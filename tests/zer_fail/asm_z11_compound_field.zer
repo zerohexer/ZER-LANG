@@ -1,0 +1,18 @@
+// EXPECTED: compile error (Z11 rule)
+//
+// Companion to asm_z11_compound_input.zer. Same Z11 audit fix, but
+// using a pointer-typed field access (`cont.ptr`) rather than a scalar
+// field. The asm uses the pointer field as input with a memory clobber
+// — pre-fix this compiled clean because the input was NODE_FIELD, not
+// NODE_IDENT. Post-fix Z11 walks the chain to root `cont` and rejects.
+
+struct Container { *u32 ptr; }
+
+naked void leak(*Container cont) {
+    asm {
+        instructions: "movq %0, %0"
+        inputs: { "rax" = cont.ptr }
+        clobbers: [ "memory" ]
+        safety: "Pointer field access from non-keep ptr param + memory clobber must be rejected by Z11"
+    }
+}

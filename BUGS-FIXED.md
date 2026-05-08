@@ -463,6 +463,103 @@ blocks forever and `th.join()` never returns.
 
 ---
 
+## Session 2026-05-08 — Audit findings: asm operand compound-bypass + diagnostic + dead handlers
+
+Five-agent codebase audit (zercheck_ir, ir_lower+emitter, checker,
+src/safety+asm, adversarial test programs) ran in parallel, then
+findings were verified against the source. Most agent claims were
+false positives; three classes of real bugs surfaced and are fixed
+in this session.
+
+### Z11/Z5/Z4: asm operand compound-expression bypass (BUG-660)
+
+**Symptom**: A `naked` function with `asm { inputs: { "rax" =
+cont.field } clobbers: ["memory"] }` where `cont` is a non-keep
+pointer parameter compiled clean. Pre-fix Z11 only checked
+`op->expr->kind == NODE_IDENT` so any access through a struct field
+or array index slipped past. Same restriction silently weakened Z5
+(local-derived pointer escape) and Z4 (provenance/escape-flag
+clearing on outputs) — compound forms didn't fire / didn't clear.
+
+**Verification**:
+- `cont` (bare ident, non-keep ptr param + memory clobber) → Z11
+  fires correctly (existing test).
+- `cont.field` (compound, same param) → pre-fix compiled silently;
+  post-fix Z11 fires.
+
+**Fix**: introduce a local `ASM_OP_ROOT_IDENT` macro inside the
+NODE_ASM handler in `checker.c`. The macro walks NODE_FIELD /
+NODE_INDEX / NODE_UNARY-deref chains to the root NODE_IDENT and
+returns it (or NULL if the chain doesn't bottom out at an ident —
+e.g., a literal expression or `@inttoptr`). All three call-sites
+(Z11 input scan, Z4 output scan, Z5 input scan) use the macro to
+locate the root symbol and apply the existing per-symbol check.
+
+The walker mirrors `ir_target_root` in `zercheck_ir.c:362-372` —
+same shape, same chain set. Universally compositional: `cont.f.g`
+walks to `cont`; `arr[k].f` walks to `arr`; `*p.f` walks to `p`.
+
+**Tests** (added 2026-05-08):
+- `tests/zer_fail/asm_z11_compound_input.zer` — must reject
+  `cont.dummy` (scalar field of non-keep ptr param)
+- `tests/zer_fail/asm_z11_compound_field.zer` — must reject
+  `cont.ptr` (pointer field of non-keep ptr param)
+
+**Universality note**: Naked-only restriction means Z11/Z5 are
+mostly-dormant today (asm bodies are short, parameters limited).
+The fix matters more once S1 relaxes and asm is allowed in
+non-naked code, where compound operand forms become common
+(passing struct fields directly to inline asm rather than copying
+to a local first). Same forward-compat reasoning that motivated
+Z1/Z2 wiring landed pre-emptively rather than post-S1-relaxation.
+
+### Diagnostic: register error message hardcodes "x86_64" regardless of `--target-arch`
+
+Three sites in `checker.c` (input/output/clobber register validation)
+formatted `not recognized for x86_64` even when `c->target_arch`
+was 2 (aarch64) or 3 (riscv64). The validation itself dispatched to
+the correct per-arch table — only the diagnostic string was wrong.
+
+**Fix**: derive `asm_arch_name` from `asm_arch` once
+(`"x86_64"` / `"aarch64"` / `"riscv64"`) and substitute via `%s` in
+all three messages. Also dropped the x86-specific register-name
+suggestion ("rax-r15, ...") from the message since it's wrong on
+two of three architectures.
+
+No regression test needed — the diagnostic doesn't drive a
+PASS/FAIL test, but the substitution is mechanical and obvious in
+diff. Future audits can spot hardcoded-arch strings via
+`grep -nE 'recognized for (x86_64|aarch64|riscv64)' checker.c`.
+
+### Emitter: dead IR_FIELD_WRITE/IR_INDEX_WRITE handlers silently miscompile if reached
+
+`emitter.c:9568` had `case IR_FIELD_WRITE: case IR_CAST: { /* CAST
+body */ }` — the field-write opcode silently fell through to the
+cast handler. `emitter.c:9677` had a `case IR_INDEX_WRITE:` group
+emitting only `/* 3AC op N — TODO */`. Today neither opcode is
+emitted by `ir_lower.c` (field/index writes route through IR_ASSIGN
++ `emit_rewritten_node`, which goes through AST `emit_expr` with
+all the existing safety wrappers). But if a future lowering
+refactor starts emitting them, the existing handlers would
+silently produce wrong code (cast semantics for FIELD_WRITE; nothing
+at all for INDEX_WRITE).
+
+**Fix**: split the merged FIELD_WRITE case off from CAST, and
+replace both stubs with `_zer_trap("... not implemented", ...)`
+so a regression surfaces as a runtime failure rather than a silent
+miscompile (FIELD_WRITE) or silent dropped operation (INDEX_WRITE).
+Five other unimplemented opcodes (IR_ADDR_OF, IR_DEREF_READ,
+IR_CALL_DECOMP, IR_INTRINSIC_DECOMP, IR_ORELSE_DECOMP, IR_SLICE_READ)
+got the same treatment for symmetry.
+
+This is technical-debt hardening, not a behavior change: ir_lower
+doesn't emit these opcodes, so the trap is unreachable today. But
+it converts a "wait until a user files a weird bug" failure mode
+into a "build/test the moment lowering changes" failure mode. Same
+philosophy as `ir_validate` defer-balance check landing 2026-04-20.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

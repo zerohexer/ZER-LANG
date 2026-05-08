@@ -9858,13 +9858,40 @@ static void check_stmt(Checker *c, Node *node) {
                     break;
                 }
             }
+            /* Z11/Z5/Z4 root-walk helper: an asm operand expression may be
+             * NODE_IDENT (bare local/param), NODE_FIELD (s.field), NODE_INDEX
+             * (arr[k]), or NODE_UNARY (*p). For Z-rules whose flag lives on a
+             * Symbol (is_keep / is_local_derived / provenance_type), follow
+             * the chain to the root NODE_IDENT — the symbol there represents
+             * the storage actually reachable from the asm operand. Without
+             * this, a memory-clobbering asm with operand `cont.ptr` (where
+             * cont is a non-keep pointer parameter) silently bypassed Z11.
+             * 2026-05-08 audit found this gap; tests in
+             * tests/zer_fail/asm_z11_compound_input.zer + companion. */
+            #define ASM_OP_ROOT_IDENT(out_ident_node)                       \
+                do {                                                          \
+                    Node *_cur = op->expr;                                    \
+                    while (_cur) {                                            \
+                        if (_cur->kind == NODE_FIELD) _cur = _cur->field.object; \
+                        else if (_cur->kind == NODE_INDEX) _cur = _cur->index_expr.object; \
+                        else if (_cur->kind == NODE_UNARY &&                  \
+                                 _cur->unary.op == TOK_STAR)                  \
+                            _cur = _cur->unary.operand;                       \
+                        else break;                                           \
+                    }                                                         \
+                    (out_ident_node) = (_cur && _cur->kind == NODE_IDENT) ? _cur : NULL; \
+                } while (0)
+
             if (has_memory_clobber) {
                 for (int i = 0; i < node->asm_stmt.input_count; i++) {
                     AsmOperand *op = &node->asm_stmt.inputs[i];
-                    if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                    if (!op->expr) continue;
+                    Node *root = NULL;
+                    ASM_OP_ROOT_IDENT(root);
+                    if (!root) continue;
                     Symbol *sym = scope_lookup(c->current_scope,
-                        op->expr->ident.name,
-                        (uint32_t)op->expr->ident.name_len);
+                        root->ident.name,
+                        (uint32_t)root->ident.name_len);
                     if (!sym) continue;
                     Type *t = sym->type;
                     if (!t) continue;
@@ -9884,7 +9911,7 @@ static void check_stmt(Checker *c, Node *node) {
                         "asm may store the pointer to memory; mark parameter "
                         "as `keep` if storage to globals is intended",
                         (int)op->reg_name_len, op->reg_name,
-                        (int)op->expr->ident.name_len, op->expr->ident.name);
+                        (int)root->ident.name_len, root->ident.name);
                 }
             }
 
@@ -9894,13 +9921,19 @@ static void check_stmt(Checker *c, Node *node) {
              * value to each output target — the asm body could store any
              * pointer with any type. Clear `provenance_type` on output
              * symbols so subsequent `@ptrcast` doesn't trust stale type info.
-             * Same pattern as NODE_ASSIGN clears at checker.c:3031. */
+             * Same pattern as NODE_ASSIGN clears at checker.c:3031.
+             * Audit-2026-05-08: walk through compound chains so that
+             * `outputs: { "rax" = s.field }` clears provenance on the root
+             * symbol `s` (not just bare-ident outputs). */
             for (int i = 0; i < node->asm_stmt.output_count; i++) {
                 AsmOperand *op = &node->asm_stmt.outputs[i];
-                if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                if (!op->expr) continue;
+                Node *root = NULL;
+                ASM_OP_ROOT_IDENT(root);
+                if (!root) continue;
                 Symbol *tsym = scope_lookup(c->current_scope,
-                    op->expr->ident.name,
-                    (uint32_t)op->expr->ident.name_len);
+                    root->ident.name,
+                    (uint32_t)root->ident.name_len);
                 if (!tsym) continue;
                 tsym->provenance_type = NULL;
                 tsym->is_local_derived = false;
@@ -9919,10 +9952,13 @@ static void check_stmt(Checker *c, Node *node) {
             if (has_memory_clobber) {
                 for (int i = 0; i < node->asm_stmt.input_count; i++) {
                     AsmOperand *op = &node->asm_stmt.inputs[i];
-                    if (!op->expr || op->expr->kind != NODE_IDENT) continue;
+                    if (!op->expr) continue;
+                    Node *root = NULL;
+                    ASM_OP_ROOT_IDENT(root);
+                    if (!root) continue;
                     Symbol *sym = scope_lookup(c->current_scope,
-                        op->expr->ident.name,
-                        (uint32_t)op->expr->ident.name_len);
+                        root->ident.name,
+                        (uint32_t)root->ident.name_len);
                     if (!sym) continue;
                     if (!sym->is_local_derived) continue;
                     checker_error(c, op->loc.line,
@@ -9931,9 +9967,10 @@ static void check_stmt(Checker *c, Node *node) {
                         "the local address externally; move target to global "
                         "or remove memory clobber",
                         (int)op->reg_name_len, op->reg_name,
-                        (int)op->expr->ident.name_len, op->expr->ident.name);
+                        (int)root->ident.name_len, root->ident.name);
                 }
             }
+            #undef ASM_OP_ROOT_IDENT
 
             /* D-Alpha-7.5 Session E2 — Z3, Z7, Z12 wiring.
              *
@@ -9983,6 +10020,14 @@ static void check_stmt(Checker *c, Node *node) {
                 (c->target_arch == 2) ? ZER_ARCH_AARCH64 :
                 (c->target_arch == 3) ? ZER_ARCH_RISCV64 :
                 ZER_ARCH_X86_64;
+            /* Audit-2026-05-08: pre-fix this branch always reported
+             * "not recognized for x86_64" regardless of target_arch.
+             * Confusing for aarch64/riscv64 builds where the user typed
+             * a valid x86 register but on the wrong target. */
+            const char *asm_arch_name =
+                (asm_arch == ZER_ARCH_AARCH64) ? "aarch64" :
+                (asm_arch == ZER_ARCH_RISCV64) ? "riscv64" :
+                "x86_64";
 
             for (int i = 0; i < node->asm_stmt.input_count; i++) {
                 AsmOperand *op = &node->asm_stmt.inputs[i];
@@ -9992,10 +10037,8 @@ static void check_stmt(Checker *c, Node *node) {
                         op->reg_name, op->reg_name_len) == 0) {
                     checker_error(c, op->loc.line,
                         "asm input register '%.*s' not recognized for "
-                        "x86_64 (O3 rule). Check spelling — known "
-                        "registers are GP regs (rax-r15, eax-r15d, "
-                        "ax-sp, al-spl, ah-dh)",
-                        (int)op->reg_name_len, op->reg_name);
+                        "%s (O3 rule). Check spelling and target arch",
+                        (int)op->reg_name_len, op->reg_name, asm_arch_name);
                 }
             }
 
@@ -10007,10 +10050,8 @@ static void check_stmt(Checker *c, Node *node) {
                         op->reg_name, op->reg_name_len) == 0) {
                     checker_error(c, op->loc.line,
                         "asm output register '%.*s' not recognized for "
-                        "x86_64 (O3 rule). Check spelling — known "
-                        "registers are GP regs (rax-r15, eax-r15d, "
-                        "ax-sp, al-spl, ah-dh)",
-                        (int)op->reg_name_len, op->reg_name);
+                        "%s (O3 rule). Check spelling and target arch",
+                        (int)op->reg_name_len, op->reg_name, asm_arch_name);
                 }
             }
 
@@ -10026,10 +10067,10 @@ static void check_stmt(Checker *c, Node *node) {
                         c->target_features,
                         op->reg_name, op->reg_name_len) == 0) {
                     checker_error(c, op->loc.line,
-                        "asm clobber '%.*s' not recognized for x86_64 "
+                        "asm clobber '%.*s' not recognized for %s "
                         "(O3 rule). Use a known register name, or "
                         "'memory' / 'cc' for side-effect markers",
-                        (int)op->reg_name_len, op->reg_name);
+                        (int)op->reg_name_len, op->reg_name, asm_arch_name);
                 }
             }
 

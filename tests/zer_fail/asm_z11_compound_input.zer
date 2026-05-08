@@ -1,0 +1,20 @@
+// EXPECTED: compile error (Z11 rule)
+//
+// Regression test for 2026-05-08 audit: pre-fix the Z11 rule (asm
+// memory clobber + non-keep pointer parameter) only checked NODE_IDENT
+// inputs, silently bypassing compound expressions like `cont.field`.
+// A user could leak a non-keep pointer's bits to an asm memory clobber
+// by accessing it through a struct field. The fix walks the operand
+// chain (NODE_FIELD / NODE_INDEX / NODE_UNARY*) to the root identifier
+// and applies Z11 there.
+
+struct Container { *u32 ptr; u32 dummy; }
+
+naked void leak(*Container cont) {
+    asm {
+        instructions: "movq %0, %0"
+        inputs: { "rax" = cont.dummy }
+        clobbers: [ "memory" ]
+        safety: "Compound input from non-keep ptr param + memory clobber must be rejected by Z11"
+    }
+}

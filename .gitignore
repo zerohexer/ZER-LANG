@@ -43,3 +43,16 @@ editors/vscode/node_modules/
 hello.c
 hello.exe
 tags
+tests/zer/arena_alloc
+tests/zer/comptime_const_arg
+tests/zer/condvar_signal
+tests/zer/goto_spaghetti_safe
+tests/zer/interior_ptr_safe
+tests/zer/recursive_functions
+tests/zer/scoped_spawn
+tests/zer/super_freelist_arena
+tests/zer/super_sensor_logger
+tests/zer/super_uart_parser
+tests/zer/typecast_cstyle
+tests/zer/typecast_safe_complex
+tests/zer_proof/A01_no_uaf

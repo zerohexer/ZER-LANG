@@ -9708,7 +9708,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
     }
 
-    case IR_FIELD_WRITE:
+    case IR_FIELD_WRITE: {
+        /* Defensive: ir_lower never emits IR_FIELD_WRITE today (field-write
+         * statements flow through IR_ASSIGN with the AST node passed via
+         * `inst->expr` to emit_rewritten_node, which routes to AST emit_expr
+         * with bounds/qualifier/safety wrappers). The opcode is reserved for
+         * a future per-field IR refactor. If it ever starts being emitted,
+         * the merged-with-IR_CAST handler below would silently emit wrong
+         * C (cast semantics, not field-write). Audit-2026-05-08: trap here
+         * instead so the regression surfaces as a build failure. */
+        fprintf(stderr, "INTERNAL: IR_FIELD_WRITE emitted but emitter has no "
+                        "handler — file a bug; field writes should flow "
+                        "through IR_ASSIGN today.\n");
+        emit_indent(e);
+        emit(e, "_zer_trap(\"IR_FIELD_WRITE not implemented\", "
+                "__FILE__, __LINE__);\n");
+        break;
+    }
+
     case IR_CAST: {
         /* (Type)expr — emit from src_local + cast_type.
          * 3 paths: to *opaque (wrap), from *opaque (unwrap+check), simple C cast. */
@@ -9817,16 +9834,36 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
     }
 
-    case IR_INDEX_WRITE:
+    case IR_INDEX_WRITE: {
+        /* Defensive: ir_lower never emits IR_INDEX_WRITE today.
+         * Index-write statements flow through IR_ASSIGN passing the AST
+         * node to emit_rewritten_node which routes to emit_expr with
+         * bounds checks. Reserved for future per-element IR refactor.
+         * Pre-fix this case silently emitted a TODO comment, which would
+         * be a silent-skip miscompile if lowering ever started emitting
+         * IR_INDEX_WRITE. Audit-2026-05-08: trap so the regression is
+         * visible as a runtime failure rather than a missing array store. */
+        emit_indent(e);
+        emit(e, "_zer_trap(\"IR_INDEX_WRITE not implemented\", "
+                "__FILE__, __LINE__);\n");
+        break;
+    }
+
     case IR_ADDR_OF:
     case IR_DEREF_READ:
     case IR_CALL_DECOMP:
     case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP:
     case IR_SLICE_READ: {
-        /* Future: emit from local IDs. */
+        /* Future: emit from local IDs. None of these are emitted by
+         * ir_lower today (the equivalent paths route through IR_ASSIGN +
+         * emit_rewritten_node). Audit-2026-05-08: emit a defensive trap
+         * instead of silent comment so a future lowering refactor that
+         * starts emitting these opcodes surfaces as a runtime failure
+         * rather than dropped operations. */
         emit_indent(e);
-        emit(e, "/* 3AC op %d — TODO */\n", inst->op);
+        emit(e, "_zer_trap(\"IR opcode %d not implemented\", "
+                "__FILE__, __LINE__);\n", inst->op);
         break;
     }
 

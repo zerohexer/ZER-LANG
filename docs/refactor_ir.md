@@ -1,7 +1,27 @@
 # Refactor IR — zercheck_ir.c Helper-Layer Restoration
 
-**Status:** Planning document. Not yet executed. Re-audited 2026-05-10.
-**Date:** 2026-05-05 (drafted), 2026-05-10 (audit + corrections)
+**Status:** Planning document. Phased execution decided 2026-05-11.
+**Date:** 2026-05-05 (drafted), 2026-05-10 (audit + corrections),
+2026-05-11 (phasing decision)
+
+**SCOPE DECISION (2026-05-11): Phase A only. Helpers 4-6 deferred.**
+
+After ROI analysis, the 6-helper bundle splits into:
+- **Phase A (DO NOW, ~4 hrs):** items 1-3 — audit script,
+  `ir_state_join`, `ir_alias_copy_provenance`. Eliminates all 5
+  documented recurring bug patterns. Direct precedent. Low risk.
+- **Phase B (DEFERRED):** items 4-6 — `ir_record_freed/_transferred`
+  wrappers, `ir_report_invalid_use`, `ir_init_handle` factory. ZERO
+  documented bugs in their class — they're prophylactic against bugs
+  that haven't happened. Land only if a bug surfaces in their category,
+  Phase 5 forces parallel patterns, or someone's already touching that
+  code.
+
+Specs for helpers 4-6 are kept below (sections 6.4-6.6, Appendix A.4-A.5,
+etc.) as a reference for future sessions. Don't delete — just don't ship
+yet. The bug rate doesn't justify them today.
+
+
 **Scope:** Internal architectural cleanup of `zercheck_ir.c`. No user-facing
 behavior changes (with 6 acknowledged lattice cells changing in formally-
 correct direction — see section 6.1). No new safety properties.
@@ -1229,32 +1249,63 @@ audit script with a new check.
 
 ### Phase ordering
 
-Recommended order (low → high risk, low → high impact):
+**Phasing decision (2026-05-11): split into Phase A (do now) and
+Phase B (DEFERRED).** Phase A items have documented bugs they prevent.
+Phase B items have ZERO documented bugs in their class — they're
+prophylactic and would be premature today. ROI analysis below.
+
+#### Phase A — DO NOW (~4 hrs, eliminates all 5 documented bug classes)
 
 1. **Audit script first.** `tools/audit_handle_helpers.sh`. Soft-fail
    in CI. Establishes the regression-prevention layer before changes.
-   Effort: ~1 hr.
+   Catches all 6 audit patterns mechanically.
+   Effort: ~1 hr. Bugs prevented: ALL future ones in helper-layer
+   classes.
 
 2. **`ir_state_join` table.** Pure refactor of one function. Easy to
    verify. Establishes the table-based dispatch idiom in the file.
-   Effort: ~1 hr.
+   Effort: ~1 hr. Bugs prevented: 2 documented (BUG-650 #1, F3.2 #1).
 
-3. **`ir_record_freed` / `ir_record_transferred` wrappers.** Thin
+3. **`ir_alias_copy_provenance`.** Migrate 7 sites that already use
+   the field-copy pattern. The remaining 0 stay ad-hoc (audit found
+   all are now true-alias after MLXDT BUG-660 corrected the count).
+   Effort: ~2 hrs. Bugs prevented: 3 documented (F3.2 #2, BUG-660,
+   latent IR_CAST drift).
+
+**Phase A total: ~4 hrs. Eliminates 5 of 5 documented recurring bugs.**
+
+#### Phase B — DEFERRED (specs preserved below for future reference)
+
+4. **`ir_record_freed` / `ir_record_transferred` wrappers.** Thin
    wrappers around existing logic. Migrate 16 sites mechanically.
-   Effort: ~1 hr.
+   Effort: ~1 hr. **DEFERRED:** ZERO documented bugs in this class.
+   The wrappers' value is documenting an undocumented decision (no
+   alias propagation on TRANSFERRED) — but that decision hasn't caused
+   bugs. Land if a TRANSFERRED-causing op needs alias propagation in
+   the future.
 
-4. **`ir_report_invalid_use`.** Migrate 18 error sites. Each migration
-   is a one-line replace. Test suite catches message-wording regressions.
-   Effort: ~2 hrs.
+5. **`ir_report_invalid_use`.** Migrate 25 error sites with
+   `IRUseContext` dispatch. Effort: ~2 hrs. **DEFERRED:** ZERO
+   documented bugs in this class. The value is UX consistency in
+   error messages — improvement, not bug-prevention. Land if a state
+   addition forces 25 message updates, or if user feedback flags
+   message inconsistency.
 
-5. **`ir_alias_copy_provenance`.** Migrate 5 of 8 sites; document the
-   3 with intentional differences. Effort: ~1 hr.
+6. **`ir_init_handle` factory.** Most invasive — 22-25 sites. Each
+   migration is ~5 lines → 1 line. Stage in batches of 5 with full
+   test runs between. Effort: ~2-3 hrs. **DEFERRED:** ZERO documented
+   bugs in this class. Most init sites have sensible defaults; the
+   factory's value is "easy to add a new alloc kind" — but no new
+   alloc kind is pending. Phase 5 atomic ordering will introduce its
+   own state machine which may or may not benefit from this pattern.
 
-6. **`ir_init_handle` factory.** Most invasive — 17 sites. Each
-   migration is ~5 lines → 1 line. Stage in batches of 5 sites with
-   full test runs between. Effort: ~2 hrs.
-
-Total: ~8 hrs end-to-end including tests.
+**Phase B trigger conditions** (any one re-enables Phase B work):
+- A bug surfaces in any deferred class (transition divergence, error
+  message regression, init pattern miss)
+- Phase 5 atomic ordering forces parallel patterns
+- Someone's already doing major work in `zercheck_ir.c` and the
+  consolidation overhead is marginal
+- User feedback flags inconsistent error messages
 
 ### Per-helper migration approach
 
@@ -1269,18 +1320,20 @@ For each helper:
 
 ### Commit boundaries
 
-One commit per helper. Six commits total plus one for the audit script.
-Each commit is independently revertable.
+**Phase A commits (3 + docs):**
 
 ```
 commit 1: tools/audit_handle_helpers.sh — bug-class regression detector
 commit 2: refactor: ir_state_join table replaces 7-case cascade
-commit 3: refactor: ir_record_freed / ir_record_transferred wrappers
-commit 4: refactor: ir_report_invalid_use central error reporter
-commit 5: refactor: ir_alias_copy_provenance for alias-copy consolidation
-commit 6: refactor: ir_init_handle factory replaces 17 ad-hoc inits
-commit 7: docs: update CLAUDE.md / compiler-internals.md with new helpers
+commit 3: refactor: ir_alias_copy_provenance for alias-copy consolidation
+commit 4: docs: update CLAUDE.md / compiler-internals.md with new helpers
 ```
+
+Each commit independently revertable. Run full `make check` between each.
+
+**Phase B commits (deferred):** would add commits 5-7 for `ir_record_*`
+wrappers, `ir_report_invalid_use`, and `ir_init_handle` factory. Same
+boundary structure (one commit per helper, full test suite between).
 
 ### Backward compatibility
 

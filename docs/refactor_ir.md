@@ -28,11 +28,25 @@ compile-time exhaustiveness.
   6 true-alias + 2 init-with-fresh-id (the 2 are covered by
   `ir_init_handle`, not this helper).
 - Error site count was rough: claimed 18, actually 25 across 3 tiers
-  (16 "use" + 4 "return" + 5 "freeing"). Recommend folding Tier 1+2
-  (20 sites) into helper; keep Tier 3 separate following Rust precedent.
+  (16 "use" + 4 "return" + 5 "freeing").
 - Lattice table makes 6 cells differ from current behavior (4 in UNK
-  row + 2 defensive XFER↔FREED). All 6 unreachable today; explicitly
-  documented as formally-correct lattice choices.
+  row + 2 defensive XFER↔FREED). All 6 unreachable today.
+
+**Decisions made (2026-05-10) — no remaining ambiguity:**
+
+- **Q1 (lattice cells):** formally-correct lattice. All 6 cells take
+  their formally-correct value, not preserved cascade behavior. Encoding
+  cascade asymmetry into a lookup table would memorialize a fall-through
+  accident — a real semilattice is what every production compiler uses.
+
+- **Q7 (error reporter scope):** fold all 25 sites via `IRUseContext`
+  enum (READ/RETURN/FREE). Rust's E0382 covers the same shape — single
+  error code with `MoveOutAction` enum dispatching wording. Splitting
+  forces 3 places to update when a state is added.
+
+These were the only two open questions. Plan is now fully concrete:
+6 helpers, 1 audit script, 50-55 sites consolidated, ~300 net LOC
+reduction, all decisions backed by production-compiler precedent.
 
 ---
 
@@ -1048,9 +1062,10 @@ static void ir_report_invalid_use(ZerCheck *zc, IRHandleInfo *h, int line,
 and the path string is shown. Otherwise the local's source name is
 shown. Function emits via `ir_zc_error`.
 
-**Sites it replaces (audit 2026-05-10):**
+**Sites it replaces (audit 2026-05-10): all 25 sites across 3 tiers,
+unified via `IRUseContext` enum.**
 
-**Tier 1 — "use of invalid handle" (16 sites, MUST fold in):**
+**Tier 1 — `IR_USE_READ` (16 sites — use/deref/field/index access):**
 - L974 (generic UAF walker), L1535 (use after move IR_COPY),
   L1560 (IR_COPY use of invalid src), L1632 (IR_CAST use of invalid),
   L1728 (IR_POOL_GET), L1779/L1783 (IR_FIELD_READ root + compound),
@@ -1059,27 +1074,22 @@ shown. Function emits via `ir_zc_error`.
   L2381 (IR_CALL move struct arg), L2533 (IR_CALL UAF walker),
   L2888 (IR_FIELD_WRITE invalid value), L2955 (IR_INDEX_WRITE invalid).
 
-**Tier 2 — "returning invalid handle" (4 sites, RECOMMEND fold in):**
+**Tier 2 — `IR_USE_RETURN` (4 sites — return statement):**
 - L2205, L2236 ("returning %s value (move struct)")
 - L2217, L2252 ("returning %s pointer ... caller would receive
   dangling pointer")
 
-Same predicate as Tier 1 (handle is in invalid state). Different
-position (return vs use). Recommend folding via context parameter:
-`ir_report_invalid_use(zc, h, line, ..., ZER_USE_RETURN)`.
-
-**Tier 3 — "freeing invalid handle" (5 sites, KEEP SEPARATE):**
+**Tier 3 — `IR_USE_FREE` (5 sites — free-call attempt):**
 - L1704 ("freeing X which may already be freed" — IR_POOL_FREE)
 - L1708 ("freeing X which was already transferred")
 - L2502, L2506 (same pair in IRMC_FREE)
 - L2719 (in IRMC_FREE_PTR)
 
-These STAY separate because they're conceptually different: "user is
-attempting a free on a handle that's already invalid" — this is a
-**double-free / free-after-move** error, distinct from "use after
-free." Rust uses separate diagnostics for these too (`use of moved
-value` vs `borrow of moved value` vs separate "double free" message).
-Following Rust precedent: keep separate.
+All 3 tiers share the predicate "handle is in invalid state." The
+verb differs (use/return/free) but the state-classification logic is
+identical. Per Q7 decision (section 11), helper accepts `IRUseContext`
+enum and dispatches wording in a switch — same pattern as Rust's E0382
+error code with `MoveOutAction` enum.
 
 **Message structure:**
 
@@ -1409,19 +1419,36 @@ update is in ONE place.
 
 ## 11. Open Questions
 
-### Q1: Defensive lattice cells `(FREED, TRANSFERRED)`?
+### Q1: Defensive lattice cells `(FREED, TRANSFERRED)`? — **DECIDED**
 
-The 5×5 table has 2 cells currently unreachable via checker constraints
-(Handle banned from spawn). Two options:
+**Decision (2026-05-10): formally-correct lattice. All 6 changed cells
+take their formally-correct value, not preserved behavior.**
 
-- **Defensive:** Set those cells to MAYBE_FREED. Catches future cases
-  if reachability changes. Costs nothing today.
-- **Strict:** Set those cells to whatever the cascade currently produces
-  (FREED stays FREED, TRANSFERRED stays TRANSFERRED). Documents
-  unreachability.
+The 6 cells: 4 in UNK row + 2 defensive (FREED↔XFER).
 
-Recommend **defensive** — MAYBE_FREED is safe, costs nothing, future-
-proofs against checker rule changes.
+**Reasoning:**
+
+1. **Mathematical correctness.** A semilattice join must be commutative,
+   associative, idempotent. The current cascade is asymmetric — encoding
+   that asymmetry into a lookup table would memorialize a fall-through
+   accident, not a deliberate semantic choice.
+
+2. **All 6 cells are unreachable today** (verified by audit). If they
+   become reachable via future checker rule changes, the formally-correct
+   behavior is what we want:
+   - UNK row: UNK is "no information"; joining with state X should
+     yield X. Keeping UNK loses information.
+   - XFER↔FREED: if reachability allows it, the join must be MAYBE_FREED
+     (conservative). Keeping FREED-only or XFER-only would be a real bug.
+
+3. **Production compiler precedent.** rustc's `JoinSemiLattice` is a
+   mathematical semilattice. Swift SIL's `OwnershipKind::join` is the
+   same. ZER would be the only compiler with deliberately non-commutative
+   "join" if we preserved current asymmetry.
+
+**Risk if a cell turns out reachable:** test suite fails loudly. That's
+a feature — it surfaces a reachability change that needs analysis. The
+current behavior at unreachable cells is dead semantic mass, not safety.
 
 ### Q2: `ir_init_handle` signature width
 
@@ -1472,25 +1499,47 @@ description grows the prompt. Compromise:
 
 Recommend **short note + full details elsewhere**.
 
-### Q7: Error reporter scope (Tier 1 vs Tier 1+2 vs Tier 1+2+3)
+### Q7: Error reporter scope — **DECIDED**
 
-Per audit 2026-05-10, there are 25 invalid-state error sites split into
-3 tiers (see section 6.5). Decision matrix:
+**Decision (2026-05-10): fold all 25 sites (Option C) via `IRUseContext`
+enum parameter.**
 
-| Option | Sites covered | Rationale | Risk |
-|---|---|---|---|
-| **A: Tier 1 only** | 16 | Conservative — only "use of invalid handle" sites | Misses 4 return sites that have identical predicate |
-| **B: Tier 1+2** | 20 | Recommended — folds returns via context param | Slight error-message wording change |
-| **C: All 3 tiers** | 25 | Maximalist — also folds "freeing invalid" | Conflates conceptually distinct errors (double-free vs use-after-free) |
+Per audit, 25 invalid-state error sites split into 3 tiers (section 6.5).
 
-Recommend **Option B**. Folds the natural identity (same predicate
-"handle in invalid state") in two contexts (use, return). Excludes
-"freeing invalid" because that's a different error class users see as
-"you tried to free X" not "you used X."
+```c
+typedef enum {
+    IR_USE_READ,    /* use/deref/field — "use after free/move" */
+    IR_USE_RETURN,  /* return stmt — "returning {state} pointer" */
+    IR_USE_FREE,    /* free attempt — "double free / free after move" */
+} IRUseContext;
 
-This matches Rust's diagnostic structure: `use of moved value` and
-`borrow of moved value` are separate from `dropped twice` even though
-all three predicate on "value moved."
+static void ir_report_invalid_use(ZerCheck *zc, IRHandleInfo *h, int line,
+                                   int local_id, const char *path,
+                                   uint32_t path_len, IRFunc *func,
+                                   IRUseContext ctx);
+```
+
+**Reasoning:**
+
+1. **All 3 tiers share the same predicate** ("handle is in invalid state").
+   The verb (use/return/free) differs but the state-classification logic
+   is identical. Splitting forces 3 places to update when a new state
+   is added.
+
+2. **Rust's E0382 pattern.** Re-reading rustc more carefully: error code
+   E0382 covers "use of moved value", "borrow of moved value", "assign
+   to part of moved value", and "drop of moved value" — ALL four share
+   a single error code with contextual wording dispatched from a
+   `MoveOutAction` enum. This is exactly Option C.
+
+3. **Site count.** 25 sites consolidating into 1 function strictly
+   beats 16 + 4 + 5 = 3 separate functions. The 5 "freeing" sites are
+   trivially handled by adding `case IR_USE_FREE:` to the switch.
+
+4. **Original draft argued AGAINST this** based on Rust precedent —
+   that argument was wrong. Rust DOES centralize.
+
+**Implementation:** see updated section 6.5 and Appendix A.5.
 
 ### Q6: Naming consistency
 
@@ -1865,27 +1914,30 @@ static void ir_record_transferred(IRHandleInfo *h, int line) {
 
 ```c
 /* ============================================================
- * Central error reporter for "use of invalid handle" diagnostics.
+ * Central error reporter for "handle in invalid state" diagnostics.
  *
- * Replaces 18 ad-hoc ir_zc_error sites with consistent state-aware
- * messages. State-specific phrasing (use-after-free vs use-after-
- * move vs use-after-thread-transfer) is determined by h->state and
- * h->is_thread_handle.
- *
- * Move-struct vs pool-handle distinction: looks up the local's
- * type via func->locals[local_id].type and consults
- * ir_should_track_move() to identify move-struct entities.
+ * Replaces 25 ad-hoc ir_zc_error sites across 3 contexts with
+ * consistent state-aware messages. Maps to Rust's E0382 error code
+ * pattern: single predicate (handle invalid), contextual wording.
  *
  * Caller responsibilities:
  *   - Verify h is non-NULL and ir_is_invalid(h) before calling
  *   - Provide local_id (>=0) for bare locals; provide path/path_len
  *     for compound entities
  *   - Provide func for type lookup (move-struct distinction)
+ *   - Specify context: USE_READ / USE_RETURN / USE_FREE
  * ============================================================ */
+
+typedef enum {
+    IR_USE_READ,    /* use, deref, field/index access */
+    IR_USE_RETURN,  /* return statement */
+    IR_USE_FREE,    /* free attempt (double-free / free-after-move) */
+} IRUseContext;
 
 static void ir_report_invalid_use(ZerCheck *zc, IRHandleInfo *h, int line,
                                    int local_id, const char *path,
-                                   uint32_t path_len, IRFunc *func) {
+                                   uint32_t path_len, IRFunc *func,
+                                   IRUseContext ctx) {
     /* Build display key: compound path or local name */
     const char *name = "?";
     int nlen = 1;
@@ -1897,42 +1949,60 @@ static void ir_report_invalid_use(ZerCheck *zc, IRHandleInfo *h, int line,
         nlen = (int)func->locals[local_id].name_len;
     }
 
-    /* Determine if this is a move-struct vs regular handle for messaging */
+    /* Move-struct vs regular handle distinction for wording */
     bool is_move = false;
     if (local_id >= 0 && func && local_id < func->local_count) {
         Type *lt = func->locals[local_id].type;
         is_move = ir_should_track_move(lt);
     }
 
+    /* Verb dispatch by context */
+    const char *verb_use, *verb_freed, *verb_moved, *verb_transferred;
+    switch (ctx) {
+    case IR_USE_READ:
+        verb_use = "use of"; verb_freed = "use after free";
+        verb_moved = "use after move"; verb_transferred = "use after transfer";
+        break;
+    case IR_USE_RETURN:
+        verb_use = "returning"; verb_freed = "returning freed pointer";
+        verb_moved = "returning moved value"; verb_transferred = "returning transferred handle";
+        break;
+    case IR_USE_FREE:
+        verb_use = "freeing"; verb_freed = "double free";
+        verb_moved = "free after move"; verb_transferred = "free after transfer";
+        break;
+    }
+
+    /* State dispatch */
     switch (h->state) {
     case IR_HS_FREED:
-        ir_zc_error(zc, line, "use after free: '%.*s' freed at line %d",
-                    nlen, name, h->free_line);
+        ir_zc_error(zc, line, "%s: '%.*s' freed at line %d",
+                    verb_freed, nlen, name, h->free_line);
         break;
     case IR_HS_MAYBE_FREED:
         if (is_move) {
             ir_zc_error(zc, line,
-                "use after move: '%.*s' may have been moved on a previous path",
-                nlen, name);
+                "%s: '%.*s' may have been moved on a previous path",
+                verb_moved, nlen, name);
         } else {
             ir_zc_error(zc, line,
-                "use after free: '%.*s' may have been freed at line %d",
-                nlen, name, h->free_line);
+                "%s: '%.*s' may have been freed at line %d",
+                verb_freed, nlen, name, h->free_line);
         }
         break;
     case IR_HS_TRANSFERRED:
         if (h->is_thread_handle) {
             ir_zc_error(zc, line,
-                "use after transfer: '%.*s' transferred to thread at line %d",
-                nlen, name, h->free_line);
+                "%s: '%.*s' transferred to thread at line %d",
+                verb_transferred, nlen, name, h->free_line);
         } else if (is_move) {
             ir_zc_error(zc, line,
-                "use after move: '%.*s' ownership transferred at line %d",
-                nlen, name, h->free_line);
+                "%s: '%.*s' ownership transferred at line %d",
+                verb_moved, nlen, name, h->free_line);
         } else {
             ir_zc_error(zc, line,
-                "use after transfer: '%.*s' transferred at line %d",
-                nlen, name, h->free_line);
+                "%s: '%.*s' transferred at line %d",
+                verb_transferred, nlen, name, h->free_line);
         }
         break;
     case IR_HS_UNKNOWN:

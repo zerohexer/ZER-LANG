@@ -25,12 +25,22 @@ compile-time exhaustiveness.
 - Init-site count was undercounted: claimed 17, actually 22-25.
   Helper consolidation is BETTER than predicted (more LOC reduction).
 - Alias-copy site classification was conflated: claimed 8, actually
-  6 true-alias + 2 init-with-fresh-id (the 2 are covered by
-  `ir_init_handle`, not this helper).
+  **7** true-alias + 2 init-with-fresh-id (the 2 are covered by
+  `ir_init_handle`, not this helper). The 7th true-alias site at
+  L1882 was missed by the original audit and discovered independently
+  on branch `claude/cool-johnson-MLXDT` (BUG-660) on the same date.
 - Error site count was rough: claimed 18, actually 25 across 3 tiers
   (16 "use" + 4 "return" + 5 "freeing").
 - Lattice table makes 6 cells differ from current behavior (4 in UNK
   row + 2 defensive XFER↔FREED). All 6 unreachable today.
+
+**Cross-validation (2026-05-10): bug rate accelerating.** A separate
+audit on branch `claude/cool-johnson-MLXDT` discovered BUG-660 — the
+**7th instance of the same alias-copy field-drift class** in under
+2 weeks (BUG-468/469, BUG-650, F0.3, F3.2 #1, F3.2 #2, latent IR_CAST,
+BUG-660). The refactor's `ir_alias_copy_provenance` would catch all 7
+by construction. Without it, the bug rate continues — MLXDT branch
+patched 1 site manually, leaving the underlying gap unaddressed.
 
 **Decisions made (2026-05-10) — no remaining ambiguity:**
 
@@ -496,12 +506,15 @@ mid-implementation.
 
 ### Gap 2: Alias-copy field drift
 
-**Locations (audit 2026-05-10): 6 alias-copy sites + 2 init-with-fresh-id
-sites. Doc previously conflated these. Reclassified:**
+**Locations (audit 2026-05-10, re-audited against MLXDT branch
+2026-05-10 late):** 7 alias-copy sites + 2 init-with-fresh-id
+sites. Doc previously conflated these AND missed one site.
+Reclassified:
 
-**True alias-copy sites (6) — copy fields from a snapshot of src_h:**
+**True alias-copy sites (7) — copy fields from src to dst:**
 - L1582 (IR_COPY general — 7 fields incl. pool_name)
 - L1644 (IR_CAST — 5 fields, missing is_thread_handle/pool_name; gated to pointer/opaque src so Handle never reaches)
+- L1882 (IR_ASSIGN compound-handle from rh — 4 fields on main; **MLXDT branch BUG-660 added pool_name, making it 6 fields**) ← **NEWLY DISCOVERED**
 - L1918 (orelse-ident in IR_ASSIGN — 7 fields)
 - L2002 (@ptrcast in IR_ASSIGN — 5 fields, has escaped)
 - L2039 (&-interior in IR_ASSIGN — 4 fields)
@@ -510,6 +523,14 @@ sites. Doc previously conflated these. Reclassified:**
 **Init-with-fresh-id sites (2) — covered by `ir_init_handle`, NOT this helper:**
 - L1547 (IR_COPY move struct dst — fresh alloc_id, ALIVE state, no field copy)
 - L2138 (NODE_IDENT move dst — fresh alloc_id, ALIVE state, no field copy)
+
+**MLXDT branch confirmation (2026-05-10):** A separate audit session on
+branch `claude/cool-johnson-MLXDT` independently discovered BUG-660 at
+L1882 — exact same field-drift class as F3.2 #2. The fix manually
+patched pool_name into that site. **This is the 7th instance of the
+same bug class in <2 weeks.** Without `ir_alias_copy_provenance`, every
+new IRHandleInfo field requires hunting all 7 sites. With it, one
+helper update propagates everywhere.
 
 **Why fragile:**
 
@@ -1612,6 +1633,39 @@ Phase 5 (atomic ordering) will add a new state machine for
 `OrderingState`. It will have its own helpers. This refactor doesn't
 prep Phase 5 — it consolidates EXISTING handle-state code.
 
+### NOT doing: MLXDT branch's parallel findings
+
+Branch `claude/cool-johnson-MLXDT` (commits b5f752b + 5c7482c, NOT yet
+merged to main) contains an audit landing 8 silent-gap fixes. Audit on
+2026-05-10 confirmed: only **BUG-660** is in the helper-layer scope of
+this refactor. The other 7 fixes are tangential:
+
+| MLXDT fix | Concern | In our scope? |
+|---|---|---|
+| BUG-660 (compound pool_name) | Alias-copy field drift | **YES** — adds 7th site to L1882 |
+| BUG-661 (@bswap width) | Type-checker validation in checker.c | NO |
+| BUG-662 (@atomic_store/cas width) | Same | NO |
+| BUG-663 (4 OOM realloc sites) | Internal array mgmt in zercheck_ir.c | NO — not IRHandleInfo init/alias sites |
+| BUG-664 (5 dead-stub patterns) | Emitter default cases | NO |
+| BUG-665 (defer NODE_IF elision) | Emitter defer body walk | NO |
+| Stale ZER_DUAL_RUN comment | Doc cleanup | NO |
+| `ir_classify_method_call` wrapper removal | Code cleanup | NO |
+
+The MLXDT branch ALSO reports **14 follow-up gaps** that need separate
+sessions (12 unused VST predicates, multiple distinct-unwrap holes in
+checker.c, slice end<=len validation, etc.). These are independent of
+this refactor.
+
+**Decision:** when this refactor is executed, the implementer should
+either:
+- Wait for MLXDT to be merged, then refactor on top (preferred — doesn't
+  conflict with their fixes; just consolidates the same patterns)
+- Coordinate to apply BUG-660's fix as part of this refactor's
+  `ir_alias_copy_provenance` migration
+
+Either way, the refactor's helper layer makes BUG-660-class bugs
+impossible to ship again — which is the entire point.
+
 ---
 
 ## Appendix A: Illustrative Code Samples
@@ -2028,12 +2082,20 @@ script (section 7) detects regressions in each.
 | F0.3 | 2026-05-03 | Wrong API choice | (n/a — different gap) | Same as above |
 | F3.2 #1 cases | 2026-05-04 | Lattice cascade | `ir_state_join` | Same audit as BUG-650 |
 | F3.2 #2 alias | 2026-05-04 | Alias-copy field drift | `ir_alias_copy_provenance` | Audit: 3+ field copies outside helper |
+| **BUG-660 (MLXDT)** | **2026-05-10** | **Alias-copy field drift (compound site)** | **`ir_alias_copy_provenance`** | **Same audit as F3.2 #2** |
 | Latent: pool_name in IR_CAST | latent | Alias-copy field drift | Same as above | Same audit |
 
 The two API-confusion bugs (BUG-650 #2, F0.3) are NOT addressed by this
 refactor — they're a separate concern, deemed not worth refactoring
-(see section 12 "Out of Scope"). The other 4 bugs are all caught by
+(see section 12 "Out of Scope"). The other **5 bugs** are all caught by
 this refactor's helpers.
+
+**BUG-660 update (2026-05-10):** A parallel audit session on branch
+`claude/cool-johnson-MLXDT` independently rediscovered the F3.2 #2
+field-drift class at a 7th alias-copy site (L1882, compound handle from
+parent in IR_ASSIGN). They patched it manually. This is the 7th
+documented instance of the same bug class — the refactor's
+`ir_alias_copy_provenance` would catch all 7 by construction.
 
 ---
 
@@ -2073,23 +2135,26 @@ cleanly. Remaining 3-6 sites have specialty patterns (returns_color
 application, param-color inheritance, IR_RETURN escape-mark with extra
 flags) that stay ad-hoc with documented rationale per site.
 
-### Alias-copy sites (6 true alias + 2 init-with-fresh-id)
+### Alias-copy sites (7 true alias + 2 init-with-fresh-id)
 
 | Line | Context | Classification |
 |---|---|---|
 | 1547 | IR_COPY move struct dst | INIT-with-fresh-id (covered by `ir_init_handle`, NOT this helper) |
 | 1582 | IR_COPY general | TRUE ALIAS — uses `ir_alias_copy_provenance` |
 | 1644 | IR_CAST | TRUE ALIAS — helper + override `escaped` |
+| **1882** | **IR_ASSIGN compound-handle from rh** | **TRUE ALIAS — uses helper. NEW: discovered via MLXDT BUG-660 audit on 2026-05-10. Originally missed.** |
 | 1918 | IR_ASSIGN orelse-ident | TRUE ALIAS — uses helper |
 | 2002 | IR_ASSIGN @ptrcast | TRUE ALIAS — helper + override `escaped` |
 | 2039 | IR_ASSIGN &-interior | TRUE ALIAS — uses helper (different alloc identity is preserved by sharing alloc_id with parent) |
 | 2138 | IR_ASSIGN NODE_IDENT move-dst | INIT-with-fresh-id (covered by `ir_init_handle`) |
 | 2154 | IR_ASSIGN NODE_IDENT non-move alias | TRUE ALIAS — uses helper |
 
-**6 of 6 true alias-copy sites use `ir_alias_copy_provenance`.**
+**7 of 7 true alias-copy sites use `ir_alias_copy_provenance`.**
 The 2 init-with-fresh-id sites are handled by `ir_init_handle` (different
-helper). Doc previously misclassified these as "ad-hoc"; they're
-actually fully covered by the OTHER helper.
+helper). Doc previously claimed 6 true-alias sites; the 7th at L1882
+was missed by the original audit and rediscovered on branch
+`claude/cool-johnson-MLXDT` (BUG-660). This is direct evidence the
+hand-counting approach is fragile and the refactor is needed.
 
 ### Lattice merge cases (1 site, 7 cases pre-refactor)
 

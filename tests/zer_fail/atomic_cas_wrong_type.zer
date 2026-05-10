@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// @atomic_cas must take pointer-to-integer with width 1/2/4/8 bytes.
+// Bug: cas path skipped width validation. Pointer-to-struct silently accepted.
+
+struct NotInt { u8 a; u32 b; u8 c; }
+
+void main() {
+    NotInt v;
+    bool r = @atomic_cas(&v, v, v);
+}

@@ -609,8 +609,11 @@ int main(int argc, char **argv) {
      * their mappings to re-generated locals). The hook ensures exactly one
      * ir_lower_func call per function — emitter and zercheck_ir share IR.
      *
-     * Opt-out: ZER_DUAL_RUN=0 disables zercheck_ir entirely. Otherwise
-     * runs unconditionally alongside every compile. */
+     * Phase F1 (2026-05-03): zercheck_ir is the SOLE safety driver.
+     * `ZER_DUAL_RUN`/`ZER_IR_ONLY` env vars REMOVED. Only opt-out
+     * is the LSP/test-shim re-run via `ZER_AGREEMENT_AUDIT=1`, which
+     * re-enables AST analysis for `tools/agreement_audit.sh` reporting —
+     * not intended for production compile. */
     Node *import_asts[64];
     int import_ast_count = 0;
     for (int ti = 0; ti < topo_count && import_ast_count < 64; ti++) {

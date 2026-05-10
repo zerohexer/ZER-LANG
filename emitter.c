@@ -4353,8 +4353,10 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     }
 
     case NODE_IMPORT:
-        emit(e, "/* import %.*s — TODO */\n\n",
-             (int)decl->import.module_name_len, decl->import.module_name);
+        /* Imports are resolved during checking — module symbols emitted via
+         * topological order across files. Nothing to emit at the C level.
+         * Previous "import N TODO" comment-only emission polluted compiled
+         * output and matched the dead-stub pattern grep in the diff audit. */
         break;
 
     case NODE_CINCLUDE:
@@ -8226,10 +8228,118 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     default:
-        /* Fallback: emit as C identifier or literal */
-        emit(e, "/* unhandled node %d */0", node->kind);
+        /* Dead-stub guard. The previous default emitted a comment plus
+         * literal 0, which is a valid C expression that compiles clean
+         * but is semantically wrong (silent miscompile vector).
+         * walker_audit.sh enforces parity with emit_expr, so reaching
+         * this default means a regression. Fail loudly instead. */
+        fprintf(stderr,
+            "INTERNAL ERROR: emit_rewritten_node reached default for NODE_%d "
+            "(file=%s line=%d). Add a case in emit_rewritten_node OR add the "
+            "kind to the pre-lowered list in tools/walker_audit.sh.\n",
+            node->kind, e->source_file ? e->source_file : "?", node->loc.line);
+        abort();
+    }
+}
+
+/* Emit one statement from a defer body. Recursive — handles nested
+ * blocks/if in defer bodies. Originally the IR_DEFER_FIRE walker only
+ * handled NODE_EXPR_STMT/RETURN/ASM and fell through to emit_rewritten_node
+ * for everything else, which silently emitted a literal-0 fallback for
+ * NODE_IF (silent miscompile, the dead-stub pattern CLAUDE.md warns about).
+ * This helper makes defer body emission complete for BLOCK and IF.
+ *
+ * NODE_DEFER, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, and NODE_RETURN-with-
+ * yield inside defer bodies are banned by the checker (defer-context bans,
+ * see CLAUDE.md Ban Framework). NODE_FOR / NODE_WHILE / NODE_SWITCH inside
+ * defer are uncommon enough that we leave them as fallback (will hit
+ * emit_rewritten_node's abort if reached). */
+static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
+    if (!s) return;
+    /* Fast path: handle the few statement kinds defer bodies actually
+     * contain (BLOCK/IF/EXPR_STMT/RETURN/ASM). Anything else falls back
+     * to expression-level emission. Using if/else-if (not switch) avoids
+     * tripping walker_default_audit.sh — the fallback isn't a "missing
+     * case" silent skip, it's the documented unsupported-stmt path. */
+    if (s->kind == NODE_EXPR_STMT) {
+        if (s->expr_stmt.expr) {
+            emit_indent(e);
+            emit_rewritten_node(e, s->expr_stmt.expr, func);
+            emit(e, ";\n");
+        }
         return;
     }
+    if (s->kind == NODE_RETURN) {
+        emit_indent(e);
+        emit(e, "return");
+        if (s->ret.expr) {
+            emit(e, " ");
+            emit_rewritten_node(e, s->ret.expr, func);
+        }
+        emit(e, ";\n");
+        return;
+    }
+    if (s->kind == NODE_ASM) {
+        emit_indent(e);
+        if (s->asm_stmt.is_structured) {
+            emit_structured_asm(e, s, func);
+        } else {
+            emit(e, "__asm__ __volatile__(%.*s);\n",
+                 (int)s->asm_stmt.code_len, s->asm_stmt.code);
+        }
+        return;
+    }
+    if (s->kind == NODE_BLOCK) {
+        emit_indent(e);
+        emit(e, "{\n");
+        e->indent++;
+        for (int i = 0; i < s->block.stmt_count; i++) {
+            emit_defer_stmt(e, s->block.stmts[i], func);
+        }
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
+        return;
+    }
+    if (s->kind == NODE_IF) {
+        emit_indent(e);
+        emit(e, "if (");
+        emit_rewritten_node(e, s->if_stmt.cond, func);
+        emit(e, ") {\n");
+        e->indent++;
+        if (s->if_stmt.then_body && s->if_stmt.then_body->kind == NODE_BLOCK) {
+            for (int i = 0; i < s->if_stmt.then_body->block.stmt_count; i++) {
+                emit_defer_stmt(e, s->if_stmt.then_body->block.stmts[i], func);
+            }
+        } else if (s->if_stmt.then_body) {
+            emit_defer_stmt(e, s->if_stmt.then_body, func);
+        }
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}");
+        if (s->if_stmt.else_body) {
+            emit(e, " else {\n");
+            e->indent++;
+            if (s->if_stmt.else_body->kind == NODE_BLOCK) {
+                for (int i = 0; i < s->if_stmt.else_body->block.stmt_count; i++) {
+                    emit_defer_stmt(e, s->if_stmt.else_body->block.stmts[i], func);
+                }
+            } else {
+                emit_defer_stmt(e, s->if_stmt.else_body, func);
+            }
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}");
+        }
+        emit(e, "\n");
+        return;
+    }
+    /* Fallback: expression-level emission for any other kind. The
+     * emit_rewritten_node abort surfaces genuine gaps if/when defer bodies
+     * grow new statement kinds. */
+    emit_indent(e);
+    emit_rewritten_node(e, s, func);
+    emit(e, ";\n");
 }
 
 /* Emit one IR instruction as C code */
@@ -8767,13 +8877,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_POOL_FREE: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
     case IR_POOL_GET:
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
-    case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
-        /* Builtin ops no longer created by lowering — all go through IR_ASSIGN.
-         * Dead code guard. */
-        emit_indent(e);
-        emit(e, "/* IR builtin dead — should be IR_ASSIGN */\n");
-        break;
-    }
+    case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED:
+        /* Phase 8d: builtin ops no longer created by lowering — pool/slab/
+         * ring/arena method calls flow through IR_ASSIGN/IR_CALL. Previous
+         * comment-emit silently miscompiled if a regression started emitting
+         * these opcodes. Fail loudly instead. */
+        fprintf(stderr,
+            "INTERNAL ERROR: IR builtin opcode %d reached emitter "
+            "(file=%s line=%d) — Phase 8d collapsed these into IR_ASSIGN/"
+            "IR_CALL. Regression in ir_lower.c.\n",
+            inst->op, e->source_file ? e->source_file : "?", inst->source_line);
+        abort();
 
     case IR_CRITICAL_BEGIN: {
         emit_indent(e);
@@ -8864,59 +8978,33 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         for (int di = e->defer_stack.count - 1; di >= base; di--) {
             Node *db = e->defer_stack.stmts[di];
             if (!db) continue;
+            /* Use emit_defer_stmt — recursive walker that handles
+             * BLOCK / IF / EXPR_STMT / RETURN / ASM. Previously the inline
+             * code only handled EXPR_STMT/RETURN/ASM and fell through to
+             * emit_rewritten_node(NODE_IF), which emitted a literal-0
+             * stub — silent miscompile of the if-body inside defer. */
             if (db->kind == NODE_BLOCK) {
                 for (int si = 0; si < db->block.stmt_count; si++) {
-                    Node *s = db->block.stmts[si];
-                    if (!s) continue;
-                    if (s->kind == NODE_EXPR_STMT && s->expr_stmt.expr) {
-                        emit_indent(e);
-                        emit_rewritten_node(e, s->expr_stmt.expr, func);
-                        emit(e, ";\n");
-                    } else if (s->kind == NODE_RETURN) {
-                        emit_indent(e);
-                        emit(e, "return");
-                        if (s->ret.expr) {
-                            emit(e, " ");
-                            emit_rewritten_node(e, s->ret.expr, func);
-                        }
-                        emit(e, ";\n");
-                    } else if (s->kind == NODE_ASM) {
-                        emit_indent(e);
-                        if (s->asm_stmt.is_structured) {
-                            emit_structured_asm(e, s, func);
-                        } else {
-                            emit(e, "__asm__ __volatile__(%.*s);\n",
-                                 (int)s->asm_stmt.code_len, s->asm_stmt.code);
-                        }
-                    } else {
-                        /* Unhandled statement in defer — emit as expression */
-                        emit_indent(e);
-                        emit_rewritten_node(e, s, func);
-                        emit(e, ";\n");
-                    }
+                    emit_defer_stmt(e, db->block.stmts[si], func);
                 }
-            } else if (db->kind == NODE_EXPR_STMT && db->expr_stmt.expr) {
-                emit_indent(e);
-                emit_rewritten_node(e, db->expr_stmt.expr, func);
-                emit(e, ";\n");
             } else {
-                /* Single non-block defer */
-                emit_indent(e);
-                emit_rewritten_node(e, db, func);
-                emit(e, ";\n");
+                emit_defer_stmt(e, db, func);
             }
         }
         if (pop) e->defer_stack.count = base;
         break;
     }
 
-    case IR_INTRINSIC: {
-        /* IR_INTRINSIC no longer created by lowering — all go through IR_ASSIGN.
-         * Dead code guard. */
-        emit_indent(e);
-        emit(e, "/* IR_INTRINSIC dead — should be IR_ASSIGN */\n");
-        break;
-    }
+    case IR_INTRINSIC:
+        /* IR_INTRINSIC no longer created by lowering — all flow through
+         * IR_ASSIGN. Previous comment-emit silently miscompiled if a
+         * regression started emitting it again. Fail loudly instead. */
+        fprintf(stderr,
+            "INTERNAL ERROR: IR_INTRINSIC reached emitter (file=%s line=%d) — "
+            "lowering should route intrinsics through IR_ASSIGN. This is a "
+            "regression in ir_lower.c.\n",
+            e->source_file ? e->source_file : "?", inst->source_line);
+        abort();
 
     case IR_NOP:
         /* ASM, spawn, or switch pass-through */
@@ -9855,23 +9943,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP:
     case IR_SLICE_READ: {
-        /* Future: emit from local IDs. None of these are emitted by
-         * ir_lower today (the equivalent paths route through IR_ASSIGN +
-         * emit_rewritten_node). Audit-2026-05-08: emit a defensive trap
-         * instead of silent comment so a future lowering refactor that
-         * starts emitting these opcodes surfaces as a runtime failure
-         * rather than dropped operations. */
+        /* Dead-code guard: ir_lower.c does NOT emit these opcodes today
+         * (the equivalent paths route through IR_ASSIGN + emit_rewritten_node).
+         * Previous stub emitted a comment-only line that silently miscompiled
+         * if a refactor added emission. Now emit a runtime trap so the
+         * regression surfaces as a runtime failure rather than dropped
+         * operations. To restore lowering: implement emission AND remove
+         * this guard. */
         emit_indent(e);
         emit(e, "_zer_trap(\"IR opcode %d not implemented\", "
                 "__FILE__, __LINE__);\n", inst->op);
         break;
     }
-
-    default:
-        emit_indent(e);
-        emit(e, "/* IR op %d not yet implemented */\n", inst->op);
-        break;
     }
+    /* Exhaustive switch on IROpKind. `default:` removed 2026-05-10 — the
+     * old default emitted a comment-only stub (silent miscompile). If a new
+     * IROpKind is added without a case, GCC -Wswitch flags it at compile
+     * time. (IR_NOP is handled in the case block above.) */
 }
 
 /* Emit a regular (non-async) function from IR */

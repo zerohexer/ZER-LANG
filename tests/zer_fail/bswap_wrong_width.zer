@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// @bswap16 must receive a 16-bit (u16/i16) argument; passing u32 silently
+// truncates upper bits when GCC lowers __builtin_bswap16. Spec (D-Alpha-2):
+//   @bswap16(u16) -> u16
+//   @bswap32(u32) -> u32
+//   @bswap64(u64) -> u64
+
+void main() {
+    u32 x = 0x11223344;
+    u16 y = @bswap16(x);
+}

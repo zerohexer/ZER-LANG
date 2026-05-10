@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Cross-pool detection on COMPOUND handle (struct field).
+// `pool_a.alloc()` stored in `b.h`, then `pool_b.free(b.h)` — must error.
+// Bug: zercheck_ir IR_ASSIGN compound handle registration dropped pool_name.
+
+struct Task { u32 id; }
+
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+struct Box { Handle(Task) h; }
+
+void free_wrong_compound() {
+    Box b;
+    b.h = pool_a.alloc() orelse return;
+    pool_b.free(b.h);
+}

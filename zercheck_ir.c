@@ -874,13 +874,6 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
-/* Backward-compat wrapper for callsites that don't have Checker handy.
- * Without checker, receiver-type validation is skipped (current behavior).
- * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
-static IRMethodKind ir_classify_method_call(Node *call) {
-    return ir_classify_method_call_ex(NULL, call);
-}
-
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
  * for `pool.alloc()` style calls (returns "pool"). Returns {NULL, 0}
@@ -1991,13 +1984,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                                  &root_local, &path,
                                                  &path_len) == 0 &&
                         path_len > 0) {
-                        /* UAF GUARD (BUG-617 family, restored in audit
-                         * 2026-04-29): rh points into ps->handles which
-                         * ir_add_compound_handle below can realloc.
-                         * Snapshot fields BEFORE the add. */
+                        /* UAF GUARD (BUG-617 family + MLXDT F3.2 pool_name):
+                         * rh points into ps->handles which ir_add_compound_handle
+                         * below can realloc. Snapshot ALL fields BEFORE the add. */
                         int s_alloc_line = rh->alloc_line;
                         int s_alloc_id = rh->alloc_id;
                         int s_color = rh->source_color;
+                        const char *r_pool = rh->pool_name;
+                        uint32_t r_pool_len = rh->pool_name_len;
                         IRHandleInfo *ch = ir_add_compound_handle(ps,
                             root_local, path, path_len);
                         if (ch) {
@@ -2005,6 +1999,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             ch->alloc_line = s_alloc_line;
                             ch->alloc_id = s_alloc_id;
                             ch->source_color = s_color;
+                            ch->pool_name = r_pool;
+                            ch->pool_name_len = r_pool_len;
                         }
                     }
                 }
@@ -4001,9 +3997,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (already) continue;
             if (covered_n >= covered_cap) {
-                covered_cap = covered_cap < 8 ? 8 : covered_cap * 2;
-                int *nc = (int *)realloc(covered_ids, covered_cap * sizeof(int));
-                if (nc) covered_ids = nc;
+                int new_cap = covered_cap < 8 ? 8 : covered_cap * 2;
+                int *nc = (int *)realloc(covered_ids, new_cap * sizeof(int));
+                if (nc) {
+                    covered_ids = nc;
+                    covered_cap = new_cap;
+                }
+                /* On OOM: covered_cap unchanged, covered_n stays >= covered_cap,
+                 * so the write below is skipped — preserves buffer integrity. */
             }
             if (covered_n < covered_cap)
                 covered_ids[covered_n++] = h->alloc_id;
@@ -4077,9 +4078,12 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 /* Remember this alloc_id so we don't report twice */
                 if (reported_n >= reported_cap) {
-                    reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
-                    int *nr = (int *)realloc(reported_ids, reported_cap * sizeof(int));
-                    if (nr) reported_ids = nr;
+                    int new_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                    int *nr = (int *)realloc(reported_ids, new_cap * sizeof(int));
+                    if (nr) {
+                        reported_ids = nr;
+                        reported_cap = new_cap;
+                    }
                 }
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
@@ -4100,10 +4104,13 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     (int)func->locals[h->local_id].name_len,
                     func->locals[h->local_id].name);
                 if (reported_n >= reported_cap) {
-                    reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                    int new_cap = reported_cap < 8 ? 8 : reported_cap * 2;
                     int *nr = (int *)realloc(reported_ids,
-                        reported_cap * sizeof(int));
-                    if (nr) reported_ids = nr;
+                        new_cap * sizeof(int));
+                    if (nr) {
+                        reported_ids = nr;
+                        reported_cap = new_cap;
+                    }
                 }
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
@@ -4143,13 +4150,25 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 "add th.join() or detach explicitly",
                 (int)t->name_len, t->name);
             if (rn_count >= rn_cap) {
-                rn_cap = rn_cap < 4 ? 4 : rn_cap * 2;
+                int new_cap = rn_cap < 4 ? 4 : rn_cap * 2;
                 const char **nn = (const char **)realloc(reported_names,
-                    rn_cap * sizeof(char *));
+                    new_cap * sizeof(char *));
                 uint32_t *nl = (uint32_t *)realloc(reported_name_lens,
-                    rn_cap * sizeof(uint32_t));
-                if (nn) reported_names = nn;
-                if (nl) reported_name_lens = nl;
+                    new_cap * sizeof(uint32_t));
+                /* Both reallocs must succeed; otherwise, the two arrays
+                 * could desync (cap bumped + only one ptr updated → OOB
+                 * write on the un-grown side). On any failure, leave
+                 * cap and pointers unchanged so the rn_count check
+                 * below skips the write. */
+                if (nn && nl) {
+                    reported_names = nn;
+                    reported_name_lens = nl;
+                    rn_cap = new_cap;
+                } else {
+                    /* Free the half that succeeded to avoid leaking. */
+                    if (nn && !nl) reported_names = nn;  /* keep, will be freed at end */
+                    if (nl && !nn) reported_name_lens = nl;
+                }
             }
             if (rn_count < rn_cap) {
                 reported_names[rn_count] = t->name;

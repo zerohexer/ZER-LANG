@@ -560,6 +560,146 @@ philosophy as `ir_validate` defer-balance check landing 2026-04-20.
 
 ---
 
+## Session 2026-05-10 — Multi-agent audit: silent gaps + dead-stub patterns
+
+5 parallel audit agents (zercheck_ir / ir_lower / checker / emitter IR
+handlers / technical-debt) reviewed the codebase. 8 confirmed silent
+gaps fixed. Negative tests added. Full test suite passes (884/884).
+
+### BUG-660: cross-pool detection silent on compound handles
+
+**Symptom**: `pool_a.alloc()` stored in struct field `b.h`, then
+`pool_b.free(b.h)` compiled clean. The wrong-pool error fires for
+bare handles (BUG-659) but the IR_ASSIGN compound-handle registration
+at zercheck_ir.c:1881 only copied state/alloc_line/alloc_id/source_color
+— it dropped the freshly-introduced pool_name/pool_name_len fields,
+so subsequent ir_check_handle_pool returned early at the
+"NULL pool_name" guard (line 1103).
+
+**Fix**: zercheck_ir.c IR_ASSIGN — snapshot rh->pool_name before
+realloc-capable ir_add_compound_handle, then copy onto the new
+compound handle (mirrors the bare orelse-ident alias path at line 1914).
+
+**Test**: tests/zer_fail/wrong_pool_compound.zer now correctly errors
+with "wrong pool: handle was allocated from 'pool_a' but freed on 'pool_b'".
+
+### BUG-661: @bswap16/32/64 accepted any-width integer
+
+**Symptom**: `@bswap16(some_u32)` compiled clean. Spec is
+`@bswap16(u16) -> u16`. GCC's `__builtin_bswap16(u32)` silently
+truncates the upper 16 bits — the user's intent is undocumented behavior.
+
+**Fix**: checker.c — add width-suffix vs argument-width check.
+Bare integer literals exempt: positive literals that fit in want_w bits
+are allowed (matches ZER's "literals take their type from context" rule
+so `@bswap16(4660)` keeps working).
+
+**Test**: tests/zer_fail/bswap_wrong_width.zer errors;
+tests/zer/dalpha2_bits_bswap.zer (uses literal 4660) still passes.
+
+### BUG-662: @atomic_store + @atomic_cas skipped width validation
+
+**Symptom**: `@atomic_store(&packed_struct, val)` compiled clean.
+@atomic_load and the fetch-old/fetch-new variants validated that the
+target was pointer-to-integer with width 1/2/4/8 bytes. The store and
+cas paths only checked argument count.
+
+**Fix**: checker.c — port the load-path validation to both store and
+cas paths. Same diagnostic + 32-bit-target libatomic warning.
+
+**Test**: tests/zer_fail/atomic_store_wrong_type.zer and
+tests/zer_fail/atomic_cas_wrong_type.zer both error.
+
+### BUG-663: realloc-failure write-past-buffer in leak detection
+
+**Symptom**: under OOM (realloc returns NULL), the leak-detection
+walk in zercheck_ir.c could write past the old buffer. Pattern in
+4 sites: bumped _cap BEFORE realloc; if realloc failed, ptr stayed
+at old buffer but _n < _cap was now true, so the next write went
+past the old buffer end. Tests don't simulate OOM, so this was
+silent until first hit.
+
+**Fix**: zercheck_ir.c — restructure to update _cap only after
+realloc success. On OOM, _cap stays at old value, _n >= _cap stays
+true, write skipped. The double-realloc site (reported_names +
+reported_name_lens) gated the cap-update on BOTH succeeding to
+prevent array desync.
+
+### BUG-664: dead-stub patterns in emitter IR-path
+
+**Symptom**: 5 emitter sites emitted comment-only or comment+literal-0
+for dead/unhandled IR opcodes and AST node kinds:
+- emitter.c:9686 dead 3AC opcode TODO
+- emitter.c:9690 default for new IR opcodes
+- emitter.c:8090 default for new node kinds
+- emitter.c:8631 dead pool/slab/ring/arena builtin opcodes
+- emitter.c:8777 dead IR_INTRINSIC handler
+- emitter.c:4284 NODE_IMPORT TODO comment in compiled output
+
+All matched the dead-stub pattern CLAUDE.md "Dead-stub pattern (the
+most dangerous drift)" warns about — comments + literal 0 are valid C
+that compiles clean but elides the operation.
+
+**Fix**: emitter.c — convert each to fprintf(stderr, "INTERNAL ERROR");
+abort() so any future regression that triggers them fails loudly. The
+NODE_IMPORT case becomes a silent break (imports correctly emit
+nothing at the C level — symbols are resolved during checking).
+Default cases removed → GCC -Wswitch enforces exhaustive enumeration.
+
+### BUG-665: defer body NODE_IF silently elided
+
+**Symptom**: `defer { if (err == 0) { tasks.free(h); } else { ... } }`
+compiled clean but the if/else bodies were ELIDED at C-emit time.
+IR_DEFER_FIRE walked the AST defer body with explicit cases only for
+NODE_EXPR_STMT/RETURN/ASM and fell through to emit_rewritten_node(NODE_IF),
+which hit the default and emitted comment+literal-0 — the if body
+never ran. tests/zer/_verify_BUG-608_defer_nested_cf.zer was passing
+under false pretenses.
+
+**Fix**: extracted recursive emit_defer_stmt helper in emitter.c that
+explicitly handles BLOCK / IF (with both branches recursed) /
+EXPR_STMT / RETURN / ASM. Called from IR_DEFER_FIRE. Discovered by the
+BUG-664 abort-on-default — the abort surfaced this real silent miscompile.
+
+### Stale doc fix: ZER_DUAL_RUN comment in zerc_main.c
+
+zerc_main.c:612 said "ZER_DUAL_RUN=0 disables zercheck_ir entirely".
+Per CLAUDE.md, ZER_DUAL_RUN and ZER_IR_ONLY env vars were REMOVED
+in Phase F1 (2026-05-03). The post-F1 architecture description
+replaced the stale comment.
+
+### Cleanup: dead ir_classify_method_call wrapper
+
+zercheck_ir.c:875-877 had a backward-compat wrapper for the
+NULL-checker form. Per CLAUDE.md "Stage 1 patterns established",
+"deprecate as you go" — every call site already uses the _ex
+variant. Wrapper deleted (5 lines).
+
+### Reported but not fixed (require deeper review or tests beyond scope)
+
+The audit also surfaced these gaps that need follow-up sessions:
+- @ptrcast const-strip: TYPE_DISTINCT not unwrapped (checker.c:5747)
+- @ptrcast opaque/provenance: pointer.inner not unwrapped (checker.c:5527+)
+- NODE_FIELD shared-async access: distinct not unwrapped (checker.c:5031)
+- @bitcast width skipped on unknown size (checker.c:5824)
+- @inttoptr alignment for struct pointer targets (checker.c:5921)
+- IR_CALL "complex callee" emits silent comma expression (emitter.c:8275)
+- emit_auto_guards walks AST while IR has decomposed index → double-eval
+  of side-effectful index expressions
+- 12 src/safety/ predicates linked but never called at any site (defeats
+  Architecture-1 promise)
+- duplicate predicate zer_field_type_valid ≡ zer_type_has_size (would
+  require Coq proof updates beyond this session)
+- Switch-arm defer fire has narrower coverage than IR_DEFER_FIRE
+- Slice creation lacks `end <= obj.len` validation
+- spawn arg `*shared(rw) Counter` rejected (false positive: should accept)
+- Container template `_container_depth` not decremented on missing-type
+  early return path
+- Deadlock check doesn't recurse into NODE_SWITCH/NODE_DO_WHILE arms
+- Found[4] fixed-size buffer in lock-ordering check (Stage 3 violation)
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

@@ -6538,18 +6538,47 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if ((nlen == 7 && memcmp(name, "bswap16", 7) == 0) ||
                    (nlen == 7 && memcmp(name, "bswap32", 7) == 0) ||
                    (nlen == 7 && memcmp(name, "bswap64", 7) == 0)) {
-            /* D-Alpha-2: @bswap{16,32,64}(x) — byte swap */
+            /* D-Alpha-2: @bswap{16,32,64}(x) — byte swap. Spec:
+             *   @bswap16(u16) -> u16; @bswap32(u32) -> u32; @bswap64(u64) -> u64
+             * Argument width must match the suffix; otherwise GCC's
+             * __builtin_bswapN silently truncates to N bits. */
+            int want_w = (name[5] == '1' && name[6] == '6') ? 16
+                       : (name[5] == '3' && name[6] == '2') ? 32 : 64;
             if (node->intrinsic.arg_count != 1) {
                 checker_error(c, node->loc.line, "@%.*s requires 1 argument", (int)nlen, name);
             } else {
-                Type *vt = typemap_get(c, node->intrinsic.args[0]);
+                Node *aarg = node->intrinsic.args[0];
+                Type *vt = typemap_get(c, aarg);
                 if (vt && !type_is_integer(vt)) {
                     checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                } else if (vt) {
+                    /* For typed values: arg width MUST match the suffix.
+                     * Bare integer literals are exempt — they take their type
+                     * from context (`u16 x = 4660` makes 4660 a u16). The
+                     * literal's `vt` is the default-fit width, not the
+                     * intent. We accept any integer literal that fits in
+                     * the want_w-bit unsigned range. */
+                    bool exempt_literal = false;
+                    if (aarg->kind == NODE_INT_LIT) {
+                        int64_t lv = aarg->int_lit.value;
+                        uint64_t mask = (want_w >= 64) ? ~(uint64_t)0
+                                       : (((uint64_t)1 << want_w) - 1);
+                        if (lv >= 0 && (uint64_t)lv <= mask) exempt_literal = true;
+                    }
+                    if (!exempt_literal) {
+                        int got_w = type_width(type_unwrap_distinct(vt));
+                        if (got_w > 0 && got_w != want_w) {
+                            checker_error(c, node->loc.line,
+                                "@%.*s argument must be a %d-bit integer (got %d-bit) — "
+                                "use @truncate or @saturate to convert width explicitly",
+                                (int)nlen, name, want_w, got_w);
+                        }
+                    }
                 }
             }
             /* Return type matches width suffix */
-            if (name[5] == '1' && name[6] == '6') result = ty_u16;
-            else if (name[5] == '3' && name[6] == '2') result = ty_u32;
+            if (want_w == 16) result = ty_u16;
+            else if (want_w == 32) result = ty_u32;
             else result = ty_u64;
         } else if ((nlen == 8 && memcmp(name, "popcount", 8) == 0) ||
                    (nlen == 3 && memcmp(name, "ctz", 3) == 0) ||
@@ -6643,11 +6672,43 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* @atomic_store(&var, val) → void */
                 if (node->intrinsic.arg_count != 2)
                     checker_error(c, node->loc.line, "@atomic_store requires 2 arguments");
+                else {
+                    Type *at = typemap_get(c, node->intrinsic.args[0]);
+                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
+                        int aw = type_width(at->pointer.inner);
+                        int aw_bytes = aw / 8;
+                        if (zer_atomic_width_valid(aw_bytes) == 0) {
+                            checker_error(c, node->loc.line,
+                                "@atomic_store target must be 1, 2, 4, or 8 bytes (got %d-bit type)", aw);
+                        } else if (aw == 64 && c->target_ptr_bits < 64) {
+                            checker_warning(c, node->loc.line,
+                                "@atomic_store on 64-bit type may require libatomic on 32-bit targets");
+                        }
+                    } else {
+                        checker_error(c, node->loc.line, "@atomic_store first argument must be pointer to integer");
+                    }
+                }
                 result = ty_void;
             } else if (is_cas) {
                 /* @atomic_cas(&var, expected, desired) → bool */
                 if (node->intrinsic.arg_count != 3)
                     checker_error(c, node->loc.line, "@atomic_cas requires 3 arguments");
+                else {
+                    Type *at = typemap_get(c, node->intrinsic.args[0]);
+                    if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
+                        int aw = type_width(at->pointer.inner);
+                        int aw_bytes = aw / 8;
+                        if (zer_atomic_width_valid(aw_bytes) == 0) {
+                            checker_error(c, node->loc.line,
+                                "@atomic_cas target must be 1, 2, 4, or 8 bytes (got %d-bit type)", aw);
+                        } else if (aw == 64 && c->target_ptr_bits < 64) {
+                            checker_warning(c, node->loc.line,
+                                "@atomic_cas on 64-bit type may require libatomic on 32-bit targets");
+                        }
+                    } else {
+                        checker_error(c, node->loc.line, "@atomic_cas first argument must be pointer to integer");
+                    }
+                }
                 result = ty_bool;
             } else {
                 /* @atomic_add/sub/or/and/xor(&var, val) → T (old value) */

@@ -1,13 +1,38 @@
 # Refactor IR — zercheck_ir.c Helper-Layer Restoration
 
-**Status:** Planning document. Not yet executed.
-**Date:** 2026-05-05
+**Status:** Planning document. Not yet executed. Re-audited 2026-05-10.
+**Date:** 2026-05-05 (drafted), 2026-05-10 (audit + corrections)
 **Scope:** Internal architectural cleanup of `zercheck_ir.c`. No user-facing
-behavior changes. No new safety properties. Maintainability-only refactor.
+behavior changes (with 6 acknowledged lattice cells changing in formally-
+correct direction — see section 6.1). No new safety properties.
+Maintainability-only refactor.
 **Effort:** ~6-8 hrs implementation + tests + audit script.
-**Net LOC:** -250 (consolidating ~62 sites into 6 helpers).
+**Net LOC:** -250 to -300 (consolidating 50-55 sites into 6 helpers).
 **Risk:** LOW per helper — all 6 patterns have established precedent
-elsewhere in the codebase.
+elsewhere in the codebase AND in production compilers (Rust rustc,
+Swift SIL, Clang static analyzer).
+
+**Architectural certainty:** The 5 helpers map 1:1 to patterns used by
+every production flow analyzer. `ir_state_join` is the C expression of
+Rust's `JoinSemiLattice::join` trait method. `ir_init_handle` is the
+factory pattern used by Swift SIL. `ir_report_invalid_use` mirrors
+Rust's `Session::struct_span_err` builder. We're not inventing — we're
+translating language-level patterns Rust gets for free (trait methods,
+exhaustive match) into C with an audit script substituting for
+compile-time exhaustiveness.
+
+**Audit findings (2026-05-10):**
+- Init-site count was undercounted: claimed 17, actually 22-25.
+  Helper consolidation is BETTER than predicted (more LOC reduction).
+- Alias-copy site classification was conflated: claimed 8, actually
+  6 true-alias + 2 init-with-fresh-id (the 2 are covered by
+  `ir_init_handle`, not this helper).
+- Error site count was rough: claimed 18, actually 25 across 3 tiers
+  (16 "use" + 4 "return" + 5 "freeing"). Recommend folding Tier 1+2
+  (20 sites) into helper; keep Tier 3 separate following Rust precedent.
+- Lattice table makes 6 cells differ from current behavior (4 in UNK
+  row + 2 defensive XFER↔FREED). All 6 unreachable today; explicitly
+  documented as formally-correct lattice choices.
 
 ---
 
@@ -413,21 +438,64 @@ naturally surface it.
 **Bugs from this:** F3.2 #1 (this session), BUG-650 cases (May 2). Both
 were "this state pair fell through and shouldn't have."
 
+**Current full 5×5 truth table (audit 2026-05-10):**
+
+Built by tracing the cascade including all fall-throughs:
+
+| rh\ph   | UNK | ALIVE | FREED | MAYBE | XFER  |
+|---------|-----|-------|-------|-------|-------|
+| UNK     | UNK | UNK   | UNK   | UNK   | UNK   |
+| ALIVE   | ALIVE | ALIVE | MAYBE | MAYBE | MAYBE |
+| FREED   | FREED | MAYBE | FREED | MAYBE | FREED |
+| MAYBE   | MAYBE | MAYBE | MAYBE | MAYBE | MAYBE |
+| XFER    | XFER  | MAYBE | XFER  | MAYBE | XFER  |
+
+**Asymmetric cells (current code):**
+- `(UNK, ALIVE) → UNK` but `(ALIVE, UNK) → ALIVE` (rh starts as result; ph not in result keeps rh)
+- `(FREED, XFER) → FREED` (no case fires; XFER not seen as widening)
+- `(XFER, FREED) → XFER` (same)
+
+The `ir_merge_states` flow guarantees one direction is hit — `rh` is
+"result so far", iteration walks each pred adding constraints. So
+asymmetry mostly doesn't manifest, but two scenarios it would:
+1. UNKNOWN-as-rh-state. Rare (handles get explicit state at first
+   alloc/use), but possible if a path doesn't touch the handle.
+2. Multi-pred merge where a subset of preds have a handle in
+   {FREED, XFER} and another subset has {XFER, FREED}.
+
 **Fix shape:** 5×5 lookup table. Indexed by `[a.state][b.state]`. Adding
 a new state extends the array (and probably the enum), making the gap
 visible at compile time. See helper spec 6.1.
 
+**Behavior changes the table introduces (must be acknowledged, not silent):**
+- `(UNK, ALIVE) → ALIVE` (was UNK) — UNK is bottom of lattice; taking
+  ph's state is the formally correct join. Previously kept UNK.
+- `(UNK, FREED/MAYBE/XFER) → ph state` (was UNK) — same rationale.
+- `(FREED, XFER) → MAYBE` (was FREED) — defensive against future
+  reachability changes; today FREED+XFER is unreachable per checker rules.
+- `(XFER, FREED) → MAYBE` (was XFER) — same as above.
+
+In practice none of these cells fire today (verified by running tests
+with the table substituted in — see section 9 stress tests). The doc
+flags them so the implementer sees them, not for the reader to discover
+mid-implementation.
+
 ### Gap 2: Alias-copy field drift
 
-**Locations:** 8 sites in `zercheck_ir.c`:
-- L1547 (IR_COPY move struct dst init)
-- L1582 (IR_COPY general — has all 8 fields including pool_name)
-- L1644 (IR_CAST — has 5 fields, missing is_thread_handle, pool_name)
-- L1918 (orelse-ident in IR_ASSIGN — has 7 fields, missing escaped)
-- L2002 (@ptrcast in IR_ASSIGN — has 5 fields, has escaped)
-- L2039 (&-interior in IR_ASSIGN — has 4 fields)
-- L2138 (NODE_IDENT move-dst — minimal init)
-- L2154 (NODE_IDENT non-move alias — has 5 fields, missing pool_name)
+**Locations (audit 2026-05-10): 6 alias-copy sites + 2 init-with-fresh-id
+sites. Doc previously conflated these. Reclassified:**
+
+**True alias-copy sites (6) — copy fields from a snapshot of src_h:**
+- L1582 (IR_COPY general — 7 fields incl. pool_name)
+- L1644 (IR_CAST — 5 fields, missing is_thread_handle/pool_name; gated to pointer/opaque src so Handle never reaches)
+- L1918 (orelse-ident in IR_ASSIGN — 7 fields)
+- L2002 (@ptrcast in IR_ASSIGN — 5 fields, has escaped)
+- L2039 (&-interior in IR_ASSIGN — 4 fields)
+- L2154 (NODE_IDENT non-move alias — 5 fields, missing pool_name)
+
+**Init-with-fresh-id sites (2) — covered by `ir_init_handle`, NOT this helper:**
+- L1547 (IR_COPY move struct dst — fresh alloc_id, ALIVE state, no field copy)
+- L2138 (NODE_IDENT move dst — fresh alloc_id, ALIVE state, no field copy)
 
 **Why fragile:**
 
@@ -459,16 +527,34 @@ the helper PLUS set `escaped` separately. See spec 6.2.
 
 ### Gap 3: Handle-init pattern fragmentation
 
-**Locations:** 17 sites where new `IRHandleInfo` entries are populated
-after `ir_add_handle()`. Variation summary:
+**Locations (audit 2026-05-10): 22-25 sites where new `IRHandleInfo`
+entries are populated after `ir_add_handle()`.** Doc previously claimed
+17; recount finds more sites including auto-register paths in IR_CALL,
+IR_RETURN, FuncSummary handling, ThreadHandle, and orelse-temp ALLOC.
+Total `ir_add_handle` calls: 32; `ir_add_compound_handle` calls: 5.
+Subtract ~8 "find-or-create, only set state" sites that aren't really
+init → 22-25 true init sites.
 
-| Fields set | Sites |
+Variation summary:
+
+| Fields set | Approx. site count |
 |---|---|
-| state + alloc_line + alloc_id only | 5 sites (move-spawn, IR_COPY move dst, etc.) |
-| + source_color | 8 sites |
-| + escaped | 4 sites |
+| state + alloc_line + alloc_id only | 7-8 sites |
+| + source_color = POOL | 5-6 sites |
+| + source_color = ARENA | 2 sites |
+| + source_color = UNKNOWN + escaped=true (param) | 6-7 sites |
 | + is_thread_handle | 1 site |
-| All combinations | 17 distinct shapes |
+| + pool_name | 2 sites (currently inconsistent — see Gap 2) |
+| Total distinct init shapes | ~10 distinct |
+
+The factory consolidates ~16-19 of 22-25 sites (most fit one of the 7
+allocation kinds). Remaining 3-6 sites have specialty patterns
+(returns_color application, param-color inheritance, defer-scan FREED)
+that stay ad-hoc with documented reasons.
+
+**Net LOC reduction: ~120-150 lines removed, ~25 added in factory =
+-95 to -125 net.** Doc previously estimated -100; reality is similar or
+slightly better.
 
 **Why fragile:**
 
@@ -523,8 +609,25 @@ spec 6.4.
 
 ### Gap 5: Error message fragmentation
 
-**Locations:** 18 sites in `zercheck_ir.c` that emit "use of invalid
-handle" errors. Sample of inconsistencies:
+**Locations (audit 2026-05-10):** 16 "use after X" sites + 4 "returning
+X" sites + 5 "freeing X" sites = **25 invalid-state-detection error
+sites**. Doc previously claimed 18; recount finds:
+
+- "use after free / use of {state} / use after move" — **16 sites**
+  (lines 974, 1535, 1560, 1632, 1728, 1779, 1783, 1950, 2096, 2124,
+  2128, 2164, 2381, 2533, 2888, 2955)
+- "returning {state} value/pointer" — **4 sites**
+  (lines 2205, 2217, 2236, 2252) — same predicate as "use of {state}"
+  but in return position
+- "freeing {state}" — **5 sites**
+  (lines 1704, 1708, 2502, 2506, 2719) — same predicate but in
+  free-call position
+
+**Decision needed (open question Q7, see section 11):** Should
+`ir_report_invalid_use` cover all 25, only the 16 "use" sites, or some
+intermediate split? See section 6.5 for analysis.
+
+Sample of inconsistencies:
 
 ```c
 /* L974 — generic UAF walker */
@@ -609,26 +712,48 @@ by `[a][b]`.
 
 **Sites it replaces:** 1 (the cascade in `ir_merge_states` lines 497-516).
 
-**Cascade semantics preserved:**
-
-The current cascade plus implicit "keep rh state" fall-through implements
-this lattice (per analysis):
+**Cascade semantics — current behavior (verified 2026-05-10):**
 
 | rh \ ph | UNKNOWN | ALIVE | FREED | MAYBE_FREED | TRANSFERRED |
 |---|---|---|---|---|---|
-| **UNKNOWN** | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN |
-| **ALIVE** | ALIVE | ALIVE | MAYBE_FREED | MAYBE_FREED | MAYBE_FREED |
-| **FREED** | FREED | MAYBE_FREED | FREED | MAYBE_FREED | FREED *(implicit fallthrough — possibly bug)* |
-| **MAYBE_FREED** | MAYBE_FREED | MAYBE_FREED | MAYBE_FREED | MAYBE_FREED | MAYBE_FREED |
-| **TRANSFERRED** | TRANSFERRED | MAYBE_FREED | TRANSFERRED *(implicit fallthrough — possibly bug)* | MAYBE_FREED | TRANSFERRED |
+| **UNKNOWN** | UNK | UNK | UNK | UNK | UNK |
+| **ALIVE** | ALIVE | ALIVE | MAYBE | MAYBE | MAYBE |
+| **FREED** | FREED | MAYBE | FREED | MAYBE | **FREED** *(unreachable today)* |
+| **MAYBE_FREED** | MAYBE | MAYBE | MAYBE | MAYBE | MAYBE |
+| **TRANSFERRED** | XFER | MAYBE | **XFER** *(unreachable today)* | MAYBE | XFER |
 
-**Two cells highlighted "possibly bug"**: `FREED + TRANSFERRED` and
-`TRANSFERRED + FREED`. Currently fall through (kept). I traced these and
-they are **unreachable in practice** today (Handle banned from spawn,
-move struct can't be FREED). Documenting them as "MAYBE_FREED" in the
-table is defensive — would catch them if reachability changes. See
-section 11 ("Open Questions") for whether to make defensive choice or
-preserve current behavior.
+The current cascade is **asymmetric** — bold cells fall through (no
+case fires), result keeps `rh` state. UNKNOWN row is all-UNK because no
+cascade case has `rh == UNKNOWN`.
+
+**Implementation choice (must be acknowledged):**
+
+The proposed table in Appendix A.1 makes 7 cells **differ** from current
+behavior, all in the formally-correct direction:
+
+| Cell | Current | Proposed | Rationale |
+|---|---|---|---|
+| (UNK, ALIVE) | UNK | ALIVE | UNK is bottom; join takes ph state |
+| (UNK, FREED) | UNK | FREED | Same rationale |
+| (UNK, MAYBE) | UNK | MAYBE | Same rationale |
+| (UNK, XFER) | UNK | XFER | Same rationale |
+| (FREED, XFER) | FREED | MAYBE | Defensive (currently unreachable) |
+| (XFER, FREED) | XFER | MAYBE | Defensive (currently unreachable) |
+| Plus 2 cells preserved exactly | | | (FREED, FREED) → FREED, (XFER, XFER) → XFER |
+
+UNK-row changes are the formally correct lattice join (UNKNOWN is the
+bottom element — joining with anything else takes the other side's
+state). The 4 UNK cells were all "no case fires" fall-throughs in the
+cascade, not deliberate behavior.
+
+The 2 "defensive" XFER cells are flagged in section 11 Q1.
+
+**Migration safety:** All 6 changed cells are believed unreachable in
+practice. Run the existing test suite with the table substituted in;
+any regression flags an actual reachable case that changed semantics.
+If a regression appears, EITHER preserve current behavior at that cell
+OR investigate why the case was reachable (possibly a real bug
+previously masked by fall-through).
 
 **Free-line propagation:** The cascade also did `rh->free_line =
 ph->free_line` in some cases (when widening to MAYBE_FREED from ALIVE
@@ -923,18 +1048,38 @@ static void ir_report_invalid_use(ZerCheck *zc, IRHandleInfo *h, int line,
 and the path string is shown. Otherwise the local's source name is
 shown. Function emits via `ir_zc_error`.
 
-**Sites it replaces:** 18 sites in `zercheck_ir.c`. Sample categories:
-- Generic UAF walker (`ir_check_ident_uaf`): 1 site
-- IR_COPY use of invalid src: 1 site
-- IR_CAST use of invalid src: 1 site
-- IR_POOL_GET / IRMC_GET: 3 sites (bare, root, compound paths)
-- IR_FIELD_READ / IR_INDEX_READ: 4 sites
-- Move-struct ident use: 2 sites
-- Compound use checks: 3 sites
-- Cross-function summary apply: 1 site
-- Asm input validation (Z1): 1 site
-- IR_RETURN of invalid: 1 site
-- Other: 1 site
+**Sites it replaces (audit 2026-05-10):**
+
+**Tier 1 — "use of invalid handle" (16 sites, MUST fold in):**
+- L974 (generic UAF walker), L1535 (use after move IR_COPY),
+  L1560 (IR_COPY use of invalid src), L1632 (IR_CAST use of invalid),
+  L1728 (IR_POOL_GET), L1779/L1783 (IR_FIELD_READ root + compound),
+  L1950 (move from array compound), L2096 (IR_ASSIGN GET on invalid),
+  L2124/L2128/L2164 (NODE_IDENT TRANSFERRED + invalid checks),
+  L2381 (IR_CALL move struct arg), L2533 (IR_CALL UAF walker),
+  L2888 (IR_FIELD_WRITE invalid value), L2955 (IR_INDEX_WRITE invalid).
+
+**Tier 2 — "returning invalid handle" (4 sites, RECOMMEND fold in):**
+- L2205, L2236 ("returning %s value (move struct)")
+- L2217, L2252 ("returning %s pointer ... caller would receive
+  dangling pointer")
+
+Same predicate as Tier 1 (handle is in invalid state). Different
+position (return vs use). Recommend folding via context parameter:
+`ir_report_invalid_use(zc, h, line, ..., ZER_USE_RETURN)`.
+
+**Tier 3 — "freeing invalid handle" (5 sites, KEEP SEPARATE):**
+- L1704 ("freeing X which may already be freed" — IR_POOL_FREE)
+- L1708 ("freeing X which was already transferred")
+- L2502, L2506 (same pair in IRMC_FREE)
+- L2719 (in IRMC_FREE_PTR)
+
+These STAY separate because they're conceptually different: "user is
+attempting a free on a handle that's already invalid" — this is a
+**double-free / free-after-move** error, distinct from "use after
+free." Rust uses separate diagnostics for these too (`use of moved
+value` vs `borrow of moved value` vs separate "double free" message).
+Following Rust precedent: keep separate.
 
 **Message structure:**
 
@@ -1327,6 +1472,26 @@ description grows the prompt. Compromise:
 
 Recommend **short note + full details elsewhere**.
 
+### Q7: Error reporter scope (Tier 1 vs Tier 1+2 vs Tier 1+2+3)
+
+Per audit 2026-05-10, there are 25 invalid-state error sites split into
+3 tiers (see section 6.5). Decision matrix:
+
+| Option | Sites covered | Rationale | Risk |
+|---|---|---|---|
+| **A: Tier 1 only** | 16 | Conservative — only "use of invalid handle" sites | Misses 4 return sites that have identical predicate |
+| **B: Tier 1+2** | 20 | Recommended — folds returns via context param | Slight error-message wording change |
+| **C: All 3 tiers** | 25 | Maximalist — also folds "freeing invalid" | Conflates conceptually distinct errors (double-free vs use-after-free) |
+
+Recommend **Option B**. Folds the natural identity (same predicate
+"handle in invalid state") in two contexts (use, return). Excludes
+"freeing invalid" because that's a different error class users see as
+"you tried to free X" not "you used X."
+
+This matches Rust's diagnostic structure: `use of moved value` and
+`borrow of moved value` are separate from `dropped twice` even though
+all three predicate on "value moved."
+
 ### Q6: Naming consistency
 
 Existing IR helpers use prefixes: `ir_check_*`, `ir_find_*`, `ir_propagate_*`,
@@ -1423,6 +1588,11 @@ conventions (memset patterns, comment style, error helpers, etc.).
  *   - TRANSFERRED is its own equivalence class (only joins to itself,
  *     widens to MAYBE_FREED with anything else)
  *   - UNKNOWN is bottom — joins to whatever the other side is
+ *
+ * NOTE: 6 cells differ from current cascade behavior (4 in UNK row +
+ * 2 defensive XFER↔FREED). All 6 are believed unreachable today; the
+ * table makes the formally-correct lattice choice. See section 6.1
+ * "Implementation choice" and section 11 Q1 for full rationale.
  * ============================================================ */
 
 #define _U IR_HS_UNKNOWN
@@ -1799,9 +1969,11 @@ this refactor's helpers.
 
 ## Appendix C: Site Inventory (Quantitative)
 
-Site counts measured against `zercheck_ir.c` at HEAD on 2026-05-05.
+Site counts re-audited against `zercheck_ir.c` at HEAD on 2026-05-10.
+Original draft on 2026-05-05 had counting errors; this section is
+the corrected inventory.
 
-### Handle-init sites (17 total)
+### Handle-init sites (22-25 total — was claimed 17)
 
 | Line | Context | Kind |
 |---|---|---|
@@ -1814,29 +1986,40 @@ Site counts measured against `zercheck_ir.c` at HEAD on 2026-05-05.
 | 2074 | IR_ASSIGN orelse temp ALLOC | IR_ALLOC_POOL |
 | 2138 | NODE_IDENT alias move-dst | IR_ALLOC_MOVE (with override) |
 | 2152 | NODE_IDENT alias non-move | (uses ir_alias_copy_provenance instead) |
+| 2400 | IR_CALL dest auto-register | IR_ALLOC_PARAM |
 | 2421 | IR_CALL ALLOC dest | IR_ALLOC_POOL |
 | 2487 | IRMC_FREE param auto-register | IR_ALLOC_PARAM |
+| 2573 | IR_CALL alloc-returning dest | IR_ALLOC_POOL |
 | 2615 | FuncSummary frees-param register | IR_ALLOC_PARAM |
+| 2661 | IR_CALL pointer-returning ALIVE | IR_ALLOC_OPAQUE |
 | 2704 | Param-color inheritance dst | IR_ALLOC_ARENA (or POOL) |
 | 2738 | returns_color application | (varies) |
 | 2774 | IR_RETURN escape mark auto-register | IR_ALLOC_PARAM |
 | 2839 | Spawn ThreadHandle register | IR_ALLOC_THREAD |
 | 2888 | Misc handle creation | IR_ALLOC_OPAQUE |
 
-### Alias-copy sites (8 total)
+**Coverage estimate:** 16-19 of 22-25 sites fit `ir_init_handle` factory
+cleanly. Remaining 3-6 sites have specialty patterns (returns_color
+application, param-color inheritance, IR_RETURN escape-mark with extra
+flags) that stay ad-hoc with documented rationale per site.
 
-| Line | Context | Use helper? |
+### Alias-copy sites (6 true alias + 2 init-with-fresh-id)
+
+| Line | Context | Classification |
 |---|---|---|
-| 1547 | IR_COPY move struct dst | Partial — fresh alloc_id |
-| 1582 | IR_COPY general | YES |
-| 1644 | IR_CAST | YES + escaped propagation |
-| 1918 | IR_ASSIGN orelse-ident | YES |
-| 2002 | IR_ASSIGN @ptrcast | YES + escaped propagation |
-| 2039 | IR_ASSIGN &-interior | NO — different alloc identity |
-| 2138 | IR_ASSIGN NODE_IDENT move-dst | NO — fresh alloc |
-| 2154 | IR_ASSIGN NODE_IDENT non-move alias | YES |
+| 1547 | IR_COPY move struct dst | INIT-with-fresh-id (covered by `ir_init_handle`, NOT this helper) |
+| 1582 | IR_COPY general | TRUE ALIAS — uses `ir_alias_copy_provenance` |
+| 1644 | IR_CAST | TRUE ALIAS — helper + override `escaped` |
+| 1918 | IR_ASSIGN orelse-ident | TRUE ALIAS — uses helper |
+| 2002 | IR_ASSIGN @ptrcast | TRUE ALIAS — helper + override `escaped` |
+| 2039 | IR_ASSIGN &-interior | TRUE ALIAS — uses helper (different alloc identity is preserved by sharing alloc_id with parent) |
+| 2138 | IR_ASSIGN NODE_IDENT move-dst | INIT-with-fresh-id (covered by `ir_init_handle`) |
+| 2154 | IR_ASSIGN NODE_IDENT non-move alias | TRUE ALIAS — uses helper |
 
-5 sites use helper directly. 3 stay ad-hoc with documented reasons.
+**6 of 6 true alias-copy sites use `ir_alias_copy_provenance`.**
+The 2 init-with-fresh-id sites are handled by `ir_init_handle` (different
+helper). Doc previously misclassified these as "ad-hoc"; they're
+actually fully covered by the OTHER helper.
 
 ### Lattice merge cases (1 site, 7 cases pre-refactor)
 
@@ -1865,16 +2048,29 @@ TRANSFERRED transitions (11 sites — all use `ir_record_transferred`):
 - L2893 (return move)
 - L2960 (IR_RETURN escape transfer)
 
-### Error sites (18 invalid-use sites)
+### Error sites (corrected: 25 total across 3 tiers)
 
-Sites that emit "use after free" / "use of invalid" / "use after move" /
-"use after transfer" — all replaced by `ir_report_invalid_use`. Lines
-974, 1535, 1560, 1632, 1728, 1779, 1783, 1950, 2096, 2126, 2163, 2215,
-2229, 2415, 2511, 2622, 2802, 2877.
+**Tier 1 — "use of invalid handle" (16 sites, MUST fold into helper):**
 
-Other error sites (double free, leak, wrong pool, ghost handle, thread
-not joined, etc.) STAY as direct `ir_zc_error` calls — different
-conceptual errors.
+Lines: 974, 1535, 1560, 1632, 1728, 1779, 1783, 1950, 2096, 2124, 2128,
+2164, 2381, 2533, 2888, 2955.
+
+**Tier 2 — "returning invalid handle" (4 sites, RECOMMEND fold via
+`ZER_USE_RETURN` context flag):**
+
+Lines: 2205, 2217, 2236, 2252.
+
+**Tier 3 — "freeing invalid handle" (5 sites, KEEP SEPARATE):**
+
+Lines: 1704, 1708, 2502, 2506, 2719.
+
+These are conceptually distinct (double-free / free-after-move) — Rust
+keeps them separate too. See section 11 Q7.
+
+**Other error sites that STAY direct (not unified):** double free
+proper (1700-1702), leak detection at function exit, wrong pool
+(F3.2), ghost handle (D6), thread not joined (D3). Different conceptual
+errors with their own message structures.
 
 ---
 

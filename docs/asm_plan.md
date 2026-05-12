@@ -1,5 +1,88 @@
 # ZER-Asm Verification Plan — Full Context Dump (2026-04-23)
 
+> ## ⚠️ STATUS UPDATE 2026-05-12 — PIVOTED. READ THIS FIRST.
+>
+> **The "make the compiler smart about specific instructions" direction
+> documented here has been SUPERSEDED for ongoing work.** See
+> [`docs/asm_lang_zer_safe.md`](asm_lang_zer_safe.md) for the new
+> direction (decided 2026-05-12).
+>
+> **What changed:** The original asm_plan committed to building a
+> per-instruction safety database (F4-F7 instruction tables, Session G
+> CFG OrderingState, Z9/Z10/Z13 forward-compat Z-rules). After
+> ~225 hours of work, the architectural realization: this approach
+> commits ZER to perpetual maintenance against an evolving silicon
+> ecosystem (new ISA extension = hundreds of new entries). It also
+> violates ZER's own architecture (smart language + generic compiler,
+> not smart compiler + database).
+>
+> **The pivot:** Make asm safety **annotation-driven** instead of
+> instruction-database-driven. User declares preconditions via operand
+> annotations (`requires: nonzero`, `align: 16`, `opens_state: X`);
+> compiler enforces via existing safety infrastructure (VRP, alignment,
+> state machines, context flags). Tiny implicit-precondition table
+> (~100 frozen well-known UB classics) provides auto-application for
+> common cases. Same safety coverage as full asm_plan. Zero ongoing
+> maintenance.
+>
+> ### Status of asm_plan items (as of 2026-05-12)
+>
+> **STAYS (already-shipped work — not removed):**
+> - 130 intrinsics (D-Alpha-1 through D-Alpha-14)
+> - Z-rules Z1-Z8, Z11, Z12 (10 of 13 wired)
+> - F2/F5/F6 register tables (auto-probed, vendored)
+> - F4 CPU feature gating (`--target-features=`)
+> - F7-light LR/SC state machine
+> - F7-full Step 2 constraints (NONZERO/ALIGNED/etc.)
+> - C8 ordering metadata (informational)
+> - Session A structured asm syntax
+> - Session B typed operand bindings
+> - Sub-extension architecture (3-arch validation)
+> - Naked-only restriction (S1)
+>
+> **STOPPED / DEFERRED:**
+> - Session G Phase 5 (CFG OrderingState, ~30-40 hrs)
+> - Z9, Z10, Z13 forward-compat Z-rules (~50 hrs)
+> - Adding more entries to F4-F7 instruction tables
+> - Naked-attribute migration
+> - Per-instruction database growth
+>
+> **NEW WORK (~3-4 months, see asm_lang_zer_safe.md):**
+> - Operand metadata extension (class, bits, role, mem_size, mem_align)
+> - Annotation processing (requires:, align:, opens_state:, etc.)
+> - Implicit-precondition table (~100 frozen classics)
+> - State-machine annotation generalization
+>
+> ### Why this doc is preserved
+>
+> This document captures the **journey** of the original design,
+> including the 8-universal-categories framework, Option C decision,
+> Sub-extension Architecture validation, and per-batch progress. That
+> context is valuable for fresh sessions understanding HOW the decisions
+> were reached. The implementation TRAJECTORY changes (pivot), but the
+> ARCHITECTURAL DECISIONS recorded here (GCC backend, naked-only,
+> intrinsic+raw asm split, 3-arch scope) are still active.
+>
+> **Read sequence for fresh sessions:**
+> 1. This warning block + Executive Summary (~5 min)
+> 2. `docs/asm_lang_zer_safe.md` end-to-end (~45 min) ← current direction
+> 3. This doc's Sub-Extension Architecture section (architectural decisions)
+> 4. This doc as reference only for HOW we got here (not WHERE we're going)
+>
+> **Do NOT:**
+> - Extend F4-F7 instruction tables based on this doc
+> - Start Session G Phase 5 based on this doc
+> - Implement Z9/Z10/Z13 based on this doc
+> - Treat the "remaining work" lists in this doc as current — they're
+>   historical
+>
+> Everything below this block is the original 2026-04-23 to 2026-05-02
+> trajectory, preserved for context. The decisions in
+> `asm_lang_zer_safe.md` SUPERSEDE the ongoing-work portions of this
+> document.
+
+---
+
 **Purpose:** This document captures the complete context from the Vale-tier verified asm design discussion so any fresh session can pick up exactly where we left off. Read this top-to-bottom if you are starting fresh on the asm verification work.
 
 > ## KEYWORD RENAME 2026-04-25 — applies throughout this document
@@ -2691,7 +2774,13 @@ escape hatch; the intrinsic is the productionized version.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Stage 4 status (updated 2026-05-02)
+### Stage 4 status (updated 2026-05-02; superseded 2026-05-12)
+
+> **⚠️ Items marked "NEXT" or "remaining" in this section have been
+> DEFERRED per the 2026-05-12 pivot. See top-of-file warning block and
+> `docs/asm_lang_zer_safe.md` for the new direction.**
+>
+> The "Already DONE" items below are still shipped and working.
 
 All concrete F-track work for Stage 4 is **DONE**:
 
@@ -2712,11 +2801,19 @@ All concrete F-track work for Stage 4 is **DONE**:
 | Session G Phase 3 (in-block enforcement) | ❌ ABANDONED 2026-05-02 — false-positive on multi-block CLWB+SFENCE idiom; see docs/asm_preconditions_research.md |
 | Session G Phase 5 (IR-level CFG OrderingState) | ⏳ NEXT — ~30-40 hrs (revised down from 80 after Phase 1+2 plumbing landed) |
 
-What's left in the asm-safety milestone:
+What's left in the asm-safety milestone (HISTORICAL — see 2026-05-12 pivot):
 
-1. **3 remaining Z-rules** (Z9, Z10, Z13) — forward-compat, blocked on S1 relaxation
-2. **Session G Phase 5 (IR-level CFG OrderingState)** (Stage 5) — atomic ordering enforcement (~30-40 hrs). Walks IR per-function, tracks barriers from BOTH asm blocks AND `@atomic_*` intrinsics, joins use set-intersection. Phase 1+2 already shipped the data plumbing.
-3. **F6-extensions (later)** — RISC-V V vector extension if demand emerges
+1. **3 remaining Z-rules** (Z9, Z10, Z13) — ~~forward-compat, blocked on S1 relaxation~~ → **DEFERRED indefinitely**. S1 is permanent; forward-compat not needed.
+2. **Session G Phase 5 (IR-level CFG OrderingState)** — ~~atomic ordering enforcement (~30-40 hrs)~~ → **DEFERRED indefinitely**. User-annotation approach in `asm_lang_zer_safe.md` covers the practical cases without compiler complexity.
+3. **F6-extensions (later)** — RISC-V V vector extension if demand emerges → **No instruction-table extensions planned** per pivot.
+
+**Active future work** is in `docs/asm_lang_zer_safe.md`:
+- Operand metadata extension (~2-3 weeks)
+- Annotation processing (~3-4 weeks)
+- Implicit-precondition table (~2 weeks)
+- State-machine annotation generalization (~2-3 weeks)
+- Tests + docs (~4-6 weeks)
+- Total ~3-4 months one-time, then zero maintenance
 
 **Stage 4 closed real silent gaps** today: BSR with unprovable nonzero,
 IDIV divisor, MOVAPS misaligned constants — all rejected at compile time

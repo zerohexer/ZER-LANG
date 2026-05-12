@@ -1301,9 +1301,33 @@ convert to stack-first dynamic OR add a one-line justification + the
 content line to `tools/fixed_buffer_baseline.txt`. Don't increase
 constants in fixed buffers — the rule is "stack fast path, arena overflow".
 
-## Stage 4 IN PROGRESS — D-Alpha-7.5 asm safety completion
+## Stage 4 PIVOTED 2026-05-12 — see docs/asm_lang_zer_safe.md
 
-**As of 2026-05-02:**
+**PIVOT NOTICE:** The "make compiler smart about specific instructions"
+direction (Session G Phase 5, Z9/Z10/Z13, more per-instruction DB
+growth) is **DEFERRED indefinitely**. New direction: annotation-driven
+asm safety per `docs/asm_lang_zer_safe.md` (the "smart language,
+generic compiler" approach).
+
+**What stays from asm_plan (already shipped):**
+- 130 intrinsics, Z1-Z8/Z11/Z12, F2/F4/F5/F6 register tables, F7-light
+  LR/SC, F7-full Step 2 constraints, C8 ordering metadata, Session A/B
+  syntax, naked-only restriction.
+
+**What's new (~3-4 months work in v1.x):**
+- Operand metadata, precondition annotations, ~100-entry implicit
+  table, state-machine annotation generalization. Reuses existing
+  Z-rules and safety infrastructure. Builds on Session A/B syntax.
+
+**Result:** Same safety as full asm_plan with ~3x less work and zero
+ongoing maintenance. Per-instruction DB frozen at ~120 entries (no
+growth per ISA extension).
+
+**For fresh sessions:** Read `docs/asm_lang_zer_safe.md` end-to-end
+before touching asm safety. The historical context below is preserved
+but the direction has changed.
+
+**As of 2026-05-02 (historical pre-pivot status):**
 
 | Sub-stage | Status | What was done |
 |---|---|---|

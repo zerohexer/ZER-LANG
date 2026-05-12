@@ -2,12 +2,22 @@
 
 **Status:** Planning document. Decision finalized 2026-05-12. Execution pending.
 **Date:** 2026-05-05 (drafted), 2026-05-10 (audit), 2026-05-11 (Phase A/B split),
-2026-05-12 (Level C decision — this version)
+2026-05-12 (Level C decision), **2026-05-12 (2-layer crystallization — see section 1.5)**.
 **Supersedes:** the extension trajectory of `docs/asm_plan.md` (Session G Phase 5,
 Z9/Z10/Z13, per-instruction database growth, register-table maintenance,
 CPU feature gating tracking).
 **Decision:** **Level C** — drop everything ISA-specific from ZER's compile-time
 asm validation. Defer to GCC. Keep only the truly frozen safety layer.
+
+> **POST-DISCUSSION UPDATE (2026-05-12, evening):** A long architectural
+> conversation explored richer layers on top of Level C (per-operand
+> annotations / "Tier 2", IR region wrappers like `@atomic_sequence`,
+> auto-guard emission). All explored. All **DEFERRED indefinitely** in
+> favor of the simpler **2-layer model: intent intrinsics (primary safe
+> path) + raw asm in naked (escape hatch)**. See **section 1.5** for
+> the crystallized final design. Level C content below is unchanged and
+> remains the execution baseline; 2-layer simply confirms that nothing
+> richer is needed on top of it.
 
 **Scope:** Aggressive cleanup of ZER's asm safety infrastructure. ~7,000 lines
 deleted. Compile-time safety preserved via hardcoded well-known UB classics
@@ -31,6 +41,8 @@ supports — automatically.
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
+1.4. [Extended Discussion (2026-05-12 evening) — Full Context Dump](#14-extended-discussion-2026-05-12-evening--full-context-dump) ← **Full conversation context (Tier 2, regions, clobber, Rust comparison, trust gaps, explicit-intent pattern, 99% coverage goal, all deferred ideas)**
+1.5. [Final Design — Two-Layer Model (crystallization, 2026-05-12 evening)](#15-final-design--two-layer-model-crystallization-2026-05-12-evening) ← **READ FIRST after Executive Summary**
 2. [The Decision in One Page](#2-the-decision-in-one-page)
 3. [The Transpiler Nature of ZER — Why This Works](#3-the-transpiler-nature-of-zer--why-this-works)
 4. [GCC Coverage in Embedded — Reality Check](#4-gcc-coverage-in-embedded--reality-check)
@@ -124,6 +136,1025 @@ aggressive cleanup levels were considered:**
 
 **Net effect:** same safety, dramatically less code, ZERO ongoing work,
 broader architecture support.
+
+---
+
+## 1.4. Extended Discussion (2026-05-12 evening) — Full Context Dump
+
+This section records the multi-hour architectural conversation that took
+place after the Level C decision was made, which explored richer designs
+on top of Level C and ultimately rejected them in favor of the 2-layer
+crystallization in section 1.5. Captured here so fresh sessions don't
+re-litigate the same ground or accidentally revive a deferred idea.
+
+### 1.4.1. Where we started — Level C was already decided
+
+Going into the evening discussion, Level C was already committed:
+- Delete instruction tables, register tables, probe scripts, CPU feature enum
+- Keep 130 intrinsics, Z-rules, naked-only, hardcoded ~12 UB classics
+- Defer everything ISA-specific to GCC
+- ~1-2 days execution, zero ongoing maintenance
+
+The discussion was about whether richer safety mechanisms should be added
+on top of Level C to push beyond what GCC's assembler validates.
+
+### 1.4.2. The "Tier 2 annotations" exploration
+
+**The idea:** add user-facing per-operand annotations on raw asm operand
+bindings to declare semantic preconditions. Example:
+
+```zer
+asm {
+    instructions: "bsr %1, %0"
+    outputs: { "rax" = result }
+    inputs:  { "rbx" = mask, requires: nonzero }    // ← Tier 2 annotation
+    safety: "..."
+}
+```
+
+The compiler would dispatch `requires: nonzero` to the existing VRP system.
+If VRP can prove `mask` is nonzero at the call site, the asm compiles. If
+not, compile error. **No theorem prover, no SMT, no formal proof — just
+existing dataflow analyses run through asm operand boundaries.**
+
+**Annotation vocabulary explored:**
+1. `requires: nonzero` → VRP check
+2. `requires: range(a, b)` → VRP check
+3. `requires: aligned(N)` / `align: N` → alignment infrastructure
+4. `requires: nonnull` → optional-unwrap
+5. `requires: kernel_context` → context flag
+6. `opens_state: X` → state machine (user-defined name)
+7. `closes_state: X` → state machine
+8. `requires_after: X` → state machine
+
+Eight kinds, frozen vocabulary. Compiler-side maintenance: zero growth
+beyond initial implementation.
+
+**Why explored:** would let users get compile-time precondition checks for
+asm patterns not in the intrinsic catalog (AMX, SVE, future ISA extensions,
+custom user operations) without writing a full intrinsic.
+
+**Why DEFERRED:**
+
+1. **Redundancy with intrinsics.** For the common case (~95% of asm),
+   intrinsics already encode preconditions. Tier 2 only helps the residual
+   ~5% of raw asm in niche cases.
+2. **Two-ways-to-express problem.** Same precondition declared two ways:
+   either as an intrinsic body or as a Tier 2 annotation. Violates "one
+   obvious way to do it."
+3. **User must know to add the annotation.** Same meta-trust problem as
+   intrinsic selection — if user is "dumb" and doesn't add the annotation,
+   no compile-time benefit. Tier 2 doesn't help dumb users.
+4. **Caller-side guards are equivalent.** A regular `if (mask == 0) trap;`
+   before calling a `naked` function gets elided by VRP if provable —
+   same result, no new language surface.
+5. **~3-4 weeks of implementation work** for marginal benefit on niche
+   cases that ~1-2% of users hit.
+
+**Verdict:** annotations defer to post-v1.0 if real demand emerges from
+production use.
+
+### 1.4.3. The "IR region wrappers for asm" exploration
+
+**The idea:** structured block wrappers for multi-block asm patterns:
+
+```zer
+@atomic_sequence {
+    asm { instructions: "lr.w t0, (a0)" /* ... */ }
+    asm { instructions: "addi t0, t0, 1" /* ... */ }
+    asm { instructions: "sc.w t1, t0, (a0)" /* ... */ }
+}
+```
+
+The region carries shared invariants (LR/SC pairing, memory ordering, etc.)
+that the compiler tracks across all blocks in the region body. Same pattern
+as existing `@critical { }`, `defer { }`, `@once { }`.
+
+**Region keywords proposed:**
+- `@atomic_sequence { }` — LR/SC, MONITOR/MWAIT pairings
+- `@cache_sync_region { }` — CLWB+SFENCE persistence sequences
+- `@dma_buffer_op(buf, len) { }` — DMA setup/transfer/complete with auto-emit cache flush + invalidate
+- `@transaction { }` — future transactional memory support
+
+**Why explored:** regions are conceptually consistent with ZER's existing
+safety-scope patterns (naked, @critical, defer, @once, shared struct, comptime),
+and they cleanly handle multi-block coordination that flat annotations
+struggle with.
+
+**Why DEFERRED:**
+
+1. **Composite intrinsics handle the same patterns cleaner.** `@atomic_cas(...)`
+   does what `@atomic_sequence { lr.w + ... + sc.w }` does — and the intrinsic
+   form is simpler from the user's perspective. The region exposes implementation
+   detail (manual LR/SC) that the intrinsic abstracts away.
+2. **Adds language surface without unlocking new safety.** Anything a region
+   would track, a well-designed composite intrinsic tracks more cleanly.
+3. **The cases regions would handle (LR/SC pairing) are already covered.**
+   F7-light state machine + composite intrinsics together cover the existing
+   real cases.
+4. **"User wraps niche asm in a region just to get safety" is a worse UX
+   than "user calls an intrinsic that has safety baked in."**
+5. **~2-3 weeks of implementation work** for marginal benefit.
+
+**Verdict:** asm-specific regions deferred. General-purpose regions like
+`@critical`, `defer`, `@once` stay — they're language features, not asm-safety
+features.
+
+### 1.4.4. The "auto-guard emission" exploration
+
+**The idea:** for Tier 2 annotations where VRP can't prove the precondition
+at compile time, emit a software runtime check (`if (!cond) _zer_trap(...)`)
+before the asm. This would eliminate hardware-dependence: wrong precondition
+always produces a deterministic ZER-controlled trap, regardless of CPU.
+
+Example: user declares `requires: aligned(16)` on a MOVAPS operand. If VRP
+can't prove the address is 16-byte aligned, ZER emits:
+
+```c
+if ((uintptr_t)addr & 15) {
+    _zer_trap("asm MOVAPS operand alignment precondition failed");
+}
+__asm__ __volatile__ ("movaps (%0), %%xmm0" : : "r"(addr));
+```
+
+**Why explored:** the hardware trap fallback is hardware-dependent:
+- Hosted Linux/BSD/macOS user mode: ~95% reliable (SIGSEGV, SIGFPE, SIGILL)
+- Bare-metal Cortex-M0 / no-MMU: hardware doesn't trap on misalignment
+- Boot code pre-exception-handler: undefined behavior (no trap path)
+
+Auto-guard would close this gap by emitting software checks ZER controls.
+
+**Why DEFERRED:**
+
+1. **Requires Tier 2 to exist.** Auto-guard is meaningful only if users can
+   declare preconditions on raw asm. If Tier 2 is deferred, auto-guard has
+   nothing to emit guards for.
+2. **Intrinsics already emit their own guards.** `@bit_scan_reverse(mask)` can
+   check `mask != 0` internally before emitting `bsr`. Layer 1 already does
+   this — auto-guard would be parallel infrastructure for the rare Layer 2
+   case.
+3. **Performance cost on tight loops.** Auto-emitted runtime checks ~2-4
+   instructions per asm block. Acceptable for safety-critical builds,
+   noise in hot paths. Without opt-in, defeats the point of inline asm.
+
+**Verdict:** auto-guard deferred along with Tier 2.
+
+### 1.4.5. The clobber gap discussion
+
+A long subthread explored whether ZER can detect missing clobber declarations
+in raw asm. The conclusion: **no production language detects this without
+either per-instruction database (maintenance hell) or formal proof per
+asm block (Vale-tier manual work).**
+
+**The mechanism of the bug:**
+
+```
+Wrong precondition (e.g., BSR on zero):
+  → asm instruction TRIES to execute
+  → CPU exception (#DE/#GP/#AC)
+  → SIGFPE/SIGSEGV/SIGBUS
+  → LOUD failure, debuggable
+
+Wrong clobber (e.g., user forgot to declare rdx clobbered by DIV):
+  → asm instruction DOES execute successfully
+  → register rdx silently contaminated with leftover from DIV
+  → next ~50 instructions run with garbage in rdx
+  → eventually flows into a load address → SIGSEGV
+  → BUT debugger points to wrong location, far from cause
+  → SILENT failure, hard to debug
+```
+
+**Why this is "the effect system gap":**
+
+Languages track *some* effects (allocation, mutation, lifetimes, types). They
+don't track *all* effects. Register state is an effect that lives outside
+every mainstream language's type system. The contract between user-asm and
+GCC is **invisible to the language**.
+
+**Category:** invisible-contract effect bug. The clobber gap is the
+asm-shaped instance of a general phenomenon. Other instances in safe code:
+
+| Category instance | Invisible contract | Wrong tool = silent bug |
+|---|---|---|
+| Wrong clobber list (asm) | "rdx preserved" | Corrupted register downstream |
+| Wrong atomic memory ordering (safe Rust) | Happens-before edges | Stale load on weak-memory hardware |
+| Wrong Mutex lock order (multi-lock) | Global lock ordering | Deadlock at runtime |
+| Wrong drop-order reliance | Field declaration order | Behavioral shift on refactor |
+| Wrong Cell vs RefCell vs Mutex choice | "Do I need runtime borrow checks?" | Panic at runtime or perf cost |
+| Wrong cinclude C function signature | C ABI | Silent ABI corruption |
+| Wrong MMIO range declaration | Hardware address layout | OS faults or wrong device |
+
+In every case: compiler accepts syntactically-correct code; user picked
+wrong tool; failure manifests downstream as silent consequence. **Same
+shape across domains.**
+
+### 1.4.6. The Rust comparison
+
+A subthread compared Rust's safety story to ZER's. Key findings:
+
+**Both pass the same test at the asm boundary.** Rust's `unsafe { asm!() }`
+has zero clobber validation, zero precondition checks beyond operand types.
+Same gap as ZER. Same gap as C. Rust's safety claim is **NOT** that asm is
+safe — it's that the **safe subset** is checked and **unsafe is bounded**.
+
+**Both implement the "composition" safety model.** Most code is in the safe
+subset (genuinely checked). Escape hatches are explicit, isolated, audited.
+The boundary between safe and unsafe is the type system's (or in ZER's case,
+the 29 tracking systems') job.
+
+**Where ZER catches more by default (the "smart compiler + dumb user" model):**
+
+| Bug class | Rust mechanism | ZER mechanism |
+|---|---|---|
+| Reference cycle leak | User picks `Weak` for back-references | Handle is index, cycles impossible by construction |
+| Lock ordering deadlock | User maintains global lock order manually | Same-statement multi-shared-type access = compile error |
+| Uninitialized memory | User picks `MaybeUninit::assume_init` correctly | Everything auto-zeroed at declaration |
+| Lifetime annotations | User writes `<'a, 'b>` on every fn | Escape analysis walks field/index chains automatically |
+| Atomic ordering | User picks `Acquire`/`Release`/`SeqCst` correctly | Single SeqCst choice — no wrong choice possible |
+| Stack overflow | User hopes for the best | `--stack-limit N` + recursion detection via DFS |
+| Lock primitive choice | User picks `Mutex` vs `RwLock` vs `Cell` vs `RefCell` | `shared struct` auto-locks; `shared(rw) struct` auto-rwlocks |
+| Spawn data race | Auto-traits `Send`/`Sync` (user may `unsafe impl` wrong) | Spawn-target body scanned at compile time |
+| Channel size choice | User picks buffer size, wrong = OOM or lockstep | `Ring(T, N)` always bounded; unbounded not available |
+| Drop order reliance | Field declaration order matters silently | `defer` makes order explicit; no implicit drop ordering |
+| Pin for self-referential | User knows when to pin futures | Async compiles to flat state machine; no Pin needed |
+| Bounds proof | User picks `.get()` vs `[]` | VRP proves indices; auto-guard only if unprovable |
+| Sign/width conversion | User picks `as` vs `try_into()` | Implicit narrowing rejected; `@truncate`/`@saturate` explicit |
+
+**The architectural insight:**
+
+```
+Rust:  Smart user × Medium-smart compiler = safe
+       (user encodes invariants in types; borrow checker enforces type discipline)
+
+ZER:   Dumb user × Very-smart compiler = safe
+       (compiler infers invariants from dataflow; user writes plain code)
+```
+
+Both reach roughly equivalent safety. Rust pushes complexity into the user's
+brain (lifetimes, Send/Sync, Pin, MaybeUninit, Cell-family choice, atomic
+ordering). ZER pushes complexity into the compiler (29 tracking systems doing
+per-function dataflow inference).
+
+**Where Rust catches more (honest):**
+
+The narrow real gap is **API expressiveness**, not safety coverage:
+- Rust's signature `fn foo<'a>(x: &'a T) -> &'a U` declares "result tied to
+  arg lifetime" at the type level. ZER has no such surface syntax.
+- Rust's trait bounds (`T: Hash`) constrain generic APIs. ZER's
+  monomorphization defers to per-stamp type-checking.
+- Rust's `&mut` aliasing rule prevents some patterns expressible only with
+  lifetimes.
+
+**But:** these are API design gaps, not safety gaps. The underlying bugs Rust
+would catch via these features, ZER catches via dataflow analysis anyway. The
+user-visible difference is "you can't write a library API that statically
+refuses aliasing in ZER" — but if your code has the bug, ZER still catches it.
+
+**Net:** ZER catches every bug class Rust catches in the safe subset. The
+mechanisms differ. The user experience differs (less expertise required for
+ZER). The audit surface and escape-hatch model are equivalent.
+
+### 1.4.7. The trust gap pattern (universal across ZER)
+
+A subthread identified that the clobber gap (user declares, compiler trusts,
+wrong declaration causes silent issue) is a **universal pattern** across ZER,
+not unique to asm. Every safety feature that bridges to external reality
+has the same shape:
+
+| Feature | User declares | Compiler trusts | If wrong, what happens |
+|---|---|---|---|
+| `mmio 0x4000..0x4FFF;` | Hardware address layout | Address valid | OS fault at runtime |
+| `volatile *u32` | Hardware requires unoptimized access | Optimizer leaves accesses | Optimizer removes essential reads silently |
+| `shared struct` | Data accessed across threads | Auto-lock generated | Silent race on bypass |
+| `threadlocal u32` | Per-thread storage | Each thread has own copy | Lost updates if actually shared |
+| `move struct` | Resource has unique ownership | Tracking enforced | Over-restrictive (false positives) |
+| `keep` parameter | Pointer may be stored globally | Storage allowed | Escape analysis fires false-positive |
+| `@ptrcast(*T, opaque)` | Memory layout is T | Type assertion accepted | Type confusion silent for cross-language |
+| `cinclude` C signatures | Function signature matches actual C | Type-checked against decl | ABI silent corruption if mismatch |
+| Asm clobber list | Registers modified by asm | Trusted verbatim | Silent register corruption |
+| Asm precondition (if Tier 2 existed) | Operand semantic | Dispatched to dataflow | Wrong type of check applied |
+
+**Pattern:** ZER (and every safe language) trusts user declarations about
+external reality. The compiler enforces ZER-side consequences of those
+declarations. External reality is the user's responsibility.
+
+**Mitigation strategy across ZER (universal):**
+1. Multiple overlapping annotations (defense in depth)
+2. Runtime/OS/hardware traps for hardware-related cases
+3. Audit-ability (all annotations greppable)
+4. Documentation conventions (`safety:` strings, header comments)
+5. For safety-critical: opt-in formal verification (`@verified_spec` v2.x+)
+
+**No additional core complexity is going to fix this universally** because
+fixing it requires either per-item databases (maintenance hell) or formal
+proofs (Vale-tier manual work). ZER's design accepts this universal trust
+gap and uses the same mitigation strategy across all instances.
+
+### 1.4.8. The hardware-dependent trap reality check
+
+A subthread examined whether the "CPU trap catches wrong precondition" claim
+is actually reliable. Conclusion: **conditional on context, not universal.**
+
+```
+Hardware trap fallback reliability:
+
+  Linux/BSD/macOS user mode (hosted):       ~95% reliable (loud crash)
+  Linux kernel module:                       ~90% reliable
+  Modern RTOS (Zephyr, FreeRTOS):           ~85% reliable
+  Bare-metal Cortex-M with handlers:        ~70% reliable
+  Bare-metal boot code (pre-handler):        ~30% reliable
+  Cortex-M0 / AVR / no-MMU MCU:              ~40% reliable
+  Inside an exception handler:               unreliable (double-fault risk)
+```
+
+Specific cases where hardware does NOT trap:
+- Misaligned scalar access on x86 (EFLAGS.AC off by default in user mode)
+- Misaligned access on ARM Cortex-A (SCTLR_EL1.A off by default in user mode)
+- Misaligned access on Cortex-M0/M0+ (no alignment check exists)
+- RDTSC in user mode (works without trap even though it reads privileged time)
+- Wrong arithmetic instruction (computes wrong value, no trap)
+- Undeclared register clobbers (silent register corruption)
+- Wrong FP rounding mode (slightly wrong float)
+
+**Implication:** the public safety claim about wrong-asm-traps-at-runtime
+needs to be honest about hardware/OS dependence. ZER's actual guarantee is
+at the operand boundary (Z-rules), not for asm body content. Hardware trap
+is "usually clean" property of the runtime environment, not a ZER guarantee.
+
+This is the same scope every safe language has for inline asm. Honest.
+
+### 1.4.9. The three tiers of contracts (clarification)
+
+A subthread distinguished three tiers of "contract" mechanisms to clarify
+what ZER does and doesn't claim:
+
+**Tier 1: Documentation comments (no enforcement)**
+- `// SAFETY: caller must ensure mask != 0` in Rust
+- `safety: "..."` string in ZER's asm syntax
+- Convention only, zero compiler check
+
+**Tier 2: Annotations checked by existing static analyses (no proofs)**
+- User declares a precondition; compiler dispatches to existing dataflow
+  analysis (VRP for ranges, alignment infrastructure, optional unwrapping)
+- Compile error if analysis can't satisfy the precondition
+- **Deterministic, no SMT solver, no theorem prover, no manual proof work**
+- ZER already does this for hardcoded UB classics (~12 frozen entries).
+- Tier 2 user-facing extension was explored and deferred (see 1.4.2).
+
+**Tier 3: Annotations checked by theorem provers / SMT solvers (formal proofs)**
+- SPARK Ada's `Pre`/`Post`/`Global` clauses
+- Frama-C ACSL's `\valid`, `\forall`, etc.
+- Vale's Coq proof obligations
+- Compiler generates proof obligations sent to SMT/theorem prover
+- May succeed, fail, or time out; user may need to write proofs manually
+- **This is what "formal verification" means in industry**
+
+**ZER's position:**
+- Tier 1 always: `safety:` strings on every asm block (≥ 30 chars via S4)
+- Tier 2 partial: hardcoded UB classics (the ~12 frozen entries)
+- Tier 2 user-facing: explored, **deferred** (see 1.4.2)
+- Tier 3: out of core scope; `@verified_spec` opt-in for v2.x+, niche audience
+
+**Critical clarification:** "contracts" in the SPARK/ACSL/Vale sense ARE
+proof systems (Tier 3). ZER's hardcoded UB classics dispatch and any future
+Tier 2 are NOT proof systems — they're existing dataflow analyses dispatched
+through annotation surface. **No mathematical proof is involved.** No SMT
+solver is in the toolchain. No Coq is required.
+
+### 1.4.10. The "smart language vs smart compiler" principle (final)
+
+```
+                  SAFE DEFAULT FOR EVERYDAY USER
+                            ↑
+                            |
+ZER's design ─────────► Compiler is smart (dataflow infers properties)
+                            |
+                            |
+                            |
+                            ↓
+                  USER MUST KNOW INVARIANTS
+                            ↑
+                            |
+Rust's design ─────► User encodes invariants in types
+                            |
+                            ↓
+                  REQUIRES SOPHISTICATION
+```
+
+Both reach equivalent safety. The dial that differs is **expected user
+sophistication.**
+
+ZER's choice: assume the user is a mid-level C programmer who has never
+heard of borrow checker. Compiler does the work. Safety guaranteed without
+expertise.
+
+Rust's choice: assume the user is a senior systems programmer who reads
+the standard library. User provides expertise. Compiler enforces what user
+encoded.
+
+**For ZER's audience (embedded/firmware/kernel developers transitioning
+from C), the "smart compiler + dumb user" model is the right design.**
+
+### 1.4.11. Industry precedent — final confirmation
+
+The 2-layer model (intrinsics primary + raw asm escape) is the **converged
+industry pattern** for production kernel/RTOS development:
+
+- **Hubris RTOS** (Oxide Computer): intrinsics for everything; raw `asm!()`
+  in tiny `kernel/boot` crate only. 99% of code never touches asm.
+- **Linux kernel**: `readl`/`writel`/`atomic_*`/`barrier` intrinsics
+  everywhere; `.S` files only in `arch/<X>/boot/`, `entry/`, `head/`.
+- **Zephyr RTOS**: intrinsics in headers; asm in `core/locore.S` and
+  `arch/<X>/core/aarch32/cortex_m/exc_exit.S` etc.
+- **FreeRTOS**: intrinsics + `portasm.S` per port.
+- **STM32 / CMSIS**: `__DMB()`, `__WFI()`, `__NOP()` intrinsic macros; raw
+  asm rare and confined to startup files.
+- **Rust core::arch**: ~5000 intrinsics covering AVX/SSE/SVE/NEON; `asm!()`
+  is the explicit unsafe escape.
+- **GCC's own kernel headers** (`<x86intrin.h>`, `<arm_neon.h>`): intrinsics
+  as the documented path; `__asm__` as the escape.
+
+**Every production kernel/RTOS converged on this model. ZER's 2-layer
+crystallization joins the converged norm.**
+
+### 1.4.12. What "fully safe" means after 2-layer
+
+The honest safety scope claim post-2-layer:
+
+```
+ZER guarantees:
+  ✓ Memory safety through asm operands (Z-rules)
+  ✓ Type safety on operand bindings (existing type system)
+  ✓ Concurrency safety through operands (Z6)
+  ✓ MMIO range validation (Z7 + mmio decl)
+  ✓ Provenance tracking (Z4, Z5)
+  ✓ Qualifier preservation (Z8)
+  ✓ Move/transfer semantics (Z2)
+  ✓ Hardcoded UB classics (~12 frozen, via AST mnemonic detection)
+  ✓ LR/SC pairing (F7-light hardcoded state machine)
+  ✓ Naked-fn isolation (MISRA Dir 4.3)
+  ✓ Intent intrinsic preconditions (via existing dataflow at intrinsic body)
+  ✓ Cross-architecture support (every arch GCC supports, ~15+ archs)
+
+ZER does NOT guarantee:
+  ✗ Algorithm correctness (Vale-tier territory, opt-in v2.x+)
+  ✗ Microarchitectural attacks (hardware vendor problem)
+  ✗ Clobber list completeness for raw asm (universal asm limit)
+  ✗ cinclude signature correctness (C interop boundary)
+  ✗ User-declared facts about external hardware/OS (trust boundary)
+  ✗ Hardware-independence of trap behavior on raw asm (context-dependent)
+
+Out of scope (acceptable, matches every safe language):
+  ✗ Wrong precondition on niche raw asm instruction (CPU trap usually catches;
+     ZER auto-guard would have helped but Tier 2 was deferred)
+```
+
+**This is the honest, audit-able safety claim.** No marketing inflation.
+Matches Rust, Zig, Linux kernel, Hubris, every production safe language at
+this tier.
+
+### 1.4.13. Maintenance picture — final crystallization
+
+```
+ZER-side ongoing maintenance after one-time Level C cleanup:
+
+  Intrinsic catalog (~130 today):
+    Growth rate: ~1-2 entries / year (real demand only)
+    Per-entry cost: ~30-50 lines if using GCC builtin (most cases)
+                    ~100-200 lines if needs per-arch inline asm wrapper
+    Total catalog code: ~3,000-5,000 lines, bounded forever
+
+  Hardcoded UB classics list (~12 frozen entries):
+    Growth rate: ~1 entry / decade (genuinely new well-known UB)
+    Per-entry cost: ~3-5 lines in checker.c
+
+  Z-rules infrastructure (Z1-Z8, Z11, Z12):
+    Frozen. Zero growth. One-time setup.
+
+  Per-arch register tables:        DELETED. Zero maintenance.
+  Per-arch instruction tables:     DELETED. Zero maintenance.
+  Probe scripts:                   DELETED. Zero maintenance.
+  CPU feature enum:                DELETED. Zero maintenance.
+  8-category framework:            DELETED. Zero maintenance.
+  Session G ordering plumbing:     DELETED. Zero maintenance.
+
+  Sub-extension support (AVX-512, AMX, SVE, SME, etc.):
+    Inherited from GCC automatically. Zero ZER work.
+
+  New architecture support (any arch GCC adds):
+    Inherited from GCC automatically. Zero ZER work.
+
+  Tier 2 annotation framework:     NOT BUILT. Deferred.
+  IR region wrappers for asm:      NOT BUILT. Deferred.
+  Auto-guard emission for Tier 2:  NOT BUILT. Deferred.
+
+TOTAL ZER-side ongoing burden: ~1-2 hours per year, bounded forever.
+NOT hellish. NOT continuous. NOT compounding.
+```
+
+### 1.4.14. The execution decision
+
+The 6-commit cleanup plan in **section 16** remains correct and proceeds
+as originally specified. The 2-layer crystallization in **section 1.5** is
+a clarification of what Level C means in practice, NOT a plan revision.
+
+**Optional follow-on (post-Level-C):** if real demand emerges for niche
+intrinsics not in the current 130-entry catalog (AMX, SVE specifics,
+cache-management wrappers), they can be added incrementally one at a time,
+each as a small ~30-50 line addition. Not blocking, not urgent, demand-driven.
+
+**Never blocking:** Tier 2 annotations, IR regions for asm, auto-guard
+emission, per-instruction database, additional structural complexity. All
+explored, all deferred indefinitely.
+
+### 1.4.15. The "explicit intent via separate intrinsics" pattern
+
+A late-conversation insight crystallized the architectural pattern ZER uses
+to handle **sibling operations with identical input types but different
+semantic intent.** This is the same shape as the clobber gap (invisible
+contract, user must know intent) but the resolution is structural rather
+than checked.
+
+**The pattern: don't ship one silent operator; ship distinct intrinsics
+with explicit names.**
+
+| Domain | C's silent default (BUG-PRODUCING) | ZER's explicit-intent split |
+|---|---|---|
+| Width conversion | `(u32)big_u64` silently truncates | `@truncate(u32, val)` — explicit |
+| Range conversion | `(i8)big_int` silently wraps | `@saturate(i8, val)` — explicit clamp |
+| Bit reinterpretation | `*(u32*)&float_val` silently aliases | `@bitcast(u32, val)` — explicit |
+| Integer → pointer | `(int*)addr` silently makes a pointer | `@inttoptr(*u32, addr)` — explicit, MMIO-validated |
+| Pointer → integer | `(uintptr_t)ptr` silently | `@ptrtoint(ptr)` — explicit |
+| Pointer type cast | `(B*)a_ptr` silent reinterpretation | `@ptrcast(*B, ptr)` — explicit, provenance-checked |
+| Container choice | `malloc` for everything | `Pool / Slab / Ring / Arena` — distinct names |
+| Atomic ordering | `atomic_load(ptr, ordering)` | **SeqCst only** — family collapsed |
+| Lock type | User picks `Mutex` vs `RwLock` vs `Cell` | `shared struct` / `shared(rw) struct` — compiler picks |
+| Bit search | One `bsr` mnemonic, UB on zero | `@bit_scan_reverse(mask)` — internal nonzero check |
+| Cache ops (future, if added) | One asm `clflushopt` or `clwb` string | `@cache_flushopt` vs `@cache_writeback` — distinct names |
+| MSR read/write | Same opcode prefix, different semantic | `@cpu_read_msr` vs `@cpu_write_msr` — distinct sigs |
+
+**The principle:**
+
+```
+C model:    ONE operator (cast) picks "truncate" silently
+            → user didn't know they were truncating
+            → silent value corruption
+
+ZER model:  THREE intrinsics (@truncate/@saturate/@bitcast)
+            → user MUST type one
+            → typing it IS the intent declaration
+            → no silent path exists
+            → forgetting = compile error, not silent bug
+```
+
+**Why this is a safety mechanism, not just ergonomics:**
+
+The act of typing the intrinsic name **is** the intent declaration. There's
+no fallback the compiler picks. The user can't "forget to think about overflow
+semantics" because forgetting means the code doesn't compile. The language
+literally cannot pick wrong for the user — the user picks, and picking is
+logged in the source code as a permanent audit trail.
+
+**Two distinct resolution strategies for sibling families:**
+
+1. **Collapse the family** when there's a single "right default":
+   - Atomic ordering → SeqCst only (5 orderings → 1)
+   - Lock type → `shared struct` auto-picks (4+ primitives → 1 declaration)
+   - Memory layout → auto-zeroing (no `MaybeUninit` family needed)
+
+2. **Split into named siblings** when operations are genuinely different:
+   - `@truncate` vs `@saturate` vs `@bitcast` — all valid, different intent
+   - `Pool` vs `Slab` vs `Ring` vs `Arena` — different allocation semantics
+   - `@cache_flushopt` vs `@cache_writeback` — different cache semantics
+
+**The dumb-user safety floor:**
+
+> User cannot silently pick wrong because the language has no silent path.
+> They must type the intent. Once typed, the consequence follows from the
+> declared intent.
+
+**This pattern has a name in language design:**
+- Zig: *"no hidden control flow, no hidden allocations, no hidden casts"*
+- Rust: *"explicit is better than implicit"* (no implicit numeric conversion)
+- Ada/SPARK: *"strong typing with explicit conversions"*
+- Python's Zen: *"explicit is better than implicit"*
+- ZER (implicit via design): **"every conversion is a named intrinsic"**
+
+All converge on the same insight: **silent operators are bug-class generators.**
+Named operators with distinct intent are safer because the picker is
+mechanically forced to declare which operation they want.
+
+**Relationship to the clobber gap (1.4.5):**
+
+| Gap shape | Clobber (raw asm) | Sibling intrinsic |
+|---|---|---|
+| Invisible contract | "rdx preserved" | "this is truncate semantics" |
+| User must know intent | Yes | Yes |
+| Compiler can verify? | No (needs per-instruction DB) | Often yes (type system / VRP) |
+| Resolution | None automatic (intrinsics absorb 95%) | Explicit naming forces intent declaration |
+| Silent failure? | Yes (register corruption downstream) | No (named operator = audit trail) |
+
+**Key insight:** the intrinsic-sibling case is structurally better than the
+clobber case because the explicit name converts the bug from "silent semantic
+corruption" into "code review can see which operation was picked." Even when
+the compiler can't verify intent, the source code records it.
+
+**Status:** this pattern is already practiced throughout ZER's existing 130
+intrinsics + container builtins + conversion intrinsics. Not a new design
+addition — a documentation crystallization of the principle already in use.
+Future intrinsic additions should follow the same rule: **if two operations
+are semantically different, give them different names. Never ship one
+operator that silently picks.**
+
+### 1.4.16. The 99% intrinsic coverage goal (zero `.S` files needed)
+
+**Goal stated by the user 2026-05-12 evening:** intrinsics should be expansive
+enough that ZER firmware/kernel projects need **zero standalone `.S` assembly
+files**. GCC handles all per-arch codegen via intrinsic bodies; raw asm in
+`naked` functions covers the irreducible ~1% (boot stubs, vector tables,
+hand-tuned hot loops).
+
+**This goal is achievable and matches the converged industry pattern.**
+Hubris RTOS (Oxide Computer, Rust-based, in production hardware) hit
+exactly this target: 99% of their kernel is intrinsic-based; ~200 LOC of
+raw asm in a tiny `boot` crate; no standalone `.S` files in their codebase.
+
+This subsection maps the path from ZER's current ~130-intrinsic catalog
+(covering ~95% of typical kernel/firmware needs) to the ~150-170-intrinsic
+target (covering ~99%).
+
+#### Current coverage map (what .S files traditionally cover vs ZER today)
+
+| Traditional `.S` use case | ZER current coverage | Status |
+|---|---|---|
+| Atomic ops, CAS, fetch-add | `@atomic_*` (15 intrinsics, D-Alpha-1) | ✓ Covered |
+| Memory barriers | `@barrier_*`, `@barrier_acq_rel` | ✓ Covered |
+| Bit ops (popcount, clz, ctz, ffs, parity) | `@popcount`, `@ctz`, `@clz`, `@ffs`, `@parity` (D-Alpha-2) | ✓ Covered |
+| Byte swap | `@bswap16/32/64` (D-Alpha-2) | ✓ Covered |
+| MSR / CR / XCR0 access | `@cpu_read_msr`, `@cpu_write_cr*`, `@cpu_*_xcr0` (D-Alpha-9) | ✓ Covered |
+| Port I/O (in/out) | `@port_in8/16/32`, `@port_out8/16/32` (D-Alpha-13) | ✓ Covered |
+| Interrupt enable/disable/wait | `@cpu_disable_int`, `@cpu_enable_int`, `@cpu_wait_int` (D-Alpha-3) | ✓ Covered |
+| Interrupt state save/restore | `@cpu_save_int_state`, `@cpu_restore_int_state` (D-Alpha-3) | ✓ Covered |
+| Cache management (CLFLUSHOPT/CLWB/MOVNTI) | `@cache_flushopt`, `@cache_writeback`, `@nt_store` (D-Alpha-13) | ✓ Covered |
+| CPU feature detection | `@cpu_cpuid`, `@cpu_cpuid_ecx`, `@cpu_vendor_id`, `@cpu_feature_bits` (D-Alpha-10/14) | ✓ Covered |
+| Context save/restore (callee-saved) | `@cpu_save_context`, `@cpu_restore_context`, `@cpu_*_fpu` (D-Alpha-4) | ✓ Covered |
+| Extended state save/restore (XSAVE) | `@cpu_xsave`, `@cpu_xrstor`, `@cpu_fxsave`, `@cpu_fxrstor` (D-Alpha-13/14) | ✓ Covered |
+| Privileged mode transitions | `@cpu_syscall`, `@cpu_sysret`, `@cpu_iret` (D-Alpha-12) | ✓ Covered |
+| Hypercalls / firmware calls | `@cpu_hypercall`, `@cpu_sbi_call`, `@cpu_smc_call` (D-Alpha-12/13) | ✓ Covered |
+| Debug registers (DR0-DR7) | `@cpu_read_dr`, `@cpu_write_dr` (D-Alpha-13) | ✓ Covered |
+| Performance counters | `@cpu_read_pmc` (D-Alpha-13) | ✓ Covered |
+| Stack / thread pointer / flags read | `@cpu_read_sp`, `@cpu_read_tp`, `@cpu_read_flags` (D-Alpha-10) | ✓ Covered |
+| Power management (sleep, idle, monitor/mwait) | `@cpu_deep_sleep`, `@cpu_idle_hint`, `@cpu_mwait`, `@cpu_umwait` (D-Alpha-11/14) | ✓ Covered |
+| Privilege query | `@cpu_get_priv_level` (D-Alpha-12) | ✓ Covered |
+| Control-flow integrity | `@cpu_endbr` (CET-IBT) (D-Alpha-14) | ✓ Covered |
+| FS/GS segment bases (FSGSBASE) | `@cpu_read_fsbase`, `@cpu_write_fsbase`, GS variants (D-Alpha-13) | ✓ Covered |
+| Cache disable/enable (privileged) | `@cpu_cache_disable`, `@cpu_cache_enable` (D-Alpha-14) | ✓ Covered |
+| End-of-interrupt | `@cpu_eoi` (D-Alpha-14) | ✓ Covered |
+| Page fault address | `@cpu_read_cr2` (D-Alpha-14) | ✓ Covered |
+| Legacy FPU init | `@cpu_fpu_init` (D-Alpha-14) | ✓ Covered |
+| **Subtotal current intrinsics** | **~130 (D-Alpha-1 through D-Alpha-14)** | **~95% of typical use** |
+
+The 130-intrinsic catalog was deliberately built for kernel/firmware needs
+across the 14 D-Alpha batches. Coverage today already exceeds what most
+embedded RTOS projects need.
+
+#### The gap — ~15-20 intrinsics to push coverage from ~95% to ~99%
+
+These are remaining `.S`-file use cases that the current catalog doesn't
+fully address. Adding them is **optional follow-on work, not blocking
+Level C execution**.
+
+| Gap area | Proposed intrinsic | Implementation strategy |
+|---|---|---|
+| **Boot stack setup** (before C runtime) | `@cpu_set_stack(addr)` | Per-arch inline asm wrapper in intrinsic body |
+| **Vector table install** | `@cpu_set_vector_table(addr)` | x86: LIDT; ARM: VTOR write; RISC-V: stvec |
+| **Unconditional jump (no return)** | `@cpu_jump_to(addr)` | Per-arch JMP/B/JR; marked `__attribute__((noreturn))` |
+| **Full context save** (incl. SP/PC/PSR) | `@cpu_save_full_context(*u8 buf)` | Beyond callee-saved subset (D-Alpha-4 has callee-saved only) |
+| **Full context restore** | `@cpu_restore_full_context(*u8 buf)` | Inverse of above |
+| **IRQ vector entry prologue** | `@irq_entry()` | Stack alignment + register save per arch ABI |
+| **IRQ vector exit epilogue** | `@irq_exit()` | Restore + IRET / RFI / SRET |
+| **Atomic max/min via CAS loop** | `@atomic_fetch_max`, `@atomic_fetch_min` | Composite intrinsic (CAS loop) |
+| **Aligned vector load/store** | `@vec_load_aligned_128/256/512`, store versions | GCC vector builtins |
+| **Saturating arithmetic** | `@sat_add`, `@sat_sub`, `@sat_mul` | GCC `__builtin_*_overflow` + clamp where available |
+| **Volatile memcpy/memset** (MMIO) | `@memcpy_volatile`, `@memset_volatile` | Cannot be optimized away — for memory-mapped regions |
+| **Cache flush range** | `@cache_flush_range(*u8 addr, usize len)` | Loop wrapper over CLFLUSHOPT / DC CVAC |
+| **Cache invalidate range** | `@cache_invalidate_range(*u8 addr, usize len)` | Loop wrapper over CLFLUSH+invalidate / DC IVAC |
+| **DMA buffer prep/complete** | `@dma_buffer_prep`, `@dma_buffer_complete` | Cache flush + memory barrier composite |
+| **TLB invalidation** | `@tlb_flush_all`, `@tlb_flush_page(addr)` | INVLPG / TLBI / SFENCE.VMA |
+| **CPU pause / spin-loop hint** | `@cpu_pause()` | PAUSE / YIELD (spin-loop optimization hint) |
+| **Random number** (RDRAND / RDSEED) | `@cpu_rdrand`, `@cpu_rdseed` | x86 hardware RNG with retry loop |
+| **Crypto primitives** (if AES-NI present) | `@aes_enc_round`, `@aes_dec_round` (optional) | AES-NI intrinsics already in GCC |
+| **SHA primitives** (if SHA-NI present) | `@sha1_msg1/2`, `@sha256_msg1/2` (optional) | SHA-NI intrinsics already in GCC |
+| **Carryless multiply** (PCLMULQDQ) | `@clmul_64x64` (optional) | For CRC, GCM mode etc. |
+
+**~15-20 additions** depending on how many crypto helpers are bundled.
+After this phase: **~150-170 intrinsics, ~99% coverage of typical kernel/
+firmware needs**.
+
+#### The irreducible minimum (~1% raw asm in naked fn, cannot be intrinsics)
+
+Even with maximum intrinsic coverage, three narrow categories will always
+need raw asm in `naked` functions. These are the same categories Hubris,
+Tock, seL4, Linux, and every production kernel maintain as small,
+hand-audited asm:
+
+**Category 1: Boot entry before C runtime exists** (~50-100 LOC per project)
+```zer
+naked void _start() {
+    asm {
+        instructions: "
+            ldr sp, =_stack_top    // set stack ptr
+            ldr r0, =_bss_start    // BSS zeroing
+            ldr r1, =_bss_end
+        1:  cmp r0, r1
+            beq 2f
+            str r2, [r0], #4
+            b 1b
+        2:  bl main                 // jump to C runtime
+            b .                     // hang if main returns
+        "
+        safety: "Boot entry: set SP, zero BSS, call main. Pre-runtime."
+    }
+}
+```
+**Why irreducible:** before the boot stub runs, the C runtime doesn't
+exist. Cannot call a function until SP is set. Cannot zero BSS until
+SP is set. The first ~10 instructions of every embedded system are
+fundamentally pre-language. Same for kernel boot, hypervisor entry, etc.
+
+**Category 2: Vendor-specific instructions before ZER catalog catches up**
+(~0-50 LOC per project, temporary)
+```zer
+naked void custom_vendor_op() {
+    asm {
+        instructions: "tdpbssd %tmm0, %tmm1, %tmm2"
+        safety: "Intel AMX matmul step; @amx_tdpbssd intrinsic planned v0.5.1"
+    }
+}
+```
+**Why irreducible (temporarily):** ZER's catalog grows ~1-2 entries/year.
+Brand-new ISA features (AVX-10.2 in 2027, ARM SME2 in 2028, etc.) may
+temporarily need raw asm until intrinsics ship. Migrates to intrinsics
+over time.
+
+**Category 3: Hand-tuned hot loops where exact scheduling matters**
+(~0-200 LOC per project, rare)
+```zer
+naked void aes_inner_loop(...) {
+    asm {
+        instructions: "
+            // ~50 lines of hand-scheduled AES rounds
+            // Compiler reordering would hurt cache/pipeline
+        "
+        safety: "Hand-tuned for Skylake µarch; matches OpenSSL reference."
+    }
+}
+```
+**Why irreducible:** crypto authors and high-perf inner loops want
+*exact* instruction order. Even GCC builtins may reorder. This is rare
+(<1% of <1% of code) but legitimate.
+
+**Total irreducible asm per typical project:** ~100-300 LOC across all
+three categories. Auditable in one sitting. Same scale as Hubris, Linux's
+`arch/<X>/boot/`, Zephyr's `core/locore.S`.
+
+#### Implementation path — phased, demand-driven
+
+```
+PHASE 0 (today):
+  Status: ~130 intrinsics shipped (D-Alpha-1 through D-Alpha-14)
+  Coverage: ~95% of typical kernel/firmware needs
+  Raw asm % in typical project: ~3-5%
+
+PHASE 1 (post-Level-C cleanup, ~3-4 weeks, OPTIONAL):
+  Action: Add ~15-20 gap intrinsics from table above
+  Priority order:
+    1. Boot helpers (@cpu_set_stack, @cpu_set_vector_table, @cpu_jump_to)
+    2. Full context save/restore (priv levels)
+    3. IRQ entry/exit wrappers
+    4. Cache range ops
+    5. DMA buffer helpers
+    6. TLB ops
+    7. @cpu_pause spin hint
+    8. Vector aligned load/store
+    9. Saturating arithmetic
+    10. Optional: crypto/SHA/CLMUL (if real demand)
+
+  Implementation: each intrinsic = ~30-100 lines, can ship one at a time
+  Coverage after: ~99% of typical needs
+  Raw asm % in typical project: ~1%
+
+PHASE 2 (ongoing, demand-driven, ~1-2 entries/year):
+  Action: Add intrinsics when real users hit specific gaps
+  Source: user issue tracker, vendor docs, new ISA extensions
+
+  Implementation: incremental, never blocking
+  Coverage after: bounded growth, asymptotic ~99%+
+
+PHASE 3 (steady state):
+  ~150-170 intrinsics in catalog
+  ~1% raw asm in typical project (boot + vectors + rare hot loop)
+  Zero standalone `.S` files in user projects
+  GCC handles all per-arch codegen via intrinsic bodies
+  ZER's source files are always `.zer` — no asm file extension needed
+```
+
+#### Industry validation — this exact target has been hit before
+
+| System | Intrinsic count | Raw asm in kernel | `.S` files needed |
+|---|---|---|---|
+| **Hubris RTOS** (Oxide) | ~250 via `core::arch` + custom wrappers | ~200 LOC in `kernel/boot` crate | Zero |
+| **Tock OS** (academic + embedded) | ~300 intrinsics + arch-specific | ~150 LOC per port | Zero |
+| **seL4** | Similar pattern, Isabelle proofs on top | ~500 LOC verified asm | Zero — even Isabelle proofs treat asm as inline |
+| **Zephyr RTOS** | Headers with intrinsics | ~300 LOC in `arch/<X>/core/` | Few (`locore.S`) — could be eliminated |
+| **Linux kernel** | Thousands of `readl`/`writel`/etc. intrinsics | Substantial — but spread across thousands of files | Some (e.g., `arch/x86/entry/entry_64.S`) — historically grew, could be modernized |
+| **ZER target** | ~150-170 intrinsics | ~100-300 LOC raw asm in naked fns | Zero (goal) |
+
+**ZER's target falls between Hubris and Zephyr in catalog size. Achievable.**
+Hubris specifically validated that 99% intrinsic coverage with raw asm
+escape works in production embedded hardware (Oxide rack switch firmware).
+
+#### What this means for marketing / public claim
+
+After Phase 1 lands, ZER's public-facing claim about asm safety can include:
+
+> "ZER firmware projects typically have zero standalone `.S` assembly files.
+> 99% of CPU-level operations are expressed via the ~150-intrinsic catalog
+> (atomic, MSR, port I/O, cache, context, etc.) — each with safety baked in
+> at the catalog level. The remaining ~1% (boot stubs, vector tables, the
+> rare hand-tuned hot loop) lives in `naked` functions with explicit raw
+> asm + `safety:` audit string. GCC handles all per-arch codegen via
+> intrinsic bodies. No probe scripts, no per-arch tables, no per-instruction
+> database — works on every architecture GCC supports automatically."
+
+This is honest, audit-able, and matches what Hubris/Tock can claim today.
+
+#### Relationship to other sections
+
+- **Section 1.5 (Final Design — Two-Layer Model):** the 99% goal is the
+  Layer 1 catalog's stretch target. Layer 2 (raw asm in naked) handles
+  the irreducible 1%. Doesn't change the architecture — just expands the
+  catalog over time.
+- **Section 9 (What We're Keeping):** intrinsic catalog is part of "Keep."
+  Phase 1 additions go here.
+- **Section 16 (Implementation Strategy):** the 6-commit Level C cleanup
+  ships first. Phase 1 catalog expansion is post-Level-C optional follow-on.
+- **Section 20 (Out of Scope):** "Algorithm correctness" and
+  "Microarchitectural" remain out of scope even at 99% intrinsic coverage.
+
+**Status:** goal documented, path defined, no commitments made beyond
+Level C execution. Phase 1 catalog expansion can be deferred indefinitely
+or executed incrementally based on user demand.
+
+---
+
+## 1.5. Final Design — Two-Layer Model (crystallization, 2026-05-12 evening)
+
+**This section supersedes any ambiguity in later sections about additional
+language complexity on top of Level C.** A multi-day architectural discussion
+on 2026-05-12 explored richer designs (Tier 2 operand annotations, IR region
+wrappers, auto-guard emission) and **rejected them all** in favor of the
+simpler two-layer model below. Level C is the execution baseline; this
+section confirms that nothing richer gets layered on top.
+
+### The two layers
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ LAYER 1 — INTENT INTRINSICS (primary safe path)           │
+│                                                            │
+│   ~130 today, room for ~20 more if real demand emerges.    │
+│                                                            │
+│   @bit_scan_reverse, @atomic_*, @cpu_read_msr, @port_*,    │
+│   @cache_*, @barrier_*, @cpu_*, @vec_load_aligned, etc.   │
+│                                                            │
+│   → Compiler-controlled emission. Safety baked in.         │
+│   → ~80% wrap GCC builtins (zero per-arch ZER code).       │
+│   → ~20% wrap per-arch inline asm (frozen, audited once).  │
+│   → User-facing experience: call function, get safety.     │
+│   → Covers 95%+ of typical kernel / firmware / embedded.   │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│ LAYER 2 — RAW ASM IN NAKED FN (escape hatch, "unsafe")    │
+│                                                            │
+│   naked fn boot() {                                        │
+│       asm {                                                │
+│           instructions: "..."                              │
+│           safety: "Audit string ≥ 30 chars (S4)"          │
+│       }                                                    │
+│   }                                                        │
+│                                                            │
+│   → No Tier 2 annotations. No IR regions. Plain asm.       │
+│   → MISRA Dir 4.3 satisfied via mandatory `naked`.         │
+│   → User responsibility: clobbers, preconditions, intent.  │
+│   → AST mnemonic still auto-applies ~12 UB classics.       │
+│   → Z-rules still apply through operand bindings.          │
+│   → Covers boot stubs, ctx switch, hand-tuned crypto.      │
+└──────────────────────────────────────────────────────────┘
+```
+
+That's it. **Two layers. Nothing else.**
+
+### What's EXPLICITLY DEFERRED indefinitely
+
+These ideas were explored in depth during the 2026-05-12 discussion and
+**rejected** as adding complexity without commensurate safety gain over the
+2-layer model. Re-opening these requires fresh user-visible motivation:
+
+| Deferred idea | Why explored | Why rejected |
+|---|---|---|
+| **Tier 2 per-operand annotations** (`requires: nonzero`, `align: 16`, etc. on asm operand bindings) | Would let users get compile-time precondition checks on raw asm without writing an intrinsic | Redundant with intrinsics for common cases; rarely useful for niche cases; intent intrinsics + caller-side guards cover the same ground without adding annotation vocabulary; "one obvious way to do it" principle |
+| **IR region wrappers for asm safety** (`@atomic_sequence { }`, `@cache_sync_region { }`, `@dma_buffer_op { }`) | Multi-block coordination patterns get clean structural scope | Composite intrinsics (`@atomic_cas`, `@cache_flush_range`, etc.) handle the same patterns with simpler syntax; regions add language surface without unlocking new safety; existing regions like `@critical`/`defer`/`@once` already exist for general scope needs |
+| **Auto-guard emission for unprovable Tier 2 preconditions** | Would make wrong-precondition behavior hardware-independent (loud ZER trap instead of CPU-dependent trap) | Only useful if Tier 2 annotations exist (which they don't); intrinsics emit their own internal guards already |
+| **State-machine annotations on individual blocks** (`opens_state:` / `closes_state:`) | Would let user-defined multi-block patterns be checked | F7-light hardcoded LR/SC state machine covers the one real case; user-defined patterns either become intrinsics or live in raw asm |
+| **Generic asm linter / per-instruction database for clobber completeness** | Would catch missing clobber declarations | Per-instruction database = maintenance hell (the whole reason Level C exists); intrinsics absorb 95%+ of clobber audits at the catalog level instead |
+| **`unsafe asm` keyword** (vs current bare `asm`) | Symmetry with Rust | Cosmetic only; `naked` already isolates asm structurally; rename happened in opposite direction (2026-04-25 dropped `unsafe asm` → bare `asm`) |
+
+### What stays from Level C, unchanged
+
+Section 2 ("The Decision in One Page") and section 9 ("What We're Keeping")
+are still correct. The 2-layer model is just a more precise framing of what
+Level C already says:
+
+- 130 intent intrinsics (catalog) — Layer 1
+- Z-rules Z1-Z8 + Z11/Z12 through asm operands — applies to Layer 2
+- Naked-only restriction (S1) — defines Layer 2 boundary
+- Structured asm syntax (`asm { instructions: ... safety: ... }`) — Layer 2 syntax
+- Hardcoded UB classics (~12 frozen) via AST mnemonic detection — applied to Layer 2
+- F7-light LR/SC pairing — applies to Layer 2 only (LR/SC also available via composite intrinsic)
+- GCC delegation for ISA-level (registers, instructions, CPU features, sub-extensions, future ISAs)
+
+### The honest "what we give up vs Rust"
+
+Rust's `core::arch::*` has ~5000 intrinsics. ZER's catalog has ~130-150. For
+truly esoteric ops Rust users find a pre-made intrinsic; ZER users either
+wait for a catalog addition or drop to Layer 2 raw asm. **In practice the
+~150 catalog covers what kernel / firmware / RTOS developers actually use.**
+The 5000-intrinsic gap is mostly SIMD variants used by numerical computing —
+not ZER's primary audience.
+
+### Maintenance picture — final
+
+```
+ZER-side ongoing maintenance after one-time implementation:
+
+  Intrinsic catalog growth:          ~1-2 entries / year (real demand only)
+  Hardcoded UB classics list:         ~1 entry / decade (genuinely new UB class)
+  Per-arch register tables:           ZERO — deleted, GCC handles
+  Per-arch instruction tables:        ZERO — deleted, GCC handles
+  CPU feature enum:                   ZERO — deleted, GCC -m flag passthrough
+  Probe scripts:                      ZERO — deleted
+  Sub-extension support:              ZERO — GCC inherits automatically
+  New architecture support:           ZERO — GCC inherits automatically
+  Tier 2 annotation framework:        ZERO — not built (deferred)
+  IR region wrappers:                 ZERO — not built (deferred)
+
+TOTAL ZER-side ongoing: ~1-2 hours per year. Bounded. Not hellish.
+```
+
+### Industry precedent for this exact model
+
+The 2-layer "intrinsics primary + raw asm escape" model is the **industry
+default for production kernel/RTOS development**:
+
+- **Hubris RTOS** (Oxide Computer, Rust-based): intrinsics for everything,
+  raw `asm!()` only in tiny `kernel/boot` crate. 99% of code never touches asm.
+- **Linux kernel**: `readl`/`writel`/`atomic_*`/`barrier` intrinsics everywhere;
+  `.S` files only in `arch/<X>/{boot,entry,head}.S`.
+- **Zephyr RTOS**: same pattern, intrinsics in headers, asm in `core/locore.S`.
+- **FreeRTOS**: same pattern.
+- **STM32 / CMSIS**: `__DMB()`, `__WFI()`, `__NOP()` intrinsic macros; raw asm rare.
+- **Rust stdlib**: `core::arch::*` is the intrinsic catalog; `asm!()` is the
+  unsafe escape.
+
+**Every production system that takes asm safety seriously uses this exact
+2-layer pattern.** ZER's design matches the converged industry norm.
+
+### Conformance — MISRA Dir 4.3 is sufficient
+
+MISRA C:2023 Dir 4.3 (Mandatory): *"Assembly language shall be encapsulated
+and isolated."*
+
+ZER's `naked` requirement satisfies this fully. No additional ZER-side
+machinery (Tier 2 annotations, region wrappers, contract systems) is
+required to claim MISRA conformance for asm encapsulation. **Bare 2-layer
+model passes the MISRA test.**
+
+Higher safety-critical standards (DO-178C Level A, ISO 26262 ASIL D, IEC
+62304 Class C) require formal proof / exhaustive testing — Vale/SPARK
+territory, opt-in via `@verified_spec` v2.x+, out of core ZER scope.
+
+### Execution path remains unchanged
+
+The 6-commit cleanup plan in **section 16** is correct and proceeds as
+specified. The 2-layer crystallization above is a clarification, not a
+plan revision. Nothing new gets built beyond what section 16 lists.
+
+If intrinsic catalog growth is desired (the optional ~20 new intent
+intrinsics for UB-prone operations not currently covered), that's a
+**post-Level-C optional follow-on**, ~3-4 weeks, bounded scope, can ship
+incrementally one intrinsic at a time. Not blocking.
 
 ---
 

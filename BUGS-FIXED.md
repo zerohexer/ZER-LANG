@@ -700,6 +700,105 @@ The audit also surfaced these gaps that need follow-up sessions:
 
 ---
 
+## Session 2026-05-13 — Full-codebase audit: 2 silent gaps closed
+
+Cross-cutting audit of the post-IR-migration codebase (5 parallel
+audit angles: AST→IR safety wrapper parity, zercheck_ir coverage,
+intrinsic emission edges, concurrency primitives, parser/checker
+TYPE_DISTINCT unwrap consistency) plus a targeted manual sweep. The
+five audit angles confirmed the IR migration is structurally sound
+— AST→IR safety wrappers, zercheck_ir lattice, deadlock detection,
+and intrinsic emission all clean. Two genuinely silent gaps surfaced
+from the manual sweep and are fixed in this session.
+
+### BUG-661: Float scientific-notation literals don't lex
+
+**Symptom**: `f64 a = 1.0e20;` (and every C-style exponent form —
+`1E10`, `1.5e+10`, `1.5e-10`, `1e3`, `5E-2`) produced
+`expected ';' after variable declaration at 'e20'`. ZER could not
+express common scientific magnitudes — microseconds, large/small
+constants used in firmware tuning, the very same `1e20` value the
+@saturate documentation in CLAUDE.md uses as an example.
+
+**Root cause**: `scan_number` in lexer.c only consumed digits +
+optional fractional part, then stopped. The `e/E[+-]?digits`
+exponent grammar was missing entirely. `strtod` in parser.c:741
+already handles exponent syntax — only the lexer needed to consume
+those characters as part of the number token.
+
+**Fix**: After the fractional-part block in `scan_number`
+(lexer.c), accept optional `[eE][+-]?digit+`. Two-character
+look-ahead (`peek_next` past the sign) decides whether to consume:
+if the char after the sign (or directly after the `e`) is not a
+digit, do not consume — preserves valid lookahead for identifiers
+like `e_const`. Promotes integer literal to float when present.
+
+**Test**: `tests/zer/float_scientific_notation.zer` — positive test
+covering 6 exponent forms with range checks against the parsed
+values.
+
+### BUG-662: Container monomorphization silently shadows user-defined type
+
+**Symptom**: A user `struct Stack_u32 { u32 user_field; }` declared
+at file scope was silently hidden by the container instantiation
+`Stack(u32) s;` inside a function. Use-sites of the user type
+(e.g. `Stack_u32 u; u.user_field = 99;`) failed with
+`struct 'Stack_u32' has no field 'user_field'` — a confusing
+error pointing at the use site, not the underlying name clash.
+
+**Root cause**: `resolve_type` for `TYNODE_CONTAINER` (checker.c
+line ~1582) stamped the monomorphized struct and called
+`add_symbol(c, mname, ...)` against `c->current_scope`. When the
+container appears inside a function body, that scope is the
+function scope. `scope_add` succeeded (function scope has no
+matching binding), and the new function-scope `Stack_u32` then
+shadowed the file-scope user struct for the rest of the function.
+
+**Fix**: Before stamping (checker.c, just before `add_symbol`),
+look up the mangled name in the current scope chain. If an
+existing user-defined nominal type (`TYPE_STRUCT`/`TYPE_ENUM`/
+`TYPE_UNION`, including any `TYPE_DISTINCT` wrapper) already
+holds that name, emit an explicit collision error referencing
+both the container expression and the colliding type, then return
+`ty_void` so the bad use-site doesn't cascade with misleading
+"no field X" errors.
+
+Idempotent re-stamping is unaffected — the cache at
+checker.c:1559-1565 returns the previously stamped struct before
+the collision check ever runs, so multiple uses of `Stack(u32)`
+across functions still hit the cache.
+
+**Test**: `tests/zer_fail/container_name_shadows_user_struct.zer`
+— must fail to compile with the new collision diagnostic.
+
+### Audit findings deferred (documented, no behavior change)
+
+- **@atomic_* on non-`shared` data**: CLAUDE.md "Intrinsics —
+  Atomic" reads "first arg must be `*shared T`," but every
+  existing positive test (`tests/zer/atomic_ops.zer`,
+  `atomic_dalpha1.zer`) uses plain global integers and relies on
+  the relaxed behavior. The relaxation is intentional for
+  baremetal ISR↔main patterns where atomics provide
+  synchronization without the shared-struct lock overhead.
+  Wording in CLAUDE.md will be tightened separately; the compiler
+  is consistent with existing test programs.
+
+- **AST emit_expr `@saturate(i64, …)` no-clamp branch**: AST path
+  emits a bare `(int64_t)expr` cast with no min/max guard, while
+  the IR path emits the full clamp. Function bodies are IR-only
+  since 2026-04-19, so the bad AST branch is reachable only via
+  global initializers — which themselves must be compile-time
+  constants where saturation is degenerate. No reproducer found;
+  left for a future cleanup pass.
+
+- **TYPE_DISTINCT unwrap gaps in return-type qualifier checks**
+  (checker.c 9021/9026/9032): defense-in-depth checks fire after
+  `can_implicit_coerce` already rejects qualifier laundering
+  through a distinct typedef. No observable silent miscompile;
+  cosmetic gap.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

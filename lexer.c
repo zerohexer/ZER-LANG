@@ -347,6 +347,29 @@ static Token scan_number(Scanner *s) {
         while (is_digit(peek(s)) || peek(s) == '_') advance(s);
     }
 
+    /* exponent part: 1e3, 1.5E-10, 1.0e+20.
+     * Accepted after either an integer mantissa (`1e3`) or a fractional one
+     * (`1.5e3`). Promotes integer literal to float when present.
+     * `strtod` (parser.c:741) handles the numeric conversion. */
+    if (peek(s) == 'e' || peek(s) == 'E') {
+        char c2 = peek_next(s);
+        bool ok = is_digit(c2);
+        if (!ok && (c2 == '+' || c2 == '-')) {
+            /* Need the char AFTER the sign to be a digit. */
+            size_t save_pos = s->pos;
+            advance(s); /* 'e'/'E' */
+            advance(s); /* sign */
+            if (is_digit(peek(s))) ok = true;
+            s->pos = save_pos;
+        }
+        if (ok) {
+            type = TOK_NUMBER_FLOAT;
+            advance(s); /* skip 'e' or 'E' */
+            if (peek(s) == '+' || peek(s) == '-') advance(s);
+            while (is_digit(peek(s)) || peek(s) == '_') advance(s);
+        }
+    }
+
     return make_token(s, type, start);
 }
 

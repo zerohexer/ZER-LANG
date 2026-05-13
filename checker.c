@@ -1587,6 +1587,30 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         char *mname = (char *)arena_alloc(c->arena, mlen + 1);
         memcpy(mname, mangled, mlen + 1);
 
+        /* Pre-stamp collision check: if a user-defined type with the mangled
+         * name already exists, refuse to silently shadow it. Prior behavior
+         * stamped into c->current_scope (function scope when the container
+         * appears inside a function body), which shadowed a file-scope user
+         * struct of the same name and produced confusing "no field X" errors
+         * at use sites. Now we report the collision explicitly. */
+        {
+            Symbol *existing = scope_lookup(c->current_scope, mname, (uint32_t)mlen);
+            if (existing && existing->type) {
+                Type *et = type_unwrap_distinct(existing->type);
+                if (et && (et->kind == TYPE_STRUCT || et->kind == TYPE_ENUM ||
+                           et->kind == TYPE_UNION)) {
+                    checker_error(c, tn->loc.line,
+                        "container '%.*s(%s)' would stamp type '%.*s' which "
+                        "collides with an existing user-defined type — "
+                        "rename one to avoid silent shadowing",
+                        (int)cnlen, cname, ctype_name,
+                        mlen, mname);
+                    _container_depth--;
+                    return ty_void;
+                }
+            }
+        }
+
         Type *st = (Type *)arena_alloc(c->arena, sizeof(Type));
         st->kind = TYPE_STRUCT;
         st->struct_type.name = mname;

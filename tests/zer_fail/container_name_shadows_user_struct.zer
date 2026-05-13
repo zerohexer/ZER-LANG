@@ -1,0 +1,22 @@
+// Container monomorphization must not silently shadow a user-defined struct.
+// Pre-fix: `Stack(u32)` inside a function stamps `struct Stack_u32` into the
+// function scope, hiding the file-scope user struct with the SAME name.
+// `u.user_field` then errors with "no field user_field" — confusing and silent
+// at the declaration site.
+// Post-fix: container instantiation rejects collision with explicit error.
+
+container Stack(T) {
+    T[8] data;
+    u32 top;
+}
+
+struct Stack_u32 {
+    u32 user_field;
+}
+
+i32 main() {
+    Stack(u32) s;
+    Stack_u32 u;
+    u.user_field = 99;
+    return (i32)u.user_field;
+}

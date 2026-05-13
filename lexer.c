@@ -302,7 +302,8 @@ static TokenType check_keyword(const char *word, size_t word_len) {
 /* ---- Scan a word (identifier or keyword) ---- */
 
 static Token scan_word(Scanner *s) {
-    size_t start = s->pos - 1; /* already consumed first char */
+    size_t start = s->pos;   /* token begins where we are */
+    advance(s);              /* consume first char (is_alpha guaranteed by caller) */
     while (is_alnum(peek(s))) advance(s);
     size_t word_len = s->pos - start;
     TokenType type = check_keyword(&s->source[start], word_len);
@@ -312,7 +313,8 @@ static Token scan_word(Scanner *s) {
 /* ---- Scan a number (integer or float) ---- */
 
 static Token scan_number(Scanner *s) {
-    size_t start = s->pos - 1; /* already consumed first digit */
+    size_t start = s->pos;   /* token begins where we are */
+    advance(s);              /* consume first digit (is_digit guaranteed by caller) */
     TokenType type = TOK_NUMBER_INT;
 
     /* hex: 0x... */
@@ -356,7 +358,8 @@ static bool is_valid_escape(char c) {
 }
 
 static Token scan_string(Scanner *s) {
-    size_t start = s->pos - 1; /* already consumed opening " */
+    size_t start = s->pos;   /* token begins at opening " */
+    advance(s);              /* consume opening " (verified by caller) */
     while (peek(s) != '"' && peek(s) != '\0') {
         if (peek(s) == '\n') s->line++;
         if (peek(s) == '\\') {
@@ -386,7 +389,8 @@ static Token scan_string(Scanner *s) {
 /* ---- Scan a character literal ---- */
 
 static Token scan_char(Scanner *s) {
-    size_t start = s->pos - 1; /* already consumed opening ' */
+    size_t start = s->pos;   /* token begins at opening ' */
+    advance(s);              /* consume opening ' (verified by caller) */
     if (peek(s) == '\\') {
         advance(s); /* skip backslash */
         char esc = peek(s);
@@ -423,8 +427,8 @@ Token next_token(Scanner *s) {
         return make_token(s, TOK_EOF, s->pos);
     }
 
-    size_t start = s->pos;
-    char c = advance(s);
+    /* peek without advancing — scan_X functions own their own advance() */
+    char c = peek(s);
 
     /* word: keyword or identifier */
     if (is_alpha(c)) return scan_word(s);
@@ -438,7 +442,10 @@ Token next_token(Scanner *s) {
     /* character literal */
     if (c == '\'') return scan_char(s);
 
-    /* operators and punctuation */
+    /* operators/punctuation: capture start, advance, then dispatch */
+    size_t start = s->pos;
+    advance(s);
+
     switch (c) {
     /* single character — unambiguous */
     case '(': return make_token(s, TOK_LPAREN, start);

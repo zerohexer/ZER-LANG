@@ -1,0 +1,12 @@
+// Regression guard for AUDIT-2026-05-14 (silent modulo-by-zero with index
+// divisor). Same gap class as div_by_zero_index_trap.zer but for `%`.
+//
+// MUST compile clean + trap at runtime with "division by zero".
+
+u32 main() {
+    u32[4] arr;
+    arr[0] = 0;
+    for (u32 i = 0; i < 1; i += 1) { arr[0] = 0; }
+    u32 z = 100 % arr[0];
+    return z;
+}

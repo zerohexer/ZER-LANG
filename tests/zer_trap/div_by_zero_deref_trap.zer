@@ -1,0 +1,14 @@
+// Regression guard for AUDIT-2026-05-14 (silent div-by-zero with deref
+// divisor). Companion to div_by_zero_index_trap.zer.
+//
+// MUST compile clean + trap at runtime with "division by zero".
+//
+// NODE_UNARY (deref `*p`) was not in the checker's forced-guard match list.
+
+u32 main() {
+    u32 y = 0;
+    for (u32 i = 0; i < 1; i += 1) { y = 0; }
+    *u32 p = &y;
+    u32 z = 10 / *p;
+    return z;
+}

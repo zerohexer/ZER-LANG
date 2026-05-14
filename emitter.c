@@ -5505,19 +5505,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             return;
         }
         /* BUG-604: signed division overflow (INT_MIN / -1 is C UB).
-         * Checker already rejects divisor-not-proven-nonzero at compile
-         * time (see checker.c forced division guard), so we only need
-         * the signed overflow trap. */
+         *
+         * Defense-in-depth div-by-zero trap (audit 2026-05-14): checker's
+         * forced-guard at checker.c:2587 only catches IDENT/FIELD/CALL
+         * divisors. Index (`arr[i]`), deref (`*p`), cast (`(i32)x`),
+         * intrinsic (`@truncate(...)`), and binary (`a+b`) expressions
+         * slip through to raw division — SIGFPE on x86/hosted, silent
+         * garbage on ARM/RISC-V baremetal. Mirror compound `/=` (line
+         * 5879) and always emit the runtime check here too. */
         if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
             Type *div_type = lt ? type_unwrap_distinct(lt) : NULL;
             bool is_signed_div = div_type && type_is_signed(div_type);
+            int tmp = e->temp_count++;
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, node->binary.right, func);
+            emit(e, ") _zer_dv%d = ", tmp);
+            emit_rewritten_node(e, node->binary.right, func);
+            emit(e, "; if (_zer_dv%d == 0) ", tmp);
+            emit(e, "_zer_trap(\"division by zero\", __FILE__, __LINE__); ");
             if (is_signed_div) {
-                int tmp = e->temp_count++;
-                emit(e, "({ __typeof__(");
-                emit_rewritten_node(e, node->binary.right, func);
-                emit(e, ") _zer_dv%d = ", tmp);
-                emit_rewritten_node(e, node->binary.right, func);
-                emit(e, "; if (_zer_dv%d == -1) { __typeof__(", tmp);
+                emit(e, "if (_zer_dv%d == -1) { __typeof__(", tmp);
                 emit_rewritten_node(e, node->binary.left, func);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_rewritten_node(e, node->binary.left, func);
@@ -5527,13 +5534,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
                 else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
-                emit(e, "(");
-                emit_rewritten_node(e, node->binary.left, func);
-                emit(e, " %s _zer_dv%d); })",
-                     node->binary.op == TOK_SLASH ? "/" : "%", tmp);
-                return;
             }
-            /* Unsigned / or %: no overflow concern. Fall through to raw emit. */
+            emit(e, "(");
+            emit_rewritten_node(e, node->binary.left, func);
+            emit(e, " %s _zer_dv%d); })",
+                 node->binary.op == TOK_SLASH ? "/" : "%", tmp);
+            return;
         }
         emit(e, "(");
         emit_rewritten_node(e, node->binary.left, func);
@@ -9631,8 +9637,19 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             /* Phase 3 fix #4: signed division overflow (INT_MIN / -1).
              * C says this is undefined. Trap explicitly when BOTH operands
              * signed and dividend is at the signed min while divisor is -1.
-             * (zercheck already forces compile-time guard for divisor == 0.) */
+             *
+             * Defense-in-depth div-by-zero trap (audit 2026-05-14): the
+             * checker's forced-guard at checker.c:2587 only catches IDENT/
+             * FIELD/CALL divisors. Index, deref, cast, intrinsic, and
+             * compound expressions slip through to raw division, which is
+             * a SIGFPE on x86/hosted and silent garbage on ARM/RISC-V
+             * baremetal. Mirror compound `/=` (emit_rewritten_node line
+             * 5879) and always emit the runtime check here too. */
             if (inst->op_token == TOK_SLASH || inst->op_token == TOK_PERCENT) {
+                emit_indent(e);
+                emit(e, "if (%s%.*s == 0) "
+                        "_zer_trap(\"division by zero\", __FILE__, __LINE__);\n",
+                     sp, (int)s2->name_len, s2->name);
                 Type *lt = s1->type ? type_unwrap_distinct(s1->type) : NULL;
                 if (lt && type_is_signed(lt)) {
                     int w = type_width(lt);

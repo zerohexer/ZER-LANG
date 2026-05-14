@@ -1,0 +1,15 @@
+// Regression guard for AUDIT-2026-05-14 (silent div-by-zero with intrinsic
+// divisor).
+//
+// MUST compile clean + trap at runtime with "division by zero".
+//
+// NODE_INTRINSIC (e.g. `@truncate(u32, ...)`, `@bitcast(u32, ...)`) was not
+// in the checker's forced-guard match list. The emitter then issued raw
+// division with no runtime guard.
+
+u32 main() {
+    u64 x = 0;
+    for (u32 i = 0; i < 1; i += 1) { x = 0; }
+    u32 z = 100 / @truncate(u32, x);
+    return z;
+}

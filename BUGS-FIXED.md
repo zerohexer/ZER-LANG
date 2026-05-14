@@ -799,6 +799,121 @@ across functions still hit the cache.
 
 ---
 
+## Session 2026-05-14 — AUDIT-2026-05-14: silent div-by-zero with non-IDENT/FIELD/CALL divisors
+
+### Symptom
+
+The following all compiled clean, then SIGFPE/illegal-instruction at
+runtime on hosted x86, and would silently return wrong values on ARM
+(DIV-by-0 returns 0) / RISC-V (returns -1) baremetal:
+
+```zer
+u32 main() {
+    u32[4] arr; arr[0] = 0;
+    for (u32 i=0; i<1; i+=1) { arr[0] = 0; }   // defeat VRP
+    return 10 / arr[0];                          // silent SIGFPE
+}
+```
+
+Same pattern hit `10 / *p` (deref), `10 / @truncate(...)` (intrinsic),
+`10 / (a+b)` (binary), `10 / -y` (unary), `10 / (i32)x` (typecast),
+and the modulo equivalents `100 % arr[0]`.
+
+### Root cause
+
+Two-part inconsistency between checker and emitter:
+
+1. **Checker (`checker.c` line 2587)** — the forced division guard only
+   matched `node->binary.right->kind == NODE_IDENT || == NODE_FIELD ||
+   == NODE_CALL`. Index / deref / cast / intrinsic / binary slipped
+   through with no compile-time error.
+
+2. **Emitter** — three paths handle division:
+   - `emit_expr` NODE_BINARY (line 1111): **correctly** emits runtime
+     `if (_zer_dv == 0) trap`.
+   - `emit_rewritten_node` NODE_BINARY (line 5409): emitted only the
+     signed-overflow trap (`INT_MIN/-1`). Unsigned fell through to raw
+     `(left / right)`.
+   - `emit_ir_inst` IR_BINOP (line 9404): same — signed-overflow trap
+     only.
+
+The two IR paths inherited the unprotected-division pattern from a
+2026-04-19 AST→IR migration (BUG-595…599 era) that ported every
+other safety wrapper but left this comment behind: "*Checker already
+rejects divisor-not-proven-nonzero at compile time, so we only need
+the signed overflow trap.*" — true only for `IDENT`/`FIELD`/`CALL`.
+
+Note: compound `/=` and `%=` paths (`emit_rewritten_node` line 5870)
+were already correct — they emit the runtime div-by-zero trap
+unconditionally. The audit found that compound paths had the right
+shape; only the binary paths were inconsistent.
+
+### Fix
+
+Make all three emission paths emit the runtime div-by-zero trap
+unconditionally, mirroring the compound `/=` path. The forced
+compile-time guard remains (catches the common case at zero cost via
+range propagation), and the runtime trap is defense-in-depth for the
+gap kinds.
+
+- `emit_rewritten_node` NODE_BINARY (emitter.c:5409): hoist divisor to
+  `_zer_dv%d`, emit `if (_zer_dv == 0) _zer_trap("division by zero")`
+  before the signed-overflow check.
+- `emit_ir_inst` IR_BINOP (emitter.c:9404): emit `if (s2_local == 0)
+  _zer_trap("division by zero")` before the signed-overflow check.
+
+Both paths use the same trap message string as the existing compound
+path for consistency.
+
+### Tests
+
+Added 5 regression guards in `tests/zer_trap/`:
+
+- `div_by_zero_index_trap.zer` — `10 / arr[0]`
+- `div_by_zero_deref_trap.zer` — `10 / *p`
+- `div_by_zero_intrinsic_trap.zer` — `100 / @truncate(u32, x)`
+- `div_by_zero_binary_trap.zer` — `10 / (a + b)`
+- `mod_by_zero_index_trap.zer` — `100 % arr[0]`
+
+Each compiles clean, traps with "division by zero" at runtime. All
+546 tests/zer + 28 test_modules tests pass.
+
+### Why the audit found this
+
+Audit methodology: write the safety claim from CLAUDE.md ("Division
+by zero — Forced guard: compile error if divisor not proven nonzero")
+and probe it with every AST expression shape that could be a divisor.
+The checker only matches three kinds; the seven other valid divisor
+shapes all silently slipped through. The emitter rounds out the gap
+by relying on the checker's promise that never covered them.
+
+### Tech debt cataloged alongside
+
+(reported but not fixed in this commit — see audit summary in
+session notes)
+
+- `ir_lower.c:727` `classify_builtin_call` is defined but unreferenced
+  anywhere in the codebase (dead code from earlier IR design).
+- `emitter.c:9677-9688` — IR_INDEX_WRITE / IR_ADDR_OF / IR_DEREF_READ /
+  IR_CALL_DECOMP / IR_INTRINSIC_DECOMP / IR_ORELSE_DECOMP / IR_SLICE_READ
+  have placeholder `/* 3AC op %d — TODO */` handlers. ir_lower.c only
+  emits `IR_STRUCT_INIT_DECOMP` among the decomp family; the other 7
+  opcodes are dead ir.h enum values + dead emitter/zercheck_ir handlers.
+- `tools/audit_matrix.sh` has a methodology bug: it reports the FIRST
+  `case NODE_X` match (which is `scan_func_props` at checker.c:7060+),
+  not the real statement handler at line 9378+/10368+. The 16 "missing
+  checks" it reports are false positives — the real handlers correctly
+  call `zer_break_allowed_in_context` etc.
+- Escape analysis flags `return slice.len` as "returns pointer to
+  local" when it returns the scalar `usize` length, not the pointer.
+  Over-conservative but soundness-safe (rejects valid code; not a
+  silent miscompile).
+- `bool < bool` and `bool > bool` are silently accepted. Per spec
+  bool is not an integer; ordering operators should be rejected
+  like `+`/`-`/`&` already are.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

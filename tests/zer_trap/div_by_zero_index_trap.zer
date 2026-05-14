@@ -1,0 +1,24 @@
+// Regression guard for AUDIT-2026-05-14 (silent div-by-zero with non-trivial
+// divisor expression).
+//
+// MUST compile clean + trap at runtime with "division by zero".
+//
+// Before the fix, the checker's forced division guard at checker.c:2587 only
+// rejected NODE_IDENT / NODE_FIELD / NODE_CALL divisors. An array-index
+// divisor (NODE_INDEX) slipped through, and neither the IR_BINOP emitter
+// (emitter.c:9404) nor the emit_rewritten_node binary path
+// (emitter.c:5409) emitted a runtime trap — only the signed-overflow
+// trap was wrapped. Result: silent SIGFPE on x86 / illegal instruction
+// on baremetal x86, silently-wrong result on ARM (DIV-by-0 returns 0)
+// and RISC-V (returns -1).
+
+u32 main() {
+    u32[4] arr;
+    arr[0] = 0;
+    // Defeat value-range propagation: rewrite arr[0] in a loop so VRP
+    // can't prove its value is the literal 0 (which would error at
+    // compile time as "division by zero").
+    for (u32 i = 0; i < 1; i += 1) { arr[0] = 0; }
+    u32 z = 10 / arr[0];
+    return z;
+}

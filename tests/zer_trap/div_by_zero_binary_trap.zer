@@ -1,0 +1,14 @@
+// Regression guard for AUDIT-2026-05-14 (silent div-by-zero with binary-expr
+// divisor).
+//
+// MUST compile clean + trap at runtime with "division by zero".
+//
+// NODE_BINARY (e.g. `a + b`) was not in the checker's forced-guard match list.
+
+i32 main() {
+    i32 a = 0;
+    i32 b = 0;
+    for (i32 i = 0; i < 1; i += 1) { a = 0; b = 0; }
+    i32 z = 10 / (a + b);
+    return z;
+}

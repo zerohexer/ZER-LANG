@@ -21,6 +21,11 @@ Added 2026-04-19 as regression guards for BUG-595 through BUG-599
 | `signed_div_overflow_trap.zer` | `INT_MIN / -1` traps via signed overflow check |
 | `inttoptr_out_of_mmio_trap.zer` | `@inttoptr` with address outside `mmio` range traps |
 | `inttoptr_unaligned_trap.zer` | `@inttoptr` with unaligned address traps |
+| `div_by_zero_index_trap.zer` | `a / arr[0]` traps via defense-in-depth div-by-zero check (AUDIT-2026-05-14) |
+| `div_by_zero_deref_trap.zer` | `a / *p` traps via defense-in-depth div-by-zero check (AUDIT-2026-05-14) |
+| `div_by_zero_intrinsic_trap.zer` | `a / @truncate(...)` traps via defense-in-depth div-by-zero check (AUDIT-2026-05-14) |
+| `div_by_zero_binary_trap.zer` | `a / (b + c)` traps via defense-in-depth div-by-zero check (AUDIT-2026-05-14) |
+| `mod_by_zero_index_trap.zer` | `a % arr[0]` traps via defense-in-depth div-by-zero check (AUDIT-2026-05-14) |
 
 Shift safety (`_zer_shl`/`_zer_shr`) doesn't go here — it's tested
 positively in `tests/zer/shift_over_width_is_zero.zer` because

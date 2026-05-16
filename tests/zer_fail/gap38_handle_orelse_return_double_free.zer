@@ -1,0 +1,17 @@
+/* Gap 38 variant: direct unwrap with orelse return.
+ *
+ * Pattern: Handle(T) h = fn() orelse return; The orelse temp is the
+ * dest of IR_ASSIGN (not IR_CALL — the call happens inside the orelse
+ * decomposition). Without the IR_ASSIGN-side fix, this orelse temp
+ * was never registered as ALIVE. */
+struct Task { u32 id; }
+Slab(Task) heap;
+
+?Handle(Task) get_handle() { return heap.alloc(); }
+
+u32 main() {
+    Handle(Task) h = get_handle() orelse return;
+    heap.free(h);
+    heap.free(h);  /* double-free — must be caught */
+    return 0;
+}

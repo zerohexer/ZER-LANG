@@ -6815,25 +6815,28 @@ static Type *check_expr(Checker *c, Node *node) {
                         "@cstr destination is a const pointer — cannot write to read-only memory");
                 }
             }
-            /* Gap 27: reject raw `*u8` destination — no bounds check is possible
-             * when the destination has no carried length. Force user to pass an
-             * array (`u8[N]`) or slice (`[]u8`/`[*]u8`) so the emitter can bounds-check
-             * src.len + 1 against the destination capacity. Without this rejection
-             * the IR emits raw `memcpy(ptr, src.ptr, src.len)` with no length check —
-             * silent buffer overflow on too-long source. */
+            /* Gap 27 fix: reject raw `*u8` / `*T` as @cstr destination —
+             * no compile-time OR runtime bounds check is possible (raw
+             * pointer carries no length). Fixed arrays (`u8[N]`) get
+             * compile-time check; slices (`[*]u8` / `[]u8`) get runtime
+             * check. Only TYPE_POINTER bypasses both.
+             *
+             * Exemptions:
+             *   - TYPE_OPAQUE inner: C-interop wrappers carry their own
+             *     length contracts at that boundary.
+             *   - `volatile *u8`: MMIO register write — user explicitly
+             *     targets hardware, size is hardware-fixed.
+             *   - `const *u8`: caught by the const-pointer rejection above. */
             if (node->intrinsic.arg_count >= 1) {
                 Type *dst_type = typemap_get(c, node->intrinsic.args[0]);
                 Type *dst_eff = dst_type ? type_unwrap_distinct(dst_type) : NULL;
-                if (dst_eff && dst_eff->kind == TYPE_POINTER) {
+                if (dst_eff && dst_eff->kind == TYPE_POINTER &&
+                    !dst_eff->pointer.is_const && !dst_eff->pointer.is_volatile) {
                     Type *inner = type_unwrap_distinct(dst_eff->pointer.inner);
-                    /* permit *opaque (used by some C-interop wrappers) — they have
-                     * their own length contracts. Reject only typed pointers like
-                     * *u8 / *T where the destination has no carried length. */
                     if (inner && inner->kind != TYPE_OPAQUE) {
                         checker_error(c, node->loc.line,
-                            "@cstr destination is a raw pointer — no bounds check is possible. "
-                            "Pass an array (`u8[N] buf`) or slice (`[*]u8 buf`) so the destination "
-                            "size is known at the call site");
+                            "@cstr destination is a raw pointer '*u8' — no bounds check possible. "
+                            "Use a slice ('[*]u8') or fixed array ('u8[N]') destination instead.");
                     }
                 }
             }

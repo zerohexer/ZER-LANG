@@ -152,6 +152,91 @@ ancestor block holds a different shared root still leak the
 outer lock. Tracked as a follow-up; the simple `return
 shared.field;` form is now safe.
 
+## ~~Gap 38 — function-return Handle bypasses zercheck_ir tracking~~ (FIXED 2026-05-16)
+
+**Status:** zercheck_ir now treats `Handle(T)` / `?Handle(T)` returns
+the same way it treats pointer returns — registers the dest local as
+fresh ALIVE with `escaped=true`. The escape flag suppresses the
+leak-at-exit check (caller commonly passes the handle to a destructor
+via `defer device_destroy(h)`, where the destructor lives in another
+module and its FuncSummary may not propagate) while still preserving
+FREED-state transitions for double-free / UAF detection.
+
+Two patterns now caught:
+
+```zer
+?Handle(Task) get_handle() { return heap.alloc(); }
+
+?Handle(Task) mh = get_handle();
+Handle(Task) a = mh orelse return;
+heap.free(a);
+heap.free(a);   // detected: double-free
+```
+
+```zer
+Handle(Task) h = get_handle() orelse return;
+heap.free(h);
+heap.free(h);   // detected: double-free (orelse-IR_ASSIGN variant)
+```
+
+Two reproducers landed in `tests/zer_fail/`:
+- `gap38_fn_return_handle_double_free.zer` (IR_CALL site fix)
+- `gap38_handle_orelse_return_double_free.zer` (IR_ASSIGN orelse-decomp site fix)
+
+Implementation: `zercheck_ir.c` — added TYPE_HANDLE to the existing
+pointer-return detection in two branches (FuncSummary present and
+not-present) of the IR_CALL handler, plus a new IRMC_NONE Handle
+branch in the IR_ASSIGN handler for orelse-wrapped calls. Both sites
+set `h->escaped = true` after registering.
+
+## ~~Gap 27 — `@cstr` to raw `*u8` destination — no bounds check~~ (FIXED 2026-05-16)
+
+**Status:** checker now rejects `*u8` (non-volatile, non-const) as
+`@cstr` destination. Pattern that silently overflowed before:
+
+```zer
+u8[4] buf;
+*u8 p = buf[0..].ptr;
+@cstr(p, "Hello, world this is too long");  // 29-byte write to 4-byte buf
+```
+
+Fix: error with hint to use slice (`[*]u8`) or fixed array (`u8[N]`)
+destination. Volatile pointers (MMIO registers) are still permitted —
+size is hardware-fixed there. Reproducer: `tests/zer_fail/gap27_cstr_raw_ptr_dest.zer`.
+
+Implementation: `checker.c` `@cstr` intrinsic handling — added
+TYPE_POINTER rejection that excludes `is_volatile` (so MMIO writes
+still compile) and `is_const` (already rejected earlier with a
+different message).
+
+## ~~Gap 10 — `@critical` on bare-metal x86 only emits memory fence~~ (FIXED 2026-05-16)
+
+**Status:** `IR_CRITICAL_BEGIN` / `IR_CRITICAL_END` now emit an
+`#elif (defined(__x86_64__) || defined(__i386__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)`
+branch that saves EFLAGS and runs `cli` (begin) / `popf` (end). On
+hosted x86 user-mode the fence-only fallback is preserved — `cli`
+SIGSEGV's at CPL > 0, and user code can't legitimately disable
+interrupts there anyway.
+
+Verified by disassembly of a freestanding-compiled @critical test:
+
+```
+0000000000000000 <main>:
+   0: endbr64
+   4: pushf
+   5: pop    %rax
+   6: cli                    ; <-- actual interrupt disable
+   7: addl   $0x1,0x0(%rip)  ; critical body
+   e: push   %rax
+   f: popf                   ; <-- EFLAGS restore
+  10: mov    0x0(%rip),%eax
+  16: ret
+```
+
+The arch cascade order in `emitter.c` IR_CRITICAL_BEGIN/END is now:
+`__ARM_ARCH` → `__AVR__` → `__riscv` → bare-metal x86 → fence
+fallback. Bare-metal x86 takes precedence over the generic fence.
+
 ## ~~4 narrow zercheck patterns not in zercheck_ir~~ (FIXED 2026-05-04, Phase F3.2)
 
 **Originally discovered:** 2026-05-03 Phase F3 audit when `test_zercheck.c`

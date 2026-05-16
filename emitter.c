@@ -8912,6 +8912,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus));\n");
         emit_indent(e);
+        /* Gap 10 fix (2026-05-16): bare-metal x86 (kernel/bootloader)
+         * actually CAN disable interrupts via cli/sti — emit the real
+         * instructions instead of a useless memory fence. Detected by
+         * __STDC_HOSTED__ == 0 (freestanding) + x86 arch macro. On
+         * hosted user-mode x86, cli/sti would SIGSEGV (CPL != 0), so
+         * the fence-only fallback is correct there. */
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)\n");
+        emit_indent(e);
+        emit(e, "unsigned long _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
+        emit_indent(e);
         emit(e, "#else\n");
         emit_indent(e);
         emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
@@ -8933,6 +8943,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit(e, "#elif defined(__riscv)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus));\n");
+        emit_indent(e);
+        /* Gap 10 fix: restore EFLAGS on bare-metal x86. The push/pop
+         * order matches IR_CRITICAL_BEGIN's save/disable sequence. */
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"push %%0\\n\\tpopf\" :: \"r\"(_zer_x86_flags) : \"memory\", \"cc\");\n");
         emit_indent(e);
         emit(e, "#else\n");
         emit_indent(e);

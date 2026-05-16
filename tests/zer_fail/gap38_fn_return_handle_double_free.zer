@@ -1,0 +1,22 @@
+/* Gap 38 (2026-05-16): function returning Handle/?Handle was not
+ * tracked at the caller — silent double-free.
+ *
+ * Pattern: get_handle() returns ?Handle(T). Caller unwraps via orelse.
+ * Two heap.free(a) calls. Previously: zercheck_ir.c only registered
+ * handles for built-in pool.alloc/slab.alloc, so the function-return
+ * Handle was an untracked u64 value. Now: TYPE_HANDLE return is
+ * tracked the same as TYPE_POINTER. */
+struct Task { u32 id; }
+Slab(Task) heap;
+
+?Handle(Task) get_handle() {
+    return heap.alloc();
+}
+
+u32 main() {
+    ?Handle(Task) mh = get_handle();
+    Handle(Task) a = mh orelse return;
+    heap.free(a);
+    heap.free(a);  /* double-free — must be caught */
+    return 0;
+}

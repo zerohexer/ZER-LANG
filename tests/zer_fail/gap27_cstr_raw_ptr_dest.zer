@@ -1,0 +1,21 @@
+/* Gap 27 (2026-05-16): @cstr to raw `*u8` destination — silent
+ * buffer overflow. Raw pointer carries no length, so neither the
+ * checker (no array size) nor the emitter (no slice .len) could
+ * insert a bounds check.
+ *
+ * Pattern was:
+ *   u8[4] buf;
+ *   *u8 p = buf[0..].ptr;
+ *   @cstr(p, "Hello, world this is too long");  // SILENT 29-byte write to 4-byte buf
+ *
+ * Fix: reject `*u8` (non-volatile, non-const) as @cstr destination
+ * at the checker level with a clear "use slice or array destination"
+ * hint. Volatile pointers (MMIO registers) are still permitted —
+ * size is hardware-fixed there. */
+u32 main() {
+    u8[4] buf;
+    *u8 p = buf[0..].ptr;
+    const [*]u8 longstr = "Hello, world this is too long";
+    @cstr(p, longstr);  /* must error — raw *u8 destination unsafe */
+    return 0;
+}

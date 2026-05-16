@@ -2265,6 +2265,60 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     /* Fall through — dest may still need tracking if get result is pointer */
+                } else if (mc == IRMC_NONE && inst->dest_local >= 0 &&
+                           inst->dest_local < func->local_count) {
+                    /* Gap 38 fix (2026-05-16): non-method function call
+                     * returning Handle(T) or ?Handle(T) — register dest
+                     * as fresh ALIVE allocation so double-free / UAF in
+                     * caller is tracked.
+                     *
+                     * Covers the orelse-wrapped case:
+                     *   Handle(Task) h = get_handle() orelse return;
+                     *
+                     * which lowers to `_zer_or1 = ASSIGN <orelse(call, ret)>`
+                     * and reaches IR_ASSIGN, not IR_CALL.
+                     *
+                     * The bare `?Handle(Task) mh = get_handle();` case
+                     * lowers to IR_CALL and is handled at the IR_CALL
+                     * site below (which also got TYPE_HANDLE wired in).
+                     *
+                     * SAFETY: registers with a fresh alloc_id and ALIVE
+                     * state. ZC_COLOR_UNKNOWN because we can't infer
+                     * which pool/slab the callee used internally;
+                     * pool_name remains NULL so cross-pool detection
+                     * doesn't false-positive across function boundaries.
+                     *
+                     * escaped=true is set so the leak-at-exit check
+                     * doesn't fire — the dest is the caller's local,
+                     * but ownership came from another function and the
+                     * caller may legitimately pass it along (return,
+                     * defer destructor, cross-function destroy). The
+                     * FREED state transition still works for the
+                     * double-free detection this gap was designed to
+                     * catch — escaped only suppresses the "alive at
+                     * function exit" warning, not state transitions. */
+                    Type *dt = func->locals[inst->dest_local].type;
+                    Type *eff = dt ? type_unwrap_distinct(dt) : NULL;
+                    if (eff && eff->kind == TYPE_OPTIONAL) {
+                        eff = type_unwrap_distinct(eff->optional.inner);
+                    }
+                    if (eff && eff->kind == TYPE_HANDLE) {
+                        IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                        if (h) {
+                            if (h->state == IR_HS_ALIVE &&
+                                !func->locals[inst->dest_local].is_temp) {
+                                ir_zc_error(zc, inst->source_line,
+                                    "handle %%%d overwritten while alive — previous leaked",
+                                    inst->dest_local);
+                            }
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->source_color = ZC_COLOR_UNKNOWN;
+                            h->escaped = true;
+                        }
+                        break;
+                    }
                 }
             }
             /* If source is an ident that's a tracked handle, create alias */
@@ -2828,14 +2882,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     (summary->returns_color == ZC_COLOR_POOL ||
                      summary->returns_color == ZC_COLOR_MALLOC);
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
-                                ret_eff->kind == TYPE_OPAQUE))
+                                ret_eff->kind == TYPE_OPAQUE ||
+                                ret_eff->kind == TYPE_HANDLE))
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_HANDLE && color_is_allocator)
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
-                                  inner->kind == TYPE_OPAQUE))
+                                  inner->kind == TYPE_OPAQUE ||
+                                  inner->kind == TYPE_HANDLE))
                         is_ptr_return = true;
                     if (inner && inner->kind == TYPE_HANDLE && color_is_allocator)
                         is_ptr_return = true;
@@ -2847,6 +2903,18 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->alloc_line = inst->source_line;
                         h->alloc_id = _ir_next_alloc_id++;
                         h->source_color = summary->returns_color;
+                        /* Gap 38 fix (2026-05-16): mark Handle returns
+                         * as escaped (see no-summary branch below for
+                         * full rationale). Same logic — ownership came
+                         * from a function, leak-at-exit shouldn't fire
+                         * but double-free / UAF still gets caught via
+                         * state transitions. */
+                        if (ret_eff && (ret_eff->kind == TYPE_HANDLE ||
+                            (ret_eff->kind == TYPE_OPTIONAL &&
+                             type_unwrap_distinct(ret_eff->optional.inner) &&
+                             type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
+                            h->escaped = true;
+                        }
                     }
                 }
             }
@@ -2869,7 +2937,24 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             bool treat_as_alloc = already_handled;
             if (!already_handled && inst->dest_local >= 0 &&
                 inst->dest_local < func->local_count) {
-                /* Check callee return type */
+                /* Check callee return type.
+                 *
+                 * Gap 38 (2026-05-16): include TYPE_HANDLE so functions
+                 * returning Handle(T) or ?Handle(T) get tracked exactly
+                 * like pool.alloc(). Without this, the pattern
+                 *
+                 *   ?Handle(Task) mh = get_handle();
+                 *   Handle(Task) a = mh orelse return;
+                 *   heap.free(a);
+                 *   heap.free(a);   // silently undetected double-free
+                 *
+                 * was untracked because get_handle()'s return was treated
+                 * as an opaque value, not an allocation. Pool/Slab handles
+                 * are 64-bit values (slot index + generation), so the
+                 * runtime gen check MIGHT catch the second free — but
+                 * only if the slot has been reallocated with a different
+                 * generation in between. In the common pattern above
+                 * (no realloc between the two frees), it is silent UB. */
                 Type *ret = checker_get_type(zc->checker, call);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
@@ -2880,12 +2965,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                  * gates on returns_color == POOL/MALLOC; without a summary
                  * we have no signal at all, so register nothing. */
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
-                                ret_eff->kind == TYPE_OPAQUE))
+                                ret_eff->kind == TYPE_OPAQUE ||
+                                ret_eff->kind == TYPE_HANDLE))
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
-                                  inner->kind == TYPE_OPAQUE))
+                                  inner->kind == TYPE_OPAQUE ||
+                                  inner->kind == TYPE_HANDLE))
                         is_ptr_return = true;
                 }
                 /* Check if dest already has handle (e.g., arena-colored) */
@@ -2907,6 +2994,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->alloc_id = _ir_next_alloc_id++;
                     /* Detect cstdlib allocators by name */
                     bool is_stdlib = false;
+                    bool is_handle_return = false;
                     if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
                         uint32_t nlen = (uint32_t)call->call.callee->ident.name_len;
                         const char *nm = call->call.callee->ident.name;
@@ -2917,6 +3005,24 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     h->source_color = is_stdlib ? ZC_COLOR_MALLOC : ZC_COLOR_UNKNOWN;
+                    /* Gap 38 fix (2026-05-16): for Handle-returning
+                     * functions, mark escaped so leak-at-exit doesn't
+                     * fire — ownership came from another function and
+                     * the caller commonly passes the handle to a
+                     * destructor via defer or returns it. The FREED
+                     * state transition still works for double-free
+                     * detection (the original Gap 38 target). Without
+                     * this, the fix would regress every multi-module
+                     * test that creates a Handle from an imported
+                     * function and frees it via a defer destructor. */
+                    Type *dt = (inst->dest_local < func->local_count) ?
+                        func->locals[inst->dest_local].type : NULL;
+                    Type *dt_eff = dt ? type_unwrap_distinct(dt) : NULL;
+                    if (dt_eff && dt_eff->kind == TYPE_OPTIONAL)
+                        dt_eff = type_unwrap_distinct(dt_eff->optional.inner);
+                    if (dt_eff && dt_eff->kind == TYPE_HANDLE)
+                        is_handle_return = true;
+                    if (is_handle_return) h->escaped = true;
                 }
             }
 

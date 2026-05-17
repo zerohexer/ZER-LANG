@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// `orelse return` inside @critical skips interrupt re-enable.
+// Without the ban, on ARM/AVR/RISC-V the function returns with interrupts
+// permanently disabled — hardware safety hazard.
+
+struct T { u32 id; }
+Pool(T, 4) p;
+?Handle(T) maybe;
+
+void test() {
+    @critical {
+        Handle(T) h = maybe orelse return;
+        p.free(h);
+    }
+}
+
+void main() { test(); }

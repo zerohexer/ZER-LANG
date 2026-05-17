@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// `orelse continue` from inside @critical inside a loop skips
+// interrupt re-enable.
+
+struct T { u32 id; }
+Pool(T, 4) p;
+?Handle(T) maybe;
+
+void test() {
+    for (u32 i = 0; i < 3; i += 1) {
+        @critical {
+            Handle(T) h = maybe orelse continue;
+            p.free(h);
+        }
+    }
+}
+
+void main() { test(); }

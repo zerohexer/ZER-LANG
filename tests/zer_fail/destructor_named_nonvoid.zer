@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// Bodyless destructor with non-void return (e.g., POSIX-style `int close(*T)`)
+// must be treated as a free per Gap 17 name-heuristic. Without this widening
+// of the void-only signature heuristic, `destroy_resource(r); pool.free_ptr(r);`
+// silently double-freed because the non-void return excluded the call.
+
+struct Resource { u32 fd; }
+Slab(Resource) pool;
+
+i32 destroy_resource(*Resource r);
+
+void test_double_free() {
+    *Resource r = pool.alloc_ptr() orelse return;
+    destroy_resource(r);
+    pool.free_ptr(r);
+}
+
+void main() { test_double_free(); }

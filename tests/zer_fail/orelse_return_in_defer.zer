@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// `orelse return` inside defer corrupts cleanup flow (same as bare return).
+// Defer is supposed to run on every exit path; orelse return from inside
+// the defer body short-circuits remaining defers and the function epilogue.
+
+struct T { u32 id; }
+Pool(T, 4) p;
+?Handle(T) maybe;
+
+void test() {
+    Handle(T) h = p.alloc() orelse return;
+    defer {
+        Handle(T) other = maybe orelse return;
+        p.free(other);
+    }
+    p.free(h);
+}
+
+void main() { test(); }

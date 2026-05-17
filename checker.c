@@ -5487,6 +5487,46 @@ static Type *check_expr(Checker *c, Node *node) {
             checker_error(c, node->loc.line, "'orelse continue' outside of loop");
         }
 
+        /* Hardware/defer-safety bans for control flow via orelse fallback.
+         * `x orelse return/break/continue` lowers to a conditional jump that
+         * exits the @critical block (skipping interrupt re-enable) or the
+         * defer body (corrupting cleanup flow), exactly like a bare return/
+         * break/continue. The NODE_RETURN/NODE_BREAK/NODE_CONTINUE handlers
+         * enforce these bans, but orelse fallback is a flag — those handlers
+         * never run. Without these explicit checks, the bans are silent. */
+        if (node->orelse.fallback_is_return &&
+            zer_return_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'orelse return' inside defer block — corrupts cleanup flow");
+            } else {
+                checker_error(c, node->loc.line,
+                    "cannot use 'orelse return' inside @critical block — interrupts would not be re-enabled");
+            }
+        }
+        if (node->orelse.fallback_is_break &&
+            zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
+                                          c->in_loop ? 1 : 0) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'orelse break' inside defer block — corrupts cleanup flow");
+            } else if (c->critical_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'orelse break' inside @critical block — interrupts would not be re-enabled");
+            }
+        }
+        if (node->orelse.fallback_is_continue &&
+            zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
+                                             c->in_loop ? 1 : 0) == 0) {
+            if (c->defer_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'orelse continue' inside defer block — corrupts cleanup flow");
+            } else if (c->critical_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "cannot use 'orelse continue' inside @critical block — interrupts would not be re-enabled");
+            }
+        }
+
         if (node->orelse.fallback_is_return ||
             node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {

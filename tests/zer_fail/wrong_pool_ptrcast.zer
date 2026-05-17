@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Wrong-pool detection through @ptrcast round-trip. Previously IR_CAST and
+// IR_ASSIGN @ptrcast alias paths dropped pool_name, making this silent.
+//
+// The pool identity of the allocated handle must survive a *T -> *opaque -> *T
+// round-trip so cross-pool misuse is still caught at the free site.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    *Task tp = pool_a.alloc_ptr() orelse return;
+    *opaque o = @ptrcast(*opaque, tp);
+    *Task tp2 = @ptrcast(*Task, o);
+    pool_b.free_ptr(tp2);
+}
+
+void main() { test(); }

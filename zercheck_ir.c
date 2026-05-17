@@ -238,6 +238,52 @@ static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
     return h;
 }
 
+/* Alias propagation helper: register `dest_local` as a bare-local alias
+ * of `src_h`. Snapshots EVERY tracked field of `src_h` BEFORE calling
+ * ir_add_handle (which may realloc ps->handles, invalidating src_h).
+ *
+ * This consolidates the snapshot+propagate pattern that was previously
+ * duplicated across 7 sites (IR_COPY, IR_CAST, IR_ASSIGN orelse/ident/
+ * ptrcast/interior/bare-ident paths). Inconsistent fields between sites
+ * historically caused:
+ *   - IR_CAST silently dropped pool_name → wrong-pool through @ptrcast
+ *     round-trip was undetected
+ *   - IR_ASSIGN bare-ident alias dropped pool_name + escaped → false
+ *     leak reports + missed wrong-pool
+ *
+ * Returns the destination handle (or NULL on alloc failure). All caller
+ * usages should treat NULL as best-effort skip (state already tracked
+ * on src_h; missing alias is silent but conservative).
+ *
+ * NOTE: does NOT propagate `free_line` (only set when state transitions
+ * to FREED via ir_propagate_alias_state) and does NOT propagate `path`
+ * (this helper is for BARE-local aliases only — compound aliases need
+ * the path argument explicitly via ir_add_compound_handle). */
+static IRHandleInfo *ir_alias_bare_handle(IRPathState *ps, int dest_local,
+                                          IRHandleInfo *src_h) {
+    if (!src_h) return NULL;
+    /* Snapshot all fields before realloc-capable add. */
+    IRHandleState s_state    = src_h->state;
+    int           s_aline    = src_h->alloc_line;
+    int           s_aid      = src_h->alloc_id;
+    bool          s_escaped  = src_h->escaped;
+    int           s_color    = src_h->source_color;
+    bool          s_th       = src_h->is_thread_handle;
+    const char   *s_pname    = src_h->pool_name;
+    uint32_t      s_pname_l  = src_h->pool_name_len;
+    IRHandleInfo *dst_h = ir_add_handle(ps, dest_local);
+    if (!dst_h) return NULL;
+    dst_h->state             = s_state;
+    dst_h->alloc_line        = s_aline;
+    dst_h->alloc_id          = s_aid;
+    dst_h->escaped           = s_escaped;
+    dst_h->source_color      = s_color;
+    dst_h->is_thread_handle  = s_th;
+    dst_h->pool_name         = s_pname;
+    dst_h->pool_name_len     = s_pname_l;
+    return dst_h;
+}
+
 /* Add a compound handle entry (or return existing). path must be arena-
  * allocated by the caller — this struct just stores the pointer. */
 static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
@@ -711,6 +757,36 @@ static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
     return false;
 }
 
+/* Substring match against destructor-convention keywords. Returns true
+ * if `name` contains any of these case-sensitively (mirrors C/Unix and
+ * common idioms). Used to widen the void-only signature heuristic to
+ * also catch destructor-named functions with non-void return (e.g.,
+ * `int close(int fd)` from POSIX, `int destroy_X(*X)` for app code).
+ *
+ * Gap 17 was originally fixed in zercheck.c with `name_looks_like_
+ * destructor` but the implementation was lost during Phase F migration
+ * (zercheck.c became a 150-line shim). Without this widening, bodyless
+ * `int destroy_resource(*Resource)` was NOT recognized as a free, so
+ * `destroy_resource(r); pool.free_ptr(r);` silently double-freed.
+ *
+ * Keywords (12): free, destroy, close, release, delete, dispose, drop,
+ * cleanup, deinit, fini, shutdown, term. */
+static bool ir_name_looks_like_destructor(const char *name, uint32_t name_len) {
+    static const struct { const char *kw; uint32_t len; } kws[] = {
+        {"free",      4}, {"destroy",  7}, {"close",     5},
+        {"release",   7}, {"delete",   6}, {"dispose",   7},
+        {"drop",      4}, {"cleanup",  7}, {"deinit",    6},
+        {"fini",      4}, {"shutdown", 8}, {"term",      4},
+    };
+    for (size_t i = 0; i < sizeof(kws)/sizeof(kws[0]); i++) {
+        if (name_len < kws[i].len) continue;
+        for (uint32_t p = 0; p + kws[i].len <= name_len; p++) {
+            if (memcmp(name + p, kws[i].kw, kws[i].len) == 0) return true;
+        }
+    }
+    return false;
+}
+
 /* Check if a call is to a function that frees its first argument.
  * 1. Explicitly named "free"
  * 2. Bodyless void fn(*opaque/*T ...)        (signature heuristic)
@@ -747,7 +823,14 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
         p0 = sym->type->func_ptr.params[0];
     if (!p0) return false;
     p0 = type_unwrap_distinct(p0);
-    return p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE;
+    if (p0->kind != TYPE_POINTER && p0->kind != TYPE_OPAQUE) return false;
+    /* Tier 1: void return → free regardless of name. */
+    Type *ret = sym->type;
+    if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+    if (ret && type_unwrap_distinct(ret)->kind == TYPE_VOID) return true;
+    /* Tier 2: non-void return → require destructor-naming convention. */
+    return ir_name_looks_like_destructor(callee->ident.name,
+                                          (uint32_t)callee->ident.name_len);
 }
 
 /* ================================================================
@@ -1609,33 +1692,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "use of %s handle %%%d",
                 ir_state_name(src_h->state), inst->src1_local);
         }
-        /* Alias: dest inherits source's alloc_id and state.
-         *
-         * UAF GUARD (audit 2026-04-26): src_h points into ps->handles which
-         * can be realloc'd by ir_add_handle below — using src_h after the
-         * add is a heap-use-after-free. Snapshot fields BEFORE the
-         * realloc-capable add. */
-        IRHandleState src_state = src_h->state;
-        int src_alloc_line = src_h->alloc_line;
-        int src_alloc_id = src_h->alloc_id;
-        int src_color = src_h->source_color;
-        bool src_is_th = src_h->is_thread_handle;
-        /* F3.2: propagate pool_name through alias copies so cross-pool
-         * detection works after orelse-decomposition (the orelse temp
-         * holds the alloc, then COPY transfers ownership to the named
-         * variable). */
-        const char *src_pool = src_h->pool_name;
-        uint32_t src_pool_len = src_h->pool_name_len;
-        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
-        if (dst_h) {
-            dst_h->state = src_state;
-            dst_h->alloc_line = src_alloc_line;
-            dst_h->alloc_id = src_alloc_id;
-            dst_h->source_color = src_color;
-            dst_h->is_thread_handle = src_is_th;
-            dst_h->pool_name = src_pool;
-            dst_h->pool_name_len = src_pool_len;
-        }
+        /* Alias: dest inherits ALL of source's tracked fields via the
+         * unified helper (handles realloc-UAF snapshot internally). */
+        ir_alias_bare_handle(ps, inst->dest_local, src_h);
         break;
     }
 
@@ -1688,7 +1747,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * F3.2 wrong-pool detection works after C-style cast aliases (e.g.,
          * `*Task t = (*Task)opaque_handle`). Pre-fix: IR_COPY propagated
          * pool_name (F3.2) but IR_CAST didn't, leaving a silent gap where
-         * cross-pool misuse through cast alias was missed. */
+         * cross-pool misuse through cast alias was missed.
+         *
+         * NOTE: This site will be replaced by MvXYC's IRAliasSnapshot helper
+         * in a subsequent commit — keeping the inline form here intentionally
+         * for clean superseding diff. */
         IRHandleState cast_state = src_h->state;
         int cast_alloc_line = src_h->alloc_line;
         int cast_alloc_id = src_h->alloc_id;
@@ -2059,7 +2122,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         /* UAF GUARD (BUG-618/643 restored 2026-04-29 from tNGWB):
                          * src_h points into ps->handles which can be realloc'd
                          * by ir_add_handle below. Snapshot ALL fields BEFORE
-                         * the add. F3.2 pool_name+len included. */
+                         * the add. F3.2 pool_name+len included. Will be
+                         * replaced by MvXYC's IRAliasSnapshot helper. */
                         IRHandleState s_state = src_h->state;
                         int s_alloc_line = src_h->alloc_line;
                         int s_alloc_id = src_h->alloc_id;
@@ -2152,21 +2216,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             }
                         }
                         if (src_h) {
-                            /* UAF GUARD: snapshot before realloc-capable add. */
-                            IRHandleState s_state = src_h->state;
-                            int s_alloc_line = src_h->alloc_line;
-                            int s_alloc_id = src_h->alloc_id;
-                            int s_color = src_h->source_color;
-                            bool s_escaped = src_h->escaped;
-                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
-                            if (dst_h) {
-                                dst_h->state = s_state;
-                                dst_h->alloc_line = s_alloc_line;
-                                dst_h->alloc_id = s_alloc_id;
-                                dst_h->source_color = s_color;
-                                /* Propagate escaped so aliases don't leak */
-                                dst_h->escaped = s_escaped;
-                            }
+                            /* Unified alias helper — includes pool_name +
+                             * is_thread_handle that the per-site snapshot
+                             * code historically missed. */
+                            ir_alias_bare_handle(ps, inst->dest_local, src_h);
                         }
                     }
                 }
@@ -2190,18 +2243,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (base_local >= 0) {
                         IRHandleInfo *base_h = ir_find_handle(ps, base_local);
                         if (base_h && base_h->alloc_id != 0) {
-                            /* UAF GUARD: snapshot before realloc-capable add. */
-                            IRHandleState b_state = base_h->state;
-                            int b_alloc_line = base_h->alloc_line;
-                            int b_alloc_id = base_h->alloc_id;
-                            int b_color = base_h->source_color;
-                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
-                            if (dst_h) {
-                                dst_h->state = b_state;
-                                dst_h->alloc_line = b_alloc_line;
-                                dst_h->alloc_id = b_alloc_id;
-                                dst_h->source_color = b_color;
-                            }
+                            /* Unified alias helper — includes pool_name +
+                             * escaped + is_thread_handle. Interior pointers
+                             * to pool-derived memory MUST inherit pool_name
+                             * so subsequent pool.free_ptr through them is
+                             * caught for wrong-pool. */
+                            ir_alias_bare_handle(ps, inst->dest_local, base_h);
                         }
                     }
                 }

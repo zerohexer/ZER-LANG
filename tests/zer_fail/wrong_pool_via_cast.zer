@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Wrong-pool detection through C-style cast round-trip. Same class as
+// wrong_pool_ptrcast.zer but exercises the IR_CAST path (typecast).
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    *Task tp = pool_a.alloc_ptr() orelse return;
+    *opaque o = (*opaque)tp;
+    *Task tp2 = (*Task)o;
+    pool_b.free_ptr(tp2);
+}
+
+void main() { test(); }

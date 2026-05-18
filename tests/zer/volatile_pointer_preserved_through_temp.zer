@@ -1,0 +1,33 @@
+// Regression: volatile *u32 qualifier was stripped when copying a global
+// volatile pointer into an IR-emitted temp, silently demoting MMIO
+// reads/writes to non-volatile (GCC could cache/elide them — silent
+// miscompile on bare-metal).
+//
+// Symptom before fix: `volatile uint32_t* reg; ...; uint32_t* _zer_t0 = reg;`
+// (volatile dropped on temp) → GCC warning "assignment discards 'volatile'
+// qualifier" + non-volatile read in subsequent indexing.
+//
+// Fix: checker.c register_decl (NODE_GLOBAL_VAR) and check_decl
+// (NODE_VAR_DECL/NODE_GLOBAL_VAR body pass) both propagate
+// var_decl.is_volatile onto TYPE_POINTER (was only done for TYPE_SLICE).
+// The symbol type now carries pointer.is_volatile, so subsequent NODE_IDENT
+// lookups + IR temps + emit_type all preserve volatile.
+//
+// Test compiles cleanly + main returns 0. The MMIO read is in a dead
+// branch so we don't fault on hosted Linux (the address is unmapped),
+// but the dead-branch path still goes through IR lowering and emit_type,
+// exercising the fix.
+mmio 0x40010000..0x40010FFF;
+volatile *u32 reg = @inttoptr(*u32, 0x40010000);
+
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        // Dead branch: never executed but compiled. The temp holding
+        // a copy of `reg` must be declared volatile, otherwise the
+        // read is non-volatile (silent MMIO miscompile).
+        u32 v = reg[0];
+        return v;
+    }
+    return 0;
+}

@@ -4328,6 +4328,36 @@ static Type *check_expr(Checker *c, Node *node) {
         /* unwrap distinct typedef for call dispatch */
         Type *effective_callee = type_unwrap_distinct(callee_type);
 
+        /* Async functions are compiled as state-machine init/poll pairs
+         * (_zer_async_FN_init + _zer_async_FN_poll). Calling them by their
+         * original name doesn't dispatch through the state machine — the
+         * emitter emits a literal call to a symbol that no longer exists.
+         * Pre-fix: silent through checker; GCC implicit-declaration warning
+         * + linker undefined-reference error (confusing to users). Now
+         * rejected at check time with a clear hint pointing at the proper
+         * init/poll dispatch.
+         *
+         * Applies anywhere async fn appears as a call target — even from
+         * inside another async fn (the emitter doesn't inline async-to-async
+         * either, so the same link failure occurs there). */
+        if (node->call.callee->kind == NODE_IDENT) {
+            Symbol *callee_sym = scope_lookup(c->current_scope,
+                node->call.callee->ident.name,
+                (uint32_t)node->call.callee->ident.name_len);
+            if (callee_sym && callee_sym->is_async) {
+                checker_error(c, node->loc.line,
+                    "cannot call async function '%.*s' as a regular call — "
+                    "async functions are state machines. Use:\n"
+                    "  _zer_async_%.*s task;\n"
+                    "  _zer_async_%.*s_init(&task);\n"
+                    "  while (_zer_async_%.*s_poll(&task) == 0) { ... }",
+                    (int)node->call.callee->ident.name_len, node->call.callee->ident.name,
+                    (int)node->call.callee->ident.name_len, node->call.callee->ident.name,
+                    (int)node->call.callee->ident.name_len, node->call.callee->ident.name,
+                    (int)node->call.callee->ident.name_len, node->call.callee->ident.name);
+            }
+        }
+
         if (effective_callee->kind == TYPE_FUNC_PTR) {
             /* verify arg count */
             if ((uint32_t)node->call.arg_count != effective_callee->func_ptr.param_count) {
@@ -7809,11 +7839,26 @@ static void check_stmt(Checker *c, Node *node) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
         }
-        /* propagate volatile from var qualifier to slice type */
+        /* propagate volatile from var qualifier to slice/pointer type.
+         *
+         * Pointer propagation (added 2026-05-18): without this, the type
+         * stored in the typemap for `volatile *u32 reg = ...` is plain
+         * `*u32`. Subsequent uses of `reg` (via NODE_IDENT) returned this
+         * non-volatile type; IR lowering copied `reg` into a temp typed
+         * `*u32`, and the emitter declared `uint32_t* _zer_t0 = reg;` —
+         * stripping volatile. GCC warned "assignment discards 'volatile'
+         * qualifier" but the resulting reads/writes through the temp were
+         * NOT volatile in C, so GCC was free to cache/elide MMIO accesses
+         * — silent miscompile on bare-metal embedded targets. */
         if (node->var_decl.is_volatile && type) {
             if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
                 type = type_volatile_slice(c->arena, type->slice.inner);
                 if (node->var_decl.is_const) type->slice.is_const = true;
+            } else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
+                Type *vp = type_pointer(c->arena, type->pointer.inner);
+                vp->pointer.is_volatile = true;
+                vp->pointer.is_const = type->pointer.is_const;
+                type = vp;
             }
         }
         /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
@@ -11181,6 +11226,7 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_function = true;
             sym->is_static = node->func_decl.is_static;
             sym->is_comptime = node->func_decl.is_comptime;
+            sym->is_async = node->func_decl.is_async;
             sym->func_node = node;
             /* BUG-218: store module prefix for function name mangling */
             sym->module_prefix = c->current_module;
@@ -11249,6 +11295,25 @@ static void register_decl(Checker *c, Node *node) {
                 type = type_const_slice(c->arena, type->slice.inner);
             } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
+            }
+        }
+        /* propagate volatile from var qualifier to slice/pointer type.
+         * Pointer propagation (added 2026-05-18): see matching block in
+         * the NODE_VAR_DECL/NODE_GLOBAL_VAR body-check case — globals are
+         * registered here in register_decl BEFORE bodies are checked, so
+         * sym->type must carry the volatile flag from this entry point.
+         * Without this, NODE_IDENT references to a global volatile pointer
+         * return the non-volatile sym->type and downstream IR temps strip
+         * volatile (silent miscompile on MMIO reads/writes). */
+        if (node->var_decl.is_volatile && type) {
+            if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
+                type = type_volatile_slice(c->arena, type->slice.inner);
+                if (node->var_decl.is_const) type->slice.is_const = true;
+            } else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
+                Type *vp = type_pointer(c->arena, type->pointer.inner);
+                vp->pointer.is_volatile = true;
+                vp->pointer.is_const = type->pointer.is_const;
+                type = vp;
             }
         }
         /* Gap 43 (2026-04-27): reject threadlocal shared struct combination.

@@ -1,0 +1,24 @@
+// Regression: auto-guard `return;` UB in promoted `int main()`.
+//
+// User writes `void main()`. The compiler auto-promotes to `int main(void)`
+// (BUG-603). If a runtime safety check (auto-guard for unproven array index,
+// MMIO bounds, or @cstr overflow) fires, it must emit `return 0;` — bare
+// `return;` in `int main(void)` is undefined behavior under C99/C11:
+//
+//   - gcc -O0: exit code 0 (eax happens to be zeroed)
+//   - gcc -O2: exit code 208 (eax holds whatever)
+//   - gcc warns "return with no value, in function returning non-void"
+//
+// Fix is in emit_safety_early_return (emitter.c): checks
+// current_main_promoted and emits `return 0;` for void main, `return;`
+// for true void functions. Test trips the path by defeating VRP with a
+// loop-mediated assignment and then accessing the unprovably-bounded array.
+u32[4] arr;
+void main() {
+    u32 i = 0;
+    for (u32 k = 0; k < 1; k += 1) { i = 99; }
+    // VRP cannot prove i < 4 here — auto-guard inserts:
+    //   if ((size_t)i >= 4u) { return 0; }  ← was `return;` (UB)
+    u32 v = arr[i];
+    arr[0] = v;
+}

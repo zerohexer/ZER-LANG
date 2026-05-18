@@ -914,6 +914,122 @@ session notes)
 
 ---
 
+## Session 2026-05-18 — Codebase audit: 3 silent gaps closed
+
+Systematic audit hunting for silent miscompilation gaps (compile-clean
++ runtime-clean but wrong behavior on bare-metal or under specific
+optimization levels). Found and fixed 3 unrelated bugs.
+
+### BUG-662: auto-guard `return;` UB in promoted `void main()`
+
+**Symptom**: `void main()` is auto-promoted to `int main(void)` per
+BUG-603. When a runtime safety auto-guard fires (NODE_INDEX bounds,
+NODE_FIELD UAF idx, or `@cstr` overflow), the emitter inserted bare
+`return;` (no value) into the now-`int`-returning main. This is a
+constraint violation in C99/C11; GCC warns but compiles. Observed
+exit codes: 0 on `-O0`, 208 on `-O2` for identical source.
+
+```c
+int main(void) {              /* auto-promoted from void main() */
+    if ((size_t)i >= 4u) {
+        return;                /* ← UB: bare return in non-void main */
+    }
+    return 0;
+}
+```
+
+**Root cause**: emit_auto_guards (and the matching `@cstr` overflow
+path) checked `e->current_func_ret->kind != TYPE_VOID` to decide
+whether to emit a value. For promoted void main, that check is true
+(VOID), so bare `return;` is emitted — but the C function signature is
+now `int main(void)`, mismatch is UB. The promotion flag
+`current_main_promoted` was set but not consulted at these sites.
+
+**Fix**: extracted `emit_safety_early_return()` helper in emitter.c
+that consolidates the four prior emit sites (NODE_INDEX auto-guard,
+NODE_FIELD UAF auto-guard, two `@cstr` overflow auto-orelse paths) and
+checks `current_main_promoted` to emit `return 0;` instead of bare
+`return;`. The four call sites now share one decision point.
+
+**Test**: `tests/zer/autoguard_void_main_promoted.zer` triggers the
+auto-guard path with VRP-defeating loop indirection and asserts
+deterministic exit code 0 (was 0 / 208 depending on optimization).
+
+---
+
+### BUG-663: `async fn()` called as a regular call → silent linker UB
+
+**Symptom**: `async void worker() { yield; }` declared. Caller writes
+`worker();` (regular call syntax instead of init/poll pair). The ZER
+checker accepted this silently. The emitter renames async functions
+to `_zer_async_NAME_init` + `_zer_async_NAME_poll`, leaving the bare
+`worker` symbol undefined. GCC emits implicit-declaration warning;
+linker emits "undefined reference to `worker`". User sees confusing
+two-stage failure with no hint at the actual cause.
+
+Affects:
+- Bare async call from regular function: undefined reference at link.
+- Bare async call from inside another async function: same — the
+  emitter doesn't auto-chain async-to-async either.
+
+**Root cause**: checker.c register_decl for NODE_FUNC_DECL set
+`sym->is_function = true` but had no way to mark the symbol as async.
+NODE_CALL handler had no async-target check.
+
+**Fix**:
+1. Added `bool is_async` to Symbol (types.h).
+2. register_decl sets `sym->is_async = node->func_decl.is_async`.
+3. NODE_CALL handler rejects async-target calls at compile time with
+   a diagnostic showing the proper init/poll dispatch pattern.
+
+**Test**: `tests/zer_fail/async_called_as_regular.zer` and
+`tests/zer_fail/async_to_async_call.zer` verify both shapes are
+rejected.
+
+---
+
+### BUG-664: `volatile *T` qualifier stripped through IR temps
+
+**Symptom**: ZER global `volatile *u32 reg = @inttoptr(*u32, 0xADDR);`
+referenced as `reg[i]` lowered through IR to:
+
+```c
+volatile uint32_t* reg = ...;
+uint32_t* _zer_t0 = {0};      /* ← volatile DROPPED on temp */
+_zer_t0 = reg;                 /* GCC warns "discards 'volatile'" */
+_zer_t2 = _zer_t0[i];          /* ← non-volatile read; GCC may cache/elide */
+```
+
+GCC warned "assignment discards 'volatile' qualifier" but the resulting
+binary had non-volatile MMIO reads. On bare-metal embedded targets,
+the optimizer may cache or elide these reads — **silent miscompile**
+where MMIO values appear stuck.
+
+**Root cause**: checker.c propagated `var_decl.is_volatile` to
+`TYPE_SLICE`'s `slice.is_volatile` but NOT to `TYPE_POINTER`'s
+`pointer.is_volatile`. The symbol's `sym->type` was therefore a plain
+non-volatile pointer. Every subsequent NODE_IDENT reference to the
+global returned the stripped type, which IR lowering propagated into
+emitted temps. The emitter had a special-case at emit_global_var that
+constructed a volatile type on the fly for the DECLARATION emission
+only — masking the symbol-level loss.
+
+**Fix**: extended the volatile-propagation block in both
+`check_stmt` (NODE_VAR_DECL / NODE_GLOBAL_VAR body pass) and
+`register_decl` (NODE_GLOBAL_VAR registration, runs FIRST) to also
+construct a volatile pointer type when `var_decl.is_volatile` is set
+and the type is TYPE_POINTER. Both call sites must be updated because
+NODE_GLOBAL_VAR is registered in `register_decl` before bodies are
+checked, and downstream NODE_IDENT resolution reads sym->type at that
+point.
+
+**Test**: `tests/zer/volatile_pointer_preserved_through_temp.zer`
+compiles cleanly (regression guard — if volatile is lost, the emitted
+C has the GCC discard-qualifiers warning + a non-volatile temp
+declaration that gcc would diagnose with `-Werror`).
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

@@ -281,27 +281,43 @@ static void emit_zero_value(Emitter *e, Type *t) {
     }
 }
 
-/* Emit the body of an auto-guard return ({ defers; return <zero>; }).
+/* Emit `{ defers; return [value]; }` for early-exit safety guards
+ * (auto-guard NODE_INDEX, UAF auto-guard NODE_FIELD, @cstr overflow auto-orelse).
+ *
  * Async-aware: in async function bodies (Duff's-device poll loops), a bare
  * C `return;` would suspend the coroutine without signalling completion —
  * subsequent polls would re-enter at state 0 and re-run the prologue,
  * silently looping. Emit the same termination sequence IR_RETURN uses for
  * async (`self->_zer_state = -1; return 1;`) so the auto-guard early-out
- * marks the coroutine done. Regular functions emit the normal return. */
-static void emit_auto_guard_return_body(Emitter *e) {
-    emit(e, "{\n");
+ * marks the coroutine done.
+ *
+ * Main-promotion-aware: `void main()` is auto-promoted to `int main(void)`.
+ * A bare `return;` in C `int main(void)` makes the exit code UB — eax holds
+ * whatever happened to be there. Observed exit=208 on gcc -O2 vs exit=0 on
+ * -O0 for the same source. Emit `return 0;` when `current_main_promoted`.
+ *
+ * `with_braces` controls whether the leading `{` / trailing `}` is emitted —
+ * NODE_INDEX/NODE_FIELD callers want explicit braces+newline (statement form);
+ * @cstr inline statement-expression already opened the brace via "if (...) { ". */
+static void emit_safety_early_return(Emitter *e, bool with_braces) {
+    if (with_braces) emit(e, "{\n");
     emit_defers(e);
     if (e->in_async) {
-        emit_indent(e);
-        emit(e, "self->_zer_state = -1; return 1; }\n");
+        if (with_braces) emit_indent(e);
+        emit(e, "self->_zer_state = -1; return 1;");
     } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
         emit(e, "return ");
         emit_zero_value(e, e->current_func_ret);
-        emit(e, "; }\n");
+        emit(e, ";");
+    } else if (e->current_main_promoted) {
+        emit(e, "return 0;");
     } else {
-        emit(e, "return; }\n");
+        emit(e, "return;");
     }
+    if (with_braces) emit(e, " }\n");
+    else emit(e, " ");
 }
+
 
 /* Walk expression tree, emit auto-guard if-return statements for unproven NODE_INDEX.
  * Called BEFORE emit_expr for the containing statement. */
@@ -315,7 +331,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
             emit(e, "if ((size_t)(");
             emit_expr(e, node->index_expr.index);
             emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
-            emit_auto_guard_return_body(e);
+            emit_safety_early_return(e, true);
         }
         emit_auto_guards(e, node->index_expr.object);
         emit_auto_guards(e, node->index_expr.index);
@@ -340,7 +356,7 @@ static void emit_auto_guards(Emitter *e, Node *node) {
                     emit(e, ") == (");
                     emit_expr(e, df->freed_idx);
                     emit(e, ")) ");
-                    emit_auto_guard_return_body(e);
+                    emit_safety_early_return(e, true);
                     break;
                 }
             }
@@ -3009,27 +3025,14 @@ static void emit_expr(Emitter *e, Node *node) {
             if (buf_eff && buf_eff->kind == TYPE_ARRAY) {
                 emit(e, "; if (_zer_cs%d.len + 1 > %llu) { ",
                      tmp, (unsigned long long)buf_eff->array.size);
-                /* auto-orelse: return zero value instead of trap. Trap stays as comment. */
-                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                    emit_defers(e);
-                    emit(e, "return ");
-                    emit_zero_value(e, e->current_func_ret);
-                    emit(e, "; } ");
-                } else {
-                    emit_defers(e);
-                    emit(e, "return; } ");
-                }
+                /* auto-orelse: return zero value instead of trap. Trap stays as comment.
+                 * Caller already opened "{ " — emit defers+return+"}" inline. */
+                emit_safety_early_return(e, false);
+                emit(e, "} ");
             } else if (dest_is_slice) {
                 emit(e, "; if (_zer_cs%d.len + 1 > _zer_cd%d.len) { ", tmp, tmp);
-                if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-                    emit_defers(e);
-                    emit(e, "return ");
-                    emit_zero_value(e, e->current_func_ret);
-                    emit(e, "; } ");
-                } else {
-                    emit_defers(e);
-                    emit(e, "return; } ");
-                }
+                emit_safety_early_return(e, false);
+                emit(e, "} ");
             } else {
                 emit(e, "; ");
             }

@@ -206,6 +206,7 @@ struct Symbol {
     /* for functions */
     bool is_function;
     bool is_comptime;       /* comptime function — evaluated at compile time */
+    bool is_async;          /* async coroutine — calls emitted as init/poll pair, not direct */
     Node *func_node;        /* AST node for function body, if applicable */
 
     /* Function summaries: computed properties of function bodies (lazy, cached).

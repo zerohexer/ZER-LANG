@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+//
+// Same root cause as async_called_as_regular.zer, but the call site is
+// INSIDE another async function. The emitter doesn't auto-chain async-to-
+// async either, so the same dangling-symbol bug applies. Pre-fix, this
+// produced a runtime crash via linker undefined-reference; now the
+// checker rejects at compile time.
+async void inner() { yield; }
+
+async void outer() {
+    inner();  // ← must be rejected even from inside another async fn
+    yield;
+}
+
+void main() { }

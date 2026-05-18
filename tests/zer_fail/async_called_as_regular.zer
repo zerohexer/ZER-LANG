@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+//
+// Regression: `async fn()` called as a regular call (not via the
+// state-machine init/poll pair). Pre-fix, the checker accepted this;
+// the emitter renamed the function to `_zer_async_NAME_init/poll`,
+// leaving the bare call as a dangling symbol — GCC implicit-declaration
+// warning + linker undefined-reference (confusing two-stage failure).
+//
+// Fix: checker recognizes Symbol.is_async at NODE_CALL and rejects
+// with a helpful diagnostic pointing at the proper init/poll dispatch.
+async void worker() {
+    yield;
+}
+
+void main() {
+    worker();  // ← must be rejected: "cannot call async function as a regular call"
+}

@@ -1,0 +1,20 @@
+// Regression: silent-gap audit 2026-05-21.
+// Pool.free of an auto-zero (never-allocated) Handle must be a no-op,
+// not silently bump gen[0] which would invalidate a legitimate handle in slot 0.
+
+struct Item { u32 v; }
+Pool(Item, 4) pool;
+
+u32 main() {
+    Handle(Item) good = pool.alloc() orelse { return 1; };
+    pool.get(good).v = 42;
+
+    // Auto-zero handle — never allocated. h_gen == 0.
+    Handle(Item) zero;
+    pool.free(zero);  // must be no-op; if it bumps gen[0], 'good' becomes invalid.
+
+    // good must still be valid — read its value
+    if (pool.get(good).v != 42) { pool.free(good); return 2; }
+    pool.free(good);
+    return 0;
+}

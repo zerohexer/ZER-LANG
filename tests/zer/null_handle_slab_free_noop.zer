@@ -1,0 +1,16 @@
+// Regression: silent-gap audit 2026-05-21 (slab counterpart of pool variant).
+
+struct Item { u32 v; }
+Slab(Item) heap;
+
+u32 main() {
+    Handle(Item) good = heap.alloc() orelse { return 1; };
+    heap.get(good).v = 42;
+
+    Handle(Item) zero;
+    heap.free(zero);  // must be no-op.
+
+    if (heap.get(good).v != 42) { heap.free(good); return 2; }
+    heap.free(good);
+    return 0;
+}

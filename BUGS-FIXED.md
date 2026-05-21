@@ -1030,6 +1030,64 @@ declaration that gcc would diagnose with `-Werror`).
 
 ---
 
+## Session 2026-05-21 — Silent-gap audit: pool/slab.free null-handle corruption
+
+**Symptom:** declaring `Handle(T) h;` with no initializer auto-zeroes
+the handle to `h_gen == 0, idx == 0`. Calling `pool.free(h)` or
+`slab.free(h)` on this "null" Handle silently bumped `gen[0]` and
+cleared `used[0]` in the recipient allocator — invalidating any
+legitimate handle the pool had issued for slot 0 (which carries
+`h_gen >= 1`). Subsequent `pool.get(legit_h)` trapped on gen mismatch,
+but the trap message blamed the legitimate handle, not the actual
+cause (null-handle free). Both compile-time and runtime missed the
+root cause — classic silent-gap.
+
+**Repro pattern:**
+```zer
+Handle(Item) good = pool.alloc() orelse { return 99; };  // slot 0, gen 1
+pool.get(good).v = 42;
+Handle(Item) zero;        // auto-zero — h_gen == 0
+pool.free(zero);          // before fix: bumped pool.gen[0] silently
+return pool.get(good).v;  // before fix: trap (gen mismatch) — blames good
+```
+
+**Root cause:** `_zer_pool_free` and `_zer_slab_free` (emitter.c
+runtime preamble) lacked any handle validation. They unconditionally
+performed `gen[idx]++; used[idx] = 0;` for `idx < capacity` — no
+check on `h_gen`. The IR-level `zercheck_ir` doesn't flag use of an
+auto-zeroed Handle (the lattice's UNKNOWN state passes through the
+IR_POOL_FREE handler without an error).
+
+**Fix:** added `if (h_gen == 0) return;` short-circuit at the top of
+both `_zer_pool_free` (emitter.c:4751) and `_zer_slab_free`
+(emitter.c:4854). Null-handle free is now a silent no-op (the typical
+"null handle" semantics), preserving pool state integrity. Both pool
+and slab runtimes get the same guard.
+
+**Stronger validation deferred.** Ideally `_zer_pool_free` would also
+trap on `gen[idx] != h_gen` (matching `_zer_pool_get`'s discipline),
+catching wrong-pool / stale-handle frees that compile-time
+`zercheck_ir` misses (e.g., cross-function calls without a
+pool-aware FuncSummary). Attempted but reverted in this session
+because it surfaced a SEPARATE emitter bug:
+
+**Found-but-not-fixed: defer-fires-twice on goto-to-same-scope-label.**
+`ir_lower.c` NODE_GOTO emits `IR_DEFER_FIRE` (fire all, no pop), then
+the function-exit defer fire emits the same set again. The
+`rust_tests/rt_goto_fires_defer.zer` test relies on the lenient
+runtime to hide this. Documented in `docs/limitations.md`.
+
+**Tests:**
+- `tests/zer/null_handle_pool_free_noop.zer`
+- `tests/zer/null_handle_slab_free_noop.zer`
+
+Also confirmed during this audit that all 7 originally-listed gaps in
+the 2026-04-19 limitations.md audit are now CAUGHT by the production
+compiler (Phase F migration + various fixes closed them). Updated
+`docs/limitations.md` table to reflect actual status.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

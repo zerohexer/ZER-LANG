@@ -237,6 +237,78 @@ The arch cascade order in `emitter.c` IR_CRITICAL_BEGIN/END is now:
 `__ARM_ARCH` → `__AVR__` → `__riscv` → bare-metal x86 → fence
 fallback. Bare-metal x86 takes precedence over the generic fence.
 
+---
+
+## ~~Pool/Slab.free of auto-zero Handle corrupts slot 0~~ (FIXED 2026-05-21, audit session)
+
+**Symptom (pre-fix):** declaring `Handle(Item) h;` without initializer
+auto-zeroes to `h_gen == 0`, `idx == 0`. Calling `pool.free(h)` on this
+"null" Handle bumped `pool.gen[0]` and cleared `pool.used[0]` —
+silently invalidating any legitimate handle that the pool had issued
+for slot 0 (which has `h_gen >= 1`). Subsequent `pool.get(legit_h)`
+would trap on gen mismatch, but the trap message blamed the legitimate
+handle instead of the actual cause (the null-handle free).
+
+**Root cause:** `_zer_pool_free` and `_zer_slab_free` lacked the
+`h_gen == 0` short-circuit. Compile-time `zercheck_ir` did not flag
+the use of an uninitialized Handle either, because UNKNOWN-state
+handles fall through the IR_POOL_FREE handler (which only checks
+ALIVE/FREED/MAYBE_FREED/TRANSFERRED transitions). Both compile-time
+miss + runtime corruption = SILENT GAP class — caught only when a
+legitimate handle later trapped on gen mismatch.
+
+**Fix:** added `if (h_gen == 0) return;` no-op at top of
+`_zer_pool_free` and `_zer_slab_free`. Auto-zero Handle free is now
+silently ignored (the typical "null handle" pattern), preserving pool
+state integrity. Regression tests:
+- `tests/zer/null_handle_pool_free_noop.zer`
+- `tests/zer/null_handle_slab_free_noop.zer`
+
+**Stronger validation deferred.** Ideally `_zer_pool_free` would also
+trap on `gen[idx] != h_gen` (matching `_zer_pool_get`'s discipline),
+catching wrong-pool / stale-handle frees that compile-time
+`zercheck_ir` misses (e.g., cross-function calls without a
+pool-aware FuncSummary). Attempted in this session but reverted: it
+trips the **defer-fires-twice-on-goto-to-same-scope** emitter bug
+described below.
+
+## OPEN — Defer fires twice when goto target is in same defer scope
+
+**Symptom:** `defer free(h); ... goto cleanup; ... cleanup: return 0;`
+fires the defer body once at the goto site AND again at the return
+site. The defer body executes twice for a single dynamic execution.
+
+**Why it's hidden today:** runtime `_zer_pool_free` is intentionally
+lenient (just bumps gen + clears used; no validation on stale h_gen).
+Double-fire of `pool.free(h)` silently bumps gen twice. The
+`rust_tests/rt_goto_fires_defer.zer` test relies on this — its
+check `freed_count != 1` runs at `cleanup:` BEFORE the second fire,
+so the test passes.
+
+**Why it matters:** any future runtime hardening of `_zer_pool_free`
+(generation validation, wrong-pool detection) traps on the second
+fire. The compile-time guarantee `zercheck_ir` reports for handle
+states becomes inconsistent with runtime behavior. Also: for user
+defers with non-idempotent side effects (file close, lock release),
+double-fire is a real bug.
+
+**Root cause:** `ir_lower.c` NODE_GOTO emits `emit_defer_fire(ctx)`
+which generates `IR_DEFER_FIRE` with mode "fire all, no pop". The
+function-exit defer fire then emits the same set again. The emitter
+needs to track which defer entries have already been fired on the
+current dynamic path, OR not fire defers when the goto target is
+inside the same defer scope (let the natural function exit fire them).
+
+**Fix estimate:** ~50-80 lines in `ir_lower.c` to compute "is goto
+target inside current defer scope" and skip the fire if so. Requires
+walking from goto site to label site through the lexical block
+structure. Alternative: a runtime per-defer "fired" flag — simpler
+but adds per-defer state.
+
+**Workaround today:** users SHOULD NOT rely on goto-fires-defer for
+non-idempotent cleanup. Either avoid goto-to-same-scope-label OR use
+explicit cleanup at the label.
+
 ## ~~4 narrow zercheck patterns not in zercheck_ir~~ (FIXED 2026-05-04, Phase F3.2)
 
 **Originally discovered:** 2026-05-03 Phase F3 audit when `test_zercheck.c`
@@ -435,15 +507,21 @@ they should fail). When a gap is fixed, move the reproducer to
 
 ### Real safety/correctness gaps
 
-| # | Short name | Gap | Runtime fallback | Fix est. |
-|---|---|---|---|---|
-| 1 | **Cross-block backward goto UAF** | `free(h); goto LABEL; ... LABEL: ... use(h)` — zercheck linear-walk can't track cycles | Slab gen counter traps at runtime (exit 133 / SIGTRAP) | ~300 lines — CFG-based zercheck rewrite |
-| 2 | **Same-line UAF suppressed** | `h.free(p); u32 x = p.x;` on same line — `h->free_line < cur_line` check filters | Slab gen counter traps | ~30 lines — replace line-compare with statement-counter |
-| 3 | **`yield` outside async silently stripped** | `void go() { yield; }` compiles; emits no-op | None (silent behavior) | ~5 lines — check `!in_async` in NODE_YIELD |
-| 4 | **async + shared struct across yield** | `async { s.v = 1; yield; s.v = 2; }` on a `shared struct` — lock held across yield = deadlock per spec, not enforced | Potential deadlock at runtime | medium — AST walker for shared access in async fn |
-| 5 | **`container<move struct>` loses move semantics** | `Box(Tok) b; b.item = t; consume(b.item); b.item.k` — move-transfer through container field not tracked | None (use after transfer) | medium — move-tracking through field writes |
-| 6 | **`goto` into if-unwrap capture scope** | `goto inside; if (m) \|v\| { inside: return v; }` — captured `v` uninitialized at goto target | Auto-zero (returns 0 silently) | medium — label reachability analysis |
-| 7 | **`defer` nested in `defer` body** | `defer { defer { ... } }` accepted per spec says banned | Runs inner defer at outer defer fire time | ~5 lines — check `defer_depth > 0` in NODE_DEFER |
+**Status update (2026-05-21 audit):** all 7 originally-listed gaps from
+the 2026-04-19 audit are NOW CAUGHT by the production compiler.
+Re-verified empirically — see status column. Phase F migration to IR-CFG
+analyzer + multiple bug fixes since then closed them. Left in place as
+history; can be removed once a follow-up audit re-confirms.
+
+| # | Short name | Gap | Status 2026-05-21 |
+|---|---|---|---|
+| 1 | **Cross-block backward goto UAF** | `free(h); goto LABEL; ... LABEL: ... use(h)` | **CAUGHT** — IR fixpoint convergence widens through backward edges; reports `use after free: 'mh' is maybe-freed` |
+| 2 | **Same-line UAF suppressed** | `h.free(p); u32 x = p.x;` on same line | **CAUGHT** — zercheck_ir reports `use after free: 'h' is freed (freed at line 7)` |
+| 3 | **`yield` outside async silently stripped** | `void go() { yield; }` compiles; emits no-op | **CAUGHT** — `error: 'yield' only allowed inside async function` |
+| 4 | **async + shared struct across yield** | `shared struct` access across `yield` = deadlock | **CAUGHT** — checker.c:5034-5038 rejects shared struct access in yield statement |
+| 5 | **`container<move struct>` loses move semantics** | `Box(Tok) b; b.item = t; consume(b.item); b.item.k` | **CAUGHT** — zercheck_ir reports `use after free: 'b' is transferred` (move tracking through field writes works for the documented pattern) |
+| 6 | **`goto` into if-unwrap capture scope** | `goto inside; if (m) \|v\| { inside: ... }` | **CAUGHT** — `error: goto 'inside' jumps into if-unwrap/switch-capture arm without binding the capture` |
+| 7 | **`defer` nested in `defer` body** | `defer { defer { ... } }` | **CAUGHT** — `error: 'defer' cannot be nested inside another 'defer' body` |
 
 ### Precision issues (not safety)
 

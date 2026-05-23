@@ -4649,15 +4649,13 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * function B that also auto-locks the same shared struct.
      * Lazy init: first lock call initializes with PTHREAD_MUTEX_RECURSIVE.
      *
-     * Baremetal audit (2026-05-05): pthread_mutex_t / pthread_cond_t are
+     * Baremetal audit (2026-05-05/23): pthread_mutex_t / pthread_cond_t are
      * only available when the pthread.h include above (gated on
-     * __STDC_HOSTED__) brings them in. On true freestanding (-nostdinc
-     * or a cross toolchain without pthread headers) the helper bodies
-     * fail to parse. shared struct itself already contains pthread_*
-     * fields and so is hosted-only by design — but the helper
-     * declarations were emitted unconditionally and broke any program
-     * compiled freestanding. Gate them on __STDC_HOSTED__ to match the
-     * include + thread barrier blocks. */
+     * __STDC_HOSTED__) brings them in. Gate the helper definitions
+     * matching the include + thread barrier blocks. Bare-metal programs
+     * that actually use `shared struct` still get a loud GCC error at the
+     * call site (undefined function) — there is no portable lock primitive
+     * ZER can fabricate without a runtime. */
     emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
     emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
     /* BUG-483: accept optional condvar pointer — init alongside mutex in CAS winner.

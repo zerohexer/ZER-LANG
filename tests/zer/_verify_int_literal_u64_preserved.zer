@@ -1,0 +1,32 @@
+// Regression: u64 / i64 literals > 2^32 were silently truncated to u32.
+// Before fix: `u64 x = 0x100000000;` silently set x = 0.
+// Root cause: checker types ALL int literals as u32; ir_lower used that
+// type for the IR temp, then emitter cast literal to (uint32_t)N which
+// truncated. Fix: ir_lower widens literal temp to u64/i64 when value
+// exceeds UINT32_MAX.
+
+u64 make_big() {
+    return 0x123456789ABCDEF0;
+}
+
+u32 main() {
+    // 1. u64 with high-bit-set literal — value must be preserved.
+    u64 x = 0x100000000;
+    if (x != 4294967296) { return 1; }
+
+    // 2. Full u64 literal — must round-trip.
+    u64 y = 0xDEADBEEFCAFEBABE;
+    if (y != 0xDEADBEEFCAFEBABE) { return 2; }
+
+    // 3. Negative i64 literal beyond i32 range.
+    i64 n = -5000000000;
+    if (n >= 0) { return 4; }
+    i64 zero = n + 5000000000;
+    if (zero != 0) { return 5; }
+
+    // 4. Function returning u64 literal.
+    u64 big = make_big();
+    if (big != 0x123456789ABCDEF0) { return 6; }
+
+    return 0;
+}

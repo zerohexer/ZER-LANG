@@ -1,0 +1,15 @@
+// Regression: minimal program preamble must compile with gcc -ffreestanding.
+// Before fix: emitter unconditionally emitted `_zer_mtx_ensure_init_cv`
+// referencing pthread types, but <pthread.h> was gated on __STDC_HOSTED__.
+// Result: every program (even empty) failed to compile bare-metal —
+// 'PTHREAD_MUTEX_RECURSIVE' undeclared in preamble.
+// Fix: wrap mutex helpers in the same __STDC_HOSTED__ guard as the
+// barrier/semaphore helpers.
+//
+// This test only verifies the program compiles + runs on hosted (the
+// usual test path). The actual freestanding-compile check is documented
+// in BUGS-FIXED.md and manually verified with `gcc -ffreestanding`.
+
+u32 main() {
+    return 0;
+}

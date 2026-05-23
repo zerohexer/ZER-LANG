@@ -2493,12 +2493,17 @@ static Type *check_expr(Checker *c, Node *node) {
 
     switch (node->kind) {
     /* ---- Literals ---- */
-    case NODE_INT_LIT:
+    case NODE_INT_LIT: {
         /* integer literals are polymorphic — assignable to any integer type.
-         * Default to i32 for standalone use, but coercion handles the rest.
-         * We use a special approach: literals coerce to any integer type. */
-        result = ty_u32;
+         * Default type comes from the value width: small literals stay u32
+         * (preserves prior small-literal behavior), large literals widen
+         * to u64 so they survive ir_lower's `(CType)N` cast. Pre-fix all
+         * literals were typed u32 and values > UINT32_MAX silently lost
+         * their upper bits (e.g. `u64 x = 0x100000000` set x = 0). */
+        uint64_t v = node->int_lit.value;
+        result = (v > 0xFFFFFFFFULL) ? ty_u64 : ty_u32;
         break;
+    }
 
     case NODE_FLOAT_LIT:
         /* float literals coerce to f32 or f64 */
@@ -11072,12 +11077,26 @@ static void register_decl(Checker *c, Node *node) {
                 if (ev->value) {
                     /* explicit value — evaluate */
                     if (ev->value->kind == NODE_INT_LIT) {
-                        sv->value = (int32_t)ev->value->int_lit.value;
+                        uint64_t v = ev->value->int_lit.value;
+                        if (v > (uint64_t)INT32_MAX) {
+                            checker_error(c, ev->value->loc.line,
+                                "enum variant '%.*s' value %llu exceeds i32 range — enum values are 32-bit signed",
+                                (int)ev->name_len, ev->name,
+                                (unsigned long long)v);
+                        }
+                        sv->value = (int32_t)v;
                     } else if (ev->value->kind == NODE_UNARY &&
                                ev->value->unary.op == TOK_MINUS &&
                                ev->value->unary.operand->kind == NODE_INT_LIT) {
                         /* negative value: -N */
-                        sv->value = -(int32_t)ev->value->unary.operand->int_lit.value;
+                        uint64_t v = ev->value->unary.operand->int_lit.value;
+                        if (v > (uint64_t)INT32_MAX + 1ULL) {
+                            checker_error(c, ev->value->loc.line,
+                                "enum variant '%.*s' value -%llu exceeds i32 range — enum values are 32-bit signed",
+                                (int)ev->name_len, ev->name,
+                                (unsigned long long)v);
+                        }
+                        sv->value = -(int32_t)v;
                     }
                     next_val = sv->value + 1;
                 } else {

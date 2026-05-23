@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Regression: enum variant value > INT32_MAX was silently truncated to 0.
+// Before fix: `enum Big { x = 0x100000000 }` emitted `#define _ZER_Big_x 0`.
+// Now: rejected at the variant declaration with a clear error message.
+// Enum underlying type is i32 — values must fit in [INT32_MIN, INT32_MAX].
+enum BigEnum { a = 0x100000000 }
+
+u32 main() {
+    return 0;
+}

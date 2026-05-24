@@ -1,0 +1,25 @@
+// SILENT GAP — C-style cast allows bool ↔ int coercion
+//
+// ZER spec rule: "bool is NOT an integer — no bool↔int coercion"
+// CLAUDE.md: "Bool↔int coercions that silently happen"
+//
+// Implicit coercion is correctly banned. But `(u32)bool_var` and
+// `(bool)int_value` via C-style cast compile clean — the cast is
+// treated as "always valid type conversion" without the bool guard.
+//
+// Site: checker.c around line 5499-5508 — typecast accepts valid=true
+// for bool↔int without the implicit-coercion rule's bool check.
+//
+// Baremetal impact: `(bool)42` produces a "boolean" containing the
+// non-{0,1} value 42 (gcc emits no-op or `!=0` depending on flags).
+// Exhaustive `switch (b) { .true => ...; .false => ...; }` reasoning
+// is silently defeated — neither arm matches 42. Default arm or
+// undefined behavior on switch fallthrough.
+
+i32 main() {
+    bool b = true;
+    u32 n = (u32)b;        // EXPECTED: compile error — bool↔int banned
+    bool b2 = (bool)42;    // EXPECTED: compile error — int↔bool banned
+    if (b2) { return (i32)n; }
+    return 0;
+}

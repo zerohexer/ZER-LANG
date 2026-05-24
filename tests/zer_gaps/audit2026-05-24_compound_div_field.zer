@@ -1,0 +1,31 @@
+// SILENT GAP — Compound /= and %= div-by-zero only checks NODE_IDENT divisor
+//
+// ZER guarantees: division by zero must be proven nonzero at compile time
+// (forced guard rule). Binary form is checked at checker.c:2593-2617
+// (covers NODE_IDENT, NODE_FIELD, NODE_CALL divisors). Compound `/=`,
+// `%=` is checked at checker.c:3768-3798 — only the NODE_IDENT branch
+// exists. Field and call divisors silently pass.
+//
+// Asymmetric to BUG-612 (compound shift safety) which did fix the
+// compound-form gap for shifts.
+//
+// Baremetal impact: division-by-zero still traps at runtime via emitter's
+// _zer_trap wrapper, so this isn't memory corruption — but compile-time
+// fail-fast discipline is lost. A `u32 x %= c.d;` where `c.d == 0` is
+// only caught at runtime when the program actually divides.
+//
+// For static analysis tools / formal verification proofs that rely on
+// "ZER rejects unproven division at compile time", this gap is a real
+// hole.
+
+struct Cfg { u32 d; }
+u32 zero_call() { return 0; }
+
+i32 main() {
+    Cfg c;
+    c.d = 0;
+    u32 x = 10;
+    x /= c.d;       // EXPECTED: compile error like `x = 10 / c.d`
+    x /= zero_call(); // EXPECTED: compile error
+    return (i32)x;
+}

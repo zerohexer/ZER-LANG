@@ -1,0 +1,30 @@
+// SILENT MISCOMPILE — spawn arg containing orelse with value fallback
+//
+// Pattern: `spawn worker(get() orelse 0);`
+//
+// Root cause: ir_lower.c stores spawn args verbatim; emitter.c:~8819
+// emits each arg via emit_rewritten_node which has no NODE_ORELSE case.
+// The fallthrough emits `/* unhandled node 47 */0` — silent wrong value
+// passed to the worker thread.
+//
+// Emitted C (verified):
+//     struct _zer_spawn_args_0 *_sa = malloc(...);
+//     _sa->a0 = /* unhandled node 47 */0;   // SHOULD BE: get() result or 0
+//     pthread_create(&th, NULL, _zer_spawn_wrap_0, (void*)_sa);
+//
+// Fix: pre_lower_orelse must descend into NODE_SPAWN.spawn_stmt.args[].
+
+?u32 get_val() { return 100; }
+threadlocal u32 tls_sink;
+
+void worker(u32 v) {
+    tls_sink = v;
+}
+
+i32 main() {
+    ThreadHandle th = spawn worker(get_val() orelse 0);
+    th.join();
+    // EXPECTED: worker received 100
+    // ACTUAL:   worker received 0 — silent miscompile in spawn arg
+    return 0;
+}

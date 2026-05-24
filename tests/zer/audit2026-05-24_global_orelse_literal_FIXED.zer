@@ -1,0 +1,38 @@
+// Regression — global = optional orelse <value> must produce the STORE
+//
+// Was: ir_lower.c:1793-1797 fell into lower_orelse_to_dest(ctx, -1, ...)
+// for global targets (ir_find_local returns -1). Both bb_ok and bb_fail
+// were gated on `if (dest_local >= 0)` — silently emitted no STORE.
+//
+// Fixed 2026-05-24: when IDENT target's local lookup fails, fall through
+// to the "Non-local target — decompose into tmp + synthesized assign"
+// path that field/index targets already used.
+//
+// Covers four orelse fallback shapes against a global target:
+// - literal value, function call, block fallback, terminating return
+
+?u32 maybe_value() { return 42; }
+u32 fallback() { return 99; }
+
+u32 g_literal;
+u32 g_fncall;
+u32 g_block;
+u32 g_return;
+
+void set_literal()  { g_literal = maybe_value() orelse 0; }
+void set_fncall()   { g_fncall  = maybe_value() orelse fallback(); }
+void set_block()    { g_block   = maybe_value() orelse { return; }; }
+void set_return()   { g_return  = maybe_value() orelse return; }
+
+i32 main() {
+    g_literal = 0; g_fncall = 0; g_block = 0; g_return = 0;
+    set_literal();
+    set_fncall();
+    set_block();
+    set_return();
+    if (g_literal != 42) { return 1; }
+    if (g_fncall  != 42) { return 2; }
+    if (g_block   != 42) { return 3; }
+    if (g_return  != 42) { return 4; }
+    return 0;
+}

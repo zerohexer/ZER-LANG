@@ -1,0 +1,39 @@
+// SILENT MISCOMPILE — defer body containing orelse with value fallback
+//
+// Pattern: `defer cleanup(maybe() orelse 0);`
+//
+// Root cause: ir_lower.c stores `node->defer.body` verbatim in
+// IR_DEFER_PUSH without calling pre_lower_orelse on it. At emission time,
+// IR_DEFER_FIRE walks the stored body via emit_rewritten_node, which has
+// no NODE_ORELSE case (verified by grep — only NODE_IDENT, NODE_BINARY,
+// NODE_FIELD, NODE_INDEX, NODE_ASSIGN, NODE_CALL, NODE_INTRINSIC,
+// NODE_SLICE, NODE_TYPECAST, NODE_STRUCT_INIT, plus literals).
+//
+// The orelse falls through to the `default:` case at emitter.c:8090
+// which emits `/* unhandled node 47 */0`. Compiles clean — the `0` is
+// a valid C expression — but the orelse fallback value and the
+// has_value branch are completely lost.
+//
+// On baremetal where there's no segfault, this is undetectable: defer
+// cleanup callbacks silently receive 0 instead of the maybe() result.
+//
+// Fix: in NODE_DEFER lowering, walk node->defer.body via a statement-aware
+// pre_lower_orelse that also descends into NODE_EXPR_STMT children.
+
+?u32 maybe_value() { return 42; }
+u32 g_cleanup_arg;
+
+void cleanup(u32 x) { g_cleanup_arg = x; }
+
+void run() {
+    defer cleanup(maybe_value() orelse 0);
+}
+
+i32 main() {
+    g_cleanup_arg = 0;
+    run();
+    // EXPECTED: g_cleanup_arg == 42 (return 0)
+    // ACTUAL:   g_cleanup_arg == 0  (return 1) — orelse silently became 0
+    if (g_cleanup_arg == 42) { return 0; }
+    return 1;
+}

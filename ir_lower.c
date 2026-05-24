@@ -1806,11 +1806,21 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 if (expr->kind == NODE_ASSIGN && expr->assign.op == TOK_EQ &&
                     expr->assign.target && expr->assign.value == orelse) {
                     Node *tgt = expr->assign.target;
+                    int dest_local_for_ident = -1;
                     if (tgt->kind == NODE_IDENT) {
-                        int dest_local = ir_find_local(ctx->func,
+                        dest_local_for_ident = ir_find_local(ctx->func,
                             tgt->ident.name,
                             (uint32_t)tgt->ident.name_len);
-                        lower_orelse_to_dest(ctx, dest_local, orelse, node->loc.line);
+                    }
+                    /* Local IDENT target: route orelse directly to that local.
+                     * Global IDENT (dest_local == -1) and field/index/deref
+                     * targets fall through to the synthesized-tmp + new_assign
+                     * path so the store actually emits. Audit 2026-05-24
+                     * found globals here silently dropped the assignment
+                     * because lower_orelse_to_dest's `if (dest_local >= 0)`
+                     * gates skipped both bb_ok and bb_fail. */
+                    if (tgt->kind == NODE_IDENT && dest_local_for_ident >= 0) {
+                        lower_orelse_to_dest(ctx, dest_local_for_ident, orelse, node->loc.line);
                     } else {
                         /* Non-local target — decompose into tmp + synthesized assign. */
                         Type *rt = checker_get_type(ctx->checker, orelse);

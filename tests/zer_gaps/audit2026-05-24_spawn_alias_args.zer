@@ -1,0 +1,35 @@
+// SUSPECTED GAP — spawn allows aliased pointers to the same global
+//
+// Pattern: `spawn worker(&g, &g);` — both args point to the same global.
+//
+// ZER's spawn rule:
+//   - non-shared pointer to spawn = compile error (data race)
+//   - scoped spawn with ThreadHandle allows *T args (will be joined)
+//
+// The scoped-spawn path validates each arg individually but never compares
+// arg identities. Two pointers to the same global silently compile.
+//
+// Why it's a real gap:
+//   1. Callee may rely on parameter independence (no aliasing assumption)
+//   2. Worker can use `a` and `b` paths concurrently → undefined behavior
+//      under strict aliasing
+//   3. Main thread also still has `&g` available between spawn and join —
+//      data race with worker's writes through both `a` and `b`
+//
+// Even with shared struct, &shared g passed twice is questionable: the
+// auto-lock fires once per access, but the function signature implies
+// `a` and `b` are independent state.
+
+shared struct S { u32 v; }
+S g;
+
+void worker(*shared S a, *shared S b) {
+    a.v = 1;
+    b.v = 2;
+}
+
+i32 main() {
+    ThreadHandle th = spawn worker(&g, &g);  // EXPECTED: warning or error
+    th.join();
+    return 0;
+}

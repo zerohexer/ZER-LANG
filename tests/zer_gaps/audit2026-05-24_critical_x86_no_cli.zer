@@ -1,0 +1,38 @@
+// SILENT GAP — @critical on x86 emits memory fence, NOT cli/sti
+//
+// emitter.c:8655-8659 IR_CRITICAL_BEGIN, x86 fallback:
+//     #else
+//         __atomic_thread_fence(__ATOMIC_SEQ_CST);   // SHOULD BE: cli
+//     #endif
+//
+// emitter.c:8677-8681 IR_CRITICAL_END, x86 fallback:
+//     #else
+//         __atomic_thread_fence(__ATOMIC_SEQ_CST);   // SHOULD BE: sti
+//     #endif
+//
+// On Linux userspace, this is "the best we can do" — you can't disable
+// interrupts there. But on baremetal x86 kernel mode, an interrupt fires
+// inside the block and races with the @critical body. The compiled C is
+// `__atomic_thread_fence` — a memory barrier that does NOT mask interrupts.
+//
+// Fix recommendation:
+// 1. Add `__x86_64__` / `__i386__` branch that emits `pushfq; cli` /
+//    `popfq` via inline asm.
+// 2. OR: gate user-mode vs kernel-mode via a new flag (e.g.
+//    `--target-mode=kernel`) so userspace keeps the fence (correct there)
+//    and kernel emits cli/sti.
+//
+// This is silent at runtime: gcc emits a valid mfence/lfence, the
+// program "works" on Linux. The kernel-mode bug only manifests under
+// actual interrupt load (hard to test in CI without QEMU + IRQ injection).
+
+shared struct State { u32 counter; }
+State g;
+
+i32 main() {
+    @critical {
+        g.counter += 1;   // EXPECTED on baremetal x86: cli; ...; sti
+                          // ACTUAL: mfence; ...; mfence — IRQs fire freely
+    }
+    return 0;
+}

@@ -1088,6 +1088,113 @@ compiler (Phase F migration + various fixes closed them). Updated
 
 ---
 
+## Session 2026-05-25 — Codebase audit: forced-division and MMIO overlap silent gaps
+
+Multi-agent audit (Explore on zercheck_ir.c, ir_lower.c, emitter.c,
+checker.c, parser.c, ir.c+vrp_ir.c) surfaced silent gaps where checker
+accepted code per-spec invalid. Confirmed via reproducer tests, two
+HIGH-severity gaps fixed.
+
+### BUG-661: forced division guard missed complex divisor shapes
+
+**Symptom**: `100 / arr[i]`, `100 / *p`, `100 / (a - b)`, `100 / @truncate(u32, x)`
+all silently compiled despite per-spec being "divisor not proven nonzero".
+Hosted runtime: SIGFPE (loses ZER's controlled `_zer_trap` source-line
+diagnostic). Baremetal: hardware fault. ZER spec promises compile-time
+rejection of unproven divisors; only NODE_IDENT/NODE_FIELD/NODE_CALL hit
+the error branch in `checker.c:2587-2618`. NODE_INDEX, NODE_UNARY,
+NODE_BINARY, NODE_INTRINSIC, NODE_TYPECAST, NODE_SLICE fell through the
+if/else-if chain with no else branch.
+
+**Root cause**: Original forced-guard added in stages (BUG-269 for const
+divisors, later extensions for FIELD then CALL) never reached a final
+catch-all clause. The omission is "silent" because each missed kind
+generates valid (if dangerous) C — there is no IR-level safety wrapper
+on raw division either (IR_BINOP at `emitter.c:9404` only handles
+signed-overflow trap; div-by-zero relies entirely on checker).
+
+**Fix** (checker.c):
+
+1. NODE_BINARY `/` and `%` path (`checker.c:2587-2630`):
+   - Special-case `@size(T)` as always-proven (sizeof of any type ≥ 1)
+   - Added catch-all `else if (kind != literal)` that errors with
+     "complex divisor expression not proven nonzero — store in local
+     variable and add 'if (d == 0) { return; }' guard"
+
+2. Compound assign `/=` `%=` path (`checker.c:3767-3835`):
+   - Pre-fix only handled NODE_IDENT — NODE_FIELD/CALL/index/deref
+     silently accepted. Mirrored the binary-path coverage:
+     same NODE_IDENT/NODE_FIELD/NODE_CALL detailed error + catch-all
+     "complex divisor expression not proven nonzero".
+   - Extended VRP lookup to compound keys for non-IDENT divisors
+     (was IDENT-only).
+   - Special-case @size(T) as proven.
+
+**Tests** (must FAIL to compile):
+- `tests/zer_fail/div_zero_index.zer` — `100 / arr[i]`
+- `tests/zer_fail/div_zero_deref.zer` — `100 / *p`
+- `tests/zer_fail/div_zero_binary_expr.zer` — `100 / (a - b)`
+- `tests/zer_fail/div_zero_intrinsic.zer` — `100 / @truncate(u32, x)`
+- `tests/zer_fail/div_zero_compound_field.zer` — `x /= s.d`
+- `tests/zer_fail/div_zero_compound_index.zer` — `x %= arr[i]`
+
+**Positive test** (must compile + run cleanly):
+- `tests/zer/div_by_size_intrinsic.zer` — `12 / @size(Foo)` proven > 0
+
+### BUG-662: overlapping `mmio` ranges silently accepted
+
+**Symptom**: Two `mmio` declarations with overlapping address ranges
+(e.g. `mmio 0x40000000..0x40000FFF; mmio 0x40000800..0x40001000;`)
+compiled clean. Overlapping ranges make `@inttoptr` validation
+ambiguous — an address falling in the overlap belongs to two
+peripherals according to the compiler, and the range-size check used
+for index bounds would pick one arbitrarily. Almost always a
+copy-paste mistake in user code.
+
+**Root cause**: `checker.c:11064-11084` (NODE_MMIO) pushed each new
+range into `c->mmio_ranges[]` without comparing against existing
+entries. The only validation was `start <= end`.
+
+**Fix**: Before registering, iterate prior ranges and reject any pair
+where `a.lo <= b.hi && b.lo <= a.hi` with both halves of the overlap
+shown in the error message.
+
+**Test**:
+- `tests/zer_fail/mmio_range_overlap.zer` — two overlapping ranges
+
+### Findings not actioned in this session (documented for triage)
+
+- **Gap 15 reverified** — free called via function pointer is still
+  untracked by zercheck_ir. Test program with `void (*fp)(Handle) =
+  free_task; fp(h); use(h);` compiles with a leak warning instead of
+  the expected UAF — a *secondary* diagnostic masks the *primary* bug.
+  Closing this needs callee resolution through function-pointer types
+  or a generic "any opaque call invalidates tracked handles" model;
+  both are larger than this session's scope.
+- **`emit_rewritten_node` for NODE_BINARY** (`emitter.c:5405-5435`)
+  intentionally omits the div-by-zero check because the checker
+  forces the guard. The audit verified this assumption holds — the
+  IR path is sound as long as the checker rejects unproven divisors,
+  which BUG-661 now ensures for every shape.
+- **VRP gaps confirmed** in `vrp_ir.c` (FOUNDATION-phase): does not
+  invalidate state on `@atomic_*` writes (today's atomics conservatively
+  invalidate the address-taken set only); does not propagate return
+  ranges through `IR_CALL`. Both pre-existing per `vrp_ir.c` header
+  comment; deferred.
+- **Dead IR opcodes** (`IR_POOL_ALLOC` through `IR_RING_PUSH_CHECKED`,
+  plus `IR_FIELD_WRITE` / `IR_INDEX_WRITE` / `IR_ADDR_OF` /
+  `IR_DEREF_READ` / `IR_*_DECOMP` / `IR_SLICE_READ`) declared in
+  `ir.h:80-121` are NEVER emitted by `ir_lower.c`. Handlers exist in
+  `zercheck_ir.c` (e.g. `case IR_FIELD_WRITE` line 2866) and in
+  `emitter.c` (line 9677 emits `/* 3AC op %d — TODO */`). Documented
+  as intentional in `CLAUDE.md` "Phase 8d collapse"; if a future
+  refactor starts emitting them, the emitter stubs would silently
+  output TODO comments instead of correct C. Recommend removing dead
+  enum + handlers or wiring `ir_validate` to reject them as
+  unreachable. Deferred.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

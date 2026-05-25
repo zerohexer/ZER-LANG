@@ -1,0 +1,10 @@
+// MUST FAIL: compound-assign division by array element not proven nonzero
+// Audit 2026-05-25 gap fix
+u32 main() {
+    u32[4] arr;
+    arr[0] = 0;
+    u32 i = 0;
+    u32 x = 100;
+    x %= arr[i];
+    return x;
+}

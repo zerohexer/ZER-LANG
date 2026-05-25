@@ -1,0 +1,8 @@
+// MUST FAIL: overlapping mmio ranges create ambiguity in @inttoptr validation
+// Audit 2026-05-25 gap fix
+mmio 0x40000000..0x40000FFF;
+mmio 0x40000800..0x40001000;
+
+void main() {
+    return;
+}

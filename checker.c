@@ -2597,6 +2597,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     if (div_val != CONST_EVAL_FAIL && div_val != 0) {
                         mark_proven(c, node); /* constant nonzero divisor */
+                    } else if (node->binary.right->kind == NODE_INTRINSIC &&
+                               node->binary.right->intrinsic.name_len == 4 &&
+                               memcmp(node->binary.right->intrinsic.name, "size", 4) == 0) {
+                        /* @size(T) is always >= 1 (sizeof of any type is positive) */
+                        mark_proven(c, node);
                     } else {
                         /* try ident lookup first, then compound key for struct fields */
                         ExprKey dkey = {NULL, 0};
@@ -2613,9 +2618,10 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* Forced division guard: if divisor is ident, struct field, or
-                     * function call and not proven nonzero → compile error.
-                     * Covers all cases: variables, struct fields, function returns.
+                    /* Forced division guard: divisor not proven nonzero → compile error.
+                     * Covers ALL non-literal divisor shapes (ident, field, call, index,
+                     * deref, binary, intrinsic, etc.). Provable cases (constant nonzero,
+                     * VRP range with known_nonzero) bypass via mark_proven above.
                      * SAFETY: zer_divisor_proven_nonzero in src/safety/arith_rules.c (M02) */
                     int div_has_proof = checker_is_proven(c, node) ? 1 : 0;
                     if (div_val != 0 && zer_divisor_proven_nonzero(div_has_proof) == 0) {
@@ -2643,6 +2649,19 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "divisor from function call not proven nonzero — "
                                     "store result in variable and add 'if (d == 0) { return; }' guard");
                             }
+                        } else if (node->binary.right->kind != NODE_INT_LIT &&
+                                   node->binary.right->kind != NODE_FLOAT_LIT &&
+                                   node->binary.right->kind != NODE_CHAR_LIT) {
+                            /* Audit 2026-05-25: complex divisor (NODE_INDEX, NODE_UNARY,
+                             * NODE_BINARY, NODE_INTRINSIC, NODE_TYPECAST, etc.) was
+                             * silently accepted, producing raw C division without any
+                             * proof of safety. Hosted: SIGFPE catches but loses ZER's
+                             * source-location trap. Baremetal: hardware fault with no
+                             * useful diagnostic. Force the user to extract to a local
+                             * so VRP / explicit guard can prove safety. */
+                            checker_error(c, node->loc.line,
+                                "complex divisor expression not proven nonzero — "
+                                "store in local variable and add 'if (d == 0) { return; }' guard");
                         }
                     }
                 }
@@ -3793,7 +3812,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         type_name(target));
                 }
             }
-            /* forced division guard for /= and %= — same check as NODE_BINARY */
+            /* forced division guard for /= and %= — same check as NODE_BINARY.
+             * Audit 2026-05-25: extended to NODE_FIELD/NODE_CALL/complex divisors,
+             * matching the binary-path coverage. Pre-fix, `x /= s.f` / `x /= arr[i]`
+             * / `x /= *p` etc. were silently accepted with no proof. */
             if (node->assign.op == TOK_SLASHEQ || node->assign.op == TOK_PERCENTEQ) {
                 Node *divisor = node->assign.value;
                 /* literal nonzero → ok */
@@ -3812,18 +3834,57 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
                 if (dv != CONST_EVAL_FAIL && dv != 0) div_ok = true;
-                /* range-proven nonzero → ok */
-                if (!div_ok && divisor->kind == NODE_IDENT) {
-                    struct VarRange *r = find_var_range(c, divisor->ident.name,
-                        (uint32_t)divisor->ident.name_len);
-                    if (r && r->known_nonzero) div_ok = true;
+                /* @size(T) is always positive */
+                if (!div_ok && divisor->kind == NODE_INTRINSIC &&
+                    divisor->intrinsic.name_len == 4 &&
+                    memcmp(divisor->intrinsic.name, "size", 4) == 0) {
+                    div_ok = true;
                 }
-                if (!div_ok && divisor->kind == NODE_IDENT) {
-                    checker_error(c, node->loc.line,
-                        "divisor '%.*s' not proven nonzero — "
-                        "add 'if (%.*s == 0) { return; }' before division",
-                        (int)divisor->ident.name_len, divisor->ident.name,
-                        (int)divisor->ident.name_len, divisor->ident.name);
+                /* range-proven nonzero — try ident first, then compound key */
+                if (!div_ok) {
+                    ExprKey dkey = {NULL, 0};
+                    if (divisor->kind == NODE_IDENT) {
+                        dkey.str = divisor->ident.name;
+                        dkey.len = (int)divisor->ident.name_len;
+                    } else {
+                        dkey = build_expr_key_a(c, divisor);
+                    }
+                    if (dkey.len > 0) {
+                        struct VarRange *r = find_var_range(c, dkey.str, (uint32_t)dkey.len);
+                        if (r && (r->known_nonzero || r->min_val > 0)) div_ok = true;
+                    }
+                }
+                if (!div_ok) {
+                    if (divisor->kind == NODE_IDENT || divisor->kind == NODE_FIELD) {
+                        ExprKey dname = build_expr_key_a(c, divisor);
+                        if (dname.len > 0) {
+                            checker_error(c, node->loc.line,
+                                "divisor '%.*s' not proven nonzero — "
+                                "add 'if (%.*s == 0) { return; }' before division",
+                                dname.len, dname.str, dname.len, dname.str);
+                        }
+                    } else if (divisor->kind == NODE_CALL) {
+                        bool call_proven = false;
+                        if (divisor->call.callee &&
+                            divisor->call.callee->kind == NODE_IDENT) {
+                            Symbol *csym = scope_lookup(c->current_scope,
+                                divisor->call.callee->ident.name,
+                                (uint32_t)divisor->call.callee->ident.name_len);
+                            if (csym && csym->has_return_range && csym->return_range_min > 0)
+                                call_proven = true;
+                        }
+                        if (!call_proven) {
+                            checker_error(c, node->loc.line,
+                                "divisor from function call not proven nonzero — "
+                                "store result in variable and add 'if (d == 0) { return; }' guard");
+                        }
+                    } else if (divisor->kind != NODE_INT_LIT &&
+                               divisor->kind != NODE_FLOAT_LIT &&
+                               divisor->kind != NODE_CHAR_LIT) {
+                        checker_error(c, node->loc.line,
+                            "complex divisor expression not proven nonzero — "
+                            "store in local variable and add 'if (d == 0) { return; }' guard");
+                    }
                 }
             }
             /* reject narrowing: value wider than target (unless value is a literal)
@@ -11415,6 +11476,30 @@ static void register_decl(Checker *c, Node *node) {
 
     case NODE_MMIO: {
         /* register mmio address range for @inttoptr validation */
+        if (node->mmio_decl.range_start > node->mmio_decl.range_end) {
+            checker_error(c, node->loc.line,
+                "mmio range start (0x%llx) must be <= end (0x%llx)",
+                (unsigned long long)node->mmio_decl.range_start,
+                (unsigned long long)node->mmio_decl.range_end);
+        }
+        /* Audit 2026-05-25: reject overlapping mmio declarations.
+         * Two overlapping ranges make @inttoptr range checks ambiguous
+         * (which peripheral does the address belong to?) and indicate
+         * a copy-paste mistake. Each peripheral should declare a
+         * disjoint MMIO region. */
+        for (int ri = 0; ri < c->mmio_range_count; ri++) {
+            uint64_t a_lo = c->mmio_ranges[ri][0];
+            uint64_t a_hi = c->mmio_ranges[ri][1];
+            uint64_t b_lo = node->mmio_decl.range_start;
+            uint64_t b_hi = node->mmio_decl.range_end;
+            if (a_lo <= b_hi && b_lo <= a_hi) {
+                checker_error(c, node->loc.line,
+                    "mmio range 0x%llx..0x%llx overlaps previously declared range 0x%llx..0x%llx",
+                    (unsigned long long)b_lo, (unsigned long long)b_hi,
+                    (unsigned long long)a_lo, (unsigned long long)a_hi);
+                break;
+            }
+        }
         if (c->mmio_range_count >= c->mmio_range_capacity) {
             int new_cap = c->mmio_range_capacity < 16 ? 16 : c->mmio_range_capacity * 2;
             uint64_t (*new_arr)[2] = (uint64_t (*)[2])arena_alloc(c->arena, new_cap * sizeof(uint64_t[2]));
@@ -11426,12 +11511,6 @@ static void register_decl(Checker *c, Node *node) {
         c->mmio_ranges[c->mmio_range_count][0] = node->mmio_decl.range_start;
         c->mmio_ranges[c->mmio_range_count][1] = node->mmio_decl.range_end;
         c->mmio_range_count++;
-        if (node->mmio_decl.range_start > node->mmio_decl.range_end) {
-            checker_error(c, node->loc.line,
-                "mmio range start (0x%llx) must be <= end (0x%llx)",
-                (unsigned long long)node->mmio_decl.range_start,
-                (unsigned long long)node->mmio_decl.range_end);
-        }
         break;
     }
 

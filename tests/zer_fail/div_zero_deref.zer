@@ -1,0 +1,8 @@
+// MUST FAIL: division by pointer dereference not proven nonzero
+// Audit 2026-05-25 gap fix
+u32 main() {
+    u32 x = 0;
+    *u32 p = &x;
+    u32 result = 100 / *p;
+    return result;
+}

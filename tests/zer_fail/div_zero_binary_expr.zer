@@ -1,0 +1,8 @@
+// MUST FAIL: division by binary expression not proven nonzero
+// Audit 2026-05-25 gap fix
+u32 main() {
+    u32 a = 5;
+    u32 b = 5;
+    u32 result = 100 / (a - b);
+    return result;
+}

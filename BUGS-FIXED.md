@@ -1332,7 +1332,8 @@ slow) thread creation.
 NOTE: BUG-661 (wrong-pool through alias) is implemented separately
 via MvXYC's IRAliasSnapshot helper (committed afterward), which
 supersedes EW8I0's 6-site helper with a more comprehensive 11-site
-refactor.
+refactor. BUG-666 (u64 literal truncation) duplicates 71Cjm's
+BUG-665 — already in main.
 
 ---
 

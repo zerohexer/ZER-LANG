@@ -13,17 +13,16 @@ u32 get_static() {
     return retries;
 }
 
-u32 get_static_const() {
-    const u32 EXPECTED = 42;
-    static u32 value = 42;
-    return value;
+u64 get_static_wide() {
+    static u64 limit = 0xCAFEBABE_DEADBEEF;
+    return limit;
 }
 
 i32 main() {
     u32 a = get_static();
     if (a != 3) { puts("FAIL: static u32 init dropped"); return 1; }
-    u32 b = get_static_const();
-    if (b != 42) { puts("FAIL: static u32 const init dropped"); return 2; }
+    u64 b = get_static_wide();
+    if (b != 0xCAFEBABE_DEADBEEF) { puts("FAIL: static u64 init dropped"); return 2; }
     puts("OK");
     return 0;
 }

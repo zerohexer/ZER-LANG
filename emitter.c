@@ -9127,11 +9127,26 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     if (ac > 0) {
                         emit_indent(e);
                         emit(e, "struct _zer_spawn_args_%d *_sa = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid);
+                        /* Audit 2026-05-26: lock around shared-field reads in
+                         * spawn arg expressions. Pre-fix, `spawn worker(g.v+1)`
+                         * emitted `_sa->a0 = (g.v + 1);` with no lock — torn
+                         * read for any g.v wider than the platform atomic
+                         * unit. Locks held only across arg evaluation (not
+                         * across pthread_create itself). */
                         for (int ai = 0; ai < ac; ai++) {
+                            Node *sroot = find_shared_root(e, sp->spawn_stmt.args[ai]);
+                            if (sroot) {
+                                emit_indent(e);
+                                emit(e, "/* shared-read lock for spawn arg %d */\n", ai);
+                                emit_shared_lock(e, sroot);
+                            }
                             emit_indent(e);
                             emit(e, "_sa->a%d = ", ai);
                             emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
                             emit(e, ";\n");
+                            if (sroot) {
+                                emit_shared_unlock(e, sroot);
+                            }
                         }
                     }
                     if (is_scoped) {

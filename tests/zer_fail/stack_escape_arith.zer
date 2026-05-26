@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Audit 2026-05-26: `g_addr = @ptrtoint(&local) + 0` silently escaped
+// a stack pointer to a global. The escape walker only matched direct
+// `target = @ptrtoint(&local)` — one arithmetic step (+ 0, & MASK, *2)
+// laundered the local-derived flag.
+//
+// Fix: expr_touches_local_derived recursively scans the init expression
+// for any local-derived sub-expression. When the target is a
+// pointer-width unsigned integer (usize / u64-on-64bit / u32-on-32bit),
+// the local-derived flag is propagated. Subsequent assignment to a
+// global triggers the existing escape detection.
+
+usize g_addr;
+
+void capture_local() {
+    u32 local = 0xDEADBEEF;
+    usize a = @ptrtoint(&local);
+    usize b = a + 0;        // arithmetic laundering — must propagate flag
+    g_addr = b;             // escape — must error
+}

@@ -885,6 +885,77 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_from_arena) dst->is_from_arena = true;
 }
 
+/* Recursively scan an expression for any identifier that refers to a
+ * local-derived Symbol (i.e., a value originally obtained via
+ * @ptrtoint(&local), or transitively through arithmetic / casts /
+ * intrinsics). Returns true if any subexpression touches such a value.
+ *
+ * Audit 2026-05-26: closes the stack-escape-via-arithmetic silent gap.
+ * The escape walker at line 3294 only matched direct
+ * `target = @ptrtoint(&local)` on RHS; one arithmetic step (e.g.
+ * `b = a + 0; g = b`) laundered the local-derived flag. By scanning
+ * the whole expression tree we catch any pointer-int chain that
+ * eventually escapes to a global. */
+static bool expr_touches_local_derived(Checker *c, Node *expr) {
+    if (!expr) return false;
+    switch (expr->kind) {
+    case NODE_IDENT: {
+        Symbol *s = scope_lookup(c->current_scope,
+            expr->ident.name, (uint32_t)expr->ident.name_len);
+        return s && s->is_local_derived;
+    }
+    case NODE_BINARY:
+        return expr_touches_local_derived(c, expr->binary.left) ||
+               expr_touches_local_derived(c, expr->binary.right);
+    case NODE_UNARY:
+        return expr_touches_local_derived(c, expr->unary.operand);
+    case NODE_TYPECAST:
+        return expr_touches_local_derived(c, expr->typecast.expr);
+    case NODE_INTRINSIC: {
+        /* @ptrtoint(&local) is the originating intrinsic — direct
+         * detection (line 3294) already marks the immediate target.
+         * For walks through other intrinsics (cast/ptrcast/bitcast),
+         * recurse into args. */
+        for (int i = 0; i < expr->intrinsic.arg_count; i++) {
+            if (expr_touches_local_derived(c, expr->intrinsic.args[i]))
+                return true;
+        }
+        /* Also check: this IS @ptrtoint(&local) directly. */
+        if (expr->intrinsic.name_len == 8 &&
+            memcmp(expr->intrinsic.name, "ptrtoint", 8) == 0 &&
+            expr->intrinsic.arg_count > 0) {
+            Node *a = expr->intrinsic.args[0];
+            if (a && a->kind == NODE_UNARY && a->unary.op == TOK_AMP) {
+                Node *root = a->unary.operand;
+                while (root && (root->kind == NODE_FIELD ||
+                                root->kind == NODE_INDEX)) {
+                    if (root->kind == NODE_FIELD) root = root->field.object;
+                    else root = root->index_expr.object;
+                }
+                if (root && root->kind == NODE_IDENT) {
+                    bool is_global = scope_lookup_local(c->global_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                    Symbol *src = scope_lookup(c->current_scope,
+                        root->ident.name, (uint32_t)root->ident.name_len);
+                    if (src && !src->is_static && !is_global) return true;
+                }
+            }
+        }
+        return false;
+    }
+    case NODE_FIELD:
+        return expr_touches_local_derived(c, expr->field.object);
+    case NODE_INDEX:
+        return expr_touches_local_derived(c, expr->index_expr.object) ||
+               expr_touches_local_derived(c, expr->index_expr.index);
+    case NODE_ORELSE:
+        return expr_touches_local_derived(c, expr->orelse.expr) ||
+               expr_touches_local_derived(c, expr->orelse.fallback);
+    default:
+        return false;
+    }
+}
+
 /* ---- ISR / @critical alloc ban helper ---- */
 
 /* Check if we're inside an interrupt handler OR a @critical block and
@@ -8203,6 +8274,26 @@ static void check_stmt(Checker *c, Node *node) {
                              * source struct was marked local-derived. Without this check,
                              * u32 val = struct_result.field falsely inherits the flag. */
                             if (src) propagate_escape_flags(sym, src, type);
+                        }
+                    }
+                    /* Audit 2026-05-26: stack-escape via arithmetic chain.
+                     * `usize b = a + 0` where `a` was @ptrtoint(&local) —
+                     * the chain walker above stops at NODE_BINARY (no
+                     * single root). Use the recursive scan to catch
+                     * arithmetic/cast laundering of local-derived values.
+                     * Only applies to pointer-width unsigned integer
+                     * (usize / u64 on 64-bit) targets that can hold a
+                     * re-castable pointer. */
+                    {
+                        Type *eff = type ? type_unwrap_distinct(type) : NULL;
+                        bool is_ptr_int = eff && (eff->kind == TYPE_USIZE ||
+                            (eff->kind == TYPE_U64 && c->target_ptr_bits >= 64) ||
+                            (eff->kind == TYPE_U32 && c->target_ptr_bits == 32));
+                        if (is_ptr_int &&
+                            node->var_decl.init &&
+                            !sym->is_local_derived &&
+                            expr_touches_local_derived(c, node->var_decl.init)) {
+                            sym->is_local_derived = true;
                         }
                     }
                 }

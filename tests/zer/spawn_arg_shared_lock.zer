@@ -1,0 +1,21 @@
+// Audit 2026-05-26: spawn arg expressions reading shared struct fields
+// silently emitted unlocked reads. `spawn worker(g.v + 1)` produced
+// `_sa->a0 = (g.v + 1)` outside any mutex — torn read for fields wider
+// than the platform atomic unit (u64 on 32-bit, struct values always).
+//
+// Fix: emitter wraps each spawn arg expression in lock/unlock when the
+// arg touches a shared root. Lock held only across arg evaluation,
+// released before pthread_create.
+
+shared struct Counter { u32 v; }
+Counter g;
+
+void worker(u32 x) {
+    g.v += x;
+}
+
+i32 main() {
+    g.v = 42;
+    spawn worker(g.v + 1);   // shared read in spawn arg — must lock
+    return 0;
+}

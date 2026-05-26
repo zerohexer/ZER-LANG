@@ -1281,25 +1281,53 @@ ident, range-derived call) take the existing zero-overhead path.
 **Test**: `tests/zer_trap/array_index_field_oob.zer` traps with
 "array index out of bounds" at runtime.
 
-### Audit-discovered (CRITICAL, fix deferred)
+### BUG-664: stack pointer escape via arithmetic chain
 
-Two silent gaps confirmed by adversarial tests but fixes were
-deferred to keep the commit focused:
+**Symptom**: `g_addr = @ptrtoint(&local) + 0` — assigning a stack
+address (via @ptrtoint) to a global through ANY arithmetic step
+compiled clean. The escape walker only matched direct
+`target = @ptrtoint(&local)` on RHS; one `+ 0` / `& MASK` / `* 2`
+laundered the local-derived flag, then the existing
+"assign-to-global" check failed because the source Symbol had no
+flag set.
 
-1. **Stack pointer escape via arithmetic chain**:
-   `g_addr = @ptrtoint(&local) + 0` — escape walker only matches
-   direct `@ptrtoint(&local)` on RHS. One arithmetic op laundering
-   breaks detection. Fix needs `is_local_derived` propagation
-   through NODE_BINARY in expression check.
+**Root cause**: var-decl init propagation walked field/index/intrinsic
+chains via single-root descent, but had no path through NODE_BINARY.
+For `usize b = a + 0;` the walker bailed at NODE_BINARY and the
+local-derived flag never propagated to b.
 
-2. **Spawn arg reads shared struct field unlocked**:
-   `spawn worker(g.v + 1)` — emitter packs `_sa->a0 = (g.v + 1)`
-   without acquiring `g._zer_mtx`. Torn read for wider-than-atomic
-   fields. Fix needs lock/unlock around spawn arg expression that
-   touches shared fields.
+**Fix**: added `expr_touches_local_derived` recursive scanner that
+walks all sub-expressions (BINARY/UNARY/CAST/INTRINSIC/FIELD/INDEX/
+ORELSE). At var-decl init, if the target is a pointer-width unsigned
+integer (usize / u64-on-64bit / u32-on-32bit) and any sub-expression
+references a local-derived Symbol, propagate the flag. The existing
+escape-to-global check at NODE_ASSIGN catches the eventual leak.
 
-Reproducers at `/tmp/v_escape.zer` and `/tmp/v_spawn_race.zer`
-respectively.
+**Test**: `tests/zer_fail/stack_escape_arith.zer`
+
+### BUG-665: spawn arg reads shared struct field unlocked
+
+**Symptom**: `spawn worker(g.v + 1)` emitted `_sa->a0 = (g.v + 1);`
+outside any mutex. Torn read for any g.v wider than the platform's
+atomic unit (u64 on 32-bit, all struct types). Race against any
+already-running thread mutating g.
+
+**Root cause**: spawn arg evaluation in `emit_ir_inst` IR_SPAWN
+path used `emit_rewritten_node` directly with no auto-lock around
+shared-field reads. The auto-locking infrastructure
+(`find_shared_root` + `emit_shared_lock` / `_unlock`) exists for
+other contexts (assignments, if/while/for conditions per Gap 36)
+but was never wired through spawn arg evaluation.
+
+**Fix**: per spawn arg, call `find_shared_root` on the arg
+expression. If non-NULL, emit `emit_shared_lock(root)` before and
+`emit_shared_unlock(root)` after the arg's `_sa->aN = expr;` line.
+Lock is held only across arg evaluation, released before
+`pthread_create` to avoid holding the mutex across the (potentially
+slow) thread creation.
+
+**Test**: `tests/zer/spawn_arg_shared_lock.zer` — emitted C contains
+`pthread_mutex_lock(&g._zer_mtx)` before the spawn arg assignment.
 
 NOTE: BUG-661 (wrong-pool through alias) is implemented separately
 via MvXYC's IRAliasSnapshot helper (committed afterward), which

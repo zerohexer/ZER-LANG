@@ -25,6 +25,260 @@ Arena allocations excluded from handle tracking (arena.alloc() does
 not need individual free — arena.reset() frees everything).
 ```
 
+## ZER Safety Architecture — Read Before Any Safety Work
+
+**Mandatory reading before modifying ANY safety-relevant code** (checker.c
+safety checks, zercheck.c, zercheck_ir.c, emitter.c safety wrappers,
+src/safety/*.c extracted predicates).
+
+ZER's safety model operates on ONE unified architectural principle applied
+across FIVE safety domains. Understanding this principle is required before
+adding or modifying any safety check, because every safety check should
+follow the same template.
+
+### The Definition A Principle (Central Architectural Rule)
+
+> **ZER verifies access mechanism correctness structurally — types, ranges,
+> qualifiers, contexts, dependencies — and treats semantic correctness
+> against external substrates (hardware, foreign code, contract truths) as
+> user responsibility, supplied through primitive choice and declarations
+> rather than verified by the language.**
+
+Two definitions of "primitive" exist in language design:
+
+- **Definition A** (ZER's choice): primitive = the basic access mechanism.
+  User intent declared through primitive choice. Compiler verifies the
+  intent is structurally consistent.
+
+- **Definition B** (rejected for ZER): primitive = the basic operation with
+  its semantics. User declares hardware/contract properties; compiler
+  verifies code matches declared properties. SPARK/Ada-style.
+
+ZER uses Definition A because:
+1. Definition B requires user-supplied contracts, which are unverified user
+   claims. Wrong contracts pass verification, producing false confidence.
+2. Definition A scales to sole-developer maintenance; Definition B requires
+   either SPARK-like infrastructure or built-in peripheral catalogs.
+3. Definition A matches ZER's audience (firmware/embedded developers who
+   want C-level cognitive load with safety enforcement).
+
+### The Five Safety Domains
+
+Same architectural shape across all domains: bounded primitive surface +
+structural verification + user-supplied substrate-specific knowledge.
+
+| Domain | Bounded primitive surface | Compiler verifies | User supplies |
+|---|---|---|---|
+| Memory | Pool/Slab/Ring/Arena + *T/[*]T/Handle + move struct | Allocation tracking, bounds, escape, ownership transfer | Allocator choice, lifetime intent |
+| Type | Conversion intrinsics + qualifier system | Conversion semantics, qualifier preservation, sign/width | Conversion intent (truncate vs saturate) |
+| ASM | Intent intrinsics + naked-fn + Z-rules + hardcoded UB classics | Operand boundary, Z-rules, context restrictions | Asm string semantics, clobber completeness, ISA delegated to GCC |
+| Concurrency | spawn/shared struct/atomics/condvars + structural rules | Race freedom via closure + structural rules | Synchronization discipline within primitives |
+| I/O | @inttoptr + mmio + volatile *T + 130 hardware intrinsics | Access mechanism, address range, alignment, context | Hardware spec correctness, peripheral semantics |
+
+Every safety check in ZER should fit one of these domains and follow the
+domain's pattern. New safety properties get evaluated against this template:
+identify the bounded primitive surface, verify each primitive structurally,
+scope out properties requiring external knowledge.
+
+### Hardware Abstraction Is Not Spec-Verified (Explicit Scoping)
+
+ZER deliberately does NOT verify:
+- Whether a declared mmio address corresponds to actual hardware
+- Whether a register's behavior matches user expectations (read-clears,
+  write-1-to-clear, side effects, etc.)
+- Whether access width matches hardware bus requirements
+- Whether the CPU is in the expected privilege mode at runtime
+- Whether inline asm string content is semantically correct
+- Whether peripheral operation sequences produce intended hardware effects
+- Whether foreign code (cinclude) maintains ZER's safety properties
+
+These are USER RESPONSIBILITY because they require hardware knowledge or
+external system knowledge the compiler cannot obtain. ZER provides
+abstractions (mmio declarations, @inttoptr, volatile *T, intrinsic catalog)
+that catch access-mechanism bugs but explicitly scope out spec-correctness.
+
+**Wrong framing to avoid:** "ZER catches some hardware bugs but not all" —
+this suggests there's a gap. The correct framing is: "ZER verifies access
+mechanism completely; hardware spec correctness is deliberately outside
+scope because it can't be reached structurally." Not a gap, a scope.
+
+### The Closure Argument
+
+The structural soundness justification for ZER's safety claims:
+
+> If the set of operations that can violate safety property P is closed
+> under a finite set of compiler-visible primitives, and the compiler
+> verifies each primitive against P, then P holds for all programs in
+> the language.
+
+Applied uniformly:
+- **Memory safety:** closure over allocation primitives
+- **Type safety:** closure over conversion intrinsics
+- **ASM safety:** closure over operand bindings + naked-fn isolation
+- **Concurrency safety:** closure over concurrency primitives
+- **I/O safety:** closure over hardware-access primitives
+
+C has no closure (operations via libraries). Rust has closure with
+in-language escape (`unsafe impl Send`). ZER has closure without in-language
+escape — only explicit cross-language boundary via `cinclude`.
+
+### The Trusted Language Base (TLB)
+
+The set of primitives the language must provide as trusted because user code
+cannot safely reconstruct them.
+
+**Strict primitives (computationally irreducible — 5 for concurrency):**
+- threadlocal, @atomic_load/store/cas, shared struct, spawn/ThreadHandle,
+  move struct
+
+**Context primitives (audience-irreducible — ~5 for concurrency):**
+- @cond_*, @atomic_arithmetic_variants, Semaphore, Barrier, shared(rw)
+  struct
+
+The TLB is NOT permanent. As analysis matures, context primitives can move
+to user library territory because structural rules catch wrong
+implementations. The strict primitives are the permanent floor.
+
+### The Substrate Accountability Principle (Rescoped)
+
+Original: "If the language provides the abstraction that creates the bug
+class, the language owns the safety obligation for that class."
+
+**Rescoped:** "ZER owns safety for the bug classes its abstractions directly
+verify against. The principle's scope follows the abstractions, not the
+emergent properties of compositions with external systems (hardware, OS,
+foreign code)."
+
+The rescoping is legitimate because the principle's scope should align with
+what the verifier can actually verify. The compiler can verify properties
+of code structure. It cannot verify properties of hardware execution model.
+
+### When Adding a New Safety Check
+
+The template:
+
+1. **Identify the safety property** P being added
+2. **Identify the bounded primitive surface** for operations that could
+   violate P
+3. **Verify the primitive set is finite and compiler-visible** (if not, P
+   may be out of scope)
+4. **Define the structural verification** for each primitive (what does the
+   compiler check at the call site?)
+5. **Scope out what's user responsibility** (what does the user supply that
+   the compiler doesn't verify?)
+6. **Decide whether the new check fits an existing domain** (memory, type,
+   ASM, concurrency, I/O) or warrants a new domain
+
+If the new check requires user-supplied contracts whose correctness can't be
+verified, reconsider — that's Definition B drift toward SPARK territory.
+ZER's positioning is specification-implicit.
+
+If the new check requires hardware knowledge the compiler can't obtain,
+scope it out explicitly. Don't pretend to verify what can't be verified.
+
+### Concurrency Safety — Specific Notes
+
+Currently implemented:
+- spawn scanner (8 levels deep) for non-shared global access
+- shared struct auto-locking
+- @atomic_* requires *shared T (partial enforcement, needs tightening)
+- @cond_* protocols
+- Same-statement deadlock check
+- async shared struct mismatch
+- Handle aliasing across spawn boundaries
+- Move struct tracking
+- ThreadHandle join requirement
+
+Pending implementation (~620-1150 lines total) for full closure:
+1. **Condvar-must-loop** (~50-100 lines): @cond_wait must be inside
+   while-loop checking condition. Catches lost wakeup.
+2. **CAS-progress** (~200-400 lines): CAS loops must have terminating
+   branch on success. Catches livelock.
+3. **Lock-balance** (~300-500 lines): acquire/release must balance across
+   CFG paths. Catches missing unlock.
+4. **Atomic-on-shared-only** (~20-50 lines): tighten existing check.
+5. **No-shared-stack** (~50-100 lines): extend escape analysis.
+
+These complete the closure argument for thread-based concurrency.
+
+### ISR-to-Main Interaction — Option 3
+
+ISR-to-main concurrency is NOT in the closure argument's scope. The decision
+(Option 3) is:
+
+> ZER's hardware-access primitives (mmio, @inttoptr, volatile *T, naked)
+> catch access-mechanism bugs. Synchronization discipline between ISR and
+> main thread is user responsibility within these primitives, because
+> verifying it would require hardware-execution-model knowledge ZER
+> deliberately delegates to the user.
+
+This is honest scoping, not a gap. The substrate accountability principle
+holds because ZER's abstractions (the hardware-access primitives) own what
+they own; ISR-to-main synchronization is an emergent property of
+compositions with hardware-driven asynchronous execution, not an abstraction
+ZER directly provides.
+
+### I/O Safety — Specific Notes
+
+The volatile bypass that doesn't exist: ZER's grammar **rejects** C-style
+casts of integer to pointer. The only path to create a pointer from a
+numeric address is `@inttoptr(*T, addr)`, which requires mmio declaration,
+alignment, and address-in-range.
+
+From `checker.c:5603-5607`:
+```c
+checker_error(c, node->loc.line,
+    "cannot cast integer to pointer — use @inttoptr(*T, addr) "
+    "with mmio range declaration");
+```
+
+This means volatile is already safe in ZER — not because volatile itself is
+magical, but because the only fabrication path is contract-verified.
+
+No `unsafe_volatile` escape hatch is needed. Don't add one without strong
+justification.
+
+### Anti-Patterns to Avoid
+
+1. **Contract-based verification for user-specifiable hardware properties:**
+   shifts ZER toward SPARK territory; wrong contracts pass verification.
+2. **Closure holes via in-language escape:** unsafe blocks degrade closure
+   in practice; only cinclude is acceptable.
+3. **TLB expansion without analysis improvement:** grows the TLB without
+   paying off maintenance cost.
+4. **Specification-explicit drift:** gradually adding annotations conflicts
+   with positioning.
+5. **Marketing-driven feature addition:** "modern languages have X" isn't
+   sufficient justification.
+6. **Closure argument without implementation:** claiming closure before the
+   structural rules ship creates false confidence.
+7. **Peripheral-specific catalog in core:** infinite catalog growth;
+   category-level only in core; peripherals in vendor library ecosystem.
+
+### Documentation References
+
+**Full safety architecture details:** `docs/primitives-data-races.md` —
+canonical reference for the unified principle, all five domains, TLB
+framework, structural rules, ISR-to-main Option 3, closure argument,
+comparison to other languages, implementation roadmap.
+
+**ASM safety details:** `docs/asm_lang_zer_safe.md` — Level C decision,
+2-layer model (intent intrinsics + naked escape), Z-rules through asm
+operands, hardcoded UB classics, GCC delegation for ISA-specific.
+
+**Memory safety details (universal pointer):** `docs/universal_pointer.md` —
+the keep/no-keep design, slice vs safe_ptr orthogonal axes, escape analysis.
+
+**Formal verification details:** `docs/proof-internals.md` (Coq+Iris+VST)
+and `docs/formal_verification_plan.md` (8-phase roadmap, ~330 axiom-free
+theorems, Phase 1 catalog 85/85 extracted).
+
+**Safety system catalog:** see CLAUDE.md "ZER Safety Architecture — 4 Models,
+29 Systems" section for the per-system catalog with locations and
+descriptions.
+
+---
+
 ## Lexer (lexer.c/h)
 - `Scanner` struct holds source pointer, current position, line number
 - Keywords: `TOK_POOL`, `TOK_RING`, `TOK_ARENA`, `TOK_HANDLE`, `TOK_STRUCT`, `TOK_ENUM`, `TOK_UNION`, `TOK_SWITCH`, `TOK_ORELSE`, `TOK_DEFER`, `TOK_IMPORT`, `TOK_VOLATILE`, `TOK_CONST`, `TOK_STATIC`, `TOK_PACKED`, `TOK_INTERRUPT`, `TOK_TYPEDEF`, `TOK_DISTINCT`

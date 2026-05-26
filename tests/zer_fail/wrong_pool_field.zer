@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Wrong-pool free through struct field. `w.h = pool_a.alloc()` registers
+// a compound handle for (w, ".h"); pool_b.free(w.h) must detect the
+// mismatch. Pre-fix: IR_ASSIGN compound key creation dropped pool_name
+// from the parent handle, so the wrong-pool walker bailed silently.
+
+struct Task { u32 id; }
+struct Wrap { Handle(Task) h; u32 pad; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    Wrap w;
+    Handle(Task) ha = pool_a.alloc() orelse return;
+    w.h = ha;
+    pool_b.free(w.h);    // wrong pool — must error
+}

@@ -5744,13 +5744,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_INDEX: {
-        /* Index: emit obj[idx] with .ptr for slices.
+        /* Index: emit obj[idx] with bounds check.
          * Phase 3 fix (Gap 0): emit _zer_bounds_check for slices.
-         * Auto-guard handles arrays (compile-time size). Slices have no
-         * separate auto-guard pass — must emit inline via comma operator
-         * (shape matches AST emit_expr TYPE_SLICE branch at 2060). */
+         * Audit 2026-05-26: also emit _zer_bounds_check for arrays when
+         * the index is non-trivial (NODE_FIELD/NODE_INDEX/NODE_BINARY etc.).
+         * Pre-fix: `arr[i.field]`, `arr[b.f.g]`, `arr[x+y]` silently
+         * read OOB — auto-guard only fired for NODE_IDENT/NODE_CALL
+         * indices, so other index expression shapes had ZERO bounds
+         * protection. Compile-time-proven indices (literal, range-
+         * derived IDENT, range-derived CALL) still take the zero-overhead
+         * path via checker_is_proven. */
         Type *idx_obj_type = checker_get_type(e->checker, node->index_expr.object);
-        bool idx_slice = idx_obj_type && type_unwrap_distinct(idx_obj_type)->kind == TYPE_SLICE;
+        Type *idx_obj_eff = idx_obj_type ? type_unwrap_distinct(idx_obj_type) : NULL;
+        bool idx_slice = idx_obj_eff && idx_obj_eff->kind == TYPE_SLICE;
+        bool idx_array = idx_obj_eff && idx_obj_eff->kind == TYPE_ARRAY;
         if (idx_slice) {
             emit(e, "(_zer_bounds_check((size_t)(");
             emit_rewritten_node(e, node->index_expr.index, func);
@@ -5761,6 +5768,44 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ".ptr)[");
             emit_rewritten_node(e, node->index_expr.index, func);
             emit(e, "]");
+        } else if (idx_array && !checker_is_proven(e->checker, node) &&
+                   node->index_expr.index->kind != NODE_INT_LIT &&
+                   node->index_expr.index->kind != NODE_IDENT &&
+                   node->index_expr.index->kind != NODE_CALL &&
+                   (idx_obj_eff->array.size > 0 || idx_obj_eff->array.sizeof_type)) {
+            /* Inline bounds check for non-trivial array indices (FIELD/
+             * INDEX/BINARY/UNARY/ASSIGN/ORELSE). Pre-fix: only NODE_IDENT
+             * and NODE_CALL triggered the statement-level auto-guard, so
+             * `arr[i.field]` / `arr[b.f.g]` / `arr[x+y]` silently read OOB.
+             *
+             * Side-effect-bearing expressions (UNARY deref, ASSIGN, ORELSE)
+             * use the single-eval `*({...})` pattern to avoid double-
+             * evaluation of the index expression. Pure expressions
+             * (FIELD, INDEX, BINARY) can safely double-evaluate. */
+            bool idx_has_side_effects =
+                (node->index_expr.index->kind == NODE_ASSIGN ||
+                 node->index_expr.index->kind == NODE_UNARY ||
+                 node->index_expr.index->kind == NODE_ORELSE);
+            if (idx_has_side_effects) {
+                int tmp = e->temp_count++;
+                emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
+                emit_rewritten_node(e, node->index_expr.index, func);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
+                emit_array_size(e, idx_obj_eff);
+                emit(e, ", __FILE__, __LINE__); &");
+                emit_rewritten_node(e, node->index_expr.object, func);
+                emit(e, "[_zer_idx%d]; })", tmp);
+            } else {
+                emit(e, "(_zer_bounds_check((size_t)(");
+                emit_rewritten_node(e, node->index_expr.index, func);
+                emit(e, "), ");
+                emit_array_size(e, idx_obj_eff);
+                emit(e, ", __FILE__, __LINE__), ");
+                emit_rewritten_node(e, node->index_expr.object, func);
+                emit(e, ")[");
+                emit_rewritten_node(e, node->index_expr.index, func);
+                emit(e, "]");
+            }
         } else {
             emit_rewritten_node(e, node->index_expr.object, func);
             emit(e, "[");
@@ -10121,7 +10166,12 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     e->defer_stack.count = 0; /* clear defer stack from previous function */
 
     /* Declare local variables (skip params — they're parameters).
-     * Static locals declared with static keyword (persists across calls). */
+     * Static locals declared with static keyword (persists across calls).
+     * Static init expressions are emitted at the declaration — checker
+     * enforces compile-time-constant for `static` init, so emitting via
+     * emit_rewritten_node produces a valid C initializer. Pre-fix, init
+     * was silently dropped (e.g. `static u32 retries = 3;` got `= {0};`
+     * — function returned 0 on every call). */
     for (int li = 0; li < func->local_count; li++) {
         IRLocal *l = &func->locals[li];
         if (l->is_param) continue;
@@ -10130,7 +10180,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         emit_indent(e);
         if (l->is_static) emit(e, "static ");
         emit_type_and_name(e, l->type, l->name, l->name_len);
-        emit(e, " = {0};\n"); /* auto-zero */
+        if (l->is_static && l->static_init) {
+            emit(e, " = ");
+            emit_rewritten_node(e, l->static_init, func);
+            emit(e, ";\n");
+        } else {
+            emit(e, " = {0};\n"); /* auto-zero */
+        }
     }
 
     /* Disable source mapping during IR block emission — #line directives

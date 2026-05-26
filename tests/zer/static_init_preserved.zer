@@ -1,0 +1,28 @@
+// Audit 2026-05-26: static local initializer was silently dropped on the
+// IR path. ir_lower emitted the local but skipped lowering the init,
+// and emitter unconditionally emitted `static T name = {0};`. Result:
+// `static u32 retries = 3;` got `retries == 0` on every call.
+//
+// Fix: ir_lower stores init on IRLocal.static_init; emitter emits it
+// inline via emit_rewritten_node.
+
+i32 puts(const *u8 s);
+
+u32 get_static() {
+    static u32 retries = 3;
+    return retries;
+}
+
+u64 get_static_wide() {
+    static u64 limit = 0xCAFEBABE_DEADBEEF;
+    return limit;
+}
+
+i32 main() {
+    u32 a = get_static();
+    if (a != 3) { puts("FAIL: static u32 init dropped"); return 1; }
+    u64 b = get_static_wide();
+    if (b != 0xCAFEBABE_DEADBEEF) { puts("FAIL: static u64 init dropped"); return 2; }
+    puts("OK");
+    return 0;
+}

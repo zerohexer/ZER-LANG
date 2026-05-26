@@ -50,6 +50,14 @@ typedef struct {
     bool hidden;
 
     int source_line;         /* for error messages + #line directives */
+
+    /* Static-local init expression. ir_lower stores the original
+     * NODE_VAR_DECL init here for is_static locals so the emitter can
+     * emit `static T name = INIT;` instead of dropping the init and
+     * emitting `static T name = {0};` (silent miscompile — pre-fix,
+     * `static u32 retries = 3;` returned 0 on every call). NULL for
+     * non-static locals and for static locals declared without init. */
+    Node *static_init;
 } IRLocal;
 
 /* ================================================================

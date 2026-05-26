@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Wrong-pool free through bare-ident alias chain. The handle alloc'd from
+// pool_a is aliased via `Handle(Task) p = ha`; freeing through pool_b on
+// the alias must be detected. Pre-fix: IR_ASSIGN-with-ident-RHS dropped
+// pool_name on the alias, so the wrong-pool walker bailed silently.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    Handle(Task) ha = pool_a.alloc() orelse return;
+    Handle(Task) p = ha;       // alias — pool_name MUST propagate
+    pool_b.free(p);             // wrong pool — must error
+}

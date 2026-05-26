@@ -1,0 +1,21 @@
+// Audit 2026-05-26: `arr[s.field]` where s.field is OOB silently read
+// garbage pre-fix because auto-guard only fired for NODE_IDENT/NODE_CALL
+// index expressions. NODE_FIELD/NODE_INDEX/NODE_BINARY indices had no
+// runtime bounds check (and the emit_rewritten_node IR path emits arrays
+// as plain `arr[idx]` with no inline check, deferring to auto-guard).
+//
+// Fix: emit_rewritten_node now emits inline _zer_bounds_check for arrays
+// when the index is non-trivial (FIELD/INDEX/BINARY/UNARY/ASSIGN/ORELSE).
+//
+// Expected: SIGTRAP at runtime with "array index out of bounds".
+
+struct Idx { u32 v; }
+
+i32 main() {
+    u8[8] arr;
+    arr[0] = 0xAA;
+    Idx i;
+    i.v = 1000;       // OOB for u8[8]
+    u32 x = arr[i.v]; // Must trap before silent OOB read
+    return (i32)x;
+}

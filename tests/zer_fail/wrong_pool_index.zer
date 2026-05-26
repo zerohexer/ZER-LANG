@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Wrong-pool free through array index. arr[0] = pool_a.alloc() registers
+// a compound handle for (arr, "[0]"); pool_b.free(arr[0]) must detect the
+// mismatch. Pre-fix: IR_ASSIGN compound key creation dropped pool_name.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    Handle(Task)[2] arr;
+    Handle(Task) ha = pool_a.alloc() orelse return;
+    arr[0] = ha;
+    pool_b.free(arr[0]);    // wrong pool — must error
+}

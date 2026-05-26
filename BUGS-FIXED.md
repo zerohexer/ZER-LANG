@@ -1195,6 +1195,119 @@ shown in the error message.
 
 ---
 
+## Session 2026-05-26 — Audit + 4 silent gap fixes
+
+Compiler-wide audit (~500K context read) found and fixed 4 silent
+miscompile / silent-OOB gaps. Each fix verified by adversarial test.
+
+### BUG-661: wrong-pool free silently corrupts pool_b state through alias
+
+**Symptom**: `Handle(Task) ha = pool_a.alloc(); Handle(Task) p = ha;
+pool_b.free(p);` compiled clean. F3.2 (BUG-659) added `pool_name`
+tracking but only the IR_COPY path and the orelse-ident shortcut
+propagated it. Five other alias-copy sites silently dropped pool_name:
+- IR_ASSIGN non-move ident alias (`p = ha`)
+- IR_ASSIGN compound-write (`s.field = h`, `arr[0] = h`)
+- IR_FIELD_WRITE compound creation
+- IR_INDEX_WRITE compound creation
+- IR_CAST alias
+- @ptrcast alias
+- &interior-pointer alias
+
+Each site propagated a different subset of `{state, alloc_line,
+free_line, alloc_id, source_color, escaped, is_thread_handle,
+pool_name, pool_name_len}` — see `docs/refactor_ir.md` for the full
+6-week bug history of this pattern.
+
+**Root cause**: alias-copy logic inlined per-site, each propagating
+a manually-listed subset of IRHandleInfo fields. Adding a new field
+required updating all sites; missing one = silent miscompile.
+
+**Fix**: extracted `IRHandleProvenance` snapshot struct +
+`ir_snapshot_provenance(src)` + `ir_alias_copy_provenance(dst, snap)`
+helper pair (Phase A of `docs/refactor_ir.md`). All 6 alias-copy
+sites now call the helper. Snapshot pattern captures fields BEFORE
+realloc-capable `ir_add_handle` — prevents the UAF guard pattern
+that was repeatedly needed inline.
+
+**Tests**: `tests/zer_fail/wrong_pool_alias.zer` (bare-ident alias),
+`wrong_pool_field.zer` (struct field), `wrong_pool_index.zer`
+(array element). All 3 now compile-error correctly.
+
+### BUG-662: static local initializer silently dropped on IR path
+
+**Symptom**: `static u32 retries = 3; return retries;` returned 0
+on every call. ir_lower.c:1684 created the local with `is_static`
+but never lowered the init expression. emitter.c:9811 unconditionally
+emitted `static T name = {0};` — auto-zero overrode the user's init.
+
+**Root cause**: ir_lower comment said "checker enforces compile-time
+constant init for static" and skipped lowering, expecting emitter to
+handle it. Emitter never read the init from anywhere.
+
+**Fix**:
+1. Added `Node *static_init` field to `IRLocal` in `ir.h`.
+2. ir_lower.c NODE_VAR_DECL is_static branch now stores `node->var_decl.init`
+   on the local.
+3. emitter.c locals-declaration loop emits `static T name = INIT;`
+   via `emit_rewritten_node(l->static_init)` for is_static locals
+   that have an init expression.
+
+**Test**: `tests/zer/static_init_preserved.zer` verifies u32 and u64
+static inits round-trip correctly through the IR path.
+
+### BUG-663: array `arr[i.field]` bypasses bounds check (silent OOB)
+
+**Symptom**: `u8[8] arr; struct Idx { u32 v; } i; i.v = 1000; arr[i.v]`
+compiled clean and read OOB at runtime. Returned garbage byte value
+silently.
+
+**Root cause**: the checker's `mark_auto_guard` only fired for
+NODE_IDENT and NODE_CALL index expressions. NODE_FIELD/NODE_INDEX/
+NODE_BINARY indices were not auto-guarded. The IR emitter
+`emit_rewritten_node` NODE_INDEX path emitted plain `arr[idx]` for
+arrays (deferring to auto-guard for compile-time-size bounds), but
+no auto-guard had been registered.
+
+**Fix**: `emit_rewritten_node` NODE_INDEX now emits inline
+`_zer_bounds_check` for arrays whose index is non-trivial
+(FIELD/INDEX/BINARY/UNARY/ASSIGN/ORELSE). Mirrors the AST `emit_expr`
+path (line 2141). Side-effect-bearing expressions
+(UNARY/ASSIGN/ORELSE) use single-eval `*({ size_t _i = idx;
+check(_i); &arr[_i]; })`. Pure expressions (FIELD/INDEX/BINARY)
+double-evaluate safely. Proven indices (literal, range-derived
+ident, range-derived call) take the existing zero-overhead path.
+
+**Test**: `tests/zer_trap/array_index_field_oob.zer` traps with
+"array index out of bounds" at runtime.
+
+### Audit-discovered (CRITICAL, fix deferred)
+
+Two silent gaps confirmed by adversarial tests but fixes were
+deferred to keep the commit focused:
+
+1. **Stack pointer escape via arithmetic chain**:
+   `g_addr = @ptrtoint(&local) + 0` — escape walker only matches
+   direct `@ptrtoint(&local)` on RHS. One arithmetic op laundering
+   breaks detection. Fix needs `is_local_derived` propagation
+   through NODE_BINARY in expression check.
+
+2. **Spawn arg reads shared struct field unlocked**:
+   `spawn worker(g.v + 1)` — emitter packs `_sa->a0 = (g.v + 1)`
+   without acquiring `g._zer_mtx`. Torn read for wider-than-atomic
+   fields. Fix needs lock/unlock around spawn arg expression that
+   touches shared fields.
+
+Reproducers at `/tmp/v_escape.zer` and `/tmp/v_spawn_race.zer`
+respectively.
+
+NOTE: BUG-661 (wrong-pool through alias) is implemented separately
+via MvXYC's IRAliasSnapshot helper (committed afterward), which
+supersedes EW8I0's 6-site helper with a more comprehensive 11-site
+refactor.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

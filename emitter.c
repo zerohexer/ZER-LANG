@@ -226,6 +226,76 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
     return false;
 }
 
+/* Conservatively check if evaluating `n` may have observable side effects.
+ * Used to decide whether to hoist a target/index into a temp before
+ * duplicating it in the emitted C code.
+ *
+ * Returns true for any subexpression that is a NODE_CALL, NODE_ASSIGN,
+ * NODE_ORELSE (may wrap a call), NODE_INTRINSIC (conservatively all),
+ * or a NODE_UNARY deref of a non-trivial expression (volatile reads
+ * must single-eval). Walks into NODE_FIELD/NODE_INDEX/NODE_SLICE
+ * subexpressions so things like `arr[fn()] <<= n` and
+ * `s.field[fn()] = v` are correctly classified.
+ *
+ * Pre-fix, several emission sites used a partial walker that descended
+ * into NODE_INDEX.object but not NODE_INDEX.index, so `arr[fn()] <<= n`
+ * silently evaluated `fn()` twice (BUG: indexed compound side-effect).
+ */
+static bool expr_has_side_effects(Node *n) {
+    if (!n) return false;
+    switch (n->kind) {
+    /* Direct side effects. */
+    case NODE_CALL:
+    case NODE_ASSIGN:
+    case NODE_ORELSE:
+    case NODE_INTRINSIC:
+        return true;
+    case NODE_UNARY:
+        /* Volatile deref must single-eval; conservatively flag any deref. */
+        if (n->unary.op == TOK_STAR) return true;
+        return expr_has_side_effects(n->unary.operand);
+    case NODE_FIELD:
+        return expr_has_side_effects(n->field.object);
+    case NODE_INDEX:
+        return expr_has_side_effects(n->index_expr.object) ||
+               expr_has_side_effects(n->index_expr.index);
+    case NODE_SLICE:
+        return expr_has_side_effects(n->slice.object) ||
+               expr_has_side_effects(n->slice.start) ||
+               expr_has_side_effects(n->slice.end);
+    case NODE_BINARY:
+        return expr_has_side_effects(n->binary.left) ||
+               expr_has_side_effects(n->binary.right);
+    case NODE_TYPECAST:
+        return expr_has_side_effects(n->typecast.expr);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) {
+            if (expr_has_side_effects(n->struct_init.fields[i].value)) return true;
+        }
+        return false;
+    /* Leaf expressions — side-effect free. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    /* Statement/decl nodes — caller should only pass expressions, but
+     * be safe: a stray declaration node has no observable subexpression
+     * side effects from our perspective (we don't lift values out of it). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+
 /* ---- Type emission ---- */
 static void prescan_async_temps(Emitter *e, Node *node);
 static bool is_condvar_type(Emitter *e, uint32_t type_id);
@@ -1472,6 +1542,34 @@ static void emit_expr(Emitter *e, Node *node) {
             bool is_signed_div = tgt_eff && type_is_signed(tgt_eff);
             const char *cop = node->assign.op == TOK_SLASHEQ ? "/" : "%";
             int tmp = e->temp_count++;
+            /* Side-effect hoist — mirror IR path. Without this,
+             * `arr[fn()] /= y` evaluates fn() twice when the INT_MIN
+             * check fires (and once when it doesn't). */
+            bool tgt_se = expr_has_side_effects(node->assign.target);
+            if (tgt_se) {
+                emit(e, "({ __typeof__(");
+                emit_expr(e, node->assign.value);
+                emit(e, ") _zer_dv%d = ", tmp);
+                emit_expr(e, node->assign.value);
+                emit(e, "; if (_zer_dv%d == 0) "
+                       "_zer_trap(\"division by zero\", __FILE__, __LINE__); ",
+                     tmp);
+                emit(e, "__auto_type _zer_dp%d = &(", tmp);
+                emit_expr(e, node->assign.target);
+                emit(e, "); ");
+                if (is_signed_div) {
+                    emit(e, "if (_zer_dv%d == -1) { __typeof__(*_zer_dp%d) _zer_dd%d = *_zer_dp%d; ",
+                         tmp, tmp, tmp, tmp);
+                    int w = type_width(tgt_eff);
+                    if (w == 8) emit(e, "if (_zer_dd%d == -128) ", tmp);
+                    else if (w == 16) emit(e, "if (_zer_dd%d == -32768) ", tmp);
+                    else if (w == 32) emit(e, "if (_zer_dd%d == (-2147483647-1)) ", tmp);
+                    else emit(e, "if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                    emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
+                }
+                emit(e, "*_zer_dp%d %s= _zer_dv%d; })", tmp, cop, tmp);
+                goto assign_done;
+            }
             emit(e, "({ __typeof__(");
             emit_expr(e, node->assign.value);
             emit(e, ") _zer_dv%d = ", tmp);
@@ -1497,19 +1595,9 @@ static void emit_expr(Emitter *e, Node *node) {
         /* compound shift: target <<= n → target = _zer_shl(target, n)
          * If target has side effects, hoist via pointer to avoid double-eval */
         if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
-            /* check if any node in target chain has side effects */
-            bool shift_side_effect = false;
-            {
-                Node *n = node->assign.target;
-                while (n) {
-                    if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
-                        shift_side_effect = true; break;
-                    }
-                    if (n->kind == NODE_FIELD) n = n->field.object;
-                    else if (n->kind == NODE_INDEX) n = n->index_expr.object;
-                    else break;
-                }
-            }
+            /* Unified side-effect check — partial walker pre-fix missed
+             * NODE_INDEX.index calls. See expr_has_side_effects above. */
+            bool shift_side_effect = expr_has_side_effects(node->assign.target);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
             if (shift_side_effect) {
                 /* hoist target into pointer: *({ auto *_p = &target; *_p = macro(*_p, n); _p; }) — but simpler: */
@@ -5748,45 +5836,51 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * Phase 3 fix (Gap 0): emit _zer_bounds_check for slices.
          * Audit 2026-05-26: also emit _zer_bounds_check for arrays when
          * the index is non-trivial (NODE_FIELD/NODE_INDEX/NODE_BINARY etc.).
-         * Pre-fix: `arr[i.field]`, `arr[b.f.g]`, `arr[x+y]` silently
-         * read OOB — auto-guard only fired for NODE_IDENT/NODE_CALL
-         * indices, so other index expression shapes had ZERO bounds
-         * protection. Compile-time-proven indices (literal, range-
-         * derived IDENT, range-derived CALL) still take the zero-overhead
-         * path via checker_is_proven. */
+         * Audit 2026-05-28: side-effect-bearing index OR object now uses
+         * single-eval `*({...})` pattern to avoid double-evaluation.
+         *
+         * Pre-fix patterns:
+         *   `arr[i.field]`, `arr[b.f.g]`, `arr[x+y]` silently read OOB
+         *     (auto-guard only fired for NODE_IDENT/NODE_CALL).
+         *   `slice[get_idx()]` silently called get_idx() TWICE (comma form). */
         Type *idx_obj_type = checker_get_type(e->checker, node->index_expr.object);
         Type *idx_obj_eff = idx_obj_type ? type_unwrap_distinct(idx_obj_type) : NULL;
         bool idx_slice = idx_obj_eff && idx_obj_eff->kind == TYPE_SLICE;
         bool idx_array = idx_obj_eff && idx_obj_eff->kind == TYPE_ARRAY;
+        bool idx_se = expr_has_side_effects(node->index_expr.index);
+        bool obj_se = expr_has_side_effects(node->index_expr.object);
         if (idx_slice) {
-            emit(e, "(_zer_bounds_check((size_t)(");
-            emit_rewritten_node(e, node->index_expr.index, func);
-            emit(e, "), ");
-            emit_rewritten_node(e, node->index_expr.object, func);
-            emit(e, ".len, __FILE__, __LINE__), ");
-            emit_rewritten_node(e, node->index_expr.object, func);
-            emit(e, ".ptr)[");
-            emit_rewritten_node(e, node->index_expr.index, func);
-            emit(e, "]");
+            if (idx_se || obj_se) {
+                int tmp = e->temp_count++;
+                emit(e, "*({ __typeof__(");
+                emit_rewritten_node(e, node->index_expr.object, func);
+                emit(e, ") _zer_obj%d = ", tmp);
+                emit_rewritten_node(e, node->index_expr.object, func);
+                emit(e, "; size_t _zer_idx%d = (size_t)(", tmp);
+                emit_rewritten_node(e, node->index_expr.index, func);
+                emit(e, "); _zer_bounds_check(_zer_idx%d, _zer_obj%d.len, "
+                       "__FILE__, __LINE__); &_zer_obj%d.ptr[_zer_idx%d]; })",
+                     tmp, tmp, tmp, tmp);
+            } else {
+                emit(e, "(_zer_bounds_check((size_t)(");
+                emit_rewritten_node(e, node->index_expr.index, func);
+                emit(e, "), ");
+                emit_rewritten_node(e, node->index_expr.object, func);
+                emit(e, ".len, __FILE__, __LINE__), ");
+                emit_rewritten_node(e, node->index_expr.object, func);
+                emit(e, ".ptr)[");
+                emit_rewritten_node(e, node->index_expr.index, func);
+                emit(e, "]");
+            }
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
                    node->index_expr.index->kind != NODE_IDENT &&
                    node->index_expr.index->kind != NODE_CALL &&
                    (idx_obj_eff->array.size > 0 || idx_obj_eff->array.sizeof_type)) {
             /* Inline bounds check for non-trivial array indices (FIELD/
-             * INDEX/BINARY/UNARY/ASSIGN/ORELSE). Pre-fix: only NODE_IDENT
-             * and NODE_CALL triggered the statement-level auto-guard, so
-             * `arr[i.field]` / `arr[b.f.g]` / `arr[x+y]` silently read OOB.
-             *
-             * Side-effect-bearing expressions (UNARY deref, ASSIGN, ORELSE)
-             * use the single-eval `*({...})` pattern to avoid double-
-             * evaluation of the index expression. Pure expressions
-             * (FIELD, INDEX, BINARY) can safely double-evaluate. */
-            bool idx_has_side_effects =
-                (node->index_expr.index->kind == NODE_ASSIGN ||
-                 node->index_expr.index->kind == NODE_UNARY ||
-                 node->index_expr.index->kind == NODE_ORELSE);
-            if (idx_has_side_effects) {
+             * INDEX/BINARY/UNARY/ASSIGN/ORELSE). Side-effect-bearing
+             * expressions use single-eval `*({...})` to avoid double-eval. */
+            if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
                 emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
                 emit_rewritten_node(e, node->index_expr.index, func);
@@ -5807,6 +5901,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, "]");
             }
         } else {
+            /* Array / pointer indexing — C evaluates arr[expr] once on
+             * its own, but if a caller wraps this in a compound op that
+             * re-emits the lvalue, we still need single-eval. The
+             * caller (compound shift/div) hoists via pointer; here we
+             * keep the plain form. */
             emit_rewritten_node(e, node->index_expr.object, func);
             emit(e, "[");
             emit_rewritten_node(e, node->index_expr.index, func);
@@ -5999,18 +6098,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * extracts call/orelse out of targets, so the simple form is
          * normally safe — pointer-hoist is defense in depth.) */
         if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
-            bool shift_side_effect = false;
-            {
-                Node *n = node->assign.target;
-                while (n) {
-                    if (n->kind == NODE_CALL || n->kind == NODE_ASSIGN) {
-                        shift_side_effect = true; break;
-                    }
-                    if (n->kind == NODE_FIELD) n = n->field.object;
-                    else if (n->kind == NODE_INDEX) n = n->index_expr.object;
-                    else break;
-                }
-            }
+            /* Side-effect check: use the unified walker so indexed targets
+             * like `arr[fn()] <<= n` are correctly classified. The prior
+             * partial walker descended only through NODE_FIELD.object /
+             * NODE_INDEX.object and missed side effects in
+             * NODE_INDEX.index — silently double-evaluating fn(). */
+            bool shift_side_effect = expr_has_side_effects(node->assign.target);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
             if (shift_side_effect) {
                 int tmp = e->temp_count++;
@@ -6041,6 +6134,35 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             bool is_signed_div = div_type && type_is_signed(div_type);
             const char *cop = node->assign.op == TOK_SLASHEQ ? "/" : "%";
             int tmp = e->temp_count++;
+            /* Side-effect hoist: if target contains a call (e.g.
+             * `arr[fn()] /= y`), the INT_MIN check and the actual
+             * division both re-emit the target — silently
+             * double-evaluating fn(). Hoist via pointer to single-eval. */
+            bool tgt_se = expr_has_side_effects(node->assign.target);
+            if (tgt_se) {
+                emit(e, "({ __typeof__(");
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ") _zer_dv%d = ", tmp);
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, "; if (_zer_dv%d == 0) "
+                       "_zer_trap(\"division by zero\", __FILE__, __LINE__); ",
+                     tmp);
+                emit(e, "__auto_type _zer_dp%d = &(", tmp);
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, "); ");
+                if (is_signed_div) {
+                    emit(e, "if (_zer_dv%d == -1) { __typeof__(*_zer_dp%d) _zer_dd%d = *_zer_dp%d; ",
+                         tmp, tmp, tmp, tmp);
+                    int w = type_width(div_type);
+                    if (w == 8) emit(e, "if (_zer_dd%d == -128) ", tmp);
+                    else if (w == 16) emit(e, "if (_zer_dd%d == -32768) ", tmp);
+                    else if (w == 32) emit(e, "if (_zer_dd%d == (-2147483647-1)) ", tmp);
+                    else emit(e, "if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                    emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
+                }
+                emit(e, "*_zer_dp%d %s= _zer_dv%d; })", tmp, cop, tmp);
+                return;
+            }
             emit(e, "({ __typeof__(");
             emit_rewritten_node(e, node->assign.value, func);
             emit(e, ") _zer_dv%d = ", tmp);

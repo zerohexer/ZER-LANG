@@ -1,0 +1,66 @@
+// Test: side-effectful call inside array/slice index must single-evaluate.
+// Bug class: inline bounds-check and compound-assign emission duplicated
+// the index expression, calling fn() twice instead of once.
+//
+// Coverage:
+//   1) Plain array read   - arr[fn()]
+//   2) Plain array write  - arr[fn()] = v
+//   3) Compound shift     - arr[fn()] <<= n   (BUG)
+//   4) Slice read         - s[fn()]
+//   5) Slice write        - s[fn()] = v       (BUG)
+//   6) Compound shift on slice                 (BUG)
+//
+// Pre-fix, steps 3/5/6 silently double-evaluated fn() because the side-
+// effect walker descended into NODE_INDEX.object but not .index, and the
+// inline-bounds-check emission for slice indices used a comma-operator
+// form that duplicated the index expression.
+
+i32 counter = 0;
+
+i32 get_idx() {
+    counter += 1;
+    return 1;
+}
+
+i32 main() {
+    i32[4] arr;
+    arr[0] = 100; arr[1] = 200;
+
+    // 1) Plain array read
+    counter = 0;
+    i32 r1 = arr[get_idx()];
+    if (counter != 1) { return 10; }
+    if (r1 != 200) { return 11; }
+
+    // 2) Plain array write
+    counter = 0;
+    arr[get_idx()] = 99;
+    if (counter != 1) { return 20; }
+    if (arr[1] != 99) { return 21; }
+
+    // 3) Compound shift on array index (BUG: double-eval)
+    counter = 0;
+    arr[1] = 4;
+    arr[get_idx()] <<= 1;
+    if (counter != 1) { return 30; }
+    if (arr[1] != 8) { return 31; }
+
+    // 4) Slice read
+    [*]i32 s = arr[0..4];
+    counter = 0;
+    i32 r4 = s[get_idx()];
+    if (counter != 1) { return 40; }
+
+    // 5) Slice write (BUG: bounds_check + actual index both eval index)
+    counter = 0;
+    s[get_idx()] = 77;
+    if (counter != 1) { return 50; }
+
+    // 6) Compound shift on slice (BUG: bounds_check + shift LHS + shift inside _zer_shl arg)
+    counter = 0;
+    s[1] = 4;
+    s[get_idx()] <<= 1;
+    if (counter != 1) { return 60; }
+
+    return 0;
+}

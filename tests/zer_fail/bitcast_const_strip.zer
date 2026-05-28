@@ -1,0 +1,11 @@
+// MUST FAIL: @bitcast must not silently strip the const qualifier
+// (mirrors @ptrcast which already rejects this).
+// Per CLAUDE.md: "@bitcast (same width required, qualifier-checked)".
+
+const u32 CONSTVAL = 100;
+
+i32 main() {
+    const *u32 p = &CONSTVAL;
+    *u32 mp = @bitcast(*u32, p);  // should be rejected — strips const
+    return 0;
+}

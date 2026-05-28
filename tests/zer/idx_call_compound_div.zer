@@ -1,0 +1,35 @@
+// Test: compound /=, %= with side-effectful index must single-evaluate
+// the target even when the INT_MIN/-1 check fires.
+//
+// Pre-fix, `arr[fn()] /= -1` evaluated arr[fn()] twice when the divisor
+// equalled -1: once for the INT_MIN guard, once for the actual division.
+// The emitter now hoists the target via pointer when it has side effects.
+
+i32 counter = 0;
+
+i32 get_idx() {
+    counter += 1;
+    return 1;
+}
+
+i32 get_neg() {
+    i32 y = -1;
+    /* Defeat VRP so divisor isn't compile-time -1. */
+    for (i32 i = 0; i < 1; i += 1) { y = -1; }
+    return y;
+}
+
+i32 main() {
+    i32[4] arr;
+    arr[0] = 100; arr[1] = 200;
+    i32 y = get_neg();
+    if (y == 0) { return 99; }   /* prove nonzero for /= */
+
+    counter = 0;
+    arr[get_idx()] /= y;          /* one call to get_idx() expected */
+    if (counter != 1) { return 1; }
+    /* arr[1] = 200 / -1 = -200 */
+    if (arr[1] != -200) { return 2; }
+
+    return 0;
+}

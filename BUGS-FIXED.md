@@ -1337,6 +1337,149 @@ BUG-665 — already in main.
 
 ---
 
+## Session 2026-05-28 — Side-effect double-eval + qualifier-strip silent gaps
+
+Multi-agent audit + targeted reproducers turned up three silent
+miscompiles + one silent qualifier leak that the test suite did not
+cover. All four are now closed with negative tests in `tests/zer_fail/`
+(or positive single-eval tests in `tests/zer/`).
+
+### BUG-661: side-effectful index double-evaluated in slice access
+
+**Symptom**: `s[get_idx()] = 99` (where `s` is a `[*]T` slice and
+`get_idx()` has observable side effects) emitted
+
+```c
+(_zer_bounds_check((size_t)(get_idx()), s.len, ...), s.ptr)[get_idx()] = 99;
+```
+
+— `get_idx()` is evaluated **twice** instead of once. The same shape
+appeared for slice reads (mitigated by IR pre-extraction in value
+position) but bit writes which are emitted through
+`emit_rewritten_node NODE_INDEX` without single-eval.
+
+**Root cause**: `emit_rewritten_node NODE_INDEX` always used the
+comma-operator form for slices and never checked whether the index or
+object expression had side effects. The AST `emit_expr` path had a
+`idx_has_side_effects` check (line 2099-2125) but the IR-side handler
+never received the same treatment when the IR migration happened.
+
+**Fix**: Added `expr_has_side_effects(Node *)` helper that
+conservatively classifies NODE_CALL / NODE_ASSIGN / NODE_ORELSE /
+NODE_INTRINSIC / volatile `*p` deref as side-effecting and walks every
+subexpression of NODE_FIELD / NODE_INDEX / NODE_SLICE / etc.
+`emit_rewritten_node NODE_INDEX` now uses the same statement-expression
+single-eval pattern (`*({ ... &s.ptr[i]; })`) for slices when either the
+index or object has side effects.
+
+**Tests**: `tests/zer/idx_call_single_eval.zer` (6 patterns: array
+read/write, array compound shift, slice read/write, slice compound
+shift) verifies the side-effectful index is evaluated exactly once.
+
+### BUG-662: compound shift target double-evaluated when index has side effects
+
+**Symptom**: `arr[get_idx()] <<= 1` evaluated `get_idx()` twice
+(silently mis-counted side effects, but the shifted value was still
+correct because both calls returned the same array slot).
+
+**Root cause**: The side-effect walker in the compound-shift emitter
+descended into `node->field.object` and `node->index_expr.object`
+but never checked `node->index_expr.index`. The shift target was
+therefore classified as having no side effects, falling into the
+`target = _zer_shl(target, val)` path that re-emits the target twice.
+
+**Fix**: Replaced the partial walker with the unified
+`expr_has_side_effects()` helper in both the AST and IR compound-shift
+paths (emitter.c). The pointer-hoist branch (`__auto_type _zer_sp%d =
+&(target); *_zer_sp%d = _zer_shl(...);`) now correctly fires for
+`arr[fn()]`-style targets.
+
+**Tests**: covered by `tests/zer/idx_call_single_eval.zer` steps 3 and
+6 (array and slice compound shift).
+
+### BUG-663: compound div target double-evaluated on INT_MIN/-1 check fire
+
+**Symptom**: `arr[get_idx()] /= -1` (or `%=` with `-1`) evaluated the
+target twice when the runtime INT_MIN guard activated: once for the
+`__typeof__(target) _zer_dd = target` snapshot, once for the actual
+`target /= _zer_dv`. Conditional on the divisor being `-1` at runtime,
+so most testing missed it.
+
+**Root cause**: The compound `/=` / `%=` emitter (AST and IR paths) had
+no side-effect path at all. It always emitted the target verbatim in
+multiple positions of the generated statement expression.
+
+**Fix**: Added a `tgt_se = expr_has_side_effects(target)` branch in
+both paths that hoists the target via `__auto_type _zer_dp%d =
+&(target); *_zer_dp%d ...;` before any duplicated mention. Single
+evaluation guaranteed for the target regardless of which branch of the
+INT_MIN check fires.
+
+**Tests**: `tests/zer/idx_call_compound_div.zer` — divisor proven
+non-zero at compile time but `-1` at runtime (defeats VRP), target
+is `arr[get_idx()]`. Expected: counter == 1 after the assignment.
+
+### BUG-664: `@bitcast` silently strips `const`
+
+**Symptom**: `*u32 mp = @bitcast(*u32, const_ptr);` accepted, returning
+a non-const pointer to read-only memory. `@ptrcast` already rejected
+this; `@bitcast` did not, despite the CLAUDE.md spec stating it is
+"qualifier-checked".
+
+**Root cause**: `checker.c` calls `check_volatile_strip` for `@bitcast`
+(BUG-341) but never added the parallel `is_const` check that
+`@ptrcast` performs at line 5747-5753. A reader assuming "qualifier-
+checked" meant both qualifiers got a false negative.
+
+**Fix**: Added explicit const-strip check after the volatile check in
+the `@bitcast` arm, mirroring the `@ptrcast` block.
+
+**Tests**: `tests/zer_fail/bitcast_const_strip.zer` — `*u32 mp =
+@bitcast(*u32, const_ptr)` is now a compile error.
+
+### BUG-665: function-call array index with provable-OOB return range
+
+**Symptom**: `arr[fn()]` where `fn()` has a compile-time-proven return
+range `[10, 10]` and `arr` has size 4 — silently compiled with no
+bounds check, reading or writing garbage memory at runtime. Neither
+the compile-time OOB path (BUG-196, only fires for NODE_INT_LIT) nor
+the auto-guard path (only fires for NODE_IDENT) covered this.
+
+**Root cause**: `check_expr NODE_INDEX` only handled the **safe** case
+of inline call-range propagation (`max < array.size → proven`). The
+symmetric **definitely-OOB** case (`min >= array.size`) was not
+checked, so a `return 10` from `get_oob` silently became an unchecked
+out-of-bounds index. This is a silent gap in both compile-time and
+runtime: nothing caught it, and on bare-metal it would have silently
+corrupted adjacent memory.
+
+**Fix**: Added the `min >= size` arm in checker.c, emitting a hard
+compile error with the proven range and the array size.
+
+**Note**: The complementary "partial overlap or unknown range" case
+was considered for auto-guard insertion but rolled back — auto-guard
+emits the index expression at the guard site, which would
+double-evaluate side effects in a call. The correct migration path is
+for the user to bind the call result to a local first, after which the
+NODE_IDENT auto-guard path inserts a single-eval guard. Documented in
+the comment block of the patched site.
+
+**Tests**: `tests/zer_fail/call_return_oob.zer`.
+
+### Technical debt: unified `expr_has_side_effects` helper
+
+Same partial-walker pattern (descend NODE_INDEX.object but skip .index)
+appeared in three places — compound shift target (AST + IR) and
+compound div target (AST + IR). Consolidated to one
+`expr_has_side_effects(Node *)` helper with an exhaustive `switch` on
+`NodeKind` (no `default:`, walker_default_audit.sh enforced).
+
+Files: `emitter.c`, `checker.c`, `tests/zer/idx_call_single_eval.zer`,
+`tests/zer/idx_call_compound_div.zer`, `tests/zer_fail/bitcast_const_strip.zer`,
+`tests/zer_fail/call_return_oob.zer`.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

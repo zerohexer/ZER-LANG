@@ -1,0 +1,13 @@
+// MUST FAIL: function-call index whose proven return range is definitely OOB
+// Compile-time check should catch arr[fn()] when fn always returns >= arr.size.
+// Before fix: silently compiled and corrupted memory at runtime.
+// Bug class: find_return_range computed [10,10] but NODE_INDEX call site did
+// not error nor insert auto-guard when range was OOB.
+
+i32 get_oob() { return 10; }  // definitely OOB for arr[4]
+
+i32 main() {
+    i32[4] arr;
+    arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4;
+    return arr[get_oob()];
+}

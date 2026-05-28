@@ -5444,7 +5444,18 @@ static Type *check_expr(Checker *c, Node *node) {
                         (unsigned long long)obj->array.size);
                 }
             }
-            /* Inline call range: arr[func()] where func has return range */
+            /* Inline call range: arr[func()] where func has return range.
+             * Sub-cases on (min, max) vs array.size:
+             *   (a) max < size  → proven safe (zero-overhead)
+             *   (b) min >= size → definitely OOB → compile error
+             *   (c) other       → leave unmarked (auto-guard would duplicate
+             *                     the call, see emit_auto_guards). User
+             *                     should bind the call to a local; the
+             *                     NODE_IDENT path will then insert the
+             *                     guard with single-eval semantics.
+             *
+             * Pre-fix only (a) was handled and (b) silently corrupted
+             * memory at runtime. Now (b) is a hard compile error. */
             if (!checker_is_proven(c, node) &&
                 node->index_expr.index->kind == NODE_CALL &&
                 node->index_expr.index->call.callee &&
@@ -5459,6 +5470,16 @@ static Type *check_expr(Checker *c, Node *node) {
                     csym->return_range_min >= 0 &&
                     (uint64_t)csym->return_range_max < obj->array.size) {
                     mark_proven(c, node);
+                } else if (csym && csym->has_return_range &&
+                           csym->return_range_min >= 0 &&
+                           (uint64_t)csym->return_range_min >= obj->array.size) {
+                    checker_error(c, node->loc.line,
+                        "array index from '%.*s()' returns [%lld, %lld] which is always out of bounds for array of size %llu",
+                        (int)node->index_expr.index->call.callee->ident.name_len,
+                        node->index_expr.index->call.callee->ident.name,
+                        (long long)csym->return_range_min,
+                        (long long)csym->return_range_max,
+                        (unsigned long long)obj->array.size);
                 }
             }
             result = obj->array.inner;
@@ -6067,6 +6088,21 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* BUG-341: volatile stripping via @bitcast (same as @ptrcast BUG-258) */
                     check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
                                          node->loc.line, "@bitcast");
+                    /* const stripping via @bitcast — mirror @ptrcast (BUG-304).
+                     * Per CLAUDE.md, @bitcast is "qualifier-checked"; missing
+                     * the const arm silently allowed `*u32 mp = @bitcast(*u32,
+                     * const_ptr);` which laundered away const. */
+                    if (val_type) {
+                        Type *src_eff = type_unwrap_distinct(val_type);
+                        Type *tgt_eff_b = result ? type_unwrap_distinct(result) : NULL;
+                        if (src_eff && tgt_eff_b &&
+                            src_eff->kind == TYPE_POINTER && src_eff->pointer.is_const &&
+                            tgt_eff_b->kind == TYPE_POINTER && !tgt_eff_b->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "@bitcast cannot strip const qualifier — "
+                                "target must be const pointer");
+                        }
+                    }
                 }
             } else {
                 result = ty_void;

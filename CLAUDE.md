@@ -1031,6 +1031,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - RF9: Dynamic parser arrays. RF10: `is_func_ptr_start()` consolidated.
 - RF11: Shared `expr_is_volatile()` / `expr_root_symbol()` helpers.
 - RF12: `build_expr_key_a()` arena-allocated expr keys (no fixed `char[128]` buffers). Dynamic `ComptimeParam` arrays (stack-first `[8]` with arena overflow).
+- RF13 (2026-05-28): Shared `expr_has_side_effects(Node *)` helper in emitter.c — exhaustive `switch` on `NodeKind` (no `default:`, enforced by walker_default_audit.sh). Used by: NODE_INDEX single-eval emission for slices, compound shift target hoist, compound div target hoist. Pre-RF13 each call site had its own partial walker that descended `NODE_INDEX.object` but skipped `.index`, silently double-evaluating `arr[fn()] <<= n` style code (BUG-661/662/663). Any new emission site that must single-evaluate a target lvalue should use this helper rather than rolling its own walker.
 
 **Design Decisions (intentional, NOT bugs):**
 - `@inttoptr(*T, 0)` allowed (MMIO address 0x0), shift widening spec-correct, `[]T → *T` coercion removed

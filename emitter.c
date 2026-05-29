@@ -4270,17 +4270,40 @@ static void emit_spawn_wrappers(Emitter *e) {
         int ac = sn->spawn_stmt.arg_count;
 
         if (ac > 0) {
-            /* Emit arg struct typedef */
+            /* Emit arg struct typedef.  Field types follow the WORKER's
+             * PARAM types, NOT the arg expression types, because the
+             * wrapper later calls `worker(_a->a0, _a->a1, ...)` and
+             * worker expects its parameter types.  Falling back to arg
+             * type only when param type is unavailable (extern with no
+             * signature, etc.) — coercion at the field-assignment site
+             * (further below) bridges the gap. Discovered 2026-05-29:
+             * spawn worker(42) where worker takes ?u32 silently
+             * miscompiled because struct field was emitted as uint32_t
+             * but worker takes _zer_opt_u32. */
+            Symbol *worker_sym = scope_lookup(e->checker->global_scope,
+                sn->spawn_stmt.func_name,
+                (uint32_t)sn->spawn_stmt.func_name_len);
+            Type *worker_ft = NULL;
+            if (worker_sym && worker_sym->type) {
+                Type *wt = type_unwrap_distinct(worker_sym->type);
+                if (wt->kind == TYPE_FUNC_PTR) worker_ft = wt;
+            }
             emit(e, "struct _zer_spawn_args_%d { ", sid);
             for (int i = 0; i < ac; i++) {
-                Type *at = checker_get_type(e->checker, sn->spawn_stmt.args[i]);
-                if (at) {
+                Type *field_type = NULL;
+                if (worker_ft && (uint32_t)i < worker_ft->func_ptr.param_count) {
+                    field_type = worker_ft->func_ptr.params[i];
+                }
+                if (!field_type) {
+                    field_type = checker_get_type(e->checker, sn->spawn_stmt.args[i]);
+                }
+                if (field_type) {
                     /* BUG-465: use emit_type_and_name with actual field name.
                      * For function pointers, name must be inside (*name)(params).
                      * Passing NULL + separate name breaks funcptr emission. */
                     char fname[8];
                     int flen = snprintf(fname, sizeof(fname), "a%d", i);
-                    emit_type_and_name(e, at, fname, flen);
+                    emit_type_and_name(e, field_type, fname, flen);
                     emit(e, "; ");
                 }
             }
@@ -9369,11 +9392,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         emit_indent(e);
                         emit(e, "struct _zer_spawn_args_%d *_sa = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid);
                         /* Audit 2026-05-26: lock around shared-field reads in
-                         * spawn arg expressions. Pre-fix, `spawn worker(g.v+1)`
-                         * emitted `_sa->a0 = (g.v + 1);` with no lock — torn
-                         * read for any g.v wider than the platform atomic
-                         * unit. Locks held only across arg evaluation (not
-                         * across pthread_create itself). */
+                         * spawn arg expressions. Audit 2026-05-29: also coerce
+                         * T → ?T per worker param signature (so `_sa->aN`
+                         * matches the wrapper struct's field types which now
+                         * follow the param types). */
+                        Symbol *worker_sym = scope_lookup(e->checker->global_scope,
+                            sp->spawn_stmt.func_name,
+                            (uint32_t)sp->spawn_stmt.func_name_len);
+                        Type *worker_ft = NULL;
+                        if (worker_sym && worker_sym->type) {
+                            Type *wt = type_unwrap_distinct(worker_sym->type);
+                            if (wt->kind == TYPE_FUNC_PTR) worker_ft = wt;
+                        }
                         for (int ai = 0; ai < ac; ai++) {
                             Node *sroot = find_shared_root(e, sp->spawn_stmt.args[ai]);
                             if (sroot) {
@@ -9383,7 +9413,31 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                             }
                             emit_indent(e);
                             emit(e, "_sa->a%d = ", ai);
-                            emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
+                            Type *pt = NULL;
+                            if (worker_ft && (uint32_t)ai < worker_ft->func_ptr.param_count) {
+                                pt = type_unwrap_distinct(worker_ft->func_ptr.params[ai]);
+                            }
+                            Type *at_ast = checker_get_type(e->checker,
+                                sp->spawn_stmt.args[ai]);
+                            Type *at_eff = at_ast ? type_unwrap_distinct(at_ast) : NULL;
+                            bool pt_is_opt_value = pt && pt->kind == TYPE_OPTIONAL &&
+                                !is_null_sentinel(pt->optional.inner);
+                            bool at_is_opt = at_eff && at_eff->kind == TYPE_OPTIONAL;
+                            if (pt_is_opt_value && !at_is_opt) {
+                                emit(e, "(");
+                                emit_type(e, pt);
+                                emit(e, "){ ");
+                                /* null literal arg → has_value=0 */
+                                if (sp->spawn_stmt.args[ai]->kind == NODE_NULL_LIT) {
+                                    emit(e, ".has_value = 0 }");
+                                } else {
+                                    emit(e, ".value = ");
+                                    emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
+                                    emit(e, ", .has_value = 1 }");
+                                }
+                            } else {
+                                emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
+                            }
                             emit(e, ";\n");
                             if (sroot) {
                                 emit_shared_unlock(e, sroot);

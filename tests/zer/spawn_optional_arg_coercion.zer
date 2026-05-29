@@ -1,0 +1,29 @@
+// Regression: spawn with `?T` worker parameter silently miscompiled
+// when arg was T literal or null.  Discovered 2026-05-29.
+//
+// Pre-fix: spawn arg struct emitted `uint32_t a0` (from arg expression
+// type) but worker took `_zer_opt_u32` — GCC rejected the worker call
+// inside the wrapper.  Now: arg struct uses param types from the
+// worker's signature, and arg assignment site wraps T/null into ?T.
+
+shared struct State { u32 hits; }
+State g;
+
+void worker_value(?u32 maybe) {
+    if (maybe) |v| { g.hits += v; }
+}
+
+void worker_null(?u32 maybe) {
+    if (maybe) |v| { g.hits += v; }
+}
+
+u32 main() {
+    ThreadHandle t1 = spawn worker_value(42);
+    ThreadHandle t2 = spawn worker_null(null);
+    ThreadHandle t3 = spawn worker_value(7);
+    t1.join();
+    t2.join();
+    t3.join();
+    if (g.hits != 49) { return 1; }  // 42 + 0 + 7
+    return 0;
+}

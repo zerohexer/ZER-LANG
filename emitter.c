@@ -5345,15 +5345,62 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     /* Ring */
     if (te->kind == TYPE_RING) {
         if (ml==4 && !memcmp(mn,"push",4) && node->call.arg_count>0) {
-            int t=e->temp_count++; emit(e,"({"); emit_type(e,te->ring.elem); emit(e," _zer_rp%d=",t); BA(0); emit(e,";_zer_ring_push(%.*s.data,&%.*s.head,&%.*s.tail,&%.*s.count,%llu,&_zer_rp%d,sizeof(_zer_rp%d));})",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,t,t); return true;
+            /* Element-type coercion: if ring elem is ?T and arg is T or
+             * null, wrap into the optional struct. Without this, the
+             * `_zer_rp%d = arg` assignment was an invalid initializer
+             * (no implicit T→?T conversion in C). Discovered 2026-05-29
+             * via the systematic T-vs-?T coercion audit. */
+            Type *elem_eff = type_unwrap_distinct(te->ring.elem);
+            Type *arg_ast = checker_get_type(e->checker, node->call.args[0]);
+            Type *arg_eff = arg_ast ? type_unwrap_distinct(arg_ast) : NULL;
+            bool elem_is_opt = elem_eff && elem_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(elem_eff->optional.inner);
+            bool arg_is_opt = arg_eff && arg_eff->kind == TYPE_OPTIONAL;
+            int t=e->temp_count++; emit(e,"({"); emit_type(e,te->ring.elem); emit(e," _zer_rp%d=",t);
+            if (elem_is_opt && !arg_is_opt) {
+                emit(e,"(");
+                emit_type(e,te->ring.elem);
+                emit(e,"){ ");
+                if (node->call.args[0]->kind == NODE_NULL_LIT) {
+                    emit(e,".has_value = 0 }");
+                } else {
+                    emit(e,".value = ");
+                    BA(0);
+                    emit(e,", .has_value = 1 }");
+                }
+            } else {
+                BA(0);
+            }
+            emit(e,";_zer_ring_push(%.*s.data,&%.*s.head,&%.*s.tail,&%.*s.count,%llu,&_zer_rp%d,sizeof(_zer_rp%d));})",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,t,t); return true;
         }
         if (ml==3 && !memcmp(mn,"pop",3)) {
             int t=e->temp_count++; Type *opt=type_optional(e->arena,te->ring.elem); emit(e,"({"); emit_type(e,opt); emit(e," _zer_ro%d={0};if(%.*s.count>0){_zer_ro%d.value=%.*s.data[%.*s.tail];_zer_ro%d.has_value=1;%.*s.tail=(%.*s.tail+1)%%%llu;%.*s.count--;}_zer_ro%d;})",t,(int)ol,on,t,(int)ol,on,(int)ol,on,t,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,(int)ol,on,t); return true;
         }
         if (ml==12 && !memcmp(mn,"push_checked",12) && node->call.arg_count>0) {
-            /* ring.push_checked(val) → ?void (null if full) */
+            /* ring.push_checked(val) → ?void (null if full).
+             * Same elem-type coercion as push above. */
+            Type *elem_eff = type_unwrap_distinct(te->ring.elem);
+            Type *arg_ast = checker_get_type(e->checker, node->call.args[0]);
+            Type *arg_eff = arg_ast ? type_unwrap_distinct(arg_ast) : NULL;
+            bool elem_is_opt = elem_eff && elem_eff->kind == TYPE_OPTIONAL &&
+                !is_null_sentinel(elem_eff->optional.inner);
+            bool arg_is_opt = arg_eff && arg_eff->kind == TYPE_OPTIONAL;
             int t=e->temp_count++;
-            emit(e,"({"); emit_type(e,te->ring.elem); emit(e," _zer_rp%d=",t); BA(0);
+            emit(e,"({"); emit_type(e,te->ring.elem); emit(e," _zer_rp%d=",t);
+            if (elem_is_opt && !arg_is_opt) {
+                emit(e,"(");
+                emit_type(e,te->ring.elem);
+                emit(e,"){ ");
+                if (node->call.args[0]->kind == NODE_NULL_LIT) {
+                    emit(e,".has_value = 0 }");
+                } else {
+                    emit(e,".value = ");
+                    BA(0);
+                    emit(e,", .has_value = 1 }");
+                }
+            } else {
+                BA(0);
+            }
             emit(e,";_zer_opt_void _zer_rc%d;if(%.*s.count<%llu){",t,(int)ol,on,(unsigned long long)te->ring.count);
             emit(e,"_zer_ring_push(%.*s.data,&%.*s.head,&%.*s.tail,&%.*s.count,%llu,&_zer_rp%d,sizeof(_zer_rp%d));",
                  (int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,t,t);

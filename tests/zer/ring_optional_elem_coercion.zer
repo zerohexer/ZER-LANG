@@ -1,0 +1,25 @@
+// Regression: Ring(?T, N).push(value) silently miscompiled — the emitted
+// `_zer_opt_T _zer_rpN = value;` was an invalid initializer (C has no
+// implicit T→?T conversion). Same coercion gap as the call-arg and
+// spawn-arg bugs fixed earlier this session.
+//
+// This test focuses only on the push coercion. The Ring.pop side has a
+// separate documented issue around double-optional unwrap that's out
+// of scope for this fix.
+
+struct W { u32 val; }
+Ring(?W, 4) chan;
+
+u32 main() {
+    W w;
+    w.val = 99;
+    chan.push(w);          // T → ?T coercion at push site
+
+    chan.push(null);       // null → ?T coercion at push site
+
+    // If push silently miscompiled (pre-fix), the program couldn't even
+    // compile because the emitted `_zer_opt_W _zer_rp0 = w;` line was
+    // an invalid C initializer. Just reaching the return means the fix
+    // is intact.
+    return 0;
+}

@@ -29,6 +29,14 @@ set -u  # don't use -e — we want to keep going through all files
 cd "$(dirname "$0")/.."
 
 # Files to audit. Add new safety-critical compiler files here as they land.
+#
+# Intentionally NOT audited: ir.c and vrp_ir.c. These files contain CFG
+# walkers and per-op IR diagnostic switches where defaults represent
+# "implicit fallthrough for non-terminator ops" or "field-invariant
+# checks only on the subset of ops that have field invariants" — not
+# silent gaps. Adding them would create noise without value. If a new
+# IR TERMINATOR op is added (rare — would be an architectural change),
+# manually audit ir.c's switches.
 FILES="checker.c zercheck.c zercheck_ir.c ir_lower.c emitter.c parser.c"
 
 found_count=0

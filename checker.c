@@ -2370,6 +2370,19 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
     return CONST_EVAL_FAIL;
 }
 
+/* Const-expression evaluation that also resolves const-symbol identifiers
+ * by walking their initializer. Used by NODE_ASM operand constraint
+ * dispatch (NONZERO / BOUNDED / ALIGNED) where the operand expression may
+ * be a literal, a const-symbol reference, or a compound expression made
+ * of these. Previously inlined three times in checker.c NODE_ASM —
+ * extracted 2026-05-29 to dedupe and to match the architectural rule
+ * "no duplicate code" (CLAUDE.md). Delegates to eval_const_expr_ex with
+ * resolve_const_ident as the callback; same one-call replacement pattern
+ * used at checker.c:2326. */
+static int64_t eval_const_with_idents(Checker *c, Node *n) {
+    return eval_const_expr_ex(n, 0, resolve_const_ident, c);
+}
+
 /* Resolve enum variant: State.idle → int value. Returns CONST_EVAL_FAIL if not an enum field. */
 static int64_t resolve_enum_field(Checker *c, Node *n) {
     if (!n || n->kind != NODE_FIELD || !n->field.object ||
@@ -10686,23 +10699,11 @@ static void check_stmt(Checker *c, Node *node) {
                                 if (oc.kind == ZER_OPC_NONZERO ||
                                     oc.kind == ZER_OPC_COMPOUND_NONZERO_NOT_INTMIN) {
                                     bool nz_ok = false;
-                                    /* Compile-time literal nonzero? */
-                                    int64_t cv = eval_const_expr(bound_expr);
-                                    /* Resolve const idents via Symbol init. */
-                                    if (cv == CONST_EVAL_FAIL &&
-                                        bound_expr->kind == NODE_IDENT) {
-                                        Symbol *bsym = scope_lookup(c->current_scope,
-                                            bound_expr->ident.name,
-                                            (uint32_t)bound_expr->ident.name_len);
-                                        if (bsym && bsym->is_const && bsym->func_node) {
-                                            Node *binit = NULL;
-                                            if (bsym->func_node->kind == NODE_GLOBAL_VAR)
-                                                binit = bsym->func_node->var_decl.init;
-                                            else if (bsym->func_node->kind == NODE_VAR_DECL)
-                                                binit = bsym->func_node->var_decl.init;
-                                            if (binit) cv = eval_const_expr(binit);
-                                        }
-                                    }
+                                    /* Compile-time literal nonzero?
+                                     * eval_const_with_idents handles literals AND
+                                     * recursively resolves const-symbol references
+                                     * (see helper near checker.c:2278). */
+                                    int64_t cv = eval_const_with_idents(c, bound_expr);
                                     if (cv != CONST_EVAL_FAIL && cv != 0) nz_ok = true;
                                     /* VRP-proven nonzero? */
                                     if (!nz_ok && bound_expr->kind == NODE_IDENT) {
@@ -10748,23 +10749,8 @@ static void check_stmt(Checker *c, Node *node) {
                                     int64_t bmax = (int64_t)oc.param2;
                                     bool in_bounds = false;
                                     bool determined = false;
-                                    /* Compile-time literal? */
-                                    int64_t bv = eval_const_expr(bound_expr);
-                                    /* Resolve const idents via Symbol init. */
-                                    if (bv == CONST_EVAL_FAIL &&
-                                        bound_expr->kind == NODE_IDENT) {
-                                        Symbol *bsym = scope_lookup(c->current_scope,
-                                            bound_expr->ident.name,
-                                            (uint32_t)bound_expr->ident.name_len);
-                                        if (bsym && bsym->is_const && bsym->func_node) {
-                                            Node *binit = NULL;
-                                            if (bsym->func_node->kind == NODE_GLOBAL_VAR)
-                                                binit = bsym->func_node->var_decl.init;
-                                            else if (bsym->func_node->kind == NODE_VAR_DECL)
-                                                binit = bsym->func_node->var_decl.init;
-                                            if (binit) bv = eval_const_expr(binit);
-                                        }
-                                    }
+                                    /* Compile-time literal? + recursive const-ident resolution. */
+                                    int64_t bv = eval_const_with_idents(c, bound_expr);
                                     if (bv != CONST_EVAL_FAIL) {
                                         determined = true;
                                         in_bounds = (bv >= bmin && bv <= bmax);
@@ -10830,21 +10816,8 @@ static void check_stmt(Checker *c, Node *node) {
                                         bex = node->asm_stmt.inputs[bi - node->asm_stmt.output_count].expr;
                                     }
                                     if (!bex) continue;
-                                    int64_t av = eval_const_expr(bex);
-                                    if (av == CONST_EVAL_FAIL &&
-                                        bex->kind == NODE_IDENT) {
-                                        Symbol *bsym = scope_lookup(c->current_scope,
-                                            bex->ident.name,
-                                            (uint32_t)bex->ident.name_len);
-                                        if (bsym && bsym->is_const && bsym->func_node) {
-                                            Node *binit = NULL;
-                                            if (bsym->func_node->kind == NODE_GLOBAL_VAR)
-                                                binit = bsym->func_node->var_decl.init;
-                                            else if (bsym->func_node->kind == NODE_VAR_DECL)
-                                                binit = bsym->func_node->var_decl.init;
-                                            if (binit) av = eval_const_expr(binit);
-                                        }
-                                    }
+                                    /* Literal? + recursive const-ident resolution. */
+                                    int64_t av = eval_const_with_idents(c, bex);
                                     if (av != CONST_EVAL_FAIL &&
                                         (uint64_t)av % aligned_required != 0) {
                                         checker_error(c, node->loc.line,

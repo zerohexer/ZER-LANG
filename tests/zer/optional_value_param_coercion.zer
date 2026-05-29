@@ -1,0 +1,23 @@
+// Regression: passing T or `null` to a function with `?T` value parameter
+// was silently miscompiled — emitted C passed `uint32_t` or `void *` to a
+// `_zer_opt_T` parameter and GCC rejected the call.  No shipping test
+// exercised this combination; discovered 2026-05-29 via the AUDIT-LOUD
+// roll-forward.  IR-path call-arg emission now wraps T-into-?T and null-
+// into-?T at the call site (designated-initializer form so field order
+// in the optional struct is robust to future changes).
+
+u32 g = 0;
+
+void take_opt(?u32 maybe) {
+    if (maybe) |v| { g = v; }
+}
+
+u32 main() {
+    take_opt(42);
+    if (g != 42) { return 1; }
+    take_opt(null);
+    if (g != 42) { return 2; }  // unchanged — null arm did nothing
+    take_opt(7);
+    if (g != 7) { return 3; }
+    return 0;
+}

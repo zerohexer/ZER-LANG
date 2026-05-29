@@ -8856,7 +8856,47 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     /* Check if param expects slice but arg is array → coerce */
                     Type *pt = (callee_ft && (uint32_t)i < callee_ft->func_ptr.param_count) ?
                         type_unwrap_distinct(callee_ft->func_ptr.params[i]) : NULL;
-                    if (at && pt && at->kind == TYPE_ARRAY && pt->kind == TYPE_SLICE) {
+                    /* Optional-value wrap coercion: param `?T` (struct
+                     * form, NOT null-sentinel pointer) and arg is the
+                     * inner T or a null literal. Lowering doesn't
+                     * insert an IR_CAST for this, so the emitter must
+                     * wrap. Without this, the emitted C passed `uint32_t`
+                     * or `void *` to a `_zer_opt_T` parameter and GCC
+                     * rejected the call. Discovered 2026-05-29.
+                     *
+                     * For null arg (al->type is void* / opaque
+                     * pointer): emit { .has_value = 0 }. For value arg:
+                     * emit { .value = local, .has_value = 1 }. Note we
+                     * suppress wrap if the arg is ALREADY of optional
+                     * type (e.g., orelse-chained or optional-returning
+                     * call) — in that case the local already holds the
+                     * optional struct. */
+                    bool pt_is_opt_value = pt && pt->kind == TYPE_OPTIONAL &&
+                        !is_null_sentinel(pt->optional.inner);
+                    bool at_is_opt = at && at->kind == TYPE_OPTIONAL;
+                    if (pt_is_opt_value && !at_is_opt) {
+                        emit(e, "(");
+                        emit_type(e, pt);
+                        emit(e, "){ ");
+                        /* Detect null literal: arg type is opaque
+                         * pointer (TYPE_POINTER to void/opaque) or the
+                         * temp was emitted as `void*`. ir_lower stores
+                         * NULL as a kind=4 literal that the emitter
+                         * surfaces as `void*` or `0` — check al->type
+                         * kind to disambiguate. */
+                        if (at && at->kind == TYPE_POINTER) {
+                            /* Null pointer literal stored in temp →
+                             * emit zero-value optional. */
+                            emit(e, ".has_value = 0 }");
+                        } else {
+                            /* Normal value → wrap with has_value=1.
+                             * Use designated initializers to be robust
+                             * to field order in _zer_opt_T struct. */
+                            emit(e, ".value = ");
+                            emit_local_name(e, func, inst->call_arg_locals[i]);
+                            emit(e, ", .has_value = 1 }");
+                        }
+                    } else if (at && pt && at->kind == TYPE_ARRAY && pt->kind == TYPE_SLICE) {
                         /* Array → slice coercion */
                         emit(e, "(");
                         emit_type(e, pt);

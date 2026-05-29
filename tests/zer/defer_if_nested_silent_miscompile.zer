@@ -1,0 +1,40 @@
+// Regression: silent miscompile of `if` statements inside `defer` bodies.
+// Discovered 2026-05-29 via walker_default_audit.sh's brace-tracking rewrite.
+//
+// Symptom (pre-fix): defer body containing `if (cond) { ... } else { ... }`
+// was walked statement-by-statement in IR_DEFER_FIRE, but the fallback for
+// non-(EXPR_STMT/RETURN/ASM) statements routed to emit_rewritten_node, which
+// handles EXPRESSIONS — not statements. NODE_IF hit the silent default and
+// emitted `/* unhandled node 14 */0` into the C output, dropping the entire
+// if-statement.
+//
+// Concrete effect: BOTH branches of the if (which both free the handle) were
+// LOST. The handle was never freed at runtime — slab leak. The compiler did
+// NOT detect this because zercheck saw the AST defer body which contained
+// the if + free calls; only the C emission stripped them.
+//
+// Test: defer body uses `if/else` with side effects. If the if-statement is
+// emitted correctly, the side-effect counter == 1. If silently miscompiled
+// to `0`, counter == 0.
+
+u32 g_counter = 0;
+
+void bump() { g_counter += 1; }
+
+void f(bool flag) {
+    defer {
+        if (flag) {
+            bump();
+        } else {
+            bump();
+        }
+    }
+}
+
+u32 main() {
+    f(true);
+    if (g_counter != 1) { return 1; }
+    f(false);
+    if (g_counter != 2) { return 2; }
+    return 0;
+}

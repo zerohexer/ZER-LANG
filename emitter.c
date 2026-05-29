@@ -8417,48 +8417,55 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     default:
-        /* Dead-stub guard. The previous default emitted a comment plus
-         * literal 0, which is a valid C expression that compiles clean
-         * but is semantically wrong (silent miscompile vector).
-         * walker_audit.sh enforces parity with emit_expr, so reaching
-         * this default means a regression. Fail loudly instead. */
-        fprintf(stderr,
-            "INTERNAL ERROR: emit_rewritten_node reached default for NODE_%d "
-            "(file=%s line=%d). Add a case in emit_rewritten_node OR add the "
-            "kind to the pre-lowered list in tools/walker_audit.sh.\n",
-            node->kind, e->source_file ? e->source_file : "?", node->loc.line);
-        abort();
+        /* AUDIT-LOUD: previously emitted "/ * unhandled node N * /0" which
+         * silently miscompiled (a `0` is a valid C expression but the wrong
+         * value). Now fails loudly at compiler-time (stderr diagnostic) AND
+         * embeds a runtime trap into the emitted C so testing catches the
+         * regression instead of producing wrong results. */
+        fprintf(stderr, "compiler bug: emit_rewritten_node hit unhandled "
+                "node kind %d at line %d (new NODE_ kind added to AST without "
+                "emit_rewritten_node handler)\n",
+                node->kind, node->loc.line);
+        emit(e, "(_zer_trap(\"compiler bug: unhandled NODE kind in "
+             "emit_rewritten_node\", __FILE__, __LINE__), 0)");
+        return;
     }
 }
 
-/* Emit one statement from a defer body. Recursive — handles nested
- * blocks/if in defer bodies. Originally the IR_DEFER_FIRE walker only
- * handled NODE_EXPR_STMT/RETURN/ASM and fell through to emit_rewritten_node
- * for everything else, which silently emitted a literal-0 fallback for
- * NODE_IF (silent miscompile, the dead-stub pattern CLAUDE.md warns about).
- * This helper makes defer body emission complete for BLOCK and IF.
+/* Emit a single statement from a defer body. Defer bodies are stored as raw
+ * AST (NODE_BLOCK or single stmt) — NOT lowered to IR — so the IR-path defer
+ * emitter needs a way to translate stmt-level AST into C. Without this
+ * helper, statement kinds (NODE_IF / NODE_FOR / NODE_WHILE / nested
+ * NODE_BLOCK) would silently hit emit_rewritten_node's default and
+ * miscompile to "/ * unhandled node N * /0", dropping the entire statement.
  *
- * NODE_DEFER, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, and NODE_RETURN-with-
- * yield inside defer bodies are banned by the checker (defer-context bans,
- * see CLAUDE.md Ban Framework). NODE_FOR / NODE_WHILE / NODE_SWITCH inside
- * defer are uncommon enough that we leave them as fallback (will hit
- * emit_rewritten_node's abort if reached). */
+ * Control-flow statements banned in defer per CLAUDE.md
+ * (return/break/continue/goto) are still rejected at checker level — this
+ * emitter accepts them defensively, but check_stmt will have errored
+ * before lowering reached us. */
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
     if (!s) return;
-    /* Fast path: handle the few statement kinds defer bodies actually
-     * contain (BLOCK/IF/EXPR_STMT/RETURN/ASM). Anything else falls back
-     * to expression-level emission. Using if/else-if (not switch) avoids
-     * tripping walker_default_audit.sh — the fallback isn't a "missing
-     * case" silent skip, it's the documented unsupported-stmt path. */
-    if (s->kind == NODE_EXPR_STMT) {
+    switch (s->kind) {
+    case NODE_BLOCK: {
+        emit_indent(e);
+        emit(e, "{\n");
+        e->indent++;
+        for (int si = 0; si < s->block.stmt_count; si++) {
+            emit_defer_stmt(e, s->block.stmts[si], func);
+        }
+        e->indent--;
+        emit_indent(e);
+        emit(e, "}\n");
+        return;
+    }
+    case NODE_EXPR_STMT:
         if (s->expr_stmt.expr) {
             emit_indent(e);
             emit_rewritten_node(e, s->expr_stmt.expr, func);
             emit(e, ";\n");
         }
         return;
-    }
-    if (s->kind == NODE_RETURN) {
+    case NODE_RETURN:
         emit_indent(e);
         emit(e, "return");
         if (s->ret.expr) {
@@ -8467,8 +8474,7 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         }
         emit(e, ";\n");
         return;
-    }
-    if (s->kind == NODE_ASM) {
+    case NODE_ASM:
         emit_indent(e);
         if (s->asm_stmt.is_structured) {
             emit_structured_asm(e, s, func);
@@ -8477,58 +8483,130 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
                  (int)s->asm_stmt.code_len, s->asm_stmt.code);
         }
         return;
-    }
-    if (s->kind == NODE_BLOCK) {
+    case NODE_IF:
         emit_indent(e);
-        emit(e, "{\n");
+        emit(e, "if (");
+        if (s->if_stmt.cond) emit_rewritten_node(e, s->if_stmt.cond, func);
+        emit(e, ") ");
+        if (s->if_stmt.then_body) {
+            if (s->if_stmt.then_body->kind == NODE_BLOCK) {
+                emit(e, "{\n");
+                e->indent++;
+                for (int si = 0; si < s->if_stmt.then_body->block.stmt_count; si++) {
+                    emit_defer_stmt(e, s->if_stmt.then_body->block.stmts[si], func);
+                }
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}");
+            } else {
+                emit(e, "{ ");
+                emit_defer_stmt(e, s->if_stmt.then_body, func);
+                emit_indent(e);
+                emit(e, "}");
+            }
+        } else {
+            emit(e, "{}");
+        }
+        if (s->if_stmt.else_body) {
+            emit(e, " else ");
+            if (s->if_stmt.else_body->kind == NODE_BLOCK) {
+                emit(e, "{\n");
+                e->indent++;
+                for (int si = 0; si < s->if_stmt.else_body->block.stmt_count; si++) {
+                    emit_defer_stmt(e, s->if_stmt.else_body->block.stmts[si], func);
+                }
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
+            } else if (s->if_stmt.else_body->kind == NODE_IF) {
+                /* else-if chain — recurse directly without extra block */
+                emit_defer_stmt(e, s->if_stmt.else_body, func);
+            } else {
+                emit(e, "{ ");
+                emit_defer_stmt(e, s->if_stmt.else_body, func);
+                emit(e, "}\n");
+            }
+        } else {
+            emit(e, "\n");
+        }
+        return;
+    case NODE_WHILE:
+        emit_indent(e);
+        emit(e, "while (");
+        if (s->while_stmt.cond) emit_rewritten_node(e, s->while_stmt.cond, func);
+        emit(e, ") {\n");
         e->indent++;
-        for (int i = 0; i < s->block.stmt_count; i++) {
-            emit_defer_stmt(e, s->block.stmts[i], func);
+        if (s->while_stmt.body && s->while_stmt.body->kind == NODE_BLOCK) {
+            for (int si = 0; si < s->while_stmt.body->block.stmt_count; si++) {
+                emit_defer_stmt(e, s->while_stmt.body->block.stmts[si], func);
+            }
+        } else if (s->while_stmt.body) {
+            emit_defer_stmt(e, s->while_stmt.body, func);
         }
         e->indent--;
         emit_indent(e);
         emit(e, "}\n");
         return;
-    }
-    if (s->kind == NODE_IF) {
+    case NODE_FOR:
+        /* Best-effort: emit C `for` directly. NODE_FOR's init can be a
+         * NODE_VAR_DECL or an expression; step is an expression. */
         emit_indent(e);
-        emit(e, "if (");
-        emit_rewritten_node(e, s->if_stmt.cond, func);
+        emit(e, "for (");
+        if (s->for_stmt.init) {
+            if (s->for_stmt.init->kind == NODE_VAR_DECL) {
+                Type *t = checker_get_type(e->checker, s->for_stmt.init);
+                if (t) emit_type(e, t);
+                emit(e, " %.*s",
+                     (int)s->for_stmt.init->var_decl.name_len,
+                     s->for_stmt.init->var_decl.name);
+                if (s->for_stmt.init->var_decl.init) {
+                    emit(e, " = ");
+                    emit_rewritten_node(e, s->for_stmt.init->var_decl.init, func);
+                }
+            } else {
+                emit_rewritten_node(e, s->for_stmt.init, func);
+            }
+        }
+        emit(e, "; ");
+        if (s->for_stmt.cond) emit_rewritten_node(e, s->for_stmt.cond, func);
+        emit(e, "; ");
+        if (s->for_stmt.step) emit_rewritten_node(e, s->for_stmt.step, func);
         emit(e, ") {\n");
         e->indent++;
-        if (s->if_stmt.then_body && s->if_stmt.then_body->kind == NODE_BLOCK) {
-            for (int i = 0; i < s->if_stmt.then_body->block.stmt_count; i++) {
-                emit_defer_stmt(e, s->if_stmt.then_body->block.stmts[i], func);
+        if (s->for_stmt.body && s->for_stmt.body->kind == NODE_BLOCK) {
+            for (int si = 0; si < s->for_stmt.body->block.stmt_count; si++) {
+                emit_defer_stmt(e, s->for_stmt.body->block.stmts[si], func);
             }
-        } else if (s->if_stmt.then_body) {
-            emit_defer_stmt(e, s->if_stmt.then_body, func);
+        } else if (s->for_stmt.body) {
+            emit_defer_stmt(e, s->for_stmt.body, func);
         }
         e->indent--;
         emit_indent(e);
-        emit(e, "}");
-        if (s->if_stmt.else_body) {
-            emit(e, " else {\n");
-            e->indent++;
-            if (s->if_stmt.else_body->kind == NODE_BLOCK) {
-                for (int i = 0; i < s->if_stmt.else_body->block.stmt_count; i++) {
-                    emit_defer_stmt(e, s->if_stmt.else_body->block.stmts[i], func);
-                }
-            } else {
-                emit_defer_stmt(e, s->if_stmt.else_body, func);
-            }
-            e->indent--;
-            emit_indent(e);
-            emit(e, "}");
+        emit(e, "}\n");
+        return;
+    case NODE_VAR_DECL: {
+        emit_indent(e);
+        Type *t = checker_get_type(e->checker, s);
+        if (t) emit_type(e, t);
+        emit(e, " %.*s", (int)s->var_decl.name_len, s->var_decl.name);
+        if (s->var_decl.init) {
+            emit(e, " = ");
+            emit_rewritten_node(e, s->var_decl.init, func);
         }
-        emit(e, "\n");
+        emit(e, ";\n");
         return;
     }
-    /* Fallback: expression-level emission for any other kind. The
-     * emit_rewritten_node abort surfaces genuine gaps if/when defer bodies
-     * grow new statement kinds. */
-    emit_indent(e);
-    emit_rewritten_node(e, s, func);
-    emit(e, ";\n");
+    default:
+        /* AUDIT-LOUD: silently miscompiling statement kinds in defer
+         * is the original bug class this helper closed. Fail loudly. */
+        fprintf(stderr, "compiler bug: emit_defer_stmt has no handler for "
+                "node kind %d at line %d\n",
+                s->kind, s->loc.line);
+        emit_indent(e);
+        emit(e, "_zer_trap(\"compiler bug: unsupported stmt kind in defer\", "
+             "__FILE__, __LINE__);\n");
+        return;
+    }
 }
 
 /* Emit one IR instruction as C code */
@@ -9183,11 +9261,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         for (int di = e->defer_stack.count - 1; di >= base; di--) {
             Node *db = e->defer_stack.stmts[di];
             if (!db) continue;
-            /* Use emit_defer_stmt — recursive walker that handles
-             * BLOCK / IF / EXPR_STMT / RETURN / ASM. Previously the inline
-             * code only handled EXPR_STMT/RETURN/ASM and fell through to
-             * emit_rewritten_node(NODE_IF), which emitted a literal-0
-             * stub — silent miscompile of the if-body inside defer. */
+            /* Defer body may be a NODE_BLOCK (typical) or a single stmt.
+             * emit_defer_stmt handles both shapes recursively + all the
+             * statement kinds the defer body can legitimately contain
+             * (NODE_IF/FOR/WHILE/BLOCK/VAR_DECL/etc.). Previously this
+             * fell back to emit_rewritten_node for non-block bodies,
+             * silently miscompiling NODE_IF and friends. */
             if (db->kind == NODE_BLOCK) {
                 for (int si = 0; si < db->block.stmt_count; si++) {
                     emit_defer_stmt(e, db->block.stmts[si], func);
@@ -10176,14 +10255,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_SLICE_READ: {
         /* Dead-code guard: ir_lower.c does NOT emit these opcodes today
          * (the equivalent paths route through IR_ASSIGN + emit_rewritten_node).
-         * Previous stub emitted a comment-only line that silently miscompiled
-         * if a refactor added emission. Now emit a runtime trap so the
-         * regression surfaces as a runtime failure rather than dropped
-         * operations. To restore lowering: implement emission AND remove
-         * this guard. */
+         * If a future refactor starts emitting them WITHOUT adding a real
+         * handler here, silent miscompile. Defense-in-depth: stderr
+         * diagnostic + runtime trap. */
+        fprintf(stderr, "compiler bug: emit_ir_inst hit dormant 3AC op %d "
+                "(IR_INDEX_WRITE/IR_ADDR_OF/IR_DEREF_READ/IR_CALL_DECOMP/"
+                "IR_INTRINSIC_DECOMP/IR_ORELSE_DECOMP/IR_SLICE_READ) — "
+                "lowerer emitted this op without an emitter handler\n",
+                inst->op);
         emit_indent(e);
-        emit(e, "_zer_trap(\"IR opcode %d not implemented\", "
-                "__FILE__, __LINE__);\n", inst->op);
+        emit(e, "_zer_trap(\"compiler bug: unhandled 3AC IR op %d\", "
+             "__FILE__, __LINE__);\n", inst->op);
         break;
     }
     }

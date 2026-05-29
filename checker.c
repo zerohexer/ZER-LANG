@@ -7408,6 +7408,16 @@ static Type *check_expr(Checker *c, Node *node) {
     }
 
     default:
+        /* AUDIT-LOUD: previously silently returned ty_void for unhandled
+         * NODE_ kinds in check_expr (the expression type dispatch). Any new
+         * expression kind added to AST without a check_expr case would
+         * type-check as void — typically caught downstream by emit but the
+         * silent-skip class of bug was preventable. Now emits a compile-time
+         * diagnostic via checker_error so a regression is loud. */
+        checker_error(c, node->loc.line,
+            "compiler bug: check_expr has no handler for node kind %d "
+            "(new NODE_ kind added to AST without check_expr case)",
+            node->kind);
         result = ty_void;
         break;
     }
@@ -8993,7 +9003,21 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_FOR: {
         push_scope(c); /* for loop has its own scope */
-        if (node->for_stmt.init) check_stmt(c, node->for_stmt.init);
+        if (node->for_stmt.init) {
+            /* Parser emits either NODE_VAR_DECL (for `u32 i = 0`) or an
+             * expression (for `i = 0`, `i += 5`, etc., via parse_expression).
+             * VAR_DECL needs check_stmt; expressions need check_expr.
+             * Discovered 2026-05-29: previously dispatched only to
+             * check_stmt — silently skipped expression-form inits because
+             * the old check_stmt default just `break`-d. Symptom was a
+             * 6-line range-propagation hole in `for (i = 0; ...)` —
+             * type errors in the init were never reported. */
+            if (node->for_stmt.init->kind == NODE_VAR_DECL) {
+                check_stmt(c, node->for_stmt.init);
+            } else {
+                check_expr(c, node->for_stmt.init);
+            }
+        }
         if (node->for_stmt.cond) {
             Type *fcond = check_expr(c, node->for_stmt.cond);
             if (!type_equals(fcond, ty_bool)) {
@@ -11119,6 +11143,16 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     default:
+        /* AUDIT-LOUD: previously silently broke for unhandled NODE_ kinds
+         * in check_stmt (the statement-level type-check dispatch). Any new
+         * statement kind added to AST without a check_stmt case would skip
+         * type checking entirely. Now reports the gap via checker_error so
+         * the regression is loud. Continues with break to give the rest
+         * of the file a chance to type-check (vs aborting). */
+        checker_error(c, node->loc.line,
+            "compiler bug: check_stmt has no handler for node kind %d "
+            "(new NODE_ kind added to AST without check_stmt case)",
+            node->kind);
         break;
     }
     c->in_async_yield_stmt = saved_yield_stmt;

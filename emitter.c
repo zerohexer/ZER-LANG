@@ -9254,17 +9254,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_POOL_FREE: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
     case IR_POOL_GET:
     case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
-    case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED:
+    case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED: {
         /* Phase 8d: builtin ops no longer created by lowering — pool/slab/
-         * ring/arena method calls flow through IR_ASSIGN/IR_CALL. Previous
-         * comment-emit silently miscompiled if a regression started emitting
-         * these opcodes. Fail loudly instead. */
-        fprintf(stderr,
-            "INTERNAL ERROR: IR builtin opcode %d reached emitter "
-            "(file=%s line=%d) — Phase 8d collapsed these into IR_ASSIGN/"
-            "IR_CALL. Regression in ir_lower.c.\n",
-            inst->op, e->source_file ? e->source_file : "?", inst->source_line);
-        abort();
+         * ring/arena method calls flow through IR_ASSIGN/IR_CALL.
+         * AUDIT-LOUD: emit a runtime trap so any future lowering regression
+         * that starts emitting these opcodes fails at runtime instead of
+         * silently dropping operations. */
+        fprintf(stderr, "compiler bug: emit_ir_inst hit dormant builtin "
+                "op %d — ir_lower started emitting it without updating "
+                "the emitter handler\n", inst->op);
+        emit_indent(e);
+        emit(e, "_zer_trap(\"compiler bug: dormant builtin IR op %d emitted\", "
+             "__FILE__, __LINE__);\n", inst->op);
+        break;
+    }
 
     case IR_CRITICAL_BEGIN: {
         emit_indent(e);
@@ -9389,16 +9392,19 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
     }
 
-    case IR_INTRINSIC:
+    case IR_INTRINSIC: {
         /* IR_INTRINSIC no longer created by lowering — all flow through
-         * IR_ASSIGN. Previous comment-emit silently miscompiled if a
-         * regression started emitting it again. Fail loudly instead. */
-        fprintf(stderr,
-            "INTERNAL ERROR: IR_INTRINSIC reached emitter (file=%s line=%d) — "
-            "lowering should route intrinsics through IR_ASSIGN. This is a "
-            "regression in ir_lower.c.\n",
-            e->source_file ? e->source_file : "?", inst->source_line);
-        abort();
+         * IR_ASSIGN. AUDIT-LOUD: emit a runtime trap so any future
+         * lowering regression is caught at runtime rather than silently
+         * dropping the operation. */
+        fprintf(stderr, "compiler bug: emit_ir_inst hit IR_INTRINSIC — "
+                "ir_lower started emitting it without updating the emitter "
+                "handler\n");
+        emit_indent(e);
+        emit(e, "_zer_trap(\"compiler bug: dormant IR_INTRINSIC emitted\", "
+             "__FILE__, __LINE__);\n");
+        break;
+    }
 
     case IR_NOP:
         /* ASM, spawn, or switch pass-through */

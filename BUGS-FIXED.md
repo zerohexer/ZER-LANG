@@ -1480,6 +1480,194 @@ Files: `emitter.c`, `checker.c`, `tests/zer/idx_call_single_eval.zer`,
 
 ---
 
+## Session 2026-05-29 — silent miscompiles surfaced by walker-audit brace fix + T→?T coercion sweep
+
+Broad audit session focused on (a) finding hidden silent miscompiles by
+fixing the walker_default_audit.sh tool, (b) systematically auditing
+T-into-?T coercion across every value-flow site in the IR emission path,
+and (c) closing the de-duplication debt in NODE_ASM operand-constraint
+dispatch.
+
+### BUG-664: walker_default_audit.sh missed nested defaults
+
+**Symptom**: tools/walker_default_audit.sh reported "OK — no defaults
+remain" while 4 real silent defaults existed in safety-critical
+walkers. Two of them turned out to be hiding active silent miscompiles
+(BUG-665, BUG-666).
+
+**Root cause**: the awk pass for each `default:` searched UPWARD for
+the closest preceding `switch (` line and used that as the enclosing
+switch. When a default sat in the OUTER of two nested switches (e.g.,
+emit_ir_inst at emitter.c:8097's switch(inst->op) with an inner
+switch(inst->op_token) at 9482), the algorithm picked the inner
+switch as the enclosing one. The inner switch was on op_token (filtered
+out as a TokenKind dispatch), so the outer default was silently
+discarded.
+
+**Fix**: rewrote the audit as a single linear awk pass that tracks
+brace depth, maintains a stack of (switch_line, body_depth) frames,
+and emits the actually-enclosing switch for every `default:` it finds
+at the top level of a switch body. Also added a LOUD-default detection
+pass that exempts defaults containing `_zer_trap` / `checker_error` /
+`abort(` / `assert(0)` / `__builtin_unreachable` / the `AUDIT-LOUD`
+marker — those defaults already fail loudly and aren't silent gaps.
+
+**Tests**: rerunning `bash tools/walker_default_audit.sh` produces 0
+findings after the LOUD-conversion fixes (BUG-665/666/667).
+
+### BUG-665: NODE_IF inside `defer` body silently dropped
+
+**Symptom**: `defer { if (cond) { free(h); } else { free(h); } }`
+compiled clean and the program ran without freeing the handle. Both
+branches were silently discarded.
+
+**Root cause**: IR_DEFER_FIRE walked the defer body's NODE_BLOCK
+statement by statement (emitter.c around 8736) and only handled
+NODE_EXPR_STMT / NODE_RETURN / NODE_ASM explicitly. Everything else
+fell through to `emit_rewritten_node(s)` — but that function is the
+IR-path expression emitter, NOT a statement emitter. NODE_IF hit its
+silent default which emitted `/* unhandled node 14 */0`, a no-op `0`
+literal in the C output.
+
+**Fix**: added `emit_defer_stmt(e, s, func)` — a recursive helper that
+handles NODE_BLOCK / IF / WHILE / FOR / VAR_DECL / EXPR_STMT / RETURN /
+ASM with proper C-syntax emission. Rewired IR_DEFER_FIRE to use it.
+The helper's own default fails loudly (stderr diagnostic + _zer_trap
+in emitted C) so future regressions are visible.
+
+**Tests**: tests/zer/defer_if_nested_silent_miscompile.zer asserts both
+arms of the if execute via side-effect counter. The bug was discovered
+because tests/zer/_verify_BUG-608_defer_nested_cf.zer started failing
+once emit_rewritten_node's default was made loud — the AUDIT-LOUD
+roll-forward surfaced what was previously silent.
+
+### BUG-666: for-loop expression-form init was never type-checked
+
+**Symptom**: `for (i = 0; i < 5; i += 1)` (where `i` is already
+declared above) compiled clean even when the init contained a type
+error — `for (i = some_slice; ...)` didn't report the assignment of
+a slice to a u32.
+
+**Root cause**: check_stmt dispatched the for-loop init via
+`check_stmt(c, node->for_stmt.init)` unconditionally. The parser emits
+either a NODE_VAR_DECL (for `u32 i = 0`) or an expression (for
+`i = 0` via parse_expression). When init was an expression, check_stmt
+hit its silent `default: break;` and the init was never type-checked.
+Made loud by the AUDIT-LOUD rollout (check_stmt's default now reports
+via checker_error), which broke tests/zer/switch_arm_orelse_break.zer
+on the otherwise-legit `for (i = 0; ...)` pattern.
+
+**Fix**: branch in NODE_FOR on init kind — VAR_DECL goes through
+check_stmt, expressions go through check_expr (matching what the
+step-position already did). check_stmt's default is now loud.
+
+**Tests**: tests/zer/for_expr_init_typecheck.zer covers the positive
+pattern; tests/zer_fail/for_expr_init_type_error.zer covers the
+negative (was silently accepted pre-fix).
+
+### BUG-667: emit_rewritten_node + emit_ir_inst silent defaults + 3AC TODO
+
+**Symptom**: dormant code paths in the IR emitter would silently
+miscompile if exercised — emit_rewritten_node's default emitted
+`/* unhandled node N */0` (a valid C value, silent miscompile);
+emit_ir_inst's default and a group of "3AC dormant ops"
+(IR_INDEX_WRITE / IR_ADDR_OF / IR_DEREF_READ / IR_CALL_DECOMP /
+IR_INTRINSIC_DECOMP / IR_ORELSE_DECOMP / IR_SLICE_READ) emitted
+`/* IR op N not yet implemented */` comments that just disappeared
+into the C output. Confirmed across 800+ test programs none of these
+fire today.
+
+**Fix**: defense in depth. Both sites now print a stderr diagnostic at
+compile time AND emit a `_zer_trap("compiler bug: ...")` into the C so
+any future regression that activates these paths fails loudly at
+runtime instead of producing wrong results.
+
+### BUG-668: call argument T → ?T silently miscompiled
+
+**Symptom**: `take_opt(42)` or `take_opt(null)` against `void
+take_opt(?u32 maybe)` compiled clean from the ZER side but GCC
+rejected with "incompatible type for argument 1 of 'take_opt' /
+expected '_zer_opt_u32' but argument is of type 'uint32_t' /
+'void *'".
+
+**Root cause**: IR lowering creates a temp local for each call arg
+expression. The IR-path call-emission loop (emitter.c around 8528)
+had array→slice and slice→pointer coercion branches but not T→?T.
+Args were emitted as the bare local. NO shipping test exercised
+this combination — no test in tests/zer, rust_tests, zig_tests,
+test_modules ever passed `null` to a `?T` value parameter, and the
+existing `?T` value-param patterns all happened to wrap via orelse-
+unwrap chains that side-stepped the gap.
+
+**Fix**: added optional-value coercion in the IR_CALL arg loop. When
+the param is `?T` (TYPE_OPTIONAL, non-null-sentinel) and the arg
+isn't already optional, wrap into the optional struct using
+designated initializers `(?T){ .value = arg, .has_value = 1 }` for
+T-valued args and `(?T){ .has_value = 0 }` for null args.
+
+**Test**: tests/zer/optional_value_param_coercion.zer covers both
+forms (T value and null).
+
+### BUG-669: spawn arg T → ?T silently miscompiled (same class as 668)
+
+**Symptom**: `spawn worker(42)` against a worker with `?u32`
+parameter — same GCC type-mismatch failure mode as BUG-668, in the
+spawn-wrapper emission.
+
+**Root cause**: two emission sites for spawn arg handling: (1) the
+wrapper-struct field type was computed from the arg expression's
+type (so `uint32_t a0` for the literal 42), but the wrapper body
+later called `worker(_a->a0)` and worker took `_zer_opt_u32`. (2) The
+arg field assignment `_sa->aN = arg_expr` had no coercion.
+
+**Fix**: changed the struct emission to use the worker's PARAM types
+(via scope_lookup of the worker symbol) instead of arg types, falling
+back to arg type only when the worker signature is unavailable.
+Mirrored the optional coercion logic from BUG-668 at the arg
+assignment site.
+
+**Test**: tests/zer/spawn_optional_arg_coercion.zer covers value, null,
+and mixed-spawn patterns.
+
+### BUG-670: Ring(?T,N).push and push_checked T → ?T silently miscompiled
+
+**Symptom**: `chan.push(w)` against `Ring(?W, 4) chan; W w;` emitted
+`_zer_opt_W _zer_rp0 = w;` which GCC rejected as "invalid initializer"
+(no implicit T → ?T conversion in C).
+
+**Root cause**: emit_builtin_method's Ring.push handler emits a temp
+of the ring elem type initialized with the arg, but didn't coerce
+T-into-?T when the ring elem was an optional value type. Same gap
+class as BUG-668/669, in the AST-path builtin emitter.
+
+**Fix**: added the same optional-value coercion in both the `push`
+and `push_checked` Ring emission sites.
+
+**Test**: tests/zer/ring_optional_elem_coercion.zer covers value and
+null push paths. The matching Ring.pop double-optional unwrap gap
+(anonymous `??T` typedef produced by Ring.pop on `Ring(?T, N)`) is a
+separate pre-existing issue documented but out of scope.
+
+### Refactor: NODE_ASM operand-constraint dispatch dedup
+
+**Before**: NODE_ASM's NONZERO / BOUNDED / ALIGNED dispatch inlined
+the same 13-line const-symbol initializer lookup three times. The
+inlined logic only resolved one level deep.
+
+**After**: extracted `eval_const_with_idents(c, n)` — a single-line
+wrapper around `eval_const_expr_ex(n, 0, resolve_const_ident, c)`
+that reuses the existing recursive resolver. Removed ~36 lines of
+duplication and made the constraint check recursively resolve
+nested const-ident chains (e.g., `const A = B; const B = 5;`)
+without the user inlining.
+
+Cumulative impact this session: 1 audit-tool fix + 6 silent miscompiles
+made loud, 4 of those underlying bugs surfaced and fixed, 1 dedup
+refactor (~36 lines removed). All 541 zer + 784 rust + 36 zig + 139
+module + 1382 C-unit tests still passing.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

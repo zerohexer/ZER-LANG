@@ -1,0 +1,10 @@
+// VRP correctly proves x nonzero when range excludes 0.
+i32 main() {
+    i32 x = 5;
+    if (x > 0) {
+        // x in [1, INT64_MAX] — never zero
+        i32 q = 100 / x;
+        return q - 20;  // 100/5 = 20, return 0
+    }
+    return 1;
+}

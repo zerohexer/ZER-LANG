@@ -1,0 +1,9 @@
+// EXPECTED: runtime trap "slice end out of bounds"
+// arr[0..end] where end > arr.len must trap, not silently create OOB slice.
+i32 main() {
+    u32[5] arr;
+    u32 end = 100;
+    for (u32 k = 0; k < 1; k += 1) { end = 100; }
+    [*]u32 s = arr[0..end];
+    return (i32)s[0];
+}

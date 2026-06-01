@@ -6215,14 +6215,15 @@ static Type *check_expr(Checker *c, Node *node) {
                              * zer_mmio_inttoptr_allowed only checks alignment. */
                             in_range = 1;
                         }
-                        /* alignment check: constant address must be aligned to target type */
+                        /* alignment check: constant address must be aligned to target type.
+                         * Pre-fix used type_width which returns 0 for struct/array/union/
+                         * pointer targets — silently skipped check for compound MMIO. */
                         int aligned = 1;   /* assume aligned until checked */
                         int align = 0;
                         if (result) {
                             Type *inner = type_unwrap_distinct(result);
                             if (inner->kind == TYPE_POINTER && inner->pointer.inner) {
-                                int w = type_width(inner->pointer.inner);
-                                align = w > 0 ? w / 8 : 0;
+                                align = type_alignment_bytes(inner->pointer.inner);
                                 if (align > 1 && (addr % (uint64_t)align) != 0) {
                                     aligned = 0;
                                 }
@@ -7275,6 +7276,15 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!is_wait && !is_timedwait && !is_signal && !is_broadcast) {
                 checker_error(c, node->loc.line,
                     "unknown condvar intrinsic '@%.*s' — use @cond_wait, @cond_timedwait, @cond_signal, or @cond_broadcast",
+                    (int)nlen, name);
+            }
+            /* Ban condvar ops inside @critical — releasing the mutex while
+             * interrupts are disabled produces deadlock / undefined behavior.
+             * Same class as the existing spawn-in-@critical ban (hardware
+             * constraint, see CLAUDE.md Ban Decision Framework). */
+            if (c->critical_depth > 0) {
+                checker_error(c, node->loc.line,
+                    "@%.*s not allowed inside @critical — would release/wait on mutex with interrupts disabled (deadlock)",
                     (int)nlen, name);
             }
             if (is_wait) {
@@ -8888,24 +8898,30 @@ static void check_stmt(Checker *c, Node *node) {
                                 !node->if_stmt.else_body;
 
                 /* Inside then-block: apply condition directly */
+                /* known_nonzero is set ONLY when the derived range provably
+                 * excludes zero. A range [a, b] excludes zero iff b < 0 or a > 0.
+                 * Pre-fix code used predicates like `cmp_val > 0 || cmp_val < 0`
+                 * (val != 0) which is wrong: e.g., `if (x <= 5)` produces
+                 * [INT64_MIN, 5] which DOES contain 0. */
                 if (var_on_left) {
                     switch (cmp_op) {
-                    case TOK_LT:      /* var < val → var.max = val - 1 */
+                    case TOK_LT:      /* var < val → range [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val > 1);
+                                       cmp_val <= 0);
                         break;
-                    case TOK_LTEQ:    /* var <= val → var.max = val */
+                    case TOK_LTEQ:    /* var <= val → range [INT64_MIN, val]; nonzero iff val < 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val < 0);
                         break;
-                    case TOK_GT:      /* var > val → var.min = val + 1 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                    case TOK_GT:      /* var > val → range [val+1, INT64_MAX]; nonzero iff val+1 > 0 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                                       cmp_val >= 0);
                         break;
-                    case TOK_GTEQ:    /* var >= val → var.min = val */
+                    case TOK_GTEQ:    /* var >= val → range [val, INT64_MAX]; nonzero iff val > 0 */
                         push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val > 0);
                         break;
-                    case TOK_EQEQ:    /* var == val → var.min = var.max = val */
+                    case TOK_EQEQ:    /* var == val → range [val, val]; nonzero iff val != 0 */
                         push_var_range(c, cmp_var, cmp_var_len, cmp_val, cmp_val,
                                        cmp_val != 0);
                         break;
@@ -8918,20 +8934,21 @@ static void check_stmt(Checker *c, Node *node) {
                 } else {
                     /* val OP var → flip: val < var means var > val */
                     switch (cmp_op) {
-                    case TOK_LT:      /* val < var → var > val → var.min = val + 1 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                    case TOK_LT:      /* val < var → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                                       cmp_val >= 0);
                         break;
-                    case TOK_LTEQ:
+                    case TOK_LTEQ:    /* val <= var → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
                         push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val > 0);
                         break;
-                    case TOK_GT:
+                    case TOK_GT:      /* val > var → var < val → [INT64_MIN, val-1]; nonzero iff val <= 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val > 1);
+                                       cmp_val <= 0);
                         break;
-                    case TOK_GTEQ:
+                    case TOK_GTEQ:    /* val >= var → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val < 0);
                         break;
                     case TOK_EQEQ:
                         push_var_range(c, cmp_var, cmp_var_len, cmp_val, cmp_val,
@@ -8951,20 +8968,21 @@ static void check_stmt(Checker *c, Node *node) {
                 /* Guard pattern: if (cond) { return; } → apply INVERSE after the if */
                 if (is_guard && var_on_left) {
                     switch (cmp_op) {
-                    case TOK_GTEQ:    /* if (var >= val) return → var < val → var.max = val - 1 */
+                    case TOK_GTEQ:    /* if (var >= val) return → var < val → [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val > 1);
+                                       cmp_val <= 0);
                         break;
-                    case TOK_GT:      /* if (var > val) return → var <= val → var.max = val */
+                    case TOK_GT:      /* if (var > val) return → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val < 0);
                         break;
-                    case TOK_LT:      /* if (var < val) return → var >= val → var.min = val */
+                    case TOK_LT:      /* if (var < val) return → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
                         push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val > 0);
                         break;
-                    case TOK_LTEQ:    /* if (var <= val) return → var > val → var.min = val + 1 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                    case TOK_LTEQ:    /* if (var <= val) return → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                                       cmp_val >= 0);
                         break;
                     case TOK_EQEQ:    /* if (var == 0) return → var != 0 → known_nonzero */
                         if (cmp_val == 0)
@@ -8975,20 +8993,21 @@ static void check_stmt(Checker *c, Node *node) {
                 } else if (is_guard && !var_on_left) {
                     /* val OP var guard → apply inverse (flip) */
                     switch (cmp_op) {
-                    case TOK_GTEQ:    /* if (val >= var) return → var > val */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX, true);
+                    case TOK_GTEQ:    /* if (val >= var) return → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
+                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                                       cmp_val >= 0);
                         break;
-                    case TOK_GT:
+                    case TOK_GT:      /* if (val > var) return → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
                         push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val > 0);
                         break;
-                    case TOK_LT:
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val > 1);
-                        break;
-                    case TOK_LTEQ:
+                    case TOK_LT:      /* if (val < var) return → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
                         push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val > 0 || cmp_val < 0);
+                                       cmp_val < 0);
+                        break;
+                    case TOK_LTEQ:    /* if (val <= var) return → var < val → [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                                       cmp_val <= 0);
                         break;
                     case TOK_EQEQ:
                         if (cmp_val == 0)
@@ -10986,12 +11005,22 @@ static void check_stmt(Checker *c, Node *node) {
                         i + 1);
                 }
             }
-            /* Handle args: ban — pool.get() not thread-safe */
+            /* Handle args: ban — pool.get() not thread-safe.
+             * Also reject ?Handle(T) — spawned thread can unwrap the optional
+             * and have the same Handle, with the same non-thread-safe access. */
             if (eff->kind == TYPE_HANDLE) {
                 checker_error(c, node->loc.line,
                     "argument %d: cannot pass Handle to spawn — "
                     "pool.get() is not thread-safe",
                     i + 1);
+            } else if (eff->kind == TYPE_OPTIONAL) {
+                Type *inner = type_unwrap_distinct(eff->optional.inner);
+                if (inner && inner->kind == TYPE_HANDLE) {
+                    checker_error(c, node->loc.line,
+                        "argument %d: cannot pass ?Handle to spawn — "
+                        "spawned thread can unwrap and use Handle (pool.get() not thread-safe)",
+                        i + 1);
+                }
             }
         }
         /* BUG-491: type-check spawn args against function parameter types.

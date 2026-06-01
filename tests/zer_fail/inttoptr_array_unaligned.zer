@@ -1,0 +1,6 @@
+// EXPECTED: compile error — unaligned address for u32[4] (alignment 4)
+mmio 0x40000000..0x4000FFFF;
+i32 main() {
+    *u32[4] arr = @inttoptr(*u32[4], 0x40000002);
+    return (i32)arr[0];
+}

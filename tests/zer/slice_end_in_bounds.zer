@@ -1,0 +1,11 @@
+// Positive test: slice with end <= obj.len must work.
+i32 main() {
+    u32[10] arr;
+    arr[0] = 100;
+    arr[1] = 200;
+    arr[2] = 300;
+    u32 end = 3;
+    for (u32 k = 0; k < 1; k += 1) { end = 3; }
+    [*]u32 s = arr[0..end];
+    return (i32)(s[2] - 300);  // 300 - 300 = 0
+}

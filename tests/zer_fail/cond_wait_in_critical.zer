@@ -1,0 +1,10 @@
+// EXPECTED: compile error — @cond_wait inside @critical = deadlock
+shared struct S { u32 v; }
+S g;
+
+i32 main() {
+    @critical {
+        @cond_wait(g, g.v > 0);
+    }
+    return 0;
+}

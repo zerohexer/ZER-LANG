@@ -2530,8 +2530,6 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "size_t _zer_cap%d = %llu; ", sl_tmp,
                      (unsigned long long)obj_type->array.size);
             } else {
-                /* Defensive fallback (e.g., unusual obj). Use 0 cap so any
-                 * non-zero bound traps. */
                 emit(e, "size_t _zer_cap%d = 0; ", sl_tmp);
             }
             emit(e, "size_t _zer_ss%d = ", sl_tmp);
@@ -5128,6 +5126,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         emit(e, "}\n\n");
 
         emit(e, "void *__wrap_calloc(size_t n, size_t size) {\n");
+        emit(e, "    /* Overflow guard: n*size mustn't wrap. Matches glibc behavior. */\n");
+        emit(e, "    if (n != 0 && size > ((size_t)-1) / n) return (void*)0;\n");
         emit(e, "    size_t total = n * size;\n");
         emit(e, "    void *p = __wrap_malloc(total);\n");
         emit(e, "    if (p) memset(p, 0, total);\n");
@@ -9294,9 +9294,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * the fence-only fallback is correct there. */
         emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)\n");
         emit_indent(e);
-        emit(e, "unsigned long _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
+        emit(e, "uintptr_t _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
         emit_indent(e);
         emit(e, "#else\n");
+        emit_indent(e);
+        emit(e, "/* hosted x86 / unknown arch: cli/sti illegal in user mode — fall back to fence. */\n");
         emit_indent(e);
         emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
         emit_indent(e);
@@ -10257,11 +10259,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         /* Defensive: ir_lower never emits IR_FIELD_WRITE today (field-write
          * statements flow through IR_ASSIGN with the AST node passed via
          * `inst->expr` to emit_rewritten_node, which routes to AST emit_expr
-         * with bounds/qualifier/safety wrappers). The opcode is reserved for
-         * a future per-field IR refactor. If it ever starts being emitted,
-         * the merged-with-IR_CAST handler below would silently emit wrong
-         * C (cast semantics, not field-write). Audit-2026-05-08: trap here
-         * instead so the regression surfaces as a build failure. */
+         * with bounds/qualifier/safety wrappers). If it ever starts being
+         * emitted, trap here so the regression surfaces as a runtime failure. */
         fprintf(stderr, "INTERNAL: IR_FIELD_WRITE emitted but emitter has no "
                         "handler — file a bug; field writes should flow "
                         "through IR_ASSIGN today.\n");
@@ -10402,9 +10401,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_SLICE_READ: {
         /* Dead-code guard: ir_lower.c does NOT emit these opcodes today
          * (the equivalent paths route through IR_ASSIGN + emit_rewritten_node).
-         * If a future refactor starts emitting them WITHOUT adding a real
-         * handler here, silent miscompile. Defense-in-depth: stderr
-         * diagnostic + runtime trap. */
+         * Defense-in-depth: stderr diagnostic + runtime trap. */
         fprintf(stderr, "compiler bug: emit_ir_inst hit dormant 3AC op %d "
                 "(IR_INDEX_WRITE/IR_ADDR_OF/IR_DEREF_READ/IR_CALL_DECOMP/"
                 "IR_INTRINSIC_DECOMP/IR_ORELSE_DECOMP/IR_SLICE_READ) — "
@@ -10414,7 +10411,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit(e, "_zer_trap(\"compiler bug: unhandled 3AC IR op %d\", "
              "__FILE__, __LINE__);\n", inst->op);
         break;
-    }
     }
     /* Exhaustive switch on IROpKind. `default:` removed 2026-05-10 — the
      * old default emitted a comment-only stub (silent miscompile). If a new

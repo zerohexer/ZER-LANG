@@ -1,0 +1,13 @@
+// EXPECTED: compile error — ?Handle to spawn is unsafe (Slab/Pool not thread-safe)
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+u32 receive(?Handle(Task) h) {
+    return 0;
+}
+
+i32 main() {
+    ?Handle(Task) mh = tasks.alloc();
+    spawn receive(mh);
+    return 0;
+}

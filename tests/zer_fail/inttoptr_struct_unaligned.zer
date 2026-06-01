@@ -1,0 +1,7 @@
+// EXPECTED: compile error — unaligned address for struct with u32 field
+mmio 0x40000000..0x4000FFFF;
+struct MmioReg { u32 ctrl; u32 stat; }
+i32 main() {
+    *MmioReg reg = @inttoptr(*MmioReg, 0x40000003);
+    return (i32)reg.ctrl;
+}

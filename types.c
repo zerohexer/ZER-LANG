@@ -204,6 +204,49 @@ int type_width(Type *a) {
     }
 }
 
+/* Required alignment in BYTES for type `a`. Returns 0 if alignment is
+ * not computable (e.g., opaque). For aggregate types, alignment is the
+ * max alignment of any field/element. Packed structs/unions = 1.
+ * Used by @inttoptr to validate MMIO addresses are properly aligned even
+ * for struct/array targets, where type_width is 0. */
+int type_alignment_bytes(Type *a) {
+    if (!a) return 0;
+    a = type_unwrap_distinct(a);
+    int w = type_width(a);
+    if (w > 0) return w / 8;
+    switch (a->kind) {
+    case TYPE_POINTER: case TYPE_FUNC_PTR:
+        return zer_target_ptr_bits / 8;
+    case TYPE_SLICE:
+        /* slice = {ptr, len}, alignment = max(ptr, size_t) = ptr_size */
+        return zer_target_ptr_bits / 8;
+    case TYPE_OPTIONAL: {
+        int inner = type_alignment_bytes(a->optional.inner);
+        return inner > 1 ? inner : 1;
+    }
+    case TYPE_ARRAY:
+        return type_alignment_bytes(a->array.inner);
+    case TYPE_STRUCT: {
+        if (a->struct_type.is_packed) return 1;
+        int max_a = 1;
+        for (uint32_t i = 0; i < a->struct_type.field_count; i++) {
+            int fa = type_alignment_bytes(a->struct_type.fields[i].type);
+            if (fa > max_a) max_a = fa;
+        }
+        return max_a;
+    }
+    case TYPE_UNION: {
+        int max_a = 1;
+        for (uint32_t i = 0; i < a->union_type.variant_count; i++) {
+            int fa = type_alignment_bytes(a->union_type.variants[i].type);
+            if (fa > max_a) max_a = fa;
+        }
+        return max_a;
+    }
+    default: return 0;
+    }
+}
+
 bool type_is_optional(Type *a) {
     /* BUG-409: unwrap distinct — distinct typedef ?*T is still optional */
     a = type_unwrap_distinct(a);

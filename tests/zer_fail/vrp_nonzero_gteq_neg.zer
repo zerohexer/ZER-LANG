@@ -1,0 +1,9 @@
+// VRP must NOT prove x nonzero from x >= -3 — 0 is in [-3, INT64_MAX].
+i32 main() {
+    i32 x = 5;
+    x = 0;
+    if (x >= -3) {
+        return 10 / x;  // EXPECTED: compile error - divisor not proven nonzero
+    }
+    return 0;
+}

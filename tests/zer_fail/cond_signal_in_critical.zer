@@ -1,0 +1,10 @@
+// EXPECTED: compile error — @cond_signal inside @critical
+shared struct S { u32 v; }
+S g;
+
+i32 main() {
+    @critical {
+        @cond_signal(g);
+    }
+    return 0;
+}

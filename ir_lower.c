@@ -2057,8 +2057,17 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- For loop: init → cond → body → step → back to cond ---- */
     case NODE_FOR: {
-        /* Lower init in current block */
-        lower_stmt(ctx, node->for_stmt.init);
+        /* Lower init in current block.
+         * Gap fix: if init touches a shared struct field, wrap with
+         * IR_LOCK/IR_UNLOCK. Without this, `for (g_shared.i = 0; ...; ...)`
+         * silently writes the shared field with no synchronization
+         * (NODE_BLOCK's per-stmt lock wrapper doesn't fire on for-init). */
+        if (node->for_stmt.init) {
+            Node *for_init_lock_root = NULL;
+            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &for_init_lock_root);
+            lower_stmt(ctx, node->for_stmt.init);
+            emit_shared_unlock_if_needed(ctx, node->for_stmt.init, for_init_lock_root);
+        }
 
         int bb_cond = ir_add_block(ctx->func, ctx->arena);
         int bb_body = ir_add_block(ctx->func, ctx->arena);
@@ -2114,9 +2123,24 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             rewrite_idents(ctx, node->for_stmt.step);
             /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
+            /* Gap fix: lock if step touches shared field. Like init above,
+             * `for (..; ..; g_shared.i = g_shared.i + 1)` was silently
+             * unsynchronized — only the cond was wrapped. */
+            Node *step_lock_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
+            if (step_lock_root) {
+                IRInst lock = make_inst(IR_LOCK, node->loc.line);
+                lock.expr = step_lock_root;
+                lock.src2_local = 1; /* write lock — step typically writes */
+                emit_inst(ctx, lock);
+            }
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             emit_inst(ctx, step);
+            if (step_lock_root) {
+                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
+                unlock.expr = step_lock_root;
+                emit_inst(ctx, unlock);
+            }
         }
         ensure_terminated(ctx, bb_cond); /* back edge */
 

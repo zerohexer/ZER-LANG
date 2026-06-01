@@ -1096,10 +1096,38 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
         found = find_shared_root_expr(c, expr->unary.operand);
     } else if (expr->kind == NODE_INDEX) {
         found = find_shared_root_expr(c, expr->index_expr.object);
+        if (!found) found = find_shared_root_expr(c, expr->index_expr.index);
     } else if (expr->kind == NODE_ORELSE) {
         found = find_shared_root_expr(c, expr->orelse.expr);
+        if (!found) found = find_shared_root_expr(c, expr->orelse.fallback);
     } else if (expr->kind == NODE_TYPECAST) {
         found = find_shared_root_expr(c, expr->typecast.expr);
+    } else if (expr->kind == NODE_SLICE) {
+        /* Slices: `shared.buf[a..b]` — recurse into object + bounds. */
+        found = find_shared_root_expr(c, expr->slice.object);
+        if (!found && expr->slice.start)
+            found = find_shared_root_expr(c, expr->slice.start);
+        if (!found && expr->slice.end)
+            found = find_shared_root_expr(c, expr->slice.end);
+    } else if (expr->kind == NODE_INTRINSIC) {
+        /* Intrinsic args may touch shared roots:
+         * `@inttoptr(*u32, shared.addr)`, `@cast(T, shared.field)`.
+         * EXCEPT condvar/barrier/once intrinsics which acquire/release the
+         * mutex internally — wrapping them with an outer lock deadlocks. */
+        const char *nm = expr->intrinsic.name;
+        size_t nlen = expr->intrinsic.name_len;
+        bool intrinsic_handles_own_lock =
+            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
+            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
+            (nlen == 4 && memcmp(nm, "once", 4) == 0);
+        if (!intrinsic_handles_own_lock) {
+            for (int i = 0; i < expr->intrinsic.arg_count && !found; i++)
+                found = find_shared_root_expr(c, expr->intrinsic.args[i]);
+        }
+    } else if (expr->kind == NODE_STRUCT_INIT) {
+        /* Struct init field values: `Wrapper { .field = shared.x }`. */
+        for (int i = 0; i < expr->struct_init.field_count && !found; i++)
+            found = find_shared_root_expr(c, expr->struct_init.fields[i].value);
     }
     return found;
 }
@@ -2933,6 +2961,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int resume_bb = ir_add_block(ctx->func, ctx->arena);
         IRInst aw = make_inst(IR_AWAIT, node->loc.line);
         rewrite_idents(ctx, node->await_stmt.cond);
+        /* The emitter re-evaluates the cond expression via emit_rewritten_node
+         * on every poll. emit_rewritten_node has no NODE_ORELSE case —
+         * if the cond contains orelse, it falls through to the silent default
+         * fingerprint. pre_lower_orelse rewrites those into NODE_IDENTs that
+         * the emitter handles correctly. */
+        pre_lower_orelse(ctx, &node->await_stmt.cond, node->loc.line);
         aw.cond_local = -1;                     /* don't use pre-computed local */
         aw.expr = node->await_stmt.cond;        /* emitter re-evaluates fresh */
         aw.goto_block = resume_bb;

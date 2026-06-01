@@ -1,0 +1,20 @@
+// Verify await cond with orelse compiles correctly (H1 — pre_lower_orelse).
+// Pre-fix, the orelse in await cond fell through emit_rewritten_node's default,
+// producing a malformed C expression.
+?u32 g_data;
+
+async void worker() {
+    g_data = 5;
+    yield;
+    g_data = 42;
+}
+
+i32 main() {
+    _zer_async_worker task;
+    _zer_async_worker_init(&task);
+    // Poll until done
+    for (u32 i = 0; i < 10; i += 1) {
+        if (_zer_async_worker_poll(&task) > 0) { return 0; }
+    }
+    return 0;
+}

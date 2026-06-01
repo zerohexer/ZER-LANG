@@ -637,7 +637,24 @@ bool ir_validate(IRFunc *func) {
                     }
                 }
                 break;
-            default:
+            /* Ops without per-field invariants (yet) — exhaustive list so
+             * -Wswitch flags any new IROpKind added without explicit handling.
+             * Pre-fix used `default: break`, which silently skipped new ops. */
+            case IR_ASSIGN: case IR_CALL: case IR_GOTO: case IR_RETURN:
+            case IR_YIELD: case IR_AWAIT: case IR_SPAWN:
+            case IR_LOCK: case IR_UNLOCK:
+            case IR_POOL_ALLOC: case IR_POOL_FREE: case IR_POOL_GET:
+            case IR_SLAB_ALLOC: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
+            case IR_SLAB_ALLOC_PTR:
+            case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
+            case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED:
+            case IR_CRITICAL_BEGIN: case IR_CRITICAL_END:
+            case IR_DEFER_PUSH: case IR_DEFER_FIRE:
+            case IR_INTRINSIC:
+            case IR_INDEX_WRITE:
+            case IR_INTRINSIC_DECOMP: case IR_ORELSE_DECOMP:
+            case IR_SLICE_READ: case IR_STRUCT_INIT_DECOMP:
+            case IR_NOP:
                 break;
             }
         }

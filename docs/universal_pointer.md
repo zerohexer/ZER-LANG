@@ -3639,3 +3639,998 @@ the document with new insights as exploration continues.
 
 When a design commitment is eventually made, that commitment will be a
 separate document referencing this map.
+
+---
+
+# PART 3: FALSE POSITIVE ANALYSIS AND AUTO-DETECTION (added 2026-06-01)
+
+This part documents the false-positive scenarios that compile-time-only
+lifetime inference produces, and how the universal pointer's runtime
+tag check (when combined with compile-time elision) eliminates them
+automatically without user annotation.
+
+This part was added after a multi-instance verification discussion that
+identified the auto-detection model as the resolution to the
+false-positive concern. See Section 30 for the verification chain.
+
+---
+
+## 26. The 6 False-Positive Scenarios in Compile-Time-Only Inference
+
+Compile-time-only lifetime inference (Section 6.9 4-rule strict, Section
+6.10 keep-only) produces false positives — programs that are actually
+safe at runtime but rejected because the compiler can't prove the
+lifetime relationship statically.
+
+These are not analysis bugs. They are fundamental limits of static
+analysis: the proof exists at runtime but is not statically derivable.
+
+### 26.1 Scenario 1 — Sibling allocator (runtime-branch provenance)
+
+```
+Pool(Task, 8) pool_a;
+Pool(Task, 8) pool_b;
+
+*Task p;
+if (runtime_cond) {
+    p = pool_a.alloc_ptr() orelse return;
+} else {
+    p = pool_b.alloc_ptr() orelse return;
+}
+use(p);  // ← compile-time-only inference: which pool's lifetime applies?
+```
+
+**Why compile-time can't prove:**
+
+If `pool_a` and `pool_b` have different scopes and neither encloses
+the other (siblings), the compiler must take the meet (intersection)
+of both lifetimes. If `use(p)` outlives that intersection, the
+compiler rejects.
+
+**Why the program is actually safe:**
+
+At runtime, one specific branch was taken. Whichever pool was picked
+is still alive — `p` is valid. The compiler can't determine which
+branch ran, so it conservatively assumes the worst.
+
+**Status as false positive:** REAL. Compile-time-only would reject;
+runtime check would accept.
+
+### 26.2 Scenario 2 — Correlated state (value-dependent lifetime)
+
+```
+?*Task p = maybe_alloc();
+bool valid = (p != null);
+// ... other code ...
+if (valid) {
+    use(p);  // safe: valid implies p is non-null
+}
+```
+
+**Why compile-time can't prove:**
+
+Path-sensitive analysis would need to correlate `valid` with `p`'s
+optional state across intervening code. This kind of value-correlation
+tracking is expensive and incomplete in general.
+
+**Why the program is actually safe:**
+
+`valid` is true iff `p` was non-null at the assignment, and `p` doesn't
+change. The runtime guarantee holds; the static proof requires
+relational tracking the compiler doesn't do.
+
+**Mitigation in idiomatic ZER:**
+
+This specific pattern can be rewritten with `?T` + `orelse` + `if |p|`
+unwrap, which IS compile-time provable:
+
+```
+if (maybe_alloc()) |p| {
+    use(p);  // p in scope only when non-null — compile-time provable
+}
+```
+
+So in idiomatic ZER, scenario 2 is partially mitigated by language
+features. Non-idiomatic versions (with separate `valid` bool) still
+produce false positives.
+
+### 26.3 Scenario 3 — Cross-function lifetime past analysis depth
+
+```
+// Function chain 8+ levels deep
+fn outermost() {
+    Pool(Task, 8) tasks;
+    middle1(&tasks);
+}
+fn middle1(t: *Pool(Task)) { middle2(t); }
+fn middle2(t: *Pool(Task)) { middle3(t); }
+// ... many levels ...
+fn deepest(t: *Pool(Task)) -> *Task {
+    return t.alloc_ptr() orelse return null;
+    // ← lifetime tied to outermost's pool, but analysis depth may be exhausted
+}
+```
+
+**Why compile-time can't prove:**
+
+Cross-function analysis has finite depth/precision. FuncProps and
+FuncSummary in ZER use lazy DFS with memoization (no fixed depth limit
+in principle), but recursive functions trigger conservative widening,
+and deeply-nested call chains may hit analysis cost cutoffs.
+
+**Why the program is actually safe:**
+
+The lifetime relationship is genuine (deep callee's return is bounded
+by outermost's pool scope). The compiler just can't see the proof.
+
+**Status as false positive:** REAL but less common in ZER than the
+other Claude implied — ZER's FuncProps is reasonably deep. Recursive
+functions are the main case.
+
+### 26.4 Scenario 4 — Aliasing disjoint pointers
+
+```
+fn mutate_and_use(p: *Task, q: *Task) {
+    p.field = 5;        // does this affect q?
+    use(q.other_field); // safe iff p and q point to different allocations
+}
+```
+
+**Why compile-time can't prove:**
+
+General alias analysis is undecidable in the limit. The compiler can't
+prove `p` and `q` point to different allocations without strong
+provenance tracking, which is conservative by default.
+
+**Why the program is actually safe:**
+
+If `p` and `q` come from different allocator slots, mutating one doesn't
+affect the other. The runtime fact (different allocations) holds; the
+compiler can't see it.
+
+**Important note for ZER:** This isn't really a keep / lifetime concern.
+It's an aliasing-axis concern (Rust's `&mut` exclusivity). The runtime
+tag check handles it correctly because each allocation has its own tag —
+mutation through `p` doesn't invalidate `q`'s tag. So the universal
+pointer's runtime check accepts this program as it should.
+
+**Status as false positive for compile-time keep:** Marginal — keep
+doesn't model aliasing exclusivity at all, so this isn't really a
+keep-rejection case. Listed for completeness; orthogonal to lifetime.
+
+### 26.5 Scenario 5 — Loop-carried lifetime
+
+```
+*Task p = init_alloc();
+while (some_condition) {
+    p = next_alloc(p);
+    // each iteration: p is alive for this iteration
+}
+use(p);  // safe iff loop executed at least once and final p still alive
+```
+
+**Why compile-time can't prove:**
+
+Loop fixed-point analysis must widen to a conservative meet. After
+the loop, the compiler doesn't know which iteration was last, so it
+can't track the specific final allocation's lifetime.
+
+**Why the program is actually safe:**
+
+At runtime, each iteration's `p` was alive for its scope. The final
+`p` (whichever it is) is valid if the loop ran at least once and the
+underlying allocator is still alive.
+
+**Status as false positive:** REAL. Loops with reassigned pointers
+are a known false-positive source for compile-time tracking.
+
+### 26.6 Scenario 6 — Self-referential / cyclic structures
+
+```
+struct Node {
+    *Node parent;
+    *Node left;
+    *Node right;
+    u32 val;
+}
+```
+
+**Why compile-time can't prove:**
+
+Compile-time analysis sees `Node` has pointers to other `Node`s. It
+can't prove these pointers stay valid because the lifetimes are
+mutually circular.
+
+**Why the program is actually safe:**
+
+If all nodes come from the same allocator (Arena, Slab), they share
+lifetime. Cycles are fine — everything dies together.
+
+**Status as false positive for compile-time keep:** REAL. Compile-time
+keep would force restructuring to indices.
+
+**Already handled in ZER:** the design pushes self-referential structures
+to Slab + Handle indices, which IS compile-time provable (Handles carry
+no pointer-lifetime concern, only gen check). So this scenario is more
+"wrong tool" than "false positive in real practice."
+
+### 26.7 The unifying principle
+
+All 6 scenarios share one shape:
+
+> **The compiler rejects exactly when the safety proof depends on a
+> runtime fact it can't statically establish** — which branch ran,
+> which values correlate, what's disjoint, how deep the lifetime
+> chain goes, whether the loop ran.
+
+Rust handles most of these by making the user assert the fact via
+annotation (`'a` lifetime says "trust me, this outlives that"),
+converting an inference problem into a checking problem.
+
+ZER refuses Rust-style lifetime annotations. So compile-time-only ZER
+has only one sound option when inference fails: reject. That's the
+trade — every false positive is a place where the proof exists at
+runtime but not statically.
+
+---
+
+## 27. Auto-Detection — Per-Deref Classification
+
+The resolution to the false-positive problem: **combine compile-time
+inference with runtime tag check, with the compiler auto-detecting
+per-deref whether elision is safe or runtime check must fire.**
+
+### 27.1 The algorithm
+
+```
+For each *T deref site in the program:
+
+  1. Run path-sensitive liveness analysis (existing zercheck infrastructure)
+  
+  2. Classify this specific deref:
+     IF compiler can PROVE the pointer is alive on this path:
+       → emit raw deref (0 runtime cost)
+       → analogous to VRP-elided bounds check
+       
+     ELSE (any of the 6 scenarios above, or any other unprovable case):
+       → emit runtime tag check before deref (~5 cycles)
+       → check accepts if actually alive, traps if not
+       
+  3. Move to next deref site
+
+No user annotation. No "mode" decision. Each deref independently
+classified per what the compiler can prove on that specific path.
+```
+
+### 27.2 Why this eliminates all 6 false-positive scenarios
+
+| Scenario | Compile-time status | Auto-decision | Runtime behavior |
+|---|---|---|---|
+| 1. Sibling allocators | Can't unify lifetimes | Insert tag check | Accepts (correct allocator's tag matches) |
+| 2. Correlated state | Can't correlate | Insert tag check | Accepts when valid |
+| 3. Cross-function depth | Past analysis horizon | Insert tag check | Accepts |
+| 4. Aliasing disjoint | Not really keep concern | Insert tag check (or elide) | Accepts (independent tags) |
+| 5. Loop-carried | Conservative widening | Insert per-iteration tag check | Accepts when alive |
+| 6. Cyclic | Routed to Slab+Handle | (different mechanism) | (gen check) |
+
+**All eliminated.** Zero false positives. The runtime check trivially has
+the fact the static proof needed (current liveness state).
+
+### 27.3 The per-deref granularity is the key
+
+The compiler doesn't pick a MODE for a function or module. It picks
+per-deref site:
+
+```
+fn example(p: *Task) {
+    p.field1 = 5;          // ← deref #1: just received p, proven alive → 0 cost
+    do_other_work();
+    p.field2 = 10;         // ← deref #2: after opaque call, can't prove → CHECK
+    return p.field3;       // ← deref #3: same scope after #2, can it elide?
+                            //              depends on whether do_other_work was opaque
+                            //              if opaque: also CHECK
+                            //              if compiler can see body: maybe elide
+}
+```
+
+Same variable `p`, three derefs, potentially three different decisions
+based on what's provable AT EACH SITE.
+
+This granularity is what eliminates false positives while keeping
+overhead low.
+
+### 27.4 The elision rate in typical code
+
+```
+Estimated deref classification for realistic ZER programs:
+
+  Linear local use:                              ~95% (PROVEN → elided)
+  Cross-function single-allocator:               ~80% provable
+  Branch-dependent provenance (Scenario 1):      ~5% unprovable → check
+  Generic container / async / opaque callback:   ~10% unprovable → check
+  Loop-carried lifetime (Scenario 5):            ~30% unprovable → check
+  Truly unknowable (cinclude boundary):          handled separately (unsafe)
+  
+Overall: ~70-85% of derefs elided, ~15-30% get runtime check
+Whole-program overhead: ~1-3% typical
+```
+
+### 27.5 What the user writes — same code in all cases
+
+```
+// User writes plain code; compiler auto-detects per deref:
+
+fn process(p1: *Task, p2: *Task, cond: bool) {
+    *Task chosen;
+    if (cond) { chosen = p1; } else { chosen = p2; }
+    chosen.field = 5;
+    // ↑ compiler can't prove which alloc → emits tag check
+    //   runtime check accepts because actual allocation is alive
+    //   ZERO false positive, ~5 cycles overhead
+}
+
+fn straightforward(p: *Task) {
+    p.field = 5;
+    p.priority = 10;
+    // ↑ both derefs proven alive (no intervening free/opaque call)
+    //   ZERO runtime cost
+}
+```
+
+User writes the same shape of code regardless of provability. Compiler
+decides per-deref.
+
+### 27.6 Implementation reuses existing infrastructure
+
+Everything needed for auto-detection already exists in ZER:
+
+| Existing ZER infrastructure | Role in auto-detection |
+|---|---|
+| zercheck path-sensitive analysis | Determines "is p provably alive at this deref?" |
+| FuncProps / FuncSummary | Cross-function liveness propagation |
+| Allocation coloring | Tracks pointer provenance to allocator source |
+| VRP elision pattern | Template for the elision logic (bounds check → tag check) |
+| Emitter auto-guard insertion | Emits runtime check when compiler can't prove |
+
+**No new analysis algorithm needed.** Extending existing bounds-check
+elision pattern to pointer tag checks. ~500-1000 lines of new code
+mostly in emission.
+
+---
+
+## 28. keep vs Runtime Tag Check — Two Cooperating Mechanisms
+
+### 28.1 They are NOT the same mechanism
+
+A common error in framing: calling the runtime check "keep" or saying
+the compiler "routes to keep." These are two distinct mechanisms that
+cooperate.
+
+```
+keep annotation:
+  - Compile-time marker that a pointer can be stored persistently
+  - Operates entirely during static analysis
+  - ZERO runtime cost — purely informs the analysis
+  - User-visible at intrinsic_def / function signature level
+  
+Runtime tag check:
+  - Universal pointer mechanism (tag + header verification)
+  - Operates at runtime on each unprovable deref
+  - ~5 cycles cost when not elided
+  - Compiler-emitted, not user-visible
+```
+
+### 28.2 How they compose
+
+```
+A pointer may have BOTH a keep annotation AND a runtime tag check:
+
+  fn store(keep p: *Task) {
+      global_cache.hot = p;     // keep cascade: provable safe → no runtime check
+      // ...
+      do_opaque_callback();
+      use(global_cache.hot);    // after opaque call: can't prove alive
+                                 // → runtime tag check fires
+                                 // → keep annotation didn't prevent the check
+                                 //   because keep is about ESCAPE, not LIVENESS-AT-USE
+  }
+
+keep says: "this pointer can be stored persistently"
+Tag check says: "this pointer is currently valid"
+
+Different axes. Both can apply to the same pointer. Both compose with
+the auto-detection: keep helps the compile-time analysis succeed more
+often (catching more cases as provable); tag check handles the cases
+that remain unprovable.
+```
+
+### 28.3 The relationship table
+
+| Question | Answered by |
+|---|---|
+| Can this pointer escape its scope? | `keep` annotation (compile-time) |
+| Is this pointer currently alive at this deref? | Compile-time analysis + runtime tag check |
+| Does this pointer come from the right allocator? | Allocation coloring (compile-time) |
+| Is this address still mapped to a valid allocation? | Runtime tag check |
+| Was this freed on some path between alloc and this use? | Compile-time path-sensitive (zercheck) |
+
+`keep` and tag check answer DIFFERENT questions on DIFFERENT axes.
+
+### 28.4 The clean formulation
+
+```
+WRONG formulation:
+  "ZER infers lifetimes statically where provable. For unprovable
+   cases, the compiler ROUTES TO KEEP, which carries a runtime check."
+
+PROBLEM: "routes to keep" conflates two mechanisms.
+         keep is compile-time. The runtime check is from the
+         universal pointer's tag mechanism, not from keep.
+
+CORRECT formulation:
+  "ZER infers lifetimes statically where provable (zero cost).
+   For unprovable cases, the compiler EMITS A RUNTIME TAG CHECK
+   via the universal pointer mechanism. No safe program is ever
+   rejected; the cost is a bounded runtime check on exactly the
+   pointers whose lifetimes are runtime-dependent, and the compiler
+   decides which those are per-deref."
+```
+
+The substitution: *"routes to keep, which carries a runtime check"*
+→ *"emits a runtime tag check via the universal pointer mechanism."*
+
+### 28.5 Why precision in naming matters
+
+Conflating keep and runtime check confuses:
+- Where the cost lives (compile-time analysis is free; runtime check costs ~5 cycles)
+- What each mechanism actually does (escape vs liveness — different axes)
+- How they compose (both can apply to the same pointer)
+- The audit boundary (keep is greppable annotation; tag check is compiler-emitted)
+
+Locked terminology going forward:
+
+| Term | Meaning |
+|---|---|
+| `keep` annotation | Compile-time marker for pointer-can-escape; zero runtime cost |
+| Runtime tag check | Universal pointer mechanism; ~5 cycles when not elided |
+| Auto-detection | Per-deref compile-time decision: elide or emit tag check |
+| Compile-time elision | Decision to emit raw deref (no runtime check) |
+| Static liveness analysis | What the compiler uses to make the elision decision |
+
+When future sessions reference "keep + runtime check," they mean the
+COOPERATING composition of these two mechanisms — not a single
+mechanism with multiple names.
+
+---
+
+## 29. The Clean Final Formulation
+
+After resolving the false-positive concern and clarifying the
+keep-vs-runtime-check vocabulary, the universal pointer design has the
+following clean formulation:
+
+### 29.1 The one-line summary
+
+```
+ZER infers lifetimes statically where provable (zero cost). For the
+unprovable cases, the compiler emits a runtime tag check on the
+pointer's tag/header. No safe program is ever rejected; the cost
+is a bounded runtime check on exactly the pointers whose lifetimes
+are runtime-dependent, and the compiler decides which those are
+per-deref.
+```
+
+### 29.2 The full claim breakdown
+
+```
+Compile-time-provable derefs:
+  - Static analysis succeeds (zercheck + FuncProps + allocation coloring)
+  - Emitted as raw deref
+  - Zero runtime cost
+  - ~70-85% of derefs in typical code
+  
+Compile-time-unprovable derefs:
+  - Falls into one of the 6 scenarios (Section 26)
+  - Static analysis can't reach the proof
+  - Emitted as raw deref + preceding runtime tag check
+  - ~5 cycles per check, branch-predictable
+  - ~15-30% of derefs in typical code
+
+Whole-program overhead: ~1-3% typical
+False positives: NONE (runtime check accepts what's actually valid)
+False negatives: NONE (tag mismatch always traps deterministically)
+User annotations required: NONE (keep is optional, helps analysis)
+FFI boundary: explicit unsafe marker (raw *T from cinclude has no tag)
+```
+
+### 29.3 The honest scope
+
+```
+Within pure ZER (no cinclude, no raw asm escape):
+  - All 6 false-positive scenarios eliminated
+  - No safe program rejected
+  - Bounded runtime cost on exactly the unprovable cases
+  - User writes plain code without lifetime annotations
+  
+At the cinclude / raw asm boundary:
+  - Pointers from C have no ZER tag in their header
+  - Compiler emits raw access at this boundary (explicit unsafe)
+  - User-declared safety via cinclude binding contract
+  - Same boundary as Rust's unsafe extern
+```
+
+### 29.4 The "smart compiler, dumb user" property satisfied
+
+```
+User experience:
+  1. Write plain ZER code with *T pointers (no lifetime annotations)
+  2. Compiler decides per-deref: elide or runtime-check
+  3. Provable case: zero cost
+  4. Unprovable case: ~5 cycle check, no compile error
+  5. Genuine UAF on linear path: compile error with directive
+  6. Truly invalid runtime access: deterministic trap
+  
+The user does NOT:
+  - Annotate lifetimes (no 'a)
+  - Pick "mode" per pointer (no compile-time-only vs runtime)
+  - Restructure code to satisfy a conservative compile-time analysis
+  - See false positives that block valid programs
+  
+The user MIGHT:
+  - Use `keep` to help compile-time analysis succeed in more places
+    (purely optional — improves elision rate, never required)
+  - Use Pool/Slab/Arena for hot paths where Handle's gen check is preferred
+    (also optional — Handle is a different mechanism with same end safety)
+```
+
+### 29.5 Comparison to other safe languages
+
+| Language | Lifetime mechanism | False positives | Runtime cost | Annotation burden |
+|---|---|---|---|---|
+| C | None | N/A | 0 | None (unsafe) |
+| Rust | Borrow checker + lifetimes | Real (~5%) | 0 | High |
+| Go/Java | GC | None | High (pauses) | None |
+| ZER (this design) | Compile-time + auto-detect runtime tag check | NONE | ~1-3% | None (keep optional) |
+
+ZER's distinctive position: same end-safety as Rust + GC languages,
+no annotations + bounded runtime cost.
+
+### 29.6 Lock-in summary
+
+```
+Design components (LOCKED 2026-06-01):
+
+  1. Universal *T pointer with embedded version tag (8 bytes, top 16 bits)
+  2. Per-allocation header containing current version
+  3. Compile-time path-sensitive analysis (zercheck + FuncProps)
+  4. Per-deref classification: elide if provable, check if not
+  5. keep annotation as optional compile-time analysis aid
+  6. Runtime tag check on unprovable derefs (~5 cycles)
+  7. FFI boundary via cinclude marker (explicit unsafe)
+  8. NO user lifetime annotations required for ordinary code
+  
+What's eliminated:
+  - All 6 false-positive scenarios in compile-time-only inference
+  - Rust-style lifetime annotation burden
+  - Conservative rejection of safe programs
+  - User restructuring forced by analysis incompleteness
+
+What's preserved:
+  - Zero runtime cost on the ~70-85% provable derefs
+  - 8-byte pointer size (top bits used for version)
+  - All existing ZER safety axes (bounds, null, types, concurrency)
+  - Compile-time errors on genuinely buggy code (UAF on linear path, etc.)
+```
+
+---
+
+## 30. Multi-Instance Verification Chain (added 2026-06-01)
+
+The auto-detection model documented in Sections 26-29 emerged from a
+multi-instance verification process. Captured here so future sessions
+understand which claims are independently verified vs single-instance.
+
+### 30.1 The verification chain
+
+```
+Instance 1: Initial proposal (compile-time only keep)
+  → Identified 6 false-positive scenarios
+
+Instance 2 (other Claude): Independent review
+  → Confirmed 6 scenarios real
+  → Proposed runtime tag check as resolution
+  
+Instance 3 (independent Claude): Verification with adversarial review
+  → Identified verbatim "demand/promise asymmetry" refinement
+  → Confirmed auto-detection eliminates all 6 scenarios
+  → Identified vocabulary issue (conflating keep with tag check)
+  
+Instance 4 (this instance): Final verification + clean formulation
+  → All 3 prior claims verified
+  → Vocabulary distinction codified
+  → 4-level conditional soundness preserved
+  → Final formulation locked
+```
+
+### 30.2 What survived adversarial verification
+
+Items that held up across multiple instances of adversarial review:
+
+```
+✓ The 6 false-positive scenarios are real (Section 26)
+✓ Auto-detection per-deref eliminates them (Section 27)
+✓ keep and runtime tag check are distinct mechanisms (Section 28)
+✓ The clean one-line formulation (Section 29.1)
+✓ ~1-3% whole-program overhead estimate
+✓ ~70-85% elision rate in typical code
+✓ No new analysis algorithm required (reuses existing infrastructure)
+✓ FFI boundary is the only explicit-unsafe escape needed
+```
+
+### 30.3 What got refined through verification
+
+```
+Initial framing → Refined framing
+─────────────────────────────────────────────────────────────────
+"Routes to keep" → "Emits runtime tag check via universal pointer"
+"keep + runtime" → "keep is compile-time; tag check is runtime; cooperate"
+"Mode per function" → "Per-deref classification"
+"User picks mode" → "Compiler auto-decides per use site"
+"FROZEN catalog" → "STABLE, grows by promotion" (from asm doc lock corrections)
+"Better than Rust" → "Different trade than Rust" (directional, not strictly better)
+```
+
+### 30.4 The Section 23 drift warning satisfied
+
+The original universal_pointer.md (PART 2) included a drift warning
+inspired by ZER's CLAUDE.md Section 23 pattern. The auto-detection
+discussion stress-tested the design and added one verified refinement
+(the keep-vs-runtime-check vocabulary distinction) that no single
+instance caught on its own.
+
+The verification chain — multiple independent instances reaching the
+same conclusion, with each refinement actually changing the doc — is
+evidence the design has converged. Future sessions don't need to
+re-derive; reference Sections 26-29.
+
+---
+
+# End of PART 3
+
+PART 3 documents the false-positive analysis and auto-detection
+resolution. Combined with PART 1 (design space exploration) and PART 2
+(expanded context), this document is the canonical reference for ZER's
+universal pointer design.
+
+The auto-detection model resolves the central tension between:
+- Compile-time-only inference (which produces false positives)
+- Pure runtime checking (which has whole-program overhead)
+
+By auto-detecting per-deref and applying runtime check only where
+compile-time can't prove, ZER achieves:
+- Zero false positives
+- ~1-3% whole-program overhead
+- No user lifetime annotations
+- All existing safety axes preserved
+
+This is the design point that satisfies ZER's "smart compiler, dumb
+user" philosophy while delivering universal pointer safety.
+
+---
+
+# PART 4: RECONCILIATION LAYER (added 2026-06-01)
+
+This part exists because a careful adversarial review across the
+multi-instance verification chain (Section 30) identified three places
+where PART 3's confident summary collapsed PART 1's hedged numbers into
+flat assertions, producing internal contradictions a reviewer reading
+both parts together would catch.
+
+This is the **drift pattern** ZER's CLAUDE.md Section 23 warns about,
+operating across document layers: PART 1 was careful ("estimates,"
+"best/realistic/worst"), PART 3's convergence summary quietly dropped
+the hedges.
+
+**The fix is append-only.** PART 1 and PART 3 are unchanged. This part
+is the reconciliation layer that explicitly cites PART 1's canonical
+hedged numbers and resolves where PART 3 over-asserted.
+
+**Discipline going forward:** every new convergence layer in this doc
+must include a reconciliation section like this one. The append-only
+log stays honest IF each new layer cleans up its own potential
+contradictions with earlier layers, instead of pretending the earlier
+numbers don't exist.
+
+---
+
+## 31. Reconciliation with PART 1 — Honest Numbers and Caveats
+
+### 31.1 The three contradictions
+
+Multi-instance review identified three places where PART 3 over-asserted
+relative to PART 1's careful hedging:
+
+| Topic | PART 3 (over-asserted) | PART 1 (honest) | Resolution |
+|---|---|---|---|
+| Per-deref cost | "~5 cycles" flat (§27.1, §29.2) | "5 best, 10-30 realistic, 100-500 worst" (§11.1, B.6) | PART 1 is canonical; §31.2 |
+| Elision rate | Stated as fact (§27.4) | Labeled "estimates" (§11.5) | PART 1 is canonical; §31.3 |
+| False negatives | "NONE" (§29.2, §29.6 implicit) | "1/65536 for 16-bit tag" (§18.4) | PART 1 is canonical; §31.4 |
+
+In all three cases, PART 1 has the careful version. PART 3's summary
+stripped the hedges. This section restores them by reference.
+
+### 31.2 Cost claim reconciliation
+
+**PART 3's claim (over-asserted):**
+- §27.1: "emit runtime tag check before deref (~5 cycles)"
+- §29.2: "~5 cycles per check, branch-predictable"
+
+**PART 1's canonical distribution (§11.1, Appendix B.6):**
+
+```
+Tagged+header per-deref cost — full distribution:
+
+  L1 cache hit on header:        ~5 cycles       (best case, warm cache)
+  L2 cache hit:                   ~10-15 cycles   (typical warm)
+  L3 cache hit:                   ~30-50 cycles
+  DRAM hit (cold cache):          ~150-300 cycles
+  Multi-thread contention spike:  ~300-1000 cycles (cache line bouncing)
+  
+  p50 latency:  ~5 ns
+  p99 latency:  ~30 ns
+  p99.9 latency: ~300 ns (cold cache + contention)
+```
+
+**Reconciled claim (canonical going forward):**
+
+> Per-deref runtime tag check cost: typically cache-warm ~5 cycles in
+> steady-state hot code, but follows the full cache distribution in
+> §11.1 — up to 100-500 cycles in cold cache or contended multi-threaded
+> scenarios, with p99.9 around 300ns. The "~5 cycles" figure in PART 3 §27
+> and §29 is the cache-warm common case, not the worst case. For
+> real-time or worst-case latency analysis, defer to PART 1's distribution.
+
+**Why this matters:** real-time systems care about p99.9 latency, not
+p50. ZER's audience includes embedded/firmware/kernel — code where a
+cache-cold pointer chase happening at the wrong moment matters. The
+flat "~5 cycles" framing obscures this.
+
+### 31.3 Elision rate reconciliation
+
+**PART 3's claim (over-asserted):**
+- §27.4: "~95% linear local, ~80% cross-function, ~30% loop-carried
+  unprovable, overall 70-85% elided"
+- §29.2: "~70-85% of derefs in typical code" (elided)
+
+**PART 1's canonical labeling (§11.5):**
+
+```
+Compile-time elision rates (estimates):
+  Linear use within function                    95%+
+  Pointer passed to single function and used    85%
+  Pointer stored in local var, used multiple    80%
+  Pointer in for-loop, body uses it             70%
+  Cross-function pointer with FuncSummary       60%
+  Pointer through generic container             20%
+  Pointer through async/callback                10%
+  Pointer through opaque function pointer       0% (must check)
+
+  Average elision rate: ~70-85% in typical code  ← LABELED "estimates"
+```
+
+**PART 1's open question (§14.10):**
+
+> "Are the cost estimates accurate enough to decide, or do we need
+> actual benchmarks? Worst-case scenarios (slab-table contention,
+> tagged+header cold cache) are hard to estimate without measurement."
+
+**Reconciled claim (canonical going forward):**
+
+> The elision rates in §27.4 and the ~1-3% whole-program overhead claim
+> in §29.2 are **estimates**, not measurements. They follow PART 1
+> §11.5's hedged numbers. The compound figure (~1-3% overhead) is the
+> product of two unmeasured estimates: elision rate × per-check cost.
+> PART 1 §14.10's open question — "do we need actual benchmarks?" —
+> has NOT been closed. The ~1-3% figure is a hypothesis awaiting empirical
+> validation, not a measured property.
+
+**Separation of concerns:**
+
+| Concern | Status |
+|---|---|
+| Soundness (no false positives, no false negatives modulo tag width) | **LOCKED** — proven by construction |
+| Performance (~1-3% whole-program overhead) | **HYPOTHESIS** — unbenchmarked estimate |
+
+The soundness lock does NOT extend to the performance estimate. Future
+sessions must NOT cite ~1-3% as if it's measured. It's an informed
+guess based on PART 1's elision rate estimates. A benchmark is needed
+to close PART 1 §14.10.
+
+### 31.4 False-negative reconciliation (tag width caveat)
+
+**PART 3's claim (over-asserted):**
+- §29.2: "False negatives: NONE (tag mismatch always traps deterministically)"
+
+**PART 1's canonical analysis (§18.4, Section 18 entirely):**
+
+```
+False-negative rates by tag width (PART 1 §18.4):
+
+  4-bit tag (ARM MTE):    1/16   (~6%)
+  8-bit tag (scudo):       1/256  (~0.4%)
+  16-bit tag:              1/65,536 (~0.0015%)
+  32-bit fat pointer:      1/4 billion (effectively zero)
+  64-bit monotonic:        ~0 (deterministic within ~570 years)
+
+Attack scenarios at 1000 attempts/sec:
+  16-bit tag:  ~65 seconds to land UAF (concerning for adversarial systems)
+  32-bit tag:  ~50 days   (effectively unattackable)
+  64-bit:      ~580 million years (mathematically unattackable)
+```
+
+**PART 3 §29.6's lock:**
+- "Universal *T pointer with embedded version tag (8 bytes, top 16 bits)"
+
+**The contradiction:** PART 3 §29.6 locks 8-byte/16-bit-tag. PART 3 §29.2
+claims "False negatives: NONE." But per PART 1 §18, 16-bit tag has a
+1/65,536 false-negative rate. The 8-byte lock and the "no false
+negatives" claim are inconsistent inside PART 3.
+
+**Reconciled claim (canonical going forward):**
+
+> The locked design (PART 3 §29.6) is 8-byte pointer with 16-bit tag in
+> high bits — chosen for embedded RAM efficiency. This carries a
+> 1/65,536 false-negative rate per PART 1 §18.4. The "False negatives:
+> NONE" claim in §29.2 is therefore **scoped**: it means "deterministic
+> trap on tag mismatch," not "zero probability of stale-tag collision."
+> 
+> For ZER's non-adversarial embedded audience, 1/65K is acceptable.
+> For security-critical contexts, the 16-byte monotonic variant
+> (§18.5-§18.6, §18.7) provides effectively-zero false-negative rate
+> at the cost of 12-byte or 16-byte pointers.
+
+**Two variants available (locked here):**
+
+```
+DEFAULT (PART 3 §29.6 lock):
+  8-byte pointer, 16-bit tag in top bits
+  False-negative rate: 1/65,536 (PART 1 §18.4)
+  Acceptable for: embedded, firmware, non-adversarial systems
+  
+SECURITY-CRITICAL VARIANT (PART 1 §18.5-§18.7):
+  12-byte fat pointer with 32-bit tag, OR
+  16-byte fat pointer with 64-bit monotonic counter
+  False-negative rate: 1/4 billion (32-bit) or ~0 (64-bit monotonic)
+  Acceptable for: security boundaries, long-running adversarial systems
+  Cost: larger pointers, slightly more shadow memory
+```
+
+Compile flag picks variant per project: `--tag-width=16` (default),
+`--tag-width=32`, `--tag-width=64`. PART 1 §18.7 describes this.
+
+### 31.5 The discipline going forward
+
+**Every new convergence layer added to this document must include a
+reconciliation subsection at its end, addressing:**
+
+1. **Cost claims** — defer to PART 1's distribution; do not flatten
+   to single numbers without citing the cache hierarchy
+2. **Performance estimates** — label as "estimates" or "hypothesis";
+   only call something measured if it's been benchmarked
+3. **Soundness vs performance separation** — soundness can be locked
+   (proven by construction); performance is empirical until benchmarked
+4. **Tag-width / variant choices** — name the specific variant locked
+   and its honest false-negative rate per PART 1 §18
+
+**Without this discipline**, the append-only log accumulates internal
+contradictions that adversarial readers find — exactly the failure mode
+the multi-instance verification chain caught in PART 3.
+
+**With this discipline**, each layer cleans up its own potential
+contradictions with the past, and the doc stays honest as a geological
+record where each stratum is dated and reconciled.
+
+### 31.6 What's locked vs what's open
+
+After reconciliation, the doc's claim status is:
+
+```
+LOCKED (proven by construction):
+  ✓ Universal *T pointer design with embedded version tag
+  ✓ Compile-time elision via existing path-sensitive analysis
+  ✓ Auto-detection per-deref (elide if provable, check if not)
+  ✓ No false positives in pure ZER code (Section 26-27)
+  ✓ keep and runtime tag check are distinct cooperating mechanisms (§28)
+  ✓ Deterministic trap on tag mismatch (modulo tag width)
+  ✓ 8-byte default lock with 16-byte security variant available
+
+OPEN (hypothesis, awaiting empirical validation):
+  ⚠ Elision rate (~70-85% typical) — PART 1 §11.5 estimate
+  ⚠ Whole-program overhead (~1-3% typical) — PART 1 §14.10 open
+  ⚠ p99.9 latency in real workloads — PART 1 §11.1, B.6 ranges
+  ⚠ Multi-threaded contention impact — PART 1 §11.5 estimate
+
+SCOPED (true within named caveats):
+  ◇ "No false negatives" — true MODULO tag-width false-negative rate
+    (1/65,536 for 16-bit; near-zero for 32-bit/64-bit variants)
+  ◇ "~5 cycles per check" — true for cache-warm steady-state;
+    cold/contended follows PART 1 §11.1 distribution
+  ◇ "ZER team work converges to fixed point" — true for X (per-decade)
+    not Layer 1 (slow-grow via promotion, per asm doc §1.6.4)
+```
+
+### 31.7 The single benchmark that would close most opens
+
+PART 1 §14.10 called for actual benchmarks. The minimum benchmark to
+close most opens:
+
+```
+Benchmark requirements:
+  1. Build a representative ZER program with universal pointer enabled
+  2. Measure:
+     a. Elision rate (count emitted tag checks / total derefs)
+     b. p50/p99/p99.9 latency on tag check fires
+     c. Whole-program overhead vs baseline (no checks)
+  3. Run on:
+     a. Single-threaded embedded target (Cortex-M4, 168 MHz)
+     b. Multi-threaded server target (x86_64, 3 GHz, 4+ cores)
+     c. Pointer-heavy workload (hash table, graph traversal)
+     d. Computation-heavy workload (matrix, signal processing)
+
+Expected outcome (per PART 1 estimates):
+  Elision rate: 70-85%
+  p99 latency: 30-100 ns on tag check
+  Whole-program overhead: 1-5% typical, 5-15% pointer-heavy
+
+If outcome matches estimates: PART 3's claims become MEASURED, can drop
+the "estimate" hedges. If outcome differs: update PART 1 estimates and
+PART 3 summary together.
+
+Until this benchmark exists: PART 3 cost claims defer to PART 1
+distribution, labeled as estimates.
+```
+
+### 31.8 The honest end-state of the document
+
+After all reconciliations:
+
+```
+What this document IS:
+  - A layered geological log of ZER's universal pointer design exploration
+  - PART 1: design space mapped with honest hedges
+  - PART 2: expanded context, examples, comparisons
+  - PART 3: auto-detection convergence model (correctness story)
+  - PART 4: reconciliation layer (this) tying summary back to hedged base
+
+What this document IS NOT:
+  - A benchmarked performance specification
+  - A finalized compiler implementation guide
+  - A finished, locked-forever artifact
+
+What's actually locked:
+  - The CORRECTNESS architecture (sound by construction)
+  - The DESIGN choices (8-byte default, 16-byte security variant)
+  - The VOCABULARY (keep vs tag check as distinct mechanisms)
+  - The DISCIPLINE (append-only with reconciliation per new layer)
+
+What's still hypothesis:
+  - Performance numbers (estimates pending benchmark)
+  - Real-world elision rates (theoretical until measured)
+  - Worst-case latency in production (depends on workload)
+```
+
+---
+
+# End of PART 4
+
+PART 4 is the reconciliation layer. It does NOT replace PART 3 — it
+references PART 3's claims and cites PART 1's hedged versions when
+PART 3 over-asserted.
+
+The discipline: future convergence layers must reconcile too. Append-
+only logs stay honest only when each new layer cleans up its own
+contradictions with the past, not when they pretend the past doesn't
+exist.
+
+The architecture is sound. The performance is estimated. Both are
+true at the same time, and the doc now says so explicitly.

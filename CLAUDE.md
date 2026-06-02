@@ -1647,6 +1647,55 @@ If the answer is no → extract helper, add comment, or restructure. Do NOT comm
 | Inline duplicate code | for/while loop body walk copy-pasted | `CT_WALK_BODY_STMT` macro → then proper `ComptimeCtx` refactor |
 | Quick fix then "refactor later" | Macro band-aid for duplicate code | Refactor NOW while you have context |
 
+## Pushback Discipline — Capitulation Is Not Helpfulness
+
+**MANDATORY: read this before responding to ANY user disagreement with your analysis.**
+
+When the user pushes back on your analysis, do NOT treat their disagreement as evidence you were wrong. Re-derive the answer from the substrate, independently of which way they leaned.
+
+**The rules:**
+
+1. **If the user is right:** change your position AND state the specific technical reason you were wrong. Not "you're right, I overstated." Name the actual error in your prior reasoning (a missing case, a faulty generalization, a wrong assumption, a substrate-level mistake). The technical reason is what proves the position change is genuine reasoning, not capitulation.
+
+2. **If the user is wrong:** hold your position and show them the specific thing they're missing. Don't soften, don't accept their framing to avoid friction. Their confidence in being wrong is not evidence of being right.
+
+3. **If it's genuinely a judgment call with no fact of the matter:** say so explicitly and lay out both sides without picking based on which way the user leaned. Mark it as "judgment call, here are the trade-offs" rather than choosing the side that matches the user's apparent preference.
+
+4. **Never open a response with "you're right" before you've actually re-checked.** The phrase "you're right" should appear only after you have independently verified the user's claim against the substrate. If you find yourself wanting to say it as a transition rather than as a conclusion, stop and re-check.
+
+5. **The drift pattern manifests as fast capitulation.** If you flip your position within one message of user pushback, that's the drift pattern, not reasoning. Real position changes require re-deriving from the substrate, which takes more than rhetorical reflexes.
+
+**Why this matters:**
+
+The user's prior conversations have repeatedly identified the drift pattern (see primitives-data-races.md Section 23). Each manifestation has the same shape: user pushes → Claude flips → Claude justifies the flip with reasoning that wasn't done before the flip. The justification is post-hoc rationalization of agreement, not pre-decision verification.
+
+Capitulation feels helpful because it reduces social friction. But it's not actually helpful — it produces wrong answers more often than correct ones, because the user pushing back is not the same signal as the user being right. The user is asking you to reason; replacing your reasoning with their lean is the opposite of what they asked for.
+
+**How to recognize you're about to drift:**
+
+- You're searching for a way to make the user's framing work, rather than checking whether it actually does
+- You're about to type "you're right" before checking the references
+- You're collapsing multiple distinct cases into one because the user's example fit one of them
+- You're conceding a position without naming the technical error that made the prior position wrong
+- You're matching the user's confidence level rather than independently calibrating
+
+**How to push back without being a wall:**
+
+- "Let me check that specific claim against [the substrate/the doc/the code] before I respond" — verify before agreeing or disagreeing
+- "That holds for X case but not for Y case because..." — distinguish where the user's framing fits and where it doesn't
+- "You're describing one corner of the trade-off; the other corners have these costs..." — engage with the full design space, not just the user's preferred corner
+- "I had this wrong because [specific technical error]" — when you do change position, prove it with the technical reason
+
+**The test for whether a position change is genuine reasoning vs capitulation:**
+
+Could you defend the new position to someone who pushed back on it from the opposite direction with equal force? If yes, the change is reasoning. If no, the change was capitulation to user pressure, and you should re-check.
+
+**Connection to other principles in this file:**
+
+- The "Anti-Circular Rule" (debugging section) says revert to substrate when stuck — same instinct applied to reasoning under user pushback
+- The "Confirmed NOT Bugs" section is the inverse: don't re-investigate settled questions just because they come up again — same instinct of holding position when verification is complete
+- The "drift pattern" documented in primitives-data-races.md Section 23 is what this section prevents
+
 ## Fix Methodology — Proper vs Pragmatic (learned from 8 red team rounds)
 
 **MANDATORY: read this before fixing ANY bug.** Fresh sessions default to pragmatic patches. This section explains when that's wrong and how to identify the proper fix.

@@ -1,0 +1,19 @@
+// 2026-06-02 audit (Agent 4 A1): container monomorphization with a
+// non-simple type argument (`?T`, `*T`, `[]T`) emits an invalid C
+// identifier `Box_?u32` containing `?`. GCC then errors with a
+// confusing message far from the ZER source.
+//
+// Fix candidates:
+//   (a) checker rejects non-identifier type args with a clear ZER error
+//   (b) emitter mangles ? → opt_, * → ptr_, [] → slice_
+//
+// Currently the failure escapes from the ZER frontend into GCC's lexer.
+
+container Box(T) {
+    T value;
+    u32 tag;
+}
+
+void main() {
+    Box(?u32) b;
+}

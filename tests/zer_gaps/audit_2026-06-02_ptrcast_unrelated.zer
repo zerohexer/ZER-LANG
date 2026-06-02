@@ -1,0 +1,19 @@
+// 2026-06-02 audit (Agent 1 Gap 4): @ptrcast between two unrelated
+// concrete struct pointers (no *opaque round-trip) is silently allowed
+// at both checker and emitter, producing type confusion.
+//
+// Provenance tracking only fires when one side is *opaque. Direct
+// `@ptrcast(*B, &a)` falls through to plain C cast.
+//
+// Reproducer compiles + runs returning 100 (low byte of A.x as B.y).
+// Expected: compile-time rejection — provenance mismatch.
+
+struct A { u32 x; }
+struct B { u8 y; }
+
+i32 main() {
+    A a;
+    a.x = 100;
+    *B b = @ptrcast(*B, &a);
+    return (i32)b.y;
+}

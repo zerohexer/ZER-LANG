@@ -24,3 +24,7 @@ fix estimates.
 | `gap7_defer_in_defer.zer` | defer nested in defer body accepted (spec says reject) |
 | `prec1_vrp_literal_i.zer` | VRP precision: `u32 i = 10; arr[i]` not proven OOB |
 | `prec2_opaque_wrong_type.zer` | *opaque cast to wrong type inside same function |
+| `audit_2026-06-02_slice_oob.zer` | `arr[0..end]` with end > arr.len silently constructs OOB slice |
+| `audit_2026-06-02_ptrcast_unrelated.zer` | `@ptrcast(*B, &a)` between unrelated concrete struct pointers accepted |
+| `audit_2026-06-02_nostrict_mmio_no_runtime.zer` | `--no-strict-mmio` drops runtime range/alignment check |
+| `audit_2026-06-02_container_optional_type_arg.zer` | `container Box(T)` with `Box(?u32)` emits invalid C identifier |

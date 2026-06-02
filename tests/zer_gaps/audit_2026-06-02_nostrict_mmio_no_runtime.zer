@@ -1,0 +1,23 @@
+// 2026-06-02 audit (Agent 3 Gap #1): `--no-strict-mmio` flag drops the
+// RUNTIME range/alignment check too, not just the compile-time one.
+//
+// Per CLAUDE.md the flag is "allow @inttoptr without mmio declarations"
+// — i.e., relax the compile-time strictness. The emitted runtime check
+// (range + alignment) should still fire. In current emission, variable
+// address with --no-strict-mmio emits `((uint32_t*)(uintptr_t)(addr))`
+// with NO check at all.
+//
+// On baremetal: writes to arbitrary peripherals silently. On hosted:
+// SIGSEGV on bad address (different failure mode than declared).
+//
+// Verify by emission inspection:
+//   zerc <this> --emit-c --no-strict-mmio -o /tmp/t.c
+//   grep "_zer_mmio\|_zer_trap" /tmp/t.c    # NO range check found
+
+i32 external_addr() { return 0x40000000; }
+
+i32 main() {
+    i32 addr = external_addr();
+    volatile *u32 reg = @inttoptr(*u32, addr);
+    return 0;
+}

@@ -1,0 +1,18 @@
+// 2026-06-02 audit (Agent 1 Gap 1): slice constructor `arr[a..b]` with
+// b > arr.len silently accepted. Both AST and IR paths only check
+// `start > end`; the upper bound against arr.len is not enforced.
+//
+// Reproducer compiles + runs returning 100 (the unsafe slice length).
+// Subsequent indexing reads adjacent stack memory (OOB read).
+//
+// Expected: trap "slice end past end" at runtime, or compile-time error
+// when end is proven > len.
+
+i32 main() {
+    u8[4] data;
+    data[0] = 1; data[1] = 2; data[2] = 3; data[3] = 4;
+    u32 e = 100;
+    for (u32 k = 0; k < 1; k += 1) { e = 100; }   // defeat VRP
+    [*]u8 s = data[0..e];
+    return (i32)s.len;   // returns 100 (currently); should trap
+}

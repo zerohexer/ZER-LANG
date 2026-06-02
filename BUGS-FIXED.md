@@ -1668,6 +1668,94 @@ module + 1382 C-unit tests still passing.
 
 ---
 
+## Session 2026-06-02 — Codebase-wide audit: 2 critical fixes + 30+ gaps catalogued
+
+Parallel 5-agent audit (`docs/audit_2026-06-02.md`) found two CRITICAL
+silent bugs the orchestrator independently verified, plus ~30 additional
+gaps now catalogued for fix.
+
+### BUG-643: volatile dropped on LOCAL pointer var-decls (silent baremetal miscompile)
+
+**Symptom**: `volatile *u32 reg = @inttoptr(*u32, ADDR);` at function scope
+emitted plain `uint32_t* reg = ...` in C — no `volatile` qualifier. Three
+sequential MMIO writes (`reg[0] = a; reg[0] = b; reg[0] = c;`) collapsed
+to a single store at GCC -O2. On baremetal: UART transmit sequences send
+only the last byte; timer reset/enable sequences skip intermediate steps;
+DMA descriptor setup races; interrupt clear may not clear properly.
+
+**Root cause**: `volatile` in ZER syntax for var-decls is parsed as a
+VARIABLE qualifier (`node->var_decl.is_volatile`), not threaded into the
+`Type *`. The checker (`checker.c:7608-7613`) propagated this only for
+TYPE_SLICE, not TYPE_POINTER. `checker_get_type()` returned an unqualified
+`*u32`. IR lowering (`ir_lower.c:1695`) stored the unqualified type on the
+IR Local. Emitter then emitted via `emit_type_and_name` which only knows
+the Type's qualifiers. Global var-decls dodged this because the AST path
+applied `emitter.c:3795` propagation; locals went through IR and lost
+volatile.
+
+**Fix**: `checker.c:7608-7623` — extend the SLICE volatile propagation to
+also cover POINTER (with `type_unwrap_distinct`), creating a fresh
+`type_pointer` with `is_volatile=true`. Mirrors the AST emitter at
+`emitter.c:3795` so both paths converge.
+
+**Verification**: x86-64 -O2 asm before fix shows `movl $0xcafe` only;
+after fix shows `movl $0xdead; movl $0xbeef; movl $0xcafe` (3 distinct
+stores preserved).
+
+**Test**: `tests/zer/_verify_BUG-643_volatile_local_ptr.zer`.
+
+### BUG-644: comptime depth counter leak
+
+**Symptom**: After ~17 comptime evaluation attempts that hit certain
+failure paths, legitimate later comptime calls falsely tripped:
+`error: comptime call chain exceeded recursion depth (16)`. The depth
+limit wasn't actually exceeded — the counter had accumulated state.
+
+**Root cause**: `eval_comptime_call_subst` (`checker.c:1757`) incremented
+`_comptime_call_depth` at line 1770, then returned `CONST_EVAL_FAIL` at
+lines 1773 (symbol not found / not comptime) and 1776 (wrong arity)
+WITHOUT decrementing. The happy path at line 1796 decrements; the loop
+arg-eval failure path at line 1786 decrements; only these two early
+returns leaked. Triggered when a comptime function calls a non-comptime
+function or with wrong arity — `_comptime_call_depth` accumulated 1 per
+call. After 17 leaks, the limit check at line 1761 (`> 16`) fired falsely
+on any subsequent comptime call.
+
+**Fix**: explicit `_comptime_call_depth--;` before each early return.
+The mistake is the same anti-pattern CLAUDE.md "Implementation Workflow"
+warns about: "save/restore pattern for mutable state" — should have been
+applied here at counter introduction.
+
+**Test**: `tests/zer/_verify_BUG-644_comptime_depth_leak.zer`.
+
+**Future**: the same pattern (static-int counter, early-return leak)
+exists in 4 other places per the agent audit (`_container_depth`,
+`_subst_depth`, `eval_comptime_block depth`, `_scan_depth`). Recommend
+either a `DepthGuard` RAII macro or move counters into `Checker` struct
+in a follow-up.
+
+### Catalogued gaps (deferred — see audit doc)
+
+30+ findings from 5 parallel agents now have reproducer tests in
+`tests/zer_gaps/` and detailed analysis in `docs/audit_2026-06-02.md`.
+Critical agent finds awaiting next sessions:
+- Slice `arr[0..end]` with end > len silently accepted (silent OOB)
+- `@ptrcast` between unrelated CONCRETE struct pointers (silent type
+  confusion, no *opaque round-trip needed)
+- `--no-strict-mmio` flag drops the runtime range/alignment check too
+- `container Box(T)` with `Box(?u32)` emits invalid C identifier
+- 8 zercheck_ir handle-tracking gaps (orelse overwrite leak, global
+  alias UAF, defer-then-manual double-free, etc.)
+- 9 baremetal hardware-safety gaps (shared in ISR, @probe freestanding
+  semantics, undersized context-save buffer, etc.)
+- 5 IR validation gaps (IR_YIELD outside async, IR_AWAIT not treated as
+  terminator by `ir_compute_preds`, etc.)
+- 33 orphaned safety predicates in `src/safety/*.c` — VST-proven but
+  no call site (frozen-spec anti-pattern)
+- `tools/audit_matrix.sh` scans wrong line range → 16 false positives
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

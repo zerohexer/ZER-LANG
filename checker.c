@@ -1865,10 +1865,21 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     _comptime_call_depth++;
     Symbol *sym = scope_lookup(_comptime_global_scope,
         call->call.callee->ident.name, (uint32_t)call->call.callee->ident.name_len);
-    if (!sym || !sym->is_comptime || !sym->func_node) return CONST_EVAL_FAIL;
+    /* BUG-644: early returns MUST decrement the depth counter. Previously these
+     * paths leaked the counter, so a comptime function calling a non-comptime
+     * symbol (or with wrong arity) would accumulate depth. After ~17 such
+     * leaks, legitimate comptime calls falsely tripped the depth-exceeded
+     * guard at line 1761 ("comptime call chain exceeded recursion depth (16)"). */
+    if (!sym || !sym->is_comptime || !sym->func_node) {
+        _comptime_call_depth--;
+        return CONST_EVAL_FAIL;
+    }
     Node *fn = sym->func_node;
     int pc = fn->func_decl.param_count;
-    if (pc != call->call.arg_count) return CONST_EVAL_FAIL;
+    if (pc != call->call.arg_count) {
+        _comptime_call_depth--;
+        return CONST_EVAL_FAIL;
+    }
     ComptimeParam stack_cp[8];
     memset(stack_cp, 0, sizeof(stack_cp));
     ComptimeParam *cparams = pc <= 8 ? stack_cp :
@@ -8047,23 +8058,22 @@ static void check_stmt(Checker *c, Node *node) {
         }
         /* propagate volatile from var qualifier to slice/pointer type.
          *
-         * Pointer propagation (added 2026-05-18): without this, the type
+         * Pointer propagation (BUG-643/664/665): without this, the type
          * stored in the typemap for `volatile *u32 reg = ...` is plain
          * `*u32`. Subsequent uses of `reg` (via NODE_IDENT) returned this
          * non-volatile type; IR lowering copied `reg` into a temp typed
          * `*u32`, and the emitter declared `uint32_t* _zer_t0 = reg;` —
-         * stripping volatile. GCC warned "assignment discards 'volatile'
-         * qualifier" but the resulting reads/writes through the temp were
-         * NOT volatile in C, so GCC was free to cache/elide MMIO accesses
-         * — silent miscompile on bare-metal embedded targets. */
+         * stripping volatile. GCC warned but the temp-routed reads/writes
+         * were not volatile in C — silent MMIO miscompile on baremetal. */
         if (node->var_decl.is_volatile && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
-                type = type_volatile_slice(c->arena, type->slice.inner);
+            Type *teff = type_unwrap_distinct(type);
+            if (teff && teff->kind == TYPE_SLICE && !teff->slice.is_volatile) {
+                type = type_volatile_slice(c->arena, teff->slice.inner);
                 if (node->var_decl.is_const) type->slice.is_const = true;
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
-                Type *vp = type_pointer(c->arena, type->pointer.inner);
+            } else if (teff && teff->kind == TYPE_POINTER && !teff->pointer.is_volatile) {
+                Type *vp = type_pointer(c->arena, teff->pointer.inner);
                 vp->pointer.is_volatile = true;
-                vp->pointer.is_const = type->pointer.is_const;
+                if (teff->pointer.is_const || node->var_decl.is_const) vp->pointer.is_const = true;
                 type = vp;
             }
         }

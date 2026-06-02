@@ -1,0 +1,32 @@
+// BUG-643: volatile dropped from local pointer var-decl during IR lowering.
+//
+// Before fix: `volatile *u32 reg = @inttoptr(*u32, ADDR);` emitted as plain
+// `uint32_t* reg = ...` in C. GCC -O2 collapsed sequential MMIO writes,
+// silently miscompiling all baremetal register sequences (UART transmit,
+// timer reset, DMA setup, interrupt clear).
+//
+// Fix in checker.c: propagate var_decl.is_volatile into TYPE_POINTER alongside
+// the existing TYPE_SLICE branch, mirroring the AST-path emitter logic at
+// emitter.c:3795.
+//
+// This test compiles + runs successfully — it does not exercise the MMIO
+// access at runtime (the address is invalid on hosted). Verification of the
+// fix is by inspecting the emitted C: `volatile uint32_t* reg` (not bare
+// `uint32_t*`). Tested manually with --emit-c on x86-64 + objdump -d showing
+// 3 distinct store instructions instead of 1 at -O2.
+
+mmio 0x40000000..0x40000040;
+
+void seq() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+    // Three writes must survive -O2 — if volatile is dropped, GCC folds to one.
+    reg[0] = 0xDEAD;
+    reg[0] = 0xBEEF;
+    reg[0] = 0xCAFE;
+}
+
+i32 main() {
+    // Don't call seq() — would SIGSEGV on hosted.
+    // The compile-clean + (manual) emission inspection is the test.
+    return 0;
+}

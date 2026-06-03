@@ -481,9 +481,9 @@ the float path.
 
 ---
 
-## ~~Silent gaps — 5 closed 2026-06-03~~ (FIXED)
+## ~~Silent gaps — 6 closed 2026-06-03~~ (FIXED)
 
-Targeted audit found and closed five distinct silent gaps:
+Targeted audit found and closed six distinct silent gaps:
 
 1. **`arena.alloc_slice` not classified as IRMC_ARENA_ALLOC** — slice
    from `ar.alloc_slice(T, n)` was not tagged `ZC_COLOR_ARENA`, so
@@ -499,12 +499,17 @@ Targeted audit found and closed five distinct silent gaps:
 5. **Shared struct passed by value** — embedded mutex copied; function
    locked its own copy → zero synchronization with caller. Fixed in
    `checker.c` call-arg validation.
+6. **`@ptrcast` launders arena pointer escape** — the arena escape check
+   only matched direct NODE_IDENT values; `g = @ptrcast(*u32, arena_ptr);`
+   bypassed it. Fixed in `checker.c` NODE_ASSIGN handler by unwrapping
+   `@ptrcast`/`@cast` before the ident check.
 
 See `BUGS-FIXED.md` "Session 2026-06-03" for full root-cause + fix
 narrative per gap. Tests in `tests/zer/shared_return_no_deadlock.zer`,
 `tests/zer/shared_for_init_locked.zer`,
 `tests/zer_fail/arena_alloc_slice_uaf.zer`,
-`tests/zer_fail/shared_struct_by_value.zer`.
+`tests/zer_fail/shared_struct_by_value.zer`,
+`tests/zer_fail/arena_ptrcast_escape.zer`.
 
 ---
 

@@ -3722,11 +3722,28 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
         }
-        if (node->assign.op == TOK_EQ &&
-            node->assign.value->kind == NODE_IDENT) {
+        if (node->assign.op == TOK_EQ) {
+            /* SILENT-GAP FIX: arena escape check missed @ptrcast laundering.
+             * `g_ptr = @ptrcast(*u32, arena_ptr);` bypassed the escape check
+             * because the assignment value was NODE_INTRINSIC, not NODE_IDENT.
+             * Unwrap @ptrcast (and @cast) to inspect the underlying ident. */
+            Node *value_root = node->assign.value;
+            if (value_root && value_root->kind == NODE_INTRINSIC &&
+                value_root->intrinsic.name_len == 7 &&
+                memcmp(value_root->intrinsic.name, "ptrcast", 7) == 0 &&
+                value_root->intrinsic.arg_count >= 1) {
+                value_root = value_root->intrinsic.args[0];
+            } else if (value_root && value_root->kind == NODE_INTRINSIC &&
+                       value_root->intrinsic.name_len == 4 &&
+                       memcmp(value_root->intrinsic.name, "cast", 4) == 0 &&
+                       value_root->intrinsic.arg_count >= 1) {
+                value_root = value_root->intrinsic.args[0];
+            }
+        if (value_root &&
+            value_root->kind == NODE_IDENT) {
             Symbol *val_sym = scope_lookup(c->current_scope,
-                node->assign.value->ident.name,
-                (uint32_t)node->assign.value->ident.name_len);
+                value_root->ident.name,
+                (uint32_t)value_root->ident.name_len);
             if (val_sym && (val_sym->is_arena_derived || val_sym->is_from_arena)) {
                 /* walk target to find root */
                 Node *root = node->assign.target;
@@ -3757,6 +3774,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
         }
+        } /* end TOK_EQ outer block wrapping the @ptrcast-aware path */
 
         /* scope escape: assigning local array to global slice (implicit coercion) */
         if (node->assign.op == TOK_EQ &&

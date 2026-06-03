@@ -1868,6 +1868,25 @@ Error message tells the user to use `*Counter` (pointer) instead.
 
 **Test**: `tests/zer_fail/shared_struct_by_value.zer` — must compile-error.
 
+### Gap 6: `@ptrcast` launders arena pointer escape — silent dangling global
+
+**Symptom**: `g_ptr = @ptrcast(*u32, arena_ptr);` silently stored an
+arena-derived pointer in a global. When the arena went out of scope
+(or `arena.reset()` fired), the global pointer dangled. Direct
+`g_ptr = arena_ptr;` was correctly rejected; the @ptrcast launder
+bypassed the check.
+
+**Root cause**: the arena escape check at the NODE_ASSIGN handler in
+`checker.c` only fired when `node->assign.value->kind == NODE_IDENT`.
+`@ptrcast(*T, src)` has value kind `NODE_INTRINSIC`, so the check was
+silently skipped.
+
+**Fix**: unwrap `@ptrcast`/`@cast` intrinsic at the assign value
+position before the NODE_IDENT check. The underlying source ident is
+then inspected for `is_arena_derived`/`is_from_arena` flags.
+
+**Test**: `tests/zer_fail/arena_ptrcast_escape.zer` — compile error.
+
 ### Audit methodology
 
 Each gap was found by:

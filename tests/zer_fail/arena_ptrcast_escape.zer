@@ -1,0 +1,16 @@
+// EXPECTED: compile error — arena escape via @ptrcast laundering
+// SILENT GAP: the arena escape check only fired when the assignment value
+// was a direct NODE_IDENT. `g = @ptrcast(*u32, arena_ptr);` had value
+// kind NODE_INTRINSIC, so the check was bypassed. Result: arena-derived
+// pointer silently stored in global; pointer dangles when arena resets.
+struct Task { u32 id; }
+?*u32 g_t = null;
+
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+    ?*Task mt = ar.alloc(Task);
+    *Task t = mt orelse return;
+    g_t = @ptrcast(*u32, t);
+    return 0;
+}

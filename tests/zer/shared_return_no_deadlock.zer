@@ -1,0 +1,22 @@
+// Regression: returning a shared struct field value must release the lock
+// so that other threads can access the shared struct without deadlocking.
+shared struct Counter { u32 v; }
+Counter g;
+
+u32 leaky() {
+    return g.v;
+}
+
+void worker() {
+    u32 x = g.v;
+    if (x != 42) { @trap(); }
+}
+
+u32 main() {
+    g.v = 42;
+    u32 a = leaky();
+    ThreadHandle t = spawn worker();
+    t.join();
+    if (a != 42) { @trap(); }
+    return 0;
+}

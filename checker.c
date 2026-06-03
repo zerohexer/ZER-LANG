@@ -4643,6 +4643,31 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
 
+                    /* SILENT-GAP FIX: passing a shared struct BY VALUE silently
+                     * copies the embedded mutex. The function then locks its
+                     * private copy of the mutex, providing zero synchronization
+                     * with the caller's struct. Result is a silent data race —
+                     * compile clean, runtime returns wrong values.
+                     *
+                     * Reject pass-by-value of shared structs at the call site;
+                     * the user must pass `*shared T` (or `*T` to a shared param
+                     * by pointer) to retain the auto-locking semantics. */
+                    if (arg && param) {
+                        Type *arg_eff = type_unwrap_distinct(arg);
+                        Type *param_eff = type_unwrap_distinct(param);
+                        if (arg_eff && param_eff &&
+                            arg_eff->kind == TYPE_STRUCT &&
+                            param_eff->kind == TYPE_STRUCT &&
+                            (arg_eff->struct_type.is_shared ||
+                             arg_eff->struct_type.is_shared_rw)) {
+                            checker_error(c, node->loc.line,
+                                "argument %u: cannot pass shared struct '%s' by value — "
+                                "embedded mutex would be copied, breaking auto-lock "
+                                "semantics. Pass by pointer '*%s' instead.",
+                                i + 1, type_name(arg), type_name(arg));
+                        }
+                    }
+
                     if (!type_equals(param, arg) &&
                         !can_implicit_coerce(arg, param) &&
                         !is_literal_compatible(node->call.args[i], param) &&
@@ -12042,6 +12067,8 @@ static bool contains_break(Node *node) {
     case NODE_STRUCT_INIT:
         return false;
     }
+    return false; /* GCC -Wreturn-type: exhaustive switch above but
+                   * lint can't prove it. Defensive fallback. */
 }
 
 static bool all_paths_return(Node *node) {

@@ -1674,16 +1674,36 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->func->current_scope++;
         for (int i = 0; i < node->block.stmt_count; i++) {
             Node *shared_root;
-            emit_shared_lock_if_needed(ctx, node->block.stmts[i], &shared_root);
+            Node *stmt = node->block.stmts[i];
+            emit_shared_lock_if_needed(ctx, stmt, &shared_root);
+            /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
+             * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
+             * IR_RETURN terminates the block. Cross-thread access then
+             * deadlocks waiting for the never-released mutex. Lower the
+             * return expression to a temp local first, emit IR_UNLOCK,
+             * then emit IR_RETURN. The deferred-fire and IR_RETURN bits
+             * mirror lower_stmt's NODE_RETURN handler. */
+            if (shared_root && stmt->kind == NODE_RETURN) {
+                Node *ret_expr = stmt->ret.expr;
+                IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
+                if (ret_expr) {
+                    rewrite_idents(ctx, ret_expr);
+                    ret.src1_local = lower_expr(ctx, ret_expr);
+                    if (ret.src1_local < 0) ret.expr = ret_expr;
+                }
+                emit_shared_unlock_if_needed(ctx, stmt, shared_root);
+                shared_root = NULL;
+                emit_defer_fire(ctx, stmt->loc.line);
+                emit_inst(ctx, ret);
+                continue;
+            }
             /* Expose the active root to lower_stmt so exit statements
-             * (NODE_RETURN) can release the lock before exiting — the
-             * IR_UNLOCK emitted after this lower_stmt is unreachable
-             * past a return / goto / break / continue. */
+             * (other than NODE_RETURN above) can also release the lock. */
             Node *prev_shared = ctx->current_stmt_shared_root;
             ctx->current_stmt_shared_root = shared_root;
-            lower_stmt(ctx, node->block.stmts[i]);
+            lower_stmt(ctx, stmt);
             ctx->current_stmt_shared_root = prev_shared;
-            emit_shared_unlock_if_needed(ctx, node->block.stmts[i], shared_root);
+            emit_shared_unlock_if_needed(ctx, stmt, shared_root);
         }
         /* Fire defers pushed inside THIS block at block exit.
          *
@@ -2090,11 +2110,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * IR_LOCK/IR_UNLOCK. Without this, `for (g_shared.i = 0; ...; ...)`
          * silently writes the shared field with no synchronization
          * (NODE_BLOCK's per-stmt lock wrapper doesn't fire on for-init). */
+        Node *init_root = NULL;
         if (node->for_stmt.init) {
-            Node *for_init_lock_root = NULL;
-            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &for_init_lock_root);
+            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &init_root);
             lower_stmt(ctx, node->for_stmt.init);
-            emit_shared_unlock_if_needed(ctx, node->for_stmt.init, for_init_lock_root);
+            if (init_root) {
+                emit_shared_unlock_if_needed(ctx, node->for_stmt.init, init_root);
+            }
         }
 
         int bb_cond = ir_add_block(ctx->func, ctx->arena);
@@ -2154,19 +2176,19 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Gap fix: lock if step touches shared field. Like init above,
              * `for (..; ..; g_shared.i = g_shared.i + 1)` was silently
              * unsynchronized — only the cond was wrapped. */
-            Node *step_lock_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
-            if (step_lock_root) {
+            Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
+            if (step_root) {
                 IRInst lock = make_inst(IR_LOCK, node->loc.line);
-                lock.expr = step_lock_root;
+                lock.expr = step_root;
                 lock.src2_local = 1; /* write lock — step typically writes */
                 emit_inst(ctx, lock);
             }
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             emit_inst(ctx, step);
-            if (step_lock_root) {
+            if (step_root) {
                 IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-                unlock.expr = step_lock_root;
+                unlock.expr = step_root;
                 emit_inst(ctx, unlock);
             }
         }

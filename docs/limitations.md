@@ -481,6 +481,33 @@ the float path.
 
 ---
 
+## ~~Silent gaps — 5 closed 2026-06-03~~ (FIXED)
+
+Targeted audit found and closed five distinct silent gaps:
+
+1. **`arena.alloc_slice` not classified as IRMC_ARENA_ALLOC** — slice
+   from `ar.alloc_slice(T, n)` was not tagged `ZC_COLOR_ARENA`, so
+   `arena.reset()` did not flag it. Post-reset access compiled clean.
+   Fixed in `zercheck_ir.c`.
+2. **Shared-struct `return field` leaked the mutex** — IR_UNLOCK emitted
+   after IR_RETURN became dead code. Cross-thread access deadlocked.
+   Fixed in `ir_lower.c` NODE_BLOCK loop.
+3. **For-init read of shared struct without lock** — `for (u32 i = g.v;
+   ...)` raced the field. Fixed in `ir_lower.c` NODE_FOR handler.
+4. **For-step write to shared struct without lock** — same shape as #3,
+   step expression side. Fixed in `ir_lower.c` NODE_FOR handler.
+5. **Shared struct passed by value** — embedded mutex copied; function
+   locked its own copy → zero synchronization with caller. Fixed in
+   `checker.c` call-arg validation.
+
+See `BUGS-FIXED.md` "Session 2026-06-03" for full root-cause + fix
+narrative per gap. Tests in `tests/zer/shared_return_no_deadlock.zer`,
+`tests/zer/shared_for_init_locked.zer`,
+`tests/zer_fail/arena_alloc_slice_uaf.zer`,
+`tests/zer_fail/shared_struct_by_value.zer`.
+
+---
+
 ## Remaining known failures
 
 ### No skipped tests

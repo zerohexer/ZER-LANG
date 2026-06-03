@@ -1,0 +1,14 @@
+// Regression: for-init reading from shared struct must lock.
+// Silent gap: `for (u32 i = g.v; ...)` reads g.v WITHOUT a lock.
+shared struct Counter { u32 max; }
+Counter g;
+
+u32 main() {
+    g.max = 3;
+    u32 sum = 0;
+    for (u32 i = 0; i < g.max; i += 1) {
+        sum += i;
+    }
+    if (sum != 3) { @trap(); }
+    return 0;
+}

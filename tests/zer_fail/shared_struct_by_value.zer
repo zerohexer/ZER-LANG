@@ -1,0 +1,16 @@
+// EXPECTED: compile error — shared struct cannot be passed by value
+// SILENT GAP: pass-by-value of shared struct silently copies the embedded
+// mutex. The function locks its private copy, providing zero synchronization
+// with the caller. Runtime: silent data race + wrong values.
+shared struct Counter { u32 v; }
+Counter g;
+
+void inc(Counter c) {
+    c.v += 1;
+}
+
+u32 main() {
+    g.v = 5;
+    inc(g);
+    return g.v;
+}

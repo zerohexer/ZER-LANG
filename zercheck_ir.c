@@ -945,6 +945,12 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
         return IRMC_ARENA_ALLOC;  /* arena.alloc(Type) takes type arg */
     }
     if (ml == 9 && memcmp(m, "alloc_ptr", 9) == 0) return IRMC_ALLOC_PTR;
+    /* arena.alloc_slice(T, n) returns ?[*]T — must be classified as ARENA
+     * alloc so that the resulting slice's source_color is ZC_COLOR_ARENA
+     * and arena.reset() correctly marks the slice as FREED. Without this,
+     * `?[*]T ms = ar.alloc_slice(T, n); ... ar.reset(); use(ms);` compiles
+     * silently and reads from invalidated arena memory at runtime. */
+    if (ml == 11 && memcmp(m, "alloc_slice", 11) == 0) return IRMC_ARENA_ALLOC;
     if (ml == 3 && memcmp(m, "get", 3) == 0) return IRMC_GET;
     if (ml == 4 && memcmp(m, "free", 4) == 0) return IRMC_FREE;
     if (ml == 8 && memcmp(m, "free_ptr", 8) == 0) return IRMC_FREE_PTR;

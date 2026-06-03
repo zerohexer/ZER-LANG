@@ -1,0 +1,16 @@
+// EXPECTED: compile error — slice from arena.alloc_slice() used after arena.reset()
+// SILENT GAP: arena.alloc_slice() was not classified as IRMC_ARENA_ALLOC in
+// zercheck_ir.c, so the dest local was not tagged ZC_COLOR_ARENA.
+// arena.reset() only marks ARENA-colored handles freed.
+struct Cell { u32 v; }
+void consume(u32 x) {}
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+    ?[*]Cell ms = ar.alloc_slice(Cell, 5);
+    [*]Cell s = ms orelse return;
+    s[0].v = 100;
+    ar.reset();
+    consume(s[0].v);
+    return 0;
+}

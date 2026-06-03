@@ -1756,6 +1756,144 @@ Critical agent finds awaiting next sessions:
 
 ---
 
+## Session 2026-06-03 — Silent gaps audit: 5 critical safety holes closed
+
+Targeted audit found five distinct silent gaps where ZER compiled clean
+and the runtime EITHER produced wrong results OR deadlocked. All five
+were missed by the existing test suite because none of the ~2000 tests
+exercised the exact safety-tracking corner that each gap lived in. Tests
+added per gap.
+
+### Gap 1: `arena.alloc_slice()` not classified — silent UAF after `arena.reset()`
+
+**Symptom**: a `[*]T` slice obtained from `ar.alloc_slice(T, n)` and then
+referenced after `ar.reset()` compiled clean and dereferenced freed arena
+memory at runtime.
+
+**Root cause**: `ir_classify_method_call_ex` in `zercheck_ir.c` recognized
+`alloc` (Pool/Slab/Arena) and `alloc_ptr` (Slab) but not `alloc_slice`
+(Arena). The classifier returned `IRMC_NONE`, so the dest local for the
+slice never got `source_color = ZC_COLOR_ARENA`. `arena.reset()` walks the
+handle table looking for `ZC_COLOR_ARENA` entries and marks them FREED;
+the slice handle stayed ALIVE and the post-reset use slipped through every
+UAF guard.
+
+**Fix**: added the missing classification at `zercheck_ir.c`:
+
+```c
+if (ml == 11 && memcmp(m, "alloc_slice", 11) == 0) return IRMC_ARENA_ALLOC;
+```
+
+Now the slice is tagged `ZC_COLOR_ARENA` at allocation; `arena.reset()`
+correctly flags every alias as FREED; subsequent access is reported as
+use-after-free at compile time.
+
+**Test**: `tests/zer_fail/arena_alloc_slice_uaf.zer` — compile error.
+
+### Gap 2: shared-struct `return` leaks the mutex lock — cross-thread deadlock
+
+**Symptom**: any function whose body is `return shared_global.field;`
+acquired the shared struct's mutex, read the field into a temp, then
+emitted `return temp;` BEFORE the matching `pthread_mutex_unlock`. The
+unlock became dead code after the return. Same-thread callers worked
+because the mutex is recursive; cross-thread access blocked forever.
+
+Reproducer was 10 lines and a 5-thread test would deadlock indefinitely
+(exit 124 = timeout).
+
+**Root cause**: the `NODE_BLOCK` loop in `ir_lower.c` calls
+`emit_shared_lock_if_needed` BEFORE `lower_stmt` and
+`emit_shared_unlock_if_needed` AFTER. For `return <shared-expr>`, the
+IR_RETURN instruction terminates the block, so the IR_UNLOCK emitted
+afterward is dead code in the generated C.
+
+**Fix**: split the NODE_RETURN-with-shared-root case out of the generic
+loop. Lower the return expression to a temp local, emit IR_UNLOCK,
+emit defer fires, THEN emit IR_RETURN. Mirrors the existing NODE_RETURN
+handler in `lower_stmt` but inserts the unlock at the safe point.
+
+**Test**: `tests/zer/shared_return_no_deadlock.zer` — must compile + run
++ join a spawned thread + exit 0 (no deadlock).
+
+### Gap 3: shared-struct `for (init; ...; ...)` reads init without locking — silent data race
+
+**Symptom**: `for (u32 i = g.v; i < N; i += 1) { ... }` where `g` is a
+shared struct read `g.v` WITHOUT taking the mutex. Other threads writing
+to `g.v` raced this read; on weakly-ordered hardware this can return
+torn values.
+
+**Root cause**: `for_stmt.init` is lowered via `lower_stmt` called
+DIRECTLY from the NODE_FOR handler in `ir_lower.c`, bypassing the
+NODE_BLOCK loop that normally wraps shared-reading statements with
+IR_LOCK/IR_UNLOCK.
+
+**Fix**: wrap the for-init `lower_stmt` call with
+`emit_shared_lock_if_needed` / `emit_shared_unlock_if_needed` — same
+helpers the block loop uses. For-cond was already locked (Gap 36 fix
+2026-04-27); now init matches.
+
+**Test**: `tests/zer/shared_for_init_locked.zer` — compile + run + exit 0.
+
+### Gap 4: shared-struct `for (...; ...; step)` writes step without locking — silent data race
+
+**Symptom**: same shape as Gap 3, applied to the step expression
+(`for (...; ...; g.v += 1)`). Read-modify-write of a shared field
+without the mutex.
+
+**Root cause**: `for_stmt.step` is lowered via a manual IR_ASSIGN emit
+in the NODE_FOR handler, also outside the NODE_BLOCK loop.
+
+**Fix**: detect shared root in the step expression via
+`find_shared_root_expr`, emit IR_LOCK before and IR_UNLOCK after the
+IR_ASSIGN. Write-lock variant since the step is typically an assignment.
+
+### Gap 5: shared struct passed by value — silent broken locking
+
+**Symptom**: `void inc(Counter c) { c.v += 1; }` where `Counter` is
+`shared struct` compiled cleanly. The struct's embedded mutex was
+copied along with the struct. `inc` then locked its private copy of
+the mutex while incrementing its private copy of the field. The
+caller's struct was UNTOUCHED — `g.v = 5; inc(g); return g.v;`
+returned 5 instead of 6. Two threads calling `inc(g)` racing on
+`g` had ZERO synchronization because each had its own mutex copy.
+
+**Root cause**: pass-by-value of `shared struct` was never rejected.
+The auto-locking emit fires on the call site COPY (the local arg),
+which has its own mutex. Spec was implicit: shared struct must be
+passed by pointer to retain the auto-lock semantics.
+
+**Fix**: in the call-arg validation loop in `checker.c`, reject pass-
+by-value of any `TYPE_STRUCT` with `is_shared`/`is_shared_rw` set.
+Error message tells the user to use `*Counter` (pointer) instead.
+
+**Test**: `tests/zer_fail/shared_struct_by_value.zer` — must compile-error.
+
+### Audit methodology
+
+Each gap was found by:
+1. Writing a reproducer `.zer` that should error (or produce wrong runtime
+   behavior) but compiles clean.
+2. Reading the emitted C to confirm the safety mechanism was either
+   missing or emitted in the wrong order.
+3. Tracing the safety check from its handler back to where the gap
+   exists, then either adding the missing check or fixing the order.
+
+All five gaps share the same flavor: existing safety infrastructure
+(handle tracking, shared locking) was correct, but a specific
+code path didn't drive it. The fixes are localized (1-30 LOC each)
+and require zero new safety subsystems. Existing tests didn't catch
+them because nothing in the suite combined `alloc_slice` with `reset`,
+or `shared return` with cross-thread access, or `for-init` with a
+shared field read.
+
+### Technical-debt cleanup (low priority, drive-by)
+
+- `contains_break` in `checker.c` had an exhaustive switch but GCC
+  -Wreturn-type couldn't prove it. Added defensive `return false;`
+  after the switch to silence the warning.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

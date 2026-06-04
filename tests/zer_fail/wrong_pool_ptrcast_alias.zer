@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// audit 2026-06-04: wrong-pool detection silently bypassed when *T pointer
+// flows through *opaque alias via @ptrcast. Pre-fix: the IR_ASSIGN
+// @ptrcast alias path (line ~2000) propagated `escaped` but not pool_name+len.
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    *Task p = pool_a.alloc_ptr() orelse return;
+    *opaque o = @ptrcast(*opaque, p);
+    *Task k = @ptrcast(*Task, o);
+    pool_b.free_ptr(k);  // wrong pool — must detect after ptrcast round-trip
+    pool_a.free_ptr(p);
+}

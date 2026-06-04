@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// audit 2026-06-04: wrong-pool detection silently bypassed when alloc
+// goes through ?Handle and then orelse-ident alias. Pre-fix: the IR
+// decomposition `?Handle mh = pool_a.alloc(); Handle h = mh orelse return`
+// dropped pool_name in the IR_ASSIGN ident-alias path (line ~2152).
+
+struct Task { u32 id; }
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void test() {
+    ?Handle(Task) mh = pool_a.alloc();
+    Handle(Task) h = mh orelse return;
+    u32 v = pool_b.get(h).id;  // wrong pool — must detect
+    pool_a.free(h);
+}

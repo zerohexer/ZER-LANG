@@ -1913,6 +1913,109 @@ shared field read.
 
 ---
 
+## Session 2026-06-04 — zercheck_ir alias-copy field drift + lattice + switch lock
+
+Comprehensive audit of zercheck_ir.c (3921 lines), ir_lower.c, and emitter.c
+identified 11 alias-copy sites with inconsistent provenance field
+propagation, 2 missing lattice merge cells, and 1 IR_LOCK leak on early
+break. The alias-copy class silently bypassed F3.2's wrong-pool detection
+through several common patterns (struct field, ?Handle decomposition,
+@ptrcast round-trip).
+
+### Wrong-pool detection bypassed via alias paths (BUG-661)
+
+**Symptom**: `pool_a.alloc()` then aliased through one of several patterns
+allowed `pool_b.get/free(alias)` to compile clean. Confirmed silent gaps:
+
+| Pattern | Pre-fix result | Reproducer |
+|---|---|---|
+| `c.h = h; pool_b.get(c.h)` | silent | `wrong_pool_compound_alias.zer` |
+| `?Handle mh = ..; Handle h = mh orelse return; pool_b.get(h)` | silent | `wrong_pool_optional_alias.zer` |
+| `*opaque o = @ptrcast(*opaque, p); ... pool_b.free_ptr(@ptrcast(*T, o))` | silent | `wrong_pool_ptrcast_alias.zer` |
+
+The direct case (`pool_b.get(h)` without alias) WAS caught. The bug was
+that 9 alias-copy sites in zercheck_ir.c each propagated a different
+subset of IRHandleInfo fields. Most missed `pool_name` / `pool_name_len`
+silently — making F3.2's wrong-pool walker (which keys on pool_name)
+skip the check (`if (!h->pool_name) return`).
+
+**Root cause**: anti-pattern from refactor_ir.md Section 6.2 — alias
+propagation hand-coded as field-by-field assignments at every site.
+When new fields are added (F3.2 added pool_name+len), only sites the
+author remembered get updated. This was bug class #4-6 from the
+refactor doc (BUG-468/469, BUG-660, F3.2-pool_name, plus 7 newly-found
+sites in this audit).
+
+**Sites affected** (lines after edit):
+- IR_COPY (line 1581) — pre-fix had pool_name added in F3.2 but missing escaped
+- IR_CAST (line 1635) — missing pool_name+len, is_thread_handle
+- IR_ASSIGN compound key (line 1881) — missing pool_name+len, escaped, is_thread_handle
+- IR_ASSIGN orelse-ident (line 1916) — had pool_name, missing escaped (+ latent UAF: only 2 fields snapshotted)
+- IR_ASSIGN @ptrcast (line 2000) — missing pool_name+len, is_thread_handle
+- IR_ASSIGN interior pointer `&b.c` (line 2037) — missing pool_name+len, escaped, is_thread_handle
+- IR_ASSIGN ident-alias (line 2152) — missing pool_name+len, escaped
+- IR_FIELD_WRITE compound key (line 2922) — most incomplete: only state/alloc_line/alloc_id
+- IR_INDEX_WRITE compound key (line 2983) — same as IR_FIELD_WRITE
+
+Plus latent UAF in compound-key paths: `rh->field` read AFTER
+`ir_add_compound_handle(ps, ...)` which may realloc `ps->handles`.
+
+**Fix**: implemented refactor_ir.md helper 6.2 (`ir_alias_copy_provenance`).
+Added `IRAliasSnapshot` struct + `ir_snapshot_alias` + `ir_apply_alias`.
+Every alias-copy site now follows the same 3-line pattern:
+
+```c
+IRAliasSnapshot snap;
+ir_snapshot_alias(&snap, src_h);                  /* before realloc */
+IRHandleInfo *dst_h = ir_add_handle(ps, ...);     /* may realloc */
+if (dst_h) {
+    ir_apply_alias(dst_h, &snap);
+    dst_h->state = ...;                            /* caller sets state */
+}
+```
+
+Solves both the field-drift class and the latent realloc-UAF class.
+Future field additions to IRHandleInfo only need 2 line changes
+(IRAliasSnapshot struct + ir_snapshot_alias/apply pair).
+
+**Tests** (new):
+- `tests/zer_fail/wrong_pool_compound_alias.zer`
+- `tests/zer_fail/wrong_pool_optional_alias.zer`
+- `tests/zer_fail/wrong_pool_ptrcast_alias.zer`
+
+### Lattice merge missing FREED↔TRANSFERRED cells (BUG-662)
+
+**Symptom**: when a handle was FREED on one CFG predecessor and
+TRANSFERRED on another, the merge `ir_merge_states` had no case for
+the pair — `rh->state` retained FREED, producing wrong diagnostic
+("use-after-free" instead of "consumed in some way"). Same code path
+catches the violation either way, so this is diagnostic-only (no new
+classes of silent gaps), but the lattice was non-monotonic.
+
+**Fix**: added 2 cells to the lattice cascade:
+- `(FREED, TRANSFERRED) → MAYBE_FREED`
+- `(TRANSFERRED, FREED) → MAYBE_FREED`
+
+### IR_LOCK leak on switch-expr early break (BUG-663)
+
+**Symptom**: `ir_lower.c` switch handler acquires IR_LOCK around the
+switch expression hoist (Gap 36 fix). On 3 internal error paths
+(`lower_expr` returns -1 for void/array, "shouldn't happen" per
+comment), code executes `break` without calling
+`emit_shared_unlock_after_cond`. If reached, runtime would deadlock
+on any subsequent shared access in the same function.
+
+**Fix**: each of the 3 early-break sites now releases the lock before
+exiting:
+- `ir_lower.c:2298` (union switch rvalue path)
+- `ir_lower.c:2323` (union switch addr-of lower_expr)
+- `ir_lower.c:2333` (non-union switch lower_expr)
+
+Currently unreachable (checker rejects void/array switch expressions),
+but defensive against future failure modes added to lower_expr.
+
+---
+
 ## Session 2026-05-04 — Phase F3.2: close remaining 2 narrow zercheck_ir gaps
 
 Closed Patterns 1 and 3 from the F3 leftovers documented in

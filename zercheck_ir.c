@@ -238,52 +238,6 @@ static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
     return h;
 }
 
-/* Alias propagation helper: register `dest_local` as a bare-local alias
- * of `src_h`. Snapshots EVERY tracked field of `src_h` BEFORE calling
- * ir_add_handle (which may realloc ps->handles, invalidating src_h).
- *
- * This consolidates the snapshot+propagate pattern that was previously
- * duplicated across 7 sites (IR_COPY, IR_CAST, IR_ASSIGN orelse/ident/
- * ptrcast/interior/bare-ident paths). Inconsistent fields between sites
- * historically caused:
- *   - IR_CAST silently dropped pool_name → wrong-pool through @ptrcast
- *     round-trip was undetected
- *   - IR_ASSIGN bare-ident alias dropped pool_name + escaped → false
- *     leak reports + missed wrong-pool
- *
- * Returns the destination handle (or NULL on alloc failure). All caller
- * usages should treat NULL as best-effort skip (state already tracked
- * on src_h; missing alias is silent but conservative).
- *
- * NOTE: does NOT propagate `free_line` (only set when state transitions
- * to FREED via ir_propagate_alias_state) and does NOT propagate `path`
- * (this helper is for BARE-local aliases only — compound aliases need
- * the path argument explicitly via ir_add_compound_handle). */
-static IRHandleInfo *ir_alias_bare_handle(IRPathState *ps, int dest_local,
-                                          IRHandleInfo *src_h) {
-    if (!src_h) return NULL;
-    /* Snapshot all fields before realloc-capable add. */
-    IRHandleState s_state    = src_h->state;
-    int           s_aline    = src_h->alloc_line;
-    int           s_aid      = src_h->alloc_id;
-    bool          s_escaped  = src_h->escaped;
-    int           s_color    = src_h->source_color;
-    bool          s_th       = src_h->is_thread_handle;
-    const char   *s_pname    = src_h->pool_name;
-    uint32_t      s_pname_l  = src_h->pool_name_len;
-    IRHandleInfo *dst_h = ir_add_handle(ps, dest_local);
-    if (!dst_h) return NULL;
-    dst_h->state             = s_state;
-    dst_h->alloc_line        = s_aline;
-    dst_h->alloc_id          = s_aid;
-    dst_h->escaped           = s_escaped;
-    dst_h->source_color      = s_color;
-    dst_h->is_thread_handle  = s_th;
-    dst_h->pool_name         = s_pname;
-    dst_h->pool_name_len     = s_pname_l;
-    return dst_h;
-}
-
 /* Add a compound handle entry (or return existing). path must be arena-
  * allocated by the caller — this struct just stores the pointer. */
 static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
@@ -297,6 +251,72 @@ static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
         h->path_len = path_len;
     }
     return h;
+}
+
+/* ================================================================
+ * Alias-copy helper (audit 2026-06-04)
+ *
+ * Solves the recurring "new IRHandleInfo field added but not propagated
+ * to all alias-copy sites" bug class. Refactor_ir.md helper 6.2 spec.
+ *
+ * Background: aliasing is when one local handle entry is created
+ * representing the same underlying allocation as another. Each
+ * call to ir_add_handle/ir_add_compound_handle may realloc ps->handles,
+ * invalidating the source pointer — so a SNAPSHOT must be taken
+ * BEFORE the add-capable call (audit 2026-04-26, BUG-617 family).
+ *
+ * Sites missing partial fields silently break safety checks:
+ * - pool_name missing → wrong-pool detection (F3.2) bypassed
+ * - escaped missing → false leak warnings on aliases that escape via src
+ * - is_thread_handle missing → spawn-no-join detection bypass
+ * - source_color missing → leak detection treats pool-aliases as malloc
+ *
+ * USAGE PATTERN:
+ *   IRAliasSnapshot snap;
+ *   ir_snapshot_alias(&snap, src_h);
+ *   IRHandleInfo *dst_h = ir_add_handle(ps, dest_local);  // may realloc
+ *   if (dst_h) {
+ *       ir_apply_alias(dst_h, &snap);
+ *       dst_h->state = ...;  // caller sets state explicitly (alive/inherit/etc)
+ *   }
+ * ================================================================ */
+
+typedef struct {
+    int alloc_line;
+    int free_line;
+    int alloc_id;
+    int source_color;
+    bool escaped;
+    bool is_thread_handle;
+    const char *pool_name;
+    uint32_t pool_name_len;
+    IRHandleState state;  /* snapshot of source state, available if caller wants to inherit */
+} IRAliasSnapshot;
+
+static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
+    snap->alloc_line = src->alloc_line;
+    snap->free_line = src->free_line;
+    snap->alloc_id = src->alloc_id;
+    snap->source_color = src->source_color;
+    snap->escaped = src->escaped;
+    snap->is_thread_handle = src->is_thread_handle;
+    snap->pool_name = src->pool_name;
+    snap->pool_name_len = src->pool_name_len;
+    snap->state = src->state;
+}
+
+/* Copy all alias-provenance fields from snapshot to dst. State NOT copied —
+ * caller sets state explicitly based on context (alive on creation,
+ * inherit on alias, etc). Use snap->state if you want to inherit. */
+static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
+    dst->alloc_line = snap->alloc_line;
+    dst->free_line = snap->free_line;
+    dst->alloc_id = snap->alloc_id;
+    dst->source_color = snap->source_color;
+    dst->escaped = snap->escaped;
+    dst->is_thread_handle = snap->is_thread_handle;
+    dst->pool_name = snap->pool_name;
+    dst->pool_name_len = snap->pool_name_len;
 }
 
 /* ================================================================
@@ -508,7 +528,12 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
      * (local_id, path, path_len). For the second loop's add-if-missing,
      * we use `ir_alloc_handle_slot` directly because `ir_add_handle`
      * goes through bare-only `ir_find_handle` and can't add a compound
-     * entry. */
+     * entry.
+     *
+     * On main today this bug is masked by AST `zercheck.c` running in
+     * parallel and catching it via different logic; the IR analyzer
+     * will be the sole exit-code driver after Phase G deletes
+     * zercheck.c, so the fix lands here pre-emptively. */
     for (int si = first_live + 1; si < state_count; si++) {
         if (states[si].terminated) continue; /* dead path, skip */
 
@@ -551,6 +576,14 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                 rh->state = IR_HS_MAYBE_FREED; /* widen — pred saw maybe-free */
             } else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_MAYBE_FREED) {
                 rh->state = IR_HS_MAYBE_FREED;
+            } else if (rh->state == IR_HS_FREED && ph->state == IR_HS_TRANSFERRED) {
+                /* audit 2026-06-04: pre-fix this pair fell through and
+                 * kept FREED, producing wrong diagnostic message
+                 * (use-after-free instead of "consumed in some way"). */
+                rh->state = IR_HS_MAYBE_FREED;
+            } else if (rh->state == IR_HS_TRANSFERRED && ph->state == IR_HS_FREED) {
+                rh->state = IR_HS_MAYBE_FREED;
+                rh->free_line = ph->free_line;
             }
             /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
              * MAYBE_FREED, keep it. Both same state → keep.
@@ -757,44 +790,9 @@ static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
     return false;
 }
 
-/* Substring match against destructor-convention keywords. Returns true
- * if `name` contains any of these case-sensitively (mirrors C/Unix and
- * common idioms). Used to widen the void-only signature heuristic to
- * also catch destructor-named functions with non-void return (e.g.,
- * `int close(int fd)` from POSIX, `int destroy_X(*X)` for app code).
- *
- * Gap 17 was originally fixed in zercheck.c with `name_looks_like_
- * destructor` but the implementation was lost during Phase F migration
- * (zercheck.c became a 150-line shim). Without this widening, bodyless
- * `int destroy_resource(*Resource)` was NOT recognized as a free, so
- * `destroy_resource(r); pool.free_ptr(r);` silently double-freed.
- *
- * Keywords (12): free, destroy, close, release, delete, dispose, drop,
- * cleanup, deinit, fini, shutdown, term. */
-static bool ir_name_looks_like_destructor(const char *name, uint32_t name_len) {
-    static const struct { const char *kw; uint32_t len; } kws[] = {
-        {"free",      4}, {"destroy",  7}, {"close",     5},
-        {"release",   7}, {"delete",   6}, {"dispose",   7},
-        {"drop",      4}, {"cleanup",  7}, {"deinit",    6},
-        {"fini",      4}, {"shutdown", 8}, {"term",      4},
-    };
-    for (size_t i = 0; i < sizeof(kws)/sizeof(kws[0]); i++) {
-        if (name_len < kws[i].len) continue;
-        for (uint32_t p = 0; p + kws[i].len <= name_len; p++) {
-            if (memcmp(name + p, kws[i].kw, kws[i].len) == 0) return true;
-        }
-    }
-    return false;
-}
-
 /* Check if a call is to a function that frees its first argument.
- * 1. Explicitly named "free"
- * 2. Bodyless void fn(*opaque/*T ...)        (signature heuristic)
- * 3. Bodyless non-void fn(*opaque/*T ...) AND name suggests destructor
- *    (Gap 17 mirror — restored 2026-04-29). Mirrors zercheck.c is_free_call
- *    so the IR-side analyzer matches the AST-side once Phase G flips
- *    primary. Without this, `int destroy(*Resource)` was a silent UAF
- *    in the IR analyzer. */
+ * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
+ * param (signature heuristic — catches destroy/close/cleanup patterns). */
 static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     if (!call || call->kind != NODE_CALL) return false;
     Node *callee = call->call.callee;
@@ -803,19 +801,14 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     /* Explicit "free" */
     if (callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0) return true;
-    /* Signature heuristic: bodyless function with *opaque/*T first param */
+    /* Signature heuristic: bodyless void fn(*opaque/*T ...) */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
         callee->ident.name, (uint32_t)callee->ident.name_len);
     if (!sym || !sym->is_function || !sym->func_node) return false;
     if (sym->func_node->func_decl.body) return false;
     Type *ret = sym->type;
     if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-    Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
-    bool ret_is_void = ret_eff && ret_eff->kind == TYPE_VOID;
-    bool name_is_dtor = zer_name_looks_like_destructor(
-        callee->ident.name, (uint32_t)callee->ident.name_len);
-    /* Void return → always heuristic-free. Non-void → only if destructor name. */
-    if (!ret_is_void && !(ret_eff && name_is_dtor)) return false;
+    if (!ret || type_unwrap_distinct(ret)->kind != TYPE_VOID) return false;
     if (sym->func_node->func_decl.param_count < 1) return false;
     Type *p0 = NULL;
     if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
@@ -823,14 +816,7 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
         p0 = sym->type->func_ptr.params[0];
     if (!p0) return false;
     p0 = type_unwrap_distinct(p0);
-    if (p0->kind != TYPE_POINTER && p0->kind != TYPE_OPAQUE) return false;
-    /* Tier 1: void return → free regardless of name. */
-    Type *ret = sym->type;
-    if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-    if (ret && type_unwrap_distinct(ret)->kind == TYPE_VOID) return true;
-    /* Tier 2: non-void return → require destructor-naming convention. */
-    return ir_name_looks_like_destructor(callee->ident.name,
-                                          (uint32_t)callee->ident.name_len);
+    return p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE;
 }
 
 /* ================================================================
@@ -945,12 +931,6 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
         return IRMC_ARENA_ALLOC;  /* arena.alloc(Type) takes type arg */
     }
     if (ml == 9 && memcmp(m, "alloc_ptr", 9) == 0) return IRMC_ALLOC_PTR;
-    /* arena.alloc_slice(T, n) returns ?[*]T — must be classified as ARENA
-     * alloc so that the resulting slice's source_color is ZC_COLOR_ARENA
-     * and arena.reset() correctly marks the slice as FREED. Without this,
-     * `?[*]T ms = ar.alloc_slice(T, n); ... ar.reset(); use(ms);` compiles
-     * silently and reads from invalidated arena memory at runtime. */
-    if (ml == 11 && memcmp(m, "alloc_slice", 11) == 0) return IRMC_ARENA_ALLOC;
     if (ml == 3 && memcmp(m, "get", 3) == 0) return IRMC_GET;
     if (ml == 4 && memcmp(m, "free", 4) == 0) return IRMC_FREE;
     if (ml == 8 && memcmp(m, "free_ptr", 8) == 0) return IRMC_FREE_PTR;
@@ -961,6 +941,13 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     if (ml == 5 && memcmp(m, "reset", 5) == 0) return IRMC_ARENA_RESET;
     if (ml == 12 && memcmp(m, "unsafe_reset", 12) == 0) return IRMC_ARENA_RESET;
     return IRMC_NONE;
+}
+
+/* Backward-compat wrapper for callsites that don't have Checker handy.
+ * Without checker, receiver-type validation is skipped (current behavior).
+ * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
+static IRMethodKind ir_classify_method_call(Node *call) {
+    return ir_classify_method_call_ex(NULL, call);
 }
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
@@ -1346,57 +1333,6 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         }
     }
 
-    /* Gap 38 follow-on (2026-05-05): `defer device_destroy(h)` where
-     * device_destroy is a user wrapper around `pool.free(h)`. Without
-     * this, registering a function-return Handle as ALIVE (Gap 38 fix
-     * above) caused false-positive leaks because the defer scanner
-     * didn't recognize the user wrapper as a free. Consult FuncSummary's
-     * frees_param[i] to mark args[i] FREED through user free-wrappers.
-     * Mirrors the IR_CALL FuncSummary apply path. */
-    if (zc && body && body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
-        body->expr_stmt.expr->kind == NODE_CALL) {
-        Node *call = body->expr_stmt.expr;
-        const char *fn_name = NULL;
-        uint32_t fn_name_len = 0;
-        if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
-            fn_name = call->call.callee->ident.name;
-            fn_name_len = (uint32_t)call->call.callee->ident.name_len;
-        }
-        if (fn_name && fn_name_len > 0) {
-            FuncSummary *summary = NULL;
-            for (int si = 0; si < zc->summary_count; si++) {
-                if (zc->summaries[si].func_name_len == fn_name_len &&
-                    memcmp(zc->summaries[si].func_name, fn_name,
-                           fn_name_len) == 0) {
-                    summary = &zc->summaries[si]; break;
-                }
-            }
-            if (summary && summary->frees_param) {
-                int npar = summary->param_count;
-                if (npar > call->call.arg_count) npar = call->call.arg_count;
-                for (int pi = 0; pi < npar; pi++) {
-                    if (!summary->frees_param[pi]) continue;
-                    Node *arg = call->call.args[pi];
-                    int root_local;
-                    const char *path;
-                    uint32_t path_len;
-                    if (ir_extract_compound_key(zc, func, arg,
-                                                 &root_local, &path, &path_len) != 0)
-                        continue;
-                    IRHandleInfo *h;
-                    if (path_len == 0) h = ir_find_handle(ps, root_local);
-                    else h = ir_find_compound_handle(ps, root_local, path, path_len);
-                    if (h && (h->state == IR_HS_ALIVE ||
-                              h->state == IR_HS_MAYBE_FREED)) {
-                        h->state = IR_HS_FREED;
-                        h->free_line = defer_line;
-                        ir_propagate_alias_state(ps, h, IR_HS_FREED, defer_line);
-                    }
-                }
-            }
-        }
-    }
-
     /* Recurse into block AND nested control-flow bodies (BUG-608).
      * Conservative: any reachable free inside defer marks handle FREED.
      * Misses some conditional-free double-detect but prevents false
@@ -1698,9 +1634,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "use of %s handle %%%d",
                 ir_state_name(src_h->state), inst->src1_local);
         }
-        /* Alias: dest inherits ALL of source's tracked fields via the
-         * unified helper (handles realloc-UAF snapshot internally). */
-        ir_alias_bare_handle(ps, inst->dest_local, src_h);
+        /* Alias: dest inherits source's alloc_id and state.
+         *
+         * UAF GUARD (audit 2026-04-26): src_h points into ps->handles which
+         * can be realloc'd by ir_add_handle below — using src_h after the
+         * add is a heap-use-after-free. Snapshot fields BEFORE the
+         * realloc-capable add.
+         *
+         * audit 2026-06-04: unified via ir_apply_alias to prevent
+         * field-drift bug class. */
+        IRAliasSnapshot snap;
+        ir_snapshot_alias(&snap, src_h);
+        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+        if (dst_h) {
+            ir_apply_alias(dst_h, &snap);
+            dst_h->state = snap.state;
+        }
         break;
     }
 
@@ -1746,34 +1695,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "use of %s handle %%%d in cast",
                 ir_state_name(src_h->state), inst->src1_local);
         }
-        /* UAF GUARD: snapshot fields before realloc-capable add (mirror of
-         * IR_COPY fix above).
-         *
-         * Gap A4 (2026-05-06): also propagate pool_name through IR_CAST so
-         * F3.2 wrong-pool detection works after C-style cast aliases (e.g.,
-         * `*Task t = (*Task)opaque_handle`). Pre-fix: IR_COPY propagated
-         * pool_name (F3.2) but IR_CAST didn't, leaving a silent gap where
-         * cross-pool misuse through cast alias was missed.
-         *
-         * NOTE: This site will be replaced by MvXYC's IRAliasSnapshot helper
-         * in a subsequent commit — keeping the inline form here intentionally
-         * for clean superseding diff. */
-        IRHandleState cast_state = src_h->state;
-        int cast_alloc_line = src_h->alloc_line;
-        int cast_alloc_id = src_h->alloc_id;
-        int cast_color = src_h->source_color;
-        bool cast_escaped = src_h->escaped;
-        const char *cast_pool = src_h->pool_name;
-        uint32_t cast_pool_len = src_h->pool_name_len;
+        /* UAF GUARD + alias-copy unification (audit 2026-06-04):
+         * snapshot fields before realloc-capable add. Pre-fix this site
+         * was missing pool_name+len and is_thread_handle, allowing wrong-
+         * pool checks to be bypassed via C-style pointer cast. */
+        IRAliasSnapshot snap;
+        ir_snapshot_alias(&snap, src_h);
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
-            dst_h->state = cast_state;
-            dst_h->alloc_line = cast_alloc_line;
-            dst_h->alloc_id = cast_alloc_id;
-            dst_h->source_color = cast_color;
-            dst_h->escaped = cast_escaped;
-            dst_h->pool_name = cast_pool;
-            dst_h->pool_name_len = cast_pool_len;
+            ir_apply_alias(dst_h, &snap);
+            dst_h->state = snap.state;
         }
         break;
     }
@@ -1920,53 +1851,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
                 else break;
             }
-
-            /* Gap A3 (2026-05-06): move-struct field-read transfers ownership.
-             *
-             * `Tok t = b.inner` where b.inner is a move struct:
-             * - lowers to IR_FIELD_READ %t1 = b.inner; IR_COPY first = %t1
-             * - the source compound (b, ".inner") MUST be marked TRANSFERRED
-             *   so subsequent &b.inner / b.inner reads = use-after-move.
-             *
-             * Pre-fix: only NODE_INDEX move-from-array-element was handled
-             * (in IR_ASSIGN's NODE_INDEX branch). Field-read move-transfer
-             * was silently dropped → `Tok t = b.inner; use(&b.inner)`
-             * compiled clean → silent UAM.
-             *
-             * Hosted + baremetal: silent UAM (struct copy in C makes b.inner
-             * still readable but logically invalid).
-             *
-             * Conditions: dest local exists and has move-tracking type, and
-             * the read is from a compound (path_len > 0) location. */
-            if (inst->dest_local >= 0 &&
-                inst->dest_local < func->local_count) {
-                Type *dest_type = func->locals[inst->dest_local].type;
-                if (ir_should_track_move(dest_type)) {
-                    int root_local;
-                    const char *path;
-                    uint32_t path_len;
-                    if (ir_extract_compound_key(zc, func, inst->expr,
-                                                 &root_local, &path,
-                                                 &path_len) == 0 &&
-                        path_len > 0) {
-                        IRHandleInfo *ch = ir_find_compound_handle(ps,
-                            root_local, path, path_len);
-                        if (ch && ch->state == IR_HS_TRANSFERRED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use after move: '%.*s' on local %%%d "
-                                "ownership transferred at line %d",
-                                (int)path_len, path, root_local,
-                                ch->free_line);
-                        }
-                        if (!ch) ch = ir_add_compound_handle(ps, root_local,
-                                                              path, path_len);
-                        if (ch) {
-                            ch->state = IR_HS_TRANSFERRED;
-                            ch->free_line = inst->source_line;
-                        }
-                    }
-                }
-            }
         }
         break;
     }
@@ -2042,7 +1926,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 target_expr->index_expr.index->kind != NODE_INT_LIT) {
                 ir_mark_local_escaped(ps, rhs_local);
             }
-            /* Compound key registration: `container.field = h` */
+            /* Compound key registration: `container.field = h`
+             *
+             * Pre-fix (audit 2026-06-04): only copied state/alloc_line/
+             * alloc_id/source_color — missing pool_name (wrong-pool bypass
+             * via struct field), escaped, is_thread_handle. Also had latent
+             * UAF: rh read after realloc-capable ir_add_compound_handle.
+             * Both fixed via unified ir_apply_alias snapshot pattern. */
             if (target_expr && rhs_local >= 0) {
                 IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
                 if (rh && rh->state == IR_HS_ALIVE) {
@@ -2053,55 +1943,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                                  &root_local, &path,
                                                  &path_len) == 0 &&
                         path_len > 0) {
-                        /* UAF GUARD (BUG-617 family + MLXDT F3.2 pool_name):
-                         * rh points into ps->handles which ir_add_compound_handle
-                         * below can realloc. Snapshot ALL fields BEFORE the add. */
-                        int s_alloc_line = rh->alloc_line;
-                        int s_alloc_id = rh->alloc_id;
-                        int s_color = rh->source_color;
-                        const char *r_pool = rh->pool_name;
-                        uint32_t r_pool_len = rh->pool_name_len;
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, rh);
                         IRHandleInfo *ch = ir_add_compound_handle(ps,
                             root_local, path, path_len);
                         if (ch) {
+                            ir_apply_alias(ch, &snap);
                             ch->state = IR_HS_ALIVE;
-                            ch->alloc_line = s_alloc_line;
-                            ch->alloc_id = s_alloc_id;
-                            ch->source_color = s_color;
-                            ch->pool_name = r_pool;
-                            ch->pool_name_len = r_pool_len;
                         }
-                    }
-                }
-            }
-
-            /* Gap A2 (2026-05-06): move-struct field-write transfers ownership.
-             *
-             * `b.field = t` where t is a move struct (or contains move fields)
-             * must mark t as TRANSFERRED. Subsequent use of t = use-after-move.
-             *
-             * Pre-fix the dead IR_FIELD_WRITE handler at line ~2882 had this
-             * logic, but ir_lower.c never emits IR_FIELD_WRITE — `obj.field=val`
-             * lowers to IR_ASSIGN with inst->expr=NODE_ASSIGN (passthrough).
-             * The actual safety logic must live here, not in the dead handler.
-             *
-             * Hosted + baremetal: silent UAM (the C `b.field = t` does a struct
-             * copy; t's bytes are still readable but represent stale state). */
-            if (target_expr && rhs_local >= 0 && rhs_local < func->local_count &&
-                (target_expr->kind == NODE_FIELD ||
-                 target_expr->kind == NODE_INDEX)) {
-                Type *rhs_type = func->locals[rhs_local].type;
-                if (ir_should_track_move(rhs_type)) {
-                    IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
-                    if (rh && ir_is_invalid(rh)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use of %s value (local %%%d) in field/index write",
-                            ir_state_name(rh->state), rhs_local);
-                    }
-                    if (!rh) rh = ir_add_handle(ps, rhs_local);
-                    if (rh) {
-                        rh->state = IR_HS_TRANSFERRED;
-                        rh->free_line = inst->source_line;
                     }
                 }
             }
@@ -2118,34 +1967,24 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
             /* Orelse-wrapped ident: `h = mh orelse return`. The primary
              * is a NODE_IDENT referencing a tracked local. Alias the
-             * destination to source, mirroring the bare-ident path below. */
+             * destination to source, mirroring the bare-ident path below.
+             *
+             * audit 2026-06-04: pre-fix was missing `escaped`. Also had a
+             * latent UAF — only s_pool/s_pool_len were snapshotted; the
+             * other src_h-> reads after ir_add_handle could fault on
+             * realloc. Unified via ir_apply_alias. */
             if (inst->expr->kind == NODE_ORELSE && rhs && rhs->kind == NODE_IDENT) {
                 int src_local = ir_find_local_exact_first(func,
                     rhs->ident.name, (uint32_t)rhs->ident.name_len);
                 if (src_local >= 0) {
                     IRHandleInfo *src_h = ir_find_handle(ps, src_local);
                     if (src_h) {
-                        /* UAF GUARD (BUG-618/643 restored 2026-04-29 from tNGWB):
-                         * src_h points into ps->handles which can be realloc'd
-                         * by ir_add_handle below. Snapshot ALL fields BEFORE
-                         * the add. F3.2 pool_name+len included. Will be
-                         * replaced by MvXYC's IRAliasSnapshot helper. */
-                        IRHandleState s_state = src_h->state;
-                        int s_alloc_line = src_h->alloc_line;
-                        int s_alloc_id = src_h->alloc_id;
-                        int s_color = src_h->source_color;
-                        bool s_is_th = src_h->is_thread_handle;
-                        const char *s_pool = src_h->pool_name;
-                        uint32_t s_pool_len = src_h->pool_name_len;
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, src_h);
                         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                         if (dst_h) {
-                            dst_h->state = s_state;
-                            dst_h->alloc_line = s_alloc_line;
-                            dst_h->alloc_id = s_alloc_id;
-                            dst_h->source_color = s_color;
-                            dst_h->is_thread_handle = s_is_th;
-                            dst_h->pool_name = s_pool;
-                            dst_h->pool_name_len = s_pool_len;
+                            ir_apply_alias(dst_h, &snap);
+                            dst_h->state = snap.state;
                         }
                     }
                 }
@@ -2156,15 +1995,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * where arr is Token[N] and Token is a move struct transfers
              * ownership from arr[0]. Register compound handle (arr, "[0]")
              * as TRANSFERRED; subsequent access to arr[0] triggers UAF.
-             * Only handles literal-index (NODE_INT_LIT) compound keys.
-             *
-             * Gap A3 (2026-05-06): also covers NODE_FIELD — `Tok t = b.inner`
-             * where b.inner is a move struct field. Pre-fix: only NODE_INDEX
-             * was handled; field-read move-transfer was silently dropped, so
-             * `Tok t = b.inner; use(&b.inner)` compiled clean → silent UAM
-             * (struct copy in C makes b.inner still readable but logically
-             * invalid). Hosted + baremetal both miss the violation. */
-            if (rhs && (rhs->kind == NODE_INDEX || rhs->kind == NODE_FIELD) &&
+             * Only handles literal-index (NODE_INT_LIT) compound keys. */
+            if (rhs && rhs->kind == NODE_INDEX &&
                 inst->dest_local >= 0 &&
                 inst->dest_local < func->local_count &&
                 ir_should_track_move(func->locals[inst->dest_local].type)) {
@@ -2222,10 +2054,18 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             }
                         }
                         if (src_h) {
-                            /* Unified alias helper — includes pool_name +
-                             * is_thread_handle that the per-site snapshot
-                             * code historically missed. */
-                            ir_alias_bare_handle(ps, inst->dest_local, src_h);
+                            /* audit 2026-06-04: unified via ir_apply_alias.
+                             * Pre-fix was missing pool_name+len and
+                             * is_thread_handle — wrong-pool detection
+                             * silently bypassed via @ptrcast through
+                             * *opaque. */
+                            IRAliasSnapshot snap;
+                            ir_snapshot_alias(&snap, src_h);
+                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                            if (dst_h) {
+                                ir_apply_alias(dst_h, &snap);
+                                dst_h->state = snap.state;
+                            }
                         }
                     }
                 }
@@ -2234,7 +2074,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             /* Phase E: interior pointer tracking. `*T field_ptr = &b.c`
              * lowers to IR_ASSIGN with expr = NODE_UNARY(TOK_AMP, NODE_FIELD(b, c)).
              * field_ptr should share alloc_id with b so when b is freed,
-             * field_ptr is also flagged. Walk &expr down to root ident. */
+             * field_ptr is also flagged. Walk &expr down to root ident.
+             *
+             * audit 2026-06-04: pre-fix was missing pool_name+len, escaped,
+             * is_thread_handle — wrong-pool detection bypassed via
+             * `*T fp = &b.field; Handle k = *fp;` interior pointer chain. */
             if (rhs && rhs->kind == NODE_UNARY && rhs->unary.op == TOK_AMP) {
                 Node *target = rhs->unary.operand;
                 /* Walk field/index chain to the root ident */
@@ -2249,12 +2093,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (base_local >= 0) {
                         IRHandleInfo *base_h = ir_find_handle(ps, base_local);
                         if (base_h && base_h->alloc_id != 0) {
-                            /* Unified alias helper — includes pool_name +
-                             * escaped + is_thread_handle. Interior pointers
-                             * to pool-derived memory MUST inherit pool_name
-                             * so subsequent pool.free_ptr through them is
-                             * caught for wrong-pool. */
-                            ir_alias_bare_handle(ps, inst->dest_local, base_h);
+                            IRAliasSnapshot snap;
+                            ir_snapshot_alias(&snap, base_h);
+                            IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                            if (dst_h) {
+                                ir_apply_alias(dst_h, &snap);
+                                dst_h->state = snap.state;
+                            }
                         }
                     }
                 }
@@ -2318,60 +2163,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     /* Fall through — dest may still need tracking if get result is pointer */
-                } else if (mc == IRMC_NONE && inst->dest_local >= 0 &&
-                           inst->dest_local < func->local_count) {
-                    /* Gap 38 fix (2026-05-16): non-method function call
-                     * returning Handle(T) or ?Handle(T) — register dest
-                     * as fresh ALIVE allocation so double-free / UAF in
-                     * caller is tracked.
-                     *
-                     * Covers the orelse-wrapped case:
-                     *   Handle(Task) h = get_handle() orelse return;
-                     *
-                     * which lowers to `_zer_or1 = ASSIGN <orelse(call, ret)>`
-                     * and reaches IR_ASSIGN, not IR_CALL.
-                     *
-                     * The bare `?Handle(Task) mh = get_handle();` case
-                     * lowers to IR_CALL and is handled at the IR_CALL
-                     * site below (which also got TYPE_HANDLE wired in).
-                     *
-                     * SAFETY: registers with a fresh alloc_id and ALIVE
-                     * state. ZC_COLOR_UNKNOWN because we can't infer
-                     * which pool/slab the callee used internally;
-                     * pool_name remains NULL so cross-pool detection
-                     * doesn't false-positive across function boundaries.
-                     *
-                     * escaped=true is set so the leak-at-exit check
-                     * doesn't fire — the dest is the caller's local,
-                     * but ownership came from another function and the
-                     * caller may legitimately pass it along (return,
-                     * defer destructor, cross-function destroy). The
-                     * FREED state transition still works for the
-                     * double-free detection this gap was designed to
-                     * catch — escaped only suppresses the "alive at
-                     * function exit" warning, not state transitions. */
-                    Type *dt = func->locals[inst->dest_local].type;
-                    Type *eff = dt ? type_unwrap_distinct(dt) : NULL;
-                    if (eff && eff->kind == TYPE_OPTIONAL) {
-                        eff = type_unwrap_distinct(eff->optional.inner);
-                    }
-                    if (eff && eff->kind == TYPE_HANDLE) {
-                        IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
-                        if (h) {
-                            if (h->state == IR_HS_ALIVE &&
-                                !func->locals[inst->dest_local].is_temp) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "handle %%%d overwritten while alive — previous leaked",
-                                    inst->dest_local);
-                            }
-                            h->state = IR_HS_ALIVE;
-                            h->alloc_line = inst->source_line;
-                            h->alloc_id = _ir_next_alloc_id++;
-                            h->source_color = ZC_COLOR_UNKNOWN;
-                            h->escaped = true;
-                        }
-                        break;
-                    }
                 }
             }
             /* If source is an ident that's a tracked handle, create alias */
@@ -2411,33 +2202,26 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     } else {
                         /* Non-move: regular alias.
-                         * UAF GUARD (BUG-622 restored 2026-04-29): snapshot
-                         * src_h state BEFORE the alias-add path may realloc
-                         * ps->handles. The secondary ir_is_invalid check
-                         * after the if-block must read the snapshot, not
-                         * the (possibly stale) pointer. */
-                        IRHandleState src_state_snap =
-                            src_h ? src_h->state : IR_HS_UNKNOWN;
+                         *
+                         * audit 2026-06-04: pre-fix was missing pool_name+len
+                         * and escaped — wrong-pool detection bypassed when
+                         * alloc goes through ?Handle (which decomposes via
+                         * IR_ASSIGN-with-NODE_IDENT temps). Unified via
+                         * ir_apply_alias. */
                         if (src_h && src_h->state == IR_HS_ALIVE) {
-                            int alias_alloc_line = src_h->alloc_line;
-                            int alias_alloc_id = src_h->alloc_id;
-                            int alias_color = src_h->source_color;
-                            bool alias_is_th = src_h->is_thread_handle;
+                            IRAliasSnapshot snap;
+                            ir_snapshot_alias(&snap, src_h);
                             IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                             if (dst_h) {
+                                ir_apply_alias(dst_h, &snap);
                                 dst_h->state = IR_HS_ALIVE;
-                                dst_h->alloc_line = alias_alloc_line;
-                                dst_h->alloc_id = alias_alloc_id;
-                                dst_h->source_color = alias_color;
-                                dst_h->is_thread_handle = alias_is_th;
                             }
                         }
-                        /* Check use of invalid handle (use snapshot — src_h
-                         * may dangle after the add above realloc'd). */
-                        if (src_h && zer_handle_state_is_invalid(src_state_snap) != 0) {
+                        /* Check use of invalid handle */
+                        if (src_h && ir_is_invalid(src_h)) {
                             ir_zc_error(zc, inst->source_line,
                                 "use of %s handle %%%d",
-                                ir_state_name(src_state_snap), src_local);
+                                ir_state_name(src_h->state), src_local);
                         }
                     }
                 }
@@ -2650,39 +2434,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     ir_should_track_move(target_type);
                 bool root_is_move = ir_should_track_move(arg_type);
                 if (!target_is_move && !root_is_move) continue;
-
-                /* Gap A3 follow-up (2026-05-06): when target is a compound
-                 * (b.inner, arr[0].field), check the compound handle FIRST
-                 * — if it was already marked TRANSFERRED by an earlier
-                 * field-read move (`Tok t = b.inner`), passing &b.inner to
-                 * a function is use-after-move. Pre-fix: only bare handle
-                 * for root b was checked, so compound TRANSFERRED state
-                 * was silently ignored. */
-                IRHandleInfo *compound_h = NULL;
-                if (target_is_move &&
-                    (target->kind == NODE_FIELD ||
-                     target->kind == NODE_INDEX)) {
-                    int croot;
-                    const char *cpath;
-                    uint32_t cpath_len;
-                    if (ir_extract_compound_key(zc, func, target,
-                                                 &croot, &cpath,
-                                                 &cpath_len) == 0 &&
-                        cpath_len > 0) {
-                        compound_h = ir_find_compound_handle(ps, croot,
-                                                              cpath, cpath_len);
-                        if (compound_h && compound_h->state == IR_HS_TRANSFERRED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use after move: compound '%.*s' on local "
-                                "'%.*s' transferred at line %d",
-                                (int)cpath_len, cpath,
-                                (int)func->locals[arg_local].name_len,
-                                func->locals[arg_local].name,
-                                compound_h->free_line);
-                        }
-                    }
-                }
-
                 IRHandleInfo *h = ir_find_handle(ps, arg_local);
                 if (h && h->state == IR_HS_TRANSFERRED) {
                     ir_zc_error(zc, inst->source_line,
@@ -2878,20 +2629,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (arg_local >= 0) {
                         IRHandleInfo *arg_h = ir_find_handle(ps, arg_local);
                         if (arg_h) {
-                            /* UAF GUARD (BUG-619 restored 2026-04-29):
-                             * arg_h points into ps->handles which can be
-                             * realloc'd by ir_add_handle below. Snapshot
-                             * BEFORE the add. */
-                            IRHandleState a_state = arg_h->state;
-                            int a_alloc_line = arg_h->alloc_line;
-                            int a_alloc_id = arg_h->alloc_id;
-                            int a_color = arg_h->source_color;
                             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                             if (dh) {
-                                dh->state = a_state;
-                                dh->alloc_line = a_alloc_line;
-                                dh->alloc_id = a_alloc_id;
-                                dh->source_color = a_color;
+                                dh->state = arg_h->state;
+                                dh->alloc_line = arg_h->alloc_line;
+                                dh->alloc_id = arg_h->alloc_id;
+                                dh->source_color = arg_h->source_color;
                                 dest_aliased_from_param = true;
                             }
                         }
@@ -2918,35 +2661,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret = checker_get_type(zc->checker, inst->expr);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
-                /* Gap 38 (2026-05-05): TYPE_HANDLE returns must register the
-                 * dest as ALIVE so subsequent free()/double-free are tracked.
-                 * Without this, `?Handle(Task) mh = wrapper();` followed by
-                 * two `heap.free(h)` calls compiled silently.
-                 *
-                 * Restriction: only when summary->returns_color is a
-                 * KNOWN allocator (POOL/MALLOC). UNKNOWN-color funcs are
-                 * accessor/transfer wrappers (e.g., `pop_free()` from a
-                 * global queue) where the optional may legitimately be
-                 * null and the caller can't be assumed to own the result.
-                 * Pointer returns (TYPE_POINTER/OPAQUE) keep their
-                 * pre-existing conservative registration regardless of
-                 * color, mirroring zercheck.c:786-808. */
-                bool color_is_allocator = summary &&
-                    (summary->returns_color == ZC_COLOR_POOL ||
-                     summary->returns_color == ZC_COLOR_MALLOC);
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
-                                ret_eff->kind == TYPE_OPAQUE ||
-                                ret_eff->kind == TYPE_HANDLE))
-                    is_ptr_return = true;
-                if (ret_eff && ret_eff->kind == TYPE_HANDLE && color_is_allocator)
+                                ret_eff->kind == TYPE_OPAQUE))
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
-                                  inner->kind == TYPE_OPAQUE ||
-                                  inner->kind == TYPE_HANDLE))
-                        is_ptr_return = true;
-                    if (inner && inner->kind == TYPE_HANDLE && color_is_allocator)
+                                  inner->kind == TYPE_OPAQUE))
                         is_ptr_return = true;
                 }
                 if (is_ptr_return) {
@@ -2956,18 +2677,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->alloc_line = inst->source_line;
                         h->alloc_id = _ir_next_alloc_id++;
                         h->source_color = summary->returns_color;
-                        /* Gap 38 fix (2026-05-16): mark Handle returns
-                         * as escaped (see no-summary branch below for
-                         * full rationale). Same logic — ownership came
-                         * from a function, leak-at-exit shouldn't fire
-                         * but double-free / UAF still gets caught via
-                         * state transitions. */
-                        if (ret_eff && (ret_eff->kind == TYPE_HANDLE ||
-                            (ret_eff->kind == TYPE_OPTIONAL &&
-                             type_unwrap_distinct(ret_eff->optional.inner) &&
-                             type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
-                            h->escaped = true;
-                        }
                     }
                 }
             }
@@ -2990,42 +2699,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             bool treat_as_alloc = already_handled;
             if (!already_handled && inst->dest_local >= 0 &&
                 inst->dest_local < func->local_count) {
-                /* Check callee return type.
-                 *
-                 * Gap 38 (2026-05-16): include TYPE_HANDLE so functions
-                 * returning Handle(T) or ?Handle(T) get tracked exactly
-                 * like pool.alloc(). Without this, the pattern
-                 *
-                 *   ?Handle(Task) mh = get_handle();
-                 *   Handle(Task) a = mh orelse return;
-                 *   heap.free(a);
-                 *   heap.free(a);   // silently undetected double-free
-                 *
-                 * was untracked because get_handle()'s return was treated
-                 * as an opaque value, not an allocation. Pool/Slab handles
-                 * are 64-bit values (slot index + generation), so the
-                 * runtime gen check MIGHT catch the second free — but
-                 * only if the slot has been reallocated with a different
-                 * generation in between. In the common pattern above
-                 * (no realloc between the two frees), it is silent UB. */
+                /* Check callee return type */
                 Type *ret = checker_get_type(zc->checker, call);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
-                /* No-summary path: only register POINTER/OPAQUE returns as
-                 * ALIVE. Handle/?Handle without a summary means we can't
-                 * tell if the function allocates (vs. forwards an existing
-                 * handle from a global queue). The summary path above
-                 * gates on returns_color == POOL/MALLOC; without a summary
-                 * we have no signal at all, so register nothing. */
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
-                                ret_eff->kind == TYPE_OPAQUE ||
-                                ret_eff->kind == TYPE_HANDLE))
+                                ret_eff->kind == TYPE_OPAQUE))
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
-                                  inner->kind == TYPE_OPAQUE ||
-                                  inner->kind == TYPE_HANDLE))
+                                  inner->kind == TYPE_OPAQUE))
                         is_ptr_return = true;
                 }
                 /* Check if dest already has handle (e.g., arena-colored) */
@@ -3047,7 +2731,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->alloc_id = _ir_next_alloc_id++;
                     /* Detect cstdlib allocators by name */
                     bool is_stdlib = false;
-                    bool is_handle_return = false;
                     if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
                         uint32_t nlen = (uint32_t)call->call.callee->ident.name_len;
                         const char *nm = call->call.callee->ident.name;
@@ -3058,24 +2741,6 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     h->source_color = is_stdlib ? ZC_COLOR_MALLOC : ZC_COLOR_UNKNOWN;
-                    /* Gap 38 fix (2026-05-16): for Handle-returning
-                     * functions, mark escaped so leak-at-exit doesn't
-                     * fire — ownership came from another function and
-                     * the caller commonly passes the handle to a
-                     * destructor via defer or returns it. The FREED
-                     * state transition still works for double-free
-                     * detection (the original Gap 38 target). Without
-                     * this, the fix would regress every multi-module
-                     * test that creates a Handle from an imported
-                     * function and frees it via a defer destructor. */
-                    Type *dt = (inst->dest_local < func->local_count) ?
-                        func->locals[inst->dest_local].type : NULL;
-                    Type *dt_eff = dt ? type_unwrap_distinct(dt) : NULL;
-                    if (dt_eff && dt_eff->kind == TYPE_OPTIONAL)
-                        dt_eff = type_unwrap_distinct(dt_eff->optional.inner);
-                    if (dt_eff && dt_eff->kind == TYPE_HANDLE)
-                        is_handle_return = true;
-                    if (is_handle_return) h->escaped = true;
                 }
             }
 
@@ -3300,7 +2965,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * `s.handle = alloc_result` where alloc_result is an ALIVE local
          * registers (local_of_s, ".handle") as tracked, sharing alloc_id
          * with the bare local. When either is freed, the other's state
-         * propagates via ir_propagate_alias_state. */
+         * propagates via ir_propagate_alias_state.
+         *
+         * audit 2026-06-04: was most incomplete site — only copied state/
+         * alloc_line/alloc_id. Missing source_color, pool_name+len,
+         * escaped, is_thread_handle. Plus latent UAF (rh read after
+         * realloc). All fixed via ir_apply_alias. */
         if (target_expr && rhs_local >= 0) {
             IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
             if (rh && rh->state == IR_HS_ALIVE) {
@@ -3310,17 +2980,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (ir_extract_compound_key(zc, func, target_expr,
                                              &root_local, &path, &path_len) == 0
                     && path_len > 0) {
-                    /* UAF GUARD (BUG-620 restored 2026-04-29): rh points
-                     * into ps->handles which ir_add_compound_handle below
-                     * can realloc. Snapshot fields BEFORE the add. */
-                    int s_alloc_line = rh->alloc_line;
-                    int s_alloc_id = rh->alloc_id;
+                    IRAliasSnapshot snap;
+                    ir_snapshot_alias(&snap, rh);
                     IRHandleInfo *ch = ir_add_compound_handle(ps, root_local,
                                                                path, path_len);
                     if (ch) {
+                        ir_apply_alias(ch, &snap);
                         ch->state = IR_HS_ALIVE;
-                        ch->alloc_line = s_alloc_line;
-                        ch->alloc_id = s_alloc_id;
                     }
                 }
             }
@@ -3366,7 +3032,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             ir_mark_local_escaped(ps, rhs_local);
         }
         /* Phase B3: register compound handle for const array-index target.
-         * Variable indices aren't trackable (matches zercheck.c behavior). */
+         * Variable indices aren't trackable (matches zercheck.c behavior).
+         *
+         * audit 2026-06-04: same alias-copy field-drift as IR_FIELD_WRITE
+         * above. Fixed via ir_apply_alias unified helper. */
         if (target_expr && rhs_local >= 0) {
             IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
             if (rh && rh->state == IR_HS_ALIVE) {
@@ -3376,17 +3045,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (ir_extract_compound_key(zc, func, target_expr,
                                              &root_local, &path, &path_len) == 0
                     && path_len > 0) {
-                    /* UAF GUARD (BUG-621 restored 2026-04-29): rh points
-                     * into ps->handles which ir_add_compound_handle below
-                     * can realloc. Snapshot fields BEFORE the add. */
-                    int s_alloc_line = rh->alloc_line;
-                    int s_alloc_id = rh->alloc_id;
+                    IRAliasSnapshot snap;
+                    ir_snapshot_alias(&snap, rh);
                     IRHandleInfo *ch = ir_add_compound_handle(ps, root_local,
                                                                path, path_len);
                     if (ch) {
+                        ir_apply_alias(ch, &snap);
                         ch->state = IR_HS_ALIVE;
-                        ch->alloc_line = s_alloc_line;
-                        ch->alloc_id = s_alloc_id;
                     }
                 }
             }
@@ -4156,14 +3821,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (already) continue;
             if (covered_n >= covered_cap) {
-                int new_cap = covered_cap < 8 ? 8 : covered_cap * 2;
-                int *nc = (int *)realloc(covered_ids, new_cap * sizeof(int));
-                if (nc) {
-                    covered_ids = nc;
-                    covered_cap = new_cap;
-                }
-                /* On OOM: covered_cap unchanged, covered_n stays >= covered_cap,
-                 * so the write below is skipped — preserves buffer integrity. */
+                covered_cap = covered_cap < 8 ? 8 : covered_cap * 2;
+                int *nc = (int *)realloc(covered_ids, covered_cap * sizeof(int));
+                if (nc) covered_ids = nc;
             }
             if (covered_n < covered_cap)
                 covered_ids[covered_n++] = h->alloc_id;
@@ -4237,12 +3897,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 /* Remember this alloc_id so we don't report twice */
                 if (reported_n >= reported_cap) {
-                    int new_cap = reported_cap < 8 ? 8 : reported_cap * 2;
-                    int *nr = (int *)realloc(reported_ids, new_cap * sizeof(int));
-                    if (nr) {
-                        reported_ids = nr;
-                        reported_cap = new_cap;
-                    }
+                    reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                    int *nr = (int *)realloc(reported_ids, reported_cap * sizeof(int));
+                    if (nr) reported_ids = nr;
                 }
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
@@ -4263,13 +3920,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     (int)func->locals[h->local_id].name_len,
                     func->locals[h->local_id].name);
                 if (reported_n >= reported_cap) {
-                    int new_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                    reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
                     int *nr = (int *)realloc(reported_ids,
-                        new_cap * sizeof(int));
-                    if (nr) {
-                        reported_ids = nr;
-                        reported_cap = new_cap;
-                    }
+                        reported_cap * sizeof(int));
+                    if (nr) reported_ids = nr;
                 }
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
@@ -4309,25 +3963,13 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 "add th.join() or detach explicitly",
                 (int)t->name_len, t->name);
             if (rn_count >= rn_cap) {
-                int new_cap = rn_cap < 4 ? 4 : rn_cap * 2;
+                rn_cap = rn_cap < 4 ? 4 : rn_cap * 2;
                 const char **nn = (const char **)realloc(reported_names,
-                    new_cap * sizeof(char *));
+                    rn_cap * sizeof(char *));
                 uint32_t *nl = (uint32_t *)realloc(reported_name_lens,
-                    new_cap * sizeof(uint32_t));
-                /* Both reallocs must succeed; otherwise, the two arrays
-                 * could desync (cap bumped + only one ptr updated → OOB
-                 * write on the un-grown side). On any failure, leave
-                 * cap and pointers unchanged so the rn_count check
-                 * below skips the write. */
-                if (nn && nl) {
-                    reported_names = nn;
-                    reported_name_lens = nl;
-                    rn_cap = new_cap;
-                } else {
-                    /* Free the half that succeeded to avoid leaking. */
-                    if (nn && !nl) reported_names = nn;  /* keep, will be freed at end */
-                    if (nl && !nn) reported_name_lens = nl;
-                }
+                    rn_cap * sizeof(uint32_t));
+                if (nn) reported_names = nn;
+                if (nl) reported_name_lens = nl;
             }
             if (rn_count < rn_cap) {
                 reported_names[rn_count] = t->name;

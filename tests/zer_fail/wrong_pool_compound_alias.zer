@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// audit 2026-06-04: wrong-pool detection silently bypassed when handle
+// is aliased through a compound key (struct field assignment).
+// Pre-fix: c.h = h dropped pool_name during compound key registration
+// in IR_ASSIGN. Subsequent pool_b.get(c.h) returned without error.
+
+struct Task { u32 id; }
+struct Cell { Handle(Task) h; }
+
+Pool(Task, 4) pool_a;
+Pool(Task, 4) pool_b;
+
+void bypass() {
+    Handle(Task) h = pool_a.alloc() orelse return;
+    Cell c;
+    c.h = h;
+    // c.h aliases h — pool_name MUST propagate
+    u32 v = pool_b.get(c.h).id;  // wrong pool — must detect
+    pool_a.free(h);
+}

@@ -2396,9 +2396,18 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 addr_expr->unary.op = TOK_AMP;
                 addr_expr->unary.operand = sw_expr;
             } else {
-                /* Rvalue (call, binary, etc.): copy into tmp first, then &tmp */
+                /* Rvalue (call, binary, etc.): copy into tmp first, then &tmp.
+                 *
+                 * audit 2026-06-04: if lower_expr fails (void/array), we
+                 * MUST release the switch-expr lock before bailing.
+                 * Previous bare `break` left IR_LOCK without matching
+                 * IR_UNLOCK — runtime deadlock if any subsequent shared
+                 * access. */
                 int val_local = lower_expr(ctx, sw_expr);
-                if (val_local < 0) break; /* void/array — shouldn't happen for union */
+                if (val_local < 0) {
+                    emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+                    break;
+                }
                 IRLocal *vl = &ctx->func->locals[val_local];
                 Node *ident = (Node *)arena_alloc(ctx->arena, sizeof(Node));
                 memset(ident, 0, sizeof(Node));
@@ -2421,7 +2430,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             Type *ptr_to_union = type_pointer(ctx->arena, sw_type);
             checker_set_type(ctx->checker, addr_expr, ptr_to_union);
             int ptr_local = lower_expr(ctx, addr_expr);
-            if (ptr_local < 0) break;
+            if (ptr_local < 0) {
+                emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+                break;
+            }
             IRLocal *pl = &ctx->func->locals[ptr_local];
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));
@@ -2431,7 +2443,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             sw_ref->ident.name_len = (size_t)pl->name_len;
         } else {
             int val_local = lower_expr(ctx, node->switch_stmt.expr);
-            if (val_local < 0) break;
+            if (val_local < 0) {
+                /* audit 2026-06-04: release switch-expr lock on early break. */
+                emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+                break;
+            }
             IRLocal *vl = &ctx->func->locals[val_local];
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));

@@ -1,5 +1,62 @@
 # CLAUDE.md
 
+## ZER's Goal — Program-Consequence Coverage (Locked Architectural Commitment)
+
+**ZER's safety claim, stated precisely:**
+
+> ZER guarantees 100% program-consequence coverage: every wrong use of a value in ZER source code is caught at the use site. This includes embedded/firmware data — once a value crosses into ZER through a typed boundary (intrinsic return, MMIO read, cinclude function, linker symbol, asm output, source literal), it is program data and ZER verifies every program-level operation on it (bounds, type, qualifier, region, context, lifetime, ownership, escape, provenance). Hardware-consequence — peripheral side effects, datasheet-specific value correctness, silicon behavior — is floor, out of scope for any language, surfaced at the narrowest typed boundary for code review but not verified by the compiler.
+
+### The vocabulary that must not equivocate
+
+The word "consequence" carries two meanings; conflating them produces false claims:
+
+- **Program-consequence** — what happens when a value is used wrongly inside ZER source. Caught at 100%. The use is in the program, so ZER owns it.
+- **Hardware-consequence** — what happens when a hardware fact is wrong relative to user belief (peripheral doesn't actually clear on read, baud value is wrong-for-this-board). Floor. The fact lives in the datasheet, never enters the program, so ZER has nothing to verify.
+
+Any external claim must use the split. Never let one word "consequence" cover both meanings — that's the equivocation that produced earlier false "100% safe" framings.
+
+### The boundary
+
+ZER's boundary is **provenance of facts, not provenance of values.** Once a value crosses into ZER it is program data regardless of where it came from (hardware register, file, network, literal). Once a fact lives in the datasheet rather than the source, it is hardware-domain regardless of how closely the program relates to it. ZER is 100% over program-domain (operations on values in the program). ZER is silent on hardware-domain (silicon behavior, datasheet facts).
+
+### Why ZER exists
+
+ZER exists because escape hatches (Rust's `unsafe`, contract-based verification that accepts wrong user claims) compromise the safety theorem. ZER's theorem holds for all programs because:
+
+- **No in-language `unsafe` keyword.** The grammar enforces that values must enter through typed boundaries (checker.c:5601-5608 — no integer-to-pointer cast except through `@inttoptr` with mandatory `mmio`).
+- **Closure argument is grammar-enforced**, not "modulo `unsafe`." This is the position Anders et al. 2024 identified as "infinite unsafe impedance" — hypothetically possible but absent from production languages. ZER occupies it.
+- **No contract-based verification of hardware properties** (Definition B). User contracts about hardware can be wrong; ZER refuses to accept claims it cannot verify against reality. Instead: ZER provides explicit-intent primitives where the user's claim is visible at the use site (audit visibility) rather than hidden in contract specifications.
+- **Definition A scoping discipline.** ZER verifies access mechanism structurally; semantic correctness against external substrates (hardware spec, vendor HAL, linker script) is user responsibility supplied through primitive choice. The trust gap is bounded by frozen catalog (~33 safety classes, ~12 firmware structural relationships) — not unbounded per-call contracts.
+
+### Document map for the safety claim
+
+- **`docs/primitives-data-races.md`** — Definition A architecture across five safety domains (memory, type, ASM, concurrency, I/O), the closure argument, anti-patterns, the drift pattern documented in §22-23
+- **`docs/asm_lang_zer_safe.md`** — Level C (delegate ISA-specific to GCC) and Level D (user-extensible intrinsics with finite verifier)
+- **`docs/universal_pointer.md`** — 4-axis pointer safety with 8-desiderata conservation analysis
+- **`docs/firmware_safety_extensions.md`** — program-consequence vs hardware-consequence vocabulary, finite firmware shadow set, four firmware extension gaps (`@section`, region kinds as type discipline, vector table convention, linker symbols), explicit anti-patterns including the drift caught in earlier drafts
+- **`docs/proof-internals.md`** — Coq+Iris+VST proof infrastructure (author review pending per proof-internals.md disclosure)
+- **`docs/limitations.md`** — documented gaps that bound the "today" claim below the target (naked attribute IR-path drop, intrinsic VRP narrowing missing, bare-metal `.bss` zeroing build-system contract, ~2% opaque destructor heuristic). None permit silent program-consequence violations.
+
+### What ZER explicitly is NOT
+
+- Not "100% safe" without qualifier (that's the equivocation trap)
+- Not "memory safe with footnotes" (that's Rust's `unsafe` problem)
+- Not contract-based verification (that's SPARK; user contracts can be wrong about hardware)
+- Not a verified compiler for hardware semantics (no language is; the floor exists by physics)
+- Not "production-ready for any specific board" (requires vendor HAL + BSP work via cinclude)
+- Not a replacement for SPARK in safety-critical certified domains (different audience, different trade-off)
+
+### What ZER IS
+
+- Memory-safe systems language with grammar-level closure (no in-language `unsafe`)
+- 100% program-consequence coverage at the use site for every value in ZER source
+- Unified safety architecture across five domains via Definition A
+- Audit-visible primitive selection (user's hardware claim visible at use site, not hidden in contract spec)
+- Architecture-agnostic (delegates ISA to GCC, vendor-specific to user libraries via cinclude)
+- Currently shipping (publicly available, VS Code extension, GitHub repo)
+
+---
+
 ## ZER Language — Complete Quick Reference
 
 ZER is memory-safe C. Same syntax, same mental model — but the compiler prevents buffer overflows, use-after-free, null dereferences, and silent memory corruption. Compiles to C, then GCC handles backends.

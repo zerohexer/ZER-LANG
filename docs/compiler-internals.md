@@ -1,5 +1,38 @@
 # Compiler Internals — Read When Working on Specific Components
 
+## ZER's Goal — Why This Compiler Exists
+
+**The locked architectural commitment** (full statement in CLAUDE.md "ZER's Goal" section + `docs/firmware_safety_extensions.md`):
+
+> ZER guarantees 100% program-consequence coverage: every wrong use of a value in ZER source code is caught at the use site. Hardware-consequence — peripheral side effects, datasheet-specific value correctness, silicon behavior — is floor, out of scope for any language.
+
+**Vocabulary discipline that must not equivocate:**
+- **Program-consequence** = caught at 100%. The use is in the program (bounds, type, qualifier, region, context, lifetime, ownership, escape, provenance). ZER owns it.
+- **Hardware-consequence** = floor. The criterion lives in the datasheet, never enters the program. ZER cannot grip it.
+
+**The boundary**: provenance of FACTS, not provenance of VALUES. Once a value crosses into ZER through a typed boundary (intrinsic return, MMIO read via @inttoptr + volatile deref, cinclude function, linker symbol extern, asm output operand, source literal), it is program data regardless of origin. Every operation the program performs on it is program-domain and verified.
+
+**Why this matters for any compiler code change:**
+
+Every patch to checker.c, emitter.c, zercheck_ir.c, or ir_lower.c either:
+1. **Adds program-consequence coverage** (catches a new class of wrong uses at the use site) — strengthens the 100% claim toward the target
+2. **Closes a documented gap** (limitations.md lists current gaps: naked attribute IR-path drop, intrinsic VRP narrowing missing, .bss zeroing build-system contract, ~2% opaque destructor heuristic) — moves "today" closer to "target"
+3. **Refactors without changing safety surface** — neutral
+4. **Reduces safety surface or weakens coverage** — STOP. This violates the locked commitment. Re-derive against the goal before proceeding.
+
+If you find yourself proposing a change that would let a wrong program-consequence slip through (silently accepted unsafe operation, redefined safety class, weakened qualifier preservation, region-tag laundering), the change is wrong. The path forward is closing the gap, not adding an escape hatch. See `docs/firmware_safety_extensions.md` §23 "Anti-Patterns" for the drift patterns documented in this project's history.
+
+**The Anders et al. 2024 reference**: ZER occupies the "infinite unsafe impedance" position from the Unsafe Impedance paper — previously identified as hypothetically possible but absent from production languages. The grammar-level closure at `checker.c:5601-5608` is the load-bearing structural property. Any change that introduces an in-language `unsafe` keyword, or a path from raw integer to typed pointer outside `@inttoptr`+`mmio`, breaks this position. Don't.
+
+**Safety architecture documents to read before safety work**:
+- `CLAUDE.md` "ZER's Goal" section — the locked commitment and vocabulary
+- `docs/primitives-data-races.md` — Definition A across five safety domains
+- `docs/firmware_safety_extensions.md` — program-consequence vs hardware-consequence split, finite firmware shadow set
+- `docs/asm_lang_zer_safe.md` — Level C/D for asm safety
+- `docs/universal_pointer.md` — pointer safety decomposition
+
+---
+
 ## Pipeline Overview
 ```
 source.zer → Scanner (lexer.c) → Parser (parser.c) → AST (ast.h)

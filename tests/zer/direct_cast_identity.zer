@@ -1,0 +1,11 @@
+// Direct (*T)src cast where src is already *T (identity) — must compile + work.
+// This is the "elide" branch: types match, no provenance issue, no @pun needed,
+// no runtime check, zero overhead.
+
+i32 main() {
+    u32 x = 42;
+    *u32 p = &x;
+    *u32 q = (*u32)p;  // identity — types match
+    if (*q != 42) { return 1; }
+    return 0;
+}

@@ -5888,18 +5888,34 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-449: *A to *B direct cast (not through *opaque) — reject.
-             * Must go through *opaque round-trip for provenance tracking. */
+            /* BUG-449: *A to *B direct cast — reject when types differ.
+             * This is the corrected rule's "known mismatch → compile-time error"
+             * branch (see docs/asm_lang_zer_safe.md §1.7 lock + design discussion).
+             * For statically-known type mismatches, compile error is the right
+             * outcome: a bare C pointer carries no runtime type_id, so a runtime
+             * check at this site would be physically impossible to act on. The
+             * checker already knows the mismatch — it should say so directly.
+             *
+             * The explicit escape is @pun(*T, src), which inlines the *opaque
+             * round-trip with runtime type_id check. */
             if (src_eff->kind == TYPE_POINTER && tgt_eff->kind == TYPE_POINTER &&
                 src_eff->pointer.inner->kind != TYPE_OPAQUE &&
                 tgt_eff->pointer.inner->kind != TYPE_OPAQUE) {
                 Type *src_inner = type_unwrap_distinct(src_eff->pointer.inner);
                 Type *tgt_inner = type_unwrap_distinct(tgt_eff->pointer.inner);
                 if (src_inner && tgt_inner && !type_equals(src_inner, tgt_inner)) {
+                    /* type_name rotates between only 2 static buffers — calling
+                     * it 3 times in one printf causes the 3rd call to overwrite
+                     * the 1st result. Capture into locals first. */
+                    char src_buf[128];
+                    char tgt_buf[128];
+                    snprintf(src_buf, sizeof(src_buf), "%s", type_name(src_inner));
+                    snprintf(tgt_buf, sizeof(tgt_buf), "%s", type_name(tgt_inner));
                     checker_error(c, node->loc.line,
-                        "cannot cast '*%s' to '*%s' — use *opaque round-trip "
-                        "for type-punning",
-                        type_name(src_inner), type_name(tgt_inner));
+                        "cannot cast '*%s' to '*%s' — types differ. "
+                        "Use @pun(*%s, src) for explicit type-punning with "
+                        "runtime check, or @ptrcast through *opaque",
+                        src_buf, tgt_buf, tgt_buf);
                 }
             }
 
@@ -6130,6 +6146,59 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                    }
+                }
+            } else {
+                result = ty_void;
+            }
+        } else if (nlen == 3 && memcmp(name, "pun", 3) == 0) {
+            /* @pun(*T, expr) — ergonomic explicit type-punning intrinsic.
+             *
+             * Semantics: equivalent to @ptrcast(*T, @ptrcast(*opaque, expr))
+             * inlined. Wraps source in _zer_opaque with type_id from source's
+             * static type, then unwraps to target with runtime type_id check.
+             *
+             * Design decision: @pun deliberately does NOT fire a compile-time
+             * provenance mismatch error (the "C corrected rule" calls this
+             * the explicit escape — see docs/asm_lang_zer_safe.md §1.7 lock).
+             * Raw `(*T)src` errors at compile time on known mismatch (BUG-449);
+             * @pun lets the user explicitly opt-in, with the runtime type_id
+             * check providing the catch.
+             *
+             * Compile-time validation still fires for: target must be pointer,
+             * source must be pointer, const stripping, volatile stripping.
+             * Those preserve the language's other safety invariants. */
+            if (node->intrinsic.type_arg) {
+                result = resolve_type(c, node->intrinsic.type_arg);
+                /* target type must be a pointer */
+                if (result) {
+                    Type *res_eff = type_unwrap_distinct(result);
+                    if (res_eff->kind != TYPE_POINTER && res_eff->kind != TYPE_FUNC_PTR) {
+                        checker_error(c, node->loc.line,
+                            "@pun target must be a pointer type, got '%s'",
+                            type_name(result));
+                    }
+                }
+                if (node->intrinsic.arg_count > 0) {
+                    Type *val_type = typemap_get(c, node->intrinsic.args[0]);
+                    if (val_type) {
+                        Type *eff = type_unwrap_distinct(val_type);
+                        if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
+                            checker_error(c, node->loc.line,
+                                "@pun source must be a pointer, got '%s'",
+                                type_name(val_type));
+                        }
+                        /* const stripping — same as @ptrcast BUG-304 */
+                        if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
+                            result && result->kind == TYPE_POINTER &&
+                            !result->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "@pun cannot strip const qualifier — "
+                                "target must be const pointer");
+                        }
+                        /* volatile stripping — same as @ptrcast BUG-258 */
+                        check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
+                                             node->loc.line, "@pun");
                     }
                 }
             } else {

@@ -5,6 +5,174 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-06 — @pun intrinsic + corrected pointer-cast architecture
+
+Major architectural session locked the pointer-cast story in three pieces:
+(1) added `@pun(*T, src)` as the ergonomic explicit type-punning intrinsic
+that inlines the *opaque round-trip with runtime type_id check;
+(2) updated BUG-449 error message to point users at @pun instead of the
+verbose `*opaque` round-trip ceremony; (3) found and fixed a real compiler
+bug in checker.c (type_name buffer rotation) discovered while implementing
+the BUG-449 message. Plus an architecturally-significant lesson about the
+dual intrinsic-emission paths in emitter.c.
+
+The corrected pointer-cast rule (locked, see docs/asm_lang_zer_safe.md §1.7
+and the design-discussion summary in compiler-internals.md):
+
+| compile-time prov(source) | target | emit as |
+|---|---|---|
+| Known, == target | T | direct C cast — ELIDE (zero overhead) |
+| Known, ≠ target | U | COMPILE ERROR — definite bug, statically known |
+| Unknown (was through *opaque/cinclude/asm wrapper) | T | runtime type_id check via existing wrapper machinery |
+
+The runtime trap is ONLY for cases where compile-time provenance was cleared
+but a runtime type_id is carried in the `_zer_opaque` wrapper. A bare C
+pointer has no type_id field — a runtime check on it is physically
+impossible. So statically-known mismatches must be caught at compile time.
+This is what BUG-449 already does; @pun is the audit-visible escape for
+users who genuinely want to opt-in to the type-erasure event.
+
+### NEW-FEATURE-001: @pun intrinsic — ergonomic explicit type-punning
+
+**Why:** The previous escape for type-punning required manual `@ptrcast(*T,
+@ptrcast(*opaque, src))` — verbose enough that users avoided it, leading
+to "should I just allow raw casts?" architectural pressure. The design
+discussion (see compiler-internals.md "Pointer cast architecture" section)
+landed on `@pun` as the right shape: single intrinsic call, same runtime
+safety as the manual round-trip, audit-visible via the `@pun` name.
+
+**Semantics:** `@pun(*T, src)` desugars to an inline `_zer_opaque` wrap
+with `type_id` from source's static type, immediately unwrapped with the
+type_id check against target's type_id. Equivalent to
+`@ptrcast(*T, @ptrcast(*opaque, src))` but written as a single intrinsic.
+
+**Design decision — @pun does NOT fire a compile-time provenance check:**
+@pun is the explicit escape for users who want the type-punning even
+though the engine can statically prove a mismatch. The runtime type_id
+check provides the catch. Const stripping, volatile stripping, and
+non-pointer target are still rejected at compile time (those preserve
+other safety invariants).
+
+**Implementation:**
+- `checker.c` ~line 6135-6190 — `@pun` type-checking handler. Mirrors
+  `@ptrcast` for qualifier-preservation checks; skips the compile-time
+  provenance mismatch check.
+- `emitter.c` ~line 2871-2966 (AST path) AND ~line 6694-6779 (IR-rewritten
+  path) — emits the inline `_zer_opaque` wrap+unwrap with runtime
+  `_zer_trap("@pun type mismatch")` on type_id mismatch.
+
+**Tests:**
+- `tests/zer/pun_identity.zer` — *Sensor → *Sensor identity, compile + run + exit 0
+- `tests/zer/pun_from_opaque.zer` — *opaque → *Sensor via @pun, compile + run + exit 0
+- `tests/zer_trap/pun_type_mismatch_trap.zer` — *Task → *Socket pun, runtime trap
+- `tests/zer_fail/pun_const_strip.zer` — const-strip rejected at compile time
+- `tests/zer_fail/pun_non_pointer_target.zer` — non-pointer target rejected
+- `tests/zer_fail/direct_cast_points_to_pun.zer` — BUG-449 message points to @pun
+
+### BUG-700: type_name() buffer rotation overwrites earlier results in 3+-call printf
+
+**Symptom:** The updated BUG-449 error message
+"cannot cast '*Task' to '*Socket' — types differ. Use @pun(*Socket, src) ..."
+was emitting "Use @pun(*Task, src)" instead — wrong target type displayed
+in the hint, contradicting the rest of the message.
+
+**Reproducer:** Any `checker_error` or `printf` that calls `type_name()`
+three or more times with different types in a single call.
+
+**Root cause:** `types.c:518-523` — `type_name()` rotates between only
+TWO static buffers (`type_name_buf0`, `type_name_buf1`) based on
+`type_name_which++ & 1`. Calling it 3 times in one expression returns
+pointers in a rotation:
+- Call 1 returns `buf0`
+- Call 2 returns `buf1`
+- Call 3 returns `buf0` (overwriting Call 1's content)
+
+C99 does not specify argument evaluation order, so the actual write
+sequence depends on compiler choices. GCC's right-to-left evaluation
+caused the third `type_name(tgt_inner)` to be written first into `buf0`,
+followed by `type_name(tgt_inner)` into `buf1`, then `type_name(src_inner)`
+overwrote `buf0`. Final state: `buf0="Task"`, `buf1="Socket"`. The
+printf args (slot 1, slot 2, slot 3) resolved to (`buf0`, `buf1`, `buf0`)
+= (`"Task"`, `"Socket"`, `"Task"`). The third slot got the source name
+instead of the target name.
+
+**Fix:** Capture each `type_name()` result into a local `snprintf` buffer
+before formatting. `checker.c:5906-5921` now uses `char src_buf[128]` and
+`char tgt_buf[128]` populated via `snprintf` from `type_name`, then
+passes the local buffers to `checker_error`.
+
+**Test:** `tests/zer_fail/direct_cast_points_to_pun.zer` — verifies the
+@pun hint shows the correct target type name (*Socket, not *Task).
+
+**Files:** checker.c (~10 LOC change in BUG-449 message path).
+
+**Followup recommendation:** Audit other `checker_error` / `printf` sites
+in the codebase that call `type_name` multiple times. Either capture into
+locals, or fix `type_name()` itself to rotate through more buffers or
+use a per-call temp allocation strategy.
+
+### NEW-FEATURE-002: Dual intrinsic-emission paths in emitter.c documented
+
+**What was learned:** The emitter has TWO separate intrinsic dispatch paths
+that must both be updated when adding a new intrinsic:
+
+1. **AST path** at `emitter.c:2754-2870` — fires when emitting from the
+   original AST (via `emit_expr`/`emit_stmt`).
+2. **IR-rewritten path** at `emitter.c:6451-6694` — fires when emitting
+   from the IR-rewritten tree (via `emit_rewritten_node`).
+
+**How the gap was discovered:** First implementation of `@pun` added a
+handler in the AST path only. Test `pun_identity.zer` then segfaulted at
+runtime because the generated C contained:
+```c
+_zer_t6 = /* @pun */ 0;   // bare 0 (NULL) — IR path had no handler
+```
+The IR-rewriter dispatched `@pun` through the fallback path which emits a
+comment-stub `/* @pun */ 0`. The 0 was assigned to the result and
+dereferencing it crashed.
+
+**Fix:** Added the IR-path handler at `emitter.c:6694-6779` mirroring the
+AST-path handler at `emitter.c:2871-2966`. Both paths now emit the
+inline `_zer_opaque` wrap+unwrap with runtime type_id check.
+
+**Lesson for future intrinsic additions:** Every new intrinsic needs a
+handler in BOTH `emit_expr`'s intrinsic dispatch AND `emit_rewritten_node`'s
+intrinsic dispatch. The codebase has a discoverable pattern: search for
+the existing intrinsic by name (e.g., `grep -n '"ptrcast"' emitter.c`) and
+verify it appears in two places.
+
+**Test:** `tests/zer/pun_identity.zer` — would have caught this initially
+(was the test that revealed the bug); kept as regression coverage.
+
+**Followup recommendation:** Consider refactoring to a shared dispatch
+table or helper function so new intrinsics only need to be registered once.
+This is a maintenance hazard for the future.
+
+### BUG-701: BUG-449 error message verbose and pointed users to manual round-trip
+
+**Symptom:** The error for direct `*A → *B` cast where types differ said
+"use *opaque round-trip for type-punning" — which directed users to write
+verbose `@ptrcast(*T, @ptrcast(*opaque, src))`. After @pun shipped, this
+message was outdated.
+
+**Fix:** Updated message at `checker.c:5907-5921` to:
+"cannot cast '*Task' to '*Socket' — types differ. Use @pun(*Socket, src)
+for explicit type-punning with runtime check, or @ptrcast through *opaque"
+
+The new message:
+- States the actual problem ("types differ") not just the rejection
+- Points to @pun as the primary escape (ergonomic, audit-visible)
+- Keeps @ptrcast through *opaque as the alternative for users who want
+  the verbose explicit version
+
+**Test:** `tests/zer_fail/direct_cast_points_to_pun.zer` — verifies the
+hint appears with correct target type.
+
+**Files:** checker.c (BUG-449 message rewrite + buffer-rotation fix from
+BUG-700).
+
+---
+
 ## Session 2026-05-05 — Gap 38 closure + baremetal preamble portability
 
 Two distinct findings landed in this session: a UAF/double-free silent

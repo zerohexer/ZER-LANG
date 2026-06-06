@@ -2868,6 +2868,99 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ")");
             }
             if (_ptrcast_track) emit(e, ")"); /* close comma expr from check_alive */
+        } else if (nlen == 3 && memcmp(name, "pun", 3) == 0) {
+            /* @pun(*T, expr) — desugars to inline *opaque round-trip with
+             * type_id wrap + runtime check. Equivalent to:
+             *   @ptrcast(*T, @ptrcast(*opaque, expr))
+             * but emitted as a single block expression.
+             *
+             * Emits:
+             *   ({ _zer_opaque _pc = (_zer_opaque){(void*)(SRC), SRC_TID};
+             *      if (_pc.type_id != TGT_TID && _pc.type_id != 0)
+             *          _zer_trap("...", __FILE__, __LINE__);
+             *      (TGT_TYPE)_pc.ptr; })
+             *
+             * Runtime semantics: if SRC's type_id matches TGT's (identity or
+             * provenance-preserved round-trip), no trap. Otherwise trap.
+             * type_id == 0 sentinel matches anything (unknown provenance trust). */
+            Type *tgt_type = node->intrinsic.type_arg ?
+                resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            Type *src_type = (node->intrinsic.arg_count > 0) ?
+                checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+            Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+
+            /* determine source type_id */
+            uint32_t src_tid = 0;
+            if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
+                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
+                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
+                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
+                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+            } else if (src_eff && src_eff->kind == TYPE_OPAQUE) {
+                /* source already *opaque — its type_id flows through directly */
+                src_tid = 0; /* will be read from the source's actual struct field */
+            }
+
+            /* determine target type_id */
+            uint32_t tgt_tid = 0;
+            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
+                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
+                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
+                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+            }
+
+            /* If source is already *opaque, reuse its existing type_id and just
+             * unwrap with check (single FROM-*opaque step). */
+            bool src_is_opaque = (src_eff &&
+                ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+                  type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
+                 src_eff->kind == TYPE_OPAQUE));
+
+            if (src_is_opaque) {
+                /* @pun on already-opaque source — only emit the FROM-*opaque check */
+                if (tgt_tid > 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pn%d = ", tmp);
+                    if (node->intrinsic.arg_count > 0)
+                        emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, "; if (_zer_pn%d.type_id != %u && _zer_pn%d.type_id != 0) ",
+                         tmp, (unsigned)tgt_tid, tmp);
+                    emit(e, "_zer_trap(\"@pun type mismatch\", __FILE__, __LINE__); (");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")_zer_pn%d.ptr; })", tmp);
+                } else {
+                    /* target has no type_id (primitive pointer) — just unwrap .ptr */
+                    emit(e, "(");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, ").ptr");
+                }
+            } else {
+                /* @pun on raw typed pointer — emit full wrap+unwrap inline */
+                if (tgt_tid > 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pn%d = (_zer_opaque){(void*)(", tmp);
+                    if (node->intrinsic.arg_count > 0)
+                        emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, "), %u}; if (_zer_pn%d.type_id != %u && _zer_pn%d.type_id != 0) ",
+                         (unsigned)src_tid, tmp, (unsigned)tgt_tid, tmp);
+                    emit(e, "_zer_trap(\"@pun type mismatch\", __FILE__, __LINE__); (");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")_zer_pn%d.ptr; })", tmp);
+                } else {
+                    /* target has no type_id (primitive pointer like *u8) — plain cast */
+                    emit(e, "((");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, "))");
+                }
+            }
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             /* @bitcast(T, val) → memcpy type punning (valid C99+GCC) */
             if (node->intrinsic.type_arg) {
@@ -6595,6 +6688,80 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, ")");
+            }
+        } else if (nlen == 3 && memcmp(name, "pun", 3) == 0) {
+            /* @pun(*T, expr) — IR-rewritten emission path. Mirrors the
+             * AST emission at line ~2871. See that comment block for the
+             * full semantics description. */
+            Type *tgt_type = node->intrinsic.type_arg ?
+                resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            Type *src_type = (node->intrinsic.arg_count > 0) ?
+                checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+            Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
+            Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
+
+            uint32_t src_tid = 0;
+            if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
+                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
+                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
+                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
+                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+            }
+
+            uint32_t tgt_tid = 0;
+            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
+                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
+                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
+                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
+                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+            }
+
+            bool src_is_opaque = (src_eff &&
+                ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+                  type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
+                 src_eff->kind == TYPE_OPAQUE));
+
+            if (src_is_opaque) {
+                /* @pun on already-opaque source — FROM-*opaque check only */
+                if (tgt_tid > 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pn%d = ", tmp);
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "; if (_zer_pn%d.type_id != %u && _zer_pn%d.type_id != 0) "
+                         "_zer_trap(\"@pun type mismatch\", __FILE__, __LINE__); (",
+                         tmp, (unsigned)tgt_tid, tmp);
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")_zer_pn%d.ptr; })", tmp);
+                } else {
+                    emit(e, "((");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, ").ptr)");
+                }
+            } else {
+                /* @pun on raw typed pointer — full wrap+check inline */
+                if (tgt_tid > 0) {
+                    int tmp = e->temp_count++;
+                    emit(e, "({ _zer_opaque _zer_pn%d = (_zer_opaque){(void*)(", tmp);
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "), %u}; if (_zer_pn%d.type_id != %u && _zer_pn%d.type_id != 0) "
+                         "_zer_trap(\"@pun type mismatch\", __FILE__, __LINE__); (",
+                         (unsigned)src_tid, tmp, (unsigned)tgt_tid, tmp);
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")_zer_pn%d.ptr; })", tmp);
+                } else {
+                    /* target has no type_id (primitive *T like *u8) — plain cast */
+                    emit(e, "((");
+                    if (tgt_type) emit_type(e, tgt_type);
+                    emit(e, ")(");
+                    if (node->intrinsic.arg_count > 0)
+                        emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "))");
+                }
             }
         } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
             /* @inttoptr(*T, addr) — integer to pointer.

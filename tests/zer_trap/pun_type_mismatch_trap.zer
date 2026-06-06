@@ -1,0 +1,31 @@
+// @pun(*Socket, task_ptr) where task_ptr is statically *Task — the
+// inline *opaque wrap stamps type_id = Task, then the unwrap-with-check
+// fires because target's type_id is Socket. Runtime trap "@pun type mismatch".
+//
+// This is the load-bearing proof that @pun is safe: the compile-time
+// check is intentionally skipped (the user opted in via @pun), but the
+// runtime type_id check catches genuine type-confusion before any read
+// of the punned struct.
+//
+// Expected: SIGTRAP at runtime with "@pun type mismatch".
+
+struct Task { u32 id; u32 state; }
+struct Socket { u32 port; u32 fd; }
+
+Slab(Task) tasks;
+
+i32 main() {
+    ?*Task mt = tasks.alloc_ptr();
+    *Task t = mt orelse { return 1; };
+    t.id = 100;
+    t.state = 1;
+
+    // @pun: source is *Task, target is *Socket — type_id mismatch at runtime
+    *Socket s = @pun(*Socket, t);
+
+    // Never reached at runtime — trap fires above.
+    // The free is present so the static checker doesn't complain.
+    u32 port = s.port;
+    tasks.free_ptr(t);
+    return (i32)port;
+}

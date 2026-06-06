@@ -1,0 +1,13 @@
+// @pun cannot strip const qualifier — same rule as @ptrcast (BUG-304).
+// The @pun intrinsic still enforces qualifier preservation at compile time;
+// the only safety it bypasses is the prov-mismatch compile error (which it
+// converts into a runtime type_id trap via inlined *opaque round-trip).
+// Const preservation is structural and must hold.
+
+const u32 CONSTVAL = 42;
+
+i32 main() {
+    const *u32 p = &CONSTVAL;
+    *u32 mp = @pun(*u32, p);  // should be rejected — strips const
+    return 0;
+}

@@ -1,0 +1,11 @@
+// Direct cast between primitive integer pointer types — must reject.
+// *u32 → *u8 is a type-pun (different widths, different semantics).
+// The corrected rule says: known mismatch → compile-time error.
+// The error must point users to @pun if they really want to do this.
+
+i32 main() {
+    u32 x = 42;
+    *u32 p = &x;
+    *u8 byte = (*u8)p;  // direct cast — must fail
+    return (i32)byte;
+}

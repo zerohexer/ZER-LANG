@@ -1,0 +1,24 @@
+// @pun on an already-*opaque source — emits the FROM-*opaque check only
+// (skips the wrap step, reuses the existing type_id). Should pass when
+// the type_id matches.
+
+struct Sensor { u32 reading; u32 id; }
+Slab(Sensor) sensors;
+
+u32 main() {
+    ?*Sensor ms = sensors.alloc_ptr();
+    *Sensor s = ms orelse { return 1; };
+    s.reading = 99;
+    s.id = 3;
+
+    // Step 1: Sensor → *opaque (existing path sets type_id = Sensor's)
+    *opaque ctx = @ptrcast(*opaque, s);
+
+    // Step 2: @pun *opaque → *Sensor (FROM-*opaque path with type_id check)
+    *Sensor back = @pun(*Sensor, ctx);
+    if (back.reading != 99) { return 2; }
+    if (back.id != 3) { return 3; }
+
+    sensors.free_ptr(s);
+    return 0;
+}

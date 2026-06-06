@@ -55,6 +55,25 @@ ZER exists because escape hatches (Rust's `unsafe`, contract-based verification 
 - Architecture-agnostic (delegates ISA to GCC, vendor-specific to user libraries via cinclude)
 - Currently shipping (publicly available, VS Code extension, GitHub repo)
 
+### Critical Compiler-Implementation Gotchas (avoid wasted-cycle rediscovery)
+
+**Two emitter dispatch paths for intrinsics.** Every intrinsic needs a handler
+in BOTH `emitter.c` paths or the IR-rewriter falls through to a placeholder
+emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
+1. AST path — search `emitter.c` around line 2754 onward
+2. IR-rewritten path — search `emitter.c` around line 6451 onward
+
+When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
+`@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
+
+**`type_name()` uses 2-buffer rotation (types.c:518-523).** Calling
+`type_name(t)` 3+ times in a single `printf`/`checker_error` overwrites
+earlier results because there are only TWO static buffers. Symptoms: error
+messages show the wrong type name in the third slot. Fix: capture each
+`type_name` result into a local `snprintf` buffer before formatting.
+Discovered in BUG-700 (session 2026-06-06); same hazard exists everywhere
+`type_name` is composed in a single expression.
+
 ---
 
 ## ZER Language — Complete Quick Reference
@@ -130,20 +149,29 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
    if (x > 5) return 1;           // PARSE ERROR — "expected '{'"
    ```
 
-2. **C-style casts ARE supported** for type conversion. `@saturate` and `@bitcast` remain for the rare cases.
+2. **C-style casts ARE supported** for type conversion. `@saturate`, `@bitcast`, and `@pun` remain for the rare cases.
    ```
    (u32)small                     // OK — widening (or narrowing truncate)
    (f32)count                     // OK — int to float value convert
    (*opaque)sensor                // OK — *T to *opaque (sets provenance)
    (*Motor)ctx                    // OK — *opaque to *T (provenance checked)
+   (*Task)t                       // OK — identity cast where t is already *Task (elided, zero overhead)
    (*u32)int_val                  // ERROR — use @inttoptr (mmio safety)
    (u32)ptr                       // ERROR — use @ptrtoint
-   (*B)a_ptr                      // ERROR — *A to *B direct, use *opaque round-trip
+   (*B)a_ptr                      // ERROR — types differ. Use @pun(*B, src) for explicit pun
    (*u32)volatile_ptr             // ERROR — cannot strip volatile
    (*u32)const_ptr                // ERROR — cannot strip const
+   @pun(*Motor, sensor_ptr)       // OK — explicit type-punning with runtime type_id check
    @saturate(i8, big)             // OK — clamp to [-128, 127] (explicit only)
    @bitcast(u32, float_val)       // OK — reinterpret bits (explicit only)
    ```
+
+   **Pointer-cast rule (LOCKED — added 2026-06-06, see BUGS-FIXED.md session
+   2026-06-06):** Direct `(*T)src` where types match → elide, zero overhead.
+   Direct `(*U)src` where types differ → compile error pointing to `@pun`.
+   `@pun(*T, src)` → audit-visible escape, inlines *opaque round-trip with
+   runtime type_id check that traps on mismatch. For byte parsing use `[*]u8`
+   slices, not pointer casts.
 
 3. **Variable declarations: type before name, no `struct` keyword in usage.**
    ```
@@ -269,6 +297,7 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 @inttoptr(*T, addr)      integer to pointer (mmio-range-validated if ranges declared)
 @ptrtoint(ptr)           pointer to integer (usize)
 @ptrcast(*T, ptr)        pointer type cast (provenance-tracked, qualifier-checked)
+@pun(*T, src)            explicit type-pun (runtime type_id check, qualifier-checked, audit-visible escape for raw casts)
 @barrier()               full memory barrier (seq_cst)
 @barrier_store()         store barrier (release)
 @barrier_load()          load barrier (acquire)

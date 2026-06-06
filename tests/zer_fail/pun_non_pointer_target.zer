@@ -1,0 +1,14 @@
+// @pun(target, src) requires target to be a pointer type.
+// Non-pointer target → compile error.
+
+struct Task { u32 id; }
+Slab(Task) tasks;
+
+u32 main() {
+    ?*Task mt = tasks.alloc_ptr();
+    *Task t = mt orelse { return 1; };
+
+    // Should error: target u32 is not a pointer
+    u32 bad = @pun(u32, t);
+    return bad;
+}

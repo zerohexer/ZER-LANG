@@ -1,0 +1,13 @@
+// Verify the updated BUG-449 error message points users to @pun
+// for direct *A → *B casts when types differ.
+
+struct Task { u32 id; }
+struct Socket { u32 port; }
+
+i32 main() {
+    Task t;
+    t.id = 1;
+    *Task tp = &t;
+    *Socket sp = (*Socket)tp;  // direct cast — must fail with @pun hint
+    return (i32)sp.port;
+}

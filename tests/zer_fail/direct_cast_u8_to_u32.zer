@@ -1,0 +1,10 @@
+// Reverse direction: *u8 → *u32 direct cast also rejected.
+// This is the byte-buffer-to-struct pattern from C; ZER forces explicit
+// intent via @pun or slice access [*]u8.
+
+i32 main() {
+    u8 bytes = 0xAB;
+    *u8 bp = &bytes;
+    *u32 wp = (*u32)bp;  // direct cast — must fail
+    return (i32)*wp;
+}

@@ -1558,7 +1558,55 @@ remembers what type went in through `*opaque` round-trips.
 - Unknown provenance (function params, cinclude) → check skipped.
 
 **SEE ALSO**
-*opaque, @container
+*opaque, @pun, @container
+
+---
+
+### @pun(*T, src)
+
+**DESCRIPTION**
+Ergonomic explicit type-punning intrinsic. Casts a pointer to a different
+pointer type with a runtime type_id check that traps on mismatch.
+Equivalent to `@ptrcast(*T, @ptrcast(*opaque, src))` inlined as a single
+intrinsic call.
+
+Direct C-style cast `(*T)src` between different pointer types is rejected
+at compile time. `@pun` is the audit-visible escape: the user explicitly
+opts in to the type-erasure event, the runtime check catches genuine
+type confusion before any memory read.
+
+**EXAMPLE**
+```zer
+*Sensor s = sensors.get();
+*Sensor back = @pun(*Sensor, s);   // identity — type_id matches, no trap
+
+*Motor m = @pun(*Motor, s);        // type_id mismatch — runtime trap
+                                   // "@pun type mismatch" before m is used
+```
+
+**NOTES**
+- Compile-time: target must be a pointer, source must be a pointer,
+  const stripping rejected, volatile stripping rejected.
+- Runtime: traps on type_id mismatch via `_zer_trap("@pun type mismatch")`.
+- For raw byte access (parsing, serialization), use `[*]u8` slices —
+  not pointer casting. Slices are bounds-checked, len-carrying, and the
+  right tool for byte-level data.
+- For direct `(*T)src` where types match (identity), no `@pun` needed —
+  the compiler allows the cast directly with zero overhead.
+
+**WHEN TO USE**
+- You have a `*T` and genuinely need to view its bits as `*U` (different
+  type) and you accept the runtime check.
+- Audit visibility matters: `grep '@pun'` finds every type-erasure event
+  in the codebase.
+
+**WHEN NOT TO USE**
+- Identity casts (`*T → *T`) — just assign directly.
+- Byte parsing — use `[*]u8` slices.
+- Passing data through opaque APIs — use `*opaque` round-trip directly.
+
+**SEE ALSO**
+@ptrcast, *opaque, [*]u8
 
 ---
 

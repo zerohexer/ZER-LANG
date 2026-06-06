@@ -1,0 +1,9 @@
+// *u16 → *u32 direct cast — must fail.
+// Different widths, definite type confusion.
+
+i32 main() {
+    u16 small = 0xBEEF;
+    *u16 sp = &small;
+    *u32 wp = (*u32)sp;  // direct cast — must fail
+    return (i32)*wp;
+}

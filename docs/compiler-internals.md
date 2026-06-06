@@ -1160,6 +1160,235 @@ Both functions now call `emit_top_level_decl(e, decl, file_node, i)`. Adding a n
 - `_Alignof(T)` — type alignment (C11, supported by GCC/Clang)
 - These make the emitted C NOT portable to MSVC
 
+## Pointer Cast Architecture — Locked 2026-06-06
+
+This section captures the architectural design, contradictions found
+during design, the corrected rule, and implementation details for
+ZER's pointer-cast safety story. Read this end-to-end if working on
+anything touching casts, provenance, or pointer-type conversions.
+
+### The Locked Rule
+
+For every pointer-to-pointer cast (whether via C-style `(T*)src`, `@ptrcast`,
+or `@pun`):
+
+| compile-time prov(source) | target | emit as |
+|---|---|---|
+| Known, == target type | T | direct C cast — ELIDE (zero overhead) |
+| Known, ≠ target type | U | **COMPILE ERROR** — statically known mismatch |
+| Unknown (was through *opaque/cinclude/asm — already wrapped) | T | runtime `type_id` check via existing `_zer_opaque` wrapper machinery |
+
+**The runtime trap is ONLY for cases where compile-time provenance was
+cleared but a runtime `type_id` is carried in the `_zer_opaque` wrapper.**
+A bare C pointer has no `type_id` field — a runtime check on it is
+physically impossible. Hence statically-known mismatches MUST be caught
+at compile time.
+
+### Why this is architecturally proper (not pragmatic)
+
+The design discussion eliminated three other candidate rules. Each is
+worth understanding so future sessions don't accidentally reintroduce them:
+
+**A-smart (rejected — Definition B drift):** Add a compile-time "structural
+compatibility" predicate (same layout? same size? substructure relation?)
+and reject casts only when the predicate fails. Sounds reasonable but
+EVERY possible compatibility predicate either approves dangerous casts
+(layouts can match while semantics differ — *Task and *Socket can both be
+`u32 + u32`) or requires inventing new language concepts (nominal compat,
+substructure). This asks the compiler to JUDGE which casts are "OK" using
+a proxy that doesn't capture the actual semantic claim — embedding a
+semantic judgment the compiler can't ground-truth. This is the SPARK
+contract-trap shape applied at the cast site.
+
+**B-alone (rejected — bare-pointer runtime check is physically impossible):**
+Propagate provenance through all direct casts and rely on runtime check
+at use sites. The contradiction: the design "elides" matching casts to
+bare C pointers, but a bare pointer carries no `type_id` field — a
+"runtime check" on a bare pointer has no data to inspect. You can't have
+both "elided to bare" and "runtime trap later." If the cast is statically
+known wrong, the catch is COMPILE-TIME (no `type_id` needed); if the
+provenance is unknown, the value must already be wrapped (in which case
+the wrapper carries the `type_id`).
+
+**C-alone (rejected — invasive ABI change):** Make every cast result a
+fat pointer (`_zer_opaque {ptr, type_id}`) so the runtime check has data
+to read. This requires variables that hold cast pointers to change ABI,
+which propagates through the type system. Far more invasive than the
+problem warrants when compile-time analysis already catches the known
+cases.
+
+The corrected rule (locked) takes the best property from each: compile-
+time error where statically known (cheap, immediate, no runtime cost),
+runtime check where genuinely unknowable (uses the existing `_zer_opaque`
+machinery which already has `type_id`), no fat pointers, no ABI changes,
+no compiler-side semantic judgment.
+
+### Track-don't-judge applied to casts
+
+ZER's broader architecture pattern: the compiler TRACKS structural
+properties (volatile, region, color, provenance) and DOESN'T JUDGE
+semantic correctness. The locked cast rule honors this by:
+
+- Tracking provenance through identity-preserving operations (direct
+  cast where types match preserves prov; *opaque round-trip sets and
+  later checks prov; allocator return sets prov to the alloc type).
+- NOT judging whether a cross-type cast is "compatible enough" — instead
+  treating it as an explicit type-erasure event that requires the user
+  to acknowledge via `@pun` (or rejected outright if they didn't).
+- Catching at the explicit-event site (`@pun` does the runtime check)
+  rather than at every downstream use (which would require fat pointers).
+
+### Implementation locations
+
+**Compile-time rejection of mismatched direct casts (BUG-449):**
+- `checker.c:~5891-5921` — direct C-style cast handler. Rejects
+  `(*U)src` where source has known static type `*T` and T ≠ U.
+  Error message: "cannot cast '*T' to '*U' — types differ. Use
+  @pun(*U, src) for explicit type-punning with runtime check, or
+  @ptrcast through *opaque".
+- Uses `snprintf` to capture `type_name()` results into local buffers
+  before formatting — see BUG-700 below for why.
+
+**Compile-time provenance check (BUG-446) — fires when source is *opaque:**
+- `checker.c:~5856-5889` (C-style cast) — when source is `*opaque` with
+  known provenance, target type must match the recorded provenance.
+- `checker.c:~6094-6132` (@ptrcast) — same logic, dispatched via the
+  intrinsic name dispatch.
+
+**Compile-time provenance setting (BUG-446):**
+- `checker.c:~5906-5931` (C-style cast TO *opaque) — when assigning a
+  typed `*T` to `*opaque`, the *opaque variable's `provenance_type` is
+  set to `*T`. Walks through `&expr`, field, index to find the root
+  ident for the assignment.
+
+**Runtime *opaque wrap/unwrap machinery:**
+- `emitter.c:~2670-2730` (C-style cast, AST path) — three branches:
+  TO *opaque (wraps in `_zer_opaque {ptr, type_id}`), FROM *opaque
+  (unwraps `.ptr` with `type_id` check + `_zer_trap` on mismatch),
+  else (plain cast — used for identity and unknown-prov paths).
+- `emitter.c:~2792-2870` (@ptrcast, AST path) — same three branches.
+- `emitter.c:~2871-2966` (@pun, AST path — NEW) — always emits the
+  inline *opaque wrap+unwrap. Two sub-branches: source already *opaque
+  (skip wrap, do unwrap with check) vs source raw typed pointer (full
+  wrap+unwrap).
+- `emitter.c:~6451-6535` (C-style cast, IR-rewritten path) — same shape
+  as AST path.
+- `emitter.c:~6628-6694` (@ptrcast, IR-rewritten path) — same shape.
+- `emitter.c:~6694-6779` (@pun, IR-rewritten path — NEW) — mirrors AST
+  path.
+
+### @pun intrinsic (added 2026-06-06)
+
+**Why:** Manual `@ptrcast(*T, @ptrcast(*opaque, src))` is verbose enough
+that users avoided it, leading to architectural pressure to allow raw
+casts everywhere. @pun is the single-call ergonomic alternative.
+
+**Semantics:** Desugars to inline `_zer_opaque` wrap + unwrap with
+`type_id` check. Same runtime safety as the manual round-trip.
+
+**Compile-time behavior:**
+- Target must be pointer
+- Source must be pointer
+- Const stripping rejected (BUG-304 analog)
+- Volatile stripping rejected (BUG-258 analog)
+- **Provenance mismatch check is deliberately NOT fired** — `@pun` is
+  the escape for users who want type-punning even when the engine can
+  statically prove a mismatch. The runtime `type_id` check provides
+  the catch.
+
+**Runtime behavior:**
+- Wraps source in `_zer_opaque {ptr, src_type_id}` (source's static
+  type contributes `type_id`)
+- Immediately unwraps to target with check:
+  `if (type_id != target_type_id && type_id != 0) _zer_trap("@pun type mismatch")`
+- The `type_id != 0` sentinel allows passing through unknown-prov
+  pointers without trapping (matches existing FROM-*opaque semantics).
+
+**Code:** `checker.c:~6135-6190` (type-checker), `emitter.c:~2871-2966`
+(AST emission), `emitter.c:~6694-6779` (IR emission).
+
+### Tests for the locked rule
+
+| Test file | Purpose |
+|---|---|
+| `tests/zer/direct_cast_identity.zer` | `(*u32)p` where p is `*u32` — must compile, run, exit clean |
+| `tests/zer/pun_identity.zer` | `@pun(*Sensor, s)` identity — compiles, runs, exit 0 |
+| `tests/zer/pun_from_opaque.zer` | `@pun` on existing *opaque source — compiles, runs, exit 0 |
+| `tests/zer_trap/pun_type_mismatch_trap.zer` | `@pun(*Socket, task_ptr)` — runtime trap |
+| `tests/zer_fail/pun_const_strip.zer` | `@pun(*u32, const_ptr)` — compile error |
+| `tests/zer_fail/pun_non_pointer_target.zer` | `@pun(u32, ptr)` — compile error |
+| `tests/zer_fail/direct_cast_points_to_pun.zer` | `(*Socket)task_ptr` — error with @pun hint |
+| `tests/zer_fail/direct_cast_u32_to_u8.zer` | `(*u8)u32_ptr` — error with @pun hint |
+| `tests/zer_fail/direct_cast_u8_to_u32.zer` | `(*u32)u8_ptr` — error with @pun hint |
+| `tests/zer_fail/direct_cast_u16_to_u32.zer` | `(*u32)u16_ptr` — error with @pun hint |
+
+### Implementation gotchas discovered during this work
+
+**Gotcha 1 — Two intrinsic emission paths:** `emitter.c` has TWO separate
+intrinsic dispatch paths. Every new intrinsic needs a handler in BOTH or
+the IR path falls through to a placeholder emission (`/* @name */ 0`)
+that crashes at runtime when its result is dereferenced.
+
+- AST path: ~line 2754 onward (uses `emit_expr`)
+- IR-rewritten path: ~line 6451 onward (uses `emit_rewritten_node`)
+
+Discovery: first attempt at `@pun` only handled the AST path; the IR
+path emitted `_zer_t6 = /* @pun */ 0;` which segfaulted. Verify by
+running `grep -n '"intrinsic_name"' emitter.c` — should return at least
+two hits for any properly-wired intrinsic.
+
+**Gotcha 2 — `type_name()` buffer rotation:** `types.c:518-523` rotates
+between only TWO static buffers. Calling `type_name(t)` three or more
+times in a single expression (including `printf` arg lists) causes the
+third call to overwrite the first result.
+
+C99 doesn't specify argument evaluation order — GCC's right-to-left
+order causes the first arg slot to point to a buffer that was just
+overwritten by the third call.
+
+**Fix:** Always capture each `type_name` result into a local `snprintf`
+buffer before composing the format string. Pattern:
+
+```c
+char src_buf[128];
+char tgt_buf[128];
+snprintf(src_buf, sizeof(src_buf), "%s", type_name(src_type));
+snprintf(tgt_buf, sizeof(tgt_buf), "%s", type_name(tgt_type));
+checker_error(c, line, "... '%s' ... '%s' ... '%s' ...",
+              src_buf, tgt_buf, tgt_buf);
+```
+
+Discovered via BUG-700: the BUG-449 error message was emitting
+"Use @pun(*Task, src)" instead of "Use @pun(*Socket, src)" because the
+third format slot pointed to a buffer that had been overwritten by the
+first `type_name` call. **Recommendation:** audit other multi-call
+`type_name` sites in checker.c (and elsewhere) for the same hazard;
+consider fixing `type_name()` itself to use more buffers or per-call
+allocation.
+
+### Design discussion summary (for future sessions that revisit)
+
+A long architectural discussion explored whether to allow raw `(*T)src`
+casts freely (no @pun ceremony) with engine tracking compensating for
+safety. Three options were considered (A-smart, B-alone, C-alone),
+each rejected for the reasons in "Why this is architecturally proper"
+above. The locked rule above is what survived.
+
+A key catch (credit to a Claude review during the design discussion):
+the "B + cast-site runtime check" framing has a fatal contradiction —
+the runtime check needs a `type_id`, a bare pointer has none, and the
+elision claim ("bare pointer, zero overhead") was false to begin with.
+You can either have elided-to-bare OR runtime-trap-on-the-bare-pointer,
+not both. The corrected rule routes statically-known mismatches to
+compile-time error (no `type_id` needed) and routes already-wrapped
+unknown-prov values to runtime check (the wrapper provides the
+`type_id`). The two never collide.
+
+For byte parsing patterns (`*u8 → *T` view), the answer is `[*]u8`
+slices, not pointer casting. Slices are bounds-checked, len-carrying,
+and the right tool for byte-level data — they sidestep the pointer-cast
+question entirely.
+
 ## ZER-CHECK Architecture (Post-Phase-F-Migration, 2026-05-03)
 
 **As of 2026-05-03 (Phase F1+F2+F3 complete), the production safety

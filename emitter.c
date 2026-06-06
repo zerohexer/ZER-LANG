@@ -10416,6 +10416,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
      * old default emitted a comment-only stub (silent miscompile). If a new
      * IROpKind is added without a case, GCC -Wswitch flags it at compile
      * time. (IR_NOP is handled in the case block above.) */
+    }
 }
 
 /* Emit a regular (non-async) function from IR */

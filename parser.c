@@ -907,14 +907,27 @@ static Node *parse_primary(Parser *p) {
         /* intrinsics like @ptrcast(*T, expr) and @size(T) take a type as first arg */
         /* @cast always takes a named type (distinct typedef) — allow TOK_IDENT for it */
         /* BUG-316: allow named types (TOK_IDENT) as first arg for intrinsics
-         * that take type parameters: @cast, @bitcast, @truncate, @saturate */
+         * that take type parameters: @cast, @bitcast, @truncate, @saturate.
+         * AUDIT 2026-06-06 (GAP-E): also @ptrcast, @pun, @inttoptr,
+         * @container — without this, a typedef name as type argument is
+         * parsed as expression, type_arg stays NULL, and the checker falls
+         * through to result = ty_void; producing a confusing "cannot
+         * initialize 'p' of type '*T' with 'void'" error at the use site. */
         bool force_type_arg = (n->intrinsic.name_len == 4 &&
                                memcmp(n->intrinsic.name, "cast", 4) == 0) ||
                               (n->intrinsic.name_len == 7 &&
                                memcmp(n->intrinsic.name, "bitcast", 7) == 0) ||
                               (n->intrinsic.name_len == 8 &&
                                (memcmp(n->intrinsic.name, "truncate", 8) == 0 ||
-                                memcmp(n->intrinsic.name, "saturate", 8) == 0));
+                                memcmp(n->intrinsic.name, "saturate", 8) == 0)) ||
+                              (n->intrinsic.name_len == 7 &&
+                               memcmp(n->intrinsic.name, "ptrcast", 7) == 0) ||
+                              (n->intrinsic.name_len == 3 &&
+                               memcmp(n->intrinsic.name, "pun", 3) == 0) ||
+                              (n->intrinsic.name_len == 8 &&
+                               memcmp(n->intrinsic.name, "inttoptr", 8) == 0) ||
+                              (n->intrinsic.name_len == 9 &&
+                               memcmp(n->intrinsic.name, "container", 9) == 0);
         if (is_type_token(p->current.type) &&
             (p->current.type != TOK_IDENT || force_type_arg)) {
             n->intrinsic.type_arg = parse_type(p);

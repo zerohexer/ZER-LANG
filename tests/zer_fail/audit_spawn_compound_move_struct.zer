@@ -1,0 +1,29 @@
+// EXPECTED: compile error
+// AUDIT 2026-06-06 (GAP-C): IR_SPAWN handler only marks NODE_IDENT arguments
+// TRANSFERRED for move-struct ownership.
+//
+// zercheck_ir.c:3035-3045 iterates inst->args[] and explicitly checks
+// `inst->args[i]->kind == NODE_IDENT` before resolving arg_local. Compound
+// expressions like `b.t` (NODE_FIELD) or `arr[0]` (NODE_INDEX) are silently
+// skipped. The source compound is never transitioned to IR_HS_TRANSFERRED,
+// so subsequent use-after-move on the compound compiles cleanly.
+//
+// Compare zercheck_ir.c IR_FIELD_WRITE (line 3080+) and IR_ASSIGN's NODE_FIELD
+// handling — both DO resolve compound keys. The spawn handler should mirror.
+//
+// Witness: `spawn worker(t)` with bare local `t` IS caught (zercheck error),
+// confirming the gap is in the NODE_IDENT-only filter.
+move struct Tok { u32 kind; }
+
+struct Box { Tok t; }
+
+void worker(Tok t) { }
+
+i32 main() {
+    Box b;
+    b.t.kind = 1;
+    ThreadHandle th = spawn worker(b.t);  // b.t.kind ownership transferred
+    th.join();
+    u32 k = b.t.kind;     // SHOULD be detected as use-after-move
+    return (i32)k;
+}

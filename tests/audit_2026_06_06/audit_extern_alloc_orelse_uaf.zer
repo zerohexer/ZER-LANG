@@ -1,0 +1,33 @@
+// EXPECTED: compile error
+// AUDIT 2026-06-06 (GAP-B): Extern alloc returning `?*T` followed by orelse in
+// the same var-decl drops handle tracking.
+//
+// The IR_ASSIGN handler at zercheck_ir.c:2028-2263 unwraps orelse via
+// ir_unwrap_alloc_expr, but its method-call branch only registers a fresh
+// IR_HS_ALIVE handle for:
+//   - IRMC_ALLOC / IRMC_ALLOC_PTR / IRMC_ARENA_ALLOC builtin methods
+//   - IRMC_NONE + dest type == TYPE_HANDLE
+// It does NOT register handles for extern alloc that returns TYPE_POINTER
+// (e.g. `?*T my_alloc()`). The IR_CALL-level extern recognition at
+// zercheck_ir.c:2828-2900 doesn't fire because the outer instruction is
+// IR_ASSIGN.
+//
+// As a result, `my_free(p)` later sees no tracked handle for p and the
+// post-free use compiles cleanly.
+//
+// Witness: writing the call in two steps
+//   ?*Res maybe = my_alloc();
+//   *Res  p     = maybe orelse return;
+// DOES catch the UAF (different IR shape), confirming the gap is in the
+// fused var-decl + orelse extern-alloc path.
+struct Res { u32 fd; u32 val; }
+
+?*Res my_alloc();
+void my_free(*Res r);
+
+i32 main() {
+    *Res p = my_alloc() orelse return;
+    my_free(p);
+    u32 v = p.val;   // SHOULD be detected as use-after-free
+    return (i32)v;
+}

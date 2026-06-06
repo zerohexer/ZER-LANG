@@ -1,0 +1,30 @@
+// EXPECTED: compile error
+// AUDIT 2026-06-06 (GAP-A): Cross-function FuncSummary frees_param[i] silently
+// skips compound (NODE_FIELD) arguments.
+//
+// zercheck_ir.c:2962-3014 only resolves arg_local for NODE_IDENT and
+// decomposed call_arg_locals paths. For `free_handle(c.h)` where c.h is
+// NODE_FIELD, ir_extract_compound_key is NEVER called along the summary
+// path, so the compound handle's state is never marked FREED. The
+// subsequent direct `slab.free(c.h)` then sees it as ALIVE → silent
+// double-free at runtime.
+//
+// The ir_is_extern_free_call path at 2902-2942 DOES handle compound keys
+// (line 2910), so this gap is specific to the summary-driven path.
+struct Resource { u32 fd; }
+
+Slab(Resource) slab;
+
+struct Container { Handle(Resource) h; }
+
+void free_handle(Handle(Resource) h) {
+    slab.free(h);
+}
+
+i32 main() {
+    Container c;
+    c.h = slab.alloc() orelse return;
+    free_handle(c.h);    // summary says frees_param[0] = true, but c.h ignored
+    slab.free(c.h);      // SHOULD be detected as double-free
+    return 0;
+}

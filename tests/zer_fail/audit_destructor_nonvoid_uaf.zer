@@ -1,0 +1,35 @@
+// EXPECTED: compile error
+// AUDIT 2026-06-06 (GAP-D): IR's `ir_is_extern_free_call` lost the
+// destructor-name heuristic during the AST→IR migration.
+//
+// zercheck.c (now-deleted AST analyzer) used to call name_looks_like_destructor
+// to widen the bodyless-void-fn heuristic to non-void returns when the name
+// suggests a destructor (free, destroy, close, release, delete, dispose, drop,
+// cleanup, deinit, fini, shutdown, term).
+//
+// The IR replacement at zercheck_ir.c:796-820 only matches:
+//   1. Literal "free" by name
+//   2. Bodyless void function with pointer first arg
+//
+// A bodyless `i32 destroy_resource(*Resource r)` is neither. It's not
+// recognized as freeing `r`, so the UAF below compiles cleanly. Instead the
+// developer gets a misleading "never freed" leak warning (which is itself
+// a false positive — destroy_resource freed it, just not by the void
+// signature pattern).
+//
+// Lesson sites updated in docs/refactor_ir.md:2293 claim equivalence but
+// the implementation never ported name_looks_like_destructor.
+struct Resource { u32 fd; u32 val; }
+
+// Bodyless: destructor-convention name BUT non-void return. The widened
+// AST-era heuristic recognized this; IR-era heuristic does not.
+i32 destroy_resource(*Resource r);
+
+Slab(Resource) slab;
+
+i32 main() {
+    *Resource r = slab.alloc_ptr() orelse return;
+    i32 status = destroy_resource(r);  // r freed (per name convention)
+    u32 v = r.val;                       // SHOULD be detected as UAF
+    return (i32)v;
+}

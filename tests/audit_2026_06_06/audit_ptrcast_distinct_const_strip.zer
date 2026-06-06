@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// AUDIT 2026-06-06 (GAP-F): @ptrcast const/volatile-strip check uses raw
+// `result->kind == TYPE_POINTER` without unwrapping TYPE_DISTINCT.
+//
+// checker.c:6095-6101 and the check_volatile_strip call at 6103 both
+// pass `result` (the resolved target type) without unwrap. When the
+// target is a `distinct typedef` of a non-const pointer, `result->kind`
+// is TYPE_DISTINCT, so `result->kind == TYPE_POINTER` is false and the
+// strip-check is silently skipped.
+//
+// Downstream, `can_implicit_coerce` sees the assignment as plain
+// `*u32 = *u32` (after distinct unwrap on both sides) and accepts it.
+// The const qualifier was launder-stripped through the distinct wrapper.
+//
+// Witness: the same test with a NON-distinct typedef (`typedef *u32
+// PlainPtr;`) correctly fires the const-strip error because
+// resolve_type returns the underlying TYPE_POINTER directly. So the
+// gap is specific to `distinct typedef` targets.
+distinct typedef *u32 PlainPtr;
+
+i32 main() {
+    u32 ro = 42;
+    const *u32 cp = &ro;
+    PlainPtr mp = @ptrcast(PlainPtr, cp);   // SHOULD error: strips const
+    *mp = 100;                                // write through laundered const
+    return 0;
+}

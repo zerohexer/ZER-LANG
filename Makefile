@@ -78,11 +78,17 @@ test_fuzz: test_fuzz.c $(LIB_SRCS)
 test_semantic_fuzz: tests/test_semantic_fuzz.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+# Systematic exhaustive shape×violation matrix (drives the zerc binary, like
+# test_semantic_fuzz but deterministic + full-grid). -Wswitch enforces that
+# the grid can't silently shrink.
+test_shape_matrix: tests/test_shape_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -97,6 +103,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_production
 	./test_fuzz
 	./test_semantic_fuzz
+	./test_shape_matrix
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh

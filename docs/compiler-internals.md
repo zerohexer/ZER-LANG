@@ -9856,3 +9856,61 @@ zercheck changes. If it flags a new site, decide: distinct-possible result
 → `type_dispatch_kind`; provably-safe → baseline + justification. Never
 silence the gate by bumping nothing — the whole point is the conscious
 checkpoint.
+
+---
+
+## Shape×Violation Matrix Oracle — `tests/test_shape_matrix.c` (2026-06-07, "option A")
+
+The retired dual-run (Phase F collapsed zercheck.c into a delegating shim,
+so there's no longer an independent AST analyzer cross-checking the IR one)
+used to mask zercheck_ir gaps via disagreement. With it gone, the IR
+analyzer's case-coverage over program *shapes* is unchecked — which is
+exactly where the 2026-06-06 audit gaps (GAP-A/B/C: entity reached via
+`s.h` / `arr[0]` / cross-function arg) lived.
+
+`test_shape_matrix.c` is the systematic replacement. Where
+`test_semantic_fuzz.c` SAMPLES random programs, this ENUMERATES the full
+`reach-shape × violation` grid deterministically and asserts every cell:
+- the violating program is REJECTED (analyzer reaches the rule for this shape)
+- the safe counterpart COMPILES + RUNS (no over-rejection)
+
+### Why this is proof-grade for its property
+
+The grid is a finite product: `{bare, field(s.h), array[0], fnarg(xfn)} ×
+{uaf, double-free, leak}`. Enumerating a finite product *completely* is
+proof-by-exhaustion for case coverage — the property GAP-A/B/C violated.
+Coq/Iris (rule soundness) and VST (pure-predicate correctness) answer
+different questions and don't reach the CFG shape-dispatch code where these
+gaps live; exhaustive C over the finite shape domain is the correct tool.
+
+### The exhaustiveness discipline (what makes it a proof, not sampling)
+
+The axes are C enums (`ShapeKind`, `Violation`) switched with NO `default:`
+in `shape_prologue` / `free_stmt` / `gen` / the name helpers. Adding a new
+`ShapeKind` or `Violation` fails GCC `-Wswitch` at build time — the grid
+cannot silently shrink. Same discipline as RF14 walkers and the type-dispatch
+gate: the enforcement is what turns a test into an exhaustiveness guarantee.
+
+### What it found on first run
+
+22/24 — `field(s.h)/leak` and `array[0]/leak` GAP. The analyzer caught UAF
+and double-free for compound-key entities but laundered leak-at-exit when a
+handle was stored in a struct field or array element (BUG-702). Fixed in
+`zercheck_ir.c` (gate the `path_len > 0` leak skip on real allocation
+origin). Post-fix 24/24.
+
+### Extending the grid
+
+Add a new reach-shape (e.g., `SH_DEREF` for interior-pointer alias,
+`SH_SPAWN` for spawn-arg move-struct) or a new tracked type by extending the
+enum + the switch arms. `-Wswitch` will list every site that needs a case.
+Future axes worth adding: tracked-type dimension (Pool Handle is covered;
+add `*T`/alloc_ptr, `*opaque`/extern, move struct) and use-after-move /
+cross-module-summary violations. Each new cell is a permanent, exhaustively
+checked guarantee, not a sample.
+
+### Wiring
+
+`make check` builds + runs `test_shape_matrix` (standalone, drives the zerc
+binary like `test_semantic_fuzz`). Exit non-zero with a printed coverage
+matrix + the offending program when any cell GAPs.

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Handle stored in a struct field, never freed — a leak. Historically
+// laundered: compound-key entities were skipped in leak detection while the
+// bare-handle equivalent was rejected (found by test_shape_matrix.c 2026-06-07).
+struct T { u32 id; }
+struct Box { Handle(T) h; }
+Pool(T, 4) gp;
+i32 main() {
+    Box b;
+    b.h = gp.alloc() orelse return;
+    return 0;
+}

@@ -4196,7 +4196,18 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 if (loc->is_temp) continue;
                 if (loc->is_param) continue;
             }
-            if (h->path_len > 0) continue;  /* compound — skip */
+            /* Compound entities (s.h, arr[0]): historically skipped wholesale,
+             * which laundered real leaks — `b.h = gp.alloc()` never freed
+             * compiled clean while the bare-handle equivalent was rejected
+             * (found by tests/test_shape_matrix.c, 2026-06-07). Leak-check them
+             * too, but only when they carry a real allocation origin
+             * (source_color set + alloc_line known). Pure field-reads / param
+             * struct-field registrations (BUG-385) have UNKNOWN color and are
+             * skipped here — and param roots are already filtered above. The
+             * escaped / covered-alloc_id / move / temp filters guard the rest. */
+            if (h->path_len > 0 &&
+                (h->source_color == ZC_COLOR_UNKNOWN || h->alloc_line <= 0))
+                continue;
 
             /* Skip if alloc_id covered somewhere */
             bool covered = false;

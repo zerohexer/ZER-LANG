@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Handle stored in an array element, never freed — same compound-key leak gap.
+struct T { u32 id; }
+Pool(T, 4) gp;
+i32 main() {
+    Handle(T)[2] arr;
+    arr[0] = gp.alloc() orelse return;
+    return 0;
+}

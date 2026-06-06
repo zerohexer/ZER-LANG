@@ -5,6 +5,54 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 — Shape-matrix oracle finds compound-key leak gap
+
+### BUG-702 (HIGH) — handle stored in struct field / array element never leak-checked
+
+**Symptom:**
+```zer
+struct T { u32 id; }
+struct Box { Handle(T) h; }
+Pool(T, 4) gp;
+i32 main() {
+    Box b;
+    b.h = gp.alloc() orelse return;   // never freed
+    return 0;                          // COMPILED CLEAN — should be a leak error
+}
+```
+The bare-handle equivalent (`Handle(T) h = gp.alloc(); return 0;`) was
+correctly rejected as a leak. Storing the handle in a struct field (`b.h`)
+or array element (`arr[0]`) laundered the leak past detection. UAF and
+double-free WERE caught for those same shapes — only leak-at-exit slipped.
+
+**Root cause:** `zercheck_ir.c` leak-flag loop had
+`if (h->path_len > 0) continue;` — a wholesale skip of every compound-key
+entity. The comment called them "non-allocation," but `b.h = gp.alloc()`
+registers a compound handle that IS a real allocation (ALIVE, alloc_line,
+alloc_id, source_color=POOL). The blanket skip dropped it.
+
+**Fix:** Gate the skip on allocation origin instead of skipping all compound
+entities: leak-check compound handles that carry a real allocation origin
+(`source_color != ZC_COLOR_UNKNOWN && alloc_line > 0`). Pure field-reads and
+BUG-385 param struct-field registrations have UNKNOWN color and stay skipped;
+param roots are already filtered above; the escaped / covered-alloc_id /
+move / temp filters guard the rest. Full suite stayed green (no
+false-positive over-rejection in rust_tests / modules / fuzzer / integration).
+
+**How it was found:** `tests/test_shape_matrix.c` (NEW) — a systematic
+exhaustive `shape × violation` enumerator that asserts every reach-shape
+(bare / field / array / cross-function-arg) × violation (UAF / double-free /
+leak) is caught. First run: 22/24 (field-leak + array-leak GAP). Post-fix:
+24/24. This is "option A": proof-by-exhaustion over a finite grid, the
+class of oracle the retired dual-run used to provide.
+
+**Tests:**
+- `tests/zer_fail/leak_handle_in_struct_field.zer` — field leak rejected
+- `tests/zer_fail/leak_handle_in_array.zer` — array-element leak rejected
+- `tests/test_shape_matrix.c` — full grid, wired into `make check`
+
+---
+
 ## Session 2026-06-07 — Audit follow-up: close GAP-B and GAP-F
 
 Verified the audit branch `claude/cool-johnson-T0Al0` (4 fixes for

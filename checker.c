@@ -952,6 +952,11 @@ static bool expr_touches_local_derived(Checker *c, Node *expr) {
         return expr_touches_local_derived(c, expr->orelse.expr) ||
                expr_touches_local_derived(c, expr->orelse.fallback);
     default:
+        /* AUDIT-LOUD exempt: this default is intentional — leaf and statement
+         * nodes can't carry a chain to a local-derived pointer. New NODE_
+         * kinds that introduce arithmetic chains should be added as explicit
+         * cases above. Walker is for stack-escape-via-arithmetic detection
+         * (EW8I0 BUG-664); false negative here = safety hole. */
         return false;
     }
 }

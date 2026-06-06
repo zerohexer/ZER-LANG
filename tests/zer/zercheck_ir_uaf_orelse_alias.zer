@@ -1,0 +1,26 @@
+// Tests zercheck_ir.c BUG-618 — orelse-ident alias UAF in IR_ASSIGN.
+// 12 paired ?Handle + Handle = ... orelse return declarations grow
+// ps->handles past initial cap=8. Without the snapshot fix the analyzer
+// reads freed memory and may produce wrong leak/UAF decisions.
+// EXPECTED: compiles clean, exits 0 (proper alias tracking — no spurious
+// UAF, no spurious leak).
+struct Task { u32 id; }
+Slab(Task) heap;
+
+void main() {
+    ?Handle(Task) m1 = heap.alloc(); Handle(Task) h1 = m1 orelse return;
+    ?Handle(Task) m2 = heap.alloc(); Handle(Task) h2 = m2 orelse return;
+    ?Handle(Task) m3 = heap.alloc(); Handle(Task) h3 = m3 orelse return;
+    ?Handle(Task) m4 = heap.alloc(); Handle(Task) h4 = m4 orelse return;
+    ?Handle(Task) m5 = heap.alloc(); Handle(Task) h5 = m5 orelse return;
+    ?Handle(Task) m6 = heap.alloc(); Handle(Task) h6 = m6 orelse return;
+    ?Handle(Task) m7 = heap.alloc(); Handle(Task) h7 = m7 orelse return;
+    ?Handle(Task) m8 = heap.alloc(); Handle(Task) h8 = m8 orelse return;
+    ?Handle(Task) m9 = heap.alloc(); Handle(Task) h9 = m9 orelse return;
+    ?Handle(Task) m10 = heap.alloc(); Handle(Task) h10 = m10 orelse return;
+    ?Handle(Task) m11 = heap.alloc(); Handle(Task) h11 = m11 orelse return;
+    ?Handle(Task) m12 = heap.alloc(); Handle(Task) h12 = m12 orelse return;
+    heap.free(h1); heap.free(h2); heap.free(h3); heap.free(h4);
+    heap.free(h5); heap.free(h6); heap.free(h7); heap.free(h8);
+    heap.free(h9); heap.free(h10); heap.free(h11); heap.free(h12);
+}

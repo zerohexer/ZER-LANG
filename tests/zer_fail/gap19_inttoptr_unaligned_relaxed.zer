@@ -1,0 +1,12 @@
+// Gap 19 (BUG-641): under --no-strict-mmio the alignment check was
+// silently skipped because it was gated on c->mmio_range_count > 0.
+// Misaligned MMIO addresses cause SIGBUS on ARM/RISC-V or silent
+// corruption on Cortex-M0+. Alignment must fire even without ranges.
+//
+// EXPECTED: compile error — address 0x40000001 not aligned to 4 bytes for u32.
+
+i32 main() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40000001);
+    u32 v = reg[0];
+    return (i32)v;
+}

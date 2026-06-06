@@ -2,10 +2,12 @@
 
 **Status:** Planning document. Decision finalized 2026-05-12 (Level C).
 **Architectural pivot to Level D locked in 2026-05-31 (see Section 1.6).**
-Execution pending: Level C cleanup first, then Level D mechanism on top.
+**Architectural refinement to Option E — Three-Layer / No-Favored-ISA — locked in 2026-06-06 (see Section 1.7). READ SECTION 1.7 FIRST — it is the current locked architecture; Level D's `@intrinsic_def` mechanism survives but its layering and ISA-reference assumptions are refined.**
+Execution pending: Level C cleanup first, then Level D mechanism on top, with Option E's no-favored-ISA factoring applied.
 **Date:** 2026-05-05 (drafted), 2026-05-10 (audit), 2026-05-11 (Phase A/B split),
 2026-05-12 (Level C decision), 2026-05-12 (2-layer crystallization — see section 1.5),
-**2026-05-31 (Level D pivot — user-extensible intrinsics, see Section 1.6)**.
+2026-05-31 (Level D pivot — user-extensible intrinsics, see Section 1.6),
+**2026-06-06 (Option E — three-layer, no-favored-ISA, program-consequence vocabulary applied to asm, structure/semantics straddle observation — see Section 1.7).**
 **Supersedes:** the extension trajectory of `docs/asm_plan.md` (Session G Phase 5,
 Z9/Z10/Z13, per-instruction database growth, register-table maintenance,
 CPU feature gating tracking).
@@ -46,7 +48,8 @@ supports — automatically.
 1. [Executive Summary](#1-executive-summary)
 1.4. [Extended Discussion (2026-05-12 evening) — Full Context Dump](#14-extended-discussion-2026-05-12-evening--full-context-dump) ← **Full conversation context (Tier 2, regions, clobber, Rust comparison, trust gaps, explicit-intent pattern, 99% coverage goal, all deferred ideas)**
 1.5. [Final Design — Two-Layer Model (crystallization, 2026-05-12 evening)](#15-final-design--two-layer-model-crystallization-2026-05-12-evening) ← **Level C baseline (still correct)**
-1.6. [Level D Pivot — User-Extensible Intrinsics with Explicit Contracts (added 2026-05-31)](#16-level-d-pivot--user-extensible-intrinsics-with-explicit-contracts-added-2026-05-31) ← **READ FIRST — CURRENT LOCKED ARCHITECTURE**
+1.6. [Level D Pivot — User-Extensible Intrinsics with Explicit Contracts (added 2026-05-31)](#16-level-d-pivot--user-extensible-intrinsics-with-explicit-contracts-added-2026-05-31) ← **Mechanism still current; layering and ISA-reference refined by 1.7**
+1.7. [Option E Pivot — Three-Layer Architecture, No Favored ISA, Program-Consequence Vocabulary (added 2026-06-06)](#17-option-e-pivot--three-layer-architecture-no-favored-isa-program-consequence-vocabulary-added-2026-06-06) ← **READ FIRST — CURRENT LOCKED ARCHITECTURE FOR ASM**
 2. [The Decision in One Page](#2-the-decision-in-one-page)
 3. [The Transpiler Nature of ZER — Why This Works](#3-the-transpiler-nature-of-zer--why-this-works)
 4. [GCC Coverage in Embedded — Reality Check](#4-gcc-coverage-in-embedded--reality-check)
@@ -1164,12 +1167,14 @@ incrementally one intrinsic at a time. Not blocking.
 
 ## 1.6. Level D Pivot — User-Extensible Intrinsics with Explicit Contracts (added 2026-05-31)
 
+> **REFINED BY OPTION E (Section 1.7, added 2026-06-06).** Level D's `@intrinsic_def` mechanism, demand/promise asymmetry rule (§1.6.17), and missing-arch propagation rule (§1.6.18) survive unchanged. The layering described in §1.6.16 ("blessed @core::* with per-ISA dispatch authored by ZER team in core") is refined by Option E: ZER core ships the schema (closed category vocabulary) + the semantic operation taxonomy + the `@intrinsic_def` / `@bind` mechanism, with **zero per-ISA bindings in language core**. Per-ISA bindings (including for operations Level D would have called "blessed @core::*") live in Layer 2 libraries, structurally peer to community libraries. The packaging question of whether ZER team maintains a canonical Layer 2 binding library (e.g., `zer-asm-x86`) is separable from the safety architecture and decidable empirically. See §1.7 for the locked layering, the structure/semantics straddle observation, and the closed-vocabulary kind-difference from SPARK elevated to load-bearing thesis. The program-consequence vs hardware-consequence vocabulary locked in `CLAUDE.md` and `firmware_safety_extensions.md` applies to all of Level D's claims; "wrong contract poisons verifier reasoning about callers" (§1.6.7) is restated as hardware-consequence floor at the `@bind` declaration site, with the closed-vocabulary discipline (§1.7.7) bounding the trust-gap shape.
+
 **This section ADDS to Level C, does not remove it.** Level C remains the
 correct execution baseline. Level D is an architectural upgrade on top of
 Level C that resolves the one remaining maintenance leak: the ~1-2
 intrinsics/year ZER team additions for new ISA features.
 
-**Status:** Architecture LOCKED IN as of 2026-05-31. Implementation pending.
+**Status:** Architecture LOCKED IN as of 2026-05-31. Implementation pending. **REFINED by Option E as of 2026-06-06 — see §1.7.**
 
 **Pivot summary:** Level C constrains Y (operations) and delegates Z
 (ISA-specific details) to GCC, but still leaves Y_intrinsic catalog growth
@@ -1802,6 +1807,8 @@ Then Level D adds intrinsic_def on the clean Level C foundation.
 
 ### 1.6.14. The architecture locks
 
+> **AUGMENTED BY §1.7.18 (Option E locks).** The 12 locks below remain valid; Option E adds: (13) no per-ISA asm in Layer 1 of language core; (14) closed-vocabulary discipline must stay hard — no free-form predicates in Layer 2; (15) structure/semantics straddle is the architectural forcing argument for the layering; (16) packaging of canonical Layer 2 libraries is separable from safety architecture; (17) program-consequence vs hardware-consequence vocabulary is locked across the asm domain identical to the firmware domain. Read §1.7.18 for the complete locked-decisions list.
+
 **Locked in (do not re-litigate in future sessions):**
 
 1. **The lever is "externalize authorship"** — different from "constrain Y"
@@ -1828,6 +1835,8 @@ Then Level D adds intrinsic_def on the clean Level C foundation.
 Reference Section 1.6 instead of re-deriving.
 
 ### 1.6.15. The complete pivot summary
+
+> **REFINED BY §1.7.16 (Option E comparison matrix).** The "Level D end state" below describes a "Frozen blessed catalog @core::* (~130 or trimmed to ~30-50)" with implicit per-ISA dispatch authored by ZER team in core. Under Option E, the catalog of ~130 intrinsics is refactored: the operation declarations move to Layer 1 (taxonomy in core, no asm bodies); the per-ISA dispatch moves to a separately-maintained Layer 2 binding library (e.g., `zer-asm-x86`). Architectural commitment: ZER core has no per-ISA bindings, ever. Packaging commitment (separable, decidable empirically): ZER team likely maintains one canonical Layer 2 library to avoid universal-constant fragmentation. See §1.7.16 for the complete comparison matrix across Levels C, D, the rejected Option C, and the locked Option E.
 
 ```
 What ZER had at Level C:
@@ -1857,6 +1866,8 @@ The bottom-line architectural lock:
 on top.
 
 ### 1.6.16. The corrected 2-layer architecture (with escape hatch excluded)
+
+> **REFINED BY §1.7.3 (Option E).** The 2-layer model below ("blessed @core::* + user-defined @<lib>::*") is restructured under Option E into a 3-layer model: **Layer 1 (ZER core: schema + operation taxonomy + mechanism, NO per-ISA bindings) + Layer 2 (per-ISA binding libraries, structurally peer, including for operations Level D would have called blessed) + Layer 3 (firmware/application code: import and call)**. The escape hatch (raw asm in naked) remains structurally separate from the layered model. The framing below — "Layer 1 blessed primitives, ZER-team-audited, with internal per-ISA dispatch authored by ZER team" — is the part Option E refines: ZER core does not author per-ISA asm bodies; those live in Layer 2 libraries (potentially ZER-team-maintained as a separate canonical library — a packaging decision, not an architectural one). The conceptual content of "Layer 1 is foundational + Layer 2 is built on top + escape hatch is parallel" carries forward, just at one more level of factoring. Read §1.7.3 for the locked 3-layer model.
 
 Clarification on the architectural layering for Level D — the safety
 story is a clean 2-layer model. Raw asm in naked functions is an
@@ -2192,6 +2203,1523 @@ If a fresh session writes "GCC will catch missing-arch via assembly
 failure," that's wrong — GCC can't validate absent emission. Need
 explicit ZER-side check at the call site. Reject and add the
 propagation rule.
+
+---
+
+## 1.7. Option E Pivot — Three-Layer Architecture, No Favored ISA, Program-Consequence Vocabulary (added 2026-06-06)
+
+**This section ADDS to Levels C and D, does not remove them.** Level C is the deletion baseline (Z stays in GCC). Level D's `@intrinsic_def` mechanism is the user-extensibility primitive. Option E is the architectural refinement that:
+
+1. Applies the **program-consequence vs hardware-consequence** vocabulary (locked in `firmware_safety_extensions.md` and `CLAUDE.md`) to the asm domain.
+2. Refines the layering from Level D's "blessed-vs-user-defined" split into a cleaner **three-layer** model: **Layer 1 (ZER core: schema + operation taxonomy + mechanism, no ISA)** / **Layer 2 (per-ISA bindings: library territory)** / **Layer 3 (firmware/application: import and call)**.
+3. Locks the **no-favored-ISA-in-core** decision: ZER's language core ships the closed category vocabulary + the semantic operation taxonomy + the `@intrinsic_def`/`@bind` mechanism, and ships **zero** per-ISA bindings in core. Per-ISA bindings — including x86 — are user/community library territory.
+4. Identifies the **structure/semantics straddle** as the architectural reason asm uniquely requires the binding mechanism while every other ZER construct sits cleanly on one side of the program-domain/hardware-domain boundary.
+5. Elevates the **closed verifier-native vocabulary** from "one of four mitigations" to "the load-bearing kind-difference from SPARK," and locks the discipline that the contract language must stay closed (no free-form `requires:` predicates).
+
+**Status:** Architecture LOCKED IN as of 2026-06-06. Mechanical confirmation (write one `@bind` binding by hand against the schema) pending. Implementation pending; the work order is Level C cleanup → Level D mechanism → Option E factoring applied at the layering and ISA-reference points.
+
+> **READ FIRST.** This section is the current locked architecture for ZER's asm safety. It is the lens through which Section 1.6 (Level D) should be read. Where 1.7 and 1.6 disagree on layering or on whether ZER core ships per-ISA bindings, **1.7 supersedes**. 1.6's `@intrinsic_def` mechanism, demand/promise asymmetry rule (§1.6.17), and missing-arch propagation rule (§1.6.18) carry forward unchanged.
+
+### 1.7.1. The vocabulary locked elsewhere, applied here
+
+The program-consequence vs hardware-consequence vocabulary was locked in `CLAUDE.md` (top of file, "ZER's Goal" section) and `docs/firmware_safety_extensions.md` (§1, §1a, §22). The full locked statement:
+
+> ZER guarantees 100% program-consequence coverage: every wrong use of a value in ZER source code is caught at the use site. This includes embedded/firmware data — once a value crosses into ZER through a typed boundary (intrinsic return, MMIO read, cinclude function, linker symbol, asm output, source literal), it is program data and ZER verifies every program-level operation on it. Hardware-consequence — peripheral side effects, datasheet-specific value correctness, silicon behavior — is floor, out of scope for any language.
+
+The vocabulary discipline that must not equivocate:
+
+- **Program-consequence** — what happens when a value is used wrongly inside ZER source. Caught at 100%. The use is in the program, so ZER owns it.
+- **Hardware-consequence** — what happens when a hardware fact is wrong relative to user belief (peripheral doesn't actually clear on read, baud value is wrong-for-this-board, asm instruction doesn't actually have the categories declared). Floor. The fact lives outside the program, never enters it, so ZER has nothing to verify.
+
+Applied to asm:
+
+- **Program-consequence (ZER total, 100%):** Every call site of every intrinsic — `@arith_add_with_carry(a, b, c_in)`, `@load_acquire(ptr)`, `@barrier_full()` — is verified against the operation's declared categories. Operand types, escape, provenance preservation through outputs, qualifier preservation through inputs, clobber accounting, ordering constraints, context permissions. Wrong use at the call site = compile error. This holds regardless of which ISA binding the caller compiles against, because the verifier reasons over the schema, not over asm strings.
+- **Hardware-consequence (floor, surfaced at the `@bind` declaration site):** Whether the asm body inside a `@bind` declaration actually has the categories the declaration claims. If a binding declares `clobbers_flags + no_memory_effect` but the asm secretly writes memory, ZER cannot detect it. This is the floor for asm just as datasheet-correctness is the floor for MMIO declarations and signature-correctness is the floor for cinclude. Same floor pattern, different boundary location.
+
+The phrase to never let collapse:
+
+> "100% program-consequence" must never read as "ZER verifies the asm body matches the contract."
+
+It doesn't. ZER verifies that every program-domain operation on values passing through the intrinsic boundary respects the declared categories. The declaration's correctness against silicon is the floor, the same floor that exists for every typed boundary into hardware-domain facts.
+
+### 1.7.2. Why Option E refines Level D's layering
+
+Level D's layering (§1.6.16, "the corrected 2-layer architecture") split intrinsics into:
+
+- **Layer 1:** Blessed `@core::*` intrinsics, ZER-team-audited, frozen, **with internal per-ISA dispatch authored by ZER team**.
+- **Layer 2:** User-defined `@<lib>::*` intrinsics, library-authored, conditional, with internal per-ISA dispatch authored by library author.
+- **Escape hatch:** Raw asm in naked.
+
+The Option E refinement: the "internal per-ISA dispatch authored by ZER team" part of Layer 1 is the architectural commitment Option E removes. ZER core does NOT author per-ISA asm bodies. ZER core ships the schema (closed category vocabulary) + the operation taxonomy (the set of semantic operations) + the `@intrinsic_def` / `@bind` mechanism, and stops there. Per-ISA bindings live in libraries — including x86, including the operations Level D would have called "blessed."
+
+This is a structural refinement, not a contradiction of Level D. Level D's `@intrinsic_def` mechanism is preserved verbatim. The demand/promise asymmetry rule (§1.6.17) is preserved. The missing-arch propagation rule (§1.6.18) is preserved. The 4-level conditional soundness claim (§1.6.9) is refined: the "blessed" level (Level 2 of the conditional soundness breakdown) is now bound to the schema correctness, not to a ZER-team-shipped per-ISA catalog.
+
+### 1.7.3. The three layers in dependency order
+
+The locked three-layer model:
+
+```
+LAYER 1 — ZER core (frozen, shipped once + rare release extensions)
+─────────────────────────────────────────────────────────────────
+  Lives in: language core, compiler binary
+  Authored by: ZER team
+  Frequency of change: rare (per-decade for category vocabulary,
+                       handful per several years for operation taxonomy)
+
+  Contents:
+    - Closed CATEGORY VOCABULARY (the schema)
+        clobbers_flags, clobbers_register(name),
+        reads_mem(width, ordering), writes_mem(width, ordering),
+        requires_aligned(n), requires_nonzero(operand),
+        requires_in_range(operand, lo, hi),
+        memory_barrier(acquire | release | seqcst),
+        produces_carry, consumes_carry,
+        changes_privilege(from, to),
+        control_flow(returns | jumps_to | calls),
+        provenance_clear_on_output(operand),
+        value_in_value_out,
+        no_memory_effect, no_flag_effect,
+        ... [closed set, ZER-owned, extended only via release]
+
+    - SEMANTIC OPERATION TAXONOMY (the named operations)
+        @arith_add_wrap(a, b) -> T
+        @arith_add_with_carry(a, b, c_in) -> {result, c_out}
+        @arith_sub_wrap, @arith_sub_with_borrow,
+        @arith_mul_wide, @arith_div_unchecked,
+        @bit_and, @bit_or, @bit_xor, @bit_shift_left, @bit_shift_right,
+        @bit_rotate_left, @bit_rotate_right,
+        @bit_scan_forward, @bit_scan_reverse, @bit_count_leading_zeros,
+        @bit_count_trailing_zeros, @bit_population_count,
+        @load_aligned(ptr), @load_unaligned(ptr),
+        @load_acquire(ptr), @load_relaxed(ptr),
+        @store_aligned(ptr, val), @store_unaligned(ptr, val),
+        @store_release(ptr, val), @store_relaxed(ptr, val),
+        @atomic_cas(ptr, expected, new),
+        @atomic_swap, @atomic_fetch_add, @atomic_fetch_sub,
+        @atomic_fetch_and, @atomic_fetch_or, @atomic_fetch_xor,
+        @barrier_acquire, @barrier_release, @barrier_full,
+        @barrier_compiler_only,
+        @cpu_disable_int, @cpu_enable_int, @cpu_wait_int, @cpu_pause,
+        @cpu_syscall, @cpu_sysret, @cpu_iret,
+        @cpu_read_msr(idx), @cpu_write_msr(idx, val),
+        @cpu_read_cr(n), @cpu_write_cr(n, val),
+        @cpu_cache_invalidate(addr), @cpu_cache_writeback(addr),
+        @cpu_dma_start(buf, channel),
+        ... [closed-after-design set, ZER-owned, extended via release]
+
+    - MECHANISM
+        @intrinsic_def     (declare a new semantic operation in core or library)
+        @bind              (provide a per-ISA implementation for a declared operation)
+        verifier dispatch  (operate on categories, dispatch to existing Z-rules
+                            + existing safety analyses; never on asm strings)
+
+    - DELEGATIONS
+        Z-level concerns (register validity, instruction validity, CPU feature
+        gating) → GCC, as per Level C
+        Hardware-consequence (whether silicon honors the binding's declared
+        categories) → engineer territory at the @bind declaration site
+
+  What Layer 1 does NOT contain:
+    - No per-ISA asm bodies
+    - No "x86 reference" or "ARM reference" or any ISA-specific catalog
+    - No free-form predicate language (closed vocabulary only)
+    - No user-extensibility of categories or operations
+      (extensions go through ZER core release with review)
+
+LAYER 2 — Per-ISA binding library (community / per-vendor / per-project)
+───────────────────────────────────────────────────────────────────────
+  Lives in: external libraries imported by user firmware
+  Authored by: library maintainers — community, vendor, or project-local
+  Frequency of change: per (operation, ISA) pair, authored once,
+                       frozen-after-review
+
+  Contents:
+    - @bind declarations mapping each semantic operation in Layer 1's
+      taxonomy to per-ISA asm
+    - Per-ISA asm bodies (instructions, operand constraints, clobbers)
+    - Category SELECTION (not invention) from Layer 1's vocabulary
+    - safety: annotations for review (one declaration ↔ one paragraph
+      explaining why the categories match what this asm does on this ISA)
+
+  Example library structure:
+    zer-asm-x86            — x86_64 bindings for Layer 1 operations
+    zer-asm-arm-cortex-m   — ARM Cortex-M bindings
+    zer-asm-arm-cortex-a   — ARM Cortex-A bindings (different memory model)
+    zer-asm-riscv          — RISC-V bindings (including no-flag emulation
+                              sequences for operations like add_with_carry)
+    zer-asm-xtensa-lx7     — Xtensa LX7 bindings
+    zer-asm-msp430         — TI MSP430 bindings
+    ...
+
+  Each library:
+    - Is structurally peer to every other Layer 2 library under the
+      Layer 1 schema
+    - Has no privileged position
+    - Authored by whoever brings up that ISA
+    - Reviewed against the closed-checklist (do declared categories
+      match what this asm does on this ISA?)
+    - Frozen after review for that (operation, ISA) pair
+
+  What Layer 2 does NOT do:
+    - Cannot invent new categories (must select from Layer 1's vocabulary)
+    - Cannot invent new operations (must bind operations Layer 1 declared)
+    - Cannot publish free-form requires: predicates
+    - If a binding cannot be expressed in Layer 1's vocabulary, the fix
+      is a Layer 1 schema-extension request via ZER core release
+      (NEVER a Layer 2 freedom)
+
+LAYER 3 — Firmware / application (the actual program)
+──────────────────────────────────────────────────────
+  Lives in: user firmware source code
+  Authored by: firmware/application engineer (the audience that matters
+               for adoption ergonomics)
+  Frequency of activity: continuous (this is the regular coding loop)
+
+  What this person does:
+    1. Imports a Layer 2 binding library for their target ISA:
+         import zer_asm_arm_cortex_m;
+    2. Imports Layer 1's operation taxonomy (transitively via Layer 2,
+       or explicitly):
+         use @core::ops;
+    3. Calls operations as typed functions:
+         let cur = *GPIOA_ODR;
+         let next = @arith_xor(cur, 0x1);
+         *GPIOA_ODR = next;
+         @barrier_release();
+    4. That is the entire workflow.
+
+  What this person does NOT do:
+    - Does not write asm
+    - Does not author @bind declarations
+    - Does not declare or select categories
+    - Does not need to read an ISA manual to use operations
+    - Does not need to know what asm the binding emits
+
+  Verification at this layer:
+    - Every call site is verified against the operation's declared
+      categories (Layer 1's contract)
+    - Verifier dispatches to existing analyses: Z-rules, escape,
+      provenance preservation, qualifier preservation, alignment,
+      ordering, context flags
+    - Program-consequence: 100% over every call site, locked
+```
+
+This is the locked three-layer architecture. The pattern parallels firmware (mmio + @inttoptr in core, per-chip addresses in user space, firmware code that just uses typed pointers), the pattern parallels cinclude (mechanism in core, vendor HAL in user space, firmware code that just calls typed wrappers), and the pattern parallels every other domain in ZER where structural primitives live in core and substrate details live in user space.
+
+### 1.7.4. The locked Layer 1 schema design rules
+
+Layer 1's contents are closed. The discipline:
+
+**Category vocabulary rules:**
+1. Categories describe **structural behavior kinds** that exist across ISAs (clobbers a flag register class, reads memory at width W with ordering O, etc.), not ISA-specific instruction properties.
+2. Categories are added only via ZER core release with review.
+3. Categories support an "N/A on this ISA" disposition — for example, `clobbers_flags` is N/A on RISC-V because no flag register exists. The verifier handles N/A correctly (does not require the binding to declare flag categories on ISAs that lack flags).
+4. Categories must be verifier-native: each category dispatches to an existing safety analysis. No category that requires a brand-new analysis.
+5. No free-form predicates. If a category-shaped concept cannot be expressed as a selection-from-finite-set, it does not enter the vocabulary.
+
+**Operation taxonomy rules:**
+1. Operations are named for what they MEAN, not for any ISA's mnemonic. `@arith_add_with_carry` not `@x86_adc`.
+2. Each operation has a fixed category profile that applies to every ISA binding of that operation. If the category profile differs structurally between ISAs (e.g., x86 ADD clobbers flags, ARM plain ADD doesn't), those are different semantic operations (`@arith_add_wrap` vs `@arith_add_with_carry`) — not one operation with per-ISA category variation.
+3. Operations are added via ZER core release. The rate is bounded by genuinely-new semantic operation kinds appearing in hardware (per-several-years for vector extensions, novel atomic primitives, new memory ordering modes).
+4. Operations are typed at the ZER level (operand types, return types). Per-ISA bindings cannot change the typed signature.
+5. Operation taxonomy is closed-after-design. Extensions go through ZER core release.
+
+**Mechanism rules:**
+1. `@intrinsic_def` declares a new operation (Layer 1 release) or a new core-blessed wrapper. Used by ZER team and by library authors of new operations they're seeking promotion.
+2. `@bind` provides a per-ISA implementation of an existing operation. Used by Layer 2 library authors.
+3. Per-ISA dispatch is internal to a `@bind` (one binding per (operation, ISA) pair).
+4. Verifier reasons over categories only. Never over asm strings.
+5. GCC handles Z-level concerns (register validity, instruction validity, CPU feature gating) as per Level C.
+
+### 1.7.5. The structure/semantics straddle — the architectural reason this factoring is forced
+
+This is the deepest architectural observation in the asm safety thread, and it should be preserved as the load-bearing reason for Option E's shape.
+
+**Every other ZER construct sits cleanly on one side of the program-domain / hardware-domain boundary:**
+
+- A `u32` value, regardless of origin (hardware read, file, network, source literal): program-domain at every operation, ZER owns 100%.
+- An `mmio` address declaration: hardware-domain claim at the declaration site (does this address really name the peripheral?), program-domain at every downstream use through the typed pointer. The boundary is crossed cleanly at the declaration.
+- A `cinclude` function signature: hardware-domain claim at the signature declaration, program-domain at every call site. Same clean cross.
+- A linker symbol extern: same pattern.
+- A typed register access: structure in program, criterion in datasheet — both sides exist but they live in separate tokens (the typed pointer vs the address value).
+
+**An asm instruction is the exception. It straddles.**
+
+`adc $0, $1` is one token that simultaneously:
+- Carries operand structure (program-domain — Z-rules apply to inputs and outputs, escape analysis applies to register clobbers, provenance clearing applies to outputs, qualifier preservation applies through the boundary, ordering constraints apply, context flags apply)
+- Carries semantic meaning (hardware-domain — what flags get clobbered, what state mutates, what precondition is required for correctness, what the instruction actually does to the machine — and this varies per ISA)
+
+You cannot separate these by reading the token. The instruction's structural connections and its hardware semantics are fused in one mnemonic. That fusion is unique to asm among ZER constructs.
+
+**Why this forces Option E specifically:**
+
+1. Asm's semantics are per-ISA hardware facts (the ISA manual is the datasheet for instruction meaning).
+2. Any safety system that wants to reason about asm meaning must import that meaning from outside the program text.
+3. "Outside the program, per-ISA" is by definition a binding (a `@bind` declaration).
+4. ZER core cannot ship "what `adc` means" without committing to an ISA's semantics in the language core — which would make ZER a "portable language" wearing a costume of universality while actually carrying a favored-ISA assumption.
+5. The only factoring that preserves both "ZER reasons about asm safety structurally" AND "ZER does not commit to an ISA" is: structure-half stays in core (universal, ISA-less, frozen — Z-rules, operand boundaries, the category vocabulary, the operation taxonomy), semantics-half imported per-ISA via `@bind` (user-authored, hardware-consequence floor surfaced at the binding site).
+
+That is Option E. It is not "the cleanest of three options" — it is the unique architecture that respects the structure/semantics straddle without either committing to one ISA or refusing to reason about asm meaning at all.
+
+**Any alternative either:**
+- (A) commits ZER core to one ISA's semantics — breaking architecture-agnostic positioning and making ZER a "<favored-ISA> language" in disguise; or
+- (B) refuses to reason about asm meaning at all — abandoning the asm safety claim and dropping back to "asm is just text we hand to GCC."
+
+Option E is what's left after rejecting both. The structure/semantics straddle dictates the shape; the choice was made by the fusion in the token, not by architectural preference.
+
+### 1.7.6. The closed-vocabulary kind-difference from SPARK — load-bearing, not bullet-point
+
+In earlier framings, four "mitigations" were listed for the SPARK-shape trust gap in `@intrinsic_def`:
+
+1. Frozen category vocabulary
+2. Per-operation contract, not per-call
+3. Audit visibility at use site
+4. Per-author trust (library author authors once, users consume)
+
+Three of these are **quantitative** mitigations — they make the SPARK trap smaller (fewer contracts, more visible, authored once). They are real but they are differences of degree. SPARK could in principle adopt all three and still be SPARK.
+
+The first one is the only **kind-difference**, and it is the load-bearing distinction from SPARK. It must be elevated from bullet point to thesis:
+
+> **SPARK contracts are arbitrary predicates; `@intrinsic_def` / `@bind` contracts can only select from a closed, ZER-owned category vocabulary that the verifier already knows how to reason about.**
+
+Why this is a different failure topology, not just a smaller surface:
+
+- A SPARK contract can be wrong in **unbounded ways**, because the predicate language is unbounded. You can assert any logical claim, including ones that are subtly self-inconsistent, vacuously discharged by the prover, or true on the implementation but false on the surrounding program.
+- A `@bind` contract can be wrong in **exactly one way**: the declared categories do not match what the asm body actually does on this ISA. It cannot be wrong about anything else, because there is nothing else to declare — the contract language consists only of selections from the closed category vocabulary.
+
+This makes the trust gap **auditable against a fixed checklist** instead of against an open-ended logical claim:
+
+| To review a SPARK contract | To review a `@bind` declaration |
+|---|---|
+| Understand the predicate language | Skim the closed category vocabulary list |
+| Decide whether the predicate is well-formed | (Not a concern — categories are syntactic) |
+| Decide whether the predicate is true of the implementation | For each declared category, check the asm body |
+| Open-ended reasoning task | Finite checklist |
+| Surface grows with predicate complexity | Surface is fixed by the schema |
+
+**This is genuinely stronger than SPARK** — not because the trust gap is absent (it isn't; the other Claudes in the design discussion were correct to push back on any framing that suggested otherwise), but because the gap has a **fixed, finite shape**, so verifying-the-contract-against-the-asm is a mechanical checklist task instead of a proof obligation.
+
+SPARK's gap is open-shaped. ZER's gap is closed-shaped. Same existence; different reviewability.
+
+### 1.7.7. The hard line: closed vocabulary or the kind-difference collapses
+
+The closed-vocabulary discipline is the whole differentiator. The moment Layer 2 is allowed to carry a free-form `requires:` predicate (an arbitrary logical precondition) or a free-form `effect:` clause or any other open-shape declaration, the kind-difference dissolves and ZER becomes "tidier SPARK," not a structurally distinct architecture.
+
+The rules that must hold:
+
+1. **`@bind` declarations select from the Layer 1 category vocabulary.** They do not invent categories.
+2. **`@bind` declarations bind operations Layer 1 declared.** They do not invent operations.
+3. **No free-form predicate language in Layer 2.** Specifically:
+   - `requires:` clauses must select from a finite precondition vocabulary (e.g., `requires_nonzero(operand)`, `requires_aligned(operand, n)`, `requires_in_range(operand, lo, hi)`, `requires_msr_writable(msr_idx)`). Never an arbitrary logical predicate.
+   - `effect:` clauses must select from a finite postcondition vocabulary (e.g., `effect_in_range(result, lo, hi)`, `effect_aligned(result, n)`, `effect_provenance_cleared(output)`). Never an arbitrary logical predicate.
+4. **If a binding cannot be expressed in the existing schema, that is a Layer 1 schema-extension request via ZER core release.** It is NEVER a Layer 2 freedom to open the vocabulary locally.
+5. **Demand/promise asymmetry rule from §1.6.17 still applies.** Promises that cause the verifier to do less checking on callers must either be verifier-checkable or explicitly taint the caller's soundness level. The closed-vocabulary discipline narrows the set of expressible promises but does not relax the asymmetry rule.
+
+The discipline implies a maintenance commitment on ZER team: the schema design must be expressive enough that real-world bindings can be expressed without users feeling the need for free-form predicates. If users keep hitting "the vocabulary is missing X" cases, that is a signal that the schema is incomplete — the fix is to extend the schema (Layer 1 release with review), never to open Layer 2.
+
+**This is the work.** Not "ship x86 reference or not" — that's a packaging decision, separable from the architecture. The real work is making the Layer 1 schema rich enough to handle structurally different machine models (flag-bearing vs flagless ISAs, weak vs TSO memory models, vector vs scalar register classes, CHERI vs non-CHERI capability models) without escape into open-shape predicates. Get this right once and the schema is stable for the long term.
+
+### 1.7.8. The safety vs governance register separation
+
+A critical observation from the design discussion: the question of **"who maintains canonical Layer 2 binding libraries"** is a packaging/governance question, separable from the safety architecture. They live in two distinct registers and must not be conflated.
+
+**Safety register (locked by Option E):**
+- Does program-consequence stay 100% under this layering? **Yes.**
+- Is binding-correctness floor cleanly named at the `@bind` site? **Yes.**
+- Is the closed-vocabulary kind-difference preserved? **Yes.**
+- Is the structure/semantics straddle respected? **Yes.**
+
+The safety architecture holds **regardless of who ships the x86 binding library, whether the ZER team blesses one, whether the community owns it, or whether vendor-specific libraries proliferate.**
+
+**Governance / packaging register (open, decidable empirically):**
+- Who maintains the canonical x86 binding library?
+- Does ZER core's release process include blessing one Layer 2 library per supported ISA?
+- Does the community own ISA-bring-up entirely?
+- Is there a `zer-asm-x86` repo maintained by the ZER team, structurally peer to community libraries but receiving extra review attention?
+
+These are real ecosystem-coordination questions. They affect onboarding friction, fragmentation risk, default-library competition, and version-skew management. They do NOT affect the safety claim, because Layer 1 (the language core, where safety is established) makes no commitment about which Layer 2 library is canonical.
+
+**Why this separation matters:**
+
+The governance question is reversible. Whether the canonical x86 binding library ships:
+- As part of `zer-core` binary,
+- As a separately-maintained `zer-asm-x86` repo authored by ZER team,
+- Or as a community library that becomes de-facto standard,
+
+these are packaging choices that can change later without breaking any user code, because the user-facing API (the operation taxonomy + categories in Layer 1) is locked at the schema layer.
+
+So you do not have to decide the governance question now to lock the safety architecture. The safety architecture locks at Option E. The governance question is independent and can be decided empirically — by writing one Layer 2 binding for a common operation (the x86 `adc` for `@arith_add_with_carry`, or the RISC-V no-flag carry-emulation sequence) and seeing what packaging model makes sense given the artifact's size, complexity, and review needs.
+
+**The honest framing on packaging:**
+
+A genuine pushback worth recording: under Option E with no x86 reference in core, every single user/library reimplements bindings that are completely identical across all users. `adc` on x86 is `adc` for everyone — it is a universal constant, not a per-user fact. Delegating a universal constant to N users means either fragmentation (N incompatible binding libraries) or de-facto standardization without official governance (one community library becomes load-bearing while ZER team has no formal commitment to it).
+
+This is a real coordination concern. It does not break the safety architecture, but it is a real ecosystem-design question.
+
+The middle-path resolution the design discussion landed on: **ship the Layer 1 schema in core, no per-ISA bindings in language core, AND maintain a small canonical Layer 2 binding library (e.g., `zer-asm-x86`) as a separately-maintained ZER-team-owned repo that is structurally peer to community libraries but receives extra review attention.** This preserves Option E's "no favored ISA in the language" while applying the "universal constant ships once, governed" insight at the library layer instead of the core layer.
+
+This is not C and it is not E-as-stated; it is E's architecture with one canonical Layer 2 library maintained by the same team. The architectural commitment is locked at E. The packaging decision about who maintains x86 is a Layer 2 governance question that can be settled empirically.
+
+### 1.7.9. The full workflow per layer
+
+To make the layering concrete, here is the end-to-end workflow for each layer.
+
+**Layer 3 workflow — firmware/application author (the audience that decides ZER's adoption):**
+
+This person's workflow is **not** extremely different from regular ZER coding. They:
+
+1. Import a per-ISA binding library matching their target:
+   ```
+   import zer_asm_arm_cortex_m;
+   ```
+
+2. Declare their firmware-side things (mmio regions, linker symbols, vector table — using the firmware extension primitives locked in `firmware_safety_extensions.md`):
+   ```
+   mmio 0x40020000..0x40020FFF;
+   volatile *u32 GPIOA_ODR = @inttoptr(volatile *u32, 0x40020014);
+   ```
+
+3. Write code calling semantic operations as typed functions:
+   ```
+   fn toggle_led() {
+       let cur = *GPIOA_ODR;                  // volatile read
+       let next = @arith_xor(cur, 0x1);       // semantic op
+       *GPIOA_ODR = next;                     // volatile write
+       @barrier_release();                    // memory barrier
+   }
+   ```
+
+4. That is the entire workflow.
+
+For this person, asm is **invisible**. They call `@arith_xor(...)` and `@barrier_release()` and the compiler routes through whichever Layer 2 binding library was imported. They never see `eor`, `dmb`, or any other ISA-specific instruction. The cognitive model is identical to calling any other typed function.
+
+**No primitive declarations, no contract authoring, no schema awareness. Same ergonomics as importing any ZER library.**
+
+This is the load-bearing usability property. The architecture is radical in Layer 2, but Layer 3 is ergonomically normal — which is what matters for the audience that decides whether ZER gets adopted.
+
+**Layer 2 workflow — per-ISA binding library author (a smaller audience, but the place where the SPARK-family work lives):**
+
+This person's workflow IS different from writing C inline asm. They:
+
+1. Pick a semantic operation from Layer 1's taxonomy:
+   ```
+   @arith_xor(a: T, b: T) -> T
+       where T in {u8, u16, u32, u64}
+       categories: { no_memory_effect, no_flag_effect, value_in_value_out }
+   ```
+
+2. Author a `@bind` declaration mapping the operation to per-ISA asm:
+   ```
+   @bind arith_xor isa: arm_cortex_m {
+       asm { instructions: "eor $0, $1, $2"
+             inputs: [a, b]
+             outputs: [result]
+             safety: "ARM EOR: bitwise xor, plain form does not affect
+                      flags; categories declared in @arith_xor's
+                      Layer 1 entry (no_memory_effect, no_flag_effect,
+                      value_in_value_out) all hold on this ISA." }
+   }
+   ```
+
+3. Select categories from Layer 1's vocabulary. **Never invent.** If a category needed for this binding does not exist in the vocabulary, submit a Layer 1 schema-extension request via ZER core release.
+
+4. Get the `@bind` declaration reviewed against the closed checklist:
+   - For each declared category, does the asm body honor it?
+   - Are all operand widths and types consistent with the operation's Layer 1 signature?
+   - Are clobbers complete (no flag-clobbering asm with `no_flag_effect` declared)?
+   - Are ordering constraints honest (no acquire/release mismatches)?
+   - Does the safety: annotation explain the binding clearly enough for future review?
+
+5. Once reviewed, the binding is frozen for that (operation, ISA) pair.
+
+This is mechanical to author (selection from a finite menu, not predicate authorship) and mechanical to review (finite checklist against a closed schema, not open proof obligation). It is genuinely different from C-style "write asm, hope it works" — but it is bounded by the schema, which is the whole point of Option E.
+
+**Layer 1 workflow — ZER core / schema author (the smallest audience, the slowest cadence):**
+
+This is design work, not coding work. It happens:
+
+1. **At initial schema design** — enumerate the closed category vocabulary, identifying every category kind needed to express the structural-behavior properties of asm operations across all machine models the architecture will support (flag-bearing, flagless, weak-memory, strong-memory, CHERI, non-CHERI, vector, scalar). Get this right once and most extensions never happen.
+
+2. **At operation taxonomy design** — enumerate the set of semantic operations the language ships in its closed-after-design taxonomy. Bias toward generality: prefer fewer, more general operations over many specialized ones.
+
+3. **At rare schema extensions** — when a Layer 2 library author or community demand identifies a category kind or operation kind the existing schema cannot express, and the extension is genuinely structural (not a workaround for missing operations), go through ZER core release with review and add it.
+
+4. **At per-decade evolutions** — when a fundamentally novel hardware-precondition kind emerges (the CHERI capability model is the canonical example), extend the schema to accommodate it. This is rare by design — the schema should be stable for many years between such extensions.
+
+This is the work the ZER team owns. It is bounded, slow-cadence, and the design discipline is locked: closed vocabulary, no free-form predicates, structural categories only, verifier-native dispatch only.
+
+### 1.7.10. Concrete examples of each operation in Layer 1
+
+To make the schema design intent concrete, here are illustrative shape sketches for several Layer 1 operations and their per-ISA bindings. **These are illustrative, not implementation specifications.** The exact category vocabulary and operation signatures will be locked at schema design time.
+
+**Example 1 — Arithmetic with carry (the canonical ADD/flags case):**
+
+```
+// Layer 1 (ZER core, frozen)
+@intrinsic_def arith_add_with_carry(a: T, b: T, c_in: u1) -> {result: T, c_out: u1}
+    where T in {u8, u16, u32, u64}
+    categories: {
+        no_memory_effect,
+        produces_carry,
+        consumes_carry,
+        value_in_value_out,
+        clobbers_flags    // declared at Layer 1; binding chooses whether
+                          // this category applies via the ISA-N/A mechanism
+    }
+    safety: "Add with carry-in producing carry-out. The clobbers_flags
+             category is N/A on ISAs that lack a flag register;
+             flagless ISAs must emulate via GPRs while preserving the
+             carry-in/carry-out semantics."
+
+// Layer 2 (zer-asm-x86)
+@bind arith_add_with_carry isa: x86_64 {
+    asm { instructions: "adc $b, $a"
+          inputs:  [a, b, c_in => CF]
+          outputs: [result => a, c_out => CF]
+          clobbers: ["flags"]
+          safety:  "x86 ADC: a := a + b + CF, sets CF based on result.
+                    All declared categories hold: no memory effect,
+                    produces and consumes carry, value_in_value_out,
+                    and clobbers_flags is honored (CF/ZF/SF/OF
+                    affected as documented in Intel SDM Vol 2 ADC)." }
+}
+
+// Layer 2 (zer-asm-arm-cortex-m)
+@bind arith_add_with_carry isa: arm_cortex_m {
+    asm { instructions: "adcs $0, $1, $2"
+          inputs:  [a, b, c_in => C]
+          outputs: [result => $0, c_out => C]
+          clobbers: ["NZCV"]
+          safety:  "ARM ADCS: rd := rn + op2 + C, sets NZCV.
+                    All declared categories hold; clobbers_flags
+                    honored via NZCV update." }
+}
+
+// Layer 2 (zer-asm-riscv)
+@bind arith_add_with_carry isa: riscv64 {
+    asm { instructions: "add $r, $a, $b\n"
+                        "sltu $t1, $r, $a\n"
+                        "add $r, $r, $c_in\n"
+                        "sltu $t2, $r, $c_in\n"
+                        "or $c_out, $t1, $t2"
+          inputs:  [a, b, c_in]
+          outputs: [result => $r, c_out]
+          clobbers: ["$t1", "$t2"]
+          isa_disposition: {
+              clobbers_flags: N/A  // RISC-V has no flag register
+          }
+          safety:  "RISC-V emulates carry-add via SLTU sequence.
+                    No flag register exists; clobbers_flags marked
+                    N/A. Categories produces_carry, consumes_carry,
+                    value_in_value_out, no_memory_effect all hold." }
+}
+```
+
+The same Layer 1 operation has structurally different per-ISA realizations. On flag-bearing ISAs the binding is small and uses the flag register; on flagless ISAs the binding is a multi-instruction emulation sequence. Both bindings honor the same Layer 1 contract. Layer 3 firmware code calls `@arith_add_with_carry(a, b, c)` and the verifier checks every call site against the Layer 1 contract regardless of which binding compiles.
+
+**Example 2 — Acquire load (memory ordering):**
+
+```
+// Layer 1 (ZER core, frozen)
+@intrinsic_def load_acquire(ptr: *T) -> T
+    where T in {u8, u16, u32, u64}
+    categories: {
+        reads_mem(sizeof(T), acquire),
+        requires_aligned(ptr, alignof(T)),
+        no_flag_effect,
+        value_in_value_out
+    }
+    safety: "Acquire-ordered load. Reads from ptr with acquire ordering
+             semantics — subsequent reads and writes cannot be reordered
+             before this load. Requires aligned pointer."
+
+// Layer 2 (zer-asm-x86)
+@bind load_acquire isa: x86_64 {
+    asm { instructions: "mov ($1), $0"
+          inputs:  [ptr]
+          outputs: [result => $0]
+          clobbers: []
+          safety:  "x86 has acquire semantics for ordinary loads under
+                    TSO. The MOV instruction satisfies acquire ordering
+                    without explicit barrier. Aligned access requirement
+                    holds via declared category." }
+}
+
+// Layer 2 (zer-asm-arm-cortex-a)
+@bind load_acquire isa: arm_cortex_a {
+    asm { instructions: "ldar $0, [$1]"
+          inputs:  [ptr]
+          outputs: [result => $0]
+          clobbers: []
+          safety:  "ARMv8 LDAR: load-acquire register. Hardware
+                    enforces acquire ordering. Aligned access required
+                    by ISA and declared category." }
+}
+
+// Layer 2 (zer-asm-riscv)
+@bind load_acquire isa: riscv64 {
+    asm { instructions: "lw $0, ($1)\n"
+                        "fence r,rw"
+          inputs:  [ptr]
+          outputs: [result => $0]
+          clobbers: []
+          safety:  "RISC-V acquire load: ordinary LW followed by
+                    fence r,rw. Acquire ordering: subsequent reads
+                    and writes cannot reorder before the load.
+                    Aligned access required." }
+}
+```
+
+**Example 3 — Memory barrier:**
+
+```
+// Layer 1 (ZER core, frozen)
+@intrinsic_def barrier_full()
+    categories: {
+        memory_barrier(seqcst),
+        no_memory_effect,
+        no_flag_effect,
+        value_in_value_out
+    }
+    safety: "Full sequential-consistency memory barrier.
+             Prevents any reordering of memory operations across
+             this point."
+
+// Layer 2 (zer-asm-x86)
+@bind barrier_full isa: x86_64 {
+    asm { instructions: "mfence"
+          inputs: []
+          outputs: []
+          clobbers: []
+          safety: "x86 MFENCE: full memory barrier, seqcst." }
+}
+
+// Layer 2 (zer-asm-arm-cortex-a)
+@bind barrier_full isa: arm_cortex_a {
+    asm { instructions: "dmb ish"
+          inputs: []
+          outputs: []
+          clobbers: []
+          safety: "ARMv8 DMB ISH: data memory barrier, inner shareable
+                    domain. Provides seqcst ordering across the
+                    inner shareable domain." }
+}
+
+// Layer 2 (zer-asm-riscv)
+@bind barrier_full isa: riscv64 {
+    asm { instructions: "fence rw,rw"
+          inputs: []
+          outputs: []
+          clobbers: []
+          safety: "RISC-V FENCE rw,rw: full memory barrier." }
+}
+```
+
+These examples illustrate the pattern: Layer 1 declares the semantic operation with its category profile; Layer 2 provides per-ISA realizations that honor the contract; Layer 3 firmware code calls the operation without seeing the asm. The verifier's reasoning is over the Layer 1 categories — every call site of `@barrier_full()` is treated as a seqcst memory barrier regardless of which ISA binding compiles, so subsequent operations are correctly ordered.
+
+### 1.7.11. The mechanical confirmation test — write one binding by hand
+
+The whole design verifies under one experiment, which is the artifact-decides discipline applied at the right granularity:
+
+**Write one Layer 2 `@bind` by hand against the schema. Write one Layer 3 call site that uses it. Check the result.**
+
+Specifically:
+
+1. Write the x86 binding for `@arith_add_with_carry` against the schema (the `adc` instruction).
+2. Write the RISC-V binding for the same operation (the SLTU-based carry emulation sequence).
+3. Write one Layer 3 firmware function that uses `@arith_add_with_carry` — for example, a multi-precision addition routine.
+4. Compile it for both targets. Inspect:
+   - Does the Layer 3 code know anything about which binding compiles? It should not.
+   - Could a firmware author who has never read an x86 manual or a RISC-V manual use `@arith_add_with_carry` correctly by just importing the relevant binding library?
+   - Is the x86 `@bind` declaration tiny (one instruction line plus the safety annotation)? It should be.
+   - Is the RISC-V `@bind` declaration substantial (a real authored sequence with intermediate registers)? It should be.
+   - Does the category vocabulary express both bindings honestly, including the "clobbers_flags N/A on RISC-V" disposition?
+
+If yes to all: the three layers are clean. Layer 2 fully absorbed the per-ISA complexity. Layer 3 ergonomics is normal. The schema is expressive enough.
+
+If Layer 3 leaks — if the firmware author has to understand the binding to use the operation correctly — Layer 2 is not doing its job, or the operation taxonomy is wrong (operations should be self-describing through categories alone). The fix is at Layer 1 (refine the operation signature or category profile), not at Layer 2 (do not add ad-hoc workarounds in bindings).
+
+If the binding cannot be expressed in the existing category vocabulary — if the author keeps reaching for a free-form `requires:` predicate — that is the signal the schema is incomplete. The fix is a Layer 1 schema-extension request through ZER core release. Not a Layer 2 freedom.
+
+**This experiment is the only confirmation that does not drift.** Architecture discussion can ratify the framing; only the artifact (one binding written, one call site compiled) confirms the layering actually delivers what the design claims.
+
+### 1.7.12. The honest scope under Option E — what ZER claims, what it does not
+
+The full claim, stated with the locked vocabulary:
+
+**Program-consequence coverage at 100%.**
+
+Every call site of every Layer 1 operation in Layer 3 firmware code is verified against the operation's declared categories. The verifier dispatches to existing safety analyses — Z-rules (operand boundary checks for asm-produced values), escape analysis (no asm-output value escapes through a memory-clobbering binding to a typed pointer outside its scope), provenance preservation (asm outputs receive provenance_clear and require explicit `@ptrcast` round-trip before re-typing), qualifier preservation (volatile passes through every binding boundary without strip), alignment checks (when categories declare `requires_aligned` the call site is verified or runtime-trapped), ordering enforcement (memory barriers declared by category profile honor the ordering at the verifier level even if the underlying asm uses different instructions per ISA), context propagation (asm-bearing bindings called inside `interrupt`-marked or `@critical`-marked context inherit the context's ban list).
+
+This holds **regardless of which Layer 2 binding library is imported**. The verifier reasons over Layer 1 categories. Layer 2's asm strings are opaque to the verifier; only the declared categories matter.
+
+This holds **regardless of whether the binding's declared categories actually match the asm semantics on this ISA**. That is the hardware-consequence floor, surfaced at the `@bind` site, library-author's responsibility, reviewable as a finite checklist against the closed schema. The program-consequence claim does not depend on binding-correctness; it depends on the schema being honored at every call site, which is structural verification.
+
+**Hardware-consequence (the floor, named):**
+
+What ZER does NOT verify:
+
+- Whether the asm body inside a `@bind` declaration actually has the categories the declaration claims. If a binding declares `clobbers_flags + no_memory_effect` and the asm secretly writes memory, ZER cannot detect it. Library author owns this; reviewer with knowledge of the ISA checks via the finite checklist.
+- Whether the asm produces semantically-correct output for the operation. If a binding for `@arith_add_with_carry` actually computes `a XOR b XOR c_in` due to a typo, ZER cannot detect it. The operation's typed signature is honored; the semantic equivalence is not verified.
+- Whether the per-ISA implementations of a single Layer 1 operation are semantically equivalent across ISAs. Cross-ISA equivalence is library-author and code-review responsibility. ZER verifies that each binding honors its declared categories on its own ISA; cross-ISA equivalence is the author's contract to the user.
+- Whether the ISA's actual hardware honors the declared categories (the silicon matches the ISA manual). This is the deepest floor — even GCC trusts the ISA manual.
+
+These are not gaps. They are the hardware-domain floor that exists for every memory-safe systems language at the asm boundary. The structural property that makes ZER's floor better than alternatives is the closed-vocabulary discipline: the floor has a fixed, finite shape, so review is bounded.
+
+**The architectural distinction from SPARK, stated precisely:**
+
+SPARK and ZER both have a hardware-consequence trust gap at the contract boundary between user declarations and silicon behavior. The gap exists by physics; no language eliminates it. The distinctions:
+
+| Property | SPARK | ZER (Option E) |
+|---|---|---|
+| Contract language | Arbitrary predicates | Closed category vocabulary |
+| Trust gap shape | Open (anything expressible can be wrong) | Closed (only "categories vs asm semantics" can be wrong) |
+| Review surface | Open-ended logical task | Finite checklist |
+| Contract count per program | Unbounded (per-call) | Bounded (per-operation-per-ISA, frozen-after-review) |
+| Audit visibility | Contracts in spec files, sometimes separated from use | Intrinsic name at use site; binding at well-known library location |
+| Trust factoring | Contract author per call site | Binding author per (operation, ISA) |
+| Hardware floor | Real and per-call | Real and per-(operation, ISA) — smaller, frozen |
+
+ZER is stronger than SPARK on the contract-language axis (closed vs open) and on the bounded-vs-unbounded contract-count axis. ZER is at the same floor as SPARK on the underlying physics (contracts can be wrong about silicon; no language can verify the silicon). Both are honest; ZER's is smaller and more structurally bounded.
+
+### 1.7.13. Cross-reference to firmware safety vocabulary
+
+The same program-consequence vs hardware-consequence vocabulary applies uniformly across ZER's safety domains. The locked statements:
+
+**For firmware (from `firmware_safety_extensions.md` §1):**
+
+> Once a value crosses into ZER through a typed boundary (intrinsic return, MMIO read, cinclude function, linker symbol, asm output, source literal), it is program data and ZER verifies every program-level operation on it. Hardware-consequence — peripheral side effects, datasheet-specific value correctness, silicon behavior — is floor, out of scope for any language.
+
+**For asm (Option E, this section):**
+
+> Every call site of every Layer 1 operation in Layer 3 firmware code is verified against the operation's declared categories. Hardware-consequence — whether the asm body inside a `@bind` declaration actually has the categories declared, whether the ISA semantics match the binding's claims, whether the silicon honors the ISA manual — is floor, out of scope for any language.
+
+The two statements are the same structural commitment applied to different boundaries. Firmware's boundary is at value-entry through typed declarations (mmio, cinclude, linker symbols). Asm's boundary is at the `@bind` declaration site. In both cases, ZER owns program-consequence at 100% and names hardware-consequence as the floor.
+
+The structure/semantics straddle observation (§1.7.5) is the reason asm uniquely requires the binding mechanism while firmware's other primitives do not — but the resulting safety story has the same shape: program-consequence total, hardware-consequence floor at the declaration site.
+
+### 1.7.14. Anti-patterns — drifts to refuse
+
+The session-level drift patterns documented in `firmware_safety_extensions.md` §23 apply to asm work too. Specifically, the following drifts must be refused regardless of how sympathetically they are framed:
+
+**Anti-pattern 1: Collapsing program-consequence and hardware-consequence under one word.**
+
+The word "consequence" must never carry both meanings in the same claim. If you find yourself writing "ZER catches every consequence at 100%," check whether you mean program-consequence (correct, locked) or hardware-consequence (false, floor). The split must be explicit. The discipline from `firmware_safety_extensions.md` §1 applies: program-consequence is caught, hardware-consequence is floor, and "consequence" by itself is ambiguous and forbidden in external claims.
+
+**Anti-pattern 2: Opening Layer 2's contract language.**
+
+The closed-vocabulary kind-difference is the load-bearing distinction from SPARK. The moment Layer 2 is allowed to carry free-form `requires:` predicates, free-form `effect:` clauses, or any other open-shape declarations, the kind-difference dissolves. Refuse this regardless of the use case argument. If a binding needs something the closed vocabulary cannot express, the fix is a Layer 1 schema extension via release, not a Layer 2 escape hatch.
+
+**Anti-pattern 3: Committing ZER core to a favored ISA.**
+
+The "ship x86 reference in core" temptation reappears under variants: "just for bootstrap," "as a baseline implementation," "as the default fallback." Each variant smuggles the favored-ISA commitment back into Layer 1. The structure/semantics straddle (§1.7.5) is the reason this is wrong: ZER core cannot know what an x86 instruction means without committing to x86's semantics, which makes ZER an "x86 language wearing a portable costume." The packaging decision (whether ZER team maintains a canonical x86 Layer 2 library separately) is independent and can be made empirically; the Layer 1 commitment must stay ISA-less.
+
+**Anti-pattern 4: Letting raw asm in naked become a "regular" path.**
+
+Raw asm in naked functions remains the escape hatch for the irreducible ~0.1% (boot stubs, hand-tuned crypto sequences, pre-runtime code). It must not be treated as a Layer 4 or as a normal alternative to Layer 2 bindings. Every operation expressible as a Layer 1 semantic operation must go through Layers 1-2. Raw asm in naked is the bounded floor, marked by mandatory `safety:` annotation, surfaced for review, and structurally separate from the layered safety story.
+
+**Anti-pattern 5: Verifying asm strings against contracts.**
+
+The temptation reappears: "what if we verify the asm body matches the declared categories?" This requires per-instruction semantic knowledge across all ISAs — which is exactly the unbounded catalog Level C rejected. The closed-vocabulary discipline accepts that asm body correctness is the floor; trying to verify it brings back the maintenance hell Levels C and D were designed to avoid.
+
+**Anti-pattern 6: Free-form `requires:` predicates "just for this one case."**
+
+The "just one case" framing always smuggles back the open-vocabulary surface. Refuse. The closed vocabulary is the architecture; opening it for any case opens it structurally. If a real use case demands a precondition the closed vocabulary cannot express, the fix is a Layer 1 schema extension — frozen, reviewed, released. Never a per-binding freedom.
+
+**Anti-pattern 7: Treating "blast radius worse than Rust unsafe" as the differentiator.**
+
+The Level D analysis (§1.6.7) honestly named that wrong contracts in `@intrinsic_def` poison the verifier's reasoning about callers — a worse blast radius than Rust's `unsafe` block. This remains true under Option E. The differentiator from Rust is NOT "smaller blast radius" — it is the **closed-vocabulary checklist-reviewable trust gap** (§1.7.6). Do not let "smaller blast radius" become the public claim; it is false. The honest claim is the closed-vocabulary kind-difference, paired with the demand/promise asymmetry rule from §1.6.17 as the blast-radius mitigation.
+
+**Anti-pattern 8: Inventing time estimates or coverage percentages.**
+
+The drift pattern documented in `firmware_safety_extensions.md` §23 applies here: time estimates ("3 weeks for Gap X") and coverage percentages ("30-40% of asm code surface") generated under pressure to produce concrete planning are not derived from measurement. They feel concrete but they are hallucinations styled as planning. Refuse. The work is real and bounded by the schema design; sequencing matters but durations are speculative.
+
+### 1.7.15. Anti-patterns specific to Layer 2 binding authorship
+
+In addition to the architectural anti-patterns above, Layer 2 binding authors should refuse:
+
+**Layer 2 anti-pattern A: Over-broad categories.**
+
+Declaring `clobbers_flags` on every binding "just to be safe" is over-restriction, which causes false-rejection at call sites that don't actually clobber flags. The demand/promise asymmetry (§1.6.17) means over-restriction is sound but annoying. The discipline: declare the categories the binding actually exhibits, no more.
+
+**Layer 2 anti-pattern B: Under-broad categories.**
+
+The dual error: omitting `clobbers_flags` on a binding that actually does clobber flags. This is under-restriction, which causes silent unsafety at call sites that rely on flag preservation. This is the SPARK-style trust gap exactly at the wrong-contract failure mode. The discipline: cross-check declared categories against the asm body via the closed checklist; review is the mitigation.
+
+**Layer 2 anti-pattern C: Cross-ISA "equivalent enough" bindings.**
+
+When binding the same Layer 1 operation across multiple ISAs, the bindings must be semantically equivalent. "x86 ADC and ARM ADCS are close enough" is not equivalent if their corner cases differ (different flag-update conditions, different operand-size constraints). The discipline: each binding honors its declared Layer 1 contract; if the ISAs cannot deliver equivalent semantics, the binding is invalid and the operation is unbindable on that ISA (mark missing-arch per §1.6.18).
+
+**Layer 2 anti-pattern D: Composing blessed primitives in user libraries to fake `@core::*` status.**
+
+If a user library wraps a Layer 1 `@core::*` operation and re-exports it under a `@<lib>::*` name, the composed library's call site loses the Layer 1's blessed soundness level (it drops to Layer 2 conditional soundness). The discipline: composition is allowed but the soundness level propagates downward, not upward.
+
+**Layer 2 anti-pattern E: Implicit ISA assumptions in operation signatures.**
+
+Operation signatures should not encode ISA-specific assumptions (e.g., register names, word widths beyond the typed `T`). Layer 1's job is to keep the operation taxonomy ISA-neutral; Layer 2 bindings handle the per-ISA realization. If an operation signature contains `register: u64` referring to an x86 register class, that is a Layer 1 design bug, not a Layer 2 binding issue.
+
+### 1.7.16. Comparison with prior architectures (Level C, Level D, Option C)
+
+For completeness, here is how Option E differs from each of the architectures considered earlier in this document.
+
+| Property | Level C (1.5) | Level D (1.6) | Option C (rejected) | **Option E (locked)** |
+|---|---|---|---|---|
+| Per-instruction database | Deleted (defer to GCC) | Deleted (defer to GCC) | Deleted (defer to GCC) | **Deleted (defer to GCC)** |
+| Register tables | Deleted | Deleted | Deleted | **Deleted** |
+| CPU feature enum | Deleted | Deleted | Deleted | **Deleted** |
+| Catalog of 130 intrinsics in core | Yes (frozen, ZER-team-owned) | Yes (blessed @core::*, ZER-team-authored per-ISA dispatch) | Yes (x86 reference shipped in core) | **No — operation taxonomy lives in core, per-ISA bindings live in Layer 2 libraries** |
+| User-extensible intrinsics | No | Yes (@intrinsic_def, @<lib>::*) | Yes (community per-ISA libraries) | **Yes (Layer 2 @bind libraries)** |
+| Favored ISA in language core | None explicit (but 130 intrinsics have x86_64 dispatch in core) | None explicit (but @core::* intrinsics have per-ISA dispatch in core) | x86 explicit | **None — Layer 1 is ISA-less by construction** |
+| Verifier reasons over | Categories (Z-rules + safety class registry) | Categories (Z-rules + safety class registry + intrinsic_def contracts) | Categories | **Categories (closed vocabulary, no free-form predicates)** |
+| Contract language | None at user level | Structured (@intrinsic_def with requires/safety_class/effect) | Structured | **Structured + closed vocabulary discipline (no free-form predicates allowed)** |
+| Layering | 2-layer (Layer 1 intrinsics + Layer 2 raw asm in naked) | 2-layer (Layer 1 @core::* + Layer 2 @<lib>::*) + escape hatch | 2-layer with x86 reference + community per-ISA | **3-layer (Layer 1 schema/taxonomy/mechanism + Layer 2 per-ISA bindings + Layer 3 firmware) + escape hatch for ~0.1%** |
+| Program-consequence vocabulary | Implicit | Implicit | Implicit | **Explicit and locked — same vocabulary as firmware_safety_extensions.md** |
+| Hardware-consequence floor location | Per-intrinsic catalog entry (ZER-team-owned) | Per-intrinsic_def declaration site (ZER team for @core::*, library author for @<lib>::*) | Per-binding declaration site, with x86 reference owned by ZER team | **Per-@bind declaration site, no ISA owned by ZER team in core (governance decision separable)** |
+| SPARK comparison | Bounded catalog, not contract-bearing for user code | Contract-bearing for user-defined intrinsics; trust gap surfaced | Contract-bearing; trust gap surfaced with x86 reference as baseline | **Contract-bearing; closed-vocabulary kind-difference elevated to load-bearing distinction** |
+| Structure/semantics straddle observation | Implicit | Implicit | Implicit | **Explicit — named as the architectural reason E is forced** |
+
+Option E preserves Level D's `@intrinsic_def` mechanism, demand/promise asymmetry rule (§1.6.17), and missing-arch propagation rule (§1.6.18). It refines the layering, makes the ISA-less commitment explicit in Layer 1, elevates the closed-vocabulary discipline to load-bearing thesis, and applies the program-consequence vocabulary uniformly.
+
+### 1.7.17. Implementation work order under Option E
+
+The implementation sequence, with dependencies but **no time estimates** (those were drift in earlier drafts):
+
+1. **Level C cleanup first.** Per the existing plan in this document (Section 16), delete per-instruction database, register tables, CPU feature enum, probe scripts. This is the foundation for both Level D and Option E.
+
+2. **Level D mechanism on top of Level C.** Implement `@intrinsic_def` parser + checker + verifier dispatch + namespace convention + demand/promise asymmetry rule + missing-arch propagation rule. Per the work order in §1.6.13. This ships the mechanism Option E uses.
+
+3. **Option E factoring during Level D implementation.** The 130 existing intrinsics, instead of being declared as `@core::*` with per-ISA dispatch in core, are split into:
+   - Layer 1 operation declarations (in core, taxonomy only — no per-ISA asm).
+   - A separately-maintained Layer 2 binding library (`zer-asm-x86`) authored by ZER team but structurally peer to community libraries. This library provides the per-ISA bindings for the existing intrinsic functionality.
+4. **Schema design.** Lock the closed category vocabulary. This is the real design work — see §1.7.7 for the discipline. The vocabulary must be expressive enough to handle structurally different machine models without escape into free-form predicates.
+
+5. **Operation taxonomy design.** Lock the set of semantic operations Layer 1 ships. Factor operations by semantic equivalence across ISAs (e.g., `@arith_add_wrap` vs `@arith_add_with_carry` are separate operations because they have different category profiles even on the same ISA).
+
+6. **Reference Layer 2 libraries.** Author at minimum:
+   - `zer-asm-x86` (ZER-team-maintained, separately versioned).
+   - A second Layer 2 library for ARM Cortex-M or RISC-V to validate the schema across structurally different machine models.
+
+7. **Mechanical confirmation.** Execute the test in §1.7.11: write one binding by hand, write one Layer 3 call site, compile for both targets, verify Layer 3 stays ergonomically normal and the schema is expressive enough.
+
+8. **Documentation.** Update `docs/reference.md`, `CLAUDE.md`, and `firmware_safety_extensions.md` with cross-references to this section. Ship the public claim using the program-consequence vocabulary.
+
+**No time estimates.** When work lands, replace this sequencing with completion records, not projected dates.
+
+**Dependencies summarized:**
+
+```
+Level C cleanup
+    └─> Level D mechanism (parser/checker/verifier)
+            ├─> Schema design (category vocabulary, operation taxonomy)
+            │       └─> Reference Layer 2 libraries
+            │               └─> Mechanical confirmation
+            │                       └─> Documentation update
+            └─> Demand/promise asymmetry rule + missing-arch propagation
+```
+
+### 1.7.18. The locked decisions, enumerated
+
+For future-session continuity (so the decisions are not re-litigated), the locked architectural commitments under Option E:
+
+1. **Program-consequence vs hardware-consequence vocabulary is locked.** The word "consequence" must never carry both meanings in external claims. Program-consequence = caught at 100%. Hardware-consequence = floor.
+
+2. **Layer 1 (ZER core) ships the schema + operation taxonomy + mechanism. No per-ISA asm in core.** The ISA-less commitment is structural; refuse "ship x86 reference in core" framings.
+
+3. **Layer 2 (per-ISA binding libraries) carries per-ISA asm bodies.** Authored once per (operation, ISA), reviewed against the closed checklist, frozen-after-review. Structurally peer libraries; whether ZER team maintains a canonical x86 binding library is a separable governance decision.
+
+4. **Layer 3 (firmware/application) imports a Layer 2 library and calls operations as typed functions.** Same ergonomics as any ZER library. Asm is invisible. No upfront declarations.
+
+5. **The structure/semantics straddle is the architectural reason this layering is forced.** Asm uniquely straddles program-domain (structure) and hardware-domain (semantics) within a single token. Any architecture that does not respect this straddle either commits to one ISA or abandons asm safety.
+
+6. **The closed verifier-native vocabulary is the load-bearing kind-difference from SPARK.** Not "smaller surface" (degree) — different failure topology (kind). SPARK contracts open-shaped; ZER contracts closed-shaped; review is bounded by the schema.
+
+7. **The contract language must stay closed.** No free-form `requires:` predicates. No free-form `effect:` clauses. No user-extensible category vocabulary in Layer 2. Extensions go through Layer 1 release with review. The closed-vocabulary discipline is the whole differentiator; opening any escape hatch dissolves the kind-difference.
+
+8. **The packaging question (who maintains canonical Layer 2 libraries) is separable from the safety architecture.** Decide empirically via the artifact, not by reasoning. Reversible decision.
+
+9. **Level D's `@intrinsic_def` mechanism, demand/promise asymmetry rule (§1.6.17), and missing-arch propagation rule (§1.6.18) survive unchanged.** Option E refines layering and ISA-reference, not the mechanism.
+
+10. **GCC continues to handle Z-level concerns** (register validity, instruction validity, CPU feature gating) per Level C.
+
+11. **Raw asm in naked is the escape hatch for the irreducible ~0.1%** (boot stubs, hand-tuned crypto, pre-runtime code). Structurally outside the three-layer model. Mandatory `safety:` annotation.
+
+12. **Time estimates and coverage percentages are not produced.** Sequencing of work is real; durations are speculative and refused per the discipline locked in `firmware_safety_extensions.md` §23.
+
+13. **The mechanical confirmation test (§1.7.11) is the only confirmation that does not drift.** Architecture review ratifies framings; only the artifact (write one binding) confirms the layering.
+
+These commitments are locked in 2026-06-06. Future sessions reading this section should treat them as architectural facts, not as open design questions.
+
+### 1.7.19. The honest public claim, locked
+
+The defensible public claim for ZER's asm safety, stated with the locked vocabulary:
+
+> ZER's asm safety architecture provides 100% program-consequence coverage: every call site of every semantic operation in ZER source code is verified at compile time against the operation's declared category profile. The verification dispatches to ZER's existing structural analyses (Z-rules, escape analysis, provenance preservation, qualifier preservation, alignment, ordering, context propagation) and reasons only over the closed category vocabulary. This holds for every Layer 3 firmware call site, regardless of which Layer 2 per-ISA binding library compiles, regardless of whether the binding's declared categories actually match the asm semantics on the target ISA. Program-consequence is total over the call-site axis.
+>
+> Hardware-consequence — whether the asm body inside a `@bind` declaration actually has the categories declared, whether the ISA semantics match the binding's claims, whether the silicon honors the ISA manual — is the floor, surfaced at the `@bind` declaration site, reviewable as a finite checklist because the contract language is closed. The library author owns binding-correctness; the closed-vocabulary discipline ensures the review surface is bounded.
+>
+> The architecture rests on three structural commitments: (1) ZER core ships the closed category vocabulary + the semantic operation taxonomy + the `@intrinsic_def` / `@bind` mechanism, with **zero per-ISA bindings in language core** — the operation set is ISA-less by construction. (2) Per-ISA bindings live in Layer 2 libraries authored against the closed schema; libraries are structurally peer to each other, with packaging of canonical libraries as a separable governance decision. (3) Layer 3 firmware/application code imports a Layer 2 binding library and calls operations as typed functions, never seeing asm, never touching the schema, with same ergonomics as importing any other ZER library.
+>
+> The architectural distinction from contract-based verification approaches (SPARK, ACSL, Vale) is the **closed verifier-native vocabulary**: where SPARK's contract language is unbounded predicates that can be wrong in arbitrary ways, ZER's `@bind` declarations select from a closed, ZER-owned category vocabulary that the verifier already knows how to reason about. The trust gap is real and bounded — not absent — but its failure topology is fundamentally different: a fixed, finite shape that allows mechanical checklist review against the schema, rather than open-ended proof obligations against arbitrary predicates. SPARK's gap is open-shaped; ZER's gap is closed-shaped. Same existence; different reviewability.
+>
+> The structure/semantics straddle observation explains why asm uniquely requires this binding mechanism while every other ZER construct sits cleanly on one side of the program-domain / hardware-domain boundary: an asm instruction simultaneously carries program-domain structure (operand connections, dataflow, clobber accounting) and hardware-domain semantics (instruction meaning, per-ISA). The two are fused in a single token; the language core cannot import the semantics without committing to an ISA. The three-layer model with no favored ISA in core is the unique factoring that respects this straddle without either committing the language to one ISA or abandoning asm meaning verification.
+>
+> The escape hatch — raw asm in naked functions for the irreducible ~0.1% (boot stubs, hand-tuned crypto, pre-runtime code) — remains structurally outside the three-layer model, marked by mandatory `safety:` annotation, surfaced for review at the `naked fn` boundary. This is the bounded floor that every memory-safe systems language has at the asm boundary; ZER's contribution is the bounded structural shape of the trust gap, not its absence.
+
+This claim survives reviewer attack because:
+- "100% program-consequence" is literal and verifiable by inspection of the verifier dispatch (it reasons over categories, never over asm strings).
+- "Hardware-consequence floor" is named and bounded by the closed schema.
+- The closed-vocabulary distinction from SPARK is structurally checkable (the contract language is not Turing-complete; the predicate set is finite).
+- The three-layer architecture is locked by construction; future sessions cannot drift to "ship x86 reference in core" without breaking the locked commitment in §1.7.18 #2.
+- The structure/semantics straddle is a load-bearing architectural fact, not a marketing framing.
+- No "100% safe" overclaim. No time estimates. No coverage percentages. No invented numbers.
+
+### 1.7.20. Glossary — terms locked for future-session continuity
+
+For continuity across fresh sessions, the following terms are locked with the meanings stated:
+
+| Term | Locked meaning |
+|---|---|
+| **Program-consequence** | What happens when a value is used wrongly inside ZER source code. Caught at 100% because the use is in the program. See `firmware_safety_extensions.md` §1 and §22 for the parallel firmware statement. |
+| **Hardware-consequence** | What happens when a hardware fact is wrong relative to user belief (silicon doesn't honor declared region, asm body doesn't honor declared categories, board's crystal doesn't deliver declared frequency). Floor. The criterion lives outside the program. |
+| **Layer 1** | ZER core: closed category vocabulary + semantic operation taxonomy + `@intrinsic_def` / `@bind` mechanism + verifier dispatch. **No per-ISA bindings.** Frozen and extended only via ZER core release with review. |
+| **Layer 2** | Per-ISA binding library: `@bind` declarations mapping Layer 1 operations to per-ISA asm bodies, selecting categories from Layer 1's closed vocabulary. Authored once per (operation, ISA), reviewed against the closed checklist, frozen-after-review. Structurally peer to other Layer 2 libraries. |
+| **Layer 3** | Firmware / application code: imports a Layer 2 library, declares firmware-side things (mmio, linker symbols, vector table per `firmware_safety_extensions.md`), calls Layer 1 operations as typed functions. Ergonomically normal — same workflow as importing any ZER library. |
+| **Escape hatch** | Raw asm in naked functions for the irreducible ~0.1% (boot stubs, hand-tuned crypto, pre-runtime code). Structurally outside Layers 1-3. Mandatory `safety:` annotation. Same conceptual category as cinclude and Rust's `unsafe { asm!() }`. |
+| **Closed category vocabulary** | The fixed, finite set of structural-behavior categories that Layer 2 `@bind` declarations select from. ZER-owned, extended only via ZER core release. The load-bearing distinction from SPARK. |
+| **Operation taxonomy** | The fixed, finite set of semantic operations Layer 1 declares (`@arith_add_with_carry`, `@load_acquire`, `@barrier_full`, etc.). ZER-owned, extended via ZER core release. Each operation has a fixed category profile that applies across all ISA bindings. |
+| **Structure/semantics straddle** | The architectural observation that an asm instruction uniquely carries both program-domain structure (operand connections, dataflow) and hardware-domain semantics (instruction meaning per ISA) within a single token. This straddle is the reason asm requires the binding mechanism while every other ZER construct sits cleanly on one side of the boundary. |
+| **Closed-vocabulary kind-difference** | The load-bearing distinction from SPARK: ZER's contract language is closed (selection from finite vocabulary), so the trust gap has a fixed shape and review is a finite checklist. SPARK's contract language is open (arbitrary predicates), so the trust gap has open shape and review is an open-ended proof obligation. Same trust-gap existence; different failure topology. |
+| **N/A on this ISA** | The disposition some categories take on ISAs that structurally lack the property (e.g., `clobbers_flags` is N/A on RISC-V because no flag register exists). The schema handles this directly; bindings can mark categories N/A without requiring per-ISA category vocabulary variation. |
+| **Demand** | A declaration in a `@bind` that causes the verifier to do MORE checking on callers. Free — over-restriction at worst, never under-protection. See §1.6.17. |
+| **Promise** | A declaration in a `@bind` that causes the verifier to do LESS checking on callers. Must be either verifier-checkable or explicitly taint the caller's soundness level. See §1.6.17. |
+| **Missing-arch propagation** | The rule that a call to an operation with no Layer 2 binding for the current compile target is a compile error at the call site. Supported-archs is part of the operation's contract; callers' portability is bounded by the intersection of all transitively-called operations' supported-arch sets. See §1.6.18. |
+| **Mechanical confirmation test** | Writing one Layer 2 `@bind` by hand against the schema and compiling one Layer 3 call site, to validate the layering actually delivers ergonomic Layer 3 and a closed-vocabulary-expressible Layer 2 binding. See §1.7.11. |
+
+These glossary entries are the canonical reference for future sessions. If a future framing uses any of these terms with a different meaning, treat as drift and re-derive against this section.
+
+### 1.7.21. Closing — the architectural commitments preserved across the asm thread
+
+Across the asm safety thread spanning Levels A, B, C, D, and the Option C-vs-D-vs-E exploration, the following commitments have remained invariant and are preserved under Option E:
+
+1. **Grammar-level closure for the language as a whole.** No in-language `unsafe` keyword. The only escape paths are the explicit cross-language boundaries (cinclude, naked asm, `@bind` for asm), each grep-able and marked. See `CLAUDE.md` "ZER's Goal" section and the Anders et al. 2024 "infinite unsafe impedance" citation.
+
+2. **GCC delegates Z-level concerns.** Register validity, instruction validity, CPU feature gating belong to the user's C compiler. Locked at Level C.
+
+3. **Definition A scoping discipline.** ZER verifies access mechanism structurally; semantic correctness against external substrates (hardware spec, vendor HAL, linker script, ISA manual) is user/library responsibility supplied through declaration sites with audit visibility.
+
+4. **No per-instruction database for semantic verification.** Verifying "this asm does what the contract says" requires per-instruction semantic knowledge across all ISAs — exactly the unbounded catalog Level C rejected. The closed-vocabulary discipline accepts this as the floor.
+
+5. **Sole-developer-sustainable maintenance burden.** ZER team's ongoing work is bounded: schema design once (rare extensions per several years), operation taxonomy design once (rare extensions per several years), mechanism shipped once. No per-ISA catalog growth on ZER team's desk.
+
+6. **Architecture-agnostic positioning.** ZER works on every architecture GCC supports, with no per-ISA commitment in the language core. Per-ISA libraries fill the binding layer; user firmware code is portable across ISAs that have Layer 2 binding coverage for the operations used.
+
+7. **Honest scoping of safety claims.** No "100% safe" without qualifier. No collapsing of program-consequence and hardware-consequence. No invented numbers. The trust gap is named and bounded.
+
+These are the load-bearing commitments. Option E is the architectural shape that preserves all of them while resolving the layering, ISA-reference, and SPARK-distinction questions that remained open through Level D. The work to ship is the implementation work order in §1.7.17, with the mechanical confirmation test in §1.7.11 as the artifact-decides discipline applied at the right granularity.
+
+The architecture is locked. The work is bounded. The discipline is documented.
+
+### 1.7.22. Schema design rationale — the closed category vocabulary in depth
+
+The closed category vocabulary is the load-bearing artifact in Option E. Its design discipline determines whether the architecture stays structurally distinct from SPARK or collapses into "tidier SPARK." This subsection captures the design principles for the category vocabulary so future schema-extension proposals can be evaluated against the locked discipline.
+
+**Design principle 1: Categories describe structural behavior kinds, not instruction properties.**
+
+A category like `clobbers_flags` describes "this operation, when executed, may invalidate the contents of the flag register class." It does not describe "this specific x86 instruction sets ZF based on result." The category is ISA-neutral; the binding's asm body realizes the category on the specific ISA. A category named after a specific instruction (e.g., `is_xmm_movaps`) is a design bug — it would tie Layer 1 to a specific ISA's nomenclature.
+
+The correct shape:
+- ✓ `clobbers_flags`, `reads_mem(width, ordering)`, `requires_aligned(operand, n)`
+- ✗ `is_x86_cmpxchg`, `arm_load_exclusive`, `riscv_lr_sc_pair`
+
+**Design principle 2: Categories must be verifier-native.**
+
+Each category dispatches to an existing safety analysis. No category that requires a brand-new compiler analysis. The available analyses:
+
+- Type system (operand type checking)
+- Z-rules (asm operand boundary checks: Z1 handle state, Z2 move tracking, Z3 VRP, Z4 provenance, Z5 escape, Z6 context, Z7 MMIO, Z8 qualifier, Z11 non-storable, Z12 keep)
+- VRP (value range propagation)
+- Alignment tracking (in pointer types and access patterns)
+- Provenance preservation (across casts, pointer arithmetic, function call boundaries)
+- Escape analysis (whether pointers escape locals, asm clobbers, calls)
+- Qualifier preservation (volatile, const)
+- Context flag propagation (naked, ISR, critical, atomic)
+- Bounds checking (slice access, runtime auto-guard)
+- Allocator coloring (Pool vs Slab vs Arena vs Handle)
+
+A proposed category that does not dispatch to one of these analyses fails the verifier-native requirement. The fix is either:
+- Reformulate the category to dispatch to an existing analysis
+- Reject the category (it doesn't belong in Layer 1)
+- Add a new safety analysis (per-decade event, very rare, requires substantial design)
+
+**Design principle 3: Categories support "N/A on this ISA" without category vocabulary variation.**
+
+Different machine models have structurally different properties. RISC-V has no flag register. CHERI has capability-tagged pointers. Some ISAs have hardware atomic primitives others lack. The schema must accommodate this without adding per-ISA category vocabulary.
+
+The N/A disposition mechanism:
+
+```
+@bind operation_x isa: riscv64 {
+    asm { ... }
+    isa_disposition: {
+        clobbers_flags: N/A    // RISC-V has no flag register
+    }
+}
+```
+
+The verifier handles N/A categories by skipping the check on this binding (the category doesn't apply because the ISA doesn't have the property the category describes). This is structural, not a vocabulary extension.
+
+What N/A is NOT:
+- N/A is not "this category doesn't apply because the binding doesn't exhibit it." That would be "category not declared," not N/A. A binding that doesn't clobber flags simply doesn't declare `clobbers_flags`.
+- N/A is "this category cannot apply on this ISA because the ISA lacks the property the category describes." It is an ISA-level disposition, not a binding-level choice.
+
+**Design principle 4: Categories must be finite-state, not arbitrary predicates.**
+
+A category like `requires_in_range(operand, lo, hi)` is finite-state — it dispatches to VRP with concrete numeric bounds. A category like `requires_user_specified_predicate(P)` is open-shape — it would dispatch to an arbitrary predicate evaluator. The latter is forbidden by the closed-vocabulary discipline.
+
+This means certain natural-feeling requirements cannot be expressed as categories:
+- "This operation requires the input to be a prime number" — open-shape, rejected.
+- "This operation requires the input to satisfy `P(x) && Q(x) || R(x)`" — open-shape, rejected.
+- "This operation requires the input to be aligned to a non-power-of-two boundary" — depends on what "non-power-of-two boundary" means; if it's a fixed alignment value, expressible; if it's a runtime-computed condition, rejected.
+
+The discipline: if the requirement cannot be expressed as a finite-state category, either find a finite-state proxy that approximates it (over-restriction is sound by the demand asymmetry) or reject the operation as un-binadable via the closed schema. Open-shape escape into predicates is forbidden.
+
+**Design principle 5: Categories compose by intersection, not by union.**
+
+A binding declares a set of categories that the asm exhibits. The verifier treats this as the intersection of all declared properties — every category must hold for the binding to be valid. Removing a category from a binding strictly weakens the contract; adding a category strictly strengthens it.
+
+This composition rule has implications:
+- A binding can be made more restrictive (add categories) without breaking callers.
+- A binding cannot be made less restrictive (remove categories) without potentially breaking callers that relied on the missing category.
+- Cross-binding equivalence requires identical category sets (modulo N/A dispositions for ISAs that lack the property).
+
+**Design principle 6: Categories are versioned.**
+
+Schema extensions (adding new categories) are versioned with the language release. A Layer 2 binding that uses a category introduced in version N requires compiler version >= N. The versioning is mechanical, not a per-binding declaration; it falls out of the schema-release process.
+
+Removing categories from the schema is a breaking change. The discipline: rarely remove. If a category turns out to be misdesigned, prefer deprecation (mark deprecated, encourage migration to a better category, remove in a future major version) over immediate removal.
+
+**Design principle 7: Categories enable safety, not optimization.**
+
+Categories describe safety-relevant properties — what guarantees the verifier can rely on at call sites to maintain program-consequence. They do NOT describe optimization-relevant properties (e.g., "this operation is constant-time," "this operation can be vectorized"). Optimization properties belong to a different concern (the compiler's optimization pipeline) and would dilute the safety-focused vocabulary.
+
+A proposed category that aims to enable an optimization rather than enforce a safety property fails this principle.
+
+### 1.7.23. Operation taxonomy factoring — when to split, when to unify
+
+The operation taxonomy design has its own discipline, distinct from the category vocabulary design. The key question: when should two superficially-similar operations be the same Layer 1 operation, and when should they be split?
+
+**Factoring principle 1: Split by category profile, not by ISA spelling.**
+
+Two operations should be separate Layer 1 entries if their category profiles differ structurally, even if some ISAs use the same instruction for both. Conversely, two operations should be the same Layer 1 entry if their category profiles are identical, even if different ISAs use different instructions.
+
+The ADD/flags example:
+- `@arith_add_wrap(a, b) -> T` — categories: `{no_memory_effect, no_flag_effect, value_in_value_out}`
+- `@arith_add_with_carry(a, b, c_in) -> {result, c_out}` — categories: `{no_memory_effect, produces_carry, consumes_carry, value_in_value_out, clobbers_flags}` (with N/A on flagless ISAs)
+
+These are different operations because their category profiles differ structurally (`clobbers_flags` and `produces_carry` are in one but not the other). On x86, the `add` instruction binds to `@arith_add_wrap` (no flag setting required by the operation, though x86 always sets them — see factoring principle 3 below) while `adc` binds to `@arith_add_with_carry`. On ARM Cortex-M, `ADD` binds to `@arith_add_wrap` and `ADCS` binds to `@arith_add_with_carry`. Same factoring principle across ISAs.
+
+**Factoring principle 2: Unify by semantic equivalence across ISAs.**
+
+If two operations differ only in ISA-specific spelling but have the same semantic contract, they are the same Layer 1 operation. The Layer 2 bindings handle the per-ISA realization. `@arith_xor(a, b)` is one Layer 1 operation with bindings to `eor` (ARM), `xor` (x86), `xor` (RISC-V), etc. — all the same Layer 1 operation because the semantics (bitwise xor of two operands) are identical and the category profile is identical.
+
+**Factoring principle 3: ISA-specific side effects that the operation does not require are not part of the category profile.**
+
+x86's plain `add` instruction always sets flags. But the operation `@arith_add_wrap(a, b) -> T` does not REQUIRE flags to be set — it requires only the wrap-around add semantic. So `clobbers_flags` is NOT in `@arith_add_wrap`'s category profile, even though the x86 binding will incidentally clobber flags.
+
+The principle: the category profile describes what the operation REQUIRES of the binding, not what every binding incidentally produces. If the x86 binding happens to clobber flags as a side effect of using `add`, that is the x86 binding's responsibility to handle (via the asm operand constraints declaring clobbers), but it is not part of the operation's contract.
+
+This means callers of `@arith_add_wrap` cannot assume flags are clobbered, even on x86. If they need post-operation flag state, they should use `@arith_add_with_carry` or a different operation whose category profile includes flag effects.
+
+**Factoring principle 4: Width parameterization through type generics.**
+
+Operations should be parameterized by operand type rather than having separate entries per width. `@arith_add_wrap<T>(a: T, b: T) -> T where T in {u8, u16, u32, u64}` is one operation parameterized by T, not four separate operations. Each Layer 2 binding can dispatch on T to choose the appropriate instruction (e.g., `add` for 32-bit, `add.w` for 16-bit, etc.).
+
+This keeps the operation taxonomy manageable. Splitting into per-width operations would explode the catalog and obscure the semantic equivalence.
+
+**Factoring principle 5: Memory ordering is part of the operation, not a category modifier.**
+
+`@load_acquire`, `@load_relaxed`, `@store_release`, `@store_relaxed` are separate Layer 1 operations because their memory ordering is fundamental to their contract, and the verifier reasons about ordering at the operation-call level.
+
+It would be tempting to have a single `@load<O>(ptr)` parameterized by ordering, but this creates verifier-dispatch complexity (the verifier would need to extract O from the call site to dispatch ordering-specific analyses). Separate operations are clearer.
+
+**Factoring principle 6: Atomic primitives are separate operations from non-atomic equivalents.**
+
+`@atomic_fetch_add(ptr, val)` is a separate operation from `@arith_add_wrap`. The atomic operation's category profile includes memory-ordering and atomicity categories that the non-atomic version doesn't have. Splitting these is essential for verifier dispatch — the verifier reasons about lock-freedom, ordering, and atomicity only at atomic-operation call sites.
+
+**Factoring principle 7: Reject operations whose semantics cannot be expressed via existing categories.**
+
+If a proposed operation requires a category that doesn't exist in the schema, the operation cannot enter the taxonomy until the schema is extended. The closed-vocabulary discipline applies to both axes: the category vocabulary is closed, and the operation taxonomy can only declare operations expressible in the existing schema.
+
+If a real-world need keeps surfacing operations that the schema can't express, that is the signal for a Layer 1 schema-extension cycle. Both the category vocabulary and the operation taxonomy are extended through ZER core release with review.
+
+### 1.7.24. Worked examples — more operations across machine models
+
+To stress-test the schema design across structurally different machine models, here are additional worked examples covering memory ordering, atomic primitives, vector operations, and CPU-state intrinsics.
+
+**Example 4 — Atomic compare-and-swap:**
+
+```
+// Layer 1 (ZER core, frozen)
+@intrinsic_def atomic_cas(ptr: *T, expected: T, new: T) -> {result: T, success: bool}
+    where T in {u32, u64, usize}
+    categories: {
+        reads_mem(sizeof(T), seqcst),
+        writes_mem(sizeof(T), seqcst),
+        atomic_rmw,
+        requires_aligned(ptr, alignof(T)),
+        no_flag_effect_required,
+        value_in_value_out
+    }
+    safety: "Atomic compare-and-swap with sequential consistency.
+             If *ptr == expected, atomically updates *ptr to new
+             and returns {result: expected, success: true}.
+             Otherwise, returns {result: *ptr, success: false}
+             with *ptr unchanged. Requires aligned ptr."
+
+// Layer 2 (zer-asm-x86)
+@bind atomic_cas isa: x86_64 {
+    asm { instructions: "lock cmpxchg $2, ($0)\n"
+                        "sete $3"
+          inputs:  [ptr, expected => RAX, new]
+          outputs: [result => RAX, success => $3]
+          clobbers: ["flags"]
+          safety:  "x86 LOCK CMPXCHG: atomic compare-and-swap.
+                    Compares *ptr with RAX (expected); if equal,
+                    writes new to *ptr and sets ZF. Otherwise loads
+                    *ptr into RAX and clears ZF. SETE captures ZF
+                    into success operand. Categories all hold;
+                    LOCK prefix provides seqcst ordering on x86." }
+}
+
+// Layer 2 (zer-asm-arm-cortex-a)
+@bind atomic_cas isa: arm_cortex_a {
+    asm { instructions: "1: ldaxr $0, [$1]\n"
+                        "   cmp $0, $2\n"
+                        "   b.ne 2f\n"
+                        "   stlxr $w3, $4, [$1]\n"
+                        "   cbnz $w3, 1b\n"
+                        "   mov $3, #1\n"
+                        "   b 3f\n"
+                        "2: clrex\n"
+                        "   mov $3, #0\n"
+                        "3:"
+          inputs:  [ptr, expected, new]
+          outputs: [result => $0, success => $3]
+          clobbers: ["NZCV", "memory"]
+          safety:  "ARMv8 LL/SC compare-and-swap via LDAXR/STLXR.
+                    Acquire-release ordering for seqcst.
+                    Loop on STLXR failure (race retry).
+                    CLREX clears monitor on mismatch path.
+                    Categories all hold including seqcst ordering." }
+}
+
+// Layer 2 (zer-asm-riscv)
+@bind atomic_cas isa: riscv64 {
+    asm { instructions: "1: lr.d.aq $0, ($1)\n"
+                        "   bne $0, $2, 2f\n"
+                        "   sc.d.rl $w3, $4, ($1)\n"
+                        "   bnez $w3, 1b\n"
+                        "   li $3, 1\n"
+                        "   j 3f\n"
+                        "2: li $3, 0\n"
+                        "3:"
+          inputs:  [ptr, expected, new]
+          outputs: [result => $0, success => $3]
+          clobbers: ["memory"]
+          safety:  "RISC-V LR/SC compare-and-swap with .aq/.rl
+                    for seqcst ordering. Loop on SC failure.
+                    Categories all hold; ordering acquired via
+                    LR.aq + SC.rl combination." }
+}
+```
+
+The three bindings have substantially different sizes — x86 is two instructions, ARM and RISC-V are LL/SC loops. All three honor the same Layer 1 category profile. Layer 3 firmware code calling `@atomic_cas(...)` is identical across all three targets.
+
+**Example 5 — CPU privileged-mode intrinsics:**
+
+```
+// Layer 1 (ZER core, frozen)
+@intrinsic_def cpu_disable_int()
+    categories: {
+        no_memory_effect,
+        changes_context(disable_interrupts),
+        requires_privilege(kernel),
+        no_flag_effect_required
+    }
+    safety: "Disable interrupts. Must be called from privileged
+             context. Acquires implicit critical-section semantics
+             from disable point to corresponding enable."
+
+@intrinsic_def cpu_enable_int()
+    categories: {
+        no_memory_effect,
+        changes_context(enable_interrupts),
+        requires_privilege(kernel),
+        no_flag_effect_required
+    }
+    safety: "Enable interrupts. Must be called from privileged
+             context. Releases implicit critical-section."
+
+// Layer 2 (zer-asm-x86)
+@bind cpu_disable_int isa: x86_64 {
+    asm { instructions: "cli"
+          inputs: []
+          outputs: []
+          clobbers: ["flags"]    // CLI clears IF in EFLAGS
+          safety: "x86 CLI: clear interrupt flag. Requires CPL <= IOPL.
+                   Categories all hold; clobbers flags via EFLAGS update." }
+}
+
+@bind cpu_enable_int isa: x86_64 {
+    asm { instructions: "sti"
+          inputs: []
+          outputs: []
+          clobbers: ["flags"]
+          safety: "x86 STI: set interrupt flag. Requires CPL <= IOPL." }
+}
+
+// Layer 2 (zer-asm-arm-cortex-a)
+@bind cpu_disable_int isa: arm_cortex_a {
+    asm { instructions: "msr daifset, #0x2"
+          inputs: []
+          outputs: []
+          clobbers: []
+          safety: "ARMv8 MSR DAIFSET #0x2: set I bit, disabling IRQ.
+                   Requires EL >= 1." }
+}
+
+@bind cpu_enable_int isa: arm_cortex_a {
+    asm { instructions: "msr daifclr, #0x2"
+          inputs: []
+          outputs: []
+          clobbers: []
+          safety: "ARMv8 MSR DAIFCLR #0x2: clear I bit, enabling IRQ.
+                   Requires EL >= 1." }
+}
+```
+
+**Example 6 — Vector load (illustrating type parameterization across vector widths):**
+
+```
+// Layer 1 (ZER core, frozen)
+@intrinsic_def vector_load_aligned(ptr: *V) -> V
+    where V in {v128_u8, v128_u16, v128_u32, v256_u8, v256_u16, v256_u32, v512_u8, ...}
+    categories: {
+        reads_mem(sizeof(V), relaxed),
+        requires_aligned(ptr, alignof(V)),
+        no_flag_effect,
+        value_in_value_out
+    }
+    safety: "Aligned vector load. Reads sizeof(V) bytes from ptr
+             as a vector value. Requires alignment to alignof(V).
+             Relaxed ordering — for ordered loads, use vector_load_acquire."
+
+// Layer 2 (zer-asm-x86) — covers SSE/AVX/AVX-512 via type dispatch
+@bind vector_load_aligned isa: x86_64 dispatch_on_type {
+    V == v128: {
+        asm { instructions: "movaps ($1), $0"
+              inputs: [ptr]
+              outputs: [result => $0]
+              clobbers: []
+              safety: "x86 MOVAPS: aligned 128-bit load into XMM register.
+                       Requires 16-byte alignment." }
+    }
+    V == v256: {
+        asm { instructions: "vmovaps ($1), $0"
+              inputs: [ptr]
+              outputs: [result => $0]
+              clobbers: []
+              safety: "x86 VMOVAPS: aligned 256-bit load into YMM.
+                       Requires 32-byte alignment; AVX." }
+    }
+    V == v512: {
+        asm { instructions: "vmovaps ($1), $0"
+              inputs: [ptr]
+              outputs: [result => $0]
+              clobbers: []
+              safety: "x86 VMOVAPS (EVEX): aligned 512-bit load into ZMM.
+                       Requires 64-byte alignment; AVX-512." }
+    }
+}
+```
+
+The `dispatch_on_type` clause in the `@bind` declaration allows one binding declaration to handle multiple type instantiations of the same operation. Each branch within the dispatch independently honors the operation's category profile. This keeps Layer 2 declarations manageable for type-parameterized operations.
+
+These examples are intentionally illustrative and incomplete; the full operation taxonomy will be designed at schema-design time. The point is to validate that the layering accommodates structurally different machine models (flag-bearing vs flagless, weak vs strong memory, LL/SC vs CAS, scalar vs vector) without escape into open-shape predicates.
+
+### 1.7.25. The full coverage matrix under Option E
+
+For comparison with the existing coverage matrix in Section 13, here is the coverage matrix as it stands under Option E.
+
+| Concern | Where verified | Verification mechanism | Floor location |
+|---|---|---|---|
+| Operand types at asm boundary | Layer 1 verifier | Existing type checker dispatched per category | None |
+| Asm-output value escape | Layer 1 verifier | Z5 escape analysis dispatched on category | None |
+| Asm-output provenance | Layer 1 verifier | Z4 provenance clearing dispatched on category | None |
+| Volatile preservation across asm | Layer 1 verifier | Z8 qualifier preservation dispatched on category | None |
+| MMIO range / alignment | Layer 1 verifier | Z7 MMIO dispatched on category | None |
+| Memory ordering at use sites | Layer 1 verifier | Ordering categories dispatched to ordering analysis | None |
+| Atomicity at use sites | Layer 1 verifier | Atomic categories dispatched to RMW analysis | None |
+| Context (ISR / critical / naked) propagation | Layer 1 verifier | Context flags propagated through call graph | None |
+| Operand alignment requirement | Layer 1 verifier | Alignment category dispatched to existing alignment tracking | None |
+| Operand range requirement | Layer 1 verifier | Range category dispatched to VRP | None |
+| Operand non-null requirement | Layer 1 verifier | Non-null category dispatched to nullability tracking | None |
+| Clobber accounting | Layer 1 verifier | Z3 / existing clobber tracking | None |
+| Cross-binding semantic equivalence | Library author + reviewer | Closed-checklist review of `@bind` against Layer 1 categories | Layer 2 binding-correctness floor |
+| Asm body matches declared categories | Library author + reviewer | Closed-checklist review of `@bind` against asm text | Layer 2 binding-correctness floor |
+| ISA instruction validity | GCC assembler | GCC's existing instruction validity check | GCC error (not ZER) |
+| Register name validity | GCC assembler | GCC's existing register validity check | GCC error (not ZER) |
+| CPU feature gating (e.g., AVX-512 only on -mavx512f) | GCC assembler | GCC's existing CPU feature check via -m flags | GCC error (not ZER) |
+| ISA spec correctness (silicon matches manual) | None | Outside any language's reach | Hardware floor |
+| Cross-ISA binding equivalence | Library author | Author's contract to users | Layer 2 binding-author responsibility |
+| Hardware-consequence of binding categories not matching silicon | None | Outside any language's reach | Hardware floor at `@bind` site |
+
+The pattern: Layer 1 covers all program-consequence aspects of asm-bearing code. Layer 2 carries the binding-correctness floor at well-defined declaration sites. GCC handles Z-level concerns. The hardware floor exists at the binding-vs-silicon boundary and is named, bounded, and reviewable as a finite checklist.
+
+### 1.7.26. Journey of the asm-thread architecture decisions
+
+Future sessions reading this document will need to understand how the architecture reached Option E without re-litigating it. Here is the abbreviated journey across the asm thread:
+
+**Phase 1 — Initial direction (`asm_plan.md`, pre-2026-05):** Build per-instruction safety knowledge into the compiler. Vendored instruction tables. Register-name validation. CPU feature gating. CFG-aware OrderingState pass. Y_intrinsic catalog ZER-team-authored and ZER-team-maintained.
+
+**Phase 2 — Levels A/B/C decision (2026-05-12):** Aggressive cleanup. Delete per-instruction database, register tables, CPU feature enum, probe scripts. Defer everything ISA-specific to GCC. Keep frozen core (Z-rules, naked-only, ~12 UB classics) + 130 intrinsics. This is Level C; it shipped as the deletion baseline.
+
+**Phase 3 — Two-layer crystallization (2026-05-12 evening):** Intent intrinsics (Layer 1) + raw asm in naked (Layer 2 / escape hatch). All "richer" designs (per-operand annotations, IR region wrappers, auto-guard emission) deferred indefinitely. The 2-layer model is the resting architecture for Level C.
+
+**Phase 4 — Level D pivot (2026-05-31):** Externalize Y_intrinsic authorship via `@intrinsic_def`. Layer 1 becomes blessed `@core::*` intrinsics; Layer 2 becomes user-defined `@<lib>::*` intrinsics. Mechanism enables unbounded community growth without ZER team involvement. The seam (wrong contract at definition site) is named explicitly; mitigation via demand/promise asymmetry rule (§1.6.17) and missing-arch propagation rule (§1.6.18).
+
+**Phase 5 — Program-consequence vocabulary lockdown (2026-06-05/06):** The "consequence" word collapses program-domain caught-set and hardware-domain floor under one number; this is identified as the load-bearing equivocation. The vocabulary is locked at `firmware_safety_extensions.md` and `CLAUDE.md`: program-consequence (caught at 100%) vs hardware-consequence (floor). The split is then applied to asm.
+
+**Phase 6 — Three-layer / no-favored-ISA refinement (2026-06-06):** The Level D 2-layer model is refined to three layers. The key move is removing per-ISA asm from Layer 1 (language core) entirely. Layer 1 ships the schema + operation taxonomy + mechanism. Layer 2 ships per-ISA bindings (community libraries, structurally peer). Layer 3 is firmware/application code (import and call). This is Option E.
+
+**Phase 7 — Structure/semantics straddle articulation (2026-06-06):** The architectural reason Option E is forced rather than chosen is identified: asm uniquely straddles program-domain (structure: operand connections, dataflow) and hardware-domain (semantics: instruction meaning per ISA) within a single token. Any architecture that does not respect this straddle either commits to one ISA or abandons asm safety. Option E is the unique factoring that respects the straddle.
+
+**Phase 8 — Closed-vocabulary kind-difference elevation (2026-06-06):** The closed verifier-native category vocabulary is elevated from "one of four mitigations" to "the load-bearing kind-difference from SPARK." Trust-gap shape (open vs closed) is identified as a difference in failure topology, not just a smaller surface. The discipline that the contract language must stay closed (no free-form predicates) is locked.
+
+**Phase 9 — Safety vs governance register separation (2026-06-06):** The question "who maintains canonical Layer 2 binding libraries (x86 in particular)" is identified as a packaging/governance question separable from the safety architecture. The safety architecture locks at Option E; the packaging question can be decided empirically via the mechanical confirmation test.
+
+**Phase 10 — Documentation lock (2026-06-06):** This section is written to capture the locked architecture, the vocabulary, the journey, and the discipline so future sessions can re-engage without re-deriving. Cross-references to `firmware_safety_extensions.md`, `CLAUDE.md`, and the existing Section 1.6 (Level D) are added.
+
+The total elapsed wall-time across phases 5-10 was a single intensive design session, with multi-session audit feedback from other Claude instances catching drift patterns at each step. The drift patterns documented in `firmware_safety_extensions.md` §23 apply here too; the locked discipline is the discipline that survives the audit.
+
+### 1.7.27. What other Claude sessions caught — drift patterns specific to this thread
+
+Several drift patterns were caught by other Claude sessions during the asm-architecture discussion. They are recorded here so future sessions can recognize and resist them.
+
+**Drift A — "100% consequence coverage" applied without vocabulary split.**
+
+The temptation appears every time the user articulates the desired safety property as "complete coverage at the use site." Without the program-consequence vs hardware-consequence split, "100% consequence coverage" reads as covering hardware behavior too, which is false. The audit caught this and forced the split into program-consequence (caught) vs hardware-consequence (floor). The discipline: never let "consequence" carry both meanings.
+
+**Drift B — Decision velocity escalation through Options C → D → E.**
+
+The architecture moved from "ship x86 reference in core (Option C)" to "schema only, no operations, no ISA (Option D)" to "schema + operation taxonomy, no ISA (Option E)" across three messages, with the model agreeing at each step. The audit identified this as drift — each option felt cleaner because the user leaned that way and the model generated a confident scaffold for each lean. The mitigation: artifact-confirms-not-reasoning. Write one binding by hand to validate the chosen architecture. The locked answer (Option E) survives this discipline because the structure/semantics straddle observation provides the forcing argument, not just preference.
+
+**Drift C — Firmware analogy applied without checking the user-specific vs universal-constant distinction.**
+
+The firmware analogy ("ZER ships `mmio` primitives, not STM32 chip addresses; therefore ZER ships the operation taxonomy, not x86 bindings") is structurally correct but has a sharp edge: firmware's delegated part (chip addresses) is user-specific; asm's delegated part (x86 `adc` binding) is universal. The audit identified that delegating a universal constant produces either fragmentation or de-facto-standardization-without-governance. The resolution: the safety architecture still locks at Option E (no per-ISA in language core); the governance question (whether ZER team maintains a canonical x86 Layer 2 library) is separable and can be decided at packaging time. See §1.7.8.
+
+**Drift D — "User intention to make it right" framing applied to universal constants.**
+
+The user's intuition "Option E is less burden because user intention makes it right" is correct for parts of Layer 2 that have genuine authorship content (RISC-V carry emulation, the substantive parts of complex bindings). It is misapplied to parts that are universal constants (x86 `adc` is `adc` for every x86 user — there's no intention to express, only a constant to transcribe). The audit caught this and forced the distinction: "user intention to make it right" is correct for substantive bindings, incorrect for universal constants which are better served by a maintained canonical library. The discipline: do not apply "user intention" uniformly to all bindings; honor the user-specific vs universal-constant split at the packaging layer.
+
+**Drift E — Treating SPARK comparison via "smaller surface" instead of "closed vocabulary."**
+
+The temptation to claim "ZER is better than SPARK because the trust gap is smaller (fewer contracts, more visible, per-author)" is real but mis-states the differentiator. Smaller is degree; SPARK could in principle adopt these mitigations and remain SPARK. The kind-difference is the closed verifier-native vocabulary — SPARK's gap is open-shaped (arbitrary predicates), ZER's gap is closed-shaped (finite category selection). Review is finite checklist vs open proof. The audit caught the "smaller surface" framing and forced elevation of the closed-vocabulary distinction to load-bearing thesis.
+
+**Drift F — Free-form `requires:` predicates "just for this one case."**
+
+The temptation to open Layer 2's contract language to express "this one binding's special requirement" is the move that collapses E back into SPARK. The audit caught this preemptively and the discipline is locked: closed vocabulary or the kind-difference dissolves. If a real binding needs something the closed vocabulary cannot express, the fix is a Layer 1 schema extension via release with review — never a Layer 2 freedom.
+
+**Drift G — Two-axis "structural vs datasheet halves" applied to side effects.**
+
+In `firmware_safety_extensions.md` §16, an earlier Claude proposed splitting "side effects" (read-clears, write-1-to-clear) into a "structural half" (in scope for ZER core) and "datasheet half" (floor). The audit caught this as smuggling per-peripheral semantics into ZER core where they don't belong. The corrected classification: side effects are floor for ZER core; vendor HAL types can cast structural shadows in user library territory using existing primitives (move struct). This pattern is preserved in the asm domain: per-instruction semantic verification is per-ISA hardware-floor; trying to verify it brings back the unbounded catalog Level C rejected.
+
+**Drift H — Time estimates and coverage percentages.**
+
+The temptation to produce concrete planning ("3 weeks for schema design, 5 weeks for reference bindings") generates numbers that are not derived from measurement. The audit caught this pattern in `firmware_safety_extensions.md` and the discipline is locked: no time estimates, no coverage percentages. Sequencing of work is real; durations are speculative. The discipline applies to asm work too — Section 1.7.17 lists dependencies without durations.
+
+**Drift I — "Blast radius better than Rust unsafe" claim.**
+
+The Level D analysis honestly named that wrong contracts in `@intrinsic_def` poison the verifier's reasoning about callers — worse blast radius than Rust's `unsafe` block. The temptation to elide this and claim "Level D is better than Rust unsafe" was caught in §1.6.7. The corrected framing: Level D is a DIFFERENT trade-off than Rust unsafe — better ergonomics and structured auditability; worse blast radius when a contract is wrong. The mitigation is the demand/promise asymmetry rule, not the structured nature of the contracts. This survives unchanged under Option E.
+
+These drift patterns are the canonical anti-patterns for asm-architecture sessions. Future sessions should recognize and resist them. The locked discipline is the discipline that survives the audit.
+
+### 1.7.28. Integration with other locked documents
+
+This section's locked commitments integrate with the following documents:
+
+**`CLAUDE.md`** — Top of file, "ZER's Goal" section, contains the locked program-consequence vs hardware-consequence vocabulary that this section applies to asm. Any change to `CLAUDE.md` that modifies the vocabulary requires updating this section to match.
+
+**`docs/firmware_safety_extensions.md`** — The companion document for firmware safety. Its §1 (Executive Summary), §1a (Three-Sentence Locked Statement), §22 (Defensible Public Claim), and §23 (Anti-Patterns) carry the same vocabulary discipline applied to firmware. This section's §1.7.1 (vocabulary), §1.7.5 (structure/semantics straddle), §1.7.6 (closed-vocabulary kind-difference), and §1.7.13 (cross-reference) tie back to firmware_safety_extensions.md.
+
+**`docs/compiler-internals.md`** — Top of file contains the "ZER's Goal — Why This Compiler Exists" section that references both `CLAUDE.md` and `docs/firmware_safety_extensions.md`. Any change to the four-category test for compiler changes (adds coverage / closes gap / neutral / weakens coverage = STOP) applies here too. A compiler change that would weaken Option E's program-consequence coverage on asm-bearing code is a STOP per the locked discipline.
+
+**`docs/primitives-data-races.md`** — Definition A architecture across five safety domains. Option E's "Layer 1 schema + operation taxonomy in core, Layer 2 per-ISA bindings in user space" is Definition A applied to asm: ZER verifies access mechanism structurally (categories at call sites); semantic correctness against external substrates (ISA semantics) is library author responsibility supplied through declaration sites with audit visibility.
+
+**`docs/universal_pointer.md`** — The 4-axis pointer safety decomposition is preserved unchanged under Option E. Pointer-related categories in the asm category vocabulary dispatch to the existing pointer safety machinery.
+
+**`docs/limitations.md`** — The four documented known gaps (naked attribute IR-path drop, intrinsic VRP narrowing missing, bare-metal .bss zeroing build-system contract, ~2% opaque destructor heuristic) bound the "today" claim. Under Option E, the naked attribute IR-path drop (limitations.md:524) directly affects the escape-hatch escape semantics (naked asm bodies); the fix is on the critical path for completing Option E's full coverage.
+
+**`docs/asm_plan.md`** — Superseded by this document at Level C (deletion baseline), Level D (mechanism), and Option E (layering). No content from `asm_plan.md` directly carries forward; this document is the locked architecture.
+
+**`docs/proof-internals.md`** — The Coq+Iris+VST proof infrastructure. Option E's layered architecture changes the proof obligations: the safety theorem for asm operations becomes "for all programs P that use Layer 1 operations through Layer 2 bindings honoring their declared category profiles, program-consequence holds at every call site." This is a stronger and more honest theorem than "for all asm-bearing programs," which has the per-ISA semantic correctness problem.
+
+### 1.7.29. The reading order for fresh sessions
+
+A fresh session encountering this document should read in the following order:
+
+1. **`CLAUDE.md` — "ZER's Goal" section (top of file).** Locks the program-consequence vs hardware-consequence vocabulary. Without this, every subsequent claim reads ambiguously.
+
+2. **`docs/firmware_safety_extensions.md` — §1 (Executive Summary), §1a (Three-Sentence Locked Statement), §22 (Defensible Public Claim).** Applies the vocabulary to firmware. Establishes the boundary discipline.
+
+3. **This section (1.7) — first.** Captures the locked asm architecture under Option E. The "READ FIRST" status is real; everything else in this document is read through Option E's lens.
+
+4. **Section 1.6 (Level D).** Read AFTER 1.7. The `@intrinsic_def` mechanism, demand/promise asymmetry rule (§1.6.17), and missing-arch propagation rule (§1.6.18) are still current and survive Option E. The "blessed @core::* with per-ISA dispatch in core" framing in §1.6.16 is refined by §1.7.3.
+
+5. **Section 1.5 (Two-Layer crystallization).** Read for context. The 2-layer Level C model is what Option E refines, not contradicts.
+
+6. **Section 1.4 (Extended Discussion).** Read for historical context on deferred ideas (Tier 2 annotations, IR region wrappers, auto-guard emission). These remain deferred under Option E.
+
+7. **Sections 2 onward.** Read for implementation details on the Level C deletion plan, file-by-file deletion list, testing strategy, etc. These are execution-level details that survive Option E unchanged.
+
+If a fresh session reads in dependency order (1.4 → 1.5 → 1.6 → 1.7), they will encounter the "blessed catalog in core with per-ISA dispatch" framing of Level D before the Option E refinement, and may build mental model on the Level D framing that they then have to update. Reading 1.7 first is the locked-priority approach.
+
+### 1.7.30. Closing note — the architectural arc
+
+The asm safety thread, taken end-to-end from Levels A/B/C through D through Option E, follows a consistent architectural arc:
+
+- **Constrain Y, delegate Z (Level C):** Bound the catalog ZER team maintains; defer ISA-specific concerns to GCC.
+- **Externalize Y authorship (Level D):** Allow user libraries to add to the catalog via `@intrinsic_def` with structured contracts.
+- **Remove ISA commitment from Y_blessed (Option E):** Layer 1 ships schema + taxonomy + mechanism, no per-ISA asm. Per-ISA bindings live in Layer 2 libraries. Layer 3 firmware is ergonomically normal.
+
+Each step preserves the discipline established at the prior step. Each step is forced by an architectural fact that becomes visible at that step:
+- Level C is forced by the unbounded catalog problem.
+- Level D is forced by the sole-developer-maintenance-burden problem.
+- Option E is forced by the structure/semantics straddle observation — once you see that asm uniquely straddles the program-domain/hardware-domain boundary, ISA-less Layer 1 with per-ISA Layer 2 bindings is the unique factoring that respects the straddle.
+
+The closure argument from the language as a whole (no in-language `unsafe`, grammar-level rejection of integer-to-pointer fabrication) holds across all steps. The cinclude / naked-asm escape hatches are the bounded cross-substrate boundaries that no language can eliminate. Option E adds the `@bind` declaration as a third bounded boundary, with the trust gap shaped by the closed-vocabulary discipline so that review is a finite checklist.
+
+The final architecture is the one that survives the audits, preserves the closure argument, respects the structure/semantics straddle, names the floor honestly, and ships an ergonomically normal Layer 3 experience for the firmware author. Option E is that architecture. The work to ship it is bounded by the implementation work order in §1.7.17, with the schema design as the real design work and the mechanical confirmation test in §1.7.11 as the artifact-decides discipline.
+
+The architecture is locked. The work is bounded. The discipline is documented. This is the resting place of the asm safety thread, with Option E refining Level D's mechanism into a three-layer no-favored-ISA model that respects the unique structural property of asm and preserves the locked program-consequence vs hardware-consequence vocabulary.
+
+### 1.7.31. Fault attribution at the binding boundary — the architectural defense
+
+This subsection captures the explicit fault-attribution model for failures observed at the Layer 2 binding boundary. It is the architectural payoff of everything above: a sharp, defensible line between complaints that Layer 1 must reject (because they ask Layer 1 to do something architecturally outside its scope) and complaints that Layer 1 must own (because they describe genuine program-domain bugs over Layer 1's own categories). The discipline this section locks is the difference between a solo maintainer surviving the post-adoption complaint flow and a solo maintainer burning out fielding bug reports that the architecture says are not language-level bugs.
+
+**The three failure categories at the binding boundary.**
+
+When something goes wrong with code that uses a Layer 2 binding, the failure falls into exactly one of three categories. Each category has a different correct attribution.
+
+**Category #1 — Binding categories do not match the silicon.**
+
+The Layer 2 author declared a category profile that does not match what the asm body actually does on the target ISA. Example: the binding declares `no_memory_effect` on an instruction that secretly writes memory; the binding declares `no_flag_effect` on an instruction that clobbers flags; the binding declares `produces_carry` correctly but the asm uses a wrong opcode and silently produces zero.
+
+**Attribution: Layer 2 author's fault. Rejected at Layer 1.**
+
+The architectural defense:
+
+> "There is no portable pattern for what an instruction does to hardware. Asm semantics are per-ISA hardware facts. The ISA manual is the datasheet for instruction meaning. Layer 1 cannot verify that a binding's declared categories match the silicon without importing per-ISA instruction semantics into the language core, which is exactly the unbounded catalog Level C rejected. Binding-correctness against silicon is the hardware-consequence floor, surfaced at the `@bind` declaration site, owned by the binding author. The closed-vocabulary discipline ensures the trust gap has a fixed shape so review is a finite checklist — but the floor itself exists and is the binding author's responsibility, not the language's."
+
+This defense is **architectural, not bandwidth-driven**. The rejection is not "I do not have time to maintain ISA semantic verification." The rejection is "that is categorically not Layer 1's domain — it is the hardware-domain floor that exists for every memory-safe systems language at the asm boundary." A defense grounded in the architecture is repeatable, principled, and acceptable to engineers; a defense grounded in maintainer bandwidth is brittle, ad-hoc, and erodes trust.
+
+The load-bearing property: **the program-vs-hardware boundary was drawn first**, in `CLAUDE.md` and `firmware_safety_extensions.md`, before any specific complaint about asm. The Category #1 rejection is the application of that pre-existing boundary to the asm domain, not a special-case carve-out for asm. This is why the rejection has teeth — it follows from the architectural commitments locked elsewhere in ZER, not from a one-off "this case is hard."
+
+**Category #2 — Binding is honest but Layer 1's verifier mis-reasons over correctly-declared categories.**
+
+The Layer 2 author declared a category profile that does match the asm body. But Layer 1's verifier dispatch logic fails to correctly propagate the declared categories to call sites. Example: the binding correctly declares `clobbers_flags`, but the verifier's category-dispatch logic fails to propagate that clobber to a caller that depends on flag preservation; the binding correctly declares `requires_aligned(ptr, 16)`, but the verifier's alignment-checking dispatch fails to enforce it at a call site with an unaligned argument.
+
+**Attribution: Layer 1's bug. Owned. Must be bug-free.**
+
+This is NOT "the math is wrong about hardware." It is "the math is wrong about its own categories." The hardware never entered the failure mode — the failure is pure program-domain logic over Layer 1's own closed schema. The Layer 2 author did everything correctly; the verifier dropped the ball reasoning over the closed vocabulary that Layer 1 owns.
+
+The hardware-floor defense does NOT apply here. Layer 1's claim is "given a binding's correctly-declared categories, every program-domain operation on values flowing through that binding is verified at the call site." If the verifier fails at this claim, the claim is wrong, and Layer 1 owns the bug.
+
+The discipline this implies for Layer 1's implementation: **the verifier dispatch logic over the closed category vocabulary must be bug-free.** This is a real commitment, not a hand-wave. The verifier must be tested against every category in the vocabulary, every dispatch path, every interaction between categories. Tests at the schema level (verifier behaves correctly given each category profile) and at the integration level (binding A combined with binding B in a call sequence behaves correctly) are mandatory.
+
+The good news: **this commitment is bounded by the closed schema.** The category vocabulary is finite. The operation taxonomy is finite. The dispatch paths are finite. Verifier correctness over a finite schema is a finite testing surface, not an open-ended one. The math Layer 1 commits to is bounded by the schema design, which is itself bounded by the closed-vocabulary discipline. Solo maintenance of this surface is feasible because the surface does not grow with hardware evolution — it grows only with rare schema extensions through release.
+
+**Category #3 — Category vocabulary cannot express the instruction honestly.**
+
+The Layer 2 author has an instruction whose actual behavior cannot be honestly expressed by selecting from the existing category vocabulary. Either the relevant category does not exist in the schema, or two categories that should be distinct have merged into one and the author cannot distinguish their binding's behavior, or the schema is incomplete in some other structural way.
+
+**Attribution: Layer 1's bug. Owned. Fixed through schema-extension release.**
+
+This is a schema-completeness issue. The author is being honest (they cannot lie about hardware because the vocabulary does not let them express the truth), and the schema has a gap that prevents honest expression. The fix is a Layer 1 schema-extension cycle: add the missing category (frozen, reviewed, released), or split the merged categories (frozen, reviewed, released), and the author can then re-express the binding honestly.
+
+This is the slow-cadence work the schema design discipline (§1.7.22) accommodates. Schema extensions are rare by construction — categories describe structural behavior kinds that exist across ISAs, and the set of such kinds is bounded by hardware-software interaction physics, not by per-instruction growth. Real-world schema-completeness issues should surface during the initial schema design (rigorous enumeration of category kinds across the supported machine models) and then arrive at low rate (per-several-years cadence) thereafter.
+
+**Why owning #2 and #3 cleanly makes the #1 rejection credible.**
+
+The architectural defense for Category #1 has teeth only if Layer 1 owns Categories #2 and #3 cleanly. If Layer 1 reflexively rejects every complaint with "hardware floor, your problem," engineers learn the defense is reflexive and stop trusting it. Friends who got excited about ZER hit a Category #2 bug, report it correctly, and watch it get waved off as "your binding's problem" — and they conclude the defense was a dodge all along.
+
+The discipline:
+
+- **Category #1 complaints get the architectural rejection, firmly and repeatably.** The rejection is grounded in the program-vs-hardware boundary locked elsewhere in ZER, not in maintainer bandwidth.
+- **Category #2 bugs get owned, fixed, and shipped.** No deflection. The verifier dispatch over the closed schema is Layer 1's math, and the math must be correct.
+- **Category #3 schema gaps get owned, evaluated, and resolved through release.** Either the gap is real (schema extension shipped) or the proposed binding can be re-expressed using existing categories (author guided through the closed vocabulary).
+
+The credibility of the #1 rejection depends on the visible owning of #2 and #3. If a maintainer reflexively applies the hardware-floor defense to everything, the defense becomes a dodge. If a maintainer owns the bugs that are genuinely Layer 1's and rejects the ones that are not with a principled architectural reason, the rejection is legitimate and engineers accept it.
+
+This is the difference between sustainable solo maintenance and burnout. The architecture provides the structure; the maintainer applies the structure consistently.
+
+**The two-responsibility, one-boundary statement.**
+
+Stated precisely, with the locked vocabulary:
+
+> Layer 1 owns category-reasoning. Given a Layer 2 binding's correctly-declared category profile, Layer 1 must propagate the implications of those categories to every call site, every time, without bugs. This is program-domain logic over Layer 1's own closed schema. The math must be correct; the verifier must be tested; this commitment is bounded by the finite schema and the closed vocabulary, and it is solo-maintainable.
+>
+> Layer 1 does NOT own category-truth-against-silicon. Given a Layer 2 binding's declared category profile, Layer 1 trusts the declaration as the binding-correctness contract supplied by the library author. Whether the asm body actually has the declared categories on the target ISA is the hardware-consequence floor, surfaced at the `@bind` declaration site, library author's responsibility, reviewable as a finite checklist because the contract language is closed.
+>
+> The boundary between Layer 1's owned responsibility (category-reasoning) and the binding author's owned responsibility (category-truth-against-silicon) is the same program-consequence vs hardware-consequence boundary that ZER applies uniformly across all safety domains. Applying this boundary to fault attribution at the binding layer: program-domain failures are Layer 1's; hardware-domain failures are the binding author's. Both responsibilities are real; both are bounded; one is solo-maintainable and the other is library-author-owned by design.
+
+**Why this works for solo maintenance.**
+
+The Category #1 rejection is the load-bearing solo-maintainer survival mechanism. Without it, the language core's maintenance burden grows with every ISA extension, every new instruction, every vendor extension — which is exactly the unbounded catalog problem Levels C, D, and Option E were designed to avoid.
+
+The Category #2 ownership is the load-bearing credibility mechanism. Without it, the #1 rejection sounds like a dodge. The bounded nature of the #2 surface (finite schema, finite dispatch paths, finite test matrix) makes #2 ownership feasible for a solo maintainer in a way that ISA-semantic verification (Category #1's territory) never would be.
+
+The Category #3 schema-extension process is the load-bearing schema-evolution mechanism. Without it, the closed-vocabulary discipline becomes brittle (real expressivity gaps cannot be fixed) and the architecture's kind-difference from SPARK dissolves (authors reach for free-form predicates as workarounds, opening the closed vocabulary). The slow-cadence release process keeps the schema closed in practice while allowing genuine extensions to land when needed.
+
+Together, the three responsibilities partition the failure space cleanly. Solo maintenance is feasible because:
+
+- Category #1 is architecturally outside Layer 1's scope (no maintenance burden at all).
+- Category #2 is bounded by the closed schema (finite, testable, manageable maintenance burden).
+- Category #3 is slow-cadence (extension events per several years, not per release).
+
+The combined ongoing burden is bounded, slow-growing, and architecturally well-defined. Option E is sustainable for one person because the architecture draws the responsibility boundary in the right place — at program-vs-hardware — and the boundary maps cleanly to fault attribution.
+
+**The drift to refuse.**
+
+The drift that breaks the model is reflexive #1-style rejection of #2 or #3 complaints. "My binding declared `clobbers_flags` but the caller is not seeing the clobber" is a #2 complaint, owned by Layer 1. Rejecting it as "your binding's problem, hardware floor" is the wrong attribution and corrodes credibility.
+
+The dual drift is owning #1 complaints as if they were #2 or #3. "My binding declared `no_memory_effect` but the asm actually writes memory and ZER didn't catch the inconsistency" is a #1 complaint, rejected at Layer 1. Accepting it as a Layer 1 bug — "we should add per-instruction semantic verification for this case" — opens the unbounded catalog and breaks the architecture.
+
+Both drifts must be refused. The discipline is the boundary itself: program-domain ↔ Layer 1 owns; hardware-domain ↔ binding author owns. The boundary is the same line ZER draws uniformly; applying it consistently at the binding layer is the architectural commitment.
+
+**One more note on false positives from category clash.**
+
+A practical question raised during the design discussion: what about false positives from category clash — where two operations have superficially similar category profiles and the verifier fails to distinguish them, producing a wrong rejection at a call site?
+
+This is **not** automatically a #1 (binding author's) fault. The correct attribution depends on the root cause:
+
+- If two operations have genuinely identical category profiles and the verifier cannot distinguish them, that may be a **schema-completeness issue (#3)** — the vocabulary is too coarse to express the structural difference, and a schema extension is the fix.
+- If two operations have distinct category profiles and the verifier mis-dispatches between them, that is a **verifier bug (#2)** — Layer 1's reasoning over the closed schema has a flaw, owned and fixable.
+- Only if the category clash arises from a Layer 2 author declaring categories incorrectly (e.g., copy-pasting from another binding without verifying applicability) is it a binding-author error — and even then, it is closer to a binding-correctness issue than a category-clash issue.
+
+The discipline: when a false positive surfaces from category clash, diagnose the root cause before defending. Reflexively classifying it as the binding author's problem is the same credibility-erosion drift as misattributing #2 as #1.
+
+**The closing on fault attribution.**
+
+The architectural defense Layer 1 provides for Category #1 is the structural reason Option E is sustainable for one person, and its credibility depends on the visible owning of Categories #2 and #3. Stated as the locked discipline:
+
+- Category #1 (binding-vs-silicon mismatch): architecturally outside Layer 1's scope. Rejected with the program-vs-hardware boundary defense. Repeatable, principled, accepted by engineers because it follows from the architecture, not from bandwidth.
+- Category #2 (verifier mis-reasoning over correctly-declared categories): Layer 1's bug. Owned, tested, fixed, shipped. Bounded by the closed schema.
+- Category #3 (vocabulary incompleteness): Layer 1's bug, schema-extension class. Owned through release process. Slow cadence, bounded by hardware-software interaction physics.
+
+The boundary between #1 and {#2, #3} is the same program-consequence vs hardware-consequence boundary that ZER applies uniformly. The boundary's consistent application at the binding layer is what makes Option E architecturally coherent, ethically defensible to library authors and firmware engineers, and sustainable for a solo maintainer over the long term.
+
+This is the architectural payoff of the entire Option E design. The closed-vocabulary discipline (§1.7.6, §1.7.7), the three-layer structure (§1.7.3), the structure/semantics straddle observation (§1.7.5), the safety-vs-governance separation (§1.7.8), and the program-consequence vs hardware-consequence vocabulary (§1.7.1) together produce a fault-attribution model that is principled, repeatable, and solo-maintainable. The architecture provides the structure; the maintainer applies the structure consistently. That is the model.
 
 ---
 

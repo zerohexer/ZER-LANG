@@ -5,6 +5,107 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 — Audit follow-up: close GAP-B and GAP-F
+
+Verified the audit branch `claude/cool-johnson-T0Al0` (4 fixes for
+GAP-A/C/D/E + 2 open gaps documented), merged it into main under
+zerohexer@gmail.com, then closed the two remaining gaps.
+
+### GAP-B (CRITICAL) — extern alloc fused with var-decl + orelse drops handle tracking
+
+**Symptom:**
+```zer
+?*Res my_alloc();
+void my_free(*Res r);
+
+i32 main() {
+    *Res p = my_alloc() orelse return;
+    my_free(p);
+    let v = p.val;   // SHOULD be UAF — silently compiled pre-fix
+    return (i32)v;
+}
+```
+
+**Root cause:** `zercheck_ir.c` IR_ASSIGN method-call branch
+(`mc == IRMC_NONE && dest type == TYPE_HANDLE` at line 2327) registered
+fresh ALIVE state for function-returned Handles but had no parallel
+branch for non-Handle pointer returns. The fused
+`*Res p = my_alloc() orelse return;` shape lowered to IR_ASSIGN with
+NODE_ORELSE expr, so the IR_CALL extern-alloc handler at line 2935
+(which only fires when `inst->expr->kind == NODE_CALL`) never matched
+either.
+
+Two-step form worked because the temp form generated separate IR_CALL
++ IR_ASSIGN instructions, and the IR_CALL branch correctly registered.
+
+**Fix:** Added TYPE_POINTER/TYPE_OPAQUE branch alongside the existing
+TYPE_HANDLE branch in IRMC_NONE handler at `zercheck_ir.c:~2358`,
+gated on `ir_is_extern_alloc_call(zc, rhs)`. Sets `escaped=true` like
+the function-returned-Handle pattern to prevent leak-at-exit
+false positives across the C-interop boundary.
+
+**Test:** `tests/zer_fail/audit_extern_alloc_orelse_uaf.zer` (moved
+from `tests/audit_2026_06_06/`).
+
+**Files:** zercheck_ir.c (~20 LOC at the IRMC_NONE handler).
+
+### GAP-F (MEDIUM) — `@ptrcast` / `@pun` const-strip ignored distinct typedef target
+
+**Symptom:**
+```zer
+distinct typedef *u32 PlainPtr;
+const *u32 cp = &ro;
+PlainPtr mp = @ptrcast(PlainPtr, cp);  // SHOULD error — silently laundered const
+*mp = 100;
+```
+
+Same shape with `@pun(PlainPtr, cp)` had identical pre-fix behavior.
+
+**Root cause:** `checker.c:6095-6101` (and the mirrored `@pun` handler
+at `~6201`) checked `result->kind == TYPE_POINTER &&
+!result->pointer.is_const` without unwrapping TYPE_DISTINCT. For
+`distinct typedef *u32 PlainPtr;` target, `result->kind` was
+TYPE_DISTINCT, so the strip check silently passed. The downstream
+`can_implicit_coerce` saw `*u32 = *u32` (after unwrap on both sides)
+and accepted the assignment.
+
+**Scope correction from audit:** Audit originally flagged this as
+@ptrcast-only. During verification, found that `@pun` (added 2026-06-06
+with const-strip mirrored from @ptrcast) inherited the same bug.
+Both handlers fixed in this session.
+
+**Fix:** Added `Type *tgt_eff_strip = type_unwrap_distinct(result)` at
+the start of both const-strip blocks; check `tgt_eff_strip->kind ==
+TYPE_POINTER && !tgt_eff_strip->pointer.is_const` instead of raw
+`result->kind`. Volatile-strip was already correct because the
+`check_volatile_strip` helper at `checker.c:1085-1086` already calls
+`type_unwrap_distinct` on both sides.
+
+**Tests:**
+- `tests/zer_fail/audit_ptrcast_distinct_const_strip.zer` (moved from
+  `tests/audit_2026_06_06/`)
+- `tests/zer_fail/audit_pun_distinct_const_strip.zer` (NEW — covers
+  the @pun variant the audit didn't originally flag)
+
+**Files:** checker.c (~12 LOC across two intrinsic handlers).
+
+### Audit branch verification — all 4 prior-session fixes confirmed legitimate
+
+Before applying the GAP-B/F fixes, ran verification on the audit branch:
+
+| Gap | Severity | On main (no fix) | On audit branch | Status |
+|---|---|---|---|---|
+| GAP-A | CRITICAL | zerc exit 0 — silent double-free | zercheck errors correctly | Audit fix confirmed |
+| GAP-C | HIGH | zerc exit 0 — silent UAM | zercheck errors correctly | Audit fix confirmed |
+| GAP-D | HIGH | wrong "never freed" msg | correct UAF msg | Audit fix confirmed |
+| GAP-E | MEDIUM | confusing "type 'void'" msg | clear "must be pointer" msg | Audit fix confirmed, applies to @pun too |
+
+The audit's spawn-then-verify protocol produced high-quality findings.
+Both originally-open gaps reproduced cleanly, both fixes implemented,
+both regression tests now pass.
+
+---
+
 ## Session 2026-06-06 — @pun intrinsic + corrected pointer-cast architecture
 
 Major architectural session locked the pointer-cast story in three pieces:

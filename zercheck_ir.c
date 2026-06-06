@@ -2355,6 +2355,42 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         break;
                     }
+                    /* GAP-B fix (2026-06-07): extern alloc returning ?*T fused
+                     * with var-decl + orelse in IR_ASSIGN shape. Pre-fix, only
+                     * TYPE_HANDLE branch above registered ALIVE state; non-Handle
+                     * pointer returns from extern alloc fell through, so the
+                     * post-free use was silently allowed.
+                     *
+                     * Two-step form (?*Res maybe = my_alloc(); *Res p = maybe orelse return;)
+                     * already worked because the IR_CALL extern-alloc handler at
+                     * line ~2935 fires when inst->expr is NODE_CALL. The fused
+                     * form fails there because inst->expr is NODE_ORELSE.
+                     *
+                     * Fix: mirror the TYPE_HANDLE branch for TYPE_POINTER/OPAQUE
+                     * when the unwrapped call is recognized as extern alloc by
+                     * ir_is_extern_alloc_call. The escaped=true flag prevents
+                     * leak-at-exit false positives across the function boundary
+                     * (caller may legitimately pass the pointer to a destructor).
+                     * Reproducer: tests/audit_2026_06_06/audit_extern_alloc_orelse_uaf.zer */
+                    if (eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_OPAQUE) &&
+                        rhs && rhs->kind == NODE_CALL &&
+                        ir_is_extern_alloc_call(zc, rhs)) {
+                        IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                        if (h) {
+                            if (h->state == IR_HS_ALIVE &&
+                                !func->locals[inst->dest_local].is_temp) {
+                                ir_zc_error(zc, inst->source_line,
+                                    "handle %%%d overwritten while alive — previous leaked",
+                                    inst->dest_local);
+                            }
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->source_color = ZC_COLOR_MALLOC;
+                            h->escaped = true;
+                        }
+                        break;
+                    }
                 }
             }
             /* If source is an ident that's a tracked handle, create alias */

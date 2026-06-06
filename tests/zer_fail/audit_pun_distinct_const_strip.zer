@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// AUDIT 2026-06-07 (GAP-F variant for @pun): @pun's const-strip check
+// inherited the same TYPE_DISTINCT bypass as @ptrcast.
+//
+// @pun was added 2026-06-06 with its const-strip check mirroring @ptrcast
+// (checker.c:~6195-6207). Both used `result->kind == TYPE_POINTER` without
+// unwrapping TYPE_DISTINCT, so a `distinct typedef *u32 PlainPtr;` target
+// silently laundered const through the distinct wrapper.
+//
+// Fix: type_unwrap_distinct(result) at the start of the strip-check block,
+// then check tgt_eff->kind. Applied to both @ptrcast and @pun in the
+// 2026-06-07 fix session.
+distinct typedef *u32 PlainPtr;
+
+i32 main() {
+    u32 ro = 42;
+    const *u32 cp = &ro;
+    PlainPtr mp = @pun(PlainPtr, cp);   // SHOULD error: strips const
+    *mp = 100;                            // would write through laundered const
+    return 0;
+}

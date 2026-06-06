@@ -1,0 +1,631 @@
+# type_dispatch_baseline.txt — frozen raw type-dispatch surface (2026-06-07).
+# Each line is a `->kind == TYPE_` / `!= TYPE_` site that predates the
+# type_dispatch_kind() enforcement. New sites must NOT be added here without
+# justification — prefer type_dispatch_kind(t). See tools/audit_type_dispatch.sh.
+checker.c:(eff->kind == TYPE_U32 && c->target_ptr_bits == 32));
+checker.c:(eff->kind == TYPE_U64 && c->target_ptr_bits >= 64) ||
+checker.c:(eff_r->kind == TYPE_SLICE || eff_r->kind == TYPE_ARRAY)) {
+checker.c:(ft->kind == TYPE_SEMAPHORE || ft->kind == TYPE_BARRIER ||
+checker.c:(ft->kind == TYPE_STRUCT && ft->struct_type.is_shared))) ? 1 : 0;
+checker.c:(ret->kind == TYPE_OPTIONAL &&
+checker.c:(ret_eff->kind == TYPE_OPTIONAL && type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE);
+checker.c:(ret_eff->kind == TYPE_STRUCT && ret_eff->struct_type.is_move) ||
+checker.c:(ret_ty_check->kind == TYPE_F32 || ret_ty_check->kind == TYPE_F64);
+checker.c:(src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE)) {
+checker.c:(t->kind == TYPE_POOL && type_equals(t->pool.elem, elem_type))) {
+checker.c:(teff->kind == TYPE_POOL || teff->kind == TYPE_RING || teff->kind == TYPE_SLAB)) {
+checker.c:(tgt_eff->kind == TYPE_OPAQUE ||
+checker.c:(tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner->kind == TYPE_OPAQUE))) {
+checker.c:(tu && tu->kind == TYPE_POINTER));
+checker.c:(type->kind == TYPE_POINTER || type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE)) {
+checker.c:(type->kind == TYPE_POOL || type->kind == TYPE_RING || type->kind == TYPE_SLAB) &&
+checker.c:(type_is_integer(target) && src_eff->kind == TYPE_BOOL)) valid = true;
+checker.c:* *u32 PlainPtr;` target had result->kind == TYPE_DISTINCT,
+checker.c:arg_eff->kind == TYPE_STRUCT &&
+checker.c:arg_sym->type && arg_sym->type->kind == TYPE_ARRAY) {
+checker.c:bool has_arena = (val_eff && val_eff->kind == TYPE_ARENA);
+checker.c:bool inner_has_variants = inner && (inner->kind == TYPE_ENUM ||
+checker.c:bool is_ptr_int = eff && (eff->kind == TYPE_USIZE ||
+checker.c:bool is_ptr_or_array = (eff->kind == TYPE_POINTER) || (eff->kind == TYPE_ARRAY);
+checker.c:bool is_resource = (ret_eff->kind == TYPE_HANDLE) ||
+checker.c:bool src_distinct = val_type->kind == TYPE_DISTINCT;
+checker.c:bool tgt_distinct = result->kind == TYPE_DISTINCT;
+checker.c:c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
+checker.c:eff->kind == TYPE_OPAQUE);
+checker.c:eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+checker.c:eff->pointer.inner->kind == TYPE_OPAQUE) {
+checker.c:else if (et->kind == TYPE_ENUM) existing_mod = et->enum_type.module_prefix;
+checker.c:else if (et->kind == TYPE_UNION) existing_mod = et->union_type.module_prefix;
+checker.c:else if (ptr_eff->kind == TYPE_SLICE) tcat = ZER_TCAT_SLICE;
+checker.c:else if (ptr_eff->kind == TYPE_STRUCT) tcat = ZER_TCAT_STRUCT;
+checker.c:et->kind == TYPE_UNION)) {
+checker.c:if (!aeff || aeff->kind != TYPE_POINTER) return;
+checker.c:if (!eff || eff->kind != TYPE_POINTER) return;
+checker.c:if (!esym || !esym->type || esym->type->kind != TYPE_ENUM) return CONST_EVAL_FAIL;
+checker.c:if (!has_arena && val_eff && val_eff->kind == TYPE_STRUCT) {
+checker.c:if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
+checker.c:if (!ns_type || ns_type->kind == TYPE_POINTER || ns_type->kind == TYPE_SLICE ||
+checker.c:if (!seff || seff->kind != TYPE_POINTER) return false;
+checker.c:if (!shared && eff->kind == TYPE_POINTER) {
+checker.c:if (!teff || teff->kind != TYPE_POINTER) return false;
+checker.c:if (!u || u->kind != TYPE_POINTER) continue;
+checker.c:if (!var_sym || (vs_eff && vs_eff->kind != TYPE_STRUCT &&
+checker.c:if ((eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY) ||
+checker.c:if ((ret->kind == TYPE_SLICE && !ret->slice.is_const) ||
+checker.c:if ((t->kind == TYPE_SLAB && type_equals(t->slab.elem, elem_type)) ||
+checker.c:if ((tgt_eff->kind == TYPE_BOOL && type_is_integer(source)) ||
+checker.c:if ((tgt_eff->kind == TYPE_POINTER || tgt_eff->kind == TYPE_OPAQUE) &&
+checker.c:if (aeff->kind == TYPE_HANDLE &&
+checker.c:if (arg && arg->kind == TYPE_SLICE &&
+checker.c:if (arg && type_unwrap_distinct(arg)->kind == TYPE_ARRAY &&
+checker.c:if (arg->kind == TYPE_POINTER && param->kind == TYPE_POINTER &&
+checker.c:if (arg->kind == TYPE_SLICE && param->kind == TYPE_SLICE &&
+checker.c:if (arg_inner && arg_inner->kind == TYPE_POINTER) arg_inner = arg_inner->pointer.inner;
+checker.c:if (arg_type && type_unwrap_distinct(arg_type)->kind == TYPE_POINTER) {
+checker.c:if (arg_type->kind == TYPE_POINTER && param_type->kind == TYPE_POINTER &&
+checker.c:if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
+checker.c:if (bt_eff && bt_eff->kind != TYPE_BARRIER)
+checker.c:if (bt_eff && bt_eff->kind == TYPE_POINTER)
+checker.c:if (call_ret && call_ret->kind != TYPE_POINTER) {
+checker.c:if (ceff->kind != TYPE_BOOL && !type_is_integer(ceff)) {
+checker.c:if (check_shared->kind == TYPE_POINTER)
+checker.c:if (check_shared->kind == TYPE_STRUCT &&
+checker.c:if (deref_inner->kind != TYPE_POINTER) {
+checker.c:if (dst_eff && dst_eff->kind == TYPE_POINTER &&
+checker.c:if (dst_type && dst_type->kind == TYPE_ARRAY &&
+checker.c:if (dst_type && dst_type->kind == TYPE_POINTER && dst_type->pointer.is_const) {
+checker.c:if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+checker.c:if (eff && eff->kind == TYPE_OPTIONAL) {
+checker.c:if (eff && eff->kind == TYPE_POINTER &&
+checker.c:if (eff && eff->kind == TYPE_STRUCT &&
+checker.c:if (eff->kind != TYPE_POINTER && eff->kind != TYPE_ARRAY) {
+checker.c:if (eff->kind != TYPE_POINTER && eff->kind != TYPE_FUNC_PTR) {
+checker.c:if (eff->kind != TYPE_POINTER) {
+checker.c:if (eff->kind == TYPE_HANDLE) {
+checker.c:if (eff->kind == TYPE_POINTER &&
+checker.c:if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
+checker.c:if (eff->kind == TYPE_POINTER) {
+checker.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared &&
+checker.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
+checker.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return eff;
+checker.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) shared = eff;
+checker.c:if (effective_callee->kind == TYPE_FUNC_PTR) {
+checker.c:if (elem->kind == TYPE_STRUCT) {
+checker.c:if (esym_eff && esym_eff->kind == TYPE_ENUM) {
+checker.c:if (et && (et->kind == TYPE_STRUCT || et->kind == TYPE_ENUM ||
+checker.c:if (et->kind == TYPE_STRUCT) existing_mod = et->struct_type.module_prefix;
+checker.c:if (exp_inner && exp_inner->kind == TYPE_POINTER) exp_inner = exp_inner->pointer.inner;
+checker.c:if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
+checker.c:if (expr->kind == NODE_CHAR_LIT && effective->kind == TYPE_U8) return true;
+checker.c:if (expr_eff && expr_eff->kind == TYPE_OPTIONAL) {
+checker.c:if (expr_eff->kind == TYPE_UNION) {
+checker.c:if (fb_type && type_unwrap_distinct(fb_type)->kind == TYPE_ARRAY) {
+checker.c:if (fld_obj_type && type_unwrap_distinct(fld_obj_type)->kind == TYPE_HANDLE) {
+checker.c:if (fret && (fret->kind == TYPE_F32 || fret->kind == TYPE_F64)) {
+checker.c:if (ft && ft->kind == TYPE_ARENA) { has_arena = true; break; }
+checker.c:if (ft->kind == TYPE_ARRAY) {
+checker.c:if (ft->kind == TYPE_STRUCT && ft->struct_type.is_move) {
+checker.c:if (inner && inner->kind != TYPE_OPAQUE) {
+checker.c:if (inner && inner->kind == TYPE_HANDLE) {
+checker.c:if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+checker.c:if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) ok = true;
+checker.c:if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) {
+checker.c:if (inner && type_unwrap_distinct(inner)->kind == TYPE_VOID) {
+checker.c:if (inner->kind == TYPE_POINTER && inner->pointer.inner) {
+checker.c:if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return 4; /* null sentinel */
+checker.c:if (inner->kind == TYPE_VOID) return 1; /* has_value only */
+checker.c:if (inner_eff->kind == TYPE_POINTER) {
+checker.c:if (inner_eff->kind == TYPE_SLICE) {
+checker.c:if (iv && iv->kind == TYPE_POINTER) {
+checker.c:if (iv && iv->kind == TYPE_SLICE) {
+checker.c:if (mt->kind == TYPE_POINTER) {
+checker.c:if (node->assign.op == TOK_EQ && target && target->kind == TYPE_SLICE) {
+checker.c:if (node->var_decl.init && type && type->kind == TYPE_SLICE) {
+checker.c:if (node->var_decl.init && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+checker.c:if (obj->kind == TYPE_ARENA) {
+checker.c:if (obj->kind == TYPE_ARRAY && flen == 3 && memcmp(fname, "len", 3) == 0) {
+checker.c:if (obj->kind == TYPE_ARRAY) {
+checker.c:if (obj->kind == TYPE_ENUM) {
+checker.c:if (obj->kind == TYPE_HANDLE) {
+checker.c:if (obj->kind == TYPE_POINTER &&
+checker.c:if (obj->kind == TYPE_POOL) {
+checker.c:if (obj->kind == TYPE_RING) {
+checker.c:if (obj->kind == TYPE_SLAB) {
+checker.c:if (obj->kind == TYPE_SLICE && flen == 3 && memcmp(fname, "len", 3) == 0) {
+checker.c:if (obj->kind == TYPE_SLICE && flen == 3 && memcmp(fname, "ptr", 3) == 0) {
+checker.c:if (obj->kind == TYPE_STRUCT) {
+checker.c:if (obj->kind == TYPE_UNION) {
+checker.c:if (obj_type && (obj_type->kind == TYPE_POOL || obj_type->kind == TYPE_SLAB)) {
+checker.c:if (obj_type && obj_type->kind == TYPE_ARENA &&
+checker.c:if (obj_type && obj_type->kind == TYPE_ARENA) {
+checker.c:if (obj_type && obj_type->kind == TYPE_POINTER) {
+checker.c:if (oeff && oeff->kind == TYPE_SLAB) is_slab_value = true;
+checker.c:if (oi->kind == TYPE_POINTER || oi->kind == TYPE_FUNC_PTR)
+checker.c:if (ot && (ot->kind == TYPE_POOL || ot->kind == TYPE_SLAB)) {
+checker.c:if (param_type && param_type->kind == TYPE_SLICE && !param_type->slice.is_const) {
+checker.c:if (ptr_eff->kind == TYPE_POINTER) tcat = ZER_TCAT_PTR;
+checker.c:if (ptr_type && ptr_type->kind == TYPE_POINTER && ptr_type->pointer.is_const) {
+checker.c:if (ptu && ptu->kind == TYPE_POINTER && ptu->pointer.inner->kind == TYPE_OPAQUE) {
+checker.c:if (ptu && ptu->kind == TYPE_POINTER) param_is_keep = true;
+checker.c:if (res_eff->kind != TYPE_POINTER) {
+checker.c:if (ret && ret->kind != TYPE_VOID &&
+checker.c:if (ret && ret->kind != TYPE_VOID) {
+checker.c:if (ret_base && ret_base->kind == TYPE_ARRAY) {
+checker.c:if (ret_eff && ret_eff->kind == TYPE_POINTER &&
+checker.c:if (ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
+checker.c:if (ret_type && ret_type->kind == TYPE_ARRAY &&
+checker.c:if (ret_type && ret_type->kind == TYPE_POINTER) {
+checker.c:if (ret_type->kind == TYPE_POINTER && c->current_func_ret->kind == TYPE_POINTER &&
+checker.c:if (ret_type->kind == TYPE_SLICE && c->current_func_ret->kind == TYPE_SLICE &&
+checker.c:if (rt->kind == TYPE_SLAB || rt->kind == TYPE_STRUCT) {
+checker.c:if (seff->kind == TYPE_POINTER) {
+checker.c:if (seff->kind == TYPE_STRUCT && seff->struct_type.is_shared) ok = true;
+checker.c:if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB) &&
+checker.c:if (sf->type && sf->type->kind == TYPE_VOID) {
+checker.c:if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
+checker.c:if (src_eff && src_eff->kind == TYPE_ARRAY &&
+checker.c:if (src_eff->kind == TYPE_POINTER &&
+checker.c:if (src_eff->kind == TYPE_POINTER && src_eff->pointer.is_const &&
+checker.c:if (src_eff->kind == TYPE_POINTER && tgt_eff->kind == TYPE_POINTER &&
+checker.c:if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
+checker.c:if (st && st->kind == TYPE_STRUCT) {
+checker.c:if (st->kind != TYPE_STRUCT) {
+checker.c:if (st->kind == TYPE_STRUCT && st->struct_type.is_shared &&
+checker.c:if (st_eff && (st_eff->kind == TYPE_VOID || st_eff->kind == TYPE_OPAQUE)) {
+checker.c:if (st_eff && st_eff->kind != TYPE_SEMAPHORE)
+checker.c:if (st_eff && st_eff->kind == TYPE_POINTER)
+checker.c:if (struct_type && struct_type->kind == TYPE_STRUCT && field_name) {
+checker.c:if (stype && stype->kind == TYPE_STRUCT) is_struct_type_ref = true;
+checker.c:if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB) &&
+checker.c:if (sv->type && sv->type->kind == TYPE_VOID) {
+checker.c:if (sw_type->kind == TYPE_ENUM) {
+checker.c:if (t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
+checker.c:if (t->kind == TYPE_ARRAY) {
+checker.c:if (t->kind == TYPE_OPTIONAL) {
+checker.c:if (t->kind == TYPE_POINTER) return CONST_EVAL_FAIL;
+checker.c:if (t->kind == TYPE_SLICE) return CONST_EVAL_FAIL;
+checker.c:if (t->kind == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw))
+checker.c:if (t->kind == TYPE_STRUCT) {
+checker.c:if (t->kind == TYPE_UNION) {
+checker.c:if (t->kind == TYPE_USIZE) return CONST_EVAL_FAIL;
+checker.c:if (target->kind == TYPE_DISTINCT || source->kind == TYPE_DISTINCT) valid = true;
+checker.c:if (target->kind == TYPE_POINTER && value->kind == TYPE_POINTER &&
+checker.c:if (target->kind == TYPE_SLICE && value->kind == TYPE_SLICE &&
+checker.c:if (teff && teff->kind == TYPE_SLICE && !teff->slice.is_volatile) {
+checker.c:if (tgt && tgt->kind == TYPE_POINTER && prov &&
+checker.c:if (tgt && tgt->kind == TYPE_POINTER) tgt = type_unwrap_distinct(tgt->pointer.inner);
+checker.c:if (tgt && tgt->kind == TYPE_STRUCT &&
+checker.c:if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+checker.c:if (tgt_eff->kind == TYPE_POINTER && prov &&
+checker.c:if (tgt_eff->kind == TYPE_POINTER && type_is_integer(source) &&
+checker.c:if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {
+checker.c:if (type && type->kind == TYPE_VOID) {
+checker.c:if (type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER &&
+checker.c:if (type->kind == TYPE_SLICE && !type->slice.is_const) {
+checker.c:if (type->kind == TYPE_SLICE && !type->slice.is_volatile &&
+checker.c:if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
+checker.c:if (type->kind == TYPE_SLICE && init_type->kind == TYPE_SLICE &&
+checker.c:if (type_is_integer(target) && (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE) &&
+checker.c:if (type_unwrap_distinct(t->optional.inner)->kind == TYPE_VOID) return 1;
+checker.c:if (ueff && ueff->kind == TYPE_UNION) {
+checker.c:if (unwrapped && unwrapped->kind == TYPE_POINTER) {
+checker.c:if (uw_eff && uw_eff->kind == TYPE_STRUCT && uw_eff->struct_type.is_move) {
+checker.c:if (value && type_unwrap_distinct(value)->kind == TYPE_ARRAY) {
+checker.c:if (var_eff && var_eff->kind == TYPE_POINTER &&
+checker.c:if (veff && veff->kind == TYPE_POINTER &&
+checker.c:if (vt && !type_is_integer(vt) && vt->kind != TYPE_BOOL) {
+checker.c:if (vt && vt->kind == TYPE_ARRAY) {
+checker.c:if (vt && vt->kind == TYPE_STRUCT && vt->struct_type.is_move) {
+checker.c:if (vt_eff && vt_eff->kind == TYPE_STRUCT && vt_eff->struct_type.is_move) {
+checker.c:init_type->kind == TYPE_ARRAY &&
+checker.c:inner->kind == TYPE_UNION);
+checker.c:int dst_is_opaque = (tgt && tgt->kind == TYPE_POINTER &&
+checker.c:int he_kind = (elem->kind == TYPE_VOID) ? ZER_HE_VOID : ZER_HE_PRIM;
+checker.c:int is_packed = (st->kind == TYPE_STRUCT && st->struct_type.is_packed) ? 1 : 0;
+checker.c:int is_ptr_src = (eff->kind == TYPE_POINTER || eff->kind == TYPE_FUNC_PTR) ? 1 : 0;
+checker.c:ns_type->kind == TYPE_STRUCT || ns_type->kind == TYPE_UNION) {
+checker.c:param && param->kind == TYPE_POINTER &&
+checker.c:param && param->kind == TYPE_SLICE &&
+checker.c:param && type_unwrap_distinct(param)->kind == TYPE_SLICE &&
+checker.c:param_eff->kind == TYPE_STRUCT &&
+checker.c:prov->kind == TYPE_POINTER) {
+checker.c:reff && reff->kind == TYPE_POINTER &&
+checker.c:ret_eff->pointer.inner->kind == TYPE_OPAQUE) {
+checker.c:ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
+checker.c:ret_type && ret_type->kind == TYPE_POINTER) {
+checker.c:return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+checker.c:src_eff->kind == TYPE_POINTER && src_eff->pointer.is_const &&
+checker.c:src_eff->pointer.inner->kind != TYPE_OPAQUE &&
+checker.c:src_eff->pointer.inner->kind == TYPE_OPAQUE &&
+checker.c:target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
+checker.c:target->kind == TYPE_SLICE && !target->slice.is_volatile) {
+checker.c:target_sym->type && target_sym->type->kind == TYPE_POINTER) {
+checker.c:teff->kind == TYPE_POOL ? "Pool" : teff->kind == TYPE_RING ? "Ring" : "Slab");
+checker.c:tgt_eff->kind == TYPE_POINTER && !tgt_eff->pointer.is_const) {
+checker.c:tgt_eff->kind == TYPE_POINTER) {
+checker.c:tgt_eff->pointer.inner->kind != TYPE_OPAQUE) {
+checker.c:tgt_eff->pointer.inner->kind == TYPE_OPAQUE) {
+checker.c:tgt_eff_b->kind == TYPE_POINTER && !tgt_eff_b->pointer.is_const) {
+checker.c:tgt_eff_pun_strip && tgt_eff_pun_strip->kind == TYPE_POINTER &&
+checker.c:tgt_eff_strip && tgt_eff_strip->kind == TYPE_POINTER &&
+checker.c:tgt_inner->kind != TYPE_OPAQUE &&
+checker.c:type && (type->kind == TYPE_SLICE || type->kind == TYPE_POINTER)) {
+checker.c:type && type->kind == TYPE_SLICE && !node->var_decl.is_const) {
+checker.c:type->kind == TYPE_POOL ? "Pool" : type->kind == TYPE_RING ? "Ring" : "Slab");
+checker.c:type_name(eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY ? left : right));
+checker.c:type_unwrap_distinct(obj->pointer.inner)->kind == TYPE_STRUCT) {
+checker.c:type_unwrap_distinct(obj->pointer.inner)->kind == TYPE_UNION) {
+checker.c:type_unwrap_distinct(ret->optional.inner)->kind == TYPE_SLICE &&
+checker.c:type_unwrap_distinct(tgt->pointer.inner)->kind == TYPE_OPAQUE) ? 1 : 0;
+checker.c:type_unwrap_distinct(type)->kind != TYPE_USIZE &&
+checker.c:type_unwrap_distinct(type)->kind == TYPE_FUNC_PTR) {
+checker.c:type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+checker.c:value && type_unwrap_distinct(value)->kind == TYPE_ARRAY &&
+checker.c:value && type_unwrap_distinct(value)->kind == TYPE_ARRAY) {
+checker.c:var_eff->pointer.inner->kind == TYPE_OPAQUE) {
+checker.c:vs_eff->kind != TYPE_ENUM && vs_eff->kind != TYPE_UNION &&
+checker.c:vs_eff->kind != TYPE_POOL && vs_eff->kind != TYPE_SLAB &&
+checker.c:vs_eff->kind != TYPE_RING && vs_eff->kind != TYPE_ARENA)) {
+checker.c:vt && (vt->kind == TYPE_POINTER || vt->kind == TYPE_OPAQUE);
+checker.c:while (elem && elem->kind == TYPE_ARRAY) elem = elem->array.inner;
+checker.c:while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+checker.c:} else if (eff->kind == TYPE_ARRAY) {
+checker.c:} else if (eff->kind == TYPE_OPTIONAL) {
+checker.c:} else if (ft->kind == TYPE_STRUCT && ft->struct_type.field_count > 0) {
+checker.c:} else if (init_type->kind == TYPE_OPTIONAL &&
+checker.c:} else if (obj->kind == TYPE_POINTER) {
+checker.c:} else if (obj->kind == TYPE_SLICE) {
+checker.c:} else if (root_type && type_unwrap_distinct(root_type)->kind == TYPE_ARRAY) {
+checker.c:} else if (sw_type->kind == TYPE_UNION) {
+checker.c:} else if (sym && sym->type && type_unwrap_distinct(sym->type)->kind == TYPE_FUNC_PTR) {
+checker.c:} else if (teff && teff->kind == TYPE_POINTER && !teff->pointer.is_volatile) {
+checker.c:} else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
+checker.c:} else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
+checker.c:} else if (unwrapped->kind == TYPE_STRUCT) {
+checker.c:} else if (vt && vt->kind == TYPE_STRUCT && vt->struct_type.field_count > 0) {
+emitter.c:!(ftype && ftype->kind == TYPE_POINTER))
+emitter.c:(!ret || ret->kind == TYPE_VOID));
+emitter.c:((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
+emitter.c:(inner->kind == TYPE_OPTIONAL && is_null_sentinel(inner->optional.inner))) {
+emitter.c:(ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
+emitter.c:Type *elem = arr_type && arr_type->kind == TYPE_ARRAY ? arr_type->array.inner : NULL;
+emitter.c:Type *elem_type = obj_type ? (obj_type->kind == TYPE_ARRAY ?
+emitter.c:Type *ftype = (st && st->kind == TYPE_STRUCT &&
+emitter.c:Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+emitter.c:Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
+emitter.c:bool arg_is_opt = arg_eff && arg_eff->kind == TYPE_OPTIONAL;
+emitter.c:bool at_is_opt = at && at->kind == TYPE_OPTIONAL;
+emitter.c:bool at_is_opt = at_eff && at_eff->kind == TYPE_OPTIONAL;
+emitter.c:bool dest_is_slice = buf_eff && buf_eff->kind == TYPE_SLICE;
+emitter.c:bool elem_is_opt = elem_eff && elem_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool idx_array = idx_obj_eff && idx_obj_eff->kind == TYPE_ARRAY;
+emitter.c:bool idx_slice = idx_obj_eff && idx_obj_eff->kind == TYPE_SLICE;
+emitter.c:bool is_array = obj_type && obj_type->kind == TYPE_ARRAY;
+emitter.c:bool is_enum = sw_eff && sw_eff->kind == TYPE_ENUM;
+emitter.c:bool is_null_src = src_eff && src_eff->kind == TYPE_POINTER &&
+emitter.c:bool is_opt = sw_eff && sw_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
+emitter.c:bool is_ptr = bt && type_unwrap_distinct(bt)->kind == TYPE_POINTER;
+emitter.c:bool is_slice = ae && ae->kind == TYPE_SLICE;
+emitter.c:bool is_union = sw_eff && sw_eff->kind == TYPE_UNION;
+emitter.c:bool l_opaque = lt && lt->kind == TYPE_POINTER &&
+emitter.c:bool need_arr_coerce = arg_type && arg_type->kind == TYPE_ARRAY &&
+emitter.c:bool need_arr_copy = (dst_eff && dst_eff->kind == TYPE_ARRAY &&
+emitter.c:bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
+emitter.c:bool need_null = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool need_slice = (dst_eff && dst_eff->kind == TYPE_SLICE &&
+emitter.c:bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool need_wrap = (dst_eff && dst_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool need_wrap = (ret_eff && ret_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool needs_cv = rte && rte->kind == TYPE_STRUCT &&
+emitter.c:bool nullsent = opt_eff && opt_eff->kind == TYPE_OPTIONAL &&
+emitter.c:bool obj_is_slice = obj_type && obj_type->kind == TYPE_SLICE;
+emitter.c:bool obj_is_slice_early = obj_type && obj_type->kind == TYPE_SLICE;
+emitter.c:bool obj_slice = obj_eff && obj_eff->kind == TYPE_SLICE;
+emitter.c:bool pt_is_opt_value = pt && pt->kind == TYPE_OPTIONAL &&
+emitter.c:bool r_opaque = rt && rt->kind == TYPE_POINTER &&
+emitter.c:bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+emitter.c:bool sa_ptr = sat && type_unwrap_distinct(sat)->kind == TYPE_POINTER;
+emitter.c:bool sr_ptr = srt && type_unwrap_distinct(srt)->kind == TYPE_POINTER;
+emitter.c:bool vp = (vt && type_unwrap_distinct(vt)->kind == TYPE_POINTER);
+emitter.c:const char *ca = (cvt && type_unwrap_distinct(cvt)->kind == TYPE_POINTER) ? "->" : ".";
+emitter.c:const char *cba = (cbt && type_unwrap_distinct(cbt)->kind == TYPE_POINTER) ? "->" : ".";
+emitter.c:const char *csa = (cst && type_unwrap_distinct(cst)->kind == TYPE_POINTER) ? "->" : ".";
+emitter.c:const char *cta = (ctt && type_unwrap_distinct(ctt)->kind == TYPE_POINTER) ? "->" : ".";
+emitter.c:dst_eff && dst_eff->kind != TYPE_OPTIONAL &&
+emitter.c:dst_eff && dst_eff->kind == TYPE_POINTER &&
+emitter.c:eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
+emitter.c:eff_callee->func_ptr.params[i]->kind == TYPE_POINTER;
+emitter.c:eff_callee->func_ptr.params[i]->kind == TYPE_SLICE;
+emitter.c:eff_type->kind == TYPE_BARRIER || eff_type->kind == TYPE_SEMAPHORE ||
+emitter.c:eff_type->kind == TYPE_OPTIONAL || eff_type->kind == TYPE_UNION ||
+emitter.c:eff_type->kind == TYPE_SLICE)) {
+emitter.c:else if (eff_type->kind == TYPE_STRUCT && eff_type->struct_type.field_count == 0)
+emitter.c:else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
+emitter.c:else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
+emitter.c:else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
+emitter.c:else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
+emitter.c:else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+emitter.c:else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+emitter.c:else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+emitter.c:else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+emitter.c:else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && inst->src1_local >= 0 &&
+emitter.c:else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+emitter.c:emit_type(e, type_slice(e->arena, obj_type->kind == TYPE_ARRAY ?
+emitter.c:expr_eff->kind == TYPE_ARRAY && ret_eff->kind == TYPE_SLICE) {
+emitter.c:fret_eff->kind == TYPE_OPTIONAL &&
+emitter.c:if (!handled && obj_type && obj_type->kind == TYPE_ARENA) {
+emitter.c:if (!handled && obj_type && obj_type->kind == TYPE_RING) {
+emitter.c:if (!handled && obj_type && obj_type->kind == TYPE_SLAB) {
+emitter.c:if (!ret || ret->kind == TYPE_VOID) {
+emitter.c:if (!st || st->kind != TYPE_STRUCT) continue;
+emitter.c:if (!t || t->kind == TYPE_VOID) return;
+emitter.c:if (alloc_type->kind == TYPE_POOL)
+emitter.c:if (alloc_type->kind == TYPE_SLAB) {
+emitter.c:if (arg_eff && arg_eff->kind == TYPE_SLICE) {
+emitter.c:if (at && at->kind == TYPE_POINTER) {
+emitter.c:if (at->kind == TYPE_SLAB) {
+emitter.c:if (at_eff && at_eff->kind == TYPE_ARRAY &&
+emitter.c:if (base_eff->kind == TYPE_FUNC_PTR) {
+emitter.c:if (buf_eff && buf_eff->kind == TYPE_ARRAY) {
+emitter.c:if (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
+emitter.c:if (ct_eff && ct_eff->kind == TYPE_OPTIONAL) {
+emitter.c:if (ct_eff->kind == TYPE_FUNC_PTR) callee_ft = ct_eff;
+emitter.c:if (dst_eff && dst_eff->kind == TYPE_ARRAY &&
+emitter.c:if (dt->kind == TYPE_OPTIONAL && type_unwrap_distinct(dt->optional.inner)->kind == TYPE_FUNC_PTR) {
+emitter.c:if (eff && eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
+emitter.c:if (eff && eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
+emitter.c:if (eff && eff->kind == TYPE_STRUCT) return eff->struct_type.is_shared_rw;
+emitter.c:if (eff->kind != TYPE_OPTIONAL) return false;
+emitter.c:if (eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
+emitter.c:if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+emitter.c:if (eff->kind == TYPE_POINTER) {
+emitter.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
+emitter.c:if (eff->kind == TYPE_STRUCT) {
+emitter.c:if (eff_type && (eff_type->kind == TYPE_STRUCT || eff_type->kind == TYPE_ARRAY ||
+emitter.c:if (eff_type->kind == TYPE_SEMAPHORE)
+emitter.c:if (fret_eff->kind == TYPE_OPTIONAL) {
+emitter.c:if (fsym && fsym->type && fsym->type->kind == TYPE_FUNC_PTR) {
+emitter.c:if (ft && ft->kind == TYPE_POINTER && ft->pointer.is_volatile) return true;
+emitter.c:if (ft && ft->kind == TYPE_SLICE && ft->slice.is_volatile) return true;
+emitter.c:if (gtype_eff && gtype_eff->kind == TYPE_OPTIONAL &&
+emitter.c:if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY &&
+emitter.c:if (inner && inner->kind == TYPE_POINTER) inner = inner->pointer.inner;
+emitter.c:if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+emitter.c:if (inner->kind == TYPE_OPTIONAL && !is_null_sentinel(inner->optional.inner)) {
+emitter.c:if (inner->kind == TYPE_POINTER && inner->pointer.inner &&
+emitter.c:if (inner->kind == TYPE_POINTER) inner = type_unwrap_distinct(inner->pointer.inner);
+emitter.c:if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
+emitter.c:if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
+emitter.c:if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
+emitter.c:if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
+emitter.c:if (iv && iv->kind == TYPE_POINTER) {
+emitter.c:if (iv && iv->kind == TYPE_SLICE) {
+emitter.c:if (l->is_capture && l->type && l->type->kind == TYPE_VOID) continue;
+emitter.c:if (le->kind == TYPE_OPTIONAL && !is_null_sentinel(le->optional.inner)) {
+emitter.c:if (le->kind == TYPE_POINTER && le->pointer.inner &&
+emitter.c:if (le->kind == TYPE_STRUCT || le->kind == TYPE_UNION) {
+emitter.c:if (node->assign.op == TOK_EQ && tgt_eff && tgt_eff->kind == TYPE_SLICE) {
+emitter.c:if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
+emitter.c:if (node->var_decl.is_volatile && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
+emitter.c:if (obj_eff && obj_eff->kind == TYPE_ARRAY &&
+emitter.c:if (obj_eff && obj_eff->kind == TYPE_ENUM) {
+emitter.c:if (obj_eff && obj_eff->kind == TYPE_POINTER) {
+emitter.c:if (obj_type && obj_type->kind == TYPE_POOL) {
+emitter.c:if (obj_type && obj_type->kind == TYPE_SLICE) {
+emitter.c:if (obj_type && obj_type->kind == TYPE_UNION) {
+emitter.c:if (obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_HANDLE) {
+emitter.c:if (oe->kind == TYPE_HANDLE) {
+emitter.c:if (oe->kind == TYPE_POINTER) acc = "->";
+emitter.c:if (opt_eff && opt_eff->kind == TYPE_OPTIONAL &&
+emitter.c:if (ot && ot->kind == TYPE_STRUCT) {
+emitter.c:if (ot_eff && ot_eff->kind == TYPE_UNION) {
+emitter.c:if (ot_eff->kind == TYPE_ARRAY) {
+emitter.c:if (ot_eff->kind == TYPE_ENUM) {
+emitter.c:if (ot_eff->kind == TYPE_HANDLE) {
+emitter.c:if (ot_eff->kind == TYPE_OPAQUE ||
+emitter.c:if (ot_eff->kind == TYPE_POINTER) {
+emitter.c:if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+emitter.c:if (ot_eff->kind == TYPE_SLICE) {
+emitter.c:if (proven_eff && proven_eff->kind == TYPE_SLICE) {
+emitter.c:if (re->kind == TYPE_OPTIONAL && !is_null_sentinel(re->optional.inner)) {
+emitter.c:if (res && (res->kind == TYPE_U8 || res->kind == TYPE_U16 ||
+emitter.c:if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+emitter.c:if (ret && ret->kind == TYPE_FUNC_PTR) {
+emitter.c:if (rte && rte->kind == TYPE_POINTER) rte = type_unwrap_distinct(rte->pointer.inner);
+emitter.c:if (seff->kind == TYPE_POINTER) {
+emitter.c:if (seff->kind == TYPE_STRUCT && seff->struct_type.is_shared)
+emitter.c:if (src_eff && src_eff->kind == TYPE_OPTIONAL) {
+emitter.c:if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
+emitter.c:if (st && st->kind == TYPE_POINTER) accessor = "->";
+emitter.c:if (st && st->kind == TYPE_SLICE) {
+emitter.c:if (st && st->kind == TYPE_STRUCT)
+emitter.c:if (t->kind == TYPE_ARRAY) {
+emitter.c:if (t->kind == TYPE_DISTINCT && type_unwrap_distinct(t)->kind == TYPE_FUNC_PTR) {
+emitter.c:if (t->kind == TYPE_DISTINCT) {
+emitter.c:if (t->kind == TYPE_FUNC_PTR) {
+emitter.c:if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_FUNC_PTR) {
+emitter.c:if (t->kind == TYPE_OPTIONAL && type_unwrap_distinct(t->optional.inner)->kind == TYPE_FUNC_PTR) {
+emitter.c:if (t->kind == TYPE_POINTER)
+emitter.c:if (t->pointer.inner && type_unwrap_distinct(t->pointer.inner)->kind == TYPE_OPAQUE) {
+emitter.c:if (td_type && td_type->kind == TYPE_DISTINCT)
+emitter.c:if (te->kind == TYPE_ARENA) {
+emitter.c:if (te->kind == TYPE_POOL) {
+emitter.c:if (te->kind == TYPE_RING) {
+emitter.c:if (te->kind == TYPE_SLAB) {
+emitter.c:if (te->kind == TYPE_STRUCT) {
+emitter.c:if (tgt_eff && tgt_eff->kind == TYPE_ARRAY) {
+emitter.c:if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+emitter.c:if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
+emitter.c:if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
+emitter.c:if (tgt_eff && tgt_eff->kind == TYPE_STRUCT && tgt_eff->struct_type.is_shared) {
+emitter.c:if (tgt_type && type_unwrap_distinct(tgt_type)->kind == TYPE_ARRAY) {
+emitter.c:if (type && type->kind == TYPE_ARENA) {
+emitter.c:if (type && type->kind == TYPE_POOL) {
+emitter.c:if (type && type->kind == TYPE_RING) {
+emitter.c:if (type && type->kind == TYPE_SLAB) {
+emitter.c:if (val_eff && val_eff->kind != TYPE_OPTIONAL) {
+emitter.c:if (val_eff && val_eff->kind == TYPE_ARRAY) {
+emitter.c:if (wt->kind == TYPE_FUNC_PTR) worker_ft = wt;
+emitter.c:lt->pointer.inner && lt->pointer.inner->kind == TYPE_OPAQUE;
+emitter.c:obj_type->array.inner : obj_type->kind == TYPE_SLICE ?
+emitter.c:orelse_eff->kind == TYPE_OPTIONAL &&
+emitter.c:ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_STRUCT) {
+emitter.c:ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+emitter.c:ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+emitter.c:ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA) {
+emitter.c:ot_eff->kind == TYPE_STRUCT /* Task.new */)
+emitter.c:pt && pt->kind == TYPE_SLICE && arg_expr) {
+emitter.c:res->kind == TYPE_I8 || res->kind == TYPE_I16)) {
+emitter.c:ret_eff && ret_eff->kind != TYPE_OPTIONAL &&
+emitter.c:return inner && inner->kind == TYPE_VOID;
+emitter.c:return inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR;
+emitter.c:rt->pointer.inner && rt->pointer.inner->kind == TYPE_OPAQUE;
+emitter.c:src_eff && src_eff->kind != TYPE_OPTIONAL);
+emitter.c:src_eff && src_eff->kind == TYPE_ARRAY) {
+emitter.c:src_eff && src_eff->kind == TYPE_ARRAY);
+emitter.c:src_eff && src_eff->kind == TYPE_OPTIONAL &&
+emitter.c:src_eff && src_eff->kind == TYPE_POINTER) {
+emitter.c:src_eff->kind == TYPE_OPAQUE) &&
+emitter.c:src_eff->kind == TYPE_OPAQUE)) {
+emitter.c:src_eff->kind == TYPE_OPAQUE));
+emitter.c:src_eff->kind == TYPE_POINTER) {
+emitter.c:src_eff->kind == TYPE_POINTER)) {
+emitter.c:src_eff->optional.inner->kind != TYPE_VOID &&
+emitter.c:src_eff->optional.inner->kind != TYPE_VOID);
+emitter.c:tgt_eff->kind == TYPE_OPTIONAL &&
+emitter.c:tgt_eff->kind == TYPE_OPTIONAL && !is_null_sentinel(tgt_eff->optional.inner)) {
+emitter.c:tgt_eff->kind == TYPE_POINTER &&
+emitter.c:tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
+emitter.c:tgt_eff->kind == TYPE_SLICE &&
+emitter.c:tgt_eff->pointer.inner && type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE) {
+emitter.c:type_unwrap_distinct(inner->pointer.inner)->kind == TYPE_OPAQUE) return false;
+emitter.c:type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE) {
+emitter.c:type_unwrap_distinct(opt_inner->pointer.inner)->kind == TYPE_OPAQUE) {
+emitter.c:type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) {
+emitter.c:type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
+emitter.c:type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
+emitter.c:type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
+emitter.c:type_unwrap_distinct(val_type)->kind == TYPE_ARRAY) {
+emitter.c:val_type->kind != TYPE_OPTIONAL &&
+emitter.c:while (base->kind == TYPE_ARRAY) base = base->array.inner;
+emitter.c:while (dim->kind == TYPE_ARRAY) {
+emitter.c:while (inner->kind == TYPE_DISTINCT) inner = inner->distinct.underlying;
+emitter.c:} else if (alloc_type->kind == TYPE_POOL) {
+emitter.c:} else if (at && pt && at->kind == TYPE_ARRAY && pt->kind == TYPE_SLICE) {
+emitter.c:} else if (at && pt && at->kind == TYPE_SLICE && pt->kind == TYPE_POINTER) {
+emitter.c:} else if (at->kind == TYPE_POOL) {
+emitter.c:} else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
+emitter.c:} else if (eff_elem->kind == TYPE_STRUCT) {
+emitter.c:} else if (eff_elem->kind == TYPE_UNION) {
+emitter.c:} else if (fret_eff->kind != TYPE_VOID) {
+emitter.c:} else if (idx_obj_type && idx_obj_type->kind == TYPE_SLICE) {
+emitter.c:} else if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR ||
+emitter.c:} else if (inner->kind == TYPE_STRUCT || inner->kind == TYPE_UNION) {
+emitter.c:} else if (node->slice.start && obj_type && obj_type->kind == TYPE_ARRAY) {
+emitter.c:} else if (src_eff && src_eff->kind == TYPE_OPAQUE) {
+emitter.c:} else if (src_eff && src_eff->kind == TYPE_POINTER &&
+emitter.c:} else if (te->kind == TYPE_UNION) {
+emitter.c:} else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+ir_lower.c:bool is_enum = sw_eff && sw_eff->kind == TYPE_ENUM;
+ir_lower.c:bool is_optional = sw_eff && sw_eff->kind == TYPE_OPTIONAL;
+ir_lower.c:bool is_union = sw_eff && sw_eff->kind == TYPE_UNION;
+ir_lower.c:bool is_void_cap = (cond_eff && cond_eff->kind == TYPE_OPTIONAL &&
+ir_lower.c:if (!lt || type_unwrap_distinct(lt)->kind == TYPE_VOID)
+ir_lower.c:if (cap_type && cap_type->kind != TYPE_VOID) {
+ir_lower.c:if (eff && eff->kind == TYPE_OPTIONAL) {
+ir_lower.c:if (eff->kind == TYPE_POINTER) {
+ir_lower.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
+ir_lower.c:if (eff->kind == TYPE_VOID || eff->kind == TYPE_ARRAY) goto passthrough;
+ir_lower.c:if (frt_eff->kind == TYPE_ARRAY) goto passthrough;
+ir_lower.c:if (func_type && func_type->kind == TYPE_FUNC_PTR &&
+ir_lower.c:if (ie && ie->kind == TYPE_OPTIONAL) rt = ie->optional.inner;
+ir_lower.c:if (init_eff && init_eff->kind == TYPE_ARRAY &&
+ir_lower.c:if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+ir_lower.c:if (inner_eff && inner_eff->kind == TYPE_ENUM) {
+ir_lower.c:if (le->kind == TYPE_OPAQUE || le->kind == TYPE_STRUCT ||
+ir_lower.c:if (le->kind == TYPE_POINTER && le->pointer.inner &&
+ir_lower.c:if (oe && oe->kind == TYPE_OPTIONAL) rt = oe->optional.inner;
+ir_lower.c:if (oe->kind == TYPE_ARRAY) {
+ir_lower.c:if (ot->kind == TYPE_ARENA) {
+ir_lower.c:if (ot->kind == TYPE_POOL) {
+ir_lower.c:if (ot->kind == TYPE_RING) {
+ir_lower.c:if (ot->kind == TYPE_SLAB) {
+ir_lower.c:if (ot_eff && ot_eff->kind == TYPE_OPTIONAL) {
+ir_lower.c:if (ot_eff && ot_eff->kind == TYPE_POINTER && ot_eff->pointer.inner)
+ir_lower.c:if (ot_eff->kind == TYPE_HANDLE || ot_eff->kind == TYPE_OPAQUE ||
+ir_lower.c:if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+ir_lower.c:if (re->kind == TYPE_OPAQUE || re->kind == TYPE_STRUCT ||
+ir_lower.c:if (rt_eff->kind != TYPE_VOID && rt_eff->kind != TYPE_ARRAY) {
+ir_lower.c:if (rt_eff->kind == TYPE_ARRAY) goto passthrough;
+ir_lower.c:if (rt_eff->kind == TYPE_VOID || rt_eff->kind == TYPE_ARRAY) goto passthrough;
+ir_lower.c:if (rt_eff->kind == TYPE_VOID || rt_eff->kind == TYPE_ARRAY) {
+ir_lower.c:if (rt_eff->kind == TYPE_VOID) {
+ir_lower.c:if (tgt_eff->kind == TYPE_VOID) goto passthrough;
+ir_lower.c:if (vt_eff && vt_eff->kind == TYPE_OPTIONAL &&
+ir_lower.c:inner_eff->kind == TYPE_FUNC_PTR);
+ir_lower.c:is_null_sent_opt = inner_eff && (inner_eff->kind == TYPE_POINTER ||
+ir_lower.c:le->kind == TYPE_OPTIONAL || le->kind == TYPE_UNION)
+ir_lower.c:ot_eff->kind == TYPE_ARRAY || ot_eff->kind == TYPE_SLICE)
+ir_lower.c:ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+ir_lower.c:ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+ir_lower.c:ot_eff->kind == TYPE_STRUCT /* Task.new/delete */)
+ir_lower.c:re->kind == TYPE_OPTIONAL || re->kind == TYPE_UNION)
+ir_lower.c:type_unwrap_distinct(cond_eff->optional.inner)->kind == TYPE_VOID);
+ir_lower.c:type_unwrap_distinct(le->pointer.inner)->kind == TYPE_OPAQUE)
+ir_lower.c:type_unwrap_distinct(sw_eff->optional.inner)->kind == TYPE_VOID;
+ir_lower.c:type_unwrap_distinct(vt_eff->optional.inner)->kind == TYPE_VOID) {
+ir_lower.c:vt_unwrap && vt_unwrap->kind == TYPE_SLICE) {
+ir_lower.c:} else if (ot_eff && ot_eff->kind == TYPE_STRUCT) {
+ir_lower.c:} else if (ot_eff && ot_eff->kind == TYPE_UNION) {
+types.c:from->kind == TYPE_USIZE ? 1 : 0,
+types.c:if (a->kind == TYPE_OPTIONAL) return a->optional.inner;
+types.c:if (from->kind == TYPE_ARRAY && to->kind == TYPE_SLICE) {
+types.c:if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER) {
+types.c:if (from->kind == TYPE_SLICE && to->kind == TYPE_SLICE) {
+types.c:if (to_eff->kind == TYPE_OPTIONAL) {
+types.c:if (zer_coerce_float_widening_allowed(from->kind == TYPE_F32 ? 1 : 0,
+types.c:return a->kind == TYPE_OPTIONAL;
+types.c:to->kind == TYPE_F64 ? 1 : 0) != 0) {
+types.c:to->kind == TYPE_USIZE ? 1 : 0,
+zercheck_ir.c:(ret_eff->kind == TYPE_OPTIONAL &&
+zercheck_ir.c:bool is_void = (type_unwrap_distinct(ret)->kind == TYPE_VOID);
+zercheck_ir.c:bool src_is_ptr = eff && (eff->kind == TYPE_POINTER ||
+zercheck_ir.c:eff->kind == TYPE_OPAQUE);
+zercheck_ir.c:ft_eff->kind == TYPE_UNION)) {
+zercheck_ir.c:if (!cur_eff || cur_eff->kind != TYPE_STRUCT) break;
+zercheck_ir.c:if (!st || (st->kind != TYPE_STRUCT &&
+zercheck_ir.c:if (dt_eff && dt_eff->kind == TYPE_HANDLE)
+zercheck_ir.c:if (dt_eff && dt_eff->kind == TYPE_OPTIONAL)
+zercheck_ir.c:if (eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_OPAQUE) &&
+zercheck_ir.c:if (eff && eff->kind == TYPE_HANDLE) {
+zercheck_ir.c:if (eff && eff->kind == TYPE_OPTIONAL) {
+zercheck_ir.c:if (eff->kind != TYPE_STRUCT) return;
+zercheck_ir.c:if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+zercheck_ir.c:if (eff->kind == TYPE_STRUCT) {
+zercheck_ir.c:if (eff->kind == TYPE_UNION) {
+zercheck_ir.c:if (ft->kind == TYPE_HANDLE) {
+zercheck_ir.c:if (ft_eff && (ft_eff->kind == TYPE_STRUCT ||
+zercheck_ir.c:if (inner && (inner->kind == TYPE_POINTER ||
+zercheck_ir.c:if (inner && (inner->kind == TYPE_POINTER || inner->kind == TYPE_OPAQUE))
+zercheck_ir.c:if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
+zercheck_ir.c:if (ret->kind == TYPE_OPTIONAL) {
+zercheck_ir.c:if (ret->kind == TYPE_POINTER || ret->kind == TYPE_OPAQUE) return true;
+zercheck_ir.c:if (ret_eff && (ret_eff->kind == TYPE_HANDLE ||
+zercheck_ir.c:if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
+zercheck_ir.c:if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
+zercheck_ir.c:if (rt && rt->kind == TYPE_POINTER) return true;
+zercheck_ir.c:if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
+zercheck_ir.c:if (vt && (vt->kind == TYPE_STRUCT || vt->kind == TYPE_UNION)) {
+zercheck_ir.c:if (vt_eff && (vt_eff->kind == TYPE_STRUCT ||
+zercheck_ir.c:inner->kind == TYPE_HANDLE))
+zercheck_ir.c:inner->kind == TYPE_OPAQUE ||
+zercheck_ir.c:inner->kind == TYPE_OPAQUE))
+zercheck_ir.c:ret_eff->kind == TYPE_HANDLE))
+zercheck_ir.c:ret_eff->kind == TYPE_OPAQUE ||
+zercheck_ir.c:return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
+zercheck_ir.c:return p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE;
+zercheck_ir.c:st->kind != TYPE_UNION)) continue;
+zercheck_ir.c:type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
+zercheck_ir.c:vt_eff->kind == TYPE_UNION)) {
+zercheck_ir.c:} else if (ft->kind == TYPE_STRUCT || ft->kind == TYPE_UNION) {

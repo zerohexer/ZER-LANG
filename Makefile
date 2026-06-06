@@ -118,6 +118,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/walker_default_audit.sh
 	@echo "=== Fixed-buffer audit (Stage 3 — Rule #7 enforcement) ==="
 	@bash tools/audit_fixed_buffers.sh
+	@echo "=== Type-dispatch audit (distinct-unwrap class kill) ==="
+	@bash tools/audit_type_dispatch.sh
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
 

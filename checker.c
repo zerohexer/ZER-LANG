@@ -6073,10 +6073,12 @@ static Type *check_expr(Checker *c, Node *node) {
             /* @ptrcast(*T, expr) → *T — source AND target must be pointers */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
-                /* BUG-375: target type must be a pointer */
+                /* BUG-375: target type must be a pointer.
+                 * type_dispatch_kind unwraps distinct — a `distinct typedef
+                 * *u32 P;` target must still be recognized as a pointer. */
                 if (result) {
-                    Type *res_eff = type_unwrap_distinct(result);
-                    if (res_eff->kind != TYPE_POINTER && res_eff->kind != TYPE_FUNC_PTR) {
+                    TypeKind res_k = type_dispatch_kind(result);
+                    if (res_k != TYPE_POINTER && res_k != TYPE_FUNC_PTR) {
                         checker_error(c, node->loc.line,
                             "@ptrcast target must be a pointer type, got '%s'",
                             type_name(result));
@@ -6179,10 +6181,10 @@ static Type *check_expr(Checker *c, Node *node) {
              * Those preserve the language's other safety invariants. */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
-                /* target type must be a pointer */
+                /* target type must be a pointer (distinct-unwrapped) */
                 if (result) {
-                    Type *res_eff = type_unwrap_distinct(result);
-                    if (res_eff->kind != TYPE_POINTER && res_eff->kind != TYPE_FUNC_PTR) {
+                    TypeKind res_k = type_dispatch_kind(result);
+                    if (res_k != TYPE_POINTER && res_k != TYPE_FUNC_PTR) {
                         checker_error(c, node->loc.line,
                             "@pun target must be a pointer type, got '%s'",
                             type_name(result));

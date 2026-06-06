@@ -9772,3 +9772,87 @@ That's substantially more scope than F7-light. Future session.
   C3 LL/SC enforcement live; F7-full C1/C2 deferred (~30 hrs); Stage 5
   / System #30 pending (~80 hrs); naked migration deferred (~20 hrs
   after S1 relaxation)
+
+---
+
+## Distinct-Unwrap Structural Kill — `type_dispatch_kind` + CI gate (2026-06-07)
+
+The #1 historical bug class in this compiler is "dispatched a safety
+decision on `result->kind == TYPE_X` without unwrapping `TYPE_DISTINCT`
+first." BUG-409's audit found 35+ such sites in one pass; GAP-F
+(2026-06-06) was the same class resurfacing in the freshly-added `@pun`
+handler (it inherited the bug by copying `@ptrcast`). A `distinct typedef
+*u32 P;` has kind `TYPE_DISTINCT`, so `== TYPE_POINTER` silently fails and
+the safety check (const-strip, provenance, target-validation) is skipped.
+
+This is the RF14 treatment applied to type dispatch: don't whack-a-mole
+the instances, kill the *class* with an accessor + a CI gate.
+
+### The accessor (types.h)
+
+```c
+static inline TypeKind type_dispatch_kind(Type *t) {
+    t = type_unwrap_distinct(t);
+    return t ? t->kind : TYPE_VOID;
+}
+```
+
+Use `type_dispatch_kind(t) == TYPE_X` instead of `t->kind == TYPE_X`
+whenever `t` is a fresh result of `checker_get_type()` / `check_expr()` /
+`resolve_type()` / `typemap_get()` that could be a distinct typedef. The
+accessor cannot forget the unwrap. NULL → `TYPE_VOID` so pointer/slice/
+struct/etc. checks correctly get a false match on NULL (matches the old
+`t && t->kind == X` idiom).
+
+**Do NOT** convert reads of already-resolved inner types
+(`.pointer.inner->kind`, `.optional.inner->kind`, `.array.inner->kind`,
+`.slice.inner->kind`) — those are post-resolution, rarely distinct, and
+converting them is pure churn. The accessor is for the *top-level*
+dispatch on a freshly-obtained `Type*`, not for inner reads. Sites that
+already use the `Type *eff = type_unwrap_distinct(x); eff->kind` idiom are
+correct as-is — don't churn them either.
+
+### The enforcement gate (tools/audit_type_dispatch.sh)
+
+Mirrors `tools/audit_fixed_buffers.sh`: snapshots the current
+`->kind == TYPE_` / `!= TYPE_` surface (627 sites at creation) into
+`tools/type_dispatch_baseline.txt` (line-number-agnostic `file:content`),
+and **fails CI on any NEW site**. Wired into `make check` after the
+fixed-buffer audit.
+
+When you add a new type-dispatch site you get a forced conscious choice:
+- Use `type_dispatch_kind(t)` — the line then has no `->kind == TYPE_` and
+  never trips the gate (preferred when `t` could be distinct).
+- If the read is genuinely safe (already-unwrapped `_eff` local, `.inner`
+  read, primitive-only context) → append the `file:content` line to the
+  baseline with a justification in the commit message.
+
+This is the durable class-kill. The accessor alone is opt-in; the gate is
+what prevents the next GAP-F from being added silently — exactly how
+RF14's `-Wswitch` discipline made walker-exhaustiveness durable.
+
+### Why no mass conversion
+
+The cast/intrinsic safety handlers already use the
+`type_unwrap_distinct → _eff local` idiom consistently. GAP-F was a single
+site that skipped it (now fixed). Mass-converting 600+ already-correct
+sites would be risky churn against the codebase's no-debt philosophy with
+zero safety gain. Only the two GAP-F handlers (`@ptrcast` / `@pun` target
+validation, single-use locals) were converted as the canonical
+demonstration. The gate carries the forward-looking guarantee.
+
+### Files
+
+- `types.h` — `type_dispatch_kind()` accessor next to `type_unwrap_distinct`.
+- `tools/audit_type_dispatch.sh` — the gate.
+- `tools/type_dispatch_baseline.txt` — frozen surface (627 sites).
+- `Makefile` `check` target — gate runs after fixed-buffer audit.
+- `checker.c` — `@ptrcast` + `@pun` target validation converted to accessor.
+
+### For fresh sessions
+
+Run `bash tools/audit_type_dispatch.sh` before committing checker/emitter/
+zercheck changes. If it flags a new site, decide: distinct-possible result
+→ `type_dispatch_kind`; provably-safe → baseline + justification. Never
+silence the gate by bumping nothing — the whole point is the conscious
+checkpoint.

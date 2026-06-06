@@ -1388,6 +1388,33 @@ convert to stack-first dynamic OR add a one-line justification + the
 content line to `tools/fixed_buffer_baseline.txt`. Don't increase
 constants in fixed buffers — the rule is "stack fast path, arena overflow".
 
+## Distinct-Unwrap Class Kill 2026-06-07 — `type_dispatch_kind` + CI gate
+
+The #1 historical bug class (BUG-409 "35+ sites", GAP-F 2026-06-06):
+dispatching a safety decision on `result->kind == TYPE_X` without
+unwrapping `TYPE_DISTINCT` first — a `distinct typedef` then has kind
+`TYPE_DISTINCT`, the check silently fails, the safety check is skipped.
+
+**Use `type_dispatch_kind(t) == TYPE_X`** (types.h) instead of
+`t->kind == TYPE_X` whenever `t` is a fresh `checker_get_type()` /
+`check_expr()` / `resolve_type()` / `typemap_get()` result that could be a
+distinct typedef. It unwraps all distinct levels, is NULL-safe (NULL →
+`TYPE_VOID`), and cannot forget the unwrap. NOT for already-resolved inner
+reads (`.pointer.inner->kind` etc.) or correct `_eff` locals — don't churn
+those.
+
+`tools/audit_type_dispatch.sh` (NEW, CI gate in `make check`) freezes the
+627-site `->kind == TYPE_` surface in `tools/type_dispatch_baseline.txt`
+(file:content, line-number-agnostic) and **fails on any NEW site** — the
+RF14 `-Wswitch` analog for type dispatch. Adding a new dispatch site forces
+a conscious choice: use `type_dispatch_kind` (no `->kind ==`, never trips),
+or justify the raw read in the baseline. This is the durable class-kill;
+mass-converting the 600+ already-correct sites was rejected as churn.
+
+Run `bash tools/audit_type_dispatch.sh` before committing checker/emitter/
+zercheck edits. Full detail in `docs/compiler-internals.md` "Distinct-Unwrap
+Structural Kill" section.
+
 ## Stage 4 PIVOTED 2026-05-12 — see docs/asm_lang_zer_safe.md
 
 **PIVOT NOTICE:** The "make compiler smart about specific instructions"

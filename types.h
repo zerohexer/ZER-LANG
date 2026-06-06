@@ -176,6 +176,31 @@ static inline Type *type_unwrap_distinct(Type *t) {
     return t;
 }
 
+/* Canonical dispatch-kind accessor (structural distinct-unwrap kill, 2026-06-07).
+ *
+ * Use this INSTEAD of `t->kind` whenever you dispatch a SAFETY decision on
+ * the RESULT of checker_get_type()/check_expr()/resolve_type() — i.e. any
+ * `result->kind == TYPE_X` where a missed distinct-unwrap would let a
+ * `distinct typedef` slip past a safety check (the GAP-F / BUG-409 class,
+ * the #1 historical bug class in this compiler). Unwraps ALL levels of
+ * TYPE_DISTINCT and is NULL-safe.
+ *
+ * NULL → TYPE_VOID: callers checking `== TYPE_POINTER/SLICE/STRUCT/...`
+ * correctly get a false match on NULL (matches the old `t && t->kind == X`
+ * idiom). A site that genuinely dispatches on `== TYPE_VOID` must still
+ * NULL-guard separately — but those read already-resolved `.inner` types,
+ * not user-type-arg results, so they are NOT in this accessor's domain.
+ *
+ * Do NOT use for reads of already-resolved inner types
+ * (`.pointer.inner->kind`, `.optional.inner->kind`, `.array.inner->kind`,
+ * `.slice.inner->kind`) — those are post-resolution and rarely distinct;
+ * converting them is churn. This accessor is for the top-level dispatch on
+ * a freshly-obtained Type*. */
+static inline TypeKind type_dispatch_kind(Type *t) {
+    t = type_unwrap_distinct(t);
+    return t ? t->kind : TYPE_VOID;
+}
+
 /* ================================================================
  * Symbol Table — Scope Chain (Decision 2)
  * ================================================================ */

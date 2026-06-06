@@ -931,6 +931,10 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
         return IRMC_ARENA_ALLOC;  /* arena.alloc(Type) takes type arg */
     }
     if (ml == 9 && memcmp(m, "alloc_ptr", 9) == 0) return IRMC_ALLOC_PTR;
+    /* ByY6r Gap 1 (2026-06-03): arena.alloc_slice(T, n) returns ?[*]T — must
+     * be classified as ARENA alloc so the dest's source_color is ZC_COLOR_ARENA.
+     * Without this, arena.reset() doesn't mark the slice FREED → silent UAF. */
+    if (ml == 11 && memcmp(m, "alloc_slice", 11) == 0) return IRMC_ARENA_ALLOC;
     if (ml == 3 && memcmp(m, "get", 3) == 0) return IRMC_GET;
     if (ml == 4 && memcmp(m, "free", 4) == 0) return IRMC_FREE;
     if (ml == 8 && memcmp(m, "free_ptr", 8) == 0) return IRMC_FREE_PTR;
@@ -1852,6 +1856,41 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 else break;
             }
         }
+        /* Gap A3 (2026-05-06, sNsjM): move-struct field-read transfers ownership.
+         * `Tok t = b.inner` where b.inner is a move-struct field MUST mark the
+         * source compound (b, ".inner") as TRANSFERRED. Pre-fix: only
+         * NODE_INDEX (array-element move) was handled, field-read move-transfer
+         * was silently dropped → `Tok t = b.inner; use(&b.inner)` compiled
+         * clean → silent UAM. */
+        if (inst->dest_local >= 0 &&
+            inst->dest_local < func->local_count) {
+            Type *dest_type = func->locals[inst->dest_local].type;
+            if (ir_should_track_move(dest_type) && inst->expr) {
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, inst->expr,
+                                             &root_local, &path,
+                                             &path_len) == 0 &&
+                    path_len > 0) {
+                    IRHandleInfo *ch = ir_find_compound_handle(ps,
+                        root_local, path, path_len);
+                    if (ch && ch->state == IR_HS_TRANSFERRED) {
+                        ir_zc_error(zc, inst->source_line,
+                            "use after move: '%.*s' on local %%%d "
+                            "ownership transferred at line %d",
+                            (int)path_len, path, root_local,
+                            ch->free_line);
+                    }
+                    if (!ch) ch = ir_add_compound_handle(ps, root_local,
+                                                          path, path_len);
+                    if (ch) {
+                        ch->state = IR_HS_TRANSFERRED;
+                        ch->free_line = inst->source_line;
+                    }
+                }
+            }
+        }
         break;
     }
 
@@ -1954,6 +1993,30 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
             }
+
+            /* Gap A2 (2026-05-06, sNsjM): move-struct field-write transfers
+             * ownership. `b.field = t` where t is a move struct (or contains
+             * move fields) MUST mark t as TRANSFERRED. Subsequent use of t =
+             * use-after-move. Hosted + baremetal: silent UAM since C struct
+             * copy makes t's bytes readable but logically invalid. */
+            if (target_expr && rhs_local >= 0 && rhs_local < func->local_count &&
+                (target_expr->kind == NODE_FIELD ||
+                 target_expr->kind == NODE_INDEX)) {
+                Type *rhs_type = func->locals[rhs_local].type;
+                if (ir_should_track_move(rhs_type)) {
+                    IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+                    if (rh && ir_is_invalid(rh)) {
+                        ir_zc_error(zc, inst->source_line,
+                            "use of %s value (local %%%d) in field/index write",
+                            ir_state_name(rh->state), rhs_local);
+                    }
+                    if (!rh) rh = ir_add_handle(ps, rhs_local);
+                    if (rh) {
+                        rh->state = IR_HS_TRANSFERRED;
+                        rh->free_line = inst->source_line;
+                    }
+                }
+            }
         }
         /* Phase E: recognize pool/slab builtin method calls in the RHS.
          * Handled shapes:
@@ -1995,8 +2058,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * where arr is Token[N] and Token is a move struct transfers
              * ownership from arr[0]. Register compound handle (arr, "[0]")
              * as TRANSFERRED; subsequent access to arr[0] triggers UAF.
-             * Only handles literal-index (NODE_INT_LIT) compound keys. */
-            if (rhs && rhs->kind == NODE_INDEX &&
+             * Only handles literal-index (NODE_INT_LIT) compound keys.
+             *
+             * Gap A3 (2026-05-06, sNsjM): also covers NODE_FIELD — `Tok t = b.inner`
+             * where b.inner is a move-struct field. Pre-fix: only NODE_INDEX was
+             * handled; field-read move-transfer was silently dropped. */
+            if (rhs && (rhs->kind == NODE_INDEX || rhs->kind == NODE_FIELD) &&
                 inst->dest_local >= 0 &&
                 inst->dest_local < func->local_count &&
                 ir_should_track_move(func->locals[inst->dest_local].type)) {
@@ -2163,6 +2230,37 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     /* Fall through — dest may still need tracking if get result is pointer */
+                } else if (mc == IRMC_NONE && inst->dest_local >= 0 &&
+                           inst->dest_local < func->local_count) {
+                    /* p3Qz0 Gap 38 (2026-05-16): non-method function call
+                     * returning Handle(T) or ?Handle(T) — register dest as
+                     * fresh ALIVE allocation. Covers orelse-wrapped case:
+                     *   Handle(Task) h = get_handle() orelse return;
+                     * which lowers to IR_ASSIGN with NODE_ORELSE expr.
+                     * Sets escaped=true so leak-at-exit doesn't fire across
+                     * function boundaries; FREED transitions still tracked. */
+                    Type *dt = func->locals[inst->dest_local].type;
+                    Type *eff = dt ? type_unwrap_distinct(dt) : NULL;
+                    if (eff && eff->kind == TYPE_OPTIONAL) {
+                        eff = type_unwrap_distinct(eff->optional.inner);
+                    }
+                    if (eff && eff->kind == TYPE_HANDLE) {
+                        IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                        if (h) {
+                            if (h->state == IR_HS_ALIVE &&
+                                !func->locals[inst->dest_local].is_temp) {
+                                ir_zc_error(zc, inst->source_line,
+                                    "handle %%%d overwritten while alive — previous leaked",
+                                    inst->dest_local);
+                            }
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->source_color = ZC_COLOR_UNKNOWN;
+                            h->escaped = true;
+                        }
+                        break;
+                    }
                 }
             }
             /* If source is an ident that's a tracked handle, create alias */
@@ -2434,6 +2532,38 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     ir_should_track_move(target_type);
                 bool root_is_move = ir_should_track_move(arg_type);
                 if (!target_is_move && !root_is_move) continue;
+
+                /* Gap A3 follow-up (2026-05-06, sNsjM): when target is a
+                 * compound (b.inner, arr[0].field), check the compound handle
+                 * FIRST — if it was already TRANSFERRED by an earlier field-read
+                 * move (`Tok t = b.inner`), passing &b.inner is use-after-move.
+                 * Without this, only the bare handle for root b was checked,
+                 * so compound TRANSFERRED state was silently ignored. */
+                IRHandleInfo *compound_h = NULL;
+                if (target_is_move &&
+                    (target->kind == NODE_FIELD ||
+                     target->kind == NODE_INDEX)) {
+                    int croot;
+                    const char *cpath;
+                    uint32_t cpath_len;
+                    if (ir_extract_compound_key(zc, func, target,
+                                                 &croot, &cpath,
+                                                 &cpath_len) == 0 &&
+                        cpath_len > 0) {
+                        compound_h = ir_find_compound_handle(ps, croot,
+                                                              cpath, cpath_len);
+                        if (compound_h && compound_h->state == IR_HS_TRANSFERRED) {
+                            ir_zc_error(zc, inst->source_line,
+                                "use after move: compound '%.*s' on local "
+                                "'%.*s' transferred at line %d",
+                                (int)cpath_len, cpath,
+                                (int)func->locals[arg_local].name_len,
+                                func->locals[arg_local].name,
+                                compound_h->free_line);
+                        }
+                    }
+                }
+
                 IRHandleInfo *h = ir_find_handle(ps, arg_local);
                 if (h && h->state == IR_HS_TRANSFERRED) {
                     ir_zc_error(zc, inst->source_line,
@@ -2661,13 +2791,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret = checker_get_type(zc->checker, inst->expr);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
+                /* p3Qz0 Gap 38 (2026-05-16): TYPE_HANDLE added to register
+                 * function-returned handles for double-free tracking. */
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
-                                ret_eff->kind == TYPE_OPAQUE))
+                                ret_eff->kind == TYPE_OPAQUE ||
+                                ret_eff->kind == TYPE_HANDLE))
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
-                                  inner->kind == TYPE_OPAQUE))
+                                  inner->kind == TYPE_OPAQUE ||
+                                  inner->kind == TYPE_HANDLE))
                         is_ptr_return = true;
                 }
                 if (is_ptr_return) {
@@ -2677,6 +2811,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->alloc_line = inst->source_line;
                         h->alloc_id = _ir_next_alloc_id++;
                         h->source_color = summary->returns_color;
+                        /* Mark Handle returns as escaped — leak-at-exit shouldn't
+                         * fire (ownership came from another function; caller often
+                         * passes to a destructor). Double-free state still works. */
+                        if (ret_eff && (ret_eff->kind == TYPE_HANDLE ||
+                            (ret_eff->kind == TYPE_OPTIONAL &&
+                             type_unwrap_distinct(ret_eff->optional.inner) &&
+                             type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
+                            h->escaped = true;
+                        }
                     }
                 }
             }
@@ -2703,13 +2846,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret = checker_get_type(zc->checker, call);
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
+                /* p3Qz0 Gap 38: TYPE_HANDLE added for double-free tracking. */
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
-                                ret_eff->kind == TYPE_OPAQUE))
+                                ret_eff->kind == TYPE_OPAQUE ||
+                                ret_eff->kind == TYPE_HANDLE))
                     is_ptr_return = true;
                 if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
                     Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     if (inner && (inner->kind == TYPE_POINTER ||
-                                  inner->kind == TYPE_OPAQUE))
+                                  inner->kind == TYPE_OPAQUE ||
+                                  inner->kind == TYPE_HANDLE))
                         is_ptr_return = true;
                 }
                 /* Check if dest already has handle (e.g., arena-colored) */
@@ -2741,6 +2887,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     h->source_color = is_stdlib ? ZC_COLOR_MALLOC : ZC_COLOR_UNKNOWN;
+                    /* p3Qz0 Gap 38: mark Handle-returning calls as escaped so
+                     * leak-at-exit doesn't fire; FREED transitions still work. */
+                    Type *dt = (inst->dest_local < func->local_count) ?
+                        func->locals[inst->dest_local].type : NULL;
+                    Type *dt_eff = dt ? type_unwrap_distinct(dt) : NULL;
+                    if (dt_eff && dt_eff->kind == TYPE_OPTIONAL)
+                        dt_eff = type_unwrap_distinct(dt_eff->optional.inner);
+                    if (dt_eff && dt_eff->kind == TYPE_HANDLE)
+                        h->escaped = true;
                 }
             }
 

@@ -790,9 +790,38 @@ static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
     return false;
 }
 
+/* Check if function name matches one of the conventional destructor
+ * keywords. Mirrors zercheck.c's pre-AST→IR-migration helper
+ * `name_looks_like_destructor` (Gap 17 in docs/4-27-2026-gaps.md).
+ *
+ * AUDIT 2026-06-06 (GAP-D): the AST→IR migration claimed this helper
+ * was "bundled into ir_is_extern_free_call" (docs/refactor_ir.md:2293)
+ * but the bundling was never actually done — the bodyless heuristic
+ * stayed void-return-only. Restoring widens detection to non-void
+ * destructor patterns like `i32 destroy_resource(*Res r);`.
+ *
+ * Keep this list in sync with the 12 substrings from the AST-era
+ * helper documented in CLAUDE.md "Stage 1" entry. */
+static bool ir_name_looks_like_destructor(const char *name, uint32_t len) {
+    static const char *kws[] = {
+        "free", "destroy", "close", "release", "delete", "dispose",
+        "drop", "cleanup", "deinit", "fini", "shutdown", "term"
+    };
+    for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++) {
+        uint32_t kl = (uint32_t)strlen(kws[i]);
+        if (kl > len) continue;
+        for (uint32_t j = 0; j + kl <= len; j++) {
+            if (memcmp(name + j, kws[i], kl) == 0) return true;
+        }
+    }
+    return false;
+}
+
 /* Check if a call is to a function that frees its first argument.
  * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
- * param (signature heuristic — catches destroy/close/cleanup patterns). */
+ * param (signature heuristic — catches destroy/close/cleanup patterns)
+ * OR bodyless non-void fn whose name matches a destructor convention
+ * (Gap 17 / AUDIT 2026-06-06 GAP-D — catches `i32 destroy_resource(*R)`). */
 static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     if (!call || call->kind != NODE_CALL) return false;
     Node *callee = call->call.callee;
@@ -801,14 +830,24 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     /* Explicit "free" */
     if (callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0) return true;
-    /* Signature heuristic: bodyless void fn(*opaque/*T ...) */
+    /* Signature heuristic: bodyless fn(*opaque/*T ...).
+     * Void return: always free-classified.
+     * Non-void return: free-classified only if name looks like a destructor. */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
         callee->ident.name, (uint32_t)callee->ident.name_len);
     if (!sym || !sym->is_function || !sym->func_node) return false;
     if (sym->func_node->func_decl.body) return false;
     Type *ret = sym->type;
     if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-    if (!ret || type_unwrap_distinct(ret)->kind != TYPE_VOID) return false;
+    if (!ret) return false;
+    bool is_void = (type_unwrap_distinct(ret)->kind == TYPE_VOID);
+    if (!is_void) {
+        /* AUDIT 2026-06-06 (GAP-D): widen heuristic to non-void returns
+         * when the name suggests a destructor convention. */
+        if (!ir_name_looks_like_destructor(callee->ident.name,
+                                            (uint32_t)callee->ident.name_len))
+            return false;
+    }
     if (sym->func_node->func_decl.param_count < 1) return false;
     Type *p0 = NULL;
     if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
@@ -1556,23 +1595,78 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * ALIVE before marking TRANSFERRED. Move struct locals aren't
          * tracked until they're transferred — without auto-registration,
          * spawn(move_struct) was a no-op and use-after-thread-transfer
-         * went undetected (B02_use_after_thread_transfer_bad). */
+         * went undetected (B02_use_after_thread_transfer_bad).
+         *
+         * AUDIT 2026-06-06 (GAP-C): pre-fix only matched NODE_IDENT, so
+         * `spawn worker(b.t)` (NODE_FIELD) and `spawn worker(arr[i])`
+         * silently skipped TRANSFERRED, producing silent UAM. Use
+         * ir_extract_compound_key to resolve both shapes uniformly,
+         * mirroring the FIELD_WRITE move-transfer path (line 3119+) and
+         * the IR_CALL extern_free path. */
         for (int i = 0; i < sp->spawn_stmt.arg_count; i++) {
             Node *arg = sp->spawn_stmt.args[i];
-            if (!arg || arg->kind != NODE_IDENT) continue;
-            int arg_local = ir_find_local_exact_first(func,
-                arg->ident.name, (uint32_t)arg->ident.name_len);
-            if (arg_local < 0) continue;
-            IRHandleInfo *h = ir_find_handle(ps, arg_local);
-            if (!h && arg_local < func->local_count) {
-                Type *lt = (Type *)func->locals[arg_local].type;
-                if (ir_should_track_move(lt)) {
-                    /* Auto-register as ALIVE so we can mark TRANSFERRED. */
-                    h = ir_add_handle(ps, arg_local);
+            if (!arg) continue;
+            int root_local;
+            const char *path;
+            uint32_t path_len;
+            if (ir_extract_compound_key(zc, func, arg,
+                                         &root_local, &path, &path_len) != 0)
+                continue;
+            IRHandleInfo *h = (path_len == 0)
+                ? ir_find_handle(ps, root_local)
+                : ir_find_compound_handle(ps, root_local, path, path_len);
+            if (!h && root_local < func->local_count) {
+                /* Auto-register move-struct args (bare or compound) so
+                 * TRANSFERRED can be observed. For compound paths, walk
+                 * the root local type and verify the targeted field is
+                 * itself a move struct — auto-registering arbitrary
+                 * compounds would over-warn. */
+                Type *lt = (Type *)func->locals[root_local].type;
+                bool track = false;
+                if (path_len == 0) {
+                    track = ir_should_track_move(lt);
+                } else {
+                    /* Best-effort: track if either the root or any of the
+                     * path's effective field types is a move struct. The
+                     * compound-key string starts with '.' for fields. */
+                    track = ir_should_track_move(lt);
+                    if (!track) {
+                        /* Walk the path one field at a time. */
+                        Type *cur = lt;
+                        uint32_t pi2 = 0;
+                        while (cur && pi2 < path_len) {
+                            if (path[pi2] != '.') break;
+                            pi2++;
+                            /* Read field name until next '.' or end */
+                            uint32_t fs = pi2;
+                            while (pi2 < path_len && path[pi2] != '.') pi2++;
+                            Type *cur_eff = type_unwrap_distinct(cur);
+                            if (!cur_eff || cur_eff->kind != TYPE_STRUCT) break;
+                            Type *next = NULL;
+                            for (uint32_t fi = 0;
+                                 fi < cur_eff->struct_type.field_count; fi++) {
+                                SField *sf = &cur_eff->struct_type.fields[fi];
+                                if (sf->name_len == (pi2 - fs) &&
+                                    memcmp(sf->name, path + fs, pi2 - fs) == 0) {
+                                    next = sf->type;
+                                    break;
+                                }
+                            }
+                            if (!next) break;
+                            cur = next;
+                        }
+                        if (cur && ir_should_track_move(cur)) track = true;
+                    }
+                }
+                if (track) {
+                    if (path_len == 0)
+                        h = ir_add_handle(ps, root_local);
+                    else
+                        h = ir_add_compound_handle(ps, root_local, path, path_len);
                     if (h) {
                         h->state = IR_HS_ALIVE;
                         h->alloc_line = inst->source_line;
-                        h->alloc_id = arg_local;
+                        if (h->alloc_id == 0) h->alloc_id = _ir_next_alloc_id++;
                     }
                 }
             }
@@ -2958,32 +3052,79 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
-        /* For each param the summary affects, resolve arg local, apply state */
+        /* For each param the summary affects, resolve arg local, apply state.
+         *
+         * AUDIT 2026-06-06 (GAP-A): the passthrough path used to filter
+         * on `inst->args[pi]->kind == NODE_IDENT`, so compound arguments
+         * like `c.h` (NODE_FIELD) or `arr[i]` (NODE_INDEX) were silently
+         * skipped. Cross-function double-free of a struct-field handle
+         * compiled cleanly. Mirror the compound-key resolution that the
+         * extern_free path already uses (see lines 2902-2942). */
         for (int pi = 0; pi < summary->param_count; pi++) {
             if (!summary->frees_param[pi] && !summary->maybe_frees_param[pi])
                 continue;
 
             int arg_local = -1;
-            /* Decomposed path */
+            const char *compound_path = NULL;
+            uint32_t compound_path_len = 0;
+            /* Decomposed path — call_arg_locals already pre-resolved to a
+             * bare local (often an IR-synthesized temp produced by
+             * FIELD_READ / INDEX_READ when the caller wrote a compound
+             * expression like `f(c.h)`). */
             if (inst->call_arg_locals && pi < inst->call_arg_local_count) {
                 arg_local = inst->call_arg_locals[pi];
             }
-            /* Passthrough path */
-            if (arg_local < 0 && inst->args && pi < inst->arg_count &&
-                inst->args[pi] && inst->args[pi]->kind == NODE_IDENT) {
-                arg_local = ir_find_local_exact_first(func,
-                    inst->args[pi]->ident.name,
-                    (uint32_t)inst->args[pi]->ident.name_len);
+            /* AUDIT 2026-06-06 (GAP-A): even when the decomposed path
+             * found a temp, the original AST may carry a compound
+             * expression — `inst->call_arg_locals[pi]` is the post-FIELD_READ
+             * temp, which has no tracked handle. Re-resolve against
+             * `inst->args[pi]` so compound shapes flow through the same
+             * code path as bare locals. Mirror the extern_free path
+             * (lines 2902-2942) which already uses ir_extract_compound_key. */
+            if (inst->args && pi < inst->arg_count && inst->args[pi]) {
+                int root_local;
+                const char *path;
+                uint32_t path_len;
+                if (ir_extract_compound_key(zc, func, inst->args[pi],
+                                             &root_local, &path,
+                                             &path_len) == 0) {
+                    /* Prefer the compound path if it finds a real handle. */
+                    IRHandleInfo *probe = (path_len == 0)
+                        ? ir_find_handle(ps, root_local)
+                        : ir_find_compound_handle(ps, root_local, path, path_len);
+                    if (probe) {
+                        arg_local = root_local;
+                        compound_path = path;
+                        compound_path_len = path_len;
+                    } else if (arg_local < 0) {
+                        /* No decomposed local either — fall back to compound
+                         * resolution so auto-registration of param args still
+                         * fires below. */
+                        arg_local = root_local;
+                        compound_path = path;
+                        compound_path_len = path_len;
+                    }
+                }
             }
             if (arg_local < 0) continue;
 
-            IRHandleInfo *h = ir_find_handle(ps, arg_local);
+            IRHandleInfo *h;
+            if (compound_path_len > 0) {
+                h = ir_find_compound_handle(ps, arg_local,
+                                            compound_path, compound_path_len);
+            } else {
+                h = ir_find_handle(ps, arg_local);
+            }
             /* Phase E: Auto-register when caller's own arg is a param and
              * the callee frees it. Enables FuncSummary chain propagation:
              * step_c frees its param → step_b calls step_c(r) → step_b's
              * r (also a param) gets marked FREED → step_b's summary
-             * frees_param[0]=true. Mark escaped to avoid leak flag. */
-            if (!h && arg_local < func->local_count &&
+             * frees_param[0]=true. Mark escaped to avoid leak flag.
+             *
+             * Auto-registration only applies to bare-local param args; a
+             * compound (`*p.field`) is too speculative to forge state for. */
+            if (!h && compound_path_len == 0 &&
+                arg_local < func->local_count &&
                 func->locals[arg_local].is_param) {
                 h = ir_add_handle(ps, arg_local);
                 if (h) {
@@ -3031,17 +3172,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 "thread creation with interrupts disabled is unsafe.");
         }
 
-        /* Arguments passed to spawn transfer ownership */
+        /* Arguments passed to spawn transfer ownership.
+         *
+         * AUDIT 2026-06-06 (GAP-C): pre-fix only matched NODE_IDENT, so
+         * `spawn worker(b.t)` (NODE_FIELD) and `spawn worker(arr[i])`
+         * (NODE_INDEX) silently skipped the TRANSFERRED transition,
+         * producing silent use-after-move. Use ir_extract_compound_key
+         * to resolve both bare-local and compound shapes. */
         for (int i = 0; i < inst->arg_count; i++) {
-            if (inst->args && inst->args[i] && inst->args[i]->kind == NODE_IDENT) {
-                int arg_local = ir_find_local_exact_first(func,
-                    inst->args[i]->ident.name,
-                    (uint32_t)inst->args[i]->ident.name_len);
-                if (arg_local >= 0) {
-                    IRHandleInfo *h = ir_find_handle(ps, arg_local);
-                    if (h) h->state = IR_HS_TRANSFERRED;
-                }
-            }
+            if (!inst->args || !inst->args[i]) continue;
+            int root_local;
+            const char *path;
+            uint32_t path_len;
+            if (ir_extract_compound_key(zc, func, inst->args[i],
+                                         &root_local, &path, &path_len) != 0)
+                continue;
+            IRHandleInfo *h = (path_len == 0)
+                ? ir_find_handle(ps, root_local)
+                : ir_find_compound_handle(ps, root_local, path, path_len);
+            if (h) h->state = IR_HS_TRANSFERRED;
         }
 
         /* Phase D3: scoped spawn produces a ThreadHandle. Register it so

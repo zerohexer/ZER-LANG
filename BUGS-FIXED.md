@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-08 — asm-safety oracle (durable surface) + S2 \n-bypass finding
+
+Built `tests/test_asm_matrix.c` — guards the DURABLE asm safety surface (the
+rules that survive the planned Level C cleanup per docs/asm_lang_zer_safe.md):
+S1 naked-only, S2 max-16, S3 no-label, S4 safety>=30, empty-insn, Z8 const-output
+(qualifier preservation), Z11 non-keep-pointer-param + memory clobber. 11 cells,
+EMIT-ONLY. Does NOT test the per-arch register/instruction tables (F4-F7) — Level
+C deletes those (delegate to GCC), so guarding them would be guarding doomed code.
+Doubles as the REGRESSION NET for the ~7000-line Level C deletion.
+
+Cross-domain note: the keep axis extends through asm operands — Z11 rejects a
+non-keep `*u32` param fed to an asm input with `memory` clobber, and the `keep`
+valve compiles it (POS cell). Same keep model as the pointer axes.
+
+**Finding (minor, audit-rule — NOT a safety hole):** the S2 instruction cap
+counts actual-newline (0x0A) and `;`, but ZER keeps `\n` ESCAPE sequences literal
+while GCC later expands them — so `instructions: "nop\nnop...×17"` passes S2
+(counted 1) yet assembles 17 real instructions. S2 is an audit/maintainability
+rule, not memory-safety, so no soundness impact. Logged in limitations.md; oracle
+uses `;` separators to test S2 as designed.
+
+**Result: 11/11, 0 false negatives, 0 over-rejections.** Eighth oracle in the
+suite. Full suite green.
+
+---
+
 ## Session 2026-06-07 (cont.) — async oracle (Domain 3, 0 holes) — FRONTIER COMPLETE
 
 Built `tests/test_async_matrix.c` — frontier Domain 3 (final). 10 cells,

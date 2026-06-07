@@ -10194,3 +10194,30 @@ expressions, revisit its reachability.
 **Result: 10/10, 0 holes** — regression lock-in. With this, all three frontier
 domains (concurrency, ISR/atomics/MMIO, async) have oracles. `async void f() {
 yield; }` / `await COND;` is the syntax. Wired into `make check`.
+
+---
+
+## Asm-Safety Oracle — `tests/test_asm_matrix.c` (2026-06-08)
+
+The eighth oracle. Guards the DURABLE asm safety surface — the rules that survive
+the planned Level C cleanup (docs/asm_lang_zer_safe.md): S1 (asm only in naked),
+S2 (max 16 instructions), S3 (no labels), S4 (safety string >= 30 chars),
+empty-instruction reject, Z8 (asm output bound to a const variable — qualifier
+preservation), Z11 (non-keep pointer param input + memory clobber). POS: asm in
+naked, output to a non-const global, keep-ptr + memory clobber (the Z11 valve),
+input binding. **Does NOT test the per-arch register/instruction validation
+tables (F4-F7)** — Level C deletes those and delegates to GCC, so guarding them
+would guard doomed code. This oracle is the REGRESSION NET for the ~7000-line
+Level C deletion: if cleanup drops a durable check, a NEG cell flips.
+
+Structured asm syntax: `naked void f() { asm { instructions: "..." clobbers:
+["memory"] inputs: { "rdi" = expr } outputs: { "rax" = lvalue } safety: "...>=30
+chars..." } }`. EMIT-ONLY harness (naked codegen isn't the point — the zercheck
+verdict is). The keep axis extends through asm operands: Z11 rejects non-keep
+`*u32` param + memory clobber, the `keep` valve compiles it.
+
+**Result: 11/11, 0 holes.** Found one minor audit-rule finding (NOT a safety
+hole): S2 counts 0x0A/`;` but `\n` escapes stay literal in ZER while GCC expands
+them, so `\n`-separated instructions bypass the count. S2 is an audit rule, not
+memory-safety — logged in limitations.md "asm S2 ... \n-escape bypass". Wired
+into `make check`.

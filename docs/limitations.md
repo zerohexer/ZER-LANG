@@ -5,6 +5,28 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — asm S2 instruction-count `\n`-escape bypass (audit rule, not safety)
+
+The S2 rule (checker.c:10379) caps an asm block at 16 instructions for
+auditability, counting actual-newline (0x0A) and `;` chars in the instruction
+string. ZER's lexer keeps `\n` ESCAPE sequences literal (does not convert to
+0x0A), but the emitted C asm string IS expanded by GCC — so
+`instructions: "nop\nnop...×17"` passes S2 (counted as 1) yet assembles as 17
+real instructions. The S2 "≤16 auditable" guarantee is therefore bypassable via
+`\n` escapes.
+
+**Severity: low — S2 is an AUDIT/maintainability rule, not a memory-safety /
+program-consequence rule** (its own message: "forces small auditable blocks").
+No safety/soundness false negative; the Z-rules, naked-only, qualifier/escape
+checks are unaffected. Found by `tests/test_asm_matrix.c` (2026-06-08).
+
+Fix sketch (when convenient): make the S2 counter also count `\n` (and `\t`)
+escape pairs in the instruction string, OR normalize asm-string escapes at lex
+time so the count matches what GCC assembles. The oracle's `too-many-instructions`
+cell uses `;` separators to test S2 as designed in the meantime.
+
+---
+
 ## STATUS — soundness oracle suite (read first, 2026-06-07)
 
 Four exhaustive `-Wswitch`-enforced oracles guard the compiler's safety analysis.
@@ -21,6 +43,7 @@ acceptable but logged). Each is built + run by `make check`.
 | Concurrency | `tests/test_conc_matrix.c` | 15 | data-race / spawn / deadlock / ThreadHandle join | green |
 | ISR/atomics/MMIO | `tests/test_hw_matrix.c` | 12 | MMIO range/align/decl, volatile-strip, ISR context + data-race (program-consequence only) | green |
 | Async | `tests/test_async_matrix.c` | 10 | yield/await in defer/@critical, spawn-in-async, valid yield/await/defer/state-promotion | green |
+| Asm | `tests/test_asm_matrix.c` | 11 | DURABLE asm surface: S1 naked-only, S2/S3/S4, empty-insn, Z8 const-output, Z11 non-keep-ptr+mem-clobber (NOT F4-F7 register tables) | green |
 
 **Pointer-lifetime axis ("universal pointer") is DONE** (2026-06-07): the
 compile-time `keep` model (PART 5 of `docs/universal_pointer.md`) — all 5 steps

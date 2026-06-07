@@ -126,11 +126,19 @@ test_hw_matrix: tests/test_hw_matrix.c
 test_async_matrix: tests/test_async_matrix.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+# asm-safety soundness guard — DURABLE surface that survives the planned Level C
+# cleanup (S-rules naked-only/max-16/no-label/safety>=30, empty-insn, Z8
+# const-output, Z11 non-keep-ptr+mem-clobber). Regression net for the ~7000-line
+# Level C deletion. EMIT-ONLY harness. Does NOT test F4-F7 register tables
+# (Level C deletes them, delegating to GCC).
+test_asm_matrix: tests/test_asm_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_hw_matrix test_async_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_hw_matrix test_async_matrix test_asm_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -152,6 +160,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_conc_matrix
 	./test_hw_matrix
 	./test_async_matrix
+	./test_asm_matrix
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh

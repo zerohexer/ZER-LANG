@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-703: move-field by-value over-rejection
+
+### BUG-703 (over-rejection) — `consume(w.inner)` falsely rejected as use-after-move
+
+**Symptom:** passing a move-struct field BY VALUE to a function was wrongly
+rejected on the transfer line itself:
+```zer
+move struct M { u32 fd; }
+struct Wrap { M inner; }
+void consume(M mm) { }
+i32 main() {
+    Wrap w; w.inner.fd = 1;
+    consume(w.inner);   // FALSELY rejected as use-after-move at line 7
+    return 0;
+}
+```
+The same pattern via `spawn mworker(w.inner)` was accepted — an implementation
+inconsistency, not principled conservatism. Found by `tests/test_shape_matrix.c`
+(move-struct/field/pos cell); confirmed pre-existing on HEAD~2.
+
+**Root cause:** `consume(w.inner)` lowers to `tmp = w.inner` (IR_FIELD_READ,
+which runs the Gap A3 move-transfer on the compound) + `IR_CALL consume(tmp)`.
+By the time IR_CALL runs, the compound is already TRANSFERRED, so BOTH the
+generic UAF walker (`ir_check_ident_uaf`) AND the move loop re-report it as
+use-after-move ON THE TRANSFER LINE. Spawn dodged it — spawn args aren't
+decomposed into FIELD_READ temps.
+
+**First attempt (reverted) — the lesson:** guarding the FIELD_READ transfer on
+`!is_temp` REGRESSED `move_field_read_uam` (`Tok first = b.inner; use(&b.inner)`)
+into a false NEGATIVE — var-decls also materialize through temps, so the guard
+dropped a real use-after-move. A false negative is a safety hole, strictly worse
+than the over-rejection it fixed. Reverted per the Anti-Circular Rule.
+
+**Fix:** at the top of the `IR_CALL` handler (zercheck_ir.c, before both the
+generic UAF walker and the move loop), undo the same-line materialization: for a
+move-typed COMPOUND arg whose transfer happened on THIS call's own line
+(`free_line == inst->source_line`), reset it to ALIVE. The move loop then
+re-transfers the bare root as the single authority. Why it's sound (no false
+negative): the bare-root transfer + the un-skipped bare checks (move-loop bare
+report, FIELD_READ prefix-walk use-check) catch every genuine later use of the
+compound — even same-line, even `&b.x` — via the transferred bare root. The reset
+only suppresses the redundant re-report of the compound's own materialization.
+Per-compound (not per-root), and only `free_line == this line`, so genuine prior
+transfers are untouched and still reported.
+
+**Tests:**
+- `tests/zer/move_field_consume_ok.zer` — by-value move-field call compiles
+- `tests/zer_fail/move_field_consume_uam.zer` — use-after still rejected
+- `tests/zer_fail/move_field_read_uam.zer` — still rejected (no regression)
+- `tests/test_shape_matrix.c` move-struct/field/pos — flipped from KNOWN-GAP
+  tripwire to a normal passing positive
+
+Full suite green (ALL TESTS PASSED); matrix 44/44.
+
+---
+
 ## Session 2026-06-07 — Shape-matrix oracle finds compound-key leak gap
 
 ### BUG-702 (HIGH) — handle stored in struct field / array element never leak-checked

@@ -121,8 +121,11 @@ static const char *viol_name(Violation v) {
  * report sites; deferred. Only the POSITIVE (safe) cell is affected — the
  * use-after-move IS still caught (neg passes). */
 static int cell_known_gap(TypeK t, ShapeKind s, Violation v, int neg) {
-    if (t == TY_MOVE && s == SH_FIELD && v == V_USE_AFTER_MOVE && neg == 0)
-        return 1;  /* BUG-703: over-rejection of consume(w.inner) */
+    (void)t; (void)s; (void)v; (void)neg;
+    /* No known gaps currently. BUG-703 (move-field by-value over-rejection)
+     * was FIXED 2026-06-07 — its move/field/pos cell now runs as a normal
+     * positive (must compile). Re-add an entry here only to park a NEW
+     * confirmed-open gap as a tripwire (see git history for the pattern). */
     return 0;
 }
 

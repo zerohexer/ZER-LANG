@@ -5,53 +5,6 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — BUG-703: move-struct field passed by value falsely rejected (over-rejection)
-
-**Symptom:** passing a move-struct field BY VALUE to a function is wrongly
-rejected as use-after-move on the transfer line itself:
-```zer
-move struct M { u32 fd; }
-struct Wrap { M inner; }
-void consume(M mm) { }
-i32 main() {
-    Wrap w;
-    w.inner.fd = 1;
-    consume(w.inner);   // FALSELY rejected: "use after move ... at line 7"
-    return 0;
-}
-```
-The same pattern via `spawn mworker(w.inner)` is ACCEPTED — so this is an
-implementation inconsistency, not principled conservatism. It's an
-over-rejection (rejects valid code), not a safety hole: the real use-after-move
-IS still caught.
-
-**Found by:** `tests/test_shape_matrix.c` move-struct/field/pos cell
-(2026-06-07). Confirmed pre-existing on HEAD~2 (not introduced by the matrix
-work).
-
-**Root cause:** `consume(w.inner)` lowers to `tmp = w.inner` (IR_FIELD_READ
-into a temp) + `IR_CALL consume(tmp)`. The FIELD_READ runs the Gap A3
-move-transfer (transfers compound `w.inner`), then the IR_CALL move loop reads
-the original arg `w.inner` and re-reports it as use-after-move on the SAME line.
-Spawn dodges it — spawn args aren't decomposed into FIELD_READ temps.
-
-**Why the obvious fix is wrong:** guarding the FIELD_READ transfer on
-`!is_temp` REGRESSES `move_field_read_uam` — var-decls (`Tok t = b.inner`) also
-materialize through temps, so the guard turns a real use-after-move into a false
-NEGATIVE (a safety hole, strictly worse than the over-rejection). Reverted
-2026-06-07 per the Anti-Circular Rule.
-
-**Fix sketch:** same-line discriminator applied across all 5 move report sites
-in `zercheck_ir.c` — skip the use-after-move report when
-`free_line == inst->source_line` (the transfer IS the arg's own materialization,
-not a prior move). Risk: a same-line legitimate double-consume edge; verify
-against the full move test set.
-
-**Tripwire:** `tests/test_shape_matrix.c` `cell_known_gap()` asserts this cell
-is CURRENTLY (wrongly) rejected. When fixed, the assertion flips, the grid
-fails loudly, and the `cell_known_gap` entry must be removed — the gap can be
-neither silently forgotten nor silently fixed.
-
 ## OPEN — shape-matrix coverage gaps: `*opaque` row + cross-module-compound
 
 Two axes the `tests/test_shape_matrix.c` oracle does NOT yet cover. Not bugs —

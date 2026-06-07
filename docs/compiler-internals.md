@@ -9925,11 +9925,14 @@ update the coverage list above and remove its limitations.md entry.
 binary like `test_semantic_fuzz`). Exit non-zero with a printed coverage
 matrix + the offending program when any cell GAPs.
 
-### Known open gap surfaced by the extended matrix — BUG-703
+### Second bug surfaced by the extended matrix — BUG-703 (FIXED 2026-06-07)
 
 The move-struct sub-matrix surfaced a second pre-existing bug (the leak gap
 above was the first): move-struct field passed BY VALUE to a function
-(`consume(w.inner)`) is falsely rejected as use-after-move. Full reproducer,
-root cause, the reverted-naive-fix lesson, and the fix sketch live in
-`docs/limitations.md` (OPEN — BUG-703). Tracked in `test_shape_matrix.c` as a
-KNOWN-GAP tripwire so it can't be silently forgotten or silently fixed.
+(`consume(w.inner)`) was falsely rejected as use-after-move on the transfer
+line. FIXED — `zercheck_ir.c` IR_CALL now undoes the same-line move-compound
+materialization before its use-checks (reset to ALIVE; the move loop re-transfers
+the bare root as the single authority). The first attempt (`!is_temp` guard on
+the FIELD_READ transfer) regressed `move_field_read_uam` into a false negative
+and was reverted — see BUGS-FIXED.md for that lesson. The matrix tripwire that
+parked it is removed; move/field/pos now runs as a normal positive.

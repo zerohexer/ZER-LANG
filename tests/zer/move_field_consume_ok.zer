@@ -1,0 +1,14 @@
+// BUG-703 regression (FIXED 2026-06-07): passing a move-struct field BY VALUE
+// to a function is a valid ownership transfer — must compile + run. Previously
+// falsely rejected as use-after-move on the transfer line (the call-arg
+// materialization FIELD_READ transferred the compound, then IR_CALL re-reported
+// it same-line).
+move struct M { u32 fd; }
+struct Wrap { M inner; }
+void consume(M mm) { }
+i32 main() {
+    Wrap w;
+    w.inner.fd = 1;
+    consume(w.inner);
+    return 0;
+}

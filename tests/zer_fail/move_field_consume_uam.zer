@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Using a move-struct field after consuming it by value — real use-after-move.
+// Must STILL be caught after the BUG-703 fix (caught via the transferred bare
+// root in the later use's FIELD_READ prefix walk).
+move struct M { u32 fd; }
+struct Wrap { M inner; }
+void consume(M mm) { }
+i32 main() {
+    Wrap w;
+    w.inner.fd = 1;
+    consume(w.inner);
+    u32 k = w.inner.fd;
+    return (i32)k;
+}

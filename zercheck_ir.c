@@ -2580,6 +2580,44 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      *   - passthrough: inst->args[i] is an AST ident → find_local
      */
     case IR_CALL: {
+        /* BUG-703: undo same-line move-compound materialization BEFORE any
+         * use-check. `consume(w.inner)` lowers to `tmp = w.inner` (IR_FIELD_READ,
+         * which runs the Gap A3 move-transfer on the compound) + this IR_CALL.
+         * So by the time we get here the compound is already TRANSFERRED — and
+         * both the generic UAF walker (below) and the move loop (further down)
+         * would re-report it as use-after-move ON THE TRANSFER LINE. That's a
+         * false over-rejection of a valid by-value move-field call.
+         *
+         * Fix: for a move-typed COMPOUND arg whose transfer happened on THIS
+         * call's own line (free_line == source_line), reset it to ALIVE. The
+         * move loop below then re-transfers the bare root as the single
+         * authority. Genuine PRIOR transfers (free_line < source_line) are NOT
+         * reset and still reported. A later use of the compound is still caught
+         * via the bare-root prefix in the FIELD_READ use-check. Per-compound
+         * (not per-root) so a sibling compound transferred earlier is unaffected.
+         * Residual edge (documented in limitations.md): two move-consumes of the
+         * SAME compound on ONE physical line can't be distinguished. */
+        if (inst->expr && inst->expr->kind == NODE_CALL) {
+            Node *bcall = inst->expr;
+            for (int bpi = 0; bpi < bcall->call.arg_count; bpi++) {
+                Node *barg = bcall->call.args[bpi];
+                if (!barg) continue;
+                if (barg->kind == NODE_UNARY && barg->unary.op == TOK_AMP)
+                    barg = barg->unary.operand;
+                if (barg->kind != NODE_FIELD && barg->kind != NODE_INDEX) continue;
+                Type *bt = checker_get_type(zc->checker, barg);
+                if (!bt || !ir_should_track_move(bt)) continue;
+                int broot; const char *bpath; uint32_t bplen;
+                if (ir_extract_compound_key(zc, func, barg,
+                                            &broot, &bpath, &bplen) != 0) continue;
+                if (bplen == 0) continue;
+                IRHandleInfo *bch = ir_find_compound_handle(ps, broot, bpath, bplen);
+                if (bch && bch->state == IR_HS_TRANSFERRED &&
+                    bch->free_line == inst->source_line) {
+                    bch->state = IR_HS_ALIVE;  /* undo same-line materialization */
+                }
+            }
+        }
         /* Phase E: generic UAF walker on the call args. Catches
          * use_ptr(freed_ident) / func(&freed.field) etc. */
         if (inst->expr) {

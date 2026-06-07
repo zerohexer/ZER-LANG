@@ -10006,3 +10006,50 @@ After the fixes: escape matrix **35/35, 0 false negatives**. Wired into
 contract (the SPARK Definition-B trap CLAUDE.md forbids). This is why the
 compile-time-only `keep` model (no runtime tag check) is sound. Full design +
 decision in `docs/universal_pointer.md` PART 5.
+
+---
+
+## Keep-Axis Oracle — `tests/test_keep_matrix.c` (2026-06-07)
+
+The third soundness oracle (after shape + escape). Where the escape matrix covers
+LOCAL-pointer escapes, this covers the KEEP axis: a NON-keep pointer parameter
+persisted into a long-lived sink violates the non-keep contract ("non-keep =
+won't be stored persistently") and must be rejected — fix is `keep p`,
+verified at the call site.
+
+**TWO cell kinds** (the keep axis has an escape valve, so positives matter):
+- NEGATIVE: a non-keep param persisted (direct / alias / @ptrcast / call-result)
+  → MUST reject for the keep reason (integrity guard: error must contain "keep").
+- POSITIVE: the `keep` valve — a `keep` param persisted → MUST compile. A
+  rejection here = over-rejection of legit keep code.
+
+Grid (`-Wswitch`-enforced): `KSink` {global, param.field, nested.field} ×
+`KLaunder` {direct, alias, @ptrcast, call-result} × `KKind` {neg, pos}.
+`cell_valid` admits all NEG cells + POS cells except call-result (identity-call
+strips keep — no valve there). 21 cells.
+
+**Found 6 false negatives on first run** (BUG-721..726): alias × 3 sinks,
+call-result × 3 sinks. keep-2a (BUG-720) had closed only the direct +
+value-side-@ptrcast cases.
+
+**The fix — `is_nonkeep_derived` taint flag (the keep-axis analog of
+`is_local_derived`):**
+- Set on non-keep `*T`/`*opaque` params at registration (checker.c ~12318).
+- Propagated through aliases by `propagate_escape_flags` (so `*T q = p` taints q).
+- Cleared on whole-var reassignment (alongside is_local_derived etc.).
+- The non-keep persist check (BUG-440/720 block) keys on `is_nonkeep_derived`
+  (covers param AND aliases) routed through `classify_escape_sink`. Direct param
+  keeps the precise "add 'keep' to parameter X" message; aliases get a generic
+  keep message.
+- Call-result: `call_has_nonkeep_derived_arg` (parallel to
+  `call_has_local_derived_arg`) + a sink block walking the value to a NODE_CALL,
+  **gated on the value being a pointer/slice** (BUG-360/383 gate) so int-returning
+  calls aren't over-rejected. Conservative proxy — rejects even if the callee
+  doesn't return the arg (over-rejection acceptable, under not).
+
+**Keep valve preserved:** `keep` params are NOT flagged `is_nonkeep_derived`, so
+`idfn(keep_p)` and `q = keep_p; sink = q;` still compile. After the fix:
+keep-matrix **21/21, 0 false negatives, 0 over-rejections**. Wired into
+`make check`. **When adding a new keep boundary (funcptr / cinclude / generic
+container), add the negative cell FIRST, then make the boundary default
+reject-on-uncertainty** — the matrix is the standing guard.

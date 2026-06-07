@@ -897,6 +897,33 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
     return false;
 }
 
+/* keep axis (2026-06-07): does this call have a non-keep-derived pointer arg?
+ * `idfn(p)` where p is a non-keep param (or a local aliasing one) yields a
+ * result that may trace back to the non-keep param — persisting it violates the
+ * non-keep contract. Conservative proxy (same philosophy as
+ * call_has_local_derived_arg): rejects even if the callee doesn't actually
+ * return the arg. Over-rejection acceptable (restructure / add `keep`),
+ * under-rejection is a safety hole. The keep VALVE is unaffected: a `keep` arg
+ * is NOT is_nonkeep_derived, so `idfn(keep_p)` does not fire. */
+static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
+    if (!call || call->kind != NODE_CALL || depth > 8) return false;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        Node *arg = call->call.args[i];
+        /* unwrap value-side intrinsic launders (@ptrcast(*T, p)) */
+        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
+            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        if (arg && arg->kind == NODE_IDENT) {
+            Symbol *src = scope_lookup(c->current_scope,
+                arg->ident.name, (uint32_t)arg->ident.name_len);
+            if (src && src->is_nonkeep_derived) return true;
+        }
+        if (arg && arg->kind == NODE_CALL) {
+            if (call_has_nonkeep_derived_arg(c, arg, depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
 /* ---- Unified escape flag helpers (prevents BUG-421 class) ---- */
 
 /* Can this type carry a pointer? Only propagate escape flags to types that
@@ -919,6 +946,7 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_local_derived) dst->is_local_derived = true;
     if (src->is_arena_derived) dst->is_arena_derived = true;
     if (src->is_from_arena) dst->is_from_arena = true;
+    if (src->is_nonkeep_derived) dst->is_nonkeep_derived = true;
 }
 
 /* Recursively scan an expression for any identifier that refers to a
@@ -3334,6 +3362,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_local_derived = false;
                         tsym->is_arena_derived = false;
                         tsym->is_from_arena = false;  /* BUG-597: must clear on reassign */
+                        tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
                         tsym->provenance_type = NULL;
                         tsym->container_struct = NULL;
                         tsym->container_field = NULL;
@@ -3523,23 +3552,23 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);
                 Type *vt = val_sym ? type_unwrap_distinct(val_sym->type) : NULL;
-                /* A non-keep pointer parameter stored in global violates the
-                 * non-keep contract. Detect parameters: func_node is NULL
-                 * (local var-decls and globals always set func_node). */
-                bool val_is_global = val_sym && scope_lookup_local(c->global_scope,
-                    val_sym->name, val_sym->name_len) != NULL;
-                bool is_ptr_param = val_sym && !val_sym->is_keep &&
-                    !val_sym->is_static && !val_is_global &&
-                    val_sym->func_node == NULL && /* parameters have no func_node */
+                /* A non-keep pointer parameter stored in a persistent sink violates
+                 * the non-keep contract. Both the param itself AND any local that
+                 * aliases it carry is_nonkeep_derived (set at registration,
+                 * propagated by propagate_escape_flags) — keep-axis matrix holes
+                 * (alias / call-result launder). func_node==NULL identifies the
+                 * direct param for the precise "add 'keep' to parameter X" message. */
+                bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
                     vt && (vt->kind == TYPE_POINTER || vt->kind == TYPE_OPAQUE);
-                if (is_ptr_param) {
-                    /* keep-universalization 2a: a non-keep pointer param persisted
-                     * into a global OR a pointer-param field/nested sink violates
-                     * the non-keep contract. Extends BUG-440 (global-only) to
-                     * param-field sinks via classify_escape_sink. Fix is `keep p`. */
+                if (is_nonkeep_value) {
+                    /* keep-universalization 2a: a non-keep pointer param (or alias)
+                     * persisted into a global OR a pointer-param field/nested sink
+                     * violates the non-keep contract. Extends BUG-440 (global-only)
+                     * to param-field sinks via classify_escape_sink. Fix is `keep`. */
                     Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                     classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
-                    if (tgt_global || tgt_param) {
+                    bool is_direct_param = val_sym->func_node == NULL; /* params have no func_node */
+                    if ((tgt_global || tgt_param) && is_direct_param) {
                         checker_error(c, node->loc.line,
                             tgt_param ?
                             "cannot store non-keep pointer parameter '%.*s' through pointer "
@@ -3549,7 +3578,38 @@ static Type *check_expr(Checker *c, Node *node) {
                             (int)val_sym->name_len, val_sym->name,
                             (int)target_sym->name_len, target_sym->name,
                             (int)val_sym->name_len, val_sym->name);
+                    } else if (tgt_global || tgt_param) {
+                        checker_error(c, node->loc.line,
+                            "cannot persist non-keep-derived pointer '%.*s' (aliases a "
+                            "non-keep parameter) — add 'keep' qualifier to the source parameter",
+                            (int)val_sym->name_len, val_sym->name);
                     }
+                }
+            }
+        }
+
+        /* keep axis (call-result launder): value is a (field/index of a) call with
+         * a non-keep-derived pointer argument, stored at a persistent sink.
+         * `gk = idfn(p)` / `h.hp = idfn(p)` where p is a non-keep param. Gated on
+         * the stored value being a pointer/slice (same as BUG-360/383) so
+         * int-returning calls aren't over-rejected. Conservative proxy — see
+         * call_has_nonkeep_derived_arg. */
+        if (node->assign.op == TOK_EQ &&
+            value && (type_dispatch_kind(value) == TYPE_POINTER ||
+                      type_dispatch_kind(value) == TYPE_SLICE)) {
+            Node *vroot = node->assign.value;
+            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                else vroot = vroot->index_expr.object;
+            }
+            if (vroot && vroot->kind == NODE_CALL &&
+                call_has_nonkeep_derived_arg(c, vroot, 0)) {
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot persist result of call with non-keep pointer argument — "
+                        "the result may trace to a non-keep parameter; add 'keep' to that parameter");
                 }
             }
         }
@@ -12311,6 +12371,15 @@ static void check_func_body(Checker *c, Node *node) {
                                      ptype, p->loc.line);
             if (sym) {
                 sym->is_keep = p->is_keep;
+                /* keep axis: a non-keep pointer param is the ROOT of the
+                 * "must not be persisted" taint. Propagates to aliases via
+                 * propagate_escape_flags; checked at persist sinks (BUG-440/720
+                 * + keep-2a). keep params are exempt (the escape valve). */
+                if (!p->is_keep && ptype) {
+                    TypeKind pk = type_dispatch_kind(ptype);
+                    if (pk == TYPE_POINTER || pk == TYPE_OPAQUE)
+                        sym->is_nonkeep_derived = true;
+                }
             }
         }
 

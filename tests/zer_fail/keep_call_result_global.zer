@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// keep-axis oracle (BUG-724, 2026-06-07): a call result derived from a non-keep
+// pointer param, persisted into a global, must be rejected — the result may
+// trace back to the non-keep parameter. Gated on pointer/slice return so
+// int-returning calls aren't over-rejected. Fix: keep the source parameter.
+*u32 idfn(*u32 ip) { return ip; }
+?*u32 gk = null;
+void store(*u32 p) {
+    gk = idfn(p);
+}
+i32 main() { return 0; }

@@ -1,0 +1,16 @@
+// keep-axis valve (2026-06-07): a `keep` param aliased through a local can still
+// be persisted — keep params are NOT tainted is_nonkeep_derived, so the alias is
+// clean. Must compile + run + exit 0. Locks that propagation doesn't over-taint.
+struct Holder { ?*u32 hp; }
+u32 gv = 42;
+void store(*Holder h, keep *u32 p) {
+    *u32 q = p;
+    h.hp = q;
+}
+u32 main() {
+    Holder box;
+    store(&box, &gv);
+    *u32 got = box.hp orelse { return 1; };
+    if (got[0] != 42) { return 2; }
+    return 0;
+}

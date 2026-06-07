@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// keep-axis oracle (BUG-721, 2026-06-07): a non-keep pointer param aliased
+// through a local, then persisted into a pointer-param's field, must be rejected.
+// The non-keep-ness propagates to the alias via is_nonkeep_derived. Fix: keep p.
+struct Holder { ?*u32 hp; }
+void store(*Holder h, *u32 p) {
+    *u32 q = p;
+    h.hp = q;
+}
+i32 main() { return 0; }

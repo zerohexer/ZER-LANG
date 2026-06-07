@@ -5,35 +5,6 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — keep axis: laundered non-keep-param persistence (needs a keep oracle)
-
-keep-universalization 2a (BUG-720) closes the DIRECT hole: a non-keep pointer
-param stored straight into a global / param-field / nested sink is rejected
-(fix: `keep p`). But the keep axis has its own laundering surface — analogous to
-the escape axis — that is NOT yet covered. Each is a potential false negative
-(non-keep pointer persisted, contract violated, compiles clean):
-
-- **alias** — `*T q = p; h.field = q;` (q is a local var aliasing a non-keep
-  param; the BUG-440/720 check only flags the param ident directly, and q is not
-  flagged non-keep).
-- **@ptrcast / @cast launder of an aliased param** — value-side intrinsic
-  unwrap (BUG-440 block) handles `h.field = @ptrcast(*T, p)` directly, but not
-  `h.field = @ptrcast(*T, q)` where q aliases p.
-- **call-result of a non-keep param** — `h.field = identity(p)`.
-
-Root cause: the non-keep-param store check keys on the value being a non-keep
-PARAM IDENT; it doesn't propagate "non-keep-ness" through local aliases the way
-`is_local_derived` propagates for the escape axis.
-
-Fix path (the sound, methodology-matching way): build a **keep-axis oracle**
-like `tests/test_escape_matrix.c` — `{non-keep-param source} × {launder} ×
-{persistent sink}`, NEGATIVE cells (must reject) PLUS POSITIVE cells (the `keep`
-escape valve must compile, so over-rejection of legit keep code is caught).
-Enumerate, find every laundered hole, close them (propagate non-keep-ness
-through aliases; route all through `classify_escape_sink`), then fix any existing
-tests the stricter rule breaks. Until then these laundered cases are
-known-residual false negatives.
-
 ## OPEN — shape-matrix oracle: remaining coverage roadmap
 
 `tests/test_shape_matrix.c` is the exhaustive memory-safety oracle (option A,

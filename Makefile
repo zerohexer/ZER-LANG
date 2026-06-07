@@ -90,11 +90,18 @@ test_shape_matrix: tests/test_shape_matrix.c
 test_escape_matrix: tests/test_escape_matrix.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+# Exhaustive keep-axis soundness guard. NEG: a non-keep pointer param persisted
+# (direct/alias/@ptrcast/call-result) into a global/param/nested sink MUST be
+# rejected for the keep reason. POS: the `keep` valve must compile. -Wswitch
+# enforces the {sink x launder x kind} grid can't shrink.
+test_keep_matrix: tests/test_keep_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -111,6 +118,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_semantic_fuzz
 	./test_shape_matrix
 	./test_escape_matrix
+	./test_keep_matrix
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh

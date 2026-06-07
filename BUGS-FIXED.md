@@ -5,6 +5,51 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-721..726: keep-axis oracle (laundered non-keep persistence)
+
+Built `tests/test_keep_matrix.c` — the keep-axis soundness oracle, companion to
+the escape matrix. Grid: `{non-keep-param} × {launder: direct/alias/@ptrcast/
+call-result} × {sink: global/param-field/nested-field}`, with NEGATIVE cells
+(non-keep persist → must reject for the keep reason) AND POSITIVE cells (the
+`keep` valve → must compile). `-Wswitch`-enforced.
+
+**First run: 15/21, 6 false negatives** — laundered non-keep persistence that
+compiled clean (keep-2a/BUG-720 closed only the DIRECT and value-side-`@ptrcast`
+cases):
+
+- **BUG-721..723 (alias × global/param-field/nested):** `*u32 q = p; sink = q;`
+  where `p` is a non-keep param. The persist check keyed on the value being a
+  non-keep param IDENT directly; `q` (a local aliasing `p`) was not flagged.
+- **BUG-724..726 (call-result × global/param-field/nested):** `sink = idfn(p)`
+  where `idfn` returns its param and `p` is non-keep. No call-result provenance
+  for the keep axis existed.
+
+**Fix (checker.c):**
+1. **Alias** — new `is_nonkeep_derived` Symbol flag (types.h). Set at param
+   registration for non-keep `*T`/`*opaque` params; propagated through aliases by
+   `propagate_escape_flags` (exactly like `is_local_derived`); cleared on
+   whole-var reassignment. The BUG-440/720 persist check now keys on
+   `is_nonkeep_derived` (covering both the param and its aliases) instead of the
+   `func_node==NULL` direct-param test. The direct param keeps the precise
+   "add 'keep' to parameter X" message; aliases get a generic keep message.
+2. **Call-result** — new `call_has_nonkeep_derived_arg` helper (parallel to
+   `call_has_local_derived_arg`). A new sink block walks the assignment value to
+   a `NODE_CALL` and rejects if it has a non-keep-derived arg, **gated on the
+   stored value being a pointer/slice** (same gate as BUG-360/383) so
+   int-returning calls aren't over-rejected. Conservative proxy (rejects even if
+   the callee doesn't return the arg) — over-rejection acceptable, under not.
+
+**Keep valve preserved:** `keep` params are NOT flagged `is_nonkeep_derived`, so
+`idfn(keep_p)` / `q = keep_p; sink = q;` still compile. All 9 positive cells stay
+green.
+
+**Result: keep-matrix 21/21, 0 false negatives, 0 over-rejections.** The keep
+axis now has the same exhaustive no-false-negative guard as the escape axis.
+Wired into `make check`. Resolves the keep-axis laundering holes tracked in
+limitations.md (entry removed).
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-720: keep-universalization 2a (param-field sink)
 
 First increment of `keep`-universalization (docs/universal_pointer.md PART 5

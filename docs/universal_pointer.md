@@ -4758,12 +4758,17 @@ instead of checks surfaces as a new matrix HOLE.
    global / param-field / nested sink is rejected (was global-only); fix is
    `keep p`, call-site-verified. Blast radius measured = 1 test (adapted). The
    `keep` escape valve (keep param → field compiles) is verified.
-3. NEXT — **keep-axis oracle** (analogous to the escape matrix):
-   `{non-keep-param source} × {launder} × {persistent sink}`, with NEGATIVE
-   cells (must reject) AND POSITIVE cells (the `keep` valve must compile).
-   Closes the laundered non-keep-param holes tracked in limitations.md (alias,
-   @ptrcast-of-alias, call-result) by propagating non-keep-ness through aliases.
-4. Then `keep` on struct fields (field-level contract) / locals / cascade
+3. ✅ **keep-axis oracle** (`tests/test_keep_matrix.c`, 21 cells, analogous to
+   the escape matrix): `{non-keep-param} × {launder: direct/alias/@ptrcast/
+   call-result} × {sink: global/param/nested}`, NEGATIVE cells (must reject) AND
+   POSITIVE cells (the `keep` valve must compile). First run found 6 laundered
+   holes (BUG-721..726: alias×3, call-result×3); closed via a new
+   `is_nonkeep_derived` Symbol flag propagated through aliases (mirrors
+   `is_local_derived`) + a `call_has_nonkeep_derived_arg` proxy for call-results
+   (gated on pointer/slice return so int-returning calls aren't over-rejected).
+   keep-matrix **21/21, 0 false negatives, 0 over-rejections** — keep axis now
+   has the same exhaustive no-false-negative guard as the escape axis.
+4. NEXT — `keep` on struct fields (field-level contract) / locals / cascade
    (Section 13.1), against the keep oracle.
 5. For each boundary default (funcptr / cinclude / generic-container): add the
    negative cell FIRST (must reject), then the feature.

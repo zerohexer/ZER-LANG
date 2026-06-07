@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Escape-matrix H1 (2026-06-07): &local laundered through @ptrcast into a global
+// store must be rejected. Previously slipped — the global-store escape check only
+// matched a bare NODE_UNARY(&), not a value wrapped in @ptrcast.
+?*u8 gesc = null;
+void leak() {
+    u32 x = 5;
+    gesc = @ptrcast(*u8, &x);
+}
+i32 main() { return 0; }

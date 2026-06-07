@@ -722,6 +722,42 @@ static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len) {
     return NULL;
 }
 
+/* Escape-sink classification for an assignment target (2026-06-07, escape-matrix
+ * hardening). Walks the target chain (field/index/deref) to its root ident and
+ * reports whether the sink is a global/static (outlives the function) OR a
+ * dereferenced/field-of pointer (param or local pointer — may alias caller or
+ * global memory). Used by the &local, local-derived, and array->slice escape
+ * checks so EVERY laundering path (direct, alias, @ptrcast, array->slice) is
+ * rejected at BOTH global and param-field sinks. The direct-&local check already
+ * did both; the laundered checks previously only did global — that asymmetry was
+ * escape-matrix holes H1-H4 (test_escape_matrix.c, 2026-06-07). Conservative:
+ * any deref-of-pointer target counts as a potential escape (over-rejection of
+ * local-pointer-to-local is acceptable; under-rejection is a safety hole). */
+static void classify_escape_sink(Checker *c, Node *target,
+                                 Symbol **out_sym, bool *is_global, bool *is_param_ptr) {
+    *out_sym = NULL; *is_global = false; *is_param_ptr = false;
+    Node *root = target;
+    bool through_deref = false;
+    while (root) {
+        if (root->kind == NODE_FIELD) { root = root->field.object; through_deref = true; }
+        else if (root->kind == NODE_INDEX) { root = root->index_expr.object; through_deref = true; }
+        else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
+            root = root->unary.operand; through_deref = true;
+        } else break;
+    }
+    if (!root || root->kind != NODE_IDENT) return;
+    Symbol *ts = scope_lookup(c->current_scope,
+                              root->ident.name, (uint32_t)root->ident.name_len);
+    *out_sym = ts;
+    if (!ts) return;
+    bool g = ts->is_static ||
+             scope_lookup_local(c->global_scope, ts->name, ts->name_len) != NULL;
+    *is_global = g;
+    if (!g && through_deref && type_dispatch_kind(ts->type) == TYPE_POINTER) {
+        *is_param_ptr = true;
+    }
+}
+
 /* BUG-374: recursively check if a call expression has any local-derived pointer
  * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
  * which itself has &x. We recurse into nested calls (max depth 8 to prevent
@@ -3228,47 +3264,29 @@ static Type *check_expr(Checker *c, Node *node) {
                 "string literal is read-only — use 'const []u8' for string storage");
         }
 
-        /* scope escape: storing &local in static/global variable (or field thereof) */
-        if (node->assign.op == TOK_EQ &&
-            node->assign.value->kind == NODE_UNARY &&
-            node->assign.value->unary.op == TOK_AMP &&
-            node->assign.value->unary.operand->kind == NODE_IDENT) {
-            /* Walk target chain (field/index/deref) to find root identifier */
-            Node *root = node->assign.target;
-            while (root) {
-                if (root->kind == NODE_FIELD) root = root->field.object;
-                else if (root->kind == NODE_INDEX) root = root->index_expr.object;
-                else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-                    root = root->unary.operand;
-                else break;
-            }
-            if (root && root->kind == NODE_IDENT) {
-                Symbol *target_sym = scope_lookup(c->current_scope,
-                    root->ident.name, (uint32_t)root->ident.name_len);
+        /* scope escape: storing &local in static/global var OR pointer-param field.
+         * Unwrap @ptrcast/@bitcast/@cast launders on the value side (escape-matrix
+         * H1: `global = @ptrcast(*u8, &local)` previously slipped — the value was a
+         * NODE_INTRINSIC, not a bare NODE_UNARY(AMP)). Target sink classified via
+         * the shared classify_escape_sink (global/static or pointer-param field). */
+        {
+            Node *aval = node->assign.value;
+            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0)
+                aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
+            if (node->assign.op == TOK_EQ && aval &&
+                aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP &&
+                aval->unary.operand->kind == NODE_IDENT) {
+                Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
                 Symbol *val_sym = scope_lookup(c->current_scope,
-                    node->assign.value->unary.operand->ident.name,
-                    (uint32_t)node->assign.value->unary.operand->ident.name_len);
+                    aval->unary.operand->ident.name,
+                    (uint32_t)aval->unary.operand->ident.name_len);
                 bool val_is_global = val_sym &&
                     scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
-                bool target_is_static = target_sym && target_sym->is_static;
-                bool target_is_global = target_sym &&
-                    scope_lookup_local(c->global_scope, target_sym->name, target_sym->name_len) != NULL;
-                /* BUG-230/290: pointer parameter deref/fields can alias globals — treat as escape.
-                 * Catches: p->field = &local, *p = &local, **p = &local */
-                bool target_is_param_ptr = false;
-                if (target_sym && !target_is_static && !target_is_global &&
-                    target_sym->type && target_sym->type->kind == TYPE_POINTER) {
-                    /* target involves dereferencing a pointer param — escapes to caller */
-                    Node *t = node->assign.target;
-                    if (t->kind == NODE_FIELD || t->kind == NODE_INDEX ||
-                        (t->kind == NODE_UNARY && t->unary.op == TOK_STAR)) {
-                        target_is_param_ptr = true;
-                    }
-                }
-                if ((target_is_static || target_is_global || target_is_param_ptr) && val_sym &&
+                if ((tgt_global || tgt_param) && val_sym &&
                     !val_sym->is_static && !val_is_global) {
                     checker_error(c, node->loc.line,
-                        target_is_param_ptr ?
+                        tgt_param ?
                         "cannot store pointer to local '%.*s' through pointer parameter '%.*s' — "
                         "may escape to caller's scope" :
                         "cannot store pointer to local '%.*s' in static/global variable '%.*s'",
@@ -3465,9 +3483,9 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-205/355: local-derived escape via assignment to global/static.
-         * After flag propagation, check if target is global/static with local-derived value.
-         * BUG-355: also walk through intrinsics (@ptrcast, @bitcast, @cast) to find root ident. */
+        /* BUG-205/355 + escape-matrix H3/H4: local-derived escape via assignment to
+         * global/static OR a pointer-param field. Walk through intrinsics to the
+         * root ident; sink classified via classify_escape_sink (global or param). */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
             /* BUG-355: walk through intrinsics to find root ident */
@@ -3477,26 +3495,18 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);
                 if (val_sym && val_sym->is_local_derived) {
-                    Node *troot = node->assign.target;
-                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                        else troot = troot->index_expr.object;
-                    }
-                    if (troot && troot->kind == NODE_IDENT) {
-                        Symbol *target_sym = scope_lookup(c->current_scope,
-                            troot->ident.name, (uint32_t)troot->ident.name_len);
-                        bool target_is_global = target_sym &&
-                            (target_sym->is_static ||
-                             scope_lookup_local(c->global_scope, target_sym->name,
-                                                target_sym->name_len) != NULL);
-                        if (target_is_global) {
-                            checker_error(c, node->loc.line,
-                                "cannot store local-derived pointer '%.*s' in "
-                                "global/static variable '%.*s' — pointer will dangle "
-                                "when function returns",
-                                (int)val_sym->name_len, val_sym->name,
-                                (int)target_sym->name_len, target_sym->name);
-                        }
+                    Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
+                    classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
+                    if (tgt_global || tgt_param) {
+                        checker_error(c, node->loc.line,
+                            tgt_param ?
+                            "cannot store local-derived pointer '%.*s' through pointer "
+                            "parameter '%.*s' — pointer will dangle after function returns" :
+                            "cannot store local-derived pointer '%.*s' in "
+                            "global/static variable '%.*s' — pointer will dangle "
+                            "when function returns",
+                            (int)val_sym->name_len, val_sym->name,
+                            (int)target_sym->name_len, target_sym->name);
                     }
                 }
             }
@@ -3669,23 +3679,18 @@ static Type *check_expr(Checker *c, Node *node) {
                         (vsym->is_static || scope_lookup_local(c->global_scope,
                             vsym->name, vsym->name_len) != NULL);
                     if (vsym && !val_is_global) {
-                        /* value root is local — check if target is global/static */
-                        Node *troot = node->assign.target;
-                        while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                            if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                            else troot = troot->index_expr.object;
-                        }
-                        if (troot && troot->kind == NODE_IDENT) {
-                            Symbol *tsym = scope_lookup(c->current_scope,
-                                troot->ident.name, (uint32_t)troot->ident.name_len);
-                            bool tgt_is_global = tsym &&
-                                (tsym->is_static || scope_lookup_local(c->global_scope,
-                                    tsym->name, tsym->name_len) != NULL);
-                            if (tgt_is_global) {
-                                checker_error(c, node->loc.line,
-                                    "cannot store local array as slice in global/static — "
-                                    "pointer will dangle after function returns");
-                            }
+                        /* value root is local — reject if target is global/static OR
+                         * a pointer-param field (escape-matrix H2: array->slice into
+                         * a *Holder field previously slipped). */
+                        Symbol *tsym = NULL; bool tgt_is_global = false, tgt_param = false;
+                        classify_escape_sink(c, node->assign.target, &tsym, &tgt_is_global, &tgt_param);
+                        if (tgt_is_global || tgt_param) {
+                            checker_error(c, node->loc.line,
+                                tgt_param ?
+                                "cannot store local array as slice through pointer parameter — "
+                                "pointer will dangle after function returns" :
+                                "cannot store local array as slice in global/static — "
+                                "pointer will dangle after function returns");
                         }
                     }
                 }

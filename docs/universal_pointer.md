@@ -1,6 +1,10 @@
 # Universal Pointer Design — Full Context Dump
 
 **Status:** Brainstorming / design-space exploration. NOT a decision document.
+**UPDATE 2026-06-07:** a DECISION has now been made for the pointer-lifetime/escape
+axis — compile-time-only `keep`, no runtime tag check. See **PART 5** at the end.
+PART 5 supersedes PART 3's auto-detection "lock" (§29.6). Parts 1–4 remain the
+exploration record (append-only); the other safety axes are still open.
 **Date started:** 2026-05-21
 **Last updated:** 2026-05-25
 **Mode:** Exploration of tradeoffs across multiple pointer-safety designs. The
@@ -1916,6 +1920,8 @@ exploration as of 2026-05-25.
 |---|---|
 | 2026-05-25 | Initial creation — comprehensive context dump from brainstorming conversation |
 | 2026-05-25 | Expansion — added Sections 16-25 with concrete code examples, verification work, detailed cost analyses, FAQ, and migration stories |
+| 2026-06-01 | PART 3 (auto-detection) + PART 4 (reconciliation) appended |
+| 2026-06-07 | PART 5 — DECISION: compile-time-only `keep`, no runtime tag check; supersedes PART 3's lock. Escape-matrix oracle built + 4 escape holes (H1-H4) fixed; foundation verified sound (20/20) |
 
 ---
 
@@ -4634,3 +4640,139 @@ exist.
 
 The architecture is sound. The performance is estimated. Both are
 true at the same time, and the doc now says so explicitly.
+
+---
+
+# PART 5: DECISION — COMPILE-TIME-ONLY `keep`, NO RUNTIME (2026-06-07)
+
+Parts 1–4 were exploration. This part records an actual COMMITMENT for the
+pointer-lifetime/escape axis, made with the project owner on 2026-06-07.
+
+**PART 5 SUPERSEDES PART 3's design lock (§29.6).** PART 3 converged on the
+auto-detection model (universal `*T` + version tag + per-deref runtime check)
+and "locked" it. ZER will NOT build that. The chosen direction is the
+**compile-time-only `keep` design** (Section 6.10 / 19), with **no runtime tag
+check, no tagged pointers, no per-allocation header, no ABI change to `*T`**.
+PART 3's auto-detection analysis remains valid as the *alternative not taken* —
+it is preserved (append-only), not deleted.
+
+## 32. The decision and why
+
+**Decided:**
+- Compile-time-only `keep` for the pointer-lifetime/escape axis.
+- Reject the runtime tag check / auto-detection (PART 3).
+- Pointers stay 8 bytes. **Zero runtime cost** on the lifetime axis.
+
+**The deciding criterion (owner's framing):**
+- A false POSITIVE (safe program rejected) is **ACCEPTABLE** — restructure to
+  better code, exactly as Rust does.
+- A false NEGATIVE (an UNSAFE program compiles clean — *"it IS wrong but our
+  design makes it pass"*) is **UNACCEPTABLE** — a hole in the safety theorem.
+
+**Why this settles runtime-vs-compile-time:** a compile-time analysis that is
+CONSERVATIVE (rejects whenever it cannot prove liveness) is SOUND — it never
+under-rejects, only over-rejects. That is the definition of a sound static
+analysis (Rust's borrow checker is one). PART 3's runtime tag check was the
+doc's answer to FALSE POSITIVES (reducing over-rejection); since over-rejection
+is acceptable here, the runtime layer is **unnecessary for soundness**. So:
+compile-time-only, accept the false positives.
+
+## 33. Soundness verification — the escape matrix (`tests/test_escape_matrix.c`)
+
+`keep` is sound iff three things hold (the false-negative risk lives entirely
+here):
+1. **Conservative default** — reject whenever liveness can't be proven.
+2. **`keep` is VERIFIED at the call site** — the compiler checks the argument
+   actually outlives the storage, cascading to a real `'static`/global source;
+   it does NOT trust the annotation (the SPARK Definition-B trap that CLAUDE.md's
+   goal section forbids).
+3. **Every laundering path tracked or rejected** — alias, `@ptrcast`,
+   `@ptrtoint`, array→slice, identity-wash, struct-wrapper, orelse-fallback — at
+   every sink: return / global / param-field / nested-field.
+
+To turn "sound" from a claim into a standing GUARD, we built an exhaustive
+negative-only oracle: `tests/test_escape_matrix.c` — the
+`{escape-dest × launder-path × local-source}` product, every cell a
+genuinely-unsafe local escape that MUST be rejected **for the escape reason**
+(integrity guard: a rejection by parse/type error is flagged INVALID, not
+silently counted as a pass — the probe-10/11 lesson). `-Wswitch`-enforced so the
+grid can't shrink. Companion to `test_shape_matrix.c` (temporal/UAF axis).
+
+**First run found 4 real false negatives** — point-2/3 holes that were already
+closed for the RETURN sink but NOT for global-via-`@ptrcast` or
+param-field/nested-field sinks (unsafe programs compiling clean):
+- **H1**: `global = @ptrcast(*T, &local)`
+- **H2**: `param.field = local_array` (array→slice)
+- **H3**: `param.field = q`  where `q = &local`
+- **H4**: `nested.field = q` where `q = &local`
+
+Root cause: the direct-`&local` check handled both global and param-field sinks,
+but the *laundered* checks (local-derived-ident, array→slice) only fired at the
+global sink, and the global check didn't unwrap `@ptrcast` on the value side.
+
+**Fix (checker.c):** a shared `classify_escape_sink()` that walks any assignment
+target to its root and reports global-vs-param-ptr sink; all three laundered
+checks route through it (fire at BOTH sinks), and the direct check unwraps
+intrinsics on the value. After the fix: **escape matrix 20/20, 0 false
+negatives.** Regression tests:
+`tests/zer_fail/escape_{ptrcast_global,array_param_field,alias_param_field,alias_nested_field}.zer`.
+
+**Call-site verification (point 2) confirmed empirically:** passing `&local` to
+a `keep` parameter is rejected with `local variable 'x' cannot satisfy 'keep'` —
+`keep` is a *checked constraint*, not a *trusted contract*. This is the property
+that makes the whole compile-time-only model sound.
+
+## 34. The plan, and the one rule that keeps it sound
+
+The escape FOUNDATION (the checks `keep` builds on) is now matrix-verified sound
+(20/20). `keep`-universalization (Section 6.10 / 19) extends `keep` from the
+narrow System #21 (params only) to struct fields, locals, and cascade. Because
+`keep` is a call-site-VERIFIED accept and the base analysis rejects-on-
+uncertainty, extending it can only (a) add verified accepts or (b) reject more —
+it **cannot introduce a false negative UNLESS a new boundary default TRUSTS
+instead of checks.**
+
+**THE ONE RULE (soundness invariant for the implementation):** every new `keep`
+boundary default must REJECT-on-uncertainty, never trust. Danger zones
+(Section 19.5): `keep` on function-pointer types, on cinclude bindings, on
+generic container fields. Each must default-to-reject when `keep` isn't declared.
+The escape matrix is the standing guard — any boundary-default that trusts
+instead of checks surfaces as a new matrix HOLE.
+
+**Sequenced steps:**
+1. ✅ Escape-matrix oracle + close H1–H4 (foundation verified sound).
+2. As `keep` grows, extend the matrix's launder/dest axes (funcptr-stored,
+   cinclude-stored, generic-container-stored) — each new boundary gets a cell.
+3. Implement `keep` on struct fields / locals / cascade (Section 13.1), against
+   the matrix.
+4. For each boundary default: add the negative cell FIRST (must reject), then
+   the feature.
+
+## 35. Reconciliation with prior parts (per the PART 4 discipline)
+
+| Topic | Prior part | PART 5 |
+|---|---|---|
+| Direction | PART 3 §29.6 "locked" universal `*T` + runtime tag check | **SUPERSEDED** — compile-time-only `keep`, no runtime check. PART 3 stands as alternative-not-taken. |
+| Runtime cost | PART 3: ~1–3% (hypothesis) | **Zero** on the lifetime axis (compile-time only). The unbenchmarked estimate is moot for the chosen design. |
+| False positives | PART 3 eliminated via runtime check | **ACCEPTED** (restructure) — the owner's explicit trade. |
+| False negatives | PART 1/3: "none modulo tag width" | Goal: **zero**, by conservative compile-time analysis; GUARDED by the escape matrix (20/20, and no tag-width caveat — there is no tag). |
+| Pointer size | PART 3: 8-byte default + 16-byte security variant | **8 bytes**, no variants (no tag). |
+
+**LOCKED by PART 5:**
+- compile-time-only `keep` for the lifetime axis (no runtime layer)
+- the soundness criterion (over-reject OK, never under-reject)
+- the escape matrix as the standing no-false-negative guard
+- the boundary-default-must-reject implementation rule
+
+**Still OPEN:**
+- `keep`-universalization itself (struct fields / locals / cascade) — foundation
+  verified, feature not yet implemented
+- aliasing-exclusivity (`&mut`) axis — out of scope, unchanged (Section 28 / 22.12)
+
+This part is append-only. PART 3's lock is superseded HERE (not by editing
+PART 3) so the geological record stays honest: PART 3 was the exploration's
+convergence; PART 5 is the owner's decision.
+
+---
+
+# End of PART 5

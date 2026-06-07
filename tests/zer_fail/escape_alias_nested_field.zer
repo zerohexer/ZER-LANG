@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Escape-matrix H4 (2026-06-07): a local-derived pointer stored into a NESTED
+// field of a pointer parameter must be rejected. classify_escape_sink walks the
+// full field/index/deref chain to the root pointer param.
+struct Inn { ?*u32 hp; }
+struct Outr { Inn inner; }
+void leak(*Outr h) {
+    u32 x = 5;
+    *u32 q = &x;
+    h.inner.hp = q;
+}
+i32 main() { return 0; }

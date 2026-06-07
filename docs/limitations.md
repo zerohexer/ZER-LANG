@@ -5,6 +5,32 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — escape-matrix oracle: pruned cells (secondary launder×sink combos)
+
+`tests/test_escape_matrix.c` (the `keep`-axis soundness guard, 2026-06-07) is
+green at 20/20 over the cells `cell_valid()` admits, and the 4 holes it found
+(BUG-704..707) are fixed. But `cell_valid()` PRUNES some launder×sink combos to
+keep v1 focused. These are NOT verified — each is a potential false negative
+(under-rejection = safety hole) until enumerated:
+
+- **identity-wash → global / param-field** — `g = id(&local)` / `h.p = id(&local)`
+  (matrix covers id-wash for RETURN only). Return is caught (BUG-360); the
+  global/param sinks for call-returns-local-derived are unverified.
+- **struct-wrapper → global / param-field** — `g = wrap(&local).p` (RETURN only
+  in the matrix).
+- **@ptrcast → param-field / nested** — covered for return + global; param-field
+  not enumerated.
+- **arena → param-field / nested** — local-arena pointer into a param field
+  (matrix covers arena→global only).
+- **@ptrtoint → global / param** — stores a `usize` integer, not a pointer; the
+  escape is deferred to a later `@inttoptr`, which is guarded by the `mmio`
+  requirement. Lower risk, but the integer-laundering path is unenumerated.
+
+Fix path: extend `cell_valid()` to admit these combos and re-run; for any that
+surface as a HOLE, route the relevant escape check through `classify_escape_sink`
+(checker.c) the same way H1-H4 were closed. Add the cell FIRST (must reject),
+then the fix.
+
 ## OPEN — shape-matrix oracle: remaining coverage roadmap
 
 `tests/test_shape_matrix.c` is the exhaustive memory-safety oracle (option A,

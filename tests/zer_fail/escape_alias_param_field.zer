@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Escape-matrix H3 (2026-06-07): a local-derived pointer (alias of &local)
+// stored into a pointer-parameter's field must be rejected. Previously the
+// local-derived escape check only fired for global/static sinks, not param fields.
+struct Holder { ?*u32 hp; }
+void leak(*Holder h) {
+    u32 x = 5;
+    *u32 q = &x;
+    h.hp = q;
+}
+i32 main() { return 0; }

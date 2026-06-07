@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Escape-matrix H2 (2026-06-07): a local array coerced to a slice and stored
+// into a pointer-parameter's field must be rejected — the slice .ptr dangles
+// after return. Previously the array->slice escape check only fired for globals.
+struct Holder { [*]u8 hp; }
+void leak(*Holder h) {
+    u8[4] a;
+    h.hp = a;
+}
+i32 main() { return 0; }

@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-704..707: escape-matrix false negatives
+
+The escape/lifetime soundness oracle `tests/test_escape_matrix.c` (NEW, the
+`keep`-axis companion to the shape matrix) found **4 real false negatives** on
+first run — genuinely-unsafe local-pointer escapes that compiled clean. These
+are exactly the "wrong program passes" class (under-rejection = safety hole),
+the opposite of the acceptable false-positive (over-rejection) class.
+
+**The 4 holes (all unsafe, all previously compiled clean):**
+
+- **BUG-704 (H1):** `global = @ptrcast(*T, &local)` — `&local` laundered through
+  `@ptrcast` into a global store. The global-store escape check matched only a
+  bare `NODE_UNARY(&)` value, not one wrapped in an intrinsic.
+- **BUG-705 (H2):** `param.field = local_array` — a local array coerced to a
+  slice and stored into a pointer-parameter's field. The array→slice escape
+  check fired only at global sinks.
+- **BUG-706 (H3):** `param.field = q` where `q = &local` — a local-derived
+  pointer stored into a pointer-param's field. The local-derived escape check
+  fired only at global/static sinks.
+- **BUG-707 (H4):** `nested.field = q` where `q = &local` — same, through a
+  nested field chain (`h.inner.hp`).
+
+**Root cause (one shared cause):** the direct-`&local` escape check handled
+BOTH global and pointer-param-field sinks (it had the `target_is_param_ptr`
+branch), but the *laundered* checks (local-derived-ident, array→slice) only
+fired at the global sink, and the global-store check never unwrapped intrinsics
+on the value. The return sink had the full laundering walk; the global and
+param-field sinks did not — that asymmetry was the hole.
+
+**Fix (checker.c):** extracted a shared `classify_escape_sink(c, target, &sym,
+&is_global, &is_param_ptr)` that walks any assignment target's field/index/deref
+chain to its root and reports whether the sink is global/static or a
+dereferenced/field-of pointer (param/local pointer that may alias caller/global).
+All three laundered escape checks now route through it and fire at BOTH sinks;
+the direct-`&local` check additionally unwraps `@ptrcast`/`@bitcast`/`@cast` on
+the value side. `classify_escape_sink` uses `type_dispatch_kind()` (the
+distinct-unwrap accessor) for its pointer test so the CI type-dispatch gate
+stays green.
+
+Conservative by design: any deref-of-pointer target counts as a potential escape
+(over-rejection of local-pointer-to-local is acceptable; under-rejection is not).
+Consistent with the pre-existing direct-`&local` conservatism. Full suite stayed
+green — no over-rejection regressions in rust_tests / zer / modules / fuzzer.
+
+**Verification:** escape matrix 16/20 → **20/20, 0 false negatives**. The
+call-site verification of `keep` (probe: `&local` to a `keep` param →
+`local variable 'x' cannot satisfy 'keep'`) confirms `keep` is a checked
+constraint, not a trusted contract — the property that makes the compile-time-
+only `keep` model sound (see docs/universal_pointer.md PART 5).
+
+**Tests:**
+- `tests/test_escape_matrix.c` — the oracle, wired into `make check`
+- `tests/zer_fail/escape_ptrcast_global.zer` (H1)
+- `tests/zer_fail/escape_array_param_field.zer` (H2)
+- `tests/zer_fail/escape_alias_param_field.zer` (H3)
+- `tests/zer_fail/escape_alias_nested_field.zer` (H4)
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-703: move-field by-value over-rejection
 
 ### BUG-703 (over-rejection) — `consume(w.inner)` falsely rejected as use-after-move

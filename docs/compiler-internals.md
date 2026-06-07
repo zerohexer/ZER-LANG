@@ -9938,3 +9938,58 @@ the bare root as the single authority). The first attempt (`!is_temp` guard on
 the FIELD_READ transfer) regressed `move_field_read_uam` into a false negative
 and was reverted — see BUGS-FIXED.md for that lesson. The matrix tripwire that
 parked it is removed; move/field/pos now runs as a normal positive.
+
+---
+
+## Escape/Lifetime Matrix Oracle — `tests/test_escape_matrix.c` (2026-06-07)
+
+The companion to the shape matrix for the OTHER memory-safety axis. The shape
+matrix covers the temporal axis (UAF / double-free / leak / use-after-move). The
+escape matrix covers the **lifetime-escape axis** — a pointer to a local (or
+local-derived via alias / arena / array→slice / @ptrcast / @ptrtoint /
+identity-wash / struct-wrapper / orelse-fallback) escaping its scope via
+return / global / param-field / nested-field. This is the axis the
+`keep`-universalization work (docs/universal_pointer.md PART 5) builds on, so its
+SOUNDNESS is guarded here before extending it.
+
+**It is NEGATIVE-ONLY by design.** The locked criterion (universal_pointer.md
+PART 5): a false positive (safe program rejected) is acceptable (restructure,
+like Rust); a false negative (unsafe program compiles clean) is a safety hole.
+So every cell is a genuinely-unsafe escape that MUST be rejected. A cell
+compiling clean = false negative = hard fail.
+
+**Integrity guard (the probe-10/11 lesson):** a rejection only counts if it is
+FOR THE ESCAPE REASON. `run_neg()` inspects stderr — a rejection by parse/type
+error is flagged INVALID-PROBE (generator bug), not silently counted as a pass.
+This is what makes a negative-only oracle trustworthy without positive cells.
+
+Axes (C enums, `-Wswitch`-enforced, no default — grid can't shrink): `EscDest`
+{return, global, param.field, nested.field} × `Launder` {direct, alias,
+@ptrcast, @ptrtoint, id-wash, wrapper, orelse-fb} × `Src` {local-var, local-arr,
+local-arena}. `cell_valid()` prunes to 20 meaningful cells.
+
+**Found 4 real false negatives on first run** (BUG-704..707, see BUGS-FIXED.md):
+global-via-@ptrcast, array→slice into param field, aliased-local into
+param/nested field. Root cause: the laundered escape checks fired only at global
+sinks, not pointer-param-field sinks; the global check didn't unwrap intrinsics.
+
+**The fix — `classify_escape_sink()` (checker.c):** the shared escape-sink
+classifier. Walks any assignment target's field/index/deref chain to its root
+ident and reports `is_global` (static or in global scope — outlives the
+function) vs `is_param_ptr` (any deref-of-pointer target — may alias caller or
+global). The three laundered escape checks (direct-`&local` after intrinsic
+unwrap, local-derived-ident, array→slice) all route through it and fire at BOTH
+sinks. **When adding a new escape check or a new value/target shape, use this
+helper** rather than re-deriving the global-vs-param classification inline — the
+H1-H4 holes existed precisely because the laundered checks each rolled their own
+global-only classification. Uses `type_dispatch_kind()` for its pointer test
+(distinct-unwrap gate compliance).
+
+After the fix: escape matrix 20/20, 0 false negatives. Wired into `make check`.
+
+**`keep` is call-site-verified, not trusted** (the soundness keystone): passing
+`&local` to a `keep` parameter is rejected (`local variable 'x' cannot satisfy
+'keep'`). `keep` is a checked constraint (like Rust's `'a`), not a trusted
+contract (the SPARK Definition-B trap CLAUDE.md forbids). This is why the
+compile-time-only `keep` model (no runtime tag check) is sound. Full design +
+decision in `docs/universal_pointer.md` PART 5.

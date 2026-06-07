@@ -5,6 +5,20 @@ Entries removed once fixed.
 
 ---
 
+## PLAN — asm Option E rework (Level C cleanup first)
+
+The asm-safety architecture is slated to move to Option E (three-layer, no-favored-
+ISA — `docs/asm_lang_zer_safe.md` §1.7). **Phase 1 = Level C cleanup**: delete the
+per-arch infrastructure (~7,000 lines: register/instruction tables, categories
+framework, probe scripts, `arch_data/*.zerdata`, stray `.v`), replace the
+checker.c F7-full table dispatch with a hardcoded ~12-entry UB-classics list, and
+delegate register/instruction/feature validation to GCC. **Intrinsics STAY in
+Phase 1** — they get re-layered (operation→Layer 1, x86 asm→Layer 2 lib) only in
+Phase 3. Verified file-by-file execution checklist (commit order, regression net,
+the `.v`/`check-vst` coupling asm_lang §10 underspecifies):
+**`docs/option_e_plan.md`** — fresh-session-executable. `tests/test_asm_matrix.c`
+is the regression net for the deletion.
+
 ## OPEN — asm S2 instruction-count `\n`-escape bypass (audit rule, not safety)
 
 The S2 rule (checker.c:10379) caps an asm block at 16 instructions for

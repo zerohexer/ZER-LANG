@@ -5,6 +5,90 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (audit cont.) — BUG-705: IR_COPY missing overwrite-while-alive check
+
+### BUG-705 (HIGH) — `h = pool.alloc() orelse return;` twice silently leaks the first
+
+**Symptom:** under-rejection (silent leak) — reassigning a still-ALIVE
+handle through `pool.alloc() orelse ...` did not fire the "overwritten
+while alive" diagnostic. The first allocation was silently dropped.
+Loop variant scaled the leak: N iterations leaked N-1 allocations.
+
+Reproducers (compiled clean before the fix):
+```zer
+struct Item { u32 id; }
+Pool(Item, 16) gp;
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    h = gp.alloc() orelse return;       // first alloc silently leaked
+    gp.free(h);
+}
+
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    for (u32 i = 0; i < N; i += 1) {
+        h = gp.alloc() orelse return;   // each iteration leaks the prior
+    }
+    gp.free(h);
+}
+```
+
+The matching directly-allocated shape `h = gp.alloc(); h = gp.alloc();`
+(if it parsed without orelse, which it doesn't) IS caught at the
+alloc-site checks (zercheck_ir.c lines 1486-1492, 2306-2311,
+2789-2795). The orelse desugaring routes around them.
+
+**Root cause:** the orelse desugaring lowers
+`Handle(T) h = pool.alloc() orelse return;` to:
+1. `_zer_or1 = pool.alloc()` (IR_ASSIGN to an optional temp)
+2. orelse branch
+3. `_zer_t0 = _zer_or1.value` (unwrap to a temp via IR_COPY)
+4. `h = _zer_t0` (IR_COPY into user-named local)
+
+Every alloc-site "overwritten while alive" check gates on
+`!func->locals[inst->dest_local].is_temp`. Steps 1-3 all write to
+`_zer_t0` / `_zer_or1` which ARE temps, so the gate filters them out.
+The actual user-named overwrite happens in step 4 — IR_COPY into `h` —
+and the IR_COPY handler had no overwrite check at all. So `h`'s prior
+ALIVE state was silently overwritten with the alias of the new alloc.
+
+**Fix:** zercheck_ir.c IR_COPY handler — snapshot the dst's existing
+state/alloc_id/escaped BEFORE the realloc-capable `ir_add_handle` call.
+If the existing dst was `IR_HS_ALIVE`, not a temp, not escaped, and the
+new alloc_id differs from the previous alloc_id, fire
+"overwritten while alive — previous allocation leaked". Snapshot via
+locals (not pointer) because ir_add_handle can realloc the handle
+array and invalidate any pre-existing pointer.
+
+**Why no false-positive on legitimate aliases:** `Handle(T) h2 = h;`
+copies the same alloc_id — the check requires `prev_alloc_id !=
+snap.alloc_id`, so same-id rebinds (`h2 = h;`) pass cleanly. First
+initialization (`h2`'s prev_state is `IR_HS_UNKNOWN`) also passes —
+only `IR_HS_ALIVE` triggers the check. Overwriting a FREED handle
+(`gp.free(h); h = gp.alloc() orelse return;`) is legitimate re-use and
+passes — prev_state is `IR_HS_FREED`, not ALIVE.
+
+**Why no false-positive on returned-handle wrappers:** the `escaped`
+flag exempts handles that have been returned to caller or stored to a
+global field; overwriting locally after escape doesn't leak the alive
+copy elsewhere. The check skips them.
+
+**Tests:**
+- `tests/zer_fail/overwrite_alive_handle_simple.zer` — bare reassign
+- `tests/zer_fail/overwrite_alive_handle_loop.zer`   — loop reassign
+- `tests/zer/overwrite_after_free_ok.zer`            — free → realloc OK
+- `tests/zer/overwrite_alias_same_id_ok.zer`         — same-id rebind OK
+
+Full suite green: 673/673 zer tests; ALL TESTS PASSED. No regressions
+in the move-struct (BUG-704) tests or any prior handle-tracking tests.
+
+Known adjacent gap not fixed in this commit: `?Handle(T) mh = gp.alloc();
+mh = gp.alloc();` (optional-typed direct assignment, no orelse) still
+slips through — optional handles go through a different lowering path
+that doesn't reach IR_COPY in the same way. Tracked separately.
+
+---
+
 ## Session 2026-06-07 (audit cont.) — BUG-704: spawn missing use-after-move check
 
 ### BUG-704 (CRITICAL) — `spawn worker(t)` twice silently accepted on move-struct

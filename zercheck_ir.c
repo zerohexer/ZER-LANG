@@ -1774,6 +1774,43 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * field-drift bug class. */
         IRAliasSnapshot snap;
         ir_snapshot_alias(&snap, src_h);
+
+        /* BUG-705 (Session 2026-06-07 audit): handle-overwrite-while-alive
+         * check was missing from IR_COPY. The orelse desugaring routes every
+         * `h = pool.alloc() orelse ...` user write through a temp local +
+         * IR_COPY into the user-named local — so the alloc-site
+         * "overwritten while alive" checks (which gate on `!is_temp`) never
+         * see the user local, only the temp. Result, silently accepted:
+         *
+         *   Handle(Item) h = gp.alloc() orelse return;
+         *   h = gp.alloc() orelse return;   // first alloc leaked, no error
+         *   gp.free(h);
+         *
+         * Mirror the alloc-site check: if dst was already ALIVE with a
+         * different alloc_id, the overwrite drops the previous allocation
+         * and the user-level var has no other handle. Snapshot the
+         * existing dst fields BEFORE ir_add_handle (realloc-capable). */
+        int prev_state = IR_HS_UNKNOWN;
+        int prev_alloc_id = 0;
+        bool prev_escaped = false;
+        {
+            IRHandleInfo *prev_dst = ir_find_handle(ps, inst->dest_local);
+            if (prev_dst) {
+                prev_state = prev_dst->state;
+                prev_alloc_id = prev_dst->alloc_id;
+                prev_escaped = prev_dst->escaped;
+            }
+        }
+        if (prev_state == IR_HS_ALIVE &&
+            !prev_escaped &&
+            inst->dest_local < func->local_count &&
+            !func->locals[inst->dest_local].is_temp &&
+            prev_alloc_id != snap.alloc_id) {
+            ir_zc_error(zc, inst->source_line,
+                "handle %%%d overwritten while alive — previous allocation leaked",
+                inst->dest_local);
+        }
+
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
             ir_apply_alias(dst_h, &snap);

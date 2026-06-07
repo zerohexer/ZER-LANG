@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// BUG-705 (Session 2026-06-07 audit): IR_COPY handler was missing the
+// "overwrite while alive" check. The orelse desugaring routes every
+// `h = pool.alloc() orelse ...` user write through a temp local + IR_COPY
+// into the user-named local, so the alloc-site `!is_temp`-gated checks
+// never saw the user-named local. Result: silent leak of the first alloc.
+struct Item { u32 id; }
+Pool(Item, 16) gp;
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    h = gp.alloc() orelse return;   // first alloc must error as leaked
+    gp.free(h);
+}
+i32 main() { run(); return 0; }

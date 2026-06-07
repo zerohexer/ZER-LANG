@@ -4778,8 +4778,16 @@ instead of checks surfaces as a new matrix HOLE.
    call-site verification. `keep` on locals / cascade: NOT pursued — no sound
    value-adding semantics in ZER's no-lifetime-tracking model (param + field
    contracts suffice).
-5. For each boundary default (funcptr / cinclude / generic-container): add the
-   negative cell FIRST (must reject), then the feature.
+5. ✅ Boundary audit (2026-06-07): the §19.5 "danger zones" probed —
+   **funcptr** params → global are SAFE (function pointers are static; only the
+   `*opaque` context is a data pointer, already keep-covered); **cinclude/extern**
+   pointers are the documented out-of-scope C boundary; **generic-container**
+   fields are ordinary struct fields, covered by the keep axis. The audit found
+   one real residual false negative (BUG-728, "hole A"): a non-keep param
+   laundered through a LOCAL struct field then a whole-struct copy to a global.
+   Fixed by extending the keep persist-check to STRUCT/UNION values (the struct
+   inherits is_nonkeep_derived; copying it to a persistent sink is the same
+   violation; returning it stays allowed = borrow returned to caller).
 
 **Soundness status (2026-06-07):** the pointer-lifetime axis now has FOUR
 exhaustive oracles — shape (temporal/UAF, 25 cells), escape (local escape, 35),
@@ -4788,6 +4796,14 @@ struct-carried local escape (build a struct locally, store &local in a field,
 then return / store-to-global / nest / alias) is rejected in every case. The
 compile-time-only `keep` model is sound (no false negatives found) for the
 current language surface.
+
+**All five PART-5 steps are complete.** "Universal pointer" (in the form ZER
+committed to — compile-time `keep`, no runtime tag) is DONE for the current
+language surface: escape + keep axes verified by four exhaustive oracles, the
+keep boundary defaults audited, and every hole found (16 escape + 6 keep + 1
+defer + 1 struct-copy) closed. Residual coverage debt (deeper/exotic launders,
+multi-level nesting, the non-memory domains) is tracked in `docs/limitations.md`,
+not a known false negative.
 
 ## 35. Reconciliation with prior parts (per the PART 4 discipline)
 

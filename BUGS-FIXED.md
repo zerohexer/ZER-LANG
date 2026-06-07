@@ -5,6 +5,49 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-728: keep-axis struct-copy launder (boundary audit)
+
+Auditing keep-universalization step 5 (boundary defaults — funcptr / cinclude /
+generic-container, PART 5 §19.5) by probe. Two were non-issues: funcptr params
+stored to globals are safe (function pointers are static — no dangling; only the
+`*opaque` context is a data pointer, and that IS keep-covered), and cinclude/
+extern pointers are the documented out-of-scope C boundary. But a third probe
+found a **real residual false negative (hole A):**
+
+```
+struct Box { ?*u32 slot; }
+Box g_box;
+void stash(*u32 p) {            // p is a non-keep param
+    Box local;
+    local.slot = p;            // store the non-keep pointer into a local struct
+    g_box = local;             // copy the WHOLE struct to a global → p persisted
+}
+```
+
+The non-keep param `p` is laundered through a local struct field, then the
+whole-struct copy `g_box = local` carries it into a global — persisting a
+non-keep pointer (dangles when the caller's pointee dies). Compiled clean.
+
+**Root cause:** `local.slot = p` correctly marked `local` as is_nonkeep_derived
+(via `propagate_escape_flags`, since structs carry pointers), but the keep
+persist check gated on the VALUE being a `POINTER`/`OPAQUE` type — and `local`
+is a `STRUCT`. The escape axis already handles struct values here (that's why
+the `&local` sibling `local.slot = &x; g = local;` was caught), so this was a
+keep-vs-escape asymmetry.
+
+**Fix:** extend the keep persist-check type gate to include `STRUCT`/`UNION`
+(via `type_dispatch_kind`). A struct that received a non-keep param in a field
+carries is_nonkeep_derived; copying it whole to a global/param-field is the same
+violation. Returning such a struct stays allowed (correct — returning a borrow
+to the caller is safe, like `*u32 id(*u32 p){return p;}`); only persist sinks
+(global/param-field) reject.
+
+Verified: hole A + the param-field variant reject; the return-borrow case and
+owned-pointer-into-struct-to-global still compile (no over-rejection); keep
+matrix 21/21. Test: `tests/zer_fail/keep_struct_copy_global.zer`.
+
+---
+
 ## Session 2026-06-07 (cont.) — field-level keep (keep-universalization step 4)
 
 Implemented `keep` on struct fields — ZER's analog of Rust's `struct H<'a> { p:

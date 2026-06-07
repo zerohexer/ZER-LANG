@@ -3579,15 +3579,21 @@ static Type *check_expr(Checker *c, Node *node) {
             if (vnode && vnode->kind == NODE_IDENT) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);
-                Type *vt = val_sym ? type_unwrap_distinct(val_sym->type) : NULL;
                 /* A non-keep pointer parameter stored in a persistent sink violates
                  * the non-keep contract. Both the param itself AND any local that
                  * aliases it carry is_nonkeep_derived (set at registration,
                  * propagated by propagate_escape_flags) — keep-axis matrix holes
                  * (alias / call-result launder). func_node==NULL identifies the
-                 * direct param for the precise "add 'keep' to parameter X" message. */
+                 * direct param for the precise "add 'keep' to parameter X" message.
+                 * STRUCT/UNION values are included (hole A, 2026-06-07): a struct
+                 * that received a non-keep param in one of its fields carries
+                 * is_nonkeep_derived (via propagate_escape_flags), and persisting
+                 * it via a whole-struct copy to a global is the same violation —
+                 * mirrors the escape axis, which already marks/checks structs. */
+                TypeKind vk = type_dispatch_kind(val_sym ? val_sym->type : NULL);
                 bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
-                    vt && (vt->kind == TYPE_POINTER || vt->kind == TYPE_OPAQUE);
+                    (vk == TYPE_POINTER || vk == TYPE_OPAQUE ||
+                     vk == TYPE_STRUCT || vk == TYPE_UNION);
                 if (is_nonkeep_value) {
                     /* keep-universalization 2a: a non-keep pointer param (or alias)
                      * persisted into a global OR a pointer-param field/nested sink

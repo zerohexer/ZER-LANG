@@ -4713,9 +4713,21 @@ global sink, and the global check didn't unwrap `@ptrcast` on the value side.
 **Fix (checker.c):** a shared `classify_escape_sink()` that walks any assignment
 target to its root and reports global-vs-param-ptr sink; all three laundered
 checks route through it (fire at BOTH sinks), and the direct check unwraps
-intrinsics on the value. After the fix: **escape matrix 20/20, 0 false
-negatives.** Regression tests:
+intrinsics on the value. After the first fix: escape matrix 16/20, 0 false
+negatives. Regression tests:
 `tests/zer_fail/escape_{ptrcast_global,array_param_field,alias_param_field,alias_nested_field}.zer`.
+
+**Then the matrix was un-pruned (20 → 35 cells)** — the secondary launder×sink
+combos v1 had deferred. It found **12 more false negatives** (BUG-708..719) in
+3 clusters: call-result laundering (`g = idfn(&x)`, `h.p = wrapfn(&x).p`) at
+assignment sinks, arena-derived into param/nested fields, and orelse-fallback
+`&local` into param/nested fields. All closed via the same `classify_escape_sink`
+routing (Cluster A also walks the value to a `NODE_CALL` + `call_has_local_derived_arg`,
+gated on the value being a pointer/slice — same gate the return sink uses, so
+`g_int = count(&local)` is NOT over-rejected). Escape matrix now **35/35, 0 false
+negatives** — the escape foundation is fully matrix-verified, no pruned-cell
+asterisk. (`@ptrtoint`→global/param is intentionally RETURN-only: it yields a
+`usize` integer whose only re-materialization, `@inttoptr`, is mmio-guarded.)
 
 **Call-site verification (point 2) confirmed empirically:** passing `&local` to
 a `keep` parameter is rejected with `local variable 'x' cannot satisfy 'keep'` —

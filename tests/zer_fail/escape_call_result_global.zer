@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Escape-matrix cluster A (2026-06-07): a call result with a local-derived arg,
+// stored at a global sink, must be rejected (g = idfn(&local)). The return sink
+// was covered (BUG-360); assignment sinks were not. Gated on the value being a
+// pointer/slice so int-returning calls aren't over-rejected.
+*u32 idfn(*u32 p) { return p; }
+?*u32 gesc = null;
+void leak() {
+    u32 x = 5;
+    gesc = idfn(&x);
+}
+i32 main() { return 0; }

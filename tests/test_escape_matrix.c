@@ -141,19 +141,23 @@ static int cell_valid(EscDest d, Launder l, Src s) {
     switch (l) {
         case LD_DIRECT:
             if (s == SR_VAR)   return 1;                 /* all 4 dests */
-            if (s == SR_ARRAY) return d == ED_RETURN || d == ED_GLOBAL || d == ED_PARAM_FIELD;
-            if (s == SR_ARENA) return d == ED_GLOBAL;    /* void fn, bare orelse return */
+            if (s == SR_ARRAY) return 1;                 /* all 4 dests (array->slice) */
+            if (s == SR_ARENA) return d != ED_RETURN;    /* void fn (bare orelse return): global/param/nested */
             return 0;
         case LD_ALIAS:
             if (s == SR_VAR)   return 1;                 /* all 4 dests */
-            if (s == SR_ARENA) return d == ED_GLOBAL;
+            if (s == SR_ARENA) return d != ED_RETURN;    /* global/param/nested */
             return 0;
-        case LD_PTRCAST:
-            return s == SR_VAR && (d == ED_RETURN || d == ED_GLOBAL);
-        case LD_PTRTOINT: return s == SR_VAR && d == ED_RETURN;
-        case LD_IDENTITY: return s == SR_VAR && d == ED_RETURN;
-        case LD_WRAPPER:  return s == SR_VAR && d == ED_RETURN;
-        case LD_ORELSE:   return s == SR_VAR && (d == ED_RETURN || d == ED_GLOBAL);
+        case LD_PTRCAST:  return s == SR_VAR;            /* all 4 dests */
+        case LD_IDENTITY: return s == SR_VAR;            /* all 4 dests */
+        case LD_WRAPPER:  return s == SR_VAR;            /* all 4 dests */
+        case LD_ORELSE:   return s == SR_VAR;            /* all 4 dests */
+        case LD_PTRTOINT:
+            /* integer-laundering path: @ptrtoint(&local) yields usize, not a
+             * pointer; the escape only re-materializes via @inttoptr, which is
+             * guarded by the mmio requirement. Intentionally RETURN-only — the
+             * global/param integer-store is a separate (mmio-gated) concern. */
+            return s == SR_VAR && d == ED_RETURN;
         case LAUNDER_COUNT: break;
     }
     return 0;
@@ -248,10 +252,16 @@ static void gen(EscDest d, Launder l, Src s, char *buf, size_t n) {
             else { char sd[64]; snprintf(sd, sizeof(sd), "struct Holder { %s hp; }\n", store_ty(RET)); strcat(decls, sd); }
             snprintf(func, sizeof(func), "void esc_fn(*Holder h) {\n%s    h.hp = %s;\n}\n", setup, E);
             break;
-        case ED_NESTED_FIELD:
-            strcat(decls, "struct Inn { ?*u32 hp; }\nstruct Outr { Inn inner; }\n");
+        case ED_NESTED_FIELD: {
+            char inn[96];
+            if (!strcmp(RET, "[*]u8"))
+                snprintf(inn, sizeof(inn), "struct Inn { [*]u8 hp; }\nstruct Outr { Inn inner; }\n");
+            else
+                snprintf(inn, sizeof(inn), "struct Inn { %s hp; }\nstruct Outr { Inn inner; }\n", store_ty(RET));
+            strcat(decls, inn);
             snprintf(func, sizeof(func), "void esc_fn(*Outr h) {\n%s    h.inner.hp = %s;\n}\n", setup, E);
             break;
+        }
         case EDEST_COUNT: func[0] = 0; break;
     }
 

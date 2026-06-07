@@ -3578,21 +3578,15 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (src && src->is_local_derived) fb_is_local = true;
             }
             if (fb_is_local) {
-                Node *troot = node->assign.target;
-                while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                    if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                    else troot = troot->index_expr.object;
-                }
-                if (troot && troot->kind == NODE_IDENT) {
-                    Symbol *ts = scope_lookup(c->current_scope,
-                        troot->ident.name, (uint32_t)troot->ident.name_len);
-                    bool tgt_global = ts && (ts->is_static ||
-                        scope_lookup_local(c->global_scope, ts->name, ts->name_len) != NULL);
-                    if (tgt_global) {
-                        checker_error(c, node->loc.line,
-                            "orelse fallback stores local pointer in global — "
-                            "pointer will dangle after function returns");
-                    }
+                Symbol *ts = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &ts, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        tgt_param ?
+                        "orelse fallback stores local pointer through pointer parameter — "
+                        "pointer will dangle after function returns" :
+                        "orelse fallback stores local pointer in global — "
+                        "pointer will dangle after function returns");
                 }
             }
         }
@@ -3643,6 +3637,34 @@ static Type *check_expr(Checker *c, Node *node) {
                             "may escape to global memory",
                             (int)val_sym->name_len, val_sym->name);
                     }
+                }
+            }
+        }
+
+        /* escape-matrix cluster A: value is a (field/index of a) call with a
+         * local-derived argument, stored at a global/static OR pointer-param sink.
+         * `g = idfn(&x)`, `h.p = wrapfn(&x).p`. The RETURN sink is handled by
+         * BUG-360/383; assignment sinks were uncovered (escape-matrix holes).
+         * Conservative (same proxy as the return check): rejects even if the
+         * callee doesn't retain the arg — over-rejection acceptable, under not. */
+        if (node->assign.op == TOK_EQ &&
+            value && (type_dispatch_kind(value) == TYPE_POINTER ||
+                      type_dispatch_kind(value) == TYPE_SLICE)) {
+            /* Gate on the stored value being a pointer/slice — same as BUG-360/383.
+             * `g_int = count(&local)` returns an int: no pointer escapes, don't reject. */
+            Node *vroot = node->assign.value;
+            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                else vroot = vroot->index_expr.object;
+            }
+            if (vroot && vroot->kind == NODE_CALL &&
+                call_has_local_derived_arg(c, vroot, 0)) {
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot store result of call with local-derived pointer argument — "
+                        "stack memory may escape (sink outlives the local)");
                 }
             }
         }
@@ -3755,32 +3777,25 @@ static Type *check_expr(Checker *c, Node *node) {
                 value_root->ident.name,
                 (uint32_t)value_root->ident.name_len);
             if (val_sym && (val_sym->is_arena_derived || val_sym->is_from_arena)) {
-                /* walk target to find root */
-                Node *root = node->assign.target;
-                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                    if (root->kind == NODE_FIELD) root = root->field.object;
-                    else root = root->index_expr.object;
+                Symbol *target_sym = NULL; bool target_is_global = false, target_is_param = false;
+                classify_escape_sink(c, node->assign.target, &target_sym, &target_is_global, &target_is_param);
+                if (target_is_global || target_is_param) {
+                    checker_error(c, node->loc.line,
+                        target_is_param ?
+                        "cannot store arena-derived pointer '%.*s' through pointer "
+                        "parameter '%.*s' — pointer will dangle when arena is reset" :
+                        "cannot store arena-derived pointer '%.*s' in "
+                        "global/static variable '%.*s' — pointer will dangle "
+                        "when arena is reset",
+                        (int)val_sym->name_len, val_sym->name,
+                        (int)(target_sym ? target_sym->name_len : 1),
+                        target_sym ? target_sym->name : "?");
                 }
-                if (root && root->kind == NODE_IDENT) {
-                    Symbol *target_sym = scope_lookup(c->current_scope,
-                        root->ident.name, (uint32_t)root->ident.name_len);
-                    bool target_is_global = target_sym &&
-                        (target_sym->is_static ||
-                         scope_lookup_local(c->global_scope, target_sym->name,
-                                            target_sym->name_len) != NULL);
-                    if (target_is_global) {
-                        checker_error(c, node->loc.line,
-                            "cannot store arena-derived pointer '%.*s' in "
-                            "global/static variable '%.*s' — pointer will dangle "
-                            "when arena is reset",
-                            (int)val_sym->name_len, val_sym->name,
-                            (int)target_sym->name_len, target_sym->name);
-                    }
-                    /* propagate arena-derived flag to target (alias tracking) */
-                    if (target_sym && !target_is_global) {
-                        target_sym->is_arena_derived = true;
-                        target_sym->is_from_arena = true;
-                    }
+                /* propagate arena-derived flag to a PLAIN LOCAL target (alias
+                 * tracking) — not for global/param sinks (those error above). */
+                if (target_sym && !target_is_global && !target_is_param) {
+                    target_sym->is_arena_derived = true;
+                    target_sym->is_from_arena = true;
                 }
             }
         }

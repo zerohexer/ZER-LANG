@@ -5,6 +5,47 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-708..719: escape-matrix expansion (35 cells)
+
+Un-pruned `tests/test_escape_matrix.c` from 20 → 35 cells (the secondary
+launder×sink combos that v1 deferred). It found **12 more false negatives** —
+unsafe local escapes compiling clean — in 3 clusters:
+
+- **Cluster A (BUG-708..713, 6):** value is a (field/index of a) call with a
+  local-derived arg, stored at a global / param-field / nested-field sink —
+  `g = idfn(&x)`, `h.p = wrapfn(&x).p`. The RETURN sink had this (BUG-360/383);
+  the assignment sinks did not.
+- **Cluster B (BUG-714..717, 4):** arena-derived pointer (direct or aliased)
+  stored into a param-field / nested-field — the arena escape check fired only
+  at global sinks.
+- **Cluster C (BUG-718..719, 2):** orelse-fallback `&local` stored into a
+  param-field / nested-field — the orelse-fallback check fired only at globals.
+
+**Fix:** same pattern as BUG-704..707 — route each check through
+`classify_escape_sink` so it fires at param sinks too. Cluster A adds a new
+block that walks the assignment value through field/index to a `NODE_CALL` and
+applies `call_has_local_derived_arg` (the conservative proxy the return sink
+uses).
+
+**Self-review catch (gated before the suite could):** Cluster A initially lacked
+the pointer/slice gate that BUG-360/383 have on the return sink — it would have
+over-rejected `g_int = count(&local)` (an int result is not a pointer escape).
+Added `type_dispatch_kind(value) == TYPE_POINTER || TYPE_SLICE` so it fires only
+when a pointer/slice actually flows out. Conservative within that gate
+(over-rejection of a non-retaining callee acceptable; under-rejection is not).
+
+`@ptrtoint`→global/param is intentionally left RETURN-only in the matrix:
+`@ptrtoint(&local)` yields a `usize` integer, not a pointer; the escape only
+re-materializes via `@inttoptr`, which the `mmio` requirement already guards.
+
+Escape matrix 23/35 → **35/35, 0 false negatives**. Full suite green (shape
+50/50, rust 784/784, no over-rejection regressions; type-dispatch gate clean).
+The escape FOUNDATION the `keep`-universalization builds on is now fully
+matrix-verified sound (no pruned-cell asterisk). See docs/universal_pointer.md
+PART 5.
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-704..707: escape-matrix false negatives
 
 The escape/lifetime soundness oracle `tests/test_escape_matrix.c` (NEW, the

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// Escape-matrix cluster B (2026-06-07): a local-arena-derived pointer stored
+// into a pointer-parameter's field must be rejected — it dangles when the arena
+// is reset. The arena escape check previously fired only at global sinks.
+struct Node { u32 v; }
+struct Holder { ?*Node hp; }
+void leak(*Holder h) {
+    u8[256] backing;
+    Arena ar = Arena.over(backing);
+    *Node n = ar.alloc(Node) orelse return;
+    h.hp = n;
+}
+i32 main() { return 0; }

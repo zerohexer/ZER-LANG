@@ -9966,12 +9966,17 @@ This is what makes a negative-only oracle trustworthy without positive cells.
 Axes (C enums, `-Wswitch`-enforced, no default — grid can't shrink): `EscDest`
 {return, global, param.field, nested.field} × `Launder` {direct, alias,
 @ptrcast, @ptrtoint, id-wash, wrapper, orelse-fb} × `Src` {local-var, local-arr,
-local-arena}. `cell_valid()` prunes to 20 meaningful cells.
+local-arena}. `cell_valid()` admits 35 meaningful cells (`@ptrtoint` is
+intentionally RETURN-only — integer path, mmio-guarded re-materialization).
 
-**Found 4 real false negatives on first run** (BUG-704..707, see BUGS-FIXED.md):
-global-via-@ptrcast, array→slice into param field, aliased-local into
-param/nested field. Root cause: the laundered escape checks fired only at global
-sinks, not pointer-param-field sinks; the global check didn't unwrap intrinsics.
+**Found 16 real false negatives total** (BUG-704..719, see BUGS-FIXED.md): first
+the initial 20-cell grid surfaced 4 (global-via-@ptrcast, array→slice into param
+field, aliased-local into param/nested); then un-pruning to 35 cells surfaced 12
+more in 3 clusters (call-result laundering at assignment sinks, arena-derived
+into param/nested, orelse-fallback `&local` into param/nested). Root cause across
+all: the laundered escape checks fired only at GLOBAL sinks, not pointer-param-
+field sinks; the global check didn't unwrap intrinsics; and the call-result check
+existed only for the return sink.
 
 **The fix — `classify_escape_sink()` (checker.c):** the shared escape-sink
 classifier. Walks any assignment target's field/index/deref chain to its root
@@ -9983,9 +9988,13 @@ sinks. **When adding a new escape check or a new value/target shape, use this
 helper** rather than re-deriving the global-vs-param classification inline — the
 H1-H4 holes existed precisely because the laundered checks each rolled their own
 global-only classification. Uses `type_dispatch_kind()` for its pointer test
-(distinct-unwrap gate compliance).
+(distinct-unwrap gate compliance). The orelse-fallback, arena-derived, and
+call-result (id-wash/wrapper) escape checks all route through it too; the
+call-result check is gated on the stored value being a pointer/slice (same as
+the return sink, BUG-360/383) so int-returning calls aren't over-rejected.
 
-After the fix: escape matrix 20/20, 0 false negatives. Wired into `make check`.
+After the fixes: escape matrix **35/35, 0 false negatives**. Wired into
+`make check`.
 
 **`keep` is call-site-verified, not trusted** (the soundness keystone): passing
 `&local` to a `keep` parameter is rejected (`local variable 'x' cannot satisfy

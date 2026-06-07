@@ -1,5 +1,11 @@
 // Rust pattern: *opaque stored in struct field — lifecycle tracking.
-// ZER: struct field *opaque with provenance through alloc/free cycle.
+// ZER: struct field *opaque with provenance through the driver.
+//
+// keep-universalization 2a (2026-06-07): driver_init STORES the device pointer
+// into the Driver for later reads, so `dev` must outlive the Driver — it is a
+// `keep` parameter. The device is a global Motor (satisfies keep). Passing a
+// local &motor here would be correctly rejected (it would dangle if the Driver
+// outlived the Motor).
 
 struct Driver {
     *opaque device;
@@ -8,7 +14,9 @@ struct Driver {
 
 struct Motor { u32 speed; u32 torque; }
 
-void driver_init(*Driver drv, *opaque dev) {
+Motor g_motor;
+
+void driver_init(*Driver drv, keep *opaque dev) {
     drv.device = dev;
     drv.status = 1;
 }
@@ -19,18 +27,17 @@ u32 driver_read_speed(*Driver drv) {
 }
 
 u32 main() {
-    Motor m;
-    m.speed = 3000;
-    m.torque = 50;
+    g_motor.speed = 3000;
+    g_motor.torque = 50;
 
     Driver drv;
-    driver_init(&drv, @ptrcast(*opaque, &m));
+    driver_init(&drv, @ptrcast(*opaque, &g_motor));
 
     u32 spd = driver_read_speed(&drv);
     if (spd != 3000) { return 1; }
 
     // Modify original, read through driver
-    m.speed = 6000;
+    g_motor.speed = 6000;
     spd = driver_read_speed(&drv);
     if (spd != 6000) { return 2; }
 

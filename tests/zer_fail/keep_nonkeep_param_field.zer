@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// keep-universalization 2a (2026-06-07): a NON-keep pointer parameter stored
+// into another pointer-parameter's field violates the non-keep contract (the
+// param's pointee may not outlive the caller's struct). Previously caught only
+// for global sinks (BUG-440); now caught for param-field sinks too. Fix: `keep p`.
+struct Holder { ?*u32 hp; }
+void store(*Holder h, *u32 p) {
+    h.hp = p;
+}
+i32 main() { return 0; }

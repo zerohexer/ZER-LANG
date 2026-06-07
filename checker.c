@@ -3533,25 +3533,22 @@ static Type *check_expr(Checker *c, Node *node) {
                     val_sym->func_node == NULL && /* parameters have no func_node */
                     vt && (vt->kind == TYPE_POINTER || vt->kind == TYPE_OPAQUE);
                 if (is_ptr_param) {
-                    Node *troot = node->assign.target;
-                    while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
-                        if (troot->kind == NODE_FIELD) troot = troot->field.object;
-                        else troot = troot->index_expr.object;
-                    }
-                    if (troot && troot->kind == NODE_IDENT) {
-                        Symbol *target_sym = scope_lookup(c->current_scope,
-                            troot->ident.name, (uint32_t)troot->ident.name_len);
-                        bool target_is_global = target_sym &&
-                            (target_sym->is_static ||
-                             scope_lookup_local(c->global_scope, target_sym->name,
-                                                target_sym->name_len) != NULL);
-                        if (target_is_global) {
-                            checker_error(c, node->loc.line,
-                                "cannot store non-keep pointer parameter '%.*s' in "
-                                "global/static '%.*s' — add 'keep' qualifier to parameter",
-                                (int)val_sym->name_len, val_sym->name,
-                                (int)target_sym->name_len, target_sym->name);
-                        }
+                    /* keep-universalization 2a: a non-keep pointer param persisted
+                     * into a global OR a pointer-param field/nested sink violates
+                     * the non-keep contract. Extends BUG-440 (global-only) to
+                     * param-field sinks via classify_escape_sink. Fix is `keep p`. */
+                    Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
+                    classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
+                    if (tgt_global || tgt_param) {
+                        checker_error(c, node->loc.line,
+                            tgt_param ?
+                            "cannot store non-keep pointer parameter '%.*s' through pointer "
+                            "parameter '%.*s' — add 'keep' qualifier to parameter '%.*s'" :
+                            "cannot store non-keep pointer parameter '%.*s' in "
+                            "global/static '%.*s' — add 'keep' qualifier to parameter '%.*s'",
+                            (int)val_sym->name_len, val_sym->name,
+                            (int)target_sym->name_len, target_sym->name,
+                            (int)val_sym->name_len, val_sym->name);
                     }
                 }
             }

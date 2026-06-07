@@ -4752,13 +4752,21 @@ The escape matrix is the standing guard — any boundary-default that trusts
 instead of checks surfaces as a new matrix HOLE.
 
 **Sequenced steps:**
-1. ✅ Escape-matrix oracle + close H1–H4 (foundation verified sound).
-2. As `keep` grows, extend the matrix's launder/dest axes (funcptr-stored,
-   cinclude-stored, generic-container-stored) — each new boundary gets a cell.
-3. Implement `keep` on struct fields / locals / cascade (Section 13.1), against
-   the matrix.
-4. For each boundary default: add the negative cell FIRST (must reject), then
-   the feature.
+1. ✅ Escape-matrix oracle (35 cells) + close all 16 escape holes (BUG-704..719)
+   — the local-escape foundation is fully matrix-verified sound.
+2. ✅ keep-2a reject-side (BUG-720): non-keep pointer param persisted into a
+   global / param-field / nested sink is rejected (was global-only); fix is
+   `keep p`, call-site-verified. Blast radius measured = 1 test (adapted). The
+   `keep` escape valve (keep param → field compiles) is verified.
+3. NEXT — **keep-axis oracle** (analogous to the escape matrix):
+   `{non-keep-param source} × {launder} × {persistent sink}`, with NEGATIVE
+   cells (must reject) AND POSITIVE cells (the `keep` valve must compile).
+   Closes the laundered non-keep-param holes tracked in limitations.md (alias,
+   @ptrcast-of-alias, call-result) by propagating non-keep-ness through aliases.
+4. Then `keep` on struct fields (field-level contract) / locals / cascade
+   (Section 13.1), against the keep oracle.
+5. For each boundary default (funcptr / cinclude / generic-container): add the
+   negative cell FIRST (must reject), then the feature.
 
 ## 35. Reconciliation with prior parts (per the PART 4 discipline)
 

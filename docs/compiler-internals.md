@@ -9988,10 +9988,14 @@ sinks. **When adding a new escape check or a new value/target shape, use this
 helper** rather than re-deriving the global-vs-param classification inline — the
 H1-H4 holes existed precisely because the laundered checks each rolled their own
 global-only classification. Uses `type_dispatch_kind()` for its pointer test
-(distinct-unwrap gate compliance). The orelse-fallback, arena-derived, and
-call-result (id-wash/wrapper) escape checks all route through it too; the
+(distinct-unwrap gate compliance). The orelse-fallback, arena-derived,
+call-result (id-wash/wrapper), AND the non-keep-pointer-param store check
+(BUG-440/720, keep-universalization 2a) all route through it too; the
 call-result check is gated on the stored value being a pointer/slice (same as
 the return sink, BUG-360/383) so int-returning calls aren't over-rejected.
+**Pattern for any new escape/persistence check: classify the sink with
+`classify_escape_sink` (global OR param-ptr), never roll your own global-only
+root walk — that asymmetry is what produced every one of these holes.**
 
 After the fixes: escape matrix **35/35, 0 false negatives**. Wired into
 `make check`.

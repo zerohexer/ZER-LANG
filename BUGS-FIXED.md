@@ -5,6 +5,42 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-720: keep-universalization 2a (param-field sink)
+
+First increment of `keep`-universalization (docs/universal_pointer.md PART 5
+step 2). Extends the non-keep-pointer-param store check from BUG-440 (global
+sinks only) to **pointer-param-field / nested-field sinks** via
+`classify_escape_sink` — the same sink classifier the escape-matrix fixes use.
+
+**BUG-720 — non-keep pointer param persisted into a param field.** `h.field = p`
+where `p` is a non-keep `*T`/`*opaque` param and `h` is a pointer param violated
+the non-keep contract ("non-keep = won't be stored persistently") but compiled
+clean (BUG-440 only checked global sinks). Combined with a call site passing
+`&local` to `p`, that's a real escape (the local's address ends up persisted in
+the caller's struct). Fix: the check now fires at param-field sinks too; the
+remedy is `keep p` (verified at the call site — `&local` to a `keep` param is
+rejected, cascading to a real long-lived source).
+
+**Blast radius measured before shipping:** exactly 1 existing test broke —
+`rt_opaque_struct_field_track`, which did `drv.device = dev` (non-keep `*opaque`
+param) and passed `&local_motor` at the call site. That is the textbook
+contract-violation/potential-UAF the rule catches; fixed correctly by adding
+`keep *opaque dev` and making the device a global Motor (so `keep` is
+satisfiable). Not a migration — a one-test adaptation to a correct new rule.
+
+**Tests:**
+- `tests/zer_fail/keep_nonkeep_param_field.zer` — non-keep param → param field rejected
+- `tests/zer/keep_param_field_ok.zer` — `keep` param → param field compiles + runs
+- `rust_tests/rt_opaque_struct_field_track.zer` — adapted to the keep contract
+
+**Known residual (tracked in limitations.md):** the keep axis has its own
+laundering surface not yet covered — a non-keep param aliased through a local
+(`*T q = p; h.field = q;`) or other launders before the field store. These are
+pre-existing holes (keep-2a closes the DIRECT case, introduces none). A dedicated
+keep-axis oracle (analogous to the escape matrix) is the next step.
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-708..719: escape-matrix expansion (35 cells)
 
 Un-pruned `tests/test_escape_matrix.c` from 20 → 35 cells (the secondary

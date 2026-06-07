@@ -1,0 +1,15 @@
+// keep-universalization 2a (2026-06-07): the `keep` escape valve — a `keep`
+// pointer parameter CAN be stored into a struct field (caller guarantees the
+// pointee outlives the field). Must compile + run + exit 0.
+struct Holder { ?*u32 hp; }
+u32 gv = 42;
+void store(*Holder h, keep *u32 p) {
+    h.hp = p;
+}
+u32 main() {
+    Holder box;
+    store(&box, &gv);
+    *u32 got = box.hp orelse { return 1; };
+    if (got[0] != 42) { return 2; }
+    return 0;
+}

@@ -5,6 +5,26 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — concurrency oracle (data-race/spawn/deadlock, 0 holes)
+
+Built `tests/test_conc_matrix.c` — the first non-memory-frontier oracle (Domain 1
+of the limitations.md frontier roadmap). 15 cells, NEG + POS, `-Wswitch`-enforced.
+NEG: spawn non-shared ptr, spawn non-shared global (direct + transitive via
+callee), deadlock same-statement, spawn-in-@critical, ThreadHandle not joined
+(direct + joined-in-only-one-branch), Slab-access from spawn. POS: shared
+auto-lock, scoped spawn+join (incl. both-branches), value args, separate-statement
+shared access, threadlocal.
+
+**Result: 15/15, 0 holes — regression lock-in, no bug found.** Unlike the pointer
+axes (24 holes this session), the concurrency checks are structural bans (Model
+3/4: spawn-body global scan w/ 8-level transitivity, lock-ordering deadlock
+detection, ThreadHandle join-state CFG merge) and held up including the edge
+cases that found holes elsewhere (transitive global at depth, one-branch join).
+No checker/zercheck change — test-only + Makefile wiring. Standing guard for the
+concurrency domain. limitations.md Domain 1 marked done.
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-728: keep-axis struct-copy launder (boundary audit)
 
 Auditing keep-universalization step 5 (boundary defaults — funcptr / cinclude /

@@ -18,6 +18,7 @@ acceptable but logged). Each is built + run by `make check`.
 | Escape | `tests/test_escape_matrix.c` | 35 | local-pointer escape × launder × sink | green |
 | Keep | `tests/test_keep_matrix.c` | 21 | non-keep-param persistence × launder × sink (+ keep valve) | green |
 | Control-flow | `tests/test_cflow_matrix.c` | 38 | if/loop/switch/break/continue/defer merges × {pool,slab} | green |
+| Concurrency | `tests/test_conc_matrix.c` | 15 | data-race / spawn / deadlock / ThreadHandle join | green |
 
 **Pointer-lifetime axis ("universal pointer") is DONE** (2026-06-07): the
 compile-time `keep` model (PART 5 of `docs/universal_pointer.md`) — all 5 steps
@@ -45,13 +46,19 @@ Many rules here ARE accept/reject (oracle-able like the memory matrices); a few
 (shared-struct auto-lock *correctness*) are emission-correctness, not accept/
 reject, and need an emit-inspection check instead.
 
-**Domain 1 — data-race / spawn / deadlock** (highest value, most accept/reject):
-- `spawn f(&local)` non-shared pointer → reject (unless scoped ThreadHandle+join)
-- `spawn` target accessing non-shared global → reject (no sync) / warn (has @atomic)
-- Handle/Slab/Pool/Ring accessed from `spawn` → reject (non-atomic metadata)
-- same-statement access to 2+ shared types → reject (deadlock); cross-statement OK
-- `spawn` in `@critical` → reject; ThreadHandle not joined before exit → reject
-- POS: `shared struct` auto-locked field access compiles; scoped spawn + join compiles
+**Domain 1 — data-race / spawn / deadlock — DONE (2026-06-07).**
+`tests/test_conc_matrix.c`, 15/15, **0 holes found** (regression lock-in — the
+spawn/deadlock/join checks are structural bans, built with extensive
+Rust-equivalent tests, and held up including the edge cases that found holes in
+other domains: transitive non-shared global at call depth, Slab-access from
+spawn, and ThreadHandle joined in only one branch). Covered NEG: spawn
+non-shared ptr, spawn non-shared global (direct + transitive), deadlock
+same-statement, spawn-in-@critical, ThreadHandle not joined (direct +
+one-branch). POS: shared auto-lock, scoped spawn+join (incl. join-both-branches),
+value args, separate-statement shared access, threadlocal. Residual (add when
+convenient): `shared(rw)` concurrent-reader same-statement, Ring/Pool-from-spawn
+(only Slab tested), condvar/@barrier/@once interactions, deeper deadlock cycles
+(A→B→C ordering).
 
 **Domain 2 — ISR / atomics / MMIO** (hardware-facing, dead-branch pattern):
 - shared global without `volatile` accessed in `interrupt` handler → reject

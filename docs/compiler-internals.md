@@ -10105,3 +10105,28 @@ applies every defer to every return block (no scope tracking), so this
 over-rejects the rare `if (c) { free(h); return; } defer free(h);` ordering —
 acceptable per the soundness criterion (over-reject OK, under-reject is the
 hole). After the fix: cflow-matrix **38/38**. Wired into `make check`.
+
+---
+
+## Concurrency Oracle — `tests/test_conc_matrix.c` (2026-06-07)
+
+The fifth oracle and the FIRST for the non-memory frontier (data-race / spawn /
+deadlock). Flat scenario list (concurrency has no pool/slab type axis), NEG+POS,
+`-Wswitch`-enforced. NEG: spawn non-shared ptr, spawn non-shared global (direct
++ transitive via callee), deadlock same-statement (two shared types), spawn in
+`@critical`, ThreadHandle not joined (direct + joined-in-only-one-branch),
+Slab-access from spawn. POS: shared-struct auto-lock, scoped spawn + join (incl.
+join-in-both-branches), value args, separate-statement shared access, threadlocal.
+
+Integrity guard: a NEG rejection must name a concurrency reason (data race /
+deadlock / non-shared / not joined / @critical / spawn / thread), not a parse
+error.
+
+**Result: 15/15, 0 holes** — regression lock-in, not a hole-finder. Unlike the
+pointer axes (24 holes), the concurrency checks are structural bans (Model 3/4:
+spawn-body global scan with 8-level transitivity, lock-ordering deadlock
+detection, ThreadHandle join-state CFG merge) that held up on the edge cases.
+Syntax note for extending it: spawn params to a shared struct are plain `*Struct`
+(the `shared` lives on the struct decl, NOT `*shared Struct`); `@critical { }` is
+a block; `ThreadHandle th = spawn f(&w); th.join();` is the scoped form. Wired
+into `make check`.

@@ -9914,3 +9914,43 @@ checked guarantee, not a sample.
 `make check` builds + runs `test_shape_matrix` (standalone, drives the zerc
 binary like `test_semantic_fuzz`). Exit non-zero with a printed coverage
 matrix + the offending program when any cell GAPs.
+
+### Known open gap surfaced by the extended matrix — BUG-703 (2026-06-07)
+
+Extending the grid with the move-struct sub-matrix surfaced a second
+pre-existing bug (the leak gap above was the first): **move-struct field
+passed BY VALUE to a function is falsely rejected as use-after-move on the
+transfer line itself.**
+
+```zer
+move struct M { u32 fd; }
+struct Wrap { M inner; }
+void consume(M mm) { }
+i32 main() {
+    Wrap w;
+    w.inner.fd = 1;
+    consume(w.inner);   // FALSELY rejected: "use after move ... at line 7"
+    return 0;
+}
+```
+
+Cause: `consume(w.inner)` lowers to `tmp = w.inner` (IR_FIELD_READ into a
+temp) + `IR_CALL consume(tmp)`. The FIELD_READ runs the Gap A3 move-transfer
+(transfers compound `w.inner` at line L), then the IR_CALL move loop reads the
+original arg `w.inner` and re-reports it as use-after-move on the same line L.
+Spawn dodges it — spawn args aren't decomposed into FIELD_READ temps.
+
+Naive fix (skip FIELD_READ transfer when dest is a temp) REGRESSES
+`move_field_read_uam` — var-decls (`Tok first = b.inner`) also materialize
+through temps, so the guard turns a real use-after-move into a false NEGATIVE
+(a safety hole, strictly worse than the over-rejection). Reverted.
+
+Correct fix needs a same-line discriminator applied across all 5 move report
+sites (skip the use-after-move report when `free_line == inst->source_line`,
+i.e. the transfer is the arg's own materialization, not a prior move) —
+deferred as focused follow-up. Only the SAFE (positive) cell is affected; the
+real use-after-move IS still caught (the negative cell passes).
+
+Tracked in `test_shape_matrix.c` as a KNOWN-GAP tripwire: the cell asserts the
+program is currently (wrongly) rejected, so when BUG-703 is fixed the assertion
+flips, the grid fails, and the `cell_known_gap` entry must be removed.

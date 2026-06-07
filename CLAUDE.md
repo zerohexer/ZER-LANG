@@ -2350,6 +2350,22 @@ After any bug fix or feature change that passes `make check`, update ALL relevan
 - `ZER-LANG.md` — if spec behavior changed
 - `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed
 
+**GAPS / LIMITATIONS / TECH DEBT GO IN `docs/limitations.md` — MANDATORY.**
+Any open bug, deferred fix, over-rejection, coverage gap, known-flaky test, or
+"can't do this yet because X" goes in `docs/limitations.md` as a `## OPEN — …`
+entry with: symptom, root cause, why the obvious fix is wrong (if applicable),
+fix sketch, and any tripwire test. This is the SEPARATION OF CONCERNS:
+- `docs/compiler-internals.md` = durable architecture + how-to a future session
+  must remember. Read once, applies forever. NOT a place to bury open problems.
+- `docs/limitations.md` = the living tech-debt ledger. Problems, gaps, deferred
+  fixes. Entries removed once fixed.
+A gap written only into compiler-internals.md (or only a commit message, or only
+a code comment) is effectively lost — it won't be found when someone goes
+looking for "what's broken / what's left." compiler-internals.md MAY mention a
+gap, but only as a one-line pointer to the limitations.md entry that owns it.
+When you defer or discover a limitation, add the limitations.md entry in the
+SAME commit. When you fix one, remove its entry in the SAME commit.
+
 **Only update docs after `make check` passes and you have high confidence the change is correct.** Do not update docs for speculative or in-progress work.
 
 ### Compiler Crash Debugging — Use ASan

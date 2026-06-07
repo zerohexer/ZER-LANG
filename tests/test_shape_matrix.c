@@ -71,7 +71,7 @@ static int run_one(const char *name, const char *code, int expect_fail) {
 
 /* ---- Grid axes ---- */
 typedef enum { TY_POOL, TY_SLAB, TY_MOVE, TYPE_KIND_COUNT } TypeK;
-typedef enum { SH_BARE, SH_FIELD, SH_ARRAY, SH_FNARG, SH_SPAWN, SHAPE_COUNT } ShapeKind;
+typedef enum { SH_BARE, SH_FIELD, SH_ARRAY, SH_FNARG, SH_SPAWN, SH_DEREF, SHAPE_COUNT } ShapeKind;
 typedef enum { V_UAF, V_DOUBLE_FREE, V_LEAK, V_USE_AFTER_MOVE, VIOL_COUNT } Violation;
 
 static const char *type_name(TypeK t) {
@@ -90,6 +90,7 @@ static const char *shape_name(ShapeKind s) {
         case SH_ARRAY: return "array[0]";
         case SH_FNARG: return "fnarg(xfn)";
         case SH_SPAWN: return "spawn-arg";
+        case SH_DEREF: return "deref(&p.f)";
         case SHAPE_COUNT: break;
     }
     return "?";
@@ -129,16 +130,21 @@ static int cell_known_gap(TypeK t, ShapeKind s, Violation v, int neg) {
 static int cell_valid(TypeK t, ShapeKind s, Violation v) {
     switch (t) {
         case TY_POOL:
-            /* free/leak violations across the storage shapes (not spawn) */
+            /* free/leak violations across the storage shapes */
             if (v == V_USE_AFTER_MOVE) return 0;
-            if (s == SH_SPAWN) return 0;
+            if (s != SH_BARE && s != SH_FIELD && s != SH_ARRAY && s != SH_FNARG)
+                return 0;
             return 1;
         case TY_SLAB:
-            /* *T via alloc_ptr/free_ptr — bare + cross-function only (*T-in-
-             * struct/array is a separate non-null concern, out of scope here) */
+            /* *T via alloc_ptr/free_ptr. bare + cross-function for uaf/df/leak
+             * (*T-in-struct/array is a separate non-null concern, out of scope).
+             * SH_DEREF = interior pointer alias (`*u32 q = &p.id`) — UAF only:
+             * the BUG-463 class where a pointer derived from a freed allocation
+             * is used. */
             if (v == V_USE_AFTER_MOVE) return 0;
-            if (s != SH_BARE && s != SH_FNARG) return 0;
-            return 1;
+            if (s == SH_DEREF) return v == V_UAF;
+            if (s == SH_BARE || s == SH_FNARG) return 1;
+            return 0;
         case TY_MOVE:
             /* ownership transfer — only use-after-move; bare/field/spawn */
             if (v != V_USE_AFTER_MOVE) return 0;
@@ -166,6 +172,7 @@ static void pool_prologue(ShapeKind s, char *out, size_t n, const char **ref) {
         case SH_ARRAY:
             snprintf(out, n, "    Handle(T)[2] arr;\n    arr[0] = gp.alloc() orelse return;\n"); *ref = "arr[0]"; return;
         case SH_SPAWN:
+        case SH_DEREF:
         case SHAPE_COUNT: break;
     }
     out[0] = 0; *ref = "h";
@@ -205,6 +212,25 @@ static const char *SLAB_DECLS =
     "void freep(*S pp) { gs.free_ptr(pp); }\n";
 
 static void gen_slab(ShapeKind s, Violation v, int neg, char *buf, size_t n) {
+    /* SH_DEREF: interior pointer alias (BUG-463 class). `*u32 q = &p.id` shares
+     * p's allocation; using q after free_ptr(p) is UAF through the interior ptr. */
+    if (s == SH_DEREF) {
+        char body[768]; int p = 0;
+        p += snprintf(body+p, sizeof(body)-p, "    *S p = gs.alloc_ptr() orelse return;\n");
+        p += snprintf(body+p, sizeof(body)-p, "    p.id = 1;\n");
+        p += snprintf(body+p, sizeof(body)-p, "    *u32 q = &p.id;\n");
+        if (neg) {
+            p += snprintf(body+p, sizeof(body)-p, "    gs.free_ptr(p);\n");
+            p += snprintf(body+p, sizeof(body)-p, "    u32 z = q[0];\n    return (i32)z;\n"); /* UAF */
+        } else {
+            p += snprintf(body+p, sizeof(body)-p, "    u32 z = q[0];\n");   /* use before free */
+            p += snprintf(body+p, sizeof(body)-p, "    gs.free_ptr(p);\n");
+            p += snprintf(body+p, sizeof(body)-p, "    if (z != 1) { return 1; }\n    return 0;\n");
+        }
+        snprintf(buf, n, "%si32 main() {\n%s}\n", SLAB_DECLS, body);
+        return;
+    }
+
     char freed[64];
     if (s == SH_FNARG) snprintf(freed, sizeof(freed), "    freep(p);\n");
     else               snprintf(freed, sizeof(freed), "    gs.free_ptr(p);\n");
@@ -251,7 +277,7 @@ static void gen_move(ShapeKind s, int neg, char *buf, size_t n) {
                      "    ThreadHandle th = spawn mworker(w.inner);\n    th.join();\n");
             snprintf(ref, sizeof(ref), "w.inner.fd");
             break;
-        case SH_ARRAY: case SH_FNARG: case SHAPE_COUNT:
+        case SH_ARRAY: case SH_FNARG: case SH_DEREF: case SHAPE_COUNT:
             setup[0] = transfer[0] = 0; snprintf(ref, sizeof(ref), "m.fd"); break;
     }
     char body[768]; int p = 0;

@@ -9901,13 +9901,23 @@ origin). Post-fix 24/24.
 
 ### Extending the grid
 
-Add a new reach-shape (e.g., `SH_DEREF` for interior-pointer alias,
-`SH_SPAWN` for spawn-arg move-struct) or a new tracked type by extending the
-enum + the switch arms. `-Wswitch` will list every site that needs a case.
-Future axes worth adding: tracked-type dimension (Pool Handle is covered;
-add `*T`/alloc_ptr, `*opaque`/extern, move struct) and use-after-move /
-cross-module-summary violations. Each new cell is a permanent, exhaustively
-checked guarantee, not a sample.
+Add a new reach-shape or tracked type by extending the enum + the switch arms.
+`-Wswitch` lists every site that needs a case (the discipline that keeps the
+grid exhaustive). Each new cell is a permanent, exhaustively checked guarantee,
+not a sample.
+
+**Currently covered (22 valid cells):**
+- types: `TY_POOL` (Handle), `TY_SLAB` (`*T` via alloc_ptr/free_ptr), `TY_MOVE`
+  (move struct)
+- shapes: `SH_BARE`, `SH_FIELD` (`s.h`), `SH_ARRAY` (`arr[0]`), `SH_FNARG`
+  (cross-function free), `SH_SPAWN` (move field through spawn — GAP-C),
+  `SH_DEREF` (interior-pointer alias `*u32 q = &p.id` — BUG-463 class)
+- violations: `V_UAF`, `V_DOUBLE_FREE`, `V_LEAK`, `V_USE_AFTER_MOVE`
+
+**Deferred axes** (`*opaque`/extern row, cross-module-compound / 2D shape
+redesign) and the open over-rejection (BUG-703) are tracked in
+`docs/limitations.md` with reproducers + fix sketches. When an axis is added,
+update the coverage list above and remove its limitations.md entry.
 
 ### Wiring
 
@@ -9915,42 +9925,11 @@ checked guarantee, not a sample.
 binary like `test_semantic_fuzz`). Exit non-zero with a printed coverage
 matrix + the offending program when any cell GAPs.
 
-### Known open gap surfaced by the extended matrix — BUG-703 (2026-06-07)
+### Known open gap surfaced by the extended matrix — BUG-703
 
-Extending the grid with the move-struct sub-matrix surfaced a second
-pre-existing bug (the leak gap above was the first): **move-struct field
-passed BY VALUE to a function is falsely rejected as use-after-move on the
-transfer line itself.**
-
-```zer
-move struct M { u32 fd; }
-struct Wrap { M inner; }
-void consume(M mm) { }
-i32 main() {
-    Wrap w;
-    w.inner.fd = 1;
-    consume(w.inner);   // FALSELY rejected: "use after move ... at line 7"
-    return 0;
-}
-```
-
-Cause: `consume(w.inner)` lowers to `tmp = w.inner` (IR_FIELD_READ into a
-temp) + `IR_CALL consume(tmp)`. The FIELD_READ runs the Gap A3 move-transfer
-(transfers compound `w.inner` at line L), then the IR_CALL move loop reads the
-original arg `w.inner` and re-reports it as use-after-move on the same line L.
-Spawn dodges it — spawn args aren't decomposed into FIELD_READ temps.
-
-Naive fix (skip FIELD_READ transfer when dest is a temp) REGRESSES
-`move_field_read_uam` — var-decls (`Tok first = b.inner`) also materialize
-through temps, so the guard turns a real use-after-move into a false NEGATIVE
-(a safety hole, strictly worse than the over-rejection). Reverted.
-
-Correct fix needs a same-line discriminator applied across all 5 move report
-sites (skip the use-after-move report when `free_line == inst->source_line`,
-i.e. the transfer is the arg's own materialization, not a prior move) —
-deferred as focused follow-up. Only the SAFE (positive) cell is affected; the
-real use-after-move IS still caught (the negative cell passes).
-
-Tracked in `test_shape_matrix.c` as a KNOWN-GAP tripwire: the cell asserts the
-program is currently (wrongly) rejected, so when BUG-703 is fixed the assertion
-flips, the grid fails, and the `cell_known_gap` entry must be removed.
+The move-struct sub-matrix surfaced a second pre-existing bug (the leak gap
+above was the first): move-struct field passed BY VALUE to a function
+(`consume(w.inner)`) is falsely rejected as use-after-move. Full reproducer,
+root cause, the reverted-naive-fix lesson, and the fix sketch live in
+`docs/limitations.md` (OPEN — BUG-703). Tracked in `test_shape_matrix.c` as a
+KNOWN-GAP tripwire so it can't be silently forgotten or silently fixed.

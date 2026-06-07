@@ -71,7 +71,8 @@ static int run_one(const char *name, const char *code, int expect_fail) {
 
 /* ---- Grid axes ---- */
 typedef enum { TY_POOL, TY_SLAB, TY_MOVE, TYPE_KIND_COUNT } TypeK;
-typedef enum { SH_BARE, SH_FIELD, SH_ARRAY, SH_FNARG, SH_SPAWN, SH_DEREF, SHAPE_COUNT } ShapeKind;
+typedef enum { SH_BARE, SH_FIELD, SH_ARRAY, SH_FNARG, SH_SPAWN, SH_DEREF,
+               SH_FIELD_XFN, SHAPE_COUNT } ShapeKind;
 typedef enum { V_UAF, V_DOUBLE_FREE, V_LEAK, V_USE_AFTER_MOVE, VIOL_COUNT } Violation;
 
 static const char *type_name(TypeK t) {
@@ -91,6 +92,7 @@ static const char *shape_name(ShapeKind s) {
         case SH_FNARG: return "fnarg(xfn)";
         case SH_SPAWN: return "spawn-arg";
         case SH_DEREF: return "deref(&p.f)";
+        case SH_FIELD_XFN: return "field-xfn";
         case SHAPE_COUNT: break;
     }
     return "?";
@@ -133,9 +135,13 @@ static int cell_known_gap(TypeK t, ShapeKind s, Violation v, int neg) {
 static int cell_valid(TypeK t, ShapeKind s, Violation v) {
     switch (t) {
         case TY_POOL:
-            /* free/leak violations across the storage shapes */
+            /* free/leak violations across the storage shapes.
+             * SH_FIELD_XFN = field-stored handle freed CROSS-FUNCTION with a
+             * compound arg (`freeit(b.h)`) — the GAP-A pattern (silent
+             * cross-function double-free of a compound). */
             if (v == V_USE_AFTER_MOVE) return 0;
-            if (s != SH_BARE && s != SH_FIELD && s != SH_ARRAY && s != SH_FNARG)
+            if (s != SH_BARE && s != SH_FIELD && s != SH_ARRAY &&
+                s != SH_FNARG && s != SH_FIELD_XFN)
                 return 0;
             return 1;
         case TY_SLAB:
@@ -171,6 +177,7 @@ static void pool_prologue(ShapeKind s, char *out, size_t n, const char **ref) {
         case SH_FNARG:
             snprintf(out, n, "    Handle(T) h = gp.alloc() orelse return;\n"); *ref = "h"; return;
         case SH_FIELD:
+        case SH_FIELD_XFN:  /* same storage as SH_FIELD; differs only in free path */
             snprintf(out, n, "    Box b;\n    b.h = gp.alloc() orelse return;\n"); *ref = "b.h"; return;
         case SH_ARRAY:
             snprintf(out, n, "    Handle(T)[2] arr;\n    arr[0] = gp.alloc() orelse return;\n"); *ref = "arr[0]"; return;
@@ -184,8 +191,12 @@ static void gen_pool(ShapeKind s, Violation v, int neg, char *buf, size_t n) {
     char prologue[256]; const char *ref = "h";
     pool_prologue(s, prologue, sizeof(prologue), &ref);
     char freed[128];
-    if (s == SH_FNARG) snprintf(freed, sizeof(freed), "    freeit(%s);\n", ref);
-    else               snprintf(freed, sizeof(freed), "    gp.free(%s);\n", ref);
+    /* SH_FNARG and SH_FIELD_XFN free CROSS-FUNCTION (via freeit), exercising
+     * FuncSummary.frees_param — SH_FIELD_XFN with a compound arg (b.h) is GAP-A. */
+    if (s == SH_FNARG || s == SH_FIELD_XFN)
+        snprintf(freed, sizeof(freed), "    freeit(%s);\n", ref);
+    else
+        snprintf(freed, sizeof(freed), "    gp.free(%s);\n", ref);
 
     char body[768]; int p = 0;
     p += snprintf(body + p, sizeof(body) - p, "%s", prologue);
@@ -280,7 +291,8 @@ static void gen_move(ShapeKind s, int neg, char *buf, size_t n) {
                      "    ThreadHandle th = spawn mworker(w.inner);\n    th.join();\n");
             snprintf(ref, sizeof(ref), "w.inner.fd");
             break;
-        case SH_ARRAY: case SH_FNARG: case SH_DEREF: case SHAPE_COUNT:
+        case SH_ARRAY: case SH_FNARG: case SH_DEREF: case SH_FIELD_XFN:
+        case SHAPE_COUNT:
             setup[0] = transfer[0] = 0; snprintf(ref, sizeof(ref), "m.fd"); break;
     }
     char body[768]; int p = 0;

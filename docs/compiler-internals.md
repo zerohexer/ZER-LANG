@@ -9906,12 +9906,14 @@ Add a new reach-shape or tracked type by extending the enum + the switch arms.
 grid exhaustive). Each new cell is a permanent, exhaustively checked guarantee,
 not a sample.
 
-**Currently covered (22 valid cells):**
+**Currently covered (25 valid cells):**
 - types: `TY_POOL` (Handle), `TY_SLAB` (`*T` via alloc_ptr/free_ptr), `TY_MOVE`
   (move struct)
 - shapes: `SH_BARE`, `SH_FIELD` (`s.h`), `SH_ARRAY` (`arr[0]`), `SH_FNARG`
-  (cross-function free), `SH_SPAWN` (move field through spawn — GAP-C),
-  `SH_DEREF` (interior-pointer alias `*u32 q = &p.id` — BUG-463 class)
+  (bare arg, cross-function free), `SH_FIELD_XFN` (field-stored handle freed
+  cross-function with a compound arg `freeit(b.h)` — the GAP-A pattern),
+  `SH_SPAWN` (move field through spawn — GAP-C), `SH_DEREF` (interior-pointer
+  alias `*u32 q = &p.id` — BUG-463 class)
 - violations: `V_UAF`, `V_DOUBLE_FREE`, `V_LEAK`, `V_USE_AFTER_MOVE`
 
 **Deferred axes** (`*opaque`/extern row, cross-module-compound / 2D shape

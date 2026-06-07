@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// BUG-704: spawn inside a loop. Without the use-after-move check on
+// the spawn handler, iterations 2..N silently passed the moved-from
+// value to new threads — a guaranteed UAF at runtime since each
+// worker thread assumes it owns the value.
+move struct Tok { u32 kind; }
+void worker(Tok t) { }
+i32 main() {
+    Tok t;
+    t.kind = 1;
+    for (u32 i = 0; i < 3; i += 1) {
+        spawn worker(t);   // iteration 0 ok; iteration 1+ use-after-move
+    }
+    return 0;
+}

@@ -1615,6 +1615,37 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             IRHandleInfo *h = (path_len == 0)
                 ? ir_find_handle(ps, root_local)
                 : ir_find_compound_handle(ps, root_local, path, path_len);
+
+            /* BUG-704 (Session 2026-06-07 audit): use-after-move check on
+             * spawn arguments was missing. IR_CALL has the equivalent check
+             * at line 2735+; spawn dodged because its args aren't decomposed
+             * into IR_FIELD_READ temps (per the BUG-703 commit note), so
+             * neither the field-read move-loop nor IR_CALL's move-loop
+             * runs over a spawn arg. Without this check:
+             *   spawn worker(t); spawn worker(t);     — silently accepted
+             *   spawn worker(b.t); spawn worker(b.t); — silently accepted
+             *   for (..) spawn worker(t);             — silently accepted
+             * The second/loop-iteration transfer just overwrites the state,
+             * losing the diagnostic. Mirror IR_CALL: check existing state
+             * before re-transferring. Place BEFORE auto-register so the
+             * newly-created ALIVE handle from auto-register isn't flagged. */
+            if (h && h->state == IR_HS_TRANSFERRED &&
+                root_local < func->local_count) {
+                if (path_len == 0) {
+                    ir_zc_error(zc, inst->source_line,
+                        "use after move: '%.*s' ownership transferred at line %d",
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name, h->free_line);
+                } else {
+                    ir_zc_error(zc, inst->source_line,
+                        "use after move: compound '%.*s' on local '%.*s' "
+                        "transferred at line %d",
+                        (int)path_len, path,
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name, h->free_line);
+                }
+            }
+
             if (!h && root_local < func->local_count) {
                 /* Auto-register move-struct args (bare or compound) so
                  * TRANSFERRED can be observed. For compound paths, walk

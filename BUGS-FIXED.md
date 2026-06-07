@@ -5,6 +5,88 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (audit cont.) — BUG-704: spawn missing use-after-move check
+
+### BUG-704 (CRITICAL) — `spawn worker(t)` twice silently accepted on move-struct
+
+**Symptom:** under-rejection (silent unsafe) — the spawn handler marked an
+argument TRANSFERRED but never checked whether the argument was *already*
+TRANSFERRED on entry. So any second use through `spawn` (double-spawn, scoped
+double-spawn, or `spawn` in a loop) silently re-transferred the value with no
+diagnostic. Worst shape — `spawn` in a loop — would spawn N threads that all
+believe they own the same moved-out-of value, a guaranteed runtime UAF.
+
+Reproducers (all compiled clean before the fix):
+```zer
+move struct Tok { u32 kind; } void worker(Tok t) { }
+i32 main() {
+    Tok t; t.kind = 1;
+    spawn worker(t); spawn worker(t);      // bare:    no diagnostic
+    return 0;
+}
+
+move struct Tok { u32 kind; } struct Box { Tok t; } void worker(Tok t) { }
+i32 main() {
+    Box b; b.t.kind = 1;
+    spawn worker(b.t); spawn worker(b.t);  // compound: no diagnostic
+    return 0;
+}
+
+move struct Tok { u32 kind; } void worker(Tok t) { }
+i32 main() {
+    Tok t; t.kind = 1;
+    for (u32 i = 0; i < 3; i += 1) {
+        spawn worker(t);                   // loop: silent runtime UAF
+    }
+    return 0;
+}
+```
+
+**Root cause:** `zercheck_ir.c` IR_NOP/NODE_SPAWN handler (line ~1606-1676)
+processed each arg with `ir_extract_compound_key` + `ir_find_handle`/
+`ir_find_compound_handle`, then unconditionally wrote
+`h->state = IR_HS_TRANSFERRED; h->free_line = inst->source_line;`. No
+use-before-transfer check. IR_CALL (line ~2735+) *does* have the equivalent
+check — but spawn arguments aren't decomposed into IR_FIELD_READ temps
+(per the BUG-703 commit note), so the IR_FIELD_READ move-loop never fires
+on spawn args either. Result: spawn was the one move-consuming op in the
+language with no use-before-transfer guard.
+
+Read-after-spawn (`u32 k = t.kind;` after `spawn worker(t);`) was already
+correctly caught — that path goes through IR_FIELD_READ on `t.kind` which
+runs the regular UAF/move walker. Only "consume the moved-from value via
+another move-consuming op (another spawn)" was missed.
+
+**Fix:** mirror IR_CALL's pattern in the spawn arg loop. Before the
+auto-register/transfer block, check `h && h->state == IR_HS_TRANSFERRED`
+and emit a use-after-move diagnostic with the prior `free_line`. Bare and
+compound get distinct messages. Newly auto-registered handles aren't
+flagged because the check runs BEFORE auto-register.
+
+**Why no false-positive on legitimate single-spawn:** the check fires only
+on pre-existing TRANSFERRED handles. A first spawn of a never-tracked move
+struct goes through auto-register (state=ALIVE) → transfer; the check sees
+nothing on entry. A first spawn of a tracked-ALIVE handle goes straight to
+transfer; the check sees ALIVE not TRANSFERRED.
+
+**Why no spurious re-report on same spawn's duplicate args:** `spawn
+worker(t, t)` with the same arg twice — iteration 0 marks TRANSFERRED,
+iteration 1 fires the new check. That IS use-after-move semantically (the
+spawned thread receives the same moved-out value twice) and the diagnostic
+is appropriate.
+
+**Tests:**
+- `tests/zer_fail/spawn_double_bare_uam.zer` — bare double-spawn rejected
+- `tests/zer_fail/spawn_double_field_uam.zer` — compound double-spawn rejected
+- `tests/zer_fail/spawn_loop_uam.zer` — loop spawn rejected
+- `tests/zer/spawn_single_move_ok.zer` — positive control: single spawn still OK
+- Existing matrix `tests/test_shape_matrix.c` move/spawn/use-after-move
+  cell continues to pass (read-after-spawn was already covered)
+
+Full suite green (669/669 zer + ALL TESTS PASSED).
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-703: move-field by-value over-rejection
 
 ### BUG-703 (over-rejection) — `consume(w.inner)` falsely rejected as use-after-move

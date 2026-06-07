@@ -1,0 +1,12 @@
+// Positive control for BUG-704 fix: a single spawn of a move-struct
+// value must still compile. Guards against the use-after-move check
+// becoming a blanket "any TRANSFERRED handle in spawn args = error"
+// that would over-reject legitimate single-transfer code.
+move struct Tok { u32 kind; }
+void worker(Tok t) { }
+i32 main() {
+    Tok t;
+    t.kind = 1;
+    spawn worker(t);    // single move into spawned thread — OK
+    return 0;
+}

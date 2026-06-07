@@ -10162,3 +10162,35 @@ EXCLUDED (would be wrong expectations): 9601 baud value, read-clears/W1C side
 effects (§16 floor), region-kind hardware correctness (Definition B),
 `@section`/region-kinds/`@reset_handler`/linker-symbol (pending gaps, not built).
 `interrupt UART { }` is the handler syntax. Wired into `make check`.
+
+---
+
+## Async Oracle — `tests/test_async_matrix.c` (2026-06-07)
+
+The seventh oracle (frontier Domain 3, final). NEG: yield/await in defer
+("corrupts coroutine state machine"), yield/await in @critical ("interrupts stay
+disabled across suspend"), spawn-in-async ("thread lifetime needs type system").
+POS: plain yield, await on a non-shared condition, defer with a non-suspending
+body, a local live across yield (Duff-device state promotion), and
+**await-on-shared**. EMIT-ONLY harness.
+
+**Wrong-expectation correction (the async 9601-floor lesson):** the first draft
+had `await g.ready == 1` (await condition reads a shared struct) as a NEG cell
+expecting rejection. It COMPILED — and that's CORRECT, not a hole. Each await
+poll evaluates the condition by locking g, reading, unlocking, THEN suspends if
+false; the lock is released between polls, never held across the suspension. The
+rule's own comment (checker.c:5438) confirms: "Shared access in non-yielding
+statements is safe (lock acquired and released within same poll call)."
+
+**Why the shared-across-suspend rule (checker.c:5450) is effectively
+unreachable:** `yield`/`await` are STATEMENT-ONLY — `g.v + yield` is "undefined
+identifier 'yield'". `in_async_yield_stmt` is only set for a NODE_EXPR_STMT /
+NODE_VAR_DECL whose expression `expr_contains_yield`, but a suspend can't be
+embedded in such an expression. So a shared lock (held only for the duration of
+its own statement) can never bracket a separate suspend statement → no expressible
+false negative. The rule is defensive/forward-compat; if yield/await ever become
+expressions, revisit its reachability.
+
+**Result: 10/10, 0 holes** — regression lock-in. With this, all three frontier
+domains (concurrency, ISR/atomics/MMIO, async) have oracles. `async void f() {
+yield; }` / `await COND;` is the syntax. Wired into `make check`.

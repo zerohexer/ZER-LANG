@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — async oracle (Domain 3, 0 holes) — FRONTIER COMPLETE
+
+Built `tests/test_async_matrix.c` — frontier Domain 3 (final). 10 cells,
+EMIT-ONLY harness. NEG: yield/await in defer, yield/await in @critical,
+spawn-in-async. POS: yield, await, defer-without-suspend, local across yield,
+await-on-shared.
+
+**Wrong-expectation correction (no bug):** the first draft expected
+`await g.ready == 1` (await condition reading a shared struct) to reject. It
+COMPILES — correctly. Each poll locks/reads/unlocks then suspends; the lock is
+released between polls, never held across the suspension. `yield`/`await` are
+statement-only (`g.v + yield` → "undefined identifier 'yield'"), so a shared
+lock can't bracket a separate suspend statement — the "shared-across-suspend"
+rule (checker.c:5450) is defensive/forward-compat and effectively unreachable.
+Converted the cell to a POS documenting await-on-shared is safe. (Async analog of
+the 9601-floor lesson — don't assume a construct is unsafe; verify.)
+
+**Result: 10/10, 0 holes — regression lock-in, no bug.** Test-only + Makefile.
+
+**FRONTIER COMPLETE:** all three non-memory domains (concurrency, ISR/atomics/
+MMIO, async) now have oracles. Seven-oracle suite total. Net frontier result: 0
+holes (all regression lock-in) — the concurrency/ISR/async checks are mature
+structural bans, vs the pointer-axis data-flow analyses (24 holes this session).
+limitations.md frontier entry closed out; only lower-value residual coverage debt
+remains.
+
+---
+
 ## Session 2026-06-07 (cont.) — ISR/atomics/MMIO oracle (Domain 2, 0 holes)
 
 Built `tests/test_hw_matrix.c` — frontier Domain 2. Read

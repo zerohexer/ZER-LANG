@@ -20,6 +20,7 @@ acceptable but logged). Each is built + run by `make check`.
 | Control-flow | `tests/test_cflow_matrix.c` | 38 | if/loop/switch/break/continue/defer merges × {pool,slab} | green |
 | Concurrency | `tests/test_conc_matrix.c` | 15 | data-race / spawn / deadlock / ThreadHandle join | green |
 | ISR/atomics/MMIO | `tests/test_hw_matrix.c` | 12 | MMIO range/align/decl, volatile-strip, ISR context + data-race (program-consequence only) | green |
+| Async | `tests/test_async_matrix.c` | 10 | yield/await in defer/@critical, spawn-in-async, valid yield/await/defer/state-promotion | green |
 
 **Pointer-lifetime axis ("universal pointer") is DONE** (2026-06-07): the
 compile-time `keep` model (PART 5 of `docs/universal_pointer.md`) — all 5 steps
@@ -77,11 +78,30 @@ read-clears / W1C / sticky side effects (§16), region-kind hardware correctness
 Residual (add when convenient): @atomic non-1/2/4/8 width reject, MMIO
 variable-index runtime-trap (belongs in tests/zer_trap, not emit-only).
 
-**Domain 3 — async (yield/await)**:
-- `yield`/`await` in `defer` → reject (duplicate Duff case labels — emission)
-- `yield`/`await` in `@critical` → reject (save/restore across suspend needs runtime)
-- shared-struct field access in a statement containing `yield` → reject (lock-across-suspend)
-- `spawn` in async → reject (thread lifetime needs type system)
+**Domain 3 — async (yield/await) — DONE (2026-06-07).**
+`tests/test_async_matrix.c`, 10/10, **0 holes** (regression lock-in — async bans
+are structural). NEG: yield/await in defer, yield/await in @critical,
+spawn-in-async. POS: yield, await, defer-without-suspend, local across yield
+(state promotion), await-on-shared. **Key finding (corrected a wrong
+expectation):** `await g.ready == 1` (await condition reads a shared struct) is
+SAFE and correctly COMPILES — each poll locks/reads/unlocks and the lock is
+released BETWEEN polls, never held across the suspension. `yield`/`await` are
+STATEMENT-ONLY (can't embed in an expression — `g.v + yield` is "undefined
+identifier 'yield'"), so a shared lock (held only for its own statement) can
+never bracket a separate suspend statement. The "shared access in a statement
+containing yield" rule (checker.c:5450) is therefore defensive/forward-compat and
+effectively unreachable today — no false negative, the unsafe construction isn't
+expressible. (The async analog of the 9601-floor lesson: don't assume a construct
+is unsafe; verify. await-on-shared is the floor-equivalent that must COMPILE.)
+Residual: if yield/await ever become expressions, revisit the 5450 reachability.
+
+**ALL THREE FRONTIER DOMAINS DONE (2026-06-07).** The seven-oracle suite (shape,
+escape, keep, cflow, conc, hw, async) covers the memory-safety axes AND the three
+non-memory domains. Net for the frontier: 0 holes found (all regression lock-in)
+— the concurrency/ISR/async checks are mature structural bans, in contrast to the
+pointer-axis data-flow analyses (24 holes this session). What remains is lower-
+value coverage debt (the per-domain "Residual" notes above + the shape-matrix
+roadmap items below), not known false negatives.
 
 **Breadth survey (2026-06-07):** direct-case guards CONFIRMED firing —
 `spawn worker(&local)` (non-shared ptr → "data race"), `@inttoptr(const)` with no

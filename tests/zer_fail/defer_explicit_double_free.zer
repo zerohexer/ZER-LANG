@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// BUG-727 (control-flow oracle, 2026-06-07): a defer free + an explicit free of
+// the same handle is a double free — the explicit free runs, then the deferred
+// free fires AGAIN at scope exit. Previously compiled clean (false negative).
+// (Contrast tests/zer/_verify_BUG-608_defer_nested_cf.zer: free in BOTH
+// mutually-exclusive branches of ONE defer body is safe and must compile.)
+struct Task { u32 id; }
+Slab(Task) tasks;
+i32 main() {
+    Handle(Task) h = tasks.alloc() orelse { return 0; };
+    defer tasks.free(h);
+    tasks.free(h);
+    return 0;
+}

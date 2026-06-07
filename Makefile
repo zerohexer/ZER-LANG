@@ -97,11 +97,19 @@ test_escape_matrix: tests/test_escape_matrix.c
 test_keep_matrix: tests/test_keep_matrix.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+# Control-flow / path-sensitivity soundness guard. NEG: an unsafe op wrapped in
+# if/loop/switch/defer/break/continue (MAYBE_FREED use, double-free, leak) MUST
+# be rejected. POS: a safe CFG-merge pattern (free+return then use; balanced
+# alloc/free in a loop; defer-free alone) MUST compile. -Wswitch enforces the
+# {type x scenario} grid can't shrink.
+test_cflow_matrix: tests/test_cflow_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -119,6 +127,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_shape_matrix
 	./test_escape_matrix
 	./test_keep_matrix
+	./test_cflow_matrix
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh

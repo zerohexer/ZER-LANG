@@ -78,6 +78,10 @@ typedef struct {
      * analysis. */
     const char *pool_name;
     uint32_t pool_name_len;
+    /* Control-flow oracle (2026-06-07): set once a defer-double-free has been
+     * reported for this handle, to avoid duplicate diagnostics when the C3
+     * exit pass re-scans the same defer body. */
+    bool defer_double_reported;
 } IRHandleInfo;
 
 /* Phase E: scoped spawn ThreadHandle tracking by name. Scoped spawn
@@ -1372,6 +1376,35 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                  * only marks h FREED, leaving mh (the ?Handle alias with
                  * same alloc_id) as ALIVE at function exit → false leak. */
                 ir_propagate_alias_state(ps, h, IR_HS_FREED, defer_line);
+            } else if (h && h->state == IR_HS_FREED &&
+                       h->free_line != defer_line &&
+                       !h->defer_double_reported) {
+                /* Control-flow oracle CF_DEFER_DOUBLE (2026-06-07): the handle
+                 * was already freed by something OTHER than this defer (an
+                 * explicit body free, or a different defer), and this deferred
+                 * free will free it AGAIN at scope exit = double free.
+                 *
+                 * The `free_line != defer_line` guard distinguishes a REAL
+                 * double free from the legitimate `defer { if (e) { free(h); }
+                 * else { free(h); } }` pattern: the recursive scan walks BOTH
+                 * mutually-exclusive branches linearly, so the second branch
+                 * sees h already FREED — but both frees carry THIS defer's line
+                 * (set at the ALIVE->FREED mark below), so free_line==defer_line
+                 * and we correctly skip. A genuine double free comes from an
+                 * explicit free (different source line) or another defer
+                 * (different defer line), so free_line!=defer_line.
+                 *
+                 * No ordering comparison: a defer registered AFTER an explicit
+                 * free still fires at scope exit (`free(h); defer free(h);` IS a
+                 * double free), so guarding on order would be a false NEGATIVE.
+                 * The only cost is over-rejecting the rare `if (c) { free(h);
+                 * return; } defer free(h);` ordering — acceptable per the
+                 * soundness criterion; under-rejection is the hole this closes. */
+                ir_zc_error(zc, defer_line,
+                    "double free: deferred free of %%%d which was already "
+                    "freed at line %d",
+                    root_local, h->free_line);
+                h->defer_double_reported = 1;
             }
         }
     }

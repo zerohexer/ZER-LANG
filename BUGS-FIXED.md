@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — BUG-727: defer double-free (control-flow oracle)
+
+Built `tests/test_cflow_matrix.c` — the control-flow / path-sensitivity
+soundness oracle. The shape/escape/keep matrices are all STRAIGHT-LINE; none
+wrap ops in if / else / loop / switch-arm / defer / break / continue. But the
+analyzer's hardest code is the CFG merge + loop fixed-point that handles those
+(the Phase-E dual-run 257->0 effort). Grid: `{pool, slab}` × 19 scenarios
+(NEG: if-then/if-both/loop/next-iter/switch-one/switch-all/double-if/leak-if/
+leak-loop/nested-if/break/continue/defer-double; POS: if-then-return/
+loop-balanced/if-balanced/defer-safe/defer-return/break-balanced). NEG cells
+must reject for a memory-safety reason; POS cells must compile. -Wswitch-enforced.
+
+**First run: 36/38, 2 false negatives** — both `defer free(h); free(h);` (pool
+and slab) compiled clean. **BUG-727:** the explicit `free(h)` runs, then the
+deferred free fires AGAIN at scope exit = double free at runtime, accepted by
+zercheck.
+
+**Root cause:** `ir_defer_scan_frees` (the Phase-C3 conservative exit pass that
+marks defer-freed handles FREED to avoid false leaks) only acted when the handle
+was ALIVE/MAYBE_FREED. When the handle was ALREADY FREED (explicit free before
+the defer fires), it silently did nothing instead of flagging the double-free.
+
+**Fix:** added an `else if (h->state == IR_HS_FREED)` branch that emits a
+double-free diagnostic. NO line-ordering guard: a defer registered AFTER an
+explicit free still fires at scope exit (`free(h); defer free(h);` IS a double
+free), so guarding on order would be a false NEGATIVE. The only cost is
+over-rejecting the rare `if (c) { free(h); return; } defer free(h);` ordering —
+over-rejection is acceptable per the soundness criterion; under-rejection is the
+hole. Dedup via a new `defer_double_reported` flag on IRHandleInfo.
+
+After the fix: cflow-matrix **38/38, 0 false negatives, 0 over-rejections**.
+The control-flow merge (if/loop/switch/break/continue/defer/early-exit) is now
+exhaustively guarded for pool + slab. Wired into `make check`. Resolves the
+limitations.md "control-flow / path-sensitivity axis" roadmap item.
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-721..726: keep-axis oracle (laundered non-keep persistence)
 
 Built `tests/test_keep_matrix.c` — the keep-axis soundness oracle, companion to

@@ -10053,3 +10053,42 @@ keep-matrix **21/21, 0 false negatives, 0 over-rejections**. Wired into
 `make check`. **When adding a new keep boundary (funcptr / cinclude / generic
 container), add the negative cell FIRST, then make the boundary default
 reject-on-uncertainty** — the matrix is the standing guard.
+
+---
+
+## Control-Flow Oracle — `tests/test_cflow_matrix.c` (2026-06-07)
+
+The fourth soundness oracle. The shape/escape/keep matrices are all
+STRAIGHT-LINE; this one wraps memory-safety ops in control flow — the analyzer's
+hardest region (CFG merge + loop fixed-point; the Phase-E 257->0 dual-run
+effort). Grid: `{pool Handle, slab *T}` × 19 scenarios. NEG cells (unsafe op in
+control flow) must reject for a memory-safety reason; POS cells (safe CFG-merge
+patterns) must compile — because CFG-merge bugs manifest BOTH as under-rejection
+(forgot to widen to MAYBE_FREED) and over-rejection (too conservative on a safe
+free+return-then-use). Integrity guard: a NEG rejection must name a mem-safety
+reason (use-after-free / double free / never freed / leaked / transferred), not
+a parse error.
+
+Scenarios — NEG: if-then/use-after (MAYBE_FREED), if-both/use (FREED),
+loop-free/use, loop next-iter UAF, switch-one/use (MAYBE_FREED), switch-all/use
+(FREED), double-free-via-if, leak-in-if, leak-in-loop, nested-if/use,
+break-free/use, continue/next-iter, defer+explicit-double. POS: if-then-return
+then use (the freed path exits), loop-balanced (alloc+use+free per iter),
+if-balanced, defer-free/use (defer is the only free), defer+early-return/use,
+break-balanced.
+
+**Found BUG-727 on first full run** (both pool + slab): `defer free(h);
+free(h);` compiled clean = double free at scope exit. Fix in
+`ir_defer_scan_frees` (zercheck_ir.c): the Phase-C3 conservative exit pass that
+marks defer-freed handles FREED (to avoid false leaks) only acted on
+ALIVE/MAYBE_FREED; an already-FREED handle (explicit free before the defer fires)
+was silently skipped. Added an `else if (IR_HS_FREED)` branch emitting a
+double-free diagnostic, deduped via `IRHandleInfo.defer_double_reported`.
+
+**Why no line-ordering guard:** a defer registered AFTER an explicit free still
+fires at scope exit (`free(h); defer free(h);` IS a double free), so guarding on
+`defer_line < free_line` would be a false NEGATIVE. The conservative C3 pass
+applies every defer to every return block (no scope tracking), so this
+over-rejects the rare `if (c) { free(h); return; } defer free(h);` ordering —
+acceptable per the soundness criterion (over-reject OK, under-reject is the
+hole). After the fix: cflow-matrix **38/38**. Wired into `make check`.

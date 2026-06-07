@@ -17,17 +17,16 @@ yet. Ranked by likelihood of finding NEW under-rejections (vs regression
 lock-in). NONE are bugs — they're coverage debt: surface where a silent
 under-rejection could still hide.
 
-**1. Control-flow / path-sensitivity axis — HIGHEST value, NOT yet started.**
-Every matrix cell today is STRAIGHT-LINE (alloc; free; use, in sequence). It
-never wraps ops in `if` / `else` / `loop` / `switch-arm` / `defer` / `orelse`.
-But the analyzer's hardest, most bug-prone code is exactly the CFG merge +
-fixed-point that handles those (the whole Phase-E dual-run 257→0 effort was
-about getting merges right): free-in-one-if-branch → MAYBE_FREED; free-in-both
-→ FREED; free-in-some-switch-arms → MAYBE_FREED; free-inside-loop →
-next-iteration UAF; defer ordering; orelse-return unwrap paths. New axis:
-control-flow-context × the existing type/violation grid. This is where new bugs
-most likely hide — do this BEFORE the lock-in items below. Suggested start:
-`if-then` / `if-else` / `loop` over the UAF/double-free/leak grid for pool+slab.
+**1. Control-flow / path-sensitivity axis — DONE (core), 2026-06-07.**
+`tests/test_cflow_matrix.c` now covers `{pool, slab}` × 19 control-flow
+scenarios (if-then/if-both/loop/next-iter/switch-one/switch-all/double-if/
+leak-if/leak-loop/nested-if/break/continue/defer-double + the safe POS
+counterparts), 38/38. Found+fixed BUG-727 (defer + explicit double-free was a
+false negative). Residual control-flow shapes NOT yet enumerated (lower
+likelihood, add when convenient): `orelse`-unwrap/fallback paths crossed with
+free state; `goto` (forward past a use; backward re-use); deeply-nested (3+)
+control flow; move-struct and `*opaque` types under control flow (the cflow
+matrix uses pool Handle + slab `*T` only). None are known bugs — coverage debt.
 
 **2. `*opaque`/extern type row — LOW value (lock-in).** A 4th type
 (`TY_OPAQUE`: bodyless `?*opaque make()` extern-alloc + `void destroy(*opaque)`

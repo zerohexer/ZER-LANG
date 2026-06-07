@@ -22,6 +22,8 @@ test_firmware2
 test_firmware3
 test_production
 test_semantic_fuzz
+test_ir_validate
+test_shape_matrix
 
 # Editor/IDE
 .idea/

@@ -5,6 +5,68 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — defer body uses a handle the function body then frees → silent UAF
+
+**Symptom:** the deferred call reads/uses a handle (`defer use_item(h)`,
+`defer print_status(h)`, etc.); the function body then transitions that
+handle out of ALIVE (`gp.free(h)`, `slab.free(h)`, `consume(move_t)`)
+before the function returns; at scope exit the defer fires on a stale
+handle. **No diagnostic.** Runtime: pool/slab handle-gen mismatch traps,
+move-struct produces silent UB (struct copied by bits, two-owner
+semantics broken).
+
+Reproducer (compiles cleanly when it shouldn't):
+```zer
+struct Item { u32 id; }
+Pool(Item, 4) gp;
+void use_item(Handle(Item) h) { gp.get(h).id = 5; }
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    defer use_item(h);    // scheduled use at scope exit
+    gp.free(h);           // h now FREED in path state
+    return;               // defer fires use_item(h) on FREED handle
+}
+```
+`gp.free(h); use_item(h);` (without defer) IS correctly rejected; the
+defer-wrapped variant slips through.
+
+**Root cause:** `zercheck_ir.c` `ir_defer_scan_frees` (line ~1351) walks
+each defer body at function exit ONLY for FREE calls, so a `defer
+gp.free(h)` correctly folds into the exit state. It does NOT scan defer
+bodies for non-free USES of handles. The path-state walker for the main
+function body sees `gp.free(h); return;` and signs off (h FREED at
+return, no leak); the deferred `use_item(h)` is never checked against the
+post-body, pre-defer-fire state.
+
+**Why the obvious fix isn't trivial:** runtime fires defers LIFO, and a
+single defer body can use h on one line and free h on the next — e.g.
+`defer { use_item(h); gp.free(h); }` is the canonical safe cleanup
+pattern and must remain accepted. The scanner needs to walk each defer
+body's statements in declaration order against a per-defer copy of the
+path state, mirroring runtime fire semantics: USE checked against the
+current state, then FREE applied to state, then advance. Multi-defer
+interaction (LIFO across defers) adds another loop dimension. A naive
+"scan all uses then apply all frees" walker over-rejects the canonical
+pattern.
+
+**Fix sketch:** at function exit, walk defers in LIFO order. For each
+defer body, walk its statements top-down against a snapshot of the
+path state: when the statement contains a non-free handle USE, check
+the snapshot state and emit a use-after-free / use-after-move
+diagnostic; when the statement is a free, apply it to the snapshot.
+After processing the defer body, fold the snapshot into the return
+path state. Conservative on nested control flow (NODE_IF/SWITCH/etc.
+inside defer body): join all branches monotonically.
+
+**Tripwire test:** `tests/zer_gaps/defer_use_after_body_free.zer`
+(present today as a KNOWN-GAP marker — fails-noisily as a positive
+mis-acceptance when the fix lands; flip to a `tests/zer_fail/` entry
+with `// EXPECTED: compile error` at that point).
+
+Discovered: Session 2026-06-07 audit (BUG-704-adjacent).
+
+---
+
 ## OPEN — shape-matrix coverage gaps: `*opaque` row + cross-module-compound
 
 Two axes the `tests/test_shape_matrix.c` oracle does NOT yet cover. Not bugs —

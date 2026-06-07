@@ -28,3 +28,4 @@ fix estimates.
 | `audit_2026-06-02_ptrcast_unrelated.zer` | `@ptrcast(*B, &a)` between unrelated concrete struct pointers accepted |
 | `audit_2026-06-02_nostrict_mmio_no_runtime.zer` | `--no-strict-mmio` drops runtime range/alignment check |
 | `audit_2026-06-02_container_optional_type_arg.zer` | `container Box(T)` with `Box(?u32)` emits invalid C identifier |
+| `audit_2026-06-07_defer_use_after_body_free.zer` | `defer use_item(h); gp.free(h);` → silent UAF (defer body USES not scanned) |

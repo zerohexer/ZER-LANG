@@ -4768,10 +4768,26 @@ instead of checks surfaces as a new matrix HOLE.
    (gated on pointer/slice return so int-returning calls aren't over-rejected).
    keep-matrix **21/21, 0 false negatives, 0 over-rejections** — keep axis now
    has the same exhaustive no-false-negative guard as the escape axis.
-4. NEXT — `keep` on struct fields (field-level contract) / locals / cascade
-   (Section 13.1), against the keep oracle.
+4. ✅ `keep` on struct fields (2026-06-07): a struct field must be declared
+   `keep` to hold a BORROWED (keep-param-derived) pointer — ZER's analog of
+   Rust's `struct H<'a> { p: &'a T }`. Tightening only (no new false negative);
+   the value is audit-visibility of borrows at the data structure. New
+   `is_keep_derived` flag (mirrors `is_nonkeep_derived`) + `target_struct_field_keep`
+   + a NODE_ASSIGN field-store check. Bounded migration (4 tests). NOT a new
+   safety guarantee — the borrow was already sound via the keep-param valve +
+   call-site verification. `keep` on locals / cascade: NOT pursued — no sound
+   value-adding semantics in ZER's no-lifetime-tracking model (param + field
+   contracts suffice).
 5. For each boundary default (funcptr / cinclude / generic-container): add the
    negative cell FIRST (must reject), then the feature.
+
+**Soundness status (2026-06-07):** the pointer-lifetime axis now has FOUR
+exhaustive oracles — shape (temporal/UAF, 25 cells), escape (local escape, 35),
+keep (non-keep persistence, 21), cflow (control-flow merges, 38). Empirically,
+struct-carried local escape (build a struct locally, store &local in a field,
+then return / store-to-global / nest / alias) is rejected in every case. The
+compile-time-only `keep` model is sound (no false negatives found) for the
+current language surface.
 
 ## 35. Reconciliation with prior parts (per the PART 4 discipline)
 

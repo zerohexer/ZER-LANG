@@ -758,6 +758,32 @@ static void classify_escape_sink(Checker *c, Node *target,
     }
 }
 
+/* field-level keep (2026-06-07): given an assignment target `obj.field`
+ * (NODE_FIELD, possibly nested / through index), resolve the SField being
+ * assigned and report whether it is declared `keep`. Returns 1 if the target is
+ * a struct field (and sets *is_keep_field to the field's keep flag), 0 if the
+ * target is not a plain struct field (global var, slice, etc.). Uses the cached
+ * type of the object (typemap) — no re-check, no side effects. */
+static int target_struct_field_keep(Checker *c, Node *target, bool *is_keep_field) {
+    *is_keep_field = false;
+    if (!target || target->kind != NODE_FIELD) return 0;
+    Type *obj = typemap_get(c, target->field.object);
+    if (type_dispatch_kind(obj) == TYPE_POINTER)
+        obj = type_unwrap_distinct(obj)->pointer.inner;
+    if (type_dispatch_kind(obj) != TYPE_STRUCT) return 0;
+    obj = type_unwrap_distinct(obj);
+    const char *fname = target->field.field_name;
+    uint32_t flen = target->field.field_name_len;
+    for (uint32_t i = 0; i < obj->struct_type.field_count; i++) {
+        SField *f = &obj->struct_type.fields[i];
+        if (f->name_len == flen && memcmp(f->name, fname, flen) == 0) {
+            *is_keep_field = f->is_keep;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* BUG-374: recursively check if a call expression has any local-derived pointer
  * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
  * which itself has &x. We recurse into nested calls (max depth 8 to prevent
@@ -947,6 +973,7 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_arena_derived) dst->is_arena_derived = true;
     if (src->is_from_arena) dst->is_from_arena = true;
     if (src->is_nonkeep_derived) dst->is_nonkeep_derived = true;
+    if (src->is_keep_derived) dst->is_keep_derived = true;
 }
 
 /* Recursively scan an expression for any identifier that refers to a
@@ -3363,6 +3390,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_arena_derived = false;
                         tsym->is_from_arena = false;  /* BUG-597: must clear on reassign */
                         tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
+                        tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
                         tsym->container_struct = NULL;
                         tsym->container_field = NULL;
@@ -3583,6 +3611,36 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot persist non-keep-derived pointer '%.*s' (aliases a "
                             "non-keep parameter) — add 'keep' qualifier to the source parameter",
                             (int)val_sym->name_len, val_sym->name);
+                    }
+                }
+            }
+        }
+
+        /* field-level keep (2026-06-07): storing a BORROW (a keep-param-derived
+         * pointer, or an alias of one) into a struct field requires the field to
+         * be declared 'keep' — the Rust `struct H<'a> { p: &'a T }` analog, so a
+         * field's borrow-ness is audit-visible at the data structure. Storing a
+         * borrow into an owned (non-keep) field is an error. Tightening only:
+         * owned/alloc pointers (not keep-derived) are unaffected; a store to a
+         * global is the canonical keep valve (not a field) and unaffected. */
+        if (node->assign.op == TOK_EQ && node->assign.target->kind == NODE_FIELD) {
+            Node *vnode = node->assign.value;
+            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
+                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            if (vnode && vnode->kind == NODE_IDENT) {
+                Symbol *val_sym = scope_lookup(c->current_scope,
+                    vnode->ident.name, (uint32_t)vnode->ident.name_len);
+                if (val_sym && val_sym->is_keep_derived) {
+                    bool field_is_keep = false;
+                    if (target_struct_field_keep(c, node->assign.target, &field_is_keep) &&
+                        !field_is_keep) {
+                        checker_error(c, node->loc.line,
+                            "cannot store borrowed pointer '%.*s' (a 'keep' parameter) "
+                            "into non-keep field '%.*s' — declare the field 'keep' to "
+                            "hold a borrow",
+                            (int)val_sym->name_len, val_sym->name,
+                            (int)node->assign.target->field.field_name_len,
+                            node->assign.target->field.field_name);
                     }
                 }
             }
@@ -12379,6 +12437,15 @@ static void check_func_body(Checker *c, Node *node) {
                     TypeKind pk = type_dispatch_kind(ptype);
                     if (pk == TYPE_POINTER || pk == TYPE_OPAQUE)
                         sym->is_nonkeep_derived = true;
+                }
+                /* field-level keep: a KEEP pointer param is a BORROW. Storing it
+                 * into a struct field requires the field to be declared 'keep'
+                 * (the Rust `struct H<'a>{p:&'a T}` analog). Propagates to
+                 * aliases via propagate_escape_flags; checked at field stores. */
+                if (p->is_keep && ptype) {
+                    TypeKind pk = type_dispatch_kind(ptype);
+                    if (pk == TYPE_POINTER || pk == TYPE_OPAQUE)
+                        sym->is_keep_derived = true;
                 }
             }
         }

@@ -136,6 +136,12 @@ static int cell_valid(KSink s, KLaunder l, KKind k) {
 static void gen(KSink s, KLaunder l, KKind k, char *buf, size_t n) {
     const char *src   = (k == KK_NEG) ? "*u32 p" : "keep *u32 p";
     const char *field = (l == KL_PTRCAST) ? "?*u8" : "?*u32";
+    /* field-level keep (2026-06-07): a POS cell stores a `keep` (borrow) param
+     * into a struct field, which now REQUIRES the field to be declared `keep`.
+     * NEG cells store a non-keep param (rejected for the non-keep reason
+     * regardless of field keep-ness), so their fields stay plain. Global sinks
+     * are not struct fields, so no qualifier. */
+    const char *fq = (k == KK_POS) ? "keep " : "";
     char decls[512]; decls[0] = 0;
 
     char launSetup[128]; launSetup[0] = 0;
@@ -158,13 +164,13 @@ static void gen(KSink s, KLaunder l, KKind k, char *buf, size_t n) {
             snprintf(func, sizeof(func), "void esc_fn(%s) {\n%s    gk = %s;\n}\n", src, launSetup, E);
             break;
         case KS_PARAM_FIELD: {
-            char sd[64]; snprintf(sd, sizeof(sd), "struct Holder { %s hp; }\n", field);
+            char sd[80]; snprintf(sd, sizeof(sd), "struct Holder { %s%s hp; }\n", fq, field);
             strcat(decls, sd);
             snprintf(func, sizeof(func), "void esc_fn(*Holder h, %s) {\n%s    h.hp = %s;\n}\n", src, launSetup, E);
             break;
         }
         case KS_NESTED_FIELD: {
-            char sd[96]; snprintf(sd, sizeof(sd), "struct Inn { %s hp; }\nstruct Outr { Inn inner; }\n", field);
+            char sd[112]; snprintf(sd, sizeof(sd), "struct Inn { %s%s hp; }\nstruct Outr { Inn inner; }\n", fq, field);
             strcat(decls, sd);
             snprintf(func, sizeof(func), "void esc_fn(*Outr h, %s) {\n%s    h.inner.hp = %s;\n}\n", src, launSetup, E);
             break;

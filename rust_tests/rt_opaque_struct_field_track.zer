@@ -8,7 +8,7 @@
 // outlived the Motor).
 
 struct Driver {
-    *opaque device;
+    keep *opaque device;
     u32 status;
 }
 

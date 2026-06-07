@@ -1,7 +1,7 @@
-// keep-universalization 2a (2026-06-07): the `keep` escape valve — a `keep`
-// pointer parameter CAN be stored into a struct field (caller guarantees the
-// pointee outlives the field). Must compile + run + exit 0.
-struct Holder { ?*u32 hp; }
+// keep-universalization 2a + field-level keep (2026-06-07): a `keep` pointer
+// parameter (a borrow) CAN be stored into a struct field declared `keep` (the
+// field's borrow-ness is audit-visible). Must compile + run + exit 0.
+struct Holder { keep ?*u32 hp; }
 u32 gv = 42;
 void store(*Holder h, keep *u32 p) {
     h.hp = p;

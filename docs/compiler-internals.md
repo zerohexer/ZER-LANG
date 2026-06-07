@@ -10054,6 +10054,19 @@ keep-matrix **21/21, 0 false negatives, 0 over-rejections**. Wired into
 container), add the negative cell FIRST, then make the boundary default
 reject-on-uncertainty** — the matrix is the standing guard.
 
+**Field-level keep (2026-06-07):** the symmetric flag `is_keep_derived` is set on
+`keep` pointer/opaque params (propagated through aliases by
+`propagate_escape_flags`, cleared on reassign). A struct field must be declared
+`keep` to hold a borrow: at a NODE_ASSIGN whose target is a struct field, if the
+value is `is_keep_derived` and `target_struct_field_keep()` reports the field is
+NOT keep → error "declare the field 'keep'". This is ZER's analog of Rust's
+`struct H<'a> { p: &'a T }` (borrow-ness audit-visible at the data structure).
+Tightening only (no new false negative); owned/alloc pointers and stores to
+globals (the keep valve, not a field) are unaffected. The keep-matrix POS
+field-sink cells use `keep` fields; `tests/zer_fail/keep_field_required.zer`
+covers the rejection. NOT a new safety guarantee — the borrow was already sound
+via the keep-param valve + call-site verification; the value is audit-visibility.
+
 ---
 
 ## Control-Flow Oracle — `tests/test_cflow_matrix.c` (2026-06-07)

@@ -6,7 +6,7 @@ typedef u32 (*DriverProbe)(*opaque ctx);
 typedef u32 (*DriverRead)(*opaque ctx, u32 offset);
 
 struct DriverOps { DriverProbe probe; DriverRead read; }
-struct DriverEntry { u32 vendor_id; DriverOps ops; *opaque context; bool active; }
+struct DriverEntry { u32 vendor_id; DriverOps ops; keep *opaque context; bool active; }
 
 DriverEntry[4] driver_table;
 u32 driver_count;

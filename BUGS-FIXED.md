@@ -5,6 +5,48 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — field-level keep (keep-universalization step 4)
+
+Implemented `keep` on struct fields — ZER's analog of Rust's `struct H<'a> { p:
+&'a T }`. A struct field must be declared `keep` to hold a BORROWED
+(keep-param-derived) pointer; storing a borrow into an owned (non-keep) field is
+an error. The field's borrow-ness is now audit-visible at the data structure,
+not just at the setter's parameter.
+
+The infrastructure already existed (parser set `FieldDecl.is_keep` at
+parser.c:2278; checker copied it to `SField.is_keep` at checker.c:11489) but was
+never enforced. This wires the enforcement:
+
+- New `is_keep_derived` Symbol flag (types.h) — the keep-axis analog of
+  `is_nonkeep_derived`. Set on `keep` pointer/opaque params at registration,
+  propagated through aliases by `propagate_escape_flags`, cleared on whole-var
+  reassign.
+- `target_struct_field_keep()` (checker.c) — resolves the SField behind an
+  assignment target `obj.field` (via the cached object type, no re-check) and
+  reports its `is_keep`.
+- New check at NODE_ASSIGN field stores: value is_keep_derived + target field
+  NOT keep → error "declare the field 'keep' to hold a borrow".
+
+**Sound (tightening only):** it rejects more, never relaxes — so no new false
+negatives. Owned/alloc pointers (not keep-derived) and stores to globals (the
+canonical keep valve, not a field) are unaffected. Over-rejection of the now-
+required annotation is acceptable per the soundness criterion.
+
+**Semantics is enforced-documentation, not a new safety guarantee** (the borrow
+was already sound via the keep-param valve + call-site verification). The value
+is audit-visibility: `keep *opaque context` on a driver-registry entry documents
+that the struct borrows its context.
+
+**Migration (bounded):** 4 existing tests declared `keep` on borrow-holding
+fields — `driver_registry` (`keep *opaque context`), `rt_opaque_struct_field_track`
+(`keep *opaque device`), `keep_param_field_ok`, `keep_alias_valve_ok`. Keep
+matrix POS field-sink cells now use `keep` fields (21/21 maintained).
+
+**Tests:** `tests/zer_fail/keep_field_required.zer` (borrow → non-keep field
+rejected), keep matrix POS cells (borrow → keep field compiles). Full suite green.
+
+---
+
 ## Session 2026-06-07 (cont.) — BUG-727: defer double-free (control-flow oracle)
 
 Built `tests/test_cflow_matrix.c` — the control-flow / path-sensitivity

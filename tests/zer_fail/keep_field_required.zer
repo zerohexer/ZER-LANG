@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// field-level keep (2026-06-07): storing a borrowed (keep-param) pointer into a
+// NON-keep struct field is rejected — the field must be declared `keep` to hold
+// a borrow (the Rust `struct H<'a> { p: &'a T }` analog). Fix: `keep ?*u32 hp;`.
+// Contrast tests/zer/keep_param_field_ok.zer (keep field → compiles).
+struct Holder { ?*u32 hp; }
+void store(*Holder h, keep *u32 p) {
+    h.hp = p;
+}
+i32 main() { return 0; }

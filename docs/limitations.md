@@ -5,27 +5,55 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — shape-matrix coverage gaps: `*opaque` row + cross-module-compound
+## OPEN — shape-matrix oracle: remaining coverage roadmap
 
-Two axes the `tests/test_shape_matrix.c` oracle does NOT yet cover. Not bugs —
-coverage debt (under-tested surface where under-rejections could still hide).
+`tests/test_shape_matrix.c` is the exhaustive memory-safety oracle (option A,
+the replacement for the retired dual-run). It currently covers 25 cells:
+3 types {pool/Handle, slab/`*T`, move-struct} × 7 reach-shapes {bare, field,
+array, fnarg, field-xfn (GAP-A), spawn (GAP-C), deref (BUG-463)} × 4 violations
+{uaf, double-free, leak, use-after-move}. Found+fixed BUG-702 (compound leak)
+and BUG-703 (move-field over-rejection). These remaining axes are NOT coverage
+yet. Ranked by likelihood of finding NEW under-rejections (vs regression
+lock-in). NONE are bugs — they're coverage debt: surface where a silent
+under-rejection could still hide.
 
-**`*opaque`/extern type row.** Negative cells are easy (compile-rejection, no
-link). Positive cells need `--run`, but bodyless extern `make()/free()` won't
-link without real C backing — and a companion cinclude header collides with
-ZER's `_zer_opaque` struct representation (see compiler-internals "Pitfalls
-Found Writing Real .zer Code": `cinclude stdlib.h` + declaring `free(*opaque)`
-conflicts). Needs a negative-only cell mode OR a runnable-backing strategy.
-Lower urgency: GAP-A/B/D just audited this surface (2026-06-06).
+**1. Control-flow / path-sensitivity axis — HIGHEST value, NOT yet started.**
+Every matrix cell today is STRAIGHT-LINE (alloc; free; use, in sequence). It
+never wraps ops in `if` / `else` / `loop` / `switch-arm` / `defer` / `orelse`.
+But the analyzer's hardest, most bug-prone code is exactly the CFG merge +
+fixed-point that handles those (the whole Phase-E dual-run 257→0 effort was
+about getting merges right): free-in-one-if-branch → MAYBE_FREED; free-in-both
+→ FREED; free-in-some-switch-arms → MAYBE_FREED; free-inside-loop →
+next-iteration UAF; defer ordering; orelse-return unwrap paths. New axis:
+control-flow-context × the existing type/violation grid. This is where new bugs
+most likely hide — do this BEFORE the lock-in items below. Suggested start:
+`if-then` / `if-else` / `loop` over the UAF/double-free/leak grid for pool+slab.
 
-**Cross-module-summary compound** (GAP-A pattern: `freeit(b.h)` cross-function
-free of a compound arg). Not a new *shape* — it's field-storage combined with
-the cross-function free path. The matrix's shape axis currently conflates "where
-it's stored" with "how it's freed"; covering this right needs a 2D shape axis
-(storage × free-path), a harness redesign worth its own session.
+**2. `*opaque`/extern type row — LOW value (lock-in).** A 4th type
+(`TY_OPAQUE`: bodyless `?*opaque make()` extern-alloc + `void destroy(*opaque)`
+extern-free). Codegen catch: positives can't `--run` (bodyless externs won't
+link). Solution worked out: add a per-type `compile_only` flag and assert the
+positive with EMIT-ONLY (`zerc f.zer -o /tmp/x.c`, no GCC/link) = exit 0 means
+zercheck accepted; negative = `-o /dev/null` still fails at zercheck before
+link. Locks in GAP-B (extern-alloc+orelse) and GAP-D (destructor heuristic).
+Just audited 2026-06-06, so mostly regression lock-in.
 
-When either is taken on, add the cells and update the "Extending the grid"
-coverage list in `docs/compiler-internals.md`.
+**3. Smaller lock-in cells — LOW value.** wrong-pool (`pool_a` handle freed via
+`pool_b` — BUG-471 class); move-array (`consume(arr[0])` move element —
+BUG-476 class); alias chains (`h2=h1; free(h1); use(h2)`); return-escape
+(`return h` — escape-vs-leak distinction); slab field/array storage (currently
+pruned for the `*T`-in-struct non-null concern — verify whether it works).
+
+**4. Different domain → SEPARATE harness, not a matrix extension — HIGH
+novelty, more work.** Concurrency (shared-struct races, deadlock ordering),
+ISR safety (volatile/atomic ISR-vs-main), atomics width/packed, async
+yield-in-defer/critical, MMIO range/alignment. The current grid is
+memory-safety-shaped; these need their own oracle (concurrency is
+timing/structural; ISR needs the dead-branch pattern). Largest untouched
+surface overall.
+
+When any axis is added: add the cells, update the "Extending the grid" coverage
+list in `docs/compiler-internals.md`, and trim this entry.
 
 ---
 

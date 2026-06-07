@@ -10130,3 +10130,35 @@ Syntax note for extending it: spawn params to a shared struct are plain `*Struct
 (the `shared` lives on the struct decl, NOT `*shared Struct`); `@critical { }` is
 a block; `ThreadHandle th = spawn f(&w); th.join();` is the scoped form. Wired
 into `make check`.
+
+---
+
+## ISR / atomics / MMIO Oracle — `tests/test_hw_matrix.c` (2026-06-07)
+
+The sixth oracle (frontier Domain 2). **Scope discipline from
+docs/firmware_safety_extensions.md is load-bearing here:** it tests
+PROGRAM-CONSEQUENCE (wrong USES of hw-derived values that have a structural
+shadow — the §8 "✓" set / left branch of the §10 fork), NOT HARDWARE-CONSEQUENCE
+(the floor / right branch). A NEG cell for a floor case would be a WRONG
+expectation, because ZER correctly COMPILES floor cases. The POS cell
+`mmio-in-range-aligned` deliberately writes `r[0] = 9601` and must COMPILE —
+that's the demonstration that a structurally-valid value (the 9601-vs-9600 floor)
+is not ZER's to reject; only the *use mechanism* (OOB / misaligned / no-decl
+`@inttoptr`) is program-consequence.
+
+NEG: @inttoptr no-decl / out-of-range / misaligned; volatile-strip; slab-in-ISR;
+spawn-in-ISR; ISR non-volatile shared global (`check_interrupt_safety`); ISR
+volatile compound-RMW ("read-modify-write is not atomic"). POS: @inttoptr
+in-range+aligned (writing 9601), pool-in-ISR (Pool is ISR-safe, unlike Slab),
+atomic on a plain u32 global, ISR volatile plain assign.
+
+**EMIT-ONLY harness** (`-o /tmp/x.c`, no gcc): interrupt-handler attributes may
+not compile on hosted x86 gcc, so emit-only isolates the zercheck VERDICT (exit 0
+= accepted). Use this pattern for any privileged/hardware oracle.
+
+**Result: 12/12, 0 holes** — regression lock-in (MMIO range/alignment, volatile
+preservation, ISR context bans + data-race detection are mature). DELIBERATELY
+EXCLUDED (would be wrong expectations): 9601 baud value, read-clears/W1C side
+effects (§16 floor), region-kind hardware correctness (Definition B),
+`@section`/region-kinds/`@reset_handler`/linker-symbol (pending gaps, not built).
+`interrupt UART { }` is the handler syntax. Wired into `make check`.

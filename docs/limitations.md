@@ -19,6 +19,7 @@ acceptable but logged). Each is built + run by `make check`.
 | Keep | `tests/test_keep_matrix.c` | 21 | non-keep-param persistence × launder × sink (+ keep valve) | green |
 | Control-flow | `tests/test_cflow_matrix.c` | 38 | if/loop/switch/break/continue/defer merges × {pool,slab} | green |
 | Concurrency | `tests/test_conc_matrix.c` | 15 | data-race / spawn / deadlock / ThreadHandle join | green |
+| ISR/atomics/MMIO | `tests/test_hw_matrix.c` | 12 | MMIO range/align/decl, volatile-strip, ISR context + data-race (program-consequence only) | green |
 
 **Pointer-lifetime axis ("universal pointer") is DONE** (2026-06-07): the
 compile-time `keep` model (PART 5 of `docs/universal_pointer.md`) — all 5 steps
@@ -34,13 +35,13 @@ MMIO). See the dedicated OPEN entry below.
 
 ## OPEN — next frontier: concurrency / ISR / atomics / async / MMIO oracles
 
-The four oracles above are all memory-safety-shaped (straight-line or
-control-flow accept/reject). The non-memory safety domains have NO oracle yet —
-this is the largest untested soundness surface. They need their own harness
-shapes (concurrency is timing/structural; ISR/privileged ops need the dead-branch
-test pattern). Recommended approach: **survey first** — write a handful of
-adversarial NEG programs per domain, see which leak (compile clean when they
-should reject), then build the oracle for whichever domain leaks most.
+Domains 1 (concurrency) and 2 (ISR/atomics/MMIO) now HAVE oracles (both
+green, 0 holes — see the STATUS table). **Domain 3 (async) is the remaining
+gap.** The non-memory domains needed their own harness shapes (concurrency is
+timing/structural; ISR/privileged ops use the EMIT-ONLY + dead-branch pattern).
+Recommended approach for the remainder: **survey first** — write a handful of
+adversarial NEG programs, see which leak (compile clean when they should reject),
+then build/extend the oracle.
 
 Many rules here ARE accept/reject (oracle-able like the memory matrices); a few
 (shared-struct auto-lock *correctness*) are emission-correctness, not accept/
@@ -60,13 +61,21 @@ convenient): `shared(rw)` concurrent-reader same-statement, Ring/Pool-from-spawn
 (only Slab tested), condvar/@barrier/@once interactions, deeper deadlock cycles
 (A→B→C ordering).
 
-**Domain 2 — ISR / atomics / MMIO** (hardware-facing, dead-branch pattern):
-- shared global without `volatile` accessed in `interrupt` handler → reject
-- compound assign (RMW) on shared volatile → reject (non-atomic read-modify-write)
-- `slab.alloc()` in ISR → reject (calloc may deadlock); Pool OK
-- `@atomic_*` width not 1/2/4/8 → reject; 64-bit on 32-bit target → warn
-- `@inttoptr` const addr outside `mmio` range → reject; misaligned → reject
-- MMIO variable index out of declared range → runtime guard (trap test)
+**Domain 2 — ISR / atomics / MMIO — DONE (2026-06-07).**
+`tests/test_hw_matrix.c`, 12/12, **0 holes** (regression lock-in — MMIO/volatile/
+ISR checks are mature). PROGRAM-CONSEQUENCE only, per
+docs/firmware_safety_extensions.md: tests wrong USES with a structural shadow,
+NOT the hardware floor. NEG: @inttoptr no-decl / out-of-range / misaligned,
+volatile-strip, slab-in-ISR, spawn-in-ISR, ISR non-volatile shared global, ISR
+volatile compound-RMW. POS: @inttoptr in-range+aligned (incl. writing 9601 — the
+floor value COMPILES, demonstrating the split), pool-in-ISR, atomic global, ISR
+volatile plain assign. EMIT-ONLY harness (interrupt attrs may not compile on
+hosted gcc). DELIBERATELY EXCLUDED (floor / Definition B / pending gaps — a NEG
+cell for these would be a WRONG expectation): 9601-vs-9600 baud value,
+read-clears / W1C / sticky side effects (§16), region-kind hardware correctness,
+`@section`/region-kinds/`@reset_handler`/linker-symbol features (not built).
+Residual (add when convenient): @atomic non-1/2/4/8 width reject, MMIO
+variable-index runtime-trap (belongs in tests/zer_trap, not emit-only).
 
 **Domain 3 — async (yield/await)**:
 - `yield`/`await` in `defer` → reject (duplicate Duff case labels — emission)

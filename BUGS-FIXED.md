@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-07 (cont.) — ISR/atomics/MMIO oracle (Domain 2, 0 holes)
+
+Built `tests/test_hw_matrix.c` — frontier Domain 2. Read
+docs/firmware_safety_extensions.md first to get the scope discipline right: tests
+PROGRAM-CONSEQUENCE only (wrong uses with a structural shadow), NOT the hardware
+floor. 12 cells, EMIT-ONLY harness (interrupt attrs may not compile on hosted
+gcc, so isolate the zercheck verdict).
+
+NEG: @inttoptr no-decl / out-of-range / misaligned; volatile-strip; slab-in-ISR;
+spawn-in-ISR; ISR non-volatile shared global; ISR volatile compound-RMW. POS:
+@inttoptr in-range+aligned (writes 9601 — the floor value COMPILES, proving the
+program/hardware-consequence split), pool-in-ISR (Pool ISR-safe vs Slab), atomic
+global, ISR volatile plain assign.
+
+DELIBERATELY EXCLUDED as wrong expectations (ZER correctly compiles these — they
+are floor / Definition B / pending gaps): 9601-vs-9600 baud value, read-clears/
+W1C/sticky side effects (§16), region-kind hardware correctness,
+`@section`/region-kinds/`@reset_handler`/linker-symbol features.
+
+**Result: 12/12, 0 holes — regression lock-in, no bug.** MMIO range/alignment,
+volatile preservation, ISR context bans + data-race detection are mature.
+Test-only + Makefile. limitations.md Domain 2 marked done; only Domain 3 (async)
+remains on the frontier.
+
+---
+
 ## Session 2026-06-07 (cont.) — concurrency oracle (data-race/spawn/deadlock, 0 holes)
 
 Built `tests/test_conc_matrix.c` — the first non-memory-frontier oracle (Domain 1

@@ -67,6 +67,14 @@ reject, and need an emit-inspection check instead.
 - shared-struct field access in a statement containing `yield` → reject (lock-across-suspend)
 - `spawn` in async → reject (thread lifetime needs type system)
 
+**Breadth survey (2026-06-07):** direct-case guards CONFIRMED firing —
+`spawn worker(&local)` (non-shared ptr → "data race"), `@inttoptr(const)` with no
+`mmio` range (→ "requires mmio range"), `yield` in `defer` (→ "corrupts coroutine
+state") all reject correctly. So the frontier is NOT wide-open; the oracle work is
+finding LAUNDERED / merge / cross-context edge cases (as the memory oracles found
+24), not plugging direct holes. Start each domain oracle from its accept/reject
+rules above and add launder/merge variants.
+
 **Harness notes:** privileged/hardware ops (ISR bodies, `@cpu_*`, MMIO) can't
 `--run` in a hosted container — use EMIT-ONLY (`zerc f.zer -o /tmp/x.c`, exit 0 =
 zercheck accepted) for POS, and the dead-branch pattern (`volatile u32 nt = 0;

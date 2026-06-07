@@ -5,6 +5,82 @@ Entries removed once fixed.
 
 ---
 
+## STATUS — soundness oracle suite (read first, 2026-06-07)
+
+Four exhaustive `-Wswitch`-enforced oracles guard the compiler's safety analysis.
+A "hole" = a NEG cell that compiled clean (false negative = unsafe program
+accepted, the unacceptable class) or a POS cell that was rejected (over-rejection,
+acceptable but logged). Each is built + run by `make check`.
+
+| Oracle | File | Cells | Domain | Status |
+|---|---|---|---|---|
+| Shape | `tests/test_shape_matrix.c` | 25 | temporal (UAF/double-free/leak/move) × type × reach-shape | green |
+| Escape | `tests/test_escape_matrix.c` | 35 | local-pointer escape × launder × sink | green |
+| Keep | `tests/test_keep_matrix.c` | 21 | non-keep-param persistence × launder × sink (+ keep valve) | green |
+| Control-flow | `tests/test_cflow_matrix.c` | 38 | if/loop/switch/break/continue/defer merges × {pool,slab} | green |
+
+**Pointer-lifetime axis ("universal pointer") is DONE** (2026-06-07): the
+compile-time `keep` model (PART 5 of `docs/universal_pointer.md`) — all 5 steps
+complete, boundary defaults audited. This session closed 24 real holes (16 escape
++ 6 keep + 1 defer-double + 1 struct-copy). Do NOT re-investigate the pointer
+axis for false negatives without a new launder/shape idea — the four oracles are
+the standing guard; add a cell if you have a new idea.
+
+**Next frontier = the non-memory domains** (concurrency / ISR / atomics / async /
+MMIO). See the dedicated OPEN entry below.
+
+---
+
+## OPEN — next frontier: concurrency / ISR / atomics / async / MMIO oracles
+
+The four oracles above are all memory-safety-shaped (straight-line or
+control-flow accept/reject). The non-memory safety domains have NO oracle yet —
+this is the largest untested soundness surface. They need their own harness
+shapes (concurrency is timing/structural; ISR/privileged ops need the dead-branch
+test pattern). Recommended approach: **survey first** — write a handful of
+adversarial NEG programs per domain, see which leak (compile clean when they
+should reject), then build the oracle for whichever domain leaks most.
+
+Many rules here ARE accept/reject (oracle-able like the memory matrices); a few
+(shared-struct auto-lock *correctness*) are emission-correctness, not accept/
+reject, and need an emit-inspection check instead.
+
+**Domain 1 — data-race / spawn / deadlock** (highest value, most accept/reject):
+- `spawn f(&local)` non-shared pointer → reject (unless scoped ThreadHandle+join)
+- `spawn` target accessing non-shared global → reject (no sync) / warn (has @atomic)
+- Handle/Slab/Pool/Ring accessed from `spawn` → reject (non-atomic metadata)
+- same-statement access to 2+ shared types → reject (deadlock); cross-statement OK
+- `spawn` in `@critical` → reject; ThreadHandle not joined before exit → reject
+- POS: `shared struct` auto-locked field access compiles; scoped spawn + join compiles
+
+**Domain 2 — ISR / atomics / MMIO** (hardware-facing, dead-branch pattern):
+- shared global without `volatile` accessed in `interrupt` handler → reject
+- compound assign (RMW) on shared volatile → reject (non-atomic read-modify-write)
+- `slab.alloc()` in ISR → reject (calloc may deadlock); Pool OK
+- `@atomic_*` width not 1/2/4/8 → reject; 64-bit on 32-bit target → warn
+- `@inttoptr` const addr outside `mmio` range → reject; misaligned → reject
+- MMIO variable index out of declared range → runtime guard (trap test)
+
+**Domain 3 — async (yield/await)**:
+- `yield`/`await` in `defer` → reject (duplicate Duff case labels — emission)
+- `yield`/`await` in `@critical` → reject (save/restore across suspend needs runtime)
+- shared-struct field access in a statement containing `yield` → reject (lock-across-suspend)
+- `spawn` in async → reject (thread lifetime needs type system)
+
+**Harness notes:** privileged/hardware ops (ISR bodies, `@cpu_*`, MMIO) can't
+`--run` in a hosted container — use EMIT-ONLY (`zerc f.zer -o /tmp/x.c`, exit 0 =
+zercheck accepted) for POS, and the dead-branch pattern (`volatile u32 nt = 0;
+if (nt == 42) { ...privileged... }`) to compile without executing. Integrity
+guard: a NEG rejection must name the relevant safety reason (data race / deadlock
+/ ISR / not joined / atomic width), not a parse error. Model the oracle on
+`tests/test_cflow_matrix.c` (closest structure: NEG+POS, find_zerc, -Wswitch).
+
+When a domain oracle lands: add it to the STATUS table above, wire into
+`make check` (Makefile `check:` deps + run line), document in
+`docs/compiler-internals.md`, and trim this entry's covered domain.
+
+---
+
 ## OPEN — shape-matrix oracle: remaining coverage roadmap
 
 `tests/test_shape_matrix.c` is the exhaustive memory-safety oracle (option A,
@@ -43,13 +119,10 @@ BUG-476 class); alias chains (`h2=h1; free(h1); use(h2)`); return-escape
 (`return h` — escape-vs-leak distinction); slab field/array storage (currently
 pruned for the `*T`-in-struct non-null concern — verify whether it works).
 
-**4. Different domain → SEPARATE harness, not a matrix extension — HIGH
-novelty, more work.** Concurrency (shared-struct races, deadlock ordering),
-ISR safety (volatile/atomic ISR-vs-main), atomics width/packed, async
-yield-in-defer/critical, MMIO range/alignment. The current grid is
-memory-safety-shaped; these need their own oracle (concurrency is
-timing/structural; ISR needs the dead-branch pattern). Largest untouched
-surface overall.
+**4. Different domain → SEPARATE harness.** Concurrency / ISR / atomics / async /
+MMIO — promoted to its own actionable entry: see "OPEN — next frontier:
+concurrency / ISR / atomics / async / MMIO oracles" above (per-domain
+accept/reject rules + survey-first plan + harness notes).
 
 When any axis is added: add the cells, update the "Extending the grid" coverage
 list in `docs/compiler-internals.md`, and trim this entry.

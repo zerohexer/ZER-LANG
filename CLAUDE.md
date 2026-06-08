@@ -74,6 +74,46 @@ messages show the wrong type name in the third slot. Fix: capture each
 Discovered in BUG-700 (session 2026-06-06); same hazard exists everywhere
 `type_name` is composed in a single expression.
 
+**VRP `derive_expr_range` for `%` must respect dividend signedness
+(checker.c:346, BUG-729 2026-06-08).** C's signed modulo preserves the
+dividend's sign — `(-5) % 4 = -1`, not `3`. The original `x % N → [0, N-1]`
+narrowing silently bypassed bounds checks for `arr[i % N]` when `i` was a
+signed value that could be negative. Fix: when the dividend's TYPE is
+signed and its VRP range isn't provably ≥ 0, widen the result range to
+`[-(N-1), N-1]`. The bounds-proof consumer requires `min_val >= 0` to skip
+the runtime guard, so a negative min naturally re-triggers auto-guard /
+bounds-check. Don't add other narrowing rules without auditing C's
+semantics on the signed/unsigned promotion of both operands.
+
+**IR-path emit_rewritten_node intrinsics must include all safety wrappers
+the AST emit_expr sibling has.** When porting an intrinsic from AST to IR
+emission, every `_zer_trap` / `_zer_bounds_check` / `_zer_shl` / mmio-range
+/ alignment / bounds-check guard around `emit_expr` MUST be replicated in
+the IR sibling. The compiler's function bodies are IR-only since
+2026-04-19; an "AST-only" safety wrapper means a silent runtime gap. BUG-730
+(@cstr bounds check, 2026-06-08) was an example — the IR handler labeled
+"Simplified: memcpy + null" silently allowed stack buffer overflow. Audit
+recipe in CLAUDE.md "AST→IR Emission Diff Audit" section is the durable
+process for catching this class.
+
+**`__builtin_ctz(0)` / `__builtin_clz(0)` is UB — gate at IR emission.**
+GCC explicitly documents these as undefined behavior on zero input. On x86
+BSF/BSR leaves the destination register untouched, leaking garbage as the
+"count". `__builtin_ffs(0) == 0`, `__builtin_popcount(0) == 0`,
+`__builtin_parity(0) == 0` are all defined — no fix needed. For `@ctz` /
+`@clz`, wrap in `({ x == 0 ? width : __builtin_*(x); })`. Matches Rust's
+`u32::trailing_zeros()` semantics. BUG-731 (2026-06-08).
+
+**Local-derived pointer detection must walk struct-init field values.**
+The is_local_derived propagation hits `&local` direct, `&local` in orelse
+fallback, and aliases (`b.ptr = local_ptr`), but the original code missed
+`Box b = { .ptr = &local }` and `Box b = { .ptr = alias_of_local }`. After
+the struct-init walker (BUG-732, 2026-06-08), the carrier struct is marked
+is_local_derived and the subsequent `g_box = b` reaches the global-store
+escape check. Mirrors BUG-728 (2026-06-07) on the keep axis. If you add a
+new escape-flag axis, you MUST also walk struct-init field values; the
+test fixture is `tests/zer_fail/local_escape_struct_init.zer`.
+
 ---
 
 ## ZER Language — Complete Quick Reference

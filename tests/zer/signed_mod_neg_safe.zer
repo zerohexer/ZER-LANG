@@ -1,0 +1,22 @@
+// REGRESSION: signed % signed previously bypassed VRP bounds proof, leading to
+// silent OOB array reads. checker.c:derive_expr_range claimed `i % N` was
+// always in [0, N-1], skipping the auto-guard. C semantics: signed % preserves
+// the dividend's sign, so a negative i32 yielded a negative idx — `arr[idx]`
+// silently read out-of-bounds (returned garbage; no trap on hosted; on
+// baremetal could be anywhere).
+//
+// Fix (2026-06-08): derive_expr_range now widens the range to [-(N-1), N-1]
+// when the dividend type is signed and isn't provably ≥ 0. The auto-guard then
+// fires correctly, returning the function's zero value instead of OOB read.
+//
+// This test must EXIT 0 — the auto-guard intercepts the negative idx and
+// returns 0 cleanly. (Pre-fix it could return non-zero garbage from arr[-3].)
+const i32 N = 4;
+i32 get_neg() { return -3; }
+i32 main() {
+    u32[4] arr;
+    arr[0] = 111; arr[1] = 222; arr[2] = 233; arr[3] = 244;
+    i32 i = get_neg();
+    i32 idx = i % N;
+    return (i32)arr[idx];
+}

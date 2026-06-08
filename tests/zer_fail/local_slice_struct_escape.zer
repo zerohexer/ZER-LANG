@@ -1,0 +1,23 @@
+// REGRESSION: slice over local array carried in struct field, struct copied
+// to global, silently escaped. Companion to local_escape_struct_init.zer
+// (covers the `&local` field case). Slice case: the slice carries a pointer
+// to stack memory plus the length; storing the carrier struct globally leaks
+// the dangling slice pointer.
+//
+// Pre-fix: NODE_VAR_DECL detection only walked direct `&local` patterns, not
+// NODE_SLICE over a local array inside a struct-init.
+//
+// Fix (2026-06-08, checker.c NODE_VAR_DECL): extend struct-init field-value
+// walker to detect NODE_SLICE objects rooted at a local array.
+struct SliceBox { [*]u8 s; }
+SliceBox g_sb;
+void leak() {
+    u8[8] local;
+    for (u32 i = 0; i < 8; i += 1) { local[i] = (u8)i; }
+    SliceBox sb = { .s = local[0..] };
+    g_sb = sb;
+}
+i32 main() {
+    leak();
+    return 0;
+}

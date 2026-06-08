@@ -1,0 +1,27 @@
+// REGRESSION: local-derived pointer in struct init field, struct copied to global,
+// silently escaped. The escape detection caught:
+//   1. Direct  `g_box.ptr = &local;`        — REJECTED (BUG-440 sibling)
+//   2. Alias   `b.ptr = &local; g_box = b;`  — REJECTED (propagate_escape_flags)
+// But missed:
+//   3. Struct  `Box b = { .ptr = &local }; g_box = b;`  — SILENT
+//
+// The is_local_derived flag was not set on b at var-decl time because the
+// existing addr_exprs scan only looked at direct/orelse-fallback `&local`,
+// not at struct-init field values. Then `g_box = b;` saw b as a normal struct.
+// After leak() returned, g_box.ptr dangled — read of g_box.ptr[0] was UAF.
+//
+// Fix (2026-06-08, checker.c NODE_VAR_DECL): scan NODE_STRUCT_INIT field
+// values for both `&local` and aliases of local-derived idents. Same shape as
+// BUG-728 (which closed the non-keep param analog 2026-06-07), here for the
+// escape axis (local-derived).
+struct Box { *u8 ptr; }
+Box g_box;
+void leak() {
+    u8 local = 42;
+    Box b = { .ptr = &local };
+    g_box = b;
+}
+i32 main() {
+    leak();
+    return 0;
+}

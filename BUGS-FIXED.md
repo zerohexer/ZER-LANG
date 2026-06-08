@@ -5,6 +5,146 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-08 (cont.) — Silent-gap audit: 4 critical safety holes closed
+
+Targeted compiler-wide probe audit found and closed four distinct silent gaps
+where wrong programs compiled clean and ran with undefined behavior, returning
+garbage results rather than trapping or rejecting at compile time. Each gap
+was reproduced first against the unmodified compiler, then closed with the
+narrowest correct fix, then regression-tested.
+
+### BUG-729: signed `%` widened VRP range silently bypassed bounds check
+
+**Symptom (pre-fix):** `const i32 N = 4; i32 i = get_neg(); i32 idx = i % N;
+arr[idx];` compiled with NO auto-guard warning, NO bounds check emission. At
+runtime `idx` evaluated to `-3` (C signed modulo preserves dividend's sign),
+and `arr[-3]` silently read garbage from the stack slot before `arr`. On
+baremetal this is a wild read with no recovery — hardware-arbitrary value.
+The reproducer returned 0 (whatever was at arr[-3]) with exit code 0 — the
+caller had no signal that an OOB read had occurred.
+
+**Root cause:** `checker.c:derive_expr_range` claimed `x % N → [0, N-1]`
+unconditionally. The consumer (range storage + array-bounds proof) only
+checks `min_val >= 0` to decide whether to skip the runtime guard, so the
+silent narrowing made every consumer think the result was bounded. C's
+signed modulo specifies "sign of result = sign of dividend (truncated
+division)" — for a negative i32 dividend the result of `% N` is in
+`[-(N-1), 0]`, not `[0, N-1]`.
+
+**Fix:** narrow only when the dividend is provably non-negative (unsigned
+type, or signed with VRP range min ≥ 0). Otherwise widen to `[-(N-1), N-1]`
+so the negative case naturally fails the `min_val >= 0` consumer check and
+triggers auto-guard / bounds check. The unsigned-literal cases (`x % 4u`)
+were not affected: when one operand is unsigned, C's usual arithmetic
+conversions promote the signed dividend to unsigned before the `%`, so the
+result is in `[0, N-1]` — VRP plays it safe at the type level since the
+fix can't see the C promotion through ZER's pre-emission type system.
+
+Test: `tests/zer/signed_mod_neg_safe.zer` — must compile + run + exit 0
+(the auto-guard intercepts the negative idx). Pre-fix it could return
+garbage from arr[-3]; post-fix it returns 0 from the auto-guard's
+early-return.
+
+### BUG-730: @cstr in IR emission path silently skipped bounds check
+
+**Symptom (pre-fix):** `u8[4] buf; @cstr(buf, "this is way too long");`
+compiled clean and emitted unchecked `memcpy(buf, src.ptr, src.len)`, writing
+42 bytes into the 4-byte buffer. The stack-buffer overflow corrupted
+adjacent stack memory silently. The AST emitter (emitter.c:3174) had the
+bounds check; the IR path (emitter.c:8351, used for ALL function bodies
+since 2026-04-19) was the silent skip — discovered by diff audit between
+AST `emit_expr` runtime guards and IR `emit_rewritten_node` siblings.
+
+**Root cause:** the IR handler's own comment said "Simplified: memcpy + null.
+Full version has bounds check + auto-return." — known-incomplete, but not
+tracked.
+
+**Fix:** port the AST-path bounds check to the IR path. Three branches:
+- Array destination (compile-time size known): `if (cs.len + 1 > N) trap`
+- Slice destination (runtime len): `if (cs.len + 1 > cd.len) trap`
+- Pointer destination: rejected at checker (Gap 27, already in place)
+
+Tests: `tests/zer_trap/cstr_overflow_ir.zer` and
+`tests/zer_trap/cstr_overflow_slice.zer` — compile clean, trap at runtime
+with "@cstr buffer overflow", exit 133. Pre-fix exited 72 (the first byte
+of the overflowing source got memcpy'd into buf[0]).
+
+### BUG-731: @ctz / @clz on zero hit __builtin_* UB
+
+**Symptom (pre-fix):** `u32 x = 0; @ctz(x);` emitted raw
+`__builtin_ctz(0)`. Per GCC docs: "If x is 0, the result is undefined."
+On x86 BSF/BSR leaves the destination register untouched on a zero input,
+leaking whatever was previously there as the "count". `@ffs(0)`,
+`@popcount(0)`, `@parity(0)` are all defined by GCC — only `ctz`/`clz`
+were exposed.
+
+**Root cause:** emitter.c:8273 dispatched all bit-query intrinsics through
+the same `__builtin_NAME(x)` shape without per-name zero-handling.
+
+**Fix:** wrap `@ctz` / `@clz` in a zero-guard returning the type's bit
+width (32 for u32, 64 for u64) when input is zero. Matches Rust's
+`u32::trailing_zeros()` and Zig's `@ctz` semantics. Non-zero paths
+unchanged.
+
+Test: `tests/zer/ctz_clz_zero.zer` — asserts `@ctz(0_u32) == 32`,
+`@clz(0_u32) == 32`, `@ctz(0_u64) == 64`, `@clz(0_u64) == 64`, plus
+non-zero sanity (`@ctz(8) == 3`).
+
+### BUG-732: local-derived pointer in struct-init field silently escaped to global
+
+**Symptom (pre-fix):** `Box b = { .ptr = &local }; g_box = b;` compiled
+clean. The local pointer hidden inside a struct field laundered through
+the whole-struct copy to a global. After the function returned, `g_box.ptr`
+dangled — subsequent reads of `g_box.ptr[0]` silently read freed stack
+memory. The companion BUG-728 (2026-06-07) closed the non-keep parameter
+analog; this is the local-derived analog of the same launder.
+
+**Caught patterns (pre-fix, sound):**
+- Direct: `g_box.ptr = &local;` — rejected at the field write
+- Alias: `b.ptr = &local; g_box = b;` — `propagate_escape_flags`
+  flags `b`, then the global-store check fires
+
+**Silently missed:**
+- Struct init: `Box b = { .ptr = &local }; g_box = b;`
+- Struct init with alias: `*u8 p = &local; Box b = { .ptr = p }; g_box = b;`
+- Slice over local: `SliceBox sb = { .s = local[0..] }; g_sb = sb;`
+
+**Root cause:** `checker.c` NODE_VAR_DECL's `is_local_derived` detection
+scanned direct `&local` / orelse-fallback `&local` patterns, but did not
+recurse into NODE_STRUCT_INIT field values. The propagation path only
+fired for explicit field-writes (`b.ptr = &local`).
+
+**Fix:** extend the addr-expr walker to recurse into struct-init field
+values, picking up both direct `&local` patterns and aliases of
+local-derived idents. Also handle NODE_SLICE field values where the
+sliced object is a local array.
+
+Tests: `tests/zer_fail/local_escape_struct_init.zer` (pointer field) and
+`tests/zer_fail/local_slice_struct_escape.zer` (slice field).
+
+### Probes that didn't surface as gaps (positive verification)
+
+The following silent-gap candidates probed during the audit but turned
+out to be already covered or correctly designed:
+
+- `signed_var % unsigned_literal` — C's usual arithmetic conversions
+  promote the signed dividend to unsigned before `%`, result is naturally
+  in `[0, N-1]` regardless of original sign. Probe `arr[(-5) % 4u]` ran
+  fine (exit 144 = arr[3] truncated).
+- Pointer alias to move struct — `&move_struct` exists but isn't the move
+  tracking unit; documented limitation, not a silent gap that can be
+  reached through the typed/checked paths. Same-statement use after move
+  via the alias requires `unsafe`-style ptr arithmetic which is rejected
+  elsewhere.
+- `@inttoptr` with variable address — runtime mmio-range check fires
+  (tested with `p = @inttoptr(*u8, @ptrtoint(&local) + 4)` against a
+  declared but non-matching mmio range; trap fires with "outside mmio
+  range" at runtime).
+- Subslice `.len` accuracy — `s[5..]` on a 10-elem slice correctly reports
+  `.len == 5`. Cross-checked with the IR-path `emit_rewritten_node`.
+
+---
+
 ## Session 2026-06-08 — asm-safety oracle (durable surface) + S2 \n-bypass finding
 
 Built `tests/test_asm_matrix.c` — guards the DURABLE asm safety surface (the

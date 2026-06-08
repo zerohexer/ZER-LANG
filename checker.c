@@ -362,13 +362,59 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
     }
     if (rval == CONST_EVAL_FAIL || rval <= 0) return false;
     if (expr->binary.op == TOK_PERCENT) {
-        /* x % N → [0, N-1] */
+        /* x % N — C semantics: sign of result matches sign of dividend.
+         * AUDIT-2026-06-08: previously claimed [0, N-1] unconditionally,
+         * silently bypassing the bounds check when dividend was a signed
+         * negative value. Reproducer: `const i32 N = 4; i32 i = -3;
+         * i32 idx = i % N; arr[idx]` — VRP claimed safe, idx was -3, raw
+         * OOB read of arr[-3] returned garbage (no trap on hosted because
+         * the bounds check was skipped, no trap on baremetal either).
+         *
+         * Fix: only narrow to [0, N-1] when the dividend is provably
+         * non-negative. For signed dividends with unknown sign, widen to
+         * [-(N-1), N-1] so the negative case is conservatively flagged.
+         * The consumer logic (return-range checks, array-index bounds
+         * propagation) requires min_val >= 0 to skip the runtime guard,
+         * so a negative min naturally triggers auto-guard / bounds-check.
+         *
+         * Note: when one side is an unsigned literal (the common case
+         * `x % 4u`), the C usual arithmetic conversions promote x to
+         * unsigned BEFORE the operation, so the result is in [0, N-1]
+         * regardless of the original x's sign — but VRP at this level
+         * doesn't see the promotion, it sees the user's `i32 % i32`
+         * after type unification, so we play it safe based on the
+         * dividend's TYPE alone. */
+        Type *lhs_t = typemap_get(c, expr->binary.left);
+        bool dividend_is_signed = lhs_t && type_is_signed(type_unwrap_distinct(lhs_t));
+        if (dividend_is_signed) {
+            /* Try to narrow via dividend's existing VRP range. */
+            int64_t lmin = INT64_MIN;
+            if (expr->binary.left->kind == NODE_IDENT) {
+                struct VarRange *r = find_var_range(c,
+                    expr->binary.left->ident.name,
+                    (uint32_t)expr->binary.left->ident.name_len);
+                if (r) lmin = r->min_val;
+            }
+            if (lmin >= 0) {
+                /* dividend provably non-negative → standard narrow range */
+                *out_min = 0;
+                *out_max = rval - 1;
+                return true;
+            }
+            /* signed dividend with unknown sign → could be negative */
+            *out_min = -(rval - 1);
+            *out_max = rval - 1;
+            return true;
+        }
+        /* x % N → [0, N-1] (unsigned dividend) */
         *out_min = 0;
         *out_max = rval - 1;
         return true;
     }
     if (expr->binary.op == TOK_AMP) {
-        /* x & MASK → [0, MASK] (unsigned bitmask) */
+        /* x & MASK → [0, MASK] (positive mask).
+         * Two's-complement: signed & positive-mask is always non-negative
+         * (low bits of any signed value, masked to fit in [0, MASK]). */
         *out_min = 0;
         *out_max = rval;
         return true;
@@ -8693,6 +8739,81 @@ static void check_stmt(Checker *c, Node *node) {
                                 root->ident.name, (uint32_t)root->ident.name_len);
                             if (src && !src->is_static && !is_global) {
                                 sym->is_local_derived = true;
+                            }
+                        }
+                    }
+                    /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
+                     * carrying a local-derived pointer. Pre-fix:
+                     *   `Box b = { .ptr = &local };`        (Case `&local`)
+                     *   `*u8 p = &local; Box b = { .ptr = p };` (alias IDENT)
+                     *   `Sl sb = { .s = local[0..] };`        (Case SLICE)
+                     * all silently failed to mark `b`/`sb` as is_local_derived.
+                     * Then `g_box = b;` / `g_sb = sb;` escaped because the
+                     * carrier wasn't flagged. This closes the struct-init analog
+                     * of BUG-728 (keep axis 2026-06-07) for the escape axis.
+                     *
+                     * Walked here as a separate inline pass rather than via
+                     * addr_exprs[] so we don't have to grow that fixed buffer
+                     * — addr_exprs stays at [4] (the original 4-slot bound). */
+                    if (init && init->kind == NODE_STRUCT_INIT && !sym->is_local_derived) {
+                        for (int fi = 0; fi < init->struct_init.field_count; fi++) {
+                            Node *fv = init->struct_init.fields[fi].value;
+                            if (!fv) continue;
+                            /* unwrap intrinsic chains the same way as direct case */
+                            Node *fu = fv;
+                            while (fu && fu->kind == NODE_INTRINSIC &&
+                                   fu->intrinsic.arg_count > 0)
+                                fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+                            /* Case A: &local — direct address-of */
+                            if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
+                                Node *root = fu->unary.operand;
+                                while (root && (root->kind == NODE_FIELD ||
+                                                 root->kind == NODE_INDEX)) {
+                                    if (root->kind == NODE_FIELD) root = root->field.object;
+                                    else root = root->index_expr.object;
+                                }
+                                if (root && root->kind == NODE_IDENT) {
+                                    bool is_global = scope_lookup_local(c->global_scope,
+                                        root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                                    Symbol *src = scope_lookup(c->current_scope,
+                                        root->ident.name, (uint32_t)root->ident.name_len);
+                                    if (src && !src->is_static && !is_global) {
+                                        sym->is_local_derived = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            /* Case B: alias ident with is_local_derived flag */
+                            if (fv->kind == NODE_IDENT) {
+                                Symbol *fsym = scope_lookup(c->current_scope,
+                                    fv->ident.name, (uint32_t)fv->ident.name_len);
+                                if (fsym && fsym->is_local_derived) {
+                                    sym->is_local_derived = true;
+                                    break;
+                                }
+                            }
+                            /* Case C: slice over local array (local[0..]) */
+                            if (fv->kind == NODE_SLICE) {
+                                Node *sroot = fv->slice.object;
+                                while (sroot && (sroot->kind == NODE_FIELD ||
+                                                  sroot->kind == NODE_INDEX)) {
+                                    if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
+                                    else sroot = sroot->index_expr.object;
+                                }
+                                if (sroot && sroot->kind == NODE_IDENT) {
+                                    Symbol *srcs = scope_lookup(c->current_scope,
+                                        sroot->ident.name, (uint32_t)sroot->ident.name_len);
+                                    bool is_global = scope_lookup_local(c->global_scope,
+                                        sroot->ident.name, (uint32_t)sroot->ident.name_len) != NULL;
+                                    Type *rt = typemap_get(c, sroot);
+                                    bool rt_is_array = (type_dispatch_kind(rt) == TYPE_ARRAY);
+                                    if (srcs && (srcs->is_local_derived ||
+                                                  (rt_is_array &&
+                                                   !srcs->is_static && !is_global))) {
+                                        sym->is_local_derived = true;
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }

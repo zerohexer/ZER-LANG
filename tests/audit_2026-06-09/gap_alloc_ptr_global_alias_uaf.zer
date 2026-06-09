@@ -1,0 +1,31 @@
+// GAP-3 (HIGH) — alloc_ptr global alias UAF
+//
+// `alloc_ptr()` returns `*T` (no generation counter). When the pointer
+// is stored in a global field, the analyzer marks `p.escaped=true` to
+// suppress the leak warning but does NOT register the global field
+// as a compound key tracking the alloc. The subsequent unwrap-optional
+// of the global field reads a fresh local that is treated as ALIVE.
+//
+// Result: compile clean + runtime silent (no Handle gen check on *T).
+//
+// Compare with `Handle(T)` global-alias UAF: same source shape but
+// the Handle's generation counter traps at runtime via
+// `_zer_slab_get`.
+//
+// Reproduces: compile clean, runs to completion with exit 0 (value
+// read from freed slot — could be 99, 0, or anything).
+
+struct Item { u32 value; }
+Slab(Item) heap;
+
+?*Item g_ptr;
+
+i32 main() {
+    *Item p = heap.alloc_ptr() orelse return;
+    p.value = 99;
+    g_ptr = p;             // escape via global store
+    heap.free_ptr(p);      // free local p; g_ptr now dangles
+    *Item gp = g_ptr orelse return;
+    u32 v = gp.value;      // UAF — should be caught compile-time
+    return (i32)v;
+}

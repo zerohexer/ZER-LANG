@@ -1,0 +1,19 @@
+// GAP-5 (MEDIUM) — orelse-reassignment overwrites alive Handle silently
+//
+// Re-assigning a Handle local that is currently ALIVE (without freeing
+// first) should be a leak. The pattern `h = pool.alloc() orelse return;`
+// decomposes to IR_COPY into the dest. IR_COPY's overwrite-leak check
+// (F3.1 partial fix 2026-05-03) did not reach this orelse-wrapped form.
+// First allocation leaks.
+//
+// Compile-time: passes (no warning, no error).
+// Runtime: first slot leaked; subsequent calls hit a different slot.
+
+Slab(u32) heap;
+
+i32 main() {
+    Handle(u32) h = heap.alloc() orelse return;
+    h = heap.alloc() orelse return;  // first allocation leaked silently
+    heap.free(h);
+    return 0;
+}

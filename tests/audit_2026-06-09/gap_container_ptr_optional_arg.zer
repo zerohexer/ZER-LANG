@@ -1,0 +1,30 @@
+// GAP-7 (MEDIUM, UX) — Container monomorphization with composite type args
+// emits invalid C identifiers.
+//
+// The emitter constructs struct names by concatenating the container
+// name with the type argument's textual form. For non-identifier type
+// args, this produces output that GCC rejects:
+//
+//   Box(?u32)            -> struct Box_?u32     // ? invalid in C ident
+//   Box(*u32)            -> struct Box_*u32     // * invalid in C ident
+//   Pair(Handle(Item))   -> struct Pair_Handle(Item)  // parens invalid
+//   Box([*]u8)           -> struct Box_[*]u8    // brackets invalid
+//
+// The user sees a GCC error, not a clear ZER error, and the error
+// often appears at a synthesized struct definition far from the
+// originating ZER expression.
+//
+// Fix candidates:
+//   (a) Reject non-identifier type args at the checker with a clean
+//       ZER error (current behavior of Zig generics — also rejects)
+//   (b) Mangle: `?` -> `_opt_`, `*` -> `_ptr_`, `(` -> `_lp_`, `)` -> `_rp_`,
+//       `[`/`]` -> `_lbr_`/`_rbr_`. Each transformation must be reversible
+//       for type-equality comparisons.
+
+container Box(T) { T val; }
+
+i32 main() {
+    Box(?u32) b1;
+    Box(*u32) b2;
+    return 0;
+}

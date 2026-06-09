@@ -1,0 +1,23 @@
+// GAP-6 (MEDIUM) — Variable-index array element double-free silent
+//
+// `ir_extract_compound_key` only accepts NODE_INT_LIT indices.
+// `arr[k]` with a non-literal `k` (even if its value is constant
+// post-VRP) fails to extract a key, so the alloc_id of arr[0] is
+// not propagated to the access `arr[k]`. zercheck_ir sees two
+// unrelated handles, neither tracked.
+//
+// Compile-time: passes (no double-free warning).
+// Runtime: `_zer_slab_free` no-ops second free (gen mismatch path).
+// Result: silent.
+
+Slab(u32) heap;
+
+i32 main() {
+    Handle(u32)[4] arr;
+    arr[0] = heap.alloc() orelse return;
+    u32 k = 0;
+    for (u32 i = 0; i < 1; i += 1) { k = 0; }  // defeat VRP
+    heap.free(arr[k]);  // free via variable index
+    heap.free(arr[0]);  // DOUBLE FREE — silent at compile and runtime
+    return 0;
+}

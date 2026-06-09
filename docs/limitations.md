@@ -5,6 +5,30 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 8 silent gaps from audit_2026-06-09
+
+Sweep of the IR-only safety surface (zercheck_ir.c, ir_lower.c, emitter.c,
+checker.c) found eight silent gaps. Each compiles clean and (with one
+exception) runs without trap. Full root-cause + fix-sketch per gap in
+`docs/audit_2026-06-09.md`. Reproducers in `tests/audit_2026-06-09/`.
+
+| ID | Severity | One-line summary |
+|---|---|---|
+| GAP-1 | HIGH | `@ptrcast(*B, *A)` between unrelated concrete pointer types is silent type confusion; `@pun` traps but `@ptrcast` does not |
+| GAP-2 | HIGH | `--no-strict-mmio` drops the *runtime* MMIO range+alignment trap too, not just compile-time strictness |
+| GAP-3 | HIGH | `*T` from `alloc_ptr` stored in global field then freed → subsequent unwrap-deref is silent (no Handle-style gen counter) |
+| GAP-4 | HIGH | Function-pointer call freeing a Handle is not tracked → direct double-free passes both gates (documented-deferred; reverified) |
+| GAP-5 | MEDIUM | `h = pool.alloc() orelse return;` re-assigned to alive Handle leaks first allocation silently |
+| GAP-6 | MEDIUM | `arr[k]` with variable-but-runtime-const index escapes `ir_extract_compound_key` → double-free silent |
+| GAP-7 | MEDIUM-UX | `Box(?u32)` / `Box(*u32)` / `Pair(Handle(T))` emit invalid C identifiers → GCC error instead of clean ZER error |
+| GAP-8 | MEDIUM | Arena-derived pointer laundered through `local.ptr = p; take(local); c = ct;` (value-typed struct param) escapes the compile-time arena-escape check |
+
+When a gap is closed, move its reproducer from `tests/audit_2026-06-09/`
+to `tests/zer_fail/` (compile rejection) or `tests/zer_trap/` (runtime
+rejection), and trim the row from this table.
+
+---
+
 ## PLAN — asm Option E rework (Level C cleanup first)
 
 The asm-safety architecture is slated to move to Option E (three-layer, no-favored-

@@ -5,6 +5,79 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 6u360k audit (2026-06-09): 7 confirmed silent gaps
+
+From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
+All 7 RE-VERIFIED present in current main (commit 7a75a58, with BUG-729..734
+landed). Reproducers (NOT auto-run — each compiles clean / runs without trap,
+which is the bug): `tests/audit_2026-06-09/*.zer`. The 8th audit gap (GAP-5,
+orelse-reassignment overwrite leak) was **closed by BUG-734** this session —
+not listed here. When fixing one, move its reproducer into `tests/zer_fail/`
+or `tests/zer_trap/`.
+
+- **GAP-1 — `@ptrcast` between unrelated CONCRETE types = silent type confusion (HIGH).**
+  `*A pa=&a; *B pb=@ptrcast(*B,pa)` (A,B unrelated structs) compiles clean, no
+  runtime trap — reads A's memory as B. Root cause: the provenance check
+  (checker.c:~6262) only fires when the SOURCE is `*opaque`; concrete→concrete
+  skips it and emits a plain `(B*)pa`. Docs call `@ptrcast` "provenance-tracked"
+  and `@pun` DOES trap — discrepancy. Fix: reject concrete→different-concrete
+  `@ptrcast` with a hint to `@pun`, OR emit `@pun`'s runtime type_id check.
+  Repro: `gap_ptrcast_concrete_unrelated.zer`.
+
+- **GAP-2 — `--no-strict-mmio` strips the RUNTIME range+align check (HIGH).**
+  The flag is documented as relaxing COMPILE-TIME strictness, but it also drops
+  the emitted `_zer_trap("@inttoptr: address outside mmio range")` and unaligned
+  trap (verified: 0 trap-checks in emitted C with the flag). Bare-metal build at
+  a runtime-computed address can silently write any peripheral / BusFault on
+  Cortex-M0. Fix: `--no-strict-mmio` should relax only compile-time enforcement;
+  the runtime range check stays whenever ranges are declared, and the alignment
+  check stays unconditionally. Repro: `gap_nostrict_mmio_drops_runtime.zer`.
+
+- **GAP-3 — `alloc_ptr` global-alias UAF silent at BOTH gates (HIGH).**
+  `*T p = heap.alloc_ptr() orelse return; g_ptr = p; heap.free_ptr(p);
+  *T gp = g_ptr orelse return; gp.value` — confirmed silent (reproducer returns
+  the stale value 99, no trap). The global `?*T g_ptr` isn't registered as a
+  compound key tracking p's alloc_id (the Handle variant was added, `*T` wasn't),
+  and `*T` has no per-slot gen counter (unlike Handle) so no runtime net.
+  Contradicts CLAUDE.md "alloc_ptr 100% compile-time safe." Fix: register globals
+  storing `alloc_ptr` `*T` as compound keys in zercheck_ir so the later
+  unwrap+deref shares p's alloc_id. Repro: `gap_alloc_ptr_global_alias_uaf.zer`.
+
+- **GAP-4 — function-pointer free not tracked → silent double-free (HIGH).**
+  Calling `fp(h)` through a funcptr whose target frees `h`, then `heap.free(h)`:
+  silent (exit 0). zercheck_ir doesn't propagate the free across the indirect
+  call, and `_zer_slab_free` is lenient on already-freed handles. Overlaps the
+  existing "Gap 15 reverified" entry. Fix: conservative "any indirect call widens
+  ALL ALIVE handles to MAYBE_FREED" barrier (or only handles of the funcptr's
+  signature types). Repro: `gap_funcptr_double_free.zer`.
+
+- **GAP-6 — array-element double-free with VARIABLE index (MEDIUM).**
+  `heap.free(arr[k]); heap.free(arr[0])` with k==0 (runtime) compiles clean and
+  runs silently. `ir_extract_compound_key` only accepts `NODE_INT_LIT` indices,
+  so `arr[k]` and `arr[0]` aren't the same compound key. Fix: accept VRP-proven-
+  const indices, or widen to "any index" (over-rejects, conservative).
+  Repro: `gap_arr_var_index_dfree.zer`.
+
+- **GAP-7 — container monomorphization with composite type args (MEDIUM, UX).**
+  `Box(?u32)` / `Box(*u32)` / `Pair(Handle(Item))` emit C struct names like
+  `Box_?u32` → GCC syntax error pointing at emitted C, not ZER source. Not a
+  safety hole (loud at GCC) but a bad-diagnostic UX gap. Fix: reject non-identifier
+  type args at the checker with a clean ZER error (Zig-style), OR a reversible
+  name-mangling pass (`?`→`_opt_`, `*`→`_ptr_`, …). Repro: `gap_container_ptr_optional_arg.zer`.
+
+- **GAP-8 — arena escape via struct copy through a value-typed parameter (MEDIUM).**
+  `local.ptr = p` (p arena-derived) then `take(local)` (by-value `Container` param)
+  then `c = ct` (store to global) slips the static arena-escape check — the
+  arena-derived flag doesn't propagate through the field-store→carrier nor through
+  the by-value param copy. Runtime catches via malloc-wrap fault on hosted (generic
+  "memory access fault", not the arena-escape error); fully silent on bare-metal.
+  Distinct from BUG-732 (struct-INIT local escape) and the 2026-06-07 struct-COPY
+  work. Fix: (1) propagate `is_arena_derived` from field-store up to the carrier
+  struct local; (2) propagate it through value-typed struct params into the callee
+  param symbol. Repro: `gap_arena_escape_via_struct_copy.zer`.
+
+---
+
 ## PLAN — asm Option E rework (Level C cleanup first)
 
 The asm-safety architecture is slated to move to Option E (three-layer, no-favored-

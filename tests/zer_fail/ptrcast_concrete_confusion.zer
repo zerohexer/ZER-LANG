@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// GAP-1 (2026-06-09, BUG-735): @ptrcast between unrelated CONCRETE pointer types
+// is silent type confusion — the provenance check only fired when the source was
+// *opaque. Now rejected, pointing at @pun (the audit-visible runtime-checked pun).
+struct A { u32 x; }
+struct B { u32 y; u32 z; }
+i32 main() {
+    A a;
+    a.x = 7;
+    *A pa = &a;
+    *B pb = @ptrcast(*B, pa);   // unrelated concrete types -> reject -> use @pun
+    return (i32)pb.y;
+}

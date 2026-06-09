@@ -5,24 +5,15 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 6u360k audit (2026-06-09): 7 confirmed silent gaps
+## OPEN — 6u360k audit (2026-06-09): 6 confirmed silent gaps
 
 From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
-All 7 RE-VERIFIED present in current main (commit 7a75a58, with BUG-729..734
-landed). Reproducers (NOT auto-run — each compiles clean / runs without trap,
-which is the bug): `tests/audit_2026-06-09/*.zer`. The 8th audit gap (GAP-5,
-orelse-reassignment overwrite leak) was **closed by BUG-734** this session —
-not listed here. When fixing one, move its reproducer into `tests/zer_fail/`
-or `tests/zer_trap/`.
-
-- **GAP-1 — `@ptrcast` between unrelated CONCRETE types = silent type confusion (HIGH).**
-  `*A pa=&a; *B pb=@ptrcast(*B,pa)` (A,B unrelated structs) compiles clean, no
-  runtime trap — reads A's memory as B. Root cause: the provenance check
-  (checker.c:~6262) only fires when the SOURCE is `*opaque`; concrete→concrete
-  skips it and emits a plain `(B*)pa`. Docs call `@ptrcast` "provenance-tracked"
-  and `@pun` DOES trap — discrepancy. Fix: reject concrete→different-concrete
-  `@ptrcast` with a hint to `@pun`, OR emit `@pun`'s runtime type_id check.
-  Repro: `gap_ptrcast_concrete_unrelated.zer`.
+RE-VERIFIED present in current main. Reproducers (NOT auto-run — each compiles
+clean / runs without trap, which is the bug): `tests/audit_2026-06-09/*.zer`.
+**CLOSED so far:** GAP-5 (orelse overwrite leak) by BUG-734; GAP-1 (`@ptrcast`
+concrete type confusion) by BUG-735 (2026-06-09) — now guarded by
+`tests/zer_fail/ptrcast_concrete_confusion.zer`. When fixing one, move its
+reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
 
 - **GAP-2 — `--no-strict-mmio` strips the RUNTIME range+align check (HIGH).**
   The flag is documented as relaxing COMPILE-TIME strictness, but it also drops

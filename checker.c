@@ -6344,6 +6344,46 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        /* GAP-1 (2026-06-09, 6u360k audit): @ptrcast between two
+                         * unrelated CONCRETE pointer types is silent type confusion.
+                         * The opaque-provenance check above only fires when the SOURCE
+                         * is *opaque, so concrete->concrete fell through to a raw
+                         * reinterpret. Matches the locked cast rule (CLAUDE.md): a cast
+                         * where the pointee types differ is a compile error pointing at
+                         * @pun (the audit-visible escape with a runtime type_id trap).
+                         * Identity casts (same pointee, incl. through distinct typedefs)
+                         * and any cast involving *opaque stay allowed. */
+                        {
+                            Type *g1_tgt = result ? type_unwrap_distinct(result) : NULL;
+                            /* Narrow to AGGREGATE->different-AGGREGATE confusion: both
+                             * pointees are struct/union and not type-equal. This is the
+                             * GAP-1 case (reading one struct's layout as another's). Do
+                             * NOT reject primitive byte-view reinterprets (*u32 -> *u8,
+                             * struct -> *u8 serialization) — those are a legitimate
+                             * systems idiom (ZER also offers [*]u8 slices for the safe
+                             * path). Opaque is neither struct nor union, so *opaque
+                             * round-trips are excluded automatically. type_dispatch_kind
+                             * keeps the distinct-unwrap CI gate green. */
+                            if (g1_tgt &&
+                                type_dispatch_kind(val_type) == TYPE_POINTER &&
+                                type_dispatch_kind(result) == TYPE_POINTER) {
+                                TypeKind g1_sk = type_dispatch_kind(eff->pointer.inner);
+                                TypeKind g1_tk = type_dispatch_kind(g1_tgt->pointer.inner);
+                                bool g1_s_agg = (g1_sk == TYPE_STRUCT || g1_sk == TYPE_UNION);
+                                bool g1_t_agg = (g1_tk == TYPE_STRUCT || g1_tk == TYPE_UNION);
+                                if (g1_s_agg && g1_t_agg) {
+                                    Type *g1_si = type_unwrap_distinct(eff->pointer.inner);
+                                    Type *g1_ti = type_unwrap_distinct(g1_tgt->pointer.inner);
+                                    if (g1_si && g1_ti && !type_equals(g1_si, g1_ti)) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast between unrelated pointer types is type "
+                                            "confusion ('%s' source) — use @pun(%s, ...) for an "
+                                            "explicit runtime-checked pun, or cast through *opaque",
+                                            type_name(val_type), type_name(result));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {

@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-09 — BUG-735: @ptrcast concrete→concrete type confusion (6u360k GAP-1)
+
+`*A pa = &a; *B pb = @ptrcast(*B, pa);` with A,B unrelated concrete structs
+compiled clean and read A's memory as B — silent type confusion, no runtime
+trap. Root cause: the `@ptrcast` provenance check (checker.c ~6308) only fired
+when the SOURCE pointee was `*opaque`; a concrete→concrete cast skipped it and
+emitted a raw `(B*)pa`. This contradicted both the doc ("`@ptrcast` is
+provenance-tracked") and the locked cast rule (CLAUDE.md: a cast where pointee
+types differ is a compile error pointing at `@pun`).
+
+Fix (checker.c @ptrcast handler): after the opaque-provenance block, reject when
+both source and target are pointers to NON-opaque pointee types that are not
+`type_equals`. Identity casts (same pointee, incl. through distinct typedefs) and
+any cast involving `*opaque` (the provenance round-trip) stay allowed. Message
+points the user at `@pun` (the audit-visible, runtime-`type_id`-checked pun) or
+casting through `*opaque`. Tightening, aligned with the C-cast rule that already
+rejected `(*B)a_ptr`.
+
+Verified: reproducer rejects; driver_registry, rt_opaque_struct_field_track, and
+all `@ptrcast` opaque round-trip tests still compile (0 over-rejection); full
+suite green. Reproducer promoted to `tests/zer_fail/ptrcast_concrete_confusion.zer`
+(removed from tests/audit_2026-06-09/). Closes 6u360k audit GAP-1.
+
+---
+
 ## Session 2026-06-09 — BUG-733..734: 2 zercheck_ir false negatives (verified from branch InoCW, implemented to main)
 
 Hand-ported from `claude/cool-johnson-InoCW` (reviewed not merged; the branch was

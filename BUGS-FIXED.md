@@ -5,6 +5,46 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-09 — BUG-733..734: 2 zercheck_ir false negatives (verified from branch InoCW, implemented to main)
+
+Hand-ported from `claude/cool-johnson-InoCW` (reviewed not merged; the branch was
+16 commits behind, so a wholesale checkout would have regressed this session's
+zercheck_ir work — re-implemented onto current zercheck_ir.c instead). Both gaps
+confirmed open on main via reproducers. **Renumbered to BUG-733/734** — the
+branch labeled these "BUG-704/705", which COLLIDE with main's escape-matrix
+BUG-704..707; these are unrelated.
+
+- **BUG-733 — use-after-move on a spawn argument (zercheck_ir.c spawn handler).**
+  The spawn-arg loop resolves the handle via `ir_extract_compound_key` and marks
+  it TRANSFERRED, but a SECOND spawn of the same value just overwrote the already-
+  TRANSFERRED state, losing the diagnostic. Silently accepted:
+  `spawn worker(t); spawn worker(t);`, `spawn worker(b.t); spawn worker(b.t);`,
+  and `for (..) spawn worker(t);`. Fix: before re-transfer (and before the
+  auto-register), if the handle is already TRANSFERRED → "use after move",
+  mirroring the IR_CALL / IR_COPY move checks. Placed before auto-register so a
+  freshly-ALIVE handle isn't flagged. Tests: `tests/zer_fail/spawn_double_bare_uam.zer`,
+  `spawn_double_field_uam.zer`, `spawn_loop_uam.zer`; positive
+  `tests/zer/spawn_single_move_ok.zer`.
+
+- **BUG-734 — IR_COPY missing overwrite-while-alive leak check (zercheck_ir.c).**
+  `Handle h = gp.alloc() orelse return; h = gp.alloc() orelse return; gp.free(h);`
+  leaked the first allocation with no error. The orelse desugaring routes every
+  `h = pool.alloc() orelse ...` write through a temp local + IR_COPY into the
+  user-named local, so the alloc-site "overwritten while alive" check (which gates
+  on `!is_temp`) only ever saw the temp, never the user local. Fix: in IR_COPY,
+  snapshot the previous dst before the realloc-capable `ir_add_handle`; if it was
+  ALIVE, not escaped, not a temp, and has a DIFFERENT alloc_id than the incoming
+  source, the overwrite drops the previous allocation → "overwritten while alive —
+  previous allocation leaked". Tests: `tests/zer_fail/overwrite_alive_handle_simple.zer`,
+  `overwrite_alive_handle_loop.zer`; positives `tests/zer/overwrite_after_free_ok.zer`
+  (overwrite after free = fine), `overwrite_alias_same_id_ok.zer` (alias copy,
+  same alloc_id = fine).
+
+Verified: 5 negatives reject for the move/leak reason, 3 positives exit 0, full
+suite green.
+
+---
+
 ## Session 2026-06-09 — BUG-729..732: 4 safety gaps (verified from branch zxTC6, implemented to main)
 
 Reviewed 4 `claude/cool-johnson-*` branches (verify-not-merge). The fixes from

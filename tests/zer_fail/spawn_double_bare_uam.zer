@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// BUG-704 (Session 2026-06-07 audit): spawn handler was missing the
+// use-after-move check that IR_CALL has. The first spawn correctly
+// marked t TRANSFERRED, but the second silently re-transferred without
+// flagging. Pattern is doubly dangerous because the spawned worker now
+// holds a moved-from value that two threads simultaneously believe
+// they own.
+move struct Tok { u32 kind; }
+void worker(Tok t) { }
+i32 main() {
+    Tok t;
+    t.kind = 1;
+    spawn worker(t);   // first spawn: t TRANSFERRED
+    spawn worker(t);   // second spawn: must be use-after-move
+    return 0;
+}

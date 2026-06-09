@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// BUG-704: same shape as spawn_double_bare_uam but with a compound
+// (struct field) move-typed argument. Without the fix, spawn handler
+// silently re-transferred `b.t` because ir_extract_compound_key
+// already returned the existing transferred compound handle.
+move struct Tok { u32 kind; }
+struct Box { Tok t; }
+void worker(Tok t) { }
+i32 main() {
+    Box b;
+    b.t.kind = 1;
+    spawn worker(b.t);    // first spawn: b.t TRANSFERRED
+    spawn worker(b.t);    // second spawn: must be use-after-move
+    return 0;
+}

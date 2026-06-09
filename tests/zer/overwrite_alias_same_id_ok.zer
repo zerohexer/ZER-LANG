@@ -1,0 +1,12 @@
+// Positive control for BUG-705: copying an alias that shares the same
+// alloc_id is a no-op re-binding, not a leak. Guards against the new
+// check false-positive on `h2 = h2;` style.
+struct Item { u32 id; }
+Pool(Item, 16) gp;
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    Handle(Item) h2 = h;     // alias, same alloc_id
+    h2 = h;                  // re-bind to same id — not a leak
+    gp.free(h);
+}
+i32 main() { run(); return 0; }

@@ -1,0 +1,12 @@
+// Positive control for BUG-705: overwriting a FREED handle is legitimate
+// re-use, not a leak. Guards against the new overwrite check becoming
+// "any reassignment to a tracked handle = error".
+struct Item { u32 id; }
+Pool(Item, 16) gp;
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    gp.free(h);                          // h is FREED
+    h = gp.alloc() orelse return;        // legitimate re-use after free
+    gp.free(h);
+}
+i32 main() { run(); return 0; }

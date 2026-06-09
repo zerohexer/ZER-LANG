@@ -1648,6 +1648,28 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             IRHandleInfo *h = (path_len == 0)
                 ? ir_find_handle(ps, root_local)
                 : ir_find_compound_handle(ps, root_local, path, path_len);
+            /* BUG-733 (verified from branch InoCW, 2026-06-09): use-after-move
+             * on a spawn argument. The transfer below just overwrote an
+             * already-TRANSFERRED state, silently accepting `spawn w(t);
+             * spawn w(t)`, `spawn w(b.t); spawn w(b.t)`, and loop re-spawn.
+             * Mirror the IR_CALL / IR_COPY move check: flag BEFORE re-transfer.
+             * Placed before auto-register so a freshly-ALIVE handle from
+             * auto-register below is never flagged. */
+            if (h && h->state == IR_HS_TRANSFERRED &&
+                root_local < func->local_count) {
+                if (path_len == 0)
+                    ir_zc_error(zc, inst->source_line,
+                        "use after move: '%.*s' ownership transferred at line %d",
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name, h->free_line);
+                else
+                    ir_zc_error(zc, inst->source_line,
+                        "use after move: compound '%.*s' on local '%.*s' "
+                        "transferred at line %d",
+                        (int)path_len, path,
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name, h->free_line);
+            }
             if (!h && root_local < func->local_count) {
                 /* Auto-register move-struct args (bare or compound) so
                  * TRANSFERRED can be observed. For compound paths, walk
@@ -1776,6 +1798,28 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * field-drift bug class. */
         IRAliasSnapshot snap;
         ir_snapshot_alias(&snap, src_h);
+        /* BUG-734 (verified from branch InoCW, 2026-06-09): handle-overwrite-
+         * while-alive leak was missing from IR_COPY. The orelse desugaring
+         * routes every `h = pool.alloc() orelse ...` through a temp + IR_COPY
+         * into the user-named local, so the alloc-site "overwritten while
+         * alive" check (which gates on !is_temp) only ever saw the temp.
+         * Result, silently accepted: `Handle h = gp.alloc() orelse return;
+         * h = gp.alloc() orelse return;` — first alloc leaked, no error.
+         * Mirror the alloc-site check: if dst was ALIVE with a DIFFERENT
+         * alloc_id, the overwrite drops the previous allocation. Read prev
+         * dst fields BEFORE the realloc-capable ir_add_handle below. */
+        {
+            IRHandleInfo *prev_dst = ir_find_handle(ps, inst->dest_local);
+            if (prev_dst && prev_dst->state == IR_HS_ALIVE &&
+                !prev_dst->escaped &&
+                inst->dest_local < func->local_count &&
+                !func->locals[inst->dest_local].is_temp &&
+                prev_dst->alloc_id != snap.alloc_id) {
+                ir_zc_error(zc, inst->source_line,
+                    "handle %%%d overwritten while alive — previous allocation leaked",
+                    inst->dest_local);
+            }
+        }
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
         if (dst_h) {
             ir_apply_alias(dst_h, &snap);

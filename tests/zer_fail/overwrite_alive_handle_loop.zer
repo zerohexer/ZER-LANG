@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// BUG-705: loop variant. Each iteration silently leaked the previous
+// allocation; only the last was freed. This is the more dangerous shape
+// because the leak count scales with iteration count.
+struct Item { u32 id; }
+Pool(Item, 16) gp;
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    for (u32 i = 0; i < 3; i += 1) {
+        h = gp.alloc() orelse return;   // overwrite must error
+    }
+    gp.free(h);
+}
+i32 main() { run(); return 0; }

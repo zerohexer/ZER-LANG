@@ -8276,13 +8276,40 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     (nlen == 6 && memcmp(name, "parity", 6) == 0) ||
                     (nlen == 3 && memcmp(name, "ffs", 3) == 0)) &&
                    node->intrinsic.arg_count >= 1) {
-            /* D-Alpha-2: bit queries (dispatch on width) */
+            /* D-Alpha-2: bit queries (dispatch on width).
+             *
+             * AUDIT-2026-06-08: @ctz(0) and @clz(0) silently call
+             * __builtin_ctz(0)/__builtin_clz(0) — undefined behavior in C
+             * (GCC docs explicitly: "If x is 0, the result is undefined").
+             * On x86 the underlying BSF/BSR leaves the destination register
+             * untouched when the input is zero, leaking garbage as the
+             * "trailing/leading zero count". On baremetal targets without
+             * the BMI1 extension (TZCNT/LZCNT), the same undefined behavior
+             * applies. @popcount(0)=0, @parity(0)=0, @ffs(0)=0 are all
+             * defined by GCC — no fix needed for those.
+             *
+             * Fix: wrap @ctz / @clz in a zero-guard that returns the type
+             * width (the natural mathematical answer: ctz(0) = bit width,
+             * clz(0) = bit width). This matches Rust's u32::trailing_zeros
+             * and Zig's @ctz semantics. */
             Type *arg_t = checker_get_type(e->checker, node->intrinsic.args[0]);
             int w = arg_t ? type_width(type_unwrap_distinct(arg_t)) : 32;
             const char *suffix = (w > 32) ? "ll" : "";
-            emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
-            emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, ")");
+            bool is_ctz = (nlen == 3 && memcmp(name, "ctz", 3) == 0);
+            bool is_clz = (nlen == 3 && memcmp(name, "clz", 3) == 0);
+            if (is_ctz || is_clz) {
+                int t = e->temp_count++;
+                emit(e, "({ __typeof__(");
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ") _zer_bz%d = (", t);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, "); (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
+                     t, w, (int)nlen, name, suffix, t);
+            } else {
+                emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ")");
+            }
         } else if (nlen == 12 && memcmp(name, "barrier_init", 12) == 0 && node->intrinsic.arg_count >= 2) {
             /* BUG-574: thread barrier init on IR path — same shape as AST emit_expr */
             Type *bt = checker_get_type(e->checker, node->intrinsic.args[0]);
@@ -8350,17 +8377,55 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0 && node->intrinsic.arg_count > 1) {
             /* @cstr(buf, str) — copy string to buffer with null terminator.
-             * Simplified: memcpy + null. Full version has bounds check + auto-return. */
+             * AUDIT-2026-06-08: previously omitted bounds check ("Simplified:
+             * memcpy + null. Full version has bounds check + auto-return.")
+             * — silent stack buffer overflow when source.len + 1 > buf size.
+             * The AST sibling at line 3174 has the check; the IR path (used
+             * for all function bodies since 2026-04-19) was the silent gap.
+             * Fix: hoist source slice, hoist destination via pointer, check
+             * `_zer_cs.len + 1 > capacity` and trap on overflow. Capacity is
+             * `sizeof(*buf)` for array destinations and `_zer_cd.len` for
+             * slice destinations. */
             int t = e->temp_count++;
+            Type *buf_type = checker_get_type(e->checker, node->intrinsic.args[0]);
+            TypeKind buf_k = type_dispatch_kind(buf_type);
+            Type *buf_eff = buf_type ? type_unwrap_distinct(buf_type) : NULL;
+            bool dest_is_slice = (buf_k == TYPE_SLICE);
             emit(e, "({ __auto_type _zer_cs%d = ", t);
             emit_rewritten_node(e, node->intrinsic.args[1], func);
-            emit(e, "; memcpy(");
-            emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, ", _zer_cs%d.ptr, _zer_cs%d.len); ((uint8_t*)", t, t);
-            emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, ")[_zer_cs%d.len] = 0; (uint8_t*)", t);
-            emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, "; })");
+            if (dest_is_slice) {
+                emit(e, "; __auto_type _zer_cd%d = ", t);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, "; if (_zer_cs%d.len + 1 > _zer_cd%d.len) "
+                       "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__);"
+                       " memcpy(_zer_cd%d.ptr, _zer_cs%d.ptr, _zer_cs%d.len);"
+                       " ((uint8_t*)_zer_cd%d.ptr)[_zer_cs%d.len] = 0;"
+                       " (uint8_t*)_zer_cd%d.ptr; })",
+                     t, t, t, t, t, t, t, t);
+            } else if (buf_k == TYPE_ARRAY) {
+                /* Array destination — known compile-time size */
+                emit(e, "; if (_zer_cs%d.len + 1 > %llu) "
+                       "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__);"
+                       " memcpy(",
+                     t, (unsigned long long)buf_eff->array.size);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", _zer_cs%d.ptr, _zer_cs%d.len); ((uint8_t*)", t, t);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ")[_zer_cs%d.len] = 0; (uint8_t*)", t);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, "; })");
+            } else {
+                /* Pointer destination (no size info) — no bounds check possible.
+                 * Callers using raw `*u8` dest are rejected at checker (Gap 27,
+                 * 2026-05-16), so this path is a defensive fallback. */
+                emit(e, "; memcpy(");
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ", _zer_cs%d.ptr, _zer_cs%d.len); ((uint8_t*)", t, t);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ")[_zer_cs%d.len] = 0; (uint8_t*)", t);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, "; })");
+            }
         } else if (nlen == 9 && memcmp(name, "cond_wait", 9) == 0 && node->intrinsic.arg_count >= 2) {
             /* @cond_wait(shared_var, cond) — check pointer vs struct for accessor */
             Type *cvt = checker_get_type(e->checker, node->intrinsic.args[0]);

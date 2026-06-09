@@ -5,6 +5,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-09 — BUG-729..732: 4 safety gaps (verified from branch zxTC6, implemented to main)
+
+Reviewed 4 `claude/cool-johnson-*` branches (verify-not-merge). The fixes from
+`claude/cool-johnson-zxTC6` were verified real (logic + reproducers compile-clean
+on main) and re-implemented directly into main under zerohexer. Not a merge —
+the two fixed files were taken from the 0-behind branch; tests copied; binary
+artifacts (`rt_task_alloc_free*`) deliberately excluded.
+
+- **BUG-729 — signed `%` VRP bounds-bypass (checker.c `derive_expr_range`).**
+  `derive_expr_range` narrowed `x % N` to `[0, N-1]` unconditionally. In C, signed
+  `%` takes the sign of the dividend (`-3 % 4 == -3`), so `arr[i % N]` with a
+  negative `i` had its index proven "in range" and the bounds check was skipped →
+  silent OOB read (no trap, hosted or baremetal). Fix: narrow to `[0,N-1]` only
+  when the dividend is provably non-negative (unsigned type, or VRP min ≥ 0);
+  otherwise widen to `[-(N-1), N-1]` so the negative case fails the ≥0 gate and
+  gets the runtime guard. (`x & MASK` stays `[0,MASK]` — signed & positive-mask is
+  non-negative in two's complement.) Test: `tests/zer/signed_mod_neg_safe.zer`.
+
+- **BUG-730 — `@ctz(0)`/`@clz(0)` undefined behavior (emitter.c IR path).**
+  Emitted `__builtin_ctz(0)`/`__builtin_clz(0)` directly — UB in C (GCC: "result
+  is undefined" for 0; BSF/BSR leak the prior register value; baremetal w/o
+  BMI1 same). Fix: wrap `@ctz`/`@clz` in a zero-guard returning the type width
+  (ctz(0)=clz(0)=bit width, matching Rust `trailing_zeros` / Zig `@ctz`).
+  `@popcount/@parity/@ffs(0)` are GCC-defined — untouched. Test: `tests/zer/ctz_clz_zero.zer`.
+
+- **BUG-731 — `@cstr` IR path missing bounds check (emitter.c).**
+  The IR `@cstr(buf, str)` handler was "Simplified: memcpy + null" with NO bounds
+  check (the AST sibling had it). Since IR is load-bearing for all function bodies
+  since 2026-04-19, this was a silent stack-buffer overflow when `src.len+1 >
+  buf size` — a textbook AST→IR safety-wrapper drop. Fix: hoist source/dest,
+  `if (len+1 > capacity) _zer_trap("@cstr buffer overflow")` (capacity = `sizeof`
+  for array dest, `.len` for slice dest; raw-pointer dest already rejected at
+  checker, Gap 27). Tests: `tests/zer_trap/cstr_overflow_{ir,slice}.zer` (exit 133).
+
+- **BUG-732 — struct-init literal carrying a local-derived pointer (checker.c).**
+  `Box b = { .ptr = &local }; g_box = b;` (and alias-ident / slice-over-local-array
+  field values) did not mark `b` as `is_local_derived`, so the whole-struct copy to
+  a global escaped. The struct-INIT analog of the struct-COPY escape work
+  (2026-06-07) — a distinct path (NODE_STRUCT_INIT in the var-decl init, not field
+  assignment). Fix: walk struct-init fields for `&local` / local-derived alias /
+  slice-over-local-array and mark the carrier `is_local_derived`. Tests:
+  `tests/zer_fail/local_escape_struct_init.zer`, `local_slice_struct_escape.zer`.
+
+Verified: reproducers reject/trap, positives exit 0, full suite green.
+
+---
+
 ## Session 2026-06-08 — asm-safety oracle (durable surface) + S2 \n-bypass finding
 
 Built `tests/test_asm_matrix.c` — guards the DURABLE asm safety surface (the

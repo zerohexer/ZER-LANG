@@ -1,0 +1,9 @@
+// REGRESSION: variant of cstr_overflow_ir.zer — slice destination should also
+// emit bounds check. Pre-fix IR path skipped check for both array and slice
+// destinations.
+i32 main() {
+    u8[4] backing;
+    [*]u8 buf_slice = backing[0..];
+    @cstr(buf_slice, "much-too-long-string"[0..]);
+    return (i32)buf_slice[0];
+}

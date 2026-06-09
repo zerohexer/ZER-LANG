@@ -1,0 +1,17 @@
+// REGRESSION: @cstr in IR emission path silently skipped bounds check, allowing
+// stack-buffer overflow at runtime (memcpy(buf, src.ptr, src.len) with no
+// guard on src.len > sizeof(buf)). The AST sibling at emitter.c:3174 had the
+// check; the IR path (used for ALL function bodies since 2026-04-19) silently
+// overwrote the stack.
+//
+// Fix (2026-06-08): IR-path @cstr now emits the same bounds check as the AST
+// path. Uses array-size compile-time or slice-len runtime. Traps on overflow
+// with "@cstr buffer overflow".
+//
+// Test compiles clean and traps at runtime — must NOT exit 0.
+const [*]u8 long_src() { return "this string is much longer than the buffer"[0..]; }
+i32 main() {
+    u8[4] buf;
+    @cstr(buf, long_src());
+    return (i32)buf[0];
+}

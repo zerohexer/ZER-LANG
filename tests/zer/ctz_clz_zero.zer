@@ -1,0 +1,28 @@
+// REGRESSION: @ctz(0) and @clz(0) silently invoked __builtin_ctz/clz with a
+// zero argument — UB per GCC docs. On x86 the BSF/BSR instruction leaves the
+// destination register unchanged when input is zero, leaking whatever was
+// previously in the register as the result. On baremetal targets without
+// BMI1 (TZCNT/LZCNT), same UB applies.
+//
+// Fix (2026-06-08): emit_rewritten_node @ctz/@clz now emits a zero-guard
+// returning the type's bit width (32 for u32, 64 for u64) when input is 0.
+// Matches Rust's u32::trailing_zeros() and Zig's @ctz semantics.
+//
+// Test: @ctz(0u32) must return 32, @clz(0u32) must return 32.
+i32 main() {
+    u32 zero32 = 0;
+    u32 t32 = @ctz(zero32);
+    u32 c32 = @clz(zero32);
+    // both must be 32 — width of u32
+    if (t32 != 32) { return 1; }
+    if (c32 != 32) { return 2; }
+    // sanity: nonzero still works
+    u32 nz = 8;  // 0b1000
+    if (@ctz(nz) != 3) { return 3; }
+    if (@clz(nz) != 28) { return 4; }
+    // u64 case
+    u64 zero64 = 0;
+    if (@ctz(zero64) != 64) { return 5; }
+    if (@clz(zero64) != 64) { return 6; }
+    return 0;
+}

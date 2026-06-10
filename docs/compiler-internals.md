@@ -4184,7 +4184,7 @@ Safe MMIO hardware discovery. `@probe(addr)` tries reading a memory address, ret
 
 **Flags:**
 - (none): strict mode, `mmio` required, @inttoptr without declaration = compile error. Declared ranges validated at boot.
-- `--no-strict-mmio`: allows @inttoptr without `mmio` declarations — plain cast, no validation (programmer's choice, like C)
+- `--no-strict-mmio`: allows @inttoptr without `mmio` declarations — RANGE validation skipped (nothing to test against). The runtime ALIGNMENT trap is still emitted for variable addresses (target-type-driven, orthogonal to mmio declarations — BUG-736, 2026-06-10). Constant addresses are alignment-checked at compile time regardless of the flag (Gap 19 fix).
 
 **@probe remains as standalone intrinsic** for manual hardware discovery. `@probe(addr)` → `?u32`, safe read. Takes `uintptr_t` (was `uint32_t` — fixed for 64-bit systems).
 

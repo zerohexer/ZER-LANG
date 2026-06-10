@@ -5,6 +5,42 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-736: --no-strict-mmio dropped the runtime alignment trap (6u360k GAP-2)
+
+With `--no-strict-mmio` and zero `mmio` declarations, a variable-address
+`@inttoptr(*u32, addr)` emitted a raw `(uint32_t*)(uintptr_t)(addr)` with NO
+runtime check at all — including the ALIGNMENT trap, which is a property of the
+target pointer type, not of mmio declarations. On Cortex-M0/M0+ a misaligned
+`volatile *u32` load BusFaults with no source line instead of giving the
+documented `_zer_trap("@inttoptr: unaligned address")`.
+
+Root cause: both emitter `@inttoptr` paths (AST `emit_expr` ~3030, IR
+`emit_rewritten_node` ~6790) gated the ENTIRE statement-expression — range
+check AND alignment check — on one flag: `need_runtime_check =
+mmio_range_count > 0 && variable-addr`. The compile-time side had already been
+fixed to treat range and alignment as orthogonal axes (Gap 19 fix, 2026-04-29);
+the runtime emission never got the same split.
+
+Fix (both emitter paths, mirrored): split into `need_range_check`
+(`mmio_range_count > 0 && variable-addr` — nothing to test against without
+declared ranges; the 2026-04-01 plain-cast decision stands for RANGE under
+--no-strict-mmio) and `need_align_check` (`target-type align > 1 &&
+variable-addr` — unconditional on declarations). The statement-expression
+wrapper is emitted when either is needed. Declared-ranges behavior is
+byte-identical to before.
+
+Also: `tests/test_zer.sh` runtime-trap section now extracts `// zerc-flags:`
+first-line flags (the positive and negative sections already did) so
+flag-dependent trap tests can run in CI.
+
+Verified: reproducer with `--no-strict-mmio` now emits 1 alignment trap +
+0 range traps; misaligned variable address traps exit 133; aligned runs exit 0;
+declared-ranges emission unchanged (1 range + 1 align trap); full suite green.
+Test: `tests/zer_trap/inttoptr_unaligned_nostrict.zer` (uses `// zerc-flags:
+--no-strict-mmio`). Closes 6u360k audit GAP-2.
+
+---
+
 ## Session 2026-06-09 — BUG-735: @ptrcast concrete→concrete type confusion (6u360k GAP-1)
 
 `*A pa = &a; *B pb = @ptrcast(*B, pa);` with A,B unrelated concrete structs

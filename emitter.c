@@ -3028,33 +3028,48 @@ static void emit_expr(Emitter *e, Node *node) {
              * With mmio ranges: variable addresses get runtime range check
              * Auto-discovery removed (2026-04-01) — --no-strict-mmio with no
              * mmio declarations just emits plain cast (like C, programmer's choice) */
-            bool need_runtime_check = e->checker->mmio_range_count > 0 &&
-                node->intrinsic.arg_count > 0 &&
+            /* GAP-2 fix (BUG-736, 2026-06-10, 6u360k audit): range and
+             * alignment are ORTHOGONAL runtime axes (mirror of the
+             * compile-time Gap 19 fix above in checker.c). The RANGE check
+             * is gated on declared ranges — nothing to test against
+             * otherwise (the 2026-04-01 plain-cast decision stands for
+             * range under --no-strict-mmio). The ALIGNMENT check is a
+             * property of the TARGET TYPE and must be emitted for variable
+             * addresses even with zero mmio declarations — a misaligned
+             * volatile *u32 load is a BusFault on Cortex-M0. */
+            bool g2_var_addr = node->intrinsic.arg_count > 0 &&
                 node->intrinsic.args[0]->kind != NODE_INT_LIT;
-            if (need_runtime_check) {
+            int g2_align = 0;
+            if (node->intrinsic.type_arg) {
+                Type *g2_t = resolve_tynode(e, node->intrinsic.type_arg);
+                Type *g2_inner = g2_t ? type_unwrap_distinct(g2_t) : NULL;
+                if (g2_inner && type_dispatch_kind(g2_inner) == TYPE_POINTER)
+                    g2_inner = g2_inner->pointer.inner;
+                g2_align = g2_inner ? type_width(g2_inner) / 8 : 0;
+            }
+            bool need_range_check = e->checker->mmio_range_count > 0 && g2_var_addr;
+            bool need_align_check = g2_align > 1 && g2_var_addr;
+            if (need_range_check || need_align_check) {
                 int tmp = e->temp_count++;
                 emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "); if (!(");
-                for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
-                    if (ri > 0) emit(e, " || ");
-                    emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
-                         tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
-                         tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                emit(e, "); ");
+                if (need_range_check) {
+                    emit(e, "if (!(");
+                    for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
+                        if (ri > 0) emit(e, " || ");
+                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
+                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
+                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                    }
+                    emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
                 }
-                emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
                 /* BUG-489: runtime alignment check — variable addresses must be
                  * aligned to target type. Constant addresses checked at compile time,
                  * but runtime addresses (0x40000000 + offset) need runtime check. */
-                if (node->intrinsic.type_arg) {
-                    Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                    Type *inner = t ? type_unwrap_distinct(t) : NULL;
-                    if (inner && inner->kind == TYPE_POINTER) inner = inner->pointer.inner;
-                    int align = inner ? type_width(inner) / 8 : 0;
-                    if (align > 1) {
-                        emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
-                             tmp, align);
-                    }
+                if (need_align_check) {
+                    emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
+                         tmp, g2_align);
                 }
                 emit(e, "(");
                 if (node->intrinsic.type_arg) {
@@ -6772,28 +6787,37 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * and runtime alignment check (must match target type). */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                bool need_runtime_check = e->checker->mmio_range_count > 0 &&
-                    node->intrinsic.arg_count > 0 &&
+                /* GAP-2 fix (BUG-736): see AST sibling in emit_expr — the
+                 * alignment check is target-type-driven and emitted even
+                 * with zero declared mmio ranges (--no-strict-mmio path);
+                 * only the range check is gated on declarations. */
+                bool g2_var_addr = node->intrinsic.arg_count > 0 &&
                     node->intrinsic.args[0]->kind != NODE_INT_LIT;
-                if (need_runtime_check) {
+                Type *g2_inner = t ? type_unwrap_distinct(t) : NULL;
+                if (g2_inner && type_dispatch_kind(g2_inner) == TYPE_POINTER)
+                    g2_inner = g2_inner->pointer.inner;
+                int g2_align = g2_inner ? type_width(g2_inner) / 8 : 0;
+                bool need_range_check = e->checker->mmio_range_count > 0 && g2_var_addr;
+                bool need_align_check = g2_align > 1 && g2_var_addr;
+                if (need_range_check || need_align_check) {
                     int tmp = e->temp_count++;
                     emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, "); if (!(");
-                    for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
-                        if (ri > 0) emit(e, " || ");
-                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
-                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
-                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                    emit(e, "); ");
+                    if (need_range_check) {
+                        emit(e, "if (!(");
+                        for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
+                            if (ri > 0) emit(e, " || ");
+                            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
+                                 tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
+                                 tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                        }
+                        emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
                     }
-                    emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
                     /* Runtime alignment check for variable address */
-                    Type *inner = t ? type_unwrap_distinct(t) : NULL;
-                    if (inner && inner->kind == TYPE_POINTER) inner = inner->pointer.inner;
-                    int align = inner ? type_width(inner) / 8 : 0;
-                    if (align > 1) {
+                    if (need_align_check) {
                         emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
-                             tmp, align);
+                             tmp, g2_align);
                     }
                     emit(e, "(");
                     emit_type(e, t);

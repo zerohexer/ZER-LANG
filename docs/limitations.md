@@ -5,24 +5,17 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 6u360k audit (2026-06-09): 6 confirmed silent gaps
+## OPEN — 6u360k audit (2026-06-09): 5 confirmed silent gaps
 
 From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
 RE-VERIFIED present in current main. Reproducers (NOT auto-run — each compiles
 clean / runs without trap, which is the bug): `tests/audit_2026-06-09/*.zer`.
 **CLOSED so far:** GAP-5 (orelse overwrite leak) by BUG-734; GAP-1 (`@ptrcast`
-concrete type confusion) by BUG-735 (2026-06-09) — now guarded by
-`tests/zer_fail/ptrcast_concrete_confusion.zer`. When fixing one, move its
+concrete type confusion) by BUG-735 — guarded by
+`tests/zer_fail/ptrcast_concrete_confusion.zer`; GAP-2 (`--no-strict-mmio`
+dropped runtime alignment trap) by BUG-736 (2026-06-10) — guarded by
+`tests/zer_trap/inttoptr_unaligned_nostrict.zer`. When fixing one, move its
 reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
-
-- **GAP-2 — `--no-strict-mmio` strips the RUNTIME range+align check (HIGH).**
-  The flag is documented as relaxing COMPILE-TIME strictness, but it also drops
-  the emitted `_zer_trap("@inttoptr: address outside mmio range")` and unaligned
-  trap (verified: 0 trap-checks in emitted C with the flag). Bare-metal build at
-  a runtime-computed address can silently write any peripheral / BusFault on
-  Cortex-M0. Fix: `--no-strict-mmio` should relax only compile-time enforcement;
-  the runtime range check stays whenever ranges are declared, and the alignment
-  check stays unconditionally. Repro: `gap_nostrict_mmio_drops_runtime.zer`.
 
 - **GAP-3 — `alloc_ptr` global-alias UAF silent at BOTH gates (HIGH).**
   `*T p = heap.alloc_ptr() orelse return; g_ptr = p; heap.free_ptr(p);

@@ -1,0 +1,17 @@
+// zerc-flags: --no-strict-mmio
+// BUG-736 (6u360k audit GAP-2): `--no-strict-mmio` must NOT drop the
+// runtime ALIGNMENT trap. Alignment is a property of the target pointer
+// type (*u32 needs 4-byte alignment), not of mmio declarations — only
+// the RANGE check is gated on declared ranges. Pre-fix this emitted a
+// raw cast with no check at all; on Cortex-M0 the misaligned load would
+// BusFault instead of giving a sourced ZER trap.
+//
+// 0x40000001 is misaligned for *u32 -> _zer_trap("unaligned address").
+
+i32 external_addr() { return 0x40000001; }
+
+i32 main() {
+    i32 addr = external_addr();
+    volatile *u32 reg = @inttoptr(*u32, addr);
+    return 0;
+}

@@ -65,7 +65,10 @@ for f in tests/zer_trap/*.zer; do
     name=$(basename "$f" .zer)
     TOTAL=$((TOTAL + 1))
     # Runtime-trap tests: compile clean, run, EXPECT non-zero exit (SIGTRAP = 133).
-    $ZERC "$f" $EXTRA_FLAGS --run 2>/dev/null
+    # Per-file flags via '// zerc-flags: ...' first line (same as positive/negative
+    # sections) — e.g. BUG-736's --no-strict-mmio alignment-trap test.
+    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
     ret=$?
     if [ $ret -ne 0 ]; then
         PASS=$((PASS + 1))

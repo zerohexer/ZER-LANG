@@ -13,4 +13,6 @@ see tests/zer_fail/overwrite_alive_handle_*.zer); GAP-1 @ptrcast concrete type
 confusion (BUG-735, see tests/zer_fail/ptrcast_concrete_confusion.zer);
 GAP-2 --no-strict-mmio dropped runtime alignment trap (BUG-736, see
 tests/zer_trap/inttoptr_unaligned_nostrict.zer); GAP-8 by-value struct param
-laundering (BUG-737, see tests/zer_fail/arena_escape_struct_param.zer).
+laundering (BUG-737, see tests/zer_fail/arena_escape_struct_param.zer);
+GAP-7 container composite type args (BUG-738, see
+tests/zer_fail/container_composite_type_arg.zer).

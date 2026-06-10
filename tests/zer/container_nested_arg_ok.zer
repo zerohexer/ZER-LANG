@@ -1,0 +1,14 @@
+// BUG-738 positive: NESTED container instantiation must keep working —
+// Stack(Stack(u32)) resolves inner-first, so the outer arg's printed
+// name is the already-stamped identifier "Stack_u32" (valid). The
+// composite-arg rejection must not touch this.
+
+container Stack(T) { T[4] data; u32 top; }
+
+i32 main() {
+    Stack(u32) s;
+    s.top = 1;
+    Stack(Stack(u32)) ss;
+    ss.top = 2;
+    return (i32)(s.top + ss.top) - 3;
+}

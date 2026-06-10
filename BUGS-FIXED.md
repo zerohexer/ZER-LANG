@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-738: container composite type args → GCC error instead of ZER error (6u360k GAP-7)
+
+`Box(?u32)` / `Box(*u32)` / `Pair(Handle(Item))` / `Box([*]u8)` stamped struct
+names like `Box_?u32` — GCC syntax error pointing at emitted C, far from the
+originating ZER line. Not a safety hole (loud at GCC) but a bad-diagnostic UX
+gap.
+
+Fix (checker.c TYNODE_CONTAINER instantiation): after building the mangled
+name from `type_name(concrete)`, validate it is a valid C identifier — a
+MECHANICAL gate, no type-kind enumeration, so any current or future type whose
+printed name can't form an identifier is caught (composites print `?` `*` `[]`
+`(` `,`; named types print bare identifiers). Clean error with a wrapper-struct
+hint: "wrap composite types in a named struct ('struct Ref { ?u32 v; }' then
+'Box(Ref)')". Critical non-regression discovered while designing: NESTED
+containers (`Stack(Stack(u32))`) work today because the arg resolves
+inner-first to the already-stamped identifier `Stack_u32` — a TYNODE-kind
+rejection would have broken them; the resolved-name gate accepts them by
+construction.
+
+Verified: reproducer rejects with the ZER error at the right line; nested
+containers and named-struct args still compile + run; full suite green.
+Tests: `tests/zer_fail/container_composite_type_arg.zer`,
+`tests/zer/container_nested_arg_ok.zer`. Closes 6u360k audit GAP-7.
+
+---
+
 ## Session 2026-06-10 — BUG-737: by-value struct param laundered arena/local pointers to globals (6u360k GAP-8)
 
 `local.ptr = p` (p arena-derived) → `take(local)` (by-value `Container` param)

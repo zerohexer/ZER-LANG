@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// BUG-738 (6u360k audit GAP-7): composite container type args produced
+// stamped names like "Box_?u32" -> GCC syntax error far from the ZER
+// source. Now a clean ZER error at the instantiation site, with a
+// wrapper-struct hint. Gate is mechanical: stamped name must be a valid
+// C identifier.
+
+container Box(T) { T val; }
+
+i32 main() {
+    Box(?u32) b1;
+    Box(*u32) b2;
+    return 0;
+}

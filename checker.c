@@ -1838,6 +1838,37 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         char *mname = (char *)arena_alloc(c->arena, mlen + 1);
         memcpy(mname, mangled, mlen + 1);
 
+        /* GAP-7 (BUG-738, 2026-06-10, 6u360k audit): composite type args
+         * (Box(?u32), Box(*u32), Pair(Handle(Item)), Box([*]u8)) produced
+         * stamped struct names like "Box_?u32" — GCC syntax errors pointing
+         * at emitted C far from the ZER source. Gate MECHANICALLY on the
+         * stamped name being a valid C identifier (no type-kind enumeration:
+         * any current or future type whose printed name can't form an
+         * identifier is caught). Nested containers stay valid by
+         * construction — Stack(Stack(u32)) resolves inner-first, so the
+         * outer arg's name is the already-stamped "Stack_u32". */
+        {
+            bool g7_ok = (mlen > 0) && !(mname[0] >= '0' && mname[0] <= '9');
+            for (int g7i = 0; g7_ok && g7i < mlen; g7i++) {
+                char g7c = mname[g7i];
+                if (!((g7c >= 'a' && g7c <= 'z') || (g7c >= 'A' && g7c <= 'Z') ||
+                      (g7c >= '0' && g7c <= '9') || g7c == '_')) {
+                    g7_ok = false;
+                }
+            }
+            if (!g7_ok) {
+                checker_error(c, tn->loc.line,
+                    "container type argument '%s' is not a plain named type — "
+                    "'%.*s(%s)' cannot be instantiated. Use a primitive or a "
+                    "named struct/enum/union; wrap composite types in a named "
+                    "struct (e.g. 'struct Ref { %s v; }' then '%.*s(Ref)')",
+                    ctype_name, (int)cnlen, cname, ctype_name, ctype_name,
+                    (int)cnlen, cname);
+                _container_depth--;
+                return ty_void;
+            }
+        }
+
         /* Pre-stamp collision check: if a user-defined type with the mangled
          * name already exists, refuse to silently shadow it. Prior behavior
          * stamped into c->current_scope (function scope when the container

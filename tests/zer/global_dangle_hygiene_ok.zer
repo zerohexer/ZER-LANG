@@ -1,0 +1,42 @@
+// BUG-742 positives — the dangling-global rules must NOT fire on:
+// s1: the taught hygiene — free, null, exit; reader takes orelse path
+// s2: registration function — store and exit ALIVE, reader uses it
+// s3: free through the global read-back, then reset
+
+struct Item { u32 value; }
+Slab(Item) heap;
+?*Item g_ptr;
+
+u32 reader() {
+    *Item gp = g_ptr orelse return;
+    return gp.value;
+}
+
+void store_free_null() {
+    *Item p = heap.alloc_ptr() orelse return;
+    g_ptr = p;
+    heap.free_ptr(p);
+    g_ptr = null;
+}
+
+void store_alive() {
+    *Item p = heap.alloc_ptr() orelse return;
+    p.value = 5;
+    g_ptr = p;
+}
+
+void free_via_global() {
+    *Item gp = g_ptr orelse return;
+    heap.free_ptr(gp);
+    g_ptr = null;
+}
+
+i32 main() {
+    store_free_null();
+    u32 a = reader();      // 0 — orelse path
+    store_alive();
+    u32 b = reader();      // 5
+    free_via_global();
+    u32 c = reader();      // 0 — orelse path
+    return (i32)(a + b + c) - 5;
+}

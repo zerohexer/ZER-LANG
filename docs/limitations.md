@@ -18,19 +18,20 @@ per-function scope — see follow-up below), GAP-4 funcptr double-free
 The `tests/audit_2026-06-09/` reproducer directory is retired — every
 reproducer was promoted into `tests/zer_fail/` or `tests/zer_trap/`.
 
-## OPEN — cross-function global-pointer UAF (MEDIUM, follow-up from BUG-739)
+## OPEN — conditional global dangle (MAYBE_FREED at exit) unflagged (LOW, BUG-742 residual)
 
-BUG-739 closed the same-function case via `IR_GLOBAL_ROOT_ID` pseudo-root
-entries. Cross-function remains open: `void f() { g_ptr = p; free_ptr(p); }
-void g() { use(g_ptr); }` — per-function analysis can't see f's free from
-g's body, and alloc_ptr `*T` has no runtime generation net. The same
-boundary applies to BUG-740's barrier (an indirect callee freeing a pointer
-held in a global the caller never passed) and to direct calls (FuncSummary
-doesn't track global frees either) — one fix covers all three. Fix sketch:
-FuncSummary (Model 3) records "function leaves global G dangling"
-(stored-then-freed without reset); call sites + module exit check globals.
-Alternatively document `*T`-in-global as Handle-recommended territory
-(Handle has the runtime gen net for exactly this).
+BUG-742 (2026-06-10) closed cross-function global UAF at the source: a
+global definitely FREED at function exit or at a ZER/indirect call site is
+a compile error (teaches `g = null;` after the free). DELIBERATELY out of
+scope: globals in MAYBE_FREED state at those points — `if (c) {
+heap.free_ptr(p); }` then exit leaves the global conditionally dangling,
+unflagged. Why: BUG-740/741 widenings produce MAYBE_FREED + escaped on
+legitimate hand-off patterns (`g_ptr = p; fp(p);` register-ctx-then-
+callback), and flagging MAYBE at exit would reject exactly those. Fix
+sketch if ever needed: distinguish widened-by-barrier (escaped at widening
+time) from conditionally-freed-by-user (definite IRMC_FREE on one branch)
+with a per-entry origin bit, and flag only the latter. Reproducer shape:
+conditional free of a global-held pointer without reset on that branch.
 
 
 

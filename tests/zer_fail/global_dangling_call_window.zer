@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// BUG-742 call-window rule: calling a ZER function while a global is
+// definitely dangling may observe freed memory — even if the global is
+// reset afterwards. Reset BEFORE making calls.
+
+struct Item { u32 value; }
+Slab(Item) heap;
+?*Item g_ptr;
+
+u32 helper() {
+    *Item gp = g_ptr orelse return;
+    return gp.value;
+}
+
+i32 main() {
+    *Item p = heap.alloc_ptr() orelse return;
+    g_ptr = p;
+    heap.free_ptr(p);
+    u32 v = helper();   // observes the dangle — error
+    g_ptr = null;       // too late
+    return (i32)v;
+}

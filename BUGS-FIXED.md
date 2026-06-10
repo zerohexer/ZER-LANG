@@ -5,6 +5,51 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-742: cross-function global-pointer UAF closed at the source (BUG-739 follow-up)
+
+`void f() { g_ptr = p; heap.free_ptr(p); }  u32 g() { gp = g_ptr orelse
+return; gp.value }  main() { f(); g(); }` — silent UAF: per-function analysis
+cannot see f's free from g's body, and alloc_ptr `*T` has no runtime
+generation net. The limitations.md fix sketch proposed FuncSummary plumbing
+("function leaves global G dangling" + call-site application + "reads global
+G" summaries). Implemented design is SIMPLER and STRONGER: close the class at
+the source so a dangling global is unobservable at every boundary
+per-function analysis can't see across — no summary fields at all:
+
+- **Exit rule** (zercheck_ir.c exit pass, checked BEFORE the escaped skip
+  since global entries always carry escaped=true): a `IR_GLOBAL_ROOT_ID`
+  entry definitely FREED at a return block → "global 'g_ptr' left dangling
+  at function exit — reset it ('g_ptr = null;') after the free, or free
+  through it before returning". With no function allowed to RETURN while a
+  global dangles, no caller can ever propagate a dangle.
+- **Call-window rule** (`ir_check_dangling_globals_at_call`, hooked at
+  IR_CALL direct-with-summary + indirect, and IR_ASSIGN result-assigned
+  calls): calling a ZER-defined function (FuncSummary exists) or an indirect
+  callee while a global is definitely FREED → "call may observe dangling
+  global". Closes the intra-function window `free(p); helper(); g = null;`.
+  Builtin Pool/Slab/... methods and bodyless externs are exempt — builtins
+  cannot read user globals; externs are outside the safety boundary.
+
+Both rules teach the same one-line hygiene: `g_ptr = null;` immediately after
+the free (the BUG-739 store hook's reset branch clears the entry on null
+assignment, so the taught fix is recognized). Together with BUG-739's
+same-function read tracking, the dangling-global class is closed without
+Model 3 changes.
+
+Deliberate scope: MAYBE_FREED globals at exit/call are NOT flagged —
+BUG-740/741 widenings produce MAYBE on legitimate hand-off patterns
+(register-ctx-then-callback), and flagging them would noise exactly those.
+Conditional dangles (`if (c) { free(p) }` then exit) therefore remain
+unflagged — recorded in docs/limitations.md as a narrower OPEN residual.
+
+Verified: cross-function reproducer rejects in f (exit rule);
+free-call-reset-too-late rejects (call window); hygiene/registration/
+free-via-global positives all clean; extern-call window exempt; full suite
+green. Tests: `tests/zer_fail/global_dangling_at_exit.zer`,
+`global_dangling_call_window.zer`, `tests/zer/global_dangle_hygiene_ok.zer`.
+
+---
+
 ## Session 2026-06-10 — BUG-741: variable-index array double-free silent (6u360k GAP-6)
 
 `heap.free(arr[k]); heap.free(arr[0]);` with k==0 at runtime — silent double

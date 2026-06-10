@@ -1,0 +1,28 @@
+// EXPECTED: compile error
+// BUG-742 (follow-up from BUG-739): cross-function global UAF, closed at
+// the SOURCE. f() returns while g_ptr points at freed memory — any later
+// reader in any function observes the dangle, which per-function
+// analysis cannot see across. Rule: a global definitely FREED at
+// function exit is an error. The fix is one line: g_ptr = null; after
+// the free.
+
+struct Item { u32 value; }
+Slab(Item) heap;
+?*Item g_ptr;
+
+void f() {
+    *Item p = heap.alloc_ptr() orelse return;
+    p.value = 99;
+    g_ptr = p;
+    heap.free_ptr(p);
+}
+
+u32 g() {
+    *Item gp = g_ptr orelse return;
+    return gp.value;
+}
+
+i32 main() {
+    f();
+    return (i32)g();
+}

@@ -1608,6 +1608,45 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
     }
 }
 
+/* BUG-742 (2026-06-10) call-window rule: a call to code that may READ
+ * globals — any ZER-defined callee (has a FuncSummary) or any indirect
+ * callee — while a global pseudo-root entry is definitely FREED may
+ * observe the dangle. Together with the exit rule (return while a
+ * global is FREED), this makes a dangling global UNOBSERVABLE at every
+ * boundary per-function analysis cannot see across — closing the
+ * cross-function global UAF class without any summary plumbing.
+ * Builtin Pool/Slab/Ring/Arena methods and bodyless externs are
+ * excluded: builtins cannot read user globals; externs are outside the
+ * safety boundary (cinclude territory). The fix the rule teaches is
+ * one line: reset the global ('g = null;') right after the free. */
+static void ir_check_dangling_globals_at_call(ZerCheck *zc, IRPathState *ps,
+                                              int line) {
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        if (h->local_id != IR_GLOBAL_ROOT_ID) continue;
+        if (h->state != IR_HS_FREED) continue;
+        if (h->path_len == 0) continue;
+        ir_zc_error(zc, line,
+            "call may observe dangling global '%.*s' (target freed at "
+            "line %d) — reset it ('%.*s = null;') before making calls",
+            (int)h->path_len, h->path, h->free_line,
+            (int)h->path_len, h->path);
+    }
+}
+
+/* BUG-742 helper: does a FuncSummary exist for this callee name?
+ * Proxy for "ZER-defined function" — bodyless externs never get one. */
+static bool ir_callee_has_summary(ZerCheck *zc, const char *name,
+                                  uint32_t name_len) {
+    if (!name || name_len == 0) return false;
+    for (int si = 0; si < zc->summary_count; si++) {
+        if (zc->summaries[si].func_name_len == name_len &&
+            memcmp(zc->summaries[si].func_name, name, name_len) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* ================================================================
  * Instruction Analysis — process one IR instruction
  * ================================================================ */
@@ -2531,10 +2570,23 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 IRMethodKind mc = ir_classify_method_call_ex(zc->checker, rhs);
                 /* GAP-4 (BUG-740): result-assigned indirect call —
                  * `u32 x = fp(h);`. Same argument-precise barrier as the
-                 * statement-form IR_CALL hook. */
+                 * statement-form IR_CALL hook. BUG-742: same dangling-
+                 * global call-window check too — result-assigned calls to
+                 * ZER functions (`u32 v = g();`) or through funcptrs are
+                 * observation points just like statement calls. */
                 if (mc == IRMC_NONE && ir_call_is_indirect(zc, func, rhs)) {
+                    ir_check_dangling_globals_at_call(zc, ps,
+                                                      inst->source_line);
                     ir_indirect_call_barrier(zc, func, ps, rhs,
                                              inst->source_line);
+                } else if (mc == IRMC_NONE &&
+                           rhs->call.callee &&
+                           rhs->call.callee->kind == NODE_IDENT &&
+                           ir_callee_has_summary(zc,
+                               rhs->call.callee->ident.name,
+                               (uint32_t)rhs->call.callee->ident.name_len)) {
+                    ir_check_dangling_globals_at_call(zc, ps,
+                                                      inst->source_line);
                 }
                 if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
                     IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
@@ -3254,9 +3306,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
         /* GAP-4 (BUG-740): indirect call — unknown callee, no FuncSummary
          * to apply. Argument-precise barrier instead: what was handed in
-         * may have been freed. See ir_indirect_call_barrier. */
+         * may have been freed. See ir_indirect_call_barrier.
+         * BUG-742: an unknown callee may also READ globals — check the
+         * dangling-global window first (prior state, before this call's
+         * own effects). */
         if (inst->expr && inst->expr->kind == NODE_CALL &&
             ir_call_is_indirect(zc, func, inst->expr)) {
+            ir_check_dangling_globals_at_call(zc, ps, inst->source_line);
             ir_indirect_call_barrier(zc, func, ps, inst->expr,
                                      inst->source_line);
             break;
@@ -3273,6 +3329,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 memcmp(zc->summaries[si].func_name, fn_name, fn_name_len) == 0) {
                 summary = &zc->summaries[si]; break;
             }
+        }
+
+        /* BUG-742 call-window rule: a ZER-defined callee (summary exists)
+         * can read globals — calling it while a global is definitely
+         * dangling may observe freed memory. Bodyless externs never have
+         * a summary and are excluded (outside the safety boundary). */
+        if (summary) {
+            ir_check_dangling_globals_at_call(zc, ps, inst->source_line);
         }
 
         /* Phase F: param-color inference application.
@@ -4591,6 +4655,44 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         IRPathState *ps = &block_states[bi];
         for (int hi = 0; hi < ps->handle_count; hi++) {
             IRHandleInfo *h = &ps->handles[hi];
+            /* Cross-function global UAF, exit rule (BUG-742, 2026-06-10,
+             * follow-up from BUG-739): a GLOBAL pseudo-root entry that is
+             * definitely FREED at a return block means the function returns
+             * while the global points at freed memory — ANY later reader
+             * (any function, any call depth) observes the dangle, which
+             * per-function analysis cannot see. Closing it at the source
+             * makes the cross-function case unrepresentable: no summaries
+             * needed. The one-line fix is hygiene the rule teaches —
+             * `g = null;` after the free (the BUG-739 store hook resets the
+             * entry on null assignment). MAYBE_FREED is deliberately NOT
+             * flagged here: BUG-740/741 widenings produce MAYBE on
+             * legitimate hand-off patterns (register-ctx-then-callback);
+             * definite dangles only. Checked BEFORE the escaped skip —
+             * global entries always carry escaped=true by invariant. */
+            if (h->local_id == IR_GLOBAL_ROOT_ID &&
+                h->state == IR_HS_FREED && h->path_len > 0) {
+                bool g_already = false;
+                for (int ri = 0; ri < reported_n; ri++) {
+                    if (reported_ids[ri] == h->alloc_id) { g_already = true; break; }
+                }
+                if (!g_already) {
+                    ir_zc_error(zc, last->source_line,
+                        "global '%.*s' left dangling at function exit — its "
+                        "target was freed at line %d; reset it ('%.*s = null;') "
+                        "after the free, or free through it before returning",
+                        (int)h->path_len, h->path, h->free_line,
+                        (int)h->path_len, h->path);
+                    if (reported_n >= reported_cap) {
+                        reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                        int *nr = (int *)realloc(reported_ids,
+                            reported_cap * sizeof(int));
+                        if (nr) reported_ids = nr;
+                    }
+                    if (reported_n < reported_cap)
+                        reported_ids[reported_n++] = h->alloc_id;
+                }
+                continue;
+            }
             if (h->escaped) continue;
             if (h->source_color == ZC_COLOR_ARENA) continue;
             if (h->local_id >= 0 && h->local_id < func->local_count) {

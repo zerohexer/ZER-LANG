@@ -22,6 +22,15 @@ test_firmware2
 test_firmware3
 test_production
 test_semantic_fuzz
+test_shape_matrix
+test_escape_matrix
+test_keep_matrix
+test_cflow_matrix
+test_conc_matrix
+test_hw_matrix
+test_async_matrix
+test_asm_matrix
+test_ir_validate
 
 # Editor/IDE
 .idea/
@@ -55,4 +64,9 @@ tests/zer/super_sensor_logger
 tests/zer/super_uart_parser
 tests/zer/typecast_cstyle
 tests/zer/typecast_safe_complex
+tests/zer/distinct_slice_ops
 tests/zer_proof/A01_no_uaf
+
+# Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
+rust_tests/rt_task_alloc_free
+rust_tests/rt_task_alloc_free_cycle

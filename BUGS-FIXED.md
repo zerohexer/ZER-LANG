@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-744: Ring.pop IR-path emission missing acquire fence (BUG-348 regression class)
+
+`chan.pop()` on a multi-producer multi-consumer Ring (or Ring + ISR
+pattern) silently dropped the `__atomic_thread_fence(__ATOMIC_ACQUIRE)`
+between data load and tail update. The AST emission path (emitter.c
+`ring.pop()` "({_zer_rp...})" branch around line 1700) included this
+fence; the IR-path inline emission (around line 5485) did not.
+
+The release/acquire pair was added by BUG-348 (`_zer_ring_push` includes
+`__atomic_thread_fence(__ATOMIC_RELEASE)` between data write and head
+update). Without the consumer-side acquire fence, weakly-ordered CPUs
+(ARM, RISC-V) may reorder the data load past the tail decrement /
+count-- — letting a producer running on another core see "ring drained"
+and overwrite the slot before the consumer has actually finished
+reading. Same regression class as BUG-595..599 (AST→IR safety-wrapper
+stripping during the Phase 8b local-ID emission migration).
+
+**Fix:** added the acquire fence to the IR-path one-liner emission. Now
+emits:
+```
+_zer_ro%d.value = chan.data[chan.tail];
+__atomic_thread_fence(__ATOMIC_ACQUIRE);       /* paired with producer release */
+_zer_ro%d.has_value = 1;
+chan.tail = (chan.tail + 1) % CAPACITY;
+chan.count--;
+```
+
+**Why it didn't manifest on x86:** the strong total store order hides
+the reorder at runtime. The bug ships as soon as anyone builds for ARM
+or RISC-V (which ZER already supports via target-arch CLI flag).
+
+**Regression test:** `tests/zer/ring_pop_acquire_fence.zer`. Functional
+test of push/pop semantics; the structural proof is the fence presence
+in the emitted C, verifiable by `grep -A2 "chan.data\[chan.tail\]"`.
+
+---
+
 ## Session 2026-06-10 — BUG-743: defer body emitted twice on goto-to-cleanup-label pattern
 
 Documented OPEN bug in `docs/limitations.md` "Defer fires twice when goto

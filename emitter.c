@@ -5482,7 +5482,22 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             emit(e,";_zer_ring_push(%.*s.data,&%.*s.head,&%.*s.tail,&%.*s.count,%llu,&_zer_rp%d,sizeof(_zer_rp%d));})",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,t,t); return true;
         }
         if (ml==3 && !memcmp(mn,"pop",3)) {
-            int t=e->temp_count++; Type *opt=type_optional(e->arena,te->ring.elem); emit(e,"({"); emit_type(e,opt); emit(e," _zer_ro%d={0};if(%.*s.count>0){_zer_ro%d.value=%.*s.data[%.*s.tail];_zer_ro%d.has_value=1;%.*s.tail=(%.*s.tail+1)%%%llu;%.*s.count--;}_zer_ro%d;})",t,(int)ol,on,t,(int)ol,on,(int)ol,on,t,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,(int)ol,on,t); return true;
+            /* BUG-348 pairing: acquire fence AFTER data read, BEFORE tail
+             * update — pairs with `_zer_ring_push`'s release fence. Without
+             * it, weakly-ordered CPUs (ARM, RISC-V) may reorder the data
+             * load after the consumer's tail decrement, letting a producer
+             * see "ring drained" and overwrite the slot before the consumer
+             * has actually finished reading.
+             *
+             * The AST-path emission (emitter.c ring.pop "({_zer_rp...})"
+             * branch) already includes this fence. The IR-path emission
+             * below previously omitted it — same regression class as
+             * BUG-595/596 (AST→IR safety-wrapper stripping).
+             *
+             * Verified by inspection of generated C: pre-fix, `chan.pop()`
+             * emitted `_zer_ro%d.value=chan.data[chan.tail]; %d.has_value=1;`
+             * with NO acquire fence between the load and the tail update. */
+            int t=e->temp_count++; Type *opt=type_optional(e->arena,te->ring.elem); emit(e,"({"); emit_type(e,opt); emit(e," _zer_ro%d={0};if(%.*s.count>0){_zer_ro%d.value=%.*s.data[%.*s.tail];__atomic_thread_fence(__ATOMIC_ACQUIRE);_zer_ro%d.has_value=1;%.*s.tail=(%.*s.tail+1)%%%llu;%.*s.count--;}_zer_ro%d;})",t,(int)ol,on,t,(int)ol,on,(int)ol,on,t,(int)ol,on,(int)ol,on,(unsigned long long)te->ring.count,(int)ol,on,t); return true;
         }
         if (ml==12 && !memcmp(mn,"push_checked",12) && node->call.arg_count>0) {
             /* ring.push_checked(val) → ?void (null if full).

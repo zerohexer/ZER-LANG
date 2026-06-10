@@ -1,0 +1,51 @@
+// Regression: Ring.pop() must emit __atomic_thread_fence(__ATOMIC_ACQUIRE)
+// AFTER the data read and BEFORE the tail update, pairing with
+// _zer_ring_push's release fence (BUG-348).
+//
+// Without the acquire fence, weakly-ordered CPUs (ARM/RISC-V) may reorder
+// the data load past the tail decrement, letting a producer running on
+// another core see "ring drained" and overwrite the slot before the
+// consumer has finished reading.
+//
+// The AST emission path included this fence. The IR path (used for the
+// `chan.pop()` builtin method emission) was missing it — same regression
+// class as BUG-595/596 (AST→IR safety-wrapper stripping).
+//
+// This test only verifies the basic functional pop path. The structural
+// proof of the fence presence is in the emitted C — see comment in
+// emitter.c "ring.pop" branch where the fence is now emitted.
+//
+// (Multi-threaded reproducer of the original reorder bug requires weakly-
+// ordered hardware to manifest naturally; on x86 the strong memory model
+// hides the bug at runtime, but the fence MUST still be emitted for
+// portability — that's the safety guarantee.)
+
+struct Msg { u32 v; }
+Ring(Msg, 8) chan;
+
+i32 main() {
+    Msg m;
+    m.v = 42;
+    chan.push(m);
+    m.v = 100;
+    chan.push(m);
+
+    ?Msg first = chan.pop();
+    ?Msg second = chan.pop();
+    ?Msg empty = chan.pop();
+
+    if (first) |v| {
+        if (v.v != 42) { return 1; }
+    } else {
+        return 4;  // pop should have returned a value
+    }
+    if (second) |v| {
+        if (v.v != 100) { return 2; }
+    } else {
+        return 5;
+    }
+    if (empty) |v| {
+        return 3;  // should not enter — pop on empty returns null
+    }
+    return 0;
+}

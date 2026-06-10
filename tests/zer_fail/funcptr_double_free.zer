@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// BUG-740 (6u360k audit GAP-4): indirect call freeing a handle, then a
+// direct free — double free that passed both gates silently (no
+// FuncSummary for funcptr targets; _zer_slab_free is lenient on the
+// free path). Now: the argument-precise barrier widens anything HANDED
+// to an unknown callee to MAYBE_FREED, so the later direct free errors.
+
+struct Item { u32 value; }
+Slab(Item) heap;
+
+void free_handle(Handle(Item) h) { heap.free(h); }
+
+i32 main() {
+    Handle(Item) h = heap.alloc() orelse return;
+    *(Handle(Item)) -> void fp = free_handle;
+    fp(h);          // handed to unknown callee — may be freed
+    heap.free(h);   // DOUBLE FREE — now caught
+    return 0;
+}

@@ -1,0 +1,44 @@
+// BUG-740 positives — the argument-precise barrier must NOT fire on:
+// s1: callee-owns transfer (caller silent after fp(h))
+// s2: precision — indirect call that never received the handle
+// s3: the pass-data idiom (fp gets the value, caller keeps the handle)
+
+struct Item { u32 value; }
+Slab(Item) heap;
+
+void take_own(Handle(Item) h) { heap.free(h); }
+void log_val(u32 x) { }
+
+u32 s1() {
+    Handle(Item) h = heap.alloc() orelse return;
+    *(Handle(Item)) -> void fp = take_own;
+    fp(h);
+    return 1;
+}
+
+u32 s2() {
+    Handle(Item) h = heap.alloc() orelse return;
+    *(u32) -> void fp = log_val;
+    fp(42);
+    h.value = 5;
+    u32 v = h.value;
+    heap.free(h);
+    return v;
+}
+
+u32 s3() {
+    Handle(Item) h = heap.alloc() orelse return;
+    h.value = 9;
+    *(u32) -> void fp = log_val;
+    fp(h.value);
+    u32 v = h.value;
+    heap.free(h);
+    return v;
+}
+
+i32 main() {
+    u32 a = s1();
+    u32 b = s2();
+    u32 c = s3();
+    return (i32)(a + b + c) - 15;
+}

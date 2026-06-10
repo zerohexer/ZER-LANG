@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// BUG-740 companion: USING a handle after handing it to an indirect
+// callee is use-after-conditional-free. Restructure: pass data
+// (pool.get(h).field) if the caller keeps ownership, or stop touching
+// the handle if the callee owns it.
+
+struct Item { u32 value; }
+Slab(Item) heap;
+
+void cb(Handle(Item) h) { heap.free(h); }
+
+i32 main() {
+    Handle(Item) h = heap.alloc() orelse return;
+    *(Handle(Item)) -> void fp = cb;
+    fp(h);
+    u32 v = h.value;   // may be freed by the callee — error
+    return (i32)v;
+}

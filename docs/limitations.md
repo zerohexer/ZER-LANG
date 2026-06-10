@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 6u360k audit (2026-06-09): 2 confirmed silent gaps
+## OPEN — 6u360k audit (2026-06-09): 1 confirmed silent gap
 
 From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
 RE-VERIFIED present in current main. Reproducers (NOT auto-run — each compiles
@@ -19,19 +19,15 @@ laundering arena/local pointers) by BUG-737 — guarded by
 `tests/zer_fail/arena_escape_struct_param.zer`; GAP-7 (container composite
 type args → GCC error) by BUG-738 — guarded by
 `tests/zer_fail/container_composite_type_arg.zer`; GAP-3 (alloc_ptr
-global-alias UAF) by BUG-739 (2026-06-10) — guarded by
+global-alias UAF) by BUG-739 — guarded by
 `tests/zer_fail/alloc_ptr_global_alias_uaf.zer` (per-function scope;
-cross-function global UAF tracked below). When fixing one, move its
+cross-function global UAF tracked below); GAP-4 (funcptr free → silent
+double-free) by BUG-740 (2026-06-10) — argument-precise indirect-call
+barrier, guarded by `tests/zer_fail/funcptr_double_free.zer` +
+`funcptr_use_after_hand.zer`. When fixing one, move its
 reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
 
 
-- **GAP-4 — function-pointer free not tracked → silent double-free (HIGH).**
-  Calling `fp(h)` through a funcptr whose target frees `h`, then `heap.free(h)`:
-  silent (exit 0). zercheck_ir doesn't propagate the free across the indirect
-  call, and `_zer_slab_free` is lenient on already-freed handles. Overlaps the
-  existing "Gap 15 reverified" entry. Fix: conservative "any indirect call widens
-  ALL ALIVE handles to MAYBE_FREED" barrier (or only handles of the funcptr's
-  signature types). Repro: `gap_funcptr_double_free.zer`.
 
 - **GAP-6 — array-element double-free with VARIABLE index (MEDIUM).**
   `heap.free(arr[k]); heap.free(arr[0])` with k==0 (runtime) compiles clean and

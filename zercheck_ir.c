@@ -1511,6 +1511,103 @@ static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
     }
 }
 
+/* GAP-4 (BUG-740, 2026-06-10, 6u360k audit): is this call INDIRECT
+ * (through a function pointer) rather than a direct function call?
+ * Direct calls get the callee's FuncSummary frees_param propagation;
+ * an indirect callee is unknown, so the argument-precise barrier
+ * (ir_indirect_call_barrier) applies instead. Recognized shapes:
+ *   - callee ident naming a funcptr-typed function LOCAL (2A or 2C)
+ *   - callee ident naming a GLOBAL funcptr VARIABLE (is_function
+ *     false — real functions and extern decls have is_function true,
+ *     so C-interop direct calls are NOT treated as indirect)
+ *   - callee NODE_FIELD whose type is a funcptr (struct Ops vtables);
+ *     builtin Pool/Slab/Ring/Arena methods never reach the barrier
+ *     call sites (classified and dispatched before it). */
+static bool ir_call_is_indirect(ZerCheck *zc, IRFunc *func, Node *call) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee) return false;
+    Node *callee = call->call.callee;
+    if (callee->kind == NODE_IDENT) {
+        int l = ir_find_local_exact_first(func, callee->ident.name,
+                                          (uint32_t)callee->ident.name_len);
+        if (l >= 0 && l < func->local_count) {
+            return type_dispatch_kind(func->locals[l].type) == TYPE_FUNC_PTR;
+        }
+        Symbol *s = scope_lookup(zc->checker->global_scope, callee->ident.name,
+                                 (uint32_t)callee->ident.name_len);
+        if (s && !s->is_function) {
+            return type_dispatch_kind(s->type) == TYPE_FUNC_PTR;
+        }
+        return false;
+    }
+    if (callee->kind == NODE_FIELD) {
+        Type *ft = checker_get_type(zc->checker, callee);
+        return ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR;
+    }
+    return false;
+}
+
+/* GAP-4 (BUG-740): argument-precise indirect-call barrier.
+ *
+ * Principle: anything HANDED to an unknown callee may have been freed
+ * by it — and only what was handed. Each tracked handle passed as an
+ * argument (bare, compound `b.h`, `&h`, or a struct root carrying
+ * compound entries) widens ALIVE → MAYBE_FREED with escaped=true
+ * (the callee may now own it), and the widening propagates to the
+ * whole alloc_id alias group. Handles NOT passed are untouched.
+ *
+ * Resulting behavior at the caller:
+ *   free after fp(h)  → "maybe freed" double-free error (the GAP-4 bug)
+ *   use after fp(h)   → use-after-conditional-free error
+ *   silence after     → clean (ownership handed to the callee)
+ *   h never passed    → untouched (no noise)
+ * The idiomatic restructure is to pass DATA (pool.get(h).field), not
+ * the handle, when the caller keeps ownership. Mirrors the existing
+ * conservative-proxy stance of call_has_nonkeep_derived_arg. */
+static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
+                                     IRPathState *ps, Node *call, int line) {
+    for (int ai = 0; ai < call->call.arg_count; ai++) {
+        Node *arg = call->call.args[ai];
+        if (!arg) continue;
+        if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
+            arg = arg->unary.operand;
+        int root_local;
+        const char *path;
+        uint32_t path_len;
+        if (ir_extract_compound_key(zc, func, arg,
+                                    &root_local, &path, &path_len) != 0)
+            continue;
+        /* Widen matching entries: exact compound for `b.h` args; for a
+         * bare root, every entry on that root (the bare handle AND any
+         * compound fields — a by-value struct copy carries them all). */
+        for (int hi = 0; hi < ps->handle_count; hi++) {
+            IRHandleInfo *h = &ps->handles[hi];
+            if (h->local_id != root_local) continue;
+            if (path_len > 0) {
+                if (h->path_len != path_len) continue;
+                if (!h->path || memcmp(h->path, path, path_len) != 0) continue;
+            }
+            if (h->state != IR_HS_ALIVE) continue;
+            h->state = IR_HS_MAYBE_FREED;
+            h->free_line = line;
+            h->escaped = true;
+            /* Group propagation — aliases share the allocation. Also
+             * escape them: ownership of the ALLOCATION was handed off,
+             * so an untouched alias must not flag as a leak. */
+            int aid = h->alloc_id;
+            if (aid != 0) {
+                for (int gi = 0; gi < ps->handle_count; gi++) {
+                    IRHandleInfo *g = &ps->handles[gi];
+                    if (g == h || g->alloc_id != aid) continue;
+                    if (ir_is_invalid(g)) continue;
+                    g->state = IR_HS_MAYBE_FREED;
+                    g->free_line = line;
+                    g->escaped = true;
+                }
+            }
+        }
+    }
+}
+
 /* ================================================================
  * Instruction Analysis — process one IR instruction
  * ================================================================ */
@@ -2432,6 +2529,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
             if (rhs && rhs->kind == NODE_CALL) {
                 IRMethodKind mc = ir_classify_method_call_ex(zc->checker, rhs);
+                /* GAP-4 (BUG-740): result-assigned indirect call —
+                 * `u32 x = fp(h);`. Same argument-precise barrier as the
+                 * statement-form IR_CALL hook. */
+                if (mc == IRMC_NONE && ir_call_is_indirect(zc, func, rhs)) {
+                    ir_indirect_call_barrier(zc, func, ps, rhs,
+                                             inst->source_line);
+                }
                 if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
                     IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
                     if (h) {
@@ -3075,6 +3179,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
                 break;
             }
+        }
+
+        /* GAP-4 (BUG-740): indirect call — unknown callee, no FuncSummary
+         * to apply. Argument-precise barrier instead: what was handed in
+         * may have been freed. See ir_indirect_call_barrier. */
+        if (inst->expr && inst->expr->kind == NODE_CALL &&
+            ir_call_is_indirect(zc, func, inst->expr)) {
+            ir_indirect_call_barrier(zc, func, ps, inst->expr,
+                                     inst->source_line);
+            break;
         }
 
         /* Look up callee by name */

@@ -5,6 +5,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-740: funcptr free not tracked → silent double-free (6u360k GAP-4)
+
+`fp(h); heap.free(h);` where fp's target frees h — double free passing BOTH
+gates silently: zercheck has no FuncSummary for indirect callees, and
+`_zer_slab_free` is intentionally lenient on the free path (gen trap only on
+get). The direct-call equivalent `free_handle(h); heap.free(h)` was already
+caught via FuncSummary propagation; the difference was purely call
+indirectness.
+
+Design (chosen over two rejected alternatives): the **argument-precise
+barrier** — anything HANDED to an unknown callee may have been freed by it,
+and only what was handed. Rejected: the aggressive barrier (any indirect call
+widens ALL live handles — false-positives on handles the callee never
+received, noise that teaches nothing) and the signature-typed barrier (widens
+by TYPE match — shape enumeration; punishes same-typed handles never passed).
+The criterion: a false positive is acceptable only when it pushes correct
+code toward clearer structure.
+
+Fix (zercheck_ir.c): `ir_call_is_indirect` recognizes funcptr-typed callees
+(local funcptr var incl. 2C syntax; global funcptr VARIABLE via
+`!sym->is_function` — real functions and extern decls stay direct; struct-
+field vtable funcptrs via callee type). `ir_indirect_call_barrier` widens
+each tracked handle passed as an argument (bare, `b.h` compound, `&h`, or all
+compound entries under a by-value struct root) ALIVE → MAYBE_FREED with
+escaped=true, propagated to the whole alloc_id alias group (escaped too —
+allocation ownership was handed off). Hooked in BOTH paths: IR_CALL
+(statement form) and IR_ASSIGN NODE_CALL (result-assigned form).
+
+Resulting caller matrix: free after `fp(h)` → "freeing local which may
+already be freed" (the bug); use after → "use after free: maybe-freed";
+silence after → clean (callee-owns transfer); handle never passed → untouched;
+`fp(h.value)` pass-data idiom → clean. The idiomatic restructure when the
+caller keeps ownership is to pass data, not the handle.
+
+Known residual (consistent with the cross-function follow-up in
+limitations.md): an indirect callee freeing a pointer held in a GLOBAL the
+caller never passed is not caught — same per-function boundary as direct
+calls (FuncSummary doesn't track global frees either).
+
+Verified: reproducer + use-after-hand reject; callee-owns / precision /
+pass-data positives clean; direct-call summary path unaffected; full suite
+green. Tests: `tests/zer_fail/funcptr_double_free.zer`,
+`tests/zer_fail/funcptr_use_after_hand.zer`,
+`tests/zer/funcptr_barrier_precision_ok.zer`. Closes 6u360k audit GAP-4.
+
+---
+
 ## Session 2026-06-10 — BUG-739: alloc_ptr global-alias UAF silent at both gates (6u360k GAP-3)
 
 `*Item p = heap.alloc_ptr() orelse return; g_ptr = p; heap.free_ptr(p);

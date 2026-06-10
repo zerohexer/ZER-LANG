@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// BUG-739 (6u360k audit GAP-3): alloc_ptr global-alias UAF. The store
+// `g_ptr = p` marked p escaped but lost all connection between the
+// global and p's alloc_id — the post-free read-back was silently
+// accepted, and `*T` has no runtime generation net (unlike Handle).
+// Now the global is tracked as a pseudo-root compound entry: the free
+// reaches it via alias propagation, the read-back inherits FREED, and
+// the use site errors.
+
+struct Item { u32 value; }
+Slab(Item) heap;
+
+?*Item g_ptr;
+
+i32 main() {
+    *Item p = heap.alloc_ptr() orelse return;
+    p.value = 99;
+    g_ptr = p;             // escape via global store
+    heap.free_ptr(p);      // free local p; g_ptr now dangles
+    *Item gp = g_ptr orelse return;
+    u32 v = gp.value;      // UAF — caught at compile time
+    return (i32)v;
+}

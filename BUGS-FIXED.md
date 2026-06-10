@@ -5,6 +5,48 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-739: alloc_ptr global-alias UAF silent at both gates (6u360k GAP-3)
+
+`*Item p = heap.alloc_ptr() orelse return; g_ptr = p; heap.free_ptr(p);
+*Item gp = g_ptr orelse return; gp.value` — compiled clean and ran silently
+(read of freed slot). The store marked p `escaped=true` (suppressing the leak
+warning) but the global lost ALL connection to p's alloc_id, and `*T` from
+alloc_ptr has no runtime generation counter (unlike Handle), so neither gate
+fired. Contradicted CLAUDE.md "alloc_ptr 100% compile-time safe."
+
+Root-cause scope finding: zercheck_ir had NO global-tracking infrastructure —
+globals were modeled purely as `escaped=true` on the stored value + untracked
+reads. Compound handles are keyed `(local_id, path)` on function locals.
+
+Fix (zercheck_ir.c, ~120 lines): a pseudo-root sentinel `IR_GLOBAL_ROOT_ID
+(-2)` keys global entries as compound handles `(-2, global_name)`, reusing ALL
+existing machinery — compound-aware CFG merge (BUG-650), free propagation via
+`ir_propagate_alias_state` (same alloc_id group), `IRAliasSnapshot` on
+read-back. Zero new PathState fields, zero new lattice semantics. Three hooks:
+(1) store `g = p` in the NODE_ASSIGN passthrough registers/overwrites the
+global entry sharing p's alloc_id (with a RESET branch for `g = null` / 
+untracked values so the null-reset pattern doesn't false-positive);
+(2) orelse read-back `gp = g orelse return` aliases dest from the global
+entry; (3) bare ident read-back `?*T m = g` likewise. Shadowing handled:
+a function local of the same name wins (`ir_ident_is_unshadowed_global`).
+
+INVARIANT: global entries always carry `escaped=true` — the exit-pass
+leak/ghost branches index `func->locals[h->local_id]` only after the escaped
+skip, so the -2 sentinel never reaches a locals[] access, and read-back
+aliases inherit escaped via the snapshot (no false leak on the alias).
+
+Scope: per-function (store→free→read-back within one body). Cross-function
+global UAF (store+free in f, read in g) needs FuncSummary work — noted in
+docs/limitations.md as a follow-up, distinct from the closed gap.
+
+Verified: reproducer rejects ("use after free: local %5 is freed at line 27");
+if-unwrap read-back variant also caught; positives clean — read-back-before-
+free, null-reset-after-free, re-assign-to-fresh-alloc all compile + run;
+full suite green. Tests: `tests/zer_fail/alloc_ptr_global_alias_uaf.zer`,
+`tests/zer/global_ptr_roundtrip_ok.zer`. Closes 6u360k audit GAP-3.
+
+---
+
 ## Session 2026-06-10 — BUG-738: container composite type args → GCC error instead of ZER error (6u360k GAP-7)
 
 `Box(?u32)` / `Box(*u32)` / `Pair(Handle(Item))` / `Box([*]u8)` stamped struct

@@ -15,4 +15,5 @@ GAP-2 --no-strict-mmio dropped runtime alignment trap (BUG-736, see
 tests/zer_trap/inttoptr_unaligned_nostrict.zer); GAP-8 by-value struct param
 laundering (BUG-737, see tests/zer_fail/arena_escape_struct_param.zer);
 GAP-7 container composite type args (BUG-738, see
-tests/zer_fail/container_composite_type_arg.zer).
+tests/zer_fail/container_composite_type_arg.zer); GAP-3 alloc_ptr
+global-alias UAF (BUG-739, see tests/zer_fail/alloc_ptr_global_alias_uaf.zer).

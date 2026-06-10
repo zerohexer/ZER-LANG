@@ -469,6 +469,38 @@ static void ir_mark_local_escaped(IRPathState *ps, int local_id) {
     if (h) h->escaped = true;
 }
 
+/* GAP-3 (BUG-739, 2026-06-10, 6u360k audit): pseudo-root for tracking
+ * pointer-typed GLOBALS that receive a tracked allocation within the
+ * current function. `g_ptr = p; heap.free_ptr(p); gp = g_ptr orelse
+ * return; gp.value` was silently accepted — the store marked p escaped
+ * but the global lost all connection to p's alloc_id, and alloc_ptr's
+ * `*T` has no runtime generation net (unlike Handle).
+ *
+ * Mechanism: compound handles keyed (IR_GLOBAL_ROOT_ID, global_name)
+ * reuse ALL existing machinery — CFG merge (compound-aware since
+ * BUG-650), ir_propagate_alias_state on free, IRAliasSnapshot on
+ * read-back. No new PathState fields.
+ *
+ * INVARIANT: these entries always carry escaped=true. The exit-pass
+ * leak/ghost branches index func->locals[h->local_id] only AFTER the
+ * `if (h->escaped) continue;` skip, so the -2 sentinel never reaches
+ * a locals[] access. Keep the invariant when touching these entries.
+ *
+ * Scope: per-function (store→free→read-back within one body). Cross-
+ * function global UAF needs FuncSummary work — see docs/limitations.md. */
+#define IR_GLOBAL_ROOT_ID (-2)
+
+/* True if ident names a module-level global NOT shadowed by any function
+ * local. Locals shadow globals, so a same-named local wins. */
+static bool ir_ident_is_unshadowed_global(ZerCheck *zc, IRFunc *func, Node *ident) {
+    if (!ident || ident->kind != NODE_IDENT) return false;
+    if (ir_find_local_exact_first(func, ident->ident.name,
+                                  (uint32_t)ident->ident.name_len) >= 0)
+        return false;
+    return scope_lookup(zc->checker->global_scope, ident->ident.name,
+                        (uint32_t)ident->ident.name_len) != NULL;
+}
+
 /* Given an AST value expression (RHS of assign or return), find the
  * local it refers to (following through NODE_ORELSE to the primary
  * expression). Returns local id or -1. */
@@ -2165,6 +2197,41 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
+            /* GAP-3 (BUG-739): bare global ident store — `g_ptr = p`.
+             * Register/overwrite the global's pseudo-root entry sharing
+             * p's alloc_id, so a later free reaches it via
+             * ir_propagate_alias_state and read-backs alias from it.
+             * The ident name string points into the AST — outlives this
+             * analysis (same lifetime argument as pool_name). */
+            if (target_expr && target_expr->kind == NODE_IDENT &&
+                ir_ident_is_unshadowed_global(zc, func, target_expr)) {
+                IRHandleInfo *grh = (rhs_local >= 0)
+                    ? ir_find_handle(ps, rhs_local) : NULL;
+                if (grh && grh->state == IR_HS_ALIVE && grh->alloc_id != 0) {
+                    IRAliasSnapshot gsnap;
+                    ir_snapshot_alias(&gsnap, grh);
+                    IRHandleInfo *gh = ir_add_compound_handle(ps,
+                        IR_GLOBAL_ROOT_ID, target_expr->ident.name,
+                        (uint32_t)target_expr->ident.name_len);
+                    if (gh) {
+                        ir_apply_alias(gh, &gsnap);
+                        gh->state = IR_HS_ALIVE;
+                        gh->escaped = true; /* INVARIANT — see IR_GLOBAL_ROOT_ID */
+                    }
+                } else {
+                    /* Non-tracked value (null reset, param, unknown):
+                     * clear any stale binding so `g = p; free(p);
+                     * g = null; read g` doesn't false-positive. */
+                    IRHandleInfo *gh = ir_find_compound_handle(ps,
+                        IR_GLOBAL_ROOT_ID, target_expr->ident.name,
+                        (uint32_t)target_expr->ident.name_len);
+                    if (gh) {
+                        gh->state = IR_HS_UNKNOWN;
+                        gh->alloc_id = 0;
+                    }
+                }
+            }
+
             /* Gap A2 (2026-05-06, sNsjM): move-struct field-write transfers
              * ownership. `b.field = t` where t is a move struct (or contains
              * move fields) MUST mark t as TRANSFERRED. Subsequent use of t =
@@ -2215,6 +2282,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (src_h) {
                         IRAliasSnapshot snap;
                         ir_snapshot_alias(&snap, src_h);
+                        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                        if (dst_h) {
+                            ir_apply_alias(dst_h, &snap);
+                            dst_h->state = snap.state;
+                        }
+                    }
+                } else if (ir_ident_is_unshadowed_global(zc, func, rhs)) {
+                    /* GAP-3 (BUG-739): `gp = g_ptr orelse return` read-back
+                     * from a tracked global. Alias dest to the global's
+                     * pseudo-root entry; the inherited state (FREED after a
+                     * free of any alias) flows through the COPY chain to the
+                     * user local and fires at the use site. escaped=true is
+                     * inherited via the snapshot — no false leak. */
+                    IRHandleInfo *gh = ir_find_compound_handle(ps,
+                        IR_GLOBAL_ROOT_ID, rhs->ident.name,
+                        (uint32_t)rhs->ident.name_len);
+                    if (gh && gh->alloc_id != 0) {
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, gh);
                         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                         if (dst_h) {
                             ir_apply_alias(dst_h, &snap);
@@ -2527,6 +2613,24 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             ir_zc_error(zc, inst->source_line,
                                 "use of %s handle %%%d",
                                 ir_state_name(src_h->state), src_local);
+                        }
+                    }
+                } else if (ir_ident_is_unshadowed_global(zc, func,
+                                                         inst->expr)) {
+                    /* GAP-3 (BUG-739): bare global read-back —
+                     * `?*Item m = g_ptr;`. Alias dest to the global's
+                     * pseudo-root entry, inheriting its state so a
+                     * post-free read-back flags at the use site. */
+                    IRHandleInfo *gh = ir_find_compound_handle(ps,
+                        IR_GLOBAL_ROOT_ID, inst->expr->ident.name,
+                        (uint32_t)inst->expr->ident.name_len);
+                    if (gh && gh->alloc_id != 0) {
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, gh);
+                        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                        if (dst_h) {
+                            ir_apply_alias(dst_h, &snap);
+                            dst_h->state = snap.state;
                         }
                     }
                 }

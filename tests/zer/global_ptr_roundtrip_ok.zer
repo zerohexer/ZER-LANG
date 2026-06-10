@@ -1,0 +1,49 @@
+// BUG-739 positives: global pointer round-trips that must stay legal.
+// s1: store + read-back + use, free AFTER the use.
+// s2: null-reset after free — read-back takes the orelse path.
+// s3: re-assign the global to a fresh allocation after freeing the old.
+
+struct Item { u32 value; }
+Slab(Item) heap;
+?*Item g_ptr;
+
+u32 s1() {
+    *Item p = heap.alloc_ptr() orelse return;
+    p.value = 7;
+    g_ptr = p;
+    *Item gp = g_ptr orelse return;
+    u32 v = gp.value;
+    heap.free_ptr(p);
+    g_ptr = null;
+    return v;
+}
+
+u32 s2() {
+    *Item p = heap.alloc_ptr() orelse return;
+    g_ptr = p;
+    heap.free_ptr(p);
+    g_ptr = null;
+    *Item gp = g_ptr orelse return;
+    return gp.value;
+}
+
+u32 s3() {
+    *Item p = heap.alloc_ptr() orelse return;
+    g_ptr = p;
+    heap.free_ptr(p);
+    *Item q = heap.alloc_ptr() orelse return;
+    q.value = 3;
+    g_ptr = q;
+    *Item gp = g_ptr orelse return;
+    u32 v = gp.value;
+    heap.free_ptr(q);
+    g_ptr = null;
+    return v;
+}
+
+i32 main() {
+    u32 a = s1();
+    u32 b = s2();
+    u32 c = s3();
+    return (i32)(a + b + c) - 10;
+}

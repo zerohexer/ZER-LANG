@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 6u360k audit (2026-06-09): 3 confirmed silent gaps
+## OPEN — 6u360k audit (2026-06-09): 2 confirmed silent gaps
 
 From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
 RE-VERIFIED present in current main. Reproducers (NOT auto-run — each compiles
@@ -17,27 +17,13 @@ dropped runtime alignment trap) by BUG-736 — guarded by
 `tests/zer_trap/inttoptr_unaligned_nostrict.zer`; GAP-8 (by-value struct param
 laundering arena/local pointers) by BUG-737 — guarded by
 `tests/zer_fail/arena_escape_struct_param.zer`; GAP-7 (container composite
-type args → GCC error) by BUG-738 (2026-06-10) — guarded by
-`tests/zer_fail/container_composite_type_arg.zer`. When fixing one, move its
+type args → GCC error) by BUG-738 — guarded by
+`tests/zer_fail/container_composite_type_arg.zer`; GAP-3 (alloc_ptr
+global-alias UAF) by BUG-739 (2026-06-10) — guarded by
+`tests/zer_fail/alloc_ptr_global_alias_uaf.zer` (per-function scope;
+cross-function global UAF tracked below). When fixing one, move its
 reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
 
-- **GAP-3 — `alloc_ptr` global-alias UAF silent at BOTH gates (HIGH).**
-  `*T p = heap.alloc_ptr() orelse return; g_ptr = p; heap.free_ptr(p);
-  *T gp = g_ptr orelse return; gp.value` — confirmed silent (reproducer returns
-  the stale value 99, no trap). The global `?*T g_ptr` isn't registered as a
-  compound key tracking p's alloc_id (the Handle variant was added, `*T` wasn't),
-  and `*T` has no per-slot gen counter (unlike Handle) so no runtime net.
-  Contradicts CLAUDE.md "alloc_ptr 100% compile-time safe."
-  **Fix-scope finding (2026-06-10):** the original sketch ("register globals
-  as compound keys") UNDERESTIMATES — zercheck_ir has NO global-tracking
-  infrastructure at all (compound keys are keyed on function-local IDs;
-  globals are modeled as `escaped=true` + untracked reads). The real fix
-  adds a per-PathState global-symbol→alloc_id table, which touches the
-  fixed-point lattice (merge at CFG joins, `pathstate_equal`, snapshots) —
-  analyzer-core surgery, needs a dedicated session. Also note scope: this
-  covers same-function store→free→read-back only; cross-function global UAF
-  needs FuncSummary work, and `*T` has no runtime gen net (unlike Handle).
-  Repro: `gap_alloc_ptr_global_alias_uaf.zer`.
 
 - **GAP-4 — function-pointer free not tracked → silent double-free (HIGH).**
   Calling `fp(h)` through a funcptr whose target frees `h`, then `heap.free(h)`:
@@ -53,6 +39,16 @@ reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
   so `arr[k]` and `arr[0]` aren't the same compound key. Fix: accept VRP-proven-
   const indices, or widen to "any index" (over-rejects, conservative).
   Repro: `gap_arr_var_index_dfree.zer`.
+
+- **FOLLOW-UP (from BUG-739, GAP-3) — cross-function global-pointer UAF (MEDIUM).**
+  BUG-739 closed the same-function case via `IR_GLOBAL_ROOT_ID` pseudo-root
+  entries. Cross-function remains open: `void f() { g_ptr = p; free_ptr(p); }
+  void g() { use(g_ptr); }` — per-function analysis can't see f's free from
+  g's body, and alloc_ptr `*T` has no runtime generation net. Fix sketch:
+  FuncSummary (Model 3) records "function leaves global G dangling"
+  (stored-then-freed without reset); call sites + module exit check globals.
+  Alternatively document `*T`-in-global as Handle-recommended territory
+  (Handle has the runtime gen net for exactly this).
 
 
 

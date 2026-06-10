@@ -509,42 +509,47 @@ pool-aware FuncSummary). Attempted in this session but reverted: it
 trips the **defer-fires-twice-on-goto-to-same-scope** emitter bug
 described below.
 
-## OPEN — Defer fires twice when goto target is in same defer scope
+## ~~Defer fires twice when goto target is in same defer scope~~ (FIXED 2026-06-10)
 
-**Symptom:** `defer free(h); ... goto cleanup; ... cleanup: return 0;`
-fires the defer body once at the goto site AND again at the return
-site. The defer body executes twice for a single dynamic execution.
+**Original symptom:** `defer free(h); ... goto cleanup; ... cleanup: return 0;`
+emitted the defer body in BOTH the goto block AND the cleanup-return block.
+Defer body ran twice per dynamic execution. Hidden because `_zer_pool_free`
+is intentionally lenient (no gen check on free path); `rt_goto_fires_defer`
+passed because its `freed_count != 1` check ran at the cleanup label BEFORE
+the second fire. Verified by inspecting generated C: the defer body string
+literally appeared in two blocks (e.g., `x = ((x * 2) + 1);` emitted at
+`_zer_bb0` AND `_zer_bb1`).
 
-**Why it's hidden today:** runtime `_zer_pool_free` is intentionally
-lenient (just bumps gen + clears used; no validation on stale h_gen).
-Double-fire of `pool.free(h)` silently bumps gen twice. The
-`rust_tests/rt_goto_fires_defer.zer` test relies on this — its
-check `freed_count != 1` runs at `cleanup:` BEFORE the second fire,
-so the test passes.
+**Real-world impact:** non-idempotent defer bodies (file close, lock
+release, counter increment) double-execute. Also blocked future runtime
+hardening of `_zer_pool_free` (wrong-pool / stale-gen detection) — adding a
+gen-mismatch trap would have traped on the second fire of legitimate code.
 
-**Why it matters:** any future runtime hardening of `_zer_pool_free`
-(generation validation, wrong-pool detection) traps on the second
-fire. The compile-time guarantee `zercheck_ir` reports for handle
-states becomes inconsistent with runtime behavior. Also: for user
-defers with non-idempotent side effects (file close, lock release),
-double-fire is a real bug.
+**Root cause:** `ir_lower.c` NODE_GOTO called `emit_defer_fire(ctx)` which
+generated `IR_DEFER_FIRE` with `cond_local=-1` (fire-all, no-pop). The
+emit-time defer stack retained all entries; the cleanup label's function-
+exit `IR_DEFER_FIRE` then re-emitted them.
 
-**Root cause:** `ir_lower.c` NODE_GOTO emits `emit_defer_fire(ctx)`
-which generates `IR_DEFER_FIRE` with mode "fire all, no pop". The
-function-exit defer fire then emits the same set again. The emitter
-needs to track which defer entries have already been fired on the
-current dynamic path, OR not fire defers when the goto target is
-inside the same defer scope (let the natural function exit fire them).
+**Fix:** NODE_GOTO now calls `emit_defer_fire_scoped(ctx, 0, true, line)`
+(fire-all, POP) and resets `ctx->defer_count = 0`. Subsequent block fires
+(notably the cleanup-return) see an empty emit-time stack and emit no defer
+bodies. Single fire per dynamic path; semantics match the documented
+"goto fires pending defers before jumping" rule (matches break/continue
+behavior with implicit base=0 since goto exits to label scope which is
+treated as a function-exit point).
 
-**Fix estimate:** ~50-80 lines in `ir_lower.c` to compute "is goto
-target inside current defer scope" and skip the fire if so. Requires
-walking from goto site to label site through the lexical block
-structure. Alternative: a runtime per-defer "fired" flag — simpler
-but adds per-defer state.
+**Regression test:** `tests/zer/goto_defer_single_fire.zer` — defer uses
+`x = x*2+1` non-idempotent transformation. Single fire: x → 1. Double fire
+(pre-fix): x → 3. Test asserts `if (x != 1) return 99` at the cleanup
+label. Existing tests (`rt_goto_fires_defer`, `goto_defer`,
+`rt_defer_goto_interaction`, `rt_drop_defer_goto_cleanup`) all still pass
+because their assertions only check defer ran AT LEAST once on the goto
+path — that semantic is preserved.
 
-**Workaround today:** users SHOULD NOT rely on goto-fires-defer for
-non-idempotent cleanup. Either avoid goto-to-same-scope-label OR use
-explicit cleanup at the label.
+**Followup opportunity (separate work):** with double-fire closed, the
+deferred `_zer_pool_free` gen-mismatch / wrong-pool runtime trap (noted in
+the FIXED entry above and in the cross-function wrong-pool gap) becomes
+unblocked.
 
 ## ~~4 narrow zercheck patterns not in zercheck_ir~~ (FIXED 2026-05-04, Phase F3.2)
 

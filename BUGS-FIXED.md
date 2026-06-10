@@ -5,6 +5,66 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-743: defer body emitted twice on goto-to-cleanup-label pattern
+
+Documented OPEN bug in `docs/limitations.md` "Defer fires twice when goto
+target is in same defer scope" — closed by scoping NODE_GOTO's defer fire.
+
+Reproducer (minimal): `defer { x = (x * 2) + 1; } goto cleanup; cleanup:
+return (i32)x;` with `x` initially 0. Single fire produces x=1; the bug
+caused x=3 (the defer body literally appeared twice in the emitted C —
+once in the goto block, once in the cleanup-return block). Hidden today
+because `_zer_pool_free` is intentionally lenient (no gen check on free
+path) so double `pool.free(h)` silently bumped gen twice; the existing
+`rt_goto_fires_defer.zer` test's `freed_count != 1` assertion ran at the
+cleanup label BEFORE the second fire, so the test passed despite the bug.
+
+**Root cause:** `ir_lower.c` NODE_GOTO emitted `emit_defer_fire(ctx)` —
+shorthand for `IR_DEFER_FIRE` with `cond_local=-1` (fire-all, no-pop).
+The emit-time defer stack retained all entries; the cleanup label's
+function-exit `IR_DEFER_FIRE` (also no-pop) then re-emitted them in a
+separate block. At runtime the goto path executed: emit-block defer body
+→ goto cleanup block → re-emitted defer body → return. The two bodies
+were not redundant code paths; both ran on a single dynamic execution.
+
+**Fix:** NODE_GOTO now calls `emit_defer_fire_scoped(ctx, 0, true, line)`
+(fire-all WITH pop=true) and resets `ctx->defer_count = 0`. The pop sets
+`e->defer_stack.count = 0` so subsequent IR_DEFER_FIRE instructions in
+downstream blocks emit nothing. The cleanup label's function-exit fire
+sees an empty stack. Semantics match the documented "goto fires pending
+defers before jumping" rule. The implementation is symmetric with
+break/continue's `emit_defer_fire_scoped(loop_defer_base, false, line)`
+— the difference is base=0 (goto exits to label-scope which we treat as
+function-exit) and pop=true (no later sibling path needs to see the
+defers; the label IS the merge point).
+
+**Real-world impact:** non-idempotent defer bodies (file close, lock
+release, accumulator increment) double-execute pre-fix. Also blocks
+follow-up runtime hardening of `_zer_pool_free` (wrong-pool detection,
+gen-mismatch trap) since adding those traps would have rejected the
+pre-fix double-fire emission of legitimate code.
+
+**Regression test:** `tests/zer/goto_defer_single_fire.zer` — defer body
+`x = (x*2)+1` non-idempotent. The cleanup label runs `if (x != 1) return
+99` to assert one fire reached x=1 (passes both pre-fix and post-fix
+since the assertion runs BEFORE the function-exit fire). The structural
+proof of the bug is the generated-C emission count: `grep -c "x = ((x *
+2) + 1);"` returned 2 pre-fix (defer body in BOTH the goto block AND the
+cleanup-return block) and 1 post-fix (defer body only in the goto
+block). The test still catches any regression that flips the fire site
+to the cleanup label only (assertion would see x=0 → return 99).
+
+Existing tests `rt_goto_fires_defer.zer`, `tests/zer/goto_defer.zer`,
+`rt_defer_goto_interaction.zer`, `rt_drop_defer_goto_cleanup.zer` all
+still pass — they assert "defer fires at least once before control
+reaches the cleanup label", which is preserved.
+
+`make check`: green (one flaky concurrency test `rc_cond_004` showed
+transient failure unrelated to the fix — direct re-runs are 10/10 clean,
+suite re-run shows 784/784 passed).
+
+---
+
 ## Session 2026-06-10 — BUG-742: cross-function global-pointer UAF closed at the source (BUG-739 follow-up)
 
 `void f() { g_ptr = p; heap.free_ptr(p); }  u32 g() { gp = g_ptr orelse

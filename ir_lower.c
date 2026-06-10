@@ -22,7 +22,7 @@
  * Lowering Context — state maintained during AST → IR translation
  * ================================================================ */
 
-/* Label → block mapping entry (BUG-575: stack-first dynamic buffer) */
+/* Label → block mapping entry (BUG-575: stack-first dynamic buffer). */
 typedef struct {
     const char *name;
     uint32_t len;
@@ -2935,7 +2935,35 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- Goto ---- */
     case NODE_GOTO: {
-        emit_defer_fire(ctx, node->loc.line);
+        /* ZER semantic: goto fires all pending defers (same as
+         * return/break/continue) — see CLAUDE.md "goto + defer interaction"
+         * and rust_tests/rt_goto_fires_defer.zer.
+         *
+         * Pre-fix, NODE_GOTO emitted `emit_defer_fire` (fire-all, no-pop)
+         * which fired the defer body but left the entry on the emit-time
+         * stack. The cleanup label's function-exit IR_DEFER_FIRE then
+         * re-emitted the SAME body, producing the documented
+         * "Defer fires twice on goto-to-same-scope-label" silent bug
+         * (limitations.md). Verified by inspection of generated C: the
+         * defer body appeared in BOTH the goto block AND the cleanup-return
+         * block. Hidden today because `_zer_pool_free` is intentionally
+         * lenient (no gen check on the free path), but blocks future
+         * hardening (wrong-pool runtime detection).
+         *
+         * Fix: emit a scoped fire from current_depth down to 0 with pop=true.
+         * Fires all defers AND removes them from the emit-time stack so
+         * subsequent function-exit fires (at the cleanup label's return)
+         * see an empty stack and emit nothing. ctx->defer_count is reset
+         * accordingly so any later block-exit logic computes against the
+         * post-goto state.
+         *
+         * Backward goto: defers pushed BETWEEN the label and the goto get
+         * fired and popped at the goto. Control jumps back to the label,
+         * the IR_DEFER_PUSH instructions for those defers re-run at runtime
+         * (the PUSH emission re-appends the body), so the next iteration
+         * has them active again — matches loop-iteration defer semantics. */
+        emit_defer_fire_scoped(ctx, 0, true, node->loc.line);
+        ctx->defer_count = 0;
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
             unlock.expr = ctx->current_stmt_shared_root;

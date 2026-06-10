@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 6u360k audit (2026-06-09): 5 confirmed silent gaps
+## OPEN — 6u360k audit (2026-06-09): 4 confirmed silent gaps
 
 From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
 RE-VERIFIED present in current main. Reproducers (NOT auto-run — each compiles
@@ -13,8 +13,10 @@ clean / runs without trap, which is the bug): `tests/audit_2026-06-09/*.zer`.
 **CLOSED so far:** GAP-5 (orelse overwrite leak) by BUG-734; GAP-1 (`@ptrcast`
 concrete type confusion) by BUG-735 — guarded by
 `tests/zer_fail/ptrcast_concrete_confusion.zer`; GAP-2 (`--no-strict-mmio`
-dropped runtime alignment trap) by BUG-736 (2026-06-10) — guarded by
-`tests/zer_trap/inttoptr_unaligned_nostrict.zer`. When fixing one, move its
+dropped runtime alignment trap) by BUG-736 — guarded by
+`tests/zer_trap/inttoptr_unaligned_nostrict.zer`; GAP-8 (by-value struct param
+laundering arena/local pointers) by BUG-737 (2026-06-10) — guarded by
+`tests/zer_fail/arena_escape_struct_param.zer`. When fixing one, move its
 reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
 
 - **GAP-3 — `alloc_ptr` global-alias UAF silent at BOTH gates (HIGH).**
@@ -49,16 +51,6 @@ reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
   type args at the checker with a clean ZER error (Zig-style), OR a reversible
   name-mangling pass (`?`→`_opt_`, `*`→`_ptr_`, …). Repro: `gap_container_ptr_optional_arg.zer`.
 
-- **GAP-8 — arena escape via struct copy through a value-typed parameter (MEDIUM).**
-  `local.ptr = p` (p arena-derived) then `take(local)` (by-value `Container` param)
-  then `c = ct` (store to global) slips the static arena-escape check — the
-  arena-derived flag doesn't propagate through the field-store→carrier nor through
-  the by-value param copy. Runtime catches via malloc-wrap fault on hosted (generic
-  "memory access fault", not the arena-escape error); fully silent on bare-metal.
-  Distinct from BUG-732 (struct-INIT local escape) and the 2026-06-07 struct-COPY
-  work. Fix: (1) propagate `is_arena_derived` from field-store up to the carrier
-  struct local; (2) propagate it through value-typed struct params into the callee
-  param symbol. Repro: `gap_arena_escape_via_struct_copy.zer`.
 
 ---
 

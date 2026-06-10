@@ -1,0 +1,31 @@
+// EXPECTED: compile error
+// BUG-737 (6u360k audit GAP-8): arena-derived pointer laundered through a
+// struct field copy + by-value parameter. `local.ptr = p` taints the carrier
+// (prior struct-copy work); the missing piece was the by-value struct param:
+// `take(local)` copies into `ct`, and the callee `c = ct` persisted the
+// arena pointer to a global with no check. Fix: non-keep by-value
+// struct/union params carrying data-pointer fields are is_nonkeep_derived
+// at registration — the keep-2a persist sink rejects the store.
+// Escape valve: `keep Container ct`.
+
+struct Item { u32 v; }
+struct Container { *Item ptr; }
+Container c;
+
+void take(Container ct) {
+    c = ct;
+}
+
+void make() {
+    Arena a;
+    *Item p = a.alloc(Item) orelse return;
+    p.v = 99;
+    Container local;
+    local.ptr = p;
+    take(local);
+}
+
+i32 main() {
+    make();
+    return 0;
+}

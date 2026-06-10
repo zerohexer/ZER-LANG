@@ -12,4 +12,5 @@ CLOSED (reproducers moved/removed): GAP-5 orelse overwrite leak (BUG-734,
 see tests/zer_fail/overwrite_alive_handle_*.zer); GAP-1 @ptrcast concrete type
 confusion (BUG-735, see tests/zer_fail/ptrcast_concrete_confusion.zer);
 GAP-2 --no-strict-mmio dropped runtime alignment trap (BUG-736, see
-tests/zer_trap/inttoptr_unaligned_nostrict.zer).
+tests/zer_trap/inttoptr_unaligned_nostrict.zer); GAP-8 by-value struct param
+laundering (BUG-737, see tests/zer_fail/arena_escape_struct_param.zer).

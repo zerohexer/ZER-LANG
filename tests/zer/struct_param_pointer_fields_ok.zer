@@ -1,0 +1,20 @@
+// BUG-737 positive: by-value struct params with pointer fields stay usable.
+// (1) read-only non-keep param — fine (the taint only fires at persist sinks);
+// (2) `keep` struct param — the escape valve, persisting is allowed.
+
+struct Item { u32 v; }
+struct Container { *Item ptr; }
+Item g_item;
+Container c;
+
+u32 read_it(Container ct) { return ct.ptr.v; }
+
+void persist(keep Container ct) { c = ct; }
+
+i32 main() {
+    g_item.v = 7;
+    Container l;
+    l.ptr = &g_item;
+    persist(l);
+    return (i32)read_it(l) - 7;
+}

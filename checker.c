@@ -27,6 +27,44 @@ static int zer_sym_region_tag(bool is_local_derived, bool is_arena_derived) {
     if (is_arena_derived) return ZER_REGION_ARENA;
     return ZER_REGION_STATIC;
 }
+
+/* GAP-8 (BUG-737, 2026-06-10): does this type carry a RAW data pointer at any
+ * nesting depth? Used to taint non-keep BY-VALUE struct/union params with
+ * is_nonkeep_derived — the struct analog of the non-keep pointer-param rule
+ * (a by-value struct's pointer fields have caller-unknown provenance: could
+ * be &local or arena-derived; persisting the struct must require 'keep').
+ * Counts: *T, *opaque, [*]T / []T (slice data pointer), and ?-wrapped /
+ * array-of / nested-struct-or-union-of those (depth-limited 32, same pattern
+ * as contains_move_struct_field_depth). Does NOT count: funcptrs (code
+ * addresses, global by nature) and Handle (u64 index, not an address).
+ * If-chain (not switch) so the walker-default audit is unaffected;
+ * type_dispatch_kind keeps the distinct-unwrap CI gate green. */
+static bool type_carries_data_pointer(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_POINTER || k == TYPE_OPAQUE || k == TYPE_SLICE) return true;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_data_pointer(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)
+        return type_carries_data_pointer(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            if (type_carries_data_pointer(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_data_pointer(u->union_type.variants[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
 #include <math.h>
 
 /* ================================================================
@@ -3649,12 +3687,18 @@ static Type *check_expr(Checker *c, Node *node) {
                     classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
                     bool is_direct_param = val_sym->func_node == NULL; /* params have no func_node */
                     if ((tgt_global || tgt_param) && is_direct_param) {
+                        /* BUG-737: name the param kind honestly — by-value
+                         * struct/union params reach this sink too (GAP-8). */
+                        const char *g8_noun = (vk == TYPE_STRUCT || vk == TYPE_UNION)
+                            ? "struct parameter (carries pointer fields)"
+                            : "pointer parameter";
                         checker_error(c, node->loc.line,
                             tgt_param ?
-                            "cannot store non-keep pointer parameter '%.*s' through pointer "
+                            "cannot store non-keep %s '%.*s' through pointer "
                             "parameter '%.*s' — add 'keep' qualifier to parameter '%.*s'" :
-                            "cannot store non-keep pointer parameter '%.*s' in "
+                            "cannot store non-keep %s '%.*s' in "
                             "global/static '%.*s' — add 'keep' qualifier to parameter '%.*s'",
+                            g8_noun,
                             (int)val_sym->name_len, val_sym->name,
                             (int)target_sym->name_len, target_sym->name,
                             (int)val_sym->name_len, val_sym->name);
@@ -12604,6 +12648,20 @@ static void check_func_body(Checker *c, Node *node) {
                     TypeKind pk = type_dispatch_kind(ptype);
                     if (pk == TYPE_POINTER || pk == TYPE_OPAQUE)
                         sym->is_nonkeep_derived = true;
+                    /* GAP-8 (BUG-737, 2026-06-10, 6u360k audit): a by-value
+                     * STRUCT/UNION param whose type carries raw data-pointer
+                     * fields is the SAME contract — the pointers inside have
+                     * caller-unknown provenance (&local, arena-derived), so
+                     * persisting the struct to a global/param sink launders
+                     * them (`void take(Container ct) { g = ct; }`). The
+                     * keep-2a persist sink already accepts STRUCT/UNION
+                     * values (hole A, 2026-06-07); only this taint at the
+                     * registration ROOT was missing. `keep Container ct` is
+                     * the escape valve, same as pointer params. */
+                    else if (pk == TYPE_STRUCT || pk == TYPE_UNION) {
+                        if (type_carries_data_pointer(ptype, 0))
+                            sym->is_nonkeep_derived = true;
+                    }
                 }
                 /* field-level keep: a KEEP pointer param is a BORROW. Storing it
                  * into a struct field requires the field to be declared 'keep'

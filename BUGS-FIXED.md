@@ -5,6 +5,46 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-737: by-value struct param laundered arena/local pointers to globals (6u360k GAP-8)
+
+`local.ptr = p` (p arena-derived) → `take(local)` (by-value `Container` param)
+→ callee `c = ct` stored the COPY to a global. Compile-time passed; the arena
+pointer dangled in the global after `make()` returned (hosted: generic
+malloc-wrap fault on later deref; bare-metal: fully silent).
+
+The carrier half was NOT the gap: `local.ptr = p` already taints `local`
+arena-derived (classify_escape_sink resolves the field chain to the root —
+prior struct-copy work), and direct `g = local` already rejects. The hole was
+the BY-VALUE PARAM root: a non-keep pointer param gets `is_nonkeep_derived` at
+registration (BUG-440/720 contract — callee can't persist what it doesn't own),
+but a by-value STRUCT param carrying pointer fields got NO taint, so the callee
+could persist the embedded pointers freely. Same contract violation: the
+struct's pointer fields have caller-unknown provenance (&local, arena).
+
+Fix (declaration site, checker.c param registration): non-keep by-value
+STRUCT/UNION params whose type carries a raw data pointer at any nesting depth
+(new `type_carries_data_pointer` helper — counts *T/*opaque/[*]T + optional/
+array/nested-aggregate of those; excludes funcptrs and Handle; depth 32;
+if-chain so the walker-default audit is untouched; `type_dispatch_kind` for
+the distinct gate) now get `sym->is_nonkeep_derived = true`. The EXISTING
+keep-2a persist sink (which already accepts STRUCT/UNION values — hole A,
+2026-06-07) rejects the store. No new sink, no new shape enumeration — the
+taint is set at the one registration root and the shared machinery does the
+rest. `keep Container ct` is the escape valve (parses today, same as pointer
+params). Sink message now names the param kind honestly ("struct parameter
+(carries pointer fields)" vs "pointer parameter").
+
+Covers local-derived laundering through the same hop too, not just arena
+(the taint is provenance-agnostic: persisting ANY non-keep param-carried
+pointer is the violation).
+
+Verified: reproducer rejects at the callee store; read-only by-value struct
+params unaffected; keep valve compiles; full suite green (0 over-rejections).
+Tests: `tests/zer_fail/arena_escape_struct_param.zer`,
+`tests/zer/struct_param_pointer_fields_ok.zer`. Closes 6u360k audit GAP-8.
+
+---
+
 ## Session 2026-06-10 — BUG-736: --no-strict-mmio dropped the runtime alignment trap (6u360k GAP-2)
 
 With `--no-strict-mmio` and zero `mmio` declarations, a variable-address

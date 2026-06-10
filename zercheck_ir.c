@@ -3156,6 +3156,77 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
                     }
+                } else if (arg && arg->kind == NODE_INDEX &&
+                           arg->index_expr.index &&
+                           arg->index_expr.index->kind != NODE_INT_LIT) {
+                    /* GAP-6 (BUG-741, 2026-06-10, 6u360k audit): free through
+                     * a VARIABLE index — `heap.free(arr[k])`. Key extraction
+                     * only accepts literal indices, so this free was
+                     * previously untracked entirely: `free(arr[k]);
+                     * free(arr[0])` with k==0 was a silent double free
+                     * (and _zer_slab_free no-ops the second free at runtime).
+                     *
+                     * Rule (same principle as the BUG-740 indirect-call
+                     * barrier): an operation the analyzer can't resolve may
+                     * consume ANY tracked element of that array.
+                     *  (1) a literal-indexed sibling already definitely
+                     *      FREED → this free may target it → error
+                     *      (catches `free(arr[0]); free(arr[k])`).
+                     *  (2) widen ALIVE literal-indexed siblings (and their
+                     *      alias groups) to MAYBE_FREED + escaped — a later
+                     *      literal free errors (`free(arr[k]); free(arr[0])`,
+                     *      the reproducer), the exit pass stays quiet.
+                     * Free-everything loops stay clean: variable-index
+                     * STORES already escape-untrack their values (no
+                     * '['-entries exist), and widened MAYBE siblings do not
+                     * re-trigger (1), which fires on definite FREED only. */
+                    Node *aroot = arg->index_expr.object;
+                    while (aroot && (aroot->kind == NODE_FIELD ||
+                                     aroot->kind == NODE_INDEX)) {
+                        if (aroot->kind == NODE_FIELD)
+                            aroot = aroot->field.object;
+                        else
+                            aroot = aroot->index_expr.object;
+                    }
+                    int aloc = (aroot && aroot->kind == NODE_IDENT)
+                        ? ir_find_local_exact_first(func, aroot->ident.name,
+                              (uint32_t)aroot->ident.name_len)
+                        : -1;
+                    if (aloc >= 0 && aloc < func->local_count) {
+                        for (int vhi = 0; vhi < ps->handle_count; vhi++) {
+                            IRHandleInfo *vh = &ps->handles[vhi];
+                            if (vh->local_id != aloc) continue;
+                            if (vh->path_len == 0 || !vh->path ||
+                                vh->path[0] != '[') continue;
+                            if (vh->state == IR_HS_FREED) {
+                                ir_zc_error(zc, inst->source_line,
+                                    "variable-index free may double-free "
+                                    "'%.*s%.*s' already freed at line %d — "
+                                    "don't mix literal- and variable-index "
+                                    "frees on the same array",
+                                    (int)func->locals[aloc].name_len,
+                                    func->locals[aloc].name,
+                                    (int)vh->path_len, vh->path,
+                                    vh->free_line);
+                            } else if (vh->state == IR_HS_ALIVE) {
+                                vh->state = IR_HS_MAYBE_FREED;
+                                vh->free_line = inst->source_line;
+                                vh->escaped = true;
+                                int vaid = vh->alloc_id;
+                                if (vaid != 0) {
+                                    for (int vgi = 0; vgi < ps->handle_count; vgi++) {
+                                        IRHandleInfo *vg = &ps->handles[vgi];
+                                        if (vg == vh || vg->alloc_id != vaid)
+                                            continue;
+                                        if (ir_is_invalid(vg)) continue;
+                                        vg->state = IR_HS_MAYBE_FREED;
+                                        vg->free_line = inst->source_line;
+                                        vg->escaped = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 break;  /* Don't fall through to FuncSummary apply */
             }

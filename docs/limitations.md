@@ -5,46 +5,32 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 6u360k audit (2026-06-09): 1 confirmed silent gap
+## CLOSED — 6u360k audit (2026-06-09): all 8 gaps fixed (BUG-734..741)
 
-From branch `claude/cool-johnson-6u360k` (audit-only, reviewed not merged).
-RE-VERIFIED present in current main. Reproducers (NOT auto-run — each compiles
-clean / runs without trap, which is the bug): `tests/audit_2026-06-09/*.zer`.
-**CLOSED so far:** GAP-5 (orelse overwrite leak) by BUG-734; GAP-1 (`@ptrcast`
-concrete type confusion) by BUG-735 — guarded by
-`tests/zer_fail/ptrcast_concrete_confusion.zer`; GAP-2 (`--no-strict-mmio`
-dropped runtime alignment trap) by BUG-736 — guarded by
-`tests/zer_trap/inttoptr_unaligned_nostrict.zer`; GAP-8 (by-value struct param
-laundering arena/local pointers) by BUG-737 — guarded by
-`tests/zer_fail/arena_escape_struct_param.zer`; GAP-7 (container composite
-type args → GCC error) by BUG-738 — guarded by
-`tests/zer_fail/container_composite_type_arg.zer`; GAP-3 (alloc_ptr
-global-alias UAF) by BUG-739 — guarded by
-`tests/zer_fail/alloc_ptr_global_alias_uaf.zer` (per-function scope;
-cross-function global UAF tracked below); GAP-4 (funcptr free → silent
-double-free) by BUG-740 (2026-06-10) — argument-precise indirect-call
-barrier, guarded by `tests/zer_fail/funcptr_double_free.zer` +
-`funcptr_use_after_hand.zer`. When fixing one, move its
-reproducer into `tests/zer_fail/` or `tests/zer_trap/`.
+All 8 silent gaps from branch `claude/cool-johnson-6u360k` are closed and
+suite-guarded: GAP-5 orelse overwrite leak (BUG-734), GAP-1 @ptrcast concrete
+type confusion (BUG-735), GAP-2 --no-strict-mmio runtime alignment trap
+(BUG-736), GAP-8 by-value struct param laundering (BUG-737), GAP-7 container
+composite type args (BUG-738), GAP-3 alloc_ptr global-alias UAF (BUG-739,
+per-function scope — see follow-up below), GAP-4 funcptr double-free
+(BUG-740, argument-precise barrier), GAP-6 variable-index array double-free
+(BUG-741). Per-gap detail in BUGS-FIXED.md Session 2026-06-09/10 entries.
+The `tests/audit_2026-06-09/` reproducer directory is retired — every
+reproducer was promoted into `tests/zer_fail/` or `tests/zer_trap/`.
 
+## OPEN — cross-function global-pointer UAF (MEDIUM, follow-up from BUG-739)
 
-
-- **GAP-6 — array-element double-free with VARIABLE index (MEDIUM).**
-  `heap.free(arr[k]); heap.free(arr[0])` with k==0 (runtime) compiles clean and
-  runs silently. `ir_extract_compound_key` only accepts `NODE_INT_LIT` indices,
-  so `arr[k]` and `arr[0]` aren't the same compound key. Fix: accept VRP-proven-
-  const indices, or widen to "any index" (over-rejects, conservative).
-  Repro: `gap_arr_var_index_dfree.zer`.
-
-- **FOLLOW-UP (from BUG-739, GAP-3) — cross-function global-pointer UAF (MEDIUM).**
-  BUG-739 closed the same-function case via `IR_GLOBAL_ROOT_ID` pseudo-root
-  entries. Cross-function remains open: `void f() { g_ptr = p; free_ptr(p); }
-  void g() { use(g_ptr); }` — per-function analysis can't see f's free from
-  g's body, and alloc_ptr `*T` has no runtime generation net. Fix sketch:
-  FuncSummary (Model 3) records "function leaves global G dangling"
-  (stored-then-freed without reset); call sites + module exit check globals.
-  Alternatively document `*T`-in-global as Handle-recommended territory
-  (Handle has the runtime gen net for exactly this).
+BUG-739 closed the same-function case via `IR_GLOBAL_ROOT_ID` pseudo-root
+entries. Cross-function remains open: `void f() { g_ptr = p; free_ptr(p); }
+void g() { use(g_ptr); }` — per-function analysis can't see f's free from
+g's body, and alloc_ptr `*T` has no runtime generation net. The same
+boundary applies to BUG-740's barrier (an indirect callee freeing a pointer
+held in a global the caller never passed) and to direct calls (FuncSummary
+doesn't track global frees either) — one fix covers all three. Fix sketch:
+FuncSummary (Model 3) records "function leaves global G dangling"
+(stored-then-freed without reset); call sites + module exit check globals.
+Alternatively document `*T`-in-global as Handle-recommended territory
+(Handle has the runtime gen net for exactly this).
 
 
 

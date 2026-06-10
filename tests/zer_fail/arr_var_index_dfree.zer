@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// BUG-741 (6u360k audit GAP-6): variable-index array double-free.
+// free(arr[k]) can't be keyed (only literal indices extract), so it was
+// untracked entirely — free(arr[k]); free(arr[0]) with k==0 passed both
+// gates silently. Rule (same principle as BUG-740): an operation the
+// analyzer can't resolve may consume ANY tracked element of that array
+// — the variable-index free widens literal siblings to MAYBE_FREED, so
+// the later literal free errors.
+
+Slab(u32) heap;
+
+i32 main() {
+    Handle(u32)[4] arr;
+    arr[0] = heap.alloc() orelse return;
+    u32 k = 0;
+    for (u32 i = 0; i < 1; i += 1) { k = 0; }  // defeat VRP
+    heap.free(arr[k]);  // may free arr[0]
+    heap.free(arr[0]);  // DOUBLE FREE — now caught
+    return 0;
+}

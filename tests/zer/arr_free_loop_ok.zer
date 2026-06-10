@@ -1,0 +1,40 @@
+// BUG-741 positives — patterns the variable-index rule must NOT break:
+// s1: the canonical alloc-loop + free-loop (THE standard pattern)
+// s2: literal store + single variable-index free (handed to dynamic code)
+// s3: literal store + literal free roundtrip
+
+Slab(u32) heap;
+
+u32 s1() {
+    Handle(u32)[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        arr[i] = heap.alloc() orelse return;
+    }
+    for (u32 j = 0; j < 4; j += 1) {
+        heap.free(arr[j]);
+    }
+    return 1;
+}
+
+u32 s2() {
+    Handle(u32)[4] arr;
+    arr[0] = heap.alloc() orelse return;
+    u32 k = 0;
+    for (u32 i = 0; i < 1; i += 1) { k = 0; }
+    heap.free(arr[k]);
+    return 2;
+}
+
+u32 s3() {
+    Handle(u32)[4] arr;
+    arr[0] = heap.alloc() orelse return;
+    heap.free(arr[0]);
+    return 3;
+}
+
+i32 main() {
+    u32 a = s1();
+    u32 b = s2();
+    u32 c = s3();
+    return (i32)(a + b + c) - 6;
+}

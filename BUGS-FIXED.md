@@ -5,6 +5,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-10 — BUG-741: variable-index array double-free silent (6u360k GAP-6)
+
+`heap.free(arr[k]); heap.free(arr[0]);` with k==0 at runtime — silent double
+free at both gates: `ir_extract_compound_key` only accepts literal indices, so
+the variable-index free was untracked entirely, and `_zer_slab_free` no-ops
+the second free at runtime (gen check only on get).
+
+Fix (zercheck_ir.c FREE handler, extraction-failure branch): the same
+principle as BUG-740's barrier — an operation the analyzer can't resolve may
+consume ANY tracked element of that array. On `free(arr[<variable>])`:
+(1) a literal-indexed sibling already definitely FREED → error
+    "variable-index free may double-free 'arr[0]' already freed at line N —
+    don't mix literal- and variable-index frees on the same array"
+    (catches the reverse order `free(arr[0]); free(arr[k])`);
+(2) ALIVE literal-indexed siblings (+ their alloc_id alias groups) widen to
+    MAYBE_FREED + escaped — a later literal free errors (the reproducer
+    order), and the exit pass stays quiet on the widened entries.
+
+The canonical free-everything loop survives by construction: variable-index
+STORES already escape-untrack their values (no '['-keyed entries exist to
+widen), and widened MAYBE siblings don't re-trigger (1), which fires on
+definite FREED only. Chosen over VRP-const key extension (would only cover
+provably-constant indices — the reproducer deliberately defeats VRP) and
+matches the false-positives-must-teach criterion: every rejection points at
+mixed literal/variable free discipline.
+
+Verified: both directions reject; alloc-loop+free-loop, single var-free, and
+literal roundtrip all clean; full suite green. Tests:
+`tests/zer_fail/arr_var_index_dfree.zer`, `arr_var_index_dfree_rev.zer`,
+`tests/zer/arr_free_loop_ok.zer`. Closes 6u360k audit GAP-6 — **all 8 audit
+gaps now closed** (BUG-734, 735, 736, 737, 738, 739, 740, 741).
+
+---
+
 ## Session 2026-06-10 — BUG-740: funcptr free not tracked → silent double-free (6u360k GAP-4)
 
 `fp(h); heap.free(h);` where fp's target frees h — double free passing BOTH

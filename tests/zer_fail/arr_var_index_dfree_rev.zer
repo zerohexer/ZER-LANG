@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// BUG-741 reverse direction: a literal free followed by a variable-index
+// free may double-free the same element. Teaching: don't mix literal-
+// and variable-index frees on the same array.
+
+Slab(u32) heap;
+
+i32 main() {
+    Handle(u32)[4] arr;
+    arr[0] = heap.alloc() orelse return;
+    u32 k = 0;
+    for (u32 i = 0; i < 1; i += 1) { k = 0; }
+    heap.free(arr[0]);
+    heap.free(arr[k]);  // k may be 0 — caught
+    return 0;
+}

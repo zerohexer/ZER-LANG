@@ -1901,3 +1901,55 @@ Proof-session implication: when strict mode lands, the 31 rules (18 structural +
 13 Z-rules) and System #30 (atomic ordering) will each want Level 3 VST extraction.
 Plan target ~500 hrs of proof work spanning ~30-50 extracted predicates. See
 `docs/asm_preconditions_research.md` C1-C8 sections for per-category oracles.
+
+## Roadmap, guarantee chain, and demonstrators note (moved from CLAUDE.md 2026-06-10)
+
+These lived in CLAUDE.md (injected every prompt) but are needed only when
+doing proof work — moved here to reclaim prompt budget. Nothing edited.
+
+**Full verification commitment (2026-04-21):** target is seL4-level formal verification = every safety property proven at operational depth + every compiler check VST-verified + CI enforces the whole thing. Total effort: ~1,085 hrs (~1 year focused, ~3 years casual).
+
+**The 8 phases:**
+1. Phase 0 — Infrastructure DONE
+2. Phase 1 — 85 pure predicates (~180 hrs) — **85/85 (100%) — FULL PHASE 1 COMPLETE 2026-04-22** (see docs/phase1_catalog.md for definitive enumeration)
+   - 71 = strict milestone (operational + typing.v real theorems, excluding concurrency schematic)
+   - 85 = full target (includes 14 concurrency schematic — real theorems, weaker oracle until Phase 7 upgrades)
+   - Decision 2026-04-22: extract full 85. Phase 6 `check-no-inline-safety` requires it; Phase 7 upgrades Coq spec only (C unchanged, ~20 min per predicate).
+   - Batches landed 2026-04-22: B1 M-section, B2 L-extras, B1b M08 redone, BUG-603 void-main fix (415/415), B3 T+K container extras, B4 P variant, B5 S stack, B6 R comptime, B7 J-extended (strict milestone 71), B8 E atomic extras, B9-11 concurrency (full 85).
+3. Phase 2 — 60 decision extractions (~150 hrs) — **4/60 (7%)** — ISR/@critical bans batch 1 (counts toward Phase 1 pure predicates too)
+3. Phase 2 — 60 decision extractions (~150 hrs)
+4. Phase 3 — Generic AST walker (~60 hrs)
+5. Phase 4 — Verified state APIs (~240 hrs)
+6. Phase 5 — Phase-typed checker (~30 hrs)
+7. Phase 6 — CI discipline (~30 hrs)
+8. Phase 7 — Deepen 82 schematic rows to operational (~425 hrs). Sub-phases: λZER-concurrency (~150), λZER-async (~80), λZER-control-flow (~30), λZER-mmio-rest (~20), λZER-opaque-rest (~30), λZER-escape-rest (~30), λZER-typing-extra (~15), λZER-vrp (~50), λZER-variant (~15), spec reviews (~25).
+9. Phase 8 — Release polish (~50 hrs)
+
+**End state claim:** "ZER is a formally verified compiler. For every program ZER accepts, the resulting C is provably free of 200+ specified safety properties — proven in Coq, verified in VST, tested empirically. Trust base: Coq kernel + GCC + hardware." Same strength as CompCert / seL4.
+
+**Each phase is stop-able with real value shipped.** Extractions commit one-at-a-time. Deepening subsets commit per-subset. No big-bang milestones.
+
+**Theory ↔ implementation guarantee (what CI proves):**
+
+The correctness chain:
+```
+Coq theory (typing.v / operational subsets) — HUMAN-WRITTEN, TRUSTED
+    ↓  REQUIRED: must have matching extraction
+src/safety/<name>.c — pure predicate
+    ↓  make check-vst PROVES match
+Coq spec in proofs/vst/verif_<name>.v (must match oracle, not code)
+    ↓  REQUIRED: checker.c must delegate
+Call sites in checker.c / zercheck.c (with /* SAFETY: ... */ link)
+    ↓  compiled with GCC
+Compiled zerc binary
+```
+
+Each `↓` is enforced by a CI gate:
+- `check-vst` — src/safety/ matches Coq spec (exists today)
+- `check-theory-extracted` — typing.v has extraction (Phase 6, not yet)
+- `check-no-inline-safety` — checker.c delegates (Phase 6, not yet)
+- `check-api-bypass` — no direct mutation (Phase 6, not yet)
+
+Phase 6 is what MAKES the guarantee mechanical. Until Phase 6, the theory→implementation link depends on HUMAN DISCIPLINE.
+
+**Also in proofs/vst/:** 21 pre-extraction demonstrator proofs (verif_simple_check.v, verif_zer_checks.v, verif_zer_checks2.v). These are standalone `.c` files written for VST, NOT extracted from the compiler. They demonstrate the VST pattern but do NOT verify real compiler code — don't count them as compiler verification.

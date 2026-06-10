@@ -258,34 +258,21 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
         return 1;
     ```
 
-16. **Inline asm uses bare `asm(...)` (renamed from `unsafe asm` 2026-04-25).** Two forms:
-    - **Inline** (legacy): `asm("nop");` or extended `asm("..." : outputs : inputs : clobbers);`
-    - **Structured** (D-Alpha-7.5 H1+H3, added 2026-04-25): `asm { instructions: "..."  safety: "..." }` — mandatory `safety:` string ≥ 30 chars (S4 audit-trail rule).
-
-    Allowed only inside `naked` functions (Phase 1 verified: `zer_asm_allowed_in_context(in_naked)`). Users prefer `@intrinsic()` calls (130 verified intrinsics shipping); `asm` is an escape hatch for edge cases. After D-Alpha-7.5 Phase 2 lands, asm becomes 100% language-safe via 13 Z-rules + 8 universal precondition categories + System #30 (auto-detection framework dispatching to existing 29 safety systems). See `docs/asm_plan.md`. **S1 ("asm requires naked") is the INTERIM guard — naked is restrictive enough on its own.** When the strict mode framework lands, S1 relaxes: asm becomes allowed in regular (non-naked) functions, and the framework (Z-rules + categories + System #30) becomes the safety guard. `naked` itself stays as a hardware-constraint keyword (no prologue/epilogue, required for ISRs and boot code). Z6's defer/async ban becomes ACTIVE only after S1 relaxes (currently no-op because naked excludes them). `--relax-asm` flag opts out of strict mode (back to naked-only); `@relax_check(ZN)` per-block disables specific Z-rules.
-    ```
-    naked void handler() {
-        asm("nop");                              // inline form, OK in naked fn
-        asm {                                    // structured form (Session A scope)
-            instructions: "nop"
-            safety: "Single-cycle no-op for timing alignment in critical path"
-        }
-        // asm("nop");                            // outside naked fn = COMPILE ERROR
-        // asm { instructions: "nop" }            // missing safety: = COMPILE ERROR
-    }
-    ```
-    **Session B (added 2026-04-25)**: typed operand bindings via `inputs:`, `outputs:`, `clobbers:` blocks. Each operand binds a register name to a ZER expression; checker enforces integer-typed scalars. Emitter lowers to GCC inline asm with constraint letters (`a`/`b`/`c`/`d`/`S`/`D` for rax/rbx/rcx/rdx/rsi/rdi).
-    ```
-    naked void load_const() {
-        asm {
-            instructions: "movq $42, %0"
-            outputs: { "rax" = g_result }
-            safety: "Test asm output binding by loading immediate 42 into rax"
-        }
-    }
-    ```
-    Per-arch register validation tables (Session C/H4) will replace the GP-register-letter mapping. Session B accepts unknown registers via `"r"` (any GPR) fallback. **Session D (added 2026-04-25)**: 4 universal structural rules — S2 (max 16 instructions), S3 universal (no labels), operand reference consistency, duplicate register binding rejection. **Session E1 (added 2026-04-26)**: 3 Z-rules wiring existing safety systems through asm operand boundaries — Z6 (forward-compat: ban asm in defer/async), Z8 (const output target rejected — qualifier preservation, System #20), Z11 (non-keep pointer param + memory clobber rejected — Keep Parameters, System #21). **Session E2 (added 2026-04-26)**: 2 more Z-rules + 1 documented reuse — Z3 (VRP range invalidated on asm output, System #12; calls `vrp_invalidate_for_assign`), Z7 (MMIO range — automatic via existing `@inttoptr` check on operand expressions; no new code), Z12 (`scan_frame` walker recurses into structured asm operands, System #18). **Session E2b (added 2026-04-26)**: 2 forward-compat Z-rules — Z4 (clear `provenance_type` + escape flags on asm output Symbol, System #3), Z5 (reject `is_local_derived` pointer input + memory clobber, System #11). **Session E3 (added 2026-04-26)**: 2 IR-layer Z-rules in `zercheck_ir.c` IR_NOP handler (NODE_ASM passthrough) — Z1 (UAF: invalid handle as asm input → error, System #7), Z2 (move struct as asm input → mark HS_TRANSFERRED, System #10). Forward-compat today (naked-only restriction excludes Handle/move-struct operands). **Cumulative: 10 of 13 Z-rules wired (Z1, Z2, Z3, Z4, Z5, Z6, Z7, Z8, Z11, Z12). Remaining: Z9/Z10/Z13 (forward-compat pending S1 relaxation).** **Session F1a (added 2026-04-26)**: 8-category framework skeleton — `src/safety/asm_categories.{h,c}` declares ZerArchId enum + 8 ZerAsmCategory bitmap flags (C1 value-range, C2 alignment, C3 state-machine, C4 cpu-feature, C5 privilege, C6 memory-addr, C7 provenance, C8 memory-order=System#30). `zer_asm_category(arch, name, len)` stub returns 0 today; F4-F6 ship vendored per-arch data tables; F7 wires per-category enforcement. **Session F2 (added 2026-04-26)**: build-time-gen pipeline. `scripts/gen_register_tables.sh` probes GCC for register validity per arch (`echo "..." \| gcc -x c -` clobber test); output vendored to `src/safety/asm_register_tables_<arch>.c`. `make gen-asm-tables` regenerates. F2 ships x86_64 (40 valid registers from 53 candidates). `zer_asm_register_valid(arch, name, len)` declared in `src/safety/asm_register_tables.h`, implemented in `src/safety/asm_register_lookup.c` as linear scan. F5/F6 add ARM64/RISC-V via cross-gcc. **Session F7-minimum (added 2026-04-26)**: validation jump done first to confirm F1a+F2 architecture works. Register name validation wired into `checker.c` NODE_ASM — 3 loops (inputs/outputs/clobbers) call `zer_asm_register_valid`. Pseudo-clobbers `"memory"` and `"cc"` special-cased. `tests/zer_fail/asm_typo_register.zer` confirms typos rejected end-to-end. Architecture validated — no rework needed for F3-F6 data entry. **Session F3 (added 2026-04-26)**: expanded `scripts/candidates_x86_64.txt` from 53 → 213 candidates (full coverage: GP, SIMD xmm/ymm/zmm, x87 FP, MMX, mask, segment, CR, DR). GCC probe accepted 104 (was 40) — covers all SIMD/FPU/MMX. AVX-512 high regs (xmm16-31) and mask regs (k0-7) need `-mavx512f` probe flag (future enhancement). Privileged regs (cr/dr/seg) intentionally rejected — not user-mode clobberable. `Dockerfile` updated with `COPY scripts/`. `tests/zer/asm_simd_register.zer` confirms `xmm0` clobber validation works. Session B's input/output type check extended to accept pointer types alongside integers (common case: MMIO addresses, struct base pointers). All Z-rules call EXISTING Phase 1 predicates / checker fields — no new extractions needed. **Sessions C + F architecture (decided 2026-04-25): build-time generation with vendored output.** Probe scripts run at zerc build time (GCC for registers, Capstone/XED/ARM-XML/RISC-V-opcodes for instructions+categories), generate `.c` tables, vendor in `src/safety/`. zerc runtime does fast hash lookup against linked tables (no GCC shell-out, LSP-responsive). Pattern matches LLVM TableGen, ICU, Linux autoconf. See `docs/asm_plan.md` "SESSIONS C + F ARCHITECTURE" notice for details.
-    **OBSOLETE (kept for context):** previously required `unsafe asm("...")` form (2026-04-23 to 2026-04-25). Audit confirmed the `unsafe` keyword was cosmetic — every safety check keys on the structural `in_naked` flag, not the keyword. Rename aligns with C/Zig/C++ convention (only Rust/Carbon use `unsafe asm`); ZER's auto-everything brand fits bare `asm`. The planned `unsafe fn` (H5 of D-Alpha-7.5) was also dropped — function-level marker is redundant once strict mode is per-block. `naked fn` stays (hardware constraint for interrupt handlers, no prologue/epilogue).
+16. **Inline asm uses bare `asm(...)`** (renamed from `unsafe asm` 2026-04-25 —
+    the keyword was cosmetic; safety keys on the structural `in_naked` flag).
+    Allowed ONLY inside `naked` functions (S1 interim guard). Two forms:
+    - Inline: `asm("nop");` or extended `asm("..." : outputs : inputs : clobbers);`
+    - Structured: `asm { instructions: "..."  inputs: { "rax" = expr }
+      outputs: { ... }  clobbers: { ... }  safety: "..." }` — the `safety:`
+      string (>= 30 chars) is MANDATORY (S4 audit-trail rule).
+    Max 16 instructions (S2), no labels (S3), register names validated per-arch,
+    10 of 13 Z-rules wired (Z1-Z8, Z11, Z12) — UAF/move/VRP/provenance/escape/
+    qualifier/MMIO tracking stays ACTIVE through asm operand boundaries (unlike
+    Rust, which goes blind inside `unsafe { asm!() }`). Users prefer
+    `@intrinsic()` calls (130 shipping); asm is the escape hatch.
+    Direction: Option E rework — `docs/asm_lang_zer_safe.md` +
+    `docs/option_e_plan.md`. Per-session implementation history:
+    `docs/compiler-internals.md` D-Alpha-7.5 Session A..F sections.
 
 ### Intrinsics (@ builtins)
 ```
@@ -496,49 +483,19 @@ ARM; sepc/sstatus on RISC-V) before the transition instruction. Dead-branch patt
 (hardened `asm`) then Phase 2 (strict mode implementation with 8 categories +
 13 Z-rules + new System #30).
 
-### `asm` safety (strict mode + Z-rules + 8 Categories, planned D-Alpha-7.5)
+### `asm` safety — current state + direction
 
-**NAMING NOTE (2026-04-25):** Throughout this section and the asm_plan.md doc, references to `unsafe asm` and `unsafe fn` are OBSOLETE — renamed to bare `asm` (and `unsafe fn` was dropped entirely). The keyword was cosmetic; safety enforced structurally via `zer_asm_allowed_in_context(in_naked)`. The plan, the H1-H7 features, all Z-rules, all 8 categories, System #30 — **unchanged**. Only the keyword.
-
-
-**Research phase COMPLETE (2026-04-24) — 7 sessions, 8 final universal precondition categories.**
-
-Fresh-session entry points:
-- `docs/asm_preconditions_research.md` — 8 categories (C1-C8), ISA citations per-arch, System #30 design spec
-- `research/asm_generics/C1..C8/` — 24 POC `.zer` files (reject+accept per category) — NOT in tests/, research artifacts only
-- `research/asm_generics/README.md` — folder structure + migration path (POCs → tests/ when strict mode lands)
-
-Final category count: **8** (was 10; C9 merged into C3 in Session 3, C10 deleted in Session 7 after found to collapse into existing structural rules). Framework verified universal across **5 architectures** (x86-64, ARM64, RISC-V full; PowerPC + Cortex-M spot-checks with 12/12 and 10/10 fit).
-
-ZER's 29 safety tracking systems extend THROUGH `unsafe asm` operand boundaries via 13 Z-rules + 8 categories. Unlike Rust (which disables borrow checker inside `unsafe { asm!() }`), ZER keeps all tracking active at asm bindings.
-
-**Strict mode = 18 structural + 13 Z-rules + 8 universal categories + 1 new System #30 = 100% language-safe. DEFAULT ON from v1.0 (no opt-in flag).**
-
-**System #30 (Atomic Ordering) — DESIGNED BUT NOT IMPLEMENTED.** Only new safety system added by Option C. Tracks happens-before edges via CFG traversal in `zercheck_ir.c` (extends Model 1 state-machine pattern). Spec + pseudocode in `docs/asm_preconditions_research.md` C8 section. ~80 hrs implementation. **DO NOT implement yet** — wait until D-Alpha-7.5 Phase 2. Current research phase produced DESIGN + POCs only, no compiler code changes.
-
-Z-rules catch through-asm bugs that Rust can't:
-- Z1: UAF through asm operand (Handle must be ALIVE per System #7)
-- Z2: move struct consumed by asm → HS_TRANSFERRED (System #10)
-- Z5: memory clobber = escape marker (stack pointer escape rejected, System #11)
-- Z7: asm memory operand must be in declared mmio range (System #19)
-- Z8: qualifier preservation (can't strip const/volatile via asm, System #20)
-- Plus Z3/Z4/Z6/Z9-Z13 leveraging VRP, provenance, context flags, ISR tracking, etc.
-
-**Per-instruction preconditions** (catching instruction-level UB like `bsr` on zero, shift UB) were evaluated 2026-04-24 and DEFERRED from Tier A. Would require hardcoded per-arch instruction database conflicting with generic-tracking philosophy. Covered by Tier C `@verified_spec` `requires:` clauses when user opts in — same mechanism as algorithm correctness. See `docs/asm_plan.md` "Per-Instruction Preconditions — Evaluated and Deferred" section.
-
-**Strict mode is DEFAULT ON** from v1.0 — not opt-in via flag. `--relax-asm` is the opt-out; per-block `@relax_check(ZN)` for legitimate edge cases. Same philosophy as Rust's borrow checker.
-
-**Layer split:** Z1/Z2 live in `zercheck_ir.c` (CFG state machines on IR_ASM). Z3-Z13 live in `checker.c` (AST-level NODE_ASM). `zercheck.c` is now a 150-line shim (Phase F migration complete 2026-05-03) — never add new safety code there; it routes everything to `zercheck_ir`.
-
-**Two orthogonal dimensions (NOT a continuum):**
-- **Language safety** (v1.0, default on, **critical-path**): **100%** via strict mode (18 structural + 13 Z-rules + 8 categories + System #30) + Phase 7 operational depth — UAF/bounds/handle/move/escape/provenance/MMIO/qualifier/ABI all caught. **This alone matches Rust + memory + concurrency safety claims, no algorithm proof needed.**
-- **Algorithm correctness** (v2.x+ specialty, NOT critical-path, opt-in per block): `@verified_spec` Vale-tier — proves "this asm IS aes-128", "this binary_search actually finds target". **Niche** — used by ~1-2% of users (crypto, safety-critical). **Deprioritized 2026-04-26** from v1.0/v1.1 to v2.x+. Specialists can use `cinclude` to link Vale-verified C code in v1.x.
-
-These dimensions compose — strict mode still runs inside Vale-tier blocks.
-
-**Scope is language-safe at operand boundary, NOT algorithm-safe.** Same scope as every safe language (Rust, Ada-without-SPARK, Zig). Algorithm choice + business logic = developer's responsibility unless they opt into `@verified_spec` (v2.x+).
-
-See `docs/compiler-internals.md` Z-rules section for implementation details; `docs/asm_plan.md` for roadmap.
+Two orthogonal dimensions (NOT a continuum): **language safety** (operand-
+boundary tracking — UAF/bounds/move/escape/provenance/MMIO/qualifier kept
+active through asm bindings; same scope as every safe language) vs
+**algorithm correctness** (`@verified_spec` Vale-tier — v2.x+ specialty, NOT
+critical-path, deprioritized 2026-04-26). Layer split: Z1/Z2 live in
+`zercheck_ir.c` (CFG state machines); Z3-Z13 in `checker.c` (AST NODE_ASM);
+`zercheck.c` is a shim — never add safety code there. Z9/Z10/Z13 never
+shipped (were blocked on S1 relaxation; superseded by the Option E pivot).
+History + research: `docs/asm_plan.md`, `docs/asm_preconditions_research.md`,
+`docs/compiler-internals.md` Z-Rules section. Direction:
+`docs/asm_lang_zer_safe.md` (Option E) + `docs/option_e_plan.md` (Phase 1).
 
 ### mmio Declaration (MANDATORY for @inttoptr)
 ```
@@ -842,45 +799,20 @@ diff zerc zerc2                  ← identical = v1.0 proven
 
 **Migration to `.zer`-primary happens when:** ZER has enough public code (GitHub repos, blog posts, Stack Overflow) that LLMs learn the syntax natively. Until then, C is the development language.
 
-**Roadmap:**
-- **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
-- **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
-- **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
-- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 786 Rust tests + 36 Zig tests + 195 ZER integration + 68 ZER negative (0 failures), flag-handler matrix audit tool (`tools/audit_matrix.sh`) found 5 missing checker validations, ctags-guided audit found 3 emitter bugs in ~5K tokens, red team audit: 42/81 Gemini attacks fixed (12 rounds) + 2 codebase analysis finds + full 25K-line audit, `Semaphore(N)` builtin, BUG-462 through BUG-506 (46 bugs fixed), systematic refactoring (25 unified helpers — R1-R3 + B1 `track_dyn_freed_index` + B2 `check_union_switch_mutation` + B4 `emit_opt_wrap_value` + B10 `handle_key_arena` + 18 prior), full codebase audit (25,757 lines): 15 distinct unwrap fixes (BUG-506 + A15/A19/A20), 5 buffer over-read fixes, 2 fixed arrays → dynamic, 2 volatile temp fixes, spawn string+struct validation, orelse emission consolidated (B3), return wrapping consolidated (B7), union typedef macro (B8), zercheck 27 arena keys (B10), zig test runner (36 tests automated), refactor plan in `docs/ZER_Refactor.md`, CFG-aware zercheck with scope-aware handle tracking (`find_handle` vs `find_handle_local`), recursive mutex with CAS lazy init, unified `emit_file_module`, VRP 100% via address_taken at TOK_AMP + compound assign invalidation, deadlock call graph DFS, async state struct temp promotion (Rust MIR-equivalent), `*opaque` comparison `.ptr` extraction, runtime MMIO alignment check, C interop safety model (`cinclude` + `*opaque` + `shared struct`), 510+ bug fixes, 4,000+ tests, FuncProps function summaries (tracking system #29 — transitive context safety via lazy DFS on Symbol)
-- **v0.4:** MIR-inspired IR (flat locals, basic blocks) — replaces 29 AST walkers with one lowering pass. zercheck on CFG, VRP on SSA-like locals, async complete by construction. Still emits C → GCC. See `docs/IR_Implementation.md`
-- **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
+**Roadmap:** per-release changelogs (v0.2 → v0.4 feature lists) moved to
+`docs/compiler-internals.md` "Release history" (2026-06-10). Current: v0.3.0
+shipped; v0.4 MIR-inspired IR is DONE and load-bearing (since 2026-04-17);
+**v1.0 = self-hosting proof** (zerc.zer compiles itself identically).
 
 
 ### C-to-ZER Conversion Tools (implemented v0.2)
 
-Two tools + one library for automated C-to-ZER migration. Full architecture docs in `docs/compiler-internals.md`.
-
-**`tools/zer-convert.c`** — Phase 1: C syntax → ZER syntax (token-level transform)
-- Types, operators, casts, sizeof, struct/enum/union keyword removal
-- switch/case/break → ZER `.VALUE => {}` syntax (nested, multi-case fallthrough)
-- typedef struct → struct Name, do-while → while(true), void* → *opaque, void** → **opaque
-- Pointer decl rearrangement: `int *ptr` → `*i32 ptr` (multi-level, return types)
-- Usage scanner `classify_params`: char* → []u8 (string), ?*u8 (nullable), *u8 (write-through)
-- Pointer arithmetic: `ptr + N` → `ptr[N..]`, `*(ptr + N)` → `ptr[N]`
-- Auto-extraction: ternary/goto/bitfields/asm → companion `_extract.h` via cinclude
-- Preprocessor → comptime: `#define MAX(a,b)` → `comptime u32 MAX(u32 a, u32 b)`, `#ifdef` → `comptime if`, `#endif` → `}`, `#define GUARD` → `const bool GUARD = true;`
-- Qualifier handling: `volatile` preserved and reordered, `extern`/`inline`/`restrict`/`register` stripped
-- MMIO casts: `(uint32_t*)0xADDR` → `@inttoptr(*u32, 0xADDR)`, `(volatile uint32_t*)0xADDR` same
-- Pointer-to-int: `(uintptr_t)ptr` → `@ptrtoint(ptr)`, `uintptr_t`/`intptr_t` → `usize`
-- Number suffixes: C suffixes (U, L, UL, ULL) stripped from literals
-- Include guards: `#ifndef FOO_H / #define FOO_H` detected and stripped
-- Unconvertible macros: stringify (`#`), token paste (`##`), variadic (`__VA_ARGS__`) → auto-extracted to companion `_extract.h` via cinclude (zero manual work)
-- `#if defined(X)` → `comptime if (X)` (expands `defined()` operator)
-
-**`tools/zer-upgrade.c`** — Phase 2: compat builtins → safe ZER (source-to-source)
-- Layer 1: strlen→.len, strcmp→bytes_equal/bytes_compare, memcpy→bytes_copy, memset→bytes_zero, strcpy/strncpy→@cstr
-- Layer 2: malloc/free → Slab(T) with Handle rewriting (cross-function, struct fields, local vars)
-- Post-processing: slab declarations, signature rewriting, import management
-
-**Pipeline:** `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`
-- Multi-file: each .c converts independently, types shared via `cinclude "header.h"`
-- For full ZER safety: replace `cinclude` with `import` (manual, one line per file)
-- 139 regression tests in `tests/test_convert.sh` (was 108, +31 for P0/P1 fixes)
+`tools/zer-convert.c` (Phase 1: C syntax → ZER syntax, token-level) +
+`tools/zer-upgrade.c` (Phase 2: compat builtins → safe ZER, source-to-source).
+Pipeline: `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`.
+139 regression tests in `tests/test_convert.sh` (`make docker-test-convert`).
+Full transform catalog + architecture: `docs/compiler-internals.md`
+(zer-convert / zer-upgrade sections).
 
 ### Compiler Internals — MANDATORY READING
 
@@ -888,150 +820,35 @@ Two tools + one library for automated C-to-ZER migration. Full architecture docs
 
 ### Proof Internals — MANDATORY for Coq/Iris work
 
-**MANDATORY — read `docs/proof-internals.md` BEFORE modifying any `proofs/operational/**/*.v` file.** It has a "Fresh-session reading order" section at the top that sequences what to read (~65 min of context, saves 2-5 hours of rediscovery). Covers: Docker/MSYS build quirks, Iris name collisions (`expr`, `val`, `state` shadow our types after `Require Import weakestpre`), typeclass subtyping (`::`), `IntoVal`/`AsVal` for `wp_value`, `destruct` intropattern pitfalls, ghost-map delete-vs-update design, Coq nested-comment lexer traps, gset/sets imports, `()` vs `tt` for unit values, `-Q` bindings per subset, and a 12-row common-errors + fixes table.
+**MANDATORY — read `docs/proof-internals.md` BEFORE modifying any
+`proofs/**/*.v` or `src/safety/*.c` file.** It has the fresh-session reading
+order, the Phase 1 extraction recipe, the VST common-errors table, spec/proof
+patterns that work, and (moved from this file 2026-06-10) the full 8-phase
+verification roadmap + the theory↔implementation CI-gate chain.
 
-**Current proof state (2026-04-21):** 47 Iris/Coq files, **~330 axiom-free theorems** across **7 subsets** (λZER-Handle/Move/Opaque/Escape/MMIO as operational + λZER-Typing as predicate-based covering all typing sections). Zero admits. All 203 rows in `docs/safety_list.md` have real proofs — NO `True. Qed.` placeholders remain for substantive rows. `make check-proofs` verifies zero admits. Layer 2: 106 theorem-linked `.zer` tests all passing.
+Current state: 47 Iris/Coq files, ~330 axiom-free theorems across 7 subsets,
+zero admits; all 203 safety_list.md rows have real proofs. Phase 1 extraction
+COMPLETE (85/85 predicates in `src/safety/`, linked into zerc AND VST-verified
+by `make check-vst` — same .c file, no divergence possible). Phase 2 (decision
+extraction) 4/60. `make check-proofs` verifies zero admits.
 
-**Sections at operational step-based depth:** A (handle, 18), B (move, 8), H (MMIO, 9), J-core (opaque, 6), O (escape, 12). Total 53 rows via step rules + resource algebra + state_interp + step specs.
+The three levels (keep straight in any claim):
+- **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.
+- **Level 2** (tests/zer_proof/) — the compiler empirically rejects known violations.
+- **Level 3** (VST on extracted `src/safety/*.c`) — real compiler code matches
+  the spec for EVERY input. Catches what 1+2 miss (`if (x = 1)` typo class).
 
-**Sections at real Coq predicate depth:** C, D, E, F, G, I, J-rest, K, L, M, N, P, Q, R, S, T (~120 rows) — all in `lambda_zer_typing/typing.v`. Bool-returning predicates + theorems about them. Decidable, mechanically checkable. Not step-based, but REAL proofs (not placeholders).
+THE ONE RULE that must survive any summary: **write Coq specs against the
+Level 1 ORACLE (typing.v / operational subset / safety_list.md), NEVER against
+the current C behavior.** A code-driven spec is a tautology that freezes bugs
+into CI forever; an oracle-driven spec makes VST failure EXPOSE compiler bugs.
+If no Level 1 oracle exists for the subsystem → audit first (can't write
+oracle-driven specs without an oracle).
 
-**Not safety-semantic:** U (35 rows — pure well-formedness, correctly marked `—`).
-
-**Level 3 — Architecture 1 extract-and-link VST (2026-04-21, 7 real extractions):** Pure predicate functions extracted from zercheck.c/zercheck_ir.c/checker.c into `src/safety/*.c`. The SAME `.c` file is linked into zerc (via Makefile CORE_SRCS) AND verified by `make check-vst` (via CompCert clightgen). If a change breaks the Coq spec, check-vst fails — blocks PR.
-
-Extracted so far (44 total — **PHASE 1 COMPLETE 2026-04-22**):
-- `src/safety/handle_state.c` — 4 predicates: state checks
-- `src/safety/range_checks.c` — 3 predicates: count/bounds/variant
-- `src/safety/type_kind.c` — 7 predicates: type categories
-- `src/safety/coerce_rules.c` — 5 predicates: widening + qualifier preservation
-- `src/safety/context_bans.c` — 6 predicates: return/break/continue/goto/defer/asm
-- `src/safety/escape_rules.c` — 3 predicates: region-tag escape (λZER-escape)
-- `src/safety/provenance_rules.c` — 3 predicates: @ptrcast provenance (λZER-opaque)
-- `src/safety/mmio_rules.c` — 2 predicates: @inttoptr safety (λZER-mmio)
-- `src/safety/optional_rules.c` — 2 predicates: null/optional rules (typing.v N)
-- `src/safety/move_rules.c` — 2 predicates: move struct tracking (λZER-move)
-- `src/safety/atomic_rules.c` — 2 predicates: @atomic width/arg (typing.v E)
-- `src/safety/container_rules.c` — 3 predicates: field/container/depth validity (typing.v T+K)
-- `src/safety/misc_rules.c` — 2 predicates: int-switch default, bool-switch exhaustive (typing.v Q)
-
-**Phase 2 batches (decision extraction):**
-- `src/safety/isr_rules.c` — 4 predicates: `zer_alloc/spawn_allowed_in_isr/critical` (hardware ban decisions, oracle: CLAUDE.md Ban Framework + typing.v C03/C04/S04/S05)
-
-Call sites: zercheck.c (is_handle_invalid, is_handle_consumed, is_move_struct_type, should_track_move), zercheck_ir.c (ir_is_invalid), checker.c (Pool/Ring count + control-flow handlers + return-escape + @ptrcast + @inttoptr + TYNODE_OPTIONAL + @atomic_*), types.c (type_is_*, can_implicit_coerce). All delegate.
-
-**Architecture 1 chosen over Architecture 2** (full Coq rewrite + extract). Reasoning: LLM velocity (C >> Coq), incremental value at every phase, no heroic rewrite risk, working compiler throughout. Architecture 2 reserved for stable subsystems year 2+. See `docs/formal_verification_plan.md` Level 3 section for concrete 8-phase roadmap.
-
-**Full verification commitment (2026-04-21):** target is seL4-level formal verification = every safety property proven at operational depth + every compiler check VST-verified + CI enforces the whole thing. Total effort: ~1,085 hrs (~1 year focused, ~3 years casual).
-
-**The 8 phases:**
-1. Phase 0 — Infrastructure DONE
-2. Phase 1 — 85 pure predicates (~180 hrs) — **85/85 (100%) — FULL PHASE 1 COMPLETE 2026-04-22** (see docs/phase1_catalog.md for definitive enumeration)
-   - 71 = strict milestone (operational + typing.v real theorems, excluding concurrency schematic)
-   - 85 = full target (includes 14 concurrency schematic — real theorems, weaker oracle until Phase 7 upgrades)
-   - Decision 2026-04-22: extract full 85. Phase 6 `check-no-inline-safety` requires it; Phase 7 upgrades Coq spec only (C unchanged, ~20 min per predicate).
-   - Batches landed 2026-04-22: B1 M-section, B2 L-extras, B1b M08 redone, BUG-603 void-main fix (415/415), B3 T+K container extras, B4 P variant, B5 S stack, B6 R comptime, B7 J-extended (strict milestone 71), B8 E atomic extras, B9-11 concurrency (full 85).
-3. Phase 2 — 60 decision extractions (~150 hrs) — **4/60 (7%)** — ISR/@critical bans batch 1 (counts toward Phase 1 pure predicates too)
-3. Phase 2 — 60 decision extractions (~150 hrs)
-4. Phase 3 — Generic AST walker (~60 hrs)
-5. Phase 4 — Verified state APIs (~240 hrs)
-6. Phase 5 — Phase-typed checker (~30 hrs)
-7. Phase 6 — CI discipline (~30 hrs)
-8. Phase 7 — Deepen 82 schematic rows to operational (~425 hrs). Sub-phases: λZER-concurrency (~150), λZER-async (~80), λZER-control-flow (~30), λZER-mmio-rest (~20), λZER-opaque-rest (~30), λZER-escape-rest (~30), λZER-typing-extra (~15), λZER-vrp (~50), λZER-variant (~15), spec reviews (~25).
-9. Phase 8 — Release polish (~50 hrs)
-
-**End state claim:** "ZER is a formally verified compiler. For every program ZER accepts, the resulting C is provably free of 200+ specified safety properties — proven in Coq, verified in VST, tested empirically. Trust base: Coq kernel + GCC + hardware." Same strength as CompCert / seL4.
-
-**Each phase is stop-able with real value shipped.** Extractions commit one-at-a-time. Deepening subsets commit per-subset. No big-bang milestones.
-
-**Level 3 structure:**
-- `src/safety/handle_state.c` — extracted predicate, linked into zerc
-- `src/safety/handle_state.h` — declarations + state constants (ZER_HS_*)
-- `proofs/vst/verif_handle_state.v` — VST spec + proof (0 admits)
-- `make check-vst` clightgens the SAME `src/safety/*.c` — no duplicates, no divergence
-
-**Also in proofs/vst/:** 21 pre-extraction demonstrator proofs (verif_simple_check.v, verif_zer_checks.v, verif_zer_checks2.v). These are standalone `.c` files written for VST, NOT extracted from the compiler. They demonstrate the VST pattern but do NOT verify real compiler code — don't count them as compiler verification.
-
-**Level 3 scope (honest):** 15-25 pure predicates extractable from zercheck.c + zercheck_ir.c. Complex functions (call-graph DFS, scope walks) need struct separation logic — 20+ hrs each, separate future work.
-
-**Three levels distinction:**
-- **Level 1 (predicates)** — `typing.v` etc.: abstract safety spec is correct.
-- **Level 2 (tests)** — `tests/zer_proof/`: compiler empirically rejects known violations.
-- **Level 3 (VST on extracted predicates)** — `src/safety/*.c` linked + `proofs/vst/verif_*.v`: real compiler code matches spec for EVERY input. Catches implementation bugs 1+2 can miss (e.g., `if (x = 1)` assignment-typo — spec correct, tests may miss, VST fails immediately).
-
-**Theory ↔ implementation guarantee (what CI proves):**
-
-The correctness chain:
-```
-Coq theory (typing.v / operational subsets) — HUMAN-WRITTEN, TRUSTED
-    ↓  REQUIRED: must have matching extraction
-src/safety/<name>.c — pure predicate
-    ↓  make check-vst PROVES match
-Coq spec in proofs/vst/verif_<name>.v (must match oracle, not code)
-    ↓  REQUIRED: checker.c must delegate
-Call sites in checker.c / zercheck.c (with /* SAFETY: ... */ link)
-    ↓  compiled with GCC
-Compiled zerc binary
-```
-
-Each `↓` is enforced by a CI gate:
-- `check-vst` — src/safety/ matches Coq spec (exists today)
-- `check-theory-extracted` — typing.v has extraction (Phase 6, not yet)
-- `check-no-inline-safety` — checker.c delegates (Phase 6, not yet)
-- `check-api-bypass` — no direct mutation (Phase 6, not yet)
-
-Phase 6 is what MAKES the guarantee mechanical. Until Phase 6, the theory→implementation link depends on HUMAN DISCIPLINE.
-
-**Adding a new Level 3 extraction (MANDATORY steps — details in `proof-internals.md` "Phase 1 extraction recipe"):**
-
-1. Identify pure predicate (primitive args, no state mutation, no AST/struct deps)
-2. Write `src/safety/<name>.c` + `.h` using VST-friendly C style: flat cascade of early-return ifs, NO nesting, NO compound conditions (`&&`/`||`). If logic wants compound, SPLIT into multiple predicates and AND at call site.
-3. Wire original C call sites to delegate: `zer_predicate_name(arg) != 0`
-4. Add to Makefile CORE_SRCS + LIB_SRCS + check-vst clightgen/coqc lines
-5. Add `<name>.v` to `src/safety/.gitignore`
-6. Write `proofs/vst/verif_<name>.v`: Coq spec uses `Z.eq_dec` (NOT `Z.eqb`) to align with proof's destruct. Standard proof: `repeat forward_if; forward; unfold <name>_coq; repeat (destruct (Z.eq_dec _ _); try lia); try entailer!`.
-7. Run `make docker-build` + `make check-vst` + `make docker-check`
-8. Commit (one predicate or tight batch per commit)
-
-**When VST check-vst fails (see common-errors table in `proof-internals.md`):**
-- `Use [forward_if Post]` → C has nested ifs or `&&`/`||`. Flatten to single cascade.
-- `variable X not found` → VST auto-substed on `==`; use `destruct (Z.eq_dec _ _)` not by name.
-- `Attempt to save an incomplete proof` → proof closed fewer goals than C has. Add more destructs.
-
-**Spec discipline (CORRECTED 2026-04-22, was "audit-before-extraction"):**
-
-The original rule ("audit before extract") was defensive but often REDUNDANT. Correct discipline:
-
-**Write the Coq spec against the Level 1 ORACLE (typing.v / operational subset / safety_list.md), NOT against the current C behavior.**
-
-When the spec is oracle-driven:
-- VST FAILS if the C diverges from the rule → bugs exposed by proof failure
-- VST PASSES if the C matches → correctness guarantee
-
-When the spec is code-driven:
-- VST trivially passes (tautology) → bugs are frozen into the spec and CI enforces them forever
-
-**Why this matters:** Level 3 VST proves "C matches spec I wrote." It does NOT prove the spec is correct. A code-matching spec just formalizes whatever the code does, bugs included. An oracle-matching spec exposes bugs because C must match the oracle.
-
-**Retroactive check of 2026-04-21 Gemini findings:** all 3 real bugs (F5 shift, F3 escape, F7 iter-limit) were catchable by Level 3 VST with disciplined spec-writing. If we'd extracted `zer_shift_eval` with a spec matching typing.v's shift rule (not matching the current int64 eval), VST would have failed — exposing the bug.
-
-**Audit-before-extraction IS still valuable when:**
-- No Level 1 oracle exists for the subsystem (schematic rows in safety_list.md)
-- Extracting won't cover the code (complex recursive functions we can't extract)
-- Testing multi-subsystem interactions (concurrency + async)
-
-**Audit-before-extraction is REDUNDANT when:**
-- Level 1 has operational/predicate proof (gold oracle)
-- The extracted predicate maps 1:1 to a Level 1 theorem
-- We write the Coq spec from the Level 1 theorem, not from the C code
-
-**Examples of bugs the 2026-04-21 Gemini audit caught** (documented fully in `BUGS-FIXED.md` "Gemini red-team audit"): comptime shift width, escape via struct field, fail-open iteration limit. All would have been caught by disciplined Level 3 extraction against Level 1 oracles. Regression tests in `tests/zer/` and `tests/zer_fail/`.
-
-**Per-batch checklist before extracting:**
-1. Does a Level 1 oracle exist for this subsystem? (Check safety_list.md and operational subsets.)
-2. If YES → extract directly. Write specs from the oracle. VST exposes any code-vs-rule divergence.
-3. If NO (schematic only, or new code) → audit first. Can't write oracle-driven specs without an oracle.
-- `Cannot find physical path bound to ... zer_safety.<name>` → Makefile missing clightgen/coqc line for the new file.
+New extraction → follow proof-internals.md "Phase 1 extraction recipe" +
+Makefile/.gitignore checklist. VST-friendly C style: flat cascade of
+early-return ifs, NO nesting, NO compound conditions (split predicates and
+AND at the call site).
 
 Contents of `docs/compiler-internals.md`:
 
@@ -1447,108 +1264,37 @@ noise the legit register-ctx-then-callback pattern) — see limitations.md.
 
 ## Stage 4 PIVOTED 2026-05-12 — see docs/asm_lang_zer_safe.md
 
-**PIVOT NOTICE:** The "make compiler smart about specific instructions"
-direction (Session G Phase 5, Z9/Z10/Z13, more per-instruction DB
-growth) is **DEFERRED indefinitely**. New direction: annotation-driven
-asm safety per `docs/asm_lang_zer_safe.md` (the "smart language,
-generic compiler" approach).
+**PIVOT NOTICE:** the "make compiler smart about specific instructions"
+direction (Session G Phase 5, Z9/Z10/Z13, per-instruction DB growth) is
+**DEFERRED indefinitely**. New direction: annotation-driven asm safety —
+**Option E** (three-layer, no-favored-ISA, `docs/asm_lang_zer_safe.md` §1.7,
+READ END-TO-END before touching asm safety; decisions there are LOCKED).
+**Phase 1 = Level C cleanup** (delete per-arch tables/scripts/categories/
+.zerdata, hardcoded ~12-entry UB-classics list, delegate register/instruction
+validation to GCC) — fresh-session-executable checklist:
+**`docs/option_e_plan.md`**. Intrinsics STAY until Phase 3 re-layering.
 
-**What stays from asm_plan (already shipped):**
-- 130 intrinsics, Z1-Z8/Z11/Z12, F2/F4/F5/F6 register tables, F7-light
-  LR/SC, F7-full Step 2 constraints, C8 ordering metadata, Session A/B
-  syntax, naked-only restriction.
+What's shipped and survives all phases: 130 intrinsics, Z1-Z8/Z11/Z12,
+structured asm syntax (Session A/B), F7-light LR/SC pairing, naked-only
+restriction (S1). Final sub-stage status table + F4/F7 dispatch list:
+`docs/compiler-internals.md` "Stage 4 final status" (moved 2026-06-10).
 
-**What's new (~3-4 months work in v1.x):**
-- Operand metadata, precondition annotations, ~100-entry implicit
-  table, state-machine annotation generalization. Reuses existing
-  Z-rules and safety infrastructure. Builds on Session A/B syntax.
+CLI flags: `--target-arch={x86_64,aarch64,riscv64}` (picks tables +
+cross-gcc), `--target-features=avx512f,sse,...` (ZerCpuFeature bitmap +
+GCC -m flags; baseline x86_64 = SSE|SSE2), `--probe-mode={hosted,raw,disabled}`.
 
-**Result:** Same safety as full asm_plan with ~3x less work and zero
-ongoing maintenance. Per-instruction DB frozen at ~120 entries (no
-growth per ISA extension).
-
-**For fresh sessions:** Read `docs/asm_lang_zer_safe.md` end-to-end
-before touching asm safety. The historical context below is preserved
-but the direction has changed.
-
-**As of 2026-05-02 (historical pre-pivot status):**
-
-| Sub-stage | Status | What was done |
-|---|---|---|
-| Sub-extension architecture | VALIDATED 2026-04-29 | 3-arch end-to-end empirical proof (x86_64 + aarch64 + riscv64). All 4 design alternatives evaluated and rejected. |
-| F4.1 + F4.2 (x86_64 instructions) | DONE 2026-04-29 | 51 entries across C1-C5 + C8. 14 CPU feature flags wired. Pipeline + dispatch + tests. |
-| F5 (aarch64 instructions) | DONE 2026-04-29 | 31 entries across C3-C5 + C8. ARM-specific semantics captured. |
-| F6 (riscv64 instructions) | DONE 2026-05-02 | 30 entries across C2-C5 + C8. RISC-V LR/SC, AMO, FENCE families. **3-arch instruction-table parity COMPLETE.** |
-| F7-light C3 (LR/SC pairing) | DONE 2026-05-02 | Per-block state machine catches SC-without-LR + LR-without-matching-SC across all 3 archs. Real UB caught. |
-| F7-full Step 1 (constraint plumbing) | DONE 2026-05-02 | Schema/generator/struct extended; all 3 arch tables vendored with per-operand constraints. |
-| F7-full Step 2a (NONZERO via VRP) | DONE 2026-05-02 | BSR/IDIV/etc. unprovable nonzero rejected with vendor citation. |
-| F7-full Step 2b (COMPOUND via VRP) | DONE 2026-05-02 | NONZERO check on divisor; INT_MIN/-1 backstopped at runtime. |
-| F7-full Step 2c (ALIGNED via heuristic Pass B) | DONE 2026-05-02 | MOVAPS misaligned constants rejected. Heuristic walks all bindings (positional binding fails when register operands are clobbers). |
-| F7-full Step 2d (BOUNDED via VRP) | DONE 2026-05-02 | Wiring active; no .zerdata entries use BOUNDED yet. |
-| C8 instruction classification | DONE 2026-05-02 | x86 CLWB/CLFLUSHOPT (53 entries), ARM LDAR/STLR/LDARB/LDARH/STLRB/STLRH (37 entries). Persistent-memory + acquire/release primitives ready for Session G enforcement. |
-| Session G Phase 1 (ordering plumbing) | DONE 2026-05-02 | `ZerBarrierKind` + `ZerOrderingRole` enums; ordering field on instruction entry; generator + 3 vendored tables. |
-| Session G Phase 2 (per-instruction classification) | DONE 2026-05-02 | x86/ARM/RISC-V C8 entries declare ordering.barrier_kind + role (MFENCE→PRODUCES FullMemory; CLWB→REQUIRES_AFTER StoreStore; LDAR→PRODUCES Acquire; etc.). |
-| Session G Phase 3 (in-block enforcement) | ABANDONED 2026-05-02 | Same-block check rejected canonical multi-block libpmem idiom; reverted. See docs/asm_preconditions_research.md "Design gaps identified during failed G3 attempt" for the 5 reasons why intermediate phases were dropped. |
-| Session G IR-level enforcement | NEXT (~30-40 hrs) | Smallest design that doesn't false-positive: full CFG-aware OrderingState in `zercheck_ir.c`. Tracks barriers from BOTH asm blocks AND `@atomic_*` intrinsics. Joins use set-intersection. See docs/asm_preconditions_research.md "Implementation sketch". |
-| C5 (privilege) | Covered by S1 | Naked-only restriction is the v1.0 stand-in. F7-full would add explicit kernel-context model. |
-| C6 (memory addr) | Covered by @inttoptr | Existing MMIO range check fires at every address derivation. |
-| Z9/Z10/Z13 forward-compat | Blocked on S1 relaxation | Included in F7-full estimate. |
-| naked attribute migration | DEFERRED | Requires asm-test rewrite (~20 hrs after S1 relaxation). See docs/limitations.md. |
-
-**Current F4/F7 dispatch fires (in checker.c NODE_ASM):**
-- C1 (value range) — Step 2a/2b NONZERO/COMPOUND via VRP
-- C2 (alignment) — Step 2c ALIGNED via heuristic Pass B
-- C3 (state machine) — F7-light LR/SC pairing across same asm block
-- C4 (CPU feature) — checked against `--target-features=` bitmap
-- C5 (privilege) — covered by S1 naked-only restriction
-- BOUNDED — Step 2d wiring ready (no instructions use it yet)
-
-**C8 enforcement (acquire/release pairing, CLWB→SFENCE) deferred to Session G.**
-Classification is in vendored tables; OrderingState tracking pending Stage 5.
-
-**`.zerdata` is compiler-internal, vendored, NOT user-extensible.**
-Design locked 2026-04-29.
-
-**CLI flags (Stage 4-related):**
-- `--target-arch={x86_64,aarch64,riscv64}` — picks register/instruction tables + cross-gcc
-- `--target-features=avx512f,sse,sse2,avx,avx2,aes,sha,bmi1,bmi2,lzcnt,popcnt,invpcid,pku,xsave,smap` — comma-separated; sets ZerCpuFeature bitmap + appends `-m<flag>` to GCC. Baseline x86_64: SSE | SSE2.
-- `--probe-mode={hosted,raw,disabled}` — `@probe` behavior (Fix #4 2026-05-02)
-
-**Mnemonic parser accepts dots** (RISC-V `lr.w`, `fence.i`, etc.) —
-both `scripts/gen_instruction_table.sh` section-header regex and
-`checker.c` NODE_ASM token reader. Don't drop this — RISC-V tables
-won't parse without it. Fixed BUG-653 + BUG-654 on 2026-05-02.
-
-**`Checker.target_ptr_bits` MUST be initialized in `checker_init`**
-from the global `zer_target_ptr_bits`. Pre-fix the field was
-memset-zeroed and never synced — any check `c->target_ptr_bits < N`
-silently always-true. See BUG-652 on 2026-05-02.
-
-**For fresh sessions touching asm safety:**
-- Read `docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29" section
-- The architecture decisions there are LOCKED IN — don't re-litigate
-- F7-full Step 2 is COMPLETE — all 4 constraint kinds (NONZERO/COMPOUND/ALIGNED/BOUNDED)
-  enforced. Pass A (positional, GCC %N convention) handles NONZERO/COMPOUND/BOUNDED.
-  Pass B (heuristic walk all bindings) handles ALIGNED.
-- F7-light LL/SC pairing implementation pattern (hardcoded LL/SC
-  mnemonic macros per arch) is the template for future state-machine
-  enforcement — see `checker.c` NODE_ASM dispatch
-- @critical "transitive escape via callee" was investigated 2026-05-02
-  and found to be NOT a bug — don't re-implement `can_escape`. See
-  docs/limitations.md.
-- **Session G (System #30 / atomic ordering) is the next major piece.**
-  Phase 1 (data plumbing) + Phase 2 (per-instruction classification)
-  DONE 2026-05-02. Phase 3 (in-block enforcement) was attempted and
-  ABANDONED — same-block check creates false positives on canonical
-  multi-block CLWB+SFENCE idiom. The honest path is IR-level
-  enforcement (Phase 5 of original plan, now the next phase) —
-  see `docs/asm_preconditions_research.md` "Design gaps identified
-  during failed G3 attempt" for why intermediate phases are
-  bypassed. Implementation: ~30-40 hrs CFG-aware OrderingState in
-  `zercheck_ir.c` that tracks barriers from BOTH asm blocks AND
-  `@atomic_*` intrinsics. Lesson: don't ship enforcement that
-  rejects valid code patterns; either skip the check or wait until
-  the analysis is correct.
+Gotchas that survive the pivot:
+- Mnemonic parser accepts dots (RISC-V `lr.w`, `fence.i`) — BOTH the gen
+  script regex AND checker.c NODE_ASM token reader. Don't drop (BUG-653/654).
+- `Checker.target_ptr_bits` MUST be initialized in `checker_init` from
+  `zer_target_ptr_bits` — memset-zeroed otherwise, checks silently always-true
+  (BUG-652).
+- @critical "transitive escape via callee" investigated 2026-05-02: NOT a bug —
+  don't re-implement `can_escape` (see docs/limitations.md).
+- Session G (System #30 atomic ordering): Phases 1-2 done (plumbing +
+  classification in vendored tables); Phase 3 in-block enforcement ABANDONED
+  (false-positived the canonical multi-block CLWB+SFENCE libpmem idiom).
+  Lesson: don't ship enforcement that rejects valid code patterns.
 
 ## Spawning Agents That Write ZER Code — MANDATORY
 
@@ -2055,110 +1801,24 @@ Full gap audit (20 items evaluated): see
 
 ## CFG Migration (zercheck.c → zercheck_ir.c) — COMPLETE 2026-05-03
 
-**Phase F MIGRATION COMPLETE.** zercheck_ir.c is the SOLE production
-safety analyzer. zercheck.c is now a 150-line shim delegating to
-zercheck_ir for backward-compat (LSP, firmware tests, production test).
-The original 3128-line AST analyzer is DELETED.
+`zercheck_ir.c` is the SOLE production safety analyzer. `zercheck.c` is a
+150-line backward-compat shim (LSP, firmware tests, test_production). Rules:
 
-**Final state (post-F1+F2+F3):**
-- `zercheck_ir.c` (~3800 lines) — production CFG-based safety analyzer
-- `zercheck.c` (~150 lines) — backward-compat shim:
-  `zercheck_run` → lower each fn to IR → `zercheck_ir` → return error_count
-- `zerc` binary uses zercheck_ir directly (skips shim)
-- `zer_lsp.c`, `test_firmware_patterns*.c`, `test_production.c` — call
-  `zercheck_run` (the shim)
-- `test_zercheck.c` — DELETED (was unit tests for the 3128-line analyzer;
-  4 of 54 narrow patterns originally failed under IR — all 4 closed in
-  Phase F3.1 + F3.2, see BUGS-FIXED.md 2026-05-03 / 2026-05-04)
+- **ALL new safety analysis goes in `zercheck_ir.c`** — never the shim.
+- **Never call `ir_lower_func` twice on the same AST** — `pre_lower_orelse`
+  (ir_lower.c) destructively rewrites NODE_ORELSE. Callers must produce a
+  fresh AST per invocation (current callers re-parse). Production zerc uses
+  the emitter's single-lowering `ir_hook`; after emit, zerc_main runs the
+  iterative FuncSummary build + main analysis on the COLLECTED IRFuncs.
+- **`IR_POOL_ALLOC`/`IR_SLAB_ALLOC`/`IR_POOL_FREE` etc. are NEVER emitted**
+  by ir_lower.c (intentional architecture). Method detection lives in
+  IR_ASSIGN/IR_CALL via `ir_classify_method_call_ex`. Don't "fix" the absence.
+- `ZER_AGREEMENT_AUDIT=1` re-enables AST analysis for
+  `tools/agreement_audit.sh` measurement only — never in production.
 
-**For fresh sessions:**
-- DO NOT add new safety analysis to `zercheck.c` — it's a shim.
-- ALL new safety analysis goes in `zercheck_ir.c`.
-- DO NOT call `ir_lower_func` outside the emitter or the shim's
-  `collect_funcs_from_file`. AST mutation issue (see below).
-- The shim's `collect_funcs_from_file` lowers each function once per call.
-  Callers (LSP, test harnesses) MUST produce a fresh AST per call —
-  re-using the same `file_node` will corrupt due to `pre_lower_orelse`'s
-  destructive AST rewrite. Current callers re-parse on every invocation.
-
-**Phase F0 closed 11 IR parity gaps (2026-05-03 session):**
-
-| Sub-phase | Gap | Fix |
-|---|---|---|
-| F0.1 | Coarse `ast_err==0 && ir_err==0 \|\| both>0` agreement check missed real disagreements | Per-test agreement reporter (`tools/agreement_audit.sh`) + `AGREEMENT_FAIL` machine-parseable line classifying each disagreement |
-| F0.2 | No way to verify "what fails when IR is sole driver" | `ZER_AGREEMENT_AUDIT=1` env var (audit mode for the reporter) — runs both analyzers without bailing on AST failure |
-| F0.3 | 6 false positives — fixed-point convergence used `ir_find_handle` (bare-only); compound handles caused infinite "changed" loops | Use `ir_find_compound_handle` in convergence check (zercheck_ir.c:2839) |
-| F0.4 | `ir_contains_move_struct_field` checked one level deep; 2-level nested move struct undetected | Recursive depth-limited (32) check `ir_contains_move_struct_field_depth` |
-| F0.5 | Function params of nested-struct types had inner `Handle` fields silently untracked | `ir_register_nested_handles` walks struct/union recursively, registers compound handles on entry block AND in post-fixed-point final pass (both sites needed!) |
-| F0.6 | Spawn arg of move-struct type wasn't auto-registered before being marked TRANSFERRED | Auto-register as ALIVE first when arg is move-struct typed |
-| F0.7 | Audit flagged `test_modules/opaque_layer1.zer`/`resource.zer` as IR false negatives — investigation showed AST was wrong (false positive on standalone library modules); IR was correct | No code change |
-
-**Control knobs (post-F1):**
-- `ZER_AGREEMENT_AUDIT=1` — debug mode: re-enable AST analysis
-  alongside IR for `tools/agreement_audit.sh` measurement. Production
-  compiles should NEVER set this.
-- `ZER_DUAL_RUN`/`ZER_DUAL_RUN=0`/`=2` — REMOVED in F1.
-- `ZER_IR_ONLY=1` — REMOVED in F1 (now the default behavior).
-
-**Tools added in F0:**
-- `tools/agreement_audit.sh` — runs all test suites with audit mode on,
-  collects per-test disagreements into `ir_false_positive` /
-  `ir_false_negative` / `ir_count_diff` classes. After F1+F2+F3 this
-  tool serves as historical record + can detect any future divergence
-  if zercheck.c logic ever drifts (it shouldn't, since it's now a shim).
-
-**THE critical architectural constraint (still applies):**
-
-`ir_lower_func` **mutates the AST** (`pre_lower_orelse` at ir_lower.c:1239
-replaces `NODE_ORELSE` with `NODE_IDENT` referencing a temp local). Calling
-`ir_lower_func` TWICE on the same function corrupts emission. The shim's
-`collect_funcs_from_file` calls `ir_lower_func` ONCE per shim invocation;
-callers (LSP, test harnesses) re-parse to get fresh AST per call.
-
-Production `zerc` binary uses the emitter's single-lowering hook: zerc_main
-registers `zerc_ir_hook` that collects each IRFunc as the emitter lowers
-it. After emit completes, zerc_main runs iterative FuncSummary build +
-main analysis on the collected IRFuncs — NOT re-lowering, just analyzing.
-
-**For fresh sessions touching analyzers:**
-- ALL new safety code goes in `zercheck_ir.c` (the production analyzer).
-- Adding new IR-based analyses: register via `Emitter.ir_hook` for
-  production path, or extend the shim for backward-compat callers.
-- The 4 narrow patterns test_zercheck.c covered (pool_a-vs-pool_b alias,
-  direct overwrite leak, free-then-realloc loop, struct copy alias UAF)
-  ARE NOW IN zercheck_ir as of Phase F3.1 + F3.2 (2026-05-03/04). The
-  fixes added: IR_COPY overwrite detection, struct-copy alloc_id
-  propagation, `pool_name` field on `IRHandleInfo` + wrong-pool walker,
-  and `ALIVE+MAYBE_FREED → MAYBE_FREED` merge case for monotonic lattice
-  convergence. Tests in `tests/zer_fail/wrong_pool_*.zer` and
-  `tests/zer/free_realloc_loop.zer`.
-
-**Critical IR lowering fact (Phase 8d, per ir_lower.c:84):**
-`IR_POOL_ALLOC` / `IR_SLAB_ALLOC` / `IR_POOL_FREE` / etc. enum values exist
-but are **NEVER emitted by ir_lower.c**. Pool/Slab/Task method calls flow
-through generic `IR_ASSIGN` (with NODE_ORELSE wrapping NODE_CALL, or direct
-NODE_CALL) and `IR_CALL` (with `inst->expr` holding the call). Specialized
-handlers for those opcodes in `zercheck_ir.c` are dead code. Method detection
-lives in `IR_ASSIGN` and `IR_CALL` via `ir_classify_method_call(Node*)`.
-
-**Do NOT try to "fix" the absence of IR_POOL_ALLOC emission** — this is
-intentional architecture. Add detection in IR_ASSIGN/IR_CALL method-call
-paths instead.
-
-<!-- Sections moved to docs/compiler-internals.md 2026-04-19:
-       - IR Path Validation (full history)
-       - IR Path Architectural Invariants (22 items)
-       - Scoped Defer Emission pattern
-       - IR lowering patterns that must passthrough
-       - Walker missing node kind class
-       - emit_rewritten_node vs emit_expr
-       - Pre-lowering architecture
-       - Test Harness Architecture
-     Total: ~145 lines moved, preserving all content. -->
-
-<!-- The orphan IR sub-sections that lived here (lines ~1137-1278) were
-     moved verbatim to docs/compiler-internals.md in the same commit. -->
-
+Migration record (F0.1-F0.7 parity gaps, F3.1/F3.2 narrow-pattern closures,
+removed knobs): `docs/compiler-internals.md` "CFG migration record"
+(moved 2026-06-10).
 
 ## First Session Workflow
 
@@ -2553,199 +2213,36 @@ For pre-release auditing, run multiple rounds. Each round gets more targeted as 
 ## Diff-Based Post-Release Audit (when you suspect drift)
 
 After a large structural change (IR transition, major refactor, multi-session
-work), don't only rely on green tests. Green can mean "test passed" OR "test
-skipped silently" OR "test passed for the wrong reason." The 2026-04-18 audit
-of the 029919e..HEAD diff (141 commits, ~10k new lines) found three real
-issues that no test suite caught. Use this checklist before declaring a
-milestone done.
-
-### The audit protocol (run before claiming a milestone complete)
-
-1. **Stat the diff**: `git diff <anchor>..HEAD --stat | sort -t'|' -k2 -rn` —
-   lists the biggest-delta files first. Focus audit effort there.
-2. **Grep the new code for drift markers**:
-   - `TODO|FIXME|XXX|HACK` in new additions (`git diff <anchor>..HEAD -- file.c | grep "^+" | grep TODO`)
-   - `unhandled|shouldn't happen|should not happen` — default cases that emit garbage if hit
-   - `fprintf\(out|emit\(e,` with comment-only content and no following emit
-3. **Compile a real .zer → emitted C** and grep the output for stray tokens.
-   Dead stubs leave fingerprints: `grep "/\* " output.c | head` catches
-   comment-only emissions with no payload. The 2026-04-18 audit found
-   `/* forward */ ` on line 1 of every multi-module output this way.
-4. **Check skip lists hygiene**: `grep -A2 KNOWN_FAIL tests/test_zer.sh
-   rust_tests/run_tests.sh zig_tests/run_tests.sh`. Every entry must
-   correspond to a still-active issue in `docs/limitations.md`. Entries
-   that refer to bugs since fixed are falsely masking green status.
-5. **Verify every new .c file is linked**: `grep -E "\\.c\\b" Makefile`
-   vs `ls *.c`. Unlinked .c files are either WIP (check the roadmap
-   doc — `docs/IR_Implementation.md` etc.) or forgotten.
-6. **Run `bash tools/walker_audit.sh`** — this catches the #1 silent-bug
-   class (missing NODE_ kind in `emit_rewritten_node`) by cross-referencing
-   the IR emitter against the AST emitter.
-
-### Dead-stub pattern (the most dangerous drift)
-
-A "dead stub" is code that writes a comment prefix but never completes
-the emission:
-
-```c
-/* BAD — prints the comment then exits the branch */
-if (cond) {
-    fprintf(out, "/* forward */ ");
-    /* "The actual definition will follow below" — except it never does */
-}
-```
-
-This pollutes emitted output silently because `/* forward */` followed
-by the next line's real code is still valid C — just ugly. Tests pass.
-grep-for-comments in emitted output catches it.
-
-**Prevention**: when you catch yourself writing a partial emit ("I'll
-fill this in after I finish the loop"), either commit with the emit
-complete OR add a compile-error `#error` so the code can't build. Never
-leave "will follow" stubs.
-
-### Real-code output grep (catches things tests don't)
-
-After any emitter change, run:
-
-```bash
-./zerc some_real_test.zer --emit-c -o /tmp/r.c
-grep -nE "/\* (TODO|forward|unhandled|stub|placeholder) \*/" /tmp/r.c
-grep -nE "^/\* [a-z]+ \*/$" /tmp/r.c   # comment-only lines
-```
-
-Anything matching is a signal: either a dead stub, or a code path that
-fell through an `/* unhandled node %d */0` fallback — both are silent
-miscompiles the test harness can't detect because `0` is a valid C
-literal that compiles clean.
-
-### When WIP files are NOT dead code
-
-Two files in the repo (as of 2026-04-18) compile cleanly but are NOT
-in the Makefile: `zercheck_ir.c` (452 lines) and `vrp_ir.c` (349
-lines). These are Phase 8-9 placeholders per the IR roadmap — the
-IR-native equivalents of the current AST-based `zercheck.c` and VRP.
-**Don't delete them.** The pattern "compile-clean but unlinked" is
-usually intentional WIP; check `docs/future_plans.md` and
-`docs/IR_Implementation.md` before concluding dead code.
-
-### What this audit found (reference for calibration)
-
-2 real bugs + 1 stale skip-list entry in +10,000 lines across 141
-commits. That's ~0.02% defect density, which is what "green tests"
-*should* mean but rarely does without this kind of audit.
-
-Key insight: the bugs weren't in code that had been validated — they
-were in code paths the tests thought they were exercising but weren't.
-`zerc --run` returning 0 for a SIGTRAP'd program (BUG-581 era) and
-`/* forward */` never emitting its body (this audit) both fell into
-the same category: the validation story, not the code, was broken.
-
-When the next "everything passes" milestone happens, run this audit.
+work), green tests are NOT sufficient — green can mean "test skipped silently"
+or "passed for the wrong reason". Run the protocol in
+`docs/compiler-internals.md` "Diff-based post-release audit protocol" (moved
+2026-06-10): stat the diff biggest-first, grep new code for drift markers and
+dead stubs (`/* forward */` with no payload), grep EMITTED C for comment-only
+stub fingerprints, check skip-list hygiene against limitations.md, verify new
+.c files are linked, run `tools/walker_audit.sh`. Calibration: the 2026-04-18
+run found 2 real bugs + 1 stale skip entry in +10k lines across 141 commits —
+bugs in paths the tests *thought* they were exercising.
 
 ## AST→IR Emission Diff Audit — MANDATORY after any IR lowering refactor
 
-**Read this before touching `IR_*` handlers in `emitter.c`.** Between
-2026-04-15 and 2026-04-19, the compiler shipped with 7 missing runtime
-safety checks in the IR emission path. Root cause: commit `010ddea`
-replaced `emit_expr(inst->expr)` (AST fallback) with direct local-ID
-emission in IR handlers, and silently stripped every safety wrapper
-`emit_expr` had been applying. Became effective at commit `82335c3`
-(IR default flip). All 7 restored at commit `3bdcf85` (BUG-595 through
-BUG-599 — see BUGS-FIXED.md). Do not recreate this class of bug.
+Class warning (7 regressions shipped 2026-04-15..19, BUG-595..599; siblings
+re-missed later as BUG-608/612): replacing `emit_expr(inst->expr)` with direct
+local-ID emission in IR handlers silently STRIPS every safety wrapper
+emit_expr applied (`_zer_bounds_check`, `_zer_trap`, `_zer_shl`, MMIO
+range/align). VRP hides the loss from tests — it proves most test values safe
+at compile time, eliding the very runtime checks that went missing. Test with
+values VRP CANNOT prove (constants laundered through a loop).
 
-### The regression class
+Two rules that survive any refactor:
+1. Audit BOTH operator forms — binary `<<` and compound `<<=` are DIFFERENT
+   switch cases (NODE_BINARY vs NODE_ASSIGN); fixing one misses the other
+   (BUG-608 vs BUG-612).
+2. Before committing an IR-emitter refactor, run:
+   `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c`
+   (AST region, line < 4000) — every match needs an IR-path equivalent;
+   a missing one is a silent miscompile.
 
-`emit_expr` in the AST path wraps expressions with runtime safety:
-`_zer_bounds_check(idx, len, ...)`, `_zer_trap("signed div overflow")`,
-`_zer_shl(a, b)` (shift safety macro), `_zer_trap("outside mmio range")`,
-`_zer_trap("unaligned address")`, `_zer_trap("slice start > end")`.
-
-When an IR handler lowers an expression and emits C directly from
-local IDs, it bypasses `emit_expr` — and therefore bypasses every
-safety wrapper. Tests don't catch this because VRP proves most
-real-world indexes/values safe at compile time, eliminating the need
-for runtime checks. The bugs only manifest when you specifically
-test with *unprovable* values.
-
-### The audit protocol (run this before committing IR refactors)
-
-```bash
-# 1. Enumerate every runtime safety emission in emit_expr
-grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c \
-  | awk -F: '$2 < 4000'
-
-# 2. For each match, find the IR equivalent. If none exists, write
-#    a reproducer test that should trap and verify it does.
-```
-
-### Audit checklist — what emit_expr does, what IR must preserve
-
-| AST emit_expr safety | Line (approx) | IR equivalent |
-|---|---|---|
-| Slice bounds check | 2045-2067 | `IR_INDEX_READ` + `emit_rewritten_node` NODE_INDEX |
-| Array bounds (variable index) — sync | 2020-2044 | `emit_auto_guards` pre-pass in `emit_regular_func_from_ir` (line ~9888) |
-| Array bounds (variable index) — async | 2020-2044 | `emit_auto_guards` pre-pass in `emit_async_func_from_ir` (line ~10013, Gap A1 fix 2026-05-06). Trap-on-failure since poll returns int — soft `return ZERO_OF(user_type)` would type-mismatch. |
-| Signed div overflow (INT_MIN/-1) — binary | 1068 | `IR_BINOP` TOK_SLASH/TOK_PERCENT (BUG-608) |
-| Signed compound div/mod (INT_MIN/-1) | 1361-1373 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612) |
-| Division by zero — binary | 1055 | checker forces compile-time guard (no IR work) |
-| Division by zero — compound | 1361-1372 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612, defense in depth) |
-| Shift safety (binary `<<`/`>>`) | 1078 | `IR_BINOP` TOK_LSHIFT/TOK_RSHIFT (BUG-608) |
-| Compound shift (`<<=`/`>>=`) | 1375-1407 | `emit_rewritten_node` NODE_ASSIGN TOK_LSHIFTEQ/TOK_RSHIFTEQ (BUG-612) |
-| Slice `arr[a..b]` range check | 2258 | `emit_rewritten_node` NODE_SLICE |
-| @inttoptr MMIO range (variable addr) | 2650 | `emit_rewritten_node` @inttoptr intrinsic |
-| @inttoptr alignment | 2660 | Same site as above |
-| @ptrcast type mismatch | 2410, 2547 | checker catches via provenance |
-| @trap / @probe | 2694, 2696 | IR handlers present and working |
-| Handle gen check | inlined in `_zer_slab_get` | runtime-level, emit-path-independent |
-
-**Lesson (BUG-612):** When auditing safety wrappers between AST and IR
-paths, ALWAYS check both binary AND compound-assign forms of each operator.
-`<<` and `<<=` are different switch cases in `emit_rewritten_node` (NODE_BINARY
-vs NODE_ASSIGN handlers) and one fix often misses the other. BUG-608 fixed
-binary forms in May; BUG-612 fixed the compound siblings the principle-first
-audit caught afterwards.
-
-### Testing that catches this class
-
-Write one reproducer per safety mechanism. The reproducer must:
-
-1. Use values that VRP CANNOT prove safe — literal constants
-   propagated through a loop so they become "runtime-unknown" from
-   VRP's perspective. Example:
-   ```zer
-   u32 i = 10;
-   for (u32 k = 0; k < 1; k += 1) { i = 10; }  // defeat VRP
-   return arr[i];  // should trap, VRP has given up
-   ```
-
-2. Assert the correct runtime trap fires (check exit code 133 or
-   trap message).
-
-3. Live in `tests/zer_gaps/ast_*.zer` (audit artifact) or
-   `tests/zer_trap/*.zer` (promoted to regression tests).
-
-### The methodology that works — 3 audits in sequence
-
-Proven effective by the 2026-04-19 late session (9 bugs fixed,
-~0.15% defect density found in a subsystem that had green tests):
-
-1. **Behavioral audit (Phase 1)** — write adversarial `.zer` programs
-   that VIOLATE each safety system's claim. 50+ programs, 1-N per
-   system. Each that compiles clean is a gap.
-
-2. **Code-inspection audit (Phase 2)** — read the source (checker.c,
-   zercheck.c, emitter.c) looking for fixed-size buffers, depth
-   caps, TODO markers. Write targeted tests for each structural
-   weakness. Finds bugs the behavioral audit missed.
-
-3. **Diff audit (Phase 3)** — when a migration has happened
-   (AST→IR, linear→CFG, etc.), grep the ORIGIN path for every
-   runtime safety emission and verify the DESTINATION path has an
-   equivalent. Missing one is a regression. Use `git log -S"X"`
-   to find the commit that introduced the gap.
-
-Each audit finds DIFFERENT bug classes. Running just one is
-insufficient. The 2026-04-19 session: Phase 1 found 7 gaps,
-Phase 2 found 1 major regression (Gap 0), Phase 3 found 6 more
-regressions. No phase found what the others found.
+Full audit protocol + the emit_expr→IR equivalence checklist table + the
+3-audit methodology (behavioral / code-inspection / diff):
+`docs/compiler-internals.md` "AST→IR emission diff audit protocol"
+(moved 2026-06-10).

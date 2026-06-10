@@ -10389,3 +10389,436 @@ appears, check whether these two primitives cover it before writing a new
 walk. Also: verification scripts that echo `$(basename $f) rc=$?` capture
 basename's exit code, not the command's — read `$?` into a variable FIRST
 (cost a false alarm this session).
+
+## Stage 4 final status (moved from CLAUDE.md 2026-06-10)
+
+Consolidated sub-stage status table + dispatch list as of the Option E
+pivot. The per-session detail is in the D-Alpha-7.5 Session A..F sections
+above; this is the summary view CLAUDE.md used to carry.
+
+
+**PIVOT NOTICE:** The "make compiler smart about specific instructions"
+direction (Session G Phase 5, Z9/Z10/Z13, more per-instruction DB
+growth) is **DEFERRED indefinitely**. New direction: annotation-driven
+asm safety per `docs/asm_lang_zer_safe.md` (the "smart language,
+generic compiler" approach).
+
+**What stays from asm_plan (already shipped):**
+- 130 intrinsics, Z1-Z8/Z11/Z12, F2/F4/F5/F6 register tables, F7-light
+  LR/SC, F7-full Step 2 constraints, C8 ordering metadata, Session A/B
+  syntax, naked-only restriction.
+
+**What's new (~3-4 months work in v1.x):**
+- Operand metadata, precondition annotations, ~100-entry implicit
+  table, state-machine annotation generalization. Reuses existing
+  Z-rules and safety infrastructure. Builds on Session A/B syntax.
+
+**Result:** Same safety as full asm_plan with ~3x less work and zero
+ongoing maintenance. Per-instruction DB frozen at ~120 entries (no
+growth per ISA extension).
+
+**For fresh sessions:** Read `docs/asm_lang_zer_safe.md` end-to-end
+before touching asm safety. The historical context below is preserved
+but the direction has changed.
+
+**As of 2026-05-02 (historical pre-pivot status):**
+
+| Sub-stage | Status | What was done |
+|---|---|---|
+| Sub-extension architecture | VALIDATED 2026-04-29 | 3-arch end-to-end empirical proof (x86_64 + aarch64 + riscv64). All 4 design alternatives evaluated and rejected. |
+| F4.1 + F4.2 (x86_64 instructions) | DONE 2026-04-29 | 51 entries across C1-C5 + C8. 14 CPU feature flags wired. Pipeline + dispatch + tests. |
+| F5 (aarch64 instructions) | DONE 2026-04-29 | 31 entries across C3-C5 + C8. ARM-specific semantics captured. |
+| F6 (riscv64 instructions) | DONE 2026-05-02 | 30 entries across C2-C5 + C8. RISC-V LR/SC, AMO, FENCE families. **3-arch instruction-table parity COMPLETE.** |
+| F7-light C3 (LR/SC pairing) | DONE 2026-05-02 | Per-block state machine catches SC-without-LR + LR-without-matching-SC across all 3 archs. Real UB caught. |
+| F7-full Step 1 (constraint plumbing) | DONE 2026-05-02 | Schema/generator/struct extended; all 3 arch tables vendored with per-operand constraints. |
+| F7-full Step 2a (NONZERO via VRP) | DONE 2026-05-02 | BSR/IDIV/etc. unprovable nonzero rejected with vendor citation. |
+| F7-full Step 2b (COMPOUND via VRP) | DONE 2026-05-02 | NONZERO check on divisor; INT_MIN/-1 backstopped at runtime. |
+| F7-full Step 2c (ALIGNED via heuristic Pass B) | DONE 2026-05-02 | MOVAPS misaligned constants rejected. Heuristic walks all bindings (positional binding fails when register operands are clobbers). |
+| F7-full Step 2d (BOUNDED via VRP) | DONE 2026-05-02 | Wiring active; no .zerdata entries use BOUNDED yet. |
+| C8 instruction classification | DONE 2026-05-02 | x86 CLWB/CLFLUSHOPT (53 entries), ARM LDAR/STLR/LDARB/LDARH/STLRB/STLRH (37 entries). Persistent-memory + acquire/release primitives ready for Session G enforcement. |
+| Session G Phase 1 (ordering plumbing) | DONE 2026-05-02 | `ZerBarrierKind` + `ZerOrderingRole` enums; ordering field on instruction entry; generator + 3 vendored tables. |
+| Session G Phase 2 (per-instruction classification) | DONE 2026-05-02 | x86/ARM/RISC-V C8 entries declare ordering.barrier_kind + role (MFENCE→PRODUCES FullMemory; CLWB→REQUIRES_AFTER StoreStore; LDAR→PRODUCES Acquire; etc.). |
+| Session G Phase 3 (in-block enforcement) | ABANDONED 2026-05-02 | Same-block check rejected canonical multi-block libpmem idiom; reverted. See docs/asm_preconditions_research.md "Design gaps identified during failed G3 attempt" for the 5 reasons why intermediate phases were dropped. |
+| Session G IR-level enforcement | NEXT (~30-40 hrs) | Smallest design that doesn't false-positive: full CFG-aware OrderingState in `zercheck_ir.c`. Tracks barriers from BOTH asm blocks AND `@atomic_*` intrinsics. Joins use set-intersection. See docs/asm_preconditions_research.md "Implementation sketch". |
+| C5 (privilege) | Covered by S1 | Naked-only restriction is the v1.0 stand-in. F7-full would add explicit kernel-context model. |
+| C6 (memory addr) | Covered by @inttoptr | Existing MMIO range check fires at every address derivation. |
+| Z9/Z10/Z13 forward-compat | Blocked on S1 relaxation | Included in F7-full estimate. |
+| naked attribute migration | DEFERRED | Requires asm-test rewrite (~20 hrs after S1 relaxation). See docs/limitations.md. |
+
+**Current F4/F7 dispatch fires (in checker.c NODE_ASM):**
+- C1 (value range) — Step 2a/2b NONZERO/COMPOUND via VRP
+- C2 (alignment) — Step 2c ALIGNED via heuristic Pass B
+- C3 (state machine) — F7-light LR/SC pairing across same asm block
+- C4 (CPU feature) — checked against `--target-features=` bitmap
+- C5 (privilege) — covered by S1 naked-only restriction
+- BOUNDED — Step 2d wiring ready (no instructions use it yet)
+
+**C8 enforcement (acquire/release pairing, CLWB→SFENCE) deferred to Session G.**
+Classification is in vendored tables; OrderingState tracking pending Stage 5.
+
+**`.zerdata` is compiler-internal, vendored, NOT user-extensible.**
+Design locked 2026-04-29.
+
+**CLI flags (Stage 4-related):**
+- `--target-arch={x86_64,aarch64,riscv64}` — picks register/instruction tables + cross-gcc
+- `--target-features=avx512f,sse,sse2,avx,avx2,aes,sha,bmi1,bmi2,lzcnt,popcnt,invpcid,pku,xsave,smap` — comma-separated; sets ZerCpuFeature bitmap + appends `-m<flag>` to GCC. Baseline x86_64: SSE | SSE2.
+- `--probe-mode={hosted,raw,disabled}` — `@probe` behavior (Fix #4 2026-05-02)
+
+**Mnemonic parser accepts dots** (RISC-V `lr.w`, `fence.i`, etc.) —
+both `scripts/gen_instruction_table.sh` section-header regex and
+`checker.c` NODE_ASM token reader. Don't drop this — RISC-V tables
+won't parse without it. Fixed BUG-653 + BUG-654 on 2026-05-02.
+
+**`Checker.target_ptr_bits` MUST be initialized in `checker_init`**
+from the global `zer_target_ptr_bits`. Pre-fix the field was
+memset-zeroed and never synced — any check `c->target_ptr_bits < N`
+silently always-true. See BUG-652 on 2026-05-02.
+
+**For fresh sessions touching asm safety:**
+- Read `docs/asm_plan.md` "Sub-Extension Architecture — Validated 2026-04-29" section
+- The architecture decisions there are LOCKED IN — don't re-litigate
+- F7-full Step 2 is COMPLETE — all 4 constraint kinds (NONZERO/COMPOUND/ALIGNED/BOUNDED)
+  enforced. Pass A (positional, GCC %N convention) handles NONZERO/COMPOUND/BOUNDED.
+  Pass B (heuristic walk all bindings) handles ALIGNED.
+- F7-light LL/SC pairing implementation pattern (hardcoded LL/SC
+  mnemonic macros per arch) is the template for future state-machine
+  enforcement — see `checker.c` NODE_ASM dispatch
+- @critical "transitive escape via callee" was investigated 2026-05-02
+  and found to be NOT a bug — don't re-implement `can_escape`. See
+  docs/limitations.md.
+- **Session G (System #30 / atomic ordering) is the next major piece.**
+  Phase 1 (data plumbing) + Phase 2 (per-instruction classification)
+  DONE 2026-05-02. Phase 3 (in-block enforcement) was attempted and
+  ABANDONED — same-block check creates false positives on canonical
+  multi-block CLWB+SFENCE idiom. The honest path is IR-level
+  enforcement (Phase 5 of original plan, now the next phase) —
+  see `docs/asm_preconditions_research.md` "Design gaps identified
+  during failed G3 attempt" for why intermediate phases are
+  bypassed. Implementation: ~30-40 hrs CFG-aware OrderingState in
+  `zercheck_ir.c` that tracks barriers from BOTH asm blocks AND
+  `@atomic_*` intrinsics. Lesson: don't ship enforcement that
+  rejects valid code patterns; either skip the check or wait until
+  the analysis is correct.
+
+
+## CFG migration record (moved from CLAUDE.md 2026-06-10)
+
+
+**Phase F MIGRATION COMPLETE.** zercheck_ir.c is the SOLE production
+safety analyzer. zercheck.c is now a 150-line shim delegating to
+zercheck_ir for backward-compat (LSP, firmware tests, production test).
+The original 3128-line AST analyzer is DELETED.
+
+**Final state (post-F1+F2+F3):**
+- `zercheck_ir.c` (~3800 lines) — production CFG-based safety analyzer
+- `zercheck.c` (~150 lines) — backward-compat shim:
+  `zercheck_run` → lower each fn to IR → `zercheck_ir` → return error_count
+- `zerc` binary uses zercheck_ir directly (skips shim)
+- `zer_lsp.c`, `test_firmware_patterns*.c`, `test_production.c` — call
+  `zercheck_run` (the shim)
+- `test_zercheck.c` — DELETED (was unit tests for the 3128-line analyzer;
+  4 of 54 narrow patterns originally failed under IR — all 4 closed in
+  Phase F3.1 + F3.2, see BUGS-FIXED.md 2026-05-03 / 2026-05-04)
+
+**For fresh sessions:**
+- DO NOT add new safety analysis to `zercheck.c` — it's a shim.
+- ALL new safety analysis goes in `zercheck_ir.c`.
+- DO NOT call `ir_lower_func` outside the emitter or the shim's
+  `collect_funcs_from_file`. AST mutation issue (see below).
+- The shim's `collect_funcs_from_file` lowers each function once per call.
+  Callers (LSP, test harnesses) MUST produce a fresh AST per call —
+  re-using the same `file_node` will corrupt due to `pre_lower_orelse`'s
+  destructive AST rewrite. Current callers re-parse on every invocation.
+
+**Phase F0 closed 11 IR parity gaps (2026-05-03 session):**
+
+| Sub-phase | Gap | Fix |
+|---|---|---|
+| F0.1 | Coarse `ast_err==0 && ir_err==0 \|\| both>0` agreement check missed real disagreements | Per-test agreement reporter (`tools/agreement_audit.sh`) + `AGREEMENT_FAIL` machine-parseable line classifying each disagreement |
+| F0.2 | No way to verify "what fails when IR is sole driver" | `ZER_AGREEMENT_AUDIT=1` env var (audit mode for the reporter) — runs both analyzers without bailing on AST failure |
+| F0.3 | 6 false positives — fixed-point convergence used `ir_find_handle` (bare-only); compound handles caused infinite "changed" loops | Use `ir_find_compound_handle` in convergence check (zercheck_ir.c:2839) |
+| F0.4 | `ir_contains_move_struct_field` checked one level deep; 2-level nested move struct undetected | Recursive depth-limited (32) check `ir_contains_move_struct_field_depth` |
+| F0.5 | Function params of nested-struct types had inner `Handle` fields silently untracked | `ir_register_nested_handles` walks struct/union recursively, registers compound handles on entry block AND in post-fixed-point final pass (both sites needed!) |
+| F0.6 | Spawn arg of move-struct type wasn't auto-registered before being marked TRANSFERRED | Auto-register as ALIVE first when arg is move-struct typed |
+| F0.7 | Audit flagged `test_modules/opaque_layer1.zer`/`resource.zer` as IR false negatives — investigation showed AST was wrong (false positive on standalone library modules); IR was correct | No code change |
+
+**Control knobs (post-F1):**
+- `ZER_AGREEMENT_AUDIT=1` — debug mode: re-enable AST analysis
+  alongside IR for `tools/agreement_audit.sh` measurement. Production
+  compiles should NEVER set this.
+- `ZER_DUAL_RUN`/`ZER_DUAL_RUN=0`/`=2` — REMOVED in F1.
+- `ZER_IR_ONLY=1` — REMOVED in F1 (now the default behavior).
+
+**Tools added in F0:**
+- `tools/agreement_audit.sh` — runs all test suites with audit mode on,
+  collects per-test disagreements into `ir_false_positive` /
+  `ir_false_negative` / `ir_count_diff` classes. After F1+F2+F3 this
+  tool serves as historical record + can detect any future divergence
+  if zercheck.c logic ever drifts (it shouldn't, since it's now a shim).
+
+**THE critical architectural constraint (still applies):**
+
+`ir_lower_func` **mutates the AST** (`pre_lower_orelse` at ir_lower.c:1239
+replaces `NODE_ORELSE` with `NODE_IDENT` referencing a temp local). Calling
+`ir_lower_func` TWICE on the same function corrupts emission. The shim's
+`collect_funcs_from_file` calls `ir_lower_func` ONCE per shim invocation;
+callers (LSP, test harnesses) re-parse to get fresh AST per call.
+
+Production `zerc` binary uses the emitter's single-lowering hook: zerc_main
+registers `zerc_ir_hook` that collects each IRFunc as the emitter lowers
+it. After emit completes, zerc_main runs iterative FuncSummary build +
+main analysis on the collected IRFuncs — NOT re-lowering, just analyzing.
+
+**For fresh sessions touching analyzers:**
+- ALL new safety code goes in `zercheck_ir.c` (the production analyzer).
+- Adding new IR-based analyses: register via `Emitter.ir_hook` for
+  production path, or extend the shim for backward-compat callers.
+- The 4 narrow patterns test_zercheck.c covered (pool_a-vs-pool_b alias,
+  direct overwrite leak, free-then-realloc loop, struct copy alias UAF)
+  ARE NOW IN zercheck_ir as of Phase F3.1 + F3.2 (2026-05-03/04). The
+  fixes added: IR_COPY overwrite detection, struct-copy alloc_id
+  propagation, `pool_name` field on `IRHandleInfo` + wrong-pool walker,
+  and `ALIVE+MAYBE_FREED → MAYBE_FREED` merge case for monotonic lattice
+  convergence. Tests in `tests/zer_fail/wrong_pool_*.zer` and
+  `tests/zer/free_realloc_loop.zer`.
+
+**Critical IR lowering fact (Phase 8d, per ir_lower.c:84):**
+`IR_POOL_ALLOC` / `IR_SLAB_ALLOC` / `IR_POOL_FREE` / etc. enum values exist
+but are **NEVER emitted by ir_lower.c**. Pool/Slab/Task method calls flow
+through generic `IR_ASSIGN` (with NODE_ORELSE wrapping NODE_CALL, or direct
+NODE_CALL) and `IR_CALL` (with `inst->expr` holding the call). Specialized
+handlers for those opcodes in `zercheck_ir.c` are dead code. Method detection
+lives in `IR_ASSIGN` and `IR_CALL` via `ir_classify_method_call(Node*)`.
+
+**Do NOT try to "fix" the absence of IR_POOL_ALLOC emission** — this is
+intentional architecture. Add detection in IR_ASSIGN/IR_CALL method-call
+paths instead.
+
+<!-- Sections moved to docs/compiler-internals.md 2026-04-19:
+       - IR Path Validation (full history)
+       - IR Path Architectural Invariants (22 items)
+       - Scoped Defer Emission pattern
+       - IR lowering patterns that must passthrough
+       - Walker missing node kind class
+       - emit_rewritten_node vs emit_expr
+       - Pre-lowering architecture
+       - Test Harness Architecture
+     Total: ~145 lines moved, preserving all content. -->
+
+<!-- The orphan IR sub-sections that lived here (lines ~1137-1278) were
+     moved verbatim to docs/compiler-internals.md in the same commit. -->
+
+
+
+## Diff-based post-release audit protocol (moved from CLAUDE.md 2026-06-10)
+
+
+After a large structural change (IR transition, major refactor, multi-session
+work), don't only rely on green tests. Green can mean "test passed" OR "test
+skipped silently" OR "test passed for the wrong reason." The 2026-04-18 audit
+of the 029919e..HEAD diff (141 commits, ~10k new lines) found three real
+issues that no test suite caught. Use this checklist before declaring a
+milestone done.
+
+### The audit protocol (run before claiming a milestone complete)
+
+1. **Stat the diff**: `git diff <anchor>..HEAD --stat | sort -t'|' -k2 -rn` —
+   lists the biggest-delta files first. Focus audit effort there.
+2. **Grep the new code for drift markers**:
+   - `TODO|FIXME|XXX|HACK` in new additions (`git diff <anchor>..HEAD -- file.c | grep "^+" | grep TODO`)
+   - `unhandled|shouldn't happen|should not happen` — default cases that emit garbage if hit
+   - `fprintf\(out|emit\(e,` with comment-only content and no following emit
+3. **Compile a real .zer → emitted C** and grep the output for stray tokens.
+   Dead stubs leave fingerprints: `grep "/\* " output.c | head` catches
+   comment-only emissions with no payload. The 2026-04-18 audit found
+   `/* forward */ ` on line 1 of every multi-module output this way.
+4. **Check skip lists hygiene**: `grep -A2 KNOWN_FAIL tests/test_zer.sh
+   rust_tests/run_tests.sh zig_tests/run_tests.sh`. Every entry must
+   correspond to a still-active issue in `docs/limitations.md`. Entries
+   that refer to bugs since fixed are falsely masking green status.
+5. **Verify every new .c file is linked**: `grep -E "\\.c\\b" Makefile`
+   vs `ls *.c`. Unlinked .c files are either WIP (check the roadmap
+   doc — `docs/IR_Implementation.md` etc.) or forgotten.
+6. **Run `bash tools/walker_audit.sh`** — this catches the #1 silent-bug
+   class (missing NODE_ kind in `emit_rewritten_node`) by cross-referencing
+   the IR emitter against the AST emitter.
+
+### Dead-stub pattern (the most dangerous drift)
+
+A "dead stub" is code that writes a comment prefix but never completes
+the emission:
+
+```c
+/* BAD — prints the comment then exits the branch */
+if (cond) {
+    fprintf(out, "/* forward */ ");
+    /* "The actual definition will follow below" — except it never does */
+}
+```
+
+This pollutes emitted output silently because `/* forward */` followed
+by the next line's real code is still valid C — just ugly. Tests pass.
+grep-for-comments in emitted output catches it.
+
+**Prevention**: when you catch yourself writing a partial emit ("I'll
+fill this in after I finish the loop"), either commit with the emit
+complete OR add a compile-error `#error` so the code can't build. Never
+leave "will follow" stubs.
+
+### Real-code output grep (catches things tests don't)
+
+After any emitter change, run:
+
+```bash
+./zerc some_real_test.zer --emit-c -o /tmp/r.c
+grep -nE "/\* (TODO|forward|unhandled|stub|placeholder) \*/" /tmp/r.c
+grep -nE "^/\* [a-z]+ \*/$" /tmp/r.c   # comment-only lines
+```
+
+Anything matching is a signal: either a dead stub, or a code path that
+fell through an `/* unhandled node %d */0` fallback — both are silent
+miscompiles the test harness can't detect because `0` is a valid C
+literal that compiles clean.
+
+### When WIP files are NOT dead code
+
+Two files in the repo (as of 2026-04-18) compile cleanly but are NOT
+in the Makefile: `zercheck_ir.c` (452 lines) and `vrp_ir.c` (349
+lines). These are Phase 8-9 placeholders per the IR roadmap — the
+IR-native equivalents of the current AST-based `zercheck.c` and VRP.
+**Don't delete them.** The pattern "compile-clean but unlinked" is
+usually intentional WIP; check `docs/future_plans.md` and
+`docs/IR_Implementation.md` before concluding dead code.
+
+### What this audit found (reference for calibration)
+
+2 real bugs + 1 stale skip-list entry in +10,000 lines across 141
+commits. That's ~0.02% defect density, which is what "green tests"
+*should* mean but rarely does without this kind of audit.
+
+Key insight: the bugs weren't in code that had been validated — they
+were in code paths the tests thought they were exercising but weren't.
+`zerc --run` returning 0 for a SIGTRAP'd program (BUG-581 era) and
+`/* forward */` never emitting its body (this audit) both fell into
+the same category: the validation story, not the code, was broken.
+
+When the next "everything passes" milestone happens, run this audit.
+
+
+## AST→IR emission diff audit protocol (moved from CLAUDE.md 2026-06-10)
+
+
+**Read this before touching `IR_*` handlers in `emitter.c`.** Between
+2026-04-15 and 2026-04-19, the compiler shipped with 7 missing runtime
+safety checks in the IR emission path. Root cause: commit `010ddea`
+replaced `emit_expr(inst->expr)` (AST fallback) with direct local-ID
+emission in IR handlers, and silently stripped every safety wrapper
+`emit_expr` had been applying. Became effective at commit `82335c3`
+(IR default flip). All 7 restored at commit `3bdcf85` (BUG-595 through
+BUG-599 — see BUGS-FIXED.md). Do not recreate this class of bug.
+
+### The regression class
+
+`emit_expr` in the AST path wraps expressions with runtime safety:
+`_zer_bounds_check(idx, len, ...)`, `_zer_trap("signed div overflow")`,
+`_zer_shl(a, b)` (shift safety macro), `_zer_trap("outside mmio range")`,
+`_zer_trap("unaligned address")`, `_zer_trap("slice start > end")`.
+
+When an IR handler lowers an expression and emits C directly from
+local IDs, it bypasses `emit_expr` — and therefore bypasses every
+safety wrapper. Tests don't catch this because VRP proves most
+real-world indexes/values safe at compile time, eliminating the need
+for runtime checks. The bugs only manifest when you specifically
+test with *unprovable* values.
+
+### The audit protocol (run this before committing IR refactors)
+
+```bash
+# 1. Enumerate every runtime safety emission in emit_expr
+grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c \
+  | awk -F: '$2 < 4000'
+
+# 2. For each match, find the IR equivalent. If none exists, write
+#    a reproducer test that should trap and verify it does.
+```
+
+### Audit checklist — what emit_expr does, what IR must preserve
+
+| AST emit_expr safety | Line (approx) | IR equivalent |
+|---|---|---|
+| Slice bounds check | 2045-2067 | `IR_INDEX_READ` + `emit_rewritten_node` NODE_INDEX |
+| Array bounds (variable index) — sync | 2020-2044 | `emit_auto_guards` pre-pass in `emit_regular_func_from_ir` (line ~9888) |
+| Array bounds (variable index) — async | 2020-2044 | `emit_auto_guards` pre-pass in `emit_async_func_from_ir` (line ~10013, Gap A1 fix 2026-05-06). Trap-on-failure since poll returns int — soft `return ZERO_OF(user_type)` would type-mismatch. |
+| Signed div overflow (INT_MIN/-1) — binary | 1068 | `IR_BINOP` TOK_SLASH/TOK_PERCENT (BUG-608) |
+| Signed compound div/mod (INT_MIN/-1) | 1361-1373 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612) |
+| Division by zero — binary | 1055 | checker forces compile-time guard (no IR work) |
+| Division by zero — compound | 1361-1372 | `emit_rewritten_node` NODE_ASSIGN TOK_SLASHEQ/TOK_PERCENTEQ (BUG-612, defense in depth) |
+| Shift safety (binary `<<`/`>>`) | 1078 | `IR_BINOP` TOK_LSHIFT/TOK_RSHIFT (BUG-608) |
+| Compound shift (`<<=`/`>>=`) | 1375-1407 | `emit_rewritten_node` NODE_ASSIGN TOK_LSHIFTEQ/TOK_RSHIFTEQ (BUG-612) |
+| Slice `arr[a..b]` range check | 2258 | `emit_rewritten_node` NODE_SLICE |
+| @inttoptr MMIO range (variable addr) | 2650 | `emit_rewritten_node` @inttoptr intrinsic |
+| @inttoptr alignment | 2660 | Same site as above |
+| @ptrcast type mismatch | 2410, 2547 | checker catches via provenance |
+| @trap / @probe | 2694, 2696 | IR handlers present and working |
+| Handle gen check | inlined in `_zer_slab_get` | runtime-level, emit-path-independent |
+
+**Lesson (BUG-612):** When auditing safety wrappers between AST and IR
+paths, ALWAYS check both binary AND compound-assign forms of each operator.
+`<<` and `<<=` are different switch cases in `emit_rewritten_node` (NODE_BINARY
+vs NODE_ASSIGN handlers) and one fix often misses the other. BUG-608 fixed
+binary forms in May; BUG-612 fixed the compound siblings the principle-first
+audit caught afterwards.
+
+### Testing that catches this class
+
+Write one reproducer per safety mechanism. The reproducer must:
+
+1. Use values that VRP CANNOT prove safe — literal constants
+   propagated through a loop so they become "runtime-unknown" from
+   VRP's perspective. Example:
+   ```zer
+   u32 i = 10;
+   for (u32 k = 0; k < 1; k += 1) { i = 10; }  // defeat VRP
+   return arr[i];  // should trap, VRP has given up
+   ```
+
+2. Assert the correct runtime trap fires (check exit code 133 or
+   trap message).
+
+3. Live in `tests/zer_gaps/ast_*.zer` (audit artifact) or
+   `tests/zer_trap/*.zer` (promoted to regression tests).
+
+### The methodology that works — 3 audits in sequence
+
+Proven effective by the 2026-04-19 late session (9 bugs fixed,
+~0.15% defect density found in a subsystem that had green tests):
+
+1. **Behavioral audit (Phase 1)** — write adversarial `.zer` programs
+   that VIOLATE each safety system's claim. 50+ programs, 1-N per
+   system. Each that compiles clean is a gap.
+
+2. **Code-inspection audit (Phase 2)** — read the source (checker.c,
+   zercheck.c, emitter.c) looking for fixed-size buffers, depth
+   caps, TODO markers. Write targeted tests for each structural
+   weakness. Finds bugs the behavioral audit missed.
+
+3. **Diff audit (Phase 3)** — when a migration has happened
+   (AST→IR, linear→CFG, etc.), grep the ORIGIN path for every
+   runtime safety emission and verify the DESTINATION path has an
+   equivalent. Missing one is a regression. Use `git log -S"X"`
+   to find the commit that introduced the gap.
+
+Each audit finds DIFFERENT bug classes. Running just one is
+insufficient. The 2026-04-19 session: Phase 1 found 7 gaps,
+Phase 2 found 1 major regression (Gap 0), Phase 3 found 6 more
+regressions. No phase found what the others found.
+
+
+## Release history v0.2–v0.4 (moved from CLAUDE.md 2026-06-10)
+
+- **v0.2 (RELEASED):** Slab(T), volatile slices, stdlib (str/fmt/io), bundled GCC, zer-convert Phase 1+2
+- **v0.2.1:** comptime functions + comptime if, 4-layer MMIO safety, @ptrcast/@container provenance, safe intrinsics, zer-convert P0+P1, value range propagation, bounds auto-guard, forced division guard, zercheck 1-4, 415+ bug fixes, 1,700+ tests
+- **v0.2.2:** FULL CONCURRENCY: shared struct (auto-locking), shared(rw) (rwlock), spawn (fire-and-forget + scoped ThreadHandle+join), deadlock detection (compile-time lock ordering), condvar (@cond_wait/signal/broadcast/timedwait), threadlocal, @once, @barrier_init/wait, async/await (stackless coroutines via Duff's device), Ring channel pointer safety, allocation coloring, semantic fuzzer (32 generators), 461+ bug fixes, 3,200+ tests (incl. 400 Rust-equivalent safety/concurrency tests)
+- **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 786 Rust tests + 36 Zig tests + 195 ZER integration + 68 ZER negative (0 failures), flag-handler matrix audit tool (`tools/audit_matrix.sh`) found 5 missing checker validations, ctags-guided audit found 3 emitter bugs in ~5K tokens, red team audit: 42/81 Gemini attacks fixed (12 rounds) + 2 codebase analysis finds + full 25K-line audit, `Semaphore(N)` builtin, BUG-462 through BUG-506 (46 bugs fixed), systematic refactoring (25 unified helpers — R1-R3 + B1 `track_dyn_freed_index` + B2 `check_union_switch_mutation` + B4 `emit_opt_wrap_value` + B10 `handle_key_arena` + 18 prior), full codebase audit (25,757 lines): 15 distinct unwrap fixes (BUG-506 + A15/A19/A20), 5 buffer over-read fixes, 2 fixed arrays → dynamic, 2 volatile temp fixes, spawn string+struct validation, orelse emission consolidated (B3), return wrapping consolidated (B7), union typedef macro (B8), zercheck 27 arena keys (B10), zig test runner (36 tests automated), refactor plan in `docs/ZER_Refactor.md`, CFG-aware zercheck with scope-aware handle tracking (`find_handle` vs `find_handle_local`), recursive mutex with CAS lazy init, unified `emit_file_module`, VRP 100% via address_taken at TOK_AMP + compound assign invalidation, deadlock call graph DFS, async state struct temp promotion (Rust MIR-equivalent), `*opaque` comparison `.ptr` extraction, runtime MMIO alignment check, C interop safety model (`cinclude` + `*opaque` + `shared struct`), 510+ bug fixes, 4,000+ tests, FuncProps function summaries (tracking system #29 — transitive context safety via lazy DFS on Symbol)
+- **v0.4:** MIR-inspired IR (flat locals, basic blocks) — replaces 29 AST walkers with one lowering pass. zercheck on CFG, VRP on SSA-like locals, async complete by construction. Still emits C → GCC. See `docs/IR_Implementation.md`
+- **v1.0:** self-hosting proof (zerc.zer compiles itself identically)

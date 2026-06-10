@@ -10221,3 +10221,171 @@ hole): S2 counts 0x0A/`;` but `\n` escapes stay literal in ZER while GCC expands
 them, so `\n`-separated instructions bypass the count. S2 is an audit rule, not
 memory-safety — logged in limitations.md "asm S2 ... \n-escape bypass". Wired
 into `make check`.
+
+
+## Audit gap-closure mechanisms (BUG-735..742, sessions 2026-06-09/10)
+
+Full mechanism reference for the 6u360k audit closure (8 gaps + follow-up).
+CLAUDE.md has the on-demand rules; this is the one-time deep context for
+sessions touching these code paths. All in `zercheck_ir.c` unless noted.
+
+### IR_GLOBAL_ROOT_ID pseudo-root global tracking (BUG-739)
+
+zercheck_ir previously had NO global-tracking infrastructure: a store to a
+global marked the value `escaped=true` (suppressing leak checks) and reads
+from globals produced untracked locals — so `g_ptr = p; free_ptr(p);
+gp = g_ptr orelse return; gp.value` was a silent UAF (and alloc_ptr `*T`
+has no runtime generation net, unlike Handle).
+
+Mechanism: compound handles are keyed `(local_id, path)`. Globals reuse
+this with a SENTINEL root: `#define IR_GLOBAL_ROOT_ID (-2)`, path = the
+global's name (AST ident string — outlives analysis, same lifetime argument
+as `pool_name`). This inherits, with zero new PathState fields: compound-
+aware CFG merge (BUG-650), `ir_propagate_alias_state` free propagation
+(same alloc_id group), `IRAliasSnapshot` on read-back.
+
+Three hooks, all in the IR_ASSIGN handler:
+- STORE (`g = p`, NODE_ASSIGN passthrough): value has an ALIVE handle ->
+  register/overwrite `(-2, "g")` sharing its alloc_id. Value NOT tracked
+  (null, param, unknown) -> RESET the entry (state UNKNOWN, alloc_id 0) so
+  the `g = p; free(p); g = null; read g` pattern doesn't false-positive.
+- ORELSE READ-BACK (`gp = g orelse return`): extension of the existing
+  orelse-ident alias path — when the ident is not a local, alias dest from
+  the `(-2, name)` entry, inheriting state (FREED flows through the COPY
+  chain to the user local; use site fires).
+- BARE READ-BACK (`?*T m = g`): same extension on the bare-ident alias path.
+
+Shadowing: `ir_ident_is_unshadowed_global` — a function local of the same
+name wins (locals shadow globals).
+
+**INVARIANT (load-bearing): global entries ALWAYS carry `escaped=true`.**
+The exit-pass leak/ghost/MAYBE branches index `func->locals[h->local_id]`
+only after the `if (h->escaped) continue;` skip — the -2 sentinel would be
+an OOB read there. Read-back aliases inherit escaped via the snapshot, so
+they don't false-flag as leaks either. If you ever add code that clears
+escaped on handles wholesale, exclude `local_id == IR_GLOBAL_ROOT_ID`.
+
+Scoping lesson (recorded because the first scoping was WRONG): the
+original fix sketch said "needs a per-PathState global table touching the
+fixed-point lattice — dedicated-session surgery." The pseudo-root reuse
+avoided ALL of it (~120 lines). For any future "track a non-local entity"
+need (e.g. per-module state), try a sentinel-keyed compound root FIRST.
+
+### Argument-precise barrier (BUG-740, principle reused in BUG-741)
+
+Principle: **anything HANDED to an operation the analyzer can't resolve may
+be consumed by it — and ONLY what was handed.** Two rejected alternatives,
+for the record: aggressive barrier (widen ALL live handles at any indirect
+call — false-positives on handles the callee never received; noise that
+teaches nothing) and signature-typed barrier (widen by type match — shape
+enumeration; punishes same-typed handles never passed).
+
+BUG-740 (indirect calls): `ir_call_is_indirect` recognizes funcptr-typed
+callees — function LOCALS by type; GLOBAL funcptr VARIABLES via
+`!sym->is_function` (real functions AND bodyless externs have
+is_function=true, so C interop stays direct); struct-field vtables via
+`checker_get_type` on the callee field. `ir_indirect_call_barrier` widens
+each tracked handle passed as an argument (bare, compound `b.h`, `&h`, or
+ALL compound entries under a by-value struct root) ALIVE -> MAYBE_FREED +
+escaped, propagated to the alloc_id alias group (escaped too — allocation
+ownership was handed off, an untouched alias must not flag as a leak).
+Hooked at IR_CALL (statement form, before the FuncSummary lookup) AND
+IR_ASSIGN NODE_CALL `mc == IRMC_NONE` (result-assigned form).
+
+Caller matrix: free after `fp(h)` -> maybe-freed double-free error; use
+after -> use-after-conditional-free; silence after -> clean (callee-owns);
+never passed -> untouched; `fp(h.value)` pass-data idiom -> clean.
+
+BUG-741 (variable-index frees): same principle in the IRMC_FREE handler's
+key-extraction-FAILURE branch (`free(arr[k])`, k non-literal): (1) a
+literal-indexed sibling already definitely FREED -> error ("don't mix
+literal- and variable-index frees on the same array"); (2) ALIVE literal
+siblings (+ alias groups) widen MAYBE_FREED + escaped. The canonical
+alloc-loop + free-loop survives by construction: variable-index STORES
+already escape-untrack their values (no '['-keyed entries exist), and
+widened MAYBE siblings don't re-trigger (1), which fires on definite FREED
+only.
+
+### Dangling-global exit + call-window rules (BUG-742)
+
+Cross-function global UAF (`f() { g=p; free(p); }  g() { read g }`) closed
+WITHOUT the sketched FuncSummary plumbing, by making a dangling global
+unobservable at every boundary per-function analysis can't see across:
+- EXIT RULE (exit pass, checked BEFORE the escaped skip since global
+  entries are always escaped): `(-2, name)` entry definitely FREED at a
+  return block -> "global left dangling at function exit — reset it
+  ('g = null;')". No function may return while a global dangles -> no
+  caller can ever inherit one.
+- CALL-WINDOW RULE (`ir_check_dangling_globals_at_call`): calling a
+  ZER-defined function (`ir_callee_has_summary` — bodyless externs never
+  have one) or an indirect callee while a global is definitely FREED ->
+  error. Closes `free(p); helper(); g = null;`. Builtin Pool/Slab methods
+  exempt (can't read user globals); externs exempt (outside the boundary).
+
+Both teach the same one-line hygiene; the STORE hook's reset branch
+recognizes `g = null;` so the taught fix compiles. MAYBE_FREED is
+DELIBERATELY not flagged at exit/call — BUG-740/741 widenings produce
+MAYBE + escaped on legitimate hand-off patterns (`g = p; fp(p);`
+register-ctx-then-callback); flagging MAYBE would reject exactly those.
+The conditional-dangle residual (`if (c) { free(p) }` then exit) is an
+OPEN entry in limitations.md with a fix sketch (per-entry origin bit).
+
+### Non-keep by-value struct param taint (BUG-737, checker.c)
+
+`void take(Container ct) { g = ct; }` laundered arena/local pointers
+through the by-value copy. The carrier-taint half already existed
+(`local.ptr = p` taints `local` via classify_escape_sink root resolution);
+the missing piece was the PARAM root. Fix at the declaration site: param
+registration sets `is_nonkeep_derived` for non-keep STRUCT/UNION params
+whose type carries a raw data pointer at any depth —
+`type_carries_data_pointer` (checker.c top): counts *T/*opaque/slices +
+optional/array/nested-aggregate of those; EXCLUDES funcptrs (code
+addresses) and Handle (u64 index); depth-limited 32; if-chain (not switch)
+so the walker-default audit is untouched; `type_dispatch_kind` for the
+distinct gate. The EXISTING keep-2a persist sink (already struct-aware,
+hole A 2026-06-07) rejects the store — no new sink, no new shape
+enumeration. `keep Container ct` parses and is the valve. The sink message
+names the param kind honestly ("struct parameter (carries pointer fields)").
+
+### Container mangled-name identifier gate (BUG-738, checker.c)
+
+`Box(?u32)` stamped `struct Box_?u32` -> GCC syntax error far from source.
+Gate is MECHANICAL: after building the mangled name from
+`type_name(concrete)`, validate it is a valid C identifier — no type-kind
+enumeration, so any future type whose printed name can't form an
+identifier is caught (composites print `?` `*` `[]` `(` `,`; named types
+print bare identifiers; module mangling uses `__` which is ident-safe).
+CRITICAL non-regression fact discovered during design: NESTED containers
+(`Stack(Stack(u32))`) work TODAY because the type arg resolves inner-first,
+so the outer arg's printed name is the already-stamped identifier
+`Stack_u32` — a TYNODE-kind rejection would have broken them; the
+resolved-name gate accepts them by construction. Do not "simplify" this
+into an AST-level kind check.
+
+### --no-strict-mmio runtime split (BUG-736, emitter.c both paths)
+
+Both @inttoptr emitter paths (AST emit_expr ~3030, IR emit_rewritten_node
+~6790) gated range AND alignment runtime checks on one flag
+(`mmio_range_count > 0`). Split: `need_range_check` (gated on declared
+ranges — nothing to test against otherwise; the 2026-04-01 plain-cast
+decision stands for RANGE) vs `need_align_check` (target-type-driven,
+unconditional for variable addresses — a misaligned volatile *u32 load is
+a BusFault on Cortex-M0). Runtime mirror of the compile-time Gap 19 fix.
+Declared-ranges emission byte-identical to before. Reminder: BOTH paths
+or the IR one silently wins (AST->IR diff-audit class).
+
+Also: `tests/test_zer.sh`'s runtime-trap section now extracts
+`// zerc-flags:` first-line flags (parity with positive/negative sections)
+— flag-dependent trap tests (e.g. `inttoptr_unaligned_nostrict.zer`) run
+in CI.
+
+### Session-level lesson
+
+All four zercheck_ir fixes (739-742) reused TWO primitives (pseudo-root
+compound entries + argument-precise widening) instead of adding per-shape
+checks — the consolidation strategy against the shape-enumeration bug
+class holding up under four consecutive fixes. When the next safety gap
+appears, check whether these two primitives cover it before writing a new
+walk. Also: verification scripts that echo `$(basename $f) rc=$?` capture
+basename's exit code, not the command's — read `$?` into a variable FIRST
+(cost a false alarm this session).

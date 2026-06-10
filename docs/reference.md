@@ -1262,6 +1262,18 @@ t.id = 1;             // COMPILE ERROR — zercheck FuncSummary knows destroy fr
 - Can mix Handle and alloc_ptr on the same Slab/Pool.
 - `const Handle(Task)` prevents mutation through auto-deref — `h.id = 42` on const Handle is a compile error.
 - For `*opaque` (C interop), Level 2+3+5 runtime checks (~1ns) cover the remaining cases zercheck can't track.
+- GLOBALS (BUG-739/742): storing an `alloc_ptr` pointer in a global then
+  freeing it requires resetting the global (`g = null;`) immediately after
+  the free — before the function returns or calls another ZER function.
+  Reading back a freed global, returning while it dangles, or calling ZER
+  code in the free→reset window are all compile errors.
+- INDIRECT CALLS (BUG-740): handles/pointers passed to a funcptr call are
+  consume-maybe — after `fp(h)`, freeing or using `h` is a compile error.
+  Pass data (`pool.get(h).field`) if the caller keeps ownership, or hand
+  ownership entirely (caller stops touching `h`).
+- VARIABLE-INDEX FREES (BUG-741): `heap.free(arr[k])` may free any tracked
+  element of `arr` — mixing literal- and variable-index frees on the same
+  array is a compile error in both orders.
 
 **SEE ALSO**
 Handle(T), Pool(T,N), Slab(T)
@@ -1520,7 +1532,11 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 ```
 
 **NOTES**
-- `--no-strict-mmio` flag allows @inttoptr without mmio declarations.
+- `--no-strict-mmio` flag allows @inttoptr without mmio declarations —
+  it relaxes the RANGE strictness only. The runtime ALIGNMENT trap is
+  still emitted for variable addresses (alignment is a property of the
+  target pointer type, not of mmio declarations — BUG-736), and constant
+  addresses are alignment-checked at compile time regardless.
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
 
 **SEE ALSO**
@@ -1556,6 +1572,9 @@ remembers what type went in through `*opaque` round-trips.
 **NOTES**
 - Checks qualifier preservation (const, volatile cannot be stripped).
 - Unknown provenance (function params, cinclude) → check skipped.
+- `@ptrcast` between two DIFFERENT struct/union pointee types is a compile
+  error — "type confusion — use @pun(...)" (BUG-735). Identity casts,
+  primitive byte-views (`*u32 → *u8`), and `*opaque` round-trips stay allowed.
 
 **SEE ALSO**
 *opaque, @pun, @container
@@ -2292,6 +2311,11 @@ void stack_push(*Stack(u32) s, u32 val) {
 - T substitution works in: T, *T, ?T, []T, T[N] field types.
 - Instances cached — same `Stack(u32)` reuses cached stamp.
 - NOT generics — no type constraints, no SFINAE.
+- Type ARGUMENT must be a plain named type (primitive or struct/enum/union).
+  Composite args — `Box(?u32)`, `Box(*u32)`, `Pair(Handle(Item))`, `Box([*]u8)`
+  — are a clean compile error with a wrapper-struct hint (BUG-738): wrap the
+  composite in a named struct and instantiate with that. NESTED containers
+  work — `Stack(Stack(u32))` resolves inner-first to `Stack_Stack_u32`.
 
 ---
 
@@ -2331,6 +2355,13 @@ void register_callback(keep *Handler h) {
 register_callback(&local_handler);   // COMPILE ERROR — local can't satisfy keep
 register_callback(&global_handler);  // OK — global persists
 ```
+
+**NOTES**
+- Applies to BY-VALUE STRUCT/UNION params too (BUG-737): a non-keep struct
+  param whose type carries pointer fields (at any nesting depth) cannot be
+  stored to a global/param sink — the pointers inside have caller-unknown
+  provenance. `keep Container ct` is the escape valve, same as pointer
+  params. Funcptr fields and Handle fields don't count (not raw addresses).
 
 ---
 

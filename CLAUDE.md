@@ -1139,8 +1139,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 266 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 162 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 314 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 260 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 66 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
@@ -1415,6 +1415,36 @@ Run `bash tools/audit_type_dispatch.sh` before committing checker/emitter/
 zercheck edits. Full detail in `docs/compiler-internals.md` "Distinct-Unwrap
 Structural Kill" section.
 
+## Audit Class-Closure 2026-06-09/10 — BUG-729..742 (14 fixes, 2 new zercheck_ir patterns)
+
+The 6u360k audit (8 silent gaps) is FULLY CLOSED plus its follow-up. New
+compile-error rules are in the agent rules block above. Full mechanism doc:
+`docs/compiler-internals.md` "Audit gap-closure mechanisms (BUG-735..742)".
+Two NEW zercheck_ir patterns future safety work MUST respect:
+
+1. **`IR_GLOBAL_ROOT_ID (-2)` pseudo-root global tracking** — globals that
+   receive a tracked allocation are compound handles keyed `(-2, name)`,
+   inheriting ALL existing machinery (CFG merge, free propagation, alias
+   snapshots). **INVARIANT: these entries always carry `escaped=true`** —
+   the exit-pass leak branches index `func->locals[h->local_id]` only after
+   the escaped skip, so -2 never reaches a locals[] access. Never clear
+   escaped on a global entry. Prefer this pseudo-root reuse over adding
+   PathState fields for any future "track non-local entity" need.
+
+2. **Argument-precise barrier principle** — "anything HANDED to an operation
+   the analyzer can't resolve may be consumed by it — and ONLY what was
+   handed." Applied twice (BUG-740 indirect calls, BUG-741 variable-index
+   frees): widen exactly the handed entities ALIVE→MAYBE_FREED + escaped
+   (+ alias group). NOT the aggressive variant (widen everything — noise),
+   NOT type-matching (shape enumeration). False positives must teach
+   structure (ownership clarity / reset hygiene), never report impossibilities.
+
+Also locked this session: false-positive criterion for new safety rules —
+acceptable ONLY when the rejected code's restructure is a teachable
+discipline (`g = null;` after free, pass-data-not-handle, don't mix index
+kinds). MAYBE_FREED globals at exit are deliberately NOT flagged (would
+noise the legit register-ctx-then-callback pattern) — see limitations.md.
+
 ## Stage 4 PIVOTED 2026-05-12 — see docs/asm_lang_zer_safe.md
 
 **PIVOT NOTICE:** The "make compiler smart about specific instructions"
@@ -1565,6 +1595,12 @@ ZER SYNTAX RULES (not C — these differ):
 - container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)
 - Name(ConcreteType) var; = stamps concrete struct, functions take *Name(Type) explicitly
 - Designated init: Point p = { .x = 10, .y = 20 }; or p = { .x = 1 };
+- @ptrcast between DIFFERENT struct/union types = compile error — use @pun (BUG-735)
+- container type arg must be a PLAIN NAMED type: Box(?u32)/Box(*u32)/Pair(Handle(T)) = compile error; wrap in a named struct. Nested Box(Box(u32)) is fine (BUG-738)
+- non-keep BY-VALUE struct param carrying pointer fields can't be stored to a global — add keep or restructure (BUG-737)
+- GLOBAL pointer hygiene: after freeing a pointer stored in a global, reset it (g = null;) BEFORE returning or calling ZER functions (BUG-739/742)
+- handles/pointers passed to a FUNCPTR call are consume-maybe: don't free or use h after fp(h); pass data (h.field) or hand ownership (BUG-740)
+- don't mix literal- and variable-index frees on the same array: free(arr[k]) then free(arr[0]) (or reverse) = compile error (BUG-741)
 ```
 
 Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).

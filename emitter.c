@@ -5070,12 +5070,17 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* SAFETY (silent-gap audit 2026-05-21): null-handle free is a no-op.
      * Auto-zero Handle (h_gen == 0) means "never allocated"; without this
      * guard, freeing it silently bumped gen[0] and could invalidate a
-     * legitimate handle in slot 0. Stronger validation (gen[idx] == h_gen
-     * trap on mismatch) is deferred — would trap the goto-fires-defer-twice
-     * pattern currently emitted by ir_lower.c (see docs/limitations.md
-     * "Defer fires twice on goto-to-same-scope-label"). Once that emitter
-     * issue is fixed, this function should also reject wrong-pool / stale-
-     * handle frees via the generation check from _zer_pool_get. */
+     * legitimate handle in slot 0.
+     *
+     * UNBLOCKED 2026-06-10 (BUG-743): the goto-fires-defer-twice emission
+     * bug that prevented adding a stronger `gen[idx] != h_gen` trap here
+     * is fixed. A follow-up change can now add the trap to catch
+     * wrong-pool / stale-handle frees at runtime (matching the discipline
+     * of `_zer_pool_get`). Not enabled in this session — needs a
+     * compatibility audit against patterns that currently rely on
+     * lenient free (e.g., double-free in disposers, free after
+     * pool-clear). Documented in docs/limitations.md cross-function
+     * wrong-pool gap as the natural follow-up. */
     emit(e, "    if (h_gen == 0) return;  /* null handle: no-op */\n");
     emit(e, "    if (idx < capacity) {\n");
     emit(e, "        used[idx] = 0;\n");

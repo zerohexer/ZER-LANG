@@ -51,6 +51,64 @@ the `.v`/`check-vst` coupling asm_lang §10 underspecifies):
 **`docs/option_e_plan.md`** — fresh-session-executable. `tests/test_asm_matrix.c`
 is the regression net for the deletion.
 
+## OPEN — cross-function wrong-pool silent corruption when gens coincidentally match (MEDIUM, found 2026-06-10)
+
+**Symptom:** Handle from `pool_a` passed to a function that calls
+`pool_b.get(h)` (or `pool_b.free(h)`) — runtime gen check may pass if
+both pools' slot[0] gen values happen to match. Result: silent
+cross-pool data corruption. Reproducer:
+
+```zer
+Pool(Item, 4) pool_a;
+Pool(Item, 4) pool_b;
+
+void cross_use(Handle(Item) h) {
+    pool_b.get(h).v = 99;   // wrong pool — undetected
+}
+
+i32 main() {
+    Handle(Item) hb = pool_b.alloc() orelse return;
+    defer pool_b.free(hb);
+    pool_b.get(hb).v = 50;
+
+    Handle(Item) h = pool_a.alloc() orelse return;
+    defer pool_a.free(h);
+    cross_use(h);              // h came from pool_a, pool_b.get(h) succeeds because both have gen=1 at slot 0
+
+    if (pool_b.get(hb).v != 50) { return 1; }   // 1 — pool_b slot 0 was overwritten
+    return 0;
+}
+```
+
+Exit code 1 on x86 hosted (verified). Both compile-time
+(`zercheck_ir.c` wrong-pool walker — same-function only) and runtime
+(`_zer_pool_get` only checks gen, not pool identity) miss this. On
+baremetal: completely silent.
+
+**Severity: medium.** Caught when gens differ (most cycled pools). Hits
+silently when freshly-allocated handles from different pools coincide.
+Existing intra-function tests (`tests/zer_fail/wrong_pool_*.zer`) catch
+the same-function variants because the source pool name is tracked on
+the local. The CROSS-function variant loses the pool name at the
+function boundary (the param's `IRHandleInfo` is allocated without
+`pool_name`).
+
+**Fix options:**
+1. **Compile-time FuncSummary:** track per-param pool identity. Hard:
+   monomorphization unless we accept conservative "any pool" for
+   functions called with different pools.
+2. **Runtime pool ID embedded in handle:** carve a `pool_id` field out
+   of Handle's 64 bits (e.g., 16 bits pool_id / 16 bits idx / 32 bits
+   gen). `_zer_pool_get/free` compares pool_id at runtime. Catches all
+   cross-function and even arbitrary-laundering cases. Trades 16 bits
+   of slot capacity. Affects every Pool/Slab call site emission +
+   per-pool registration.
+
+Recommendation: option 2 for the next concurrency hardening pass —
+parallel work to the BUG-742 follow-up that also wants a runtime
+identity bit. Option 1 is exposed to "Handle param called from N
+different pools" which our current code allows freely.
+
 ## OPEN — asm S2 instruction-count `\n`-escape bypass (audit rule, not safety)
 
 The S2 rule (checker.c:10379) caps an asm block at 16 instructions for

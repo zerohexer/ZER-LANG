@@ -1,0 +1,12 @@
+// Negative test: ?volatile *u32 → ?*u32 silently stripped volatile because
+// type_equals did not check pointer.is_volatile (only is_const). With the
+// optional wrapper, can_implicit_coerce never re-checked qualifiers either.
+// Fix makes volatile structural like const; T → volatile T still allowed
+// via can_implicit_coerce.
+mmio 0x40000000..0x40000FFF;
+i32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+    ?volatile *u32 v = reg;
+    ?*u32 stripped = v;
+    return 0;
+}

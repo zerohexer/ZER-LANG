@@ -3359,10 +3359,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         if (arg_h) {
                             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                             if (dh) {
+                                /* Audit 2026-06-11: raw field copy missed
+                                 * pool_name + escaped + is_thread_handle, so
+                                 * wrong-pool detection silently bypassed when
+                                 * the handle round-tripped through a passthrough
+                                 * function. Use ir_apply_alias to copy ALL
+                                 * tracked state — same shape as IR_COPY at 2758. */
+                                IRAliasSnapshot snap;
+                                ir_snapshot_alias(&snap, arg_h);
+                                ir_apply_alias(dh, &snap);
                                 dh->state = arg_h->state;
-                                dh->alloc_line = arg_h->alloc_line;
-                                dh->alloc_id = arg_h->alloc_id;
-                                dh->source_color = arg_h->source_color;
                                 dest_aliased_from_param = true;
                             }
                         }

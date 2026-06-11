@@ -284,6 +284,10 @@ bool type_equals(Type *a, Type *b) {
      * direction (mutable→const) is handled by can_implicit_coerce. */
     case TYPE_POINTER:
         if (a->pointer.is_const != b->pointer.is_const) return false;
+        /* Audit 2026-06-11: volatile is structural like const — `volatile *u32`
+         * and `*u32` must not type-equal, else a `?volatile *u32 → ?*u32`
+         * silently strips volatile (no MMIO ordering). */
+        if (a->pointer.is_volatile != b->pointer.is_volatile) return false;
         return type_equals(a->pointer.inner, b->pointer.inner);
     case TYPE_OPTIONAL:
         return type_equals(a->optional.inner, b->optional.inner);
@@ -427,6 +431,17 @@ bool can_implicit_coerce(Type *from, Type *to) {
     /* mutable pointer to const pointer */
     if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER) {
         if (to->pointer.is_const && !from->pointer.is_const) {
+            return type_equals(from->pointer.inner, to->pointer.inner);
+        }
+    }
+
+    /* nonvolatile pointer to volatile pointer — safe direction (adds
+     * observability). type_equals deliberately treats volatile as structural
+     * (mirror of const) so stripping silently is rejected; this coercion
+     * allows the safe direction `*T → volatile *T`. */
+    if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER) {
+        if (to->pointer.is_volatile && !from->pointer.is_volatile &&
+            from->pointer.is_const == to->pointer.is_const) {
             return type_equals(from->pointer.inner, to->pointer.inner);
         }
     }

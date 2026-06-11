@@ -1,0 +1,20 @@
+// Regression: yield + orelse-decomp + defer combo caused ir_validate to
+// fire false-positive "defer body would never execute" because the IR_YIELD
+// CFG successor was hardcoded `bi+1` (next sequential block) instead of
+// `last->goto_block` (the resume block id). When orelse inserts an
+// intermediate fail-RETURN block between yield and resume, bi+1 points at
+// the wrong block.
+async void worker() {
+    ?u32 m = 1;
+    u32 v = m orelse return;
+    defer { u32 x = v + 1; }
+    yield;
+}
+
+i32 main() {
+    _zer_async_worker task;
+    _zer_async_worker_init(&task);
+    _zer_async_worker_poll(&task);
+    _zer_async_worker_poll(&task);
+    return 0;
+}

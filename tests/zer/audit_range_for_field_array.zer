@@ -1,0 +1,16 @@
+// Regression: `for (T v in struct.fixed_array)` emitted `struct.field.len`
+// which is invalid C (fixed arrays have no .len member). Fix walks struct
+// fields to resolve the field type, then emits the array size literal.
+struct Bag { u32[8] data; }
+
+i32 main() {
+    Bag g;
+    g.data[0] = 1; g.data[1] = 2; g.data[2] = 3; g.data[3] = 4;
+    g.data[4] = 5; g.data[5] = 6; g.data[6] = 7; g.data[7] = 8;
+    u32 sum = 0;
+    for (u32 v in g.data) {
+        sum += v;
+    }
+    if (sum == 36) { return 0; }
+    return 1;
+}

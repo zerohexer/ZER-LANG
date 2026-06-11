@@ -2720,6 +2720,17 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->typecast.expr);
                 emit(e, ").ptr)");
             }
+        } else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && src_eff &&
+                   (type_is_integer(src_eff) || type_is_float(src_eff) ||
+                    src_eff->kind == TYPE_POINTER)) {
+            /* To bool: use truthy conversion (!!x), not plain integer cast.
+             * ZER emits bool as uint8_t so (uint8_t)5 gives 5, not 1 —
+             * BUG-586 fixed this in IR_CAST but the AST path (used for
+             * global initializers, which must be constant expressions and
+             * therefore cannot take the IR path) was missed. */
+            emit(e, "((uint8_t)!!(");
+            emit_expr(e, node->typecast.expr);
+            emit(e, "))");
         } else {
             /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
             emit(e, "((");
@@ -5952,6 +5963,46 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         /* Default: determine accessor from object type (. or ->) */
         {
             Type *obj_type = checker_get_type(e->checker, node->field.object);
+            /* Fallback for nested NODE_FIELD (e.g. range-for `g.data.len` where
+             * `g.data` is a cloned NODE_FIELD that may not be in the typemap):
+             * walk struct fields to resolve the type of the inner field. */
+            if (!obj_type && node->field.object &&
+                node->field.object->kind == NODE_FIELD) {
+                Node *inner = node->field.object;
+                Type *inner_obj = checker_get_type(e->checker, inner->field.object);
+                if (!inner_obj && inner->field.object &&
+                    inner->field.object->kind == NODE_IDENT) {
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        inner->field.object->ident.name,
+                        (uint32_t)inner->field.object->ident.name_len);
+                    if (sym) inner_obj = sym->type;
+                }
+                if (inner_obj) {
+                    Type *ie = type_unwrap_distinct(inner_obj);
+                    if (ie->kind == TYPE_POINTER)
+                        ie = type_unwrap_distinct(ie->pointer.inner);
+                    if (ie->kind == TYPE_STRUCT) {
+                        for (uint32_t i = 0; i < ie->struct_type.field_count; i++) {
+                            SField *f = &ie->struct_type.fields[i];
+                            if (f->name_len == inner->field.field_name_len &&
+                                memcmp(f->name, inner->field.field_name,
+                                       f->name_len) == 0) {
+                                obj_type = f->type;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            /* Array .len on a resolved nested-field object → emit literal size */
+            if (obj_type && node->field.field_name_len == 3 &&
+                memcmp(node->field.field_name, "len", 3) == 0) {
+                Type *oe = type_unwrap_distinct(obj_type);
+                if (oe->kind == TYPE_ARRAY) {
+                    emit(e, "%uU", (unsigned)oe->array.size);
+                    return;
+                }
+            }
             /* NODE_CALL results (e.g. Handle auto-deref get()) are typically pointers */
             if (!obj_type && node->field.object &&
                 node->field.object->kind == NODE_CALL) {
@@ -6574,11 +6625,23 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 int w = type_width(t);
                 bool is_signed = type_is_signed(t);
                 if (is_signed) {
-                    int64_t min_v = -(1LL << (w - 1));
+                    /* For w == 64, the literal min INT64_MIN = -9223372036854775808
+                     * cannot be written as `-9223372036854775808LL` — C parses that as
+                     * unary-minus applied to a literal that overflows i64, triggering
+                     * "integer constant is so large that it is unsigned" warnings (and
+                     * `-Werror` failures). Emit `(LLONG_MIN_LITERAL)` for w==64 and
+                     * the direct form for smaller widths. */
                     int64_t max_v = (1LL << (w - 1)) - 1;
-                    emit(e, "_zer_sat%d < %lldLL ? (%lldLL) : _zer_sat%d > %lldLL ? (%lldLL) : (",
-                         tmp, (long long)min_v, (long long)min_v,
-                         tmp, (long long)max_v, (long long)max_v);
+                    if (w == 64) {
+                        emit(e, "_zer_sat%d < (-9223372036854775807LL - 1) ? (-9223372036854775807LL - 1) : "
+                                "_zer_sat%d > %lldLL ? (%lldLL) : (",
+                             tmp, tmp, (long long)max_v, (long long)max_v);
+                    } else {
+                        int64_t min_v = -(1LL << (w - 1));
+                        emit(e, "_zer_sat%d < %lldLL ? (%lldLL) : _zer_sat%d > %lldLL ? (%lldLL) : (",
+                             tmp, (long long)min_v, (long long)min_v,
+                             tmp, (long long)max_v, (long long)max_v);
+                    }
                 } else {
                     /* Unsigned target: clamp below 0 AND above max */
                     uint64_t max_v = w >= 64 ? UINT64_MAX : ((1ULL << w) - 1);
@@ -10304,6 +10367,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 break;
             case 6: /* ?void has_value */
                 emit(e, "(_zer_opt_void){ %d }", (int)inst->literal_int);
+                break;
+            default:
+                /* Defense in depth: out-of-range literal_kind should never
+                 * happen, but if a future lowerer emits one the bare `dest = ;`
+                 * would be invalid C. Trap so the regression is visible. */
+                fprintf(stderr, "compiler bug: IR_LITERAL with unhandled "
+                        "literal_kind %u\n", (unsigned)inst->literal_kind);
+                emit(e, "0 /* IR_LITERAL bad kind %u */",
+                     (unsigned)inst->literal_kind);
                 break;
             }
             emit(e, ";\n");

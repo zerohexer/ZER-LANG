@@ -5,6 +5,154 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-11 — BUG-743..751: 9-gap audit sweep (parallel-agent + verification)
+
+Five parallel exploration agents read the compiler (emitter, checker,
+zercheck_ir, ir/ir_lower, and the baremetal/hardware surface) and produced
+~25 candidate findings; verification (each with a working `.zer` reproducer
+and `./zerc <file>` quote) kept 12 confirmed silent gaps and 1 over-rejection.
+9 were fixed in this session, 4 promoted to `docs/limitations.md` with
+fix sketches.
+
+### BUG-743 (CRITICAL) — IR_YIELD/IR_AWAIT successor was `bi+1`, not `goto_block`
+
+`async + orelse + defer + yield` triggered `INTERNAL ERROR: IR validation
+failed`. `ir.c:243-269` (ir_compute_preds), `cfg_reaches_fire`, `dfs_reachable`,
+and the defer-balance check inside `ir_validate` all assumed the YIELD/AWAIT
+block's successor is the next-sequential block. `ir_lower.c:2980` sets
+`y.goto_block = resume_bb`; when an orelse decomp inserts an intermediate
+fail-RETURN block between yield and resume, `bi+1` points at the wrong block,
+the defer-fire check fails, `valid = false`, `abort()`.
+
+Same gap silently lost zercheck_ir state across legitimate yields: resume_bb
+ended up with `pred_count=0`, so state-merge started empty, and the dead-code-
+after-return fallback (`zercheck_ir.c:4010-4014`) restored coverage by
+accident via a different code path. Any refactor of either side would have
+silently dropped UAF coverage across yields.
+
+Fix: all four sites now route through `last->goto_block` when set, with
+`bi+1` as defense-in-depth fallback. Test: `tests/zer/audit_async_orelse_defer_yield.zer`.
+
+### BUG-744 (HIGH) — `shared(rw) struct` cond evaluation always took write lock
+
+`emit_shared_lock_around_cond` (`ir_lower.c:1180-1188`) created `IR_LOCK`
+via `make_inst` which defaults `src2_local = -1`. The emitter's lock-mode
+dispatch (`emitter.c:9560`) reads `inst->src2_local != 0` — true for -1 —
+so every `if`, `while`, `for`, `switch` condition that read a `shared(rw)`
+field emitted `pthread_rwlock_wrlock` instead of `pthread_rwlock_rdlock`.
+Defeated reader concurrency entirely.
+
+Fix: explicitly set `lock.src2_local = 0` for cond locks. Test:
+`tests/zer/audit_shared_rw_cond_rdlock.zer`.
+
+### BUG-745 (HIGH) — `bool` cast in global initializer missed `!!` (BUG-586 AST sibling)
+
+`bool g = (bool)5;` in a global var-decl emitted `(uint8_t)(5)` = 5, not
+`(uint8_t)!!(5)` = 1. `bool g1 = (bool)5; bool g2 = (bool)10;` then made
+`g1 != g2` true and broke equality with literal `true`. BUG-586 fixed this
+in IR_CAST for local-scope casts but the AST `NODE_TYPECAST` path used for
+global initializers (which must be C constant expressions and cannot take
+the IR path) was missed.
+
+Fix: mirror the `!!` truthy conversion in `NODE_TYPECAST` for TYPE_BOOL
+target. Test: `tests/zer/audit_bool_cast_global_init.zer`.
+
+### BUG-746 (HIGH) — Range-for over a struct field fixed array emitted invalid C
+
+`for (T v in g.data)` where `g.data` is `T[N]` (struct field, fixed array)
+emitted `_zer_rlen = g.data.len;` — fixed arrays in C have no `.len`,
+GCC errored with "request for member 'len' in something not a structure".
+The BUG-501 fix in `emit_expr` rewrites `arr.len` to the literal size,
+but only when `arr` is `NODE_IDENT` and the typemap has its type. For
+`g.data` the parser's range-for clone is a fresh NODE_FIELD whose typemap
+entry may be missing; the IR-path `emit_rewritten_node` NODE_FIELD handler
+fell through to a raw field-access emission.
+
+Fix: in `emit_rewritten_node` NODE_FIELD default path, when the object is
+itself a NODE_FIELD, walk the struct definition to resolve the inner type
+and apply the array.len → literal rewrite. Test:
+`tests/zer/audit_range_for_field_array.zer`.
+
+### BUG-747 (HIGH) — `volatile` strip via `?volatile *u32 → ?*u32` silent
+
+`type_equals` for `TYPE_POINTER` checked `pointer.is_const` but not
+`pointer.is_volatile`, so `volatile *u32` and `*u32` type-equal'd. The
+volatile-strip site at `checker.c:8589` gated on
+`type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER` — when
+either side is wrapped in TYPE_OPTIONAL the strip check was silently
+skipped. `?volatile *u32 v = reg; ?*u32 stripped = v;` then dropped the
+volatile qualifier — GCC -O2 could collapse sequential MMIO writes.
+
+Fix: extend `type_equals` to also check `pointer.is_volatile` (mirroring
+the existing TYPE_SLICE handling). Add a `can_implicit_coerce` rule that
+still permits the safe direction `*T → volatile *T` (adding observability
+is sound; stripping is not). Test:
+`tests/zer_fail/audit_optional_volatile_strip.zer`.
+
+### BUG-748 (HIGH) — `@ptrcast` between `**A` and `*B` silently accepted
+
+BUG-735's confusion check required BOTH source's `pointer.inner->kind` AND
+target's `pointer.inner->kind` to be `TYPE_STRUCT || TYPE_UNION`. For
+`@ptrcast(*B, **A)` the source's inner is TYPE_POINTER (not aggregate),
+so the check was skipped and the cast fell through to a plain reinterpret.
+
+Fix: when EXACTLY ONE side is aggregate and neither is `*opaque`, reject
+as type confusion. Test: `tests/zer_fail/audit_ptrcast_doubleptr.zer`.
+
+### BUG-749 (HIGH) — `@cpu_save_context` / `@cpu_save_fpu` accepted undersized buffers
+
+The argument validator only checked "u8 buffer or u8[N] of any N". CLAUDE.md
+states 128+ bytes (CPU context) and 512+ bytes 16-byte-aligned (FPU). With
+a `u8[16] buf; @cpu_save_context(&buf[0])`, the emitted asm wrote 40-96
+bytes to an under-sized buffer — silent stack corruption.
+
+Fix: walk `&arr[0]` / bare-ident patterns at the call site to find the
+underlying array's size; reject when N < 128 (CPU) or N < 512 (FPU).
+Tests: `tests/zer_fail/audit_save_context_undersized.zer`,
+`tests/zer_fail/audit_save_fpu_undersized.zer`.
+
+### BUG-750 (MEDIUM) — `@saturate(i64, ...)` emitted malformed `-9223372036854775808LL`
+
+IR path computed `min_v = -(1LL << 63)` and emitted `%lldLL` formatting,
+producing `-9223372036854775808LL`. C parses this as `-(9223372036854775808LL)`
+where the unsigned literal overflows `long long` — GCC warns
+"integer constant is so large that it is unsigned", `-Werror` builds fail.
+
+Fix: special-case `w == 64` to emit `(-9223372036854775807LL - 1)` which
+is unambiguously INT64_MIN. Test: `tests/zer/audit_saturate_i64_literal_ok.zer`.
+
+### BUG-751 (LOW) — IR_LITERAL switch lacked `default:` (defense in depth)
+
+`literal_kind` is `uint8_t` (not enum) so `-Wswitch` cannot enforce
+exhaustiveness. An invalid kind (>=7) would silently emit `dest = ;` —
+invalid C that surfaces at GCC, not as a zerc internal error. Same class
+as the dead-stub-opcodes-trap fix from 2026-05-08.
+
+Fix: add `default:` with stderr diagnostic and `0` placeholder so a future
+lowerer bug fails loudly rather than producing GCC-unparseable C.
+
+### Bonus partial fixes — incomplete pool_name through wrapper functions
+
+`zercheck_ir.c:3358-3367` (`returns_param_color` alias) raw-copied four
+fields from arg handle to dest handle but omitted `pool_name`, `escaped`,
+`is_thread_handle` — the IR_COPY path already used `ir_apply_alias` to
+copy all alias-provenance fields. Converted to `ir_apply_alias` for
+consistency. NOTE: the full fix requires also auto-registering param
+handles with alloc_ids at IR_RETURN time so the inference at
+line 4350 can match — deferred to follow-up (recorded in limitations.md).
+
+### Findings promoted to docs/limitations.md (deferred, with fix sketches)
+
+- `@cpu_*` privileged intrinsics callable from any context (dead-branch
+  pattern is doc-only, not enforced)
+- Pool/Slab/Ring non-atomic RMW vs ISR (CLAUDE.md says "ISR-safe" but
+  implementation isn't atomic)
+- `@ptrcast` misaligned-source byte-offset accepted (Cortex-M0/M0+ BusFault)
+- Optional handle field re-unwrap-after-free (false-positive leak +
+  cross-binding alias gap)
+
+---
+
 ## Session 2026-06-10 — BUG-742: cross-function global-pointer UAF closed at the source (BUG-739 follow-up)
 
 `void f() { g_ptr = p; heap.free_ptr(p); }  u32 g() { gp = g_ptr orelse

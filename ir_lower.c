@@ -1183,6 +1183,11 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     if (!root) return NULL;
     IRInst lock = make_inst(IR_LOCK, line);
     lock.expr = root;
+    /* Audit 2026-06-11: cond evaluation is READ-only for shared(rw).
+     * Without explicit src2_local=0, the make_inst default of -1 means the
+     * emitter's `inst->src2_local != 0` check sees true → write lock for
+     * every cond read, defeating shared(rw)'s reader concurrency. */
+    lock.src2_local = 0;
     emit_inst(ctx, lock);
     return root;
 }

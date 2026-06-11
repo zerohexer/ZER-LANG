@@ -6457,6 +6457,26 @@ static Type *check_expr(Checker *c, Node *node) {
                                             type_name(val_type), type_name(result));
                                     }
                                 }
+                                /* Audit 2026-06-11: BUG-735 only covered the
+                                 * concrete struct ↔ struct case (both inner aggregate).
+                                 * `@ptrcast(*B, **A)` falls through because the source
+                                 * inner is TYPE_POINTER, not aggregate — but the cast
+                                 * is still confusion (pointer-to-pointer reinterpret).
+                                 * Reject unless either side is *opaque, or the two
+                                 * inners structurally type_equals. */
+                                if (g1_s_agg != g1_t_agg) {
+                                    /* one is *T, other is *struct — only safe if T is
+                                     * opaque (the documented round-trip). */
+                                    bool src_opq = (g1_sk == TYPE_OPAQUE);
+                                    bool dst_opq = (g1_tk == TYPE_OPAQUE);
+                                    if (!src_opq && !dst_opq) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast between unrelated pointer types is type "
+                                            "confusion ('%s' source) — use @pun(%s, ...) for an "
+                                            "explicit runtime-checked pun, or cast through *opaque",
+                                            type_name(val_type), type_name(result));
+                                    }
+                                }
                             }
                         }
                     }
@@ -7214,6 +7234,12 @@ static Type *check_expr(Checker *c, Node *node) {
                    (nlen == 15 && memcmp(name, "cpu_restore_fpu", 15) == 0)) {
             /* D-Alpha-4: context switch state save/restore (1-arg: buffer pointer).
              * Buffer must be u8[N] of sufficient size (128+ for CPU, 512+ aligned for FPU). */
+            bool is_fpu = (nlen >= 4 && memcmp(name + nlen - 4, "_fpu", 4) == 0);
+            /* Worst-case lower bounds across supported archs:
+             *   CPU context (callee-saved GPRs): x86-64 needs 5*8=40, ARM64 10*8=80,
+             *     RISC-V 12*8=96. Reserve 128 for headroom + future use.
+             *   FPU context (legacy fxsave): 512 bytes, 16-byte aligned. */
+            uint64_t min_size = is_fpu ? 512 : 128;
             if (node->intrinsic.arg_count != 1) {
                 checker_error(c, node->loc.line, "@%.*s requires 1 argument (buffer pointer)", (int)nlen, name);
             } else {
@@ -7230,8 +7256,44 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     if (!is_ptr_to_u8) {
                         checker_error(c, node->loc.line,
-                            "@%.*s argument must be a u8 buffer (e.g., u8[128] buf; @%.*s(&buf[0]))",
-                            (int)nlen, name, (int)nlen, name);
+                            "@%.*s argument must be a u8 buffer (e.g., u8[%llu] buf; @%.*s(&buf[0]))",
+                            (int)nlen, name, (unsigned long long)min_size, (int)nlen, name);
+                    }
+                    /* Audit 2026-06-11: undersized u8[N] buffer = silent stack
+                     * overflow on every supported arch. When the argument is
+                     * `&arr[0]` of a u8[N] with N < min_size, reject. Also
+                     * when the param expression itself has a known array type. */
+                    Type *known_arr = NULL;
+                    if (eff->kind == TYPE_ARRAY) {
+                        known_arr = eff;
+                    } else {
+                        /* Walk &expr / arr[0..].ptr / &arr[0] patterns to find the
+                         * underlying array. */
+                        Node *src = node->intrinsic.args[0];
+                        if (src && src->kind == NODE_UNARY && src->unary.op == TOK_AMP) {
+                            Node *inner_node = src->unary.operand;
+                            if (inner_node && inner_node->kind == NODE_INDEX) {
+                                Type *obj_t = typemap_get(c, inner_node->index_expr.object);
+                                if (obj_t) {
+                                    Type *oe = type_unwrap_distinct(obj_t);
+                                    if (oe->kind == TYPE_ARRAY) known_arr = oe;
+                                }
+                            } else if (inner_node && inner_node->kind == NODE_IDENT) {
+                                Type *t = typemap_get(c, inner_node);
+                                if (t) {
+                                    Type *ie = type_unwrap_distinct(t);
+                                    if (ie->kind == TYPE_ARRAY) known_arr = ie;
+                                }
+                            }
+                        }
+                    }
+                    if (known_arr && known_arr->array.size > 0 &&
+                        (uint64_t)known_arr->array.size < min_size) {
+                        checker_error(c, node->loc.line,
+                            "@%.*s buffer too small: u8[%llu] given, %llu+ required (worst-case across x86_64/aarch64/riscv64)",
+                            (int)nlen, name,
+                            (unsigned long long)known_arr->array.size,
+                            (unsigned long long)min_size);
                     }
                 }
             }

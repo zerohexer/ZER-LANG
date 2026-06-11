@@ -5,6 +5,109 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — privileged `@cpu_*` intrinsics callable from any function context (MEDIUM, BUG-743 sibling)
+
+`@cpu_disable_int`, `@cpu_enable_int`, `@cpu_wait_int`, `@cpu_iret`,
+`@cpu_sysret`, `@cpu_syscall`, `@cpu_read_msr`, `@cpu_write_msr`,
+`@cpu_read/write_cr0/cr3/cr4/xcr0`, `@cpu_hypercall`, MMU control intrinsics,
+port I/O — all emit raw asm with no compile-time guard on the calling
+context. CLAUDE.md documents a "dead-branch test pattern" for verifying these
+compile without executing the privileged op, but the discipline is
+documentation-only — the checker does not require it.
+
+User-mode hosted invocation → SIGSEGV (visible failure).
+Kernel/firmware compiled without the dead-branch pattern → no audit trail
+for "did the developer mean to call this at the top level?".
+
+**Fix sketch:** introduce `check_priv_intrinsic_context()` helper that
+verifies `c->in_naked || c->in_interrupt || (immediate-dead-branch pattern)`.
+Apply at ~30 intrinsic dispatch sites in checker.c. ~1-2 hours.
+
+## OPEN — Pool/Slab/Ring runtime ops are non-atomic across ISR (HIGH, doc/impl drift)
+
+`_zer_pool_alloc` (`emitter.c:4817-4829`) does plain RMW on `used[]` bitset:
+`if (!used[i]) { used[i] = 1; ... }`. No `__atomic_*`, no `cli/sti`.
+`_zer_pool_free` and `_zer_ring_push` have the same shape. `_zer_ring_push`
+uses `__atomic_thread_fence(__ATOMIC_RELEASE)` for ordering but does NOT
+make the counters atomic — ordering is necessary but not sufficient.
+
+CLAUDE.md positions `Pool(T,N)` as "ISR-safe alternative to Slab". With
+non-atomic RMW, two contexts (main + ISR, or two ISRs at different NVIC
+priorities) preempt between the read of `used[i]` and the write, and both
+get the same handle. Next free corrupts gen counter; subsequent allocation
+reuses corrupted slot. Same bug class hits Ring's head/tail/count.
+
+**Fix candidates:**
+1. Emit `__atomic_compare_exchange_n` loop in `_zer_pool_alloc/free`.
+2. Document Pool as "single-context only" + reject same-Pool access from
+   both main and ISR contexts.
+3. New `IsrSafePool` builtin with atomic primitives.
+
+Decision needed: option 1 affects every Pool user with a CAS-loop cost;
+option 2 requires user-visible discipline; option 3 splits the type
+hierarchy. The "best" depends on whether ZER's safety claim wants to be
+"Pool is ISR-safe under all conditions" (option 1) or "Pool is ISR-safe
+when accessed from one context" (option 2).
+
+## OPEN — `@ptrcast(*u32, &arr[k])` accepts misaligned byte-offset source (HIGH on Cortex-M0/M0+)
+
+`@inttoptr` already enforces alignment at runtime (BUG-736 path).
+`@ptrcast` does not. `*u32 p = @ptrcast(*u32, &buf[1]);` emits a raw
+reinterpret with no alignment check. On Cortex-M0/M0+ this BusFaults
+silently when `p[0]` is read; on Cortex-M3+/x86 it works but breaks
+atomics and SIMD on the result pointer.
+
+**Fix sketch:** when the source is `&array[const_or_var_index]` or
+`&struct.field` with offset-of mod-target-align != 0, emit the same
+alignment trap as `@inttoptr`. ~3-5 lines in `checker.c` + same in
+emitter as runtime fallback.
+
+## OPEN — Optional handle field re-unwrap-after-free silently re-extracts freed handle (MEDIUM)
+
+```zer
+struct Holder { ?Handle(Task) maybe; }
+Holder h;
+h.maybe = pool.alloc() orelse return;
+if (h.maybe) |k| { pool.free(k); }  // k freed, but h.maybe still has_value=1
+if (h.maybe) |k2| { pool.get(k2).id = 999; }  // UAF via re-extract
+```
+
+zercheck_ir doesn't propagate `k`'s FREED state back to its source compound
+`h.maybe`. After the free, h.maybe is treated as ALIVE; the second unwrap
+re-binds `k2` to the same (now-stale) handle bits. Runtime gen check
+catches Handle UAF at use time (so this isn't a memory-safety hole in
+practice), BUT:
+1. Compile-time error message is misleading (reports "h never freed"
+   instead of "k2 is freed via alias from h.maybe").
+2. The `alloc_ptr` (`*T`) variant has NO runtime backup — silent UAF.
+
+**Fix sketch:** when `if (opt) |k| { ... pool.free(k); }` is the only
+consumer of `opt`, propagate the FREED state to opt's compound entry.
+Requires tracking the binding→source alias across the if-unwrap. ~50-80
+LOC in zercheck_ir.c IR_ASSIGN orelse handler.
+
+## OPEN — wrong-pool detection lost on `returns_param_color` alias for trivial passthrough (MEDIUM)
+
+`Handle(T) passthrough(Handle(T) h) { return h; }` then
+`Handle(T) h2 = passthrough(h1); pb.free(h2);` silently accepts even
+though h1 came from `pa.alloc()`.
+
+Root cause: `returns_param_color` inference at `zercheck_ir.c:4350` requires
+both `ph->alloc_id == rh->alloc_id && ph->alloc_id != 0`. Params get an
+alloc_id only via IR_CAST (`zercheck_ir.c:2026`). A bare `return h` (no
+cast) leaves the param's alloc_id=0, so inference fails and dest is
+registered as a fresh allocation without pool_name.
+
+BUG-751-bonus fix: the `returns_param_color` application path was already
+using raw field copy; now uses `ir_apply_alias` so when inference DOES
+succeed pool_name flows. The remaining gap is the inference itself.
+
+**Fix sketch:** auto-register pointer/handle params with fresh alloc_ids
+on first read at IR_RETURN (matching the IR_CAST auto-register pattern).
+~10-15 LOC.
+
+---
+
 ## CLOSED — 6u360k audit (2026-06-09): all 8 gaps fixed (BUG-734..741)
 
 All 8 silent gaps from branch `claude/cool-johnson-6u360k` are closed and

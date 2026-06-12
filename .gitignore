@@ -22,6 +22,18 @@ test_firmware2
 test_firmware3
 test_production
 test_semantic_fuzz
+test_ir_validate
+test_shape_matrix
+test_escape_matrix
+test_keep_matrix
+test_cflow_matrix
+test_conc_matrix
+test_hw_matrix
+test_async_matrix
+test_asm_matrix
+test_modules/main
+rust_tests/rt_task_alloc_free
+rust_tests/rt_task_alloc_free_cycle
 
 # Editor/IDE
 .idea/

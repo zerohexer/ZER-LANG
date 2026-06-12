@@ -3438,19 +3438,45 @@ static Type *check_expr(Checker *c, Node *node) {
          * Unwrap @ptrcast/@bitcast/@cast launders on the value side (escape-matrix
          * H1: `global = @ptrcast(*u8, &local)` previously slipped — the value was a
          * NODE_INTRINSIC, not a bare NODE_UNARY(AMP)). Target sink classified via
-         * the shared classify_escape_sink (global/static or pointer-param field). */
+         * the shared classify_escape_sink (global/static or pointer-param field).
+         *
+         * AUDIT 2026-06-12: the walker previously descended into the LAST arg
+         * for every intrinsic. That works for @ptrcast/@bitcast/@cast/@pun
+         * (arg_count=1, last==args[0]==value). It is WRONG for @container —
+         * which has args=[ptr, field_name], arg_count=2; descending into the
+         * last gives the field-name ident, not the pointer, and the escape
+         * (`g = @container(*Device, &local.lh, lh);`) was silently allowed.
+         * Fix: for @container specifically, take args[0] (the pointer);
+         * everything else continues to use the last-arg unwrap. */
         {
             Node *aval = node->assign.value;
-            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0)
-                aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
+            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0) {
+                const char *iname = aval->intrinsic.name;
+                size_t inlen = aval->intrinsic.name_len;
+                if (inlen == 9 && memcmp(iname, "container", 9) == 0)
+                    aval = aval->intrinsic.args[0];
+                else
+                    aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
+            }
+            /* AUDIT 2026-06-12: walk &(...) through NODE_FIELD / NODE_INDEX to
+             * the root ident so `&local.field` / `&local.field.sub` / `&local[k]`
+             * are detected (previously only bare `&local` was caught). The
+             * @container reproducer hits this — `@container(*T, &local.lh, lh)`
+             * unwraps to `&local.lh` whose operand is NODE_FIELD, not NODE_IDENT. */
+            Node *opv = (aval && aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP)
+                        ? aval->unary.operand : NULL;
+            while (opv && (opv->kind == NODE_FIELD || opv->kind == NODE_INDEX)) {
+                opv = (opv->kind == NODE_FIELD) ? opv->field.object
+                                                : opv->index_expr.object;
+            }
             if (node->assign.op == TOK_EQ && aval &&
                 aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP &&
-                aval->unary.operand->kind == NODE_IDENT) {
+                opv && opv->kind == NODE_IDENT) {
                 Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
                 Symbol *val_sym = scope_lookup(c->current_scope,
-                    aval->unary.operand->ident.name,
-                    (uint32_t)aval->unary.operand->ident.name_len);
+                    opv->ident.name,
+                    (uint32_t)opv->ident.name_len);
                 bool val_is_global = val_sym &&
                     scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
                 if ((tgt_global || tgt_param) && val_sym &&
@@ -8516,12 +8542,17 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
         /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
-         * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR). */
-        if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
-            checker_error(c, node->loc.line,
-                "non-null pointer '*%s' requires an initializer — "
-                "use '?*%s' for nullable pointers",
-                type_name(type->pointer.inner), type_name(type->pointer.inner));
+         * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR).
+         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT so `distinct typedef *u32 P; P p;`
+         * is caught — sibling funcptr check below already unwraps. */
+        if (!node->var_decl.init && type) {
+            Type *teff = type_unwrap_distinct(type);
+            if (teff && teff->kind == TYPE_POINTER) {
+                checker_error(c, node->loc.line,
+                    "non-null pointer '*%s' requires an initializer — "
+                    "use '?*%s' for nullable pointers",
+                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
+            }
         }
         /* Function pointer without initializer — auto-zero creates NULL funcptr.
          * Calling it would segfault. Require init or use ?FuncPtr for nullable. */
@@ -12099,12 +12130,17 @@ static void register_decl(Checker *c, Node *node) {
                     (int)node->var_decl.name_len, node->var_decl.name);
             }
         }
-        /* BUG-253: non-null pointer (*T) requires initializer at global scope too */
-        if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
-            checker_error(c, node->loc.line,
-                "non-null pointer '*%s' requires an initializer — "
-                "use '?*%s' for nullable pointers",
-                type_name(type->pointer.inner), type_name(type->pointer.inner));
+        /* BUG-253: non-null pointer (*T) requires initializer at global scope too.
+         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT to catch
+         * `distinct typedef *u32 P; P g;` at global scope. */
+        if (!node->var_decl.init && type) {
+            Type *teff = type_unwrap_distinct(type);
+            if (teff && teff->kind == TYPE_POINTER) {
+                checker_error(c, node->loc.line,
+                    "non-null pointer '*%s' requires an initializer — "
+                    "use '?*%s' for nullable pointers",
+                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
+            }
         }
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,

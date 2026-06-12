@@ -5,6 +5,118 @@ Entries removed once fixed.
 
 ---
 
+## CLOSED — 2026-06-12 audit (this session, 4 silent gaps closed)
+
+Fresh-session audit found and closed 4 distinct silent gaps + documented
+5 already-known ones. Per-gap detail in commit message.
+
+1. **distinct typedef + non-null pointer uninit** (HIGH, was silent) —
+   `distinct typedef *u32 P; P p;` (local) and `P g;` (global) compiled
+   clean, auto-zeroed to NULL, deref segfaulted. Root cause: checker.c
+   non-null-init check dispatched on `type->kind == TYPE_POINTER` without
+   unwrapping `TYPE_DISTINCT`. The sibling funcptr check did unwrap. Fix:
+   use `type_unwrap_distinct(type)` at lines 8520 and 12103 (now sites in
+   tools/type_dispatch_baseline.txt). Same BUG-409 distinct-unwrap class.
+
+2. **@container with `&local.field` escape laundering** (HIGH, was silent)
+   — `g_dev = @container(*Device, &local.lh, lh);` stored a pointer to a
+   stack-local in a global; escape analysis at checker.c:3443-3445 walked
+   the LAST intrinsic arg (which for @container is the field-name ident,
+   not the pointer) and missed the escape. Compound fix: for @container
+   specifically use args[0], AND walk the unary operand through NODE_FIELD/
+   NODE_INDEX to the root ident so `&local.field`/`&local[k]` are detected
+   on EVERY escape sink (not just bare `&local`).
+
+3. **spawn arg already-FREED `*shared T` accepted silently** (HIGH, was
+   silent) — `*Task t = heap.alloc_ptr(); heap.free_ptr(t); spawn worker(t);`
+   compiled clean. zercheck_ir.c:1826 only checked TRANSFERRED, then
+   line 1897 unconditionally overwrote state to TRANSFERRED — masking the
+   real UAF. Fix: add FREED/MAYBE_FREED arm mirroring the TRANSFERRED arm
+   right before the state overwrite. The spawned thread would have read
+   dangling slab memory; now a compile error.
+
+Plus documented (no fix this session — see below):
+4. defer-fires-twice on goto-to-same-scope (already in limitations.md)
+5. conditional global dangle (BUG-742 residual, already in limitations.md)
+6. @critical on hosted ARM (Raspberry Pi Linux) emits privileged `cpsid i`
+   (new finding, see entry below)
+7. Slab runtime `calloc`/`free` unguarded by `__STDC_HOSTED__` (new finding)
+8. Pool/Ring/Arena globals `= {0}` initializer puts them in `.data` not
+   `.bss` — silent flash bloat on embedded (new finding)
+9. checker escape `call_has_local_derived_arg` depth-8 silent return-false
+   (new finding, low-severity synthetic case)
+
+Reproducers for 4-9 in `tests/zer_gaps/audit_2026-06-12_*.zer`.
+
+## OPEN — @critical on hosted ARM emits privileged `cpsid i` (MEDIUM)
+
+The emitter `@critical` cascade at emitter.c:9528-9594 gates `__ARM_ARCH`
+WITHOUT a `__STDC_HOSTED__` guard:
+
+```
+#if defined(__ARM_ARCH)                          /* no hosted guard */
+    __asm__ __volatile__("mrs %0, primask\n cpsid i" ...);
+...
+#elif (defined(__x86_64__) || defined(__i386__)) &&
+      (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)
+    __asm__ __volatile__("pushf\n\tpop %0\n\tcli" ...);
+```
+
+On hosted ARM (Raspberry Pi Linux, Apple-silicon macOS) `@critical { ... }`
+emits `cpsid i` — a CPL=0-only instruction. User-mode programs SIGILL at
+runtime. The x86 arm has the hosted guard; ARM does not.
+
+Symmetric fix: add `&& (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)`
+to the `__ARM_ARCH`, `__AVR__`, and `__riscv` arms; on hosted those archs
+fall through to the existing memory-fence fallback. Same shape as the x86
+arm.
+
+Reproducer: `tests/zer_gaps/audit_2026-06-12_critical_hosted_arm.zer`.
+
+## OPEN — `_zer_slab_alloc`/`_free_ptr` unguarded calloc/free (HIGH for bare-metal)
+
+`emitter.c:5148-5157` emits `calloc` and `free` calls inside
+`_zer_slab_alloc` UNCONDITIONALLY (no `#if __STDC_HOSTED__` guard). On
+`-ffreestanding -nostdlib` the link fails with `undefined reference to
+calloc`/`free`/`memcpy` for ANY program declaring `Slab(T)` or using
+`Task.alloc()` (auto-slab).
+
+This is the symmetric case to the pthread block at 4869-4875 — that one
+IS gated; Slab is not. Fix: wrap the entire `_zer_slab_*` runtime block in
+`#if __STDC_HOSTED__` with a clear comment that Slab requires libc. Loud
+GCC undefined-function error at the call site is better than the current
+undecorated `calloc` reference.
+
+The pool/ring/arena helpers are libc-free and correctly stay unguarded.
+
+## OPEN — Pool/Ring/Arena globals get `= {0}` initializer → `.data`, not `.bss`
+
+CLAUDE.md asserts ZER's auto-zero relies on `.bss`-zeroing at startup. C99
+§ 6.7.8 ¶ 10 says any global with static storage starts zero — no
+initializer is needed. The emitter at lines 4077-4078 (Pool), 4088-4089
+(Ring), 4101-4102 (Arena) emits an explicit `= {0}` initializer which
+forces the global into `.data` (flash on embedded). A `Pool(SensorRecord,
+1024)` × 64-byte struct = 64 KB of zeros in flash per Pool.
+
+Slab needs `.slot_size` so cannot become `.bss`. Pool/Ring/Arena have no
+init-required fields and SHOULD be emitted without the `= {0}` — `.bss`
++ C99 zero-init handles it. This silently bloats embedded binaries.
+
+Reproducer: any embedded program with `Pool(T, N)`. Inspect the resulting
+section sizes (`size out.elf`) and compare with `= {0}` removed.
+
+## OPEN — checker `call_has_local_derived_arg` depth-8 silent return-false (LOW)
+
+checker.c:875 caps recursion at depth > 8 with a silent `return false`
+(claim: "no escape"). A 9+-level chain of identity calls
+(`id(id(...(id(&local))))`) hides a real escape. Synthetic — real code is
+unlikely to chain identity-like calls that deep — but the silent bypass
+should either raise the cap to 32 (matching other walkers) or error
+explicitly when escape analysis runs out of budget rather than silently
+claiming safe.
+
+---
+
 ## CLOSED — 6u360k audit (2026-06-09): all 8 gaps fixed (BUG-734..741)
 
 All 8 silent gaps from branch `claude/cool-johnson-6u360k` are closed and

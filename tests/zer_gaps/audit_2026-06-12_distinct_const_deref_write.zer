@@ -1,0 +1,25 @@
+// AUDIT 2026-06-12 — HIGH severity
+//
+// Gap: write through a const-qualified distinct-typedef pointer is
+// silently allowed. The deref-write checker walks back to the symbol
+// and is supposed to reject when the symbol carries `is_const`. But
+// when the base pointer's type is TYPE_DISTINCT (wrapping the actual
+// pointer), the `through_const_pointer` detection at checker.c:3360-
+// 3401 sees TYPE_DISTINCT not TYPE_POINTER and never sets the flag.
+//
+// Reproducer below: writes 7 through a `const MyPtr cg` and silently
+// mutates the underlying memory.
+//
+// Expected: COMPILE ERROR ("cannot write through const pointer")
+// Actual:   compiles, STATIC_BUF becomes 7
+
+distinct typedef *u32 MyPtr;
+
+u32 STATIC_BUF = 0;
+MyPtr g = @cast(MyPtr, &STATIC_BUF);
+
+i32 main() {
+    const MyPtr cg = g;
+    *cg = 7;            // SHOULD error — writing through const distinct
+    return (i32)STATIC_BUF;  // returns 7, proving write succeeded
+}

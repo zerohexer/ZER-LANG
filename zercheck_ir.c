@@ -1838,6 +1838,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         (int)func->locals[root_local].name_len,
                         func->locals[root_local].name, h->free_line);
             }
+            /* AUDIT 2026-06-12: also reject spawn arg that's already FREED /
+             * MAYBE_FREED. Pre-fix the TRANSFERRED overwrite at line 1897
+             * silently masked a real use-after-free — `*T t = alloc_ptr();
+             * free_ptr(t); spawn worker(t);` compiled clean and the spawned
+             * thread read dangling slab memory. Mirror the TRANSFERRED check
+             * shape; the same `urs_has` dedup isn't needed since spawn-arg is
+             * a single use site per loop iteration. */
+            if (h && (h->state == IR_HS_FREED ||
+                      h->state == IR_HS_MAYBE_FREED) &&
+                root_local < func->local_count) {
+                if (path_len == 0)
+                    ir_zc_error(zc, inst->source_line,
+                        "use after free: '%.*s' is %s (freed at line %d) — "
+                        "spawned thread would read dangling memory",
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name,
+                        ir_state_name(h->state), h->free_line);
+                else
+                    ir_zc_error(zc, inst->source_line,
+                        "use after free: compound '%.*s' on local '%.*s' is %s "
+                        "(freed at line %d) — spawned thread would read "
+                        "dangling memory",
+                        (int)path_len, path,
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name,
+                        ir_state_name(h->state), h->free_line);
+            }
             if (!h && root_local < func->local_count) {
                 /* Auto-register move-struct args (bare or compound) so
                  * TRANSFERRED can be observed. For compound paths, walk

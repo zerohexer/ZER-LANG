@@ -629,3 +629,4 @@ zercheck_ir.c:st->kind != TYPE_UNION)) continue;
 zercheck_ir.c:type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
 zercheck_ir.c:vt_eff->kind == TYPE_UNION)) {
 zercheck_ir.c:} else if (ft->kind == TYPE_STRUCT || ft->kind == TYPE_UNION) {
+checker.c:if (teff && teff->kind == TYPE_POINTER) {

@@ -1,0 +1,13 @@
+// AUDIT 2026-06-12 — HIGH severity
+// Sibling of distinct_nonnull_uninit.zer at global scope.
+// checker.c:12103 has the same distinct-unwrap miss as 8520.
+//
+// Expected: COMPILE ERROR
+// Actual:   compiles, g is auto-zero NULL, any deref segfaults
+distinct typedef *u32 MyPtr;
+
+MyPtr g;     // currently allowed at global scope — SHOULD error
+
+i32 main() {
+    return 0;
+}

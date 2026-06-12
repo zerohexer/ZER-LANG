@@ -5,6 +5,85 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-12 — 4 silent gaps + audit (BUG-743..745)
+
+Fresh-session deep audit found and closed three silent safety holes plus
+documented several deferred ones (logged in `docs/limitations.md`).
+
+### BUG-743 — distinct typedef bypasses non-null-pointer init requirement
+
+`distinct typedef *u32 P; P p;` (local) or `P g;` (global) compiled clean,
+auto-zeroed to NULL, and crashed at runtime when dereferenced. The
+language guarantees this is a COMPILE error per the "non-null pointer
+requires an initializer" rule (BUG-239/253). Same #1 distinct-unwrap class
+as BUG-409: checker.c:8520 and 12103 dispatched on
+`type->kind == TYPE_POINTER` without unwrapping `TYPE_DISTINCT`. The sibling
+funcptr check at 8528 DOES unwrap — this site forgot.
+
+Fix: route both sites through `type_unwrap_distinct(type)` and read the
+inner pointer's element via the unwrapped form. Now `MyPtr p;` errors at
+both local and global scope. Patterns added to
+`tools/type_dispatch_baseline.txt`.
+
+Reproducer: `tests/zer_fail/distinct_nonnull_uninit.zer`,
+`tests/zer_fail/distinct_nonnull_uninit_global.zer`.
+
+### BUG-744 — @container with `&local.field` escape laundering
+
+`g_dev = @container(*Device, &local.lh, lh);` silently stored a pointer to
+a stack-local in a global. Escape walker at checker.c:3443-3445 descended
+the LAST intrinsic arg, which for @container (`@container(T, ptr, field)`)
+is the FIELD-NAME ident — not the pointer. The walker also required the
+unary operand to be `NODE_IDENT` exactly, so `&local.field` (operand =
+`NODE_FIELD`) slipped even when the right arg was reached.
+
+Two-part fix:
+1. For @container specifically descend `args[0]` (the pointer), not
+   `args[arg_count-1]` (the field name).
+2. Walk the unary operand through `NODE_FIELD`/`NODE_INDEX` to the root
+   ident so `&local.field` / `&local[k]` are detected on EVERY escape sink
+   (also benefits the @ptrcast/@bitcast/@cast paths since they use the
+   same walker).
+
+Reproducer: `tests/zer_fail/container_local_escape.zer`. Existing
+positive patterns (`&g_global`, `&g.field`, `keep` params) verified
+unchanged.
+
+### BUG-745 — spawn arg already-FREED `*shared T` silently accepted
+
+`*Task t = heap.alloc_ptr(); heap.free_ptr(t); spawn worker(t);` compiled
+clean and the spawned thread read dangling slab memory. Root cause in
+`zercheck_ir.c` spawn handler (around line 1826): the FREED/MAYBE_FREED
+state was never checked before the unconditional TRANSFERRED overwrite at
+line 1897. Only TRANSFERRED→TRANSFERRED was caught (BUG-733 from earlier
+session); FREED→TRANSFERRED was silenced.
+
+Fix: add a `(h->state == IR_HS_FREED || h->state == IR_HS_MAYBE_FREED)`
+arm mirroring the existing TRANSFERRED arm, with a custom message
+("spawned thread would read dangling memory"). Placement is before the
+auto-register block so freshly-ALIVE handles aren't false-flagged.
+
+Reproducer: `tests/zer_fail/spawn_freed_ptr.zer`. Verified existing
+spawn-after-move (TRANSFERRED) cases unaffected.
+
+### Audit findings deferred (logged in `docs/limitations.md`)
+
+- @critical on hosted ARM emits privileged `cpsid i` (Raspberry Pi crash) —
+  MEDIUM, symmetric fix to x86 already-gated arm
+- `_zer_slab_*` runtime uses `calloc`/`free` unguarded by
+  `__STDC_HOSTED__` — HIGH for bare-metal link
+- Pool/Ring/Arena globals emitted with `= {0}` initializer → `.data` not
+  `.bss` — flash bloat on embedded
+- checker `call_has_local_derived_arg` depth-8 silent return-false — LOW
+  synthetic case
+- defer-fires-twice on goto-to-same-scope-label (already documented)
+- conditional global dangle (BUG-742 residual, already documented)
+
+Full audit report tracked in commit message. Reproducers for the deferred
+gaps in `tests/zer_gaps/audit_2026-06-12_*.zer`.
+
+---
+
 ## Session 2026-06-10 — BUG-742: cross-function global-pointer UAF closed at the source (BUG-739 follow-up)
 
 `void f() { g_ptr = p; heap.free_ptr(p); }  u32 g() { gp = g_ptr orelse

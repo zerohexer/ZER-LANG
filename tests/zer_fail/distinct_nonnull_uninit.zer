@@ -1,0 +1,32 @@
+// AUDIT 2026-06-12 — HIGH severity (silent compile-time blind spot)
+//
+// Gap: distinct typedef of *T (non-null) BYPASSES the "non-null pointer
+// requires an initializer" rule. Auto-zero creates NULL; subsequent
+// dereference is undefined behavior / runtime SIGSEGV trap, NOT the
+// promised compile-time error.
+//
+// Root cause: checker.c:8520 and checker.c:12103 dispatch on
+//   `type->kind == TYPE_POINTER`
+// without unwrapping TYPE_DISTINCT. A `distinct typedef *u32 MyPtr` has
+// kind TYPE_DISTINCT wrapping TYPE_POINTER. The check skips. The
+// function-pointer sibling check at 8529 DOES unwrap; this site forgot.
+//
+// Fix: use `type_dispatch_kind(type) == TYPE_POINTER` (and same for
+// the global path at 12103). Then pull `type->pointer.inner` from the
+// unwrapped form.
+//
+// Expected: COMPILE ERROR ("non-null pointer requires initializer")
+// Actual:   compiles clean, NULL deref at runtime
+//
+// Pattern matches the BUG-409 distinct-unwrap class but at two safety-
+// critical sites not in `tools/type_dispatch_baseline.txt` audit scope
+// (the audit covers existing sites; these were already pessimistic-passing
+// in baseline).
+
+distinct typedef *u32 MyPtr;
+
+i32 main() {
+    MyPtr p;           // currently allowed — SHOULD error
+    u32 v = *p;        // null deref at runtime
+    return (i32)v;
+}

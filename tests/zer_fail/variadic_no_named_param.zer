@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// '...' requires at least one named parameter before it. Must fail to compile.
+void f(...);
+
+i32 main() {
+    return 0;
+}

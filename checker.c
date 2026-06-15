@@ -4928,11 +4928,20 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         if (effective_callee->kind == TYPE_FUNC_PTR) {
-            /* verify arg count */
-            if ((uint32_t)node->call.arg_count != effective_callee->func_ptr.param_count) {
+            /* verify arg count. Variadic (C-interop extern) accepts any number
+             * of trailing args beyond the fixed params; only the fixed params
+             * are type-checked below — the varargs cross the C boundary
+             * unchecked, same status as cinclude raw pointers. */
+            bool callee_variadic = effective_callee->func_ptr.is_variadic;
+            uint32_t fixed_params = effective_callee->func_ptr.param_count;
+            bool arg_count_ok = callee_variadic
+                ? ((uint32_t)node->call.arg_count >= fixed_params)
+                : ((uint32_t)node->call.arg_count == fixed_params);
+            if (!arg_count_ok) {
                 checker_error(c, node->loc.line,
-                    "expected %u arguments, got %d",
-                    effective_callee->func_ptr.param_count, node->call.arg_count);
+                    callee_variadic ? "expected at least %u arguments, got %d"
+                                    : "expected %u arguments, got %d",
+                    fixed_params, node->call.arg_count);
             } else {
                 /* verify each arg type */
                 for (uint32_t i = 0; i < effective_callee->func_ptr.param_count; i++) {
@@ -12215,6 +12224,7 @@ static void register_decl(Checker *c, Node *node) {
             }
         }
         Type *func_type = type_func_ptr(c->arena, params, pc, ret);
+        func_type->func_ptr.is_variadic = node->func_decl.is_variadic;
         /* carry keep flags from ParamDecl to Type */
         {
             bool any_keep = false;

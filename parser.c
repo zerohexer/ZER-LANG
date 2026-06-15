@@ -2456,9 +2456,20 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
         ParamDecl *params = stack_params;
         int param_cap = 16;
         int param_count = 0;
+        bool is_variadic = false;
 
         if (!check(p, TOK_RPAREN)) {
             do {
+                /* C-interop variadic: '...' must be the final parameter and
+                 * needs at least one named parameter before it. Restricted to
+                 * bodyless extern declarations below — ZER functions cannot
+                 * read untyped varargs (the unchecked-boundary ban). */
+                if (match(p, TOK_ELLIPSIS)) {
+                    if (param_count == 0)
+                        error(p, "'...' requires at least one named parameter before it");
+                    is_variadic = true;
+                    break;
+                }
                 if (param_count >= param_cap) {
                     int new_cap = param_cap * 2;
                     ParamDecl *new_p = (ParamDecl *)parser_alloc(p, new_cap * sizeof(ParamDecl));
@@ -2496,6 +2507,7 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
         consume(p, TOK_RPAREN, "expected ')' after parameters");
 
         n->func_decl.param_count = param_count;
+        n->func_decl.is_variadic = is_variadic;
         if (param_count > 0) {
             n->func_decl.params = (ParamDecl *)arena_alloc(p->arena, param_count * sizeof(ParamDecl));
             memcpy(n->func_decl.params, params, param_count * sizeof(ParamDecl));
@@ -2506,6 +2518,11 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
             n->func_decl.body = NULL;
             return n;
         }
+        /* '...' is a C-interop boundary only — a ZER function with a body
+         * cannot be variadic (it could read untyped, unverified arguments). */
+        if (is_variadic)
+            error(p, "variadic '...' is only allowed on bodyless extern declarations, "
+                     "not on a ZER function with a body");
         n->func_decl.body = parse_block(p);
         return n;
     }

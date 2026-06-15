@@ -304,6 +304,7 @@ struct Node {
             bool is_comptime;       /* comptime = compile-time evaluated */
             bool is_naked;          /* naked = no prologue/epilogue, asm-only body */
             bool is_async;          /* async = coroutine, transformed to state machine */
+            bool is_variadic;       /* C-interop varargs (...) — bodyless extern decls only */
             const char *section;    /* section(".text.startup") or NULL */
             size_t section_len;
         } func_decl;

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// '...' is a C-interop boundary only — a ZER function with a body cannot be
+// variadic (it could read untyped, unverified arguments). Must fail to compile.
+void log_it(const *u8 fmt, ...) {
+    return;
+}
+
+i32 main() {
+    log_it("hi");
+    return 0;
+}

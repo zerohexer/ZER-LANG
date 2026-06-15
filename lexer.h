@@ -71,6 +71,7 @@ typedef enum {
     /* === Operators (1 or 2 characters) === */
     TOK_DOT,            /* . */
     TOK_DOTDOT,         /* .. (range/slice) */
+    TOK_ELLIPSIS,       /* ... (C-interop variadic, extern decls only) */
     TOK_PLUS,           /* + */
     TOK_MINUS,          /* - */
     TOK_STAR,           /* * */

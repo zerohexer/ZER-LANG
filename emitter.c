@@ -4051,6 +4051,7 @@ static void emit_func_decl(Emitter *e, Node *node) {
                 func_type->func_ptr.params[i] : resolve_tynode(e,p->type);
             emit_type_and_name(e, ptype, p->name, p->name_len);
         }
+        if (node->func_decl.is_variadic) emit(e, ", ...");
     }
     emit(e, ") ");
 

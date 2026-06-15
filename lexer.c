@@ -484,9 +484,12 @@ Token next_token(Scanner *s) {
     case '@': return make_token(s, TOK_AT, start);
     case '?': return make_token(s, TOK_QUESTION, start);
 
-    /* dot or dot-dot (range) */
+    /* dot, dot-dot (range), or ellipsis (C-interop variadic) */
     case '.':
-        if (match(s, '.')) return make_token(s, TOK_DOTDOT, start);
+        if (match(s, '.')) {
+            if (match(s, '.')) return make_token(s, TOK_ELLIPSIS, start);
+            return make_token(s, TOK_DOTDOT, start);
+        }
         return make_token(s, TOK_DOT, start);
 
     /* plus or plus-eq */
@@ -649,6 +652,7 @@ const char *token_type_name(TokenType type) {
     case TOK_QUESTION: return "?";
     case TOK_DOT: return ".";
     case TOK_DOTDOT: return "..";
+    case TOK_ELLIPSIS: return "...";
     case TOK_PLUS: return "+";
     case TOK_MINUS: return "-";
     case TOK_STAR: return "*";

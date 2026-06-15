@@ -136,6 +136,7 @@ struct Type {
             uint32_t param_count;
             Type *ret;
             bool *param_keeps;  /* per-param keep flags (NULL if none) */
+            bool is_variadic;   /* trailing ... (C-interop extern decls only) */
         } func_ptr;
 
         /* TYPE_POOL */

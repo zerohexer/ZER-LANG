@@ -1,0 +1,11 @@
+// Variadic '...' on a bodyless extern (C-interop boundary) — calling C printf.
+// Positive: must compile, run, and exit 0.
+i32 printf(const *u8 fmt, ...);
+
+i32 main() {
+    i32 x = 5;
+    *i32 ptr = &x;
+    printf("variadic ok: %d\n", *ptr);
+    printf("multi: %d %d %d\n", 1, 2, 3);
+    return 0;
+}

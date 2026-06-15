@@ -449,8 +449,8 @@ static void test_edge_cases(void) {
     TokenType dd[] = { TOK_DOT, TOK_DOT, TOK_DOT };
     expect_sequence(". . .", dd, 3, "three separate dots");
 
-    TokenType dd2[] = { TOK_DOTDOT, TOK_DOT };
-    expect_sequence("...", dd2, 2, "dotdot then dot");
+    TokenType dd2[] = { TOK_ELLIPSIS };
+    expect_sequence("...", dd2, 1, "ellipsis (C-interop variadic)");
 
     /* unknown character */
     expect_single("#", TOK_ERROR, "hash is error");

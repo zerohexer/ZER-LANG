@@ -1,0 +1,17 @@
+// Regression: direct `g = local[0..]` (no intermediate var-decl) must
+// reject. The intermediate form `s = local[0..]; g = s;` was caught
+// because var-decl already descended NODE_SLICE to set is_local_derived
+// on s; direct assignment had no Symbol to tag, so the local-derived
+// escape walker at NODE_ASSIGN skipped it.
+[*]u32 g;
+
+void leak() {
+    u32[4] local;
+    local[0] = 42;
+    g = local[0..];
+}
+
+u32 main() {
+    leak();
+    return g[0];
+}

@@ -1,0 +1,15 @@
+// Regression: `return s.f[0..]` where s is a local struct with an array
+// field must reject — the slice borrows the struct's stack storage.
+// Walker must descend NODE_SLICE → NODE_FIELD → NODE_IDENT and recognize
+// the struct local as a non-escaping binding.
+struct S { u32[4] f; }
+
+[*]u32 leak() {
+    S s;
+    s.f[0] = 77;
+    return s.f[0..];
+}
+
+u32 main() {
+    return leak()[0];
+}

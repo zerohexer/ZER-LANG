@@ -1,0 +1,26 @@
+// AUDIT 2026-06-12 — HIGH severity
+//
+// Gap: `spawn worker(t)` where `t` is a *FREED* `*shared T` pointer
+// is silently accepted. zercheck_ir.c:1826 (spawn arg handler in the
+// IR_NOP/NODE_SPAWN path) and the IR_SPAWN handler at 3686 both check
+// the TRANSFERRED state to detect use-after-move but neither checks
+// FREED / MAYBE_FREED. The path then UNCONDITIONALLY overwrites the
+// handle state to TRANSFERRED (line 1897), erasing the original FREED
+// origin and silencing any later use of the same handle.
+//
+// Expected: COMPILE ERROR ("use after free: 't' was freed at line N")
+// Actual:   compiles, spawned thread reads dangling pointer
+
+shared struct Task { u32 id; }
+Slab(Task) heap;
+
+void worker(*Task t) {
+    // dangling pointer — reads stale slab memory
+}
+
+i32 main() {
+    *Task t = heap.alloc_ptr() orelse return;
+    heap.free_ptr(t);
+    spawn worker(t);    // SHOULD reject — t is FREED
+    return 0;
+}

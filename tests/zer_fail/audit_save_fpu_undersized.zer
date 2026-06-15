@@ -1,0 +1,10 @@
+// Negative test: @cpu_save_fpu accepts any u8 buffer; spec requires 512+
+// bytes (fxsave/xsave save area). Fix rejects at compile time.
+i32 main() {
+    u8[64] small_fpu;
+    volatile u32 nt = 0;
+    if (nt == 42) {
+        @cpu_save_fpu(&small_fpu[0]);
+    }
+    return 0;
+}

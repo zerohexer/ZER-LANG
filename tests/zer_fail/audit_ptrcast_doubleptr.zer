@@ -1,0 +1,12 @@
+// Negative test: @ptrcast between unrelated pointer types (e.g. **A vs *B)
+// silently accepted because BUG-735's check required BOTH source and target
+// inner types to be struct/union (concrete aggregate). When one side has
+// pointer-typed inner, the check skipped.
+struct A { u32 x; }
+struct B { u32 y; }
+
+i32 main() {
+    A a; *A ap = &a; **A app = &ap;
+    *B bp = @ptrcast(*B, app);
+    return 0;
+}

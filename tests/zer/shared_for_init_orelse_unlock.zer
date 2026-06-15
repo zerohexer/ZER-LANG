@@ -1,0 +1,24 @@
+// Regression: for-init with `orelse return` on a shared-struct read must
+// release the lock before the early return. emit_shared_lock_if_needed
+// acquires the lock for the init expression — if the orelse fallback
+// fires return without an IR_UNLOCK, the next thread to acquire deadlocks.
+shared struct Bag { ?u32 maybe; u32 value; }
+Bag g;
+
+void grab_for() {
+    for (u32 v = g.maybe orelse return; v < 0; v += 1) {
+        g.value = v;
+    }
+}
+
+void worker() {
+    g.value = 13;
+}
+
+u32 main() {
+    grab_for();
+    ThreadHandle th = spawn worker();
+    th.join();
+    if (g.value != 13) { @trap(); }
+    return 0;
+}

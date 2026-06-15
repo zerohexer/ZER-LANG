@@ -5,6 +5,89 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-15 — Integration: 21 silent-gap fixes from 4 parallel audit branches
+
+Combined the source fixes from four parallel audit branches
+(`cool-johnson-24wimb`, `-7xum5y`, `-viwhrr`, `-jpglg6`) into one change.
+Branches were NOT merged — each fix was reviewed against current `main`
+(every reproducer re-run: `zer_fail` must reject, `zer` must compile), then
+the source hunks were applied and the full suite re-run (ZER 733, Rust 784,
+Zig 36, all matrices — green; all discipline audits pass).
+
+NOTE on numbering: the four sessions independently reused BUG-743..751 for
+**different** bugs (parallel branches, no shared counter). Entries below are
+grouped by root cause; the originating branch is named for traceability.
+
+### Escape / init hardening (from `-24wimb`)
+- **distinct-typedef non-null-init** — `distinct typedef *u32 P; P p;` (local
+  or global) compiled, auto-zeroed to NULL, crashed on deref. `check_stmt` /
+  `register_decl` now `type_unwrap_distinct` before the `*T`-requires-init
+  rule. Tests: `tests/zer_fail/distinct_nonnull_uninit{,_global}.zer`.
+- **`@container(&local.field)` escape** — escape walker descended the last
+  intrinsic arg (the field-name ident for `@container`); now descends
+  `args[0]` and walks `&local.field`→root ident (also strengthens
+  `@ptrcast`/`@bitcast`/`@cast`). Test: `tests/zer_fail/container_local_escape.zer`.
+- **spawn of already-FREED `*shared T`** — spawn handler only caught
+  TRANSFERRED; added a FREED/MAYBE_FREED arm. Test: `tests/zer_fail/spawn_freed_ptr.zer`.
+
+### Misc IR / emitter / checker (from `-7xum5y`)
+- **async+orelse+defer+yield IR successor** (CRITICAL) — YIELD/AWAIT resume
+  used `bi+1` not `last->goto_block` across 4 CFG sites; **crashed the
+  compiler** (`abort()`) and silently dropped UAF coverage across yields.
+  Test: `tests/zer/audit_async_orelse_defer_yield.zer`.
+- **`shared(rw)` cond took write lock** — cond `IR_LOCK` defaulted
+  `src2_local=-1` → wrlock; set `=0` for read lock. Test:
+  `tests/zer/audit_shared_rw_cond_rdlock.zer`.
+- **`@ptrcast(*B, **A)` confusion** — XOR-aggregate inner now rejected unless
+  `*opaque`. Test: `tests/zer_fail/audit_ptrcast_doubleptr.zer`.
+- **`@cpu_save_context/_fpu` undersized buffer** — reject `u8[N]` with N<128
+  (CPU) / N<512 (FPU). Tests: `tests/zer_fail/audit_save_{context,fpu}_undersized.zer`.
+- **`bool` cast in global initializer** — emit `(uint8_t)!!(x)` (AST path,
+  mirrors BUG-586). Test: `tests/zer/audit_bool_cast_global_init.zer`.
+- **range-for over struct-field fixed array** — resolve nested-field type,
+  emit literal `.len`. Test: `tests/zer/audit_range_for_field_array.zer`
+  (local-struct case verified working too).
+- **`@saturate(i64)` INT64_MIN literal** — emit `(-9223372036854775807LL-1)`
+  to avoid the `-Werror` unsigned-literal break. Test: `tests/zer/audit_saturate_i64_literal_ok.zer`.
+- **`IR_LITERAL` missing `default:`** — defense-in-depth trap.
+- **passthrough alias provenance** — `returns_param_color` now uses
+  `ir_apply_alias` so `pool_name`/`escaped`/`is_thread_handle` propagate.
+
+### Emission correctness (from `-viwhrr`)
+- **Ring.pop IR-path missing acquire fence** (CRITICAL on ARM/RISC-V) — added
+  `__atomic_thread_fence(__ATOMIC_ACQUIRE)` between data load and tail update
+  (matches the AST path / BUG-348 producer release). Test: `tests/zer/ring_pop_acquire_fence.zer`.
+- **goto fires defer twice** — `NODE_GOTO` now `emit_defer_fire_scoped(…,pop=true)`
+  + resets `defer_count`. Test: `tests/zer/goto_defer_single_fire.zer`.
+
+### Slice-of-local escapes + orelse-shared-lock leaks (from `-jpglg6`)
+- **orelse early-exit leaks shared lock** ×3 (deadlock; one shape **crashed
+  the compiler** on a stale/incremental build) — emit `IR_UNLOCK` on the
+  orelse return/break/continue fallback, and inherit `prev_shared` when a
+  nested block/for-init has no lock of its own. Tests:
+  `tests/zer/shared_orelse_unlock.zer`, `tests/zer/shared_for_init_orelse_unlock.zer`.
+- **slice-of-local escapes** ×6 — `return arr[0..]`, `return s.f[0..]`,
+  `g = local[0..]`, `tmp.ref = local[0..]; g = tmp`, slice stored in a
+  `Handle` field, and `keep`-param slice borrow. The escape walkers now
+  descend `NODE_SLICE`→root and treat a non-static non-global root as local.
+  Tests: `tests/zer_fail/{return_local_slice,return_local_slice_orelse,
+  return_local_struct_field_slice,slice_local_to_global,
+  struct_field_slice_then_copy,keep_param_local_slice}.zer`.
+
+### Pending (left as `TODO(human)`)
+- **BUG-747 volatile-strip via optional** (`?volatile *u32 → ?*u32`) — being
+  closed the *narrow* way (extend `check_volatile_strip` to peel `?`/slice
+  wrappers at the coercion site) instead of making `type_equals` globally
+  volatile-strict. The peel loop is a `TODO(human)` in `check_volatile_strip`;
+  test parked at `tests/zer_gaps/audit_optional_volatile_strip.zer` until it
+  lands. `types.c` deliberately untouched.
+
+### Documented-open (see `docs/limitations.md`)
+- defer-body-uses-handle-then-body-frees → silent UAF (needs a new LIFO
+  per-defer state-walk pass; reproducer in `tests/zer_gaps/`).
+
+---
+
 ## Session 2026-06-10 — BUG-742: cross-function global-pointer UAF closed at the source (BUG-739 follow-up)
 
 `void f() { g_ptr = p; heap.free_ptr(p); }  u32 g() { gp = g_ptr orelse

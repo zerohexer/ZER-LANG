@@ -1,0 +1,23 @@
+// KNOWN GAP — Session 2026-06-07 audit
+// This file COMPILES CLEAN today but should be rejected.
+// See docs/limitations.md "OPEN — defer body uses a handle the function
+// body then frees → silent UAF".
+//
+// At scope exit, the deferred `use_item(h)` fires AFTER `gp.free(h)` ran in
+// the function body — silent use-after-free with no diagnostic. The
+// non-defer version (`gp.free(h); use_item(h);`) IS correctly rejected,
+// confirming this is specifically the defer-scheduled-use path that's
+// missing from the analyzer.
+//
+// When the fix lands, move this file to tests/zer_fail/ and flip the
+// header to `// EXPECTED: compile error`.
+struct Item { u32 id; }
+Pool(Item, 4) gp;
+void use_item(Handle(Item) h) { gp.get(h).id = 5; }
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    defer use_item(h);    // scheduled use at scope exit
+    gp.free(h);           // h FREED in path state
+    return;               // defer fires use_item(h) on FREED handle
+}
+i32 main() { run(); return 0; }

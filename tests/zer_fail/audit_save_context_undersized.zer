@@ -1,0 +1,11 @@
+// Negative test: @cpu_save_context with under-128-byte buffer used to
+// accept silently, then emit asm that wrote ~40 bytes past the buffer
+// (stack overflow). Fix rejects at compile time.
+i32 main() {
+    u8[16] tiny;
+    volatile u32 nt = 0;
+    if (nt == 42) {
+        @cpu_save_context(&tiny[0]);
+    }
+    return 0;
+}

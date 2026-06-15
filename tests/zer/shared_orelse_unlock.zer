@@ -1,0 +1,32 @@
+// Regression: orelse fallback (return/break/continue) on a statement that
+// reads a shared struct field MUST release the auto-mutex before the early
+// exit. Without this, the next thread to acquire the same lock deadlocks
+// forever. Covers both the bare `orelse return` form and the block
+// `orelse { return; }` form.
+shared struct Bag { ?u32 maybe; u32 value; }
+Bag g;
+
+void grab_bare() {
+    u32 v = g.maybe orelse return;
+    g.value = v;
+}
+
+void grab_block() {
+    u32 v = g.maybe orelse { return; };
+    g.value = v;
+}
+
+void worker() {
+    g.value = 7;
+}
+
+u32 main() {
+    grab_bare();
+    grab_block();
+    // If either grab leaked the mutex, this spawn deadlocks on the
+    // worker thread's pthread_mutex_lock(&g._zer_mtx).
+    ThreadHandle th = spawn worker();
+    th.join();
+    if (g.value != 7) { @trap(); }
+    return 0;
+}

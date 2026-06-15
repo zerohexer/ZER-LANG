@@ -1169,6 +1169,50 @@ attribute in `emit_func_attributes` (emitter.c) and remove this entry.
 
 ---
 
+## OPEN — defer body uses a handle the function body then frees → silent UAF (2026-06-15)
+
+**Symptom:** a deferred call *uses* a handle (`defer use_item(h);`), the
+function body then transitions that handle out of ALIVE (`gp.free(h)`,
+`slab.free(h)`, move-consume) before returning; at scope exit the defer
+fires on the stale handle. **No diagnostic.** Runtime: pool/slab gen
+mismatch traps; move-struct is silent UB.
+
+Reproducer (compiles cleanly when it shouldn't — confirmed on 2026-06-15):
+```zer
+struct Item { u32 id; }
+Pool(Item, 4) gp;
+void use_item(Handle(Item) h) { gp.get(h).id = 5; }
+void run() {
+    Handle(Item) h = gp.alloc() orelse return;
+    defer use_item(h);    // scheduled use at scope exit
+    gp.free(h);           // h now FREED in path state
+    return;               // defer fires use_item(h) on a FREED handle
+}
+```
+The non-defer form `gp.free(h); use_item(h);` IS correctly rejected — only
+the defer-scheduled use slips through.
+
+**Root cause:** `zercheck_ir.c` `ir_defer_scan_frees` (~line 1351) walks
+each defer body ONLY for free calls (so `defer gp.free(h)` folds into the
+exit state correctly). It does NOT scan defer bodies for non-free *uses*
+of a handle. The main-body walker sees `gp.free(h); return;` and signs off;
+the deferred `use_item(h)` is never checked against the post-body state.
+
+**Why the obvious fix isn't trivial:** defers fire LIFO and a single defer
+body can legitimately use-then-free — `defer { use_item(h); gp.free(h); }`
+is the canonical safe cleanup and must stay accepted. A naive "scan all
+uses then apply all frees" over-rejects it.
+
+**Fix sketch (deferred — net-new analysis pass):** at function exit, walk
+defers in LIFO order; for each defer body walk its statements top-down
+against a snapshot of the path state — a non-free USE checks the snapshot
+(emit use-after-free/use-after-move if FREED/TRANSFERRED), a FREE applies
+to the snapshot, then advance. Fold the snapshot into the return state.
+Originally found in the 2026-06-07 audit (cool-johnson-InoCW); reproducer
+`tests/zer_gaps/audit_2026-06-07_defer_use_after_body_free.zer`.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

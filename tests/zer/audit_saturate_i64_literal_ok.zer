@@ -1,0 +1,9 @@
+// Regression: @saturate(i64, u64) used to emit `-9223372036854775808LL`
+// which GCC warns "integer constant is so large that it is unsigned".
+// Fix emits `(-9223372036854775807LL - 1)` for the INT64_MIN bound.
+i32 main() {
+    u64 big = 9223372036854775808;
+    i64 r = @saturate(i64, big);
+    if (r == 9223372036854775807) { return 0; }   // clamped to INT64_MAX
+    return 1;
+}

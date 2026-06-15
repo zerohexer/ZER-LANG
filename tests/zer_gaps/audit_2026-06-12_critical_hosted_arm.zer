@@ -1,0 +1,34 @@
+// AUDIT 2026-06-12 — MEDIUM severity (hosted-ARM runtime crash)
+//
+// Gap: emitter `@critical` cascade at emitter.c:9528-9594 gates
+// `__ARM_ARCH` WITHOUT a `__STDC_HOSTED__` guard but gates
+// `__x86_64__/__i386__` WITH such a guard:
+//
+//   #if defined(__ARM_ARCH)                      // <-- no hosted guard
+//       __asm__ __volatile__("mrs %0, primask\n cpsid i" ...);
+//   ...
+//   #elif (defined(__x86_64__) || defined(__i386__)) &&
+//         (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)
+//       __asm__ __volatile__("pushf\n\tpop %0\n\tcli" ...);
+//
+// On hosted ARM (Raspberry Pi Linux, Apple-silicon macOS), the user
+// runs the binary in user mode; `cpsid i` is privileged → SIGILL at
+// runtime. On hosted x86 the user gets the documented fence fallback.
+// The asymmetry produces "fails on user's machine but only on ARM."
+//
+// Expected (when test is executed on hosted ARM): runs OK with fence
+//          fallback (same as x86 hosted)
+// Actual:   SIGILL inside @critical on hosted ARM
+//
+// EMIT-ONLY reproducer — verifies the C output cascade omits the
+// !__STDC_HOSTED__ guard on the ARM arm.
+
+shared struct Counter { u32 val; }
+Counter c;
+
+i32 main() {
+    @critical {
+        c.val += 1;
+    }
+    return 0;
+}

@@ -252,8 +252,16 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
                 add_pred(&func->blocks[last->goto_block], arena, bi);
             break;
         case IR_YIELD:
-            /* Yield → next block is resume point (implicit edge) */
-            if (bi + 1 < func->block_count)
+            /* Yield → resume point. ir_lower sets last->goto_block = resume_bb
+             * (ir_lower.c:2980). Pre-fix used `bi + 1`, which only matches when
+             * the resume_bb is the next-sequential block — but when an orelse
+             * decomp inserts intermediate blocks between yield and resume,
+             * bi+1 points at a fail-RETURN block instead. Result: missing CFG
+             * edge for the resume → false-positive "defer unreachable" trap
+             * AND lost zercheck_ir state across the yield. */
+            if (last->goto_block >= 0 && last->goto_block < func->block_count)
+                add_pred(&func->blocks[last->goto_block], arena, bi);
+            else if (bi + 1 < func->block_count)
                 add_pred(&func->blocks[bi + 1], arena, bi);
             break;
         case IR_RETURN:
@@ -309,6 +317,10 @@ static bool cfg_reaches_fire(IRFunc *func, int from, const bool *has_fire_in_blo
         return false;
     case IR_YIELD:
     case IR_AWAIT:
+        /* Resume target lives in last->goto_block (ir_lower sets this).
+         * Falls back to bi+1 only if no goto_block — defense in depth. */
+        if (last->goto_block >= 0 && last->goto_block < func->block_count)
+            return cfg_reaches_fire(func, last->goto_block, has_fire_in_block, visited);
         if (from + 1 < func->block_count)
             return cfg_reaches_fire(func, from + 1, has_fire_in_block, visited);
         return false;
@@ -346,8 +358,12 @@ static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
         break;
     case IR_YIELD:
     case IR_AWAIT:
-        /* async resume falls through to next block */
-        if (bi + 1 < func->block_count) dfs_reachable(func, bi + 1, reachable);
+        /* async resume jumps to last->goto_block (ir_lower sets this).
+         * Falls back to bi+1 for defense in depth. */
+        if (last->goto_block >= 0 && last->goto_block < func->block_count)
+            dfs_reachable(func, last->goto_block, reachable);
+        else if (bi + 1 < func->block_count)
+            dfs_reachable(func, bi + 1, reachable);
         break;
     default:
         /* Non-terminator last instruction = implicit fallthrough. */
@@ -725,6 +741,14 @@ bool ir_validate(IRFunc *func) {
                                 break;
                             case IR_RETURN:
                                 reached = false;
+                                break;
+                            case IR_YIELD:
+                            case IR_AWAIT:
+                                /* Resume target is goto_block, not bi+1. */
+                                if (last->goto_block >= 0 && last->goto_block < func->block_count)
+                                    reached = cfg_reaches_fire(func, last->goto_block, fire_in_block, visited);
+                                else if (bi + 1 < func->block_count)
+                                    reached = cfg_reaches_fire(func, bi + 1, fire_in_block, visited);
                                 break;
                             default:
                                 if (bi + 1 < func->block_count)

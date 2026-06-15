@@ -1,0 +1,13 @@
+// Regression: `return arr[0..]` of a LOCAL array must reject — the slice
+// borrows stack storage that's freed when the function returns.
+// Indirect `[*]u32 s = arr[0..]; return s;` was already caught; direct
+// `return arr[0..]` was a silent gap (compile clean, runtime junk).
+[*]u32 leak() {
+    u32[4] arr;
+    arr[0] = 99;
+    return arr[0..];
+}
+
+u32 main() {
+    return leak()[0];
+}

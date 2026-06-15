@@ -1,0 +1,21 @@
+// Regression: storing a slice-of-local through a Handle field must reject —
+// the heap-allocated Holder outlives the local, so h.ref dangles after the
+// function returns. classify_escape_sink previously only flagged
+// TYPE_POINTER through-deref targets; TYPE_HANDLE was missed.
+struct Holder { [*]u32 ref; }
+Slab(Holder) heap;
+
+Handle(Holder) make() {
+    u32[4] local;
+    local[0] = 42;
+    ?Handle(Holder) mh = heap.alloc();
+    Handle(Holder) h = mh orelse return;
+    h.ref = local[0..];   // borrow-of-local stored in heap-resident field
+    return h;
+}
+
+u32 main() {
+    Handle(Holder) h = make();
+    defer heap.free(h);
+    return h.ref[0];
+}

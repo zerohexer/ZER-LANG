@@ -1,0 +1,35 @@
+// AUDIT 2026-06-12 — HIGH severity (silent dangling pointer)
+//
+// Gap: `@container(*T, &local.field, field_name)` walks a stack-local
+// out through @container and stores into a global pointer. Escape
+// analysis at checker.c:3443-3445 only descends the LAST intrinsic
+// arg; for @container that is the field-name identifier, not the
+// pointer. The pointer slips, escape is not detected, the function
+// returns, and the global holds a dangling pointer.
+//
+// Expected: COMPILE ERROR
+//   "address of stack-local 'local' escapes to global 'g_dev'
+//    via @container — local will be destroyed when this function returns"
+// Actual:   compiles clean; g_dev dangles after f() returns; subsequent
+//           dereference reads stack garbage (returns 0 in the run below
+//           even though id was set to 42 in f).
+
+struct ListHead { ?*ListHead next; }
+struct Device { u32 id; ListHead lh; }
+
+?*Device g_dev = null;
+
+void f() {
+    Device local;
+    local.id = 42;
+    g_dev = @container(*Device, &local.lh, lh);  // SHOULD reject
+}
+
+i32 main() {
+    f();
+    // dereferencing g_dev now reads dead stack
+    if (g_dev) |d| {
+        return (i32)d.id;
+    }
+    return 0;
+}

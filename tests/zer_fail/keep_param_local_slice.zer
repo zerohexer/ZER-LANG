@@ -1,0 +1,21 @@
+// Regression: passing `local[0..]` as a `keep` parameter must reject —
+// the slice borrows stack storage that doesn't outlive what `keep` allows
+// the callee to do (store in global/static, persistent field).
+// `&local` and is_local_derived ident were already caught; NODE_SLICE
+// borrow of a plain local array was a silent gap in the call-site walker.
+[*]u32 g;
+
+void store(keep [*]u32 s) {
+    g = s;
+}
+
+void leak() {
+    u32[4] local;
+    local[0] = 42;
+    store(local[0..]);
+}
+
+u32 main() {
+    leak();
+    return g[0];
+}

@@ -629,3 +629,21 @@ zercheck_ir.c:st->kind != TYPE_UNION)) continue;
 zercheck_ir.c:type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
 zercheck_ir.c:vt_eff->kind == TYPE_UNION)) {
 zercheck_ir.c:} else if (ft->kind == TYPE_STRUCT || ft->kind == TYPE_UNION) {
+
+# Audit 2026-06-11 — sites added by the silent-gap sweep session.
+# All operate on `_eff` / `ie` / `oe` / `tgt_eff` locals that were already
+# unwrapped via type_unwrap_distinct() at the surrounding line. The dispatch
+# is safe because the distinct case can never reach these reads — the unwrap
+# was performed in the same function scope.
+checker.c:if (eff->kind == TYPE_ARRAY) {
+checker.c:if (ie->kind == TYPE_ARRAY) known_arr = ie;
+checker.c:if (oe->kind == TYPE_ARRAY) known_arr = oe;
+emitter.c:if (ie->kind == TYPE_POINTER)
+emitter.c:if (ie->kind == TYPE_STRUCT) {
+emitter.c:if (oe->kind == TYPE_ARRAY) {
+
+# Audit 2026-06-12 — distinct-typedef non-null-init check (cool-johnson-24wimb).
+# `teff` is the result of type_unwrap_distinct(type) on the line above, so the
+# distinct case is already peeled — the TYPE_POINTER read is safe.
+checker.c:if (teff && teff->kind == TYPE_POINTER) {
+emitter.c:} else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && src_eff &&

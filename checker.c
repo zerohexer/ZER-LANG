@@ -837,8 +837,25 @@ static void classify_escape_sink(Checker *c, Node *target,
     bool g = ts->is_static ||
              scope_lookup_local(c->global_scope, ts->name, ts->name_len) != NULL;
     *is_global = g;
-    if (!g && through_deref && type_dispatch_kind(ts->type) == TYPE_POINTER) {
-        *is_param_ptr = true;
+    if (!g && through_deref) {
+        /* Sink categories that outlive a local borrow:
+         *   - `*T` (pointer param/local): caller's storage or heap.
+         *   - `Handle(T)` / `?Handle(T)`: pool/slab-allocated heap.
+         * Both make a local-borrow stored through them dangle when the
+         * current function exits. Reusing the `is_param_ptr` flag because
+         * the caller's error message ("through pointer parameter") is the
+         * closest existing diagnostic — the underlying invariant
+         * ("destination outlives current scope") is the same. */
+        TypeKind rk = type_dispatch_kind(ts->type);
+        if (rk == TYPE_POINTER || rk == TYPE_HANDLE) {
+            *is_param_ptr = true;
+        } else if (rk == TYPE_OPTIONAL) {
+            Type *inner = type_unwrap_distinct(ts->type)->optional.inner;
+            if (inner && (type_dispatch_kind(inner) == TYPE_HANDLE ||
+                          type_dispatch_kind(inner) == TYPE_POINTER)) {
+                *is_param_ptr = true;
+            }
+        }
     }
 }
 
@@ -1259,6 +1276,22 @@ static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
                                   Type *tgt_type, int line, const char *context) {
     Type *seff = type_unwrap_distinct(src_type);
     Type *teff = type_unwrap_distinct(tgt_type);
+    /* BUG-747: peel matching wrapper types in lockstep so an optional (or
+     * slice) wrapper does not hide the pointer level — e.g. `?volatile *u32`
+     * assigned to `?*u32` must still be caught. Stop the moment the two kinds
+     * diverge (a different type error covers that mismatch), leaving
+     * seff/teff at the innermost matched level. This keeps the fix local to
+     * the coercion site instead of making `type_equals` volatile-strict
+     * globally (which would change type identity everywhere).
+     *
+     * TODO(human): write the lockstep peel loop over seff/teff here.
+     * While seff and teff are both non-NULL, have the SAME kind, and that
+     * kind is a wrapper worth seeing through (TYPE_OPTIONAL — you may also
+     * include TYPE_SLICE), advance both to their inner type, re-applying
+     * type_unwrap_distinct after each step. The inner type for TYPE_OPTIONAL
+     * is `->optional.inner`. Leave seff/teff pointing at the innermost
+     * matched level so the TYPE_POINTER check below sees through the wrapper. */
+
     if (!seff || seff->kind != TYPE_POINTER) return false;
     if (!teff || teff->kind != TYPE_POINTER) return false;
     if (teff->pointer.is_volatile) return false; /* target keeps volatile — ok */
@@ -3438,19 +3471,45 @@ static Type *check_expr(Checker *c, Node *node) {
          * Unwrap @ptrcast/@bitcast/@cast launders on the value side (escape-matrix
          * H1: `global = @ptrcast(*u8, &local)` previously slipped — the value was a
          * NODE_INTRINSIC, not a bare NODE_UNARY(AMP)). Target sink classified via
-         * the shared classify_escape_sink (global/static or pointer-param field). */
+         * the shared classify_escape_sink (global/static or pointer-param field).
+         *
+         * AUDIT 2026-06-12: the walker previously descended into the LAST arg
+         * for every intrinsic. That works for @ptrcast/@bitcast/@cast/@pun
+         * (arg_count=1, last==args[0]==value). It is WRONG for @container —
+         * which has args=[ptr, field_name], arg_count=2; descending into the
+         * last gives the field-name ident, not the pointer, and the escape
+         * (`g = @container(*Device, &local.lh, lh);`) was silently allowed.
+         * Fix: for @container specifically, take args[0] (the pointer);
+         * everything else continues to use the last-arg unwrap. */
         {
             Node *aval = node->assign.value;
-            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0)
-                aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
+            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0) {
+                const char *iname = aval->intrinsic.name;
+                size_t inlen = aval->intrinsic.name_len;
+                if (inlen == 9 && memcmp(iname, "container", 9) == 0)
+                    aval = aval->intrinsic.args[0];
+                else
+                    aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
+            }
+            /* AUDIT 2026-06-12: walk &(...) through NODE_FIELD / NODE_INDEX to
+             * the root ident so `&local.field` / `&local.field.sub` / `&local[k]`
+             * are detected (previously only bare `&local` was caught). The
+             * @container reproducer hits this — `@container(*T, &local.lh, lh)`
+             * unwraps to `&local.lh` whose operand is NODE_FIELD, not NODE_IDENT. */
+            Node *opv = (aval && aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP)
+                        ? aval->unary.operand : NULL;
+            while (opv && (opv->kind == NODE_FIELD || opv->kind == NODE_INDEX)) {
+                opv = (opv->kind == NODE_FIELD) ? opv->field.object
+                                                : opv->index_expr.object;
+            }
             if (node->assign.op == TOK_EQ && aval &&
                 aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP &&
-                aval->unary.operand->kind == NODE_IDENT) {
+                opv && opv->kind == NODE_IDENT) {
                 Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
                 Symbol *val_sym = scope_lookup(c->current_scope,
-                    aval->unary.operand->ident.name,
-                    (uint32_t)aval->unary.operand->ident.name_len);
+                    opv->ident.name,
+                    (uint32_t)opv->ident.name_len);
                 bool val_is_global = val_sym &&
                     scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
                 if ((tgt_global || tgt_param) && val_sym &&
@@ -3583,6 +3642,34 @@ static Type *check_expr(Checker *c, Node *node) {
                                 tsym->container_field_len = src->container_field_len;
                             }
                         }
+                        /* BUG-750: `tmp.ref = local[0..]` field-store of a slice
+                         * borrowing a local also taints the root struct so a
+                         * subsequent `g = tmp` struct-copy is rejected by the
+                         * is_local_derived sink check. Mirrors the struct-LITERAL
+                         * propagation (BUG-732) for the assignment-then-field-store
+                         * laundering shape. Only on plain `=` to a field/index
+                         * target with pointer-carrying type. */
+                        if (vcheck->kind == NODE_SLICE &&
+                            (node->assign.target->kind == NODE_FIELD ||
+                             node->assign.target->kind == NODE_INDEX) &&
+                            type_can_carry_pointer(tsym->type)) {
+                            Node *sroot = vcheck->slice.object;
+                            while (sroot && (sroot->kind == NODE_FIELD ||
+                                              sroot->kind == NODE_INDEX)) {
+                                if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
+                                else sroot = sroot->index_expr.object;
+                            }
+                            if (sroot && sroot->kind == NODE_IDENT) {
+                                Symbol *src = scope_lookup(c->current_scope,
+                                    sroot->ident.name, (uint32_t)sroot->ident.name_len);
+                                bool src_is_global = src && scope_lookup_local(c->global_scope,
+                                    src->name, src->name_len) != NULL;
+                                if (src && (src->is_local_derived ||
+                                            (!src->is_static && !src_is_global))) {
+                                    tsym->is_local_derived = true;
+                                }
+                            }
+                        }
                         /* @ptrcast provenance on assignment (compile-time belt) */
                         if (vcheck->kind == NODE_INTRINSIC &&
                             vcheck->intrinsic.name_len == 7 &&
@@ -3657,16 +3744,45 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* BUG-205/355 + escape-matrix H3/H4: local-derived escape via assignment to
          * global/static OR a pointer-param field. Walk through intrinsics to the
-         * root ident; sink classified via classify_escape_sink (global or param). */
+         * root ident; sink classified via classify_escape_sink (global or param).
+         *
+         * BUG-748: also walk through NODE_SLICE so direct `g = local[0..]` (no
+         * intermediate `[*]T s = local[0..]; g = s;` binding) is caught — the
+         * intermediate path is rejected because var-decl marks `s` is_local_derived,
+         * but direct assignment leaves no Symbol to query unless we descend
+         * NODE_SLICE here. Mirrors the var-decl walker at checker.c:8979. */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
             /* BUG-355: walk through intrinsics to find root ident */
             while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
                 vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* BUG-748: descend through `arr[a..b]` borrow shape */
+            bool via_slice_borrow = false;
+            if (vnode && vnode->kind == NODE_SLICE) {
+                via_slice_borrow = true;
+                vnode = vnode->slice.object;
+                while (vnode && (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
+                    if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
+                    else vnode = vnode->index_expr.object;
+                }
+            }
             if (vnode && vnode->kind == NODE_IDENT) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);
-                if (val_sym && val_sym->is_local_derived) {
+                bool val_is_local = false;
+                if (val_sym) {
+                    if (val_sym->is_local_derived) {
+                        val_is_local = true;
+                    } else if (via_slice_borrow) {
+                        /* Slice-borrow root: a non-static non-global ident is a
+                         * local (mirrors checker.c:10186 promotion in the return
+                         * escape walker). */
+                        bool sym_is_global = scope_lookup_local(c->global_scope,
+                            val_sym->name, val_sym->name_len) != NULL;
+                        if (!val_sym->is_static && !sym_is_global) val_is_local = true;
+                    }
+                }
+                if (val_sym && val_is_local) {
                     Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                     classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
                     if (tgt_global || tgt_param) {
@@ -5106,10 +5222,24 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (ld_count < ld_cap) ld_nodes[ld_count++] = ld_walk;
                             }
                             for (int ldi = 0; ldi < ld_count; ldi++) {
-                                if (ld_nodes[ldi]->kind != NODE_IDENT) continue;
+                                Node *iarg = ld_nodes[ldi];
+                                /* BUG-751: descend NODE_SLICE so `store(local[0..])`
+                                 * for a `keep` slice param is rejected (slice borrows
+                                 * stack storage that doesn't outlive the call's keep
+                                 * guarantee). Mirrors BUG-748 in the assignment path. */
+                                bool ld_via_slice = false;
+                                while (iarg && (iarg->kind == NODE_SLICE ||
+                                                iarg->kind == NODE_FIELD ||
+                                                iarg->kind == NODE_INDEX)) {
+                                    if (iarg->kind == NODE_SLICE) {
+                                        ld_via_slice = true; iarg = iarg->slice.object;
+                                    } else if (iarg->kind == NODE_FIELD) iarg = iarg->field.object;
+                                    else iarg = iarg->index_expr.object;
+                                }
+                                if (!iarg || iarg->kind != NODE_IDENT) continue;
                                 Symbol *arg_sym = scope_lookup(c->current_scope,
-                                    ld_nodes[ldi]->ident.name,
-                                    (uint32_t)ld_nodes[ldi]->ident.name_len);
+                                    iarg->ident.name,
+                                    (uint32_t)iarg->ident.name_len);
                                 if (arg_sym && arg_sym->is_local_derived) {
                                     checker_error(c, node->loc.line,
                                         "argument %d: local-derived pointer '%.*s' cannot "
@@ -5121,6 +5251,19 @@ static Type *check_expr(Checker *c, Node *node) {
                                         "argument %d: arena-derived pointer '%.*s' cannot "
                                         "satisfy 'keep' parameter — arena memory may be reset",
                                         i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                }
+                                /* Slice-borrow case (BUG-751): the IDENT may not carry
+                                 * is_local_derived (a local ARRAY ident is plain), but
+                                 * `local[0..]` still borrows stack memory. */
+                                if (ld_via_slice && arg_sym && !arg_sym->is_static) {
+                                    bool sym_is_global = scope_lookup_local(c->global_scope,
+                                        arg_sym->name, arg_sym->name_len) != NULL;
+                                    if (!sym_is_global && !arg_sym->is_local_derived) {
+                                        checker_error(c, node->loc.line,
+                                            "argument %d: slice borrowing local '%.*s' cannot "
+                                            "satisfy 'keep' parameter — stack memory is freed when function returns",
+                                            i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                    }
                                 }
                             }
                         }
@@ -6457,6 +6600,26 @@ static Type *check_expr(Checker *c, Node *node) {
                                             type_name(val_type), type_name(result));
                                     }
                                 }
+                                /* Audit 2026-06-11: BUG-735 only covered the
+                                 * concrete struct ↔ struct case (both inner aggregate).
+                                 * `@ptrcast(*B, **A)` falls through because the source
+                                 * inner is TYPE_POINTER, not aggregate — but the cast
+                                 * is still confusion (pointer-to-pointer reinterpret).
+                                 * Reject unless either side is *opaque, or the two
+                                 * inners structurally type_equals. */
+                                if (g1_s_agg != g1_t_agg) {
+                                    /* one is *T, other is *struct — only safe if T is
+                                     * opaque (the documented round-trip). */
+                                    bool src_opq = (g1_sk == TYPE_OPAQUE);
+                                    bool dst_opq = (g1_tk == TYPE_OPAQUE);
+                                    if (!src_opq && !dst_opq) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast between unrelated pointer types is type "
+                                            "confusion ('%s' source) — use @pun(%s, ...) for an "
+                                            "explicit runtime-checked pun, or cast through *opaque",
+                                            type_name(val_type), type_name(result));
+                                    }
+                                }
                             }
                         }
                     }
@@ -7214,6 +7377,12 @@ static Type *check_expr(Checker *c, Node *node) {
                    (nlen == 15 && memcmp(name, "cpu_restore_fpu", 15) == 0)) {
             /* D-Alpha-4: context switch state save/restore (1-arg: buffer pointer).
              * Buffer must be u8[N] of sufficient size (128+ for CPU, 512+ aligned for FPU). */
+            bool is_fpu = (nlen >= 4 && memcmp(name + nlen - 4, "_fpu", 4) == 0);
+            /* Worst-case lower bounds across supported archs:
+             *   CPU context (callee-saved GPRs): x86-64 needs 5*8=40, ARM64 10*8=80,
+             *     RISC-V 12*8=96. Reserve 128 for headroom + future use.
+             *   FPU context (legacy fxsave): 512 bytes, 16-byte aligned. */
+            uint64_t min_size = is_fpu ? 512 : 128;
             if (node->intrinsic.arg_count != 1) {
                 checker_error(c, node->loc.line, "@%.*s requires 1 argument (buffer pointer)", (int)nlen, name);
             } else {
@@ -7230,8 +7399,44 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     if (!is_ptr_to_u8) {
                         checker_error(c, node->loc.line,
-                            "@%.*s argument must be a u8 buffer (e.g., u8[128] buf; @%.*s(&buf[0]))",
-                            (int)nlen, name, (int)nlen, name);
+                            "@%.*s argument must be a u8 buffer (e.g., u8[%llu] buf; @%.*s(&buf[0]))",
+                            (int)nlen, name, (unsigned long long)min_size, (int)nlen, name);
+                    }
+                    /* Audit 2026-06-11: undersized u8[N] buffer = silent stack
+                     * overflow on every supported arch. When the argument is
+                     * `&arr[0]` of a u8[N] with N < min_size, reject. Also
+                     * when the param expression itself has a known array type. */
+                    Type *known_arr = NULL;
+                    if (eff->kind == TYPE_ARRAY) {
+                        known_arr = eff;
+                    } else {
+                        /* Walk &expr / arr[0..].ptr / &arr[0] patterns to find the
+                         * underlying array. */
+                        Node *src = node->intrinsic.args[0];
+                        if (src && src->kind == NODE_UNARY && src->unary.op == TOK_AMP) {
+                            Node *inner_node = src->unary.operand;
+                            if (inner_node && inner_node->kind == NODE_INDEX) {
+                                Type *obj_t = typemap_get(c, inner_node->index_expr.object);
+                                if (obj_t) {
+                                    Type *oe = type_unwrap_distinct(obj_t);
+                                    if (oe->kind == TYPE_ARRAY) known_arr = oe;
+                                }
+                            } else if (inner_node && inner_node->kind == NODE_IDENT) {
+                                Type *t = typemap_get(c, inner_node);
+                                if (t) {
+                                    Type *ie = type_unwrap_distinct(t);
+                                    if (ie->kind == TYPE_ARRAY) known_arr = ie;
+                                }
+                            }
+                        }
+                    }
+                    if (known_arr && known_arr->array.size > 0 &&
+                        (uint64_t)known_arr->array.size < min_size) {
+                        checker_error(c, node->loc.line,
+                            "@%.*s buffer too small: u8[%llu] given, %llu+ required (worst-case across x86_64/aarch64/riscv64)",
+                            (int)nlen, name,
+                            (unsigned long long)known_arr->array.size,
+                            (unsigned long long)min_size);
                     }
                 }
             }
@@ -8516,12 +8721,17 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
         /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
-         * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR). */
-        if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
-            checker_error(c, node->loc.line,
-                "non-null pointer '*%s' requires an initializer — "
-                "use '?*%s' for nullable pointers",
-                type_name(type->pointer.inner), type_name(type->pointer.inner));
+         * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR).
+         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT so `distinct typedef *u32 P; P p;`
+         * is caught — sibling funcptr check below already unwraps. */
+        if (!node->var_decl.init && type) {
+            Type *teff = type_unwrap_distinct(type);
+            if (teff && teff->kind == TYPE_POINTER) {
+                checker_error(c, node->loc.line,
+                    "non-null pointer '*%s' requires an initializer — "
+                    "use '?*%s' for nullable pointers",
+                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
+            }
         }
         /* Function pointer without initializer — auto-zero creates NULL funcptr.
          * Calling it would segfault. Require init or use ?FuncPtr for nullable. */
@@ -10173,11 +10383,23 @@ static void check_stmt(Checker *c, Node *node) {
                      * value cannot leak a stack reference, so gate this
                      * escape check on whether the return TYPE could carry
                      * a pointer. Without this gate, `return s.len` (usize)
-                     * is rejected as a false positive. */
+                     * is rejected as a false positive.
+                     *
+                     * NODE_SLICE: also descend through `arr[a..b]` shaped
+                     * borrows. The assignment-time path at NODE_VAR_DECL
+                     * uses the same NODE_SLICE→object descent (see
+                     * checker.c:8979) to set is_local_derived on the
+                     * destination, but a direct `return arr[0..]` never
+                     * binds an intermediate — so we need to detect the
+                     * slice-of-local at return time directly. */
                     Node *orig_root = root;
-                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                    bool sliced_borrow = false;
+                    while (root && (root->kind == NODE_FIELD ||
+                                    root->kind == NODE_INDEX ||
+                                    root->kind == NODE_SLICE)) {
                         if (root->kind == NODE_FIELD) root = root->field.object;
-                        else root = root->index_expr.object;
+                        else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                        else { sliced_borrow = true; root = root->slice.object; }
                     }
                     bool projected = (root != orig_root);
                     if (root && root->kind == NODE_IDENT) {
@@ -10189,6 +10411,23 @@ static void check_stmt(Checker *c, Node *node) {
                              * Only RegStatic pointers can escape the current scope. */
                             int region = zer_sym_region_tag(sym->is_local_derived,
                                                               sym->is_arena_derived);
+                            /* Slice-borrow case: `arr[a..b]` (or any chain
+                             * ending in NODE_SLICE) borrows the root's
+                             * storage as a {ptr, len} pair that outlives
+                             * nothing. The root may not carry the
+                             * is_local_derived bit (local array → STATIC
+                             * tag; local struct with array field → STATIC
+                             * tag) — promote to LOCAL whenever the root
+                             * symbol is itself a non-static non-global
+                             * binding. Covers `return arr[0..]` AND
+                             * `return s.f[0..]` (field-of-local-struct). */
+                            if (sliced_borrow && region == ZER_REGION_STATIC) {
+                                bool is_global = scope_lookup_local(c->global_scope,
+                                    sym->name, sym->name_len) != NULL;
+                                if (!sym->is_static && !is_global) {
+                                    region = ZER_REGION_LOCAL;
+                                }
+                            }
                             if (zer_region_can_escape(region) == 0) {
                                 if (zer_region_is_arena(region) != 0) {
                                     checker_error(c, node->loc.line,
@@ -12099,12 +12338,17 @@ static void register_decl(Checker *c, Node *node) {
                     (int)node->var_decl.name_len, node->var_decl.name);
             }
         }
-        /* BUG-253: non-null pointer (*T) requires initializer at global scope too */
-        if (!node->var_decl.init && type && type->kind == TYPE_POINTER) {
-            checker_error(c, node->loc.line,
-                "non-null pointer '*%s' requires an initializer — "
-                "use '?*%s' for nullable pointers",
-                type_name(type->pointer.inner), type_name(type->pointer.inner));
+        /* BUG-253: non-null pointer (*T) requires initializer at global scope too.
+         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT to catch
+         * `distinct typedef *u32 P; P g;` at global scope. */
+        if (!node->var_decl.init && type) {
+            Type *teff = type_unwrap_distinct(type);
+            if (teff && teff->kind == TYPE_POINTER) {
+                checker_error(c, node->loc.line,
+                    "non-null pointer '*%s' requires an initializer — "
+                    "use '?*%s' for nullable pointers",
+                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
+            }
         }
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,

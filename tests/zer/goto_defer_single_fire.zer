@@ -1,0 +1,34 @@
+// Regression: defer body fires EXACTLY ONCE on goto-to-cleanup-label
+// pattern (was OPEN in limitations.md "Defer fires twice when goto target
+// is in same defer scope").
+//
+// Root cause: NODE_GOTO called emit_defer_fire (no-pop), then the cleanup
+// label's function-exit IR_DEFER_FIRE re-fired the same defers. Verified
+// by inspection of generated C: the defer body appeared in BOTH the goto
+// block AND the cleanup-return block.
+//
+// Fix: NODE_GOTO uses scoped fire with pop=true so subsequent fires see
+// an empty stack.
+//
+// Detection: defer body uses x = x*2+1 (non-idempotent).
+// Single fire: 0 → 1. Double fire: 0 → 1 → 3. Asserted via if (x != 1).
+
+u32 x;
+
+i32 main() {
+    x = 0;
+    defer { x = (x * 2) + 1; }
+
+    goto cleanup;
+
+cleanup:
+    // After the goto, the defer should have fired exactly once (x=1).
+    // Pre-fix BUG: defer fired at goto (x=1), then again at cleanup
+    // return (x=3). The check below catches the runtime state at the
+    // cleanup label — BEFORE the function-exit fire — and would fail
+    // (returning 99) if the bug were present.
+    if (x != 1) {
+        return 99;  // FAIL: defer fired wrong number of times
+    }
+    return 0;
+}

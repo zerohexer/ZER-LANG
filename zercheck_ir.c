@@ -1838,6 +1838,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         (int)func->locals[root_local].name_len,
                         func->locals[root_local].name, h->free_line);
             }
+            /* AUDIT 2026-06-12: also reject spawn arg that's already FREED /
+             * MAYBE_FREED. Pre-fix the TRANSFERRED overwrite at line 1897
+             * silently masked a real use-after-free — `*T t = alloc_ptr();
+             * free_ptr(t); spawn worker(t);` compiled clean and the spawned
+             * thread read dangling slab memory. Mirror the TRANSFERRED check
+             * shape; the same `urs_has` dedup isn't needed since spawn-arg is
+             * a single use site per loop iteration. */
+            if (h && (h->state == IR_HS_FREED ||
+                      h->state == IR_HS_MAYBE_FREED) &&
+                root_local < func->local_count) {
+                if (path_len == 0)
+                    ir_zc_error(zc, inst->source_line,
+                        "use after free: '%.*s' is %s (freed at line %d) — "
+                        "spawned thread would read dangling memory",
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name,
+                        ir_state_name(h->state), h->free_line);
+                else
+                    ir_zc_error(zc, inst->source_line,
+                        "use after free: compound '%.*s' on local '%.*s' is %s "
+                        "(freed at line %d) — spawned thread would read "
+                        "dangling memory",
+                        (int)path_len, path,
+                        (int)func->locals[root_local].name_len,
+                        func->locals[root_local].name,
+                        ir_state_name(h->state), h->free_line);
+            }
             if (!h && root_local < func->local_count) {
                 /* Auto-register move-struct args (bare or compound) so
                  * TRANSFERRED can be observed. For compound paths, walk
@@ -3359,10 +3386,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         if (arg_h) {
                             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                             if (dh) {
+                                /* Audit 2026-06-11: raw field copy missed
+                                 * pool_name + escaped + is_thread_handle, so
+                                 * wrong-pool detection silently bypassed when
+                                 * the handle round-tripped through a passthrough
+                                 * function. Use ir_apply_alias to copy ALL
+                                 * tracked state — same shape as IR_COPY at 2758. */
+                                IRAliasSnapshot snap;
+                                ir_snapshot_alias(&snap, arg_h);
+                                ir_apply_alias(dh, &snap);
                                 dh->state = arg_h->state;
-                                dh->alloc_line = arg_h->alloc_line;
-                                dh->alloc_id = arg_h->alloc_id;
-                                dh->source_color = arg_h->source_color;
                                 dest_aliased_from_param = true;
                             }
                         }

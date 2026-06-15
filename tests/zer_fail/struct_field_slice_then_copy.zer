@@ -1,0 +1,20 @@
+// Regression: `tmp.ref = local[0..]` followed by `g = tmp` must reject.
+// The struct LITERAL form (`Holder tmp = { .ref = local[0..] };`) was caught
+// by BUG-732, but the assignment-then-field-store laundering shape leaked
+// because the field assignment didn't propagate is_local_derived to the
+// root struct symbol.
+struct Holder { [*]u32 ref; }
+Holder g;
+
+void leak() {
+    u32[4] local;
+    local[0] = 42;
+    Holder tmp;
+    tmp.ref = local[0..];
+    g = tmp;
+}
+
+u32 main() {
+    leak();
+    return g.ref[0];
+}

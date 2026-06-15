@@ -1,0 +1,13 @@
+// Regression: `bool g = (bool)N` for N>1 in global initializer emitted
+// `(uint8_t)(N)` instead of `(uint8_t)!!(N)`. Multiple non-zero values
+// stored as their raw value, so `(bool)5 != (bool)10` was true.
+bool g_b1 = (bool)5;
+bool g_b2 = (bool)10;
+bool g_b3 = (bool)0;
+
+i32 main() {
+    if (g_b1 != g_b2) { return 1; }
+    if (g_b1 != true) { return 2; }
+    if (g_b3 != false) { return 3; }
+    return 0;
+}

@@ -1,0 +1,33 @@
+# Build the ZER compiler frontend as a WebAssembly module (zer.js + zer.wasm).
+# This replaces the native zer-lsp.exe / zerc.exe in the spawn path: node loads
+# the .wasm (a data file), so there is no unsigned native PE for Defender to flag.
+FROM emscripten/emsdk:3.1.74
+
+WORKDIR /zer
+
+COPY *.c *.h ./
+COPY src/ src/
+COPY win-resources/ win-resources/
+
+# Phase 1 verified-predicate sources (same set linked into native zerc).
+ENV SAFETY_SRCS="src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c src/safety/escape_rules.c src/safety/provenance_rules.c src/safety/mmio_rules.c src/safety/optional_rules.c src/safety/move_rules.c src/safety/atomic_rules.c src/safety/container_rules.c src/safety/misc_rules.c src/safety/isr_rules.c src/safety/arith_rules.c src/safety/variant_rules.c src/safety/stack_rules.c src/safety/comptime_rules.c src/safety/cast_rules.c src/safety/concurrency_rules.c src/safety/asm_categories.c src/safety/asm_register_lookup.c src/safety/asm_register_tables_x86_64.c src/safety/asm_register_tables_x86_64_avx512f.c src/safety/asm_register_tables_aarch64.c src/safety/asm_register_tables_riscv64.c src/safety/asm_instruction_table_x86_64.c src/safety/asm_instruction_table_aarch64.c src/safety/asm_instruction_table_riscv64.c"
+
+RUN mkdir -p /out && emcc -O2 -I. \
+    zer_wasm.c \
+    lexer.c parser.c ast.c types.c checker.c emitter.c \
+    zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS \
+    -sEXPORTED_FUNCTIONS=_zer_diagnostics_json,_zer_emit_c,_zer_free,_zer_version,_malloc,_free \
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
+    -sMODULARIZE=1 -sEXPORT_NAME=ZerModule \
+    -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=node -sNO_DISABLE_EXCEPTION_CATCHING \
+    --no-entry \
+    -o /out/zer.js
+
+# Smoke test inside the build (node ships with emsdk image).
+COPY win-resources/wasm-smoke.js /zer/wasm-smoke.js
+RUN cp /out/zer.js /out/zer.wasm /zer/ && node /zer/wasm-smoke.js
+
+# LSP server end-to-end test: drive server.js through a real LSP handshake.
+COPY editors/vscode/lsp/ /zer/lsp/
+COPY win-resources/lsp-client-test.js /zer/lsp/lsp-client-test.js
+RUN cp /out/zer.js /out/zer.wasm /zer/lsp/ && node /zer/lsp/lsp-client-test.js /zer/lsp/server.js

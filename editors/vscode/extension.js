@@ -42,18 +42,13 @@ function activate(context) {
     // macOS: compile from source on first activation
     ensureMacOSBuild(context);
 
-    // LSP: use bundled zer-lsp if available, else config/PATH
-    let lspPath = config.get('lspPath', '');
-    if (!lspPath) {
-        const lspName = process.platform === 'win32' ? 'zer-lsp.exe' : 'zer-lsp';
-        lspPath = findBundled(context, lspName);
-    }
-
     // --- PATH resolution: check what `where zerc` resolves to BEFORE we inject ---
     const platDir = path.join(context.extensionPath, 'bin', getPlatformDir());
     const sep = process.platform === 'win32' ? ';' : ':';
-    const exeExt = process.platform === 'win32' ? '.exe' : '';
-    const bundledZercPath = path.join(platDir, 'zerc' + exeExt);
+    // Windows ships a `zerc.cmd` shim (bundled signed node + zer.wasm + gcc);
+    // other platforms ship a native `zerc`.
+    const zercCmdName = process.platform === 'win32' ? 'zerc.cmd' : 'zerc';
+    const bundledZercPath = path.join(platDir, zercCmdName);
     const gccBinDir = process.platform === 'win32' ? path.join(platDir, 'gcc', 'bin') : null;
 
     const pathsEqual = (a, b) =>
@@ -140,10 +135,17 @@ function activate(context) {
 
     const args = config.get('lspArgs', []);
 
+    // WASM language server (lsp/server.js + zer.wasm). VS Code spawns its own
+    // Node (Electron-as-node, Microsoft-signed) and loads zer.wasm as a data
+    // file — there is no unsigned native binary in the spawn path, so Windows
+    // Defender has nothing to flag. No native fallback (by design).
+    const wasmServer = path.join(context.extensionPath, 'lsp', 'server.js');
+
     const serverOptions = {
-        command: lspPath,
-        args: args,
-        transport: TransportKind.stdio
+        command: process.execPath, // VS Code's Electron, run as plain Node
+        args: [wasmServer, ...args],
+        transport: TransportKind.stdio,
+        options: { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } }
     };
 
     const clientOptions = {
@@ -176,7 +178,7 @@ function activate(context) {
     context.subscriptions.push(refCmd);
 
     // Status message
-    const zercName = process.platform === 'win32' ? 'zerc.exe' : 'zerc';
+    const zercName = process.platform === 'win32' ? 'zerc.cmd' : 'zerc';
     const bundledZerc = path.join(platDir, zercName);
     if (fs.existsSync(bundledZerc)) {
         vscode.window.setStatusBarMessage('ZER: ready (bundled compiler)', 5000);

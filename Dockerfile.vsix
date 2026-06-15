@@ -1,73 +1,93 @@
+# ============================================================================
+# Stage 1 — build the ZER compiler as WebAssembly (zer.js + zer.wasm)
+# This is the toolchain frontend for BOTH the LSP and the `zerc` CLI. Shipping
+# it as wasm (loaded by node) instead of an unsigned native .exe is what removes
+# the Defender `Wacatac.B!ml` false positive — there is no unsigned PE to flag.
+# ============================================================================
+FROM emscripten/emsdk:3.1.74 AS wasm
+WORKDIR /zer
+COPY *.c *.h ./
+COPY src/ src/
+ENV SAFETY_SRCS="src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c src/safety/escape_rules.c src/safety/provenance_rules.c src/safety/mmio_rules.c src/safety/optional_rules.c src/safety/move_rules.c src/safety/atomic_rules.c src/safety/container_rules.c src/safety/misc_rules.c src/safety/isr_rules.c src/safety/arith_rules.c src/safety/variant_rules.c src/safety/stack_rules.c src/safety/comptime_rules.c src/safety/cast_rules.c src/safety/concurrency_rules.c src/safety/asm_categories.c src/safety/asm_register_lookup.c src/safety/asm_register_tables_x86_64.c src/safety/asm_register_tables_x86_64_avx512f.c src/safety/asm_register_tables_aarch64.c src/safety/asm_register_tables_riscv64.c src/safety/asm_instruction_table_x86_64.c src/safety/asm_instruction_table_aarch64.c src/safety/asm_instruction_table_riscv64.c"
+RUN emcc -O2 -I. \
+    zer_wasm.c \
+    lexer.c parser.c ast.c types.c checker.c emitter.c \
+    zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS \
+    -sEXPORTED_FUNCTIONS=_zer_diagnostics_json,_zer_emit_c,_zer_free,_zer_version,_malloc,_free \
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
+    -sMODULARIZE=1 -sEXPORT_NAME=ZerModule \
+    -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=node \
+    --no-entry \
+    -o /zer/zer.js
+
+# ============================================================================
+# Stage 2 — assemble and package the VSIX
+# ============================================================================
 FROM gcc:13
 
-# Install mingw (Windows), osxcross deps (macOS), Node.js, vsce, 7zip, rsvg
+# Node.js (host build tooling: vsce), 7zip, rsvg
 RUN apt-get update -qq && \
     apt-get install -y -qq \
-    gcc-mingw-w64-x86-64-posix \
     p7zip-full curl librsvg2-bin \
-    clang cmake libssl-dev libxml2-dev lzma-dev libbz2-dev zlib1g-dev \
-    gcc-aarch64-linux-gnu \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y -qq nodejs \
     && npm install -g @vscode/vsce \
     && rm -rf /var/lib/apt/lists/*
 
-# Download portable MinGW GCC for Windows
+# Portable MinGW GCC for Windows (the only native compiler binary we ship — it
+# is widely distributed and carries download reputation, so it is not flagged).
 RUN curl -fsSL "https://github.com/skeeto/w64devkit/releases/download/v2.6.0/w64devkit-x64-2.6.0.7z.exe" \
     -o /tmp/w64devkit.7z && \
     cd /tmp && 7z x -y w64devkit.7z > /dev/null && \
     rm /tmp/w64devkit.7z
 
-WORKDIR /zer
+# Official, OpenJS-Foundation-SIGNED node.exe for the Windows `zerc` terminal
+# shim. Signed + reputable => not Wacatac-flagged (unlike an unsigned mingw PE).
+RUN curl -fsSL "https://nodejs.org/dist/v20.18.1/node-v20.18.1-win-x64.zip" -o /tmp/node.zip && \
+    7z e /tmp/node.zip -o/tmp/nodewin "node-v20.18.1-win-x64/node.exe" -y > /dev/null && \
+    rm /tmp/node.zip
 
-# Copy compiler sources
+WORKDIR /zer
 COPY *.c *.h Makefile ./
 COPY src/ src/
-COPY test_modules/ test_modules/
 
-# Copy extension sources
+# Extension sources (includes lsp/server.js, lsp/zerc-cli.js, win-shims/zerc.cmd)
 COPY editors/vscode/ /ext/
 
-# Create platform bin directories
-RUN mkdir -p /ext/bin/win32-x64 /ext/bin/linux-x64 /ext/bin/darwin-x64 /ext/bin/darwin-arm64
+RUN mkdir -p /ext/bin/win32-x64 /ext/bin/linux-x64 /ext/lsp
 
-# Phase 1 verified-predicate sources (extracted to src/safety/, linked into zerc)
 ENV SAFETY_SRCS="src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c src/safety/escape_rules.c src/safety/provenance_rules.c src/safety/mmio_rules.c src/safety/optional_rules.c src/safety/move_rules.c src/safety/atomic_rules.c src/safety/container_rules.c src/safety/misc_rules.c src/safety/isr_rules.c src/safety/arith_rules.c src/safety/variant_rules.c src/safety/stack_rules.c src/safety/comptime_rules.c src/safety/cast_rules.c src/safety/concurrency_rules.c src/safety/asm_categories.c src/safety/asm_register_lookup.c src/safety/asm_register_tables_x86_64.c src/safety/asm_register_tables_x86_64_avx512f.c src/safety/asm_register_tables_aarch64.c src/safety/asm_register_tables_riscv64.c src/safety/asm_instruction_table_x86_64.c src/safety/asm_instruction_table_aarch64.c src/safety/asm_instruction_table_riscv64.c"
 
-# ---- Windows x64 ----
-RUN x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zerc.exe \
-    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c $SAFETY_SRCS && \
-    x86_64-w64-mingw32-gcc -std=c99 -O2 -I. -o /ext/bin/win32-x64/zer-lsp.exe \
-    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS
+# ---- WASM compiler: the LSP + CLI frontend (platform-independent) ----
+COPY --from=wasm /zer/zer.js  /ext/lsp/zer.js
+COPY --from=wasm /zer/zer.wasm /ext/lsp/zer.wasm
 
-# Bundle portable GCC for Windows
-RUN cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
+# ---- Windows: signed node.exe + terminal shim (NO native zerc/zer-lsp) ----
+RUN cp /tmp/nodewin/node.exe /ext/bin/win32-x64/node.exe && \
+    cp /ext/win-shims/zerc.cmd /ext/bin/win32-x64/zerc.cmd && \
+    cp -r /tmp/w64devkit /ext/bin/win32-x64/gcc && \
     rm -rf /ext/bin/win32-x64/gcc/share /ext/bin/win32-x64/gcc/src
 
-# ---- Linux x64 (native gcc:13) ----
+# ---- Linux x64: native zerc CLI (no Defender; LSP is still wasm) ----
 RUN gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zerc \
-    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c $SAFETY_SRCS && \
-    gcc -std=c99 -O2 -I. -static -o /ext/bin/linux-x64/zer-lsp \
-    zer_lsp.c lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS
-# Linux users have gcc installed — no need to bundle
+    lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c $SAFETY_SRCS
 
-# ---- macOS x64 + arm64 ----
-# macOS cross-compilation requires osxcross + macOS SDK (legal gray area).
-# Instead: build as C source bundle — macOS users compile on first run.
-RUN cp lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zercheck_ir.c ir.c ir_lower.c zerc_main.c zer_lsp.c \
-       lexer.h parser.h ast.h types.h checker.h emitter.h zercheck.h ir.h \
-       /ext/bin/darwin-x64/ && \
-    mkdir -p /ext/bin/darwin-x64/src/safety && \
-    cp src/safety/*.c src/safety/*.h /ext/bin/darwin-x64/src/safety/ && \
-    cp -r /ext/bin/darwin-x64/. /ext/bin/darwin-arm64/ 2>/dev/null; true && \
-    echo '#!/bin/bash' > /ext/bin/darwin-x64/build.sh && \
-    echo 'DIR="$(cd "$(dirname "$0")" && pwd)"' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'SAFE="$DIR/src/safety/handle_state.c $DIR/src/safety/range_checks.c $DIR/src/safety/type_kind.c $DIR/src/safety/coerce_rules.c $DIR/src/safety/context_bans.c $DIR/src/safety/escape_rules.c $DIR/src/safety/provenance_rules.c $DIR/src/safety/mmio_rules.c $DIR/src/safety/optional_rules.c $DIR/src/safety/move_rules.c $DIR/src/safety/atomic_rules.c $DIR/src/safety/container_rules.c $DIR/src/safety/misc_rules.c $DIR/src/safety/isr_rules.c $DIR/src/safety/arith_rules.c $DIR/src/safety/variant_rules.c $DIR/src/safety/stack_rules.c $DIR/src/safety/comptime_rules.c $DIR/src/safety/cast_rules.c $DIR/src/safety/concurrency_rules.c $DIR/src/safety/asm_categories.c $DIR/src/safety/asm_register_lookup.c $DIR/src/safety/asm_register_tables_x86_64.c $DIR/src/safety/asm_register_tables_x86_64_avx512f.c $DIR/src/safety/asm_register_tables_aarch64.c $DIR/src/safety/asm_register_tables_riscv64.c $DIR/src/safety/asm_instruction_table_x86_64.c $DIR/src/safety/asm_instruction_table_aarch64.c $DIR/src/safety/asm_instruction_table_riscv64.c"' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zerc" "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/zercheck_ir.c "$DIR"/ir.c "$DIR"/ir_lower.c "$DIR"/zerc_main.c $SAFE' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'cc -std=c99 -O2 -I"$DIR" -o "$DIR/zer-lsp" "$DIR"/zer_lsp.c "$DIR"/lexer.c "$DIR"/parser.c "$DIR"/ast.c "$DIR"/types.c "$DIR"/checker.c "$DIR"/emitter.c "$DIR"/zercheck.c "$DIR"/zercheck_ir.c "$DIR"/ir.c "$DIR"/ir_lower.c $SAFE' >> /ext/bin/darwin-x64/build.sh && \
-    echo 'echo "ZER: compiled zerc and zer-lsp for macOS"' >> /ext/bin/darwin-x64/build.sh && \
-    chmod +x /ext/bin/darwin-x64/build.sh && \
-    cp /ext/bin/darwin-x64/build.sh /ext/bin/darwin-arm64/build.sh
+# Verify the wasm LSP server starts and produces diagnostics before packaging.
+COPY win-resources/lsp-client-test.js /ext/lsp/lsp-client-test.js
+RUN node /ext/lsp/lsp-client-test.js /ext/lsp/server.js && rm /ext/lsp/lsp-client-test.js
+
+# Verify the wasm zerc CLI end-to-end: emit (track_cptrs on for --run, so the
+# __wrap_malloc Level-5 interception is present + linkable) -> gcc -> run.
+RUN printf 'i32 printf(const *u8 fmt, ...);\ni32 main(){ printf("cli ok\\n"); return 0; }\n' > /tmp/cli.zer && \
+    node /ext/lsp/zerc-cli.js /tmp/cli.zer --run | grep -q "cli ok" && \
+    echo "ZERC CLI e2e OK" && rm -f /tmp/cli.zer /tmp/cli
+
+# The wasm CLI MUST reject unsafe code via zercheck_ir (sole safety driver),
+# exactly as native zerc does — guards against the analyzer silently not running.
+RUN printf 'struct Task { u32 id; }\nPool(Task, 4) pool;\nu32 main(){ Handle(Task) h = pool.alloc() orelse return; pool.free(h); pool.free(h); return 0; }\n' > /tmp/df.zer && \
+    if node /ext/lsp/zerc-cli.js /tmp/df.zer --run > /dev/null 2>&1; then \
+        echo "FAIL: wasm CLI compiled a double-free (zercheck_ir not gating)"; exit 1; \
+    else echo "ZERC CLI rejects double-free (zercheck_ir) OK"; fi && rm -f /tmp/df.zer
 
 # Convert SVG icon to PNG for marketplace
 RUN rsvg-convert -w 128 -h 128 /ext/icon.svg -o /ext/icon.png

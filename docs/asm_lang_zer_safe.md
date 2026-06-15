@@ -1,3 +1,3407 @@
+# ZER-Asm Safety — Effect-Row Composition (READ FIRST, supersedes Option E where they conflict)
+
+**Status:** Architectural refinement. Direction LOCKED. Implementation PENDING. This document
+refines `docs/asm_lang_zer_safe.md` §1.7 (Option E, locked 2026-06-06); where this design and
+Option E conflict, this design supersedes. Nothing here is shipped yet. The step-by-step
+execution order lives in `docs/option_e_plan.md` (Phase 1 = table deletion) and in §"IMPLEMENTATION
+PLAN" of the longer companion sections of this document. Treat every `@bind` / `compose` / `leaf`
+surface syntax below as **(illustrative — proposed surface, not yet shipped)**.
+
+---
+
+## Thesis (one paragraph)
+
+Asm safety in ZER reduces to: a small, audited set of **leaves** (the only place raw-asm
+primitives appear, the only gated unit), plus a **closed set of fold rules** that derive a
+composed operation's safety properties from its children. Authors recombine leaves into new
+operations (`compose`) with NO assembly and NO compiler release; the composed-binding grammar
+literally has no mnemonic production, so freeform asm cannot appear in a composition — the same
+shape of structural gate ZER already uses for `@inttoptr` (no typed pointer except through that
+witness). Safety categories are modeled as composable **effect rows** (ERBT — Effect-Row Binding
+Types); the checker folds and infers them. The core theorem: **safe leaves + sound fold ⇒
+everything composed above the leaf line is safe.** Composition cannot manufacture a violation,
+but it also cannot fix a lying leaf — safety is *relative to* leaf correctness, so the floor
+concentrates into the finite leaf set. This collapses asm safety from Option E's O(bindings)
+distributed-prose checklists to O(leaves) + an O(1) fold proof — the same closure shape ZER
+already uses for memory safety (closure over allocation primitives), type safety (over conversion
+intrinsics), and concurrency (over sync primitives).
+
+---
+
+## The whole design in 12 bullets
+
+1. **LEVEL 0** — plain ZER arithmetic (`+`, `&`, `<<`) emits C, GCC compiles it. NOT a leaf and
+   not asm; already fully safe (overflow wraps, shift-by-≥width = 0). The lowest primitive everything
+   else sits above.
+2. **TIER A LEAF** — a GCC builtin (`__builtin_add_overflow`, `__atomic_*`, `__builtin_clz/ctz/popcount`,
+   `__builtin_bswap`). NO raw asm. The effect row is DERIVED from the builtin's documented contract
+   (one audited table, one time). GCC selects the real instruction and handles sub-architecture via
+   `-march`. Structural, portable, zero-per-ISA. Objective Tier-A boundary: **it compiles under
+   `-ffreestanding`** (verified: clz / add_overflow / bswap do; `__rdmsr` does not). ~95% of ops by
+   count (computational / ALU / atomic / bit).
+3. **TIER B LEAF** — raw asm (real mnemonic), the ONLY place raw asm appears. ONLY for ops *outside*
+   C's abstract machine for which GCC has no portable builtin: control-state writes (CR0/3/4, RDMSR/
+   WRMSR, XSETBV), I/O ports (IN/OUT), privilege transitions (SYSCALL/SYSRET, IRET, ECALL, SVC),
+   inspection/cache/TLB (CPUID, RDTSC, INVLPG, WBINVD). ~36 ops, per-ISA. These CONFIGURE the machine
+   (privilege, page tables, MSRs, ports, interrupt flag — concepts C has no model for) so no portable
+   builtin is possible. Effect row is WITNESSED (where decidable) or DECLARED + TAINTED.
+4. **The one test** that splits Tier A from Tier B: *is the operation a value-computation inside C's
+   abstract machine, or does it CONFIGURE the machine?* Value-computation → builtin (Tier A);
+   machine-configuration → raw-asm leaf (Tier B).
+5. **LEAF** — the audited primitive unit. Small and per-ISA. The only construct that may contain
+   Tier-B raw asm and the only construct the gate fences. Everything else is composition.
+6. **COMPOSITION (the flexible layer)** — authors write `compose` operations that recombine leaves and
+   ops. No asm, no core release. The composed-binding grammar has **no mnemonic production** (the
+   `@inttoptr`-shaped structural gate). The composed op's effect row is DERIVED by closed FOLD RULES
+   over its children. An author MAY state an EXPECTED row; declared-vs-derived mismatch = COMPILE ERROR.
+7. **ERBT (Effect-Row Binding Types)** — Option E's categories re-expressed as composable ROWS that the
+   checker folds and infers. The type-theoretic backbone of composition; one-time maintenance;
+   structural compile-gate.
+8. **FOLD SOUNDNESS** — `clobbers_register` / `clobbers_flags` fold by UNION/OR (sound);
+   `requires_aligned(n)` folds by MAX (sound). Ordering / `memory_barrier` does NOT fold soundly:
+   max-ordering-of-children is UNSOUND. ZER already proved this — Phase 3 in-block ordering enforcement
+   was ABANDONED because it false-positived the canonical libpmem CLWB+SFENCE idiom (CLAUDE.md:1295-1296).
+   So **positional `memory_barrier` is EXCLUDED from the fold vocabulary; ordering stays value-intrinsic
+   only.**
+9. **CLOSURE ARGUMENT (the core theorem)** — safe leaves + sound fold ⇒ everything composed above the
+   leaf line is safe. Composition safety ALONE is not sufficient: a sound fold faithfully *propagates*
+   a lying leaf. Safety is relative to leaf correctness; the floor concentrates into the leaf set.
+10. **CONFORMANCE WITNESS** — the toolchain runs per-category probes in QEMU to verify a Tier-B leaf's
+    DECLARED row against observed behavior; the witness is bound to `(op, ISA, category-profile,
+    asm-hash)`. A Layer-3 import / leaf-use of an unwitnessed or hash-mismatched binding = COMPILE ERROR
+    (fail-closed). DECIDABLE categories: `clobbers_register`/`clobbers_flags` (sentinel-fill all regs,
+    run, read back — the witness sweet spot, catches the classic under-declared-clobber bug GCC/Rust
+    cannot), `changes_privilege` (CPL readback), `requires_nonzero` (zero-trap), `requires_aligned`
+    where it actually traps. UNOBSERVABLE: memory ordering (QEMU TCG flattens to TSO — a too-weak fence
+    witnesses GREEN, *worse* than author-trust) and alignment on x86 (AC-off → no trap). Env note: only
+    `qemu-system-x86_64` 8.2.7 is present (no ARM/RISC-V system QEMU, no user-mode QEMU, no
+    cross-compilers); privileged ops are probeable because QEMU emulates privilege in system mode (boot
+    a ring0 stub).
+11. **TAINT (named floor)** — categories neither derived (Tier A / composition) nor witnessed (decidable
+    Tier B) stay author-DECLARED but carry a greppable floor marker that TAINTS the importing function so
+    it can never read as verified-green. Covers ordering, non-x86 privileged asm (no QEMU on this host),
+    and `provenance_clear_on_output`.
+12. **THE TRIANGLE + THE RESIDUAL FLOOR** — flexibility / safety / maintainability: pick any two fully,
+    the third degrades. Effect-Row Composition is the *flexibility-weighted* winner (ADOPTED) =
+    flexibility + safety, paying with a small leaf-audit and a named floor past the leaf boundary. The
+    honest residual floor: (1) silicon errata / microarchitecture — the anchor moves from author's-word
+    to GCC-contract (Tier A) + QEMU-TCG-model (Tier B), auditable and shared but neither is the die;
+    (2) QEMU/TCG fidelity; (3) ordering + `provenance_clear_on_output` (tainted); (4) non-x86 privileged
+    asm on this host (env limit, not architecture — installing system QEMU + cross-gcc promotes
+    taint → witness); (5) leaf assertions + fold rules (small, centralized, reviewable without silicon).
+
+---
+
+## Relationship to Option E — this REFINES it, does not replace it
+
+Option E (`docs/asm_lang_zer_safe.md` §1.7) remains the parent architecture. The following Option E
+machinery **carries forward unchanged**:
+
+- The **program-consequence vs hardware-consequence** vocabulary (CLAUDE.md "ZER's Goal";
+  `asm_lang_zer_safe.md:2225-2243`). ZER owns 100% of program-consequence (every wrong USE of a value
+  at the use site); hardware-consequence (does the silicon honor the declared categories) is the named
+  floor. This split is exactly what concentrates into the leaf below.
+- The **structure/semantics straddle** observation (`asm_lang_zer_safe.md:2216`) — asm is the one ZER
+  construct that straddles the program-domain / hardware-domain boundary, which is *why* it uniquely
+  needs a binding mechanism.
+- The **closed category vocabulary** (`asm_lang_zer_safe.md:2270-2282`: `clobbers_flags`,
+  `clobbers_register`, `reads_mem`/`writes_mem(width, ordering)`, `requires_aligned(n)`,
+  `requires_nonzero`, `memory_barrier(ordering)`, `produces_carry`/`consumes_carry`,
+  `changes_privilege`, `control_flow`, `provenance_clear_on_output`, `value_in_value_out`,
+  `no_memory_effect`, …) and the operation taxonomy (`@arith_add_with_carry`, `@load_acquire`,
+  `@atomic_cas`, `@cpu_write_cr3`, …). These ARE the effect-row categories ERBT folds.
+
+What Effect-Row Composition **replaces**: Option E's **Layer 2 = "per-ISA bindings, each `@bind`
+DECLARING categories, trusted via a library-author + manual checklist."** Option E's static verifier
+checks Layer-3 call sites against DECLARED categories, so a wrong declaration produces a Layer-3 result
+that is verified-against-a-lie (green, wrong on silicon). Effect-Row Composition replaces that single
+trust mechanism with three:
+
+- **DERIVED** — Tier-A leaves and all compositions get their rows computed (builtin contract table /
+  fold rules), never declared by hand.
+- **WITNESSED** — decidable Tier-B leaf categories are probed in QEMU and gated on the asm-hash.
+- **TAINTED** — the irreducible remainder (ordering, non-x86 privileged, `provenance_clear_on_output`)
+  stays author-declared but is marked floor and propagates the taint to callers.
+
+So Layer 3 still verifies against rows, but those rows are now (mostly) machine-produced, and the
+hand-declared residue is structurally fenced off as floor instead of silently believed.
+
+---
+
+## Reading order for a fresh session
+
+1. **This file** (`00_summary.md`) — orientation, glossary, the 12-bullet design, the Option-E delta.
+2. **CLAUDE.md "ZER's Goal"** — the program-consequence / hardware-consequence vocabulary that all asm
+   claims must respect, and the closure philosophy ("no path to the unsafe construct except a
+   compiler-enforced gate").
+3. **`docs/asm_lang_zer_safe.md` §1.7** (the parent Option E) — the three-layer model, the closed
+   category vocabulary (§1.7.3 list), the structure/semantics straddle, the SPARK kind-difference.
+4. The **leaf / Tier-A / Tier-B** section of this document — what a leaf is, the `-ffreestanding`
+   boundary, the ~36 Tier-B ops.
+5. The **composition / ERBT / fold** section — the no-mnemonic grammar, the fold rules, why ordering
+   is excluded.
+6. The **closure argument** section — the theorem and why composition-safety alone is insufficient.
+7. The **witness + taint** sections — the QEMU conformance harness, decidable vs unobservable
+   categories, the taint marker.
+8. **`docs/option_e_plan.md`** + the IMPLEMENTATION PLAN — Phase-1 table deletion through Step-7 DRC CI.
+
+---
+
+## Locked glossary
+
+- **Level 0** — plain ZER arithmetic that emits C and is compiled by GCC. Not a leaf, not asm; the
+  lowest already-safe primitive.
+- **Tier A leaf** — a leaf backed by a GCC builtin; row DERIVED from the builtin's documented contract;
+  portable; no raw asm. Objective test: compiles under `-ffreestanding`.
+- **Tier B leaf** — a leaf backed by raw asm (real mnemonic) for a machine-configuring op with no
+  portable builtin; per-ISA; row WITNESSED (decidable) or DECLARED + TAINTED.
+- **Leaf** — the audited primitive unit; the only construct that may contain Tier-B raw asm; the only
+  gated unit. Small, per-ISA, demand-driven, fail-closed.
+- **Composition** — a `compose` operation that recombines leaves/ops with no asm and no core release;
+  its grammar has no mnemonic production; its row is derived by fold rules.
+- **Effect row** — the bundle of safety categories (from Option E's closed vocabulary) attached to an
+  op, treated as a composable row that can be folded and inferred.
+- **ERBT (Effect-Row Binding Types)** — the type discipline that makes categories composable rows the
+  checker folds and infers; the type-theoretic backbone of composition.
+- **Fold rule** — a closed, per-category rule for deriving a parent's category value from its children:
+  union/OR for clobbers (sound), max for `requires_aligned` (sound); ordering/`memory_barrier` has NO
+  sound fold and is excluded.
+- **Conformance witness** — a toolchain-produced certificate that a Tier-B leaf's declared row matches
+  observed QEMU behavior for decidable categories, bound to `(op, ISA, category-profile, asm-hash)`;
+  consumed fail-closed at import.
+- **Taint marker** — a greppable floor marker on a category that is neither derived nor witnessed; it
+  taints the importing function so it can never read as verified-green.
+- **The floor** — hardware-consequence: facts the language cannot verify (does silicon honor the
+  declared categories). Surfaced at the narrowest typed boundary (here: the leaf), never silently
+  believed.
+- **Closure argument** — the theorem that safe leaves + sound fold ⇒ all composed ops are safe;
+  safety is relative to leaf correctness, so the floor concentrates into the finite leaf set.
+- **The triangle** — flexibility / safety / maintainability; pick any two fully. Effect-Row
+  Composition (ADOPTED) takes flexibility + safety.
+- **Decidable category** — one whose declared value is observable and deterministic in QEMU
+  (clobbers, `changes_privilege`, `requires_nonzero`, trapping alignment); can be witnessed.
+- **Unobservable category** — one whose declared value cannot be soundly observed in this environment
+  (memory ordering under TCG-TSO; alignment on x86 with AC off); stays tainted, never witnessed.
+
+---
+
+## Verified repo anchors
+
+- `emitter.c:3128`,`:3134`,`:3146`,`:3152` hardcode `__ATOMIC_SEQ_CST` for atomic *value*-ops, and
+  `emitter.c:3098` is the *fence* path (the fence path is the one that is ordering-parameterizable).
+  So "category derived from the builtin's contract" for ordering is FALSE today and must be WIRED;
+  until then the derive-table must conservatively declare `ordering = seq_cst` (the actually-emitted
+  truth).
+- `checker.c:10529-10941` is the `NODE_ASM` handler region (no `@bind` / `@intrinsic_def` / allow-list
+  exists there yet — that is Phase 2/3 work).
+- CLAUDE.md:1295-1296 — Session-G Phase 3 in-block ordering enforcement was ABANDONED because it
+  false-positived the canonical multi-block CLWB+SFENCE libpmem idiom. This is the evidence that
+  positional ordering does not fold soundly.
+- `docs/asm_lang_zer_safe.md:2227` / `:2270-2308` — the program-consequence statement and the closed
+  category vocabulary + operation taxonomy that ERBT folds.
+- `docs/option_e_plan.md` — the Phase-1 deletion plan (remove per-arch instruction/register tables,
+  `arch_data/*.zerdata`, `asm_categories.{c,h}`).
+
+
+## 1. The problem and the floor
+
+This section defines the exact problem the rest of the document solves: the gap
+between what an asm binding *declares* and what its asm body *actually does* on
+silicon. It locates that gap inside ZER's program-consequence /
+hardware-consequence vocabulary, explains why the prior design (Option E) left
+the gap to manual diligence (the SPARK-trust model ZER exists to beat), and
+derives — from the way an asm instruction *fuses* program-domain structure with
+hardware-domain semantics — why asm alone among ZER constructs needs a binding
+mechanism, and why that fusion forces the leaf/composition split this document
+specifies. A reader with zero prior context should leave able to state the floor
+precisely, point at it in the code, and see why the leaf is where it concentrates.
+
+### 1.1 The binding-vs-silicon floor, stated exactly
+
+ZER's asm safety architecture (Option E, `docs/asm_lang_zer_safe.md` §1.7) lets
+a value-computing or machine-configuring operation be *declared* once as a
+named semantic operation (the taxonomy: `@arith_add_with_carry`,
+`@load_acquire`, `@atomic_cas`, `@cpu_write_cr3`, …) and *bound* per-ISA to an
+asm body via `@bind` (§1.7.3). Every binding `@bind` declaration must select,
+from a **closed category vocabulary** (§1.7.4), the structural effects its asm
+body has: `clobbers_flags`, `clobbers_register(name)`, `reads_mem(width,
+ordering)`, `writes_mem(width, ordering)`, `requires_aligned(n)`,
+`requires_nonzero(operand)`, `memory_barrier(ordering)`, `produces_carry`,
+`changes_privilege(from, to)`, `control_flow(...)`,
+`provenance_clear_on_output(operand)`, `value_in_value_out`, `no_memory_effect`,
+and so on. A downstream caller (Layer 3, firmware) then calls the typed
+operation; the static verifier checks the *call site* against the *declared*
+categories of the operation it is calling.
+
+> **The floor, in one sentence:** *Does a binding's asm body actually honor the
+> categories it declared?*
+
+If a binding declares `clobbers_flags + no_memory_effect` but its asm body
+secretly writes memory, ZER cannot detect it. This is stated verbatim in
+`docs/asm_lang_zer_safe.md` §1.7.1:
+
+> "If a binding declares `clobbers_flags + no_memory_effect` but the asm secretly
+> writes memory, ZER cannot detect it. This is the floor for asm just as
+> datasheet-correctness is the floor for MMIO declarations and
+> signature-correctness is the floor for cinclude."
+
+The verifier reasons over the **schema**, never over the asm string (§1.7.1) —
+deliberate and correct, since it is what makes Layer 3 ISA-portable. But it has a
+sharp consequence: a wrong category declaration is a lie the verifier cannot see.
+Every Layer 3 call site that compiles green against a lying declaration is
+**verified-against-a-lie** — green in the compiler, wrong on silicon. The
+verification is sound *relative to* the declaration; the declaration is the floor.
+
+### 1.2 Program-consequence vs hardware-consequence, applied to asm
+
+ZER's load-bearing vocabulary (locked in `CLAUDE.md`, "ZER's Goal", and in
+`docs/asm_lang_zer_safe.md` §1.7.1) splits "consequence" into two meanings that
+must never be conflated:
+
+- **Program-consequence** — what happens when a value is used wrongly *inside
+  ZER source*. The use is in the program, so ZER owns it: caught at 100% at the
+  use site. ZER's claim is *100% program-consequence coverage*.
+- **Hardware-consequence** — what happens when a *fact* (silicon behavior,
+  datasheet value, what an instruction does to the machine) is wrong relative to
+  user belief. The fact lives outside the program and never enters it, so ZER
+  has nothing to verify. This is the **floor** — out of scope for any language.
+
+Applied to asm (faithful to §1.7.1):
+
+- **Program-consequence (ZER total, 100%):** Every call site of every operation
+  — `@arith_add_with_carry(a, b, c_in)`, `@load_acquire(ptr)`, `@barrier_full()`
+  — is verified against the operation's declared categories: operand types,
+  escape, provenance preservation through outputs, qualifier preservation
+  through inputs, clobber accounting, ordering constraints, context permissions.
+  Wrong use at the call site = compile error. This holds **regardless of which
+  ISA binding the caller compiles against**, because the verifier reasons over
+  the schema, not over asm strings.
+
+- **Hardware-consequence (floor, surfaced at the `@bind` declaration site):**
+  Whether the asm body inside a `@bind` declaration actually has the categories
+  the declaration claims. Same floor pattern as datasheet-correctness for MMIO,
+  signature-correctness for cinclude, baud-value-correctness for a peripheral.
+  Different boundary *location* (the `@bind` declaration site), same floor
+  *shape*.
+
+The phrase §1.7.1 forbids from collapsing:
+
+> "100% program-consequence" must NEVER read as "ZER verifies the asm body
+> matches the contract."
+
+It does not. The split is the whole honesty discipline: **owning every wrong
+*use* of a value (program-consequence, 100%) does not entail certifying the
+*fact* a binding asserts about silicon (hardware-consequence, floor).** This
+document is about shrinking and concentrating that floor — not pretending it is
+absent.
+
+### 1.3 Why Option E left this floor manual — and why that is the model ZER rejects
+
+Option E names the floor honestly and locates it precisely at the `@bind`
+declaration site. But it leaves *discharging* the floor to the library author
+plus a manual checklist. §1.7.6 makes this explicit as the design's strength:
+because the contract language is the closed category vocabulary, reviewing a
+`@bind` declaration is *a finite checklist task* ("for each declared category,
+check the asm body") rather than the open-ended proof obligation a SPARK
+arbitrary-predicate contract requires. The closed-vocabulary kind-difference
+(§1.7.6) is real and is preserved by this document.
+
+But "closed-shaped gap, reviewable by checklist" is still **a gap discharged by
+a human looking at asm**. Whether the author actually performed the check, and
+performed it correctly, is the author's diligence. Nothing in the toolchain
+forces it. A wrong-but-syntactically-valid declaration compiles green and
+propagates a lie to every Layer 3 caller.
+
+That is precisely the model ZER's closure philosophy rejects. ZER's existing
+guarantees are not "trust the user to run the right check"; they are
+**compiler-enforced gates with no path to the unsafe construct except through
+the gate**. There is no typed pointer except via `@inttoptr` + `mmio` — the
+grammar makes the unsafe construct *unreachable* without a witness
+(`checker.c:5601-5608`: no integer-to-pointer cast except through `@inttoptr`
+with mandatory `mmio`). "Run a CI test" or "review the asm carefully" is the
+**SPARK / MISRA trust-the-user model**: it relies on optional diligence and
+fails open when the diligence lapses. The discipline ZER holds itself to:
+
+> Prefer language/toolchain enforcement — *compile error*, or *unusable without
+> a witness* — over optional diligence.
+
+Option E's checklist is the best *manual* discharge of the floor (closed-shaped,
+not open-shaped — strictly better than SPARK). It is still manual. **This
+document's job is to convert as much of that manual discharge as possible into
+enforcement** — derive the categories where they are derivable, witness them
+where they are observable, and TAINT (a greppable, non-green floor marker) only
+the irreducible residue. The floor does not vanish; it shrinks and concentrates.
+
+### 1.4 The structure/semantics straddle — why asm uniquely needs a binding
+
+This is the deepest architectural observation in the asm thread
+(`docs/asm_lang_zer_safe.md` §1.7.5), and it is the reason the binding mechanism
+exists *for asm and for no other ZER construct*.
+
+**Every other ZER construct sits cleanly on one side of the program-domain /
+hardware-domain boundary** (§1.7.5):
+
+- A `u32` value, regardless of origin (hardware read, file, network, literal):
+  program-domain at every operation, ZER owns 100%.
+- An `mmio` address declaration: a hardware-domain claim *at the declaration*
+  ("does this address really name the peripheral?"), then program-domain at
+  every downstream use through the typed pointer. The boundary is crossed
+  cleanly, *once*, at the declaration.
+- A `cinclude` function signature: hardware-domain claim at the signature
+  declaration, program-domain at every call site. Same clean cross.
+- A linker-symbol extern: same pattern.
+- A typed register access: the structure lives in the program (the typed
+  pointer), the criterion lives in the datasheet (the address value) — both
+  sides exist, but **they live in separate tokens**.
+
+**An asm instruction is the exception. It straddles.** §1.7.5 gives the worked
+case: `adc $0, $1` is *one token* that simultaneously:
+
+- **Carries operand structure (program-domain):** the Z-rules apply to its
+  inputs and outputs, escape analysis applies to register clobbers, provenance
+  clearing applies to outputs, qualifier preservation applies through the
+  boundary, ordering constraints apply, context flags apply. (ZER keeps 10 of
+  13 Z-rules — Z1-Z8, Z11, Z12 — *active through asm operand boundaries*,
+  unlike Rust which goes blind inside `unsafe { asm!() }`; see `CLAUDE.md`,
+  "asm safety".)
+- **Carries semantic meaning (hardware-domain):** what flags get clobbered, what
+  state mutates, what precondition is required for correctness, what the
+  instruction actually does to the machine — **and this varies per ISA**. The
+  ISA manual is the datasheet for instruction meaning (§1.7.5).
+
+> You cannot separate these by reading the token. The instruction's structural
+> connections and its hardware semantics are **fused in one mnemonic.** That
+> fusion is unique to asm among ZER constructs.
+
+For an `mmio` address the two sides are *already in two tokens* (the typed
+pointer carries the structure; the integer carries the datasheet claim), so the
+boundary can be crossed cleanly at one declaration and ZER reasons about the
+rest structurally. For an asm instruction there is no second token to factor the
+hardware claim into — the meaning is *inside* the mnemonic, and it is per-ISA.
+
+**Why the straddle forces a binding** (§1.7.5, paraphrased and faithful):
+
+1. Asm's semantics are per-ISA hardware facts.
+2. Any safety system that wants to reason about asm meaning must import that
+   meaning from outside the program text.
+3. "Outside the program, per-ISA" is, by definition, a binding (`@bind`).
+4. ZER core cannot ship "what `adc` means" without committing to one ISA's
+   semantics in the language core — which would make ZER an
+   "x86 language wearing a portable costume."
+
+The only factoring that preserves both *"ZER reasons about asm safety
+structurally"* and *"ZER does not commit to an ISA"* is:
+
+- **Structure-half stays in core** (universal, ISA-less, frozen): the Z-rules,
+  the operand boundaries, the closed category vocabulary, the operation
+  taxonomy.
+- **Semantics-half imported per-ISA via `@bind`** (user/library-authored;
+  hardware-consequence floor surfaced at the binding site).
+
+§1.7.5 is emphatic that this is not a preference among options:
+
+> "It is not 'the cleanest of three options' — it is the unique architecture that
+> respects the structure/semantics straddle without either committing to one ISA
+> or refusing to reason about asm meaning at all."
+
+Any alternative either (A) commits ZER core to one ISA's semantics (breaking
+architecture-agnostic positioning), or (B) refuses to reason about asm meaning
+at all (dropping back to "asm is just text we hand to GCC"). The straddle
+dictates the shape; the fusion in the token made the choice, not architectural
+taste.
+
+### 1.5 Why the straddle forces a leaf + composition split
+
+The straddle says: import semantics per-ISA, reason about structure
+universally. This document's refinement reads that mandate as a **partition of
+the work**, and the partition is decided by **one test** (developed in detail in
+the levels/tiers section of this document):
+
+> *Is the operation inside C's abstract machine (a value-computation), or does it
+> CONFIGURE the machine?*
+
+The test sorts operations along the very seam the straddle exposes:
+
+- **Value-computations** (arithmetic, bit ops, atomics, byteswap) are inside
+  C's abstract machine. Their *semantics* are already captured by a portable
+  GCC builtin (`__builtin_add_overflow`, `__atomic_*`, `__builtin_clz/ctz/
+  popcount`, `__builtin_bswap`). The hardware-semantics half is *delegated to
+  GCC*, which selects the real instruction and handles sub-architecture via
+  `-march`. The category row is then **derived** from the builtin's documented
+  contract — one audited table, one time, structural and portable.
+
+- **Machine-configurations** (CR0/3/4 writes, RDMSR/WRMSR, I/O ports,
+  SYSCALL/IRET, CPUID/INVLPG/WBINVD) configure privilege, page tables, MSRs,
+  I/O ports, the interrupt flag — concepts C's abstract machine has *no model
+  for*. GCC has no portable builtin (verified: `__rdmsr` does **not** compile
+  `-ffreestanding`, while `clz`/`add_overflow`/`bswap` do). These are the only
+  operations whose semantics genuinely must be imported per-ISA as **raw asm**.
+
+This is exactly the leaf/composition split:
+
+- A **LEAF** is the audited primitive unit — the *only* place the per-ISA
+  semantics half lives. For value-computations it is a GCC builtin (the binding
+  *is* the GCC backend; the category row is derived). For machine-configurations
+  it is raw asm whose declared row is WITNESSED where decidable, otherwise
+  DECLARED + TAINTED. Leaves are small, per-ISA, and finite (the
+  machine-configuration set is ~36 ops).
+
+- **COMPOSITION** is the flexible layer where authors recombine leaves/operations
+  with **no asm and no core release**. The composed-binding grammar has *no
+  mnemonic production* (you literally cannot write freeform asm in a
+  composition — the `@inttoptr`-shaped gate, applied to asm). A composed
+  operation's category row is **derived by closed fold rules over its children**
+  (clobbers fold by sound UNION/OR; `requires_aligned` by MAX). This is the
+  *structure-half reasoned universally* that the straddle promised: composition
+  is pure program-domain reasoning, ISA-independent, and a new ISA gets all
+  compositions for free once its leaf set exists.
+
+The straddle is why the partition is *forced rather than chosen*: the only part
+of an asm program that *cannot* be reasoned about universally is the per-ISA
+semantics fused into the mnemonic — so that part, and only that part, is pushed
+down into a finite, audited leaf set; everything above the leaf line is
+structure, and structure folds.
+
+This is also why **the floor concentrates into the leaf set.** Composition
+faithfully propagates whatever the leaf declared — soundly, but lie and all — so
+safety is *relative to leaf correctness*. Option E spread the floor across
+`O(bindings)` distributed prose checklists; the leaf/composition split reduces it
+to `O(leaves) + O(1)` fold proof: a small, centralized set of leaf assertions
+plus one soundness argument for the fold. Later sections specify the tiers of
+leaves, the derive table, the fold rules and their soundness boundary, the
+conformance witness, and the named TAINT floor — all aimed at making the leaf set
+as small, as derived, and as witnessed as the physics permits.
+
+### 1.6 Where this lives in the tree today (so the floor is concretely locatable)
+
+The floor is not abstract — it has a code site and a deletion plan:
+
+- The static verifier's asm handler is the `NODE_ASM` handler in `checker.c`
+  (~lines 10720-10890). No `@bind` / `@intrinsic_def` / allow-list mechanism
+  exists there yet — that is later-phase work (`docs/option_e_plan.md`
+  Phases 2/3).
+- Phase 1 (`docs/option_e_plan.md`, Level C cleanup) *deletes* the per-arch
+  infrastructure that the rejected disassemble-table designs would revive:
+  `src/safety/asm_instruction_table_{x86_64,aarch64,riscv64}.c`,
+  `asm_register_tables_*.c`, `asm_categories.{c,h}`, and the `arch_data/*.zerdata`.
+  These are the "53/37/30-row" tables — the proactive per-ISA opcode tables this
+  architecture explicitly does *not* rebuild.
+- The ordering category is the hardest part of the floor and the reason
+  positional `memory_barrier` is excluded from the fold vocabulary: ZER's own
+  Session-G evidence (`CLAUDE.md` ~lines 1294-1296) records that Phase 3 in-block
+  ordering enforcement was **ABANDONED** because it false-positived the canonical
+  libpmem `CLWB`+`SFENCE` idiom. Ordering does not fold soundly and is not
+  observable in the QEMU witness (TCG flattens to TSO), so it stays
+  value-intrinsic and TAINTED — the irreducible corner of the floor, treated in
+  full later in this document.
+
+The lesson Session-G teaches is the same one that motivates the whole
+enforcement-over-diligence stance here: do not ship enforcement that rejects
+valid code, and do not ship a green checkmark for a property you cannot actually
+observe. The floor must be *named*, not painted over.
+
+
+## 2. The design-space exploration — why this design and not the others
+
+This section is the audit trail for the architectural choice. A fresh session
+reading only this document must know that the adopted design (Effect-Row
+Composition) was not the first idea, not the only idea, and not picked by
+preference — it survived a deliberate adversarial fan-out against thirteen
+competitors, judged on two fixed lenses, with a third priority (flexibility)
+added late that reordered the winner. Recording the *losers and their killing
+reasons* is the load-bearing part: it stops a future session from re-proposing a
+design that was already tried and rejected for a specific, verifiable reason
+(most dangerously, the per-ISA opcode-table designs that Phase 1 of
+`docs/option_e_plan.md` is *deleting*).
+
+### 2.1 The fan-out method
+
+The exploration was a 14-angle adversarial fan-out run in two waves, roughly 58
+agents total. "Adversarial" means each candidate design was developed by an agent
+*and then attacked* by the next — the brief was to find the failure mode, not to
+advocate. Every candidate was scored on two fixed lenses:
+
+- **Maintainability** — how much recurring human work the design imposes on a
+  *solo* author (ZER is solo-authored; this is not incidental, it disqualifies
+  whole families of design — see n-version and formal-Sail below). The named
+  disqualifier, inherited from the Level C cleanup rationale, is
+  **per-instruction / per-vendor / per-ISA-extension PROACTIVE scaling**: any
+  design that must enumerate the ISA catalog *ahead of demand* loses on
+  maintainability. This is exactly the machinery Phase 1 deletes — the
+  `asm_instruction_table_{x86_64,aarch64,riscv64}.c`, the
+  `asm_register_tables_*.c`, `asm_categories.{c,h}`, the
+  `arch_data/*.zerdata`, and the `gen_*` probe scripts
+  (`docs/option_e_plan.md` §1, the DELETE table). A design that *revives* this
+  machinery is not a step forward; it un-does the cleanup.
+
+- **Soundness** — does the mechanism *structurally* prevent a wrong asm-safety
+  declaration from reading as verified-green, or does it merely make wrongness
+  *less likely*? ZER's CLOSURE philosophy (CLAUDE.md: "no path to the unsafe
+  construct except a compiler-enforced gate") rejects "run a CI test" /
+  "trust-the-user" mechanisms as the *gate*. A design that fails open (an
+  unhandled input silently passes) fails the soundness lens outright,
+  regardless of how good its happy path is.
+
+The two waves let candidates that survived Wave 1 be re-attacked with the
+specific weakness another candidate exposed. The output was a scoreboard, not a
+single recommendation — because the ranking *depends on how you weight the
+lenses*, which is the crux of §2.2.
+
+Scoreboard (the designs that matter for a fresh session; the disposition column
+is the actionable part):
+
+| Design | What it is | Disposition | Why |
+|---|---|---|---|
+| **Intrinsic-Maximalism** | floor-by-subtraction: builtin dual-path shrinks the floor's *domain*, residue structurally fenced | maint-weighted **winner (8.4)** | safety+maintenance; frozen taxonomy loses flexibility |
+| **Effect-Row Composition** | closed-leaf `@bind` (no mnemonic production) ⊕ ERBT + witness/taint | **ADOPTED** (flex-weighted) | safety+flexibility; pays small leaf-audit + named floor |
+| **BIND-VIA-BUILTIN** | GCC backend *is* the binding; categories derived from builtin contract | **KEPT** as Tier-A mechanism | maint 9 / enforce 8 — folded into the adopted design |
+| **Witnessed Floor / SDCW** | 4-owner decision order: derive → compose → witness → taint | **KEPT** as the verification-ownership skeleton | composes the other surviving pieces in priority order |
+| **DCA** (disassemble-classify) | disassemble + classify against opcode table | **REJECTED** | revives deleted table + fail-open + "100×" fiction |
+| **DSC** (disassemble-static-check) | DCA + check declarations vs classification | **REJECTED** | same three reasons as DCA |
+| **n-version** | N independent impls per-op-per-ISA, cross-checked | **REJECTED** | per-op-per-ISA cost + common-mode under solo |
+| **formal-Sail** | discharge leaves vs official ARM/RISC-V Sail models | **REJECTED-for-solo** (maint 3) | per-ISA + from-scratch toolchain + x86 has no model |
+| **standalone QEMU-witness** | ring0 stub observes leaf behavior in QEMU | **DEMOTED** | existential-vs-universal gap; decidable x86 predicates only |
+| **DRC** (differential reference) | pure-ZER reference + fuzzed differential | **KEPT-as-CI**, not a gate | catches wrong-VALUE bugs but is a test, warns cross-compile |
+| **litmus / CWH** | herd7-style ordering probing | **CONFIRMATORY** | probabilistic; confirms ordering is the hardest category |
+
+The two surviving *composite* designs deserve a note because they are not
+competitors to the adopted design — they are *inside* it. **BIND-VIA-BUILTIN** is
+the Tier-A leaf mechanism: the GCC backend *is* the binding, and the effect row
+is derived from the builtin's documented contract (one audited table, one-time).
+**Witnessed Floor / SDCW** is the decision-ownership skeleton — the rule that a
+category's row is settled by trying, *in this order*, derive (Tier A /
+composition) → compose (fold) → witness (decidable Tier-B) → taint (the named
+floor for what neither derives nor witnesses). The adopted design is literally
+"Composition-Only @bind + ERBT, with BIND-VIA-BUILTIN supplying the leaves and
+SDCW supplying the decision order." The fan-out did not pick one winner and
+discard the rest; it picked a *vertex* and assembled the surviving pieces that
+sit at it.
+
+### 2.2 The two winners and the re-weighting
+
+**Two different designs won, under two different weightings.** This is the most
+important fact in the section.
+
+**Maintainability-weighted winner: Intrinsic-Maximalism — 8.4.**
+If maintainability is the dominant lens, the winner is *floor-by-subtraction*:
+push as many operations as possible onto a GCC builtin dual-path so the floor's
+*domain* shrinks (the operation no longer needs raw asm at all, so there is no
+declaration to get wrong), and structurally fence the small residue that has no
+builtin. Frozen taxonomy: the set of expressible operations is fixed and grows
+only by deliberate ZER-team addition (~1–2 ops per decade, matching the
+"|Y_intrinsic| ... ~1–2/year additions" / "STABLE at current ~130" framing in
+`docs/asm_lang_zer_safe.md` ~lines 1252/1345). This is a *maintainability asset*:
+a frozen vocabulary means no per-ISA bring-up, no per-instruction table, no
+recurring author work — the disqualifier is structurally avoided because there is
+nothing to scale. The companion BIND-VIA-BUILTIN mechanism (the GCC backend *is*
+the binding; categories derived from the builtin's documented contract) scored
+even higher on the maintainability sub-axis (maint 9 / enforce 8) and is what the
+adopted design keeps as its Tier-A leaf mechanism.
+
+**Flexibility-weighted winner (ADOPTED): Effect-Row Composition.**
+The re-weighting is this: **flexibility was added as a co-equal third priority.**
+The question "can an *author* (not the ZER team) express a *new* operation
+without a core release?" is not answered by Intrinsic-Maximalism — its frozen
+taxonomy is the very thing that made it cheap. A frozen taxonomy is a
+maintainability *asset* and simultaneously a flexibility *liability*: the same
+property (the vocabulary cannot grow except by ZER-team action ~1–2/decade) that
+eliminates recurring work also means a firmware author who needs an op outside
+the taxonomy has *no in-language path* — they wait for a core addition or drop to
+raw asm. Once flexibility is weighted equally, that liability dominates, and the
+winner flips to **Effect-Row Composition = Composition-Only (closed-leaf `@bind`,
+no mnemonic production) ⊕ ERBT (effect-row types) + witness/taint escape.**
+
+Effect-Row Composition pays for its flexibility with a *small leaf-audit* (the
+finite Tier-B raw-asm leaf set, ~36 ops, demand-driven) plus a *named floor* past
+the leaf boundary (the tainted categories). In exchange, authors write `compose`
+operations that recombine existing leaves/ops — no asm, no core release — and the
+composed effect row is derived by closed fold rules. New-ISA bring-up is "write
+its leaf set once, then *all* compositions work on it for free": flexibility and
+per-ISA cost decouple. This is why it wins the flexibility lens while staying
+sound (safe leaves + sound fold ⇒ everything composed above the leaf line is
+safe).
+
+The frozen taxonomy is the exact pivot, so it is worth stating precisely. Under
+Intrinsic-Maximalism a new operation can only enter the language by a ZER-team
+addition to the catalog — the same "slow promotion ... handful per several years"
+/ "STABLE at current ~130" rate documented in `docs/asm_lang_zer_safe.md`
+(~lines 1345/1822). For the *maintainer*, that ceiling is the whole point: a
+vocabulary that cannot grow except deliberately is a vocabulary that imposes no
+recurring per-ISA work, which is why it dodges the disqualifier. For the *firmware
+author*, the identical ceiling is a wall: an op outside the catalog is
+inexpressible without either lobbying for a multi-year core addition or dropping
+to raw asm (which re-opens the very unsafety the language exists to close). The
+two readings are the same fact seen from the two sides of the trade — there is no
+tuning that makes a frozen taxonomy both un-growing-for-the-maintainer and
+freely-growing-for-the-author. Effect-Row Composition breaks the bind not by
+un-freezing the *leaf* set (the leaves stay a small, audited, demand-driven set —
+that is where safety concentrates) but by making *composition above the leaves*
+the author-extensible surface: authors recombine frozen leaves under closed fold
+rules, so expressiveness grows without the catalog growing and without raw asm
+re-appearing.
+
+The decision is therefore not "Effect-Row Composition is better than
+Intrinsic-Maximalism." It is "under a three-priority weighting
+(flexibility + safety + maintainability) where flexibility is co-equal,
+Effect-Row Composition is the point on the trade-off surface ZER chose." See the
+triangle in §2.4.
+
+### 2.3 Rejected and demoted designs — the scoreboard with killing reasons
+
+Each entry below names the design, its appeal, and the *specific* reason it lost.
+The killing reason is what a fresh session needs: it is what stops the design
+from being re-proposed.
+
+**REJECTED — DCA (Disassemble-Classify) and DSC (Disassemble-Static-Check).**
+Appeal: instead of trusting an author's declared categories, *disassemble* the
+emitted/assembled asm and classify each instruction against an opcode table, then
+check declarations against the classification. Three killing reasons, any one
+fatal:
+1. **Revives the deleted per-ISA opcode table** — exactly the
+   `asm_instruction_table_*.c` infrastructure Phase 1 deletes
+   (`docs/option_e_plan.md` §1). This trips the named disqualifier
+   (per-instruction/per-ISA PROACTIVE scaling) head-on; the design *un-does* the
+   cleanup it is layered on top of.
+2. **Fail-open** — an untabled mnemonic classifies as `NO_CATEGORY`, and a wrong
+   declaration against `NO_CATEGORY` passes GREEN. The hole is silent and grows
+   with every new instruction the table doesn't cover. This is the
+   trust-the-user failure mode ZER's closure philosophy rejects, dressed up as
+   automation.
+3. **The "100× smaller table" defense was a VERIFIED FICTION.** The argument for
+   DCA was that the classification table would be ~100× smaller than a full
+   opcode table. The real tables ZER actually built are **53 / 37 / 30 rows**
+   (x86_64 / aarch64 / riscv64) — roughly **120 rows total**, not the ~1500-row
+   straw man the "100×" claim divided against. The reduction is illusory.
+   Additionally, **-O0 compiler glue contaminates the disassembly**: in a
+   measured `cmpxchg` case, **8 of 11 instructions** in the disassembled output
+   were compiler glue, not the intended operation — so even the classification
+   step is unreliable on real output.
+
+**REJECTED — n-version.**
+Appeal: implement each op multiple independent times (per-op, per-ISA) and
+cross-check the versions; a single author error shows as a disagreement.
+Killing reason: **per-op-per-ISA cost** (the disqualifier, multiplied by the
+version count) *plus* **common-mode failure under solo authorship** — the same
+author writing all N versions makes correlated errors, so the versions agree on
+the *same* wrong answer. n-version's soundness premise (independent failure modes)
+is false when there is one author. It buys cost without buying the soundness it
+exists to provide.
+
+**REJECTED-for-solo — formal-Sail.**
+Appeal: the aspirational *ceiling*. Discharge each leaf's declared behavior
+against the official ARM / RISC-V Sail formal models — a real proof, not a
+probe. Maint 3. Killing reasons: (1) **per-ISA**, against official models that
+must be obtained and tracked per architecture; (2) requires a **from-scratch
+Sail/OCaml verification toolchain** — infeasible for a solo author; (3) **x86 —
+the most asm-heavy ISA — has NO official Sail model**, so the highest-value
+target is exactly the one this approach cannot cover. It is the correct *north
+star* for what "verified leaf" would ideally mean, and it is recorded as such,
+but it is not a shippable gate here. The witness mechanism (§ conformance
+witness in the main design) is the pragmatic, decidable substitute for the
+decidable categories.
+
+**DEMOTED — standalone QEMU-witness.**
+Appeal: boot a ring0 stub under `qemu-system-x86_64` and *observe* a leaf's
+behavior, comparing observed effects against its declared categories. Why
+demoted rather than rejected: a standalone witness certifies an **EXISTENTIAL**
+("these categories were *observed* on x86 in QEMU") that the safety gate would
+consume as a **UNIVERSAL** ("the declaration is honored"). That inference is
+sound *only for decidable predicates* — categories that are observable and
+deterministic (clobbers_register/clobbers_flags via sentinel sweep,
+changes_privilege via CPL readback, requires_nonzero via zero-trap). For
+unobservable categories (memory ordering: QEMU TCG flattens to TSO, so a
+too-weak fence witnesses GREEN — *worse* than author-trust because it manufactures
+false confidence; x86 alignment: AC-off means no trap) the existential→universal
+leap is unsound. So the witness is **demoted to a subordinate role: decidable x86
+predicates only**, never the whole gate. It is also x86-only in this environment
+(only `qemu-system-x86_64` 8.2.7 is present; no ARM/RISC-V system QEMU, no
+user-mode QEMU, no cross-compilers) — a reason it cannot stand alone as the
+verification story.
+
+**REJECTED-as-gate, KEPT-as-CI — DRC (Differential Reference Compilation).**
+Appeal: write a pure-ZER reference implementation of each op, run a fuzzed
+differential against the asm leaf, and flag any value divergence. DRC catches a
+class *no category mechanism can*: **wrong-VALUE** bugs — adc-drops-carry, an
+off-by-one in bsr, a CAS with operands swapped. These are correctness bugs inside
+a leaf that has *correct categories*; the effect-row machinery is blind to them
+by construction (it reasons about effects, not values). Killing reason as a
+*gate*: DRC is a **TEST, not a structure** — it is process, not a compile-time
+property, and on cross-compilation it can only warn (you cannot run an
+ARM/RISC-V binary's differential on an x86 CI host). A warning-not-error that
+runs only on the native host is not a gate (it fails ZER's "compile error /
+unusable-without-witness" bar). So DRC is **kept as an opt-in x86-native CI
+sanity layer** (`make drc-x86`, STEP 7 of the plan), never the gate. Its value is
+real and orthogonal — it is the only thing in the whole exploration that catches
+wrong-value leaf bugs — which is exactly why it is retained rather than dropped.
+
+**CONFIRMATORY — litmus / CWH (herd7-style concurrent ordering probing).**
+Appeal: the *only* path toward verifying the ordering category — run litmus
+tests / a concurrency-witness harness to probe whether a fence is strong enough.
+Result: it is **explicitly PROBABILISTIC** (litmus testing observes *some*
+interleavings, never proves their absence) and **x86-is-TSO hides both
+under-declaration and over-declaration** (the strong default memory model masks a
+too-weak fence). Its contribution to the exploration is *confirmatory, not
+constructive*: it independently confirms that **ordering is the irreducible
+hardest category** — no available mechanism (fold, witness, or litmus) makes it
+sound on this host. This is the same conclusion ZER reached the hard way in
+Session G: Phase 3 in-block ordering enforcement was **ABANDONED** because it
+false-positived the canonical libpmem CLWB+SFENCE idiom (CLAUDE.md ~lines
+1295–1296; `docs/asm_lang_zer_safe.md` §5.4, the "Session G Phase 3 lesson",
+~line 3988+; "don't ship enforcement that rejects valid code patterns"). Ordering
+therefore stays **value-intrinsic and TAINTED**, excluded from the fold
+vocabulary — litmus/CWH is the evidence that this is not pessimism but the actual
+boundary.
+
+### 2.4 The organizing lens — the flexibility / safety / maintainability triangle
+
+The whole exploration resolves to one trade-off triangle. **You can have any two
+fully; the third degrades.** This is why two designs "won" — they sit at
+different vertices, and the choice is which corner to give up.
+
+```
+                         SAFETY
+                          /\
+                         /  \
+                        /    \
+   Intrinsic-Maximalism●      ●Effect-Row Composition  (ADOPTED)
+   (safety+maintenance,        (safety+flexibility,
+    frozen taxonomy =           pays: small leaf-audit
+    can't express new ops)      + named floor past leaf)
+                       /          \
+                      /            \
+        MAINTAINABILITY ---------- FLEXIBILITY
+                          ●DCA
+              (flexibility + low-friction,
+               loses SAFETY — fail-open)
+```
+
+Reading the three corners:
+
+- **Safety + Maintainability, sacrifice Flexibility → Intrinsic-Maximalism.**
+  Frozen taxonomy. Cheap to maintain, structurally safe, but can express only
+  the ~130 ops the ZER team has blessed; new ops arrive at ~1–2/decade. The
+  maintainability-weighted winner; rejected as the *primary* design only because
+  flexibility was raised to co-equal.
+
+- **Safety + Flexibility, sacrifice some Maintainability → Effect-Row
+  Composition (ADOPTED).** Authors compose freely without a core release; safety
+  holds via safe leaves + sound fold; the cost is a small, *centralized*
+  leaf-audit (O(leaves) + O(categories), reviewable without silicon) plus a named
+  floor (the tainted categories) past the leaf boundary. Crucially the
+  maintainability cost is *bounded and demand-driven*, not the unbounded
+  per-ISA-catalog scaling of the disqualifier: new-ISA bring-up is one leaf set,
+  then every composition works for free.
+
+- **Flexibility + low-friction, sacrifice Safety → DCA.** Maximum expressiveness,
+  minimal author ceremony, but fail-open. This corner is the one ZER's closure
+  philosophy forbids — it is the SPARK/trust-the-user model, and it is why DCA is
+  rejected rather than merely demoted.
+
+The adopted design's central theorem (developed fully in the main document)
+follows directly from picking the safety+flexibility corner: **safe leaves +
+sound fold ⇒ everything composed above the leaf line is safe**, with the
+important honesty that *composition safety alone is not sufficient* (a sound fold
+faithfully propagates a *lying* leaf — safety is relative to leaf correctness).
+The floor does not disappear; it **concentrates into the finite leaf set**,
+reducing the verification problem from O(bindings) distributed prose checklists
+(the Option E status quo) to O(leaves) + O(1)-fold-proof. That concentration —
+trading flexibility's cost for a small, centralized, auditable floor instead of
+giving up safety (DCA) or flexibility (Intrinsic-Maximalism) — is the whole
+reason this vertex was chosen.
+
+
+## 3. Three levels, two tiers — the "inside C's abstract machine?" test
+
+This section defines the structural partition that the rest of the design rests
+on. Every operation a ZER program can express is placed into exactly one of
+three levels. The boundary between the two that matter for asm safety — Tier A
+vs Tier B — is decided by a single objective test, not by taste. The whole point
+is to make the set of operations that require raw-assembly verification as small
+as possible, because the residual floor of this design concentrates into that
+set (see §"Closure argument" and §"Conformance witness"). Safety here is bought
+by **avoiding** assembly, not by cleverly verifying it.
+
+### 3.1 The decisive test
+
+> **Is the operation a value-computation *inside* C's abstract machine, or does
+> it CONFIGURE the machine?**
+
+C's abstract machine has a model for: integers, their arithmetic (with
+well-defined wraparound under `-fwrapv`), memory cells, loads/stores, bit
+operations, and — since C11 — atomics with an ordering parameter. It has **no
+model** for: privilege level / current protection ring, page-table base
+registers, model-specific registers (MSRs), I/O port space, the interrupt-enable
+flag, TLB/cache state as nameable entities, or the CPUID feature space.
+
+- If the operation produces a value (or a memory effect) that C's abstract
+  machine can already describe, GCC has — or can have — a portable builtin for
+  it. That operation is **Tier A**.
+- If the operation changes machine state that C has no concept of, there is no
+  portable builtin and never can be (you cannot write a portable `__builtin`
+  that "sets the page-table base register" because portable C has no page
+  tables). That operation is **Tier B**, and it is the only place raw assembly
+  is permitted.
+
+The test is not a heuristic. It coincides with an objective, mechanically
+checkable boundary: **does the operation compile under `-ffreestanding`?** A
+freestanding GCC has the full builtin/atomic surface but no hosted runtime and
+no privileged-instruction intrinsics. Verified facts: `__builtin_clz`,
+`__builtin_add_overflow`, and `__builtin_bswap32` compile `-ffreestanding`;
+there is no `__builtin_rdmsr` — reading an MSR can only be written as raw asm
+(`__asm__ __volatile__("rdmsr" ...)`, which is exactly what the emitter does
+today for `@cpu_read_msr` at `emitter.c:7184`). The presence/absence of a
+freestanding builtin *is* the Tier-A/Tier-B line made objective.
+
+### 3.2 Level 0 — plain ZER arithmetic (not a leaf)
+
+Level 0 is ordinary ZER expression code: `a + b`, `x & mask`, `v << n`,
+comparisons, struct field reads, array indexing. It lowers to plain C and is
+handed to GCC. It is the **lowest primitive** in the design and it is **already
+fully safe** by ZER's existing guarantees — integer overflow wraps (defined, via
+`-fwrapv` and the `#pragma GCC optimize("wrapv")` emitter preamble), shift by
+`>=` width yields 0 (the `_zer_shl`/`_zer_shr` wrappers), bounds are checked,
+division-by-zero is gated. See CLAUDE.md "Safety Guarantees" table.
+
+Level 0 is **not a leaf** and never appears in the asm-safety verification
+machinery at all. There is no effect row to derive, no witness to run, no taint
+to propagate. It is mentioned here only to fix the floor of the hierarchy: when
+an author composes operations (§"Effect-row composition"), the base case of the
+fold can be a Level-0 arithmetic value, which carries the empty/trivial effect
+row. Anything expressible at Level 0 should stay at Level 0 — never reach for a
+builtin (Tier A) or asm (Tier B) for something `+` already does safely.
+
+### 3.3 Tier A leaf — a GCC builtin (no asm)
+
+A **Tier-A leaf** is an operation backed by a GCC builtin or a C11 atomic
+builtin. There is **no raw assembly** anywhere in a Tier-A leaf. The defining
+properties:
+
+1. **GCC owns instruction selection.** The leaf emits a builtin call; GCC
+   selects the real machine instruction. `@bswap32` emits `__builtin_bswap32`
+   (`emitter.c:8294`); `@popcount`/`@ctz`/`@clz`/`@parity`/`@ffs` emit
+   `__builtin_popcount`/`ctz`/`clz`/... dispatched on operand width
+   (`emitter.c:8290`–`8336`); the alloc-size overflow guard emits
+   `__builtin_mul_overflow` (`emitter.c:1948`); the 15 `@atomic_*` intrinsics
+   emit `__atomic_load_n` / `__atomic_store_n` / `__atomic_compare_exchange_n` /
+   `__atomic_fetch_*` / `__atomic_*_fetch` (`emitter.c:8362`–`8400`).
+
+2. **Sub-architecture is GCC's job via `-march`.** The author does not pick
+   between `POPCNT` (SSE4.2) and a software popcount, or between `LZCNT` (BMI1)
+   and `BSR`. GCC picks based on `-march`/`-mtune`. This is why the existing
+   comment at `emitter.c` reads "All use GCC builtins — auto-port to
+   x86-64/ARM64/RISC-V without per-arch work." A Tier-A leaf is portable for
+   free: one leaf definition, every ISA GCC supports.
+
+3. **Effect row is DERIVED from the builtin's documented contract.** A Tier-A
+   leaf's categories (clobbers_flags, value_in_value_out, reads_mem/writes_mem
+   with width and ordering, requires_nonzero, ...) are not author-declared. They
+   are looked up in **one audited table** keyed by builtin name. This table is
+   written and reviewed **once** (it is `O(1)` maintenance: ~a dozen builtin
+   families, not per-binding and not per-ISA). The author of a Tier-A leaf
+   **cannot** state categories — declaring them is a compile error, because the
+   derive-table is authoritative (Step 1 of the implementation plan,
+   `option_e_plan.md` / the S1 derive-table in checker.c).
+
+4. **"Using intrinsics, not emulating."** GCC builtins emit the *real*
+   instruction the operation names; they are not a software shim that pretends
+   to be hardware. There is exactly **one** genuine emulation exception worth
+   naming: **RISC-V add-with-carry**. RISC-V has no architectural carry flag, so
+   `__builtin_add_overflow` on RISC-V compiles to a compare-and-branch sequence
+   that *computes* the carry rather than reading a flag. That is real emulation
+   — and it is the correct, safe behavior (the program-level result is
+   identical; only the produces_carry/consumes_carry category is a derived
+   property of the builtin contract, not of a physical flag). Every other
+   Tier-A op maps to a native instruction on every target that has one.
+
+**Coverage.** Tier A is roughly **95% of operations by count** — the entire
+computational / ALU / atomic / bit-manipulation surface. This is the
+"floor-by-subtraction" lever: each op that fits Tier A is an op that needs no
+raw-asm verification, no per-ISA binding, and no conformance witness. Maximize
+Tier A and the thing left to verify shrinks toward nothing.
+
+**The ordering caveat (must be wired, today it is a lie).** "Effect row derived
+from the builtin contract" is currently **false for the ordering category** on
+atomics. The emitter hardcodes `__ATOMIC_SEQ_CST` for every atomic value-op:
+`@atomic_load` → `..., __ATOMIC_SEQ_CST)` at `emitter.c:8364`, store at `:8368`,
+cas at `:8375`, the fetch ops at `:8399`; the duplicate site near
+`emitter.c:3128`–`3152` does the same; the inline comment at `emitter.c:8357`
+says "All SEQ_CST ordering for now (Ordering param deferred)." Only the
+**fence** path is ordering-parameterized (`__atomic_thread_fence(__ATOMIC_*)` at
+`emitter.c:3098`–`3102`, mirrored at `:6854`). Consequence for this design:
+until the ordering parameter is threaded through the atomic value-ops, the
+derive-table **must conservatively declare `ordering = seq_cst`** — the
+actually-emitted truth — rather than the author-intended ordering. Declaring
+anything weaker would make the derived row a lie about the emitted C. (Wiring
+this is Step 2 of the plan; ordering also stays value-intrinsic and is excluded
+from the fold and never witnessed — see the other sections.)
+
+### 3.4 Tier B leaf — raw asm (the irreducible residue)
+
+A **Tier-B leaf** is an operation that fails the decisive test: it CONFIGURES
+the machine, C has no model for it, and GCC therefore has no portable builtin.
+It is the **only** place a real mnemonic (raw assembly) is allowed to appear,
+and it is the only **gated** unit. Tier-B leaves are per-ISA and small.
+
+The Tier-B residue is roughly **~36 ops**, grouped:
+
+- **Control-state writes:** `CR0`/`CR3`/`CR4` reads/writes (`@cpu_read_cr3` /
+  `@cpu_write_cr3` etc.), `RDMSR`/`WRMSR` (`@cpu_read_msr` /`@cpu_write_msr`;
+  the emitter already emits the raw `rdmsr` at `emitter.c:7184`), `XSETBV`
+  (`@cpu_write_xcr0`).
+- **I/O ports:** `IN`/`OUT` byte/word/dword (`@port_in8` … `@port_out32`) — x86
+  port space, which C cannot address.
+- **Privilege transitions:** `SYSCALL`/`SYSRET`, `IRET`, and the ISA analogues
+  `ECALL` (RISC-V), `SVC`/`ERET` (ARM) — `@cpu_syscall` / `@cpu_sysret` /
+  `@cpu_iret`.
+- **Inspection / cache / TLB:** `CPUID`, `RDTSC`/`RDPMC`, `INVLPG`, `WBINVD`,
+  `CLWB`/`CLFLUSHOPT` (`@cpu_cpuid`, `@cpu_read_pmc`, the cache ops, etc.).
+
+These configure privilege, page tables, MSRs, I/O ports, and the interrupt flag
+— concepts C has no model for — so no portable builtin is possible, by
+construction, not by GCC's oversight.
+
+A Tier-B leaf's effect row cannot be derived from a builtin contract (there is
+no builtin). Instead it is, per category:
+
+- **WITNESSED** where the category is decidable on the host emulator — e.g.
+  clobbers_register/clobbers_flags via a sentinel sweep, changes_privilege via a
+  CPL readback, requires_nonzero via a zero-trap (see §"Conformance witness").
+- **DECLARED + TAINTED** where the category is not decidable on this host —
+  memory ordering (QEMU TCG flattens to TSO), x86 alignment (AC-off does not
+  trap), provenance_clear_on_output, and any privileged op on a non-x86 ISA for
+  which this environment has no system QEMU. The declaration stands but carries a
+  greppable floor marker that taints the importing function (see §"Taint").
+
+The Tier-B set is maintained **demand-driven** and **fail-closed**: a leaf is
+implemented only when firmware actually uses that op; an unimplemented
+privileged op is a **compile error**, never a silent hole. The set you *use* is
+mostly decades-stable (CR3/MSR/port/IRET/IF), and new privileged ops arrive
+slowly and vendor-driven (XSAVE, FSGSBASE, SMAP, PKE, CET each added theirs over
+a generation). So the burden tracks *your* usage — tiny and slow — not the ISA
+catalog.
+
+### 3.5 Worked classification
+
+| Operation | Level / Tier | Why | Emit / anchor |
+|---|---|---|---|
+| `a + b`, `x & mask`, `v << n` | **Level 0** | value-computation already in C's machine; already safe | plain C + `-fwrapv` / `_zer_shl` |
+| array index `buf[i]` | **Level 0** | in-machine; bounds checked by existing ZER | plain C + `_zer_bounds_check` |
+| `@bswap32(x)` | **Tier A** | pure value-computation, freestanding builtin exists | `__builtin_bswap32` (`emitter.c:8294`) |
+| `@popcount`/`@ctz`/`@clz`/`@ffs` | **Tier A** | in-machine bit query; GCC picks POPCNT/LZCNT via `-march` | `__builtin_*` (`emitter.c:8290`–`8336`) |
+| `__builtin_mul_overflow` (alloc guard) | **Tier A** | overflow-checked arithmetic, in-machine | `emitter.c:1948` |
+| `@atomic_add`, `@atomic_cas`, `@atomic_load` | **Tier A** | C11 atomics are part of the abstract machine | `__atomic_*` (`emitter.c:8362`–`8400`) |
+| RISC-V add-with-carry | **Tier A (emulated)** | no carry flag on RISC-V → builtin emits compute-the-carry sequence; the one true emulation case | `__builtin_add_overflow` lowering |
+| `@cpu_read_cr3` / `@cpu_write_cr3` | **Tier B** | page-table base register — C has no model | raw asm leaf, per-ISA |
+| `@cpu_read_msr` (`RDMSR`) | **Tier B** | MSR space; no freestanding builtin | raw `rdmsr` (`emitter.c:7184`) |
+| `@port_in8` / `@port_out32` (`IN`/`OUT`) | **Tier B** | x86 I/O port space; C cannot address it | raw asm leaf |
+| `@cpu_disable_int` / interrupt flag | **Tier B** | interrupt-enable flag; not in C's machine | raw `cli`/`sti`/`cpsid`/`csrci` leaf |
+| `@cpu_syscall` / `@cpu_iret` | **Tier B** | privilege transition | raw `syscall`/`iret`/`ecall`/`eret` leaf |
+| `@cpu_cpuid` | **Tier B** | feature-inspection instruction; no portable builtin | raw `cpuid` leaf |
+
+Disambiguation rule when an op looks borderline: apply the freestanding test. If
+`gcc -ffreestanding` accepts a builtin for it, it is Tier A; if the only way to
+emit it is `__asm__` with a mnemonic, it is Tier B. There is no third option and
+no author discretion.
+
+### 3.6 The floor-by-subtraction principle
+
+The strategic claim of this partition: **safety by avoidance, not by
+verification.** Every operation pushed into Tier A is an operation that:
+
+- needs no raw-asm verifier (it has no asm),
+- needs no per-ISA binding (GCC + `-march` ports it),
+- needs no conformance witness (its categories are derived from a one-time
+  audited table, not observed),
+- and inherits ZER's existing Level-0 value safety through its operands.
+
+Because Tier A absorbs ~95% of operations, the set that needs real
+raw-assembly verification — the Tier-B leaves — is small (~36, per-ISA,
+demand-driven, fail-closed). The residual floor of the entire asm-safety design
+(silicon errata, QEMU/TCG fidelity, ordering, non-x86 privileged asm on this
+host) concentrates into that small set and into the one-time
+derive-table/fold-rule audit. That concentration — from `O(bindings)` distributed
+prose checklists down to `O(leaves) + O(1)` — is the central engineering payoff,
+and Tier A is the lever that makes it possible. Maximize Tier A; verify only what
+truly cannot live there.
+
+> Illustrative surface (proposed, not yet shipped): a leaf binding might be
+> declared `leaf @cpu_read_cr3 -> u64 { asm: "mov %%cr3, %0" ; categories:
+> changes_privilege, clobbers_register(...) }` for Tier B, versus a Tier-A op
+> which has **no** binding body at all — its categories come from the
+> derive-table and any author-stated categories are rejected. Treat all such
+> syntax as illustrative (proposed surface, not yet shipped); the load-bearing
+> facts are the emit anchors and the freestanding test above.
+
+
+## 4. Leaves — the audited primitive unit
+
+A **leaf** is the smallest indivisible asm/operation unit that ZER trusts directly,
+rather than deriving by composition. It is the only place a Tier-B raw mnemonic may
+appear, and it is the only gated/audited unit in the whole design. Everything above
+the leaf line (Section 5, composition) is *derived*: a composed op carries no asm and
+its effect row is folded from its children by closed rules. Composition can only
+faithfully propagate what the leaves declare — so **all safety is relative to leaf
+correctness, and the floor concentrates into the leaf set.** The leaf set is small
+and per-ISA; the audit is centralized. This is the genuine shrink from Option E's
+O(bindings) distributed prose-checklists to O(leaves)+O(1)-fold-proof (the closure
+theorem, Section 6).
+
+### 4.1 The one test that classifies a leaf
+
+Every operation is sorted by a single structural question:
+
+> *Is the operation INSIDE C's abstract machine (a value-computation), or does it
+> CONFIGURE the machine (privilege, page tables, MSRs, I/O ports, the interrupt
+> flag — concepts C has no model for)?*
+
+- **Value-computation** → **Tier A leaf** (a GCC builtin; no raw asm; portable).
+- **Machine-configuration** → **Tier B leaf** (raw mnemonic; per-ISA; witnessed or tainted).
+
+Below both tiers sits **Level 0** — plain ZER arithmetic (`+`, `&`, `<<`, `>>`).
+Level 0 is *not a leaf*: it emits ordinary C and is already fully safe (overflow
+wraps under `-fwrapv`, over-width shift = 0; see CLAUDE.md "No undefined behavior").
+It is the lowest primitive but needs no asm-safety machinery at all.
+
+The split is objective, not stylistic. The boundary is **"does it compile under
+`-ffreestanding`"**: `__builtin_clz` / `__builtin_add_overflow` / `__builtin_bswap`
+DO (Tier A), `RDMSR` has no portable builtin and does NOT (Tier B). Tier A covers
+~95% of operations by count (computational / ALU / atomic / bit-query). Tier B is
+~36 ops (control-state writes, I/O ports, privilege transitions, inspection /
+cache / TLB), per-ISA.
+
+### 4.2 Tier A leaves — derived from a GCC builtin
+
+A Tier-A leaf is *defined by* a GCC builtin. There is **no raw asm and no per-ISA
+work**: GCC selects the real instruction (and the right sub-arch instruction under
+`-march`) and the emitted C is portable across every backend GCC supports. The leaf's
+effect row is **DERIVED** from the builtin's documented C11/GCC contract via **ONE
+audited derive-table** — a one-time mapping `builtin-name -> category bitset`, audited
+once against the contract, not re-audited per binding.
+
+Tier-A leaves already ship in ZER as the 15 `@atomic_*` and 8 bit/bswap intrinsics
+(CLAUDE.md "Atomic Intrinsics", "Bit Query / Byte Swap Intrinsics"). Their emission
+is the existing builtin-routing surface in `emitter.c` (the `atomic_*` dispatch at
+`emitter.c:8355` onward; the bit-query dispatch at `emitter.c:8303` onward). Under
+this design those emission sites stay; what is ADDED is the derive-table that reads
+the builtin name and yields the categories, replacing any author-declared categories.
+
+**Derive-table shape (illustrative — proposed surface, not yet shipped):**
+
+```
+builtin                       categories (bitset)                        notes
+----------------------------- ------------------------------------------ ---------------------------
+__builtin_add_overflow        value_in_value_out, produces_carry,        carry-out is the bool result
+                              no_memory_effect, clobbers_flags
+__builtin_clz / __builtin_ctz value_in_value_out, no_memory_effect,      UB at input 0 -> requires_nonzero
+                              requires_nonzero
+__builtin_popcount/parity/ffs value_in_value_out, no_memory_effect       defined at 0 -> NO requires_nonzero
+__builtin_bswap{16,32,64}     value_in_value_out, no_memory_effect       pure
+__atomic_fetch_add (etc.)     reads_mem(w,ord), writes_mem(w,ord),       ordering value-intrinsic (4.5)
+                              value_in_value_out
+__atomic_compare_exchange_n   reads_mem(w,ord), writes_mem(w,ord),       lock-free-width guard (4.4)
+                              value_in_value_out, requires_nonzero(ptr)
+__atomic_thread_fence         memory_barrier(ordering)                   fence path, ordering-parameterized
+```
+
+Two soundness columns are mandatory in this table and must be derived from the
+contract, never from the author:
+
+#### 4.4.a `requires_nonzero` — the `clz(0)` / `ctz(0)` UB column
+
+GCC documents `__builtin_clz`/`__builtin_ctz` as **undefined when the input is 0**
+("If x is 0, the result is undefined"). On x86 the underlying BSF/BSR leaves the
+destination untouched, leaking garbage; without BMI1 (LZCNT/TZCNT) the UB stands.
+ZER already guards this: `@ctz`/`@clz` emit a zero-test that returns the type width
+on input 0 — see `emitter.c:8324-8331` (the `_zer_bz` temp + `== 0 ? width :
+__builtin_...`). `@popcount`/`@parity`/`@ffs` are defined at 0 by GCC and carry NO
+guard (`emitter.c:8332-8336`). The derive-table must encode this distinction as a
+`requires_nonzero` column: the same builtin family splits by UB-at-zero, and the
+column is exactly what the guard (or the caller's proven-nonzero range, Model 2 VRP)
+must satisfy. A wrong column = a re-introduced UB hole, so this column is part of the
+one-time audit, not author input.
+
+#### 4.4.b lock-free-width guard — the 16-byte CAS column
+
+`@atomic_cas` on a 16-byte operand emits `__atomic_compare_exchange_16`. On most
+targets that is **not** lock-free: GCC lowers it to an external `libatomic` call,
+which does not exist under `-ffreestanding` (link error) and is not interrupt-safe.
+This is the same hazard documented for atomics generally — "GCC `__atomic` builtins
+... On platforms WITHOUT them, GCC calls `libatomic` which may not exist for embedded
+targets" (docs/ASM_ZER-LANG.md:53-68) — sharpened to the 16-byte case. The derive
+column is a **lock-free-width guard**: widths 1/2/4/8 derive normally; width 16 (and
+any width whose `__atomic_*_N` is not lock-free on the target) is rejected at the
+leaf, not silently shipped as an external call. ZER already constrains atomic operand
+width to 1/2/4/8 bytes and warns on 32-bit libatomic (CLAUDE.md "Atomic width
+validation"); the lock-free-width guard makes 16-byte CAS a leaf-level error rather
+than a `-ffreestanding` time bomb.
+
+**Forbidding author categories for builtin-backed ops.** Because Tier-A categories
+are DERIVED, an author may NOT declare them. A leaf that names a builtin and also
+hand-writes a category bitset is a **compile error** (planned test
+`bind_on_builtin_op.zer`). The single source of truth is the derive-table; allowing a
+parallel author declaration would re-open the "verified against a lie" gap that
+Tier-A exists to close.
+
+**Illustrative Tier-A leaf (proposed surface, not yet shipped):**
+
+```
+# A leaf is DEFINED by the builtin; categories are derived, not written.
+leaf @arith_add_with_carry(u64 a, u64 b) -> (u64 sum, bool carry)
+    = builtin __builtin_add_overflow;
+    # effect row DERIVED: value_in_value_out, produces_carry,
+    #                     clobbers_flags, no_memory_effect
+    # author MUST NOT restate categories -> bind_on_builtin_op.zer = compile error
+```
+
+### 4.3 Tier B leaves — per-ISA raw asm, witnessed or tainted
+
+A Tier-B leaf is the *only* construct in which a real mnemonic appears. It exists
+solely for ops OUTSIDE C's abstract machine that GCC has no portable builtin for:
+
+- **control-state writes** — CR0/CR3/CR4, RDMSR/WRMSR, XSETBV
+- **I/O ports** — IN/OUT
+- **privilege transitions** — SYSCALL/SYSRET, IRET, ECALL, SVC, SMC, hypercall
+- **inspection / cache / TLB** — CPUID, RDTSC, INVLPG, WBINVD, CLWB, CLFLUSHOPT
+
+These map to ZER's existing privileged intrinsic batches D-Alpha-3/4/9..14 (CLAUDE.md
+"Interrupt Control", "MSR/CR/XCR0 Access", "Privileged Mode Transitions", etc.). Each
+CONFIGURES the machine; no portable builtin can express "switch address space"
+(`@cpu_write_cr3`) or "read a model-specific register" (`@cpu_read_msr`).
+
+A Tier-B leaf wraps its mnemonic in the existing **structured asm** form (CLAUDE.md
+line 265; docs/ASM_ZER-LANG.md "Extended Inline ASM"): a block with `instructions:`,
+`inputs:`, `outputs:`, `clobbers:`, and the **mandatory `safety:` string (>= 30
+chars, S4 audit-trail rule)**. The leaf additionally DECLARES its effect row. That
+declaration cannot be taken on the author's word: it is either **WITNESSED** (Section
+on conformance witness — for decidable categories, on x86, via QEMU) or **TAINTED**
+(Section on the named floor — for categories that are neither derivable nor decidably
+observable). The classic under-declared-clobber bug — a leaf that touches `rax` but
+forgets to list it — is exactly the witness sweet spot: a sentinel-fill of all
+registers, run, read-back catches it (something GCC and Rust cannot, because they
+trust the author's clobber list).
+
+**Illustrative Tier-B leaf, x86 privileged (proposed surface, not yet shipped):**
+
+```
+# RDMSR — no portable builtin; CONFIGURES the machine (reads a model-specific reg).
+leaf @cpu_read_msr(u32 msr) -> u64 for arch x86_64
+    asm {
+        instructions: "rdmsr"
+        inputs:   { "ecx" = msr }
+        outputs:  { lo = "eax", hi = "edx" }     # result = (hi << 32) | lo
+        clobbers: { }
+        safety: "RDMSR reads MSR[ecx]; faults #GP if CPL!=0 or MSR unimplemented"
+    }
+    declares {
+        changes_privilege: requires_cpl0,         # WITNESSABLE (CPL readback)
+        reads_mem: no,  writes_mem: no,
+        clobbers_register: { },                   # WITNESSABLE (sentinel sweep)
+        clobbers_flags: false,
+    };
+    # changes_privilege + clobbers_* -> witnessed under qemu-system-x86_64.
+    # No ordering/provenance categories here -> nothing tainted for this leaf.
+```
+
+ZER's existing operand-level safety stays ACTIVE across the Tier-B operand boundary
+(unlike Rust, which goes blind inside `unsafe { asm!() }`): Z-rules Z1-Z8/Z11/Z12
+keep UAF / move / VRP / provenance / escape / qualifier / MMIO tracking live through
+asm `inputs:`/`outputs:` (CLAUDE.md line 267-271). Register NAME validity is delegated
+to GCC (the assembler errors on a bad name); reserved registers (sp/bp/pc) are
+structurally banned as operands (docs/ASM_ZER-LANG.md "Reserved register rejection").
+So even a Tier-B leaf is not a total blind spot for value-level program-consequence —
+the witness/taint machinery is only about the *effect row* (the machine-config side),
+and operand values remain owned by the existing checker.
+
+### 4.4 Sub-architecture is handled AT THE LEAF
+
+Sub-arch divergence does not leak above the leaf line. A single op can have multiple
+leaves — one per sub-arch — selected by GCC's target macros at compile time, exactly
+as ZER already emits dual-path atomics (docs/ASM_ZER-LANG.md:70-96, "Dual-Path
+Emission" gated on `__ARM_FEATURE_LDREX` / `__ARM_ARCH_6M__` / `__riscv_atomic` /
+`__AVR__`). The canonical case is Cortex-M0 vs M4: M3/M4/M7 have `ldrex`/`strex`
+(native atomics, real effect row), M0/M0+ have neither and must fall back to
+interrupt-disable.
+
+**Illustrative per-sub-arch leaf, Cortex-M0 vs M4 (proposed surface, not yet shipped):**
+
+```
+# @atomic_cas on ARM: the leaf picks its body by GCC sub-arch macro.
+leaf @atomic_cas(*shared u32 p, u32 expected, u32 desired) -> bool for arch arm
+    when __ARM_FEATURE_LDREX:           # Cortex-M3/M4/M7 — native
+        = builtin __atomic_compare_exchange_n;   # Tier-A derive here
+        # effect row DERIVED: reads_mem(4,seq_cst), writes_mem(4,seq_cst),
+        #                     value_in_value_out
+    when __ARM_ARCH_6M__:               # Cortex-M0/M0+ — no ldrex/strex
+        asm {
+            instructions: "mrs %0, primask\n cpsid i ... cpsie i"
+            safety: "M0 has no LL/SC; CAS emulated under interrupt-disable critical section"
+        }
+        declares {
+            changes_privilege: toggles_interrupt_flag,   # TAINTED (no QEMU here)
+            reads_mem: yes, writes_mem: yes,
+            clobbers_flags: true,
+        };
+```
+
+The caller writes `@atomic_cas` once. Which leaf body compiles is decided by the
+`#if defined(...)` macro GCC evaluates per target. The M0 leaf's
+`toggles_interrupt_flag` is a non-x86 privileged effect that **cannot be witnessed on
+this host** (env limit: only `qemu-system-x86_64` is present; no
+`qemu-system-aarch64`) — so it stays TAINTED, marking any importer. The M4 leaf is
+Tier-A-derived and clean. Both presentations of the same op are correct; sub-arch is
+fully absorbed at the leaf and never seen by composition.
+
+### 4.5 Effect rows — what a leaf declares/derives
+
+An **effect row** is the leaf's category set, drawn from Option E Layer-1's CLOSED
+category vocabulary (asm_lang_zer_safe.md §1.7): `clobbers_flags`,
+`clobbers_register(set)`, `no_memory_effect`, `reads_mem(width,ordering)`,
+`writes_mem(width,ordering)`, `requires_aligned(n)`, `requires_nonzero`,
+`memory_barrier(ordering)`, `produces_carry` / `consumes_carry`, `changes_privilege`,
+`control_flow`, `provenance_clear_on_output`, `value_in_value_out`. The row is the
+type-level interface (ERBT — Effect-Row Binding Types, Section 5): the checker folds
+child rows into a parent row by closed rules. A leaf's row is the *base case* of that
+fold.
+
+**The fold-vocabulary exclusion that the leaf must respect.** `clobbers_register`,
+`clobbers_flags` fold by UNION/OR (sound); `requires_aligned` folds by MAX (sound).
+**Ordering / `memory_barrier` does NOT fold soundly** — max-ordering-of-children is
+unsound. This is ZER's own evidence, not a hypothesis: Session-G Phase 3 in-block
+ordering enforcement was ABANDONED because it false-positived the canonical libpmem
+CLWB+SFENCE idiom (CLAUDE.md:1294-1296). Consequence at the leaf: a leaf may declare
+ordering on its memory categories, but ordering is **value-intrinsic only** — it lives
+on `reads_mem`/`writes_mem`/`memory_barrier` as a property of THAT op and is never
+folded positionally. Positional `memory_barrier` is excluded from the composition
+fold vocabulary entirely. (See the observability spectrum: clobber = sound-fold +
+observable-witness = best; ordering = unsound-fold + unobservable = worst, stays
+floor.)
+
+**Today's ordering caveat the derive-table must encode.** ZER's atomic value-ops
+hardcode `__ATOMIC_SEQ_CST` — `emitter.c:8364` (`__atomic_load_n(..., __ATOMIC_SEQ_CST)`),
+`:8368` (store), `:8375` (CAS). The fence path IS ordering-parameterized
+(`emitter.c:3098-3102`, the three `__atomic_thread_fence(__ATOMIC_{SEQ_CST,RELEASE,
+ACQUIRE})` arms). So "ordering derived from the builtin's contract" is FALSE today for
+value-ops. Until the ordering parameter is wired through, the derive-table must
+**conservatively declare `ordering = seq_cst`** for those ops — the actually-emitted
+truth — rather than a weaker ordering the code does not produce.
+
+### 4.6 New-ISA bring-up: write the leaf set once, compositions follow for free
+
+The leaf line is where the flexibility/maintainability decoupling lives. Bringing up a
+new ISA = writing **its leaf set once** (bounded: the ~36 Tier-B ops it actually
+needs, plus the Tier-A ops which are mostly free because GCC already retargets the
+builtins). Tier-B leaves are **demand-driven and fail-closed**: implement a leaf only
+when firmware on that ISA uses that op; an unimplemented privileged op is a compile
+error, never a silent hole. The burden tracks YOUR usage (tiny, slow — CR3/MSR/port/
+IRET/IF are decades-old, implemented once; vendor extensions like FSGSBASE/SMAP/PKE/
+CET arrive slowly, per-generation), not the whole ISA catalog. This deliberately does
+NOT trip the rejected "proactive per-instruction/per-vendor whole-ISA table" pattern
+(the DCA/DSC disqualifier) — those needed the entire opcode table up front or be
+fail-open; demand-driven + fail-closed + one-tiny-leaf-at-a-time does not.
+
+Once a new ISA's leaf set exists, **every composition (Section 5) works on it for
+free** — composed ops contain no asm and no per-ISA branches; they fold the new
+leaves' rows by the same closed rules. Flexibility (new composed ops) and per-ISA cost
+(new leaf sets) are independent axes. This is the concrete payoff of the adopted
+Effect-Row Composition design: per-ISA bring-up is a bounded one-time leaf audit, and
+the open-ended expressive surface (composition) costs zero per ISA.
+
+### 4.7 Why the leaf is the floor (and what it is NOT)
+
+The leaf is the audited primitive unit precisely because it is where trust is *placed
+directly* rather than derived:
+
+- **Tier A** trust anchors in the **GCC/C11 builtin contract** (one audited table,
+  shared, auditable without silicon — but neither it nor GCC is the die).
+- **Tier B** trust anchors in either a **QEMU/TCG witness** (for decidable categories
+  on x86) or an **explicit taint marker** (for ordering, non-x86 privileged asm on
+  this host, and `provenance_clear_on_output`).
+
+What the leaf line does NOT claim: it does not verify silicon semantics (errata,
+microarchitecture — the named hardware-consequence floor, CLAUDE.md "program- vs
+hardware-consequence"), and a sound fold above a *lying* leaf will faithfully
+propagate the lie green. Composition safety alone is therefore insufficient; safety is
+relative to leaf correctness. That is the honest statement of the design: the floor is
+not eliminated, it is **concentrated** into a small, centralized, per-ISA leaf set plus
+the one-time derive-table and fold-rule audit — reviewable without a die, and far
+smaller than Option E's O(bindings) distributed prose checklists.
+
+
+## 5. Composition and Effect-Row Types (the flexible layer)
+
+### 5.1 What this layer is, and why it exists
+
+Sections 3-4 establish the **leaf** as the audited primitive unit: a Tier-A leaf is a
+GCC builtin (`__builtin_add_overflow`, `__atomic_*`, `__builtin_clz`, `__builtin_bswap`)
+whose effect row is *derived* from the builtin's documented contract; a Tier-B leaf is
+raw asm for an op outside C's abstract machine (CR3/MSR/port/IRET/CPUID...), whose effect
+row is *witnessed* (decidable categories) or *declared+tainted* (the rest). Leaves are
+**small** (~36 Tier-B ops, ~95% of ops by count covered by Tier A) and **per-ISA**, and
+they are the **only** place raw asm appears.
+
+Leaves alone are not enough for a real firmware codebase. Firmware authors continually
+need *new* operations that are not single instructions: a 128-bit add-with-carry chain, a
+"disable interrupts, read a control register, restore" critical-region helper, a
+masked-load-then-popcount, a CAS-loop fetch-max. Under the rejected Intrinsic-Maximalism
+design these would each require a **core release** (extend the frozen taxonomy, ~1-2
+ops/decade) — that is the flexibility cost that disqualified it. Under the **Effect-Row
+Composition** design (the flexibility-weighted winner, ADOPTED), authors get a third
+construct:
+
+> **Composition: an author recombines existing leaves and ops into a new named operation
+> with NO asm and NO core release.** The composed operation's effect row is *derived
+> mechanically* from its children by closed fold rules. The author writes only ZER-level
+> glue (Level-0 arithmetic, control flow, calls to leaves/ops); they never write a
+> mnemonic.
+
+This is the layer that delivers the **flexibility** half of the triangle
+(flexibility / safety / maintainability — pick two; Composition pays the third with a
+small leaf-audit + a named floor past the leaf boundary). New operations cost an author a
+local edit, not a language revision. A new ISA's bring-up cost is "write its leaf set
+once" (bounded); after that **every existing composition runs on it for free** — flexibility
+and per-ISA cost *decouple*.
+
+### 5.2 The structural gate: the composed-binding grammar has no mnemonic production
+
+The single load-bearing structural fact of this layer:
+
+> **You literally cannot write freeform asm in a composition.** The composed-binding
+> grammar production for a composition body has **no mnemonic / no instruction string**.
+> Raw asm is reachable only through `NODE_LEAF_BIND` (Tier-B), which is itself gated behind
+> a closed privileged allow-list (§6 / STEP 4 of the plan).
+
+This is deliberately the same shape as ZER's existing CLOSURE gates: there is *no path*
+to a typed raw pointer except `@inttoptr`+mmio (anything else is a compile error); there is
+*no path* to raw asm in a composition except dropping down to a leaf (which is allow-listed,
+not freeform). The gate is grammatical, not a lint — a composition that tries to embed a
+mnemonic does not parse into a `NODE_COMPOSED_BIND` at all. Concretely (planned AST split,
+STEP 3):
+
+- `NODE_LEAF_BIND` — **has** an `instructions` field (Tier-B raw asm); subject to the
+  privileged allow-list fence; subject to the conformance witness (§4).
+- `NODE_COMPOSED_BIND` — **has no** `instructions` field. Its body is a list of child
+  calls (other ops / leaves / Level-0 ZER) plus glue. The verifier folds children's
+  effect rows; it never parses an asm string here because there is none to parse.
+
+The `@bind` keyword itself is fenced (STEP 4): `@bind` on an op not on the closed
+privileged allow-list = **compile error** (test fixtures `composed_bind_mnemonic.zer`,
+`bind_on_builtin_op.zer`). Binding a builtin-backed (Tier-A) op by hand is forbidden because
+its row is *derived*, not declared — declaring categories for it would let an author state a
+lie the deriver would otherwise have gotten right.
+
+### 5.3 Effect rows and the DERIVE-vs-DECLARE direction of trust
+
+An **effect row** is the multiset of categories an operation carries, drawn from the
+**closed, ZER-owned category vocabulary** (`docs/asm_lang_zer_safe.md:2270-2282`):
+
+```
+clobbers_flags, clobbers_register(name),
+reads_mem(width, ordering), writes_mem(width, ordering),
+requires_aligned(n), requires_nonzero(operand), requires_in_range(operand, lo, hi),
+memory_barrier(acquire | release | seqcst),
+produces_carry, consumes_carry,
+changes_privilege(from, to),
+control_flow(returns | jumps_to | calls),
+provenance_clear_on_output(operand),
+value_in_value_out, no_memory_effect, no_flag_effect
+```
+
+The category set is **closed** (extended only via a ZER release) — this is the kind-difference
+from SPARK that the main doc elevates to load-bearing: a binding contract "can be wrong in
+*exactly one way*: the declared categories do not match what the asm body actually does"
+(`docs/asm_lang_zer_safe.md:2488`). There is no free-form predicate to mis-state.
+
+For compositions the row is **DERIVED** (never trusted from the author):
+
+1. The verifier computes each child's effect row (a leaf's row, or a recursively-derived
+   sub-composition's row).
+2. It **folds** the children's rows by the closed fold rules of §5.4 into one row for the
+   composition.
+3. The author MAY write an **EXPECTED** row annotation. The checker compares
+   **declared vs derived**. Mismatch = **COMPILE ERROR** (illustrated in §5.6). The
+   expected row is a *documentation/assertion convenience that the compiler proves*, never an
+   input to the analysis — the derived row is authoritative.
+
+This inverts Option E's trust direction. Option E checked Layer-3 *call sites* against the
+binding's **DECLARED** categories, so a wrong declaration meant "Layer-3 verified against a
+lie" (green, wrong on silicon). Composition **repoints Layer-3 from DECLARED to DERIVED**
+(STEP 3): above the leaf line, nothing is declared — it is computed. The floor therefore
+*concentrates into the leaf set* and does not leak per-composition.
+
+### 5.4 Fold rules and fold soundness (the part that must not be wrong)
+
+A fold rule is sound iff the composition's derived category is **at least as strong /
+at least as conservative** as the true effect of running the children in sequence. Sound
+folds:
+
+| Category | Fold operator | Why sound |
+|---|---|---|
+| `clobbers_register(name)` | **UNION** of children's clobber sets | If any child clobbers a register, the composition clobbers it. Register write-sets are **structural, not data-dependent** — a sound over-approximation never drops a real clobber. |
+| `clobbers_flags` | **OR** | If any child writes flags, the composition writes flags. |
+| `requires_aligned(n)` | **MAX** of children's `n` | The strictest child precondition is the composition's precondition; satisfying MAX satisfies all. |
+| `control_flow(...)` | **OR** (lattice join of `returns`/`jumps_to`/`calls`) | If any child can jump/call/not-return, the composition can. |
+| `produces_carry` / `consumes_carry` | by the carry data-flow of the composition body (intrinsic to the op chain), not a positional fold | Carry is a value flowing through operands, tracked like any value. |
+| `value_in_value_out`, `no_memory_effect`, `no_flag_effect` | **AND** (a composition is pure / flag-free / memory-free only if **all** children are) | Removing a guarantee is the conservative direction. |
+
+`clobbers_register` and `clobbers_flags` folding by union/OR is the high-confidence corner
+of the **observability spectrum**: sound fold (this section) **times** observable witness
+(§4 sentinel-sweep) = the best-achievable category. A category's safety-achievability =
+(fold soundness) × (witness observability); clobber scores high on both.
+
+**The category with NO sound fold — EXCLUDED:**
+
+> **`memory_barrier` / ordering does not fold soundly and is therefore EXCLUDED from the
+> composition fold vocabulary.** Ordering stays **value-intrinsic only** (a property of a
+> single `reads_mem`/`writes_mem`/atomic op's own `ordering` parameter), never a positional
+> category the fold combines across children.
+
+The tempting-but-wrong rule is "the composition's barrier = MAX-ordering-of-children" (treat
+`seqcst > release/acquire > relaxed` as a lattice and join). It is **unsound**, and ZER has
+*its own first-hand evidence* of exactly this failure mode:
+
+> Session G (System #30 atomic ordering): Phases 1-2 done (plumbing + classification in
+> vendored tables); **Phase 3 in-block enforcement ABANDONED** (false-positived the
+> canonical multi-block CLWB+SFENCE libpmem idiom). Lesson: don't ship enforcement that
+> rejects valid code patterns.
+> — `CLAUDE.md:1294-1297`
+
+The libpmem persistence idiom is `CLWB <addr>` (cache-line write-back, a *weak*, unordered
+flush) followed later, possibly in a *separate block*, by a single `SFENCE` that orders the
+whole batch. A positional max-of-children fold sees the `CLWB` as carrying weak/no ordering
+and the `SFENCE` as `seqcst`, and either (a) demands a fence the author correctly placed
+elsewhere (false positive — exactly what killed Session-G Phase 3), or (b) where used as a
+*witness*, certifies a too-weak fence as adequate because QEMU-TCG flattens to TSO and hides
+the gap (false confidence — §4). Ordering is therefore the **low-low** corner: unsound fold
+× unobservable witness = the **irreducible-hardest** category. It is not folded, not witnessed,
+and stays in the named **TAINT** floor (§7). It is the empirical confirmation that ZER's
+litmus/concurrency analysis already reached: ordering is the one category no structural
+mechanism closes.
+
+Note the asymmetry: `requires_aligned` is excluded from *witnessing on x86* (AC-off ⇒ no
+trap) but is **soundly folded** by MAX and remains a real precondition checked at the Level-3
+call site; ordering is excluded from *both* fold and witness. The two exclusions have
+different causes and different residual status.
+
+### 5.5 ERBT — Effect-Row Binding Types (the type-theoretic backbone)
+
+**ERBT** is the type system in which the above lives. Categories are treated as **rows**
+(in the record-/effect-row sense: an unordered, label-keyed bag of category fields). An
+operation's type is `(value signature) carrying (effect row)`. ERBT gives the layer three
+properties:
+
+1. **Compositionality** — the effect row of a composite is a pure function of its children's
+   rows under the §5.4 fold operators. This is what makes "no core release per new op"
+   possible: adding a composition adds no axioms, only an application of existing fold rules.
+2. **Inference** — the author need not annotate the row; the checker *infers* it bottom-up
+   from leaf rows (the EXPECTED annotation, when present, is checked, not required).
+3. **Structural compile-gate** — a row mismatch is a **type error at compile time**, not a
+   CI finding. This is the CLOSURE-philosophy stance: "run a CI test" is the trust-the-user
+   model ZER *rejects*; ERBT makes the wrong composition **fail to compile**.
+
+ERBT is **one-time maintenance**: the fold-rule table (§5.4) and the closed category
+vocabulary (§5.3) are defined once and audited once. Adding the thousandth composition
+exercises the same table as the first. This is the O(leaves) + O(1)-fold-proof cost shape
+that replaces Option E's O(bindings) distributed-prose checklists.
+
+The check the verifier performs at a composition is a **row subtype** test. Let `D` = derived
+row, `E` = author-expected row. The composition is well-typed iff `E ⊒ D` *and* `D ⊒ E` in
+the relevant direction per category, i.e. the author's stated row must **exactly match** the
+derived row component-wise (over-claiming a clobber the body doesn't have is also rejected, so
+the EXPECTED annotation stays honest documentation). For *uses* of the composition at Level-3,
+the standard subsumption applies: a call site must satisfy every `requires_*` precondition in
+the derived row, and must treat every `clobbers_*` / effect as actually occurring.
+
+### 5.6 Illustrative compose surface and a mismatch compile error
+
+*(illustrative — proposed surface, not yet shipped; STEP 3 wires `NODE_COMPOSED_BIND`.
+Syntax not final; the load-bearing facts are: no `instructions` field, derived row,
+declared-vs-derived check.)*
+
+A 128-bit add built by chaining the `@arith_add_with_carry` op (itself a Tier-A leaf backed
+by `__builtin_add_overflow`, row derived from the builtin contract):
+
+```zer
+// (illustrative — proposed surface, not yet shipped)
+compose add128(a: u128, b: u128) -> { result: u128, carry: u1 } {
+    lo = @arith_add_with_carry(a.low,  b.low,  0)      // child 1
+    hi = @arith_add_with_carry(a.high, b.high, lo.c_out) // child 2
+    return { result: u128_from(hi.result, lo.result), carry: hi.c_out }
+    // NOTE: no `instructions:` block exists in this grammar. None can be written.
+}
+// Derived row (folded over the two children):
+//   { value_in_value_out, produces_carry, consumes_carry, clobbers_flags,
+//     no_memory_effect }   <- clobbers_flags by OR; carry by the chain's data-flow.
+```
+
+A composition that states an EXPECTED row contradicting the derived row — the canonical
+compile error this layer produces:
+
+```zer
+// (illustrative — proposed surface, not yet shipped)
+compose disable_irq_read_msr(idx: u32) -> u64
+  expects { no_memory_effect, no_flag_effect, value_in_value_out } {   // <-- author's claim
+    @cpu_disable_int()                 // Tier-B leaf: changes_privilege-adjacent, clobbers IF
+    v = @cpu_read_msr(idx)             // Tier-B leaf: declared+tainted (ordering/priv)
+    @cpu_enable_int()
+    return v
+}
+```
+
+```
+error[ERBT-row-mismatch]: composition `disable_irq_read_msr` declared an effect row
+        that does not match the row derived from its children
+  --> firmware/cpu.zer:14:3
+   |
+14 |   expects { no_memory_effect, no_flag_effect, value_in_value_out }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = derived row (folded over children @cpu_disable_int, @cpu_read_msr, @cpu_enable_int):
+       { clobbers_flags(IF), changes_privilege(...), value_in_value_out }   [TAINTED: ordering of @cpu_read_msr]
+   = declared `no_flag_effect`   but child @cpu_disable_int folds clobbers_flags  -> contradiction
+   = declared `no_memory_effect` is consistent (kept)
+   = note: the derived row is authoritative; remove the false guarantees or change the body.
+   = note: this composition is TAINTED because it transitively uses @cpu_read_msr, whose
+           ordering category is author-declared and unverifiable on this host (see §7).
+```
+
+The author cannot suppress this by re-declaring; the only resolutions are to fix the body or
+correct the EXPECTED annotation to the truth. There is no flag to demote the error to a
+warning — that would reintroduce the trust-the-user model.
+
+### 5.7 Closure: what this layer proves, and what it does not
+
+The composition layer carries exactly **one** theorem and is honest about its one limit:
+
+- **Theorem (composition soundness).** Given (i) safe leaves and (ii) sound fold rules,
+  *everything composed above the leaf line is safe*: every derived row is a faithful
+  over-approximation of the composite's true effect, so every Level-3 use is checked against
+  the truth, not a declaration.
+- **The limit (faithful propagation of a lie).** Composition safety **alone is not
+  sufficient**. A sound fold *faithfully propagates* a lying leaf — if a Tier-B leaf
+  under-declares a clobber, the union-fold dutifully omits it from every composition that uses
+  it. **Safety is RELATIVE TO leaf correctness.** This is by design: the floor
+  *concentrates* into the finite leaf set (§4 witness for decidable categories; §7 taint for
+  the rest) instead of smearing across O(bindings) prose checklists.
+
+This is the same closure shape ZER already relies on elsewhere: memory safety is closure over
+the allocation primitives; type safety is closure over the conversion intrinsics; concurrency
+safety is closure over the sync primitives. In each, a finite **primitive set** is audited
+once and a **propagation rule** ("P holds for all programs") carries it everywhere. Here the
+leaves are the primitive set and the §5.4 fold is the propagation rule. The genuine shrink the
+main doc claims is real and measurable: O(bindings) distributed prose → O(leaves) +
+O(categories) centralized, reviewable-without-silicon audit.
+
+**Cross-references.** Leaf definition and the Tier-A/Tier-B split: §3. Conformance witness for
+decidable Tier-B categories: §4. The privileged allow-list that fences `@bind`: §6. The named
+TAINT floor for ordering / non-x86 privileged asm / `provenance_clear_on_output`: §7.
+Implementation: `option_e_plan.md` Phase 1 (delete per-arch tables) precedes all of this; the
+composition machinery is STEP 3 (`NODE_COMPOSED_BIND`, fold OR/MAX, exclude positional
+`memory_barrier`, repoint Layer-3 to DERIVED).
+
+
+## 6. The closure argument and floor concentration
+
+This section states the theorem that makes Effect-Row Composition safe, proves
+its shape against ZER's existing closure machinery, and is honest about exactly
+what the theorem does and does not buy. A fresh reader should leave knowing
+*which artifacts are trusted, how few of them there are, and why everything
+above them is safe for free.*
+
+### 6.1 The core theorem
+
+> **Safe leaves + sound fold ⇒ everything composed above the leaf line is safe.**
+
+Unpacked into its two premises and one conclusion:
+
+- **Leaf correctness (premise 1).** Every leaf's declared effect row is the
+  truth about that leaf. For a **Tier-A leaf** (a GCC builtin —
+  `__builtin_add_overflow`, `__atomic_*`, `__builtin_clz/ctz/popcount`,
+  `__builtin_bswap`) the row is *derived* from one audited table mapping the
+  builtin's documented contract to a category bitset; correctness reduces to
+  "the table faithfully transcribes GCC's documented contract." For a **Tier-B
+  leaf** (raw asm for control-state / I/O / privilege / inspection ops —
+  ~36 ops, the only place a real mnemonic appears) the row is *witnessed* for
+  the decidable categories (clobbers, privilege, nonzero, trapping alignment)
+  and *declared+tainted* for the rest; correctness reduces to "the witness
+  observed what the row claims" plus "the tainted residue is named, not assumed
+  green."
+
+- **Fold soundness (premise 2).** Each fold rule that combines children's rows
+  into a composed op's row is sound: the composed row over-approximates the
+  union of effects the children can actually have. `clobbers_register` and
+  `clobbers_flags` fold by **UNION/OR** (a composition clobbers a register iff
+  *some* child clobbers it — sound by construction). `requires_aligned(n)` folds
+  by **MAX** (the strictest child constraint dominates — sound). Categories that
+  do **not** fold soundly are *excluded from the fold vocabulary entirely*:
+  positional `memory_barrier` / ordering is excluded because "max-ordering of
+  children" is unsound (see §6.5). The fold vocabulary is therefore a closed,
+  audited set of rules, each individually proven monotone over its lattice.
+
+- **Conclusion.** Any operation written with the `compose` form — which has
+  **no mnemonic production** in its grammar, so it can only recombine existing
+  leaves and Level-0 ZER expressions — has an effect row that is correct by
+  the soundness of the fold applied to correct children. By induction over the
+  composition tree (leaves at the base, folds at each internal node), the row
+  of *any* composed op is correct. The Layer-3 static verifier then checks
+  Layer-3 call sites against this **derived** row (Phase 3 repoints Layer 3 from
+  the author-DECLARED row to the DERIVED row), so call-site checking inherits
+  the correctness.
+
+This is the whole safety story for the flexible layer: authors compose freely,
+the checker folds, and no new trusted artifact is created by any composition.
+
+### 6.2 Composition safety alone is INSUFFICIENT — safety is relative to leaf correctness
+
+The theorem is a conditional, and the antecedent matters. **A sound fold
+faithfully propagates a lying leaf.** If a Tier-B leaf *declares*
+`no_memory_effect` but its raw asm actually writes memory, the union/max fold
+will dutifully compute a composed row that *also* omits the memory effect —
+correctly, soundly, and wrong on silicon. The fold did its job perfectly; it
+propagated a falsehood it was never asked to detect.
+
+Therefore:
+
+- Composition safety is **conditional**, not absolute. The statement is
+  "compositions are as correct as their leaves," not "compositions are correct."
+- This is *exactly* the failure mode Option E carried (`docs/asm_lang_zer_safe.md`
+  §1.7): a binding whose asm does not honor its declared categories yields
+  "Layer 3 verified-against-a-lie" — green in the checker, wrong on the die.
+  Effect-Row Composition does **not** eliminate that failure mode. It
+  **relocates** it.
+
+### 6.3 Floor concentration — the actual contribution
+
+What changes between Option E and Effect-Row Composition is *where the
+unverifiable trust lives*, not whether it exists.
+
+- **Option E (dispersed floor).** Every `@bind` is an independent author claim.
+  "Does this binding's asm honor its declared categories?" is asked once per
+  binding, answered by a manual checklist, and the answer is distributed across
+  every binding library. Trust scales as **O(bindings)** prose checklists. Any
+  one wrong declaration is a silent hole, and there is no single place to look.
+
+- **Effect-Row Composition (concentrated floor).** Compositions create no new
+  trust — their rows are derived. The *only* artifacts that can be wrong are:
+  1. each **leaf's** effect row (≈36 Tier-B leaves + one Tier-A derive table),
+     and
+  2. each **fold rule** (a fixed, small set: union for clobbers, max for
+     alignment; ordering deliberately absent).
+  Trust scales as **O(leaves) + O(1) fold-proof.** The floor does not disappear;
+  it **concentrates** into the leaf set and the fold-rule set, which are small,
+  centralized, and reviewable *without a silicon die in hand*.
+
+The complexity reduction is the genuine deliverable. ZER's residual-floor
+accounting states it directly (see RESIDUAL FLOOR item 5): the audit surface
+shrinks from *O(bindings) distributed prose* to *O(leaves) + O(categories)
+centralized audit*. Concretely, ~95% of ops by count are Tier-A (derived from
+one table, zero per-ISA work, GCC selects the instruction and handles sub-arch
+via `-march`); only the ~36 Tier-B ops carry a per-ISA leaf, and only those
+~36 plus the fold rules are the trusted set.
+
+### 6.4 The same shape as ZER's existing closure argument
+
+This is not a new kind of proof. It is ZER's **Closure Principle**
+(`docs/primitives-data-races.md` §21.1, lines 1808-1816) applied to asm effect
+rows. The principle, stated in the repo:
+
+> "if the set of operations that can violate safety property P is closed under
+> a finite set of compiler-visible primitives, and the compiler verifies each
+> primitive against P, then P holds for all programs in the language."
+> — `docs/primitives-data-races.md:1810-1813`
+
+ZER already discharges this in four other domains; asm effect-correctness is the
+fifth instance of the *identical* structure:
+
+| Domain | Finite primitive set ("the leaves") | The fold / closure ("P holds for all programs") | Repo anchor |
+|---|---|---|---|
+| **Memory safety** | allocation primitives | access mechanism verified per-primitive; ownership intent via primitive choice | `primitives-data-races.md:72` |
+| **Type safety** | conversion intrinsics | structural correctness verified per-intrinsic | `primitives-data-races.md:73` |
+| **Concurrency** | sync primitives | every race-creating op goes through a finite primitive set | `primitives-data-races.md:828, 1346` |
+| **ASM effect-rows (this design)** | leaves: ~36 Tier-B raw-asm ops + 1 Tier-A derive table | sound fold (union/max) over composition trees; positional ordering excluded | this document |
+
+The mapping is exact: **the leaves are the finite primitive set; the fold is
+the "P holds for all programs" closure.** In memory safety, closure is taken
+over allocation primitives — verify each primitive's access mechanism and
+*every* program built from them is memory-safe. In type safety, over conversion
+intrinsics. In concurrency, over sync primitives. Here, over asm leaves: verify
+each leaf's row and prove each fold rule sound, and *every* composed op has a
+correct row. The fold *is* the mechanical step that turns "P holds for each
+primitive" into "P holds for all programs," because composition is the only way
+to build new ops and the fold preserves correctness across it.
+
+Same closure, same grammar-level enforcement: just as the language as a whole
+has "no path to the unsafe construct except a compiler-enforced gate" (no
+integer-to-pointer cast except through `@inttoptr`+`mmio` —
+`checker.c:5601-5608`), the `compose` form has **no mnemonic production** — you
+literally cannot write freeform asm in a composition. Raw asm is reachable
+*only* through a `NODE_LEAF_BIND` on a closed privileged allow-list (the
+`@inttoptr`-shaped gate for asm). The leaf line is the gate; everything above it
+is closed.
+
+### 6.5 What must be true for the theorem to hold (the complete trusted set)
+
+The theorem holds **iff** both of the following, and *nothing else*, are true.
+These are the only trusted artifacts; everything else is mechanically derived
+from them.
+
+1. **Each leaf's effect row is correct.**
+   - *Tier-A leaves:* the derive table faithfully transcribes each GCC builtin's
+     documented contract into a category bitset. One audited table, audited once.
+     **Caveat with a current anchor:** the derive table must declare the *truth
+     that is actually emitted*, not the truth on paper. Today the emitter
+     hardcodes `__ATOMIC_SEQ_CST` for atomic value-ops
+     (`emitter.c:3128`, `emitter.c:3134`, `emitter.c:3146`, `emitter.c:3152`),
+     so until ordering is wired through (Step 2) the derive table must
+     conservatively declare `ordering = seq_cst` — the emitted reality — not the
+     weaker ordering a programmable builtin could express. The fence path
+     *is* already ordering-parameterized (`emitter.c:3098-3102`,
+     barrier=SEQ_CST / barrier_store=RELEASE / barrier_load=ACQUIRE), which is
+     why ordering-on-fences and ordering-on-value-ops must not be conflated in
+     the table.
+   - *Tier-B leaves:* for **decidable** categories the witness observed what the
+     row claims (clobbers via sentinel sweep, privilege via CPL readback,
+     nonzero via zero-trap, alignment where it actually traps — §on conformance
+     witness), bound to `(op, ISA, category-profile, asm-hash)`; for
+     **undecidable** categories (ordering, provenance, non-x86 privileged on
+     this host) the declared value is *tainted*, i.e. carries a greppable floor
+     marker and can never read as verified-green.
+
+2. **Each fold rule is sound.**
+   - `clobbers_register` / `clobbers_flags`: UNION/OR — sound (over-approximates).
+   - `requires_aligned(n)`: MAX — sound (strictest dominates).
+   - Ordering / positional `memory_barrier`: **excluded from the fold
+     vocabulary**, because "max-ordering-of-children" is **unsound**. ZER has
+     direct evidence: Session-G Phase 3 in-block ordering enforcement was
+     ABANDONED because it false-positived the canonical multi-block
+     CLWB+SFENCE libpmem idiom (`CLAUDE.md:1294-1297`,
+     "Lesson: don't ship enforcement that rejects valid code patterns"). Ordering
+     stays **value-intrinsic only** — it is never folded positionally, never
+     synthesized by composition.
+
+If both hold, the conclusion follows by structural induction over composition
+trees. If either fails, the failure is localized: a wrong leaf row is wrong only
+in compositions that include that leaf (and is the *named, concentrated* floor),
+and a wrong fold rule would be caught by the one-time fold-soundness proof
+before it ships.
+
+Nothing else is trusted. In particular: register *name* validity is delegated
+to GCC (the assembler errors on a bad name, not the checker); operand *values*
+in/out remain under the existing ZER Z-rules (Z1-Z8/Z11 keep
+UAF/bounds/qualifier/provenance tracking active *through* asm operands — unlike
+Rust, which goes blind inside `unsafe asm`); reserved registers (sp/bp/pc) are
+structurally banned as operands. None of these are part of the effect-row trust
+set; they are independently closed by other mechanisms.
+
+### 6.6 The author-mismatch gate (closing the leaf line from above)
+
+The theorem says compositions cannot manufacture a *new* lie. The
+**declared-vs-derived mismatch check** makes that property load-bearing at
+authoring time: an author MAY state an EXPECTED row on a `compose` op, but the
+checker computes the DERIVED row by folding the children and compares.
+
+```
+// illustrative — proposed surface, not yet shipped
+compose @lib::set_and_test(...) expects { clobbers_flags }
+// if the folded children also clobber rax, derived = { clobbers_flags,
+//   clobbers_register(rax) }; declared ⊊ derived  ⇒  COMPILE ERROR
+```
+
+A mismatch is a **compile error**, not a warning. This means an author can never
+under-declare a composition into looking safer than its leaves are — the only
+way to change a composition's row is to change which leaves it uses, and each
+leaf's row is already in the trusted set. The gate thus protects the *boundary*
+of the closure: leaves are trusted-and-audited from below, compositions are
+derived-and-checked from above, and the two meet exactly at the leaf line.
+
+### 6.7 Honest restatement
+
+The closure argument does **not** make asm safe in an absolute sense — no
+language can verify silicon, and ZER does not claim to (program-consequence is
+owned 100%; hardware-consequence is floor, `CLAUDE.md:13-14`). What it provides
+is a *structural* guarantee with a *named, minimal* exception set:
+
+- **Owned (program-consequence, 100%):** correctness of every composed op's
+  effect row, given correct leaves — by sound fold, grammar-enforced (no
+  mnemonic above the leaf line), checked at every Layer-3 call site against the
+  derived row.
+- **Floor (concentrated, not dispersed):** correctness of each leaf row and each
+  fold rule — O(leaves) + O(1), centralized, reviewable without silicon. The
+  undecidable residue (ordering, provenance_clear_on_output, non-x86 privileged
+  asm on this host) is *tainted*: named, greppable, never green-by-default.
+
+That relocation — from O(bindings) distributed prose checklists to O(leaves) +
+O(1) fold-proof, with the irreducible remainder explicitly tainted — is the
+entire claim of the closure argument. It is the fifth application of the same
+Closure Principle ZER already uses for memory, type, and concurrency safety.
+
+
+## 7. The conformance witness — verifying Tier-B leaves against reality
+
+### 7.1. What the witness is for, in one sentence
+
+Tier-B leaves are the only place raw asm appears (see §LEAVES). A leaf carries a
+DECLARED effect row — the set of categories (`clobbers_register`,
+`clobbers_flags`, `changes_privilege`, `requires_nonzero`, `requires_aligned(n)`,
+`reads_mem/writes_mem`, ordering, ...) the leaf's author asserts about its asm.
+Everything above the leaf line is verified *against that declaration*: the fold
+rules propagate it through compositions (§COMPOSITION), and Layer-3 call sites are
+checked against the DERIVED row. So if a leaf's declaration is a lie — the asm
+under-declares its clobbers, or claims a privilege transition it doesn't make —
+the entire tower above it is "verified against a lie": green at compile time,
+wrong on silicon. This is the FLOOR that Option E (§1.7) named but left to a
+library-author checklist.
+
+The conformance witness is the mechanism that closes the gap *for the categories
+that are decidable*. It runs per-category probes in QEMU, observes the leaf's
+actual behavior, and compares observed-vs-declared. A leaf whose declaration
+survives the probes is WITNESSED; a leaf that is unwitnessed or whose asm has
+changed since it was witnessed is a COMPILE ERROR at any use site. The witness
+does not (and provably cannot) cover every category — that residue stays TAINTED
+(§TAINT). The witness is the second half of the closure theorem: safe leaves +
+sound fold ⇒ safe tower, and the witness is how "safe leaf" stops being an
+author's promise and becomes an observed fact for the decidable categories.
+
+This is the subordinate, decidable-predicates-only role the standalone
+QEMU-witness was DEMOTED to in the design fan-out (§THE DESIGN EXPLORATION). It
+is not the gate; the structural composition grammar + fold are the gate. The
+witness is what makes the *leaf inputs* to that gate trustworthy.
+
+### 7.2. The witness binding — what gets certified
+
+A witness is not "this op is fine." It is bound to a four-tuple so that any
+drift in the inputs invalidates it:
+
+```
+witness = (op, ISA, category-profile, asm-hash)        (illustrative — proposed surface, not yet shipped)
+```
+
+- **op** — the semantic operation name (`@cpu_write_cr3`, `@port_out8`,
+  `@cpu_read_msr`, ...). Tier-B ops are the ~36 outside C's abstract machine.
+- **ISA** — the target (`x86_64`). The witness is per-ISA because the asm is
+  per-ISA; an x86 witness says nothing about an aarch64 leaf for the same op.
+- **category-profile** — exactly which categories were probed and what each
+  probe concluded. A witness certifies a *set* of category claims, not a blanket
+  pass. Categories not in the profile are NOT covered by this witness (they fall
+  to taint).
+- **asm-hash** — `blake2(asm-text)` of the leaf's mnemonic body. Any edit to the
+  asm — even a clobber-list change — changes the hash and invalidates the
+  witness. This is what makes "the leaf was witnessed" mean "*this exact asm* was
+  witnessed," not "an asm with this name once was."
+
+The witness record (illustrative — proposed surface, not yet shipped) is a
+`.zerwitness` file, one record per `(op, ISA)`:
+
+```
+op           = @cpu_write_cr3
+isa          = x86_64
+asm_hash     = blake2(...)
+qemu_version = qemu-system-x86_64 8.2.7
+profile {
+  changes_privilege   = OBSERVED   (CPL readback: probe ran at CPL=0)
+  clobbers_register   = OBSERVED   {rax}        (sentinel sweep)
+  clobbers_flags      = OBSERVED   none
+  ordering            = NOT-PROBED  -> TAINTED
+}
+```
+
+The `qemu_version` field is in the tuple-by-extension: the witness is only as
+good as the emulator that produced it, so the producing QEMU is recorded and
+becomes part of the residual floor (§RESIDUAL FLOOR (2): QEMU/TCG fidelity). In
+this environment only `qemu-system-x86_64 8.2.7` is present, so every witness
+this host can produce carries that string.
+
+### 7.3. Fail-closed at firmware-compile time, no QEMU on that path
+
+The structural precondition is: **use of an unwitnessed or hash-mismatched
+Tier-B leaf = COMPILE ERROR.** This is fail-closed by construction — the default
+state of a leaf is "not witnessed," and the only way out is a matching witness
+record. An author who forgets to witness a new privileged leaf gets a hard error
+at the first import, not a silent green (contrast the REJECTED disassemble-table
+designs, which were fail-OPEN: an untabled mnemonic produced NO_CATEGORY and the
+wrong declaration sailed through green).
+
+Critically, the firmware-compile path does NOT run QEMU. The check at
+firmware-compile time is purely:
+
+1. recompute `blake2(asm-text)` of the leaf as it exists in source now,
+2. look up the `.zerwitness` record for `(op, ISA)`,
+3. error if the record is missing, or if its `asm_hash` ≠ the recomputed hash,
+   or if a category the Layer-3 call site relies on is not OBSERVED in the
+   profile.
+
+All three are pure-CPU operations (hashing + a table lookup). This is what
+**preserves cross-compile**: a firmware build targeting aarch64 on an x86 host,
+or any host without the relevant system QEMU, still type-checks and emits C →
+GCC normally. QEMU is needed only to *produce* a witness, never to *consume*
+one. Witness production is a separate, lazy, opt-in step (`tool/asm_witness/`,
+STEP 5 of the plan), re-run only when a leaf's asm changes (hash miss) or a new
+leaf is added. The compile path reads the cached artifact; it never boots an
+emulator. (Same shape as ZER's other artifact-cached checks: the witness file is
+to a Tier-B leaf what a cached `FuncSummary` is to a function — computed once,
+consumed cheaply, recomputed on input change.)
+
+### 7.4. DECIDABLE categories and their probe strategies
+
+A category is *decidable* when its honoring/violation is observable and
+deterministic in QEMU. For those, the witness is real verification, not faith.
+Each probe is generic to the CATEGORY, not the instruction — there are ~a dozen
+categories in the closed vocabulary, so there are ~a dozen probe templates, and
+every Tier-B leaf reuses them. This is the bounded-by-vocabulary property: probe
+count scales with the closed category set, not with the instruction catalog.
+
+**clobbers_register / clobbers_flags — the witness sweet spot.**
+Strategy: sentinel-fill every general-purpose register (and the flags register)
+with a distinct known value, execute the leaf's asm once, read every register
+back. Any register whose value changed but is NOT in the declared
+`clobbers_register` set is an UNDER-DECLARED clobber → witness FAIL. This is the
+sweet spot because (a) register write-sets are *structural*, not data-dependent
+— a single run observes the complete clobber set with near-certainty (an
+instruction either writes `rax` or it does not; it doesn't depend on operand
+values the way a branch target might), and (b) it catches the exact bug class
+that GCC and Rust *cannot*: GCC trusts the programmer's clobber list inside
+`asm` and Rust goes blind inside `unsafe { asm!() }`. The sentinel sweep is the
+ground truth GCC never checks. (Note the asymmetry with composition: composition
+clobbers fold by SOUND union — see §FOLD SOUNDNESS — so the high-soundness fold
+meets the high-observability witness here; clobber is the high-high corner of
+the OBSERVABILITY SPECTRUM.)
+
+**changes_privilege — CPL readback in a ring0 stub.**
+QEMU emulates privilege levels faithfully in *system* mode, so privileged ops
+ARE probeable: boot a minimal ring0 stub, read the current privilege level
+(CPL), run the leaf, read CPL again (or set up the transition target and observe
+the level on the other side). A leaf declaring `changes_privilege` that leaves
+CPL unchanged, or one that changes CPL without declaring it, fails. This is why
+the env's lack of user-mode QEMU is not fatal for privileged ops: privileged
+behavior is exactly what system-mode QEMU models, and the ring0 stub is the
+harness for it.
+
+**requires_nonzero — zero-trap.**
+Strategy: feed the leaf a zero operand and observe whether it traps (or produces
+the divide-error / undefined-result the category claims). A leaf declaring
+`requires_nonzero` whose asm silently accepts zero has a wrong declaration. The
+probe is a single boundary input.
+
+**requires_aligned(n) — where it actually traps.**
+Strategy: feed a deliberately misaligned address and observe a trap. The crucial
+qualifier is *where it actually traps*: alignment is only decidable on a target
+that raises a fault on misaligned access for that instruction. On x86 with
+alignment-check (AC) off — the default — most accesses simply *succeed*
+misaligned, so the probe observes no trap and CANNOT distinguish a correctly
+`requires_aligned` leaf from a lying one. So `requires_aligned` is decidable on
+ISAs/instructions that trap, and UNOBSERVABLE on x86-with-AC-off (§7.5).
+
+### 7.5. UNOBSERVABLE categories — why a green witness can be false confidence
+
+The witness is sound only for predicates QEMU can actually observe. Two
+categories are unobservable in this environment, and for them a green witness
+would be WORSE than honest author-trust, because it manufactures false
+confidence. These stay TAINTED and are NEVER witnessed.
+
+**Memory ordering — QEMU TCG flattens to TSO.**
+QEMU's TCG (the dynamic translator used without KVM) does not reproduce weak
+memory reordering; it effectively presents a strong (TSO-ish) model. So a leaf
+that declares a strong fence and one that declares a too-weak fence both produce
+*the same observed behavior* under TCG: green. A too-weak fence — the dangerous
+under-declaration — witnesses GREEN. That is strictly worse than leaving ordering
+to the author's word, because the green badge tells a reader "verified" when the
+emulator was simply incapable of exhibiting the reordering that would expose the
+bug. Ordering therefore stays value-intrinsic and TAINTED (this also matches the
+fold: ordering does NOT fold soundly — max-ordering-of-children false-positived
+the canonical libpmem CLWB+SFENCE idiom, which is why ZER ABANDONED in-block
+ordering enforcement; see CLAUDE.md ~line 1295-1296. Ordering is the low-low
+corner: unsound fold × unobservable witness — the irreducibly hardest category,
+confirmed independently by the litmus/CWH angle in the fan-out.)
+
+**Alignment on x86 — AC off ⇒ no trap.**
+As in §7.4: with the alignment-check flag off (the normal state), x86 does not
+trap misaligned accesses, so the alignment probe observes nothing. On x86 this
+category falls to taint; on an ISA that traps it is decidable.
+
+**provenance_clear_on_output** — not behaviorally observable by a register/CPL probe at all; stays TAINTED.
+
+### 7.6. The existential-vs-universal lesson (why standalone witness was demoted)
+
+This is the load-bearing soundness argument and must not be lost in any summary.
+
+A probe **samples one execution path**: it runs the asm with one (or a few)
+chosen inputs, in one emulated machine state, and observes the result. That
+establishes an EXISTENTIAL fact — "on *this* run, the leaf did/did not change
+CPL / clobber `rbx` / trap on zero."
+
+A category is a **universal contract** — "for *all* executions, this leaf honors
+`changes_privilege`." The gate consumes the witness as if it were universal:
+Layer-3 verification treats a witnessed category as "declaration honored,
+always."
+
+The inference existential ⇒ universal is sound ONLY when the predicate is
+deterministic and path-independent — i.e., when one observation generalizes
+because the behavior cannot vary across inputs/paths. That holds for the
+decidable categories in §7.4: a register write-set is structural (one run is
+complete), CPL transition is deterministic, the zero-trap is a fixed boundary.
+It does NOT hold for ordering: the reordering you need to observe is precisely
+what TCG never produces, so "no reordering observed on this run" does not
+generalize to "no reordering ever." A green witness on an unobservable category
+asserts a universal from an existential that doesn't license it — false
+confidence.
+
+This is *why* the standalone QEMU-witness was DEMOTED from gate to a subordinate
+role: as a standalone gate it would certify an existential ("some categories
+observed on x86") and let the system read it as the universal ("declaration
+honored"), which is sound only for decidable predicates. Restricting the witness
+to decidable-x86 predicates is exactly the restriction that makes the
+existential⇒universal step legitimate.
+
+### 7.7. Environment reality and the per-category (not per-instruction) bound
+
+**Env:** only `qemu-system-x86_64` (8.2.7) is present on this host — no
+ARM/RISC-V system QEMU, no user-mode QEMU, no cross-compilers. Consequences:
+
+- The witness can promote x86 decidable categories from taint to verified.
+- Privileged ops are still probeable *because* QEMU emulates privilege in system
+  mode (the ring0-stub strategy), even though there is no user-mode QEMU.
+- Non-x86 privileged asm cannot be witnessed here at all → it stays TAINTED.
+  This is an ENV limit, not an architectural one: installing
+  `qemu-system-aarch64` + a cross-gcc would let the same probe templates promote
+  those taints to witnesses, opt-in (§RESIDUAL FLOOR (4)).
+
+**Per-category, not per-instruction.** The probes are written once per CATEGORY,
+and the category vocabulary is CLOSED (the Layer-1 core). So the witness tool is
+~a dozen probe templates total, and a new Tier-B leaf is witnessed by re-running
+the templates for the categories it declares — no new probe code per
+instruction. This is what keeps the witness inside the maintainability budget
+and is the reason it does NOT trip the named disqualifier (per-instruction /
+per-vendor / per-ISA-extension PROACTIVE scaling): probe surface tracks the
+closed category set, and leaf surface is demand-driven (§PRIVILEGED RESIDUE).
+
+### 7.8. Methodology — follow the existing matrix oracles
+
+The witness harness should follow the methodology already proven by ZER's eight
+matrix oracles in `tests/test_*_matrix.c` (`test_asm_matrix.c`,
+`test_hw_matrix.c`, `test_conc_matrix.c`, `test_cflow_matrix.c`,
+`test_escape_matrix.c`, `test_async_matrix.c`, `test_shape_matrix.c`,
+`test_keep_matrix.c`). Those oracles are the template; the witness is the same
+shape with QEMU observation substituted for the zercheck verdict. The properties
+to carry over, with their anchors:
+
+1. **Bipartite expectation per cell.** Each matrix oracle splits scenarios into
+   NEG (must reject for the *right reason*) and POS (must accept). See
+   `tests/test_asm_matrix.c:96-120` (the `AMScenario` enum) and
+   `:112-121` (`scenario_is_negative`). The witness analog: a leaf whose declared
+   category is honored = POS (witness PASS); a deliberately mis-declared leaf
+   (under-declared clobber, claimed-but-absent privilege change) = NEG (witness
+   must FAIL). A NEG that witnesses GREEN is a false negative — the same hole
+   class the oracles guard.
+
+2. **Integrity guard against wrong-reason verdicts.** `test_asm_matrix.c:64-69`
+   flags an INVALID-PROBE when a NEG is rejected by a parse error rather than the
+   asm-safety check under test; `:42-46` (`has_asm_reason`) requires the
+   rejection to cite an asm reason. Witness analog: a witness FAIL must be
+   attributable to the *probed category* (e.g., "observed clobber rbx not in
+   declared set"), not to a stub-boot crash or a QEMU launch failure. A crash
+   that happens to fail the probe is an INVALID-PROBE, not a real FAIL — it must
+   be reported separately so it cannot masquerade as verification.
+
+3. **Explicit accounting of failure kinds.** The oracles tally `false_neg`,
+   `invalid_probe`, `over_reject` separately (`test_asm_matrix.c:27`, printed at
+   `:253-255`). The witness should likewise separate: real category-FAIL,
+   invalid-probe (harness/QEMU error), and over-strict-FAIL (a correctly-declared
+   leaf the probe wrongly rejects).
+
+4. **`-Wswitch`-enforced exhaustive scenario enum.** The oracles use an enum with
+   no `default:` so GCC errors when a scenario is added without a handler
+   (`test_asm_matrix.c:95-110`). The witness profile should enumerate the closed
+   category set the same way, so adding a category to the Layer-1 vocabulary
+   forces a probe decision (decidable → probe template; unobservable → explicit
+   taint) rather than silently leaving the new category un-probed.
+
+5. **Emit-only vs run harness distinction.** The matrix oracles run *emit-only*
+   (`-o /tmp/x.c`, no GCC) because they judge the *verdict*, not runtime behavior
+   (`test_asm_matrix.c:17-18`, `test_hw_matrix.c:14-16`). The witness is the
+   opposite end: it MUST run the asm under QEMU, because its whole point is
+   observed behavior. The two are complementary — the matrix oracle guards the
+   structural verdict at compile time; the witness guards the leaf's observed
+   behavior at witness-production time.
+
+### 7.9. How the witness fits the toolchain anchors
+
+For a fresh implementer, the witness touches these real code points:
+
+- **The Tier-B leaves themselves** live as the only raw-asm-bearing `@bind`
+  forms (`NODE_LEAF_BIND`, STEP 4 of the plan). The checker's existing
+  `NODE_ASM` handler (checker.c ~10720-10890, e.g. the duplicate-register-binding
+  checks at `:10720-10738` and the Z-rule context bans at `:10751`+) is the
+  machinery that already keeps operand-boundary safety (Z1-Z8/Z11) ACTIVE inside
+  a leaf's asm — the witness verifies the *categories*, while these Z-rules keep
+  verifying the *operand values* (UAF/bounds/qualifier/provenance) that flow
+  through the asm. The witness does not replace them; it adds the missing layer.
+
+- **Ordering is not yet derivable from the builtin** and must stay conservative
+  until wired. emitter.c hardcodes `__ATOMIC_SEQ_CST` for atomic *value*-ops
+  (e.g. `__atomic_load_n(..., __ATOMIC_SEQ_CST)` at emitter.c:3128 and the
+  full block 3117-3152; the @atomic_* routing comment at emitter.c:8355-8359
+  states "All SEQ_CST ordering for now"). The fence path *is*
+  ordering-parameterized (emitter.c:3098-3102 maps SEQ_CST/RELEASE/ACQUIRE). The
+  consequence for the witness: ordering is BOTH unobservable in QEMU AND
+  not-yet-derived from the builtin, so it stays doubly TAINTED — the
+  derive-table must conservatively declare `ordering = seq_cst` (the
+  actually-emitted truth) until the param is wired through the value-ops, and the
+  witness never tries to confirm it.
+
+- **No `@bind` / witness consumption exists in checker.c yet** — it is Phase 2/3
+  work. The witness producer is `tool/asm_witness/` (STEP 5); the consumer is the
+  hash-recompute + lookup added to the leaf-import path. The 8 matrix oracles in
+  `tests/test_*_matrix.c` are the regression harness pattern the witness conformance
+  tests should imitate (§7.8).
+
+### 7.10. What the witness does NOT do (honest scope)
+
+- It does NOT verify wrong-VALUE bugs (adc-drops-carry, off-by-one bsr,
+  CAS-wrong-operand). Those are caught by the differential reference (DRC), kept
+  as an opt-in x86-native CI sanity layer, NEVER the gate (§THE DESIGN
+  EXPLORATION). The witness checks category *honoring*, not algorithmic
+  *correctness*.
+- It does NOT make composition or Tier-A leaves safer — those are derived
+  (Tier A from the GCC builtin contract) or folded (composition), needing no
+  QEMU. The witness exists solely for Tier-B (~36 ops outside C's abstract
+  machine).
+- It does NOT cover the unobservable categories (ordering, x86 alignment,
+  provenance_clear_on_output) — those remain a NAMED, greppable floor (§TAINT),
+  honestly marked as never-verified rather than falsely green.
+- It does NOT escape the QEMU/TCG fidelity floor: a witness is only as faithful
+  as the emulator that produced it, which is why `qemu_version` is recorded and
+  the floor is named (§RESIDUAL FLOOR (1)-(2)). The anchor moves from the
+  author's word to the QEMU-TCG model — auditable and shared, but not the die.
+
+In sum: the witness converts "the leaf author asserts category C" into "QEMU observed category C honored on x86" for the decidable categories — collapsing the floor into a smaller, centralized, reviewable set — while explicitly refusing to fake verification for the categories an emulator cannot see.
+
+
+## 8. Clobber and register safety (the strongest case)
+
+Clobber/register safety is the category where ZER's asm-safety design is at its
+*strongest* — the exact opposite end of the spectrum from memory ordering (§ on
+ordering), which is the *weakest*. Understanding *why* it is the strongest case
+is the whole point of this section: it isolates the two structural properties
+(fold soundness, witness observability) that make a category cheap to make safe,
+and shows that both hold maximally for clobbers and minimally for ordering. The
+two ends are independent axes, not a single danger dial — that independence is
+the load-bearing observation at the end.
+
+A clobber declaration is a claim: *"executing this asm modifies exactly these
+registers/flags and no others."* Get it wrong (under-declare) and the compiler
+above the asm assumes a caller-saved register survived the asm when it did not —
+a register the surrounding code still needs gets silently corrupted. This is the
+canonical asm bug; the existing Option E doc names it as the *invisible-contract
+effect bug* and tabulates it as the asm-shaped instance of a general phenomenon
+(`docs/asm_lang_zer_safe.md:341-346`): the row reads *"Wrong clobber list (asm) |
+'rdx preserved' | Corrupted register downstream."* The same doc also lists the
+wrong-clobber-list among the trust-gaps Level D had to confront
+(`docs/asm_lang_zer_safe.md:346`).
+
+What makes this category strong is that *every* sub-problem of clobber/register
+safety has a structural mechanism — none of it falls to author-trust or to the
+tainted floor. There are five distinct sub-problems, each with its own mechanism.
+
+### 8.1 The five sub-problems and their mechanisms
+
+| Sub-problem | Mechanism | Where it lives |
+|---|---|---|
+| (1) composition clobbers | sound UNION fold over children | ERBT fold rules (S2, proposed) |
+| (2) leaf clobbers | QEMU sentinel-sweep witness | conformance witness (S3, proposed) |
+| (3) register NAME validity | delegated to GCC assembler | already shipping + `zer_asm_register_valid_with_features` |
+| (4) operand VALUES in/out | existing ZER Z-rules (Z1-Z8, Z11) | `checker.c` NODE_ASM, already shipping |
+| (5) reserved registers (sp/bp/pc) | structural ban as operand | parse-time, already shipping |
+
+Three of the five (3, 4, 5) are *already implemented today*; only (1) and (2)
+are part of the proposed Effect-Row Composition refinement. This is itself
+evidence the category is tractable — most of it shipped before the refinement.
+
+### 8.2 Sub-problem (1): composition clobbers fold by SOUND union
+
+When an author writes a `compose` operation that recombines leaves and ops (the
+flexible layer — no asm, no core release), the composed op's clobber set is the
+*union* of its children's clobber sets, and its flags-clobber is the *OR* of its
+children's flags-clobbers. This fold is **sound** in the strict sense: the union
+can only ever *over*-approximate the true clobber set, never *under*-approximate
+it. If child A clobbers `{rax}` and child B clobbers `{rcx}`, the composition
+clobbers `{rax, rcx}` — and that is exactly what executing A then B does. The
+caller above is told to assume *more* registers are destroyed than strictly
+necessary; the failure mode of an over-approximation is a missed optimization
+(a register spilled that needn't be), never a corrupted register. Soundness here
+means: **the derived row is always a superset of the true effect.** That is the
+safe direction.
+
+Contrast with `requires_aligned(n)`, which folds by MAX (also sound: the
+strictest child alignment requirement dominates). Contrast sharply with
+`memory_barrier`/ordering, which does **not** fold soundly — taking the
+max-ordering-of-children is *unsound* (ZER's own Session-G evidence: Phase 3
+in-block ordering enforcement was abandoned because it false-positived the
+canonical libpmem CLWB+SFENCE idiom — `CLAUDE.md:1294-1297`). Positional
+`memory_barrier` is therefore *excluded* from the fold vocabulary entirely;
+ordering stays value-intrinsic only. Clobber's union/OR fold is the textbook
+case of a fold that *is* sound, which is precisely why this sub-problem is easy.
+
+The soundness is structural, not empirical: a register written by *either*
+child is a register written by the sequence, full stop. No data-dependence, no
+ordering subtlety, no weak-memory hazard. The fold is closed and total over the
+clobber vocabulary.
+
+### 8.3 Sub-problem (2): leaf clobbers are the WITNESS SWEET SPOT
+
+A Tier-B leaf (raw asm, real mnemonic — the only place freeform asm appears) has
+a *declared* clobber row. The conformance witness verifies it. Clobbers are the
+single best category for witnessing, for three converging reasons:
+
+1. **Observable.** The toolchain fills *every* register with a distinct sentinel
+   value, runs the leaf's asm under `qemu-system-x86_64` (8.2.7 — the only system
+   QEMU present in this env), then reads every register back. Any register whose
+   sentinel survived was *not* clobbered; any register whose sentinel is gone
+   *was* clobbered. This directly observes the true clobber set and compares it
+   against the declaration. A declared-but-not-observed register is harmless
+   (over-declaration). An *observed-but-not-declared* register is the bug — the
+   classic under-declared-clobber — and the sweep catches it.
+
+2. **Deterministic and near-complete in a single run.** Register write-sets are
+   *structural*, not data-dependent: an instruction either writes a register or
+   it does not, irrespective of operand values. (A multiply writes `rdx:rax`
+   whether the inputs are 0 or 2^31.) So one sentinel-fill-and-readback run
+   observes essentially the complete clobber set — there is no need to fuzz
+   operand values to coax out hidden clobbers, unlike value-correctness bugs
+   which *are* data-dependent. This is why clobber witnessing is cheap: O(1)
+   runs, not a search.
+
+3. **It catches a bug GCC and Rust structurally CANNOT.** Both GCC inline asm
+   and Rust `asm!` *trust the clobber list the author wrote* — they propagate it
+   into register allocation without ever checking whether the asm body honors it.
+   An under-declared clobber in GCC/Rust is a silent miscompile that surfaces as
+   data corruption far from the asm site. ZER's sentinel sweep is the only one of
+   the three that *verifies the declaration against observed behavior* — it
+   closes the exact hole GCC/Rust leave open. The witness is bound to
+   `(op, ISA, category-profile, blake2(asm))`; a leaf-use of an unwitnessed or
+   hash-mismatched binding is a **compile error** (fail-closed structural
+   precondition), so you cannot use a leaf whose clobber declaration was never
+   checked.
+
+The decidable witness categories are exactly the observable+deterministic ones:
+clobbers_register/clobbers_flags (this sub-problem — the sweet spot),
+`changes_privilege` (CPL readback), `requires_nonzero` (zero-trap), and
+`requires_aligned` *where it actually traps*. The UNOBSERVABLE categories —
+memory ordering (QEMU TCG flattens to TSO, so a too-weak fence witnesses GREEN,
+which is *worse* than author-trust because it manufactures false confidence) and
+alignment on x86 (AC-off ⇒ no trap) — stay tainted and are never witnessed.
+Clobber sits at the top of the decidable set.
+
+### 8.4 Sub-problem (3): register NAME validity → GCC
+
+Whether `rax` is a real register name, whether `x0` is valid on this target,
+whether a sub-extension register exists — all of this is delegated downward.
+GCC's assembler errors on a bad register name; ZER does not duplicate the ISA
+register catalog (Phase 1 of the plan *deletes* the per-arch register tables —
+`asm_register_tables_*.c`). The compiler does a lightweight pre-check today:
+`checker.c` NODE_ASM validates each input/output/clobber register name via
+`zer_asm_register_valid_with_features(arch, features, name, len)`
+(`checker.c:10977-11020`), emitting the *O3 rule* error
+*"asm clobber 'X' not recognized for x86_64 — Use a known register name, or
+'memory' / 'cc' for side-effect markers."* The pseudo-clobbers `"memory"` and
+`"cc"` are special-cased and skipped — they are GCC side-effect markers, not real
+registers (`checker.c:11006-11010`). Arch is plumbed from `--target-arch` through
+`Checker.target_arch` (`checker.c:10964-10967`); a valid x86 register typed on an
+aarch64 build is reported against the *actual* target, not always-x86 (audit fix,
+`checker.c:10968-10975`). This pre-check is a UX nicety; GCC remains the
+authoritative oracle for register-name validity — *"GCC is the trusted
+assembler"* (`docs/asm_lang_zer_safe.md:5849`).
+
+### 8.5 Sub-problem (4): operand VALUES in/out → existing ZER Z-rules
+
+This is the dimension where ZER diverges hardest from Rust. The *names* of
+clobbers are a register-allocation concern; the *values* flowing through asm
+operands are a memory-safety concern, and ZER keeps its full safety analysis
+**active through the asm operand boundary** — unlike Rust, which *goes blind*
+inside `unsafe { asm!() }` (the asm doc lists Rust's `unsafe { asm!() }` as a
+trust-the-author construct, `docs/asm_lang_zer_safe.md:1493`).
+
+Ten of ZER's thirteen Z-rules are wired into the NODE_ASM handler (Z1-Z8, Z11,
+Z12 — `docs/asm_lang_zer_safe.md:4361-4376`). The operand-relevant ones:
+
+| Z-rule | What it tracks through an asm operand |
+|---|---|
+| Z1 | UAF check at the operand boundary (freed handle passed as operand) |
+| Z2 | move-struct transfer at the operand (use-after-move) |
+| Z3 | VRP range invalidation on asm output |
+| Z4 | provenance type cleared on asm output |
+| Z5 | local-derived pointer rejected when asm declares a memory clobber (could store the escaping pointer) |
+| Z7 | MMIO range/alignment check on a memory-operand address (via `@inttoptr`) |
+| Z8 | qualifier (volatile/const) preservation on asm output |
+| Z11 | non-`keep` pointer param + memory clobber rejected |
+
+Two of these key directly off the *clobber list*, tying value-safety to clobber
+declarations. When an asm statement declares a `"memory"` clobber, the checker
+sets `has_memory_clobber` (`checker.c:10797-10810`) and then:
+
+- **Z5** rejects any `is_local_derived` pointer passed as an input, because a
+  memory-clobbering asm body may *store* that pointer somewhere it outlives its
+  scope — *"asm body may store ... or remove memory clobber"*
+  (`checker.c:10889-10913`).
+- **Z11** rejects a non-`keep` pointer *param* under a memory clobber, for the
+  same store-escape reason (`checker.c:10792-10855`).
+
+So the memory clobber is not merely accounted for register-allocation-wise — it
+*arms* the escape and keep-param analyses. The clobber declaration and the
+value-safety analysis are coupled. (Empty clobber entries are also rejected at
+parse-validate time: *"asm clobber entry must be non-empty register name string,"*
+`checker.c:10603-10607`.)
+
+### 8.6 Sub-problem (5): reserved registers sp/bp/pc structurally banned
+
+The stack pointer, frame pointer, and program counter cannot appear as asm
+operands at all. This is a *structural ban*, not a tracked property: an operand
+binding to `sp`/`bp`/`pc` (or their per-arch spellings) is rejected outright.
+The rule predates Option E — it is item 4 of the original Option-C validation
+list: *"Reserved register rejection — reject sp/bp/pc if used as operand (parse
+clobber list)"* (`docs/ASM_ZER-LANG.md:229`, `:280`). Banning these as operands
+keeps GCC's prologue/epilogue and the compiler's own stack/frame accounting
+intact; an asm that needs to touch the stack pointer belongs in a `naked`
+function where there is no prologue to corrupt (asm is allowed *only* inside
+`naked` functions — the S1 interim guard, `CLAUDE.md:264-268`). Combined with
+Z12 (the `scan_frame` stack-depth walker recurses into asm operands —
+`docs/asm_lang_zer_safe.md:4376`), the reserved-register ban means asm cannot
+silently subvert ZER's stack-overflow accounting.
+
+### 8.7 Illustrative leaf with clobbers and the three checks
+
+A Tier-B leaf is the only place a real mnemonic appears. Its declaration carries
+an effect row including clobbers; three independent checks gate it. Syntax below
+is **illustrative — proposed surface, not yet shipped**:
+
+```
+leaf_bind @cpu_write_cr3 x86_64 {                 // illustrative
+    instructions: "mov %0, %%cr3"
+    inputs:   { pa: u64 }                          // operand VALUE — Z-rules active
+    clobbers: { "memory" }                         // flags/regs touched
+    categories: clobbers_register("memory"),
+                changes_privilege,                  // witnessable (CPL readback)
+                writes_mem(8, seq_cst)              // ordering → TAINTED, never witnessed
+    safety: "writes CR3; flushes non-global TLB; CPL=0 required; see SDM Vol 3"
+}
+```
+
+The three checks that must all pass before any caller can use this leaf:
+
+1. **Consistency (compile-time, structural).** Does every register/clobber NAME
+   resolve on this ISA? → `zer_asm_register_valid_with_features` +, ultimately,
+   GCC. A typo'd or wrong-arch register name is a compile error (sub-problem 3).
+
+2. **Witness (toolchain, decidable categories).** Does the asm actually clobber
+   exactly what `clobbers_register` declares? → sentinel-fill all registers, run
+   the asm under `qemu-system-x86_64` (privileged leaves boot a ring0 stub —
+   QEMU emulates privilege so CR3/MSR/port ops *are* probeable in system mode),
+   read back. An observed-but-undeclared register fails the witness. The witness
+   is recorded as `(op, ISA, profile, blake2(asm), qemu-version)`; the importer
+   recomputes the hash and a missing/stale witness is a **compile error**
+   (sub-problem 2). `changes_privilege` is co-witnessed (CPL readback). The
+   `writes_mem(...,seq_cst)` *ordering* sub-claim is **NOT** witnessed — it stays
+   tainted (QEMU TCG ⇒ TSO would witness a too-weak fence GREEN).
+
+3. **GCC (assembler).** GCC compiles the emitted C+asm; the assembler is the
+   final authority on instruction encoding and register-name validity. ZER never
+   re-implements the encoder (emit-C is permanent).
+
+Above the leaf line, a `compose` op that calls `@cpu_write_cr3` plus, say, an
+`@invlpg` leaf gets its clobber row by **union fold** (sub-problem 1) — no asm,
+no witness re-run for the composition itself, and the derived row is guaranteed a
+superset of the true effect. The author may *declare* an expected row;
+declared-vs-derived mismatch is a **compile error** (the @inttoptr-shaped gate:
+the composed-binding grammar has no mnemonic production, so you literally cannot
+smuggle raw asm into a composition).
+
+### 8.8 The observability spectrum — danger and verifiability are independent axes
+
+The reason clobber/register is the strongest case and ordering is the weakest is
+captured by one principle:
+
+> A category's **safety-achievability = (fold soundness) × (witness
+> observability).** Both factors are HIGH for clobbers and LOW for ordering.
+
+| Category | Fold soundness | Witness observability | Safety-achievability |
+|---|---|---|---|
+| clobbers_register / clobbers_flags | HIGH (sound union/OR) | HIGH (sentinel sweep, deterministic) | **BEST** |
+| requires_aligned | HIGH (sound MAX) | partial (traps only where HW traps) | good |
+| changes_privilege | n/a (leaf-only) | HIGH (CPL readback) | good |
+| memory ordering | LOW (max-of-children unsound — Session-G) | LOW (TCG flattens to TSO; too-weak fence ⇒ false GREEN) | **WORST (floor)** |
+
+The crucial, non-obvious corollary: **danger and verifiability are independent
+axes.** A scary-named, high-privilege operation like `@cpu_write_cr3` (writes the
+page-directory base; gets it wrong and the whole address space is gone) is
+*observable* — `changes_privilege` reads back via CPL, the clobber sweep observes
+the register set — and therefore sits high on the safety-achievability scale.
+Meanwhile a boring-named, unprivileged operation like a release-fence in an
+ordering claim is *unobservable* on this host and sits on the irreducible floor.
+
+The frightening operation is the *easy* one to verify; the mundane one is the
+*hard* one. Intuition that ranks categories by how dangerous they sound is
+exactly backwards. ZER ranks them by `fold-soundness × witness-observability`,
+which is why clobber/register safety is presented here as the strongest case: it
+is the one category where both factors are maxed, the union fold is provably
+sound, the sentinel sweep observes the truth deterministically in one run, and
+the bug it catches (under-declared clobber) is one that GCC and Rust
+structurally cannot.
+
+### 8.9 What is NOT claimed here (honest floor)
+
+Clobber/register safety is *relative to leaf correctness* like everything else in
+the closure argument: a sound union fold faithfully propagates a *lying* leaf, so
+the floor concentrates into the leaf set, and the conformance witness is what
+shrinks that floor for clobbers specifically. The residual floor that clobber
+safety does **not** remove: silicon errata (a register the silicon clobbers that
+neither the SDM nor QEMU's TCG model reflects — anchored to the QEMU-TCG model,
+auditable but not the die), and QEMU/TCG fidelity itself. These are named floors,
+not silent holes. Ordering, alignment-on-x86, and `provenance_clear_on_output`
+remain tainted — they are *not* clobber problems and are covered in their own
+sections. Within its own boundary, clobber/register is the category where the
+mechanism is most complete.
+
+
+## 9. The privileged residue (Tier B) and why it stays bounded
+
+This section pins down the *only* place in the whole design where a real
+mnemonic (raw asm) is still allowed to appear: the **Tier B leaf set** — the
+privileged / machine-configuration operations. Everything else (Level 0 ZER
+arithmetic, Tier A GCC-builtin leaves, and all `compose`d operations above the
+leaf line) is either inside C's abstract machine or recombined from leaves by
+sound fold rules, and therefore carries *no* mnemonic and *no* per-ISA asm
+maintenance. Tier B is the residue. The claim defended here is narrow and
+precise: **the residue exists for a structural reason (these ops are outside
+C's value-semantics and are inherently single-ISA), it is small and slow-growing,
+its growth is demand-driven and fail-closed rather than proactive-whole-ISA, and
+the bulk of its declared safety properties are *witnessable* on x86 rather than
+blindly trusted.** That is the difference between a bounded floor and an
+unbounded one.
+
+### 9.1 What forces an op into Tier B: the abstract-machine test
+
+The single test that splits Tier A from Tier B (introduced in §1 / the
+effect-row-composition refinement) is:
+
+> *Is the operation a value-computation inside C's abstract machine, or does it
+> CONFIGURE the machine?*
+
+- **Inside the abstract machine** → there is, or could be, a portable GCC
+  builtin whose documented contract *is* the effect row. GCC selects the real
+  instruction and handles sub-architecture selection via `-march`. These become
+  **Tier A leaves** (`__builtin_add_overflow`, `__atomic_*`,
+  `__builtin_clz/ctz/popcount`, `__builtin_bswap`, …). No raw asm. ~95% of ops
+  by count.
+
+- **Configures the machine** → the operation manipulates state that C *has no
+  model for*: the current privilege level, the page-table base, model-specific
+  registers, the interrupt flag, I/O port space, the TLB, cache coherency state.
+  C's abstract machine is a model of *values and objects in memory*; it has no
+  notion of "ring 0", "CR3", "an MSR", or "port 0x60". Because the operation has
+  **no value-semantics expressible in C**, GCC cannot offer a portable builtin
+  for it — there is nothing for a builtin's contract to *be about*. These become
+  **Tier B leaves**, and a Tier B leaf is the *only* construct in ZER's asm
+  surface that contains a real mnemonic.
+
+Two independent properties make these ops Tier B, and **both** hold for every
+member of the set:
+
+1. **Outside C's abstract machine** — no value-semantics, hence no portable
+   builtin is even *possible* (not "GCC happens not to ship one", but "there is
+   nothing to model").
+2. **Inherently single-ISA** — the *concept* may be cross-architecture (every
+   ISA has an "interrupt enable"), but the encoding, operand register discipline,
+   and frequently the semantics are per-ISA. x86 `cli` ≠ ARM `cpsid i` ≠ RISC-V
+   `csrci sstatus, 8`. There is no neutral spelling.
+
+The objective Tier-A boundary test from §1 — *does it compile under
+`-ffreestanding`?* — confirms the split empirically: `__builtin_clz`,
+`__builtin_add_overflow`, and `__builtin_bswap*` compile freestanding (Tier A);
+`__rdmsr` does **not** (Tier B). The privileged ops fail freestanding precisely
+because they are not abstract-machine operations.
+
+### 9.2 The categorization of the ~36 Tier-B ops
+
+ZER already shipped this entire set as the **D-Alpha privileged/CPU
+intrinsics** (CLAUDE.md, the "130/130" intrinsic batches; see CLAUDE.md:482).
+The Tier-B leaf set is *exactly* the privileged + machine-configuration subset
+of those intrinsics — it is not a new catalog to be invented, it is the
+already-enumerated privileged residue. Today these are emitted as per-arch
+inline asm (CLAUDE.md:347 "Per-arch inline asm emission"); under this design
+they become the gated Tier-B leaves. Four categories, with their real D-Alpha
+anchors:
+
+**(a) Control-state writes — CR / MSR / XCR0** (D-Alpha-9, CLAUDE.md:363-375):
+
+```
+@cpu_read_msr(u32) -> u64    @cpu_write_msr(u32,u64)    # RDMSR / WRMSR
+@cpu_read_cr0/cr3/cr4()      @cpu_write_cr0/cr3/cr4(u64)
+@cpu_read_xcr0() -> u64      @cpu_write_xcr0(u64)        # XSETBV
+```
+
+`@cpu_write_cr3` switches the address space and flushes the non-global TLB
+(CLAUDE.md:370) — a page-table reconfiguration with no value-semantics. All are
+"All privileged (CPL=0). SIGSEGV in user mode. Non-x86 archs get no-op
+fallback." (CLAUDE.md:376). Related control-state ops appear in D-Alpha-13:
+`@cpu_read_fsbase/gsbase`, `@cpu_write_fsbase/gsbase` (require CR4.FSGSBASE=1,
+CLAUDE.md:418), debug registers `@cpu_read_dr`/`@cpu_write_dr`
+(CLAUDE.md:436-438), and `@cpu_read_cr2` (page-fault address, D-Alpha-14,
+CLAUDE.md:463).
+
+**(b) I/O ports — IN / OUT** (D-Alpha-13, CLAUDE.md:424-430):
+
+```
+@port_in8/in16/in32(u16) -> uN     @port_out8/out16/out32(u16, uN)
+```
+
+x86 port I/O is "privileged (CPL <= IOPL)" (CLAUDE.md:424). Port space is a
+separate address space C cannot name; there is no builtin and no portable
+spelling.
+
+**(c) Privilege transitions — the genuinely "call-like" ops** (D-Alpha-12,
+"ALL privileged", CLAUDE.md:404-411):
+
+```
+@cpu_syscall()    # user→kernel: syscall / svc #0 / ecall
+@cpu_sysret()     # kernel→user: sysretq / eret / sret
+@cpu_iret()       # interrupt return: iretq / eret / mret
+@cpu_hypercall()  # guest→hypervisor: vmcall / hvc #0 / ecall
+@cpu_set_priv_stack(u64)   @cpu_get_priv_level() -> u32
+```
+
+These are the ops that *transfer control across a privilege boundary*. Note the
+firmware-call siblings in D-Alpha-13: `@cpu_sbi_call` (RISC-V ecall to M-mode)
+and `@cpu_smc_call` (ARM TrustZone `smc #0`) (CLAUDE.md:441-442). Each "require
+correctly-set system register context (CS/RIP/RFLAGS on x86; ELR/SPSR on ARM;
+sepc/sstatus on RISC-V) before the transition" (CLAUDE.md:413-414) — a
+precondition C's type system cannot express, which is exactly why these stay
+TAINTED/witnessed rather than derived. The interrupt-control ops
+(D-Alpha-3, CLAUDE.md:339-345) belong here in spirit — `@cpu_disable_int` /
+`@cpu_enable_int` (cli/sti, cpsid/cpsie, csrci/csrsi) flip the interrupt flag,
+a piece of machine state C cannot see.
+
+**(d) Inspection / cache / TLB** — CPUID / RDTSC / INVLPG / WBINVD and friends
+(D-Alpha-10, -11, -14):
+
+```
+@cpu_cpuid(u32,u32) -> u64   @cpu_cpuid_ecx(...)        # CPUID
+@cpu_vendor_id/feature_bits/model_id()                  # CPUID leaves 0/1
+@cpu_cache_disable()   # CR0.CD=1 + WBINVD  (CLAUDE.md:466)
+@cpu_cache_enable()    # CR0.CD=0
+@cache_flushopt/@cache_writeback   # CLFLUSHOPT / CLWB  (D-Alpha-13)
+@cpu_eoi()             # end-of-interrupt to LAPIC/GICv3
+```
+
+Some inspection reads are **non-privileged** (D-Alpha-10 are "All
+non-privileged — run in user mode directly", CLAUDE.md:392) — `@cpu_read_sp`,
+`@cpu_read_flags`, `@cpu_vendor_id`, etc. They are still Tier B because they
+inspect CPU state that has no value-semantics in C and have no portable builtin
+(except `@cpu_read_tp`, which is genuinely a builtin — `__builtin_thread_pointer`,
+CLAUDE.md:382, so it can ride Tier A). Cache/TLB ops (WBINVD, INVLPG, CLWB)
+manipulate coherency state — outside the abstract machine by construction. **CLWB
+specifically is the op behind the Session-G ordering false-positive** discussed
+below.
+
+The set is ~36 distinct machine-configuration ops once the genuine builtins
+(`@cpu_read_tp`) and the abstract-machine-internal ops (atomics, bit ops, bswap
+— all Tier A) are subtracted from the 130 D-Alpha intrinsics (CLAUDE.md:482).
+
+### 9.3 Why the residue stays bounded — three structural properties
+
+The fear this section must put to rest is: *"per-ISA raw asm sounds like exactly
+the per-instruction/per-vendor/per-ISA-extension maintenance treadmill the whole
+design was supposed to escape."* It is not, for three reasons that **must hold
+jointly**.
+
+**(1) The USED set is mostly stable, decades-old core.** CR3 switching, MSR
+read/write, port I/O, IRET, and the interrupt flag are not moving targets —
+they are the same instructions kernels have driven since the 386 / since each
+ISA's first protected mode. Implement a leaf for `@cpu_write_cr3` *once* and it
+does not change. The privileged *core* is a fixed point, not a growing frontier.
+
+**(2) New privileged ops arrive SLOWLY, and vendor-driven.** New privileged
+operations *do* arrive — XSAVE/XRSTOR, FSGSBASE, SMAP, PKE (protection keys),
+CET (control-flow integrity, e.g. `@cpu_endbr` → ENDBR64, CLAUDE.md:478-479),
+WAITPKG (`@cpu_umwait`/`@cpu_umonitor`, CLAUDE.md:474-476). But they arrive on a
+*per-architecture-generation cadence*, gated on silicon shipping, not on a
+release schedule ZER controls. This is single-digit ops per architecture per
+*generation* — the "~1-2 ops/decade" growth rate cited in §1's triangle for the
+frozen-taxonomy axis. The set grows, but at the speed silicon grows, which is
+geologically slow compared to software churn.
+
+**(3) DEMAND-DRIVEN + FAIL-CLOSED — the property that actually defeats the
+disqualifier.** This is the load-bearing one:
+
+- **Demand-driven**: you write a Tier-B leaf *only when firmware actually uses
+  that op*. You never enumerate the whole ISA's privileged opcode space upfront.
+  If no firmware in your tree calls `@cpu_write_xcr0`, no leaf for it needs to
+  exist. The burden tracks **your usage** (tiny, slow), **not the ISA catalog**
+  (huge, vendor-defined).
+- **Fail-closed**: an unimplemented privileged op is a **compile error**, never a
+  silent hole. There is no "unknown op → assume benign → pass GREEN" path. If
+  firmware names an op with no Tier-B leaf, compilation stops; you implement the
+  one leaf, witness/taint it, and proceed. Coverage gaps are *loud*, not
+  *exploitable*.
+
+The two together mean: **the maintenance burden is bounded by the size of the
+privileged surface your firmware actually touches**, and any attempt to use an
+unimplemented op is structurally blocked rather than silently mishandled.
+
+### 9.4 Why this does NOT trip the named disqualifier
+
+The design fan-out (§ on the rejected alternatives) named a specific
+disqualifier: **proactive per-instruction / per-vendor / per-ISA-extension table
+maintenance that must cover the whole ISA or be fail-open.** The rejected
+disassemble-classify designs (DCA / DSC) tripped it exactly:
+
+- They needed the **whole-ISA opcode table** *proactively* — every mnemonic had
+  to be tabled in advance, because an untabled mnemonic decodes to
+  `NO_CATEGORY`, and `NO_CATEGORY` means a wrong declaration passes **GREEN**
+  (fail-OPEN). The "100x-smaller table" defense for those designs was a verified
+  fiction: the real per-ISA tables ZER deletes in Phase 1 are 53/37/30 rows
+  (asm_instruction_table_x86/arm/riscv), not the claimed ~15.
+
+Tier-B leaf maintenance trips *none* of the three clauses of the disqualifier:
+
+| Disqualifier clause | DCA/DSC (rejected) | Tier-B leaves (this design) |
+|---|---|---|
+| Proactive whole-ISA cover | **Yes** — must table every opcode | **No** — demand-driven, one leaf when used |
+| Fail-open on gaps | **Yes** — untabled → NO_CATEGORY → GREEN | **No** — unimplemented → compile error |
+| Granularity of growth | per-instruction table rows | one tiny leaf at a time, on first use |
+
+The distinction is *not* "Tier B has no per-ISA work" — it plainly does (a leaf
+*is* per-ISA asm). The distinction is that the per-ISA work is **(a) lazy**, **(b)
+fail-closed** (gaps are errors, not silent wrong-GREEN), and **(c)
+one-leaf-at-a-time** (no obligation to mirror the vendor's opcode catalog).
+New-ISA bring-up is therefore *bounded*: write that
+ISA's leaf set once (only the ops your firmware uses), and then **every
+composition above the leaf line works on the new ISA for free** — flexibility
+and per-ISA cost decouple (§1 triangle, "New-ISA bring-up").
+
+### 9.5 The residue is mostly *witnessed*, not blindly trusted
+
+The final reason the residue is acceptable: most of its declared safety
+properties are **observable on x86 and verified by the conformance witness**
+(see §ConformanceWitness), so "trusting the author's declaration" is the
+*exception*, not the rule, within Tier B.
+
+Recall the witness mechanism: the toolchain runs per-category probes in
+**qemu-system-x86_64** (the only system QEMU present in this env; version
+8.2.7), boots a **ring-0 stub** so that privileged ops *are* executable under
+emulation, and binds a `.zerwitness` record to `(op, ISA, category-profile,
+blake2(asm), qemu-version)`. A leaf whose declared row is contradicted by
+observation, or whose asm hash has drifted, is a **compile error** (fail-closed
+precondition).
+
+What is **witnessable** for the privileged residue — the verified majority:
+
+- **`changes_privilege`** — directly observable by **CPL readback**. A privilege
+  transition (`@cpu_syscall`, `@cpu_sysret`, `@cpu_iret`) either lands at the
+  declared privilege level or it does not; the stub reads CS.RPL / CPL before and
+  after. This is the category that dominates Tier B (it is *why* most of these
+  ops are privileged), and it is **decidable**. QEMU *emulates* privilege, so
+  privileged ops are probeable in system mode — this is the whole reason the
+  ring-0 stub exists.
+- **`clobbers_register` / `clobbers_flags`** — the witness sweet spot:
+  sentinel-fill every GPR + flags, run the leaf, read back, diff. Register
+  write-sets are *structural, not data-dependent*, so a single run is
+  near-complete. This catches the classic under-declared-clobber bug that GCC
+  and Rust inline-asm cannot (they trust the clobber list the author wrote;
+  ZER's witness checks it against silicon-emulation reality). MSR/CR writes,
+  CPUID (clobbers EAX/EBX/ECX/EDX), and the like all expose their real clobber
+  sets here.
+- **`requires_nonzero`** (zero-trap probe) and **`requires_aligned` where it
+  actually traps** — decidable by feeding the trapping input and observing the
+  fault.
+
+What is **NOT witnessable**, and therefore stays TAINTED (the named floor for
+the residue):
+
+- **Memory ordering** on the cache/TLB/fence-adjacent ops. QEMU TCG flattens to
+  TSO, so a *too-weak* fence witnesses GREEN — *worse* than author-trust, because
+  it manufactures false confidence. Ordering is the low-low corner of the
+  observability spectrum (unsound fold × unobservable witness) and **stays
+  value-intrinsic, declared, and tainted**. This is grounded in ZER's own
+  Session-G evidence: Phase 3 in-block ordering enforcement was **ABANDONED**
+  because it false-positived the canonical libpmem **CLWB + SFENCE** idiom
+  (CLAUDE.md:1294-1296; "Phase 3 in-block enforcement ABANDONED (false-positived
+  the canonical multi-block CLWB+SFENCE libpmem idiom)"). The lesson recorded
+  there — "don't ship enforcement that rejects valid code patterns"
+  (CLAUDE.md:1297) — is *why* positional `memory_barrier` is excluded from the
+  fold vocabulary and why ordering is never witnessed.
+- **Alignment on x86** — with AC off, misaligned access does not trap, so
+  `requires_aligned` cannot be observed on this host for x86.
+- **Non-x86 privileged asm** — there is **no ARM or RISC-V system QEMU and no
+  cross-compiler in this env**. So ARM/RISC-V Tier-B leaves (e.g.
+  `@cpu_iret` → `eret`/`mret`, `@cpu_smc_call`, `@cpu_sbi_call`) cannot be
+  witnessed here and stay TAINTED. **This is an environment limit, not an
+  architecture limit**: installing `qemu-system-aarch64` + a cross-gcc promotes
+  these from taint → witness, opt-in (Residual Floor item 4). Today's D-Alpha
+  fallback for these on a non-matching host is already conservative —
+  "Non-x86 archs get no-op fallback" (CLAUDE.md:376) — which is fail-safe but
+  uninformative, hence the taint marker.
+
+So the honest accounting for Tier B: `changes_privilege` and the clobber
+categories — the properties that *make* an op privileged and the properties most
+likely to be mis-declared — are **verified by witness on x86**. Only ordering,
+x86 alignment, and the *non-x86* leaves on this host fall to the named taint
+floor. The residue is **mostly verified, partly tainted, never silently
+trusted** (because taint is greppable and propagates to the importing function;
+see §Taint).
+
+### 9.6 Where the residue concentrates the floor (closure restatement)
+
+The closure theorem (§ClosureArgument) says: *safe leaves + sound fold ⇒
+everything composed above the leaf line is safe; safety is RELATIVE TO leaf
+correctness.* Tier B is where that relativity lives. A sound fold faithfully
+propagates a **lying leaf** — it cannot detect one. So the entire correctness
+budget for machine-configuration safety **concentrates into this ~36-op set**.
+That concentration is the win: it reduces the audit surface from O(bindings)
+distributed prose checklists (Option E's per-binding "did the author honor the
+declared categories?" question, repeated everywhere) to **O(leaves) +
+O(1)-fold-proof**, where O(leaves) here is the small, slow-growing, mostly-
+witnessed Tier-B set.
+
+The residual floor for Tier B, stated without marketing, is therefore exactly
+three things: **(1)** silicon errata / microarchitecture beneath the QEMU-TCG
+model (the anchor moves from author's-word to the QEMU-TCG model — auditable and
+shared, but not the die); **(2)** the ordering + `provenance_clear_on_output`
+categories that are structurally untestable here (tainted); and **(3)** the
+non-x86 privileged leaves until ARM/RISC-V QEMU + cross-gcc are installed
+(environment-removable, not architectural). Everything else in Tier B is a
+compile-error-or-witnessed structural gate.
+
+> **Implementation note (illustrative — proposed surface, not yet shipped).**
+> Per STEP 4 / STEP 5 of the plan: a Tier-B leaf is the *only* `@bind` form that
+> may carry a real mnemonic (`NODE_LEAF_BIND`), and even then `@bind` is a
+> **compile error unless the op is on the closed privileged allow-list** (tests
+> `composed_bind_mnemonic.zer`, `bind_on_builtin_op.zer`). A leaf-use of an
+> *unwitnessed or hash-mismatched* privileged binding is a compile error
+> (`.zerwitness` missing/stale → fail-closed). There is **no checker support for
+> `@bind` / `@intrinsic_def` / allow-list today** (it lives in Phase 2/3); today
+> these ops are the per-arch-inline-asm D-Alpha intrinsics in the emitter, and
+> the NODE_ASM checker handler is checker.c ~10720-10890. The Tier-B
+> categorization above is the *target* leaf set, anchored to the already-shipped
+> D-Alpha privileged intrinsics.
+
+
+## 10. Honest scope, fault attribution, and the residual floor
+
+This section states, without marketing, exactly what the Effect-Row Composition
+design proves structurally, what it proves by witness, what it leaves
+author-declared behind a greppable taint marker, and what is irreducible floor
+that no language can close. It carries forward the fault-attribution discipline
+that Option E locked in `docs/asm_lang_zer_safe.md` §1.7.31 and reframes it in
+terms of the leaf/composition/witness structure this document adds. A fresh
+reader must be able to answer, for any single asm-touching guarantee, the
+question "is this STRUCTURAL, WITNESSED, TAINTED, or FLOOR?" — and know who owns
+the bug when it goes wrong.
+
+The governing vocabulary is the one locked across all of ZER (`CLAUDE.md`,
+"ZER's Goal"): **program-consequence** (every wrong USE of a value in ZER source
+is caught at the use site — ZER owns this at 100%) versus **hardware-consequence**
+(datasheet/silicon facts that never enter the program as values — floor, out of
+scope for any language). The asm boundary inherits this split unchanged; the
+refinement here is only about WHERE the hardware-consequence floor concentrates
+once leaves and folds replace Option E's distributed per-binding prose
+checklists.
+
+### 10.1. What is STRUCTURAL (compile-enforced, no diligence required)
+
+Structural means: enforced by the grammar or by a closed, terminating checker
+fold — a wrong program does not compile. No CI test, no reviewer attention, no
+"trust the author" step participates. This is the CLOSURE register: "no path to
+the unsafe construct except a compiler-enforced gate."
+
+1. **Tier-A leaf effect rows are DERIVED, not declared.** A Tier-A leaf is a GCC
+   builtin (`__builtin_add_overflow`, `__atomic_*`, `__builtin_clz/ctz/popcount`,
+   `__builtin_bswap*`). Its effect row is read out of ONE audited table mapping
+   builtin name -> category bitset (the S1 derive-table in `checker.c`). The
+   author of a Tier-A op is FORBIDDEN from declaring categories — declaration is
+   a compile error, because the derive-table is the single source of truth and
+   GCC, not the author, selects the real instruction (and the sub-arch via
+   `-march`). This is ~95% of operations by count (computational / ALU / atomic /
+   bit). The objective Tier-A boundary is "compiles under `-ffreestanding`":
+   verified that `clz`, `add_overflow`, and `bswap` do; `__rdmsr` does not (it is
+   not a builtin — it is Tier B).
+
+2. **Composed effect rows are DERIVED by closed fold rules.** A `compose`
+   operation (NODE_COMPOSED_BIND) recombines existing leaves/ops. It has **no
+   instructions field** — the composed-binding grammar HAS NO mnemonic
+   production. The composed op's effect row is computed by folding children:
+   `clobbers_register` and `clobbers_flags` by UNION/OR; `requires_aligned(n)` by
+   MAX. The author MAY state an EXPECTED row; declared-vs-derived mismatch is a
+   COMPILE ERROR. Layer-3 call-site verification is repointed from the author's
+   DECLARED row to the DERIVED row.
+
+3. **The no-mnemonic grammar gate.** Raw asm (a real mnemonic) can appear ONLY
+   inside a NODE_LEAF_BIND, and a `@bind` is a compile error unless its operation
+   is on the closed privileged allow-list (Step 4 structural fence; tripwire
+   tests `composed_bind_mnemonic.zer`, `bind_on_builtin_op.zer`). You literally
+   cannot write freeform asm in a composition. This is the same shape as ZER's
+   existing pointer gate (`checker.c:5601-5608`: no integer-to-pointer cast except
+   through `@inttoptr` with mandatory `mmio`) — the unsafe construct exists only
+   behind a structural witness.
+
+4. **Operand-value safety stays live through asm.** The existing ZER Z-rules
+   (Z1-Z8, Z11, Z12 — wired today in the NODE_ASM handler at `checker.c:10529`)
+   keep UAF / bounds / move / VRP / provenance / escape / qualifier / MMIO
+   tracking ACTIVE across the asm operand boundary. This is strictly stronger
+   than Rust, which goes blind inside `unsafe { asm!() }`. Reserved registers
+   (sp/bp/pc) are structurally banned as operands; register NAME validity is
+   delegated to GCC (the assembler errors on a bad name).
+
+5. **Fold soundness is the theorem, not a hope.** `clobbers_*` fold by union (a
+   superset of clobbers is always a safe over-approximation — sound). The
+   CLOSURE ARGUMENT: safe LEAVES + sound FOLD => everything composed above the
+   leaf line is safe. This is the SAME closure shape ZER already relies on
+   elsewhere (memory safety = closure over allocation primitives; type safety =
+   closure over conversion intrinsics; concurrency = closure over sync
+   primitives). Composition reduces the audit from O(bindings) distributed prose
+   checklists to O(leaves) + O(1) fold-proof.
+
+What structural safety does NOT give you: it faithfully PROPAGATES whatever the
+leaf declared. A sound fold over a lying leaf produces a green-but-wrong result.
+Therefore composition safety is RELATIVE TO leaf correctness — see §10.5. The
+floor does not disappear; it CONCENTRATES into the leaf set.
+
+### 10.2. What is WITNESSED (decidable Tier-B categories on an executable ISA)
+
+Tier-B leaves are the ~36 raw-asm ops OUTSIDE C's abstract machine (control-state
+writes — CR0/3/4, RDMSR/WRMSR, XSETBV; I/O ports IN/OUT; privilege transitions
+SYSCALL/SYSRET/IRET/ECALL/SVC; inspection/cache/TLB — CPUID, RDTSC, INVLPG,
+WBINVD). C has no portable builtin for them because they CONFIGURE the machine
+(privilege, page tables, MSRs, ports, interrupt flag — concepts C has no model
+for). Their declared effect rows cannot be derived; some can be WITNESSED.
+
+The conformance witness (Step 5, `tool/asm_witness/`) runs per-category probes
+in `qemu-system-x86_64` (verified present: version 8.2.7) and compares the
+DECLARED effect row against OBSERVED behavior. QEMU emulates privilege, so
+privileged ops ARE probeable in system mode by booting a ring-0 stub. The
+witness is bound to the tuple `(op, ISA, category-profile, blake2(asm),
+qemu-version)` and written to a `.zerwitness` record. A Layer-3 import / leaf-use
+of an unwitnessed or hash-mismatched binding is a COMPILE ERROR — the gate is a
+structural precondition and FAILS CLOSED. The hash is recomputed at import; a
+missing or stale witness is an error, with lazy re-witnessing.
+
+DECIDABLE (observable, deterministic) categories — what the witness actually
+certifies:
+
+- **`clobbers_register` / `clobbers_flags`** — the WITNESS SWEET SPOT. Sentinel-
+  fill every register, run the op, read back. Register write-sets are STRUCTURAL,
+  not data-dependent, so a single run is near-complete. This catches the classic
+  under-declared-clobber bug that GCC and Rust CANNOT catch.
+- **`changes_privilege`** — CPL readback after the op.
+- **`requires_nonzero`** — zero-trap probe.
+- **`requires_aligned`** — only where it actually traps.
+
+The observability spectrum: a category's safety-achievability = (fold soundness)
+x (witness observability). `clobbers_*` is high-high (sound fold AND observable
+witness) — the best case. Note the witness's logical scope: it certifies an
+EXISTENTIAL ("these categories were observed honored on x86 under QEMU TCG"). The
+gate consumes it as a UNIVERSAL ("the declaration is honored"). That inference is
+sound ONLY for decidable predicates — which is exactly why standalone
+QEMU-witness was DEMOTED in the design fan-out to this subordinate, decidable-x86
+role rather than serving as the general gate.
+
+### 10.3. What is TAINTED (the named floor — author-declared, greppable, never green)
+
+Some categories are neither derivable (Tier A / composition) nor witnessable
+(decidable Tier B). They stay author-DECLARED but carry a greppable taint marker
+(Step 6 — reuse of the existing trust-boundary marker) that propagates to and
+TAINTS every importing function. A tainted symbol can never read as
+verified-green. This is the honest middle: not structural, not silent.
+
+What is tainted:
+
+1. **Memory ordering / `memory_barrier(ordering)`.** Ordering does NOT fold
+   soundly — max-ordering-of-children is UNSOUND. This is ZER's own Session-G
+   evidence: Phase 3 in-block ordering enforcement was ABANDONED because it
+   false-positived the canonical libpmem CLWB+SFENCE idiom (`CLAUDE.md`
+   lines 1295-1296). So positional `memory_barrier` is EXCLUDED from the fold
+   vocabulary entirely; ordering stays value-intrinsic only. Ordering is also
+   UNOBSERVABLE under witness: QEMU TCG flattens to TSO, so a too-weak fence
+   witnesses GREEN — strictly WORSE than author-trust because it manufactures
+   false confidence. Ordering is therefore low-low on the observability spectrum
+   (unsound fold AND unobservable witness — the irreducibly hardest category) and
+   stays tainted, never witnessed. The litmus/herd7 path is the only conceivable
+   ordering probe and is explicitly PROBABILISTIC; x86-is-TSO hides both
+   under- and over-declaration. This confirms ordering as the worst case rather
+   than relieving it.
+
+   IMPLEMENTATION NOTE (load-bearing): "ordering derived from the builtin" is
+   FALSE in the emitter TODAY. Atomic value-ops hardcode `__ATOMIC_SEQ_CST`
+   (`emitter.c:3128`, `:3134`, `:3146`, `:3152`); only the fence path
+   (`emitter.c:3098-3102`) is ordering-parameterized. Until Step 2 wires the
+   ordering parameter through the atomic value-ops, the derive-table MUST
+   conservatively declare `ordering = seq_cst` — the actually-emitted truth — so
+   the declared row never overstates what GCC emits.
+
+2. **Non-x86 privileged asm on THIS host.** ARM/RISC-V privileged leaves cannot
+   be witnessed here: the environment has only `qemu-system-x86_64` 8.2.7 — no
+   `qemu-system-aarch64`, no `qemu-system-riscv64`, no user-mode QEMU, no
+   cross-compilers. Their effect rows stay DECLARED + TAINTED. This is an
+   ENVIRONMENT limit, not an architecture limit — see §10.4 #4: installing
+   `qemu-system-aarch64` + a cross-gcc promotes these from taint to witness with
+   no design change (opt-in).
+
+3. **`provenance_clear_on_output`.** Not structurally derivable and not
+   observable by the probe set; stays declared + tainted.
+
+The taint marker is the design's honesty mechanism: every place the floor is
+crossed is greppable, and the floor cannot masquerade as verified.
+
+### 10.4. What is IRREDUCIBLE FLOOR (no language closes it)
+
+These exist by physics or by host configuration, not by any defect in the
+design. They are named, not hidden.
+
+1. **Silicon errata / microarchitecture.** Whether the actual die honors the ISA
+   manual is the deepest floor — even GCC trusts the ISA manual
+   (§1.7.12: "even GCC trusts the ISA manual"). The design's contribution is to
+   MOVE the anchor from "the binding author's word" (Option E) to a shared,
+   auditable contract: GCC's documented builtin contract (Tier A) and the QEMU
+   TCG model (Tier B). Neither is the silicon, but both are inspectable and
+   shared rather than per-author prose.
+
+2. **QEMU / TCG fidelity.** The Tier-B witness is only as faithful as TCG's
+   model of the ISA. A witness GREEN means "honored under TCG," not "honored on
+   the die." This is why the witness scope is limited to decidable predicates and
+   why TSO-flattened ordering is excluded (§10.2, §10.3).
+
+3. **Ordering and `provenance_clear_on_output`.** Tainted, per §10.3 — listed
+   here because, beyond the taint marker, there is no mechanism (structural or
+   witnessed) available in this design that closes them.
+
+4. **Non-x86 privileged asm on this host.** Floor only because of the missing
+   QEMU systems and cross-toolchains; promotable to witness by installing them.
+   Distinguished from #1-#3 because it is the one floor entry the operator can
+   remove without changing the architecture.
+
+5. **Leaf assertions + fold rules — the centralized small audit (the genuine
+   shrink).** Every Tier-B leaf's DECLARED-where-undecidable categories, and the
+   correctness of the fold rules themselves, must be trusted. But this set is
+   SMALL, CENTRALIZED, and reviewable WITHOUT silicon: the fold soundness proof
+   is O(1), and the leaf set is per-ISA and demand-driven. This is the
+   replacement for Option E's O(bindings) distributed-prose-checklist floor — the
+   genuine reduction the whole design buys: O(leaves) + O(categories) centralized
+   audit instead of one prose checklist per binding scattered across libraries.
+
+### 10.5. Fault attribution (carried from Option E §1.7.31, refined for leaves)
+
+§1.7.31 partitions every binding-boundary failure into three categories. The
+leaf/composition/witness structure preserves the partition and sharpens where
+each lands.
+
+- **Category #1 — declared effect row does not match the silicon.** The leaf
+  author declared categories the asm does not honor on the target ISA. This is
+  the binding/leaf AUTHOR'S fault, REJECTED at the language core. The defense is
+  ARCHITECTURAL, not bandwidth-driven: "asm semantics are per-ISA hardware facts;
+  the ISA manual is the datasheet for instruction meaning; the core cannot verify
+  category-truth-against-silicon without importing per-ISA instruction semantics
+  — the unbounded catalog Phase 1 deletes." REFINEMENT: this design narrows
+  Category #1's surface. For Tier-A ops it is structurally IMPOSSIBLE (no
+  declaration exists to be wrong — §10.1 #1). For decidable Tier-B categories the
+  witness CATCHES the classic instance (under-declared clobber — §10.2). What
+  remains genuinely Category #1 is the tainted residue (§10.3) and undecidable
+  Tier-B declarations.
+
+- **Category #2 — leaf is honest, the core mis-reasons over correct categories.**
+  The fold drops a clobber, or the call-site checker fails to enforce a correctly
+  derived `requires_aligned`. This is the CORE'S bug, OWNED, must be bug-free.
+  The hardware-floor defense does NOT apply: the math is wrong about its OWN
+  categories, not about hardware. The commitment is bounded — the category
+  vocabulary, the operation taxonomy, the fold rules, and the dispatch paths are
+  all FINITE, so verifier correctness is a finite testing surface (the same
+  oracle methodology as the 8 matrix oracles in `tests/test_*_matrix.c`).
+
+- **Category #3 — the vocabulary cannot express the leaf honestly.** A missing
+  or over-merged category. This is the CORE'S bug, fixed through a slow-cadence
+  schema-extension release. By construction extensions are rare: categories
+  describe structural behavior KINDS bounded by hardware-software interaction
+  physics, not by per-instruction growth.
+
+The load-bearing discipline (§1.7.31): the Category #1 rejection has teeth ONLY
+because Categories #2 and #3 are visibly OWNED. Reflexively rejecting a #2 bug as
+"#1, your problem" corrodes credibility; accepting a #1 complaint as "we should
+add per-instruction semantic verification" reopens the unbounded catalog. Both
+drifts are refused. The boundary is the same program-consequence vs
+hardware-consequence line ZER draws everywhere.
+
+**The two-responsibility, one-boundary statement, in leaf terms:**
+
+> The core OWNS category-REASONING: given a leaf's correctly-stated effect row,
+> the fold and the call-site checker must propagate its implications to every use
+> site, every time, without bugs. This is program-domain logic over the closed
+> schema; it is bounded by the finite schema and is solo-maintainable.
+>
+> The core does NOT own category-TRUTH-against-silicon: whether a Tier-B leaf's
+> declared-and-undecidable categories actually hold on the die is the
+> hardware-consequence floor, surfaced at the leaf and carried by the taint
+> marker. For Tier-A and for decidable Tier-B categories, this floor is removed
+> (derived or witnessed); for the rest it is named, not verified.
+
+### 10.6. The triangle, and where this design deliberately sits
+
+THE TRIANGLE: flexibility / safety / maintainability — pick any two fully; the
+third degrades. The design space was explored by a 14-angle adversarial fan-out
+(two waves, ~58 agents, each judged on maintainability and soundness):
+
+- **Intrinsic-Maximalism** — the maintainability-weighted winner (8.4). Buys
+  safety + maintenance, SACRIFICES flexibility: a frozen taxonomy growing ~1-2
+  ops/decade that cannot express genuinely new ops.
+- **Effect-Row Composition (ADOPTED)** — the flexibility-weighted winner. Buys
+  flexibility + safety, PAYS with a small leaf-audit plus the named floor past
+  the leaf boundary (§10.3-§10.4). Authors write `compose` operations recombining
+  leaves with no asm and no core release; new-ISA bring-up is "write its leaf set
+  once (bounded), then ALL compositions work on it for free" — flexibility and
+  per-ISA cost DECOUPLE.
+- **DCA (disassemble-classify)** — buys flexibility + low friction, LOSES safety
+  (fail-open). REJECTED: it revives the per-ISA opcode table Phase 1 deletes (the
+  named disqualifier) AND fails open (an untabled mnemonic -> NO_CATEGORY -> a
+  wrong declaration passes GREEN). The "100x smaller table" defense was a VERIFIED
+  FICTION — real tables are 53/37/30 rows (~120 total: the very files Phase 1
+  removes — `src/safety/asm_instruction_table_{x86_64,aarch64,riscv64}.c`,
+  `asm_register_tables_*.c`, `asm_categories.{c,h}`), not 1500; and `-O0`
+  compiler-glue contaminates disassembly (8 of 11 instructions glue in a measured
+  cmpxchg case).
+
+The privileged residue is maintainable BECAUSE it is DEMAND-DRIVEN (implement a
+leaf only when firmware uses that op — never the whole ISA upfront) and
+FAIL-CLOSED (an unimplemented privileged op is a compile error, not a silent
+hole). The set you USE is mostly decades-old and stable (CR3/MSR/port/IRET/IF);
+new privileged ops arrive SLOWLY (vendor-driven, per-architecture-generation:
+XSAVE/FSGSBASE/SMAP/PKE/CET). The burden tracks YOUR usage (tiny, slow), not the
+ISA catalog — so it does NOT trip the named disqualifier (per-instruction /
+per-vendor / per-ISA-extension PROACTIVE scaling) that sank the disassemble-table
+designs, which needed the WHOLE-ISA opcode table proactively or else be
+fail-open.
+
+Where this design sits, stated plainly: **flexibility + safety, with bounded
+maintenance** — not the maintenance-maximum corner, and explicitly not the
+fail-open flexibility corner. The maintenance cost is real but bounded (a small
+per-ISA leaf set + an O(1) fold proof + a finite verifier test matrix); the
+safety is structural for ~95% of ops, witnessed for the decidable privileged
+residue, and the remainder is a NAMED, greppable, never-green floor rather than a
+silent gap. That is the honest scope: total program-consequence coverage at the
+call site, a concentrated and shrunken hardware-consequence floor at the leaf
+line, and no equivocation between the two.
+
+
+## 11. Implementation plan (lowest-effort-first)
+
+This section is the executable ordering. It assumes the design from the
+preceding sections: TIER A leaves = GCC builtins (effect row DERIVED from one
+audited builtin→category table), TIER B leaves = raw asm for the ~36 ops
+outside C's abstract machine (effect row WITNESSED where decidable, else
+DECLARED+TAINTED), COMPOSITION = `compose` operations that recombine
+leaves/ops with NO mnemonic production and an effect row folded by closed
+OR/MAX rules, and the CLOSURE theorem (safe leaves + sound fold ⇒ everything
+above the leaf line is safe). The steps are ordered by ascending effort and by
+dependency: each step is independently shippable and leaves the tree green
+(`make docker-check`).
+
+The plan rides existing machinery rather than building new dispatch:
+**64 `__builtin_`/`__atomic_` routing sites** already exist in `emitter.c`
+(verified `grep -cE "__builtin_|__atomic_" emitter.c` = 64) and
+**196 ISA-dispatch sites** (`grep -cE "target_arch|__x86_64__|__aarch64__|__riscv" emitter.c` = 196).
+Tier A reuses the first set; Tier B reuses the second. No new code-emission
+backbone is required — the new work is in `checker.c` (category derivation,
+fold, structural gate) plus one out-of-tree witness tool.
+
+A note on what is enforced where, repeated throughout: a **COMPILE ERROR** is a
+structural gate the user cannot bypass without a witness or a legal construct; a
+**NAMED FLOOR** is a category that is author-DECLARED, carries a greppable taint
+marker, and can never read as verified-green. The whole point of the plan is to
+maximize the first and concentrate the second into the smallest, most
+centralized surface (the leaf set + the fold rules).
+
+---
+
+### STEP 0 — Execute Phase 1 (delete the per-arch tables)
+
+Phase 1 is the Level C cleanup already specified in `docs/option_e_plan.md`
+(Commits 1–6, verified there 2026-06-08). It removes the per-ISA infrastructure
+that Option E / Effect-Row Composition replaces, and is a precondition: the new
+mechanism must be built on a core with no competing per-arch machinery to
+reconcile (`option_e_plan.md` §3).
+
+Commit order (the plan recommends doing the checker swap FIRST to validate the
+approach before any file deletion):
+
+- **Commit 1** (`option_e_plan.md` §2, "was C6") — in the `checker.c`
+  `NODE_ASM` handler, DELETE the three `zer_asm_register_valid_with_features(...)`
+  register-validation loops and the `zer_asm_instruction_info(...)` F4/F7-full
+  table dispatch + CPU-feature gating; ADD the frozen ~30-line UB-classics list
+  (BSR/BSF/DIV/IDIV → `REQUIRES_NONZERO`; MOVAPS/MOVDQA/VMOVAPS → `REQUIRES_ALIGN_{16,32}`;
+  IDIV → `COMPOUND_INTMIN_NEG1`). Register-name validation becomes GCC's job
+  (the emitted C → GCC assembler errors on a bad register name).
+- **Commit 2** — `git rm` the instruction tables
+  (`asm_instruction_table.h`, `asm_instruction_table_{x86_64,aarch64,riscv64}.c`
+  — 53/37/30 rows), `gen_instruction_table.sh`, `candidates_*.txt`,
+  `arch_data/*.zerdata`, `arch_data/SCHEMA.md`.
+- **Commit 3** — `git rm` the register tables
+  (`asm_register_tables.h`, `asm_register_tables_{x86_64,x86_64_avx512f,aarch64,riscv64}.c`,
+  `asm_register_lookup.c`), `gen_register_tables.sh`, and the stray `.v`/`.o`.
+- **Commit 4** — `git rm` `asm_categories.{c,h}` + `asm_categories.v` + `.o`.
+- **Commit 5** — Makefile + `check-vst` wiring: remove the 9 `src/safety/asm_*`
+  files from `CORE_SRCS`/`LIB_SRCS`, the `gen-asm-tables:` target, and the
+  deleted files from the `check-vst` `clightgen` line.
+- **Commit 6** — convert tests that referenced deleted infrastructure
+  (`tests/zer_fail/asm_aarch64_x86_reg.zer`, `asm_riscv64_x86_reg.zer` now fail
+  at GCC instead of at ZER — relabel, do not delete; `asm_avx512_register.zer`
+  / `asm_simd_register.zer` still validated by GCC `-mavx512f`).
+
+End state (`option_e_plan.md` §3): ~600 lines of durable asm safety
+infrastructure (Z-rules Z1–Z8/Z11/Z12, F7-light LR/SC, the UB-classics list),
+**zero per-arch tables, zero probe scripts**. This is the disqualifier removal:
+Effect-Row Composition must NOT revive the per-ISA opcode table Phase 1 deletes
+(that is exactly the REJECTED DCA/DSC failure mode).
+
+---
+
+### STEP 1 — S1: the Tier-A derive-table in `checker.c` NODE_ASM
+
+Add the closed `builtin name → category bitset` table — the single audited,
+one-time artifact from which every Tier-A leaf's effect row is DERIVED. The
+`NODE_ASM` handler lives at **`checker.c` ~10720–10890** (the duplicate-register
+checks, the Z6/Z8/Z11/Z4/Z5 wiring, and the `ASM_OP_ROOT_IDENT` root-walk macro
+are all in that span — verified). The derive-table is the logical home for the
+"builtin-backed op → categories" lookup that replaces author-declared categories
+for the ~95% of ops GCC has a builtin for.
+
+Content of the derive-table (one row per builtin family):
+- `__builtin_add_overflow` / `__builtin_sub_overflow` / `__builtin_mul_overflow`
+  → `produces_carry`, `value_in_value_out`, `no_memory_effect`.
+- `__builtin_clz` / `__builtin_ctz` / `__builtin_popcount` / `__builtin_parity`
+  → `value_in_value_out`, `no_memory_effect`; clz/ctz additionally carry the
+  **`requires_nonzero` column** (input 0 is undefined for clz/ctz — this is a
+  REAL Tier-A floor and must be a derived category, not author-stated).
+- `__builtin_bswap{16,32,64}` → `value_in_value_out`, `no_memory_effect`.
+- `__atomic_load_n` / `__atomic_store_n` / `__atomic_fetch_*` /
+  `__atomic_compare_exchange_n` → `reads_mem`/`writes_mem(width, ordering)`,
+  plus the **lock-free-width guard**: 16-byte CAS (`__int128`) is NOT
+  lock-free on baseline x86-64 (needs `cmpxchg16b` / `-mcx16`) — the table must
+  declare a width column and the checker must reject (or taint) 16-byte atomics
+  that would silently route through libatomic locks. The existing atomic routing
+  already validates widths 1/2/4/8 (see CLAUDE.md "Atomic width validation"); the
+  guard extends that to the 16-byte case.
+
+Two structural rules in this step, both **COMPILE ERRORS**:
+1. For any op that is builtin-backed, **author-supplied categories are
+   FORBIDDEN** — the row is derived, and a `@bind`/`compose` that re-declares a
+   category for a builtin-backed op is an error (the declaration cannot lie
+   because there is nothing to declare). This is the `bind_on_builtin_op.zer`
+   test in STEP 4.
+2. The objective Tier-A boundary is `-ffreestanding` compilability: clz /
+   add_overflow / bswap DO compile `-ffreestanding`; `__rdmsr` does NOT. Only
+   builtins on the freestanding side belong in the derive-table; the rest are
+   Tier B (STEP 5).
+
+---
+
+### STEP 2 — Wire the ordering param through atomic value-ops (fix SEQ_CST hardcoding)
+
+"Category derived from the builtin's contract" is FALSE today for the `ordering`
+category: the emitter hardcodes `__ATOMIC_SEQ_CST` for every atomic value-op.
+Verified sites in `emitter.c`:
+- The AST path: **`emitter.c` ~3128 / ~3134 / ~3146 / ~3152** (load/store/cas/fetch-*).
+- The IR-rewritten path: **`emitter.c` ~8358 onward** (the comment at ~8357
+  literally says "All SEQ_CST ordering for now (Ordering param deferred)"),
+  with the actual `, __ATOMIC_SEQ_CST)` emissions at ~8364 / ~8368 / ~8375 / ~8399.
+- The fence path is ALREADY ordering-parameterized: `@barrier` → `SEQ_CST`,
+  `@barrier_store` → `__ATOMIC_RELEASE`, `@barrier_load` → `__ATOMIC_ACQUIRE`
+  at **`emitter.c` ~3098–3102**. This is the model to copy.
+
+Two acceptable outcomes (pick the cheaper that keeps the derive-table honest):
+- **(a)** Wire an `ordering` parameter through the atomic value-ops in BOTH
+  emitter paths (AST ~3128–3152 and IR ~8358+), mirroring the fence-path
+  precedent, then have the derive-table read the actual ordering.
+- **(b)** Until (a) ships, the derive-table must conservatively declare
+  `ordering = seq_cst` — the **actually-emitted truth**. A conservative
+  over-declaration here is sound (seq_cst is the strongest); under-declaring
+  would be the unsound direction.
+
+Critical constraint that bounds this step's ambition: **`memory_barrier` /
+positional ordering does NOT fold soundly** and stays out of the composition
+fold vocabulary (STEP 3). Ordering is the low-low cell of the observability
+spectrum (unsound fold × unobservable witness) — it stays a NAMED FLOOR
+(taint, STEP 6), never witnessed. ZER's own Session-G evidence: Phase 3 in-block
+ordering enforcement was ABANDONED because it false-positived the canonical
+libpmem CLWB+SFENCE idiom (CLAUDE.md **~1295–1296**). Do not re-attempt
+positional ordering enforcement here.
+
+---
+
+### STEP 3 — S2: composition (the flexible layer)
+
+Add the composition node and the fold. Two new node kinds:
+- `NODE_COMPOSED_BIND` — has NO `instructions` field. The composed-binding
+  grammar has no mnemonic production: you literally cannot write freeform asm in
+  a `compose` body (this is the `@inttoptr`-shaped gate for asm). A composed op
+  recombines leaves/ops and other compositions only.
+- `NODE_LEAF_BIND` — the ONLY node where raw asm (a real mnemonic) is permitted,
+  and only behind the structural fence of STEP 4.
+
+The composed op's effect row is DERIVED by the closed FOLD RULES over its
+children's effect rows:
+- `clobbers_register` / `clobbers_flags` → fold by **UNION / OR** (sound:
+  superset of clobbers is always safe to assume).
+- `requires_aligned(n)` → fold by **MAX** (sound: the strictest child alignment
+  is the requirement).
+- `requires_nonzero` → OR (sound: any child that traps on zero makes the
+  composite require nonzero).
+- positional `memory_barrier` / ordering → **EXCLUDED from the fold vocabulary**
+  (max-ordering-of-children is unsound — STEP 2 rationale; ordering stays
+  value-intrinsic only, never positional, never composed).
+
+Author may state an EXPECTED effect row on a `NODE_COMPOSED_BIND`. **Declared vs
+derived mismatch = COMPILE ERROR.** This is the ERBT (Effect-Row Binding Types)
+inference check: the checker folds the children, infers the row, and rejects any
+author claim that disagrees.
+
+Finally, **repoint Layer-3 from DECLARED to DERIVED**: the static verifier that
+checks Layer-3 call sites against effect rows must read the DERIVED row of the
+composed op, not an author-declared one. Under Option E (the prior design)
+Layer 3 was "verified against a lie" if a binding mis-declared; under
+composition, a composed op cannot mis-declare (mismatch is rejected), and a
+leaf's declaration is either derived (Tier A), witnessed (decidable Tier B), or
+tainted (STEP 6). This is the closure theorem made operational: the floor
+concentrates into the leaf set, reducing safety from O(bindings) prose
+checklists to O(leaves) + O(1) fold proof.
+
+---
+
+### STEP 4 — Structural fence: `@bind` is a compile error unless on the closed privileged allow-list
+
+`@bind` (the leaf mechanism that introduces raw asm) is a **COMPILE ERROR**
+unless its op is on a closed privileged allow-list — the ~36 Tier-B ops outside
+C's abstract machine (CR0/3/4 read/write, RDMSR/WRMSR, XSETBV, IN/OUT ports,
+SYSCALL/SYSRET/IRET, CPUID/RDTSC/INVLPG/WBINVD, FSGSBASE, etc.). This is the
+DEMAND-DRIVEN + FAIL-CLOSED rule: a leaf is implemented only when firmware uses
+that op, and an unimplemented privileged op is a compile error, never a silent
+hole. The burden tracks YOUR usage (tiny, slow — CR3/MSR/port/IRET/IF are
+decades-old) not the ISA catalog, so it does NOT trip the per-instruction /
+per-vendor proactive-scaling disqualifier.
+
+Two negative tests (both **COMPILE ERRORS**), in `tests/zer_fail/`:
+- `composed_bind_mnemonic.zer` — a `compose`/`NODE_COMPOSED_BIND` body that
+  tries to contain a raw mnemonic. Must error: the grammar has no mnemonic
+  production at the composition level.
+- `bind_on_builtin_op.zer` — a `@bind`/`NODE_LEAF_BIND` (or category
+  re-declaration) on an op that is builtin-backed (Tier A, in the STEP 1
+  derive-table). Must error: builtin-backed ops are derived, not bound; raw asm
+  for them is forbidden (GCC already has the portable builtin).
+
+Follow the matrix-oracle methodology of the 8 existing oracles
+(`tests/test_*_matrix.c` — `test_asm_matrix.c`, `test_hw_matrix.c`,
+`test_escape_matrix.c`, etc.): the asm conformance harness should be a
+positive/negative matrix, not ad-hoc one-off tests.
+
+---
+
+### STEP 5 — S3: the conformance witness tool (`tools/asm_witness/`) under qemu-system-x86_64
+
+Build the out-of-tree witness tool that verifies a Tier-B leaf's DECLARED
+effect row against observed behavior. ENV note: only **`qemu-system-x86_64`**
+is present (verified `/usr/bin/qemu-system-x86_64`); there is no system QEMU for
+ARM/RISC-V, no user-mode QEMU, no cross-compilers. QEMU emulates privilege, so
+privileged ops ARE probeable in system mode by booting a ring0 stub.
+
+Per-category probes (DECIDABLE categories only — observable + deterministic):
+- `clobbers_register` / `clobbers_flags` — the **witness sweet spot**: fill all
+  GPRs (and flags) with sentinels, run the leaf, read back. Register write-sets
+  are structural, not data-dependent, so a single run is near-complete. This
+  catches the classic under-declared-clobber bug that GCC and Rust CANNOT.
+- `changes_privilege` — CPL readback before/after.
+- `requires_nonzero` — zero-trap probe.
+- `requires_aligned` — only where it actually traps (NOT x86 with AC off — that
+  silently succeeds, so it is UNOBSERVABLE on this host).
+
+UNOBSERVABLE categories are NOT witnessed (witnessing them produces FALSE
+confidence, worse than honest taint): memory ordering (QEMU TCG flattens to TSO,
+so a too-weak fence witnesses GREEN), and x86 alignment with AC off. These stay
+TAINTED (STEP 6).
+
+Witness artifact: a `.zerwitness` file binding `(op, ISA, category-profile,
+blake2(asm-hash), qemu-version)`. The gate: a Layer-3 import / leaf-use of a
+binding recomputes the asm hash; **missing witness or hash mismatch = COMPILE
+ERROR** (a structural, FAIL-CLOSED precondition). Re-witnessing is lazy (only
+when the hash changes). Note the demotion rationale: standalone QEMU-witness
+certifies an EXISTENTIAL ("some categories observed on x86") that the gate
+consumes as a UNIVERSAL ("declaration honored") — sound ONLY for the decidable
+predicates above, which is why the tool is subordinate and scoped to those.
+
+---
+
+### STEP 6 — S4: the taint marker (the NAMED FLOOR)
+
+Add the greppable taint marker for categories that are neither DERIVED (Tier A /
+composition) nor WITNESSED (decidable Tier B). Reuse the existing
+trust-boundary / audit-visible marker rather than inventing a new mechanism, and
+propagate it to importers: any function importing a tainted binding is itself
+tainted and **can never read as verified-green**. This is the honest residual,
+not a compile error — the user is permitted to proceed, but the taint is
+auditable and propagates.
+
+Taint covers exactly: memory ordering (the irreducible-hardest category —
+unsound fold × unobservable witness), non-x86 privileged asm on this host (an
+ENV limit, not an architecture limit — installing `qemu-system-aarch64` +
+cross-gcc would promote those from taint to witness, opt-in), and
+`provenance_clear_on_output`. Everything else resolves to DERIVED or WITNESSED.
+
+The split to keep straight: COMPILE ERROR = the gate (unwitnessed/hash-mismatch
+leaf, `@bind` off the allow-list, declared-vs-derived mismatch, raw mnemonic in
+a composition, author categories on a builtin-backed op). NAMED FLOOR = taint
+(ordering, non-x86 privileged, provenance_clear_on_output).
+
+---
+
+### STEP 7 — Optional: `make drc-x86` native CI differential (NOT a gate)
+
+Add an opt-in differential reference check as a native-x86 CI sanity layer. DRC
+runs each leaf against a pure-ZER reference implementation under fuzzed
+differential testing, catching **wrong-VALUE** bugs that no category mechanism
+can detect (adc-drops-carry, off-by-one bsr, CAS-wrong-operand). It is a TEST
+(process, not structure): it can only warn (not error) on cross-compile because
+the reference and the leaf must both run on the same host. Keep it as an opt-in
+`make drc-x86` CI target; **NEVER make it the gate** — making a probabilistic /
+host-bound test a structural precondition would violate the closure model (a
+gate must be a compile-time structural property, not a CI run, per ZER's
+"run-a-CI-test is the trust-the-user model ZER rejects").
+
+---
+
+### Summary: what each step gates
+
+| Step | Adds | Enforcement |
+|---|---|---|
+| 0 | Delete per-arch tables (`option_e_plan.md` C1–6) | — (removes the disqualifier) |
+| 1 | Tier-A derive-table in `checker.c` ~10720–10890; `requires_nonzero` col; lock-free-width guard | COMPILE ERROR: author categories on builtin-backed op |
+| 2 | Wire `ordering` through atomics (`emitter.c` ~3128–3152, ~8358+) or declare `seq_cst` | — (honesty of derived row) |
+| 3 | `NODE_COMPOSED_BIND` (no instructions), `NODE_LEAF_BIND`, OR/MAX fold, exclude positional barrier, Layer-3 → DERIVED | COMPILE ERROR: declared ≠ derived row |
+| 4 | Structural fence + `composed_bind_mnemonic.zer`, `bind_on_builtin_op.zer` | COMPILE ERROR: `@bind` off allow-list; mnemonic in composition |
+| 5 | `tools/asm_witness/` under qemu-system-x86_64; `.zerwitness` = (op, ISA, profile, blake2(asm), qemu-version) | COMPILE ERROR: missing/stale witness |
+| 6 | Taint marker (reuse trust-boundary marker), propagate to importers | NAMED FLOOR: ordering, non-x86 privileged, provenance_clear_on_output |
+| 7 | `make drc-x86` native differential | CI only — never a gate |
+
+Effort ascends 0→7; each step is independently shippable and green. STEP 0 is
+pure deletion (already specified). STEPS 1–4 are `checker.c`-local and ride the
+64 builtin + 196 ISA-dispatch sites. STEP 5 is the only out-of-tree artifact.
+STEPS 6–7 are markers and an opt-in test.
+
+
+---
+
+# ===================================================================
+# APPENDIX A — Option E and prior asm-safety architecture (PRESERVED)
+#
+# Everything below is the prior Option E architecture. It is the SUBSTRATE
+# the Effect-Row Composition design above refines: the program-consequence
+# vs hardware-consequence vocabulary, the three-layer model, the closed
+# category vocabulary, the structure/semantics straddle (1.7.5), and the
+# fault-attribution model (1.7.31) all CARRY FORWARD. Where the new design
+# above conflicts with Option E below, the NEW DESIGN SUPERSEDES.
+# ===================================================================
+
 # ZER-Asm Safety — Level C: Defer to GCC, Frozen Core
 
 **Status:** Planning document. Decision finalized 2026-05-12 (Level C).

@@ -6656,6 +6656,21 @@ hardening if a related bug ever surfaces.
 
 ---
 
+> **ASM SAFETY ARCHITECTURE — SOURCE OF TRUTH IS `docs/asm_lang_zer_safe.md`.**
+> The current locked design is **Effect-Row Composition** (READ FIRST section at the
+> top of that file): three levels / two tiers (Level 0 plain C; Tier A = GCC-builtin
+> leaves with categories *derived* from the builtin contract; Tier B = raw-asm leaves
+> for the ~36 machine-configuring privileged ops), `compose`-d operations whose effect
+> rows are *derived* by sound fold rules (clobbers/flags = union, alignment = max;
+> ordering EXCLUDED — Session-G/libpmem), the closure argument (safe leaves + sound
+> fold ⇒ everything above safe; floor concentrates into leaves), the conformance
+> witness (QEMU, decidable categories only, fail-closed), and the taint/named-floor
+> for the rest. Execution checklist: `docs/option_e_plan.md`. The D-Alpha sections
+> below are the per-intrinsic *implementation history* that the leaf/derive layer
+> builds on — they remain accurate as implementation notes, but the ARCHITECTURE
+> they sit under is now the Effect-Row Composition doc, not the old per-arch tables
+> (which Phase 1 / Level C deletes).
+
 ## Phase D-Alpha: adding new intrinsics (2026-04-23)
 
 ZER-Asm verified intrinsics ship in two layers: D-Alpha (implementation,

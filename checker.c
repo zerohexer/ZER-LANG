@@ -1276,21 +1276,18 @@ static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
                                   Type *tgt_type, int line, const char *context) {
     Type *seff = type_unwrap_distinct(src_type);
     Type *teff = type_unwrap_distinct(tgt_type);
-    /* BUG-747: peel matching wrapper types in lockstep so an optional (or
-     * slice) wrapper does not hide the pointer level — e.g. `?volatile *u32`
-     * assigned to `?*u32` must still be caught. Stop the moment the two kinds
-     * diverge (a different type error covers that mismatch), leaving
-     * seff/teff at the innermost matched level. This keeps the fix local to
-     * the coercion site instead of making `type_equals` volatile-strict
-     * globally (which would change type identity everywhere).
-     *
-     * TODO(human): write the lockstep peel loop over seff/teff here.
-     * While seff and teff are both non-NULL, have the SAME kind, and that
-     * kind is a wrapper worth seeing through (TYPE_OPTIONAL — you may also
-     * include TYPE_SLICE), advance both to their inner type, re-applying
-     * type_unwrap_distinct after each step. The inner type for TYPE_OPTIONAL
-     * is `->optional.inner`. Leave seff/teff pointing at the innermost
-     * matched level so the TYPE_POINTER check below sees through the wrapper. */
+    /* BUG-747: peel matching optional wrappers in lockstep so an optional
+     * wrapper does not hide the pointer level — e.g. `?volatile *u32` coerced
+     * to `?*u32` must still be caught. Stop the moment the kinds diverge (a
+     * real type mismatch is reported elsewhere), leaving seff/teff at the
+     * innermost matched level. Keeping the qualifier check local to the
+     * coercion site avoids making `type_equals` volatile-strict globally
+     * (which would change type identity at every call site). */
+    while (seff && teff && seff->kind == TYPE_OPTIONAL &&
+           teff->kind == TYPE_OPTIONAL) {
+        seff = type_unwrap_distinct(seff->optional.inner);
+        teff = type_unwrap_distinct(teff->optional.inner);
+    }
 
     if (!seff || seff->kind != TYPE_POINTER) return false;
     if (!teff || teff->kind != TYPE_POINTER) return false;
@@ -4204,10 +4201,20 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "cannot assign const slice to mutable — would allow writing to read-only memory");
             }
-            /* BUG-282: volatile pointer → non-volatile assignment */
-            if (target->kind == TYPE_POINTER && value->kind == TYPE_POINTER &&
-                !target->pointer.is_volatile) {
-                bool val_volatile = value->pointer.is_volatile;
+            /* BUG-282 + BUG-747: volatile pointer → non-volatile assignment.
+             * Peel matching optional wrappers in lockstep so the optional-wrapped
+             * form (`?*T = v;` where v is `?volatile *T`) is caught too — mirrors
+             * the var-decl gate. type_equals ignores volatile, so this is the
+             * only check that fires on the `?`-wrapped strip. */
+            Type *tgv = type_unwrap_distinct(target);
+            Type *vgv = type_unwrap_distinct(value);
+            while (tgv && vgv && tgv->kind == TYPE_OPTIONAL && vgv->kind == TYPE_OPTIONAL) {
+                tgv = type_unwrap_distinct(tgv->optional.inner);
+                vgv = type_unwrap_distinct(vgv->optional.inner);
+            }
+            if (tgv && vgv && tgv->kind == TYPE_POINTER && vgv->kind == TYPE_POINTER &&
+                !tgv->pointer.is_volatile) {
+                bool val_volatile = vgv->pointer.is_volatile;
                 if (!val_volatile && node->assign.value->kind == NODE_IDENT) {
                     Symbol *vs = scope_lookup(c->current_scope,
                         node->assign.value->ident.name,
@@ -4215,7 +4222,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (vs && vs->is_volatile) val_volatile = true;
                 }
                 /* check target too — if target sym is volatile, it's fine */
-                bool tgt_volatile = target->pointer.is_volatile;
+                bool tgt_volatile = tgv->pointer.is_volatile;
                 if (!tgt_volatile) {
                     Node *tr = node->assign.target;
                     while (tr && (tr->kind == NODE_FIELD || tr->kind == NODE_INDEX))
@@ -8794,21 +8801,33 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot initialize mutable pointer from const — "
                         "would allow writing to read-only memory");
                 }
-                /* BUG-197/282: volatile pointer → non-volatile drops volatile qualifier.
-                 * Check both type-level (pointer.is_volatile) and symbol-level (sym->is_volatile). */
-                if (type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER &&
-                    !type->pointer.is_volatile && !node->var_decl.is_volatile) {
-                    bool src_volatile = init_type->pointer.is_volatile;
-                    if (!src_volatile && node->var_decl.init->kind == NODE_IDENT) {
-                        Symbol *vs = scope_lookup(c->current_scope,
-                            node->var_decl.init->ident.name,
-                            (uint32_t)node->var_decl.init->ident.name_len);
-                        if (vs && vs->is_volatile) src_volatile = true;
+                /* BUG-197/282 + BUG-747: volatile pointer → non-volatile drops the
+                 * volatile qualifier. Peel matching optional wrappers in lockstep so
+                 * `?volatile *u32 → ?*u32` is caught too (type_equals ignores volatile,
+                 * so this is the only gate that fires on the optional-wrapped form).
+                 * Check both type-level (pointer.is_volatile) and symbol-level. */
+                {
+                    Type *tv = type_unwrap_distinct(type);
+                    Type *itv = type_unwrap_distinct(init_type);
+                    while (tv && itv && tv->kind == TYPE_OPTIONAL &&
+                           itv->kind == TYPE_OPTIONAL) {
+                        tv = type_unwrap_distinct(tv->optional.inner);
+                        itv = type_unwrap_distinct(itv->optional.inner);
                     }
-                    if (src_volatile) {
-                        checker_error(c, node->loc.line,
-                            "cannot initialize non-volatile pointer from volatile — "
-                            "writes through non-volatile pointer may be optimized away");
+                    if (tv && itv && tv->kind == TYPE_POINTER && itv->kind == TYPE_POINTER &&
+                        !tv->pointer.is_volatile && !node->var_decl.is_volatile) {
+                        bool src_volatile = itv->pointer.is_volatile;
+                        if (!src_volatile && node->var_decl.init->kind == NODE_IDENT) {
+                            Symbol *vs = scope_lookup(c->current_scope,
+                                node->var_decl.init->ident.name,
+                                (uint32_t)node->var_decl.init->ident.name_len);
+                            if (vs && vs->is_volatile) src_volatile = true;
+                        }
+                        if (src_volatile) {
+                            checker_error(c, node->loc.line,
+                                "cannot initialize non-volatile pointer from volatile — "
+                                "writes through non-volatile pointer may be optimized away");
+                        }
                     }
                 }
                 if (type->kind == TYPE_SLICE && init_type->kind == TYPE_SLICE &&

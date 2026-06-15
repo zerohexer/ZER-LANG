@@ -74,13 +74,19 @@ grouped by root cause; the originating branch is named for traceability.
   return_local_struct_field_slice,slice_local_to_global,
   struct_field_slice_then_copy,keep_param_local_slice}.zer`.
 
-### Pending (left as `TODO(human)`)
-- **BUG-747 volatile-strip via optional** (`?volatile *u32 → ?*u32`) — being
-  closed the *narrow* way (extend `check_volatile_strip` to peel `?`/slice
-  wrappers at the coercion site) instead of making `type_equals` globally
-  volatile-strict. The peel loop is a `TODO(human)` in `check_volatile_strip`;
-  test parked at `tests/zer_gaps/audit_optional_volatile_strip.zer` until it
-  lands. `types.c` deliberately untouched.
+### BUG-747 volatile-strip via optional (`?volatile *u32 → ?*u32`) — narrow fix
+Closed the *narrow* way (NOT 7xum5y's global `type_equals` change, which would
+have made volatile structural at every type-identity site). The volatile-strip
+checks now peel matching `?` wrappers in lockstep before the pointer/volatile
+compare, at three coercion sites:
+- `check_volatile_strip` (covers `@ptrcast`/`@bitcast`/`@cast`/`@pun`)
+- the var-decl init gate (BUG-197/282), and
+- the assign gate (BUG-282).
+`type_equals` / `can_implicit_coerce` deliberately untouched (`types.c` clean),
+so the safe direction `*T → volatile *T` and all type identity behave exactly as
+before — zero false-positive surface. Verified: `?*u32 = (?volatile *u32)`
+rejects; add-optional / same-type / add-volatile all still compile. Test:
+`tests/zer_fail/audit_optional_volatile_strip.zer`.
 
 ### Documented-open (see `docs/limitations.md`)
 - defer-body-uses-handle-then-body-frees → silent UAF (needs a new LIFO

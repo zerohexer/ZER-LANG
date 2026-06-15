@@ -647,3 +647,16 @@ emitter.c:if (oe->kind == TYPE_ARRAY) {
 # distinct case is already peeled — the TYPE_POINTER read is safe.
 checker.c:if (teff && teff->kind == TYPE_POINTER) {
 emitter.c:} else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && src_eff &&
+
+# Audit 2026-06-15 — BUG-747 optional-wrapper volatile-strip peel loops.
+# seff/teff/tv/itv/tgv/vgv are all type_unwrap_distinct() results (the distinct
+# case is peeled before these reads); the lockstep loops then peel TYPE_OPTIONAL
+# to reach the inner pointer for the volatile compare. Safe — no un-unwrapped
+# type reaches these dispatches. (check_volatile_strip + var-decl + assign gates)
+checker.c:while (seff && teff && seff->kind == TYPE_OPTIONAL &&
+checker.c:teff->kind == TYPE_OPTIONAL) {
+checker.c:while (tv && itv && tv->kind == TYPE_OPTIONAL &&
+checker.c:itv->kind == TYPE_OPTIONAL) {
+checker.c:if (tv && itv && tv->kind == TYPE_POINTER && itv->kind == TYPE_POINTER &&
+checker.c:while (tgv && vgv && tgv->kind == TYPE_OPTIONAL && vgv->kind == TYPE_OPTIONAL) {
+checker.c:if (tgv && vgv && tgv->kind == TYPE_POINTER && vgv->kind == TYPE_POINTER &&

@@ -1,5 +1,3 @@
-// PENDING — BUG-747 narrow fix: check_volatile_strip peel loop is a TODO(human).
-// Compiles clean TODAY (gap open); promote to tests/zer_fail/ once the loop lands.
 // Negative test: ?volatile *u32 → ?*u32 silently stripped volatile because
 // type_equals did not check pointer.is_volatile (only is_const). With the
 // optional wrapper, can_implicit_coerce never re-checked qualifiers either.

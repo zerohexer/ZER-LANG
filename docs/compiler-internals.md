@@ -10837,3 +10837,55 @@ regressions. No phase found what the others found.
 - **v0.3.0 (CURRENT):** `move struct`, `Barrier` keyword type, comptime locals/loops/switch/arrays/struct-return/float/enum, `static_assert`, range-based `for (T item in slice)`, `do-while`, designated initializers + compound literals, `container` keyword (monomorphization), `--stack-limit N`, spawn global data race detection (error/warning), 786 Rust tests + 36 Zig tests + 195 ZER integration + 68 ZER negative (0 failures), flag-handler matrix audit tool (`tools/audit_matrix.sh`) found 5 missing checker validations, ctags-guided audit found 3 emitter bugs in ~5K tokens, red team audit: 42/81 Gemini attacks fixed (12 rounds) + 2 codebase analysis finds + full 25K-line audit, `Semaphore(N)` builtin, BUG-462 through BUG-506 (46 bugs fixed), systematic refactoring (25 unified helpers — R1-R3 + B1 `track_dyn_freed_index` + B2 `check_union_switch_mutation` + B4 `emit_opt_wrap_value` + B10 `handle_key_arena` + 18 prior), full codebase audit (25,757 lines): 15 distinct unwrap fixes (BUG-506 + A15/A19/A20), 5 buffer over-read fixes, 2 fixed arrays → dynamic, 2 volatile temp fixes, spawn string+struct validation, orelse emission consolidated (B3), return wrapping consolidated (B7), union typedef macro (B8), zercheck 27 arena keys (B10), zig test runner (36 tests automated), refactor plan in `docs/ZER_Refactor.md`, CFG-aware zercheck with scope-aware handle tracking (`find_handle` vs `find_handle_local`), recursive mutex with CAS lazy init, unified `emit_file_module`, VRP 100% via address_taken at TOK_AMP + compound assign invalidation, deadlock call graph DFS, async state struct temp promotion (Rust MIR-equivalent), `*opaque` comparison `.ptr` extraction, runtime MMIO alignment check, C interop safety model (`cinclude` + `*opaque` + `shared struct`), 510+ bug fixes, 4,000+ tests, FuncProps function summaries (tracking system #29 — transitive context safety via lazy DFS on Symbol)
 - **v0.4:** MIR-inspired IR (flat locals, basic blocks) — replaces 29 AST walkers with one lowering pass. zercheck on CFG, VRP on SSA-like locals, async complete by construction. Still emits C → GCC. See `docs/IR_Implementation.md`
 - **v1.0:** self-hosting proof (zerc.zer compiles itself identically)
+
+---
+
+## WASM bridge (`zer_wasm.c`) — second emission host for the VS Code extension
+
+The compiler frontend compiles to WebAssembly so the VS Code extension ships
+**no unsigned native binary** (Windows Defender flags unsigned mingw PEs as
+`Wacatac.B!ml`). Same `.c` sources as native — `zer_wasm.c` is just a second
+host, parallel to `zerc_main.c`/`zer_lsp.c`, exporting string-in/string-out
+entry points compiled with emscripten (`Dockerfile.wasm`). The extension's
+`lsp/server.js` (LSP) and `lsp/zerc-cli.js` (CLI) load `zer.wasm` from node;
+VS Code spawns its own signed node (Electron-as-node) so nothing unsigned runs.
+
+Entry points (all return a pointer into one reused static buffer):
+- `zer_diagnostics_json(src, fname)` → `[{line,col,severity,message}]`. Runs
+  lexer→parser→checker→`zercheck` **shim** (AST), matching the former native
+  `zer_lsp.c`. (Editor diagnostics, best-effort — see limitations.md.)
+- `zer_emit_c(src, fname, track_cptrs)` → `{"ok":true,"c":...}` or
+  `{"ok":false,"diagnostics":[...]}`. Full compile path; emit captured via
+  `open_memstream` (no temp files).
+
+**THE INVARIANT (cost 4 bugs to learn — BUGS-FIXED 2026-06-16): every emitter
+and checker field `zerc_main.c` sets, `zer_wasm.c` must set too, or the wasm
+path silently diverges from native.** `emitter_init`/`checker_init` `memset`
+to 0, so a forgotten field defaults to 0 — often a *silent* wrong behavior, not
+a crash. The non-obvious ones:
+- `emitter.track_cptrs = (track_cptrs != 0)` — mirrors `zerc_main.c:661`
+  (`track_cptrs || do_run`). Gates BOTH the Level-3/4/5 `*opaque` tracking AND
+  the `__wrap_malloc/free/calloc/realloc` definitions that the `--wrap=malloc`
+  link interception needs. Off ⇒ no wrappers ⇒ the CLI must NOT pass `--wrap`
+  (it detects `__wrap_malloc` in the emitted C). The CLI passes `track_cptrs`
+  on for `--run`/`--track-cptrs`, exactly as native.
+- **`zercheck_ir` must be wired** (it's the sole production safety driver since
+  Phase F1, not the shim). `zer_emit_c` sets `emitter.ir_hook = wasm_ir_hook`
+  to collect each lowered `IRFunc` during `emit_file`, then runs the iterative
+  FuncSummary build + main pass (`wasm_run_zercheck_ir`) and gates the result
+  on `zc_ir.error_count` — replicating `zerc_main.c:705-744`. Without this the
+  wasm compile path emits UAF/double-free/leaks native rejects. `zercheck_ir`
+  reports to stderr (`ir_zc_error`); `zerc-cli.js` captures emscripten stderr
+  (`printErr`) and prints the `zercheck:` lines on `ok:false`.
+- `wasm_config_checker`: `target_features = SSE|SSE2`, `target_arch = x86_64`,
+  **`target_ptr_bits = 64`** (the bundled desktop gcc is LP64/LLP64; the global
+  default 32 would model `usize` as 32-bit and over-reject `u64↔usize` /
+  miscompute `@size(usize)`). `source = src` for caret display.
+
+Build/packaging: `Dockerfile.wasm` (emsdk → `zer.js`/`zer.wasm`, runs
+`win-resources/wasm-smoke.js` + `lsp-client-test.js`). `Dockerfile.vsix` is now
+multi-stage: stage 1 builds the wasm, stage 2 bundles it + a signed OpenJS
+`node.exe` + `zerc.cmd` shim + the w64devkit gcc, and **builds no native
+`zerc.exe`/`zer-lsp.exe`** for Windows. The only Windows `.exe`s shipped are the
+signed `node.exe` and the reputable w64devkit toolchain. Open gaps (flags not
+plumbed, single-file only, macOS terminal CLI): `docs/limitations.md`.

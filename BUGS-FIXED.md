@@ -5,6 +5,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-16 — Variadic `...` + WASM toolchain port (4 port bugs caught)
+
+**Feature: variadic `...` for C-interop.** `...` as the final parameter,
+allowed ONLY on bodyless extern declarations (so `printf` et al. work),
+banned on any ZER function with a body (a ZER function cannot read untyped
+varargs — the unchecked-boundary ban). Requires ≥1 named param before `...`;
+call sites require ≥ the fixed-param count. New `TOK_ELLIPSIS` (maximal-munch
+`...`), `is_variadic` on `func_decl` (AST) + `func_ptr` (Type), parser
+bodyless enforcement, checker call-count relaxation, emitter `, ...` in the
+C prototype. Tests: `tests/zer/variadic_extern.zer`,
+`tests/zer_fail/variadic_with_body.zer`, `tests/zer_fail/variadic_no_named_param.zer`.
+
+**WASM toolchain (`zer_wasm.c`).** The compiler frontend now also compiles to
+WebAssembly so the VS Code extension ships no unsigned native binary (Defender
+`Wacatac.B!ml` false positive). Four bugs found during the port, all from the
+same root cause — **`zer_wasm.c` must replicate every emitter/checker field
+`zerc_main.c` sets, or the wasm path silently diverges from native**:
+
+1. **`track_cptrs` dropped** — `zer_emit_c` never set `emitter.track_cptrs`, so
+   the Level-5 `__wrap_malloc` interception (native sets it for `--run`) was
+   never emitted → cross-C-boundary UAF backstop silently absent. Fix: take a
+   `track_cptrs` arg, set `emitter.track_cptrs`, mirroring `zerc_main.c:661`.
+2. **Unconditional `--wrap` link failure** — the CLI passed
+   `-Wl,--wrap=malloc` always; with `track_cptrs` off the wrappers aren't
+   emitted, so mingw `crt2.o` → undefined `__wrap_malloc`. (Linux glibc linked
+   anyway, hiding it; Windows surfaced it.) Fix: CLI adds `--wrap` iff the
+   emitted C contains `__wrap_malloc` (consistency check, not the decision).
+3. **`zercheck_ir` not wired** — the production CFG safety analyzer (UAF /
+   double-free / leak / move; sole safety driver since Phase F1) runs via the
+   emitter `ir_hook` + a post-emit iterative pass in native, gated on
+   `error_count`. `zer_emit_c` ran neither → wasm compiled code native rejects.
+   Fix: replicate the hook + summary/main passes + the compile gate.
+4. **`target_ptr_bits` = 32 vs 64** — native probes gcc (`__SIZEOF_SIZE_T__`)
+   → 64 on the bundled win-x64 mingw / linux-x64; wasm used the global default
+   32 → modelled `usize` as 32-bit while gcc compiles it 64-bit, over-rejecting
+   `u64↔usize` and miscomputing `@size(usize)`. Fix: `wasm_config_checker` sets
+   `c->target_ptr_bits = 64` (+ `target_features` SSE|SSE2, `target_arch`
+   x86_64). Open: embedded cross-width is a future `--target-bits` plumb
+   (`docs/limitations.md`).
+
+In-image regression guards (Dockerfile.wasm / Dockerfile.vsix): wasm smoke
+(track_cptrs gates `__wrap_malloc`; double-free → `ok:false`), LSP handshake,
+CLI compile/run + double-free rejection. Architecture: `docs/compiler-internals.md`
+"WASM bridge". Open gaps: `docs/limitations.md`.
+
+---
+
 ## Session 2026-06-15 — Integration: 21 silent-gap fixes from 4 parallel audit branches
 
 Combined the source fixes from four parallel audit branches

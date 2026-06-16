@@ -274,6 +274,18 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
     `docs/option_e_plan.md`. Per-session implementation history:
     `docs/compiler-internals.md` D-Alpha-7.5 Session A..F sections.
 
+17. **Variadic `...` — bodyless extern declarations ONLY (2026-06-16).** For
+    C-interop so `printf` et al. work:
+    ```
+    i32 printf(const *u8 fmt, ...);   // OK — bodyless extern
+    printf("x=%d\n", 7);               // OK — call site needs >= fixed params
+    void f(...);                        // ERROR — needs >= 1 named param first
+    void g(*u8 s, ...) { }              // ERROR — variadic with a body is banned
+    ```
+    A ZER function with a body cannot be variadic (it would read untyped,
+    unverified args — the unchecked-boundary ban). `...` must be the final
+    parameter; ≥1 named param required before it.
+
 ### Intrinsics (@ builtins)
 ```
 @size(T)                 sizeof — returns usize
@@ -1003,10 +1015,21 @@ All runners auto-detect positive vs negative tests. `make check` runs everything
 - `[]T → *T` extern auto-coerce const safety: string literals and const slices to non-const `*T` param now rejected. Must declare `const *T`. Prevents `.rodata` write-through.
 
 **VS Code Extension (VSIX) Build:**
-- `make docker-vsix` — builds complete VSIX with bundled `zerc.exe`, `zer-lsp.exe`, and portable GCC (w64devkit)
-- `Dockerfile.vsix` — gcc:13 + mingw cross-compile + Node.js/vsce + w64devkit portable GCC + librsvg2 for SVG→PNG icon conversion
-- Extension auto-detects bundled binaries: `bin/win32-x64/zerc.exe`, `bin/win32-x64/zer-lsp.exe`, `bin/win32-x64/gcc/bin/gcc.exe`
-- `editors/vscode/extension.js` — uses `findBundled()` to prefer bundled binaries, falls back to system PATH
+- **WASM toolchain (2026-06-16):** the extension ships the compiler as
+  WebAssembly (`lsp/zer.wasm` from `zer_wasm.c` via emscripten), NOT native
+  `zerc.exe`/`zer-lsp.exe` for Windows. Reason: unsigned mingw PEs trip
+  Defender `Wacatac.B!ml`. LSP = `lsp/server.js` + `zer.wasm` run by VS Code's
+  own signed node (Electron-as-node); terminal `zerc` = `zerc.cmd` → bundled
+  signed `node.exe` → `lsp/zerc-cli.js` → `zer.wasm` → bundled gcc. Only native
+  Windows `.exe`s shipped are signed `node.exe` + reputable w64devkit gcc.
+  Architecture + the "replicate every native emitter/checker field" invariant:
+  `docs/compiler-internals.md` "WASM bridge"; open gaps: `docs/limitations.md`.
+- `make docker-vsix` — multi-stage `Dockerfile.vsix`: stage 1 (emsdk) builds
+  the wasm, stage 2 bundles wasm + signed node.exe + zerc.cmd + portable GCC,
+  runs in-image smoke/LSP/CLI tests, packages via vsce.
+- `editors/vscode/extension.js` — launches `lsp/server.js` via `process.execPath`
+  with `ELECTRON_RUN_AS_NODE=1` (no native fallback); still injects
+  `bin/win32-x64` (now holds `zerc.cmd`, `node.exe`, `gcc/`) onto PATH.
 - `editors/vscode/package.json` — name `zerc-language`, publisher `zerohexer`, MPL-2.0
 - Icon: `editors/vscode/icon.svg` — black background, silver `[*]` pointer-in-brackets logo, auto-converted to PNG during build
 - Auto-PATH: on first activation, if `zerc` not on system PATH, prompts user to add bundled dir permanently via PowerShell `[Environment]::SetEnvironmentVariable`. Requires VS Code restart after.

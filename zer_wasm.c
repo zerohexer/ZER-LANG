@@ -206,20 +206,94 @@ static int wasm_run_zercheck_ir(ZerCheck *zc_ir) {
     return zc_ir->error_count;
 }
 
+/* Target config — set by the JS driver via zer_set_target() before an emit /
+ * diagnostics call (single-threaded, sequential). Defaults match the bundled
+ * desktop gcc (mingw-w64 / linux x86_64: LP64/LLP64, 8-byte size_t). */
+static int      g_ptr_bits        = 64;
+static int      g_target_arch     = 1;                      /* ZER_ARCH_X86_64 */
+static unsigned g_target_features = (1u << 1) | (1u << 2);  /* SSE | SSE2 */
+static int      g_no_strict_mmio  = 0;
+static int      g_stack_limit     = 0;
+
+/* Mirrors the native CLI flags: --target-bits / --target-arch /
+ * --target-features / --no-strict-mmio / --stack-limit. ptr_bits<=0 keeps the
+ * 64-bit default; arch<=0 keeps x86_64. */
+WASM_EXPORT void zer_set_target(int ptr_bits, int arch, unsigned features,
+                                int no_strict_mmio, int stack_limit) {
+    g_ptr_bits        = ptr_bits > 0 ? ptr_bits : 64;
+    g_target_arch     = arch > 0 ? arch : 1;
+    g_target_features = features;  /* 0 is valid (e.g. ARM); caller sets baseline */
+    g_no_strict_mmio  = no_strict_mmio;
+    g_stack_limit     = stack_limit < 0 ? 0 : stack_limit;
+}
+
 /* Apply the same checker target config the native driver sets (zerc_main.c),
- * so asm/intrinsic validation matches. Pointer width comes from the global
- * zer_target_ptr_bits (default 32) inside checker_init. */
+ * so asm/intrinsic, mmio, stack and pointer-width checks all match. */
 static void wasm_config_checker(Checker *c, const char *src) {
     c->source = src;
-    c->target_features = (1u << 1) | (1u << 2); /* SSE | SSE2 — native baseline */
-    c->target_arch = 1;                          /* ZER_ARCH_X86_64 — native default */
-    /* The wasm CLI/LSP target the bundled desktop gcc (mingw-w64 on win-x64,
-     * gcc on linux-x64) — both LP64/LLP64 with 8-byte size_t. Native zerc
-     * probes gcc and sets 64 here; the global default (32, for embedded) would
-     * make the checker model usize as 32-bit while gcc compiles it 64-bit,
-     * over-rejecting u64<->usize and miscomputing @size(usize). Override to 64.
-     * (Embedded cross-compile width is a future --target-bits plumb.) */
-    c->target_ptr_bits = 64;
+    c->target_features = g_target_features;
+    c->target_arch = g_target_arch;
+    c->no_strict_mmio = (g_no_strict_mmio != 0);
+    c->stack_limit = (uint32_t)g_stack_limit;
+    /* CRITICAL: type_width(usize) reads the GLOBAL zer_target_ptr_bits
+     * (types.c:202), and checker_init copies global -> c->target_ptr_bits. Set
+     * the GLOBAL so the checker AND C emission agree on usize width — setting
+     * only the field leaves @size(usize)/struct layout at the 32-bit default
+     * while the checker thinks 64. Default 64 (bundled desktop gcc);
+     * --target-bits overrides for embedded. */
+    zer_target_ptr_bits = g_ptr_bits;
+    c->target_ptr_bits = g_ptr_bits;
+}
+
+/* ir_print is defined in ir.c (ir.h: void ir_print(FILE*, IRFunc*)); mirror it
+ * with a void* func like the zercheck_ir extern, so ir.h need not be included. */
+extern void ir_print(FILE *out, void *func);
+
+/* Emit C from a parse-checked file_node, driving the zercheck_ir safety
+ * analyzer via the emitter ir_hook (exactly as zerc_main.c). Returns the
+ * zercheck_ir error count, or -1 on internal failure. If out_c != NULL the
+ * emitted C is returned there (caller frees); otherwise it is discarded — the
+ * LSP path wants only the safety-analysis side effect (stderr diagnostics).
+ * If ir_out != NULL, each lowered IRFunc is ir_print'd to it (for --emit-ir). */
+static int wasm_emit_and_analyze(Checker *checker, Node *file_node,
+                                 const char *fname, int track_cptrs,
+                                 char **out_c, FILE *ir_out) {
+    char *buf = NULL; size_t size = 0;
+    FILE *mem = open_memstream(&buf, &size);
+    if (!mem) { if (out_c) *out_c = NULL; return -1; }
+
+    Emitter emitter;
+    emitter_init(&emitter, mem, checker->arena, checker);
+    emitter.track_cptrs = (track_cptrs != 0);
+    emitter.source_file = fname;
+
+    ZerCheck zc_ir;
+    zercheck_init(&zc_ir, checker, checker->arena, fname);
+    zc_ir.import_asts = NULL;
+    zc_ir.import_ast_count = 0;
+    emitter.ir_hook_ctx = &zc_ir;
+    emitter.ir_hook = wasm_ir_hook;
+    g_ir_count = 0;
+
+    emit_file(&emitter, file_node);
+    fflush(mem);
+    fclose(mem);
+
+    int errs = wasm_run_zercheck_ir(&zc_ir);
+
+    if (ir_out) {
+        for (int i = 0; i < g_ir_count; i++) {
+            ir_print(ir_out, g_ir_funcs[i]);
+            fputc('\n', ir_out);
+        }
+    }
+
+    if (g_ir_funcs) { free(g_ir_funcs); g_ir_funcs = NULL; }
+    g_ir_count = 0; g_ir_cap = 0;
+
+    if (out_c) *out_c = buf;
+    else if (buf) free(buf);
+    return errs;
 }
 
 /* ================================================================
@@ -253,12 +327,13 @@ WASM_EXPORT const char *zer_diagnostics_json(const char *src, const char *fname)
         checked = true;
 
         if (checker.error_count == 0) {
-            /* LSP diagnostics use the lighter zercheck shim, same as the
-             * former native zer_lsp.c. The full zercheck_ir CFG analysis runs
-             * on the compile path (zer_emit_c) which gates the produced binary. */
-            ZerCheck zc;
-            zercheck_init(&zc, &checker, &arena, fname);
-            zercheck_run(&zc, file_node);
+            /* Run the full production safety analyzer (zercheck_ir) so the
+             * editor surfaces exactly what `zerc` would reject — not the lighter
+             * shim. The emitted C is discarded; the side effect we want is
+             * zercheck_ir's stderr diagnostics (file:line: zercheck: msg), which
+             * server.js captures (printErr) and merges into the published list.
+             * track_cptrs on to match the --run safety surface. */
+            wasm_emit_and_analyze(&checker, file_node, fname, 1, NULL, NULL);
         }
     }
 
@@ -300,9 +375,7 @@ WASM_EXPORT const char *zer_emit_c(const char *src, const char *fname, int track
     bool ok = false;
     Checker checker;
     bool checked = false;
-
     char *c_buf = NULL;
-    size_t c_size = 0;
 
     if (!parser.had_error && file_node) {
         checker_init(&checker, &arena, fname);
@@ -311,50 +384,14 @@ WASM_EXPORT const char *zer_emit_c(const char *src, const char *fname, int track
         checked = true;
 
         if (checker.error_count == 0) {
-            FILE *mem = open_memstream(&c_buf, &c_size);
-            if (mem) {
-                Emitter emitter;
-                emitter_init(&emitter, mem, &arena, &checker);
-                /* Mirror the native driver (zerc_main.c:661):
-                 *   emitter.track_cptrs = track_cptrs || do_run;
-                 * Enables Level 3/4/5 *opaque inline-header tracking AND the
-                 * __wrap_malloc/free/calloc/realloc definitions the --wrap=malloc
-                 * linker interception requires. The CLI passes it on for
-                 * --run / --track-cptrs. */
-                emitter.track_cptrs = (track_cptrs != 0);
-                emitter.source_file = fname;
-
-                /* Wire the SOLE production safety analyzer exactly as
-                 * zerc_main.c does: zercheck_ir runs via the emitter ir_hook on
-                 * the same lowered IR (collected here), then an iterative
-                 * summary build + main pass after emit. WITHOUT this the wasm
-                 * compile path would emit binaries containing UAF / double-free
-                 * / leaks that native zerc rejects. */
-                ZerCheck zc_ir;
-                zercheck_init(&zc_ir, &checker, &arena, fname);
-                zc_ir.import_asts = NULL;
-                zc_ir.import_ast_count = 0;
-                emitter.ir_hook_ctx = &zc_ir;
-                emitter.ir_hook = wasm_ir_hook;
-                g_ir_count = 0;
-
-                emit_file(&emitter, file_node);
-                fflush(mem);
-                fclose(mem);
-
-                int safety_errors = wasm_run_zercheck_ir(&zc_ir);
-
-                /* Gate the compile on BOTH the type checker and the IR safety
-                 * analyzer (zerc_main.c:744 removes the output on zercheck
-                 * errors — here we just report ok:false). zercheck_ir messages
-                 * go to stderr (ir_zc_error); the JS CLI captures and prints
-                 * them. */
-                ok = (checker.error_count == 0 && safety_errors == 0);
-
-                if (g_ir_funcs) { free(g_ir_funcs); g_ir_funcs = NULL; }
-                g_ir_count = 0;
-                g_ir_cap = 0;
-            }
+            /* Emit + run the SOLE production safety analyzer (zercheck_ir),
+             * gating the compile on BOTH the type checker and zercheck_ir
+             * (zerc_main.c:744 removes the output on safety errors — here we
+             * report ok:false). zercheck_ir messages go to stderr; the JS CLI
+             * captures and prints them. */
+            int safety_errors = wasm_emit_and_analyze(&checker, file_node, fname,
+                                                      track_cptrs, &c_buf, NULL);
+            ok = (safety_errors == 0);
         }
     }
 
@@ -374,11 +411,63 @@ WASM_EXPORT const char *zer_emit_c(const char *src, const char *fname, int track
     return publish_result(&sb);
 }
 
+/* ================================================================
+ * Entry point 3 (--emit-ir, debug) — print the lowered MIR-style IR.
+ * On success returns {"ok":true,"ir":"<text>"}, else {"ok":false,...}.
+ * IR is shown whenever the type checker is clean (a debug aid); safety
+ * errors still print to stderr but do not suppress the IR dump.
+ * ================================================================ */
+WASM_EXPORT const char *zer_emit_ir(const char *src, const char *fname) {
+    SB sb; sb_init(&sb);
+    if (!src) { sb_puts(&sb, "{\"ok\":false,\"diagnostics\":[]}"); return publish_result(&sb); }
+    if (!fname || !*fname) fname = "input.zer";
+
+    Arena arena;
+    arena_init(&arena, 256 * 1024);
+    Scanner scanner; scanner_init(&scanner, src);
+    Parser parser; parser_init(&parser, &scanner, &arena, fname);
+    Node *file_node = parse_file(&parser);
+
+    bool ok = false;
+    Checker checker; bool checked = false;
+    char *ir_buf = NULL; size_t ir_size = 0;
+
+    if (!parser.had_error && file_node) {
+        checker_init(&checker, &arena, fname);
+        wasm_config_checker(&checker, src);
+        checker_check(&checker, file_node);
+        checked = true;
+        if (checker.error_count == 0) {
+            FILE *ir_mem = open_memstream(&ir_buf, &ir_size);
+            if (ir_mem) {
+                wasm_emit_and_analyze(&checker, file_node, fname, 0, NULL, ir_mem);
+                fflush(ir_mem); fclose(ir_mem);
+                ok = (ir_buf != NULL);
+            }
+        }
+    }
+
+    if (ok && ir_buf) {
+        sb_puts(&sb, "{\"ok\":true,\"ir\":");
+        sb_json_str(&sb, ir_buf);
+        sb_putc(&sb, '}');
+    } else {
+        sb_puts(&sb, "{\"ok\":false,\"diagnostics\":");
+        append_diag_array(&sb, &parser, checked ? &checker : NULL);
+        sb_putc(&sb, '}');
+    }
+
+    if (ir_buf) free(ir_buf);
+    if (checked && checker.diagnostics) free(checker.diagnostics);
+    arena_free(&arena);
+    return publish_result(&sb);
+}
+
 /* Free the static result buffer (optional — JS can ignore; reused per call). */
 WASM_EXPORT void zer_free(void) {
     if (g_result) { free(g_result); g_result = NULL; }
 }
 
 WASM_EXPORT const char *zer_version(void) {
-    return "0.5.0";
+    return "0.5.5";
 }

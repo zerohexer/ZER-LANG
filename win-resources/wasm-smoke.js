@@ -49,9 +49,23 @@ const ZerModule = require('/zer/zer.js');
     const e2 = JSON.parse(emitC(doubleFree, 'df.zer', 1));
     console.log('EMIT(double-free) ok=', e2.ok, '(MUST be false — zercheck_ir gate)');
 
+    // 7) --emit-ir entry returns lowered IR text.
+    const emitIr = M.cwrap('zer_emit_ir', 'string', ['string', 'string']);
+    const ir = JSON.parse(emitIr(ok, 'ok.zer'));
+    console.log('EMIT_IR ok=', ir.ok, ' len=', ir.ok ? ir.ir.length : 0);
+
+    // 8) zer_set_target is callable and does not break emit (width plumb).
+    const setTarget = M.cwrap('zer_set_target', null, ['number', 'number', 'number', 'number', 'number']);
+    setTarget(32, 1, (1 << 1) | (1 << 2), 0, 0);
+    const e32 = JSON.parse(emitC(ok, 'ok.zer', 0));
+    setTarget(64, 1, (1 << 1) | (1 << 2), 0, 0); // restore desktop default
+    console.log('EMIT after set_target(bits=32) ok=', e32.ok);
+
     // Assertions
     const fail = (m) => { console.error('SMOKE FAIL:', m); process.exit(1); };
     if (e2.ok) fail('zercheck_ir did NOT reject double-free — safety analyzer not wired into compile path!');
+    if (!ir.ok || ir.ir.length < 10) fail('zer_emit_ir produced no IR');
+    if (!e32.ok) fail('emit after zer_set_target(32) failed');
     if (d1 !== '[]') fail('clean program produced diagnostics');
     if (!d2.includes('argument') && !d2.includes('expected')) fail('error program lacked diagnostic');
     if (d3 !== '[]') fail('variadic program produced diagnostics');

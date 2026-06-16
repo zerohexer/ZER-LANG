@@ -13,7 +13,7 @@ RUN emcc -O2 -I. \
     zer_wasm.c \
     lexer.c parser.c ast.c types.c checker.c emitter.c \
     zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS \
-    -sEXPORTED_FUNCTIONS=_zer_diagnostics_json,_zer_emit_c,_zer_free,_zer_version,_malloc,_free \
+    -sEXPORTED_FUNCTIONS=_zer_diagnostics_json,_zer_emit_c,_zer_emit_ir,_zer_set_target,_zer_free,_zer_version,_malloc,_free \
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
     -sMODULARIZE=1 -sEXPORT_NAME=ZerModule \
     -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=node \
@@ -80,7 +80,9 @@ RUN node /ext/lsp/lsp-client-test.js /ext/lsp/server.js && rm /ext/lsp/lsp-clien
 # __wrap_malloc Level-5 interception is present + linkable) -> gcc -> run.
 RUN printf 'i32 printf(const *u8 fmt, ...);\ni32 main(){ printf("cli ok\\n"); return 0; }\n' > /tmp/cli.zer && \
     node /ext/lsp/zerc-cli.js /tmp/cli.zer --run | grep -q "cli ok" && \
-    echo "ZERC CLI e2e OK" && rm -f /tmp/cli.zer /tmp/cli
+    echo "ZERC CLI e2e OK" && \
+    test -n "$(node /ext/lsp/zerc-cli.js /tmp/cli.zer --emit-ir)" && \
+    echo "ZERC --emit-ir OK" && rm -f /tmp/cli.zer /tmp/cli
 
 # The wasm CLI MUST reject unsafe code via zercheck_ir (sole safety driver),
 # exactly as native zerc does — guards against the analyzer silently not running.

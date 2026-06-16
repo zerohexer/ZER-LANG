@@ -5,46 +5,34 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — WASM CLI/LSP: flags not plumbed, single-file only, shim diagnostics (MEDIUM)
+## OPEN — WASM CLI: multi-file imports + macOS terminal zerc (LOW–MEDIUM)
 
 The VS Code extension ships the compiler as WebAssembly (`zer_wasm.c` →
-`lsp/zer.wasm`, driven by `lsp/server.js` and `lsp/zerc-cli.js`) to avoid the
-unsigned-native-binary Defender flag. The wasm entry points (`zer_diagnostics_json`,
-`zer_emit_c`) replicate the native driver's emitter/checker config, but several
-native CLI capabilities are not yet routed through them:
+`lsp/zer.wasm`, driven by `lsp/server.js` and `lsp/zerc-cli.js`). As of
+2026-06-16 the flag plumbing, `--emit-ir`, and full LSP safety parity are DONE
+(`zer_set_target` carries `--target-bits/-arch/-features`, `--no-strict-mmio`,
+`--stack-limit`; `zer_emit_ir`; `zer_diagnostics_json` runs `zercheck_ir` and
+`server.js` merges its stderr into editor diagnostics). Two gaps remain:
 
-- **CLI flags ignored:** `zerc-cli.js` parses only `<input> -o <out> --run
-  --emit-c --track-cptrs`. `--emit-ir`, `--no-strict-mmio`, `--stack-limit N`,
-  `--target-bits N`, `--target-arch`, `--target-features` are silently dropped.
-  Defaults are baked in (`wasm_config_checker`): strict mmio, no stack limit,
-  x86_64 + SSE|SSE2, **64-bit usize**. So embedded cross-compilation (different
-  pointer width / arch / features) is not possible via the wasm CLI — use the
-  native `linux-x64` `zerc` for that. Fix sketch: add an options struct arg to
-  `zer_emit_c` and set the corresponding `checker.*` / `emitter.*` / global
-  `zer_target_ptr_bits` fields; parse the flags in `zerc-cli.js`.
-- **Single-file only:** `zer_emit_c` sets `import_asts = NULL` /
-  `import_ast_count = 0` and emits one `file_node`. Multi-module programs
-  (`import`) won't resolve cross-module symbols through the wasm CLI. Native
-  zerc handles modules (topological emit). Fix sketch: thread a virtual FS or
-  an import-resolver callback from JS into the wasm so the checker/emitter can
-  read imported sources.
-- **LSP diagnostics use the lighter `zercheck` shim, not `zercheck_ir`:**
-  `zer_diagnostics_json` runs the AST-based shim (matching the former native
-  `zer_lsp.c`), so editor squiggles can be less complete than what `zerc --run`
-  enforces. The COMPILE path (`zer_emit_c`) DOES run the full `zercheck_ir` and
-  gates the binary, so this is a UX gap, not a safety hole. Fix sketch: run a
-  throwaway emit + `ir_hook` inside `zer_diagnostics_json` to surface
-  `zercheck_ir` errors as diagnostics (heavier per-keystroke).
+- **Single-file only:** `zer_emit_c`/`zer_diagnostics_json` set
+  `import_asts = NULL` and process one `file_node`. Multi-module programs
+  (`import`) won't resolve cross-module symbols through the wasm CLI/LSP. Native
+  zerc handles modules (topological emit across files). Fix sketch: thread a
+  node-side import resolver (read imported `.zer` by path, parse, pass the AST
+  array in) — emscripten `NODERAWFS` would let the checker's `fopen`-based
+  import loader work directly, or pass `import_asts`/`import_ast_count` built in
+  JS. Largest remaining piece; needs replicating zerc_main's module loop.
 - **macOS terminal `zerc` dropped:** the wasm VSIX bundles a signed Windows
-  `node.exe` for the `zerc.cmd` shim and keeps a native `linux-x64` `zerc`, but
-  no darwin CLI build remains. macOS LSP still works (wasm via Electron-node);
-  only the macOS *terminal* `zerc` is absent. Fix sketch: bundle a signed
-  darwin node + a `zerc` shell shim, or a darwin native build.
-- **Cosmetic:** the CLI prints some checker errors twice (the checker records
+  `node.exe` for `zerc.cmd` and keeps a native `linux-x64` `zerc`, but no darwin
+  CLI build remains. macOS LSP still works (wasm via Electron-node); only the
+  macOS *terminal* `zerc` is absent. Fix sketch: bundle a signed darwin node +
+  a `zerc` shell shim.
+- **Cosmetic:** the CLI prints some checker errors twice (checker records
   certain diagnostics twice); pre-existing, not wasm-specific.
 
-Untested headless (needs a real Windows VS Code run, not a limitation per se):
-the LSP spawn via `ELECTRON_RUN_AS_NODE` and the `zerc.cmd` terminal path.
+Cross-arch caveat: `--target-arch aarch64|riscv64` configures the *checker*
+correctly, but the wasm CLI compiles with the bundled **x86_64** gcc — actual
+cross-compilation needs a cross-gcc the bundle doesn't ship.
 
 ---
 

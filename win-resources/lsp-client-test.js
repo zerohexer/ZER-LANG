@@ -48,6 +48,11 @@ send({ jsonrpc: '2.0', method: 'textDocument/didOpen', params: {
     textDocument: { uri: 'file:///bad.zer', languageId: 'zer', version: 1,
         text: 'void puts(const *u8 s);\ni32 main() { puts("hi", 1); return 0; }' } } });
 
+// UAF doc -> zercheck_ir safety diagnostic (LSP parity with the compile path)
+send({ jsonrpc: '2.0', method: 'textDocument/didOpen', params: {
+    textDocument: { uri: 'file:///uaf.zer', languageId: 'zer', version: 1,
+        text: 'struct Task { u32 id; }\nPool(Task, 4) pool;\nu32 main() { Handle(Task) h = pool.alloc() orelse return; pool.free(h); pool.free(h); return 0; }' } } });
+
 setTimeout(() => {
     const initResp = received.find((r) => r.id === 1);
     if (!initResp || !initResp.result || !initResp.result.capabilities) fail('no initialize response');
@@ -68,7 +73,14 @@ setTimeout(() => {
     // verify 0-based line conversion (error is on source line 2 -> LSP line 1)
     if (badDiag.params.diagnostics[0].range.start.line !== 1) fail('expected 0-based line 1, got ' + badDiag.params.diagnostics[0].range.start.line);
 
-    console.log('LSP TEST OK — WASM language server speaks LSP and produces correct diagnostics');
+    // zercheck_ir parity: the editor must surface the double-free.
+    const uafDiag = received.find((r) => r.method === 'textDocument/publishDiagnostics' && r.params.uri === 'file:///uaf.zer');
+    if (!uafDiag) fail('no diagnostics published for uaf.zer');
+    console.log('uaf.zer diagnostics:', JSON.stringify(uafDiag.params.diagnostics));
+    const hasSafety = uafDiag.params.diagnostics.some((d) => d.source === 'zercheck' || /free/i.test(d.message));
+    if (!hasSafety) fail('LSP did not surface the zercheck_ir double-free diagnostic (parity gap)');
+
+    console.log('LSP TEST OK — diagnostics + zercheck_ir safety parity');
     child.kill();
     process.exit(0);
 }, 2500);

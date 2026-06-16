@@ -22,6 +22,7 @@ const ZerModule = require(path.join(__dirname, 'zer.js'));
 let M = null;          // instantiated wasm module
 let diagnose = null;   // cwrapped zer_diagnostics_json(src, fname) -> json string
 const pending = [];    // messages received before wasm finished loading
+const stderrBuf = [];  // captured wasm stderr (zercheck_ir safety diagnostics)
 
 // ---- document store: uri -> text ----------------------------------
 const docs = new Map();
@@ -38,6 +39,7 @@ function publishDiagnostics(uri) {
     const text = docs.get(uri);
     if (text == null || !diagnose) return;
 
+    stderrBuf.length = 0; // capture only this run's wasm stderr
     let arr = [];
     try {
         arr = JSON.parse(diagnose(text, 'input.zer'));
@@ -45,18 +47,32 @@ function publishDiagnostics(uri) {
         arr = [];
     }
 
-    const diagnostics = arr.map((d) => {
-        const line = d.line > 0 ? d.line - 1 : 0; // compiler is 1-based, LSP is 0-based
-        return {
-            range: {
-                start: { line, character: 0 },
-                end: { line, character: 999 },
-            },
-            severity: d.severity || 1,
-            source: 'zerc',
-            message: d.message || '',
-        };
-    });
+    const mkRange = (ln1) => {
+        const line = ln1 > 0 ? ln1 - 1 : 0; // compiler 1-based -> LSP 0-based
+        return { start: { line, character: 0 }, end: { line, character: 999 } };
+    };
+
+    const diagnostics = arr.map((d) => ({
+        range: mkRange(d.line),
+        severity: d.severity || 1,
+        source: 'zerc',
+        message: d.message || '',
+    }));
+
+    // Merge zercheck_ir safety errors — printed to stderr as
+    // "file:line: zercheck: msg" by the wasm during zer_diagnostics_json — so
+    // the editor surfaces exactly what `zerc` would reject.
+    for (const line of stderrBuf) {
+        const m = /:(\d+):\s*zercheck:\s*(.+)$/.exec(line);
+        if (m) {
+            diagnostics.push({
+                range: mkRange(parseInt(m[1], 10)),
+                severity: 1,
+                source: 'zercheck',
+                message: m[2].trim(),
+            });
+        }
+    }
 
     send({
         jsonrpc: '2.0',
@@ -168,9 +184,13 @@ process.stdin.on('data', (chunk) => {
 process.stdin.on('end', () => process.exit(0));
 
 // ---- load the wasm compiler, then drain queued messages -----------
-ZerModule().then((mod) => {
+ZerModule({ printErr: (s) => stderrBuf.push(s) }).then((mod) => {
     M = mod;
     diagnose = M.cwrap('zer_diagnostics_json', 'string', ['string', 'string']);
+    // Desktop target defaults (64-bit usize, x86_64, SSE|SSE2) — matches the
+    // bundled gcc; keeps the checker's pointer-width/asm checks correct.
+    const setTarget = M.cwrap('zer_set_target', null, ['number', 'number', 'number', 'number', 'number']);
+    setTarget(64, 1, (1 << 1) | (1 << 2), 0, 0);
     for (const msg of pending) handle(msg);
     pending.length = 0;
 }).catch((err) => {

@@ -231,29 +231,6 @@ threadlocal u32 counter;
 @atomic_add(&flag, 1);
 ```
 
-## Tests
-
-3,200+ tests across all dimensions, including 415 tests translated from Rust's test suite:
-
-```
-Lexer:                        218 tests
-Parser:                       168 tests
-Type Checker:                 584 tests
-ZER-CHECK:                     54 tests
-C Emitter:                    238 end-to-end tests
-Firmware Patterns (4 rounds): 116 end-to-end tests
-Parser Fuzz:                  491 adversarial inputs
-Semantic Fuzzer:              200 tests/run (32 generators)
-Module Imports:                23 patterns
-ZER Integration:              120+ .zer E2E tests
-Rust-Equivalent:              415 tests (from Rust's tests/ui/)
-Conversion Tools:             139 tests
-──────────────────────────────────────────────────
-Total:                       3,200+ tests, all passing
-```
-
-461 compiler bugs found and fixed. 415 Rust-equivalent tests covering threads, UAF, bounds, division, null safety, narrowing, scope escape, defer, handles, *opaque provenance, async, atomics, condvar, shared struct, and deadlock detection.
-
 ## Editor Support
 
 LSP server (`zer-lsp`) provides diagnostics, hover, go-to-definition, completion, and document symbols for any editor:
@@ -266,7 +243,7 @@ VS Code extension in `editors/vscode/` with full syntax highlighting.
 
 Works with: VS Code, Neovim (nvim-lspconfig), Emacs (eglot/lsp-mode), Helix, Zed.
 
-## Status: v0.3.0
+## Status: v0.5.x
 
 ZER compiles to C99 and runs on any target GCC supports.
 
@@ -276,7 +253,6 @@ ZER compiles to C99 and runs on any target GCC supports.
 
 **Proven against real CVEs:** Heartbleed (CVE-2014-0160) and Baron Samedit (CVE-2021-3156) reproduced side-by-side — C silently leaks memory, ZER traps at the bounds check. See [`examples/cve-demos/`](examples/cve-demos/).
 
-**3,200+ tests, 461 bugs fixed, zero failures.**
 
 ## License
 

@@ -1244,6 +1244,676 @@ Originally found in the 2026-06-07 audit (cool-johnson-InoCW); reproducer
 
 ---
 
+## OPEN — 2026-06-18 multi-agent bug-hunt (BH-18): index + reproduction harness
+
+A 12-finder adversarial bug hunt against current HEAD (`cc374ab`) found and
+triple-verified (finder → independent verifier → maintainer re-run in a
+container) **14 distinct compiler bugs**. All compile **clean** unless noted.
+Six are memory-unsafe soundness holes. Each entry below (BH-18 #1..#14) is
+self-contained: minimal reproducer, exact observed/expected, the asymmetric
+control that proves it is a gap (not a design choice), root cause, and a fix
+sketch. A fresh session can reproduce every one with only the steps here.
+
+**How to reproduce (any fresh session):**
+```
+# build the compiler (native or in Docker; Docker avoids Windows AV):
+gcc -O1 -w -I. -o zerc lexer.c parser.c ast.c types.c checker.c emitter.c \
+    zercheck.c ir.c ir_lower.c zercheck_ir.c vrp_ir.c zerc_main.c src/safety/*.c
+# OR: make zerc
+
+zerc x.zer --run                 # compile+run; prints "zerc: running x" then process exit = main()'s return
+zerc x.zer -o x.exe              # compile only (clean compile = no 'error:' line, exit 0)
+zerc x.zer --emit-c -o x.c       # inspect the emitted C (proves dropped guards / placeholders)
+# To PROVE an out-of-bounds access is real (#2,#4,#5), ASan the emitted C:
+zerc x.zer --emit-c -o x.c && gcc -fsanitize=address -g -O0 x.c -o x_asan && ./x_asan
+```
+A "soundness hole" = clean compile + memory-unsafe/guarantee-violating at
+runtime (the crown-jewel class — ZER claims 100% program-consequence
+coverage). "miscompile" = clean compile + wrong runtime result. Severity tags:
+🔴 critical (memory-unsafe), 🟠 high (race / double-free), 🟡 medium
+(miscompile), 🟢 low (false-reject / diagnostic).
+
+| # | Bug | Class | Root-cause area |
+|---|---|---|---|
+| 1 | move-struct pointer-alias defeats ownership/free tracking (heap UAF + use-after-move + double-consume) | 🔴 soundness | zercheck_ir move/alias |
+| 2 | VRP range-narrow scope leak → OOB write | 🔴 soundness | checker.c if-VRP |
+| 3 | `@bitcast` forges integer↔pointer | 🔴 soundness | checker `@bitcast` |
+| 4 | `@pun(*Struct,*primitive)` skips type_id trap → OOB read | 🔴 soundness | emitter `@pun` guard |
+| 5 | fixed-array bare-call index drops bounds check | 🔴 soundness | emitter index single-eval |
+| 6 | `if (opt) \|*v\|` capture escapes to a global | 🔴 soundness | capture desugar + escape prov |
+| 7 | shared-struct multi-access via cast/intrinsic/index/orelse subexpr evades lock check → race | 🟠 race | checker `collect_shared_types_in_expr` |
+| 8 | `spawn` data-race scan blind to funcptr indirection → race | 🟠 race | checker `scan_unsafe_global_access` |
+| 9 | shared-struct read in `await` condition unlocked → race | 🟠 race | checker `NODE_AWAIT` handler |
+| 10 | value-returning `async` never finalizes state machine | 🟡 miscompile | emitter `IR_RETURN` async |
+| 11 | bit-query/byte-swap intrinsics emit `0` in global initializers | 🟡 miscompile | emitter AST `NODE_INTRINSIC` |
+| 12 | `defer` + backward `goto` fires wrong count (folds into known #5) | 🟡 miscompile | ir_lower defer/back-edge |
+| 13 | nested inline designated initializer false-reject | 🟢 false-reject | checker `validate_struct_init` |
+| 14 | conversion-intrinsic arity not validated (missing/excess args) | 🟢 diagnostic | checker intrinsic arg check |
+
+---
+
+## OPEN — BH-18 #1 — move-struct pointer alias defeats ownership/free tracking (🔴 soundness)
+
+**Symptom:** a `*T` pointer alias taken **before** a `move struct` is consumed
+(or before its owned pointer field is freed) is never linked to the source's
+`HS_TRANSFERRED`/`FREED` state. Three escalating, clean-compiling manifestations
+— the worst is a genuine **heap use-after-free with slab slot reuse**.
+
+**1a — heap UAF + slot reuse (memory corruption):**
+```zer
+struct Task { u32 id; }
+Slab(Task) pool;
+move struct Owner { *Task p; }
+void release(Owner o) { pool.free_ptr(o.p); }
+u32 main() {
+    Owner o;
+    o.p = pool.alloc_ptr() orelse return;
+    o.p.id = 100;
+    *Task alias = o.p;          // raw-ptr alias copied out before the move
+    release(o);                 // moves o AND frees the slab slot (cross-function)
+    *Task fresh = pool.alloc_ptr() orelse return;  // reuses the just-freed slot
+    fresh.id = 222;
+    u32 corrupted = alias.id;   // reads the REUSED slot -> 222, no trap
+    pool.free_ptr(fresh);
+    return corrupted;
+}
+```
+Observed: clean compile, `EXIT=222` (reads memory now owned by `fresh`).
+`@ptrtoint(alias) == @ptrtoint(fresh)` proves they share one slot. The
+`alloc_ptr` raw-pointer path has **no** runtime generation backstop (emitted C
+is a bare `alias->id` deref), so it corrupts **silently** — the Handle-field
+variant at least traps at runtime (slab gen check, EXIT=133).
+
+**1b — use-after-move stale read** (stack; logical violation, no corruption):
+```zer
+move struct Tok { u32 kind; }
+u32 main() { Tok a; a.kind = 11; *Tok p = &a; Tok b = a; return p.kind; }
+```
+Observed: clean compile, `EXIT=11` — reads the moved-from value through `p`.
+
+**1c — double-consume / double-close** (re-consumes a unique resource):
+```zer
+move struct FileHandle { i32 fd; }
+i32 g_closes;
+void close_file(FileHandle f) { g_closes += 1; }
+u32 main() {
+    FileHandle f; f.fd = 3;
+    *FileHandle alias = &f;
+    close_file(f);                  // first consume
+    FileHandle reborn = *alias;      // resurrect moved-from f via the alias
+    close_file(reborn);             // second consume of the SAME fd
+    return (u32)g_closes;            // EXIT=2 -> double-close
+}
+```
+
+**Control (proves it is a gap, not design):** every NON-alias form IS caught.
+Direct `*Task a = pool.alloc_ptr()...; *Task alias = a; release(a); alias.id`
+→ `zercheck: use after free`. Direct `Tok b = a; a.kind` → `use after move:
+'a' ... transferred`. Direct `close_file(f); close_file(f)` → `use after
+move`. Only routing the post-move read/free through a `*T` alias taken before
+the transfer escapes both nets.
+
+**Root cause:** move-transfer marks the source variable `HS_TRANSFERRED`, but
+(a) it does not propagate that state to a pre-existing pointer alias
+(`*T p = &x`), and (b) for a move-struct *field* the transfer clears/overrides
+the owned field allocation's tracking instead of linking the field's `alloc_id`
+to its aliases before transfer. ZER already does the equivalent
+alias-propagation for Pool/Slab interior pointers (shared `alloc_id`, BUG-488/494)
+and the design note in `docs/refactor_ir.md` (~1036-1045) explicitly states
+"TRANSFERRED does NOT propagate to aliases" under the assumption "source's
+alloc_id has no aliases at the time of transfer" — taking `&f`/`alias = o.p`
+before the move **violates that precondition**.
+
+**Fix sketch (track, don't ban):** when `&x` is taken of a move-tracked
+variable (or a raw-ptr copy of a move-struct's owned field is made), register
+the alias to share `x`'s move/free-state key (declaration-site aliasing, same
+pattern as handle `alloc_id`). Then `HS_TRANSFERRED`/`FREED` flows to the alias
+and the use/free through it is gated. Suggested tripwire: `tests/zer_fail/`
+three reproducers (1a/1b/1c) must each produce a use-after-free/use-after-move
+error.
+
+**Distinctness:** NOT BUG-740 (funcptr consume-maybe — caught here), NOT
+BUG-742 (conditional global dangle), NOT defer item #9 (no defer, no Handle).
+
+---
+
+## OPEN — BH-18 #2 — VRP range-narrowing scope leak → unchecked OOB write (🔴 soundness)
+
+**Symptom:** a recognized bounds guard (`if (idx >= N) { return; }`) **nested
+inside a non-comparison `if` (e.g. `if (b)`)** leaks its range narrowing
+(`idx <= N-1`) out to the unconditional path. The compiler then "proves" the
+later array index safe and emits it with **no** `_zer_bounds_check` and **no**
+auto-guard and **no** warning — but the guard only ran on the `b == true` path.
+
+**Reproducer:**
+```zer
+u32 main() {
+    u32[4] buf;
+    buf[0] = 0;
+    u32 idx = 0;
+    for (u32 k = 0; k < 5; k += 1) { idx += 1; }   // idx == 5 (laundered past VRP)
+    bool b = false;
+    if (b) {
+        if (idx >= 4) { return 0; }   // guard runs ONLY when b is true
+    }
+    buf[idx] = 2989;                  // idx==5 -> OOB write, NO guard emitted
+    return buf[0];
+}
+```
+Observed: clean compile (no warning), `--run` EXIT=0 (silent stack corruption).
+ASan on the emitted C: `AddressSanitizer: stack-buffer-overflow ... WRITE of
+size 4 ... [32,48) 'buf' <== Memory access at offset 52 overflows this
+variable`. Expected: auto-guard or `_zer_bounds_check` (exactly what the
+plain `buf[idx]` path emits when idx is unprovable), or a "not proven in range"
+warning.
+
+**Control (proves it is a scope leak, not guard-trust):**
+- baseline (no inner guard) → "index not proven in range — auto-guard inserted", ASan clean.
+- outer **comparison** `if (mode == 1) { if (idx>=4) return; }` → guard emitted, ASan clean (this branch saves/restores `saved_range_count`).
+- **unconditional** `if (idx>=4) return;` at top level → no guard emitted but genuinely SOUND (ASan clean) — proves ZER does NOT blanket-trust guards; only the nested-non-comparison scope leak is wrong.
+- cross-function `pick(5,false)` returning the guarded value → `find_return_range` derives a bogus `[0,3]` and the caller's index is unchecked too (ASan overflow).
+
+**Root cause:** in the checker if-statement VRP handler, the
+`/* non-comparison condition — no range narrowing */` branch calls
+`check_stmt(then_body)` **without** saving/restoring `c->var_range_count`
+around it. The nested guard's inverse-range push (`idx.max = 3`, intended to
+"stay valid after the if") therefore persists past the `if (b)` body and is
+treated as unconditionally valid.
+
+**Fix sketch:** save/restore `var_range_count` (or scope the pushed ranges)
+around the non-comparison branch exactly as the comparison branch already does
+with `saved_range_count`. Tripwire: `tests/zer_trap/` — the reproducer must
+trap (or `tests/zer/` with the auto-guard warning), never run clean.
+
+---
+
+## OPEN — BH-18 #3 — `@bitcast` forges integer↔pointer, bypassing the mmio/inttoptr gate (🔴 soundness)
+
+**Symptom:** `@bitcast(*T, intval)` (and `@bitcast(uN, *T)`) reinterprets an
+arbitrary integer as a pointer (and back) with a **clean compile** — no mmio
+range check, no alignment check, no `@inttoptr`/`@ptrtoint` gate. On 64-bit a
+pointer and `u64` are both 8 bytes, so `@bitcast`'s same-width check passes and
+int↔ptr reinterpretation is permitted. Round-tripping through `u64` also
+synthesizes the pointer arithmetic ZER explicitly bans.
+
+**Reproducer (silent write through a forged pointer):**
+```zer
+u32 main() {
+    u32 real = 12345;
+    u64 raw = @bitcast(u64, &real);
+    *u32 p = @bitcast(*u32, raw);
+    p[0] = 99;            // writes through a forged pointer, no gate
+    return real;          // EXIT=99
+}
+```
+Observed: clean compile, `EXIT=99`. (Forged offset variant: bitcast `&arr[0]`
+to u64, `+= 8`, bitcast back, deref → reads `arr[2]`, the banned `ptr+N`.)
+
+**Control:** the identical conversion via the intended primitive is rejected —
+`*u32 p = @inttoptr(*u32, addr);` → `error: @inttoptr requires mmio range
+declarations`. And direct `*u32 q = p + 2;` → `error: arithmetic requires
+numeric types`. So all three guards (`@inttoptr` mmio, `@ptrtoint`, no-ptr-math)
+are enforced and `@bitcast` circumvents all three.
+
+**Why it matters:** ZER claims grammar-level closure — "no in-language unsafe",
+every value entering a pointer must cross a typed, mmio-validated boundary.
+`@bitcast` is an unguarded escape hatch for the entire mechanism. (Note: the
+runtime "ZER TRAP" some inputs hit is just the OS SIGSEGV handler for an
+unmapped address — a mapped/in-range forged address reads/writes silently, as
+EXIT=99 shows.)
+
+**Root cause:** the `@bitcast` checker handler allows the cast whenever
+`src`/`dst` widths match; it does not reject the case where exactly one of
+`{src, dst}` is a pointer type.
+
+**Fix sketch:** in the `@bitcast` checker, reject when exactly one operand is a
+pointer (point users at `@inttoptr`/`@ptrtoint`, mirroring the existing C-style
+`(*T)int` → "use @inttoptr" diagnostic). Pointer↔pointer and scalar↔scalar bit
+reinterpretation stay allowed. Tripwire: `tests/zer_fail/bitcast_int_ptr.zer`.
+
+---
+
+## OPEN — BH-18 #4 — `@pun(*Struct, *primitive)` silently skips its runtime type_id trap → OOB read (🔴 soundness)
+
+**Symptom:** `@pun`'s documented guarantee is "runtime type_id check that traps
+on mismatch." A fully-typed in-ZER pointer to a **primitive** (`*u32`, `*u8`,
+a slice `.ptr`, an `@inttoptr` result) packs `type_id == 0`, and the emitted
+guard `if (type_id != TARGET && type_id != 0) trap;` short-circuits to false —
+so the trap is skipped even when the sizes plainly mismatch.
+
+**Reproducer:**
+```zer
+struct Big { u64 a; u64 b; }
+u32 main() {
+    u32 small = 7;
+    *u32 sp = &small;
+    *Big bp = @pun(*Big, sp);   // 4-byte target punned to 16-byte struct, no trap
+    return (u32)bp.b;           // reads offset 8, past the 4-byte 'small'
+}
+```
+Observed: clean compile, runtime garbage; ASan: `stack-buffer-overflow ... READ
+of size 8 ... underflows this variable`. The emitted guard is
+`(_zer_opaque){(void*)(sp), 0}; if (0 != 1 && 0 != 0) _zer_trap(...)` →
+`(true && false)` → trap skipped.
+
+**Control (proves the bypass is type_id==0-specific):** `@pun` between two
+**struct** types (both type_ids nonzero) correctly traps:
+`ZER TRAP: @pun type mismatch` / EXIT=133. And `@ptrcast(*Big, *u32)` is
+correctly compile-rejected ("type confusion — use @pun"). Only `@pun` with a
+primitive/slice source slips through.
+
+**Root cause:** the `type_id == 0` escape clause in the `@pun` runtime guard was
+intended for genuinely-unknown-provenance pointers (cinclude/extern `*opaque`),
+but in-ZER primitive/slice-element pointers also carry `type_id == 0`.
+
+**Distinctness:** This is the WORKS-AS-DESIGNED note "type_id=0 (cinclude)
+skipping the **@ptrcast** check" applied to the **wrong** intrinsic and the
+wrong source — it is `@pun` (not `@ptrcast`, which here compile-rejects) and an
+**in-program** primitive pointer (not a cinclude `*opaque`).
+
+**Fix sketch:** in the `@pun` lowering, do not apply the `!= 0` escape when the
+source is a fully-typed in-ZER primitive/slice pointer; OR add a compile-time
+size-widening check at the `@pun` site (the 4-vs-16-byte mismatch is statically
+known). Tripwire: `tests/zer_fail/pun_primitive_to_struct.zer`.
+
+---
+
+## OPEN — BH-18 #5 — fixed-array index that is a bare function call drops the bounds check (🔴 soundness)
+
+**Symptom:** indexing a fixed-size array by a **bare function call**
+(`a[idx()]`) emits a raw C subscript with **neither** the auto-guard (used for
+simple variable indices) **nor** the `_zer_bounds_check` wrapper (used for
+arithmetic indices and slices). This is the documented BUG-595..612
+emission-diff class: a single-eval path for the side-effecting index never got
+the bounds wrapper that `emit_expr` applies elsewhere.
+
+**Reproducer:**
+```zer
+u32 g = 100;
+u32 idx() { return g; }
+u32 main() {
+    u32[4] a;
+    a[idx()] = 999;   // idx()==100 -> OOB write into a u32[4], no trap
+    return 5;
+}
+```
+Observed: clean compile (no warning), `EXIT=5` (no trap). Emitted main body:
+`_zer_t0 = a[idx()] = 999;` — bare subscript. Also reproduces for read
+(`v = a[idx()]`) and compound (`a[idx()] <<= 1` — the `_zer_shl` shift guard is
+kept but the bounds check is still dropped).
+
+**Control (proves VRP is NOT proving it safe, the check was dropped):** the
+SAME OOB value through any other index shape traps or auto-guards —
+`a[idx()+0]` → `ZER TRAP: array index out of bounds` (EXIT=133); slice
+`s[idx()]` (`[*]u32 s = a;`) → same trap; simple `u32 i = g; a[i]` → "not
+proven in range — auto-guard inserted". Wrapping the call in trivial arithmetic
+re-routes it through the guarded complex-expression path.
+
+**Root cause:** the emitter path that single-evaluates a side-effecting index
+for a **fixed array** (so `idx()` is called once) omits the bounds wrapper.
+Slices go through a different, correctly-guarded path.
+
+**Fix sketch:** port the `_zer_bounds_check` / auto-guard emission to the
+fixed-array side-effecting-index single-eval path (mirror the slice path / the
+`a[idx()+0]` complex-expression path). Run the BH audit grep before committing:
+`grep -nE "_zer_trap|_zer_bounds_check|_zer_shl" emitter.c` — every AST-region
+match needs an IR-path equivalent. Tripwire: `tests/zer_trap/array_call_index_oob.zer`.
+
+---
+
+## OPEN — BH-18 #6 — `if (opt) |*v|` mutable capture escapes a pointer-to-local to a global (🔴 soundness)
+
+**Symptom:** `if (opt) |*v| { ... }` binds `v = &m.value` — a pointer **into**
+the local optional `m`. Storing `v` into a global is a dangling-pointer escape,
+but the capture-desugared `v` does not carry local-derived provenance, so the
+escape check is bypassed. After the function returns, the global points at dead
+stack.
+
+**Reproducer (scalar):**
+```zer
+?*u32 g = null;
+void stash() {
+    ?u32 m = 5;
+    if (m) |*v| { g = v; }      // pointer-to-local m escapes to global g
+}
+u32 main() { stash(); if (g) |gv| { return gv[0]; } return 0; }
+```
+Observed: clean compile (only a benign bounds-check warning), runtime returns
+dead-stack garbage (varies; inserting a clobber between `stash()` and the read
+changes the value — proving it reads a reclaimed frame, not the stored 5).
+The struct variant (`?P` with `P { u32 x; }`) reproduces identically.
+
+**Control:** the syntactically-direct form IS rejected —
+`void stash(){ ?u32 m=5; g=&m.value; }` → `error: cannot store pointer to local
+'m' in static/global variable 'g'`. The escape analysis exists and fires for
+`&m.value` written by hand; it only misses the same address synthesized by the
+`|*v|` capture binding.
+
+**Root cause:** the `|*v|` capture desugars to a synthesized
+`v = &m.value` whose result does not inherit the `is_local_derived` escape
+provenance, so System-11 scope-escape analysis treats `g = v` as a normal
+global store.
+
+**Fix sketch:** mark the capture binding `v` from `|*v|` as local-derived
+(pointer into the local optional's storage), so the existing escape check fires
+on `g = v` exactly as it does for `g = &m.value`. Tripwire:
+`tests/zer_fail/capture_ptr_escape_global.zer` (scalar + struct).
+
+**Distinctness:** NOT BUG-742 (that is a freed-heap MAYBE_FREED-at-exit case);
+this is an unconditional stack-local-address escape, caught in every direct
+form, missed only through `|*v|` capture desugaring.
+
+---
+
+## OPEN — BH-18 #7 — shared-struct multi-access in one statement evades the deadlock/lock check via a cast/intrinsic/index/orelse subexpression → data race (🟠 race)
+
+**Symptom:** reading a shared-struct field inside a `(T)cast`, `@intrinsic(...)`,
+array index, or `orelse` subexpression — while assigning another shared
+struct's field in the same statement — compiles clean. The shared-type
+collector does not recurse into those node kinds, so it sees only ONE shared
+type and stays silent; the emitter (lock-per-statement) then locks one struct
+and reads the other **unlocked**.
+
+**Reproducer:**
+```zer
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+void f(*A pa, *B pb) { pa.x = (u32)pb.y; }   // reads B's field under only A's lock
+u32 main() { return 0; }
+```
+Emitted `f()`:
+```c
+void f(struct A* pa, struct B* pb) {
+    pthread_mutex_lock(&pa->_zer_mtx);
+    _zer_t0 = pa->x = ((uint32_t)pb->y);   // <-- reads pb->y of struct B with NO B lock
+    pthread_mutex_unlock(&pa->_zer_mtx);
+}
+```
+ThreadSanitizer confirms a real read/write race on `b` (the two threads hold
+different mutexes M0=A, M1=B). Also reproduces via `@bitcast(u32, pb.y)` and
+`pb.arr[pb.idx]`.
+
+**Control:** the plain binary form `pa.x = pb.y;` IS rejected —
+`error: deadlock: single statement accesses both 'A' (order 1) and 'B'
+(order 2)`. Only wrapping one access in a cast/intrinsic/index/orelse evades it.
+
+**Root cause:** `collect_shared_types_in_expr` (checker.c, ~14597) recurses
+into `NODE_BINARY`/`NODE_ASSIGN`/`NODE_UNARY`/CALL-args but NOT into
+`NODE_CAST`/`NODE_TYPECAST`/`NODE_INTRINSIC`/`NODE_INDEX` (the index
+sub-expression)/`NODE_ORELSE`.
+
+**Fix sketch:** add those node kinds to the collector's recursion so the
+deadlock/multi-lock check sees both shared types (then the binary-form error
+fires for the cast form too). Tripwire: `tests/zer_fail/shared_cast_subexpr.zer`.
+
+---
+
+## OPEN — BH-18 #8 — `spawn` data-race scan is blind to function-pointer indirection → data race (🟠 race)
+
+**Symptom:** the spawn non-shared-global scan follows only **direct** calls. A
+call through a function pointer (a `*()` param `cb()`, or a local
+`*() fp = do_increment; fp()`) is invisible, so a non-shared global mutated in
+the indirectly-reached callee is never flagged.
+
+**Reproducer:**
+```zer
+u32 g_counter;
+void do_increment() { g_counter = g_counter + 1; }
+void run_n(*() cb, u32 n) { for (u32 i = 0; i < n; i += 1) { cb(); } }
+void worker() { run_n(do_increment, 500000); }
+u32 main() { spawn worker(); spawn worker(); return 0; }
+```
+Observed: clean compile (only a "stack depth not verifiable" warning), no
+data-race error. TSan confirms a read+write race on `g_counter`.
+
+**Control:** the direct-call form `void worker() { do_increment(); }` IS
+rejected — `error: spawn target 'worker' accesses non-shared global
+'g_counter' — data race`. Direct calls are even transitive (multi-level), so
+the indirect miss is a genuine escape, not a depth limit. Contradicts the
+limitations.md "spawn non-shared global (direct + transitive) — 0 holes"
+claim, which tested direct-call depth only.
+
+**Root cause:** `scan_unsafe_global_access` (checker.c, ~8491) only descends
+`NODE_CALL` with a `NODE_IDENT` callee resolvable to a function symbol; it skips
+funcptr call sites entirely instead of treating an unresolvable indirect call
+conservatively.
+
+**Fix sketch:** apply the BUG-740 argument-precise-barrier discipline — an
+unresolvable indirect call inside a spawn target should widen to a possible-race
+(error/conservative), not be silently skipped. (A trivial intraprocedural
+resolution would even catch the `fp = do_increment; fp()` local case.) Tripwire:
+`tests/zer_fail/spawn_funcptr_global_race.zer`.
+
+---
+
+## OPEN — BH-18 #9 — shared-struct access in an `await` condition is not locked (D02 false-negative) → data race (🟠 race)
+
+**Symptom:** accessing a `shared struct` field in an `await` condition compiles
+clean and emits an **unlocked** read, violating both the D02 "no shared access
+in a yield/await statement" ban and the "shared struct = auto-locked" guarantee.
+
+**Reproducer:**
+```zer
+shared struct Flag { u32 ready; u32 data; }
+Flag g;
+async void waiter() {
+    await g.ready > 0;     // shared read in await cond -> D02 should reject, doesn't
+    g.data = g.ready;      // (this one IS properly mutex-wrapped)
+}
+```
+Emitted poll: `case 1:; if (!((g.ready > 0))) { self->_zer_state = 1; return 0; }`
+— `g.ready` read with **no** `pthread_mutex_lock(&g._zer_mtx)`, while every
+other access to `g` in the program is mutex-wrapped. The await condition is
+re-evaluated on every poll while suspended; a concurrent `spawn setter()` (whose
+write IS locked) races it. Pointer form `*Flag p = &g; await p.ready > 0;` also
+slips through.
+
+**Root cause:** the D02 ban (checker.c, ~5722) is gated on
+`c->in_async_yield_stmt`, which is set only for `NODE_EXPR_STMT` and
+`NODE_VAR_DECL` whose expression contains yield (checker.c, ~8677-8681). A bare
+`await cond;` is a `NODE_AWAIT` statement (checker.c, ~11717) — neither node
+kind — so the flag is never set. Because `yield`/`await` are statements (not
+expressions), the await condition is the only realistic way to have a shared
+access inside a suspending statement, so the unguarded path is exactly the
+reachable one.
+
+**Fix sketch:** one-line parity — set `c->in_async_yield_stmt` around the
+`check_expr` of the `await` condition in the `NODE_AWAIT` handler (or detect
+`NODE_AWAIT` in `check_stmt` like the other two node kinds). Tripwire:
+`tests/zer_fail/await_shared_unlocked.zer`.
+
+---
+
+## OPEN — BH-18 #10 — value-returning `async` never finalizes its state machine (🟡 miscompile)
+
+**Symptom:** `async u32` / `async ?u32` (any `return <value>;` in an async body)
+never sets `self->_zer_state = -1` on completion and returns the user value
+instead of the poll done-flag. Result: (1) the coroutine tail **re-executes on
+every subsequent poll** (re-runs side effects), and (2) `while(poll()==0)`
+breaks because the user value is indistinguishable from the "not done" flag.
+
+**Reproducer:**
+```zer
+u32 side;
+async u32 compute() { yield; side += 1000; return 42; }
+u32 main() {
+    side = 0;
+    _zer_async_compute task;
+    _zer_async_compute_init(&task);
+    _zer_async_compute_poll(&task);   // poll 1: yield
+    _zer_async_compute_poll(&task);   // poll 2: completes, side += 1000
+    _zer_async_compute_poll(&task);   // poll 3: should be no-op...
+    _zer_async_compute_poll(&task);   // poll 4: ...but re-runs the tail
+    return side / 1000;               // EXIT=3 (tail ran 3x); expected 1
+}
+```
+Observed: `EXIT=3`. Emitted completion block: `... side += ...; self->_zer_t1 =
+(uint32_t)42; return self->_zer_t1;` — no `self->_zer_state = -1`. With
+`return 0;` the canonical `while(poll()==0)` loop infinite-loops.
+
+**Control:** `async void` (same body) correctly emits `self->_zer_state = -1;
+return 1;` and is idempotent → `EXIT=1`.
+
+**Root cause:** emitter `IR_RETURN` handler (emitter.c, ~9413): the `is_async`
+finalization (`self->_zer_state = -1; return 1;`) lives only in the void/bare
+return branch (~9466-9468). The value-return branch (~9456-9463) never checks
+`func->is_async`. BUG-509 fixed the void path only; the value path was never
+fixed. The checker accepts `async <non-void>` without rejection.
+
+**Fix sketch:** in the value-return branch, when `func->is_async`, emit
+`self->_zer_state = -1;` before returning and reconcile the poll protocol (the
+poll signature is `int` done-flag; a value-returning async needs a separate
+value-retrieval mechanism, not a return-value overload). Tripwire:
+`tests/zer/async_value_return_idempotent.zer` (or reject `async <non-void>`
+until a real value-retrieval API exists).
+
+---
+
+## OPEN — BH-18 #11 — bit-query/byte-swap intrinsics emit `0` in global initializers (🟡 miscompile)
+
+**Symptom:** `@popcount`/`@ctz`/`@clz`/`@ffs`/`@parity`/`@bswap16`/`@bswap32`/
+`@bswap64` used in a **global variable initializer** silently emit
+`/* @X — unknown */0`. Clean compile, wrong value (and wrong control flow when
+the global feeds a comparison).
+
+**Reproducer:**
+```zer
+u32 g = @popcount(255);   // emitted: uint32_t g = /* @popcount — unknown */0;
+u32 main() { return g; }   // EXIT=0 ; expected 8
+```
+Observed: `g == 0`. `@bswap32(1)` global → 0 (expected 16777216), and an
+`if (g == 16777216)` then wrongly takes the false branch.
+
+**Control:** the SAME intrinsic in a **function body** is correct
+(`u32 x = @popcount(255);` → 8). And `@truncate`/`@bitcast`/`@size` ARE handled
+in the global/AST path — so it is specifically these 9 intrinsics missing from
+that path, not a general "no intrinsics in globals" limit.
+
+**Root cause:** the documented two-emitter-path gotcha. The IR-rewritten path
+(emitter.c, ~6561) handles popcount/ctz/clz/ffs/parity/bswap*, but the AST path
+(`NODE_INTRINSIC`, emitter.c, ~2765 — used for global initializers) does not,
+and falls through to the `/* @%.*s — unknown */0` placeholder. The checker
+accepts the global because these return `u32` (type-checks fine).
+
+**Fix sketch:** add handlers for the 9 bit-query/byte-swap intrinsics to the AST
+`NODE_INTRINSIC` emitter path (mirror the IR path / the existing
+`@truncate`/`@bitcast` AST handlers). Verify both paths with
+`grep -n '"popcount"' emitter.c` returning TWO hits. Tripwire:
+`tests/zer/bitquery_global_init.zer`.
+
+---
+
+## OPEN — BH-18 #12 — `defer` + backward `goto` fires the wrong count (🟡 miscompile; folds into known item "defer fires twice")
+
+**Symptom:** a function-scope `defer` is lowered onto the backward-`goto`
+**back-edge** block instead of the real exit paths, so it fires once **per
+back-edge traversal** — N times for N traversals, **0** times when the back-edge
+is never taken (silent skipped cleanup / leak), and never at the true return.
+
+**Reproducer:**
+```zer
+u32 counter;
+void inc() { counter += 1; }
+void run() {
+    u32 i = 0;
+    defer inc();              // registered once, before the label
+    loop:
+    i += 1;
+    if (i < 3) { goto loop; }  // 2 back-edges
+}
+u32 main() { run(); return counter; }   // EXIT=2 ; expected 1
+```
+Observed: `EXIT=2`. Parametric: bound `i<1`→0 fires (cleanup skipped), `i<2`→1,
+`i<5`→4. With `defer pool.free_ptr(h)` this becomes a clean-compiling
+double-free; with the back-edge never taken it becomes a leak.
+
+**Control:** the structured-loop analog (`while (i<3) { i += 1; }`, same defer)
+correctly fires once → `EXIT=1`.
+
+**Root cause:** ir_lower defer lowering attaches the function-scope defer to the
+same-scope `goto` back-edge block rather than to all real exit paths.
+
+**Distinctness / honesty note:** this is the **same defect** as the existing
+OPEN item "defer fires twice when a goto target sits in the same defer scope" —
+this entry is a sharper characterization (parametric fire count, plus the
+0-fire leak and the double-free escalation), not a wholly new bug. Track it as
+an escalation of that item, not a separate fix. Tripwire (shared with that
+item): the goto-loop defer must fire exactly once.
+
+---
+
+## OPEN — BH-18 #13 — nested inline designated initializer rejected ("got void") (🟢 false-reject)
+
+**Symptom:** a designated initializer whose field value is itself an inline
+brace literal is rejected — the inner literal is typed `void` because the
+field's expected type isn't threaded into it. Reproduces in all three
+value-flow sites (var-decl init, assignment, return).
+
+**Reproducer:**
+```zer
+struct Inner { u32 x; u32 y; }
+struct Outer { Inner pos; u32 id; }
+u32 main() {
+    Outer o = { .pos = { .x = 3, .y = 4 }, .id = 9 };   // error: field '.pos' expects 'Inner', got 'void'
+    return o.pos.x + o.pos.y + o.id;
+}
+```
+Observed: `error: field '.pos' expects 'Inner', got 'void'`.
+
+**Control (proves the data model + emitter are fine):** hoisting the inner
+literal to a named var compiles and runs — `Inner i = { .x = 3, .y = 4 };
+Outer o = { .pos = i, .id = 9 };` → `EXIT=16`.
+
+**Root cause:** `validate_struct_init` (checker.c, ~1194-1229) calls
+`checker_get_type(df->value)` on each field value but does not recurse when
+`df->value` is itself a `NODE_STRUCT_INIT`, so the inner literal never gets
+validated against the field's declared type and types as `void`.
+
+**Fix sketch:** in `validate_struct_init`, when `df->value->kind ==
+NODE_STRUCT_INIT`, recurse `validate_struct_init(c, df->value, field_type,
+line)` instead of comparing `checker_get_type` against the field type. (The
+array-field variant `{ .data = { 10, 20, 30 } }` is a SEPARATE missing feature
+— ZER has no bare-aggregate array-literal syntax at all; don't conflate.)
+Tripwire: `tests/zer/nested_designated_init.zer`.
+
+---
+
+## OPEN — BH-18 #14 — conversion-intrinsic arity is not validated (🟢 diagnostic)
+
+**Symptom:** the conversion/layout intrinsic family (`@truncate`, `@bitcast`,
+`@saturate`, `@cast`, `@inttoptr`, `@ptrcast`, `@size`) does not validate
+argument count: a **missing value operand** passes the checker and emits invalid
+C (GCC then errors on a non-existent source line), and **excess trailing args**
+are silently dropped.
+
+**Reproducers:**
+```zer
+u32 main() { u8 x = @truncate(u8, 5, 6, 7); return (u32)x; }   // EXIT=5 — args 6,7 silently dropped
+```
+```zer
+u32 main() { u8 x = @truncate(u8); return 0; }   // checker accepts; emits (uint8_t)(); GCC: "expected expression before ')'"
+```
+Observed: extra-args case compiles clean (`(uint8_t)(5)` emitted, EXIT=5);
+missing-operand case passes the ZER checker (`--emit-c` exits 0) and only GCC
+complains, mis-attributed to the wrong line.
+
+**Control:** a normal user function enforces arity —
+`add(1,2,3)` for a 2-param `add` → `error: expected 2 arguments, got 3`. And
+`@atomic_load()` gives a clean checker error `@atomic_load requires 1
+argument`. So the front-end has the mechanism; the conversion-intrinsic family
+just doesn't apply it.
+
+**Why it's diagnostic, not a soundness hole:** these programs never produce a
+running binary, so there's no memory unsafety — the harm is silently-masked
+typos (extra args) and a wrong-line/wrong-stage error (missing arg).
+
+**Fix sketch:** add an exact-arity check to the conversion/layout intrinsic
+checker handlers (reject too-few AND too-many), matching `@atomic_load`'s
+"requires N argument" pattern. Tripwire: `tests/zer_fail/intrinsic_arity.zer`.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

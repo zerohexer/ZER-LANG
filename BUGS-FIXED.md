@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-20 — defer-goto-fallthrough drop FIXED (the 6th/last plt86m gap) — capture-on-FIRE + runtime guard
+
+**What broke (HIGH miscompile):** a defer scope with both a `goto` exit and a
+sibling fall-through exit dropped the defer body on the fall-through path
+(deferred cleanup — free / unlock / `@cpu_enable_int` / close — silently elided
+on the non-goto path). `multi_path(5)` ran its `defer mark()` ZERO times.
+
+**Root cause (two entangled facts).** The emitter walked basic blocks in
+block-ID order maintaining ONE shared mutable `defer_stack`; `IR_DEFER_FIRE`
+emitted from it and (when `pop`) truncated it. Block-ID order ≠ control-flow
+order, so the goto-path fire (emitted first) popped the stack and the
+sibling fall-through fire then found it empty → emitted nothing (THE DROP). But
+that same shared-stack `pop=true` was ALSO load-bearing: it silenced the
+goto-to-cleanup-label DOUBLE-fire (`goto cleanup; cleanup: return` — the goto
+fires the defers, and the cleanup return must not re-fire). So any fix for the
+drop must NOT reintroduce the double-fire.
+
+**Why earlier attempts failed (recorded so they're not re-tried).** (1)
+Plain capture-on-FIRE (each fire emits its own snapshot) fixes the drop but
+unmasks the cleanup double-fire. (2) Capture-on-FIRE + reset-defer_count at a
+goto-only label fixes `return; cleanup:` but not `if(true){goto;} deadcode;
+cleanup:` (the linear lowerer does no reachability, so a dead/both-reachable
+predecessor looks like a live fall-through). (3) Capture-on-FIRE + a
+fall-through-EDGE fire fixes the count but fires the defer BEFORE the label's
+`return <expr>` evaluates — violating BUG-442 when the defer modifies state the
+return reads (`defer held=0; held+=1; cleanup: return held` returned 0 not 2).
+
+**The fix (capture-on-FIRE + per-label runtime "fired" flag):**
+- **capture-on-FIRE** (ir.h `IRInst.defer_fire_bodies`; ir_lower.c LowerCtx
+  `defer_bodies[]` parallel stack + `ir_snapshot_defer_bodies`; emitter emits the
+  snapshot LIFO): each `IR_DEFER_FIRE` carries its own live-defer snapshot, so
+  emission is order-independent — fixes the sibling-fall-through DROP.
+- **goto-only label** (no live fall-through — preceding block terminated or the
+  empty dead block after a return): reset `defer_count = 0` so the label's exit
+  fires nothing. No flag.
+- **both-reachable label** (a LIVE fall-through reaches it): install a RUNTIME
+  GUARD. The goto sets a per-label bool flag (`get_label_guard_flag` →
+  `IR_LITERAL`); the label's subsequent return-fire emits each goto-fired body
+  (`IRInst.defer_fire_guard_flag`/`_guard_below`) as `if (!flag) { body }`. On
+  the goto path flag=1 → skip (already fired eagerly); on the fall-through path
+  flag=0 → fire AT the return, after the return expr is evaluated (BUG-442
+  preserved). Defers registered AFTER the label (depth ≥ guard_below) stay
+  unguarded.
+
+**Verified (emitted-C per-path + asserting tests, not exit codes alone):**
+`connect_or_fail`, `gen_defer_009`/`locked_op`, `rt_goto_fires_defer` each fire
+their cleanup exactly once per path; `op(0)==2` / `op(1)==0` proves the BUG-442
+timing. Tests: `tests/zer/defer_goto_fallthrough_fires.zer` (drop, both paths
+once), `tests/zer/defer_goto_both_reachable.zer` (both-reachable, plain
+non-gen-checked counter), `tests/zer/defer_goto_return_reads_deferred.zer`
+(asserts the return VALUES). Full `make check` green. **Closes the LAST of the 9
+plt86m gaps.** Architecture: docs/compiler-internals.md "capture-on-FIRE +
+runtime-flag defer emission".
+
+---
+
 ## Session 2026-06-19e — 5 of 6 remaining plt86m gaps closed + keep-default audit hygiene
 
 Verified, reproducer-driven fixes for 5 of the 6 open plt86m gaps (the 6th,

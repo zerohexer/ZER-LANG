@@ -1,0 +1,25 @@
+// plt86m audit 2026-06-17 (defer-goto-fallthrough drop, NOW FIXED): a defer in
+// a scope with both a goto exit and a sibling fall-through exit must fire on
+// BOTH paths exactly once. Pre-fix the emitter dropped the fall-through fire.
+// Exits 0 only if BOTH paths fired exactly once (g_called == 2) — catching the
+// drop (would be 1) AND any double-fire regression (would be 3).
+i32 g_called = 0;
+void mark() { g_called += 1; }
+
+u32 multi_path(u32 x) {
+    if (x > 0) {
+        defer mark();
+        if (x == 1) { goto done; }
+        // fall-through here — defer must fire
+    }
+    return 100;
+done:
+    return 200;
+}
+
+i32 main() {
+    multi_path(5);   // fall-through path
+    multi_path(1);   // goto path
+    if (g_called == 2) { return 0; }
+    return 1;
+}

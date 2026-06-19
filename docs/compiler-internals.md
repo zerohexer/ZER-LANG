@@ -5195,6 +5195,59 @@ Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
 as flag values fell into the validator's "out of range" check for
 functions with local_count == 0.
 
+### capture-on-FIRE + runtime-flag defer emission (2026-06-20 — plt86m defer-goto)
+
+**The defer body-emission model changed: each `IR_DEFER_FIRE` carries its OWN
+snapshot of live defer bodies (captured at lowering), and a both-reachable
+cleanup label fire is runtime-guarded.** Mandatory before touching defer
+lowering/emission.
+
+THE BUG it fixed: the emitter walked basic blocks in block-ID order with ONE
+shared mutable `e->defer_stack` (push on `IR_DEFER_PUSH`, emit-from + truncate
+on `IR_DEFER_FIRE`). Block-ID order ≠ control-flow order, so two MUTUALLY-
+EXCLUSIVE sibling exits of one scope (a goto-path block + a fall-through block,
+each with its own FIRE) had the first-emitted FIRE pop the stack and the second
+emit NOTHING — silently dropping cleanup on the non-goto path. But that same
+`pop=true` was LOAD-BEARING: it also silenced the goto-to-cleanup-label
+double-fire (`goto cleanup; cleanup: return` — the goto fires the defers, and
+the cleanup return must not re-fire). So the drop bug and the double-fire
+prevention were ENTANGLED in the shared stack.
+
+THE FIX (`IRInst.defer_fire_bodies`/`_body_count` + `_guard_flag`/`_guard_below`):
+- **capture-on-FIRE.** LowerCtx has a parallel depth-indexed `defer_bodies[]`
+  stack (stack-first 32 + arena overflow). NODE_DEFER records the body at its
+  depth. `emit_defer_fire`/`_scoped` call `ir_snapshot_defer_bodies` to copy
+  `defer_bodies[base..count)` into the fire (arena). The emitter emits that
+  snapshot (LIFO), NOT the shared stack — order-independent, fixes the DROP. The
+  `defer_stack` push/pop bookkeeping stays for `ir_validate` balance but is dead
+  for emission.
+- **goto-only cleanup label** (no live fall-through — preceding block terminated
+  or the empty dead block after a return): reset `defer_count = 0` so its exit
+  fires nothing. No flag.
+- **both-reachable cleanup label** (a LIVE fall-through reaches it): RUNTIME
+  GUARD. `IRLabelMap.guard_flag_local` is a bool local (lazily via
+  `get_label_guard_flag`); the goto, after firing eagerly, sets it
+  (`IR_LITERAL` flag=1); the label sets `ctx->active_guard_flag`/`_below =
+  defer_count`; `ir_snapshot_defer_bodies` attaches them so the emitter wraps
+  each body of original depth < guard_below in `if (!flag) { body }`. Goto path:
+  flag=1 → skip (already fired). Fall-through path: flag=0 → fire AT the return,
+  AFTER the return expr is evaluated (BUG-442). Defers registered after the
+  label (depth ≥ guard_below) stay unguarded.
+
+INVARIANTS for future work:
+- Snapshot at LOWERING, emit at EMISSION. Never re-introduce a block-order stack
+  replay for body emission.
+- Do NOT change the NODE_GOTO `ctx->defer_count = 0` reset — it keeps the linear
+  count consistent for the goto path.
+- `make_inst` must keep `defer_fire_guard_flag = -1` (0 is a valid local id).
+- Three earlier attempts were dead ends (plain capture-on-FIRE → cleanup
+  double-fire; +reset → misses dead-code-before-label; +fall-through-edge-fire →
+  violates BUG-442 timing). See BUGS-FIXED.md "Session 2026-06-20".
+- VERIFY defer changes by DIFFING emitted C per control-flow path (free/mark
+  counts), NOT by test exit codes — several defer+goto tests pass despite wrong
+  cleanup because they assert return values, not side-effects
+  (rt_drop_defer_goto_cleanup, rt_goto_fires_defer, gen_defer_009).
+
 ### V3 target-type routing
 
 `route_alloc_to_ptr_if_needed(call, target)` and

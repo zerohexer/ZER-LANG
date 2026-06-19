@@ -51,3 +51,9 @@ zercheck.c:    int covered_stack[64];
 # (silent skip beyond 64) confirmed acceptable in CLAUDE.md "Confirmed
 # NOT Bugs" section.
 zerc_main.c:    Node *import_asts[64];
+
+# Capture-on-FIRE defer-body stack (plt86m defer-goto fix): stack-first per
+# CLAUDE rule #7 — inline 32, arena-doubling overflow grown in the NODE_DEFER
+# handler (never silently drops; defer_bodies_cap doubles). Mirrors LowerCtx's
+# own label_inline[32] in the same struct.
+ir_lower.c:    Node *defer_bodies_inline[32];

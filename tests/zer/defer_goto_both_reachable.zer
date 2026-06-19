@@ -1,0 +1,31 @@
+// plt86m audit 2026-06-17 (defer-goto, the both-reachable cleanup-label case):
+// a function-scoped defer + `if(c){goto cleanup;} livecode; cleanup:` must fire
+// the defer EXACTLY ONCE on both the goto path and the fall-through path, never
+// twice. Uses a plain global counter (NOT a gen-checked Pool free) so a
+// cleanup-label double-fire is actually observable. Exit 0 = correct.
+i32 fires;
+i32 livecode_ran;
+
+void inc_fires() { fires += 1; }
+
+u32 run(u32 c) {
+    defer inc_fires();
+    if (c > 0) { goto cleanup; }
+    livecode_ran = 1;        // live fall-through code before the label
+cleanup:
+    return 0;
+}
+
+i32 main() {
+    fires = 0; livecode_ran = 0;
+    run(1);                            // goto path
+    if (fires != 1) { return 1; }      // defer fired exactly once (not 0, not 2)
+    if (livecode_ran != 0) { return 2; }   // livecode skipped on goto path
+
+    fires = 0;
+    run(0);                            // fall-through path
+    if (fires != 1) { return 3; }      // defer fired exactly once
+    if (livecode_ran != 1) { return 4; }   // livecode ran on fall-through
+
+    return 0;
+}

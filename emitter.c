@@ -9785,21 +9785,42 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (pop) e->defer_stack.count = base;
             break;
         }
-        for (int di = e->defer_stack.count - 1; di >= base; di--) {
-            Node *db = e->defer_stack.stmts[di];
+        /* capture-on-FIRE (plt86m defer-goto): emit THIS fire's own snapshot of
+         * live defer bodies (LIFO: index high = newest defer = first), NOT a
+         * replay of the shared mutable defer_stack in block-ID order — that
+         * replay dropped a sibling fall-through fire after a goto-path fire
+         * popped the stack. The defer_stack push/pop bookkeeping (below) stays
+         * for ir_validate balance but is no longer READ for body emission.
+         * emit_defer_stmt handles NODE_BLOCK + every legit defer-body kind. */
+        for (int di = inst->defer_fire_body_count - 1; di >= 0; di--) {
+            Node *db = inst->defer_fire_bodies[di];
             if (!db) continue;
-            /* Defer body may be a NODE_BLOCK (typical) or a single stmt.
-             * emit_defer_stmt handles both shapes recursively + all the
-             * statement kinds the defer body can legitimately contain
-             * (NODE_IF/FOR/WHILE/BLOCK/VAR_DECL/etc.). Previously this
-             * fell back to emit_rewritten_node for non-block bodies,
-             * silently miscompiling NODE_IF and friends. */
+            /* both-reachable cleanup-label guard (plt86m defer-goto): a body
+             * whose ORIGINAL defer depth (base+di) is < guard_below was fired
+             * EAGERLY by a goto (which set the flag), so emit it as
+             * `if (!flag) { body }` — skipped on the goto path, fired on the
+             * fall-through path (flag still 0) AT this return, after eval. */
+            int depth = base + di;
+            bool guarded = (inst->defer_fire_guard_flag >= 0) &&
+                           (depth < inst->defer_fire_guard_below);
+            if (guarded) {
+                emit_indent(e);
+                emit(e, "if (!");
+                emit_local_name(e, func, inst->defer_fire_guard_flag);
+                emit(e, ") {\n");
+                e->indent++;
+            }
             if (db->kind == NODE_BLOCK) {
                 for (int si = 0; si < db->block.stmt_count; si++) {
                     emit_defer_stmt(e, db->block.stmts[si], func);
                 }
             } else {
                 emit_defer_stmt(e, db, func);
+            }
+            if (guarded) {
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
             }
         }
         if (pop) e->defer_stack.count = base;

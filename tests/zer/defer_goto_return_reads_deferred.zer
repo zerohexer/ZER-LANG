@@ -1,0 +1,26 @@
+// plt86m audit (defer-goto, BUG-442 timing for both-reachable cleanup label):
+// the defer modifies state the return reads. Via the FALL-THROUGH path into a
+// goto-target label, the defer must fire AT the return (after the return expr is
+// evaluated), so the return sees the PRE-defer value (2). Via the GOTO path the
+// defer fired eagerly ("goto fires defers"), so the return sees 0. Exactly one
+// fire on each path. Asserts the actual return VALUES (the prior fix attempt
+// got the fall-through value wrong by firing before eval).
+u32 g;
+void reset_g() { g = 0; }
+
+u32 op(u32 c) {
+    g = 1;
+    defer reset_g();
+    if (c > 0) { goto done; }
+    g += 1;             // fall-through: g = 2
+done:
+    return g;           // fall-through -> 2 (eval before defer); goto -> 0
+}
+
+i32 main() {
+    if (op(0) != 2) { return 1; }   // fall-through: BUG-442 — return reads g=2
+    if (g != 0) { return 2; }        // defer fired exactly once -> g=0
+    if (op(1) != 0) { return 3; }   // goto: eager fire -> return reads g=0
+    if (g != 0) { return 4; }        // defer fired exactly once (no double)
+    return 0;
+}

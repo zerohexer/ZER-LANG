@@ -160,6 +160,22 @@ typedef struct IRInst {
 
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
+    /* IR_DEFER_FIRE: capture-on-FIRE snapshot of the live defer bodies at this
+     * fire point, captured at lowering. The emitter emits THESE (LIFO: index 0 =
+     * oldest/outermost, emit high->low) instead of replaying a shared mutable
+     * stack in block-ID order (which dropped a sibling fall-through fire after a
+     * goto-path fire popped the stack — plt86m defer-goto gap). NULL/0 for
+     * pop-only fires and non-fire ops (make_inst memsets). */
+    Node **defer_fire_bodies;
+    int    defer_fire_body_count;
+    /* IR_DEFER_FIRE guard (plt86m defer-goto, both-reachable cleanup label):
+     * snapshot bodies whose ORIGINAL defer depth < defer_fire_guard_below are
+     * emitted as `if (!<flag local>) { body }` — the goto sets the flag, so the
+     * eager goto-path fire is not duplicated by this lazy label-return fire,
+     * while the fall-through path (flag still 0) fires AFTER the return expr is
+     * evaluated (BUG-442 timing). guard_flag = -1 means no guard. */
+    int    defer_fire_guard_flag;
+    int    defer_fire_guard_below;
 
     /* Intrinsic operand */
     const char *intrinsic_name;

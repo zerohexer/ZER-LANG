@@ -27,6 +27,13 @@ typedef struct {
     const char *name;
     uint32_t len;
     int block_id;
+    /* plt86m defer-goto fix: set when a FORWARD goto fired >=1 defer before
+     * jumping to this label. Drives the goto-target label handling. */
+    int goto_fired;
+    /* Runtime "already fired" flag local for a both-reachable goto-target
+     * label. The goto sets it to 1 after firing eagerly; the label's lazy
+     * return-fire emits `if (!flag) { body }`. -1 = not yet allocated. */
+    int guard_flag_local;
 } IRLabelMap;
 
 typedef struct {
@@ -42,6 +49,20 @@ typedef struct {
 
     /* Defer tracking */
     int defer_count;          /* number of pending defers */
+    /* Parallel depth-indexed stack of live defer bodies (defer_bodies[i] = body
+     * pushed at depth i). Capture-on-FIRE reads defer_bodies[base..count) into
+     * each IR_DEFER_FIRE so emission is order-independent (plt86m defer-goto).
+     * Stack-first per CLAUDE rule #7: inline 32, arena on overflow. */
+    Node *defer_bodies_inline[32];
+    Node **defer_bodies;
+    int defer_bodies_cap;
+    /* Active runtime defer-fire guard (plt86m defer-goto, both-reachable cleanup
+     * label). After such a label, subsequent fires of the goto-fired defers
+     * (original depth < active_guard_below) emit `if (!flag) {...}` so the goto
+     * path (flag=1) doesn't double-fire and the fall-through path (flag=0) fires
+     * at the return, after eval. -1 = no active guard. */
+    int active_guard_flag;
+    int active_guard_below;
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
      * defers — the enclosing construct (loop body, if-branch, switch arm)
      * already does it with the correct semantics (no-pop for loops so
@@ -95,6 +116,7 @@ static IRInst make_inst(IROpKind op, int line) {
      * reject every IR_RETURN / IR_GOTO (they leave these fields unused). */
     inst.obj_local = -1;
     inst.handle_local = -1;
+    inst.defer_fire_guard_flag = -1;  /* no guard by default */
     inst.source_line = line;
     return inst;
 }
@@ -137,8 +159,28 @@ static int find_label_block(LowerCtx *ctx, const char *name, uint32_t len) {
     ctx->labels[ctx->label_count].name = name;
     ctx->labels[ctx->label_count].len = len;
     ctx->labels[ctx->label_count].block_id = bid;
+    ctx->labels[ctx->label_count].goto_fired = 0;
+    ctx->labels[ctx->label_count].guard_flag_local = -1;
     ctx->label_count++;
     return bid;
+}
+
+/* plt86m defer-goto fix: mark / query whether a forward goto fired defers to a
+ * label (see IRLabelMap.goto_fired). */
+static void mark_label_goto_fired(LowerCtx *ctx, const char *name, uint32_t len) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0) {
+            ctx->labels[i].goto_fired = 1;
+            return;
+        }
+}
+static int label_goto_fired(LowerCtx *ctx, const char *name, uint32_t len) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0)
+            return ctx->labels[i].goto_fired;
+    return 0;
 }
 
 /* collect_locals REMOVED — locals now created on-demand in lower_stmt.
@@ -221,6 +263,21 @@ static int create_temp(LowerCtx *ctx, Type *type, int line) {
     return ir_add_local(ctx->func, ctx->arena,
                         name, (uint32_t)tl, type,
                         false, false, true, line);
+}
+
+/* plt86m defer-goto fix: get (lazily allocate) the runtime "already fired"
+ * flag local for a goto-target label. The flag is a bool local auto-zeroed at
+ * function entry; the goto sets it to 1 after firing eagerly, the label's lazy
+ * return-fire checks it. Defined after create_temp so it can allocate. */
+static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, int line) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0) {
+            if (ctx->labels[i].guard_flag_local < 0)
+                ctx->labels[i].guard_flag_local = create_temp(ctx, ty_bool, line);
+            return ctx->labels[i].guard_flag_local;
+        }
+    return -1;
 }
 
 /* Emit helper: creates instruction, adds to current block */
@@ -821,10 +878,32 @@ static IROpKind classify_builtin_call(LowerCtx *ctx, Node *call,
     return IR_NOP; /* Not a builtin — regular method call */
 }
 
+/* Capture-on-FIRE (plt86m defer-goto): snapshot the live defer bodies
+ * [base, defer_count) into a fire instruction (arena-allocated), so the emitter
+ * emits this fire's OWN bodies instead of replaying a shared mutable stack in
+ * block-ID order. */
+static void ir_snapshot_defer_bodies(LowerCtx *ctx, IRInst *fire, int base) {
+    int n = ctx->defer_count - base;
+    if (n <= 0) return;
+    fire->defer_fire_bodies = (Node **)arena_alloc(ctx->arena, (size_t)n * sizeof(Node *));
+    for (int i = 0; i < n; i++)
+        fire->defer_fire_bodies[i] = ctx->defer_bodies[base + i];
+    fire->defer_fire_body_count = n;
+    /* Attach the active both-reachable-cleanup-label guard: bodies whose
+     * ORIGINAL depth (base+i) is < active_guard_below were fired eagerly by a
+     * goto, so this fire emits them as `if (!flag) {...}`. Newer defers
+     * (depth >= guard_below, registered after the label) stay unguarded. */
+    if (ctx->active_guard_flag >= 0) {
+        fire->defer_fire_guard_flag = ctx->active_guard_flag;
+        fire->defer_fire_guard_below = ctx->active_guard_below;
+    }
+}
+
 /* Emit IR_DEFER_FIRE for pending defers (fire all, no pop — function/return exit) */
 static void emit_defer_fire(LowerCtx *ctx, int line) {
     if (ctx->defer_count > 0) {
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        ir_snapshot_defer_bodies(ctx, &fire, 0);
         emit_inst(ctx, fire);
     }
 }
@@ -837,6 +916,7 @@ static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) 
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
         fire.cond_local = base;
         fire.src2_local = pop ? 0 : 1;
+        ir_snapshot_defer_bodies(ctx, &fire, base);
         emit_inst(ctx, fire);
     }
 }
@@ -3003,6 +3083,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * the IR_DEFER_PUSH instructions for those defers re-run at runtime
          * (the PUSH emission re-appends the body), so the next iteration
          * has them active again — matches loop-iteration defer semantics. */
+        bool goto_had_defers = ctx->defer_count > 0;
         emit_defer_fire_scoped(ctx, 0, true, node->loc.line);
         ctx->defer_count = 0;
         if (ctx->current_stmt_shared_root) {
@@ -3012,6 +3093,27 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         int target = find_label_block(ctx,
             node->goto_stmt.label, (uint32_t)node->goto_stmt.label_len);
+        /* plt86m defer-goto fix: the goto fired the defers EAGERLY. Record that
+         * (mark_label_goto_fired) and set the target label's runtime "already
+         * fired" flag to 1, so a both-reachable cleanup label's LAZY return-fire
+         * (emitted `if (!flag) {...}`) is skipped on this goto path — no
+         * double-free — while the fall-through path (flag still 0) fires at the
+         * return, after eval. Emitted before the IR_GOTO so it runs on this
+         * path. (For a goto-ONLY target the label resets defer_count and the
+         * flag is simply unused.) */
+        if (goto_had_defers) {
+            mark_label_goto_fired(ctx, node->goto_stmt.label,
+                                  (uint32_t)node->goto_stmt.label_len);
+            int gflag = get_label_guard_flag(ctx, node->goto_stmt.label,
+                            (uint32_t)node->goto_stmt.label_len, node->loc.line);
+            if (gflag >= 0) {
+                IRInst setf = make_inst(IR_LITERAL, node->loc.line);
+                setf.dest_local = gflag;
+                setf.literal_int = 1;
+                setf.literal_kind = 3;  /* bool */
+                emit_inst(ctx, setf);
+            }
+        }
         IRInst go = make_inst(IR_GOTO, node->loc.line);
         go.goto_block = target;
         emit_inst(ctx, go);
@@ -3022,9 +3124,43 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_LABEL: {
         int target = find_label_block(ctx,
             node->label_stmt.name, (uint32_t)node->label_stmt.name_len);
+        /* plt86m defer-goto fix. A forward goto fired ALL live defers (base 0)
+         * EAGERLY on its edge and set this label's "already fired" flag. The
+         * defers must fire exactly once on every path. Two cases:
+         *
+         *  - GOTO-ONLY target (no LIVE fall-through into the label — the
+         *    preceding block ended in a return/goto, so it is terminated or is
+         *    the empty dead block left after a terminator): the only edges in
+         *    are gotos, which fired already. Reset defer_count to 0 so the
+         *    label's own exit fires nothing. No flag needed.
+         *
+         *  - BOTH-REACHABLE target (a LIVE fall-through reaches the label, defers
+         *    still live on that path): install a RUNTIME GUARD. Keep defer_count;
+         *    record (flag, guard_below = count) so the label's subsequent
+         *    return-fire emits `if (!flag) { body }` for these goto-fired defers.
+         *    On the goto path flag=1 -> skip (already fired); on the fall-through
+         *    path flag=0 -> fire AT the return, after the return expr is
+         *    evaluated (preserves BUG-442). Defers registered AFTER the label
+         *    (depth >= guard_below) stay unguarded. */
+        int fired_target = label_goto_fired(ctx,
+            node->label_stmt.name, (uint32_t)node->label_stmt.name_len);
+        bool guarded = false;
+        if (fired_target) {
+            IRBlock *pb = &ctx->func->blocks[ctx->current_block];
+            bool live_fallthrough =
+                (pb->inst_count > 0) && !ir_block_is_terminated(pb);
+            if (live_fallthrough && ctx->defer_count > 0) {
+                ctx->active_guard_flag = get_label_guard_flag(ctx,
+                    node->label_stmt.name, (uint32_t)node->label_stmt.name_len,
+                    node->loc.line);
+                ctx->active_guard_below = ctx->defer_count;
+                guarded = true;
+            }
+        }
         /* End current block, start the label's block */
         ensure_terminated(ctx, target);
         ctx->current_block = target;
+        if (fired_target && !guarded) ctx->defer_count = 0;
         break;
     }
 
@@ -3037,6 +3173,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
         emit_inst(ctx, push);
+        /* capture-on-FIRE: record the body at this depth so each later FIRE can
+         * snapshot the live defers. Grow into arena on overflow (rule #7). */
+        if (ctx->defer_count >= ctx->defer_bodies_cap) {
+            int nc = ctx->defer_bodies_cap * 2;
+            Node **nb = (Node **)arena_alloc(ctx->arena, (size_t)nc * sizeof(Node *));
+            memcpy(nb, ctx->defer_bodies, (size_t)ctx->defer_count * sizeof(Node *));
+            ctx->defer_bodies = nb;
+            ctx->defer_bodies_cap = nc;
+        }
+        ctx->defer_bodies[ctx->defer_count] = node->defer.body;
         ctx->defer_count++;
         break;
     }
@@ -3192,6 +3338,9 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.checker = checker;
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
+    ctx.defer_bodies = ctx.defer_bodies_inline;
+    ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
+    ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
     ctx.label_capacity = (int)(sizeof(ctx.label_inline) / sizeof(ctx.label_inline[0]));
 
@@ -3301,6 +3450,9 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.checker = checker;
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
+    ctx.defer_bodies = ctx.defer_bodies_inline;
+    ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
+    ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
     ctx.label_capacity = (int)(sizeof(ctx.label_inline) / sizeof(ctx.label_inline[0]));
 

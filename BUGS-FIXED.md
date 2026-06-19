@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-19b — build hygiene: `make clean` left `src/safety/*.o` (stale-object phantom-bug class)
+
+**What broke:** a corrupt `src/safety/comptime_rules.o` (from an OOM-interrupted
+build; its `.c` older than the `.o`, so `make` never rebuilt it) made the
+`make zerc` compiler spuriously reject trivial programs (`expression nesting too
+deep` on `u32 main(){u32 x=5;return x;}`); semantic fuzzer ~165/200. The object's
+`zer_expr_nesting_valid` read its arg from `%ecx` instead of `%edi` (ABI/codegen
+mismatch) → garbage instead of the depth.
+
+**Root cause:** `make clean` removed only top-level `*.o`, never `src/safety/*.o`,
+so the corrupt object survived every clean and every rebuild. `git archive` /
+single-`gcc` builds (and CI) recompiled it fresh and passed — which is why "main
+works fine."
+
+**Fix:** Makefile `clean:` now also `rm -f src/safety/*.o`. Diagnose with
+`objdump -d src/safety/comptime_rules.o | grep -A4 zer_expr_nesting_valid:`
+(correct = `%edi`). Misdiagnosed earlier as a "semantic-fuzzer flake / uninit
+read" — corrected to the real post-mortem in docs/limitations.md, with the
+detection lesson in CLAUDE.md gotchas + the debugging playbook in
+docs/compiler-internals.md "Layout-fragile bug debugging".
+
+---
+
 ## Session 2026-06-19 — `keep` is now INFERRED (3 sites auto, no annotation) + BH-15 transitivity soundness hole closed
 
 **Feature: keep auto-inference.** The `keep` annotation is no longer required at

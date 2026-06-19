@@ -10889,3 +10889,84 @@ multi-stage: stage 1 builds the wasm, stage 2 bundles it + a signed OpenJS
 `zerc.exe`/`zer-lsp.exe`** for Windows. The only Windows `.exe`s shipped are the
 signed `node.exe` and the reputable w64devkit toolchain. Open gaps (flags not
 plumbed, single-file only, macOS terminal CLI): `docs/limitations.md`.
+
+## `keep` auto-inference (System #21, since 2026-06-19)
+
+`keep` is no longer a required annotation — it is INFERRED, and the keyword is an
+optional explicit override. This rewired System #21 (Model 4) into a
+declaration+inference hybrid. Mandatory reading before touching keep/escape code.
+
+**The semantic shift.** OLD model: storing a non-`keep` pointer param into a
+global/static/param-field was an ERROR at the function ("add 'keep'"). NEW model:
+that store now INFERS `keep` on the param (the function compiles clean), and the
+safety boundary moves to the CALL SITE — passing `&local` / an arena pointer / a
+local slice to such a (now-keep) param is rejected there. The property is
+identical (a stack pointer can never be persisted), just enforced at the call.
+
+**The three sites (checker.c):**
+- Site 1 — function param keep: the 3 `NODE_ASSIGN` escape sites that used to
+  error now call `infer_mark_param_keep` / `infer_keep_from_call_args`, which
+  write the signature's `param_keeps[]` (the SAME `Type*` call sites resolve to).
+- Site 2 — struct-field keep requirement REMOVED. The `target_struct_field_keep`
+  helper is gone; a keep-derived borrow is provably static so it is safe in any
+  field.
+- Site 3 — funcptr keep already auto (a funcptr CALL worst-cases ALL pointer
+  params as keep regardless of the type's flags).
+
+**Pass 2.5 — `check_keep_inference(Checker*)` (the load-bearing piece).**
+`param_keeps[]` is FINAL only after ALL bodies are checked, so inline call-site
+enforcement would be unsound for forward-referenced / cross-module / transitive
+callees. The escape pass instead records `KeepEdge`s (a Checker dynamic array)
+during the single body pass; then `check_keep_inference` (wired into
+`checker_check` + `zerc_main` AFTER `checker_check_bodies`, before
+`checker_post_passes`) runs a **transitive-escape fixpoint** (an arg tracing to
+caller param P that feeds a keep callee position makes P keep too — closes the
+BH-15 hole where `outer(p){inner(p)}` with `inner(keep)` let `&local` reach a
+global) then **deferred enforcement** off the recorded edges. Root-param
+attribution rides on `Symbol.nonkeep_root_param` (set at param registration,
+carried by `propagate_escape_flags`).
+
+**Invariants future work must respect:**
+- `type_func_ptr` (types.c) MUST zero-init `param_keeps`/`is_variadic` —
+  `arena_alloc` does not zero, and an uninitialized `param_keeps` is a non-null
+  garbage pointer that `infer_mark_param_keep` writes through (wild write).
+- `type_equals` does NOT compare `param_keeps` (worst-case-keep at the call
+  covers it; comparing the bits spuriously rejects assigning an inferred-keep
+  function to a plain funcptr type).
+- `param_keeps` is ALWAYS allocated for a function with params (zero-init, seeded
+  from explicit `keep`) so inference + call sites can read/write it.
+- Test oracle: `tests/test_keep_matrix.c` — NEG cells call `esc_fn(&local)` and
+  expect a CALL-SITE keep rejection (the boundary moved there). POS cells
+  exercise the keep valve. Negative `.zer` repros (`tests/zer_fail/keep_*.zer`)
+  pass `&local` at the call site, not a function-body error.
+Full per-bug detail: BUGS-FIXED.md "Session 2026-06-19".
+
+## Layout-fragile bug debugging (Heisenbugs sanitizers can't see)
+
+When a bug appears in exactly ONE build and vanishes under prints / ASan / `-O0`
+/ valgrind, it is layout-dependent (stale-arena read, wild write through a
+garbage-but-mapped pointer, ABI mismatch, or — most commonly — a **stale `.o`**).
+valgrind/ASan/UBSan all MISS this class (arena/stale memory reads "defined";
+wild writes land in mapped memory; no signed-overflow/OOB to flag). Playbook,
+in order of cheapness, proven on the 2026-06-19 session:
+
+1. **Suspect a stale object first.** If `git archive HEAD | make zerc` (no
+   gitignored `.o`) passes but the working-tree `make zerc` fails, it is a stale
+   `.o`. `rm -f *.o src/safety/*.o` and rebuild. (This was the actual cause that
+   session; everything below was spent NOT doing this first.)
+2. **`gdb` the error site, read the STACK DEPTH.** `break <error line>; run; bt`.
+   A "nesting too deep / recursion limit" error on a SHALLOW stack ⇒ a counter
+   was corrupted (or its predicate is wrong), NOT real recursion. Then check the
+   predicate's actual machine code, not its source.
+3. **`objdump`/`nm` the emitted code.** A pure function returning the wrong
+   answer for a constant input ⇒ ABI/codegen problem (e.g. arg in `%ecx` vs
+   `%edi`) ⇒ almost always a stale/mismatched `.o`. `objdump -d <obj.o> | grep
+   -A6 '<fn>:'` and compare HEAD vs working-tree builds.
+4. **Env-gate to bisect WITHOUT relinking.** Add `if(getenv("X"))return;` to
+   suspect functions, build ONCE, toggle `X=1` vs unset on the same binary —
+   isolates a code path with zero layout change between runs (prints/edits shift
+   layout and hide the bug).
+5. **Discriminate layout vs logic.** Add equivalent dummy struct padding to a
+   clean baseline to replicate a size change WITHOUT the new logic — if that
+   passes, the bug is the logic, not the layout shift.
+Do NOT keep chasing the source with sanitizers once 1–3 point elsewhere.

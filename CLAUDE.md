@@ -74,6 +74,32 @@ messages show the wrong type name in the third slot. Fix: capture each
 Discovered in BUG-700 (session 2026-06-06); same hazard exists everywhere
 `type_name` is composed in a single expression.
 
+**STALE `src/safety/*.o` — the #1 phantom-bug trap (cost a full session 2026-06-19).**
+If a `make zerc`-built compiler spuriously rejects TRIVIAL valid programs
+(e.g. `error: expression nesting too deep` on `u32 main(){u32 x=5;return x;}`)
+but a `git archive HEAD | ... make zerc` or a single-`gcc *.c` build of the SAME
+source passes — **suspect a stale object file FIRST, do not debug the source.**
+Root cause that session: a corrupt `src/safety/comptime_rules.o` (from an
+OOM-interrupted build) whose `zer_expr_nesting_valid` read its arg from the
+wrong register (`%ecx` not `%edi`); its `.c` was older than the `.o`, so `make`
+never rebuilt it, and the OLD `make clean` removed only top-level `*.o` (now
+fixed to also `rm src/safety/*.o`). Diagnose in one step:
+`objdump -d src/safety/comptime_rules.o | grep -A4 zer_expr_nesting_valid:` —
+correct reads `%edi`. When testing a working tree in Docker, the `tar` includes
+these gitignored `.o`; **always `rm -f *.o src/safety/*.o` before a fresh
+build/test.** This class is invisible to valgrind/ASan/UBSan (arena/stale data
+reads "defined"; wild writes hit mapped memory) and vanishes under any
+instrumentation — sanitizers will NOT find it; an `objdump` ABI check will.
+
+**Layout-fragile Heisenbug debugging (when sanitizers come up empty).** If a
+bug only appears in one exact build and disappears under prints/ASan/`-O0`: (1)
+env-gate suspect functions (`if(getenv("NK"))return;`) so you toggle code paths
+on the SAME binary (no layout change between tests); (2) `gdb` break at the
+error site + `bt` — a SHALLOW stack with a "deep recursion" error means a
+counter was corrupted, not real recursion; (3) `objdump`/`nm` the actual emitted
+code, don't trust the source. Full playbook: docs/compiler-internals.md
+"Layout-fragile bug debugging".
+
 ---
 
 ## ZER Language — Complete Quick Reference

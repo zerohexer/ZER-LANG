@@ -206,7 +206,19 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
         Type *obj_type = checker_get_type(e->checker, n->field.object);
         if (obj_type) {
             Type *eff = type_unwrap_distinct(obj_type);
-            if (eff->kind == TYPE_STRUCT) {
+            /* BUG-749 (2026-06-18): pointer-to-struct auto-deref (`ptr.field`
+             * for `*S ptr`) must also be scanned. Pre-fix expr_is_volatile
+             * matched only direct struct values, so a volatile field reached
+             * via `reg.status` for `*MMIO reg` returned false, and any
+             * duplicating emitter (bounds-check + index) re-read the
+             * volatile location twice — silent volatile-semantics violation
+             * (program-consequence: a volatile-qualified read must be a
+             * single C-level load; hardware: read-clear/sequence-counter/
+             * FIFO registers misbehave). Unwrap pointer/optional here. */
+            if (eff && eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+            if (eff && eff->kind == TYPE_OPTIONAL) eff = type_unwrap_distinct(eff->optional.inner);
+            if (eff && eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+            if (eff && eff->kind == TYPE_STRUCT) {
                 for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
                     if (eff->struct_type.fields[i].name_len == (uint32_t)n->field.field_name_len &&
                         memcmp(eff->struct_type.fields[i].name, n->field.field_name,
@@ -3387,6 +3399,45 @@ static void emit_expr(Emitter *e, Node *node) {
             if (!sr_ptr) emit(e, "&");
             emit_expr(e, node->intrinsic.args[0]);
             emit(e, ")");
+        } else if (nlen == 7 && (memcmp(name, "bswap16", 7) == 0 ||
+                                 memcmp(name, "bswap32", 7) == 0 ||
+                                 memcmp(name, "bswap64", 7) == 0) &&
+                   node->intrinsic.arg_count >= 1) {
+            /* BH-18 #11: byte swap also reachable from AST path (e.g. global init). */
+            emit(e, "__builtin_%.*s(", (int)nlen, name);
+            emit_expr(e, node->intrinsic.args[0]);
+            emit(e, ")");
+        } else if (((nlen == 8 && memcmp(name, "popcount", 8) == 0) ||
+                    (nlen == 3 && memcmp(name, "ctz", 3) == 0) ||
+                    (nlen == 3 && memcmp(name, "clz", 3) == 0) ||
+                    (nlen == 6 && memcmp(name, "parity", 6) == 0) ||
+                    (nlen == 3 && memcmp(name, "ffs", 3) == 0)) &&
+                   node->intrinsic.arg_count >= 1) {
+            /* BH-18 #11: bit-query intrinsics emitted from the AST path (global init,
+             * comptime-eval fallback). The IR-rewritten sibling at emitter.c:~8381 wraps
+             * ctz/clz with a zero-guard returning bit width; mirror that here so the
+             * value is correct in static contexts. popcount/parity/ffs are GCC-defined
+             * at 0. */
+            Type *arg_t = checker_get_type(e->checker, node->intrinsic.args[0]);
+            int w = arg_t ? type_width(type_unwrap_distinct(arg_t)) : 32;
+            const char *suffix = (w > 32) ? "ll" : "";
+            bool is_ctz = (nlen == 3 && memcmp(name, "ctz", 3) == 0);
+            bool is_clz = (nlen == 3 && memcmp(name, "clz", 3) == 0);
+            if (is_ctz || is_clz) {
+                /* AST emission is reachable from global initializers (file scope) where
+                 * GCC statement expressions are not allowed. Use a conditional expression
+                 * which double-evaluates the arg — safe for globals (constant expr) and
+                 * matches the IR-path semantics: ctz(0)/clz(0) → bit-width. */
+                emit(e, "(uint32_t)(((");
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ") == 0) ? %d : __builtin_%.*s%s(", w, (int)nlen, name, suffix);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, "))");
+            } else {
+                emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
+            }
         } else {
             emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
         }
@@ -6099,6 +6150,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         bool idx_array = idx_obj_eff && idx_obj_eff->kind == TYPE_ARRAY;
         bool idx_se = expr_has_side_effects(node->index_expr.index);
         bool obj_se = expr_has_side_effects(node->index_expr.object);
+        /* BUG-749 (2026-06-18): a volatile read in the index expression
+         * must single-eval, exactly like a CALL/INTRINSIC. Without this
+         * check, a fixed-array index of the form `arr[reg.status]` (with
+         * volatile field) emits `_zer_bounds_check((size_t)(reg->status),
+         * 16, ...) , arr)[reg->status]` — two C-level loads of the same
+         * volatile location. Side-effects (read-clear, FIFO, sequence
+         * counter) get duplicated; on baremetal the second read sees a
+         * different value or pops a second entry. expr_is_volatile spans
+         * the field chain; OR it in to route through the single-eval
+         * statement-expression branch. */
+        if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
+        if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;

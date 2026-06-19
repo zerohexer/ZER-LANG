@@ -380,6 +380,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
  * Prevents BUG-502 class: compound key path was missing compound op check. */
 static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
                                        TokenType op, Node *value);
+static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
 
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
@@ -6464,6 +6465,50 @@ static Type *check_expr(Checker *c, Node *node) {
             check_expr(c, node->intrinsic.args[i]);
         }
 
+        /* BH-18 #14: arity validation for the conversion/layout intrinsic family.
+         * Pre-fix these accepted any arg count and either silently dropped extras
+         * (`@truncate(u8, 5, 6, 7)` → 5) or emitted invalid C the user couldn't
+         * locate (`@truncate(u8)` → `(uint8_t)()`, GCC error mis-attributed).
+         * Each of these takes a type_arg + exactly one value (or zero values for
+         * @size, where the type itself is the arg).
+         *
+         * Family handled here:
+         *   @truncate / @saturate / @bitcast / @cast (T, val)
+         *   @inttoptr / @ptrcast / @pun           (*T, src)
+         *   @size                                  (T)            — 0 value args
+         *
+         * Sites already enforcing arity (@atomic_*, @offset, @container, the
+         * @cpu_* family) are unaffected. */
+        if (node->intrinsic.type_arg != NULL) {
+            int expected = -1;
+            const char *iname = NULL;
+            int inlen = 0;
+            if (nlen == 4 && memcmp(name, "size", 4) == 0) {
+                expected = 0; iname = "@size"; inlen = 5;
+            } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
+                expected = 1; iname = "@truncate"; inlen = 9;
+            } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
+                expected = 1; iname = "@saturate"; inlen = 9;
+            } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
+                expected = 1; iname = "@bitcast"; inlen = 8;
+            } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
+                expected = 1; iname = "@cast"; inlen = 5;
+            } else if (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) {
+                expected = 1; iname = "@inttoptr"; inlen = 9;
+            } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
+                expected = 1; iname = "@ptrcast"; inlen = 8;
+            } else if (nlen == 3 && memcmp(name, "pun", 3) == 0) {
+                expected = 1; iname = "@pun"; inlen = 4;
+            }
+            if (expected >= 0 && node->intrinsic.arg_count != expected) {
+                checker_error(c, node->loc.line,
+                    "%.*s expects %d argument%s after type, got %d",
+                    inlen, iname,
+                    expected, (expected == 1 ? "" : "s"),
+                    node->intrinsic.arg_count);
+            }
+        }
+
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
             /* BUG-231/320: reject @size(void) and @size(opaque) — no meaningful size.
              * Unwrap distinct first (BUG-320: distinct typedef void still has no size).
@@ -9909,10 +9954,45 @@ static void check_stmt(Checker *c, Node *node) {
                 node->kind == NODE_DO_WHILE ? "do-while" : "while",
                 type_name(cond));
         }
+
+        /* BUG-748 (2026-06-18): while/do-while body was checked under any
+         * outer init-range for variables it writes. `u32 i = 0;
+         * while (i < N) { arr[i] = ...; i += 1; }` saw `i` as still
+         * [0,0] inside the body, falsely proving arr[i] safe and
+         * dropping the auto-guard (silent stack OOB confirmed by ASan).
+         *
+         * For-loop already invalidates via its check_expr(step) call
+         * which runs vrp_invalidate_for_assign on the loop var BEFORE
+         * the body is checked. While has no step phase, so we mirror
+         * that here: walk the body for ident-assignments and widen
+         * their ranges first, then optionally push a narrow range from
+         * the cond (mirrors the for-loop pattern), then check body.
+         * saved_range_count restores after the loop. */
+        int saved_range_count = c->var_range_count;
+        vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
+
+        if (node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY) {
+            Node *wc = node->while_stmt.cond;
+            TokenType wop = wc->binary.op;
+            if (wc->binary.left->kind == NODE_IDENT) {
+                const char *lv = wc->binary.left->ident.name;
+                uint32_t lvl = (uint32_t)wc->binary.left->ident.name_len;
+                int64_t bv = eval_const_expr(wc->binary.right);
+                if (bv != CONST_EVAL_FAIL) {
+                    if (wop == TOK_LT) {
+                        push_var_range(c, lv, lvl, INT64_MIN, bv - 1, false);
+                    } else if (wop == TOK_LTEQ) {
+                        push_var_range(c, lv, lvl, INT64_MIN, bv, false);
+                    }
+                }
+            }
+        }
+
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
         check_stmt(c, node->while_stmt.body);
         c->in_loop = prev_in_loop;
+        c->var_range_count = saved_range_count;
         break;
     }
 
@@ -13284,6 +13364,70 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
         r->max_val = INT64_MAX;
         r->known_nonzero = false;
     }
+}
+
+/* BUG-748 (2026-06-18): pre-pass for while/do-while bodies that widens
+ * VRP ranges for any variable the body writes. For-loop's
+ * check_expr(step) does this naturally because the step expression is
+ * checked BEFORE the body. While has no separate step, so without this
+ * helper the body indexes (arr[i]) see the stale init range from before
+ * the loop and falsely prove safety. We only WIDEN existing ranges, we
+ * don't create them — variables without a prior range are unaffected.
+ *
+ * Implemented as if/else chain (not switch on ->kind) to keep the
+ * walker_default_audit.sh discipline: adding a `default:` to a switch
+ * on node->kind would mask future NodeKind additions. We dispatch only
+ * on the handful of node kinds that can CONTAIN an assignment as a
+ * subtree; assignments/calls inside other expression kinds are
+ * recursed via NODE_ASSIGN's RHS walk and NODE_EXPR_STMT.  */
+static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
+    if (!body) return;
+    NodeKind k = body->kind;
+    if (k == NODE_ASSIGN) {
+        Node *t = body->assign.target;
+        /* walk through field/index chains to root ident */
+        while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX)) {
+            if (t->kind == NODE_FIELD) t = t->field.object;
+            else t = t->index_expr.object;
+        }
+        if (t && t->kind == NODE_IDENT) {
+            vrp_invalidate_for_assign(c, t->ident.name,
+                (uint32_t)t->ident.name_len,
+                body->assign.op, body->assign.value);
+        }
+        /* RHS may also contain assignments (e.g., compound expr) */
+        vrp_invalidate_loop_body_writes(c, body->assign.value);
+    } else if (k == NODE_BLOCK) {
+        for (int i = 0; i < body->block.stmt_count; i++) {
+            vrp_invalidate_loop_body_writes(c, body->block.stmts[i]);
+        }
+    } else if (k == NODE_IF) {
+        vrp_invalidate_loop_body_writes(c, body->if_stmt.then_body);
+        vrp_invalidate_loop_body_writes(c, body->if_stmt.else_body);
+    } else if (k == NODE_FOR) {
+        vrp_invalidate_loop_body_writes(c, body->for_stmt.init);
+        vrp_invalidate_loop_body_writes(c, body->for_stmt.step);
+        vrp_invalidate_loop_body_writes(c, body->for_stmt.body);
+    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        vrp_invalidate_loop_body_writes(c, body->while_stmt.body);
+    } else if (k == NODE_SWITCH) {
+        for (int i = 0; i < body->switch_stmt.arm_count; i++) {
+            vrp_invalidate_loop_body_writes(c, body->switch_stmt.arms[i].body);
+        }
+    } else if (k == NODE_EXPR_STMT) {
+        vrp_invalidate_loop_body_writes(c, body->expr_stmt.expr);
+    } else if (k == NODE_DEFER) {
+        vrp_invalidate_loop_body_writes(c, body->defer.body);
+    } else if (k == NODE_CRITICAL) {
+        vrp_invalidate_loop_body_writes(c, body->critical.body);
+    } else if (k == NODE_ONCE) {
+        vrp_invalidate_loop_body_writes(c, body->once.body);
+    }
+    /* All other NodeKind values: no assignment subtree to widen.
+     * Calls do not write the caller's locals (the callee's analysis
+     * owns its own ranges). VAR_DECL inner inits shadow rather than
+     * widen the outer range.  RETURN/BREAK/CONTINUE/GOTO/LABEL/YIELD/
+     * AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */

@@ -1,0 +1,24 @@
+// BUG-748 (2026-06-18): while/do-while body was checked under the
+// OUTER init-range of any variable it writes. `u32 i = 0; while (i < N)
+// { arr[i] = ...; i += 1; }` saw `i` as still [0,0] inside the body,
+// falsely proving arr[i] safe and DROPPING the auto-guard — silent
+// stack OOB (confirmed by ASan pre-fix).
+//
+// For-loop's check_expr(step) widened the loop-var's range as a side
+// effect; while has no step phase. Fix: pre-pass invalidates ranges
+// for vars the body writes, then optional cond-narrow push.
+//
+// Expected post-fix: warning fires + auto-guard inserted so the
+// program early-returns instead of overflowing. Exit 0 is the
+// auto-guard early-return; pre-fix this exited 0 too but corrupted
+// stack memory — only ASan caught it. Verification of the WARNING is
+// in the test_zer.sh warn_check section.
+u32 main() {
+    u32 i = 0;
+    u32[5] arr;
+    while (i < 10) {
+        arr[i] = 99;
+        i += 1;
+    }
+    return 0;
+}

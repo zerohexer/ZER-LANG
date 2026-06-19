@@ -2737,6 +2737,38 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         break;
                     }
+                    /* BH-19 #1 (2026-06-19): parity with Gap 38 (Handle path).
+                     * Bodied ZER factory returning `?*T` from a fused
+                     * `*T h = factory() orelse return;` — orelse-wrapped
+                     * IR_ASSIGN's expr is NODE_ORELSE, so the regular
+                     * IR_CALL/IR_ASSIGN-NODE_CALL handlers below don't see it.
+                     * Pre-fix, only TYPE_HANDLE returns (Gap 38) and extern
+                     * `?*T` allocs (GAP-B) were registered here; bodied ZER
+                     * factories returning `?*T` silently fell through, leaving
+                     * the destination untracked. Subsequent free + free was
+                     * accepted (asymmetric: the `?Handle` factory variant
+                     * caught it). Mirror Gap 38: register ALIVE+escaped so
+                     * FREED transitions fire while leak-at-exit doesn't
+                     * (caller commonly hands ownership to a destructor).
+                     * Repro: tests/zer_fail/bh19_factory_alloc_ptr_*.zer */
+                    if (eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_OPAQUE) &&
+                        rhs && rhs->kind == NODE_CALL) {
+                        IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
+                        if (h) {
+                            if (h->state == IR_HS_ALIVE &&
+                                !func->locals[inst->dest_local].is_temp) {
+                                ir_zc_error(zc, inst->source_line,
+                                    "handle %%%d overwritten while alive — previous leaked",
+                                    inst->dest_local);
+                            }
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->source_color = ZC_COLOR_UNKNOWN;
+                            h->escaped = true;
+                        }
+                        break;
+                    }
                 }
             }
             /* If source is an ident that's a tracked handle, create alias */

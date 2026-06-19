@@ -5,6 +5,56 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-19c — 5 daily-review fixes reimplemented (BH-18 #11/#14, BH-19 #1, BUG-748, BUG-749)
+
+Five fixes from the daily-review branches (`x9otrk`, `67x4go`), independently
+verified legit (bug real on baseline + fix effective + no over-rejection, each
+re-run in a container) and reimplemented under our authorship. All landed on top
+of the keep auto-inference work; full `make check` green.
+
+- **BH-18 #11 — bit-query/byte-swap intrinsics emit `0` in global initializers
+  (miscompile).** `u32 g = @popcount(255);` → `g == 0`. Root cause: the AST
+  `NODE_INTRINSIC` emitter path (used for global initializers) had no handler for
+  `@popcount/@ctz/@clz/@ffs/@parity/@bswap16/32/64`, falling through to the
+  `/* @X — unknown */0` placeholder; only the IR path handled them. Fix
+  (emitter.c emit_expr AST path): add the handlers, mirroring the IR path
+  (ctz/clz use a `((x)==0)?width:__builtin_ctz` conditional — constant-context
+  safe). Test: `tests/zer/bh18_11_bitquery_global_init.zer`.
+
+- **BH-18 #14 — conversion/layout intrinsic arity not validated (diagnostic).**
+  `@truncate(u8,5,6,7)` silently dropped extras; `@truncate(u8)` passed the
+  checker and emitted invalid C. Fix (checker.c check_expr): exact-arity table
+  for `@truncate/@saturate/@bitcast/@cast/@inttoptr/@ptrcast/@pun` (1 value arg)
+  and `@size` (0), leaving `@atomic_*/@offset/@container/@cpu_*` untouched.
+
+- **BH-19 #1 — bodied `?*T` factory free-tracking gap (soundness).** A bodied
+  ZER factory returning `?*T` consumed via `*T h = factory() orelse return;`
+  (fused NODE_ORELSE IR_ASSIGN) left the dest UNTRACKED, so double-free / UAF was
+  accepted (asymmetric: the `?Handle` factory variant was caught). Fix
+  (zercheck_ir.c, parity with Gap 38): register the dest ALIVE+escaped so FREED
+  transitions fire while leak-at-exit doesn't. Tests:
+  `tests/zer_fail/bh19_factory_alloc_ptr_{uaf,double_free}.zer`.
+
+- **BUG-748 — while/do-while body checked under stale outer init-range
+  (soundness).** `u32 i=0; u32[5] arr; while(i<N){ arr[i]=X; i+=1; }` saw `i` as
+  still `[0,0]` inside the body, falsely proving `arr[i]` safe and dropping the
+  auto-guard → silent stack OOB (ASan-confirmed). For-loops were safe because
+  `check_expr(step)` invalidates the range before the body. Fix (checker.c):
+  `vrp_invalidate_loop_body_writes` widens VRP ranges for vars the body writes +
+  a cond-narrow push, mirroring the for-loop. Tests:
+  `tests/zer/{while,dowhile}_vrp_autoguard.zer`.
+
+- **BUG-749 — volatile field-read in an array index emitted as TWO C-level loads
+  (soundness/MMIO).** `arr[reg.status]` with `reg: *MMIO`, `status: volatile u32`
+  emitted `reg->status` twice (bounds-check operand + index) → read-clear/FIFO/
+  sequence MMIO registers read twice. Fix (emitter.c): extend `expr_is_volatile`
+  to unwrap pointer/optional for `ptr.field` auto-deref, and OR a volatile index
+  into the single-eval statement-expression branch. New `->kind == TYPE_` sites
+  added to `tools/type_dispatch_baseline.txt`. Test:
+  `tests/zer/vol_field_index_single_eval.zer`.
+
+---
+
 ## Session 2026-06-19b — build hygiene: `make clean` left `src/safety/*.o` (stale-object phantom-bug class)
 
 **What broke:** a corrupt `src/safety/comptime_rules.o` (from an OOM-interrupted

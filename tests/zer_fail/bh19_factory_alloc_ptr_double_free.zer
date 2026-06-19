@@ -1,0 +1,19 @@
+// BH-19 #1: cross-function `?*T` factory return defeated double-free
+// detection. Pre-fix, the orelse-decomp IR_ASSIGN handler only registered
+// pointer returns for EXTERN allocs; bodied ZER factories returning ?*T
+// fell through. Asymmetric with the ?Handle factory variant (Gap 38).
+// Must reject `gp.free_ptr(h); gp.free_ptr(h);` as double-free.
+struct Task { u32 id; }
+Slab(Task) gp;
+
+?*Task factory() {
+    *Task p = gp.alloc_ptr() orelse return;
+    return p;
+}
+
+u32 main() {
+    *Task h = factory() orelse return;
+    gp.free_ptr(h);
+    gp.free_ptr(h);
+    return 0;
+}

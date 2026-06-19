@@ -1,0 +1,21 @@
+// BH-18 #11: bit-query / byte-swap intrinsics in global initializer.
+// Pre-fix the AST path fell through to an unknown-intrinsic placeholder
+// (literal 0), miscompiling every global initialized by these intrinsics.
+// Mirrors the IR-path handlers so global init matches function-body emission.
+
+u32 g_pop = @popcount(255);
+u32 g_bswap = @bswap32(1);
+u32 g_ctz0 = @ctz(0);
+u32 g_clz0 = @clz(0);
+u32 g_parity = @parity(7);
+u32 g_ffs = @ffs(16);
+
+u32 main() {
+    if (g_pop != 8) { return 1; }
+    if (g_bswap != 16777216) { return 2; }
+    if (g_ctz0 != 32) { return 3; }
+    if (g_clz0 != 32) { return 4; }
+    if (g_parity != 1) { return 5; }
+    if (g_ffs != 5) { return 6; }
+    return 0;
+}

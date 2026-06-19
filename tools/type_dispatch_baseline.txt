@@ -660,3 +660,6 @@ checker.c:itv->kind == TYPE_OPTIONAL) {
 checker.c:if (tv && itv && tv->kind == TYPE_POINTER && itv->kind == TYPE_POINTER &&
 checker.c:while (tgv && vgv && tgv->kind == TYPE_OPTIONAL && vgv->kind == TYPE_OPTIONAL) {
 checker.c:if (tgv && vgv && tgv->kind == TYPE_POINTER && vgv->kind == TYPE_POINTER &&
+emitter.c:if (eff && eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+emitter.c:if (eff && eff->kind == TYPE_OPTIONAL) eff = type_unwrap_distinct(eff->optional.inner);
+emitter.c:if (eff && eff->kind == TYPE_STRUCT) {

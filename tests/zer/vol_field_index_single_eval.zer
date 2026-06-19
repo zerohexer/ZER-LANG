@@ -1,0 +1,26 @@
+// BUG-749 (2026-06-18): array indexing by a volatile field-read
+// `arr[reg.status]` emitted `_zer_bounds_check(reg->status, ...),
+// arr)[reg->status]` — duplicate C-level loads of the same volatile
+// location. For MMIO read-clear / FIFO / sequence-counter registers
+// the second read sees a different value or pops a second entry =
+// silent program-consequence violation (volatile semantics demand
+// exactly one C-level load per source read).
+//
+// Fix: expr_is_volatile now unwraps pointer/optional to reach the
+// struct, and the IR-rewritten index emitter ORs expr_is_volatile
+// into idx_se/obj_se so the side-effect path (statement-expression
+// with temp) is taken — one volatile read into the temp, bounds-
+// check on the temp, index by the temp.
+//
+// This test uses a stack volatile to avoid needing real MMIO at run
+// time. The fix is symmetric (single-eval applies to any volatile
+// read in the index position).
+struct Reg { volatile u32 status; }
+u32 main() {
+    Reg reg = { .status = 2 };
+    u32[8] arr;
+    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;
+    // post-fix: single load into a temp, bounds-check + index from temp.
+    u32 v = arr[reg.status];
+    return v - 30;
+}

@@ -1,0 +1,17 @@
+// BH-19 #1: same factory pattern, UAF variant. Caller frees the returned
+// pointer then dereferences. Pre-fix, silently accepted because the
+// bodied factory's ?*T return wasn't registered as a tracked allocation.
+struct Task { u32 id; }
+Slab(Task) gp;
+
+?*Task factory() {
+    *Task p = gp.alloc_ptr() orelse return;
+    return p;
+}
+
+u32 main() {
+    *Task h = factory() orelse return;
+    gp.free_ptr(h);
+    h.id = 99;
+    return 0;
+}

@@ -1,15 +1,19 @@
 /* test_keep_matrix.c — keep-axis soundness oracle (2026-06-07).
  *
  * Companion to test_escape_matrix.c. The escape matrix covers LOCAL-pointer
- * escapes; this covers the KEEP axis: a NON-KEEP pointer parameter persisted
- * into a long-lived sink (global / param-field / nested-field) violates the
- * non-keep contract ("non-keep = won't be stored persistently") and must be
- * rejected — the fix is `keep p`, verified at the call site.
+ * escapes; this covers the KEEP axis. Since the 2026-06-19 keep auto-inference,
+ * a pointer parameter persisted into a long-lived sink (global / param-field /
+ * nested-field) INFERS keep — the function compiles clean — and the unsafe case
+ * is rejected at the CALL SITE when a stack-local is passed to the now-keep
+ * param. So each NEG cell calls esc_fn(&local) and expects that call to be
+ * rejected for the keep reason (the safety boundary moved from the function to
+ * the call site; the property is identical, just enforced at the call).
  *
  * TWO cell kinds (the keep axis has an escape valve, so positives matter):
- *   - NEGATIVE: a NON-keep param persisted (possibly laundered: alias, @ptrcast,
- *     call-result) MUST be rejected FOR THE KEEP REASON. A cell compiling clean
- *     = false negative = unsafe persistence the analyzer missed.
+ *   - NEGATIVE: a non-keep param persisted (possibly laundered: alias, @ptrcast,
+ *     call-result) infers keep; the cell then CALLS esc_fn with &local, which
+ *     MUST be rejected FOR THE KEEP REASON at the call site. The call compiling
+ *     clean = false negative = unsafe persistence the analyzer missed.
  *   - POSITIVE: the `keep` escape valve — a KEEP param persisted (direct, alias,
  *     @ptrcast) MUST compile. A rejection here = over-rejection of legit keep
  *     code (the keep valve is broken).
@@ -178,7 +182,21 @@ static void gen(KSink s, KLaunder l, KKind k, char *buf, size_t n) {
         case KSINK_COUNT: func[0] = 0; break;
     }
 
-    snprintf(buf, n, "%s%s%si32 main() { return 0; }\n", decls, glob, func);
+    /* keep auto-inference (2026-06-19): a non-keep param persisted into a sink
+     * now INFERS keep (the function compiles clean); the unsafe case is rejected
+     * at the CALL SITE when a stack-local is passed. NEG cells therefore call
+     * esc_fn with &local and expect the call-site keep rejection. POS cells just
+     * exercise the keep valve (the function compiles, no call needed). */
+    char call[176]; call[0] = 0;
+    if (k == KK_NEG) {
+        switch (s) {
+            case KS_GLOBAL:       snprintf(call, sizeof(call), "u32 loc = 0; esc_fn(&loc);"); break;
+            case KS_PARAM_FIELD:  snprintf(call, sizeof(call), "Holder hh; u32 loc = 0; esc_fn(&hh, &loc);"); break;
+            case KS_NESTED_FIELD: snprintf(call, sizeof(call), "Outr oo; u32 loc = 0; esc_fn(&oo, &loc);"); break;
+            case KSINK_COUNT: break;
+        }
+    }
+    snprintf(buf, n, "%s%s%si32 main() { %s return 0; }\n", decls, glob, func, call);
 }
 
 int main(void) {

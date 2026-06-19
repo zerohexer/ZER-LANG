@@ -219,6 +219,7 @@ struct Symbol {
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
     bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
     bool is_nonkeep_derived; /* pointer traces to a non-keep param — cannot be persisted (keep axis) */
+    int nonkeep_root_param;  /* keep inference: index of the param this pointer traces to (valid only when is_nonkeep_derived) */
     bool is_keep_derived;   /* pointer traces to a KEEP param — a borrow; storing into a struct field requires a 'keep' field (field-level keep, Rust &'a analog) */
     bool is_thread_handle;  /* ThreadHandle from scoped spawn — must call .join() */
 

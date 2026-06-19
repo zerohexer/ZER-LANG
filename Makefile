@@ -208,7 +208,7 @@ demo_lexer: main.c lexer.c
 
 # ---- Clean ----
 clean:
-	rm -f zerc zerc.exe zer-lsp zer-lsp.exe *.o \
+	rm -f zerc zerc.exe zer-lsp zer-lsp.exe *.o src/safety/*.o \
 	      test_lexer test_lexer.exe \
 	      test_parser test_parser.exe \
 	      test_parser_edge test_parser_edge.exe \

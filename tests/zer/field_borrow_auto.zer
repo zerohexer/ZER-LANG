@@ -1,0 +1,18 @@
+// keep inference Site 2 (2026-06-19): storing a keep-derived borrow into a
+// non-keep struct field is now ACCEPTED (no `keep` field needed). The borrow is
+// provably static — every caller of `fill`'s keep param must pass static/global —
+// so it is safe in any field. (Was tests/zer_fail/keep_field_required.zer.)
+struct Holder { ?*u32 hp; }
+u32 g_static_src = 7;
+void fill(*Holder h, keep *u32 p) { h.hp = p; }
+u32 main() {
+    Holder hh;
+    fill(&hh, &g_static_src);
+    // verify the keep borrow was stored into the (non-keep) field and is readable;
+    // exit 0 on success (tests/zer positives must exit 0).
+    if (hh.hp) |pp| {
+        if (*pp == 7) { return 0; }
+        return 1;
+    }
+    return 2;
+}

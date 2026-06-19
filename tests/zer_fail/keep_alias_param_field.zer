@@ -1,10 +1,11 @@
 // EXPECTED: compile error
-// keep-axis oracle (BUG-721, 2026-06-07): a non-keep pointer param aliased
-// through a local, then persisted into a pointer-param's field, must be rejected.
-// The non-keep-ness propagates to the alias via is_nonkeep_derived. Fix: keep p.
+// keep inference (Site 1, 2026-06-19): a non-keep pointer param aliased through
+// a local and persisted into a pointer-param field is INFERRED keep (the escape
+// is detected). The safety boundary is now the CALL SITE: passing &local for p
+// is rejected because p is inferred keep. (Was: error at the body demanding keep.)
 struct Holder { ?*u32 hp; }
 void store(*Holder h, *u32 p) {
     *u32 q = p;
     h.hp = q;
 }
-i32 main() { return 0; }
+u32 main() { Holder hh; u32 loc; store(&hh, &loc); return 0; }

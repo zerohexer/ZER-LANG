@@ -1,10 +1,6 @@
 // EXPECTED: compile error
-// keep-universalization 2a (2026-06-07): a NON-keep pointer parameter stored
-// into another pointer-parameter's field violates the non-keep contract (the
-// param's pointee may not outlive the caller's struct). Previously caught only
-// for global sinks (BUG-440); now caught for param-field sinks too. Fix: `keep p`.
+// keep inference (Site 1): a non-keep pointer param stored into a pointer-param's
+// field infers keep on the param. Passing &local is rejected at the call site.
 struct Holder { ?*u32 hp; }
-void store(*Holder h, *u32 p) {
-    h.hp = p;
-}
-i32 main() { return 0; }
+void store(*Holder h, *u32 p) { h.hp = p; }
+u32 main() { Holder hh; u32 loc; store(&hh, &loc); return 0; }

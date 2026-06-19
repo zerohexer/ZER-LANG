@@ -1,14 +1,8 @@
 // EXPECTED: compile error
-// keep axis, struct-copy launder (hole A, 2026-06-07): a non-keep pointer param
-// stored into a LOCAL struct's field, then the whole struct copied to a global,
-// persists the borrow into the global (dangles when the caller's pointee dies).
-// The struct inherits is_nonkeep_derived via the field store; the persist check
-// now fires on STRUCT/UNION values, not just bare pointers. Fix: `keep *u32 p`.
+// keep inference (Site 1): a non-keep pointer param stored into a local struct's
+// field, then the struct copied to a global, infers keep on the param (the struct
+// carrier propagates the root). Passing &local is rejected at the call site.
 struct Box { ?*u32 slot; }
 Box g_box;
-void stash(*u32 p) {
-    Box local;
-    local.slot = p;
-    g_box = local;
-}
-i32 main() { return 0; }
+void stash(*u32 p) { Box local; local.slot = p; g_box = local; }
+u32 main() { u32 loc; stash(&loc); return 0; }

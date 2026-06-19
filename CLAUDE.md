@@ -1434,7 +1434,7 @@ Failure to include these rules causes agents to write invalid ZER (e.g., using i
 | 16 | **Non-Storable** | `pool.get()` result — can't be stored in variables |
 | 19 | **MMIO Ranges** | Declared valid address ranges — `@inttoptr` validation |
 | 20 | **Qualifier Tracking** | `is_volatile`, `is_const` — prevent stripping through casts |
-| 21 | **Keep Parameters** | `is_keep` — pointer param can be stored in globals |
+| 21 | **Keep Parameters** | `is_keep` — pointer param retained beyond the call. **INFERRED since 2026-06-19** (no annotation needed; keyword optional). Escape sites infer it; a post-body fixpoint (`check_keep_inference`) propagates transitively + enforces at call sites. See BUGS-FIXED.md 2026-06-19 + docs/reference.md "keep parameters". |
 
 ### Infrastructure (not safety models — supports the 4 models above)
 | # | System | Purpose |
@@ -1736,7 +1736,7 @@ After implementing any feature, test these interactions:
 14. Any new coercion must work in ALL 4 value-flow sites: var-decl init, assignment, call args, return (BUG-419)
 15. Feature + `@critical` — control flow banned inside (return/break/continue/goto skip interrupt re-enable)
 16. Feature + `defer` + `return expr` — return expression must evaluate BEFORE defers fire (BUG-442). Test: `defer free(h); return h.field;` must work (not UAF)
-17. Feature + `keep` parameter — non-keep pointer params cannot be stored in global/static (BUG-440). Test: function storing param to global without `keep` must error
+17. Feature + `keep` parameter — keep is INFERRED (2026-06-19): a function storing a pointer param to a global/static/param-field now *infers* keep (compiles), and the safety boundary is the CALL SITE: passing `&local`/arena/local-slice to such a function must error. Test the call-site rejection, not a body error. Transitive too (`outer(p){inner(p)}` with inner keep → outer's p keep → `outer(&local)` rejected).
 
 ### Write Real Code After Implementing Features — MANDATORY
 

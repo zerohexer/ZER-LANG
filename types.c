@@ -312,10 +312,13 @@ bool type_equals(Type *a, Type *b) {
         for (uint32_t i = 0; i < a->func_ptr.param_count; i++) {
             if (!type_equals(a->func_ptr.params[i], b->func_ptr.params[i]))
                 return false;
-            /* keep mismatch: if source has keep, target must too */
-            bool a_keep = a->func_ptr.param_keeps && a->func_ptr.param_keeps[i];
-            bool b_keep = b->func_ptr.param_keeps && b->func_ptr.param_keeps[i];
-            if (a_keep != b_keep) return false;
+            /* keep flags are NOT compared (keep inference, 2026-06-19): a function-
+             * pointer CALL worst-cases ALL pointer params as keep regardless of the
+             * type's flags (checker.c call-site logic), so the funcptr type's keep
+             * bits are irrelevant to safety. With inference many functions become
+             * keep; comparing the bits here would spuriously reject assigning an
+             * inferred-keep function to a plain funcptr type. Dropping the check is
+             * sound (worst-case keep at the call covers every case) and necessary. */
         }
         return true;
 

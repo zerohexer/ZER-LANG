@@ -1914,6 +1914,65 @@ checker handlers (reject too-few AND too-many), matching `@atomic_load`'s
 
 ---
 
+## CLOSED — keep transitivity through a function-POINTER forward (2026-06-19)
+
+Initially left open, then **closed the same day** (option B). `keep_edge_propagates`
+now worst-cases EVERY pointer param of a funcptr call (it just calls
+`keep_edge_callee_keeps`), so forwarding a param to ANY funcptr — direct funcptr
+param, global funcptr, or stored callback — infers keep on the forwarded param.
+A stack pointer therefore can never reach a retaining callback via a forwarder;
+`invoke(&local, retaining_cb)` is rejected. This makes a *forward through* a
+funcptr consistent with a *direct* funcptr call (`fn(&local)` was already
+rejected), closing the funcptr-forwarding hole to **100% soundness** for the
+keep/escape property.
+
+**Cost (measured, tiny):** a read-only callback called with a STACK-local context
+is now also rejected (`compute(&local_ctx, reader)`) — use a long-lived context.
+This restricts exactly ONE pattern across the whole suite
+(`rust_tests/rt_opaque_provenance_chain.zer`, updated to a global context). The
+precise alternative (resolve the concrete callback's inferred keep per call site
+via a forwarding summary — preserves the read-only-stack-local idiom) was judged
+not worth ~150 lines to save one rare pattern; revisit if it bites in practice.
+
+---
+
+## CLOSED — "semantic-fuzzer flake / expr-nesting-too-deep" was a STALE corrupt `.o`, not a code bug (2026-06-19)
+
+**This corrects a misdiagnosis.** A prior note here blamed an "uninitialized-read
+UB" for the `make zerc` build spuriously rejecting trivial programs with
+`error: expression nesting too deep (limit 1000)` (semantic fuzzer ~165/200).
+That was WRONG — the compiler source is fine.
+
+**Real root cause:** a stale, MISCOMPILED `src/safety/comptime_rules.o` left in
+the working tree (dated 2026-06-06, gitignored). In that object,
+`zer_expr_nesting_valid` read its argument from register `%ecx` instead of
+`%edi` (wrong calling convention), so it received stale garbage instead of the
+nesting depth and rejected ~80% of programs. The `.c` source is OLDER than the
+bad `.o`, so `make` saw the object as up-to-date and never rebuilt it. The
+corrupt object almost certainly came from an OOM-interrupted / corrupted build
+on 2026-06-06.
+
+**Why it looked layout/`vrp_ir`-dependent:** any build path that RECOMPILES
+`comptime_rules.c` — a single-`gcc` invocation, the `vrp_ir`-linked dev build, a
+fresh `git archive` checkout, normal CI — produced a correct object (reads
+`%edi`) → 200/200. Only builds that REUSED the stale object failed. "Baseline
+fails identically" was true precisely because baseline reused the SAME stale
+object.
+
+**Fix (done):** (1) `rm -f *.o src/safety/*.o` clears the corrupt object;
+(2) the Makefile `clean:` target now removes `src/safety/*.o` (it previously
+removed only top-level `*.o`, which let the bad object survive every
+`make clean`). Verified: fresh `make zerc` → `zer_expr_nesting_valid` reads
+`%edi`, semantic fuzzer 200/200, full `make check` green.
+
+**Lesson for future sessions:** if a `make`-built `zerc` spuriously rejects
+trivial programs but a `git archive` / single-`gcc` build of the SAME source
+passes, suspect a stale `src/safety/*.o` FIRST — `objdump -d src/safety/<x>.o`
+and check which register the function reads its argument from. Don't chase a
+Heisenbug in the source.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

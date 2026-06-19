@@ -1849,13 +1849,17 @@ static void test_negative_sweep(void) {
     ok("u8[@size(usize)] buf;\nu32 main() { return 0; }",
        "@size(usize) as array size accepted (sizeof-based)");
 
-    /* BUG-277: keep in function pointer types */
-    err("void store(keep *u32 p) { }\n"
-        "u32 main() {\n"
-        "    void (*fn)(*u32) = store;\n"
-        "    return 0;\n"
-        "}",
-        "keep func to non-keep func ptr rejected (type mismatch)");
+    /* keep inference (Site 1, 2026-06-19): assigning a keep function to a
+     * non-keep funcptr type is now ACCEPTED. A funcptr CALL worst-cases all
+     * pointer params as keep regardless of the type's flags, so the flags are
+     * irrelevant to safety and comparing them in type_equals was over-strict
+     * (it would also spuriously reject inferred-keep functions). */
+    ok("void store(keep *u32 p) { }\n"
+       "u32 main() {\n"
+       "    void (*fn)(*u32) = store;\n"
+       "    return 0;\n"
+       "}",
+       "keep func to non-keep func ptr now accepted (worst-case keep at call)");
     err("void store(keep *u32 p) { }\n"
         "u32 main() {\n"
         "    u32 x = 5;\n"

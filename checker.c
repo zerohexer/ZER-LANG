@@ -859,31 +859,10 @@ static void classify_escape_sink(Checker *c, Node *target,
     }
 }
 
-/* field-level keep (2026-06-07): given an assignment target `obj.field`
- * (NODE_FIELD, possibly nested / through index), resolve the SField being
- * assigned and report whether it is declared `keep`. Returns 1 if the target is
- * a struct field (and sets *is_keep_field to the field's keep flag), 0 if the
- * target is not a plain struct field (global var, slice, etc.). Uses the cached
- * type of the object (typemap) — no re-check, no side effects. */
-static int target_struct_field_keep(Checker *c, Node *target, bool *is_keep_field) {
-    *is_keep_field = false;
-    if (!target || target->kind != NODE_FIELD) return 0;
-    Type *obj = typemap_get(c, target->field.object);
-    if (type_dispatch_kind(obj) == TYPE_POINTER)
-        obj = type_unwrap_distinct(obj)->pointer.inner;
-    if (type_dispatch_kind(obj) != TYPE_STRUCT) return 0;
-    obj = type_unwrap_distinct(obj);
-    const char *fname = target->field.field_name;
-    uint32_t flen = target->field.field_name_len;
-    for (uint32_t i = 0; i < obj->struct_type.field_count; i++) {
-        SField *f = &obj->struct_type.fields[i];
-        if (f->name_len == flen && memcmp(f->name, fname, flen) == 0) {
-            *is_keep_field = f->is_keep;
-            return 1;
-        }
-    }
-    return 0;
-}
+/* field-level keep: helper target_struct_field_keep REMOVED (Site 2, 2026-06-19).
+ * The field-keep store requirement it served is now auto (a keep-derived borrow
+ * is provably static via the keep-param call-site chain, so storing it into any
+ * field is safe). See the removed check in the NODE_ASSIGN handler. */
 
 /* BUG-374: recursively check if a call expression has any local-derived pointer
  * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
@@ -1051,6 +1030,104 @@ static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
     return false;
 }
 
+/* keep inference (Site 1, 2026-06-19): mark param `idx` of the function currently
+ * being checked as keep — it escapes (persisted into a global/sink) or is
+ * borrowed long-term. Writes the signature's param_keeps (the SAME Type* call
+ * sites resolve to), so callers get restricted to long-lived args. Idempotent. */
+static void infer_mark_param_keep(Checker *c, int idx) {
+    if (idx < 0 || !c->current_func_sig) return;
+    Type *sig = type_unwrap_distinct(c->current_func_sig);
+    if (!sig || sig->kind != TYPE_FUNC_PTR) return;
+    if (idx >= (int)sig->func_ptr.param_count || !sig->func_ptr.param_keeps) return;
+    sig->func_ptr.param_keeps[idx] = true;
+}
+
+/* keep inference: mirror of call_has_nonkeep_derived_arg, but instead of
+ * reporting, marks keep on the root param of every non-keep-derived argument —
+ * the launder case `g = idfn(p)` makes p escape, so p must become keep. */
+static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
+    if (!call || call->kind != NODE_CALL || depth > 8) return;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        Node *arg = call->call.args[i];
+        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
+            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        if (arg && arg->kind == NODE_IDENT) {
+            Symbol *src = scope_lookup(c->current_scope,
+                arg->ident.name, (uint32_t)arg->ident.name_len);
+            if (src && src->is_nonkeep_derived)
+                infer_mark_param_keep(c, src->nonkeep_root_param);
+        }
+        if (arg && arg->kind == NODE_CALL)
+            infer_keep_from_call_args(c, arg, depth + 1);
+    }
+}
+
+/* keep-arg short-lived-borrow classes (Site 1 deferred enforcement). KV_NONE =
+ * the arg is acceptable for a keep param (static/global/param/other). */
+enum { KV_NONE = 0, KV_LOCAL_ADDR, KV_LOCAL_DERIVED, KV_ARENA, KV_LOCAL_ARRAY, KV_SLICE_LOCAL };
+
+/* keep inference (Site 1): record one deferred keep edge for a call argument at a
+ * pointer-param position. Resolved in check_keep_inference after ALL bodies are
+ * checked (param_keeps is final only then — inline enforcement would be unsound
+ * for forward-referenced/cross-module callees and miss transitive escape). */
+static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
+                             bool is_fn_ptr_call, int violation_kind,
+                             const char *arg_name, uint32_t arg_name_len,
+                             int arg_pos, int line, Type *caller_sig, int caller_param_index) {
+    /* skip edges that can neither error (no violation) nor propagate (no caller param) */
+    if (violation_kind == KV_NONE && caller_param_index < 0) return;
+    if (!callee_sig) return;
+    if (c->keep_edge_count >= c->keep_edge_capacity) {
+        int ncap = c->keep_edge_capacity ? c->keep_edge_capacity * 2 : 64;
+        struct KeepEdge *nb = (struct KeepEdge *)arena_alloc(c->arena, ncap * sizeof(struct KeepEdge));
+        if (!nb) return;
+        if (c->keep_edges)
+            memcpy(nb, c->keep_edges, c->keep_edge_count * sizeof(struct KeepEdge));
+        c->keep_edges = nb;
+        c->keep_edge_capacity = ncap;
+    }
+    struct KeepEdge *e = &c->keep_edges[c->keep_edge_count++];
+    e->callee_sig = callee_sig;
+    e->param_index = param_index;
+    e->is_fn_ptr_call = is_fn_ptr_call;
+    e->violation_kind = violation_kind;
+    e->arg_name = arg_name;
+    e->arg_name_len = arg_name_len;
+    e->arg_pos = arg_pos;
+    e->line = line;
+    e->caller_sig = caller_sig;
+    e->caller_param_index = caller_param_index;
+}
+
+/* keep inference (Site 1, transitivity): walk a call argument to its root ident
+ * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
+ * non-keep caller param, return that param's index (so passing it to a keep
+ * callee position makes the caller param escape too). Else -1. */
+static int keep_arg_caller_root(Checker *c, Node *arg) {
+    Node *n = arg;
+    for (int guard = 0; n && guard < 64; guard++) {
+        switch (n->kind) {
+        case NODE_UNARY:     n = n->unary.operand; break;
+        case NODE_FIELD:     n = n->field.object; break;
+        case NODE_INDEX:     n = n->index_expr.object; break;
+        case NODE_SLICE:     n = n->slice.object; break;
+        case NODE_ORELSE:    n = n->orelse.expr; break;
+        case NODE_TYPECAST:  n = n->typecast.expr; break;
+        case NODE_INTRINSIC:
+            n = (n->intrinsic.arg_count > 0)
+                ? n->intrinsic.args[n->intrinsic.arg_count - 1] : NULL;
+            break;
+        case NODE_IDENT: {
+            Symbol *s = scope_lookup(c->current_scope,
+                n->ident.name, (uint32_t)n->ident.name_len);
+            return (s && s->is_nonkeep_derived) ? s->nonkeep_root_param : -1;
+        }
+        default: return -1;
+        }
+    }
+    return -1;
+}
+
 /* ---- Unified escape flag helpers (prevents BUG-421 class) ---- */
 
 /* Can this type carry a pointer? Only propagate escape flags to types that
@@ -1073,7 +1150,10 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_local_derived) dst->is_local_derived = true;
     if (src->is_arena_derived) dst->is_arena_derived = true;
     if (src->is_from_arena) dst->is_from_arena = true;
-    if (src->is_nonkeep_derived) dst->is_nonkeep_derived = true;
+    if (src->is_nonkeep_derived) {
+        dst->is_nonkeep_derived = true;
+        dst->nonkeep_root_param = src->nonkeep_root_param; /* keep inference: carry root param to aliases */
+    }
     if (src->is_keep_derived) dst->is_keep_derived = true;
 }
 
@@ -3829,62 +3909,29 @@ static Type *check_expr(Checker *c, Node *node) {
                      * to param-field sinks via classify_escape_sink. Fix is `keep`. */
                     Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                     classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
-                    bool is_direct_param = val_sym->func_node == NULL; /* params have no func_node */
-                    if ((tgt_global || tgt_param) && is_direct_param) {
-                        /* BUG-737: name the param kind honestly — by-value
-                         * struct/union params reach this sink too (GAP-8). */
-                        const char *g8_noun = (vk == TYPE_STRUCT || vk == TYPE_UNION)
-                            ? "struct parameter (carries pointer fields)"
-                            : "pointer parameter";
-                        checker_error(c, node->loc.line,
-                            tgt_param ?
-                            "cannot store non-keep %s '%.*s' through pointer "
-                            "parameter '%.*s' — add 'keep' qualifier to parameter '%.*s'" :
-                            "cannot store non-keep %s '%.*s' in "
-                            "global/static '%.*s' — add 'keep' qualifier to parameter '%.*s'",
-                            g8_noun,
-                            (int)val_sym->name_len, val_sym->name,
-                            (int)target_sym->name_len, target_sym->name,
-                            (int)val_sym->name_len, val_sym->name);
-                    } else if (tgt_global || tgt_param) {
-                        checker_error(c, node->loc.line,
-                            "cannot persist non-keep-derived pointer '%.*s' (aliases a "
-                            "non-keep parameter) — add 'keep' qualifier to the source parameter",
-                            (int)val_sym->name_len, val_sym->name);
+                    if (tgt_global || tgt_param) {
+                        /* keep inference (Site 1): a non-keep pointer/struct param
+                         * (or an alias of one) is persisted into a global/static or
+                         * a pointer-param sink — it ESCAPES, so it must be keep.
+                         * val_sym->nonkeep_root_param names the originating param
+                         * (its own index for a direct param; the propagated root for
+                         * an alias). Callers are then restricted at the call site. */
+                        infer_mark_param_keep(c, val_sym->nonkeep_root_param);
                     }
                 }
             }
         }
 
-        /* field-level keep (2026-06-07): storing a BORROW (a keep-param-derived
-         * pointer, or an alias of one) into a struct field requires the field to
-         * be declared 'keep' — the Rust `struct H<'a> { p: &'a T }` analog, so a
-         * field's borrow-ness is audit-visible at the data structure. Storing a
-         * borrow into an owned (non-keep) field is an error. Tightening only:
-         * owned/alloc pointers (not keep-derived) are unaffected; a store to a
-         * global is the canonical keep valve (not a field) and unaffected. */
-        if (node->assign.op == TOK_EQ && node->assign.target->kind == NODE_FIELD) {
-            Node *vnode = node->assign.value;
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
-            if (vnode && vnode->kind == NODE_IDENT) {
-                Symbol *val_sym = scope_lookup(c->current_scope,
-                    vnode->ident.name, (uint32_t)vnode->ident.name_len);
-                if (val_sym && val_sym->is_keep_derived) {
-                    bool field_is_keep = false;
-                    if (target_struct_field_keep(c, node->assign.target, &field_is_keep) &&
-                        !field_is_keep) {
-                        checker_error(c, node->loc.line,
-                            "cannot store borrowed pointer '%.*s' (a 'keep' parameter) "
-                            "into non-keep field '%.*s' — declare the field 'keep' to "
-                            "hold a borrow",
-                            (int)val_sym->name_len, val_sym->name,
-                            (int)node->assign.target->field.field_name_len,
-                            node->assign.target->field.field_name);
-                    }
-                }
-            }
-        }
+        /* field-level keep (Site 2, AUTO 2026-06-19): the requirement to declare
+         * a struct field `keep` before storing a borrow into it is REMOVED. A
+         * value that is keep-derived (is_keep_derived) traces to a `keep`
+         * parameter, and every caller of a keep parameter is forced (call-site
+         * check) to pass a static/global pointer — so the borrow is PROVABLY
+         * static and storing it into any field, regardless of field declaration,
+         * is memory-safe. The old error was audit-visibility only, not safety;
+         * inference makes `keep` annotation-free, so this nudge is dropped. The
+         * `keep` field keyword is still accepted (parsed) as an optional marker.
+         * (Verified: the keep-param chain rejects `fill(&local)`, proving static.) */
 
         /* keep axis (call-result launder): value is a (field/index of a) call with
          * a non-keep-derived pointer argument, stored at a persistent sink.
@@ -3905,9 +3952,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
                 if (tgt_global || tgt_param) {
-                    checker_error(c, node->loc.line,
-                        "cannot persist result of call with non-keep pointer argument — "
-                        "the result may trace to a non-keep parameter; add 'keep' to that parameter");
+                    /* keep inference (Site 1): `sink = idfn(p)` persists a value that
+                     * launders a non-keep param p — p escapes, so mark p keep. */
+                    infer_keep_from_call_args(c, vroot, 0);
                 }
             }
         }
@@ -5108,24 +5155,24 @@ static Type *check_expr(Checker *c, Node *node) {
                     !scope_lookup(c->current_scope,
                         node->call.callee->ident.name,
                         (uint32_t)node->call.callee->ident.name_len)->is_function);
-                if (effective_callee->func_ptr.param_keeps || is_fn_ptr_call) {
+                {
                     for (int i = 0; i < (int)effective_callee->func_ptr.param_count &&
                          i < node->call.arg_count; i++) {
-                        /* auto-keep: fn ptr calls treat ALL pointer params as keep */
-                        bool param_is_keep = false;
-                        if (effective_callee->func_ptr.param_keeps &&
-                            effective_callee->func_ptr.param_keeps[i]) {
-                            param_is_keep = true;
-                        } else if (is_fn_ptr_call) {
-                            Type *pt = effective_callee->func_ptr.params[i];
-                            Type *ptu = type_unwrap_distinct(pt);
-                            if (ptu && ptu->kind == TYPE_POINTER) param_is_keep = true;
-                        }
-                        if (!param_is_keep) continue;
-                        /* keep param: arg must be static/global, not local.
-                         * BUG-339: also check orelse fallback for &local.
-                         * BUG-338: walk into intrinsics for &local. */
+                        /* keep inference (Site 1, deferred 2026-06-19): record a keep
+                         * edge for every pointer-arg position. Enforcement + the
+                         * transitive-escape fixpoint run in check_keep_inference after
+                         * ALL bodies are checked (param_keeps is final only then).
+                         * The arg's short-lived-borrow class and its root caller param
+                         * are captured here with live scope; the detection logic below
+                         * is the SAME as the old inline check, redirected to edge_vkind.
+                         * NO param-type gate: keep applies to pointer/slice/opaque AND
+                         * optional-of-pointer (?*T) AND by-value struct/union carrying
+                         * pointers. Non-pointer params yield KV_NONE + no caller root,
+                         * which record_keep_edge drops — so recording all params is
+                         * free and correct (matches the old un-gated inline behaviour). */
                         Node *arg_node = node->call.args[i];
+                        int edge_vkind = KV_NONE;
+                        const char *edge_argname = NULL; uint32_t edge_argname_len = 0;
                         /* unwrap orelse — check all branches recursively
                          * BUG-370: nested orelse chains: a orelse b orelse &x
                          * Stage 3 (2026-04-28): stack-first dynamic — fixed
@@ -5185,12 +5232,10 @@ static Type *check_expr(Checker *c, Node *node) {
                                         is_global = scope_lookup_local(c->global_scope, mk, mkl) != NULL;
                                     }
                                 }
-                                if (!is_global) {
-                                    checker_error(c, node->loc.line,
-                                        "argument %d: local variable '%.*s' cannot "
-                                        "satisfy 'keep' parameter — must be static or global",
-                                        i + 1,
-                                        (int)arg_sym->name_len, arg_sym->name);
+                                if (!is_global && edge_vkind == KV_NONE) {
+                                    edge_vkind = KV_LOCAL_ADDR;
+                                    edge_argname = arg_sym->name;
+                                    edge_argname_len = arg_sym->name_len;
                                 }
                             }
                         }
@@ -5256,29 +5301,23 @@ static Type *check_expr(Checker *c, Node *node) {
                                 Symbol *arg_sym = scope_lookup(c->current_scope,
                                     iarg->ident.name,
                                     (uint32_t)iarg->ident.name_len);
-                                if (arg_sym && arg_sym->is_local_derived) {
-                                    checker_error(c, node->loc.line,
-                                        "argument %d: local-derived pointer '%.*s' cannot "
-                                        "satisfy 'keep' parameter — points to stack memory",
-                                        i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                if (arg_sym && arg_sym->is_local_derived && edge_vkind == KV_NONE) {
+                                    edge_vkind = KV_LOCAL_DERIVED;
+                                    edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                 }
-                                if (arg_sym && arg_sym->is_arena_derived) {
-                                    checker_error(c, node->loc.line,
-                                        "argument %d: arena-derived pointer '%.*s' cannot "
-                                        "satisfy 'keep' parameter — arena memory may be reset",
-                                        i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                if (arg_sym && arg_sym->is_arena_derived && edge_vkind == KV_NONE) {
+                                    edge_vkind = KV_ARENA;
+                                    edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                 }
                                 /* Slice-borrow case (BUG-751): the IDENT may not carry
                                  * is_local_derived (a local ARRAY ident is plain), but
                                  * `local[0..]` still borrows stack memory. */
-                                if (ld_via_slice && arg_sym && !arg_sym->is_static) {
+                                if (ld_via_slice && arg_sym && !arg_sym->is_static && edge_vkind == KV_NONE) {
                                     bool sym_is_global = scope_lookup_local(c->global_scope,
                                         arg_sym->name, arg_sym->name_len) != NULL;
                                     if (!sym_is_global && !arg_sym->is_local_derived) {
-                                        checker_error(c, node->loc.line,
-                                            "argument %d: slice borrowing local '%.*s' cannot "
-                                            "satisfy 'keep' parameter — stack memory is freed when function returns",
-                                            i + 1, (int)arg_sym->name_len, arg_sym->name);
+                                        edge_vkind = KV_SLICE_LOCAL;
+                                        edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                     }
                                 }
                             }
@@ -5287,35 +5326,32 @@ static Type *check_expr(Checker *c, Node *node) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
                                 arg_node->ident.name,
                                 (uint32_t)arg_node->ident.name_len);
-                            if (arg_sym && arg_sym->is_local_derived) {
-                                checker_error(c, node->loc.line,
-                                    "argument %d: local-derived pointer '%.*s' cannot "
-                                    "satisfy 'keep' parameter — points to stack memory",
-                                    i + 1,
-                                    (int)arg_sym->name_len, arg_sym->name);
+                            if (arg_sym && arg_sym->is_local_derived && edge_vkind == KV_NONE) {
+                                edge_vkind = KV_LOCAL_DERIVED;
+                                edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                             }
-                            /* BUG-336: reject arena-derived pointers for keep params */
-                            if (arg_sym && arg_sym->is_arena_derived) {
-                                checker_error(c, node->loc.line,
-                                    "argument %d: arena-derived pointer '%.*s' cannot "
-                                    "satisfy 'keep' parameter — arena memory may be reset",
-                                    i + 1,
-                                    (int)arg_sym->name_len, arg_sym->name);
+                            /* BUG-336: arena-derived pointers can't satisfy keep */
+                            if (arg_sym && arg_sym->is_arena_derived && edge_vkind == KV_NONE) {
+                                edge_vkind = KV_ARENA;
+                                edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                             }
-                            /* BUG-334: reject local arrays coerced to keep slices */
+                            /* BUG-334: local arrays coerced to keep slices can't satisfy keep */
                             if (arg_sym && !arg_sym->is_static &&
-                                arg_sym->type && arg_sym->type->kind == TYPE_ARRAY) {
+                                arg_sym->type && arg_sym->type->kind == TYPE_ARRAY &&
+                                edge_vkind == KV_NONE) {
                                 bool sym_is_global = scope_lookup_local(c->global_scope,
                                     arg_sym->name, arg_sym->name_len) != NULL;
                                 if (!sym_is_global) {
-                                    checker_error(c, node->loc.line,
-                                        "argument %d: local array '%.*s' cannot "
-                                        "satisfy 'keep' parameter — stack memory is freed when function returns",
-                                        i + 1,
-                                        (int)arg_sym->name_len, arg_sym->name);
+                                    edge_vkind = KV_LOCAL_ARRAY;
+                                    edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                 }
                             }
                         }
+                        /* transitivity: does the arg trace to a non-keep caller param? */
+                        int caller_root = keep_arg_caller_root(c, arg_node);
+                        record_keep_edge(c, effective_callee, i, is_fn_ptr_call,
+                                         edge_vkind, edge_argname, edge_argname_len,
+                                         i + 1, node->loc.line, c->current_func_sig, caller_root);
                     }
                 }
             }
@@ -12225,17 +12261,17 @@ static void register_decl(Checker *c, Node *node) {
         }
         Type *func_type = type_func_ptr(c->arena, params, pc, ret);
         func_type->func_ptr.is_variadic = node->func_decl.is_variadic;
-        /* carry keep flags from ParamDecl to Type */
-        {
-            bool any_keep = false;
+        /* carry keep flags from ParamDecl to Type. Keep inference (Site 1):
+         * ALWAYS allocate param_keeps when the function has params, zero-init and
+         * seeded from explicit `keep` annotations. The escape-inference pass
+         * (check_keep_inference) writes INFERRED keep flags into this same array,
+         * which call sites later read — so it must exist even with no annotation.
+         * Always-zero for a non-escaping function ⇒ identical to the old NULL
+         * (type_equals / call-site checks treat absent and false identically). */
+        if (pc > 0) {
+            func_type->func_ptr.param_keeps = (bool *)arena_alloc(c->arena, pc * sizeof(bool));
             for (uint32_t i = 0; i < pc; i++) {
-                if (node->func_decl.params[i].is_keep) { any_keep = true; break; }
-            }
-            if (any_keep) {
-                func_type->func_ptr.param_keeps = (bool *)arena_alloc(c->arena, pc * sizeof(bool));
-                for (uint32_t i = 0; i < pc; i++) {
-                    func_type->func_ptr.param_keeps[i] = node->func_decl.params[i].is_keep;
-                }
+                func_type->func_ptr.param_keeps[i] = node->func_decl.params[i].is_keep;
             }
         }
 
@@ -12934,6 +12970,17 @@ static void check_func_body(Checker *c, Node *node) {
         }
         }
         c->current_func_ret = ret;
+        /* keep inference (Site 1): track the function + its signature so the
+         * escape-detection sites can mark an escaping param keep, and call-site
+         * keep edges can name the enclosing function for the transitivity pass.
+         * Resolved from the symbol so it is the SAME Type* call sites read. */
+        c->current_func_node = node;
+        {
+            Symbol *fsym = scope_lookup_local(c->global_scope, node->func_decl.name,
+                                              (uint32_t)node->func_decl.name_len);
+            c->current_func_sig = (fsym && fsym->type &&
+                type_dispatch_kind(fsym->type) == TYPE_FUNC_PTR) ? fsym->type : NULL;
+        }
 
         /* create function scope with parameters */
         push_scope(c);
@@ -12950,8 +12997,10 @@ static void check_func_body(Checker *c, Node *node) {
                  * + keep-2a). keep params are exempt (the escape valve). */
                 if (!p->is_keep && ptype) {
                     TypeKind pk = type_dispatch_kind(ptype);
-                    if (pk == TYPE_POINTER || pk == TYPE_OPAQUE)
+                    if (pk == TYPE_POINTER || pk == TYPE_OPAQUE) {
                         sym->is_nonkeep_derived = true;
+                        sym->nonkeep_root_param = i; /* keep inference: this param is its own root */
+                    }
                     /* GAP-8 (BUG-737, 2026-06-10, 6u360k audit): a by-value
                      * STRUCT/UNION param whose type carries raw data-pointer
                      * fields is the SAME contract — the pointers inside have
@@ -12963,8 +13012,10 @@ static void check_func_body(Checker *c, Node *node) {
                      * registration ROOT was missing. `keep Container ct` is
                      * the escape valve, same as pointer params. */
                     else if (pk == TYPE_STRUCT || pk == TYPE_UNION) {
-                        if (type_carries_data_pointer(ptype, 0))
+                        if (type_carries_data_pointer(ptype, 0)) {
                             sym->is_nonkeep_derived = true;
+                            sym->nonkeep_root_param = i; /* keep inference: struct param is its own root */
+                        }
                     }
                 }
                 /* field-level keep: a KEEP pointer param is a BORROW. Storing it
@@ -13076,6 +13127,8 @@ static void check_func_body(Checker *c, Node *node) {
 
         pop_scope(c);
         c->current_func_ret = NULL;
+        c->current_func_node = NULL;
+        c->current_func_sig = NULL;
     }
 
     if (node->kind == NODE_INTERRUPT && node->interrupt.body) {
@@ -14305,6 +14358,88 @@ static void check_call_provenance(Checker *c, Node *node) {
     }
 }
 
+/* keep inference (Site 1): callee param keep for ENFORCEMENT — a funcptr call
+ * worst-cases POINTER params as keep (can't see the target), so passing a stack
+ * pointer DIRECTLY to a funcptr pointer param is rejected. Matches the original
+ * behaviour exactly: only TYPE_POINTER funcptr params are worst-cased (slice /
+ * opaque funcptr params are NOT — passing a local array as a slice to a callback
+ * stays allowed); a non-pointer funcptr param is enforced only if it is
+ * EXPLICITLY declared keep in the funcptr type. */
+static bool keep_edge_callee_keeps(struct KeepEdge *e) {
+    Type *cs = type_unwrap_distinct(e->callee_sig);
+    if (!cs || cs->kind != TYPE_FUNC_PTR ||
+        e->param_index >= (int)cs->func_ptr.param_count) return false;
+    if (e->is_fn_ptr_call) {
+        Type *pt = type_unwrap_distinct(cs->func_ptr.params[e->param_index]);
+        if (pt && pt->kind == TYPE_POINTER) return true; /* pointer worst-case */
+    }
+    return cs->func_ptr.param_keeps && cs->func_ptr.param_keeps[e->param_index];
+}
+
+/* keep inference (Site 1): callee param keep for TRANSITIVE PROPAGATION.
+ * For a DIRECT call: the callee's inferred keep (so `outer(p){inner(p)}` with
+ * inner's param keep makes outer's p keep — the BH-15 fix).
+ * For a FUNCPTR call: WORST-CASE every POINTER param (can't see the target, and
+ * the target could retain the pointer). This makes a forward THROUGH a funcptr
+ * consistent with a DIRECT funcptr call (`fn(&local)` is already rejected), so a
+ * stack pointer can never reach a retaining callback via a forwarder — closing
+ * the funcptr-forwarding hole to 100% soundness (2026-06-19). Identical to
+ * keep_edge_callee_keeps; kept as a separate name for the call-site intent.
+ * Cost: a read-only callback called with a STACK-local context is rejected too
+ * (use a long-lived context) — measured at 1 pattern across the whole suite. */
+static bool keep_edge_propagates(struct KeepEdge *e) {
+    return keep_edge_callee_keeps(e);
+}
+
+/* keep inference Pass 2.5 (Site 1, 2026-06-19): run AFTER all function bodies are
+ * checked. (1) Transitive-escape fixpoint — an argument that traces to a caller
+ * param P and feeds a keep callee position makes P escape, so P becomes keep too
+ * (closes the BH-15 transitivity hole). (2) Enforcement — a short-lived
+ * (stack/arena) argument feeding a now-final keep param is rejected, exactly as
+ * the old inline check did, but with param_keeps fully resolved (so forward-
+ * referenced/cross-module callees and transitive keeps are handled soundly). */
+void check_keep_inference(Checker *c) {
+    /* (1) transitive-escape fixpoint (monotone: flags only turn on → converges) */
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 1000000) {
+        changed = false;
+        for (int i = 0; i < c->keep_edge_count; i++) {
+            struct KeepEdge *e = &c->keep_edges[i];
+            if (e->caller_param_index < 0 || !e->caller_sig) continue;
+            if (!keep_edge_propagates(e)) continue; /* declared keep, not funcptr worst-case */
+            Type *cs = type_unwrap_distinct(e->caller_sig);
+            if (cs && cs->kind == TYPE_FUNC_PTR && cs->func_ptr.param_keeps &&
+                e->caller_param_index < (int)cs->func_ptr.param_count &&
+                !cs->func_ptr.param_keeps[e->caller_param_index]) {
+                cs->func_ptr.param_keeps[e->caller_param_index] = true;
+                changed = true;
+            }
+        }
+    }
+    /* (2) enforcement against final param_keeps */
+    for (int i = 0; i < c->keep_edge_count; i++) {
+        struct KeepEdge *e = &c->keep_edges[i];
+        if (e->violation_kind == KV_NONE) continue;
+        if (!keep_edge_callee_keeps(e)) continue;
+        const char *msg = NULL;
+        switch (e->violation_kind) {
+        case KV_LOCAL_ADDR:
+            msg = "argument %d: local variable '%.*s' cannot satisfy 'keep' parameter — must be static or global"; break;
+        case KV_LOCAL_DERIVED:
+            msg = "argument %d: local-derived pointer '%.*s' cannot satisfy 'keep' parameter — points to stack memory"; break;
+        case KV_ARENA:
+            msg = "argument %d: arena-derived pointer '%.*s' cannot satisfy 'keep' parameter — arena memory may be reset"; break;
+        case KV_LOCAL_ARRAY:
+            msg = "argument %d: local array '%.*s' cannot satisfy 'keep' parameter — stack memory is freed when function returns"; break;
+        case KV_SLICE_LOCAL:
+            msg = "argument %d: slice borrowing local '%.*s' cannot satisfy 'keep' parameter — stack memory is freed when function returns"; break;
+        default: continue;
+        }
+        checker_error(c, e->line, msg, e->arg_pos, (int)e->arg_name_len, e->arg_name);
+    }
+}
+
 bool checker_check(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return false;
 
@@ -14315,6 +14450,10 @@ bool checker_check(Checker *c, Node *file_node) {
 
     /* Pass 2: type-check all function bodies and global initializers */
     bool ok = checker_check_bodies(c, file_node);
+
+    /* Pass 2.5: keep inference — transitive escape fixpoint + deferred enforcement */
+    check_keep_inference(c);
+    if (c->error_count > 0) ok = false;
 
     /* Pass 3: whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {

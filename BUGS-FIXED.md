@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-19 — `keep` is now INFERRED (3 sites auto, no annotation) + BH-15 transitivity soundness hole closed
+
+**Feature: keep auto-inference.** The `keep` annotation is no longer required at
+any of its three sites; the compiler infers it and the keyword is now an
+optional explicit override. Sound, verified regression-free (tests/zer 324/324,
+rust 358/358 = baseline, C unit 584/584, test_emit 238/238, modules 28/28).
+
+- **Site 1 — function param `keep` (full sound inference).** The escape
+  detection that previously *errored* "add 'keep'" now *infers* keep instead
+  (checker.c: the 3 NODE_ASSIGN escape sites call `infer_mark_param_keep` /
+  `infer_keep_from_call_args` writing the signature's `param_keeps`). Because
+  `param_keeps` is final only after ALL bodies are checked, a new **Pass 2.5**
+  (`check_keep_inference`, wired into `checker_check` + `zerc_main`) runs a
+  **transitive-escape fixpoint** then **deferred enforcement** off recorded
+  `KeepEdge`s — so forward-referenced/cross-module/transitive keeps are handled
+  soundly (inline enforcement would miss them). Root-param attribution added via
+  `Symbol.nonkeep_root_param` (set at param registration, carried through
+  `propagate_escape_flags`).
+- **BH-15 (new soundness hole found + fixed this session): keep transitivity was
+  not enforced.** `void outer(*Task p){ inner(p); }` with `inner(keep *Task q){
+  g=q; }` compiled clean and let `&local` reach a global → ASan-confirmed
+  stack-use-after-return. The Pass 2.5 fixpoint closes it (outer's `p` inferred
+  keep). 3-level deep verified.
+- **Site 2 — struct-field `keep` requirement removed.** Storing a keep-derived
+  borrow into a non-keep field is now accepted (the borrow is provably static
+  via the keep-param call-site chain). Removed the NODE_ASSIGN field-keep check
+  + the `target_struct_field_keep` helper.
+- **Site 3 — funcptr `keep` already auto.** A funcptr CALL still worst-cases
+  POINTER params as keep (enforcement); the keyword is optional.
+
+**Supporting fixes made during implementation:**
+- `type_equals` (types.c) no longer compares func_ptr `param_keeps` — comparing
+  them spuriously rejected assigning an inferred-keep function to a plain funcptr
+  type, and the bits are irrelevant (funcptr calls worst-case anyway).
+- Funcptr forwarding closed to 100% soundness (option B): `keep_edge_propagates`
+  worst-cases EVERY pointer param of a funcptr call (it calls
+  `keep_edge_callee_keeps`), so forwarding a param to any funcptr — direct,
+  global, or stored callback — infers keep on it. A stack pointer can't reach a
+  retaining callback via a forwarder; `invoke(&local, retaining_cb)` is rejected.
+  Consistent with the existing direct-funcptr worst-case (`fn(&local)` already
+  rejected). **Measured cost: 1 pattern** — a read-only callback with a
+  *stack-local* context (`rust_tests/rt_opaque_provenance_chain`, updated to a
+  global context). Initially shipped as a declared-only split (left the forward
+  open) then closed same-day; see docs/limitations.md "CLOSED — keep transitivity
+  through a function-POINTER forward".
+- `param_keeps` is now ALWAYS allocated for functions with params (zero-init,
+  seeded from explicit keep) so inference can write it.
+
+**Tests:** `tests/zer_fail/keep_{alias_param_field,call_result_global,
+nonkeep_param_field,struct_copy_global}.zer` rewritten to pass `&local` at the
+call site (the safety boundary moved there); `keep_field_required.zer` →
+`tests/zer/field_borrow_auto.zer` (now a positive test); `test_checker_full.c`
+BUG-277 funcptr-type-mismatch test flipped err→ok. Note: the pre-existing
+semantic-fuzzer flake (uninitialized-read UB in the no-`vrp_ir` build, identical
+on baseline) is unrelated — see `docs/limitations.md`.
+
 ## Session 2026-06-16 — Variadic `...` + WASM toolchain port (4 port bugs caught)
 
 **Feature: variadic `...` for C-interop.** `...` as the final parameter,

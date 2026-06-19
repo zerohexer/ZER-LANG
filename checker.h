@@ -38,6 +38,8 @@ typedef struct {
     int error_count;
     int warning_count;
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
+    Node *current_func_node; /* NODE_FUNC_DECL being checked — keep inference (Site 1) */
+    Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int defer_depth;        /* > 0 when inside a defer block */
     int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */
@@ -148,6 +150,26 @@ typedef struct {
     int param_expect_count;
     int param_expect_capacity;
 
+    /* keep inference (Site 1, 2026-06-19): deferred call-site keep enforcement +
+     * transitive escape fixpoint. Edges are recorded during the single body pass
+     * and resolved afterwards in check_keep_inference (param_keeps is final only
+     * after all bodies are checked, so inline enforcement would be unsound for
+     * forward-referenced / cross-module callees). */
+    struct KeepEdge {
+        Type *callee_sig;        /* resolved callee signature (param_keeps source) */
+        int param_index;         /* which callee param this arg feeds */
+        bool is_fn_ptr_call;     /* funcptr call → all pointer params worst-case keep */
+        int violation_kind;      /* KV_* short-lived-borrow class of this arg, or 0 */
+        const char *arg_name;
+        uint32_t arg_name_len;
+        int arg_pos;             /* 1-based position for the diagnostic */
+        int line;
+        Type *caller_sig;        /* enclosing function sig (transitivity target) */
+        int caller_param_index;  /* arg roots at this caller param, else -1 */
+    } *keep_edges;
+    int keep_edge_count;
+    int keep_edge_capacity;
+
     /* Interrupt safety: track globals accessed from ISR and regular code */
     bool in_interrupt;  /* true when checking NODE_INTERRUPT body */
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */
@@ -232,6 +254,7 @@ void checker_init(Checker *c, Arena *arena, const char *file_name);
 void checker_register_file(Checker *c, Node *file_node); /* register declarations only */
 bool checker_check(Checker *c, Node *file_node);
 bool checker_check_bodies(Checker *c, Node *file_node); /* check bodies only, decls already registered */
+void check_keep_inference(Checker *c); /* keep inference: transitive escape fixpoint + deferred enforcement (after ALL bodies) */
 void checker_post_passes(Checker *c, Node *file_node); /* stack depth + interrupt safety (after all bodies checked) */
 void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with module's own types */
 void checker_pop_module_scope(Checker *c); /* pop module scope */

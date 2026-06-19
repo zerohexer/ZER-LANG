@@ -2337,31 +2337,53 @@ zerc main.zer --run --stack-limit 2048
 
 ## C INTEROP
 
-### keep parameters
+### keep parameters (INFERRED — no annotation needed, 2026-06-19)
 
 **DESCRIPTION**
-Functions that store pointers beyond the call must annotate with `keep`.
-The compiler checks that only global/static pointers are passed to `keep` params.
+`keep` marks a pointer parameter whose pointee the function retains beyond the
+call (stores into a global/static, into another pointer-param's field, or
+returns through a sink). Callers of a keep param may pass only static/global
+(long-lived) pointers, never `&local`/arena/local-slice — otherwise the stored
+pointer would dangle when the caller's frame dies.
+
+**`keep` is now INFERRED — you never have to write it.** The compiler detects
+the retention from the function body and infers keep automatically, including
+*transitively* (a param forwarded to another function's keep param becomes keep
+too). The `keep` keyword is still **accepted** as an optional explicit marker
+(e.g. to document an API contract before the storing line exists), but it is
+never *required*.
 
 **SYNTAX**
 ```zer
-void register_callback(keep *Handler h) {
-    global_handler = h;
+void register_callback(*Handler h) {   // no `keep` needed — inferred from the store
+    global_handler = h;                 // retention detected → h inferred keep
 }
 ```
 
 **EXAMPLE**
 ```zer
-register_callback(&local_handler);   // COMPILE ERROR — local can't satisfy keep
+register_callback(&local_handler);   // COMPILE ERROR — local can't satisfy (inferred) keep
 register_callback(&global_handler);  // OK — global persists
 ```
 
 **NOTES**
-- Applies to BY-VALUE STRUCT/UNION params too (BUG-737): a non-keep struct
-  param whose type carries pointer fields (at any nesting depth) cannot be
-  stored to a global/param sink — the pointers inside have caller-unknown
-  provenance. `keep Container ct` is the escape valve, same as pointer
-  params. Funcptr fields and Handle fields don't count (not raw addresses).
+- Inference covers: direct store to global/static, store through a pointer-param
+  field, store of an alias, a call-result launder (`g = idfn(p)`), and a
+  by-value STRUCT/UNION param whose pointer fields are persisted (BUG-737).
+- **Transitive (closes BH-15):** `void outer(*T p) { inner(p); }` where
+  `inner`'s param is (inferred or explicit) keep → `outer`'s `p` is inferred
+  keep, so `outer(&local)` is rejected. This is sound across forward references
+  and modules (a dedicated post-body pass resolves keep before enforcing).
+- **Struct fields:** storing a keep-derived borrow into a struct field no longer
+  requires a `keep` field — the borrow is provably static, so it is always safe.
+- **Function pointers:** a funcptr CALL worst-cases its pointer params as keep
+  (the target is invisible and could retain the pointer). This applies both to
+  passing `&local` *directly* to a funcptr param AND to *forwarding* a param to
+  a funcptr (`void fwd(*T p, *(*T) cb){ cb(p); }` infers `p` keep), so a stack
+  pointer can never reach a retaining callback through any funcptr indirection —
+  the keep/escape property is 100% sound. Consequence: a read-only callback must
+  be given a long-lived (global/static) context, not a stack-local one — the same
+  rule that already applies to a direct funcptr call.
 
 ---
 

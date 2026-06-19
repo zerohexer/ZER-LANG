@@ -555,6 +555,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Pass 2.5: keep inference across ALL modules' bodies — transitive escape
+     * fixpoint + deferred call-site keep enforcement (param_keeps is final now,
+     * so forward-referenced/cross-module/transitive keeps are handled soundly). */
+    check_keep_inference(&checker);
+
     /* Post-passes on main file: stack depth + interrupt safety + lock ordering */
     checker_post_passes(&checker, main_mod->ast);
     if (checker.error_count > 0) {

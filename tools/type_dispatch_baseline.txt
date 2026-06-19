@@ -663,3 +663,10 @@ checker.c:if (tgv && vgv && tgv->kind == TYPE_POINTER && vgv->kind == TYPE_POINT
 emitter.c:if (eff && eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
 emitter.c:if (eff && eff->kind == TYPE_OPTIONAL) eff = type_unwrap_distinct(eff->optional.inner);
 emitter.c:if (eff && eff->kind == TYPE_STRUCT) {
+
+# keep auto-inference (2026-06-19): funcptr-sig kind checks on type_unwrap_distinct
+# results — sig/cs/pt are already-unwrapped locals, so the raw ->kind is correct.
+checker.c:if (!sig || sig->kind != TYPE_FUNC_PTR) return;
+checker.c:if (!cs || cs->kind != TYPE_FUNC_PTR ||
+checker.c:if (cs && cs->kind == TYPE_FUNC_PTR && cs->func_ptr.param_keeps &&
+checker.c:if (pt && pt->kind == TYPE_POINTER) return true; /* pointer worst-case */

@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-19d — distinct typedef laundered `const` through pointer/slice (soundness, plt86m Theme B)
+
+**What broke:** a `distinct typedef *u32 MyPtr;` (or `[]u8` slice) let `const`
+be silently stripped — `const MyPtr cm = m; MyPtr alias = cm; *alias = 7;`
+compiled clean and wrote through what the caller believed was read-only; same at
+function-argument and assignment boundaries. The PLAIN (non-distinct) variant was
+correctly rejected.
+
+**Root cause:** two distinct facts compounded. (1) The const-strip guards tested
+`t->kind == TYPE_POINTER/TYPE_SLICE` WITHOUT unwrapping `TYPE_DISTINCT` — a
+`distinct` target/param keeps kind `TYPE_DISTINCT`, so the guard was skipped (the
+#1 historical bug class). (2) `const MyPtr` stores `const` on the SYMBOL
+(`is_const`), not on the dropped distinct type, so the type-level
+`pointer.is_const`/`slice.is_const` is false even after unwrap.
+
+**Fix (checker.c, 3 sites):** var-decl init (~8870), assignment (~4240),
+call-arg (~5017) const guards now use `type_dispatch_kind` (unwraps distinct,
+audit-safe — no new `->kind ==` site) + `type_unwrap_distinct` for the qualifier
+read, PLUS a symbol-level `is_const` check at the var-decl and call-arg sites for
+the distinct case (guarded by `arg_type_const` so it doesn't double-fire on plain
+const). Verified: all 3 reproducers now reject for the const reason; legit
+distinct + plain-mutable code unaffected (no over-rejection).
+
+**Tests:** `tests/zer_fail/distinct_const_{var_decl,param,slice_param}_launder.zer`
+(moved from `tests/zer_gaps/`). Full `make check` green.
+
+---
+
 ## Session 2026-06-19c — 5 daily-review fixes reimplemented (BH-18 #11/#14, BH-19 #1, BUG-748, BUG-749)
 
 Five fixes from the daily-review branches (`x9otrk`, `67x4go`), independently

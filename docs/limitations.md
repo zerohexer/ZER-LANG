@@ -1978,7 +1978,8 @@ Heisenbug in the source.
 Nine gaps documented on branch `claude/cool-johnson-plt86m`, INDEPENDENTLY
 re-verified real this session (each reproduced on baseline). Reproducers:
 `tests/zer_gaps/audit_2026-06-17_*.zer`. 6 are NEW; 3 fold into known classes
-(noted). None fixed yet.
+(noted). **Theme B (3 distinct-const sites) FIXED 2026-06-19** (repros moved to
+`tests/zer_fail/`); the remaining 6 are still open.
 
 **Theme A — defer + control flow:**
 - `defer_goto_fallthrough_drops` (NEW, HIGH miscompile): when a defer scope has a
@@ -1992,15 +1993,13 @@ re-verified real this session (each reproduced on baseline). Reproducers:
   Siblings of the documented 2026-06-15 "defer body uses a handle the function
   then frees" gap (`ir_defer_scan_frees` scans defer bodies for FREE, not USE).
 
-**Theme B — distinct typedef defeats const-strip (NEW; the #1 distinct-unwrap class):**
-- `distinct_const_var_decl_launder` (checker.c var-decl init ~8807),
-  `distinct_const_param_launder` (call-arg ~4971),
-  `distinct_const_slice_param_launder` (slice arg ~4965): a `distinct typedef`
-  over a const pointer/slice bypasses the const-launder check because the site
-  tests `t->kind == TYPE_POINTER/TYPE_SLICE` without `type_unwrap_distinct` first.
-  Verified asymmetry: the PLAIN (non-distinct) variant IS rejected; the distinct
-  one compiles clean. Fix: `type_dispatch_kind` / unwrap at each site (~10 lines
-  each; assignment site ~4194 too).
+**Theme B — distinct typedef defeats const-strip — FIXED 2026-06-19:** the
+var-decl-init, assignment, and call-arg const guards now use `type_dispatch_kind`
++ `type_unwrap_distinct` (and a symbol-level check at the call site, since
+`const MyPtr` stores `const` on the SYMBOL, not the dropped distinct type — the
+type-level `pointer.is_const` is false). The 3 reproducers moved to
+`tests/zer_fail/distinct_const_{var_decl,param,slice_param}_launder.zer`. See
+BUGS-FIXED.md "Session 2026-06-19d".
 
 **Other:**
 - `mmio_range_ignores_size` (NEW): `@inttoptr(*u32, addr)` validates

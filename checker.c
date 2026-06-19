@@ -4239,13 +4239,19 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* const/volatile laundering: reject qualified → unqualified assignment */
         if (node->assign.op == TOK_EQ && target && value) {
-            if (target->kind == TYPE_POINTER && value->kind == TYPE_POINTER &&
-                value->pointer.is_const && !target->pointer.is_const) {
+            /* distinct typedef must not launder const (plt86m audit 2026-06-17):
+             * a `distinct typedef *u32` target keeps kind TYPE_DISTINCT, so the
+             * raw kind check skipped. Use type_dispatch_kind (unwraps) + unwrap
+             * for the qualifier read. */
+            Type *cst_t = type_unwrap_distinct(target);
+            Type *cst_v = type_unwrap_distinct(value);
+            if (type_dispatch_kind(target) == TYPE_POINTER && type_dispatch_kind(value) == TYPE_POINTER &&
+                cst_v->pointer.is_const && !cst_t->pointer.is_const) {
                 checker_error(c, node->loc.line,
                     "cannot assign const pointer to mutable — would allow writing to read-only memory");
             }
-            if (target->kind == TYPE_SLICE && value->kind == TYPE_SLICE &&
-                value->slice.is_const && !target->slice.is_const) {
+            if (type_dispatch_kind(target) == TYPE_SLICE && type_dispatch_kind(value) == TYPE_SLICE &&
+                cst_v->slice.is_const && !cst_t->slice.is_const) {
                 checker_error(c, node->loc.line,
                     "cannot assign const slice to mutable — would allow writing to read-only memory");
             }
@@ -5010,17 +5016,50 @@ static Type *check_expr(Checker *c, Node *node) {
 
                     /* const safety: reject const slice/pointer → mutable param */
                     if (arg && param) {
-                        if (arg->kind == TYPE_SLICE && param->kind == TYPE_SLICE &&
-                            arg->slice.is_const && !param->slice.is_const) {
+                        /* distinct typedef must not launder const (plt86m audit
+                         * 2026-06-17): unwrap so a distinct *T / []T param is
+                         * still const-checked. */
+                        Type *ca_arg = type_unwrap_distinct(arg);
+                        Type *ca_par = type_unwrap_distinct(param);
+                        if (type_dispatch_kind(arg) == TYPE_SLICE && type_dispatch_kind(param) == TYPE_SLICE &&
+                            ca_arg->slice.is_const && !ca_par->slice.is_const) {
                             checker_error(c, node->loc.line,
                                 "argument %d: cannot pass const slice to mutable parameter",
                                 i + 1);
                         }
-                        if (arg->kind == TYPE_POINTER && param->kind == TYPE_POINTER &&
-                            arg->pointer.is_const && !param->pointer.is_const) {
+                        if (type_dispatch_kind(arg) == TYPE_POINTER && type_dispatch_kind(param) == TYPE_POINTER &&
+                            ca_arg->pointer.is_const && !ca_par->pointer.is_const) {
                             checker_error(c, node->loc.line,
                                 "argument %d: cannot pass const pointer to mutable parameter",
                                 i + 1);
+                        }
+                        /* distinct const-strip via the arg SYMBOL (plt86m audit
+                         * 2026-06-17): `const MyPtr` stores const on the symbol,
+                         * not the dropped distinct type (so ca_arg->...is_const is
+                         * false). Mirror the var-decl symbol check. Guarded by
+                         * arg_type_const so it doesn't double-fire with the
+                         * type-level checks above on plain const pointers/slices. */
+                        TypeKind ca_ak = type_dispatch_kind(arg);
+                        bool arg_type_const =
+                            (ca_ak == TYPE_POINTER && ca_arg->pointer.is_const) ||
+                            (ca_ak == TYPE_SLICE   && ca_arg->slice.is_const);
+                        if (!arg_type_const && node->call.args[i]->kind == NODE_IDENT) {
+                            Symbol *asym = scope_lookup(c->current_scope,
+                                node->call.args[i]->ident.name,
+                                (uint32_t)node->call.args[i]->ident.name_len);
+                            if (asym && asym->is_const) {
+                                TypeKind ca_pk = type_dispatch_kind(param);
+                                bool param_mut =
+                                    (ca_pk == TYPE_POINTER && !ca_par->pointer.is_const) ||
+                                    (ca_pk == TYPE_SLICE   && !ca_par->slice.is_const);
+                                if (param_mut) {
+                                    checker_error(c, node->loc.line,
+                                        "argument %d: cannot pass const variable '%.*s' to mutable parameter — "
+                                        "would allow writing to read-only memory",
+                                        i + 1, (int)node->call.args[i]->ident.name_len,
+                                        node->call.args[i]->ident.name);
+                                }
+                            }
                         }
                         /* BUG-263: volatile pointer → non-volatile param strips volatile.
                          * Check both type-level and symbol-level volatile. */
@@ -5338,7 +5377,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                             /* BUG-334: local arrays coerced to keep slices can't satisfy keep */
                             if (arg_sym && !arg_sym->is_static &&
-                                arg_sym->type && arg_sym->type->kind == TYPE_ARRAY &&
+                                type_dispatch_kind(arg_sym->type) == TYPE_ARRAY &&
                                 edge_vkind == KV_NONE) {
                                 bool sym_is_global = scope_lookup_local(c->global_scope,
                                     arg_sym->name, arg_sym->name_len) != NULL;
@@ -8870,7 +8909,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* const slice/pointer → mutable variable: blocked (prevents write to .rodata) */
             if (!node->var_decl.is_const && node->var_decl.init->kind == NODE_IDENT &&
-                type && (type->kind == TYPE_SLICE || type->kind == TYPE_POINTER)) {
+                (type_dispatch_kind(type) == TYPE_SLICE || type_dispatch_kind(type) == TYPE_POINTER)) {
                 Symbol *src = scope_lookup(c->current_scope,
                     node->var_decl.init->ident.name,
                     (uint32_t)node->var_decl.init->ident.name_len);
@@ -8885,8 +8924,11 @@ static void check_stmt(Checker *c, Node *node) {
             /* check assignment compatibility */
             /* const laundering: reject const → mutable in init */
             if (type && init_type) {
-                if (type->kind == TYPE_POINTER && init_type->kind == TYPE_POINTER &&
-                    init_type->pointer.is_const && !type->pointer.is_const) {
+                /* distinct typedef must not launder const (plt86m audit 2026-06-17) */
+                Type *vdc_t = type_unwrap_distinct(type);
+                Type *vdc_i = type_unwrap_distinct(init_type);
+                if (type_dispatch_kind(type) == TYPE_POINTER && type_dispatch_kind(init_type) == TYPE_POINTER &&
+                    vdc_i->pointer.is_const && !vdc_t->pointer.is_const) {
                     checker_error(c, node->loc.line,
                         "cannot initialize mutable pointer from const — "
                         "would allow writing to read-only memory");
@@ -8920,8 +8962,8 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
-                if (type->kind == TYPE_SLICE && init_type->kind == TYPE_SLICE &&
-                    init_type->slice.is_const && !type->slice.is_const) {
+                if (type_dispatch_kind(type) == TYPE_SLICE && type_dispatch_kind(init_type) == TYPE_SLICE &&
+                    vdc_i->slice.is_const && !vdc_t->slice.is_const) {
                     checker_error(c, node->loc.line,
                         "cannot initialize mutable slice from const — "
                         "would allow writing to read-only memory");

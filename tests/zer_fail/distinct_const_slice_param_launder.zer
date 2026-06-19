@@ -1,3 +1,4 @@
+// EXPECTED: compile error — distinct typedef must not launder const (fixed 2026-06-19)
 // AUDIT 2026-06-17 — HIGH severity (silent const-strip via distinct
 // typedef SLICE at function argument boundary)
 //

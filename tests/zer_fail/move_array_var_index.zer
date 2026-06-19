@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// plt86m audit 2026-06-17: a VARIABLE-index move out of a move-struct array
+// element (Token m = arr[i]) was silently untracked, so a later literal-index
+// read (arr[0]) was an undetected use-after-move. Companion to BUG-741 (which
+// applied the variable-index barrier to FREE only). Now a hard error.
+move struct Token { u32 kind; }
+void consume(Token t) { t.kind = t.kind; }
+u32 main() {
+    Token[4] arr;
+    arr[0].kind = 42;
+    arr[1].kind = 99;
+    u32 i = 1;
+    Token m = arr[i];
+    consume(m);
+    u32 v = arr[0].kind;
+    return v;
+}

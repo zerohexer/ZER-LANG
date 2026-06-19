@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// plt86m audit (x9-11 completeness): a bit-query/byte-swap intrinsic in a
+// global initializer emits __builtin_popcount(a) directly; a non-constant arg
+// makes GCC reject the init with "initializer element is not constant". Now
+// caught with a clean ZER error. (Constant args like @popcount(255) still OK.)
+u32 a = 5;
+u32 g = @popcount(a);
+u32 main() { return g; }

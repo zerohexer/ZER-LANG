@@ -1973,54 +1973,57 @@ Heisenbug in the source.
 
 ---
 
-## OPEN — 2026-06-17 audit (from plt86m branch): 9 verified gaps + x9-11 completeness
+## OPEN — 2026-06-17 audit (from plt86m branch): 1 gap left (defer-goto-drop); 8 of 9 FIXED
 
 Nine gaps documented on branch `claude/cool-johnson-plt86m`, INDEPENDENTLY
-re-verified real this session (each reproduced on baseline). Reproducers:
-`tests/zer_gaps/audit_2026-06-17_*.zer`. 6 are NEW; 3 fold into known classes
-(noted). **Theme B (3 distinct-const sites) FIXED 2026-06-19** (repros moved to
-`tests/zer_fail/`); the remaining 6 are still open.
+re-verified real (each reproduced on baseline). **8 of 9 are now FIXED**
+(2026-06-19d/e); **only `defer_goto_fallthrough_drops` remains OPEN.** Each
+fixed gap has a `tests/zer_fail/` tripwire (and a `tests/zer/` over-rejection
+guard where relevant); see BUGS-FIXED.md "Session 2026-06-19d/e".
 
-**Theme A — defer + control flow:**
-- `defer_goto_fallthrough_drops` (NEW, HIGH miscompile): when a defer scope has a
-  `goto` exit AND a sibling fall-through exit, the emitter (IR_DEFER_FIRE, shared
-  `defer_stack`) pops at the first fire and emits NOTHING on the sibling block —
-  the deferred cleanup (free / unlock / `@cpu_enable_int` / close) is silently
-  elided on the non-goto path. Distinct from the known goto/defer double-fire.
-  Fix sketch: copy (not move) the stack entries to a per-block emitted-fire set.
-- `defer_use_after_alloc_ptr`, `defer_use_after_move` (KNOWN class): a
-  defer-scheduled USE of a slab pointer / move-struct the body then frees/consumes.
-  Siblings of the documented 2026-06-15 "defer body uses a handle the function
-  then frees" gap (`ir_defer_scan_frees` scans defer bodies for FREE, not USE).
+**STILL OPEN — `defer_goto_fallthrough_drops` (NEW, HIGH miscompile):** when a
+defer scope has a `goto` exit AND a sibling fall-through exit, the emitter
+(IR_DEFER_FIRE, shared `defer_stack`) pops at the first fire (block-ID order) and
+emits NOTHING on the sibling block — the deferred cleanup (free / unlock /
+`@cpu_enable_int` / close) is silently elided on the non-goto path. Distinct from
+the known goto/defer double-fire. Verified live in `rust_tests/rt_drop_defer_goto_cleanup.zer`
+(handle leaked on the non-goto return; test passes only because it asserts return
+values, not free side-effects). Reproducer:
+`tests/zer_gaps/audit_2026-06-17_defer_goto_fallthrough_drops.zer`. Root cause is
+EMISSION-stack-consumption, not lowering-missing-fire — both DEFER_FIRE insts ARE
+in the IR. Fix sketch: capture-on-FIRE — each IR_DEFER_FIRE carries its own
+snapshot of the live defer bodies (captured at lowering), so emission is
+order-independent; do NOT change the goto handler's `ctx->defer_count = 0` reset
+(ir_lower.c:3007, which prevents the double-fire). HIGH regression risk (defer is
+load-bearing) — verify by grepping emitted C for exact per-path free/mark counts,
+not just test exit codes.
 
-**Theme B — distinct typedef defeats const-strip — FIXED 2026-06-19:** the
-var-decl-init, assignment, and call-arg const guards now use `type_dispatch_kind`
-+ `type_unwrap_distinct` (and a symbol-level check at the call site, since
-`const MyPtr` stores `const` on the SYMBOL, not the dropped distinct type — the
-type-level `pointer.is_const` is false). The 3 reproducers moved to
-`tests/zer_fail/distinct_const_{var_decl,param,slice_param}_launder.zer`. See
-BUGS-FIXED.md "Session 2026-06-19d".
+**FIXED 2026-06-19e (5 gaps):**
+- `container_const_strip` — reject a `TYNODE_CONST`/`TYNODE_VOLATILE` container
+  type arg (checker.c TYNODE_CONTAINER); the qualifier was dropped at
+  monomorphization. `tests/zer_fail/container_const_type_arg.zer`.
+- `mmio_range_ignores_size` — the @inttoptr range gate now requires the whole
+  span `[addr, addr+sizeof(T)-1]` to fit (checker.c constant path + both emitter
+  variable-address runtime traps). `tests/zer_fail/inttoptr_size_past_range.zer`
+  + `tests/zer/inttoptr_u8_at_range_end.zer`.
+- `var_index_move_array` — a variable-index move from a move-struct array is now a
+  hard error (zercheck_ir.c). `tests/zer_fail/move_array_var_index.zer`.
+- `defer_use_after_alloc_ptr`, `defer_use_after_move` — new `ir_defer_scan_uses`
+  walker checks defer-body USES against the pristine exit state.
+  `tests/zer_fail/defer_use_after_{alloc_ptr,move}.zer` +
+  `tests/zer/defer_free_pattern_ok.zer`.
+- x9-11 completeness — a non-constant bit-query intrinsic arg in a global
+  initializer is now a clean ZER error (checker.c NODE_GLOBAL_VAR init check,
+  NODE_FIELD-guarded for enum constants). `tests/zer_fail/global_init_nonconst_intrinsic.zer`.
 
-**Other:**
-- `mmio_range_ignores_size` (NEW): `@inttoptr(*u32, addr)` validates
-  `addr <= range_end` without `+ sizeof(T) - 1`, so a u32 at `range_end-2` reads
-  2 bytes past the declared mmio range (checker.c ~6833).
-- `container_const_strip` (KNOWN/WAD): `container Box(const u32)` monomorphizes
-  dropping the qualifier (BUG-738 shape); const-strip is not unique to
-  monomorphization — verify before fixing.
-- `var_index_move_array` (NEW): `Token m = arr[i]; consume(m); use(arr[0])` with a
-  VARIABLE index is silently untracked — companion to BUG-741 (the variable-index
-  argument-precise barrier was applied to FREE only, not MOVE). `zercheck_ir.c`
-  `ir_extract_compound_key` rejects variable indices.
+**FIXED 2026-06-19d (Theme B, 3 distinct-const sites):** var-decl-init,
+assignment, and call-arg const guards now use `type_dispatch_kind` +
+`type_unwrap_distinct` (+ a symbol-level check, since `const MyPtr` stores
+`const` on the SYMBOL). `tests/zer_fail/distinct_const_{var_decl,param,slice_param}_launder.zer`.
 
-**x9-11 completeness (from the BH-18 #11 review, fixed 2026-06-19c for constants):**
-the bit-query intrinsic global-init fix is complete for CONSTANT args. A
-NON-constant arg in a global initializer (`u32 a=5; u32 g=@popcount(a);`) now
-emits `__builtin_popcount(a)`, which GCC rejects ("initializer element is not
-constant") instead of a clean ZER error. NOT a regression (baseline silently
-emitted the wrong `0`, and ZER has no global-init constness check at all —
-`u32 g=a+1;` fails identically at GCC). Fix sketch: a checker rule rejecting
-non-constant intrinsic args in global initializers with a clean ZER message.
+Note `container_const_strip` was tagged "KNOWN/WAD-maybe" in the original audit;
+on verification the plain-const variant IS rejected while the container variant
+silently dropped const — a real asymmetry, so it was fixed (reject), not waived.
 
 ---
 

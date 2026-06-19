@@ -5,6 +5,82 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-19e — 5 of 6 remaining plt86m gaps closed + keep-default audit hygiene
+
+Verified, reproducer-driven fixes for 5 of the 6 open plt86m gaps (the 6th,
+defer-goto-fallthrough, is tracked separately). Each was diagnosed by a
+read-only investigation pass and INDEPENDENTLY re-verified against source before
+implementation; every fix has a `tests/zer_fail/` tripwire (reject) and, where
+over-rejection was a risk, a `tests/zer/` positive guard. Full `make check`
+green (ZER 754/754, rust 784/784, both audits OK).
+
+- **container const-strip (soundness).** `container Box(T){T value;}` stamped
+  with `Box(const u32)` dropped the qualifier at monomorphization — the field
+  became plain `u32` and the callee mutated a value the caller declared `const`.
+  Fix (checker.c TYNODE_CONTAINER ~1919): reject a `TYNODE_CONST`/`TYNODE_VOLATILE`
+  type arg (mirrors BUG-738's named-type rule; propagating const is a larger
+  change the audit didn't ask for). Tests: `tests/zer_fail/container_const_type_arg.zer`.
+
+- **mmio range ignores sizeof(T) (soundness).** `@inttoptr(*u32, range_end-2)`
+  passed the range gate (`addr <= range_end`) though the 4-byte access ran 2
+  bytes past the declared end. Fix: require the whole span `[addr, addr+wb-1]` to
+  fit, where `wb = type_width(T)/8`. checker.c constant-address gate (~6955, via
+  `type_dispatch_kind` — audit-safe) + the variable-address RUNTIME range trap in
+  BOTH emitter paths (AST ~3084, IR ~6958 — the two-emitter-path rule). span>=1
+  so `*u8` and compound/unknown-width targets behave exactly as before (no
+  over-rejection). Tests: `tests/zer_fail/inttoptr_size_past_range.zer` (reject) +
+  `tests/zer/inttoptr_u8_at_range_end.zer` (the over-rejection guard).
+
+- **global-init non-constant intrinsic arg (x9-11 completeness).** A bit-query/
+  byte-swap intrinsic in a global initializer emits `__builtin_popcount(arg)`
+  directly; a non-constant arg made GCC reject the init with the cryptic
+  "initializer element is not constant". Fix (checker.c NODE_GLOBAL_VAR init
+  check ~14453): reject the bit-query family in a global init when
+  `eval_const_expr(arg) == CONST_EVAL_FAIL`, guarded `arg->kind != NODE_FIELD`
+  so an enum constant (`State.x`, which eval_const_expr can't see — checker.c:2768)
+  is not falsely rejected. Constant args (`@popcount(255)`) still compile.
+  Tests: `tests/zer_fail/global_init_nonconst_intrinsic.zer`.
+
+- **variable-index move from a move-struct array (soundness).** `Token m =
+  arr[i]` (variable i, Token a `move struct`) was silently untracked —
+  `ir_extract_compound_key` only accepts literal indices, so every element
+  stayed ALIVE and a later `arr[0]` read was an undetected use-after-move.
+  Companion to BUG-741 (which applied the variable-index barrier to FREE only).
+  Fix (zercheck_ir.c IR_ASSIGN move-from-array branch ~2510): an `else if` that
+  hard-errors on a non-literal NODE_INDEX move (the moved element's identity is
+  unknowable and there are no literal `[N]` siblings to widen, so error is the
+  only sound disposition). Tests: `tests/zer_fail/move_array_var_index.zer`.
+
+- **defer-body use-after-free / use-after-move (soundness).** The defer-body
+  scan (`ir_defer_scan_frees`) only looked for FREE calls, so a defer-scheduled
+  USE of a pointer/move-struct the body already freed/transferred slipped
+  through (the non-defer forms were already rejected). Fix (zercheck_ir.c): a new
+  `ir_defer_scan_uses` walker routes defer-body non-free USES through the
+  existing `ir_check_expr_uaf`, checked against each return block's PRISTINE
+  exit state in a uses-pass that runs BEFORE the frees-pass (so the LIFO-valid
+  `defer free(h); defer use(h)` is not false-flagged), with a shared
+  `UafReportSet` deduping per root-local across return blocks. The `!farg` guard
+  keeps the canonical `defer free(h)` legal. Tests:
+  `tests/zer_fail/defer_use_after_{alloc_ptr,move}.zer` (reject) +
+  `tests/zer/defer_free_pattern_ok.zer` (canonical free + use-then-free, must
+  compile). Minor cosmetic debt: the move case reports "use after free … is
+  transferred" (the shared `ir_check_ident_uaf` message) — functionally correct,
+  wording polish deferred.
+
+**Build hygiene (found en route): `keep_arg_caller_root` walker-default gap.**
+The keep auto-inference commit (856fbb0) shipped a `default: return -1;` in a
+`switch(n->kind)` (checker.c:1126) — a walker-exhaustiveness violation that a
+future NODE_ kind would silently fall into (a latent keep-inference gap). It was
+NEVER CAUGHT because Windows-checkout CRLF `.sh` shebangs make `make` stop at
+`tests/test_zer.sh` (Makefile line ~166) before reaching `walker_default_audit.sh`
+(line ~182) — so the prior session's `make check` exit=2 ("the CRLF artifact")
+was actually masking a real audit failure. Normalizing the `.sh` line endings
+exposed it. Fix: converted the `default:` to an exhaustive case list (all 45
+non-traced NODE_ kinds → `return -1`) — behaviorally identical, now `-Wswitch`-
+and audit-enforced. Lesson recorded in CLAUDE.md.
+
+---
+
 ## Session 2026-06-19d — distinct typedef laundered `const` through pointer/slice (soundness, plt86m Theme B)
 
 **What broke:** a `distinct typedef *u32 MyPtr;` (or `[]u8` slice) let `const`

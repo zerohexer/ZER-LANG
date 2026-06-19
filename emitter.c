@@ -3078,12 +3078,18 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "); ");
                 if (need_range_check) {
+                    /* plt86m audit 2026-06-17: account for the access SPAN
+                     * (sizeof T) so a variable address near the range end can't
+                     * straddle past it. span>=1 (compound/unknown width -> 1 =
+                     * byte-identical to the previous start-only check). */
+                    int g2_span = g2_align > 1 ? g2_align : 1;
                     emit(e, "if (!(");
                     for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
                         if (ri > 0) emit(e, " || ");
-                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
+                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + %dULL <= 0x%llxULL)",
                              tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
-                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                             tmp, g2_span - 1,
+                             (unsigned long long)e->checker->mmio_ranges[ri][1]);
                     }
                     emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
                 }
@@ -6952,12 +6958,15 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
                     emit(e, "); ");
                     if (need_range_check) {
+                        /* plt86m audit 2026-06-17: span-aware (see AST path). */
+                        int g2_span = g2_align > 1 ? g2_align : 1;
                         emit(e, "if (!(");
                         for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
                             if (ri > 0) emit(e, " || ");
-                            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL)",
+                            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + %dULL <= 0x%llxULL)",
                                  tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
-                                 tmp, (unsigned long long)e->checker->mmio_ranges[ri][1]);
+                                 tmp, g2_span - 1,
+                                 (unsigned long long)e->checker->mmio_ranges[ri][1]);
                         }
                         emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
                     }

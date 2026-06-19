@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// plt86m audit 2026-06-17: move-struct variant of the defer-use-after-free
+// class. The body move-transfers t, then the deferred use_tok(t) fires on the
+// moved-from value. The non-defer form (take(t); use_tok(t);) was already
+// rejected as use-after-move.
+move struct Token { u32 v; }
+void take(Token t) { t.v = t.v; }      // consumes ownership
+void use_tok(Token t) { t.v = t.v; }
+
+void run() {
+    Token t;
+    t.v = 1;
+    defer use_tok(t);   // schedule USE at scope exit
+    take(t);            // t now TRANSFERRED in path state
+    return;             // defer fires use_tok(t) on a moved value
+}
+
+i32 main() { run(); return 0; }

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// plt86m audit 2026-06-17: the defer-body scan only looked for FREE calls, so
+// a defer-scheduled USE of a pointer the body already freed slipped through.
+// The non-defer form (sl.free_ptr(p); use_item(p);) was already rejected.
+struct Item { u32 id; }
+Slab(Item) sl;
+
+void use_item(*Item p) { p.id = 5; }
+
+void run() {
+    *Item p = sl.alloc_ptr() orelse return;
+    defer use_item(p);   // scheduled USE at scope exit
+    sl.free_ptr(p);      // p FREED in path state
+    return;              // defer fires use_item(p) on a freed pointer
+}
+
+i32 main() { run(); return 0; }

@@ -1,0 +1,9 @@
+// plt86m audit 2026-06-17 (over-rejection guard for inttoptr_size_past_range):
+// a single-byte *u8 access at exactly the range end must STILL compile — the
+// span fix is byte-identical to the old start-only check when sizeof(T)==1.
+// The pointer is created but never dereferenced, so the program exits 0.
+mmio 0x40000000..0x4000FFFD;
+i32 main() {
+    volatile *u8 reg = @inttoptr(*u8, 0x4000FFFD);
+    return 0;
+}

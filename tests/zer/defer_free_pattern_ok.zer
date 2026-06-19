@@ -1,0 +1,26 @@
+// plt86m audit 2026-06-17 (over-rejection guard for the defer-use fix): the
+// canonical `defer free(p)` cleanup must NOT be flagged — a free statement's
+// own argument is not a "use". A defer that USES then FREES within itself is
+// also legit (the use runs against a still-alive p). Both must compile + run.
+struct Item { u32 id; }
+Slab(Item) sl;
+
+void touch(*Item p) { p.id = 9; }
+
+void simple_free() {
+    *Item p = sl.alloc_ptr() orelse return;
+    defer sl.free_ptr(p);   // canonical deferred cleanup — p never used after
+    p.id = 7;
+}
+
+void use_then_free() {
+    *Item p = sl.alloc_ptr() orelse return;
+    defer { touch(p); sl.free_ptr(p); }   // use-then-free WITHIN the defer
+    p.id = 7;
+}
+
+i32 main() {
+    simple_free();
+    use_then_free();
+    return 0;
+}

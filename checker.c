@@ -1123,7 +1123,30 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
                 n->ident.name, (uint32_t)n->ident.name_len);
             return (s && s->is_nonkeep_derived) ? s->nonkeep_root_param : -1;
         }
-        default: return -1;
+        /* Exhaustive (no default:) per the walker-default audit / -Wswitch
+         * discipline (the keep commit 856fbb0 shipped a `default: return -1`
+         * here; it was masked because CRLF .sh shebangs made make stop before
+         * the audit). Any other node kind can't be traced to a caller-param
+         * root, so the keep-escape trace gives up (return -1) — but listing
+         * every kind makes GCC -Wswitch flag a NEW NODE_ kind that might need
+         * a trace rule, instead of silently returning -1 (a latent keep gap).
+         * Behaviorally identical to the old default. */
+        case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+        case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+        case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+        case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+        case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
+        case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+        case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+        case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+        case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+        case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+        case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+        case NODE_BINARY: case NODE_ASSIGN: case NODE_CALL:
+        case NODE_CAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+            return -1;
         }
     }
     return -1;
@@ -1916,6 +1939,27 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         }
         const char *cname = tn->container.name;
         uint32_t cnlen = (uint32_t)tn->container.name_len;
+
+        /* plt86m audit 2026-06-17: a const/volatile-qualified container type
+         * argument (e.g. Box(const u32)) silently DROPS the qualifier during
+         * monomorphization — the stamped field becomes plain `u32` and the
+         * callee mutates it freely, erasing the caller's stated invariant.
+         * Mirror BUG-738's named-type rule (composite shapes like Box(*T)/
+         * Box(?T) are already rejected): reject a qualifier-wrapped type arg.
+         * (Propagating const into the field would be a larger change; the
+         * audit's Expected is rejection.) */
+        if (tn->container.type_arg &&
+            (tn->container.type_arg->kind == TYNODE_CONST ||
+             tn->container.type_arg->kind == TYNODE_VOLATILE)) {
+            _container_depth--;
+            checker_error(c, tn->loc.line,
+                "container type argument cannot be '%s'-qualified — the "
+                "qualifier is dropped during monomorphization; wrap the "
+                "qualified type in a named struct instead",
+                tn->container.type_arg->kind == TYNODE_CONST ? "const" : "volatile");
+            return ty_void;
+        }
+
         Type *concrete = resolve_type(c, tn->container.type_arg);
 
         /* Check cache first */
@@ -6949,10 +6993,26 @@ static Type *check_expr(Checker *c, Node *node) {
                         int64_t cval = eval_const_expr(node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
+                        /* plt86m audit 2026-06-17: the range gate must account
+                         * for the ACCESS SPAN (sizeof T), not just the start
+                         * address — a *u32 at range_end-2 reads 2 bytes past the
+                         * declared end. span>=1 (compound/unknown width -> 1, so
+                         * *u8 and struct targets behave exactly as before; only
+                         * known scalar widths 2/4/8 tighten the upper bound).
+                         * Use type_dispatch_kind (audit-safe) then unwrap. */
+                        uint64_t span = 1;
+                        if (result && type_dispatch_kind(result) == TYPE_POINTER) {
+                            Type *sinner = type_unwrap_distinct(result);
+                            if (sinner->pointer.inner) {
+                                int wb = type_width(sinner->pointer.inner) / 8;
+                                if (wb > 1) span = (uint64_t)wb;
+                            }
+                        }
                         int in_range = 0;
                         if (c->mmio_range_count > 0) {
                             for (int ri = 0; ri < c->mmio_range_count; ri++) {
-                                if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1]) {
+                                if (addr >= c->mmio_ranges[ri][0] &&
+                                    addr + (span - 1) <= c->mmio_ranges[ri][1]) {
                                     in_range = 1;
                                     break;
                                 }
@@ -6980,9 +7040,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* Delegate the combined decision; split messages for clarity. */
                         if (zer_mmio_inttoptr_allowed(in_range, aligned) == 0) {
                             if (in_range == 0) {
+                                /* span>1: the start is in range but the access
+                                 * (sizeof T bytes) extends past the range end. */
                                 checker_error(c, node->loc.line,
-                                    "@inttoptr address 0x%llx is outside all declared mmio ranges",
-                                    (unsigned long long)addr);
+                                    "@inttoptr %llu-byte access at 0x%llx (ends 0x%llx) "
+                                    "is outside all declared mmio ranges",
+                                    (unsigned long long)span,
+                                    (unsigned long long)addr,
+                                    (unsigned long long)(addr + span - 1));
                             } else {
                                 checker_error(c, node->loc.line,
                                     "@inttoptr address 0x%llx is not aligned to %d bytes (required for %s)",
@@ -14407,6 +14472,38 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     "global variable '%.*s' initializer must be a constant expression — "
                     "cannot call functions at global scope",
                     (int)decl->var_decl.name_len, decl->var_decl.name);
+            }
+            /* plt86m audit (x9-11 completeness): bit-query / byte-swap
+             * intrinsics emit __builtin_*(arg) directly, so a NON-constant arg
+             * makes GCC reject the global init with the cryptic "initializer
+             * element is not constant". Catch it here with a clean ZER error.
+             * eval_const_expr (non-scoped) matches GCC's notion of a foldable
+             * arg: literals/arith fold; a plain ident (variable OR const, which
+             * ZER emits as a real C `const` var) does not. NODE_FIELD is skipped
+             * to avoid over-rejecting an enum constant (State.x) which IS a C
+             * constant but which eval_const_expr can't see (checker.c:2768). */
+            if (ginit->kind == NODE_INTRINSIC && ginit->intrinsic.arg_count >= 1 &&
+                ginit->intrinsic.args[0] &&
+                ginit->intrinsic.args[0]->kind != NODE_FIELD) {
+                const char *gn = ginit->intrinsic.name;
+                uint32_t gl = (uint32_t)ginit->intrinsic.name_len;
+                int is_bitq =
+                    (gl == 8 && memcmp(gn, "popcount", 8) == 0) ||
+                    (gl == 3 && memcmp(gn, "ctz", 3) == 0) ||
+                    (gl == 3 && memcmp(gn, "clz", 3) == 0) ||
+                    (gl == 3 && memcmp(gn, "ffs", 3) == 0) ||
+                    (gl == 6 && memcmp(gn, "parity", 6) == 0) ||
+                    (gl == 7 && (memcmp(gn, "bswap16", 7) == 0 ||
+                                 memcmp(gn, "bswap32", 7) == 0 ||
+                                 memcmp(gn, "bswap64", 7) == 0));
+                if (is_bitq &&
+                    eval_const_expr(ginit->intrinsic.args[0]) == CONST_EVAL_FAIL) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' initializer must be a compile-time "
+                        "constant — @%.*s requires a constant argument at global scope",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)gl, gn);
+                }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */
             if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {

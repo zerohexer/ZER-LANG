@@ -1493,6 +1493,72 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     }
 }
 
+/* plt86m audit 2026-06-17: walk a defer body and check non-free USES against
+ * the supplied exit path state `ps`. A USE of an entity that is FREED /
+ * move-TRANSFERRED at scope exit is a use-after-free / use-after-move — the
+ * defer fires AFTER the body's frees/moves, but the deferred statement is
+ * lifted out of the linear IR stream, so the ordinary use-checker
+ * (ir_check_expr_uaf during the fixpoint) never sees it. We route it through
+ * the SAME checker here. A free(x)/free_ptr(x) statement's argument is NOT a
+ * use (freeing in a defer is the normal cleanup pattern — handled by
+ * ir_defer_scan_frees), so skip those. `rs` dedups reports per root-local
+ * across every return block + defer in the function. */
+static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                Node *body, int defer_line, UafReportSet *rs) {
+    if (!body) return;
+
+    if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
+        ir_defer_free_arg(body) == NULL) {
+        ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
+    }
+
+    switch (body->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < body->block.stmt_count; i++)
+            ir_defer_scan_uses(zc, func, ps, body->block.stmts[i], defer_line, rs);
+        break;
+    case NODE_IF:
+        ir_defer_scan_uses(zc, func, ps, body->if_stmt.then_body, defer_line, rs);
+        ir_defer_scan_uses(zc, func, ps, body->if_stmt.else_body, defer_line, rs);
+        break;
+    case NODE_FOR:
+        ir_defer_scan_uses(zc, func, ps, body->for_stmt.body, defer_line, rs);
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        ir_defer_scan_uses(zc, func, ps, body->while_stmt.body, defer_line, rs);
+        break;
+    case NODE_SWITCH:
+        for (int i = 0; i < body->switch_stmt.arm_count; i++)
+            ir_defer_scan_uses(zc, func, ps, body->switch_stmt.arms[i].body, defer_line, rs);
+        break;
+    case NODE_CRITICAL:
+        ir_defer_scan_uses(zc, func, ps, body->critical.body, defer_line, rs);
+        break;
+    case NODE_ONCE:
+        ir_defer_scan_uses(zc, func, ps, body->once.body, defer_line, rs);
+        break;
+    /* exhaustive (no default:) per the -Wswitch walker rule — leaf/non-
+     * control-flow kinds carry no scannable sub-body. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        break;
+    }
+}
+
 /* Propagate state through aliases sharing alloc_id. When `target` is
  * marked FREED or TRANSFERRED, other entities (bare or compound) with
  * the same alloc_id represent the same underlying allocation and must
@@ -2506,6 +2572,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         ch->state = IR_HS_TRANSFERRED;
                         ch->free_line = inst->source_line;
                     }
+                } else if (rhs->kind == NODE_INDEX &&
+                           rhs->index_expr.index &&
+                           rhs->index_expr.index->kind != NODE_INT_LIT) {
+                    /* Companion to BUG-741 (the variable-index FREE barrier): a
+                     * VARIABLE-index MOVE out of a move-struct array element —
+                     * `Token m = arr[i]`. Key extraction only accepts literal
+                     * indices (ir_measure/build_key_path return -1 otherwise),
+                     * so the move was previously untracked and every element
+                     * stayed ALIVE, making a later literal-index read (arr[0]) a
+                     * silent use-after-move. The moved element's identity is
+                     * unknowable at compile time and — unlike the FREE path —
+                     * there are no pre-registered literal `[N]` move siblings to
+                     * widen, so this is a hard error (audit Expected). The
+                     * enclosing ir_should_track_move(dest type) guard keeps this
+                     * off non-move arrays (`u32 x = arr[i]` is unaffected). */
+                    ir_zc_error(zc, inst->source_line,
+                        "variable-index move from a move-struct array — any "
+                        "element may have been moved; index by a literal or "
+                        "hand off the whole array");
                 }
             }
 
@@ -4485,6 +4570,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      *
      * We walk all blocks to collect defers once, then apply to each return
      * block's state. */
+    /* plt86m audit 2026-06-17: also check defer-body USES (not just frees)
+     * against each return block's PRISTINE exit state — a deferred USE of a
+     * handle the body already freed / move-transferred is a use-after-free /
+     * use-after-move. The uses-pass runs BEFORE the frees-pass below so a
+     * `defer free(h); defer use(h)` (LIFO-valid: use fires first, against a
+     * still-ALIVE h) is not false-flagged; the shared `defer_use_rs` dedups
+     * reports per root-local across all return blocks. */
+    UafReportSet defer_use_rs = {0};
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
         if (bb->inst_count == 0) continue;
@@ -4492,6 +4585,17 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (last->op != IR_RETURN) continue;
 
         IRPathState *ret_ps = &block_states[bi];
+        /* uses-pass: pristine exit state, before this block's frees apply */
+        for (int di = 0; di < func->block_count; di++) {
+            IRBlock *db = &func->blocks[di];
+            for (int dj = 0; dj < db->inst_count; dj++) {
+                IRInst *inst = &db->insts[dj];
+                if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
+                ir_defer_scan_uses(zc, func, ret_ps, inst->defer_body,
+                                   inst->source_line, &defer_use_rs);
+            }
+        }
+        /* frees-pass: marks FREED for leak detection (mutates ret_ps) */
         for (int di = 0; di < func->block_count; di++) {
             IRBlock *db = &func->blocks[di];
             for (int dj = 0; dj < db->inst_count; dj++) {
@@ -4502,6 +4606,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
         }
     }
+    free(defer_use_rs.ids);
 
     /* Phase D6: ghost handle detection — compute which allocated handles
      * are NEVER read subsequently. `pool.alloc()` as a bare expression

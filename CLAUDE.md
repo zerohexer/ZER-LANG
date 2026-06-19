@@ -100,6 +100,22 @@ counter was corrupted, not real recursion; (3) `objdump`/`nm` the actual emitted
 code, don't trust the source. Full playbook: docs/compiler-internals.md
 "Layout-fragile bug debugging".
 
+**`make check` exit=2 is NOT always "just the CRLF artifact" — CRLF MASKS the
+audits (cost a debug cycle 2026-06-19e).** On a Windows checkout the `.sh` test
+runners have `#!/bin/bash^M` shebangs, so `tests/test_zer.sh` (Makefile line
+~166) fails Error 127 and `make` STOPS THERE — *before* reaching the audit gates
+that run last (`walker_default_audit.sh` ~182, `audit_type_dispatch.sh`,
+`audit_fixed_buffers.sh`). So a REAL audit failure (a new `default:` in a
+kind/op switch, a new raw `->kind == TYPE_` site, a new fixed buffer) is
+SILENTLY MASKED — the run dies at the CRLF script and never reaches the audit.
+The keep commit (856fbb0) shipped a walker-default violation this way. **Before
+trusting a green `make check`, normalize line endings so make reaches the
+audits:** `find . -name "*.sh" -exec sed -i 's/\r$//' {} +` (the Docker harness
+should always do this). A genuinely-green run shows `MAKE_CHECK_EXIT=0` AND the
+audit lines ("OK — no default: clauses…", "OK — no new raw type-dispatch
+sites"). exit=2 with those lines ABSENT means an earlier step (often CRLF)
+aborted make before the audits — investigate, don't wave it off.
+
 ---
 
 ## ZER Language — Complete Quick Reference

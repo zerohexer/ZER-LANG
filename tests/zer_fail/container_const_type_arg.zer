@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// plt86m audit 2026-06-17: a const-qualified container type argument silently
+// dropped the qualifier during monomorphization (Box_u32 field became plain
+// u32), letting the callee mutate a value the caller declared const. Now
+// rejected (mirrors BUG-738's named-type rule).
+container Box(T) { T value; }
+void show(Box(const u32) b) { b.value = 99; }
+i32 main() { Box(const u32) b; show(b); return (i32)b.value; }

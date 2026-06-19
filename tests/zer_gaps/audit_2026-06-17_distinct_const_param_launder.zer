@@ -1,0 +1,30 @@
+// AUDIT 2026-06-17 — HIGH severity (silent const-strip via distinct typedef
+// at function argument boundary)
+//
+// Companion to audit_2026-06-17_distinct_const_var_decl_launder.zer —
+// same root cause (TYPE_DISTINCT not unwrapped before `kind` check),
+// different site.
+//
+// Plain pointer equivalent: REJECTED at checker.c:4971
+//   ```
+//   void try_write(*u32 m) { *m = 42; }
+//   const *u32 cm = ...; try_write(cm);   // errors
+//   ```
+//
+// Distinct typedef variant: ACCEPTED. `cm` has type `const MyPtr`
+// (which is TYPE_DISTINCT wrapping a const pointer), the call-arg
+// const check at checker.c:4971 sees TYPE_DISTINCT not TYPE_POINTER,
+// the const guard never fires, and the callee writes to memory
+// through what the caller thought was a read-only view.
+
+distinct typedef *u32 MyPtr;
+u32 BUF = 0;
+
+void try_write(MyPtr m) { *m = 42; }
+
+i32 main() {
+    MyPtr m = @cast(MyPtr, &BUF);
+    const MyPtr cm = m;       // const view
+    try_write(cm);             // SHOULD reject: const distinct -> mutable param
+    return (i32)BUF;           // returns 42 = write succeeded
+}

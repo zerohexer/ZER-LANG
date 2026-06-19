@@ -1,0 +1,29 @@
+// AUDIT 2026-06-17 — HIGH severity (silent UAF — variant of
+// docs/limitations.md "OPEN — defer body uses a handle the function
+// body then frees" gap, exercising slab.alloc_ptr/free_ptr instead
+// of Pool Handle.)
+//
+// Same root cause: zercheck_ir.c `ir_defer_scan_frees` (~line 1387)
+// scans defer bodies for FREE calls only, never for USES against the
+// post-body path state. Body frees the pointer, defer fires a USE on
+// the dead pointer.
+//
+// The non-defer form (`sl.free_ptr(p); use_item(p);`) IS correctly
+// rejected — only the defer-scheduled use path slips through.
+//
+// Expected: COMPILE ERROR ("use after free: 'p' is freed")
+// Actual:   compiles clean, exit 0 at runtime (poisoned read).
+
+struct Item { u32 id; }
+Slab(Item) sl;
+
+void use_item(*Item p) { p.id = 5; }
+
+void run() {
+    *Item p = sl.alloc_ptr() orelse return;
+    defer use_item(p);   // scheduled use at scope exit
+    sl.free_ptr(p);      // p now FREED in path state
+    return;              // defer fires use_item(p) on freed pointer
+}
+
+i32 main() { run(); return 0; }

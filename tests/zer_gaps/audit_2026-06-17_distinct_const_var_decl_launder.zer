@@ -1,0 +1,42 @@
+// AUDIT 2026-06-17 — HIGH severity (silent const-strip via distinct typedef)
+//
+// Gap: assigning a `const MyPtr` (distinct typedef pointer) to a
+// non-const `MyPtr` variable bypasses the const-launder gate.
+//
+// Plain pointer equivalent: REJECTED at checker.c:8807
+//   ```
+//   *u32 m = &BUF;
+//   const *u32 cm = m;
+//   *u32 alias = cm;   // 3 errors fire
+//   ```
+//
+// Distinct typedef variant: ACCEPTED (compiles clean) because
+// checker.c:8807 dispatches on `type->kind == TYPE_POINTER` WITHOUT
+// first calling `type_unwrap_distinct()`. A distinct typedef has
+// kind TYPE_DISTINCT, the check silently skips, the assignment goes
+// through, and the resulting non-const alias can write to the
+// underlying memory.
+//
+// Same class as audit_2026-06-12_distinct_const_deref_write (which
+// is the deref-write site) — both stem from missing distinct unwrap
+// on const checks. Verified manifestations:
+//   - var-decl init: checker.c:8807 (this file)
+//   - assignment:    checker.c:4194
+//   - call args:     checker.c:4965 (slice) + 4971 (pointer)
+//   - field assign:  same root cause via assignment site
+//   - distinct slice variant compiles + writes to backing memory
+//
+// Expected: COMPILE ERROR ("cannot initialize mutable pointer from
+//           const — would allow writing to read-only memory")
+// Actual:   compiles, write to STATIC_BUF succeeds (returns 7)
+
+distinct typedef *u32 MyPtr;
+u32 STATIC_BUF = 100;
+
+i32 main() {
+    MyPtr g = @cast(MyPtr, &STATIC_BUF);
+    const MyPtr cg = g;       // const view of distinct typedef
+    MyPtr alias = cg;         // SHOULD BE rejected — drops const
+    *alias = 7;
+    return (i32)STATIC_BUF;
+}

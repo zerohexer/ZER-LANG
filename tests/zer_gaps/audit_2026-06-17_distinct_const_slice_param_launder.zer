@@ -1,0 +1,28 @@
+// AUDIT 2026-06-17 — HIGH severity (silent const-strip via distinct
+// typedef SLICE at function argument boundary)
+//
+// Same class as audit_2026-06-17_distinct_const_param_launder.zer —
+// const-strip via distinct typedef bypass — but for SLICE types.
+//
+// Plain slice equivalent: REJECTED at checker.c:4965
+//   ```
+//   void try_write([]u8 s) { s[0] = 42; }
+//   const []u8 cm = ...; try_write(cm);   // errors
+//   ```
+//
+// Distinct typedef SLICE variant: ACCEPTED. The call-arg slice const
+// check at checker.c:4965 dispatches on `arg->kind == TYPE_SLICE`
+// without unwrap_distinct — same kind-not-unwrapped pattern.
+//
+// Runtime: 42 — write through "const slice view" succeeded.
+
+distinct typedef []u8 MySlice;
+void try_write(MySlice s) { s[0] = 42; }
+
+i32 main() {
+    u8[10] data;
+    MySlice m = @cast(MySlice, data[0..]);
+    const MySlice cm = m;
+    try_write(cm);   // SHOULD reject: const distinct slice -> mutable param
+    return (i32)data[0];   // returns 42 = write succeeded
+}

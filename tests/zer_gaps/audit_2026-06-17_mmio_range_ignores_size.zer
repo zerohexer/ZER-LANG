@@ -1,0 +1,32 @@
+// AUDIT 2026-06-17 — MEDIUM severity (silent off-end MMIO access)
+//
+// Gap: `@inttoptr(*T, addr)` validates `addr` against declared
+// `mmio` ranges with `addr <= range[1]`, but does NOT account for
+// `sizeof(T)`. A u32 access at address `range[1] - 2` extends to
+// `range[1] + 1` — past the declared end.
+//
+// Reproducer: mmio range ends at 0x4000_FFFD (last valid BYTE),
+// but the checker accepts a `*u32` at 0x4000_FFFC even though the
+// u32 access reads 0x4000_FFFC..0x4000_FFFF — two bytes off-range.
+//
+// Sibling sites in checker.c that compute `rsz` correctly
+// (~lines 6010-6013) but the @inttoptr range gate at 6833-6839
+// ignores it. 9391-9394 has the same single-byte check pattern.
+//
+// Real safety issue: off-end MMIO access writes into unrelated
+// peripheral / unmapped memory → SIGBUS, peripheral lockup, or
+// hardware-consequence corruption that the explicit `mmio` range
+// declaration was meant to prevent at the program-consequence
+// boundary.
+//
+// Expected: COMPILE ERROR ("@inttoptr u32 access at 0x4000FFFC
+//           extends past mmio range end 0x4000FFFD")
+// Actual:   compiles clean
+
+mmio 0x4000_0000..0x4000_FFFD;
+
+i32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x4000_FFFC);
+    reg[0] = 1;   // writes bytes 0x4000_FFFC..0x4000_FFFF
+    return 0;
+}

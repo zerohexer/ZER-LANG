@@ -1973,6 +1973,58 @@ Heisenbug in the source.
 
 ---
 
+## OPEN — 2026-06-17 audit (from plt86m branch): 9 verified gaps + x9-11 completeness
+
+Nine gaps documented on branch `claude/cool-johnson-plt86m`, INDEPENDENTLY
+re-verified real this session (each reproduced on baseline). Reproducers:
+`tests/zer_gaps/audit_2026-06-17_*.zer`. 6 are NEW; 3 fold into known classes
+(noted). None fixed yet.
+
+**Theme A — defer + control flow:**
+- `defer_goto_fallthrough_drops` (NEW, HIGH miscompile): when a defer scope has a
+  `goto` exit AND a sibling fall-through exit, the emitter (IR_DEFER_FIRE, shared
+  `defer_stack`) pops at the first fire and emits NOTHING on the sibling block —
+  the deferred cleanup (free / unlock / `@cpu_enable_int` / close) is silently
+  elided on the non-goto path. Distinct from the known goto/defer double-fire.
+  Fix sketch: copy (not move) the stack entries to a per-block emitted-fire set.
+- `defer_use_after_alloc_ptr`, `defer_use_after_move` (KNOWN class): a
+  defer-scheduled USE of a slab pointer / move-struct the body then frees/consumes.
+  Siblings of the documented 2026-06-15 "defer body uses a handle the function
+  then frees" gap (`ir_defer_scan_frees` scans defer bodies for FREE, not USE).
+
+**Theme B — distinct typedef defeats const-strip (NEW; the #1 distinct-unwrap class):**
+- `distinct_const_var_decl_launder` (checker.c var-decl init ~8807),
+  `distinct_const_param_launder` (call-arg ~4971),
+  `distinct_const_slice_param_launder` (slice arg ~4965): a `distinct typedef`
+  over a const pointer/slice bypasses the const-launder check because the site
+  tests `t->kind == TYPE_POINTER/TYPE_SLICE` without `type_unwrap_distinct` first.
+  Verified asymmetry: the PLAIN (non-distinct) variant IS rejected; the distinct
+  one compiles clean. Fix: `type_dispatch_kind` / unwrap at each site (~10 lines
+  each; assignment site ~4194 too).
+
+**Other:**
+- `mmio_range_ignores_size` (NEW): `@inttoptr(*u32, addr)` validates
+  `addr <= range_end` without `+ sizeof(T) - 1`, so a u32 at `range_end-2` reads
+  2 bytes past the declared mmio range (checker.c ~6833).
+- `container_const_strip` (KNOWN/WAD): `container Box(const u32)` monomorphizes
+  dropping the qualifier (BUG-738 shape); const-strip is not unique to
+  monomorphization — verify before fixing.
+- `var_index_move_array` (NEW): `Token m = arr[i]; consume(m); use(arr[0])` with a
+  VARIABLE index is silently untracked — companion to BUG-741 (the variable-index
+  argument-precise barrier was applied to FREE only, not MOVE). `zercheck_ir.c`
+  `ir_extract_compound_key` rejects variable indices.
+
+**x9-11 completeness (from the BH-18 #11 review, fixed 2026-06-19c for constants):**
+the bit-query intrinsic global-init fix is complete for CONSTANT args. A
+NON-constant arg in a global initializer (`u32 a=5; u32 g=@popcount(a);`) now
+emits `__builtin_popcount(a)`, which GCC rejects ("initializer element is not
+constant") instead of a clean ZER error. NOT a regression (baseline silently
+emitted the wrong `0`, and ZER has no global-init constness check at all —
+`u32 g=a+1;` fails identically at GCC). Fix sketch: a checker rule rejecting
+non-constant intrinsic args in global initializers with a clean ZER message.
+
+---
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

@@ -1,0 +1,23 @@
+// AUDIT 2026-06-17 — MEDIUM severity (silent UB — move-struct variant
+// of the defer-use-after-body-free class; see docs/limitations.md
+// "OPEN — defer body uses a handle the function body then frees").
+//
+// Same root cause: zercheck_ir.c's defer-body scan walks defers only
+// for FREE calls; non-free USES of an entity transitioned out of
+// ALIVE (here, TRANSFERRED via move) by the body before the defer
+// fires are NOT checked. The non-defer form
+// (`take(t); use_tok(t);`) IS correctly rejected as use-after-move.
+
+move struct Token { u32 v; }
+void take(Token t) { t.v = t.v; }   // consumes ownership
+void use_tok(Token t) { t.v = t.v; }
+
+void run() {
+    Token t;
+    t.v = 1;
+    defer use_tok(t);   // schedule use at scope exit
+    take(t);            // t now TRANSFERRED in path state
+    return;             // defer fires use_tok(t) on moved value
+}
+
+i32 main() { run(); return 0; }

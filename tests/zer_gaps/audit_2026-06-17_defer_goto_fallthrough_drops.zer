@@ -1,0 +1,47 @@
+// AUDIT 2026-06-17 — HIGH severity (silent miscompilation — defer dropped)
+//
+// Gap: when a defer scope contains a `goto` that exits via one path,
+// the defer body is silently NOT emitted on the SIBLING fall-through
+// exit path from the same scope.
+//
+// IR_DEFER_FIRE at emitter.c:9700 uses a shared defer_stack and pops
+// at the first fire. If the CFG has two sibling DEFER_FIRE
+// instructions (one in goto-path block, one in fall-through block),
+// the emitter visits the goto path first, pops the entry, then visits
+// the fall-through block and finds an empty stack -> emits nothing.
+//
+// Symptom in real code: Pool/Slab handles leaked on non-goto paths,
+// shared-struct locks NOT released, file descriptors NOT closed,
+// @cpu_enable_int NOT restored, arena cleanup skipped.
+//
+// Reproducer below: defer mark() should fire on fall-through (x=5)
+// but does NOT. The IR has BOTH DEFER_FIRE instructions; the emitter
+// drops the second one because the first popped the stack.
+//
+// Expected: g_called == 1 after multi_path(5)
+// Actual:   g_called == 0 (return 0 from main)
+//
+// Runtime proof of severity: 4 calls to a function with the same
+// defer + goto + fall-through shape, where defer is `gp.free(h)`,
+// leak all Pool slots; the next alloc fails despite every prior call
+// "completing." The dropped defer means production code with Pool/
+// Slab/file/lock cleanup is silently broken on the non-goto path.
+
+i32 g_called = 0;
+void mark() { g_called += 1; }
+
+u32 multi_path(u32 x) {
+    if (x > 0) {
+        defer mark();
+        if (x == 1) { goto done; }
+        // fall-through here — should fire mark()
+    }
+    return 100;
+done:
+    return 200;
+}
+
+i32 main() {
+    multi_path(5);     // takes fall-through; defer SHOULD fire but doesn't
+    return g_called;   // returns 0 — bug; should return 1
+}

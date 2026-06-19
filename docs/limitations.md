@@ -1973,30 +1973,59 @@ Heisenbug in the source.
 
 ---
 
-## OPEN — 2026-06-17 audit (from plt86m branch): 1 gap left (defer-goto-drop); 8 of 9 FIXED
+## OPEN — 2026-06-17 audit (from plt86m branch): 8 of 9 FIXED; defer-goto still OPEN
 
 Nine gaps documented on branch `claude/cool-johnson-plt86m`, INDEPENDENTLY
-re-verified real (each reproduced on baseline). **8 of 9 are now FIXED**
-(2026-06-19d/e); **only `defer_goto_fallthrough_drops` remains OPEN.** Each
-fixed gap has a `tests/zer_fail/` tripwire (and a `tests/zer/` over-rejection
-guard where relevant); see BUGS-FIXED.md "Session 2026-06-19d/e".
+re-verified real (each reproduced on baseline). **8 of 9 are FIXED**
+(2026-06-19d/e); **`defer_goto_fallthrough_drops` remains OPEN** — a
+capture-on-FIRE fix was attempted and REVERTED (analysis below). Each fixed gap
+has a `tests/zer_fail/` tripwire (and a `tests/zer/` positive guard where
+relevant); see BUGS-FIXED.md "Session 2026-06-19d/e".
 
-**STILL OPEN — `defer_goto_fallthrough_drops` (NEW, HIGH miscompile):** when a
-defer scope has a `goto` exit AND a sibling fall-through exit, the emitter
-(IR_DEFER_FIRE, shared `defer_stack`) pops at the first fire (block-ID order) and
-emits NOTHING on the sibling block — the deferred cleanup (free / unlock /
-`@cpu_enable_int` / close) is silently elided on the non-goto path. Distinct from
-the known goto/defer double-fire. Verified live in `rust_tests/rt_drop_defer_goto_cleanup.zer`
-(handle leaked on the non-goto return; test passes only because it asserts return
+**STILL OPEN — `defer_goto_fallthrough_drops` (HIGH miscompile) — harder than it
+looks; needs CFG defer-liveness dataflow:** when a defer scope has a `goto` exit
+AND a sibling fall-through exit, the emitter drops the defer body on the
+fall-through path (the shared compile-time `defer_stack` is consumed by the
+goto-path fire in block-ID order; the sibling fire finds it empty → emits
+nothing). Verified live in `rust_tests/rt_drop_defer_goto_cleanup.zer` (handle
+leaked on the normal-return path; the test passes because it asserts return
 values, not free side-effects). Reproducer:
-`tests/zer_gaps/audit_2026-06-17_defer_goto_fallthrough_drops.zer`. Root cause is
-EMISSION-stack-consumption, not lowering-missing-fire — both DEFER_FIRE insts ARE
-in the IR. Fix sketch: capture-on-FIRE — each IR_DEFER_FIRE carries its own
-snapshot of the live defer bodies (captured at lowering), so emission is
-order-independent; do NOT change the goto handler's `ctx->defer_count = 0` reset
-(ir_lower.c:3007, which prevents the double-fire). HIGH regression risk (defer is
-load-bearing) — verify by grepping emitted C for exact per-path free/mark counts,
-not just test exit codes.
+`tests/zer_gaps/audit_2026-06-17_defer_goto_fallthrough_drops.zer`.
+
+**Why the obvious fix (capture-on-FIRE) does NOT work — attempted + reverted
+2026-06-19f.** The idea: give each `IR_DEFER_FIRE` its own snapshot of the live
+defer bodies (captured at lowering), so emission is order-independent. It
+correctly fixes the sibling-fall-through DROP — BUT the emitter's shared-stack
+`pop=true` at a goto was LOAD-BEARING for a SECOND, opposite property: it
+prevented the **goto-to-cleanup-label double-fire** (the documented "defer fires
+twice when a goto target sits in the same scope" issue). The goto fires the
+defers and pops the stack; the cleanup label's own return then finds an empty
+stack and emits nothing. Capture-on-FIRE removes that pop's effect, so the
+cleanup label's return RE-fires the defers the goto already fired → **double-free
+/ double-close** on the goto path. So capture-on-FIRE trades a leak (fall-through
+drop) for a double-fire (cleanup label) — worse for non-gen-checked cleanup
+(`free_ptr`/move/`@cpu_enable_int`/file close); it only looks green because Pool
+free is gen-checked (a double free is a no-op) and the tests assert at the
+cleanup label, BEFORE the spurious return-fire.
+
+**Partial mitigation attempted (also insufficient):** reset `defer_count = 0` at
+a label that is a forward-goto target with no LIVE fall-through into it (preceding
+block terminated or empty/dead). This fixes the `return; cleanup:` shape
+(rt_drop_defer_goto_cleanup) but NOT the common `if (c) { goto cleanup; } ...;
+cleanup:` shape, nor `if (true) { goto cleanup; } deadcode; cleanup:`
+(rt_goto_fires_defer): the linear lowerer does not constant-fold `if`/reachability,
+so it treats the (dead or both-reachable) predecessor as a live fall-through with
+the defers still counted, and the cleanup return double-fires.
+
+**Real fix (future work):** CFG-level defer-liveness dataflow — compute, per
+block, the set of defers actually live on entry (merge of predecessors), instead
+of the single linear `defer_count`. Then each fire (sibling fall-through AND
+cleanup label) emits exactly the defers live on its path. This is a substantial
+change to the defer model (ir_lower.c), not a surgical patch. Do NOT re-attempt
+capture-on-FIRE alone — it is a known dead end (this analysis). Verify ANY future
+attempt by DIFFING emitted C per control-flow path (free/mark counts) across all
+`defer`+`goto` tests — several pass despite wrong cleanup because they assert
+return values, not side-effects (rt_drop_defer_goto_cleanup, rt_goto_fires_defer).
 
 **FIXED 2026-06-19e (5 gaps):**
 - `container_const_strip` — reject a `TYNODE_CONST`/`TYNODE_VOLATILE` container

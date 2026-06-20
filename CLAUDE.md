@@ -673,7 +673,14 @@ comptime if (1) {
 shared struct Counter { u32 value; u32 total; }
 Counter g;
 g.value = 42;              // auto: lock → write → unlock
-g.total = g.value + 1;     // same lock scope (grouped with above)
+g.total = g.value + 1;     // SEPARATE lock scope — locking is PER-STATEMENT, NOT
+                           // grouped (current_stmt_shared_root, ir_lower.c). Two
+                           // statements = two lock/unlock pairs; the lock is
+                           // released between them. This is what makes cross-
+                           // statement lock ordering deadlock-free; it also means
+                           // multi-statement check-then-act is NOT atomic (see the
+                           // `locked g {}` design discussion in
+                           // docs/primitives-data-races.md §24).
 
 // spawn — fire-and-forget thread creation:
 spawn worker(&g);           // OK — *shared struct, auto-locked
@@ -702,6 +709,25 @@ a.x = 1; b.y = 2;          // OK — separate statements, no nested locks
 b.y = 2; a.x = 1;          // OK — separate statements, locks released between
 a.x = b.y;                 // ERROR — same statement accesses both A and B
 ```
+
+> **CONCURRENCY MEMORY-SAFETY STATUS (audited 2026-06-20, NOT closed) — READ
+> BEFORE touching/claiming anything about ZER concurrency safety.** All
+> concurrency PRIMITIVES are implemented (shared/spawn/atomics/Semaphore/Barrier/
+> condvar/Ring/async/move). But three adversarial sweeps found **~25 verified
+> cross-thread MEMORY-safety holes** (data races + cross-thread UAF) that compile
+> clean today. They are NOT independent bugs — they map to **four architectural
+> axes** (A reachability/exclusion-list scanner, B single-root auto-lock
+> incompleteness, C per-function CFG lattice that never merges `threads[]`, D
+> cinclude/emitter-runtime concurrency-capture boundary). ZER's concurrency claim
+> is therefore **"designed to match Rust's memory safety via auto-inference, but
+> not yet complete"** — do NOT state ZER is data-race-safe as shipped. The full
+> verified hole inventory, the four-axis closure design, the Rust mapping, and the
+> single most-actionable bug (axis C: `ir_merge_states` drops scoped-spawn join
+> obligations at every CFG merge → false-green stack-UAF) are in
+> **`docs/limitations.md` "## OPEN — Concurrency memory-safety"** and
+> **`docs/primitives-data-races.md` §24**. Liveness (deadlock/livelock) is the
+> named floor — out of scope for ZER *and* Rust. This is subsystem-scale work, not
+> patches. See also [[project_concurrency_audit]] in memory.
 
 ### Move Struct — Ownership Transfer
 ```
@@ -885,6 +911,14 @@ zero admits; all 203 safety_list.md rows have real proofs. Phase 1 extraction
 COMPLETE (85/85 predicates in `src/safety/`, linked into zerc AND VST-verified
 by `make check-vst` — same .c file, no divergence possible). Phase 2 (decision
 extraction) 4/60. `make check-proofs` verifies zero admits.
+NEW 8th subset (2026-06-21): `lambda_zer_concurrency/` (10 files, zero admits) —
+the FIRST WP-using + threadpool subset; proves the four-condition concurrency
+closure (SUFFICIENCY). The WP-atomic-lifting RECIPE for ZER's flat languages + the
+per-file iteration build command + Iris-version gotchas (↦ notation absent, unit
+`tt` not `()`, `congruence`-fails-on-lookups, `done`-can't-close-iProp) are in
+`docs/proof-internals.md` "λZER-Concurrency subset" — READ before any concurrency
+proof work. Remaining: operational adequacy (generic plumbing) + wp_store/shared
+specs + formal necessity. Compiler implementation of the closure NOT started.
 
 The three levels (keep straight in any claim):
 - **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.

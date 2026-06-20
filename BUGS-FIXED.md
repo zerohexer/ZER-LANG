@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
+
+**Not a bug-fix session — recorded here for chronological continuity.** Three
+adversarial, code-grounded sweeps (each finding verified against the actual
+handlers) found **~25 cross-thread memory holes** (data races + cross-thread UAF)
+that compile clean. They are NOT fixed — they are documented OPEN in
+`docs/limitations.md` "## OPEN — Concurrency memory-safety", grouped into four
+architectural axes (exclusion-list scanner / single-root auto-lock / per-function
+CFG lattice dropping `threads[]` at merges / cinclude-runtime boundary). The single
+concrete shipped soundness bug to fix FIRST: `ir_merge_states` (zercheck_ir.c:573-643)
+merges `handles[]` but not `threads[]` ⇒ scoped-spawn join obligations silently
+dropped at CFG merges ⇒ false-green stack-UAF.
+
+Built the operational Coq/Iris proof of the closure:
+`proofs/operational/lambda_zer_concurrency/` (10 files, zero admits — the first
+WP-using + threadpool subset), proving the four conditions compose to make
+cross-thread hazards inexpressible (sufficiency). Design/Rust-mapping/Iris-decision:
+`docs/primitives-data-races.md` §24/§24.6; proof recipe + gotchas:
+`docs/proof-internals.md` "λZER-Concurrency subset". Compiler implementation of the
+closure is NOT started (prove-first; implement is phase 2).
+
+---
+
 ## Session 2026-06-20 — defer-goto-fallthrough drop FIXED (the 6th/last plt86m gap) — capture-on-FIRE + runtime guard
 
 **What broke (HIGH miscompile):** a defer scope with both a `goto` exit and a

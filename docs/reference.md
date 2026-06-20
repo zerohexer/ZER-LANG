@@ -2509,14 +2509,6 @@ zerc source.zer --probe-mode=disabled             # reject any @probe usage at c
 source.zer → Lexer → Parser → AST → Checker → ZER-CHECK → Emitter → .c → GCC → binary
 ```
 
-### Build
-
-```bash
-make docker-check      # build + test in Docker (preferred)
-make check             # build + test natively
-make docker-install    # build Windows binaries, install to PATH
-```
-
 ---
 
 ## CONCURRENCY

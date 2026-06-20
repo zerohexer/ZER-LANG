@@ -11023,3 +11023,30 @@ in order of cheapness, proven on the 2026-06-19 session:
    clean baseline to replicate a size change WITHOUT the new logic — if that
    passes, the bug is the logic, not the layout shift.
 Do NOT keep chasing the source with sanitizers once 1–3 point elsewhere.
+
+---
+
+## Concurrency memory-safety — audit + proof state (2026-06-21)
+
+Before touching ANY concurrency code (shared/spawn/atomics/Semaphore/Barrier/
+condvar/Ring/async/move) or claiming ZER concurrency is data-race-safe, read
+`docs/limitations.md` "## OPEN — Concurrency memory-safety". All concurrency
+PRIMITIVES are implemented, but three adversarial sweeps found **~25 verified
+cross-thread memory holes** (data races + cross-thread UAF) that compile clean.
+They map to **four architectural axes**: A) exclusion-list spawn scanner (volatile/
+Arena/threadlocal excluded, slice/opaque spawn-arg kinds uncased); B) single-root
+auto-lock incompleteness (multi-root / union-switch / cond-predicate / @once /
+defer-body unlocked); C) per-function CFG lattice that merges `handles[]` but NOT
+`threads[]` — so `ir_merge_states` (zercheck_ir.c:573-643) **silently drops
+scoped-spawn join obligations at every CFG merge = false-green stack-UAF, the one
+concrete shipped soundness bug, fix first**; D) cinclude/emitter-runtime
+concurrency-capture boundary. The closure (the fix, not yet implemented): a single
+inferred non-strippable `shared` taint (Model-4 extension of `volatile`) + auto-lock
+completeness + the CFG-lattice merging every tracked family + a cinclude capability,
+all frozen by a CI audit gate. Liveness (deadlock/livelock) is the named floor (same
+as Rust — Rust does NOT prevent deadlock either). Full design + Rust mapping +
+completeness-via-Iris decision: `docs/primitives-data-races.md` §24/§24.6. The
+four-condition closure is PROVEN (sufficiency) in Coq/Iris:
+`proofs/operational/lambda_zer_concurrency/` (10 files, zero admits, see its
+DESIGN.md + `docs/proof-internals.md` "λZER-Concurrency subset"). Status: closure
+proven, compiler implementation NOT started (prove-first; implement is phase 2).

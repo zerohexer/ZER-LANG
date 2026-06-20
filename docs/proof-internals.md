@@ -1953,3 +1953,77 @@ Each `↓` is enforced by a CI gate:
 Phase 6 is what MAKES the guarantee mechanical. Until Phase 6, the theory→implementation link depends on HUMAN DISCIPLINE.
 
 **Also in proofs/vst/:** 21 pre-extraction demonstrator proofs (verif_simple_check.v, verif_zer_checks.v, verif_zer_checks2.v). These are standalone `.c` files written for VST, NOT extracted from the compiler. They demonstrate the VST pattern but do NOT verify real compiler code — don't count them as compiler verification.
+
+---
+
+## λZER-Concurrency subset (2026-06-21) — the FIRST WP-using subset
+
+`proofs/operational/lambda_zer_concurrency/` (10 `.v` files, zero admits) is the
+operational Iris proof of ZER's concurrency memory-safety closure — built fresh
+this session, replacing the old SCHEMATIC `lambda_zer_handle/iris_concurrency.v`
+(which is all trivial `True` closures). It is the **first subset to use Iris's
+concurrent threadpool semantics** and the **first to build real `WP` triples** —
+every prior subset (handle/move/escape/mmio/opaque) deliberately stops at the
+resource/step-spec level. Design + the four-condition closure: the subset's
+`DESIGN.md`; the engineering hole inventory: `docs/limitations.md` "## OPEN —
+Concurrency memory-safety" + `docs/primitives-data-races.md` §24.
+
+**What it proves (the four necessary conditions for a cross-thread hazard, each
+negated — DESIGN §1):** reach (`is_shared`/`publish_shared`), discipline
+(`local_excl`, `shared_acc`, and the WP `wp_load`), lifetime (region tags + the
+LINEAR `join_tok` + `join_tok_in_auth` = the formal statement of the
+`ir_merge_states` compiler bug — a dropped linear obligation at a CFG merge), and
+visibility (`boundary_cap`). The capstone `concurrency_closure`
+(`iris_concurrency_theorems.v`) composes all four into ONE theorem: cross-thread
+memory hazards are inexpressible (the SUFFICIENCY direction). NOT yet done
+(documented, not admitted): the operational adequacy corollary (generic
+`wp_adequacy` instantiation — plumbing, not new argument), `wp_store` + the shared
+guarded WP specs, and the formal NECESSITY (these four and no fifth).
+
+**Per-file iteration build (far faster than `make check-proofs` for one file):**
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG/proofs/operational:/work" \
+  -w /work zer-proofs bash -c 'eval $(opam env) && \
+  coqc -Q lambda_zer_concurrency zer_conc -w -redundant-canonical-projection,-notation-overridden \
+  lambda_zer_concurrency/<file>.v'
+```
+(`zer-proofs:latest` image already exists. The `-v` bind-mount writing `.vo` to the
+Windows FS is the SANCTIONED proof-build pattern — `.vo` are gitignored, not exes,
+AV-safe.) Probe an unknown Iris lemma signature with a throwaway `coqc` of a
+`Check @lemma.` file in the image before writing the proof — it saved many
+iterations this session.
+
+**WP atomic lifting RECIPE for the flat λZC_lang (took 7 iterations to discover —
+reuse for `wp_store`/shared specs).** ZER's languages are FLAT (not ectx), so the
+ectx lifting lemmas don't apply; use `wp_lift_atomic_step_fupd` (from
+`iris.program_logic.lifting`; it supplies a `£1` later-credit). Skeleton:
+1. `iApply wp_lift_atomic_step_fupd; first done.` (the `to_val=None`); then
+   `iIntros (σ1 ns κ κs nt) "Hσ"`.
+2. `iDestruct (gen_heap_valid with "Hσ Hl") as %Hlook` → the heap lookup.
+3. `iModIntro. iSplitR. { iPureIntro. exists [],<e'>,σ1,[]. split;[reflexivity|]. by apply <step>. }` (reducible).
+4. `iIntros (e2 σ2 efs Hps) "_". destruct Hps as [_ Hcs].`
+5. FACTOR the head-step inversion into a PURE lemma (`load_inv`-style) — inversion's
+   auto-named vars otherwise break the proof; the pure lemma gives clean names via
+   `apply load_inv in Hcs as (w & Hw & -> & -> & ->)`.
+6. UNIFY the read value: `congruence`/`simplify_eq` MYSTERIOUSLY FAIL on two same-LHS
+   `σ!!l` lookups — use `rewrite Hw in Hlook. injection Hlook as ->.` instead.
+7. POSTCOND: `simpl` will NOT reduce the language `to_val` projection — add a
+   `reflexivity`-proven `to_val_EVal : to_val (EVal v) = Some v` and
+   `rewrite to_val_EVal /=` to reduce `from_option Φ False (to_val (EVal v))` → `Φ v`.
+8. TAIL framing: `iSplitL "Hl"; last done. iSplitR "Hl"; [ iPureIntro; reflexivity | iFrame "Hl" ].`
+
+**Iris-version gotchas in `zer-proofs` (cost real time):**
+- The bare `↦` (gen_heap points-to) NOTATION is NOT active — only the `pointsto`
+  function. Use `pointsto l (DfracOwn 1) v` or a `Local Notation "l '↦' v" :=
+  (pointsto l (DfracOwn 1) v) (at level 20) : bi_scope`.
+- Unit VALUE is `tt`, not `()` (`()` parses as a TYPE → "Lookup ... (gmap nat ())"
+  error). Type is `unit`.
+- `namespace` (for `inv`/`is_shared`) needs `From iris.base_logic.lib Require Import
+  invariants` explicitly.
+- Coq's `done` does NOT close an iProp goal like `⌜v=v⌝` — use `iPureIntro;
+  reflexivity`. `iSplit` mishandles a linear `∗` split — use `iSplitL`/`iSplitR`.
+- An iProp `False` goal from a Coq-`False` hyp (e.g. `publishable RegStack`) closes
+  via `destruct H`, not `exact H`.
+- Confirmed API sigs: `pointsto_valid_2`, `inv_acc`, `dfrac_valid_own`,
+  `gen_heap_valid`, `wp_lift_atomic_step_fupd`, `ghost_map_elem_valid_2/_agree`,
+  `ghost_map_lookup` all exist with the expected shapes.

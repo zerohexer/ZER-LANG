@@ -2047,18 +2047,22 @@ analysis missed. Otherwise, they stand.
 > No-shared-stack) was an incomplete model. Three adversarial code-grounded
 > sweeps (each finding verified against the actual handlers, not agent
 > assertion) replaced it with a precise inventory and a four-axis architecture.
-> Status: **audited, design converged, IMPLEMENTATION IN PROGRESS** — phase 2
-> began 2026-06-21b with **9 of ~25 holes CLOSED** (BUG-743..751: Axis C
-> `ir_merge_states` thread-merge, A1 exhaustive spawn dispatch, C2 spawn
-> lifetime arm, A3 volatile-RMW, A4 Arena, D2 `@probe` `__thread`, B5 defer
-> lock, A6/#5 interior-extraction ban extension, scoped-borrow exclusivity),
-> each verified + regression-tested; full `make check` GREEN. Remaining real
-> builds = the subsystem-scale core (B1–B4 lock-scope redesign, A6 `shared`-scalar
-> representation incl. #7, scoped-borrow READ/CFG residue). **D1 (cinclude
-> thread-capture) is RECLASSIFIED as a named FLOOR**, not a build — C-domain
-> behavior, out of scope; the safe path exists today (long-lived data, no
-> annotation). Per-hole CLOSED/OPEN ledger: `docs/limitations.md` "## OPEN —
-> Concurrency memory-safety". Spec NOT yet frozen.
+> Status: **audited, design converged, IMPLEMENTATION MOSTLY COMPLETE** — phase 2
+> (BUG-743..756) closed the bulk: Axis C `ir_merge_states` thread-merge, A1
+> exhaustive spawn dispatch, C2 spawn lifetime arm, A3 volatile-RMW, A4 Arena,
+> D2 `@probe` `__thread`, A6/#5 interior-extraction ban, scoped-borrow exclusivity,
+> **A6-full atomic-cell inclusion taint (BUG-752)**, and **the ENTIRE Axis B
+> lock-completeness family — B1 multi-root (753), B2 union copy-out (754), B3
+> cond_wait foreign-shared reject (755), B4 @once loser-wait (756), B5 defer (749)**,
+> each verified + regression-tested; full `make check` GREEN. The B1–B4 "lock-scope
+> redesign" did NOT need a global redesign — each closed in place without ever
+> holding two shared locks at once (read-locks-compose / copy-out-under-one-lock /
+> reject-not-lock / private-once-flag). Remaining = the **narrow tail**: A5
+> threadlocal `&`-escape, the scoped-borrow READ/CFG residue (write-path FIXED), the
+> A6 micro-residuals (atomic-cell struct-field READS + `&s.f` launder). **D1 (cinclude
+> thread-capture) is a named FLOOR**, not a build — C-domain, out of scope; safe path
+> exists today (long-lived data, no annotation). Per-hole CLOSED/OPEN ledger:
+> `docs/limitations.md` "## OPEN — Concurrency memory-safety". Spec NOT yet frozen.
 
 ### 24.1 Current state — primitives done, safety incomplete
 

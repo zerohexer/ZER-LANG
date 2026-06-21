@@ -718,21 +718,23 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > races + cross-thread UAF) mapping to **four architectural axes** (A
 > reachability/exclusion-list scanner, B single-root auto-lock incompleteness, C
 > per-function CFG lattice that never merged `threads[]`, D cinclude/emitter-runtime
-> capture). **9 holes are now CLOSED** (BUG-743..751 incl. A6/#5 interior-extraction
-> ban + scoped-borrow exclusivity; full `make check` GREEN), each verified + regression
-> negative test in `tests/zer_fail/` running in `make check`): Axis C
-> `ir_merge_states` now merges `threads[]` (the false-green scoped-spawn stack-UAF —
-> the most-actionable bug — is fixed); A1 exhaustive spawn-arg dispatch
+> capture). **Most holes are now CLOSED** (BUG-743..756; full `make check` GREEN),
+> each verified + regression negative test in `tests/zer_fail/` running in `make check`):
+> Axis C `ir_merge_states` now merges `threads[]` (the false-green scoped-spawn
+> stack-UAF — the most-actionable bug — is fixed); A1 exhaustive spawn-arg dispatch
 > (slice/opaque); C2 fire-and-forget stack-pointer lifetime arm; A3 volatile-RMW in
-> spawn; A4 Arena exclusion; D2 `@probe` `__thread`; B5 deferred shared access
-> lock-wrapped. **STILL OPEN (subsystem-scale, deadlock/type-system-risky, do NOT
-> claim ZER is fully data-race-safe yet):** B1–B4 lock-scope-walker redesign
-> (multi-root / union-switch / cond-predicate / `@once` loser-wait), A5 threadlocal
-> `&`-escape, A6 `shared`-as-scalar/pointer qualifier (the recurring blocker), and
-> the scoped-borrow READ/CFG residue (write-path FIXED in BUG-751). **D1 (cinclude
-> thread-capture) is a named FLOOR, not a hole** — C-domain behavior, out of scope;
-> the safe path exists today (hand capturing externs long-lived data — global /
-> `shared struct` instance / Pool/Slab — never `&stack_local`). Full
+> spawn; A4 Arena exclusion; D2 `@probe` `__thread`; **A6-full atomic-cell inclusion
+> taint** (scalar write/read/launder + struct-field, concurrency-aware, BUG-752);
+> and **AXIS B COMPLETE** — B1 multi-root lock (BUG-753), B2 shared union-switch
+> copy-out (BUG-754), B3 `@cond_wait` foreign-shared reject (BUG-755), B4 `@once`
+> loser-wait (BUG-756), B5 defer-body lock (BUG-749). **STILL OPEN (narrow tail, do
+> NOT claim ZER is fully data-race-safe yet):** A5 threadlocal `&`-escape (store
+> `&threadlocal` to a global); the scoped-borrow READ/CFG residue (write-path FIXED
+> in BUG-751; read-side + cross-block remain); A6 micro-residuals (atomic-cell
+> struct-field plain READS + `&s.f` launder — narrower than the scalar versions).
+> **D1 (cinclude thread-capture) is a named FLOOR, not a hole** — C-domain behavior,
+> out of scope; the safe path exists today (hand capturing externs long-lived data —
+> global / `shared struct` instance / Pool/Slab — never `&stack_local`). Full
 > CLOSED/OPEN ledger + fix sketches: **`docs/limitations.md` "## OPEN — Concurrency
 > memory-safety"**; design + Rust mapping: **`docs/primitives-data-races.md` §24**;
 > Coq/Iris closure proof (sufficiency, zero-admit):

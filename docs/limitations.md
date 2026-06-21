@@ -2093,12 +2093,16 @@ modules 139, all audits OK):**
   Micro-residuals [OPEN, very narrow]: struct-field plain READS + `&s.f` launder
   (even rarer than the scalar equivalents; same machinery extended by field).
 
-The remaining OPEN holes (B1–B4 lock-scope redesign, A5 threadlocal-escape, A6
-shared-scalar representation incl. #7 atomic-cell uniformity, and the
-scoped-borrow READ/CFG residue) are the deadlock-sensitive / type-system-extension
-/ subsystem-scale pieces; each is annotated `[OPEN]` below. **D1 (cinclude
-thread-capture) is RECLASSIFIED as a named FLOOR, not a hole** (C-domain behavior,
-out of ZER's scope; safe path already exists via long-lived data — see Axis D).
+**AXIS B IS COMPLETE (2026-06-22): B1 multi-root (BUG-753), B2 union copy-out
+(BUG-754), B3 cond_wait foreign-shared reject (BUG-755), B4 @once loser-wait
+(BUG-756), B5 defer lock (BUG-749).** A6-full atomic-cell taint is also complete
+(BUG-752). The remaining OPEN holes are now the NARROW TAIL: A5 threadlocal-escape
+(store `&threadlocal` to a global), the scoped-borrow READ/CFG residue (write-path
+FIXED in BUG-751; read-side + cross-block remain), and the A6 micro-residuals
+(atomic-cell struct-field plain READS + `&s.f` launder). Each is annotated `[OPEN]`
+below. **D1 (cinclude thread-capture) is RECLASSIFIED as a named FLOOR, not a hole**
+(C-domain behavior, out of ZER's scope; safe path already exists via long-lived
+data — see Axis D).
 **Risk classification (confirmed 2026-06-21b):** a botched lock-scope redesign's
 worst NEW failure is a DEADLOCK = a hang = the liveness floor (NOT a memory-safety
 violation; out of scope for ZER *and* Rust), now made VISIBLE by the runner
@@ -2133,7 +2137,8 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
   gate on the spawn-arg dispatch.
 
 **Axis B — single-root auto-lock incompleteness** (per-statement
-`current_stmt_shared_root`, ir_lower.c). Locks only the first shared root; bypassed at:
+`current_stmt_shared_root`, ir_lower.c) — **ALL FIVE SUB-ITEMS NOW CLOSED
+(2026-06-22)**. Was: locks only the first shared root; bypassed at:
 - **[FIXED BUG-753 — B1]** `shared(rw)` multi-read (`x = ga.v + gb.v`) now locks
   ALL distinct shared roots, not just the first (`find_all_shared_roots_expr`;
   extras as read locks — deadlock-free since read locks compose and the
@@ -2277,23 +2282,22 @@ already kills the lock-ordering deadlock class by construction.
 CLOSED** (Axis C `ir_merge_states` + A1 + C2 + A3 + A4 + D2 + B5; BUG-743..749),
 each verified by the full ZER suite (769/769) + C unit tests, each with a
 regression negative test in `tests/zer_fail/` that runs in `make check` (the gate).
-The CLOSED set covers the reachability holes that need no representation change
-(volatile-RMW, Arena, slice/opaque dispatch), the spawn lifetime arm, the runtime
-race (`@probe`), and the most-common lock-completeness case (defer). REMAINING
-(each annotated `[OPEN]` above) is the **subsystem-scale** core (like `keep` / the
-IR migration): **B1–B4** the deadlock-sensitive lock-scope-walker redesign
-(multi-root / union-switch / cond-predicate / `@once` loser-wait); **A5**
-threadlocal `&`-escape taint; **A6** the `shared`-as-scalar/pointer qualifier
-representation (the recurring blocker that subsumes A5 + the carrier-or-tainted
-inclusion model); and the scoped-borrow READ/CFG residue (write-path FIXED in
-BUG-751). **D1 is now a FLOOR, not a remaining build** (C-domain; safe path
-exists). And the still-unprobed residue (FFI callback tables; other
-emitter-runtime statics;
-cross-module spawn/extern; `NODE_STRUCT_INIT` global read in a spawn body). These
-each carry real risk (deadlock for the lock redesign, false-positives for the
-type-system extension) and were deliberately NOT shipped half-verified — the next
-session continues with the lock-scope-walker redesign (B1–B4) and the
-`shared`-scalar representation (A6).
+The CLOSED set covers the reachability holes (volatile-RMW, Arena, slice/opaque
+dispatch), the spawn lifetime arm, the runtime race (`@probe`), **the A6-full
+atomic-cell inclusion taint (BUG-752)**, and **the ENTIRE Axis B lock-completeness
+family — B1 multi-root (BUG-753), B2 union copy-out (BUG-754), B3 cond_wait
+foreign-shared reject (BUG-755), B4 @once loser-wait (BUG-756), B5 defer (BUG-749)**.
+The B1–B4 "deadlock-sensitive lock-scope-walker redesign" turned out NOT to need a
+single global redesign: each was closed in place without ever holding two shared
+locks at once (B1 read-locks-compose, B2 copy-out-under-the-one-lock, B3 reject not
+lock, B4 a private once-flag not a struct mutex). REMAINING (each annotated `[OPEN]`
+above) is the **narrow tail**: **A5** threadlocal `&`-escape taint (store
+`&threadlocal` to a global); the scoped-borrow READ/CFG residue (write-path FIXED in
+BUG-751; read-side + cross-block remain); the **A6 micro-residuals** (atomic-cell
+struct-field plain READS + `&s.f` launder). **D1 is a FLOOR, not a remaining build**
+(C-domain; safe path exists). And the still-unprobed residue (FFI callback tables;
+other emitter-runtime statics; cross-module spawn/extern; `NODE_STRUCT_INIT` global
+read in a spawn body).
 
 ---
 

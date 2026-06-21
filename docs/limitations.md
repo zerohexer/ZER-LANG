@@ -2134,18 +2134,26 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
 
 **Axis B — single-root auto-lock incompleteness** (per-statement
 `current_stmt_shared_root`, ir_lower.c). Locks only the first shared root; bypassed at:
-- **[OPEN — B1]** `shared(rw)` multi-read (`x = ga.v + gb.v`) → only `ga` locked
-  (BUG-500 removed the deadlock-skip for read locks). Read locks COMPOSE
-  (deadlock-free), so the fix — lock ALL read roots in canonical order — is safe;
-  but it requires making `current_stmt_shared_root` a SET (lock-scope redesign).
+- **[FIXED BUG-753 — B1]** `shared(rw)` multi-read (`x = ga.v + gb.v`) now locks
+  ALL distinct shared roots, not just the first (`find_all_shared_roots_expr`;
+  extras as read locks — deadlock-free since read locks compose and the
+  multi-WRITE case is rejected by the deadlock check; lock/unlock re-derive the
+  set, so no `current_stmt_shared_root`-set change was needed). Non-`orelse`
+  statements only (narrow residual). Verified in emitted C.
 - **[OPEN — B2]** union-switch on a shared field: lock released before arm bodies;
   the arm capture is a live raw pointer into the shared bytes.
 - **[OPEN — B3]** `@cond_wait` predicate: a 2nd shared read in the predicate gets
   no lock (`collect_shared_types_in_expr` has no `NODE_INTRINSIC` case).
 - **[OPEN — B4]** `@once` loser doesn't wait for the winner → reads
   half-constructed published state. Fix: a 3-state flag (0 untouched / 1 in-progress
-  / 2 done): winner CAS 0→1, runs body, stores 2; loser spins until 2. Needs CFG
-  surgery (inject the done-store at body-block end + a spin in the loser path).
+  / 2 done): winner CAS 0→1, runs body, stores 2; loser spins until 2.
+  **BLOCKER found 2026-06-21:** the once-flag id (`_zer_once_N`) is EMITTER-
+  generated (a static counter in the `IR_BRANCH`/`NODE_ONCE` handler,
+  emitter.c:~9509), NOT in the IR — so the lowering can't emit a winner-done
+  store or loser spin that references the same flag. Proper fix: move the oid
+  into the `IR_BRANCH` inst at lowering (ir_lower.c NODE_ONCE, ~3370), restructure
+  to 3 blocks (body→store-done→cont / wait→cont), and have the emitter read the
+  oid from the inst. Non-trivial IR+emitter change, deferred.
 - **[FIXED BUG-749 — B5]** defer-body shared access: `emit_defer_stmt`'s
   `NODE_EXPR_STMT` now lock-wraps the deferred shared access
   (`emit_defer_shared_root` + `emit_shared_lock_mode`/`unlock`, recursive mutex).

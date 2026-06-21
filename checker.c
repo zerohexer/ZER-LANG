@@ -3003,6 +3003,21 @@ static Type *check_expr(Checker *c, Node *node) {
         Symbol *sym = find_symbol(c, node->ident.name, (uint32_t)node->ident.name_len,
                                   node->loc.line);
         result = sym ? sym->type : ty_void;
+        /* Scoped-borrow READ-side (BUG-751 write-side extension): a parent READ of
+         * a local currently borrowed by a scoped spawn races the thread, which may
+         * be writing it through the `&local` it holds. The write-side (NODE_ASSIGN)
+         * already flags writes; this flags value reads. Skip the write target
+         * (in_assign_target — write path) and `&data` (in_amp — the launder is
+         * rarer; the obvious race is a plain read). The borrow is cleared at
+         * `.join()`, so reads after the join are fine. Linear (same-block) like the
+         * write-side; cross-block stays the documented CFG residual. */
+        if (sym && sym->is_borrowed_by_thread && !c->in_assign_target && !c->in_amp) {
+            checker_error(c, node->loc.line,
+                "cannot read '%.*s' while it is borrowed by a scoped spawn — the "
+                "thread has access to it until its .join() (data race). Join first, "
+                "or copy the value before spawning",
+                (int)node->ident.name_len, node->ident.name);
+        }
         /* interrupt safety: track global variable access from ISR vs regular code */
         if (sym && !sym->is_function && c->current_func_ret != NULL) {
             Symbol *gs = scope_lookup(c->global_scope, node->ident.name,

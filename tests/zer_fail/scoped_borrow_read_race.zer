@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Scoped-borrow read-side: a parent READ of a local borrowed by a scoped spawn
+// races the thread, which may be writing it through the &local it holds. The
+// thread has the local until .join() — must join before reading (or copy first).
+struct Work { u32 result; }
+void compute(*Work w) { w.result = 42; }
+u32 main() {
+    Work job;
+    job.result = 0;
+    ThreadHandle th = spawn compute(&job);
+    u32 x = job.result;     // READ while borrowed → data race
+    th.join();
+    if (x > 100) { return 1; }
+    return 0;
+}

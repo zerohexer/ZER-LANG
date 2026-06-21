@@ -487,6 +487,31 @@ Full `make check` GREEN for both: semantic-fuzz 200, ZER 795, modules 139, all 5
 
 ---
 
+### BUG-759 — scoped-borrow read-side: parent reads a local while a scoped thread holds it (Axis C residual)
+
+**What broke (data race):** BUG-751 flagged a parent WRITE to a local borrowed by a
+scoped spawn (between `spawn`..`join`), but a parent READ slipped through. A scoped
+thread holds `&local` and may be WRITING it, so the parent reading it concurrently
+is a read/write data race: `ThreadHandle th = spawn compute(&job); u32 x = job.result;
+th.join();` compiled clean.
+
+**Fix (checker.c, NODE_IDENT read):** mirror the write-side — when reading an ident
+whose symbol is `is_borrowed_by_thread`, error. Gated `!in_assign_target` (the
+write-side owns writes) and `!in_amp` (a plain value read is the obvious race; `&data`
+launder is rarer). The borrow flag is set at the scoped spawn and cleared at
+`.join()`, so reads after the join are fine.
+
+**Over-rejection: zero** — `make check` stayed green (every existing scoped-spawn
+test joins before touching the local, the correct pattern). Linear (same-block) like
+the write-side. **Remaining [OPEN, documented]:** the cross-block case (spawn and
+access in different CFG blocks) — the proper fix is a borrow-set merge in
+zercheck_ir (like the `threads[]` merge), subsystem-scale and lower-value now that
+the common same-block read+write are both covered. Tests:
+`tests/zer_fail/scoped_borrow_read_race.zer`,
+`tests/zer/scoped_borrow_read_after_join_ok.zer`. Full `make check` GREEN: ZER 797.
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

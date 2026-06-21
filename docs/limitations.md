@@ -2066,11 +2066,13 @@ modules 139, all audits OK):**
   positive-test runner now has a 30s `timeout` so a deadlocking auto-lock fails
   red (exit 124) instead of hanging CI — the visibility mechanism for the B
   lock-scope redesign.
-- **[FIXED BUG-751, Axis C scoped-borrow]** a parent WRITE to a non-shared local
-  lent via `&x` to a scoped spawn, between `spawn` and `th.join()`, now errors
-  (the thread has exclusive `&mut`-style access). Write-only + linear
-  approximation; READ-during-borrow and cross-block remain as a tighter CFG
-  version.
+- **[FIXED BUG-751 + BUG-759, Axis C scoped-borrow]** a parent WRITE (751) or READ
+  (759) of a non-shared local lent via `&x` to a scoped spawn, between `spawn` and
+  `th.join()`, now errors (the thread has exclusive `&mut`-style access until join).
+  Both linear (same-block); the borrow flag is set at the spawn and cleared at join.
+  **Remaining [OPEN]: cross-block** (spawn and access in different CFG blocks) — the
+  proper fix is a borrow-set merge in zercheck_ir (like the `threads[]` merge),
+  subsystem-scale and lower-value now that same-block read+write are both covered.
 - **[FIXED BUG-752, Axis A6-full, #7 — atomic-cell inclusion model, slices 1/2/4
   DONE]** a scalar global used with `@atomic_*` is an atomic cell; in a
   fire-and-forget concurrent context, a plain WRITE (slice 1), a plain READ
@@ -2098,10 +2100,11 @@ modules 139, all audits OK):**
 **AXIS B IS COMPLETE (2026-06-22): B1 multi-root (BUG-753), B2 union copy-out
 (BUG-754), B3 cond_wait foreign-shared reject (BUG-755), B4 @once loser-wait
 (BUG-756), B5 defer lock (BUG-749).** A6-full atomic-cell taint complete (BUG-752 +
-758). **A5 threadlocal `&`-escape FIXED (BUG-757).** The remaining OPEN hole is now
-just the **scoped-borrow READ/CFG residue** (write-path FIXED in BUG-751; read-side
-+ cross-block remain). **D1 (cinclude thread-capture) is RECLASSIFIED as a named
-FLOOR, not a hole**
+758). **A5 threadlocal `&`-escape FIXED (BUG-757).** Scoped-borrow read+write are
+both FIXED (BUG-751 + 759). The remaining OPEN hole is now ONLY the **scoped-borrow
+CROSS-BLOCK case** (spawn and access in different CFG blocks — same-block read+write
+are covered; the proper fix is a borrow-set merge in zercheck_ir, subsystem-scale).
+**D1 (cinclude thread-capture) is RECLASSIFIED as a named FLOOR, not a hole**
 (C-domain behavior, out of ZER's scope; safe path already exists via long-lived
 data — see Axis D).
 **Risk classification (confirmed 2026-06-21b):** a botched lock-scope redesign's
@@ -2294,10 +2297,11 @@ The B1–B4 "deadlock-sensitive lock-scope-walker redesign" turned out NOT to ne
 single global redesign: each was closed in place without ever holding two shared
 locks at once (B1 read-locks-compose, B2 copy-out-under-the-one-lock, B3 reject not
 lock, B4 a private once-flag not a struct mutex). Also FIXED: **A5** threadlocal
-`&`-escape (BUG-757) and the **A6 micro-residuals** (BUG-758, struct-field
-reads + `&s.f` launder). REMAINING (annotated `[OPEN]` above) is now just the
-**scoped-borrow READ/CFG residue** (write-path FIXED in BUG-751; read-side +
-cross-block remain). **D1 is a FLOOR, not a remaining build**
+`&`-escape (BUG-757), the **A6 micro-residuals** (BUG-758, struct-field reads +
+`&s.f` launder), and the **scoped-borrow read-side** (BUG-759, same-block).
+REMAINING (annotated `[OPEN]` above) is now ONLY the **scoped-borrow CROSS-BLOCK**
+case (a zercheck_ir borrow-set merge — subsystem-scale, lower-value). **D1 is a
+FLOOR, not a remaining build**
 (C-domain; safe path exists). And the still-unprobed residue (FFI callback tables;
 other emitter-runtime statics; cross-module spawn/extern; `NODE_STRUCT_INIT` global
 read in a spawn body).

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// A6-full atomic-cell inclusion (#7b): a global used with @atomic_* is an
+// atomic cell; a plain write to it (here in the spawning function, after the
+// spawn) is a mixed atomic/non-atomic data race. Strict (Rust) model: every
+// access must be atomic. Pre-A6 this compiled clean (the spawn scanner only
+// checks the spawn TARGET's body, not the spawner after the spawn).
+u32 g;
+void worker() { u32 x = @atomic_add(&g, 1); }
+u32 main() {
+    spawn worker();
+    g = 5;
+    return 0;
+}

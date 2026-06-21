@@ -368,6 +368,8 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
+static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
+static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
 static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
 
 /* Try to derive a bounded range from an expression.
@@ -3360,6 +3362,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         (int)troot->ident.name_len, troot->ident.name);
                 }
             }
+        }
+        /* A6-full atomic-cell inclusion: record a plain write to a scalar global
+         * ONLY when it could be concurrent (after a spawn in this function) —
+         * post-check `check_atomic_cell_safety` flags it if the global is an
+         * atomic cell. A pre-spawn / single-threaded plain write (init) is reached
+         * by only one thread → safe → not recorded. */
+        if (c->after_spawn_in_func) {
+            Symbol *aw = atomic_scalar_global_target(c, node->assign.target);
+            if (aw) record_atomic_plain_write(c, aw, node->loc.line);
         }
         /* V3: route Task.new()/slab.alloc() RHS to _ptr variant when
          * target is a pointer type. Same logic as var_decl hook. */
@@ -7842,6 +7853,13 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!is_load && !is_store && !is_cas && !is_arith) {
                 checker_error(c, node->loc.line, "unknown atomic intrinsic '@%.*s'", (int)nlen, name);
             }
+            /* A6-full: a scalar global targeted by `@atomic_*` is an atomic cell —
+             * mark it so any plain write elsewhere (recorded at NODE_ASSIGN) is
+             * flagged post-check. */
+            if (node->intrinsic.arg_count > 0) {
+                Symbol *acell = atomic_scalar_global_target(c, node->intrinsic.args[0]);
+                if (acell) acell->is_atomic_cell = true;
+            }
             if (is_load) {
                 /* @atomic_load(&var) → T */
                 if (node->intrinsic.arg_count != 1)
@@ -12097,6 +12115,9 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_SPAWN: {
         /* spawn func(args); — validate function, check arg safety.
          * Also: scan spawned function body for non-shared global access (data race). */
+        /* A6-full atomic-cell: a spawn has now run — from here on in this
+         * function, a plain write to an atomic cell could race the new thread. */
+        c->after_spawn_in_func = true;
         Symbol *func_sym = scope_lookup(c->global_scope,
             node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
         if (!func_sym || !func_sym->is_function) {
@@ -13435,7 +13456,15 @@ static void check_func_body(Checker *c, Node *node) {
         bool saved_async = c->in_async;
         if (node->func_decl.is_comptime) c->in_comptime_body = true;
         if (node->func_decl.is_async) c->in_async = true;
+        /* A6-full atomic-cell: reset the per-function "after a spawn" flag.
+         * A plain write to an atomic cell is only flagged when it could be
+         * concurrent — i.e. AFTER a spawn in this function. Pre-spawn init and
+         * single-threaded use stay legal (the inclusion-model "shared = reachable
+         * by >=2 threads" — a pre-spawn write is reached by only one). */
+        bool saved_after_spawn = c->after_spawn_in_func;
+        c->after_spawn_in_func = false;
         check_stmt(c, node->func_decl.body);
+        c->after_spawn_in_func = saved_after_spawn;
         c->in_comptime_body = saved_comptime;
         c->in_async = saved_async;
         c->in_naked = false;
@@ -13808,6 +13837,62 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
     } else {
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
+    }
+}
+
+/* ================================================================
+ * A6-FULL ATOMIC-CELL INCLUSION (2026-06-21) — the inclusion model that
+ * replaces the exclusion-list for the atomic dimension: a scalar global used
+ * with `@atomic_*` anywhere becomes an "atomic cell", and the STRICT (Rust)
+ * model then requires EVERY access to it to be atomic. A plain access (even
+ * init) is a mixed atomic/non-atomic data race. Collect-then-check (like ISR):
+ * mark cells during check, flag recorded plain writes post-check.
+ * ================================================================ */
+
+/* The scalar GLOBAL targeted by `&g` (or a bare `g` assign target), or NULL.
+ * Only direct integer scalar globals — struct-field atomics (`&s.f`) are a
+ * later slice (they'd need the per-field carrier taint). */
+static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
+    if (e && e->kind == NODE_UNARY && e->unary.op == TOK_AMP)
+        e = e->unary.operand;
+    if (e && e->kind == NODE_IDENT) {
+        Symbol *gs = scope_lookup(c->global_scope, e->ident.name,
+                                  (uint32_t)e->ident.name_len);
+        if (gs && !gs->is_function && gs->type && type_is_integer(gs->type))
+            return gs;
+    }
+    return NULL;
+}
+
+static void record_atomic_plain_write(Checker *c, Symbol *sym, int line) {
+    if (!sym) return;
+    if (c->atomic_plain_write_count >= c->atomic_plain_write_capacity) {
+        int nc = c->atomic_plain_write_capacity < 8 ? 8
+                 : c->atomic_plain_write_capacity * 2;
+        struct AtomicPlainWrite *nw = (struct AtomicPlainWrite *)realloc(
+            c->atomic_plain_writes, nc * sizeof(*nw));
+        if (!nw) return;
+        c->atomic_plain_writes = nw;
+        c->atomic_plain_write_capacity = nc;
+    }
+    c->atomic_plain_writes[c->atomic_plain_write_count].sym = sym;
+    c->atomic_plain_writes[c->atomic_plain_write_count].line = line;
+    c->atomic_plain_write_count++;
+}
+
+/* Post-check: a scalar global used atomically (is_atomic_cell) must be accessed
+ * atomically EVERYWHERE — a plain write to it is a mixed atomic/non-atomic data
+ * race. Strict (Rust) model: even init must use @atomic_store. */
+static void check_atomic_cell_safety(Checker *c) {
+    for (int i = 0; i < c->atomic_plain_write_count; i++) {
+        Symbol *s = c->atomic_plain_writes[i].sym;
+        if (s && s->is_atomic_cell) {
+            checker_error(c, c->atomic_plain_writes[i].line,
+                "plain write to '%.*s' — it is used with @atomic_* elsewhere, so "
+                "it is an atomic cell and EVERY access (including init) must be "
+                "atomic. Use @atomic_store(&%.*s, value)",
+                (int)s->name_len, s->name, (int)s->name_len, s->name);
+        }
     }
 }
 
@@ -14947,6 +15032,8 @@ bool checker_check(Checker *c, Node *file_node) {
     if (c->isr_global_count > 0) {
         check_interrupt_safety(c);
     }
+    /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
+    check_atomic_cell_safety(c);
 
     /* Pass 5: stack depth analysis — detect recursion */
     check_stack_depth(c, file_node);
@@ -15434,6 +15521,8 @@ void checker_post_passes(Checker *c, Node *file_node) {
     if (c->isr_global_count > 0) {
         check_interrupt_safety(c);
     }
+    /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
+    check_atomic_cell_safety(c);
 
     /* Stack depth analysis — detect recursion */
     check_stack_depth(c, file_node);

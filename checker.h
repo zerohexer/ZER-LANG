@@ -175,6 +175,7 @@ typedef struct {
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */
     bool in_async;      /* true when checking async function body */
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
+    bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
     struct IsrGlobal {
         const char *name;
@@ -186,6 +187,16 @@ typedef struct {
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;
+
+    /* A6-full atomic-cell inclusion: plain (non-atomic) writes to scalar globals,
+     * recorded during check; post-check flags any whose symbol got marked
+     * is_atomic_cell (an `@atomic_*` target). Collect-then-check, like ISR. */
+    struct AtomicPlainWrite {
+        struct Symbol *sym;
+        int line;
+    } *atomic_plain_writes;
+    int atomic_plain_write_count;
+    int atomic_plain_write_capacity;
 
     /* Container templates: parameterized struct definitions */
     struct ContainerTemplate {

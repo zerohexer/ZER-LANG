@@ -224,6 +224,46 @@ audit gate.)
 
 ---
 
+### BUG-752 — atomic-cell inclusion model: plain write to an @atomic'd global after a spawn (mixed atomic/non-atomic race) [Axis A6-full, slice 1, #7]
+
+**What broke (HIGH):** a scalar global accessed with `@atomic_*` in a spawned
+thread, then written PLAINLY in the spawning function after the spawn
+(`spawn worker(); g = 5;` where worker does `@atomic_add(&g,1)`) compiled clean —
+a mixed atomic/non-atomic data race. The spawn scanner only checks the spawn
+TARGET's body (caught #7a: plain access *inside* worker), not the spawner after
+the spawn (#7b).
+
+**Fix (the first slice of A6-full — the inclusion model that replaces the
+exclusion-list for the atomic dimension):** a scalar global targeted by
+`@atomic_*` is marked `is_atomic_cell` (Symbol flag). A plain write to it is
+recorded — but ONLY when it could be concurrent, i.e. AFTER a spawn in the
+current function (`Checker.after_spawn_in_func`, reset per function, set at
+`NODE_SPAWN`). Post-check `check_atomic_cell_safety` flags any recorded plain
+write whose symbol is an atomic cell (collect-then-check, like the ISR pass).
+
+**Why concurrency-aware, not strict-always:** the strict (Rust-`AtomicU32`)
+model — *all* access atomic, including init — was implemented first and
+**false-positived 21 existing tests**: every one was a `g = 0;` plain init
+*before* any spawn (or single-threaded), which is safe (reached by one thread).
+Gating on "after a spawn in this function" matches the inclusion-model invariant
+("shared = reachable by ≥2 threads") and keeps pre-spawn init + single-threaded
+atomic use legal — full flexibility, no false positives.
+
+**Tests:** `tests/zer_fail/atomic_cell_plain_write.zer` (plain write after spawn
+→ rejected); `tests/zer/atomic_cell_atomic_init_ok.zer` (atomic-throughout → OK),
+`atomic_cell_plain_global_ok.zer` (never-atomic global, plain access → OK).
+Existing single-threaded `atomic_ops.zer` + the 21 rust atomic tests pass
+unchanged (no migration needed). Full `make check` GREEN: semantic-fuzz 200,
+ZER 777, Rust 784, Zig 36, modules 139, all audits OK.
+
+**Remaining A6-full slices (OPEN):** plain READS of an atomic cell (slice 2;
+write-side done here), struct-field atomics `@atomic_*(&s.f)` (slice 3, the
+per-field carrier taint), and the full scalar/pointer `shared` qualifier
+propagation replacing the rest of the exclusion-list (slice 4). See
+docs/limitations.md.
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

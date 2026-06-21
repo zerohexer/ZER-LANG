@@ -234,6 +234,13 @@ struct Symbol {
     bool is_borrowed_by_thread;
     const char *th_borrows_name;
     uint32_t th_borrows_name_len;
+    /* A6-full atomic-cell inclusion (2026-06-21): set on a scalar GLOBAL the
+     * first time it is the target of an `@atomic_*`. Strict (Rust) model: once a
+     * location is atomic, ALL access must be atomic — a plain access anywhere
+     * (incl. init) is a data race (mixed atomic/non-atomic). The "inclusion"
+     * model that replaces the exclusion-list: instead of listing what's safe,
+     * mark what's shared and require synchronized access. */
+    bool is_atomic_cell;
 
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */

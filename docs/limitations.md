@@ -2073,9 +2073,11 @@ modules 139, all audits OK):**
   version.
 
 The remaining OPEN holes (B1–B4 lock-scope redesign, A5 threadlocal-escape, A6
-shared-scalar representation incl. #7 atomic-cell uniformity, D1 cinclude
-capability, and the scoped-borrow READ/CFG residue) are the deadlock-sensitive /
-type-system-extension / subsystem-scale pieces; each is annotated `[OPEN]` below.
+shared-scalar representation incl. #7 atomic-cell uniformity, and the
+scoped-borrow READ/CFG residue) are the deadlock-sensitive / type-system-extension
+/ subsystem-scale pieces; each is annotated `[OPEN]` below. **D1 (cinclude
+thread-capture) is RECLASSIFIED as a named FLOOR, not a hole** (C-domain behavior,
+out of ZER's scope; safe path already exists via long-lived data — see Axis D).
 **Risk classification (confirmed 2026-06-21b):** a botched lock-scope redesign's
 worst NEW failure is a DEADLOCK = a hang = the liveness floor (NOT a memory-safety
 violation; out of scope for ZER *and* Rust), now made VISIBLE by the runner
@@ -2160,14 +2162,39 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
   (e.g. future per-path lifetime tags) repeats the omission.
 
 **Axis D — boundary/runtime concurrency-capture.** Concurrency entering with no
-visible ZER node, so A/B/C cannot attach:
-- **[OPEN — D1]** FFI/cinclude — a ZER ptr/funcptr handed to a bodyless extern
-  that `pthread_create`s internally (`scan_unsafe_global_access` dead-ends at the
-  missing body; `keep` is lifetime-only, never thread-safety; `IRThreadTrack` keys
-  off ZER `spawn` only). Fix: a `threads`/`captures` capability on cinclude params
-  (+ `--strict-interop` default-reject for non-`shared`/non-static ZER pointers to
-  thread-capturing externs). New annotation + checker work; the one place the
-  "100% program-consequence" claim leaks for concurrency.
+visible ZER node:
+- **[FLOOR — D1, RECLASSIFIED 2026-06-21b — NOT a hole, NOT in scope]** FFI/cinclude:
+  a ZER ptr/funcptr handed to a bodyless extern that `pthread_create`s internally.
+  This is **C-domain behavior**, outside ZER's safety boundary by the same logic
+  that makes ZER silent on *any* C-internal behavior (a `cinclude`d C function that
+  double-frees, stashes, or over-writes your pointer is equally invisible —
+  "C code is outside ZER's safety boundary", CLAUDE.md). It is NOT a
+  program-consequence leak: the program-consequence claim is scoped to uses **in
+  ZER source**; a C lib threading your pointer is a use **in C source**. It belongs
+  with **deadlock and hardware-consequence as a named FLOOR**, not an OPEN hole. The
+  earlier audit framing ("the one place the program-consequence claim leaks") was
+  wrong — it was never *in* the claim.
+  - **A VERIFICATION would be the contract-trap CLAUDE.md rejects:** trusting a
+    `captures` annotation and claiming safety = accepting an unverifiable claim
+    about C behavior = manufacturing FALSE safety. Do NOT build it as a closure.
+  - **The safe path already exists today, no annotation needed (document this as
+    the recipe):** the only hazard is *lifetime* (the C thread outlives the data),
+    and ZER already lets you express data that outlives the thread — hand a
+    capturing extern a **global**, a **global instance of a `shared struct`**, or
+    **Pool/Slab-allocated** data (never `&stack_local`, the same discipline as
+    "can't return `&local`"). That eliminates the cross-thread UAF with existing
+    primitives. The remaining *mutual-exclusion* half (the C thread and ZER both
+    touching the data) follows the **C library's own threading contract** — ZER's
+    auto-lock does NOT reach into the C thread (C never acquires `_zer_mtx`); use
+    `@atomic_*`/`*opaque` or the lib's locking, same as any FFI. This mirrors how
+    ZER treats hardware: it hands you safe building blocks (lifetimes you control,
+    `mmio` ranges), you apply them at the boundary.
+  - **Optional future polish (NOT a closure):** a `captures`/`threads` marker on a
+    cinclude param could be added purely as **audit visibility** (the asm
+    `safety:`-string style) — it would let ZER enforce the in-scope *lifetime*
+    consequence ("if you declare this param captured, the ZER pointer must be
+    long-lived"). But it can't be inferred (no ZER body), doesn't protect the
+    unaware user, and must NEVER be sold as "verified". Deferred unless users ask.
 - **[FIXED BUG-748 — D2]** the compiler-emitted `@probe` runtime
   `_zer_in_probe`/`_zer_probe_jmp` are now `__thread` (were process-global statics
   raced by threads → cross-thread longjmp corruption). **[OPEN]** residue: other
@@ -2180,15 +2207,20 @@ visible ZER node, so A/B/C cannot attach:
 **The closure (ends all four):** put the invariant on the DATA — an inferred,
 non-strippable `shared` taint (Model 4 extension of the `volatile` machinery)
 propagated through `&`/casts/slices; auto-lock covers every sub-statement; the CFG
-lattice merges every tracked-state family; the cinclude boundary gets a capability
-+ strict-interop; all frozen by a CI audit gate so it cannot regress. `shared` on
+lattice merges every tracked-state family; the cinclude boundary is the named
+FLOOR (D1 — safe via long-lived data, not a verification target); all frozen by a
+CI audit gate so it cannot regress. `shared` on
 scalars/pointers is INFERRED (keep/escape/provenance family) — the dumb user never
 writes it; only the `shared struct` keyword stays, and it is demanded by an error.
 This is the auto-inferred equivalent of Rust's `Send`/`Sync`+`'static` (Rust is the
 existence proof it's achievable).
 
 **Out of scope (named floor):** deadlock/livelock — undecidable, same boundary Rust
-holds (a Rust `Mutex` AB-BA deadlock compiles fine). ZER's per-statement auto-lock
+holds (a Rust `Mutex` AB-BA deadlock compiles fine); **D1 cinclude thread-capture**
+— C-domain behavior, outside ZER's safety boundary (the safe path exists today:
+hand capturing externs long-lived data — global / global `shared struct` instance /
+Pool/Slab — never `&stack_local`; cross-C-thread mutual exclusion follows the C
+lib's contract). ZER's per-statement auto-lock
 already kills the lock-ordering deadlock class by construction.
 
 **Status (2026-06-21b):** implementation phase 2 BEGUN — **7 of the ~25 holes
@@ -2203,9 +2235,9 @@ IR migration): **B1–B4** the deadlock-sensitive lock-scope-walker redesign
 (multi-root / union-switch / cond-predicate / `@once` loser-wait); **A5**
 threadlocal `&`-escape taint; **A6** the `shared`-as-scalar/pointer qualifier
 representation (the recurring blocker that subsumes A5 + the carrier-or-tainted
-inclusion model); **D1** the cinclude concurrency-capture capability +
-`--strict-interop`; the scoped-borrow READ/CFG residue (write-path FIXED in
-BUG-751); and the still-unprobed residue (FFI callback tables; other
+inclusion model); and the scoped-borrow READ/CFG residue (write-path FIXED in
+BUG-751). **D1 is now a FLOOR, not a remaining build** (C-domain; safe path
+exists). And the still-unprobed residue (FFI callback tables; other
 emitter-runtime statics;
 cross-module spawn/extern; `NODE_STRUCT_INIT` global read in a spawn body). These
 each carry real risk (deadlock for the lock redesign, false-positives for the

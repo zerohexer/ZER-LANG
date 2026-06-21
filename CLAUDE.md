@@ -728,8 +728,11 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > lock-wrapped. **STILL OPEN (subsystem-scale, deadlock/type-system-risky, do NOT
 > claim ZER is fully data-race-safe yet):** B1–B4 lock-scope-walker redesign
 > (multi-root / union-switch / cond-predicate / `@once` loser-wait), A5 threadlocal
-> `&`-escape, A6 `shared`-as-scalar/pointer qualifier (the recurring blocker), D1
-> cinclude concurrency-capture capability, scoped-borrow exclusivity. Full
+> `&`-escape, A6 `shared`-as-scalar/pointer qualifier (the recurring blocker), and
+> the scoped-borrow READ/CFG residue (write-path FIXED in BUG-751). **D1 (cinclude
+> thread-capture) is a named FLOOR, not a hole** — C-domain behavior, out of scope;
+> the safe path exists today (hand capturing externs long-lived data — global /
+> `shared struct` instance / Pool/Slab — never `&stack_local`). Full
 > CLOSED/OPEN ledger + fix sketches: **`docs/limitations.md` "## OPEN — Concurrency
 > memory-safety"**; design + Rust mapping: **`docs/primitives-data-races.md` §24**;
 > Coq/Iris closure proof (sufficiency, zero-admit):

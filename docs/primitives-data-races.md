@@ -2052,10 +2052,12 @@ analysis missed. Otherwise, they stand.
 > `ir_merge_states` thread-merge, A1 exhaustive spawn dispatch, C2 spawn
 > lifetime arm, A3 volatile-RMW, A4 Arena, D2 `@probe` `__thread`, B5 defer
 > lock, A6/#5 interior-extraction ban extension, scoped-borrow exclusivity),
-> each verified + regression-tested; full `make check` GREEN. Remaining = the
-> subsystem-scale core (B1–B4 lock-scope redesign, A6 `shared`-scalar
-> representation incl. #7, D1 cinclude capability, scoped-borrow READ/CFG
-> residue). Per-hole CLOSED/OPEN ledger: `docs/limitations.md` "## OPEN —
+> each verified + regression-tested; full `make check` GREEN. Remaining real
+> builds = the subsystem-scale core (B1–B4 lock-scope redesign, A6 `shared`-scalar
+> representation incl. #7, scoped-borrow READ/CFG residue). **D1 (cinclude
+> thread-capture) is RECLASSIFIED as a named FLOOR**, not a build — C-domain
+> behavior, out of scope; the safe path exists today (long-lived data, no
+> annotation). Per-hole CLOSED/OPEN ledger: `docs/limitations.md` "## OPEN —
 > Concurrency memory-safety". Spec NOT yet frozen.
 
 ### 24.1 Current state — primitives done, safety incomplete
@@ -2159,14 +2161,22 @@ built ONLY for handles:
 **Axis D — Boundary / runtime-completeness (NEW, found sweep 3; spec NOT frozen).**
 Concurrency that enters with NO visible ZER `spawn`/`shared`/lock node, so axes
 A/B/C have nothing to attach to:
-- **FFI/cinclude capture:** a ZER pointer/funcptr handed to a bodyless extern that
-  `pthread_create`s internally. `scan_unsafe_global_access` dead-ends at the
-  missing body (checker.c:8757 requires `func_decl.body`); `keep`-inference cannot
-  widen an unannotated extern param (no body) and `keep` enforces *lifetime* only,
-  never thread-safety (a `static` buffer satisfies `keep` yet is still raced);
-  `IRThreadTrack` keys off ZER `spawn` only. The ZER pointer/funcptr IS a value
-  crossing a typed boundary — this is the one place the "100% program-consequence
-  coverage" claim leaks for the concurrency dimension.
+- **FFI/cinclude capture — RECLASSIFIED 2026-06-21b as a named FLOOR, not a hole:**
+  a ZER pointer/funcptr handed to a bodyless extern that `pthread_create`s
+  internally. This is **C-domain behavior**, outside ZER's boundary by the same
+  logic that makes ZER silent on ANY C-internal behavior (a `cinclude`d C function
+  that double-frees / stashes / over-writes your pointer is equally invisible).
+  It is NOT a "program-consequence leak": that claim is scoped to uses **in ZER
+  source**; a C lib threading your pointer is a use **in C source**. The earlier
+  framing ("the one place the claim leaks") was WRONG — it was never in the claim.
+  A verification would be the contract-trap §22/CLAUDE.md rejects (trust an
+  unverifiable C-behavior claim, manufacture false safety). **The safe path exists
+  TODAY, no annotation:** hand capturing externs long-lived data (global / global
+  `shared struct` instance / Pool/Slab — never `&stack_local`) → no cross-thread
+  UAF; cross-C-thread mutual exclusion follows the C lib's contract (ZER's
+  auto-lock doesn't reach into the C thread). Belongs with deadlock + hardware-
+  consequence as the FLOOR. (An optional `captures` marker could later be added as
+  pure AUDIT VISIBILITY — never sold as verified.)
 - **Compiler-emitted runtime:** `@probe` emits `static` (NOT `__thread`)
   `_zer_in_probe`/`_zer_probe_jmp` + a process-global signal handler
   (emitter.c:~5056) unconditionally alongside `<pthread.h>`; two threads in

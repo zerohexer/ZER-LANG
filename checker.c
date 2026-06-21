@@ -8691,11 +8691,15 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             Type *t = type_unwrap_distinct(sym->type);
             if (t->kind == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw))
                 return false;
-            /* Arena (bump allocator) and Barrier (has own mutex) are safe.
-             * Pool, Slab, Ring are NOT thread-safe — alloc/free/push/pop have
-             * non-atomic metadata access. Must use from single thread or wrap
-             * in shared struct. */
-            if (t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
+            /* Barrier (own mutex) and Semaphore (own counting lock) are
+             * internally synchronized → safe. Pool, Slab, Ring are NOT
+             * thread-safe (non-atomic alloc/free/push/pop metadata).
+             * Axis A4 (2026-06-21): Arena REMOVED from this exclusion — its
+             * bump-pointer metadata is NOT thread-safe either (concurrent
+             * arena.alloc() races); it was wrongly grouped with the
+             * internally-synced primitives. A global Arena touched from a
+             * spawned thread now flags as a data race. */
+            if (t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
                 return false;
             /* Non-shared global — potential data race */
             *out_name = node->ident.name;
@@ -8729,6 +8733,26 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_VAR_DECL:
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
+        /* Axis A3 (2026-06-21): a COMPOUND assignment (RMW: +=, |=, etc.) on a
+         * volatile non-shared global from a spawned thread is a data race —
+         * volatile gives NO atomicity, so the read-modify-write is non-atomic.
+         * The ISR path catches this (check_interrupt_safety) but is gated on
+         * in_interrupt and misses the thread case. Wire the VST-verified
+         * oracle zer_volatile_compound_valid (concurrency_rules.c, previously
+         * never called): invalid iff (is_volatile AND is_compound). A simple
+         * volatile load/store of a flag stays allowed (not a RMW). */
+        if (node->assign.target && node->assign.target->kind == NODE_IDENT) {
+            Symbol *ts = scope_lookup(c->global_scope,
+                node->assign.target->ident.name,
+                (uint32_t)node->assign.target->ident.name_len);
+            if (ts && !ts->is_function && !ts->is_const &&
+                zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,
+                                            node->assign.op != TOK_EQ ? 1 : 0) == 0) {
+                *out_name = node->assign.target->ident.name;
+                *out_len = (uint32_t)node->assign.target->ident.name_len;
+                return true;
+            }
+        }
         if (scan_unsafe_global_access(c, node->assign.target, out_name, out_len)) return true;
         return scan_unsafe_global_access(c, node->assign.value, out_name, out_len);
     case NODE_BINARY:
@@ -12208,7 +12232,9 @@ static void check_stmt(Checker *c, Node *node) {
                 } else {
                     checker_error(c, node->loc.line,
                         "spawn target '%.*s' accesses non-shared global '%.*s' — "
-                        "data race. Use shared struct, threadlocal, @atomic_*, or volatile",
+                        "data race. Use shared struct, threadlocal, or @atomic_* "
+                        "(volatile is NOT synchronization — it gives no atomicity "
+                        "or ordering)",
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
                         (int)bad_len, bad_name);
                 }

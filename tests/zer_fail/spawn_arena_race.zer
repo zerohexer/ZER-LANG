@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Axis A4: a global Arena accessed from a spawned thread is a data race — the
+// bump-pointer metadata is NOT thread-safe (concurrent alloc races). Pre-fix,
+// TYPE_ARENA was wrongly grouped with the internally-synced Barrier/Semaphore
+// in the spawn scanner's safe-exclusion list, so this compiled clean.
+struct Cell { u32 x; }
+Arena g_arena;
+void worker() {
+    *Cell p = g_arena.alloc(Cell) orelse return;
+    p.x = 1;
+}
+u32 main() {
+    spawn worker();
+    return 0;
+}

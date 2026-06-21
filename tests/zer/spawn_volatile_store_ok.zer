@@ -1,0 +1,10 @@
+// Axis A3 regression guard (positive): a SIMPLE volatile store (not a RMW)
+// from a spawned thread stays allowed — this is the established single-word
+// volatile-flag idiom (matches the ISR path, which also only flags RMW).
+volatile u32 g;
+void worker() { g = 1; }
+u32 main() {
+    g = 0;
+    spawn worker();
+    return 0;
+}

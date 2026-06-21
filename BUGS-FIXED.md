@@ -85,6 +85,43 @@ global, or copy-by-value) BEFORE the shared-carrier check — so even a
 `spawn_scoped_slice_ok.zer` (scoped+joined stack slice → OK). Full ZER suite
 765/765, C unit tests 584+238+14+39 pass.
 
+### BUG-746 — spawn scanner whitelisted volatile globals wholesale (thread RMW data race) [Axis A3]
+
+**What broke (HIGH):** `scan_unsafe_global_access` returned "safe" for ANY
+volatile global (`if (sym->is_volatile) return false;`). volatile gives no
+atomicity or ordering, so `g += 1` (a read-modify-write) on a volatile global
+from a spawned thread is a non-atomic data race. The ISR path catches volatile
+compound-RMW (`check_interrupt_safety`) but is gated on `in_interrupt` and never
+fired for threads. The spawn error even *recommended* volatile as a fix.
+
+**Fix:** in the scanner's `NODE_ASSIGN` case, wire the VST-verified oracle
+`zer_volatile_compound_valid(is_volatile, is_compound)` (concurrency_rules.c,
+previously **never called**) — a compound assignment to a volatile non-shared
+global flags as a race. A simple volatile load/store (single-word flag idiom)
+stays allowed, matching the ISR path. Removed "or volatile" from the spawn
+error's fix suggestion (volatile is not synchronization).
+
+### BUG-747 — global Arena whitelisted in spawn scanner (concurrent alloc races bump metadata) [Axis A4]
+
+**What broke (MED):** the scanner grouped `TYPE_ARENA` with the
+internally-synced `TYPE_BARRIER`/`TYPE_SEMAPHORE` as "thread-safe". An Arena's
+bump-pointer metadata is NOT thread-safe — concurrent `arena.alloc()` races it.
+
+**Fix:** removed `TYPE_ARENA` from the safe-exclusion; a global Arena touched
+from a spawned thread now flags. Barrier/Semaphore (their own mutex/counting
+lock) stay excluded.
+
+**Note on A5 (threadlocal `&`-escape):** the threadlocal exclusion in this
+scanner is CORRECT — a spawned thread accessing a threadlocal reads its own
+copy. The real A5 hole is publishing `&threadlocal` into a shared/global
+carrier (another thread then dereferences a pointer into the wrong thread's TLS
+slot). That is an escape/taint sink, not this scanner — folded into the Axis-A
+taint work; tracked in docs/limitations.md.
+
+**Tests (A3+A4):** `tests/zer_fail/spawn_volatile_rmw.zer`,
+`spawn_arena_race.zer` (now rejected); `tests/zer/spawn_volatile_store_ok.zer`
+(simple volatile store still OK). Full ZER suite 768/768, C units pass.
+
 **Note on C3 (move-struct `&`-unwrap in IR_SPAWN):** investigated and rejected
 as framed. For a SCOPED spawn `spawn worker(&f)` is a *borrow* (join returns
 control), so a permanent move-transfer would false-positive legitimate

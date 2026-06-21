@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Axis A3: a volatile compound RMW (g += 1) from a spawned thread is a data
+// race — volatile gives NO atomicity, the read-modify-write is non-atomic.
+// Pre-fix, the spawn scanner whitelisted any volatile global access wholesale
+// (the ISR volatile-RMW guard is gated on in_interrupt and missed threads).
+volatile u32 g;
+void worker() { g += 1; }
+u32 main() {
+    g = 0;
+    spawn worker();
+    return 0;
+}

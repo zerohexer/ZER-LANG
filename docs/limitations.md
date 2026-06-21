@@ -2039,10 +2039,11 @@ file:line detail: workflow task outputs `wpbbu8v47` / `wwt4c31zh` / `wgvm1bid5`.
 (auto-inferred Rust-equivalent safety); implementation has BEGUN (phase 2) but is
 not complete.
 
-**IMPLEMENTATION PROGRESS (phase 2, session 2026-06-21b) — 7 holes CLOSED, each
-verified by the full ZER suite + C unit tests (every fix below has a negative
-test in `tests/zer_fail/` that runs in `make check`, which IS the regression
-gate):**
+**IMPLEMENTATION PROGRESS (phase 2, session 2026-06-21b) — 9 holes CLOSED
+(BUG-743..751), each verified by the full ZER suite + C unit tests (every fix
+below has a negative test in `tests/zer_fail/` that runs in `make check`, which
+IS the regression gate; full `make check` GREEN — ZER 774, Rust 784, Zig 36,
+modules 139, all audits OK):**
 - **[FIXED BUG-743, Axis C]** `ir_merge_states` now merges `threads[]` (union by
   name, `joined` = AND over preds) + the convergence check compares thread state
   — the false-green scoped-spawn stack-UAF is closed. (The concrete soundness bug
@@ -2065,10 +2066,15 @@ gate):**
   positive-test runner now has a 30s `timeout` so a deadlocking auto-lock fails
   red (exit 124) instead of hanging CI — the visibility mechanism for the B
   lock-scope redesign.
+- **[FIXED BUG-751, Axis C scoped-borrow]** a parent WRITE to a non-shared local
+  lent via `&x` to a scoped spawn, between `spawn` and `th.join()`, now errors
+  (the thread has exclusive `&mut`-style access). Write-only + linear
+  approximation; READ-during-borrow and cross-block remain as a tighter CFG
+  version.
 
 The remaining OPEN holes (B1–B4 lock-scope redesign, A5 threadlocal-escape, A6
 shared-scalar representation incl. #7 atomic-cell uniformity, D1 cinclude
-capability, scoped-borrow exclusivity) are the deadlock-sensitive /
+capability, and the scoped-borrow READ/CFG residue) are the deadlock-sensitive /
 type-system-extension / subsystem-scale pieces; each is annotated `[OPEN]` below.
 **Risk classification (confirmed 2026-06-21b):** a botched lock-scope redesign's
 worst NEW failure is a DEADLOCK = a hang = the liveness floor (NOT a memory-safety
@@ -2138,11 +2144,16 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
 - **[OPEN]** remaining lifetime/temporal holes: free-after-publish across threads;
   detached grandchild outliving a scoped join; block-scoped Barrier/Semaphore
   outlived by a function-scoped join; async task struct raced by concurrent polls;
-  the **scoped-borrow-exclusivity** rule (a non-shared object borrowed by a scoped
-  `spawn worker(&x)` must not be accessed by the parent between `spawn` and
-  `join` — the C3-investigation residual). Fix direction: block-scope carrier
-  lifetime tracking + publication lifetime-arm + Handle-gen runtime trap for
-  freeable carrier payloads + a borrow-window dataflow rule.
+  block-scoped Barrier/Semaphore outlived by a function-scoped join. Fix
+  direction: block-scope carrier lifetime tracking + publication lifetime-arm +
+  Handle-gen runtime trap for freeable carrier payloads.
+- **[FIXED BUG-751]** scoped-borrow exclusivity (the C3-investigation residual):
+  a parent WRITE to a non-shared local lent via `&x` to a scoped spawn, between
+  `spawn` and `th.join()`, now errors (the thread has exclusive `&mut`-style
+  access). Symbol `is_borrowed_by_thread`/`th_borrows_name`; write-only + linear
+  (statement-order) approximation. **[OPEN residue]** parent READ during the
+  borrow window (a tighter case) and cross-block / aliased-pointer writes — a CFG
+  version in zercheck_ir (borrow set merged like `threads[]`) would be exact.
 - **General class warning (still OPEN):** a systematic "merged vs first_live-only"
   audit of EVERY `IRPathState` field — the Axis-C bug class is "a second lattice
   family not added to the merge". `threads[]` is now merged; verify no other field
@@ -2193,8 +2204,9 @@ IR migration): **B1–B4** the deadlock-sensitive lock-scope-walker redesign
 threadlocal `&`-escape taint; **A6** the `shared`-as-scalar/pointer qualifier
 representation (the recurring blocker that subsumes A5 + the carrier-or-tainted
 inclusion model); **D1** the cinclude concurrency-capture capability +
-`--strict-interop`; the **scoped-borrow-exclusivity** rule; and the
-still-unprobed residue (FFI callback tables; other emitter-runtime statics;
+`--strict-interop`; the scoped-borrow READ/CFG residue (write-path FIXED in
+BUG-751); and the still-unprobed residue (FFI callback tables; other
+emitter-runtime statics;
 cross-module spawn/extern; `NODE_STRUCT_INIT` global read in a spawn body). These
 each carry real risk (deadlock for the lock redesign, false-positives for the
 type-system extension) and were deliberately NOT shipped half-verified — the next

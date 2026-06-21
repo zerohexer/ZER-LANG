@@ -718,7 +718,8 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > races + cross-thread UAF) mapping to **four architectural axes** (A
 > reachability/exclusion-list scanner, B single-root auto-lock incompleteness, C
 > per-function CFG lattice that never merged `threads[]`, D cinclude/emitter-runtime
-> capture). **7 holes are now CLOSED** (BUG-743..749, each verified + regression
+> capture). **9 holes are now CLOSED** (BUG-743..751 incl. A6/#5 interior-extraction
+> ban + scoped-borrow exclusivity; full `make check` GREEN), each verified + regression
 > negative test in `tests/zer_fail/` running in `make check`): Axis C
 > `ir_merge_states` now merges `threads[]` (the false-green scoped-spawn stack-UAF —
 > the most-actionable bug — is fixed); A1 exhaustive spawn-arg dispatch

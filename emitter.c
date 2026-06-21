@@ -5059,8 +5059,16 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         emit(e, "#include <setjmp.h>\n");
         emit(e, "#include <signal.h>\n\n");
         emit(e, "/* Universal memory fault handler — catches bad MMIO at runtime */\n");
-        emit(e, "static volatile int _zer_in_probe = 0;\n");
-        emit(e, "static jmp_buf _zer_probe_jmp;\n\n");
+        /* Axis D2 (2026-06-21): the probe re-entry flag and jmp_buf MUST be
+         * per-thread. As process-global statics, two threads concurrently in
+         * @probe regions raced the flag and the SIGSEGV-delivered thread could
+         * longjmp into another thread's stale jmp_buf (cross-thread stack
+         * corruption). `__thread` gives each thread its own copy; the signal is
+         * delivered to the faulting thread, whose handler reads ITS flag and
+         * longjmps to ITS setjmp site. Harmless (single copy) in single-threaded
+         * programs. */
+        emit(e, "static __thread volatile int _zer_in_probe = 0;\n");
+        emit(e, "static __thread jmp_buf _zer_probe_jmp;\n\n");
         emit(e, "static void _zer_fault_handler(int sig) {\n");
         emit(e, "    if (_zer_in_probe) {\n");
         emit(e, "        longjmp(_zer_probe_jmp, 1);\n");

@@ -8922,6 +8922,69 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 }
 
+/* Axis B5 (2026-06-21): find the shared-struct root touched by a defer-body
+ * expression so the deferred access can be lock-wrapped. Defer bodies are
+ * emitted as RAW AST at the IR_DEFER_FIRE site (not lowered through
+ * emit_shared_lock_if_needed), so a `defer g.count = 0;` on a shared `g` was
+ * emitted with NO mutex — an unlocked shared write that races other threads.
+ * Mirrors ir_lower.c find_shared_root_expr; returns ONLY a genuinely-shared
+ * root (so emit_shared_lock_mode never emits a lock on a struct that has no
+ * _zer_mtx field, which would be a compile error in the emitted C). The shared
+ * mutex is recursive (BUG-473), so wrapping here is safe even if a lock is
+ * already held. */
+static Node *emit_defer_shared_root(Emitter *e, Node *expr) {
+    if (!expr) return NULL;
+    if (expr->kind == NODE_FIELD) {
+        Node *root = expr;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        if (root->kind == NODE_IDENT) {
+            Type *t = checker_get_type(e->checker, root);
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                if (eff->kind == TYPE_STRUCT &&
+                    (eff->struct_type.is_shared || eff->struct_type.is_shared_rw))
+                    return root;
+                if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT &&
+                        (inner->struct_type.is_shared || inner->struct_type.is_shared_rw))
+                        return root;
+                }
+            }
+        }
+    }
+    Node *found = NULL;
+    switch (expr->kind) {
+    case NODE_BINARY:
+        found = emit_defer_shared_root(e, expr->binary.left);
+        if (!found) found = emit_defer_shared_root(e, expr->binary.right);
+        break;
+    case NODE_ASSIGN:
+        found = emit_defer_shared_root(e, expr->assign.target);
+        if (!found) found = emit_defer_shared_root(e, expr->assign.value);
+        break;
+    case NODE_CALL:
+        for (int i = 0; i < expr->call.arg_count && !found; i++)
+            found = emit_defer_shared_root(e, expr->call.args[i]);
+        break;
+    case NODE_UNARY:
+        found = emit_defer_shared_root(e, expr->unary.operand);
+        break;
+    case NODE_INDEX:
+        found = emit_defer_shared_root(e, expr->index_expr.object);
+        if (!found) found = emit_defer_shared_root(e, expr->index_expr.index);
+        break;
+    case NODE_TYPECAST:
+        found = emit_defer_shared_root(e, expr->typecast.expr);
+        break;
+    default: break;
+    }
+    return found;
+}
+
 /* Emit a single statement from a defer body. Defer bodies are stored as raw
  * AST (NODE_BLOCK or single stmt) — NOT lowered to IR — so the IR-path defer
  * emitter needs a way to translate stmt-level AST into C. Without this
@@ -8950,9 +9013,17 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
     }
     case NODE_EXPR_STMT:
         if (s->expr_stmt.expr) {
+            /* Axis B5: lock-wrap a deferred shared-struct access (the IR-path
+             * lock-emission doesn't reach raw defer bodies). Write lock if the
+             * expression is an assignment, else read lock. Recursive mutex
+             * (BUG-473) makes this safe even if a lock is already held. */
+            Node *sroot = emit_defer_shared_root(e, s->expr_stmt.expr);
+            bool is_w = (s->expr_stmt.expr->kind == NODE_ASSIGN);
+            if (sroot) emit_shared_lock_mode(e, sroot, is_w);
             emit_indent(e);
             emit_rewritten_node(e, s->expr_stmt.expr, func);
             emit(e, ";\n");
+            if (sroot) emit_shared_unlock(e, sroot);
         }
         return;
     case NODE_RETURN:

@@ -1,0 +1,15 @@
+// Axis B5: a deferred shared-struct write must be emitted under the auto-lock
+// (raw defer bodies bypassed the IR lock-emission, racing other threads). This
+// verifies the defer fires correctly AND, by the emitted-C check in the build
+// harness, that the access is wrapped in pthread_mutex_lock/unlock.
+shared struct S { u32 count; }
+S g;
+void f() {
+    defer g.count = 7;
+    g.count = 5;
+}
+u32 main() {
+    f();
+    if (g.count != 7) { return 1; }
+    return 0;
+}

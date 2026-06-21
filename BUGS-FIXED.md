@@ -131,6 +131,47 @@ hazard — a DATA RACE on a non-shared object borrowed by a scoped spawn between
 `spawn` and `join` (parent and thread access concurrently) — is a distinct
 scoped-borrow-exclusivity rule (Axis B), tracked in docs/limitations.md.
 
+### BUG-748 — @probe runtime flag/jmp_buf were process-global (cross-thread longjmp corruption) [Axis D2]
+
+**What broke (MED):** the hosted `@probe` fault-recovery runtime emitted
+`static volatile int _zer_in_probe` + `static jmp_buf _zer_probe_jmp` — both
+process-global. Two threads concurrently in `@probe` regions raced the flag,
+and a SIGSEGV-delivered thread could `longjmp` into another thread's stale
+`jmp_buf` (cross-thread stack corruption).
+
+**Fix:** emit both as `__thread` (per-thread); the fault is delivered to the
+faulting thread, whose handler reads ITS flag and longjmps to ITS setjmp site.
+Harmless single copy in single-threaded programs. (emitter.c hosted-probe
+preamble.) Probe test compiles + runs; emitted C has 2 `__thread` lines.
+
+### BUG-749 — deferred shared-struct access emitted WITHOUT the auto-lock (data race) [Axis B5]
+
+**What broke (HIGH):** defer bodies are snapshotted as raw AST and emitted at
+the `IR_DEFER_FIRE` site, bypassing the IR lock-emission
+(`emit_shared_lock_if_needed`). So `defer g.count = 0;` on a shared `g` emitted
+a bare `g.count = 0;` with NO mutex — an unlocked shared write that races other
+threads (confirmed in emitted C: the normal write was locked, the deferred one
+was not).
+
+**Fix:** `emit_defer_stmt`'s `NODE_EXPR_STMT` case now finds the shared-struct
+root of the deferred expression (new `emit_defer_shared_root`, mirroring
+ir_lower's `find_shared_root_expr`, returning ONLY genuinely-shared roots so no
+lock is ever emitted on a struct lacking `_zer_mtx`) and wraps the access in
+`emit_shared_lock_mode`/`emit_shared_unlock` (write lock for an assignment, read
+lock otherwise; recursive mutex makes it safe even if a lock is already held).
+
+**Tests:** `tests/zer/defer_shared_locked.zer` (emitted C now wraps the deferred
+write in mutex_lock/unlock; runs, defer fires correctly). Full ZER suite
+769/769, C units 584+238+14+39 pass.
+
+**Remaining Axis-B (NOT yet fixed — see docs/limitations.md):** multi-root
+locking in one statement (B1: `x = ga.v + gb.v` two shared(rw) reads → only ga
+locked), union-switch arm capture holding a live raw pointer into shared bytes
+(B2), `@cond_wait` predicate's 2nd shared read (B3), `@once` loser not waiting
+for the winner (B4), and shared access inside an `if`/`for`/`while` *condition*
+within a defer body (the B5 fix covers `NODE_EXPR_STMT` defer bodies). These are
+the deadlock-sensitive lock-scope-redesign pieces.
+
 ---
 
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)

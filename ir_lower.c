@@ -1139,6 +1139,7 @@ static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt) {
 /* Walk the field/index/deref chain to the root ident, check if that
  * root's type is `shared struct` (directly or via pointer param). */
 static Node *find_shared_root_expr(Checker *c, Node *expr);
+static Node *find_orelse(Node *expr); /* B1: defined below, used by the lock emitter */
 
 static Node *find_shared_root_expr(Checker *c, Node *expr) {
     if (!expr) return NULL;
@@ -1210,6 +1211,86 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
             found = find_shared_root_expr(c, expr->struct_init.fields[i].value);
     }
     return found;
+}
+
+/* B1 (2026-06-21): collect ALL distinct shared(rw) roots in an expr (dedup by
+ * ident name), so a multi-shared-read statement (`x = ga.v + gb.v`) locks BOTH,
+ * not just the first. Read locks compose (deadlock-free); the same-statement
+ * multi-shared-TYPE deadlock check already rejects the multi-WRITE case, so any
+ * statement that reaches here with >1 root is all-reads. Uses if/else (not a
+ * switch) to avoid the walker-default audit. */
+static void add_shared_root_unique(Node *root, Node **out, int *count, int max) {
+    if (!root || *count >= max) return;
+    for (int i = 0; i < *count; i++) {
+        if (out[i] == root) return;
+        if (out[i]->kind == NODE_IDENT && root->kind == NODE_IDENT &&
+            out[i]->ident.name_len == root->ident.name_len &&
+            memcmp(out[i]->ident.name, root->ident.name,
+                   root->ident.name_len) == 0)
+            return;
+    }
+    out[(*count)++] = root;
+}
+
+static void find_all_shared_roots_expr(Checker *c, Node *expr,
+                                       Node **out, int *count, int max) {
+    if (!expr || *count >= max) return;
+    if (expr->kind == NODE_FIELD) {
+        Node *root = expr;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        if (root->kind == NODE_IDENT) {
+            Type *t = checker_get_type(c, root);
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                if (eff->kind == TYPE_STRUCT &&
+                    (eff->struct_type.is_shared || eff->struct_type.is_shared_rw))
+                    add_shared_root_unique(root, out, count, max);
+                else if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT &&
+                        (inner->struct_type.is_shared ||
+                         inner->struct_type.is_shared_rw))
+                        add_shared_root_unique(root, out, count, max);
+                }
+            }
+        }
+    }
+    if (expr->kind == NODE_BINARY) {
+        find_all_shared_roots_expr(c, expr->binary.left, out, count, max);
+        find_all_shared_roots_expr(c, expr->binary.right, out, count, max);
+    } else if (expr->kind == NODE_ASSIGN) {
+        find_all_shared_roots_expr(c, expr->assign.target, out, count, max);
+        find_all_shared_roots_expr(c, expr->assign.value, out, count, max);
+    } else if (expr->kind == NODE_CALL) {
+        for (int i = 0; i < expr->call.arg_count; i++)
+            find_all_shared_roots_expr(c, expr->call.args[i], out, count, max);
+    } else if (expr->kind == NODE_UNARY) {
+        find_all_shared_roots_expr(c, expr->unary.operand, out, count, max);
+    } else if (expr->kind == NODE_INDEX) {
+        find_all_shared_roots_expr(c, expr->index_expr.object, out, count, max);
+        find_all_shared_roots_expr(c, expr->index_expr.index, out, count, max);
+    } else if (expr->kind == NODE_TYPECAST) {
+        find_all_shared_roots_expr(c, expr->typecast.expr, out, count, max);
+    } else if (expr->kind == NODE_SLICE) {
+        find_all_shared_roots_expr(c, expr->slice.object, out, count, max);
+        if (expr->slice.start)
+            find_all_shared_roots_expr(c, expr->slice.start, out, count, max);
+        if (expr->slice.end)
+            find_all_shared_roots_expr(c, expr->slice.end, out, count, max);
+    }
+}
+
+/* The shared-root-bearing expression of a simple statement (EXPR_STMT / VAR_DECL
+ * / RETURN), else NULL — mirrors find_shared_root_in_stmt_ir's dispatch. */
+static Node *stmt_shared_expr_ir(Node *stmt) {
+    if (!stmt) return NULL;
+    if (stmt->kind == NODE_EXPR_STMT) return stmt->expr_stmt.expr;
+    if (stmt->kind == NODE_VAR_DECL)  return stmt->var_decl.init;
+    if (stmt->kind == NODE_RETURN)    return stmt->ret.expr;
+    return NULL;
 }
 
 static Node *find_shared_root_in_stmt_ir(Checker *c, Node *stmt) {
@@ -1298,10 +1379,41 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     lock.expr = root;
     lock.src2_local = stmt_writes_shared_ir(stmt) ? 1 : 0;
     emit_inst(ctx, lock);
+    /* B1: also lock every OTHER distinct shared(rw) root in this statement
+     * (`x = ga.v + gb.v` must lock gb too). Extras are READ locks (a
+     * multi-root statement is all-reads — the multi-WRITE case is rejected by
+     * the same-statement deadlock check). Skipped for orelse statements:
+     * lowering rewrites NODE_ORELSE, so the unlock's re-derivation would
+     * mismatch — those stay single-root (a narrow documented residual). */
+    Node *se = stmt_shared_expr_ir(stmt);
+    if (se && !find_orelse(se)) {
+        Node *roots[16]; int n = 0;
+        find_all_shared_roots_expr(ctx->checker, se, roots, &n, 16);
+        for (int i = 0; i < n; i++) {
+            if (roots[i] == root) continue; /* primary already locked */
+            IRInst l2 = make_inst(IR_LOCK, stmt->loc.line);
+            l2.expr = roots[i];
+            l2.src2_local = 0; /* read lock for extras */
+            emit_inst(ctx, l2);
+        }
+    }
 }
 
 static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *stmt, Node *root) {
     if (!root) return;
+    /* B1: unlock the extras (reverse order), then the primary. Re-derive the
+     * root set — deterministic for the non-orelse statements that locked extras. */
+    Node *se = stmt_shared_expr_ir(stmt);
+    if (se && !find_orelse(se)) {
+        Node *roots[16]; int n = 0;
+        find_all_shared_roots_expr(ctx->checker, se, roots, &n, 16);
+        for (int i = n - 1; i >= 0; i--) {
+            if (roots[i] == root) continue;
+            IRInst u2 = make_inst(IR_UNLOCK, stmt->loc.line);
+            u2.expr = roots[i];
+            emit_inst(ctx, u2);
+        }
+    }
     IRInst unlock = make_inst(IR_UNLOCK, stmt->loc.line);
     unlock.expr = root;
     emit_inst(ctx, unlock);

@@ -295,6 +295,38 @@ docs/limitations.md. Full `make check` GREEN: ZER 782, Rust 784, Zig 36.
 
 ---
 
+### BUG-753 — auto-lock locked only the FIRST shared root of a statement (Axis B1)
+
+**What broke (MED, data race / silent miscompile):** the per-statement auto-lock
+(`emit_shared_lock_if_needed`, ir_lower.c) locked only the first shared-struct
+root it found. `x = ga.v + gb.v` (two different `shared(rw)` structs) emitted a
+lock around `ga` but read `gb.v` **unsynchronized** — a data race on `gb` (the
+BUG-500 read-only deadlock-skip allows two `shared(rw)` reads in one statement,
+which is exactly when this leaks).
+
+**Fix (ir_lower.c):** new `find_all_shared_roots_expr` collects every distinct
+shared root in the statement (dedup by name, if/else not switch to satisfy the
+walker audit); the lock emitter now locks the primary root plus every other root
+(extras as READ locks — a multi-root statement is all-reads, the multi-WRITE case
+is already rejected by the same-statement deadlock check), and the unlock emitter
+releases them in reverse. Read locks compose, so locking all is deadlock-free.
+Restricted to non-`orelse` statements (lowering rewrites `NODE_ORELSE`, so the
+unlock's re-derivation would mismatch — those stay single-root, a narrow
+documented residual).
+
+**Verified in emitted C:** `x = ga.v + gb.v` now emits
+`rdlock(ga); rdlock(gb); …read…; unlock(gb); unlock(ga)`. Test:
+`tests/zer/shared_multiroot_lock.zer` (compiles + runs exit 0). Full `make check`
+GREEN (ZER 783, Rust 784, Zig 36). (`roots[16]` scratch + `eff/inner->kind` sites
+baselined — bounded local + already-unwrapped.)
+
+**Axis B remaining [OPEN]:** B2 union-switch-arm (hold lock across arm), B3
+`@cond_wait` 2nd-shared-read (lock ordering with the cond mutex), B4 `@once`
+loser-wait (CFG surgery: body-end done-store + loser spin). Each is more
+deadlock-/CFG-sensitive than B1.
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

@@ -690,3 +690,9 @@ checker.c:bool vshared = vt && vt->kind == TYPE_STRUCT &&
 # A6-full slice 3 (2026-06-21): struct-field atomic-cell extractor — st is a
 # type_unwrap_distinct() result (already distinct-unwrapped), raw ->kind correct.
 checker.c:if (!st || st->kind != TYPE_STRUCT) return false;
+# B1 multi-root lock (2026-06-21): find_all_shared_roots_expr — eff/inner are
+# type_unwrap_distinct() results (already distinct-unwrapped), raw ->kind correct
+# (mirrors the existing find_shared_root_expr in the same file).
+ir_lower.c:else if (eff->kind == TYPE_POINTER) {
+ir_lower.c:if (eff->kind == TYPE_STRUCT &&
+ir_lower.c:if (inner && inner->kind == TYPE_STRUCT &&

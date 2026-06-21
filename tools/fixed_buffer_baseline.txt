@@ -57,3 +57,9 @@ zerc_main.c:    Node *import_asts[64];
 # handler (never silently drops; defer_bodies_cap doubles). Mirrors LowerCtx's
 # own label_inline[32] in the same struct.
 ir_lower.c:    Node *defer_bodies_inline[32];
+# B1 multi-root lock (2026-06-21): bounded local scratch for the distinct
+# shared(rw) roots in ONE statement. Realistic max is 2-3 (a statement reading
+# >16 distinct shared structs is not a real program); find_all_shared_roots_expr
+# stops at max, never overflowing. emit_shared_lock_if_needed +
+# emit_shared_unlock_if_needed re-derive the same set, so lock/unlock stay paired.
+ir_lower.c:        Node *roots[16]; int n = 0;

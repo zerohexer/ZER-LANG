@@ -222,6 +222,18 @@ struct Symbol {
     int nonkeep_root_param;  /* keep inference: index of the param this pointer traces to (valid only when is_nonkeep_derived) */
     bool is_keep_derived;   /* pointer traces to a KEEP param — a borrow; storing into a struct field requires a 'keep' field (field-level keep, Rust &'a analog) */
     bool is_thread_handle;  /* ThreadHandle from scoped spawn — must call .join() */
+    /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a non-shared local
+     * borrowed by a scoped `spawn worker(&x)` is exclusively lent to the
+     * thread until `th.join()`. A parent WRITE to it in that window is a data
+     * race (Rust's `&mut` scoped-thread rule). `is_borrowed_by_thread` is set
+     * on the borrowed local at the spawn and cleared at the join;
+     * `th_borrows_name` records, on the ThreadHandle symbol, which local it
+     * borrowed so join can clear it. Linear (statement-order) approximation —
+     * sound for the straight-line spawn→write→join pattern; conservative for
+     * branches. */
+    bool is_borrowed_by_thread;
+    const char *th_borrows_name;
+    uint32_t th_borrows_name_len;
 
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */

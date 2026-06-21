@@ -2,6 +2,9 @@
 // and joined AFTER the merge must STILL compile. This proves the threads-merge
 // carries the join obligation forward through the merge AND that a join
 // happening after the merge correctly discharges it (no spurious "not joined").
+// NOTE: the branch must NOT write the borrowed `w` (that would be a real
+// scoped-borrow data race, BUG-751) — it reads w.task_id BEFORE the spawn and
+// branches on a separate local instead.
 struct Work { u32 task_id; u32 result; }
 
 void compute(*Work w) {
@@ -12,9 +15,10 @@ u32 main() {
     Work w;
     w.task_id = 7;
     w.result = 0;
+    u32 flag = w.task_id;
     ThreadHandle th = spawn compute(&w);
-    if (w.task_id > 3) {
-        w.result = w.result;
+    if (flag > 3) {
+        flag = 1;
     }
     th.join();
     if (w.result != 70) { return 1; }

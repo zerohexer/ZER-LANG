@@ -3334,6 +3334,33 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
+        /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a WRITE to a local
+         * that is currently borrowed by a scoped spawn (between `spawn
+         * worker(&x)` and `th.join()`) is a data race — the thread has
+         * exclusive access. Walk the target to its root ident. Write-only
+         * (the clearest race; a parent READ during the borrow is a tighter,
+         * future case). Cleared by join. */
+        {
+            Node *troot = node->assign.target;
+            while (troot) {
+                if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                else if (troot->kind == NODE_INDEX) troot = troot->index_expr.object;
+                else if (troot->kind == NODE_UNARY && troot->unary.op == TOK_STAR)
+                    troot = troot->unary.operand;
+                else break;
+            }
+            if (troot && troot->kind == NODE_IDENT) {
+                Symbol *bts = scope_lookup(c->current_scope,
+                    troot->ident.name, (uint32_t)troot->ident.name_len);
+                if (bts && bts->is_borrowed_by_thread) {
+                    checker_error(c, node->loc.line,
+                        "cannot write to '%.*s' while it is borrowed by a scoped "
+                        "spawn — the thread has exclusive access until its "
+                        ".join() (data race). Join first, or copy the value",
+                        (int)troot->ident.name_len, troot->ident.name);
+                }
+            }
+        }
         /* V3: route Task.new()/slab.alloc() RHS to _ptr variant when
          * target is a pointer type. Same logic as var_decl hook. */
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
@@ -4615,6 +4642,15 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (mlen == 4 && memcmp(mname, "join", 4) == 0) {
                         if (node->call.arg_count != 0)
                             checker_error(c, node->loc.line, "ThreadHandle.join() takes no arguments");
+                        /* Scoped-borrow exclusivity: join ends the borrow — the
+                         * thread is done, the parent may use the local again. */
+                        if (osym2->th_borrows_name) {
+                            Symbol *bv = scope_lookup(c->current_scope,
+                                osym2->th_borrows_name, osym2->th_borrows_name_len);
+                            if (bv) bv->is_borrowed_by_thread = false;
+                            osym2->th_borrows_name = NULL;
+                            osym2->th_borrows_name_len = 0;
+                        }
                         result = ty_void;
                         typemap_set(c, field_node, result);
                         break;
@@ -12232,6 +12268,33 @@ static void check_stmt(Checker *c, Node *node) {
                 sym->is_const = false;
                 sym->is_thread_handle = true;
                 typemap_set(c, node, ty_u64);
+                /* Scoped-borrow exclusivity: a non-shared stack local lent via
+                 * `&x` to a scoped spawn is exclusively borrowed by the thread
+                 * until `th.join()`. Mark the FIRST such arg borrowed (and
+                 * record it on the handle so join clears it); a parent WRITE to
+                 * it before join is a data race. Shared structs are excluded
+                 * (auto-locked); globals/statics outlive the thread. */
+                for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
+                    Node *ba = node->spawn_stmt.args[bi];
+                    if (!ba || ba->kind != NODE_UNARY ||
+                        ba->unary.op != TOK_AMP || !ba->unary.operand ||
+                        ba->unary.operand->kind != NODE_IDENT)
+                        continue;
+                    const char *vn = ba->unary.operand->ident.name;
+                    uint32_t vl = (uint32_t)ba->unary.operand->ident.name_len;
+                    Symbol *vs = scope_lookup(c->current_scope, vn, vl);
+                    bool vglobal = scope_lookup_local(c->global_scope,
+                                       vn, vl) != NULL;
+                    if (!vs || vs->is_static || vglobal || !vs->type) continue;
+                    Type *vt = type_unwrap_distinct(vs->type);
+                    bool vshared = vt && vt->kind == TYPE_STRUCT &&
+                        (vt->struct_type.is_shared || vt->struct_type.is_shared_rw);
+                    if (vshared) continue;
+                    vs->is_borrowed_by_thread = true;
+                    sym->th_borrows_name = vn;
+                    sym->th_borrows_name_len = vl;
+                    break; /* track the first borrowed local (common case) */
+                }
             }
         }
         /* Scan spawned function body for non-shared global access (data race).

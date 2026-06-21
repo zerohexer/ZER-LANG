@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Scoped-borrow exclusivity (BUG-751): a non-shared local lent via &x to a
+// scoped spawn is exclusively borrowed by the thread until th.join(). A parent
+// WRITE to it before the join races the thread (which mutates it). Pre-fix this
+// compiled clean — the scoped spawn allowed &local on the join premise but
+// nothing prevented concurrent parent access during the borrow window.
+struct Work { u32 v; }
+void worker(*Work w) { w.v = 9; }
+u32 main() {
+    Work x;
+    x.v = 1;
+    ThreadHandle th = spawn worker(&x);
+    x.v = 2;
+    th.join();
+    return 0;
+}

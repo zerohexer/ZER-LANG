@@ -681,3 +681,9 @@ checker.c:if (inner && inner->kind == TYPE_STRUCT &&
 checker.c:if (st && st->kind == TYPE_ARRAY) return true;
 emitter.c:if (eff->kind == TYPE_STRUCT &&
 emitter.c:if (inner && inner->kind == TYPE_STRUCT &&
+# concurrency closure phase 2 (2026-06-21): interior-extraction ban extension
+# (BUG-750) + scoped-borrow exclusivity (BUG-751) — st/vt are
+# type_unwrap_distinct() results (already distinct-unwrapped), raw ->kind is correct.
+checker.c:if (st->kind == TYPE_STRUCT &&
+checker.c:} else if (st->kind == TYPE_POINTER) {
+checker.c:bool vshared = vt && vt->kind == TYPE_STRUCT &&

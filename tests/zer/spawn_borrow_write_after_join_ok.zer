@@ -1,0 +1,17 @@
+// Scoped-borrow exclusivity regression guard (positive): writing the borrowed
+// local AFTER join must compile — join ends the borrow, the parent may use it
+// again. Also writing a DIFFERENT local during the borrow window is fine.
+struct Work { u32 v; }
+void worker(*Work w) { w.v = 9; }
+u32 main() {
+    Work x;
+    Work y;
+    x.v = 1;
+    y.v = 0;
+    ThreadHandle th = spawn worker(&x);
+    y.v = 5;
+    th.join();
+    x.v = 2;
+    if (x.v != 2 || y.v != 5) { return 1; }
+    return 0;
+}

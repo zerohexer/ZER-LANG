@@ -193,6 +193,35 @@ of hanging CI).
 (direct access + `&whole_struct` still OK). Full ZER suite 772/772 (zero new
 false positives), C units pass.
 
+### BUG-751 — scoped-spawn borrow not exclusive: parent could write `&x` between spawn and join (data race) [Axis C, scoped-borrow]
+
+**What broke (HIGH):** a non-shared local lent via `&x` to a scoped
+`spawn worker(&x)` is permitted ONLY because the thread is joined before scope
+exit — but nothing prevented the PARENT from accessing `x` during the borrow
+window. `spawn worker(&x); x.v = 2; th.join();` compiled clean while the thread
+concurrently mutates `x` (a data race; Rust's `&mut` scoped-thread rule makes
+the borrow exclusive).
+
+**Fix:** scoped-borrow exclusivity (the C3-investigation residual). New Symbol
+fields `is_borrowed_by_thread` (on the borrowed local) + `th_borrows_name` (on
+the ThreadHandle, so join can clear it). At a scoped spawn, the first non-shared,
+non-global `&local` arg is marked borrowed; `th.join()` clears it; a parent
+WRITE (`NODE_ASSIGN` whose target root is a borrowed local) in between errors.
+Write-only (the clearest race; parent READ-during-borrow is a documented tighter
+case). Linear/statement-order approximation — sound for the straight-line
+spawn→write→join pattern, conservative for branches. Shared structs are excluded
+(auto-locked); globals/statics outlive the thread.
+
+**Tests:** `tests/zer_fail/spawn_borrow_write_race.zer` (now rejected);
+`tests/zer/spawn_borrow_write_after_join_ok.zer` (write after join + write a
+different local → OK). Fixed `tests/zer/spawn_join_after_branch.zer` whose
+`w.result = w.result` filler was itself a borrow-write race the old compiler
+missed (now reads `w` before the spawn, branches on a separate local). Full
+`make check` GREEN: semantic-fuzz 200, ZER 774, Rust 784, Zig 36, modules 139,
+all audits OK. (Also retroactively added BUG-750's `st->kind` sites to the
+type-dispatch baseline — that commit had run test_zer.sh + C units but not the
+audit gate.)
+
 ---
 
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)

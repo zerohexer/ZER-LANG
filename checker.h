@@ -177,6 +177,7 @@ typedef struct {
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
+    bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
     struct IsrGlobal {
         const char *name;

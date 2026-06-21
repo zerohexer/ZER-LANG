@@ -3336,6 +3336,17 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
             }
+            /* A6-full slice 4 (pointer taint): taking &(atomic cell) for a
+             * NON-atomic purpose in a concurrent context (after a fire-and-forget
+             * spawn) launders it past the atomic discipline — the resulting
+             * pointer could be plain-derefed. Bless ONLY the @atomic target
+             * (in_atomic_intrinsic_arg blesses arg0); any OTHER &atomic_cell is
+             * recorded and flagged post-check by check_atomic_cell_safety. This
+             * makes the atomic-cell taint non-strippable via & . */
+            if (c->after_spawn_in_func && !c->in_atomic_intrinsic_arg) {
+                Symbol *acell = atomic_scalar_global_target(c, node);
+                if (acell) record_atomic_plain_write(c, acell, node->loc.line);
+            }
             break;
 
         default:
@@ -6626,12 +6637,21 @@ static Type *check_expr(Checker *c, Node *node) {
         /* type-check arguments — skip field name args for @offset, @container */
         bool has_field_arg = (nlen == 6 && memcmp(name, "offset", 6) == 0) ||
                              (nlen == 9 && memcmp(name, "container", 9) == 0);
+        /* A6-full slice 4: the TARGET arg (arg0) of an @atomic_* is the blessed
+         * atomic access — its `&g` must NOT be flagged as a launder. Bless ONLY
+         * arg0 (value args are checked normally, so reading another atomic cell
+         * as a value is still caught). */
+        bool atomic_intr = (nlen >= 7 && memcmp(name, "atomic_", 7) == 0);
         for (int i = 0; i < node->intrinsic.arg_count; i++) {
             if (has_field_arg && i == node->intrinsic.arg_count - 1) {
                 /* last arg is a field name — don't look up as variable */
                 continue;
             }
+            bool bless = (atomic_intr && i == 0);
+            bool saved_atomic_arg = c->in_atomic_intrinsic_arg;
+            if (bless) c->in_atomic_intrinsic_arg = true;
             check_expr(c, node->intrinsic.args[i]);
+            c->in_atomic_intrinsic_arg = saved_atomic_arg;
         }
 
         /* BH-18 #14: arity validation for the conversion/layout intrinsic family.

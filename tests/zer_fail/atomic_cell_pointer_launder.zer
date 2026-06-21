@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// A6-full slice 4 (pointer taint): taking the address of an atomic cell for a
+// NON-atomic purpose (here storing it into a plain pointer, then plain-derefing)
+// launders it past the atomic discipline. After a fire-and-forget spawn, the
+// only blessed use of &g is as the @atomic_* target — any other &g is flagged,
+// making the atomic-cell taint non-strippable via `&`.
+u32 g;
+void worker() { @atomic_add(&g, 1); }
+u32 main() {
+    @atomic_store(&g, 0);
+    spawn worker();
+    *u32 p = &g;
+    p[0] = 5;
+    return 0;
+}

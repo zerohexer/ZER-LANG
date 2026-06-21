@@ -265,10 +265,22 @@ legal (the 21 rust atomic tests + new `atomic_cell_atomic_read_ok.zer` pass).
 Tests: `tests/zer_fail/atomic_cell_plain_read.zer`. Full `make check` GREEN
 (ZER 779, Rust 784, Zig 36).
 
-**Remaining A6-full slices (OPEN):** struct-field atomics `@atomic_*(&s.f)`
-(slice 3, per-field carrier taint), and the scalar/pointer `shared`-qualifier
-PROPAGATION through `&`/casts (slice 4 — closes pointer-laundering of an atomic
-cell, e.g. `*u32 p = &g; p[0] = 5`). See docs/limitations.md.
+**A6-full slice 4 (pointer taint / non-strippable `&`) — DONE:** taking
+`&atomic_cell` for a NON-atomic purpose after a fire-and-forget spawn is now
+flagged — the `@atomic_*` target arg0 is BLESSED (new
+`Checker.in_atomic_intrinsic_arg`, set only around arg0), so the launder
+`*u32 p = &g; p[0] = 5` is caught at the `&g`. This makes the atomic-cell taint
+non-strippable via `&` (the "propagating qualifier" property). Test:
+`tests/zer_fail/atomic_cell_pointer_launder.zer`. Full `make check` GREEN
+(ZER 780, Rust 784, Zig 36).
+
+**A6-full status:** the scalar atomic-cell taint is FUNCTIONALLY COMPLETE —
+write (slice 1), read (slice 2), and address-launder (slice 4), all gated on a
+fire-and-forget concurrent context. **Remaining (OPEN, narrow tail):** struct-
+field atomics `@atomic_*(&s.f)` on a plain (non-shared) global struct (slice 3) —
+needs a parallel (struct-symbol, field) compound-key list (the scalar machinery
+keys on the Symbol, which has no per-field flag); uncommon + mostly logic race.
+See docs/limitations.md.
 
 ---
 

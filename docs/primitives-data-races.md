@@ -2057,12 +2057,15 @@ analysis missed. Otherwise, they stand.
 > each verified + regression-tested; full `make check` GREEN. The B1–B4 "lock-scope
 > redesign" did NOT need a global redesign — each closed in place without ever
 > holding two shared locks at once (read-locks-compose / copy-out-under-one-lock /
-> reject-not-lock / private-once-flag). Remaining = the **narrow tail**: A5
-> threadlocal `&`-escape, the scoped-borrow READ/CFG residue (write-path FIXED), the
-> A6 micro-residuals (atomic-cell struct-field READS + `&s.f` launder). **D1 (cinclude
-> thread-capture) is a named FLOOR**, not a build — C-domain, out of scope; safe path
-> exists today (long-lived data, no annotation). Per-hole CLOSED/OPEN ledger:
-> `docs/limitations.md` "## OPEN — Concurrency memory-safety". Spec NOT yet frozen.
+> reject-not-lock / private-once-flag). **The tail is now also closed (BUG-757..759):
+> A5 threadlocal `&`-escape, A6 micro-residuals (struct-field READS + `&s.f` launder),
+> and the scoped-borrow read-side.** Remaining = **ONE** item: the scoped-borrow
+> CROSS-BLOCK case (a zercheck_ir borrow-set merge, subsystem-scale, lower-value —
+> same-block read+write are covered). **D1 (cinclude thread-capture) is a named
+> FLOOR**, not a build — C-domain, out of scope; safe path exists today (long-lived
+> data, no annotation). Per-hole CLOSED/OPEN ledger: `docs/limitations.md` "## OPEN —
+> Concurrency memory-safety". The compiler-side closure is essentially complete; the
+> formal NECESSITY proof (these four axes and no fifth) is the remaining proof work.
 
 ### 24.1 Current state — primitives done, safety incomplete
 

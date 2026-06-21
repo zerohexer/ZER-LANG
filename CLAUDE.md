@@ -773,11 +773,12 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > taint** (scalar write/read/launder + struct-field, concurrency-aware, BUG-752);
 > and **AXIS B COMPLETE** — B1 multi-root lock (BUG-753), B2 shared union-switch
 > copy-out (BUG-754), B3 `@cond_wait` foreign-shared reject (BUG-755), B4 `@once`
-> loser-wait (BUG-756), B5 defer-body lock (BUG-749). **STILL OPEN (narrow tail, do
-> NOT claim ZER is fully data-race-safe yet):** A5 threadlocal `&`-escape (store
-> `&threadlocal` to a global); the scoped-borrow READ/CFG residue (write-path FIXED
-> in BUG-751; read-side + cross-block remain); A6 micro-residuals (atomic-cell
-> struct-field plain READS + `&s.f` launder — narrower than the scalar versions).
+> loser-wait (BUG-756), B5 defer-body lock (BUG-749); plus the TAIL — A5 threadlocal
+> `&`-escape (BUG-757), A6 micro-residuals (struct-field read/launder, BUG-758),
+> scoped-borrow read-side (BUG-759). **STILL OPEN (one item, do NOT claim ZER is
+> fully data-race-safe yet):** the scoped-borrow **CROSS-BLOCK** case (spawn and
+> access in different CFG blocks — same-block read+write are covered; the proper fix
+> is a zercheck_ir borrow-set merge like the `threads[]` merge, subsystem-scale).
 > **D1 (cinclude thread-capture) is a named FLOOR, not a hole** — C-domain behavior,
 > out of scope; the safe path exists today (hand capturing externs long-lived data —
 > global / `shared struct` instance / Pool/Slab — never `&stack_local`). Full

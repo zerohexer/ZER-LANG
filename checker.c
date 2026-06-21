@@ -3352,6 +3352,11 @@ static Type *check_expr(Checker *c, Node *node) {
             if (c->after_spawn_in_func && !c->in_atomic_intrinsic_arg) {
                 Symbol *acell = atomic_scalar_global_target(c, node);
                 if (acell) record_atomic_plain_write(c, acell, node->loc.line);
+                /* A6 micro-residual: same launder ban for a struct-field atomic
+                 * cell — `&s.f` for non-atomic use after a spawn strips the lock. */
+                Symbol *lfs; const char *lff; uint32_t lfl;
+                if (atomic_struct_field_target(c, node, &lfs, &lff, &lfl))
+                    track_atomic_field(c, lfs, lff, lfl, false, node->loc.line);
             }
             break;
 
@@ -3741,6 +3746,31 @@ static Type *check_expr(Checker *c, Node *node) {
                         "cannot store pointer to local '%.*s' in static/global variable '%.*s'",
                         (int)val_sym->name_len, val_sym->name,
                         (int)target_sym->name_len, target_sym->name);
+                }
+                else if ((tgt_global || tgt_param) && val_sym && val_sym->func_node &&
+                    (val_sym->func_node->kind == NODE_VAR_DECL ||
+                     val_sym->func_node->kind == NODE_GLOBAL_VAR) &&
+                    val_sym->func_node->var_decl.is_threadlocal) {
+                    /* A5: storing &threadlocal in a NON-threadlocal global/static
+                     * escapes the per-thread copy to other threads — the address
+                     * points into THIS thread's TLS, which dangles when the thread
+                     * exits (cross-thread UAF). A threadlocal is global-scope, so
+                     * val_is_global is true and the &local check above skips it.
+                     * Storing into ANOTHER threadlocal is within-thread → allowed. */
+                    bool tgt_is_tl = target_sym && target_sym->func_node &&
+                        (target_sym->func_node->kind == NODE_VAR_DECL ||
+                         target_sym->func_node->kind == NODE_GLOBAL_VAR) &&
+                        target_sym->func_node->var_decl.is_threadlocal;
+                    if (!tgt_is_tl) {
+                        checker_error(c, node->loc.line,
+                            "cannot store the address of threadlocal '%.*s' in %s '%.*s' — each "
+                            "thread has its own copy, so the pointer escapes to other threads and "
+                            "dangles when this thread exits. Pass the value, or use a shared struct",
+                            (int)val_sym->name_len, val_sym->name,
+                            tgt_param ? "pointer parameter" : "static/global",
+                            (int)(target_sym ? target_sym->name_len : 0),
+                            target_sym ? target_sym->name : "");
+                    }
                 }
             }
         }
@@ -5739,6 +5769,18 @@ static Type *check_expr(Checker *c, Node *node) {
     case NODE_FIELD: {
         const char *fname = node->field.field_name;
         uint32_t flen = (uint32_t)node->field.field_name_len;
+
+        /* A6 micro-residual: record a plain READ of a global-struct field in a
+         * concurrent context (after a fire-and-forget spawn); post-check flags it
+         * if the field is an atomic cell (used with @atomic_* elsewhere). Skip &s.f
+         * (in_amp — that's a launder, tracked at TOK_AMP) and assign targets
+         * (in_assign_target — the write path records those). Mirrors the scalar
+         * read hook at NODE_IDENT. */
+        if (c->after_spawn_in_func && !c->in_amp && !c->in_assign_target) {
+            Symbol *rfs; const char *rff; uint32_t rfl;
+            if (atomic_struct_field_target(c, node, &rfs, &rff, &rfl))
+                track_atomic_field(c, rfs, rff, rfl, false, node->loc.line);
+        }
 
         /* BUG-432: module-qualified variable access: config.VERSION
          * Must intercept BEFORE check_expr on object, because module

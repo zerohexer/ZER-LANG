@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// A5: storing the address of a threadlocal in a (non-threadlocal) global escapes
+// the per-thread copy — the pointer points into THIS thread's TLS, so another
+// thread reading the global gets a pointer into this thread's storage, which
+// dangles when this thread exits (cross-thread UAF). Pass the value instead, or
+// use a shared struct.
+threadlocal u32 tl_counter;
+?*u32 g_escape;
+u32 main() {
+    g_escape = &tl_counter;
+    return 0;
+}

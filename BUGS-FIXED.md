@@ -444,6 +444,49 @@ B4 (once loser-wait), B5 (defer lock) — all closed.
 
 ---
 
+### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
+
+**What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a
+`threadlocal` and `g_ptr` is a non-threadlocal global compiled clean. The address
+points into THIS thread's TLS; another thread reading the global dereferences into
+this thread's storage, which **dangles when this thread exits** — a cross-thread
+use-after-free. The existing `&local`→global escape check skipped it because a
+threadlocal is *global-scope* (`val_is_global` is true).
+
+**Fix (checker.c, the escape-sink assignment check):** an `else if` after the
+`&local` branch — if the `&X` value is a threadlocal (`func_node->var_decl.is_threadlocal`)
+and the target is a global/static (or pointer param) that is NOT itself a
+threadlocal, error. Storing `&tl` into ANOTHER threadlocal is within-thread (each
+thread has its own copies) → allowed. Reuses the existing `classify_escape_sink` +
+`val_sym`/`target_sym`. Tests: `tests/zer_fail/threadlocal_addr_escape.zer`,
+`tests/zer/threadlocal_addr_same_thread_ok.zer`.
+
+---
+
+### BUG-758 — atomic-cell struct-field plain READ + &s.f launder after spawn (Axis A6 micro-residuals)
+
+**What broke (the last A6 gap):** A6-full slice 3 tracked struct-field atomic-cell
+*writes* but not plain *reads* or `&s.f` *launders*. So after a fire-and-forget
+spawn, `u32 x = s.hits;` (plain read) and `*u32 p = &s.hits;` (launder) of a field
+used with `@atomic_*` elsewhere compiled clean — a race / a strip of the atomic
+discipline.
+
+**Fix (checker.c, mirroring the scalar slices 2/4 for struct-fields):** (1) at the
+NODE_FIELD read site, gated `after_spawn_in_func && !in_amp && !in_assign_target`,
+`atomic_struct_field_target` → `track_atomic_field(is_atomic=false)` records the
+plain read; (2) at TOK_AMP, alongside the scalar launder, the same for `&s.f`
+(gated `!in_atomic_intrinsic_arg`, so `@atomic_load(&s.f)`'s blessed arg0 is not
+flagged). Post-check `check_atomic_cell_safety` flags fields that are both
+`@atomic`'d and plain-accessed. Tests:
+`tests/zer_fail/atomic_cell_struct_field_read.zer`,
+`tests/zer_fail/atomic_cell_struct_field_launder.zer`,
+`tests/zer/atomic_cell_struct_field_read_ok.zer`. **A6-full is now COMPLETE** —
+scalar + struct-field, write/read/launder, all concurrency-aware.
+
+Full `make check` GREEN for both: semantic-fuzz 200, ZER 795, modules 139, all 5 audits OK.
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

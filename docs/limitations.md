@@ -2090,17 +2090,18 @@ modules 139, all audits OK):**
   (scalar write/read/launder + struct-field, all concurrency-aware). The
   remaining exclusion-list entries (const/shared-struct/threadlocal/atomic/
   Barrier/Semaphore) are the genuinely-safe SYNCHRONIZED categories, not holes.
-  Micro-residuals [OPEN, very narrow]: struct-field plain READS + `&s.f` launder
-  (even rarer than the scalar equivalents; same machinery extended by field).
+  Micro-residuals **[FIXED BUG-758]**: struct-field plain READS + `&s.f` launder
+  now tracked (read hook at NODE_FIELD, launder hook at TOK_AMP, mirroring the
+  scalar slices 2/4, gated on the fire-and-forget after-spawn context). **A6-full
+  is now COMPLETE end to end** — scalar + struct-field, write/read/launder.
 
 **AXIS B IS COMPLETE (2026-06-22): B1 multi-root (BUG-753), B2 union copy-out
 (BUG-754), B3 cond_wait foreign-shared reject (BUG-755), B4 @once loser-wait
-(BUG-756), B5 defer lock (BUG-749).** A6-full atomic-cell taint is also complete
-(BUG-752). The remaining OPEN holes are now the NARROW TAIL: A5 threadlocal-escape
-(store `&threadlocal` to a global), the scoped-borrow READ/CFG residue (write-path
-FIXED in BUG-751; read-side + cross-block remain), and the A6 micro-residuals
-(atomic-cell struct-field plain READS + `&s.f` launder). Each is annotated `[OPEN]`
-below. **D1 (cinclude thread-capture) is RECLASSIFIED as a named FLOOR, not a hole**
+(BUG-756), B5 defer lock (BUG-749).** A6-full atomic-cell taint complete (BUG-752 +
+758). **A5 threadlocal `&`-escape FIXED (BUG-757).** The remaining OPEN hole is now
+just the **scoped-borrow READ/CFG residue** (write-path FIXED in BUG-751; read-side
++ cross-block remain). **D1 (cinclude thread-capture) is RECLASSIFIED as a named
+FLOOR, not a hole**
 (C-domain behavior, out of ZER's scope; safe path already exists via long-lived
 data — see Axis D).
 **Risk classification (confirmed 2026-06-21b):** a botched lock-scope redesign's
@@ -2123,11 +2124,13 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
   "or volatile" removed from the spawn fix suggestion.
 - **[FIXED BUG-747]** `Arena` whitelisted → concurrent `arena.alloc()` races.
   Now removed from the safe-exclusion (Barrier/Semaphore kept — internally synced).
-- **[OPEN — A5]** `threadlocal` whitelisted (CORRECT for direct access — a
-  spawned thread reads its own TLS copy) BUT `&threadlocal` untainted → publishing
-  `&tl` to a shared/global carrier = cross-thread wrong-TLS/UAF. This is an
-  escape/taint SINK, not the scanner; fold into the A6 taint work (mark `&tl`
-  tl-derived, reject store to a global/shared carrier).
+- **[FIXED BUG-757 — A5]** `threadlocal` whitelisted for direct access (CORRECT — a
+  spawned thread reads its own TLS copy), but `&threadlocal` published to a
+  non-threadlocal global/static was a cross-thread wrong-TLS/UAF. Now rejected at
+  the escape-sink assignment check (checker.c) — an `else if` after the `&local`
+  branch, since a threadlocal is global-scope (`val_is_global`) so the `&local`
+  check skipped it. Storing `&tl` into ANOTHER threadlocal is within-thread →
+  allowed.
 - **[FIXED BUG-744]** `TYPE_SLICE` + `TYPE_OPAQUE` spawn args were uncased → now
   the spawn-arg dispatch is exhaustive over pointer/slice/opaque; the
   `spawn_arg_is_stack_derived` helper unwraps casts + `@ptrcast/@bitcast/@cast/@pun`
@@ -2290,11 +2293,11 @@ foreign-shared reject (BUG-755), B4 @once loser-wait (BUG-756), B5 defer (BUG-74
 The B1–B4 "deadlock-sensitive lock-scope-walker redesign" turned out NOT to need a
 single global redesign: each was closed in place without ever holding two shared
 locks at once (B1 read-locks-compose, B2 copy-out-under-the-one-lock, B3 reject not
-lock, B4 a private once-flag not a struct mutex). REMAINING (each annotated `[OPEN]`
-above) is the **narrow tail**: **A5** threadlocal `&`-escape taint (store
-`&threadlocal` to a global); the scoped-borrow READ/CFG residue (write-path FIXED in
-BUG-751; read-side + cross-block remain); the **A6 micro-residuals** (atomic-cell
-struct-field plain READS + `&s.f` launder). **D1 is a FLOOR, not a remaining build**
+lock, B4 a private once-flag not a struct mutex). Also FIXED: **A5** threadlocal
+`&`-escape (BUG-757) and the **A6 micro-residuals** (BUG-758, struct-field
+reads + `&s.f` launder). REMAINING (annotated `[OPEN]` above) is now just the
+**scoped-borrow READ/CFG residue** (write-path FIXED in BUG-751; read-side +
+cross-block remain). **D1 is a FLOOR, not a remaining build**
 (C-domain; safe path exists). And the still-unprobed residue (FFI callback tables;
 other emitter-runtime statics; cross-module spawn/extern; `NODE_STRUCT_INIT` global
 read in a spawn body).

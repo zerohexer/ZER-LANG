@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// A6 micro-residual: taking &s.f of an atomic struct-field cell for a NON-atomic
+// purpose after a fire-and-forget spawn launders it past the atomic discipline
+// (the resulting pointer could be plain-derefed). Only the @atomic target is
+// blessed; any other &s.f is flagged — the field-level taint is non-strippable.
+struct Stats { u32 hits; }
+Stats s;
+void worker() { @atomic_add(&s.hits, 1); }
+u32 main() {
+    @atomic_store(&s.hits, 0);
+    spawn worker();
+    *u32 p = &s.hits;        // launder of atomic struct-field cell → flagged
+    p[0] = 9;
+    return 0;
+}

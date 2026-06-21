@@ -1,0 +1,14 @@
+// A6 micro positive: an atomic struct-field cell READ via @atomic_load after a
+// fire-and-forget spawn is the correct synchronized access — the &s.hits is the
+// blessed @atomic target (in_amp + in_atomic_intrinsic_arg), so neither the
+// read hook nor the launder hook fires. No false positive.
+struct Stats { u32 hits; }
+Stats s;
+void worker() { @atomic_add(&s.hits, 1); }
+u32 main() {
+    @atomic_store(&s.hits, 0);
+    spawn worker();
+    u32 x = @atomic_load(&s.hits);   // atomic read — OK
+    if (x > 100) { return 1; }
+    return 0;
+}

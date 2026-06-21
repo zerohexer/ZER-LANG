@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// A6 micro-residual: a global-struct field used with @atomic_* is an atomic cell
+// at FIELD granularity. A plain READ of it after a fire-and-forget spawn races the
+// thread updating it atomically — must use @atomic_load(&s.hits).
+struct Stats { u32 hits; u32 misses; }
+Stats s;
+void worker() { @atomic_add(&s.hits, 1); }
+u32 main() {
+    @atomic_store(&s.hits, 0);
+    spawn worker();
+    u32 x = s.hits;          // plain read of atomic cell after spawn → race
+    if (x > 100) { return 1; }
+    return 0;
+}

@@ -1,0 +1,14 @@
+// A5 positive: storing a threadlocal's address into ANOTHER threadlocal is
+// within-thread (each thread has its own copies of both), so the pointer never
+// crosses a thread boundary — allowed. Proves the A5 ban is precise (only
+// &threadlocal → non-threadlocal-global is rejected).
+threadlocal u32 tl_a;
+threadlocal ?*u32 tl_ptr;
+u32 main() {
+    tl_a = 7;
+    tl_ptr = &tl_a;          // within-thread: both per-thread — OK
+    u32 out = 0;
+    if (tl_ptr) |p| { out = p[0]; }
+    if (out != 7) { return 1; }
+    return 0;
+}

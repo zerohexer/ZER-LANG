@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// B3 instance-precise: even two instances of the SAME shared type race — the cond
+// var is ga, but the predicate also reads gb (a different instance, hence a
+// different mutex). A type_id-keyed check would MISS this (same type Q); the
+// root-ident check catches it. Proves the instance-precise strengthening.
+shared struct Q { u32 count; }
+Q ga;
+Q gb;
+u32 main() {
+    ga.count = 1;
+    gb.count = 1;
+    @cond_wait(ga, ga.count > 0 && gb.count > 0);
+    return 0;
+}

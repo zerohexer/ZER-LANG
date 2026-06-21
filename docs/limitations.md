@@ -2140,10 +2140,30 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
   multi-WRITE case is rejected by the deadlock check; lock/unlock re-derive the
   set, so no `current_stmt_shared_root`-set change was needed). Non-`orelse`
   statements only (narrow residual). Verified in emitted C.
-- **[OPEN — B2]** union-switch on a shared field: lock released before arm bodies;
-  the arm capture is a live raw pointer into the shared bytes.
-- **[OPEN — B3]** `@cond_wait` predicate: a 2nd shared read in the predicate gets
-  no lock (`collect_shared_types_in_expr` has no `NODE_INTRINSIC` case).
+- **[FIXED BUG-754 — B2]** union-switch on a shared struct field: the lvalue path
+  built `sw_ref = &g.union` (a raw alias into the shared bytes) and the discriminant
+  + capture reads happened AFTER the lock released — even the `|x|` VALUE capture was
+  a cross-thread torn read / type confusion. FIX (copy-out, ir_lower.c): when the
+  switch root is shared (`find_shared_root_expr`, covers `shared(rw)` too) take the
+  RVALUE path, which copies the whole union into a LOCAL *under* the switch-expr lock;
+  every subsequent tag/capture read is then of a private snapshot. The `|*x|` mutable
+  capture of a shared union is REJECTED at the checker (it would alias the throwaway
+  copy → lost mutation; mirrors the A6/#5 interior-extraction ban). No nested lock
+  (lock scope unchanged), no new IR. Tests: `tests/zer/shared_union_switch_copyout.zer`,
+  `tests/zer_fail/shared_union_switch_ptr_capture.zer`.
+- **[FIXED BUG-755 — B3]** `@cond_wait`/`@cond_timedwait` predicate reading a shared
+  struct OTHER than the cond struct: the predicate is re-evaluated under ONLY the cond
+  mutex (pthread_cond_wait releases only that one lock), so a foreign shared read is an
+  unsynchronized cross-thread race. FIX (checker-only reject, `cond_pred_foreign_shared`):
+  reject a predicate that reads any shared root whose ROOT IDENT differs from the cond
+  var's — instance-precise, so a 2nd INSTANCE of the SAME shared type is also caught,
+  while the legit pointer-param `b`/`b.field` case passes. Locking the 2nd struct inside
+  the cond mutex is not an option (AB-BA deadlock + cond_wait sleeps holding the extra
+  lock); the textbook rule is "a condvar predicate reads only the cond mutex's own
+  state." Over-rejects nothing (all 30 existing condvar predicates read only their cond
+  struct). Tests: `tests/zer_fail/cond_wait_foreign_shared.zer`,
+  `tests/zer_fail/cond_wait_foreign_same_type.zer` (instance-precise),
+  `tests/zer/cond_wait_same_struct_multifield.zer` (the prescribed safe restructure).
 - **[OPEN — B4]** `@once` loser doesn't wait for the winner → reads
   half-constructed published state. Fix: a 3-state flag (0 untouched / 1 in-progress
   / 2 done): winner CAS 0→1, runs body, stores 2; loser spins until 2.

@@ -327,6 +327,75 @@ deadlock-/CFG-sensitive than B1.
 
 ---
 
+### BUG-754 — union-switch on a shared struct: capture aliased live shared bytes past the auto-lock (Axis B2)
+
+**What broke (HIGH, both memory-safety and logic):** for `switch (g.union) { .v => |x| ... }`
+where `g` is a `shared` struct, the union-switch lowering built `sw_ref = &g.union`
+(a raw pointer ALIASING the shared bytes), then RELEASED the switch-expr lock
+*before* the arm bodies (ir_lower.c:2698). So the discriminant compare AND every
+`|x|` VALUE-capture read happened through `&g.union` with no lock held — a
+cross-thread torn read / union type confusion if another thread flips the variant.
+The `|*x|` mutable capture was worse: a raw writable pointer into the shared union
+with no lock. (The scalar shared switch was already safe — it copies the value out
+under the lock; the union path was the lone offender because it took the address.)
+
+**Fix (copy-out — ir_lower.c + checker.c):** when the switch root is a shared struct
+(`find_shared_root_expr`, whose `is_shared` check also covers `shared(rw)`), force
+the union switch onto the existing RVALUE path: `lower_expr(sw_expr)` copies the
+**whole union into a LOCAL** while the switch-expr lock (emitted at 2606) is still
+held, then `&local`. Every subsequent tag/capture read is now of a private snapshot,
+so releasing the lock before the arm bodies is safe. Lock scope is unchanged (no
+nested lock → no deadlock), zero new IR — it reuses the path the rvalue case already
+emits. Separately, the `|*x|` mutable capture of a shared union is REJECTED at the
+checker (NODE_SWITCH union ptr-capture branch): with copy-out it would alias the
+throwaway local (mutation silently lost), and conceptually it strips the auto-lock
+off shared bytes — same class as the A6/#5 `&shared.field` interior-extraction ban.
+
+**Note:** the copy-out routing was prototyped by a (read-only-intended) design agent
+that overstepped and left an uncommitted, unnamed (`root_is_shared_PROBE`), untested
+edit; it was reviewed, verified correct, renamed, and completed with the `|*x|`
+reject + tests here.
+
+**Tests:** `tests/zer/shared_union_switch_copyout.zer` (value capture compiles + runs,
+variant preserved through the snapshot), `tests/zer_fail/shared_union_switch_ptr_capture.zer`
+(`|*x|` rejected). Full `make check`: ZER 788/0 + all audits green.
+
+---
+
+### BUG-755 — @cond_wait predicate reading a foreign shared struct raced (Axis B3)
+
+**What broke (data race / logic):** `@cond_wait(sv, sv.x && other.y)` — the predicate
+is re-evaluated under ONLY `sv`'s mutex (pthread_cond_wait atomically releases just
+the one mutex passed to it), so the read of a SECOND shared struct `other.y` was
+unsynchronized against writers holding `other`'s own mutex. It was also undetected:
+`collect_shared_types_in_expr` has no `NODE_INTRINSIC` case, so the same-statement
+deadlock scan never saw the predicate's roots.
+
+**Fix (checker-only reject — `cond_pred_foreign_shared`):** reject a
+`@cond_wait`/`@cond_timedwait` predicate that reads any shared struct whose ROOT
+IDENT differs from the condition variable's. **Instance-precise, not type_id-keyed**
+(the adversarial review caught that type_id would miss two INSTANCES of the same
+shared type — distinct mutexes, still a race) — so `@cond_wait(ga, gb.count > 0)`
+with `ga`/`gb` both type `Q` is correctly rejected, while the legit pointer-param
+case (cond `b`, predicate `b.field` — same root ident) passes. Locking the foreign
+struct inside the cond mutex is NOT an option: AB-BA deadlock, and pthread_cond_wait
+would SLEEP still holding the extra lock. The textbook condvar rule (a predicate
+reads only state protected by the cond mutex) is the teachable restructure: fold the
+state into the same `shared struct`, or signal on its change.
+
+**Over-rejection: empirically zero** — all 30 existing `@cond_wait` predicates in the
+test tree read only their own cond struct's fields (multi-field same-struct reads
+still pass). Pure front-end rejection: no emission change, no deadlock risk.
+
+**Tests:** `tests/zer_fail/cond_wait_foreign_shared.zer` (different shared type),
+`tests/zer_fail/cond_wait_foreign_same_type.zer` (two instances of the SAME type —
+proves instance-precision), `tests/zer/cond_wait_same_struct_multifield.zer` (the
+prescribed safe pattern compiles + runs). Full `make check`: ZER 788/0 + all audits
+green. (`rust_tests/rc_cond_004` is a pre-existing load-flaky 3-thread condvar test —
+identical pass/fail on clean HEAD, untouched by this change.)
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

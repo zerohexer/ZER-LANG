@@ -1,0 +1,12 @@
+// B3 positive guard: a @cond_wait predicate that reads MULTIPLE fields of its
+// OWN cond struct is the prescribed safe pattern (fold the state into one shared
+// struct). Predicate is already true, so cond_wait returns immediately (no block,
+// no signal needed) — proves the same-struct multi-field read still compiles+runs.
+shared struct Q { u32 count; u32 shutdown; }
+Q gq;
+u32 main() {
+    gq.count = 1;
+    gq.shutdown = 0;
+    @cond_wait(gq, gq.count > 0 && gq.shutdown == 0);
+    return 0;
+}

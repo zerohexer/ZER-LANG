@@ -374,6 +374,8 @@ static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
                                        const char **out_field, uint32_t *out_flen);
 static void track_atomic_field(Checker *c, Symbol *s, const char *field,
                                uint32_t flen, bool is_atomic, int line);
+static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
+                                      const char *cond_root, uint32_t cond_root_len);
 static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
 
 /* Try to derive a bounded range from an expression.
@@ -8323,6 +8325,30 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@cond_wait condition must be bool or integer expression");
                     }
                 }
+                /* B3: the predicate is re-evaluated under ONLY the cond struct's
+                 * mutex (pthread_cond_wait releases only that one lock). A read of
+                 * any OTHER shared struct in the predicate is therefore an
+                 * unsynchronized cross-thread race. Reject it (instance-precise on
+                 * the root ident, so a 2nd instance of the SAME shared type is also
+                 * caught, while the legit pointer-param `b`/`b.field` case passes).
+                 * Locking the 2nd struct inside the cond mutex is not an option
+                 * (AB-BA deadlock + cond_wait sleeps holding the extra lock). */
+                Node *croot = node->intrinsic.args[0];
+                while (croot->kind == NODE_FIELD) croot = croot->field.object;
+                while (croot->kind == NODE_INDEX) croot = croot->index_expr.object;
+                while (croot->kind == NODE_UNARY && croot->unary.op == TOK_STAR)
+                    croot = croot->unary.operand;
+                if (croot->kind == NODE_IDENT) {
+                    Node *bad = cond_pred_foreign_shared(c, node->intrinsic.args[1],
+                        croot->ident.name, (uint32_t)croot->ident.name_len);
+                    if (bad) {
+                        checker_error(c, node->loc.line,
+                            "@cond_wait predicate may only read the condition variable's own shared struct '%.*s' — reading a different shared struct here is an unsynchronized cross-thread race (pthread_cond_wait releases only the '%.*s' mutex). Fold that state into '%.*s', or signal on its change.",
+                            (int)croot->ident.name_len, croot->ident.name,
+                            (int)croot->ident.name_len, croot->ident.name,
+                            (int)croot->ident.name_len, croot->ident.name);
+                    }
+                }
             }
             if (!is_timedwait) result = ty_void;
         } else if (nlen >= 8 && memcmp(name, "barrier_", 8) == 0) {
@@ -10408,6 +10434,49 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                     if (arm->capture_is_ptr) {
+                        /* B2: a shared-rooted union switch is lowered via COPY-OUT —
+                         * the discriminant + variant are snapshotted under the
+                         * auto-lock into a throwaway LOCAL (ir_lower.c, the
+                         * !root_is_shared rvalue path). So a |*x| pointer capture
+                         * would alias that local, NOT the shared union: the mutation
+                         * is silently lost, and conceptually it strips the auto-lock
+                         * off shared bytes. Reject it (mirrors the A6/#5
+                         * interior-extraction ban on &shared.field). Copy the field
+                         * into a local, mutate, then assign back as its own
+                         * (auto-locked) statement. is_shared covers shared(rw) too. */
+                        {
+                            Node *sr = node->switch_stmt.expr;
+                            while (sr) {
+                                if (sr->kind == NODE_UNARY && sr->unary.op == TOK_STAR)
+                                    sr = sr->unary.operand;
+                                else if (sr->kind == NODE_FIELD) sr = sr->field.object;
+                                else if (sr->kind == NODE_INDEX) sr = sr->index_expr.object;
+                                else break;
+                            }
+                            if (sr && sr->kind == NODE_IDENT) {
+                                Symbol *ss = scope_lookup(c->current_scope,
+                                    sr->ident.name, (uint32_t)sr->ident.name_len);
+                                if (ss && ss->type) {
+                                    Type *seff = type_unwrap_distinct(ss->type);
+                                    bool sh = (type_dispatch_kind(seff) == TYPE_STRUCT &&
+                                               seff->struct_type.is_shared);
+                                    if (!sh && type_dispatch_kind(seff) == TYPE_POINTER) {
+                                        Type *si = type_unwrap_distinct(seff->pointer.inner);
+                                        if (si && type_dispatch_kind(si) == TYPE_STRUCT &&
+                                            si->struct_type.is_shared)
+                                            sh = true;
+                                    }
+                                    if (sh) {
+                                        checker_error(c, arm->loc.line,
+                                            "cannot capture a shared union variant by pointer (|*%.*s|) in a switch — "
+                                            "the shared union is snapshotted under the auto-lock, so the pointer would "
+                                            "alias a throwaway copy (the mutation is lost). Copy the field into a local, "
+                                            "mutate it, then assign it back as a separate statement.",
+                                            (int)arm->capture_name_len, arm->capture_name);
+                                    }
+                                }
+                            }
+                        }
                         cap_type = type_pointer(c->arena, variant_type);
                         cap_const = switch_src_const; /* BUG-326 */
                         if (cap_const) cap_type->pointer.is_const = true;
@@ -15411,6 +15480,81 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
 
 /* Collect ALL shared types in an expression (not just the first).
  * Returns count of distinct shared types found (max 2 for deadlock check). */
+/* B3 (2026-06-21): walk a @cond_wait / @cond_timedwait predicate and return the
+ * first sub-expression that READS a shared struct whose ROOT IDENT differs from
+ * the condition variable's own root ident, else NULL.
+ *
+ * Why instance-precise (root-ident), not type_id: pthread_cond_wait atomically
+ * releases ONLY the cond struct's mutex and re-evaluates the predicate under it,
+ * so any OTHER shared struct read in the predicate is unsynchronized — even a
+ * second INSTANCE of the SAME shared type (its mutex is a distinct lock). Keying
+ * on root identity catches that, while still ACCEPTING the legit pointer-param
+ * case (cond struct `b`, predicate `b.field` — same root ident). Locking the 2nd
+ * struct inside the cond mutex is NOT an option (AB-BA deadlock, and cond_wait
+ * sleeps holding the extra lock), so the correct discipline is the textbook one:
+ * a condvar predicate may read only state protected by the cond mutex. Uses
+ * if/else (not switch) to satisfy the walker-default audit, and type_dispatch_kind
+ * (not a raw type-kind comparison) to satisfy the type-dispatch audit. */
+static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
+                                      const char *cond_root, uint32_t cond_root_len) {
+    if (!pred) return NULL;
+    if (pred->kind == NODE_FIELD || pred->kind == NODE_INDEX) {
+        Node *root = pred;
+        while (root->kind == NODE_FIELD) root = root->field.object;
+        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        if (root->kind == NODE_IDENT) {
+            Type *t = typemap_get(c, root);
+            if (!t) {
+                Symbol *sym = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (sym) t = sym->type;
+            }
+            if (t) {
+                Type *eff = type_unwrap_distinct(t);
+                bool is_shared = false;
+                if (type_dispatch_kind(eff) == TYPE_STRUCT && eff->struct_type.is_shared)
+                    is_shared = true;
+                if (!is_shared && type_dispatch_kind(eff) == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && type_dispatch_kind(inner) == TYPE_STRUCT &&
+                        inner->struct_type.is_shared)
+                        is_shared = true;
+                }
+                if (is_shared &&
+                    !((uint32_t)root->ident.name_len == cond_root_len &&
+                      memcmp(root->ident.name, cond_root, cond_root_len) == 0)) {
+                    return pred; /* foreign shared read */
+                }
+            }
+        }
+    }
+    Node *r = NULL;
+    if (pred->kind == NODE_BINARY) {
+        if ((r = cond_pred_foreign_shared(c, pred->binary.left, cond_root, cond_root_len)))
+            return r;
+        return cond_pred_foreign_shared(c, pred->binary.right, cond_root, cond_root_len);
+    }
+    if (pred->kind == NODE_UNARY)
+        return cond_pred_foreign_shared(c, pred->unary.operand, cond_root, cond_root_len);
+    if (pred->kind == NODE_FIELD)
+        return cond_pred_foreign_shared(c, pred->field.object, cond_root, cond_root_len);
+    if (pred->kind == NODE_INDEX) {
+        if ((r = cond_pred_foreign_shared(c, pred->index_expr.object, cond_root, cond_root_len)))
+            return r;
+        return cond_pred_foreign_shared(c, pred->index_expr.index, cond_root, cond_root_len);
+    }
+    if (pred->kind == NODE_TYPECAST)
+        return cond_pred_foreign_shared(c, pred->typecast.expr, cond_root, cond_root_len);
+    if (pred->kind == NODE_CALL) {
+        for (int i = 0; i < pred->call.arg_count; i++)
+            if ((r = cond_pred_foreign_shared(c, pred->call.args[i], cond_root, cond_root_len)))
+                return r;
+    }
+    return NULL;
+}
+
 static int collect_shared_types_in_expr(Checker *c, Node *expr,
                                          Type **types, int max_types, int count) {
     if (!expr || count >= max_types) return count;

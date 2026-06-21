@@ -2615,10 +2615,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         Node *sw_ref = NULL;
         if (is_union) {
             Node *sw_expr = node->switch_stmt.expr;
+            /* B2: when the union switch root is a shared struct, do NOT take the
+             * lvalue alias path (sw_ref = &g.union) — that aliases live shared
+             * bytes and the discriminant/capture reads happen AFTER the lock is
+             * released (ir_lower.c:2698), a cross-thread torn read / type
+             * confusion. Force the RVALUE path instead, which copies the whole
+             * union into a LOCAL *under* the switch-expr lock (emitted at 2606),
+             * so every subsequent read is of a private snapshot. is_shared also
+             * covers shared(rw). The matching |*x|-capture reject is in checker.c. */
+            bool root_is_shared = (find_shared_root_expr(ctx->checker, sw_expr) != NULL);
             bool is_lvalue = (sw_expr->kind == NODE_IDENT ||
                               sw_expr->kind == NODE_FIELD ||
                               sw_expr->kind == NODE_INDEX ||
-                              (sw_expr->kind == NODE_UNARY && sw_expr->unary.op == TOK_STAR));
+                              (sw_expr->kind == NODE_UNARY && sw_expr->unary.op == TOK_STAR))
+                             && !root_is_shared;
             Node *addr_expr;
             if (is_lvalue) {
                 /* Build &sw_expr — TOK_AMP passthrough in lower_expr preserves lvalue */

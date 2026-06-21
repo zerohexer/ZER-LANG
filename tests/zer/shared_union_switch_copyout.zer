@@ -1,0 +1,19 @@
+// B2 positive: a union field of a SHARED struct, switched with a VALUE capture.
+// The shared union is snapshotted under the auto-lock (copy-out path in ir_lower),
+// so the discriminant + captured value are read from a private local, never the
+// live shared bytes. Single-threaded here — proves copy-out compiles + runs and
+// preserves the active variant through the snapshot.
+struct Inner { u32 v; }
+union Payload { Inner s; u32 num; }
+shared struct Box { Payload p; }
+Box g;
+u32 main() {
+    g.p.num = 42;
+    u32 out = 0;
+    switch (g.p) {
+        .s => |val| { out = val.v; }
+        .num => |n| { out = n; }
+    }
+    if (out != 42) { return 1; }
+    return 0;
+}

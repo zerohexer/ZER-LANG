@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// B3: a @cond_wait predicate that reads a DIFFERENT shared struct (gs) than the
+// condition variable (gq) is an unsynchronized cross-thread race — pthread_cond_wait
+// releases only gq's mutex, so the read of gs.flag races writers holding gs's lock.
+// Must be rejected; fold the shutdown flag into gq, or signal on its change.
+shared struct Q { u32 count; }
+shared struct Shutdown { u32 flag; }
+Q gq;
+Shutdown gs;
+u32 main() {
+    gq.count = 1;
+    gs.flag = 0;
+    @cond_wait(gq, gq.count > 0 && gs.flag == 0);
+    return 0;
+}

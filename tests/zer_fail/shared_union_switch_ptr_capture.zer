@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// B2: a |*x| mutable pointer capture of a SHARED union variant. Because the shared
+// union is copy-snapshotted under the auto-lock, the pointer would alias a throwaway
+// local (the mutation is silently lost) and strip the lock off shared bytes. Must be
+// rejected — copy the field into a local, mutate, then assign it back as its own
+// (auto-locked) statement.
+struct Inner { u32 v; }
+union Payload { Inner s; u32 num; }
+shared struct Box { Payload p; }
+Box g;
+u32 main() {
+    g.p.s.v = 1;
+    switch (g.p) {
+        .s => |*val| { val.v = 99; }
+        .num => |n| { }
+    }
+    return 0;
+}

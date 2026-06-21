@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Axis A6/#5: taking the address of a shared struct's field THROUGH a pointer
+// to the shared struct (*Counter c; &c.value) extracts an interior pointer
+// that aliases the shared bytes and bypasses auto-locking. Pre-fix the ban
+// only matched a NODE_FIELD on a struct-typed root ident, so the pointer-rooted
+// case slipped through.
+shared struct Counter { u32 value; }
+void f(*Counter c) {
+    *u32 p = &c.value;
+    p[0] = 1;
+}
+u32 main() { return 0; }

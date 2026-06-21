@@ -172,6 +172,27 @@ for the winner (B4), and shared access inside an `if`/`for`/`while` *condition*
 within a defer body (the B5 fix covers `NODE_EXPR_STMT` defer bodies). These are
 the deadlock-sensitive lock-scope-redesign pieces.
 
+### BUG-750 — interior-extraction ban missed pointer-rooted + array-element cases (lock bypass) [Axis A6/#5]
+
+**What broke (HIGH):** the `&shared.field` ban (which prevents extracting an
+interior pointer that bypasses the auto-lock) only matched `operand->kind ==
+NODE_FIELD` on a struct-typed root ident. Two bypasses slipped through:
+`*Counter c; &c.value` (pointer-rooted — root type is `TYPE_POINTER`, not
+`TYPE_STRUCT`) and `&shared.arr[i]` (`operand->kind == NODE_INDEX`).
+
+**Fix (checker.c TOK_AMP):** the ban now fires when the operand is `NODE_FIELD`
+**or** `NODE_INDEX` and the walked root resolves to a shared struct **directly
+or via a pointer to a shared struct** (shared + shared(rw)). Taking the address
+of the WHOLE shared struct (`&s`, bare ident) is still allowed — that is how a
+shared struct is passed/spawned (auto-locked). The runner now also has a
+30s `timeout` (a botched auto-lock that deadlocks fails red, exit 124, instead
+of hanging CI).
+
+**Tests:** `tests/zer_fail/shared_interior_ptr_via_pointer.zer`,
+`shared_interior_ptr_array.zer` (now rejected); `tests/zer/shared_field_direct_ok.zer`
+(direct access + `&whole_struct` still OK). Full ZER suite 772/772 (zero new
+false positives), C units pass.
+
 ---
 
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)

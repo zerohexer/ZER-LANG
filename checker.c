@@ -3283,14 +3283,39 @@ static Type *check_expr(Checker *c, Node *node) {
                             "pointer alias would bypass variant lock",
                             (int)c->union_switch_var_len, c->union_switch_var);
                     }
-                    /* shared struct: ban &s.field — pointer would bypass auto-locking */
-                    if (sym && sym->type) {
+                    /* shared struct: ban &s.field / &s.arr[i] (INTERIOR
+                     * extraction) — the extracted pointer aliases the shared
+                     * bytes and bypasses auto-locking. Axis A6/#5 (2026-06-21):
+                     * extended beyond the original `NODE_FIELD on a struct
+                     * root` to also cover (a) pointer-rooted shared structs
+                     * (`*Counter p; &p.value`) and (b) array-element extraction
+                     * (`&shared.arr[i]`, operand is NODE_INDEX). Taking the
+                     * address of the WHOLE shared struct (`&s`, operand is the
+                     * bare IDENT) is still allowed — that is how a shared struct
+                     * is passed/spawned, auto-locked. shared(rw) included. */
+                    if (sym && sym->type &&
+                        (node->unary.operand->kind == NODE_FIELD ||
+                         node->unary.operand->kind == NODE_INDEX)) {
                         Type *st = type_unwrap_distinct(sym->type);
-                        if (st->kind == TYPE_STRUCT && st->struct_type.is_shared &&
-                            node->unary.operand->kind == NODE_FIELD) {
+                        bool root_is_shared = false;
+                        if (st->kind == TYPE_STRUCT &&
+                            (st->struct_type.is_shared ||
+                             st->struct_type.is_shared_rw)) {
+                            root_is_shared = true;
+                        } else if (st->kind == TYPE_POINTER) {
+                            Type *inner = type_unwrap_distinct(st->pointer.inner);
+                            if (inner && inner->kind == TYPE_STRUCT &&
+                                (inner->struct_type.is_shared ||
+                                 inner->struct_type.is_shared_rw))
+                                root_is_shared = true;
+                        }
+                        if (root_is_shared) {
                             checker_error(c, node->loc.line,
-                                "cannot take address of shared struct field — "
-                                "pointer would bypass auto-locking");
+                                "cannot take address of a shared struct's "
+                                "interior (field or element) — the pointer "
+                                "would bypass auto-locking. Operate on the field "
+                                "directly under the auto-lock, or take the "
+                                "address of the whole shared struct");
                         }
                     }
                 }

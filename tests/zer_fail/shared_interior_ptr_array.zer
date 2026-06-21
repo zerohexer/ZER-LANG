@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Axis A6/#5: taking the address of a shared struct's ARRAY ELEMENT
+// (&g.arr[0]) extracts an interior pointer that bypasses auto-locking. Pre-fix
+// the ban only matched operand->kind == NODE_FIELD, so the NODE_INDEX
+// (array-element) case slipped through.
+shared struct Buf { u32[8] arr; }
+Buf g;
+u32 main() {
+    *u32 p = &g.arr[0];
+    p[0] = 1;
+    return 0;
+}

@@ -39,7 +39,13 @@ for f in tests/zer/*.zer; do
     # and appended to ZERC invocation. Used for tests that need specific
     # target features (e.g., --target-features=avx512f).
     file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
-    $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
+    # Timeout (2026-06-21): a positive test must compile + run + exit 0 within
+    # ZER_RUN_TIMEOUT seconds. A DEADLOCK (e.g. a botched auto-lock leaving a
+    # mutex held) would otherwise hang the whole `make check`; `timeout` makes
+    # it a visible FAIL (exit 124) instead — the concurrency stress tests rely
+    # on this so a latent deadlock surfaces in CI rather than shipping silently.
+    ZER_RUN_TIMEOUT="${ZER_RUN_TIMEOUT:-30}"
+    timeout "$ZER_RUN_TIMEOUT" $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
     ret=$?
     if [ $ret -eq 0 ]; then
         PASS=$((PASS + 1))
@@ -50,8 +56,12 @@ for f in tests/zer/*.zer; do
             echo "  SKIP: $name (exit $ret — known pre-existing issue, docs/limitations.md)"
         else
             FAIL=$((FAIL + 1))
-            echo "  FAIL: $name (exit $ret)"
-            $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>&1 | head -5
+            if [ $ret -eq 124 ]; then
+                echo "  FAIL: $name (TIMEOUT after ${ZER_RUN_TIMEOUT}s — possible deadlock)"
+            else
+                echo "  FAIL: $name (exit $ret)"
+            fi
+            timeout "$ZER_RUN_TIMEOUT" $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>&1 | head -5
         fi
     fi
     rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null

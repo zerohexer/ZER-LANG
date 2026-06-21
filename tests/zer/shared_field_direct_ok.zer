@@ -1,0 +1,14 @@
+// Axis A6/#5 regression guard (positive): DIRECT shared-field access (read and
+// write under the auto-lock) and taking the address of the WHOLE shared struct
+// must STILL compile — the extended interior-extraction ban must only reject
+// &(field or element), not normal access or &(whole struct).
+shared struct Counter { u32 value; }
+Counter g;
+void worker(*Counter c) { c.value += 1; }
+u32 main() {
+    g.value = 5;
+    u32 x = g.value;
+    spawn worker(&g);
+    if (x != 5) { return 1; }
+    return 0;
+}

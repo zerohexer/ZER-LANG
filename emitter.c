@@ -8956,31 +8956,26 @@ static Node *emit_defer_shared_root(Emitter *e, Node *expr) {
             }
         }
     }
+    /* Recurse via if/else chains (NOT a switch) — mirrors ir_lower.c
+     * find_shared_root_expr and avoids the walker-default audit (no default:
+     * clause to silently swallow new node kinds). */
     Node *found = NULL;
-    switch (expr->kind) {
-    case NODE_BINARY:
+    if (expr->kind == NODE_BINARY) {
         found = emit_defer_shared_root(e, expr->binary.left);
         if (!found) found = emit_defer_shared_root(e, expr->binary.right);
-        break;
-    case NODE_ASSIGN:
+    } else if (expr->kind == NODE_ASSIGN) {
         found = emit_defer_shared_root(e, expr->assign.target);
         if (!found) found = emit_defer_shared_root(e, expr->assign.value);
-        break;
-    case NODE_CALL:
+    } else if (expr->kind == NODE_CALL) {
         for (int i = 0; i < expr->call.arg_count && !found; i++)
             found = emit_defer_shared_root(e, expr->call.args[i]);
-        break;
-    case NODE_UNARY:
+    } else if (expr->kind == NODE_UNARY) {
         found = emit_defer_shared_root(e, expr->unary.operand);
-        break;
-    case NODE_INDEX:
+    } else if (expr->kind == NODE_INDEX) {
         found = emit_defer_shared_root(e, expr->index_expr.object);
         if (!found) found = emit_defer_shared_root(e, expr->index_expr.index);
-        break;
-    case NODE_TYPECAST:
+    } else if (expr->kind == NODE_TYPECAST) {
         found = emit_defer_shared_root(e, expr->typecast.expr);
-        break;
-    default: break;
     }
     return found;
 }

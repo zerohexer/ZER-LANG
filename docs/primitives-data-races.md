@@ -2047,7 +2047,14 @@ analysis missed. Otherwise, they stand.
 > No-shared-stack) was an incomplete model. Three adversarial code-grounded
 > sweeps (each finding verified against the actual handlers, not agent
 > assertion) replaced it with a precise inventory and a four-axis architecture.
-> Status: **audited, design converged, NOT implemented.** Spec NOT yet frozen.
+> Status: **audited, design converged, IMPLEMENTATION IN PROGRESS** — phase 2
+> began 2026-06-21b with **7 of ~25 holes CLOSED** (BUG-743..749: Axis C
+> `ir_merge_states` thread-merge, A1 exhaustive spawn dispatch, C2 spawn
+> lifetime arm, A3 volatile-RMW, A4 Arena, D2 `@probe` `__thread`, B5 defer
+> lock), each verified + regression-tested. Remaining = the subsystem-scale core
+> (B1–B4 lock-scope redesign, A6 `shared`-scalar representation, D1 cinclude
+> capability). Per-hole CLOSED/OPEN ledger: `docs/limitations.md` "## OPEN —
+> Concurrency memory-safety". Spec NOT yet frozen.
 
 ### 24.1 Current state — primitives done, safety incomplete
 

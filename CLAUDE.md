@@ -710,24 +710,30 @@ b.y = 2; a.x = 1;          // OK — separate statements, locks released between
 a.x = b.y;                 // ERROR — same statement accesses both A and B
 ```
 
-> **CONCURRENCY MEMORY-SAFETY STATUS (audited 2026-06-20, NOT closed) — READ
-> BEFORE touching/claiming anything about ZER concurrency safety.** All
-> concurrency PRIMITIVES are implemented (shared/spawn/atomics/Semaphore/Barrier/
-> condvar/Ring/async/move). But three adversarial sweeps found **~25 verified
-> cross-thread MEMORY-safety holes** (data races + cross-thread UAF) that compile
-> clean today. They are NOT independent bugs — they map to **four architectural
-> axes** (A reachability/exclusion-list scanner, B single-root auto-lock
-> incompleteness, C per-function CFG lattice that never merges `threads[]`, D
-> cinclude/emitter-runtime concurrency-capture boundary). ZER's concurrency claim
-> is therefore **"designed to match Rust's memory safety via auto-inference, but
-> not yet complete"** — do NOT state ZER is data-race-safe as shipped. The full
-> verified hole inventory, the four-axis closure design, the Rust mapping, and the
-> single most-actionable bug (axis C: `ir_merge_states` drops scoped-spawn join
-> obligations at every CFG merge → false-green stack-UAF) are in
-> **`docs/limitations.md` "## OPEN — Concurrency memory-safety"** and
-> **`docs/primitives-data-races.md` §24**. Liveness (deadlock/livelock) is the
-> named floor — out of scope for ZER *and* Rust. This is subsystem-scale work, not
-> patches. See also [[project_concurrency_audit]] in memory.
+> **CONCURRENCY MEMORY-SAFETY STATUS (audited 2026-06-20; implementation phase 2
+> IN PROGRESS 2026-06-21b — NOT closed) — READ BEFORE touching/claiming anything
+> about ZER concurrency safety.** All concurrency PRIMITIVES are implemented
+> (shared/spawn/atomics/Semaphore/Barrier/condvar/Ring/async/move). Three
+> adversarial sweeps found **~25 verified cross-thread MEMORY-safety holes** (data
+> races + cross-thread UAF) mapping to **four architectural axes** (A
+> reachability/exclusion-list scanner, B single-root auto-lock incompleteness, C
+> per-function CFG lattice that never merged `threads[]`, D cinclude/emitter-runtime
+> capture). **7 holes are now CLOSED** (BUG-743..749, each verified + regression
+> negative test in `tests/zer_fail/` running in `make check`): Axis C
+> `ir_merge_states` now merges `threads[]` (the false-green scoped-spawn stack-UAF —
+> the most-actionable bug — is fixed); A1 exhaustive spawn-arg dispatch
+> (slice/opaque); C2 fire-and-forget stack-pointer lifetime arm; A3 volatile-RMW in
+> spawn; A4 Arena exclusion; D2 `@probe` `__thread`; B5 deferred shared access
+> lock-wrapped. **STILL OPEN (subsystem-scale, deadlock/type-system-risky, do NOT
+> claim ZER is fully data-race-safe yet):** B1–B4 lock-scope-walker redesign
+> (multi-root / union-switch / cond-predicate / `@once` loser-wait), A5 threadlocal
+> `&`-escape, A6 `shared`-as-scalar/pointer qualifier (the recurring blocker), D1
+> cinclude concurrency-capture capability, scoped-borrow exclusivity. Full
+> CLOSED/OPEN ledger + fix sketches: **`docs/limitations.md` "## OPEN — Concurrency
+> memory-safety"**; design + Rust mapping: **`docs/primitives-data-races.md` §24**;
+> Coq/Iris closure proof (sufficiency, zero-admit):
+> `proofs/operational/lambda_zer_concurrency/`. Liveness (deadlock/livelock) is the
+> named floor — out of scope for ZER *and* Rust. See also [[project_concurrency_audit]].
 
 ### Move Struct — Ownership Transfer
 ```

@@ -179,7 +179,7 @@ checker.c:if (stype && stype->kind == TYPE_STRUCT) is_struct_type_ref = true;
 checker.c:if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB) &&
 checker.c:if (sv->type && sv->type->kind == TYPE_VOID) {
 checker.c:if (sw_type->kind == TYPE_ENUM) {
-checker.c:if (t->kind == TYPE_ARENA || t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
+checker.c:if (t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
 checker.c:if (t->kind == TYPE_ARRAY) {
 checker.c:if (t->kind == TYPE_OPTIONAL) {
 checker.c:if (t->kind == TYPE_POINTER) return CONST_EVAL_FAIL;
@@ -670,3 +670,14 @@ checker.c:if (!sig || sig->kind != TYPE_FUNC_PTR) return;
 checker.c:if (!cs || cs->kind != TYPE_FUNC_PTR ||
 checker.c:if (cs && cs->kind == TYPE_FUNC_PTR && cs->func_ptr.param_keeps &&
 checker.c:if (pt && pt->kind == TYPE_POINTER) return true; /* pointer worst-case */
+# concurrency closure phase 2 (2026-06-21): spawn-arg ptr-like dispatch
+# (spawn_arg_is_stack_derived + the NODE_SPAWN handler) and the defer-body
+# shared-root finder (emit_defer_shared_root) — eff/inner/st/t are all
+# type_unwrap_distinct() results (already distinct-unwrapped), so the raw
+# ->kind is the correct read. See BUG-744/745/749.
+checker.c:bool is_ptr_like = (eff->kind == TYPE_POINTER ||
+checker.c:eff->kind == TYPE_SLICE ||
+checker.c:if (inner && inner->kind == TYPE_STRUCT &&
+checker.c:if (st && st->kind == TYPE_ARRAY) return true;
+emitter.c:if (eff->kind == TYPE_STRUCT &&
+emitter.c:if (inner && inner->kind == TYPE_STRUCT &&

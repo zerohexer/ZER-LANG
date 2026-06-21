@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Axis A1: [*]T (slice) spawn arg was uncased — a slice over a stack array
+// passed to a fire-and-forget spawn lets the thread read freed stack memory.
+void worker([*]u8 data) { data[0] = 1; }
+u32 main() {
+    u8[16] buf;
+    buf[0] = 0;
+    [*]u8 s = buf;
+    spawn worker(s);
+    return 0;
+}

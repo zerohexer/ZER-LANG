@@ -1,0 +1,13 @@
+// Axis A1 regression guard (positive): a scoped spawn (ThreadHandle + join)
+// passing a stack-derived slice must STILL compile — the enforced join bounds
+// the thread to the scope, so the borrow is safe.
+void worker([*]u8 data) { data[0] = 1; }
+u32 main() {
+    u8[16] buf;
+    buf[0] = 0;
+    [*]u8 s = buf;
+    ThreadHandle th = spawn worker(s);
+    th.join();
+    if (buf[0] != 1) { return 1; }
+    return 0;
+}

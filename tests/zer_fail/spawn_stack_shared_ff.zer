@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// Axis C2: fire-and-forget spawn borrowing a pointer to a STACK-LOCAL shared
+// struct. Pre-fix, checker.c accepted *shared T unconditionally ("OK — shared
+// struct pointer, auto-locked") with NO lifetime check — the thread outlives
+// the stack frame (cross-thread use-after-free). Must now error.
+shared struct Counter { u32 v; }
+void worker(*Counter c) { c.v += 1; }
+u32 main() {
+    Counter local;
+    local.v = 0;
+    spawn worker(&local);
+    return 0;
+}

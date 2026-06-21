@@ -8853,6 +8853,65 @@ static bool expr_contains_yield(Node *n) {
     return false;
 }
 
+/* Axis A1/C2 (2026-06-21): does a spawn argument reference a pointer/slice/
+ * opaque DERIVED from a function-local stack object? Unwraps casts + the
+ * provenance-preserving cast intrinsics, walks `&` / field / index to the
+ * root ident; a non-static, non-global root is stack-derived. Also honors the
+ * propagated is_local_derived / is_arena_derived flags (a local pointer/slice
+ * assigned `&local`), and a bare local ARRAY ident (its slice coercion aliases
+ * the stack). Used to reject publishing stack memory to a fire-and-forget
+ * spawn — the thread can outlive the frame (cross-thread use-after-free).
+ * Formalized by `stack_not_publishable` in
+ * proofs/operational/lambda_zer_concurrency/iris_region_join.v. */
+static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
+    Node *e = arg;
+    for (;;) {
+        if (!e) return false;
+        if (e->kind == NODE_TYPECAST) { e = e->typecast.expr; continue; }
+        if (e->kind == NODE_INTRINSIC && e->intrinsic.arg_count > 0) {
+            const char *n = e->intrinsic.name;
+            uint32_t l = (uint32_t)e->intrinsic.name_len;
+            if ((l == 7 && memcmp(n, "ptrcast", 7) == 0) ||
+                (l == 7 && memcmp(n, "bitcast", 7) == 0) ||
+                (l == 4 && memcmp(n, "cast", 4) == 0) ||
+                (l == 3 && memcmp(n, "pun", 3) == 0)) {
+                e = e->intrinsic.args[e->intrinsic.arg_count - 1];
+                continue;
+            }
+        }
+        break;
+    }
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_AMP) {
+        Node *root = e->unary.operand;
+        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+            root = (root->kind == NODE_FIELD) ? root->field.object
+                                              : root->index_expr.object;
+        }
+        if (root && root->kind == NODE_IDENT) {
+            const char *vn = root->ident.name;
+            uint32_t vl = (uint32_t)root->ident.name_len;
+            Symbol *s = scope_lookup(c->current_scope, vn, vl);
+            bool is_global = scope_lookup_local(c->global_scope, vn, vl) != NULL;
+            if (s && !s->is_static && !is_global) return true;
+        }
+        return false;
+    }
+    if (e->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                 (uint32_t)e->ident.name_len);
+        if (s) {
+            if (s->is_local_derived || s->is_arena_derived) return true;
+            bool is_global = scope_lookup_local(c->global_scope, e->ident.name,
+                                 (uint32_t)e->ident.name_len) != NULL;
+            if (!s->is_static && !is_global && s->type) {
+                Type *st = type_unwrap_distinct(s->type);
+                if (st && st->kind == TYPE_ARRAY) return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
@@ -12003,18 +12062,43 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
             Type *eff = type_unwrap_distinct(arg_type);
-            /* Pointer args: scoped spawn allows *T (will be joined), fire-and-forget requires *shared */
-            if (eff->kind == TYPE_POINTER) {
-                Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) {
-                    /* OK — shared struct pointer, auto-locked */
-                } else if (is_scoped) {
-                    /* OK — scoped spawn, thread will be joined before scope exit */
-                } else {
+            /* Ptr-like args (pointer / slice / *opaque): a fire-and-forget
+             * spawn requires a SYNCHRONIZED carrier (pointer to a shared
+             * struct) whose lifetime OUTLIVES the thread (not a stack local);
+             * a scoped spawn (ThreadHandle + enforced join) bounds the
+             * lifetime so *T is allowed. Axis A1 (exhaustive dispatch over
+             * slice/opaque, previously UNCASED — `[*]T` over a stack array and
+             * `(*opaque)&local` fell straight through) + Axis C2 (the stack-
+             * lifetime arm — `*shared T` to a stack local was accepted with no
+             * check). See proofs/operational/lambda_zer_concurrency:
+             * stack_not_publishable (lifetime) + is_shared (reach/discipline). */
+            bool is_ptr_like = (eff->kind == TYPE_POINTER ||
+                                eff->kind == TYPE_SLICE ||
+                                eff->kind == TYPE_OPAQUE);
+            if (is_ptr_like) {
+                bool shared_carrier = false;
+                if (eff->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                    if (inner && inner->kind == TYPE_STRUCT &&
+                        inner->struct_type.is_shared)
+                        shared_carrier = true;
+                }
+                bool stack_derived =
+                    spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i]);
+                if (is_scoped) {
+                    /* OK — scoped spawn, thread joined before scope exit */
+                } else if (stack_derived) {
                     checker_error(c, node->loc.line,
-                        "argument %d: cannot pass non-shared pointer to spawn — "
-                        "data race. Use shared struct, copy by value, or use "
-                        "ThreadHandle to join before scope exit",
+                        "argument %d: cannot pass a pointer/slice to a stack "
+                        "local to a fire-and-forget spawn — the thread may "
+                        "outlive the stack frame (cross-thread use-after-free). "
+                        "Use ThreadHandle + join, a shared global, or copy by value",
+                        i + 1);
+                } else if (!shared_carrier) {
+                    checker_error(c, node->loc.line,
+                        "argument %d: cannot pass non-shared pointer/slice to "
+                        "spawn — data race. Use shared struct, copy by value, or "
+                        "use ThreadHandle to join before scope exit",
                         i + 1);
                 }
             }

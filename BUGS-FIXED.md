@@ -50,6 +50,50 @@ after the branch → OK, proves the obligation carries through the merge and the
 later join discharges it). Full ZER suite 760/760, C unit tests
 584+238+14+17+39 all pass.
 
+### BUG-744 — spawn-arg dispatch missed TYPE_SLICE / TYPE_OPAQUE (data race / stack-UAF) [Axis A1]
+
+**What broke (HIGH):** the spawn-arg safety check (checker.c NODE_SPAWN) cased
+only `TYPE_POINTER` (+ `TYPE_HANDLE`/`TYPE_OPTIONAL`). A `[*]T` slice over a
+stack array, or `(*opaque)&local`, fell straight through with NO check — a
+fire-and-forget thread reads freed stack / races shared data.
+
+**Fix:** unified ptr-like dispatch over `TYPE_POINTER | TYPE_SLICE |
+TYPE_OPAQUE`. A fire-and-forget spawn requires a synchronized carrier (pointer
+to a shared struct); a scoped spawn (ThreadHandle + enforced join) still allows
+`*T`. New helper `spawn_arg_is_stack_derived` unwraps casts / `@ptrcast` /
+`@bitcast` / `@cast` / `@pun`, walks `&`/field/index to the root ident, and
+honors the propagated `is_local_derived`/`is_arena_derived` flags + bare local
+ARRAY idents.
+
+### BUG-745 — `*shared T` fire-and-forget spawn to a STACK-LOCAL accepted (cross-thread UAF) [Axis C2]
+
+**What broke (HIGH):** checker.c accepted `*shared T` spawn args
+unconditionally ("OK — shared struct pointer, auto-locked") with NO lifetime
+check. `spawn worker(&local)` where `local` is a stack-local shared struct
+published a pointer into a dead frame to an unbounded thread (cross-thread UAF).
+
+**Fix:** for a fire-and-forget spawn, a ptr-like arg that is
+`spawn_arg_is_stack_derived` is rejected (point at ThreadHandle+join, a shared
+global, or copy-by-value) BEFORE the shared-carrier check — so even a
+`*shared T` to a stack local errors. A global shared struct (`&g`) still passes
+(global lifetime ≥ thread). Formalized by `stack_not_publishable` in
+`proofs/operational/lambda_zer_concurrency/iris_region_join.v`.
+
+**Tests (A1+C2):** `tests/zer_fail/spawn_stack_shared_ff.zer`,
+`spawn_opaque_stack.zer`, `spawn_slice_stack.zer` (all now rejected);
+`tests/zer/spawn_global_shared_ff_ok.zer` (global shared → OK),
+`spawn_scoped_slice_ok.zer` (scoped+joined stack slice → OK). Full ZER suite
+765/765, C unit tests 584+238+14+39 pass.
+
+**Note on C3 (move-struct `&`-unwrap in IR_SPAWN):** investigated and rejected
+as framed. For a SCOPED spawn `spawn worker(&f)` is a *borrow* (join returns
+control), so a permanent move-transfer would false-positive legitimate
+post-join use; for FIRE-AND-FORGET, `&move_struct` is already rejected by the
+A1/C2 checker rules (non-shared pointer / stack-derived). The real residual
+hazard — a DATA RACE on a non-shared object borrowed by a scoped spawn between
+`spawn` and `join` (parent and thread access concurrently) — is a distinct
+scoped-borrow-exclusivity rule (Axis B), tracked in docs/limitations.md.
+
 ---
 
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Axis A1: *opaque spawn arg was uncased — (*opaque)&local fell straight
+// through the spawn-arg dispatch. The opaque pointer aliases a stack local;
+// a fire-and-forget thread reading it is a cross-thread use-after-free.
+void worker(*opaque p) { }
+u32 main() {
+    u32 local;
+    local = 5;
+    spawn worker((*opaque)&local);
+    return 0;
+}

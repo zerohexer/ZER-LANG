@@ -1,0 +1,11 @@
+// Axis C2 regression guard (positive): fire-and-forget spawn borrowing a
+// pointer to a GLOBAL shared struct must STILL compile — global lifetime
+// outlives the thread and the shared struct is auto-locked.
+shared struct Counter { u32 v; }
+Counter g;
+void worker(*Counter c) { c.v += 1; }
+u32 main() {
+    g.v = 0;
+    spawn worker(&g);
+    return 0;
+}

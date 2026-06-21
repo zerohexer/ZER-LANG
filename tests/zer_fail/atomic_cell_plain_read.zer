@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// A6-full slice 2: a plain READ of an atomic cell after a fire-and-forget spawn
+// (which runs unbounded) races the thread atomically updating it. Must use
+// @atomic_load. (Reads after a SCOPED spawn's join are safe — the thread is
+// done — so only fire-and-forget gates this.)
+u32 g;
+void worker() { @atomic_add(&g, 1); }
+u32 main() {
+    @atomic_store(&g, 0);
+    spawn worker();
+    u32 x = g;
+    return x;
+}

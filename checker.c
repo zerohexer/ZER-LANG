@@ -3005,6 +3005,15 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* this ident IS a global — track ISR/func access */
                 track_isr_global(c, node->ident.name,
                                  (uint32_t)node->ident.name_len, false);
+                /* A6-full slice 2: record a plain VALUE read of a scalar global
+                 * after a spawn (concurrent context). Post-check flags it if the
+                 * global is an atomic cell. Skip `&g` (in_amp — address-take, not
+                 * a value read; the @atomic target arrives this way) and assign
+                 * targets (in_assign_target — the write path records those). */
+                if (c->after_spawn_in_func && !c->in_amp && !c->in_assign_target &&
+                    gs->type && type_is_integer(gs->type)) {
+                    record_atomic_plain_write(c, gs, node->loc.line);
+                }
             }
         }
         break;
@@ -3189,7 +3198,12 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Unary expression ---- */
     case NODE_UNARY: {
+        /* A6-full slice 2: a global under `&` is an address-take, not a plain
+         * value read — set in_amp so the atomic-cell read hook skips it. */
+        bool saved_in_amp = c->in_amp;
+        if (node->unary.op == TOK_AMP) c->in_amp = true;
         Type *operand = check_expr(c, node->unary.operand);
+        c->in_amp = saved_in_amp;
 
         switch (node->unary.op) {
         case TOK_MINUS:
@@ -12115,9 +12129,11 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_SPAWN: {
         /* spawn func(args); — validate function, check arg safety.
          * Also: scan spawned function body for non-shared global access (data race). */
-        /* A6-full atomic-cell: a spawn has now run — from here on in this
-         * function, a plain write to an atomic cell could race the new thread. */
-        c->after_spawn_in_func = true;
+        /* A6-full atomic-cell: a FIRE-AND-FORGET spawn runs unbounded — from here
+         * on in this function, a plain access to an atomic cell could race it. A
+         * SCOPED spawn (ThreadHandle) is joined, so post-join access is safe; the
+         * spawn..join window is the narrower scoped-borrow concern, not this. */
+        if (node->spawn_stmt.handle_name == NULL) c->after_spawn_in_func = true;
         Symbol *func_sym = scope_lookup(c->global_scope,
             node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
         if (!func_sym || !func_sym->is_function) {
@@ -13888,9 +13904,10 @@ static void check_atomic_cell_safety(Checker *c) {
         Symbol *s = c->atomic_plain_writes[i].sym;
         if (s && s->is_atomic_cell) {
             checker_error(c, c->atomic_plain_writes[i].line,
-                "plain write to '%.*s' — it is used with @atomic_* elsewhere, so "
-                "it is an atomic cell and EVERY access (including init) must be "
-                "atomic. Use @atomic_store(&%.*s, value)",
+                "plain access to '%.*s' in a concurrent context — it is used with "
+                "@atomic_* elsewhere, so it is an atomic cell and must be accessed "
+                "atomically here too (use @atomic_load(&%.*s) / @atomic_store / "
+                "@atomic_* — a plain read/write races the other thread)",
                 (int)s->name_len, s->name, (int)s->name_len, s->name);
         }
     }

@@ -256,11 +256,19 @@ Existing single-threaded `atomic_ops.zer` + the 21 rust atomic tests pass
 unchanged (no migration needed). Full `make check` GREEN: semantic-fuzz 200,
 ZER 777, Rust 784, Zig 36, modules 139, all audits OK.
 
-**Remaining A6-full slices (OPEN):** plain READS of an atomic cell (slice 2;
-write-side done here), struct-field atomics `@atomic_*(&s.f)` (slice 3, the
-per-field carrier taint), and the full scalar/pointer `shared` qualifier
-propagation replacing the rest of the exclusion-list (slice 4). See
-docs/limitations.md.
+**A6-full slice 2 (reads) — DONE:** a plain READ of an atomic cell after a
+FIRE-AND-FORGET spawn is also flagged (new `Checker.in_amp` skips `&g`
+address-takes; the read is recorded at the global-access site). Gated on
+fire-and-forget (not scoped) spawns: a scoped spawn is joined, so a post-join
+plain read is safe — this keeps the common "verify counter after join" pattern
+legal (the 21 rust atomic tests + new `atomic_cell_atomic_read_ok.zer` pass).
+Tests: `tests/zer_fail/atomic_cell_plain_read.zer`. Full `make check` GREEN
+(ZER 779, Rust 784, Zig 36).
+
+**Remaining A6-full slices (OPEN):** struct-field atomics `@atomic_*(&s.f)`
+(slice 3, per-field carrier taint), and the scalar/pointer `shared`-qualifier
+PROPAGATION through `&`/casts (slice 4 — closes pointer-laundering of an atomic
+cell, e.g. `*u32 p = &g; p[0] = 5`). See docs/limitations.md.
 
 ---
 

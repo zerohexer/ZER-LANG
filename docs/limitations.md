@@ -2071,6 +2071,19 @@ modules 139, all audits OK):**
   (the thread has exclusive `&mut`-style access). Write-only + linear
   approximation; READ-during-borrow and cross-block remain as a tighter CFG
   version.
+- **[FIXED BUG-752, Axis A6-full slice 1, #7]** atomic-cell inclusion model: a
+  scalar global used with `@atomic_*` is an atomic cell; a plain WRITE to it
+  AFTER a spawn in the same function is a mixed atomic/non-atomic race, now
+  flagged. **Concurrency-aware (gated on after-spawn), NOT strict-always** — the
+  strict Rust-`AtomicU32` model false-positived 21 safe pre-spawn `g=0` inits, so
+  the gate keeps pre-spawn init + single-threaded atomic use legal (matches
+  "shared = reachable by ≥2 threads"). **Slice-1 LEARNING:** the inclusion model
+  is NOT strictly simpler than the exclusion-list — it ALSO needs concurrency
+  context (the after-spawn gate). Remaining A6 slices [OPEN]: atomic-cell READS
+  (slice 2, mostly logic races), struct-field atomics `@atomic_*(&s.f)` (slice 3),
+  full scalar/pointer `shared`-qualifier taint replacing the rest of the
+  exclusion-list (slice 4 — architectural cleanliness; the memory-safety holes
+  are largely already closed by the spawn-target scan + A3/A4 + this slice).
 
 The remaining OPEN holes (B1–B4 lock-scope redesign, A5 threadlocal-escape, A6
 shared-scalar representation incl. #7 atomic-cell uniformity, and the

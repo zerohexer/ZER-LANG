@@ -2084,8 +2084,14 @@ modules 139, all audits OK):**
   context. **Remaining [OPEN, narrow]:** struct-field atomics `@atomic_*(&s.f)` on
   a plain (non-shared) global struct (slice 3) — needs a parallel
   (struct-symbol, field) compound-key list (the scalar machinery keys on the
-  Symbol, which has no per-field flag); uncommon + mostly logic race. The
-  scalar atomic-cell dimension is functionally complete.
+  Symbol, which has no per-field flag); uncommon + mostly logic race.
+  **UPDATE: slice 3 DONE** — struct-field atomic cells now tracked field-precise
+  (`Checker.atomic_fields`, write side). **A6-full atomic-cell taint COMPLETE**
+  (scalar write/read/launder + struct-field, all concurrency-aware). The
+  remaining exclusion-list entries (const/shared-struct/threadlocal/atomic/
+  Barrier/Semaphore) are the genuinely-safe SYNCHRONIZED categories, not holes.
+  Micro-residuals [OPEN, very narrow]: struct-field plain READS + `&s.f` launder
+  (even rarer than the scalar equivalents; same machinery extended by field).
 
 The remaining OPEN holes (B1–B4 lock-scope redesign, A5 threadlocal-escape, A6
 shared-scalar representation incl. #7 atomic-cell uniformity, and the

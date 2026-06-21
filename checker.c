@@ -10746,6 +10746,12 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
+        /* B4: ban control flow that exits a @once body (would skip the done-publish). */
+        if (c->in_once) {
+            checker_error(c, node->loc.line,
+                "cannot use 'return' inside @once block — it would skip the one-time "
+                "completion publish and hang threads waiting on @once");
+        }
         /* Context-ban check delegates to VST-verified predicate.
          * SAFETY: zer_return_allowed_in_context in src/safety/context_bans.c */
         if (zer_return_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
@@ -11177,6 +11183,11 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_BREAK:
+        if (c->in_once) {
+            checker_error(c, node->loc.line,
+                "cannot use 'break' inside @once block — it would skip the one-time "
+                "completion publish and hang threads waiting on @once");
+        }
         /* SAFETY: zer_break_allowed_in_context in src/safety/context_bans.c */
         if (zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
                                            c->in_loop ? 1 : 0) == 0) {
@@ -11192,6 +11203,11 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_GOTO:
+        if (c->in_once) {
+            checker_error(c, node->loc.line,
+                "cannot use 'goto' inside @once block — it would skip the one-time "
+                "completion publish and hang threads waiting on @once");
+        }
         /* goto target label validation done in check_function_body (post-pass)
          * SAFETY: zer_goto_allowed_in_context in src/safety/context_bans.c */
         if (zer_goto_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
@@ -11209,6 +11225,11 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_CONTINUE:
+        if (c->in_once) {
+            checker_error(c, node->loc.line,
+                "cannot use 'continue' inside @once block — it would skip the one-time "
+                "completion publish and hang threads waiting on @once");
+        }
         /* SAFETY: zer_continue_allowed_in_context in src/safety/context_bans.c */
         if (zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
                                               c->in_loop ? 1 : 0) == 0) {
@@ -12194,9 +12215,17 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_ONCE:
-        /* @once { body } — check body */
+        /* @once { body } — check body. B4: ban control flow that EXITS the body
+         * (return/break/continue/goto). The winner publishes a "done" flag at the
+         * @once join AFTER the body so loser threads can wait for it; an early
+         * exit skips that publish and hangs the losers. (Conservative: a break of
+         * a loop fully INSIDE the body is also rejected — factor it into a helper
+         * called from @once. No existing code uses control flow in a @once body.) */
         if (node->once.body) {
+            bool saved_in_once = c->in_once;
+            c->in_once = true;
             check_stmt(c, node->once.body);
+            c->in_once = saved_in_once;
         }
         break;
 

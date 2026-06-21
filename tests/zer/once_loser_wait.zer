@@ -1,0 +1,29 @@
+// B4 positive: @once with the loser-wait runs the body exactly once across
+// threads and does NOT hang — losers spin on the done flag until the winner
+// publishes, then proceed. The winner writes a plain global inside @once (same
+// shape as conc_once_multithread); every thread then bumps a shared counter, so
+// reaching counter == 3 proves all three threads got past @once without hanging.
+u32 g_value;
+shared struct Counter { u32 c; }
+Counter g_counter;
+
+void worker() {
+    @once {
+        g_value = 42;
+    }
+    g_counter.c += 1;
+}
+
+u32 main() {
+    g_value = 0;
+    g_counter.c = 0;
+    ThreadHandle t1 = spawn worker();
+    ThreadHandle t2 = spawn worker();
+    ThreadHandle t3 = spawn worker();
+    t1.join();
+    t2.join();
+    t3.join();
+    if (g_value != 42) { return 1; }    // body ran
+    if (g_counter.c != 3) { return 2; } // all threads passed @once (no hang)
+    return 0;
+}

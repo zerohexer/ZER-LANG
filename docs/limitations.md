@@ -2164,16 +2164,17 @@ checker.c + spawn-arg handler). Every exclusion / forgotten type-kind is a hole:
   struct). Tests: `tests/zer_fail/cond_wait_foreign_shared.zer`,
   `tests/zer_fail/cond_wait_foreign_same_type.zer` (instance-precise),
   `tests/zer/cond_wait_same_struct_multifield.zer` (the prescribed safe restructure).
-- **[OPEN — B4]** `@once` loser doesn't wait for the winner → reads
-  half-constructed published state. Fix: a 3-state flag (0 untouched / 1 in-progress
-  / 2 done): winner CAS 0→1, runs body, stores 2; loser spins until 2.
-  **BLOCKER found 2026-06-21:** the once-flag id (`_zer_once_N`) is EMITTER-
-  generated (a static counter in the `IR_BRANCH`/`NODE_ONCE` handler,
-  emitter.c:~9509), NOT in the IR — so the lowering can't emit a winner-done
-  store or loser spin that references the same flag. Proper fix: move the oid
-  into the `IR_BRANCH` inst at lowering (ir_lower.c NODE_ONCE, ~3370), restructure
-  to 3 blocks (body→store-done→cont / wait→cont), and have the emitter read the
-  oid from the inst. Non-trivial IR+emitter change, deferred.
+- **[FIXED BUG-756 — B4]** `@once` loser now WAITS for the winner. 3-state flag
+  (0/1/2): winner CAS 0→1 → body → store 2 (RELEASE) at the join block; loser spins
+  on `!= 2` (ACQUIRE) → skip. The ACQUIRE/RELEASE pairing means a loser never reads
+  the half-constructed published state. **The "BLOCKER" was illusory** — naming the
+  function-scope flag `_zer_once_<bb_skip_id>` (the @once's `false_block` id, unique
+  per @once, available as `inst->false_block` at the branch AND `bb->id` at the join)
+  makes it reachable from both emission sites with ZERO IR change. Control flow
+  (return/break/continue/goto) that exits a @once body is now banned (`Checker.in_once`)
+  — an early exit would skip the done-publish and hang losers. Tests:
+  `tests/zer/once_loser_wait.zer`, `tests/zer_fail/once_control_flow.zer`. Freestanding
+  path unchanged (single-core, loser does not wait).
 - **[FIXED BUG-749 — B5]** defer-body shared access: `emit_defer_stmt`'s
   `NODE_EXPR_STMT` now lock-wraps the deferred shared access
   (`emit_defer_shared_root` + `emit_shared_lock_mode`/`unlock`, recursive mutex).

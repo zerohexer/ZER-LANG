@@ -178,6 +178,7 @@ typedef struct {
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
+    bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
     struct IsrGlobal {
         const char *name;

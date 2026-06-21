@@ -4807,6 +4807,14 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
     emit(e, "#include <pthread.h>\n");
     emit(e, "#include <time.h>\n");
+    emit(e, "#include <sched.h>\n");
+    emit(e, "#endif\n");
+    emit(e, "\n");
+    /* B4: @once loser-wait relax — yield so the winner (running the @once body)
+     * makes progress while losers spin on the done flag. Hosted only; freestanding
+     * @once stays single-core (loser does not wait). */
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "static inline void _zer_once_relax(void) { sched_yield(); }\n");
     emit(e, "#endif\n");
     emit(e, "\n");
 
@@ -9501,23 +9509,31 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          *   static uint32_t _zer_once_N = 0;
          *   if (!__atomic_exchange_n(&_zer_once_N, 1, __ATOMIC_ACQ_REL)) { body } */
         if (inst->expr && inst->expr->kind == NODE_ONCE && inst->cond_local < 0) {
-            static int once_id_counter = 0;
-            int oid = once_id_counter++;
+            /* B4 (BUG-756): 3-state @once with LOSER-WAIT. The flag
+             * `_zer_once_<oid>` is declared at function scope (see the pre-scan in
+             * emit_regular_func_from_ir) so it is visible both here and at the join
+             * block where the winner publishes "done". oid = false_block (bb_skip)
+             * id — unique per @once and reachable from both sites.
+             * States: 0 untouched, 1 in-progress, 2 done.
+             *   winner: CAS 0->1 succeeds -> run body -> (join) store 2 (RELEASE)
+             *   loser : CAS fails -> spin-load until ==2 (ACQUIRE) -> skip
+             * The ACQUIRE load pairs with the winner's RELEASE store, so a loser
+             * never observes the half-constructed state the winner published. */
+            int oid = inst->false_block;
             emit_indent(e);
-            emit(e, "{ static uint32_t _zer_once_%d = 0;\n", oid);
-            /* Fix #2 (2026-05-02): guard atomic emission by __STDC_HOSTED__.
-             * Hosted: full atomic exchange (lock-free on targets with native
-             * CAS, otherwise libatomic). Freestanding (bare-metal without
-             * libatomic linkage): non-atomic single-core init. Multi-core
-             * bare-metal users must provide their own synchronization
-             * around @once or use atomic intrinsics directly. */
+            emit(e, "{\n");
             emit_indent(e);
             emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
             emit_indent(e);
-            emit(e, "if (!__atomic_exchange_n(&_zer_once_%d, 1, __ATOMIC_ACQ_REL)) goto _zer_bb%d; else goto _zer_bb%d;\n",
-                 oid, inst->true_block, inst->false_block);
+            emit(e, "uint32_t _zer_once_exp_%d = 0;\n", oid);
             emit_indent(e);
-            emit(e, "#else /* freestanding: non-atomic, single-core safe only */\n");
+            emit(e, "if (__atomic_compare_exchange_n(&_zer_once_%d, &_zer_once_exp_%d, 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) goto _zer_bb%d;\n",
+                 oid, oid, inst->true_block);
+            emit_indent(e);
+            emit(e, "else { while (__atomic_load_n(&_zer_once_%d, __ATOMIC_ACQUIRE) != 2u) _zer_once_relax(); goto _zer_bb%d; }\n",
+                 oid, inst->false_block);
+            emit_indent(e);
+            emit(e, "#else /* freestanding: non-atomic, single-core safe only (loser does not wait) */\n");
             emit_indent(e);
             emit(e, "if (_zer_once_%d == 0) { _zer_once_%d = 1; goto _zer_bb%d; } else goto _zer_bb%d;\n",
                  oid, oid, inst->true_block, inst->false_block);
@@ -11068,6 +11084,23 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    /* B4 (BUG-756): declare a function-scope flag for each @once so the
+     * loser-wait (emitted at the @once branch) and the winner's done-publish
+     * (emitted at the join block below) can both reference it. The flag id is the
+     * @once's bb_skip (false_block) id — unique within the function, and reachable
+     * from both the branch (inst->false_block) and the join (bb->id). */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_BRANCH && in->cond_local < 0 &&
+                in->expr && in->expr->kind == NODE_ONCE) {
+                emit_indent(e);
+                emit(e, "static uint32_t _zer_once_%d = 0;\n", in->false_block);
+            }
+        }
+    }
+
     /* Disable source mapping during IR block emission — #line directives
      * collide with goto labels and statement expressions (BUG-418 class). */
     const char *saved_source = e->source_file;
@@ -11079,6 +11112,29 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* Label for every block (including bb0 — goto may target entry) */
         emit(e, "_zer_bb%d:;\n", bb->id);
+
+        /* B4: if this block is a @once join (the bb_skip / false_block of some
+         * @once branch), the winner reaches it after running the body — publish
+         * "done" (RELEASE) so a spinning loser (ACQUIRE) observes the fully
+         * constructed state. The loser also re-enters here and re-stores 2
+         * (idempotent). Hosted only; freestanding @once is single-core (no wait). */
+        {
+            bool is_once_join = false;
+            for (int bj = 0; bj < func->block_count && !is_once_join; bj++) {
+                for (int ij = 0; ij < func->blocks[bj].inst_count; ij++) {
+                    IRInst *in = &func->blocks[bj].insts[ij];
+                    if (in->op == IR_BRANCH && in->cond_local < 0 &&
+                        in->expr && in->expr->kind == NODE_ONCE &&
+                        in->false_block == bb->id) { is_once_join = true; break; }
+                }
+            }
+            if (is_once_join) {
+                emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+                emit_indent(e);
+                emit(e, "__atomic_store_n(&_zer_once_%d, 2u, __ATOMIC_RELEASE);\n", bb->id);
+                emit(e, "#endif\n");
+            }
+        }
 
         /* Check if block has a capture that conflicts with another capture
          * of the same name but different type — wrap in C { } scope.

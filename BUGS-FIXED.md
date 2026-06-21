@@ -396,6 +396,54 @@ identical pass/fail on clean HEAD, untouched by this change.)
 
 ---
 
+### BUG-756 — @once loser did not wait for the winner → read half-constructed state (Axis B4)
+
+**What broke (memory-safety):** `@once { init }` compiled to a 2-state atomic flag
+that was set to its terminal "taken" value on ENTRY (before the body): winner
+`__atomic_exchange_n(&flag, 1)` → run body; LOSER → `goto skip` with **no wait**.
+So a loser raced straight past `@once` while the winner was still mid-body — on the
+canonical `@once { init_globals() }` it reads half-constructed published state
+(null/partial pointers on weakly-ordered archs, or any arch if the winner is
+preempted mid-body). pthread_once's losers block; this hand-rolled gate did not.
+
+**Fix (3-state flag with LOSER-WAIT, emitter + checker):**
+- **emitter** — states 0 untouched / 1 in-progress / 2 done. Winner CAS 0→1
+  (`__atomic_compare_exchange_n`, ACQ_REL) → runs body → at the `@once` join block
+  stores 2 (`__atomic_store_n`, **RELEASE**). Loser: CAS fails → spins
+  `while(__atomic_load_n(&flag, ACQUIRE) != 2) sched_yield()` → skip. The loser's
+  ACQUIRE pairs with the winner's RELEASE, so it never observes the half-built state.
+- The flag is declared at **function scope** (`_zer_once_<bb_skip_id>`) via a
+  pre-scan in `emit_regular_func_from_ir`, so it is reachable from BOTH the branch
+  (loser-wait) and the join block (winner-store). The **flag id = the @once's
+  bb_skip / false_block id** — unique per @once within the function, available as
+  `inst->false_block` at the branch and `bb->id` at the join, so no IRInst field
+  and no oid counter are needed.
+
+**The documented "blocker" was illusory:** the prior session thought the
+emitter-generated oid forced an IR restructure. It does not — naming the flag by
+the bb_skip block id makes it reachable from both emission sites with zero IR
+change. (The adversarial review also caught that the naive "store at the end of
+`true_block`" placement silent-hangs for control-flow bodies; the store goes at the
+JOIN block instead, which all winner fall-through paths reach.)
+
+**Control-flow ban (checker):** `return`/`break`/`continue`/`goto` that exits a
+`@once` body is now rejected (`Checker.in_once`), because an early exit skips the
+winner's done-publish → losers spin forever. Same rationale as the `@critical`
+control-flow ban. Conservative (a `break` of a loop fully inside the body is also
+rejected — factor it into a helper); no existing `@once` body uses control flow.
+
+**Tests:** `tests/zer/once_loser_wait.zer` (3 threads, body runs once, all pass
+`@once` without hanging — 5/5 clean runs), `tests/zer_fail/once_control_flow.zer`
+(`return` in `@once` rejected). Loser-wait verified structurally in the emitted C
+(CAS + ACQUIRE-spin + RELEASE-store, all on the same `_zer_once_<id>`). Full
+`make check` GREEN: semantic-fuzz 200, ZER 790, modules 139, all 5 audits OK.
+Freestanding (`#else`) path unchanged (single-core, loser does not wait).
+
+**Axis B COMPLETE:** B1 (multi-root), B2 (union copy-out), B3 (cond_wait foreign),
+B4 (once loser-wait), B5 (defer lock) — all closed.
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

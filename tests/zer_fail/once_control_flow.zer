@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// B4: control flow that EXITS a @once body (return here; break/continue/goto
+// likewise) would skip the winner's one-time completion publish at the @once
+// join, leaving loser threads spinning forever. Banned (same rationale as the
+// @critical control-flow ban).
+u32 g;
+void f(u32 x) {
+    @once {
+        if (x > 0) { return; }
+        g = 1;
+    }
+}
+u32 main() { f(1); return 0; }

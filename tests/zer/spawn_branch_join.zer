@@ -1,0 +1,22 @@
+// Axis-C regression guard (positive): scoped spawn created inside a branch
+// AND joined in the same branch must STILL compile — the threads-merge fix
+// must not introduce a false positive. th is joined on the only path it
+// exists, so the merged join obligation is discharged.
+struct Work { u32 task_id; u32 result; }
+
+void compute(*Work w) {
+    w.result = w.task_id * 10;
+}
+
+u32 main() {
+    Work w;
+    w.task_id = 7;
+    w.result = 0;
+    u32 cond = w.task_id;
+    if (cond > 3) {
+        ThreadHandle th = spawn compute(&w);
+        th.join();
+    }
+    if (w.result != 70) { return 1; }
+    return 0;
+}

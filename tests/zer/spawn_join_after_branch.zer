@@ -1,0 +1,22 @@
+// Axis-C regression guard (positive): a ThreadHandle spawned BEFORE a branch
+// and joined AFTER the merge must STILL compile. This proves the threads-merge
+// carries the join obligation forward through the merge AND that a join
+// happening after the merge correctly discharges it (no spurious "not joined").
+struct Work { u32 task_id; u32 result; }
+
+void compute(*Work w) {
+    w.result = w.task_id * 10;
+}
+
+u32 main() {
+    Work w;
+    w.task_id = 7;
+    w.result = 0;
+    ThreadHandle th = spawn compute(&w);
+    if (w.task_id > 3) {
+        w.result = w.result;
+    }
+    th.join();
+    if (w.result != 70) { return 1; }
+    return 0;
+}

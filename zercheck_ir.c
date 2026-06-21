@@ -640,6 +640,42 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                  * compile). */
             }
         }
+
+        /* Axis-C fix BUG-743 (2026-06-21): merge ThreadHandle join
+         * obligations across predecessors. PRE-FIX the merge unioned only
+         * handles[]; threads[] rode SOLELY via ir_ps_copy(&states[first_live]),
+         * so a scoped-spawn ThreadHandle created on a NON-first_live
+         * predecessor was SILENTLY DROPPED at the CFG merge — the exit
+         * join-scan then saw an empty threads[] and emitted no "not joined"
+         * diagnostic. Because `&stack-local` into a scoped spawn is permitted
+         * ONLY on the join premise (checker.c), the dropped obligation is a
+         * false-green cross-thread stack-UAF. Formalized by the linear
+         * join_tok merge obligation (join_tok_in_auth) in
+         * proofs/operational/lambda_zer_concurrency/iris_region_join.v: a
+         * linear resource dropped at a merge is unsound.
+         *
+         * Lattice: a thread present in ANY pred SURVIVES the merge (union by
+         * name); `joined` is the AND over the preds that contain it (joined
+         * only if joined on every such path). A thread joined on one branch
+         * but not another stays UN-joined — mirrors the handle
+         * MAYBE_FREED→error conservatism ("maybe not joined" is an error,
+         * forcing join-on-all-paths). */
+        for (int pti = 0; pti < states[si].thread_count; pti++) {
+            IRThreadTrack *pt = &states[si].threads[pti];
+            IRThreadTrack *rt = ir_find_thread(&result, pt->name, pt->name_len);
+            if (rt) {
+                /* AND: un-joined on any path wins; point the diagnostic at
+                 * an un-joined spawn site. */
+                if (!pt->joined) {
+                    if (rt->joined) rt->spawn_line = pt->spawn_line;
+                    rt->joined = false;
+                }
+            } else {
+                IRThreadTrack *nt = ir_add_thread(&result, pt->name,
+                                                  pt->name_len, pt->spawn_line);
+                if (nt) nt->joined = pt->joined;
+            }
+        }
     }
 
     return result;
@@ -4235,6 +4271,29 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (!oh || oh->state != mh->state) {
                         changed = true;
                         break;
+                    }
+                }
+            }
+
+            /* Axis-C fix BUG-743 (2026-06-21): the fixed point must also
+             * track ThreadHandle join obligations. Without this, a thread
+             * whose `joined` flips across a back-edge merge (but whose
+             * handle set is unchanged) is missed and the analysis
+             * "converges" prematurely on a stale threads[] — re-opening the
+             * dropped-obligation hole through loops. Compare thread_count
+             * and per-thread `joined` by name. */
+            if (!changed) {
+                if (merged.thread_count != block_states[bi].thread_count) {
+                    changed = true;
+                } else {
+                    for (int ti = 0; ti < merged.thread_count; ti++) {
+                        IRThreadTrack *mt = &merged.threads[ti];
+                        IRThreadTrack *ot = ir_find_thread(
+                            &block_states[bi], mt->name, mt->name_len);
+                        if (!ot || ot->joined != mt->joined) {
+                            changed = true;
+                            break;
+                        }
                     }
                 }
             }

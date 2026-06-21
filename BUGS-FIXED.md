@@ -5,6 +5,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-21b — Concurrency closure IMPLEMENTATION (phase 2) begins — Axis C: BUG-743
+
+This session implements the four-axis concurrency-safety closure proven in
+`proofs/operational/lambda_zer_concurrency/` (sufficiency, zero-admit). Fixes
+land one axis at a time, each verified by the full ZER suite + C unit tests.
+
+### BUG-743 — `ir_merge_states` dropped ThreadHandle join obligations at CFG merges (false-green cross-thread stack-UAF) [Axis C]
+
+**What broke (HIGH, silent miscompile / false-green):** a scoped-spawn
+`ThreadHandle th = spawn worker(&local);` created inside a *branch* (any
+non-`first_live` predecessor of a CFG merge) and never joined compiled CLEAN —
+no "not joined" diagnostic — even though the spawned thread borrows `&local` (a
+stack local) and outlives it. `&stack-local` into a scoped spawn is permitted
+ONLY on the premise that the join is enforced (checker.c), so dropping the join
+obligation is a real cross-thread use-after-free.
+
+**Root cause:** `ir_merge_states` (zercheck_ir.c) unioned only `handles[]`;
+`threads[]`/`joined` rode SOLELY via `ir_ps_copy(&states[first_live])`. A
+`ThreadHandle` tracked on a non-`first_live` predecessor was silently dropped at
+the merge, so the exit join-scan (which reads the converged `block_states[]`)
+saw an empty `threads[]` and emitted nothing. The fixpoint convergence check
+also compared only handle state, so a `joined` flip across a back-edge merge was
+invisible and the analysis could "converge" on a stale `threads[]`.
+
+**Fix (two sites, zercheck_ir.c):**
+1. `ir_merge_states` now merges `threads[]` across predecessors — union by name;
+   `joined` is the **AND** over the preds that contain the thread (joined only
+   if joined on every such path). A thread joined on one branch but not another
+   stays UN-joined — mirroring the handle `MAYBE_FREED`→error conservatism.
+2. The fixpoint convergence check now also compares `thread_count` and per-thread
+   `joined` by name, so a join-state change across a back-edge keeps iterating.
+
+**Why this is the right (architecture-independent) fix:** formalized by the
+linear join-token merge obligation `join_tok_in_auth` in
+`proofs/operational/lambda_zer_concurrency/iris_region_join.v` — a *linear*
+resource dropped at a CFG merge is unsound under ANY design. The merge must
+thread the obligation through, exactly as the handle merge does.
+
+**Tests:** `tests/zer_fail/spawn_branch_no_join.zer` (now correctly rejected),
+`tests/zer/spawn_branch_join.zer` (joined in same branch → OK, no false
+positive), `tests/zer/spawn_join_after_branch.zer` (spawned before / joined
+after the branch → OK, proves the obligation carries through the merge and the
+later join discharges it). Full ZER suite 760/760, C unit tests
+584+238+14+17+39 all pass.
+
+---
+
 ## Session 2026-06-21 — Concurrency memory-safety audit + four-condition closure PROOF (no compiler bugs fixed)
 
 **Not a bug-fix session — recorded here for chronological continuity.** Three

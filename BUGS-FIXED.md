@@ -274,13 +274,24 @@ non-strippable via `&` (the "propagating qualifier" property). Test:
 `tests/zer_fail/atomic_cell_pointer_launder.zer`. Full `make check` GREEN
 (ZER 780, Rust 784, Zig 36).
 
-**A6-full status:** the scalar atomic-cell taint is FUNCTIONALLY COMPLETE —
-write (slice 1), read (slice 2), and address-launder (slice 4), all gated on a
-fire-and-forget concurrent context. **Remaining (OPEN, narrow tail):** struct-
-field atomics `@atomic_*(&s.f)` on a plain (non-shared) global struct (slice 3) —
-needs a parallel (struct-symbol, field) compound-key list (the scalar machinery
-keys on the Symbol, which has no per-field flag); uncommon + mostly logic race.
-See docs/limitations.md.
+**A6-full slice 3 (struct-field atomics) — DONE:** a field of a plain (non-shared)
+global struct used with `@atomic_*(&s.f)` is an atomic cell at FIELD granularity
+(new `Checker.atomic_fields` (struct,field) list, one entry two flags, mirroring
+`IsrGlobal`); a plain write to it after a fire-and-forget spawn is flagged, while
+a DIFFERENT field of the same struct stays unconstrained. New
+`atomic_struct_field_target` extractor + `track_atomic_field`. Tests:
+`tests/zer_fail/atomic_cell_struct_field.zer`, `tests/zer/atomic_cell_struct_field_ok.zer`.
+(`st->kind` site added to the type-dispatch baseline — already-unwrapped.)
+
+**A6-full COMPLETE — the atomic-cell inclusion model is the `shared`-taint for the
+atomic dimension:** scalar write (1) + read (2) + address-launder/non-strippable
+`&` (4) + struct-field (3), all concurrency-aware (fire-and-forget after-spawn
+gate) and field-precise. The remaining exclusion-list entries
+(const/shared-struct/threadlocal/atomic/Barrier/Semaphore) are the genuinely-safe
+SYNCHRONIZED categories — not holes — so the spawn-target scan (with the A3/A4
+fixes) + this taint together are the inclusion closure. Micro-residuals (struct-
+field plain READS and `&s.f` launder) are even narrower and noted in
+docs/limitations.md. Full `make check` GREEN: ZER 782, Rust 784, Zig 36.
 
 ---
 

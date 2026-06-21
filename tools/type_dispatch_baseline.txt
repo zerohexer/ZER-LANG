@@ -687,3 +687,6 @@ emitter.c:if (inner && inner->kind == TYPE_STRUCT &&
 checker.c:if (st->kind == TYPE_STRUCT &&
 checker.c:} else if (st->kind == TYPE_POINTER) {
 checker.c:bool vshared = vt && vt->kind == TYPE_STRUCT &&
+# A6-full slice 3 (2026-06-21): struct-field atomic-cell extractor — st is a
+# type_unwrap_distinct() result (already distinct-unwrapped), raw ->kind correct.
+checker.c:if (!st || st->kind != TYPE_STRUCT) return false;

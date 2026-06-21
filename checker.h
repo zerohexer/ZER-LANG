@@ -200,6 +200,21 @@ typedef struct {
     int atomic_plain_write_count;
     int atomic_plain_write_capacity;
 
+    /* A6-full slice 3: struct-field atomic cells `@atomic_*(&s.f)` on a plain
+     * global struct. One list, two flags (mirrors IsrGlobal): a (struct, field)
+     * that is BOTH @atomic'd and plain-accessed in a concurrent context is a
+     * mixed atomic/non-atomic race. */
+    struct AtomicFieldEntry {
+        struct Symbol *s;
+        const char *field;
+        uint32_t field_len;
+        bool atomic_used;
+        bool plain_used;
+        int plain_line;
+    } *atomic_fields;
+    int atomic_field_count;
+    int atomic_field_capacity;
+
     /* Container templates: parameterized struct definitions */
     struct ContainerTemplate {
         const char *name;

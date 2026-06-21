@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// A6-full slice 3: a field of a plain global struct used with @atomic_* is an
+// atomic cell at FIELD granularity; a plain write to it after a fire-and-forget
+// spawn is a mixed atomic/non-atomic race. (A different field of the same struct
+// stays unconstrained — field-precise, not whole-struct.)
+struct Stats { u32 hits; u32 misses; }
+Stats s;
+void worker() { @atomic_add(&s.hits, 1); }
+u32 main() {
+    @atomic_store(&s.hits, 0);
+    spawn worker();
+    s.hits = 5;
+    return 0;
+}

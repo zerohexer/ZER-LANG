@@ -370,6 +370,10 @@ static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Ty
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
+static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
+                                       const char **out_field, uint32_t *out_flen);
+static void track_atomic_field(Checker *c, Symbol *s, const char *field,
+                               uint32_t flen, bool is_atomic, int line);
 static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
 
 /* Try to derive a bounded range from an expression.
@@ -3396,6 +3400,10 @@ static Type *check_expr(Checker *c, Node *node) {
         if (c->after_spawn_in_func) {
             Symbol *aw = atomic_scalar_global_target(c, node->assign.target);
             if (aw) record_atomic_plain_write(c, aw, node->loc.line);
+            /* Slice 3: plain WRITE to a global-struct field after a spawn. */
+            Symbol *fs; const char *ff; uint32_t fl;
+            if (atomic_struct_field_target(c, node->assign.target, &fs, &ff, &fl))
+                track_atomic_field(c, fs, ff, fl, false, node->loc.line);
         }
         /* V3: route Task.new()/slab.alloc() RHS to _ptr variant when
          * target is a pointer type. Same logic as var_decl hook. */
@@ -7893,6 +7901,11 @@ static Type *check_expr(Checker *c, Node *node) {
             if (node->intrinsic.arg_count > 0) {
                 Symbol *acell = atomic_scalar_global_target(c, node->intrinsic.args[0]);
                 if (acell) acell->is_atomic_cell = true;
+                /* Slice 3: struct-field atomic cell `@atomic_*(&s.f)`. */
+                Symbol *fs; const char *ff; uint32_t fl;
+                if (atomic_struct_field_target(c, node->intrinsic.args[0],
+                                               &fs, &ff, &fl))
+                    track_atomic_field(c, fs, ff, fl, true, node->loc.line);
             }
             if (is_load) {
                 /* @atomic_load(&var) → T */
@@ -13916,10 +13929,70 @@ static void record_atomic_plain_write(Checker *c, Symbol *sym, int line) {
     c->atomic_plain_write_count++;
 }
 
+/* Slice 3: the (global-struct, field) named by `&s.f` / `s.f`, else false.
+ * Only a NODE_FIELD on a non-shared global-struct IDENT (shared structs are
+ * auto-locked, not atomic cells). */
+static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
+                                       const char **out_field, uint32_t *out_flen) {
+    if (e && e->kind == NODE_UNARY && e->unary.op == TOK_AMP)
+        e = e->unary.operand;
+    if (!e || e->kind != NODE_FIELD) return false;
+    if (!e->field.object || e->field.object->kind != NODE_IDENT) return false;
+    Symbol *gs = scope_lookup(c->global_scope, e->field.object->ident.name,
+                              (uint32_t)e->field.object->ident.name_len);
+    if (!gs || gs->is_function || !gs->type) return false;
+    Type *st = type_unwrap_distinct(gs->type);
+    if (!st || st->kind != TYPE_STRUCT) return false;
+    if (st->struct_type.is_shared || st->struct_type.is_shared_rw) return false;
+    *out_s = gs;
+    *out_field = e->field.field_name;
+    *out_flen = (uint32_t)e->field.field_name_len;
+    return true;
+}
+
+static void track_atomic_field(Checker *c, Symbol *s, const char *field,
+                               uint32_t flen, bool is_atomic, int line) {
+    for (int i = 0; i < c->atomic_field_count; i++) {
+        struct AtomicFieldEntry *e = &c->atomic_fields[i];
+        if (e->s == s && e->field_len == flen &&
+            memcmp(e->field, field, flen) == 0) {
+            if (is_atomic) e->atomic_used = true;
+            else { e->plain_used = true; if (!e->plain_line) e->plain_line = line; }
+            return;
+        }
+    }
+    if (c->atomic_field_count >= c->atomic_field_capacity) {
+        int nc = c->atomic_field_capacity < 8 ? 8 : c->atomic_field_capacity * 2;
+        struct AtomicFieldEntry *nf = (struct AtomicFieldEntry *)realloc(
+            c->atomic_fields, nc * sizeof(*nf));
+        if (!nf) return;
+        c->atomic_fields = nf;
+        c->atomic_field_capacity = nc;
+    }
+    struct AtomicFieldEntry *e = &c->atomic_fields[c->atomic_field_count++];
+    e->s = s; e->field = field; e->field_len = flen;
+    e->atomic_used = is_atomic;
+    e->plain_used = !is_atomic;
+    e->plain_line = is_atomic ? 0 : line;
+}
+
 /* Post-check: a scalar global used atomically (is_atomic_cell) must be accessed
  * atomically EVERYWHERE — a plain write to it is a mixed atomic/non-atomic data
  * race. Strict (Rust) model: even init must use @atomic_store. */
 static void check_atomic_cell_safety(Checker *c) {
+    /* Slice 3: struct-field atomic cells — (struct, field) both @atomic'd and
+     * plain-accessed in a concurrent context. */
+    for (int i = 0; i < c->atomic_field_count; i++) {
+        struct AtomicFieldEntry *e = &c->atomic_fields[i];
+        if (e->atomic_used && e->plain_used && e->s) {
+            checker_error(c, e->plain_line,
+                "plain access to '%.*s.%.*s' in a concurrent context — the field "
+                "is used with @atomic_* elsewhere (atomic cell), so access it "
+                "atomically here too (@atomic_load(&%.*s.%.*s) / @atomic_*)",
+                (int)e->s->name_len, e->s->name, (int)e->field_len, e->field,
+                (int)e->s->name_len, e->s->name, (int)e->field_len, e->field);
+        }
+    }
     for (int i = 0; i < c->atomic_plain_write_count; i++) {
         Symbol *s = c->atomic_plain_writes[i].sym;
         if (s && s->is_atomic_cell) {

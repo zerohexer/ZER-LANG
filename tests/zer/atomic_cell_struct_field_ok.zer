@@ -1,0 +1,15 @@
+// A6-full slice 3 regression guard (positive): atomic-throughout access to an
+// atomic field (scoped spawn + join) compiles + runs; and a DIFFERENT,
+// non-atomic field of the same struct may be accessed plainly (field-precise).
+struct Stats { u32 hits; u32 misses; }
+Stats s;
+void worker() { @atomic_add(&s.hits, 1); }
+u32 main() {
+    @atomic_store(&s.hits, 0);
+    s.misses = 3;
+    ThreadHandle th = spawn worker();
+    th.join();
+    u32 v = @atomic_load(&s.hits);
+    if (v != 1 || s.misses != 3) { return 1; }
+    return 0;
+}

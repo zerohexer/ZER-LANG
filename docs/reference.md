@@ -1262,16 +1262,16 @@ t.id = 1;             // COMPILE ERROR — zercheck FuncSummary knows destroy fr
 - Can mix Handle and alloc_ptr on the same Slab/Pool.
 - `const Handle(Task)` prevents mutation through auto-deref — `h.id = 42` on const Handle is a compile error.
 - For `*opaque` (C interop), Level 2+3+5 runtime checks (~1ns) cover the remaining cases zercheck can't track.
-- GLOBALS (BUG-739/742): storing an `alloc_ptr` pointer in a global then
+- GLOBALS: storing an `alloc_ptr` pointer in a global then
   freeing it requires resetting the global (`g = null;`) immediately after
   the free — before the function returns or calls another ZER function.
   Reading back a freed global, returning while it dangles, or calling ZER
   code in the free→reset window are all compile errors.
-- INDIRECT CALLS (BUG-740): handles/pointers passed to a funcptr call are
+- INDIRECT CALLS: handles/pointers passed to a funcptr call are
   consume-maybe — after `fp(h)`, freeing or using `h` is a compile error.
   Pass data (`pool.get(h).field`) if the caller keeps ownership, or hand
   ownership entirely (caller stops touching `h`).
-- VARIABLE-INDEX FREES (BUG-741): `heap.free(arr[k])` may free any tracked
+- VARIABLE-INDEX FREES: `heap.free(arr[k])` may free any tracked
   element of `arr` — mixing literal- and variable-index frees on the same
   array is a compile error in both orders.
 
@@ -1535,7 +1535,7 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 - `--no-strict-mmio` flag allows @inttoptr without mmio declarations —
   it relaxes the RANGE strictness only. The runtime ALIGNMENT trap is
   still emitted for variable addresses (alignment is a property of the
-  target pointer type, not of mmio declarations — BUG-736), and constant
+  target pointer type, not of mmio declarations), and constant
   addresses are alignment-checked at compile time regardless.
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
 
@@ -1573,7 +1573,7 @@ remembers what type went in through `*opaque` round-trips.
 - Checks qualifier preservation (const, volatile cannot be stripped).
 - Unknown provenance (function params, cinclude) → check skipped.
 - `@ptrcast` between two DIFFERENT struct/union pointee types is a compile
-  error — "type confusion — use @pun(...)" (BUG-735). Identity casts,
+  error — "type confusion — use @pun(...)". Identity casts,
   primitive byte-views (`*u32 → *u8`), and `*opaque` round-trips stay allowed.
 
 **SEE ALSO**
@@ -2313,7 +2313,7 @@ void stack_push(*Stack(u32) s, u32 val) {
 - NOT generics — no type constraints, no SFINAE.
 - Type ARGUMENT must be a plain named type (primitive or struct/enum/union).
   Composite args — `Box(?u32)`, `Box(*u32)`, `Pair(Handle(Item))`, `Box([*]u8)`
-  — are a clean compile error with a wrapper-struct hint (BUG-738): wrap the
+  — are a clean compile error with a wrapper-struct hint: wrap the
   composite in a named struct and instantiate with that. NESTED containers
   work — `Stack(Stack(u32))` resolves inner-first to `Stack_Stack_u32`.
 
@@ -2369,7 +2369,7 @@ register_callback(&global_handler);  // OK — global persists
 **NOTES**
 - Inference covers: direct store to global/static, store through a pointer-param
   field, store of an alias, a call-result launder (`g = idfn(p)`), and a
-  by-value STRUCT/UNION param whose pointer fields are persisted (BUG-737).
+  by-value STRUCT/UNION param whose pointer fields are persisted.
 - **Transitive (closes BH-15):** `void outer(*T p) { inner(p); }` where
   `inner`'s param is (inferred or explicit) keep → `outer`'s `p` is inferred
   keep, so `outer(&local)` is rejected. This is sound across forward references
@@ -2520,6 +2520,11 @@ Counter g;
 g.value = 42;              // auto: lock → write → unlock
 g.total = g.value + 1;     // same lock scope (consecutive access grouped)
 ```
+- `switch` over a **union field of a shared struct** is safe: the union is copied
+  out under the lock, so a value capture `.v => |x| { ... }` reads a private
+  snapshot. A **mutable pointer capture `|*x|` of a shared union variant** is a
+  compile error (it would alias the shared bytes past the auto-lock) — copy the
+  field into a local, mutate it, then assign it back as its own statement.
 
 ### shared(rw) struct — Reader-Writer Lock
 ```zer
@@ -2559,6 +2564,14 @@ th.join();                      // MUST join — zercheck error if not
 @cond_broadcast(shared_var);                    // wake all waiters
 @cond_timedwait(shared_var, condition, 1000);   // timeout in ms → ?void
 ```
+- The predicate is re-checked under **only** the condition variable's own mutex, so
+  it may read **only that same shared struct**. Reading a *different* shared struct
+  in the predicate → compile error (it would be an unsynchronized cross-thread race):
+  ```zer
+  @cond_wait(gq, gq.count > 0 && gother.flag);   // ERROR: gother is a different shared struct
+  @cond_wait(gq, gq.count > 0 && gq.shutdown);   // OK: both fields are gq's own
+  ```
+  Fold the extra state into the same `shared struct`, or signal on its change.
 
 ### threadlocal — Per-Thread Storage
 ```zer
@@ -2576,6 +2589,14 @@ threadlocal u32 counter;    // each thread has its own copy
     global_config = load_defaults();
 }
 ```
+- Runs the body **exactly once** across all threads. Threads that lose the race
+  **block until the winner finishes the body**, then proceed — so a loser never
+  observes half-initialized state (e.g. a published pointer before its target is
+  built). (Bare-metal/freestanding builds without atomics are single-core only and
+  do not wait.)
+- Control flow that exits the body — `return`, `break`, `continue`, `goto` — is a
+  **compile error** (it would skip the one-time completion signal and hang the
+  waiting threads). Put such logic in a helper function called from `@once`.
 
 ### Barrier — Thread Sync Point
 ```zer

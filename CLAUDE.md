@@ -116,6 +116,52 @@ audit lines ("OK — no default: clauses…", "OK — no new raw type-dispatch
 sites"). exit=2 with those lines ABSENT means an earlier step (often CRLF)
 aborted make before the audits — investigate, don't wave it off.
 
+**Ad-hoc Docker verify (binary-safe — binaries stay in-container, no Wacatac).**
+The Makefile `docker-*` targets are best, but for a quick targeted build+test of
+uncommitted edits use the read-only-mount + tar-to-`/build` pattern (NEVER a
+writable bind mount — that lands unsigned `.exe`s on the Windows FS = Defender
+`Wacatac`):
+```
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-check:latest bash -c '
+  mkdir -p /build && tar -C /src -cf - --exclude=.git --exclude=".git*" . | (cd /build && tar xf -)
+  cd /build && find . -name "*.sh" -exec sed -i "s/\r$//" {} + && rm -f *.o src/safety/*.o
+  make zerc >/tmp/b.log 2>&1 && make check >/tmp/mc.log 2>&1; echo "EXIT=$?"
+  grep -E "Passed:|FAIL|OK — no" /tmp/mc.log '
+```
+The `:ro` mount means the container can't write binaries to the host. Host-side
+source edits ARE picked up (the tar copies the edited tree in).
+
+**Spawning agents (Agent/Workflow/Explore) for COMPILER work — two hazards
+(learned 2026-06-22, the hard way).** (1) Agents that compile **build NATIVELY on
+the host** (`gcc *.c -o zerc`, `./zerc /tmp/x.zer`) → create-execute-delete of
+unsigned `.exe` = triggers Defender Wacatac. If you must spawn them, tell them
+read-only / "do NOT compile or run" explicitly, or have them use the Docker pattern
+above. (2) A "map/design only" agent **may still EDIT source files** and leave them
+uncommitted — after any agent run on the repo, `git status` + `git diff` + `git
+blame` the touched lines (a 2026-06-22 design agent left an unnamed
+`root_is_shared_PROBE` edit in `ir_lower.c`). Verify + own anything an agent wrote
+before relying on it. For pure code-reading/design, the workflow IS efficient (keeps
+file content out of the parent context) — just gate it.
+
+**`zerc -o <path>` gotchas when testing by hand.** (a) `zerc f.zer -o /tmp/out.c`
+(emit-C mode) returns **exit 0 even on checker errors** — useless for negative
+tests; use `-o /tmp/exe` (compile-to-exe) which returns non-zero on error, or just
+rely on `make check`. (b) `zerc f.zer -o /tmp/exe` for a non-`.c` path builds the
+exe **next to the source** (`f`), not at the `-o` path — to run, `cp f.zer /tmp/ &&
+zerc /tmp/f.zer && /tmp/f`, or just trust `make check`.
+
+**The type-dispatch audit (`audit_type_dispatch.sh`) greps `->kind == TYPE_` and
+matches inside COMMENTS too.** A doc-comment containing the literal `->kind ==
+TYPE_` trips it as a "NEW raw site" (cost a loop 2026-06-22). Reword comments to
+say "type-kind comparison", not the literal pattern. Real code: use
+`type_dispatch_kind(t) == TYPE_X` (no `->kind ==`, never trips).
+
+**Lock-completeness fixes must NEVER hold two different shared-struct locks at
+once** (the per-statement model's deadlock-freedom-by-construction). The whole Axis
+B family closed in place WITHOUT a global redesign by respecting this: read-locks
+compose (B1), copy-out-under-the-one-lock (B2), reject-don't-nest (B3), private
+once-flag not a struct mutex (B4). See compiler-internals.md "Axis B implementation".
+
 ---
 
 ## ZER Language — Complete Quick Reference

@@ -11048,5 +11048,56 @@ as Rust — Rust does NOT prevent deadlock either). Full design + Rust mapping +
 completeness-via-Iris decision: `docs/primitives-data-races.md` §24/§24.6. The
 four-condition closure is PROVEN (sufficiency) in Coq/Iris:
 `proofs/operational/lambda_zer_concurrency/` (10 files, zero admits, see its
-DESIGN.md + `docs/proof-internals.md` "λZER-Concurrency subset"). Status: closure
-proven, compiler implementation NOT started (prove-first; implement is phase 2).
+DESIGN.md + `docs/proof-internals.md` "λZER-Concurrency subset").
+
+**Status (2026-06-22): phase-2 implementation MOSTLY COMPLETE — BUG-743..756 closed,
+including the ENTIRE Axis B and A6-full atomic-cell taint.** Per-hole ledger:
+`docs/limitations.md`. The narrow tail still open: A5 threadlocal `&`-escape,
+scoped-borrow read-side/CFG residue, A6 micro-residuals (atomic-cell struct-field
+reads + `&s.f` launder). D1 (cinclude thread-capture) is a named FLOOR, not a hole.
+
+### Axis B implementation (B1–B5) — the "no nested lock" principle
+
+The big surprise: B1–B4 did **NOT** need the feared global "lock-scope-set redesign."
+ZER's deadlock-freedom comes from the per-statement lock model **never holding two
+different shared-struct locks at once**. Every B fix preserves that invariant rather
+than breaking it — that's the design key for any future lock work:
+- **B1 multi-root** (BUG-753, ir_lower.c `find_all_shared_roots_expr` +
+  `emit_shared_lock_if_needed`): a statement reading several `shared(rw)` roots
+  (`x = ga.v + gb.v`) locks them ALL — but the extras as **read locks**, which
+  compose (multiple readers OK). The same-statement multi-WRITE case is still a
+  compile error, so a multi-root statement is always all-reads → no deadlock.
+- **B2 shared union-switch** (BUG-754): the union-switch lowering used to alias the
+  shared bytes (`sw_ref = &g.union`) and read tag/capture AFTER the lock released.
+  Fix = **copy-out**: when `find_shared_root_expr(sw_expr) != NULL` (covers
+  `shared(rw)` since `is_shared` is set for it too), route through the *existing
+  rvalue path* (ir_lower.c, the `&& !root_is_shared` clause on `is_lvalue`) which
+  `lower_expr`s the whole union into a LOCAL *under* the switch-expr lock. Every
+  tag/capture read is then of a private snapshot. The `|*x|` mutable capture of a
+  shared union is rejected in the checker (NODE_SWITCH union ptr-capture branch) —
+  copy-out makes it alias the throwaway local (lost mutation); same class as the
+  A6/#5 `&shared.field` ban.
+- **B3 `@cond_wait` foreign read** (BUG-755, checker.c `cond_pred_foreign_shared`):
+  the predicate is re-evaluated under ONLY the cond struct's mutex, so a read of a
+  DIFFERENT shared struct races. **Reject** (not lock — locking the 2nd struct nests
+  inside the cond mutex = AB-BA + cond_wait sleeps holding it). **Instance-precise on
+  the root ident**, not type_id — catches two instances of the same shared type while
+  accepting the legit pointer-param `b`/`b.field` case. Over-rejects nothing (every
+  existing condvar predicate reads only its own cond struct).
+- **B4 `@once` loser-wait** (BUG-756): the prior "needs an IR restructure" blocker
+  was **illusory**. 3-state flag (0/1/2): winner CAS 0→1 → body → store 2 (RELEASE)
+  at the join block; loser spins on `!= 2` (ACQUIRE) → skip. The trick that avoids
+  the IR change: name the flag **`_zer_once_<bb_skip_id>`** — the `@once`'s
+  `false_block` id is unique per `@once` and is reachable from BOTH emission sites
+  (`inst->false_block` at the branch, `bb->id` at the join). The flag is declared at
+  **function scope** via a pre-scan in `emit_regular_func_from_ir` (after the local
+  decls), so both the loser-wait and the winner-store can see it. The winner-store is
+  injected after the join block's label in the block loop. `sched_yield()` relax
+  (`_zer_once_relax`, needs `<sched.h>` — added to the preamble). Control flow
+  (return/break/continue/goto) that exits a `@once` body is now **banned**
+  (`Checker.in_once`, checked in the 4 control-flow handlers) — an early exit would
+  skip the done-publish and hang losers (same rationale as the `@critical` ban; no
+  existing `@once` body uses control flow). Freestanding (`#else`) path unchanged
+  (single-core, loser does not wait).
+- **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
+  deferred shared access.

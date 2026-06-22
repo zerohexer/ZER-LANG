@@ -549,6 +549,41 @@ struct-field). The relaxation can now proceed on a verified-complete sink matrix
 
 ---
 
+### BUG-763 — local laundered through a call into a keep param escaped (UAF)
+
+**What broke (UAF, pre-existing, found 2026-06-22 verifying the keep sink before the
+relaxation):** the keep call-site validation (checker.c ~5468) detected `&local`,
+local idents, local arrays, and local SLICES (BUG-751) as args that can't satisfy a
+`keep` param — but NOT a `NODE_CALL` arg whose result is local-derived. So a local
+laundered through a function into a keep param escaped:
+```
+[*]u8 gk; void keepfn([*]u8 x){ gk = x; } [*]u8 idfn([*]u8 s){ return s; }
+void leak(){ u8[16] a; keepfn(idfn(a[0..16])); }   // compiled clean — gk dangles
+```
+`keepfn(a[0..16])` (direct) was already rejected (BUG-761); the laundered-through-a-
+call form was not.
+
+**Fix (checker.c ~5630, before record_keep_edge):** if the keep arg unwraps (orelse /
+field / index / slice) to a `NODE_CALL` whose `call_has_local_derived_arg` is true,
+record a `KV_LOCAL_DERIVED` keep edge (named by the laundering callee). Mirrors the
+store/return call-launder checks (BUG-760). Conservative — global-source launders
+(`keepfn(idfn(global[..]))`) stay allowed.
+
+**Over-rejection: zero** — `make check` green; global-source positive runs. Tests:
+`tests/zer_fail/keep_call_launder_escape.zer`, `tests/zer/keep_call_launder_global_ok.zer`.
+Full `make check` GREEN: ZER 805/0, all 5 audits.
+
+**Pattern note (BUG-760..763):** four escape holes this session, ALL the same class —
+a per-sink escape check (store / keep-inference / struct-field-store / keep-call-site)
+independently missing the "call-laundered or slice-of-local" arg shape. The durable
+fix is a UNIFIED call-result provenance (mark a call result local-derived once, in one
+place, when any local-derived arg flows into a value-carrying return — the "infer what
+Rust annotates" architecture), so every sink catches it via the single
+`is_local_derived` flag instead of each re-implementing the walk. Tracked as a
+refactor in limitations.md.
+
+---
+
 ### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
 
 **What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a

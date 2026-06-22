@@ -1,0 +1,12 @@
+// keepfn(idfn(global[..])) — a GLOBAL slice laundered through idfn into a keep
+// param is safe (global storage outlives the program). The fix must stay precise:
+// only LOCAL-derived call results are rejected.
+[*]u8 g_kept;
+u8[16] g_src;
+void keepfn([*]u8 x) { g_kept = x; }
+[*]u8 idfn([*]u8 s) { return s; }
+u32 main() {
+    g_src[0] = 3;
+    keepfn(idfn(g_src[0..16]));   // global source — OK
+    return 0;
+}

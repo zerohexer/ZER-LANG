@@ -5626,6 +5626,35 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        /* BUG-763: call-laundered local into a keep param —
+                         * keepfn(idfn(local[..])). The callee returns a value
+                         * derived from the local arg, so it can't satisfy keep.
+                         * Mirrors the store/return call-launder checks
+                         * (call_has_local_derived_arg, BUG-760). The direct
+                         * keepfn(local[..]) is already caught above; this is the
+                         * laundered-through-a-call form. */
+                        if (edge_vkind == KV_NONE) {
+                            Node *carg = arg_node;
+                            if (carg && carg->kind == NODE_ORELSE) carg = carg->orelse.expr;
+                            while (carg && (carg->kind == NODE_FIELD ||
+                                            carg->kind == NODE_INDEX ||
+                                            carg->kind == NODE_SLICE)) {
+                                if (carg->kind == NODE_FIELD) carg = carg->field.object;
+                                else if (carg->kind == NODE_INDEX) carg = carg->index_expr.object;
+                                else carg = carg->slice.object;
+                            }
+                            if (carg && carg->kind == NODE_CALL &&
+                                call_has_local_derived_arg(c, carg, 0)) {
+                                edge_vkind = KV_LOCAL_DERIVED;
+                                if (carg->call.callee &&
+                                    carg->call.callee->kind == NODE_IDENT) {
+                                    edge_argname = carg->call.callee->ident.name;
+                                    edge_argname_len = (uint32_t)carg->call.callee->ident.name_len;
+                                } else {
+                                    edge_argname = "call result"; edge_argname_len = 11;
+                                }
+                            }
+                        }
                         /* transitivity: does the arg trace to a non-keep caller param? */
                         int caller_root = keep_arg_caller_root(c, arg_node);
                         record_keep_edge(c, effective_callee, i, is_fn_ptr_call,

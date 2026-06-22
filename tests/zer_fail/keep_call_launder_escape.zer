@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Call-laundered local into a keep param: keepfn keeps its arg (stores to a
+// global); idfn returns its param. keepfn(idfn(local[..])) launders a local slice
+// through idfn into the keep param, so the global ends up pointing into the
+// caller's freed stack. The direct keepfn(local[..]) was already caught (BUG-761);
+// this is the laundered-through-a-call form — the keep call-site now detects a
+// NODE_CALL arg whose result is local-derived.
+[*]u8 g_kept;
+void keepfn([*]u8 x) { g_kept = x; }
+[*]u8 idfn([*]u8 s) { return s; }
+void leak() {
+    u8[16] a;
+    keepfn(idfn(a[0..16]));
+}
+u32 main() { leak(); return 0; }

@@ -54,6 +54,7 @@ lambda_zer_escape/iris_escape_resources.v
 lambda_zer_escape/iris_escape_state.v
 lambda_zer_escape/iris_escape_specs.v
 lambda_zer_escape/iris_escape_theorems.v
+lambda_zer_escape/param_lattice.v
 
 lambda_zer_mmio/syntax.v
 lambda_zer_mmio/semantics.v

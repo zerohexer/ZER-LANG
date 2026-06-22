@@ -165,6 +165,25 @@ and make the return-borrow-from-param relaxation below trivially safe. Refactor-
 (touches several escape sites); not whack-a-mole. Until then, each sink is patched
 individually (BUG-760..763 done; siblings open).
 
+**Theorem-first grounding (2026-06-22):** the lattice this refactor needs is now
+MECHANIZED — `proofs/operational/lambda_zer_escape/param_lattice.v` (7 `Qed`, 0
+admits, in the `make check-proofs` gate). It extends the operationally-proven
+3-region oracle (only `RegStatic` escapes, `iris_escape_specs.v`) with the relational
+constructor `ARParam n` (the per-function return summary "result aliases parameter
+n", = the inferred `'a`) and proves: (T1) `subst_escape_sound` — resolving the
+summary against the actual arg regions at the call site is sound (no under-rejection);
+(T2/`pick_escapes_iff_chosen_static`) — a pick-one function escapes iff the CHOSEN arg
+is static, not iff "no arg is local"; (T3) `precision_gain_unrelated_static` — the
+current `old_approx` (checker.c:9937 `if (call_has_local_derived_arg) result=LOCAL`)
+gratuitously rejects an `ARStatic`-returning callee on a local-containing call, while
+the new analysis allows it AND is sound; (T4) `new_never_underrejects` — a true-LOCAL
+result is never permitted to escape. The finite states the implementation must track
+are exactly `{STATIC, LOCAL, ARENA}` + `PARAM(n)` + join + the call-site
+substitution. **Stageable:** Stage 1 = add a `returns_static` summary bit (kills the
+unrelated-static over-rejection at checker.c:9937 in ~a few lines, covered by the
+existing 3-region proof); Stage 2 = the full per-param `PARAM(n)` summary +
+substitution unifying every sink (this entry's durable fix).
+
 ---
 
 ## FIXED (BUG-764, 2026-06-22) — return-borrow-from-param relaxation shipped

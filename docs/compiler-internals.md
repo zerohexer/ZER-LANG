@@ -11101,3 +11101,70 @@ than breaking it — that's the design key for any future lock work:
   (single-core, loser does not wait).
 - **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
   deferred shared access.
+
+## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
+
+ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow
+escape analysis in checker.c, plus the `keep` system (System #21). This is ZER's
+inferred equivalent of Rust's `'a` — it reads the lifetime relationship off the body
+instead of asking for an annotation, and verifies at call sites. **A whole class of
+UAF bugs (BUG-760..763) lives here; read this before editing.**
+
+**The finite state (the provenance "lattice", on `Symbol`):**
+- `is_local_derived` — points into THIS frame's stack (escapable = NO).
+- `is_arena_derived` / `is_from_arena` — points into a local arena (escapable = NO).
+- `is_nonkeep_derived` + `nonkeep_root_param` — a non-keep pointer/slice/opaque/
+  struct-carrying-pointer PARAM is a borrow rooted at param N; persisting it infers
+  `keep`. Set at param registration (~13632; **must include TYPE_SLICE**, BUG-761).
+- (implicit) STATIC — global/static or a slice/pointer param/external pointee
+  (escapable = YES, i.e. safe to return — it's the CALLER's memory).
+- `zer_sym_region_tag(is_local_derived, is_arena_derived)` → ZER_REGION_{STATIC,LOCAL,
+  ARENA}; `zer_region_can_escape` is the query.
+
+**The sinks (every place a stack pointer can be persisted beyond its frame — they are
+FINITE, bounded by ZER's storage classes):** store-to-global/static, return,
+struct-field-of-a-global, `keep`-param (call site), `keep`-inference (param→global),
+spawn-arg, Pool/Slab/Arena store. Each is a separate check in checker.c — and THAT is
+the bug class: **each sink independently re-implements "is this value frame-bound?",
+and several historically missed the same shapes** (a call-laundered local, a
+slice-of-local arg, a pointer/slice FIELD of a local-derived struct). The session
+2026-06-22 closed four of these one-by-one:
+- **BUG-760** `call_has_local_derived_arg` (~880) missed NODE_SLICE/NODE_INDEX args
+  (`g = f(local[0..n])`). It's the shared "call result is local-derived" proxy used
+  by the store + return + var-decl-init checks — fixing it closed one-step AND
+  two-step (`t=f(local); g=t`, the var-decl uses the same helper).
+- **BUG-761** keep-inference missed TYPE_SLICE at BOTH gates (param-taint ~13634 +
+  persist-sink ~4115) → a slice param stored to a global never inferred keep.
+- **BUG-762** the store-escape check (~4043) didn't walk a `.field` value to its root
+  (`g = v.data`, v local-derived) — descend NODE_FIELD/INDEX gated on the value being
+  a pointer/slice (scalar fields must NOT be flagged).
+- **BUG-763** the keep call-site (~5468) didn't handle a NODE_CALL arg whose result is
+  local-derived (`keepfn(f(local))`).
+
+**The `keep` system (the inferred-`'a` for "this function retains the pointer"):**
+keep-INFERENCE marks a param keep when the body persists it to a global/static/
+param-field (~4112 direct, ~4154 call-laundered). keep-ENFORCEMENT is a DEFERRED
+fixpoint (`check_keep_inference`, runs after ALL bodies are checked — `param_keeps` is
+final only then) + a call-site validator (~5405) that rejects `&local`/local idents/
+local arrays/local slices/local-derived/call-laundered args to a keep param. Edges
+are `record_keep_edge`; the message kinds are KV_LOCAL_ADDR/DERIVED/ARRAY/SLICE_LOCAL.
+
+**Return-escape: 3 sites (checker.c ~11023 &expr, ~11034 &expr-in-orelse, ~11088
+sliced_borrow promotion).** The **return-borrow-from-param relaxation (BUG-764)** made
+these skip a root whose type is SLICE/POINTER and is NOT `is_local_derived` — a param/
+static/null pointee is the caller's memory, safe to return a view of; the call site
+catches a caller that passes a local. Still rejected: local arrays (`return arr[0..]`),
+local-derived slices, `&local`. This is what makes `trim([*]u8 s){return s[i..j];}`
+and `lib/str.zer`'s `bytes_trim*` compile.
+
+**MANDATORY when editing escape analysis:** the sinks are a patchwork — a fix at ONE
+sink does NOT cover the others. After any change, re-run the full sink matrix
+(store / return / keep-call / keep-inference / struct-field / spawn) against
+call-laundered, slice-of-local, and field-of-local-derived-struct value shapes. The
+DURABLE fix (tracked in `docs/limitations.md` "unify call-result provenance") is to
+compute the provenance ONCE — including the relational `PARAM(n)` state, which is the
+inferred `'a` — and make every sink a single lattice query; until then, audit ALL
+sinks on every change. Use the **read-only sink-enumeration workflow** (3 Explore
+agents: storage-class top-down, checker-code bottom-up, adversarial missed-sink hunt;
+NO compilation) when asking "is this analysis complete?" — it found BUG-762's class
+this session.

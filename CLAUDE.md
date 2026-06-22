@@ -162,6 +162,23 @@ B family closed in place WITHOUT a global redesign by respecting this: read-lock
 compose (B1), copy-out-under-the-one-lock (B2), reject-don't-nest (B3), private
 once-flag not a struct mutex (B4). See compiler-internals.md "Axis B implementation".
 
+**Escape/keep analysis is a PER-SINK PATCHWORK — fixing one sink does NOT fix the
+others.** The "is this value frame-bound (local/arena-derived)?" question is
+re-implemented at every escape sink (store-to-global, return, keep-call-site,
+keep-inference, struct-field-store, spawn-arg), and several historically missed the
+same value shapes — a call-laundered local (`g = f(local[..])`), a slice-of-local
+arg, a pointer/slice FIELD of a local-derived struct. That single class produced
+BUG-760..763 (each a separate sink, same blind spot). **When editing escape analysis,
+re-run the FULL sink matrix** against those shapes; a green test at one sink proves
+nothing about the others. Shared proxy: `call_has_local_derived_arg` (checker.c ~880);
+flags: `is_local_derived` / `is_arena_derived` / `is_nonkeep_derived`; keep enforcement
+is a DEFERRED fixpoint (`check_keep_inference`, after all bodies). The durable fix
+(unify call-result provenance → one lattice query per sink, incl. the relational
+`PARAM(n)` = inferred `'a`) is tracked in limitations.md. Full map +
+the read-only sink-enumeration workflow: compiler-internals.md "Escape & keep
+analysis". Returning a sub-slice/`&elem` of a slice/pointer PARAM is ALLOWED
+(BUG-764 relaxation); returning a view of a LOCAL is not.
+
 ---
 
 ## ZER Language — Complete Quick Reference

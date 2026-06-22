@@ -37,7 +37,29 @@ THE OPEN ISSUE — bundling a C→wasm compiler that is small AND keeps `--wrap`
   out.wasm) + `entrypoint.run({args:['/p/x.c','-o','/p/x.wasm','-target','wasm32-wasi'],
   mount:{'/p':dir}})`.
 
-**clang.wasm integration plan (the focused next pass):**
+**INVESTIGATION RESULT (2026-06-22) — clang.wasm via Wasmer is BLOCKED in node.**
+Validated thoroughly: `@wasmer/sdk/node` (15 MB, runtime wasm INLINED → no CDN fetch
+needed; the earlier "fetch failed" was the BROWSER entry). `Wasmer.fromRegistry('clang/clang')`
+→ `clang-16` + `wasm-ld` (LLVM 16, so `--wrap` *should* work). clang-16 **COMPILES**
+(cc1 runs in-process: `Target: wasm32-unknown-wasi`, sysroot mounted at `/sysroot`,
+resource dir `/lib/clang/16` ✓) but **CANNOT LINK**: clang's spawn of the `wasm-ld`
+subprocess fails with `clang-16: error: linker command failed with exit code 45` —
+even for plain `int main(){return 7;}` (so it is NOT a `--wrap` problem; `--wrap` was
+never reached). Worse, the WASIX runtime is **FLAKY in node** — ~4 of 5 invocations
+HANG (node exits 13, "unfinished top-level await"). Root cause: the `clang/clang`
+package targets the full **Wasmer runtime** (WASIX process-spawn + threads);
+`@wasmer/sdk`-in-node lacks reliable WASIX subprocess spawning, which a clang→wasm-ld
+toolchain fundamentally needs. A two-step `clang -c` + direct `wasm-ld` run would dodge
+the spawn, but the per-run hang/flakiness makes it unusable for an in-editor tool
+regardless. clang.wasm would need a real WASIX-capable host (e.g. native `wasmtime` —
+which re-introduces a native binary). **NOT a clean node/VSIX bundle today.**
+
+**Net: the only WORKING small option is `zig cc`** (341 MB, drops `--wrap` →
+`track_cptrs=0`: pure-ZER stays 100% compile-time-safe, cinclude'd C loses the ~2%
+runtime malloc net). Native clang is correct-but-unshippable (~1.4 GB). The proven
+pipeline + the `-WASI` scaffolding + the smoke-test contract are committed regardless.
+
+**clang.wasm integration plan (only if revisited via a WASIX-capable host):**
 1. Pre-fetch (network) the `clang/clang` `.webc` + the `@wasmer/sdk` WASIX runtime
    wasm, BUNDLE them in the VSIX, and configure `@wasmer/sdk` to load them OFFLINE
    (no `fromRegistry` fetch at runtime — a plain `docker run` hit `init()`/registry

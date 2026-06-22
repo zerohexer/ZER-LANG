@@ -1,0 +1,14 @@
+// The struct-wrap escape fix must be precise: storing a SCALAR field of a
+// local-derived struct to a global is a VALUE copy, not a reference escape — it
+// must stay allowed (the fix gates the field-descent on the value being a
+// pointer/slice). Only the pointer/slice field would escape.
+struct Pair { [*]u8 data; u32 count; }
+u32 g_count;
+u32 main() {
+    u8[10] buf;
+    buf[0] = 1;
+    Pair p = { .data = buf[0..10], .count = 7 };   // p is local-derived (data → local buf)
+    g_count = p.count;     // scalar field — value copy, NOT an escape → OK
+    if (g_count != 7) { return 1; }
+    return 0;
+}

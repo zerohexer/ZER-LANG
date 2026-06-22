@@ -36,7 +36,7 @@ cross-compilation needs a cross-gcc the bundle doesn't ship.
 
 ---
 
-## OPEN — struct-wrapped-slice launder escapes via a call result (UAF, pre-existing; MED)
+## FIXED (BUG-762, 2026-06-22) — struct-wrapped-slice launder escaped via a field store
 
 **Symptom (verified 2026-06-22 by the escape-sink enumeration's adversarial pass):**
 a function that returns a STRUCT BY VALUE wrapping a pointer/slice PARAM, called with
@@ -57,13 +57,15 @@ POINTER/SLICE — a STRUCT return wrapping a pointer/slice is not tagged, so `v2
 clean and the later `g_ptr = v2.data` isn't caught. Same family as BUG-760/761 (call
 result provenance), one level up (struct-wrapped).
 
-**Fix sketch:** extend the var-decl + store-result-of-call provenance so a call whose
-return type is a STRUCT/UNION that `type_carries_data_pointer`, made with a
-local-derived/slice arg, marks the result local-derived (mirrors the scalar
-pointer/slice path; reuses `call_has_local_derived_arg` + `type_carries_data_pointer`).
-Conservative — only rejects more. **NOT yet implemented.** Orthogonal to the
-return-borrow-from-param relaxation below (that relaxation's DIRECT sinks are all
-covered; this struct-wrap path is a separate, narrower pre-existing pattern).
+**FIX (BUG-762):** the actual gap was narrower than the sketch — `v2` IS marked
+local-derived (the var-decl provenance at ~9868 already handles struct returns); the
+store-escape check at ~4043 just didn't walk a `.field` value to its root. Fixed by
+descending `NODE_FIELD`/`NODE_INDEX` on the value (gated on the value being a
+pointer/slice so scalar-field stores aren't false-flagged). Zero over-rejection.
+**Residual [OPEN, narrow]:** a NESTED struct field carrying pointers
+(`g = v.inner_struct` where inner is a sub-struct) — the gate is pointer/slice only,
+not `type_carries_data_pointer` on struct/union values; the whole-struct store
+(`g = v`) is still caught, so this is a deep-nesting residual only.
 
 ---
 

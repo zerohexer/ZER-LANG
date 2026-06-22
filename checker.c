@@ -4055,6 +4055,25 @@ static Type *check_expr(Checker *c, Node *node) {
                     else vnode = vnode->index_expr.object;
                 }
             }
+            /* BUG-762 (struct-wrap launder): `g = v.data` where v is a local-derived
+             * struct and `.data` is a pointer/slice field — the field carries a
+             * reference into v's local backing. Descend FIELD/INDEX to the root,
+             * GATED on the stored VALUE being a pointer/slice: a scalar field store
+             * (`g_int = v.count`) copies a value, not a reference, and must NOT be
+             * flagged. The is_local_derived check below then catches it; a struct
+             * PARAM's field stays unflagged (the param is not local-derived). */
+            if (!via_slice_borrow && vnode &&
+                (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
+                Type *vt = typemap_get(c, node->assign.value);
+                if (vt && (type_dispatch_kind(vt) == TYPE_POINTER ||
+                           type_dispatch_kind(vt) == TYPE_SLICE)) {
+                    while (vnode && (vnode->kind == NODE_FIELD ||
+                                     vnode->kind == NODE_INDEX)) {
+                        if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
+                        else vnode = vnode->index_expr.object;
+                    }
+                }
+            }
             if (vnode && vnode->kind == NODE_IDENT) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);

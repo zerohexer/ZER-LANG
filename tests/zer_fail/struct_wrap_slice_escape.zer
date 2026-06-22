@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Struct-wrapped-slice launder: a function returning a struct that wraps a param
+// slice, called with a LOCAL, then the slice field extracted and stored to a
+// global, escapes — v2.data points into the caller's freed stack. The store check
+// now descends `v2.data` to its root v2 (local-derived) and rejects.
+struct View { [*]u8 data; }
+[*]u8 g_ptr;
+View get_view([*]u8 s) { View v = { .data = s }; return v; }
+void caller() {
+    u8[10] buf;
+    View v2 = get_view(buf[0..10]);
+    g_ptr = v2.data;     // slice field of a local-derived struct → escape
+}
+u32 main() { caller(); return 0; }

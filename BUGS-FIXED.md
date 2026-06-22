@@ -511,6 +511,44 @@ over-rejection (the flexibility win). See limitations.md "OPEN — return-borrow
 
 ---
 
+### BUG-762 — storing a pointer/slice FIELD of a local-derived struct to a global escaped (UAF)
+
+**What broke (UAF, pre-existing, found 2026-06-22 by the escape-sink enumeration's
+adversarial pass):** the store-to-global escape check (checker.c ~4043) walked the
+stored VALUE through `NODE_SLICE` (BUG-748) and bare idents, but **not a plain
+`.field` access**. So `g_ptr = v.data` — a pointer/slice field of a local-derived
+struct — was not walked to its root `v`, and escaped:
+```
+struct View { [*]u8 data; }
+[*]u8 g_ptr;
+View get_view([*]u8 s){ View v={.data=s}; return v; }
+void caller(){ u8[10] buf; View v2 = get_view(buf[0..10]); g_ptr = v2.data; }  // compiled clean
+```
+`v2` IS marked local-derived (returning it or storing the whole struct `g = v2` was
+caught) — the check just never reached `v2` through the `.data` field access. This
+is the struct-wrapped-slice launder the sink enumeration predicted.
+
+**Fix (checker.c ~4057):** descend `NODE_FIELD`/`NODE_INDEX` on the value side to the
+root ident, **gated on the stored value being a pointer/slice** (`type_dispatch_kind`)
+— a scalar field store (`g_int = v.count`) copies a value, not a reference, and must
+not be flagged. The existing `is_local_derived` check on the root then catches it; a
+struct PARAM's field stays unflagged (the param is not local-derived). Conservative —
+only rejects more.
+
+**Over-rejection: zero** — `make check` green; the scalar-field positive
+(`g_count = p.count` on a local-derived struct) still compiles + runs. Tests:
+`tests/zer_fail/struct_wrap_slice_escape.zer`, `tests/zer/struct_wrap_scalar_field_ok.zer`.
+Full `make check` GREEN: ZER 803/0, all 5 audits.
+
+**Escape-safety arc (BUG-760/761/762):** the escape-sink ENUMERATION (a finite
+storage-class audit, not a heavy proof) drove these — it confirmed the
+return-borrow-from-param relaxation's DIRECT sinks are all covered AND surfaced these
+three call/keep/struct-field provenance holes. With all three closed, the major sinks
+catch a laundered local through every shape (direct slice, slice-param-keep,
+struct-field). The relaxation can now proceed on a verified-complete sink matrix.
+
+---
+
 ### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
 
 **What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a

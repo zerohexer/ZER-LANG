@@ -1,0 +1,127 @@
+# ============================================================================
+# Dockerfile.vsix-WASI — VSIX with a FULLY-WASM run pipeline.
+#
+#   ZER source -> zer.wasm (ZER->C) -> wasi-sdk clang (C->wasm32-wasi) ->
+#   app.wasm -> node's built-in WASI.
+#
+# The compiled program is a `.wasm`, NEVER a native `.exe`, so no freshly-built
+# unsigned binary is ever created on the user's machine -> no per-run Defender
+# scan. The Level-4 malloc interception (`-Wl,--wrap=malloc,...`) is preserved:
+# wasm-ld supports --wrap (LLVM 9+, review D62380).
+#
+# Parallel to Dockerfile.vsix (the GCC->native-exe variant), which is left
+# untouched. Builds editors/vscode-WASI -> release/zer-lang-wasi.vsix.
+# ============================================================================
+
+# ---- Stage 1: build the ZER compiler as WebAssembly (identical to Dockerfile.vsix) ----
+FROM emscripten/emsdk:3.1.74 AS wasm
+WORKDIR /zer
+COPY *.c *.h ./
+COPY src/ src/
+ENV SAFETY_SRCS="src/safety/handle_state.c src/safety/range_checks.c src/safety/type_kind.c src/safety/coerce_rules.c src/safety/context_bans.c src/safety/escape_rules.c src/safety/provenance_rules.c src/safety/mmio_rules.c src/safety/optional_rules.c src/safety/move_rules.c src/safety/atomic_rules.c src/safety/container_rules.c src/safety/misc_rules.c src/safety/isr_rules.c src/safety/arith_rules.c src/safety/variant_rules.c src/safety/stack_rules.c src/safety/comptime_rules.c src/safety/cast_rules.c src/safety/concurrency_rules.c src/safety/asm_categories.c src/safety/asm_register_lookup.c src/safety/asm_register_tables_x86_64.c src/safety/asm_register_tables_x86_64_avx512f.c src/safety/asm_register_tables_aarch64.c src/safety/asm_register_tables_riscv64.c src/safety/asm_instruction_table_x86_64.c src/safety/asm_instruction_table_aarch64.c src/safety/asm_instruction_table_riscv64.c"
+RUN emcc -O2 -I. \
+    zer_wasm.c \
+    lexer.c parser.c ast.c types.c checker.c emitter.c \
+    zercheck.c zercheck_ir.c ir.c ir_lower.c $SAFETY_SRCS \
+    -sEXPORTED_FUNCTIONS=_zer_diagnostics_json,_zer_emit_c,_zer_emit_ir,_zer_set_target,_zer_free,_zer_version,_malloc,_free \
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
+    -sMODULARIZE=1 -sEXPORT_NAME=ZerModule \
+    -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=node \
+    --no-entry \
+    -o /zer/zer.js
+
+# ---- Stage 2: assemble + package the WASI VSIX ----
+FROM gcc:13
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq p7zip-full curl librsvg2-bin && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y -qq nodejs && \
+    npm install -g @vscode/vsce && \
+    rm -rf /var/lib/apt/lists/*
+
+# wasi-sdk (clang + wasm-ld + wasi-sysroot) — the WASM C toolchain. NOTE: large.
+ARG WASI_TAG=wasi-sdk-33
+ARG WASI_VER=33.0
+# Linux (used for the in-container smoke test AND linux users)
+RUN curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_TAG}/wasi-sdk-${WASI_VER}-x86_64-linux.tar.gz" -o /tmp/wl.tgz && \
+    mkdir -p /opt/wasi-linux && tar -C /opt/wasi-linux --strip-components=1 -xf /tmp/wl.tgz && rm /tmp/wl.tgz && \
+    rm -rf /opt/wasi-linux/share/man /opt/wasi-linux/share/doc
+# Windows (bundled for the user's machine — only files, never executed in this build)
+RUN curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/${WASI_TAG}/wasi-sdk-${WASI_VER}-x86_64-windows.tar.gz" -o /tmp/ww.tgz && \
+    mkdir -p /opt/wasi-win && tar -C /opt/wasi-win --strip-components=1 -xf /tmp/ww.tgz && rm /tmp/ww.tgz && \
+    rm -rf /opt/wasi-win/share/man /opt/wasi-win/share/doc
+
+# TRIM each wasi-sdk to the minimal C->wasm toolchain (the full SDK ships all of
+# LLVM ~1.6 GB; a C->wasm compile needs only clang + an lld linker + the clang
+# resource dir + the wasi-sysroot). Drop llvm-*/lldb/clang-tidy/static libs.
+# Separate RUN so the (cached) download layers above are NOT re-fetched.
+# Delete the known LLVM bulk (each llvm-*/lldb tool statically links LLVM ~100 MB)
+# by PATTERN — keeps clang*, the lld linkers, every *.dll clang.exe needs, and the
+# clang resource dir + wasi-sysroot. Removes the LLVM static libs in lib/ (the GB).
+RUN for D in /opt/wasi-linux /opt/wasi-win; do \
+      ( cd "$D/bin" && rm -f \
+          llvm-* lldb* sancov* verify-uselistorder* split-file* \
+          clang-tidy* clang-format* clang-scan-deps* clang-cl* clang-repl* \
+          clang-refactor* clang-check* clang-extdef* clang-import-test* \
+          clang-offload* clang-linker-wrapper* clang-nvlink-wrapper* \
+          c-index-test* diagtool* git-clang-format* run-clang-tidy* scan-build* scan-view* \
+          2>/dev/null ; true ) ; \
+      ( cd "$D" && \
+        find lib -maxdepth 1 -mindepth 1 ! -name 'clang' ! -name '*.so*' -exec rm -rf {} + ; \
+        rm -rf share/man share/doc ) ; \
+      echo "TRIMMED $D -> $(du -sh "$D" | cut -f1)" ; \
+    done
+# NOTE (compiler-size): keeping libclang-cpp.so (clang's LLVM core) leaves each
+# wasi-sdk at ~1 GB. The size fix is STRIPPING it (llvm-strip on libclang-cpp.so +
+# clang + lld), or moving to a wasm-hosted clang (clang.wasm). See the WASI build
+# notes in docs/limitations.md / compiler-internals.md.
+
+# OpenJS-signed node.exe for the Windows `zerc` terminal shim + the WASI runner.
+RUN curl -fsSL "https://nodejs.org/dist/v20.18.1/node-v20.18.1-win-x64.zip" -o /tmp/node.zip && \
+    7z e /tmp/node.zip -o/tmp/nodewin "node-v20.18.1-win-x64/node.exe" -y > /dev/null && rm /tmp/node.zip
+
+# Extension sources (lsp/server.js, lsp/zerc-cli.js, lsp/wasi-run.mjs, win-shims/zerc.cmd)
+COPY editors/vscode-WASI/ /ext/
+RUN mkdir -p /ext/bin/win32-x64 /ext/bin/linux-x64 /ext/lsp
+
+# ---- WASM compiler frontend (LSP + CLI), platform-independent ----
+COPY --from=wasm /zer/zer.js  /ext/lsp/zer.js
+COPY --from=wasm /zer/zer.wasm /ext/lsp/zer.wasm
+
+# ---- Bundle the wasi-sdk toolchains + signed node + terminal shim ----
+RUN cp -r /opt/wasi-linux /ext/bin/linux-x64/wasi-sdk && \
+    cp -r /opt/wasi-win   /ext/bin/win32-x64/wasi-sdk && \
+    cp /tmp/nodewin/node.exe /ext/bin/win32-x64/node.exe && \
+    cp /ext/win-shims/zerc.cmd /ext/bin/win32-x64/zerc.cmd
+
+# ---- Verify the wasm LSP server starts + produces diagnostics ----
+COPY win-resources/lsp-client-test.js /ext/lsp/lsp-client-test.js
+RUN node /ext/lsp/lsp-client-test.js /ext/lsp/server.js && rm /ext/lsp/lsp-client-test.js
+
+# ---- Verify the WASI CLI end-to-end: emit -> clang-wasi -> node-WASI run ----
+RUN printf 'i32 printf(const *u8 fmt, ...);\ni32 main(){ printf("cli ok\\n"); return 0; }\n' > /tmp/cli.zer && \
+    node /ext/lsp/zerc-cli.js /tmp/cli.zer --run | grep -q "cli ok" && \
+    echo "ZERC-WASI CLI e2e OK (ZER -> wasm -> node-WASI)" && rm -f /tmp/cli.zer
+
+# ---- The WASI CLI MUST still reject unsafe code via zercheck_ir ----
+RUN printf 'struct Task { u32 id; }\nPool(Task, 4) pool;\nu32 main(){ Handle(Task) h = pool.alloc() orelse return; pool.free(h); pool.free(h); return 0; }\n' > /tmp/df.zer && \
+    if node /ext/lsp/zerc-cli.js /tmp/df.zer --run > /dev/null 2>&1; then \
+        echo "FAIL: WASI CLI compiled a double-free (zercheck_ir not gating)"; exit 1; \
+    else echo "ZERC-WASI CLI rejects double-free (zercheck_ir) OK"; fi && rm -f /tmp/df.zer
+
+# ---- A bounds-overflow program must TRAP at runtime under WASI ----
+RUN printf 'i32 printf(const *u8 fmt, ...);\nu32 read_at([*]u32 a, u32 i){ return a[i]; }\ni32 main(){ u32[2] b; b[0]=1; b[1]=2; u32 n=9; printf("%%d\\n", read_at(b, n)); return 0; }\n' > /tmp/tr.zer && \
+    if node /ext/lsp/zerc-cli.js /tmp/tr.zer --run > /dev/null 2>&1; then \
+        echo "FAIL: WASI CLI did not trap an out-of-bounds slice read"; exit 1; \
+    else echo "ZERC-WASI CLI traps OOB slice read OK"; fi && rm -f /tmp/tr.zer
+
+# Marketplace icon
+RUN rsvg-convert -w 128 -h 128 /ext/icon.svg -o /ext/icon.png
+
+WORKDIR /ext
+RUN npm install --production && \
+    mkdir -p /out && \
+    npx vsce package --allow-missing-repository -o /out/zer-lang-wasi.vsix
+
+CMD ["true"]

@@ -1,0 +1,62 @@
+{
+    "name": "zerc-language-wasi",
+    "displayName": "ZER Lang (WASI)",
+    "description": "Memory-safe systems programming — compiler + LSP + a WASM C toolchain. Programs compile and run as WebAssembly (no native exe is ever produced, so no per-run antivirus scans). Zero setup.",
+    "version": "0.5.7",
+    "publisher": "zerohexer",
+    "license": "MPL-2.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/zerohexer/ZER-LANG"
+    },
+    "icon": "icon.png",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": ["Programming Languages"],
+    "activationEvents": [
+        "onLanguage:zer",
+        "onCommand:zer.openReference"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "languages": [{
+            "id": "zer",
+            "aliases": ["ZER", "zer"],
+            "extensions": [".zer"],
+            "configuration": "./language-configuration.json"
+        }],
+        "grammars": [{
+            "language": "zer",
+            "scopeName": "source.zer",
+            "path": "./syntaxes/zer.tmLanguage.json"
+        }],
+        "commands": [{
+            "command": "zer.openReference",
+            "title": "ZER: Open Language Reference"
+        }],
+        "configuration": {
+            "title": "ZER Language",
+            "properties": {
+                "zer.lspPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Path to zer-lsp executable (leave empty to use bundled)"
+                },
+                "zer.lspArgs": {
+                    "type": "array",
+                    "default": [],
+                    "description": "Additional arguments for zer-lsp"
+                }
+            }
+        }
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.0",
+        "vscode-languageserver-protocol": "^3.17.0"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.75.0",
+        "@vscode/vsce": "^3.0.0"
+    }
+}

@@ -314,6 +314,17 @@ docker-vsix:
 	@echo "VS Code extension: release/zer-lang.vsix"
 	@echo "Install: code --install-extension release/zer-lang.vsix"
 
+# ---- Docker VSIX (WASI): fully-WASM run pipeline (wasi-sdk clang, no native exe) ----
+docker-vsix-wasi:
+	docker build -t zer-lang-vsix-wasi -f Dockerfile.vsix-WASI .
+	@mkdir -p release
+	docker rm -f zer-vsix-wasi-out 2>/dev/null; true
+	docker run --name zer-vsix-wasi-out zer-lang-vsix-wasi true
+	docker cp zer-vsix-wasi-out:/out/zer-lang-wasi.vsix release/zer-lang-wasi.vsix
+	docker rm zer-vsix-wasi-out
+	@echo "VS Code extension (WASI): release/zer-lang-wasi.vsix"
+	@echo "Install: code --install-extension release/zer-lang-wasi.vsix"
+
 # ---- Formal-verification proofs (Coq + Iris) ----
 # Requires Docker image `zer-proofs` (build once: `make check-proofs-image`).
 # The proofs are the "tests" — compilation IS the correctness check.
@@ -451,4 +462,4 @@ check-safety-coverage:
 	    echo "OK: safety_coverage_raw.md up to date"; \
 	fi
 
-.PHONY: check check-all clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst
+.PHONY: check check-all clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix docker-vsix-wasi check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst

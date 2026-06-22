@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// A function that stores a SLICE parameter to a global "keeps" it (inferred keep);
+// passing a slice of a local array then escapes — the global ends up pointing into
+// the caller's freed stack (cross-scope UAF). Keep inference now covers slice
+// params, not only pointer params (was a hole: gs = slice_param didn't infer keep).
+[*]u8 g_kept;
+void keep_slice([*]u8 s) { g_kept = s; }
+void leak() {
+    u8[16] local;
+    keep_slice(local[0..16]);   // local slice can't satisfy the inferred keep
+}
+u32 main() { leak(); return 0; }

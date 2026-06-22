@@ -1,0 +1,10 @@
+// A GLOBAL slice satisfies the inferred keep on a slice param — no escape, allowed.
+// Proves the keep-slice inference is precise (only LOCAL slice args are rejected).
+[*]u8 g_kept;
+u8[16] g_src;
+void keep_slice([*]u8 s) { g_kept = s; }
+u32 main() {
+    g_src[0] = 9;
+    keep_slice(g_src[0..16]);   // global source satisfies keep — OK
+    return 0;
+}

@@ -4112,7 +4112,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * mirrors the escape axis, which already marks/checks structs. */
                 TypeKind vk = type_dispatch_kind(val_sym ? val_sym->type : NULL);
                 bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
-                    (vk == TYPE_POINTER || vk == TYPE_OPAQUE ||
+                    (vk == TYPE_POINTER || vk == TYPE_OPAQUE || vk == TYPE_SLICE ||
                      vk == TYPE_STRUCT || vk == TYPE_UNION);
                 if (is_nonkeep_value) {
                     /* keep-universalization 2a: a non-keep pointer param (or alias)
@@ -13631,7 +13631,14 @@ static void check_func_body(Checker *c, Node *node) {
                  * + keep-2a). keep params are exempt (the escape valve). */
                 if (!p->is_keep && ptype) {
                     TypeKind pk = type_dispatch_kind(ptype);
-                    if (pk == TYPE_POINTER || pk == TYPE_OPAQUE) {
+                    if (pk == TYPE_POINTER || pk == TYPE_OPAQUE || pk == TYPE_SLICE) {
+                        /* TYPE_SLICE added 2026-06-22: a `[*]u8` slice param is a
+                         * {ptr,len} borrow exactly like a pointer param — storing it
+                         * to a global/param-field launders the caller's buffer. Was a
+                         * hole: slice params were never tainted non-keep, so a
+                         * slice-storing function never inferred keep and local-slice
+                         * callers were not rejected. Pairs with the TYPE_SLICE gate
+                         * at the persist sink (~4115). */
                         sym->is_nonkeep_derived = true;
                         sym->nonkeep_root_param = i; /* keep inference: this param is its own root */
                     }

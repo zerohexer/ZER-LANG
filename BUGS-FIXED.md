@@ -477,6 +477,40 @@ prerequisite for safely relaxing that — see "OPEN — return-borrow-from-param
 
 ---
 
+### BUG-761 — slice param stored to a global never inferred `keep` (cross-scope UAF)
+
+**What broke (UAF, pre-existing, found 2026-06-22 during the same investigation):**
+keep-inference fires for a `*T` POINTER param stored to a global (`gp = x` → `x`
+inferred `keep` → callers passing `&local` rejected), but **NOT for a `[*]T` SLICE
+param** (`gs = x` where `gs` is a global slice). So:
+```
+[*]u8 g; void keep_slice([*]u8 s){ g = s; }
+void leak(){ u8[16] a; keep_slice(a[0..16]); }   // compiled clean — g now dangles
+```
+A slice param is a `{ptr,len}` borrow exactly like a pointer; storing it to a global
+launders the caller's buffer. Neither the body (`g = s` allowed — no keep inferred)
+nor the caller (`keep_slice(a[..])` not rejected) caught it.
+
+**Fix — TWO matching gates both omitted `TYPE_SLICE`:** (1) the non-keep ROOT taint
+on param registration (checker.c ~13634) set `is_nonkeep_derived` only for
+`TYPE_POINTER|TYPE_OPAQUE` → added `TYPE_SLICE`; (2) the persist-sink keep-inference
+value-type gate (~4115) likewise → added `TYPE_SLICE`. Together: a slice param is
+now a non-keep root, storing it to a global/param-field infers `keep`, and the
+call-site (which already descends `NODE_SLICE`, BUG-751) rejects a local-slice arg.
+
+**Over-rejection: zero** — `make check` stayed green (passing a GLOBAL slice still
+satisfies keep; only LOCAL-slice args to keep params are rejected, which is the
+actual escape). Tests: `tests/zer_fail/keep_slice_param_escape.zer`,
+`tests/zer/keep_slice_param_global_ok.zer`. Full `make check` GREEN: ZER 801/0,
+all 5 audits OK.
+
+**With BUG-760 + 761, all the major escape sinks (store-to-global, return,
+struct-field-of-global, keep-param) now catch a call-laundered / slice-param local**
+— which is exactly the prerequisite for safely relaxing the return-borrow-from-param
+over-rejection (the flexibility win). See limitations.md "OPEN — return-borrow-from-param".
+
+---
+
 ### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
 
 **What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a

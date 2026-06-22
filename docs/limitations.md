@@ -54,18 +54,22 @@ frame). The `&expr` return path (~10951) rejects `&s[0]` the same way. It is
 **safe (conservative reject), never a UAF** — it errs toward rejection.
 
 **Why it's only LOW / not rushed:** relaxing it safely requires the call-result
-provenance to catch every escape *through* such a function at the call site. The
-core of that (store + return sinks for `f(local[..])`, one-step AND two-step) was
-**fixed in BUG-760**. The safe relaxation is then: in the promotion + `&expr`
-paths, do NOT promote when the root symbol's type is a SLICE/POINTER (external
-pointee) — only promote ARRAY/STRUCT roots (frame storage); the `is_local_derived`
-bit already flags a slice LOCAL that points to a local, so it stays rejected.
-**Remaining prerequisite before relaxing:** audit the OTHER escape sinks
-(keep-param pass-through `keepfn(f(local[..]))`, Pool/Slab store, struct-field of a
-global) to confirm each also catches a call-laundered local — only the
-store-to-global / return / store-to-param-field sinks are verified so far. Once all
-sinks are confirmed, the relaxation is a ~10-line change in the two return-escape
-sites. This is the "infer what Rust annotates (the `'a`)" enhancement.
+provenance to catch every escape *through* such a function at the call site. As of
+2026-06-22 the major sinks are ALL verified to catch a call-laundered / slice-param
+local: store-to-global + return (BUG-760, one-step AND two-step), struct-field of a
+global (already worked), and keep-param pass-through (BUG-761). So the prerequisite
+is essentially met. The safe relaxation itself is then a **~10-line change** in the
+two return-escape sites: in the `sliced_borrow` promotion (~11016) and the `&expr`
+return path (~10951), do NOT reject when the root symbol's type is a SLICE/POINTER
+(external pointee — the caller's memory) — only ARRAY/STRUCT roots (frame storage)
+escape; the `is_local_derived` bit already flags a slice LOCAL pointing to a local,
+so that stays rejected. After relaxing, re-verify the full sink matrix with an
+actual sub-slice-returning helper (`trim`) — local use allowed, every escape (g =
+trim(local), t = trim(local);g=t, keepfn(trim(local)), struct-field = trim(local))
+rejected. This is the "infer what Rust annotates (the `'a`)" enhancement; remaining
+unverified sinks are the rare ones (Pool/Slab/Ring element store). NOTE: once
+relaxed, `lib/str.zer`'s `bytes_trim*` should be revisited (they currently don't
+compile).
 
 ---
 

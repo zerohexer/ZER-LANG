@@ -69,6 +69,32 @@ not `type_carries_data_pointer` on struct/union values; the whole-struct store
 
 ---
 
+## OPEN — unify call-result provenance (refactor; the durable fix for BUG-760..763's class)
+
+**Pattern (2026-06-22):** the return-borrow-from-param investigation surfaced FOUR
+escape holes (BUG-760 store/return call-launder, BUG-761 slice-param keep inference,
+BUG-762 struct-field store, BUG-763 keep call-launder) — ALL the same shape: a
+per-sink escape check independently failing to recognise a *call-laundered* or
+*slice-of-local* argument. Each was a separate site re-implementing "is this value
+derived from a local?" and several got it incomplete. The remaining suspected
+siblings (not yet verified/fixed): `call_has_nonkeep_derived_arg` lacks NODE_SLICE
+descent; spawn-arg launder `spawn f(g_via_call(local))`; nested-struct-field
+(`g = v.inner_struct`).
+
+**Durable fix (the right architecture):** compute call-result provenance ONCE — when
+a call's return type is value-carrying (pointer / slice / struct-or-union that
+`type_carries_data_pointer`) and any arg is local/arena-derived, mark the result
+symbol `is_local_derived` (and the keep-edge) in a SINGLE place (the var-decl +
+assignment + arg-evaluation provenance), so every sink (store, return, keep,
+struct-field, spawn) catches it through the one flag instead of re-walking. This is
+ZER's "infer what Rust annotates (the `'a`)" — return provenance is the inferred
+lifetime relationship. It would close the whole class (incl. the unverified siblings)
+and make the return-borrow-from-param relaxation below trivially safe. Refactor-sized
+(touches several escape sites); not whack-a-mole. Until then, each sink is patched
+individually (BUG-760..763 done; siblings open).
+
+---
+
 ## OPEN — return-borrow-from-param over-rejection (expressiveness, NOT safety; LOW)
 
 **Symptom (verified 2026-06-22):** returning a sub-slice or `&`-element of a

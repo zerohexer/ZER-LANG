@@ -5,6 +5,56 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — clang-wasi run pipeline: compiler bundling (pipeline DONE; bundle TBD)
+
+**Status (2026-06-22): the fully-WASM run pipeline WORKS end-to-end — only the
+compiler-bundling is unresolved.** Goal: VS Code "run" produces a `.wasm` (not a
+native `.exe`) → no per-run Defender scan. Pipeline: `zerc.wasm` (ZER→C, done) →
+`clang --target=wasm32-wasi` (C→wasm) → run in node-WASI.
+
+DONE + committed:
+- **Emitter `__wasi__` gate** (emitter.c ~4807-5066, commit 75ce5cfc): POSIX
+  preamble (pthread/sched/signal) gated `!defined(__wasi__)` so emitted C compiles
+  to wasm32-wasi; hosted unaffected; `make check` green.
+- **`-WASI` VSIX scaffolding** (commit ceb3d543): `editors/vscode-WASI/`
+  (`zerc-language-wasi`; `lsp/zerc-cli.js` → clang-wasi → app.wasm → node-WASI via
+  `lsp/wasi-run.mjs`), `Dockerfile.vsix-WASI`, `make docker-vsix-wasi`.
+- **PROVEN in the real build** — 3 in-container smoke tests pass: ZER→wasm→node-WASI
+  prints + exits 0; double-free rejected (zercheck_ir); OOB slice read TRAPS at
+  runtime. `wasm-ld --wrap=malloc` (Level-4 interception) confirmed (LLVM 9+/D62380).
+
+THE OPEN ISSUE — bundling a C→wasm compiler that is small AND keeps `--wrap`:
+- **native wasi-sdk clang**: full `--wrap` ✓ but **~1.4 GB/platform** (Windows
+  clang.exe is a fat static LLVM; `llvm-strip --strip-debug` barely helped — it's
+  code, not debug). vsce can't package ~2 GB. UNSHIPPABLE.
+- **zig cc**: small (341 MB) but **rejects `-Wl,--wrap`** (verified: "unsupported
+  linker arg"). Would need emit with `track_cptrs=0` (no `__wrap` machinery) →
+  pure-ZER stays 100% compile-time safe; cinclude'd C loses the ~2% runtime net.
+- **clang.wasm (CHOSEN)**: wasm-hosted clang+lld via **Wasmer** ("clang-in-browser",
+  `@wasmer/sdk` ~15 MB, runs in node too). Recent clang+lld → `--wrap` ✓, smallest,
+  zero native compiler (kills install-time scans too). API:
+  `Wasmer.fromRegistry('clang/clang')` + a `Directory` (writeFile in.c / readFile
+  out.wasm) + `entrypoint.run({args:['/p/x.c','-o','/p/x.wasm','-target','wasm32-wasi'],
+  mount:{'/p':dir}})`.
+
+**clang.wasm integration plan (the focused next pass):**
+1. Pre-fetch (network) the `clang/clang` `.webc` + the `@wasmer/sdk` WASIX runtime
+   wasm, BUNDLE them in the VSIX, and configure `@wasmer/sdk` to load them OFFLINE
+   (no `fromRegistry` fetch at runtime — a plain `docker run` hit `init()`/registry
+   "fetch failed" with github/npm reachable, so offline loading is mandatory).
+2. Rewire `editors/vscode-WASI/lsp/zerc-cli.js`: replace the native-clang `spawnSync`
+   with `@wasmer/sdk` running the bundled clang on the emitted C → `app.wasm`, then
+   run via the existing `wasi-run.mjs`.
+3. Update `Dockerfile.vsix-WASI`: drop the wasi-sdk download/trim; bundle
+   `@wasmer/sdk` + the clang `.webc`; keep the 3 smoke tests.
+4. Verify size (~50-100 MB target) + the 3 smoke tests + that `--wrap` survives.
+
+The native-clang `Dockerfile.vsix-WASI` is committed as the proven-pipeline harness
+(its smoke tests are the contract); the clang.wasm swap reuses it. The original GCC
+VSIX (`Dockerfile.vsix`, `editors/vscode/`) is UNTOUCHED throughout.
+
+---
+
 ## OPEN — WASM CLI: multi-file imports + macOS terminal zerc (LOW–MEDIUM)
 
 The VS Code extension ships the compiler as WebAssembly (`zer_wasm.c` →

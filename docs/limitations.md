@@ -2283,7 +2283,7 @@ silently dropped const — a real asymmetry, so it was fixed (reject), not waive
 
 ---
 
-## OPEN — Concurrency memory-safety: 3-sweep audit (~25 holes), four-axis closure (IMPLEMENTATION IN PROGRESS, 2026-06-21)
+## OPEN — Concurrency memory-safety: ~24/25 holes CLOSED, 1 open (cross-block scoped-borrow) + named floors (2026-06-22)
 
 **Scope of this entry:** ZER's concurrency PRIMITIVES are all implemented
 (shared/spawn/atomics/Semaphore/Barrier/condvar/Ring/async/move). This entry is
@@ -2291,9 +2291,15 @@ the standing ledger of the **memory-safety gaps** in the concurrency model —
 verified data races + cross-thread use-after-free that compile clean. Full
 design + Rust mapping + closure: `docs/primitives-data-races.md` §24. Per-hole
 file:line detail: workflow task outputs `wpbbu8v47` / `wwt4c31zh` / `wgvm1bid5`.
-**Do NOT yet claim ZER is data-race-safe as shipped** — it is *designed* to be
-(auto-inferred Rust-equivalent safety); implementation has BEGUN (phase 2) but is
-not complete.
+**Do NOT yet claim ZER is FULLY data-race-safe as shipped** — but the open surface
+is now ONE hole, not ~25. ~24 of the ~25 audited holes are CLOSED + regression-tested
+(BUG-743..759: Axis B complete, A6-full atomic-cell taint complete, A5 threadlocal
+`&`-escape fixed, Axis C `threads[]` merge + scoped-borrow same-block read/write
+fixed). The single remaining memory-safety hole is the **cross-block scoped-borrow
+case** (spawn and access in different CFG blocks; same-block is covered) — detailed
+below. Everything else is named FLOORS, out of scope for ZER *and* Rust: D1 cinclude
+thread-capture (C-domain, safe path exists) and liveness (deadlock/livelock). So:
+very close, not 100% — one subsystem-scale fix (a zercheck_ir borrow-set merge) away.
 
 **IMPLEMENTATION PROGRESS (phase 2, session 2026-06-21b) — 9 holes CLOSED
 (BUG-743..751), each verified by the full ZER suite + C unit tests (every fix

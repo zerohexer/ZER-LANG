@@ -1095,6 +1095,19 @@ static bool call_result_static_given_args(Checker *c, Node *call) {
     return true;
 }
 
+/* Unified call-result escape decision (2026-06-22): does this call's RESULT carry a
+ * caller local that the surrounding sink would let escape? True iff some argument is
+ * local-derived (the UNDER-rejection guard, `call_has_local_derived_arg`) AND the
+ * result is not provably static given the args (the OVER-rejection skip,
+ * `call_result_static_given_args`). This is the single policy the var-decl /
+ * assignment / return / return-field / keep-call sinks all consult — centralised so
+ * one definition governs every sink (a change to the escape policy touches one place,
+ * not five). `call` need not be a NODE_CALL (both callees return false otherwise). */
+static bool call_result_escapes(Checker *c, Node *call) {
+    return call_has_local_derived_arg(c, call, 0) &&
+           !call_result_static_given_args(c, call);
+}
+
 /* keep axis (2026-06-07): does this call have a non-keep-derived pointer arg?
  * `idfn(p)` where p is a non-keep param (or a local aliasing one) yields a
  * result that may trace back to the non-keep param — persisting it violates the
@@ -1136,10 +1149,33 @@ static void infer_mark_param_keep(Checker *c, int idx) {
 
 /* keep inference: mirror of call_has_nonkeep_derived_arg, but instead of
  * reporting, marks keep on the root param of every non-keep-derived argument —
- * the launder case `g = idfn(p)` makes p escape, so p must become keep. */
+ * the launder case `g = idfn(p)` makes p escape THROUGH IDFN'S RESULT, so p must
+ * become keep.
+ *
+ * Refinement (2026-06-22, uses ret_param_mask): this inference is about the RESULT
+ * aliasing the arg, so it fires only for arg positions the callee MAY actually
+ * return. `g = idfn(scratch, keep_me)` where idfn returns keep_me (not scratch)
+ * launders only keep_me via the result; scratch is skipped. A callee that provably
+ * never returns position i (complete summary, bit i clear) does not escape arg i
+ * THROUGH ITS RESULT — and the OTHER escape path (idfn internally retaining arg i)
+ * is covered independently by the keep-call-site transitivity at this same call
+ * (idfn's param i would be keep, propagating to the caller's param). Conservative:
+ * an incomplete summary treats every position as maybe-returned (no under-inference). */
 static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
     if (!call || call->kind != NODE_CALL || depth > 8) return;
+    Symbol *csym = NULL;
+    if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
+        csym = scope_lookup(c->current_scope, call->call.callee->ident.name,
+                            (uint32_t)call->call.callee->ident.name_len);
+        if (!csym) csym = scope_lookup(c->global_scope, call->call.callee->ident.name,
+                                       (uint32_t)call->call.callee->ident.name_len);
+    }
+    bool complete = csym && csym->ret_summary_complete;
+    uint64_t mask = csym ? csym->ret_param_mask : 0;
     for (int i = 0; i < call->call.arg_count; i++) {
+        /* skip positions the callee provably never returns (no result-launder there) */
+        bool may_return_i = !complete || (i < 64 && (mask & (1ull << i)));
+        if (!may_return_i) continue;
         Node *arg = call->call.args[i];
         while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
             arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
@@ -4350,8 +4386,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 else vroot = vroot->index_expr.object;
             }
             if (vroot && vroot->kind == NODE_CALL &&
-                call_has_local_derived_arg(c, vroot, 0) &&
-                !call_result_static_given_args(c, vroot)) {   /* Stage 1: static return can't escape */
+                call_result_escapes(c, vroot)) {
                 Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
                 if (tgt_global || tgt_param) {
@@ -5704,8 +5739,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                 else carg = carg->slice.object;
                             }
                             if (carg && carg->kind == NODE_CALL &&
-                                call_has_local_derived_arg(c, carg, 0) &&
-                                !call_result_static_given_args(c, carg)) {
+                                call_result_escapes(c, carg)) {
                                 /* Stage 3 (2026-06-22): a call whose result is
                                  * provably STATIC (global/static, or a returned
                                  * param whose actual arg is static) is RETAINABLE,
@@ -10003,11 +10037,10 @@ static void check_stmt(Checker *c, Node *node) {
                     else call = call->index_expr.object;
                 }
                 if (call && call->kind == NODE_CALL) {
-                    /* Stage 1: skip the taint when the callee provably returns a
-                     * STATIC value — `g = lookup(local)` where lookup returns a
-                     * global aliases no frame memory (param_lattice.v T3). */
-                    if (call_has_local_derived_arg(c, call, 0) &&
-                        !call_result_static_given_args(c, call)) {
+                    /* skip the taint when the call result is provably static given
+                     * the args — `g = lookup(local)` (lookup returns a global) /
+                     * `g = second(local, global)` (returns the global param). */
+                    if (call_result_escapes(c, call)) {
                         sym->is_local_derived = true;
                     }
                 }
@@ -11361,8 +11394,7 @@ static void check_stmt(Checker *c, Node *node) {
              * return identity(identity(&x)) must also be caught. */
             if (node->ret.expr->kind == NODE_CALL &&
                 ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
-                if (call_has_local_derived_arg(c, node->ret.expr, 0) &&
-                    !call_result_static_given_args(c, node->ret.expr)) {  /* Stage 1: static return is safe */
+                if (call_result_escapes(c, node->ret.expr)) {
                     checker_error(c, node->loc.line,
                         "cannot return result of call with local-derived pointer argument — "
                         "stack memory may escape through function return");
@@ -11380,8 +11412,7 @@ static void check_stmt(Checker *c, Node *node) {
                     else rroot = rroot->index_expr.object;
                 }
                 if (rroot && rroot->kind == NODE_CALL) {
-                    if (call_has_local_derived_arg(c, rroot, 0) &&
-                        !call_result_static_given_args(c, rroot)) {  /* Stage 1: static return is safe */
+                    if (call_result_escapes(c, rroot)) {
                         checker_error(c, node->loc.line,
                             "cannot return pointer extracted from call with local-derived "
                             "argument — stack memory may escape through struct field");

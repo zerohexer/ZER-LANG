@@ -1,0 +1,29 @@
+// EXPECTED: compile error
+// Keep-inference precision must NOT lose the OTHER escape path. The result-launder
+// refinement skips the scratch position (param 0, not returned), but `idfn` retains
+// `scratch` INTERNALLY (passes it to `keeper`, which stores it). That makes idfn's
+// param 0 keep, which propagates to `caller`'s param `a` via the keep-call-site
+// transitivity — so `caller(&local, ...)` is still rejected. Proves the refinement
+// only drops the result-launder path, not the internal-retention path.
+?*u32 g_kept;
+void keeper(*u32 x) { g_kept = x; }          // retains x -> x is keep
+
+u32 g_glob;
+?*u32 g_result;
+
+// retains scratch (via keeper) AND returns keep_me. mask = {1}, but param 0 is keep.
+*u32 idfn(*u32 scratch, *u32 keep_me) {
+    keeper(scratch);                          // scratch retained internally -> idfn param 0 keep
+    return keep_me;
+}
+
+void caller(*u32 a, *u32 b) {
+    g_result = idfn(a, b);                    // a passed to idfn's keep param 0 -> a inferred keep (transitivity)
+}
+
+u32 main() {
+    u32 local = 5;
+    g_glob = 9;
+    caller(&local, &g_glob);                  // a=&local, but a is keep -> ERROR
+    return 0;
+}

@@ -141,7 +141,15 @@ not `type_carries_data_pointer` on struct/union values; the whole-struct store
 
 ---
 
-## OPEN — unify call-result provenance (refactor; the durable fix for BUG-760..763's class)
+## RESOLVED (2026-06-22e) — unified call-result provenance (the durable fix for BUG-760..763's class)
+
+**Status: RESOLVED.** Stages 1-3 + the tail closed every call-result over-rejection,
+fixed a shadowing UAF, added per-param + keep-inference precision, and centralized the
+policy into `call_result_escapes`. The detail below is kept for history (the per-sink
+patchwork class and the staged plan); the only intentionally-declined item is the
+compute-once-cache-on-node optimization (see the end). No open over-rejection or safety
+gap remains in this subsystem.
+
 
 **Pattern (2026-06-22):** the return-borrow-from-param investigation surfaced FOUR
 escape holes (BUG-760 store/return call-launder, BUG-761 slice-param keep inference,
@@ -220,18 +228,22 @@ args regardless (moot). Tests: `tests/zer/escape_keep_static_call_result_ok.zer`
 **What's deliberately NOT unified (different axis):** the keep-INFERENCE site (~4241,
 `call_has_nonkeep_derived_arg`) asks "does the result launder non-keep param p?", NOT
 "is the result static?" — gating it with `call_result_static_given_args` would
-UNDER-infer keep (a function returning its non-keep param looks static to the local
-check but still launders it = a safety hole). A precise keep-INFERENCE refinement
-(use `ret_param_mask` to infer keep on p only if the function may actually return the
-arg position p was passed to) is a possible future item — separate from this entry.
+UNDER-infer keep. **DONE (2026-06-22e):** the keep-INFERENCE precision shipped via the
+RIGHT query — `infer_keep_from_call_args` uses `ret_param_mask` to infer keep on the arg
+at position i only if the callee may actually RETURN position i (the result-launder
+path); the internal-retention escape path stays covered by the keep-call-site
+transitivity. Tests: `tests/zer/keep_infer_scratch_not_kept_ok.zer`,
+`tests/zer_fail/keep_infer_internal_keep_transitivity.zer`.
 
-**Optional remainder (code structure, no behavior change):** the UNDER-rejection guard
-(`call_has_local_derived_arg`/`arg_is_local_derived`) is still CALLED per-sink rather
-than computed once and cached on the node. The behavioral over-rejection is closed at
-all sinks; the compute-once-store-on-node refactor is a pure optimization (it would
-also let the per-sink callers read a flag instead of re-walking) — low value now that
-the query is shared. This entry is behaviorally RESOLVED; keep only as a pointer to the
-optional refactor.
+**Policy centralization DONE (2026-06-22e):** the five call-result sinks now consult ONE
+function `call_result_escapes(c, call)` (= `call_has_local_derived_arg` AND
+`!call_result_static_given_args`) instead of repeating the two-part predicate — the
+escape policy lives in a single place. The literal compute-once-CACHE-on-node variant was
+deliberately NOT done: it's a no-behavior-change optimization that adds stale-cache risk
+to safety analysis (a stale region = under-rejection = UAF) for marginal compile-time
+gain, and the re-walk it would save is trivial (a handful of args at check time). **This
+entry is RESOLVED** — no open over-rejection, no safety gap, policy centralized; the
+node-cache is intentionally declined.
 
 ---
 

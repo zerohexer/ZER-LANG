@@ -1,0 +1,32 @@
+// Keep-inference precision (2026-06-22, uses ret_param_mask): the result-launder
+// keep inference (`g = idfn(p)` makes p keep) now fires only for the arg positions
+// the callee MAY actually RETURN. `idfn` returns `keep_me` (param 1), never
+// `scratch` (param 0), so laundering its result to a global escapes only keep_me —
+// `scratch` is NOT inferred keep, and `caller` may pass a local for that position.
+// Grounded by param_lattice.v (the result aliases param n only if n is in the mask).
+
+u32 g_glob;
+?*u32 g_result;
+
+// returns keep_me (param 1) only; writes through scratch (param 0) but never returns it.
+*u32 idfn(*u32 scratch, *u32 keep_me) {
+    *scratch = 1;
+    return keep_me;
+}
+
+// stores idfn's RESULT to a global. Only the returned position (b) escapes -> only b
+// is inferred keep; a (the scratch position) stays non-keep.
+void caller(*u32 a, *u32 b) {
+    g_result = idfn(a, b);
+}
+
+u32 main() {
+    u32 local = 5;               // a LOCAL for the scratch position (not kept)
+    g_glob = 9;
+    caller(&local, &g_glob);     // a=&local OK (scratch not keep), b=&g_glob static
+    if (local != 1) { return 1; } // scratch was written through
+    if (g_result) |p| {
+        if (*p != 9) { return 2; }
+    }
+    return 0;
+}

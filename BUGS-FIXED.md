@@ -621,6 +621,39 @@ refactor in limitations.md.
 
 ---
 
+## Session 2026-06-22e — Escape precision tail: keep-inference refinement + policy centralization
+
+### FEATURE — keep-INFERENCE uses `ret_param_mask` (result-launder precision)
+
+The result-launder keep inference (`g = idfn(p)` makes p keep — `infer_keep_from_call_args`)
+now fires only for the arg positions the callee MAY actually RETURN. `g = idfn(scratch,
+keep_me)` where idfn returns keep_me (param 1), never scratch (param 0), launders only
+keep_me via the result — `scratch` is no longer inferred keep, so the caller may pass a
+local for that position. **Soundness:** the OTHER escape path (idfn RETAINING scratch
+internally) is covered independently by the keep-call-site transitivity at the same call
+(idfn's param 0 becomes keep, propagating to the caller's param) — verified by
+`tests/zer_fail/keep_infer_internal_keep_transitivity.zer` (still rejects). Conservative:
+an incomplete callee summary treats every position as maybe-returned (no under-inference).
+This is the keep-axis analog of the Stage 2 `PARAM(n)` precision. Tests:
+`tests/zer/keep_infer_scratch_not_kept_ok.zer` (+ the negative above).
+
+### REFACTOR (No-Debt) — `call_result_escapes`: one escape policy for all five sinks
+
+The five call-result sinks (var-decl taint, assignment, return-of-call, return-field,
+keep-call) all repeated the same two-part predicate
+`call_has_local_derived_arg(X) && !call_result_static_given_args(X)`. Extracted into one
+`call_result_escapes(c, call)` (the UNDER-rejection guard AND the OVER-rejection skip),
+so the escape policy lives in a single place — a future policy change touches one
+function, not five. Behavior-preserving (the adversarial matrix + full `make check`
+unchanged). This is the safe form of the "unify call-result provenance" durable fix; the
+literal compute-once-cache-on-node variant was deliberately NOT done — it's a no-behavior
+optimization that adds stale-cache risk to safety analysis for marginal compile-time gain
+(see docs/limitations.md).
+
+`make check` GREEN (Rust 784/0, Zig 36/0, shape-matrix 50/50, fuzz 200, all 4 audit gates).
+
+---
+
 ## Session 2026-06-22d — Escape precision Stage 3: keep-call sink onto the unified query
 
 ### FEATURE — the keep-call sink now consults `call_result_static_given_args`

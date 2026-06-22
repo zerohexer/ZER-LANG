@@ -11273,6 +11273,18 @@ spawn rejects non-shared pointer args regardless. **Do NOT gate the keep-INFEREN
 (~4241, `call_has_nonkeep_derived_arg`)** — it's a different axis ("does the result
 launder non-keep param p?", not "is the result static?"); gating it would UNDER-infer
 keep (a function returning its non-keep param looks static to the local check but still
-launders it = a safety hole). A precise keep-inference refinement via `ret_param_mask`
-(infer keep on p only if the function may return the position p was passed to) is a
-possible future item.
+launders it = a safety hole).
+
+**Escape PRECISION tail (2026-06-22e).** Two finishing items. (1) **keep-INFERENCE
+precision** — `infer_keep_from_call_args` now uses `ret_param_mask`: `g = idfn(scratch,
+keep_me)` infers keep only on the positions idfn MAY return (keep_me), not scratch. Sound
+because the internal-retention path (idfn keeping scratch) is covered by the keep-call-site
+transitivity at the same call — so dropping the result-launder inference for a
+provably-not-returned position never under-infers. This is the keep-axis analog of the
+Stage 2 PARAM(n) precision. (2) **policy centralization** — the five call-result sinks now
+call ONE `call_result_escapes(c, call)` (= `call_has_local_derived_arg` AND
+`!call_result_static_given_args`) instead of repeating the two-part predicate; **any new
+call-result sink must use this helper, not re-inline the predicate.** The literal
+compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape analysis
+= under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
+The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.

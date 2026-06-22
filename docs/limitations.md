@@ -36,6 +36,37 @@ cross-compilation needs a cross-gcc the bundle doesn't ship.
 
 ---
 
+## OPEN — struct-wrapped-slice launder escapes via a call result (UAF, pre-existing; MED)
+
+**Symptom (verified 2026-06-22 by the escape-sink enumeration's adversarial pass):**
+a function that returns a STRUCT BY VALUE wrapping a pointer/slice PARAM, called with
+a LOCAL, then has its field extracted and stored to a global, escapes undetected:
+```
+struct View { [*]u8 data; }
+[*]u8 g_ptr;
+View get_view([*]u8 s) { View v = { .data = s }; return v; }   // compiles (param wrap — fine)
+void caller() { u8[10] buf; View v2 = get_view(buf[0..10]); g_ptr = v2.data; }  // ESCAPES
+```
+`v2.data` points into `buf`; `g_ptr = v2.data` is not flagged. (The DIRECT case —
+returning a struct wrapping the function's OWN local — IS caught: `v` becomes
+local-derived. The gap is only the call-RESULT propagation.)
+
+**Root cause:** the var-decl provenance that marks `t` local-derived from
+`t = f(local)` (via `call_has_local_derived_arg`) is gated on the return type being a
+POINTER/SLICE — a STRUCT return wrapping a pointer/slice is not tagged, so `v2` stays
+clean and the later `g_ptr = v2.data` isn't caught. Same family as BUG-760/761 (call
+result provenance), one level up (struct-wrapped).
+
+**Fix sketch:** extend the var-decl + store-result-of-call provenance so a call whose
+return type is a STRUCT/UNION that `type_carries_data_pointer`, made with a
+local-derived/slice arg, marks the result local-derived (mirrors the scalar
+pointer/slice path; reuses `call_has_local_derived_arg` + `type_carries_data_pointer`).
+Conservative — only rejects more. **NOT yet implemented.** Orthogonal to the
+return-borrow-from-param relaxation below (that relaxation's DIRECT sinks are all
+covered; this struct-wrap path is a separate, narrower pre-existing pattern).
+
+---
+
 ## OPEN — return-borrow-from-param over-rejection (expressiveness, NOT safety; LOW)
 
 **Symptom (verified 2026-06-22):** returning a sub-slice or `&`-element of a

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// A slice of a LOCAL array, laundered through a function call and stored to a
+// global, escapes — the returned slice still points into the local's stack
+// storage, which dangles when leak() returns. Was a hole: call_has_local_derived_arg
+// recognized &local and bare local idents but not a NODE_SLICE arg (local[0..16]).
+[*]u8 g_slice;
+[*]u8 ident([*]u8 s) { return s; }
+void leak() {
+    u8[16] local;
+    g_slice = ident(local[0..16]);   // launder local's stack pointer to a global
+}
+u32 main() { leak(); return 0; }

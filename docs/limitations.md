@@ -36,6 +36,39 @@ cross-compilation needs a cross-gcc the bundle doesn't ship.
 
 ---
 
+## OPEN — return-borrow-from-param over-rejection (expressiveness, NOT safety; LOW)
+
+**Symptom (verified 2026-06-22):** returning a sub-slice or `&`-element of a
+slice/pointer PARAMETER is rejected outright — `[*]u8 trim([*]u8 s){ return
+s[i..j]; }` and `*u8 first([*]u8 s){ return &s[0]; }` both error `"cannot return
+pointer to local 's'"`, regardless of `const`, `[]u8` vs `[*]u8`, or literal vs
+variable bounds. So slice/string helpers that return a view into their input
+(`trim`/`split`/`find`) can't be written; `lib/str.zer`'s `bytes_trim*` do NOT
+compile. (This is the ZER analog of Rust's `fn f<'a>(s:&'a[u8])->&'a[u8]`, which
+Rust expresses with a lifetime param.)
+
+**Root cause:** the return-escape `sliced_borrow` promotion (checker.c ~11016)
+promotes region STATIC→LOCAL for *any* non-static non-global root, which wrongly
+includes a slice/pointer param (whose pointee is the CALLER's memory, not the
+frame). The `&expr` return path (~10951) rejects `&s[0]` the same way. It is
+**safe (conservative reject), never a UAF** — it errs toward rejection.
+
+**Why it's only LOW / not rushed:** relaxing it safely requires the call-result
+provenance to catch every escape *through* such a function at the call site. The
+core of that (store + return sinks for `f(local[..])`, one-step AND two-step) was
+**fixed in BUG-760**. The safe relaxation is then: in the promotion + `&expr`
+paths, do NOT promote when the root symbol's type is a SLICE/POINTER (external
+pointee) — only promote ARRAY/STRUCT roots (frame storage); the `is_local_derived`
+bit already flags a slice LOCAL that points to a local, so it stays rejected.
+**Remaining prerequisite before relaxing:** audit the OTHER escape sinks
+(keep-param pass-through `keepfn(f(local[..]))`, Pool/Slab store, struct-field of a
+global) to confirm each also catches a call-laundered local — only the
+store-to-global / return / store-to-param-field sinks are verified so far. Once all
+sinks are confirmed, the relaxation is a ~10-line change in the two return-escape
+sites. This is the "infer what Rust annotates (the `'a`)" enhancement.
+
+---
+
 ## CLOSED — 6u360k audit (2026-06-09): all 8 gaps fixed (BUG-734..741)
 
 All 8 silent gaps from branch `claude/cool-johnson-6u360k` are closed and

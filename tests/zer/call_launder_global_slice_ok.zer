@@ -1,0 +1,12 @@
+// Passing a slice of a GLOBAL array through a call and storing to another global is
+// safe — no stack memory escapes (global storage lives for the whole program). The
+// hole fix must stay precise: only LOCAL-derived slice args are flagged.
+[*]u8 g_dst;
+u8[16] g_src;
+[*]u8 ident([*]u8 s) { return s; }
+u32 main() {
+    g_src[0] = 7;
+    g_dst = ident(g_src[0..16]);   // global source — no escape, allowed
+    if (g_dst.len != 16) { return 1; }
+    return 0;
+}

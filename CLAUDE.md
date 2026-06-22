@@ -1185,7 +1185,7 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 3. **`const []u8` return type requires parser lookahead.** `const` and `volatile` at global scope trigger var-decl parsing. The parser now peeks ahead to detect function declarations. Works as of this session — but if adding new qualifier keywords, they need the same lookahead treatment.
 
-4. **Functions returning sub-slices of `const` input must return `const []u8`.** `bytes_trim(const []u8 s) → []u8` fails — the sub-slice inherits const. Return type must be `const []u8`.
+4. **Returning a sub-slice/view of a slice/pointer PARAMETER is currently REJECTED by escape analysis** — `[*]u8 f([*]u8 s){ return s[i..j]; }` (and `return &s[i]`) errors `"cannot return pointer to local 's'"`, regardless of `const`/`[]u8` vs `[*]u8`/literal vs variable bounds. (Verified 2026-06-22; the older note here claiming `const []u8` return makes it work was WRONG — `lib/str.zer`'s `bytes_trim*` do NOT compile.) Root cause: the return-escape promotion (checker.c ~11016) treats a slice/pointer param as frame-owned. Workaround: return an INDEX or `(start,len)` and let the caller reconstruct `buf[start..len]` (the caller owns `buf`). This over-rejection (and the planned safe relaxation via call-result provenance) is tracked in `docs/limitations.md`. NOTE: the related call-launder UAF hole (`g = f(local[0..n])`) was FIXED 2026-06-22 (BUG-760).
 
 5. **C macros (stderr, stdout) are NOT accessible from ZER.** They're preprocessor symbols, not variables. Wrap them in a C helper function in a `.h` file: `static inline FILE *zer_get_stderr(void) { return stderr; }`. Then `cinclude` the header and declare the function in ZER.
 

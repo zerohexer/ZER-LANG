@@ -444,6 +444,39 @@ B4 (once loser-wait), B5 (defer lock) — all closed.
 
 ---
 
+### BUG-760 — call-laundered local-slice escapes a function call undetected (escape analysis)
+
+**What broke (UAF, pre-existing, found 2026-06-22 while investigating the
+return-borrow-from-param trade-off):** `call_has_local_derived_arg` (checker.c) —
+the conservative proxy used by the store-escape (`g = call(...)`) and return-escape
+(`return call(...)`) checks — recognized `&local`, a bare local ident, a local
+array, a nested pointer-returning call, and orelse fallbacks, but **NOT a
+`NODE_SLICE`/`NODE_INDEX` arg**. So the idiomatic `f(local[0..n])` slipped through:
+```
+[*]u8 g;  [*]u8 ident([*]u8 s){ return s; }
+void leak(){ u8[16] a; g = ident(a[0..16]); }   // compiled clean — g now dangles
+```
+A slice of a stack array, laundered through any param-returning function, escaped
+to a global undetected → use-after-free when the frame is freed. The direct
+`g = a[0..16]` was caught; wrapping it in *any* call erased the provenance.
+
+**Fix:** add a `NODE_SLICE`/`NODE_INDEX` case to `call_has_local_derived_arg` — walk
+the slice/index/field chain to the root ident and flag it if the root is a local
+array or a local-derived binding (`type_dispatch_kind` for the array test).
+Conservative (only rejects more). **Closes BOTH the one-step (`g = f(local[..])`)
+AND the two-step (`t = f(local[..]); g = t`)** — the var-decl provenance uses the
+same helper, so `t` is now correctly tagged local-derived and the later `g = t` is
+caught. Tests: `tests/zer_fail/call_launder_slice_escape.zer` (rejected),
+`tests/zer/call_launder_global_slice_ok.zer` (global source — correctly allowed).
+Full `make check` GREEN: ZER 799, all 5 audits OK; no regressions.
+
+**Related — NOT fixed here, tracked in limitations.md:** the *over-rejection* dual
+(returning a sub-slice/view of a slice/pointer PARAM, e.g. `trim([*]u8 s){return
+s[i..j];}`, is rejected entirely). The call-result provenance fixed here is the
+prerequisite for safely relaxing that — see "OPEN — return-borrow-from-param".
+
+---
+
 ### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
 
 **What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a

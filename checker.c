@@ -909,6 +909,30 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
                 if (!src->is_static && !is_global) return true;
             }
         }
+        /* slice/index of a local: f(arr[a..b]) / f(arr[i]) / f(s.f[a..b]) where the
+         * root is a local array or local-derived binding. Was a HOLE: a NODE_SLICE
+         * arg (the idiomatic `f(local[0..n])`) fell through every case above, so
+         * `g = f(local[0..n])` laundered a stack pointer to a global undetected. */
+        if (arg->kind == NODE_SLICE || arg->kind == NODE_INDEX) {
+            Node *root = arg;
+            while (root && (root->kind == NODE_SLICE ||
+                            root->kind == NODE_INDEX || root->kind == NODE_FIELD)) {
+                if (root->kind == NODE_SLICE) root = root->slice.object;
+                else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+                else root = root->field.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                Symbol *src = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                bool is_global = scope_lookup_local(c->global_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                if (src && !src->is_static && !is_global &&
+                    (src->is_local_derived ||
+                     (src->type &&
+                      type_dispatch_kind(src->type) == TYPE_ARRAY)))
+                    return true;
+            }
+        }
         /* nested call returning pointer — recurse */
         if (arg->kind == NODE_CALL) {
             Type *arg_type = typemap_get(c, arg);

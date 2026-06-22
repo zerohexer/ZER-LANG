@@ -11217,3 +11217,25 @@ sinks on every change. Use the **read-only sink-enumeration workflow** (3 Explor
 agents: storage-class top-down, checker-code bottom-up, adversarial missed-sink hunt;
 NO compilation) when asking "is this analysis complete?" — it found BUG-762's class
 this session.
+
+**Escape PRECISION Stage 1 — `returns_static` (2026-06-22b, the inverse direction).**
+The sinks above prevent UNDER-rejection (catch every escape). The over-rejection went
+the other way: `g = lookup(local)` where `lookup` returns a GLOBAL was rejected because
+`call_has_local_derived_arg` taints the result on ANY local arg, ignoring what the
+callee returns. Fix: a per-function summary `Symbol.returns_static` (true iff every
+valued return aliases no param/no local — rooted at global/static or `null`), consulted
+via `call_returns_static` to SKIP the taint at all four direct-call-result sinks
+(var-decl/assign/return/return-field). **Design note for any future summary like this:
+use an ACCUMULATOR, not a standalone body-scanner.** `returns_static` is computed by
+`Checker.cur_returns_static` (set true at func-body-check entry, ANDed false at each
+non-static valued return in the `NODE_RETURN` handler) — NOT a `find_return_range`-style
+recursion. Two reasons, both soundness-critical (a missed non-static return =
+under-rejection = UAF): (1) a standalone statement-recursion MISSES returns inside
+`orelse { return X; }` blocks (the fallback is checked via `check_stmt` at the
+NODE_ORELSE handler, emitter side — not a statement child of the body); the accumulator
+hooks that exact traversal so it can't miss one. (2) the accumulator runs DURING body
+check when params/locals are in scope (`return_expr_is_static` can identify a param
+root), whereas a post-body scan runs after the body scope is popped. The summary
+defaults false (bodyless externs, recursion, anything unprovable) → conservative.
+Grounded by `param_lattice.v` (ARStatic; T1/T4 = no under-rejection). Stage 2 (the
+durable fix above) generalizes `returns_static` to the per-param `ARParam n`.

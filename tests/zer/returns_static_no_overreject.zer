@@ -1,0 +1,42 @@
+// Stage 1 escape precision (returns_static, 2026-06-22): a function that returns
+// a GLOBAL (its return aliases no parameter and no local) may have its result
+// stored into a global even when called with a LOCAL-derived argument — the
+// result aliases the global table, not the caller's local. This was over-rejected
+// before Stage 1 (the call-result was tarred local-derived whenever ANY arg was
+// local-derived, regardless of what the callee returns). Covers BOTH escape sinks
+// the over-rejection touched: the direct assignment and the var-decl->global-store.
+// Grounded by proofs/operational/lambda_zer_escape/param_lattice.v (T3).
+
+u32[8] g_table;
+
+// takes a pointer to a caller local, returns a pointer INTO the global table —
+// provably STATIC (root = g_table, a global), NOT a view of `sel`. So a
+// local-derived `&idx` argument does NOT taint the result.
+*u32 lookup(*u32 sel) {
+    return &g_table[*sel % 8];
+}
+
+?*u32 g_result;
+?*u32 g_result2;
+
+u32 main() {
+    u32 idx = 3;              // a LOCAL
+    g_table[3] = 42;          // *sel = 3  ->  g_table[3 % 8] = g_table[3]
+
+    // assignment sink: &idx is local-derived, but lookup returns static, so
+    // storing the result into a global is allowed (was an error before Stage 1).
+    g_result = lookup(&idx);
+
+    // var-decl -> store sink: `r` is not tainted (callee returns static), so it
+    // too can be stored into a global.
+    *u32 r = lookup(&idx);
+    g_result2 = r;
+
+    u32 a = 0;
+    u32 b = 0;
+    if (g_result) |p| { a = *p; }
+    if (g_result2) |q| { b = *q; }
+    if (a != 42) { return 1; }
+    if (b != 42) { return 2; }
+    return 0;
+}

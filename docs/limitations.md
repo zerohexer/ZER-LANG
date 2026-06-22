@@ -179,10 +179,25 @@ gratuitously rejects an `ARStatic`-returning callee on a local-containing call, 
 the new analysis allows it AND is sound; (T4) `new_never_underrejects` — a true-LOCAL
 result is never permitted to escape. The finite states the implementation must track
 are exactly `{STATIC, LOCAL, ARENA}` + `PARAM(n)` + join + the call-site
-substitution. **Stageable:** Stage 1 = add a `returns_static` summary bit (kills the
-unrelated-static over-rejection at checker.c:9937 in ~a few lines, covered by the
-existing 3-region proof); Stage 2 = the full per-param `PARAM(n)` summary +
-substitution unifying every sink (this entry's durable fix).
+substitution.
+
+**Stage 1 SHIPPED (2026-06-22b, see BUGS-FIXED.md):** `Symbol.returns_static` — a
+per-function summary (true iff every valued return aliases no param/no local, rooted
+at a global/static or `null`), computed by an accumulator (`Checker.cur_returns_static`,
+ANDed at each return in the `NODE_RETURN` handler — sound by construction, catches
+`orelse`-block returns and runs in-scope). `call_returns_static` gates ALL FOUR
+direct-call-result sinks (var-decl taint ~9958, assignment error ~4315, return-of-call
+~11308, return-field ~11326). This kills the **unrelated-static** over-rejection
+(`g = lookup(local)` where lookup returns a global). Conservative: defaults false → no
+under-rejection (T4); a param-returning function stays tainted. Tests:
+`tests/zer/returns_static_no_overreject.zer`,
+`tests/zer_fail/returns_param_still_rejected.zer`.
+
+**Stage 2 (REMAINING)** = the full per-param `PARAM(n)` summary + call-site
+substitution — kills **multi-param-pick** (`longest(local, global)` returning the
+global arg) AND unifies every sink (store/return/keep/struct-field/spawn) into one
+lattice query (this entry's durable fix). Stage 1's `returns_static` is the `ARStatic`
+special case of that summary; Stage 2 generalizes it to `ARParam n`.
 
 ---
 

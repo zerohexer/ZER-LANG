@@ -621,6 +621,53 @@ refactor in limitations.md.
 
 ---
 
+## Session 2026-06-22b — Escape precision Stage 1: `returns_static` (theorem-grounded)
+
+### FEATURE — `returns_static` summary kills the unrelated-static over-rejection
+
+**What it fixes (over-rejection, NOT a safety hole):** `g = lookup(local)` where
+`lookup` returns a GLOBAL (`return &g_table[...]`) was rejected — the call-result was
+tarred `is_local_derived` whenever ANY argument was local-derived, regardless of what
+the callee actually returns (`call_has_local_derived_arg` is a conservative proxy,
+checker.c ~880). But a function that returns a STATIC value cannot carry the caller's
+frame memory, so a local-derived arg is irrelevant. This blocked the everyday
+lookup-returns-global pattern for zero safety gain.
+
+**Theorem-first:** grounded by `proofs/operational/lambda_zer_escape/param_lattice.v`
+(committed 92eb9497) — the `ARStatic` summary + T3 `precision_gain_unrelated_static`
+(old over-rejects, new allows AND is sound) + T4 `new_never_underrejects`.
+
+**Implementation (checker.c + types.h + checker.h):**
+- New per-function summary `Symbol.returns_static` — true iff EVERY valued return
+  aliases no param and no local (rooted at a global/static, or `null`).
+- Computed by an ACCUMULATOR (`Checker.cur_returns_static`): set true at func-body-check
+  entry, ANDed false at each non-static valued return in the `NODE_RETURN` handler.
+  **Sound by construction** — it hooks the same traversal that validates every return,
+  so it sees `orelse { return X; }` block returns (checked via `check_stmt`, emitter.c
+  NODE_ORELSE) that a standalone AST scan would miss, and it runs IN-SCOPE (params
+  identifiable), unlike a post-body scan where the body scope is popped.
+  `return_expr_is_static` classifies one return; `call_returns_static` is the call-site
+  query.
+- Gates ALL FOUR direct-call-result escape sinks (the escape-sink-patchwork lesson —
+  fixing one ≠ fixing siblings): var-decl-init taint (~9958), assignment error (~4315),
+  return-of-call error (~11308), return-of-call-field error (~11326). Each skips the
+  taint/error when the callee `returns_static`.
+
+**Soundness:** conservative — `returns_static` defaults false (bodyless externs,
+recursion, any unprovable return), so the taint stays on unless provably static; no
+under-rejection (T4). A function returning a PARAMETER (a view of caller memory) is NOT
+static → its result stays tainted.
+
+**Verified:** `make check` GREEN (Rust 784/0, Zig 36/0, shape-matrix 50/50, fuzz 200,
+all 4 audit gates OK — incl. type-dispatch via `type_dispatch_kind`). Tests:
+`tests/zer/returns_static_no_overreject.zer` (lookup-returns-global compiles + runs,
+both assign + var-decl sinks), `tests/zer_fail/returns_param_still_rejected.zer`
+(param-return stays rejected — no under-rejection). Stage 2 (full per-param `PARAM(n)`
++ substitution, killing multi-param-pick + unifying all sinks) remains — see
+docs/limitations.md.
+
+---
+
 ## Session 2026-06-22 — Strict `*T`-indexing + interior-pointer deref UAF (BUG-765)
 
 ### FEATURE — indexing a single pointer `*T` is now a COMPILE ERROR (was a warning)

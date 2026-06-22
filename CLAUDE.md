@@ -174,7 +174,12 @@ nothing about the others. Shared proxy: `call_has_local_derived_arg` (checker.c 
 flags: `is_local_derived` / `is_arena_derived` / `is_nonkeep_derived`; keep enforcement
 is a DEFERRED fixpoint (`check_keep_inference`, after all bodies). The durable fix
 (unify call-result provenance → one lattice query per sink, incl. the relational
-`PARAM(n)` = inferred `'a`) is tracked in limitations.md. Full map +
+`PARAM(n)` = inferred `'a`) is tracked in limitations.md; **Stage 1 SHIPPED** —
+`Symbol.returns_static` (a per-function "returns no param/no local" summary,
+accumulated in the `NODE_RETURN` handler via `Checker.cur_returns_static`) and
+`call_returns_static` now gate ALL FOUR direct-call-result sinks, so the call result
+is NOT tainted when the callee provably returns a global/static (`g = lookup(local)`
+no longer over-rejected). Grounded by `param_lattice.v`. Full map +
 the read-only sink-enumeration workflow: compiler-internals.md "Escape & keep
 analysis". Returning a sub-slice/`&elem` of a slice/pointer PARAM is ALLOWED
 (BUG-764 relaxation); returning a view of a LOCAL is not.

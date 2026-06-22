@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Stage 1 must NOT under-reject: a function that returns its PARAMETER (a view of
+// the CALLER's memory — a PARAM region, not STATIC) keeps its call-result tainted,
+// so storing `g = trimview(local)` — where `local` escapes through the returned
+// view into a global — is still a dangling-pointer error. This proves the
+// returns_static summary distinguishes a param-return (false) from a global-return
+// (true): the precision gain never weakens the escape check. (No under-rejection;
+// param_lattice.v T4 new_never_underrejects.)
+[*]u8 trimview([*]u8 s) {
+    return s[1..3];          // returns a VIEW of the PARAM s — NOT static
+}
+
+?[*]u8 g_sink;
+
+u32 main() {
+    u8[4] local_buf;          // a LOCAL
+    local_buf[0] = 9;
+    g_sink = trimview(local_buf);   // local_buf escapes through the param view -> ERROR
+    return 0;
+}

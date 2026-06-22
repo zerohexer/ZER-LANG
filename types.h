@@ -293,6 +293,16 @@ struct Symbol {
     int64_t return_range_max;
     bool has_return_range;
 
+    /* cross-function escape summary (Stage 1, 2026-06-22): the function provably
+     * returns a STATIC value — every return aliases NO parameter and NO local
+     * (rooted at a global/static, or `null`). Lets the call-result taint at the
+     * escape sinks (var-decl/assign/return) be SKIPPED for `g = lookup(local)`:
+     * a static return cannot carry frame memory regardless of the args, so a
+     * local-derived arg does NOT taint the result. Grounded by
+     * lambda_zer_escape/param_lattice.v (ARStatic summary; T3/T4). Conservative:
+     * false unless EVERY return is provably static (never under-rejects). */
+    bool returns_static;
+
     /* module prefix for name mangling (NULL = main module) */
     const char *module_prefix;
     uint32_t module_prefix_len;

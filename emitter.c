@@ -4804,7 +4804,13 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#include <string.h>\n");
     emit(e, "#include <stdio.h>\n");
     emit(e, "#include <stdlib.h>\n");
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    /* wasm32-wasi defines __STDC_HOSTED__==1 (it has a libc) but lacks
+     * pthread/sched (WASI preview1 is single-threaded). Gate the POSIX-thread
+     * headers + helpers on !__wasi__ (clang defines __wasi__ for that target)
+     * so single-threaded ZER compiles to wasm; hosted (Linux/gcc) is
+     * unaffected since !defined(__wasi__) is true there. Concurrency under
+     * wasi stays unsupported (a loud undefined-symbol error at the use site). */
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
     emit(e, "#include <pthread.h>\n");
     emit(e, "#include <time.h>\n");
     emit(e, "#include <sched.h>\n");
@@ -4813,7 +4819,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* B4: @once loser-wait relax — yield so the winner (running the @once body)
      * makes progress while losers spin on the done flag. Hosted only; freestanding
      * @once stays single-core (loser does not wait). */
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
     emit(e, "static inline void _zer_once_relax(void) { sched_yield(); }\n");
     emit(e, "#endif\n");
     emit(e, "\n");
@@ -4951,7 +4957,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * call site (undefined function) — there is no portable lock primitive
      * ZER can fabricate without a runtime. */
     emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
     /* BUG-483: accept optional condvar pointer — init alongside mutex in CAS winner.
      * Fixes race where condvar init after ensure_init was always false. */
     emit(e, "static inline void _zer_mtx_ensure_init_cv(pthread_mutex_t *mtx, uint8_t *inited, pthread_cond_t *cond) {\n");
@@ -4978,7 +4984,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
 
     /* ZER thread barrier — portable (mutex + condvar, like Rust) */
     emit(e, "/* ZER thread barrier */\n");
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
     emit(e, "typedef struct {\n");
     emit(e, "    pthread_mutex_t mtx;\n");
     emit(e, "    pthread_cond_t cond;\n");
@@ -5063,7 +5069,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         emit(e, "}\n\n");
     } else {
         /* HOSTED mode (default) — current behavior with __STDC_HOSTED__ dispatch. */
-        emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1\n");
+        emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1 && !defined(__wasi__)\n");
         emit(e, "#include <setjmp.h>\n");
         emit(e, "#include <signal.h>\n\n");
         emit(e, "/* Universal memory fault handler — catches bad MMIO at runtime */\n");

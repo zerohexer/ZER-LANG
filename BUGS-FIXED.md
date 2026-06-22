@@ -669,6 +669,33 @@ cross-function too (`p = view(s); free(s); *p` is caught).
 
 ---
 
+### FEATURE — wasi-portable preamble (clang-wasi run pipeline, step 1)
+
+**What changed:** the emitted-C preamble's POSIX blocks (pthread/sched includes,
+mutex/barrier/semaphore helpers, the setjmp/signal MMIO-fault handler) were gated
+`#if __STDC_HOSTED__`. wasm32-wasi defines `__STDC_HOSTED__==1` (it has a libc), so
+those leaked in and broke compilation under wasi-sdk clang (`'pthread.h' file not
+found`). Added `&& !defined(__wasi__)` to those 5 gates (emitter.c ~4807-5066;
+clang defines `__wasi__` for the target). `_zer_trap` is LEFT on plain
+`__STDC_HOSTED__` (its `fprintf`+`abort` both work under wasi). Hosted (Linux/gcc)
+is byte-identical — `!defined(__wasi__)` is true there — so `make check` is GREEN
+(Rust 784/0, Zig 36/0, all audits).
+
+**Verified end-to-end (Docker, 2026-06-22):** a real ZER program → emitted C →
+`clang --target=wasm32-wasi -fwrapv` → wasm → run under node-WASI prints correct
+output + exit 0. The `-Wl,--wrap=malloc,...` Level-4 interception is also confirmed
+working under `wasm-ld` (LLD, since LLVM 9 / review D62380 — same `__wrap_`/`__real_`
+semantics as GNU ld). So the whole safety machinery is clang-portable; ZER's real
+safety is compile-time in `zerc` (compiler-agnostic). Single-threaded ZER runs under
+wasi; concurrency stays a WASI-preview1 limitation (no threads) — a loud
+undefined-symbol error at the use site, which is correct.
+
+**This is step 1 of the full clang-wasi VSIX run pipeline** (remaining: bundle a
+wasi-sdk subset + wire `lsp/zerc-cli.js` + `Dockerfile.vsix`). Full de-risk findings
++ test recipe: `docs/compiler-internals.md` "clang-wasi run pipeline".
+
+---
+
 ### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
 
 **What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a

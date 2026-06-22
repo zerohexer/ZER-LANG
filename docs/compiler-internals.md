@@ -10952,6 +10952,46 @@ multi-stage: stage 1 builds the wasm, stage 2 bundles it + a signed OpenJS
 signed `node.exe` and the reputable w64devkit toolchain. Open gaps (flags not
 plumbed, single-file only, macOS terminal CLI): `docs/limitations.md`.
 
+## clang-wasi run pipeline — de-risk findings + the `__wasi__` preamble gate (2026-06-22)
+
+DIRECTION (decided 2026-06-22): make the VS Code "run" pipeline fully WASM so NO
+unsigned native binary ever lands on the user's machine (kills the
+Windows-corporate Defender scan, on every OS). Pipeline: `zerc.wasm` (ZER→C,
+already WASM) → emitted C → **`clang --target=wasm32-wasi`** (wasi-sdk) →
+`app.wasm` → run in node's built-in WASI. Native GCC survives ONLY for explicit
+firmware/native cross-compiles (the user's own toolchain, not bundled).
+
+DE-RISK (all verified in Docker):
+- **`wasm-ld --wrap=malloc` WORKS** — the Level-4 malloc-interception flags
+  (`-Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc`) survive. `--wrap`
+  landed in wasm-ld in LLVM 9 (review D62380), same `__wrap_`/`__real_` semantics as
+  GNU ld. So the whole safety machinery is clang-portable: `-fwrapv` /
+  `-fno-strict-aliasing` are clang flags; GNU C extensions (stmt-exprs, `__typeof__`,
+  `__auto_type`, packed) are clang's GNU-C mode; `#pragma GCC optimize` is already
+  guarded `!__clang__` (falls back to the `-fwrapv` flag). ZER's real safety is
+  compile-time in `zerc` (compiler-agnostic) regardless.
+- **STEP 1 DONE — `__wasi__` preamble gate (emitter.c ~4807-5066).** The preamble's
+  POSIX blocks (pthread/sched includes, mutex/barrier/semaphore helpers, the
+  setjmp/signal MMIO-fault handler) were `#if __STDC_HOSTED__`. wasm32-wasi sets
+  `__STDC_HOSTED__==1` so they leaked → `'pthread.h' not found`. Added
+  `&& !defined(__wasi__)` to those 5 gates. `_zer_trap` LEFT on plain
+  `__STDC_HOSTED__` (fprintf+abort both work under wasi). Hosted byte-identical
+  (`!defined(__wasi__)` true) — `make check` GREEN. Verified: real emitted C → wasm
+  → node-WASI prints correct output + exit 0. Concurrency under wasi = unsupported
+  (WASI preview1 has no threads) → loud undefined-symbol at the use site (correct).
+- REMAINING (the build wiring): bundle a wasi-sdk subset (clang + wasm-ld +
+  wasi-sysroot) into the VSIX; rewire `lsp/zerc-cli.js` (`zer.wasm`→C, then
+  `clang-wasi`→wasm, then node-WASI run); update `Dockerfile.vsix`.
+
+TEST RECIPE (baked image `zer-wasi:latest` = `emscripten/emsdk:3.1.74` +
+`/opt/wasi-sdk-22.0`; rebuild via `docker run --name t emscripten/emsdk:3.1.74
+bash -lc 'cd /opt && curl -sL <wasi-sdk-22-linux.tar.gz> | tar xz' && docker commit
+t zer-wasi:latest && docker rm t`):
+- emit C with the `zer-check` image (`zerc x.zer -o /tmp/x.c`), then in `zer-wasi`:
+  `clang --target=wasm32-wasi -O2 -fwrapv -o p.wasm x.c` and run with
+  `node --experimental-wasi-unstable-preview1` using `new WASI({version:"preview1",
+  returnOnExit:true})` + `wasi.start(inst)` (exit code returned).
+
 ## `keep` auto-inference (System #21, since 2026-06-19)
 
 `keep` is no longer a required annotation — it is INFERRED, and the keyword is an

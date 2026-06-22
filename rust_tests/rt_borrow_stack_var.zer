@@ -16,6 +16,6 @@ u32 main() {
     arr[0] = 5;
 
     // p still points to same location (stack, same scope)
-    if (p[0] != 5) { return 1; }
+    if (*p != 5) { return 1; }
     return 0;
 }

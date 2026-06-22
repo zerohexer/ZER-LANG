@@ -16,14 +16,14 @@ struct Plugin {
 
 ?u32 filter_handler(const [*]u8 data, u32 threshold) {
     if (data.len == 0) { return null; }
-    u32 first = @truncate(u32, data.ptr[0]);
+    u32 first = @truncate(u32, data[0]);
     if (first < threshold) { return null; }
     return first;
 }
 
 ?u32 transform_handler(const [*]u8 data, u32 multiplier) {
     if (data.len == 0) { return null; }
-    return @truncate(u32, data.ptr[0]) * multiplier;
+    return @truncate(u32, data[0]) * multiplier;
 }
 
 u32 run_plugins(Plugin[MAX_PLUGINS()] plugins, const [*]u8 data) {

@@ -6,7 +6,7 @@ u32 g_val = 42;
 
 u32 read_ref(IntRef r) {
     *u32 raw = @cast(*u32, r);
-    return raw[0];
+    return *raw;
 }
 
 u32 main() {

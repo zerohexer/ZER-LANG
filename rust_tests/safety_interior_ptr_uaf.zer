@@ -11,6 +11,6 @@ u32 main() {
     b.value = 42;
     *u32 p = &b.value;
     heap.free_ptr(b);
-    u32 x = p[0];
+    u32 x = *p;
     return 0;
 }

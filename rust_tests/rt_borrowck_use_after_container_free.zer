@@ -8,10 +8,10 @@ Slab(List) slab;
 i32 main() {
     ?*List ml = slab.alloc_ptr();
     *List l = ml orelse return;
-    l[0].head = 1;
-    l[0].count = 5;
+    l.head = 1;
+    l.count = 5;
     slab.free_ptr(l);
     // l freed — accessing field = UAF
-    u32 c = l[0].count;
+    u32 c = l.count;
     return 0;
 }

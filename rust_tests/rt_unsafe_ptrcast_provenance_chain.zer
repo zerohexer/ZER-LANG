@@ -10,8 +10,8 @@ i32 main() {
     ?*Sensor ms = slab.alloc_ptr();
     *Sensor s = ms orelse return;
     defer slab.free_ptr(s);
-    s[0].id = 1;
-    s[0].reading = 42;
+    s.id = 1;
+    s.reading = 42;
 
     // *Sensor → *opaque — provenance = Sensor
     *opaque ctx = @ptrcast(*opaque, s);

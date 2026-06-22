@@ -2288,6 +2288,30 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
 
+    /* BUG-765 (2026-06-22): unary reads — `*p` (pointer deref) lowers to
+     * IR_UNOP carrying the NODE_UNARY on inst->expr (the dormant
+     * IR_DEREF_READ is never emitted). Dereferencing an INTERIOR pointer
+     * after its parent is freed (`*u32 p = &b.a; free(b); *p`) is a UAF,
+     * but IR_UNOP was a no-op here — only the INDEX form (`p[0]`,
+     * IR_INDEX_READ above) was checked, leaving the deref form a silent
+     * hole. Run the same UAF walker. ir_check_expr_uaf skips `&`
+     * (TOK_AMP = capture, not read) and reports nothing for non-handle
+     * operands, so this is also safe for `-x` / `!x` / `~x`. Sub-exprs are
+     * decomposed into their own ops, so `*p` is always its own IR_UNOP —
+     * no overlap with the IR_ASSIGN/IR_INDEX_READ walkers. */
+    case IR_UNOP: {
+        if (inst->expr) {
+            UafReportSet rs = {0};
+            ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            UafReportSet pool_rs = {0};
+            ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
+                                     inst->source_line, &pool_rs);
+            free(pool_rs.ids);
+            free(rs.ids);
+        }
+        break;
+    }
+
     case IR_FIELD_READ: {
         if (inst->expr && inst->expr->kind == NODE_FIELD) {
             /* Walk from full expression up to root, checking each prefix. */
@@ -4062,7 +4086,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_RING_PUSH_CHECKED:
     case IR_DEFER_PUSH: case IR_DEFER_FIRE:
     case IR_INTRINSIC:
-    case IR_BINOP: case IR_UNOP: case IR_LITERAL:
+    case IR_BINOP: case IR_LITERAL:
     case IR_ADDR_OF: case IR_DEREF_READ:
     case IR_CALL_DECOMP: case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP: case IR_SLICE_READ:

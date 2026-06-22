@@ -621,6 +621,54 @@ refactor in limitations.md.
 
 ---
 
+## Session 2026-06-22 — Strict `*T`-indexing + interior-pointer deref UAF (BUG-765)
+
+### FEATURE — indexing a single pointer `*T` is now a COMPILE ERROR (was a warning)
+
+**What changed (hardening):** `arr[i]` where `arr` is a non-volatile single pointer `*T`
+used to emit only a *warning* ("pointer indexing has no bounds check — use slice") and
+compile. A `*T` is ONE object with no length, so the index cannot be bounds-checked — the
+warning shipped a guaranteed silent-buffer-overflow path. It is now a hard compile error
+(checker.c ~6403) directing the user to `[*]T` (a slice — carries a length, bounds-checked)
+for a collection, or `*ptr` / `ptr.field` (deref) to read the single pointee. Volatile `*T`
+from `@inttoptr` is unaffected (MMIO path: bounds-checked against the `mmio` range).
+
+**Migration (our own tests — the only fallout, with no users):** ~40 `*T`-index sites
+across `test_production.c` (MODBUS/CRC/double-buffer/protocol firmware), the semantic
+fuzzer, the shape-matrix, and 35 `.zer` tests (rust_tests / zig_tests / tests/zer) moved
+to the honest op: `ptr[0]`→`*ptr`, `ptr[0].f`→`ptr.f`, `slice.ptr[i]`→`slice[i]` (restores
+the slice bounds check), and a genuine `*T`-as-array param → `[*]T` (array auto-coerces to
+a slice at the call site). The migrated firmware tests now demonstrate the safe `[*]T`
+pattern. Safety-table row updated (CLAUDE.md), user note added (reference.md `*T` section).
+
+### BUG-765 — deref of an interior pointer after free was NOT caught (silent UAF)
+
+**What broke (UAF, pre-existing, exposed by the strict-index change 2026-06-22):**
+`*u32 p = &b.a; free(b); u32 v = *p;` — dereferencing an interior pointer after its parent
+is freed — compiled CLEAN. The interior-pointer UAF check ran on `IR_FIELD_READ` (`b.a`)
+and `IR_INDEX_READ` (`p[0]`) but the DEREF form (`*p`) lowers to `IR_UNOP`, which sat in
+zercheck_ir's exhaustive no-op group and never ran the UAF walker. The old fuzzer/interior
+tests masked this by using `p[0]` (index), which the new strict-index error now rejects
+outright — so switching them to the honest `*p` surfaced the hole.
+
+**Root cause:** field / index / deref are the three "dangerous reads", and sub-expressions
+are decomposed so each gets its OWN op. `IR_FIELD_READ` and `IR_INDEX_READ` ran
+`ir_check_expr_uaf`; `IR_UNOP` (the deref) did not — the third leg of the trio was missing.
+
+**Fix (zercheck_ir.c):** give `IR_UNOP` the same `ir_check_expr_uaf` + `ir_check_expr_wrong_pool`
+walker that `IR_INDEX_READ` has (pulled out of the no-op group). `ir_check_expr_uaf` already
+handles `NODE_UNARY` (skips `&` = capture-not-read; recurses the operand for a deref), so
+`*p` of a freed interior pointer is now caught. Non-handle operands (`-x` / `!x` / `~x`)
+report nothing; deref-WRITE (`*p = x`) was already covered by the `IR_ASSIGN` walker. Holds
+cross-function too (`p = view(s); free(s); *p` is caught).
+
+**Over-rejection: zero** — full `make check` GREEN (Rust 784/0, Zig 36/0, shape-matrix
+50/50 with 0 false-neg / 0 over-reject, fuzz 200, all 5 audits). Tests:
+`tests/zer_fail/interior_ptr_deref_uaf.zer` (deref-after-free rejected),
+`tests/zer/interior_ptr_deref_ok.zer` (deref-before-free compiles + runs).
+
+---
+
 ### BUG-757 — &threadlocal stored in a global escapes the per-thread copy (Axis A5)
 
 **What broke (cross-thread UAF):** `g_ptr = &tl_var;` where `tl_var` is a

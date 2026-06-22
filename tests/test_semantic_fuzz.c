@@ -175,7 +175,7 @@ static void gen_safe_interior_ptr(char *buf, int id) {
     p += sprintf(p, "    *Blk%d b = mb orelse return;\n", id);
     p += sprintf(p, "    b.b = %d;\n", id * 13);
     p += sprintf(p, "    *u32 p = &b.b;\n");
-    p += sprintf(p, "    u32 val = p[0];\n");  /* use BEFORE free — safe */
+    p += sprintf(p, "    u32 val = *p;\n");  /* deref single ptr, use BEFORE free — safe */
     p += sprintf(p, "    heap%d.free_ptr(b);\n", id);
     p += sprintf(p, "    if (val != %d) { return 1; }\n", id * 13);
     p += sprintf(p, "    return 0;\n");
@@ -208,7 +208,7 @@ static void gen_unsafe_interior_uaf(char *buf, int id) {
     p += sprintf(p, "    b.a = 42;\n");
     p += sprintf(p, "    *u32 p = &b.a;\n");
     p += sprintf(p, "    iheap%d.free_ptr(b);\n", id);
-    p += sprintf(p, "    u32 val = p[0];\n"); /* UAF via interior ptr */
+    p += sprintf(p, "    u32 val = *p;\n"); /* UAF via interior ptr (deref after free) */
     p += sprintf(p, "    return val;\n");
     p += sprintf(p, "}\n");
 }

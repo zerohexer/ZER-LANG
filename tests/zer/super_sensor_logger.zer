@@ -25,7 +25,7 @@ u32 identity(u32 raw) {
 struct LogEntry { u32 sensor_id; u32 processed; bool over_threshold; }
 
 // Process a batch of samples, write results to arena scratch buffer
-u32 process_batch(*SensorConfig configs, u32 config_count,
+u32 process_batch([*]SensorConfig configs, u32 config_count,
                   Handle(Sample)[16] samples, u32 sample_count) {
     u32 alerts = 0;
 
@@ -103,7 +103,7 @@ u32 main() {
     batch_count += 1;
 
     // Process batch — expect 2 alerts (sensor 1 first reading + sensor 3)
-    u32 alerts = process_batch(&configs[0], 3, batch, batch_count);
+    u32 alerts = process_batch(configs, 3, batch, batch_count);
     if (alerts != 2) {
         sample_pool.free(s1);
         sample_pool.free(s2);

@@ -7,7 +7,7 @@ async void handler() {
     switch (m) {
         .val => |*v| {
             yield;
-            v[0] = 99;
+            *v = 99;
         }
         .code => { }
     }

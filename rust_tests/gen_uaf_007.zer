@@ -10,6 +10,6 @@ u32 main() {
     p.a = 10;
     *u32 field_ptr = &p.a;
     heap.free_ptr(p);
-    u32 v = field_ptr[0];
+    u32 v = *field_ptr;
     return v;
 }

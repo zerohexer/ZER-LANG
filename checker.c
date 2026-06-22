@@ -6401,10 +6401,21 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             if (!ptr_proven && !obj->pointer.is_volatile) {
-                checker_warning(c, node->loc.line,
-                    "pointer indexing has no bounds check — "
-                    "use []%s (slice) for bounds-checked access",
-                    type_name(obj->pointer.inner));
+                /* A non-volatile `*T` is ONE object with no length, so indexing it
+                 * as an array can never be bounds-checked — it is either silent
+                 * memory corruption (overrun into mapped memory) or a raw fault.
+                 * Statically-known-unsafe with no tracking that can rescue it (the
+                 * length simply isn't stored) → a compile ERROR is the honest call,
+                 * not a warning that ships the hole. Use `[*]T` (a slice: carries a
+                 * length, bounds-checked). Volatile `*T` (MMIO) is handled above and
+                 * bounds-checked against the `mmio` declaration. */
+                const char *inner = type_name(obj->pointer.inner);
+                checker_error(c, node->loc.line,
+                    "cannot index a single pointer '*%s' as an array — `*T` is one "
+                    "object and carries no length, so this access cannot be "
+                    "bounds-checked (it would be a silent buffer overflow). Use "
+                    "'[*]%s' (a slice — it carries a length and is bounds-checked).",
+                    inner, inner);
             }
             result = obj->pointer.inner;
         } else {

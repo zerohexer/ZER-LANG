@@ -16,7 +16,7 @@ u32 main() {
     *u32 pb = &b.b;
 
     // Read through interior pointers before free
-    u32 sum = pa[0] + pb[0];
+    u32 sum = *pa + *pb;
 
     // Free after use
     heap.free_ptr(b);

@@ -2,7 +2,7 @@
 u32 sum_slice(const [*]u32 data) {
     u32 total = 0;
     for (usize i = 0; i < data.len; i += 1) {
-        total = total + data.ptr[i];
+        total = total + data[i];
     }
     return total;
 }

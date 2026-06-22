@@ -11,6 +11,6 @@ u32 main() {
     *Config c = mc orelse return;
     *u32 mode_ptr = &c.mode;
     heap.free_ptr(c);
-    u32 x = mode_ptr[0];
+    u32 x = *mode_ptr;
     return x;
 }

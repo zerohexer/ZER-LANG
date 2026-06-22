@@ -5,7 +5,7 @@
 struct Work { u32 data; }
 
 void process(*Work w) {
-    w[0].data += 1;
+    w.data += 1;
 }
 
 i32 main() {

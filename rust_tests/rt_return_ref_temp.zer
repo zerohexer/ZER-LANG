@@ -10,5 +10,5 @@
 
 u32 main() {
     *u32 p = gimme_static_mut();
-    return p[0];
+    return *p;
 }

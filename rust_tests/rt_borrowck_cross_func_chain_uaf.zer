@@ -20,9 +20,9 @@ void shutdown(*Res r) {
 i32 main() {
     ?*Res mr = slab.alloc_ptr();
     *Res r = mr orelse return;
-    r[0].val = 99;
+    r.val = 99;
     shutdown(r);
     // r freed through 3-layer chain — UAF
-    u32 v = r[0].val;
+    u32 v = r.val;
     return 0;
 }

@@ -4,7 +4,7 @@ u32 global_ctx_val;
 
 void set_value(*opaque ctx, u32 val) {
     *u32 p = (*u32)ctx;
-    p[0] = val;
+    *p = val;
 }
 
 u32 main() {

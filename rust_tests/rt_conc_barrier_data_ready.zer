@@ -17,7 +17,7 @@ void writer(*Buffer b) {
 void reader(*Buffer b, *u32 out) {
     @barrier_wait(bar);
     // Writer guaranteed to have finished
-    out[0] = b.data[0] + b.data[1] + b.data[2] + b.data[3];
+    *out = b.data[0] + b.data[1] + b.data[2] + b.data[3];
 }
 
 i32 main() {

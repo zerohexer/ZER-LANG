@@ -10,7 +10,7 @@ void writer(*Database d) {
 }
 
 void reader(*Database d, *u32 out) {
-    out[0] = d.version;
+    *out = d.version;
 }
 
 i32 main() {

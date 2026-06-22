@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Dereferencing an interior pointer AFTER its parent is freed is a use-after-free.
+// `*u32 p = &b.a` makes p share b's alloc_id; freeing b marks p FREED, so `*p`
+// (deref) must be rejected — exactly like `p[0]` (index) and `b.a` (field) already
+// were. This closes the IR_UNOP deref hole (BUG-765): the deref of `*p` lowers to
+// IR_UNOP, which used to be a no-op in zercheck_ir, so only the index/field forms
+// ran the UAF walker and the deref form was a silent hole.
+struct B { u32 a; u32 b; }
+Slab(B) heap;
+u32 test() {
+    ?*B mb = heap.alloc_ptr();
+    *B b = mb orelse return;
+    b.a = 42;
+    *u32 p = &b.a;
+    heap.free_ptr(b);
+    u32 val = *p;        // UAF — deref of freed interior pointer
+    return val;
+}
+u32 main() { return test(); }

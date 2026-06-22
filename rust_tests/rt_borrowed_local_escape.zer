@@ -14,5 +14,5 @@ struct Pair { u32 first; u32 second; }
 
 u32 main() {
     *u32 x = get_first();
-    return x[0];
+    return *x;
 }

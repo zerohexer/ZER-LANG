@@ -11,7 +11,7 @@ void writer() {
 
 void reader(*u32 out) {
     while (@atomic_load(&flag) == 0) { }   // spin until flag set
-    out[0] = data;   // data guaranteed visible after flag
+    *out = data;   // data guaranteed visible after flag
 }
 
 i32 main() {

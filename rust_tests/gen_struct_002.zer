@@ -15,7 +15,7 @@ u32 main() {
     if (s != 30) { return 1; }
 
     *u32 px = &d.x;
-    px[0] = 99;
+    *px = 99;
     if (d.x != 99) { return 2; }
     return 0;
 }

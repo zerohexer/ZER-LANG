@@ -4,8 +4,8 @@
 struct Counters { u32 hits; u32 misses; u32 total; }
 
 void inc(*u32 p) {
-    u32 v = p[0];
-    p[0] = v + 1;
+    u32 v = *p;
+    *p = v + 1;
 }
 
 i32 main() {

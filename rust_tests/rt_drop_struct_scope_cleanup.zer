@@ -11,8 +11,8 @@ u32 adopt_and_release(u32 name) {
     ?*Cat mc = slab.alloc_ptr();
     *Cat c = mc orelse return;
     defer slab.free_ptr(c);
-    c[0].name = name;
-    return c[0].name;
+    c.name = name;
+    return c.name;
 }
 
 i32 main() {

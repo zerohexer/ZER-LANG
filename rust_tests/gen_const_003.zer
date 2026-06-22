@@ -1,7 +1,7 @@
 // Const: const pointer param — cannot write through
 
 u32 read_only(const *u32 p) {
-    return p[0];
+    return *p;
 }
 
 u32 main() {

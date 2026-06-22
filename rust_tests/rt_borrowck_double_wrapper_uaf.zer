@@ -16,9 +16,9 @@ void outer_destroy(*Data d) {
 i32 main() {
     ?*Data md = slab.alloc_ptr();
     *Data d = md orelse return;
-    d[0].val = 99;
+    d.val = 99;
     outer_destroy(d);
     // d freed through 2-layer wrapper chain — UAF
-    u32 v = d[0].val;
+    u32 v = d.val;
     return 0;
 }

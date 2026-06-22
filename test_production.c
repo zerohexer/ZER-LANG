@@ -94,7 +94,7 @@ static void test_modbus_crc(void) {
     printf("\n--- Production 1: MODBUS CRC-16 ---\n");
 
     test_e2e(
-        "u16 modbus_crc16(*u8 data, u32 length) {\n"
+        "u16 modbus_crc16([*]u8 data, u32 length) {\n"
         "    u16 crc = 0xFFFF;\n"
         "    for (u32 i = 0; i < length; i += 1) {\n"
         "        crc = crc ^ @truncate(u16, data[i]);\n"
@@ -114,7 +114,7 @@ static void test_modbus_crc(void) {
         "    data[1] = 0x03;\n"
         "    data[2] = 0x00;\n"
         "    data[3] = 0x00;\n"
-        "    u16 crc = modbus_crc16(&data[0], 4);\n"
+        "    u16 crc = modbus_crc16(data, 4);\n"
         "    if (crc == 0xD8F1) { return 0; }\n"
         "    return 1;\n"
         "}\n",
@@ -129,7 +129,7 @@ static void test_crc8(void) {
     printf("\n--- Production 2: CRC-8 (Sensirion) ---\n");
 
     test_e2e(
-        "u8 crc8(*u8 data, u32 len) {\n"
+        "u8 crc8([*]u8 data, u32 len) {\n"
         "    u8 crc = 0xFF;\n"
         "    for (u32 i = 0; i < len; i += 1) {\n"
         "        crc = crc ^ data[i];\n"
@@ -147,7 +147,7 @@ static void test_crc8(void) {
         "    u8[2] data;\n"
         "    data[0] = 0xBE;\n"
         "    data[1] = 0xEF;\n"
-        "    u8 crc = crc8(&data[0], 2);\n"
+        "    u8 crc = crc8(data, 2);\n"
         "    if (crc == 0x92) { return 0; }\n"
         "    return @truncate(u32, crc);\n"
         "}\n",
@@ -558,7 +558,7 @@ static void test_modbus_frame(void) {
     printf("\n--- Production 9: MODBUS frame ---\n");
 
     test_e2e(
-        "u16 modbus_crc(*u8 data, u32 len) {\n"
+        "u16 modbus_crc([*]u8 data, u32 len) {\n"
         "    u16 crc = 0xFFFF;\n"
         "    for (u32 i = 0; i < len; i += 1) {\n"
         "        crc = crc ^ @truncate(u16, data[i]);\n"
@@ -572,7 +572,7 @@ static void test_modbus_frame(void) {
         "    }\n"
         "    return crc;\n"
         "}\n"
-        "void build_frame(*u8 frame, u8 addr, u8 func, u16 start, u16 qty) {\n"
+        "void build_frame([*]u8 frame, u8 addr, u8 func, u16 start, u16 qty) {\n"
         "    frame[0] = addr;\n"
         "    frame[1] = func;\n"
         "    frame[2] = @truncate(u8, start >> 8);\n"
@@ -583,7 +583,7 @@ static void test_modbus_frame(void) {
         "    frame[6] = @truncate(u8, crc & 0xFF);\n"
         "    frame[7] = @truncate(u8, crc >> 8);\n"
         "}\n"
-        "bool validate_frame(*u8 frame, u32 len) {\n"
+        "bool validate_frame([*]u8 frame, u32 len) {\n"
         "    if (len < 4) { return false; }\n"
         "    u16 received = @truncate(u16, frame[len - 2]) | (@truncate(u16, frame[len - 1]) << 8);\n"
         "    u16 calculated = modbus_crc(frame, len - 2);\n"
@@ -591,12 +591,12 @@ static void test_modbus_frame(void) {
         "}\n"
         "u32 main() {\n"
         "    u8[8] frame;\n"
-        "    build_frame(&frame[0], 1, 3, 0x0000, 10);\n"
-        "    if (!validate_frame(&frame[0], 8)) { return 1; }\n"
+        "    build_frame(frame, 1, 3, 0x0000, 10);\n"
+        "    if (!validate_frame(frame, 8)) { return 1; }\n"
         "    if (frame[0] != 1) { return 2; }\n"
         "    if (frame[1] != 3) { return 3; }\n"
         "    frame[3] = 0xFF;\n"
-        "    if (validate_frame(&frame[0], 8)) { return 4; }\n"
+        "    if (validate_frame(frame, 8)) { return 4; }\n"
         "    return 0;\n"
         "}\n",
         0, "MODBUS frame build + CRC validate + tamper detect");
@@ -661,12 +661,12 @@ static void test_double_buffer(void) {
         "u8[64] buf_b;\n"
         "u32 active = 0;\n"
         "u32 processed = 0;\n"
-        "void fill_buffer(*u8 buf, u8 val, u32 len) {\n"
+        "void fill_buffer([*]u8 buf, u8 val, u32 len) {\n"
         "    for (u32 i = 0; i < len; i += 1) {\n"
         "        buf[i] = val;\n"
         "    }\n"
         "}\n"
-        "u32 process_buffer(*u8 buf, u32 len) {\n"
+        "u32 process_buffer([*]u8 buf, u32 len) {\n"
         "    u32 sum = 0;\n"
         "    for (u32 i = 0; i < len; i += 1) {\n"
         "        sum += @truncate(u32, buf[i]);\n"
@@ -675,10 +675,10 @@ static void test_double_buffer(void) {
         "    return sum;\n"
         "}\n"
         "u32 main() {\n"
-        "    fill_buffer(&buf_a[0], 1, 64);\n"
-        "    fill_buffer(&buf_b[0], 2, 64);\n"
-        "    u32 sum_a = process_buffer(&buf_a[0], 64);\n"
-        "    u32 sum_b = process_buffer(&buf_b[0], 64);\n"
+        "    fill_buffer(buf_a, 1, 64);\n"
+        "    fill_buffer(buf_b, 2, 64);\n"
+        "    u32 sum_a = process_buffer(buf_a, 64);\n"
+        "    u32 sum_b = process_buffer(buf_b, 64);\n"
         "    if (sum_a != 64) { return 1; }\n"
         "    if (sum_b != 128) { return 2; }\n"
         "    if (processed != 2) { return 3; }\n"
@@ -700,7 +700,7 @@ static void test_protocol_parser(void) {
         "    u8 msg_type;\n"
         "    u16 length;\n"
         "}\n"
-        "PacketHeader parse_header(*u8 raw) {\n"
+        "PacketHeader parse_header([*]u8 raw) {\n"
         "    PacketHeader h;\n"
         "    h.sync = raw[0];\n"
         "    h.msg_type = raw[1];\n"
@@ -713,7 +713,7 @@ static void test_protocol_parser(void) {
         "    raw[1] = 0x03;\n"
         "    raw[2] = 0x10;\n"
         "    raw[3] = 0x00;\n"
-        "    PacketHeader h = parse_header(&raw[0]);\n"
+        "    PacketHeader h = parse_header(raw);\n"
         "    if (h.sync != 0xAA) { return 1; }\n"
         "    if (h.msg_type != 3) { return 2; }\n"
         "    if (h.length != 16) { return 3; }\n"

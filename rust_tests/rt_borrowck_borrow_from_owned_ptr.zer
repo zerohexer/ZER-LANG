@@ -17,6 +17,6 @@ i32 main() {
     f.bar2 = 20;
     *u32 field_ptr = &f.bar1;
     foos.free_ptr(f);
-    field_ptr[0] = 99;
+    *field_ptr = 99;
     return 0;
 }

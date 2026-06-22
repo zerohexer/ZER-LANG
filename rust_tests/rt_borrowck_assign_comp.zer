@@ -17,6 +17,6 @@ i32 main() {
     p.y = 7;
     *u32 qx = &p.x;
     points.free_ptr(p);
-    qx[0] = 5;
+    *qx = 5;
     return 0;
 }

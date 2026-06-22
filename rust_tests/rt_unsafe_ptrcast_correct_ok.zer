@@ -6,7 +6,7 @@ Slab(Sensor) slab;
 
 void process_opaque(*opaque ctx) {
     *Sensor s = (*Sensor)ctx;
-    u32 v = s[0].value;
+    u32 v = s.value;
 }
 
 i32 main() {
@@ -14,9 +14,9 @@ i32 main() {
     *Sensor s = ms orelse return;
     defer slab.free_ptr(s);
 
-    s[0].id = 1;
-    s[0].value = 42;
-    s[0].status = 0;
+    s.id = 1;
+    s.value = 42;
+    s.status = 0;
 
     *opaque ctx = (*opaque)s;
     process_opaque(ctx);

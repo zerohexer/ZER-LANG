@@ -13,7 +13,7 @@ i32 main() {
     u32 data = 42;
     PtrWrap(u32) w;
     w.ptr = &data;
-    if (w.ptr[0] != 42) { return 1; }
+    if (*w.ptr != 42) { return 1; }
 
     return 0;
 }

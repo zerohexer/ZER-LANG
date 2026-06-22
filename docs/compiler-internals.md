@@ -6178,6 +6178,15 @@ from 108 to 8. Each fix below cites the commit that landed it.
 - Interior pointer tracking in IR_ASSIGN — `*T field_ptr = &b.c`
   shares alloc_id with b.
 - IR_INDEX_READ handler + IR_CALL UAF walker for general use-sites.
+- **IR_UNOP runs the UAF walker too (BUG-765, 2026-06-22).** The three "dangerous
+  reads" — `b.f` / `p[i]` / `*p` — lower to IR_FIELD_READ / IR_INDEX_READ / IR_UNOP
+  respectively (sub-exprs are decomposed into their own op). ALL THREE must run
+  `ir_check_expr_uaf`, or a deref-after-free of an interior pointer slips through.
+  IR_UNOP was in the exhaustive no-op group, so `*p` after free was a SILENT UAF
+  (the field/index forms were caught; the deref form wasn't) until the strict
+  `*T`-index change forced interior tests onto `*p` and exposed it. **Invariant: any
+  new IR op that reads through a value must run the UAF walker — don't drop it into
+  the no-op group.** Deref-WRITE (`*p = x`) is already covered by the IR_ASSIGN walker.
 
 **Shadow scoping (commit `51c6f7c`):**
 - `ir_find_local_exact_first` — zercheck-specific variant that prefers

@@ -9,9 +9,9 @@ i32 main() {
     for (u32 i = 0; i < 5; i += 1) {
         ?*Node mn = slab.alloc_ptr();
         *Node n = mn orelse return;
-        n[0].val = i * 3;
-        n[0].next = 0;
-        total += n[0].val;
+        n.val = i * 3;
+        n.next = 0;
+        total += n.val;
         slab.free_ptr(n);
     }
     // total = 0 + 3 + 6 + 9 + 12 = 30

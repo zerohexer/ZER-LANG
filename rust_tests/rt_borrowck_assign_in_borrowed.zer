@@ -13,9 +13,9 @@ void modify(*S p) {
 i32 main() {
     ?*S ms = slab.alloc_ptr();
     *S s = ms orelse return;
-    s[0].val = 42;
+    s.val = 42;
 
     modify(s);           // s freed by cross-function summary
-    u32 v = s[0].val;    // UAF — s freed by modify
+    u32 v = s.val;    // UAF — s freed by modify
     return 0;
 }

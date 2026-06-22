@@ -322,9 +322,11 @@ static void test_arrays(void) {
         "}\n",
         0, "array filled in loop");
 
-    /* 4c: array passed to function via pointer */
+    /* 4c: array passed to function as a slice (the SAFE pattern — `*T` indexing is
+     * now a compile error; pass `[*]T` which carries a length and is bounds-checked.
+     * `arr` (u32[3]) auto-coerces to a {ptr, len=3} slice at the call site). */
     test_e2e(
-        "u32 sum_three(*u32 data) {\n"
+        "u32 sum_three([*]u32 data) {\n"
         "    return data[0] + data[1] + data[2];\n"
         "}\n"
         "u32 main() {\n"
@@ -332,9 +334,9 @@ static void test_arrays(void) {
         "    arr[0] = 10;\n"
         "    arr[1] = 20;\n"
         "    arr[2] = 12;\n"
-        "    return sum_three(&arr[0]) - 42;\n"
+        "    return sum_three(arr) - 42;\n"
         "}\n",
-        0, "array passed via &arr[0]");
+        0, "array passed via slice (was &arr[0])");
 
     /* 4d: array of structs */
     test_e2e(

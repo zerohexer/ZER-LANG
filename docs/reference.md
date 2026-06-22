@@ -290,7 +290,10 @@ void set_priority(*Task t, u32 p) {
 
 **NOTES**
 - No pointer arithmetic. `ptr + 1` is a compile error. Use indexing or @ptrtoint.
-- Pointer indexing (`ptr[5]`) emits a warning — use [*]T for bounds-checked access.
+- Indexing a `*T` (`ptr[i]`) is a COMPILE ERROR — `*T` is one object and carries no
+  length, so the access cannot be bounds-checked (it would be a silent buffer overflow).
+  Use `[*]T` (a slice — it carries a length and is bounds-checked) for a collection, or
+  dereference to read the single pointee: `*ptr` (or `ptr.field` for a field).
 
 **SEE ALSO**
 ?*T, [*]T, *opaque

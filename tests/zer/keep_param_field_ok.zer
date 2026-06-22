@@ -10,6 +10,6 @@ u32 main() {
     Holder box;
     store(&box, &gv);
     *u32 got = box.hp orelse { return 1; };
-    if (got[0] != 42) { return 2; }
+    if (*got != 42) { return 2; }
     return 0;
 }

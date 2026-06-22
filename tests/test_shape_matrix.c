@@ -235,9 +235,9 @@ static void gen_slab(ShapeKind s, Violation v, int neg, char *buf, size_t n) {
         p += snprintf(body+p, sizeof(body)-p, "    *u32 q = &p.id;\n");
         if (neg) {
             p += snprintf(body+p, sizeof(body)-p, "    gs.free_ptr(p);\n");
-            p += snprintf(body+p, sizeof(body)-p, "    u32 z = q[0];\n    return (i32)z;\n"); /* UAF */
+            p += snprintf(body+p, sizeof(body)-p, "    u32 z = *q;\n    return (i32)z;\n"); /* UAF via interior-ptr deref */
         } else {
-            p += snprintf(body+p, sizeof(body)-p, "    u32 z = q[0];\n");   /* use before free */
+            p += snprintf(body+p, sizeof(body)-p, "    u32 z = *q;\n");   /* deref before free — safe */
             p += snprintf(body+p, sizeof(body)-p, "    gs.free_ptr(p);\n");
             p += snprintf(body+p, sizeof(body)-p, "    if (z != 1) { return 1; }\n    return 0;\n");
         }

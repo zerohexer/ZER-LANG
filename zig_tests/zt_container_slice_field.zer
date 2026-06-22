@@ -16,7 +16,7 @@ i32 main() {
 
     u32 sum = 0;
     for (u32 i = 0; i < h.count; i += 1) {
-        sum += h.data.ptr[i];
+        sum += h.data[i];
     }
     if (sum != 10) { return 1; }
     return 0;

@@ -5,7 +5,7 @@
 struct Local { u32 val; }
 
 void worker(*Local l) {
-    l[0].val += 1;
+    l.val += 1;
 }
 
 i32 main() {

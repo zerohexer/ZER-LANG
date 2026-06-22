@@ -207,16 +207,31 @@ per-arg predicate `arg_is_local_derived` was extracted from `call_has_local_deri
 `tests/zer_fail/escape_param_shadows_global.zer`,
 `tests/zer_fail/escape_multi_return_local.zer`.
 
-**Stage 3 (REMAINING — the durable-fix unification):** the PARAM(n) precision is done
-only at the FOUR direct-call-result sinks. The OTHER escape sinks (keep-call,
-keep-inference, struct-field-store, spawn-arg) still use `call_has_local_derived_arg`
-WITHOUT the `call_result_static_given_args` skip — so `keepfn(second(local, global))`
-and `gstruct.f = second(local, global)` over-reject the same way Stage 1 did before.
-Routing every sink through the one `call_result_static_given_args` query (and the
-result-region it computes) is this entry's durable fix — it both extends the precision
-uniformly and retires the per-sink patchwork (the BUG-760..763 class). Lower priority
-than Stages 1+2 (those covered the common shapes); the lattice + helpers are now in
-place so Stage 3 is mechanical.
+**Stage 3 SHIPPED (2026-06-22d, see BUGS-FIXED.md):** the call-result OVER-rejection
+is now unified onto the ONE query `call_result_static_given_args` across EVERY
+applicable sink. Probing the candidates showed Stage 3 was a single gate: the keep-call
+sink (~5707) was the only ungated direct-call-result over-rejection (now gated — a
+static call-result is RETAINABLE so it satisfies keep, `store(second(local, global))`
+allowed); struct-field-store-to-global already flows through the gated Stage 2 assign
+sink (via `classify_escape_sink`, verified compiling); spawn rejects non-shared pointer
+args regardless (moot). Tests: `tests/zer/escape_keep_static_call_result_ok.zer`,
+`tests/zer_fail/escape_keep_call_returns_local.zer`.
+
+**What's deliberately NOT unified (different axis):** the keep-INFERENCE site (~4241,
+`call_has_nonkeep_derived_arg`) asks "does the result launder non-keep param p?", NOT
+"is the result static?" — gating it with `call_result_static_given_args` would
+UNDER-infer keep (a function returning its non-keep param looks static to the local
+check but still launders it = a safety hole). A precise keep-INFERENCE refinement
+(use `ret_param_mask` to infer keep on p only if the function may actually return the
+arg position p was passed to) is a possible future item — separate from this entry.
+
+**Optional remainder (code structure, no behavior change):** the UNDER-rejection guard
+(`call_has_local_derived_arg`/`arg_is_local_derived`) is still CALLED per-sink rather
+than computed once and cached on the node. The behavioral over-rejection is closed at
+all sinks; the compute-once-store-on-node refactor is a pure optimization (it would
+also let the per-sink callers read a flag instead of re-walking) — low value now that
+the query is shared. This entry is behaviorally RESOLVED; keep only as a pointer to the
+optional refactor.
 
 ---
 

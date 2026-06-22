@@ -1,0 +1,31 @@
+// Stage 3 escape precision (2026-06-22): the keep-call sink now consults the same
+// call-result query as the other sinks. A `keep` parameter requires a RETAINABLE
+// value; a call whose result is provably STATIC (here a returned param whose actual
+// arg is a global) is retainable, so it satisfies keep even when ANOTHER argument
+// to that call is a local. `store` infers keep on `p` (it persists p to a global);
+// passing `second(&local, &g_val)` — which returns &g_val (the global), not the
+// local — is allowed. Grounded by param_lattice.v (resolve(R_f, argreg)).
+
+?*u32 g_held;
+void store(*u32 p) { g_held = p; }   // persists p to a global -> infers keep on p
+
+u32 g_val;
+
+// returns parameter 1 ONLY (the global), never param 0 (the local).
+*u32 second(*u32 scratch, *u32 keep_me) {
+    *scratch = *scratch + 1;          // uses param 0 (the local) but does NOT return it
+    return keep_me;                    // returns param 1 (static at the call below)
+}
+
+u32 main() {
+    u32 local = 7;
+    g_val = 42;
+    // second returns &g_val (static) -> retainable -> satisfies store's keep param,
+    // even though &local is also passed (in the non-returned position).
+    store(second(&local, &g_val));
+    if (local != 8) { return 1; }      // confirm the local was used (incremented)
+    if (g_held) |p| {
+        if (*p != 42) { return 2; }
+    }
+    return 0;
+}

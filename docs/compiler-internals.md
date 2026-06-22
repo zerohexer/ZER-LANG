@@ -11260,7 +11260,19 @@ STATIC and never a wrong index (param names are unique; static checks run first;
 param-laundered local maps via `nonkeep_root_param`). (3) **chained `return f(...)`** —
 classified STATIC only if f's own mask is empty (f returns only statics); a
 param-returning f could thread one of OUR params, which Stage 2 does not re-resolve, so
-it's UNKNOWN. The `>=64`-param case forces UNKNOWN (mask is a `uint64_t`). **Stage 3
-(remaining):** only the FOUR direct-call-result sinks consult the query; routing
-keep/struct-field/spawn through it too (the durable patchwork-elimination) is tracked in
-limitations.md.
+it's UNKNOWN. The `>=64`-param case forces UNKNOWN (mask is a `uint64_t`).
+
+**Escape PRECISION Stage 3 — unify the keep-call sink (2026-06-22d).** The
+`call_result_static_given_args` query now gates EVERY applicable call-result sink. Stage
+3 was a single gate (probing showed the rest already covered): the keep-call check
+(~5707, BUG-763) now skips when the call result is static — a static result is
+RETAINABLE so it satisfies `keep` (`store(second(local, global))` allowed; returns-local
++ direct-local stay rejected). Struct-field-store-to-global already flows through the
+gated Stage 2 assign sink (`classify_escape_sink` flags the field-of-global target);
+spawn rejects non-shared pointer args regardless. **Do NOT gate the keep-INFERENCE site
+(~4241, `call_has_nonkeep_derived_arg`)** — it's a different axis ("does the result
+launder non-keep param p?", not "is the result static?"); gating it would UNDER-infer
+keep (a function returning its non-keep param looks static to the local check but still
+launders it = a safety hole). A precise keep-inference refinement via `ret_param_mask`
+(infer keep on p only if the function may return the position p was passed to) is a
+possible future item.

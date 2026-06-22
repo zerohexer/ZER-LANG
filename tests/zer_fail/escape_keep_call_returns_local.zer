@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// Stage 3 soundness: the keep-call gate skips ONLY when the call result is provably
+// static. Here `second` returns parameter 1, and at the call site parameter 1 is
+// the LOCAL (`&l`) — so the result is the caller's stack, NOT retainable, and
+// cannot satisfy `store`'s keep parameter. The per-arg resolution distinguishes
+// this from escape_keep_static_call_result_ok.zer (same function, args swapped).
+?*u32 g_held;
+void store(*u32 p) { g_held = p; }   // persists p -> infers keep on p
+
+u32 g_val;
+*u32 second(*u32 scratch, *u32 keep_me) { return keep_me; }   // returns param 1
+
+u32 main() {
+    u32 l = 7;
+    g_val = 42;
+    store(second(&g_val, &l));         // param 1 (keep_me) is &l (LOCAL) -> result not retainable -> ERROR
+    return 0;
+}

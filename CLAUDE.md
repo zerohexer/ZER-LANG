@@ -184,10 +184,13 @@ provably returns a global/static (`g = lookup(local)`) OR returns a SPECIFIC par
 whose actual arg is static (`g = second(local, global)`, returns param 1). Sound:
 defaults `{false,0}`; a param shadowing a same-named global is correctly ARParam(n)
 not static (`src == gsym` check — a fixed Stage 1 UAF). `arg_is_local_derived` is the
-extracted per-arg predicate (`call_has_local_derived_arg` loops over it). **Stage 3
-(remaining):** the keep/struct-field/spawn sinks still lack the skip — route them
-through `call_result_static_given_args` too (limitations.md). Grounded by
-`param_lattice.v`. Full map + the read-only sink-enumeration workflow:
+extracted per-arg predicate (`call_has_local_derived_arg` loops over it). **Stages 1+2+3
+SHIPPED** — `call_result_static_given_args` now gates EVERY applicable call-result
+sink: var-decl, assignment (incl. struct-field-of-global via `classify_escape_sink`),
+return, return-field, AND keep-call (~5707 — a static call-result is retainable so it
+satisfies `keep`). NOT gated (different axis, intentional): keep-INFERENCE (~4241,
+`call_has_nonkeep_derived_arg`) — the static query ≠ the "launders param p" query, so
+gating it would under-infer keep. Grounded by `param_lattice.v`. Full map + the read-only sink-enumeration workflow:
 compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
 slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
 

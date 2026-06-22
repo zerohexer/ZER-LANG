@@ -621,6 +621,38 @@ refactor in limitations.md.
 
 ---
 
+## Session 2026-06-22d — Escape precision Stage 3: keep-call sink onto the unified query
+
+### FEATURE — the keep-call sink now consults `call_result_static_given_args`
+
+Routes the last direct-call-result over-rejection sink — the keep call-site check
+(BUG-763, checker.c ~5707) — through the SAME `call_result_static_given_args` query as
+the var-decl/assign/return sinks. A `keep` parameter needs a RETAINABLE value; a call
+whose result is provably STATIC (a global, or a returned param whose actual arg is
+static) is retainable, so it satisfies keep even when ANOTHER arg to that call is a
+local: `store(second(local, global))` (second returns the global) is now allowed (was
+rejected). `store(second(global, local))` (returns the local) and direct
+`store(&local)` stay rejected.
+
+**Scope (smaller than the limitations.md "Stage 3" framing — confirmed by probing):**
+the OTHER sinks were already covered. Struct-field-store-to-global
+(`gstruct.f = second(local, global)`) goes through the Stage 2 assign sink (gated, via
+`classify_escape_sink`) and already compiled; spawn rejects non-shared pointer args
+regardless (moot). Keep-INFERENCE (the non-keep-param-launder site ~4241) is a
+DIFFERENT axis — it asks "does the result launder param p?", not "is the result
+static?" — and is intentionally NOT gated: gating it with the static query would
+UNDER-infer keep (a function returning its non-keep param looks static to the local
+check but still launders it = a safety hole). So Stage 3 is the single keep-call gate.
+
+With this, the call-result OVER-rejection is unified onto ONE query
+(`call_result_static_given_args`) across every applicable sink (var-decl, assign incl.
+struct-field, return, return-field, keep-call). Verified: `make check` GREEN (Rust
+784/0, Zig 36/0, shape-matrix 50/50, fuzz 200, all 4 audit gates). Tests:
+`tests/zer/escape_keep_static_call_result_ok.zer`,
+`tests/zer_fail/escape_keep_call_returns_local.zer`.
+
+---
+
 ## Session 2026-06-22c — Escape precision Stage 2: per-param `PARAM(n)` + a Stage 1 UAF fix
 
 ### BUG — param-shadows-global was a UAF under-rejection (introduced in Stage 1)

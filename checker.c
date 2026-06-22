@@ -5704,7 +5704,16 @@ static Type *check_expr(Checker *c, Node *node) {
                                 else carg = carg->slice.object;
                             }
                             if (carg && carg->kind == NODE_CALL &&
-                                call_has_local_derived_arg(c, carg, 0)) {
+                                call_has_local_derived_arg(c, carg, 0) &&
+                                !call_result_static_given_args(c, carg)) {
+                                /* Stage 3 (2026-06-22): a call whose result is
+                                 * provably STATIC (global/static, or a returned
+                                 * param whose actual arg is static) is RETAINABLE,
+                                 * so it satisfies `keep` even when another arg is a
+                                 * local — `store(second(local, global))` where
+                                 * second returns the global. Skips the keep
+                                 * rejection here exactly when the result escapes
+                                 * safely (same query as the other escape sinks). */
                                 edge_vkind = KV_LOCAL_DERIVED;
                                 if (carg->call.callee &&
                                     carg->call.callee->kind == NODE_IDENT) {

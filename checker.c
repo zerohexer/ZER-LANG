@@ -365,7 +365,12 @@ static bool body_always_exits(Node *body);
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found);
-static bool return_expr_is_static(Checker *c, Node *rexpr);
+/* classify_return_root result codes: a single return is STATIC (global/static/
+ * null), UNKNOWN (local/unprovable — forces summary incomplete), or a param index
+ * in [0,63]. See the function for the param_lattice.v ARStatic/ARParam(n) mapping. */
+#define RET_STATIC  (-1)
+#define RET_UNKNOWN (-2)
+static int classify_return_root(Checker *c, Node *rexpr);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
@@ -874,14 +879,19 @@ static void classify_escape_sink(Checker *c, Node *target,
  * is provably static via the keep-param call-site chain, so storing it into any
  * field is safe). See the removed check in the NODE_ASSIGN handler. */
 
-/* BUG-374: recursively check if a call expression has any local-derived pointer
- * arguments. identity(identity(&x)) — the outer call's arg is a NODE_CALL,
- * which itself has &x. We recurse into nested calls (max depth 8 to prevent
- * pathological input). Returns true if any arg is &local or local-derived. */
-static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
-    if (!call || call->kind != NODE_CALL || depth > 8) return false;
-    for (int i = 0; i < call->call.arg_count; i++) {
-        Node *arg = call->call.args[i];
+/* BUG-374 + Stage 2 extraction (2026-06-22): does a SINGLE call argument carry a
+ * pointer/slice derived from a caller LOCAL (frame memory)?  Behavior-preserving
+ * split-out of the per-argument body of `call_has_local_derived_arg` so the
+ * call-result escape summary (call_result_static_given_args) can ask the question
+ * per-argument (for the params a function may return). identity(identity(&x)) —
+ * a NODE_CALL arg recurses (max depth 8). Cases: &local, a local ident, a local
+ * array (array->slice), a slice/index of a local, a nested call laundering a
+ * local, an orelse fallback to &local/local, @cstr of a local, a field of a
+ * local-derived struct. */
+static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
+static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
+    if (!arg || depth > 8) return false;
+    {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
             Node *root = arg->unary.operand;
@@ -1037,16 +1047,34 @@ static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
     return false;
 }
 
-/* Stage 1 escape precision (2026-06-22): does this call target a function whose
- * cross-function summary proves it returns a STATIC value (aliases no param/no
- * local)?  If so, a local-derived ARGUMENT does NOT make the RESULT escape — the
- * result is a global/static, not the caller's frame.  Used to SKIP the
- * `call_has_local_derived_arg` taint/reject at the escape sinks, killing the
- * unrelated-static over-rejection (`g = lookup(local)` where lookup returns a
- * global).  Conservative: false unless the callee is a resolvable named function
- * with `returns_static` set, so it never weakens the escape check (no
- * under-rejection — grounded by lambda_zer_escape/param_lattice.v T1/T4). */
-static bool call_returns_static(Checker *c, Node *call) {
+/* call_has_local_derived_arg: does ANY argument carry a caller local? (the
+ * under-rejection guard used by the escape sinks). Behavior-preserving loop over
+ * the extracted per-argument predicate. */
+static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
+    if (!call || call->kind != NODE_CALL || depth > 8) return false;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        if (arg_is_local_derived(c, call->call.args[i], depth)) return true;
+    }
+    return false;
+}
+
+/* Stage 1->2 escape precision (2026-06-22): is the RESULT of this call provably
+ * STATIC given the ACTUAL arguments? — the call-site substitution
+ * resolve(R_f, argreg) of lambda_zer_escape/param_lattice.v. The callee's summary
+ * (ret_summary_complete + ret_param_mask) is resolved here:
+ *   - not a resolvable named function, or summary incomplete  -> NOT static
+ *     (conservative: the call-result taint stays — Stage 1 / current behavior).
+ *   - mask == 0 (returns only globals/statics)                -> STATIC regardless
+ *     of the args (the unrelated-static case, T3).
+ *   - mask != 0 (may return a view of some parameters)        -> STATIC iff every
+ *     such parameter's actual argument is itself static (NOT local-derived):
+ *       `second(local, global)` returns param 1 -> STATIC (arg1 is the global);
+ *       `longest(local, global)` returns param 0 OR 1 -> NOT static (arg0 local);
+ *       `trim(local)` returns param 0 -> NOT static (arg0 local).
+ * Never weakens the escape check (no under-rejection, T1/T4): an unprovable
+ * summary, an unresolvable arg, or any masked param receiving a local forces the
+ * taint to stay. */
+static bool call_result_static_given_args(Checker *c, Node *call) {
     if (!call || call->kind != NODE_CALL) return false;
     Node *callee = call->call.callee;
     if (!callee || callee->kind != NODE_IDENT) return false;
@@ -1054,7 +1082,17 @@ static bool call_returns_static(Checker *c, Node *call) {
         callee->ident.name, (uint32_t)callee->ident.name_len);
     if (!csym) csym = scope_lookup(c->global_scope,
         callee->ident.name, (uint32_t)callee->ident.name_len);
-    return csym && csym->returns_static;
+    if (!csym || !csym->ret_summary_complete) return false;
+    uint64_t mask = csym->ret_param_mask;
+    if (mask == 0) return true;                       /* returns only statics */
+    for (int n = 0; n < 64 && mask; n++) {
+        if (!(mask & (1ull << n))) continue;
+        mask &= ~(1ull << n);
+        if (n >= call->call.arg_count) return false;  /* can't resolve the arg -> conservative */
+        if (arg_is_local_derived(c, call->call.args[n], 0))
+            return false;                             /* a returned param received a local */
+    }
+    return true;
 }
 
 /* keep axis (2026-06-07): does this call have a non-keep-derived pointer arg?
@@ -4313,7 +4351,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             if (vroot && vroot->kind == NODE_CALL &&
                 call_has_local_derived_arg(c, vroot, 0) &&
-                !call_returns_static(c, vroot)) {   /* Stage 1: static return can't escape */
+                !call_result_static_given_args(c, vroot)) {   /* Stage 1: static return can't escape */
                 Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
                 if (tgt_global || tgt_param) {
@@ -9960,7 +9998,7 @@ static void check_stmt(Checker *c, Node *node) {
                      * STATIC value — `g = lookup(local)` where lookup returns a
                      * global aliases no frame memory (param_lattice.v T3). */
                     if (call_has_local_derived_arg(c, call, 0) &&
-                        !call_returns_static(c, call)) {
+                        !call_result_static_given_args(c, call)) {
                         sym->is_local_derived = true;
                     }
                 }
@@ -10934,15 +10972,19 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
 
-            /* Stage 1 escape summary accumulator (2026-06-22): a VALUED return
-             * whose value is not provably STATIC (it aliases a param or local)
-             * makes this function NOT returns_static. Sound by construction —
-             * this runs for every valued return check_stmt validates, including
-             * returns inside `orelse { ... }` blocks (checked via check_stmt at
-             * the NODE_ORELSE handler). Bare returns (no value) don't reach here.
-             * Grounded by lambda_zer_escape/param_lattice.v (the ARStatic summary). */
-            if (!return_expr_is_static(c, node->ret.expr)) {
-                c->cur_returns_static = false;
+            /* Stage 1->2 escape summary accumulator (2026-06-22): classify this
+             * valued return's region. STATIC contributes nothing; ARParam(n) adds
+             * param n to the may-return mask; UNKNOWN (a local/unprovable return)
+             * marks the summary incomplete so the result is never treated as
+             * static. Sound by construction — runs for every valued return
+             * check_stmt validates, including returns inside `orelse { ... }`
+             * blocks (checked via check_stmt at the NODE_ORELSE handler) and
+             * in-scope so params are identifiable. Grounded by
+             * lambda_zer_escape/param_lattice.v (ARStatic/ARParam(n)). */
+            {
+                int rc = classify_return_root(c, node->ret.expr);
+                if (rc == RET_UNKNOWN) c->cur_ret_summary_complete = false;
+                else if (rc >= 0) c->cur_ret_param_mask |= (1ull << rc);
             }
 
             /* string literal returned as mutable slice → .rodata write risk
@@ -11311,7 +11353,7 @@ static void check_stmt(Checker *c, Node *node) {
             if (node->ret.expr->kind == NODE_CALL &&
                 ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
                 if (call_has_local_derived_arg(c, node->ret.expr, 0) &&
-                    !call_returns_static(c, node->ret.expr)) {  /* Stage 1: static return is safe */
+                    !call_result_static_given_args(c, node->ret.expr)) {  /* Stage 1: static return is safe */
                     checker_error(c, node->loc.line,
                         "cannot return result of call with local-derived pointer argument — "
                         "stack memory may escape through function return");
@@ -11330,7 +11372,7 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 if (rroot && rroot->kind == NODE_CALL) {
                     if (call_has_local_derived_arg(c, rroot, 0) &&
-                        !call_returns_static(c, rroot)) {  /* Stage 1: static return is safe */
+                        !call_result_static_given_args(c, rroot)) {  /* Stage 1: static return is safe */
                         checker_error(c, node->loc.line,
                             "cannot return pointer extracted from call with local-derived "
                             "argument — stack memory may escape through struct field");
@@ -13828,10 +13870,12 @@ static void check_func_body(Checker *c, Node *node) {
          * by >=2 threads" — a pre-spawn write is reached by only one). */
         bool saved_after_spawn = c->after_spawn_in_func;
         c->after_spawn_in_func = false;
-        /* Stage 1 escape summary: assume returns_static until a valued non-static
-         * return clears it (accumulated in the NODE_RETURN handler during the body
-         * check below; read into Symbol.returns_static after). */
-        c->cur_returns_static = true;
+        /* Stage 1->2 escape summary: start complete with an empty param mask;
+         * the NODE_RETURN handler classifies each valued return below (UNKNOWN
+         * clears `complete`, ARParam(n) sets mask bit n; read into the Symbol
+         * after the body). */
+        c->cur_ret_summary_complete = true;
+        c->cur_ret_param_mask = 0;
         check_stmt(c, node->func_decl.body);
         c->after_spawn_in_func = saved_after_spawn;
         c->in_comptime_body = saved_comptime;
@@ -13879,22 +13923,23 @@ static void check_func_body(Checker *c, Node *node) {
             }
         }
 
-        /* Cross-function escape summary (Stage 1, 2026-06-22): record whether
-         * this function provably returns a STATIC value (its return aliases no
-         * param and no local), for the pointer/slice/struct return types that
-         * reach the call-result escape sinks. The accumulator c->cur_returns_static
-         * was set true at body-check entry and ANDed false at each non-static
-         * valued return. Bodyless externs keep returns_static=false (can't prove)
-         * — conservative, the taint stays on. Grounded by
-         * lambda_zer_escape/param_lattice.v (ARStatic summary; T1/T4 no
-         * under-rejection). */
+        /* Cross-function escape summary (Stage 1->2, 2026-06-22): record the
+         * per-function return provenance (ret_summary_complete + ret_param_mask),
+         * for the pointer/slice/struct return types that reach the call-result
+         * escape sinks. The accumulators were computed across the body above.
+         * Bodyless externs keep {false, 0} (can't prove) — conservative, the taint
+         * stays on. Grounded by lambda_zer_escape/param_lattice.v (ARStatic/
+         * ARParam(n); T1/T4 no under-rejection). */
         {
             TypeKind rk = type_dispatch_kind(ret);  /* unwraps distinct; NULL→VOID */
-            if (node->func_decl.body && c->cur_returns_static &&
+            if (node->func_decl.body &&
                 (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT)) {
                 Symbol *fsym = scope_lookup(c->current_scope,
                     node->func_decl.name, (uint32_t)node->func_decl.name_len);
-                if (fsym) fsym->returns_static = true;
+                if (fsym) {
+                    fsym->ret_summary_complete = c->cur_ret_summary_complete;
+                    fsym->ret_param_mask = c->cur_ret_param_mask;
+                }
             }
         }
 
@@ -14935,18 +14980,25 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
     return true; /* non-return statement — ok */
 }
 
-/* Stage 1 escape summary helper: is a SINGLE return expression provably STATIC
- * — i.e. its value aliases NO parameter and NO local?  STATIC = rooted at a
- * global/static symbol (the view/deref/addr path is followed to the root), or
- * the `null` literal.  Anything not provably static (a param/local root, a
- * non-null literal, an unknown call) yields false — the conservative direction,
- * so a true-PARAM/LOCAL return can never be mistaken for static (no
- * under-rejection).  Models the `ARStatic` summary in
- * lambda_zer_escape/param_lattice.v. */
-static bool return_expr_is_static(Checker *c, Node *rexpr) {
-    if (!rexpr) return true;
-    /* null pointer / null sentinel — escapes fine, no aliasing */
-    if (rexpr->kind == NODE_NULL_LIT) return true;
+/* Stage 1->2 escape summary helper: classify a SINGLE return expression's region
+ * for the per-function ARStatic/ARParam(n) summary (lambda_zer_escape/param_lattice.v).
+ * Returns:
+ *   RET_STATIC  (-1): rooted at a GLOBAL/static, or `null` — escapable regardless
+ *                     of the call's args. Param-shadows-global is handled correctly:
+ *                     the name is the global ONLY if the resolved binding IS the
+ *                     global symbol (`src == gsym`), so a param shadowing a
+ *                     same-named global is NOT mistaken for static (that was a
+ *                     Stage 1 under-rejection — `f(*u32 g){return g;}` with a
+ *                     global `g`).
+ *   RET_UNKNOWN (-2): a local/unprovable return — forces the summary INCOMPLETE,
+ *                     so the function's result is never treated as static (the
+ *                     conservative direction; no under-rejection).
+ *   n in [0,63]     : aliases PARAMETER n (a view of param n's pointee — directly,
+ *                     or via a local that borrows it, tracked by nonkeep_root_param).
+ * A return aliasing a param/local is NEVER classified RET_STATIC. */
+static int classify_return_root(Checker *c, Node *rexpr) {
+    if (!rexpr) return RET_STATIC;               /* bare return — no value */
+    if (rexpr->kind == NODE_NULL_LIT) return RET_STATIC;
     /* follow view (.field / [i] / [a..b]) and deref/addr (* / &) to the root */
     Node *root = rexpr;
     for (;;) {
@@ -14958,20 +15010,49 @@ static bool return_expr_is_static(Checker *c, Node *rexpr) {
             root = root->unary.operand;
         else break;
     }
-    if (!root) return false;
-    if (root->kind == NODE_IDENT) {
-        bool is_global = scope_lookup_local(c->global_scope,
-            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
-        if (is_global) return true;               /* global root — static storage */
-        Symbol *src = scope_lookup(c->current_scope,
-            root->ident.name, (uint32_t)root->ident.name_len);
-        if (src && src->is_static) return true;   /* static-duration local — static */
-        return false;                              /* param or local root — NOT static */
+    if (!root) return RET_UNKNOWN;
+    /* `return f(...)`: STATIC only if f returns ONLY statics (its own mask is
+     * empty) — if f may return a parameter, that could be one of OUR params or a
+     * local threaded through, which Stage 2 does not re-thread; be conservative. */
+    if (root->kind == NODE_CALL) {
+        Node *ic = root->call.callee;
+        if (ic && ic->kind == NODE_IDENT) {
+            Symbol *icsym = scope_lookup(c->current_scope,
+                ic->ident.name, (uint32_t)ic->ident.name_len);
+            if (!icsym) icsym = scope_lookup(c->global_scope,
+                ic->ident.name, (uint32_t)ic->ident.name_len);
+            if (icsym && icsym->ret_summary_complete && icsym->ret_param_mask == 0)
+                return RET_STATIC;
+        }
+        return RET_UNKNOWN;
     }
-    /* `return f(...)` where f itself provably returns static (summary already
-     * computed if f was declared earlier; conservative false otherwise). */
-    if (root->kind == NODE_CALL) return call_returns_static(c, root);
-    return false;                                  /* unclassifiable — conservatively not static */
+    if (root->kind != NODE_IDENT) return RET_UNKNOWN;
+    /* resolve the binding — innermost wins, so a param SHADOWS a same-named global */
+    Symbol *src  = scope_lookup(c->current_scope,
+        root->ident.name, (uint32_t)root->ident.name_len);
+    Symbol *gsym = scope_lookup_local(c->global_scope,
+        root->ident.name, (uint32_t)root->ident.name_len);
+    if (src && src == gsym) return RET_STATIC;    /* the name resolves to the global */
+    if (src && src->is_static) return RET_STATIC; /* static-duration local */
+    /* not static: a parameter, or a local. Identify the parameter index if it is
+     * one (param names are unique; globals/statics were excluded above, so a name
+     * match here is a genuine param). */
+    if (c->current_func_node) {
+        Node *fn = c->current_func_node;
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            if (fn->func_decl.params[i].name_len == root->ident.name_len &&
+                memcmp(fn->func_decl.params[i].name, root->ident.name,
+                       (size_t)root->ident.name_len) == 0) {
+                return (i < 64) ? i : RET_UNKNOWN; /* >=64 params can't mask -> conservative */
+            }
+        }
+    }
+    /* a local that borrows a (non-keep) parameter: `t = s[1..]; return t` */
+    if (src && src->is_nonkeep_derived && src->nonkeep_root_param >= 0)
+        return (src->nonkeep_root_param < 64) ? src->nonkeep_root_param : RET_UNKNOWN;
+    /* a plain local pointer/slice (returning it is already a compile error for the
+     * relevant types) — conservatively unknown. */
+    return RET_UNKNOWN;
 }
 
 /* Find what type a *opaque parameter is cast to inside a function body.

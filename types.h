@@ -293,15 +293,20 @@ struct Symbol {
     int64_t return_range_max;
     bool has_return_range;
 
-    /* cross-function escape summary (Stage 1, 2026-06-22): the function provably
-     * returns a STATIC value — every return aliases NO parameter and NO local
-     * (rooted at a global/static, or `null`). Lets the call-result taint at the
-     * escape sinks (var-decl/assign/return) be SKIPPED for `g = lookup(local)`:
-     * a static return cannot carry frame memory regardless of the args, so a
-     * local-derived arg does NOT taint the result. Grounded by
-     * lambda_zer_escape/param_lattice.v (ARStatic summary; T3/T4). Conservative:
-     * false unless EVERY return is provably static (never under-rejects). */
-    bool returns_static;
+    /* cross-function escape summary (Stage 1->2, 2026-06-22): the per-function
+     * return provenance — the ARStatic/ARParam(n) lattice of
+     * lambda_zer_escape/param_lattice.v. `ret_summary_complete` = every valued
+     * return is classifiable (rooted at a global/static or `null` = STATIC, or a
+     * view of a parameter = ARParam(n)); false if any return is unprovable, in
+     * which case the result is never treated as static (conservative).
+     * `ret_param_mask` = bit n set iff some return path may return a view of
+     * parameter n. The call RESULT is static-escapable iff `ret_summary_complete`
+     * AND every masked param's actual argument is itself static (the call-site
+     * substitution `resolve(R_f, argreg)`). Stage 1's "returns_static" is the
+     * special case `ret_summary_complete && ret_param_mask == 0`. Defaults
+     * {false, 0} → the taint stays unless proven (no under-rejection, T4). */
+    bool ret_summary_complete;
+    uint64_t ret_param_mask;
 
     /* module prefix for name mangling (NULL = main module) */
     const char *module_prefix;

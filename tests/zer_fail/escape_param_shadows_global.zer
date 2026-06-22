@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Stage 2 soundness: a parameter that SHADOWS a same-named global must NOT be
+// mistaken for static when returned. `f(*u32 g_x)` returns the PARAMETER g_x (the
+// caller's memory), not the global g_x — so storing f(&local) into a global is a
+// dangling pointer. This was a Stage 1 under-rejection (the classifier asked "is
+// there a global named g_x?" instead of "does the name RESOLVE to the global?");
+// fixed via the resolved-symbol identity check (src == gsym). In the lattice the
+// return is ARParam(0), not ARStatic. (proofs/.../param_lattice.v T4)
+u32 g_x;                              // global
+*u32 f(*u32 g_x) { return g_x; }      // param shadows the global; returns the PARAM
+?*u32 g_sink;
+u32 main() {
+    u32 local = 5;
+    g_sink = f(&local);               // f returns &local -> g_sink would dangle -> ERROR
+    return 0;
+}

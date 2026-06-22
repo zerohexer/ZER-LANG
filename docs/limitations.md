@@ -181,23 +181,42 @@ result is never permitted to escape. The finite states the implementation must t
 are exactly `{STATIC, LOCAL, ARENA}` + `PARAM(n)` + join + the call-site
 substitution.
 
-**Stage 1 SHIPPED (2026-06-22b, see BUGS-FIXED.md):** `Symbol.returns_static` — a
-per-function summary (true iff every valued return aliases no param/no local, rooted
-at a global/static or `null`), computed by an accumulator (`Checker.cur_returns_static`,
-ANDed at each return in the `NODE_RETURN` handler — sound by construction, catches
-`orelse`-block returns and runs in-scope). `call_returns_static` gates ALL FOUR
-direct-call-result sinks (var-decl taint ~9958, assignment error ~4315, return-of-call
-~11308, return-field ~11326). This kills the **unrelated-static** over-rejection
-(`g = lookup(local)` where lookup returns a global). Conservative: defaults false → no
-under-rejection (T4); a param-returning function stays tainted. Tests:
+**Stages 1+2 SHIPPED (2026-06-22b/c, see BUGS-FIXED.md):** the per-function return
+summary `{Symbol.ret_summary_complete, Symbol.ret_param_mask}` (mask bit n = some
+return may be a view of parameter n; complete = every return classifiable as STATIC
+or ARParam(n)), computed by an accumulator (`Checker.cur_ret_summary_complete` +
+`cur_ret_param_mask`, updated at each return in the `NODE_RETURN` handler — sound by
+construction, catches `orelse`-block returns and runs in-scope so params are
+identifiable). `classify_return_root` classifies one return (with the
+param-shadows-global fix: the name is the global only if the resolved binding IS the
+global symbol, `src == gsym` — a Stage 1 UAF under-rejection, now fixed +
+regression-tested). The call-site query `call_result_static_given_args` is the
+substitution `resolve(R_f, argreg)`: result is static-escapable iff the summary is
+complete AND every masked param's actual arg is static. It gates the FOUR
+direct-call-result sinks (var-decl ~9958, assignment ~4315, return-of-call ~11308,
+return-field ~11326). Kills both the **unrelated-static** over-rejection
+(`g = lookup(local)`, lookup returns a global) and adds the **multi-param precision**
+(`second(local, global)` returning param 1 is allowed — the returned param's arg is
+the global; `longest(local, global)` returning EITHER stays rejected; `trim(local)`
+stays rejected). Conservative: defaults `{false, 0}` → no under-rejection (T4). The
+per-arg predicate `arg_is_local_derived` was extracted from `call_has_local_derived_arg`
+(behavior-preserving) for the per-masked-param check. Tests:
 `tests/zer/returns_static_no_overreject.zer`,
-`tests/zer_fail/returns_param_still_rejected.zer`.
+`tests/zer/escape_param_view_static_arg_ok.zer`,
+`tests/zer_fail/returns_param_still_rejected.zer`,
+`tests/zer_fail/escape_param_shadows_global.zer`,
+`tests/zer_fail/escape_multi_return_local.zer`.
 
-**Stage 2 (REMAINING)** = the full per-param `PARAM(n)` summary + call-site
-substitution — kills **multi-param-pick** (`longest(local, global)` returning the
-global arg) AND unifies every sink (store/return/keep/struct-field/spawn) into one
-lattice query (this entry's durable fix). Stage 1's `returns_static` is the `ARStatic`
-special case of that summary; Stage 2 generalizes it to `ARParam n`.
+**Stage 3 (REMAINING — the durable-fix unification):** the PARAM(n) precision is done
+only at the FOUR direct-call-result sinks. The OTHER escape sinks (keep-call,
+keep-inference, struct-field-store, spawn-arg) still use `call_has_local_derived_arg`
+WITHOUT the `call_result_static_given_args` skip — so `keepfn(second(local, global))`
+and `gstruct.f = second(local, global)` over-reject the same way Stage 1 did before.
+Routing every sink through the one `call_result_static_given_args` query (and the
+result-region it computes) is this entry's durable fix — it both extends the precision
+uniformly and retires the per-sink patchwork (the BUG-760..763 class). Lower priority
+than Stages 1+2 (those covered the common shapes); the lattice + helpers are now in
+place so Stage 3 is mechanical.
 
 ---
 

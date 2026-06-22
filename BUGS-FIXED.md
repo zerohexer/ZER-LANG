@@ -621,6 +621,66 @@ refactor in limitations.md.
 
 ---
 
+## Session 2026-06-22c — Escape precision Stage 2: per-param `PARAM(n)` + a Stage 1 UAF fix
+
+### BUG — param-shadows-global was a UAF under-rejection (introduced in Stage 1)
+
+**What broke (UAF, in committed Stage 1 code 0d18cc28):** Stage 1's
+`return_expr_is_static` classified a return as STATIC via
+`is_global = scope_lookup_local(global_scope, name) != NULL`. When a PARAMETER
+shadows a same-named GLOBAL, that check sees the global and wrongly says STATIC —
+but `return g_x` returns the PARAMETER (caller's memory). So
+`*u32 f(*u32 g_x){ return g_x; }` (with a global `g_x`) got `returns_static=true`,
+and `g_sink = f(&local)` was ACCEPTED → a stored dangling pointer. Verified
+exploitable before the fix (`SHADOW_EXIT=0`).
+
+**Fix:** the classifier resolves the binding and treats the name as the global
+ONLY if the innermost resolved symbol IS the global symbol (`src == gsym`) — a
+param shadowing a global is then correctly ARParam(n), not ARStatic. Negative
+test: `tests/zer_fail/escape_param_shadows_global.zer`.
+
+### FEATURE — per-param `PARAM(n)` summary + call-site substitution
+
+**Generalizes Stage 1's `returns_static`** to the full lattice of
+`proofs/operational/lambda_zer_escape/param_lattice.v`. The per-function summary is
+now `{ret_summary_complete, ret_param_mask}` (replacing `returns_static`):
+`ret_param_mask` bit n = some return path may return a view of parameter n.
+`classify_return_root` classifies each return as STATIC / ARParam(n) / UNKNOWN
+(UNKNOWN → summary incomplete → conservative); a local that borrows a param is
+mapped to its `nonkeep_root_param`. The accumulator (`Checker.cur_ret_param_mask`
++ `cur_ret_summary_complete`) is computed in the `NODE_RETURN` handler.
+
+The call-site query `call_result_static_given_args` is the substitution
+`resolve(R_f, argreg)`: the result is static-escapable iff the summary is complete
+AND every masked param's actual argument is itself static (not local-derived).
+This adds the **multi-param precision**: `second(local, global)` returning param 1
+is now ALLOWED (the returned param's arg is the global; the local is in a
+non-returned position), while `second(global, local)` (returns the local) and
+`longest(local, global)` (may return either) stay rejected.
+
+**Refactor (No-Debt):** the per-argument local-derived check was extracted from
+`call_has_local_derived_arg` into `arg_is_local_derived` (behavior-preserving —
+`call_has_local_derived_arg` is now a loop over it), so the call-site query can ask
+the question per-masked-param without duplicating the logic.
+
+**Soundness (no under-rejection, T1/T4):** summary defaults `{false, 0}`; UNKNOWN
+returns, unresolvable args, >=64-param indices, and any masked param receiving a
+local all force the taint to stay. A return aliasing a param/local is NEVER
+classified STATIC. The four direct-call-result sinks (var-decl/assign/return/
+return-field) consult the generalized query.
+
+**Verified:** `make check` GREEN (Rust 784/0, Zig 36/0, shape-matrix 50/50, fuzz
+200, all 4 audit gates OK). Adversarial matrix all correct (shadow/trim/longest/
+second-returns-local reject; second-returns-static-param + lookup allow). Tests:
+`tests/zer/escape_param_view_static_arg_ok.zer` (case B compiles + runs),
+`tests/zer_fail/escape_param_shadows_global.zer`,
+`tests/zer_fail/escape_multi_return_local.zer`. The PARAM(n) precision is now done
+at the 4 direct-call-result sinks; unifying the OTHER sinks (keep/struct-field/
+spawn) onto the same query is the remaining architectural cleanup — see
+docs/limitations.md.
+
+---
+
 ## Session 2026-06-22b — Escape precision Stage 1: `returns_static` (theorem-grounded)
 
 ### FEATURE — `returns_static` summary kills the unrelated-static over-rejection

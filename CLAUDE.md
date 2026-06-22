@@ -174,15 +174,22 @@ nothing about the others. Shared proxy: `call_has_local_derived_arg` (checker.c 
 flags: `is_local_derived` / `is_arena_derived` / `is_nonkeep_derived`; keep enforcement
 is a DEFERRED fixpoint (`check_keep_inference`, after all bodies). The durable fix
 (unify call-result provenance → one lattice query per sink, incl. the relational
-`PARAM(n)` = inferred `'a`) is tracked in limitations.md; **Stage 1 SHIPPED** —
-`Symbol.returns_static` (a per-function "returns no param/no local" summary,
-accumulated in the `NODE_RETURN` handler via `Checker.cur_returns_static`) and
-`call_returns_static` now gate ALL FOUR direct-call-result sinks, so the call result
-is NOT tainted when the callee provably returns a global/static (`g = lookup(local)`
-no longer over-rejected). Grounded by `param_lattice.v`. Full map +
-the read-only sink-enumeration workflow: compiler-internals.md "Escape & keep
-analysis". Returning a sub-slice/`&elem` of a slice/pointer PARAM is ALLOWED
-(BUG-764 relaxation); returning a view of a LOCAL is not.
+`PARAM(n)` = inferred `'a`) is tracked in limitations.md; **Stages 1+2 SHIPPED** —
+the per-function return summary `{Symbol.ret_summary_complete, Symbol.ret_param_mask}`
+(mask bit n = a return may be a view of param n), accumulated in the `NODE_RETURN`
+handler (`classify_return_root` → `Checker.cur_ret_*`), and the call-site query
+`call_result_static_given_args` (the substitution `resolve(R_f, argreg)`) gate the
+FOUR direct-call-result sinks: the call result is NOT tainted when the callee
+provably returns a global/static (`g = lookup(local)`) OR returns a SPECIFIC param
+whose actual arg is static (`g = second(local, global)`, returns param 1). Sound:
+defaults `{false,0}`; a param shadowing a same-named global is correctly ARParam(n)
+not static (`src == gsym` check — a fixed Stage 1 UAF). `arg_is_local_derived` is the
+extracted per-arg predicate (`call_has_local_derived_arg` loops over it). **Stage 3
+(remaining):** the keep/struct-field/spawn sinks still lack the skip — route them
+through `call_result_static_given_args` too (limitations.md). Grounded by
+`param_lattice.v`. Full map + the read-only sink-enumeration workflow:
+compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
+slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
 
 ---
 

@@ -1,0 +1,31 @@
+// Stage 2 escape precision (PARAM(n), 2026-06-22): a function that returns a
+// SPECIFIC parameter may be called with a local-derived argument in a DIFFERENT
+// (non-returned) position and have its result stored into a global — the result
+// aliases the RETURNED parameter (here a global), not the local. The call site
+// resolves the per-function return summary (ARParam(n)) against the actual args:
+// the returned param's arg must be static; a local in a non-returned position is
+// irrelevant. Grounded by proofs/operational/lambda_zer_escape/param_lattice.v
+// (T1 subst_escape_sound, T2 pick_escapes_iff_chosen_static).
+
+u32 g_val;
+
+// returns parameter 1 ONLY (never param 0). Summary: ret_param_mask = {1}.
+*u32 second(*u32 scratch, *u32 keep_me) {
+    *scratch = *scratch + 1;     // uses param 0 (the local) — but does NOT return it
+    return keep_me;              // returns param 1
+}
+
+?*u32 g_sink;
+
+u32 main() {
+    u32 local = 10;              // a LOCAL — passed in the NON-returned position
+    g_val = 42;
+    // returned param (keep_me = &g_val) is static; the local (scratch) is not
+    // returned -> the result is static -> storing it to a global is allowed.
+    g_sink = second(&local, &g_val);
+    if (g_sink) |p| {
+        if (*p != 42) { return 1; }
+    }
+    if (local != 11) { return 2; }   // confirm the local was used (incremented)
+    return 0;
+}

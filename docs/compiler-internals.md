@@ -11237,5 +11237,30 @@ hooks that exact traversal so it can't miss one. (2) the accumulator runs DURING
 check when params/locals are in scope (`return_expr_is_static` can identify a param
 root), whereas a post-body scan runs after the body scope is popped. The summary
 defaults false (bodyless externs, recursion, anything unprovable) → conservative.
-Grounded by `param_lattice.v` (ARStatic; T1/T4 = no under-rejection). Stage 2 (the
-durable fix above) generalizes `returns_static` to the per-param `ARParam n`.
+Grounded by `param_lattice.v` (ARStatic; T1/T4 = no under-rejection).
+
+**Escape PRECISION Stage 2 — per-param `PARAM(n)` (2026-06-22c).** Generalizes Stage 1
+to the full lattice. The summary is now `{Symbol.ret_summary_complete,
+Symbol.ret_param_mask}` (replacing `returns_static`): mask bit n set iff a return may
+be a view of parameter n; complete = every return is classifiable. `classify_return_root`
+returns `RET_STATIC` / `RET_UNKNOWN` / a param index; the accumulator (`cur_ret_param_mask`
++ `cur_ret_summary_complete`) ORs the bit / clears complete in the NODE_RETURN handler.
+The call-site query `call_result_static_given_args` is the substitution
+`resolve(R_f, argreg)`: static-escapable iff complete AND every masked param's actual
+arg is itself static (checked via the extracted `arg_is_local_derived`). Gain:
+`second(local, global)` returning param 1 is now allowed (returned param's arg is the
+global); `longest(local, global)` (returns either) and `second(global, local)` (returns
+the local) stay rejected. **Three soundness landmines, all handled — note them before
+touching `classify_return_root`:** (1) **param-shadows-global** — a param with the same
+name as a global must NOT classify STATIC; check the resolved-symbol identity
+(`src == gsym`), NOT "a global of this name exists" (that was a live Stage 1 UAF
+under-rejection, now regression-tested by `escape_param_shadows_global.zer`). (2) **mask
+completeness** — a return aliasing a param must set its bit OR force UNKNOWN; never
+STATIC and never a wrong index (param names are unique; static checks run first; a
+param-laundered local maps via `nonkeep_root_param`). (3) **chained `return f(...)`** —
+classified STATIC only if f's own mask is empty (f returns only statics); a
+param-returning f could thread one of OUR params, which Stage 2 does not re-resolve, so
+it's UNKNOWN. The `>=64`-param case forces UNKNOWN (mask is a `uint64_t`). **Stage 3
+(remaining):** only the FOUR direct-call-result sinks consult the query; routing
+keep/struct-field/spawn through it too (the durable patchwork-elimination) is tracked in
+limitations.md.

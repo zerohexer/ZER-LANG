@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Stage 2 conservatism: a function that may return EITHER parameter (a runtime
+// pick) keeps BOTH params in its return mask, so a local in ANY masked position
+// forces rejection — the compiler can't know which one the function returns at the
+// call site. In the lattice: ret_param_mask = {0,1}; resolving against the args
+// (local, global) is NOT static because parameter 0's argument is the local.
+// (proofs/operational/lambda_zer_escape/param_lattice.v — the join over returns.)
+u32 g;
+*u32 longest(*u32 a, *u32 b) {
+    if (*a > *b) { return a; }        // may return parameter 0
+    return b;                          // ... or parameter 1
+}
+?*u32 g_sink;
+u32 main() {
+    u32 local = 5;
+    g = 9;
+    g_sink = longest(&local, &g);     // may return &local -> ERROR
+    return 0;
+}

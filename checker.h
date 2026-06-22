@@ -40,12 +40,13 @@ typedef struct {
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     Node *current_func_node; /* NODE_FUNC_DECL being checked — keep inference (Site 1) */
     Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
-    bool cur_returns_static; /* Stage 1 escape summary accumulator: ANDed false at each
-                              * valued return whose value is NOT provably static (aliases a
-                              * param/local). Set true at func-body-check entry; read into
-                              * Symbol.returns_static after the body. Sound by construction —
-                              * hooks the NODE_RETURN check, so it sees every valued return
-                              * (incl. orelse-block returns checked via check_stmt). */
+    /* Stage 1->2 escape summary accumulators (set at func-body-check entry, updated
+     * at each valued return in the NODE_RETURN handler, read into
+     * Symbol.ret_summary_complete / ret_param_mask after the body). Sound by
+     * construction — hooks the NODE_RETURN check, so it sees every valued return
+     * (incl. orelse-block returns checked via check_stmt) and runs in-scope. */
+    bool cur_ret_summary_complete; /* false once any return is not classifiable (STATIC/PARAM(n)) */
+    uint64_t cur_ret_param_mask;   /* bit n: a return may be a view of parameter n */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int defer_depth;        /* > 0 when inside a defer block */
     int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */

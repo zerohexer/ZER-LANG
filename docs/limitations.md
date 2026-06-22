@@ -95,10 +95,18 @@ individually (BUG-760..763 done; siblings open).
 
 ---
 
-## OPEN — return-borrow-from-param over-rejection (expressiveness, NOT safety; LOW)
+## FIXED (BUG-764, 2026-06-22) — return-borrow-from-param relaxation shipped
 
-**Symptom (verified 2026-06-22):** returning a sub-slice or `&`-element of a
-slice/pointer PARAMETER is rejected outright — `[*]u8 trim([*]u8 s){ return
+**RESOLVED:** returning a sub-slice/`&`-element of a slice/pointer PARAM is now
+allowed (3 return-escape sites relaxed to skip slice/pointer params that are not
+`is_local_derived`). Verified against the complete sink matrix — every escape is
+still caught (the BUG-760..763 fixes covered the sinks); `lib/str.zer`'s `bytes_trim*`
+compile again. The empirical matrix proved the conservative proxy + the 4 fixes
+suffice; the unified lattice refactor (above) is now optional future-proofing, not a
+prerequisite. Original symptom kept below for history.
+
+**Symptom (was, verified 2026-06-22):** returning a sub-slice or `&`-element of a
+slice/pointer PARAMETER was rejected outright — `[*]u8 trim([*]u8 s){ return
 s[i..j]; }` and `*u8 first([*]u8 s){ return &s[0]; }` both error `"cannot return
 pointer to local 's'"`, regardless of `const`, `[]u8` vs `[*]u8`, or literal vs
 variable bounds. So slice/string helpers that return a view into their input

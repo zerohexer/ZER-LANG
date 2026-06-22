@@ -573,6 +573,43 @@ store/return call-launder checks (BUG-760). Conservative — global-source laund
 `tests/zer_fail/keep_call_launder_escape.zer`, `tests/zer/keep_call_launder_global_ok.zer`.
 Full `make check` GREEN: ZER 805/0, all 5 audits.
 
+### BUG-764 (FEATURE) — return-borrow-from-param relaxation: sub-slice/&element of a slice/pointer param may be returned
+
+**What changed (flexibility, safe):** ZER used to reject returning a view into a
+slice/pointer PARAMETER outright — `[*]u8 trim([*]u8 s){ return s[i..j]; }` and
+`*u8 first([*]u8 s){ return &s[0]; }` both errored "cannot return pointer to local
+'s'". A slice/pointer param's pointee is the CALLER's memory, not this frame, so the
+return is memory-safe at the function level; the safety burden is the CALL SITE (a
+caller that passes a local and lets the result escape). With BUG-760..763 closing
+every call/keep/struct-field launder sink, that burden is fully covered — so the
+return-escape sites can stop rejecting param-view returns.
+
+**Fix (3 return-escape sites, ~10 lines, checker.c):** in the `sliced_borrow`
+promotion (~11088) and the two `&expr` return checks (~11034, ~11127), do NOT reject
+when the root symbol's type is a SLICE/POINTER and it is NOT `is_local_derived`
+(i.e. a param or static/null pointee — external memory). Still reject: local arrays
+(`return arr[0..]`), local-derived slices (`[*]u8 t=arr[0..]; return t[..]`),
+`&local` scalars, and `&local_array[i]`. Uses `type_dispatch_kind`.
+
+**Verified — the complete sink matrix (the experiment that proved the 4 fixes
+sufficed, no lattice refactor needed):** POSITIVES compile — `trim` sub-slice
+return, `first` `&param[0]`, local use of `trim(local)`, `trim(global)`→global.
+NEGATIVES all still rejected — `g=trim(local)`, `t=trim(local);g=t`,
+`keepfn(trim(local))`, `gstruct.f=trim(local)`, `return trim(local)`,
+`return local_arr[..]`, `&s[0]` laundered through `first(local)`, `return &local`.
+**`lib/str.zer`'s `bytes_trim*` now COMPILE** (were broken). Tests:
+`tests/zer/return_param_subslice.zer` (compiles + runs), 
+`tests/zer_fail/return_param_subslice_caller_escape.zer` (caller escape rejected).
+Full `make check` GREEN: ZER 807/0, all 5 audits. This is ZER inferring the lifetime
+relationship Rust annotates with `'a` — zero annotations, no `unsafe`.
+
+**Note:** the unified call-result-provenance lattice refactor (limitations.md) remains
+the durable cleanup — it would make FUTURE sinks automatically safe — but the current
+sinks are now verified-complete, so the relaxation ships safely on the conservative
+proxy + BUG-760..763.
+
+---
+
 **Pattern note (BUG-760..763):** four escape holes this session, ALL the same class —
 a per-sink escape check (store / keep-inference / struct-field-store / keep-call-site)
 independently missing the "call-laundered or slice-of-local" arg shape. The durable

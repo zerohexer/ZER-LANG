@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// The relaxation allows returning a view of a param (see return_param_subslice.zer),
+// but the CALL SITE must still catch a caller that passes a LOCAL and then lets the
+// returned view escape its frame. view(buf[0..8]) returns a slice into the caller's
+// local buf; storing it to a global dangles when leak() returns.
+[*]u8 g_escape;
+[*]u8 view([*]u8 s) { return s[0..s.len]; }
+void leak() {
+    u8[8] buf;
+    g_escape = view(buf[0..8]);   // view(local) result escaped to a global → rejected
+}
+u32 main() { leak(); return 0; }

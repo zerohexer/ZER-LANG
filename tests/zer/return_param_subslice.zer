@@ -1,0 +1,23 @@
+// return-borrow-from-param relaxation: a function may return a sub-slice (or
+// &element) of a slice/pointer PARAM — a view into the CALLER's buffer. Safe at
+// the function level (the pointee is the caller's memory, not this frame); the
+// call-site escape analysis rejects a caller that passes a local and lets the
+// result escape. Here the caller owns the buffer for the whole use.
+[*]u8 trim_left([*]u8 s, u8 c) {
+    u32 i = 0;
+    while (i < s.len) {
+        if (s[i] != c) { return s[i..s.len]; }
+        i += 1;
+    }
+    return s[s.len..s.len];
+}
+u32 main() {
+    u8[5] buf;
+    buf[0] = 32; buf[1] = 32;                 // two leading spaces
+    buf[2] = 65; buf[3] = 66; buf[4] = 67;    // "ABC"
+    [*]u8 t = trim_left(buf[0..5], 32);        // view into buf, used locally
+    if (t.len != 3) { return 1; }
+    if (t[0] != 65) { return 2; }             // 'A'
+    if (t[2] != 67) { return 3; }             // 'C'
+    return 0;
+}

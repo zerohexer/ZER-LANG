@@ -1185,7 +1185,17 @@ These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh
 
 3. **`const []u8` return type requires parser lookahead.** `const` and `volatile` at global scope trigger var-decl parsing. The parser now peeks ahead to detect function declarations. Works as of this session — but if adding new qualifier keywords, they need the same lookahead treatment.
 
-4. **Returning a sub-slice/view of a slice/pointer PARAMETER is currently REJECTED by escape analysis** — `[*]u8 f([*]u8 s){ return s[i..j]; }` (and `return &s[i]`) errors `"cannot return pointer to local 's'"`, regardless of `const`/`[]u8` vs `[*]u8`/literal vs variable bounds. (Verified 2026-06-22; the older note here claiming `const []u8` return makes it work was WRONG — `lib/str.zer`'s `bytes_trim*` do NOT compile.) Root cause: the return-escape promotion (checker.c ~11016) treats a slice/pointer param as frame-owned. Workaround: return an INDEX or `(start,len)` and let the caller reconstruct `buf[start..len]` (the caller owns `buf`). This over-rejection (and the planned safe relaxation via call-result provenance) is tracked in `docs/limitations.md`. NOTE: the related call-launder UAF hole (`g = f(local[0..n])`) was FIXED 2026-06-22 (BUG-760).
+4. **Returning a sub-slice/view of a slice/pointer PARAMETER is ALLOWED** (relaxation
+   shipped 2026-06-22, BUG-764) — `[*]u8 trim([*]u8 s){ return s[i..j]; }` and
+   `*u8 first([*]u8 s){ return &s[0]; }` compile: a slice/pointer param's pointee is
+   the CALLER's memory, so the return is safe at the function level; the call site
+   rejects a caller that passes a LOCAL and lets the result escape (`g = trim(local)`
+   etc. error, `trim(global)` and local use are fine). `lib/str.zer`'s `bytes_trim*`
+   compile again. (Still rejected: returning a view of a LOCAL array/struct —
+   `return arr[0..]`, `return &local`.) This is ZER inferring Rust's `'a` with zero
+   annotations. The safety rests on the escape-sink coverage from BUG-760..763 (call/
+   keep/struct-field launder); the durable unified-provenance refactor is tracked in
+   `docs/limitations.md` as optional future-proofing.
 
 5. **C macros (stderr, stdout) are NOT accessible from ZER.** They're preprocessor symbols, not variables. Wrap them in a C helper function in a `.h` file: `static inline FILE *zer_get_stderr(void) { return stderr; }`. Then `cinclude` the header and declare the function in ZER.
 

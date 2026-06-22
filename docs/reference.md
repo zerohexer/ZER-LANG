@@ -179,6 +179,15 @@ process(buf);              // auto-coerces: { .ptr=buf, .len=256 }
 **NOTES**
 - Size must be a compile-time constant.
 - Returning a local array as a slice is a compile error (dangling pointer).
+- BUT returning a **sub-slice or `&`-element of a slice/pointer PARAMETER** is
+  allowed — it's a view into the caller's buffer, not your stack:
+  ```zer
+  [*]u8 trim([*]u8 s, u8 c) { ... return s[i..s.len]; }   // OK — view of the param
+  *u8 first([*]u8 s) { return &s[0]; }                     // OK
+  ```
+  The compiler still rejects a *caller* that passes a local and lets the result
+  escape (`g_global = trim(local_buf)` is an error); using the result while the
+  buffer is alive is fine. No lifetime annotations needed.
 
 **SEE ALSO**
 [*]T

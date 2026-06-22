@@ -11031,7 +11031,15 @@ static void check_stmt(Checker *c, Node *node) {
                                 inner->ident.name, (uint32_t)inner->ident.name_len);
                             bool is_global = scope_lookup_local(c->global_scope,
                                 inner->ident.name, (uint32_t)inner->ident.name_len) != NULL;
-                            if (sym && !sym->is_static && !is_global) {
+                            /* RELAXATION: `return &s[0]` where s is a slice/pointer
+                             * param/external (NOT local-derived) points into the
+                             * caller's memory — safe at the function level (the call
+                             * site rejects a caller passing a local). */
+                            bool root_is_ref = sym && sym->type &&
+                                (type_dispatch_kind(sym->type) == TYPE_SLICE ||
+                                 type_dispatch_kind(sym->type) == TYPE_POINTER);
+                            if (sym && !sym->is_static && !is_global &&
+                                !(root_is_ref && !sym->is_local_derived)) {
                                 checker_error(c, node->loc.line,
                                     "cannot return pointer to local '%.*s' — "
                                     "stack memory is freed when function returns",
@@ -11088,7 +11096,22 @@ static void check_stmt(Checker *c, Node *node) {
                             if (sliced_borrow && region == ZER_REGION_STATIC) {
                                 bool is_global = scope_lookup_local(c->global_scope,
                                     sym->name, sym->name_len) != NULL;
-                                if (!sym->is_static && !is_global) {
+                                /* RELAXATION (return-borrow-from-param): a slice/
+                                 * pointer ROOT here has region STATIC, i.e. it is NOT
+                                 * local-derived — its pointee is the CALLER's memory
+                                 * (a param) or static, NOT this frame. Returning a
+                                 * sub-slice of it is memory-safe at the function
+                                 * level; the call-site escape analysis (BUG-760..763)
+                                 * catches a caller that passes a LOCAL through it. So
+                                 * only promote ARRAY/STRUCT roots (frame-owned). A
+                                 * local slice that points to a local already carries
+                                 * is_local_derived → region is LOCAL, never STATIC,
+                                 * so it never reaches this promotion and stays
+                                 * rejected. */
+                                bool root_is_ref = sym->type &&
+                                    (type_dispatch_kind(sym->type) == TYPE_SLICE ||
+                                     type_dispatch_kind(sym->type) == TYPE_POINTER);
+                                if (!sym->is_static && !is_global && !root_is_ref) {
                                     region = ZER_REGION_LOCAL;
                                 }
                             }
@@ -11124,7 +11147,16 @@ static void check_stmt(Checker *c, Node *node) {
                     uint32_t vlen = (uint32_t)root->ident.name_len;
                     Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
                     bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-                    if (sym && !sym->is_static && !is_global) {
+                    /* RELAXATION: `return &s[0]` where s is a slice/pointer PARAM (or
+                     * any slice/pointer that is NOT local-derived) points into the
+                     * CALLER's memory — safe at the function level; the call site
+                     * rejects a caller that passes a local. Still reject &local_array
+                     * elements, &local scalars, and &local-derived-slice elements. */
+                    bool root_is_ref = sym && sym->type &&
+                        (type_dispatch_kind(sym->type) == TYPE_SLICE ||
+                         type_dispatch_kind(sym->type) == TYPE_POINTER);
+                    if (sym && !sym->is_static && !is_global &&
+                        !(root_is_ref && !sym->is_local_derived)) {
                         checker_error(c, node->loc.line,
                             "cannot return pointer to local variable '%.*s'",
                             (int)vlen, vname);

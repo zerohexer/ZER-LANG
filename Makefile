@@ -366,7 +366,8 @@ check-proofs:
 	          proofs/operational/lambda_zer_bounds/*.v \
 	          proofs/operational/lambda_zer_qualifier/*.v \
 	          proofs/operational/lambda_zer_capture/*.v \
-	          proofs/operational/lambda_zer_volatile/*.v; do \
+	          proofs/operational/lambda_zer_volatile/*.v \
+	          proofs/operational/lambda_zer_disjoint/*.v; do \
 	    FILES="$$FILES $$f"; \
 	 done; \
 	 if grep -l 'Admitted\|admit\.' $$FILES 2>/dev/null | grep -q .; then \

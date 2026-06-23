@@ -41,6 +41,26 @@ The follow-on is writing/refactoring the C classification against each oracle
 the pure-predicate parts; for bounds that means wiring the orphaned sound CFG-VRP
 (`vrp_ir.c`) so BH-18 #2 closes by construction. Tracked in docs/limitations.md.
 
+### RICH-oracle rungs — driving over-rejection DOWN via richer abstractions (theorem-first)
+
+Two refined oracles (zero admits, in the admit-gate, now 49 files) that raise the
+precision ceiling for the escape + aliasing classes. Theorem-first by design: these
+are the SPEC; the implementations are deferred (one is a re-architecture, flagged).
+- `lambda_zer_escape/join_lattice.v` (5 thms) — the **n-ary JOIN return summary**.
+  Refines param_lattice.v's flat `ret_param_mask` (which OR-accumulates and
+  COLLAPSES a disjunctive return to UNKNOWN) into the JOIN — the finite SET of
+  regions a return may be. `pick(){if c return &local; return p}` keeps the
+  `ARParam 0` fact (`pick_join_retains_param`) instead of killing the whole
+  summary; `local_member_blocks_escape` (saturate-toward-LOCAL) keeps it sound;
+  `static_or_param_resolves_per_arg` = Rust's `<'a>(x:&'a)->&'a` inferred. Impl =
+  mask→member-set behind the SAME `call_result_escapes` gate — NOT a re-architecture.
+- `lambda_zer_disjoint/disjoint_lattice.v` (3 thms) — the **EXCEEDS-Rust prize**.
+  Accept aliased mutation Rust rejects by the aliasing-XOR-mutability rule when
+  disjointness is PROVEN (`aliased_mut_permitted_when_disjoint`). `disjoint_no_overlap`
+  (D1 sound) + `disjoint_cannot_suppress_unsafe` (D2: disjointness is ADDITIVE —
+  architecturally unable to suppress a UAF/OOB rejection, the BH-18 #1 structural
+  defense). Impl needs a relational VRP layer = a re-architecture, deferred.
+
 ---
 
 ## Session 2026-06-21b — Concurrency closure IMPLEMENTATION (phase 2) begins — Axis C: BUG-743

@@ -9,6 +9,7 @@
 -Q lambda_zer_qualifier zer_qualifier
 -Q lambda_zer_capture zer_capture
 -Q lambda_zer_volatile zer_volatile
+-Q lambda_zer_disjoint zer_disjoint
 
 -arg -w -arg -notation-overridden
 -arg -w -arg -redundant-canonical-projection
@@ -59,6 +60,7 @@ lambda_zer_escape/iris_escape_state.v
 lambda_zer_escape/iris_escape_specs.v
 lambda_zer_escape/iris_escape_theorems.v
 lambda_zer_escape/param_lattice.v
+lambda_zer_escape/join_lattice.v
 
 lambda_zer_mmio/syntax.v
 lambda_zer_mmio/semantics.v
@@ -82,3 +84,4 @@ lambda_zer_bounds/bounds_lattice.v
 lambda_zer_qualifier/qualifier_lattice.v
 lambda_zer_capture/capture_lattice.v
 lambda_zer_volatile/volatile_lattice.v
+lambda_zer_disjoint/disjoint_lattice.v

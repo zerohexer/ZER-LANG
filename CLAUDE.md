@@ -1021,6 +1021,16 @@ as unsound. These are the SPEC (Level 1); writing the C against them (the
 `param_lattice.v → call_result_static_given_args` pattern) + VST-extracting the
 pure predicates is the follow-on — for bounds that means wiring the orphaned
 `vrp_ir.c`. The oracle-backed classes are now 11 (was 7).
+RICH-oracle rungs (2026-06-23, driving over-rejection DOWN via richer abstractions,
+theorem-first): `lambda_zer_escape/join_lattice.v` (the n-ary JOIN return summary —
+refines the flat `ret_param_mask` so a disjunctive return `pick(){if c return
+&local; return p}` keeps the ARParam fact instead of collapsing to UNKNOWN;
+saturate-toward-LOCAL keeps it sound; impl = mask→member-set behind the SAME
+`call_result_escapes` gate, NOT a re-architecture) and `lambda_zer_disjoint/
+disjoint_lattice.v` (the EXCEEDS-Rust prize — accept aliased mutation Rust rejects
+by rule when disjointness is PROVEN; disjointness is ADDITIVE, structurally unable
+to suppress UAF/OOB (the BH-18 #1 defense); impl needs a relational VRP layer = a
+re-architecture, deferred). admit-gate now 49 files.
 
 The three levels (keep straight in any claim):
 - **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.

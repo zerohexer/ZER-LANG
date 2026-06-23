@@ -362,7 +362,11 @@ check-proofs:
 	          proofs/operational/lambda_zer_opaque/*.v \
 	          proofs/operational/lambda_zer_escape/*.v \
 	          proofs/operational/lambda_zer_mmio/*.v \
-	          proofs/operational/lambda_zer_typing/*.v; do \
+	          proofs/operational/lambda_zer_typing/*.v \
+	          proofs/operational/lambda_zer_bounds/*.v \
+	          proofs/operational/lambda_zer_qualifier/*.v \
+	          proofs/operational/lambda_zer_capture/*.v \
+	          proofs/operational/lambda_zer_volatile/*.v; do \
 	    FILES="$$FILES $$f"; \
 	 done; \
 	 if grep -l 'Admitted\|admit\.' $$FILES 2>/dev/null | grep -q .; then \

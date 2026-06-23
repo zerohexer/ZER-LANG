@@ -5,6 +5,10 @@
 -Q lambda_zer_mmio   zer_mmio
 -Q lambda_zer_typing zer_typing
 -Q lambda_zer_concurrency zer_conc
+-Q lambda_zer_bounds zer_bounds
+-Q lambda_zer_qualifier zer_qualifier
+-Q lambda_zer_capture zer_capture
+-Q lambda_zer_volatile zer_volatile
 
 -arg -w -arg -notation-overridden
 -arg -w -arg -redundant-canonical-projection
@@ -73,3 +77,8 @@ lambda_zer_concurrency/iris_wp_heap.v
 lambda_zer_concurrency/iris_region_join.v
 lambda_zer_concurrency/iris_boundary.v
 lambda_zer_concurrency/iris_concurrency_theorems.v
+
+lambda_zer_bounds/bounds_lattice.v
+lambda_zer_qualifier/qualifier_lattice.v
+lambda_zer_capture/capture_lattice.v
+lambda_zer_volatile/volatile_lattice.v

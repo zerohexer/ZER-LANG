@@ -1011,6 +1011,16 @@ per-file iteration build command + Iris-version gotchas (↦ notation absent, un
 `docs/proof-internals.md` "λZER-Concurrency subset" — READ before any concurrency
 proof work. Remaining: operational adequacy (generic plumbing) + wp_store/shared
 specs + formal necessity. Compiler implementation of the closure NOT started.
+NEW oracle subsets (2026-06-23): `lambda_zer_{bounds,qualifier,capture,volatile}/`
+— 4 self-contained `param_lattice.v`-style oracles (18 thms, zero admits, in the
+admit-gate, now 47 files) that CERTIFY THE FINITE-STATE DOMAIN for the four
+safety classes that previously had NO oracle (so their state sets were red-team-
+discovered — the root of BH-18 #2 bounds-OOB + #6 capture-UAF). bounds_lattice.v
+also pins the merge=JOIN rule #2 breaks; capture_lattice.v witnesses #6's reset
+as unsound. These are the SPEC (Level 1); writing the C against them (the
+`param_lattice.v → call_result_static_given_args` pattern) + VST-extracting the
+pure predicates is the follow-on — for bounds that means wiring the orphaned
+`vrp_ir.c`. The oracle-backed classes are now 11 (was 7).
 
 The three levels (keep straight in any claim):
 - **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.

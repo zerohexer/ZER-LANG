@@ -5,6 +5,44 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-06-23 — Operational oracles for 4 previously-uncertified safety classes
+
+### INFRA — certify the finite-state domain for bounds/VRP, qualifier, capture, volatile
+
+**Why:** a safety class's accuracy is bounded by the completeness of its abstract
+domain (the finite state set) AND its transfer matrix. The domain is *certified
+complete* only when it has an operational ORACLE (the Coq state set + sound
+decision the C is written against); without one, the state set is discovered by
+red team — which is exactly how BH-18 #2 (bounds/VRP scope-leak OOB) and #6
+(capture-escape UAF) arose: those classes had NO oracle. Audit found 7 classes
+WITH oracles (escape/handle/move/opaque/mmio/typing/concurrency) and these 4
+WITHOUT.
+
+**What landed — 4 self-contained, zero-admit oracle files (param_lattice.v style),
+wired into `_CoqProject` + the `make check-proofs` admit-gate (now 47 files):**
+- `proofs/operational/lambda_zer_bounds/bounds_lattice.v` (6 thms) — the interval
+  domain `{TOP} ∪ {[lo,hi]}` + the sound decision "elide the runtime bounds check
+  iff provably in `[0,n)`" + **the merge=JOIN theorem (`elide_on_join_sound`) that
+  BH-18 #2 violated** (a branch-local narrowing must not license elision past a
+  control-flow join) + the conservative-TOP default (T4).
+- `proofs/operational/lambda_zer_qualifier/qualifier_lattice.v` (5 thms) — the
+  4-state `{const,volatile}` lattice + "a cast may not STRIP a qualifier"
+  (`cast_ok_no_strip`, `strip_always_rejected`) + the partial-order/composability.
+- `proofs/operational/lambda_zer_capture/capture_lattice.v` (4 thms) — the
+  `|v|`/`|*v|` capture INHERITS the payload's region; **`buggy_reset_unsound`
+  witnesses BH-18 #6** (capture defaulting to STATIC) as a soundness violation.
+- `proofs/operational/lambda_zer_volatile/volatile_lattice.v` (3 thms) — the
+  volatile-EFFECT class (distinct from the qualifier strip): a volatile access is
+  never elided (`volatile_never_elided`) + effect-count preservation.
+
+**Status:** these certify the STATE SET + DECISION (the oracle / Level-1 spec).
+The follow-on is writing/refactoring the C classification against each oracle
+(the `param_lattice.v → call_result_static_given_args` pattern) + VST-extracting
+the pure-predicate parts; for bounds that means wiring the orphaned sound CFG-VRP
+(`vrp_ir.c`) so BH-18 #2 closes by construction. Tracked in docs/limitations.md.
+
+---
+
 ## Session 2026-06-21b — Concurrency closure IMPLEMENTATION (phase 2) begins — Axis C: BUG-743
 
 This session implements the four-axis concurrency-safety closure proven in

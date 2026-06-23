@@ -1635,6 +1635,15 @@ BUG-742 (conditional global dangle), NOT defer item #9 (no defer, no Handle).
 
 ## OPEN — BH-18 #2 — VRP range-narrowing scope leak → unchecked OOB write (🔴 soundness)
 
+**ORACLE NOW EXISTS (2026-06-23):** `proofs/operational/lambda_zer_bounds/bounds_lattice.v`
+certifies the bounds state set + the sound decision, and `elide_on_join_sound`
+pins the exact rule this bug breaks — eliding must use the JOIN of predecessor
+ranges, so a branch-local narrowing cannot license elision on a path it doesn't
+hold. The durable fix is to write the C against this oracle: wire the orphaned
+sound CFG-VRP (`vrp_ir.c`, currently absent from the Makefile) as the sole range
+source, which closes this class by construction. The point-fix (save/restore
+`var_range_count` on the non-comparison branch) remains the cheap interim.
+
 **Symptom:** a recognized bounds guard (`if (idx >= N) { return; }`) **nested
 inside a non-comparison `if` (e.g. `if (b)`)** leaks its range narrowing
 (`idx <= N-1`) out to the unconditional path. The compiler then "proves" the
@@ -1818,6 +1827,14 @@ match needs an IR-path equivalent. Tripwire: `tests/zer_trap/array_call_index_oo
 ---
 
 ## OPEN — BH-18 #6 — `if (opt) |*v|` mutable capture escapes a pointer-to-local to a global (🔴 soundness)
+
+**ORACLE NOW EXISTS (2026-06-23):** `proofs/operational/lambda_zer_capture/capture_lattice.v`
+certifies the rule — a capture INHERITS the payload's region
+(`capture_preserves_escape`), and `buggy_reset_unsound` witnesses this exact bug
+(the capture defaulting to STATIC) as a soundness violation. The fix is to make
+the `|v|`/`|*v|` desugaring set the capture's escape-provenance from the matched
+value's region (don't reset), and add the tripwire — now verifiable against the
+oracle.
 
 **Symptom:** `if (opt) |*v| { ... }` binds `v = &m.value` — a pointer **into**
 the local optional `m`. Storing `v` into a global is a dangling-pointer escape,

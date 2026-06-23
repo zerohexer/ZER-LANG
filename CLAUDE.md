@@ -1045,6 +1045,44 @@ into CI forever; an oracle-driven spec makes VST failure EXPOSE compiler bugs.
 If no Level 1 oracle exists for the subsystem → audit first (can't write
 oracle-driven specs without an oracle).
 
+**MAX-ORACLE STANDARD (MANDATORY — the DEFAULT, not an upgrade you wait to be asked
+for).** When writing ANY oracle (the Coq/Iris Level-1 spec for a safety class) write
+the MAXIMAL one — the richest sound, decidable abstraction — NEVER the coarsest that
+merely certifies soundness. A coarse oracle is a RUNG to climb, not a destination; a
+fresh session that writes the simple version and stops has under-delivered. The whole
+point of an oracle is "all finite variables, fully, none missing" — the most precise,
+maximally-inferring abstraction the class admits. The bar:
+1. **Finite-state COMPLETENESS — every distinguishable variable, none missing.** The
+   abstract domain must capture EVERY state the concrete semantics can be in for that
+   property, DERIVED from the operational semantics (not guessed). A missing state is
+   over-approximation (over-reject) or — worse — an un-representable bad state = a
+   SOUNDNESS HOLE: every BH-18 🔴 hole IS a missing finite variable. The `∀ r` proof
+   certifies the states; an incomplete state set = a sound proof the C still can't
+   classify a form against → hole.
+2. **MAX PRECISION — richest abstraction, minimize over-rejection.** Prefer relational
+   over flat (n-ary JOIN over a bitmask; a Tofte–Talpin outlives partial order over a
+   flat lattice; interval-relational `i<j` over plain intervals; reduced-product
+   refinement where two domains feed each other). Drive over-rejection toward minimal;
+   stop ONLY at diminishing returns. Soundness is a HARD WALL (zero under-rejection,
+   non-negotiable); over-rejection is a SOFT gradient (minimize, never zero — Rice).
+   "Least false positive is fine; allowing unsafe never is."
+3. **The 4-theorem contract per oracle (`param_lattice.v` is the template):** T1
+   transfer/decision soundness; T3 a PRECISION WITNESS (name the exact over-rejection
+   it closes — proves the gain is real); T4 NO-UNDER-REJECTION (the crown jewel — a
+   true-dangerous state is FORCED to reject). Plus MERGE = JOIN/LUB with the UNSAFE
+   classification as the conservative default (saturate-toward-LOCAL / widen-toward-
+   FREED / TOP-never-elides) so a missed or unclassifiable form can ONLY over-reject.
+   `bounds_lattice.v`'s `elide_on_join_sound` is the merge template.
+4. **Zero admits, in the `make check-proofs` admit-gate, oracle-driven, honest LIMIT
+   named** (the Rice/decidability fallback to conservative). Self-contained
+   `param_lattice.v`-style files; templates: `lambda_zer_escape/{param_lattice,join_lattice}.v`,
+   `lambda_zer_disjoint/disjoint_lattice.v`, `lambda_zer_{bounds,qualifier,capture,volatile}/`.
+Accuracy of a class = completeness of its finite-state set × completeness of its
+transfer matrix × reduced-product refinement across classes — the MAX oracle maxes all
+three while the soundness floor never moves. Writing the oracle is pure spec work (no C,
+no re-architecture, doesn't worsen soundness) so it goes FIRST; the implementation against
+it is mechanical afterward.
+
 New extraction → follow proof-internals.md "Phase 1 extraction recipe" +
 Makefile/.gitignore checklist. VST-friendly C style: flat cascade of
 early-return ifs, NO nesting, NO compound conditions (split predicates and

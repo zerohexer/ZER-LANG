@@ -7267,6 +7267,32 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "target must be const pointer");
                         }
                     }
+                    /* BH-18 #3: @bitcast must not FORGE a pointer from a non-pointer
+                     * (int<->ptr) — that escapes the mmio/@inttoptr gate and the
+                     * grammar-level "no in-language unsafe" closure (synthesizes the
+                     * banned ptr+N). The VST-verified predicate zer_bitcast_operand_valid
+                     * (src/safety/cast_rules.c) returns 0 for a pointer operand; if its
+                     * results DIFFER between src and dst, exactly one operand is a
+                     * pointer = the banned forge. Ptr<->ptr (use @ptrcast/@pun) and
+                     * scalar<->scalar bit-reinterpret stay allowed. type_dispatch_kind
+                     * unwraps distinct (no raw ->kind, audit-safe).
+                     * SAFETY: zer_bitcast_operand_valid in src/safety/cast_rules.c */
+                    if (val_type && result) {
+                        TypeKind sk = type_dispatch_kind(val_type);
+                        TypeKind dk = type_dispatch_kind(result);
+                        int src_prim = !(sk == TYPE_POINTER || sk == TYPE_OPAQUE ||
+                                         sk == TYPE_SLICE || sk == TYPE_FUNC_PTR);
+                        int dst_prim = !(dk == TYPE_POINTER || dk == TYPE_OPAQUE ||
+                                         dk == TYPE_SLICE || dk == TYPE_FUNC_PTR);
+                        if (zer_bitcast_operand_valid(src_prim) !=
+                            zer_bitcast_operand_valid(dst_prim)) {
+                            checker_error(c, node->loc.line,
+                                "@bitcast cannot reinterpret between a pointer and a "
+                                "non-pointer (forges a pointer) — use @%s for the "
+                                "address conversion",
+                                dst_prim ? "ptrtoint" : "inttoptr");
+                        }
+                    }
                 }
             } else {
                 result = ty_void;

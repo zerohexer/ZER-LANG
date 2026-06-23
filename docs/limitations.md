@@ -20,7 +20,8 @@ from this ledger after the parallel workflow rate-limited).
 ### NOT-SOUND — under-rejects (accepts unsafe). The urgent tier (close before precision work).
 
 **Memory-corruption (🔴 UAF/OOB):**
-- **`@bitcast` int↔ptr forge** (#3, line ~1695) — `@bitcast(*T, intval)` / `@bitcast(uN, *T)`
+- **`@bitcast` int↔ptr forge** (#3) — **[FIXED 2026-06-23 — wired the verified
+  `zer_bitcast_operand_valid`; see the FIXED entry below]**. Was: `@bitcast(*T, intval)`
   reinterprets an integer as a pointer with a clean compile: on 64-bit a ptr and u64 are
   both 8 bytes so `zer_bitcast_width_valid` passes, and the handler (checker.c:7230-7270)
   calls ONLY the width + const/volatile-strip checks — never an int-vs-ptr operand check.
@@ -1815,9 +1816,20 @@ trap (or `tests/zer/` with the auto-guard warning), never run clean.
 
 ---
 
-## OPEN — BH-18 #3 — `@bitcast` forges integer↔pointer, bypassing the mmio/inttoptr gate (🔴 soundness)
+## FIXED (2026-06-23) — BH-18 #3 — `@bitcast` forges integer↔pointer, bypassing the mmio/inttoptr gate (🔴 soundness)
 
-**Symptom:** `@bitcast(*T, intval)` (and `@bitcast(uN, *T)`) reinterprets an
+**RESOLVED:** the @bitcast checker handler (checker.c ~7270) now wires the
+VST-verified `zer_bitcast_operand_valid` (src/safety/cast_rules.c): it computes
+`src_prim`/`dst_prim` (non-pointer-kind, via `type_dispatch_kind` so the
+type-dispatch audit isn't tripped) and rejects when the two predicate results
+DIFFER — i.e. exactly one operand is a pointer = the int↔ptr forge, pointing at
+`@inttoptr`/`@ptrtoint`. Ptr↔ptr (use @ptrcast/@pun) and scalar↔scalar stay allowed.
+Verified empirically: int→ptr AND ptr→int forges rejected with the operand error;
+`@bitcast(u32, f32)` still compiles+runs; `make check` GREEN (Rust 784/0, Zig 36/0,
+fuzz 200, type-dispatch audit OK — no ptr↔ptr regression). Tripwire:
+`tests/zer_fail/bitcast_int_ptr.zer`.
+
+**Symptom (was):** `@bitcast(*T, intval)` (and `@bitcast(uN, *T)`) reinterprets an
 arbitrary integer as a pointer (and back) with a **clean compile** — no mmio
 range check, no alignment check, no `@inttoptr`/`@ptrtoint` gate. On 64-bit a
 pointer and `u64` are both 8 bytes, so `@bitcast`'s same-width check passes and

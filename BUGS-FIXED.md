@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## BH-18 #3 FIXED (2026-06-23) — `@bitcast` int↔ptr forge closed by wiring the verified predicate
+
+**What broke (🔴 UNDER-rejection, a grammar-level unsafe breach):** `@bitcast(*T, intval)`
+/ `@bitcast(uN, *T)` reinterpreted an integer as a pointer with a clean compile — on a
+64-bit target a ptr and u64 are both 8 bytes so `zer_bitcast_width_valid` passed, and the
+handler did only width + const/volatile checks, never an int-vs-ptr operand check. This
+escaped the mmio/`@inttoptr` gate and synthesizes the banned `ptr+N`. Every other path
+(`(*T)int`→@inttoptr, `(u32)ptr`→@ptrtoint) gates int↔ptr; only `@bitcast` bypassed it.
+
+**Root cause:** the fix predicate `zer_bitcast_operand_valid(is_primitive)` (returns 0 for
+a pointer operand) was ALREADY in src/safety/cast_rules.c AND VST-verified in
+proofs/vst/verif_cast_rules.v — but `checker.c` never called it (the proven-but-unwired
+class). 
+
+**Fix (checker.c ~7270):** wire it. Compute `src_prim`/`dst_prim` (non-pointer-kind, via
+`type_dispatch_kind` so the type-dispatch audit isn't tripped); reject when
+`zer_bitcast_operand_valid(src_prim) != zer_bitcast_operand_valid(dst_prim)` — the
+predicate results differ iff exactly one operand is a pointer = the int↔ptr forge,
+pointing at `@inttoptr`/`@ptrtoint`. Ptr↔ptr (use @ptrcast/@pun) and scalar↔scalar
+bit-reinterpret stay allowed.
+
+**Verified EMPIRICALLY (not asserted):** int→ptr AND ptr→int forges both rejected with the
+operand error; `@bitcast(u32, f32)` still compiles + runs; `make check` GREEN (Rust 784/0,
+Zig 36/0, shape-matrix 50/50, fuzz 200, type-dispatch audit OK — no ptr↔ptr regression).
+Tripwire: `tests/zer_fail/bitcast_int_ptr.zer`.
+
+---
+
 ## Session 2026-06-23 — Operational oracles for 4 previously-uncertified safety classes
 
 ### INFRA — certify the finite-state domain for bounds/VRP, qualifier, capture, volatile

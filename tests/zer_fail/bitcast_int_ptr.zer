@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// BH-18 #3: @bitcast must NOT forge a pointer from an integer. int<->ptr must go
+// through @inttoptr/@ptrtoint (mmio/provenance-gated) — @bitcast is bit-reinterpret
+// for same-width scalars (and ptr<->ptr / scalar<->scalar), never a pointer/non-
+// pointer mix. On a 64-bit target a u64 and a *u32 are both 8 bytes, so the width
+// check passes; the operand check (zer_bitcast_operand_valid) is what rejects this.
+u32 main() {
+    u64 addr = 4096;
+    *u32 p = @bitcast(*u32, addr);   // int -> ptr FORGE: ERROR (use @inttoptr)
+    return *p;
+}

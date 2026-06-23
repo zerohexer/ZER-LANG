@@ -4210,6 +4210,29 @@ static Type *check_expr(Checker *c, Node *node) {
             Node *vnode = node->assign.value;
             while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
                 vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* P9 (BUG-737 field-launder, 2026-06-24): `g = param.field` (or
+             * `param[i]`) where the stored value is a pointer/slice FIELD of a
+             * non-keep-derived by-value struct param launders the caller's
+             * pointer exactly like `g = param` (the whole-struct case BUG-737
+             * already covers). The non-keep sink below matched only a bare
+             * NODE_IDENT, so the FIELD form slipped through (a verified escape
+             * under-rejection: `stash(Holder h){ g = h.p; }` + `stash({.p=&local})`
+             * compiled). Descend the field/index projection to the root ident,
+             * GATED on the stored value being a pointer/slice — a scalar field
+             * store (`g_int = h.count`) copies a value, not a reference, and
+             * must NOT infer keep. Certified by param_lattice.v
+             * projection_preserves_escape / buggy_projection_unsound. */
+            if (vnode && (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
+                Type *vt2 = typemap_get(c, node->assign.value);
+                if (vt2 && (type_dispatch_kind(vt2) == TYPE_POINTER ||
+                            type_dispatch_kind(vt2) == TYPE_SLICE)) {
+                    while (vnode && (vnode->kind == NODE_FIELD ||
+                                     vnode->kind == NODE_INDEX)) {
+                        if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
+                        else vnode = vnode->index_expr.object;
+                    }
+                }
+            }
             if (vnode && vnode->kind == NODE_IDENT) {
                 Symbol *val_sym = scope_lookup(c->current_scope,
                     vnode->ident.name, (uint32_t)vnode->ident.name_len);

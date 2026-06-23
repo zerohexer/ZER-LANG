@@ -1,0 +1,15 @@
+// P9 fix flexibility (2026-06-24): a by-value struct whose pointer field points
+// to a GLOBAL may be passed to a function that persists that field to a global —
+// the value is retainable, so the inferred `keep` is satisfied. Companion to
+// tests/zer_fail/escape_byval_struct_field_launder.zer (same function; the `.p`
+// points to a local there, a global here). Proves the field-launder fix is the
+// keep INFERENCE + call-site check, not a blanket ban on storing param fields.
+struct Holder { *u32 p; }
+?*u32 g_target;
+u32 g_backing;
+void stash(Holder h) { g_target = h.p; }
+u32 main() {
+    Holder hh = { .p = &g_backing };        // hh.p points to a GLOBAL
+    stash(hh);
+    return 0;
+}

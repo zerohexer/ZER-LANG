@@ -163,3 +163,34 @@ Proof.
     rewrite Hlocal in Htrue. simpl in Htrue. discriminate.
   - reflexivity.
 Qed.
+
+(* ================================================================
+   (T5) FIELD / INDEX PROJECTION INHERITS THE BASE REGION — the BUG-737
+   field-launder soundness (the P9 hole, 2026-06-24).
+
+   Projecting a pointer FIELD (or element) out of a value — `base.field`,
+   `base[i]` — does NOT make it more escapable than `base`: the projected
+   pointer has the same (caller-unknown) provenance as the value it came out
+   of. So the C classification of `g = param.field` MUST descend the
+   projection to the ROOT and use the root's region (here: ARParam n / the
+   non-keep taint), NOT treat the field as a fresh escapable value. *)
+Definition aregion_of_projection (a : aregion) : aregion := a.
+
+Theorem projection_preserves_escape : forall a argreg,
+  can_escape (resolve (aregion_of_projection a) argreg)
+    = can_escape (resolve a argreg).
+Proof. reflexivity. Qed.
+
+(* the UNSOUND classification P9 actually performed: a pointer field of a
+   by-value struct PARAM was never tainted (the non-keep sink only matched a
+   whole-struct ident, not `param.field`), so storing it to a global was
+   treated as storing a STATIC (escapable-safe) value. This witness — a field
+   of a param bound to a LOCAL is "escapable" under the bug, "not escapable"
+   under the inheriting rule — is why the C must descend the projection.
+   (Mirrors capture_lattice.v's buggy_reset_unsound for the if-unwrap case.) *)
+Definition aregion_of_projection_BUGGY (a : aregion) : aregion := ARStatic.
+
+Theorem buggy_projection_unsound : forall n,
+  can_escape (resolve (aregion_of_projection_BUGGY (ARParam n)) (fun _ => RegLocal)) = true
+  /\ can_escape (resolve (ARParam n) (fun _ => RegLocal)) = false.
+Proof. intro n. split; reflexivity. Qed.

@@ -167,8 +167,11 @@ others.** The "is this value frame-bound (local/arena-derived)?" question is
 re-implemented at every escape sink (store-to-global, return, keep-call-site,
 keep-inference, struct-field-store, spawn-arg), and several historically missed the
 same value shapes — a call-laundered local (`g = f(local[..])`), a slice-of-local
-arg, a pointer/slice FIELD of a local-derived struct. That single class produced
-BUG-760..763 (each a separate sink, same blind spot). **When editing escape analysis,
+arg, a pointer/slice FIELD of a local-derived struct, and (P9, 2026-06-24) a pointer
+FIELD of a non-keep by-value struct PARAM (`stash(Holder h){ g = h.p; }` — the keep-2a
+sink matched only a bare ident `g = h`, not `g = h.p`, so the launder compiled; fixed by
+descending the projection, certified by `param_lattice.v` T5). That single class produced
+BUG-760..763 + P9 (each a separate sink, same blind spot). **When editing escape analysis,
 re-run the FULL sink matrix** against those shapes; a green test at one sink proves
 nothing about the others. Shared proxy: `call_has_local_derived_arg` (checker.c ~880);
 flags: `is_local_derived` / `is_arena_derived` / `is_nonkeep_derived`; keep enforcement

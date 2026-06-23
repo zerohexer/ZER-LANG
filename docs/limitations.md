@@ -62,6 +62,14 @@ from this ledger after the parallel workflow rate-limited).
   (lambda_zer_capture/capture_lattice.v — `capture_preserves_escape` + `buggy_reset_unsound`
   witness the bug); fix = capture inherits the matched value's region.
 - **defer-body UAF** (line ~1459) — a defer body uses a handle the function body then frees.
+- **P9 by-value struct field-launder** (#P9) — **[FIXED 2026-06-24 — see BUGS-FIXED.md]**.
+  Was: `void stash(Holder h){ g = h.p; }` + `stash({.p=&local})` COMPILED — a pointer field
+  of a by-value struct PARAM stored to a global laundered a local-derived pointer (the direct
+  `g = h.p` with a local `h` was already caught; only the through-a-param launder slipped).
+  Found by the empirical probe sweep. Fixed: the keep-2a sink (checker.c ~4209) now descends
+  the `param.field` projection to the root param and infers keep (theorem param_lattice.v T5
+  projection_preserves_escape / buggy_projection_unsound). This was a form→state coverage
+  gap, NOT a missing finite state — the per-sink-patchwork class the codebase warns about.
 
 **Data-race (🟠 concurrency):** shared-struct multi-access hidden in a cast/intrinsic/
 index/orelse SUBEXPRESSION evades the same-statement deadlock/lock check (#7, ~1881); the
@@ -78,17 +86,33 @@ trap on the AST emit path (~938).
 
 ### NOT-FLEXIBLE — over-rejects (rejects correct code). Coarse abstractions.
 
-- **Escape disjunctive return** — `pick(){if c return &local; return p}` collapses the
-  WHOLE summary to UNKNOWN (the flat `ret_param_mask` can't hold a disjunction), so EVERY
-  call of `pick` is maximally conservative. RICH oracle SPEC'd
-  (lambda_zer_escape/join_lattice.v, the n-ary JOIN) but NOT implemented; impl =
-  mask→member-set behind the same `call_result_escapes` gate (not a re-architecture).
-- **Aliased mutation / `alloc_id` fate-sharing** — provably-disjoint aliased mutation is
-  rejected (no relational layer), and freeing one slice-half false-positives the other
-  (alloc_id couples them). RICH oracle SPEC'd (lambda_zer_disjoint/disjoint_lattice.v, the
-  EXCEEDS-Rust prize) but NOT implemented; impl needs a relational VRP layer (a
-  re-architecture, deferred).
-- **Nested inline designated initializer** wrongly rejected ("got void") (#13, ~2119).
+- **Escape disjunctive return** — **NARROWER THAN PREVIOUSLY STATED (empirically corrected
+  2026-06-24).** The common disjunctive shapes COMPILE: `pick(c){if c return &g1; return &g2}`
+  (both static) and `either(p,c){if c return p; return &g}` called with a global arg both
+  compile (Stages 1-2 handle them). The flat `ret_param_mask`'s only real loss vs the JOIN is
+  using the surviving `ARParam` fact for DOWNSTREAM precision, not the escape verdict itself
+  — for the escape decision, "summary incomplete → UNKNOWN → reject" and "summary contains
+  ARLocal → reject" coincide, so a function with a genuinely-unclassifiable return path is
+  rejected either way (and is usually unsafe to escape anyway). The RICH oracle
+  (lambda_zer_escape/join_lattice.v) is still worth implementing for downstream precision +
+  the relational tail, but the "EVERY call maximally conservative" framing was an over-claim.
+- **Aliased mutation** — **DOES NOT REPRODUCE (empirically corrected 2026-06-24).** ZER has
+  NO aliasing-XOR-mutability rule, so two live interior pointers into one array mutated
+  through both (`*u32 p=&a[0]; *u32 q=&a[5]; *p=1; *q=2;`) COMPILES — ZER already accepts
+  what Rust rejects here; there is nothing to "unblock". The disjoint oracle
+  (lambda_zer_disjoint/disjoint_lattice.v) is NOT needed to accept aliased mutation. The
+  genuine residual is narrower: the `alloc_id` **fate-sharing** false-positive (freeing one
+  slice-half false-flags the other; mixing literal/variable index frees, BUG-741) — that is
+  the only real over-rejection in this area, and it needs the relational layer.
+- **Nested inline designated initializer** wrongly rejected ("got void") (#13, ~2119) —
+  **CONFIRMED reproduces (2026-06-24):** `Outer o = { .inner = { .x = 1 }, .y = 2 };` is
+  rejected with "field '.inner' … got 'void'". A plain bug, not a deep inference gap.
+- **MAYBE_FREED path-correlation** — **CONFIRMED the one genuine idiomatic over-rejection
+  (2026-06-24):** `if(c){free(h);} if(c!=0?no:yes...){use(h);}` — freeing under one guard and
+  using under the disjoint guard is memory-safe, but the LINEAR (non-flow-sensitive) handle
+  analysis sees `use` after a MAYBE_FREED and rejects. The fix is a flow-sensitive handle
+  state lattice (a real subsystem) — see the handle-oracle gap. This is the highest-value
+  flexibility target.
 - Every flat-lattice class carries residual over-rejection by construction (see below).
 
 ### ORACLE COVERAGE — the theorem layer, by class (the (c) criterion)

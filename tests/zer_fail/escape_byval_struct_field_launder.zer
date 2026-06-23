@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// P9 (BUG-737 field-launder, 2026-06-24): storing a POINTER FIELD of a by-value
+// struct PARAM to a global launders the caller's pointer — the same escape as
+// storing the whole struct (which BUG-737 already caught). `stash` infers keep
+// on `h` (it persists `h.p` to a global); passing a Holder whose `.p` points to
+// a LOCAL is then rejected at the call site. The direct forms (`g = &x`,
+// `g = h.p` with a local `h`) were already rejected; only the launder THROUGH a
+// by-value struct param was an under-rejection (it COMPILED — a stored dangling
+// pointer). Certified by proofs/operational/lambda_zer_escape/param_lattice.v
+// (projection_preserves_escape / buggy_projection_unsound).
+struct Holder { *u32 p; }
+?*u32 g_target;
+void stash(Holder h) { g_target = h.p; }   // persists h.p -> infers keep on h
+u32 main() {
+    u32 x = 5;
+    Holder hh = { .p = &x };                // hh.p points to a LOCAL
+    stash(hh);                              // ERROR: local-derived holder to keep param
+    return 0;
+}

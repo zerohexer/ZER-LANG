@@ -5,6 +5,44 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## P9 FIXED (2026-06-24) — by-value struct pointer-field laundered to a global (🔴 escape under-rejection)
+
+**What broke (🔴 UNDER-rejection, a stored dangling pointer):** storing a POINTER
+FIELD of a by-value struct PARAMETER to a global — `void stash(Holder h){ g = h.p; }`
+called as `stash({.p = &local})` — COMPILED. The same escape done directly was caught:
+`g = &x` and `g = h.p` with a LOCAL `h` both reject. Only the launder THROUGH a by-value
+struct param slipped the net. Found by an empirical over-/under-rejection probe sweep
+(the direct controls reject, the laundered form compiled).
+
+**Root cause (a form→state coverage gap, NOT a missing finite state):** BUG-737 (2026-06-10)
+correctly TAINTS a non-keep by-value struct param carrying a data pointer
+(`is_nonkeep_derived`, `nonkeep_root_param` at registration, checker.c ~13923) and the
+keep-2a persist sink (checker.c ~4209) consumes that taint to infer keep — but the sink
+only matched a bare `NODE_IDENT` value (`g = h`, the whole struct). The FIELD form
+`g = h.p` is a `NODE_FIELD`, so the sink was skipped entirely and no keep was inferred,
+so the call site was never restricted. The escape lattice already has the state (reachable
+-from-param); the C just didn't classify the `param.field` form onto it.
+
+**Fix (checker.c ~4209):** descend the field/index projection to the root ident in the
+keep-2a sink, GATED on the stored value being a pointer/slice (a scalar field store
+`g_int = h.count` copies a value, not a reference — must NOT infer keep). Then `g = h.p`
+infers keep on `h`'s root param exactly as `g = h` does; the call site rejects a Holder
+whose `.p` is local-derived.
+
+**Theorem first (param_lattice.v T5, zero admits, in the gate):** `projection_preserves_escape`
+(a field/index projection inherits the base region — `base.field` is at most as escapable as
+`base`) + `buggy_projection_unsound` (the reset-to-static the bug performed is a witnessed
+soundness violation — a field of a param bound to a LOCAL classified "escapable"). Mirrors
+capture_lattice.v's `buggy_reset_unsound`.
+
+**Verified empirically:** `stash({.p = &local})` REJECTED ("local-derived pointer 'hh'
+cannot satisfy 'keep' parameter"); `stash({.p = &global})` COMPILES (flexible — keep
+INFERENCE, not a ban); scalar-field store COMPILES (no spurious keep); `make check` GREEN.
+Tests: `tests/zer_fail/escape_byval_struct_field_launder.zer`,
+`tests/zer/escape_byval_struct_field_static_ok.zer`.
+
+---
+
 ## BH-18 #4 FIXED (2026-06-23) — `@pun` widening OOB closed by a compile-time size reject
 
 **What broke (🔴 UNDER-rejection):** `@pun`'s guarantee is a runtime type_id trap on

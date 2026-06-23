@@ -7222,6 +7222,36 @@ static Type *check_expr(Checker *c, Node *node) {
                          * check_volatile_strip handles distinct unwrap internally. */
                         check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
                                              node->loc.line, "@pun");
+                        /* BH-18 #4: a @pun that WIDENS the pointee (target pointee
+                         * larger than the source pointee) reads PAST the source
+                         * object = OOB. The runtime type_id trap is skipped for an
+                         * in-ZER primitive/slice pointer whose type_id packs 0
+                         * (emitter `type_id != TGT && type_id != 0`), so the OOB is
+                         * SILENT. The widening is statically known when both pointee
+                         * sizes are known, so reject at compile time (better than a
+                         * skipped runtime trap). Unknown pointee (opaque/cinclude →
+                         * CONST_EVAL_FAIL) keeps the runtime guard — the FFI floor.
+                         * type_dispatch_kind guards (no raw ->kind, audit-safe). */
+                        if (type_dispatch_kind(val_type) == TYPE_POINTER &&
+                            result && type_dispatch_kind(result) == TYPE_POINTER &&
+                            eff->pointer.inner &&
+                            type_dispatch_kind(eff->pointer.inner) != TYPE_OPAQUE) {
+                            int64_t src_sz = compute_type_size(eff->pointer.inner);
+                            int64_t dst_sz = tgt_eff_pun_strip
+                                ? compute_type_size(tgt_eff_pun_strip->pointer.inner)
+                                : CONST_EVAL_FAIL;
+                            /* ONLY a concrete, KNOWN-sized source pointee (src_sz > 0)
+                             * can be read past. An OPAQUE / unknown / target-dependent
+                             * source (excluded above, or compute_type_size <= 0 /
+                             * CONST_EVAL_FAIL) keeps the runtime type_id guard — the
+                             * cinclude/FFI floor (e.g. @pun(*Sensor, *opaque)). */
+                            if (src_sz > 0 && dst_sz != CONST_EVAL_FAIL && dst_sz > src_sz) {
+                                checker_error(c, node->loc.line,
+                                    "@pun widens the pointee — the %lld-byte target "
+                                    "reads past the %lld-byte source (out-of-bounds)",
+                                    (long long)dst_sz, (long long)src_sz);
+                            }
+                        }
                     }
                 }
             } else {

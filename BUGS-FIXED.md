@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## BH-18 #4 FIXED (2026-06-23) — `@pun` widening OOB closed by a compile-time size reject
+
+**What broke (🔴 UNDER-rejection):** `@pun`'s guarantee is a runtime type_id trap on
+mismatch, but the emitted guard is `if (type_id != TGT && type_id != 0) trap`
+(emitter.c:2972 + 5 siblings; comment at 2908 admits "type_id == 0 sentinel matches
+anything"). An in-ZER pointer to a PRIMITIVE (`*u32`/slice `.ptr`/`@inttoptr` result)
+packs `type_id==0`, so `(0 != TGT && 0 != 0)` = false → the trap is SKIPPED even for a
+statically-known size mismatch: `*u32 sp=&small; *Big bp=@pun(*Big, sp); bp.b` reads 8
+bytes past a 4-byte object (OOB read).
+
+**Fix (checker.c ~7224, compile-time — the soundest place):** reject a WIDENING pun.
+When the source and target pointees are both CONCRETE known-sized (`compute_type_size`)
+and the target is larger, the pun reads past the source → compile error (better than a
+skipped runtime trap). An OPAQUE / unknown source pointee (the cinclude/FFI floor,
+`@pun(*Sensor, *opaque)`) is EXCLUDED and keeps the runtime guard —
+`type_dispatch_kind(eff->pointer.inner) != TYPE_OPAQUE` + `src_sz > 0`. (The exclusion
+was found EMPIRICALLY: a first cut without it false-rejected `pun_from_opaque`, caught
+by `make check` — fixed, not papered over.)
+
+**Verified empirically:** `@pun(*Big, *u32)` (16←4) rejected with the OOB error;
+`pun_from_opaque` (FFI floor) still compiles + runs; `make check` GREEN (Rust 784/0 on
+re-run; the one-off `rc_cond_004` fail was a pre-existing FLAKY concurrency test [4/5],
+uses no `@pun`). Tripwire: `tests/zer_fail/pun_primitive_to_struct.zer`.
+
+---
+
 ## BH-18 #3 FIXED (2026-06-23) — `@bitcast` int↔ptr forge closed by wiring the verified predicate
 
 **What broke (🔴 UNDER-rejection, a grammar-level unsafe breach):** `@bitcast(*T, intval)`

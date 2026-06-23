@@ -33,7 +33,8 @@ from this ledger after the parallel workflow rate-limited).
   @ptrtoint" (6848) — every other path gates int↔ptr; only `@bitcast` bypasses all three.
   **Fix = one call site** (wire the proven predicate; reject when exactly one of {src,dst}
   is a pointer) + tripwire. The cleanest fix in this whole audit.
-- **`@pun` `type_id==0` short-circuit** (#4, line ~1741) — the emitted guard is
+- **`@pun` `type_id==0` short-circuit** (#4) — **[FIXED 2026-06-23 — compile-time
+  widening reject; see the FIXED entry below]**. Was: the emitted guard is
   `if (type_id != TGT && type_id != 0) trap` (emitter.c:2723/2870/2951/2972/6860/6921;
   comment at 2908 admits "type_id == 0 sentinel matches anything"). An in-ZER pointer to
   a PRIMITIVE (`*u32`/`*u8`/slice `.ptr`/`@inttoptr` result) packs `type_id==0`, so
@@ -1873,9 +1874,21 @@ reinterpretation stay allowed. Tripwire: `tests/zer_fail/bitcast_int_ptr.zer`.
 
 ---
 
-## OPEN — BH-18 #4 — `@pun(*Struct, *primitive)` silently skips its runtime type_id trap → OOB read (🔴 soundness)
+## FIXED (2026-06-23) — BH-18 #4 — `@pun(*Struct, *primitive)` silently skips its runtime type_id trap → OOB read (🔴 soundness)
 
-**Symptom:** `@pun`'s documented guarantee is "runtime type_id check that traps
+**RESOLVED (compile-time, the soundest place):** the @pun checker handler (checker.c
+~7224) now rejects a WIDENING pun — when the source pointee and target pointee are
+both CONCRETE known-sized (`compute_type_size`) and the target is larger, the pun
+reads past the source = OOB, so it's a compile error (better than a skipped runtime
+trap). An OPAQUE/unknown source pointee (the cinclude/FFI floor, e.g.
+`@pun(*Sensor, *opaque)`) is EXCLUDED — it keeps the runtime type_id guard
+(`type_dispatch_kind(eff->pointer.inner) != TYPE_OPAQUE` + `src_sz > 0`). Verified
+empirically: `@pun(*Big, *u32)` (16←4) rejected with the OOB error; `pun_from_opaque`
+(the FFI-floor positive test) still compiles + runs; `make check` GREEN (Rust 784/0 on
+re-run — the one-off `rc_cond_004` failure was a pre-existing FLAKY concurrency test
+[4/5], unrelated: it uses no `@pun`). Tripwire: `tests/zer_fail/pun_primitive_to_struct.zer`.
+
+**Symptom (was):** `@pun`'s documented guarantee is "runtime type_id check that traps
 on mismatch." A fully-typed in-ZER pointer to a **primitive** (`*u32`, `*u8`,
 a slice `.ptr`, an `@inttoptr` result) packs `type_id == 0`, and the emitted
 guard `if (type_id != TARGET && type_id != 0) trap;` short-circuits to false —

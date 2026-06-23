@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// BH-18 #4: @pun(*Big, *u32) widens the pointee — a 16-byte target read through a
+// pointer to a 4-byte source object = out-of-bounds read. An in-ZER primitive
+// pointer packs type_id==0, so the @pun runtime type_id trap is SKIPPED
+// (emitter: `type_id != TGT && type_id != 0`) and the OOB would be silent. The
+// widening is statically known, so the compiler rejects it.
+struct Big { u64 a; u64 b; }
+u32 main() {
+    u32 small = 7;
+    *u32 sp = &small;
+    *Big bp = @pun(*Big, sp);          // widen 4 -> 16 bytes: ERROR (OOB read)
+    return @truncate(u32, bp.b);
+}

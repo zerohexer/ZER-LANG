@@ -5,6 +5,38 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## ORACLE (2026-06-24) — handle flow-lattice: the MAX oracle for use-after-free / MAYBE_FREED
+
+**Theorem-first (the MAYBE_FREED flexibility work + the handle proof-completeness gap).**
+The handle class (UAF/double-free/leak) is the compiler's #1 safety job but had the
+WEAKEST oracle: the operational track (`handle_safety.v`/`adequacy.v`) leaves its
+soundness obligations unproved (excluded from the admit-gate), and the gated Iris track is
+a flat 2-state resource that never models the 3-valued ALIVE/FREED/MAYBE_FREED the compiler
+runs. So the abstract DOMAIN was uncertified — the root of both the idiomatic over-rejection
+`if(c){free(h)} if(!c){use(h)}` and the MAX-oracle audit's "no real handle oracle" finding.
+
+**`proofs/operational/lambda_zer_handle/handle_flow_lattice.v`** (8 theorems, zero admits,
+in the admit-gate — now 50 gated files), self-contained, two levels:
+- **Level A — the soundness lattice (certifies what the compiler runs today):** finite states
+  `{HUninit, HAlive, HFreed, HMaybe}`, merge = JOIN (widen-toward-freed), decision USE-requires
+  -ALIVE. `use_sound` (T1, no UAF), `join_covers_left/right` (merge covers both predecessors),
+  `join_freed_blocks_use` (T4 — a free on ANY incoming branch blocks the post-merge use; the
+  exact MAYBE_FREED conservatism, here CERTIFIED), `join_alive_usable` (T3 basic precision).
+- **Level B — the GUARDED refinement (drives the over-rejection down):** a state is qualified
+  by the PATH PREDICATE it holds under; a use under guard Gu is safe iff Gu is DISJOINT from
+  the free guard Gf. `maybe_freed_correlation_recovered` (the precision witness: free under
+  `c`, use under `!c`, disjoint → ACCEPTED, vs the flat lattice's HMaybe reject),
+  `guarded_use_sound` (no UAF under a satisfied guard), `guarded_not_disjoint_rejects`
+  (no under-rejection — a non-disjoint guard pair is a real UAF, never accepted).
+
+**Status:** Level A is the compiler's CURRENT behavior, now certified (closing the
+domain-uncertified half of the handle proof gap). Level B is the SPEC; its implementation —
+a per-free path-predicate in zercheck_ir so `if(c)free; if(!c)use` is accepted — is the
+follow-on (tracked in docs/limitations.md). The operational-track admits + Iris placeholders
+are a separate cleanup (the domain is now certified independently).
+
+---
+
 ## #13 FIXED (2026-06-24) — nested inline designated initializer rejected ("got void")
 
 **What broke (over-rejection):** a nested designated initializer

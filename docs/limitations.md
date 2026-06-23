@@ -111,18 +111,32 @@ trap on the AST emit path (~938).
   the field type (which it inherits as context). 2/3-level nests compile+run; inner
   field-name/type errors still rejected.
 - **MAYBE_FREED path-correlation** — **CONFIRMED the one genuine idiomatic over-rejection
-  (2026-06-24):** `if(c){free(h);} if(c!=0?no:yes...){use(h);}` — freeing under one guard and
-  using under the disjoint guard is memory-safe, but the LINEAR (non-flow-sensitive) handle
-  analysis sees `use` after a MAYBE_FREED and rejects. The fix is a flow-sensitive handle
-  state lattice (a real subsystem) — see the handle-oracle gap. This is the highest-value
-  flexibility target.
+  (2026-06-24); ORACLE WRITTEN, implementation pending.** `if(c){free(h);} if(!c){use(h);}`
+  — freeing under one guard and using under the DISJOINT guard is memory-safe, but the LINEAR
+  (non-flow-sensitive) handle analysis sees `use` after a MAYBE_FREED and rejects. The
+  theorem is done: `proofs/operational/lambda_zer_handle/handle_flow_lattice.v` Level B
+  (`maybe_freed_correlation_recovered`) certifies that a use under guard `!c` is safe when the
+  free is under the disjoint guard `c`, with `guarded_not_disjoint_rejects` pinning
+  no-under-rejection (a non-disjoint guard pair is a real UAF, never accepted). The
+  IMPLEMENTATION — a per-free path-predicate in zercheck_ir, so the guarded refinement is
+  checked at the use site — is the follow-on (a real subsystem; Level A, the current
+  conservative behavior, is already certified by the same file). Highest-value flexibility
+  target remaining.
 - Every flat-lattice class carries residual over-rejection by construction (see below).
 
 ### ORACLE COVERAGE — the theorem layer, by class (the (c) criterion)
 
-- **AT-MAX (sound + MAX-oracle-backed):** `@ptrcast`/`@container` provenance
-  (lambda_zer_opaque Iris ghost-map, J04/J11), handle states (lambda_zer_handle), MMIO
-  ranges (lambda_zer_mmio). These pass all three criteria.
+- **AT-MAX (sound + MAX-oracle-backed):** **CORRECTED (2026-06-24, maximality workflow
+  overturned the original trio).** The verified at-max set is `move` (lambda_zer_move),
+  `qualifier` and `volatile` (the property admits no richer sound abstraction). `@ptrcast`/
+  `@container` provenance (lambda_zer_opaque) is SUFFICIENCY-only for the modeled fragment
+  (PtrNull / type_id=0 / structured `@container` provenance unmodeled). MMIO is COARSE (see
+  below). **Handle is NOT at-max:** its operational track leaves soundness obligations
+  unproved (excluded from the gate) and the gated Iris track is flat 2-state with placeholder
+  lemmas — BUT the abstract DOMAIN is now certified by
+  `lambda_zer_handle/handle_flow_lattice.v` (the 4-state flow lattice + JOIN merge, Level A;
+  the guarded MAYBE_FREED refinement, Level B). So handle's domain went uncertified → certified
+  (2026-06-24); the proof-track admits/placeholders remain a separate cleanup.
 - **COARSE oracle (exists but FLAT — precision left on the table):** escape (shipped
   `param_lattice.v` is flat; the rich `join_lattice.v` is spec-only), bounds (interval, not
   relational `i<j`), qualifier / capture / volatile (the 4 added 2026-06-23 are flat by

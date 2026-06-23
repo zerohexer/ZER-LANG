@@ -358,6 +358,7 @@ check-proofs:
 	@# (syntax.v, semantics.v) are included when in non-handle subsets.
 	@FILES=""; \
 	 for f in proofs/operational/lambda_zer_handle/iris_*.v \
+	          proofs/operational/lambda_zer_handle/handle_flow_lattice.v \
 	          proofs/operational/lambda_zer_move/*.v \
 	          proofs/operational/lambda_zer_opaque/*.v \
 	          proofs/operational/lambda_zer_escape/*.v \

@@ -38,6 +38,7 @@ lambda_zer_handle/iris_misc_sections.v
 lambda_zer_handle/iris_mmio_cast_escape.v
 lambda_zer_handle/iris_concurrency.v
 lambda_zer_handle/iris_demo.v
+lambda_zer_handle/handle_flow_lattice.v
 
 lambda_zer_move/syntax.v
 lambda_zer_move/semantics.v

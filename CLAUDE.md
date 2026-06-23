@@ -1034,6 +1034,18 @@ disjoint_lattice.v` (the EXCEEDS-Rust prize — accept aliased mutation Rust rej
 by rule when disjointness is PROVEN; disjointness is ADDITIVE, structurally unable
 to suppress UAF/OOB (the BH-18 #1 defense); impl needs a relational VRP layer = a
 re-architecture, deferred). admit-gate now 49 files.
+HANDLE flow-lattice oracle (2026-06-24): `lambda_zer_handle/handle_flow_lattice.v` (8 thms,
+zero admits, admit-gate now 50 files) — the MAX oracle for the use-after-free / MAYBE_FREED
+class (the #1 safety class, previously the WEAKEST-proven: operational track unproved +
+excluded, gated Iris track flat 2-state + placeholders). Level A certifies the soundness
+lattice the compiler ALREADY runs ({HUninit,HAlive,HFreed,HMaybe}, merge=JOIN,
+use-requires-ALIVE; `join_freed_blocks_use` = the MAYBE_FREED conservatism CERTIFIED). Level B
+specs the GUARDED refinement that recovers the idiomatic over-rejection `if(c){free}
+if(!c){use}` (`maybe_freed_correlation_recovered` — a use under guard `!c` is safe when the
+free is under the disjoint guard `c`; `guarded_not_disjoint_rejects` = no under-rejection).
+Level B's IMPLEMENTATION (a per-free path-predicate in zercheck_ir) is the pending follow-on;
+Level A is current behavior. So the handle DOMAIN is now certified; the proof-track
+admits/placeholders are a separate cleanup. The oracle-backed classes are now 12.
 
 The three levels (keep straight in any claim):
 - **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.

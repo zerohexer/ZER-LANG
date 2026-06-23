@@ -5,6 +5,129 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — MAX-ORACLE GAP AUDIT (2026-06-23) — the master map: which safety classes are not-sound / not-flexible / coarse-or-no-oracle
+
+Audit of EVERY safety class against the MAX-ORACLE STANDARD (CLAUDE.md): a class is
+"at maximum" iff it is (a) SOUND (zero under-rejection — never accepts unsafe), (b)
+FLEXIBLE (minimal over-rejection), AND (c) backed by a MAX oracle (a Coq/Iris Level-1
+spec whose finite-state set is COMPLETE and whose abstraction is the richest sound one,
+not a flat/coarse one). This is the INDEX; per-hole detail lives in the linked entries
+below. Verdict tally: ~14 live under-rejections (6 are 🔴 memory-corruption), ~4 real
+over-rejections, and MOST classes are coarse-oracle or no-oracle — only 3 are genuinely
+AT-MAX. Two clusters (type/provenance fully audited 2026-06-23; the other five audited
+from this ledger after the parallel workflow rate-limited).
+
+### NOT-SOUND — under-rejects (accepts unsafe). The urgent tier (close before precision work).
+
+**Memory-corruption (🔴 UAF/OOB):**
+- **`@bitcast` int↔ptr forge** (#3, line ~1695) — `@bitcast(*T, intval)` / `@bitcast(uN, *T)`
+  reinterprets an integer as a pointer with a clean compile: on 64-bit a ptr and u64 are
+  both 8 bytes so `zer_bitcast_width_valid` passes, and the handler (checker.c:7230-7270)
+  calls ONLY the width + const/volatile-strip checks — never an int-vs-ptr operand check.
+  A grammar-level breach of the "no in-language unsafe" closure (synthesizes the banned
+  `ptr+N`). The fix predicate ALREADY EXISTS and is VST-verified —
+  `zer_bitcast_operand_valid(is_primitive)` returns 0 for a pointer operand
+  (src/safety/cast_rules.c:31, proofs/vst/verif_cast_rules.v) — but is NEVER CALLED from
+  checker.c. Control: `(*T)int`→"use @inttoptr" (checker.c:6840), `(u32)ptr`→"use
+  @ptrtoint" (6848) — every other path gates int↔ptr; only `@bitcast` bypasses all three.
+  **Fix = one call site** (wire the proven predicate; reject when exactly one of {src,dst}
+  is a pointer) + tripwire. The cleanest fix in this whole audit.
+- **`@pun` `type_id==0` short-circuit** (#4, line ~1741) — the emitted guard is
+  `if (type_id != TGT && type_id != 0) trap` (emitter.c:2723/2870/2951/2972/6860/6921;
+  comment at 2908 admits "type_id == 0 sentinel matches anything"). An in-ZER pointer to
+  a PRIMITIVE (`*u32`/`*u8`/slice `.ptr`/`@inttoptr` result) packs `type_id==0`, so
+  `(0 != TGT && 0 != 0)` = false → trap SKIPPED even for a statically-known size mismatch
+  (`*u32 sp=&small; *Big bp=@pun(*Big,sp); bp.b` reads 8 past a 4-byte object). The opaque
+  oracle (lambda_zer_opaque J04) models TRACKED provenance and never sanctions extending
+  the unknown-tag(0) escape to a fully-typed in-program pointer. **Fix:** don't grant the
+  `!=0` escape to a fully-typed in-ZER primitive/slice pointer (the 0-escape is only for
+  genuinely-unknown cinclude `*opaque`), or add the compile-time size-widening check.
+- **move-struct alias** (#1, line ~1551) — an alias taken BEFORE the move-transfer isn't
+  registered in the source's state group, so TRANSFERRED doesn't propagate → free/move
+  tracking defeated.
+- **VRP scope-leak OOB** (#2, line ~1636) — a branch-local range narrowing leaks past a
+  control-flow join (flat AST `var_range_count` not saved/restored on the non-comparison
+  branch) → the compiler proves `buf[idx]` safe and emits NO bounds check on a path where
+  `idx` is OOB. ROOT: the sound CFG-VRP `vrp_ir.c` is orphaned (absent from the Makefile,
+  not even compiled); production runs the unsound flat pass. Oracle now exists
+  (lambda_zer_bounds/bounds_lattice.v `elide_on_join_sound`); fix = wire `vrp_ir.c`.
+- **fixed-array bare-call index** (#5, line ~1786) — `arr[f()]` on a fixed array drops the
+  bounds check on the bare-call single-eval emission path.
+- **`|*v|` capture escape** (#6, line ~1829) — the `if(opt)|*v|` capture binds `v=&m.value`
+  (into a local) but the desugaring doesn't inherit `is_local_derived`, so `g=v` is treated
+  as a normal global store → dangling global. The direct `g=&m.value` IS rejected; only the
+  capture-synthesized address slips through. Oracle now exists
+  (lambda_zer_capture/capture_lattice.v — `capture_preserves_escape` + `buggy_reset_unsound`
+  witness the bug); fix = capture inherits the matched value's region.
+- **defer-body UAF** (line ~1459) — a defer body uses a handle the function body then frees.
+
+**Data-race (🟠 concurrency):** shared-struct multi-access hidden in a cast/intrinsic/
+index/orelse SUBEXPRESSION evades the same-statement deadlock/lock check (#7, ~1881); the
+`spawn` data-race scan is blind to function-pointer indirection (#8, ~1925); shared access
+in an `await` CONDITION is not locked (D02 false-negative, #9, ~1963); the one remaining
+**cross-block scoped-borrow** hole (spawn + access in different CFG blocks — needs a
+zercheck_ir borrow-set merge; concurrency entry ~2303).
+
+**Miscompile (🟡 — unsound OUTPUT, not a UAF):** value-returning `async` never finalizes
+its state machine (#10, ~2001); bit-query/byte-swap intrinsics emit `0` in global
+initializers (#11, ~2046); `defer` + backward `goto` fires the wrong defer count (#12,
+~2080 / the "defer fires twice" entry ~799); compound `/=`/`%=` lack the signed-overflow
+trap on the AST emit path (~938).
+
+### NOT-FLEXIBLE — over-rejects (rejects correct code). Coarse abstractions.
+
+- **Escape disjunctive return** — `pick(){if c return &local; return p}` collapses the
+  WHOLE summary to UNKNOWN (the flat `ret_param_mask` can't hold a disjunction), so EVERY
+  call of `pick` is maximally conservative. RICH oracle SPEC'd
+  (lambda_zer_escape/join_lattice.v, the n-ary JOIN) but NOT implemented; impl =
+  mask→member-set behind the same `call_result_escapes` gate (not a re-architecture).
+- **Aliased mutation / `alloc_id` fate-sharing** — provably-disjoint aliased mutation is
+  rejected (no relational layer), and freeing one slice-half false-positives the other
+  (alloc_id couples them). RICH oracle SPEC'd (lambda_zer_disjoint/disjoint_lattice.v, the
+  EXCEEDS-Rust prize) but NOT implemented; impl needs a relational VRP layer (a
+  re-architecture, deferred).
+- **Nested inline designated initializer** wrongly rejected ("got void") (#13, ~2119).
+- Every flat-lattice class carries residual over-rejection by construction (see below).
+
+### ORACLE COVERAGE — the theorem layer, by class (the (c) criterion)
+
+- **AT-MAX (sound + MAX-oracle-backed):** `@ptrcast`/`@container` provenance
+  (lambda_zer_opaque Iris ghost-map, J04/J11), handle states (lambda_zer_handle), MMIO
+  ranges (lambda_zer_mmio). These pass all three criteria.
+- **COARSE oracle (exists but FLAT — precision left on the table):** escape (shipped
+  `param_lattice.v` is flat; the rich `join_lattice.v` is spec-only), bounds (interval, not
+  relational `i<j`), qualifier / capture / volatile (the 4 added 2026-06-23 are flat by
+  design), optional/null (typing.v Section N is flat — certifies only `?T`-vs-`*T`
+  type-discipline, NOT the flow-sensitive null-state lattice; rows N04/N06/N07/N08 unproven,
+  typing.v:1324).
+- **NO oracle (finite-state set UNCERTIFIED — discovered by red team):** distinct-typedef
+  unwrap invariant (the #1 historical bug class BUG-409/GAP-F, guarded only by the
+  line-frozen `tools/audit_type_dispatch.sh` linter, not an oracle), division-by-zero,
+  integer-overflow-wrap, shift safety, ISR safety, naked/asm (Z9/Z10/Z13 never shipped),
+  stack-overflow/recursion, `@critical` control-flow, and the intrinsic-miscompile classes
+  (#10/#11/#12). The "next frontier" oracle backlog (concurrency/ISR/atomics/async/MMIO
+  decision oracles) is line ~393.
+
+### NAMED FLOORS — NOT gaps (out of scope, do not chase)
+
+cinclude/FFI `type_id=0` (extern `*opaque`, C-domain), liveness/deadlock-livelock (out of
+scope for ZER *and* Rust), hardware-consequence (datasheet/silicon correctness — physics
+floor).
+
+### PRIORITY (fixed by the "never allow unsafe" hard constraint — sound before precision)
+
+1. **The two proof-backed near-free 🔴 wins:** `@bitcast` #3 (wire the already-VST-verified
+   `zer_bitcast_operand_valid`, one call site + tripwire) and `@pun` #4 (the size guard).
+2. The stateful 🔴 holes: #1 (decl-site alias), #2 (wire `vrp_ir.c`), #5 (emitter path),
+   #6 (capture inherits region — oracle ready).
+3. The 🟠 races (#7/#8/#9) + the cross-block scoped-borrow.
+4. The 🟡 miscompiles.
+5. THEN precision: implement `join_lattice.v` (disjunctive return) and `disjoint_lattice.v`
+   (aliased mutation), and write the missing/richer oracles (relational bounds, the null
+   flow-state lattice, distinct-unwrap, the no-oracle classes).
+
+---
+
 ## OPEN — clang-wasi run pipeline: compiler bundling (pipeline DONE; bundle TBD)
 
 **Status (2026-06-22): the fully-WASM run pipeline WORKS end-to-end — only the

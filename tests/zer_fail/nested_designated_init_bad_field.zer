@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// #13 soundness: the nested designated initializer is validated RECURSIVELY
+// against the field type, so an unknown inner field is still rejected (the fix
+// is "inherit the field type as context", NOT "skip checking the inner init").
+struct Inner { u32 x; }
+struct Outer { Inner inner; u32 y; }
+u32 main() {
+    Outer o = { .inner = { .nope = 1 }, .y = 2 };   // Inner has no field 'nope'
+    return 0;
+}

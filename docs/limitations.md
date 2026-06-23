@@ -104,9 +104,12 @@ trap on the AST emit path (~938).
   genuine residual is narrower: the `alloc_id` **fate-sharing** false-positive (freeing one
   slice-half false-flags the other; mixing literal/variable index frees, BUG-741) — that is
   the only real over-rejection in this area, and it needs the relational layer.
-- **Nested inline designated initializer** wrongly rejected ("got void") (#13, ~2119) —
-  **CONFIRMED reproduces (2026-06-24):** `Outer o = { .inner = { .x = 1 }, .y = 2 };` is
-  rejected with "field '.inner' … got 'void'". A plain bug, not a deep inference gap.
+- **Nested inline designated initializer** (#13) — **[FIXED 2026-06-24 — see BUGS-FIXED.md]**.
+  Was: `Outer o = { .inner = { .x = 1 }, .y = 2 };` rejected with "field '.inner' … got
+  'void'" (the inner `{ .x = 1 }` has no standalone type). Fixed: `validate_struct_init`
+  (checker.c ~1441) now recurses on a `NODE_STRUCT_INIT` field value, validating it against
+  the field type (which it inherits as context). 2/3-level nests compile+run; inner
+  field-name/type errors still rejected.
 - **MAYBE_FREED path-correlation** — **CONFIRMED the one genuine idiomatic over-rejection
   (2026-06-24):** `if(c){free(h);} if(c!=0?no:yes...){use(h);}` — freeing under one guard and
   using under the disjoint guard is memory-safe, but the LINEAR (non-flow-sensitive) handle

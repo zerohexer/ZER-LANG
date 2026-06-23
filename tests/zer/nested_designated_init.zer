@@ -1,0 +1,16 @@
+// #13 (2026-06-24): nested inline designated initializers. The inner `{ .x=1 }`
+// has no standalone type — it inherits the FIELD type as its target context and
+// is validated recursively. Was rejected with "field '.inner' … got 'void'".
+// Exits 0 iff every nested field initialized correctly (2- and 3-level deep).
+struct Inner { u32 x; u32 z; }
+struct Outer { Inner inner; u32 y; }
+struct A { u32 v; }
+struct B { A a; u32 w; }
+struct C { B b; u32 t; }
+u32 main() {
+    Outer o = { .inner = { .x = 1, .z = 3 }, .y = 2 };
+    C c = { .b = { .a = { .v = 4 }, .w = 5 }, .t = 6 };
+    if (o.inner.x == 1 && o.inner.z == 3 && o.y == 2 &&
+        c.b.a.v == 4 && c.b.w == 5 && c.t == 6) { return 0; }
+    return 1;
+}

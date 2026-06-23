@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## #13 FIXED (2026-06-24) — nested inline designated initializer rejected ("got void")
+
+**What broke (over-rejection):** a nested designated initializer
+`Outer o = { .inner = { .x = 1 }, .y = 2 }` was rejected with
+`field '.inner' expects 'Inner', got 'void'`. The inner `{ .x = 1 }` is a
+`NODE_STRUCT_INIT` with no standalone type — `validate_struct_init` typed the
+field value via `checker_get_type` (checker.c:1441), which returns `void` for a
+bare struct-init (it needs a target type as context), so the scalar
+`type_equals(ft, vt)` check failed.
+
+**Fix (checker.c ~1441):** when a field's value is itself a `NODE_STRUCT_INIT`,
+validate it RECURSIVELY against the field type `ft` (the inner init inherits the
+field type as its target context) and record `ft` via `checker_set_type` for the
+emitter, instead of the scalar type check. `validate_struct_init` already emits
+the right error if `ft` is not a struct, and the recursion still validates inner
+field NAMES and TYPES — no soundness loss.
+
+**Verified empirically:** 2-level and 3-level nested inits compile + run with the
+correct field values (`o.inner.x==1`, deep `c.b.a.v==4`); an unknown inner field
+(`{ .nope = 1 }`) and a mismatched inner type (`{ .x = 5 }` into `*u32 x`) are
+still rejected; `make check` GREEN (emitter handles the nested compound literal
+natively at any depth). Tests: `tests/zer/nested_designated_init.zer`,
+`tests/zer_fail/nested_designated_init_bad_field.zer`.
+
+---
+
 ## P9 FIXED (2026-06-24) — by-value struct pointer-field laundered to a global (🔴 escape under-rejection)
 
 **What broke (🔴 UNDER-rejection, a stored dangling pointer):** storing a POINTER

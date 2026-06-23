@@ -1438,6 +1438,19 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                 memcmp(st->struct_type.fields[si].name, df->name, df->name_len) == 0) {
                 found = true;
                 Type *ft = st->struct_type.fields[si].type;
+                /* Nested designated initializer: `Outer o = { .inner = { .x = 1 } }`.
+                 * The inner `{ .x = 1 }` is a NODE_STRUCT_INIT with no standalone
+                 * type — `checker_get_type` returns 'void', tripping the scalar
+                 * type_equals check below ("field '.inner' … got 'void'"). It
+                 * inherits the FIELD type as its target context: validate it
+                 * RECURSIVELY against `ft` and record `ft` so the emitter knows the
+                 * inner type. validate_struct_init emits the right error itself if
+                 * `ft` is not a struct. (#13, 2026-06-24) */
+                if (df->value && df->value->kind == NODE_STRUCT_INIT) {
+                    validate_struct_init(c, df->value, ft, line);
+                    checker_set_type(c, df->value, ft);
+                    break;
+                }
                 Type *vt = checker_get_type(c, df->value);
                 if (vt && ft && !type_equals(ft, vt) &&
                     !can_implicit_coerce(vt, ft) &&

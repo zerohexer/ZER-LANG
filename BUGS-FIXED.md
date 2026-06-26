@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied @bitcast ptr-confusion + struct-init-arg launder (batch 8, final, manual, no merge)
+
+- **@bitcast unrelated-pointer confusion (checker.c, from er0bp3):** `@bitcast(*B, *A)` between
+  unrelated aggregate pointee types (struct↔different-struct, aggregate↔primitive, neither
+  *opaque) was silently allowed — it could serve as the "unguarded" pointer reinterpret that
+  @ptrcast forbids (BUG-735/GAP-1) and routes to @pun. Fix: mirror @ptrcast's block in the
+  @bitcast handler. Complementary to this session's BH-18 #3 (int↔ptr forge): #3 is the
+  one-side-pointer case, this is the both-pointers-different-pointee case. Identity, *opaque
+  round-trips, and the `*u32`↔`*u8` byte-view stay allowed. Tests:
+  `tests/zer_fail/bitcast_struct_confusion.zer`,
+  `tests/zer_fail/bitcast_aggregate_primitive_confusion.zer`.
+- **struct-init-arg launder (checker.c `arg_is_local_derived`, from 8ezecl):** an inline
+  `{ .p = &local }` passed as a call argument was never visited by the local-derived
+  predicate, so `g = first({ .p = &x })` laundered the local through the call-result sink.
+  Fix: descend NODE_STRUCT_INIT field values (the call-arg-side sibling of this session's P9,
+  which descended a by-value param's `.p` at the storing side). Test:
+  `tests/zer_fail/struct_init_arg_local_launder.zer`.
+
+Verified: all three reject; `make check` GREEN (suite 845, escape-matrix 35/35, keep-matrix
+21/21, all audit gates OK).
+
+**This completes the cool-johnson copy effort — 23 fixes across 8 batches** (t8vr3h #2/#5/#6/#7/
+#9/#10, anqp95 ×4, er0bp3 ×2, 8ezecl ×3, dfcqr9 ×6, anb3cw ×2). Skipped as already-in-main:
+67x4go, x9otrk, t8vr3h #3/#4/#13. er0bp3's await-shared and array-OOB were superseded by
+t8vr3h's #9/#5. iww4tc + plt86m are audit-only (findings, no code).
+
+---
+
 ## 2026-06-26 — copied BUG-770/771 escape gaps from cool-johnson-anb3cw (batch 7, manual, no merge)
 
 Both verified still holes in current main (after batch 6 — different sinks).

@@ -1,0 +1,15 @@
+// Negative test: @bitcast between unrelated struct/union pointer types is
+// silent type confusion — must reject with "use @pun".
+// Mirror of BUG-735 (@ptrcast GAP-1, 6u360k audit) applied to @bitcast.
+// Without the fix, this read pb.b silently reads byte-1 of A.x.
+struct A { u32 x; u32 y; }
+struct B { u8 a; u8 b; u8 c; u8 d; }
+
+u32 main() {
+    A av;
+    av.x = 0xDEADBEEF;
+    av.y = 0x12345678;
+    *A pa = &av;
+    *B pb = @bitcast(*B, pa);
+    return (u32)pb.b;
+}

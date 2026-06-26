@@ -1043,6 +1043,19 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                     return true;
             }
         }
+        /* 8ezecl (copied): inline NODE_STRUCT_INIT carrying a &local / local-derived
+         * field — `stash({ .p = &local })` (as a call arg) laundered through the
+         * escape sinks because this predicate never visited the field values. The
+         * sibling of this session's P9 fix (which descended a by-value PARAM's `.p`
+         * projection at the STORING side); here we descend the VALUE side of an
+         * inline struct-init used as a call argument. */
+        if (arg->kind == NODE_STRUCT_INIT) {
+            for (int fi = 0; fi < arg->struct_init.field_count; fi++) {
+                Node *fv = arg->struct_init.fields[fi].value;
+                if (arg_is_local_derived(c, fv, depth + 1))
+                    return true;
+            }
+        }
     }
     return false;
 }
@@ -7363,6 +7376,46 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_error(c, node->loc.line,
                                 "@bitcast cannot strip const qualifier — "
                                 "target must be const pointer");
+                        }
+                        /* er0bp3 (copied): @bitcast pointer-confusion — mirror of
+                         * @ptrcast GAP-1 (BUG-735). @ptrcast rejects unrelated
+                         * aggregate-pointee casts (routes users to @pun); @bitcast
+                         * silently allowed the same reinterpret. Reject
+                         * struct/union<->different-struct/union and aggregate<->
+                         * primitive (neither *opaque). Identity, *opaque round-trips,
+                         * and the *u32<->*u8 byte-view stay allowed. Complementary to
+                         * BH-18 #3 (int<->ptr forge) handled just below — this is the
+                         * BOTH-pointers case, #3 the one-side-pointer case. */
+                        if (src_eff && tgt_eff_b &&
+                            type_dispatch_kind(src_eff) == TYPE_POINTER &&
+                            type_dispatch_kind(tgt_eff_b) == TYPE_POINTER) {
+                            TypeKind bc_sk = type_dispatch_kind(src_eff->pointer.inner);
+                            TypeKind bc_tk = type_dispatch_kind(tgt_eff_b->pointer.inner);
+                            bool bc_s_agg = (bc_sk == TYPE_STRUCT || bc_sk == TYPE_UNION);
+                            bool bc_t_agg = (bc_tk == TYPE_STRUCT || bc_tk == TYPE_UNION);
+                            bool bc_s_opq = (bc_sk == TYPE_OPAQUE);
+                            bool bc_t_opq = (bc_tk == TYPE_OPAQUE);
+                            if (bc_s_agg && bc_t_agg) {
+                                Type *bc_si = type_unwrap_distinct(src_eff->pointer.inner);
+                                Type *bc_ti = type_unwrap_distinct(tgt_eff_b->pointer.inner);
+                                if (bc_si && bc_ti && !type_equals(bc_si, bc_ti)) {
+                                    checker_error(c, node->loc.line,
+                                        "@bitcast between unrelated pointer types is type "
+                                        "confusion ('%s' source) — use @pun(%s, ...) for an "
+                                        "explicit runtime-checked pun, or cast through *opaque",
+                                        type_name(val_type), type_name(result));
+                                }
+                            } else if (bc_s_agg != bc_t_agg) {
+                                /* aggregate <-> primitive — only safe if either
+                                 * side is *opaque (documented round-trip). */
+                                if (!bc_s_opq && !bc_t_opq) {
+                                    checker_error(c, node->loc.line,
+                                        "@bitcast between unrelated pointer types is type "
+                                        "confusion ('%s' source) — use @pun(%s, ...) for an "
+                                        "explicit runtime-checked pun, or cast through *opaque",
+                                        type_name(val_type), type_name(result));
+                                }
+                            }
                         }
                     }
                     /* BH-18 #3: @bitcast must not FORGE a pointer from a non-pointer

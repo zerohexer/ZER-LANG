@@ -1,0 +1,12 @@
+// Negative test: @bitcast aggregate↔primitive pointer (where neither side is
+// *opaque) is type confusion — must reject with "use @pun" or "cast through
+// *opaque". Mirror of BUG-735 (@ptrcast asymmetric arm, audit 2026-06-11)
+// applied to @bitcast.
+struct Big { u64 a; u64 b; }
+
+u32 main() {
+    u32 small = 7;
+    *u32 sp = &small;
+    *Big bp = @bitcast(*Big, sp);
+    return (u32)bp.b;
+}

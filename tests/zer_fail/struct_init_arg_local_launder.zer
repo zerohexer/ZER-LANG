@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// 8ezecl: an inline struct-init `{ .p = &local }` passed as a call argument whose
+// result is laundered to a global must be caught — arg_is_local_derived now descends
+// NODE_STRUCT_INIT field values, so call_has_local_derived_arg sees the local and the
+// assign sink rejects `g = first({ .p = &x })`.
+struct Holder { *u32 p; }
+*u32 first(Holder h) { return h.p; }
+?*u32 g;
+u32 main() {
+    u32 x = 5;
+    g = first({ .p = &x });   // result aliases &local -> must reject
+    return 0;
+}

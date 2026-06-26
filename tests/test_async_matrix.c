@@ -103,15 +103,18 @@ typedef enum {
     AS_YIELD_IN_CRITICAL,  /* yield inside @critical */
     AS_AWAIT_IN_CRITICAL,  /* await inside @critical */
     AS_SPAWN_IN_ASYNC,     /* spawn inside an async function */
+    AS_AWAIT_ON_SHARED_REJECT, /* BH-18 #9 (copied from cool-johnson-t8vr3h): an await
+                                * condition that reads a shared struct is REJECTED — the
+                                * emitted poll() reads the shared field with NO
+                                * pthread_mutex_lock around it, so a concurrent locked
+                                * writer races the unlocked read (TSan-confirmed). The
+                                * earlier "safe — each poll locks/reads/unlocks" finding
+                                * was wrong about the actual emit. */
     /* POSITIVE — valid async (must compile) */
     AS_YIELD_OK,           /* plain yield in an async function */
     AS_AWAIT_OK,           /* await on a non-shared global condition */
     AS_DEFER_NO_SUSPEND_OK,/* defer with a non-suspending body + yield elsewhere */
     AS_LOCAL_ACROSS_YIELD_OK, /* a local live across yield (state-promoted) */
-    AS_AWAIT_ON_SHARED_OK, /* await condition reads a shared struct — SAFE: each poll
-                            * locks/reads/unlocks, lock released between polls, never
-                            * held across the suspension (yield/await are statement-only,
-                            * so a shared lock can't bracket a suspend). NOT a hole. */
     ASSCEN_COUNT
 } ASScenario;
 
@@ -120,10 +123,10 @@ static int scenario_is_negative(ASScenario s) {
         case AS_YIELD_IN_DEFER: case AS_AWAIT_IN_DEFER:
         case AS_YIELD_IN_CRITICAL: case AS_AWAIT_IN_CRITICAL:
         case AS_SPAWN_IN_ASYNC:
+        case AS_AWAIT_ON_SHARED_REJECT:
             return 1;
         case AS_YIELD_OK: case AS_AWAIT_OK:
         case AS_DEFER_NO_SUSPEND_OK: case AS_LOCAL_ACROSS_YIELD_OK:
-        case AS_AWAIT_ON_SHARED_OK:
             return 0;
         case ASSCEN_COUNT: break;
     }
@@ -141,7 +144,7 @@ static const char *scen_name(ASScenario s) {
         case AS_AWAIT_OK:              return "async-await-ok";
         case AS_DEFER_NO_SUSPEND_OK:   return "async-defer-no-suspend-ok";
         case AS_LOCAL_ACROSS_YIELD_OK: return "local-across-yield-ok";
-        case AS_AWAIT_ON_SHARED_OK:    return "await-on-shared-ok";
+        case AS_AWAIT_ON_SHARED_REJECT: return "await-on-shared-reject";
         case ASSCEN_COUNT: break;
     }
     return "?";
@@ -201,7 +204,7 @@ static void gen(ASScenario s, char *buf, size_t n) {
                 "async void worker() {\n    u32 acc = 5;\n    yield;\n    acc = acc + 1;\n    yield;\n}\n"
                 "u32 main() { return 0; }\n");
             break;
-        case AS_AWAIT_ON_SHARED_OK:
+        case AS_AWAIT_ON_SHARED_REJECT:
             snprintf(buf, n,
                 "shared struct C { u32 ready; }\n"
                 "C g;\n"

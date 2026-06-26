@@ -12648,7 +12648,17 @@ static void check_stmt(Checker *c, Node *node) {
                 "'await' only allowed inside async function");
         }
         if (node->await_stmt.cond) {
+            /* BH-18 #9 (copied from cool-johnson-t8vr3h): a bare `await cond;`
+             * is a NODE_AWAIT, not a NODE_EXPR_STMT/NODE_VAR_DECL, so the
+             * in_async_yield_stmt flag (set at check_stmt's top for those two
+             * kinds) was never set — the D02 ban (no shared access in a
+             * yield/await statement) was unreachable for await conditions, and
+             * a shared read in `await g.ready > 0;` emitted UNLOCKED (race).
+             * Set the flag around check_expr so the existing ban fires. */
+            bool saved_ays = c->in_async_yield_stmt;
+            c->in_async_yield_stmt = true;
             check_expr(c, node->await_stmt.cond);
+            c->in_async_yield_stmt = saved_ays;
         }
         break;
     }
@@ -16137,6 +16147,37 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
     }
     if (expr->kind == NODE_UNARY)
         count = collect_shared_types_in_expr(c, expr->unary.operand, types, max_types, count);
+    /* BH-18 #7 (copied from cool-johnson-t8vr3h): the collector skipped node
+     * kinds that hide shared reads in subexpressions. The plain `pa.x = pb.y`
+     * form was rejected with the deadlock multi-shared-type error, but wrapping
+     * ONE side in any of these node kinds evaded the check — the emitter
+     * (lock-per-statement) then locked one struct and read the other unlocked,
+     * a real cross-struct race (TSan-confirmed). Recurse into them. */
+    if (expr->kind == NODE_TYPECAST)
+        count = collect_shared_types_in_expr(c, expr->typecast.expr, types, max_types, count);
+    if (expr->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < expr->intrinsic.arg_count && count < max_types; i++)
+            count = collect_shared_types_in_expr(c, expr->intrinsic.args[i], types, max_types, count);
+    }
+    if (expr->kind == NODE_INDEX) {
+        count = collect_shared_types_in_expr(c, expr->index_expr.object, types, max_types, count);
+        count = collect_shared_types_in_expr(c, expr->index_expr.index, types, max_types, count);
+    }
+    if (expr->kind == NODE_ORELSE) {
+        count = collect_shared_types_in_expr(c, expr->orelse.expr, types, max_types, count);
+        if (expr->orelse.fallback && !expr->orelse.fallback_is_return &&
+            !expr->orelse.fallback_is_break && !expr->orelse.fallback_is_continue)
+            count = collect_shared_types_in_expr(c, expr->orelse.fallback, types, max_types, count);
+    }
+    if (expr->kind == NODE_SLICE) {
+        count = collect_shared_types_in_expr(c, expr->slice.object, types, max_types, count);
+        count = collect_shared_types_in_expr(c, expr->slice.start, types, max_types, count);
+        count = collect_shared_types_in_expr(c, expr->slice.end, types, max_types, count);
+    }
+    if (expr->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < expr->struct_init.field_count && count < max_types; i++)
+            count = collect_shared_types_in_expr(c, expr->struct_init.fields[i].value, types, max_types, count);
+    }
     /* Statement nodes that may appear when scanning callee bodies transitively */
     if (expr->kind == NODE_RETURN && expr->ret.expr)
         return collect_shared_types_in_expr(c, expr->ret.expr, types, max_types, count);

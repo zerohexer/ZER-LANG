@@ -1,0 +1,22 @@
+/* BH-18 #7 regression (negative test): multi-shared-struct access where
+ * one side is wrapped in a (T)cast, @intrinsic, [], or orelse subexpression
+ * MUST still trigger the deadlock/multi-lock check.
+ *
+ * Pre-fix, the plain `pa.x = pb.y;` form was rejected with the deadlock
+ * multi-shared-type error, but wrapping one side in any of these node kinds
+ * evaded the check — `collect_shared_types_in_expr` (checker.c) only recursed
+ * into NODE_BINARY/NODE_ASSIGN/NODE_UNARY/NODE_CALL. The emitter
+ * (lock-per-statement) then locked one struct and read the other unlocked,
+ * producing a real cross-struct race (TSan-confirmed).
+ *
+ * Post-fix: the collector recurses into NODE_TYPECAST, NODE_INTRINSIC,
+ * NODE_INDEX, NODE_ORELSE, NODE_SLICE, NODE_STRUCT_INIT — closing all the
+ * sibling shapes. */
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+
+void via_cast(*A pa, *B pb) {
+    pa.x = (u32)pb.y;   /* (T)cast hides pb.y from the collector */
+}
+u32 main() { return 0; }

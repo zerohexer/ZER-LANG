@@ -1,0 +1,21 @@
+/* BH-18 #9 regression (negative test): a `shared struct` field read in
+ * an `await` condition is a data race and MUST be rejected.
+ *
+ * Pre-fix, the emitted poll() function read `g.ready` with NO
+ * `pthread_mutex_lock(&g._zer_mtx)` — a concurrent locked writer races
+ * the unlocked async read (TSan-confirmed).
+ *
+ * The D02 ban (no shared access in a yield/await statement, checker.c)
+ * was already on the books but gated on `c->in_async_yield_stmt`, which
+ * only fired for NODE_EXPR_STMT and NODE_VAR_DECL. A bare `await cond;`
+ * is a NODE_AWAIT statement — neither kind — so the flag was never set
+ * around the condition check.
+ *
+ * Post-fix: NODE_AWAIT handler sets in_async_yield_stmt around
+ * check_expr(cond), and the existing D02 ban fires. */
+shared struct Flag { u32 ready; u32 data; }
+Flag g;
+async void waiter() {
+    await g.ready > 0;       /* shared read in await cond — must reject */
+}
+u32 main() { return 0; }

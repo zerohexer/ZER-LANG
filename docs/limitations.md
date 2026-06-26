@@ -2102,7 +2102,7 @@ form, missed only through `|*v|` capture desugaring.
 
 ---
 
-## OPEN — BH-18 #7 — shared-struct multi-access in one statement evades the deadlock/lock check via a cast/intrinsic/index/orelse subexpression → data race (🟠 race)
+## FIXED (2026-06-26, copied from cool-johnson-t8vr3h) — BH-18 #7 — shared multi-access via cast/intrinsic/index/orelse subexpr (🟠 race)
 
 **Symptom:** reading a shared-struct field inside a `(T)cast`, `@intrinsic(...)`,
 array index, or `orelse` subexpression — while assigning another shared
@@ -2184,7 +2184,7 @@ resolution would even catch the `fp = do_increment; fp()` local case.) Tripwire:
 
 ---
 
-## OPEN — BH-18 #9 — shared-struct access in an `await` condition is not locked (D02 false-negative) → data race (🟠 race)
+## FIXED (2026-06-26, copied from cool-johnson-t8vr3h) — BH-18 #9 — shared-struct read in `await` condition emitted unlocked (🟠 race)
 
 **Symptom:** accessing a `shared struct` field in an `await` condition compiles
 clean and emits an **unlocked** read, violating both the D02 "no shared access

@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied 2 BH-18 race fixes from cool-johnson-t8vr3h (batch 2, manual, no merge)
+
+- **BH-18 #7 🟠 (checker.c `collect_shared_types_in_expr`):** a shared multi-struct access
+  with one side wrapped in a `(T)`cast / `@intrinsic` / `[]` / `orelse` / slice / struct-init
+  evaded the same-statement deadlock check (the collector only recursed into
+  BINARY/ASSIGN/UNARY/CALL); the lock-per-statement emitter then locked one struct and read
+  the other unlocked — a cross-struct race (TSan-confirmed). Fix: recurse into the 6 missing
+  node kinds. Now `pa.x = (u32)pb.y;` rejects with the existing deadlock error.
+- **BH-18 #9 🟠 (checker.c NODE_AWAIT):** a `shared` read in an `await` condition emitted an
+  unlocked read. The D02 ban (no shared access in a yield/await statement) was gated on
+  `in_async_yield_stmt`, set only for NODE_EXPR_STMT/NODE_VAR_DECL — a bare `await cond;` is a
+  NODE_AWAIT, so the flag was never set and the ban unreachable. Fix: set the flag around the
+  await condition's `check_expr`. **Also flipped `tests/test_async_matrix.c`** —
+  `AS_AWAIT_ON_SHARED_OK` (a wrong "safe" positive based on an emit assumption that didn't
+  hold) → `AS_AWAIT_ON_SHARED_REJECT` (negative). async-matrix stays 10/10.
+
+Verified: both reject with the correct diagnostics; `make check` GREEN (all matrices incl.
+async 10/10). Tests: `tests/zer_fail/bh18_7_shared_cast_subexpr.zer`,
+`tests/zer_fail/bh18_9_await_shared_unlocked.zer`. limitations.md #7/#9 marked FIXED.
+
+---
+
 ## 2026-06-26 — copied 3 BH-18 soundness fixes from cool-johnson-t8vr3h (batch 1, manual, no merge)
 
 Manually re-applied three fixes from branch `cool-johnson-t8vr3h` (verified not in main,

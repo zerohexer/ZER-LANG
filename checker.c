@@ -15986,90 +15986,6 @@ bool checker_check(Checker *c, Node *file_node) {
     return c->error_count == 0;
 }
 
-/* Find the shared struct type accessed in an expression (for lock ordering) */
-static Type *find_shared_type_in_expr(Checker *c, Node *expr) {
-    if (!expr) return NULL;
-    if (expr->kind == NODE_FIELD) {
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        if (root->kind == NODE_IDENT) {
-            Type *t = typemap_get(c, root);
-            if (!t) {
-                Symbol *sym = scope_lookup(c->current_scope,
-                    root->ident.name, (uint32_t)root->ident.name_len);
-                if (sym) t = sym->type;
-            }
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return eff;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        return inner;
-                }
-            }
-        }
-    }
-    /* Recurse */
-    if (expr->kind == NODE_BINARY) {
-        Type *l = find_shared_type_in_expr(c, expr->binary.left);
-        return l ? l : find_shared_type_in_expr(c, expr->binary.right);
-    }
-    if (expr->kind == NODE_ASSIGN) {
-        Type *l = find_shared_type_in_expr(c, expr->assign.target);
-        return l ? l : find_shared_type_in_expr(c, expr->assign.value);
-    }
-    if (expr->kind == NODE_UNARY) return find_shared_type_in_expr(c, expr->unary.operand);
-    if (expr->kind == NODE_CALL) {
-        for (int i = 0; i < expr->call.arg_count; i++) {
-            Type *r = find_shared_type_in_expr(c, expr->call.args[i]);
-            if (r) return r;
-        }
-    }
-    return NULL;
-}
-
-/* Find shared type in a statement */
-static Type *find_shared_type_in_stmt(Checker *c, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_type_in_expr(c, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_type_in_expr(c, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_type_in_expr(c, stmt->ret.expr);
-    case NODE_IF: return find_shared_type_in_expr(c, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_type_in_expr(c, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Type *r = find_shared_type_in_expr(c, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_type_in_expr(c, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_type_in_expr(c, stmt->switch_stmt.expr);
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
-     * cond/init/expr that could read a shared struct. find_shared_type
-     * is per-statement to detect deadlock-risky multi-shared accesses
-     * within one statement; nothing to scan for these. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return NULL;
-    }
-    return NULL;
-}
-
 /* ---- Per-function shared type cache for deadlock detection (BUG-474 proper fix) ----
  * DFS with memoization + cycle detection. No depth limit. Each function
  * computed once, result cached. Call graph traversal visits each function
@@ -16668,14 +16584,60 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
             }
         }
 
-        /* Recurse into nested blocks */
-        if (stmt->kind == NODE_BLOCK) check_block_lock_ordering(c, stmt);
-        if (stmt->kind == NODE_IF) {
+        /* Recurse into nested bodies. EVERY body-bearing statement kind must be
+         * descended, or a multi-shared deadlock statement nested inside it
+         * escapes the per-statement check (verified holes before this fix:
+         * switch arm, do-while, @critical/@once/defer bodies — the old if-chain
+         * only handled BLOCK/IF/FOR/WHILE). No-default exhaustive switch so a new
+         * body-bearing NodeKind trips -Werror=switch instead of silently
+         * reintroducing the gap. check_block_lock_ordering no-ops on a non-block
+         * body, so passing a single-stmt body is harmless. */
+        switch (stmt->kind) {
+        case NODE_BLOCK:
+            check_block_lock_ordering(c, stmt);
+            break;
+        case NODE_IF:
             check_block_lock_ordering(c, stmt->if_stmt.then_body);
             check_block_lock_ordering(c, stmt->if_stmt.else_body);
+            break;
+        case NODE_FOR:
+            check_block_lock_ordering(c, stmt->for_stmt.body);
+            break;
+        case NODE_WHILE:
+        case NODE_DO_WHILE:
+            check_block_lock_ordering(c, stmt->while_stmt.body);
+            break;
+        case NODE_SWITCH:
+            for (int ai = 0; ai < stmt->switch_stmt.arm_count; ai++)
+                check_block_lock_ordering(c, stmt->switch_stmt.arms[ai].body);
+            break;
+        case NODE_CRITICAL:
+            check_block_lock_ordering(c, stmt->critical.body);
+            break;
+        case NODE_ONCE:
+            check_block_lock_ordering(c, stmt->once.body);
+            break;
+        case NODE_DEFER:
+            check_block_lock_ordering(c, stmt->defer.body);
+            break;
+        /* No-op kinds — not body-bearing (the per-statement collect check above
+         * already covered this statement's own expressions). NO default:. */
+        case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+        case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+        case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+        case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK:
+        case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+        case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN: case NODE_YIELD:
+        case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+        case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+        case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+        case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+        case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+        case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+            break;
         }
-        if (stmt->kind == NODE_FOR) check_block_lock_ordering(c, stmt->for_stmt.body);
-        if (stmt->kind == NODE_WHILE) check_block_lock_ordering(c, stmt->while_stmt.body);
     }
 }
 

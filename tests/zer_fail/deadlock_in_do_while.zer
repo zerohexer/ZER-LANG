@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Deadlock check nesting regression (negative test): a multi-shared-type
+// statement (a.x = b.y) nested inside a DO-WHILE body. Same class as the
+// switch-arm hole — check_block_lock_ordering's old if-chain recursion did not
+// descend do-while bodies (only BLOCK/IF/FOR/WHILE), so it was silently missed.
+// Post-fix the recursion is a no-default exhaustive switch covering DO_WHILE.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+
+void foo(u32 k) {
+    do { a.x = b.y; } while (k > 0);
+}
+
+u32 main() { return 0; }

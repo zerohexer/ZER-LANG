@@ -64,6 +64,28 @@ forms of an operation but not all siblings). This closes the class mechanically.
   the four missing recursions. The reproducer now rejects with the specific B3
   message; legit same-struct predicates still compile (no over-rejection). Test:
   `tests/zer_fail/cond_wait_foreign_same_type_intrinsic.zer`.
+- **Deadlock-check nesting 🔴 (checker.c `check_block_lock_ordering`) — TWO more
+  real holes, at the statement-NESTING level.** This is the live deadlock pass
+  (BUG-464 model: a single statement accessing 2+ distinct shared types is the
+  one real deadlock — the emitter locks one per statement and leaves the other
+  unprotected). It ran `collect_shared_types_in_stmt` per statement, then recursed
+  into nested bodies via a partial if-chain covering only BLOCK/IF/FOR/WHILE — so
+  a multi-shared deadlock statement inside a **switch arm, do-while, @critical,
+  @once, or defer body** was never checked. Verified two real holes in HEAD
+  (`switch { 0 => { a.x = b.y; } }` and `do { a.x = b.y; } while(...)` both
+  compiled clean). Fix: convert the recursion to a no-default exhaustive switch
+  that descends EVERY body-bearing kind (switch arms, do-while, critical, once,
+  defer added). Both reproducers now reject; suite +2, nothing else broke (no
+  over-rejection). Tests: `tests/zer_fail/deadlock_in_switch_arm.zer`,
+  `tests/zer_fail/deadlock_in_do_while.zer`.
+- **Dead code removed (checker.c).** Hunting the above surfaced
+  `find_shared_type_in_expr` / `find_shared_type_in_stmt` — a legacy "first shared
+  type" helper pair from the PRE-BUG-464 ascending-type_id lock-ordering design,
+  dead since that redesign (GCC `-Wunused-function` confirmed `find_shared_type_in_stmt`
+  unused; `_in_expr` was only called by it). The live `check_block_lock_ordering`
+  uses `collect_shared_types_in_stmt`, not these. Deleted both (and corrected the
+  stale `docs/compiler-internals.md` "Pass 7" paragraph, which still described the
+  old ascending-order algorithm and named the deleted helpers).
 
 **Stale tool noted (not a code bug):** `tools/audit_matrix.sh` (the flag-handler
 matrix) now reports 16 false-positive "gaps" — its hardcoded line range
@@ -77,12 +99,17 @@ surface a real flag-handler gap (the noise would bury it). Tracked in
 `docs/limitations.md` for a proper rework (anchor on `check_stmt`'s switch, not a
 line range). The flag-handler CONTRACTS themselves are sound.
 
-Verified: whole-tree `-Werror=switch` build exit 0 (zero switch warnings);
-`make check` GREEN with the gate active (semantic-fuzz 200/0, ZER 847/0,
+Verified: whole-tree `-Werror=switch` build exit 0 (zero switch warnings, and the
+`find_shared_type_*` `-Wunused-function` warning is gone after deletion); `make
+check` GREEN with the gate active (semantic-fuzz 200/0, ZER 849/0,
 modules/convert 139/0, escape-matrix 35/35, keep-matrix 21/21, conc-matrix
-15/15); walker-default audit still "OK — no default: clauses"; BH-18 #7
-(`tests/zer_fail/bh18_7_shared_cast_subexpr.zer`) and #7b
-(`tests/zer_fail/bh18_7b_transitive_cast_deadlock.zer`) both reject.
+15/15); walker-default audit still "OK — no default: clauses". All four
+concurrency shared-type walkers (`collect_shared_types_in_expr`,
+`scan_body_shared_types`, `cond_pred_foreign_shared`, `check_block_lock_ordering`)
+are now no-default exhaustive switches under the gate; the four new negative tests
+(`bh18_7b_transitive_cast_deadlock`, `cond_wait_foreign_same_type_intrinsic`,
+`deadlock_in_switch_arm`, `deadlock_in_do_while`) plus the pre-existing BH-18 #7
+(`bh18_7_shared_cast_subexpr`) all reject.
 
 ---
 

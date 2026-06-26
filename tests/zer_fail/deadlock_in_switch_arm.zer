@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// Deadlock check nesting regression (negative test): a single statement that
+// accesses TWO different shared structs (a.x = b.y) is the one real deadlock
+// scenario (emitter locks one per statement, leaves the other unprotected).
+// At top level it is rejected. Here it is nested inside a SWITCH ARM body.
+//
+// Pre-fix: check_block_lock_ordering (checker.c) recursed into nested bodies
+// via a partial if-chain covering only BLOCK/IF/FOR/WHILE — NOT switch arms
+// (nor do-while / @critical / @once / defer). So a multi-shared deadlock
+// statement inside a switch arm escaped the check entirely.
+//
+// Post-fix: the recursion is a no-default exhaustive switch over every
+// body-bearing statement kind, so the arm body is descended and rejected.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+
+void foo(u32 k) {
+    switch (k) {
+        0 => { a.x = b.y; }
+        default => { }
+    }
+}
+
+u32 main() { return 0; }

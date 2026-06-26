@@ -4692,7 +4692,12 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
             emit_func_from_ir(e, ir);
         } else {
             /* Forward declaration only — emit just the signature. */
-            emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void);\n",
+            /* 8ezecl (copied): `used` alongside `interrupt` — on baremetal the
+             * only reference to the ISR is the vector table in a separate
+             * .S/linker script the C TU never sees; without `used`,
+             * `gcc -ffunction-sections -Wl,--gc-sections` silently tree-shakes
+             * the handler and the vector slot keeps its default trap. */
+            emit(e, "void __attribute__((interrupt, used)) %.*s_IRQHandler(void);\n",
                  (int)decl->interrupt.name_len, decl->interrupt.name);
         }
         break;
@@ -10995,7 +11000,10 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
      * return type, and the GCC `interrupt` attribute + _IRQHandler suffix.
      * `ir_lower_interrupt` sets func->is_interrupt and fn->kind=NODE_INTERRUPT. */
     if (func->is_interrupt) {
-        emit(e, "void __attribute__((interrupt)) %.*s_IRQHandler(void) {\n",
+        /* 8ezecl (copied): emit `used` so -ffunction-sections + --gc-sections
+         * (mainstream embedded flags) cannot silently tree-shake the ISR — the
+         * only reference is the vector table in a separate TU. */
+        emit(e, "void __attribute__((interrupt, used)) %.*s_IRQHandler(void) {\n",
              (int)fn->interrupt.name_len, fn->interrupt.name);
         e->indent++;
         e->current_func_ret = NULL;

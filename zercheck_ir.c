@@ -1645,6 +1645,15 @@ static bool ir_call_is_indirect(ZerCheck *zc, IRFunc *func, Node *call) {
         Type *ft = checker_get_type(zc->checker, callee);
         return ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR;
     }
+    /* 8ezecl (copied): array/slice-indexed funcptr callee (`cbs[0](h)`,
+     * `vt.cbs[i](h)`). The argument-precise barrier (BUG-740) must fire for any
+     * funcptr callee — NODE_INDEX of a funcptr array is the direct sibling of
+     * NODE_FIELD on a struct funcptr field; without this the double-free / UAF
+     * across an array-indexed callback was missed. */
+    if (callee->kind == NODE_INDEX) {
+        Type *ft = checker_get_type(zc->checker, callee);
+        return ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR;
+    }
     return false;
 }
 

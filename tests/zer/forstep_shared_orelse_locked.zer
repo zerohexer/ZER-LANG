@@ -1,0 +1,23 @@
+// Regression: for-loop step `i = g.shared_field orelse 0` must lock the
+// shared field read.
+//
+// Before the fix: pre_lower_orelse ran BEFORE the IR_LOCK was emitted,
+// so the orelse-expanded shared read (`_zer_or = g.next`) happened
+// unlocked — a silent data race that compiled clean despite ZER's
+// "shared struct = auto-locked" guarantee.
+//
+// After: lock is emitted BEFORE pre_lower_orelse + current_stmt_shared_root
+// is set so orelse-return/break/continue inside the step releases the lock.
+
+shared struct State { ?u32 next; u32 total; }
+State g;
+
+u32 main() {
+    g.total = 0;
+    g.next = 5;
+    for (u32 i = 0; i < 3; i = g.next orelse 10) {
+        g.total += 1;
+    }
+    if (g.total == 1) { return 0; }
+    return 1;
+}

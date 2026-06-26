@@ -2404,11 +2404,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->current_block = bb_step;
         if (node->for_stmt.step) {
             rewrite_idents(ctx, node->for_stmt.step);
-            /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
-            pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
-            /* Gap fix: lock if step touches shared field. Like init above,
-             * `for (..; ..; g_shared.i = g_shared.i + 1)` was silently
-             * unsynchronized — only the cond was wrapped. */
+            /* er0bp3 (copied): lock BEFORE pre_lower_orelse — orelse expansion
+             * synthesizes IR_ASSIGN nodes that evaluate the optional source
+             * (which may be a shared field, e.g. `i = g.next orelse 0`); if the
+             * lock were emitted AFTER pre_lower_orelse the shared read in the
+             * branches would happen unlocked. Mirror the for-init pattern: find
+             * the shared root on the RAW step, lock, set current_stmt_shared_root
+             * (so an orelse-return/break/continue inside the step releases the
+             * lock before the early exit), lower, then unlock. */
             Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
             if (step_root) {
                 IRInst lock = make_inst(IR_LOCK, node->loc.line);
@@ -2416,9 +2419,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 lock.src2_local = 1; /* write lock — step typically writes */
                 emit_inst(ctx, lock);
             }
+            Node *prev_step_shared = ctx->current_stmt_shared_root;
+            ctx->current_stmt_shared_root = step_root ? step_root : prev_step_shared;
+            /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
+            pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             emit_inst(ctx, step);
+            ctx->current_stmt_shared_root = prev_step_shared;
             if (step_root) {
                 IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
                 unlock.expr = step_root;

@@ -1,0 +1,29 @@
+/* 2026-06-24 (audit): NODE_INDEX funcptr call must trigger BUG-740 argument-precise
+ * barrier — `cbs[0](h)` should widen `h` to MAYBE_FREED so a subsequent
+ * `gp.free(h)` is flagged as a possible double-free, exactly as `o.cb(h)`
+ * (struct-field funcptr) already does.
+ *
+ * Pre-fix: ir_call_is_indirect handled only NODE_IDENT and NODE_FIELD callees,
+ * so an array-indexed funcptr slipped through the barrier silently.
+ *
+ * EXPECTED: compile error — use after free / double free
+ */
+struct Task { u32 id; }
+Pool(Task, 16) gp;
+
+typedef *(Handle(Task)) Callback;
+Callback[1] cbs;
+
+void may_free(Handle(Task) h) {
+    gp.free(h);
+}
+
+u32 demo() {
+    cbs[0] = may_free;
+    Handle(Task) h = gp.alloc() orelse return;
+    cbs[0](h);
+    gp.free(h);
+    return 0;
+}
+
+u32 main() { return demo(); }

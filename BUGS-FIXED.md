@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied 3 isolated fixes from cool-johnson-er0bp3 + 8ezecl (batch 4, manual, no merge)
+
+- **for-step shared-orelse unlocked (ir_lower.c, from er0bp3):** a for-loop step
+  `i = g.shared orelse 0` had `pre_lower_orelse` run BEFORE the `IR_LOCK` was emitted, so the
+  orelse-expanded shared read happened unlocked — a silent data race despite the auto-lock
+  guarantee. Fix: find the shared root on the raw step, lock, set `current_stmt_shared_root`
+  (so an orelse-return/break/continue releases the lock), THEN lower. Mirrors the for-init
+  pattern. Test: `tests/zer/forstep_shared_orelse_locked.zer`.
+- **NODE_INDEX funcptr callee barrier (zercheck_ir.c, from 8ezecl):** `ir_call_is_indirect`
+  handled only NODE_IDENT/NODE_FIELD callees, so an array-indexed funcptr call `cbs[0](h)`
+  skipped the BUG-740 argument-precise barrier — a double-free / UAF across an array-indexed
+  callback went silent. Fix: add the NODE_INDEX case (sibling of NODE_FIELD). Test:
+  `tests/zer_fail/bug_node_index_funcptr_double_free.zer`.
+- **ISR `used` attribute (emitter.c, from 8ezecl):** ISR handlers emitted
+  `__attribute__((interrupt))` without `used`; on baremetal the only reference is the vector
+  table in a separate TU, so `gcc -ffunction-sections -Wl,--gc-sections` silently tree-shook
+  the handler. Fix: emit `__attribute__((interrupt, used))` (both forward-decl and definition).
+
+Verified: the two tripwires behave (node-index rejects, for-step runs exit 0), ISR `used`
+emitted, `make check` GREEN on re-run (the one-off `rc_cond_004` was the known scheduling-flaky
+concurrency test — 6/6 on re-run, has no for-step-orelse, unrelated).
+
+---
+
 ## 2026-06-26 — copied 4 isolated fixes from cool-johnson-anqp95 (batch 3, manual, no merge)
 
 - **slice `.ptr` volatile strip (checker.c):** the slice `.ptr` handler propagated `is_const`

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// Tripwire — `@truncate(NonInt, val)` previously only ran the source check
+// (numeric source) and then passed the target through to the emitter; GCC
+// would reject the resulting `(NonInt)(val)` with "conversion to non-scalar
+// type requested" attributed to the emitted C, far from the .zer source.
+// Now mirrors `@saturate`'s target-int check at the checker.
+struct S { u32 x; }
+
+u32 main() {
+    u32 v = 0x1FF;
+    S bad = @truncate(S, v);
+    return bad.x;
+}

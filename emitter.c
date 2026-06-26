@@ -4936,7 +4936,10 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#elif defined(__AVR__)\n");
     emit(e, "    __asm__ volatile(\"break\"); for(;;) {}\n");
     emit(e, "#elif defined(__x86_64__) || defined(__i386__)\n");
-    emit(e, "    __asm__ volatile(\"int3\");\n");
+    /* anqp95 (copied): the for(;;){} sentinel mirrors the ARM/RISC-V/AVR arms
+     * and prevents falling through to undefined execution if SIGTRAP is masked
+     * or no IDT #BP handler is installed. */
+    emit(e, "    __asm__ volatile(\"int3\"); for(;;) {}\n");
     emit(e, "#elif defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
     emit(e, "    abort();\n");
     emit(e, "#else\n");
@@ -8120,7 +8123,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"csrci mstatus, 8\" ::: \"memory\");\n"
                 "#else\n"
-                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#  error \"@cpu_disable_int has no implementation for this target architecture (ZER supports x86, ARM, AArch64, RISC-V)\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 14 && memcmp(name, "cpu_enable_int", 14) == 0) {
@@ -8133,7 +8136,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"csrsi mstatus, 8\" ::: \"memory\");\n"
                 "#else\n"
-                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
+                "#  error \"@cpu_enable_int has no implementation for this target architecture (ZER supports x86, ARM, AArch64, RISC-V)\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 12 && memcmp(name, "cpu_wait_int", 12) == 0) {
@@ -8161,7 +8164,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "#elif defined(__riscv)\n"
                 "    { unsigned long _zer_m; __asm__ __volatile__ (\"csrr %0, mstatus\" : \"=r\"(_zer_m) :: \"memory\"); _zer_istate = _zer_m; }\n"
                 "#else\n"
-                "    _zer_istate = 0;\n"
+                "#  error \"@cpu_save_int_state has no implementation for this target architecture (ZER supports x86, ARM, AArch64, RISC-V)\"\n"
                 "#endif\n"
                 "_zer_istate; })");
         } else if (nlen == 10 && memcmp(name, "mmu_set_pt", 10) == 0 &&

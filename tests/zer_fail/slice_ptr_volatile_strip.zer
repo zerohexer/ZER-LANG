@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Tripwire — `slice.ptr` previously dropped `is_volatile` (only `is_const`
+// was propagated). A user who created `volatile [*]T` (e.g., an MMIO-mapped
+// slice) and bound it to `*T` (non-volatile) silently stripped the qualifier,
+// so subsequent writes through `p` could be optimized away by GCC. Fixed in
+// checker.c at the slice .ptr handler — both qualifiers now propagate.
+void leak(volatile [*]u32 s) {
+    *u32 p = s.ptr;
+    *p = 1;
+}
+u32 main() { return 0; }

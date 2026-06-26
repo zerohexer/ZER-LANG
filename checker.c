@@ -6249,6 +6249,10 @@ static Type *check_expr(Checker *c, Node *node) {
         if (obj->kind == TYPE_SLICE && flen == 3 && memcmp(fname, "ptr", 3) == 0) {
             Type *ptr = type_pointer(c->arena, obj->slice.inner);
             if (obj->slice.is_const) ptr->pointer.is_const = true;
+            /* anqp95 (copied): propagate volatile too — `volatile [*]T s;
+             * *T p = s.ptr;` silently stripped volatile, so `*p = v` could be
+             * optimized away (qualifier strip not caught at the checker). */
+            if (obj->slice.is_volatile) ptr->pointer.is_volatile = true;
             result = ptr;
             break;
         }
@@ -7375,6 +7379,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@truncate requires numeric source, got '%s'", type_name(val_type));
                     }
+                }
+                /* anqp95 (copied): target must be an integer — mirrors @saturate.
+                 * Without this, `@truncate(SomeStruct, val)` reaches GCC as
+                 * `(SomeStruct)(val)` → "conversion to non-scalar type requested"
+                 * error attributed to the emitted C, not the .zer source line. */
+                if (!type_is_integer(result)) {
+                    checker_error(c, node->loc.line,
+                        "@truncate target must be an integer type, got '%s'", type_name(result));
                 }
             } else {
                 result = ty_void;

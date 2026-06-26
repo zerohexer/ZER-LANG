@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied 4 isolated fixes from cool-johnson-anqp95 (batch 3, manual, no merge)
+
+- **slice `.ptr` volatile strip (checker.c):** the slice `.ptr` handler propagated `is_const`
+  but not `is_volatile`, so `volatile [*]u32 s; *u32 p = s.ptr;` silently stripped volatile and
+  a later `*p = v` could be optimized away. Fix: propagate `is_volatile` too — now rejected at
+  the checker.
+- **`@truncate(NonInt, val)` (checker.c):** the target-int check was missing (only the source
+  was checked), so `@truncate(S, v)` reached GCC as `(S)(v)` → "conversion to non-scalar type"
+  attributed to the emitted C. Fix: mirror `@saturate`'s target-int check.
+- **`_zer_trap` x86 int3 sentinel (emitter.c):** the x86 arm emitted `int3` without a `for(;;){}`
+  sentinel (inconsistent with ARM/RISC-V/AVR) — if SIGTRAP is masked or no #BP handler is
+  installed, execution fell through to UB. Fix: add the sentinel.
+- **`@cpu_disable_int`/`@cpu_enable_int`/`@cpu_save_int_state` unknown-arch fallback (emitter.c):**
+  emitted a no-op memory fence / zero on unsupported targets, silently breaking the
+  "critical-section-against-ISR" semantics. Fix: loud `#error` on unsupported arch (x86/ARM/
+  AArch64/RISC-V are supported; make check unaffected — the x86 branch is taken).
+
+Verified: both checker tripwires reject; `make check` GREEN (suite 831, all audit gates OK).
+Tests: `tests/zer_fail/slice_ptr_volatile_strip.zer`,
+`tests/zer_fail/truncate_target_non_int.zer`.
+
+---
+
 ## 2026-06-26 — copied 2 BH-18 race fixes from cool-johnson-t8vr3h (batch 2, manual, no merge)
 
 - **BH-18 #7 🟠 (checker.c `collect_shared_types_in_expr`):** a shared multi-struct access

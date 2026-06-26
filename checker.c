@@ -16324,7 +16324,8 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
 static int collect_shared_types_in_expr(Checker *c, Node *expr,
                                          Type **types, int max_types, int count) {
     if (!expr || count >= max_types) return count;
-    if (expr->kind == NODE_FIELD) {
+    switch (expr->kind) {
+    case NODE_FIELD: {
         Node *root = expr;
         while (root->kind == NODE_FIELD) root = root->field.object;
         while (root->kind == NODE_INDEX) root = root->index_expr.object;
@@ -16358,57 +16359,62 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                 }
             }
         }
+        break;
     }
-    /* Recurse */
-    if (expr->kind == NODE_BINARY) {
+    case NODE_BINARY:
         count = collect_shared_types_in_expr(c, expr->binary.left, types, max_types, count);
         count = collect_shared_types_in_expr(c, expr->binary.right, types, max_types, count);
-    }
-    if (expr->kind == NODE_ASSIGN) {
+        break;
+    case NODE_ASSIGN:
         count = collect_shared_types_in_expr(c, expr->assign.target, types, max_types, count);
         count = collect_shared_types_in_expr(c, expr->assign.value, types, max_types, count);
-    }
-    if (expr->kind == NODE_UNARY)
+        break;
+    case NODE_UNARY:
         count = collect_shared_types_in_expr(c, expr->unary.operand, types, max_types, count);
+        break;
     /* BH-18 #7 (copied from cool-johnson-t8vr3h): the collector skipped node
      * kinds that hide shared reads in subexpressions. The plain `pa.x = pb.y`
      * form was rejected with the deadlock multi-shared-type error, but wrapping
      * ONE side in any of these node kinds evaded the check — the emitter
      * (lock-per-statement) then locked one struct and read the other unlocked,
      * a real cross-struct race (TSan-confirmed). Recurse into them. */
-    if (expr->kind == NODE_TYPECAST)
+    case NODE_TYPECAST:
         count = collect_shared_types_in_expr(c, expr->typecast.expr, types, max_types, count);
-    if (expr->kind == NODE_INTRINSIC) {
+        break;
+    case NODE_INTRINSIC:
         for (int i = 0; i < expr->intrinsic.arg_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->intrinsic.args[i], types, max_types, count);
-    }
-    if (expr->kind == NODE_INDEX) {
+        break;
+    case NODE_INDEX:
         count = collect_shared_types_in_expr(c, expr->index_expr.object, types, max_types, count);
         count = collect_shared_types_in_expr(c, expr->index_expr.index, types, max_types, count);
-    }
-    if (expr->kind == NODE_ORELSE) {
+        break;
+    case NODE_ORELSE:
         count = collect_shared_types_in_expr(c, expr->orelse.expr, types, max_types, count);
         if (expr->orelse.fallback && !expr->orelse.fallback_is_return &&
             !expr->orelse.fallback_is_break && !expr->orelse.fallback_is_continue)
             count = collect_shared_types_in_expr(c, expr->orelse.fallback, types, max_types, count);
-    }
-    if (expr->kind == NODE_SLICE) {
+        break;
+    case NODE_SLICE:
         count = collect_shared_types_in_expr(c, expr->slice.object, types, max_types, count);
         count = collect_shared_types_in_expr(c, expr->slice.start, types, max_types, count);
         count = collect_shared_types_in_expr(c, expr->slice.end, types, max_types, count);
-    }
-    if (expr->kind == NODE_STRUCT_INIT) {
+        break;
+    case NODE_STRUCT_INIT:
         for (int i = 0; i < expr->struct_init.field_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->struct_init.fields[i].value, types, max_types, count);
-    }
+        break;
     /* Statement nodes that may appear when scanning callee bodies transitively */
-    if (expr->kind == NODE_RETURN && expr->ret.expr)
-        return collect_shared_types_in_expr(c, expr->ret.expr, types, max_types, count);
-    if (expr->kind == NODE_EXPR_STMT)
-        return collect_shared_types_in_expr(c, expr->expr_stmt.expr, types, max_types, count);
-    if (expr->kind == NODE_VAR_DECL && expr->var_decl.init)
-        return collect_shared_types_in_expr(c, expr->var_decl.init, types, max_types, count);
-    if (expr->kind == NODE_CALL) {
+    case NODE_RETURN:
+        count = collect_shared_types_in_expr(c, expr->ret.expr, types, max_types, count);
+        break;
+    case NODE_EXPR_STMT:
+        count = collect_shared_types_in_expr(c, expr->expr_stmt.expr, types, max_types, count);
+        break;
+    case NODE_VAR_DECL:
+        count = collect_shared_types_in_expr(c, expr->var_decl.init, types, max_types, count);
+        break;
+    case NODE_CALL: {
         for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
         /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
@@ -16445,6 +16451,29 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                 }
             }
         }
+        break;
+    }
+    /* No-op kinds — these cannot hide a shared-struct field read that the
+     * per-statement deadlock check must see (literals, idents, declarations,
+     * and control-flow statements whose bodies are scanned elsewhere). Listed
+     * explicitly with NO default: clause so -Wswitch / -Werror=switch forces a
+     * conscious decision here whenever a new NodeKind is added. This is the
+     * structural defense against the BH-18 #7 form-coverage gap class — a new
+     * expression form that could carry a shared read can no longer be silently
+     * skipped; it becomes a build failure until handled. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
+    case NODE_GOTO: case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
     }
     return count;
 }

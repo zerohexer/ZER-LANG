@@ -5,6 +5,41 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-27 — exhaustiveness hardening: `-Werror=switch` HARD GATE + collector switch conversion
+
+Structural follow-up to the cool-johnson copy effort (the 23-fix root cause was
+~18 "form→state coverage gaps" — hand-written walkers enumerating some syntactic
+forms of an operation but not all siblings). This closes the class mechanically.
+
+- **`collect_shared_types_in_expr` (checker.c) — partial if-chain → no-default
+  exhaustive switch.** This is the per-statement deadlock-check shared-type
+  collector. It was an `if (expr->kind == NODE_X)` chain covering only some node
+  kinds — exactly the shape that produced BH-18 #7 (a shared read wrapped in a
+  `(T)cast` / `@intrinsic` / `[]` / `orelse` evaded the multi-shared-type lock
+  check; the emitter's lock-per-statement then locked one struct and read the
+  other unlocked — a real cross-struct race). Batch 2 fixed the specific leaked
+  kinds; this converts the function to a `switch (expr->kind)` with every one of
+  the 53 NodeKinds listed (recurse or explicit no-op) and NO `default:`, so a
+  newly-added node kind that could carry a shared read is a build failure until
+  handled. Behavior is identical to the prior if-chain (verified: full suite +
+  BH-18 #7 still rejects).
+- **`-Werror=switch` added to Makefile `CFLAGS`.** Until now `CFLAGS = -Wall
+  -Wextra`, so `-Wswitch` was a *warning* — the CLAUDE.md "guarantee" that a new
+  enum value errors at compile time was aspirational; a partial walker could ship
+  with only a warning. The gate now makes every no-default kind/op switch (the
+  ~42 audited by `walker_default_audit.sh` + the converted collector) a HARD
+  failure on an unhandled enum value. First verified the whole tree builds
+  `-Wswitch`-clean (`make zerc CFLAGS="... -Werror=switch"` → exit 0, zero
+  warnings) so the gate breaks nothing.
+
+Verified: whole-tree `-Werror=switch` build exit 0 (zero switch warnings);
+`make check` GREEN with the gate active (semantic-fuzz 200/0, ZER 845/0,
+modules/convert 139/0, escape-matrix 35/35, keep-matrix 21/21, conc-matrix
+15/15); walker-default audit still "OK — no default: clauses"; BH-18 #7
+(`tests/zer_fail/bh18_7_shared_cast_subexpr.zer`) still rejects.
+
+---
+
 ## 2026-06-26 — copied @bitcast ptr-confusion + struct-init-arg launder (batch 8, final, manual, no merge)
 
 - **@bitcast unrelated-pointer confusion (checker.c, from er0bp3):** `@bitcast(*B, *A)` between

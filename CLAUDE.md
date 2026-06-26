@@ -1098,6 +1098,34 @@ three while the soundness floor never moves. Writing the oracle is pure spec wor
 no re-architecture, doesn't worsen soundness) so it goes FIRST; the implementation against
 it is mechanical afterward.
 
+**THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
+precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
+Rice: the true set "memory-safe on every execution" is undecidable, so no sound,
+terminating analysis can match it; every one must over-reject SOME safe program. Decompose
+the over-rejection into two parts and design only against the second:
+- **FORCED (semantic, UNPAYABLE).** Any FINITE sound abstraction of the infinite concrete
+  space must LOSE information — at control-flow joins, at operations the domain can't
+  represent exactly, at cross-class interactions — and at every loss point soundness forces
+  rounding TOWARD reject. Over-rejection and soundness are the SAME coin: you cannot have
+  "finite + sound" without "rounds-toward-reject somewhere." This floor cannot be removed;
+  chasing it is wasted effort.
+- **PAYABLE (engineering, RECOVERABLE).** Extra over-rejection from a cheaper-than-necessary
+  abstraction or a not-yet-built refinement. THIS is the entire design target. Two levers
+  recover it: REDUCED PRODUCT (combine class theorems so domains feed each other — recovers
+  the cross-class loss) and RELATIONAL domains (octagon/outlives `i<j`/region-order — recover
+  the within-class join loss). "Infer more / combine theorems" pays this down, moving toward
+  the wall without reaching it. Cost: each richer abstraction is a NEW soundness-proof surface
+  (the MAX-oracle burden) — bounded by "prove each increment," not free.
+NOT a mapping limit: the oracle is finite-state BY CONSTRUCTION, which is exactly what makes
+it map to C and VST-verify (the Level-1→3 extraction IS that mapping, and it works); state
+count is bounded, tracking is polynomial for most domains (only the richest relational
+domains — octagon O(n³), polyhedra exponential — cost enough to trade precision for speed, a
+payable choice, not a wall). The theorem maps into C perfectly; what doesn't map is the gap
+between the FINITE theorem and the INFINITE truth it approximates — non-zero for any finite
+theorem, by Rice, no matter how many elements are tracked. So: spend design effort on the
+payable side (reduced product + relational refinement, each proven), accept the rare forced
+tail, never chase the hard wall.
+
 New extraction → follow proof-internals.md "Phase 1 extraction recipe" +
 Makefile/.gitignore checklist. VST-friendly C style: flat cascade of
 early-return ifs, NO nesting, NO compound conditions (split predicates and
@@ -1443,6 +1471,23 @@ resolved (8 → 0).
 new NODE_KIND / TYNODE_KIND / TYPE_KIND / IR_OPKIND value is added
 without a case label in any safety-critical walker. The "missing case
 in safety walker" gap class is mechanically prevented going forward.
+
+**HARD GATE since 2026-06-27 — `-Werror=switch` in the Makefile.** Until
+2026-06-27 this was a *warning* only (`CFLAGS = -Wall -Wextra`), so the
+guarantee above was aspirational — a new node kind silently produced a
+warning, not a build failure, and a partial hand-written walker could still
+ship. `CFLAGS` now carries `-Werror=switch`, making every no-default
+kind-switch a HARD build failure when a new enum value is unhandled. Two
+things changed together: (1) `collect_shared_types_in_expr` (checker.c, the
+per-statement deadlock-check shared-type collector) was a partial `if`-chain
+over node kinds — exactly the "form→state coverage gap" shape that produced
+BH-18 #7 (a `(T)cast`/`@intrinsic`/`[]`/`orelse`-wrapped shared read evaded
+the multi-lock check) — and is now a no-default exhaustive `switch`; (2) the
+`-Werror=switch` gate ensures it (and the ~42 existing no-default switches)
+can never silently regress. The whole-tree build is `-Wswitch`-clean, so the
+gate is free. **Do NOT add a `default:` to a kind/op switch to silence this**
+— enumerate the no-op kinds explicitly (see the `collect_shared_types_in_expr`
+no-op case block) so a future new kind still trips the gate.
 
 **Run before adding new walkers:** `bash tools/walker_default_audit.sh`
 must continue to exit 0. If you write a new walker, do NOT add a

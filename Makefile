@@ -1,5 +1,12 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2 -I.
+# -Werror=switch: a switch over an enum (NodeKind/TYPE_/IROpKind/TypeNodeKind/...)
+# that omits a value with NO default: clause is a HARD build failure, not a
+# warning. This is the structural defense against the "form->state coverage gap"
+# bug class (BH-18 #7 et al.): the ~42 no-default kind-switches in the safety
+# walkers can no longer silently skip a newly-added node/type kind — adding one
+# forces a handling decision in every exhaustive switch at compile time. Switches
+# that legitimately want a catch-all keep an explicit default: (unaffected).
+CFLAGS = -Wall -Wextra -Werror=switch -std=c99 -O2 -I.
 
 # Core source files for the compiler
 # zercheck_ir.c is the CFG-based replacement for zercheck.c (per docs/cfg_migration_plan.md).

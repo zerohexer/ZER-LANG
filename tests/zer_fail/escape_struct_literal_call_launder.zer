@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// Silent gap (audited 2026-06-26): a struct-literal whose field is a
+// CALL-result of `&local` was missed by the BUG-732 struct-init escape
+// descent. Cases A (`&local`), B (alias ident), and C (slice over local)
+// were closed; Case D — call-result launder (`pass(&local)`) — was not.
+//
+// Direct field-store `g_box.p = pass(&local);` IS rejected (the assignment
+// sink runs call_has_local_derived_arg). The launder THROUGH a local
+// struct's initializer escapes the same flag tracking: the carrier `b`
+// was never flagged is_local_derived, so `g_box = b;` slipped through.
+// Mirrors the field-store class (BUG-742 / BUG-763 family) at the
+// struct-literal sink.
+struct Box { *u32 p; }
+Box g_box;
+*u32 pass(*u32 p) { return p; }
+void leak() {
+    u32 local = 99;
+    Box b = { .p = pass(&local) };  // hidden launder of &local through a call
+    g_box = b;                       // ERROR: b carries a local-derived pointer
+}
+u32 main() { leak(); return 0; }

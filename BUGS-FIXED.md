@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied BUG-770/771 escape gaps from cool-johnson-anb3cw (batch 7, manual, no merge)
+
+Both verified still holes in current main (after batch 6 — different sinks).
+
+- **BUG-770 🔴 (checker.c struct-init descent):** `Box b = { .p = pass(&local) }; g_box = b;`
+  — the struct-literal field is a CALL-result laundering a local (`pass(&local)`). The
+  struct-init escape descent had Cases A/B/C (direct `&local`, alias ident, slice-of-local)
+  but not the launder-through-a-call shape, so the carrier `b` was never flagged
+  is_local_derived and `g_box = b` slipped through. Fix: Case D — if a field value is a
+  NODE_CALL with a local-derived arg, flag the struct local-derived.
+- **BUG-771 🔴 (checker.c NODE_SPAWN):** a SCOPED spawn `ThreadHandle th = spawn worker(&local);
+  th.join();` bypassed keep-inference — if `worker` persists its pointer arg to a long-lived
+  sink, the global retains the pointer after join() and after the caller frame exits =
+  cross-thread dangling pointer. The direct `worker(&local)` was already caught at NODE_CALL.
+  Fix: record keep-edges for each spawn arg (mirroring NODE_CALL's record_keep_edge), so the
+  deferred keep-inference fixpoint restricts callers passing a local.
+
+Verified: both reject with the correct diagnostics; `make check` GREEN (suite 842,
+escape-matrix 35/35, keep-matrix 21/21, conc-matrix 15/15, all audit gates OK). Tests:
+`tests/zer_fail/escape_struct_literal_call_launder.zer`,
+`tests/zer_fail/escape_scoped_spawn_keep_bypass.zer`.
+
+---
+
 ## 2026-06-26 — copied BUG-766/767 (5 stack-UAF launders + intrinsic global-init) from cool-johnson-dfcqr9 (batch 6, manual, no merge)
 
 All six reproducers verified STILL HOLES in current main before applying (this session's

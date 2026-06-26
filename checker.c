@@ -9971,6 +9971,18 @@ static void check_stmt(Checker *c, Node *node) {
                                     }
                                 }
                             }
+                            /* Case D (BUG-770, copied from cool-johnson-anb3cw):
+                             * call-result launder — `Box b = { .p = pass(&local) };`.
+                             * Cases A/B/C close direct &local / alias / slice-of-local;
+                             * Case D closes the launder-through-a-call shape — without
+                             * it the carrier `b` is never flagged is_local_derived and a
+                             * later `g = b;` slips through. Uses call_has_local_derived_arg,
+                             * the same predicate the assign/return/keep sinks use. */
+                            if (fv->kind == NODE_CALL &&
+                                call_has_local_derived_arg(c, fv, 0)) {
+                                sym->is_local_derived = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -12898,6 +12910,94 @@ static void check_stmt(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "spawn argument %d: expected '%s', got '%s'",
                         i + 1, type_name(param_type), type_name(arg_type));
+                }
+            }
+        }
+
+        /* BUG-771 spawn keep-edge recording (copied from cool-johnson-anb3cw):
+         * mirror NODE_CALL's record_keep_edge for each spawn arg. Without it, a
+         * SCOPED spawn `ThreadHandle th = spawn worker(&local); th.join();`
+         * bypasses keep-inference — if `worker` stores its pointer arg into a
+         * long-lived sink (shared global/static), the global retains the pointer
+         * AFTER th.join() and after the caller frame exits = cross-thread dangling
+         * pointer. The direct `worker(&local);` is already caught at NODE_CALL. */
+        if (func_sym && func_sym->type &&
+            type_dispatch_kind(func_sym->type) == TYPE_FUNC_PTR) {
+            Type *callee_sig = type_unwrap_distinct(func_sym->type);
+            if (callee_sig) {
+                int param_count = (int)callee_sig->func_ptr.param_count;
+                for (int i = 0; i < node->spawn_stmt.arg_count && i < param_count; i++) {
+                    Node *arg_node = node->spawn_stmt.args[i];
+                    int edge_vkind = KV_NONE;
+                    const char *edge_argname = NULL;
+                    uint32_t edge_argname_len = 0;
+                    Node *karg = arg_node;
+                    while (karg && karg->kind == NODE_INTRINSIC &&
+                           karg->intrinsic.arg_count > 0)
+                        karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                    /* &local — KV_LOCAL_ADDR */
+                    if (karg && karg->kind == NODE_UNARY &&
+                        karg->unary.op == TOK_AMP &&
+                        karg->unary.operand &&
+                        karg->unary.operand->kind == NODE_IDENT) {
+                        Symbol *asym = scope_lookup(c->current_scope,
+                            karg->unary.operand->ident.name,
+                            (uint32_t)karg->unary.operand->ident.name_len);
+                        if (asym && !asym->is_static) {
+                            bool is_global = scope_lookup_local(c->global_scope,
+                                asym->name, asym->name_len) != NULL;
+                            if (!is_global && c->current_module) {
+                                uint32_t mkl = c->current_module_len + 2 + asym->name_len;
+                                char *mk = (char *)arena_alloc(c->arena, mkl + 1);
+                                if (mk) {
+                                    memcpy(mk, c->current_module, c->current_module_len);
+                                    mk[c->current_module_len] = '_';
+                                    mk[c->current_module_len + 1] = '_';
+                                    memcpy(mk + c->current_module_len + 2, asym->name, asym->name_len);
+                                    is_global = scope_lookup_local(c->global_scope, mk, mkl) != NULL;
+                                }
+                            }
+                            if (!is_global) {
+                                edge_vkind = KV_LOCAL_ADDR;
+                                edge_argname = asym->name;
+                                edge_argname_len = asym->name_len;
+                            }
+                        }
+                    }
+                    /* IDENT shapes: local-derived / arena-derived / local array */
+                    if (edge_vkind == KV_NONE && arg_node && arg_node->kind == NODE_IDENT) {
+                        Symbol *asym = scope_lookup(c->current_scope,
+                            arg_node->ident.name, (uint32_t)arg_node->ident.name_len);
+                        if (asym && asym->is_local_derived) {
+                            edge_vkind = KV_LOCAL_DERIVED;
+                            edge_argname = asym->name; edge_argname_len = asym->name_len;
+                        } else if (asym && asym->is_arena_derived) {
+                            edge_vkind = KV_ARENA;
+                            edge_argname = asym->name; edge_argname_len = asym->name_len;
+                        } else if (asym && !asym->is_static &&
+                                   asym->type &&
+                                   type_dispatch_kind(asym->type) == TYPE_ARRAY) {
+                            bool sym_is_global = scope_lookup_local(c->global_scope,
+                                asym->name, asym->name_len) != NULL;
+                            if (!sym_is_global) {
+                                edge_vkind = KV_LOCAL_ARRAY;
+                                edge_argname = asym->name; edge_argname_len = asym->name_len;
+                            }
+                        }
+                    }
+                    /* Generic fall-through: slice/field/index of local + call-result
+                     * launder + orelse fallback (same coverage as arg_is_local_derived). */
+                    if (edge_vkind == KV_NONE &&
+                        arg_is_local_derived(c, arg_node, 0)) {
+                        edge_vkind = KV_LOCAL_DERIVED;
+                        edge_argname = "argument";
+                        edge_argname_len = 8;
+                    }
+                    int caller_root = keep_arg_caller_root(c, arg_node);
+                    record_keep_edge(c, callee_sig, i, /* is_fn_ptr_call */ false,
+                                     edge_vkind, edge_argname, edge_argname_len,
+                                     i + 1, node->loc.line,
+                                     c->current_func_sig, caller_root);
                 }
             }
         }

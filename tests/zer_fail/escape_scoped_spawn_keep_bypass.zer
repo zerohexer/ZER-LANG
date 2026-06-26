@@ -1,0 +1,32 @@
+// EXPECTED: compile error
+// Silent gap (audited 2026-06-26): scoped-spawn `ThreadHandle th = spawn
+// worker(...); th.join();` bypasses keep-parameter inference. The thread
+// is joined before the function returns, BUT if the worker stores its
+// pointer arg into a long-lived sink (shared global field), the global
+// retains the pointer AFTER th.join() and AFTER the caller frame exits
+// — dangling cross-thread pointer.
+//
+// Equivalent DIRECT call `worker(&g_counter, &local_val);` is correctly
+// rejected with "local variable 'local_val' cannot satisfy 'keep'
+// parameter" — keep-inference fires at NODE_CALL via record_keep_edge.
+// NODE_SPAWN has its OWN per-arg loop (checker.c ~12686) that validates
+// shared-carrier / stack-derived / qualifiers but does NOT call
+// record_keep_edge — so keep-inference never sees the spawn site.
+//
+// Root cause: keep-edge recording is duplicated logic, only one of two
+// arg-loop sinks calls it. Fix is to share the keep-edge recording
+// between NODE_CALL and NODE_SPAWN.
+shared struct Counter { u32 value; *u32 stash; }
+Counter g_counter;
+void worker(*Counter c, *u32 ptr) {
+    c.stash = ptr;          // keep-inferred: writes ptr to a long-lived sink
+    c.value = *ptr;
+}
+void launch() {
+    u32 local_val = 7;
+    ThreadHandle th = spawn worker(&g_counter, &local_val);
+    th.join();
+    // After this returns, launch() returns. local_val is dead, but
+    // g_counter.stash still points at its dead stack slot.
+}
+u32 main() { launch(); return 0; }

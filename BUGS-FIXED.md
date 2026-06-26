@@ -31,12 +31,31 @@ forms of an operation but not all siblings). This closes the class mechanically.
   failure on an unhandled enum value. First verified the whole tree builds
   `-Wswitch`-clean (`make zerc CFLAGS="... -Werror=switch"` → exit 0, zero
   warnings) so the gate breaks nothing.
+- **BH-18 #7b 🟠 (checker.c `scan_body_shared_types`) — a REAL transitive hole
+  found while hardening, not just a structural conversion.** This walker builds
+  the per-function shared-type cache that the deadlock check reads transitively
+  (`collect_shared_types_in_expr`'s NODE_CALL case merges it). It was a partial
+  if-chain that recursed into BINARY/ASSIGN/UNARY/CALL/BLOCK/IF/.../ORELSE/
+  INTRINSIC but **NOT NODE_TYPECAST/INDEX/SLICE/STRUCT_INIT** — so a callee that
+  read a shared struct through a `(u32)cast` never recorded it, and a caller
+  statement that locked another shared struct and called it (`a.x = helper()`
+  where `helper` returns `(u32)b.y`) missed the A-then-B lock-ordering edge —
+  the transitive sibling of BH-18 #7. Verified a genuine hole in HEAD before
+  fixing (reproducer compiled clean). Fix: convert to a no-default exhaustive
+  switch over all 53 NodeKinds AND add the four missing recursions (in lockstep
+  with `collect_shared_types_in_expr`). The reproducer now rejects with
+  `deadlock: single statement accesses both 'A' (order 1) and 'B' (order 2)`.
+  The added recursions are sound (the transitive cache already merges all types
+  a callee touches; this only makes it COMPLETE, catching cast-hidden reads) —
+  no over-rejection (suite stays green, +1 = the new test only). Test:
+  `tests/zer_fail/bh18_7b_transitive_cast_deadlock.zer`.
 
 Verified: whole-tree `-Werror=switch` build exit 0 (zero switch warnings);
-`make check` GREEN with the gate active (semantic-fuzz 200/0, ZER 845/0,
+`make check` GREEN with the gate active (semantic-fuzz 200/0, ZER 846/0,
 modules/convert 139/0, escape-matrix 35/35, keep-matrix 21/21, conc-matrix
 15/15); walker-default audit still "OK — no default: clauses"; BH-18 #7
-(`tests/zer_fail/bh18_7_shared_cast_subexpr.zer`) still rejects.
+(`tests/zer_fail/bh18_7_shared_cast_subexpr.zer`) and #7b
+(`tests/zer_fail/bh18_7b_transitive_cast_deadlock.zer`) both reject.
 
 ---
 

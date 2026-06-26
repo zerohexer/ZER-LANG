@@ -16149,8 +16149,9 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
 /* Recursive body scanner — finds shared field accesses + callee calls */
 static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedTypes *fsc) {
     if (!node) return;
+    switch (node->kind) {
     /* Direct shared field access */
-    if (node->kind == NODE_FIELD) {
+    case NODE_FIELD: {
         Node *root = node;
         while (root->kind == NODE_FIELD) root = root->field.object;
         while (root->kind == NODE_INDEX) root = root->index_expr.object;
@@ -16170,77 +16171,126 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
                 }
             }
         }
+        break;
     }
-    /* Function call — compute callee transitively and merge */
-    if (node->kind == NODE_CALL && node->call.callee &&
-        node->call.callee->kind == NODE_IDENT) {
-        const char *cn = node->call.callee->ident.name;
-        uint32_t cl = (uint32_t)node->call.callee->ident.name_len;
-        compute_func_shared_types(c, cn, cl);
-        struct FuncSharedTypes *callee_fsc = find_func_shared_cache(c, cn, cl);
-        if (callee_fsc) {
-            for (int i = 0; i < callee_fsc->type_count; i++)
-                fsc_add_type_id(fsc, callee_fsc->type_ids[i]);
+    /* Function call — compute callee transitively and merge, then recurse args */
+    case NODE_CALL: {
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            const char *cn = node->call.callee->ident.name;
+            uint32_t cl = (uint32_t)node->call.callee->ident.name_len;
+            compute_func_shared_types(c, cn, cl);
+            struct FuncSharedTypes *callee_fsc = find_func_shared_cache(c, cn, cl);
+            if (callee_fsc) {
+                for (int i = 0; i < callee_fsc->type_count; i++)
+                    fsc_add_type_id(fsc, callee_fsc->type_ids[i]);
+            }
         }
-    }
-    /* Recurse into all children */
-    if (node->kind == NODE_BINARY) {
-        scan_body_shared_types(c, node->binary.left, fsc);
-        scan_body_shared_types(c, node->binary.right, fsc);
-    }
-    if (node->kind == NODE_ASSIGN) {
-        scan_body_shared_types(c, node->assign.target, fsc);
-        scan_body_shared_types(c, node->assign.value, fsc);
-    }
-    if (node->kind == NODE_UNARY)
-        scan_body_shared_types(c, node->unary.operand, fsc);
-    if (node->kind == NODE_CALL) {
         for (int i = 0; i < node->call.arg_count; i++)
             scan_body_shared_types(c, node->call.args[i], fsc);
+        break;
     }
-    if (node->kind == NODE_BLOCK) {
+    case NODE_BINARY:
+        scan_body_shared_types(c, node->binary.left, fsc);
+        scan_body_shared_types(c, node->binary.right, fsc);
+        break;
+    case NODE_ASSIGN:
+        scan_body_shared_types(c, node->assign.target, fsc);
+        scan_body_shared_types(c, node->assign.value, fsc);
+        break;
+    case NODE_UNARY:
+        scan_body_shared_types(c, node->unary.operand, fsc);
+        break;
+    /* Sibling shapes of BH-18 #7 — a shared read can hide inside a (T)cast,
+     * index, slice, intrinsic, orelse, or struct-init subexpression. The
+     * TRANSITIVE cache MUST descend them: a callee that reads a shared struct
+     * through one of these forms otherwise goes unrecorded, and a caller
+     * statement that locks another shared struct + calls it then misses the
+     * cross-struct lock-ordering edge (deadlock) the per-statement model would
+     * reject at the direct site. (Kept in lockstep with
+     * collect_shared_types_in_expr, which closed these at the direct site.) */
+    case NODE_TYPECAST:
+        scan_body_shared_types(c, node->typecast.expr, fsc);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            scan_body_shared_types(c, node->intrinsic.args[i], fsc);
+        break;
+    case NODE_INDEX:
+        scan_body_shared_types(c, node->index_expr.object, fsc);
+        scan_body_shared_types(c, node->index_expr.index, fsc);
+        break;
+    case NODE_SLICE:
+        scan_body_shared_types(c, node->slice.object, fsc);
+        scan_body_shared_types(c, node->slice.start, fsc);
+        scan_body_shared_types(c, node->slice.end, fsc);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            scan_body_shared_types(c, node->struct_init.fields[i].value, fsc);
+        break;
+    case NODE_ORELSE:
+        scan_body_shared_types(c, node->orelse.expr, fsc);
+        scan_body_shared_types(c, node->orelse.fallback, fsc);
+        break;
+    case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
             scan_body_shared_types(c, node->block.stmts[i], fsc);
-    }
-    if (node->kind == NODE_RETURN && node->ret.expr)
+        break;
+    case NODE_RETURN:
         scan_body_shared_types(c, node->ret.expr, fsc);
-    if (node->kind == NODE_EXPR_STMT)
+        break;
+    case NODE_EXPR_STMT:
         scan_body_shared_types(c, node->expr_stmt.expr, fsc);
-    if (node->kind == NODE_VAR_DECL && node->var_decl.init)
+        break;
+    case NODE_VAR_DECL:
         scan_body_shared_types(c, node->var_decl.init, fsc);
-    if (node->kind == NODE_IF) {
+        break;
+    case NODE_IF:
         scan_body_shared_types(c, node->if_stmt.cond, fsc);
         scan_body_shared_types(c, node->if_stmt.then_body, fsc);
         scan_body_shared_types(c, node->if_stmt.else_body, fsc);
-    }
-    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE) {
+        break;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
         scan_body_shared_types(c, node->while_stmt.cond, fsc);
         scan_body_shared_types(c, node->while_stmt.body, fsc);
-    }
-    if (node->kind == NODE_FOR) {
+        break;
+    case NODE_FOR:
         scan_body_shared_types(c, node->for_stmt.init, fsc);
         scan_body_shared_types(c, node->for_stmt.cond, fsc);
         scan_body_shared_types(c, node->for_stmt.step, fsc);
         scan_body_shared_types(c, node->for_stmt.body, fsc);
-    }
-    if (node->kind == NODE_SWITCH) {
+        break;
+    case NODE_SWITCH:
         scan_body_shared_types(c, node->switch_stmt.expr, fsc);
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             scan_body_shared_types(c, node->switch_stmt.arms[i].body, fsc);
-    }
-    if (node->kind == NODE_DEFER)
+        break;
+    case NODE_DEFER:
         scan_body_shared_types(c, node->defer.body, fsc);
-    if (node->kind == NODE_CRITICAL)
+        break;
+    case NODE_CRITICAL:
         scan_body_shared_types(c, node->critical.body, fsc);
-    if (node->kind == NODE_ONCE)
+        break;
+    case NODE_ONCE:
         scan_body_shared_types(c, node->once.body, fsc);
-    if (node->kind == NODE_ORELSE) {
-        scan_body_shared_types(c, node->orelse.expr, fsc);
-        scan_body_shared_types(c, node->orelse.fallback, fsc);
-    }
-    if (node->kind == NODE_INTRINSIC) {
-        for (int i = 0; i < node->intrinsic.arg_count; i++)
-            scan_body_shared_types(c, node->intrinsic.args[i], fsc);
+        break;
+    /* No-op kinds — no subexpression the deadlock-cache must descend
+     * (literals/idents/declarations, control-flow without a shared-readable
+     * expr, and spawn/await/yield whose concurrency safety is enforced by
+     * their own checks). NO default: so a new NodeKind trips -Werror=switch
+     * here too — same structural defense as collect_shared_types_in_expr. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
     }
 }
 

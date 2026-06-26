@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// BH-18 #7b regression (negative test): the TRANSITIVE half of the shared-type
+// collection. `helper()` reads shared struct B through a (u32)cast; `foo()`
+// locks shared struct A for the statement and calls helper() inside it — so A
+// is held while helper acquires B (an A-then-B lock-ordering edge that risks
+// AB-BA deadlock and is rejected by the per-statement model).
+//
+// Pre-fix: scan_body_shared_types (checker.c) — which builds the per-function
+// shared-type cache the deadlock check reads transitively — recursed into
+// BINARY/ASSIGN/UNARY/CALL/.../ORELSE/INTRINSIC but NOT NODE_TYPECAST (nor
+// INDEX/SLICE/STRUCT_INIT). So helper's cast-hidden read of B never entered its
+// cache, foo's `a.x = helper()` statement saw only A, and the deadlock edge was
+// silently missed — the transitive sibling of BH-18 #7.
+//
+// Post-fix: scan_body_shared_types is a no-default exhaustive switch that
+// descends TYPECAST/INDEX/SLICE/STRUCT_INIT, in lockstep with
+// collect_shared_types_in_expr. B is recorded; this statement is rejected.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+
+u32 helper() { return (u32)b.y; }
+void foo() { a.x = helper(); }
+
+u32 main() { return 0; }

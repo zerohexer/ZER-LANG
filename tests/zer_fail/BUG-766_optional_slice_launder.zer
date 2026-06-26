@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// BUG-766: silent stack-UAF — optional-slice return laundering. The
+//   call-result launder check was gated on POINTER or SLICE value types, so
+//   `g_leaked = idfn(np)` where idfn returns `?[*]u8` (TYPE_OPTIONAL wrapping
+//   a slice) was missed. The gate is now type_carries_data_pointer-based,
+//   which recurses through OPTIONAL.
+?[*]u8 g_leaked;
+?[*]u8 idfn([*]u8 p) { return p; }
+void launder([*]u8 np) {
+    g_leaked = idfn(np);
+}
+u32 main() {
+    u8[16] buf;
+    buf[0] = 5;
+    launder(buf[0..16]);
+    if (g_leaked) |s| { return (u32)s[0]; }
+    return 0;
+}

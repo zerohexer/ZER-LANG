@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// BUG-766: silent stack-UAF — direct slice-of-nonkeep-param laundered through
+//   a call. `g = idfn(np[0..16])` previously bypassed both
+//   call_has_nonkeep_derived_arg (didn't descend NODE_SLICE) AND
+//   infer_keep_from_call_args (mirror function), so np's is_nonkeep_derived
+//   never propagated to its keep status. Caller could then pass `buf[0..]`
+//   from a local array and the launder() body writes the stack pointer into
+//   g_leaked. ASan: stack-use-after-return when victim() returns.
+[*]u8 g_leaked;
+[*]u8 idfn([*]u8 p) { return p; }
+void launder([*]u8 np) {
+    g_leaked = idfn(np[0..16]);
+}
+u32 main() {
+    u8[16] buf;
+    buf[0] = 7;
+    launder(buf[0..16]);
+    return (u32)g_leaked[0];
+}

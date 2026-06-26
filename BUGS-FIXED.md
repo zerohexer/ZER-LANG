@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied BUG-766/767 (5 stack-UAF launders + intrinsic global-init) from cool-johnson-dfcqr9 (batch 6, manual, no merge)
+
+All six reproducers verified STILL HOLES in current main before applying (this session's
+escape rework covered different sink shapes — the per-sink patchwork). Applied on top of
+this session's `call_result_escapes` (the gate-widening composes — escape-matrix 35/35,
+keep-matrix 21/21 stay green).
+
+**BUG-766 — 5 silent stack-UAFs (checker.c):**
+1. slice-via-intermediate-var: VAR_DECL init-root walk now descends NODE_SLICE so
+   `[*]u8 s = np[0..16]` propagates `is_nonkeep_derived` from np to s.
+2. direct slice-of-nonkeep-param through a call: `call_has_nonkeep_derived_arg` and
+   `infer_keep_from_call_args` now descend SLICE/INDEX/FIELD to the root, so
+   `g = idfn(np[0..16])` is caught.
+3. whole-struct call-result to a global: the assign-sink call-launder gate widened from
+   pointer/slice-only to `type_carries_data_pointer`, so `g = mk_outer(p)` (struct wrapping
+   a slice) is covered.
+4. whole-struct call-result through return: same widening at the return sink (keeps this
+   session's `call_result_escapes` inner check).
+5. optional-slice return: `type_carries_data_pointer` also covers `?[*]u8` returns.
+
+**BUG-767 — intrinsic global-init miscompile (emitter.c):** a runtime/privileged intrinsic
+(`@port_in32`, `@cpu_read_msr`, …) used in a global const-init fell through the AST emitter's
+unknown-intrinsic path to `/* @name — unknown */0`, silently substituting zero. Now emits an
+undeclared identifier so GCC errors loudly.
+
+Verified: all 6 reproducers reject; `make check` GREEN (suite 840, escape/keep matrices
+green, all audit gates OK). Tests: `tests/zer_fail/BUG-766_*.zer` (5),
+`tests/zer_fail/BUG-767_intrinsic_global_init_loud.zer`.
+
+---
+
 ## 2026-06-26 — copied BH-18 #6 capture-escape fix from cool-johnson-t8vr3h (batch 5, manual, no merge)
 
 **BH-18 #6 🔴 (checker.c if-unwrap capture):** `if (m) |*v| { g = v; }` where `m` is a local

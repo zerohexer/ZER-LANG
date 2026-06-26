@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// BUG-766: silent stack-UAF — return-call whole-struct laundering. The
+//   return-call escape walker at NODE_RETURN was gated on POINTER or SLICE
+//   return types, so `return mk_outer(buf[0..16])` returning a STRUCT
+//   wrapping the slice was missed. Caller's `Outer o = leak()` then sees a
+//   struct whose inner.data points into leak's own stack frame. ASan:
+//   stack-use-after-return on the read of o.inner.data[0].
+struct Inner { [*]u8 data; }
+struct Outer { Inner inner; }
+Inner mk_inner([*]u8 p) { Inner i = { .data = p }; return i; }
+Outer mk_outer([*]u8 p) { Outer o = { .inner = mk_inner(p) }; return o; }
+Outer leak() {
+    u8[16] buf;
+    return mk_outer(buf[0..16]);
+}
+u32 main() {
+    Outer o = leak();
+    return (u32)o.inner.data[0];
+}

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// BUG-766: silent stack-UAF — slice-var laundering of a nonkeep slice param.
+//   `[*]u8 s = np[0..16];` previously failed to propagate is_nonkeep_derived
+//   from np through NODE_SLICE (the VAR_DECL chain walker didn't descend it),
+//   so `keepfn(s)` never triggered keep inference on np's root param. The
+//   caller of launder() could then hand it a slice into a stack local and
+//   the keepfn would write that stack pointer into a global — ASan reports
+//   stack-use-after-return when the caller later reads g_leaked.
+[*]u8 g_leaked;
+void keepfn(keep [*]u8 x) { g_leaked = x; }
+void launder([*]u8 np) {
+    [*]u8 s = np[0..16];
+    keepfn(s);
+}
+u32 main() {
+    u8[16] buf;
+    buf[0] = 7;
+    launder(buf[0..16]);
+    return (u32)g_leaked[0];
+}

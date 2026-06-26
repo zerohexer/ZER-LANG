@@ -3445,7 +3445,13 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ")");
             }
         } else {
-            emit(e, "/* @%.*s — unknown */0", (int)nlen, name);
+            /* BUG-767 (copied from cool-johnson-dfcqr9): a runtime/privileged
+             * intrinsic with no AST-path handler (e.g. @port_in32, @cpu_read_msr)
+             * used in a global const-init previously emitted a placeholder + 0,
+             * silently substituting zero for the runtime read. Emit an undeclared
+             * identifier so GCC errors loudly instead of producing a binary that
+             * reads 0 at startup. */
+            emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context", (int)nlen, name);
         }
         break;
     }

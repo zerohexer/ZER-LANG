@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// BUG-767: silent miscompile when a runtime/privileged intrinsic
+//   (D-Alpha-9..14: @port_in32, @cpu_read_msr, etc.) is used at a global
+//   constant-init context. The AST-path emitter previously fell through to
+//   "/* @name — unknown */0", silently substituting zero for the intended
+//   runtime read. Now emits an undeclared identifier so GCC errors loudly
+//   with "use of undeclared identifier" instead of producing a binary that
+//   silently reads 0 at startup.
+const u32 PORT_VAL = @port_in32(0x60);
+u32 main() { return PORT_VAL; }

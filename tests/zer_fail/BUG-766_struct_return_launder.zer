@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// BUG-766: silent stack-UAF — call-result whole-struct laundering. The
+//   call-result launder check at NODE_ASSIGN was gated on POINTER or SLICE
+//   value types, so `g = mk_outer(np)` returning a STRUCT wrapping a slice
+//   was missed even though the struct carries a data pointer. ASan reports
+//   stack-use-after-return after the caller frame is torn down.
+struct Inner { [*]u8 data; }
+struct Outer { Inner inner; }
+Outer g;
+Inner mk_inner([*]u8 p) { Inner i = { .data = p }; return i; }
+Outer mk_outer([*]u8 p) { Outer o = { .inner = mk_inner(p) }; return o; }
+void launder([*]u8 np) {
+    g = mk_outer(np);
+}
+u32 main() {
+    u8[16] buf;
+    buf[0] = 9;
+    launder(buf[0..16]);
+    return (u32)g.inner.data[0];
+}

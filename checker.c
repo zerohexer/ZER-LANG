@@ -1123,6 +1123,16 @@ static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
         /* unwrap value-side intrinsic launders (@ptrcast(*T, p)) */
         while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
             arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        /* BUG-766 (copied from cool-johnson-dfcqr9): descend SLICE/INDEX/FIELD to
+         * the root ident — `g = idfn(np[0..16])` (direct slice of a non-keep
+         * param) previously laundered the flag here and silently escaped. */
+        while (arg && (arg->kind == NODE_SLICE ||
+                       arg->kind == NODE_INDEX ||
+                       arg->kind == NODE_FIELD)) {
+            if (arg->kind == NODE_SLICE)      arg = arg->slice.object;
+            else if (arg->kind == NODE_INDEX) arg = arg->index_expr.object;
+            else                              arg = arg->field.object;
+        }
         if (arg && arg->kind == NODE_IDENT) {
             Symbol *src = scope_lookup(c->current_scope,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
@@ -1179,6 +1189,16 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
         Node *arg = call->call.args[i];
         while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
             arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        /* BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
+         * descent — without it, `g = idfn(np[0..16])` records the launder but
+         * skips keep inference (no propagation to np's root param). */
+        while (arg && (arg->kind == NODE_SLICE ||
+                       arg->kind == NODE_INDEX ||
+                       arg->kind == NODE_FIELD)) {
+            if (arg->kind == NODE_SLICE)      arg = arg->slice.object;
+            else if (arg->kind == NODE_INDEX) arg = arg->index_expr.object;
+            else                              arg = arg->field.object;
+        }
         if (arg && arg->kind == NODE_IDENT) {
             Symbol *src = scope_lookup(c->current_scope,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
@@ -4301,9 +4321,13 @@ static Type *check_expr(Checker *c, Node *node) {
          * the stored value being a pointer/slice (same as BUG-360/383) so
          * int-returning calls aren't over-rejected. Conservative proxy — see
          * call_has_nonkeep_derived_arg. */
-        if (node->assign.op == TOK_EQ &&
-            value && (type_dispatch_kind(value) == TYPE_POINTER ||
-                      type_dispatch_kind(value) == TYPE_SLICE)) {
+        if (node->assign.op == TOK_EQ && value &&
+            /* BUG-766 (copied from cool-johnson-dfcqr9): gate via
+             * type_carries_data_pointer so STRUCT/UNION/OPTIONAL returns wrapping
+             * a pointer/slice are covered (`g = mk_outer(p)`, `g = idfn(np)`
+             * returning ?[*]u8) — the old pointer/slice-only gate left silent
+             * stack-UAFs. Scalars stay false → unaffected. */
+            type_carries_data_pointer(value, 0)) {
             Node *vroot = node->assign.value;
             while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
                 if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
@@ -4411,9 +4435,13 @@ static Type *check_expr(Checker *c, Node *node) {
          * BUG-360/383; assignment sinks were uncovered (escape-matrix holes).
          * Conservative (same proxy as the return check): rejects even if the
          * callee doesn't retain the arg — over-rejection acceptable, under not. */
-        if (node->assign.op == TOK_EQ &&
-            value && (type_dispatch_kind(value) == TYPE_POINTER ||
-                      type_dispatch_kind(value) == TYPE_SLICE)) {
+        if (node->assign.op == TOK_EQ && value &&
+            /* BUG-766 (copied from cool-johnson-dfcqr9): gate via
+             * type_carries_data_pointer so STRUCT/UNION/OPTIONAL returns wrapping
+             * a pointer/slice are covered (`g = mk_outer(p)`, `g = idfn(np)`
+             * returning ?[*]u8) — the old pointer/slice-only gate left silent
+             * stack-UAFs. Scalars stay false → unaffected. */
+            type_carries_data_pointer(value, 0)) {
             /* Gate on the stored value being a pointer/slice — same as BUG-360/383.
              * `g_int = count(&local)` returns an int: no pointer escapes, don't reject. */
             Node *vroot = node->assign.value;
@@ -9778,6 +9806,11 @@ static void check_stmt(Checker *c, Node *node) {
                         while (init_root) {
                             if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
                             else if (init_root->kind == NODE_INDEX) init_root = init_root->index_expr.object;
+                            /* BUG-766 (copied from dfcqr9): walk NODE_SLICE — `s = np[0..16]`
+                             * root is np. Without this, is_nonkeep_derived doesn't propagate
+                             * from the slice subject through a slice-via-intermediate-var, so
+                             * a later keepfn(s) never infers keep on np's root param. */
+                            else if (init_root->kind == NODE_SLICE) init_root = init_root->slice.object;
                             /* BUG-338: walk into intrinsic args (ptrcast, bitcast) */
                             else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
                                 init_root = init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
@@ -11528,8 +11561,12 @@ static void check_stmt(Checker *c, Node *node) {
              * pointer arg returning a pointer type. Conservatively assume result
              * may be local-derived. BUG-374: recurse into nested calls —
              * return identity(identity(&x)) must also be caught. */
-            if (node->ret.expr->kind == NODE_CALL &&
-                ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
+            if (node->ret.expr->kind == NODE_CALL && ret_type &&
+                /* BUG-766 (copied from dfcqr9): widen the gate to
+                 * type_carries_data_pointer so a STRUCT/UNION/OPTIONAL return
+                 * wrapping a pointer (`return mk_outer(buf[0..])`) is covered;
+                 * keeps this session's call_result_escapes inner check. */
+                type_carries_data_pointer(ret_type, 0)) {
                 if (call_result_escapes(c, node->ret.expr)) {
                     checker_error(c, node->loc.line,
                         "cannot return result of call with local-derived pointer argument — "

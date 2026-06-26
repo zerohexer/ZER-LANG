@@ -5,6 +5,23 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied BH-18 #6 capture-escape fix from cool-johnson-t8vr3h (batch 5, manual, no merge)
+
+**BH-18 #6 🔴 (checker.c if-unwrap capture):** `if (m) |*v| { g = v; }` where `m` is a local
+optional — `v` points INTO `m`'s storage, so storing it to a global dangles after the
+function returns. The hand-written analog `g = &m.value;` was already rejected; only the
+capture-desugared `v` slipped through (it didn't carry the local-derived flag). Fix: when the
+capture is a pointer (`|*v|`) AND the condition root resolves to a function-local, mark the
+capture `is_local_derived` so the existing escape sink fires. Certified by this session's
+`capture_lattice.v` oracle ("capture inherits the payload's region"). Verified not in main
+(reproducer compiled clean before; rejects after). `make check` GREEN (suite 834). Test:
+`tests/zer_fail/bh18_6_capture_ptr_escape_global.zer`. limitations.md #6 marked FIXED.
+
+This completes t8vr3h's not-in-main set (#2/#5/#6/#7/#9/#10; #3/#4/#13 were already in main as
+this session's fixes; #8 was deferred on the branch).
+
+---
+
 ## 2026-06-26 — copied 3 isolated fixes from cool-johnson-er0bp3 + 8ezecl (batch 4, manual, no merge)
 
 - **for-step shared-orelse unlocked (ir_lower.c, from er0bp3):** a for-loop step

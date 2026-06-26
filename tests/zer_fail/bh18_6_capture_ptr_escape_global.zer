@@ -1,0 +1,23 @@
+/* BH-18 #6 regression (negative test): `if (opt) |*v| { g = v; }` where
+ * opt is a LOCAL — `v` is a pointer INTO the local optional's storage.
+ * Storing v into a global is a dangling-pointer escape.
+ *
+ * Pre-fix, the hand-written analog `g = &m.value;` was rejected by the
+ * escape-sink scan, but the capture-desugared `v` did not carry the
+ * `is_local_derived` flag, so `g = v` slipped through as a normal store
+ * and `g` ended up pointing at dead stack after `stash()` returned.
+ *
+ * Post-fix: when capture_is_ptr is true AND the condition's root ident
+ * resolves to a function-local (not global, not is_static), the capture
+ * inherits is_local_derived, and the existing escape check fires on g = v. */
+?*u32 g = null;
+
+void stash() {
+    ?u32 m = 5;
+    if (m) |*v| { g = v; }   /* must reject: v points into local m */
+}
+
+u32 main() {
+    stash();
+    return 0;
+}

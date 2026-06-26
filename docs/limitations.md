@@ -2050,7 +2050,7 @@ match needs an IR-path equivalent. Tripwire: `tests/zer_trap/array_call_index_oo
 
 ---
 
-## OPEN — BH-18 #6 — `if (opt) |*v|` mutable capture escapes a pointer-to-local to a global (🔴 soundness)
+## FIXED (2026-06-26, copied from cool-johnson-t8vr3h) — BH-18 #6 — `if(opt)|*v|` capture escapes a pointer-to-local to a global (🔴 soundness)
 
 **ORACLE NOW EXISTS (2026-06-23):** `proofs/operational/lambda_zer_capture/capture_lattice.v`
 certifies the rule — a capture INHERITS the payload's region

@@ -10323,6 +10323,27 @@ static void check_stmt(Checker *c, Node *node) {
                             Symbol *csym = scope_lookup(c->current_scope,
                                 croot->ident.name, (uint32_t)croot->ident.name_len);
                             if (csym) propagate_escape_flags(cap, csym, cap->type);
+                            /* BH-18 #6 (copied from cool-johnson-t8vr3h):
+                             * `if (m) |*v| { g = v; }` where `m` is a local
+                             * optional — `v` points INTO `m`'s storage. The
+                             * hand-written analog `g = &m.value;` is rejected,
+                             * but the capture-desugared `v` did not carry the
+                             * local-derived flag, so `g = v` slipped through and
+                             * `g` dangled after the function returned. Fix: when
+                             * the capture is a pointer (`|*v|`) AND the condition
+                             * root resolves to a function-local, mark the
+                             * capture is_local_derived so the existing escape
+                             * sink fires. (Certified by capture_lattice.v —
+                             * "capture inherits the payload's region".) */
+                            if (node->if_stmt.capture_is_ptr && csym) {
+                                bool cond_root_is_global = scope_lookup_local(
+                                    c->global_scope,
+                                    croot->ident.name,
+                                    (uint32_t)croot->ident.name_len) != NULL;
+                                if (!cond_root_is_global && !csym->is_static) {
+                                    cap->is_local_derived = true;
+                                }
+                            }
                         }
                     }
 

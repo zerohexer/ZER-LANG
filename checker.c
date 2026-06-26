@@ -16308,13 +16308,20 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
  * case (cond struct `b`, predicate `b.field` — same root ident). Locking the 2nd
  * struct inside the cond mutex is NOT an option (AB-BA deadlock, and cond_wait
  * sleeps holding the extra lock), so the correct discipline is the textbook one:
- * a condvar predicate may read only state protected by the cond mutex. Uses
- * if/else (not switch) to satisfy the walker-default audit, and type_dispatch_kind
- * (not a raw type-kind comparison) to satisfy the type-dispatch audit. */
+ * a condvar predicate may read only state protected by the cond mutex. A
+ * no-default exhaustive switch over node kinds (satisfies the walker-default
+ * audit, and brings it under -Werror=switch so a new kind can't silently evade
+ * it — closed a real same-type intrinsic-wrapped foreign-read hole, 2026-06-27),
+ * with type_dispatch_kind (not a raw type-kind comparison) for the
+ * type-dispatch audit. */
 static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
                                       const char *cond_root, uint32_t cond_root_len) {
     if (!pred) return NULL;
-    if (pred->kind == NODE_FIELD || pred->kind == NODE_INDEX) {
+    Node *r = NULL;
+    switch (pred->kind) {
+    case NODE_FIELD:
+    case NODE_INDEX: {
+        /* base case: walk to the root ident, flag a foreign shared read */
         Node *root = pred;
         while (root->kind == NODE_FIELD) root = root->field.object;
         while (root->kind == NODE_INDEX) root = root->index_expr.object;
@@ -16345,28 +16352,74 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
                 }
             }
         }
-    }
-    Node *r = NULL;
-    if (pred->kind == NODE_BINARY) {
-        if ((r = cond_pred_foreign_shared(c, pred->binary.left, cond_root, cond_root_len)))
-            return r;
-        return cond_pred_foreign_shared(c, pred->binary.right, cond_root, cond_root_len);
-    }
-    if (pred->kind == NODE_UNARY)
-        return cond_pred_foreign_shared(c, pred->unary.operand, cond_root, cond_root_len);
-    if (pred->kind == NODE_FIELD)
-        return cond_pred_foreign_shared(c, pred->field.object, cond_root, cond_root_len);
-    if (pred->kind == NODE_INDEX) {
+        /* not a foreign read at this level — descend the subexpressions
+         * (a nested field, or an index expression, can hold one) */
+        if (pred->kind == NODE_FIELD)
+            return cond_pred_foreign_shared(c, pred->field.object, cond_root, cond_root_len);
         if ((r = cond_pred_foreign_shared(c, pred->index_expr.object, cond_root, cond_root_len)))
             return r;
         return cond_pred_foreign_shared(c, pred->index_expr.index, cond_root, cond_root_len);
     }
-    if (pred->kind == NODE_TYPECAST)
+    case NODE_BINARY:
+        if ((r = cond_pred_foreign_shared(c, pred->binary.left, cond_root, cond_root_len)))
+            return r;
+        return cond_pred_foreign_shared(c, pred->binary.right, cond_root, cond_root_len);
+    case NODE_UNARY:
+        return cond_pred_foreign_shared(c, pred->unary.operand, cond_root, cond_root_len);
+    case NODE_TYPECAST:
         return cond_pred_foreign_shared(c, pred->typecast.expr, cond_root, cond_root_len);
-    if (pred->kind == NODE_CALL) {
+    case NODE_CALL:
         for (int i = 0; i < pred->call.arg_count; i++)
             if ((r = cond_pred_foreign_shared(c, pred->call.args[i], cond_root, cond_root_len)))
                 return r;
+        return NULL;
+    /* B3 completeness — a foreign shared read can also hide inside an
+     * @intrinsic (e.g. @truncate(u8, gb.count)), an orelse, a slice, or a
+     * struct-init subexpression of the predicate. Without descending these a
+     * same-shared-TYPE different-INSTANCE foreign read evades BOTH B3 (which
+     * never saw it) AND the deadlock check (which dedups by type_id, so two
+     * instances of the same shared type look like one) — an unsynchronized
+     * cross-thread race compiles clean. (Sibling of the BH-18 #7 gap; verified
+     * a real hole before this fix.) */
+    case NODE_INTRINSIC:
+        for (int i = 0; i < pred->intrinsic.arg_count; i++)
+            if ((r = cond_pred_foreign_shared(c, pred->intrinsic.args[i], cond_root, cond_root_len)))
+                return r;
+        return NULL;
+    case NODE_ORELSE:
+        if ((r = cond_pred_foreign_shared(c, pred->orelse.expr, cond_root, cond_root_len)))
+            return r;
+        return cond_pred_foreign_shared(c, pred->orelse.fallback, cond_root, cond_root_len);
+    case NODE_SLICE:
+        if ((r = cond_pred_foreign_shared(c, pred->slice.object, cond_root, cond_root_len)))
+            return r;
+        if ((r = cond_pred_foreign_shared(c, pred->slice.start, cond_root, cond_root_len)))
+            return r;
+        return cond_pred_foreign_shared(c, pred->slice.end, cond_root, cond_root_len);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < pred->struct_init.field_count; i++)
+            if ((r = cond_pred_foreign_shared(c, pred->struct_init.fields[i].value, cond_root, cond_root_len)))
+                return r;
+        return NULL;
+    /* No-op kinds — a predicate sub-expression that cannot itself carry a
+     * foreign shared read this check must see (literals/idents, assignments,
+     * and statement/declaration kinds that never appear inside a boolean
+     * predicate). NO default: so a new NodeKind trips -Werror=switch here. */
+    case NODE_ASSIGN:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return NULL;
     }
     return NULL;
 }

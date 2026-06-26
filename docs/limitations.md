@@ -5,6 +5,46 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `tools/audit_matrix.sh` is STALE (false positives mask real flag-handler gaps) (LOW — tool only, contracts sound)
+
+**Symptom:** `bash tools/audit_matrix.sh checker.c` reports 16 "BUG: … missing …
+check" gaps (RETURN/BREAK/CONTINUE/GOTO/YIELD/AWAIT/SPAWN × defer_depth/
+critical_depth/in_loop/in_interrupt). **All 16 are FALSE POSITIVES** — the
+contracts they claim are missing are actually enforced.
+
+**Root cause:** the script hardcodes a line window (`$1 > 8500 && $1 < 11000`)
+and extracts the handler body as "first `case NODE_X:` in that window → next 200
+lines." checker.c has grown to 16k+ lines, and the SAME control-flow case labels
+now appear in FIVE different switches (scan_frame, collect_labels, validate_gotos,
+the real `check_stmt`, plus the emit-side). The script grabs a DECOY case (e.g.
+`case NODE_RETURN:` at ~9062 in a non-checking switch) instead of the real
+handler. The actual context-ban checks live at checker.c ~6730
+(`zer_return_allowed_in_context(defer_depth, critical_depth)` and the break/
+continue siblings) and ~11237 (the check_stmt switch) — both outside the tool's
+window. Verified by hand: every one of the 16 contracts holds.
+
+**Why it matters (and why LOW):** it is a MANUAL audit, NOT a `make check` gate,
+so it gates nothing and cannot fail CI. BUT in its current state it cannot
+surface a *real* flag-handler gap — the 16-line noise floor would bury it (same
+failure mode as "CRLF masks the audits"). So the flag-handler dimension currently
+has no working automated guard, unlike the switch-exhaustiveness dimension (now a
+hard `-Werror=switch` gate, 2026-06-27).
+
+**Fix sketch:** stop using a line range. Anchor on the real `check_stmt` function
+(find its `switch (node->kind)` by walking from the `check_stmt` definition), and
+within THAT switch only, extract each control-flow case to its `break`. Or
+better, drop the grep heuristic entirely and assert the contracts a different way
+(e.g. a small unit test that feeds each `return/break/.../spawn`-in-`defer`/
+`@critical` program through the checker and asserts rejection — those negative
+`.zer` tests already exist in `tests/zer_fail/`, so the tool is arguably
+redundant and could be retired in favor of them).
+
+**Tripwire:** none yet (the negative `.zer` tests in `tests/zer_fail/` —
+`*_in_critical.zer`, defer-ban tests — are the real guarantee; this tool was
+meant to be a static cross-check of them).
+
+---
+
 ## OPEN — MAX-ORACLE GAP AUDIT (2026-06-23) — the master map: which safety classes are not-sound / not-flexible / coarse-or-no-oracle
 
 Audit of EVERY safety class against the MAX-ORACLE STANDARD (CLAUDE.md): a class is

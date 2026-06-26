@@ -49,9 +49,36 @@ forms of an operation but not all siblings). This closes the class mechanically.
   a callee touches; this only makes it COMPLETE, catching cast-hidden reads) —
   no over-rejection (suite stays green, +1 = the new test only). Test:
   `tests/zer_fail/bh18_7b_transitive_cast_deadlock.zer`.
+- **B3 🔴 (checker.c `cond_pred_foreign_shared`) — a third REAL hole, same shape.**
+  The B3 check rejects a `@cond_wait` predicate that reads a shared struct OTHER
+  than the condition variable's own (an unsynchronized cross-thread race —
+  cond_wait releases only the cond struct's mutex). It was a partial if-chain
+  recursing into BINARY/UNARY/FIELD/INDEX/TYPECAST/CALL but NOT
+  INTRINSIC/ORELSE/SLICE/STRUCT_INIT. So a foreign read wrapped in an
+  `@intrinsic` (`@cond_wait(ga, ga.count > 0 && @truncate(u8, gb.count) > 0)`)
+  was never visited. This is worse than a missed message: the deadlock check
+  (the usual backstop) dedups by `type_id`, so when `ga`/`gb` are the SAME
+  shared TYPE, different INSTANCES, it sees one type and does NOT fire either —
+  the race compiled clean (verified a real hole in HEAD; the bare and
+  different-type forms were already caught). Fix: no-default exhaustive switch +
+  the four missing recursions. The reproducer now rejects with the specific B3
+  message; legit same-struct predicates still compile (no over-rejection). Test:
+  `tests/zer_fail/cond_wait_foreign_same_type_intrinsic.zer`.
+
+**Stale tool noted (not a code bug):** `tools/audit_matrix.sh` (the flag-handler
+matrix) now reports 16 false-positive "gaps" — its hardcoded line range
+(8500–11000) and first-`case`-in-range extraction no longer match checker.c
+(grown to 16k+ lines, with the same control-flow case labels appearing in 5
+different switches: scan_frame, collect_labels, validate_gotos, the real
+check_stmt, …). All 16 contracts were verified to actually hold (the real checks
+live at checker.c ~6730 and ~11237, outside the tool's window). It is a MANUAL
+tool, not a `make check` gate, so it gates nothing — but it currently can't
+surface a real flag-handler gap (the noise would bury it). Tracked in
+`docs/limitations.md` for a proper rework (anchor on `check_stmt`'s switch, not a
+line range). The flag-handler CONTRACTS themselves are sound.
 
 Verified: whole-tree `-Werror=switch` build exit 0 (zero switch warnings);
-`make check` GREEN with the gate active (semantic-fuzz 200/0, ZER 846/0,
+`make check` GREEN with the gate active (semantic-fuzz 200/0, ZER 847/0,
 modules/convert 139/0, escape-matrix 35/35, keep-matrix 21/21, conc-matrix
 15/15); walker-default audit still "OK — no default: clauses"; BH-18 #7
 (`tests/zer_fail/bh18_7_shared_cast_subexpr.zer`) and #7b

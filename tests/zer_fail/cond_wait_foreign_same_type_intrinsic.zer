@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// B3 completeness regression (negative test): a @cond_wait predicate that reads
+// a DIFFERENT INSTANCE of the SAME shared type (gb) than the condition variable
+// (ga), with the foreign read hidden inside an @intrinsic (@truncate).
+//
+// This is an unsynchronized cross-thread race: pthread_cond_wait atomically
+// releases ONLY ga's mutex and re-evaluates the predicate under it, so gb.count
+// is read without gb's (distinct) lock held.
+//
+// Pre-fix: cond_pred_foreign_shared (checker.c, the B3 check) recursed into
+// BINARY/UNARY/FIELD/INDEX/TYPECAST/CALL but NOT NODE_INTRINSIC — so the
+// @truncate-wrapped gb.count was never visited. AND the deadlock check (the
+// usual backstop) dedups by type_id, so two instances of the SAME shared type
+// look like one type and it does not fire either. The race compiled clean.
+//
+// Post-fix: cond_pred_foreign_shared is a no-default exhaustive switch that
+// descends INTRINSIC/ORELSE/SLICE/STRUCT_INIT, so the foreign read is found.
+shared struct Cnt { u32 count; }
+Cnt ga; Cnt gb;
+
+void waiter() {
+    @cond_wait(ga, ga.count > 0 && @truncate(u8, gb.count) > 0);
+}
+
+u32 main() { return 0; }

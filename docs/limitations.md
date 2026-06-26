@@ -1834,7 +1834,7 @@ BUG-742 (conditional global dangle), NOT defer item #9 (no defer, no Handle).
 
 ---
 
-## OPEN — BH-18 #2 — VRP range-narrowing scope leak → unchecked OOB write (🔴 soundness)
+## FIXED (2026-06-26, copied from cool-johnson-t8vr3h) — BH-18 #2 — VRP range-narrowing scope leak → unchecked OOB write (🔴 soundness)
 
 **ORACLE NOW EXISTS (2026-06-23):** `proofs/operational/lambda_zer_bounds/bounds_lattice.v`
 certifies the bounds state set + the sound decision, and `elide_on_join_sound`
@@ -2007,7 +2007,7 @@ known). Tripwire: `tests/zer_fail/pun_primitive_to_struct.zer`.
 
 ---
 
-## OPEN — BH-18 #5 — fixed-array index that is a bare function call drops the bounds check (🔴 soundness)
+## FIXED (2026-06-26, copied from cool-johnson-t8vr3h) — BH-18 #5 — fixed-array bare-call index drops the bounds check (🔴 soundness)
 
 **Symptom:** indexing a fixed-size array by a **bare function call**
 (`a[idx()]`) emits a raw C subscript with **neither** the auto-guard (used for
@@ -2222,7 +2222,7 @@ reachable one.
 
 ---
 
-## OPEN — BH-18 #10 — value-returning `async` never finalizes its state machine (🟡 miscompile)
+## FIXED (2026-06-26, copied from cool-johnson-t8vr3h) — BH-18 #10 — value-returning `async` never finalizes its state machine (🟡 miscompile)
 
 **Symptom:** `async u32` / `async ?u32` (any `return <value>;` in an async body)
 never sets `self->_zer_state = -1` on completion and returns the user value

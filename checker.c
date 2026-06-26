@@ -10545,10 +10545,21 @@ static void check_stmt(Checker *c, Node *node) {
                     check_stmt(c, node->if_stmt.else_body);
                 }
             } else {
-                /* non-comparison condition — no range narrowing */
+                /* non-comparison condition — no range narrowing.
+                 * BH-18 #2 (copied from cool-johnson-t8vr3h): a nested guard
+                 * inside the then/else body (`if (b) { if (idx >= 4) return; }`)
+                 * pushes inverse ranges that are only sound on the path where the
+                 * outer condition was true. Save/restore var_range_count around
+                 * each branch so the narrowing does NOT leak past the
+                 * unconditional join (a leak silently dropped the bounds check on
+                 * a later `buf[idx]` — ASan-verified stack OOB write). */
+                int local_saved = c->var_range_count;
                 check_stmt(c, node->if_stmt.then_body);
-                if (node->if_stmt.else_body)
+                c->var_range_count = local_saved;
+                if (node->if_stmt.else_body) {
                     check_stmt(c, node->if_stmt.else_body);
+                    c->var_range_count = local_saved;
+                }
             }
             /* guard ranges stay — they're valid after the if */
         }

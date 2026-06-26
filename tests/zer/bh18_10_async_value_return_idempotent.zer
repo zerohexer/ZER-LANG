@@ -1,0 +1,32 @@
+/* BH-18 #10 regression: a value-returning async (`async u32`) must finalize
+ * its state machine on `return <value>;` so subsequent polls are idempotent.
+ *
+ * Pre-fix, the IR_RETURN emitter only handled func->is_async in the void/
+ * bare-return branch; the value-return branch emitted `return <user_value>;`
+ * with NO `self->_zer_state = -1;`. Result: each poll AFTER the first
+ * completion re-ran the tail (side effects executed N times for N polls).
+ *
+ * Post-fix: value-returning async emits `self->_zer_state = -1; return 1;`
+ * (matching the void path). The user value is discarded — the poll
+ * protocol is `int` done-flag; a separate value-retrieval mechanism would
+ * be additive when needed. Idempotence is restored. */
+u32 side;
+async u32 compute() {
+    yield;
+    side += 1000;
+    return 42;
+}
+u32 main() {
+    side = 0;
+    _zer_async_compute task;
+    _zer_async_compute_init(&task);
+    _zer_async_compute_poll(&task);   /* poll 1: hits yield */
+    _zer_async_compute_poll(&task);   /* poll 2: completes, side += 1000 */
+    _zer_async_compute_poll(&task);   /* poll 3: must be no-op */
+    _zer_async_compute_poll(&task);   /* poll 4: must be no-op */
+    /* Pre-fix: side = 3000 (tail ran 3x), exit 3.
+     * Post-fix: side = 1000 (tail ran once), exit 1. Test maps exit 1 -> exit 0. */
+    u32 expected_runs = side / 1000;
+    if (expected_runs != 1) { return 1; }
+    return 0;
+}

@@ -6216,7 +6216,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
                    node->index_expr.index->kind != NODE_IDENT &&
-                   node->index_expr.index->kind != NODE_CALL &&
+                   /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
+                    * on a fixed array previously fell through to the raw emit,
+                    * relying on the auto-guard pre-pass — which only fires for
+                    * known-range callees, so unknown-range calls silently OOB'd.
+                    * Routing NODE_CALL through this branch produces the single-eval
+                    * *({ size_t _zer_idx = call(); bounds_check; &a[_zer_idx]; })
+                    * pattern (the same shape NODE_BINARY/FIELD/INDEX already use). */
                    (idx_obj_eff->array.size > 0 || idx_obj_eff->array.sizeof_type)) {
             /* Inline bounds check for non-trivial array indices (FIELD/
              * INDEX/BINARY/UNARY/ASSIGN/ORELSE). Side-effect-bearing
@@ -9579,6 +9585,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_RETURN: {
         emit_indent(e);
+
+        /* BH-18 #10 (copied from cool-johnson-t8vr3h): a value-returning async
+         * (`async u32`, ...) previously emitted `return <user_value>;` with NO
+         * state-machine finalization, so subsequent polls re-ran the tail (each
+         * poll N>1 re-executed side effects) and `while(poll()==0)` saw the user
+         * value instead of the done-flag. Coerce the value-return into the
+         * void-async termination pattern: the poll protocol is an `int` done-flag,
+         * so emit `self->_zer_state = -1; return 1;` and discard the user value.
+         * (No existing test uses non-void async; a value-retrieval mechanism would
+         * be additive when needed.) */
+        if (inst->src1_local >= 0 && func->is_async) {
+            emit(e, "self->_zer_state = -1; return 1;\n");
+            break;
+        }
 
         /* All return expressions decomposed to local ID by lower_expr */
         if (inst->src1_local >= 0) {

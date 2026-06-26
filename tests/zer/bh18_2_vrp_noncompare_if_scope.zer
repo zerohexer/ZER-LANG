@@ -1,0 +1,21 @@
+/* BH-18 #2 regression: a nested guard inside a non-comparison `if (b) { ... }`
+ * must NOT leak its inverse range past the join. Pre-fix, the inner
+ * `if (idx >= 4) return;` was treated as unconditionally narrowing `idx <= 3`,
+ * so the post-if `buf[idx]` was emitted with NO bounds check and a `b=false`
+ * runtime had a silent stack OOB write.
+ *
+ * Post-fix: the inner guard's narrowing is scoped to the `if (b)` body; the
+ * post-if index is unprovable, an auto-guard fires, and `idx=5` returns 0
+ * early instead of corrupting the stack. */
+u32 main() {
+    u32[4] buf;
+    buf[0] = 0;
+    u32 idx = 0;
+    for (u32 k = 0; k < 5; k += 1) { idx += 1; }   /* idx = 5 (past VRP) */
+    bool b = false;
+    if (b) {
+        if (idx >= 4) { return 0; }
+    }
+    buf[idx] = 2989;  /* auto-guard ensures no OOB write when idx >= 4 */
+    return buf[0];    /* if auto-guard fires, main returns 0 above */
+}

@@ -1,0 +1,18 @@
+/* BH-18 #5 regression: a fixed-array index that is a bare function call
+ * MUST emit the single-eval bounds check pattern. Pre-fix, NODE_CALL was
+ * explicitly excluded at emitter.c:6219 from the bounds-check branch,
+ * relying on the auto-guard pre-pass — but the pre-pass only fires when
+ * the callee has a known return range, leaving `arr[idx()]` (unknown
+ * range) as a silent OOB write.
+ *
+ * Expected (post-fix): runtime trap (_zer_bounds_check fires).
+ *
+ * Compile-clean confirmation: the file uses no negative-test directive,
+ * so zerc -o ... must succeed. The runtime exit is non-zero (133 / SIGTRAP). */
+u32 g = 100;
+u32 idx() { return g; }
+u32 main() {
+    u32[4] a;
+    a[idx()] = 999;   /* idx() == 100, array size 4 -> trap */
+    return 5;
+}

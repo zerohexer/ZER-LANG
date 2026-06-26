@@ -5,6 +5,38 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-26 — copied 3 BH-18 soundness fixes from cool-johnson-t8vr3h (batch 1, manual, no merge)
+
+Manually re-applied three fixes from branch `cool-johnson-t8vr3h` (verified not in main,
+no conflict with this session's escape-sink work). NOT a merge — the changes were copied
+against current code and committed fresh.
+
+- **BH-18 #2 🔴 (checker.c, non-comparison if-branch):** a nested guard inside a
+  non-comparison `if (b) { if (idx >= 4) return; }` pushed inverse-range narrowing on
+  `idx` that LEAKED past the join, so a later `buf[idx]` emitted with no bounds check / no
+  auto-guard → silent stack OOB write on the `b == false` path (ASan-verified pre-fix).
+  Fix: save/restore `c->var_range_count` around the non-comparison then/else bodies,
+  matching the comparison-branch discipline. (The branch's #2 commit also re-did the
+  nested-init recursion, which is ALREADY in main as this session's #13 fix — not copied.)
+- **BH-18 #5 🔴 (emitter.c ~6216):** `a[idx()]` (bare-call index) on a fixed array fell
+  through to the raw emit because NODE_CALL was excluded from the inline bounds-check
+  branch, relying on the auto-guard pre-pass — which only fires for known-range callees.
+  Unknown-range calls silently OOB-wrote. Fix: remove the NODE_CALL exclusion; the index
+  now routes through the single-eval `idx_se` branch (bounds-checked, single-eval).
+- **BH-18 #10 🟡 (emitter.c IR_RETURN):** a value-returning `async` re-ran its tail on
+  every poll after completion (state machine never finalized; `while(poll()==0)` saw the
+  user value not the done-flag). Fix: the value-return branch checks `func->is_async` and
+  emits `self->_zer_state = -1; return 1;` (the void-async termination), discarding the
+  user value (poll protocol is an int done-flag).
+
+Verified: #2 + #10 `--run` exit 0, #5 traps at runtime (via the trap-test runner), `make
+check` GREEN (all 5 audit gates OK, suite 827). Tests:
+`tests/zer/bh18_2_vrp_noncompare_if_scope.zer`,
+`tests/zer_trap/bh18_5_array_call_index_oob.zer`,
+`tests/zer/bh18_10_async_value_return_idempotent.zer`.
+
+---
+
 ## ORACLE (2026-06-24) — handle flow-lattice: the MAX oracle for use-after-free / MAYBE_FREED
 
 **Theorem-first (the MAYBE_FREED flexibility work + the handle proof-completeness gap).**

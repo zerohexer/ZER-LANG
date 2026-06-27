@@ -624,6 +624,27 @@ Two ways to recover layer-3 accuracy from a layer-2 loss:
 **Default to decision-layer when the state layer is the fixpoint.** State-layer
 refinement is the higher-precision endgame, not the first move.
 
+**State-layer refinement was ATTEMPTED for handles and REVERTED (2026-06-28) —
+recorded so it isn't blindly retried.** The change: at block entry, narrow a
+`MAYBE_FREED` handle to `ALIVE` when the block's guard contradicts the free's
+guard (`merged.handles[hi].state = IR_HS_ALIVE`), making the state truthful so
+every consumer benefits. The use/double-free cases worked and all soundness
+negatives still rejected (no unsoundness — refinement only ever produces a
+provably-safe ALIVE). BUT it REGRESSED the leak on the nested positive
+(`if(c){free} if(!c){ read; if(x>1000){} free }`): refining `h` to `ALIVE`
+bypasses the double-free branch that set `freed_all_paths`, and the free-transition
+replacement did not restore the flag through the nested-`if` sub-blocks — a
+leak false-positive (over-rejection, safe, but a strict regression vs the
+decision-layer, which handles that case). Root issue: the leak's "freed on ALL
+paths" is a COVERAGE fact that cannot live in per-block state, and making the
+state-refinement coexist with the coverage flag across a non-trivial CFG is
+fragile. Doing it properly needs the coverage fact tracked as a per-handle
+free-guard SET (union across merges) with a tautology check, and likely a more
+precise (dominator/per-edge) guard computation than the single-forward-pass
+`ir_compute_block_guards` — a real investment, deferred. The shipped decision-layer
+gives the correct OUTCOMES; full state-truthfulness for the handle leak is the
+open higher-precision rung.
+
 ### Level B implementation map (zercheck_ir.c, 2026-06-27)
 
 Recovers the `if(c){free} if(!c){use}` family at three sites, all gated on the

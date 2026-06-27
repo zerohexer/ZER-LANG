@@ -161,9 +161,18 @@ trap on the AST emit path (~938).
   exhaustive AST walk (`ast_name_mutated_or_addrd`) rejecting any reassigned/address-taken
   condition — two accept-unsafe holes (reassigned param; `&c` in a call arg) were found+closed
   during the build. Certified by handle_flow_lattice.v Level B. Tests:
-  `tests/zer/guarded_maybe_freed_disjoint.zer` + 6 `tests/zer_fail/guarded_*`. The staged
-  implementation plan below is HISTORICAL (superseded by the shipped design). Full detail:
+  `tests/zer/guarded_maybe_freed_disjoint.zer` + 6 `tests/zer_fail/guarded_*`. Full detail:
   BUGS-FIXED.md 2026-06-27.
+  - **DEFERRED — full state-TRUTHFULNESS (2026-06-28).** The shipped design is
+    DECISION-layer (the `MAYBE_FREED` state stays coarse; the use/double-free/leak
+    sites consult guard side-channels to get the right OUTCOME). The truer
+    STATE-layer version (refine `MAYBE_FREED → ALIVE` in the lattice so every
+    consumer sees the truth) was attempted and reverted — it regressed the leak on
+    a nested `if` (the refinement bypasses the `freed_all_paths` set-path; the
+    leak's "freed on ALL paths" is a coverage fact that can't be per-block state).
+    Outcomes are already correct; state-truthfulness needs a per-handle
+    free-guard-SET + a more precise (dominator/per-edge) guard computation. See
+    `docs/compiler-internals.md` "Sound relaxation" (the reverted-attempt note).
 - Every flat-lattice class carries residual over-rejection by construction (see below).
 
 ### ORACLE COVERAGE — the theorem layer, by class (the (c) criterion)

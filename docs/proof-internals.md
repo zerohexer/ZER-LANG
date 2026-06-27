@@ -9,6 +9,14 @@
 - Adding a new subset (`lambda_zer_move`, `lambda_zer_mmio`, etc.)
 - Debugging a Coq build failure
 
+**The endgame this all feeds:** the 100%-sound-checker plan (core λZER = one term
+language with a type system [AST/checker statics] + an operational semantics [IR
+dynamics]; per-class lattices = the abstract domains; the missing half is the
+coverage/simulation bridge against a formal `step`). Architecture + sequencing:
+`docs/compiler-internals.md` "Verification endgame — core λZER + verified
+desugaring" and CLAUDE.md "The Verification Endgame". This file is the proof-
+writing MECHANICS for that plan; that section is the WHAT/WHY/ORDER.
+
 ## Fresh-session reading order (do this first)
 
 If you're picking up proof work cold, read these in order. Total ~65 minutes. After this, you have enough context to safely modify any `.v` file.

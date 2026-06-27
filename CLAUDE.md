@@ -55,6 +55,89 @@ ZER exists because escape hatches (Rust's `unsafe`, contract-based verification 
 - Architecture-agnostic (delegates ISA to GCC, vendor-specific to user libraries via cinclude)
 - Currently shipping (publicly available, VS Code extension, GitHub repo)
 
+### The Verification Endgame — 100% Sound Checker via Core λZER (LOCKED DIRECTION)
+
+This is the formal-proof endgame for the Program-Consequence Coverage claim above.
+Full technical context: `docs/compiler-internals.md` "Verification endgame — core
+λZER + verified desugaring".
+
+**The goal (locked):** a machine-checked **100%-sound checker** —
+`accepted(p) → ∀ reachable config c, ¬ bad(c)` (if ZER accepts a program, no
+reachable state is a program-consequence UB), for ALL programs, over the REAL
+checker. This is the proof OF program-consequence coverage, not a new claim.
+
+**Soundness, NOT precision — and that is what makes it reachable.** 100%
+SOUNDNESS (never accept an unsafe program) is achievable and **Rice-IMMUNE**.
+100% PRECISION (accept every safe program) is **impossible** by Rice and is NOT
+a goal — permanent over-rejection is harmless to safety (a wrongly-rejected
+program just never runs; no UB). Rice is the enemy of ergonomics, never of
+safety. Why this matters more for ZER than Rust: ZER is annotation-free, so ALL
+the trust sits on the inference — no human-supplied (checked) lifetime shares the
+burden. The soundness theorem is therefore not polish; it is the ONLY thing that
+can justify trusting a fully-automatic analysis. The theorem certifies the
+AUTO-INFERENCE itself (a stronger object than RustBelt's human-assisted system).
+
+**Method — core λZER + verified desugaring + simulation (NOT all 53 node kinds).**
+A node kind is GRAMMAR; its MEANING is given by DESUGARING into a small core.
+Define a CORE λZER = ONE term language (~15-20 semantic primitives) with TWO
+judgments over it (TAPL/λRust shape): a **type system** (the "logic in types" —
+type resolution / optional / qualifier / provenance, which in the impl lives in
+`checker.c` on the AST = the STATICS) AND an **operational semantics**
+(small-step `step` + a `bad` UB predicate = the DYNAMICS). The core spans BOTH
+the AST (statics) and the IR (dynamics) layers — the IR is the flat CFG that
+"runs" so it grounds `step`/emission, but it is the EXECUTION half, NOT the whole
+core (do not say "core = IR" — that drops the type-system half). The 53 surface
+NodeKinds collapse to ~15-20 MEANINGS (for/while/do-while → loop+branch, orelse →
+branch, += → assign, range-for → index loop, …). Two safety halves to prove:
+**type safety** (preservation+progress on the statics — type-level correctness)
+AND **memory safety** (the flow-analysis invariants, by **forward simulation**
+from the operational semantics to the abstract analysis, excluding `bad`);
+**a missing abstract state = a diagram that won't close = a STUCK PROOF**, so
+"coverage / no missing state" is SUBSUMED by the simulation and the silent
+missing-state hole class (BH-18) becomes loud. All 53 are COVERED — via
+translation, not 53 separate semantics.
+
+**The desugaring MUST be verified — this is what makes it 100%, not 90%.**
+`surface-sound = core-sound (simulation) ∘ desugar-preserving`. Formalizing all
+53 directly is a TRAP: it re-creates the uncompression/drift bug class (this
+session's form-coverage holes) INSIDE the trusted spec where no test catches it,
+and bloats the trusted artifact. Keep the trusted semantics small + hand-auditable;
+make the desugaring a CHECKABLE syntactic function with a preservation proof. ZER
+alignment: the **type system (statics) comes from `checker.c`/AST**, the
+**operational `step` (dynamics) is IR-shaped**, and the **desugaring-to-verify ≈
+the parser desugarings ∘ `ir_lower.c`** — all already exist as code (the IR is
+the execution half, not the whole core).
+
+**Scope — LANGUAGE LEVEL only. Explicit floors; do NOT chase them.**
+- **IN (the 100% target):** every program-consequence — every operation on a
+  value in ZER source.
+- **OUT (floors, not failures to verify — no language escapes them):**
+  **cinclude / C-FFI** (values from hand-written C are outside the language) and
+  **hardware** (physics).
+- **SEPARATE axis (not "unsafe", but not free either):** the **emitter**
+  (core→C) + **GCC** (C→asm). A 100%-sound CHECKER ≠ a 100%-safe BINARY without
+  emitter correctness; emit-C keeps GCC trusted (verify the emitter later, or
+  trust it). NEVER conflate "sound checker" with "verified compiler to asm."
+
+**Builds on what exists — not a rewrite.** The per-class oracles
+(`param_lattice.v`, `handle_flow_lattice.v`, bounds/qualifier/capture/volatile)
+ARE the abstract domains X; `lambda_zer_concurrency` is the one worked
+operational instance (the prototype of the move). The endgame ADDS: the unified
+core semantics, the abstraction relation per class, and the simulation bridge.
+**Current gap:** the oracles prove the transfer is sound over the states LISTED,
+NOT that the listed states COVER the semantics — the coverage/simulation half is
+what's missing (it is why missing-state holes were red-team-found, not
+proof-found).
+
+**Sequencing — do NOT go Coq-first now.** Keep iterating the C checker until the
+design + memory model FREEZE (still finding holes ⇒ not frozen; Coq-first on a
+moving design freezes bugs into proofs). Build the core semantics + a **UAF
+vertical slice FIRST** (alloc/free/deref + the handle lattice + its simulation)
+to de-risk the whole architecture in one small proof; then generalize
+class-by-class over the same semantics; then compose into the single
+`accepted → safe` theorem. Oracle-driven always (spec against the SEMANTICS,
+never against current C).
+
 ### Critical Compiler-Implementation Gotchas (avoid wasted-cycle rediscovery)
 
 **Two emitter dispatch paths for intrinsics.** Every intrinsic needs a handler

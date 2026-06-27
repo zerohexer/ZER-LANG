@@ -312,6 +312,259 @@ descriptions.
 
 ---
 
+## Verification endgame — core λZER + verified desugaring (the 100%-sound-checker plan)
+
+This is the full technical context for the locked direction stated in CLAUDE.md
+"The Verification Endgame — 100% Sound Checker via Core λZER". It is the formal
+proof OF the program-consequence-coverage claim, not a new claim. Proof-writing
+mechanics (Iris/VST recipes, the admit-gate, extraction) live in
+`docs/proof-internals.md`; THIS section is the architecture of the endgame —
+what to prove, against what, in what order, and what stays out of scope. Read
+both together when doing verification work.
+
+### 0. The one distinction everything rests on: soundness ≠ precision
+
+- **Soundness** = "never accept an unsafe program." About what the checker
+  ACCEPTS. This is the safety guarantee and the goal.
+- **Precision** = "accept as many SAFE programs as possible." About what the
+  checker REJECTS. This is ergonomics.
+
+They are orthogonal: "reject everything" is perfectly sound and perfectly
+imprecise. **Rice's theorem forbids only the sound+complete (100%-precision)
+combination — it never touches soundness.** So 100% soundness is achievable and
+Rice-IMMUNE; 100% precision is impossible and is NOT a goal. Permanent
+over-rejection is harmless to safety (a wrongly-rejected program never runs, so
+it produces no UB). Every design decision here optimizes soundness and treats
+over-rejection as a soft, minimize-but-never-zero quantity (see the MAX-ORACLE
+STANDARD and "THE PRECISION CEILING" in CLAUDE.md for the forced-vs-payable
+decomposition of over-rejection).
+
+Why this matters MORE for ZER than for Rust: Rust shares the trust — the
+programmer asserts lifetimes (checked), so part of the safety argument is
+human-supplied. ZER is annotation-free, so ALL the trust sits on the inference.
+The soundness theorem is therefore the ONLY thing that can justify trusting the
+analysis, and it certifies a FULLY-AUTOMATIC inference (a stronger object than
+RustBelt's human-assisted type system).
+
+### 1. The target theorem
+
+A forward-simulation / preservation theorem from a concrete operational
+semantics to the abstract analysis, yielding type safety:
+
+```
+accepted(p)  →  ∀ c, reachable_from(p, c)  →  ¬ bad(c)
+```
+
+"If ZER accepts p, no reachable configuration is a program-consequence UB" — for
+all inputs, all paths, over the real checker. This is the RustBelt "fundamental
+theorem" analog.
+
+**The mechanism that makes missing states detectable:** prove the simulation by
+case analysis on the concrete `step` rules. For each concrete transition
+`c → c'`, you must exhibit a matching abstract transition over the domain X with
+`c'` still represented (`abstracts a' c'`). If X cannot represent the post-state
+of some step, **the simulation diagram will not close — the proof gets stuck on
+exactly that configuration.** So the "coverage" property (every reachable
+concrete config is abstracted by some element of X) is SUBSUMED by the simulation
+obligation; you do not write it separately. This is what converts the silent
+"missing finite state" hole class (the root of the BH-18 holes — found by
+red-teaming because nothing connected X to the semantics) into a LOUD
+unprovable goal.
+
+### 2. Core λZER — why a core, not all 53 node kinds
+
+A NodeKind is GRAMMAR (surface syntax). Its MEANING is operational. Many of the
+53 grammar forms share the same meaning: `for`/`while`/`do-while` all mean
+"loop + conditional branch"; `else if` = nested `if`; `+=` = `x = x + e`;
+`orelse` = branch on the optional; range-for = index loop; `switch` = nested
+branching; `defer` = cleanup inserted at scope exits. So the 53 grammar forms
+collapse to ~15-20 MEANINGS.
+
+Define a **core λZER** — ONE term language (the ~15-20 semantic primitives) with
+TWO judgments over it (the standard TAPL/λRust shape: one term type, typing rules
+AND reduction rules over the same terms):
+- **core syntax** — an inductive type (the primitives only),
+- **type system** — the typing rules (`Γ ⊢ e : τ` analog): the "logic in types"
+  that in the implementation lives in `checker.c` on the AST (type resolution,
+  optional/null discipline, qualifiers, provenance, …). This is the STATICS half.
+- **memory model** — store, allocations, handle/generation counters, the
+  region/arena model. This is the heart; defining `bad` IS defining what
+  UAF / OOB / qualifier-violation / region-escape mean operationally,
+- **small-step `step`** relation — the DYNAMICS half (execution),
+- **`bad` predicate** — the UB conditions (the stuck/bad configs).
+
+The core spans BOTH the AST and the IR layers of the implementation, NOT just the
+IR (see §3): the type system is AST/checker-flavored (statics), the operational
+semantics is IR-flavored (dynamics, since the IR is the flat CFG that "runs").
+The surface 53 are COVERED by DESUGARING (translation) into the core terms, NOT by
+giving each its own semantics.
+
+**Why formalizing all 53 directly is a TRAP (three reasons):**
+1. **Redundancy → drift IN THE SPEC.** 53 separate rule sets re-prove the same
+   memory-safety reasoning per form — the uncompression/drift bug class (this
+   session's four form-coverage holes), now relocated into the TRUSTED spec
+   where no test catches a wrong/missing rule (a wrong step rule proves
+   cleanly). Core+desugar compresses the MEANING into ~15-20 rules proven once;
+   the 53→core map carries NO safety reasoning (pure syntactic rewriting).
+2. **Trusted-surface size.** The semantics + `bad` is ASSUMED correct (the
+   faithfulness floor), not proven. ~15-20 constructs are hand-auditable; 53
+   with every sugar edge case are not. Smaller core = smaller trusted base =
+   fewer places the spec is silently wrong.
+3. **It is the proven method.** λRust (RustBelt) is a core; Rust desugars to it
+   via MIR; surface Rust is never formalized. CompCert has Clight/Cminor cores.
+   Full-surface formalization has never been done for a real language because it
+   is both harder AND less trustworthy.
+
+### 3. The desugaring obligation — what makes it 100%, not 90%
+
+Core soundness alone does NOT make the surface sound. The chain is:
+
+```
+surface-sound  =  core-sound (the simulation theorem)
+               ∘  desugar-preserving (the desugaring theorem)
+```
+
+You MUST prove `behavior(desugar(s)) = behavior(s)` (or at least that desugaring
+preserves the safety-relevant behavior — a simulation between surface and core
+semantics). Skip this and core-λZER IS the hole the "why not just a core?"
+skeptic fears — a surface form could do something the core proof never covered.
+The desugaring is the right place for this because it is a CHECKABLE syntactic
+function, whereas a 53-rule semantics is TRUSTED.
+
+**ZER alignment — the core spans BOTH representations, not just the IR.** ZER's
+logic is split across two implementation representations, and the formal core
+unifies them:
+- **Type-level logic (statics) lives on the AST, in `checker.c`** — type
+  resolution, optional/null/qualifier/provenance discipline, and most of the
+  per-class safety analyses. This becomes the **type system** of core λZER.
+- **Execution/flow (dynamics) lives on the IR** — `ir_lower.c` lowers AST → IR,
+  `zercheck_ir.c` runs the handle-state CFG analysis, the emitter consumes the
+  IR. The IR is the flat CFG that "runs," so it is the natural basis for the
+  **operational `step` semantics** — but it is the EXECUTION half, NOT the whole
+  core. (Earlier drafts said "core ≈ the IR"; that was too IR-centric — it
+  dropped the type-system half.)
+- **the desugaring-to-verify ≈ the surface→core translation** = the parser's
+  desugarings (else-if → nested if, range-for → index loop, …) composed with
+  `ir_lower.c`. Proving it preserves behavior IS the desugaring theorem.
+
+So the verification work is: formalize ONE core term language; give it a **type
+system** (from the AST/checker type logic) and an **operational semantics**
+(IR-shaped `step`/`bad`); prove **type safety** (preservation+progress) on the
+statics AND **memory safety** (the flow-analysis invariants, by simulation
+against `step`, excluding `bad`) on the dynamics; and prove the surface→core
+desugaring preserving. The type system is the scaffolding the flow analyses
+assume — neither layer alone yields the full `accepted → ¬bad` theorem. All
+aligned with existing artifacts (checker.c statics, IR dynamics, ir_lower
+desugaring), not a parallel rewrite.
+
+### 4. Scope — language level only; the explicit floors
+
+- **IN (the 100% target):** every program-consequence — every operation on a
+  value in ZER source. Once a value crosses a typed boundary into ZER it is
+  program data and every program-level operation on it is verified.
+- **OUT — floors, not failures to verify (no language escapes them):**
+  - **cinclude / C-FFI** — a value from hand-written C is outside the language;
+    trust is relocated to that narrow, visible boundary, not eliminated.
+  - **hardware** — datasheet/silicon facts never enter the program; physics.
+- **SEPARATE axis (not "unsafe", but not free):** the **emitter** (core→C) and
+  **GCC** (C→asm). A 100%-sound CHECKER proves accepted *programs* are safe; a
+  buggy emitter could still miscompile, so a sound checker ≠ a safe BINARY
+  without emitter correctness. The "emit-C via GCC permanently" decision keeps
+  GCC trusted; the emitter can be verified later (CompCert-style C→asm is a
+  larger, separate effort that contradicts emit-C and is NOT in this plan).
+  NEVER conflate "100% sound checker" with "verified compiler to asm."
+
+This scoping is the same equivocation-free split as CLAUDE.md "ZER's Goal":
+program-consequence is owned and 100%; hardware-consequence is floor. State both
+or the claim is the equivocation trap.
+
+### 5. How it composes with the existing oracle suite
+
+The per-class oracles already in the admit-gate (`lambda_zer_escape/param_lattice.v`,
+`lambda_zer_handle/handle_flow_lattice.v`, `lambda_zer_{bounds,qualifier,capture,volatile}/`,
+the rich `join_lattice.v` / `disjoint_lattice.v`) ARE the abstract domains X.
+Today they prove (the T1/T3/T4 contract): the transfer function is sound, a
+precision witness, and no-under-rejection — **in the abstract**, floating free of
+any concrete semantics. `lambda_zer_concurrency/` is the ONE worked operational
+instance (Iris/WP, proving the four-condition closure sound w.r.t. an operational
+model) — the prototype of the simulation move, for the concurrency fragment.
+
+The endgame ADDS three things and reuses the lattices:
+1. the unified concrete `step` semantics (new; shared by all classes),
+2. an abstraction relation `abstracts : X → config → Prop` per class (the
+   bridge from each existing lattice to the semantics),
+3. the simulation proof per class against the shared semantics.
+
+The lattices are NOT wasted — they are the X you simulate over. **The current
+gap, stated precisely:** the oracles certify "the transfer is sound over the
+states LISTED"; they do NOT certify "the listed states COVER the semantics." The
+coverage/simulation bridge is the missing half — and is exactly why missing-state
+holes were red-team-found rather than proof-found. (This is also the relationship
+to the three-level model in CLAUDE.md: the per-class oracles are Level 1; the
+simulation against a formal semantics is the unifying layer that turns the
+federation of class-local lattices into a single `accepted → safe` statement.)
+
+### 6. Relationship to abstract interpretation / CEGAR (why the runtime engine stays as-is)
+
+What `zercheck_ir.c` does today IS abstract interpretation: a fixed, hand-designed
+finite lattice (the X for each class) + hand-written transfer functions (the
+"matrix": form × state → next state) + JOIN at control-flow merges
+(`ir_merge_states`) + fixpoint for loops (convergence via `pathstate_equal`).
+This is the CORRECT runtime architecture for a compiler: it always TERMINATES and
+is FAST.
+
+- **Do NOT replace the engine with CEGAR / predicate abstraction.** CEGAR
+  (SLAM/BLAST) auto-DISCOVERS the abstraction by counterexample refinement, but
+  has no termination guarantee on infinite-state programs and is slow (SMT in a
+  loop). Disqualifying for a checker that must always halt fast. No production
+  checker uses it as the engine, and neither should ZER.
+- **CEGAR IS useful at DESIGN TIME** as a hole-finder: throw programs at a model
+  checker; a counterexample your lattice cannot classify, plus the refinement
+  predicate it synthesizes, names a state your X is missing. A systematic
+  red-team for completing X — complementary to, not a replacement for, the
+  coverage theorem.
+- **The coverage theorem (§1) is the FINAL guarantee**; CEGAR is the cheaper
+  INTERIM hole-finder while the design is still moving. Both feed the same
+  hand-written matrix; neither becomes the engine.
+- **Finite vs infinite X:** type-state classes (UAF/handle, escape/region,
+  qualifier, move) have a FINITE per-entity X — fully enumerable, so coverage is
+  tractable and missing-state becomes detectable. Numeric classes (bounds, div)
+  have an INFINITE X (intervals, relational `i<j`) — no finite complete X exists
+  (Rice); there you use a lattice family with a proven Galois connection
+  (soundness free, precision forced-lossy), not enumeration.
+
+### 7. Sequencing — the order that does not freeze bugs into proofs
+
+1. **Keep iterating the C checker** until the language design AND the memory
+   model FREEZE. Still finding soundness holes ⇒ NOT frozen (this session found
+   four). Going Coq-first on a moving design freezes current behavior — including
+   bugs — into proofs; the "oracle-driven, never code-driven" rule exists
+   precisely to prevent that.
+2. **Build the core `step` semantics** (the one enabling artifact not yet
+   present — operational SUBSETS exist, e.g. concurrency, but no whole-language
+   `step`) + a **UAF vertical slice FIRST**: minimal λZER (alloc/free/deref) +
+   the handle lattice `{Uninit,Alive,Freed,Maybe}` + the abstraction relation +
+   the simulation `accepted → no-UAF`. UAF is the #1 class and `handle_flow_lattice.v`
+   already exists. If that one diagram closes, every other class is the SAME
+   pattern over the SAME semantics — all architectural risk front-loaded into one
+   small proof. If it does not close, you learned the memory model is wrong
+   cheaply.
+3. **Generalize class-by-class** over the shared semantics (escape, bounds,
+   qualifier, …), each adding only its abstraction relation + simulation.
+4. **Compose** the per-class invariants into the single `accepted → safe`
+   theorem.
+5. **Then** (optional, separate) the desugaring/`ir_lower` preservation proof to
+   close surface→core, and (much larger, separate) emitter correctness if you
+   ever stop trusting GCC.
+
+The smallest-trusted-artifact payoff: when this is done, trust shrinks from
+"16k lines of `checker.c`" to "a few hundred lines of core semantics + `bad`
+predicate" — a human-auditable spec — plus the named floors (cinclude, GCC,
+hardware). That relocation is the entire point of the verified route and the
+best CompCert/seL4/CakeML achieve.
+
+---
+
 ## Lexer (lexer.c/h)
 - `Scanner` struct holds source pointer, current position, line number
 - Keywords: `TOK_POOL`, `TOK_RING`, `TOK_ARENA`, `TOK_HANDLE`, `TOK_STRUCT`, `TOK_ENUM`, `TOK_UNION`, `TOK_SWITCH`, `TOK_ORELSE`, `TOK_DEFER`, `TOK_IMPORT`, `TOK_VOLATILE`, `TOK_CONST`, `TOK_STATIC`, `TOK_PACKED`, `TOK_INTERRUPT`, `TOK_TYPEDEF`, `TOK_DISTINCT`

@@ -57,6 +57,20 @@ typedef struct {
     IRHandleState state;
     int alloc_line;        /* where allocated */
     int free_line;         /* where freed */
+    /* Level B guarded refinement (2026-06-27): the BLOCK index where this handle
+     * was freed (-1 = not freed / unknown). Paired with the per-block guard sets
+     * (ZerCheck.gr_block_guards) to decide, at a MAYBE_FREED use, whether the
+     * use's guard is DISJOINT from the free's guard (`if(c){free} if(!c){use}`
+     * recovery). Preserved through the ALIVE+FREED→MAYBE_FREED merge. */
+    int free_block;
+    /* Level B leak-coverage: set when this handle has been freed under a
+     * condition AND its exact SINGLETON complement (free under (C,+) in one
+     * block and (C,-) in another, each guard set being exactly {(C,·)} so there
+     * is no enclosing condition that could skip both) — i.e. freed on ALL paths.
+     * A MAYBE_FREED handle with this set is NOT a leak at exit. OR-carried
+     * through merges (sound: a genuine complementary coverage admits no
+     * still-alive path). */
+    int freed_all_paths;
     int alloc_id;          /* groups aliases — same alloc = same id */
     bool escaped;          /* returned, stored to global, etc. */
     /* Phase D1: allocation color — tracks where memory came from.
@@ -231,6 +245,7 @@ static IRHandleInfo *ir_alloc_handle_slot(IRPathState *ps) {
     IRHandleInfo *h = &ps->handles[ps->handle_count++];
     memset(h, 0, sizeof(IRHandleInfo));
     h->state = IR_HS_UNKNOWN;
+    h->free_block = -1;   /* Level B: 0 is a valid block, so -1 = "not freed" */
     return h;
 }
 
@@ -255,6 +270,329 @@ static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
         h->path_len = path_len;
     }
     return h;
+}
+
+/* ================================================================
+ * Level B guarded-refinement support (2026-06-27)
+ *
+ * Certified by proofs/operational/lambda_zer_handle/handle_flow_lattice.v
+ * Level B: a USE under guard ¬c is sound when the FREE is under the DISJOINT
+ * guard c (`if(c){free(h)} ... if(!c){use(h)}`). The flat Level-A lattice
+ * widens the post-free join to MAYBE_FREED and rejects the use; this refinement
+ * recovers it WITH NO soundness loss — it fires ONLY when disjointness is
+ * provable, else falls back to the conservative MAYBE_FREED.
+ *
+ * SOUNDNESS GATE — the "looks-disjoint-but-isn't" defense. We only ever track a
+ * guard whose root is an IMMUTABLE boolean local: bool-typed, defined at most
+ * once (value stable at every later read), and address NEVER taken (cannot be
+ * mutated through an alias). Then the guard's truth value is identical at the
+ * free's branch and at the use's branch, so `c` at the free and `c` at the use
+ * are the SAME value and `c ∧ ¬c = False` genuinely holds. Anything else —
+ * a reassigned condition, an &-taken condition, a comparison/`&&`/call result,
+ * two unrelated conditions — is NOT tracked and stays MAYBE_FREED (Level A).
+ * ================================================================ */
+
+/* Resolve a branch-condition LOCAL to its ROOT boolean local + polarity by
+ * tracing IR_UNOP(!) and IR_COPY chains back to a single definition. Sets
+ * *polarity (true = condition equals root, false = condition equals ¬root) and
+ * returns the root local id, or -1 if the condition is not a simple chain
+ * rooted at one local (e.g. a comparison or call result is its own root — only
+ * usable if ir_local_is_immutable_bool accepts it; `&&`/`||`/multi-def stop the
+ * trace). Step-capped; no behavior change on its own. */
+static int ir_resolve_cond_root(IRFunc *func, int cond_local, bool *polarity) {
+    bool pol = true;
+    int cur = cond_local;
+    for (int steps = 0; steps < 16 && cur >= 0 && cur < func->local_count; steps++) {
+        /* Find the UNIQUE defining instruction of `cur` (dest_local == cur).
+         * If there isn't exactly one, `cur` is the root (stop tracing). */
+        IRInst *def = NULL;
+        int def_count = 0;
+        for (int bi = 0; bi < func->block_count && def_count < 2; bi++) {
+            IRBlock *bb = &func->blocks[bi];
+            for (int ii = 0; ii < bb->inst_count; ii++) {
+                if (bb->insts[ii].dest_local == cur) {
+                    def = &bb->insts[ii];
+                    if (++def_count >= 2) break;
+                }
+            }
+        }
+        if (def_count != 1 || !def) break;
+        if (def->op == IR_UNOP && def->op_token == TOK_BANG && def->src1_local >= 0) {
+            pol = !pol;
+            cur = def->src1_local;
+            continue;
+        }
+        if (def->op == IR_COPY && def->src1_local >= 0) {
+            cur = def->src1_local;
+            continue;
+        }
+        break; /* any other defining op → `cur` is the root */
+    }
+    if (cur < 0 || cur >= func->local_count) return -1;
+    *polarity = pol;
+    return cur;
+}
+
+/* Exhaustive recursive AST scan: does the subtree REASSIGN `name` (a NODE_ASSIGN
+ * whose target ident is `name` — the defining NODE_VAR_DECL does NOT count) or
+ * take its ADDRESS (`&name`)? Either makes the value non-stable, so a guard
+ * built on it cannot be trusted to mean the same thing at the free and at the
+ * use. This is the COMPLETE source-level check — writes and address-takes hide
+ * in AST exprs (call args like `flip(&c)`, defer bodies, etc.) that the flat IR
+ * instruction fields do not expose. No-default switch (walker_default_audit +
+ * -Werror=switch): a new NodeKind forces a decision here; opaque/rare kinds
+ * (cast/asm/static_assert/declarations) return true (assume mutation) so a gap
+ * can only OVER-reject, never accept a mutated condition. */
+static bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_ASSIGN: {
+        Node *t = n->assign.target;
+        if (t && t->kind == NODE_IDENT &&
+            (uint32_t)t->ident.name_len == len &&
+            memcmp(t->ident.name, name, len) == 0)
+            return true;                            /* reassignment */
+        return ast_name_mutated_or_addrd(n->assign.target, name, len) ||
+               ast_name_mutated_or_addrd(n->assign.value, name, len);
+    }
+    case NODE_UNARY:
+        if (n->unary.op == TOK_AMP && n->unary.operand &&
+            n->unary.operand->kind == NODE_IDENT &&
+            (uint32_t)n->unary.operand->ident.name_len == len &&
+            memcmp(n->unary.operand->ident.name, name, len) == 0)
+            return true;                            /* address taken */
+        return ast_name_mutated_or_addrd(n->unary.operand, name, len);
+    case NODE_BINARY:
+        return ast_name_mutated_or_addrd(n->binary.left, name, len) ||
+               ast_name_mutated_or_addrd(n->binary.right, name, len);
+    case NODE_CALL: {
+        if (ast_name_mutated_or_addrd(n->call.callee, name, len)) return true;
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (ast_name_mutated_or_addrd(n->call.args[i], name, len)) return true;
+        return false;
+    }
+    case NODE_FIELD:  return ast_name_mutated_or_addrd(n->field.object, name, len);
+    case NODE_INDEX:  return ast_name_mutated_or_addrd(n->index_expr.object, name, len) ||
+                             ast_name_mutated_or_addrd(n->index_expr.index, name, len);
+    case NODE_SLICE:  return ast_name_mutated_or_addrd(n->slice.object, name, len) ||
+                             ast_name_mutated_or_addrd(n->slice.start, name, len) ||
+                             ast_name_mutated_or_addrd(n->slice.end, name, len);
+    case NODE_ORELSE: return ast_name_mutated_or_addrd(n->orelse.expr, name, len) ||
+                             ast_name_mutated_or_addrd(n->orelse.fallback, name, len);
+    case NODE_TYPECAST: return ast_name_mutated_or_addrd(n->typecast.expr, name, len);
+    case NODE_INTRINSIC: {
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (ast_name_mutated_or_addrd(n->intrinsic.args[i], name, len)) return true;
+        return false;
+    }
+    case NODE_STRUCT_INIT: {
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (ast_name_mutated_or_addrd(n->struct_init.fields[i].value, name, len)) return true;
+        return false;
+    }
+    case NODE_BLOCK: {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (ast_name_mutated_or_addrd(n->block.stmts[i], name, len)) return true;
+        return false;
+    }
+    case NODE_IF: return ast_name_mutated_or_addrd(n->if_stmt.cond, name, len) ||
+                         ast_name_mutated_or_addrd(n->if_stmt.then_body, name, len) ||
+                         ast_name_mutated_or_addrd(n->if_stmt.else_body, name, len);
+    case NODE_FOR: return ast_name_mutated_or_addrd(n->for_stmt.init, name, len) ||
+                          ast_name_mutated_or_addrd(n->for_stmt.cond, name, len) ||
+                          ast_name_mutated_or_addrd(n->for_stmt.step, name, len) ||
+                          ast_name_mutated_or_addrd(n->for_stmt.body, name, len);
+    case NODE_WHILE:
+    case NODE_DO_WHILE: return ast_name_mutated_or_addrd(n->while_stmt.cond, name, len) ||
+                               ast_name_mutated_or_addrd(n->while_stmt.body, name, len);
+    case NODE_SWITCH: {
+        if (ast_name_mutated_or_addrd(n->switch_stmt.expr, name, len)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (ast_name_mutated_or_addrd(n->switch_stmt.arms[i].body, name, len)) return true;
+        return false;
+    }
+    case NODE_RETURN:    return ast_name_mutated_or_addrd(n->ret.expr, name, len);
+    case NODE_EXPR_STMT: return ast_name_mutated_or_addrd(n->expr_stmt.expr, name, len);
+    case NODE_VAR_DECL:  return ast_name_mutated_or_addrd(n->var_decl.init, name, len);
+    case NODE_DEFER:     return ast_name_mutated_or_addrd(n->defer.body, name, len);
+    case NODE_CRITICAL:  return ast_name_mutated_or_addrd(n->critical.body, name, len);
+    case NODE_ONCE:      return ast_name_mutated_or_addrd(n->once.body, name, len);
+    case NODE_AWAIT:     return ast_name_mutated_or_addrd(n->await_stmt.cond, name, len);
+    case NODE_SPAWN: {
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            if (ast_name_mutated_or_addrd(n->spawn_stmt.args[i], name, len)) return true;
+        return false;
+    }
+    /* Leaves — cannot reassign or take the address of `name`. */
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_SIZEOF:
+        return false;
+    /* Opaque / rare / non-body kinds — conservative (assume mutation). */
+    case NODE_CAST: case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return true;
+    }
+    return true;  /* unreachable (exhaustive) — conservative */
+}
+
+/* A local is a TRACKABLE guard root iff bool-typed and NEITHER reassigned NOR
+ * address-taken anywhere in the function (so its value is identical at the free's
+ * branch and the use's branch — the soundness gate for the guarded refinement).
+ * Uses the complete source-AST scan (writes/&c hide in exprs the IR flattens),
+ * plus an IR_ADDR_OF backup. Conservative — when in doubt, false (→ MAYBE). */
+static bool ir_local_is_immutable_bool(IRFunc *func, int local) {
+    if (local < 0 || local >= func->local_count) return false;
+    if (type_dispatch_kind(func->locals[local].type) != TYPE_BOOL) return false;
+    const char *lname = func->locals[local].orig_name
+        ? func->locals[local].orig_name : func->locals[local].name;
+    uint32_t lname_len = func->locals[local].orig_name
+        ? func->locals[local].orig_name_len : func->locals[local].name_len;
+    if (!lname || lname_len == 0) return false;
+    if (!func->ast_node || func->ast_node->kind != NODE_FUNC_DECL) return false;
+    if (ast_name_mutated_or_addrd(func->ast_node->func_decl.body, lname, lname_len))
+        return false;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++)
+            if (bb->insts[ii].op == IR_ADDR_OF && bb->insts[ii].src1_local == local)
+                return false;   /* synthesized address-of the source walk can't see */
+    }
+    return true;
+}
+
+/* A guard = a (root bool local, polarity) decision known to hold (pol 1 = root
+ * is true, 0 = root is false). A block's guard SET is every guard that holds on
+ * EVERY path reaching that block. Small fixed cap (8) — overflow just drops
+ * guards (conservative: fewer guards = fewer relaxations = still sound). */
+typedef struct { int root; int8_t pol; } IRGuard;
+typedef struct { IRGuard g[8]; int count; } IRGuardSet;
+
+static bool ir_gs_has(const IRGuardSet *s, int root, int pol) {
+    for (int i = 0; i < s->count; i++)
+        if (s->g[i].root == root && s->g[i].pol == (int8_t)pol) return true;
+    return false;
+}
+static void ir_gs_add(IRGuardSet *s, int root, int pol) {
+    if (root < 0 || ir_gs_has(s, root, pol)) return;
+    if (s->count < 8) {
+        s->g[s->count].root = root;
+        s->g[s->count].pol = (int8_t)pol;
+        s->count++;
+    }
+}
+
+/* The (root, polarity) decision a branch terminator contributes on its edge to
+ * successor `succ`, or root=-1 if none (non-branch terminator, both edges to
+ * succ, or a condition that is not an immutable boolean we can track). */
+static IRGuard ir_edge_label(IRFunc *func, IRBlock *pred, int succ) {
+    IRGuard none = { -1, 0 };
+    if (pred->inst_count == 0) return none;
+    IRInst *term = &pred->insts[pred->inst_count - 1];
+    if (term->op != IR_BRANCH) return none;
+    if (term->true_block == succ && term->false_block == succ) return none;
+    bool pol;
+    int root = ir_resolve_cond_root(func, term->cond_local, &pol);
+    if (root < 0 || !ir_local_is_immutable_bool(func, root)) return none;
+    if (term->true_block == succ)  { IRGuard r = { root, (int8_t)(pol ? 1 : 0) }; return r; }
+    if (term->false_block == succ) { IRGuard r = { root, (int8_t)(pol ? 0 : 1) }; return r; }
+    return none;
+}
+
+/* Per-block guard set = the guards holding on ALL paths to the block. SINGLE
+ * forward pass: blocks are in topological order for forward edges, so a block's
+ * forward preds are already computed; any block reachable via a BACK edge (pred
+ * index >= own, i.e. a loop) gets the EMPTY set — sound and conservative (we
+ * never claim a loop-carried guard). Entry / unreachable → empty. Misordering
+ * (a forward pred numbered higher) only ever yields empty too → still sound.
+ * Caller owns the returned array (func->block_count entries); free with free(). */
+static IRGuardSet *ir_compute_block_guards(IRFunc *func) {
+    IRGuardSet *bg = (IRGuardSet *)calloc(func->block_count > 0 ? func->block_count : 1,
+                                          sizeof(IRGuardSet));
+    if (!bg) return NULL;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        bg[bi].count = 0;
+        if (bb->pred_count == 0) continue;
+        bool back_edge = false;
+        for (int pi = 0; pi < bb->pred_count; pi++)
+            if (bb->preds[pi] >= bi) { back_edge = true; break; }
+        if (back_edge) continue;
+        for (int pi = 0; pi < bb->pred_count; pi++) {
+            int pj = bb->preds[pi];
+            IRGuardSet contrib = bg[pj];   /* by-value copy of the small struct */
+            IRGuard lbl = ir_edge_label(func, &func->blocks[pj], bi);
+            if (lbl.root >= 0) ir_gs_add(&contrib, lbl.root, lbl.pol);
+            if (pi == 0) {
+                bg[bi] = contrib;
+            } else {
+                IRGuardSet inter; inter.count = 0;
+                for (int k = 0; k < bg[bi].count; k++)
+                    if (ir_gs_has(&contrib, bg[bi].g[k].root, bg[bi].g[k].pol))
+                        ir_gs_add(&inter, bg[bi].g[k].root, bg[bi].g[k].pol);
+                bg[bi] = inter;
+            }
+        }
+    }
+    return bg;
+}
+
+/* Level B use-site decision (the relaxation): is a use/free of MAYBE_FREED
+ * handle h SOUND at the current block because the use's guard is DISJOINT from
+ * the free's guard? (`if(c){free(h)} ... if(!c){use(h)}` — free under c, use
+ * under ¬c, c∧¬c=False, so the use never sees a freed handle.) Certified by
+ * handle_flow_lattice.v Level B (guarded_use_sound / guarded_not_disjoint_rejects).
+ *
+ * SOUNDNESS — conservative in every direction:
+ *   - ONLY IR_HS_MAYBE_FREED is eligible. IR_HS_FREED is a definite free on ALL
+ *     paths (a real UAF/double-free) and IR_HS_TRANSFERRED is the move axis —
+ *     both keep erroring.
+ *   - "disjoint" = there is an immutable-bool root C with (C,p) in the FREE
+ *     block's guard set and (C,¬p) in the USE block's — a genuine contradiction,
+ *     so the free's path and the use's path are mutually exclusive. The guard
+ *     sets contain ONLY immutable-bool roots (ir_local_is_immutable_bool), so C
+ *     has the same value at both branches.
+ *   - NULL guards / out-of-range blocks / no contradiction → false (→ reject).
+ * So a wrong/absent guard can only OVER-reject, never accept an unsafe use. */
+static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
+    if (!h || h->state != IR_HS_MAYBE_FREED) return false;
+    if (!zc->gr_block_guards) return false;
+    int fb = h->free_block;
+    int ub = zc->gr_cur_block;
+    if (fb < 0 || fb >= zc->gr_block_count) return false;
+    if (ub < 0 || ub >= zc->gr_block_count) return false;
+    IRGuardSet *bg = (IRGuardSet *)zc->gr_block_guards;
+    const IRGuardSet *gf = &bg[fb];
+    const IRGuardSet *gu = &bg[ub];
+    for (int i = 0; i < gf->count; i++) {
+        /* free under (C,p), use under (C,¬p) → guards disjoint → use is safe */
+        if (ir_gs_has(gu, gf->g[i].root, gf->g[i].pol ? 0 : 1))
+            return true;
+    }
+    return false;
+}
+
+/* Level B leak-coverage: does freeing MAYBE_FREED handle h in the CURRENT block
+ * COMPLETE its coverage to all paths? True iff the prior free's guard set and
+ * the current block's guard set are each a SINGLE complementary decision —
+ * {(C,+)} and {(C,-)}. The singleton requirement is the soundness gate: with no
+ * other guards, C partitions ALL paths, so freeing under both polarities frees
+ * on every path (no enclosing condition can skip both — that case has a count>1
+ * guard set and is rejected here, staying a leak). */
+static bool ir_free_completes_coverage(ZerCheck *zc, IRHandleInfo *h) {
+    if (!h || !zc->gr_block_guards) return false;
+    int fb = h->free_block;
+    int ub = zc->gr_cur_block;
+    if (fb < 0 || fb >= zc->gr_block_count) return false;
+    if (ub < 0 || ub >= zc->gr_block_count) return false;
+    IRGuardSet *bg = (IRGuardSet *)zc->gr_block_guards;
+    if (bg[fb].count != 1 || bg[ub].count != 1) return false;
+    return bg[fb].g[0].root == bg[ub].g[0].root &&
+           bg[fb].g[0].pol  != bg[ub].g[0].pol;
 }
 
 /* ================================================================
@@ -621,6 +959,19 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                 rh->state = IR_HS_MAYBE_FREED;
                 rh->free_line = ph->free_line;
             }
+            /* Level B: carry the free BLOCK from whichever predecessor froze the
+             * handle, so a MAYBE_FREED handle remembers WHERE it was freed (used
+             * by the guard-disjointness check at the use). Mirror of the
+             * free_line carry above; only fill when rh has none of its own. */
+            if (rh->state == IR_HS_MAYBE_FREED && rh->free_block < 0 &&
+                ph->free_block >= 0) {
+                rh->free_block = ph->free_block;
+            }
+            /* Level B: OR-carry the all-paths-freed flag. Sound because it is
+             * only set for SINGLETON complementary coverage (no path leaves the
+             * handle alive), so a pred without it cannot contribute an alive
+             * path that this would wrongly mask. */
+            if (ph->freed_all_paths) rh->freed_all_paths = 1;
             /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
              * MAYBE_FREED, keep it. Both same state → keep.
              * Both freed → keep freed. */
@@ -1154,7 +1505,7 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         /* Try root-only when a compound key wasn't found */
         if (path_len > 0) h = ir_find_handle(ps, root_local);
     }
-    if (h && ir_is_invalid(h)) {
+    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
         const char *name = (root_local >= 0 && root_local < func->local_count)
             ? func->locals[root_local].name : "?";
         int nlen = (root_local >= 0 && root_local < func->local_count)
@@ -2240,9 +2591,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     "double free: %%%d already freed at line %d",
                     target, h->free_line);
             } else if (h->state == IR_HS_MAYBE_FREED) {
-                ir_zc_error(zc, inst->source_line,
-                    "freeing %%%d which may already be freed",
-                    target);
+                if (ir_use_guard_disjoint(zc, h)) {
+                    /* free under a guard disjoint from the prior free — no
+                     * double-free. If it is the exact complement, the handle is
+                     * now freed on ALL paths (clears the leak check). */
+                    if (ir_free_completes_coverage(zc, h)) h->freed_all_paths = 1;
+                } else {
+                    ir_zc_error(zc, inst->source_line,
+                        "freeing %%%d which may already be freed",
+                        target);
+                }
             } else if (h->state == IR_HS_TRANSFERRED) {
                 ir_zc_error(zc, inst->source_line,
                     "freeing %%%d which was already transferred",
@@ -2263,7 +2621,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         int target = inst->handle_local;
         if (target >= 0) {
             IRHandleInfo *h = ir_find_handle(ps, target);
-            if (h && ir_is_invalid(h)) {
+            if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                 ir_zc_error(zc, inst->source_line,
                     "use after free: %%%d is %s (freed at line %d)",
                     target, ir_state_name(h->state), h->free_line);
@@ -2337,7 +2695,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     } else {
                         h = ir_find_compound_handle(ps, root_local, path, path_len);
                     }
-                    if (h && ir_is_invalid(h)) {
+                    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                         if (path_len == 0) {
                             ir_zc_error(zc, inst->source_line,
                                 "use after free: local %%%d is %s (freed at line %d)",
@@ -2811,7 +3169,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             IRHandleInfo *h;
                             if (path_len == 0) h = ir_find_handle(ps, root_local);
                             else h = ir_find_compound_handle(ps, root_local, path, path_len);
-                            if (h && ir_is_invalid(h)) {
+                            if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                                 ir_zc_error(zc, inst->source_line,
                                     "use after free: local %%%d is %s (freed at line %d)",
                                     root_local, ir_state_name(h->state), h->free_line);
@@ -3037,7 +3395,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             IRHandleInfo *h = ir_find_handle(ps, ret_local_direct);
             Type *ret_type = func->locals[ret_local_direct].type;
             if (ir_should_track_move(ret_type)) {
-                if (h && ir_is_invalid(h)) {
+                if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                     ir_zc_error(zc, inst->source_line,
                         "returning %s value (local %%%d)",
                         ir_state_name(h->state), ret_local_direct);
@@ -3049,7 +3407,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->escaped = true;
                 }
             } else {
-                if (h && ir_is_invalid(h)) {
+                if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                     ir_zc_error(zc, inst->source_line,
                         "returning %s pointer (local %%%d, freed at line %d) — "
                         "caller would receive dangling pointer",
@@ -3068,7 +3426,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 IRHandleInfo *h = ir_find_handle(ps, ret_local);
                 Type *ret_type = func->locals[ret_local].type;
                 if (ir_should_track_move(ret_type)) {
-                    if (h && ir_is_invalid(h)) {
+                    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                         ir_zc_error(zc, inst->source_line,
                             "returning %s value (local %%%d)",
                             ir_state_name(h->state), ret_local);
@@ -3084,7 +3442,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                      * in a FREED/MAYBE_FREED/TRANSFERRED state is unsafe to
                      * hand to the caller. This catches `free(p); return p;`
                      * and any alias of a freed allocation. */
-                    if (h && ir_is_invalid(h)) {
+                    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                         ir_zc_error(zc, inst->source_line,
                             "returning %s pointer (local %%%d, freed at line %d) — "
                             "caller would receive dangling pointer",
@@ -3405,9 +3763,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 "double free: local %%%d already freed at line %d",
                                 root_local, h->free_line);
                         } else if (h->state == IR_HS_MAYBE_FREED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "freeing local %%%d which may already be freed",
-                                root_local);
+                            if (ir_use_guard_disjoint(zc, h)) {
+                                if (ir_free_completes_coverage(zc, h))
+                                    h->freed_all_paths = 1;
+                            } else {
+                                ir_zc_error(zc, inst->source_line,
+                                    "freeing local %%%d which may already be freed",
+                                    root_local);
+                            }
                         } else if (h->state == IR_HS_TRANSFERRED) {
                             ir_zc_error(zc, inst->source_line,
                                 "freeing local %%%d which was already transferred",
@@ -3506,7 +3869,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     IRHandleInfo *h;
                     if (path_len == 0) h = ir_find_handle(ps, root_local);
                     else h = ir_find_compound_handle(ps, root_local, path, path_len);
-                    if (h && ir_is_invalid(h)) {
+                    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                         ir_zc_error(zc, inst->source_line,
                             "use after free: local %%%d is %s (freed at line %d)",
                             root_local, ir_state_name(h->state), h->free_line);
@@ -3746,9 +4109,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 "double free: local %%%d already freed at line %d",
                                 root_local, h->free_line);
                         } else if (h->state == IR_HS_MAYBE_FREED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "freeing local %%%d which may already be freed",
-                                root_local);
+                            if (ir_use_guard_disjoint(zc, h)) {
+                                if (ir_free_completes_coverage(zc, h))
+                                    h->freed_all_paths = 1;
+                            } else {
+                                ir_zc_error(zc, inst->source_line,
+                                    "freeing local %%%d which may already be freed",
+                                    root_local);
+                            }
                         }
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
@@ -4183,6 +4551,16 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     for (int bi = 0; bi < func->block_count; bi++)
         ir_ps_init(&block_states[bi]);
 
+    /* Level B guarded refinement (2026-06-27): per-block guard sets — which
+     * immutable-bool conditions hold on ALL paths to each block. Computed once;
+     * read at MAYBE_FREED use sites to recover `if(c){free} if(!c){use}` when the
+     * use's guard is disjoint from the free's. Stored on zc for the free/use
+     * sites inside ir_check_inst. */
+    IRGuardSet *block_guards = ir_compute_block_guards(func);
+    zc->gr_block_guards = block_guards;
+    zc->gr_block_count = func->block_count;
+    zc->gr_cur_block = 0;
+
     /* F0.5 (2026-05-03): nested-handle param registration is done
      * INSIDE the fixed-point loop on the merged state for the entry
      * block — pre-loop registration on block_states[0] would be
@@ -4274,8 +4652,20 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
 
             /* Process instructions in this block */
+            zc->gr_cur_block = bi;
             for (int ii = 0; ii < bb->inst_count; ii++) {
                 ir_check_inst(zc, &merged, &bb->insts[ii], func);
+            }
+            /* Level B: tag handles freed IN this block (state FREED, no
+             * free_block yet) with bi. Inherited-freed handles already carry
+             * their origin block; MAYBE_FREED handles get free_block via the
+             * merge carry. free_block is NOT part of the convergence check
+             * (state only), so this can't perturb the fixed point. */
+            for (int hi = 0; hi < merged.handle_count; hi++) {
+                if (merged.handles[hi].state == IR_HS_FREED &&
+                    merged.handles[hi].free_block < 0) {
+                    merged.handles[hi].free_block = bi;
+                }
             }
 
             /* Check if state changed (for fixed-point convergence).
@@ -4395,8 +4785,17 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             free(pred_states);
         }
 
+        zc->gr_cur_block = bi;
         for (int ii = 0; ii < bb->inst_count; ii++) {
             ir_check_inst(zc, &merged, &bb->insts[ii], func);
+        }
+        /* Level B: tag handles freed in this block (the final pass also writes
+         * block_states[bi], read by later blocks' merges in this same pass). */
+        for (int hi = 0; hi < merged.handle_count; hi++) {
+            if (merged.handles[hi].state == IR_HS_FREED &&
+                merged.handles[hi].free_block < 0) {
+                merged.handles[hi].free_block = bi;
+            }
         }
 
         ir_ps_free(&block_states[bi]);
@@ -5022,8 +5421,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 if (reported_n < reported_cap)
                     reported_ids[reported_n++] = h->alloc_id;
-            } else if (h->state == IR_HS_MAYBE_FREED) {
-                /* Phase E: MAYBE_FREED at non-fallback non-early-exit
+            } else if (h->state == IR_HS_MAYBE_FREED && !h->freed_all_paths) {
+                /* Level B: skip if freed_all_paths — the handle was freed under
+                 * a condition AND its exact singleton complement, so it is freed
+                 * on every path despite the conservative MAYBE_FREED join.
+                 * Phase E: MAYBE_FREED at non-fallback non-early-exit
                  * return block. With exhaustive switch fix (elide
                  * unreachable fallthrough) and is_early_exit tagging,
                  * spurious MAYBE_FREED from CFG merge conservatism is
@@ -5104,6 +5506,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     for (int bi = 0; bi < func->block_count; bi++)
         ir_ps_free(&block_states[bi]);
     free(block_states);
+    free(block_guards);            /* Level B: per-block guard sets */
+    zc->gr_block_guards = NULL;
+    zc->gr_block_count = 0;
 
     return zc->error_count == 0;
 }

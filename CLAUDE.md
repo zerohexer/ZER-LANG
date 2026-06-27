@@ -1126,9 +1126,15 @@ use-requires-ALIVE; `join_freed_blocks_use` = the MAYBE_FREED conservatism CERTI
 specs the GUARDED refinement that recovers the idiomatic over-rejection `if(c){free}
 if(!c){use}` (`maybe_freed_correlation_recovered` — a use under guard `!c` is safe when the
 free is under the disjoint guard `c`; `guarded_not_disjoint_rejects` = no under-rejection).
-Level B's IMPLEMENTATION (a per-free path-predicate in zercheck_ir) is the pending follow-on;
-Level A is current behavior. So the handle DOMAIN is now certified; the proof-track
-admits/placeholders are a separate cleanup. The oracle-backed classes are now 12.
+Level B's IMPLEMENTATION **SHIPPED 2026-06-27** (zercheck_ir.c): per-block immutable-bool
+guard sets + per-handle `free_block`/`freed_all_paths` recover `if(c){free} if(!c){use}` at
+the use site, the double-free site, AND the leak check, all gated on provable guard
+disjointness; soundness gate = `ir_local_is_immutable_bool` via a no-default exhaustive AST
+walk (`ast_name_mutated_or_addrd`) that rejects any reassigned/address-taken condition (two
+accept-unsafe holes — reassigned param, `&c` in a call arg — were found+closed during the
+build; 6 negatives in `tests/zer_fail/guarded_*` pin them). So the handle DOMAIN is now
+certified AND the precision recovered; the proof-track admits/placeholders are a separate
+cleanup. The oracle-backed classes are now 12. See BUGS-FIXED.md 2026-06-27.
 
 The three levels (keep straight in any claim):
 - **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.

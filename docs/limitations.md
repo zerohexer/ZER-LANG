@@ -150,53 +150,20 @@ trap on the AST emit path (~938).
   (checker.c ~1441) now recurses on a `NODE_STRUCT_INIT` field value, validating it against
   the field type (which it inherits as context). 2/3-level nests compile+run; inner
   field-name/type errors still rejected.
-- **MAYBE_FREED path-correlation** — **CONFIRMED the one genuine idiomatic over-rejection
-  (2026-06-24); ORACLE WRITTEN, implementation pending.** `if(c){free(h);} if(!c){use(h);}`
-  — freeing under one guard and using under the DISJOINT guard is memory-safe, but the LINEAR
-  (non-flow-sensitive) handle analysis sees `use` after a MAYBE_FREED and rejects. The
-  theorem is done: `proofs/operational/lambda_zer_handle/handle_flow_lattice.v` Level B
-  (`maybe_freed_correlation_recovered`) certifies that a use under guard `!c` is safe when the
-  free is under the disjoint guard `c`, with `guarded_not_disjoint_rejects` pinning
-  no-under-rejection (a non-disjoint guard pair is a real UAF, never accepted). The
-  IMPLEMENTATION — a per-free path-predicate in zercheck_ir, so the guarded refinement is
-  checked at the use site — is the follow-on (a real subsystem; Level A, the current
-  conservative behavior, is already certified by the same file). Highest-value flexibility
-  target remaining.
-
-  **IMPLEMENTATION PLAN (scoped 2026-06-24 by tracing zercheck_ir.c — it is a SUBSYSTEM, not
-  a patch).** The `MAYBE_FREED`-use rejection is scattered across ~10+ sites (zercheck_ir.c
-  ~1163, 1950, 2229/2259, 2334, 2807, 3394/3502, 3735, 4473, 5016) and the FREE transition
-  across ~5+ (~1440, 2242, 3357, 3410, 3744). No per-block guard infrastructure exists. Sound
-  staged plan, each stage `make check`-gated and behavior-preserving until the last:
-  - **Stage 0 — centralize the use-check.** Extract the ~10 `state==MAYBE_FREED/FREED → "use
-    after free"` sites into ONE helper (`ir_handle_use_check`). Behavior-preserving refactor
-    (the project's "same fix at 4+ sites → extract helper FIRST" rule); verify identical
-    diagnostics + green. This is the prerequisite — the disjointness check must live in ONE
-    place, not 10.
-  - **Stage 1 — per-block immediate guard.** For each block, derive its immediately-dominating
-    branch `(cond_expr, polarity)` = the unique `IR_BRANCH` whose `true_block`/`false_block`
-    is this block AND this block has a single predecessor. (`inst->expr` holds the condition
-    AST; `true_block`/`false_block` the successors.) Single-immediate-guard only — sound, less
-    complete than full guard-sets; nested guards fall back to reject.
-  - **Stage 2 — record `free_guard`.** Add `Node *free_guard_expr; int free_guard_pol;` to
-    `IRHandleInfo`; set it at the FREE transition to the freeing block's immediate guard; and
-    in `ir_merge_states` (~599-620) COPY it from the `FREED` predecessor onto the merged
-    `MAYBE_FREED` handle (the ONLY new merge logic).
-  - **Stage 3 — conservative negation-aware disjointness, in the Stage-0 helper.** At a
-    `MAYBE_FREED` use in a block with immediate guard `(Eu,pu)`: downgrade to ALIVE (no error)
-    IFF `disjoint((Ef,pf),(Eu,pu))` — same base condition, opposite effective polarity.
-    Normalize `!E` → `(E, flip)`, `a==k`/`a!=k` as negations; **anything not provably a
-    negation → NOT disjoint → keep the reject.** A false "disjoint" is a UAF, so this predicate
-    must reject on any doubt.
-  - **Stage 4 — soundness gate (mandatory).** The 4 probes: `if(c)free;if(!c)use`→ACCEPT;
-    `if(c)free;if(c)use`→REJECT (same guard = UAF); `if(c)free;use(h)`→REJECT (unguarded);
-    `if(c)free;if(d)use`→REJECT (unrelated guard). PLUS the full ~260 `tests/zer_fail/`
-    negative suite must stay red and `make check` GREEN. Grounded by handle_flow_lattice.v
-    `guarded_not_disjoint_rejects` (the no-under-rejection wall) and `maybe_freed_correlation_
-    recovered` (the accept witness).
-  Risk: this edits the production UAF analyzer; the containment (only reject→accept on PROVEN
-  disjointness) keeps soundness-by-construction, but the disjointness predicate is the risk
-  surface — do it as a focused pass, not a tail-chain.
+- **MAYBE_FREED path-correlation — FIXED (2026-06-27): Level B guarded refinement SHIPPED.**
+  `if(c){free(h)} if(!c){use(h)}` — and the matching double-free under `!c` + the leak check
+  when freed under both `c` and `!c` — now COMPILE: freeing under one guard and using/freeing
+  under the DISJOINT complement is recovered, gated on PROVABLE guard disjointness (else the
+  Level-A MAYBE_FREED conservatism stands). Implementation (zercheck_ir.c): per-block
+  immutable-bool guard sets (`ir_compute_block_guards`) + per-handle `free_block` /
+  `freed_all_paths`; the use/double-free/leak sites relax via `ir_use_guard_disjoint` /
+  `ir_free_completes_coverage`. SOUNDNESS GATE: `ir_local_is_immutable_bool` via a no-default
+  exhaustive AST walk (`ast_name_mutated_or_addrd`) rejecting any reassigned/address-taken
+  condition — two accept-unsafe holes (reassigned param; `&c` in a call arg) were found+closed
+  during the build. Certified by handle_flow_lattice.v Level B. Tests:
+  `tests/zer/guarded_maybe_freed_disjoint.zer` + 6 `tests/zer_fail/guarded_*`. The staged
+  implementation plan below is HISTORICAL (superseded by the shipped design). Full detail:
+  BUGS-FIXED.md 2026-06-27.
 - Every flat-lattice class carries residual over-rejection by construction (see below).
 
 ### ORACLE COVERAGE — the theorem layer, by class (the (c) criterion)

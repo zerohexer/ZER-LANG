@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-06-27 — Level B guarded refinement IMPLEMENTED (MAYBE_FREED precision, zercheck_ir.c)
+
+Implements `proofs/operational/lambda_zer_handle/handle_flow_lattice.v` Level B
+(previously spec-only). Recovers the idiomatic over-rejection
+`if(c){free(h)} ... if(!c){use(h)}`: a free under guard `c` and a use under the
+DISJOINT guard `!c` is safe (`c ∧ !c = False`), so the conservative MAYBE_FREED
+join no longer rejects it. Three coordinated recoveries, all gated on the same
+proven-disjoint guard, all sound (only fire when disjointness is provable; else
+the Level-A MAYBE_FREED conservatism stands):
+1. **use-site** — a read/deref/get of a MAYBE_FREED handle whose free guard is
+   disjoint from the use's guard (9 `ir_is_invalid` use sites + the
+   `ir_check_ident_uaf` read path).
+2. **double-free site** — a second free under the disjoint guard is not a
+   double-free (3 free sites).
+3. **leak coverage** — a handle freed under `c` AND its exact singleton
+   complement `!c` is freed on ALL paths (not a leak at exit), via a
+   `freed_all_paths` flag, OR-carried through merges.
+
+**Mechanism:** a per-function pre-pass computes, for each basic block, the SET of
+immutable-bool guards holding on all paths to it (`ir_compute_block_guards`,
+single forward pass, bail-to-empty on back edges). Branch conditions are resolved
+to a root bool local + polarity by tracing `!`/copy chains
+(`ir_resolve_cond_root`). A handle records the BLOCK it was freed in
+(`free_block`); disjointness = the free block's guard set contradicts the use
+block's on some root (`ir_use_guard_disjoint`). NO change to the CFG fixpoint or
+its convergence (guards are a deterministic read-only side input; `free_block` /
+`freed_all_paths` are not part of the changed-state check).
+
+**THE soundness gate — `ir_local_is_immutable_bool`.** A guard is tracked ONLY if
+its root is a bool that is NEITHER reassigned NOR address-taken anywhere in the
+function (so its value is identical at the free's branch and the use's branch).
+This is enforced by `ast_name_mutated_or_addrd`, a **no-default exhaustive AST
+walk** of the function body (under `-Werror=switch` + walker_default_audit), not
+IR-field inspection — because writes (`c = e` → IR_ASSIGN with the target in the
+AST expr) and address-takes (`flip(&c)` → a call-arg AST expr) hide in AST
+exprs the flat IR does not expose. **Two real accept-unsafe holes were found and
+closed during implementation** (each a missed mutation form): a reassigned param
+looked immutable (IR `dest_local` scan missed IR_ASSIGN); an address-taken
+condition looked immutable (IR_ADDR_OF scan missed `&c` in a call arg). Both now
+rejected.
+
+Verified: the positive idiom compiles + runs (`tests/zer/guarded_maybe_freed_disjoint.zer`);
+**six soundness negatives reject** (`tests/zer_fail/guarded_*`: condition
+reassigned, address-taken, same-polarity, different-conditions,
+non-complementary double-free, nested-complementary-still-leaks). `make check`
+GREEN (semantic-fuzz 200/0, ZER 856/0, modules 139/0, Rust 784/0, Zig 36/0,
+matrices escape 35/35 · keep 21/21 · conc 15/15 · shape 50/50, all audit gates
+OK, fixpoint converges). Built incrementally (foundation → tracking → relaxation)
+with a no-behavior-change checkpoint after the tracking phase.
+
+---
+
 ## 2026-06-27 — exhaustiveness hardening: `-Werror=switch` HARD GATE + collector switch conversion
 
 Structural follow-up to the cool-johnson copy effort (the 23-fix root cause was

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Level B soundness: free under `c`, use under `!d` — TWO UNRELATED conditions.
+// `c` and `!d` are not complementary (both can be true: c && !d), so the use can
+// see a freed handle. The guarded refinement must only fire on the SAME root
+// with opposite polarity; different roots → no disjointness → reject.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void f(bool c, bool d) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c) { pool.free(h); }
+    if (!d) { u32 v = pool.get(h).id; if (v > 0) { } pool.free(h); }
+}
+
+u32 main() { f(true, false); return 0; }

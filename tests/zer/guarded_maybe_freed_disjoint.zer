@@ -1,0 +1,23 @@
+// Level B guarded refinement (handle_flow_lattice.v Level B): the canonical
+// idiom `if(c){free} if(!c){use; free}` compiles end-to-end. Three coordinated
+// recoveries, all gated on the SAME proven-disjoint guard:
+//   1. READ under !c of a handle freed under c   → use-site disjointness
+//   2. FREE under !c of that handle              → double-free disjointness
+//   3. freed under c AND under !c (complements)  → leak coverage (all paths)
+// The flat Level-A lattice rejects all three (MAYBE_FREED). The guarded
+// refinement recovers them with no soundness loss — `c` is an immutable bool
+// (the soundness gate), and c ∧ !c = False.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void run(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c) { pool.free(h); }                 // free under c  → h MAYBE_FREED
+    if (!c) {
+        u32 x = pool.get(h).id;              // READ under !c → recovered (1)
+        if (x > 1000) { }                    // use x (no early return — that would be a MAYBE exit)
+        pool.free(h);                        // FREE under !c → recovered (2) + completes coverage (3)
+    }
+}
+
+u32 main() { run(false); return 0; }

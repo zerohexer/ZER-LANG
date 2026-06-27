@@ -30,9 +30,11 @@
        under guard Gu is safe iff Gu is DISJOINT from the free guard Gf. This
        RECOVERS the idiomatic case the flat lattice rejects, with NO soundness
        loss: a non-disjoint guard pair is unprovable -> falls back to reject
-       (guarded_not_disjoint_rejects). Level B's IMPLEMENTATION needs a per-free
-       path-predicate in zercheck_ir (the precision follow-on); Level A is what
-       the compiler runs today.
+       (guarded_not_disjoint_rejects). Level B's IMPLEMENTATION SHIPPED 2026-06-27
+       in zercheck_ir.c (per-block immutable-bool guard sets + per-handle
+       free_block/freed_all_paths; soundness gate ir_local_is_immutable_bool).
+       Both Level A (the conservative floor) and Level B (the recovery) now run.
+       See BUGS-FIXED.md 2026-06-27.
    ================================================================ *)
 From Coq Require Import Bool.
 

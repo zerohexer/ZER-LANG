@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Level B soundness: the guard condition `c` is REASSIGNED between the free and
+// the use, so `c` at the free ≠ `c` at the use — the guards do NOT correlate and
+// the free/use are NOT actually disjoint. f(true): free under c=true, then c=e,
+// then if(!c) may be true → use-after-free. The immutable-bool gate must reject
+// (a reassigned param/local is not a trackable guard root). NOTE: this is the
+// exact accept-unsafe hole found while building the feature — `c = e` lowers to
+// IR_ASSIGN with the target in the AST expr, so the check must scan the source.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void f(bool c, bool e) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c) { pool.free(h); }
+    c = e;
+    if (!c) { u32 v = pool.get(h).id; if (v > 0) { } pool.free(h); }
+}
+
+u32 main() { f(true, true); return 0; }

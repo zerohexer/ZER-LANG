@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Level B soundness (double-free site): two frees under UNRELATED conditions
+// (`c` and `d`). f(true, true) frees h twice → real double-free. The guarded
+// double-free relaxation must only suppress when the second free's guard is
+// disjoint from the first's; `c` and `d` are not complementary, so it must
+// reject (and not wrongly set freed-on-all-paths).
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void f(bool c, bool d) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c) { pool.free(h); }
+    if (d) { pool.free(h); }
+}
+
+u32 main() { f(true, true); return 0; }

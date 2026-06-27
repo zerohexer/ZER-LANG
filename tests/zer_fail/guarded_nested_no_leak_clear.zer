@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Level B leak-coverage soundness: the complementary frees (under c and !c) are
+// NESTED under an outer condition d. They cover all paths ONLY when d is true —
+// on the !d path the handle is never freed (leak). The coverage clear must NOT
+// fire here: it requires SINGLETON guard sets {(c,+)} and {(c,-)} (no enclosing
+// condition); here the free blocks' guard sets are {(d,+),(c,+)} / {(d,+),(c,-)}
+// (count > 1), so freed_all_paths stays unset and the leak is correctly reported.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void f(bool c, bool d) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (d) {
+        if (c) { pool.free(h); }
+        if (!c) { pool.free(h); }
+    }
+}
+
+u32 main() { f(false, true); return 0; }

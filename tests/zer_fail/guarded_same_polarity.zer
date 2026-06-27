@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Level B soundness: free under `c` and use under `c` (SAME polarity, not
+// complement). The guards are NOT disjoint (both true when c is true), so the
+// use can see a freed handle. Must reject. f(true): free then use-after-free.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void f(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c) { pool.free(h); }
+    if (c) { u32 v = pool.get(h).id; if (v > 0) { } }
+}
+
+u32 main() { f(true); return 0; }

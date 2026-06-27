@@ -107,6 +107,16 @@ typedef struct {
     /* imported module ASTs for cross-module summary building */
     Node **import_asts;
     int import_ast_count;
+
+    /* Level B guarded refinement (2026-06-27) — per-function, set by the IR
+     * analysis driver, read at free/use sites. gr_block_guards is an
+     * IRGuardSet[gr_block_count] (opaque void* — type is zercheck_ir-internal);
+     * gr_cur_block is the block currently being analyzed. See zercheck_ir.c
+     * "Level B guarded-refinement support" and
+     * proofs/operational/lambda_zer_handle/handle_flow_lattice.v Level B. */
+    void *gr_block_guards;
+    int gr_block_count;
+    int gr_cur_block;
 } ZerCheck;
 
 /* ---- API ---- */

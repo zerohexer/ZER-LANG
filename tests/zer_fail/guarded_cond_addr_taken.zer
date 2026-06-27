@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// Level B soundness: the guard condition `c` has its ADDRESS taken (flip(&c)),
+// so it could be mutated through the alias — its value at the free's branch is
+// not guaranteed equal to its value at the use's branch. The immutable-bool gate
+// must reject. NOTE: `&c` here is a CALL ARGUMENT (an AST expr), not an
+// IR_ADDR_OF instruction — the second accept-unsafe hole found while building;
+// the gate must scan the source AST (call args, defer bodies, …), not just IR.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+void flip(*bool b) { }
+
+void f(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    flip(&c);
+    if (c) { pool.free(h); }
+    if (!c) { u32 v = pool.get(h).id; if (v > 0) { } pool.free(h); }
+}
+
+u32 main() { f(true); return 0; }

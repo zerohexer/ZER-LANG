@@ -1215,6 +1215,62 @@ theorem, by Rice, no matter how many elements are tracked. So: spend design effo
 payable side (reduced product + relational refinement, each proven), accept the rare forced
 tail, never chase the hard wall.
 
+**OPERATIONAL PRECONDITIONS ARE FINITE VARIABLES — model them in the oracle, not just the
+states (the Level B lesson, 2026-06-27).** A MAX oracle must model not only the abstract
+STATES + transfer + decision, but every OPERATIONAL PRECONDITION the decision silently relies
+on. Concrete case that proved this: the handle Level B oracle
+(`lambda_zer_handle/handle_flow_lattice.v`) proved "DISJOINT guards → safe use" with guards
+as abstract `world -> bool`. Sound *for that model* — but it OMITTED one finite variable:
+**guard STABILITY** (that `c` at the free and `c` at the use are the SAME value — the
+condition is not reassigned or address-taken between the two program points). The free and
+the use happen at DIFFERENT points; if the guard's underlying value can change between them,
+"disjoint" is a lie (`if(c){free} c=e; if(!c){use}` with `c` reassigned is a real UAF). The
+oracle modeled the LOGIC (disjoint → safe) but not the PRECONDITION (same stable value), so
+the abstract domain did not CONTAIN the variable that distinguishes safe from unsafe.
+Consequence — the textbook missing-variable symptom: the implementation's two accept-unsafe
+holes (a reassigned param looked immutable; `&c` in a call arg looked immutable) were found
+by RED-TEAM, **not by a failing proof** — because the proof's model had no variable to fail
+on. The rules this adds to the standard:
+- **"All finite variables, none missing" INCLUDES preconditions.** A relaxation `P → accept`
+  is a MAX oracle only if `P` carries EVERY condition reality requires (here: disjoint AND
+  stable). Enumerate the operational preconditions of every decision and make each an explicit
+  hypothesis in the oracle.
+- **The tell you missed one: a soundness hole found by testing/red-team rather than by a
+  failing proof.** That means the abstract domain lacked the distinguishing variable. The fix
+  is to ADD it to the oracle (climb the oracle), NOT just patch the C — a C patch leaves the
+  oracle still certifying the wrong thing and the next form of the same hole still un-modeled.
+- **Where the oracle can't yet model it, the C must DISCHARGE it with a complete gate, and
+  that gap must be written down.** Level B's stability precondition is discharged by
+  `ir_local_is_immutable_bool` (a no-default exhaustive AST walk); the oracle file now records
+  that its `world->bool` abstraction PRESUMES stability, discharged there. That note is the
+  honest bridge until the oracle is strengthened to model the temporal/mutation dimension.
+
+**IMPLEMENTING A RELAXATION (any reject→accept change) — the accept-unsafe discipline.** A
+relaxation is the ONE change class where a bug = a SHIPPED use-after-free (everything else
+this codebase does TIGHTENS, where a bug only over-rejects = safe). Treat it accordingly. Full
+methodology + the Level B worked case study (the three accuracy layers, decision-layer vs
+state-layer recovery, the two holes and how each was a missed mutation form, the incremental
+no-behavior-change build): `docs/compiler-internals.md` "Sound relaxation (reject→accept)".
+The four load-bearing rules:
+1. **Diagnose the LAYER first.** Over-rejection is almost always a COARSE DOMAIN (theorem
+   sound, C faithful, the lattice lost info at a JOIN — e.g. MAYBE_FREED collapses
+   freed-under-c / alive-under-!c into one blob), NOT "theorem wrong" or "C inference bug." The
+   fix is a RICHER abstraction proven sound, never an ad-hoc C patch.
+2. **The soundness gate must be a COMPLETE exhaustive walk, not IR-field inspection.** Writes
+   and address-takes (and other "is this safe to relax?" facts) hide in AST exprs the flat IR
+   does not expose (`c = e` → `IR_ASSIGN`-in-expr; `flip(&c)` → a call-arg expr). Use a
+   no-default exhaustive AST walk (under `-Werror=switch`), conservative-on-unknown. An
+   IR-field scan is structurally incomplete → accept-unsafe holes.
+3. **Prefer decision-layer recovery over state-layer when the state layer is the fixpoint.**
+   Overriding the accept/reject decision via a read-only side channel (Level B's guard sets)
+   leaves the lattice state coarse but keeps the CFG fixpoint/convergence untouched and
+   concentrates the risk in ONE predicate. Refining the state itself (truly-truthful, richer
+   lattice) is higher precision but touches convergence — the higher-risk endgame, not the
+   default.
+4. **Build incrementally with a no-behavior-change checkpoint:** foundation + tracking → verify
+   `make check` GREEN (proves convergence/no regression) → THEN flip the relaxation + the full
+   negative matrix. Isolates the one risky bit; the negatives are the safety net.
+
 New extraction → follow proof-internals.md "Phase 1 extraction recipe" +
 Makefile/.gitignore checklist. VST-friendly C style: flat cascade of
 early-return ifs, NO nesting, NO compound conditions (split predicates and

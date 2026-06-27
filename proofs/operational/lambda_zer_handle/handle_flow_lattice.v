@@ -102,6 +102,26 @@ Proof. reflexivity. Qed.
    A free guard Gf : world -> bool is true on worlds where the handle was freed;
    a use guard Gu is true on worlds where the use executes. The use is SAFE iff
    every use-world is a non-free-world (the guards are DISJOINT).
+
+   OMITTED OPERATIONAL PRECONDITION — guard STABILITY (read before relying on this
+   for soundness). Gf and Gu are modeled here as FIXED functions of a single
+   `world`, evaluated consistently. The real program evaluates the guard at TWO
+   DIFFERENT program points (the free and the use); if the guard's underlying
+   value is MUTATED between them (a reassigned or address-taken condition), then
+   "Gf and Gu refer to the same `c`" is FALSE and disjointness is a lie
+   (`if(c){free} c=e; if(!c){use}` is a real UAF). This oracle does NOT model the
+   temporal/mutation dimension, so it certifies the disjointness LOGIC but not the
+   stability PRECONDITION. The implementation DISCHARGES that precondition:
+   zercheck_ir.c `ir_local_is_immutable_bool` (a no-default exhaustive AST walk,
+   `ast_name_mutated_or_addrd`) tracks a guard ONLY if its root bool is neither
+   reassigned nor address-taken anywhere in the function — so the modeled "same
+   `world`" assumption holds. Strengthening THIS file to model state transitions
+   and require the guard stable across the free->use interval is the proper
+   MAX-oracle climb (a missing finite variable, per CLAUDE.md "OPERATIONAL
+   PRECONDITIONS ARE FINITE VARIABLES"). Until then, the immutability gate is the
+   bridge. Two accept-unsafe holes (reassigned param; `&c` in a call arg) were
+   red-team-found precisely because this variable was unmodeled — see
+   BUGS-FIXED.md 2026-06-27 and tests/zer_fail/guarded_*.
    ================================================================ *)
 Section Guarded.
   Variable world : Type.

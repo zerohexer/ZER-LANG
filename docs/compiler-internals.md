@@ -565,6 +565,142 @@ best CompCert/seL4/CakeML achieve.
 
 ---
 
+## Sound relaxation (reject→accept) — methodology + Level B case study
+
+This section is the durable how-to for the riskiest change class in the
+compiler: a **relaxation** — making the analyzer ACCEPT a program it used to
+REJECT (driving down over-rejection / "payable" imprecision). It is the inverse
+of everything else this codebase does. Read it before touching any analyzer
+decision in the accept direction. The CLAUDE.md "IMPLEMENTING A RELAXATION"
+rules are the summary; this is the full reasoning + the worked example.
+
+### Why relaxations are the dangerous class
+
+Every other safety change TIGHTENS (closes a hole). A bug in a tightening change
+= an OVER-rejection = harmless to safety (annoying, not unsafe). A relaxation
+LOOSENS. **A bug in a relaxation = accept-when-should-reject = a SHIPPED
+use-after-free / OOB / data race — the worst outcome the compiler can produce.**
+So the risk asymmetry is total: tightening errs toward safety, relaxing errs
+toward catastrophe. Budget verification effort accordingly (heavier red-team, a
+complete soundness gate, incremental rollout).
+
+### The three accuracy layers (where precision is lost, where it can be recovered)
+
+Take the canonical handle case `if(c){free(h)} if(!c){use(h)}`:
+
+1. **Concrete truth** — "freed on the `c` path, alive on the `!c` path." Exact,
+   per-path.
+2. **The lattice STATE (`MAYBE_FREED`)** — the CFG JOIN *collapses* those two
+   distinguishable facts into one element. **This is where accuracy is lost** —
+   at the merge. `MAYBE_FREED` means "I can no longer tell which path froze it."
+   The state is a SOUND but LOSSY approximation; it is not "wrong," it is COARSE.
+3. **The DECISION (accept/reject)** — Level A reads the coarse state and
+   conservatively rejects; the recovery re-derives the lost correlation.
+
+Key consequence for diagnosis: when you see an over-rejection, it is almost
+always layer 2 (a coarse domain), **not** a wrong theorem and **not** a C
+inference bug. The theorem is sound over the coarse domain; the C faithfully
+implements it. To gain accuracy you ENRICH the domain (a richer, relational
+abstraction), prove the richer domain sound, then implement — you do not "fix"
+the theorem or hand-patch the C.
+
+### Decision-layer recovery vs state-layer refinement
+
+Two ways to recover layer-3 accuracy from a layer-2 loss:
+
+- **State-layer refinement (truly truthful):** make the lattice STATE precise
+  again — e.g. refine `MAYBE_FREED → ALIVE` at a block whose guard proves the
+  free didn't happen. The state then tells the truth. BUT this lives in the CFG
+  fixpoint (`ir_merge_states` + convergence), the most fragile, oscillation-prone
+  code (see the documented `ALIVE↔MAYBE_FREED` loop-convergence bugs). High risk.
+- **Decision-layer recovery (what Level B does):** LEAVE the state coarse
+  (`MAYBE_FREED` stays `MAYBE_FREED`) and override the accept/reject DECISION at
+  the use site by consulting a READ-ONLY side channel (per-block guard sets) that
+  re-derives the lost correlation. The analyzer still internally "believes"
+  `MAYBE`; it just looks up extra info before deciding. The OUTCOME is accurate;
+  the STATE is not. Lower risk: the CFG fixpoint is untouched, and the
+  accept-unsafe surface is concentrated in ONE predicate.
+
+**Default to decision-layer when the state layer is the fixpoint.** State-layer
+refinement is the higher-precision endgame, not the first move.
+
+### Level B implementation map (zercheck_ir.c, 2026-06-27)
+
+Recovers the `if(c){free} if(!c){use}` family at three sites, all gated on the
+same provable guard disjointness (else the Level-A `MAYBE_FREED` conservatism
+stands):
+
+- **Pre-pass `ir_compute_block_guards(func)`** → per-block `IRGuardSet` = the
+  immutable-bool guards `(root, polarity)` holding on ALL paths to the block.
+  Single forward pass (blocks are topological for forward edges); any block with
+  a BACK-edge predecessor (a loop) gets the EMPTY set — sound, conservative (no
+  loop-carried guard claimed). Intersection across predecessors + the branch
+  edge label.
+- **`ir_resolve_cond_root(func, cond_local, &pol)`** → traces `!`/copy chains
+  (`IR_UNOP TOK_BANG`, `IR_COPY`) from a branch's `cond_local` to a root bool
+  local + polarity, so `if(c)` and `if(!c)` correlate as `(c,+)` / `(c,−)`.
+- **Per-handle `free_block`** (`IRHandleInfo`) — the block a handle was freed in;
+  set in the driver post-inst-loop (state FREED + `free_block < 0` ⇒ freed here),
+  carried to `MAYBE_FREED` through `ir_merge_states`.
+- **Use-site + double-free recovery `ir_use_guard_disjoint(zc, h)`** — true iff
+  `h` is `MAYBE_FREED` and the free block's guard set CONTRADICTS the current
+  block's on some root (free under `(C,p)`, use under `(C,¬p)`). Applied at the
+  9 `ir_is_invalid` use sites and the 3 double-free sites.
+- **Leak-coverage `ir_free_completes_coverage` + `freed_all_paths`** — a second
+  free that is the EXACT SINGLETON complement of the first (`{(C,+)}` then
+  `{(C,−)}`, no enclosing condition) means freed on ALL paths → not a leak at
+  exit. The singleton requirement is the soundness gate (a count>1 guard set
+  means an enclosing condition could skip both frees — stays a leak). OR-carried
+  through merges (a genuine complementary coverage admits no still-alive path).
+- **NO change to the CFG fixpoint or its convergence** — guards are a
+  deterministic read-only side input; `free_block`/`freed_all_paths` are not part
+  of the changed-state convergence check.
+
+### THE soundness gate — `ir_local_is_immutable_bool` (and why it is an AST walk)
+
+A guard is tracked ONLY if its root bool is NEITHER reassigned NOR address-taken
+anywhere in the function (so its value is identical at the free's branch and the
+use's branch — the *stability* precondition the oracle presumes). This is
+enforced by **`ast_name_mutated_or_addrd`, a no-default EXHAUSTIVE AST walk** of
+the function body — NOT IR-field inspection. The reason is the central
+lesson:
+
+> Writes and address-takes hide in AST exprs the flat IR does not expose.
+> `c = e` lowers to `IR_ASSIGN` with the target in the AST `expr` (dest_local
+> = −1); `flip(&c)` is a call-argument AST expr, not an `IR_ADDR_OF`
+> instruction. An IR-field scan is therefore STRUCTURALLY INCOMPLETE for "is
+> this condition ever mutated?" and will leave accept-unsafe holes.
+
+**Two real accept-unsafe holes were found by red-team during the build** (each a
+missed mutation form — the form→state coverage-gap class):
+1. a reassigned param looked immutable (the IR `dest_local` scan missed
+   `IR_ASSIGN`-via-expr) → `if(c){free} c=e; if(!c){use}` wrongly accepted;
+2. an address-taken condition looked immutable (the `IR_ADDR_OF` scan missed
+   `&c` in a call arg) → `flip(&c); if(c){free} if(!c){use}` wrongly accepted.
+
+Both are now rejected. The fix — an exhaustive no-default AST walk,
+conservative-on-unknown (opaque/rare kinds return "mutated"), under the
+`-Werror=switch` gate so a new NodeKind forces a decision — is the airtight
+pattern for ANY "is it safe to relax?" predicate. Six negatives in
+`tests/zer_fail/guarded_*` pin every failure mode.
+
+### The oracle gap this exposed (the durable methodology lesson)
+
+`handle_flow_lattice.v` Level B proved `disjoint guards → safe` with guards as
+abstract `world -> bool`. Sound for its model, but it OMITTED the **stability**
+finite variable: it did not model that the free and the use occur at DIFFERENT
+program points with a possibly-MUTATED condition between them. The proof
+certified the LOGIC, not the PRECONDITION. That omission is exactly why the holes
+were found by red-team rather than a failing proof — the abstract domain had no
+variable to fail on. The fix lives in two places: the implementation discharges
+the precondition via `ir_local_is_immutable_bool`, and the oracle file now
+records that its `world->bool` abstraction PRESUMES stability (the proper
+MAX-oracle climb — modeling the temporal/mutation dimension explicitly — is a
+future oracle-strengthening). See CLAUDE.md "OPERATIONAL PRECONDITIONS ARE
+FINITE VARIABLES" for the generalized rule.
+
+---
+
 ## Lexer (lexer.c/h)
 - `Scanner` struct holds source pointer, current position, line number
 - Keywords: `TOK_POOL`, `TOK_RING`, `TOK_ARENA`, `TOK_HANDLE`, `TOK_STRUCT`, `TOK_ENUM`, `TOK_UNION`, `TOK_SWITCH`, `TOK_ORELSE`, `TOK_DEFER`, `TOK_IMPORT`, `TOK_VOLATILE`, `TOK_CONST`, `TOK_STATIC`, `TOK_PACKED`, `TOK_INTERRUPT`, `TOK_TYPEDEF`, `TOK_DISTINCT`

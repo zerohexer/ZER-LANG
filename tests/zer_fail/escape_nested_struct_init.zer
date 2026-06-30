@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// AU-3: nested struct-init `{ .inner = { .ptr = &local } }` escapes to a global.
+// The 1-level form is caught (BUG-732); the nested literal needs the recursive
+// struct_init_has_local_derived walker.
+struct Box { *u32 ptr; }
+struct Outer { Box inner; }
+Outer g;
+void leak() {
+    u32 local = 99;
+    Outer o = { .inner = { .ptr = &local } };
+    g = o;
+}
+u32 main() { leak(); return 0; }

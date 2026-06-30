@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// AU-4: direct assignment of a struct literal carrying &local to a global —
+// `g = { .ptr = &local };`. The var-decl-then-assign form is caught; the
+// direct-assign sink needs the recursive walker too.
+struct Box { *u32 ptr; }
+Box g;
+void leak() {
+    u32 local = 99;
+    g = { .ptr = &local };
+}
+u32 main() { leak(); return 0; }

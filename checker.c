@@ -1121,6 +1121,77 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* AU-3/AU-4 (2026-07-01): does a struct/union literal carry a pointer/slice
+ * to a function-local, at ANY nesting depth? Returns true for a field value
+ * that is &local (Case A), an is_local_derived alias ident (B), a slice over a
+ * local array (C), a call-launder of a local-derived arg (D), OR a NESTED
+ * struct literal `{ .inner = { .ptr = &local } }` that itself carries one (the
+ * recursion — AU-3's fix). RECURSIVE form of the previously-inline BUG-732
+ * var-decl walker, extracted so the var-decl carrier sink AND the NODE_ASSIGN-
+ * to-global sink (AU-4: `g = { .ptr = &local };`) share ONE definition. Pure
+ * tightening: only flags non-static non-global locals, so a global/static
+ * address never trips it. */
+static bool struct_init_has_local_derived(Checker *c, Node *init) {
+    if (!init || init->kind != NODE_STRUCT_INIT) return false;
+    for (int fi = 0; fi < init->struct_init.field_count; fi++) {
+        Node *fv = init->struct_init.fields[fi].value;
+        if (!fv) continue;
+        /* AU-3: descend nested struct/union literals. */
+        if (fv->kind == NODE_STRUCT_INIT) {
+            if (struct_init_has_local_derived(c, fv)) return true;
+            continue;
+        }
+        /* unwrap intrinsic chains (mirror the direct case) */
+        Node *fu = fv;
+        while (fu && fu->kind == NODE_INTRINSIC && fu->intrinsic.arg_count > 0)
+            fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+        /* Case A: &local — direct address-of */
+        if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
+            Node *root = fu->unary.operand;
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                if (root->kind == NODE_FIELD) root = root->field.object;
+                else root = root->index_expr.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                bool is_global = scope_lookup_local(c->global_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                Symbol *src = scope_lookup(c->current_scope,
+                    root->ident.name, (uint32_t)root->ident.name_len);
+                if (src && !src->is_static && !is_global) return true;
+            }
+        }
+        /* Case B: alias ident already flagged is_local_derived */
+        if (fv->kind == NODE_IDENT) {
+            Symbol *fsym = scope_lookup(c->current_scope,
+                fv->ident.name, (uint32_t)fv->ident.name_len);
+            if (fsym && fsym->is_local_derived) return true;
+        }
+        /* Case C: slice over a local array (local[0..]) */
+        if (fv->kind == NODE_SLICE) {
+            Node *sroot = fv->slice.object;
+            while (sroot && (sroot->kind == NODE_FIELD || sroot->kind == NODE_INDEX)) {
+                if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
+                else sroot = sroot->index_expr.object;
+            }
+            if (sroot && sroot->kind == NODE_IDENT) {
+                Symbol *srcs = scope_lookup(c->current_scope,
+                    sroot->ident.name, (uint32_t)sroot->ident.name_len);
+                bool is_global = scope_lookup_local(c->global_scope,
+                    sroot->ident.name, (uint32_t)sroot->ident.name_len) != NULL;
+                Type *rt = typemap_get(c, sroot);
+                bool rt_is_array = (type_dispatch_kind(rt) == TYPE_ARRAY);
+                if (srcs && (srcs->is_local_derived ||
+                             (rt_is_array && !srcs->is_static && !is_global)))
+                    return true;
+            }
+        }
+        /* Case D: call-result launder of a local-derived arg */
+        if (fv->kind == NODE_CALL && call_has_local_derived_arg(c, fv, 0))
+            return true;
+    }
+    return false;
+}
+
 /* keep axis (2026-06-07): does this call have a non-keep-derived pointer arg?
  * `idfn(p)` where p is a non-keep param (or a local aliasing one) yields a
  * result that may trace back to the non-keep param — persisting it violates the
@@ -4269,6 +4340,27 @@ static Type *check_expr(Checker *c, Node *node) {
                             (int)target_sym->name_len, target_sym->name);
                     }
                 }
+            }
+        }
+
+        /* AU-4 (2026-07-01): direct assignment of a struct/union literal carrying
+         * a pointer to a local into a global/param-field — `g = { .ptr = &local };`.
+         * The var-decl form `Box b = {.ptr=&local}; g = b;` is caught (b flagged
+         * is_local_derived), but the direct-assign form has no carrier Symbol and
+         * the IDENT-root walker above never inspects a NODE_STRUCT_INIT value.
+         * Reuse the recursive struct_init_has_local_derived helper (AU-3's fix).
+         * Gated on classify_escape_sink (global/param) so a LOCAL target is fine. */
+        if (node->assign.op == TOK_EQ &&
+            node->assign.value && node->assign.value->kind == NODE_STRUCT_INIT &&
+            struct_init_has_local_derived(c, node->assign.value)) {
+            Symbol *tgt_sym = NULL; bool tgt_g = false, tgt_p = false;
+            classify_escape_sink(c, node->assign.target, &tgt_sym, &tgt_g, &tgt_p);
+            if ((tgt_g || tgt_p) && tgt_sym) {
+                checker_error(c, node->loc.line,
+                    "cannot store struct/union literal carrying a pointer to a "
+                    "local in %s '%.*s' — pointer will dangle when function returns",
+                    tgt_p ? "pointer-parameter field" : "global/static variable",
+                    (int)tgt_sym->name_len, tgt_sym->name);
             }
         }
 
@@ -10043,79 +10135,13 @@ static void check_stmt(Checker *c, Node *node) {
                      * Walked here as a separate inline pass rather than via
                      * addr_exprs[] so we don't have to grow that fixed buffer
                      * — addr_exprs stays at [4] (the original 4-slot bound). */
+                    /* AU-3 (2026-07-01): the Cases A-D walk (and the recursion
+                     * into nested `{ .inner = { .ptr = &local } }` literals) now
+                     * lives in struct_init_has_local_derived — shared with the
+                     * NODE_ASSIGN-to-global sink (AU-4). */
                     if (init && init->kind == NODE_STRUCT_INIT && !sym->is_local_derived) {
-                        for (int fi = 0; fi < init->struct_init.field_count; fi++) {
-                            Node *fv = init->struct_init.fields[fi].value;
-                            if (!fv) continue;
-                            /* unwrap intrinsic chains the same way as direct case */
-                            Node *fu = fv;
-                            while (fu && fu->kind == NODE_INTRINSIC &&
-                                   fu->intrinsic.arg_count > 0)
-                                fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
-                            /* Case A: &local — direct address-of */
-                            if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
-                                Node *root = fu->unary.operand;
-                                while (root && (root->kind == NODE_FIELD ||
-                                                 root->kind == NODE_INDEX)) {
-                                    if (root->kind == NODE_FIELD) root = root->field.object;
-                                    else root = root->index_expr.object;
-                                }
-                                if (root && root->kind == NODE_IDENT) {
-                                    bool is_global = scope_lookup_local(c->global_scope,
-                                        root->ident.name, (uint32_t)root->ident.name_len) != NULL;
-                                    Symbol *src = scope_lookup(c->current_scope,
-                                        root->ident.name, (uint32_t)root->ident.name_len);
-                                    if (src && !src->is_static && !is_global) {
-                                        sym->is_local_derived = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            /* Case B: alias ident with is_local_derived flag */
-                            if (fv->kind == NODE_IDENT) {
-                                Symbol *fsym = scope_lookup(c->current_scope,
-                                    fv->ident.name, (uint32_t)fv->ident.name_len);
-                                if (fsym && fsym->is_local_derived) {
-                                    sym->is_local_derived = true;
-                                    break;
-                                }
-                            }
-                            /* Case C: slice over local array (local[0..]) */
-                            if (fv->kind == NODE_SLICE) {
-                                Node *sroot = fv->slice.object;
-                                while (sroot && (sroot->kind == NODE_FIELD ||
-                                                  sroot->kind == NODE_INDEX)) {
-                                    if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
-                                    else sroot = sroot->index_expr.object;
-                                }
-                                if (sroot && sroot->kind == NODE_IDENT) {
-                                    Symbol *srcs = scope_lookup(c->current_scope,
-                                        sroot->ident.name, (uint32_t)sroot->ident.name_len);
-                                    bool is_global = scope_lookup_local(c->global_scope,
-                                        sroot->ident.name, (uint32_t)sroot->ident.name_len) != NULL;
-                                    Type *rt = typemap_get(c, sroot);
-                                    bool rt_is_array = (type_dispatch_kind(rt) == TYPE_ARRAY);
-                                    if (srcs && (srcs->is_local_derived ||
-                                                  (rt_is_array &&
-                                                   !srcs->is_static && !is_global))) {
-                                        sym->is_local_derived = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            /* Case D (BUG-770, copied from cool-johnson-anb3cw):
-                             * call-result launder — `Box b = { .p = pass(&local) };`.
-                             * Cases A/B/C close direct &local / alias / slice-of-local;
-                             * Case D closes the launder-through-a-call shape — without
-                             * it the carrier `b` is never flagged is_local_derived and a
-                             * later `g = b;` slips through. Uses call_has_local_derived_arg,
-                             * the same predicate the assign/return/keep sinks use. */
-                            if (fv->kind == NODE_CALL &&
-                                call_has_local_derived_arg(c, fv, 0)) {
-                                sym->is_local_derived = true;
-                                break;
-                            }
-                        }
+                        if (struct_init_has_local_derived(c, init))
+                            sym->is_local_derived = true;
                     }
                 }
             }

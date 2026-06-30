@@ -1,0 +1,16 @@
+// AU-3/AU-4 positive (no over-rejection): struct literals that DON'T escape a
+// local must still compile — local carrier (never stored to a global), and a
+// &global pointer (not local-derived) stored to a global.
+struct Box { *u32 ptr; }
+struct Outer { Box inner; }
+Box g;
+u32 gv;
+void ok() {
+    u32 local = 7;
+    Box b = { .ptr = &local };                 // local carrier, not escaped — OK
+    Outer o = { .inner = { .ptr = &local } };  // nested local carrier — OK
+    g = { .ptr = &gv };                        // &global — not local-derived — OK
+    b.ptr = &gv;                               // use b so it isn't dead
+    o.inner.ptr = &gv;                         // use o
+}
+u32 main() { gv = 5; ok(); return 0; }

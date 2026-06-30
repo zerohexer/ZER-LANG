@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — AU-3 + AU-4: struct-literal escape holes (recursive + assign-sink), checker.c
+
+🔴 silent UAF (dangling global). Two siblings of the BUG-732 struct-init escape walker, both
+confirmed LIVE against current main before fix, both PURE TIGHTENING. `make check` GREEN, ZER
+876/0, escape-matrix 35/35.
+
+- **AU-3 — nested struct literal escapes:** `Outer o = { .inner = { .ptr = &local } }; g = o;`
+  compiled clean. The BUG-732 var-decl walker checked each top-level field for &local/alias/
+  slice/call-launder but did NOT recurse into a field value that is itself a `NODE_STRUCT_INIT`,
+  so the nested `{ .ptr = &local }` was opaque. The 1-level form was already caught.
+- **AU-4 — direct-assignment struct literal escapes:** `g = { .ptr = &local };` compiled clean.
+  The var-decl-then-assign form (`Box b = {.ptr=&local}; g = b;`) is caught (b flagged
+  is_local_derived), but the direct-assign form has no carrier Symbol and the NODE_ASSIGN
+  IDENT-root escape walker never inspected a `NODE_STRUCT_INIT` value.
+
+Fix: extracted the (previously inline) Cases A-D struct-init walk into a single RECURSIVE helper
+`struct_init_has_local_derived(c, init)` (descends nested literals — AU-3), and reused it at BOTH
+the var-decl carrier sink AND a new NODE_ASSIGN-to-global/param sink (AU-4, gated on
+`classify_escape_sink` so a LOCAL target is fine — no over-rejection). One definition governs
+both sinks. Tests: `tests/zer_fail/escape_{nested,assign}_struct_init.zer` (negatives),
+`tests/zer/struct_init_escape_ok.zer` (positive — local carrier + &global stored to global both
+compile). Closes 2 of the anqp95 audit-2026-06-25 AU findings.
+
+---
+
 ## 2026-07-01 — Branch-import Tier 3 (field-projection blindness in 5 shared-type walkers, from a5erj3)
 
 🔴 silent data race. Class: form-coverage / per-sink patchwork (BH-18 #7 sibling). Each of

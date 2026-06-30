@@ -5,9 +5,18 @@ Entries removed once fixed.
 
 ---
 
-## IN-PROGRESS — BRANCH-IMPORT BACKLOG (2026-07-01) — 9 fixes / 13 holes from 6 cool-johnson branches
+## DONE (2026-07-01) — BRANCH-IMPORT LANDED (9 fixes / 13 holes) — residual flags + open items below
 
-**What this is.** A review of six sibling bug-fix branches (`claude/cool-johnson-{sesjma,
+**STATUS: all three tiers committed + `make check` GREEN, ZER 873/0.** Tier 1 `6c368761`
+(6 holes: defer-goto, funcptr-race, intrinsic-arity, typedef-ptr-UAF, assign-launder, switch-
+capture). Tier 2 `4cf2c479` (2 AST→IR drift holes: static-init `@ctz`, await/spawn auto-guard).
+Tier 3 `1098202f` (field-projection blindness in 5 shared-type walkers). Permanent record:
+BUGS-FIXED.md 2026-07-01 (three entries). The tier detail below is retained as HISTORY; the
+two surviving **FLAGS** and the **STILL OPEN** list at the end of this entry are the live parts
+— do not delete those when this history block is eventually pruned. (FLAG #3 was retracted: all
+hunks applied cleanly onto the rewritten walkers.)
+
+**What this was.** A review of six sibling bug-fix branches (`claude/cool-johnson-{sesjma,
 a5erj3, 11ct36, anb3cw, anqp95, ongou2}`) produced a prioritized backlog of fixes that are
 NOT yet in main. The code is ALREADY WRITTEN on those branches — this is a COPY-the-fix
 (re-derive onto current main), **NOT a merge/pull** (the branches pre-date main's recent
@@ -17,6 +26,18 @@ with `git show <sha> -- <file>` (fetch the branch first: `git fetch origin
 'refs/heads/claude/cool-johnson-<name>:refs/remotes/origin/claude/cool-johnson-<name>'`).
 Verify each tier with the Docker pattern (CLAUDE.md "Ad-hoc Docker verify"). Remove a row's
 line + delete this whole entry once all tiers land + `make check` GREEN.
+
+**CORRECTION (2026-07-01, verified):** sesjma/a5erj3/ongou2 all branch from `9ad13c0c`, which
+ALREADY CONTAINS the walker rewrites (22061071/dafbc1f6/28e9562e/64ea3da2 are its ancestors);
+11ct36 branches from `fcd2dc34`. **Every fix's source hunks were verified to apply CLEANLY to
+current main via `git show <sha> -- <files> | git apply --check`** (all 7 commits CLEAN,
+including the Tier-3 field-projection set and the older-base 11ct36). So the earlier Tier-3
+"OVERLAPS main's rewrites / RE-DERIVE / FLAG #3" concern was based on a WRONG base assumption
+and is RETRACTED — the a5erj3 field-projection fixes were written ON TOP of the rewritten
+walkers and apply directly. Implementation is a faithful `git apply` of each source diff +
+`git checkout <sha> -- <testfile>` for tripwires (NOT a merge). The "unify into one helper"
+idea for the 5 walkers is OPTIONAL polish, deliberately deferred (the user asked to copy the
+fixes, not introduce a new refactor mid-import). FLAG #1 and FLAG #2 stand; FLAG #3 retracted.
 
 **Already in main — DO NOT re-take:** anb3cw `b6773a3d` (BUG-770/771) = main batch 7
 `28a7455c`; anqp95 `e09da736` 4 fixes (slice `.ptr` volatile-strip, `@truncate(NonInt)`,

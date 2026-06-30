@@ -1,0 +1,9 @@
+// Tripwire: NEW-3 (BUG-595..612 class) — spawn arg with unproven array index.
+// Compiler should emit "auto-guard inserted" warning AND emit the bounds
+// check in the parent thread's arg copy. Audit: 2026-06-30 — fixed at
+// emitter.c IR auto-guards gate (added IR_NOP) + emit_auto_guards descent
+// into NODE_SPAWN.args[].
+u32[4] g_arr;
+void worker(u32 v) { return; }
+void run(u32 i) { spawn worker(g_arr[i]); }
+u32 main() { run(2); return 0; }

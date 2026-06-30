@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — Branch-import Tier 2 (2 AST→IR drift holes, emitter.c)
+
+Both are the AST→IR emission-drift class (FLAG #1). `make check` GREEN (ZER 869/0).
+
+- **`static u32 v = @ctz(16);` emitted invalid C** (`emitter.c`, from a5erj3 `9e47b9c4` part c).
+  🟡 invalid C. The IR `@ctz`/`@clz` emitter always wrote the statement-expression `({...})`
+  zero-guard; GCC rejects a stmt-expr in a static-local initializer ("initializer element is
+  not constant") while the AST path already had a conditional form. Fix: use the conditional-
+  expression form when the arg has no side effects (`expr_has_side_effects` gate, RF13), keeping
+  the stmt-expr only for side-effecting args. Tripwire (added here, the branch shipped none):
+  `tests/zer/static_init_bitquery.zer`.
+- **IR auto-guards gate missing `IR_AWAIT`/`IR_NOP`** (`emitter.c`, from ongou2 `bbbdf95c` hole
+  3). 🔴 silent OOB. `await arr[i]` / `spawn worker(arr[i])` with unproven `i` printed "auto-
+  guard inserted" but emitted a raw unchecked access (baremetal corruption; hosted SIGSEGV).
+  Fix (paired): add `IR_AWAIT || IR_NOP` to both auto-guard gate lists (regular + async paths),
+  and make `emit_auto_guards` descend `spawn_stmt.args[]` / `await_stmt.cond` instead of
+  no-op'ing them as leaves. Same BUG-595..612 class. Tests:
+  `tests/zer/{await_array_index_autoguard,spawn_arg_array_index_autoguard}.zer`.
+
+FLAG #1 follow-up (a full AST→IR wrapper-by-wrapper audit of the ~20 `_zer_trap`/`_zer_bounds_
+check`/`_zer_shl` AST-region sites vs their IR twins) remains a recommended separate pass — see
+`docs/limitations.md` BRANCH-IMPORT BACKLOG.
+
+---
+
 ## 2026-07-01 — Branch-import Tier 1 (6 holes, faithful copy from cool-johnson branches)
 
 Import of verified fixes from sibling audit branches (`sesjma`, `11ct36`, `a5erj3`,

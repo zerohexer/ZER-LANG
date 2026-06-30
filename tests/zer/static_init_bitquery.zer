@@ -1,0 +1,15 @@
+// Tripwire (T2.1, branch a5erj3 9e47b9c4 part c): bit-query intrinsics
+// @ctz/@clz in a STATIC-LOCAL initializer must emit a valid C static
+// initializer (the conditional-expression form), NOT a statement-expression
+// `({...})` — GCC rejects the latter with "initializer element is not
+// constant". Pre-fix: clean ZER compile, broken C output. Sibling of the
+// BH-18 #11 globals fix; this is the static-local axis (AST->IR drift class).
+u32 probe() {
+    static u32 a = @ctz(16);   // 16 = 0b10000 -> 4 trailing zeros
+    static u32 b = @clz(1);    // clz(1) on u32 -> 31 leading zeros
+    return a + b;              // 4 + 31 = 35
+}
+u32 main() {
+    if (probe() == 35) { return 0; }
+    return 1;
+}

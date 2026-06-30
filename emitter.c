@@ -479,6 +479,21 @@ static void emit_auto_guards(Emitter *e, Node *node) {
         emit_auto_guards(e, node->slice.start);
         emit_auto_guards(e, node->slice.end);
         break;
+    /* Audit-fix (2026-06-30): descend into spawn args and await condition.
+     * Previously NODE_SPAWN and NODE_AWAIT fell through as leaf no-ops, so an
+     * unproven array index inside `spawn worker(arr[i])` or `await arr[i] != 0`
+     * never had its checker-promised auto-guard emitted — the warning printed
+     * "auto-guard inserted" but the IR emitter wrote raw `g_arr[i]` without
+     * the if(i>=N)return; guard. Same BUG-595..612 class — silent OOB on
+     * baremetal, SIGSEGV-rescued on hosted. Pair-fix with the IR gate widening
+     * at emitter.c:11241 / :11380 adding IR_AWAIT and IR_NOP. */
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            emit_auto_guards(e, node->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        emit_auto_guards(e, node->await_stmt.cond);
+        break;
     /* Leaf nodes — no sub-expressions with array indices */
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
@@ -492,8 +507,8 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
     case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
         break;
     }
 }
@@ -8520,13 +8535,30 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             bool is_ctz = (nlen == 3 && memcmp(name, "ctz", 3) == 0);
             bool is_clz = (nlen == 3 && memcmp(name, "clz", 3) == 0);
             if (is_ctz || is_clz) {
-                int t = e->temp_count++;
-                emit(e, "({ __typeof__(");
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, ") _zer_bz%d = (", t);
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "); (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
-                     t, w, (int)nlen, name, suffix, t);
+                /* AUDIT-2026-06-28: when arg has no side effects (static local
+                 * init with a literal is the canonical case), prefer the
+                 * conditional-expression form. Statement expressions are NOT
+                 * valid in static-local initializers in C; the IR-path always
+                 * emitted `({...})` for the zero-guard, so
+                 * `static u32 v = @ctz(16);` cleanly compiled in ZER but failed
+                 * GCC with "initializer element is not constant". The conditional
+                 * form double-evaluates the arg, which is safe because the
+                 * side-effect-free gate excludes calls / assigns / etc. */
+                if (!expr_has_side_effects(node->intrinsic.args[0])) {
+                    emit(e, "(uint32_t)(((");
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, ") == 0) ? %d : __builtin_%.*s%s(", w, (int)nlen, name, suffix);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "))");
+                } else {
+                    int t = e->temp_count++;
+                    emit(e, "({ __typeof__(");
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, ") _zer_bz%d = (", t);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "); (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
+                         t, w, (int)nlen, name, suffix, t);
+                }
             } else {
                 emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -11238,9 +11270,14 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
             IRInst *ins = &bb->insts[ii];
             if (ins->expr) {
                 IROpKind k = ins->op;
+                /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
+                 * AST array indexing re-emitted per-poll) and IR_NOP (carries
+                 * NODE_SPAWN args copied in parent thread). Both were
+                 * silently miscompiling unproven arr[i] — emit_auto_guards
+                 * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
                 if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
                     k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ) {
+                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
                     emit_auto_guards(e, ins->expr);
                 }
             }
@@ -11377,9 +11414,12 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
             IRInst *ins = &bb->insts[ii];
             if (ins->expr) {
                 IROpKind k = ins->op;
+                /* Audit-fix (2026-06-30): paired with the regular-path gate
+                 * widening — IR_AWAIT carries the await condition's array
+                 * indexing re-emitted per-poll; IR_NOP carries spawn args. */
                 if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
                     k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ) {
+                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
                     emit_auto_guards(e, ins->expr);
                 }
             }

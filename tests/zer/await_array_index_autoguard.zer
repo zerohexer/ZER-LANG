@@ -1,0 +1,14 @@
+// Tripwire: NEW-3 (BUG-595..612 class) — await with unproven array index.
+// Compiler should emit "auto-guard inserted" warning AND emit the bounds
+// check. Audit: 2026-06-30 — fixed at emitter.c IR auto-guards gate
+// (added IR_AWAIT) + emit_auto_guards descent into NODE_AWAIT.cond.
+// Without fix: silent OOB read on bare-metal; SIGSEGV on hosted.
+u32[4] g_arr;
+async void waiter(u32 i) { await g_arr[i] != 0; return; }
+u32 main() {
+    g_arr[0] = 1;
+    _zer_async_waiter t;
+    _zer_async_waiter_init(&t, 0);
+    _zer_async_waiter_poll(&t);
+    return 0;
+}

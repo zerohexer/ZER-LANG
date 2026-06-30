@@ -1,0 +1,7 @@
+// BH-18 #8 — spawn data-race scan must follow function-name args
+// EXPECTED: error — spawn target reaches g_counter via funcptr forwarding
+u32 g_counter;
+void do_increment() { g_counter = g_counter + 1; }
+void run_n(*() cb, u32 n) { for (u32 i = 0; i < n; i += 1) { cb(); } }
+void worker() { run_n(do_increment, 500000); }
+u32 main() { spawn worker(); spawn worker(); return 0; }

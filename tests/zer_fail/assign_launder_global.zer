@@ -1,0 +1,14 @@
+// Tripwire: assignment-form call-launder, global-store sink.
+// Audit: 2026-06-30.
+u8 gbuf = 0;
+?*u8 g = null;
+*u8 launder(*u8 q) { return q; }
+
+void stash() {
+    u8 local = 99;
+    *u8 p = &gbuf;
+    p = launder(&local);
+    g = p;
+}
+
+u32 main() { stash(); return 0; }

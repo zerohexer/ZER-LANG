@@ -1,0 +1,5 @@
+// EXPECTED: compile error — conversion intrinsics require a type argument
+u32 main() {
+    usize x = @size();
+    return (u32)x;
+}

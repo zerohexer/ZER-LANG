@@ -1,0 +1,15 @@
+// Tripwire: assignment-form call-launder must propagate is_local_derived
+// to the target. Sibling of var-decl Case D (checker.c:10027/BUG-770).
+// Sink: spawn arg cross-thread UAF.
+// Audit: 2026-06-30 — fixed at checker.c NODE_ASSIGN re-derivation block.
+shared struct Box { u8 b; }
+Box g;
+void worker(*Box bp) { bp.b = 1; }
+*Box launder(*Box q) { return q; }
+
+void main() {
+    Box local_box;
+    *Box p = &g;
+    p = launder(&local_box);
+    spawn worker(p);
+}

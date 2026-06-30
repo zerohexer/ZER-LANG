@@ -4167,6 +4167,29 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        /* Case D parity (BUG-770 sibling for NODE_ASSIGN):
+                         * call-result launder on reassignment — `p = launder(&local);`
+                         * Without this, p is NOT flagged is_local_derived and downstream
+                         * sinks (spawn-arg, global-store, return, keep) see a plain
+                         * pointer and accept what the var-decl Case D (checker.c:10027)
+                         * already rejects. Uses call_has_local_derived_arg, the same
+                         * predicate the existing call-launder sinks use.
+                         *
+                         * Type-gated on type_can_carry_pointer(target) — a SCALAR result
+                         * (e.g. `acc = op(acc, data[i])` returning u32) cannot carry a
+                         * pointer and must not be tainted. Same gating as BUG-762's
+                         * struct-wrap launder. The over-approximation in
+                         * call_has_local_derived_arg (any local-derived ARG taints the
+                         * RESULT) is sound only when the result can hold the ref. */
+                        {
+                            Node *vcheck = node->assign.value;
+                            if (vcheck->kind == NODE_ORELSE) vcheck = vcheck->orelse.expr;
+                            if (vcheck->kind == NODE_CALL &&
+                                type_can_carry_pointer(tsym->type) &&
+                                call_has_local_derived_arg(c, vcheck, 0)) {
+                                tsym->is_local_derived = true;
+                            }
+                        }
                     }
                 }
             }
@@ -7002,7 +7025,7 @@ static Type *check_expr(Checker *c, Node *node) {
          *
          * Sites already enforcing arity (@atomic_*, @offset, @container, the
          * @cpu_* family) are unaffected. */
-        if (node->intrinsic.type_arg != NULL) {
+        {
             int expected = -1;
             const char *iname = NULL;
             int inlen = 0;
@@ -7023,12 +7046,36 @@ static Type *check_expr(Checker *c, Node *node) {
             } else if (nlen == 3 && memcmp(name, "pun", 3) == 0) {
                 expected = 1; iname = "@pun"; inlen = 4;
             }
-            if (expected >= 0 && node->intrinsic.arg_count != expected) {
-                checker_error(c, node->loc.line,
-                    "%.*s expects %d argument%s after type, got %d",
-                    inlen, iname,
-                    expected, (expected == 1 ? "" : "s"),
-                    node->intrinsic.arg_count);
+            if (expected >= 0) {
+                /* Type argument is mandatory for the whole family.
+                 * Pre-fix: `@size()`/`@bitcast()` etc. with no type passed the
+                 * checker (type_arg gate skipped the arity check), then GCC
+                 * errored on the emitted `(usize)()` / similar — mis-attributed
+                 * to a wrong line.
+                 *
+                 * Two parse paths:
+                 *  (a) type keyword (u32/*T/etc.) → type_arg set, args carry values
+                 *  (b) named type as TOK_IDENT for intrinsics NOT in force_type_arg
+                 *      (currently only @size) → type_arg NULL, args[0] is the type ident
+                 *      (see parser.c:931-936 + BUG-316 path). The checker dispatch at
+                 *      ~7039 already handles both for the @size body. */
+                if (node->intrinsic.type_arg == NULL) {
+                    bool size_named_path =
+                        (expected == 0 && node->intrinsic.arg_count == 1 &&
+                         node->intrinsic.args[0] &&
+                         node->intrinsic.args[0]->kind == NODE_IDENT);
+                    if (!size_named_path) {
+                        checker_error(c, node->loc.line,
+                            "%.*s requires a type argument",
+                            inlen, iname);
+                    }
+                } else if (node->intrinsic.arg_count != expected) {
+                    checker_error(c, node->loc.line,
+                        "%.*s expects %d argument%s after type, got %d",
+                        inlen, iname,
+                        expected, (expected == 1 ? "" : "s"),
+                        node->intrinsic.arg_count);
+                }
             }
         }
 
@@ -9351,24 +9398,56 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         /* Check call arguments for global access */
         for (int i = 0; i < node->call.arg_count; i++)
             if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
-        /* Transitive: follow direct function calls into callee body.
-         * This catches helper() accessing non-shared globals from spawned context. */
-        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *csym = scope_lookup(c->global_scope,
-                node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
-            if (csym && csym->is_function && csym->func_node &&
-                csym->func_node->kind == NODE_FUNC_DECL &&
-                csym->func_node->func_decl.body) {
-                /* Depth limit to prevent infinite recursion on recursive call chains.
-                 * Phase A3 fix: raised from 8 to 32. Real call graphs can easily
-                 * exceed 8 levels (handler → validator → parser → helper → ...).
-                 * 32 still prevents pathological infinite recursion while catching
-                 * legitimate transitive data races. */
-                static int _scan_depth = 0;
+        {
+            /* Depth limit shared between the direct-call and funcptr-arg
+             * transitive scans below — single counter is critical because
+             * both descend into bodies and could re-enter each other. */
+            static int _scan_depth = 0;
+            /* Transitive: follow direct function calls into callee body.
+             * This catches helper() accessing non-shared globals from spawned context. */
+            if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+                Symbol *csym = scope_lookup(c->global_scope,
+                    node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
+                if (csym && csym->is_function && csym->func_node &&
+                    csym->func_node->kind == NODE_FUNC_DECL &&
+                    csym->func_node->func_decl.body) {
+                    /* Phase A3 fix: raised from 8 to 32. Real call graphs can easily
+                     * exceed 8 levels (handler → validator → parser → helper → ...). */
+                    if (_scan_depth < 32) {
+                        _scan_depth++;
+                        bool found = scan_unsafe_global_access(c,
+                            csym->func_node->func_decl.body, out_name, out_len);
+                        _scan_depth--;
+                        if (found) return true;
+                    }
+                }
+            }
+            /* BH-18 #8 (2026-06-27): a function NAME passed as a call argument
+             * (`run_n(do_increment, ...)`) is a transitively-callable function
+             * the receiver may invoke through its funcptr param. Follow each
+             * function-name arg into its body so the scan catches non-shared
+             * globals reached via funcptr forwarding the same way it catches
+             * them via direct calls. Without this, the indirect call site
+             * `cb()` inside run_n was a blind spot — confirmed reproducer
+             * `spawn_funcptr_global_race.zer` raced `g_counter`.
+             * Tradeoff: a function-name passed but never invoked (e.g.
+             * register_handler(my_cb) where my_cb is stored, not called) is
+             * scanned too. Sound + the typical embedded use is "pass to be
+             * invoked" — false positives are rare and remediable (use
+             * @atomic_* / shared, the same fix needed if the function WERE
+             * invoked transitively). Argument-precise barrier from BUG-740. */
+            for (int i = 0; i < node->call.arg_count; i++) {
+                Node *a = node->call.args[i];
+                if (!a || a->kind != NODE_IDENT) continue;
+                Symbol *asym = scope_lookup(c->global_scope,
+                    a->ident.name, (uint32_t)a->ident.name_len);
+                if (!asym || !asym->is_function || !asym->func_node ||
+                    asym->func_node->kind != NODE_FUNC_DECL ||
+                    !asym->func_node->func_decl.body) continue;
                 if (_scan_depth < 32) {
                     _scan_depth++;
                     bool found = scan_unsafe_global_access(c,
-                        csym->func_node->func_decl.body, out_name, out_len);
+                        asym->func_node->func_decl.body, out_name, out_len);
                     _scan_depth--;
                     if (found) return true;
                 }
@@ -11026,6 +11105,23 @@ static void check_stmt(Checker *c, Node *node) {
                         Symbol *src = scope_lookup(c->current_scope,
                             sw_root->ident.name, (uint32_t)sw_root->ident.name_len);
                         if (src) propagate_escape_flags(cap, src, cap->type);
+                        /* BH-18 #6 SIBLING (2026-06-30 audit): the if-capture
+                         * fix at checker.c ~10459-10467 closed
+                         * `if (m) |*v| { g = v; }` — the switch-arm form
+                         * `switch (m) { default => |*v| { g = v; } }` has the
+                         * SAME shape (capture binds &local_optional.value) and
+                         * was unfixed. ASan: stack-use-after-return verified.
+                         * Mirror the if-capture rule per capture_lattice.v
+                         * "capture inherits the payload's region". */
+                        if (arm->capture_is_ptr && src) {
+                            bool sw_root_is_global = scope_lookup_local(
+                                c->global_scope,
+                                sw_root->ident.name,
+                                (uint32_t)sw_root->ident.name_len) != NULL;
+                            if (!sw_root_is_global && !src->is_static) {
+                                cap->is_local_derived = true;
+                            }
+                        }
                     }
                 }
 

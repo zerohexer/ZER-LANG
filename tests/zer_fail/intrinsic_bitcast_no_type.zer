@@ -1,0 +1,5 @@
+// EXPECTED: compile error — @bitcast requires a type argument
+u32 main() {
+    u32 x = @bitcast();
+    return x;
+}

@@ -1,0 +1,22 @@
+// Real-impact tripwire for defer-goto-fallthrough fix (2026-06-29):
+// A typical handle-cleanup pattern with `defer pool.free(h); if (err) {goto fail;}`
+// followed by `fail:` at function scope would silently LEAK the pool slot on the
+// success (no-err) fall-through path before the fix. Verifies the defer fires.
+
+struct Item { u32 v; }
+Pool(Item, 4) gp;
+u32 freed_count;
+
+void run(u32 take_err) {
+    Handle(Item) h = gp.alloc() orelse return;
+    defer gp.free(h);
+    if (take_err == 1) { goto fail; }
+    fail:
+}
+
+u32 main() {
+    // Loop 8 times; Pool capacity is 4. Without defer firing on fall-through
+    // (take_err=0), all 4 slots leak by iteration 4 and subsequent allocs fail.
+    for (u32 i = 0; i < 8; i += 1) { run(0); }
+    return 0;
+}

@@ -696,3 +696,6 @@ checker.c:if (!st || st->kind != TYPE_STRUCT) return false;
 ir_lower.c:else if (eff->kind == TYPE_POINTER) {
 ir_lower.c:if (eff->kind == TYPE_STRUCT &&
 ir_lower.c:if (inner && inner->kind == TYPE_STRUCT &&
+zercheck_ir.c:(pt_eff->kind != TYPE_POINTER &&
+zercheck_ir.c:pt_eff->kind != TYPE_HANDLE &&
+zercheck_ir.c:pt_eff->kind != TYPE_OPAQUE)) {

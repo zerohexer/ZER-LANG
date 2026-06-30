@@ -5,6 +5,47 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — Branch-import Tier 1 (6 holes, faithful copy from cool-johnson branches)
+
+Import of verified fixes from sibling audit branches (`sesjma`, `11ct36`, `a5erj3`,
+`ongou2`), applied as clean `git apply` (not a merge). Full ordered backlog + branch/commit
+refs in `docs/limitations.md` "BRANCH-IMPORT BACKLOG". `make check` GREEN: fuzz 200/0, all 8
+matrices, ZER 866/0 (+9 tripwires), modules 139/0.
+
+- **defer + forward-goto fall-through dropped the defer** (`ir_lower.c`, from sesjma
+  `31cfe9da`). 🟡 silent Pool-slot leak. `NODE_GOTO` zeroed `ctx->defer_count` after the eager
+  fire, so `NODE_LABEL`'s guard-install gate saw 0 and skipped → fall-through emitted no fire;
+  the `live_fallthrough` test also excluded empty-but-reachable join blocks. Fix: `IRLabelMap.
+  goto_fired_count` (MAX across gotos), `NODE_LABEL` restores `defer_count = max(current,
+  goto_fired_count)` on a live fallthrough; relax `live_fallthrough` to `!ir_block_is_terminated`.
+  Completes the defer-goto family (2026-06-20 covered defer inside the if-body). Tests:
+  `tests/zer/defer_goto_{fallthrough_zero_fire,handle_leak_regression}.zer`.
+- **BH-18 #8 — spawn data-race scan blind to funcptr forwarding** (`checker.c`, from 11ct36
+  `ecd6f65d`). 🔴 race. `scan_unsafe_global_access` now descends `NODE_IDENT` args resolving to
+  function symbols (shared `_scan_depth` cap 32). Test: `tests/zer_fail/spawn_funcptr_global_race.zer`.
+- **BH-18 #14 — `@size`/`@bitcast` with no type arg → invalid C** (`checker.c`, 11ct36
+  `ecd6f65d`). 🟡 invalid C. Arity block restructured: family ID unconditional, "requires a
+  type arg" split from "expects N args after type"; `@size(NamedType)` preserved via
+  `size_named_path`. Tests: `tests/zer_fail/intrinsic_{no_type_arg,bitcast_no_type}.zer`.
+- **typedef-wrapped pointer destructor blinds FuncSummary → silent UAF** (`zercheck_ir.c`, from
+  a5erj3 `c2eb1652`). 🔴 UAF. FuncSummary gated param-FREED on the syntactic `TypeNode` kind;
+  a `typedef *T TPtr` param is `TYNODE_NAMED` → dropped. Fix: gate on the resolved
+  `type_unwrap_distinct(func->locals[plocal].type)` (`TYPE_POINTER/HANDLE/OPAQUE`). Distinct-
+  unwrap class on the TypeNode axis (the `audit_type_dispatch.sh` gate is blind to TypeNode
+  reads — tracked as FLAG #2). +3 `type_dispatch_baseline.txt` entries. Test:
+  `tests/zer_fail/typedef_ptr_funcsummary_uaf.zer`.
+- **Assignment-form call-launder defeats escape check (3 sinks)** (`checker.c`, from ongou2
+  `bbbdf95c`). 🔴 UAF. `p = launder(&local); spawn worker(p);` compiled clean — the NODE_ASSIGN
+  re-derivation lacked the var-decl handler's "Case D" (BUG-770). Fix: same arm + predicate
+  `call_has_local_derived_arg`, type-gated on `type_can_carry_pointer`. Tests:
+  `tests/zer_fail/assign_launder_{global,slice,spawn}.zer`.
+- **Switch-default capture escapes ptr-to-local to a global (BH-18 #6 sibling)** (`checker.c`,
+  ongou2 `bbbdf95c`). 🔴 UAF. Switch-arm `|*v|` capture didn't inherit the matched value's
+  region. Fix: ptr-capture + function-local switch root → mark `is_local_derived` (the BH-18 #6
+  rule). Certified by `capture_lattice.v`. Test: `tests/zer_fail/switch_default_capture_escape.zer`.
+
+---
+
 ## 2026-06-27 — Level B guarded refinement IMPLEMENTED (MAYBE_FREED precision, zercheck_ir.c)
 
 Implements `proofs/operational/lambda_zer_handle/handle_flow_lattice.v` Level B

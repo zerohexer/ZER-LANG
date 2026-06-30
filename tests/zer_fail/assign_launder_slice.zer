@@ -1,0 +1,14 @@
+// Tripwire: assignment-form slice launder, global-store sink.
+// Slice version of the call-launder hole; verified by ASan
+// (stack-use-after-return). Audit: 2026-06-30.
+[*]u8 g;
+[*]u8 trim([*]u8 s) { return s[0..1]; }
+
+void leak() {
+    u8[16] local;
+    [*]u8 p = local[0..];
+    p = trim(local[0..]);
+    g = p;
+}
+
+u32 main() { leak(); return 0; }

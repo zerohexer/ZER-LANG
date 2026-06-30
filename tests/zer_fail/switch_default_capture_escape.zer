@@ -1,0 +1,17 @@
+// Tripwire: BH-18 #6 SIBLING — `switch (m) { default => |*v| { g = v; } }`
+// has the same shape as the if-capture form (capture binds &local.value).
+// The if-capture was fixed (BH-18 #6 / checker.c ~10459); this switch-arm
+// sibling was unfixed and accepted a stack-use-after-return.
+// Audit: 2026-06-30 — fixed at checker.c switch-arm capture handler.
+?*u32 g = null;
+void stash() {
+    ?u32 m = 12345;
+    switch (m) {
+        default => |*v| { g = v; }
+    }
+}
+u32 main() {
+    stash();
+    if (g) |gv| { return *gv; }
+    return 0;
+}

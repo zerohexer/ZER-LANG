@@ -4865,14 +4865,24 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
 
                 for (int i = 0; i < pc; i++) {
                     ParamDecl *p = &fn->func_decl.params[i];
-                    TypeNode *tnode = p->type;
-                    if (!tnode || (tnode->kind != TYNODE_HANDLE &&
-                        tnode->kind != TYNODE_POINTER)) {
+                    int plocal = ir_find_local_exact_first(func, p->name, (uint32_t)p->name_len);
+                    if (plocal < 0) { all_return_blocks_freed[i] = false; continue; }
+                    /* Use the RESOLVED Type from IR local rather than the syntactic
+                     * TypeNode: `typedef *T TPtr; void destroy(TPtr p)` has
+                     * tnode->kind == TYNODE_NAMED, but the resolved type is a
+                     * pointer (or a TYPE_DISTINCT wrapping a pointer). Gating on
+                     * TYNODE_POINTER/TYNODE_HANDLE silently skipped any typedef'd
+                     * destructor parameter — frees_param never set, so caller's
+                     * UAF/double-free both passed silently. */
+                    Type *pt_eff = func->locals[plocal].type
+                        ? type_unwrap_distinct(func->locals[plocal].type) : NULL;
+                    if (!pt_eff ||
+                        (pt_eff->kind != TYPE_POINTER &&
+                         pt_eff->kind != TYPE_HANDLE &&
+                         pt_eff->kind != TYPE_OPAQUE)) {
                         all_return_blocks_freed[i] = false;
                         continue;
                     }
-                    int plocal = ir_find_local_exact_first(func, p->name, (uint32_t)p->name_len);
-                    if (plocal < 0) { all_return_blocks_freed[i] = false; continue; }
                     IRHandleInfo *h = ir_find_handle(ps, plocal);
                     if (!h) {
                         all_return_blocks_freed[i] = false;

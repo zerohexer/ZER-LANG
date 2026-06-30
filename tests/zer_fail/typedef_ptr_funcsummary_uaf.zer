@@ -1,0 +1,17 @@
+// Regression: typedef-wrapped pointer in destructor param must still propagate
+// frees_param[0] so caller's use-after-free is caught.
+// Bug: zercheck_ir.c FuncSummary builder gated on TYNODE_POINTER/TYNODE_HANDLE,
+// missing TYNODE_NAMED (typedef). Silent UAF + silent double-free before fix.
+
+struct T { u32 v; }
+Slab(T) sl;
+typedef *T TPtr;
+
+void destroy(TPtr p) { sl.free_ptr(p); }
+
+u32 main() {
+    *T p = sl.alloc_ptr() orelse return;
+    p.v = 88;
+    destroy(p);
+    return p.v;   // EXPECTED ERROR: use after free (was silent UAF reading freed memory)
+}

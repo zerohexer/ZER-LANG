@@ -34,6 +34,16 @@ typedef struct {
      * label. The goto sets it to 1 after firing eagerly; the label's lazy
      * return-fire emits `if (!flag) { body }`. -1 = not yet allocated. */
     int guard_flag_local;
+    /* NEW (2026-06-29): defer count fired by any goto edge to this label.
+     * BUG sibling of "defer fires twice" (2026-06-17 audit): the FORWARD-goto
+     * path zeroed ctx->defer_count after the eager fire, so when the LABEL
+     * handler ran with a LIVE fall-through, defer_count was 0 → no guard
+     * installed → fall-through path silently dropped the defer (0 fires
+     * instead of 1; cleanup/locks/handle-free leak). Recorded here by
+     * NODE_GOTO; the LABEL handler restores ctx->defer_count on a live
+     * fall-through and installs the guard so the lazy return-fire runs on
+     * fall-through (flag=0) and is skipped on the goto path (flag=1). */
+    int goto_fired_count;
 } IRLabelMap;
 
 typedef struct {
@@ -161,6 +171,7 @@ static int find_label_block(LowerCtx *ctx, const char *name, uint32_t len) {
     ctx->labels[ctx->label_count].block_id = bid;
     ctx->labels[ctx->label_count].goto_fired = 0;
     ctx->labels[ctx->label_count].guard_flag_local = -1;
+    ctx->labels[ctx->label_count].goto_fired_count = 0;
     ctx->label_count++;
     return bid;
 }
@@ -180,6 +191,29 @@ static int label_goto_fired(LowerCtx *ctx, const char *name, uint32_t len) {
         if (ctx->labels[i].len == len &&
             memcmp(ctx->labels[i].name, name, len) == 0)
             return ctx->labels[i].goto_fired;
+    return 0;
+}
+/* Record / read the defer count fired by a goto edge to this label (see
+ * IRLabelMap.goto_fired_count). Multiple gotos may target the same label
+ * with different pre-fire counts (e.g. a goto from inside a nested defer
+ * scope); take the MAX so the fall-through path restores enough to cover
+ * any goto path's fired defers. The runtime guard flag prevents double-fire
+ * on the goto path. */
+static void record_label_goto_fired_count(LowerCtx *ctx, const char *name,
+                                          uint32_t len, int count) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0) {
+            if (count > ctx->labels[i].goto_fired_count)
+                ctx->labels[i].goto_fired_count = count;
+            return;
+        }
+}
+static int get_label_goto_fired_count(LowerCtx *ctx, const char *name, uint32_t len) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0)
+            return ctx->labels[i].goto_fired_count;
     return 0;
 }
 
@@ -3214,6 +3248,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * (the PUSH emission re-appends the body), so the next iteration
          * has them active again — matches loop-iteration defer semantics. */
         bool goto_had_defers = ctx->defer_count > 0;
+        int goto_fired_count = ctx->defer_count;  /* save BEFORE the pop */
         emit_defer_fire_scoped(ctx, 0, true, node->loc.line);
         ctx->defer_count = 0;
         if (ctx->current_stmt_shared_root) {
@@ -3234,6 +3269,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (goto_had_defers) {
             mark_label_goto_fired(ctx, node->goto_stmt.label,
                                   (uint32_t)node->goto_stmt.label_len);
+            /* Remember the pre-fire count so the LABEL handler can restore
+             * defer_count on a live fall-through path (and thus install the
+             * guard). Without this, the fall-through silently dropped the
+             * defer because defer_count was already 0 by the time the LABEL
+             * handler checked. */
+            record_label_goto_fired_count(ctx, node->goto_stmt.label,
+                (uint32_t)node->goto_stmt.label_len, goto_fired_count);
             int gflag = get_label_guard_flag(ctx, node->goto_stmt.label,
                             (uint32_t)node->goto_stmt.label_len, node->loc.line);
             if (gflag >= 0) {
@@ -3277,14 +3319,35 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool guarded = false;
         if (fired_target) {
             IRBlock *pb = &ctx->func->blocks[ctx->current_block];
-            bool live_fallthrough =
-                (pb->inst_count > 0) && !ir_block_is_terminated(pb);
-            if (live_fallthrough && ctx->defer_count > 0) {
-                ctx->active_guard_flag = get_label_guard_flag(ctx,
-                    node->label_stmt.name, (uint32_t)node->label_stmt.name_len,
-                    node->loc.line);
-                ctx->active_guard_below = ctx->defer_count;
-                guarded = true;
+            /* 2026-06-29: an EMPTY but unterminated current block is also a
+             * live fall-through — e.g. an `if`-handler's bb_join with no
+             * else and only the goto-side then-body. The previous
+             * `inst_count > 0` guard misclassified that as "not live" and
+             * dropped the defer on the fall-through path. ensure_terminated
+             * below adds the GOTO to the label block, making the path
+             * concretely live. */
+            bool live_fallthrough = !ir_block_is_terminated(pb);
+            if (live_fallthrough) {
+                /* 2026-06-29 fix: if the fall-through path still has defers
+                 * registered AFTER what any goto fired, those defers (above
+                 * goto_fired_count) ALSO need to fire on this path — the
+                 * guard only suppresses re-firing of the goto-fired ones.
+                 * So restore defer_count to max(current, goto_fired_count):
+                 * the goto-fired defers will fire under `if (!flag) {...}`,
+                 * the rest unconditionally. The defer_bodies[] backing array
+                 * is never cleared, so the snapshot mechanism still has them. */
+                int restore_count = get_label_goto_fired_count(ctx,
+                    node->label_stmt.name, (uint32_t)node->label_stmt.name_len);
+                if (restore_count > ctx->defer_count)
+                    ctx->defer_count = restore_count;
+                if (ctx->defer_count > 0) {
+                    ctx->active_guard_flag = get_label_guard_flag(ctx,
+                        node->label_stmt.name, (uint32_t)node->label_stmt.name_len,
+                        node->loc.line);
+                    ctx->active_guard_below = restore_count > 0
+                        ? restore_count : ctx->defer_count;
+                    guarded = true;
+                }
             }
         }
         /* End current block, start the label's block */

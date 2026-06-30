@@ -1,0 +1,12 @@
+// bh18_1b positive (no over-rejection): taking &a and reading through the alias
+// is fine when `a` is NOT moved — no false leak from registering the move local,
+// no false use-after-move.
+move struct Tok { u32 kind; }
+u32 main() {
+    Tok a;
+    a.kind = 7;
+    *Tok p = &a;
+    u32 x = p.kind;
+    if (x == 7) { return 0; }
+    return 1;
+}

@@ -73,6 +73,14 @@ typedef struct {
     int freed_all_paths;
     int alloc_id;          /* groups aliases — same alloc = same id */
     bool escaped;          /* returned, stored to global, etc. */
+    /* bh18_1b (2026-07-01): this handle (or its alias group) tracks a
+     * move-struct STACK LOCAL registered so `*T p = &a` can alias it (and the
+     * later `T b = a` transfer can propagate TRANSFERRED to p). It is NOT an
+     * allocation — the leak check MUST skip it (the move local itself is already
+     * skipped by ir_should_track_move, but a pointer ALIAS `p` is not a move
+     * type, so without this flag it would be flagged as a false leak). Inherited
+     * by aliases through ir_snapshot_alias / ir_apply_alias. */
+    bool is_move_local;
     /* Phase D1: allocation color — tracks where memory came from.
      * ZC_COLOR_POOL   — Pool/Slab, needs individual free or defer.
      * ZC_COLOR_ARENA  — Arena, freed by arena.reset(). Skip leak check.
@@ -630,6 +638,7 @@ typedef struct {
     int source_color;
     bool escaped;
     bool is_thread_handle;
+    bool is_move_local;   /* bh18_1b: move-local handle/alias — leak-skip */
     const char *pool_name;
     uint32_t pool_name_len;
     IRHandleState state;  /* snapshot of source state, available if caller wants to inherit */
@@ -642,6 +651,7 @@ static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
     snap->source_color = src->source_color;
     snap->escaped = src->escaped;
     snap->is_thread_handle = src->is_thread_handle;
+    snap->is_move_local = src->is_move_local;
     snap->pool_name = src->pool_name;
     snap->pool_name_len = src->pool_name_len;
     snap->state = src->state;
@@ -657,6 +667,7 @@ static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
     dst->source_color = snap->source_color;
     dst->escaped = snap->escaped;
     dst->is_thread_handle = snap->is_thread_handle;
+    dst->is_move_local = snap->is_move_local;
     dst->pool_name = snap->pool_name;
     dst->pool_name_len = snap->pool_name_len;
 }
@@ -2477,6 +2488,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (src_h) {
                     src_h->state = IR_HS_TRANSFERRED;
                     src_h->free_line = inst->source_line;
+                    /* bh18_1b (2026-07-01): propagate TRANSFERRED to pointer
+                     * aliases of the moved-from local — `*T p = &a;` taken
+                     * before `T b = a;` shares a's alloc_id, so a later use
+                     * through p is use-after-move. Mirrors the free path. */
+                    ir_propagate_alias_state(ps, src_h, IR_HS_TRANSFERRED,
+                                             inst->source_line);
                 }
                 IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                 if (dst_h) {
@@ -3143,6 +3160,27 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         target->ident.name, (uint32_t)target->ident.name_len);
                     if (base_local >= 0) {
                         IRHandleInfo *base_h = ir_find_handle(ps, base_local);
+                        /* bh18_1b (2026-07-01): a move-struct local isn't a
+                         * tracked handle until it's transferred, so `*T p = &a`
+                         * taken BEFORE `T b = a` had nothing to alias and the
+                         * transfer never reached p (use-after-move via the alias
+                         * slipped). Register the move base ALIVE now (flagged
+                         * is_move_local so the leak check skips it AND its alias)
+                         * so the alias link forms and the transfer propagates
+                         * TRANSFERRED to p. */
+                        if (base_local < func->local_count &&
+                            ir_should_track_move(func->locals[base_local].type)) {
+                            if (!base_h) base_h = ir_add_handle(ps, base_local);
+                            if (base_h) {
+                                base_h->is_move_local = true;
+                                if (base_h->state == IR_HS_UNKNOWN) {
+                                    base_h->state = IR_HS_ALIVE;
+                                    base_h->alloc_line = inst->source_line;
+                                }
+                                if (base_h->alloc_id == 0)
+                                    base_h->alloc_id = _ir_next_alloc_id++;
+                            }
+                        }
                         if (base_h && base_h->alloc_id != 0) {
                             IRAliasSnapshot snap;
                             ir_snapshot_alias(&snap, base_h);
@@ -5406,6 +5444,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (h->escaped) continue;
             if (h->source_color == ZC_COLOR_ARENA) continue;
+            /* bh18_1b: move-local handle and its pointer aliases are not
+             * allocations — skip (the move local itself is also caught by the
+             * ir_should_track_move skip below; this also covers the `*T p = &a`
+             * alias whose own type is a pointer, not a move struct). */
+            if (h->is_move_local) continue;
             if (h->local_id >= 0 && h->local_id < func->local_count) {
                 IRLocal *loc = &func->locals[h->local_id];
                 Type *lt = loc->type;

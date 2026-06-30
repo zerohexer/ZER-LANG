@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — BH-18 #1b: use-after-move via a pre-existing pointer alias, zercheck_ir.c
+
+🔴 silent UAF. Confirmed LIVE against current main (returned the stale value), now rejected.
+`move struct Tok; Tok a; a.kind=11; *Tok p=&a; Tok b=a; return p.kind;` compiled clean and read
+the moved-from storage — the `Tok b = a;` transfer marked `a` TRANSFERRED but did NOT propagate
+to the pre-existing pointer alias `p = &a`.
+
+**Root cause (two parts):** (1) a move-struct STACK LOCAL isn't registered as a tracked handle
+until it is transferred, so `*T p = &a` taken BEFORE the move had no handle to alias — the
+interior-pointer aliasing (`base_h && alloc_id != 0`) found nothing, so `p` never shared `a`'s
+alloc_id. (2) The transfer never called `ir_propagate_alias_state` (the free path does).
+
+**Fix:** (a) when `&a` is taken and `a` is a move struct, register it ALIVE with a fresh alloc_id
+so the alias link forms; (b) at the IR_COPY move-transfer, propagate TRANSFERRED to the alloc_id
+group (mirrors the free path). To avoid a FALSE LEAK from registering the move local (the local
+itself is leak-skipped by `ir_should_track_move`, but its pointer alias `p` is a `*T`, not a move
+type, so it would be flagged), added an `is_move_local` flag on `IRHandleInfo` (+ snapshot/apply
+copy) that the leak check skips — covers both the local and its aliases. PURE TIGHTENING (the only
+new rejection is use-after-move-via-alias; the flag prevents the false leak). Tests:
+`tests/zer_fail/move_alias_stale_read.zer` (negative), `tests/zer/move_alias_ok.zer` (positive —
+alias-without-move compiles + runs). `make check` GREEN.
+
+---
+
 ## 2026-07-01 — AU-1 + AU-2: deferred use-after-free / use-after-reset, zercheck_ir.c
 
 🔴 silent UAF. Both confirmed LIVE against current main, both PURE TIGHTENING. `make check` GREEN.

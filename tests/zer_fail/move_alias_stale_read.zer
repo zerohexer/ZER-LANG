@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// bh18_1b: use-after-move via a pre-existing pointer alias. `*Tok p = &a` then
+// `Tok b = a` (move transfer) — reading `p.kind` reads the moved-from storage.
+// The transfer now propagates TRANSFERRED to the alias p.
+move struct Tok { u32 kind; }
+u32 main() {
+    Tok a;
+    a.kind = 11;
+    *Tok p = &a;
+    Tok b = a;
+    return p.kind;
+}

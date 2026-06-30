@@ -186,11 +186,10 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 - ✅ **AU-1 / AU-2 / AU-3 / AU-4 — FIXED 2026-07-01** (see BUGS-FIXED.md): defer LIFO use-after-free;
   deferred `arena.reset()`; nested struct-init escape; direct-assign struct-init escape. All were
   confirmed LIVE by triage, all now reject.
-- 🔴 **`tests/zer_gaps/bh18_1b_move_alias_stale_read.zer`** (move-struct alias stale read, SOUNDNESS)
-  — confirmed LIVE. NO fix yet. `move struct Tok; Tok a; *Tok p=&a; Tok b=a; return p.kind;` — the
-  transfer of `a` doesn't propagate TRANSFERRED to the pre-existing pointer alias `p`. Needs
-  alias-propagation-on-move (mark `&a`-derived pointers transferred when `a` is moved) — a real
-  subsystem, harder than the AU fixes.
+- ✅ **bh18_1b — FIXED 2026-07-01** (see BUGS-FIXED.md): move-struct use-after-move via a
+  pre-existing pointer alias. Register the move local when `&a` is taken (flagged `is_move_local`
+  so the leak check skips it + its alias) + propagate TRANSFERRED to the alloc_id group at the
+  transfer. Tests `tests/zer_fail/move_alias_stale_read.zer` + `tests/zer/move_alias_ok.zer`.
 - 🟡 **`tests/zer_gaps/bh18_12_defer_goto_parametric.zer`** (miscompile) — confirmed LIVE (defer
   fires N× on a same-scope backward goto; value=3, want 1). NO fix yet. Backward-goto to a
   same-scope label should NOT fire the function-scope defer (it isn't exiting the scope) — opposite

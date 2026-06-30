@@ -171,9 +171,21 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 
 ### THE 3 FLAGS (carry forward even after the fixes land)
 
-- 🚩 **FLAG #1 — AST→IR drift class is live (T2.1 + T2.2).** Two independent branches hit the
-  drift class in one week; the AST→IR emission-diff audit isn't being run and the auto-guard
-  gate lists are a recurring weak point. Run the grep after T2 and consider a `make check` gate.
+- ✅ **FLAG #1 — AUDITED CLEAN (2026-07-01), no remaining drift.** Full AST→IR emission-diff
+  audit run after T2: (1) WRAPPER-TYPE coverage — every AST-region (<4000) safety trap
+  (`division by zero`, `signed division overflow`, `@inttoptr` range/align, `@ptrcast`/`@pun`
+  mismatch, `slice start>end`/`end>len`, `type mismatch in cast`, `_zer_shl/shr`,
+  `_zer_bounds_check`, `_zer_probe`) has an IR-path twin (code inspection); (2) ARRAY-INDEX
+  CONTEXT coverage — read/branch/while/index-write/field-write/nested-field-index with an
+  UNPROVEN (param) index are ALL auto-guarded (6 behavioral tests, no segv); (3) SHIFT contexts
+  — binary `<<`, compound `<<=`, array-element `a[0]<<=` all emit `_zer_shl` (over-width →
+  defined 0). STRUCTURAL REASON it's robust: 3AC lowering decomposes every access into its own
+  gated instruction (IR_ASSIGN/IR_INDEX_READ/…), so the surrounding context can't drop the
+  guard — which is exactly why `await`/`spawn` (whose exprs are NOT pre-decomposed, carried on
+  IR_AWAIT/IR_NOP) were the ONLY drift, closed by T2.2. No automated `make check` gate added: a
+  simple grep can't catch the gate-list-completeness risk (the real failure mode), and the
+  manual protocol in compiler-internals.md "AST→IR emission diff audit" remains the tool. The
+  two T2 holes were the live instances; the class is now closed.
 - ✅ **FLAG #2 — RESOLVED (2026-07-01).** `tools/audit_type_dispatch.sh` now ALSO scans the
   syntactic `TypeNode` axis (`->kind == TYNODE_` / `!= TYNODE_`); the 12 legitimate existing
   sites are baselined and a NEW TYNODE dispatch trips the gate (validated by inject-and-revert).

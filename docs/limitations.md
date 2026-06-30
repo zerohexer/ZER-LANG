@@ -5,6 +5,176 @@ Entries removed once fixed.
 
 ---
 
+## IN-PROGRESS — BRANCH-IMPORT BACKLOG (2026-07-01) — 9 fixes / 13 holes from 6 cool-johnson branches
+
+**What this is.** A review of six sibling bug-fix branches (`claude/cool-johnson-{sesjma,
+a5erj3, 11ct36, anb3cw, anqp95, ongou2}`) produced a prioritized backlog of fixes that are
+NOT yet in main. The code is ALREADY WRITTEN on those branches — this is a COPY-the-fix
+(re-derive onto current main), **NOT a merge/pull** (the branches pre-date main's recent
+walker rewrites and would conflict/revert them). This entry is the full handoff so a fresh
+session can execute it with zero prior context. Each fix's source commit is named; inspect it
+with `git show <sha> -- <file>` (fetch the branch first: `git fetch origin
+'refs/heads/claude/cool-johnson-<name>:refs/remotes/origin/claude/cool-johnson-<name>'`).
+Verify each tier with the Docker pattern (CLAUDE.md "Ad-hoc Docker verify"). Remove a row's
+line + delete this whole entry once all tiers land + `make check` GREEN.
+
+**Already in main — DO NOT re-take:** anb3cw `b6773a3d` (BUG-770/771) = main batch 7
+`28a7455c`; anqp95 `e09da736` 4 fixes (slice `.ptr` volatile-strip, `@truncate(NonInt)`,
+`_zer_trap` x86 sentinel, `@cpu_*` unknown-arch) = main batch 3 `9a94dad4`. **Ignore binary
+regens** (`49f77bba`, `87d2e360`, `7a8feae1` — rebuilt test ELFs, 0 source lines).
+
+**No theorem/oracle bugs anywhere** — every fix is checker/IR/emitter coverage; O2 is
+*certified by* `capture_lattice.v`. Counting each walker site, 13 distinct holes → 9
+root-cause fixes. All are PURE TIGHTENING (accept-unsafe → reject, or miscompile → correct);
+none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch a relaxation.
+
+### TIER 1 — clean, no structural conflict with main. Do FIRST. (6 holes)
+
+- **[T1.1] sesjma `31cfe9da` — defer + forward-goto fall-through silently drops the defer.**
+  🟡 silent Pool-slot LEAK every call. File: `ir_lower.c`. CAUSE: `NODE_GOTO` eagerly fires
+  the defer and zeroes `ctx->defer_count`; `NODE_LABEL`'s guard-install gate
+  (`live_fallthrough && defer_count>0`) then sees 0 and skips → fall-through emits no fire;
+  AND the `live_fallthrough` check `(inst_count>0) && !is_terminated` excludes empty-but-
+  reachable join blocks (a no-else `if`'s `bb_join`). FIX: add `goto_fired_count` to
+  `IRLabelMap`; `NODE_GOTO` records the pre-fire count on the target label (MAX across gotos);
+  `NODE_LABEL` restores `ctx->defer_count = max(current, goto_fired_count)` on a live
+  fallthrough; fix the `live_fallthrough` test to include empty reachable join blocks. Sibling
+  of the 2026-06-20 defer-inside-if fix (this completes the family: function-scope defer
+  outside any if-body). Copy the branch's tripwire test. CLASS: control-flow lowering /
+  missing-site.
+
+- **[T1.2] 11ct36 `ecd6f65d` — BH-18 #8: spawn data-race scan blind to funcptr forwarding.**
+  🔴 data race. File: `checker.c`, `scan_unsafe_global_access` NODE_CALL handler. CAUSE:
+  `worker(){ run_n(do_increment, n); }` + `spawn worker()` raced a global via the indirect
+  call `cb()` inside `run_n`; the scan descended the direct callee but not funcptr args. FIX:
+  follow every `NODE_IDENT` argument that resolves to a function symbol, descending into its
+  body the same way as the direct callee; single shared `_scan_depth` counter (cap 32).
+  Tripwire `tests/zer_fail/spawn_funcptr_global_race.zer`. CLASS: form-coverage / missing-site.
+
+- **[T1.3] 11ct36 `ecd6f65d` — BH-18 #14: `@size()`/`@bitcast()` with no type arg → invalid C.**
+  🟡 invalid C. File: `checker.c`. CAUSE: the arity `type_arg` gate let the zero-type case
+  through. FIX: restructure the arity block — make family identification unconditional, then
+  SPLIT "requires a type argument" from "expects N args after type"; preserve the
+  `@size(NamedType)` parse path (BUG-316) via `size_named_path`. Tripwires
+  `tests/zer_fail/intrinsic_{no_type_arg,bitcast_no_type}.zer`. CLASS: arity / missing-site.
+
+- **[T1.4] a5erj3 `c2eb1652` — typedef-wrapped pointer destructor blinds FuncSummary → silent
+  UAF + double-free.** 🔴 UAF. File: `zercheck_ir.c`, FuncSummary builder. CAUSE: gated
+  param-FREED observation on the SYNTACTIC `TypeNode` kind (`tnode->kind == TYNODE_HANDLE ||
+  TYNODE_POINTER`); a `typedef *T TPtr` param is `TYNODE_NAMED`, so the gate silently dropped
+  it → `frees_param[i]` never set. Distinct-unwrap class (BUG-409/GAP-F) on the TypeNode axis.
+  FIX: gate on the IR local's RESOLVED `Type *` via
+  `type_unwrap_distinct(func->locals[plocal].type)` and check `TYPE_POINTER/TYPE_HANDLE/
+  TYPE_OPAQUE` — TYNODE form irrelevant. Mirror of the apply-side at `zercheck_ir.c:3974-3985`.
+  Add the branch's 3 `tools/type_dispatch_baseline.txt` entries for the `pt_eff->kind` reads.
+  Tripwire `tests/zer_fail/typedef_ptr_funcsummary_uaf.zer`. CLASS: distinct-unwrap / missing-
+  site. 🚩 FLAG #2 (see below).
+
+- **[T1.5] ongou2 `bbbdf95c` (hole 1) — assignment-form call-launder defeats escape check (3
+  sinks).** 🔴 UAF / dangling-global. File: `checker.c` ~4170 (the NODE_ASSIGN re-derivation
+  block). CAUSE: `*Box p = &g; p = launder(&local_box); spawn worker(p);` compiled clean — the
+  assignment path was missing the parallel of "Case D" (BUG-770) that the var-decl handler has
+  at `checker.c:10027`. FIX: add the same arm to the assignment path, predicate
+  `call_has_local_derived_arg` (the one 4 existing sinks use), type-gated on
+  `type_can_carry_pointer` so scalar reductions (`acc = op(acc, data[i])`) aren't false-
+  positived. Closes spawn / global-store / return sinks for the assignment-launder shape
+  (pointer + slice). Tripwires `tests/zer_fail/assign_launder_{global,slice,spawn}.zer`. CLASS:
+  per-sink escape patchwork / missing-sink.
+
+- **[T1.6] ongou2 `bbbdf95c` (hole 2) — switch-default capture escapes ptr-to-local to a
+  global (BH-18 #6 SIBLING).** 🔴 UAF. File: `checker.c`, switch-arm capture handler (sibling
+  of BH-18 #6 at `checker.c ~10459`). CAUSE: `switch(m){ default => |*v| { g = v; } }`
+  accepted while the `if |*v|` sibling was rejected; the switch-arm capture-desugar didn't
+  inherit the matched value's region. FIX: when the capture is a pointer (`|*v|`) AND the
+  switch root resolves to a function-local, mark the capture `is_local_derived` (same rule as
+  BH-18 #6). CERTIFIED by `capture_lattice.v` "capture inherits the payload's region".
+  Tripwire `tests/zer_fail/switch_default_capture_escape.zer`. CLASS: per-sink capture
+  patchwork / missing-sink.
+
+### TIER 2 — AST→IR DRIFT pair. Take, THEN re-run the drift audit grep. (2 holes)
+
+- **[T2.1] a5erj3 `9e47b9c4` (part c) — `static u32 v = @ctz(16);` emits invalid C.** 🟡
+  invalid C. File: `emitter.c`, `@ctz`/`@clz` IR emitter. CAUSE: the IR path ALWAYS emitted
+  the statement-expression `({...})` zero-guard wrapper; the AST path already had a conditional
+  form. GCC rejects a stmt-expr in a static-local initializer ("initializer element is not
+  constant"). FIX: `@ctz`/`@clz` IR emitter uses the conditional form when the arg has no side
+  effects (safe to double-evaluate); keep the stmt-expr for side-effecting args.
+
+- **[T2.2] ongou2 `bbbdf95c` (hole 3) — IR auto-guards gate missing `IR_AWAIT` and `IR_NOP`.**
+  🔴 silent corruption (dropped bounds guard). File: `emitter.c`. CAUSE: `await arr[i]` /
+  `spawn worker(arr[i])` with unproven `i` PRINTED "auto-guard inserted" but emitted RAW
+  unchecked access (baremetal: corruption; hosted: SIGSEGV-rescued). FIX (two pairs): (a)
+  `emitter.c:11241` and `:11380` — add `|| k == IR_AWAIT || k == IR_NOP` to BOTH auto-guards
+  gate lists (regular IR + async paths); (b) `emitter.c:406` (`emit_auto_guards`) — replace
+  the NODE_SPAWN/NODE_AWAIT fall-through-as-leaf with descent into `spawn_stmt.args[]` and
+  `await_stmt.cond` (both were silently no-op'd as leaves). Tripwires (POSITIVE)
+  `tests/zer/{await_array_index_autoguard,spawn_arg_array_index_autoguard}.zer`. The commit
+  itself calls this "the same shape as BUG-595..612 (audit gap recurrence)."
+
+  **AFTER T2: run the AST→IR emission diff audit** (CLAUDE.md "AST→IR emission diff audit"):
+  `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c` and confirm
+  every AST-region (line < 4000) safety wrapper has an IR-path equivalent. Two drift recurrences
+  in one week (T2.1 + T2.2) ⇒ the gate lists are a recurring weak point — sweep for siblings.
+
+### TIER 3 — OVERLAPS main's recent walker rewrites. Do LAST, RE-DERIVE (do not copy). (5 holes, 1 class)
+
+- **[T3] a5erj3 `9e47b9c4` (a,b) + `ef7fb239` + `5001940b` — field-projection blindness in 5
+  shared-type walkers.** 🔴 data race. Each walker walked to the innermost `NODE_IDENT` and
+  checked only that ident's type, so an intermediate `*shared S` FIELD projection
+  (`Wrap w; w.sp = &shared_g; w.sp.v = 99;`) passed silently → the write emitted with NO
+  `pthread_mutex_lock`. The 5 walkers:
+  1. `find_shared_root_expr` (`ir_lower.c` ~1144) — the lock emitter [`9e47b9c4` a]
+  2. `collect_shared_types_in_expr` (`checker.c` ~16343) — same-statement deadlock detector [`9e47b9c4` b]
+  3. `scan_body_shared_types` (`checker.c` ~16150) — transitive callee scan [`ef7fb239`]
+  4. `cond_pred_foreign_shared` (`checker.c`) — `@cond_wait` scanner [`5001940b` a]
+  5. `emit_defer_shared_root` (`emitter.c`) — defer-body lock walker [`5001940b` b]
+  FIX PATTERN: at each FIELD/INDEX/deref step, check the OBJECT's resolved type (object-side,
+  NOT the outer expression's own type — this preserves "writing a pointer field" [no pointee
+  lock] vs "accessing through the pointer" [pointee lock]). When the object is `shared` or
+  `*shared S`, THAT is the lock/scope root. For the `checker.c` walkers use `typemap_get`
+  (populated by the check pass for params + intermediate projections) with `scope_lookup`
+  fallback for bare globals.
+  ⚠️ **CRITICAL OVERLAP — re-derive, do NOT cherry-pick:** main rewrote walkers 2/3/4 AFTER
+  a5erj3 branched (`collect_shared_types_in_expr` → `22061071`; `scan_body_shared_types` →
+  `dafbc1f6`; `cond_pred_foreign_shared` → `28e9562e`; these are the exhaustive-switch + BH-18
+  #7 subexpr-form fixes). The gap STILL EXISTS in main (verified: main's
+  `collect_shared_types_in_expr` NODE_FIELD case still does
+  `while(root->kind==NODE_FIELD) root=root->field.object`). A verbatim copy would conflict
+  with / revert the exhaustive-switch work. **Re-apply the object-type-per-step check onto
+  main's CURRENT structure, and ideally UNIFY the 5 sites into one shared helper
+  (`shared_root_through_projections()`)** rather than patching 5 walkers a third time.
+  Tripwires `tests/zer_fail/shared_field_pointer_multi.zer`, `tests/zer/shared_field_pointer_
+  locks.zer`, `tests/zer_fail/shared_transitive_field_ptr.zer`, `tests/zer_fail/cond_wait_
+  foreign_field_ptr.zer`. Add the branch's `type_dispatch_baseline.txt` entries for the
+  already-unwrapped `eff->kind` reads. CLASS: form-coverage / per-sink patchwork (×5).
+
+### THE 3 FLAGS (carry forward even after the fixes land)
+
+- 🚩 **FLAG #1 — AST→IR drift class is live (T2.1 + T2.2).** Two independent branches hit the
+  drift class in one week; the AST→IR emission-diff audit isn't being run and the auto-guard
+  gate lists are a recurring weak point. Run the grep after T2 and consider a `make check` gate.
+- 🚩 **FLAG #2 — audit-matrix blind axis (T1.4).** `tools/audit_type_dispatch.sh` only scans
+  RESOLVED-Type `->kind == TYPE_X` reads, NOT syntactic `TypeNode` reads (`tnode->kind ==
+  TYNODE_X`), so the distinct-unwrap class recurs undetected on the TypeNode axis. (anqp95's
+  tech-debt index independently flagged `type_dispatch_baseline` content-collision masking.)
+- 🚩 **FLAG #3 — refactoring overlap (T3).** Re-derive onto current main; a verbatim merge
+  reverts the exhaustive-switch walkers.
+
+### STILL OPEN — flagged by the branches, NO fix exists (NOT part of this backlog)
+
+- 🔴 `tests/zer_gaps/bh18_1b_move_alias_stale_read.zer` (move-struct alias stale read,
+  SOUNDNESS) — tripwire only.
+- 🟡 `tests/zer_gaps/bh18_12_defer_goto_parametric.zer` (miscompile) — tripwire only.
+- `naked_attribute_silently_dropped` (intentional deferral).
+- anqp95 `e09da736` documented **AU-1..AU-6** (defer use+free LIFO UAF; defer `arena.reset()`
+  invisible to defer-frees scanner; nested `NODE_STRUCT_INIT` escape walker not recursive;
+  `g = {.ptr = &local}` direct-assign bypasses escape check; ISR-alloc blind to funcptr
+  indirection; privileged `@cpu_*` no call-site context check). **4+ days old — verify against
+  current main first; some may already be closed. AU-3/AU-4 look like the same escape-patchwork
+  family as T1.5.**
+
+---
+
 ## OPEN — `tools/audit_matrix.sh` is STALE (false positives mask real flag-handler gaps) (LOW — tool only, contracts sound)
 
 **Symptom:** `bash tools/audit_matrix.sh checker.c` reports 16 "BUG: … missing …

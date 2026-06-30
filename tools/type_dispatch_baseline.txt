@@ -700,3 +700,20 @@ zercheck_ir.c:(pt_eff->kind != TYPE_POINTER &&
 zercheck_ir.c:pt_eff->kind != TYPE_HANDLE &&
 zercheck_ir.c:pt_eff->kind != TYPE_OPAQUE)) {
 ir_lower.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return next;
+
+# --- TypeNode (syntactic) dispatch sites (FLAG #2, 2026-07-01) ---
+# Gating on tnode->kind == TYNODE_X is correct ONLY as a syntactic
+# pre-filter that then RESOLVES the named type (the T1.4 lesson). These
+# 12 are legitimate (declared-qualifier checks, named-type pre-filters,
+# array var-decl). A NEW TYNODE dispatch must resolve-then-check or be
+# justified here.
+checker.c:(tn->container.type_arg->kind == TYNODE_CONST ||
+checker.c:if (stmt->var_decl.type && stmt->var_decl.type->kind == TYNODE_ARRAY) {
+checker.c:if (tn->kind == TYNODE_NAMED &&
+checker.c:sf->is_volatile = (fd->type && fd->type->kind == TYNODE_VOLATILE);
+checker.c:tn->container.type_arg->kind == TYNODE_CONST ? "const" : "volatile");
+checker.c:tn->container.type_arg->kind == TYNODE_VOLATILE)) {
+emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
+emitter.c:if (ta->kind == TYNODE_NAMED) {
+zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
+zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;

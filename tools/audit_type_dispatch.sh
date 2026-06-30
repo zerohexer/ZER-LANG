@@ -51,9 +51,15 @@ trap "rm -f $CURRENT" EXIT
 for f in $FILES; do
     [ -f "$f" ] || continue
     # Match the GAP-F comparison shape: `<expr>->kind == TYPE_` and `!= TYPE_`.
+    # FLAG #2 (2026-07-01): ALSO the syntactic-TypeNode axis `->kind == TYNODE_`
+    # — the T1.4 bug class (gating a safety decision on a syntactic TypeNode kind
+    # instead of resolving the type first; a typedef'd pointer is TYNODE_NAMED so
+    # a `== TYNODE_POINTER` gate silently drops it). Legitimate TYNODE dispatch
+    # (a NAMED pre-filter that then resolves, a declared-qualifier check) is
+    # baselined; a NEW site forces resolve-then-check or a justification.
     # Output file:content (leading whitespace trimmed, CR stripped) so the
     # baseline is line-number-agnostic.
-    grep -nE -- '->kind == TYPE_|->kind != TYPE_' "$f" \
+    grep -nE -- '->kind == TYPE_|->kind != TYPE_|->kind == TYNODE_|->kind != TYNODE_' "$f" \
         | sed -E 's|^[0-9]+:[[:space:]]*||' \
         | sed "s|^|$f:|"
 done | tr -d '\r' | sort -u > "$CURRENT"

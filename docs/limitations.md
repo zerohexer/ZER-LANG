@@ -174,25 +174,31 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 - 🚩 **FLAG #1 — AST→IR drift class is live (T2.1 + T2.2).** Two independent branches hit the
   drift class in one week; the AST→IR emission-diff audit isn't being run and the auto-guard
   gate lists are a recurring weak point. Run the grep after T2 and consider a `make check` gate.
-- 🚩 **FLAG #2 — audit-matrix blind axis (T1.4).** `tools/audit_type_dispatch.sh` only scans
-  RESOLVED-Type `->kind == TYPE_X` reads, NOT syntactic `TypeNode` reads (`tnode->kind ==
-  TYNODE_X`), so the distinct-unwrap class recurs undetected on the TypeNode axis. (anqp95's
-  tech-debt index independently flagged `type_dispatch_baseline` content-collision masking.)
-- 🚩 **FLAG #3 — refactoring overlap (T3).** Re-derive onto current main; a verbatim merge
-  reverts the exhaustive-switch walkers.
+- ✅ **FLAG #2 — RESOLVED (2026-07-01).** `tools/audit_type_dispatch.sh` now ALSO scans the
+  syntactic `TypeNode` axis (`->kind == TYNODE_` / `!= TYNODE_`); the 12 legitimate existing
+  sites are baselined and a NEW TYNODE dispatch trips the gate (validated by inject-and-revert).
+  The distinct-unwrap class can no longer recur undetected on the TypeNode axis.
+- 🚩 **FLAG #3 — RETRACTED (wrong-base assumption).** All hunks applied cleanly onto the
+  rewritten walkers.
 
-### STILL OPEN — flagged by the branches, NO fix exists (NOT part of this backlog)
+### STILL OPEN — triaged against current main 2026-07-01 (all confirmed LIVE except where noted)
 
-- 🔴 `tests/zer_gaps/bh18_1b_move_alias_stale_read.zer` (move-struct alias stale read,
-  SOUNDNESS) — tripwire only.
-- 🟡 `tests/zer_gaps/bh18_12_defer_goto_parametric.zer` (miscompile) — tripwire only.
+- ✅ **AU-1 / AU-2 / AU-3 / AU-4 — FIXED 2026-07-01** (see BUGS-FIXED.md): defer LIFO use-after-free;
+  deferred `arena.reset()`; nested struct-init escape; direct-assign struct-init escape. All were
+  confirmed LIVE by triage, all now reject.
+- 🔴 **`tests/zer_gaps/bh18_1b_move_alias_stale_read.zer`** (move-struct alias stale read, SOUNDNESS)
+  — confirmed LIVE. NO fix yet. `move struct Tok; Tok a; *Tok p=&a; Tok b=a; return p.kind;` — the
+  transfer of `a` doesn't propagate TRANSFERRED to the pre-existing pointer alias `p`. Needs
+  alias-propagation-on-move (mark `&a`-derived pointers transferred when `a` is moved) — a real
+  subsystem, harder than the AU fixes.
+- 🟡 **`tests/zer_gaps/bh18_12_defer_goto_parametric.zer`** (miscompile) — confirmed LIVE (defer
+  fires N× on a same-scope backward goto; value=3, want 1). NO fix yet. Backward-goto to a
+  same-scope label should NOT fire the function-scope defer (it isn't exiting the scope) — opposite
+  direction of the sesjma forward-goto fix; ir_lower.c goto/defer scope machinery.
+- 🟠 **AU-5** (ISR-alloc blind to funcptr indirection) / 🟠 **AU-6** (privileged `@cpu_*` no
+  call-site context check) — bare-metal, NOT yet triaged/fixed. AU-6 is partly a design question
+  (ZER has no kernel/user context type to check against).
 - `naked_attribute_silently_dropped` (intentional deferral).
-- anqp95 `e09da736` documented **AU-1..AU-6** (defer use+free LIFO UAF; defer `arena.reset()`
-  invisible to defer-frees scanner; nested `NODE_STRUCT_INIT` escape walker not recursive;
-  `g = {.ptr = &local}` direct-assign bypasses escape check; ISR-alloc blind to funcptr
-  indirection; privileged `@cpu_*` no call-site context check). **4+ days old — verify against
-  current main first; some may already be closed. AU-3/AU-4 look like the same escape-patchwork
-  family as T1.5.**
 
 ---
 

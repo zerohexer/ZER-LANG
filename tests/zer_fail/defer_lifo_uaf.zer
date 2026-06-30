@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// AU-1: defers fire LIFO. `defer use(p)` registered BEFORE `defer free(p)`
+// fires AFTER it → use-after-free. Was silently accepted (uses checked against
+// pristine pre-free state).
+struct R { u32 v; }
+Slab(R) sl;
+void use_it(*R p) { p.v = p.v + 1; }
+void f() {
+    *R p = sl.alloc_ptr() orelse return;
+    p.v = 5;
+    defer use_it(p);
+    defer sl.free_ptr(p);
+}
+u32 main() { f(); return 0; }

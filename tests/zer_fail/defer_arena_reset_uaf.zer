@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// AU-2: `defer arena.reset()` must invalidate arena handles. Combined with the
+// AU-1 LIFO ordering: reset (registered last) fires first, then use_it(p) fires
+// against the reset (freed) arena pointer → use-after-reset.
+struct R { u32 v; }
+Arena ar;
+void use_it(*R p) { p.v = p.v + 1; }
+void f() {
+    *R p = ar.alloc(R) orelse return;
+    p.v = 5;
+    defer use_it(p);
+    defer ar.reset();
+}
+u32 main() { f(); return 0; }

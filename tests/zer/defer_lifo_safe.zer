@@ -1,0 +1,13 @@
+// AU-1 positive (no over-rejection): `defer free` registered BEFORE `defer use`
+// — LIFO means the use fires FIRST (against a still-alive handle), then the
+// free. Safe, must compile + run + exit 0.
+struct R { u32 v; }
+Slab(R) sl;
+void use_it(*R p) { p.v = p.v + 1; }
+void f() {
+    *R p = sl.alloc_ptr() orelse return;
+    p.v = 5;
+    defer sl.free_ptr(p);
+    defer use_it(p);
+}
+u32 main() { f(); return 0; }

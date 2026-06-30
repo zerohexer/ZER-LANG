@@ -1739,6 +1739,51 @@ static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
  * freed in any defer is considered potentially covered.
  * ================================================================ */
 
+/* AU-2 (2026-07-01): mark every ALIVE arena-colored handle (and any alias
+ * sharing its alloc_id) FREED. Shared by the direct IRMC_ARENA_RESET path AND
+ * the defer-body scanner — `defer arena.reset()` must invalidate arena handles
+ * the same way a direct `arena.reset()` does. Two-pass (snapshot alloc_ids,
+ * then mark) so aliases with ZC_COLOR_UNKNOWN are also caught. */
+static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
+    int aid_cap = ps->handle_count > 0 ? ps->handle_count : 1;
+    int *aids = (int *)malloc((size_t)aid_cap * sizeof(int));
+    if (!aids) return;
+    int aid_count = 0;
+    for (int hi = 0; hi < ps->handle_count; hi++) {
+        IRHandleInfo *h = &ps->handles[hi];
+        if (h->source_color == ZC_COLOR_ARENA && h->state == IR_HS_ALIVE)
+            aids[aid_count++] = h->alloc_id;
+    }
+    for (int hi = 0; hi < ps->handle_count; hi++) {
+        IRHandleInfo *h = &ps->handles[hi];
+        if (h->state != IR_HS_ALIVE) continue;
+        for (int ai = 0; ai < aid_count; ai++) {
+            if (h->alloc_id == aids[ai]) {
+                h->state = IR_HS_FREED;
+                h->free_line = line;
+                break;
+            }
+        }
+    }
+    free(aids);
+}
+
+/* AU-2: is an AST statement an `arena.reset()` / `arena.unsafe_reset()` call?
+ * (NODE_FIELD callee, method "reset"/"unsafe_reset"). Mirrors ir_defer_free_arg
+ * shape. Used by the defer scanner so a deferred reset invalidates arena
+ * handles. */
+static bool ir_defer_is_arena_reset(Node *node) {
+    if (!node || node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return false;
+    Node *call = node->expr_stmt.expr;
+    if (call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return false;
+    const char *m = callee->field.field_name;
+    uint32_t ml = (uint32_t)callee->field.field_name_len;
+    return (ml == 5 && memcmp(m, "reset", 5) == 0) ||
+           (ml == 12 && memcmp(m, "unsafe_reset", 12) == 0);
+}
+
 /* Check if an AST statement is a free call. Returns the argument
  * expression (the thing being freed) or NULL. Recognizes:
  *   - pool.free(x)    (NODE_FIELD callee, method "free")
@@ -1827,6 +1872,13 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             }
         }
     }
+
+    /* AU-2 (2026-07-01): a deferred arena.reset()/unsafe_reset() invalidates
+     * every arena-colored handle, exactly like a direct reset. Without this a
+     * `defer arena.reset(); defer use(p);` (or just leak detection on an
+     * arena handle freed only via deferred reset) was blind. */
+    if (ir_defer_is_arena_reset(body))
+        ir_mark_arena_handles_freed(ps, defer_line);
 
     /* Recurse into block AND nested control-flow bodies (BUG-608).
      * Conservative: any reachable free inside defer marks handle FREED.
@@ -3700,35 +3752,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * adding may invalidate pointers — Gap 20-25 family), then
              * walk and mark any handle in the set FREED. */
             if (mc == IRMC_ARENA_RESET) {
-                /* Pass 1: snapshot alloc_ids of currently-alive ARENA handles. */
-                int aid_cap = ps->handle_count > 0 ? ps->handle_count : 1;
-                int *aids = (int *)malloc((size_t)aid_cap * sizeof(int));
-                int aid_count = 0;
-                if (aids) {
-                    for (int hi = 0; hi < ps->handle_count; hi++) {
-                        IRHandleInfo *h = &ps->handles[hi];
-                        if (h->source_color == ZC_COLOR_ARENA &&
-                            h->state == IR_HS_ALIVE) {
-                            aids[aid_count++] = h->alloc_id;
-                        }
-                    }
-                    /* Pass 2: mark every handle whose alloc_id matches one
-                     * collected. Catches aliases (e.g., `s` from `?[*]T ms = ...
-                     * orelse return; [*]T s = ms orelse return;` which inherits
-                     * alloc_id but may have ZC_COLOR_UNKNOWN). */
-                    for (int hi = 0; hi < ps->handle_count; hi++) {
-                        IRHandleInfo *h = &ps->handles[hi];
-                        if (h->state != IR_HS_ALIVE) continue;
-                        for (int ai = 0; ai < aid_count; ai++) {
-                            if (h->alloc_id == aids[ai]) {
-                                h->state = IR_HS_FREED;
-                                h->free_line = inst->source_line;
-                                break;
-                            }
-                        }
-                    }
-                    free(aids);
-                }
+                /* AU-2 (2026-07-01): the two-pass arena-handle invalidation is
+                 * now ir_mark_arena_handles_freed, shared with the defer-body
+                 * scanner so a deferred arena.reset() behaves identically. */
+                ir_mark_arena_handles_freed(ps, inst->source_line);
                 break;
             }
             if ((mc == IRMC_FREE || mc == IRMC_FREE_PTR) &&
@@ -5079,34 +5106,47 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * still-ALIVE h) is not false-flagged; the shared `defer_use_rs` dedups
      * reports per root-local across all return blocks. */
     UafReportSet defer_use_rs = {0};
+    /* AU-1 (2026-07-01): defers fire in LIFO (reverse-registration) order at
+     * scope exit. A `defer use(h)` registered BEFORE a `defer free(h)` therefore
+     * fires AFTER it — the use sees a FREED handle (a real UAF). The old split
+     * (all-uses against pristine state, THEN all-frees) missed this: it checked
+     * every use before applying any free. Fix: collect defers in registration
+     * order, then per return block process them in FIRE order (reverse) — for
+     * each defer, check its USES against the current state, THEN apply its
+     * FREES. So a use sees exactly the frees of later-registered defers (which
+     * fire first). The safe shape `defer free(h); defer use(h)` (use fires first,
+     * against ALIVE h) still passes — its free is applied after its use is
+     * checked. Leak detection is unaffected (the FINAL state has every free
+     * applied regardless of order). */
+    IRInst **dfs = NULL; int dfn = 0, dfc = 0;
+    for (int di = 0; di < func->block_count; di++) {
+        IRBlock *db = &func->blocks[di];
+        for (int dj = 0; dj < db->inst_count; dj++) {
+            IRInst *inst = &db->insts[dj];
+            if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
+            if (dfn == dfc) {
+                int ndc = dfc ? dfc * 2 : 8;
+                IRInst **nd = (IRInst **)realloc(dfs, (size_t)ndc * sizeof(IRInst *));
+                if (!nd) break;
+                dfs = nd; dfc = ndc;
+            }
+            dfs[dfn++] = inst;
+        }
+    }
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
         if (bb->inst_count == 0) continue;
         IRInst *last = &bb->insts[bb->inst_count - 1];
         if (last->op != IR_RETURN) continue;
-
         IRPathState *ret_ps = &block_states[bi];
-        /* uses-pass: pristine exit state, before this block's frees apply */
-        for (int di = 0; di < func->block_count; di++) {
-            IRBlock *db = &func->blocks[di];
-            for (int dj = 0; dj < db->inst_count; dj++) {
-                IRInst *inst = &db->insts[dj];
-                if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
-                ir_defer_scan_uses(zc, func, ret_ps, inst->defer_body,
-                                   inst->source_line, &defer_use_rs);
-            }
-        }
-        /* frees-pass: marks FREED for leak detection (mutates ret_ps) */
-        for (int di = 0; di < func->block_count; di++) {
-            IRBlock *db = &func->blocks[di];
-            for (int dj = 0; dj < db->inst_count; dj++) {
-                IRInst *inst = &db->insts[dj];
-                if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
-                ir_defer_scan_frees(zc, func, ret_ps, inst->defer_body,
-                                     inst->source_line);
-            }
+        for (int k = dfn - 1; k >= 0; k--) {   /* LIFO fire order */
+            ir_defer_scan_uses(zc, func, ret_ps, dfs[k]->defer_body,
+                               dfs[k]->source_line, &defer_use_rs);
+            ir_defer_scan_frees(zc, func, ret_ps, dfs[k]->defer_body,
+                                dfs[k]->source_line);
         }
     }
+    free(dfs);
     free(defer_use_rs.ids);
 
     /* Phase D6: ghost handle detection — compute which allocated handles

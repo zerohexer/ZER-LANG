@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — AU-1 + AU-2: deferred use-after-free / use-after-reset, zercheck_ir.c
+
+🔴 silent UAF. Both confirmed LIVE against current main, both PURE TIGHTENING. `make check` GREEN.
+
+- **AU-1 — defer LIFO use-after-free:** `defer use(p); defer free(p);` compiled clean. Defers
+  fire LIFO, so a `defer use` registered BEFORE a `defer free` fires AFTER it — the use touches a
+  freed handle. The exit-defer analysis ran an all-USES pass against the pristine pre-free state,
+  THEN an all-FREES pass, so it checked every use before any free was applied and missed the
+  ordering. Fix: collect the function's defers in registration order, then per return block
+  process them in FIRE order (reverse) — for each defer, check its USES against the current state,
+  THEN apply its FREES. A use now sees exactly the frees of later-registered defers (which fire
+  first). The safe shape `defer free; defer use` (use fires first, against an alive handle) still
+  passes; leak detection is unaffected (the final state has every free applied regardless of order).
+- **AU-2 — `defer arena.reset()` invisible to the defer scanner:** a deferred `arena.reset()` /
+  `unsafe_reset()` did not invalidate arena-colored handles (the scanner only recognized
+  `pool.free`/`slab.free`-style calls), so a `defer use(p); defer arena.reset();` use-after-reset
+  was blind. Fix: extracted the direct-path `IRMC_ARENA_RESET` two-pass invalidation into a shared
+  `ir_mark_arena_handles_freed(ps, line)`, and added an `ir_defer_is_arena_reset` detector that the
+  defer scanner calls — one definition governs both direct and deferred resets. Composes with AU-1
+  (reset fires first under LIFO, then the use is caught).
+
+Tests: `tests/zer_fail/defer_lifo_uaf.zer`, `tests/zer_fail/defer_arena_reset_uaf.zer` (negatives),
+`tests/zer/defer_lifo_safe.zer` (positive — the safe LIFO ordering still compiles + runs). Closes
+2 more of the anqp95 audit-2026-06-25 AU findings (AU-1..AU-4 now done).
+
+---
+
 ## 2026-07-01 — AU-3 + AU-4: struct-literal escape holes (recursive + assign-sink), checker.c
 
 🔴 silent UAF (dangling global). Two siblings of the BUG-732 struct-init escape walker, both

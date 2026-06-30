@@ -1,0 +1,15 @@
+// Regression: shared struct holding *shared S field — accessing through both
+// fields in one statement must REJECT as a multi-shared deadlock.
+// Bug: find_shared_root_expr/collect_shared_types_in_expr walked only to the
+// innermost IDENT and missed the intermediate *shared A field, silently
+// accepting a clean compile that locked only B, leaving A unlocked.
+// Fix: walk every NODE_FIELD step and check the OBJECT's type.
+
+shared struct A { u32 a; }
+shared struct B { *A pa; u32 v; }
+A ga; B gb;
+u32 main() {
+    gb.pa = &ga;
+    gb.pa.a = 1;   // EXPECTED ERROR: deadlock (B + A in one statement)
+    return 0;
+}

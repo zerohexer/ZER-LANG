@@ -1,0 +1,17 @@
+// Regression: @cond_wait predicate reading a foreign shared struct via a
+// field-pointer (`w.pa.a` where w.pa is *shared A) must REJECT. Before the
+// audit-2026-06-28 fix, the cond_pred_foreign_shared walker walked to the
+// innermost IDENT only and missed the intermediate *shared A field, so
+// reading A through w.pa was treated as if it were just `w` (non-shared).
+// pthread_cond_wait releases ONLY g_cond's mutex; A is unsynchronized.
+
+shared struct S { u32 ready; }
+shared struct A { u32 a; }
+struct Wrap { *A pa; }
+Wrap w;
+S g_cond; A g_a;
+u32 main() {
+    w.pa = &g_a;
+    @cond_wait(g_cond, w.pa.a > 0);   // EXPECTED ERROR: foreign-shared read
+    return 0;
+}

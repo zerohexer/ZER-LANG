@@ -1,0 +1,14 @@
+// Positive: shared *S held in non-shared struct field. Accesses must compile
+// AND the emitted C must lock the pointed-to S struct — not the wrap struct.
+// Used to silently emit unlocked C. Now locks &w.sp->_zer_mtx correctly.
+
+shared struct S { u32 v; }
+struct Wrap { *S sp; }
+Wrap w;
+S g;
+u32 main() {
+    w.sp = &g;
+    w.sp.v = 99;
+    if (w.sp.v == 99) { return 0; }
+    return 1;
+}

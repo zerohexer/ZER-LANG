@@ -5,6 +5,39 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — Branch-import Tier 3 (field-projection blindness in 5 shared-type walkers, from a5erj3)
+
+🔴 silent data race. Class: form-coverage / per-sink patchwork (BH-18 #7 sibling). Each of
+five shared-type walkers descended to the innermost `NODE_IDENT` and checked only that ident's
+type, so an intermediate `*shared S` FIELD projection passed silently — `Wrap w; w.sp =
+&shared_g; w.sp.v = 99;` emitted `w.sp->v = 99` with NO `pthread_mutex_lock`. Fix pattern
+(applied to all five): at each FIELD/INDEX/deref step, check the OBJECT's resolved type
+(`typemap_get`/`checker_get_type`, object-side not outer-expr-side, so "writing a pointer
+field" still differs from "accessing through the pointer"); when the object is `shared` or
+`*shared S`, that is the lock/scope root. Verified applies cleanly on top of main's
+exhaustive-switch walker rewrites (the earlier "must re-derive / FLAG #3" concern was a wrong-
+base assumption, retracted). The five walkers (all from a5erj3 `9e47b9c4`/`ef7fb239`/`5001940b`):
+
+- `find_shared_root_expr` (`ir_lower.c`) — the lock emitter (returns the outermost shared
+  sub-expr so the emitter locks the pointed-to S).
+- `collect_shared_types_in_expr` (`checker.c`) — same-statement multi-shared deadlock detector
+  (`gb.pa.v` with B shared holding `*shared A` now correctly rejected).
+- `scan_body_shared_types` (`checker.c`) — transitive callee FuncSharedTypes scan
+  (`gb.b = read_a(&ga);` where `read_a` touches A via a `*shared A` param field now rejected).
+- `cond_pred_foreign_shared` (`checker.c`) — `@cond_wait` predicate scanner (`@cond_wait(g,
+  w.pa.a > 0)` with `w.pa` = `*shared A` now rejected — the cond releases only g's mutex).
+- `emit_defer_shared_root` (`emitter.c`) — defer-body lock walker (`defer w.sp.v = X;` now
+  emits `pthread_mutex_lock(&w.sp->_zer_mtx)`).
+
+Tests: `tests/zer_fail/shared_field_pointer_multi.zer`, `tests/zer/shared_field_pointer_locks.zer`,
+`tests/zer_fail/shared_transitive_field_ptr.zer`, `tests/zer_fail/cond_wait_foreign_field_ptr.zer`.
++`type_dispatch_baseline.txt` entries for the already-unwrapped `eff->kind` reads. DURABLE
+NOTE: the same blind spot lived in 5 walkers — the per-sink-patchwork debt; unifying into one
+`shared_root_through_projections()` helper is optional future polish (deferred, see
+limitations.md). `make check` GREEN.
+
+---
+
 ## 2026-07-01 — Branch-import Tier 2 (2 AST→IR drift holes, emitter.c)
 
 Both are the AST→IR emission-drift class (FLAG #1). `make check` GREEN (ZER 869/0).

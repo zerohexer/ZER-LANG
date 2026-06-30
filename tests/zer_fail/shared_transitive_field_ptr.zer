@@ -1,0 +1,16 @@
+// Regression: transitive shared-type scan must see a *shared A param's
+// `pa.x` access. Before the audit-2026-06-28 fix, scan_body_shared_types
+// walked field chains to the innermost IDENT only — pa.x where pa is *A
+// param had A invisible in the transitive cache.
+// Effect: a caller doing `gb.b = read_a(&ga)` (same-statement B + A)
+// silently compiled, locked only B, accessed A unlocked = cross-struct race.
+
+shared struct A { u32 a; }
+shared struct B { u32 b; }
+A ga; B gb;
+u32 read_a(*A pa) { return pa.a; }   // *shared A param
+
+u32 main() {
+    gb.b = read_a(&ga);   // EXPECTED ERROR: deadlock A+B in one stmt
+    return 0;
+}

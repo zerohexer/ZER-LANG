@@ -16162,18 +16162,36 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
 static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedTypes *fsc) {
     if (!node) return;
     switch (node->kind) {
-    /* Direct shared field access */
+    /* Direct shared field access.
+     * AUDIT-2026-06-28: at each FIELD step, check the OBJECT's resolved type —
+     * not just the innermost IDENT. A `*shared S` field on an outer struct
+     * (`w.sp.v` where `w.sp` is `*S`) was previously silently passed through,
+     * so the transitive shared-types cache missed the shared S read. A caller
+     * locking another shared + calling such a function then evaded the
+     * cross-struct deadlock detection. Mirror of the same-statement fix in
+     * collect_shared_types_in_expr above.
+     *
+     * Look up the object's type via typemap_get FIRST (the typemap was
+     * populated during the function's check pass and carries resolved
+     * types for params, locals, and intermediate field-projections);
+     * fall back to scope_lookup for bare globals that may not appear in
+     * the typemap. The body scan runs outside the function's local scope
+     * so a parameter like `pa` in `void f(*A pa){ pa.x; }` is found via
+     * typemap, not via scope_lookup. */
     case NODE_FIELD: {
-        Node *root = node;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        if (root->kind == NODE_IDENT) {
-            Symbol *sym = scope_lookup(c->global_scope,
-                root->ident.name, (uint32_t)root->ident.name_len);
-            if (!sym) sym = scope_lookup(c->current_scope,
-                root->ident.name, (uint32_t)root->ident.name_len);
-            if (sym && sym->type) {
-                Type *eff = type_unwrap_distinct(sym->type);
+        Node *cur = node;
+        while (cur && cur->kind == NODE_FIELD) {
+            Node *obj = cur->field.object;
+            Type *ot = obj ? typemap_get(c, obj) : NULL;
+            if (!ot && obj && obj->kind == NODE_IDENT) {
+                Symbol *sym = scope_lookup(c->global_scope,
+                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                if (!sym) sym = scope_lookup(c->current_scope,
+                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                if (sym) ot = sym->type;
+            }
+            if (ot) {
+                Type *eff = type_unwrap_distinct(ot);
                 if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
                     fsc_add_type_id(fsc, eff->struct_type.type_id);
                 if (eff->kind == TYPE_POINTER) {
@@ -16182,6 +16200,7 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
                         fsc_add_type_id(fsc, inner->struct_type.type_id);
                 }
             }
+            cur = obj;
         }
         break;
     }
@@ -16333,21 +16352,25 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
     switch (pred->kind) {
     case NODE_FIELD:
     case NODE_INDEX: {
-        /* base case: walk to the root ident, flag a foreign shared read */
-        Node *root = pred;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
-            Type *t = typemap_get(c, root);
-            if (!t) {
+        /* AUDIT-2026-06-28: walk every FIELD/INDEX/deref step, not just to
+         * the innermost ident. A `*shared A` field-projection (`w.pa.a` where
+         * w.pa is `*A`) was previously silently passed through, so a
+         * `@cond_wait(g, w.pa.a > 0)` predicate reading a foreign shared
+         * struct via the wrap field evaded the foreign-shared check.
+         * Companion to the find_shared_root_expr / collect_shared_types_in_expr
+         * fixes — same blindness, different walker. Detects foreignness by
+         * the SHARED ROOT IDENT (one level above the *shared subexpr if
+         * applicable, or the bare ident). */
+        Node *cur = pred;
+        while (cur) {
+            Type *ct = typemap_get(c, cur);
+            if (!ct && cur->kind == NODE_IDENT) {
                 Symbol *sym = scope_lookup(c->current_scope,
-                    root->ident.name, (uint32_t)root->ident.name_len);
-                if (sym) t = sym->type;
+                    cur->ident.name, (uint32_t)cur->ident.name_len);
+                if (sym) ct = sym->type;
             }
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
+            if (ct) {
+                Type *eff = type_unwrap_distinct(ct);
                 bool is_shared = false;
                 if (type_dispatch_kind(eff) == TYPE_STRUCT && eff->struct_type.is_shared)
                     is_shared = true;
@@ -16357,12 +16380,24 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
                         inner->struct_type.is_shared)
                         is_shared = true;
                 }
-                if (is_shared &&
-                    !((uint32_t)root->ident.name_len == cond_root_len &&
-                      memcmp(root->ident.name, cond_root, cond_root_len) == 0)) {
-                    return pred; /* foreign shared read */
+                if (is_shared) {
+                    /* Find the bare root ident for the cond-name comparison. */
+                    Node *root = cur;
+                    while (root->kind == NODE_FIELD) root = root->field.object;
+                    while (root->kind == NODE_INDEX) root = root->index_expr.object;
+                    while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+                        root = root->unary.operand;
+                    if (root->kind == NODE_IDENT &&
+                        !((uint32_t)root->ident.name_len == cond_root_len &&
+                          memcmp(root->ident.name, cond_root, cond_root_len) == 0)) {
+                        return pred; /* foreign shared read */
+                    }
                 }
             }
+            if (cur->kind == NODE_FIELD) cur = cur->field.object;
+            else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
+            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) cur = cur->unary.operand;
+            else break;
         }
         /* not a foreign read at this level — descend the subexpressions
          * (a nested field, or an index expression, can hold one) */
@@ -16441,18 +16476,32 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
     if (!expr || count >= max_types) return count;
     switch (expr->kind) {
     case NODE_FIELD: {
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        if (root->kind == NODE_IDENT) {
-            Type *t = typemap_get(c, root);
-            if (!t) {
+        /* AUDIT-2026-06-28: at each FIELD/INDEX step, check the OBJECT's
+         * type — that's the struct (or *shared struct pointer) being
+         * dereferenced for the field access. The old walker descended all
+         * the way to the innermost IDENT and checked only that, missing
+         * intermediate `*shared S` fields: `w.sp.v` where `w.sp` is `*S`
+         * silently compiled, emitting an unlocked `w.sp->v = X` race, and
+         * the multi-shared `gb.pa.v` (B shared + *shared A) escaped the
+         * deadlock check entirely. Class is the BH-18 #7 sibling — same
+         * form-coverage shape, different node level.
+         *
+         * IMPORTANT: only the FIELD OBJECT (not the outer expression
+         * itself) is shared-checked. `gb.pa = &ga` reads/writes `gb`'s
+         * field-`.pa`; the *shared type of `gb.pa` does NOT mean A is
+         * accessed (no deref). Walking object-by-object preserves that
+         * distinction. */
+        Node *cur = expr;
+        while (cur && cur->kind == NODE_FIELD) {
+            Node *obj = cur->field.object;
+            Type *ot = typemap_get(c, obj);
+            if (!ot && obj && obj->kind == NODE_IDENT) {
                 Symbol *sym = scope_lookup(c->current_scope,
-                    root->ident.name, (uint32_t)root->ident.name_len);
-                if (sym) t = sym->type;
+                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                if (sym) ot = sym->type;
             }
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
+            if (ot) {
+                Type *eff = type_unwrap_distinct(ot);
                 Type *shared = NULL;
                 if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) shared = eff;
                 if (!shared && eff->kind == TYPE_POINTER) {
@@ -16461,7 +16510,6 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                         shared = inner;
                 }
                 if (shared) {
-                    /* Check if already in the list */
                     bool dup = false;
                     for (int i = 0; i < count; i++) {
                         if (types[i]->struct_type.type_id == shared->struct_type.type_id) {
@@ -16473,6 +16521,7 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                     }
                 }
             }
+            cur = obj;
         }
         break;
     }

@@ -699,3 +699,4 @@ ir_lower.c:if (inner && inner->kind == TYPE_STRUCT &&
 zercheck_ir.c:(pt_eff->kind != TYPE_POINTER &&
 zercheck_ir.c:pt_eff->kind != TYPE_HANDLE &&
 zercheck_ir.c:pt_eff->kind != TYPE_OPAQUE)) {
+ir_lower.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return next;

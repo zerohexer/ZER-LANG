@@ -1178,22 +1178,31 @@ static Node *find_orelse(Node *expr); /* B1: defined below, used by the lock emi
 static Node *find_shared_root_expr(Checker *c, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
-            Type *t = checker_get_type(c, root);
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
+        /* AUDIT-2026-06-28: at each FIELD/INDEX/deref step, check if the
+         * CURRENT object's type is `shared struct` or `*shared struct`. The
+         * old walker descended all the way to NODE_IDENT and only checked the
+         * innermost ident; `w.sp.v` where `w.sp` is `*shared S` was silently
+         * missed, emitting `w.sp->v = X` with no mutex_lock — a real
+         * data race. Return the OUTERMOST shared sub-expression so the
+         * emitter locks the right struct (the pointed-to S, via `w.sp`). */
+        Node *cur = expr;
+        while (cur) {
+            Node *next;
+            if (cur->kind == NODE_FIELD) next = cur->field.object;
+            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
+            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
+            else break;
+            Type *nt = checker_get_type(c, next);
+            if (nt) {
+                Type *eff = type_unwrap_distinct(nt);
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return next;
                 if (eff->kind == TYPE_POINTER) {
                     Type *inner = type_unwrap_distinct(eff->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        return root;
+                        return next;
                 }
             }
+            cur = next;
         }
     }
     /* Recurse into sub-expressions */

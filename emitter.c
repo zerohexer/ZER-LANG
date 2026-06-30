@@ -9001,25 +9001,33 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
 static Node *emit_defer_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
-            Type *t = checker_get_type(e->checker, root);
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
+        /* AUDIT-2026-06-28: at each FIELD step, check the OBJECT's type.
+         * Defer-body shared access like `defer w.sp.v = X;` where `w.sp`
+         * is `*shared S` was silently missed — the walker descended past
+         * `w.sp` to `w` (non-shared) and returned NULL. No lock was
+         * emitted around the deferred access = silent race at defer fire.
+         * Companion to find_shared_root_expr in ir_lower.c. */
+        Node *cur = expr;
+        while (cur) {
+            Node *next;
+            if (cur->kind == NODE_FIELD) next = cur->field.object;
+            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
+            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
+            else break;
+            Type *nt = checker_get_type(e->checker, next);
+            if (nt) {
+                Type *eff = type_unwrap_distinct(nt);
                 if (eff->kind == TYPE_STRUCT &&
                     (eff->struct_type.is_shared || eff->struct_type.is_shared_rw))
-                    return root;
+                    return next;
                 if (eff->kind == TYPE_POINTER) {
                     Type *inner = type_unwrap_distinct(eff->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT &&
                         (inner->struct_type.is_shared || inner->struct_type.is_shared_rw))
-                        return root;
+                        return next;
                 }
             }
+            cur = next;
         }
     }
     /* Recurse via if/else chains (NOT a switch) — mirrors ir_lower.c

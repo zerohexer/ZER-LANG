@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — form-coverage: B1 multi-lock walker `find_all_shared_roots_expr` missed NODE_INTRINSIC/ORELSE/STRUCT_INIT (silent data race on shared(rw) multi-reads), ir_lower.c
+
+🔴 soundness / silent data race. `find_all_shared_roots_expr` (ir_lower.c ~1307)
+— the B1 SECONDARY-lock walker that finds every additional shared root in a
+statement so the emitter can rdlock each of them — handled `NODE_TYPECAST` and
+`NODE_SLICE` but NOT `NODE_INTRINSIC`, `NODE_ORELSE`, or `NODE_STRUCT_INIT`.
+The PRIMARY walker `find_shared_root_expr` at ir_lower.c ~1207 DID handle these
+(fixed 2026-06-27 as part of BH-18 #7), so the first shared struct got locked;
+the sibling wrapped in an intrinsic / orelse-fallback / struct-init field value
+did NOT get locked → the emitter read it through the unlocked path = **silent
+race**.
+
+**Confirmed LIVE on `fb8091d`:**
+```
+shared(rw) struct A { u32 v; } A ga;
+shared(rw) struct B { u32 v; } B gb;
+u32 f() { return ga.v + @truncate(u32, gb.v); }  // 1 rdlock emitted (ga), 0 on gb
+u32 g() { Pair p = { .a=ga.v, .b=gb.v }; return p.a+p.b; }  // same
+u32 h() { return ga.v + (no_v() orelse gb.v); }  // same
+```
+The multi-shared-TYPE deadlock check (`collect_shared_types_in_expr`, checker.c
+~16556) already handles NODE_INTRINSIC / NODE_ORELSE / NODE_STRUCT_INIT (fixed
+2026-06-27), so these `shared(rw)` multi-read statements PASS the checker (two
+rwlock reads are compose-safe) — but the emitter then only locked one struct.
+Class = same form-coverage / walker-completeness as the two `scan_*` walkers
+fixed above; different site.
+
+**Root cause:** the walker was written before the BH-18 #7 fix landed on the
+sibling walkers; when 2026-06-27 patched the primary and the checker
+collectors, this secondary emitter-walker copy was missed. The full walker set
+is now aligned (primary `find_shared_root_expr`, collectors `collect_shared_
+types_in_expr` and `scan_body_shared_types`, secondary B1 `find_all_shared_
+roots_expr`).
+
+**Fix:** add the three cases with recursion mirroring the primary walker.
+condvar/barrier/once intrinsics (which self-lock internally) skipped to avoid
+double-wrap, exactly like the primary. Zero over-rejection risk. Tests:
+`tests/zer/shared_rw_multi_lock_intrinsic.zer` (positive — 3 wrapping forms
+all run and return the correct sum, ensuring the second rdlock is emitted).
+`make check` GREEN.
+
+**Remaining sibling walkers audited in same session:** `emit_defer_shared_root`
+(emitter.c ~9001) and `find_shared_root` (emitter.c ~558) also miss
+NODE_INTRINSIC / NODE_ORELSE / NODE_STRUCT_INIT. Both narrower impact than
+this one: `find_shared_root_in_stmt` (emitter.c ~521) is dead code with no
+callers; `find_shared_root` is only used for spawn-arg extraction lock (line
+10066) where the shared-struct pattern is a direct spawn-arg (rare to bury in
+an intrinsic); `emit_defer_shared_root` covers defer-body shared access — a
+real narrower race, deferred to a follow-up (see docs/limitations.md).
+
+---
+
 ## 2026-07-01 — form-coverage: spawn-race + ISR-context walkers leaf-return NODE_TYPECAST/SLICE/STRUCT_INIT (silent data race + silent context loss), checker.c
 
 🔴 soundness / silent data race. Two adjacent walkers — `scan_unsafe_global_access`

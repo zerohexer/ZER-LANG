@@ -1352,6 +1352,36 @@ static void find_all_shared_roots_expr(Checker *c, Node *expr,
             find_all_shared_roots_expr(c, expr->slice.start, out, count, max);
         if (expr->slice.end)
             find_all_shared_roots_expr(c, expr->slice.end, out, count, max);
+    } else if (expr->kind == NODE_INTRINSIC) {
+        /* AUDIT-2026-07-01 form-coverage: B1 secondary-lock walker must recurse
+         * intrinsic args (`@truncate(u32, gb.v)`, `@ptrcast(*T, &gb.f)`) the same
+         * way the primary find_shared_root_expr does (ir_lower.c ~1265). Without
+         * this, a multi-rwlock read like `ga.v + @truncate(u32, gb.v)` — which
+         * the deadlock check passes because both are shared(rw) reads — emits
+         * only ga's rdlock; gb.v is read unlocked → silent race. condvar/barrier/
+         * once intrinsics handle their own lock; don't double-wrap. */
+        const char *nm = expr->intrinsic.name;
+        size_t nlen = expr->intrinsic.name_len;
+        bool intrinsic_handles_own_lock =
+            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
+            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
+            (nlen == 4 && memcmp(nm, "once", 4) == 0);
+        if (!intrinsic_handles_own_lock) {
+            for (int i = 0; i < expr->intrinsic.arg_count; i++)
+                find_all_shared_roots_expr(c, expr->intrinsic.args[i], out, count, max);
+        }
+    } else if (expr->kind == NODE_ORELSE) {
+        /* AUDIT-2026-07-01 form-coverage: an orelse fallback that reads another
+         * shared struct (`maybe_v() orelse gb.v`) needs gb locked too. Primary
+         * walker handles this (ir_lower.c ~1253); B1 walker did not. */
+        find_all_shared_roots_expr(c, expr->orelse.expr, out, count, max);
+        find_all_shared_roots_expr(c, expr->orelse.fallback, out, count, max);
+    } else if (expr->kind == NODE_STRUCT_INIT) {
+        /* AUDIT-2026-07-01 form-coverage: `Pair p = { .a = ga.v, .b = gb.v }`
+         * needs both locks. Primary walker handles this (ir_lower.c ~1280);
+         * B1 walker did not → only the first-found shared struct was locked. */
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            find_all_shared_roots_expr(c, expr->struct_init.fields[i].value, out, count, max);
     }
 }
 

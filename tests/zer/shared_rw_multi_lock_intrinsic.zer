@@ -1,0 +1,41 @@
+// find_all_shared_roots_expr (ir_lower.c B1 multi-lock walker) must recurse
+// into NODE_INTRINSIC / NODE_ORELSE / NODE_STRUCT_INIT so a shared(rw) read
+// hidden in one of these forms picks up its rdlock alongside the primary.
+// Compiles + runs + emitted C carries the second rdlock (verified via grep in
+// the audit; here we just prove the source compiles and runs).
+shared(rw) struct A { u32 v; }
+shared(rw) struct B { u32 v; }
+
+A ga;
+B gb;
+
+struct Pair { u32 a; u32 b; }
+
+?u32 no_v() { return null; }
+
+u32 mix_intrinsic() {
+    u32 x = ga.v + @truncate(u32, gb.v);
+    return x;
+}
+
+Pair mix_struct_init() {
+    Pair p = { .a = ga.v, .b = gb.v };
+    return p;
+}
+
+u32 mix_orelse() {
+    u32 x = ga.v + (no_v() orelse gb.v);
+    return x;
+}
+
+u32 main() {
+    ga.v = 3;
+    gb.v = 4;
+    u32 a = mix_intrinsic();
+    Pair p = mix_struct_init();
+    u32 b = mix_orelse();
+    if (a != 7) { return 1; }
+    if (p.a != 3 || p.b != 4) { return 2; }
+    if (b != 7) { return 3; }
+    return 0;
+}

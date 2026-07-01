@@ -9,3 +9,15 @@ zerc/
 release/
 docs/
 *.md
+# build artifacts + backups + local DBs — never COPYed by any Dockerfile, ~5GB
+# of context bloat otherwise (2026-07-01)
+*.vsix
+vsix-out/
+.git.backup.*
+.git-rewrite/
+*.srctrlbm
+*.srctrldb
+*.srctrlprj
+*.srctrl*-shm
+*.srctrl*-wal
+.planning/

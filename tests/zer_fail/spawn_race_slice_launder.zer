@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// scan_unsafe_global_access must recurse into NODE_SLICE.
+// Slicing a non-shared global array from a spawned function body silently
+// laundered past the data-race check.
+u32[10] g_arr;
+
+void worker() {
+    [*]u32 s = g_arr[0..5];
+    if (s.len > 0) { return; }
+}
+
+u32 main() {
+    spawn worker();
+    return 0;
+}

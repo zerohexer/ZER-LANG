@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// Transitive form: a callee reads a non-shared global ONLY inside a
+// NODE_STRUCT_INIT field value; the per-call recursion (32-level DFS) fed
+// the callee body into scan_unsafe_global_access, which returned false on
+// NODE_STRUCT_INIT — transitive race missed.
+u32 g_bad;
+
+struct Row { u32 v; }
+
+Row read_wrapped() {
+    Row r = { .v = g_bad };
+    return r;
+}
+
+void worker() {
+    Row r = read_wrapped();
+    if (r.v > 0) { return; }
+}
+
+u32 main() {
+    spawn worker();
+    return 0;
+}

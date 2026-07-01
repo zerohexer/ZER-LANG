@@ -9262,6 +9262,24 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     case NODE_ONCE:
         scan_func_props(c, node->once.body, parent_sym);
         return;
+    /* AUDIT-2026-07-01 form-coverage: an effect-carrying sub-expression can
+     * hide inside a (T)cast, slice, or struct-init field value. The previous
+     * leaf-return list silently dropped a call/spawn/yield/await/alloc
+     * transitively reachable via any of these forms, so context bans
+     * (ISR / @critical / async) failed to fire — the same class the
+     * scan_body_shared_types walker closed on 2026-06-27 (BH-18 #7 shape). */
+    case NODE_TYPECAST:
+        scan_func_props(c, node->typecast.expr, parent_sym);
+        return;
+    case NODE_SLICE:
+        scan_func_props(c, node->slice.object, parent_sym);
+        scan_func_props(c, node->slice.start, parent_sym);
+        scan_func_props(c, node->slice.end, parent_sym);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            scan_func_props(c, node->struct_init.fields[i].value, parent_sym);
+        return;
     /* Stage 2 Part B (2026-04-28): exhaustive — leaf/no-body kinds
      * have no children to scan for FuncProps tracking. */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
@@ -9272,8 +9290,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     case NODE_LABEL: case NODE_ASM: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return;
     }
 }
@@ -9592,6 +9609,21 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             if (scan_unsafe_global_access(c, node->switch_stmt.arms[i].body, out_name, out_len)) return true;
         return false;
+    /* AUDIT-2026-07-01 form-coverage: a non-shared global read wrapped in
+     * a (T)cast, slice, or struct-init field value must NOT slip past the
+     * data-race check. Sibling of BH-18 #7 (closed on scan_body_shared_types
+     * 2026-06-27); same shape here on the spawn-race walker. Recurse the
+     * exact same way find_shared_root_expr / scan_body_shared_types do. */
+    case NODE_TYPECAST:
+        return scan_unsafe_global_access(c, node->typecast.expr, out_name, out_len);
+    case NODE_SLICE:
+        if (scan_unsafe_global_access(c, node->slice.object, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->slice.start, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->slice.end, out_name, out_len);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            if (scan_unsafe_global_access(c, node->struct_init.fields[i].value, out_name, out_len)) return true;
+        return false;
     /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
      * kinds without expressions/bodies that could contain a global
      * access. NODE_IDENT handled above (returns true with out_name set
@@ -9606,8 +9638,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
     return false;

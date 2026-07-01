@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// scan_func_props had the same leaf-return list as scan_unsafe_global_access.
+// can_spawn does not propagate through a NODE_STRUCT_INIT field value → an
+// ISR indirectly reaching a spawn via a struct-init-wrapped call was silently
+// accepted. "spawn inside interrupt handler" must transitively fire.
+struct Wrap { u32 dummy; }
+
+void dummy_worker() {}
+
+void inner_spawner() {
+    spawn dummy_worker();
+}
+
+u32 call_helper() {
+    inner_spawner();
+    return 0;
+}
+
+u32 wrapped_call() {
+    Wrap w = { .dummy = call_helper() };
+    return w.dummy;
+}
+
+interrupt USART1 {
+    u32 x = wrapped_call();
+    if (x > 0) { return; }
+}

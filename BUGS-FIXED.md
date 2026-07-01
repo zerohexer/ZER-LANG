@@ -5,6 +5,55 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — form-coverage: spawn-race + ISR-context walkers leaf-return NODE_TYPECAST/SLICE/STRUCT_INIT (silent data race + silent context loss), checker.c
+
+🔴 soundness / silent data race. Two adjacent walkers — `scan_unsafe_global_access`
+(checker.c ~9420, the spawn-race check for non-shared globals) and `scan_func_props`
+(checker.c ~9047, the FuncProps ISR/@critical/async context tracker) — kept an
+exhaustive-switch tail list that treated `NODE_TYPECAST`, `NODE_SLICE`, and
+`NODE_STRUCT_INIT` as LEAVES and returned false/void without recursing. A
+non-shared global read (or a call/spawn/yield/await/alloc effect) wrapped in any
+of these three forms was silently laundered past the check. Same shape as BH-18
+#7 (fixed 2026-06-27 on `scan_body_shared_types` at checker.c ~16213 — that walker
+did close the recursion; these two siblings did not).
+
+**Confirmed LIVE on HEAD `e3fe5d4`:**
+- `u32 x = (u32)g_counter;` inside a spawned function body → compiles clean
+  (data race missed) — the bare `x = g_counter` correctly errors.
+- `[*]u32 s = g_arr[0..5];` inside spawned body — same.
+- `Point p = { .x = g_val };` inside spawned body — same.
+- Transitive: `read_wrapped()` reading `g_bad` ONLY inside a struct-init field
+  value, called from a spawned function via the 32-level DFS → race missed.
+- Transitive spawn-in-ISR: `interrupt X { wrapped(); }` where `wrapped() { W w = {
+  .dummy = call_that_spawns() }; }` → "spawn inside interrupt handler" missed
+  (GCC's SSE-in-ISR reject is the wrong-axis backstop the AU-5 fix already
+  called out).
+
+**Root cause (both walkers):** the walker was written before NODE_TYPECAST /
+NODE_SLICE / NODE_STRUCT_INIT existed as effect-carrying forms; when the walker
+was made `-Wswitch`-exhaustive in Stage 2 Part B (2026-04-28), these kinds went
+into the "no children" tail list to keep GCC happy — but they DO carry children
+(`typecast.expr`, `slice.{object,start,end}`, `struct_init.fields[i].value`),
+so the exhaustive tail silently swallowed them. The 2026-06-27 BH-18 #7 fix
+patched the deadlock walker; these two siblings were missed. Class = form-coverage
+/ walker-completeness (the same class the doc calls "the #1 historical bug
+class").
+
+**Fix:** move `NODE_TYPECAST` / `NODE_SLICE` / `NODE_STRUCT_INIT` out of the
+leaf-list into explicit recurse cases in BOTH walkers, mirroring
+`scan_body_shared_types` / `find_shared_root_expr`. `NODE_CAST` (a phantom kind
+never created by the parser) and `NODE_SIZEOF` (a real leaf) stay in the tail.
+Zero over-rejection risk — same well-defined recursion the deadlock walker has
+run since 2026-06-27. Tests:
+`tests/zer_fail/spawn_race_typecast_launder.zer`,
+`tests/zer_fail/spawn_race_slice_launder.zer`,
+`tests/zer_fail/spawn_race_struct_init_launder.zer`,
+`tests/zer_fail/spawn_race_transitive_struct_init.zer`,
+`tests/zer_fail/isr_spawn_via_struct_init_launder.zer`.
+`make check` GREEN (890/890 zer + 784/784 rust + 36/36 zig + 28/28 module).
+
+---
+
 ## 2026-07-01 — AU-5: ISR-alloc / context-restriction scan blind to funcptr indirection, checker.c
 
 🟠 bare-metal context-restriction gap (Definition A §2.3/§5.7). `scan_func_props` followed

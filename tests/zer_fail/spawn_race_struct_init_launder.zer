@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// scan_unsafe_global_access must recurse into NODE_STRUCT_INIT field values.
+// A non-shared global read hidden inside a designated initializer field value
+// in a spawned function body silently laundered past the data-race check.
+u32 g_val;
+
+struct Point { u32 x; u32 y; }
+
+void worker() {
+    Point p = { .x = g_val, .y = 0 };
+    if (p.x > 0) { return; }
+}
+
+u32 main() {
+    spawn worker();
+    return 0;
+}

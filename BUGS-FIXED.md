@@ -5,6 +5,59 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — form-coverage: defer-body shared-lock walker `emit_defer_shared_root` missed NODE_INTRINSIC/ORELSE/SLICE/STRUCT_INIT + NODE_VAR_DECL defer-stmt was uninstrumented (silent defer-body race), emitter.c
+
+🔴 soundness / silent data race in defer bodies. Two adjacent gaps in
+`emitter.c` around 9001-9270 combined to leave a class of defer-body reads
+of `shared struct` unlocked at defer-fire time:
+
+1. **Walker gap:** `emit_defer_shared_root` (~9001) missed `NODE_INTRINSIC`,
+   `NODE_ORELSE`, `NODE_SLICE`, and `NODE_STRUCT_INIT` — mirror of the two
+   walker gaps just above. A defer that reads `g.v` through an intrinsic
+   (`defer { u32 z = @truncate(u32, g.v); }`) or a struct-init field value
+   returned NULL from the walker → no lock emitted → race.
+2. **Handler gap:** `emit_defer_stmt` (~9099) only lock-wrapped the
+   `NODE_EXPR_STMT` case (~9120 `emit_defer_shared_root(...) → emit_shared_
+   lock_mode`). The `NODE_VAR_DECL` case at ~9248 emitted the assignment /
+   init directly without calling the walker at all. So even a plain
+   `defer { u32 z = g.v; }` (var-decl init reading a shared field) emitted
+   no lock — the fresh audit case.
+
+**Confirmed LIVE on `1947146`** (verified by grepping emitted C):
+`defer { u32 z = @truncate(u32, g.v); result = z; }` compiled to
+`uint32_t z = (uint32_t)(g.v);` with NO surrounding `pthread_mutex_lock`.
+After fix the same source emits `pthread_mutex_lock(&g._zer_mtx); ...z =
+(uint32_t)(g.v); ...pthread_mutex_unlock`.
+
+**Root cause:** same class as the two prior fixes (form-coverage on a
+walker written before NODE_INTRINSIC/ORELSE/SLICE/STRUCT_INIT existed as
+effect-carriers), plus a distinct site (`NODE_VAR_DECL` case in
+`emit_defer_stmt`) that was never routed through the walker at all.
+
+**Fix:**
+- Add `NODE_INTRINSIC` (condvar/barrier/once skipped — they self-lock),
+  `NODE_ORELSE`, `NODE_SLICE`, and `NODE_STRUCT_INIT` recursion cases to
+  `emit_defer_shared_root` mirroring `find_shared_root_expr`.
+- Route `NODE_VAR_DECL` in `emit_defer_stmt` through the walker + rdlock
+  (var-decl init is a read; recursive mutex makes it safe if the caller
+  already holds a lock, BUG-473).
+
+Zero over-rejection risk (locks are extra work; correctness = safety).
+Test: `tests/zer/defer_shared_intrinsic_lock.zer` (positive — intrinsic-
+and struct-init-wrapped defer reads run and give the correct value; the
+lock is required for correctness against a concurrent writer).
+
+**Follow-up left OPEN:** `defer { u32 z = miss() orelse g.v; }` triggers a
+SEPARATE emitter bug — `emit_rewritten_node` has no `NODE_ORELSE` handler
+because defer bodies bypass IR lowering (which normally rewrites
+NODE_ORELSE). Emits `_zer_trap("compiler bug: unhandled NODE kind ...")`
+at runtime. Recorded in docs/limitations.md; not part of the walker
+class-closure.
+
+`make check` GREEN (892/892 zer + 784/784 rust + 36/36 zig + 28/28 modules).
+
+---
+
 ## 2026-07-01 — form-coverage: B1 multi-lock walker `find_all_shared_roots_expr` missed NODE_INTRINSIC/ORELSE/STRUCT_INIT (silent data race on shared(rw) multi-reads), ir_lower.c
 
 🔴 soundness / silent data race. `find_all_shared_roots_expr` (ir_lower.c ~1307)

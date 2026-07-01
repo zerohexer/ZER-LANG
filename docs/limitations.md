@@ -1067,6 +1067,51 @@ Gated the "may require libatomic on 32-bit" warning on
 the field was memset-zeroed and any `target_ptr_bits < N` check
 silently always-true. See BUGS-FIXED.md "Fix #1".
 
+## OPEN — `NODE_ORELSE` inside a `defer` body traps at runtime (emit_rewritten_node has no orelse handler) (LOW-MEDIUM, narrow)
+
+**Symptom (2026-07-01, discovered as a follow-up to the emit_defer_shared_root
+walker fix — see BUGS-FIXED.md 2026-07-01 defer entry):** `defer { u32 z =
+maybe() orelse g.v; }` compiles then TRAPS at runtime with:
+```
+_zer_trap("compiler bug: unhandled NODE kind in emit_rewritten_node", ...)
+```
+`stderr` line: `compiler bug: emit_rewritten_node hit unhandled node kind 47
+at line X (new NODE_ kind added to AST without emit_rewritten_node handler)`.
+Non-defer `u32 z = maybe() orelse g.v;` compiles fine (IR lowering rewrites
+NODE_ORELSE before emit_rewritten_node sees it).
+
+**Root cause:** defer bodies are emitted from RAW AST at IR_DEFER_FIRE (they
+never go through `ir_lower`), so the IR pipeline's NODE_ORELSE lowering is
+skipped. `emit_rewritten_node` (emitter.c) has no NODE_ORELSE handler
+because it was designed for the post-IR case where orelse has already been
+rewritten to a temp + branch. When a defer body contains orelse it hits the
+walker's default (LOUD, not silent — `_zer_trap` + fprintf) but is still a
+compile+link+runtime-abort cycle instead of a checker rejection.
+
+**Fix sketch (two options, both narrow):**
+- **Option A (checker-side reject):** the simplest fix — treat orelse inside
+  a defer body as a checker error at NODE_DEFER validation
+  (`check_body_effects` or the checker's per-scope defer walk). Consistent
+  with the other defer bans (return/break/continue/goto) documented in
+  CLAUDE.md as "banned inside defer" — orelse implicitly can early-return
+  (`orelse return;`) so the same argument applies.
+- **Option B (emitter-side lower):** teach `emit_defer_stmt` /
+  `emit_rewritten_node` to lower orelse inline (temp-load, branch on
+  has_value, fall-back expr). More code, but preserves orelse's expression
+  form for the value-only shape (`x orelse 0`).
+
+Option A is the safer default (kills the class + a whole trap-at-runtime
+UX loss) — pick unless a specific defer-body-with-orelse use case emerges.
+
+**Tripwire:** `tests/zer_fail/defer_orelse_unhandled.zer` (needs writing
+once the fix direction is chosen; the trap-at-runtime signature is easy to
+match).
+
+**Class:** emitter walker completeness (defer-body path bypasses IR
+lowering).
+
+---
+
 ## OPEN — `naked` attribute silently dropped on IR path
 
 See full entry near the bottom of this file ("`naked` attribute

@@ -1,0 +1,40 @@
+// emit_defer_shared_root (emitter.c ~9001) must recurse into NODE_INTRINSIC,
+// NODE_SLICE, and NODE_STRUCT_INIT so a deferred shared read via any of those
+// forms picks up its mutex lock at defer-fire. Also covers the NODE_VAR_DECL
+// defer-stmt path (was uninstrumented before).
+//
+// (NODE_ORELSE inside defer is a separate emitter-side gap — emit_rewritten_node
+// has no orelse handler because defer bodies bypass IR lowering. Not covered
+// here; see docs/limitations.md.)
+shared struct S { u32 v; }
+
+S g;
+u32 result;
+
+void via_intrinsic() {
+    defer {
+        u32 z = @truncate(u32, g.v);
+        result = z;
+    }
+    result = 0;
+}
+
+struct Pair { u32 a; }
+
+void via_struct_init() {
+    defer {
+        Pair p = { .a = g.v };
+        result = p.a;
+    }
+    result = 0;
+}
+
+u32 main() {
+    g.v = 42;
+    via_intrinsic();
+    if (result != 42) { return 1; }
+    result = 0;
+    via_struct_init();
+    if (result != 42) { return 3; }
+    return 0;
+}

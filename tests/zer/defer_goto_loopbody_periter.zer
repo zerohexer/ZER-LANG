@@ -1,0 +1,12 @@
+// bh18_12 guard: a defer registered INSIDE the loop (AFTER the label) must
+// still fire per-iteration (loop-iteration semantics preserved). 3 iterations.
+u32 counter;
+void inc() { counter += 1; }
+void run() {
+    u32 i = 0;
+    loop:
+    defer inc();
+    i += 1;
+    if (i < 3) { goto loop; }
+}
+u32 main() { run(); if (counter == 3) { return 0; } return 1; }

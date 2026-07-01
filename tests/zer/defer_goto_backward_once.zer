@@ -1,0 +1,12 @@
+// bh18_12: a function-scope `defer` before a loop label must fire ONCE at the
+// real exit, NOT once per backward-goto traversal. Was: counter=3; want: 1.
+u32 counter;
+void inc() { counter += 1; }
+void run() {
+    u32 i = 0;
+    defer inc();
+    loop:
+    i += 1;
+    if (i < 3) { goto loop; }
+}
+u32 main() { run(); if (counter == 1) { return 0; } return 1; }

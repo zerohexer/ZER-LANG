@@ -44,6 +44,15 @@ typedef struct {
      * fall-through and installs the guard so the lazy return-fire runs on
      * fall-through (flag=0) and is skipped on the goto path (flag=1). */
     int goto_fired_count;
+    /* bh18_12 (2026-07-01): ctx->defer_count captured when this label was
+     * DEFINED (NODE_LABEL) = the number of defers registered BEFORE the label.
+     * -1 = not yet defined. On a BACKWARD goto (label already defined = loop
+     * back-edge), fire ONLY defers registered AFTER the label (index >= this);
+     * defers registered BEFORE it (e.g. a function-scope `defer` before the
+     * loop) stay pending for the real exit — NOT once per iteration. Without
+     * this a `defer inc(); loop: ... goto loop;` fired inc() per back-edge
+     * (bh18_12: counter=3 instead of 1). */
+    int defer_count_at_def;
 } IRLabelMap;
 
 typedef struct {
@@ -172,6 +181,7 @@ static int find_label_block(LowerCtx *ctx, const char *name, uint32_t len) {
     ctx->labels[ctx->label_count].goto_fired = 0;
     ctx->labels[ctx->label_count].guard_flag_local = -1;
     ctx->labels[ctx->label_count].goto_fired_count = 0;
+    ctx->labels[ctx->label_count].defer_count_at_def = -1;
     ctx->label_count++;
     return bid;
 }
@@ -215,6 +225,25 @@ static int get_label_goto_fired_count(LowerCtx *ctx, const char *name, uint32_t 
             memcmp(ctx->labels[i].name, name, len) == 0)
             return ctx->labels[i].goto_fired_count;
     return 0;
+}
+/* bh18_12: record/read the defer count captured when a label was DEFINED.
+ * A goto whose target has a >= 0 value here is a BACKWARD goto (the label was
+ * already processed) — see IRLabelMap.defer_count_at_def. */
+static void set_label_defer_count_at_def(LowerCtx *ctx, const char *name,
+                                         uint32_t len, int count) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0) {
+            ctx->labels[i].defer_count_at_def = count;
+            return;
+        }
+}
+static int get_label_defer_count_at_def(LowerCtx *ctx, const char *name, uint32_t len) {
+    for (int i = 0; i < ctx->label_count; i++)
+        if (ctx->labels[i].len == len &&
+            memcmp(ctx->labels[i].name, name, len) == 0)
+            return ctx->labels[i].defer_count_at_def;
+    return -1;
 }
 
 /* collect_locals REMOVED — locals now created on-demand in lower_stmt.
@@ -3256,10 +3285,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * the IR_DEFER_PUSH instructions for those defers re-run at runtime
          * (the PUSH emission re-appends the body), so the next iteration
          * has them active again — matches loop-iteration defer semantics. */
-        bool goto_had_defers = ctx->defer_count > 0;
-        int goto_fired_count = ctx->defer_count;  /* save BEFORE the pop */
-        emit_defer_fire_scoped(ctx, 0, true, node->loc.line);
-        ctx->defer_count = 0;
+        /* bh18_12 (2026-07-01): a BACKWARD goto (target label already DEFINED)
+         * is a loop back-edge — it exits only the scopes INSIDE the loop, so it
+         * fires ONLY defers registered AFTER the label (index >= the label's
+         * defer_count_at_def). Defers registered BEFORE the label (a function-
+         * scope `defer` before the loop) stay pending and fire at the real exit,
+         * NOT once per iteration. A FORWARD goto (label not yet defined -> -1)
+         * keeps base 0 + the existing guard machinery (sesjma 2026-06-29). */
+        int lbl_def = get_label_defer_count_at_def(ctx, node->goto_stmt.label,
+            (uint32_t)node->goto_stmt.label_len);
+        int fire_base = (lbl_def >= 0) ? lbl_def : 0;
+        bool goto_had_defers = ctx->defer_count > fire_base;
+        int goto_fired_count = ctx->defer_count - fire_base; /* count actually fired */
+        emit_defer_fire_scoped(ctx, fire_base, true, node->loc.line);
+        ctx->defer_count = fire_base;
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -3305,6 +3344,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_LABEL: {
         int target = find_label_block(ctx,
             node->label_stmt.name, (uint32_t)node->label_stmt.name_len);
+        /* bh18_12 (2026-07-01): record the defers live at the label's program
+         * point (on the fall-through path) = defers registered BEFORE the label.
+         * A later BACKWARD goto to this label fires only defers ABOVE this count
+         * (loop-body defers), leaving pre-label defers pending for the real exit.
+         * Captured BEFORE the restore logic below (which mutates defer_count). */
+        set_label_defer_count_at_def(ctx, node->label_stmt.name,
+            (uint32_t)node->label_stmt.name_len, ctx->defer_count);
         /* plt86m defer-goto fix. A forward goto fired ALL live defers (base 0)
          * EAGERLY on its edge and set this label's "already fired" flag. The
          * defers must fire exactly once on every path. Two cases:

@@ -202,10 +202,10 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
   pre-existing pointer alias. Register the move local when `&a` is taken (flagged `is_move_local`
   so the leak check skips it + its alias) + propagate TRANSFERRED to the alloc_id group at the
   transfer. Tests `tests/zer_fail/move_alias_stale_read.zer` + `tests/zer/move_alias_ok.zer`.
-- 🟡 **`tests/zer_gaps/bh18_12_defer_goto_parametric.zer`** (miscompile) — confirmed LIVE (defer
-  fires N× on a same-scope backward goto; value=3, want 1). NO fix yet. Backward-goto to a
-  same-scope label should NOT fire the function-scope defer (it isn't exiting the scope) — opposite
-  direction of the sesjma forward-goto fix; ir_lower.c goto/defer scope machinery.
+- ✅ **bh18_12 — FIXED 2026-07-01** (see BUGS-FIXED.md): defer fired N× on a same-scope backward
+  goto. Fix: per-label `defer_count_at_def`; a backward goto fires only defers registered AFTER
+  the label (loop-body defers), leaving pre-label defers pending for the real exit. Forward gotos
+  unchanged (base 0 + sesjma guard). Tests `tests/zer/defer_goto_{backward_once,loopbody_periter}.zer`.
 - 🟠 **AU-5** (ISR-alloc blind to funcptr indirection) — bare-metal memory-safety, NOT yet
   triaged. NOT ASM/deferred: it is the SAME funcptr-descent shape as BH-18 #8 (the spawn-race
   scan) applied to the ISR-alloc ban — `scan_func_props` NODE_CALL should follow funcptr args

@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — BH-18 #12: defer fires N× on a same-scope backward goto (miscompile), ir_lower.c
+
+🟡 miscompile. Confirmed LIVE (`defer inc(); loop: i+=1; if(i<3){goto loop;}` gave counter=3,
+want 1). A function-scope `defer` registered BEFORE a loop label fired once per backward-goto
+traversal instead of once at the real exit.
+
+**Root cause:** the `NODE_GOTO` handler fired ALL live defers (`emit_defer_fire_scoped(ctx, 0,
+…)` — base 0) on every goto. For a backward goto (loop back-edge) that eagerly fires the pre-loop
+defer on each iteration. The handler's own comment even documented firing "defers pushed BETWEEN
+the label and the goto" as loop-iteration semantics — but base 0 also fired defers pushed BEFORE
+the label.
+
+**Fix:** record `defer_count_at_def` on each label (ctx->defer_count captured when NODE_LABEL is
+processed = defers registered before the label). On a BACKWARD goto (target already defined,
+`defer_count_at_def >= 0`), fire from that base instead of 0 — so only defers registered AFTER
+the label (loop-body defers) fire per-iteration; pre-label defers stay pending for the real exit.
+FORWARD gotos (label not yet defined → -1) keep base 0 + the sesjma 2026-06-29 guard machinery
+unchanged. Verified: bh18_12 → counter=1; a loop-BODY defer still fires per-iteration (counter=3,
+no regression); both sesjma forward-goto tests still pass. Tests:
+`tests/zer/defer_goto_backward_once.zer`, `tests/zer/defer_goto_loopbody_periter.zer`. `make check` GREEN.
+
+---
+
 ## 2026-07-01 — BH-18 #1b: use-after-move via a pre-existing pointer alias, zercheck_ir.c
 
 🔴 silent UAF. Confirmed LIVE against current main (returned the stale value), now rejected.

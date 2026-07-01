@@ -1,0 +1,9 @@
+// AU-5 positive (no over-rejection): passing an alloc-ing function as a funcptr
+// argument OUTSIDE any ISR/@critical/async context is fine — the effect props
+// only trigger errors at restricted-context entry.
+struct T { u32 v; }
+Slab(T) sl;
+void alloc_it() { *T p = sl.alloc_ptr() orelse return; p.v = 1; sl.free_ptr(p); }
+void run_fn(*() fn) { fn(); }
+void normal() { run_fn(alloc_it); }
+u32 main() { normal(); return 0; }

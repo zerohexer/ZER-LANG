@@ -9146,6 +9146,31 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
             }
         }
 
+        /* AU-5 (2026-07-01): a function passed as a funcptr ARGUMENT may be
+         * invoked indirectly by the callee (`run(fn); ... fn();`). The ISR /
+         * @critical / async context checks are Definition-A VERIFIED context
+         * restrictions (primitives-data-races.md §2.3, §5.7 "no allocation in
+         * ISR") — so their effects must propagate, else e.g. `slab.alloc()`
+         * reachable via a funcptr from an ISR is missed and the guarantee
+         * carries an asterisk (violating the §2.4 honesty property). Conservative
+         * (the callee might not invoke it), mirroring the direct-call
+         * propagation above and the BH-18 #8 funcptr-descent (spawn-race scan).
+         * Harmless outside restricted contexts — these props only trigger errors
+         * at ISR/@critical/async entry. */
+        for (int ai = 0; ai < node->call.arg_count; ai++) {
+            Node *arg = node->call.args[ai];
+            if (!arg || arg->kind != NODE_IDENT) continue;
+            Symbol *fs = scope_lookup(c->global_scope,
+                arg->ident.name, (uint32_t)arg->ident.name_len);
+            if (fs && fs->is_function) {
+                ensure_func_props(c, fs);
+                if (fs->props.can_yield) parent_sym->props.can_yield = true;
+                if (fs->props.can_spawn) parent_sym->props.can_spawn = true;
+                if (fs->props.can_alloc) parent_sym->props.can_alloc = true;
+                if (fs->props.has_sync)  parent_sym->props.has_sync = true;
+            }
+        }
+
         /* Module-qualified calls: config.func() rewritten to NODE_FIELD(NODE_IDENT, field).
          * The field name is the function name after module prefix rewrite. */
         if (node->call.callee && node->call.callee->kind == NODE_FIELD &&

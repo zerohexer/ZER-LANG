@@ -206,10 +206,11 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
   goto. Fix: per-label `defer_count_at_def`; a backward goto fires only defers registered AFTER
   the label (loop-body defers), leaving pre-label defers pending for the real exit. Forward gotos
   unchanged (base 0 + sesjma guard). Tests `tests/zer/defer_goto_{backward_once,loopbody_periter}.zer`.
-- 🟠 **AU-5** (ISR-alloc blind to funcptr indirection) — bare-metal memory-safety, NOT yet
-  triaged. NOT ASM/deferred: it is the SAME funcptr-descent shape as BH-18 #8 (the spawn-race
-  scan) applied to the ISR-alloc ban — `scan_func_props` NODE_CALL should follow funcptr args
-  into their bodies. Tractable; triage repro first.
+- ✅ **AU-5 — FIXED 2026-07-01** (see BUGS-FIXED.md): the ISR/@critical/async context-restriction
+  scan (`scan_func_props`) was blind to a function passed as a funcptr argument and invoked
+  indirectly. Per primitives-data-races.md §2.3/§5.7 (context restrictions are Definition-A
+  VERIFIED), closed by propagating a funcptr-arg function's props to the parent (mirrors BH-18 #8).
+  Tests `tests/zer_fail/isr_alloc_via_funcptr.zer` + `tests/zer/funcptr_alloc_non_isr_ok.zer`.
 - ⏸️ **AU-6** (privileged `@cpu_*` have no call-site context check) — **DEFERRED to the Option E
   ASM-safety rework** (`docs/asm_lang_zer_safe.md`, LOCKED). Under Effect-Row Composition the
   privileged `@cpu_*` ops are Tier-B LEAVES; their privilege safety is a declared effect-row

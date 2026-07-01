@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — AU-5: ISR-alloc / context-restriction scan blind to funcptr indirection, checker.c
+
+🟠 bare-metal context-restriction gap (Definition A §2.3/§5.7). `scan_func_props` followed
+DIRECT calls (propagating `can_alloc`/`can_spawn`/`can_yield`/`has_sync` for the ISR/@critical/
+async context checks) but NOT a function passed as a funcptr ARGUMENT and invoked indirectly:
+`void run(*() fn){ fn(); } void isr_work(){ run(alloc_it); } interrupt X { isr_work(); }` —
+`alloc_it`'s `slab.alloc()` was invisible to the "no allocation in ISR" verification. GCC's
+`interrupt`-attribute (SSE-in-ISR) incidentally rejected the emitted C, but on the WRONG axis
+(ISA-ABI, a hardware concern per §5.7), not the deadlock — so the guarantee carried an asterisk
+(violating the §2.4 honesty property), and a funcptr-in-ISR pattern not tripping SSE would slip
+through silently.
+
+**Decision (Option A, per primitives-data-races.md):** context restrictions are Definition-A
+VERIFIED (§2.3, §5.7 "no allocation in ISR"), so ZER must complete its own check rather than
+lean on GCC's axis-mismatched backstop. **Fix:** in `scan_func_props` NODE_CALL, for each arg
+that is a `NODE_IDENT` resolving to a global function, propagate its props to the parent —
+mirroring the direct-call path and the BH-18 #8 funcptr-descent. Conservative (the callee might
+not invoke the funcptr); harmless outside restricted contexts (props only error at ISR/@critical/
+async entry). Now ZER catches the funcptr-alloc-in-ISR at the checker with the correct
+`cannot allocate inside interrupt handler` diagnostic (before GCC). Tests:
+`tests/zer_fail/isr_alloc_via_funcptr.zer` (negative), `tests/zer/funcptr_alloc_non_isr_ok.zer`
+(positive — non-ISR use still compiles). `make check` GREEN.
+
+---
+
 ## 2026-07-01 — BH-18 #12: defer fires N× on a same-scope backward goto (miscompile), ir_lower.c
 
 🟡 miscompile. Confirmed LIVE (`defer inc(); loop: i+=1; if(i<3){goto loop;}` gave counter=3,

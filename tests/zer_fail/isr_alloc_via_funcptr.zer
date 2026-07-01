@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// AU-5: heap allocation reachable from an ISR THROUGH a funcptr must be caught
+// by ZER's "no allocation in ISR" verification (primitives-data-races.md §5.7),
+// not left to GCC's incidental SSE-in-ISR error. scan_func_props now propagates
+// effects of a function passed as a funcptr argument.
+struct T { u32 v; }
+Slab(T) sl;
+void alloc_it() { *T p = sl.alloc_ptr() orelse return; p.v = 1; sl.free_ptr(p); }
+void run_fn(*() fn) { fn(); }
+void isr_work() { run_fn(alloc_it); }
+interrupt USART1 { isr_work(); }
+u32 main() { return 0; }

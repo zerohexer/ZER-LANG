@@ -206,9 +206,18 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
   fires N× on a same-scope backward goto; value=3, want 1). NO fix yet. Backward-goto to a
   same-scope label should NOT fire the function-scope defer (it isn't exiting the scope) — opposite
   direction of the sesjma forward-goto fix; ir_lower.c goto/defer scope machinery.
-- 🟠 **AU-5** (ISR-alloc blind to funcptr indirection) / 🟠 **AU-6** (privileged `@cpu_*` no
-  call-site context check) — bare-metal, NOT yet triaged/fixed. AU-6 is partly a design question
-  (ZER has no kernel/user context type to check against).
+- 🟠 **AU-5** (ISR-alloc blind to funcptr indirection) — bare-metal memory-safety, NOT yet
+  triaged. NOT ASM/deferred: it is the SAME funcptr-descent shape as BH-18 #8 (the spawn-race
+  scan) applied to the ISR-alloc ban — `scan_func_props` NODE_CALL should follow funcptr args
+  into their bodies. Tractable; triage repro first.
+- ⏸️ **AU-6** (privileged `@cpu_*` have no call-site context check) — **DEFERRED to the Option E
+  ASM-safety rework** (`docs/asm_lang_zer_safe.md`, LOCKED). Under Effect-Row Composition the
+  privileged `@cpu_*` ops are Tier-B LEAVES; their privilege safety is a declared effect-row
+  category (`changes_privilege: requires_cpl0` + the mandatory `safety:` string), enforced as
+  WITNESSED (QEMU CPL readback) or DECLARED+TAINTED (named floor), NOT a static per-call context
+  gate — actual CPL is a runtime hardware fact ZER can't check statically. AU-6's context-check
+  approach is superseded; do NOT implement it standalone. NOTE: the intrinsics STAY (they become
+  the leaves; `option_e_plan.md` STEP 0 deletes the per-arch tables, not the intrinsics).
 - `naked_attribute_silently_dropped` (intentional deferral).
 
 ---

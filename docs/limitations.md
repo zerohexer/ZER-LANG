@@ -1231,42 +1231,22 @@ pool-aware FuncSummary). Attempted in this session but reverted: it
 trips the **defer-fires-twice-on-goto-to-same-scope** emitter bug
 described below.
 
-## OPEN — Defer fires twice when goto target is in same defer scope
+## FIXED (verified 2026-07-01 — was stale OPEN entry) — Defer fires twice when goto target is in same defer scope
 
-**Symptom:** `defer free(h); ... goto cleanup; ... cleanup: return 0;`
-fires the defer body once at the goto site AND again at the return
-site. The defer body executes twice for a single dynamic execution.
+**RESOLVED.** The forward-goto shape quoted below (`defer free(h); goto
+cleanup; cleanup: return 0;`) now fires the defer exactly once — verified
+against current main with the exact reproducer. Closed by the plt86m
+(2026-06-17/2026-06-20) + sesjma (2026-06-29, forward-goto-fallthrough)
+guard-flag work, and the backward-goto sibling (BH-18 #12, loop back-edges)
+by the 2026-07-01 `defer_count_at_def` fix. This entry's write-up predates
+both fixes and was never removed. Original symptom/root-cause kept below for
+history.
 
-**Why it's hidden today:** runtime `_zer_pool_free` is intentionally
-lenient (just bumps gen + clears used; no validation on stale h_gen).
-Double-fire of `pool.free(h)` silently bumps gen twice. The
-`rust_tests/rt_goto_fires_defer.zer` test relies on this — its
-check `freed_count != 1` runs at `cleanup:` BEFORE the second fire,
-so the test passes.
-
-**Why it matters:** any future runtime hardening of `_zer_pool_free`
-(generation validation, wrong-pool detection) traps on the second
-fire. The compile-time guarantee `zercheck_ir` reports for handle
-states becomes inconsistent with runtime behavior. Also: for user
-defers with non-idempotent side effects (file close, lock release),
-double-fire is a real bug.
-
-**Root cause:** `ir_lower.c` NODE_GOTO emits `emit_defer_fire(ctx)`
-which generates `IR_DEFER_FIRE` with mode "fire all, no pop". The
-function-exit defer fire then emits the same set again. The emitter
-needs to track which defer entries have already been fired on the
-current dynamic path, OR not fire defers when the goto target is
-inside the same defer scope (let the natural function exit fire them).
-
-**Fix estimate:** ~50-80 lines in `ir_lower.c` to compute "is goto
-target inside current defer scope" and skip the fire if so. Requires
-walking from goto site to label site through the lexical block
-structure. Alternative: a runtime per-defer "fired" flag — simpler
-but adds per-defer state.
-
-**Workaround today:** users SHOULD NOT rely on goto-fires-defer for
-non-idempotent cleanup. Either avoid goto-to-same-scope-label OR use
-explicit cleanup at the label.
+**Original symptom:** `defer free(h); ... goto cleanup; ... cleanup: return 0;`
+fired the defer body once at the goto site AND again at the return
+site. **Original root cause:** `ir_lower.c` NODE_GOTO emitted an eager
+"fire all, no pop" that the function-exit fire then repeated; fixed via a
+per-label runtime guard flag (goto path sets it, return-fire checks it).
 
 ## ~~4 narrow zercheck patterns not in zercheck_ir~~ (FIXED 2026-05-04, Phase F3.2)
 
@@ -1304,91 +1284,19 @@ the missing case (and the symmetric TRANSFERRED + MAYBE_FREED). ~6 LOC.
 
 ---
 
-## OPEN — `naked` is a silent marker, not real-naked
+## STALE DUPLICATE BLOCK REMOVED (2026-07-01) — 2026-05-01 audit findings
 
-**Discovered:** 2026-05-01 audit (BUG-651 sibling).
-
-Functions declared `naked` compile cleanly but the IR emission path
-does NOT emit `__attribute__((naked))`. GCC therefore inserts a
-normal prologue/epilogue around the user's hand-written asm. The
-existing `tests/zer/asm_*.zer` suite implicitly relies on this — none
-of those asm bodies include explicit `ret` instructions.
-
-Restoring real naked semantics requires:
-
-1. Emit `__attribute__((naked))` from `emit_regular_func_from_ir`.
-2. Update every existing asm test to include `ret`/`bx lr`/`ret` in
-   the asm body.
-3. Add a checker error for `return expr;` inside naked (ABI broken
-   when there's no prologue to set the return register).
-4. Document the migration in CLAUDE.md and reference.md.
-
-This is a user-visible breaking change. Until then, `naked` enforces
-the asm-only body restriction (BUG V4 fix from 2026-04-12) but does
-NOT actually elide the prologue. The false-naked semantics are sound:
-regular C prologue + asm body + regular C epilogue is well-defined;
-users who expected true naked would fail to assemble due to the
-missing `ret` they didn't write.
-
-## OPEN — `@once` lacks `__STDC_HOSTED__` guard
-
-**Discovered:** 2026-05-01 audit.
-
-Emitter unconditionally produces `__atomic_exchange_n(&_zer_once_N, 1,
-__ATOMIC_ACQ_REL)` for `@once` blocks (emitter.c:8313). GCC implements
-`__atomic_*` via libatomic on targets without lock-free CAS for the
-relevant width — freestanding/baremetal builds without libatomic
-linkage will fail to link or fall back to a non-atomic implementation
-that's racy across cores. Should guard with `__STDC_HOSTED__` or emit
-a target-specific intrinsic where available.
-
-## OPEN — `@probe` silently succeeds on freestanding
-
-**Discovered:** 2026-05-01 audit.
-
-`@probe(addr)` returns `?u32`. Hosted builds catch SIGSEGV and return
-null on fault. Freestanding builds (no signal handler) return
-`{ .has_value = 1, .value = <whatever the load returned> }` — silent
-garbage on bad MMIO addresses. Either disable `@probe` on freestanding
-or add a target-specific fault handler hook.
-
-## OPEN — `@critical` indirect return via callee
-
-**Discovered:** 2026-05-01 audit. checker.c around lines 8983 and 10016.
-
-Direct `return`/`break`/`continue`/`goto` inside `@critical` is rejected.
-Calling a function whose body returns from the caller's perspective
-escapes `@critical` without re-enabling interrupts:
-
-```zer
-void unlock() { return; }   // legal
-@critical { unlock(); }     // interrupts NOT re-enabled
-```
-
-Catching this requires call-graph analysis or function summaries
-(`can_escape` predicate), similar to the existing transitive deadlock
-detection. Tracked in the audit roadmap; defer until concurrency
-work resumes.
-
-## OPEN — AST `emit_expr` compound `/=` and `%=` lack signed-overflow trap
-
-**Discovered:** 2026-05-01 audit. emitter.c:1433–1444.
-
-BUG-612 fixed `INT_MIN / -1` trap emission for the IR path
-(`emit_rewritten_node` at emitter.c:5787–5808). The AST sibling at
-1433–1444 only emits the divzero trap. Reachability through user
-function bodies is limited (function bodies are IR-only since
-2026-04-19), but other emission contexts (some statement-expression
-fallbacks) still go through `emit_expr`. Apply the same `INT_MIN`
-guard pattern as the IR path.
-
-## OPEN — u64 atomic warning fires on 64-bit targets
-
-**Discovered:** 2026-05-01 audit. checker.c around lines 6601, 6637.
-
-The "may require libatomic on 32-bit" warning is emitted for every
-`@atomic_*` on a u64 operand, regardless of `--target-bits`. False
-positive on 64-bit hosts. Gate the warning on `target_bits < 64`.
+This block originally re-stated, verbatim, five findings from the 2026-05-01
+audit that were ALL already fixed and documented elsewhere in this file
+(diff-confirmed 2026-07-01 — identical text to the `~~struck-through~~ (FIXED
+…)` entries below: `@once` guard, `@probe` freestanding, `@critical` indirect
+return [investigated, not a bug], AST compound `/=`/`%=` trap, u64 atomic
+warning), plus a duplicate of the `naked`-is-silent-marker entry (see the
+fuller write-up later in this file, "`naked` attribute silently dropped on IR
+path (deferred 2026-05-02)" — that one remains genuinely OPEN, is asm-related,
+and per current direction folds into the Option E rework, not a standalone fix).
+The original audit dump is preserved in git history; removed here to stop the
+doc claiming five fixed bugs are open.
 
 ---
 
@@ -1891,7 +1799,18 @@ attribute in `emit_func_attributes` (emitter.c) and remove this entry.
 
 ---
 
-## OPEN — defer body uses a handle the function body then frees → silent UAF (2026-06-15)
+## FIXED (incidentally, 2026-07-01 — verified, was stale OPEN entry) — defer body uses a handle the function body then frees → silent UAF (2026-06-15)
+
+**RESOLVED — closed as a SIDE EFFECT of the AU-1 LIFO fix (BUGS-FIXED.md
+2026-07-01), not targeted directly.** Verified against current main with the
+exact reproducer below: now correctly rejected (`use after free: 'h' is freed`).
+The legitimate same-defer `defer { use_item(h); gp.free(h); }` pattern still
+compiles (no over-rejection). AU-1's fix (collect all `IR_DEFER_PUSH` in
+registration order, process in reverse/LIFO order per return block, checking
+each defer's uses against the LIVE path state before applying its frees) means
+a single defer's use is checked against `ret_ps`, which already reflects any
+main-body free that executed before the return — so this case was subsumed.
+Original write-up kept below for history/context.
 
 **Symptom:** a deferred call *uses* a handle (`defer use_item(h);`), the
 function body then transitions that handle out of ALIVE (`gp.free(h)`,
@@ -1983,12 +1902,46 @@ coverage). "miscompile" = clean compile + wrong runtime result. Severity tags:
 
 ---
 
-## OPEN — BH-18 #1 — move-struct pointer alias defeats ownership/free tracking (🔴 soundness)
+## PARTIALLY FIXED (2026-07-01) — BH-18 #1 — move-struct pointer alias defeats ownership/free tracking (🔴 soundness) — 1b CLOSED, 1a + 1c STILL LIVE
 
-**Symptom:** a `*T` pointer alias taken **before** a `move struct` is consumed
-(or before its owned pointer field is freed) is never linked to the source's
-`HS_TRANSFERRED`/`FREED` state. Three escalating, clean-compiling manifestations
-— the worst is a genuine **heap use-after-free with slab slot reuse**.
+**Status as of 2026-07-01, verified by fresh reproduction against current
+main:** this entry has THREE escalating manifestations (1a/1b/1c below).
+**Only 1b is fixed.** 1a and 1c were re-verified LIVE (clean compile) with
+their exact reproducers — do NOT treat this entry as closed.
+
+- **1b (use-after-move stale read via `&x` alias) — FIXED 2026-07-01.**
+  `*Tok p = &a; Tok b = a; return p.kind;` now correctly rejects
+  (`use after free: local %2 is transferred`). Fix: register the move-struct
+  local when `&a` is taken (flagged `is_move_local` so the leak check skips it
+  + its aliases), and propagate `TRANSFERRED` to the alloc_id group at the
+  transfer (mirrors the existing free-path `ir_propagate_alias_state`). See
+  BUGS-FIXED.md 2026-07-01 ("BH-18 #1b"). Tests:
+  `tests/zer_fail/move_alias_stale_read.zer`, `tests/zer/move_alias_ok.zer`.
+
+- **1a (heap UAF + slab slot reuse via a move-struct FIELD's pointer copied
+  out) — STILL LIVE.** Re-verified 2026-07-01 with the exact reproducer below:
+  clean compile, `alias.id` reads the reused slot. Mechanism is DIFFERENT from
+  1b: `alias` is a plain VALUE COPY of a struct field (`*Task alias = o.p;` —
+  a `NODE_FIELD` read whose result happens to be a pointer), not `&`-of-the-
+  move-struct or its field. Unclear yet whether the 1b fix's alias machinery
+  extends here or whether field-pointer-value-copies need their own alias
+  registration (independent investigation needed before implementing — see
+  the 2026-07-01 addendum below this entry).
+
+- **1c (double-consume/double-close via re-dereferencing the alias to
+  resurrect a moved-from value) — STILL LIVE.** Re-verified 2026-07-01 with the
+  exact reproducer below: clean compile, `g_closes == 2`. `alias = &f` IS the
+  1b shape (and now correctly carries `f`'s alloc_id + inherits TRANSFERRED
+  per the 1b fix) — but `FileHandle reborn = *alias;` is a FULL DEREFERENCE
+  (`*ptr`, producing a fresh struct-value copy), a DIFFERENT code path than the
+  `.field` read UAF check the 1b fix touched. Needs its own investigation (see
+  the 2026-07-01 addendum below).
+
+**Symptom (original, all three manifestations):** a `*T` pointer alias taken
+**before** a `move struct` is consumed (or before its owned pointer field is
+freed) is never linked to the source's `HS_TRANSFERRED`/`FREED` state. Three
+escalating, clean-compiling manifestations — the worst is a genuine **heap
+use-after-free with slab slot reuse**.
 
 **1a — heap UAF + slot reuse (memory corruption):**
 ```zer
@@ -2065,6 +2018,13 @@ error.
 
 **Distinctness:** NOT BUG-740 (funcptr consume-maybe — caught here), NOT
 BUG-742 (conditional global dangle), NOT defer item #9 (no defer, no Handle).
+
+**2026-07-01 status:** the "`&x` taken of a move-tracked variable" half of this
+sketch is DONE (closes 1b). The "raw-ptr copy of a move-struct's owned FIELD"
+half (closes 1a) and the full-dereference-through-alias gap (closes 1c) are
+NOT yet designed — see the PARTIALLY FIXED header above for what's confirmed
+still live and why each needs separate investigation before implementing
+(different code paths than the 1b fix touched).
 
 ---
 
@@ -2380,7 +2340,15 @@ fires for the cast form too). Tripwire: `tests/zer_fail/shared_cast_subexpr.zer`
 
 ---
 
-## OPEN — BH-18 #8 — `spawn` data-race scan is blind to function-pointer indirection → data race (🟠 race)
+## FIXED (2026-07-01, copied from cool-johnson-11ct36) — BH-18 #8 — `spawn` data-race scan is blind to function-pointer indirection → data race (🟠 race)
+
+**RESOLVED.** Verified with the exact reproducer below against current main:
+now correctly rejected (`error: spawn target 'worker' accesses non-shared
+global 'g_counter' — data race`). Fix: `scan_unsafe_global_access` (checker.c)
+now follows every `NODE_IDENT` call argument that resolves to a function
+symbol, descending into its body the same way it descends into a direct
+callee (shared `_scan_depth` cap 32). See BUGS-FIXED.md 2026-07-01
+("Branch-import Tier 1"). Original write-up kept below for history.
 
 **Symptom:** the spawn non-shared-global scan follows only **direct** calls. A
 call through a function pointer (a `*()` param `cb()`, or a local
@@ -2501,7 +2469,15 @@ until a real value-retrieval API exists).
 
 ---
 
-## OPEN — BH-18 #11 — bit-query/byte-swap intrinsics emit `0` in global initializers (🟡 miscompile)
+## FIXED (verified 2026-07-01 — was stale OPEN entry) — BH-18 #11 — bit-query/byte-swap intrinsics emit `0` in global initializers (🟡 miscompile)
+
+**RESOLVED.** Verified with the exact reproducer below against current main:
+`u32 g = @popcount(255); u32 main() { return g; }` now returns `8` (was `0`).
+The AST `NODE_INTRINSIC` emitter path now emits the GCC builtins for all 9
+bit-query/byte-swap intrinsics in global initializers. Fixed in an untracked
+prior session (sesjma's 2026-06-29 audit independently reconfirmed this same
+fix on a different code path — see that entry's note below); this entry's
+write-up predates it and was never removed. Original write-up kept for history.
 
 **Symptom:** `@popcount`/`@ctz`/`@clz`/`@ffs`/`@parity`/`@bswap16`/`@bswap32`/
 `@bswap64` used in a **global variable initializer** silently emit
@@ -2535,7 +2511,17 @@ accepts the global because these return `u32` (type-checks fine).
 
 ---
 
-## OPEN — BH-18 #12 — `defer` + backward `goto` fires the wrong count (🟡 miscompile; folds into known item "defer fires twice")
+## FIXED (2026-07-01) — BH-18 #12 — `defer` + backward `goto` fires the wrong count (🟡 miscompile; folds into known item "defer fires twice")
+
+**RESOLVED.** Verified with the exact reproducer below against current main:
+`counter` is now `1` (was `2`, parametric with back-edge count). Fix: per-label
+`defer_count_at_def` recorded when `NODE_LABEL` is processed (= defers
+registered before the label); a BACKWARD goto (target already defined) fires
+only defers registered AFTER the label (loop-body defers), leaving pre-label
+defers pending for the real exit. Forward gotos unchanged (base 0 + the
+existing guard machinery). Verified no regression: a loop-BODY defer still
+fires per-iteration. See BUGS-FIXED.md 2026-07-01
+("BH-18 #12: defer fired N-times..."). Original write-up kept below.
 
 **Symptom:** a function-scope `defer` is lowered onto the backward-`goto`
 **back-edge** block instead of the real exit paths, so it fires once **per
@@ -2574,7 +2560,15 @@ item): the goto-loop defer must fire exactly once.
 
 ---
 
-## OPEN — BH-18 #13 — nested inline designated initializer rejected ("got void") (🟢 false-reject)
+## FIXED (verified 2026-07-01 — was stale OPEN entry) — BH-18 #13 — nested inline designated initializer rejected ("got void") (🟢 false-reject)
+
+**RESOLVED.** Verified with the exact reproducer below against current main:
+`Outer o = { .pos = { .x = 3, .y = 4 }, .id = 9 };` now compiles and runs
+(`EXIT=16`, was a compile error). `validate_struct_init` now recurses when a
+field value is itself a `NODE_STRUCT_INIT`. Fixed in an untracked prior
+session (11ct36's audit independently listed this as a stale-closed entry);
+this write-up predates the fix and was never removed. Original write-up kept
+for history.
 
 **Symptom:** a designated initializer whose field value is itself an inline
 brace literal is rejected — the inner literal is typed `void` because the
@@ -2610,7 +2604,7 @@ Tripwire: `tests/zer/nested_designated_init.zer`.
 
 ---
 
-## OPEN — BH-18 #14 — conversion-intrinsic arity is not validated (🟢 diagnostic)
+## FIXED (2026-07-01, copied from cool-johnson-11ct36) — BH-18 #14 — conversion-intrinsic arity is not validated (🟢 diagnostic)
 
 **Symptom:** the conversion/layout intrinsic family (`@truncate`, `@bitcast`,
 `@saturate`, `@cast`, `@inttoptr`, `@ptrcast`, `@size`) does not validate
@@ -2642,6 +2636,14 @@ typos (extra args) and a wrong-line/wrong-stage error (missing arg).
 **Fix sketch:** add an exact-arity check to the conversion/layout intrinsic
 checker handlers (reject too-few AND too-many), matching `@atomic_load`'s
 "requires N argument" pattern. Tripwire: `tests/zer_fail/intrinsic_arity.zer`.
+
+**RESOLVED.** Verified with both exact reproducers above against current main:
+extra-args (`@truncate(u8, 5, 6, 7)`) and missing-operand (`@truncate(u8)`) are
+BOTH now rejected at the ZER checker level (not GCC). The arity block was
+restructured — family identification unconditional, then "requires a type
+argument" split from "expects N args after type"; the `@size(NamedType)` parse
+path (BUG-316) preserved via `size_named_path`. See BUGS-FIXED.md 2026-07-01
+("Branch-import Tier 1").
 
 ---
 

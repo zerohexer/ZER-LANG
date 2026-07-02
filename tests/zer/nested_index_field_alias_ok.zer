@@ -1,0 +1,31 @@
+// BH-18 #1a sibling positive (no over-rejection): a nested index+field
+// pointer copy that does NOT outlive the source must still compile + run;
+// a nested index+field SCALAR access (no pointer at all, no aliasing
+// possible) must also be entirely unaffected.
+struct Task { u32 id; }
+struct Holder { *Task p; }
+Slab(Task) pool;
+u32 result;
+void run_ptr() {
+    Holder[2] arr;
+    *Task got = pool.alloc_ptr() orelse return;
+    arr[0].p = got;
+    arr[0].p.id = 55;
+    *Task alias = arr[0].p;
+    result = alias.id;
+    pool.free_ptr(arr[0].p);
+}
+struct Inner { u32 v; }
+struct Holder2 { Inner in; }
+u32 scalar_result;
+void run_scalar() {
+    Holder2[2] arr2;
+    arr2[0].in.v = 7;
+    u32 alias = arr2[0].in.v;
+    scalar_result = alias;
+}
+u32 main() {
+    run_ptr(); run_scalar();
+    if (result == 55 && scalar_result == 7) { return 0; }
+    return 1;
+}

@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// BH-18 #1a sibling: a NESTED index+field compound pointer-VALUE read
+// (`*Task alias = arr[0].p;` — index THEN field) never registered `alias` as
+// an alias of arr[0].p's tracked handle. Distinct lowering path from the
+// simple `o.p` single-level field case (which lowers via IR_FIELD_READ) —
+// this nested shape retains the full compound expr and lowers via IR_ASSIGN,
+// needing its own registration (same per-sink-patchwork class as the
+// original 1a fix).
+struct Task { u32 id; }
+struct Holder { *Task p; }
+Slab(Task) pool;
+u32 result;
+void run() {
+    Holder[2] arr;
+    *Task got = pool.alloc_ptr() orelse return;
+    arr[0].p = got;
+    arr[0].p.id = 100;
+    *Task alias = arr[0].p;
+    pool.free_ptr(arr[0].p);
+    result = alias.id;
+}
+u32 main() { run(); return result; }

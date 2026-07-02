@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
+
+🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed
+live, then explicitly asked to close in the same session). `make check` GREEN, ZER 891/0
+(+2 tripwires).
+
+**Root cause — a SECOND lowering path for the same conceptual operation.** The 1a fix (added
+to `case IR_FIELD_READ`) closed `*Task alias = o.p;` (single-level field off a bare local).
+But `*Task alias = arr[0].p;` (index THEN field) uses a DIFFERENT IR shape entirely — traced
+by instrumenting all three candidate cases (`IR_FIELD_READ`, `IR_INDEX_READ`, `IR_ASSIGN`)
+with unconditional prints and reading the trace: the nested form lowers as `IR_ASSIGN` with
+`rhs` retaining the FULL compound AST (`NODE_FIELD` whose `.object` is `NODE_INDEX`), never
+decomposed into a separate `IR_FIELD_READ`/`IR_INDEX_READ` pair. My first attempt at 1a
+(reverted earlier the same session) had actually targeted the right CASE for this shape —
+it just failed verification because the test at the time used the wrong reproducer
+(`o.p`, which takes the other path). Two genuinely different lowering paths for one
+conceptual operation is the same per-sink-patchwork class as 1a/1c themselves.
+
+**Fix:** the identical registration logic (extract the compound key from `rhs`, look up an
+already-tracked compound handle, alias the destination via `IRAliasSnapshot`/`ir_apply_alias`)
+added to `case IR_ASSIGN`, gated on `rhs->kind == NODE_FIELD || NODE_INDEX`. Sound by the
+same argument as the IR_FIELD_READ fix (only matches an already-tracked key). NOT redundant
+with the IR_FIELD_READ fix — each covers a different lowering path; verified both still fire
+correctly together (1a, 1c, and the nested case all reject; the nested safe-pattern and a
+nested pure-scalar access both still compile with no over-rejection).
+
+Tests: `tests/zer_fail/nested_index_field_alias_uaf.zer`,
+`tests/zer/nested_index_field_alias_ok.zer`.
+
+---
+
 ## 2026-07-01 — BH-18 #1a + #1c: move-alias gaps closed via a 13-site refactor (zercheck_ir.c)
 
 🔴 silent UAF / double-consume (both memory corruption). Completes BH-18 #1 (1b was fixed

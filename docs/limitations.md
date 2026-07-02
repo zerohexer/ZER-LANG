@@ -1927,14 +1927,16 @@ propagation refactor + a new IR_FIELD_READ registration path — see BUGS-FIXED.
   CLAUDE.md's documented "per-sink patchwork" class and its refactor remedy. Test:
   `tests/zer_fail/move_double_close_via_alias.zer`.
 
-**NEW sibling gap found during verification, NOT fixed (out of the 1a/1c scope, logged not
-chased):** a NESTED index+field compound alias — `Holder[2] arr; *Task alias = arr[0].p;` —
-is STILL LIVE (confirmed via targeted reproducer). The 1a fix's `ir_find_compound_handle`
-lookup only succeeds if the compound key was registered at WRITE time; likely the write-side
-registration (`container.field = h` in `case IR_ASSIGN`) doesn't handle index-then-field
-chains, only single-level field writes — a plausible 4th per-sink instance of the same class,
-unconfirmed. Needs its own investigation before fixing (same discipline as 1a/1c: don't patch
-blind).
+**Sibling gap found during verification — FIXED same session (2026-07-01).** A NESTED
+index+field compound alias — `Holder[2] arr; *Task alias = arr[0].p;` — was confirmed live via
+targeted reproducer, then root-caused (NOT the write-side registration as first hypothesized;
+confirmed via instrumented tracing that the WRITE side registers correctly — `root=0,
+path='[0].p'` — but the READ side never reached `IR_FIELD_READ` at all: the nested form lowers
+via a DIFFERENT case, `IR_ASSIGN`, retaining the full compound AST rather than decomposing).
+Fixed by adding the same registration logic to `case IR_ASSIGN`, gated on
+`rhs->kind == NODE_FIELD || NODE_INDEX`. See BUGS-FIXED.md 2026-07-01 ("BH-18 #1a sibling:
+nested index+field"). Tests: `tests/zer_fail/nested_index_field_alias_uaf.zer`,
+`tests/zer/nested_index_field_alias_ok.zer`.
 
 **Symptom (original, all three manifestations):** a `*T` pointer alias taken
 **before** a `move struct` is consumed (or before its owned pointer field is

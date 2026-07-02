@@ -3243,6 +3243,44 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 /* Don't break — continue alias path if RHS is just an ident too */
             }
 
+            /* BH-18 #1a sibling (2026-07-01): a NESTED index+field compound
+             * pointer-VALUE read — `*Task alias = arr[0].p;` (index THEN
+             * field, as opposed to `o.p`'s single-level field-off-a-bare-
+             * local, which lowers via case IR_FIELD_READ and is handled
+             * there). This shape lowers as IR_ASSIGN with `rhs` retaining the
+             * full compound AST (NODE_FIELD whose .object is NODE_INDEX), NOT
+             * decomposed into a separate IR_FIELD_READ/IR_INDEX_READ pair —
+             * confirmed by instrumented tracing (a single ZDBG_AS hit, zero
+             * ZDBG_FR/ZDBG_IR hits, for this exact instruction). Same
+             * registration logic as the IR_FIELD_READ fix (sound by the same
+             * argument: ir_find_compound_handle only matches an
+             * already-tracked key), applied to the shape that reaches THIS
+             * case instead. The two fixes are NOT redundant — each covers a
+             * DIFFERENT lowering path for what is conceptually one operation
+             * (read a tracked field/index chain into a new local), the exact
+             * per-sink-patchwork shape CLAUDE.md documents; do not assume
+             * fixing one closes the other. */
+            if (rhs && (rhs->kind == NODE_FIELD || rhs->kind == NODE_INDEX)) {
+                int fsrc_root;
+                const char *fsrc_path;
+                uint32_t fsrc_path_len;
+                if (ir_extract_compound_key(zc, func, rhs, &fsrc_root,
+                                             &fsrc_path, &fsrc_path_len) == 0 &&
+                    fsrc_path_len > 0) {
+                    IRHandleInfo *fsrc_h = ir_find_compound_handle(ps, fsrc_root,
+                        fsrc_path, fsrc_path_len);
+                    if (fsrc_h && fsrc_h->alloc_id != 0) {
+                        IRAliasSnapshot fsnap;
+                        ir_snapshot_alias(&fsnap, fsrc_h);
+                        IRHandleInfo *fdst_h = ir_add_handle(ps, inst->dest_local);
+                        if (fdst_h) {
+                            ir_apply_alias(fdst_h, &fsnap);
+                            fdst_h->state = fsnap.state;
+                        }
+                    }
+                }
+            }
+
             if (rhs && rhs->kind == NODE_CALL) {
                 IRMethodKind mc = ir_classify_method_call_ex(zc->checker, rhs);
                 /* GAP-4 (BUG-740): result-assigned indirect call —

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// AUDIT-2026-07-02 — sibling of bh18_1b for `&b.field` compound alias.
+// See move_alias_compound_uaf.zer for the full fix summary.
+move struct Tok { u32 kind; }
+struct Box { Tok inner; }
+u32 main() {
+    Box b;
+    b.inner.kind = 42;
+    *Tok p = &b.inner;
+    Tok c = b.inner;
+    return p.kind;
+}

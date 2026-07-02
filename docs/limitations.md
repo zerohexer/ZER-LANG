@@ -169,6 +169,73 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
   foreign_field_ptr.zer`. Add the branch's `type_dispatch_baseline.txt` entries for the
   already-unwrapped `eff->kind` reads. CLASS: form-coverage / per-sink patchwork (×5).
 
+### CLOSED 2026-07-02 — silent-gap audit (6 verified fixes + HOLE-A4 deferred)
+
+Parallel-agent audit closed six additional silent gaps under the same "sound
+before precision" bar; see BUGS-FIXED.md 2026-07-02 for per-fix detail.
+
+- ✅ **TYPE_OPTIONAL two-step launder (🔴 stack-UAF)** — var-decl gate at
+  checker.c:10362 widened to `type_carries_data_pointer` (matches sibling
+  assign/return sinks); `type_can_carry_pointer` extended to include
+  TYPE_OPTIONAL when its inner carries a pointer.
+- ✅ **@container const-strip (🟡 qualifier)** — last cast form still missing
+  the BUG-304-family check; mirror added at checker.c:8756.
+- ✅ **spawn-arg lock walker T3 (🟠 data race)** — the missed 6th walker (spawn-
+  arg lock at emitter.c:558) got the field-projection fix + NODE_INTRINSIC/
+  SLICE/STRUCT_INIT descent that the 5 fixed by T3 already had.
+- ✅ **Move-alias A1/A2/A3 (🔴 UAM)** — siblings of BH-18 #1b for `&arr[LIT]`,
+  `&b.field`, and spawn-arg move source. `&expr` alias registration extended
+  to compound keys; `ir_propagate_alias_state` called at the 5 previously
+  missing sites.
+- ✅ **Baremetal @cpu_syscall/sysret/iret/hypercall silent no-op (🟡)** —
+  `#else #error` fallbacks added; only the 4 privileged mode-transitions were
+  guaranteed to no-op silently on i386 / MIPS / other archs (the read-CR*/MSR
+  intrinsics' 0-return fallback stays as documented intentional behavior).
+
+### STILL OPEN from the 2026-07-02 audit (deferred)
+
+- **HOLE-A4** (`Tok b = *p;` move-via-deref) — needs a new IR_UNOP handler
+  that recognizes a deref-read of a move struct as a transfer event. Repro:
+  `move struct Tok{u32 kind;} Tok a; a.kind=5; *Tok p=&a; Tok b=*p; return a.kind;`
+  compiles clean and reads the moved-from storage. Class: sibling of A1..A3
+  but on the read-through-pointer axis (no existing handler at all —
+  distinct from the "set-TRANSFERRED-but-don't-propagate" pattern of A1..A3).
+- **spawn direct funcptr arg** (agent finding, checker.c:13246-13251) —
+  🟠 data race. `spawn foo(danger)` where `foo(*() cb){cb();}` — spawn handler
+  scans `foo.body` but doesn't apply BH-18 #8 funcptr-descent to spawn's own
+  args. Fix sketch: for each `spawn_stmt.args[i]` that is a NODE_IDENT
+  resolving to a global function, also `scan_unsafe_global_access` on that
+  function's body (32-depth cap). Two-level indirection via a wrapper param
+  (`wrap(cb){foo(cb)}; spawn wrap(danger)`) is a deeper hole needing per-param
+  binding threading.
+- **NODE_FIELD-on-side-effect-indexed-array emits invalid C (🟡 loud)** —
+  emitter agent finding: `arr[give(1)].x` emits `*({...&arr[_i];}).x` which C
+  parses as `*(({...}).x)` due to `.` binding tighter than `*`. GCC rejects
+  (LOUD, not silent UB). Fix: NODE_INDEX single-eval path should emit
+  `(*({...&arr[_i];}))` (fully parenthesized).
+- **emit_rewritten_node "kind 47" (🟡 loud)** — a NODE_ORELSE in a spawn arg
+  hits an unhandled-kind trap in `emit_rewritten_node` and emits a
+  `_zer_trap(...)` call. Compiler prints "compiler bug" to stderr but returns
+  exit 0 with a runtime trap in the emitted binary. Fix: add NODE_ORELSE case
+  to `emit_rewritten_node` for inline expression use, OR surface the
+  diagnostic as a hard error at the appropriate site.
+- **_zer_probe freestanding always returns has_value=1 (🟠 silent lie)** —
+  agent finding: `@probe`'s contract "returns null if address faults" is
+  impossible to honor on freestanding without a fault handler; the current
+  code just raw-reads and hardcodes `has_value=1`. Documented as intentional
+  in the comment; not surfaced at the call site.
+- **`_zer_mmio_validate` gated on `!linux && !APPLE && !WIN32`** — silent no-op
+  on WASI (constructor fires, `_zer_probe` freestanding lies), phantom trap
+  on FreeBSD/other UNIX (probe uses SIGSEGV, MMIO reads fault in user space),
+  silent no-op on baremetal (same as WASI). Fix: re-gate on the actual
+  probe-availability axis, not host-OS-name.
+- **`@once` on multi-core baremetal (🟠 SMP race)** — freestanding fallback is
+  non-atomic; two cores can both observe `_zer_once == 0` and both run the
+  body. Documented as "single-core safe only" but no compile-time refusal.
+- **`find_shared_root_in_stmt` dead code REMOVED** — was 36 lines of unused
+  code missing the T3 fix, produced -Wunused-function warning. Deleted in the
+  same commit as the spawn-arg walker fix (had zero callers).
+
 ### THE 3 FLAGS (carry forward even after the fixes land)
 
 - ✅ **FLAG #1 — AUDITED CLEAN (2026-07-01), no remaining drift.** Full AST→IR emission-diff

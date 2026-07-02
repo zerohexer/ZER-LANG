@@ -1388,13 +1388,26 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
 /* Can this type carry a pointer? Only propagate escape flags to types that
  * can actually hold a reference to stack/arena memory. Scalar types (u32,
  * bool, enum, handle) cannot carry pointers — propagating flags to them
- * causes false positives (BUG-421). */
+ * causes false positives (BUG-421).
+ *
+ * AUDIT-2026-07-02: added TYPE_OPTIONAL when its inner carries a pointer
+ * (?*u32, ?[*]u8, ?Wrap where Wrap has pointer fields). Missing this
+ * previously produced the two-step launder stack-UAF closed at the
+ * var-decl call-launder gate (checker.c ~10362) at the same time. Keep
+ * scope narrow (don't reuse the recursive predicate) — this is called at
+ * 5 non-var-decl sites that expect a flat pointer/slice/struct filter and
+ * treating ARRAY-of-scalar as "carries pointer" caused zercheck leak-
+ * warning false positives on ?*T locals. */
 static bool type_can_carry_pointer(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
-    return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
-                   eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
-                   eff->kind == TYPE_OPAQUE);
+    if (!eff) return false;
+    if (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+        eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+        eff->kind == TYPE_OPAQUE) return true;
+    if (eff->kind == TYPE_OPTIONAL)
+        return type_can_carry_pointer(eff->optional.inner);
+    return false;
 }
 
 /* Propagate is_local_derived / is_arena_derived / is_from_arena from src to dst,
@@ -8747,6 +8760,24 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (ptr_type)
                         check_volatile_strip(c, node->intrinsic.args[0], ptr_type, result,
                                              node->loc.line, "@container");
+                    /* AUDIT-2026-07-02: const-strip check parallel to
+                     * @ptrcast/@bitcast/@pun/@cast (BUG-304 family). @container
+                     * was the last cast form still missing it — silently
+                     * accepted `@container(*Device, const_field_ptr, list)`
+                     * which reverse-derives a mutable struct pointer from a
+                     * const field, then mutates the struct. */
+                    if (ptr_type) {
+                        Type *src_eff = type_unwrap_distinct(ptr_type);
+                        Type *tgt_eff = type_unwrap_distinct(result);
+                        if (src_eff && src_eff->kind == TYPE_POINTER &&
+                            src_eff->pointer.is_const &&
+                            tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                            !tgt_eff->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "@container cannot strip const qualifier — "
+                                "target must be const pointer");
+                        }
+                    }
                 }
             } else {
                 result = ty_void;
@@ -10358,9 +10389,19 @@ static void check_stmt(Checker *c, Node *node) {
              * BUG-374: recurse into nested calls — identity(identity(&x)).
              * BUG-383: also walk through field/index chains — wrap(&x).p.
              * Applies to BOTH pointer results AND struct results (struct may
-             * contain pointer fields carrying the local pointer). */
+             * contain pointer fields carrying the local pointer).
+             *
+             * AUDIT-2026-07-02: widened from (POINTER|STRUCT|SLICE) to
+             * type_carries_data_pointer to catch OPTIONAL/UNION/OPAQUE/ARRAY-
+             * wrapped pointers. The sibling assign sink (~4572) and return sink
+             * (~11781) already use type_carries_data_pointer since BUG-766;
+             * this gate was the last shallow-kind holdout, silently accepting
+             *   ?*u32 launder(?*u32 p) { return p; }
+             *   ?*u32 x = launder(&local); g = x;
+             * (a two-step stack-UAF laundering through an optional-wrapped
+             * pointer). Scalars stay false → unaffected. */
             if (sym && node->var_decl.init && type &&
-                (type->kind == TYPE_POINTER || type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE)) {
+                type_carries_data_pointer(type, 0)) {
                 Node *call = node->var_decl.init;
                 if (call->kind == NODE_ORELSE) call = call->orelse.expr;
                 /* BUG-383: walk through field/index to find call root */

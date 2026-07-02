@@ -717,3 +717,13 @@ emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
 emitter.c:if (ta->kind == TYNODE_NAMED) {
 zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
 zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+# AUDIT-2026-07-02 — new sites from silent-gap fixes (all reads on
+# type_unwrap_distinct'd _eff locals, GAP-F-safe):
+checker.c:eff->kind == TYPE_OPAQUE) return true;
+checker.c:if (eff->kind == TYPE_OPTIONAL)
+checker.c:if (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+checker.c:if (src_eff && src_eff->kind == TYPE_POINTER &&
+checker.c:tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+emitter.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return next;
+zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
+zercheck_ir.c:(eff->kind == TYPE_UNION &&

@@ -1,0 +1,21 @@
+// AUDIT-2026-07-02 — emitter.c:558 find_shared_root (spawn-arg lock walker)
+// missed the T3 field-projection fix (only 5 walkers were updated 2026-07-01;
+// this was the missed 6th). Reads a shared struct field through a pointer
+// projection in a spawn arg, verifying compile+run succeed. The runtime
+// property "the emitter inserted pthread_mutex_lock around the read" is
+// verified by out-of-band audit; this file just proves the fix doesn't break
+// the code path.
+shared struct S { u32 v; }
+struct Wrap { *S sp; }
+S global_s;
+
+void worker(u32 x) { }
+
+u32 main() {
+    Wrap w;
+    w.sp = &global_s;
+    global_s.v = 7;
+    spawn worker(w.sp.v);
+    spawn worker(@truncate(u32, w.sp.v));
+    return 0;
+}

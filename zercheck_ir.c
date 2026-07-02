@@ -2448,6 +2448,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (h) {
                 h->state = IR_HS_TRANSFERRED;
                 h->free_line = inst->source_line;
+                /* AUDIT-2026-07-02 (HOLE-A3 sibling — IR_NOP spawn path):
+                 * propagate to aliases of the moved-from bare local so
+                 * `*T p = &a; spawn worker(a);` is followed by rejection on
+                 * `p.field`. Mirrors the IR_SPAWN path (line ~4356). */
+                ir_propagate_alias_state(ps, h, IR_HS_TRANSFERRED,
+                                         inst->source_line);
             }
         }
 
@@ -2815,6 +2821,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (ch) {
                         ch->state = IR_HS_TRANSFERRED;
                         ch->free_line = inst->source_line;
+                        /* AUDIT-2026-07-02 (HOLE-A2 sibling): propagate to
+                         * pointer aliases of the moved-from compound handle
+                         * (`*Tok p = &b.inner; Tok c = b.inner;`). No-op when
+                         * the compound has no registered aliases. */
+                        ir_propagate_alias_state(ps, ch, IR_HS_TRANSFERRED,
+                                                 inst->source_line);
                     }
                 }
             }
@@ -3067,6 +3079,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (ch) {
                         ch->state = IR_HS_TRANSFERRED;
                         ch->free_line = inst->source_line;
+                        /* AUDIT-2026-07-02 (HOLE-A1 sibling): propagate
+                         * TRANSFERRED to pointer aliases of the moved-from
+                         * compound handle (`*Tok p = &arr[0]; Tok b = arr[0];`).
+                         * No-op when the compound has no registered aliases. */
+                        ir_propagate_alias_state(ps, ch, IR_HS_TRANSFERRED,
+                                                 inst->source_line);
                     }
                 } else if (rhs->kind == NODE_INDEX &&
                            rhs->index_expr.index &&
@@ -3148,6 +3166,65 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * is_thread_handle — wrong-pool detection bypassed via
              * `*T fp = &b.field; Handle k = *fp;` interior pointer chain. */
             if (rhs && rhs->kind == NODE_UNARY && rhs->unary.op == TOK_AMP) {
+                Node *addr_target = rhs->unary.operand;
+                /* AUDIT-2026-07-02 (HOLE-A1/A2): if the address-taken expression
+                 * is a COMPOUND (`&arr[0]` or `&b.field`) on a move-tracking base,
+                 * alias the pointer against the COMPOUND handle so a later move
+                 * out of that same compound propagates TRANSFERRED to the pointer.
+                 * Requires the compound-move sites (2818, 3068, 4412, 4485) to
+                 * call ir_propagate_alias_state (added same audit). */
+                int c_root_local = -1;
+                const char *c_path = NULL;
+                uint32_t c_path_len = 0;
+                bool used_compound = false;
+                /* Widen the base-type check: `Tok[4]` (a move struct array) is
+                 * not caught by ir_should_track_move (which walks STRUCT/UNION,
+                 * not ARRAY). Check the DEST pointer's inner type OR the
+                 * innermost element the address points to instead. If the
+                 * target expression `arr[i]` / `b.f` yields a move struct at
+                 * check time, that's the finest gate. */
+                Type *addr_target_ty = addr_target
+                    ? checker_get_type(zc->checker, addr_target) : NULL;
+                bool target_is_move_tracked = false;
+                if (addr_target_ty) {
+                    Type *eff = type_unwrap_distinct(addr_target_ty);
+                    if (eff && (ir_is_move_struct_type(eff) ||
+                                (eff->kind == TYPE_STRUCT &&
+                                 ir_contains_move_struct_field(eff)) ||
+                                (eff->kind == TYPE_UNION &&
+                                 ir_contains_move_struct_field(eff))))
+                        target_is_move_tracked = true;
+                }
+                if (addr_target && addr_target->kind != NODE_IDENT &&
+                    target_is_move_tracked &&
+                    ir_extract_compound_key(zc, func, addr_target,
+                                             &c_root_local, &c_path, &c_path_len) == 0 &&
+                    c_path_len > 0 && c_root_local >= 0 &&
+                    c_root_local < func->local_count) {
+                    IRHandleInfo *ch = ir_find_compound_handle(ps, c_root_local,
+                                                                 c_path, c_path_len);
+                    if (!ch) ch = ir_add_compound_handle(ps, c_root_local,
+                                                          c_path, c_path_len);
+                    if (ch) {
+                        ch->is_move_local = true;
+                        if (ch->state == IR_HS_UNKNOWN) {
+                            ch->state = IR_HS_ALIVE;
+                            ch->alloc_line = inst->source_line;
+                        }
+                        if (ch->alloc_id == 0)
+                            ch->alloc_id = _ir_next_alloc_id++;
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, ch);
+                        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                        if (dst_h) {
+                            ir_apply_alias(dst_h, &snap);
+                            dst_h->state = snap.state;
+                            dst_h->is_move_local = true;
+                        }
+                        used_compound = true;
+                    }
+                }
+
                 Node *target = rhs->unary.operand;
                 /* Walk field/index chain to the root ident */
                 while (target) {
@@ -3155,7 +3232,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     else if (target->kind == NODE_INDEX) target = target->index_expr.object;
                     else break;
                 }
-                if (target && target->kind == NODE_IDENT) {
+                if (target && target->kind == NODE_IDENT && !used_compound) {
                     int base_local = ir_find_local_exact_first(func,
                         target->ident.name, (uint32_t)target->ident.name_len);
                     if (base_local >= 0) {
@@ -4346,7 +4423,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             IRHandleInfo *h = (path_len == 0)
                 ? ir_find_handle(ps, root_local)
                 : ir_find_compound_handle(ps, root_local, path, path_len);
-            if (h) h->state = IR_HS_TRANSFERRED;
+            if (h) {
+                h->state = IR_HS_TRANSFERRED;
+                h->free_line = inst->source_line;
+                /* AUDIT-2026-07-02 (HOLE-A3, sibling of bh18_1b):
+                 * propagate TRANSFERRED to aliases of the moved-from local so
+                 * `*T p = &a; spawn worker(a); use(p);` catches the alias UAM.
+                 * A no-op when the source has no aliases (safe). */
+                ir_propagate_alias_state(ps, h, IR_HS_TRANSFERRED,
+                                         inst->source_line);
+            }
         }
 
         /* Phase D3: scoped spawn produces a ThreadHandle. Register it so
@@ -4411,6 +4497,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (rh) {
                     rh->state = IR_HS_TRANSFERRED;
                     rh->free_line = inst->source_line;
+                    /* AUDIT-2026-07-02 (HOLE-A1 sibling — IR_FIELD_WRITE):
+                     * propagate to aliases of the moved-from bare local. */
+                    ir_propagate_alias_state(ps, rh, IR_HS_TRANSFERRED,
+                                             inst->source_line);
                 }
             }
         }
@@ -4484,6 +4574,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (rh) {
                     rh->state = IR_HS_TRANSFERRED;
                     rh->free_line = inst->source_line;
+                    /* AUDIT-2026-07-02 (HOLE-A1 sibling — IR_INDEX_WRITE):
+                     * propagate to aliases of the moved-from bare local. */
+                    ir_propagate_alias_state(ps, rh, IR_HS_TRANSFERRED,
+                                             inst->source_line);
                 }
             }
         }

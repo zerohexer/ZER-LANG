@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// AUDIT-2026-07-02 — sibling of bh18_1b for spawn-arg move. `spawn worker(a)`
+// sets a's IR handle TRANSFERRED but never propagated to `*Tok p = &a`.
+// Fixed by mirroring the IR_COPY propagate call at both spawn move-transfer
+// sites (IR_NOP spawn path ~2451 and IR_SPAWN ~4349).
+move struct Tok { u32 kind; }
+void worker(Tok t) { }
+u32 main() {
+    Tok a;
+    a.kind = 5;
+    *Tok p = &a;
+    spawn worker(a);
+    return p.kind;
+}

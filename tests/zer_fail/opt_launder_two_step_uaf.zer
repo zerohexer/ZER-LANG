@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// AUDIT-2026-07-02 — var-decl call-launder gate at checker.c:10362 previously
+// used a shallow kind check that excluded TYPE_OPTIONAL. A two-step launder
+// through an ?T-returning function silently produced a stack-UAF:
+//   ?*u32 launder(?*u32 p) { return p; }
+//   ?*u32 x = launder(&local); g = x;
+// Fixed by widening the gate to type_carries_data_pointer (matches the sibling
+// assign/return sinks used since BUG-766) and by adding TYPE_OPTIONAL to
+// type_can_carry_pointer so propagate_escape_flags catches downstream stores.
+?*u32 g;
+?*u32 launder(?*u32 p) { return p; }
+void f() {
+    u32 local = 42;
+    ?*u32 x = launder(&local);
+    g = x;
+}
+u32 main() {
+    f();
+    return 0;
+}

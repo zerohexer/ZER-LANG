@@ -513,70 +513,43 @@ static void emit_auto_guards(Emitter *e, Node *node) {
     }
 }
 
-static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
-
-/* Find shared struct variable accessed in a statement or expression.
- * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
- * Used to auto-insert lock/unlock around statements. */
-static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_root(e, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
-    case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Node *r = find_shared_root(e, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
-     * cond/init/expr that could read a shared struct. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return NULL;
-    }
-    return NULL;
-}
+/* AUDIT-2026-07-02: `find_shared_root_in_stmt` (a dispatcher that walked
+ * NODE_EXPR_STMT / NODE_VAR_DECL / NODE_IF / NODE_WHILE / … cond/init/expr
+ * fields into find_shared_root) has been removed. It had zero callers —
+ * all lock-wrapping for regular statements goes through the IR path
+ * (ir_lower.c find_shared_root_expr / find_shared_root_in_stmt_ir). The
+ * remaining call site of find_shared_root is spawn-arg lock detection at
+ * line ~10066, which passes the arg expression directly, not a statement. */
 
 static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {
-        /* Walk to root of field chain */
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
-            Type *t = checker_get_type(e->checker, root);
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
-                /* Direct shared struct */
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return root;
-                /* Pointer to shared struct */
+        /* AUDIT-2026-07-02: at each FIELD/INDEX/deref step, check the OBJECT's
+         * resolved type — the T3 field-projection fix (branch-import 2026-07-01)
+         * landed on 5 walkers but MISSED this one, the spawn-arg lock walker.
+         * Old code descended to the innermost NODE_IDENT and only checked that
+         * ident's type, so `spawn worker(w.sp.v)` where `w.sp` is `*shared S`
+         * emitted `_sa->a0 = w.sp->v;` with NO pthread_mutex_lock/unlock — a
+         * silent data race on the pointer-field projection at the spawn site.
+         * Mirrors ir_lower.c find_shared_root_expr + emit_defer_shared_root. */
+        Node *cur = expr;
+        while (cur) {
+            Node *next;
+            if (cur->kind == NODE_FIELD) next = cur->field.object;
+            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
+            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
+            else break;
+            Type *nt = checker_get_type(e->checker, next);
+            if (nt) {
+                Type *eff = type_unwrap_distinct(nt);
+                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return next;
                 if (eff->kind == TYPE_POINTER) {
                     Type *inner = type_unwrap_distinct(eff->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        return root;
+                        return next;
                 }
             }
+            cur = next;
         }
     }
     /* Recurse into sub-expressions */
@@ -594,10 +567,38 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
         found = find_shared_root(e, expr->unary.operand);
     } else if (expr->kind == NODE_INDEX) {
         found = find_shared_root(e, expr->index_expr.object);
+        if (!found) found = find_shared_root(e, expr->index_expr.index);
     } else if (expr->kind == NODE_ORELSE) {
         found = find_shared_root(e, expr->orelse.expr);
+        if (!found && expr->orelse.fallback &&
+            !expr->orelse.fallback_is_return &&
+            !expr->orelse.fallback_is_break &&
+            !expr->orelse.fallback_is_continue)
+            found = find_shared_root(e, expr->orelse.fallback);
     } else if (expr->kind == NODE_TYPECAST) {
         found = find_shared_root(e, expr->typecast.expr);
+    } else if (expr->kind == NODE_INTRINSIC) {
+        /* AUDIT-2026-07-02: `spawn worker(@truncate(u32, global_s.v))` — the
+         * shared read hidden in an intrinsic arg silently missed the lock.
+         * cond_wait / barrier / once handle their own locking internally
+         * (wrapping them with an outer lock deadlocks); skip those. */
+        const char *nm = expr->intrinsic.name;
+        size_t nlen = expr->intrinsic.name_len;
+        bool intrinsic_handles_own_lock =
+            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
+            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
+            (nlen == 4 && memcmp(nm, "once", 4) == 0);
+        if (!intrinsic_handles_own_lock) {
+            for (int i = 0; i < expr->intrinsic.arg_count && !found; i++)
+                found = find_shared_root(e, expr->intrinsic.args[i]);
+        }
+    } else if (expr->kind == NODE_SLICE) {
+        found = find_shared_root(e, expr->slice.object);
+        if (!found && expr->slice.start) found = find_shared_root(e, expr->slice.start);
+        if (!found && expr->slice.end) found = find_shared_root(e, expr->slice.end);
+    } else if (expr->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < expr->struct_init.field_count && !found; i++)
+            found = find_shared_root(e, expr->struct_init.fields[i].value);
     }
     return found;
 }
@@ -7636,7 +7637,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             /* D-Alpha-12: issue syscall (user-side trap to kernel).
              * x86: syscall — fast syscall via MSR_LSTAR target
              * ARM64: svc #0 — supervisor call
-             * RISC-V: ecall — environment call from U-mode to S/M */
+             * RISC-V: ecall — environment call from U-mode to S/M
+             * AUDIT-2026-07-02: #else #error added (was silently empty on
+             * unknown arch — i386, MIPS, etc. compiled to `({})` = zero
+             * instructions, kernel silently continued past the syscall). */
             emit(e, "({\n"
                 "#if defined(__x86_64__)\n"
                 "    __asm__ __volatile__ (\"syscall\" ::: \"rcx\", \"r11\", \"memory\");\n"
@@ -7644,6 +7648,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"svc #0\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#else\n"
+                "#error \"@cpu_syscall: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 10 && memcmp(name, "cpu_sysret", 10) == 0) {
@@ -7651,7 +7657,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * Requires correctly-set return context (CS/RIP/RFLAGS/RSP/SS on x86).
              * x86: sysretq — fast return counterpart to syscall
              * ARM64: eret — return from exception using ELR/SPSR
-             * RISC-V: sret — return from supervisor mode */
+             * RISC-V: sret — return from supervisor mode
+             * AUDIT-2026-07-02: #else #error added. */
             emit(e, "({\n"
                 "#if defined(__x86_64__)\n"
                 "    __asm__ __volatile__ (\"sysretq\");\n"
@@ -7659,13 +7666,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"eret\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"sret\");\n"
+                "#else\n"
+                "#error \"@cpu_sysret: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 8 && memcmp(name, "cpu_iret", 8) == 0) {
             /* D-Alpha-12: return from interrupt handler.
              * x86: iretq — restores CS/RIP/RFLAGS/RSP/SS from interrupt stack
              * ARM64: eret — same instruction as sysret (arch-unified)
-             * RISC-V: mret — return from machine mode */
+             * RISC-V: mret — return from machine mode
+             * AUDIT-2026-07-02: #else #error added. */
             emit(e, "({\n"
                 "#if defined(__x86_64__)\n"
                 "    __asm__ __volatile__ (\"iretq\");\n"
@@ -7673,6 +7683,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"eret\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"mret\");\n"
+                "#else\n"
+                "#error \"@cpu_iret: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 18 && memcmp(name, "cpu_set_priv_stack", 18) == 0 &&
@@ -7714,7 +7726,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "#endif\n"
                 "_zer_pl; })");
         } else if (nlen == 13 && memcmp(name, "cpu_hypercall", 13) == 0) {
-            /* D-Alpha-12: invoke hypervisor (for code running as a guest). */
+            /* D-Alpha-12: invoke hypervisor (for code running as a guest).
+             * AUDIT-2026-07-02: #else #error added. */
             emit(e, "({\n"
                 "#if defined(__x86_64__)\n"
                 "    __asm__ __volatile__ (\"vmcall\" ::: \"memory\");\n"
@@ -7722,6 +7735,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"hvc #0\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#else\n"
+                "#error \"@cpu_hypercall: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 15 && memcmp(name, "cpu_read_fsbase", 15) == 0) {

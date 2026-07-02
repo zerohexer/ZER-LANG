@@ -5,6 +5,132 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-02 — silent-gap audit (6 fixes: TYPE_OPTIONAL launder, @container const, spawn-arg lock projection, move-alias compound/field/spawn, baremetal #error)
+
+Parallel-agent audit surfaced 6 verified silent gaps + 1 dead code + 1 audit-tool
+gap. Every fix landed with a regression test in `tests/zer_fail/` (or `tests/zer/`
+for the emit-shape smoke test). `make check` GREEN (891 ZER tests passing).
+
+### 🔴 checker.c — TYPE_OPTIONAL two-step launder stack-UAF
+
+```
+?*u32 launder(?*u32 p) { return p; }
+?*u32 g;
+void f() { u32 local = 42; ?*u32 x = launder(&local); g = x; }
+```
+Compiled clean, silent stack escape via the optional-wrapped pointer.
+
+**Root cause:** the var-decl call-launder gate at checker.c:10362 used a shallow
+`type->kind == (POINTER | STRUCT | SLICE)` check, excluding TYPE_OPTIONAL.
+Sibling assign (~4572) and return (~11781) sinks already used the deeper
+`type_carries_data_pointer(t, 0)` since BUG-766. This gate was the last
+shallow-kind holdout, silently leaving the two-step launder open. A companion
+predicate `type_can_carry_pointer` (used by `propagate_escape_flags` at 5 sites)
+also excluded TYPE_OPTIONAL, so even a downstream store missed the taint.
+
+**Fix:** (a) widen the var-decl gate to `type_carries_data_pointer(type, 0)`,
+matching the sibling sinks. (b) Extend `type_can_carry_pointer` to include
+TYPE_OPTIONAL when its inner carries a pointer. Kept the predicate scope narrow
+(not aliased to the full `type_carries_data_pointer`) — the fully-recursive
+form false-positives on ARRAY-of-scalar and produces spurious zercheck
+leak-warnings on `?*T` locals. Test:
+`tests/zer_fail/opt_launder_two_step_uaf.zer`.
+
+### 🟡 checker.c — @container missing const-strip check
+
+`@container(*Device, const_cp, list)` silently reverse-derived a mutable struct
+pointer from a const-field pointer — the last cast form still missing the
+BUG-304-family const-strip check (@ptrcast/@bitcast/@pun/@cast/C-style all
+had it; @container had only volatile at BUG-381). Mirror check added at
+checker.c:8756. Test: `tests/zer_fail/container_const_strip.zer`.
+
+### 🟠 emitter.c — spawn-arg lock walker missed T3 field-projection + subexpr forms
+
+`spawn worker(w.sp.v)` where `w.sp` is `*shared S` emitted
+`_sa->a0 = w.sp->v;` at the spawn site with NO `pthread_mutex_lock`/unlock —
+silent data race on the pointer-field projection. Same for
+`spawn worker(@truncate(u32, global_s.v))`, and any read hidden in a
+NODE_SLICE / NODE_STRUCT_INIT subexpression of a spawn arg.
+
+**Root cause:** `find_shared_root` in emitter.c (line 558) — the spawn-arg lock
+walker used by the emitter at line 10066 — was NOT in the 2026-07-01 T3
+branch-import fix set (5 walkers were identified; this was the missed 6th).
+It walked to the innermost NODE_IDENT and only checked that ident's type,
+missing intermediate `*shared S` field projections. It also lacked
+NODE_INTRINSIC / NODE_SLICE / NODE_STRUCT_INIT descent that
+`ir_lower.c:find_shared_root_expr` had.
+
+**Fix:** mirror the T3 pattern from `ir_lower.c:find_shared_root_expr` — walk
+each FIELD/INDEX/deref step checking the object's resolved type, and add
+NODE_INTRINSIC (skip cond_/barrier_/once — they lock internally), NODE_SLICE,
+NODE_STRUCT_INIT descent. Also deleted `find_shared_root_in_stmt` (dead code
+— zero callers, produced `-Wunused-function`). Test:
+`tests/zer/spawn_shared_field_ptr_projection_ok.zer` (positive smoke test).
+
+### 🔴 zercheck_ir.c — move-alias A1/A2/A3 (compound/field/spawn transferred not propagated)
+
+Three siblings of BH-18 #1b (`bh18_1b`, 2026-07-01): the alias-propagation-on-
+TRANSFERRED fix landed for IR_COPY bare-local move but not for these forms:
+- **A1:** `Tok[4] arr; *Tok p = &arr[0]; Tok b = arr[0];` — compound array
+  move never propagated to the pointer alias.
+- **A2:** `Box b; *Tok p = &b.inner; Tok c = b.inner;` — same for struct-field
+  compound move.
+- **A3:** `Tok a; *Tok p = &a; spawn worker(a);` — spawn-arg move set
+  TRANSFERRED on `a` but the alias `p` stayed ALIVE.
+
+**Root cause (two parts):**
+1. The `&expr` alias-registration in bh18_1b handled only `&ident`. For
+   `&arr[LIT]` and `&b.field`, no compound handle was registered against the
+   move-tracking base, so the alias `p` had no shared alloc_id to inherit.
+2. Every compound-move-transfer site (IR_ASSIGN compound-source ~3068,
+   IR_FIELD_READ ~2818, IR_FIELD_WRITE ~4412, IR_INDEX_WRITE ~4485) and the
+   spawn move sites (IR_NOP ~2451, IR_SPAWN ~4356) set state=TRANSFERRED but
+   omitted the `ir_propagate_alias_state` call (only the IR_COPY path at 2495
+   had it).
+
+**Fix:**
+1. Extended the `&expr` alias-registration to also match `&arr[LIT]` and
+   `&b.field`: when the address-taken expression yields a move-tracked
+   compound (checked at type-level via `ir_is_move_struct_type` /
+   `ir_contains_move_struct_field`), register/find the compound handle via
+   `ir_extract_compound_key`, share alloc_id with the dst pointer via
+   `ir_snapshot_alias`/`ir_apply_alias`, and inherit `is_move_local` so the
+   leak check skips the alias.
+2. Added `ir_propagate_alias_state(ps, h, IR_HS_TRANSFERRED, line)` at all 5
+   missing sites (2451, 2818, 3068, 4356, 4412, 4485). Safe no-op when the
+   handle has no aliases.
+
+Tests: `tests/zer_fail/move_alias_compound_uaf.zer`,
+`tests/zer_fail/move_alias_field_uaf.zer`,
+`tests/zer_fail/move_alias_spawn_uaf.zer`.
+
+**Deferred:** HOLE-A4 (`Tok b = *p;` move-via-deref) — needs a new IR_UNOP
+handler that recognizes a deref-read of a move struct as a transfer event.
+Documented in `docs/limitations.md`.
+
+### 🟡 emitter.c — baremetal @cpu_syscall / @cpu_sysret / @cpu_iret / @cpu_hypercall silent no-op on unknown arch
+
+Only 3 of ~30 privileged D-Alpha `@cpu_*` intrinsics had `#else #error`
+fallbacks on unknown target architecture (`@cpu_disable_int/enable_int/save_int_state`).
+The rest silently no-op'd — on i386 (32-bit x86 has `__i386__` but not
+`__x86_64__`), MIPS, and other archs, `@cpu_syscall()` compiled to `({})` =
+zero instructions. Kernel silently continued past the syscall point.
+
+**Fix:** add `#else #error` to the four privileged transitions (`cpu_syscall`,
+`cpu_sysret`, `cpu_iret`, `cpu_hypercall`) so a build against an unsupported
+target fails LOUD at C-compile rather than shipping a silent no-op. Other
+`@cpu_*` intrinsics that legitimately have arch-conditional behavior (e.g.,
+`cpu_read_fsbase` returns 0 on non-x86 as a defined fallback) intentionally
+retain their no-op paths.
+
+### Fixed audit-tool gap: type_dispatch_baseline.txt updated
+
+Added 8 new file:content sites for the safe `type_unwrap_distinct'd _eff`
+reads introduced by these fixes. Every added site is on an already-unwrapped
+`_eff` local (GAP-F-safe).
+
+---
+
 ## 2026-07-01 — AU-5: ISR-alloc / context-restriction scan blind to funcptr indirection, checker.c
 
 🟠 bare-metal context-restriction gap (Definition A §2.3/§5.7). `scan_func_props` followed

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// AUDIT-2026-07-02 — sibling of bh18_1b (BH-18 #1b). The 2026-07-01 fix
+// registered the alias only for `&ident`, missing compound `&arr[LIT]`.
+// The compound move `Tok b = arr[0]` did set the compound handle TRANSFERRED
+// but never propagated to `p = &arr[0]`. Extended:
+//   1. `&arr[LIT]` / `&b.field` now register a compound handle aliased by the
+//      pointer, sharing alloc_id.
+//   2. Every compound-move-transfer site (IR_ASSIGN, IR_FIELD_READ,
+//      IR_FIELD_WRITE, IR_INDEX_WRITE) now calls ir_propagate_alias_state.
+move struct Tok { u32 kind; }
+u32 main() {
+    Tok[4] arr;
+    arr[0].kind = 11;
+    *Tok p = &arr[0];
+    Tok b = arr[0];
+    return p.kind;
+}

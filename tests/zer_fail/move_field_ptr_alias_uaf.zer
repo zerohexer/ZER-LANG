@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// BH-18 #1a: heap UAF + slab slot reuse via a move-struct FIELD's pointer
+// copied out before the struct is consumed. `alias` shares o.p's alloc_id
+// (registered at the IR_FIELD_READ that reads o.p); `release(o)` frees the
+// slot via pool.free_ptr(o.p) inside the callee. Was: clean compile, silent
+// corruption (alias.id reads memory now owned by a freshly-reused slot).
+struct Task { u32 id; }
+Slab(Task) pool;
+move struct Owner { *Task p; }
+void release(Owner o) { pool.free_ptr(o.p); }
+u32 main() {
+    Owner o;
+    o.p = pool.alloc_ptr() orelse return;
+    o.p.id = 100;
+    *Task alias = o.p;
+    release(o);
+    *Task fresh = pool.alloc_ptr() orelse return;
+    fresh.id = 222;
+    u32 corrupted = alias.id;
+    pool.free_ptr(fresh);
+    return corrupted;
+}

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// BH-18 #1c: double-consume/double-close via re-dereferencing a pointer
+// alias to resurrect a moved-from value. `alias = &f` shares f's alloc_id
+// (the 1b interior-pointer registration); `close_file(f)` (a function-call
+// argument consume) now propagates TRANSFERRED to alias via ir_mark_transferred;
+// reading `*alias` to produce `reborn` is then a use-after-move.
+move struct FileHandle { i32 fd; }
+i32 g_closes;
+void close_file(FileHandle f) { g_closes += 1; }
+u32 main() {
+    FileHandle f; f.fd = 3;
+    *FileHandle alias = &f;
+    close_file(f);
+    FileHandle reborn = *alias;
+    close_file(reborn);
+    return (u32)g_closes;
+}

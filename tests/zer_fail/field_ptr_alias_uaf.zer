@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// BH-18 #1a is NOT move-struct-specific: copying a pointer-typed struct
+// FIELD's value (`*Task alias = b.p;` — no `&`) into a new local must
+// register `alias` as sharing b.p's tracked alloc_id, so freeing b.p later
+// is caught as use-after-free through the alias. Isolates the gap from move
+// semantics entirely (plain struct, no move struct anywhere).
+struct Task { u32 id; }
+struct Box { *Task p; }
+Slab(Task) pool;
+u32 result;
+void run() {
+    Box b;
+    *Task got = pool.alloc_ptr() orelse return;
+    b.p = got;
+    b.p.id = 100;
+    *Task alias = b.p;
+    pool.free_ptr(b.p);
+    result = alias.id;
+}
+u32 main() { run(); return result; }

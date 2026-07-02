@@ -1,0 +1,25 @@
+// BH-18 #1a positive (no over-rejection): a field-pointer-value copy that
+// does NOT outlive the source (read + freed in the same scope, no dangling
+// use after) must still compile + run correctly. Also covers a plain scalar
+// field copy (unaffected by the pointer-aliasing fix).
+struct Task { u32 id; }
+struct Box { *Task p; }
+Slab(Task) pool;
+struct Scalar { u32 count; }
+Scalar sc;
+u32 result;
+void run_ptr() {
+    Box b;
+    *Task got = pool.alloc_ptr() orelse return;
+    b.p = got;
+    b.p.id = 42;
+    *Task alias = b.p;
+    result = alias.id;
+    pool.free_ptr(b.p);
+}
+void run_scalar() {
+    sc.count = 5;
+    u32 c = sc.count;
+    result += c;
+}
+u32 main() { run_ptr(); run_scalar(); if (result == 47) { return 0; } return 1; }

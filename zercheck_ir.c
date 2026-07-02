@@ -2027,6 +2027,26 @@ static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
     }
 }
 
+/* BH-18 #1 (2026-07-01): THE single move-transfer sink. Marks `h` TRANSFERRED
+ * at `line` AND propagates to every alias sharing its alloc_id (via
+ * ir_propagate_alias_state). Before this helper, 13 call sites set
+ * `h->state = IR_HS_TRANSFERRED` directly and only ONE of them (the IR_COPY
+ * var-decl/assignment handler, the original 1b fix) also propagated — a
+ * per-sink patchwork identical in shape to the documented escape-analysis
+ * class (CLAUDE.md "Escape & keep analysis is a PER-SINK PATCHWORK"): asm-
+ * operand-consume, function-call-argument-consume (1c's `close_file(f)`),
+ * struct-field-write-consume, array-write-consume, return-consume (direct +
+ * compound), and others each silently transferred `h` without checking
+ * whether a `*T` alias (registered via `&x` on a move-tracked local, or via
+ * the field-pointer-value alias registration) needed the same update. ALL
+ * transfer sites must funnel through this one function — do not re-inline
+ * `h->state = IR_HS_TRANSFERRED` at a new sink. */
+static void ir_mark_transferred(IRPathState *ps, IRHandleInfo *h, int line) {
+    h->state = IR_HS_TRANSFERRED;
+    h->free_line = line;
+    ir_propagate_alias_state(ps, h, IR_HS_TRANSFERRED, line);
+}
+
 /* GAP-4 (BUG-740, 2026-06-10, 6u360k audit): is this call INDIRECT
  * (through a function pointer) rather than a direct function call?
  * Direct calls get the callee's FuncSummary frees_param propagation;
@@ -2288,8 +2308,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (op_local >= 0 && op_local < func->local_count) {
                     Type *lt = (Type *)func->locals[op_local].type;
                     if (ir_should_track_move(lt) && h->state == IR_HS_ALIVE) {
-                        h->state = IR_HS_TRANSFERRED;
-                        h->free_line = inst->source_line;
+                        ir_mark_transferred(ps, h, inst->source_line);
                     }
                 }
             }
@@ -2446,8 +2465,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
             if (h) {
-                h->state = IR_HS_TRANSFERRED;
-                h->free_line = inst->source_line;
+                ir_mark_transferred(ps, h, inst->source_line);
             }
         }
 
@@ -2485,16 +2503,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         src_h->free_line);
                 }
                 if (!src_h) src_h = ir_add_handle(ps, inst->src1_local);
-                if (src_h) {
-                    src_h->state = IR_HS_TRANSFERRED;
-                    src_h->free_line = inst->source_line;
-                    /* bh18_1b (2026-07-01): propagate TRANSFERRED to pointer
-                     * aliases of the moved-from local — `*T p = &a;` taken
-                     * before `T b = a;` shares a's alloc_id, so a later use
-                     * through p is use-after-move. Mirrors the free path. */
-                    ir_propagate_alias_state(ps, src_h, IR_HS_TRANSFERRED,
-                                             inst->source_line);
-                }
+                /* bh18_1b (2026-07-01): ir_mark_transferred propagates TRANSFERRED
+                 * to pointer aliases of the moved-from local — `*T p = &a;` taken
+                 * before `T b = a;` shares a's alloc_id, so a later use through p
+                 * is use-after-move. Mirrors the free path. */
+                if (src_h) ir_mark_transferred(ps, src_h, inst->source_line);
                 IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                 if (dst_h) {
                     dst_h->state = IR_HS_ALIVE;
@@ -2784,6 +2797,44 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 else break;
             }
         }
+        /* BH-18 #1a (2026-07-01): copying a POINTER-TYPED field's VALUE
+         * (`*Task alias = o.p;` — no `&`, and `o.p`'s type is a plain
+         * pointer/handle, NOT itself move-tracked — that's the DIFFERENT Gap
+         * A3 case just below) never registered `alias` as an alias of
+         * whatever `o.p` is tracked as. Root cause: this file's per-instance
+         * IR is 3AC — a field READ used as an rvalue lowers to its OWN
+         * IR_FIELD_READ instruction (dest_local=alias, expr=o.p), never an
+         * IR_ASSIGN with expr=NODE_FIELD, so the interior-pointer alias logic
+         * in case IR_ASSIGN (which handles `&b.c`) never sees this shape.
+         * Sound by construction: `ir_find_compound_handle` only matches a key
+         * some EARLIER instruction registered as tracked (e.g.
+         * `o.p = pool.alloc_ptr()...`), so an untracked/scalar field
+         * (`o.count`) can never spuriously match. Uses the SAME
+         * root_local/path/path_len already computed by the UAF-check walk
+         * above (first loop iteration, cur == inst->expr) — recompute once
+         * more here rather than thread state out of that loop, since the
+         * loop's purpose (report then break) is orthogonal to registration. */
+        if (inst->dest_local >= 0 && inst->expr &&
+            (inst->expr->kind == NODE_FIELD || inst->expr->kind == NODE_INDEX)) {
+            int src_root;
+            const char *src_path;
+            uint32_t src_path_len;
+            if (ir_extract_compound_key(zc, func, inst->expr, &src_root,
+                                         &src_path, &src_path_len) == 0 &&
+                src_path_len > 0) {
+                IRHandleInfo *src_h = ir_find_compound_handle(ps, src_root,
+                    src_path, src_path_len);
+                if (src_h && src_h->alloc_id != 0) {
+                    IRAliasSnapshot snap;
+                    ir_snapshot_alias(&snap, src_h);
+                    IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                    if (dst_h) {
+                        ir_apply_alias(dst_h, &snap);
+                        dst_h->state = snap.state;
+                    }
+                }
+            }
+        }
         /* Gap A3 (2026-05-06, sNsjM): move-struct field-read transfers ownership.
          * `Tok t = b.inner` where b.inner is a move-struct field MUST mark the
          * source compound (b, ".inner") as TRANSFERRED. Pre-fix: only
@@ -2813,8 +2864,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (!ch) ch = ir_add_compound_handle(ps, root_local,
                                                           path, path_len);
                     if (ch) {
-                        ch->state = IR_HS_TRANSFERRED;
-                        ch->free_line = inst->source_line;
+                        ir_mark_transferred(ps, ch, inst->source_line);
                     }
                 }
             }
@@ -2975,8 +3025,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     if (!rh) rh = ir_add_handle(ps, rhs_local);
                     if (rh) {
-                        rh->state = IR_HS_TRANSFERRED;
-                        rh->free_line = inst->source_line;
+                        ir_mark_transferred(ps, rh, inst->source_line);
                     }
                 }
             }
@@ -3065,8 +3114,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (!ch) ch = ir_add_compound_handle(ps, root_local,
                                                           path, path_len);
                     if (ch) {
-                        ch->state = IR_HS_TRANSFERRED;
-                        ch->free_line = inst->source_line;
+                        ir_mark_transferred(ps, ch, inst->source_line);
                     }
                 } else if (rhs->kind == NODE_INDEX &&
                            rhs->index_expr.index &&
@@ -3397,10 +3445,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         /* Ensure source exists as handle so we can mark it */
                         if (!src_h) src_h = ir_add_handle(ps, src_local);
-                        if (src_h) {
-                            src_h->state = IR_HS_TRANSFERRED;
-                            src_h->free_line = inst->source_line;
-                        }
+                        if (src_h) ir_mark_transferred(ps, src_h, inst->source_line);
                         /* Destination takes new ownership identity */
                         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
                         if (dst_h) {
@@ -3492,8 +3537,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
                 if (!h) h = ir_add_handle(ps, ret_local_direct);
                 if (h) {
-                    h->state = IR_HS_TRANSFERRED;
-                    h->free_line = inst->source_line;
+                    ir_mark_transferred(ps, h, inst->source_line);
                     h->escaped = true;
                 }
             } else {
@@ -3523,8 +3567,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     if (!h) h = ir_add_handle(ps, ret_local);
                     if (h) {
-                        h->state = IR_HS_TRANSFERRED;
-                        h->free_line = inst->source_line;
+                        ir_mark_transferred(ps, h, inst->source_line);
                         h->escaped = true;
                     }
                 } else {
@@ -3738,10 +3781,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         func->locals[arg_local].name, h->free_line);
                 }
                 if (!h) h = ir_add_handle(ps, arg_local);
-                if (h) {
-                    h->state = IR_HS_TRANSFERRED;
-                    h->free_line = inst->source_line;
-                }
+                /* BH-18 #1c (2026-07-01): this is the exact site that missed
+                 * `close_file(f)` consuming a move struct passed by value to a
+                 * function call — ir_mark_transferred now propagates TRANSFERRED
+                 * to any alias of `f` (e.g. `*FileHandle alias = &f;` taken
+                 * before this call), closing the resurrection-via-deref gap. */
+                if (h) ir_mark_transferred(ps, h, inst->source_line);
             }
         }
 
@@ -4346,7 +4391,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             IRHandleInfo *h = (path_len == 0)
                 ? ir_find_handle(ps, root_local)
                 : ir_find_compound_handle(ps, root_local, path, path_len);
-            if (h) h->state = IR_HS_TRANSFERRED;
+            /* 2026-07-01: was a bare state write with no free_line and no
+             * alias propagation — ir_mark_transferred fixes both (spawn-arg
+             * move-transfer now propagates to aliases, same as every other
+             * transfer sink). */
+            if (h) ir_mark_transferred(ps, h, inst->source_line);
         }
 
         /* Phase D3: scoped spawn produces a ThreadHandle. Register it so
@@ -4409,8 +4458,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
                 if (!rh) rh = ir_add_handle(ps, rhs_local);
                 if (rh) {
-                    rh->state = IR_HS_TRANSFERRED;
-                    rh->free_line = inst->source_line;
+                    ir_mark_transferred(ps, rh, inst->source_line);
                 }
             }
         }
@@ -4482,8 +4530,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
                 if (!rh) rh = ir_add_handle(ps, rhs_local);
                 if (rh) {
-                    rh->state = IR_HS_TRANSFERRED;
-                    rh->free_line = inst->source_line;
+                    ir_mark_transferred(ps, rh, inst->source_line);
                 }
             }
         }

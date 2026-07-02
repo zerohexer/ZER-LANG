@@ -1902,40 +1902,39 @@ coverage). "miscompile" = clean compile + wrong runtime result. Severity tags:
 
 ---
 
-## PARTIALLY FIXED (2026-07-01) — BH-18 #1 — move-struct pointer alias defeats ownership/free tracking (🔴 soundness) — 1b CLOSED, 1a + 1c STILL LIVE
+## FIXED (2026-07-01) — BH-18 #1 — move-struct pointer alias defeats ownership/free tracking (🔴 soundness) — ALL THREE (1a/1b/1c) CLOSED
 
-**Status as of 2026-07-01, verified by fresh reproduction against current
-main:** this entry has THREE escalating manifestations (1a/1b/1c below).
-**Only 1b is fixed.** 1a and 1c were re-verified LIVE (clean compile) with
-their exact reproducers — do NOT treat this entry as closed.
+**All three manifestations now verified rejected against current main.** 1b closed earlier in
+the day (interior-pointer registration + propagation on `&x`); 1a and 1c closed via a 13-site
+propagation refactor + a new IR_FIELD_READ registration path — see BUGS-FIXED.md 2026-07-01
+("BH-18 #1a + #1c"). Full root-cause + fix detail there; summary:
 
-- **1b (use-after-move stale read via `&x` alias) — FIXED 2026-07-01.**
-  `*Tok p = &a; Tok b = a; return p.kind;` now correctly rejects
-  (`use after free: local %2 is transferred`). Fix: register the move-struct
-  local when `&a` is taken (flagged `is_move_local` so the leak check skips it
-  + its aliases), and propagate `TRANSFERRED` to the alloc_id group at the
-  transfer (mirrors the existing free-path `ir_propagate_alias_state`). See
-  BUGS-FIXED.md 2026-07-01 ("BH-18 #1b"). Tests:
+- **1b (use-after-move stale read via `&x` alias) — FIXED.** Register the move-struct local
+  when `&a` is taken + propagate TRANSFERRED to the alloc_id group at the transfer. Tests:
   `tests/zer_fail/move_alias_stale_read.zer`, `tests/zer/move_alias_ok.zer`.
+- **1a (heap UAF + slab slot reuse via a move-struct FIELD's pointer copied out) — FIXED.**
+  Confirmed NOT move-struct-specific (isolated to a plain `Box`/`*Task` field, no move struct).
+  Root cause: a field READ used as an rvalue lowers to its own `IR_FIELD_READ` instruction
+  (not `IR_ASSIGN`), so the existing `&b.c` interior-pointer alias logic never saw it. Fix:
+  alias registration added to `case IR_FIELD_READ`, gated on an already-tracked compound key
+  (sound by construction). Tests: `tests/zer_fail/{move_field_ptr_alias_uaf,
+  field_ptr_alias_uaf}.zer`, `tests/zer/field_ptr_alias_safe_ok.zer`.
+- **1c (double-consume/double-close via re-dereferencing the alias to resurrect a moved-from
+  value) — FIXED.** Root cause: 13 separate sites in zercheck_ir.c set `state = TRANSFERRED`;
+  only 1 (the 1b fix site) propagated to aliases. `close_file(f)` — a function-CALL-ARGUMENT
+  consume — was one of the 12 silent ones. Fix: extracted `ir_mark_transferred(ps, h, line)`
+  (sets state + propagates) and replaced all 13 raw assignments with calls to it — matching
+  CLAUDE.md's documented "per-sink patchwork" class and its refactor remedy. Test:
+  `tests/zer_fail/move_double_close_via_alias.zer`.
 
-- **1a (heap UAF + slab slot reuse via a move-struct FIELD's pointer copied
-  out) — STILL LIVE.** Re-verified 2026-07-01 with the exact reproducer below:
-  clean compile, `alias.id` reads the reused slot. Mechanism is DIFFERENT from
-  1b: `alias` is a plain VALUE COPY of a struct field (`*Task alias = o.p;` —
-  a `NODE_FIELD` read whose result happens to be a pointer), not `&`-of-the-
-  move-struct or its field. Unclear yet whether the 1b fix's alias machinery
-  extends here or whether field-pointer-value-copies need their own alias
-  registration (independent investigation needed before implementing — see
-  the 2026-07-01 addendum below this entry).
-
-- **1c (double-consume/double-close via re-dereferencing the alias to
-  resurrect a moved-from value) — STILL LIVE.** Re-verified 2026-07-01 with the
-  exact reproducer below: clean compile, `g_closes == 2`. `alias = &f` IS the
-  1b shape (and now correctly carries `f`'s alloc_id + inherits TRANSFERRED
-  per the 1b fix) — but `FileHandle reborn = *alias;` is a FULL DEREFERENCE
-  (`*ptr`, producing a fresh struct-value copy), a DIFFERENT code path than the
-  `.field` read UAF check the 1b fix touched. Needs its own investigation (see
-  the 2026-07-01 addendum below).
+**NEW sibling gap found during verification, NOT fixed (out of the 1a/1c scope, logged not
+chased):** a NESTED index+field compound alias — `Holder[2] arr; *Task alias = arr[0].p;` —
+is STILL LIVE (confirmed via targeted reproducer). The 1a fix's `ir_find_compound_handle`
+lookup only succeeds if the compound key was registered at WRITE time; likely the write-side
+registration (`container.field = h` in `case IR_ASSIGN`) doesn't handle index-then-field
+chains, only single-level field writes — a plausible 4th per-sink instance of the same class,
+unconfirmed. Needs its own investigation before fixing (same discipline as 1a/1c: don't patch
+blind).
 
 **Symptom (original, all three manifestations):** a `*T` pointer alias taken
 **before** a `move struct` is consumed (or before its owned pointer field is

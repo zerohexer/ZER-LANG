@@ -5,6 +5,67 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-01 — BH-18 #1a + #1c: move-alias gaps closed via a 13-site refactor (zercheck_ir.c)
+
+🔴 silent UAF / double-consume (both memory corruption). Completes BH-18 #1 (1b was fixed
+earlier the same day) via the REFACTOR the earlier investigation recommended — not a patch.
+`make check` GREEN, ZER 889/0 (+4 tripwires).
+
+**Root-cause investigation (before any fix — per the "think first" discipline):** empirically
+isolated BOTH remaining sub-bugs down to exact mechanisms, not guessed:
+- **1c** traced to a per-sink patchwork: grepped every site in `zercheck_ir.c` that sets
+  `state = IR_HS_TRANSFERRED` — **13 sites total**, and only the ONE touched for the 1b fix
+  (the `IR_COPY` var-decl/assignment handler) called `ir_propagate_alias_state`. The other 12
+  — asm-operand-consume, **function-call-argument-consume** (`close_file(f)`, 1c's exact
+  cause), struct-field-write-consume, array-write-consume, return-consume (×2),
+  compound-field-consume (×2), spawn-arg-consume, and others — silently transferred without
+  ever checking whether a `*T` alias needed the same update. Exactly the shape CLAUDE.md
+  already documents for escape analysis ("PER-SINK PATCHWORK — fixing one sink does NOT fix
+  the others"); per the "same fix needed at 4+ sites → extract helper" refactor trigger, 13
+  sites is unambiguously a refactor, not 13 patches.
+- **1a** traced to a genuinely different, NOT move-struct-specific gap: copying a
+  pointer-typed struct FIELD's VALUE (`*Task alias = o.p;` — no `&`) into a new local never
+  registered `alias` as sharing `o.p`'s tracked `alloc_id`. Confirmed via an isolated
+  non-move-struct reproducer (`Box`/`*Task` field, no move struct anywhere) — same gap,
+  same shape, proving it's general. Root cause: this IR is 3AC — a field READ used as an
+  rvalue lowers to its OWN `IR_FIELD_READ` instruction, never an `IR_ASSIGN` with
+  `expr=NODE_FIELD` — so the existing interior-pointer alias logic (which lives in
+  `case IR_ASSIGN`, handling `&b.c`) never saw this shape. First attempt at the fix was
+  placed in the wrong case (`IR_ASSIGN`) and silently never fired — caught via one targeted
+  debug fprintf (per the debugging workflow) showing `ir_extract_compound_key` never even
+  ran for the real reproducer; relocated to `case IR_FIELD_READ`.
+
+**Fix — Gap #2 (propagation, closes 1c):** extracted `ir_mark_transferred(ps, h, line)` —
+sets `h->state=TRANSFERRED; h->free_line=line;` AND calls `ir_propagate_alias_state` — and
+replaced all 13 raw `h->state = IR_HS_TRANSFERRED;` sites (including refactoring the original
+1b site for consistency) with calls to it. One behavior at every transfer sink now.
+
+**Fix — Gap #1 (registration, closes 1a):** added alias registration to `case IR_FIELD_READ`
+— when `inst->expr` is a `NODE_FIELD`/`NODE_INDEX` whose extracted compound key
+(`ir_extract_compound_key`) matches an EXISTING tracked compound handle
+(`ir_find_compound_handle`), the destination local inherits it via the existing
+`IRAliasSnapshot`/`ir_apply_alias` pattern (mirrors the `@ptrcast` and `&b.c` alias patterns
+already in this file). Sound by construction — an untracked/scalar field (`o.count`) can
+never spuriously match, since the lookup only succeeds against a key some EARLIER
+instruction actually registered as tracked; no type check needed.
+
+**Verified:** both exact original reproducers (1a's heap-slot-reuse, 1c's double-close via
+`*alias` resurrection) now reject; an isolated non-move-struct field-alias case also
+rejects (confirms 1a's generality); a same-scope field-pointer copy that does NOT outlive
+the source still compiles + runs (no over-rejection); a plain scalar field copy is
+unaffected. Tests: `tests/zer_fail/{move_field_ptr_alias_uaf,field_ptr_alias_uaf,
+move_double_close_via_alias}.zer`, `tests/zer/field_ptr_alias_safe_ok.zer`.
+
+**Deliberately NOT fixed here (discovered during verification, out of the 1a/1c scope,
+reported not silently expanded):** a NESTED index+field compound alias
+(`Holder[2] arr; *Task alias = arr[0].p;`) is a STILL-LIVE sibling gap — confirmed via a
+targeted reproducer. Likely the write-side compound-key registration (`container.field = h`
+in `case IR_ASSIGN`) doesn't handle index-then-field chains, only single-level field writes
+— a plausible fourth per-sink instance, unconfirmed. Logged in limitations.md rather than
+chased, per "match scope to what was requested."
+
+---
+
 ## 2026-07-01 — AU-5: ISR-alloc / context-restriction scan blind to funcptr indirection, checker.c
 
 🟠 bare-metal context-restriction gap (Definition A §2.3/§5.7). `scan_func_props` followed

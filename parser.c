@@ -483,7 +483,28 @@ static TypeNode *parse_base_type(Parser *p) {
 }
 
 /* parse full type with prefix modifiers: const, volatile, *, ?, [] */
+static TypeNode *parse_type_inner(Parser *p);
+
+/* A7-13 (2026-07-03): the type grammar recurses on every prefix modifier
+ * (`*T`, `?T`, `const/volatile T`, `[]T`, container/2C-funcptr type args) with
+ * NO native-stack guard — deep `****…u32` / `??…` / `[][]…` / `Box(Box(…))` /
+ * `*(*(…))` input overflowed the C stack (SIGSEGV) before the checker's
+ * AST-level nesting guard could fire. This crashed batch compiles AND the LSP/
+ * WASM CLI (same parser). Guard shares p->depth with parse_precedence/
+ * parse_unary (combined nesting bound 256), mirroring the existing expression
+ * guard. On overflow: report + return a TYNODE_VOID error node. */
 static TypeNode *parse_type(Parser *p) {
+    if (++p->depth > 256) {
+        error(p, "type nesting too deep (limit 256)");
+        p->depth--;
+        return new_type_node(p, TYNODE_VOID);
+    }
+    TypeNode *t = parse_type_inner(p);
+    p->depth--;
+    return t;
+}
+
+static TypeNode *parse_type_inner(Parser *p) {
     /* const T */
     if (match(p, TOK_CONST)) {
         TypeNode *t = new_type_node(p, TYNODE_CONST);
@@ -973,7 +994,24 @@ static Node *parse_primary(Parser *p) {
 
 static Node *parse_postfix(Parser *p, Node *left); /* forward decl */
 
+static Node *parse_unary_inner(Parser *p);
+
+/* A7-13 (2026-07-03): parse_unary self-recurses on each prefix operator with no
+ * native-stack guard — deep `------…1` overflowed the C stack before the
+ * checker's AST nesting guard. Shares p->depth (limit 256) with the other
+ * recursive parsers. */
 static Node *parse_unary(Parser *p) {
+    if (++p->depth > 256) {
+        error(p, "expression nesting too deep (limit 256)");
+        p->depth--;
+        return new_node(p, NODE_INT_LIT); /* dummy node */
+    }
+    Node *n = parse_unary_inner(p);
+    p->depth--;
+    return n;
+}
+
+static Node *parse_unary_inner(Parser *p) {
     /* prefix: - ! ~ * & */
     if (match(p, TOK_MINUS) || match(p, TOK_BANG) || match(p, TOK_TILDE) ||
         match(p, TOK_STAR) || match(p, TOK_AMP)) {

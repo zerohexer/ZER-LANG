@@ -84,6 +84,29 @@ outermost shared sub-expression as a lock root. Test `tests/zer/shared_multi_fie
 **Also (tech debt):** removed the dead `has_atomic_or_barrier` scanner (checker.c — absorbed
 into `scan_func_props`, zero callers).
 
+**Follow-up (same session, batch 2):**
+
+**8. 🟡 Parser stack overflow (DoS + LSP crash) on deeply-nested input (A7-13).** Files:
+`parser.c` `parse_type`/`parse_unary`. The only native-stack depth guards were in
+`parse_precedence` (256) and `parse_block` (64); the type grammar (`*T`/`?T`/`[]T`/container/
+2C-funcptr) and the unary-prefix grammar recursed with NONE. Deep `****…`/`??…`/`[][]…`/
+`------…`/`Box(Box(…))`/`*(*(…))` overflowed the C stack (SIGSEGV) before the checker's
+AST-level nesting guard could fire — a batch-compile DoS, and (same parser) an LSP/WASM-CLI
+crash on a pathological editor buffer. Fix: wrap both in a thin guard sharing `p->depth`
+(limit 256), mirroring the existing expression guard; deep input now reports "nesting too deep"
+and returns an error node. Tests `tests/zer_fail/parser_deep_{unary,type}_recursion.zer`.
+
+**9. 🟡 `@critical` interrupt-disable lacked the `"memory"` clobber on ARM / AVR / RISC-V (A7-6).**
+File: `emitter.c` ~9891/9895/9899 (BEGIN) + ~9925/9929/9933 (END). The x86 arms had `"memory"`
+(Gap 10, 2026-05-16); the other three did not, so GCC could reorder non-volatile accesses across
+`cpsid i`/`cli`/`csrrci` — the critical section was not a compiler barrier for anything the
+volatile-global rule misses. Fix: added the `"memory"` clobber to all six non-x86 arms (AVR END
+gets an empty-asm barrier before the `SREG=` restore since that is a plain C store).
+
+**Reverted (A7-7, too aggressive):** a preamble `_Static_assert` on `usize` width broke the
+`test_emit.c` E2E harness (default width 32 compiled on a 64-bit host is a BENIGN mismatch the
+assert can't distinguish). Kept OPEN in limitations.md with the reason so it isn't retried.
+
 ---
 
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)

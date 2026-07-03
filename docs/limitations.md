@@ -73,22 +73,23 @@ sketch so a fresh session can close it. Remove a row when it lands.
   it inside the re-emitted cond, so each poll recomputes it. (Sibling of the now-fixed C-F1
   await-cond-block-insertion family.)
 
-- **[A7-6] `@critical` interrupt-disable asm lacks the `"memory"` clobber on ARM / AVR / RISC-V.**
-  File: `emitter.c` ~9861/9865/9869 (+ END arms). The 2026-05-16 x86 fix added `:: "memory"`;
-  the ARM/AVR/RISC-V arms never got it, so GCC may reorder non-volatile stores/loads across the
-  `cpsid i` / `csrrci` boundary — the critical section is not a compiler barrier. Anything the
-  volatile-global rule misses (incl. non-volatile locals mutated under `@critical`) can be
-  reordered out. Fix: add `::: "memory"` (and `"cc"` where flags change) to all four non-x86 arms.
-  Secondary: the AVR arm references `SREG` but the preamble never includes `<avr/io.h>`.
+- **[A7-6] ~~`@critical` missing `"memory"` clobber on ARM/AVR/RISC-V~~ — FIXED 2026-07-03**
+  (BUGS-FIXED.md). Clobber added to all six non-x86 arms. (Secondary, still OPEN: the AVR arm
+  references `SREG` but the preamble never includes `<avr/io.h>` — a loud compile error on AVR.)
 
 - **[A7-7] Cross-compile usize width mismatch silently truncates u64→usize.** File: `zerc_main.c`
   ~357 (usize auto-detected from HOST gcc). `usize x = some_u64;` compiles under host 64-bit and
   emits `size_t x = b;`; recompiled with `arm-none-eabi-gcc` (size_t=32-bit — the exact
   `examples/qemu-cortex-m3/Makefile` flow, which passes no `--target-bits 32`) it truncates
-  silently, voiding the "must @truncate" guarantee, and VRP reasons with the wrong width. Fix
-  (one line): emit `_Static_assert(sizeof(size_t)*8 == <zer_target_ptr_bits>, "recompile with
-  --target-bits");` into the preamble so a mismatch is a loud GCC error. (Also reconcile
-  CLAUDE.md "hardcoded 32-bit" vs the actual auto-detect.)
+  silently, voiding the "must @truncate" guarantee, and VRP reasons with the wrong width.
+  **A naive `_Static_assert(sizeof(size_t)*8 == <zer_target_ptr_bits>)` in the preamble does
+  NOT work and was reverted 2026-07-03** — the `test_emit.c` E2E harness (and any emitter use
+  that keeps the default width 32 while compiling on a 64-bit host) hits a BENIGN mismatch the
+  assert cannot distinguish from a dangerous one, so it fails valid builds. The real fix must
+  either (a) make the checker's `target_ptr_bits` always equal the actual emit target (so the
+  default can't diverge from the compiling gcc), or (b) assert only when a `usize` value is
+  actually width-narrowed, or (c) gate the assert on `--target-bits` having been set EXPLICITLY
+  (not the default). Also reconcile CLAUDE.md "hardcoded 32-bit" vs the actual auto-detect.
 
 - **[A7-8] Per-arch intrinsic cascades silently emit NOTHING on 32-bit ARM (Cortex-M).** File:
   `emitter.c` ~7574 (`@cpu_deep_sleep`/`@cpu_idle_hint`) + ~50 `defined(__aarch64__)`-only arms
@@ -137,16 +138,10 @@ sketch so a fresh session can close it. Remove a row when it lands.
   parse as a parenthesized expression. Add `(*p & mask)` positive tests; also fix the example
   Makefile.
 
-- **[A7-13] Unbounded recursion in `parse_type` and `parse_unary` → SIGSEGV on deep input.**
-  File: `parser.c` `parse_type` (~486), `parse_unary` (~976); also container type-arg and 2C
-  funcptr. The only depth guards are in `parse_precedence` (256) and `parse_block` (64); the type
-  grammar and unary-prefix grammar recurse with NO guard. Deep `*`/`?`/`[]`/unary/`Box(Box(…))`/
-  `*(*(…))` input overflows the native stack (ASan stack-overflow) before the checker's
-  nesting-depth guard (which runs on the already-built AST) can fire. A batch-compile DoS, and —
-  worse — the same paths back the LSP and WASM CLI, so a pathological editor buffer crashes the
-  language server. Fix: increment/decrement a shared `p->depth` (with the existing `> N` error +
-  early return) at the entry of `parse_type` and `parse_unary`; add a matching guard to
-  `resolve_type_inner`. Add deep-`*`/`?`/`[]`/unary negatives to `tests/zer_fail/`.
+- **[A7-13] ~~Unbounded recursion in `parse_type`/`parse_unary` → SIGSEGV~~ — FIXED 2026-07-03**
+  (BUGS-FIXED.md). Both wrapped in a `p->depth`-sharing guard (limit 256). (Defense-in-depth
+  `resolve_type_inner` guard for programmatically-large types is not added — parser guard is
+  sufficient for source input; note if a future path builds huge types directly.)
 
 ### ⚪ diagnostics / debt
 

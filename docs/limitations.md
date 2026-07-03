@@ -5,6 +5,177 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-07-03 deep audit (8-agent fan-out): findings not yet fixed
+
+The 2026-07-03 deep audit fixed 7 holes (BUGS-FIXED.md 2026-07-03: union-tag, await-pred,
+2× VRP scope-leak, array-launder, 2× shared-lock). The findings below were REPRODUCED against
+`./zerc` but NOT yet fixed. Ordered by severity. Each has a minimal repro location and a fix
+sketch so a fresh session can close it. Remove a row when it lands.
+
+### 🔴 memory-safety (fix first)
+
+- **[A7-1] MMIO index bounds lost through a `volatile *T` PARAM or a local alias → silent
+  bare-metal wild write.** File: `checker.c` TYPE_POINTER index path (~6650, `Symbol.mmio_bound`).
+  The mmio-range bounds check for `volatile *T` indexing keys on `mmio_bound`, set only on the
+  var directly initialized from `@inttoptr`. `void wr(volatile *u32 base, u32 i){ base[i]=v; }`
+  and `volatile *u32 alias = reg; alias[i]=v;` both emit a RAW indexed store — no guard, no
+  warning, no error (the non-volatile `*T` "no length to bounds-check" compile error at ~6710
+  does NOT fire for volatile). Hosted may SIGSEGV; bare metal writes at `base+4·i` silently.
+  This is the escape-sink patchwork class in the MMIO domain. Fix: propagate `mmio_bound` on
+  var-decl/assign from a bound source (like `is_local_derived`), and for a volatile-pointer
+  param either infer a per-param bound via FuncSummary or conservatively REJECT variable
+  indexing of a volatile pointer with unknown bound (the error text at ~6710 already promises
+  this).
+
+- **[A7-2] Side-effecting index on a `volatile *T` (MMIO) is evaluated TWICE and the bounds
+  guard checks a DIFFERENT value than the access uses.** File: `emitter.c` IR_INDEX_READ handler
+  (~10833) + NODE_INDEX pointer branch (~6279) vs `emit_auto_guards` (~406). For
+  `reg[f()]` the IR decomposes the index into a temp used by the access, but the auto-guard pass
+  re-emits the ORIGINAL AST index → a second, independent `f()` call. Result: side effect runs
+  twice AND `if (f() >= N)` guards call B while `reg[tA]` uses call A — if call A is OOB and
+  call B in-bounds, the guard passes and an out-of-bounds volatile access is emitted. The BH-18
+  #5 fix covered fixed arrays + slices; the volatile-pointer path was not. Fix: route a
+  side-effecting volatile-pointer index through the same single-eval statement-expression as the
+  fixed-array/slice paths, and suppress the separate `emit_auto_guards` re-emission for that node.
+
+### 🟠 concurrency (data race / silent corruption)
+
+- **[A7-3] `spawn` data-race scan blind to a funcptr BOUND to a variable/struct field (D2).**
+  File: `checker.c` `scan_unsafe_global_access` NODE_CALL (~9500). BH-18 #8/T1.2 closed the
+  funcptr-ARGUMENT form (`run_n(do_inc, n)`); the BINDING form is its unclosed sibling:
+  `void worker(){ *()->void fp = do_inc; fp(); }` + `spawn worker()` races a global via `fp()`
+  and compiles clean (the byte-identical direct `do_inc()` IS flagged; the compiler even prints
+  "calls through function pointer with unknown target" yet the race scan accepts). Fix: track
+  funcptr assignments that bind a resolvable function symbol (`local/field = func_ident`), and
+  when the scan hits a call resolving through that binding, descend the target body (bounded by
+  the existing `_scan_depth` cap 32). The ISR/@critical analog (`scan_func_props`) has the same
+  binding blind spot.
+
+- **[A7-4] ISR shared-global analysis (Pass 4) is NOT transitive — one helper call bypasses the
+  missing-volatile AND non-atomic-RMW checks.** File: `checker.c` `in_interrupt` set only around
+  the NODE_INTERRUPT body (~14512); `track_isr_global` call sites (~3263/3769). `void bump(){
+  g_count += 1; } interrupt USART1 { bump(); }` compiles clean; the direct
+  `interrupt USART1 { g_count += 1; }` correctly errors "must be volatile". No depth cap — there
+  is NO transitive scan for this pass (unlike the alloc/spawn/asm FuncProps scan). Bare-metal
+  result: torn reads / lost RMW — silent corruption. Fix: mirror AU-5/BH-18 #8 — walk direct
+  callees (cap ~8) with `in_interrupt` held, or union per-function "globals accessed" summaries
+  at ISR call sites.
+
+### 🟡 miscompile / emission
+
+- **[A7-5] `await (opt orelse d) == x` never re-polls the orelse'd value → coroutine stuck.**
+  File: `ir_lower.c` NODE_AWAIT (~3450) + `pre_lower_orelse`. `pre_lower_orelse` hoists the
+  orelse computation into blocks that run BEFORE the AWAIT and replaces the subexpr with a temp;
+  on resume the Duff switch jumps to `case N:;` (the AWAIT), skipping those blocks, so the temp
+  is never recomputed and the BUG-591 per-poll re-eval is defeated. Runtime: a suspended
+  `await (g orelse 0) == 7` can never make progress after `g` becomes 7. Fix: keep the
+  value-inserting subexpr's decomposition in the RESUME block (after `case N:;`), or re-evaluate
+  it inside the re-emitted cond, so each poll recomputes it. (Sibling of the now-fixed C-F1
+  await-cond-block-insertion family.)
+
+- **[A7-6] `@critical` interrupt-disable asm lacks the `"memory"` clobber on ARM / AVR / RISC-V.**
+  File: `emitter.c` ~9861/9865/9869 (+ END arms). The 2026-05-16 x86 fix added `:: "memory"`;
+  the ARM/AVR/RISC-V arms never got it, so GCC may reorder non-volatile stores/loads across the
+  `cpsid i` / `csrrci` boundary — the critical section is not a compiler barrier. Anything the
+  volatile-global rule misses (incl. non-volatile locals mutated under `@critical`) can be
+  reordered out. Fix: add `::: "memory"` (and `"cc"` where flags change) to all four non-x86 arms.
+  Secondary: the AVR arm references `SREG` but the preamble never includes `<avr/io.h>`.
+
+- **[A7-7] Cross-compile usize width mismatch silently truncates u64→usize.** File: `zerc_main.c`
+  ~357 (usize auto-detected from HOST gcc). `usize x = some_u64;` compiles under host 64-bit and
+  emits `size_t x = b;`; recompiled with `arm-none-eabi-gcc` (size_t=32-bit — the exact
+  `examples/qemu-cortex-m3/Makefile` flow, which passes no `--target-bits 32`) it truncates
+  silently, voiding the "must @truncate" guarantee, and VRP reasons with the wrong width. Fix
+  (one line): emit `_Static_assert(sizeof(size_t)*8 == <zer_target_ptr_bits>, "recompile with
+  --target-bits");` into the preamble so a mismatch is a loud GCC error. (Also reconcile
+  CLAUDE.md "hardcoded 32-bit" vs the actual auto-detect.)
+
+- **[A7-8] Per-arch intrinsic cascades silently emit NOTHING on 32-bit ARM (Cortex-M).** File:
+  `emitter.c` ~7574 (`@cpu_deep_sleep`/`@cpu_idle_hint`) + ~50 `defined(__aarch64__)`-only arms
+  without an `__ARM_ARCH` arm or `#else`. On the project's flagship QEMU Cortex-M3 target,
+  `@cpu_deep_sleep()` is a no-op → a low-power idle becomes a busy spin, silently. Fix: sweep the
+  D-Alpha emission block; every per-arch cascade gets an `__ARM_ARCH` arm or the batch-3 `#error`
+  `#else` (grep `defined(__aarch64__)` in emitter.c, filter out `__ARM_ARCH`).
+
+- **[A7-9] `packed struct` overlay on MMIO defeats the alignment/access-width discipline.**
+  File: `checker.c` `@inttoptr` alignment check (integer/float pointees only; struct pointees
+  skip it). `@inttoptr(*Regs, addr)` with a packed `Regs` compiles with no diagnostic; on ARM,
+  GCC lowers a packed volatile field write to byte-split transactions — a single u16 register
+  write becomes two 8-bit bus cycles (silent hardware corruption for w1c/read-sensitive
+  registers), bypassing the advertised "Misaligned MMIO" compile-time layer. Fix: reject/warn on
+  `@inttoptr` to a pointer-to-packed-struct, or reject a volatile packed-field access whose
+  offset misaligns the field's natural width.
+
+- **[A7-10] `section(...)` globals silently escape the auto-zero contract.** File: parser/emitter
+  `section()` support. Distinct from the known `.bss` item: a conforming startup that zeroes
+  `.bss` / copies `.data` never touches a user-named section (`.ccmram` etc.), so "Everything
+  auto-zeroed" is void for every `section()` global (CCM/backup RAM is garbage at power-on). No
+  diagnostic. Fix: warn on `section()` globals ("outside the .bss/.data startup contract"); and
+  reconcile `firmware_safety_extensions.md` §11 (presents `@section` as unshipped) with the
+  shipped attribute.
+
+- **[A7-11] Boot-time MMIO validation (`_zer_mmio_validate`) is doubly dead on bare metal.**
+  File: `emitter.c` ~5427 + `examples/qemu-cortex-m3/{startup.c,link.ld}`. Layer 3 of the
+  advertised 4-layer MMIO safety is an `__attribute__((constructor))`, but the reference startup
+  never processes `.init_array` (no ctor loop, no `KEEP(*(.init_array*))`, `--gc-sections` may
+  drop it) → never runs; and even if it ran, freestanding `_zer_probe` unconditionally returns
+  `has_value=1`, so the validator is statically unreachable. Fix: document that layer 3 needs a
+  ctor-running startup + fault-recoverable probe; add `KEEP(*(.init_array*))` + a ctor loop to
+  the reference startup; on freestanding, skip emitting the dead validator or emit `#warning`.
+
+### 🟡 over-rejection / bitrot / DoS
+
+- **[A7-12] ALL 8 QEMU firmware examples fail to compile — `(*ptr & mask)` parse regression.**
+  File: `parser.c` ~871 (`TOK_STAR` after `(` unconditionally starts a pointer-cast). The
+  canonical MMIO poll idiom `(*UART0_FR & 0x20)` — used across `hello.zer`/`rtos.zer`/`shell.zer`
+  and every example — errors "expected ')' after cast type"; even bare `(*r)` no longer parses.
+  The 2026-06-06 C-style-cast feature made `(` `*` unconditionally a cast, with no backtrack for
+  the parenthesized-dereference reading; no `tests/zer/` test covers `(*var ...)`, so `make check`
+  stayed green while the firmware example suite bitrotted. Fix: for the ambiguous `TOK_STAR` case,
+  save scanner state (the designated-init lookahead at parser.c ~810 already does this); if
+  `parse_type` doesn't end at `)` or the token after `)` can't start a unary expr, restore and
+  parse as a parenthesized expression. Add `(*p & mask)` positive tests; also fix the example
+  Makefile.
+
+- **[A7-13] Unbounded recursion in `parse_type` and `parse_unary` → SIGSEGV on deep input.**
+  File: `parser.c` `parse_type` (~486), `parse_unary` (~976); also container type-arg and 2C
+  funcptr. The only depth guards are in `parse_precedence` (256) and `parse_block` (64); the type
+  grammar and unary-prefix grammar recurse with NO guard. Deep `*`/`?`/`[]`/unary/`Box(Box(…))`/
+  `*(*(…))` input overflows the native stack (ASan stack-overflow) before the checker's
+  nesting-depth guard (which runs on the already-built AST) can fire. A batch-compile DoS, and —
+  worse — the same paths back the LSP and WASM CLI, so a pathological editor buffer crashes the
+  language server. Fix: increment/decrement a shared `p->depth` (with the existing `> N` error +
+  early return) at the entry of `parse_type` and `parse_unary`; add a matching guard to
+  `resolve_type_inner`. Add deep-`*`/`?`/`[]`/unary negatives to `tests/zer_fail/`.
+
+### ⚪ diagnostics / debt
+
+- **[A7-14] Runtime trap messages report the WRONG source line.** The IR-path function emission
+  disables `#line` during block emission (emitter.c ~11187) but still passes `__FILE__/__LINE__`
+  into `_zer_bounds_check`/`_zer_trap`, so `__LINE__` is the drifted C line, not the ZER source
+  line (an 8-line `.zer` reports "line 18"). Fix: pass the IR instruction's `source_line` literal
+  into the check/trap calls instead of `__LINE__`, or emit a per-statement `#line` on the IR path.
+- **`ir_merge_states` copies `critical_depth` from `first_live` only** (zercheck_ir.c ~895) — not
+  reconciled across predecessors like `handles[]`/`threads[]`. Sound today because `@critical`
+  bans control-flow exit so the depth is structurally balanced at joins; worth a one-line note.
+- **`lambda_zer_concurrency/*.v` is NOT in the `make check-proofs` admit-gate glob** — clean today
+  (zero admits) but a future admit there would not fail CI. Add it to the FILES list.
+- **~26 VST-verified `src/safety/*.c` predicates are UNWIRED** (production runs a parallel
+  hand-written copy: spawn bans, ISR-shared, switch exhaustiveness, `zer_handle_state_is_*`). The
+  VST proof covers the predicate, not the shipped path — the `@bitcast` situation in miniature.
+  Wire each to its inline site (mechanical) so the proof governs production.
+
+### precision (relaxation opportunities — sound, unimplemented)
+
+Wire the orphaned `vrp_ir.c` (CFG-VRP) as the sole range source — closes A7-family VRP
+precision loss AND is the durable form of the two 2026-07-03 VRP fixes (the flat AST pass has no
+real JOIN). Oracle ready (`bounds_lattice.v`). Implement `join_lattice.v` member-set return
+summary (replaces the flat `ret_param_mask`) for downstream escape precision. `disjoint_lattice.v`
+for the alloc_id fate-sharing false positive (BUG-741). All three are in the "MAX-ORACLE GAP
+AUDIT" master map below.
+
+---
+
 ## DONE (2026-07-01) — BRANCH-IMPORT LANDED (9 fixes / 13 holes) — residual flags + open items below
 
 **STATUS: all three tiers committed + `make check` GREEN, ZER 873/0.** Tier 1 `6c368761`

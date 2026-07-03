@@ -1,0 +1,16 @@
+// Regression (C-F3): an `orelse return` inside a shared-struct-reading if
+// condition must release the cond mutex before the early exit (else the lock
+// leaks -> deadlock). Must compile, run, and exit 0 (no deadlock/timeout).
+shared struct S { ?u32 v; u32 w; }
+S g;
+void f() {
+    if ((g.v orelse return) == 1) { g.w = 2; }
+}
+u32 main() {
+    g.v = 5;
+    f();          // v=5 != 1, has-value path, no write
+    g.v = 1;
+    f();          // v=1, writes w=2
+    if (g.w != 2) { return 1; }
+    return 0;
+}

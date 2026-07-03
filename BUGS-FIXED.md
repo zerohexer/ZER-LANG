@@ -5,6 +5,87 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-03 — Deep audit batch: 7 soundness/race fixes (8-agent fan-out + coordinator verify)
+
+`make check` GREEN, ZER 898/0 (+7 regression tests). Every fix independently reproduced
+against `./zerc` before and after. All are pure TIGHTENING except the two VRP fixes, which
+recover a soundly-elided bounds guard (a mistake there over-rejects → guard inserted → safe).
+Remaining audit findings that are NOT yet fixed are tracked in `docs/limitations.md`
+("2026-07-03 deep audit — OPEN findings").
+
+**1. 🔴 Union type confusion — variant write through a `*Union` pointer skipped the tag.**
+File: `emitter.c` ~6314 (IR-path union-tag walk). `void f(*Val vp){ vp.i = 77; }` emitted
+`vp->i = 77;` with NO `vp->_tag = N` update — the walk only recognized a union field write
+when the object's type was directly `TYPE_UNION`, but ZER's `.` auto-derefs a `*Union`, so
+the object type is `TYPE_POINTER` and the tag-set was skipped. A later `switch(u)` at the
+caller then read the WRONG variant (stale discriminant). SILENT on both hosted and bare metal
+for non-pointer variants (`union{u8;u64}` reads 8 bytes when tagged `small`); a pointer
+variant dereferenced an integer. This is a grammar-level closure breach (union safety
+defeated). Fix: detect `TYPE_POINTER`-to-union at each field step and emit `_zer_up = vp`
+(no `&`) so `_zer_up->_tag` writes through the pointer. Test `tests/zer/union_ptr_write_tag_ok.zer`.
+
+**2. 🔴 Use-after-free undetected across an `await` whose condition inserts CFG blocks.**
+File: `ir.c` `ir_compute_preds` ~254. `IR_AWAIT` was in the `default` fall-through, which only
+adds the `bi+1` predecessor edge. When the await condition pre-lowers into extra blocks (e.g.
+`await (opt orelse d) == x`), the AWAIT lands in a later block whose resume `goto_block` is not
+`bi+1`, so the resume block got NO predecessor → zercheck_ir's forward dataflow never visited
+it → a handle freed before the await was not seen FREED at a use after it. The two other CFG
+walkers (`dfs_reachable`, `cfg_reaches_fire`) already grouped `IR_YIELD`/`IR_AWAIT`;
+`ir_compute_preds` was the straggler. Fix: one-line — add `case IR_AWAIT:` next to
+`case IR_YIELD:`. Test `tests/zer_fail/await_orelse_cond_uaf.zer`.
+
+**3. 🔴 VRP branch-assignment scope leak → elided bounds guard → OOB write (Finding A).**
+File: `checker.c` if-handler VRP block ~10619/10759/10839. An assignment inside a conditional
+branch (`if (b) { x = 1; }`) calls `vrp_invalidate_for_assign`, which mutates the shared
+`VarRange` struct IN PLACE. The BH-18 #2 count-only restore rewinds entries *pushed* by the
+branch but cannot undo an in-place mutation of a pre-existing entry, so the branch-local range
+(`[1,1]`) leaked past the join and `arr[x]` was proven "safe" on the real path where `x` was
+OOB — no bounds guard emitted. ASan-confirmed stack OOB write. Fix: snapshot pre-branch range
+VALUES (`vrp_snap_take/restore/join`) and JOIN (union) each branch's result at the merge so
+the range over-approximates every path (join, not widen-to-full, to preserve `known_nonzero`
+for divisors). Applied to BOTH the comparison-guard and non-comparison branch paths. Test
+`tests/zer/vrp_branch_assign_guard_ok.zer`.
+
+**4. 🔴 VRP loop-body pre-pass narrowed to the assigned literal instead of widening (Finding B).**
+File: `checker.c` `vrp_invalidate_loop_body_writes` ~14700. The while/do-while pre-pass
+(meant to WIDEN body-written vars so a body index doesn't trust a stale pre-loop range)
+delegated to `vrp_invalidate_for_assign`, which for a literal rhs (`i = 0`) NARROWS the entry
+to `[0,0]`. So a body use `arr[i]` executed BEFORE `i = 0` was proven safe against the
+post-assignment literal, not the loop-carried value — bounds guard elided → OOB on a fixed
+array (slices keep their dynamic `.len` check). ASan-confirmed. Fix: new `vrp_join_assign_range`
+JOINs the write's value range with the carried range (`d = 3` keeps `100/d` provable; `i = 0`
+widens the bound and drops `known_nonzero`). Test `tests/zer/vrp_loop_assign_guard_ok.zer`.
+
+**5. 🔴 Local array pointer-carrier laundered a stack pointer past the escape sinks (D1).**
+File: `checker.c` `type_can_carry_pointer` ~1396. The predicate the store/return/keep escape
+sinks use to decide "is this a pointer carrier?" excluded `TYPE_ARRAY`, so `Box[2] arr;
+arr[0].p = local_slice; g = arr[0].p;` never marked the array root local-derived and the
+dangling store to `g` compiled clean. Fix: an array whose element carries a pointer is itself
+a carrier — delegate to the existing recursive `type_carries_data_pointer` on the element.
+Purely additive (more taint) → sound. Test `tests/zer_fail/array_field_launder_escape.zer`.
+
+**6. 🟠 Shared-cond mutex leak → deadlock: `orelse return/break` inside a locked condition (C-F3).**
+File: `ir_lower.c` `emit_shared_lock_around_cond`/`emit_shared_unlock_after_cond` ~1413. The
+cond lock emitter did not set `ctx->current_stmt_shared_root`, so an `orelse return` lowered
+from inside the condition (`if ((g.v orelse return) == 1)`) took its early-exit path without
+`lower_orelse_to_dest` emitting an `IR_UNLOCK` — the shared mutex stayed held forever
+(compiler-introduced deadlock). Fix: expose the cond's lock root as `current_stmt_shared_root`
+during cond lowering (saved/restored via a new `LowerCtx.cond_shared_saved`). Test
+`tests/zer/shared_cond_orelse_unlock_ok.zer`.
+
+**7. 🟠 Multi-root shared lock blind to `*shared S` field projections → data race (C-F4).**
+File: `ir_lower.c` `find_all_shared_roots_expr` ~1310. The B1 multi-root walker walked straight
+to the innermost ident and only checked its type, so `wa.sp.v + wb.sp.v` (two `*shared S` field
+reads) emitted the second read with NO `pthread_mutex_lock` — the 6th sibling of the 2026-07-01
+T3 field-projection class (the primary emitter `find_shared_root_expr` was fixed then; this
+extras walker was missed). Fix: check the object's type at EACH projection step and add the
+outermost shared sub-expression as a lock root. Test `tests/zer/shared_multi_field_ptr_lock_ok.zer`.
+
+**Also (tech debt):** removed the dead `has_atomic_or_barrier` scanner (checker.c — absorbed
+into `scan_func_props`, zero callers).
+
+---
+
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
 
 🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed

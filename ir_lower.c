@@ -110,6 +110,13 @@ typedef struct {
      * Single-level tracking — nested shared blocks accumulate locks
      * (recursive mutex), and only the outermost unlock fires here. */
     Node *current_stmt_shared_root;
+    /* C-F3 (2026-07-03): prev value of current_stmt_shared_root saved while a
+     * condition's shared-read lock is active, so an `orelse return/break` inside
+     * an if/while/for/switch/do-while CONDITION releases the cond mutex before
+     * the early exit (else the lock leaks -> permanent deadlock). Cond locks do
+     * not nest within one condition (conditions are expressions), so one slot
+     * suffices. */
+    Node *cond_shared_saved;
 } LowerCtx;
 
 /* ---- Helpers ---- */
@@ -1308,27 +1315,39 @@ static void find_all_shared_roots_expr(Checker *c, Node *expr,
                                        Node **out, int *count, int max) {
     if (!expr || *count >= max) return;
     if (expr->kind == NODE_FIELD) {
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
-            Type *t = checker_get_type(c, root);
-            if (t) {
-                Type *eff = type_unwrap_distinct(t);
+        /* C-F4 (2026-07-03): check the OBJECT's type at EACH projection step,
+         * not just the innermost ident — mirrors the primary lock emitter
+         * find_shared_root_expr. `wa.sp.v` where `wa.sp` is `*shared S` was
+         * silently missed (root walked to plain `wa`), so a second `*shared S`
+         * field read in a multi-root statement emitted with NO lock (race).
+         * Add the OUTERMOST shared sub-expression as the lock root. */
+        Node *cur = expr;
+        Node *shared_sub = NULL;
+        while (cur) {
+            Node *next;
+            if (cur->kind == NODE_FIELD) next = cur->field.object;
+            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
+            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
+            else break;
+            Type *nt = checker_get_type(c, next);
+            if (nt) {
+                Type *eff = type_unwrap_distinct(nt);
                 if (eff->kind == TYPE_STRUCT &&
-                    (eff->struct_type.is_shared || eff->struct_type.is_shared_rw))
-                    add_shared_root_unique(root, out, count, max);
-                else if (eff->kind == TYPE_POINTER) {
+                    (eff->struct_type.is_shared || eff->struct_type.is_shared_rw)) {
+                    shared_sub = next; break;
+                }
+                if (eff->kind == TYPE_POINTER) {
                     Type *inner = type_unwrap_distinct(eff->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT &&
-                        (inner->struct_type.is_shared ||
-                         inner->struct_type.is_shared_rw))
-                        add_shared_root_unique(root, out, count, max);
+                        (inner->struct_type.is_shared || inner->struct_type.is_shared_rw)) {
+                        shared_sub = next; break;
+                    }
                 }
             }
+            cur = next;
         }
+        if (shared_sub)
+            add_shared_root_unique(shared_sub, out, count, max);
     }
     if (expr->kind == NODE_BINARY) {
         find_all_shared_roots_expr(c, expr->binary.left, out, count, max);
@@ -1422,11 +1441,18 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
      * every cond read, defeating shared(rw)'s reader concurrency. */
     lock.src2_local = 0;
     emit_inst(ctx, lock);
+    /* C-F3: expose the cond's lock root so an `orelse return/break/continue`
+     * lowered from INSIDE the condition (lower_orelse_to_dest consults
+     * ctx->current_stmt_shared_root) releases the mutex on the early-exit path.
+     * Restored by emit_shared_unlock_after_cond on the normal path. */
+    ctx->cond_shared_saved = ctx->current_stmt_shared_root;
+    ctx->current_stmt_shared_root = root;
     return root;
 }
 
 static void emit_shared_unlock_after_cond(LowerCtx *ctx, Node *root, int line) {
     if (!root) return;
+    ctx->current_stmt_shared_root = ctx->cond_shared_saved;  /* C-F3 restore */
     IRInst unlock = make_inst(IR_UNLOCK, line);
     unlock.expr = root;
     emit_inst(ctx, unlock);

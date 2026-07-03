@@ -1,0 +1,19 @@
+// Regression: writing a union variant through a *Union pointer must update the
+// discriminant tag (else switch reads the wrong variant — silent type confusion).
+union Val { u8 small; u64 big; }
+void set_small(*Val vp) { vp.small = 3; }
+u64 read_as(Val v) {
+    u64 out = 0;
+    switch (v) {
+        .small => |s| { out = (u64)s; }
+        .big => |b| { out = b; }
+    }
+    return out;
+}
+u32 main() {
+    Val a;
+    a.big = 0xAABBCCDD11223344;
+    set_small(&a);          // sets .small=3 AND tag -> small
+    if (read_as(a) != 3) { return 1; }   // wrong tag would read 8 bytes
+    return 0;
+}

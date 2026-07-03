@@ -717,3 +717,9 @@ emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
 emitter.c:if (ta->kind == TYNODE_NAMED) {
 zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
 zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+emitter.c:if (obj_is_ptr && obj_type && obj_type->kind == TYPE_POINTER)
+emitter.c:if (ot_eff && ot_eff->kind == TYPE_POINTER) {
+emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
+# ^ 3 added 2026-07-03: union-tag-set-through-*Union-pointer fix (emitter.c ~6318).
+#   All are already-unwrapped locals (type_unwrap_distinct results): ot_eff, pinner,
+#   obj_type — the distinct-unwrap has already happened, so a raw ->kind read is safe.

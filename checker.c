@@ -359,6 +359,10 @@ static Type *resolve_type(Checker *c, TypeNode *tn);
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
+/* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
+static struct VarRange *vrp_snap_take(Checker *c, int n);
+static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
+static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
@@ -1392,6 +1396,14 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
 static bool type_can_carry_pointer(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
+    /* Finding D1 (2026-07-03): a local ARRAY whose element carries a pointer is
+     * itself a pointer-carrier — `Box[2] arr; arr[0].p = local_slice; g =
+     * arr[0].p;` laundered a stack pointer to a global because the store-escape
+     * taint (~4136/4160) gates on this predicate and arrays were excluded, so
+     * the array root was never marked local-derived. Delegate to the recursive
+     * carrier check on the element. Purely additive (more taint) → sound. */
+    if (eff && type_dispatch_kind(eff) == TYPE_ARRAY)
+        return type_carries_data_pointer(eff->array.inner, 0);
     return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
                    eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
                    eff->kind == TYPE_OPAQUE);
@@ -9335,86 +9347,6 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
-
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
  * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -10613,6 +10545,13 @@ static void check_stmt(Checker *c, Node *node) {
         /* Value range propagation: extract constraints from condition */
         {
             int saved_range_count = c->var_range_count;
+            /* Finding A: snapshot pre-branch VALUES so an in-place range
+             * mutation by an assignment inside the comparison-guard then-body
+             * (`if (mode == 0) { i = 1; }`) can be JOINed at the merge instead
+             * of leaking. The non-comparison path takes its own local snapshot
+             * below; this one covers the comparison / guard path. */
+            struct VarRange *cmp_pre = vrp_snap_take(c, saved_range_count);
+            struct VarRange *cmp_thenv = NULL;
             Node *if_cond = node->if_stmt.cond;
 
             /* detect comparison pattern: ident OP const or const OP ident */
@@ -10747,6 +10686,12 @@ static void check_stmt(Checker *c, Node *node) {
 
                 check_stmt(c, node->if_stmt.then_body);
                 c->var_range_count = saved_range_count; /* restore */
+                /* Finding A: capture the then-body's in-place range mutations,
+                 * then reset pre-existing entries to their pre-branch values so
+                 * the guard-inverse push + else-body run from a clean base. The
+                 * then result is JOINed back at the end of the block. */
+                cmp_thenv = vrp_snap_take(c, saved_range_count);
+                vrp_snap_restore(c, cmp_pre, saved_range_count);
 
                 /* Guard pattern: if (cond) { return; } → apply INVERSE after the if */
                 if (is_guard && var_on_left) {
@@ -10805,6 +10750,12 @@ static void check_stmt(Checker *c, Node *node) {
                      * (but we already restored, so just check else normally) */
                     check_stmt(c, node->if_stmt.else_body);
                 }
+                /* Finding A: entries now hold the else-result (or the restored
+                 * pre-branch values on fallthrough); union with the captured
+                 * then-result so a branch-local narrowing cannot leak. Pushed
+                 * guard-inverse entries live at index >= saved_range_count and
+                 * are untouched. */
+                vrp_snap_join(c, cmp_thenv, saved_range_count);
             } else {
                 /* non-comparison condition — no range narrowing.
                  * BH-18 #2 (copied from cool-johnson-t8vr3h): a nested guard
@@ -10813,16 +10764,30 @@ static void check_stmt(Checker *c, Node *node) {
                  * outer condition was true. Save/restore var_range_count around
                  * each branch so the narrowing does NOT leak past the
                  * unconditional join (a leak silently dropped the bounds check on
-                 * a later `buf[idx]` — ASan-verified stack OOB write). */
+                 * a later `buf[idx]` — ASan-verified stack OOB write).
+                 * Finding A (2026-07-03): the count restore is NOT enough — an
+                 * assignment inside the branch (`if (b) { x = 1; }`) mutates x's
+                 * pre-existing range IN PLACE, which count-restore can't undo.
+                 * Snapshot pre-branch VALUES and JOIN each branch's result so the
+                 * merged range over-approximates every path. */
                 int local_saved = c->var_range_count;
+                struct VarRange *pre = vrp_snap_take(c, local_saved);
                 check_stmt(c, node->if_stmt.then_body);
                 c->var_range_count = local_saved;
+                struct VarRange *thenv = vrp_snap_take(c, local_saved);
+                vrp_snap_restore(c, pre, local_saved);  /* reset for else / fallthrough */
                 if (node->if_stmt.else_body) {
                     check_stmt(c, node->if_stmt.else_body);
                     c->var_range_count = local_saved;
                 }
+                /* entries hold else-result (or pre on fallthrough); union with then */
+                vrp_snap_join(c, thenv, local_saved);
+                free(pre);
+                free(thenv);
             }
             /* guard ranges stay — they're valid after the if */
+            free(cmp_pre);
+            free(cmp_thenv);
         }
         break;
     }
@@ -14656,6 +14621,71 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
     }
 }
 
+/* VRP branch-merge (Finding A, 2026-07-03): an assignment inside an if-branch
+ * mutates the shared VarRange struct IN PLACE (vrp_invalidate_for_assign). The
+ * if-handler's count-only restore (BH-18 #2) rewinds entries PUSHED by the
+ * branch but cannot undo an in-place mutation of an entry that existed before
+ * the branch — so a path-specific narrowed range leaked past the unconditional
+ * join, eliding a later bounds/division guard (ASan-verified stack OOB write).
+ * These snapshot the pre-branch VALUES so each branch's result can be JOINed
+ * (unioned) at the merge: take a snapshot, run a branch, restore for the other
+ * branch, then join. Only min/max/known_nonzero are touched — address_taken
+ * (a permanent invalidation) is intentionally left as the branch set it. */
+static struct VarRange *vrp_snap_take(Checker *c, int n) {
+    if (n <= 0) return NULL;
+    struct VarRange *s = malloc(sizeof(struct VarRange) * (size_t)n);
+    if (!s) return NULL;
+    for (int i = 0; i < n; i++) s[i] = c->var_ranges[i];
+    return s;
+}
+static void vrp_snap_restore(Checker *c, struct VarRange *s, int n) {
+    if (!s) return;
+    for (int i = 0; i < n && i < c->var_range_count; i++) {
+        c->var_ranges[i].min_val = s[i].min_val;
+        c->var_ranges[i].max_val = s[i].max_val;
+        c->var_ranges[i].known_nonzero = s[i].known_nonzero;
+    }
+}
+static void vrp_snap_join(Checker *c, struct VarRange *s, int n) {
+    if (!s) return;
+    for (int i = 0; i < n && i < c->var_range_count; i++) {
+        struct VarRange *r = &c->var_ranges[i];
+        if (s[i].min_val < r->min_val) r->min_val = s[i].min_val;
+        if (s[i].max_val > r->max_val) r->max_val = s[i].max_val;
+        r->known_nonzero = r->known_nonzero && s[i].known_nonzero;
+    }
+}
+
+/* JOIN (union) an assignment's value range into a variable's live VRP range,
+ * instead of REPLACING it. Used for a loop-body write, where the body index
+ * use may observe either the loop-carried (pre) value OR this write's value:
+ * the sound range is the union of both. Preserves known_nonzero only when
+ * both the prior range and the assigned value are nonzero (so `d = 3` inside
+ * a loop keeps a `100/d` division provable, while `i = 0` correctly drops
+ * known_nonzero and widens the bound). Mirrors vrp_invalidate_for_assign's
+ * value-range derivation but unions rather than overwrites. */
+static void vrp_join_assign_range(Checker *c, const char *name, uint32_t name_len,
+                                   TokenType op, Node *value) {
+    struct VarRange *r = find_var_range(c, name, name_len);
+    if (!r) return;
+    int64_t vmin, vmax;
+    bool vnz;
+    if (op == TOK_EQ && value && value->kind == NODE_INT_LIT) {
+        vmin = vmax = (int64_t)value->int_lit.value;
+        vnz = (vmin != 0);
+    } else if (op == TOK_EQ && value && derive_expr_range(c, value, &vmin, &vmax)) {
+        vnz = (vmin > 0);
+    } else {
+        /* compound op (+=, etc.) or underivable rhs → result unknown */
+        vmin = INT64_MIN;
+        vmax = INT64_MAX;
+        vnz = false;
+    }
+    if (vmin < r->min_val) r->min_val = vmin;
+    if (vmax > r->max_val) r->max_val = vmax;
+    r->known_nonzero = r->known_nonzero && vnz;
+}
+
 /* BUG-748 (2026-06-18): pre-pass for while/do-while bodies that widens
  * VRP ranges for any variable the body writes. For-loop's
  * check_expr(step) does this naturally because the step expression is
@@ -14663,6 +14693,15 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
  * helper the body indexes (arr[i]) see the stale init range from before
  * the loop and falsely prove safety. We only WIDEN existing ranges, we
  * don't create them — variables without a prior range are unaffected.
+ *
+ * Finding B (2026-07-03): this MUST widen to full range, never narrow.
+ * The prior version delegated to vrp_invalidate_for_assign, which for a
+ * LITERAL rhs (`i = 0`) narrows the entry to [0,0] — so a body index
+ * `arr[i]` executed BEFORE the reassignment was proven safe against the
+ * post-assignment literal, not the (unknown) loop-carried value. That
+ * elided the bounds check → silent OOB write on a fixed array (slices
+ * keep their dynamic .len check so only fixed arrays miscompiled).
+ * ASan-confirmed. Now always widens.
  *
  * Implemented as if/else chain (not switch on ->kind) to keep the
  * walker_default_audit.sh discipline: adding a `default:` to a switch
@@ -14681,7 +14720,10 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
             else t = t->index_expr.object;
         }
         if (t && t->kind == NODE_IDENT) {
-            vrp_invalidate_for_assign(c, t->ident.name,
+            /* JOIN this write's value range with the loop-carried (pre) range —
+             * never narrow to just the assigned value. The body use may see
+             * either the carried value or this write's value. */
+            vrp_join_assign_range(c, t->ident.name,
                 (uint32_t)t->ident.name_len,
                 body->assign.op, body->assign.value);
         }

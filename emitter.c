@@ -6309,16 +6309,32 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * case but missed index/nested-field chains — same bug, different
          * manifestation. Fix here covers both. */
         if (node->assign.op == TOK_EQ && node->assign.target) {
-            /* Walk up: find the NODE_FIELD whose object is a union. */
+            /* Walk up: find the NODE_FIELD whose object is a union. The object
+             * may be a union VALUE, or (ZER auto-deref `ptr.variant`) a
+             * POINTER-to-union — writing a variant through a `*Union` param
+             * must still update the discriminant `_tag`, else `switch(u)` at
+             * the caller reads the wrong arm (union type confusion, silent for
+             * non-pointer variants). `obj_is_ptr` records which so emission can
+             * use the pointer directly instead of taking its address. */
             Node *walk = node->assign.target;
             Node *union_field = NULL;  /* the NODE_FIELD(union, variant) */
+            bool obj_is_ptr = false;   /* object is *Union (auto-deref) */
             while (walk) {
                 if (walk->kind == NODE_FIELD) {
                     Type *ot = checker_get_type(e->checker, walk->field.object);
                     Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
                     if (ot_eff && ot_eff->kind == TYPE_UNION) {
                         union_field = walk;
+                        obj_is_ptr = false;
                         break;
+                    }
+                    if (ot_eff && ot_eff->kind == TYPE_POINTER) {
+                        Type *pinner = type_unwrap_distinct(ot_eff->pointer.inner);
+                        if (pinner && pinner->kind == TYPE_UNION) {
+                            union_field = walk;
+                            obj_is_ptr = true;
+                            break;
+                        }
                     }
                     walk = walk->field.object;
                 } else if (walk->kind == NODE_INDEX) {
@@ -6334,17 +6350,31 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Node *obj_node = union_field->field.object;
                 Type *obj_type_raw = checker_get_type(e->checker, obj_node);
                 Type *obj_type = obj_type_raw ? type_unwrap_distinct(obj_type_raw) : NULL;
+                /* For the pointer case the variant metadata lives on the
+                 * pointee union, not the pointer type. */
+                if (obj_is_ptr && obj_type && obj_type->kind == TYPE_POINTER)
+                    obj_type = type_unwrap_distinct(obj_type->pointer.inner);
                 const char *vname = union_field->field.field_name;
                 uint32_t vlen = (uint32_t)union_field->field.field_name_len;
-                for (uint32_t i = 0; i < obj_type->union_type.variant_count; i++) {
+                for (uint32_t i = 0; obj_type && i < obj_type->union_type.variant_count; i++) {
                     SUVariant *v = &obj_type->union_type.variants[i];
                     if (v->name_len == vlen && memcmp(v->name, vname, vlen) == 0) {
                         int tmp = e->temp_count++;
+                        if (obj_is_ptr) {
+                            /* obj_node is already a `*Union`; hoist it directly
+                             * (no `&`) so `_zer_up->_tag` writes through it. */
+                            emit(e, "({ __typeof__(");
+                            emit_rewritten_node(e, obj_node, func);
+                            emit(e, ") _zer_up%d = (", tmp);
+                            emit_rewritten_node(e, obj_node, func);
+                            emit(e, "); _zer_up%d->_tag = %u; ", tmp, i);
+                        } else {
                         emit(e, "({ __typeof__(");
                         emit_rewritten_node(e, obj_node, func);
                         emit(e, ") *_zer_up%d = &(", tmp);
                         emit_rewritten_node(e, obj_node, func);
                         emit(e, "); _zer_up%d->_tag = %u; ", tmp, i);
+                        }
                         /* Re-emit the target but replacing the hoisted
                          * union object with *_zer_up%d. For `u.variant = v`
                          * this is `_zer_up%d->variant = v`. For

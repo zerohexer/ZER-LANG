@@ -57,9 +57,18 @@ sketch so a fresh session can close it. Remove a row when it lands.
   g_count += 1; } interrupt USART1 { bump(); }` compiles clean; the direct
   `interrupt USART1 { g_count += 1; }` correctly errors "must be volatile". No depth cap — there
   is NO transitive scan for this pass (unlike the alloc/spawn/asm FuncProps scan). Bare-metal
-  result: torn reads / lost RMW — silent corruption. Fix: mirror AU-5/BH-18 #8 — walk direct
-  callees (cap ~8) with `in_interrupt` held, or union per-function "globals accessed" summaries
-  at ISR call sites.
+  result: torn reads / lost RMW — silent corruption. **A naive transitive scan (walk ISR callees
+  with `in_interrupt` held, recording `from_isr`) was ATTEMPTED and REVERTED 2026-07-03** — it
+  correctly flags the real `bump()`-shared-with-main race BUT over-rejects an ISR-ONLY helper:
+  `void bump(){ g += 1; } interrupt{ bump(); }` with no main access gets flagged, because bump's
+  OWN body-check (in non-ISR context) already marked `g` `from_func`, and the transitive scan
+  then adds `from_isr` → looks shared. The DIRECT ISR-only form (`interrupt{ g += 1; }`) is
+  ALLOWED, so this is an inconsistent false positive on valid firmware. Root cause: `from_func`
+  means "accessed in some non-ISR body-check", NOT "reachable from main/a thread" — a pure-ISR
+  helper's body-check wrongly counts as `from_func`. The PROPER fix needs main-reachability (a
+  call-graph pass marking which functions are reachable from a genuinely-concurrent context) so
+  the transitive `from_isr` is only flagged against a `from_func` that came from a main-reachable
+  path — mirror AU-5/BH-18 #8 for the from_isr side, but pair it with reachability for from_func.
 
 ### 🟡 miscompile / emission
 

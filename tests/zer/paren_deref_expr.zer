@@ -1,0 +1,24 @@
+// Regression (A7-12): a parenthesized dereference `(*ptr ...)` — the canonical
+// MMIO poll idiom — must parse, and must NOT be mistaken for a `(*Type)` cast.
+// Covers: (*p & mask), bare (*p), (*p) op, and the (*Type)cast it disambiguates.
+struct Motor { u32 rpm; }
+u32 read_via_cast(*opaque ctx) {
+    *Motor m = (*Motor)ctx;      // pointer cast — must still work
+    return m.rpm;
+}
+u32 main() {
+    u32 flags = 0x20;
+    *u32 p = &flags;
+    u32 a = 0;
+    if ((*p & 0x20) != 0) { a = 1; }   // (*p & mask) — parenthesized deref
+    u32 b = (*p);                        // bare parenthesized deref
+    u32 c = (*p) + 3;                    // deref followed by operator
+    Motor mtr; mtr.rpm = 99;
+    *opaque cx = @ptrcast(*opaque, &mtr);
+    u32 d = read_via_cast(cx);
+    if (a != 1) { return 10; }
+    if (b != 0x20) { return 11; }
+    if (c != 0x23) { return 12; }
+    if (d != 99) { return 13; }
+    return 0;
+}

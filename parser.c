@@ -713,6 +713,27 @@ static bool is_assign_op(TokenType type) {
 /* forward */
 static Node *parse_precedence(Parser *p, Precedence min_prec);
 
+/* A7-12: can this token begin a unary/primary expression? Used to disambiguate
+ * `(*Type)operand` (cast — operand follows the `)`) from `(*ptr ...)` (a
+ * parenthesized dereference — an operator/`)`/`;` follows). A cast operand is a
+ * unary expression, so its first token is a literal, ident, `(`, `@`, a prefix
+ * operator, or a type keyword (nested cast). */
+static bool token_can_start_unary(TokenType t) {
+    switch (t) {
+    case TOK_NUMBER_INT: case TOK_NUMBER_FLOAT: case TOK_STRING: case TOK_CHAR:
+    case TOK_TRUE: case TOK_FALSE: case TOK_NULL:
+    case TOK_IDENT: case TOK_LPAREN: case TOK_AT:
+    case TOK_MINUS: case TOK_BANG: case TOK_TILDE: case TOK_STAR: case TOK_AMP:
+    case TOK_U8: case TOK_U16: case TOK_U32: case TOK_U64:
+    case TOK_I8: case TOK_I16: case TOK_I32: case TOK_I64:
+    case TOK_USIZE: case TOK_F32: case TOK_F64:
+    case TOK_BOOL: case TOK_VOID: case TOK_OPAQUE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* ---- Primary expressions ---- */
 
 static Node *parse_primary(Parser *p) {
@@ -884,18 +905,61 @@ static Node *parse_primary(Parser *p) {
          * Only KEYWORD types are unambiguous. (ident) could be (variable).
          * Named type casts use pointer prefix: (*Motor)ctx */
         bool is_cast = false;
+        bool star_ambiguous = false;
         switch (p->current.type) {
         case TOK_U8: case TOK_U16: case TOK_U32: case TOK_U64:
         case TOK_I8: case TOK_I16: case TOK_I32: case TOK_I64:
         case TOK_USIZE: case TOK_F32: case TOK_F64:
         case TOK_BOOL: case TOK_VOID: case TOK_OPAQUE:
-        case TOK_STAR:      /* (*T) pointer cast */
         case TOK_QUESTION:  /* (?T) optional cast */
         case TOK_CONST:     /* (const *T) */
         case TOK_VOLATILE:  /* (volatile *T) */
             is_cast = true;
             break;
+        case TOK_STAR:      /* (*T) pointer cast — AMBIGUOUS with (*ptr) deref */
+            is_cast = true;
+            star_ambiguous = true;
+            break;
         default: break;
+        }
+
+        /* A7-12 (2026-07-03): `(` `*` is AMBIGUOUS — a pointer cast `(*Motor)ctx`
+         * OR a parenthesized dereference `(*ptr & mask)` (the canonical MMIO poll
+         * idiom in every firmware example). The 2026-06-06 C-style-cast feature
+         * made `(*` unconditionally a cast, breaking `(*ptr ...)` (regression that
+         * bitrotted all 8 QEMU examples; no test covered it). Disambiguate by
+         * SPECULATION: try to parse `(*Type)`; it is a cast ONLY if a full type is
+         * followed by `)` AND the token after `)` can start a unary expression
+         * (the cast operand). Otherwise backtrack and parse a parenthesized
+         * expression. The scanner + panic_mode/had_error are saved/restored so a
+         * failed speculative parse leaves no spurious error. Only `*` needs this;
+         * keyword/`?`/`const`/`volatile` triggers are unambiguous. */
+        if (is_cast && star_ambiguous) {
+            Scanner saved = *p->scanner;
+            Token saved_cur = p->current;
+            Token saved_prev = p->previous;
+            bool saved_panic = p->panic_mode;
+            bool saved_err = p->had_error;
+            TypeNode *cast_type = parse_type(p);
+            if (check(p, TOK_RPAREN)) {
+                advance(p); /* consume ) */
+                if (token_can_start_unary(p->current.type)) {
+                    Node *expr = parse_unary(p);
+                    Node *n = new_node(p, NODE_TYPECAST);
+                    n->typecast.target_type = cast_type;
+                    n->typecast.expr = expr;
+                    return n;
+                }
+            }
+            /* Not a cast — restore and parse as a parenthesized expression. */
+            *p->scanner = saved;
+            p->current = saved_cur;
+            p->previous = saved_prev;
+            p->panic_mode = saved_panic;
+            p->had_error = saved_err;
+            Node *n = parse_expression(p);
+            consume(p, TOK_RPAREN, "expected ')' after expression");
+            return n;
         }
 
         if (is_cast) {

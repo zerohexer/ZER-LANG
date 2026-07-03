@@ -107,6 +107,20 @@ gets an empty-asm barrier before the `SREG=` restore since that is a plain C sto
 `test_emit.c` E2E harness (default width 32 compiled on a 64-bit host is a BENIGN mismatch the
 assert can't distinguish). Kept OPEN in limitations.md with the reason so it isn't retried.
 
+**Batch 3:**
+
+**10. 🟢 `(*ptr & mask)` parse regression broke every QEMU firmware example (A7-12).** File:
+`parser.c` primary-expression `(` handler. The 2026-06-06 C-style-cast feature made `(` `*`
+unconditionally start a pointer-cast, so the canonical MMIO poll idiom `(*UART0_FR & 0x20)` —
+and even bare `(*r)` — errored "expected ')' after cast type". No `tests/zer/` test covered
+`(*var …)`, so `make check` stayed green while all 8 `examples/qemu-cortex-m3/*.zer` bitrotted.
+Fix: only `TOK_STAR` is ambiguous (keyword/`?`/`const`/`volatile` casts are not); for it,
+SPECULATE — save scanner + `panic_mode`/`had_error`, try `(*Type)`, accept as a cast iff a full
+type is followed by `)` AND the token after `)` can start a unary expression (the cast operand),
+else restore and parse a parenthesized expression. `(*Motor)ctx`, `(*p)`, `(*p)[i]`, `(*p).f`,
+`(*p & m)`, `(*p) + 3` all parse correctly. Test `tests/zer/paren_deref_expr.zer`. (The example
+BUILD flow — flags + Makefile — is still bitrotted; tracked OPEN in limitations.md.)
+
 ---
 
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)

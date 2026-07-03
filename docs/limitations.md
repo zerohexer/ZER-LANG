@@ -126,17 +126,15 @@ sketch so a fresh session can close it. Remove a row when it lands.
 
 ### 🟡 over-rejection / bitrot / DoS
 
-- **[A7-12] ALL 8 QEMU firmware examples fail to compile — `(*ptr & mask)` parse regression.**
-  File: `parser.c` ~871 (`TOK_STAR` after `(` unconditionally starts a pointer-cast). The
-  canonical MMIO poll idiom `(*UART0_FR & 0x20)` — used across `hello.zer`/`rtos.zer`/`shell.zer`
-  and every example — errors "expected ')' after cast type"; even bare `(*r)` no longer parses.
-  The 2026-06-06 C-style-cast feature made `(` `*` unconditionally a cast, with no backtrack for
-  the parenthesized-dereference reading; no `tests/zer/` test covers `(*var ...)`, so `make check`
-  stayed green while the firmware example suite bitrotted. Fix: for the ambiguous `TOK_STAR` case,
-  save scanner state (the designated-init lookahead at parser.c ~810 already does this); if
-  `parse_type` doesn't end at `)` or the token after `)` can't start a unary expr, restore and
-  parse as a parenthesized expression. Add `(*p & mask)` positive tests; also fix the example
-  Makefile.
+- **[A7-12] ~~`(*ptr & mask)` parse regression broke all 8 QEMU examples~~ — PARSE FIXED
+  2026-07-03** (BUGS-FIXED.md). `parser.c` now speculatively disambiguates `(*Type)cast` from
+  `(*ptr)deref` (scanner + panic/err save-restore; cast iff a full type is followed by `)` AND a
+  unary-starting token). Test `tests/zer/paren_deref_expr.zer`. **STILL OPEN (non-parse):** the
+  examples also need the Makefile's `--no-strict-mmio` flag (some hit `@inttoptr requires mmio
+  range` / a `[]T`-deprecation / a keep-arg checker error) and the example Makefile's
+  `$(ZERC) hello.zer` expects a `hello.c` the current default deletes — the example BUILD flow is
+  still bitrotted even though every file now parses. Add the examples to a CI smoke target so this
+  can't recur.
 
 - **[A7-13] ~~Unbounded recursion in `parse_type`/`parse_unary` → SIGSEGV~~ — FIXED 2026-07-03**
   (BUGS-FIXED.md). Both wrapped in a `p->depth`-sharing guard (limit 256). (Defense-in-depth

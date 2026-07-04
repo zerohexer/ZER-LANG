@@ -1,0 +1,12 @@
+// Struct value-copy of a struct holding an allocation must not false-leak/
+// false-double-free when the copy is unused and the original is freed.
+struct Task { u32 id; }
+struct Holder { ?*Task p; }
+Slab(Task) heap;
+u32 main() {
+    *Task raw = heap.alloc_ptr() orelse return;
+    Holder a; a.p = raw;
+    Holder b = a;
+    heap.free_ptr(raw);
+    return 0;
+}

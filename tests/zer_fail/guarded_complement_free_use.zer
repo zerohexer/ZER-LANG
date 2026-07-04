@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Level-B guard relaxation: freeing on complementary guards frees on ALL paths;
+// a subsequent use under either guard is a use-after-free (was accepted 2026-07-04).
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+void f(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+    if (!c) { u32 v = pool.get(h).id; if (v > 0) { } }
+}
+u32 main() { f(false); return 0; }

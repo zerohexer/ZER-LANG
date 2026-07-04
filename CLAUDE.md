@@ -931,7 +931,10 @@ Uses zercheck's existing HS_TRANSFERRED state — zero new infrastructure.
 ### Hardware Support
 ```
 volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);  // MMIO register
-u32 bits = reg[9..8];                               // bit extraction
+u32 val = *reg;                                     // read register into an integer first
+u32 bits = val[9..8];                               // bit extraction (works on INTEGER values,
+                                                    //   NOT on a pointer: reg[9..8] parses as a
+                                                    //   pointer-slice and is rejected)
 interrupt USART1 { handle_rx(); }                    // interrupt handler
 packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ```

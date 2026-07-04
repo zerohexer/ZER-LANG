@@ -3,6 +3,7 @@
 #include "src/safety/coerce_rules.h"  /* zer_coerce_* — VST-verified */
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 
 /* ================================================================
  * Target configuration
@@ -450,69 +451,89 @@ static char type_name_buf0[256];
 static char type_name_buf1[256];
 static int type_name_which = 0;
 
+/* Clamping append (2026-07-04): snprintf returns the WOULD-BE (untruncated)
+ * length, so the old `pos += snprintf(buf+pos, max-pos, ...)` pattern let `pos`
+ * run PAST `max` on a long leaf name. A subsequent compound write then computed
+ * `buf + pos` (out of the 256-byte buffer) and `max - pos` (negative → huge
+ * size_t) → out-of-bounds write / SIGSEGV on long type names (e.g. a struct with
+ * a very long name nested in an array/Pool/Handle). Routing every write through
+ * this helper clamps `pos` to [0, max-1] so it can never index past the buffer. */
+static int tn_append(char *buf, int pos, int max, const char *fmt, ...) {
+    if (pos < 0) pos = 0;
+    if (pos >= max - 1) return max - 1;   /* full — a further write is a no-op */
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + pos, (size_t)(max - pos), fmt, ap);
+    va_end(ap);
+    if (n < 0) return pos;                 /* encoding error — leave pos */
+    pos += n;
+    if (pos >= max) pos = max - 1;         /* truncated write — clamp to buffer end */
+    return pos;
+}
+
 static int type_name_write(Type *t, char *buf, int pos, int max) {
     if (!t || pos >= max - 1) return pos;
 
     switch (t->kind) {
-    case TYPE_VOID:   return pos + snprintf(buf + pos, max - pos, "void");
-    case TYPE_BOOL:   return pos + snprintf(buf + pos, max - pos, "bool");
-    case TYPE_U8:     return pos + snprintf(buf + pos, max - pos, "u8");
-    case TYPE_U16:    return pos + snprintf(buf + pos, max - pos, "u16");
-    case TYPE_U32:    return pos + snprintf(buf + pos, max - pos, "u32");
-    case TYPE_U64:    return pos + snprintf(buf + pos, max - pos, "u64");
-    case TYPE_USIZE:  return pos + snprintf(buf + pos, max - pos, "usize");
-    case TYPE_I8:     return pos + snprintf(buf + pos, max - pos, "i8");
-    case TYPE_I16:    return pos + snprintf(buf + pos, max - pos, "i16");
-    case TYPE_I32:    return pos + snprintf(buf + pos, max - pos, "i32");
-    case TYPE_I64:    return pos + snprintf(buf + pos, max - pos, "i64");
-    case TYPE_F32:    return pos + snprintf(buf + pos, max - pos, "f32");
-    case TYPE_F64:    return pos + snprintf(buf + pos, max - pos, "f64");
-    case TYPE_OPAQUE: return pos + snprintf(buf + pos, max - pos, "opaque");
-    case TYPE_ARENA:   return pos + snprintf(buf + pos, max - pos, "Arena");
-    case TYPE_BARRIER: return pos + snprintf(buf + pos, max - pos, "Barrier");
-    case TYPE_SEMAPHORE: return pos + snprintf(buf + pos, max - pos, "Semaphore(%u)", t->semaphore.count);
+    case TYPE_VOID:   return tn_append(buf, pos, max, "void");
+    case TYPE_BOOL:   return tn_append(buf, pos, max, "bool");
+    case TYPE_U8:     return tn_append(buf, pos, max, "u8");
+    case TYPE_U16:    return tn_append(buf, pos, max, "u16");
+    case TYPE_U32:    return tn_append(buf, pos, max, "u32");
+    case TYPE_U64:    return tn_append(buf, pos, max, "u64");
+    case TYPE_USIZE:  return tn_append(buf, pos, max, "usize");
+    case TYPE_I8:     return tn_append(buf, pos, max, "i8");
+    case TYPE_I16:    return tn_append(buf, pos, max, "i16");
+    case TYPE_I32:    return tn_append(buf, pos, max, "i32");
+    case TYPE_I64:    return tn_append(buf, pos, max, "i64");
+    case TYPE_F32:    return tn_append(buf, pos, max, "f32");
+    case TYPE_F64:    return tn_append(buf, pos, max, "f64");
+    case TYPE_OPAQUE: return tn_append(buf, pos, max, "opaque");
+    case TYPE_ARENA:   return tn_append(buf, pos, max, "Arena");
+    case TYPE_BARRIER: return tn_append(buf, pos, max, "Barrier");
+    case TYPE_SEMAPHORE: return tn_append(buf, pos, max, "Semaphore(%u)", t->semaphore.count);
     case TYPE_POINTER:
-        pos += snprintf(buf + pos, max - pos, "*");
+        pos = tn_append(buf, pos, max, "*");
         return type_name_write(t->pointer.inner, buf, pos, max);
     case TYPE_OPTIONAL:
-        pos += snprintf(buf + pos, max - pos, "?");
+        pos = tn_append(buf, pos, max, "?");
         return type_name_write(t->optional.inner, buf, pos, max);
     case TYPE_SLICE:
-        if (t->slice.is_volatile) pos += snprintf(buf + pos, max - pos, "volatile ");
-        pos += snprintf(buf + pos, max - pos, "[]");
+        if (t->slice.is_volatile) pos = tn_append(buf, pos, max, "volatile ");
+        pos = tn_append(buf, pos, max, "[]");
         return type_name_write(t->slice.inner, buf, pos, max);
     case TYPE_ARRAY:
         pos = type_name_write(t->array.inner, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, "[%llu]", (unsigned long long)t->array.size);
+        return tn_append(buf, pos, max, "[%llu]", (unsigned long long)t->array.size);
     case TYPE_STRUCT:
-        return pos + snprintf(buf + pos, max - pos, "%.*s",
+        return tn_append(buf, pos, max, "%.*s",
                               (int)t->struct_type.name_len, t->struct_type.name);
     case TYPE_ENUM:
-        return pos + snprintf(buf + pos, max - pos, "%.*s",
+        return tn_append(buf, pos, max, "%.*s",
                               (int)t->enum_type.name_len, t->enum_type.name);
     case TYPE_UNION:
-        return pos + snprintf(buf + pos, max - pos, "%.*s",
+        return tn_append(buf, pos, max, "%.*s",
                               (int)t->union_type.name_len, t->union_type.name);
     case TYPE_FUNC_PTR:
-        return pos + snprintf(buf + pos, max - pos, "fn(...)");
+        return tn_append(buf, pos, max, "fn(...)");
     case TYPE_POOL:
-        pos += snprintf(buf + pos, max - pos, "Pool(");
+        pos = tn_append(buf, pos, max, "Pool(");
         pos = type_name_write(t->pool.elem, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, ", %llu)", (unsigned long long)t->pool.count);
+        return tn_append(buf, pos, max, ", %llu)", (unsigned long long)t->pool.count);
     case TYPE_RING:
-        pos += snprintf(buf + pos, max - pos, "Ring(");
+        pos = tn_append(buf, pos, max, "Ring(");
         pos = type_name_write(t->ring.elem, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, ", %llu)", (unsigned long long)t->ring.count);
+        return tn_append(buf, pos, max, ", %llu)", (unsigned long long)t->ring.count);
     case TYPE_HANDLE:
-        pos += snprintf(buf + pos, max - pos, "Handle(");
+        pos = tn_append(buf, pos, max, "Handle(");
         pos = type_name_write(t->handle.elem, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, ")");
+        return tn_append(buf, pos, max, ")");
     case TYPE_SLAB:
-        pos += snprintf(buf + pos, max - pos, "Slab(");
+        pos = tn_append(buf, pos, max, "Slab(");
         pos = type_name_write(t->slab.elem, buf, pos, max);
-        return pos + snprintf(buf + pos, max - pos, ")");
+        return tn_append(buf, pos, max, ")");
     case TYPE_DISTINCT:
-        return pos + snprintf(buf + pos, max - pos, "%.*s",
+        return tn_append(buf, pos, max, "%.*s",
                               (int)t->distinct.name_len, t->distinct.name);
     }
     return pos;

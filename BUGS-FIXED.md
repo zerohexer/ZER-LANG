@@ -5,6 +5,88 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-04 — Multi-agent audit: 5 fixes (2 UAF, 2 crashes, 1 OOB). `make check` GREEN.
+
+A broad audit (parallel subagents over checker / emitter / ir_lower / zercheck_ir /
+parser+types, plus a black-box baremetal sweep) surfaced a batch of confirmed holes. Five
+were fixed with regression tests this session; the rest are logged as OPEN entries in
+`docs/limitations.md` under "## OPEN — 2026-07-04 audit". Each fix below was verified with a
+compiled reproducer (runtime UAF trap / SIGSEGV before, clean after) and the full suite.
+
+### BUG-A1 — 🔴 Level-B guard relaxation admitted a UAF/double-free after a complementary free-pair (zercheck_ir.c)
+
+Accept-unsafe. `if(c){free(h)} if(!c){free(h)} if(!c){use(h)}` compiled clean and the emitted
+C performed a genuine use-after-free (Level-2 generation check trapped at runtime, exit 133).
+Root cause: the 2026-06-27 Level-B relaxation records only ONE free site per handle
+(`IRHandleInfo.free_block`). When a complementary free-pair completes coverage it sets
+`freed_all_paths=1` and `state=FREED`, but leaves `free_block` pointing at the FIRST free's
+block. A later use/free under the complement guard is then judged "disjoint" from that stale
+block and admitted — though it coincides with the SECOND free on its own path. Fix:
+`ir_use_guard_disjoint` returns false when `h->freed_all_paths` is set (a handle freed on all
+paths admits no disjoint use). `freed_all_paths` propagates monotonically through the CFG
+merge (zercheck_ir.c:985), so it reliably reaches every downstream use/free. The legit
+single-free case `if(c){free} if(!c){use}` is preserved (coverage never completes, so the
+flag stays 0). Certified boundary: `handle_flow_lattice.v` Level B models a single free's
+guard vs the use's guard; the multi-free case is the missing finite variable (oracle-climb
+noted in limitations). Tests: `tests/zer_fail/guarded_complement_free_use.zer`,
+`tests/zer_fail/guarded_complement_double_free.zer`.
+
+### BUG-A2 — 🔴 find_return_range credited a guard-body `return param` with the guard's inverse range → elided caller bounds check → stack OOB write (checker.c)
+
+Accept-unsafe. `u32 pick(u32 n){ if(n>=100){return n;} return 0; }` then
+`u8[100] arr; arr[pick(150)] = 7;` compiled with NO bounds check and wrote `arr[150]`
+(pre-fix exit 150 = OOB executed). Root cause: `find_return_range` read `find_var_range`
+(the range live at the END of body-checking — a program-point snapshot) for a bare-param
+return, not the range at THAT return's point. The guard `if(n>=100)` persists its INVERSE
+(`n<100` → `[0,99]`) after the if, so the guard-BODY `return n` (which yields n>=100) was
+wrongly credited `[0,99]`; the caller used that to elide its bounds guard. Fix: thread a
+`bool in_branch` through the recursive walk and apply the VarRange narrowing ONLY for
+top-level returns (`in_branch==false`), never inside an if/switch/loop arm. This keeps the
+SOUND top-level case (`if(raw>=16){return 0;} return raw;` — the cross-module
+`range_lib.safe_slot` optimization, `raw<16` genuinely holds there) and drops the unsound
+in-branch case. Tests: `tests/zer/return_range_guard_body_bounds.zer` (unsound → now guarded)
++ existing `test_modules/range_user.zer` (sound → still proven, no auto-guard).
+
+### BUG-A3 — 🔴 struct value-copy dropped compound handle entries → UAF (zercheck_ir.c) — REGRESSION of documented Pattern 4
+
+Accept-unsafe. `Holder a; a.p = raw; Holder b = a; free(raw); use(b.p)` compiled a
+use-after-free (b.p untracked). Root cause: the IR_COPY handler aliased only the BARE local;
+the destination's COMPOUND entries (`b.p` ← `a.p`) were never replicated. This was the
+documented "Pattern 4 two-pass collect + replicate" (limitations.md) that silently rotted out
+of the file in a later refactor with no regression test guarding it. Fix: restored the
+two-pass replicate in IR_COPY, placed BEFORE the `!src_h` early-break (the src's tracked field
+is a compound entry, so the bare-only `ir_find_handle` returns NULL and would otherwise skip
+it). Snapshot each src compound row first (add may realloc), then add + alias on the dest
+root. No-op for plain scalar copies. Tests: `tests/zer_fail/struct_copy_compound_uaf.zer`
+(UAF now caught) + `tests/zer/struct_copy_compound_ok.zer` (free-through-original, copy unused
+— no false leak/double-free).
+
+### BUG-A4 — CRASH: parse_unary / parse_type recursed with no depth guard → stack-overflow SIGSEGV (parser.c)
+
+DoS on crafted source. A long prefix chain (`-`×200000, `*`×N, `?`×N, const/volatile, array
+dims, 2C funcptr) overflowed the C stack in `parse_unary` (self-recurses per prefix without
+going through the guarded `parse_precedence`) and in `parse_type` (recurses on every
+type prefix/suffix); the unbounded TypeNode also overflowed the checker's `resolve_type`
+recursion. Fix: `parse_unary` increments/checks `p->depth` (limit 256, mirroring
+`parse_precedence`) with a single decrementing exit; `parse_type` gets a thin depth-guard
+wrapper (`parse_type_inner` holds the body). Bounding node depth at parse time fixes both the
+parser and the downstream checker overflow. Tests: `tests/zer_fail/parse_unary_depth.zer`,
+`tests/zer_fail/parse_type_depth.zer` (both must reject gracefully, not crash).
+
+### BUG-A5 — CRASH / OOB write: type_name overflowed its 256-byte static buffer on long type names (types.c)
+
+`snprintf` returns the WOULD-BE (untruncated) length, so `pos += snprintf(buf+pos, max-pos,…)`
+let `pos` run past `max` on a long leaf name; a subsequent compound write (array/Pool/Handle
+of a long-named struct) then computed `buf+pos` (past the buffer) and `max-pos` (negative →
+huge size_t) → OOB write (corrupts the adjacent static at ~260 chars — the exact 2-buffer
+rotation hazard — SIGSEGV at very long names). Fix: a clamping `tn_append` va-helper that
+holds `pos` in `[0, max-1]`; `type_name_write` routes every write through it. Verified: a
+200k-char struct name nested in a Pool no longer crashes (clean error). No dedicated .zer test
+(crafting a 200k-char identifier file is impractical); guarded by the fix's structural
+invariant.
+
+---
+
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
 
 🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed

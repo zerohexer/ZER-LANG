@@ -515,46 +515,6 @@ static void emit_auto_guards(Emitter *e, Node *node) {
 
 static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
 
-/* Find shared struct variable accessed in a statement or expression.
- * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
- * Used to auto-insert lock/unlock around statements. */
-static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_root(e, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
-    case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Node *r = find_shared_root(e, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
-     * cond/init/expr that could read a shared struct. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return NULL;
-    }
-    return NULL;
-}
-
 static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {

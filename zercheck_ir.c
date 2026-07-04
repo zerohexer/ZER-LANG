@@ -568,6 +568,15 @@ static IRGuardSet *ir_compute_block_guards(IRFunc *func) {
  * So a wrong/absent guard can only OVER-reject, never accept an unsafe use. */
 static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
     if (!h || h->state != IR_HS_MAYBE_FREED) return false;
+    /* SOUNDNESS (2026-07-04): once the handle has been freed on ALL paths
+     * (a complementary free-pair {(C,+),(C,-)} completed its coverage), NO
+     * subsequent use or free is admissible — every path reaches the freed
+     * handle. The single `free_block` only records ONE of the two frees, so
+     * without this gate a use/free under the complement guard is wrongly
+     * judged disjoint from the *other* free and accepted, though it coincides
+     * with the free on its own path (accept-unsafe UAF / double-free). See
+     * tests/zer_fail/guarded_complement_free_use.zer. */
+    if (h->freed_all_paths) return false;
     if (!zc->gr_block_guards) return false;
     int fb = h->free_block;
     int ub = zc->gr_cur_block;
@@ -2515,6 +2524,55 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     dst_h->alloc_id = _ir_next_alloc_id++;
                 }
                 break;
+            }
+        }
+
+        /* Struct value-copy `Holder b = a` replicates the COMPOUND entries
+         * (a.p, a.h, …) onto the destination so b.p aliases a.p (same alloc_id).
+         * Restored 2026-07-04: this was the documented "Pattern 4 two-pass
+         * replicate" (limitations.md) that silently rotted out in a later
+         * refactor — without it, `Holder b = a; free(raw); use(b.p)` compiled a
+         * use-after-free (b.p untracked). Runs BEFORE the bare-alias path below:
+         * the src's tracked field is a COMPOUND entry (path != NULL), so
+         * `ir_find_handle` (bare-only) returns NULL and the `!src_h` early-break
+         * would otherwise skip this. Two-pass: snapshot every src compound row
+         * FIRST (ir_add_compound_handle may realloc ps->handles and invalidate
+         * pointers), then add + alias. A plain scalar copy has no compound rows,
+         * so this is a no-op there. */
+        {
+            int src_root = inst->src1_local;
+            int ccount = 0;
+            for (int hi = 0; hi < ps->handle_count; hi++) {
+                if (ps->handles[hi].local_id == src_root &&
+                    ps->handles[hi].path != NULL) ccount++;
+            }
+            if (ccount > 0) {
+                struct { const char *path; uint32_t path_len; IRAliasSnapshot snap; }
+                    stack_rows[16], *rows = stack_rows;
+                int cap = 16;
+                if (ccount > cap) {
+                    void *mem = malloc((size_t)ccount * sizeof(stack_rows[0]));
+                    if (mem) { rows = mem; cap = ccount; }
+                }
+                int ri = 0;
+                for (int hi = 0; hi < ps->handle_count && ri < cap; hi++) {
+                    IRHandleInfo *ch = &ps->handles[hi];
+                    if (ch->local_id == src_root && ch->path != NULL) {
+                        rows[ri].path = ch->path;
+                        rows[ri].path_len = ch->path_len;
+                        ir_snapshot_alias(&rows[ri].snap, ch);
+                        ri++;
+                    }
+                }
+                for (int k = 0; k < ri; k++) {
+                    IRHandleInfo *dch = ir_add_compound_handle(
+                        ps, inst->dest_local, rows[k].path, rows[k].path_len);
+                    if (dch) {
+                        ir_apply_alias(dch, &rows[k].snap);
+                        dch->state = rows[k].snap.state;
+                    }
+                }
+                if (rows != stack_rows) free(rows);
             }
         }
 

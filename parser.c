@@ -483,7 +483,26 @@ static TypeNode *parse_base_type(Parser *p) {
 }
 
 /* parse full type with prefix modifiers: const, volatile, *, ?, [] */
+static TypeNode *parse_type_inner(Parser *p);
+
+/* Depth-guard wrapper (2026-07-04): parse_type self-recurses on every type
+ * prefix/suffix (`*`×N, `?`×N, const/volatile, slice, array dims, 2C funcptr)
+ * with no depth check, so a deeply-nested type built an unbounded TypeNode that
+ * overflowed the C stack here AND later in the checker's resolve_type recursion
+ * → SIGSEGV. Bounding the node depth at parse time fixes both. Reuses p->depth
+ * (shared nesting counter, same as parse_precedence/parse_block). */
 static TypeNode *parse_type(Parser *p) {
+    if (++p->depth > 256) {
+        error(p, "type nesting too deep (limit 256)");
+        p->depth--;
+        return new_type_node(p, TYNODE_VOID);
+    }
+    TypeNode *t = parse_type_inner(p);
+    p->depth--;
+    return t;
+}
+
+static TypeNode *parse_type_inner(Parser *p) {
     /* const T */
     if (match(p, TOK_CONST)) {
         TypeNode *t = new_type_node(p, TYNODE_CONST);
@@ -974,6 +993,16 @@ static Node *parse_primary(Parser *p) {
 static Node *parse_postfix(Parser *p, Node *left); /* forward decl */
 
 static Node *parse_unary(Parser *p) {
+    /* Depth guard (2026-07-04): parse_unary self-recurses per prefix token
+     * (below) WITHOUT going through parse_precedence, so a long prefix chain
+     * (`-`×200000, `*`×N, `!`, `~`, `&`) overflowed the C stack → SIGSEGV.
+     * Mirror parse_precedence's p->depth guard so it degrades to a clean error. */
+    if (++p->depth > 256) {
+        error(p, "expression nesting too deep (limit 256)");
+        p->depth--;
+        return new_node(p, NODE_NULL_LIT);
+    }
+    Node *result;
     /* prefix: - ! ~ * & */
     if (match(p, TOK_MINUS) || match(p, TOK_BANG) || match(p, TOK_TILDE) ||
         match(p, TOK_STAR) || match(p, TOK_AMP)) {
@@ -981,10 +1010,13 @@ static Node *parse_unary(Parser *p) {
         Node *n = new_node(p, NODE_UNARY);
         n->unary.op = op;
         n->unary.operand = parse_unary(p);
-        return n;
+        result = n;
+    } else {
+        /* parse_primary then postfix (. [] () ) so that &x.field = &(x.field) */
+        result = parse_postfix(p, parse_primary(p));
     }
-    /* parse_primary then postfix (. [] () ) so that &x.field = &(x.field) */
-    return parse_postfix(p, parse_primary(p));
+    p->depth--;
+    return result;
 }
 
 /* ---- Postfix: calls, field access, indexing, slicing ---- */

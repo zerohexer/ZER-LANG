@@ -2452,9 +2452,17 @@ of falling into C undefined behavior.
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
 ### Bit Extraction
+Bit extraction / bit-set works on INTEGER VALUES (`[high..low]`, high >= low). It does NOT
+apply to a pointer — `volatile *u32 reg; reg[9..8]` parses as a pointer-slice (start > end)
+and is rejected. Read the register into an integer first.
 ```zer
-reg[9..8]                  // Extract bits 9:8
-reg[7..4] = 0x0F;          // Set bits 7:4
+u32 val = 0xABCD1234;
+u32 b = val[9..8];         // Extract bits 9:8 (of the value)
+val[7..4] = 0x0F;          // Set bits 7:4
+
+volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+u32 rv = *reg;             // read MMIO register into an integer first
+u32 field = rv[9..8];      // then extract — NOT `reg[9..8]`
 ```
 
 ### NOT in ZER

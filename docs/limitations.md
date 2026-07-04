@@ -223,6 +223,198 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 
 ---
 
+## OPEN — 2026-07-04 audit (parallel subagents + baremetal sweep): confirmed holes NOT yet fixed
+
+A broad multi-agent audit. FIVE holes were fixed this session (BUGS-FIXED.md 2026-07-04:
+BUG-A1..A5 — Level-B guard-relaxation UAF, find_return_range OOB, struct-copy compound UAF,
+parser depth-guard crash, type_name overflow). The entries below are CONFIRMED with compiled
+reproducers (in the audit scratch, not committed unless noted) but left unfixed — several
+cluster on a shared root cause and want a coordinated fix, not a piecemeal patch. Ranked
+soundness-first. Remove a row when it lands + `make check` GREEN.
+
+### 🔴 accept-unsafe (compile-clean UAF / double-free) — the urgent tier
+
+- **A6 — identity/pass-through function return not aliased to its arg → UAF.**
+  `Handle(T) idf(Handle(T) x){ return x; }` then `h2 = idf(h); free(h); use(h2)` compiles
+  clean; runtime traps generation-mismatch. Root: the IR_CALL/FuncSummary return path
+  establishes allocation COLOR for returned handles but not alias IDENTITY (shared `alloc_id`)
+  when a function returns one of its Handle/pointer PARAMS. So `h2` never joins `h`'s alias
+  group and free of `h` doesn't mark `h2` FREED. Distinct from the FIXED Gap-38 (which covered
+  wrappers returning a NEWLY-allocated handle via `returns_color`). Fix sketch: when a
+  FuncSummary records "return may be param N", the call site joins the result local into the
+  Nth arg's alloc_id group (mirror `ir_snapshot_alias`/`ir_apply_alias`) — the Handle/UAF
+  analog of the `ret_param_mask` escape work. Repro shape above.
+
+- **A7 — `alloc_ptr()` stored DIRECTLY into a struct field / array element is never
+  registered → double-free + UAF + leak all missed.** `Holder a; a.p = heap.alloc_ptr();` then
+  two `free_ptr` of the extracted pointer compiles clean. Root (zercheck_ir.c IR_ASSIGN
+  handler): for `s.field = <allocator call>` the compound target makes `ir_find_value_local`
+  return −1 (so the compound-registration block is skipped) AND `rhs` is the whole
+  `NODE_ASSIGN` not a `NODE_CALL` (so the alloc-classification block is skipped). The
+  allocation is completely untracked. The bare-local-first form (`*T raw = alloc_ptr(); a.p =
+  raw;`) IS caught — only the direct-to-compound form leaks. Fix sketch: a single
+  `register_alloc(dest_or_compound_key, color)` funnel consulted by both the bare and compound
+  assignment targets (mirrors the `ir_mark_transferred` consolidation done for the move axis).
+  This + A6 + A3(fixed) are the "allocation-registration / alias is a per-shape patchwork"
+  class the agents flag; the durable fix is one funnel, not N sinks.
+
+### 🔴 CRASH + 🔴 accept-unsafe + 🟠 lock-leak — the emitter-injected-early-return cluster (ONE root cause)
+
+`emit_safety_early_return` (emitter.c:384-401) emits a bare `return;`/guard exit that is
+CONTEXT-BLIND — it has no awareness of held shared-struct locks, an open `@critical` section,
+or pending defers, and it is emitted AFTER the statement's `IR_LOCK`. ir_lower's own early-exit
+bookkeeping (which correctly unlocks on `orelse return`) never sees this emitter-injected exit.
+Four manifestations, all from this one hole:
+
+- **A8 (CRASH) — `defer` + any auto-guarded array index in the same function aborts zerc.**
+  `void f(u32 i){ defer cleanup(); arr[i] = 1; }` → `INTERNAL ERROR: emit_defers_from reached
+  with 1 pending defers … Aborted` (exit 134). `emit_safety_early_return` calls `emit_defers`
+  → `emit_defers_from`, which `abort()`s when `defer_stack.count>0`; the comment "stays 0 in
+  production" is FALSE (IR_DEFER_PUSH at emitter.c:9937 populates it).
+- **A9 (accept-unsafe OOB) — a defer BODY skips auto-guard emission entirely.**
+  `defer arr[i] = 7;` with unproven `i` prints "auto-guard inserted" but emits raw `arr[i]=7`
+  (ASan: global-buffer-overflow). Defer bodies travel in `defer_fire_bodies`, which
+  `emit_defer_stmt` emits without ever calling `emit_auto_guards`. Same class as BUG-595/T2.2,
+  one context further out.
+- **A10 (deadlock) — the guard early-`return` leaks a held shared-struct mutex.**
+  `void f(u32 i){ g.v = arr[i]; }` (g shared) emits `pthread_mutex_lock(&g._zer_mtx); if(i>=4){
+  return; } …` → the guard returns holding the mutex → next thread deadlocks (verified exit
+  124).
+- **A11 (baremetal silent) — the guard early-`return` inside `@critical` skips interrupt
+  re-enable.** Emits `return;` between the `cli`/`cpsid` prologue and the restore epilogue —
+  exactly the hazard for which ZER bans USER `return` in `@critical`; the compiler's own
+  inserted return violates it. Hosted x86 degrades to a fence so no hosted test catches it.
+
+Coordinated fix (one place): teach guard emission the ambient lock/`@critical`/defer state
+(fire defers, unlock, restore-critical before the guard return), OR emit guards BEFORE the
+statement's IR_LOCK and route defers through the IR-tracked machinery. Do NOT "fix" A8 by
+merely suppressing the abort — that converts a loud crash into a silent skipped-cleanup
+miscompile.
+
+### 🔴 soundness + 🟠 lock-leak + 🟡 leak — the ir_lower goto/defer guard-flag cluster (ONE root cause)
+
+The plt86m goto/defer guard flag (`get_label_guard_flag`, one function-scoped bool per label,
+ir_lower.c:335) was designed for a single function-scope defer and a single-shot forward goto.
+It has no scope- or iteration-awareness, producing:
+
+- **A12 (double-free soundness) — block-scoped / if-arm-scoped `defer` + forward `goto` out of
+  the block fires the defer TWICE on the fall-through path.** `{ defer pool.free(h); if(c){goto
+  cleanup;} } cleanup: return 0;` emits two `_zer_pool_free(...,h,...)` on one path — a
+  double-free zercheck does NOT catch (clean compile). The block-exit fires+pops its own scoped
+  defer, then the label's guard-restore fires it again. The documented "FIXED" case
+  (limitations.md ~1234) covered only the FUNCTION-scope shape.
+- **A13 (deadlock) — `orelse`-with-terminating-fallback inside a shared-reading CONDITION leaks
+  the auto-mutex.** `if ((g.opt orelse return) > 2) { … }` — the cond-level lock (from
+  `emit_shared_lock_around_cond`) is NOT recorded in `current_stmt_shared_root`, so the
+  orelse early-exit can't release it → the null path leaks g's mutex → next thread deadlocks
+  (verified exit 124). Affects all four `emit_shared_lock_around_cond` sites (if/while/for/
+  switch cond). Distinct from the FIXED BUG-665 (statement-level nested-multi-root).
+- **A14 (leak) — per-iteration `defer` under-fires when a both-reachable goto-target label sits
+  inside the loop body.** The per-label guard flag is set on iteration 0 and never reset per
+  iteration, so `if(!flag){body}` is suppressed on iterations 1+ → a per-iteration
+  `defer pool.free(h)` fires once, leaking later iterations.
+
+Fix direction: scope the guard flag to the defer-scope the goto exits (or reconcile fire-count
+per path rather than via a persistent bool); record cond-level lock roots in
+`current_stmt_shared_root` so orelse early-exits release them. `ir_validate`'s defer-balance
+check is existence-only (ir.c:679-772) — it cannot see double-fire/under-fire; a count-balanced
+check would surface this class.
+
+### 🟡 miscompile / over-reject (wrong output or wrong-stage, not memory-unsafe)
+
+- **A15 — designated-init OPTIONAL VALUE field silently becomes null.** `struct Wrap{ ?u32 m; }
+  Wrap w = { .m = 5 };` emits `.m = 5` (raw u32) instead of the `(_zer_opt_u32){5,1}` wrap, so
+  `w.m orelse 111` yields 111. The BUG-419 "coerce at all 4 value-flow sites" rule missed the
+  5th site: struct-init fields (IR_STRUCT_INIT_DECOMP emitter.c:10967 + NODE_STRUCT_INIT
+  ~8956). Confirmed for var-decl init, assignment-form, `?bool`, and through `container Box(T){
+  ?T item; }`. `?*T` fields are unaffected (null-sentinel, no wrapper). Fix: at both struct-init
+  emission sites, when the declared field type is a value-`?T` and the value type is `T`, emit
+  the optional wrap (look the field type up by name in `cast_type`).
+- **A16 — `@saturate` in a GLOBAL initializer emits a statement-expression → gcc rejects.**
+  `i8 g = @saturate(i8, 300);` → `braced-group within expression allowed only inside a
+  function`. The T2.1 constant-context fix was applied to `@ctz`/`@clz` only; `@saturate` is the
+  straggler (all other tested intrinsics emit constant-safe forms). Fix: emit the conditional/
+  constant form for `@saturate` in constant context, like the `@ctz` fix.
+- **A17 — transitive deadlock detection over-rejects a call to a function touching ≥2 shared
+  structs in SEPARATE statements.** `void helper(){ ga.x=1; gb.y=2; }` then `helper();` errors
+  "deadlock: single statement accesses both A and B" — but the per-statement lock model holds
+  only one lock at a time in the callee, no deadlock. `collect_shared_types_in_expr` merges the
+  callee's ENTIRE transitive shared-type set into the one call statement; it should merge only
+  types reachable WITHIN a single callee statement (real nested-lock risk), or only when the
+  caller statement also directly touches a shared struct.
+
+### 🟡 silent gaps (baremetal / spec) — compile-time AND runtime both miss
+
+- **A18 — interior pointer/slice into a `packed struct` field silently drops alignment.**
+  `*u32 p = &packed.field;` and `[*]u32 s = packed.array_field;` compile with zero diagnostics;
+  the resulting `*u32`/slice is treated as fully aligned. Works on x86; on strict-alignment
+  baremetal (ARMv7-M, RISC-V) an unaligned `u32` deref hard-faults or reads wrong bytes.
+  GCC's own `-Waddress-of-packed-member` fires on the emitted C but ZER's default gcc
+  invocation doesn't enable it. ZER already has alignment discipline elsewhere (`@inttoptr`
+  trap, BUG-498 sync-in-packed reject), so this is an inconsistent gap. Rust makes it E0793
+  (deny), Zig puts alignment in the type. Fix: flag interior pointers/slices of packed fields in
+  the checker, or minimally add `-Waddress-of-packed-member -Werror` to the emitted-C gcc call.
+- **A19 — float→int conversion is bare C UB.** `(u32)f` / `(i32)f` emit `((uint32_t)f)` with no
+  clamp/trap; out-of-range (1e20, -5.0, 4.3e9) is C99 6.3.1.4 UNDEFINED → platform/opt-level
+  dependent value. ZER's "No undefined behavior" claim omits float→int. Rust `as` saturates,
+  Zig `@intFromFloat` traps. Fix: emit a saturating/trapping conversion (or a checked helper).
+- **A20 — out-of-range enum + `switch` without `default` silently routes to the LAST arm.**
+  `@bitcast(Enum,x)` / `@truncate(Enum,x)` produce out-of-range discriminants with no check;
+  an exhaustive no-default switch lowers the last arm as an unconditional `else`, so byte 250
+  silently runs the last variant's handler. Exhaustiveness ensures valid variants are handled
+  but mishandles invalid values instead of trapping. Adding `default =>` catches it (works), and
+  enum-as-array-index IS independently bounds-checked — the gap is specific to switch-no-default.
+  Judgment call (design tradeoff): consider a trap on the fell-through-last-arm when the switched
+  value provably can be out-of-range (came from bitcast/truncate).
+
+### debt / doc
+
+- **A21 — distinct integer typedef leaks through the WIDENING coercion path** (types.c:376-389,
+  `can_implicit_coerce` integer branch). `distinct typedef u8 Byte; distinct typedef u32 Word;
+  Word w = someByte;` is accepted (and `Byte`→base `u32` too). Same-width, base→distinct, and
+  cross-distinct-same-width are all correctly REJECTED — only the widening direction leaks
+  (the branch runs before any nominal-distinctness gate and `type_is_integer`/`type_width`
+  unwrap distinct internally). Memory-SAFE (widening is value-preserving) but defeats `distinct`
+  and contradicts CLAUDE.md "Confirmed NOT Bugs #1". Fix: a nominal-distinctness gate at the top
+  of `can_implicit_coerce` (reject when exactly one of {from,to} is TYPE_DISTINCT).
+- **A22 — `type_name` 2-buffer rotation still bites composed error messages** — orthogonal to
+  the A5 overflow fix. Three `type_name(...)` in one `checker_error` overwrites the first (only
+  two static buffers). Known hazard (CLAUDE.md); no systemic fix, only per-site `snprintf`-to-
+  local. Low priority.
+- **A23 — comptime integer overflow silently wraps.** `comptime u32 BIG(){ return
+  100000*100000; }` → 1410065408, no error (Zig/Rust error on const-eval overflow). Not
+  memory-unsafe (a wrapped array size traps at runtime), but silent wrong compile-time constant.
+- **A24 — DOC DRIFT: bit-extraction `reg[9..8]` on a `volatile *u32` doesn't compile.** CLAUDE.md
+  "Hardware Support" and reference.md (~2456) both show `volatile *u32 reg = @inttoptr(...); u32
+  bits = reg[9..8];`. Bit-extraction routes on `type_is_integer(obj)`, but `reg` is a POINTER, so
+  `reg[9..8]` parses as a pointer-slice (start>end → rejected). Correct form: read into an
+  integer first (`u32 v = *reg; u32 bits = v[9..8];`). `(*reg)[9..8]` is a PARSE ERROR (postfix
+  `[..]` after a parenthesized expr isn't accepted). Fix: correct the docs (done 2026-07-04 for
+  the doc portion); optionally support postfix-after-paren and/or auto-deref+extract.
+- **A25 — dead functions in emitter.c** — `find_shared_root_in_stmt` (was emitter.c:521)
+  REMOVED 2026-07-04. Three more pre-existing definition-only dead functions remain
+  (`-Wunused-function`): `shared_needs_condvar`, `stmt_writes_shared`, and the recursive
+  `collect_async_locals` (no external caller). Low-priority cleanup — remove when touching the
+  shared-lock / async-lowering emitter regions.
+- **A26 — minor front-end:** float literal overflow parses to `inf` silently (`f64 x = 1e999;`,
+  parser.c ~741 — integer literals correctly reject); embedded NUL byte truncates source
+  (`scanner_init` uses `strlen`, lexer.c:32); lexer rejects uppercase `0X`/`0B` int prefixes
+  (`0X1F` mis-lexes as `0` + ident, lexer.c:321/331 — C accepts it; the mmio parser DOES accept
+  `0X`, a dead branch). All low-severity robustness/consistency.
+
+### NOT bugs (verified during the audit — do not re-investigate)
+- Escape sinks (store-to-global / global-field / Pool-Slab element via handle auto-deref /
+  threadlocal / static-local / defer-body / orelse-fallback / if-`|*v|` / switch-`|*v|`) — ALL
+  caught. Pool/Slab element-store of a ptr-to-local (the doc's "unverified sibling") IS rejected.
+- Guard-refinement immutable-bool stability gate (`ast_name_mutated_or_addrd`): reassigned param,
+  `&c`, struct-field guard, two-var guards — all correctly rejected (the A1 hole was orthogonal:
+  the free-set model, not the stability gate).
+- shift-by-width → 0, reversed slice/bit-extraction (compile error), non-exhaustive enum switch
+  (compile error), comptime zero array size (rejected), @truncate/@saturate on bool/pointer
+  (rejected), @bitcast int↔ptr and @pun widening (rejected — BH-18 #3/#4 hold).
+
+---
+
 ## OPEN — `tools/audit_matrix.sh` is STALE (false positives mask real flag-handler gaps) (LOW — tool only, contracts sound)
 
 **Symptom:** `bash tools/audit_matrix.sh checker.c` reports 16 "BUG: … missing …

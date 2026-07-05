@@ -1,0 +1,4 @@
+// EXPECTED: compile error — returning a ?*T field pointing into a local
+struct Outer { ?*u32 data; }
+?*u32 leak() { u32 loc = 5; Outer o; o.data = &loc; return o.data; }
+u32 main() { return 0; }

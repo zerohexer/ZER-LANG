@@ -1,0 +1,16 @@
+// A guard narrowing inside ONE switch arm must NOT leak past the join (was silent OOB).
+// Post-fix: buf[idx] with idx=9 auto-guards → early return 0; pre-fix: OOB write/read → 99.
+u32 getval(u32 x) { return x; }
+enum Sel { a, b }
+u32[4] buf;
+u32 pick(u32 raw) {
+    u32 i = getval(raw);
+    Sel sel = Sel.b;
+    switch (sel) {
+        .a => { if (i >= 4) { return 0; } }
+        .b => { }
+    }
+    buf[i] = 99;
+    return buf[i];
+}
+u32 main() { if (pick(9) == 0) { return 0; } return 1; }

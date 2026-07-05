@@ -5,6 +5,79 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-05 — Multi-agent audit: 8 fixes (2 silent-OOB, 2 escape-sink, 3 miscompile, 1 compiler-crash)
+
+A 6-surface parallel audit found ~16 issues; **8 fixed** here, each verified (ASan/exit-code)
+and regression-tested. `make check` GREEN (ZER 900, Rust 784, Zig 36, all audits OK). The
+deferred residuals (concurrency scoped-borrow gaps, cross-module container dup, global-init
+stmt-expr intrinsics, `--track-cptrs` IR parity) are in `docs/limitations.md` "## OPEN —
+2026-07-05".
+
+**1. 🔴 switch-arm VRP range-narrowing leak → silent OOB (checker.c NODE_SWITCH).** A guard
+narrowing inside ONE switch arm (`.a => { if (i >= 4) { return; } }`) leaked past the switch
+join, so the compiler "proved" a later `arr[i]` safe on ALL paths and emitted NO bounds check
+— ASan `global/stack-buffer-overflow`, clean compile, no warning. Root: the `NODE_SWITCH`
+handler lacked the `saved_range_count` save/restore the `if`/`for`/`while` handlers have
+(sibling of BH-18 #2). Fix: snapshot `c->var_range_count` before the arm loop, restore after
+each arm body. Test `tests/zer/switch_vrp_no_leak.zer`.
+
+**2. 🔴 Ring.push local-derived pointer escape (checker.c ring push).** `rx.push(m)` where `m`
+is a local struct with `m.p = &local` copied the dangling pointer into the global Ring — ASan
+`stack-use-after-return`, clean compile (the "rare unverified Pool/Slab/Ring element store"
+sink noted in BUG-764). The whole-struct store `g = m` IS caught; push wasn't. Fix: new shared
+helper `container_push_arg_escapes` (element carries a data pointer AND arg is local-derived)
+wired into `push`/`push_checked`. Test `tests/zer_fail/ring_push_local_escape.zer`.
+
+**3. 🔴 `?*T`-field-of-local escape — store + return sinks (checker.c).** `Outer o; o.data =
+&b[0]; g = o.data;` (data: `?*u32`) escaped a stack pointer to a global; the SLICE-field
+version was caught — a pointer-only asymmetry. THREE root gaps, all fixed: (a) the `&`-operand
+marking at ~4112 only matched a bare `&ident`, not `&arr[i]`/`&s.f` — now walks field/index to
+the root; (b) the store-sink field-descent gated on `TYPE_POINTER||TYPE_SLICE`, missing
+`?*T` (optional-of-pointer) — now `type_carries_data_pointer`; (c) `type_can_carry_pointer`
+excluded `TYPE_OPTIONAL` — now recurses on the inner (`?*T`→yes, `?u32`→no). ASan
+`stack-use-after-return`. Tests `tests/zer_fail/ptr_field_local_escape_{store,return}.zer`.
+
+**4. 🔴 spawn value-struct carrying a local pointer escapes (checker.c NODE_SPAWN).** `Msg m;
+m.p = &local; spawn worker(m);` (fire-and-forget, by-value struct) copied the dangling pointer
+into the thread — cross-thread UAF; `spawn worker(&local)` is rejected, this wasn't (the
+`is_ptr_like` gate skips value structs). Fix: reject a non-scoped spawn arg that
+`type_carries_data_pointer` AND `spawn_arg_is_stack_derived`. Test
+`tests/zer_fail/spawn_value_struct_local_escape.zer`.
+
+**5. 🟡 `@saturate(UnsignedT, huge)` returns 0 in the IR path (emitter.c).** A large unsigned
+source (≥2^63, e.g. `@saturate(u32, 18e18)`) was clamped to 0 instead of the target max: the
+IR-path unsigned clamp forced `(int64_t)_zer_sat`, misreading the value as negative. The AST
+path was correct; bodies are IR-only, so all real code hit the bug. Fix: do the clamp in the
+source's own type (per-width literals, no cast) — mirrors the AST path. Test
+`tests/zer/saturate_unsigned_large.zer`.
+
+**6. 🟡 optional struct-field designated-init silently loses its value (emitter.c, 3 paths).**
+`Cfg c = { .b = 7 }` where `.b : ?u32` emitted `.b = 7` — C99 brace-elision set `.has_value =
+0`, so the field read as `none` and every `if (c.b)|v|`/`orelse` took the wrong branch (silent
+wrong value). THREE struct-init emission paths (AST global-init, IR_STRUCT_DECOMP,
+emit_rewritten_node fallback) each emitted the field bare. Fix: extracted ONE shared helper
+`struct_field_opt_wrap` (wraps a value-optional field's plain value into `(_zer_opt_T){ .value
+= …, .has_value = 1 }`; excludes `?*T`/`?void`/already-optional) and routed all three through
+it. Test `tests/zer/optional_field_designated_init.zer` (var-decl + assign + `?bool`).
+
+**7. 🟡 signed comptime return not sign-extended (checker.c).** A signed comptime result whose
+type-width sign bit was set (`comptime i16 F(){ return 40000; }` → -25536) stayed POSITIVE (the
+width-mask zero-extends), silently flipping a `comptime if (F() < 0)` to the wrong branch —
+wrong code emitted. Fix: sign-extend (`val |= ~mask`) when the return type is signed and the
+sign bit is set. Test `tests/zer/comptime_signed_return.zer`.
+
+**8. compiler CRASH — `defer` + auto-guarded array index aborts the compiler (emitter.c).**
+A function combining a `defer` with an unprovable fixed-array index (`defer {…}; a[i] = 1;`
+with `i` unproven) hit `emit_defers_from`'s stale `abort()` — the auto-guard early-return
+fired defers via the removed AST path. Valid code, exit 134. Fix: new `emit_pending_ir_defers`
+fires the pending IR defers (LIFO over `e->defer_stack`, via `emit_defer_stmt`) — exactly what
+`IR_DEFER_FIRE` does; added `Emitter.current_ir_func` (set in `emit_regular_func_from_ir`) so
+the early-return path knows the IRFunc. Falls back to the abort safety net if the func is
+unknown. Test `tests/zer/defer_autoguard_early_return.zer` (defer fires once on the guarded
+early return).
+
+---
+
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
 
 🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed

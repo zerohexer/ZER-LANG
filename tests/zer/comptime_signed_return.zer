@@ -1,0 +1,6 @@
+// signed comptime return must sign-extend so comptime-if sees the true (negative) value
+comptime i16 F(i16 a) { return a * 1000; }
+u32 main() {
+    comptime if (F(40) > 0) { return 1; }
+    else { return 0; }
+}

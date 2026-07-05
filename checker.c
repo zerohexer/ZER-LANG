@@ -1121,6 +1121,20 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* Ring/Pool/Slab element-store escape (the "rare unverified sink" noted in
+ * BUG-764): pushing a BY-VALUE element into a GLOBAL container (Ring is always
+ * global) copies the element's bytes into storage that outlives the frame. If
+ * the element type carries a data pointer AND the pushed argument is
+ * local/arena-derived, that pointer dangles after the function returns — the
+ * exact escape the store-to-global sink catches for `g = m`, but the container
+ * push sink historically did not consult. Gated on `type_carries_data_pointer`
+ * so a pure-value element (no pointer to dangle) is never over-rejected. */
+static bool container_push_arg_escapes(Checker *c, Type *elem, Node *arg) {
+    if (!elem || !arg) return false;
+    if (!type_carries_data_pointer(elem, 0)) return false;
+    return arg_is_local_derived(c, arg, 0);
+}
+
 /* AU-3/AU-4 (2026-07-01): does a struct/union literal carry a pointer/slice
  * to a function-local, at ANY nesting depth? Returns true for a field value
  * that is &local (Case A), an is_local_derived alias ident (B), a slice over a
@@ -1392,9 +1406,17 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
 static bool type_can_carry_pointer(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
-    return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
-                   eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
-                   eff->kind == TYPE_OPAQUE);
+    if (!eff) return false;
+    /* An optional wrapping a pointer/slice (`?*T`, `?[*]T`) CAN hold a reference
+     * — recurse on the inner so a `return o.data` / `g = o.data` where `.data`
+     * is `?*u32` is escape-checked (it was silently exempt when this returned
+     * false for TYPE_OPTIONAL). `?u32`/`?bool`/`?Handle` (scalar inner) stay
+     * excluded, so no scalar false positive is introduced. */
+    if (eff->kind == TYPE_OPTIONAL)
+        return type_can_carry_pointer(eff->optional.inner);
+    return eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+           eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+           eff->kind == TYPE_OPAQUE;
 }
 
 /* Propagate is_local_derived / is_arena_derived / is_from_arena from src to dst,
@@ -4096,15 +4118,28 @@ static Type *check_expr(Checker *c, Node *node) {
                             vcheck = vcheck->orelse.expr;
                         }
                         if (vcheck->kind == NODE_UNARY &&
-                            vcheck->unary.op == TOK_AMP &&
-                            vcheck->unary.operand->kind == NODE_IDENT) {
-                            Symbol *src = scope_lookup(c->current_scope,
-                                vcheck->unary.operand->ident.name,
-                                (uint32_t)vcheck->unary.operand->ident.name_len);
-                            bool src_is_global = src && scope_lookup_local(c->global_scope,
-                                src->name, src->name_len) != NULL;
-                            if (src && !src->is_static && !src_is_global)
-                                tsym->is_local_derived = true;
+                            vcheck->unary.op == TOK_AMP) {
+                            /* Walk the `&` operand through FIELD/INDEX to the root
+                             * ident: `o.data = &b[0]` / `o.p = &s.field` point into a
+                             * local (b / s) just as `&local` does, so the target
+                             * aggregate (o) is frame-bound. The old code only matched a
+                             * bare `&ident`, so a `&arr[i]` / `&s.f` stored into a
+                             * pointer field never marked the parent local-derived and
+                             * `g = o.data` later escaped (ASan stack-use-after-return). */
+                            Node *op = vcheck->unary.operand;
+                            while (op && (op->kind == NODE_FIELD ||
+                                          op->kind == NODE_INDEX)) {
+                                op = (op->kind == NODE_FIELD) ? op->field.object
+                                                              : op->index_expr.object;
+                            }
+                            if (op && op->kind == NODE_IDENT) {
+                                Symbol *src = scope_lookup(c->current_scope,
+                                    op->ident.name, (uint32_t)op->ident.name_len);
+                                bool src_is_global = src && scope_lookup_local(c->global_scope,
+                                    src->name, src->name_len) != NULL;
+                                if (src && !src->is_static && !src_is_global)
+                                    tsym->is_local_derived = true;
+                            }
                         }
                     }
                     /* check if new value is an alias of local/arena-derived */
@@ -4300,8 +4335,15 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!via_slice_borrow && vnode &&
                 (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt = typemap_get(c, node->assign.value);
-                if (vt && (type_dispatch_kind(vt) == TYPE_POINTER ||
-                           type_dispatch_kind(vt) == TYPE_SLICE)) {
+                /* Gate on "value carries a data pointer" — NOT just a bare
+                 * pointer/slice. A `?*T` field (`g = o.data`, data: ?*u32) is a
+                 * TYPE_OPTIONAL wrapping a pointer, so the old POINTER||SLICE gate
+                 * skipped the descent and the pointer-to-local laundered through the
+                 * optional wrapper escaped undetected (ASan stack-use-after-return).
+                 * type_carries_data_pointer covers pointer/slice/opaque/optional-of-
+                 * pointer/struct-carrying-pointer; a scalar field (`g_int = o.count`)
+                 * stays excluded (copies a value, not a reference). */
+                if (type_carries_data_pointer(vt, 0)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -5181,6 +5223,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
+                        if (container_push_arg_escapes(c, elt, node->call.args[0]))
+                            checker_error(c, node->loc.line,
+                                "cannot push a local-derived pointer through Ring channel — "
+                                "the pointer dangles once this function returns "
+                                "(the Ring outlives the frame). Push a copy of the data, "
+                                "not a pointer to a local");
                     }
                     result = ty_void;
                     typemap_set(c, field_node,result);
@@ -5200,6 +5248,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
+                        if (container_push_arg_escapes(c, elt, node->call.args[0]))
+                            checker_error(c, node->loc.line,
+                                "cannot push a local-derived pointer through Ring channel — "
+                                "the pointer dangles once this function returns "
+                                "(the Ring outlives the frame). Push a copy of the data, "
+                                "not a pointer to a local");
                     }
                     result = type_optional(c->arena, ty_void);
                     typemap_set(c, field_node,result);
@@ -6053,6 +6107,15 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (w > 0 && w < 64) {
                                     uint64_t mask = (1ULL << w) - 1ULL;
                                     val = (int64_t)((uint64_t)val & mask);
+                                    /* SIGN-EXTEND for a signed return type: the mask
+                                     * above zero-extends, so a signed comptime result
+                                     * whose type-width sign bit is set (e.g. `comptime
+                                     * i16 F(){ return 40000; }` → -25536) stayed
+                                     * POSITIVE, silently flipping a `comptime if (F() <
+                                     * 0)` to the wrong branch (wrong code emitted). */
+                                    if (type_is_signed(ret_ty_check) &&
+                                        (val & (1LL << (w - 1))))
+                                        val |= (int64_t)(~mask);
                                 }
                             }
                             node->call.comptime_value = val;
@@ -11000,6 +11063,14 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* VRP scope-leak (sibling of BH-18 #2): a guard-inverse range narrowing
+         * pushed inside ONE switch arm (`.a => { if (i >= 4) { return; } }`) is
+         * sound only on that arm's path, but without a save/restore it leaks past
+         * the switch join and the compiler then "proves" a later `arr[i]` safe on
+         * ALL paths → dropped bounds check → silent OOB (ASan-verified). Mirror the
+         * if/for/while handlers: snapshot var_range_count and restore after every
+         * arm body so per-arm narrowing cannot escape the switch. */
+        int saved_switch_range = c->var_range_count;
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
 
@@ -11223,6 +11294,8 @@ static void check_stmt(Checker *c, Node *node) {
             } else {
                 check_stmt(c, arm->body);
             }
+            /* discard this arm's range narrowing before the next arm / the join */
+            c->var_range_count = saved_switch_range;
         }
 
         /* exhaustiveness check — unwrap distinct for type dispatch */
@@ -13042,6 +13115,21 @@ static void check_stmt(Checker *c, Node *node) {
                         "use ThreadHandle to join before scope exit",
                         i + 1);
                 }
+            } else if (!is_scoped && type_carries_data_pointer(eff, 0) &&
+                       spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
+                /* A by-VALUE struct/union arg that CARRIES a pointer/slice FIELD
+                 * pointing into a stack local (`Msg m; m.p = &local; spawn
+                 * worker(m);`) copies that dangling pointer into the fire-and-
+                 * forget thread — a cross-thread use-after-free once the frame
+                 * returns. The bare `spawn worker(&local)` form is already
+                 * rejected; this closes the same escape one field-level down.
+                 * Scoped spawns are exempt (the join bounds the lifetime). */
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass a value carrying a pointer to a "
+                    "stack local to a fire-and-forget spawn — the field pointer "
+                    "dangles once the frame returns (cross-thread use-after-free). "
+                    "Use ThreadHandle + join, or point the field at long-lived data",
+                    i + 1);
             }
             /* Handle args: ban — pool.get() not thread-safe.
              * Also reject ?Handle(T) — spawned thread can unwrap the optional

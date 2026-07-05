@@ -49,6 +49,9 @@ typedef struct {
     Type *current_func_ret; /* return type of current function */
     bool current_main_promoted; /* true if current func is `void main()` promoted to `int main()` — bare return becomes `return 0;` */
     DeferStack defer_stack; /* current block's deferred statements */
+    void *current_ir_func;  /* IRFunc* currently being emitted (void* to avoid an
+                             * ir.h include cycle) — used to fire pending IR defers
+                             * at an auto-guard early return */
     int loop_defer_base;    /* defer stack base at loop entry (for break/continue) */
     bool lib_mode;          /* --lib: no prefix on struct names, no preamble */
     bool track_cptrs;       /* --track-cptrs: Level 3+4+5 inline header tracking */

@@ -1,0 +1,5 @@
+// EXPECTED: compile error — pushing a local-derived pointer through a global Ring
+struct Msg { *u32 p; }
+Ring(Msg, 8) rx;
+void producer() { u32 local = 4242; Msg m; m.p = &local; rx.push(m); }
+u32 main() { return 0; }

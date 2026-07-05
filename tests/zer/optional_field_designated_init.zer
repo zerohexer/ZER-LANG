@@ -1,0 +1,12 @@
+// ?T field set to plain T in a designated initializer must keep has_value=1 (BUG: brace elision)
+struct Cfg { u32 a; ?u32 b; ?bool flag; }
+u32 main() {
+    Cfg c = { .a = 10, .b = 7, .flag = true };
+    u32 got = 0;
+    if (c.b) |v| { got += v; }
+    if (c.flag) |f| { if (f) { got += 100; } }
+    c = { .a = 1, .b = 20 };
+    if (c.b) |v2| { got += v2; }
+    if (got == 127) { return 0; }
+    return 1;
+}

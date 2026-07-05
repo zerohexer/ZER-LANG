@@ -1,0 +1,5 @@
+// EXPECTED: compile error — ?*T field of a local aggregate holding &local escapes to a global
+struct Outer { ?*u32 data; }
+?*u32 g = null;
+void leak() { u32[4] b; b[0] = 1; Outer o; o.data = &b[0]; g = o.data; }
+u32 main() { return 0; }

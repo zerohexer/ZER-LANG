@@ -341,6 +341,8 @@ static void emit_shared_ensure_init(Emitter *e, Node *root, const char *arrow) {
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
 static void emit_auto_guards(Emitter *e, Node *node);
 static void emit_defers(Emitter *e);
+static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
+static void emit_pending_ir_defers(Emitter *e);
 
 /* Emit the zero value for a type (used by auto-guard return, auto-orelse).
  * void → nothing (caller emits bare return), integer → 0, bool → 0,
@@ -383,7 +385,7 @@ static void emit_zero_value(Emitter *e, Type *t) {
  * @cstr inline statement-expression already opened the brace via "if (...) { ". */
 static void emit_safety_early_return(Emitter *e, bool with_braces) {
     if (with_braces) emit(e, "{\n");
-    emit_defers(e);
+    emit_pending_ir_defers(e);
     if (e->in_async) {
         if (with_braces) emit_indent(e);
         emit(e, "self->_zer_state = -1; return 1;");
@@ -398,6 +400,39 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
     }
     if (with_braces) emit(e, " }\n");
     else emit(e, " ");
+}
+
+/* T → ?T struct-field coercion, shared by the THREE struct-init emission paths
+ * (AST global-init NODE_STRUCT_INIT, IR_STRUCT_DECOMP, emit_rewritten_node
+ * fallback). A value-optional field (`?T`, NOT `?*T`/`?void` null-sentinel) set
+ * to a plain `T` in a designated initializer must be wrapped into
+ * `(_zer_opt_T){ .value=..., .has_value=1 }` — otherwise C99 brace-elision fills
+ * only `.value` and leaves `.has_value = 0`, so the field silently reads as
+ * `none` (a wrong-value miscompile). Returns the field's (optional) type when a
+ * wrap is required; NULL otherwise (null value, non-optional field, already-
+ * optional value, or field-not-found). Callers emit their own value expression
+ * between `(fldty){ .value = ` and `, .has_value = 1 }`. */
+static Type *struct_field_opt_wrap(Type *struct_type, const char *fname,
+                                   uint32_t flen, Type *value_type,
+                                   bool value_is_null) {
+    if (value_is_null) return NULL;
+    Type *seff = struct_type ? type_unwrap_distinct(struct_type) : NULL;
+    if (!seff || seff->kind != TYPE_STRUCT) return NULL;
+    Type *fld_ty = NULL;
+    for (uint32_t fi = 0; fi < seff->struct_type.field_count; fi++) {
+        if (seff->struct_type.fields[fi].name_len == flen &&
+            memcmp(seff->struct_type.fields[fi].name, fname, flen) == 0) {
+            fld_ty = seff->struct_type.fields[fi].type;
+            break;
+        }
+    }
+    Type *feff = fld_ty ? type_unwrap_distinct(fld_ty) : NULL;
+    if (!feff || feff->kind != TYPE_OPTIONAL) return NULL;
+    if (is_null_sentinel(feff->optional.inner)) return NULL;
+    if (type_dispatch_kind(feff->optional.inner) == TYPE_VOID) return NULL;
+    Type *veff = value_type ? type_unwrap_distinct(value_type) : NULL;
+    if (veff && veff->kind == TYPE_OPTIONAL) return NULL;
+    return fld_ty;
 }
 
 
@@ -2783,7 +2818,21 @@ static void emit_expr(Emitter *e, Node *node) {
             if (i > 0) emit(e, ", ");
             emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
                  node->struct_init.fields[i].name);
-            emit_expr(e, node->struct_init.fields[i].value);
+            Node *fv = node->struct_init.fields[i].value;
+            Type *wrap = struct_field_opt_wrap(si_type,
+                node->struct_init.fields[i].name,
+                node->struct_init.fields[i].name_len,
+                checker_get_type(e->checker, fv),
+                fv && fv->kind == NODE_NULL_LIT);
+            if (wrap) {
+                emit(e, "(");
+                emit_type(e, wrap);
+                emit(e, "){ .value = ");
+                emit_expr(e, fv);
+                emit(e, ", .has_value = 1 }");
+            } else {
+                emit_expr(e, fv);
+            }
         }
         emit(e, " }");
         break;
@@ -3513,6 +3562,29 @@ static void emit_defers_from(Emitter *e, int base) {
 /* emit ALL defers (for return — must fire every scope's defers) */
 static void emit_defers(Emitter *e) {
     emit_defers_from(e, 0);
+}
+
+/* Fire pending IR defers (LIFO) at an auto-guard early return. Function bodies
+ * are IR-only, so the pending defer bodies live on e->defer_stack (pushed by
+ * IR_DEFER_PUSH) and are emitted via emit_defer_stmt — exactly what
+ * IR_DEFER_FIRE (cond_local=-1, function exit) does. Before this, the auto-guard
+ * early-return path called emit_defers(), whose AST-era body was removed and
+ * abort()s when any defer is pending — so a function combining `defer` with an
+ * auto-guarded (unprovable) array index CRASHED the compiler. Falls back to
+ * emit_defers() (the abort safety net) only when the current IRFunc is unknown. */
+static void emit_pending_ir_defers(Emitter *e) {
+    IRFunc *func = (IRFunc *)e->current_ir_func;
+    if (!func || e->defer_stack.count == 0) { emit_defers(e); return; }
+    for (int di = e->defer_stack.count - 1; di >= 0; di--) {
+        Node *db = e->defer_stack.stmts[di];
+        if (!db) continue;
+        if (db->kind == NODE_BLOCK) {
+            for (int si = 0; si < db->block.stmt_count; si++)
+                emit_defer_stmt(e, db->block.stmts[si], func);
+        } else {
+            emit_defer_stmt(e, db, func);
+        }
+    }
 }
 
 
@@ -6790,12 +6862,22 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                              tmp, (long long)max_v, (long long)max_v);
                     }
                 } else {
-                    /* Unsigned target: clamp below 0 AND above max */
-                    uint64_t max_v = w >= 64 ? UINT64_MAX : ((1ULL << w) - 1);
-                    emit(e, "(int64_t)_zer_sat%d < 0 ? 0 : "
-                             "(int64_t)_zer_sat%d > %lluLL ? (%lluULL) : (",
-                         tmp, tmp, (unsigned long long)max_v,
-                         (unsigned long long)max_v);
+                    /* Unsigned target: clamp below 0 AND above max. The lower/upper
+                     * comparisons MUST be done in the SOURCE's own type — the old
+                     * `(int64_t)_zer_sat` cast misread a large UNSIGNED source (value
+                     * >= 2^63, e.g. `@saturate(u32, 18e18)`) as negative, clamping it
+                     * to 0 instead of the target max. `_zer_sat` is `__auto_type` (the
+                     * source type), so a bare `_zer_sat < 0` is always-false for an
+                     * unsigned source (no lower clamp) and true for a signed source
+                     * (BUG-546). Mirrors the AST path (emitter.c ~3040). */
+                    const char *max_cmp, *max_val;
+                    if (w == 8)       { max_cmp = "255";                    max_val = "255"; }
+                    else if (w == 16) { max_cmp = "65535";                  max_val = "65535"; }
+                    else if (w == 32) { max_cmp = "4294967295ULL";          max_val = "4294967295U"; }
+                    else              { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
+                    emit(e, "_zer_sat%d < 0 ? 0 : "
+                             "_zer_sat%d > %s ? (%s) : (",
+                         tmp, tmp, max_cmp, max_val);
                 }
                 emit_type(e, t);
                 emit(e, ")_zer_sat%d; })", tmp);
@@ -8966,7 +9048,22 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (i > 0) emit(e, ", ");
             emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
                  node->struct_init.fields[i].name);
-            emit_rewritten_node(e, node->struct_init.fields[i].value, func);
+            Node *fv = node->struct_init.fields[i].value;
+            /* T → ?T coercion for a value-optional field (shared helper). */
+            Type *wrap = struct_field_opt_wrap(si_type,
+                node->struct_init.fields[i].name,
+                node->struct_init.fields[i].name_len,
+                checker_get_type(e->checker, fv),
+                fv && fv->kind == NODE_NULL_LIT);
+            if (wrap) {
+                emit(e, "(");
+                emit_type(e, wrap);
+                emit(e, "){ .value = ");
+                emit_rewritten_node(e, fv, func);
+                emit(e, ", .has_value = 1 }");
+            } else {
+                emit_rewritten_node(e, fv, func);
+            }
         }
         emit(e, " }");
         return;
@@ -10978,8 +11075,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 if (i > 0) emit(e, ", ");
                 emit(e, ".%.*s = ", (int)inst->expr->struct_init.fields[i].name_len,
                      inst->expr->struct_init.fields[i].name);
-                if (inst->call_arg_locals && i < inst->call_arg_local_count &&
-                    inst->call_arg_locals[i] >= 0) {
+                bool have_val = inst->call_arg_locals &&
+                    i < inst->call_arg_local_count && inst->call_arg_locals[i] >= 0;
+                /* T → ?T coercion for a value-optional field (function-body IR
+                 * path; shared helper, same as the AST/rewrite paths). */
+                Type *wrap = NULL;
+                if (have_val)
+                    wrap = struct_field_opt_wrap(inst->cast_type,
+                        inst->expr->struct_init.fields[i].name,
+                        inst->expr->struct_init.fields[i].name_len,
+                        func->locals[inst->call_arg_locals[i]].type, false);
+                if (wrap) {
+                    emit(e, "(");
+                    emit_type(e, wrap);
+                    emit(e, "){ .value = ");
+                    emit_local_name(e, func, inst->call_arg_locals[i]);
+                    emit(e, ", .has_value = 1 }");
+                } else if (have_val) {
                     emit_local_name(e, func, inst->call_arg_locals[i]);
                 } else {
                     emit(e, "0"); /* fallback */
@@ -11036,6 +11148,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
     Node *fn = func->ast_node;
     if (!fn) return;
+    e->current_ir_func = func; /* for firing pending IR defers at an auto-guard early return */
 
     /* Emit source mapping */
     if (e->source_file) {

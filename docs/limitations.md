@@ -5,6 +5,102 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-07-05 multi-agent audit residuals (found + triaged; 8 siblings FIXED, these deferred)
+
+A 6-surface parallel audit (emitter drift, VRP bounds, escape sinks, concurrency,
+comptime/container, optional/union/move) found ~16 distinct issues. **EIGHT were
+fixed this session** (see BUGS-FIXED.md 2026-07-05): switch-arm VRP scope-leak OOB;
+Ring.push local-derived escape; `@saturate` unsigned IR-path returns 0; optional
+struct-field designated-init loses value; signed comptime return not sign-extended;
+`?*T`-field-of-local escape (store + return); spawn value-struct-carrying-local
+escape; `defer` + auto-guarded index compiler abort. The items below are the
+**deferred residuals** — each verified real, deferred for scope (subsystem-scale),
+severity (LOUD, not silent), or over-rejection risk. Ranked.
+
+### 🟠 Concurrency — scoped-spawn borrow model gaps (linear, not CFG)
+
+The scoped-borrow exclusivity tracker (`Symbol.is_borrowed_by_thread`, set at spawn,
+cleared at `th.join()`) is a **linear source-order flag, not a CFG lattice** — the
+documented open axis. Three verified TSan-confirmed data races ride on it, all
+compile clean where the direct analog rejects:
+
+- **[C1] multi-arg scoped spawn tracks only the FIRST borrowed local** (checker.c
+  ~13276, the `break;`). `ThreadHandle th = spawn worker(&a, &b); b = 5; th.join();`
+  — a write to `b` (the 2nd `&`-arg) races because only `a` was marked borrowed.
+  The handle records ONE borrowed name (`th_borrows_name`); a proper fix needs a
+  borrowed-name LIST on the handle Symbol + join-clears-all. **Deferred: Symbol
+  data-structure change.** Tripwire shape: `spawn f(&a,&b); b=5; th.join()`.
+- **[C2] conditional `th.join()` clears the borrow, allowing an unconditional racy
+  write** (checker.c ~5068 join-clear). `spawn worker(&local); if (cond){ th.join(); }
+  local = 5; th.join();` — the source-order walk clears the flag at the conditional
+  join, so the later unconditional `local = 5` is accepted but races when `cond==0`.
+  This is the same documented **cross-block scoped-borrow** hole (a zercheck_ir
+  borrow-set merge like the `threads[]` merge is the real fix); note the racy access
+  is unconditional + same-block, sharper than the "different block" framing.
+- **[C3] a function passed BY VALUE to a spawn, invoked via a funcptr param,
+  reaching a non-shared global** (checker.c `scan_unsafe_global_access` ~9556).
+  `void worker(*() fn){ fn(); } spawn worker(do_inc);` where `do_inc` writes a
+  global — the spawn body scan follows only funcptr-NAME args at `NODE_CALL` sites
+  (BH-18 #8 covered direct-call forwarding), not a function name bound to the
+  target's funcptr PARAM. Extends the BH-18 #8 argument-precise-barrier discipline.
+
+### 🟠 Concurrency — atomic-cell taint coverage gaps
+
+- **[C4] scoped spawns are exempt from atomic-cell / shared-scalar taint during the
+  spawn..join window** (checker.c ~12955: `after_spawn_in_func` is set only for
+  fire-and-forget). `ThreadHandle th = spawn worker(); g_flag = 5; th.join();` where
+  `worker` does `@atomic_store(&g_flag, ...)` — a plain write to `g_flag` in the
+  window races the thread's atomic writes. The gate deliberately excludes scoped
+  spawns (post-join access IS safe), but the spawn..join window on a GLOBAL cell is
+  unguarded. Fix: taint atomic cells inside the window too (a global cell is neither
+  a borrowed local nor taint-tracked for scoped spawns).
+- **[C5] 2-level struct-field atomic cell not registered** (checker.c ~14847:
+  `atomic_struct_field_target` requires `field.object->kind == NODE_IDENT`).
+  `@atomic_store(&g.inner.count, ...)` (object `g.inner` is a `NODE_FIELD`) is never
+  recorded as an atomic cell, so a plain write to `g.inner.count` in a concurrent
+  context isn't flagged. Fix: walk nested field/index to the root when registering
+  (mirror the slice-3 struct-field-atomic fix, one level deeper).
+- **[C6] transitive spawn scan depth capped at 32** (checker.c ~9533/9564,
+  `_scan_depth < 32`). A >32-deep call chain from a spawn target to a non-shared
+  global write compiles clean. Structural, low (needs 33+ nested calls); raise the
+  cap or memoize per-function scan results.
+
+### 🟡 Miscompile / invalid-C (LOUD — GCC errors, not silent)
+
+- **[M1] cross-module container monomorphization emits duplicate struct
+  definitions.** Two imported modules that each instantiate the same container
+  concrete type (`Box(u32)`) produce multiple `struct Box_u32 {…}` blocks in the
+  combined emitted C → GCC `error: redefinition of 'struct Box_u32'`. Valid ZER,
+  non-compiling output. Needs a cross-module dedup registry for stamped container
+  structs (emitter container-stamping emission). Each module compiles in isolation.
+- **[M2] statement-expression intrinsics in a global/const initializer emit invalid
+  C.** `const i8 X = @saturate(i8, 500);` (also `@bitcast`, and by construction
+  `@ptrcast`/`@pun`/`@container`/`@cstr`/variable `@inttoptr`/atomics) emit a GCC
+  braced-group `({ … })` at file scope → `error: braced-group within expression
+  allowed only inside a function`. The AST NODE_INTRINSIC path special-cased
+  `@ctz`/`@clz` to a conditional-expression constant form (emitter.c ~3447) but not
+  these. `--emit-c` returns 0 while writing uncompilable C (the GCC step fails).
+  Fix: give the remaining stmt-expr intrinsics a constant-expression form in the
+  global-init path, or reject them in a const initializer at the checker with a
+  clear message (matching `@expect`'s BUG-767 sentinel).
+
+### 🟢 Lower-severity residuals
+
+- **[L1] `--track-cptrs` runtime UAF guard (`_zer_check_alive`) is emitted only on
+  the AST path, inert in function bodies.** The IR `@ptrcast`-from-`*opaque` handler
+  (emitter.c ~6853) omits the `_zer_check_alive(...)` call the AST path (~2841)
+  inserts; since bodies are IR-only, the guard is defined but never called. Bounded
+  impact: pure-ZER `*opaque` UAF is caught at compile time (zercheck_ir); the runtime
+  guard only ever mattered for the ~2% cinclude-boundary gap, now compile-time-only.
+  Restore the call in the IR path for parity.
+- **[L2] auto-guard early-return returns `NULL` for a `*T`-returning function**
+  (emitter.c ~390, `emit_zero_value` of a pointer). Injects null into ZER's non-null
+  `*T` contract. Every reachable ZER use is a deref → faults → caught by the SIGSEGV
+  handler (safe trap), so no silent corruption observed, but trapping at the guard
+  site would be cleaner than returning a contract-violating null.
+
+---
+
 ## DONE (2026-07-01) — BRANCH-IMPORT LANDED (9 fixes / 13 holes) — residual flags + open items below
 
 **STATUS: all three tiers committed + `make check` GREEN, ZER 873/0.** Tier 1 `6c368761`

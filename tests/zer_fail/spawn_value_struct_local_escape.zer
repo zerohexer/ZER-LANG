@@ -1,0 +1,6 @@
+// EXPECTED: compile error — a by-value struct carrying a pointer to a stack local
+// passed to a fire-and-forget spawn is a cross-thread use-after-free.
+struct Msg { *u32 p; }
+void worker(Msg m) { }
+void bad() { u32 local = 5; Msg m; m.p = &local; spawn worker(m); }
+u32 main() { return 0; }

@@ -1,0 +1,8 @@
+// A `defer` combined with an auto-guarded (unprovable) array index used to ABORT
+// the compiler (emit_defers_from stale assertion). Now it compiles and the defer
+// fires exactly once when the guard takes the early return.
+u32 counter;
+void inc() { counter += 1; }
+u32 ext(u32 x) { return x; }
+u32 run() { u8[8] a; u32 i = ext(9); defer inc(); a[i] = 1; return 5; }
+u32 main() { u32 r = run(); if (counter == 1) { return 0; } return 1; }

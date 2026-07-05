@@ -717,3 +717,12 @@ emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
 emitter.c:if (ta->kind == TYNODE_NAMED) {
 zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
 zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+# 2026-07-05 audit fixes — reads on ALREADY-UNWRAPPED type_unwrap_distinct
+# results (_eff/seff/feff/veff locals) in type_can_carry_pointer +
+# struct_field_opt_wrap; no distinct to unwrap, so a raw ->kind is correct.
+checker.c:eff->kind == TYPE_OPAQUE;
+checker.c:if (eff->kind == TYPE_OPTIONAL)
+checker.c:return eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+emitter.c:if (!feff || feff->kind != TYPE_OPTIONAL) return NULL;
+emitter.c:if (!seff || seff->kind != TYPE_STRUCT) return NULL;
+emitter.c:if (veff && veff->kind == TYPE_OPTIONAL) return NULL;

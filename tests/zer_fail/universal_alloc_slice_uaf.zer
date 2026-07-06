@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Universal alloc: use-after-free on a heap slice must be rejected (Model-1 UAF
+// tracking, same as alloc_ptr). docs/universal_alloc.md.
+struct B { u32 x; }
+u32 main() {
+    [*]B b = alloc(B, 4) orelse return;
+    free(b);
+    b[0].x = 1;                 // UAF — 'b' freed on the previous line
+    return 0;
+}

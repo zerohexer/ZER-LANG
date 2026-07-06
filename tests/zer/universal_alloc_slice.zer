@@ -1,0 +1,35 @@
+// Universal alloc — Phase 2: alloc(T, n) -> ?[*]T (runtime-sized escaping heap
+// slice) + free(slice). The kv_table_create shape: buckets is [*]Bucket with NO
+// bound, sized at runtime by `n`, stored in a returned struct (escapes), then
+// freed by the caller. No Arena, no Handle, no fixed array. docs/universal_alloc.md.
+i32 printf(const *u8 fmt, ...);
+
+struct Bucket { u32 head; }
+struct KvTable { u32 size; [*]Bucket buckets; }
+
+?*KvTable kv_table_create(u32 n) {
+    *KvTable ht = alloc(KvTable) orelse return;        // kmalloc(table)
+    ht.size = n;
+    ht.buckets = alloc(Bucket, n) orelse {             // kcalloc(n, sizeof(Bucket))
+        free(ht);
+        return null;
+    };
+    return ht;                                         // escapes — heap-derived
+}
+
+void kv_table_free(*KvTable ht) {
+    free(ht.buckets);
+    free(ht);
+}
+
+u32 main() {
+    *KvTable ht = kv_table_create(4) orelse return;
+    if (ht.size != 4) { return 1; }
+    if (ht.buckets.len != 4) { return 2; }
+    if (ht.buckets[0].head != 0) { return 3; }         // calloc zeroes
+    ht.buckets[2].head = 99;
+    if (ht.buckets[2].head != 99) { return 4; }
+    printf("universal_alloc_slice: ok size=%d len=%d\n", ht.size, ht.buckets.len);
+    kv_table_free(ht);
+    return 0;
+}

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Universal alloc: double-free on a heap slice must be rejected. docs/universal_alloc.md.
+struct B { u32 x; }
+u32 main() {
+    [*]B b = alloc(B, 4) orelse return;
+    free(b);
+    free(b);                    // double free
+    return 0;
+}

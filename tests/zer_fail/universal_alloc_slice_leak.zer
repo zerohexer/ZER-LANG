@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Universal alloc: a heap slice that is neither freed nor escaped is a leak and
+// must be rejected (POOL-colored, leak-checked, same as alloc_ptr). docs/universal_alloc.md.
+struct B { u32 x; }
+u32 main() {
+    [*]B b = alloc(B, 4) orelse return;
+    b[0].x = 1;
+    return 0;                   // 'b' never freed, never escaped — leak
+}

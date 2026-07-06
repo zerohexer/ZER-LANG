@@ -4991,6 +4991,77 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* ===== Universal alloc/free — ONE brainless allocation surface =====
+         *   alloc(T)     -> ?*T    (Phase 1: desugars to T.alloc_ptr(), reusing
+         *                           the auto-slab machinery verbatim)
+         *   alloc(T, n)  -> ?[*]T  (Phase 2: runtime-sized escaping heap slice,
+         *                           handled DIRECTLY — no T.alloc_slice method;
+         *                           the emitter recovers T from the result type)
+         *   free(p:*T)   -> void   (desugars to T.free_ptr(p))
+         *   free(s:[*]T) -> void   (frees the heap slice directly)
+         * Retires alloc_ptr/free_ptr as the default surface. Full context +
+         * multi-phase plan: docs/universal_alloc.md. */
+        if (node->call.callee->kind == NODE_IDENT &&
+            node->call.callee->ident.name_len == 5 &&
+            memcmp(node->call.callee->ident.name, "alloc", 5) == 0 &&
+            (node->call.arg_count == 1 || node->call.arg_count == 2) &&
+            node->call.args[0]->kind == NODE_IDENT) {
+            Node *type_arg = node->call.args[0];
+            Symbol *tsym = scope_lookup(c->current_scope,
+                type_arg->ident.name, (uint32_t)type_arg->ident.name_len);
+            if (tsym && tsym->type &&
+                type_dispatch_kind(tsym->type) == TYPE_STRUCT) {
+                if (node->call.arg_count == 1) {
+                    /* alloc(T) -> T.alloc_ptr(); drop the type arg, fall through */
+                    node->call.callee->kind = NODE_FIELD;
+                    node->call.callee->field.object = type_arg;
+                    node->call.callee->field.field_name = "alloc_ptr";
+                    node->call.callee->field.field_name_len = 9;
+                    node->call.args = NULL;
+                    node->call.arg_count = 0;
+                    /* fall through — field-method dispatch handles it */
+                } else {
+                    /* alloc(T, n) -> ?[*]T, handled directly (keep the type arg;
+                     * the emitter reads T from this result type). */
+                    if (arg_types && arg_types[1] && type_is_integer(arg_types[1])) {
+                        result = type_optional(c->arena,
+                            type_slice(c->arena, tsym->type));
+                    } else {
+                        checker_error(c, node->loc.line,
+                            "alloc(T, n): allocation count must be an integer");
+                        result = ty_void;
+                    }
+                    break;  /* common tail sets node's type from result */
+                }
+            }
+        } else if (node->call.callee->kind == NODE_IDENT &&
+                   node->call.callee->ident.name_len == 4 &&
+                   memcmp(node->call.callee->ident.name, "free", 4) == 0 &&
+                   node->call.arg_count == 1 && arg_types) {
+            Type *ae = arg_types[0] ? type_unwrap_distinct(arg_types[0]) : NULL;
+            TypeKind aek = arg_types[0] ? type_dispatch_kind(arg_types[0]) : TYPE_VOID;
+            if (ae && aek == TYPE_POINTER &&
+                type_dispatch_kind(ae->pointer.inner) == TYPE_STRUCT) {
+                /* free(p:*T) -> T.free_ptr(p) (reuses free_ptr machinery) */
+                Type *st = type_unwrap_distinct(ae->pointer.inner);
+                Node *recv = (Node *)arena_alloc(c->arena, sizeof(Node));
+                memset(recv, 0, sizeof(Node));
+                recv->kind = NODE_IDENT;
+                recv->ident.name = st->struct_type.name;
+                recv->ident.name_len = st->struct_type.name_len;
+                recv->loc = node->loc;
+                node->call.callee->kind = NODE_FIELD;
+                node->call.callee->field.object = recv;
+                node->call.callee->field.field_name = "free_ptr";
+                node->call.callee->field.field_name_len = 8;
+                /* args unchanged [p]; fall through to field dispatch */
+            } else if (ae && aek == TYPE_SLICE) {
+                /* free(s:[*]T) -> direct heap-slice free (handled in emitter) */
+                result = ty_void;
+                break;
+            }
+        }
+
         /* module-qualified call: config.func() → rewrite callee to NODE_IDENT
          * with the raw function name. The existing unqualified call resolution
          * already finds imported functions by raw name in global scope.

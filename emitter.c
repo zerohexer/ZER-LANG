@@ -6630,6 +6630,49 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, "%lld", (long long)node->call.comptime_value);
             return;
         }
+        /* Universal alloc(T,n) -> ?[*]T (calloc) and free(slice) -> free(ptr).
+         * ident-callee builtins; T recovered from args[0] type name. Mirrors the
+         * arena.alloc_slice slice-wrap but heap-backed + escapable. See
+         * docs/universal_alloc.md. */
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            const char *cn2 = node->call.callee->ident.name;
+            uint32_t cl2 = (uint32_t)node->call.callee->ident.name_len;
+            if (cl2 == 5 && memcmp(cn2, "alloc", 5) == 0 &&
+                node->call.arg_count == 2 &&
+                node->call.args[0]->kind == NODE_IDENT) {
+                Symbol *ts = scope_lookup(e->checker->global_scope,
+                    node->call.args[0]->ident.name,
+                    (uint32_t)node->call.args[0]->ident.name_len);
+                if (ts && ts->type) {
+                    Type *st = type_unwrap_distinct(ts->type);
+                    Type *slice_t = type_slice(e->arena, ts->type);
+                    Type *opt_t = type_optional(e->arena, slice_t);
+                    int t = e->temp_count++;
+                    emit(e, "({size_t _zer_hn%d=", t);
+                    emit_rewritten_node(e, node->call.args[1], func);
+                    emit(e, ";void *_zer_hp%d=calloc(_zer_hn%d,sizeof(", t, t);
+                    if (type_dispatch_kind(ts->type) == TYPE_STRUCT)
+                        emit(e, "struct %.*s", (int)st->struct_type.name_len, st->struct_type.name);
+                    else emit_type(e, ts->type);
+                    emit(e, "));_zer_hp%d?(", t);
+                    emit_type(e, opt_t); emit(e, "){("); emit_type(e, slice_t); emit(e, "){(");
+                    emit_type(e, type_pointer(e->arena, ts->type));
+                    emit(e, ")_zer_hp%d,_zer_hn%d},1}:(", t, t);
+                    emit_type(e, opt_t); emit(e, "){0};})");
+                    return;
+                }
+            }
+            if (cl2 == 4 && memcmp(cn2, "free", 4) == 0 &&
+                node->call.arg_count == 1) {
+                Type *at = checker_get_type(e->checker, node->call.args[0]);
+                if (at && type_dispatch_kind(at) == TYPE_SLICE) {
+                    emit(e, "free((void*)(");
+                    emit_rewritten_node(e, node->call.args[0], func);
+                    emit(e, ").ptr)");
+                    return;
+                }
+            }
+        }
         /* Detect builtins + ThreadHandle.join: callee NODE_FIELD */
         if (node->call.callee && node->call.callee->kind == NODE_FIELD &&
             node->call.callee->field.object &&

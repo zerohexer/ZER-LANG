@@ -1393,7 +1393,25 @@ static bool ir_receiver_is_builtin_target(Checker *c, Node *callee) {
 static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     if (!call || call->kind != NODE_CALL) return IRMC_NONE;
     Node *callee = call->call.callee;
-    if (!callee || callee->kind != NODE_FIELD) return IRMC_NONE;
+    if (!callee) return IRMC_NONE;
+    /* Universal alloc(T,n) / free(slice) — ident-callee heap-slice builtins,
+     * tracked EXACTLY like alloc_ptr/free_ptr (POOL color, escapable, alloc_id
+     * group → UAF/double-free/leak all fall out). free(*T) is desugared to
+     * T.free_ptr earlier, so only the slice free reaches here as an ident
+     * callee. See docs/universal_alloc.md. */
+    if (callee->kind == NODE_IDENT) {
+        const char *in = callee->ident.name;
+        uint32_t il = (uint32_t)callee->ident.name_len;
+        if (il == 5 && memcmp(in, "alloc", 5) == 0 && call->call.arg_count == 2)
+            return IRMC_ALLOC_PTR;
+        if (il == 4 && memcmp(in, "free", 4) == 0 && call->call.arg_count == 1) {
+            Type *at = checker_get_type(c, call->call.args[0]);
+            if (at && type_dispatch_kind(at) == TYPE_SLICE)
+                return IRMC_FREE_PTR;
+        }
+        return IRMC_NONE;
+    }
+    if (callee->kind != NODE_FIELD) return IRMC_NONE;
     /* Gap 32: receiver must be a builtin target type. */
     if (!ir_receiver_is_builtin_target(c, callee)) return IRMC_NONE;
     const char *m = callee->field.field_name;

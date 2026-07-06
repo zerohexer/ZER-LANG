@@ -705,6 +705,29 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             }
         }
 
+        /* Universal alloc(T,n) / free(slice): ident-callee builtins. alloc(T,n)
+         * carries a type-name arg[0] that must NOT be decomposed; free(slice) is
+         * emitted inline. Route both through IR_CALL with expr. Gated on the
+         * result/arg type so a cinclude free(ptr) (pointer, not slice) is never
+         * hijacked. See docs/universal_alloc.md. */
+        if (!call_is_builtin && expr->call.callee &&
+            expr->call.callee->kind == NODE_IDENT) {
+            const char *cn = expr->call.callee->ident.name;
+            uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
+            if (cl == 5 && memcmp(cn, "alloc", 5) == 0 &&
+                expr->call.arg_count == 2 &&
+                expr->call.args[0]->kind == NODE_IDENT) {
+                Type *art = checker_get_type(ctx->checker, expr);
+                if (art && type_dispatch_kind(art) == TYPE_OPTIONAL)
+                    call_is_builtin = true;
+            } else if (cl == 4 && memcmp(cn, "free", 4) == 0 &&
+                       expr->call.arg_count == 1) {
+                Type *fat = checker_get_type(ctx->checker, expr->call.args[0]);
+                if (fat && type_dispatch_kind(fat) == TYPE_SLICE)
+                    call_is_builtin = true;
+            }
+        }
+
         /* Decompose arguments to locals (skip for builtins — type-name args) */
         int *arg_locals = NULL;
         int arg_count = expr->call.arg_count;

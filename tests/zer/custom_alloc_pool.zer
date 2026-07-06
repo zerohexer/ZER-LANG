@@ -1,0 +1,34 @@
+// Custom allocator (INDEX-based object pool with a free-list) over a heap region,
+// built with only the universal alloc + slice indexing. Demonstrates that
+// homogeneous custom allocators need no reinterpret — the index/handle pattern
+// (same as built-in Pool/Slab/Handle) covers them. docs/universal_alloc.md.
+i32 printf(const *u8 fmt, ...);
+
+struct Slot { u32 val; bool used; }
+struct ObjPool { [*]Slot slots; }
+
+?u32 op_alloc(*ObjPool p) {
+    for (u32 i = 0; i < p.slots.len; i += 1) {
+        if (!p.slots[i].used) { p.slots[i].used = true; return i; }
+    }
+    return null;
+}
+
+void op_release(*ObjPool p, u32 idx) {
+    if (idx < p.slots.len) { p.slots[idx].used = false; }
+}
+
+u32 main() {
+    ObjPool p;
+    p.slots = alloc(Slot, 4) orelse return;
+    u32 a = op_alloc(&p) orelse { free(p.slots); return 1; };
+    u32 c = op_alloc(&p) orelse { free(p.slots); return 2; };
+    p.slots[a].val = 7;
+    p.slots[c].val = 9;
+    op_release(&p, a);
+    u32 d = op_alloc(&p) orelse { free(p.slots); return 3; };  // reuses slot a
+    if (d != a) { free(p.slots); return 4; }
+    free(p.slots);
+    printf("custom_alloc_pool: ok (reused slot %d)\n", d);
+    return 0;
+}

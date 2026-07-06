@@ -10255,7 +10255,21 @@ static void check_stmt(Checker *c, Node *node) {
                                 root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                             Symbol *src = scope_lookup(c->current_scope,
                                 root->ident.name, (uint32_t)root->ident.name_len);
-                            if (src && !src->is_static && !is_global) {
+                            /* RELAXATION (pointer-into-nonlocal-ref): `p = &r[i]`
+                             * or `p = &r.f` where r is a slice/pointer that is NOT
+                             * local-derived (a PARAM or a HEAP allocation) points
+                             * into r's POINTEE — the caller's or heap memory, not
+                             * this frame — so p is NOT local-derived and may
+                             * escape. Still local for &local_array[i], &local
+                             * scalar/struct, and &local-derived-slice[i]. Mirrors
+                             * the return &s[i] relaxation (see ~line 11785).
+                             * Enables pointer-returning custom allocators over a
+                             * heap region. docs/universal_alloc.md. */
+                            bool root_is_ref = src && src->type &&
+                                (type_dispatch_kind(src->type) == TYPE_SLICE ||
+                                 type_dispatch_kind(src->type) == TYPE_POINTER);
+                            if (src && !src->is_static && !is_global &&
+                                !(root_is_ref && !src->is_local_derived)) {
                                 sym->is_local_derived = true;
                             }
                         }

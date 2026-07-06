@@ -1,0 +1,30 @@
+// Custom allocator (POINTER-returning bump allocator) over a heap region, built
+// with only the universal alloc + the pointer-return relaxation: `*T p = &r[i];
+// return p;` where r is a slice/pointer whose pointee is NOT this frame (a param
+// or heap allocation) is memory-safe and now compiles. docs/universal_alloc.md.
+i32 puts(const *u8 s);
+
+struct Node { u32 val; }
+struct Bump { [*]Node region; u32 off; }
+
+?*Node bump_ptr(*Bump b) {
+    if (b.off >= b.region.len) { return null; }
+    *Node p = &b.region[b.off];   // &heap-region[i] via the *Bump param — safe
+    b.off += 1;
+    return p;
+}
+
+u32 main() {
+    Bump b;
+    b.region = alloc(Node, 8) orelse return;
+    b.off = 0;
+    *Node n0 = bump_ptr(&b) orelse { free(b.region); return 1; };
+    *Node n1 = bump_ptr(&b) orelse { free(b.region); return 2; };
+    n0.val = 10;
+    n1.val = 20;
+    if (n0.val + n1.val != 30) { free(b.region); return 3; }
+    if (b.off != 2) { free(b.region); return 4; }
+    free(b.region);
+    puts("custom_alloc_bump_ptr: ok");
+    return 0;
+}

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Tripwire for the pointer-return relaxation: it must NOT allow returning a
+// pointer to a LOCAL array even when bound to a local first (&arr[i] -> p ->
+// return p). The relaxation only accepts &r[i] where r is a NON-local-derived
+// slice/pointer (param/heap); a local array is frame memory. docs/universal_alloc.md.
+struct T { u32 v; }
+*T bad() {
+    T[8] arr;
+    *T p = &arr[0];
+    return p;               // dangling — arr is stack memory
+}
+u32 main() { return 0; }

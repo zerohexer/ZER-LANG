@@ -738,7 +738,28 @@ static Node *parse_primary(Parser *p) {
     /* float literal */
     if (match(p, TOK_NUMBER_FLOAT)) {
         Node *n = new_node(p, NODE_FLOAT_LIT);
-        n->float_lit.value = strtod(p->previous.start, NULL);
+        /* Strip digit-group underscores before strtod. The lexer accepts `_`
+         * in the integer/fraction/exponent parts (e.g. `1_000.5`, `1e1_0`), but
+         * strtod on the raw token STOPS at the first `_`, silently truncating
+         * the value (`1_000.5` -> 1.0). Copy the token minus underscores into a
+         * NUL-terminated buffer first (audit 2026-07-06). Integer literals
+         * already strip underscores in their own loop above. */
+        size_t flen = p->previous.length;
+        char stackbuf[64];
+        char *fbuf = stackbuf;
+        if (flen + 1 > sizeof(stackbuf))
+            fbuf = (char *)parser_alloc(p, flen + 1);
+        if (fbuf) {
+            size_t w = 0;
+            for (size_t i = 0; i < flen; i++) {
+                char ch = p->previous.start[i];
+                if (ch != '_') fbuf[w++] = ch;
+            }
+            fbuf[w] = '\0';
+            n->float_lit.value = strtod(fbuf, NULL);
+        } else {
+            n->float_lit.value = strtod(p->previous.start, NULL);
+        }
         return n;
     }
 

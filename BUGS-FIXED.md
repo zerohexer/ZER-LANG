@@ -5,6 +5,79 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-06 — Multi-agent audit: 7 fixes (4 🔴 soundness, 1 🔴 miscompile, 2 🟡)
+
+A parallel multi-agent audit of the whole compiler surfaced a batch of confirmed holes.
+Seven were fixed this pass (the rest are logged in `docs/limitations.md` under the
+"2026-07-06 audit" entry). All fixes are TIGHTENING (reject-unsafe / correct a miscompile);
+none widen acceptance except the short-circuit lowering, which is a semantics correction.
+`make check` GREEN after the batch.
+
+**F1 🔴 `find_return_range` skipped `NODE_DO_WHILE` bodies → bounds check elided (silent OOB).**
+`checker.c` (~15493). The cross-function return-range scanner recursed into `for`/`while`
+bodies but not `do-while`, so a `return` inside a do-while under-approximated the function's
+return set. `buf[pick(7)]` where `pick` returns 999 only via a do-while path had its bounds
+check ELIDED (the range looked like `[0,0]`). Silent OOB read on baremetal; garbage/no-trap on
+hosted. Fix: add `NODE_DO_WHILE` to the loop-body recursion (shares `while_stmt.body`).
+Test: `tests/zer_trap/dowhile_return_range_oob.zer` (must trap).
+
+**F2 🔴 Level-B guarded relaxation forgot the second free under complementary guards → UAF +
+double-free.** `zercheck_ir.c`. `IRHandleInfo.free_block` records only ONE free site; for
+`if(c){free} if(!c){free}` the second free (under `!c`) was never remembered, so a later use
+under `!c` was judged disjoint from the FIRST free (under `c`) and accepted — a real
+use-after-free (reproduced: the dangling write clobbered a reused slab slot). Fix: new
+`multi_freed` flag set (via `ir_mark_multi_freed`, alias-group + merge OR-carried) when a
+second guard-disjoint free is accepted; once set, `ir_use_guard_disjoint` returns false
+(relaxation disabled — the handle is freed on ≥2 mutually-exclusive paths). Soundness-first:
+over-rejects only the exotic non-complementary multi-guard-free case. The legitimate
+`if(c){free} if(!c){use;free}` pattern still compiles. Tests:
+`tests/zer_fail/level_b_multifree_uaf.zer` (reject), `tests/zer/level_b_disjoint_free_ok.zer`
+(accept).
+
+**F3 🔴 VRP `VarRange` map leaked across function boundaries → bounds guard elided.** `checker.c`
+(~14400). `VarRange` is keyed by variable NAME with no scope/function discriminator and was
+never reset between function bodies, so a range narrowed in an EARLIER function
+(`if (i >= 16) return;` → `i ∈ [0,15]`) persisted into a LATER function reusing the name `i`,
+silently dropping its `arr[i]` bounds guard. Order-dependent silent OOB. Fix: reset
+`c->var_range_count = 0` at each function-body entry (NOT restored after — the post-body
+`find_return_range` reads the body's ranges, and the next function's entry re-clears). Test:
+`tests/zer/vrp_crossfunc_range_no_leak.zer`.
+
+**F4 🔴 `?*T` / `?[*]T` field of a local struct evaded escape analysis → dangling global/return.**
+`checker.c` `type_can_carry_pointer` (~1392) + the assignment-launder sink (~4313). The escape
+gate only recognised bare `POINTER/SLICE/STRUCT/UNION/OPAQUE`, not an optional wrapping one, so
+`gr = s.p` where `s.p : ?*u32` borrows `&local` slipped every sink while the plain `*u32` field
+was correctly rejected. Fix: recurse `type_can_carry_pointer` into `TYPE_OPTIONAL` (still
+excludes `?u32`/`?Handle`, avoiding the BUG-421 false-positive class) + an explicit
+optional-wrapping-ptr/slice arm in the assignment-store descent. Test:
+`tests/zer_fail/opt_field_escape_global.zer`.
+
+**F5 🔴 Narrow-int arithmetic lost ZER wrap semantics on inline emission → silent wrong element
+write / false OOB.** `emitter.c` `emit_rewritten_node` NODE_BINARY/NODE_UNARY. C integer
+promotion computes `a + b` (u8) in `int`, so `arr[a + b]` with `a+b == 300` wrote `arr[300]`
+instead of the wrapped `arr[44]` (silent wrong element in-bounds; or a false OOB trap when the
+un-wrapped index exceeds the array). The narrowing cast existed on the AST `emit_expr` path
+(BUG-215) but was absent from the IR inline-emission path (the AST→IR emission-diff class).
+Fix: shared `ir_narrow_arith_cast` helper applied to +,-,*,&,|,^ and unary ~,- when the result
+is u8/i8/u16/i16. Test: `tests/zer/narrow_arith_wrap_index.zer`.
+
+**SC 🔴 `&&` / `||` did not short-circuit → RHS side effects always ran (spurious trap / broken
+guards).** `ir_lower.c`. The 3AC lowering evaluated BOTH operands into temps then combined with
+C `&&`, so `if (i < len && arr[i]...)` evaluated `arr[i]` even when `i < len` was false (spurious
+OOB trap on hosted / silent OOB on baremetal), and any side-effecting RHS ran unconditionally.
+Fix: new `lower_shortcircuit_to_dest` lowers `&&`/`||` to short-circuit branches (LHS decides
+whether the RHS block runs), modelled on `lower_orelse_to_dest`. Tests:
+`tests/zer/shortcircuit_side_effects.zer`, `tests/zer/shortcircuit_value_ok.zer`.
+(NOTE the residual over-rejection: the checker still rejects `d != 0 && n / d` because it does
+not narrow `d`'s range into the `&&` RHS — logged in limitations.md as a follow-up.)
+
+**F8 🟡 Float literal digit-group underscores truncated the value.** `parser.c` (~741). `strtod`
+on the raw token STOPS at the first `_`, so `1_000.5` parsed as `1.0`, `1e1_0` as `1.0` — silent
+wrong value. Fix: strip underscores into a NUL-terminated buffer before `strtod` (integer
+literals already did this). Test: `tests/zer/float_underscore_literal.zer`.
+
+---
+
 ## 2026-07-01 — AU-5: ISR-alloc / context-restriction scan blind to funcptr indirection, checker.c
 
 🟠 bare-metal context-restriction gap (Definition A §2.3/§5.7). `scan_func_props` followed

@@ -1392,9 +1392,19 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
 static bool type_can_carry_pointer(Type *t) {
     if (!t) return false;
     Type *eff = type_unwrap_distinct(t);
-    return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
-                   eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
-                   eff->kind == TYPE_OPAQUE);
+    if (!eff) return false;
+    /* An optional wrapping a pointer/slice/struct still carries the pointer:
+     * `?*T`, `?[*]T`, `?Struct`. Omitting this (audit 2026-07-06) let a
+     * projected optional-pointer field of a local struct (`gr = s.p` where
+     * `s.p : ?*u32` borrows `&local`) escape to a global/return unflagged,
+     * while the plain `*u32` field was correctly rejected. Recurse so `?u32`
+     * (scalar) and `?Handle` (u64 key) stay excluded — same as their bare
+     * forms — to avoid the BUG-421 false-positive class. */
+    if (eff->kind == TYPE_OPTIONAL)
+        return type_can_carry_pointer(eff->optional.inner);
+    return eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+           eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+           eff->kind == TYPE_OPAQUE;
 }
 
 /* Propagate is_local_derived / is_arena_derived / is_from_arena from src to dst,
@@ -4300,8 +4310,19 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!via_slice_borrow && vnode &&
                 (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt = typemap_get(c, node->assign.value);
-                if (vt && (type_dispatch_kind(vt) == TYPE_POINTER ||
-                           type_dispatch_kind(vt) == TYPE_SLICE)) {
+                TypeKind vt_k = vt ? type_dispatch_kind(vt) : TYPE_VOID;
+                bool vt_is_ref = (vt_k == TYPE_POINTER || vt_k == TYPE_SLICE);
+                /* audit 2026-07-06: an optional-wrapped pointer/slice field
+                 * (`?*T`/`?[*]T`) carries the reference just like the bare form;
+                 * without this the `?*T` field launder `gr = s.p` slipped every
+                 * escape sink. */
+                if (!vt_is_ref && vt_k == TYPE_OPTIONAL) {
+                    Type *vte = type_unwrap_distinct(vt);
+                    Type *vti = vte ? type_unwrap_distinct(vte->optional.inner) : NULL;
+                    if (vti && (vti->kind == TYPE_POINTER || vti->kind == TYPE_SLICE))
+                        vt_is_ref = true;
+                }
+                if (vt && vt_is_ref) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -14399,6 +14420,17 @@ static void check_func_body(Checker *c, Node *node) {
          * after the body). */
         c->cur_ret_summary_complete = true;
         c->cur_ret_param_mask = 0;
+        /* Reset the value-range map at each function-body entry. VarRange is
+         * keyed by variable NAME with no scope discriminator, so ranges derived
+         * in an EARLIER function (e.g. `if (i >= 16) return;` narrowing param
+         * `i` to [0,15]) would otherwise persist into a LATER function that
+         * reuses the name, silently eliding its bounds guard (audit 2026-07-06).
+         * NOT restored after the body: the post-body find_return_range pass
+         * (cross-function range summary) READS these ranges (e.g. `return raw`
+         * proven [0,15] by an in-body guard), and the next function's own entry
+         * reset re-clears them. Functions never nest, so nothing between here and
+         * that next reset consults a stale range. */
+        c->var_range_count = 0;
         check_stmt(c, node->func_decl.body);
         c->after_spawn_in_func = saved_after_spawn;
         c->in_comptime_body = saved_comptime;
@@ -15490,7 +15522,12 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         }
         return true;
     }
-    if (node->kind == NODE_FOR || node->kind == NODE_WHILE) {
+    if (node->kind == NODE_FOR || node->kind == NODE_WHILE ||
+        node->kind == NODE_DO_WHILE) {
+        /* NODE_DO_WHILE shares the while_stmt union field. Omitting it here
+         * (audit 2026-07-06) let a `return` inside a do-while body escape the
+         * scan, so the function's return range UNDER-approximated and call
+         * sites elided the bounds check on `arr[f()]` — a silent OOB. */
         Node *body = (node->kind == NODE_FOR) ? node->for_stmt.body : node->while_stmt.body;
         return find_return_range(c, body, out_min, out_max, found);
     }

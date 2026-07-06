@@ -5,6 +5,136 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-07-06 multi-agent audit: fixed batch + remaining backlog
+
+A parallel multi-agent audit (8 agents over the whole compiler + empirical black-box
+fuzzing) surfaced ~20 confirmed findings. **7 fixed this pass** (see BUGS-FIXED.md
+2026-07-06: F1 do-while return-range, F2 Level-B multi-free UAF, F3 VRP cross-function
+range leak, F4 `?*T` field escape, F5 narrow-arith wrap, SC short-circuit, F8 float
+underscore). The rest are logged here, most-severe first. All are CONFIRMED (reproduced
+against the built compiler) unless marked.
+
+### 🔴 still open — control-flow / concurrency lowering (delicate defer/CFG machinery)
+
+- **F-goto1 — forward `goto` OVER a `defer` registration still fires the defer.**
+  `ir_lower.c` NODE_GOTO/NODE_LABEL. `if (c) { goto skip; } defer inc(); skip: ...` —
+  on the goto path `inc()` fires though its registration was jumped over (the compile-time
+  defer stack is flow-insensitive). The canonical `if (err) goto out; ... defer free(p);
+  out:` runs cleanup against auto-zeroed/never-acquired state (spurious free/unlock/close;
+  with a Pool handle → SIGTRAP at runtime, compiled clean). Confirmed by two agents +
+  empirical. Fix sketch: a per-goto record of which defers are registered at the goto vs at
+  the label; only fire the intersection (defers registered before BOTH). Sibling of the
+  landed T1.1 (defer DROP) and bh18_12 (backward-goto count) fixes — same family, not yet
+  complete.
+- **F-goto2 — per-iteration loop `defer` + `goto` out of the loop fires N+1 times on the
+  normal path (double-free shape).** `ir_lower.c` NODE_LABEL `goto_fired_count` restore
+  (added 2026-06-29). A loop-body defer is fired per-iteration; a `goto` out of the loop
+  records `goto_fired_count=1` on the label, and the live fall-through restore re-fires it at
+  function exit. `for(i<2){ defer inc(); if(c) goto out; } out:` fires 3× (expected 2) on the
+  no-goto path. Regression from the sesjma fall-through-drop fix — the restore doesn't
+  distinguish loop-scoped (already-fired-and-reset) defers from function-scope ones.
+- **F-await-orelse — `await` condition containing `orelse` goes stale; task never wakes.**
+  `ir_lower.c` NODE_AWAIT calls `pre_lower_orelse` on the cond, hoisting the orelse eval
+  BEFORE `IR_AWAIT`, so the Duff resume lands after it and every later poll re-tests a stale
+  temp. Violates invariant #14 (await cond re-evaluated per poll). `await (g_opt orelse 0) >
+  2;` never completes.
+- **F-condlock — shared-struct mutex leaked (permanent cross-thread deadlock) when
+  `orelse return/break/continue` sits inside a shared-reading condition.** `ir_lower.c`
+  `emit_shared_lock_around_cond` emits `IR_LOCK` but does not set
+  `ctx->current_stmt_shared_root`, so `lower_orelse_to_dest`'s terminating fallback returns
+  while holding the mutex (no unlock). `if ((g.opt orelse return) > 0) {…}` — bb0 locks,
+  the orelse-fail block returns with no unlock. Recursive mutex hides it single-threaded; any
+  other thread blocks forever. Fix sketch: set `current_stmt_shared_root` in
+  `emit_shared_lock_around_cond` so the existing orelse-fail unlock path fires.
+
+### 🔴 still open — accept-unsafe (parser)
+
+- **F6 — `mmio` range literals: binary (`0b…`) parses as garbage and hex has no overflow
+  check → accepts undeclared addresses.** `parser.c` (~2763) re-parses the address token with
+  a duplicated hex/decimal-only converter (no `0b`, no overflow guard), bypassing the
+  overflow-checked converter in `parse_primary` (BUG-607). `mmio 0b1000..0b1111;` yields range
+  501000..501111 (rejects the intended addrs AND accepts undeclared ones); a 65-bit hex range
+  wraps to `0x0..0xFF`. mmio is a Model-4 safety annotation → accept-unsafe. Fix: extract the
+  overflow-checked int-literal conversion from `parse_primary` into a shared helper and use it
+  here (also fixes `0b`).
+
+### 🟡 still open — miscompile / wrong-value / invalid-C
+
+- **F21 — value-optional field (`?u32`/`?bool`) in a struct designated initializer silently
+  drops the value.** `emitter.c` IR_STRUCT_INIT_DECOMP (~11007) + AST paths (2786, 9009).
+  `Cfg c = { .baud = 9600 }` emits `.baud = 9600` where `.baud` is `_zer_opt_u32`; C brace-
+  elision lands 9600 in `.value` and leaves `.has_value = 0`, so `c.baud orelse 0` returns 0.
+  Extremely idiomatic (CLAUDE.md's own `Config c = { .baud = 9600 }`). Fix: wrap a scalar
+  field value as `(_zer_opt_X){ <val>, 1 }` when the field's declared type is a non-sentinel
+  struct-optional and the value isn't already optional.
+- **F9 — IR-path bit extraction `reg[hi..lo]` uses 32-bit `1U << width` with no width guard →
+  wrong value / UB on full-width extraction.** `emitter.c` (~8803) `emit_rewritten_node`
+  NODE_SLICE. AST path uses `1ull` + width clamp; IR sibling does not. `v[31..0]` yields
+  `1U << 32` (UB). Fix: mirror the AST path's `1ull` + `_zer_w` clamp.
+- **F10 — signed division with a side-effecting dividend double-evaluates it when divisor ==
+  -1.** `emitter.c` (~5938) `emit_rewritten_node` NODE_BINARY `/`,`%`. The dividend is emitted
+  once in the `INT_MIN/-1` overflow-check block and again in the final division. `arr[i] =
+  next() / d` with `d == -1` runs `next()` twice. Fix: hoist the dividend into a temp (as the
+  `/=` path does).
+- **F7 — `@saturate` / `@bitcast` in a global/static initializer emit a GCC statement-
+  expression → "braced-group within expression allowed only inside a function".** `emitter.c`
+  (~3029 / bitcast). Valid ZER (`i8 G = @saturate(i8, 999);`) fails to compile. Sibling of the
+  `@ctz` T2.1 drift. Fix: emit a constant-foldable form when the arg has no side effects (or
+  reject in the checker with a clean ZER diagnostic, like `@expect`).
+- **F11 — `\xNN` string escape: raw passthrough → wrong bytes/len + spurious runtime trap.**
+  `lexer.c` (395) defines `\x` as exactly two hex digits but `parser.c` (749) stores the raw
+  quoted text pasted verbatim into a C literal, where `\x` consumes unlimited hex digits.
+  `"\x41BC"` → ZER {0x41,'B','C'} (len 3) but C one out-of-range escape (len 1) → `s[1]`
+  traps. Same class: `\0`+digit octal. Fix: re-encode string bytes at emission.
+- **F13 — range-for over a FIELD collection whose object is a CALL evaluates the collection
+  N+1 times + shares an AST subtree.** `parser.c` (~1374) checks only the top node kind; a
+  `for (x in get().items)` passes (FIELD whose `.object` is a call), and `CLONE_COLLECTION`
+  copies `.object` by pointer. `get()` ran 4× for a 4-iter loop. Also lets a `NODE_ORELSE`
+  into multiple tree positions (works by accident today). Fix: require the field-chain ROOT to
+  be a trivial ident (reject CALL/ORELSE/INDEX anywhere in the chain).
+- **default-mid — a `default` switch arm in a non-last position silently swallows all later
+  arms.** `ir_lower.c` (~2820/3186) NODE_SWITCH: the default arm gets an unconditional
+  terminator and `current_block` isn't advanced, so later arms' comparisons are dead code.
+  `switch(2){ default => r=100; 2 => r=5; }` → r=100. No parser/checker rejection. Fix: either
+  reject a non-last default in the checker, or advance the block after the default arm.
+- **F12 — distinct-typedef width-differing integer coercion bypasses the "distinct blocks
+  implicit conversion" wall.** `types.c` (~376) `can_implicit_coerce` integer path uses
+  `type_is_integer`/`type_width` which unwrap distinct internally, so `distinct u16 PortId; u32
+  x = p;` compiles without `@cast`. Violates reference.md:687. Fix: early-return false if either
+  side is a distinct typedef (after the `type_equals` check, keeping the T→?T handling).
+- **shared-whole-struct-read — a bare read/copy of a `shared struct` value is emitted without a
+  lock (torn read).** `ir_lower.c` `find_shared_root_expr` (~1207) only matches
+  FIELD/INDEX/deref chains, not a bare NODE_IDENT of shared-struct type (`Counter c = g;` or
+  passing `g` by value). Fix: match a whole-struct shared ident as a lock root.
+
+### 🟢 still open — over-rejection / diagnostics (lower priority)
+
+- **SC-checker-narrowing** — the checker does not narrow a range established by the LHS of
+  `&&` into the RHS, so the div-guard idiom `if (d != 0 && n / d > 5)` is rejected ("divisor
+  not proven nonzero") even though the SC runtime fix now makes it safe. Fix: propagate the
+  LHS guard's VRP narrowing into the RHS analysis of `&&`.
+- **F14** — `(*p)` (parenthesized deref) misparsed as a `(*T)` cast and rejected. `parser.c`
+  (~865): a `TOK_STAR` after `(` unconditionally assumes a pointer cast. Rare in ZER (`.` auto-
+  derefs). Fix: only treat `( *IDENT )` as a cast when IDENT is a known type name.
+- **F15** — `const`/`volatile` + `*NamedType` (or `*opaque`) return type fails to parse.
+  `parser.c` (~2864/2898): the lookahead breaks at the first `TOK_IDENT` (the type name), and
+  the keyword-skip range excludes `TOK_OPAQUE`. `const *Task f()` fails; `const *u32 f()` works.
+- **F16** — documented 2C funcptr array syntax `*(...)->T [N] name;` doesn't work
+  (`parse_func_ptr_2c` swallows `[N]` into the return type). Either fix the parse or the docs.
+- **F17** — `@probe` on freestanding always returns `has_value=1` (the fault path is
+  `#if __STDC_HOSTED__`-gated). The program-level optional contract silently does not hold on
+  baremetal (partly the hardware-consequence floor — no portable bus-fault catch — but emitted
+  with no diagnostic).
+- **F18** — `@expect` in a constant context emits an undefined-symbol sentinel that fails GCC
+  loudly instead of a clean ZER checker error (or a constant-fold to the value).
+- **F19** — an unterminated block comment silently swallows the rest of the file (no lexer
+  diagnostic). **F20** — top-level `comptime if` is rejected (`parse_declaration` has no arm),
+  so conditional *declarations* are impossible. **F10-defer-printf** — a `defer
+  printf("…")` (string literal to a variadic extern) drops the `.ptr` coercion in the deferred-
+  emission path → GCC type error on valid ZER.
+
+---
+
 ## DONE (2026-07-01) — BRANCH-IMPORT LANDED (9 fixes / 13 holes) — residual flags + open items below
 
 **STATUS: all three tiers committed + `make check` GREEN, ZER 873/0.** Tier 1 `6c368761`

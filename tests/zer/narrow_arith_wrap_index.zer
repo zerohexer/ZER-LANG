@@ -1,0 +1,12 @@
+// audit 2026-07-06 F5: narrow-int arith wrap must survive inline (array index)
+u8 get_a() { return 200; }
+u8 get_b() { return 100; }
+u32 main() {
+    u8 a = get_a();
+    u8 b = get_b();
+    u8[310] arr;
+    arr[a + b] = 9;          // u8 wraps: 300 -> 44
+    if (arr[44] != 9) { return 1; }
+    if (arr[300] != 0) { return 2; }
+    return 0;
+}

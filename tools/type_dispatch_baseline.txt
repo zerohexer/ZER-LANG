@@ -717,3 +717,10 @@ emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
 emitter.c:if (ta->kind == TYNODE_NAMED) {
 zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
 zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+# audit 2026-07-06 F4: type_can_carry_pointer + optional-field escape gate.
+# All reads below are on ALREADY-UNWRAPPED locals (eff = type_unwrap_distinct(t),
+# vti = type_unwrap_distinct(vte->optional.inner)) — the documented-safe case.
+checker.c:eff->kind == TYPE_OPAQUE;
+checker.c:if (eff->kind == TYPE_OPTIONAL)
+checker.c:if (vti && (vti->kind == TYPE_POINTER || vti->kind == TYPE_SLICE))
+checker.c:return eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||

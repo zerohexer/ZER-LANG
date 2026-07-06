@@ -1,0 +1,11 @@
+// SC: logical value correctness preserved
+u32 main() {
+    bool a = true; bool b = false; bool c = true;
+    u32 r = 0;
+    if (a && c) { r += 1; }       // true
+    if (a && b) { r += 10; }      // false (skip)
+    if (b || c) { r += 100; }     // true
+    if (b || (b && a)) { r += 1000; } // false
+    if (r != 101) { return 1; }
+    return 0;
+}

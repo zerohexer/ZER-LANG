@@ -1,0 +1,14 @@
+// EXPECTED: compile error — complementary-guard free forgets the 2nd free (UAF)
+// audit 2026-07-06 F2: Level-B free_block singleton
+struct Node { u32 val; }
+Slab(Node) heap;
+bool getflag(u32 x) { if (x > 100) { return true; } return false; }
+u32 main() {
+    *Node p = heap.alloc_ptr() orelse return;
+    p.val = 111;
+    bool c = getflag(5);
+    if (c) { heap.free_ptr(p); }
+    if (!c) { heap.free_ptr(p); }
+    if (!c) { p.val = 999; }
+    return 0;
+}

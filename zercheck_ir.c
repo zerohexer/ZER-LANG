@@ -71,6 +71,17 @@ typedef struct {
      * through merges (sound: a genuine complementary coverage admits no
      * still-alive path). */
     int freed_all_paths;
+    /* Level B guard-multiplicity gate (audit 2026-07-06). `free_block` records
+     * only ONE free site; a handle freed under COMPLEMENTARY guards
+     * (`if(c){free} if(!c){free}`) forgets the second free, so a later use whose
+     * guard matched the second free was wrongly judged disjoint from the first
+     * (remembered) free and accepted — a real use-after-free / double-free. Set
+     * when a SECOND guard-disjoint free is accepted; once set, the disjoint-use
+     * relaxation is DISABLED for this handle (ir_use_guard_disjoint returns
+     * false), so any subsequent use/free re-errors. OR-carried through merges
+     * and set across the alias group. Sound: over-rejects only the exotic
+     * non-complementary multi-guard-free case (soundness-first). */
+    bool multi_freed;
     int alloc_id;          /* groups aliases — same alloc = same id */
     bool escaped;          /* returned, stored to global, etc. */
     /* bh18_1b (2026-07-01): this handle (or its alias group) tracks a
@@ -568,6 +579,13 @@ static IRGuardSet *ir_compute_block_guards(IRFunc *func) {
  * So a wrong/absent guard can only OVER-reject, never accept an unsafe use. */
 static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
     if (!h || h->state != IR_HS_MAYBE_FREED) return false;
+    /* Guard-multiplicity gate (audit 2026-07-06): once this handle has been
+     * freed under two distinct guards, `free_block` (a single site) can no
+     * longer represent every free, so disjointness against it is unsound —
+     * disable the relaxation (the handle is freed on ≥2 mutually-exclusive
+     * paths; recovering the rare still-safe path would need the full free-guard
+     * SET). Soundness-first: this only over-rejects. */
+    if (h->multi_freed) return false;
     if (!zc->gr_block_guards) return false;
     int fb = h->free_block;
     int ub = zc->gr_cur_block;
@@ -601,6 +619,20 @@ static bool ir_free_completes_coverage(ZerCheck *zc, IRHandleInfo *h) {
     if (bg[fb].count != 1 || bg[ub].count != 1) return false;
     return bg[fb].g[0].root == bg[ub].g[0].root &&
            bg[fb].g[0].pol  != bg[ub].g[0].pol;
+}
+
+/* audit 2026-07-06: mark a handle (and its whole alloc_id alias group) as
+ * freed under ≥2 distinct guards, which disables the disjoint-use relaxation
+ * (ir_use_guard_disjoint). Called at every free site that accepts a second
+ * guard-disjoint free. Alias-group loop mirrors ir_propagate_alias_state. */
+static void ir_mark_multi_freed(IRPathState *ps, IRHandleInfo *h) {
+    if (!h) return;
+    h->multi_freed = true;
+    int aid = h->alloc_id;
+    if (aid == 0) return;
+    for (int i = 0; i < ps->handle_count; i++)
+        if (ps->handles[i].alloc_id == aid)
+            ps->handles[i].multi_freed = true;
 }
 
 /* ================================================================
@@ -983,6 +1015,10 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle alive), so a pred without it cannot contribute an alive
              * path that this would wrongly mask. */
             if (ph->freed_all_paths) rh->freed_all_paths = 1;
+            /* audit 2026-07-06: OR-carry the guard-multiplicity flag so a use
+             * downstream of a two-guard free sees the relaxation disabled
+             * regardless of which predecessor path it arrives on. */
+            if (ph->multi_freed) rh->multi_freed = true;
             /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
              * MAYBE_FREED, keep it. Both same state → keep.
              * Both freed → keep freed. */
@@ -2665,6 +2701,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                      * double-free. If it is the exact complement, the handle is
                      * now freed on ALL paths (clears the leak check). */
                     if (ir_free_completes_coverage(zc, h)) h->freed_all_paths = 1;
+                    /* audit 2026-07-06: this handle now has TWO free sites under
+                     * distinct guards. free_block still points at the first; the
+                     * flag disables further disjoint relaxation so a use/free
+                     * matching the SECOND free can no longer slip through (was a
+                     * UAF/double-free). */
+                    ir_mark_multi_freed(ps, h);
                 } else {
                     ir_zc_error(zc, inst->source_line,
                         "freeing %%%d which may already be freed",
@@ -3831,6 +3873,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
                                     h->freed_all_paths = 1;
+                                ir_mark_multi_freed(ps, h);  /* audit 2026-07-06 */
                             } else {
                                 ir_zc_error(zc, inst->source_line,
                                     "freeing local %%%d which may already be freed",
@@ -4177,6 +4220,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
                                     h->freed_all_paths = 1;
+                                ir_mark_multi_freed(ps, h);  /* audit 2026-07-06 */
                             } else {
                                 ir_zc_error(zc, inst->source_line,
                                     "freeing local %%%d which may already be freed",

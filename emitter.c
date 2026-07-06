@@ -5733,6 +5733,34 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
  * DOES NOT CALL emit_expr. Each node type emitted directly.
  * For sub-expressions, calls itself recursively.
  * ================================================================ */
+/* Narrowing-cast prefix for a narrow-integer arithmetic result, or NULL.
+ * C integer promotion computes `a + b` (etc.) in `int`, so a narrow result
+ * (u8/i8/u16/i16) loses ZER's defined wrap unless cast back. emit_expr does
+ * this on the AST path (BUG-215); this mirrors it for emit_rewritten_node /
+ * IR_BINOP/IR_UNOP, where the result is emitted INLINE as a preserved
+ * sub-expression (array index, field/index write value, await/spawn arg) and
+ * never lands in a narrow temp that would truncate it (audit 2026-07-06,
+ * the AST->IR emission-diff class). Applies to +,-,*,&,|,^ (and unary ~,-);
+ * / and % can't exceed the operands' range so they don't need it. */
+static const char *ir_narrow_arith_cast(Emitter *e, Node *node, int op,
+                                         bool is_unary) {
+    if (is_unary) {
+        if (op != TOK_TILDE && op != TOK_MINUS) return NULL;
+    } else {
+        if (op != TOK_PLUS && op != TOK_MINUS && op != TOK_STAR &&
+            op != TOK_AMP && op != TOK_PIPE && op != TOK_CARET) return NULL;
+    }
+    Type *res = checker_get_type(e->checker, node);
+    if (!res) return NULL;
+    switch (type_dispatch_kind(res)) {
+    case TYPE_U8:  return "(uint8_t)";
+    case TYPE_I8:  return "(int8_t)";
+    case TYPE_U16: return "(uint16_t)";
+    case TYPE_I16: return "(int16_t)";
+    default: return NULL;
+    }
+}
+
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
@@ -5963,6 +5991,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  node->binary.op == TOK_SLASH ? "/" : "%", tmp);
             return;
         }
+        {
+            /* audit 2026-07-06: preserve narrow-int wrap on inline emission */
+            const char *ncast = ir_narrow_arith_cast(e, node, node->binary.op, false);
+            if (ncast) emit(e, "%s", ncast);
+        }
         emit(e, "(");
         emit_rewritten_node(e, node->binary.left, func);
         emit(e, " %s ", op);
@@ -5971,7 +6004,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         return;
     }
 
-    case NODE_UNARY:
+    case NODE_UNARY: {
+        /* audit 2026-07-06: narrow unary ~/- also promotes to int in C; cast
+         * the result back so `arr[~a]` (u8 a) wraps instead of using the huge
+         * promoted value (false OOB) or the wrong element. */
+        const char *ncast = ir_narrow_arith_cast(e, node, node->unary.op, true);
+        if (ncast) emit(e, "%s(", ncast);
         switch (node->unary.op) {
         case TOK_MINUS: emit(e, "-"); break;
         case TOK_BANG: emit(e, "!"); break;
@@ -5981,7 +6019,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         default: break;
         }
         emit_rewritten_node(e, node->unary.operand, func);
+        if (ncast) emit(e, ")");
         return;
+    }
 
     case NODE_FIELD: {
         /* Check object type for accessor: struct uses '.', pointer uses '->' */

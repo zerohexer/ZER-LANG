@@ -1,0 +1,6 @@
+// EXPECTED: compile error — ?*T field of a local struct stored to a global dangles
+// audit 2026-07-06 F4: type_can_carry_pointer omitted TYPE_OPTIONAL
+struct Box { *u32 q; ?*u32 p; }
+?*u32 gr = null;
+void leak() { u32 x = 5; Box s; s.q = &x; s.p = &x; gr = s.p; }
+u32 main() { leak(); return 0; }

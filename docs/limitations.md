@@ -60,13 +60,12 @@ against the built compiler) unless marked.
 
 ### 🟡 still open — miscompile / wrong-value / invalid-C
 
-- **F21 — value-optional field (`?u32`/`?bool`) in a struct designated initializer silently
-  drops the value.** `emitter.c` IR_STRUCT_INIT_DECOMP (~11007) + AST paths (2786, 9009).
-  `Cfg c = { .baud = 9600 }` emits `.baud = 9600` where `.baud` is `_zer_opt_u32`; C brace-
-  elision lands 9600 in `.value` and leaves `.has_value = 0`, so `c.baud orelse 0` returns 0.
-  Extremely idiomatic (CLAUDE.md's own `Config c = { .baud = 9600 }`). Fix: wrap a scalar
-  field value as `(_zer_opt_X){ <val>, 1 }` when the field's declared type is a non-sentinel
-  struct-optional and the value isn't already optional.
+- **F21 — value-optional field designated init — FIXED 2026-07-06** (see BUGS-FIXED.md). The
+  scalar-into-`?T`-field drop is fixed on all three struct-init emission paths via
+  `struct_init_opt_wrap_type`. **Residual (loud, separate):** a GLOBAL `Cfg G = { .baud = 9600
+  };` is REJECTED by the CHECKER ("cannot initialize 'G' of type 'Cfg' with 'void'") — a
+  distinct over-rejection of a valid global struct-init whose fields have optional types; the
+  emitter fix already covers it if the checker is relaxed. Not silent.
 - **F9 — IR-path bit extraction `reg[hi..lo]` uses 32-bit `1U << width` with no width guard →
   wrong value / UB on full-width extraction.** `emitter.c` (~8803) `emit_rewritten_node`
   NODE_SLICE. AST path uses `1ull` + width clamp; IR sibling does not. `v[31..0]` yields

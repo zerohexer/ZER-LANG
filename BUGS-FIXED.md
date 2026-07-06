@@ -5,13 +5,24 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## 2026-07-06 — Multi-agent audit: 7 fixes (4 🔴 soundness, 1 🔴 miscompile, 2 🟡)
+## 2026-07-06 — Multi-agent audit: 8 fixes (4 🔴 soundness, 1 🔴 miscompile, 3 🟡)
 
 A parallel multi-agent audit of the whole compiler surfaced a batch of confirmed holes.
-Seven were fixed this pass (the rest are logged in `docs/limitations.md` under the
+Eight were fixed this pass (the rest are logged in `docs/limitations.md` under the
 "2026-07-06 audit" entry). All fixes are TIGHTENING (reject-unsafe / correct a miscompile);
 none widen acceptance except the short-circuit lowering, which is a semantics correction.
 `make check` GREEN after the batch.
+
+**F21 🟡 value-optional (`?u32`/`?bool`) struct field in a designated initializer silently
+dropped the value.** `emitter.c` — all three struct-init emission paths (var-decl init
+`IR_STRUCT_INIT_DECOMP`, compound-literal assignment `emit_rewritten_node`, and the AST
+`emit_expr` path). `Cfg c = { .baud = 9600 }` emitted `.baud = 9600` where `.baud` is
+`_zer_opt_u32`; C brace-elision landed 9600 in `.value` and left `.has_value = 0`, so
+`c.baud orelse d` always returned `d` (silent wrong value on CLAUDE.md's own idiom). Fix:
+shared `struct_init_opt_wrap_type` helper wraps a scalar as `(_zer_opt_X){ val, 1 }` when the
+field is a non-sentinel struct-optional and the value isn't already optional (so `?*T`
+null-sentinel fields and already-optional values are untouched). Test:
+`tests/zer/optional_field_designated_init.zer`.
 
 **F1 🔴 `find_return_range` skipped `NODE_DO_WHILE` bodies → bounds check elided (silent OOB).**
 `checker.c` (~15493). The cross-function return-range scanner recursed into `for`/`while`

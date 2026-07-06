@@ -1,0 +1,18 @@
+// audit 2026-07-06 F21: a scalar in a value-optional (?u32/?bool) struct field
+// designated initializer was dropped (C brace-elision -> .has_value=0), so
+// `c.baud orelse d` always took the fallback (CLAUDE.md's `Cfg c = {.baud=9600}`).
+struct Cfg { ?u32 baud; ?bool flag; u32 id; }
+u32 main() {
+    // var-decl init
+    Cfg c = { .baud = 9600, .flag = true, .id = 1 };
+    if ((c.baud orelse 0) != 9600) { return 1; }
+    if ((c.flag orelse false) != true) { return 2; }
+    if (c.id != 1) { return 3; }
+    // compound-literal assignment
+    Cfg d;
+    d = { .baud = 55, .id = 2 };
+    if ((d.baud orelse 0) != 55) { return 4; }
+    // unmentioned optional field stays null
+    if (d.flag) |f| { return 5; }
+    return 0;
+}

@@ -1,19 +1,34 @@
 # Universal Allocation — Full Context Dump (`alloc` / `free`)
 
-**Status:** PHASES 1-2 SHIPPED (2026-07-07) — `alloc(T) -> ?*T`,
-`alloc(T, n) -> ?[*]T`, and `free(x)` are implemented, fully Model-1 tracked
-(UAF / double-free / leak, incl. through struct fields; escape works), and
-`make check` is GREEN (ZER 896/0). The `kv_table_create` shape (Appendix B)
-compiles + runs + escapes. STILL TODO: Phase 4 (the `[*]u8 -> [*]T` target-driven
-coercion — the un-lock for user-written custom allocators) and the migration
-that RETIRES `alloc_ptr`/`free_ptr` (they currently still work alongside `alloc`/
-`free` as the reuse target for `alloc(T)`/`free(*T)`). Implementation notes for
-what shipped are inline in §9.1 (marked ✅). This document was the durable design
-handoff; it cost a very long multi-turn session (many dead ends, three background
-design workflows, ~3M subagent tokens, and a dozen Docker verifications) to reach
-the design, then the phased build. Read §2 for the surface; read §3 before you
-propose ANY alternative — almost every "obvious" alternative was already tried
-and has a recorded compiler error proving it dead.
+**Status:** PHASES 1-2 + PRIMITIVE-ELEMENT SUPPORT SHIPPED (2026-07-07).
+Implemented and `make check` GREEN (ZER 898/0):
+- `alloc(T) -> ?*T` (struct only; desugars to `T.alloc_ptr()`),
+- `alloc(T, n) -> ?[*]T` for T = **any struct OR primitive** (`alloc(u32, n)`,
+  `alloc(u8, n)`, `alloc(Node, n)` — the parser accepts a primitive type keyword
+  as the first arg; the element type is resolved by name via
+  `alloc_resolve_elem_type`, never check_expr'd as a value),
+- `free(p:*T)` (desugars to `T.free_ptr`) and `free(s:[*]T)` (direct heap free).
+All fully Model-1 tracked (UAF / double-free / leak, incl. through struct-field
+compound keys; escape works). The `kv_table_create` shape (Appendix B) compiles +
+runs + escapes.
+
+STILL TODO: (a) the `[*]u8 -> [*]T` target-driven reinterpret coercion — the
+un-lock for user-written HETEROGENEOUS custom allocators (one byte region carved
+into mixed typed views). NOTE this is now *lower priority* because `alloc(T, n)`
+works for every element type directly, so a plain "dynamic array of X" needs no
+reinterpret; the coercion is only for hand-written bump/pool allocators. The
+BASELINE for it is favorable — same-type slice assignment already propagates
+`alloc_id` (verified: `[*]B b2 = b; free(b); b2[0]` is a caught UAF), so the
+reinterpret's UAF-through-view would come mostly free. (b) migration that RETIRES
+`alloc_ptr`/`free_ptr` (they still work alongside `alloc`/`free` as the reuse
+target for the `*T` cases).
+
+This document was the durable design handoff; it cost a very long multi-turn
+session (many dead ends, three background design workflows, ~3M subagent tokens,
+and many Docker verifications) to reach the design, then the phased build. Read
+§2 for the surface; read §3 before you propose ANY alternative — almost every
+"obvious" alternative was already tried and has a recorded compiler error proving
+it dead.
 
 **Date started:** 2026-07-06
 **Owner framing (verbatim intent, preserved):** "find like the most universal

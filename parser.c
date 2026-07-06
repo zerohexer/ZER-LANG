@@ -1009,7 +1009,22 @@ static Node *parse_postfix(Parser *p, Node *left) {
                         args = new_args;
                         arg_cap = new_cap;
                     }
-                    args[arg_count++] = parse_expression(p);
+                    /* alloc(PRIM, n): the first arg may be a primitive type
+                     * keyword (u8/u32/.../bool). Synthesize an ident carrying its
+                     * spelling so alloc works over ALL element types, not just
+                     * struct names. See docs/universal_alloc.md. */
+                    if (arg_count == 0 && left->kind == NODE_IDENT &&
+                        left->ident.name_len == 5 &&
+                        memcmp(left->ident.name, "alloc", 5) == 0 &&
+                        p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL) {
+                        Node *tn = new_node(p, NODE_IDENT);
+                        tn->ident.name = p->current.start;
+                        tn->ident.name_len = p->current.length;
+                        advance(p);
+                        args[arg_count++] = tn;
+                    } else {
+                        args[arg_count++] = parse_expression(p);
+                    }
                 } while (match(p, TOK_COMMA));
             }
             consume(p, TOK_RPAREN, "expected ')' after arguments");

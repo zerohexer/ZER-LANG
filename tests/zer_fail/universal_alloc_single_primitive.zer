@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// Universal alloc: alloc(T) allocates ONE object and needs a struct type (the
+// auto-slab is per struct). A single primitive has no auto-slab — use
+// alloc(T, n) for a primitive array. docs/universal_alloc.md.
+u32 main() {
+    [*]u8 x = alloc(u8) orelse return;
+    return 0;
+}

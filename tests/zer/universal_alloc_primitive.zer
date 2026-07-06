@@ -1,0 +1,23 @@
+// Universal alloc — primitive element types: alloc(u32, n) / alloc(u8, n) give
+// [*]u32 / [*]u8 directly (no struct wrapper). alloc is complete over ALL element
+// types, not just struct names. docs/universal_alloc.md.
+i32 printf(const *u8 fmt, ...);
+
+u32 main() {
+    [*]u32 xs = alloc(u32, 4) orelse return;
+    xs[0] = 10; xs[1] = 20; xs[2] = 30; xs[3] = 40;
+    u32 sum = 0;
+    for (u32 i = 0; i < 4; i += 1) { sum += xs[i]; }
+    if (sum != 100) { free(xs); return 1; }
+    if (xs.len != 4) { free(xs); return 2; }
+
+    [*]u8 buf = alloc(u8, 16) orelse { free(xs); return 3; };
+    if (buf[0] != 0) { free(buf); free(xs); return 4; }   // calloc zeroes
+    buf[3] = 255;
+    if (buf.len != 16) { free(buf); free(xs); return 5; }
+
+    free(buf);
+    free(xs);
+    printf("universal_alloc_primitive: ok sum=%d\n", sum);
+    return 0;
+}

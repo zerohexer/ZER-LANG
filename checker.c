@@ -1616,6 +1616,38 @@ static Symbol *find_or_create_auto_slab(Checker *c, Type *struct_type) {
     return auto_sym;
 }
 
+/* Resolve the element type of a universal alloc(T, ...) from its name: a
+ * primitive keyword (u8/u16/.../bool) OR a named struct/enum/union. Returns NULL
+ * if unknown. This is what lets alloc() work over ALL element types, not just
+ * struct names. See docs/universal_alloc.md. */
+static Type *alloc_resolve_elem_type(Checker *c, const char *name, uint32_t len) {
+    switch (len) {
+        case 2:
+            if (memcmp(name, "u8", 2) == 0) return ty_u8;
+            if (memcmp(name, "i8", 2) == 0) return ty_i8;
+            break;
+        case 3:
+            if (memcmp(name, "u16", 3) == 0) return ty_u16;
+            if (memcmp(name, "u32", 3) == 0) return ty_u32;
+            if (memcmp(name, "u64", 3) == 0) return ty_u64;
+            if (memcmp(name, "i16", 3) == 0) return ty_i16;
+            if (memcmp(name, "i32", 3) == 0) return ty_i32;
+            if (memcmp(name, "i64", 3) == 0) return ty_i64;
+            if (memcmp(name, "f32", 3) == 0) return ty_f32;
+            if (memcmp(name, "f64", 3) == 0) return ty_f64;
+            break;
+        case 4:
+            if (memcmp(name, "bool", 4) == 0) return ty_bool;
+            break;
+        case 5:
+            if (memcmp(name, "usize", 5) == 0) return ty_usize;
+            break;
+    }
+    Symbol *s = scope_lookup(c->current_scope, name, len);
+    if (s && s->type) return s->type;
+    return NULL;
+}
+
 /* ---- Volatile stripping check helper ---- */
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
@@ -4981,6 +5013,55 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Function call ---- */
     case NODE_CALL: {
+        /* ===== Universal alloc — handled BEFORE the generic arg loop, because
+         * alloc's type-name arg (which may be a primitive keyword like u8) must
+         * NOT be check_expr'd as a value.
+         *   alloc(T)    -> ?*T    (struct only; desugars to T.alloc_ptr())
+         *   alloc(T, n) -> ?[*]T  (T is any struct OR primitive; heap slice)
+         * Full context + phased plan: docs/universal_alloc.md. */
+        if (node->call.callee->kind == NODE_IDENT &&
+            node->call.callee->ident.name_len == 5 &&
+            memcmp(node->call.callee->ident.name, "alloc", 5) == 0 &&
+            (node->call.arg_count == 1 || node->call.arg_count == 2) &&
+            node->call.args[0]->kind == NODE_IDENT) {
+            Node *type_arg = node->call.args[0];
+            Type *elem = alloc_resolve_elem_type(c, type_arg->ident.name,
+                (uint32_t)type_arg->ident.name_len);
+            if (elem) {
+                if (node->call.arg_count == 1) {
+                    if (type_dispatch_kind(elem) == TYPE_STRUCT) {
+                        /* alloc(T) -> T.alloc_ptr(); drop type arg, fall through */
+                        node->call.callee->kind = NODE_FIELD;
+                        node->call.callee->field.object = type_arg;
+                        node->call.callee->field.field_name = "alloc_ptr";
+                        node->call.callee->field.field_name_len = 9;
+                        node->call.args = NULL;
+                        node->call.arg_count = 0;
+                        /* fall through — field-method dispatch handles it */
+                    } else {
+                        checker_error(c, node->loc.line,
+                            "alloc(T) allocates ONE object and needs a struct type; "
+                            "use alloc(T, n) for an array of a primitive");
+                        result = ty_void;
+                        break;
+                    }
+                } else {
+                    /* alloc(T, n) -> ?[*]T. Check ONLY the count (arg 1); the type
+                     * arg (arg 0) is resolved by name, never as a value. */
+                    Type *nt = check_expr(c, node->call.args[1]);
+                    if (nt && type_is_integer(nt)) {
+                        result = type_optional(c->arena, type_slice(c->arena, elem));
+                    } else {
+                        checker_error(c, node->loc.line,
+                            "alloc(T, n): allocation count must be an integer");
+                        result = ty_void;
+                    }
+                    break;  /* common tail sets node's type from result */
+                }
+            }
+            /* elem == NULL: fall through to normal resolution (undefined 'alloc') */
+        }
+
         /* check args first */
         Type **arg_types = NULL;
         if (node->call.arg_count > 0) {
@@ -4991,50 +5072,11 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* ===== Universal alloc/free — ONE brainless allocation surface =====
-         *   alloc(T)     -> ?*T    (Phase 1: desugars to T.alloc_ptr(), reusing
-         *                           the auto-slab machinery verbatim)
-         *   alloc(T, n)  -> ?[*]T  (Phase 2: runtime-sized escaping heap slice,
-         *                           handled DIRECTLY — no T.alloc_slice method;
-         *                           the emitter recovers T from the result type)
-         *   free(p:*T)   -> void   (desugars to T.free_ptr(p))
-         *   free(s:[*]T) -> void   (frees the heap slice directly)
-         * Retires alloc_ptr/free_ptr as the default surface. Full context +
-         * multi-phase plan: docs/universal_alloc.md. */
+        /* Universal free — free(p:*T) -> T.free_ptr(p) / free(s:[*]T) -> direct
+         * heap-slice free. (alloc is handled BEFORE the arg loop, above, so its
+         * type-name arg — possibly a primitive keyword — is never check_expr'd as
+         * a value.) See docs/universal_alloc.md. */
         if (node->call.callee->kind == NODE_IDENT &&
-            node->call.callee->ident.name_len == 5 &&
-            memcmp(node->call.callee->ident.name, "alloc", 5) == 0 &&
-            (node->call.arg_count == 1 || node->call.arg_count == 2) &&
-            node->call.args[0]->kind == NODE_IDENT) {
-            Node *type_arg = node->call.args[0];
-            Symbol *tsym = scope_lookup(c->current_scope,
-                type_arg->ident.name, (uint32_t)type_arg->ident.name_len);
-            if (tsym && tsym->type &&
-                type_dispatch_kind(tsym->type) == TYPE_STRUCT) {
-                if (node->call.arg_count == 1) {
-                    /* alloc(T) -> T.alloc_ptr(); drop the type arg, fall through */
-                    node->call.callee->kind = NODE_FIELD;
-                    node->call.callee->field.object = type_arg;
-                    node->call.callee->field.field_name = "alloc_ptr";
-                    node->call.callee->field.field_name_len = 9;
-                    node->call.args = NULL;
-                    node->call.arg_count = 0;
-                    /* fall through — field-method dispatch handles it */
-                } else {
-                    /* alloc(T, n) -> ?[*]T, handled directly (keep the type arg;
-                     * the emitter reads T from this result type). */
-                    if (arg_types && arg_types[1] && type_is_integer(arg_types[1])) {
-                        result = type_optional(c->arena,
-                            type_slice(c->arena, tsym->type));
-                    } else {
-                        checker_error(c, node->loc.line,
-                            "alloc(T, n): allocation count must be an integer");
-                        result = ty_void;
-                    }
-                    break;  /* common tail sets node's type from result */
-                }
-            }
-        } else if (node->call.callee->kind == NODE_IDENT &&
                    node->call.callee->ident.name_len == 4 &&
                    memcmp(node->call.callee->ident.name, "free", 4) == 0 &&
                    node->call.arg_count == 1 && arg_types) {

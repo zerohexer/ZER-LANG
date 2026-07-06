@@ -6639,26 +6639,27 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             uint32_t cl2 = (uint32_t)node->call.callee->ident.name_len;
             if (cl2 == 5 && memcmp(cn2, "alloc", 5) == 0 &&
                 node->call.arg_count == 2 &&
-                node->call.args[0]->kind == NODE_IDENT) {
-                Symbol *ts = scope_lookup(e->checker->global_scope,
-                    node->call.args[0]->ident.name,
-                    (uint32_t)node->call.args[0]->ident.name_len);
-                if (ts && ts->type) {
-                    Type *st = type_unwrap_distinct(ts->type);
-                    Type *slice_t = type_slice(e->arena, ts->type);
-                    Type *opt_t = type_optional(e->arena, slice_t);
+                checker_get_type(e->checker, node) &&
+                type_dispatch_kind(checker_get_type(e->checker, node)) == TYPE_OPTIONAL) {
+                /* element type recovered from the result type ?[*]T — works for
+                 * struct AND primitive element types uniformly. */
+                Type *rt = checker_get_type(e->checker, node);       /* ?[*]T */
+                Type *sl = type_unwrap_distinct(rt)->optional.inner;  /* [*]T  */
+                if (sl && type_dispatch_kind(sl) == TYPE_SLICE) {
+                    Type *elem = type_unwrap_distinct(sl)->slice.inner; /* T */
+                    Type *ee = type_unwrap_distinct(elem);
                     int t = e->temp_count++;
                     emit(e, "({size_t _zer_hn%d=", t);
                     emit_rewritten_node(e, node->call.args[1], func);
                     emit(e, ";void *_zer_hp%d=calloc(_zer_hn%d,sizeof(", t, t);
-                    if (type_dispatch_kind(ts->type) == TYPE_STRUCT)
-                        emit(e, "struct %.*s", (int)st->struct_type.name_len, st->struct_type.name);
-                    else emit_type(e, ts->type);
+                    if (type_dispatch_kind(elem) == TYPE_STRUCT)
+                        emit(e, "struct %.*s", (int)ee->struct_type.name_len, ee->struct_type.name);
+                    else emit_type(e, elem);
                     emit(e, "));_zer_hp%d?(", t);
-                    emit_type(e, opt_t); emit(e, "){("); emit_type(e, slice_t); emit(e, "){(");
-                    emit_type(e, type_pointer(e->arena, ts->type));
+                    emit_type(e, rt); emit(e, "){("); emit_type(e, sl); emit(e, "){(");
+                    emit_type(e, type_pointer(e->arena, elem));
                     emit(e, ")_zer_hp%d,_zer_hn%d},1}:(", t, t);
-                    emit_type(e, opt_t); emit(e, "){0};})");
+                    emit_type(e, rt); emit(e, "){0};})");
                     return;
                 }
             }

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// free(slice) emits free() directly — holds the libc heap lock, same deadlock
+// hazard as slab.free / Task.free_ptr inside @critical. The universal slice-free
+// path is handled directly (never desugars to a banned method), so it needs its
+// own check_isr_ban.
+void main() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    @critical {
+        free(s);
+    }
+}

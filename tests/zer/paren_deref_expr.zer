@@ -1,0 +1,31 @@
+// Regression: `(*p & mask)` — a parenthesized deref-expression — must parse.
+// The cast lookahead used to commit to a pointer cast `(*T)` on seeing `(*`,
+// then fail at `&` ("expected ')' after cast type"). This broke the canonical
+// MMIO poll idiom `while ((*REG & BIT) != 0)` and 6/8 firmware examples. Fixed
+// by backtracking: `(*...)` commits to a cast only if `)` immediately follows
+// the type; otherwise it's a parenthesized expression. `(*T)cast` still works.
+
+struct Motor { u32 rpm; }
+
+u32 read_masked(*u32 p) {
+    return (*p & 1);                 // parenthesized deref, NOT a cast
+}
+
+u32 use_cast(*opaque ctx) {
+    *Motor m = (*Motor)ctx;          // real pointer cast — must still work
+    return m.rpm;
+}
+
+u32 main() {
+    u32 status = 0x21;
+    u32 spins = 0;
+    while ((*(&status) & 0x20) != 0) {   // MMIO-style poll idiom over real memory
+        spins += 1;
+        status = 0x01;                    // clear the polled bit
+        if (spins > 3) { return 1; }
+    }
+    u32 x = 3;
+    if (read_masked(&x) != 1) { return 2; }
+    if (spins != 1) { return 4; }
+    return 0;
+}

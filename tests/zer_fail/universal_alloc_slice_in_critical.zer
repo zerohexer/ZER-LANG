@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// alloc(T, n) emits calloc directly — the same libc-heap-lock deadlock hazard
+// that bans slab.alloc / Task.alloc_ptr inside @critical. The universal alloc
+// slice path is handled directly (never desugars to a banned method), so it
+// needs its own check_isr_ban. Sibling of alloc_in_critical.zer.
+?[*]u32 g;
+void main() {
+    @critical {
+        g = alloc(u32, 4);
+    }
+}

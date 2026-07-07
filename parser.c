@@ -878,13 +878,44 @@ static Node *parse_primary(Parser *p) {
         }
 
         if (is_cast) {
-            TypeNode *cast_type = parse_type(p);
-            consume(p, TOK_RPAREN, "expected ')' after cast type");
-            Node *expr = parse_unary(p);
-            Node *n = new_node(p, NODE_TYPECAST);
-            n->typecast.target_type = cast_type;
-            n->typecast.expr = expr;
-            return n;
+            /* `(*...)` is AMBIGUOUS: a pointer cast `(*T)operand` vs a
+             * parenthesized deref-expression `(*p & 1)` / `(*p)`. The other
+             * cast-starts (keyword type, `?`, `const`, `volatile`) cannot begin
+             * an expression, so they stay unambiguous. For `*`, tentatively
+             * parse the type and commit to a cast ONLY if a ')' immediately
+             * follows; otherwise backtrack and parse a parenthesized expression.
+             * Behavior is IDENTICAL to the old eager path whenever ')' does
+             * follow the type — this only rescues the `)`-does-not-follow case
+             * (`(*p & 1)`, the MMIO poll idiom) that used to be a parse error. */
+            if (p->current.type == TOK_STAR) {
+                Scanner saved = *p->scanner;
+                Token saved_cur = p->current;
+                Token saved_prev = p->previous;
+                bool saved_err = p->had_error;
+                bool saved_panic = p->panic_mode;
+                TypeNode *cast_type = parse_type(p);
+                if (!p->oom && !p->had_error && match(p, TOK_RPAREN)) {
+                    Node *expr = parse_unary(p);
+                    Node *n = new_node(p, NODE_TYPECAST);
+                    n->typecast.target_type = cast_type;
+                    n->typecast.expr = expr;
+                    return n;
+                }
+                /* Not a cast — restore scanner state and fall through. */
+                *p->scanner = saved;
+                p->current = saved_cur;
+                p->previous = saved_prev;
+                p->had_error = saved_err;
+                p->panic_mode = saved_panic;
+            } else {
+                TypeNode *cast_type = parse_type(p);
+                consume(p, TOK_RPAREN, "expected ')' after cast type");
+                Node *expr = parse_unary(p);
+                Node *n = new_node(p, NODE_TYPECAST);
+                n->typecast.target_type = cast_type;
+                n->typecast.expr = expr;
+                return n;
+            }
         }
 
         Node *n = parse_expression(p);

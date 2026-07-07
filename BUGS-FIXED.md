@@ -5,6 +5,68 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-07 — Full-codebase audit: 6 fixes (2 accept-unsafe UAF, deadlock-class, baremetal-silent free, parser regression, compiler crash)
+
+Multi-agent adversarial audit of the whole compiler (universal-alloc + pointer-return
+relaxation, zercheck_ir CFG lattice, emitter dual-path, concurrency walkers, baremetal/
+freestanding, oracle↔impl fidelity). Six confirmed bugs fixed; the remaining verified
+findings are logged in `docs/limitations.md` "## OPEN — 2026-07-07 audit". `make check`
+GREEN (ZER 909/0, +8 tripwires).
+
+**1. 🔴 accept-unsafe — reassignment `p = &local[i]` / `p = &local.f` escaped the frame.**
+The var-decl escape walker walks the field/index chain of an address-of to its root and
+applies the pointer-into-nonlocal-ref relaxation; the ASSIGNMENT path matched only a bare
+`&local` (`NODE_IDENT` operand) and skipped the chain, so `*T p = &local[0]; p = &local[1];
+return p;` (and the global-store sink) shipped a dangling stack pointer (only a non-fatal
+`-Wreturn-local-addr`, absent on many targets). FIX: extracted `addr_of_is_local_derived`
+(checker.c) — the single walk-to-root + relaxation used by BOTH the var-decl and assignment
+sinks (direct `&` and orelse-fallback `&`), so they can't diverge again. Param/heap roots
+stay escapable (relaxation preserved). Tests `tests/zer_fail/reassign_addr_local_{index_return,
+field_global}.zer`.
+
+**2. 🔴 accept-unsafe — Level-B guard copy-chain defeated the immutability gate (silent UAF +
+double-free).** `ir_resolve_cond_root` (zercheck_ir.c) traces a branch condition through
+`IR_COPY`/`IR_UNOP(!)` to a root bool, then checks immutability of the ROOT only. A reassigned
+intermediate copy — `bool c2 = c; if(c){free} c2 = e; if(!c2){use}` — hides in an expr-form
+`IR_ASSIGN` (dest_local == −1) invisible to the def-count, so the guard disjointness
+"free under (c,+), use under (c,−)" was a lie and the UAF+double-free compiled clean. FIX:
+gate each COPY/UNOP hop on `ir_local_is_immutable_bool(cur)`; a mutated intermediate stops the
+trace, so `ir_edge_label` re-checks and rejects. Valid disjoint guards still compile. Test
+`tests/zer_fail/guarded_cond_copychain_reassigned.zer`.
+
+**3. 🟡 deadlock-class — universal `alloc(T, n)` / `free(slice)` not banned in ISR/@critical.**
+`slab.alloc`/`Task.alloc_ptr`/`slab.free_ptr` route through `check_isr_ban` (calloc/free hold
+the libc heap lock → deadlock with IRQs off), but the universal slice paths are handled
+directly (never desugar to a banned method) and emitted `calloc`/`free` inside a `cpsid i`
+`@critical` block undetected. FIX: `check_isr_ban` at both direct paths (checker.c). Tests
+`tests/zer_fail/universal_{alloc_slice_in_critical,free_slice_in_critical,alloc_slice_in_isr}.zer`.
+
+**4. 🟡 baremetal-silent — `free()` of provably frame-local memory not rejected.**
+`free(&local)` / `free(local_array_slice)` / `free(local[a..b])` free stack memory (always UB;
+silent on baremetal, only a non-fatal `-Wfree-nonheap-object` on hosted GCC). FIX: reject when
+the free arg is provably `arg_is_local_derived` (checker.c) — a sound zero-false-positive
+tightening (unknown/heap/param provenance still allowed, matching the escape-sink policy).
+
+**5. 🟡 parser regression — `(*p & mask)` misparsed as a cast `(*T)`.** The cast lookahead
+committed to a pointer cast on seeing `(*`, then failed at the binary op ("expected ')' after
+cast type"). This broke the canonical MMIO poll idiom `while ((*REG & BIT) != 0)` and 6/8
+firmware examples. FIX (parser.c): `(*...)` now tentatively parses the type and commits to a
+cast only if `)` immediately follows; otherwise it backtracks to a parenthesized expression.
+Behavior is identical to the old eager path whenever `)` follows the type — only the
+`)`-does-not-follow case is rescued. `(*Motor)ctx` cast preserved. Test
+`tests/zer/paren_deref_expr.zer`.
+
+**6. 🔴 compiler crash — auto-guard + pending `defer` aborted the compiler.** An unproven
+array index in a function with a live `defer` (`defer free(x); arr[i]=…`, extremely common)
+hit the auto-guard early-return → `emit_defers` → the dead AST `emit_defers_from` stub, which
+`abort()`ed ("emit_defers_from reached with N pending defers"). FIX (emitter): store the
+current IRFunc on the emitter (`cur_ir_func`); `emit_defers_from` now fires the pending IR
+defer bodies (LIFO, no pop) via `emit_defer_stmt` instead of aborting. The guard early-exit
+and the normal exit are mutually exclusive, so the defer fires exactly once. Test
+`tests/zer/defer_autoguard_earlyexit.zer`.
+
+---
+
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
 
 🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed

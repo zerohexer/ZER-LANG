@@ -307,6 +307,8 @@ static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
  * rooted at one local (e.g. a comparison or call result is its own root — only
  * usable if ir_local_is_immutable_bool accepts it; `&&`/`||`/multi-def stop the
  * trace). Step-capped; no behavior change on its own. */
+static bool ir_local_is_immutable_bool(IRFunc *func, int local);
+
 static int ir_resolve_cond_root(IRFunc *func, int cond_local, bool *polarity) {
     bool pol = true;
     int cur = cond_local;
@@ -325,6 +327,19 @@ static int ir_resolve_cond_root(IRFunc *func, int cond_local, bool *polarity) {
             }
         }
         if (def_count != 1 || !def) break;
+        /* Trace THROUGH `cur` (assume it equals its copy/negation source at the
+         * branch) ONLY if `cur` is itself STABLE — never reassigned or
+         * address-taken. A reassignment of an intermediate copy variable hides
+         * in an expr-form IR_ASSIGN (dest_local == -1) that the def-count above
+         * cannot see, so `bool c2 = c; … c2 = e; if(!c2){…}` would trace c2→c
+         * and check only c's immutability — a silent UAF (the exact
+         * IR-invisibility class ir_local_is_immutable_bool closes, here on the
+         * INTERMEDIATE, not just the final root). If `cur` is mutated, stop:
+         * `cur` becomes the root and ir_edge_label re-checks + rejects it. */
+        if (((def->op == IR_UNOP && def->op_token == TOK_BANG) ||
+             def->op == IR_COPY) && def->src1_local >= 0) {
+            if (!ir_local_is_immutable_bool(func, cur)) break;
+        }
         if (def->op == IR_UNOP && def->op_token == TOK_BANG && def->src1_local >= 0) {
             pol = !pol;
             cur = def->src1_local;

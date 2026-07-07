@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Reassignment `p = &local[i]` (index operand) must re-mark p local-derived so
+// the subsequent return is rejected. The assignment-path escape walker used to
+// match only a bare `&local` (NODE_IDENT operand) and skipped the field/index
+// chain the var-decl path already walked — a shipped return-UAF. Fixed by the
+// shared addr_of_is_local_derived helper.
+struct T { u32 v; }
+*T f() {
+    T[8] local;
+    *T p = &local[0];
+    p = &local[1];
+    return p;               // dangling — local is stack memory
+}
+u32 main() { return 0; }

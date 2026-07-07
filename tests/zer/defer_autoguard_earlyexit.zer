@@ -1,0 +1,24 @@
+// Regression: an auto-guarded (unproven) array index in a function that also
+// has a live `defer` used to ABORT the compiler ("emit_defers_from reached with
+// N pending defers ...") because the guard's early-return called the dead AST
+// emit_defers stub. The `defer free(x); arr[i]=…` idiom is extremely common.
+// Fixed: emit_defers_from now fires the pending IR defer bodies (via the
+// emitter's cur_ir_func) instead of aborting. The guard's early-exit path and
+// the normal-exit path are mutually exclusive, so the defer fires exactly once.
+struct Buf { u32 x; }
+Slab(Buf) heap;
+u32[4] g_arr;
+
+u32 f(u32 i) {
+    *Buf b = heap.alloc_ptr() orelse { return 9; };
+    defer heap.free_ptr(b);          // must fire on BOTH the guard and normal exit
+    b.x = 7;
+    g_arr[i] = b.x;                  // unproven i → auto-guard early-return
+    return g_arr[i];
+}
+
+u32 main() {
+    if (f(2) != 7) { return 1; }    // in range
+    if (f(9) != 0) { return 2; }    // OOB → guard returns 0, defer frees b
+    return 0;
+}

@@ -97,6 +97,15 @@ typedef struct {
     void (*ir_hook)(void *ctx, void *ir_func);
     void *ir_hook_ctx;
 
+    /* The IRFunc whose body is currently being emitted (actually IRFunc*, typed
+     * void* to keep ir.h out of emitter.h). Set at emit_regular/async_func_from_ir
+     * entry, cleared at exit. Lets a mid-body conditional early-exit (auto-guard
+     * bounds return, @cstr overflow return) FIRE the pending IR defer bodies
+     * (which live on defer_stack, keyed to this func's locals) instead of
+     * aborting — the AST-path emit_defers stub used to abort() whenever any
+     * defer was pending. NULL on the AST/global-init path (which has no defers). */
+    void *cur_ir_func;
+
 } Emitter;
 
 /* ---- API ---- */

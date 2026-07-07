@@ -1412,6 +1412,37 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_keep_derived) dst->is_keep_derived = true;
 }
 
+/* Given the operand of a `&` (address-of), decide whether the resulting
+ * pointer is LOCAL-DERIVED (points into THIS frame). Walks the field/index
+ * chain to the root ident, then applies the pointer-into-nonlocal-ref
+ * RELAXATION (see checker.c var-decl escape path): `&r[i]` / `&r.f` where r is
+ * a NON-local-derived slice/pointer points into r's POINTEE (the caller's or
+ * heap memory), not this frame, so it may escape. Still local for
+ * `&local_array[i]`, `&local` scalar/struct, and `&local-derived-slice[i]`.
+ *
+ * SHARED by the var-decl and the assignment escape sinks so they cannot
+ * diverge — the assignment path missing this field/index walk (it matched only
+ * a bare `&local` NODE_IDENT operand) was a shipped return/global UAF:
+ * `*T p = &local[0]; p = &local[1]; return p;` escaped undetected. */
+static bool addr_of_is_local_derived(Checker *c, Node *operand) {
+    Node *root = operand;
+    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+        if (root->kind == NODE_FIELD) root = root->field.object;
+        else root = root->index_expr.object;
+    }
+    if (!root || root->kind != NODE_IDENT) return false;
+    bool is_global = scope_lookup_local(c->global_scope,
+        root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+    Symbol *src = scope_lookup(c->current_scope,
+        root->ident.name, (uint32_t)root->ident.name_len);
+    if (!src || src->is_static || is_global) return false;
+    bool root_is_ref = src->type &&
+        (type_dispatch_kind(src->type) == TYPE_SLICE ||
+         type_dispatch_kind(src->type) == TYPE_POINTER);
+    if (root_is_ref && !src->is_local_derived) return false;
+    return true;
+}
+
 /* Recursively scan an expression for any identifier that refers to a
  * local-derived Symbol (i.e., a value originally obtained via
  * @ptrtoint(&local), or transitively through arithmetic / casts /
@@ -4109,16 +4140,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* BUG-314: walk into orelse — check both expr and fallback */
                         if (vcheck->kind == NODE_ORELSE) {
                             Node *fb = vcheck->orelse.fallback;
+                            /* &local / &local[i] / &local.f fallback — walk the
+                             * field/index chain (addr_of_is_local_derived), same as
+                             * the direct case, so `p = opt orelse &local[i]` is
+                             * caught (the old NODE_IDENT-only match missed it). */
                             if (fb && fb->kind == NODE_UNARY &&
                                 fb->unary.op == TOK_AMP &&
-                                fb->unary.operand->kind == NODE_IDENT) {
-                                Symbol *src = scope_lookup(c->current_scope,
-                                    fb->unary.operand->ident.name,
-                                    (uint32_t)fb->unary.operand->ident.name_len);
-                                bool src_is_global = src && scope_lookup_local(c->global_scope,
-                                    src->name, src->name_len) != NULL;
-                                if (src && !src->is_static && !src_is_global)
-                                    tsym->is_local_derived = true;
+                                addr_of_is_local_derived(c, fb->unary.operand)) {
+                                tsym->is_local_derived = true;
                             }
                             if (fb && fb->kind == NODE_IDENT) {
                                 Symbol *src = scope_lookup(c->current_scope,
@@ -4127,16 +4156,17 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                             vcheck = vcheck->orelse.expr;
                         }
+                        /* &local / &local[i] / &local.f — walk the field/index
+                         * chain to the root (addr_of_is_local_derived). Matching
+                         * only a bare `&local` NODE_IDENT operand here (as the code
+                         * previously did) left `p = &local[i]` / `p = &local.f`
+                         * un-flagged → the dangling pointer escaped via
+                         * return/global (shipped UAF). Shared with the var-decl
+                         * path via the helper so they can't diverge again. */
                         if (vcheck->kind == NODE_UNARY &&
                             vcheck->unary.op == TOK_AMP &&
-                            vcheck->unary.operand->kind == NODE_IDENT) {
-                            Symbol *src = scope_lookup(c->current_scope,
-                                vcheck->unary.operand->ident.name,
-                                (uint32_t)vcheck->unary.operand->ident.name_len);
-                            bool src_is_global = src && scope_lookup_local(c->global_scope,
-                                src->name, src->name_len) != NULL;
-                            if (src && !src->is_static && !src_is_global)
-                                tsym->is_local_derived = true;
+                            addr_of_is_local_derived(c, vcheck->unary.operand)) {
+                            tsym->is_local_derived = true;
                         }
                     }
                     /* check if new value is an alias of local/arena-derived */
@@ -5056,6 +5086,11 @@ static Type *check_expr(Checker *c, Node *node) {
                             "alloc(T, n): allocation count must be an integer");
                         result = ty_void;
                     }
+                    /* alloc(T, n) emits calloc directly — same libc-heap-lock
+                     * deadlock hazard as slab.alloc / Task.alloc_ptr, which route
+                     * through check_isr_ban. The direct path never desugared to a
+                     * banned method, so ban it here too (ISR + @critical). */
+                    check_isr_ban(c, node->loc.line, "alloc(T, n)");
                     break;  /* common tail sets node's type from result */
                 }
             }
@@ -5082,6 +5117,21 @@ static Type *check_expr(Checker *c, Node *node) {
                    node->call.arg_count == 1 && arg_types) {
             Type *ae = arg_types[0] ? type_unwrap_distinct(arg_types[0]) : NULL;
             TypeKind aek = arg_types[0] ? type_dispatch_kind(arg_types[0]) : TYPE_VOID;
+            /* free() on PROVABLY frame-local memory (`free(&local)`,
+             * `free(local_array_slice)`, `free(local[a..b])`) is always UB —
+             * stack memory is never heap-allocated, so free() corrupts the heap
+             * (silent on baremetal; only a non-fatal -Wfree-nonheap-object on
+             * hosted GCC). Reject it here (both the *T and slice free surfaces).
+             * Conservative: only a PROVABLY-local root is rejected; unknown/
+             * heap/param provenance is allowed (matches the escape-sink policy).*/
+            if ((aek == TYPE_POINTER || aek == TYPE_SLICE) &&
+                arg_is_local_derived(c, node->call.args[0], 0)) {
+                checker_error(c, node->loc.line,
+                    "cannot free() frame-local memory — it is not heap-allocated; "
+                    "free() only accepts a pointer/slice returned by alloc(...)");
+                result = ty_void;
+                break;
+            }
             if (ae && aek == TYPE_POINTER &&
                 type_dispatch_kind(ae->pointer.inner) == TYPE_STRUCT) {
                 /* free(p:*T) -> T.free_ptr(p) (reuses free_ptr machinery) */
@@ -5099,6 +5149,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* args unchanged [p]; fall through to field dispatch */
             } else if (ae && aek == TYPE_SLICE) {
                 /* free(s:[*]T) -> direct heap-slice free (handled in emitter) */
+                /* free() holds the libc heap lock — same deadlock hazard as
+                 * slab.free / Task.free_ptr (which route through check_isr_ban).
+                 * The direct slice-free path never desugared to a banned method,
+                 * so ban it here too (ISR + @critical). */
+                check_isr_ban(c, node->loc.line, "free(slice)");
                 result = ty_void;
                 break;
             }
@@ -10245,34 +10300,13 @@ static void check_stmt(Checker *c, Node *node) {
                             addr_exprs[addr_count++] = fb;
                     }
                     for (int ai = 0; ai < addr_count; ai++) {
-                        Node *root = addr_exprs[ai]->unary.operand;
-                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                            if (root->kind == NODE_FIELD) root = root->field.object;
-                            else root = root->index_expr.object;
-                        }
-                        if (root && root->kind == NODE_IDENT) {
-                            bool is_global = scope_lookup_local(c->global_scope,
-                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
-                            Symbol *src = scope_lookup(c->current_scope,
-                                root->ident.name, (uint32_t)root->ident.name_len);
-                            /* RELAXATION (pointer-into-nonlocal-ref): `p = &r[i]`
-                             * or `p = &r.f` where r is a slice/pointer that is NOT
-                             * local-derived (a PARAM or a HEAP allocation) points
-                             * into r's POINTEE — the caller's or heap memory, not
-                             * this frame — so p is NOT local-derived and may
-                             * escape. Still local for &local_array[i], &local
-                             * scalar/struct, and &local-derived-slice[i]. Mirrors
-                             * the return &s[i] relaxation (see ~line 11785).
-                             * Enables pointer-returning custom allocators over a
-                             * heap region. docs/universal_alloc.md. */
-                            bool root_is_ref = src && src->type &&
-                                (type_dispatch_kind(src->type) == TYPE_SLICE ||
-                                 type_dispatch_kind(src->type) == TYPE_POINTER);
-                            if (src && !src->is_static && !is_global &&
-                                !(root_is_ref && !src->is_local_derived)) {
-                                sym->is_local_derived = true;
-                            }
-                        }
+                        /* &local / &local[i] / &local.f — the pointer-into-
+                         * nonlocal-ref RELAXATION lives in addr_of_is_local_derived
+                         * (shared with the assignment path). Enables pointer-
+                         * returning custom allocators over a heap region.
+                         * docs/universal_alloc.md. */
+                        if (addr_of_is_local_derived(c, addr_exprs[ai]->unary.operand))
+                            sym->is_local_derived = true;
                     }
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:

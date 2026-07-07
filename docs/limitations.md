@@ -5,6 +5,146 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-07-07 full-codebase audit: confirmed findings NOT yet fixed
+
+The 2026-07-07 multi-agent audit fixed 6 bugs (BUGS-FIXED.md 2026-07-07). The findings
+below are ALL CONFIRMED with repros (emitted-C / accept-reject verified) but deferred —
+each needs a focused multi-site change with its own regression matrix. Ordered by severity.
+Probes were under `/tmp/probe-*/` (ephemeral); minimal repros are inline.
+
+### 🔴 AUD-1 — shared-struct access in CALLEE position of a call is unlocked (data race)
+The 5 shared-root walkers descend `call.args` but never `call.callee`, so `ops.fn(x)` where
+`ops` is a `shared struct` holding a funcptr emits the field read with NO `pthread_mutex_lock`,
+and the same-statement deadlock check / `@cond_wait` foreign-shared / defer walkers all miss
+it. This is the exact class the 2026-07-01 Tier-3 field-projection fix closed, one node-position
+over (callee instead of an operand). Verified: `shared struct Ops{ *(u32)->u32 fn; } Ops ops;
+… u32 r = ops.fn(5);` — emitted C locks the assignment `ops.fn = id` but the read `_zer_t1 =
+ops.fn(5)` is outside any lock. Blind walkers: `find_shared_root_expr` (ir_lower.c ~1268),
+`collect_shared_types_in_expr` (checker.c ~16671 NODE_CALL), `cond_pred_foreign_shared`
+(checker.c ~16545), `scan_body_shared_types`, `emit_defer_shared_root` (emitter.c ~9087).
+FIX: descend `call.callee` at each walker (object-side type per step, as Tier-3 did for
+FIELD/INDEX); ideally UNIFY the 5 into `shared_root_through_projections()` (the "optional
+future polish" the Tier-3 entry names) so this class closes in one place.
+
+### 🔴 AUD-2 — fire-and-forget spawn: ptr to a LOCAL shared instance laundered through a struct
+`spawn_arg_is_stack_derived` (checker.c ~9819) recognizes `&local`/`&local.f`/cast-wrapped/
+array idents, but NOT (a) a pointer READ from a struct field holding `&local`, nor (b) a whole
+by-value struct carrying a pointer field. When the carrier is `*shared S` the `shared_carrier`
+branch accepts it with no lifetime check → a pointer to a STACK-local shared instance reaches a
+fire-and-forget thread that outlives the frame = cross-thread UAF. Verified ACCEPTED:
+`shared struct S{u32 v;} struct W{*S sp;} … S local; W w; w.sp=&local; spawn worker(w.sp);`
+(field launder) and `spawn worker(w)` with `W` by-value (BUG-737/P9 class on the spawn sink).
+Controls `spawn worker(&local)` / `*S p=&local; spawn worker(p)` correctly reject. FIX: trace a
+struct-field pointer value back to its `&local` origin (is_local_derived), and lifetime-check
+ptr-carrying by-value struct spawn args (or require the shared_carrier pointee be non-stack).
+
+### 🔴 AUD-3 — auto-guard NOT emitted inside `defer` bodies (silent OOB on baremetal)
+An unproven array/slice index in a `defer` body prints "auto-guard inserted" but the emitted C
+has a RAW unchecked access — `emit_defer_stmt` (emitter.c ~9112) emits the body with no
+`emit_auto_guards` prepass, and the two auto-guard gate lists never cover defer bodies (fired at
+FIRE time, not as gated instructions). Verified: `defer g_arr[i] = 0xDEAD;` emits raw
+`g_arr[i] = 57005;`. Silent corruption on baremetal (hosted SIGSEGVs only for unmapped
+addresses). NOTE the subtlety: the array auto-guard is a SILENT `if(idx>=N) return;`, which is
+semantically wrong inside a defer (can't `return` from cleanup) — the correct fix for defer-body
+indices is a TRAPPING `_zer_bounds_check` (as slices already use), not the if-return guard.
+Same BUG-595..612 / 2026-07-01-branch-import class (the FLAG #1 "full AST→IR wrapper audit" is
+listed as pending; this is one of its holes).
+
+### 🔴 AUD-4 — ISR→main non-volatile-global check is NOT transitive through calls (silent race)
+A global written by a HELPER called from an interrupt handler and read directly by `main`
+compiles with zero diagnostics and is emitted NON-volatile → GCC may cache it in a register →
+silent stale value on baremetal. `track_isr_global` (checker.c ~14901) keys on `c->in_interrupt`
+(set only for the ISR body itself), so `check_interrupt_safety` sees `from_isr=false` for the
+helper. Contrast: the ISR ALLOC ban IS transitive via FuncProps, and the direct-access case is
+caught both directions. Verified: `u32 flag; void set(){flag=1;} interrupt USART1 { set(); }
+u32 main(){ return flag; }` — ACCEPTED, `flag` emitted without `volatile`. FIX: propagate a
+`from_isr` reachability the way the alloc ban propagates FuncProps (mirror the AU-5 funcptr-arg
+props propagation), then require `volatile` on any global reachable-written from an ISR and
+read from main (or vice-versa).
+
+### 🟡 AUD-5 — `section("…")` attribute is half-implemented: placement works, ALL enforcement missing
+`section(".rodata") u32 cfg; cfg = 5;` compiles silently — on baremetal the write to flash is
+dropped (silent logic corruption); a `section(".noinit")` global still gets the `= 0`
+initializer and is treated as auto-zeroed by the checker, but a NOLOAD section is never zeroed
+→ ZER's "everything auto-zeroed" invariant is silently broken. Parsed (parser.c ~2561/~2964),
+emitted verbatim, `grep section checker.c` → zero checker sites. `docs/firmware_safety_
+extensions.md:410` still claims "ZER has no way to place a declaration in a specific linker
+section" (stale — the syntax shipped) while line 197 lists the enforcement as pending: the
+syntax escaped ahead of its safety rules AND its own docs. FIX: reject writes to a known-RO
+section name; treat NOLOAD/.noinit sections as not-auto-zeroed (or reject until zeroing is
+modeled). Until enforced, consider rejecting `section()` on RO/NOLOAD names.
+
+### 🟡 AUD-6 — blocking sync primitives allowed inside interrupt handlers
+`@cond_wait`, `@sem_acquire`, and shared-struct auto-lock compile inside `interrupt` bodies
+(direct AND transitive) — a blocking wait / mutex-lock in an ISR is the hang/deadlock class the
+existing `slab.alloc`-in-ISR ban exists for. No `in_interrupt` check on `@cond_wait`/`@sem_*` in
+checker.c (the ban matrix covers alloc/spawn only). Ban Decision Framework rule 1 (hardware/OS
+constraint) already bans the sibling cases. FIX: `check_isr_ban`-style gate on `@cond_wait`/
+`@sem_acquire`/`@sem_release` (and shared-struct lock from ISR-only access).
+
+### 🟡 AUD-7 — volatile compound-RMW through a pointer alias evades the spawn A3 check
+BUG-746/A3 rejects `vg += n` (non-atomic RMW on a volatile global) in a spawn target, but the
+check (checker.c ~9611 NODE_ASSIGN in `scan_unsafe_global_access`) fires only when the target is
+a bare `NODE_IDENT`. `volatile *u32 p = &vg; *p += n;` has a deref target → missed. FIX: resolve
+a deref/alias target back to its volatile-global pointee in the A3 NODE_ASSIGN case.
+
+### 🟡 AUD-8 — `@saturate` / `@bitcast` in a global/static initializer emit invalid C
+`static i8 s = @saturate(i8, 500);` and `static u32 b = @bitcast(u32, 1000);` emit GCC
+statement-expressions `({…})`, illegal at file scope (GCC: "braced-group within expression
+allowed only inside a function"). Same BH-18 #11 class fixed for `@ctz`/`@clz` (conditional-expr
+form) but not these two. Loud (invalid C, not silent/unsafe). FIX for `@saturate`: emit the
+constant conditional-expression form (double-evaluate the constant arg), mirroring `@ctz`
+(emitter.c ~3448). `@bitcast` (float→int bit reinterpret) has no C99 constant-initializer form
+in general — either reject it in a constant context with a clear message or accept the loud GCC
+error; the double-eval trick does not apply.
+
+### 🟡 AUD-9 — universal `free(slice)` in a helper isn't recognized by FuncSummary (over-rejection)
+`void release([*]u32 s) { free(s); }` does not set `frees_param[0]`, so a heap slice passed to a
+free-helper (`h = alloc(u32,4); release(h);`) is falsely reported as a leak — the universal
+`free(slice)` (IRMC_FREE_PTR) isn't wired into the FuncSummary param-free detection (the summary
+gates on TYPE_POINTER/HANDLE/OPAQUE, not TYPE_SLICE). Over-rejection (safe), but it blocks the
+idiomatic `kv_table_free(table)` helper the universal-alloc feature is meant to enable. FIX:
+include TYPE_SLICE in the FuncSummary free-param param-type gate (zercheck_ir.c ~5060).
+
+### 🟢 AUD-10 — misc (diagnostic / workflow, not safety)
+- **`(*p) + 1`** (parens close right after the deref, then a binary op) still misparses as a
+  cast — PRE-EXISTING (unchanged by the AUD fix #5, which only rescues the `&`-inside-parens
+  regression). Fixing it needs cast-operand-start lookahead after the `)`. Low priority.
+- **usize width auto-detected from HOST gcc**; the firmware Makefiles never pass `--target-bits
+  32`, so `usize` values ≥ 2³² validate at the wrong width and silently truncate on the 32-bit
+  target (div/bounds guards keep the classic UB paths loud). Workflow fix: examples' Makefiles
+  should pass `--target-bits 32`; docs should require it for cross builds.
+- **`_zer_mmio_validate` boot-time check is inert on baremetal** (freestanding `_zer_probe`
+  always returns `{val,1}`, and the `__attribute__((constructor))` is `--gc-sections`-stripped
+  on the reference startup that calls `main()` directly). Documented net doesn't run on the
+  targets it's emitted for.
+- **`reg[9..8]` bit-extraction on a `volatile *u32`** (documented in reference.md/ZER-LANG.md)
+  does not compile — bit ops need a value copy first (`u32 v = *REG; v[9..8]`), which
+  incidentally guarantees the single-volatile-read property. Doc↔impl mismatch.
+- **`_zer_check_alive` (@ptrcast Level-3 UAF backstop)** is emitted only on the AST path (never
+  the IR path), so it's absent from real code — only the `type_id` mismatch trap survives. It's
+  a runtime backstop for the `*opaque`+cinclude corner (compile-time zercheck + inline header
+  remain primary), so exposure is narrow.
+- **qemu-cortex-m3 examples need `mmio` declarations / `--no-strict-mmio`** (they predate
+  strict-mmio-by-default) — after the AUD fix #5 they parse, but 6/8 then need mmio config and
+  2/8 need the string-literal→mutable-`[]u8` tightening applied. The baremetal validation surface
+  (`make qemu`) has been dead; worth restoring as regression coverage.
+
+### Relaxation opportunities (precision, from the oracle audit — sound, deferred)
+- **Switch-arm Level-B disjointness (size M):** `if(c){free} if(!c){use,free}` compiles but the
+  switch analog `switch(m){.a=>free} switch(m){.b=>use,free}` on an immutable enum is rejected.
+  `handle_flow_lattice.v` Level B is general (guards are `world->bool`); two arms of a switch on
+  an immutable scrutinee are disjoint predicates exactly as `c`/`¬c`. Extend `ir_edge_label` to
+  label switch-arm edges with `(scalar_root, arm_value)` + an immutable-scalar gate.
+- **Relational bounds `i < a.len` (size L):** the highest-frequency over-guard — `for(i=0;
+  i<a.len;i+=1){ a[i] }` still emits a runtime `_zer_bounds_check` because the interval VRP can't
+  relate `i` to the symbolic `a.len`. Needs a relational (octagon / `i<len`) bounds oracle + layer.
+- **Admit-gate hygiene (size S):** `lambda_zer_concurrency/*` is zero-admit today but OUTSIDE the
+  `make check-proofs` FILES list, so a future admit there wouldn't be caught. Add its `.v` files
+  to the gate to lock in the current status.
+
+---
+
 ## DONE (2026-07-01) — BRANCH-IMPORT LANDED (9 fixes / 13 holes) — residual flags + open items below
 
 **STATUS: all three tiers committed + `make check` GREEN, ZER 873/0.** Tier 1 `6c368761`

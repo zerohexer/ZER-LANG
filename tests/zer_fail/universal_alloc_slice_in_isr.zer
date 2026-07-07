@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// alloc(T, n) (calloc) inside an interrupt handler — malloc/calloc may deadlock.
+// Sibling of isr_slab_alloc.zer for the universal-alloc slice surface.
+?[*]u32 g;
+interrupt UART {
+    g = alloc(u32, 4);
+}
+u32 main() { return 0; }

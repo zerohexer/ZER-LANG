@@ -74,13 +74,15 @@ syntax escaped ahead of its safety rules AND its own docs. FIX: reject writes to
 section name; treat NOLOAD/.noinit sections as not-auto-zeroed (or reject until zeroing is
 modeled). Until enforced, consider rejecting `section()` on RO/NOLOAD names.
 
-### 🟡 AUD-6 — blocking sync primitives allowed inside interrupt handlers
-`@cond_wait`, `@sem_acquire`, and shared-struct auto-lock compile inside `interrupt` bodies
-(direct AND transitive) — a blocking wait / mutex-lock in an ISR is the hang/deadlock class the
-existing `slab.alloc`-in-ISR ban exists for. No `in_interrupt` check on `@cond_wait`/`@sem_*` in
-checker.c (the ban matrix covers alloc/spawn only). Ban Decision Framework rule 1 (hardware/OS
-constraint) already bans the sibling cases. FIX: `check_isr_ban`-style gate on `@cond_wait`/
-`@sem_acquire`/`@sem_release` (and shared-struct lock from ISR-only access).
+### 🟡 AUD-6 — blocking sync primitives allowed inside interrupt handlers — FIXED 2026-07-07
+Was: `@cond_wait`/`@cond_timedwait`/`@barrier_wait`/`@sem_acquire` compiled inside `interrupt`
+bodies — a blocking wait in an ISR hangs the handler (hardware-constraint class, like the
+alloc/spawn ISR bans). FIXED: an `in_interrupt` ban on the four BLOCKING ops (checker.c);
+`@cond_signal`/`@cond_broadcast`/`@sem_release` (non-blocking wakes) stay allowed — the
+canonical "ISR signals a waiting thread" pattern. Test `tests/zer_fail/isr_cond_wait.zer`.
+RESIDUAL (transitive): a blocking wait reached via a HELPER called from the ISR is not yet
+banned (the ban is per-site, not FuncProps-propagated like the alloc ban) — same shape as
+AUD-4; fold into that fix.
 
 ### 🟡 AUD-7 — volatile compound-RMW through a pointer alias evades the spawn A3 check
 BUG-746/A3 rejects `vg += n` (non-atomic RMW on a volatile global) in a spawn target, but the

@@ -65,6 +65,15 @@ defer bodies (LIFO, no pop) via `emit_defer_stmt` instead of aborting. The guard
 and the normal exit are mutually exclusive, so the defer fires exactly once. Test
 `tests/zer/defer_autoguard_earlyexit.zer`.
 
+**7. 🟡 hardware-constraint — blocking sync primitives allowed inside interrupt handlers.**
+`@cond_wait`/`@cond_timedwait`/`@barrier_wait`/`@sem_acquire` compiled inside an `interrupt`
+body — a blocking wait in an ISR hangs the handler (same class as the alloc/spawn ISR bans;
+there was already a `@critical` ban for condvar ops but no ISR ban). FIX: `in_interrupt` ban
+on the four BLOCKING ops (checker.c). Non-blocking wakes (`@cond_signal`/`@cond_broadcast`/
+`@sem_release`) stay allowed — the canonical "ISR signals a waiting thread" pattern. Test
+`tests/zer_fail/isr_cond_wait.zer`. (Transitive-via-helper residual tracked as AUD-6/AUD-4 in
+limitations.md.)
+
 ---
 
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// A blocking @sem_acquire inside an interrupt handler hangs the ISR — the same
+// hardware-constraint class as the alloc/spawn ISR bans. @sem_release /
+// @cond_signal / @cond_broadcast (non-blocking) stay allowed from an ISR.
+Semaphore(1) gate;
+interrupt UART {
+    @sem_acquire(gate);
+}
+u32 main() { return 0; }

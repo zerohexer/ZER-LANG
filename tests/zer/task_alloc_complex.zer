@@ -25,13 +25,13 @@ u32 main() {
     if (n.depth != 5) { return 5; }
 
     // Mix Handle and ptr on same type
-    *Task t2 = Task.alloc_ptr() orelse { return 6; };
+    *Task t2 = alloc(Task) orelse { return 6; };
     t2.id = 77;
     if (t2.id != 77) { return 7; }
 
     Task.free(t);
     Node.free(n);
-    Task.free_ptr(t2);
+    free(t2);
 
     return 0;
 }

@@ -18,7 +18,7 @@ void f2(*Task t) { f3(t); }
 void f1(*Task t) { f2(t); }
 
 u32 main() {
-    *Task t = Task.alloc_ptr() orelse return;
+    *Task t = alloc(Task) orelse return;
     f1(t);
     u32 x = t.id;
     return x;

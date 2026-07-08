@@ -3,9 +3,9 @@
 struct Worker { u32 id; }
 
 u32 main() {
-    *Worker w = Worker.alloc_ptr() orelse { return 1; };
+    *Worker w = alloc(Worker) orelse { return 1; };
     w.id = 42;
-    Worker.free_ptr(w);
+    free(w);
     w.id = 99;    // UAF — w freed by Task.delete_ptr
     return 0;
 }

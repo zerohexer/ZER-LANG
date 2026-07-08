@@ -10,7 +10,7 @@ Slab(Task) heap;
 
 u32 main() {
     u32 mode = 2;
-    *Task t = Task.alloc_ptr() orelse return;
+    *Task t = alloc(Task) orelse return;
     switch (mode) {
         0 => { heap.free_ptr(t); }
         1 => { heap.free_ptr(t); }

@@ -13,7 +13,7 @@ struct Task { u32 id; }
 Slab(Task) heap;
 
 u32 main() {
-    *Task t = Task.alloc_ptr() orelse return;
+    *Task t = alloc(Task) orelse return;
     u32 i = 0;
     top:
     if (i >= 2) { goto done; }

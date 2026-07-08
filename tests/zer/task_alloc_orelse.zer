@@ -13,11 +13,11 @@ u32 main() {
     t2.id = 20;
 
     // Pointer with bare orelse
-    *Sensor s1 = Sensor.alloc_ptr() orelse return;
+    *Sensor s1 = alloc(Sensor) orelse return;
     s1.val = 100;
 
     // Pointer with block orelse
-    *Sensor s2 = Sensor.alloc_ptr() orelse { return 2; };
+    *Sensor s2 = alloc(Sensor) orelse { return 2; };
     s2.val = 200;
 
     // Verify all values
@@ -28,7 +28,7 @@ u32 main() {
 
     Task.free(t1);
     Task.free(t2);
-    Sensor.free_ptr(s1);
-    Sensor.free_ptr(s2);
+    free(s1);
+    free(s2);
     return 0;
 }

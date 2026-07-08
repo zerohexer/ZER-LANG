@@ -1,17 +1,17 @@
-// Universal alloc — Phase 1: alloc(T) -> ?*T (desugars to T.alloc_ptr()).
-// Verifies the brainless single-object allocation surface. No Slab declaration,
-// no Handle, no Arena. See docs/universal_alloc.md.
+// Universal alloc — alloc(T) -> ?*T (single heap object) + free(x).
+// The brainless single-object allocation surface: no Slab declaration, no
+// Handle, no Arena. See docs/universal_alloc.md.
 i32 puts(const *u8 s);
 
 struct Task { u32 id; u32 value; }
 
 u32 main() {
-    *Task t = alloc(Task) orelse return;   // was Task.alloc_ptr()
+    *Task t = alloc(Task) orelse return;
     t.id = 7;
     t.value = 42;
     if (t.id != 7) { return 1; }
     if (t.value != 42) { return 2; }
-    Task.free_ptr(t);                       // free stays explicit for now (Phase 3 adds free())
+    free(t);
     puts("universal_alloc_single: ok");
     return 0;
 }

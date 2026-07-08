@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Double-free through a range subslice view of a heap slice.
+struct B { u32 x; }
+u32 main() {
+    [*]B b = alloc(B, 8) orelse return;
+    [*]B v = b[0..4];
+    free(b);
+    free(v);
+    return 0;
+}

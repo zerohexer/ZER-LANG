@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// Spawn data-race scan must see a global read in an orelse FALLBACK (was dropped).
+u32 g;
+threadlocal u32 tl;
+?u32 maybe() { return null; }
+void worker() { tl = maybe() orelse g; }
+void run() { spawn worker(); g = 5; }
+u32 main() { run(); return 0; }

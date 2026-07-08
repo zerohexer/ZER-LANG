@@ -280,6 +280,14 @@ p", not "is it static") with its OWN mask use: it infers keep on arg i only if t
 callee may return position i. Grounded by `param_lattice.v`. Full map + the read-only sink-enumeration workflow:
 compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
 slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
+**2026-07-08 audit added two more sinks to this matrix (BUG-773/774):** the ASSIGNMENT form
+`[*]T s; s = arr;` (whole-ident slice target = local array) was un-tainted while the var-decl
+form was caught — now BOTH go through the shared helper `mark_slice_local_derived_from_value`
+(don't re-inline the slice-from-local walk); and the universal `free(slice)` is a NEW escape/
+provenance sink — `free()` of a local-array / is_local_derived / is_arena_derived slice is a
+compile error (raw libc free on stack/arena memory), heap + param slices allowed. The universal
+`alloc(T,n)`/`free([*]T)` slice `alloc_id` is now tracked through subslice views (BUG-775, IR_ASSIGN
+NODE_SLICE alias) and cross-fn/by-value-field frees (BUG-776, TYPE_SLICE in the frees_param gate).
 
 ---
 

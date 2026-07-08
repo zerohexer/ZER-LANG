@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// A range subslice VIEW of a heap slice must share the alloc_id: UAF after freeing
+// the source must be caught (only whole-copy was aliased before). universal_alloc.md.
+struct B { u32 x; }
+u32 main() {
+    [*]B b = alloc(B, 8) orelse return;
+    [*]B v = b[0..4];
+    free(b);
+    v[0].x = 1;
+    return 0;
+}

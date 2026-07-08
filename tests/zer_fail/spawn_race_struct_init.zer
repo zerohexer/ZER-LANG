@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// Spawn data-race scan must see a non-shared global read inside a struct initializer.
+u32 g;
+threadlocal u32 tl;
+struct P { u32 x; }
+void worker() { P p = { .x = g }; tl = p.x; }
+void run() { spawn worker(); g = 5; }
+u32 main() { run(); return 0; }

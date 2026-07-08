@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// Spawn data-race scan must see a non-shared global read THROUGH a cast.
+// scan_unsafe_global_access was wrapper-blind (NODE_TYPECAST was a non-recursing leaf).
+u32 g_counter;
+threadlocal u32 tl_sink;
+void worker() { tl_sink = (u32)g_counter + 1; }
+void run() { spawn worker(); g_counter = 5; }
+u32 main() { run(); return 0; }

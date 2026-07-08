@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// free() of a slice viewing a STACK array is UB (raw libc free on stack memory).
+u32 main() {
+    u8[16] buf;
+    [*]u8 s = buf[0..];
+    free(s);
+    return 0;
+}

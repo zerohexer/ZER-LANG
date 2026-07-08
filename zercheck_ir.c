@@ -2938,6 +2938,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             free(rs.ids);
         }
 
+        /* H1 subslice alias: `v = b[0..n]` — the destination views the SAME
+         * heap region as b, so it must share b's alloc_id + state, or
+         * `free(b); v[0]` (UAF) and `free(b); free(v)` (double-free) slip
+         * through. The whole-slice copy `v = b` is an IR_COPY (already aliased);
+         * the RANGE subslice lowers to this IR_ASSIGN carrying a NODE_SLICE
+         * expr, which was untracked (universal_alloc.md §9.2 landmine #1 — the
+         * slice alloc_id lattice element was only half-built). Mirrors the
+         * IR_CAST / IR_COPY alias edge. Additive (only ever adds an alias to a
+         * genuine view), so it can only catch MORE UAF/double-free — never
+         * over-reject. */
+        if (inst->expr && inst->expr->kind == NODE_SLICE &&
+            inst->dest_local >= 0) {
+            int src_local = ir_find_value_local(func, inst->expr->slice.object);
+            if (src_local >= 0 && src_local != inst->dest_local) {
+                IRHandleInfo *src_h = ir_find_handle(ps, src_local);
+                if (src_h) {
+                    IRAliasSnapshot snap;
+                    ir_snapshot_alias(&snap, src_h);
+                    IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                    if (dst_h) {
+                        ir_apply_alias(dst_h, &snap);
+                        dst_h->state = snap.state;
+                    }
+                }
+            }
+        }
+
         /* Phase E: NODE_ASSIGN(target, value) passthrough — field/index
          * writes. If target root is a global or escape-detector positive,
          * mark the RHS local escaped (suppresses leak detection).
@@ -5047,7 +5074,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (!pt_eff ||
                         (pt_eff->kind != TYPE_POINTER &&
                          pt_eff->kind != TYPE_HANDLE &&
-                         pt_eff->kind != TYPE_OPAQUE)) {
+                         pt_eff->kind != TYPE_OPAQUE &&
+                         /* H3: a heap-slice param freed via the universal
+                          * `free(p)` (ident-callee IRMC_FREE_PTR) must also be
+                          * recorded into frees_param, or a caller's
+                          * `sink(b); free(b)` double-free / `sink(b); b[0]` UAF
+                          * passes silently — the slice sibling of the typedef'd
+                          * destructor gap above. */
+                         pt_eff->kind != TYPE_SLICE)) {
                         all_return_blocks_freed[i] = false;
                         continue;
                     }

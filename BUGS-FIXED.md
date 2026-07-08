@@ -5,6 +5,76 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-08 — Multi-agent audit: 5 accept-unsafe hole families closed (BUG-772..776)
+
+Full-codebase adversarial audit (5 parallel reader-agents + independent verification). Every
+finding below was reproduced against a built compiler, verified as accept-unsafe (compiles clean,
+real UB), and fixed as a PURE TIGHTENING (reject→accept-unsafe becomes reject; no relaxation, so a
+mistake can only over-reject = safe). `make check` GREEN. Two families that were rushed-risk
+(defer double-fire, cross-block scoped-borrow) are documented in `docs/limitations.md` instead of
+patched — see the OPEN entries. AST→IR emission drift audit came back CLEAN.
+
+### BUG-772 — spawn data-race scan is wrapper-blind (checker.c `scan_unsafe_global_access`)
+🔴 data race. A spawned thread reading a NON-shared global THROUGH an expression wrapper compiled
+clean: the walker's exhaustive switch put `NODE_TYPECAST`, `NODE_SLICE`, `NODE_STRUCT_INIT` in the
+non-recursing leaf group and `NODE_ORELSE` recursed only `.expr` (dropping `.fallback`). So
+`(u32)g`, `P{ .x = g }`, `maybe() orelse g` all hid a global read from the scan while the plain
+`g` read was correctly rejected. This is NOT the BH-18 #7 fix (that hardened
+`collect_shared_types_in_expr`, the deadlock walker) — a SEPARATE hand-rolled walker with the same
+per-sink-patchwork root, new sink. **Fix:** recurse into TYPECAST(.expr), SLICE(.object/.start/.end),
+STRUCT_INIT(field values), and ORELSE(.fallback). `NODE_CAST` (vestigial) / `NODE_SIZEOF`
+(compile-time) stay true leaves. **Tests:** tests/zer_fail/spawn_race_{cast,struct_init,orelse_fallback}.zer.
+
+### BUG-773 — assignment-form slice-of-local escapes (checker.c NODE_ASSIGN)
+🔴 dangling stack slice. `[*]u8 r = arr;` (var-decl) is correctly rejected on `return r` / `g = r`,
+but `[*]u8 r; r = arr;` (ASSIGNMENT) was accepted, then `return r`, `g = r`, AND the pointer-return
+relaxation `*u8 p = &r[0]; return p;` all escaped a dangling stack slice. Root cause: the
+array→slice / NODE_SLICE taint blocks in the NODE_ASSIGN handler were gated on
+`NODE_FIELD || NODE_INDEX` targets, EXCLUDING whole-ident slice targets; the var-decl path handled
+them, the assignment path never got the logic (declaration-vs-assignment sink asymmetry). **Fix:**
+extracted the var-decl "slice from local array" walk into a shared helper
+`mark_slice_local_derived_from_value` and call it from BOTH sinks (durable — they can no longer
+drift). Heap-slice and param-slice reassignment stay accepted (no over-reject). **Tests:**
+tests/zer_fail/{return,global}_reassigned_slice_local.zer, return_reassigned_slice_ptr.zer;
+positive tests/zer/slice_reassign_heap_ok.zer.
+
+### BUG-774 — free() of a non-heap slice accepted (checker.c universal free)
+🔴 free() on stack/arena memory (UB; GCC's own -Wfree-nonheap-object flags it). The universal
+`free(s:[*]T)` emits a raw libc `free((void*)s.ptr)` with NO provenance guard (unlike the slab
+`free_ptr` path, which runtime-traps a foreign pointer), and the checker accepted ANY slice —
+`free(buf[0..])` and `[*]u8 s = buf[0..]; free(s)` both compiled. **Fix:** reject at compile time a
+free() of a slice whose root is a local array or is is_local_derived / is_arena_derived. Heap slices
+(alloc(T,n)) and param/global slices stay allowed. (Freeing a param slice remains accepted — that
+needs ownership inference; see limitations OPEN entry.) **Tests:**
+tests/zer_fail/free_nonheap_slice_{stack,direct}.zer.
+
+### BUG-775 — range subslice loses alloc_id → UAF + double-free (zercheck_ir.c IR_ASSIGN)
+🔴 silent UAF/double-free. `[*]B v = b[0..4]` (a range subslice VIEW of a heap slice) did not share
+b's alloc_id, so `free(b); v[0]` (UAF) and `free(b); free(v)` (double-free) passed silently — while
+the whole-copy `[*]B v = b` (an IR_COPY, already aliased) was caught. The subslice lowers to
+`IR_ASSIGN` carrying a `NODE_SLICE` expr, which was untracked (universal_alloc.md §9.2 landmine #1 —
+the slice alloc_id lattice element was only half-built). **Fix:** at IR_ASSIGN with a NODE_SLICE
+expr, register the destination as an alias of the slice's source handle (mirrors the IR_CAST/IR_COPY
+alias edge). Additive — only ever adds an alias to a genuine view, so it can only catch MORE
+UAF/double-free, never over-reject. The BUG-764 "return a subslice of a param" relaxation still
+compiles. **Tests:** tests/zer_fail/alloc_subslice_{uaf,double_free}.zer; positive
+tests/zer/alloc_subslice_use_ok.zer.
+
+### BUG-776 — cross-function / by-value-field slice free untracked (zercheck_ir.c FuncSummary)
+🔴 silent double-free + UAF. A callee that frees its heap-slice param via the ident-callee
+`free(p)` was not recorded into the FuncSummary `frees_param[]` — the gate excluded `TYPE_SLICE`
+(only POINTER/HANDLE/OPAQUE, the same distinct-unwrap-class shape as the typedef'd-destructor gap
+above it). So `void sink([*]B p){ free(p); } sink(b); free(b);` double-freed and
+`sink(b); b[0]` UAF'd silently (the UAF was even mis-reported as a spurious "leak"). The by-value
+struct-field sibling `void fb(H h){ free(h.buckets); } fb(h); h.buckets[0]` had the same blind spot.
+**Fix:** add `TYPE_SLICE` to the frees_param param-kind gate; the type-agnostic call-site
+propagation then marks slice args FREED. Ownership transfer (callee frees, caller doesn't) and
+non-freeing callees stay accepted (no over-reject). **Tests:**
+tests/zer_fail/alloc_crossfn_slice_double_free.zer, alloc_byval_field_slice_uaf.zer; positive
+tests/zer/slice_param_free_ownership_ok.zer.
+
+---
+
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
 
 🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed

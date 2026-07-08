@@ -223,6 +223,80 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 
 ---
 
+## OPEN — defer double-fires on forward-goto-out-of-nested-scope with a converging fall-through (🔴 double-free / double-cleanup; found 2026-07-08)
+
+**Symptom (confirmed, deterministic double-free — exit 134 with universal alloc, silent
+corruption on bare-metal without glibc double-free detection):**
+```zer
+struct B { u32 x; }
+void f(u32 x) {
+    {
+        [*]B b = alloc(B, 2) orelse return;
+        defer free(b);
+        if (x > 5) { goto done; }   // forward goto OUT of the block
+    }                               // block scope closes -> defer fires on fall-through
+done:                               // fall-through CONVERGES into the label
+    return;
+}
+u32 main() { f(1); return 0; }      // fall-through path -> free(b) runs TWICE
+```
+A pure counter proves it: `defer mark();` with a `mark()` that does `fires += 1` gives
+`fires==2` on the fall-through path (`f(1)`) and `fires==1` on the goto path (`f(10)`) — correct
+is 1 on both. The narrow shape is: a `defer` in a NESTED lexical scope + a forward `goto` out of
+that scope + a label the fall-through ALSO converges into.
+
+**Root cause — `ir_lower.c` NODE_LABEL restore (the mirror-image of the T1.1 / sesjma fix).**
+On the fall-through path the intervening block-scope exit (NODE_BLOCK, ir_lower.c ~2041) already
+fires the nested defer and resets `ctx->defer_count`. The NODE_LABEL handler then RESTORES
+`ctx->defer_count = get_label_goto_fired_count(...)` (the count the forward goto fired) and installs
+the guard, so the label's return-fire re-fires the SAME defer under `if (!flag) {...}` (flag==0 on
+fall-through). The goto path is fine (flag==1 skips the re-fire). The T1.1 fix (limitations "DONE
+2026-07-01" T1.1) added this restore to stop the fall-through from DROPPING a function-scope defer;
+this bug is that the restore is too eager — it resurrects defers whose scope already CLOSED before
+the label.
+
+**Why the obvious fix is wrong / why it's deferred (not rushed).** The two cases are
+indistinguishable from `ctx->defer_count` alone: T1.1's needs-restore shape ALSO has
+`defer_count == 0` at the label with the defer still live. The clean distinguisher is per-defer
+lexical scope DEPTH (`ctx->func->current_scope`): a goto-fired defer registered at depth D > the
+label's depth L was in a scope that closed before the label and must NOT be restored; D <= L means
+it is still live and the T1.1 restore is correct. But `defer_bodies[]` is a single emit-time array
+reused across branches (the goto resets `defer_count` to the base, then new defers can reuse those
+slots between the goto and the label), so a naive depth clamp reads stale depths. A correct fix
+needs per-defer depth tracking AND resolution of the array-reuse interaction — a real (if small)
+structural change to machinery that THREE prior sessions (bh18_12, sesjma/T1.1, plt86m) have already
+oscillated on, each fix a mirror of the last. Rushing a 4th ad-hoc patch risks a SILENT regression
+(dropped defer = leak, or wrong count in another shape) — the exact class this audit is closing —
+so it is deferred to a design-freeze pass, not shipped.
+
+**Fix sketch.** Add a parallel `defer_depth[]` (mirror `defer_bodies[]` inline+heap) stamped with
+`ctx->func->current_scope` at each NODE_DEFER push. At NODE_LABEL, clamp the restore/guard to only
+the goto-fired defers whose recorded depth <= the label's current scope depth. Resolve array-reuse
+by snapshotting the goto-fired (depth, body) pairs onto the label record at the goto (not just a
+count), or by tracking defer liveness per lexical scope rather than a single restored counter.
+Tripwire (assert `fires==1` on both paths): the counter repro above.
+
+**Not a compile-time test today** — the program COMPILES (it's a runtime double-execution), so it
+can't be a `tests/zer_fail/` gate; it needs a runtime fire-count assertion harness.
+
+---
+
+## OPEN — `free(&local)` / free of a foreign pointer accepted at COMPILE time (LOW — runtime-trapped, not silent; found 2026-07-08)
+
+`free(&local)` (a `*T` to a stack object) desugars to `T.free_ptr(&local)` and is accepted by the
+checker; the slab `_zer_slab_free_ptr` runtime guard traps it ("free_ptr with invalid pointer",
+exit 133), so it is NOT silent on a hosted target. Similarly `free(param_slice)` — freeing a slice
+PARAM whose caller may have passed a stack slice — is accepted (BUG-774 only rejects LOCAL/arena
+slices, not param slices, because a caller CAN legitimately hand over a heap slice for the callee to
+free, and ZER has no ownership-transfer annotation to tell the two apart). Violates the "100%
+COMPILE-time safe for pure-ZER heap use" claim for these two shapes. **Fix sketch:** reject
+`free(&ident)` where ident is a function-local at compile time (cheap, the arg is a NODE_UNARY AMP
+of a local); for the param-slice case, extend keep-style inference so `free(param)` marks the param
+"consumed" and the CALL SITE rejects passing a stack/local slice (the same call-site-boundary shape
+as keep). Low priority — runtime-trapped on hosted; bare-metal freestanding has no libc free anyway.
+
+---
+
 ## OPEN — `tools/audit_matrix.sh` is STALE (false positives mask real flag-handler gaps) (LOW — tool only, contracts sound)
 
 **Symptom:** `bash tools/audit_matrix.sh checker.c` reports 16 "BUG: … missing …

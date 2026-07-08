@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Assignment form (not var-decl) of a slice viewing a LOCAL array must be caught
+// on return — was accepted (whole-ident slice target excluded from taint).
+[*]u8 leak() {
+    u8[4] arr;
+    arr[0] = 42;
+    [*]u8 r;
+    r = arr;
+    return r;
+}
+u32 main() { return 0; }

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// The pointer-return relaxation must NOT let &r[0] escape when r is a
+// reassigned slice-of-local (compound of the assignment-taint hole).
+*u8 leak() {
+    u8[4] arr; arr[0] = 42;
+    [*]u8 r; r = arr;
+    *u8 p = &r[0];
+    return p;
+}
+u32 main() { return 0; }

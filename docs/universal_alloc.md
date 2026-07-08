@@ -655,15 +655,31 @@ per method. `tools/audit_matrix.sh` / walker audits help.
 
 ### 9.2 The flagged verification landmines (attack these hardest)
 
+> **STATUS 2026-07-08 — landmines #1 and #2 WERE live and are now CLOSED (BUG-775/776).**
+> The audit confirmed the initial `alloc(T,n)`/`free(slice)` ship (5eac59b/54e7233) left the
+> slice `alloc_id` lattice element only HALF-built: whole-copy `v = b` was aliased (generic
+> IR_COPY) but the RANGE subslice `v = b[0..n]` (landmine #1) and the cross-fn / by-value-field
+> slice free (landmine #2) were NOT — both silent UAF/double-free. Plus a THIRD hole the plan
+> didn't flag: `free()` of a NON-heap slice (a local-array or arena view) emitted a raw libc
+> `free()` on stack/arena memory (BUG-774). All three now fixed:
+> - #1 subslice: IR_ASSIGN-with-NODE_SLICE aliases the destination to the source handle
+>   (zercheck_ir.c, mirrors the IR_CAST edge).
+> - #2 cross-fn/by-value-field: `TYPE_SLICE` added to the FuncSummary `frees_param` param-kind
+>   gate (zercheck_ir.c); the type-agnostic call-site propagation does the rest.
+> - free-of-non-heap-slice: compile-time reject when the freed slice's root is a local array /
+>   is_local_derived / is_arena_derived (checker.c).
+> Remaining OPEN: `free(param_slice)` (ownership-transfer, needs keep-style call-site inference)
+> — see docs/limitations.md.
+
 1. **Subslice `alloc_id` inheritance for a slice-typed local.** `buckets[a..b]`
    MUST keep the region's `alloc_id`. A view that loses it escapes tracking →
    silent UAF. This is the one genuinely-new lattice element. Verify FIRST with a
-   free-then-use-subview negative test.
+   free-then-use-subview negative test. **[CLOSED — BUG-775.]**
 2. **Cross-fn struct-field free (P9 / BUG-737).** `free(h.buckets)` where
    `buckets` is a pointer/slice field of a BY-VALUE struct param. The escape
    summary (`frees_param`) must descend into the projection, not match only a
    bare ident. The codebase ALREADY shipped a UAF through this exact shape (P9);
-   re-run the full escape-sink matrix.
+   re-run the full escape-sink matrix. **[CLOSED — BUG-776.]**
 3. **Coercion registered in BOTH emitter paths (§8.8).** The recurring
    "two handlers or it segfaults" trap.
 

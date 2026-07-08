@@ -1,0 +1,14 @@
+// A subslice VIEW used alongside its source, freed exactly once, must be accepted
+// (the subslice-alias fix must not over-reject legitimate views). universal_alloc.md.
+i32 puts(const *u8 s);
+struct B { u32 x; }
+u32 main() {
+    [*]B b = alloc(B, 8) orelse return;
+    [*]B v = b[0..4];
+    v[0].x = 1;
+    b[5].x = 2;
+    if (v[0].x + b[5].x != 3) { free(b); return 1; }
+    free(b);
+    puts("alloc_subslice_use_ok: ok");
+    return 0;
+}

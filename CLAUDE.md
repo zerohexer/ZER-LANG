@@ -940,7 +940,7 @@ packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 - No classes, inheritance, templates, generics (use `container` keyword for type-stamped containers)
 - No exceptions, try/catch
 - No garbage collector
-- No heap/malloc/free (use Pool/Slab/Ring/Arena)
+- Heap allocation IS `alloc(T)` / `alloc(T,n)` / `free(x)` — a typed, zercheck-tracked malloc-equivalent (see docs/universal_alloc.md). What ZER does NOT have: a RAW untyped `void*` malloc. Pool/Slab/Ring/Arena/Handle remain as explicit-control allocators.
 - No implicit narrowing or sign conversion
 - No undefined behavior (overflow wraps, shift by >=width = 0)
 - No `++`/`--`, no comma operator
@@ -1800,7 +1800,8 @@ ZER SYNTAX RULES (not C — these differ):
 - Bit queries: @popcount, @ctz, @clz, @parity, @ffs (return u32). Byte swap: @bswap16/32/64. Control-flow hints: @unreachable(), @expect(val, exp). Full barrier: @barrier_acq_rel().
 - Interrupt control (privileged, kernel-mode only): @cpu_disable_int/@cpu_enable_int/@cpu_wait_int/@cpu_save_int_state/@cpu_restore_int_state. Tests use dead-branch pattern (volatile + if(never_true)) to verify compile without executing privileged asm.
 - Context switch (callee-saved subset): @cpu_save_context/@cpu_restore_context/@cpu_save_fpu/@cpu_restore_fpu. Take *u8 buffer arg. Dead-branch tested.
-- No malloc/free — use Pool(T, N), Slab(T), Arena
+- Heap alloc (the malloc-equivalent, safe): alloc(T) -> ?*T (one struct object); alloc(T, n) -> ?[*]T (runtime-sized array — T = struct OR primitive like u8/u32; calloc-zeroed; escapes/returnable in a struct); free(x) frees a *T or [*]T. Fully tracked (UAF/double-free/leak). alloc(T) single needs a STRUCT (use alloc(T,n) for a primitive array). Custom allocators (bump/pool over one alloc(T,N) region) are plain ZER — hand out indices, or *T interior pointers (&region[i] where region is a heap slice or slice param is allowed). See docs/universal_alloc.md.
+- Explicit-control allocators STAY (named pools; address by variable): Pool(T, N) (fixed, ISR-safe), Slab(T) (growable), Arena (bump-reset), Handle(T). e.g. myslab.alloc_ptr(). alloc(T) uses an implicit auto-slab; a named pool is a deliberate SEPARATE pool you address explicitly.
 - move struct Name { } = ownership transfer on pass/assign, use after move = error
 - container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)
 - Name(ConcreteType) var; = stamps concrete struct, functions take *Name(Type) explicitly

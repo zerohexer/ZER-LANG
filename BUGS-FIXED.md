@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-08 — Universal `alloc` / `free` + pointer-return relaxation (checker.c, ir_lower.c, emitter.c, zercheck_ir.c, parser.c)
+
+Feature + one over-rejection fix. `make check` GREEN (ZER 901/0). Full design,
+dead-end map, and machinery map: **docs/universal_alloc.md** (read it before
+touching any of this). Five commits: `5eac59b2` (surface), `54e7233d` (primitive
+element types), `3d6d2704` (pointer-return relaxation), `3037569c` (migrate
+auto-slab `Type.alloc_ptr()` → `alloc`).
+
+**What shipped — one brainless allocation surface:**
+- `alloc(T)` → `?*T` — pure sugar: the checker rewrites the AST callee `alloc`
+  into `T.alloc_ptr()` (NODE_IDENT → NODE_FIELD) and it flows through the existing
+  auto-slab machinery unchanged. `free(p:*T)` similarly desugars to `T.free_ptr(p)`.
+- `alloc(T, n)` → `?[*]T` — the previously-impossible runtime-sized, escaping,
+  freeable heap slice (the `kv_table_create` / `void** buckets` case). Handled
+  DIRECTLY (no `T.alloc_slice` method — kept the surface single per owner). Emits
+  `calloc(n, sizeof(T))` wrapped in a `?[*]T {ptr,len}`; the length is
+  allocation-derived (never forgeable). `free([*]T)` frees the slice directly.
+- Works for **all** element types incl. primitives (`alloc(u8, n)` / `alloc(u32,
+  n)`): the generic arg loop would `check_expr` a primitive type keyword as a
+  value and error, so alloc is intercepted BEFORE the arg loop and the type is
+  resolved by NAME (`alloc_resolve_elem_type`, primitive keyword or struct). The
+  parser synthesizes an ident from a primitive type keyword (Token.start/length)
+  so `alloc(u8, n)` even parses.
+- Tracking reused verbatim from `alloc_ptr`: `IRMC_ALLOC_PTR`/`IRMC_FREE_PTR`
+  classification for the ident-callee builtins → UAF / double-free / leak all
+  caught, incl. through struct-field compound keys; the slice escapes correctly.
+  No new safety-model oracle.
+
+**Cross-cutting gotchas future sessions MUST respect:**
+- `alloc`/`free` are ident-callee builtins, so ir_lower.c marks them
+  `call_is_builtin` (gated on result/arg being `?[*]T` / slice) to skip arg
+  decomposition (the type-name arg must survive); the emitter handles them in
+  `emit_rewritten_node`'s NODE_CALL, and zercheck classifies them in
+  `ir_classify_method_call_ex` (ident branch added at the top). `free(*T)`
+  desugars to a FIELD callee so the existing paths handle it.
+- Every new `X->kind == TYPE_Y` site used `type_dispatch_kind(X) == TYPE_Y` to
+  pass `audit_type_dispatch.sh` (which flagged the first attempt).
+
+**The over-rejection fix (relaxation — reject→accept, verified with an adversarial
+matrix):** `*T p = &r[i]; return p;` where `r` is a slice/pointer whose pointee is
+NOT this frame (a PARAM or a HEAP allocation) is memory-safe but was rejected
+"cannot return pointer to local 'p'". The var-decl escape propagation
+(checker.c ~10258) marked `p` local-derived unconditionally. Fix mirrors the
+proven `return &s[i]` relaxation (~11785): only mark local when the address-of
+root is NOT a non-local-derived slice/pointer. Enables POINTER-returning custom
+allocators (bump/pool over a heap region) alongside the already-working
+INDEX/handle pattern. Matrix: ACCEPT `&heap_region[i]` / `&param_slice[i]`;
+REJECT `&local_array[i]` / `&local_scalar` / `&local-derived-slice[i]`.
+escape-matrix held 35/35. (Known residual: the separate *assignment* form
+`p = &r[i]` (not var-decl) is a different escape sink and may still reject.)
+
+Tests: `tests/zer/universal_alloc_{single,slice,primitive}.zer`,
+`tests/zer/custom_alloc_{bump_ptr,pool}.zer`,
+`tests/zer_fail/universal_alloc_slice_{uaf,double_free,leak}.zer`,
+`tests/zer_fail/universal_alloc_single_primitive.zer`,
+`tests/zer_fail/return_local_array_ptr_binding.zer`.
+
+---
+
 ## 2026-07-01 — BH-18 #1a sibling: nested index+field compound alias, second lowering path (zercheck_ir.c)
 
 🔴 silent UAF. Discovered while VERIFYING the 1a fix (not part of the original ask, confirmed

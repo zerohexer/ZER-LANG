@@ -58,6 +58,42 @@ Arena allocations excluded from handle tracking (arena.alloc() does
 not need individual free — arena.reset() frees everything).
 ```
 
+## Universal `alloc` / `free` — implementation pointer (2026-07-08)
+
+The brainless default allocation surface — `alloc(T)` → `?*T`, `alloc(T, n)` →
+`?[*]T` (runtime-sized escaping heap slice), `free(x)`. **The full machinery map
+(file:line), the exhaustive dead-end map, and the phased build are in
+`docs/universal_alloc.md` — read it before touching alloc.** The five load-bearing
+facts a future session needs:
+
+1. **`alloc(T)` / `free(*T)` are checker DESUGARS** (pure sugar): the NODE_CALL
+   callee `alloc`/`free` is rewritten in place into `T.alloc_ptr()` / `T.free_ptr(p)`
+   (NODE_IDENT → NODE_FIELD) and flows through the existing auto-slab machinery
+   unchanged. `alloc(T, n)` and `free([*]T)` are NOT sugar — handled directly.
+2. **alloc is intercepted BEFORE the generic arg loop** (checker.c NODE_CALL) so
+   its type-name arg is never `check_expr`'d as a value — that is what lets
+   `alloc(u8, n)` / `alloc(u32, n)` work (a primitive keyword is not a value).
+   Type resolved by NAME via `alloc_resolve_elem_type` (primitive OR struct). The
+   parser synthesizes an ident from a primitive type keyword.
+3. **ident-callee builtins need the `call_is_builtin` flag in ir_lower.c** (gated
+   on the result/arg being `?[*]T`/slice) so the type-name arg is NOT decomposed;
+   emission is in `emit_rewritten_node`'s NODE_CALL (calloc-slice; element type
+   recovered from the RESULT type, uniform for struct+primitive); zercheck
+   classifies them in `ir_classify_method_call_ex` (ident branch, → IRMC_ALLOC_PTR
+   / IRMC_FREE_PTR — full Model-1 UAF/double-free/leak reused, no new oracle).
+4. **The slice length is allocation-derived** (`n` from calloc), never forgeable —
+   this is the soundness invariant. `alloc(T,n)` is POOL-colored (escapable),
+   never `is_from_arena`, so it returns/stores like `alloc_ptr`.
+5. **The pointer-return relaxation** (checker.c ~10258): `*T p = &r[i]; return p;`
+   is accepted when `r` is a non-local-derived slice/pointer (param/heap) — mirrors
+   the `return &s[i]` relaxation at ~11785. Lets custom allocators hand out `*T`
+   interior pointers. The assignment form `p = &r[i]` is a separate sink (still
+   over-rejects — see limitations.md).
+
+Auto-slab `Type.alloc_ptr()` was migrated to `alloc(T)` in tests; explicit-slab
+`slab.alloc_ptr()` (allocate `*T` from a NAMED pool) is a distinct capability and
+STAYS. Open findings from the build: limitations.md "universal-`alloc` build".
+
 ## ZER Safety Architecture — Read Before Any Safety Work
 
 **Mandatory reading before modifying ANY safety-relevant code** (checker.c

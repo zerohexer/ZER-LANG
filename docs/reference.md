@@ -1059,6 +1059,90 @@ orelse, ?T, ?*T
 
 ## BUILTIN ALLOCATORS
 
+### alloc / free — Universal Heap Allocation (the default)
+
+**DESCRIPTION**
+The brainless, malloc-equivalent surface — `alloc` for allocation, `free` to
+release. No `Slab`/`Pool`/`Arena` declaration, no `Handle`. It works for **any**
+element type (structs and primitives), returns a **typed** pointer or slice
+(never an untyped `void*`), and is fully tracked by zercheck at compile time
+(use-after-free, double-free, and leak all caught). Reach for this first;
+`Pool`/`Slab`/`Handle`/`Arena` (below) are the explicit-control options for when
+you specifically want a named pool.
+
+**SYNOPSIS**
+```zer
+*Task  t  = alloc(Task) orelse return;      // one object      (like malloc(sizeof(Task)))
+[*]u32 xs = alloc(u32, n) orelse return;    // n objects, zeroed (like calloc(n, sizeof(u32)))
+free(t);                                     // release a *T
+free(xs);                                    // release a [*]T
+```
+
+**FORMS**
+- `alloc(T)` → `?*T` — one heap object of a **struct** type `T`.
+- `alloc(T, n)` → `?[*]T` — a runtime-sized array of `n` `T` (T = struct **or**
+  primitive: `alloc(u8, n)`, `alloc(u32, n)`, `alloc(Node, n)`). Memory is
+  auto-zeroed (calloc semantics).
+- `free(x)` → `void` — releases a `*T` or a `[*]T`. Dispatches on the shape.
+
+**EXAMPLE**
+```zer
+struct KvEntry { u32 key; u32 value; ?*KvEntry next; }
+struct Bucket  { ?*KvEntry head; }
+struct KvTable { u32 size; [*]Bucket buckets; }   // [*]T — no bound in the type
+
+?*KvTable kv_table_create(u32 n) {
+    *KvTable ht = alloc(KvTable) orelse return;         // one table
+    ht.size = n;
+    ht.buckets = alloc(Bucket, n) orelse {              // runtime-sized array
+        free(ht);
+        return null;
+    };
+    return ht;                                          // escapes in the returned struct
+}
+
+void kv_table_free(*KvTable ht) {
+    free(ht.buckets);
+    free(ht);
+}
+```
+
+**ERRORS**
+```zer
+[*]u32 x = alloc(u32, 4) orelse return;
+free(x);
+x[0] = 1;              // COMPILE ERROR — use-after-free
+
+free(x);
+free(x);               // COMPILE ERROR — double free
+
+[*]u32 y = alloc(u32, 4) orelse return;
+return 0;              // COMPILE ERROR — 'y' never freed, never escaped (leak)
+
+*u8 p = alloc(u8) orelse return;   // COMPILE ERROR — alloc(T) needs a STRUCT;
+                                    // use alloc(u8, n) for a primitive array
+```
+
+**NOTES**
+- `alloc(T)` is exactly `T.alloc_ptr()` under the hood (sugar); `alloc(T, n)` and
+  the slice `free` are new. Prefer the `alloc`/`free` spelling in new code.
+- A slice from `alloc(T, n)` **escapes** — you can store it in a returned struct
+  and free it later (a runtime-sized collection that outlives the function that
+  built it). This is what plain fixed arrays and `Arena` slices cannot do.
+- Custom allocators (a bump allocator or object pool over one `alloc(T, N)`
+  region) are ordinary ZER code — hand out slot **indices**, or hand out `*T`
+  interior pointers (`*T p = &region[i]; return p;` where `region` is a heap
+  slice or a slice param is allowed; `&local_array[i]` is still rejected).
+- Uses `calloc` internally — same ISR restriction as `Slab` (`alloc` inside an
+  interrupt handler → compile error; use `Pool` there).
+- `free` needs a `*T` or `[*]T` — a cinclude `free(ptr)` on a raw C pointer is
+  left alone (routes to C's `free`).
+
+**SEE ALSO**
+Slab(T), Pool(T,N), Handle(T), Arena, alloc_ptr
+
+---
+
 ### Pool(T, N) — Fixed-Slot Allocator
 
 **DESCRIPTION**
@@ -1349,9 +1433,10 @@ u32 main() {
 - `T.free()` type-checks argument — `*Motor` passed to `Task.free()` is a compile error.
 - Can mix with explicit Slab/Pool in the same program.
 - Uniform allocator vocabulary across ZER: Pool / Slab / Arena / Task sugar all use `alloc` / `free` (no `new` / `delete`).
+- **Preferred spelling:** the free-standing `alloc(T)` / `free(x)` (see "alloc / free — Universal Heap Allocation" above) is the recommended surface for auto-slab allocation, and adds `alloc(T, n)` for runtime-sized arrays. `Type.alloc_ptr()` / `Type.free_ptr()` remain as equivalents.
 
 **SEE ALSO**
-Slab(T), Pool(T,N), Handle(T), alloc_ptr
+alloc / free, Slab(T), Pool(T,N), Handle(T), alloc_ptr
 
 ---
 

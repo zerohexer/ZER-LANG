@@ -5,6 +5,45 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — findings surfaced during the universal-`alloc` build (2026-07-08) (mostly LOW/MEDIUM, none an active soundness hole)
+
+Bugs found while building `alloc`/`free` (docs/universal_alloc.md) but out of that
+scope, so NOT fixed. Full write-ups (repro + root cause) in
+**docs/universal_alloc.md §11**. Triage:
+
+- **MEDIUM — bare `orelse return;` inside a `?T`-returning function yields a wrong
+  `None`.** `?u32 f(){ *E e = slot orelse return; return e.value; }` with `slot`
+  null: the caller sees `f()` as HAVING a value. Only the BARE form in a `?T`
+  function; the block form `orelse { …; return null; }` and explicit `return
+  null;` are fine. A correctness bug (wrong runtime behavior), narrow.
+- **MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
+  `handle.elem`.** Any `container` field shaped `Handle(T)`/`?Handle(T)` fails
+  with "undefined type 'T'" (breaks self-referential `container Chained(T){
+  ?Handle(Chained(T)) next; }` and more). Separate from the depth-32 recursion
+  guard. Would need `subst_typenode` to recurse HANDLE like POINTER/OPTIONAL do.
+- **LOW — global `Arena` in-place `garena.over(buf)` does not initialize** → a
+  later `garena.alloc_slice(...)` returns `None` at runtime. Only `Arena x =
+  Arena.over(buf)` (capture the return) works.
+- **LOW — `global = arena.alloc_slice(...)` (direct form) compiles** when the
+  temp-var form is rejected: the escape rejection (checker.c ~4694) only fires on
+  a bare `NODE_IDENT` value; the direct call/orelse form only taints
+  (checker.c ~4645). A false-negative escape gap (masked at runtime by the global-
+  arena init bug above).
+- **LOW — `[*]?*T` slice element emits broken C** ("incompatible types … struct
+  anonymous" from GCC). Workaround: a named wrapper struct (`struct Bucket { ?*T
+  head; }`). An anonymous-struct-in-slice-typedef emitter gap.
+- **LOW — a named `const` is not accepted as an array size** (`?*E[N]` with a
+  const N → "array size must be a compile-time constant"); only a literal or a
+  `comptime` function call is. Cosmetic wart.
+
+**Also OPEN — the pointer-return relaxation covers var-decl only.** `*T p = &r[i];
+return p;` (where r is a param/heap slice) is accepted; the separate ASSIGNMENT
+form `p = &r[i]` (p declared earlier, assigned later) is a different escape sink
+(checker.c ~4138 area) and may still over-reject. Extend by mirroring the same
+`root_is_ref && !is_local_derived` guard there. See BUGS-FIXED.md 2026-07-08.
+
+---
+
 ## DONE (2026-07-01) — BRANCH-IMPORT LANDED (9 fixes / 13 holes) — residual flags + open items below
 
 **STATUS: all three tiers committed + `make check` GREEN, ZER 873/0.** Tier 1 `6c368761`

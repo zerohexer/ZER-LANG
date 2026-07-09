@@ -5103,7 +5103,22 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->call.callee->field.field_name_len = 8;
                 /* args unchanged [p]; fall through to field dispatch */
             } else if (ae && aek == TYPE_SLICE) {
-                /* free(s:[*]T) -> direct heap-slice free (handled in emitter) */
+                /* free(s:[*]T) -> direct heap-slice free (handled in emitter).
+                 * [A] 2026-07-09: the emitter emits a raw free((void*)s.ptr) with
+                 * no membership check (unlike the *Struct path which routes through
+                 * _zer_slab_free_ptr). Freeing a slice of a STACK array corrupts
+                 * the heap ("free on address which was not malloc()-ed"). Reject a
+                 * provably stack/arena-derived slice here (reuse the escape-sink
+                 * provenance predicate). A [*]T PARAM stays allowed (unknown
+                 * provenance — the caller's contract); only a slice whose root is
+                 * a local fixed array / local-derived / local-arena binding is
+                 * rejected. Frees of heap slices from alloc(T,n) are unaffected. */
+                if (arg_is_local_derived(c, node->call.args[0], 0)) {
+                    checker_error(c, node->loc.line,
+                        "cannot free a stack/arena-derived slice — free() takes a "
+                        "heap slice from alloc(T, n); this slice points into local "
+                        "or arena memory, not the heap");
+                }
                 result = ty_void;
                 break;
             }

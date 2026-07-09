@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// free() of a subslice of a stack array — same non-heap free. 2026-07-09 [A].
+u32 main() {
+    u8[8] a;
+    free(a[0..4]);
+    return 0;
+}

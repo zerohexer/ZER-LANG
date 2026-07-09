@@ -62,6 +62,10 @@ typedef struct {
     int spawn_wrapper_count;
     int spawn_wrapper_capacity;
     int next_spawn_id;      /* counter for unique spawn wrapper IDs */
+    int in_defer_body;      /* >0 while emitting a defer body: the fixed-array
+                             * auto-guard must TRAP (a mid-defer `return` would
+                             * skip the rest of the cleanup + the real return
+                             * value), and emit_auto_guards must run here too */
 
     /* async function emission state */
     bool in_async;              /* true when emitting inside an async function body */

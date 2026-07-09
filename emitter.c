@@ -410,10 +410,22 @@ static void emit_auto_guards(Emitter *e, Node *node) {
         uint64_t ag_size = checker_auto_guard_size(e->checker, node);
         if (ag_size > 0) {
             emit_indent(e);
-            emit(e, "if ((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
-            emit_safety_early_return(e, true);
+            if (e->in_defer_body) {
+                /* [E] 2026-07-09: inside a defer body the silent early-return
+                 * guard is unsound (it would skip the remaining cleanup and the
+                 * function's real return value). Emit a trapping bounds check
+                 * instead — the same _zer_bounds_check the slice path uses, which
+                 * travels correctly into any context. */
+                emit(e, "_zer_bounds_check((size_t)(");
+                emit_expr(e, node->index_expr.index);
+                emit(e, "), %lluu, __FILE__, __LINE__);\n",
+                     (unsigned long long)ag_size);
+            } else {
+                emit(e, "if ((size_t)(");
+                emit_expr(e, node->index_expr.index);
+                emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
+                emit_safety_early_return(e, true);
+            }
         }
         emit_auto_guards(e, node->index_expr.object);
         emit_auto_guards(e, node->index_expr.index);
@@ -9133,6 +9145,11 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
             Node *sroot = emit_defer_shared_root(e, s->expr_stmt.expr);
             bool is_w = (s->expr_stmt.expr->kind == NODE_ASSIGN);
             if (sroot) emit_shared_lock_mode(e, sroot, is_w);
+            /* [E] 2026-07-09: the main IR block loop runs emit_auto_guards before
+             * each statement; the defer path skipped it, so a fixed-array index
+             * with an unprovable subscript emitted a raw OOB access. Run it here
+             * too — in_defer_body makes the guard trap instead of early-return. */
+            emit_auto_guards(e, s->expr_stmt.expr);
             emit_indent(e);
             emit_rewritten_node(e, s->expr_stmt.expr, func);
             emit(e, ";\n");
@@ -9140,6 +9157,7 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         }
         return;
     case NODE_RETURN:
+        if (s->ret.expr) emit_auto_guards(e, s->ret.expr);  /* [E] 2026-07-09 */
         emit_indent(e);
         emit(e, "return");
         if (s->ret.expr) {
@@ -10024,6 +10042,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ") {\n");
                 e->indent++;
             }
+            e->in_defer_body++;  /* [E] 2026-07-09: fixed-array auto-guards inside
+                                  * the defer body must trap, not early-return */
             if (db->kind == NODE_BLOCK) {
                 for (int si = 0; si < db->block.stmt_count; si++) {
                     emit_defer_stmt(e, db->block.stmts[si], func);
@@ -10031,6 +10051,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else {
                 emit_defer_stmt(e, db, func);
             }
+            e->in_defer_body--;
             if (guarded) {
                 e->indent--;
                 emit_indent(e);

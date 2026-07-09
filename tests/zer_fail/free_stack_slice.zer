@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// free() of a slice derived from a STACK array corrupts the heap (raw
+// free((void*)s.ptr) on non-malloc'd memory). Must reject. 2026-07-09 [A].
+u32 main() {
+    u8[8] a;
+    [*]u8 s = a;
+    free(s);
+    return 0;
+}

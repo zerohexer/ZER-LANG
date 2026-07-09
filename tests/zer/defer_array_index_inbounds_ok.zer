@@ -1,0 +1,7 @@
+// Companion to defer_array_index_oob: an in-bounds defer index must run clean
+// (no over-trap from the [E] fix). 2026-07-09.
+u8[8] buf;
+u32 sink = 0;
+void store(u8 x){ sink = x; }
+void run() { u32 i = 3; buf[3] = 42; defer store(buf[i]); return; }
+u32 main() { run(); if (sink != 42) { return 1; } return 0; }

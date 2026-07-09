@@ -5,6 +5,41 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-09 — Audit batch 2: alloc/free provenance + defer auto-guard (checker.c, emitter.c)
+
+Two more verified 🔴 soundness holes from the same audit, both in the newest
+`alloc`/`free` reject→accept surface (highest-risk change class). `make check`
+GREEN. One verified hole (subslice-UAF alloc_id) remains logged in limitations.md.
+
+- **[A] 🔴 `free()` of a non-heap `[*]T` slice — no provenance check.**
+  `free(s:[*]T)` (checker.c ~5105) set `result=ty_void` and the emitter emitted a
+  raw `free((void*)s.ptr)` with no membership check (unlike the `*Struct` path,
+  which routes through `_zer_slab_free_ptr` and safely no-ops a non-member). So
+  `u8[8] a; [*]u8 s = a; free(s);` corrupted the heap (ASan: "attempting free on
+  address which was not malloc()-ed"). Fix: reject when the slice arg is provably
+  stack/arena-derived, reusing the escape-sink predicate `arg_is_local_derived`.
+  A `[*]T` PARAM stays allowed (unknown provenance — caller's contract); heap
+  slices from `alloc(T,n)` (incl. a heap slice stored in a struct field, the
+  `kv_table_free` pattern) are unaffected. Tests:
+  `tests/zer_fail/free_stack_{slice,subslice}.zer`.
+
+- **[E] 🔴 fixed-array index auto-guard dropped inside `defer` bodies.** The
+  statement-level `emit_auto_guards` pre-pass runs in the main IR block loop but
+  `emit_defer_stmt` (emitter.c ~9127) re-emitted its stored AST via
+  `emit_rewritten_node` without it, so `defer store(buf[i])` / `defer buf[i]=v`
+  with an unprovable `i` emitted a raw OOB access while the checker printed
+  "auto-guard inserted" (same silent-miscompile signature as BUG-595..612 / T2.2;
+  `defer` bodies were a new uncovered context). Fix: run `emit_auto_guards` in the
+  defer body's expr/return arms, gated by a new `Emitter.in_defer_body` flag that
+  makes the NODE_INDEX auto-guard emit a **trapping** `_zer_bounds_check` instead
+  of the early-`return` (a mid-defer return would skip the rest of the cleanup and
+  the real return value). Inline wrappers already travelled into defer correctly;
+  only the separate-pass fixed-array guard was dropped. Tests:
+  `tests/zer_trap/defer_array_index_oob.zer` (traps),
+  `tests/zer/defer_array_index_inbounds_ok.zer` (runs clean).
+
+---
+
 ## 2026-07-09 — Audit batch 1: escape/concurrency/VRP form-coverage holes (checker.c)
 
 Codebase-wide silent-gap audit (5 parallel adversarial hunters + own probing).

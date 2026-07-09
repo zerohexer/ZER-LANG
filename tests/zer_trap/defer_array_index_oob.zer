@@ -1,0 +1,15 @@
+// [E] 2026-07-09: a fixed-array index with an unprovable subscript inside a
+// defer body dropped its bounds guard (emit_defer_stmt never ran the
+// statement-level emit_auto_guards pre-pass) -> silent OOB read. Now the defer
+// path emits a trapping _zer_bounds_check (an early-return would be unsound
+// mid-defer). i=100, buf size 8 -> must trap at runtime.
+u32 gi = 100;
+u8[8] buf;
+u32 sink = 0;
+void store(u8 x){ sink = x; }
+void run() {
+    u32 i = gi;
+    defer store(buf[i]);
+    return;
+}
+u32 main() { run(); return 0; }

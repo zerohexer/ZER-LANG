@@ -5,36 +5,30 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — 2026-07-09 audit batch: subslice-view UAF (verified, unfixed)
+## OPEN — 2026-07-09 audit: residual low-severity items
 
-Found during the codebase-wide silent-gap audit. Sibling findings [A]
-(free-of-non-heap-slice) and [E] (defer auto-guard drop) from this batch are
-FIXED (see BUGS-FIXED.md 2026-07-09 "Audit batch 2"); [B] below is verified
-(ASan-proven, asymmetric control) but NOT yet fixed. It is in the newest
-`alloc`/`free` reject→accept relaxation surface, i.e. the highest-risk class.
+The codebase-wide silent-gap audit closed six verified soundness holes (see
+BUGS-FIXED.md 2026-07-09 batches 1–3: escape-arena-launder, spawn-wrapper-scan,
+VRP-scope-leak ×3, free-of-non-heap-slice, defer-auto-guard, subslice-view-UAF).
+The remaining items are low-severity:
 
-- **[B] 🔴 subslice of a heap slice does not inherit the base's `alloc_id` →
-  UAF + double-free undetected.** `base[a..b]` of a heap `[*]T` produces a view
-  that shares the base's lifetime, but zercheck_ir does not register it as an
-  `alloc_id` alias, so use-after-free / double-free through the subslice slip:
-  ```zer
-  u32 main() {
-      [*]u8 b = alloc(u8,16) orelse return;
-      [*]u8 sub = b[0..4];
-      free(b);
-      sub[0] = 1;                // UAF — NOT caught (ASan: heap-use-after-free)
-      return 0;
-  }
-  ```
-  Control: the DIRECT `free(b); b[0]=1` IS caught. This is exactly the
-  UAF-through-a-view case docs/universal_alloc.md §7.2 relies on (it wires
-  `alloc_id` sharing on `IR_CAST` for the `[*]u8→[*]T` coercion, but SUBSLICE
-  `base[a..b]` is a different lowering path that was never given the alias). Fix
-  sketch: when a slice-range/subslice result is bound and the base is a tracked
-  heap allocation, register the result as an `alloc_id` alias of the base
-  (ir_snapshot_alias/ir_apply_alias). Also consider rejecting `free(subslice)`
-  outright (free the base, not an offset view). Tripwire: subslice-after-free +
-  double-free-via-subslice must both reject.
+- **subslice of a COMPOUND base** (`s.buf[a..b]` where `s.buf` is a heap slice
+  field) is left conservative by the [B] fix — the alloc_id alias only fires when
+  the subslice base walks (through slice/index steps) to a root IDENT with a
+  tracked handle; a FIELD in the chain bails (no alias, no false positive, same
+  as before the fix). A UAF through a subslice of a struct-FIELD heap slice is
+  therefore still uncaught. Fix: extend the [B] arm to resolve a compound base via
+  `ir_extract_compound_key` + `ir_find_compound_handle` (mirrors the NODE_FIELD
+  alias arm just below it). Lower priority than the direct-local case (the common
+  one, now closed).
+
+- **cross-function free of a `[*]T` slice param not tracked → false leak**
+  (over-rejection, not a soundness hole). `void my_free([*]u8 s){ free(s); }` +
+  `my_free(h)` where `h = alloc(u8,n)` reports `h` as leaked — the FuncSummary
+  `frees_param` machinery covers `*T`/Handle params but not slice params. A
+  conservative over-rejection; the workaround is to free at the call site or
+  return the slice. Fix: extend the FuncSummary free-param detection to
+  `TYPE_SLICE` params.
 
 - **[LOW nit] `@bitcast`/`@saturate`/`@truncate`/`@cast` accept a VARIABLE name in
   the type-argument position** and silently resolve it to that variable's type

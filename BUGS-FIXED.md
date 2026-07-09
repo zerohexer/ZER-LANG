@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-09 — Audit batch 3: subslice-view UAF (zercheck_ir.c)
+
+The last verified 🔴 from the codebase-wide audit; closes the alloc/free
+soundness core. `make check` GREEN.
+
+- **[B] 🔴 subslice of a heap slice did not inherit the base's `alloc_id` →
+  UAF + double-free through the view undetected.** `[*]u8 sub = b[0..4]` of a
+  heap `[*]u8 b` produced a view sharing the base's lifetime, but the IR_ASSIGN
+  handler in zercheck_ir.c registered `alloc_id` aliases only for NODE_FIELD /
+  NODE_INDEX right-hand sides, never NODE_SLICE. So `free(b); sub[0]=1` compiled
+  clean (ASan: heap-use-after-free) while the base-direct `free(b); b[0]=1` was
+  correctly caught (the asymmetry proving the gap). This is exactly the
+  UAF-through-a-view case docs/universal_alloc.md §7.2 relies on — it wired the
+  `alloc_id` share onto `IR_CAST` (the `[*]u8→[*]T` coercion) but SUBSLICE is a
+  different lowering (`IR_ASSIGN`, `expr = NODE_SLICE`) that never got the alias.
+  Fix: in the IR_ASSIGN handler, when the RHS is a subslice whose base walks
+  (through slice/index steps only) to a root ident with a tracked heap handle
+  (`alloc_id != 0`), register the destination as an `alloc_id` alias of the base
+  via `ir_snapshot_alias`/`ir_apply_alias` (the same mechanism IR_CAST uses).
+  Then `free(base)` marks the whole group FREED and any use/free through the
+  subslice is caught. A subslice of a param / stack slice (no handle) is
+  unaffected; compound bases (`s.buf[a..b]`) are left conservative (no alias).
+  Tests: `tests/zer_fail/subslice_{uaf,double_free}.zer`,
+  `tests/zer/subslice_alive_ok.zer`.
+
+---
+
 ## 2026-07-09 — Audit batch 2: alloc/free provenance + defer auto-guard (checker.c, emitter.c)
 
 Two more verified 🔴 soundness holes from the same audit, both in the newest

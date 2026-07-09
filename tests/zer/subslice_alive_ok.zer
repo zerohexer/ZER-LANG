@@ -1,0 +1,10 @@
+// A subslice used while the base is still alive, base freed after — must
+// compile+run (no over-rejection from the [B] alloc_id-alias fix). 2026-07-09.
+u32 main() {
+    [*]u8 b = alloc(u8, 16) orelse return;
+    [*]u8 sub = b[0..4];
+    sub[0] = 9;
+    if (sub[0] != 9) { free(b); return 1; }
+    free(b);
+    return 0;
+}

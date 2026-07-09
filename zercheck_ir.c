@@ -2897,6 +2897,54 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * inside the assign's expression — these are collapsed into IR_ASSIGN
      * per ir_lower.c Phase 8d and must be recognized here to track state. */
     case IR_ASSIGN: {
+        /* [B] 2026-07-09: a subslice `sub = base[a..b]` of a tracked HEAP slice
+         * is a VIEW sharing the base's lifetime — register it as an alloc_id
+         * alias of the base so use-after-free / double-free THROUGH the subslice
+         * is caught (the base-direct `free(b); b[0]=1` already is; the view was a
+         * blind spot, ASan-confirmed heap-use-after-free). Handles both the
+         * var-decl-init form (inst->expr is the NODE_SLICE) and the plain-assign
+         * form (inst->expr is NODE_ASSIGN whose value is the NODE_SLICE). Walk to
+         * a root IDENT through slice/index steps only (bail on a FIELD — a
+         * compound base needs compound-key resolution; conservative = no alias).
+         * Fires only when the root has a tracked heap handle (alloc_id != 0), so a
+         * subslice of a param / stack slice (no handle) is unaffected. */
+        {
+            Node *slice_val = NULL;
+            int b_dest = -1;
+            if (inst->expr && inst->expr->kind == NODE_SLICE) {
+                slice_val = inst->expr;
+                b_dest = inst->dest_local;
+            } else if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+                       inst->expr->assign.value &&
+                       inst->expr->assign.value->kind == NODE_SLICE) {
+                slice_val = inst->expr->assign.value;
+                b_dest = ir_find_value_local(func, inst->expr->assign.target);
+            }
+            if (slice_val && b_dest >= 0) {
+                Node *sroot = slice_val;
+                while (sroot && (sroot->kind == NODE_SLICE ||
+                                 sroot->kind == NODE_INDEX)) {
+                    if (sroot->kind == NODE_SLICE) sroot = sroot->slice.object;
+                    else sroot = sroot->index_expr.object;
+                }
+                if (sroot && sroot->kind == NODE_IDENT) {
+                    int base_local = ir_find_local(func, sroot->ident.name,
+                        (uint32_t)sroot->ident.name_len);
+                    if (base_local >= 0 && base_local != b_dest) {
+                        IRHandleInfo *bsrc_h = ir_find_handle(ps, base_local);
+                        if (bsrc_h && bsrc_h->alloc_id != 0) {
+                            IRAliasSnapshot bsnap;
+                            ir_snapshot_alias(&bsnap, bsrc_h);
+                            IRHandleInfo *bdst_h = ir_add_handle(ps, b_dest);
+                            if (bdst_h) {
+                                ir_apply_alias(bdst_h, &bsnap);
+                                bdst_h->state = bsnap.state;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         /* Phase E: move struct field-write reset BEFORE UAF check.
          * `m.code = 1` where m is a move struct currently TRANSFERRED
          * resets m to ALIVE — writing to a field is re-initialization,

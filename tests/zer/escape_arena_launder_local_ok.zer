@@ -1,0 +1,14 @@
+// Arena pointer passed to a call, result used locally (never escapes) — must
+// compile+run. Guards against over-rejection from the is_arena_derived launder
+// fix (2026-07-09): arena args to calls whose result isn't escaped stay fine.
+struct Blob { u32 v; }
+u32 read_v(*Blob b) { return b.v; }
+u32 main() {
+    u8[4096] backing;
+    Arena scratch = Arena.over(backing);
+    *Blob b = scratch.alloc(Blob) orelse { return 1; };
+    b.v = 7;
+    u32 r = read_v(b);
+    if (r != 7) { return 2; }
+    return 0;
+}

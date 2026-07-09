@@ -5,6 +5,84 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-07-09 audit batch: alloc/free provenance + defer auto-guard (verified, unfixed)
+
+Found during the codebase-wide silent-gap audit (same session that fixed the
+escape-arena-launder [D], spawn-wrapper-scan [C], and VRP-scope-leak [F] holes —
+see BUGS-FIXED.md 2026-07-09). These are verified (ASan-proven / asymmetric-
+control) but NOT yet fixed. All are in the newest `alloc`/`free` reject→accept
+relaxation surface or its emitter, i.e. the highest-risk change class.
+
+- **[A] 🔴 `free()` of a non-heap `[*]T` slice — no provenance check.**
+  `free(s:[*]T)` (checker.c ~5100) sets `result=ty_void` and the emitter emits a
+  raw `free((void*)s.ptr)` with NO check that `s` came from `alloc(T,n)`. Freeing
+  a slice of a STACK array corrupts the heap:
+  ```zer
+  u32 main() { u8[8] a; [*]u8 s = a; free(s); return 0; }   // clean compile
+  ```
+  ASan: `attempting free on address which was not malloc()-ed`. Control:
+  `free(alloc(u8,8))` is fine (real heap). Note: `free(p:*Struct)` is protected —
+  it routes through `_zer_slab_free_ptr` which does a runtime slab-membership
+  check (so `free(&local_struct)` no-ops safely); only the SLICE path emits the
+  raw `free()`. Fix sketch: at the `free(slice)` site reject when the slice's
+  root is PROVABLY stack-array-derived (a local fixed array / `is_local_derived`),
+  mirroring the escape-sink provenance in reverse. A `[*]T` PARAM stays allowed
+  (unknown provenance — caller's contract). Tripwire: a `tests/zer_fail/` freeing
+  a stack-array slice must reject.
+
+- **[B] 🔴 subslice of a heap slice does not inherit the base's `alloc_id` →
+  UAF + double-free undetected.** `base[a..b]` of a heap `[*]T` produces a view
+  that shares the base's lifetime, but zercheck_ir does not register it as an
+  `alloc_id` alias, so use-after-free / double-free through the subslice slip:
+  ```zer
+  u32 main() {
+      [*]u8 b = alloc(u8,16) orelse return;
+      [*]u8 sub = b[0..4];
+      free(b);
+      sub[0] = 1;                // UAF — NOT caught (ASan: heap-use-after-free)
+      return 0;
+  }
+  ```
+  Control: the DIRECT `free(b); b[0]=1` IS caught. This is exactly the
+  UAF-through-a-view case docs/universal_alloc.md §7.2 relies on (it wires
+  `alloc_id` sharing on `IR_CAST` for the `[*]u8→[*]T` coercion, but SUBSLICE
+  `base[a..b]` is a different lowering path that was never given the alias). Fix
+  sketch: when a slice-range/subslice result is bound and the base is a tracked
+  heap allocation, register the result as an `alloc_id` alias of the base
+  (ir_snapshot_alias/ir_apply_alias). Also consider rejecting `free(subslice)`
+  outright (free the base, not an offset view). Tripwire: subslice-after-free +
+  double-free-via-subslice must both reject.
+
+- **[E] 🔴 fixed-array index auto-guard dropped inside `defer` bodies.** The
+  statement-level `emit_auto_guards` pre-pass runs in the main IR block loop
+  (emitter.c ~11330) but `emit_defer_stmt` (emitter.c ~9112) re-emits its stored
+  AST via `emit_rewritten_node` WITHOUT that pre-pass. An unprovable fixed-array
+  index in a `defer` compiles to a raw `buf[i]` — OOB read, or OOB **store** for
+  the write form — while the compiler PRINTS "auto-guard inserted". Same class as
+  BUG-595..612 / T2.2 (the IR_AWAIT/IR_NOP gate); `defer` bodies are a new
+  uncovered context. Inline wrappers (`_zer_shl`, `_zer_trap`, slice
+  `_zer_bounds_check`, `@inttoptr` range/align) DO travel into defer correctly —
+  only the separate-pass fixed-array auto-guard is dropped.
+  ```zer
+  u8[8] buf; u32 gi = 100; u32 sink = 0;
+  void store(u8 x){ sink = x; }
+  void f() { u32 i = gi; defer store(buf[i]); return; }   // buf[100], no guard
+  ```
+  ASan: global-buffer-overflow. Fix sketch: the auto-guard's silent early-`return`
+  is semantically wrong inside a defer body (must not skip remaining cleanup), so
+  route fixed-array indexing in defer bodies through an inline `_zer_bounds_check`
+  trap (the mechanism slices already use, which travels correctly) rather than the
+  return-guard. Tripwire in `tests/zer_trap/`.
+
+- **[LOW nit] `@bitcast`/`@saturate`/`@truncate`/`@cast` accept a VARIABLE name in
+  the type-argument position** and silently resolve it to that variable's type
+  (`@bitcast(gv, gv)` ≡ `@bitcast(typeof(gv), gv)`). A literal in type position is
+  correctly rejected. No safety bypass — all width/integer/pointer/qualifier
+  checks fire on the resolved type; it's a diagnostic-quality confusing-accept
+  only. Fix: require the type-arg position to be a type node, not an expression.
+
+---
+
 ## OPEN — findings surfaced during the universal-`alloc` build (2026-07-08) (mostly LOW/MEDIUM, none an active soundness hole)
 
 Bugs found while building `alloc`/`free` (docs/universal_alloc.md) but out of that

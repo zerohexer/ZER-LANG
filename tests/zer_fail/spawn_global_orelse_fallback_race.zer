@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// Non-shared global read in an orelse fallback from a spawned thread — the
+// NODE_ORELSE case scanned only .expr, not .fallback. 2026-07-09.
+u32 g = 5;
+?u32 maybe() { return null; }
+void worker() { u32 x = maybe() orelse g; if (x > 100) { return; } }
+u32 main() { spawn worker(); return 0; }

@@ -5,6 +5,61 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-09 — Audit batch 1: escape/concurrency/VRP form-coverage holes (checker.c)
+
+Codebase-wide silent-gap audit (5 parallel adversarial hunters + own probing).
+Three verified soundness holes closed, all in checker.c, all pure TIGHTENING
+(a mistake only over-rejects = safe). `make check` GREEN (ZER 909/0, Rust 784,
+Zig 36, modules 28, fuzz 200, all audits OK). Remaining verified-but-unfixed
+findings (free-of-non-heap, subslice-UAF, defer auto-guard drop, bitcast
+type-arg nit) are logged in `docs/limitations.md`.
+
+- **[D] 🔴 escape call-launder blind to `is_arena_derived`** — `arg_is_local_derived`
+  (checker.c ~892, the per-arg predicate behind `call_result_escapes`) tested
+  `src->is_local_derived` at 5 sites (NODE_IDENT, slice/index, orelse fallback,
+  nested orelse, field-of-local-struct) but NEVER `src->is_arena_derived`. An
+  `Arena.over(local_buffer)` pointer laundered through a call and stored to a
+  global / returned escaped a **stack** pointer with a clean compile
+  (ASan: stack-use-after-return). The direct-store + keep sinks already reject
+  arena-derived; only the call-launder path was blind. Fix: add
+  `|| src->is_arena_derived` at each of the 5 sites (frame-bound = local OR
+  local-arena). Tests: `tests/zer_fail/escape_arena_launder_global.zer`,
+  `tests/zer/escape_arena_launder_local_ok.zer`. Sibling of the BUG-760..763
+  per-sink patchwork (which covered the `is_local_derived` arm only).
+
+- **[C] 🟠 spawn data-race scan blind to wrapper subexpressions** —
+  `scan_unsafe_global_access` (checker.c ~9538, the transitive spawn-target-body
+  scanner) left NODE_TYPECAST / NODE_SLICE / NODE_STRUCT_INIT in the
+  `return false` leaf group and NODE_ORELSE recursed only `.expr`, not
+  `.fallback`. A non-shared global read from a spawned thread wrapped in a
+  typecast (`(u32)g`), slice (`g[0..4]`), designated-init (`{ .a = g }`), or
+  orelse fallback (`maybe() orelse g`) evaded the data-race check (emitted C:
+  unlocked global read). Exact same form-coverage class as BH-18 #7 (the sibling
+  deadlock detector `collect_shared_types_in_expr` was hardened for these; the
+  spawn scanner never mirrored it). Fix: mirror the sibling's recursion. Tests:
+  `tests/zer_fail/spawn_global_{typecast,orelse_fallback,structinit}_race.zer`.
+
+- **[F] 🔴 flat-VRP guard-narrowing scope leak (3 sibling sites)** — BH-18 #2
+  fixed the leak for the plain non-comparison `if(b){}` only. A bounds guard
+  `if(idx>=N){return;}` nested inside a **conditionally-executed** sub-block
+  pushes an inverse-range narrowing (`idx<=N-1`) that the flat AST VRP
+  (`c->var_ranges`/`var_range_count`) never discards at the sub-block join, so
+  the compiler proves a later `buf[idx]` in-range and emits NO bounds check /
+  NO warning on a path where the guard never ran (ASan: stack-buffer-overflow).
+  Three unpatched conditionally-executed bodies: (a) **switch arms** (leaks to
+  sibling arms + past the switch), (b) **`if(opt)|v|` capture body**, (c)
+  **`orelse { block }` fallback**. Fix: snapshot/restore `c->var_range_count`
+  around each (mirrors BH-18 #2's save/restore). Anti-case verified: a top-level
+  straight-line guard still elides (no over-rejection). Tests:
+  `tests/zer/vrp_{switch_arm,if_capture,orelse_block}_guard_no_leak.zer` (each
+  exits 0 iff the auto-guard is inserted; a regression OOBs then returns 1).
+  The durable class-fix (wire the orphaned CFG-based `vrp_ir.c` — join discards
+  branch-local narrowings by construction) remains a subsystem-scale item in
+  limitations.md; `vrp_ir.c` today lacks branch-narrowing + loop-induction so
+  wiring it as-is would massively over-reject.
+
+---
+
 ## 2026-07-08 — Universal `alloc` / `free` + pointer-return relaxation (checker.c, ir_lower.c, emitter.c, zercheck_ir.c, parser.c)
 
 Feature + one over-rejection fix. `make check` GREEN (ZER 901/0). Full design,

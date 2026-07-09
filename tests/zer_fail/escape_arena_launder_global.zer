@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Arena-over-local pointer laundered through a call then stored to a global.
+// The direct form `g = b` is rejected; the call-laundered form must be too.
+// (2026-07-09: arg_is_local_derived was blind to is_arena_derived.)
+struct Blob { u32 v; }
+?*Blob g = null;
+*Blob identity(*Blob b) { return b; }
+void bad() {
+    u8[4096] backing;
+    Arena scratch = Arena.over(backing);
+    *Blob b = scratch.alloc(Blob) orelse return;
+    g = identity(b);
+}
+u32 main() { return 0; }

@@ -1,0 +1,17 @@
+// A bounds guard in switch arm .a must NOT narrow idx for arm .b (VRP scope
+// leak, BH-18 #2 sibling, 2026-07-09). With the fix, arm .b's buf[idx] gets an
+// auto-guard -> early return 0 (idx=9 OOB). A regression drops the guard,
+// executes the OOB write, and reaches `return 1`.
+u32 g = 9;
+enum Mode { a, b }
+u32 main() {
+    u8[4] buf;
+    buf[0] = 0;
+    u32 idx = g;
+    Mode m = Mode.b;
+    switch (m) {
+        .a => { if (idx >= 4) { return 0; } }
+        .b => { buf[idx] = 7; }
+    }
+    return 1;
+}

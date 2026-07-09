@@ -911,7 +911,12 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
         if (arg->kind == NODE_IDENT) {
             Symbol *src = scope_lookup(c->current_scope,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
-            if (src && src->is_local_derived)
+            /* is_arena_derived (2026-07-09): a pointer from a LOCAL arena.alloc()
+             * is frame-bound just like a local — laundering it through a call and
+             * storing the result to a global/return escapes a stack pointer. The
+             * direct-store + keep sinks already reject arena-derived; this launder
+             * path was blind to it (only tested is_local_derived). */
+            if (src && (src->is_local_derived || src->is_arena_derived))
                 return true;
             /* local array passed as slice → points to stack */
             if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
@@ -938,7 +943,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                 bool is_global = scope_lookup_local(c->global_scope,
                     root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                 if (src && !src->is_static && !is_global &&
-                    (src->is_local_derived ||
+                    (src->is_local_derived || src->is_arena_derived ||
                      (src->type &&
                       type_dispatch_kind(src->type) == TYPE_ARRAY)))
                     return true;
@@ -974,7 +979,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
             if (fb && fb->kind == NODE_IDENT) {
                 Symbol *src = scope_lookup(c->current_scope,
                     fb->ident.name, (uint32_t)fb->ident.name_len);
-                if (src && src->is_local_derived)
+                if (src && (src->is_local_derived || src->is_arena_derived))
                     return true;
             }
             /* recurse into nested orelse: o1 orelse o2 orelse &x */
@@ -1000,7 +1005,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                     if (ifb && ifb->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             ifb->ident.name, (uint32_t)ifb->ident.name_len);
-                        if (src && src->is_local_derived)
+                        if (src && (src->is_local_derived || src->is_arena_derived))
                             return true;
                     }
                     inner = ifb;
@@ -1039,7 +1044,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
             if (froot && froot->kind == NODE_IDENT && froot != arg) {
                 Symbol *src = scope_lookup(c->current_scope,
                     froot->ident.name, (uint32_t)froot->ident.name_len);
-                if (src && src->is_local_derived)
+                if (src && (src->is_local_derived || src->is_arena_derived))
                     return true;
             }
         }
@@ -6998,7 +7003,14 @@ static Type *check_expr(Checker *c, Node *node) {
                  * Yield inside: safe at var-decl level (BUG-481 state struct temps).
                  * Unsafe at expression level — caught by GCC ("switch jumps into
                  * statement expression"). No checker ban needed. */
-                check_stmt(c, node->orelse.fallback);
+                /* F-fix (2026-07-09): the fallback block runs only when the
+                 * optional is null — a bounds guard inside it must not leak its
+                 * narrowing past the orelse join (BH-18 #2 sibling). */
+                {
+                    int orelse_saved_rc = c->var_range_count;
+                    check_stmt(c, node->orelse.fallback);
+                    c->var_range_count = orelse_saved_rc;
+                }
                 result = unwrapped;
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
@@ -9697,13 +9709,36 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         return false;
     }
     case NODE_ORELSE:
-        return scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len);
+        if (scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len)) return true;
+        /* C-fix (2026-07-09): the fallback of `x orelse g` (or `orelse (g+1)`)
+         * reads the non-shared global g from the spawned thread. Mirror
+         * collect_shared_types_in_expr — scan the fallback unless it's a bare
+         * return/break/continue (no value expression). */
+        if (node->orelse.fallback && !node->orelse.fallback_is_return &&
+            !node->orelse.fallback_is_break && !node->orelse.fallback_is_continue)
+            return scan_unsafe_global_access(c, node->orelse.fallback, out_name, out_len);
+        return false;
     case NODE_DEFER:
         return scan_unsafe_global_access(c, node->defer.body, out_name, out_len);
     case NODE_SWITCH:
         if (scan_unsafe_global_access(c, node->switch_stmt.expr, out_name, out_len)) return true;
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             if (scan_unsafe_global_access(c, node->switch_stmt.arms[i].body, out_name, out_len)) return true;
+        return false;
+    /* C-fix (2026-07-09): wrapper expressions that carry a global read but were
+     * in the return-false leaf group — a non-shared global read hidden in a
+     * typecast / slice / designated-initializer from a spawned thread evaded the
+     * data-race scan. Same form-coverage class as BH-18 #7 (the deadlock
+     * detector's sibling fix); mirror collect_shared_types_in_expr's recursion. */
+    case NODE_TYPECAST:
+        return scan_unsafe_global_access(c, node->typecast.expr, out_name, out_len);
+    case NODE_SLICE:
+        if (scan_unsafe_global_access(c, node->slice.object, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->slice.start, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->slice.end, out_name, out_len);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            if (scan_unsafe_global_access(c, node->struct_init.fields[i].value, out_name, out_len)) return true;
         return false;
     /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
      * kinds without expressions/bodies that could contain a global
@@ -9719,8 +9754,8 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST:
+    case NODE_SIZEOF:
         return false;
     }
     return false;
@@ -10722,11 +10757,24 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
-                check_stmt(c, node->if_stmt.then_body);
-                pop_scope(c);
+                /* F-fix (2026-07-09): the capture body is CONDITIONALLY executed
+                 * (only when the optional has a value). A bounds guard inside it
+                 * (`if (idx >= N) { return; }`) narrows idx only on the value
+                 * path; its inverse-range narrowing must NOT leak past the
+                 * capture-if join (BH-18 #2 sibling — that fix covered only the
+                 * plain non-comparison if). Save/restore var_range_count around
+                 * each conditional body so the narrowing is discarded at the join. */
+                {
+                    int cap_saved_rc = c->var_range_count;
+                    check_stmt(c, node->if_stmt.then_body);
+                    c->var_range_count = cap_saved_rc;
+                    pop_scope(c);
 
-                if (node->if_stmt.else_body)
-                    check_stmt(c, node->if_stmt.else_body);
+                    if (node->if_stmt.else_body) {
+                        check_stmt(c, node->if_stmt.else_body);
+                        c->var_range_count = cap_saved_rc;
+                    }
+                }
                 break;
             }
         }
@@ -11129,6 +11177,11 @@ static void check_stmt(Checker *c, Node *node) {
 
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
+            /* F-fix (2026-07-09): snapshot the VRP range stack before this arm so
+             * a bounds guard inside one arm cannot narrow a var for sibling arms
+             * or code after the switch — each arm is a conditionally-executed
+             * sub-block (BH-18 #2 sibling). Restored at the end of the arm. */
+            int arm_saved_rc = c->var_range_count;
 
             /* check match values — skip for enum/union dot syntax (.variant) */
             if (!arm->is_enum_dot) {
@@ -11350,6 +11403,9 @@ static void check_stmt(Checker *c, Node *node) {
             } else {
                 check_stmt(c, arm->body);
             }
+            /* F-fix (2026-07-09): discard guard narrowings from this arm's
+             * conditionally-executed body (see snapshot above). */
+            c->var_range_count = arm_saved_rc;
         }
 
         /* exhaustiveness check — unwrap distinct for type dispatch */

@@ -1,0 +1,13 @@
+// A bounds guard inside an orelse fallback block must NOT leak past the join
+// (VRP scope leak, BH-18 #2 sibling, 2026-07-09). maybe() returns a value so the
+// fallback never runs; with the fix buf[idx] is auto-guarded (idx=9 OOB)->return 0.
+u32 g = 9;
+?u32 maybe() { return 7; }
+u32 main() {
+    u8[4] buf;
+    buf[0] = 0;
+    u32 idx = g;
+    u32 v = maybe() orelse { if (idx >= 4) { return 0; } return 0; };
+    buf[idx] = 7;
+    return 1;
+}

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// Non-shared global read in a designated-initializer value from a spawned thread. 2026-07-09.
+u32 g = 5;
+struct Box { u32 a; }
+void worker() { Box b = { .a = g }; if (b.a > 100) { return; } }
+u32 main() { spawn worker(); return 0; }

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// A non-shared global read from a spawned thread, hidden in a typecast, evaded
+// scan_unsafe_global_access (it sat in the return-false leaf group). 2026-07-09.
+u32 g = 5;
+void worker() { u32 x = (u32)g; if (x > 100) { return; } }
+u32 main() { spawn worker(); return 0; }

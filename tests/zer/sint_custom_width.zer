@@ -1,0 +1,17 @@
+// Native arbitrary-width SIGNED integers (Path C): iN with correct two's-complement
+// wrap + sign-extension on the carrier.
+i32 main() {
+    i12 a = 2047;      // max i12 (2^11 - 1)
+    i12 b = a + 1;     // 2048 -> wraps to -2048 (i12 min) via sign-extend
+    if (b != -2048) { return 1; }
+    i12 c = -2048;     // min i12
+    i12 d = c - 1;     // -2049 -> wraps to 2047
+    if (d != 2047) { return 2; }
+    i12 e = -5; i12 f = e + 3;   // -2 (ordinary negative arithmetic)
+    if (f != -2) { return 3; }
+    i12 g = 100; i12 h = g * 30; // 3000 -> signed 12-bit = 3000 - 4096 = -1096
+    if (h != -1096) { return 4; }
+    i5 s = -16; i5 t = s - 1;    // -17 -> wraps to 15 (5-bit signed)
+    if (t != 15) { return 5; }
+    return 0;
+}

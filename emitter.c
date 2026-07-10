@@ -10953,6 +10953,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, " = %s", op);
             emit_local_name(e, func, inst->src1_local);
             emit(e, ";\n");
+            /* Path C: wrap uN/iN unary result — negation (-x) and complement
+             * (~x) can leave bits above N set in the carrier. (! yields a bool;
+             * deref/addr-of already jumped to unop_done.) */
+            if (inst->op_token == TOK_MINUS || inst->op_token == TOK_TILDE) {
+                const char *usp = func->is_async ? "self->" : "";
+                emit_intn_mask(e, &func->locals[inst->dest_local], usp);
+            }
         }
         unop_done:
         break;

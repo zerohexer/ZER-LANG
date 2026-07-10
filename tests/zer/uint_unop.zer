@@ -1,0 +1,14 @@
+// Native uN/iN unary ops wrap to width: ~x (complement) and -x (negation) mask
+// their result to N bits (carrier is wider, so the high bits must be cleared).
+u32 main() {
+    u3 x = 1;
+    u3 c = ~x;           // ~1 masked to 3 bits = 0b110 = 6
+    if (c != 6) { return 1; }
+    u21 a = 0;
+    u21 d = ~a;          // ~0 masked to 21 bits = 2^21 - 1 = 2097151
+    if (d != 2097151) { return 2; }
+    i5 s = -16;          // i5 min
+    i5 neg = -s;         // -(-16) = 16 -> overflows i5 [-16,15] -> wraps to -16
+    if (neg != -16) { return 3; }
+    return 0;
+}

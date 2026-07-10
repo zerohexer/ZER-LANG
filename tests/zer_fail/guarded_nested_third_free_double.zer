@@ -1,0 +1,10 @@
+// EXPECTED: compile error — nested-guard 3rd free is a double free on the !c path
+struct Task { u32 id; }
+Pool(Task, 8) pool;
+void doit(bool c, bool d) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c)  { if (d) { pool.free(h); } }
+    if (!c) { pool.free(h); }
+    if (!c) { pool.free(h); }   // double free on !c path
+}
+u32 main() { doit(false, false); return 0; }

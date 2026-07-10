@@ -1,0 +1,4 @@
+// EXPECTED: compile error — by-value struct carrying a pointer to a stack local passed to fire-and-forget spawn (cross-thread UAF)
+struct Box { *u32 p; }
+void worker(Box b) { u32 x = b.p[0]; }
+u32 main() { u32 local; Box h; h.p = &local; spawn worker(h); return 0; }

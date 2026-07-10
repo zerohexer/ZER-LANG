@@ -382,6 +382,15 @@ static void emit_zero_value(Emitter *e, Type *t) {
  * NODE_INDEX/NODE_FIELD callers want explicit braces+newline (statement form);
  * @cstr inline statement-expression already opened the brace via "if (...) { ". */
 static void emit_safety_early_return(Emitter *e, bool with_braces) {
+    /* Inside a defer body an early-return would re-fire the defer stack and skip
+     * the remaining function cleanup, so a bounds/UAF auto-guard traps instead
+     * (aborts safely before the out-of-bounds access). See Emitter.guard_traps. */
+    if (e->guard_traps) {
+        if (with_braces) emit(e, "{ ");
+        emit(e, "_zer_trap(\"out-of-bounds array access in defer cleanup\", __FILE__, __LINE__);");
+        if (with_braces) emit(e, " }\n"); else emit(e, " ");
+        return;
+    }
     if (with_braces) emit(e, "{\n");
     emit_defers(e);
     if (e->in_async) {
@@ -9126,6 +9135,14 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
     }
     case NODE_EXPR_STMT:
         if (s->expr_stmt.expr) {
+            /* Bounds/UAF auto-guards: defer bodies are raw AST emitted via
+             * emit_rewritten_node and never reached the IR auto-guard pre-pass,
+             * so an unprovable fixed-array index in a defer (`defer arr[i]=x`)
+             * wrote raw (silent OOB). Emit guards in TRAP mode (early-return
+             * would re-fire the defer stack). Mirrors the IR gate at ~11330. */
+            e->guard_traps = true;
+            emit_auto_guards(e, s->expr_stmt.expr);
+            e->guard_traps = false;
             /* Axis B5: lock-wrap a deferred shared-struct access (the IR-path
              * lock-emission doesn't reach raw defer bodies). Write lock if the
              * expression is an assignment, else read lock. Recursive mutex
@@ -9140,6 +9157,11 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         }
         return;
     case NODE_RETURN:
+        if (s->ret.expr) {
+            e->guard_traps = true;
+            emit_auto_guards(e, s->ret.expr);
+            e->guard_traps = false;
+        }
         emit_indent(e);
         emit(e, "return");
         if (s->ret.expr) {
@@ -9158,6 +9180,11 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         }
         return;
     case NODE_IF:
+        if (s->if_stmt.cond) {
+            e->guard_traps = true;
+            emit_auto_guards(e, s->if_stmt.cond);
+            e->guard_traps = false;
+        }
         emit_indent(e);
         emit(e, "if (");
         if (s->if_stmt.cond) emit_rewritten_node(e, s->if_stmt.cond, func);
@@ -9772,11 +9799,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return;\n");
                 }
             } else {
-                /* Bare `return;` from `?void` function means SUCCESS: { has_value=1 }.
-                 * For ?T struct optional, bare return also = success (emit {0, 1}).
+                /* Bare `return;` from `?void` function means SUCCESS: { has_value=1 }
+                 * (?void's only payload IS the success/fail bit, so a value-less
+                 * return is the success case — BUG-563).
+                 * For a ?T (T != void) function a bare `return;` is the failure-
+                 * propagation idiom `x orelse return;` — it carries NO value, so the
+                 * ONLY sound meaning is None: emit { 0, 0 } (has_value=0). Emitting
+                 * { 0, 1 } (the old BUG-563 mirror of ?void) produced a bogus Some(0)
+                 * that the caller treated as a present value — a silent miscompile on
+                 * the failure path (limitations.md 2026-07-08). Explicit `return null`
+                 * takes the need_wrap/is_null_src path and already emits { 0, 0 }.
                  * For plain void return, emit `return;`. For ?*T null-sentinel,
-                 * bare return has no natural value — emit null.
-                 * Only explicit `return null` should emit null literal. */
+                 * bare return has no natural value — emit null. */
                 Type *ret = e->current_func_ret;
                 Type *eff = ret ? type_unwrap_distinct(ret) : NULL;
                 if (eff && eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
@@ -9785,7 +9819,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     } else {
                         emit(e, "return (");
                         emit_type(e, eff);
-                        emit(e, "){ 0, 1 };\n");
+                        emit(e, "){ 0, 0 };\n");
                     }
                 } else {
                     emit_return_null(e);

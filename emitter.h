@@ -63,6 +63,12 @@ typedef struct {
     int spawn_wrapper_capacity;
     int next_spawn_id;      /* counter for unique spawn wrapper IDs */
 
+    /* When true, a safety auto-guard emits a TRAP instead of an early-return.
+     * Set only while emitting a `defer` body: an early-return there would fire
+     * emit_defers() (re-entering the defer stack) and skip the rest of the
+     * function's cleanup — wrong. A trap aborts safely before the OOB access,
+     * matching how slice bounds-checks already behave inside defers. */
+    bool guard_traps;
     /* async function emission state */
     bool in_async;              /* true when emitting inside an async function body */
     int async_yield_id;         /* counter for yield/await state IDs */

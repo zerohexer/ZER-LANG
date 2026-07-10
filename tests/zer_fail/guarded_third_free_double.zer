@@ -1,0 +1,15 @@
+// EXPECTED: compile error — 3rd free on the !c path is a double free (sticky-free_block hole, limitations 2026-07-10)
+struct Task { u32 id; }
+Pool(Task, 8) pool;
+
+void doit(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+    if (!c) { pool.free(h); }
+}
+
+u32 main() {
+    doit(false);
+    return 0;
+}

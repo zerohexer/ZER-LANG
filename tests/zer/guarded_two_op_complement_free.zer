@@ -1,0 +1,8 @@
+struct Task { u32 id; }
+Pool(Task, 8) pool;
+void doit(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+}
+u32 main() { doit(true); return 0; }

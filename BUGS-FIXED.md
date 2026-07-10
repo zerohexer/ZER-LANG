@@ -5,6 +5,139 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-10 — Full-codebase audit: 7 silent safety holes + 1 correctness bug (checker.c, emitter.c, ir_lower.c, zercheck_ir.c)
+
+A deep audit (5 parallel adversarial subagents over escape/keep, UAF/handle-IR,
+AST→IR drift, concurrency, VRP/cast/optional) surfaced **7 verified accept-unsafe /
+silent-miscompile holes and 1 fundamental correctness regression**, all reproduced
+against the real `zerc` and all now FIXED with regression tests. `make check` GREEN
+throughout. None touched an oracle/theorem — every fix is checker/IR/emitter coverage,
+all PURE TIGHTENING except #1 (adds guards) and #6 (restores short-circuit); a mistake
+in any over-guards/over-rejects (safe), never ships UB.
+
+### BUG-A (#4) — bare `orelse return;` in a `?T` function emitted Some(0), not None
+- **Symptom (silent miscompile):** `?u32 get(?*E s){ *E e = s orelse return; return e.value; }`
+  with `s == null` returned `(_zer_opt_u32){0, 1}` — `has_value=1` — so the caller's
+  `if (r) |v|` entered with a bogus `v=0`. Only the FAILURE path; masked whenever the
+  null path isn't taken (why 900+ tests missed it).
+- **Root cause:** emitter.c IR_RETURN bare-return path mirrored `?void`'s success
+  convention onto `?T` (`{0,1}`, BUG-563). `?void`'s only payload IS the success bit, so
+  bare return = success there; a `?T` bare return carries NO value, so the only sound
+  meaning is None.
+- **Fix:** emitter.c ~9788 — `?T` (non-void, non-null-sentinel) bare return now emits
+  `{0, 0}` (None). `?void` unchanged. Explicit `return null` already emitted `{0,0}`.
+- **Test:** `tests/zer/orelse_return_optional_none.zer` (null path → exit 0).
+
+### BUG-B (#3) — spawn data-race scanner blind to wrapper subexpressions
+- **Symptom (🟠 data race):** a spawned worker reading a non-shared global through a
+  cast (`(u64)g`), struct-init (`{.v=g}`), `orelse` FALLBACK (`x orelse g`), or slice
+  (`g_arr[0..4]`) compiled clean — the direct read is rejected. Emitted C had the raw
+  unsynchronized global access inside the worker.
+- **Root cause:** `scan_unsafe_global_access` (checker.c) bucketed NODE_TYPECAST /
+  NODE_SLICE / NODE_STRUCT_INIT into the no-op `return false` group and scanned only
+  `orelse.expr`, not `.fallback` — the same form-coverage class as the T3 field-projection
+  walkers (2026-07-01).
+- **Fix:** added recursing cases (typecast→expr; slice→object+start+end; struct-init→each
+  field; orelse→expr AND fallback), mirroring `scan_body_shared_types`. NODE_CAST stays a
+  leaf (matches the reference walker + emitter).
+- **Tests:** `tests/zer_fail/spawn_global_{cast,structinit,orelse_fallback}_race.zer`.
+
+### BUG-C (#7) — optional pointer/slice field projection escapes (stack UAF)
+- **Symptom (🔴 dangling):** `g = h.p` / `return h.p` where `h.p : ?*T` (or `?[*]T`) and
+  `h` is a local — the local-derived reference escaped to a global/return. The plain
+  `*T`/`[*]T` field form is rejected; the OPTIONAL form was accepted.
+- **Root cause:** the projection-descent gates (checker.c BUG-762 assign sink; P9 keep
+  sink; the projected-return sink) gated on `TYPE_POINTER || TYPE_SLICE` (or
+  `type_can_carry_pointer`, which omits TYPE_OPTIONAL), so a `?*T` field failed the gate,
+  the walk-to-carrier was skipped, and `is_local_derived` was never consulted.
+- **Fix:** use the existing recursive `type_carries_data_pointer()` at all three gates
+  (it descends OPTIONAL/ARRAY/STRUCT/UNION). A scalar-carrying optional (`?u32`) still
+  returns false → not flagged.
+- **Tests:** `tests/zer_fail/escape_opt_field_{global,return}.zer`.
+
+### BUG-D (#8) — spawn of a by-value aggregate carrying a pointer-to-local (cross-thread UAF)
+- **Symptom (🔴 UAF):** `spawn worker(h)` where `h` is a by-value struct with a pointer
+  field to a stack local — the shallow copy still references the dying frame; the direct
+  `spawn worker(&local)` is rejected.
+- **Root cause:** the spawn stack-lifetime check (checker.c ~13159) fired only for
+  `is_ptr_like` (POINTER/SLICE/OPAQUE); a by-value STRUCT/UNION/ARRAY arg was never
+  subjected to `spawn_arg_is_stack_derived`, even though it carries `is_local_derived`.
+- **Fix:** added an aggregate arm — reject a non-scoped spawn arg that is a
+  STRUCT/UNION/ARRAY, `type_carries_data_pointer`, AND `spawn_arg_is_stack_derived`.
+  Scoped to the stack-lifetime hazard (a by-value copy is not shared state, so no
+  data-race arm); a struct whose pointer field targets a global/shared is NOT
+  local-derived → still accepted (verified: no over-rejection).
+- **Test:** `tests/zer_fail/spawn_aggregate_stack_ptr.zer`.
+
+### BUG-E (#5) — fixed-array index inside a `defer` body dropped its auto-guard (silent OOB)
+- **Symptom (🔴 silent OOB):** `defer arr[i] = x` with an unprovable `i` on a fixed array
+  emitted the RAW access with NO bounds guard, though the checker printed "auto-guard
+  inserted". Same access outside a defer is guarded. Slices in defers were unaffected
+  (their check is inline).
+- **Root cause:** defer bodies are raw AST emitted via `emit_rewritten_node` and never
+  reached the IR auto-guard pre-pass (`emit_auto_guards`, which runs on lowered IR only).
+- **Fix:** emitter.c `emit_defer_stmt` now calls `emit_auto_guards` at the expr-stmt /
+  return / if-cond sites, in a new **trap mode** (`Emitter.guard_traps`): an early-return
+  guard would re-fire the defer stack, so `emit_safety_early_return` emits a `_zer_trap`
+  instead (aborts safely before the OOB access, matching slice-in-defer behavior).
+- **Test:** `tests/zer_trap/defer_array_oob.zer` (compiles clean, traps at runtime).
+
+### BUG-F (#2) — Level-B guarded-MAYBE_FREED relaxation missed a double-free via a stale `free_block`
+- **Symptom (🔴 double-free / UAF):** `if(c){free(h)} if(!c){free(h)} if(!c){free(h)}` (or
+  a `pool.get`/use as the 3rd op) compiled clean — a genuine double free / UAF on the `c=false`
+  path. The 2-op control (`if(!c){free} if(!c){free}`) is correctly rejected.
+- **Root cause:** each handle remembered only a SINGLE sticky `free_block` (the FIRST free).
+  After a first free under `{c}`, `ir_use_guard_disjoint` cleared every later `{¬c}` op as
+  "disjoint from `{c}`" — even the 2nd `{¬c}` free, which double-frees the 1st `{¬c}` free.
+  The guarded relaxation is only meant for the TWO-operation complement.
+- **Fix (zercheck_ir.c):** when a SECOND guarded free is allowed (the disjoint branch in the
+  IR_CALL free handler), poison `free_block` to sentinel **-2** ("freed under multiple guards
+  — no single representative"). `ir_use_guard_disjoint` / `ir_free_completes_coverage` already
+  return false for `free_block < 0`, so any 3rd free/use conservatively rejects. Preserved
+  across the CFG: the post-block tagging guard changed `< 0 → == -1`, and the merge carries
+  `-2` from ANY predecessor (order-independent). Certified scope matches the relaxation's
+  intent (2-op complement only); everything else rejects (sound).
+- **Tests:** `tests/zer_fail/guarded_third_free_double.zer`,
+  `tests/zer_fail/guarded_nested_third_free_double.zer` (nested guard — the
+  `freed_all_paths` shortcut alone would miss this; the merge `-2` catches it),
+  `tests/zer/guarded_two_op_complement_free.zer` (the legit 2-op still compiles).
+
+### BUG-G (#1) — VRP join-leak via IN-PLACE range mutation (silent OOB write)
+- **Symptom (🔴 silent OOB):** a range NARROWED by an assignment inside a conditionally-taken
+  branch (`if (cond) { i = 1; }`) leaked past the unconditional join; on the not-taken path
+  `i` held its wide value, but the checker `mark_proven`'d `buf[i]` and emitted NO bounds
+  guard. Verified deterministic struct-field (canary) corruption. A live sibling of the fixed
+  BH-18 #2 through a mechanism the existing fix does not cover.
+- **Root cause:** `vrp_invalidate_for_assign` MUTATES a pre-existing `VarRange` IN PLACE
+  (`i = 1` → [1,1]); the branch `var_range_count` save/restore only drops APPENDED entries,
+  so the in-place narrowing survives the join. (The sound CFG-VRP `vrp_ir.c` that would
+  compute real joins is still orphaned/uncompiled.)
+- **Fix (checker.c):** after every conditionally-executed branch body, WIDEN-to-full
+  (`[MIN,MAX]`, unknown) the tracked range of every variable the branch ASSIGNS
+  (`vrp_widen_branch_writes_to_full`, wired into both comparison and non-comparison branches,
+  then- and else-bodies). Widen-to-full is the sound over-approximation of
+  union(pre-branch, branch-end) — it can only ADD an auto-guard, never drop a needed one.
+  A var NOT assigned in the branch keeps its proven range (verified: no over-guard). This
+  closes the flat pass conservatively until `vrp_ir.c` is wired.
+- **Test:** `tests/zer/vrp_branch_narrow_no_leak.zer` (guarded, no corruption, exit 0).
+
+### BUG-H (#6) — `&&` / `||` did not short-circuit on the IR path (correctness regression)
+- **Symptom (correctness / spurious traps):** the IR 3AC lowering evaluated BOTH operands of
+  `&&`/`||` unconditionally — RHS side effects ran when C would skip them, and the defensive
+  idiom `if (i < len && arr[i])` / `if (n != 0 && x/n)` evaluated the guarded access/division
+  regardless of the guard, spuriously TRAPPING instead of taking the safe branch. Memory-SAFE
+  (ZER's inline guards trap, no UB) but wrong results. Undocumented regression from the AST→IR
+  migration (compiler-internals.md still claimed short-circuit).
+- **Root cause:** `ir_lower.c` NODE_BINARY lowered `left` and `right` with `lower_expr`
+  unconditionally, then emitted one IR_BINOP.
+- **Fix:** route `TOK_AMPAMP` / `TOK_PIPEPIPE` to `passthrough`, so the emitter produces
+  native C `a && b` / `a || b` (which short-circuits); operands are emitted recursively with
+  their inline slice bounds-checks, so those short-circuit too.
+- **Test:** `tests/zer/short_circuit_and_or.zer` (side effects skipped; guarded slice access
+  short-circuits).
+
+---
+
 ## 2026-07-08 — Universal `alloc` / `free` + pointer-return relaxation (checker.c, ir_lower.c, emitter.c, zercheck_ir.c, parser.c)
 
 Feature + one over-rejection fix. `make check` GREEN (ZER 901/0). Full design,

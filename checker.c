@@ -395,6 +395,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
                                        TokenType op, Node *value);
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
+static void vrp_widen_branch_writes_to_full(Checker *c, Node *body);
 
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
@@ -4332,8 +4333,15 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!via_slice_borrow && vnode &&
                 (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt = typemap_get(c, node->assign.value);
-                if (vt && (type_dispatch_kind(vt) == TYPE_POINTER ||
-                           type_dispatch_kind(vt) == TYPE_SLICE)) {
+                /* type_carries_data_pointer (not a bare POINTER||SLICE test): an
+                 * OPTIONAL pointer/slice field (`?*u32 p`) or a nested aggregate
+                 * field also carries a reference into the local backing. The old
+                 * two-kind gate skipped the descent for `g = h.p` where `h.p` is
+                 * `?*T`/`?[*]T`, so `vnode` stayed a NODE_FIELD and the escape
+                 * check below never ran — a verified escape under-rejection. A
+                 * scalar-carrying optional (`?u32`) still returns false → not
+                 * flagged (copies a value, not a reference). */
+                if (vt && type_carries_data_pointer(vt, 0)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -4417,8 +4425,10 @@ static Type *check_expr(Checker *c, Node *node) {
              * projection_preserves_escape / buggy_projection_unsound. */
             if (vnode && (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt2 = typemap_get(c, node->assign.value);
-                if (vt2 && (type_dispatch_kind(vt2) == TYPE_POINTER ||
-                            type_dispatch_kind(vt2) == TYPE_SLICE)) {
+                /* type_carries_data_pointer: an OPTIONAL/nested pointer field
+                 * (`?*T`) laundered from a non-keep param is the same violation
+                 * as a bare pointer field — see the escape-sink twin above. */
+                if (vt2 && type_carries_data_pointer(vt2, 0)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -9697,7 +9707,25 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         return false;
     }
     case NODE_ORELSE:
-        return scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len);
+        /* Scan BOTH sides: a non-shared global read in the fallback
+         * (`maybe() orelse g_counter`) is the same race as one in the primary
+         * expression. The old code omitted .fallback (verified spawn-race hole). */
+        if (scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->orelse.fallback, out_name, out_len);
+    case NODE_TYPECAST:
+        /* A global read wrapped in a C-style cast (`(u64)g_counter`) is the same
+         * race — the wrapper is cosmetic. Was in the no-op group (verified hole). */
+        return scan_unsafe_global_access(c, node->typecast.expr, out_name, out_len);
+    case NODE_SLICE:
+        /* `s = g_arr[0..4]` aliases a global; scan object + bounds. */
+        if (scan_unsafe_global_access(c, node->slice.object, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->slice.start, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->slice.end, out_name, out_len);
+    case NODE_STRUCT_INIT:
+        /* `Box b = { .v = g_counter }` reads a global in a field initializer. */
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            if (scan_unsafe_global_access(c, node->struct_init.fields[i].value, out_name, out_len)) return true;
+        return false;
     case NODE_DEFER:
         return scan_unsafe_global_access(c, node->defer.body, out_name, out_len);
     case NODE_SWITCH:
@@ -9719,8 +9747,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
     return false;
@@ -10874,6 +10901,11 @@ static void check_stmt(Checker *c, Node *node) {
 
                 check_stmt(c, node->if_stmt.then_body);
                 c->var_range_count = saved_range_count; /* restore */
+                /* #1 fix: a comparison branch also leaks an in-place narrowing when
+                 * the branch ASSIGNS a variable OTHER than the compared one (the
+                 * pushed comparison entry only absorbs the compared var). Widen any
+                 * branch-assigned var to full. Runs before the guard-inverse push. */
+                vrp_widen_branch_writes_to_full(c, node->if_stmt.then_body);
 
                 /* Guard pattern: if (cond) { return; } → apply INVERSE after the if */
                 if (is_guard && var_on_left) {
@@ -10930,7 +10962,10 @@ static void check_stmt(Checker *c, Node *node) {
                 if (node->if_stmt.else_body) {
                     /* else-block gets the inverse of then-block's range
                      * (but we already restored, so just check else normally) */
+                    int else_saved = c->var_range_count;
                     check_stmt(c, node->if_stmt.else_body);
+                    c->var_range_count = else_saved;
+                    vrp_widen_branch_writes_to_full(c, node->if_stmt.else_body); /* #1 fix */
                 }
             } else {
                 /* non-comparison condition — no range narrowing.
@@ -10944,9 +10979,14 @@ static void check_stmt(Checker *c, Node *node) {
                 int local_saved = c->var_range_count;
                 check_stmt(c, node->if_stmt.then_body);
                 c->var_range_count = local_saved;
+                /* #1 fix: revert any branch-local IN-PLACE range narrowing the
+                 * count-restore cannot undo — else it leaks past the join and
+                 * elides a bounds guard on the path where the index is OOB. */
+                vrp_widen_branch_writes_to_full(c, node->if_stmt.then_body);
                 if (node->if_stmt.else_body) {
                     check_stmt(c, node->if_stmt.else_body);
                     c->var_range_count = local_saved;
+                    vrp_widen_branch_writes_to_full(c, node->if_stmt.else_body);
                 }
             }
             /* guard ranges stay — they're valid after the if */
@@ -11717,7 +11757,14 @@ static void check_stmt(Checker *c, Node *node) {
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *sym = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
-                        if (sym && (!projected || type_can_carry_pointer(ret_type))) {
+                        /* type_carries_data_pointer (not type_can_carry_pointer): a
+                         * projected OPTIONAL pointer/slice return (`return h.p` with
+                         * h.p : ?*T) carries a reference out of the local `h` but
+                         * TYPE_OPTIONAL is absent from type_can_carry_pointer, so the
+                         * check was skipped — a verified return-escape under-rejection.
+                         * A projected scalar (`return s.len`, `return h.count`) still
+                         * returns false and stays unflagged. */
+                        if (sym && (!projected || type_carries_data_pointer(ret_type, 0))) {
                             /* SAFETY: zer_region_can_escape in src/safety/escape_rules.c
                              * Oracle: lambda_zer_escape/iris_escape_specs.v
                              * Only RegStatic pointers can escape the current scope. */
@@ -13143,6 +13190,28 @@ static void check_stmt(Checker *c, Node *node) {
             bool is_ptr_like = (eff->kind == TYPE_POINTER ||
                                 eff->kind == TYPE_SLICE ||
                                 eff->kind == TYPE_OPAQUE);
+            /* A by-value STRUCT/UNION/ARRAY arg is copied SHALLOW: a pointer/slice
+             * FIELD pointing into a stack local still dangles when the spawning
+             * frame dies (cross-thread UAF). is_ptr_like missed this — the arg's
+             * own kind is aggregate, not pointer. Only the stack-lifetime hazard
+             * applies (a by-value copy is not itself shared state, and the arg is
+             * flagged is_local_derived ONLY when it actually carries a pointer to a
+             * local — so a struct whose pointer field targets a global/shared is
+             * NOT local-derived and stays accepted; no over-rejection). */
+            bool is_ptr_carrier_aggregate = !is_ptr_like &&
+                (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+                 eff->kind == TYPE_ARRAY) &&
+                type_carries_data_pointer(eff, 0);
+            if (is_ptr_carrier_aggregate && !is_scoped &&
+                spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass a by-value aggregate carrying a "
+                    "pointer to a stack local to a fire-and-forget spawn — the "
+                    "shallow copy still references the stack frame, which the "
+                    "thread may outlive (cross-thread use-after-free). Use "
+                    "ThreadHandle + join, or point the field at a shared global",
+                    i + 1);
+            }
             if (is_ptr_like) {
                 bool shared_carrier = false;
                 if (eff->kind == TYPE_POINTER) {
@@ -14845,6 +14914,80 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
      * owns its own ranges). VAR_DECL inner inits shadow rather than
      * widen the outer range.  RETURN/BREAK/CONTINUE/GOTO/LABEL/YIELD/
      * AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
+}
+
+/* #1 VRP join-leak fix (2026-07-10): widen ONE assignment target's tracked range
+ * to FULL (unknown). Handles both a plain ident (`i`) and a compound key
+ * (`s.field`, `a[k]`), mirroring the dual invalidation the assignment checker
+ * does at check-time. Only touches EXISTING ranges (find_var_range → NULL is a
+ * no-op), so a var without a prior range is unaffected. */
+static void vrp_widen_one_target_to_full(Checker *c, Node *t) {
+    if (!t) return;
+    if (t->kind == NODE_IDENT) {
+        struct VarRange *r = find_var_range(c, t->ident.name, (uint32_t)t->ident.name_len);
+        if (r) { r->min_val = INT64_MIN; r->max_val = INT64_MAX; r->known_nonzero = false; }
+        return;
+    }
+    if (t->kind == NODE_FIELD || t->kind == NODE_INDEX) {
+        ExprKey ek = build_expr_key_a(c, t);
+        if (ek.len > 0) {
+            struct VarRange *r = find_var_range(c, ek.str, (uint32_t)ek.len);
+            if (r) { r->min_val = INT64_MIN; r->max_val = INT64_MAX; r->known_nonzero = false; }
+        }
+        Node *root = t;
+        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX))
+            root = (root->kind == NODE_FIELD) ? root->field.object : root->index_expr.object;
+        if (root && root->kind == NODE_IDENT) {
+            struct VarRange *r = find_var_range(c, root->ident.name, (uint32_t)root->ident.name_len);
+            if (r) { r->min_val = INT64_MIN; r->max_val = INT64_MAX; r->known_nonzero = false; }
+        }
+    }
+}
+
+/* #1 VRP join-leak fix (2026-07-10): after a CONDITIONALLY-executed branch body,
+ * widen to FULL (unknown) the tracked range of every variable the branch ASSIGNS.
+ * WHY: the flat VRP pass narrows a range IN PLACE (vrp_invalidate_for_assign:
+ * `i = 1` → [1,1]); the branch's `var_range_count` save/restore only drops
+ * APPENDED entries, so a branch-local narrowing of a PRE-EXISTING range leaks past
+ * the unconditional join. mark_proven then silently elides the bounds guard on the
+ * path where the index is OUT OF BOUNDS (verified deterministic struct corruption).
+ * Widen-to-full is the sound over-approximation of union(pre-branch, branch-end):
+ * never narrower than the true post-join range, so it can only ADD an auto-guard,
+ * never DROP a needed one. Recursion mirrors vrp_invalidate_loop_body_writes. The
+ * proper fix is the CFG-VRP (vrp_ir.c) that computes real joins; this closes the
+ * flat pass's unsoundness conservatively until then. */
+static void vrp_widen_branch_writes_to_full(Checker *c, Node *body) {
+    if (!body) return;
+    NodeKind k = body->kind;
+    if (k == NODE_ASSIGN) {
+        vrp_widen_one_target_to_full(c, body->assign.target);
+        vrp_widen_branch_writes_to_full(c, body->assign.value);
+    } else if (k == NODE_BLOCK) {
+        for (int i = 0; i < body->block.stmt_count; i++)
+            vrp_widen_branch_writes_to_full(c, body->block.stmts[i]);
+    } else if (k == NODE_IF) {
+        vrp_widen_branch_writes_to_full(c, body->if_stmt.then_body);
+        vrp_widen_branch_writes_to_full(c, body->if_stmt.else_body);
+    } else if (k == NODE_FOR) {
+        vrp_widen_branch_writes_to_full(c, body->for_stmt.init);
+        vrp_widen_branch_writes_to_full(c, body->for_stmt.step);
+        vrp_widen_branch_writes_to_full(c, body->for_stmt.body);
+    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        vrp_widen_branch_writes_to_full(c, body->while_stmt.body);
+    } else if (k == NODE_SWITCH) {
+        for (int i = 0; i < body->switch_stmt.arm_count; i++)
+            vrp_widen_branch_writes_to_full(c, body->switch_stmt.arms[i].body);
+    } else if (k == NODE_EXPR_STMT) {
+        vrp_widen_branch_writes_to_full(c, body->expr_stmt.expr);
+    } else if (k == NODE_DEFER) {
+        vrp_widen_branch_writes_to_full(c, body->defer.body);
+    } else if (k == NODE_CRITICAL) {
+        vrp_widen_branch_writes_to_full(c, body->critical.body);
+    } else if (k == NODE_ONCE) {
+        vrp_widen_branch_writes_to_full(c, body->once.body);
+    }
+    /* Other kinds: no assignment subtree (calls own their locals; VAR_DECL inits
+     * shadow rather than mutate an outer range). */
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */

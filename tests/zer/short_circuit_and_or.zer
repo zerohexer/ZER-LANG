@@ -1,0 +1,24 @@
+// Regression (#6, 2026-07-10): `&&` and `||` must SHORT-CIRCUIT. The IR 3AC path
+// lowered both operands unconditionally; now `&&`/`||` pass through to native C.
+u32 side_called;
+bool side(u32 v) { side_called = v; return true; }
+u32 main() {
+    // `||` with true LHS must NOT evaluate the RHS
+    side_called = 0;
+    bool t = true;
+    if (t || side(99)) { }
+    if (side_called != 0) { return 1; }   // fail: RHS ran
+
+    // `&&` with false LHS must NOT evaluate the RHS
+    side_called = 0;
+    bool f = false;
+    if (f && side(88)) { }
+    if (side_called != 0) { return 2; }   // fail: RHS ran
+
+    // defensive idiom: guarded slice access must short-circuit (no OOB trap)
+    const [*]u8 s = "hi";                  // len 2
+    u32 i = 5;
+    if (i < s.len && s[i] != 0) { return 3; }  // i<len false -> s[i] not evaluated
+
+    return 0;                              // all correct
+}

@@ -1,0 +1,13 @@
+// Regression: bare `orelse return;` in a ?T function must yield None (has_value=0),
+// not a bogus Some(0). Was emitter.c {0,1}; fixed to {0,0}. (limitations 2026-07-08)
+struct E { u32 value; }
+?u32 get(?*E slot) {
+    *E e = slot orelse return;   // null slot -> None, NOT Some(0)
+    return e.value;
+}
+u32 main() {
+    ?*E nothing = null;
+    ?u32 r = get(nothing);
+    if (r) |v| { return 100 + v; }  // must NOT enter (would mean bogus has_value)
+    return 0;                        // correct: None -> exit 0
+}

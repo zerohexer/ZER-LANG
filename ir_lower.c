@@ -434,6 +434,16 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Binary operations: decompose both sides ---- */
     case NODE_BINARY: {
+        /* #6 fix (2026-07-10): `&&` / `||` MUST short-circuit. The 3AC path below
+         * lowers BOTH operands unconditionally, which (a) runs RHS side effects
+         * that C would skip and (b) defeats the defensive idiom `if (i < len &&
+         * arr[i])` / `if (n != 0 && x/n)` — the guarded access/division ran anyway
+         * and spuriously trapped instead of taking the safe branch. Route to
+         * passthrough so the emitter produces native C `a && b` / `a || b` (which
+         * short-circuits); each operand is emitted recursively WITH its inline
+         * slice bounds-check, so those short-circuit too. */
+        if (expr->binary.op == TOK_AMPAMP || expr->binary.op == TOK_PIPEPIPE)
+            goto passthrough;
         /* Complex operand types need emit_expr (opaque .ptr, struct compare, etc.) */
         Type *lt = checker_get_type(ctx->checker, expr->binary.left);
         Type *rty = checker_get_type(ctx->checker, expr->binary.right);

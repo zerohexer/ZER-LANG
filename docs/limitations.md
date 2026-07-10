@@ -5,17 +5,31 @@ Entries removed once fixed.
 
 ---
 
+## FIXED 2026-07-10 — full-codebase audit closed 7 silent safety holes + 1 correctness bug
+
+A 5-subagent adversarial audit found and FIXED (all verified, all with regression tests,
+`make check` GREEN, ZER 914/0): BUG-A `orelse return;`→Some(0) miscompile; BUG-B spawn
+data-race scanner blind to cast/slice/struct-init/orelse-fallback wrappers; BUG-C optional
+(`?*T`) field-projection escape (stack UAF); BUG-D spawn of a by-value aggregate carrying a
+pointer-to-local (cross-thread UAF); BUG-E fixed-array index in a `defer` body dropped its
+bounds guard (silent OOB); BUG-F Level-B guarded-MAYBE_FREED double-free via a stale
+`free_block`; BUG-G VRP join-leak via in-place range mutation (silent OOB write); BUG-H
+`&&`/`||` did not short-circuit on the IR path. Full symptom/root-cause/fix/test for each:
+**BUGS-FIXED.md 2026-07-10**. The individual OPEN entries below (VRP #2, FLAG #1) are
+annotated with their fix status inline.
+
+---
+
 ## OPEN — findings surfaced during the universal-`alloc` build (2026-07-08) (mostly LOW/MEDIUM, none an active soundness hole)
 
 Bugs found while building `alloc`/`free` (docs/universal_alloc.md) but out of that
 scope, so NOT fixed. Full write-ups (repro + root cause) in
 **docs/universal_alloc.md §11**. Triage:
 
-- **MEDIUM — bare `orelse return;` inside a `?T`-returning function yields a wrong
-  `None`.** `?u32 f(){ *E e = slot orelse return; return e.value; }` with `slot`
-  null: the caller sees `f()` as HAVING a value. Only the BARE form in a `?T`
-  function; the block form `orelse { …; return null; }` and explicit `return
-  null;` are fine. A correctness bug (wrong runtime behavior), narrow.
+- ✅ **FIXED 2026-07-10 (BUG-A) — bare `orelse return;` inside a `?T`-returning
+  function yielded a wrong Some(0)** (was: the caller saw `f()` as HAVING a value).
+  emitter.c bare-return path mirrored `?void`'s success `{0,1}` onto `?T`; now emits
+  None `{0,0}`. Test `tests/zer/orelse_return_optional_none.zer`. BUGS-FIXED.md 2026-07-10.
 - **MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
   `handle.elem`.** Any `container` field shaped `Handle(T)`/`?Handle(T)` fails
   with "undefined type 'T'" (breaks self-referential `container Chained(T){
@@ -225,6 +239,15 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
   simple grep can't catch the gate-list-completeness risk (the real failure mode), and the
   manual protocol in compiler-internals.md "AST→IR emission diff audit" remains the tool. The
   two T2 holes were the live instances; the class is now closed.
+  - ⚠️ **CORRECTION 2026-07-10:** the "class is now closed" claim was OVER-stated. The
+    2026-07-10 audit found a THIRD drift instance the "AUDITED CLEAN" pass missed:
+    **`defer` bodies** (raw AST emitted via `emit_rewritten_node`) never reached the IR
+    auto-guard pre-pass, so a fixed-array index in a defer dropped its bounds guard (silent
+    OOB) — BUG-E, FIXED (emitter.c `emit_defer_stmt` now runs `emit_auto_guards` in trap
+    mode). The structural reason (3AC decomposes accesses) does NOT hold for raw-AST bodies
+    (defer / spawn-arg / await-cond), which is exactly where all THREE drift instances lived.
+    The gate-list / raw-AST-body completeness risk remains un-gated; the manual protocol
+    stands.
 - ✅ **FLAG #2 — RESOLVED (2026-07-01).** `tools/audit_type_dispatch.sh` now ALSO scans the
   syntactic `TypeNode` axis (`->kind == TYNODE_` / `!= TYNODE_`); the 12 legitimate existing
   sites are baselined and a NEW TYNODE dispatch trips the gate (validated by inject-and-revert).
@@ -344,12 +367,18 @@ from this ledger after the parallel workflow rate-limited).
 - **move-struct alias** (#1, line ~1551) — an alias taken BEFORE the move-transfer isn't
   registered in the source's state group, so TRANSFERRED doesn't propagate → free/move
   tracking defeated.
-- **VRP scope-leak OOB** (#2, line ~1636) — a branch-local range narrowing leaks past a
-  control-flow join (flat AST `var_range_count` not saved/restored on the non-comparison
-  branch) → the compiler proves `buf[idx]` safe and emits NO bounds check on a path where
-  `idx` is OOB. ROOT: the sound CFG-VRP `vrp_ir.c` is orphaned (absent from the Makefile,
-  not even compiled); production runs the unsound flat pass. Oracle now exists
-  (lambda_zer_bounds/bounds_lattice.v `elide_on_join_sound`); fix = wire `vrp_ir.c`.
+- ✅ **VRP scope-leak OOB** (#2) — **SOUNDNESS FIXED 2026-07-10 (BUG-G); precision
+  upgrade still open.** Was: a branch-local range narrowing leaked past a control-flow
+  join → NO bounds check on a path where `idx` is OOB. The 2026-07-01 fix saved/restored
+  `var_range_count`, but that only drops APPENDED entries — `vrp_invalidate_for_assign`
+  MUTATES a pre-existing `VarRange` IN PLACE (`i = 1` → [1,1]), which survived the join
+  (verified deterministic canary corruption). FIXED conservatively: after every
+  conditionally-executed branch, `vrp_widen_branch_writes_to_full` widens to full
+  (`[MIN,MAX]`) the range of every var the branch ASSIGNS — the sound over-approximation
+  of the join (can only ADD a guard). Test `tests/zer/vrp_branch_narrow_no_leak.zer`.
+  The flat pass is now SOUND but COARSE; wiring the sound CFG-VRP `vrp_ir.c` (still
+  orphaned; oracle `lambda_zer_bounds/bounds_lattice.v elide_on_join_sound`) remains the
+  PRECISION upgrade that would recover the guards this conservative widen adds.
 - **fixed-array bare-call index** (#5, line ~1786) — `arr[f()]` on a fixed array drops the
   bounds check on the bare-call single-eval emission path.
 - **`|*v|` capture escape** (#6, line ~1829) — the `if(opt)|*v|` capture binds `v=&m.value`

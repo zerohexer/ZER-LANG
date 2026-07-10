@@ -1,0 +1,5 @@
+// EXPECTED: compile error — ?*T field projected out of a local escapes to a global (dangling)
+struct Box { ?*u32 p; }
+?*u32 g = null;
+void store() { u32 local; Box h; h.p = &local; g = h.p; }
+u32 main() { return 0; }

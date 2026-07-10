@@ -717,3 +717,5 @@ emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
 emitter.c:if (ta->kind == TYNODE_NAMED) {
 zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
 zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+checker.c:(eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+checker.c:eff->kind == TYPE_ARRAY) &&

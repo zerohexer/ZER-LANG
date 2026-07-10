@@ -1,0 +1,6 @@
+// EXPECTED: compile error — orelse-fallback reads non-shared global in spawned worker (data race)
+u32 g_counter;
+threadlocal u32 sink;
+?u32 maybe_none() { return null; }
+void worker() { sink = maybe_none() orelse g_counter; }
+u32 main() { spawn worker(); g_counter = 5; return 0; }

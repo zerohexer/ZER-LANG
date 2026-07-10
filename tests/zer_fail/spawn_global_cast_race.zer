@@ -1,0 +1,5 @@
+// EXPECTED: compile error — cast-wrapped non-shared global read in spawned worker (data race)
+u32 g_counter;
+threadlocal u64 tl_acc;
+void worker() { tl_acc = tl_acc + (u64)g_counter; }
+u32 main() { spawn worker(); g_counter = 5; return 0; }

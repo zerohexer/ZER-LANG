@@ -974,9 +974,18 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle, so a MAYBE_FREED handle remembers WHERE it was freed (used
              * by the guard-disjointness check at the use). Mirror of the
              * free_line carry above; only fill when rh has none of its own. */
-            if (rh->state == IR_HS_MAYBE_FREED && rh->free_block < 0 &&
+            if (rh->state == IR_HS_MAYBE_FREED && rh->free_block == -1 &&
                 ph->free_block >= 0) {
                 rh->free_block = ph->free_block;
+            }
+            /* Propagate the -2 "freed under multiple guards" poison from ANY
+             * predecessor (order-independent — a later pred with a real block
+             * must not overwrite an earlier pred's -2, and the `== -1` carry
+             * above already refuses to touch a -2 rh). Keeps the sticky-
+             * free_block double-free fix sound across CFG joins. */
+            if (ph->free_block == -2 &&
+                (rh->state == IR_HS_MAYBE_FREED || rh->state == IR_HS_FREED)) {
+                rh->free_block = -2;
             }
             /* Level B: OR-carry the all-paths-freed flag. Sound because it is
              * only set for SINGLETON complementary coverage (no path leaves the
@@ -2696,6 +2705,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                      * double-free. If it is the exact complement, the handle is
                      * now freed on ALL paths (clears the leak check). */
                     if (ir_free_completes_coverage(zc, h)) h->freed_all_paths = 1;
+                    /* The guarded relaxation supports exactly the TWO-operation
+                     * complement (`if(c){free} if(!c){free|use}`). This is the
+                     * SECOND guarded free — it consumes the one-shot. Poison
+                     * free_block to -2 so a THIRD free/use can no longer prove
+                     * disjointness against a single STALE free block (the sticky-
+                     * free_block hole: with one remembered free, `if(c){free}
+                     * if(!c){free} if(!c){free}` cleared the 2nd+3rd frees as
+                     * "disjoint from {c}" and missed the ¬c-path double free).
+                     * -2 < 0 makes ir_use_guard_disjoint / ir_free_completes_
+                     * coverage return false → every later op conservatively
+                     * rejects. Preserved by the tagging (== -1 guard) and the
+                     * merge (-2 propagation) below. Must run AFTER the coverage
+                     * check, which reads the real (first) free_block. */
+                    h->free_block = -2;
                 } else {
                     ir_zc_error(zc, inst->source_line,
                         "freeing %%%d which may already be freed",
@@ -3932,6 +3955,19 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
                                     h->freed_all_paths = 1;
+                                /* SECOND guarded free consumes the one-shot
+                                 * two-operation complement relaxation. Poison
+                                 * free_block to -2 so a THIRD free/use can no
+                                 * longer prove disjointness against a single
+                                 * STALE free block (the sticky-free_block
+                                 * double-free hole: `if(c){free} if(!c){free}
+                                 * if(!c){free}` masked the ¬c-path double free).
+                                 * -2 < 0 → ir_use_guard_disjoint /
+                                 * ir_free_completes_coverage return false → every
+                                 * later op conservatively rejects. Preserved by
+                                 * the tagging (== -1 guard) + merge (-2 carry).
+                                 * AFTER the coverage read (it uses real fb). */
+                                h->free_block = -2;
                             } else {
                                 ir_zc_error(zc, inst->source_line,
                                     "freeing local %%%d which may already be freed",
@@ -4831,7 +4867,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
              * (state only), so this can't perturb the fixed point. */
             for (int hi = 0; hi < merged.handle_count; hi++) {
                 if (merged.handles[hi].state == IR_HS_FREED &&
-                    merged.handles[hi].free_block < 0) {
+                    merged.handles[hi].free_block == -1) {
                     merged.handles[hi].free_block = bi;
                 }
             }
@@ -4961,7 +4997,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
          * block_states[bi], read by later blocks' merges in this same pass). */
         for (int hi = 0; hi < merged.handle_count; hi++) {
             if (merged.handles[hi].state == IR_HS_FREED &&
-                merged.handles[hi].free_block < 0) {
+                merged.handles[hi].free_block == -1) {
                 merged.handles[hi].free_block = bi;
             }
         }

@@ -1,0 +1,20 @@
+// Regression (#1, limitations 2026-07-10): a range NARROWED by an assignment inside
+// a conditionally-taken branch must NOT leak past the join and elide the bounds guard.
+// seed=0 -> cond false -> i stays 4 (OOB for buf[4]); the auto-guard must fire and
+// prevent the OOB write (early-return 0), NOT silently corrupt the canary.
+u32 ext(u32 x) { return x; }
+bool extb(u32 x) { return x != 0; }
+struct Box { u8[4] buf; u32 canary; }
+u32 run(u32 seed) {
+    Box b;
+    b.canary = 77;
+    u32 i = 0;
+    i += ext(4);              // i = 4 (one past buf); range entry is wide
+    bool cond = extb(seed);   // non-comparison bool condition
+    if (cond) { i = 1; }      // in-place narrow to [1,1] — must NOT leak
+    b.buf[i] = 200;           // seed=0: i=4 OOB -> guard fires -> early return 0
+    return b.canary;          // reached only on the in-bounds path
+}
+u32 main() {
+    return run(0);            // OOB path -> guarded -> returns 0 (exit 0)
+}

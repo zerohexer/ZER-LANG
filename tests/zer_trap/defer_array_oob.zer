@@ -1,0 +1,4 @@
+// Compiles clean; the unprovable defer index (i=30) must TRAP, not silently write OOB.
+u32 mkidx() { u32 i = 0; for (u32 k = 0; k < 30; k += 1) { i += 1; } return i; }
+u32 writeit() { u32[8] arr; u32 i = mkidx(); defer arr[i] = 57005; return 0; }
+u32 main() { return writeit(); }

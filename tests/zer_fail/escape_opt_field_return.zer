@@ -1,0 +1,4 @@
+// EXPECTED: compile error — returning a ?*T field projected out of a local (dangling)
+struct Box { ?*u32 p; }
+?*u32 leak() { u32 local; Box h; h.p = &local; return h.p; }
+u32 main() { return 0; }

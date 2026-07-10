@@ -5,27 +5,25 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish + proof)
+## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 
 Native arbitrary-width integers `uN`/`iN` shipped (BUGS-FIXED.md 2026-07-09,
-commits e7ea2bcb/d91d0742/80183261; `make check` GREEN). Remaining edges:
+commits e7ea2bcb/d91d0742/80183261; `make check` GREEN). The type-kind
+predicates are VST-verified for `TYPE_UINT`/`TYPE_SINT` (Level-3 restored,
+`verif_type_kind.v`, verified via `make check-vst` 2026-07-10). Remaining edges:
 
-- **VST proof (MEDIUM — proof debt, not a runtime hole).** `src/safety/type_kind.c`
-  (`is_integer`/`is_numeric`/`is_signed`/`is_unsigned`) now recognise
-  `TYPE_UINT`/`TYPE_SINT`, but `verif_type_kind.v` (their Coq spec) was NOT
-  updated. `make check` is green (it doesn't run VST); `make check-vst` would
-  diverge until the `.v` gets the `ZER_TK_UINT=30`/`SINT=31` cases. Level-3
-  (real-code-matches-spec) is temporarily off for those two kinds. Fix: add the
-  two cases + proofs to `verif_type_kind.v`.
 - **VRP mask-elision (LOW — performance).** `emit_intn_mask` always emits the
   `& (2^N-1)` after `uN` arithmetic. Sound but not minimal: where VRP can prove
   the result already fits N bits (bounded counters, constants), the mask should
   be elided → single machine op. Also the invariant-preserving ops (`& | ^ >>`)
-  never need the mask and could skip it unconditionally. Not built.
+  never need the mask and could skip it unconditionally. Not built. (Explicitly
+  deferred 2026-07-10 — a Rice-bounded precision optimization on the least-
+  important axis, not a correctness matter; see BUGS-FIXED.md.)
 - **`uN`/`iN` mask coverage gaps (LOW).** `emit_intn_mask` is wired into
-  `IR_BINOP` (general arithmetic + shift). NOT masked: unary negation (`-x` on a
-  `uN`) and global-scope arithmetic (AST `NODE_BINARY` at emitter.c ~5897). Add
-  the mask at those sites for full coverage.
+  `IR_BINOP` (general arithmetic + shift) and `IR_UNOP` (negation/complement,
+  commit 9fa81989). NOT masked: global-scope arithmetic (AST `NODE_BINARY` at
+  emitter.c ~5897 — rare, const-folded in practice). Add the mask there for
+  full coverage.
 - **Single-bit `reg[5]` shorthand — an ARCHITECT DECISION, not a mechanical fix.**
   A bare single index on a scalar integer (`reg[5]`) errors "cannot index type";
   use the range form `reg[5..5]` (works today, read + write). Making `reg[5]` a

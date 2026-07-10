@@ -7,11 +7,11 @@
 
    Functions verified (all linked into zerc):
      zer_type_kind_is_integer(int kind)
-       returns 1 iff kind ∈ {U8..U64, USIZE, I8..I64, ENUM}
+       returns 1 iff kind ∈ {U8..U64, USIZE, I8..I64, ENUM, UINT, SINT}
      zer_type_kind_is_signed(int kind)
-       returns 1 iff kind ∈ {I8..I64, ENUM}
+       returns 1 iff kind ∈ {I8..I64, ENUM, SINT}
      zer_type_kind_is_unsigned(int kind)
-       returns 1 iff kind ∈ {U8..U64, USIZE}
+       returns 1 iff kind ∈ {U8..U64, USIZE, UINT}
      zer_type_kind_is_float(int kind)
        returns 1 iff kind ∈ {F32, F64}
      zer_type_kind_is_numeric(int kind)
@@ -51,6 +51,8 @@ Definition ZER_TK_OPAQUE     : Z := 21.
 Definition ZER_TK_STRUCT     : Z := 17.
 Definition ZER_TK_UNION      : Z := 19.
 Definition ZER_TK_ENUM       : Z := 18.
+Definition ZER_TK_UINT       : Z := 30.  (* Path C: uN arbitrary-width unsigned *)
+Definition ZER_TK_SINT       : Z := 31.  (* Path C: iN arbitrary-width signed *)
 
 (* ---- Coq specifications ---- *)
 
@@ -65,6 +67,8 @@ Definition zer_type_kind_is_integer_coq (k : Z) : Z :=
   else if Z.eq_dec k ZER_TK_I32   then 1
   else if Z.eq_dec k ZER_TK_I64   then 1
   else if Z.eq_dec k ZER_TK_ENUM  then 1
+  else if Z.eq_dec k ZER_TK_UINT  then 1
+  else if Z.eq_dec k ZER_TK_SINT  then 1
   else 0.
 
 Definition zer_type_kind_is_signed_coq (k : Z) : Z :=
@@ -73,6 +77,7 @@ Definition zer_type_kind_is_signed_coq (k : Z) : Z :=
   else if Z.eq_dec k ZER_TK_I32  then 1
   else if Z.eq_dec k ZER_TK_I64  then 1
   else if Z.eq_dec k ZER_TK_ENUM then 1
+  else if Z.eq_dec k ZER_TK_SINT then 1
   else 0.
 
 Definition zer_type_kind_is_unsigned_coq (k : Z) : Z :=
@@ -81,6 +86,7 @@ Definition zer_type_kind_is_unsigned_coq (k : Z) : Z :=
   else if Z.eq_dec k ZER_TK_U32   then 1
   else if Z.eq_dec k ZER_TK_U64   then 1
   else if Z.eq_dec k ZER_TK_USIZE then 1
+  else if Z.eq_dec k ZER_TK_UINT  then 1
   else 0.
 
 Definition zer_type_kind_is_float_coq (k : Z) : Z :=
@@ -102,6 +108,8 @@ Definition zer_type_kind_is_numeric_coq (k : Z) : Z :=
   else if Z.eq_dec k ZER_TK_I32   then 1
   else if Z.eq_dec k ZER_TK_I64   then 1
   else if Z.eq_dec k ZER_TK_ENUM  then 1
+  else if Z.eq_dec k ZER_TK_UINT  then 1
+  else if Z.eq_dec k ZER_TK_SINT  then 1
   else if Z.eq_dec k ZER_TK_F32   then 1
   else if Z.eq_dec k ZER_TK_F64   then 1
   else 0.

@@ -46,7 +46,24 @@ paths. `u256_add` threads carry across limbs.
 Tests: `tests/zer/{uint_custom_width,sint_custom_width,addc_basic,subb_basic,mulw_basic,u256_add_addc}.zer`,
 `tests/zer_fail/{addc_arity,bitslice_overwidth}.zer`.
 
-Open follow-ups: see `docs/limitations.md` "native uN/iN".
+**Update 2026-07-10 — VST Level-3 restored + unop masking.** Two follow-ups closed:
+(1) `emit_intn_mask` now also runs on `IR_UNOP` (negation `-x` / complement `~x`)
+so `~x` on a `u3` = 6, etc. wrap to width (commit 9fa81989, `tests/zer/uint_unop.zer`).
+(2) `proofs/vst/verif_type_kind.v` updated with the `ZER_TK_UINT=30`/`SINT=31`
+constants + the UINT/SINT cases in the `is_integer`/`is_signed`/`is_unsigned`/
+`is_numeric` Coq specs. The generic `repeat forward_if; ... repeat (destruct
+(Z.eq_dec _ _))` proof pattern absorbs the extra branches unchanged. Verified with
+the `zer-vst` image (clightgen regenerates `type_kind.v` from the edited C; `coqc`
+checks the proof against the specs) → `VERIF_OK`. Spec is oracle-driven ("uN is an
+unsigned integer, iN is signed"), which the C matches. Only `verif_type_kind.v`
+imports `zer_safety.type_kind` (grep-confirmed), so the change is independent of the
+other 29 VST predicate files. Level-3 (real-code-matches-spec) is back on for these
+7 type-kind predicates.
+
+Open follow-ups: see `docs/limitations.md` "native uN/iN". VRP mask-elision is
+explicitly DEFERRED (a Rice-bounded precision optimization — build more inference to
+elide a cheap `and` where provably in-range; marginal perf on the least-important
+axis, not a correctness/safety matter; often already elided by GCC at -O2).
 
 ---
 

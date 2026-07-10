@@ -26,10 +26,17 @@ commits e7ea2bcb/d91d0742/80183261; `make check` GREEN). Remaining edges:
   `IR_BINOP` (general arithmetic + shift). NOT masked: unary negation (`-x` on a
   `uN`) and global-scope arithmetic (AST `NODE_BINARY` at emitter.c ~5897). Add
   the mask at those sites for full coverage.
-- **Single-bit `reg[5]` shorthand (LOW — ergonomics).** A bare single index on a
-  scalar integer (`reg[5]`) errors "cannot index type"; use the range form
-  `reg[5..5]`. Routing `NODE_INDEX` on a scalar-int into the bit-extraction path
-  (read + write, checker + emitter) is the fix.
+- **Single-bit `reg[5]` shorthand — an ARCHITECT DECISION, not a mechanical fix.**
+  A bare single index on a scalar integer (`reg[5]`) errors "cannot index type";
+  use the range form `reg[5..5]` (works today, read + write). Making `reg[5]` a
+  bit-access is a 2-line rewrite (`NODE_INDEX` → `NODE_SLICE[N..N]` in the
+  checker), and it works — BUT it conflicts with an INTENTIONAL safety design:
+  ZER deliberately rejects indexing a scalar integer (`u32_var[i]`) to catch
+  "I thought this was an array" bugs (C unit test "index u32 rejected"). Bit
+  access uses the explicit range syntax on purpose. Flipping `scalar[5]` from an
+  error to a silent bit-access removes that guard — a safety tradeoff to decide
+  deliberately, not slip in. (Attempted + reverted 2026-07-09: the rewrite broke
+  that test; `reg[5..5]` remains the way unless the design is changed on purpose.)
 - **`>64`-bit `uN` uses emulated multi-word arithmetic** (carrier is `__int128`
   ≤128; the `emit_intn_mask` __int128 branch). For hand-tuned big-int use the
   `@addc`/`@subb`/`@mulw` carry primitives + a limb struct (library).

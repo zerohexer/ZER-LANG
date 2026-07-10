@@ -5,6 +5,51 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-09 — Native arbitrary-width integers `uN`/`iN` + `@addc`/`@subb`/`@mulw` carry primitives (types.*, checker.c, emitter.c, src/safety/type_kind.*)
+
+Feature + one silent-truncation fix. `make check` GREEN (ZER 909). Commits
+`e7ea2bcb` (uN/iN + carry primitives), `d91d0742` (over-width bit-slice fix),
+`80183261` (signed test).
+
+**Native `uN`/`iN` (Path C, finished this session):** `u21`, `i48`, `u3`,
+`u128` … as first-class types (widths 1..128). The type representation
+(`TYPE_UINT`/`TYPE_SINT` + `.intn.bits`, carrier emission) was pre-existing
+scaffolding; three pieces were missing and added here:
+- **Front door** — `resolve_type` TYNODE_NAMED now maps `u<N>`/`i<N>` names to
+  `type_uint`/`type_sint` (`parse_intn_width`). `u8/16/32/64` stay keywords and
+  never reach it.
+- **Width masking** — `emit_intn_mask` (emitter, in `IR_BINOP` after arithmetic
+  + shift) masks the result to N bits: `uN` bitmask `& (2^N-1)`, `iN` sign-extend
+  (unsigned-shift then arithmetic `>>`, avoids signed-shift UB). Native widths
+  (8/16/32/64/128) self-wrap → no mask. So odd widths wrap at 2^N, not the
+  carrier width.
+- **Type-kind predicates** — `src/safety/type_kind.c` (`is_integer`, `is_numeric`,
+  `is_signed`, `is_unsigned`) + `type_kind.h` now recognise `TYPE_UINT`/`TYPE_SINT`
+  (ZER_TK_UINT=30/SINT=31). Without this, `u21` was not seen as an integer and
+  every use (literal-fits, arithmetic) failed.
+
+**Root-cause note (registration):** `AddCarry64`/native-type registration in
+`checker_check` was silently NOT running — that isn't the entry point for the
+compile path; moved to `checker_init` (always runs once per checker). Same
+lesson as prior "register in the always-run init" fixes.
+
+**Silent-truncation fix:** `reg[hi..lo] = LIT` where LIT exceeded the field
+width used to truncate silently (`reg[3..1]=9` → `9&7=1`). Now a compile error
+for a scalar-int bit-slice target with constant hi/lo + constant over-width
+value (checker NODE_ASSIGN). In-range writes / runtime values unaffected.
+
+**Carry primitives:** `@addc`/`@subb`/`@mulw` → `AddCarry64`/`SubBorrow64`/
+`MulWide64` spellable builtin structs, lowering to `__builtin_add_overflow` /
+`__builtin_sub_overflow` / `__int128` (portable fallback). Both emitter dispatch
+paths. `u256_add` threads carry across limbs.
+
+Tests: `tests/zer/{uint_custom_width,sint_custom_width,addc_basic,subb_basic,mulw_basic,u256_add_addc}.zer`,
+`tests/zer_fail/{addc_arity,bitslice_overwidth}.zer`.
+
+Open follow-ups: see `docs/limitations.md` "native uN/iN".
+
+---
+
 ## 2026-07-08 — Universal `alloc` / `free` + pointer-return relaxation (checker.c, ir_lower.c, emitter.c, zercheck_ir.c, parser.c)
 
 Feature + one over-rejection fix. `make check` GREEN (ZER 901/0). Full design,

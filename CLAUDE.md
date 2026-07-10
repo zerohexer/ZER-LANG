@@ -291,6 +291,7 @@ ZER is memory-safe C. Same syntax, same mental model — but the compiler preven
 ```
 u8  u16  u32  u64        unsigned integers
 i8  i16  i32  i64        signed integers
+uN  iN                   arbitrary-width integers (u21, i48, u3 … N=1..128; native, carrier+mask, wraps at 2^N)
 usize                    pointer-width unsigned (hardcoded 32-bit currently)
 f32  f64                 floating point
 bool                     true / false (NOT an integer — no bool↔int coercion)
@@ -554,6 +555,24 @@ Ordering parameter (relaxed/acquire/release/acq_rel/seq_cst) deferred to later b
 @ffs(x) -> u32           find first set bit, 1-indexed (0 if input is 0)
 ```
 All use GCC builtins — auto-port to x86-64/ARM64/RISC-V without per-arch work.
+
+### Carry Primitives + native uN/iN (2026-07 — commits e7ea2bcb / d91d0742 / 80183261)
+```
+@addc(a, b, carry_in)  -> AddCarry64  { u64 sum;  u8 carry;  }   __builtin_add_overflow
+@subb(a, b, borrow_in) -> SubBorrow64 { u64 diff; u8 borrow; }   __builtin_sub_overflow
+@mulw(a, b)            -> MulWide64   { u64 lo;   u64 hi;     }   __int128 (portable fallback)
+```
+Safe value ops (no asm, no memory surface) — the building blocks for big ints.
+Result types are spellable builtin structs (registered in `checker_init`; both
+emitter dispatch paths). Plain `a + b` on u64 == `@addc(a,b,0).sum`. Companion
+feature: NATIVE arbitrary-width integers `uN`/`iN` (u21, i48, u3, N=1..128) —
+`resolve_type` maps `u<N>`/`i<N>` → `type_uint`/`type_sint`; carrier = smallest
+native int ≥ N; `emit_intn_mask` (emitter, IR_BINOP) masks arithmetic to N bits
+(uN bitmask / iN sign-extend) so odd widths wrap at 2^N; `src/safety/type_kind.*`
+predicates recognise TYPE_UINT/TYPE_SINT. Over-width bit-slice write `reg[hi..lo]=LIT`
+is now a compile error (was silent truncation). Open follow-ups (docs/limitations.md):
+`verif_type_kind.v` UINT/SINT cases (VST Level-3); VRP mask-elision; single-bit
+`reg[5]` shorthand (use `reg[5..5]`); iN mask on unop/global sites.
 
 ### Interrupt Control Intrinsics (D-Alpha-3, privileged — kernel mode only)
 ```

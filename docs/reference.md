@@ -51,6 +51,36 @@ u8..u64
 
 ---
 
+### uN, iN — Arbitrary-Width Integers
+
+**DESCRIPTION**
+Integers of any bit width from 1 to 128 — `u21`, `i48`, `u3`, `u128`, etc.
+`u` = unsigned, `i` = signed (two's complement). First-class native types:
+declare, assign, and use all operators. Stored in the smallest native carrier
+that holds N bits; arithmetic wraps at 2^N (unsigned) or sign-extends (signed),
+so the width is honest. The standard widths (u8/16/32/64, i8/16/32/64) stay
+their own keywords; `uN`/`iN` covers every other width.
+
+**SYNTAX**
+```zer
+u21 addr = 2097151;      // 21-bit, range [0, 2^21-1]
+u21 next = addr + 1;     // wraps to 0 at 2^21
+i12 delta = -2048;       // signed 12-bit, range [-2048, 2047]
+u3  flag  = 7;           // sub-byte
+u48 big;                 // 48-bit
+```
+
+**NOTES**
+- Widths 1..128. Same no-implicit-narrowing rule as u8..u64 (`u21 x = @truncate(u21, big);`).
+- Carrier = smallest native int ≥ N bits (`u21` → `uint32_t`); the compiler masks arithmetic results to N bits so the wrap is at 2^N, not the carrier width.
+- A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`.
+- `>64`-bit arithmetic (`u128` …) works but is emulated (multi-word). For hand-tuned big-int, use the `@addc`/`@subb`/`@mulw` carry primitives.
+
+**SEE ALSO**
+u8..u64, i8..i64, @addc, @subb, @mulw, @truncate
+
+---
+
 ### usize
 
 **DESCRIPTION**
@@ -1844,6 +1874,39 @@ Bit query operations. All return `u32`.
 
 Input must be integer. Width-dispatched (ll suffix for 64-bit inputs).
 Emits GCC `__builtin_*` / `__builtin_*ll`.
+
+---
+
+### @addc(a, b, carry_in), @subb(a, b, borrow_in), @mulw(a, b)
+
+**DESCRIPTION**
+Safe carry primitives for multi-word integer arithmetic — the building blocks
+for big integers (u128, u256, …). Pure value operations, no asm, same safety
+class as `@popcount`. Each returns a spellable 2-field struct:
+- `@addc(a, b, carry_in)` → `AddCarry64 { u64 sum; u8 carry; }` — add with carry
+- `@subb(a, b, borrow_in)` → `SubBorrow64 { u64 diff; u8 borrow; }` — subtract with borrow
+- `@mulw(a, b)` → `MulWide64 { u64 lo; u64 hi; }` — full 64×64 → 128 multiply
+
+Lower to GCC builtins: `__builtin_add_overflow` / `__builtin_sub_overflow` /
+`unsigned __int128` multiply (portable fallback where `__int128` is absent).
+GCC emits the hardware carry-flag / wide-multiply instructions.
+
+**EXAMPLE**
+```zer
+// 128-bit add: chain @addc across two u64 limbs
+AddCarry64 lo = @addc(a_lo, b_lo, 0);
+AddCarry64 hi = @addc(a_hi, b_hi, lo.carry);
+// result = { hi.sum : lo.sum }, carry-out = hi.carry
+```
+
+**NOTES**
+- Plain `a + b` on a `u64` is `@addc(a, b, 0).sum` — the carry primitive is the
+  general form; `+` is the restriction that discards the carry.
+- For a fixed >64-bit integer, build `struct { u64[k] limb; }` and loop `@addc`
+  across the limbs (how a library `U256` is written).
+
+**SEE ALSO**
+uN/iN, u64, @popcount
 
 ---
 

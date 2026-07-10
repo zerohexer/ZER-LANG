@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// Writing a value that doesn't fit a bit-slice field must be rejected, not
+// silently truncated (9 into a 3-bit field [3..1] used to become 9&7=1).
+u32 main() {
+    u8 reg = 0;
+    reg[3..1] = 9;   // 3-bit field holds [0,7]; 9 does not fit
+    return 0;
+}

@@ -3743,6 +3743,34 @@ static Type *check_expr(Checker *c, Node *node) {
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
 
+        /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
+         * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
+         * For a scalar-integer object (bit extraction, not array sub-slicing)
+         * with constant hi/lo and a constant over-width value, that is now a
+         * compile error — no silent narrowing on the positional-bits primitive. */
+        if (node->assign.target->kind == NODE_SLICE &&
+            node->assign.target->slice.start && node->assign.target->slice.end) {
+            Type *_bt = typemap_get(c, node->assign.target->slice.object);
+            if (_bt && type_is_integer(type_unwrap_distinct(_bt))) {
+                int64_t _hi = eval_const_expr(node->assign.target->slice.start);
+                int64_t _lo = eval_const_expr(node->assign.target->slice.end);
+                int64_t _v  = eval_const_expr(node->assign.value);
+                if (_hi != CONST_EVAL_FAIL && _lo != CONST_EVAL_FAIL &&
+                    _v != CONST_EVAL_FAIL && _hi >= _lo && _lo >= 0 &&
+                    _hi < 64 && _v >= 0) {
+                    uint32_t _w = (uint32_t)(_hi - _lo + 1);
+                    uint64_t _max = (_w >= 64) ? ~0ULL : ((1ULL << _w) - 1ULL);
+                    if ((uint64_t)_v > _max) {
+                        checker_error(c, node->loc.line,
+                            "value %lld does not fit the %u-bit field [%lld..%lld] "
+                            "(max %llu) — would silently truncate",
+                            (long long)_v, _w, (long long)_hi, (long long)_lo,
+                            (unsigned long long)_max);
+                    }
+                }
+            }
+        }
+
         /* BUG-487: union variant assignment may overwrite move struct.
          * m.id = 100 when m.k (move struct variant) might be active → resource leak.
          * Only fires for unions that contain at least one move struct variant. */

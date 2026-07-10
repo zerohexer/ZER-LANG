@@ -354,6 +354,7 @@ static Type *typemap_get(Checker *c, Node *node) {
 static Type *check_expr(Checker *c, Node *node);
 static void check_stmt(Checker *c, Node *node);
 static Type *resolve_type(Checker *c, TypeNode *tn);
+static void register_builtin_pair_types(Checker *c);
 
 /* Value range propagation helpers (defined after checker_init) */
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
@@ -516,6 +517,17 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
         case TYPE_I64:
             return true;  /* val is uint64, positive literal fits in i64 */
+        /* Path C: arbitrary-width int — fits if within the width's max */
+        case TYPE_UINT: {
+            uint32_t _b = effective->intn.bits;
+            if (_b >= 64) return true;
+            return val <= ((1ULL << _b) - 1ULL);
+        }
+        case TYPE_SINT: {
+            uint32_t _b = effective->intn.bits;
+            if (_b >= 64) return true;
+            return val <= ((1ULL << (_b - 1)) - 1ULL);
+        }
         /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
          * trivially "fit" (the literal is being coerced to a non-int
          * target via other rules, so this predicate doesn't apply). */
@@ -543,8 +555,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_I16:   return val <= 32768;
             case TYPE_I32:   return val <= 2147483648ULL;
             case TYPE_I64:   return true;
+            /* Path C: signed arbitrary-width — -val fits if val <= 2^(bits-1) */
+            case TYPE_SINT: {
+                uint32_t _b = effective->intn.bits;
+                if (_b >= 64) return true;
+                return val <= (1ULL << (_b - 1));
+            }
             /* unsigned types: negative literals never fit */
             case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+            case TYPE_UINT:
                 return false;
             /* Stage 2 Part B (2026-04-28): exhaustive — non-integer
              * targets trivially "fit" (negative-literal coercion to
@@ -1967,6 +1986,25 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
 }
 
 /* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
+/* Path C front door: parse an arbitrary-width int type name like "u21"/"i48".
+ * Sets *out_bits (1..128) and *out_signed; returns false if `name` is not a
+ * uN/iN spelling. u8/16/32/64 and i8/16/32/64 are keywords (TOK_U8 …) and never
+ * reach here, so this only fires for the non-standard widths. */
+static bool parse_intn_width(const char *name, uint32_t len,
+                             uint32_t *out_bits, bool *out_signed) {
+    if (len < 2 || len > 4) return false;
+    if (name[0] != 'u' && name[0] != 'i') return false;
+    uint32_t bits = 0;
+    for (uint32_t i = 1; i < len; i++) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        bits = bits * 10u + (uint32_t)(name[i] - '0');
+    }
+    if (bits < 1 || bits > 128) return false;
+    *out_bits = bits;
+    *out_signed = (name[0] == 'i');
+    return true;
+}
+
 static Type *resolve_type(Checker *c, TypeNode *tn) {
     if (!tn) return ty_void;
     /* check cache first */
@@ -2159,6 +2197,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         /* look up type name in scope (struct, enum, union, typedef) */
         Symbol *sym = scope_lookup(c->current_scope, tn->named.name, (uint32_t)tn->named.name_len);
         if (!sym) {
+            /* Path C: arbitrary-width integer u<N>/i<N> (e.g. u21, i48). */
+            uint32_t _nb; bool _sgn;
+            if (parse_intn_width(tn->named.name, (uint32_t)tn->named.name_len, &_nb, &_sgn)) {
+                return _sgn ? type_sint(c->arena, _nb) : type_uint(c->arena, _nb);
+            }
             checker_error(c, tn->loc.line, "undefined type '%.*s'",
                           (int)tn->named.name_len, tn->named.name);
             return ty_void;
@@ -8528,6 +8571,42 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 result = ty_u32;
             }
+        } else if (nlen == 4 && memcmp(name, "addc", 4) == 0) {
+            /* @addc(a, b, carry_in) -> AddCarry64 { u64 sum; u8 carry; } */
+            if (node->intrinsic.arg_count != 3) {
+                checker_error(c, node->loc.line, "@addc requires 3 arguments (a, b, carry_in)");
+            } else {
+                for (int _ai = 0; _ai < 3; _ai++) {
+                    Type *_ti = typemap_get(c, node->intrinsic.args[_ai]);
+                    if (_ti && !type_is_integer(_ti))
+                        checker_error(c, node->loc.line, "@addc argument %d must be integer", _ai + 1);
+                }
+            }
+            result = c->builtin_addcarry64 ? c->builtin_addcarry64 : ty_u32;
+        } else if (nlen == 4 && memcmp(name, "subb", 4) == 0) {
+            /* @subb(a, b, borrow_in) -> SubBorrow64 { u64 diff; u8 borrow; } */
+            if (node->intrinsic.arg_count != 3) {
+                checker_error(c, node->loc.line, "@subb requires 3 arguments (a, b, borrow_in)");
+            } else {
+                for (int _si = 0; _si < 3; _si++) {
+                    Type *_ti = typemap_get(c, node->intrinsic.args[_si]);
+                    if (_ti && !type_is_integer(_ti))
+                        checker_error(c, node->loc.line, "@subb argument %d must be integer", _si + 1);
+                }
+            }
+            result = c->builtin_subborrow64 ? c->builtin_subborrow64 : ty_u32;
+        } else if (nlen == 4 && memcmp(name, "mulw", 4) == 0) {
+            /* @mulw(a, b) -> MulWide64 { u64 lo; u64 hi; } */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line, "@mulw requires 2 arguments (a, b)");
+            } else {
+                for (int _mi = 0; _mi < 2; _mi++) {
+                    Type *_ti = typemap_get(c, node->intrinsic.args[_mi]);
+                    if (_ti && !type_is_integer(_ti))
+                        checker_error(c, node->loc.line, "@mulw argument %d must be integer", _mi + 1);
+                }
+            }
+            result = c->builtin_mulwide64 ? c->builtin_mulwide64 : ty_u32;
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             /* @probe(addr) → ?u32: try reading MMIO address, null if faults.
              *
@@ -14657,6 +14736,7 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
     c->global_scope = scope_new(arena, NULL);
     c->current_scope = c->global_scope;
     c->next_type_id = 1; /* 0 = unknown provenance (BUG-393) */
+    register_builtin_pair_types(c); /* AddCarry64 etc. — @addc/@subb/@mulw result types */
 
     /* Sync target pointer width from global. Without this the field
      * stays 0 (memset-zeroed), and any check `c->target_ptr_bits < N`
@@ -15113,6 +15193,15 @@ static uint32_t estimate_type_size(Type *t) {
     case TYPE_U16: case TYPE_I16: return 2;
     case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_USIZE: return 4;
     case TYPE_U64: case TYPE_I64: case TYPE_F64: return 8;
+    /* Path C: arbitrary-width int — carrier size by bit count */
+    case TYPE_UINT: case TYPE_SINT: {
+        uint32_t _b = t->intn.bits;
+        if (_b <= 8) return 1;
+        if (_b <= 16) return 2;
+        if (_b <= 32) return 4;
+        if (_b <= 64) return 8;
+        return 16; /* __int128 */
+    }
     case TYPE_POINTER: case TYPE_OPAQUE: return 4; /* conservative: 32-bit */
     case TYPE_HANDLE: return 8; /* u64 */
     case TYPE_ARRAY: return (uint32_t)(t->array.size * estimate_type_size(t->array.inner));
@@ -16223,6 +16312,39 @@ void check_keep_inference(Checker *c) {
         }
         checker_error(c, e->line, msg, e->arg_pos, (int)e->arg_name_len, e->arg_name);
     }
+}
+
+/* Register builtin carry-op result struct types so `AddCarry64 r = @addc(...)`
+ * resolves as a normal, spellable struct (no _zer_ prefix). The intrinsic
+ * typing branch returns the cached Type* so LHS/result nominal identity holds.
+ * @addc/@subb/@mulw. */
+/* Build a 2-field builtin struct type and register it directly into the
+ * persistent global scope (like auto-slabs at ~1619) so it is spellable
+ * everywhere; add_symbol targets current_scope, which is not global this
+ * early. Used for the @addc/@subb/@mulw result types. */
+static Type *make_pair_struct(Checker *c, const char *name, uint32_t nlen,
+                              const char *f0, uint32_t f0l, Type *f0t,
+                              const char *f1, uint32_t f1l, Type *f1t) {
+    Type *t = (Type *)arena_alloc(c->arena, sizeof(Type));
+    memset(t, 0, sizeof(Type));
+    t->kind = TYPE_STRUCT;
+    t->struct_type.name = name;
+    t->struct_type.name_len = nlen;
+    t->struct_type.field_count = 2;
+    t->struct_type.type_id = c->next_type_id++;
+    SField *f = (SField *)arena_alloc(c->arena, 2 * sizeof(SField));
+    memset(f, 0, 2 * sizeof(SField));
+    f[0].name = f0; f[0].name_len = f0l; f[0].type = f0t;
+    f[1].name = f1; f[1].name_len = f1l; f[1].type = f1t;
+    t->struct_type.fields = f;
+    scope_add(c->arena, c->global_scope, name, nlen, t, 0, c->file_name);
+    return t;
+}
+
+static void register_builtin_pair_types(Checker *c) {
+    c->builtin_addcarry64  = make_pair_struct(c, "AddCarry64", 10, "sum", 3, ty_u64, "carry", 5, ty_u8);
+    c->builtin_subborrow64 = make_pair_struct(c, "SubBorrow64", 11, "diff", 4, ty_u64, "borrow", 6, ty_u8);
+    c->builtin_mulwide64   = make_pair_struct(c, "MulWide64", 9, "lo", 2, ty_u64, "hi", 2, ty_u64);
 }
 
 bool checker_check(Checker *c, Node *file_node) {

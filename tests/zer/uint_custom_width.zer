@@ -1,0 +1,16 @@
+// Native arbitrary-width integers (Path C): u21/u48/u3/i12 as first-class types.
+// Arithmetic wraps at 2^N (odd widths masked on the carrier).
+u32 main() {
+    u21 a = 2097151; u21 b = 1;
+    u21 c = a + b;               // (2^21-1)+1 -> wraps to 0
+    if (c != 0) { return 1; }
+    u21 e = 100; u21 f = e + 50; // 150
+    if (f != 150) { return 2; }
+    u21 g = 2000; u21 h = g * 2000;  // 4000000 mod 2^21 = 1902848
+    if (h != 1902848) { return 3; }
+    u48 big = 281474976710655; u48 bw = big + 1;  // 2^48-1 + 1 -> 0
+    if (bw != 0) { return 4; }
+    u3 s = 7; u3 sw = s + 1;     // 3-bit wrap: 8 -> 0
+    if (sw != 0) { return 5; }
+    return 0;
+}

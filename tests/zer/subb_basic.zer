@@ -1,0 +1,11 @@
+// @subb — safe subtract-with-borrow primitive. Returns SubBorrow64 { u64 diff; u8 borrow; }.
+// Lowers to __builtin_sub_overflow (no asm).
+u32 main() {
+    SubBorrow64 r = @subb(0, 1, 0);                       // 0 - 1 - 0 -> underflow, borrow out
+    if (r.diff != 18446744073709551615) { return 1; }     // 2^64 - 1
+    if (r.borrow != 1) { return 2; }
+    SubBorrow64 r2 = @subb(10, 3, 1);                     // 10 - 3 - 1 = 6, no borrow
+    if (r2.diff != 6) { return 3; }
+    if (r2.borrow != 0) { return 4; }
+    return 0;
+}

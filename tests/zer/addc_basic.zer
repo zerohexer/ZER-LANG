@@ -1,0 +1,11 @@
+// @addc — safe add-with-carry primitive. Returns AddCarry64 { u64 sum; u8 carry; }.
+// Lowers to __builtin_add_overflow (no asm). See docs: universal alloc / carry primitives.
+u32 main() {
+    AddCarry64 r = @addc(18446744073709551615, 1, 0);   // (2^64-1) + 1 + 0 -> wraps, carry out
+    if (r.sum != 0) { return 1; }
+    if (r.carry != 1) { return 2; }
+    AddCarry64 r2 = @addc(5, 7, 1);                       // 5 + 7 + 1 = 13, no carry
+    if (r2.sum != 13) { return 3; }
+    if (r2.carry != 0) { return 4; }
+    return 0;
+}

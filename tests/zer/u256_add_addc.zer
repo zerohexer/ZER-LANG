@@ -1,0 +1,23 @@
+// 256-bit add built on the @addc primitive — carry threads across 4 limbs.
+// Proves the safe carry intrinsic composes into real bignum arithmetic.
+struct U256 { u64[4] limb; }
+u32 main() {
+    U256 a; U256 b;
+    a.limb[0] = 18446744073709551615;   // limb0 = 2^64 - 1
+    a.limb[1] = 18446744073709551615;   // limb1 = 2^64 - 1   (a = 2^128 - 1)
+    b.limb[0] = 1;                        // b = 1
+    U256 r;
+    AddCarry64 c0 = @addc(a.limb[0], b.limb[0], 0);
+    r.limb[0] = c0.sum;
+    AddCarry64 c1 = @addc(a.limb[1], b.limb[1], c0.carry);
+    r.limb[1] = c1.sum;
+    AddCarry64 c2 = @addc(a.limb[2], b.limb[2], c1.carry);
+    r.limb[2] = c2.sum;
+    AddCarry64 c3 = @addc(a.limb[3], b.limb[3], c2.carry);
+    r.limb[3] = c3.sum;
+    // (2^128 - 1) + 1 = 2^128  ->  limb0=0, limb1=0, limb2=1 (carry propagated two limbs)
+    if (r.limb[0] != 0) { return 1; }
+    if (r.limb[1] != 0) { return 2; }
+    if (r.limb[2] != 1) { return 3; }
+    return 0;
+}

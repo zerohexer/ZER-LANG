@@ -93,6 +93,9 @@ typedef struct {
      *   2 = DISABLED         — compile error on any @probe usage */
     int probe_mode;
     uint32_t next_type_id; /* BUG-393: counter for runtime provenance type IDs */
+    Type *builtin_addcarry64; /* @addc result struct type (AddCarry64 { u64 sum; u8 carry; }) */
+    Type *builtin_subborrow64; /* @subb result struct type (SubBorrow64 { u64 diff; u8 borrow; }) */
+    Type *builtin_mulwide64; /* @mulw result struct type (MulWide64 { u64 lo; u64 hi; }) */
 
     /* BUG-393: compile-time provenance map for compound paths (h.p, arr[0]) */
     struct { char *key; uint32_t key_len; Type *provenance; } *prov_map;

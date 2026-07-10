@@ -20,6 +20,8 @@ int zer_type_kind_is_integer(int kind) {
     if (kind == ZER_TK_I32)   { return 1; }
     if (kind == ZER_TK_I64)   { return 1; }
     if (kind == ZER_TK_ENUM)  { return 1; }
+    if (kind == ZER_TK_UINT)  { return 1; } /* Path C: uN */
+    if (kind == ZER_TK_SINT)  { return 1; } /* Path C: iN */
     return 0;
 }
 
@@ -29,6 +31,7 @@ int zer_type_kind_is_signed(int kind) {
     if (kind == ZER_TK_I32)  { return 1; }
     if (kind == ZER_TK_I64)  { return 1; }
     if (kind == ZER_TK_ENUM) { return 1; }
+    if (kind == ZER_TK_SINT) { return 1; } /* Path C: iN signed */
     return 0;
 }
 
@@ -38,6 +41,7 @@ int zer_type_kind_is_unsigned(int kind) {
     if (kind == ZER_TK_U32)   { return 1; }
     if (kind == ZER_TK_U64)   { return 1; }
     if (kind == ZER_TK_USIZE) { return 1; }
+    if (kind == ZER_TK_UINT)  { return 1; } /* Path C: uN unsigned */
     return 0;
 }
 
@@ -62,6 +66,8 @@ int zer_type_kind_is_numeric(int kind) {
     if (kind == ZER_TK_I32)   { return 1; }
     if (kind == ZER_TK_I64)   { return 1; }
     if (kind == ZER_TK_ENUM)  { return 1; }
+    if (kind == ZER_TK_UINT)  { return 1; } /* Path C: uN */
+    if (kind == ZER_TK_SINT)  { return 1; } /* Path C: iN */
     if (kind == ZER_TK_F32)   { return 1; }
     if (kind == ZER_TK_F64)   { return 1; }
     return 0;

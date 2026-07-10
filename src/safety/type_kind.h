@@ -46,6 +46,8 @@
 #define ZER_TK_SLAB       27
 #define ZER_TK_SEMAPHORE  28
 #define ZER_TK_DISTINCT   29
+#define ZER_TK_UINT       30  /* Path C: uN arbitrary-width unsigned integer */
+#define ZER_TK_SINT       31  /* Path C: iN arbitrary-width signed integer */
 
 /* Returns 1 iff kind is an integer type (unsigned or signed ints, usize,
  * or enum — enums are i32 internally).

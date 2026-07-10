@@ -51,6 +51,14 @@ typedef enum {
 
     /* distinct typedef */
     TYPE_DISTINCT,      /* distinct typedef — nominal wrapper around underlying type */
+
+    /* arbitrary-width integers (Path C: width-field integer representation).
+     * APPENDED at the end so ZER_TK_* constants + verif_type_kind.v proofs
+     * (which hardcode enum order) stay valid — never reorder the values above.
+     * Signedness lives in the KIND (UINT vs SINT) so the kind-based verified
+     * predicates remain meaningful; width lives in the .intn.bits field. */
+    TYPE_UINT,          /* uN — unsigned, .intn.bits in 1..128 */
+    TYPE_SINT,          /* iN — signed,   .intn.bits in 1..128 */
 } TypeKind;
 
 /* ---- Struct field (semantic) ---- */
@@ -86,6 +94,10 @@ struct Type {
 
         /* TYPE_OPTIONAL */
         struct { Type *inner; } optional;
+
+        /* TYPE_UINT / TYPE_SINT — arbitrary-width integer, width in bits (1..128).
+         * Carrier chosen at emission by bit count (≤8 uint8_t … ≤128 __int128). */
+        struct { uint32_t bits; } intn;
 
         /* TYPE_SLICE */
         struct { Type *inner; bool is_const; bool is_volatile; } slice;
@@ -359,6 +371,8 @@ extern Type *ty_barrier;
 void types_init(Arena *arena);
 
 /* constructors — allocate from arena */
+Type *type_uint(Arena *a, uint32_t bits);   /* Path C: arbitrary-width unsigned int */
+Type *type_sint(Arena *a, uint32_t bits);   /* Path C: arbitrary-width signed int */
 Type *type_pointer(Arena *a, Type *inner);
 Type *type_const_pointer(Arena *a, Type *inner);
 Type *type_optional(Arena *a, Type *inner);

@@ -1375,6 +1375,7 @@ static bool ir_receiver_is_builtin_target(Checker *c, Node *callee) {
         case TYPE_VOID: case TYPE_BOOL:
         case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
         case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+        case TYPE_UINT: case TYPE_SINT: /* Path C: uN/iN are not alloc/free receivers */
         case TYPE_F32: case TYPE_F64:
         case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
         case TYPE_ARRAY: case TYPE_ENUM: case TYPE_UNION:

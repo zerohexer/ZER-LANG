@@ -68,6 +68,20 @@ Type *type_pointer(Arena *a, Type *inner) {
     return t;
 }
 
+/* Arbitrary-width integer constructors (Path C). bits in 1..128. */
+Type *type_uint(Arena *a, uint32_t bits) {
+    Type *t = (Type *)arena_alloc(a, sizeof(Type));
+    t->kind = TYPE_UINT;
+    t->intn.bits = bits;
+    return t;
+}
+Type *type_sint(Arena *a, uint32_t bits) {
+    Type *t = (Type *)arena_alloc(a, sizeof(Type));
+    t->kind = TYPE_SINT;
+    t->intn.bits = bits;
+    return t;
+}
+
 Type *type_const_pointer(Arena *a, Type *inner) {
     Type *t = type_pointer(a, inner);
     t->pointer.is_const = true;
@@ -200,6 +214,7 @@ int type_width(Type *a) {
     case TYPE_U32: case TYPE_I32: case TYPE_F32: case TYPE_ENUM: return 32;
     case TYPE_U64: case TYPE_I64: case TYPE_F64: case TYPE_HANDLE: return 64;
     case TYPE_USIZE: return zer_target_ptr_bits; /* matches target, not host */
+    case TYPE_UINT: case TYPE_SINT: return (int)a->intn.bits; /* Path C: width-field */
     default: return 0;
     }
 }
@@ -277,6 +292,10 @@ bool type_equals(Type *a, Type *b) {
     case TYPE_F32: case TYPE_F64:
     case TYPE_OPAQUE: case TYPE_ARENA:
         return true;
+
+    /* Path C: arbitrary-width int — same kind (checked above) + same width */
+    case TYPE_UINT: case TYPE_SINT:
+        return a->intn.bits == b->intn.bits;
 
     /* pointer/optional/slice: recurse on inner.
      * const-aware: *const T != *T. This makes const checking work
@@ -467,6 +486,8 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_I64:    return pos + snprintf(buf + pos, max - pos, "i64");
     case TYPE_F32:    return pos + snprintf(buf + pos, max - pos, "f32");
     case TYPE_F64:    return pos + snprintf(buf + pos, max - pos, "f64");
+    case TYPE_UINT:   return pos + snprintf(buf + pos, max - pos, "u%u", t->intn.bits);
+    case TYPE_SINT:   return pos + snprintf(buf + pos, max - pos, "i%u", t->intn.bits);
     case TYPE_OPAQUE: return pos + snprintf(buf + pos, max - pos, "opaque");
     case TYPE_ARENA:   return pos + snprintf(buf + pos, max - pos, "Arena");
     case TYPE_BARRIER: return pos + snprintf(buf + pos, max - pos, "Barrier");

@@ -739,6 +739,57 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
     emit(e, ", %llu })", (unsigned long long)array_type->array.size);
 }
 
+/* Path C: emit the C carrier type for an arbitrary-width integer.
+ * Carrier = smallest native int that holds `bits` (odd widths are masked
+ * to `bits` at arithmetic/read sites in Phase C). */
+static void emit_intn_carrier(Emitter *e, uint32_t bits, bool is_signed) {
+    if (is_signed) {
+        if (bits <= 8) emit(e, "int8_t");
+        else if (bits <= 16) emit(e, "int16_t");
+        else if (bits <= 32) emit(e, "int32_t");
+        else if (bits <= 64) emit(e, "int64_t");
+        else emit(e, "__int128");
+    } else {
+        if (bits <= 8) emit(e, "uint8_t");
+        else if (bits <= 16) emit(e, "uint16_t");
+        else if (bits <= 32) emit(e, "uint32_t");
+        else if (bits <= 64) emit(e, "uint64_t");
+        else emit(e, "unsigned __int128");
+    }
+}
+
+/* Path C: after an arithmetic op, mask a uN/iN result to its bit width when the
+ * carrier is wider than N (non-standard widths). Native 8/16/32/64/128 self-wrap.
+ * uN -> bitmask; iN -> sign-extend (unsigned-shift then arithmetic >> to avoid
+ * signed-shift UB). No-op for non-integer / native-width destinations. */
+static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
+    if (!dst || !dst->type) return;
+    TypeKind k = type_dispatch_kind(dst->type);
+    if (k != TYPE_UINT && k != TYPE_SINT) return;
+    uint32_t nb = type_unwrap_distinct(dst->type)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    emit_indent(e);
+    if (k == TYPE_UINT) {
+        if (nb < 64)
+            emit(e, "%s%.*s = (%s%.*s & 0x%llxULL);\n",
+                 sp, (int)dst->name_len, dst->name,
+                 sp, (int)dst->name_len, dst->name,
+                 (unsigned long long)((1ULL << nb) - 1ULL));
+        else
+            emit(e, "%s%.*s = (%s%.*s & ((((unsigned __int128)1u) << %u) - 1u));\n",
+                 sp, (int)dst->name_len, dst->name,
+                 sp, (int)dst->name_len, dst->name, nb);
+    } else {
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        uint32_t sh = cw - nb;
+        emit(e, "%s%.*s = (%s)((%s)%s%.*s << %u) >> %u;\n",
+             sp, (int)dst->name_len, dst->name,
+             ss, su, sp, (int)dst->name_len, dst->name, sh, sh);
+    }
+}
+
 /* emit a C type name for a ZER type */
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
@@ -757,6 +808,8 @@ static void emit_type(Emitter *e, Type *t) {
     case TYPE_I64:    emit(e, "int64_t"); break;
     case TYPE_F32:    emit(e, "float"); break;
     case TYPE_F64:    emit(e, "double"); break;
+    case TYPE_UINT:   emit_intn_carrier(e, t->intn.bits, false); break;
+    case TYPE_SINT:   emit_intn_carrier(e, t->intn.bits, true); break;
     case TYPE_OPAQUE: emit(e, "void"); break;
 
     case TYPE_POINTER:
@@ -851,6 +904,7 @@ static void emit_type(Emitter *e, Type *t) {
             case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
             case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
             case TYPE_DISTINCT:
+            case TYPE_UINT: case TYPE_SINT: /* Path C: ?[]uN → anonymous optional slice */
                 emit(e, "struct { ");
                 emit_type(e, opt_inner);
                 emit(e, " value; uint8_t has_value; }");
@@ -865,6 +919,7 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+        case TYPE_UINT: case TYPE_SINT: /* Path C: ?uN → anonymous optional */
             emit(e, "struct { ");
             emit_type(e, opt_inner);
             emit(e, " value; uint8_t has_value; }");
@@ -905,6 +960,7 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
         case TYPE_DISTINCT:
+        case TYPE_UINT: case TYPE_SINT: /* Path C: [*]uN → anonymous slice */
             emit(e, "struct { ");
             if (t->slice.is_volatile) emit(e, "volatile ");
             emit_type(e, sl_inner);
@@ -1285,6 +1341,9 @@ static void emit_expr(Emitter *e, Node *node) {
                     case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
                     case TYPE_I32: case TYPE_I64:
                     case TYPE_F32: case TYPE_F64:
+                    /* Path C: uN/iN — carrier-width wrap; odd-width masking
+                     * is applied at the Phase-C mask sites, not here. */
+                    case TYPE_UINT: case TYPE_SINT:
                     case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
                     case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
                     case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
@@ -2346,6 +2405,8 @@ static void emit_expr(Emitter *e, Node *node) {
                     case TYPE_VOID: case TYPE_BOOL:
                     case TYPE_U8: case TYPE_U16: case TYPE_U32:
                     case TYPE_U64: case TYPE_USIZE:
+                    /* Path C: uN unsigned (no cast); iN handled via width in Phase C */
+                    case TYPE_UINT: case TYPE_SINT:
                     case TYPE_F32: case TYPE_F64:
                     case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
                     case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
@@ -2466,6 +2527,7 @@ static void emit_expr(Emitter *e, Node *node) {
             case TYPE_OPAQUE: case TYPE_POOL: case TYPE_RING:
             case TYPE_ARENA: case TYPE_BARRIER: case TYPE_HANDLE:
             case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+            case TYPE_UINT: case TYPE_SINT: /* Path C: [*]uN → anonymous slice literal */
                 break;
             }
             if (sname) {
@@ -3459,6 +3521,20 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ")");
             }
+        } else if (nlen == 4 && memcmp(name, "addc", 4) == 0 && node->intrinsic.arg_count == 3) {
+            emit(e, "_zer_do_addc_u64(");
+            emit_expr(e, node->intrinsic.args[0]); emit(e, ", ");
+            emit_expr(e, node->intrinsic.args[1]); emit(e, ", ");
+            emit_expr(e, node->intrinsic.args[2]); emit(e, ")");
+        } else if (nlen == 4 && memcmp(name, "subb", 4) == 0 && node->intrinsic.arg_count == 3) {
+            emit(e, "_zer_do_subb_u64(");
+            emit_expr(e, node->intrinsic.args[0]); emit(e, ", ");
+            emit_expr(e, node->intrinsic.args[1]); emit(e, ", ");
+            emit_expr(e, node->intrinsic.args[2]); emit(e, ")");
+        } else if (nlen == 4 && memcmp(name, "mulw", 4) == 0 && node->intrinsic.arg_count == 2) {
+            emit(e, "_zer_do_mulw_u64(");
+            emit_expr(e, node->intrinsic.args[0]); emit(e, ", ");
+            emit_expr(e, node->intrinsic.args[1]); emit(e, ")");
         } else {
             /* BUG-767 (copied from cool-johnson-dfcqr9): a runtime/privileged
              * intrinsic with no AST-path handler (e.g. @port_in32, @cpu_read_msr)
@@ -4856,6 +4932,17 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { uint8_t value; uint8_t has_value; } _zer_opt_u8;\n");
     emit(e, "typedef struct { uint16_t value; uint8_t has_value; } _zer_opt_u16;\n");
     emit(e, "typedef struct { uint32_t value; uint8_t has_value; } _zer_opt_u32;\n");
+    /* Carry-op result structs + helpers (@addc/@subb/@mulw). Spellable names, no _zer_ prefix. */
+    emit(e, "typedef struct AddCarry64 { uint64_t sum; uint8_t carry; } AddCarry64;\n");
+    emit(e, "static inline AddCarry64 _zer_do_addc_u64(uint64_t a, uint64_t b, uint64_t cin){ uint64_t s; unsigned char c1=__builtin_add_overflow(a,b,&s); unsigned char c2=__builtin_add_overflow(s,cin,&s); return (AddCarry64){ s, (uint8_t)(c1|c2) }; }\n");
+    emit(e, "typedef struct SubBorrow64 { uint64_t diff; uint8_t borrow; } SubBorrow64;\n");
+    emit(e, "static inline SubBorrow64 _zer_do_subb_u64(uint64_t a, uint64_t b, uint64_t bin){ uint64_t d; unsigned char b1=__builtin_sub_overflow(a,b,&d); unsigned char b2=__builtin_sub_overflow(d,bin,&d); return (SubBorrow64){ d, (uint8_t)(b1|b2) }; }\n");
+    emit(e, "typedef struct MulWide64 { uint64_t lo; uint64_t hi; } MulWide64;\n");
+    emit(e, "#if defined(__SIZEOF_INT128__)\n");
+    emit(e, "static inline MulWide64 _zer_do_mulw_u64(uint64_t a, uint64_t b){ unsigned __int128 p=(unsigned __int128)a*(unsigned __int128)b; return (MulWide64){ (uint64_t)p, (uint64_t)(p>>64) }; }\n");
+    emit(e, "#else\n");
+    emit(e, "static inline MulWide64 _zer_do_mulw_u64(uint64_t a, uint64_t b){ uint64_t al=a&0xffffffffULL,ah=a>>32,bl=b&0xffffffffULL,bh=b>>32; uint64_t ll=al*bl,lh=al*bh,hl=ah*bl,hh=ah*bh; uint64_t mid=(ll>>32)+(lh&0xffffffffULL)+(hl&0xffffffffULL); uint64_t lo=(ll&0xffffffffULL)|(mid<<32); uint64_t hi=hh+(lh>>32)+(hl>>32)+(mid>>32); return (MulWide64){ lo, hi }; }\n");
+    emit(e, "#endif\n");
     emit(e, "typedef struct { uint64_t value; uint8_t has_value; } _zer_opt_u64;\n");
     emit(e, "typedef struct { int8_t value; uint8_t has_value; } _zer_opt_i8;\n");
     emit(e, "typedef struct { int16_t value; uint8_t has_value; } _zer_opt_i16;\n");
@@ -8833,6 +8920,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->intrinsic.args[node->intrinsic.arg_count - 1], func);
             else
                 emit(e, "0");
+        } else if (nlen == 4 && memcmp(name, "addc", 4) == 0 && node->intrinsic.arg_count == 3) {
+            emit(e, "_zer_do_addc_u64(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func); emit(e, ", ");
+            emit_rewritten_node(e, node->intrinsic.args[1], func); emit(e, ", ");
+            emit_rewritten_node(e, node->intrinsic.args[2], func); emit(e, ")");
+        } else if (nlen == 4 && memcmp(name, "subb", 4) == 0 && node->intrinsic.arg_count == 3) {
+            emit(e, "_zer_do_subb_u64(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func); emit(e, ", ");
+            emit_rewritten_node(e, node->intrinsic.args[1], func); emit(e, ", ");
+            emit_rewritten_node(e, node->intrinsic.args[2], func); emit(e, ")");
+        } else if (nlen == 4 && memcmp(name, "mulw", 4) == 0 && node->intrinsic.arg_count == 2) {
+            emit(e, "_zer_do_mulw_u64(");
+            emit_rewritten_node(e, node->intrinsic.args[0], func); emit(e, ", ");
+            emit_rewritten_node(e, node->intrinsic.args[1], func); emit(e, ")");
         } else {
             /* Truly unknown intrinsic — should not reach here */
             emit(e, "/* @%.*s */ 0", (int)nlen, name);
@@ -10729,6 +10830,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                      inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr",
                      sp, (int)s1->name_len, s1->name,
                      sp, (int)s2->name_len, s2->name);
+                emit_intn_mask(e, dst, sp); /* Path C: wrap uN/iN shift result to its width */
                 break;
             }
 
@@ -10817,6 +10919,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                      op,
                      sp, (int)s2->name_len, s2->name);
             }
+            emit_intn_mask(e, dst, sp); /* Path C: wrap uN/iN arithmetic result to its width */
         }
         break;
     }

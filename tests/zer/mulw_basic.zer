@@ -1,0 +1,11 @@
+// @mulw — safe wide multiply (64x64 -> 128). Returns MulWide64 { u64 lo; u64 hi; }.
+// Lowers to a single hardware multiply via unsigned __int128 (portable fallback otherwise).
+u32 main() {
+    MulWide64 r = @mulw(18446744073709551615, 2);        // (2^64-1) * 2 = 2^65 - 2
+    if (r.lo != 18446744073709551614) { return 1; }       // low 64 = 2^64 - 2
+    if (r.hi != 1) { return 2; }                          // high 64 = 1
+    MulWide64 r2 = @mulw(6, 7);                           // 42, fits in low
+    if (r2.lo != 42) { return 3; }
+    if (r2.hi != 0) { return 4; }
+    return 0;
+}

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// @addc requires exactly 3 arguments (a, b, carry_in).
+u32 main() {
+    AddCarry64 r = @addc(1, 2);   // missing carry_in
+    return 0;
+}

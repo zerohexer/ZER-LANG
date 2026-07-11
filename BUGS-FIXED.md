@@ -5,6 +5,73 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-11 — Audit sweep: 6 accept-unsafe/silent-miscompile fixes + 1 escape-leak relaxation (checker.c, emitter.c, zercheck_ir.c)
+
+Multi-agent audit round (escape sinks, MMIO/bare-metal, uN/iN, IR emission
+wrappers). Seven confirmed findings fixed; each with a positive/negative test in
+`tests/zer/` or `tests/zer_fail/`. `make check` GREEN.
+
+**F1 — accept-unsafe UAF: nested slice-returning call laundered a local past the
+escape sinks.** `arg_is_local_derived` (checker.c) recursed into a nested-call
+argument only when the call's return type was `TYPE_POINTER`; a call returning a
+`[*]T` SLICE that views a caller local (`g = pick(sub(local[..]), ..)` where
+`sub([*]u8)->[*]u8` returns `s[0..n]`) was skipped and the stack slice escaped to
+a global. Fix: new shared predicate `escape_type_carries_ref()` (pointer | slice |
+optional-of-those); the nested-call recursion and both assignment-sink field-descend
+gates now use it. Test: `tests/zer_fail/escape_nested_slice_launder.zer`.
+
+**F3 — accept-unsafe UAF: optional-pointer (`?*T`) field/element read laundered a
+local.** The assignment global-store sink, the keep-inference sink, and the var-decl
+propagation all gated the "descend field/index to the root local" walk on
+`TYPE_POINTER`/`TYPE_SLICE` only; a `?*T` value read (`g = b.p` where `b.p = &local`,
+type `TYPE_OPTIONAL`) skipped the walk, so the stack pointer escaped. Fix: the same
+`escape_type_carries_ref()` predicate at every gate, plus a var-decl field-read
+propagation for the two-step `?*u32 t = b.p; g = t`. ASan-confirmed stack-use-after-
+return before the fix. Test: `tests/zer_fail/escape_optional_ptr_field_launder.zer`.
+
+**F4 — silent accept-unsafe (bare-metal): MMIO range/alignment defeated for aggregate
+targets.** `@inttoptr(*T, addr)` computed its access SPAN and runtime ALIGNMENT from
+`type_width()`, which returns 0 for any struct/array/union — so a 16-byte peripheral
+STRUCT mapped over an 8-byte-declared `mmio` range collapsed to a 1-byte span (range
+overflow undetected) and got NO runtime alignment trap. On an MMU-less firmware target
+this is silent corruption of an adjacent peripheral. Fix: const span uses
+`compute_type_size()` (checker.c); the AST + IR `@inttoptr` emitters use
+`type_alignment_bytes()` for alignment and C `sizeof(target)` for the range span.
+Test: `tests/zer_fail/mmio_struct_range_overflow.zer`.
+
+**F5 — silent miscompile: uN/iN width mask dropped on assignment / compound-assign.**
+`emit_intn_mask` ran only on `IR_BINOP`/`IR_UNOP`/shift arithmetic temps, so `x = a+b`,
+`x += n`, `x <<= n`, `s.v += n` on a `uN` target kept the over-width value in the
+carrier (only var-decl init was masked) — breaking `==`, `<`, and bit-slice silently.
+Fix: `emit_intn_mask_assign_target()` re-masks a non-side-effecting uN/iN assignment
+target at the IR_ASSIGN statement boundary. Test: `tests/zer/intn_assign_mask.zer`.
+
+**F6 — silent miscompile: `@truncate(uN, val)` did not mask to N bits.** Both truncate
+emitters emitted a bare `(carrier)(val)` cast, leaving bits above N set (out-of-range
+uN). Fix: `emit_intn_trunc_prefix/suffix` wrap the value with the N-bit mask (unsigned)
+or sign-extend (signed) on both emit paths. Test: `tests/zer/intn_truncate_mask.zer`.
+
+**F8 — silent miscompile: variable-bounds bit-slice READ used a 32-bit unguarded mask
+in the IR path.** `reg[hi..lo]` with variable bounds emitted `(1U << (hi-lo+1)) - 1`
+(32-bit), truncating any extract wider than 32 bits and invoking C shift-UB at width 32.
+Fix: mirror the AST reference — 64-bit `1ull` mask with `>=64`/`<=0` clamps and an
+unsigned cast of a signed source. Test: `tests/zer/bitslice_read_wide.zer`.
+
+**F7 — over-rejection relaxation: allocation stored into a struct field then returned
+by value was falsely flagged as a leak.** `Holder h = { .n = p }; return h;` reported
+`p` "never freed" — the returned struct carries `p` to the caller (ownership transfer),
+so it is not a leak. Root: `IR_STRUCT_INIT_DECOMP` was an empty handler (the field-store
+of an allocation was untracked), and struct COPY didn't propagate compound handles. Fix
+(three parts): (1) `IR_STRUCT_INIT_DECOMP` registers a compound handle per field
+initialized with a tracked ALIVE allocation; (2) aggregate `IR_COPY` mirrors compound
+handles src→dest (a struct copy copies its field pointers); (3) `IR_RETURN` of a struct/
+union/array escapes compound handles rooted at the returned local — the alloc_id-covering
+exit pass then suppresses the aliased root's leak. A field allocation that is NEITHER
+returned nor freed still leaks (guard test). Tests: `tests/zer/alloc_struct_field_return.zer`,
+`tests/zer_fail/leak_struct_field_not_returned.zer`.
+
+---
+
 ## 2026-07-09 — Native arbitrary-width integers `uN`/`iN` + `@addc`/`@subb`/`@mulw` carry primitives (types.*, checker.c, emitter.c, src/safety/type_kind.*)
 
 Feature + one silent-truncation fix. `make check` GREEN (ZER 909). Commits

@@ -1,0 +1,9 @@
+// MUST FAIL: an allocation stored into a struct field that is NEITHER returned nor
+// freed still leaks. Guards the F7 relaxation against over-suppressing real leaks.
+struct Node { u32 v; }
+struct Holder { *Node n; }
+void f() {
+    *Node p = alloc(Node) orelse { return; };
+    Holder h = { .n = p };
+    h.n.v = 1;
+}

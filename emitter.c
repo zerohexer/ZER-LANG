@@ -1057,6 +1057,41 @@ static void emit_type(Emitter *e, Type *t) {
     }
 }
 
+/* F6: @truncate(uN/iN, val) must keep only the low N bits (unsigned) or sign-extend
+ * from bit N (signed) — a bare `(carrier)(val)` cast left bits above N set, so the
+ * documented "keep low bits" was false for non-native widths. These helpers bracket
+ * the value expression with the width wrap so the same fix works on both emit paths
+ * (AST global-init + IR function body). Returns the width to wrap, 0 for a native
+ * carrier / non-uN target (plain cast, no wrap). Parenthesised so precedence holds. */
+static uint32_t emit_intn_trunc_prefix(Emitter *e, Type *t) {
+    if (!t) return 0;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return 0;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return 0;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        emit(e, "(("); emit_type(e, t); emit(e, ")(");
+    } else {
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        emit(e, "((%s)((%s)((", ss, su); emit_type(e, t); emit(e, ")(");
+    }
+    return nb;
+}
+static void emit_intn_trunc_suffix(Emitter *e, Type *t, uint32_t nb) {
+    if (nb == 0) return;
+    TypeKind k = type_dispatch_kind(t);
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        if (nb < 64) emit(e, ") & 0x%llxULL)", (unsigned long long)((1ULL << nb) - 1ULL));
+        else emit(e, ") & ((((unsigned __int128)1u) << %u) - 1u))", nb);
+    } else {
+        uint32_t sh = cw - nb;
+        emit(e, ")) << %u) >> %u)", sh, sh);
+    }
+}
+
 /* emit type with variable name (handles arrays and func ptrs) */
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t name_len) {
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
@@ -3078,16 +3113,18 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "0");
             }
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
-            /* @truncate(val) → (T)(val) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* @truncate(T, val) → (T)(val), N-bit-wrapped for a uN/iN target (F6). */
+            Type *t = node->intrinsic.type_arg ? resolve_tynode(e,node->intrinsic.type_arg) : NULL;
+            uint32_t twrap = emit_intn_trunc_prefix(e, t);
+            if (twrap == 0) {
+                emit(e, "(");
+                if (t) emit_type(e, t);
+                emit(e, ")(");
             }
-            emit(e, ")(");
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ")");
+            if (twrap == 0) emit(e, ")");
+            emit_intn_trunc_suffix(e, t, twrap);
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
@@ -3140,12 +3177,17 @@ static void emit_expr(Emitter *e, Node *node) {
             bool g2_var_addr = node->intrinsic.arg_count > 0 &&
                 node->intrinsic.args[0]->kind != NODE_INT_LIT;
             int g2_align = 0;
+            Type *g2_inner = NULL;
             if (node->intrinsic.type_arg) {
                 Type *g2_t = resolve_tynode(e, node->intrinsic.type_arg);
-                Type *g2_inner = g2_t ? type_unwrap_distinct(g2_t) : NULL;
+                g2_inner = g2_t ? type_unwrap_distinct(g2_t) : NULL;
                 if (g2_inner && type_dispatch_kind(g2_inner) == TYPE_POINTER)
                     g2_inner = g2_inner->pointer.inner;
-                g2_align = g2_inner ? type_width(g2_inner) / 8 : 0;
+                /* F4: alignment must use type_alignment_bytes (recurses into
+                 * struct/array/union fields) — type_width returned 0 for any
+                 * aggregate, so a struct-typed MMIO pointer got NO runtime
+                 * alignment trap at a variable address. */
+                g2_align = g2_inner ? type_alignment_bytes(g2_inner) : 0;
             }
             bool need_range_check = e->checker->mmio_range_count > 0 && g2_var_addr;
             bool need_align_check = g2_align > 1 && g2_var_addr;
@@ -3155,17 +3197,18 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "); ");
                 if (need_range_check) {
-                    /* plt86m audit 2026-06-17: account for the access SPAN
-                     * (sizeof T) so a variable address near the range end can't
-                     * straddle past it. span>=1 (compound/unknown width -> 1 =
-                     * byte-identical to the previous start-only check). */
-                    int g2_span = g2_align > 1 ? g2_align : 1;
+                    /* plt86m audit 2026-06-17: account for the access SPAN so a
+                     * variable address near the range end can't straddle past it.
+                     * F4: span = sizeof(target) via C sizeof (GCC-evaluated, correct
+                     * for struct/array/union too) — the previous `g2_align>1?..:1`
+                     * collapsed every aggregate span to 1 byte. */
                     emit(e, "if (!(");
                     for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
                         if (ri > 0) emit(e, " || ");
-                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + %dULL <= 0x%llxULL)",
-                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
-                             tmp, g2_span - 1,
+                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + (sizeof(",
+                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][0], tmp);
+                        if (g2_inner) emit_type(e, g2_inner); else emit(e, "char");
+                        emit(e, ") - 1ULL) <= 0x%llxULL)",
                              (unsigned long long)e->checker->mmio_ranges[ri][1]);
                     }
                     emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
@@ -6881,16 +6924,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")");
             return;
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
-            /* @truncate(T, val) → (T)(val) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* @truncate(T, val) → (T)(val), N-bit-wrapped for a uN/iN target (F6). */
+            Type *t = node->intrinsic.type_arg ? resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            uint32_t twrap = emit_intn_trunc_prefix(e, t);
+            if (twrap == 0) {
+                emit(e, "(");
+                if (t) emit_type(e, t);
+                emit(e, ")(");
             }
-            emit(e, ")(");
             if (node->intrinsic.arg_count > 0)
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, ")");
+            if (twrap == 0) emit(e, ")");
+            emit_intn_trunc_suffix(e, t, twrap);
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp to T range */
             if (node->intrinsic.type_arg) {
@@ -7137,7 +7182,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *g2_inner = t ? type_unwrap_distinct(t) : NULL;
                 if (g2_inner && type_dispatch_kind(g2_inner) == TYPE_POINTER)
                     g2_inner = g2_inner->pointer.inner;
-                int g2_align = g2_inner ? type_width(g2_inner) / 8 : 0;
+                /* F4: alignment via type_alignment_bytes (aggregate-aware); span via
+                 * C sizeof — type_width returned 0 for struct/array/union targets,
+                 * dropping both the runtime alignment trap and shrinking the range
+                 * span to 1 byte. Mirrors the AST path in emit_expr. */
+                int g2_align = g2_inner ? type_alignment_bytes(g2_inner) : 0;
                 bool need_range_check = e->checker->mmio_range_count > 0 && g2_var_addr;
                 bool need_align_check = g2_align > 1 && g2_var_addr;
                 if (need_range_check || need_align_check) {
@@ -7147,13 +7196,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit(e, "); ");
                     if (need_range_check) {
                         /* plt86m audit 2026-06-17: span-aware (see AST path). */
-                        int g2_span = g2_align > 1 ? g2_align : 1;
                         emit(e, "if (!(");
                         for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
                             if (ri > 0) emit(e, " || ");
-                            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + %dULL <= 0x%llxULL)",
-                                 tmp, (unsigned long long)e->checker->mmio_ranges[ri][0],
-                                 tmp, g2_span - 1,
+                            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + (sizeof(",
+                                 tmp, (unsigned long long)e->checker->mmio_ranges[ri][0], tmp);
+                            if (g2_inner) emit_type(e, g2_inner); else emit(e, "char");
+                            emit(e, ") - 1ULL) <= 0x%llxULL)",
                                  (unsigned long long)e->checker->mmio_ranges[ri][1]);
                         }
                         emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
@@ -8946,15 +8995,42 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *obj_type = checker_get_type(e->checker, node->slice.object);
         Type *obj_eff = obj_type ? type_unwrap_distinct(obj_type) : NULL;
         if (obj_eff && type_is_integer(obj_eff) && node->slice.start && node->slice.end) {
-            /* Bit extraction: val[hi..lo] with safety when hi < lo → 0 */
+            /* Bit extraction: val[hi..lo]. F8: mirror the AST reference — a 64-bit
+             * `1ull` mask with a `>=64`/`<=0` clamp and an unsigned cast of a signed
+             * source. The prior IR form used a 32-bit `1U << (hi-lo+1)` with no width
+             * guard, silently truncating any extract wider than 32 bits and invoking
+             * C shift-UB when the extracted width reached 32. Single-eval (object,
+             * start, end each emitted once; the `<=0` mask branch subsumes hi<lo). */
+            const char *ucast = "";
+            switch (obj_eff->kind) {
+            case TYPE_I8:  ucast = "(uint8_t)";  break;
+            case TYPE_I16: ucast = "(uint16_t)"; break;
+            case TYPE_I32: ucast = "(uint32_t)"; break;
+            case TYPE_I64: ucast = "(uint64_t)"; break;
+            /* Exhaustive (Stage 2 Part B -Wswitch discipline): only signed ints
+             * need the unsigned cast; every other kind is a no-op. No default:. */
+            case TYPE_VOID: case TYPE_BOOL:
+            case TYPE_U8: case TYPE_U16: case TYPE_U32:
+            case TYPE_U64: case TYPE_USIZE:
+            case TYPE_UINT: case TYPE_SINT:
+            case TYPE_F32: case TYPE_F64:
+            case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+            case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+            case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+            case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+            case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+            case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+                break;
+            }
             int t = e->temp_count++;
-            emit(e, "({ int _zer_hi%d = (", t);
+            emit(e, "({ int _zer_hi%d = (int)(", t);
             emit_rewritten_node(e, node->slice.start, func);
-            emit(e, "); int _zer_lo%d = (", t);
+            emit(e, "); int _zer_lo%d = (int)(", t);
             emit_rewritten_node(e, node->slice.end, func);
-            emit(e, "); _zer_hi%d >= _zer_lo%d ? (((", t, t);
+            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", t, t, t, ucast);
             emit_rewritten_node(e, node->slice.object, func);
-            emit(e, ") >> _zer_lo%d) & ((1U << (_zer_hi%d - _zer_lo%d + 1)) - 1)) : 0U; })", t, t, t);
+            emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                 t, t, t, t);
             return;
         }
         bool obj_slice = obj_eff && obj_eff->kind == TYPE_SLICE;
@@ -9384,6 +9460,43 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
     }
 }
 
+/* Path C (F5): a uN/iN value that reaches a target via assignment / compound-assign
+ * (`x = a+b`, `x += n`, `x <<= n`, `s.v += n`) keeps the over-width bits in the store
+ * target — the IR_BINOP/UNOP/shift mask only wraps the arithmetic TEMP, not the
+ * assignment target carrier. Re-mask the target here at the statement boundary so the
+ * "uN wraps at 2^N" invariant holds for every write, not just var-decl init. Gated on
+ * a non-side-effecting target lvalue to avoid double-evaluating a `arr[f()]`-style
+ * target (rare; that residual is a documented limitation). */
+static void emit_intn_mask_assign_target(Emitter *e, IRFunc *func, Node *expr) {
+    if (!expr || expr->kind != NODE_ASSIGN) return;
+    Node *tgt = expr->assign.target;
+    if (!tgt) return;
+    Type *tt = checker_get_type(e->checker, tgt);
+    if (!tt) return;
+    TypeKind k = type_dispatch_kind(tt);
+    if (k != TYPE_UINT && k != TYPE_SINT) return;
+    uint32_t nb = type_unwrap_distinct(tt)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return;
+    if (expr_has_side_effects(tgt)) return;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    emit_indent(e);
+    if (k == TYPE_UINT) {
+        emit_rewritten_node(e, tgt, func);
+        emit(e, " = (");
+        emit_rewritten_node(e, tgt, func);
+        if (nb < 64) emit(e, " & 0x%llxULL);\n", (unsigned long long)((1ULL << nb) - 1ULL));
+        else emit(e, " & ((((unsigned __int128)1u) << %u) - 1u));\n", nb);
+    } else {
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        uint32_t sh = cw - nb;
+        emit_rewritten_node(e, tgt, func);
+        emit(e, " = (%s)((%s)", ss, su);
+        emit_rewritten_node(e, tgt, func);
+        emit(e, " << %u) >> %u;\n", sh, sh);
+    }
+}
+
 /* Emit one IR instruction as C code */
 static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     switch (inst->op) {
@@ -9456,11 +9569,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
+            emit_intn_mask_assign_target(e, func, inst->expr);
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
             emit_rewritten_node(e, inst->expr, func);
             emit(e, ";\n");
+            emit_intn_mask_assign_target(e, func, inst->expr);
         }
         break;
     }

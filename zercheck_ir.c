@@ -818,6 +818,27 @@ static void ir_mark_local_escaped(IRPathState *ps, int local_id) {
     if (h) h->escaped = true;
 }
 
+/* F7: returning a struct/union/array BY VALUE hands its field contents to the
+ * caller, so any allocation stored into one of its fields (`h.n = p; return h;`,
+ * or the temp-materialized `return { .n = p }`) ESCAPES and must not be reported
+ * as a leak. Mark every compound handle rooted at the returned local escaped; the
+ * alloc_id-covering exit pass (which the field-store registered as an alias of the
+ * root allocation) then suppresses the leak. This is the value-return analog of the
+ * store-to-global / return-of-view escape sinks — over-rejection only (a genuine
+ * leak of a field NOT reachable from the returned value keeps its own handle). */
+static void ir_escape_returned_aggregate(IRPathState *ps, IRFunc *func, int ret_local) {
+    if (ret_local < 0 || ret_local >= func->local_count) return;
+    Type *t = func->locals[ret_local].type;
+    if (!t) return;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_STRUCT && k != TYPE_UNION && k != TYPE_ARRAY) return;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        if (h->local_id == ret_local && h->path_len > 0)
+            h->escaped = true;
+    }
+}
+
 /* GAP-3 (BUG-739, 2026-06-10, 6u360k audit): pseudo-root for tracking
  * pointer-typed GLOBALS that receive a tracked allocation within the
  * current function. `g_ptr = p; heap.free_ptr(p); gp = g_ptr orelse
@@ -2537,6 +2558,35 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
+        /* F7: copying an aggregate (struct/union/array) BY VALUE copies its field
+         * pointers, so any COMPOUND handle rooted at the source (a field holding an
+         * allocation — e.g. a struct literal built in a temp then `Holder h = tmp`)
+         * must be mirrored onto the dest as an alias. Without this the temp->named
+         * copy dropped the p-alias and `Holder h = { .n = p }; return h;` falsely
+         * reported p as leaked (the returned struct carries p to the caller). The
+         * bare-handle alias below never fired because a struct temp has no bare
+         * handle (`if (!src_h) break`). Snapshot-then-add per entry (add may realloc
+         * ps->handles); a fixed pre-pass count bounds the loop against new adds. */
+        if (inst->dest_local < func->local_count &&
+            inst->src1_local < func->local_count) {
+            Type *dt = func->locals[inst->dest_local].type;
+            TypeKind dk = dt ? type_dispatch_kind(dt) : TYPE_VOID;
+            if (dk == TYPE_STRUCT || dk == TYPE_UNION || dk == TYPE_ARRAY) {
+                int pre_n = ps->handle_count;
+                for (int i = 0; i < pre_n; i++) {
+                    if (ps->handles[i].local_id != inst->src1_local ||
+                        ps->handles[i].path_len == 0) continue;
+                    IRAliasSnapshot csnap;
+                    ir_snapshot_alias(&csnap, &ps->handles[i]);
+                    const char *cpath = ps->handles[i].path;
+                    uint32_t cplen = ps->handles[i].path_len;
+                    IRHandleInfo *ch = ir_add_compound_handle(ps, inst->dest_local,
+                                                              cpath, cplen);
+                    if (ch) ir_apply_alias(ch, &csnap);
+                }
+            }
+        }
+
         IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
         if (!src_h) break;
         /* Error if source is invalid */
@@ -3606,6 +3656,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
                 if (h) h->escaped = true;
             }
+            ir_escape_returned_aggregate(ps, func, ret_local_direct);
         }
 
         /* Case (a): direct ident return */
@@ -3640,6 +3691,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     if (h) h->escaped = true;
                 }
+                ir_escape_returned_aggregate(ps, func, ret_local);
             }
         }
 
@@ -4637,6 +4689,34 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_CALL_DECOMP: case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP: case IR_SLICE_READ:
     case IR_STRUCT_INIT_DECOMP:
+        /* F7: register a compound handle for each field initialized with a tracked
+         * ALIVE allocation (`Holder h = { .n = p }`), so the allocation is tracked
+         * THROUGH the struct. The temp->named COPY then mirrors the alias and a
+         * `return h` escapes it — without this the struct-literal field-store was
+         * invisible and p was falsely reported leaked. Mirrors the IR_ASSIGN
+         * field-store compound registration; snapshot-before-add (add may realloc). */
+        if (inst->expr && inst->expr->kind == NODE_STRUCT_INIT &&
+            inst->dest_local >= 0) {
+            for (int fi = 0; fi < inst->expr->struct_init.field_count; fi++) {
+                DesigField *df = &inst->expr->struct_init.fields[fi];
+                if (!df->value || !df->name) continue;
+                int fv_local = ir_find_value_local(func, df->value);
+                if (fv_local < 0) continue;
+                IRHandleInfo *rh = ir_find_handle(ps, fv_local);
+                if (!rh || rh->state != IR_HS_ALIVE) continue;
+                uint32_t plen = 1 + (uint32_t)df->name_len;
+                char *path = (char *)arena_alloc(zc->arena, plen + 1);
+                if (!path) continue;
+                path[0] = '.';
+                memcpy(path + 1, df->name, df->name_len);
+                path[plen] = '\0';
+                IRAliasSnapshot snap;
+                ir_snapshot_alias(&snap, rh);
+                IRHandleInfo *ch = ir_add_compound_handle(ps, inst->dest_local,
+                                                          path, plen);
+                if (ch) ir_apply_alias(ch, &snap);
+            }
+        }
         break;
     }
 }

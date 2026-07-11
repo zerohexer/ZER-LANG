@@ -1,0 +1,11 @@
+// MUST FAIL: a nested slice-returning call that views a caller LOCAL, passed as an
+// arg to an outer call whose result is stored to a global, launders a stack slice.
+// F1: arg_is_local_derived nested-call recursion was TYPE_POINTER-only (skipped slices).
+[*]u8 g_slice;
+[*]u8 sub([*]u8 s) { return s[0..2]; }
+[*]u8 pick([*]u8 a, [*]u8 b) { return a; }
+void danger([*]u8 owned) {
+    u8[8] local;
+    [*]u8 ls = local[0..8];
+    g_slice = pick(sub(ls), owned);
+}

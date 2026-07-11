@@ -898,6 +898,29 @@ static void classify_escape_sink(Checker *c, Node *target,
  * is provably static via the keep-param call-site chain, so storing it into any
  * field is safe). See the removed check in the NODE_ASSIGN handler. */
 
+/* A value of this type can carry a REFERENCE into frame memory: a pointer, a
+ * slice ({ptr,len} — views frame memory exactly as a pointer does), or an
+ * optional wrapping either (?*T is a bare pointer, ?[*]T an optional slice).
+ * The escape taint-walks gate their "descend to the root local" on this so that
+ * EVERY frame-carrying shape is followed — the earlier per-site gates enumerated
+ * only {POINTER, SLICE} and each missed a different shape (a nested slice-call
+ * result laundered as an outer arg; an optional-pointer struct field/element read
+ * stored to a global). A VALUE optional (?u32) copies a value, not a reference, so
+ * it is correctly excluded (its unwrapped inner is not a pointer/slice). */
+static bool escape_type_carries_ref(Type *vt) {
+    if (!vt) return false;
+    TypeKind k = type_dispatch_kind(vt);
+    if (k == TYPE_POINTER || k == TYPE_SLICE) return true;
+    if (k == TYPE_OPTIONAL) {
+        Type *inner = type_unwrap_optional(vt);
+        if (inner) {
+            TypeKind ik = type_dispatch_kind(inner);
+            return ik == TYPE_POINTER || ik == TYPE_SLICE;
+        }
+    }
+    return false;
+}
+
 /* BUG-374 + Stage 2 extraction (2026-06-22): does a SINGLE call argument carry a
  * pointer/slice derived from a caller LOCAL (frame memory)?  Behavior-preserving
  * split-out of the per-argument body of `call_has_local_derived_arg` so the
@@ -963,10 +986,14 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                     return true;
             }
         }
-        /* nested call returning pointer — recurse */
+        /* nested call returning a pointer/slice/optional-view — recurse. Was
+         * TYPE_POINTER-only, so a nested call returning a SLICE that views a caller
+         * local (`stash(sub(local[..]))` where `sub([*]u8)->[*]u8` returns a view of
+         * its param) laundered the stack slice past the escape sinks undetected.
+         * A slice references frame memory exactly as a pointer does. */
         if (arg->kind == NODE_CALL) {
             Type *arg_type = typemap_get(c, arg);
-            if (arg_type && type_unwrap_distinct(arg_type)->kind == TYPE_POINTER) {
+            if (escape_type_carries_ref(arg_type)) {
                 if (call_has_local_derived_arg(c, arg, depth + 1))
                     return true;
             }
@@ -4403,8 +4430,11 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!via_slice_borrow && vnode &&
                 (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt = typemap_get(c, node->assign.value);
-                if (vt && (type_dispatch_kind(vt) == TYPE_POINTER ||
-                           type_dispatch_kind(vt) == TYPE_SLICE)) {
+                /* escape_type_carries_ref: pointer|slice|optional-of-those. Was
+                 * pointer/slice-only, so `g = b.p` where b.p is a ?*T field holding
+                 * &local (type TYPE_OPTIONAL) skipped the descend-to-root walk and
+                 * laundered a stack pointer into a global undetected (F3). */
+                if (escape_type_carries_ref(vt)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -4488,8 +4518,10 @@ static Type *check_expr(Checker *c, Node *node) {
              * projection_preserves_escape / buggy_projection_unsound. */
             if (vnode && (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt2 = typemap_get(c, node->assign.value);
-                if (vt2 && (type_dispatch_kind(vt2) == TYPE_POINTER ||
-                            type_dispatch_kind(vt2) == TYPE_SLICE)) {
+                /* escape_type_carries_ref: pointer|slice|optional-of-those — a ?*T
+                 * field of a by-value param launders the caller pointer identically
+                 * to a bare *T field (F3 sibling on the keep-inference sink). */
+                if (escape_type_carries_ref(vt2)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -7871,7 +7903,12 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (result && type_dispatch_kind(result) == TYPE_POINTER) {
                             Type *sinner = type_unwrap_distinct(result);
                             if (sinner->pointer.inner) {
-                                int wb = type_width(sinner->pointer.inner) / 8;
+                                /* F4: use compute_type_size (full byte size incl.
+                                 * struct/array/union) — type_width returns 0 for any
+                                 * aggregate, which collapsed a 16-byte peripheral
+                                 * struct to a 1-byte span and let it overflow the
+                                 * declared mmio range undetected. */
+                                int64_t wb = compute_type_size(sinner->pointer.inner);
                                 if (wb > 1) span = (uint64_t)wb;
                             }
                         }
@@ -10594,7 +10631,7 @@ static void check_stmt(Checker *c, Node *node) {
              * Applies to BOTH pointer results AND struct results (struct may
              * contain pointer fields carrying the local pointer). */
             if (sym && node->var_decl.init && type &&
-                (type->kind == TYPE_POINTER || type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE)) {
+                (escape_type_carries_ref(type) || type_dispatch_kind(type) == TYPE_STRUCT)) {
                 Node *call = node->var_decl.init;
                 if (call->kind == NODE_ORELSE) call = call->orelse.expr;
                 /* BUG-383: walk through field/index to find call root */
@@ -10608,6 +10645,31 @@ static void check_stmt(Checker *c, Node *node) {
                      * `g = second(local, global)` (returns the global param). */
                     if (call_result_escapes(c, call)) {
                         sym->is_local_derived = true;
+                    }
+                }
+            }
+
+            /* F3 two-step (var-decl field/index-read launder): `?*u32 t = b.p; g = t`
+             * where b.p is a pointer/slice/optional-pointer FIELD (or element) of a
+             * local-derived struct/array. The direct `g = b.p` store is caught at the
+             * assignment sink; this propagates is_local_derived onto the var so the
+             * subsequent `g = t` store is caught too. Gated on the value type carrying
+             * a reference (a scalar field copy `u32 v = b.count` must NOT taint). */
+            if (sym && !sym->is_local_derived && node->var_decl.init &&
+                escape_type_carries_ref(type)) {
+                Node *fr = node->var_decl.init;
+                if (fr->kind == NODE_ORELSE) fr = fr->orelse.expr;
+                if (fr && (fr->kind == NODE_FIELD || fr->kind == NODE_INDEX)) {
+                    Node *root = fr;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        Symbol *src = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (src && src->is_local_derived)
+                            sym->is_local_derived = true;
                     }
                 }
             }

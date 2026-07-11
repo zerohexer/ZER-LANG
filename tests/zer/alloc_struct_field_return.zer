@@ -1,0 +1,26 @@
+// F7: an allocation stored into a struct field and returned by value ESCAPES
+// (ownership transferred to caller) — must NOT be a false leak. Both the struct
+// literal form and explicit field-store form must compile, run, and free cleanly.
+struct Node { u32 v; }
+struct Holder { *Node n; }
+Holder make_lit(u32 val) {
+    *Node p = alloc(Node) orelse { Holder z; return z; };
+    p.v = val;
+    return { .n = p };
+}
+Holder make_field(u32 val) {
+    *Node p = alloc(Node) orelse { Holder z; return z; };
+    Holder h;
+    h.n = p;
+    h.n.v = val;
+    return h;
+}
+u32 main() {
+    Holder a = make_lit(11);
+    Holder b = make_field(31);
+    u32 sum = a.n.v + b.n.v;
+    free(a.n);
+    free(b.n);
+    if (sum == 42) { return 0; }
+    return 1;
+}

@@ -1,0 +1,17 @@
+// F5: uN/iN width mask must apply on assignment + compound-assign paths, not just
+// var-decl init. Every branch below must agree with the var-decl-masked reference.
+u32 main() {
+    u21 a = 2000000;
+    u21 b = 2000000;
+    u21 ref = a + b;          // masked at var-decl: 4000000 & 0x1FFFFF = 1902848
+    u21 x = 0;
+    x = a + b;                // simple assignment path
+    if (x != ref) { return 1; }
+    u21 y = 2000000;
+    y += 2000000;             // compound-assign path
+    if (y != ref) { return 2; }
+    u21 z = 1;
+    z <<= 21;                 // compound shift: 1<<21 = 2097152, wraps to 0 in u21
+    if (z != 0) { return 3; }
+    return 0;
+}

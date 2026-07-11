@@ -21,9 +21,18 @@ predicates are VST-verified for `TYPE_UINT`/`TYPE_SINT` (Level-3 restored,
   important axis, not a correctness matter; see BUGS-FIXED.md.)
 - **`uN`/`iN` mask coverage gaps (LOW).** `emit_intn_mask` is wired into
   `IR_BINOP` (general arithmetic + shift) and `IR_UNOP` (negation/complement,
-  commit 9fa81989). NOT masked: global-scope arithmetic (AST `NODE_BINARY` at
-  emitter.c ~5897 — rare, const-folded in practice). Add the mask there for
-  full coverage.
+  commit 9fa81989). The **assignment / compound-assign** paths (`x = a+b`,
+  `x += n`, `x <<= n`, `s.v += n`) and **`@truncate(uN, val)`** are now masked too
+  (BUGS-FIXED 2026-07-11 F5/F6 — `emit_intn_mask_assign_target` on `IR_ASSIGN`;
+  `emit_intn_trunc_prefix/suffix` on both `@truncate` emitters). STILL not masked:
+  global-scope arithmetic (AST `NODE_BINARY` at emitter.c ~5897 — rare,
+  const-folded in practice). Add the mask there for full coverage.
+  Two documented F5 residuals (both narrow, non-safety): the assignment re-mask
+  skips a **side-effecting** target (`arr[f()] += n` on a `uN`) to avoid
+  double-evaluating the index — the arithmetic temp is already width-correct, only
+  the stored carrier keeps the extra bits; and a `uN` assignment used **as an
+  expression value** (`u32 y = (x = a+b)`) gives `y` the pre-mask value while `x`
+  itself is masked correctly.
 - **Single-bit `reg[5]` shorthand — an ARCHITECT DECISION, not a mechanical fix.**
   A bare single index on a scalar integer (`reg[5]`) errors "cannot index type";
   use the range form `reg[5..5]` (works today, read + write). Making `reg[5]` a

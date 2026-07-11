@@ -1,0 +1,15 @@
+// Native uN/iN as GLOBAL variables — the valid, safe form is a fitting literal.
+// A fitting literal can't overflow the width, so no masking is needed at global
+// scope (over-width / arithmetic inits are all rejected — see the companion
+// tests/zer_fail/global_uN_arith_narrow.zer). Verifies the value round-trips.
+u21 g_u = 100000;        // in-range unsigned 21-bit
+u21 g_max = 2097151;     // exactly max u21 (2^21 - 1)
+i12 g_i = -2048;         // signed 12-bit min
+const u21 g_c = 1500;    // const global (const-fold emit path)
+u32 main() {
+    if (g_u != 100000) { return 1; }
+    if (g_max != 2097151) { return 2; }
+    if (g_i != -2048) { return 3; }
+    if (g_c != 1500) { return 4; }
+    return 0;
+}

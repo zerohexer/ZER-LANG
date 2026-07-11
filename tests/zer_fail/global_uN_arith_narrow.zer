@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// A global uN initialized with integer arithmetic is rejected: `1000 + 500` is
+// typed u32, and u32 -> u21 is a narrowing conversion. This narrowing rejection
+// (together with the "does not fit" check on over-width literals and C's
+// constant-initializer requirement, which blocks uN-operand arithmetic) is what
+// makes width-masking unnecessary at global scope: no over-width value can reach
+// a global uN in the first place. emit_intn_mask therefore runs only on the
+// function-body paths (IR_BINOP / IR_UNOP), where real uN arithmetic occurs.
+//
+// TRIPWIRE: if this ever COMPILES (someone relaxes the uN narrowing/const-fold
+// rules), the global emit path must mask the result to the width at that time —
+// otherwise the global would hold an unmasked over-width value. Do not delete
+// this test without adding that mask.
+u21 g = 1000 + 500;
+u32 main() { return 0; }

@@ -567,13 +567,16 @@ Result types are spellable builtin structs (registered in `checker_init`; both
 emitter dispatch paths). Plain `a + b` on u64 == `@addc(a,b,0).sum`. Companion
 feature: NATIVE arbitrary-width integers `uN`/`iN` (u21, i48, u3, N=1..128) —
 `resolve_type` maps `u<N>`/`i<N>` → `type_uint`/`type_sint`; carrier = smallest
-native int ≥ N; `emit_intn_mask` (emitter, IR_BINOP) masks arithmetic to N bits
-(uN bitmask / iN sign-extend) so odd widths wrap at 2^N; `src/safety/type_kind.*`
+native int ≥ N; `emit_intn_mask` (emitter, IR_BINOP + IR_UNOP) masks arithmetic to
+N bits (uN bitmask / iN sign-extend) so odd widths wrap at 2^N; `src/safety/type_kind.*`
 predicates recognise TYPE_UINT/TYPE_SINT. Over-width bit-slice write `reg[hi..lo]=LIT`
 is now a compile error (was silent truncation). uN/iN type-kind predicates are
-VST-verified (Level-3, `make check-vst`, verif_type_kind.v). Open follow-ups
+VST-verified (Level-3, `make check-vst`, verif_type_kind.v). Global-scope uN
+arithmetic needs no mask — verified safe by rejection (u32→uN narrowing + fits-check
++ C constant-initializer requirement all reject over-width global inits; only a
+fitting literal is a valid global uN init, which can't overflow). Open follow-ups
 (docs/limitations.md): VRP mask-elision (deferred — Rice-bounded perf); single-bit
-`reg[5]` shorthand (use `reg[5..5]`); iN mask on global-scope arithmetic.
+`reg[5]` shorthand (use `reg[5..5]`).
 
 ### Interrupt Control Intrinsics (D-Alpha-3, privileged — kernel mode only)
 ```

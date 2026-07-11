@@ -60,6 +60,28 @@ imports `zer_safety.type_kind` (grep-confirmed), so the change is independent of
 other 29 VST predicate files. Level-3 (real-code-matches-spec) is back on for these
 7 type-kind predicates.
 
+**Update 2026-07-12 — global-scope uN masking verified SAFE (no hole, no code change).**
+`emit_intn_mask` runs on the function-body paths (`IR_BINOP` arithmetic/shift +
+`IR_UNOP` negation/complement) but NOT on global-scope initializers (AST path). This
+was flagged as a possible coverage gap; empirical investigation (5 build+run probe
+rounds in Docker) proves it is NOT a hole — a global `uN` cannot carry an over-width
+value, because every construction is rejected:
+- `u21 g = 1000 + 500;` (int-literal arithmetic) → checker rejects: `1000+500` is
+  `u32`, and u32→u21 is a narrowing conversion (holds at global AND local scope —
+  the earlier "locals silently wrap int arithmetic" mental model was wrong).
+- `u21 g = 2097152;` (over-width literal) → checker rejects: "does not fit".
+- `const u21 g = a * b;` (uN-typed const operands) → GCC rejects: "initializer
+  element is not constant". `eval_const_expr` does not fold const-`uN` idents, so a
+  runtime expression is emitted, which is not a valid C constant initializer.
+The only valid global `uN` init is a fitting literal (`u21 g = 100000;` →
+`uint32_t g = 100000;`), which cannot overflow by construction. So the masking gap
+is UNREACHABLE — defended by three independent mechanisms, not by masking. Pinned by
+`tests/zer/uint_global.zer` (+, valid literals round-trip incl. `u21`=max, `i12`=min)
+and `tests/zer_fail/global_uN_arith_narrow.zer` (−, tripwire: if the narrowing/fold
+rules are ever relaxed to ACCEPT such an init, the global emit path must add the mask
+at that time). `make check` 912/0. No code change — adding a mask to the global path
+would be untestable dead code today.
+
 Open follow-ups: see `docs/limitations.md` "native uN/iN". VRP mask-elision is
 explicitly DEFERRED (a Rice-bounded precision optimization — build more inference to
 elide a cheap `and` where provably in-range; marginal perf on the least-important

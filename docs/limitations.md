@@ -10,7 +10,10 @@ Entries removed once fixed.
 Native arbitrary-width integers `uN`/`iN` shipped (BUGS-FIXED.md 2026-07-09,
 commits e7ea2bcb/d91d0742/80183261; `make check` GREEN). The type-kind
 predicates are VST-verified for `TYPE_UINT`/`TYPE_SINT` (Level-3 restored,
-`verif_type_kind.v`, verified via `make check-vst` 2026-07-10). Remaining edges:
+`verif_type_kind.v`, verified via `make check-vst` 2026-07-10). Width-masking is
+complete: `emit_intn_mask` runs on `IR_BINOP` (arithmetic + shift) and `IR_UNOP`
+(negation/complement); global-scope arithmetic needs no mask (verified safe by
+rejection 2026-07-12 — see BUGS-FIXED.md). Remaining edges (all polish/deferred):
 
 - **VRP mask-elision (LOW — performance).** `emit_intn_mask` always emits the
   `& (2^N-1)` after `uN` arithmetic. Sound but not minimal: where VRP can prove
@@ -19,11 +22,6 @@ predicates are VST-verified for `TYPE_UINT`/`TYPE_SINT` (Level-3 restored,
   never need the mask and could skip it unconditionally. Not built. (Explicitly
   deferred 2026-07-10 — a Rice-bounded precision optimization on the least-
   important axis, not a correctness matter; see BUGS-FIXED.md.)
-- **`uN`/`iN` mask coverage gaps (LOW).** `emit_intn_mask` is wired into
-  `IR_BINOP` (general arithmetic + shift) and `IR_UNOP` (negation/complement,
-  commit 9fa81989). NOT masked: global-scope arithmetic (AST `NODE_BINARY` at
-  emitter.c ~5897 — rare, const-folded in practice). Add the mask there for
-  full coverage.
 - **Single-bit `reg[5]` shorthand — an ARCHITECT DECISION, not a mechanical fix.**
   A bare single index on a scalar integer (`reg[5]`) errors "cannot index type";
   use the range form `reg[5..5]` (works today, read + write). Making `reg[5]` a

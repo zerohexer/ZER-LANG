@@ -3166,16 +3166,29 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "0");
             }
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
-            /* @truncate(val) → (T)(val) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* @truncate(T, val) → (T)(val). For a non-native uN/iN target the
+             * cast alone keeps the over-width bits (`@truncate(u3,13)` → 13 not
+             * 5), so mask the result here — covers INLINE uses (comparisons,
+             * call args), not just stores. */
+            Type *tt = node->intrinsic.type_arg ? resolve_tynode(e,node->intrinsic.type_arg) : NULL;
+            if (type_is_nonnative_intn(tt)) {
+                int tmp = e->temp_count++;
+                char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
+                emit(e, "({ "); emit_type(e, tt);
+                emit(e, " _zer_tr%d = (", tmp); emit_type(e, tt); emit(e, ")(");
+                if (node->intrinsic.arg_count > 0) emit_expr(e, node->intrinsic.args[0]);
+                else emit(e, "0");
+                emit(e, "); ");
+                emit_intn_mask_lv(e, tt, lv);
+                emit(e, "_zer_tr%d; })", tmp);
+            } else {
+                emit(e, "(");
+                if (tt) emit_type(e, tt);
+                emit(e, ")(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
             }
-            emit(e, ")(");
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
@@ -7015,16 +7028,27 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")");
             return;
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
-            /* @truncate(T, val) → (T)(val) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* @truncate(T, val) → (T)(val). Non-native uN/iN: mask the result
+             * (IR-path twin of the emit_expr site) — covers inline uses. */
+            Type *tt = node->intrinsic.type_arg ? resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            if (type_is_nonnative_intn(tt)) {
+                int tmp = e->temp_count++;
+                char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
+                emit(e, "({ "); emit_type(e, tt);
+                emit(e, " _zer_tr%d = (", tmp); emit_type(e, tt); emit(e, ")(");
+                if (node->intrinsic.arg_count > 0) emit_rewritten_node(e, node->intrinsic.args[0], func);
+                else emit(e, "0");
+                emit(e, "); ");
+                emit_intn_mask_lv(e, tt, lv);
+                emit(e, "_zer_tr%d; })", tmp);
+            } else {
+                emit(e, "(");
+                if (tt) emit_type(e, tt);
+                emit(e, ")(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ")");
             }
-            emit(e, ")(");
-            if (node->intrinsic.arg_count > 0)
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp to T range */
             if (node->intrinsic.type_arg) {

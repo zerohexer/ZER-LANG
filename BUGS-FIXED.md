@@ -41,7 +41,10 @@ and globals; broke both uN wrap and iN sign-extend. Fixed by intercepting a scal
 non-native uN/iN store and emitting store+mask through ONE hoisted pointer
 (`emit_intn_mask_lv` + `type_is_nonnative_intn`), single-eval-safe for a
 side-effecting index. `/= %= >>=` keep their paths (result magnitude ≤ operand, no
-overflow). Test `tests/zer/intn_assign_mask.zer`.
+overflow). ALSO masked the `@truncate(uN, val)` emit site itself (both dispatch
+paths) so a non-native truncate is correct when used INLINE (comparison / call
+arg), not only when stored — `@truncate(u3, 13) == 5` now holds. Tests
+`tests/zer/intn_assign_mask.zer`, `tests/zer/intn_truncate_inline.zer`.
 
 **4. ESCAPE #1 — direct-call arena assignment laundered to global/param (real
 UAF).** `checker.c` NODE_ASSIGN arena block. `g = arena.alloc_slice(...)` (DIRECT

@@ -94,6 +94,66 @@ Auto-slab `Type.alloc_ptr()` was migrated to `alloc(T)` in tests; explicit-slab
 `slab.alloc_ptr()` (allocate `*T` from a NAMED pool) is a distinct capability and
 STAYS. Open findings from the build: limitations.md "universal-`alloc` build".
 
+## Native `uN`/`iN` + carry primitives — implementation pointer (2026-07-09..12)
+
+Arbitrary-width integers (`u17`, `u21`, `i48`, `u3`, `u128` — any width 1..128,
+signed/unsigned) plus the safe carry primitives `@addc`/`@subb`/`@mulw`. User
+surface: `docs/reference.md`. Session history: BUGS-FIXED.md 2026-07-09 (+ the
+07-10 / 07-12 update notes). The load-bearing facts a future session needs:
+
+1. **Generic over N — there is NO per-width code.** `u17` works because the whole
+   pipeline computes from the bit count: `parse_intn_width` (checker.c ~1993)
+   parses any `u<N>`/`i<N>` name (N in 1..128); the `resolve_type` TYNODE_NAMED
+   hook (~2200, fires ONLY when `scope_lookup` finds no struct/typedef of that
+   name) returns `type_uint`/`type_sint(arena, N)` — a `TYPE_UINT`/`TYPE_SINT`
+   with `.intn.bits = N`. `u8/16/32/64` are LEXER KEYWORDS (`TOK_U8`…) and never
+   reach this path; only non-standard widths do. There is NO allow-list to extend
+   — supporting a new width requires zero code.
+2. **Carrier = smallest native int ≥ N** (`emit_intn_carrier`, emitter.c ~745):
+   u17→`uint32_t`, u48→`uint64_t`, u100→`unsigned __int128`. The carrier is WIDER
+   than N for non-native widths, so high bits must be cleared after arithmetic.
+3. **`emit_intn_mask` (emitter.c ~765) is the wrap.** After each arithmetic op:
+   uN → `x = (x & (2^N-1))`; iN → sign-extend `(ss)((su)x << sh) >> sh`
+   (unsigned-shift-then-arithmetic-`>>` avoids signed-shift UB). Native widths
+   {8,16,32,64,128} self-wrap in their carrier → NO mask (early return). Wired at
+   TWO IR sites: IR_BINOP (arithmetic + shift, ~10833/10922) and IR_UNOP
+   (negation/complement, ~10960). It takes an `IRLocal*` — **IR-path ONLY**
+   (function bodies), which is why the global-scope question (#4) matters.
+4. **Global-scope needs NO mask — verified safe by REJECTION, not by masking.** A
+   global `uN` cannot carry an over-width value: int-literal arithmetic
+   (`u21 g = 1000+500`) is u32→uN narrowing-REJECTED (this holds at LOCAL scope
+   too — real uN arithmetic needs uN-TYPED operands, not bare int literals, whose
+   sum defaults to u32); over-width literals hit the fits-check; uN-operand const
+   arithmetic (`const u21 g = a*b`) is GCC "initializer element is not constant"
+   (`eval_const_expr` does not fold const-uN idents). Only a fitting literal is a
+   valid global uN init, which can't overflow. Pinned by `tests/zer/uint_global.zer`
+   + `tests/zer_fail/global_uN_arith_narrow.zer` (tripwire). Do NOT "add the mask
+   for completeness" — it is untestable dead code; the tripwire forces a mask ONLY
+   if the narrowing is ever relaxed.
+5. **Carry primitives are safe value ops** (no asm/memory surface): `@addc`/`@subb`/
+   `@mulw` → spellable builtin structs `AddCarry64{sum,carry}` / `SubBorrow64{diff,
+   borrow}` / `MulWide64{lo,hi}`, lowering to `__builtin_add_overflow` /
+   `__builtin_sub_overflow` / `unsigned __int128` (schoolbook fallback). Plain
+   `a+b` on u64 == `@addc(a,b,0).sum`. **Result types are registered in
+   `register_builtin_pair_types`, called from `checker_init` — NOT `checker_check`**
+   (checker_check is not the entry point for the compile path; registering there
+   silently no-ops → "undefined type AddCarry64"). Same "register in the always-run
+   init" lesson as auto-slabs. BOTH emitter dispatch paths handle them (AST +
+   IR-rewritten) — `grep '"addc"' emitter.c` must show 2 hits.
+6. **type_kind predicates recognize them + are VST-verified.** `TYPE_UINT`/`TYPE_SINT`
+   (enum values 30/31; `ZER_TK_UINT/SINT` in the .h) added to
+   `zer_type_kind_is_integer/is_signed/is_unsigned/is_numeric`
+   (src/safety/type_kind.c) — WITHOUT this a uN is not seen as an integer and every
+   use fails the fits-check. `is_numeric` INLINES its own cases (does not call
+   is_integer) — update BOTH if the integer set changes. These are Level-3
+   VST-verified (`proofs/vst/verif_type_kind.v`); the verify workflow + the
+   "add-a-TypeKind" recipe are in `docs/proof-internals.md`.
+
+Over-width bit-slice write `reg[hi..lo]=LIT` is a compile error (checker NODE_ASSIGN,
+was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
+mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
+(architect decision, use `reg[5..5]`).
+
 ## ZER Safety Architecture — Read Before Any Safety Work
 
 **Mandatory reading before modifying ANY safety-relevant code** (checker.c

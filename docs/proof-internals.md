@@ -211,6 +211,46 @@ proofs/vst/
   verif_<func>.v         # VST spec + proof
 ```
 
+### Fast targeted verify + adding an enum value to a verified predicate (2026-07-12)
+
+**Targeted single-predicate verify (skip the ~5-min full `make check-vst`).** When
+you edit ONE `verif_X.v`, re-run just that predicate. Two gotchas learned the hard
+way: (1) the `zer-vst` image runs as **NON-ROOT** — `mkdir /build` fails
+"Permission denied"; use `/tmp/build`. (2) `src/safety/X.v` is clightgen-GENERATED
+from `X.c` on each run — **never hand-edit it**; edit only `proofs/vst/verif_X.v`.
+```
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-vst bash -c '
+  eval $(opam env)
+  mkdir -p /tmp/build && tar -C /src -cf - --exclude=.git --exclude=".git*" src proofs Makefile | (cd /tmp/build && tar xf -)
+  cd /tmp/build && clightgen -normalize src/safety/type_kind.c && cd proofs/vst &&
+  coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/type_kind.v &&
+  coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_type_kind.v && echo VERIF_OK '
+```
+A `verif_X.v` that imports only its own `zer_safety.X` predicate is INDEPENDENT of
+the other predicate files — `grep "Require.*zer_safety" proofs/vst/*.v` shows which
+files import X — so the targeted run is authoritative for that change; no need to
+re-run the whole suite. (Name coincidences don't count: `verif_move_rules.v` names
+`zer_type_kind_is_move_struct` but does not `Require` `zer_safety.type_kind`.)
+
+**Recipe — adding a new enum value (e.g. a new `TypeKind`) to an EXISTING verified
+predicate** (done 2026-07-12 for `TYPE_UINT`/`TYPE_SINT` → the type_kind predicates):
+1. Add `#define ZER_TK_<NAME> <n>` to `src/safety/<pred>.h` AND the matching
+   `Definition ZER_TK_<NAME> : Z := <n>.` to `proofs/vst/verif_<pred>.v`.
+2. Add the `if (kind == ZER_TK_<NAME>) { return 1; }` cases to the C AND the
+   `else if Z.eq_dec k ZER_TK_<NAME> then 1` cases to the Coq spec — **in the SAME
+   cascade order as the C** (VST's `forward_if` walks the C ifs in order; a mismatch
+   fails the proof).
+3. The proof BODY needs NO change: the generic
+   `repeat forward_if; forward; unfold; repeat (destruct (Z.eq_dec _ _); try lia);
+   try entailer!` tactic absorbs the extra branches. (This is why these predicates
+   are written as flat equality cascades — the VST-friendly C style.)
+4. Watch INLINED predicates: `zer_type_kind_is_numeric` inlines the integer cases
+   (does not call `is_integer`) — update its cascade AND its Coq spec too.
+5. Spec is ORACLE-driven: the new case must match the TYPE SEMANTICS ("uN is an
+   unsigned integer, iN is signed"), not just whatever the C happens to do. When the
+   oracle and C agree and VST passes, the guarantee is real (C matches the rule for
+   every input); if VST fails, the C diverges from the rule — bug exposed.
+
 ### VST 3.0 patterns
 
 **VST 3.0 is Iris-based.** `funspec` takes an implicit `Σ : gFunctors` argument. For simple proofs without custom ghost state, use the precompiled `VST.floyd.compat`:

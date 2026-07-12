@@ -214,6 +214,25 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-ch
 The `:ro` mount means the container can't write binaries to the host. Host-side
 source edits ARE picked up (the tar copies the edited tree in).
 
+**Ad-hoc VST verify (Level-3 proofs — `zer-vst` image, non-root gotcha).** To
+check a `proofs/vst/verif_*.v` edit WITHOUT the full ~5-min `make check-vst`,
+targeted-run just that one predicate. Two traps: (a) the `zer-vst` image runs as
+NON-ROOT, so `mkdir /build` fails "Permission denied" — use `/tmp/build`; (b)
+`src/safety/*.v` is clightgen-GENERATED from the `.c` each run (never hand-edit
+it) — you edit `proofs/vst/verif_*.v` (the spec+proof):
+```
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-vst bash -c '
+  eval $(opam env)
+  mkdir -p /tmp/build && tar -C /src -cf - --exclude=.git --exclude=".git*" src proofs Makefile | (cd /tmp/build && tar xf -)
+  cd /tmp/build && clightgen -normalize src/safety/type_kind.c && cd proofs/vst &&
+  coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/type_kind.v &&
+  coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_type_kind.v && echo VERIF_OK '
+```
+A `verif_X.v` importing only its own `zer_safety.X` is independent of the other
+~29 predicate files (`grep "Require.*zer_safety" proofs/vst/*.v` to confirm), so
+the targeted run is authoritative for that change. Full recipe (incl. adding a new
+TypeKind/enum value to a verified predicate): docs/proof-internals.md.
+
 **Spawning agents (Agent/Workflow/Explore) for COMPILER work — two hazards
 (learned 2026-06-22, the hard way).** (1) Agents that compile **build NATIVELY on
 the host** (`gcc *.c -o zerc`, `./zerc /tmp/x.zer`) → create-execute-delete of

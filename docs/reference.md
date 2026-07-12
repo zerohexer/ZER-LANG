@@ -391,6 +391,13 @@ u32 result = safe_divide(10, 3) orelse 0;  // default to 0
 - `?void` has ONE field (`has_value`). Everything else has TWO (`value` + `has_value`).
 - Returning `null` sets `has_value = 0`.
 - Returning a value sets `has_value = 1` and stores the value.
+- A bare `return;` (and the `orelse return;` propagation form) in a `?T`-value
+  function returns **None** (`has_value = 0`) — a valueless return carries no
+  value. Use `return x;` to return `Some(x)`.
+- In a `?void` function a standalone bare `return;` means **success**
+  (`has_value = 1`) — there is no value form, so the bare return is the natural
+  "succeeded". But `orelse return;` in a `?void` function propagates **failure**
+  (`has_value = 0`), consistent with `?T` propagation.
 
 **SEE ALSO**
 ?*T, orelse, if-unwrap

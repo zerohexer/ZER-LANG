@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// ESCAPE #2: assignment-form `p = &local[i]` (projection) must mark p local-derived
+// so the later store `g = p` is rejected. Previously only bare `&local` was caught
+// at the assignment sink, so this dangling pointer laundered to a global silently.
+?*u32 g;
+u32 other;
+void danger() {
+    u32[8] local;
+    *u32 p = &other;
+    p = &local[3];
+    g = p;            // must be REJECTED — dangles into danger's frame
+}
+u32 main() { danger(); return 0; }

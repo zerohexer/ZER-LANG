@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// ESCAPE #1 sibling: direct-call arena assignment into a pointer-param field.
+struct Item { u32 v; }
+struct Holder { [*]Item s; }
+void fill(*Holder h) {
+    u8[1024] backing;
+    Arena a = Arena.over(backing);
+    h.s = a.alloc_slice(Item, 4) orelse return;
+}
+u32 main() { return 0; }

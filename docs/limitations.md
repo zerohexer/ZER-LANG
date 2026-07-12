@@ -45,11 +45,12 @@ Bugs found while building `alloc`/`free` (docs/universal_alloc.md) but out of th
 scope, so NOT fixed. Full write-ups (repro + root cause) in
 **docs/universal_alloc.md §11**. Triage:
 
-- **MEDIUM — bare `orelse return;` inside a `?T`-returning function yields a wrong
-  `None`.** `?u32 f(){ *E e = slot orelse return; return e.value; }` with `slot`
-  null: the caller sees `f()` as HAVING a value. Only the BARE form in a `?T`
-  function; the block form `orelse { …; return null; }` and explicit `return
-  null;` are fine. A correctness bug (wrong runtime behavior), narrow.
+- ✅ **FIXED 2026-07-12 — bare `orelse return;` / `return;` in a `?T`-returning
+  function yielded a wrong Some(0).** The emitter emitted `{0,1}` (has_value=1) for
+  a bare return in a value-optional function; now `{0,0}` (None). Its `?void` twin
+  (`orelse return;` propagating SUCCESS instead of failure) was also fixed via
+  `IRInst.ret_from_orelse`. See BUGS-FIXED.md 2026-07-12; tests
+  `tests/zer/optional_bare_return_none.zer`, `optional_void_orelse_propagate.zer`.
 - **MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
   `handle.elem`.** Any `container` field shaped `Handle(T)`/`?Handle(T)` fails
   with "undefined type 'T'" (breaks self-referential `container Chained(T){
@@ -58,11 +59,14 @@ scope, so NOT fixed. Full write-ups (repro + root cause) in
 - **LOW — global `Arena` in-place `garena.over(buf)` does not initialize** → a
   later `garena.alloc_slice(...)` returns `None` at runtime. Only `Arena x =
   Arena.over(buf)` (capture the return) works.
-- **LOW — `global = arena.alloc_slice(...)` (direct form) compiles** when the
-  temp-var form is rejected: the escape rejection (checker.c ~4694) only fires on
-  a bare `NODE_IDENT` value; the direct call/orelse form only taints
-  (checker.c ~4645). A false-negative escape gap (masked at runtime by the global-
-  arena init bug above).
+- ✅ **FIXED 2026-07-12 — `global = arena.alloc_slice(...)` (direct form) now
+  rejected** (ESCAPE #1). The direct-call arena block previously only TAINTED the
+  target (rejection lived at the `NODE_IDENT`-value path), so the direct call
+  laundered an arena/local-backed pointer into a global / struct-field-of-global /
+  pointer-param-field silently — a local `Arena.over(local_backing)` made it a real
+  stack UAF. The direct-call block now classifies the sink and rejects global/param
+  (plain-local target still tainted for alias tracking). See BUGS-FIXED.md
+  2026-07-12; tests `tests/zer_fail/escape_arena_direct_{global,param_field}.zer`.
 - **LOW — `[*]?*T` slice element emits broken C** ("incompatible types … struct
   anonymous" from GCC). Workaround: a named wrapper struct (`struct Bucket { ?*T
   head; }`). An anonymous-struct-in-slice-typedef emitter gap.
@@ -70,11 +74,73 @@ scope, so NOT fixed. Full write-ups (repro + root cause) in
   const N → "array size must be a compile-time constant"); only a literal or a
   `comptime` function call is. Cosmetic wart.
 
-**Also OPEN — the pointer-return relaxation covers var-decl only.** `*T p = &r[i];
-return p;` (where r is a param/heap slice) is accepted; the separate ASSIGNMENT
-form `p = &r[i]` (p declared earlier, assigned later) is a different escape sink
-(checker.c ~4138 area) and may still over-reject. Extend by mirroring the same
-`root_is_ref && !is_local_derived` guard there. See BUGS-FIXED.md 2026-07-08.
+**Also — the ASSIGNMENT-form address-of sink is now projection-aware (2026-07-12,
+ESCAPE #2).** The assignment sink previously matched only a bare `&local`; the
+projection forms `p = &local[i]` / `p = &loc.field` did NOT mark `p`
+local-derived, so a later `g = p` laundered a dangling pointer to a global (a real
+UAF — UNDER-rejection). The sink now uses `mark_local_derived_from_amp` which walks
+the projection to the root ident and applies the same `root_is_ref &&
+!is_local_derived` guard as the var-decl path — so `p = &local[i]; g = p` is
+rejected while the param-view relaxation (`p = &param_slice[i]`, and returning it)
+stays allowed. See BUGS-FIXED.md 2026-07-12; test
+`tests/zer_fail/escape_assign_local_index.zer`.
+
+---
+
+## OPEN — leak on a conditional early-return path is NOT flagged (DELIBERATE tradeoff, 2026-07-12)
+
+**Symptom.** An allocation abandoned on a conditional early-return path is not a
+compile error:
+```zer
+*Node n = alloc(Node) orelse return;
+if (c) { return; }   // n leaks on the c==true path — NOT flagged
+free(n);
+```
+This is a real leak on that path, and it is a gap against the "ALIVE at function
+exit = error" guarantee (which holds only at the *canonical* fall-through exit).
+
+**Root cause (intentional).** The exit-time leak pass (`zercheck_ir.c`) skips
+`is_early_exit` RETURN blocks. Removing that skip (with a sound per-block-coverage
+pass — prototyped 2026-07-12) DID catch the true leak, but it over-rejected the
+ubiquitous idiom "allocate → validate → early-return-on-failure → free-at-end"
+(5 semantic-fuzzer `safe_task` cases plus much real code, e.g.
+`*T t = mt orelse return; …; if (t.id != K) { return 1; } … free(t);`). There is
+no static way to distinguish an intended free-later / dead-branch early return
+from an accidental leak without annotations or full path-sensitive liveness.
+
+**Why the obvious fix is wrong.** Flagging every alloc-then-validate-then-early-
+return would make error handling hostile — exactly the class ZER wants to keep
+ergonomic. The MAYBE_FREED machinery deliberately treats a branch that always
+exits as non-leaking for the same reason.
+
+**Sound workaround (idiomatic).** Use `defer free(x);` right after the allocation
+— it fires on ALL exit paths including early returns, so the allocation is freed on
+the `c==true` path too. This is the recommended pattern and is already encouraged
+throughout ZER.
+
+**If ever revisited:** a precise fix needs VRP-backed dead-branch elimination (to
+drop the `if (t.id != K)` false positive) plus per-block liveness — a large,
+higher-risk analysis change for a leak-only (no UB, no corruption) gap. Not worth
+it at present.
+
+---
+
+## OPEN — callee freeing a by-value struct param's pointer FIELD → caller over-rejects as leak (LOW, 2026-07-12)
+
+**Symptom (over-rejection, sound but noisy).** Safe code where the callee frees a
+pointer *field* reached through a by-value struct param is wrongly flagged "never
+freed":
+```zer
+struct Box { *Node p; }
+void destroy(Box b) { free(b.p); }   // frees the pointee
+void f() { *Node n = alloc(Node) orelse return; Box b; b.p = n; destroy(b); } // n IS freed — but reported as a leak
+```
+**Root cause.** `FuncSummary.frees_param[i]` models freeing a pointer/handle PARAM
+itself, not "callee frees a pointer field reached through a struct-by-value param,"
+so the caller never learns `n` was freed. Sound (rejects, never accepts unsafe) but
+over-restrictive. **Workaround:** pass the pointer directly (`destroy(n)`) rather
+than wrapped in a by-value struct. **Fix direction:** extend the return/param
+summary to record field-projection frees.
 
 ---
 

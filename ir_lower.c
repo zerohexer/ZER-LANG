@@ -1850,6 +1850,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
             emit_inst(ctx, unlock);
         }
         IRInst ret = make_inst(IR_RETURN, line);
+        ret.ret_from_orelse = true;  /* ?void: propagate FAILURE (None), not success */
         emit_inst(ctx, ret);
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */

@@ -5,6 +5,77 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-12 — Audit sweep: 6 fixes (optional-return None, uN/iN store masking, 2 escape holes, early-return leak) (emitter.c, ir.h, ir_lower.c, checker.c, zercheck_ir.c)
+
+Multi-agent audit of the freshest subsystems (optional emission, uN/iN, escape
+analysis, zercheck_ir). Five confirmed defects fixed; `make check` GREEN. (A
+sixth candidate — the early-return leak gap — was investigated and confirmed a
+DELIBERATE usability tradeoff, not a bug; see docs/limitations.md.)
+
+**1. `?T` bare / `orelse return;` emitted Some(0), not None (silent miscompile).**
+`emitter.c` IR_RETURN handler. A bare `return;` (and `orelse return;`, which
+lowers to the same bare IR_RETURN) in a `?u32`/`?bool`/`?Enum`-returning function
+emitted `return (_zer_opt_T){ 0, 1 }` — has_value=1 = Some(0) — so the caller saw
+a spurious value instead of None. A bare return carries no value ⇒ it is the None
+form. Fixed the value-optional branch `{0,1}` → `{0,0}` (`?*T` was already a null
+sentinel = None; `?void` handled separately, see #2). Test
+`tests/zer/optional_bare_return_none.zer`.
+
+**2. `?void` `orelse return;` propagated SUCCESS, not failure.** Twin of #1.
+`?void` standalone `return;` = SUCCESS `{1}` (no value form exists, so bare return
+is the natural "succeeded"), but `orelse return;` (failure propagation) shared the
+same lowering and also emitted `{1}` — silently swallowing a failure. Added
+`IRInst.ret_from_orelse` (set in `ir_lower.c` `lower_orelse_to_dest`, read in the
+emitter): a `?void` orelse-fallback return now emits `{0}` (None) while a
+standalone `return;` stays `{1}`. Test
+`tests/zer/optional_void_orelse_propagate.zer`.
+
+**3. uN/iN assignment & compound-assign skipped width masking (CRITICAL silent
+miscompile).** `emitter.c` NODE_ASSIGN (both `emit_expr` and the load-bearing
+`emit_rewritten_node` paths). Only var-decl init was masked (it decomposes to a
+masked `IR_BINOP` temp via `emit_intn_mask`); plain assignment / `+=` / `-=` /
+`*=` / `<<=` / `@truncate` stores were AST-passthrough and emitted the raw C op
+with NO mask. Result: `u3 y; y = a+b` (7+1) → 8 not 0; `s -= 1` → 255 not 7; and
+`arr[idx] += n` produced an OUT-OF-BOUNDS index. Affected locals, struct fields,
+and globals; broke both uN wrap and iN sign-extend. Fixed by intercepting a scalar
+non-native uN/iN store and emitting store+mask through ONE hoisted pointer
+(`emit_intn_mask_lv` + `type_is_nonnative_intn`), single-eval-safe for a
+side-effecting index. `/= %= >>=` keep their paths (result magnitude ≤ operand, no
+overflow). Test `tests/zer/intn_assign_mask.zer`.
+
+**4. ESCAPE #1 — direct-call arena assignment laundered to global/param (real
+UAF).** `checker.c` NODE_ASSIGN arena block. `g = arena.alloc_slice(...)` (DIRECT
+call) only TAINTED the target and never rejected — rejection lived at the
+`NODE_IDENT`-value path (`g = arena_ptr`), so the direct form stored an
+arena/local-backed pointer into a global / struct-field-of-global /
+pointer-param-field silently (a local `Arena.over(local_backing)` → stack UAF).
+Now classifies the sink in the direct-call block and rejects global/param (plain
+local still tainted for alias tracking). Tests
+`tests/zer_fail/escape_arena_direct_{global,param_field}.zer`.
+
+**5. ESCAPE #2 — assignment-form `p = &local[i]` projection missed
+is_local_derived (real UAF).** `checker.c` NODE_ASSIGN. The is_local_derived
+setter at the assignment sink matched only a bare `&local`; `p = &local[3]` /
+`p = &loc.field` (a FIELD/INDEX projection) did not mark p local-derived, so a
+later `g = p` laundered a dangling pointer to a global. Extracted
+`mark_local_derived_from_amp` (walks the projection to the root ident, mirrors the
+var-decl logic incl. the BUG-764 param-view relaxation — `&param_slice[i]` stays
+non-local) and used it at the value + orelse-fallback checks. Test
+`tests/zer_fail/escape_assign_local_index.zer`.
+
+**Investigated, NOT a bug — early-return leak gap is a deliberate tradeoff.** An
+allocation abandoned on a conditional early-return path (`n = alloc(); if (c) {
+return; } free(n);`) is NOT flagged: the exit-time leak pass skips `is_early_exit`
+RETURN blocks on purpose. A per-block-coverage early-exit pass was prototyped and
+DID catch the true leak, but it over-rejected the ubiquitous "alloc; validate;
+early-return-on-failure; free-at-end" idiom (5 semantic-fuzzer `safe_task` cases +
+much real code) — there is no static way to distinguish an intended
+free-later/dead-branch early return from an accidental leak without annotations.
+The sound resolution is `defer free(x)` (fires on all paths), which ZER already
+encourages. Reverted; documented in docs/limitations.md.
+
+---
+
 ## 2026-07-09 — Native arbitrary-width integers `uN`/`iN` + `@addc`/`@subb`/`@mulw` carry primitives (types.*, checker.c, emitter.c, src/safety/type_kind.*)
 
 Feature + one silent-truncation fix. `make check` GREEN (ZER 909). Commits

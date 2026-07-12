@@ -790,6 +790,45 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
     }
 }
 
+/* Width-mask a non-native uN/iN LVALUE given as a printf-ready C string
+ * (e.g. "(*_zer_np3)"). Emits `<lv> = wrap_to_N(<lv>); ` inline (trailing
+ * space, no newline — for use inside a statement-expression). unsigned →
+ * mask low N bits; signed → shift-left-then-arithmetic-shift-right to
+ * sign-extend. No-op for native widths (8/16/32/64/128). Mirrors
+ * emit_intn_mask (the IR_BINOP-temp masker) but for an arbitrary lvalue —
+ * the assignment/compound-assign path is AST-passthrough and never reaches
+ * emit_intn_mask, so odd-width stores need masking here (else silent wrong
+ * value: `u3 y; y = a+b` would keep bit 3). */
+static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
+    if (!t) return;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        if (nb < 64)
+            emit(e, "%s = (%s & 0x%llxULL); ", lv, lv,
+                 (unsigned long long)((1ULL << nb) - 1ULL));
+        else
+            emit(e, "%s = (%s & ((((unsigned __int128)1u) << %u) - 1u)); ", lv, lv, nb);
+    } else {
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        uint32_t sh = cw - nb;
+        emit(e, "%s = (%s)((%s)%s << %u) >> %u; ", lv, ss, su, lv, sh, sh);
+    }
+}
+
+/* True if t is a non-native-width uN/iN scalar (needs post-store masking). */
+static bool type_is_nonnative_intn(Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return false;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    return !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
+}
+
 /* emit a C type name for a ZER type */
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
@@ -1459,6 +1498,55 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_ASSIGN:
+        /* Native uN/iN width masking (odd widths u3/u21/i48/…). A store to a
+         * non-native-width integer lvalue must re-wrap the result (uN mask /
+         * iN sign-extend). The generic assignment path below emits the raw C
+         * op with NO mask — var-decl init is masked via the IR_BINOP temp
+         * (emit_intn_mask), but assignment & compound-assign are AST-passthrough
+         * and skip it → silent wrong value (`u3 y; y = a+b` keeps bit 3; `s-=1`
+         * underflows to 255). Emit store + mask through ONE hoisted pointer so
+         * the target lvalue (incl. a side-effecting index) is evaluated exactly
+         * once. Scalar targets only (array/union/bit-slice writes are handled by
+         * the dedicated cases below and don't carry a scalar uN/iN type here).
+         * /= %= >>= can't exceed the width (result magnitude ≤ operand), so they
+         * skip this and keep their existing div-guard / shift paths. */
+        {
+            Type *nn_t = checker_get_type(e->checker, node->assign.target);
+            if (type_is_nonnative_intn(nn_t)) {
+                TokenType aop = node->assign.op;
+                if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
+                    aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
+                    aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
+                    int tmp = e->temp_count++;
+                    char lv[40];
+                    snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
+                    emit(e, "({ __typeof__(");
+                    emit_expr(e, node->assign.target);
+                    emit(e, ") *_zer_np%d = &(", tmp);
+                    emit_expr(e, node->assign.target);
+                    emit(e, "); ");
+                    if (aop == TOK_EQ) {
+                        emit(e, "%s = (", lv);
+                        emit_expr(e, node->assign.value);
+                        emit(e, "); ");
+                    } else if (aop == TOK_LSHIFTEQ) {
+                        emit(e, "%s = _zer_shl(%s, (", lv, lv);
+                        emit_expr(e, node->assign.value);
+                        emit(e, ")); ");
+                    } else {
+                        const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
+                                          aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
+                                          aop==TOK_PIPEEQ?"|":"^";
+                        emit(e, "%s = (%s %s (", lv, lv, cop);
+                        emit_expr(e, node->assign.value);
+                        emit(e, ")); ");
+                    }
+                    emit_intn_mask_lv(e, nn_t, lv);
+                    emit(e, "})");
+                    goto assign_done;
+                }
+            }
+        }
         /* union variant assignment: msg.sensor = val → set tag first */
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_FIELD) {
@@ -6384,6 +6472,52 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *tgt_type = checker_get_type(e->checker, node->assign.target);
         Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
 
+        /* Native uN/iN width masking (odd widths u3/u21/i48/…) — IR path twin of
+         * the emit_expr intercept. A store to a non-native-width integer lvalue
+         * must re-wrap the result (uN mask / iN sign-extend). var-decl init is
+         * masked via the IR_BINOP temp (emit_intn_mask), but assignment &
+         * compound-assign are AST-passthrough here and skip it → silent wrong
+         * value (`u3 y; y = a+b` keeps bit 3; `s-=1` underflows to 255). Emit
+         * store + mask through ONE hoisted pointer so a side-effecting index in
+         * the target evaluates once. Scalar targets only (array/union/bit-slice
+         * are handled by the dedicated cases below and don't carry a scalar
+         * uN/iN type here). /= %= >>= can't exceed the width (result magnitude ≤
+         * operand) so they keep their existing div-guard / shift paths. */
+        if (type_is_nonnative_intn(tgt_type)) {
+            TokenType aop = node->assign.op;
+            if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
+                aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
+                aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
+                int tmp = e->temp_count++;
+                char lv[40];
+                snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
+                emit(e, "({ __typeof__(");
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, ") *_zer_np%d = &(", tmp);
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, "); ");
+                if (aop == TOK_EQ) {
+                    emit(e, "%s = (", lv);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, "); ");
+                } else if (aop == TOK_LSHIFTEQ) {
+                    emit(e, "%s = _zer_shl(%s, (", lv, lv);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, ")); ");
+                } else {
+                    const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
+                                      aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
+                                      aop==TOK_PIPEEQ?"|":"^";
+                    emit(e, "%s = (%s %s (", lv, lv, cop);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, ")); ");
+                }
+                emit_intn_mask_lv(e, tgt_type, lv);
+                emit(e, "})");
+                return;
+            }
+        }
+
         /* BUG-582: Union variant assignment — port from emit_expr (line 1210+)
          * with extension: also handle `u.variant[i] = val` and deeper chains
          * by walking up the target through NODE_INDEX/NODE_FIELD until we
@@ -9873,20 +10007,30 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return;\n");
                 }
             } else {
-                /* Bare `return;` from `?void` function means SUCCESS: { has_value=1 }.
-                 * For ?T struct optional, bare return also = success (emit {0, 1}).
-                 * For plain void return, emit `return;`. For ?*T null-sentinel,
-                 * bare return has no natural value — emit null.
-                 * Only explicit `return null` should emit null literal. */
+                /* Bare `return;` semantics by return type:
+                 *   ?void  → SUCCESS { has_value=1 } (no value form exists, so a
+                 *            bare return is the natural "succeeded" statement).
+                 *   ?T     → NONE { 0, 0 }. A bare `return;` carries no value, so
+                 *            it is the None form (the value form is `return x;`).
+                 *            This is what `orelse return;` propagation needs; the
+                 *            old `{ 0, 1 }` (Some(0)) was a silent correctness bug
+                 *            — the caller saw a spurious value. (limitations.md
+                 *            "bare orelse return in a ?T function".)
+                 *   ?*T    → null sentinel (None) via emit_return_null below.
+                 * Only explicit `return null` also emits None. */
                 Type *ret = e->current_func_ret;
                 Type *eff = ret ? type_unwrap_distinct(ret) : NULL;
                 if (eff && eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
                     if (is_void_opt(eff)) {
-                        emit(e, "return (_zer_opt_void){ 1 };\n");
+                        /* orelse-fallback return propagates FAILURE (None);
+                         * a standalone bare `return;` is SUCCESS. */
+                        emit(e, inst->ret_from_orelse
+                                ? "return (_zer_opt_void){ 0 };\n"
+                                : "return (_zer_opt_void){ 1 };\n");
                     } else {
                         emit(e, "return (");
                         emit_type(e, eff);
-                        emit(e, "){ 0, 1 };\n");
+                        emit(e, "){ 0, 0 };\n");
                     }
                 } else {
                     emit_return_null(e);

@@ -3614,9 +3614,23 @@ Two tools + one library for automated C-to-ZER migration:
 - `?*T` → plain C pointer (NULL = none, non-NULL = some). No struct wrapper.
 - `?T` (value) → `struct { T value; uint8_t has_value; }`. Check `.has_value`, extract `.value`.
 - `?void` → `struct { uint8_t has_value; }`. **NO `.value` field** — accessing it is a GCC error.
-- Bare `return;` from `?void` func → `return (_zer_opt_void){ 1 };`
+- Bare `return;` from `?void` func → `return (_zer_opt_void){ 1 };` (SUCCESS) —
+  EXCEPT an `orelse return;` fallback (`IRInst.ret_from_orelse`) → `{ 0 }` (None),
+  so failure propagation works (fixed 2026-07-12).
 - `return null;` from `?void` func → `return (_zer_opt_void){ 0 };`
-- Bare `return;` from `?T` func → `return (opt_type){ 0, 1 };`
+- Bare `return;` / `orelse return;` from `?T` (value) func → `return (opt_type){ 0, 0 };`
+  (**None** — a valueless return carries no value; was wrongly `{0,1}`=Some(0)
+  before 2026-07-12). `return x;` → `{ x, 1 }`.
+
+**Native uN/iN store masking (odd widths u3/u21/i48/…):** var-decl init is masked
+via the `IR_BINOP`/`IR_UNOP` temp (`emit_intn_mask`), but assignment &
+compound-assign are AST-passthrough and must mask separately or the store keeps the
+over-width bits (`u3 y; y = a+b` → 8 not 0; `s -= 1` → 255). The NODE_ASSIGN
+handler intercepts a scalar non-native uN/iN target (`type_is_nonnative_intn`) and
+emits store+mask through ONE hoisted pointer (`emit_intn_mask_lv`), single-eval-safe
+for a side-effecting index. **This lives in BOTH NODE_ASSIGN emitters** — `emit_expr`
+(~1500) AND `emit_rewritten_node` (~6470, the load-bearing IR path). Edit both.
+`/= %= >>=` skip it (result magnitude ≤ operand, can't exceed width).
 
 **Bounds checks in emitted C (BUG-078/079/119 — inline, NOT hoisted):**
 - **Simple index** (ident, literal): `(_zer_bounds_check((size_t)(idx), size, ...), arr)[idx]` — comma operator, preserves lvalue.

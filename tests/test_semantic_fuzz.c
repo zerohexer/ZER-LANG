@@ -611,6 +611,42 @@ static void gen_unsafe_arena_global(char *buf, int id) {
     p += sprintf(p, "}\n");
 }
 
+static void gen_safe_uN(char *buf, int id) {
+    char *p = buf;
+    /* Native arbitrary-width integer. Width 17..31 is NON-native (carrier is a
+     * wider uint32_t), so emit_intn_mask's wrap is exercised. Operands are
+     * uN-TYPED (not bare int literals), so there is no u32->uN narrowing reject. */
+    int n = 17 + (id % 15);
+    unsigned long long modulus = 1ULL << n;
+    unsigned long long a = modulus - 1;                 /* max uN */
+    unsigned long long sum = (a + 1ULL) % modulus;      /* max + 1 -> wraps to 0 */
+    unsigned long long prod = (1000ULL * 1000ULL) % modulus;
+    p += sprintf(p, "u32 test_uN_%d() {\n", id);
+    p += sprintf(p, "    u%d a = %llu;\n", n, a);
+    p += sprintf(p, "    u%d b = 1;\n", n);
+    p += sprintf(p, "    u%d c = a + b;\n", n);          /* wraps at 2^N */
+    p += sprintf(p, "    if (c != %llu) { return 1; }\n", sum);
+    p += sprintf(p, "    u%d x = 1000;\n", n);
+    p += sprintf(p, "    u%d y = 1000;\n", n);
+    p += sprintf(p, "    u%d z = x * y;\n", n);          /* masked to N bits */
+    p += sprintf(p, "    if (z != %llu) { return 2; }\n", prod);
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
+static void gen_unsafe_uN(char *buf, int id) {
+    char *p = buf;
+    /* Over-width literal: 2^n is exactly one past max uN -> must be REJECTED
+     * ("integer literal ... does not fit in 'uN'"). */
+    int n = 17 + (id % 10);
+    unsigned long long over = 1ULL << n;
+    p += sprintf(p, "u32 test_uN_bad_%d() {\n", id);
+    p += sprintf(p, "    u%d x = %llu;\n", n, over);
+    p += sprintf(p, "    if (x != 0) { return 1; }\n");
+    p += sprintf(p, "    return 0;\n");
+    p += sprintf(p, "}\n");
+}
+
 int main(int argc, char **argv) {
     unsigned seed = argc > 1 ? (unsigned)atoi(argv[1]) : 42;
     int count = argc > 2 ? atoi(argv[2]) : 200;
@@ -627,7 +663,7 @@ int main(int argc, char **argv) {
         char decls[4096] = "";
         char calls[2048] = "";
         char *cp = calls;
-        int pattern = rng(32);
+        int pattern = rng(34);
 
         switch (pattern) {
         case 0: case 1: { /* safe arena chain */
@@ -908,6 +944,22 @@ int main(int argc, char **argv) {
             }
             snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
             run_test(name, prog, 0);
+            break;
+        }
+        case 32: { /* safe uN arithmetic — wraps at 2^N (non-native width) */
+            gen_safe_uN(decls, i);
+            cp += sprintf(cp, "    if (test_uN_%d() != 0) { return 1; }\n", i);
+            snprintf(name, sizeof(name), "safe_uN_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s    return 0;\n}\n", decls, calls);
+            run_test(name, prog, 0);
+            break;
+        }
+        case 33: { /* unsafe uN — over-width literal must be rejected */
+            gen_unsafe_uN(decls, i);
+            cp += sprintf(cp, "    return test_uN_bad_%d();\n", i);
+            snprintf(name, sizeof(name), "unsafe_uN_overwidth_%d", i);
+            snprintf(prog, sizeof(prog), "%s\nu32 main() {\n%s}\n", decls, calls);
+            run_test(name, prog, 1);
             break;
         }
         }

@@ -297,6 +297,7 @@ static void rewrite_capture_name(Node *node, const char *from_name, uint32_t fro
                                  const char *to_name, uint32_t to_len);
 static int lower_expr(LowerCtx *ctx, Node *expr);
 static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line);
+static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local, Node *node, int line);
 static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line);
 
 /* can_lower_expr removed — lower_expr is now unconditional.
@@ -434,6 +435,14 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Binary operations: decompose both sides ---- */
     case NODE_BINARY: {
+        /* Short-circuit &&/|| must NOT eagerly evaluate both operands (audit
+         * 2026-07-06). Lower to branches so RHS side effects/traps only run when
+         * the LHS doesn't decide the result. */
+        if (expr->binary.op == TOK_AMPAMP || expr->binary.op == TOK_PIPEPIPE) {
+            int tmp = create_temp(ctx, ty_bool, expr->loc.line);
+            lower_shortcircuit_to_dest(ctx, tmp, expr, expr->loc.line);
+            return tmp;
+        }
         /* Complex operand types need emit_expr (opaque .ptr, struct compare, etc.) */
         Type *lt = checker_get_type(ctx->checker, expr->binary.left);
         Type *rty = checker_get_type(ctx->checker, expr->binary.right);
@@ -1950,6 +1959,63 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         emit_inst(ctx, go);
         ctx->current_block = bb_join;
     }
+}
+
+/* Lower `a && b` / `a || b` with SHORT-CIRCUIT semantics into blocks, storing
+ * the bool result in dest_local. The 3AC path previously lowered BOTH operands
+ * eagerly then combined with C `&&`/`||`, so the RHS side effects ALWAYS ran —
+ * breaking `if (i < len && arr[i]...)` (spurious OOB) and `d != 0 && n/d` (the
+ * div-by-zero guard). Only opaque/struct operands took the passthrough path
+ * that kept C's native short-circuit. Audit 2026-07-06. Model: lower_orelse. */
+static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local,
+                                       Node *node, int line) {
+    bool is_and = (node->binary.op == TOK_AMPAMP);
+    /* Evaluate LHS in the current block. */
+    int la = lower_expr(ctx, node->binary.left);
+
+    int bb_rhs   = ir_add_block(ctx->func, ctx->arena); /* evaluate RHS */
+    int bb_short = ir_add_block(ctx->func, ctx->arena); /* short-circuit const */
+    int bb_join  = ir_add_block(ctx->func, ctx->arena);
+
+    IRInst br = make_inst(IR_BRANCH, line);
+    br.cond_local = la;
+    /* &&: LHS true -> eval RHS, LHS false -> result false.
+     * ||: LHS true -> result true,  LHS false -> eval RHS. */
+    br.true_block  = is_and ? bb_rhs   : bb_short;
+    br.false_block = is_and ? bb_short : bb_rhs;
+    emit_inst(ctx, br);
+
+    /* === RHS block: result = (bool) RHS === */
+    ctx->current_block = bb_rhs;
+    int lb = lower_expr(ctx, node->binary.right);
+    if (dest_local >= 0) {
+        IRInst cp = make_inst(IR_COPY, line);
+        cp.dest_local = dest_local;
+        cp.src1_local = lb;
+        emit_inst(ctx, cp); /* lower_expr(RHS) may have split blocks; emit in current */
+    }
+    {
+        IRInst go = make_inst(IR_GOTO, line);
+        go.goto_block = bb_join;
+        emit_inst(ctx, go);
+    }
+
+    /* === Short-circuit block: result = constant (false for &&, true for ||) === */
+    ctx->current_block = bb_short;
+    if (dest_local >= 0) {
+        IRInst lit = make_inst(IR_LITERAL, line);
+        lit.dest_local = dest_local;
+        lit.literal_int = is_and ? 0 : 1;
+        lit.literal_kind = 3; /* bool */
+        emit_inst(ctx, lit);
+    }
+    {
+        IRInst go = make_inst(IR_GOTO, line);
+        go.goto_block = bb_join;
+        emit_inst(ctx, go);
+    }
+
+    ctx->current_block = bb_join;
 }
 
 /* Lower a single statement */

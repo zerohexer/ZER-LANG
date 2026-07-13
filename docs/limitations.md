@@ -13,7 +13,7 @@ found + fixed overlapping soundness / miscompile / crash holes. **NONE are merge
 main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
 regression-test file is absent from main; signature helpers absent). The heavy overlap is
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
-dedup — **3 landed 2026-07-13 (the uN/iN trio #17/#18/#19), 38 remaining.**
+dedup — **4 landed 2026-07-13 (uN/iN trio #17/#18/#19 + #20 `&&`/`||` short-circuit), 37 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -68,15 +68,17 @@ binary regen). To inspect any fix: `git show <sha>`.
 
 ### D. uN/iN + miscompiles (🟠)
 **✅ DONE 2026-07-13 (merged to main): #17 assign/compound-assign mask, #18 `@truncate`
-mask (inline+store), #19 bit-slice-read 64-bit guarded mask.** Sources: k7l625
-(`87a01415` helpers `emit_intn_mask_lv`/`type_is_nonnative_intn` + assign intercept both
-emit paths; `ea58e5cc` truncate) + jfrmer F8 (`5a6889df`, bitslice read). k7l625's assign
-approach was chosen over jfrmer's F5 because it single-eval-masks a side-effecting index
-target (`arr[f()] += n`) whereas jfrmer's bails on side effects. Tests:
-`tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide}.zer`. make check 915/0.
+mask (inline+store), #19 bit-slice-read 64-bit guarded mask, #20 `&&`/`||` short-circuit.**
+uN/iN sources: k7l625 (`87a01415` helpers `emit_intn_mask_lv`/`type_is_nonnative_intn` +
+assign intercept both emit paths; `ea58e5cc` truncate) + jfrmer F8 (`5a6889df`, bitslice
+read). k7l625's assign approach was chosen over jfrmer's F5 because it single-eval-masks a
+side-effecting index target (`arr[f()] += n`) whereas jfrmer's bails on side effects. #20
+short-circuit: ubjj9o `f40ca06b` (`lower_shortcircuit_to_dest`, IR branch-lowering; chosen
+over a47dg2 `9edc49b8` passthrough which would hide the control flow from IR analysis).
+Tests: `tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide,shortcircuit_side_effects,shortcircuit_value_ok}.zer`.
+make check 917/0.
 | # | Fix | Proper source (sha) | Files | Main |
 |---|---|---|---|---|
-| 20 | `&&`/`\|\|` short-circuit (lower to branches) | f40ca06b (SC) | ir_lower.c | absent |
 | 21 | `?T`/`?void` bare/orelse return → `None` not `Some(0)` | 87a01415 (#1+#2, adds ?void) | emitter.c, ir.h, ir_lower.c | absent |
 | 22 | optional struct-field designated-init keeps value | fb3315f2 (3 paths, shared helper) | emitter.c | absent |
 | 23 | `@saturate` unsigned from ≥2^63 source | a3e1f66c | emitter.c | absent |
@@ -119,10 +121,10 @@ target (`arr[f()] += n`) whereas jfrmer's bails on side effects. Tests:
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ~~uN/iN trio #17/#18/#19~~ ✅ landed 2026-07-13. Remaining
-highest-value: the miscompiles (#20 `&&`/`\|\|` short-circuit, #21 optional-None) and the
-crashes (#33 `type_name` overflow, #34 `(*ptr & mask)` firmware regression) — all
-verified absent from main.
+**Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 `&&`/`||` short-circuit~~ ✅ landed
+2026-07-13. Remaining highest-value: #21 optional-None (`?T`/`?void` bare/orelse return →
+`Some(0)`) and the crashes (#33 `type_name` overflow, #34 `(*ptr & mask)` firmware
+regression) — all verified absent from main.
 
 ---
 

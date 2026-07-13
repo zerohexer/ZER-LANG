@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-13 — `&&`/`||` short-circuit on the IR path (ir_lower.c)
+
+`&&` and `||` did NOT short-circuit: the 3AC lowering evaluated BOTH operands eagerly
+(only opaque/struct operands took the emit_expr passthrough that kept C's native
+short-circuit), then combined with C `&&`/`||`. So the RHS side effects ALWAYS ran —
+a real miscompile: `if (i < len && arr[i] > 0)` evaluated `arr[i]` even when `i < len`
+was false (spurious bounds trap), `d != 0 && n/d` ran the division through the
+div-by-zero guard, and any side-effecting RHS (`f() || g()`) always called both.
+
+Fix (merged from `claude/*` tracker #20, source nifty-gates-ubjj9o `f40ca06b`): in
+`lower_expr`'s NODE_BINARY case, intercept `TOK_AMPAMP`/`TOK_PIPEPIPE` and lower to
+real branches via new `lower_shortcircuit_to_dest` (modeled on `lower_orelse_to_dest`):
+LHS in the current block → `IR_BRANCH` to an RHS block or a short-circuit-const block
+(`false` for `&&`, `true` for `||`) → join. The result is a bool temp, so it composes
+in every context (if/while conditions, assignments, nesting). Keeps `&&`/`||` IR-native
+(not punted to emit_expr), so IR-based safety analysis sees the real control flow.
+
+Chosen over gifted-a47dg2 `9edc49b8` BUG-H ("route to passthrough" = widen the emit_expr
+fallback to `&&`/`||`), which would fix the semantics but hide the short-circuit control
+flow from the IR — a step backward for the IR-only-bodies architecture.
+
+Tests: `tests/zer/{shortcircuit_side_effects,shortcircuit_value_ok}.zer`. make check
+917/0. Tracker (limitations.md) #20 retired.
+
+---
+
 ## 2026-07-13 — uN/iN masking completed: assignment/compound-assign + `@truncate` + bit-slice-read (emitter.c)
 
 Three uN/iN width-masking gaps closed by merging the PROPER version from the parallel

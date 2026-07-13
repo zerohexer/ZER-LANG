@@ -1,0 +1,21 @@
+// audit 2026-07-06 SC: && / || must short-circuit (RHS side effects skipped).
+// The 3AC path used to evaluate BOTH operands eagerly then combine with C &&,
+// so the RHS always ran — breaking guarded array access (spurious trap) and
+// any side-effecting RHS. Now lowered to short-circuit branches.
+u32 calls = 0;
+bool sideT() { calls += 1; return true; }
+bool sideF() { calls += 1; return false; }
+u32 main() {
+    calls = 0;
+    if (sideF() && sideT()) { return 90; }   // RHS skipped -> calls == 1
+    if (calls != 1) { return 1; }
+    calls = 0;
+    if (sideT() || sideF()) { }              // RHS skipped -> calls == 1
+    if (calls != 1) { return 2; }
+    // guarded array: arr[i] must NOT be evaluated when i < len is false
+    u8[4] arr;
+    u32 len = 0;
+    u32 i = 10;
+    if (i < len && arr[i] > 0) { return 3; }
+    return 0;
+}

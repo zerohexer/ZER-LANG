@@ -13,7 +13,7 @@ found + fixed overlapping soundness / miscompile / crash holes. **NONE are merge
 main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
 regression-test file is absent from main; signature helpers absent). The heavy overlap is
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
-dedup.
+dedup — **3 landed 2026-07-13 (the uN/iN trio #17/#18/#19), 38 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -66,12 +66,16 @@ binary regen). To inspect any fix: `git show <sha>`.
 | 15 | VarRange map reset per-function (cross-fn name-key leak) | f40ca06b (F3) | checker.c |
 | 16 | defer body keeps array bounds-guard (trapping mode) | 9edc49b8 (E, `guard_traps`) | emitter.c/.h |
 
-### D. uN/iN + miscompiles (🟠; MOST RELEVANT — completes this session's uN/iN feature)
+### D. uN/iN + miscompiles (🟠)
+**✅ DONE 2026-07-13 (merged to main): #17 assign/compound-assign mask, #18 `@truncate`
+mask (inline+store), #19 bit-slice-read 64-bit guarded mask.** Sources: k7l625
+(`87a01415` helpers `emit_intn_mask_lv`/`type_is_nonnative_intn` + assign intercept both
+emit paths; `ea58e5cc` truncate) + jfrmer F8 (`5a6889df`, bitslice read). k7l625's assign
+approach was chosen over jfrmer's F5 because it single-eval-masks a side-effecting index
+target (`arr[f()] += n`) whereas jfrmer's bails on side effects. Tests:
+`tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide}.zer`. make check 915/0.
 | # | Fix | Proper source (sha) | Files | Main |
 |---|---|---|---|---|
-| 17 | uN/iN mask on assignment / compound-assign (`s-=1`, `arr[i]+=n`) | 87a01415 (#3, both emit paths) | emitter.c | ⚠️ partial (binop/unop only) |
-| 18 | `@truncate(uN,val)` mask (store + inline uses) | ea58e5cc | emitter.c | absent |
-| 19 | bit-slice READ 64-bit guarded mask (IR path) | 5a6889df (F8) | emitter.c | absent |
 | 20 | `&&`/`\|\|` short-circuit (lower to branches) | f40ca06b (SC) | ir_lower.c | absent |
 | 21 | `?T`/`?void` bare/orelse return → `None` not `Some(0)` | 87a01415 (#1+#2, adds ?void) | emitter.c, ir.h, ir_lower.c | absent |
 | 22 | optional struct-field designated-init keeps value | fb3315f2 (3 paths, shared helper) | emitter.c | absent |
@@ -115,10 +119,10 @@ binary regen). To inspect any fix: `git show <sha>`.
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Highest-value / start here:** the uN/iN trio (#17/#18/#19) — directly completes this
-session's uN/iN feature, off the freshest bases (k7l625 @ b3b9f18a, jfrmer @ 72e74913), so
-smallest rebase distance. Then the miscompiles (#20 short-circuit, #21 optional-None) and
-the crashes (#33 type_name overflow, #34 `(*ptr & mask)` firmware regression).
+**Next up (start here):** ~~uN/iN trio #17/#18/#19~~ ✅ landed 2026-07-13. Remaining
+highest-value: the miscompiles (#20 `&&`/`\|\|` short-circuit, #21 optional-None) and the
+crashes (#33 `type_name` overflow, #34 `(*ptr & mask)` firmware regression) — all
+verified absent from main.
 
 ---
 
@@ -129,8 +133,11 @@ commits e7ea2bcb/d91d0742/80183261; `make check` GREEN). The type-kind
 predicates are VST-verified for `TYPE_UINT`/`TYPE_SINT` (Level-3 restored,
 `verif_type_kind.v`, verified via `make check-vst` 2026-07-10). Width-masking is
 complete: `emit_intn_mask` runs on `IR_BINOP` (arithmetic + shift) and `IR_UNOP`
-(negation/complement); global-scope arithmetic needs no mask (verified safe by
-rejection 2026-07-12 — see BUGS-FIXED.md). Remaining edges (all polish/deferred):
+(negation/complement); `emit_intn_mask_lv` masks assignment + compound-assign stores
+(`=`/`+=`/`-=`/`*=`/`&=`/`|=`/`^=`/`<<=`, single-eval on side-effecting targets); `@truncate`
+masks inline+stored; bit-slice READ uses a 64-bit guarded mask (all 2026-07-13, merged from
+k7l625/jfrmer branches); global-scope arithmetic needs no mask (verified safe by rejection
+2026-07-12 — see BUGS-FIXED.md). Remaining edges (all polish/deferred):
 
 - **VRP mask-elision (LOW — performance).** `emit_intn_mask` always emits the
   `& (2^N-1)` after `uN` arithmetic. Sound but not minimal: where VRP can prove

@@ -790,6 +790,45 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
     }
 }
 
+/* Width-mask a non-native uN/iN LVALUE given as a printf-ready C string
+ * (e.g. "(*_zer_np3)"). Emits `<lv> = wrap_to_N(<lv>); ` inline (trailing
+ * space, no newline — for use inside a statement-expression). unsigned →
+ * mask low N bits; signed → shift-left-then-arithmetic-shift-right to
+ * sign-extend. No-op for native widths (8/16/32/64/128). Mirrors
+ * emit_intn_mask (the IR_BINOP-temp masker) but for an arbitrary lvalue —
+ * the assignment/compound-assign path is AST-passthrough and never reaches
+ * emit_intn_mask, so odd-width stores need masking here (else silent wrong
+ * value: `u3 y; y = a+b` would keep bit 3). */
+static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
+    if (!t) return;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        if (nb < 64)
+            emit(e, "%s = (%s & 0x%llxULL); ", lv, lv,
+                 (unsigned long long)((1ULL << nb) - 1ULL));
+        else
+            emit(e, "%s = (%s & ((((unsigned __int128)1u) << %u) - 1u)); ", lv, lv, nb);
+    } else {
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        uint32_t sh = cw - nb;
+        emit(e, "%s = (%s)((%s)%s << %u) >> %u; ", lv, ss, su, lv, sh, sh);
+    }
+}
+
+/* True if t is a non-native-width uN/iN scalar (needs post-store masking). */
+static bool type_is_nonnative_intn(Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return false;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    return !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
+}
+
 /* emit a C type name for a ZER type */
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
@@ -1459,6 +1498,55 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_ASSIGN:
+        /* Native uN/iN width masking (odd widths u3/u21/i48/…). A store to a
+         * non-native-width integer lvalue must re-wrap the result (uN mask /
+         * iN sign-extend). The generic assignment path below emits the raw C
+         * op with NO mask — var-decl init is masked via the IR_BINOP temp
+         * (emit_intn_mask), but assignment & compound-assign are AST-passthrough
+         * and skip it → silent wrong value (`u3 y; y = a+b` keeps bit 3; `s-=1`
+         * underflows to 255). Emit store + mask through ONE hoisted pointer so
+         * the target lvalue (incl. a side-effecting index) is evaluated exactly
+         * once. Scalar targets only (array/union/bit-slice writes are handled by
+         * the dedicated cases below and don't carry a scalar uN/iN type here).
+         * /= %= >>= can't exceed the width (result magnitude ≤ operand), so they
+         * skip this and keep their existing div-guard / shift paths. */
+        {
+            Type *nn_t = checker_get_type(e->checker, node->assign.target);
+            if (type_is_nonnative_intn(nn_t)) {
+                TokenType aop = node->assign.op;
+                if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
+                    aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
+                    aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
+                    int tmp = e->temp_count++;
+                    char lv[40];
+                    snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
+                    emit(e, "({ __typeof__(");
+                    emit_expr(e, node->assign.target);
+                    emit(e, ") *_zer_np%d = &(", tmp);
+                    emit_expr(e, node->assign.target);
+                    emit(e, "); ");
+                    if (aop == TOK_EQ) {
+                        emit(e, "%s = (", lv);
+                        emit_expr(e, node->assign.value);
+                        emit(e, "); ");
+                    } else if (aop == TOK_LSHIFTEQ) {
+                        emit(e, "%s = _zer_shl(%s, (", lv, lv);
+                        emit_expr(e, node->assign.value);
+                        emit(e, ")); ");
+                    } else {
+                        const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
+                                          aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
+                                          aop==TOK_PIPEEQ?"|":"^";
+                        emit(e, "%s = (%s %s (", lv, lv, cop);
+                        emit_expr(e, node->assign.value);
+                        emit(e, ")); ");
+                    }
+                    emit_intn_mask_lv(e, nn_t, lv);
+                    emit(e, "})");
+                    goto assign_done;
+                }
+            }
+        }
         /* union variant assignment: msg.sensor = val → set tag first */
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_FIELD) {
@@ -3078,16 +3166,29 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, "0");
             }
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
-            /* @truncate(val) → (T)(val) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* @truncate(T, val) → (T)(val). For a non-native uN/iN target the
+             * cast alone keeps the over-width bits (`@truncate(u3,13)` → 13 not
+             * 5), so mask the result here — covers INLINE uses (comparisons,
+             * call args), not just stores. */
+            Type *tt = node->intrinsic.type_arg ? resolve_tynode(e,node->intrinsic.type_arg) : NULL;
+            if (type_is_nonnative_intn(tt)) {
+                int tmp = e->temp_count++;
+                char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
+                emit(e, "({ "); emit_type(e, tt);
+                emit(e, " _zer_tr%d = (", tmp); emit_type(e, tt); emit(e, ")(");
+                if (node->intrinsic.arg_count > 0) emit_expr(e, node->intrinsic.args[0]);
+                else emit(e, "0");
+                emit(e, "); ");
+                emit_intn_mask_lv(e, tt, lv);
+                emit(e, "_zer_tr%d; })", tmp);
+            } else {
+                emit(e, "(");
+                if (tt) emit_type(e, tt);
+                emit(e, ")(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
             }
-            emit(e, ")(");
-            if (node->intrinsic.arg_count > 0)
-                emit_expr(e, node->intrinsic.args[0]);
-            emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
@@ -6384,6 +6485,52 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *tgt_type = checker_get_type(e->checker, node->assign.target);
         Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
 
+        /* Native uN/iN width masking (odd widths u3/u21/i48/…) — IR path twin of
+         * the emit_expr intercept. A store to a non-native-width integer lvalue
+         * must re-wrap the result (uN mask / iN sign-extend). var-decl init is
+         * masked via the IR_BINOP temp (emit_intn_mask), but assignment &
+         * compound-assign are AST-passthrough here and skip it → silent wrong
+         * value (`u3 y; y = a+b` keeps bit 3; `s-=1` underflows to 255). Emit
+         * store + mask through ONE hoisted pointer so a side-effecting index in
+         * the target evaluates once. Scalar targets only (array/union/bit-slice
+         * are handled by the dedicated cases below and don't carry a scalar
+         * uN/iN type here). /= %= >>= can't exceed the width (result magnitude ≤
+         * operand) so they keep their existing div-guard / shift paths. */
+        if (type_is_nonnative_intn(tgt_type)) {
+            TokenType aop = node->assign.op;
+            if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
+                aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
+                aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
+                int tmp = e->temp_count++;
+                char lv[40];
+                snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
+                emit(e, "({ __typeof__(");
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, ") *_zer_np%d = &(", tmp);
+                emit_rewritten_node(e, node->assign.target, func);
+                emit(e, "); ");
+                if (aop == TOK_EQ) {
+                    emit(e, "%s = (", lv);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, "); ");
+                } else if (aop == TOK_LSHIFTEQ) {
+                    emit(e, "%s = _zer_shl(%s, (", lv, lv);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, ")); ");
+                } else {
+                    const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
+                                      aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
+                                      aop==TOK_PIPEEQ?"|":"^";
+                    emit(e, "%s = (%s %s (", lv, lv, cop);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, ")); ");
+                }
+                emit_intn_mask_lv(e, tgt_type, lv);
+                emit(e, "})");
+                return;
+            }
+        }
+
         /* BUG-582: Union variant assignment — port from emit_expr (line 1210+)
          * with extension: also handle `u.variant[i] = val` and deeper chains
          * by walking up the target through NODE_INDEX/NODE_FIELD until we
@@ -6881,16 +7028,27 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")");
             return;
         } else if (nlen == 8 && memcmp(name, "truncate", 8) == 0) {
-            /* @truncate(T, val) → (T)(val) */
-            emit(e, "(");
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                emit_type(e, t);
+            /* @truncate(T, val) → (T)(val). Non-native uN/iN: mask the result
+             * (IR-path twin of the emit_expr site) — covers inline uses. */
+            Type *tt = node->intrinsic.type_arg ? resolve_tynode(e, node->intrinsic.type_arg) : NULL;
+            if (type_is_nonnative_intn(tt)) {
+                int tmp = e->temp_count++;
+                char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
+                emit(e, "({ "); emit_type(e, tt);
+                emit(e, " _zer_tr%d = (", tmp); emit_type(e, tt); emit(e, ")(");
+                if (node->intrinsic.arg_count > 0) emit_rewritten_node(e, node->intrinsic.args[0], func);
+                else emit(e, "0");
+                emit(e, "); ");
+                emit_intn_mask_lv(e, tt, lv);
+                emit(e, "_zer_tr%d; })", tmp);
+            } else {
+                emit(e, "(");
+                if (tt) emit_type(e, tt);
+                emit(e, ")(");
+                if (node->intrinsic.arg_count > 0)
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ")");
             }
-            emit(e, ")(");
-            if (node->intrinsic.arg_count > 0)
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
-            emit(e, ")");
         } else if (nlen == 8 && memcmp(name, "saturate", 8) == 0) {
             /* @saturate(T, val) → clamp to T range */
             if (node->intrinsic.type_arg) {
@@ -8946,15 +9104,42 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *obj_type = checker_get_type(e->checker, node->slice.object);
         Type *obj_eff = obj_type ? type_unwrap_distinct(obj_type) : NULL;
         if (obj_eff && type_is_integer(obj_eff) && node->slice.start && node->slice.end) {
-            /* Bit extraction: val[hi..lo] with safety when hi < lo → 0 */
+            /* Bit extraction: val[hi..lo]. F8: mirror the AST reference — a 64-bit
+             * `1ull` mask with a `>=64`/`<=0` clamp and an unsigned cast of a signed
+             * source. The prior IR form used a 32-bit `1U << (hi-lo+1)` with no width
+             * guard, silently truncating any extract wider than 32 bits and invoking
+             * C shift-UB when the extracted width reached 32. Single-eval (object,
+             * start, end each emitted once; the `<=0` mask branch subsumes hi<lo). */
+            const char *ucast = "";
+            switch (obj_eff->kind) {
+            case TYPE_I8:  ucast = "(uint8_t)";  break;
+            case TYPE_I16: ucast = "(uint16_t)"; break;
+            case TYPE_I32: ucast = "(uint32_t)"; break;
+            case TYPE_I64: ucast = "(uint64_t)"; break;
+            /* Exhaustive (Stage 2 Part B -Wswitch discipline): only signed ints
+             * need the unsigned cast; every other kind is a no-op. No default:. */
+            case TYPE_VOID: case TYPE_BOOL:
+            case TYPE_U8: case TYPE_U16: case TYPE_U32:
+            case TYPE_U64: case TYPE_USIZE:
+            case TYPE_UINT: case TYPE_SINT:
+            case TYPE_F32: case TYPE_F64:
+            case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+            case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+            case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+            case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+            case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+            case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+                break;
+            }
             int t = e->temp_count++;
-            emit(e, "({ int _zer_hi%d = (", t);
+            emit(e, "({ int _zer_hi%d = (int)(", t);
             emit_rewritten_node(e, node->slice.start, func);
-            emit(e, "); int _zer_lo%d = (", t);
+            emit(e, "); int _zer_lo%d = (int)(", t);
             emit_rewritten_node(e, node->slice.end, func);
-            emit(e, "); _zer_hi%d >= _zer_lo%d ? (((", t, t);
+            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", t, t, t, ucast);
             emit_rewritten_node(e, node->slice.object, func);
-            emit(e, ") >> _zer_lo%d) & ((1U << (_zer_hi%d - _zer_lo%d + 1)) - 1)) : 0U; })", t, t, t);
+            emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                 t, t, t, t);
             return;
         }
         bool obj_slice = obj_eff && obj_eff->kind == TYPE_SLICE;

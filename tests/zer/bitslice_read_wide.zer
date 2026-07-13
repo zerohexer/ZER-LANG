@@ -1,0 +1,12 @@
+// F8: variable-bounds bit-slice READ must use a 64-bit guarded mask. The IR path
+// used a 32-bit `1U` shift -> upper-32-bit truncation + shift-UB at width 32.
+u64 ext64(u64 reg, u32 hi, u32 lo) { return reg[hi..lo]; }
+u32 ext32(u32 reg, u32 hi, u32 lo) { return reg[hi..lo]; }
+u32 main() {
+    u64 v = 0x1122334455667788;
+    if (ext64(v, 63, 0) != 0x1122334455667788) { return 1; }   // full width, no truncation
+    if (ext64(v, 31, 16) != 0x5566) { return 2; }
+    u32 w = 0xDEADBEEF;
+    if (ext32(w, 31, 0) != 0xDEADBEEF) { return 3; }           // width 32, no UB
+    return 0;
+}

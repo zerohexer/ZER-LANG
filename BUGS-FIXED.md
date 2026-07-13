@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-13 — uN/iN masking completed: assignment/compound-assign + `@truncate` + bit-slice-read (emitter.c)
+
+Three uN/iN width-masking gaps closed by merging the PROPER version from the parallel
+`claude/*` audit branches (tracker: limitations.md "unmerged audit fixes" #17/#18/#19).
+`emit_intn_mask` (this session's IR_BINOP/IR_UNOP masker) covered var-decl init +
+arithmetic; these three sites were still AST-passthrough / IR-only and skipped it, so a
+non-native `uN`/`iN` kept over-width bits — silent wrong value / OOB index. `make check`
+915/0 (+3 tests). None of the three were in main (verified: 0 `emit_intn_mask` assign/
+truncate sites pre-fix).
+
+- **#17 assignment + compound-assign not masked** (`u3 y; y = a+b` kept bit 3; `s -= 1`
+  underflowed to 255; `arr[i] += n` produced an OOB index). Added `emit_intn_mask_lv`
+  (masks a non-native uN/iN LVALUE given as a C string) + `type_is_nonnative_intn`, and a
+  NODE_ASSIGN intercept in BOTH emit paths (emit_expr + emit_rewritten_node) for
+  `= += -= *= &= |= ^= <<=`. Emits store+mask through ONE hoisted pointer
+  (`({ __typeof__(t) *p = &(t); *p = op; *p = mask(*p); })`) so a side-effecting index
+  target evaluates exactly once. `/= %= >>=` skip it (result magnitude ≤ operand → can't
+  exceed the width). Source: k7l625 `87a01415`. Chosen over jfrmer's `5a6889df` F5, which
+  BAILS on side-effecting targets (`if (expr_has_side_effects(tgt)) return;` → leaves
+  `arr[f()] += n` unmasked) and only covers the IR local-store path.
+- **#18 `@truncate(uN,val)` emitted a bare `(carrier)(val)` cast, no mask** —
+  `@truncate(u3,13)` compared as 13, not 5, when used INLINE (comparison / call arg).
+  Wrapped the result in a statement-expression `({ T tmp = (T)(val); mask(tmp); tmp; })` on
+  both @truncate dispatch paths, reusing `emit_intn_mask_lv`. Source: k7l625 `ea58e5cc`.
+- **#19 variable-bounds bit-slice READ used a 32-bit unguarded mask on the IR path**
+  (`1U << (hi-lo+1)` — truncated any extract wider than 32 bits + C shift-UB at width 32).
+  Mirrored the AST reference: a 64-bit `1ull` mask with `>=64`/`<=0` clamp + an unsigned
+  cast of a signed source (exhaustive no-default `ucast` switch, -Wswitch-safe). Source:
+  jfrmer `5a6889df` F8.
+
+Tests: `tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide}.zer`. The
+uN/iN follow-ups ledger (limitations.md) now records masking as complete across
+init/binop/unop/assign/compound-assign/truncate/bitslice-read; global-scope stays
+safe-by-rejection.
+
+---
+
 ## 2026-07-09 — Native arbitrary-width integers `uN`/`iN` + `@addc`/`@subb`/`@mulw` carry primitives (types.*, checker.c, emitter.c, src/safety/type_kind.*)
 
 Feature + one silent-truncation fix. `make check` GREEN (ZER 909). Commits

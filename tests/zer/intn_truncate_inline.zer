@@ -1,0 +1,10 @@
+// Regression: @truncate(uN, val) must mask its result even when used INLINE
+// (comparison / call arg), not only when stored. `@truncate(u3, 13)` == 5.
+i32 printf(const *u8 fmt, ...);
+u32 main() {
+    if (@truncate(u3, 13) != 5) { return 1; }        // inline in comparison
+    if (@truncate(u5, 33) != 1) { return 2; }        // 33 & 31 == 1
+    u32 widened = (u32)@truncate(u3, 15);            // inline as cast operand
+    if (widened != 7) { return 3; }                   // 15 & 7 == 7
+    return 0;
+}

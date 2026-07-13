@@ -5,6 +5,123 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — unmerged audit fixes across 12 parallel `claude/*` branches (2026-07-13) — TASK TRACKER
+
+**READ THIS BEFORE DOING ANY NEW AUDIT / BUG-HUNT.** Most holes are ALREADY FOUND and
+FIXED on a branch — don't re-derive them. Twelve parallel `claude/*` audit sessions each
+found + fixed overlapping soundness / miscompile / crash holes. **NONE are merged to
+main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
+regression-test file is absent from main; signature helpers absent). The heavy overlap is
+AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
+dedup.
+
+**Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
+whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
+its OWN fork base, not current main (esp. the uN/iN ones — this session changed that exact
+code); (3) fixes pile onto the same functions across branches → apply per-FAMILY, re-verify
+after each (conflict groups noted at the end); (4) drop junk commit `e4829572` (0-source
+binary regen). To inspect any fix: `git show <sha>`.
+
+### Source branches (fork base → commits)
+| Branch | Base | Commits (short) |
+|---|---|---|
+| gifted-noether-k7l625 | b3b9f18a | 87a01415, ea58e5cc |
+| gifted-noether-jfrmer | 72e74913 | 5a6889df |
+| gifted-noether-a47dg2 | abdf629e | 9edc49b8 |
+| gifted-noether-9rryue | 3d6d2704 | bf29ffdc |
+| gifted-noether-5ergto | abdf629e | 85cc109e, a604ac57, 8d9514f3 |
+| cool-johnson-53cbd5 | 67a53c56 | 582920db (+e4829572 junk) |
+| cool-johnson-baujiz | e3fe5d46 | fb8091d6, 19471462, 2c7645b9 |
+| nifty-gates-84coh3 | 54ecfc9e | 59a968cb |
+| nifty-gates-jkaz5c | 3d6d2704 | 66332d39, 1fdaaffe |
+| nifty-gates-m0v91c | 54ecfc9e | a3e1f66c |
+| nifty-gates-ubjj9o | e3fe5d46 | f40ca06b, fb3315f2 |
+| nifty-gates-ziwscu | 54ecfc9e | 586507fb, a8968db0, ce9af8cb (+56497f28 doc) |
+
+### A. Memory safety — UAF / double-free / move (🔴; absent in main)
+| # | Fix | Proper source (sha) | Files |
+|---|---|---|---|
+| 1 | subslice of heap slice inherits base `alloc_id` (view UAF/DF) | 8d9514f3 | zercheck_ir.c |
+| 2 | cross-fn slice-param free tracked (`frees_param` += TYPE_SLICE) | bf29ffdc | zercheck_ir.c |
+| 3 | reject `free()` of non-heap (stack/arena/local-array) slice | bf29ffdc | checker.c |
+| 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |
+| 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
+| 6 | struct value-copy preserves compound handle (Pattern-4 replicate) | 59a968cb (A3) | zercheck_ir.c |
+| 7 | move-alias via `&arr[i]` / `&b.field` / spawn-arg | 582920db (#4) | zercheck_ir.c |
+
+### B. Escape / dangling-pointer sinks (🔴; #8 base helper partial in main)
+| # | Fix | Proper source (sha) | Files |
+|---|---|---|---|
+| 8 | optional/array pointer-carrier escape | 5a6889df (`escape_type_carries_ref`) **+ TYPE_ARRAY arm from** 586507fb (D1) | checker.c |
+| 9 | reassign `p = &local[i]/.f` escapes frame | 66332d39 (#1, `addr_of_is_local_derived`) | checker.c |
+| 10 | assignment-form slice-of-local (`r = arr; return r`) | bf29ffdc (773) | checker.c |
+| 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
+| 12 | Ring.push / spawn of by-value aggregate carrying ptr-to-local | a3e1f66c | checker.c |
+
+### C. VRP / bounds — silent OOB (🔴; absent)
+| # | Fix | Proper source (sha) | Files |
+|---|---|---|---|
+| 13 | VRP guard-narrowing leaks past switch/if-capture/orelse/loop join | 586507fb (A+B, JOIN) | checker.c |
+| 14 | `find_return_range` do-while body + guard-body over-credit | f40ca06b (F1) **+** 59a968cb (A2) — different arms | checker.c |
+| 15 | VarRange map reset per-function (cross-fn name-key leak) | f40ca06b (F3) | checker.c |
+| 16 | defer body keeps array bounds-guard (trapping mode) | 9edc49b8 (E, `guard_traps`) | emitter.c/.h |
+
+### D. uN/iN + miscompiles (🟠; MOST RELEVANT — completes this session's uN/iN feature)
+| # | Fix | Proper source (sha) | Files | Main |
+|---|---|---|---|---|
+| 17 | uN/iN mask on assignment / compound-assign (`s-=1`, `arr[i]+=n`) | 87a01415 (#3, both emit paths) | emitter.c | ⚠️ partial (binop/unop only) |
+| 18 | `@truncate(uN,val)` mask (store + inline uses) | ea58e5cc | emitter.c | absent |
+| 19 | bit-slice READ 64-bit guarded mask (IR path) | 5a6889df (F8) | emitter.c | absent |
+| 20 | `&&`/`\|\|` short-circuit (lower to branches) | f40ca06b (SC) | ir_lower.c | absent |
+| 21 | `?T`/`?void` bare/orelse return → `None` not `Some(0)` | 87a01415 (#1+#2, adds ?void) | emitter.c, ir.h, ir_lower.c | absent |
+| 22 | optional struct-field designated-init keeps value | fb3315f2 (3 paths, shared helper) | emitter.c | absent |
+| 23 | `@saturate` unsigned from ≥2^63 source | a3e1f66c | emitter.c | absent |
+| 24 | signed comptime return sign-extended | a3e1f66c | checker.c | absent |
+| 25 | float literal digit-group `_` not truncated | f40ca06b (F8-parser) | parser.c | absent |
+
+### E. Concurrency (🔴/🟠; absent)
+| # | Fix | Proper source (sha) | Files |
+|---|---|---|---|
+| 26 | spawn data-race scanner recurses cast/slice/struct-init/orelse | 9edc49b8 (B) or bf29ffdc (772) | checker.c |
+| 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
+| 28 | defer-body shared read emits the lock | 2c7645b9 | emitter.c |
+| 29 | shared-cond mutex unlock on orelse-return/break (no deadlock) | 586507fb (C-F3) | ir_lower.c |
+| 30 | `IR_AWAIT` keeps resume pred edge (UAF-across-await visible) | 586507fb (1-line) | ir.c |
+| 31 | union variant write via `*Union` updates `_tag` | 586507fb | emitter.c |
+
+### F. Parser / crashes / robustness
+| # | Fix | Proper source (sha) | Files | Main |
+|---|---|---|---|---|
+| 32 | parser DoS: `parse_type` + prefix-modifier depth guard | a8968db0 (A7-13) | parser.c | ⚠️ partial (expr guard only) |
+| 33 | `type_name` 256-byte buffer overflow → SIGSEGV | 59a968cb (A5, clamping `tn_append`) | types.c | absent |
+| 34 | `(*ptr & mask)` parse regression (breaks QEMU firmware) | ce9af8cb (A7-12) | parser.c | absent |
+| 35 | defer + auto-guard compiler abort (`N pending defers`) | 66332d39 (#6, `emit_pending_ir_defers`) | emitter.c/.h | absent |
+
+### G. Bare-metal / ISR / qualifier (absent)
+| # | Fix | Proper source (sha) | Files |
+|---|---|---|---|
+| 36 | `@critical` `"memory"` clobber on ARM/AVR/RISC-V | a8968db0 (A7-6) | emitter.c |
+| 37 | baremetal `@cpu_syscall/sysret/iret/hypercall` `#else #error` | 582920db (#5) | emitter.c preamble |
+| 38 | `@inttoptr` aggregate span/alignment (drop `type_width`=0) | 5a6889df (F4) | checker.c, emitter.c |
+| 39 | ISR ban: `@cond_wait`/`@barrier_wait`/`@sem_acquire` | 1fdaaffe | checker.c |
+| 40 | ISR ban: universal `alloc(T,n)`/`free(slice)` in ISR/@critical | 66332d39 (#3) | checker.c |
+| 41 | `@container` const-strip check (last cast form) | 582920db (#2) | checker.c |
+
+### Conflict groups (apply per-family, re-verify after each)
+- checker.c escape sinks: #8, 9, 10, 11, 12 (same region)
+- zercheck_ir.c Level-B: #4, 5 (same free_block/guard machinery)
+- ir_lower.c shared-lock: #27, 29 (cond-lock helpers)
+- emitter.c uN/iN: #17, 18, 19 (same mask sites this session touched)
+- emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
+- checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
+
+**Highest-value / start here:** the uN/iN trio (#17/#18/#19) — directly completes this
+session's uN/iN feature, off the freshest bases (k7l625 @ b3b9f18a, jfrmer @ 72e74913), so
+smallest rebase distance. Then the miscompiles (#20 short-circuit, #21 optional-None) and
+the crashes (#33 type_name overflow, #34 `(*ptr & mask)` firmware regression).
+
+---
+
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 
 Native arbitrary-width integers `uN`/`iN` shipped (BUGS-FIXED.md 2026-07-09,

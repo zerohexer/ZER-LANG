@@ -2341,6 +2341,13 @@ When starting a new session or lacking context:
 
 ### Bug Hunting Workflow (principle-first, not brute-force)
 
+**BEFORE any new audit/bug-hunt, read `docs/limitations.md` "## OPEN — unmerged audit
+fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
+soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
+merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). The uN/iN
+masking trio (#17/18/19) is the highest-relevance starting point.
+
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)
 2. Derive the GENERAL PRINCIPLE the bug violates (e.g., "TYPE_DISTINCT must be unwrapped")

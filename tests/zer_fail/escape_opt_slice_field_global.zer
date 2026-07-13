@@ -1,0 +1,5 @@
+// MUST FAIL: a ?[*]T (optional slice) field borrowing a local array escapes.
+struct Box { ?[*]u32 p; }
+?[*]u32 g;
+void f() { u32[8] arr; Box b; b.p = arr[0..4]; g = b.p; }
+u32 main() { f(); return 0; }

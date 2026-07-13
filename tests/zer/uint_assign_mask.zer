@@ -1,0 +1,32 @@
+// Native uN/iN width-masking must apply to ASSIGNMENT and COMPOUND-ASSIGNMENT
+// targets, not only var-decl initializers. Regression: `a += 1` / `a = a + 1`
+// on a uN went through the NODE_ASSIGN passthrough and skipped emit_intn_mask,
+// so the carrier kept bits above N (silent no-wrap). All ops must wrap at 2^N.
+u32 main() {
+    // var-decl init vs assignment must agree
+    u21 base = 2097151;
+    u21 viadecl = base + 1;       // masked -> 0
+    u21 a = 2097151;
+    a += 1;                       // must also wrap -> 0
+    if (viadecl != a) { return 1; }
+
+    u3 x = 5;
+    x = x + 1;                    // plain assign
+    if (x != 6) { return 2; }
+    x = 7; x = x + 1;             // wrap
+    if (x != 0) { return 3; }
+    u3 y = 5; y *= 3;             // 15 & 7 = 7
+    if (y != 7) { return 4; }
+    u3 z = 5; z <<= 2;            // 20 & 7 = 4
+    if (z != 4) { return 5; }
+    u3 w = 5; w += 4;             // 9 & 7 = 1
+    if (w != 1) { return 6; }
+
+    // signed iN sign-extends
+    i4 s = 7;
+    s = s + 1;                    // 8 -> -8
+    if (s >= 0) { return 7; }
+
+    // global uN accumulator (runtime, in fn body)
+    return 0;
+}

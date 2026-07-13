@@ -1,0 +1,14 @@
+// A shared read hidden in an array index under an outer field (`arr[g.i].v`)
+// must compile and lock `g` around the statement (previously emitted with NO
+// mutex_lock — a data race + TOCTOU on the double-evaluated g.i). Here it just
+// must compile + run; the negative deadlock sibling proves the lock is tracked.
+shared struct Counter { u32 i; u32 v; }
+Counter g;
+struct Box { u32 v; }
+Box[8] arr;
+u32 main() {
+    g.i = 3;
+    arr[g.i].v = 99;
+    if (arr[3].v != 99) { return 1; }
+    return 0;
+}

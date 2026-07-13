@@ -4024,6 +4024,47 @@ static bool is_async_local(Emitter *e, const char *name, size_t len) {
 
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward decl for emit_structured_asm */
 
+/* Mask/sign-extend a uN/iN value written to an lvalue by a NODE_ASSIGN
+ * passthrough (`t = expr`, `t += x`, `t <<= n`, …). The 3AC IR_BINOP/IR_UNOP
+ * paths call emit_intn_mask on their temp, but a NODE_ASSIGN passes through
+ * un-decomposed via emit_rewritten_node, so the carrier keeps bits above N —
+ * e.g. `u21 a=2097151; a += 1;` did NOT wrap to 0 (only the var-decl init form
+ * `u21 d = a + 1;` was masked). This re-emits `t = (t & mask);` (uN) or a
+ * shift-based sign-extend (iN) after the assignment. Idempotent when the value
+ * already fits (harmless redundant mask; VRP-elision is a separate perf item).
+ * Gated on a side-effect-free target so re-emitting the lvalue is safe; a
+ * side-effecting lvalue (`arr[next()] += 1`, `*p = x`) is left un-masked — a
+ * rare documented tail (see docs/limitations.md). */
+static void emit_intn_mask_target(Emitter *e, Node *target, IRFunc *func) {
+    if (!target) return;
+    Type *tt = checker_get_type(e->checker, target);
+    if (!tt) return;
+    TypeKind k = type_dispatch_kind(tt);
+    if (k != TYPE_UINT && k != TYPE_SINT) return;
+    uint32_t nb = type_unwrap_distinct(tt)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return;
+    if (expr_has_side_effects(target)) return;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    emit_indent(e);
+    if (k == TYPE_UINT) {
+        emit_rewritten_node(e, target, func);
+        emit(e, " = (");
+        emit_rewritten_node(e, target, func);
+        if (nb < 64)
+            emit(e, " & 0x%llxULL);\n", (unsigned long long)((1ULL << nb) - 1ULL));
+        else
+            emit(e, " & ((((unsigned __int128)1u) << %u) - 1u));\n", nb);
+    } else {
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        uint32_t sh = cw - nb;
+        emit_rewritten_node(e, target, func);
+        emit(e, " = (%s)((%s)", ss, su);
+        emit_rewritten_node(e, target, func);
+        emit(e, " << %u) >> %u;\n", sh, sh);
+    }
+}
+
 /* D-Alpha-7.5 Session B — Map x86_64 register name to GCC inline-asm constraint
  * letter. Returns NULL if unknown (Session C will add full per-arch tables).
  *
@@ -9456,11 +9497,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
+            /* Width-mask a uN/iN assignment target (`t = expr` / `t += x`) —
+             * the passthrough emit above does not decompose to a masked temp. */
+            if (inst->expr->kind == NODE_ASSIGN)
+                emit_intn_mask_target(e, inst->expr->assign.target, func);
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
             emit_rewritten_node(e, inst->expr, func);
             emit(e, ";\n");
+            if (inst->expr->kind == NODE_ASSIGN)
+                emit_intn_mask_target(e, inst->expr->assign.target, func);
         }
         break;
     }

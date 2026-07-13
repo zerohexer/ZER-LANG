@@ -5,7 +5,82 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## 2026-07-09 — Native arbitrary-width integers `uN`/`iN` + `@addc`/`@subb`/`@mulw` carry primitives (types.*, checker.c, emitter.c, src/safety/type_kind.*)
+## 2026-07-13 — Audit session: 4 confirmed bugs fixed (2×🔴 UAF, 🟠/🔴 data race, 🟡 miscompile)
+
+Adversarial audit (5 parallel subsystem sweeps + verification). Four confirmed,
+each fixed at the root with a regression test. `make check` GREEN.
+
+### BUG — `?*T`/`?[*]T` field read of a local-derived struct escapes (🔴 UAF, checker.c)
+`type_can_carry_pointer` (checker.c ~1411) unwrapped `TYPE_DISTINCT` but not
+`TYPE_OPTIONAL`, so an OPTIONAL pointer/slice field (`?*T`, `?[*]T`) was treated
+as a non-pointer scalar. Reading such a field out of a local-derived struct
+laundered the local-derived taint, letting a stack pointer escape to a global /
+return / keep-call / by-value-param-store (dangling pointer / use-after-free —
+runtime-confirmed the global held a freed stack address). The non-optional `*T`
+sibling was correctly rejected; only the optional wrapper slipped.
+- **Fix:** `type_can_carry_pointer` recurses through `TYPE_OPTIONAL` (so `?*T`/
+  `?[*]T` → true, `?u32` scalar → false). Added `type_is_ref_like` (unwraps
+  distinct+optional → pointer/slice) and wired it at the two escape-sink
+  value-type gates that narrowly checked `TYPE_POINTER || TYPE_SLICE` (the BUG-762
+  struct-wrap-launder descend at ~4415 and the keep-2a projection descend at
+  ~4513). All 5 sinks (return / global-store / struct-field-of-global / by-value
+  param / two-step launder) now reject; `?u32` scalar field copy still compiles
+  (no false positive). Pure tightening.
+- **Tests:** `tests/zer_fail/escape_opt_ptr_field_{global,return,byval_param}.zer`,
+  `escape_opt_slice_field_global.zer`; positive `tests/zer/escape_opt_scalar_field_ok.zer`.
+
+### BUG — Level B guarded free composed with a funcptr consume → double-free/UAF (🔴, zercheck_ir.c)
+A handle freed under guard `c` (`if(c){free(h)}`) then consumed via an
+indirect/funcptr call under the disjoint guard `!c` (`if(!c){ fp(h); h.id=5;
+free(h); }`) compiled clean and double-freed at runtime. `ir_indirect_call_barrier`
+did `if (h->state != IR_HS_ALIVE) continue;` — it SKIPPED an already-MAYBE_FREED
+handle, so the second potential free was never recorded, and the guarded-disjoint
+relaxation (`ir_use_guard_disjoint`) then judged the `!c` use "disjoint from the
+`c` free" and accepted it. The relaxation's single-free assumption was violated by
+the composition (the CLAUDE.md "Level B lesson" missing-variable class — surfaced
+by cross-feature composition, not a failing proof).
+- **Fix:** when the barrier re-touches a MAYBE_FREED handle (and its alias group),
+  disable the guarded relaxation for it via an out-of-range `free_block` sentinel
+  (`= gr_block_count`): `ir_use_guard_disjoint`/`ir_free_completes_coverage` both
+  reject `fb >= gr_block_count`, so the next use/free takes the conservative
+  MAYBE_FREED path. The sentinel is positive, so the merge-carries (which only
+  fill `free_block < 0`) preserve it. Pure tightening; the pure guarded pattern
+  `if(c){free} if(!c){use;free}` (no funcptr) still compiles.
+- **Test:** `tests/zer_fail/guarded_free_funcptr_double_free.zer`.
+
+### BUG — shared read in an array index under an outer field emits NO lock (🟠→🔴, ir_lower.c + checker.c)
+`arr[g.i].v = 99` (shared `g`, `arr` non-shared) emitted with no `pthread_mutex_lock`
+and evaluated `g.i` twice (bounds check + index) — a data race AND a TOCTOU: a
+concurrent writer changing `g.i` between the two reads defeats the bounds check
+→ OOB write. Three FIELD-chain walkers descended `.object`/`.index_expr.object`
+but never visited a `NODE_INDEX`'s `.index` subexpression, so the shared read in
+the index was dropped by the auto-lock emitter AND the same-statement deadlock
+detector (`arr[a.i].v = b.y` with two shared structs raised no deadlock error).
+Distinct from the 2026-06-28 object-chain projection fix and BH-18 #7 (there the
+INDEX is at the top; here it is nested under a FIELD).
+- **Fix:** all three walkers now recurse into the index subexpression while
+  descending the object chain: `find_shared_root_expr` + `find_all_shared_roots_expr`
+  (ir_lower.c) and `collect_shared_types_in_expr` (checker.c). `arr[g.i].v` now
+  locks `g`; `arr[a.i].v=b.y` now raises the deadlock error; non-shared indexes
+  emit no lock (no over-locking).
+- **Tests:** `tests/zer_fail/shared_index_under_field_deadlock.zer`,
+  `tests/zer/shared_index_under_field_locks.zer`.
+
+### BUG — uN/iN arithmetic in an assignment/compound-assignment not width-masked (🟡 miscompile, emitter.c)
+`u21 a=2097151; a += 1;` did NOT wrap to 0 (only the var-decl init form
+`u21 d = a + 1;` masked). The 3AC `IR_BINOP`/`IR_UNOP` paths call `emit_intn_mask`
+on their temp, but a `NODE_ASSIGN` (`t = expr`, `t += x`, `t <<= n`) passes
+through un-decomposed via `emit_rewritten_node`, leaving carrier bits above N.
+Affected every op (`+ - * << …`) on any `uN`/`iN` — any accumulator (`sum = sum +
+d`, `acc += x`). Contradicted the `docs/limitations.md` "masking is complete"
+claim (which held only for var-decl init). Not memory-unsafe: the bounds/bit-slice
+nets are not fooled by the out-of-range value (both audit agents confirmed).
+- **Fix:** `emit_intn_mask_target` re-emits `t = (t & mask);` (uN) / a shift
+  sign-extend (iN) after the passthrough assignment, gated on a side-effect-free
+  target (`arr[next()] += 1` / `*p = x` — side-effecting lvalues — left as a
+  documented rare tail). Wired in both IR_ASSIGN branches (dest-local + void).
+- **Test:** `tests/zer/uint_assign_mask.zer` (plain/compound/`*=`/`<<=`/`+=` wrap +
+  iN sign-extend + var-decl-vs-assign agreement).
 
 Feature + one silent-truncation fix. `make check` GREEN (ZER 909). Commits
 `e7ea2bcb` (uN/iN + carry primitives), `d91d0742` (over-width bit-slice fix),

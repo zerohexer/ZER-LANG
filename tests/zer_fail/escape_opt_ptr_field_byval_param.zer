@@ -1,0 +1,7 @@
+// MUST FAIL: a ?*T field of a by-value struct param stored to a global must
+// infer keep, rejecting a caller that passes a local-derived struct.
+struct Box { ?*u32 p; }
+?*u32 g;
+void stash(Box h) { g = h.p; }
+void f() { u32 x = 5; Box b; b.p = &x; stash(b); }
+u32 main() { f(); return 0; }

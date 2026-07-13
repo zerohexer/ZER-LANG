@@ -1,0 +1,7 @@
+// MUST FAIL: a ?*T field read of a local-derived struct escapes to a global.
+// Regression: type_can_carry_pointer / type_is_ref_like must unwrap TYPE_OPTIONAL
+// so the local-derived taint on `b` is traced through the optional field read.
+struct Box { ?*u32 p; }
+?*u32 g;
+void f() { u32 x = 5; Box b; b.p = &x; g = b.p; }
+u32 main() { f(); return 0; }

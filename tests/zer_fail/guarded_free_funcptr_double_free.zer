@@ -1,0 +1,20 @@
+// MUST FAIL: a handle freed under guard `c` and then consumed via a funcptr
+// call under the disjoint guard `!c` is freed on the !c path too, so the
+// subsequent use + free are a use-after-free + double-free. The Level B
+// guarded-disjoint relaxation must NOT fire once an indirect/funcptr call
+// re-consumes an already-MAYBE_FREED handle (its single-free assumption is
+// violated). Regression: ir_indirect_call_barrier disables the relaxation.
+struct Task { u32 id; }
+void reap(*Task t) { free(t); }
+void f(bool c) {
+    *Task h = alloc(Task) orelse return;
+    h.id = 111;
+    if (c) { free(h); }
+    *(*Task) fp = reap;
+    if (!c) {
+        fp(h);
+        h.id = 5;
+        free(h);
+    }
+}
+u32 main() { f(false); return 0; }

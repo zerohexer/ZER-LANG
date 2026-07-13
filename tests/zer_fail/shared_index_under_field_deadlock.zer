@@ -1,0 +1,12 @@
+// MUST FAIL: two different shared structs accessed in one statement, one hidden
+// in an array-index subexpression under an outer field access. `arr[a.i].v=b.y`
+// reads shared A (via a.i in the index) and shared B (b.y) — the same-statement
+// multi-shared-type deadlock check must catch it. Regression: the FIELD-chain
+// walkers must recurse into a NODE_INDEX's index subexpression (arr[a.i].v
+// previously evaded the check and emitted an unlocked shared read).
+shared struct A { u32 i; u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+struct Box { u32 v; }
+Box[8] arr;
+u32 main() { arr[a.i].v = b.y; return 0; }

@@ -1,0 +1,4 @@
+// MUST FAIL: return a ?*T field read of a local-derived struct.
+struct Box { ?*u32 p; }
+?*u32 f() { u32 x = 5; Box b; b.p = &x; return b.p; }
+u32 main() { return 0; }

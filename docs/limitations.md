@@ -10,10 +10,24 @@ Entries removed once fixed.
 Native arbitrary-width integers `uN`/`iN` shipped (BUGS-FIXED.md 2026-07-09,
 commits e7ea2bcb/d91d0742/80183261; `make check` GREEN). The type-kind
 predicates are VST-verified for `TYPE_UINT`/`TYPE_SINT` (Level-3 restored,
-`verif_type_kind.v`, verified via `make check-vst` 2026-07-10). Width-masking is
-complete: `emit_intn_mask` runs on `IR_BINOP` (arithmetic + shift) and `IR_UNOP`
-(negation/complement); global-scope arithmetic needs no mask (verified safe by
-rejection 2026-07-12 — see BUGS-FIXED.md). Remaining edges (all polish/deferred):
+`verif_type_kind.v`, verified via `make check-vst` 2026-07-10). Width-masking
+covers the 3AC binop/unop paths (`emit_intn_mask` on `IR_BINOP` arithmetic +
+shift, and `IR_UNOP` negation/complement) AND — since 2026-07-13 — assignment /
+compound-assignment targets (`emit_intn_mask_target` on the `NODE_ASSIGN`
+passthrough; the earlier "masking is complete" claim was FALSE — `a += 1`, `a =
+a + 1` on a `uN` silently did not wrap, fixed 2026-07-13, see BUGS-FIXED.md);
+global-scope arithmetic needs no mask (verified safe by rejection 2026-07-12).
+Remaining edges (all polish/deferred):
+
+- **Side-effecting-lvalue assignment target NOT masked (LOW — rare tail).** The
+  2026-07-13 assignment-mask fix (`emit_intn_mask_target`) re-emits the target
+  lvalue, so it is gated on a side-effect-free target. A uN/iN compound-assign to
+  a side-effecting lvalue — `arr[next()] += 1` (call in the index) or `*p = x`
+  (deref target) — is left un-masked (would double-evaluate the side effect if
+  re-emitted). Silently wrong value (same 🟡 class as the fixed bug), not memory-
+  unsafe. Fix: hoist the target lvalue to a single-eval temp (reuse the RF13
+  compound-shift target-hoist path) before masking, OR lower the compound assign
+  through a real masked `IR_BINOP`.
 
 - **VRP mask-elision (LOW — performance).** `emit_intn_mask` always emits the
   `& (2^N-1)` after `uN` arithmetic. Sound but not minimal: where VRP can prove
@@ -36,6 +50,38 @@ rejection 2026-07-12 — see BUGS-FIXED.md). Remaining edges (all polish/deferre
 - **`>64`-bit `uN` uses emulated multi-word arithmetic** (carrier is `__int128`
   ≤128; the `emit_intn_mask` __int128 branch). For hand-tuned big-int use the
   `@addc`/`@subb`/`@mulw` carry primitives + a limb struct (library).
+
+---
+
+## OPEN — 2026-07-13 audit residuals (findings confirmed but NOT fixed this session)
+
+Four confirmed bugs from the 2026-07-13 adversarial audit were fixed (see
+BUGS-FIXED.md 2026-07-13). These three were confirmed but left open:
+
+- **🟢 Level B over-rejection — immutable-bool guard scanned over the WHOLE
+  function body.** `ir_local_is_immutable_bool` disqualifies a guard `c` if `c`
+  is reassigned/address-taken ANYWHERE in the function, even AFTER all its
+  guarded uses. So `if(c){free(h)} if(!c){use(h);free(h)} c = true;` is rejected
+  though the reassignment is dominated by both uses (c is stable at every use).
+  Sound direction (over-reject only), matches the documented "defined at most once
+  in the whole function" conservatism. Fix: a dominator-aware "no reassignment
+  between the free and the use" gate would recover it. LOW priority.
+
+- **🔴 (documented-open, RECONFIRMED live) local-variable funcptr spawn escape.**
+  `void worker(){ *() fp = do_alloc; fp(); }` + `spawn worker()` where `do_alloc`
+  touches a global `Pool`/plain global compiles clean, while the direct-call form
+  is rejected. This is the still-open remainder of BH-18 #8 (only the
+  argument-forwarding form `run_n(do_increment,…)` was fixed 2026-07-01). The
+  `scan_unsafe_global_access` NODE_CALL handler follows funcptr ARGUMENTS but not
+  a funcptr stored in a LOCAL and then called. Fix: track local funcptr bindings
+  (`*() fp = g; fp()`) to their target function and descend it, same as the
+  argument-forwarding case.
+
+- **🟢 spec-tightening — `@truncate`/`@saturate` accept a float operand.**
+  `@truncate(u8, 3.5f32)` / `@saturate(i8, f)` compile and emit a plain C
+  value-cast (→ 3), though both are documented int→int ("keep low bits" / clamp).
+  Produces a defined value, not corruption — a spec-tightening question (reject
+  non-integer operands), not a safety hole.
 
 ---
 

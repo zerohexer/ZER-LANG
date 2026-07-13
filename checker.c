@@ -1410,10 +1410,31 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
  * causes false positives (BUG-421). */
 static bool type_can_carry_pointer(Type *t) {
     if (!t) return false;
-    Type *eff = type_unwrap_distinct(t);
-    return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
-                   eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
-                   eff->kind == TYPE_OPAQUE);
+    /* An optional pointer/slice (?*T, ?[*]T) still carries a reference to
+     * stack/arena memory — its payload is a pointer. Unwrap and test the
+     * inner so escape flags propagate through optional fields (BUG: a
+     * `?*T`/`?[*]T` field read of a local-derived struct laundered the
+     * local-derived taint and let it escape to a global/return/keep-call).
+     * `?u32` (optional scalar) still returns false via the recursion. */
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_OPTIONAL)
+        return type_can_carry_pointer(type_unwrap_distinct(t)->optional.inner);
+    return (k == TYPE_POINTER || k == TYPE_SLICE || k == TYPE_STRUCT ||
+            k == TYPE_UNION || k == TYPE_OPAQUE);
+}
+
+/* True if the type is (possibly optional/distinct) a pointer or slice — i.e. a
+ * VALUE that is itself a reference into memory (not a scalar or a struct copy).
+ * Used at escape sinks to decide whether a field READ (`v.p`) yields a reference
+ * that must be traced to its backing root. A `?*T`/`?[*]T` field read still
+ * carries the pointer, so the TYPE_OPTIONAL wrapper must be unwrapped (the same
+ * blind spot fixed in type_can_carry_pointer). `?u32` scalar → false. */
+static bool type_is_ref_like(Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_OPTIONAL)
+        return type_is_ref_like(type_unwrap_distinct(t)->optional.inner);
+    return k == TYPE_POINTER || k == TYPE_SLICE;
 }
 
 /* Propagate is_local_derived / is_arena_derived / is_from_arena from src to dst,
@@ -4403,8 +4424,7 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!via_slice_borrow && vnode &&
                 (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt = typemap_get(c, node->assign.value);
-                if (vt && (type_dispatch_kind(vt) == TYPE_POINTER ||
-                           type_dispatch_kind(vt) == TYPE_SLICE)) {
+                if (vt && type_is_ref_like(vt)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -4488,8 +4508,7 @@ static Type *check_expr(Checker *c, Node *node) {
              * projection_preserves_escape / buggy_projection_unsound. */
             if (vnode && (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
                 Type *vt2 = typemap_get(c, node->assign.value);
-                if (vt2 && (type_dispatch_kind(vt2) == TYPE_POINTER ||
-                            type_dispatch_kind(vt2) == TYPE_SLICE)) {
+                if (vt2 && type_is_ref_like(vt2)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -16851,6 +16870,14 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
             }
             cur = obj;
         }
+        /* The FIELD object-chain can bottom out in a NODE_INDEX (`arr[g.i].v`)
+         * whose INDEX subexpression itself reads a shared field (`g.i`). The
+         * loop above only inspected object TYPES along the chain, never the
+         * index, so `arr[g.i].v` evaded the same-statement multi-shared-type
+         * deadlock check. Recurse on the remaining sub-expression so the
+         * NODE_INDEX case (and others) visit the index. */
+        if (cur && cur->kind != NODE_IDENT)
+            count = collect_shared_types_in_expr(c, cur, types, max_types, count);
         break;
     }
     case NODE_BINARY:

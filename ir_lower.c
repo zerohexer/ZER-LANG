@@ -1241,7 +1241,15 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
         while (cur) {
             Node *next;
             if (cur->kind == NODE_FIELD) next = cur->field.object;
-            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
+            else if (cur->kind == NODE_INDEX) {
+                /* The index subexpression may itself read a shared field —
+                 * `arr[g.i].v` reads `g.i` (shared) but the object chain only
+                 * visits `arr`, so the shared read was emitted with NO lock (a
+                 * data race + `g.i` TOCTOU double-eval). Descend the index. */
+                Node *fi = find_shared_root_expr(c, cur->index_expr.index);
+                if (fi) return fi;
+                next = cur->index_expr.object;
+            }
             else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
             else break;
             Type *nt = checker_get_type(c, next);
@@ -1333,7 +1341,12 @@ static void find_all_shared_roots_expr(Checker *c, Node *expr,
     if (expr->kind == NODE_FIELD) {
         Node *root = expr;
         while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
+        while (root->kind == NODE_INDEX) {
+            /* `arr[g.i].v`: the index subexpression may read a distinct shared
+             * root — collect it too, or the multi-root lock omits it. */
+            find_all_shared_roots_expr(c, root->index_expr.index, out, count, max);
+            root = root->index_expr.object;
+        }
         while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
             root = root->unary.operand;
         if (root->kind == NODE_IDENT) {

@@ -2150,6 +2150,33 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
                 if (h->path_len != path_len) continue;
                 if (!h->path || memcmp(h->path, path, path_len) != 0) continue;
             }
+            if (h->state == IR_HS_MAYBE_FREED) {
+                /* The handle was already potentially freed on another path
+                 * (e.g. a guarded `if (c) { free(h); }`). This indirect call
+                 * is a SECOND potential free under a possibly-different guard,
+                 * so the guarded-disjoint relaxation's single-free assumption no
+                 * longer holds — a use under the complement `!c` path is NOT
+                 * safe just because the first free was under `c` (this call may
+                 * free it under `!c` too). Disable the relaxation for this handle
+                 * (and its alias group) with an out-of-range free_block sentinel:
+                 * ir_use_guard_disjoint / ir_free_completes_coverage both reject
+                 * fb >= gr_block_count, so the next use/free takes the
+                 * conservative MAYBE_FREED path. The sentinel is positive, so the
+                 * merge-carries (which only fill free_block < 0) preserve it.
+                 * Pure tightening; fixes a clean-compiling UAF + double-free. */
+                h->free_block = zc->gr_block_count;
+                int aidm = h->alloc_id;
+                if (aidm != 0) {
+                    for (int gi = 0; gi < ps->handle_count; gi++) {
+                        IRHandleInfo *g = &ps->handles[gi];
+                        if (g == h || g->alloc_id != aidm) continue;
+                        if (ir_is_invalid(g)) continue;
+                        if (g->state == IR_HS_MAYBE_FREED)
+                            g->free_block = zc->gr_block_count;
+                    }
+                }
+                continue;
+            }
             if (h->state != IR_HS_ALIVE) continue;
             h->state = IR_HS_MAYBE_FREED;
             h->free_line = line;

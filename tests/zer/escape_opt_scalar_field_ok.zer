@@ -1,0 +1,7 @@
+// A ?u32 (optional scalar) field carries a value, not a reference — storing it
+// to a global is a value copy and must compile (type_is_ref_like returns false
+// for ?u32, so no false-positive escape rejection).
+struct Box { ?u32 v; }
+?u32 g;
+void f() { u32 x = 5; Box b; b.v = x; g = b.v; }
+u32 main() { f(); return 0; }

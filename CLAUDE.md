@@ -2345,9 +2345,10 @@ When starting a new session or lacking context:
 fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
 soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
 merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). The uN/iN
-trio (#17/18/19) + #20 `&&`/`||` short-circuit + #21 optional-None landed
-2026-07-13/14; next highest-value are the crashes #33/#34.
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 7 landed
+2026-07-13/14 (uN/iN trio #17/18/19, #20 `&&`/`||` short-circuit, #21 optional-None,
+#33 `type_name` overflow, #34 `(*ptr & mask)`); 34 remaining. Next: #35 defer-abort,
+#22 designated-init, #32 parser DoS, and the memory-safety cluster (§A/§B).
 
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)

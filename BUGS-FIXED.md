@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-14 — two crash/robustness fixes: `type_name` buffer overflow + `(*ptr & mask)` parse regression (types.c, parser.c)
+
+Tracker #33 + #34 (independent; one pass). Both merged from the parallel `claude/*`
+audit branches.
+
+**#33 `type_name` 256-byte static buffer overflow → OOB write / SIGSEGV** (source
+nifty-gates-84coh3 `59a968cb` A5). `type_name_write` used the
+`pos += snprintf(buf+pos, max-pos, ...)` idiom, but `snprintf` returns the WOULD-BE
+(untruncated) length — so on a long leaf name `pos` ran PAST `max`, and a subsequent
+compound write then computed `buf + pos` (out of the 256-byte buffer) and `max - pos`
+(negative → huge `size_t`) → out-of-bounds write / crash on long type names (e.g. a
+long-named struct nested in an array/Pool/Handle). Fix: route every write through a
+new clamping `tn_append` (vsnprintf + clamp `pos` to `[0, max-1]`), so `pos` can never
+index past the buffer. Adapted to current main — also converted the `TYPE_UINT`/`SINT`
+cases (added this session, absent from the branch's older base). Defensive; no dedicated
+`.zer` test (hard to trigger deterministically) — `make check` exercises `type_name`
+broadly and the clamp is exhaustive.
+
+**#34 `(*ptr & mask)` misparsed as a `(*T)` cast — broke every QEMU firmware example**
+(source nifty-gates-ziwscu `ce9af8cb` A7-12). The 2026-06-06 C-style-cast feature made
+`(` `*` unconditionally start a pointer cast, so the canonical MMIO poll idiom
+`(*UART0_FR & 0x20)` — and bare `(*r)` — errored "expected ')' after cast type". No
+test covered `(*var ...)`, so `make check` stayed green while all 8
+`examples/qemu-cortex-m3/*.zer` silently over-rejected. Fix: `(` `*` is now AMBIGUOUS —
+disambiguate by SPECULATION. Try to parse `(*Type)`; it's a cast ONLY if a full type is
+followed by `)` AND the token after `)` can start a unary expression (the cast operand,
+via new `token_can_start_unary`); else restore the saved scanner + `panic_mode`/`had_error`
+and parse a parenthesized expression. Chosen over jkaz5c `66332d39` #5, whose simpler
+"does `)` immediately follow the type" heuristic would misparse `(*ptr) + 3` (a deref) as
+a cast — the unary-start check is what distinguishes it from `(*Motor)ctx`. Verified: all
+8 QEMU examples parse with 0 cast-parse-errors; `(*Motor)ctx`, `(*p)`, `(*p)[i]`,
+`(*p).f`, `(*p & m)`, `(*p) + 3` all correct.
+
+Test: `tests/zer/paren_deref_expr.zer`. make check 920/0. Tracker #33/#34 retired.
+
+---
+
 ## 2026-07-14 — optional bare/orelse `return` → None, not Some(0) (emitter.c, ir.h, ir_lower.c)
 
 Two related optional-return miscompiles on failure propagation (tracker #21, source

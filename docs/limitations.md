@@ -13,7 +13,7 @@ found + fixed overlapping soundness / miscompile / crash holes. **NONE are merge
 main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
 regression-test file is absent from main; signature helpers absent). The heavy overlap is
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
-dedup — **5 landed (uN/iN trio #17/#18/#19 + #20 `&&`/`||` short-circuit + #21 optional-None), 36 remaining.**
+dedup — **7 landed (uN/iN trio #17/#18/#19, #20 `&&`/`||` short-circuit, #21 optional-None, #33 `type_name` overflow, #34 `(*ptr & mask)` regression), 34 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -99,11 +99,14 @@ make check 919/0.
 | 31 | union variant write via `*Union` updates `_tag` | 586507fb | emitter.c |
 
 ### F. Parser / crashes / robustness
+**✅ DONE 2026-07-14: #33 `type_name` buffer overflow → SIGSEGV (`59a968cb` A5, clamping
+`tn_append`; UINT/SINT cases adapted for current main); #34 `(*ptr & mask)` parse
+regression (`ce9af8cb` A7-12, speculation + `token_can_start_unary`; chosen over
+`66332d39` #5 whose simpler heuristic misparses `(*ptr) + 3`). All 8 QEMU examples parse
+again. Test `paren_deref_expr`. make check 920/0.**
 | # | Fix | Proper source (sha) | Files | Main |
 |---|---|---|---|---|
 | 32 | parser DoS: `parse_type` + prefix-modifier depth guard | a8968db0 (A7-13) | parser.c | ⚠️ partial (expr guard only) |
-| 33 | `type_name` 256-byte buffer overflow → SIGSEGV | 59a968cb (A5, clamping `tn_append`) | types.c | absent |
-| 34 | `(*ptr & mask)` parse regression (breaks QEMU firmware) | ce9af8cb (A7-12) | parser.c | absent |
 | 35 | defer + auto-guard compiler abort (`N pending defers`) | 66332d39 (#6, `emit_pending_ir_defers`) | emitter.c/.h | absent |
 
 ### G. Bare-metal / ISR / qualifier (absent)
@@ -124,11 +127,11 @@ make check 919/0.
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 short-circuit, #21 optional-None~~
-✅ landed 2026-07-13/14. Remaining highest-value: the crashes — #33 `type_name` 256-buffer
-overflow → SIGSEGV, #34 `(*ptr & mask)` parse regression (breaks QEMU firmware) — plus #22
-optional-field designated-init and the memory-safety cluster (§A/§B). All verified absent
-from main.
+**Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 short-circuit, #21 optional-None,
+#33 `type_name` overflow, #34 `(*ptr & mask)`~~ ✅ landed 2026-07-13/14. Remaining
+highest-value: #35 defer+auto-guard compiler abort, #22 optional-field designated-init,
+#32 parser DoS (parse_type/prefix — main has only the expr-depth guard), and the
+memory-safety cluster (§A/§B). All verified absent from main.
 
 ---
 

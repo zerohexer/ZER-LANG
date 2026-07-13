@@ -133,6 +133,32 @@ static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
     emit(e, ", 1 }");
 }
 
+/* F21 (audit 2026-07-06): if struct field `fname` of `si_type` is a value-
+ * optional (?u32/?bool/… — a struct optional, NOT a ?*T null-sentinel) and the
+ * initializer value's type `val_type` is NOT already optional, return the field's
+ * optional Type so the caller wraps the scalar as {val,1}. Otherwise NULL. Without
+ * the wrap, C brace-elision drops the scalar into `.value`, leaving `.has_value=0`
+ * (so `Cfg c = { .baud = 9600 }; c.baud orelse d` always took the fallback). */
+static Type *struct_init_opt_wrap_type(Type *si_type, const char *fname,
+                                       uint32_t fname_len, Type *val_type) {
+    Type *si_eff = si_type ? type_unwrap_distinct(si_type) : NULL;
+    if (!si_eff || si_eff->kind != TYPE_STRUCT) return NULL;
+    Type *ftype = NULL;
+    for (uint32_t j = 0; j < si_eff->struct_type.field_count; j++) {
+        if (si_eff->struct_type.fields[j].name_len == fname_len &&
+            memcmp(si_eff->struct_type.fields[j].name, fname, fname_len) == 0) {
+            ftype = si_eff->struct_type.fields[j].type;
+            break;
+        }
+    }
+    if (!ftype) return NULL;
+    Type *ft_eff = type_unwrap_distinct(ftype);
+    if (!ft_eff || ft_eff->kind != TYPE_OPTIONAL) return NULL;
+    if (is_null_sentinel(ft_eff->optional.inner)) return NULL;
+    if (val_type && type_dispatch_kind(val_type) == TYPE_OPTIONAL) return NULL;
+    return ftype;
+}
+
 /* Emit return-null for current function's return type.
  * Handles ?void, ?T struct, ?*T null sentinel, void, and scalar. */
 static void emit_return_null(Emitter *e) {
@@ -2931,9 +2957,14 @@ static void emit_expr(Emitter *e, Node *node) {
         emit(e, "{ ");
         for (int i = 0; i < node->struct_init.field_count; i++) {
             if (i > 0) emit(e, ", ");
-            emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
-                 node->struct_init.fields[i].name);
-            emit_expr(e, node->struct_init.fields[i].value);
+            const char *fname = node->struct_init.fields[i].name;
+            uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+            emit(e, ".%.*s = ", (int)fname_len, fname);
+            Node *fval = node->struct_init.fields[i].value;
+            Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len,
+                                                 checker_get_type(e->checker, fval));
+            if (wt) emit_opt_wrap_value(e, wt, fval);  /* F21 */
+            else    emit_expr(e, fval);
         }
         emit(e, " }");
         break;
@@ -9294,9 +9325,23 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         emit(e, "{ ");
         for (int i = 0; i < node->struct_init.field_count; i++) {
             if (i > 0) emit(e, ", ");
-            emit(e, ".%.*s = ", (int)node->struct_init.fields[i].name_len,
-                 node->struct_init.fields[i].name);
-            emit_rewritten_node(e, node->struct_init.fields[i].value, func);
+            const char *fname = node->struct_init.fields[i].name;
+            uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+            emit(e, ".%.*s = ", (int)fname_len, fname);
+            Node *fval = node->struct_init.fields[i].value;
+            /* F21: wrap a scalar into a value-optional field {val,1} (the
+             * compound-literal assignment path `c = { .baud = 9600 };`). */
+            Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len,
+                                                 checker_get_type(e->checker, fval));
+            if (wt) {
+                emit(e, "(");
+                emit_type(e, wt);
+                emit(e, "){ ");
+                emit_rewritten_node(e, fval, func);
+                emit(e, ", 1 }");
+            } else {
+                emit_rewritten_node(e, fval, func);
+            }
         }
         emit(e, " }");
         return;
@@ -11325,11 +11370,25 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, "){ ");
             for (int i = 0; i < inst->expr->struct_init.field_count; i++) {
                 if (i > 0) emit(e, ", ");
-                emit(e, ".%.*s = ", (int)inst->expr->struct_init.fields[i].name_len,
-                     inst->expr->struct_init.fields[i].name);
+                const char *fname = inst->expr->struct_init.fields[i].name;
+                uint32_t fname_len = (uint32_t)inst->expr->struct_init.fields[i].name_len;
+                emit(e, ".%.*s = ", (int)fname_len, fname);
                 if (inst->call_arg_locals && i < inst->call_arg_local_count &&
                     inst->call_arg_locals[i] >= 0) {
-                    emit_local_name(e, func, inst->call_arg_locals[i]);
+                    int vloc = inst->call_arg_locals[i];
+                    /* F21: wrap a scalar into a value-optional field {val,1}. */
+                    Type *vt = (vloc < func->local_count) ? func->locals[vloc].type : NULL;
+                    Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
+                                                         fname_len, vt);
+                    if (wt) {
+                        emit(e, "(");
+                        emit_type(e, wt);
+                        emit(e, "){ ");
+                        emit_local_name(e, func, vloc);
+                        emit(e, ", 1 }");
+                    } else {
+                        emit_local_name(e, func, vloc);
+                    }
                 } else {
                     emit(e, "0"); /* fallback */
                 }

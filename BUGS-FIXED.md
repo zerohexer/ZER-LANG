@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-14 — value-optional struct-field designated init dropped the value (emitter.c)
+
+Tracker #22 (source nifty-gates-ubjj9o `fb3315f2` F21). `Cfg c = { .baud = 9600 }` where
+`.baud : ?u32` emitted `.baud = 9600`; C99 brace-elision landed the scalar into the
+optional's `.value` and left `.has_value = 0`, so `c.baud orelse d` **silently returned
+the fallback** — a miscompile of CLAUDE.md's own designated-init idiom.
+
+Fix: new shared `struct_init_opt_wrap_type(si_type, fname, fname_len, val_type)` helper —
+returns the field's optional Type iff the field is a value-optional (`?u32`/`?bool`/… — a
+struct optional, NOT a `?*T` null-sentinel) AND the value isn't already optional; else
+NULL. Wired at all THREE struct-init emission paths so the scalar is wrapped as
+`(_zer_opt_X){ val, 1 }`: AST `emit_expr` (global/const init), `emit_rewritten_node`
+(compound-literal assignment `c = { … };`), and `emit_ir_inst` IR_STRUCT_INIT_DECOMP
+(var-decl init). `?*T` null-sentinel fields and already-optional values are untouched;
+unmentioned optional fields stay `null` (C zero-init). The helper reads `si_eff->kind`/
+`ft_eff->kind` on ALREADY-`type_unwrap_distinct`'d locals (documented-safe `_eff` reads,
+added to `tools/type_dispatch_baseline.txt`).
+
+Test: `tests/zer/optional_field_designated_init.zer` (var-decl init + compound-literal
+assignment + unmentioned-field-stays-null). make check 921/0. Tracker #22 retired.
+
+---
+
 ## 2026-07-14 — two crash/robustness fixes: `type_name` buffer overflow + `(*ptr & mask)` parse regression (types.c, parser.c)
 
 Tracker #33 + #34 (independent; one pass). Both merged from the parallel `claude/*`

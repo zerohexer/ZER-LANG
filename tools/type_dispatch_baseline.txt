@@ -717,3 +717,7 @@ emitter.c:if (f->type && f->type->kind == TYNODE_VOLATILE &&
 emitter.c:if (ta->kind == TYNODE_NAMED) {
 zercheck_ir.c:* tnode->kind == TYNODE_NAMED, but the resolved type is a
 zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
+# audit 2026-07-06 F21: struct_init_opt_wrap_type — reads on ALREADY-UNWRAPPED
+# locals (si_eff / ft_eff = type_unwrap_distinct(...)). Documented-safe.
+emitter.c:if (!ft_eff || ft_eff->kind != TYPE_OPTIONAL) return NULL;
+emitter.c:if (!si_eff || si_eff->kind != TYPE_STRUCT) return NULL;

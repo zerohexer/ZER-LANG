@@ -13,7 +13,7 @@ found + fixed overlapping soundness / miscompile / crash holes. **NONE are merge
 main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
 regression-test file is absent from main; signature helpers absent). The heavy overlap is
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
-dedup — **7 landed (uN/iN trio #17/#18/#19, #20 `&&`/`||` short-circuit, #21 optional-None, #33 `type_name` overflow, #34 `(*ptr & mask)` regression), 34 remaining.**
+dedup — **8 landed (uN/iN trio #17/#18/#19, #20 `&&`/`||` short-circuit, #21 optional-None, #22 designated-init, #33 `type_name` overflow, #34 `(*ptr & mask)` regression), 33 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -80,10 +80,12 @@ over a47dg2 `9edc49b8` passthrough which would hide the control flow from IR ana
 `?void` orelse propagates failure via new `IRInst.ret_from_orelse` (chosen over a47dg2
 `9edc49b8` BUG-A which fixed only the `?T` case).
 Tests: `tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide,shortcircuit_side_effects,shortcircuit_value_ok,optional_bare_return_none,optional_void_orelse_propagate}.zer`.
-make check 919/0.
+make check 919/0. #22 (2026-07-14): value-optional struct-field designated-init dropped
+the value (`{.baud=9600}` on a `?u32` field → `has_value=0`, so `orelse` took the
+fallback); fb3315f2's shared `struct_init_opt_wrap_type` wraps the scalar `{val,1}` on all
+3 struct-init emission paths (test `optional_field_designated_init`; make check 921/0).
 | # | Fix | Proper source (sha) | Files | Main |
 |---|---|---|---|---|
-| 22 | optional struct-field designated-init keeps value | fb3315f2 (3 paths, shared helper) | emitter.c | absent |
 | 23 | `@saturate` unsigned from ≥2^63 source | a3e1f66c | emitter.c | absent |
 | 24 | signed comptime return sign-extended | a3e1f66c | checker.c | absent |
 | 25 | float literal digit-group `_` not truncated | f40ca06b (F8-parser) | parser.c | absent |
@@ -128,10 +130,11 @@ again. Test `paren_deref_expr`. make check 920/0.**
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
 **Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 short-circuit, #21 optional-None,
-#33 `type_name` overflow, #34 `(*ptr & mask)`~~ ✅ landed 2026-07-13/14. Remaining
-highest-value: #35 defer+auto-guard compiler abort, #22 optional-field designated-init,
-#32 parser DoS (parse_type/prefix — main has only the expr-depth guard), and the
-memory-safety cluster (§A/§B). All verified absent from main.
+#22 designated-init, #33 `type_name` overflow, #34 `(*ptr & mask)`~~ ✅ landed 2026-07-13/14.
+Remaining highest-value: #35 defer+auto-guard compiler abort, #23 `@saturate` unsigned,
+#24 signed-comptime-return, #25 float-underscore literal, #32 parser DoS (parse_type/prefix
+— main has only the expr-depth guard), and the memory-safety cluster (§A/§B). All verified
+absent from main.
 
 ---
 

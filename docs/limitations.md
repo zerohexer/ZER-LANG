@@ -13,7 +13,7 @@ found + fixed overlapping soundness / miscompile / crash holes. **NONE are merge
 main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
 regression-test file is absent from main; signature helpers absent). The heavy overlap is
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
-dedup — **4 landed 2026-07-13 (uN/iN trio #17/#18/#19 + #20 `&&`/`||` short-circuit), 37 remaining.**
+dedup — **5 landed (uN/iN trio #17/#18/#19 + #20 `&&`/`||` short-circuit + #21 optional-None), 36 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -67,19 +67,22 @@ binary regen). To inspect any fix: `git show <sha>`.
 | 16 | defer body keeps array bounds-guard (trapping mode) | 9edc49b8 (E, `guard_traps`) | emitter.c/.h |
 
 ### D. uN/iN + miscompiles (🟠)
-**✅ DONE 2026-07-13 (merged to main): #17 assign/compound-assign mask, #18 `@truncate`
-mask (inline+store), #19 bit-slice-read 64-bit guarded mask, #20 `&&`/`||` short-circuit.**
+**✅ DONE (merged to main): #17 assign/compound-assign mask, #18 `@truncate` mask
+(inline+store), #19 bit-slice-read 64-bit guarded mask, #20 `&&`/`||` short-circuit
+(all 2026-07-13), #21 optional bare/orelse return → None (2026-07-14).**
 uN/iN sources: k7l625 (`87a01415` helpers `emit_intn_mask_lv`/`type_is_nonnative_intn` +
 assign intercept both emit paths; `ea58e5cc` truncate) + jfrmer F8 (`5a6889df`, bitslice
 read). k7l625's assign approach was chosen over jfrmer's F5 because it single-eval-masks a
 side-effecting index target (`arr[f()] += n`) whereas jfrmer's bails on side effects. #20
 short-circuit: ubjj9o `f40ca06b` (`lower_shortcircuit_to_dest`, IR branch-lowering; chosen
 over a47dg2 `9edc49b8` passthrough which would hide the control flow from IR analysis).
-Tests: `tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide,shortcircuit_side_effects,shortcircuit_value_ok}.zer`.
-make check 917/0.
+#21 optional-None: k7l625 `87a01415` (#1+#2) — `?T` bare return `{0,0}` not `{0,1}`;
+`?void` orelse propagates failure via new `IRInst.ret_from_orelse` (chosen over a47dg2
+`9edc49b8` BUG-A which fixed only the `?T` case).
+Tests: `tests/zer/{intn_assign_mask,intn_truncate_inline,bitslice_read_wide,shortcircuit_side_effects,shortcircuit_value_ok,optional_bare_return_none,optional_void_orelse_propagate}.zer`.
+make check 919/0.
 | # | Fix | Proper source (sha) | Files | Main |
 |---|---|---|---|---|
-| 21 | `?T`/`?void` bare/orelse return → `None` not `Some(0)` | 87a01415 (#1+#2, adds ?void) | emitter.c, ir.h, ir_lower.c | absent |
 | 22 | optional struct-field designated-init keeps value | fb3315f2 (3 paths, shared helper) | emitter.c | absent |
 | 23 | `@saturate` unsigned from ≥2^63 source | a3e1f66c | emitter.c | absent |
 | 24 | signed comptime return sign-extended | a3e1f66c | checker.c | absent |
@@ -121,10 +124,11 @@ make check 917/0.
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 `&&`/`||` short-circuit~~ ✅ landed
-2026-07-13. Remaining highest-value: #21 optional-None (`?T`/`?void` bare/orelse return →
-`Some(0)`) and the crashes (#33 `type_name` overflow, #34 `(*ptr & mask)` firmware
-regression) — all verified absent from main.
+**Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 short-circuit, #21 optional-None~~
+✅ landed 2026-07-13/14. Remaining highest-value: the crashes — #33 `type_name` 256-buffer
+overflow → SIGSEGV, #34 `(*ptr & mask)` parse regression (breaks QEMU firmware) — plus #22
+optional-field designated-init and the memory-safety cluster (§A/§B). All verified absent
+from main.
 
 ---
 

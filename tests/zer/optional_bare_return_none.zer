@@ -1,0 +1,24 @@
+// Regression: bare `return;` / `orelse return;` in a ?T-returning function must
+// yield None (has_value=0), NOT Some(0). Previously emitted {0,1} (Some(0)) so a
+// caller saw a spurious value. See limitations.md "bare orelse return in a ?T".
+?u32 maybe_fail(u32 x) {
+    if (x == 0) { return null; }
+    return x;
+}
+?u32 via_bare(u32 x) {
+    if (x == 0) { return; }
+    return x + 100;
+}
+?u32 via_orelse(u32 x) {
+    u32 v = maybe_fail(x) orelse return;
+    return v + 100;
+}
+u32 main() {
+    // failure paths must be None
+    if (via_bare(0)) |_| { return 1; }
+    if (via_orelse(0)) |_| { return 2; }
+    // success paths must carry the value
+    if (via_bare(5)) |a| { if (a != 105) { return 4; } } else { return 3; }
+    if (via_orelse(5)) |b| { if (b != 105) { return 6; } } else { return 5; }
+    return 0;
+}

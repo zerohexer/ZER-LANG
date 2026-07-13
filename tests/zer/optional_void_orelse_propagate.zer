@@ -1,0 +1,15 @@
+// Regression: in a ?void function, `orelse return;` must propagate FAILURE (None),
+// while a standalone `return;` remains SUCCESS. Previously the orelse-fallback
+// return emitted {has_value=1} (success), silently swallowing a failure.
+?void inner(u32 x) { if (x == 0) { return null; } return; }
+?void outer(u32 x) {
+    inner(x) orelse return;   // must yield None when inner fails
+    return;                    // standalone -> success
+}
+?void just_success() { return; }   // standalone bare return -> success
+u32 main() {
+    if (outer(0)) { return 1; }        // must be None -> if-true means BUG
+    if (outer(5)) { } else { return 2; } // must be success
+    if (just_success()) { } else { return 3; } // standalone success preserved
+    return 0;
+}

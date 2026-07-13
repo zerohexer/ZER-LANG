@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-14 — optional bare/orelse `return` → None, not Some(0) (emitter.c, ir.h, ir_lower.c)
+
+Two related optional-return miscompiles on failure propagation (tracker #21, source
+k7l625 `87a01415` #1+#2). A `?T`-returning function's caller saw a spurious value, and a
+`?void` `orelse return;` swallowed the failure — both silent.
+
+- **`?T` bare / `orelse` return emitted `Some(0)` not `None`.** A bare `return;` in a
+  `?u32` function (directly, or via `x orelse return;`) carries NO value, so it is the
+  None form — but the IR_RETURN emitter wrote `(_zer_opt_u32){ 0, 1 }` (has_value=1 =
+  Some(0)). A caller `if (f()) |v|` then bound `v = 0` on the failure path instead of
+  taking the else. Fixed: emit `{ 0, 0 }` (None) for the non-void optional bare return.
+- **`?void` `orelse return;` propagated SUCCESS not FAILURE.** In a `?void` function a
+  standalone bare `return;` IS success `{has_value=1}` (the only "value"), but an
+  `orelse return;` fallback must propagate the failure = None `{has_value=0}`. The IR
+  couldn't tell them apart — both were bare returns. Added `IRInst.ret_from_orelse`
+  (ir.h), set true on the orelse-fallback return in `lower_orelse_to_dest` (ir_lower.c),
+  and read in the IR_RETURN emitter: `ret_from_orelse ? {0} : {1}`. Standalone `?void`
+  `return;` stays success; `?T` bare returns are None regardless.
+
+Tests: `tests/zer/{optional_bare_return_none,optional_void_orelse_propagate}.zer`
+(exercise both failure and success paths). make check 919/0. Chosen over a47dg2
+`9edc49b8` BUG-A which fixed only the `?T` case (no `?void` orelse distinction).
+Tracker (limitations.md) #21 retired.
+
+---
+
 ## 2026-07-13 — `&&`/`||` short-circuit on the IR path (ir_lower.c)
 
 `&&` and `||` did NOT short-circuit: the 3AC lowering evaluated BOTH operands eagerly

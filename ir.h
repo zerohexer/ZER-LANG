@@ -199,6 +199,13 @@ typedef struct IRInst {
 
     /* Type info for emission (needed when emitting from local IDs) */
     Type *cast_type;         /* target type for IR_CAST */
+
+    /* IR_RETURN: this bare return is an `orelse return;` FAILURE-propagation
+     * fallback (not a standalone `return;`). Matters only for a ?void-returning
+     * function: a standalone bare `return;` = SUCCESS {has_value=1}, but an
+     * orelse-fallback bare return must propagate FAILURE = None {has_value=0}.
+     * (?T bare returns are None either way; ?*T is a null sentinel.) */
+    bool ret_from_orelse;
 } IRInst;
 
 /* ================================================================

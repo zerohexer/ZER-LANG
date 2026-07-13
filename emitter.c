@@ -10058,20 +10058,30 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return;\n");
                 }
             } else {
-                /* Bare `return;` from `?void` function means SUCCESS: { has_value=1 }.
-                 * For ?T struct optional, bare return also = success (emit {0, 1}).
-                 * For plain void return, emit `return;`. For ?*T null-sentinel,
-                 * bare return has no natural value — emit null.
-                 * Only explicit `return null` should emit null literal. */
+                /* Bare `return;` semantics by return type:
+                 *   ?void  → SUCCESS { has_value=1 } (no value form exists, so a
+                 *            bare return is the natural "succeeded" statement).
+                 *   ?T     → NONE { 0, 0 }. A bare `return;` carries no value, so
+                 *            it is the None form (the value form is `return x;`).
+                 *            This is what `orelse return;` propagation needs; the
+                 *            old `{ 0, 1 }` (Some(0)) was a silent correctness bug
+                 *            — the caller saw a spurious value. (limitations.md
+                 *            "bare orelse return in a ?T function".)
+                 *   ?*T    → null sentinel (None) via emit_return_null below.
+                 * Only explicit `return null` also emits None. */
                 Type *ret = e->current_func_ret;
                 Type *eff = ret ? type_unwrap_distinct(ret) : NULL;
                 if (eff && eff->kind == TYPE_OPTIONAL && !is_null_sentinel(eff->optional.inner)) {
                     if (is_void_opt(eff)) {
-                        emit(e, "return (_zer_opt_void){ 1 };\n");
+                        /* orelse-fallback return propagates FAILURE (None);
+                         * a standalone bare `return;` is SUCCESS. */
+                        emit(e, inst->ret_from_orelse
+                                ? "return (_zer_opt_void){ 0 };\n"
+                                : "return (_zer_opt_void){ 1 };\n");
                     } else {
                         emit(e, "return (");
                         emit_type(e, eff);
-                        emit(e, "){ 0, 1 };\n");
+                        emit(e, "){ 0, 0 };\n");
                     }
                 } else {
                     emit_return_null(e);

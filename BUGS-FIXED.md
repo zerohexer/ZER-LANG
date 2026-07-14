@@ -5,6 +5,70 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-14 — audit sweep: @bitcast uN/iN, orelse-block value gap, ?[*]T slice coercion + escape holes
+
+Fresh full-codebase audit (four parallel subsystem sweeps + direct probing). Six confirmed
+bugs, all with repros + regression tests. None are in the 41-item cross-branch tracker.
+
+**1. `@bitcast(uN/iN, x)` never masked/sign-extended the result — silent miscompile (emitter.c).**
+`@bitcast` memcpy-puns into a carrier-width temp but, unlike `@truncate`, omitted the
+non-native `uN`/`iN` mask, so `@bitcast(u5, i5(-1))` yielded 255 (carrier byte) instead of
+31, and `@bitcast(i5, u5(31))` yielded 31 instead of -1 (no sign-extend). Invisible only in
+the assignment form (re-masked by `emit_intn_mask_lv` afterward); var-decl-init, `return`,
+and inline uses were all wrong. Fix: apply `emit_intn_mask_lv` to `_zer_bco` when
+`type_is_nonnative_intn(t)` on BOTH dispatch paths (AST `emit_expr` + IR `emit_rewritten_node`),
+mirroring the `@truncate` handler. Test `tests/zer/bitcast_intn.zer`.
+
+**2. Non-diverging `orelse { block }` in value position silently yielded 0 (checker.c).**
+`u32 x = f() orelse { g = 1; };` (block falls through) compiled clean and set `x = 0` —
+the checker typed the orelse `unwrapped` unconditionally, relying on a stale "GCC rejects
+value-position stmt-exprs" assumption that the IR path (auto-zeroed result temp in basic
+blocks) defeats. Fix: new `orelse_block_diverges()` helper (tail return/break/continue/goto,
+nested-if with both arms diverging, `orelse return/break/continue` tail); a FALL-THROUGH
+block types the orelse `void`, so existing "cannot initialize X with void" / return-mismatch
+checks reject value-context use while a bare-statement `f() orelse { ... }` (value discarded)
+stays legal. Diverging blocks keep the unwrapped type. Tests
+`tests/zer/orelse_block_diverge.zer`, `tests/zer_fail/orelse_block_value_nondiverge.zer`.
+
+**3. Array → `?[*]T` (optional slice) coercion dropped `.len` at every value-flow site —
+silent miscompile (emitter.c).**
+Wrapping an array into an optional slice emitted `.value = <array>` (array decays to
+ptr-only → `.len = 0`), so `?[*]u8 s = buf; take(s)` saw a zero-length slice. Fixed the four
+value-flow sites — assignment/var-decl-init (`emit_rewritten_node` NODE_ASSIGN + IR_COPY
+`need_wrap`), call-arg, and (global-array) return — to build the `{ptr,len}` slice inside the
+optional when `optional.inner` is a slice and the source is an array. Test
+`tests/zer/optional_slice_coerce.zer` + `optional_slice_return_global.zer`.
+
+**4. `?[*]T` return of a local array bypassed the dangling-pointer escape check — MEMORY
+SAFETY hole (checker.c).**
+`?[*]u8 mk() { u8[5] buf; return buf; }` compiled a dangling slice into a dead stack frame;
+the non-optional `[*]u8` form was correctly rejected. The check gated on
+`current_func_ret->kind == TYPE_SLICE`, so the `?[*]T` (TYPE_OPTIONAL) wrapper hid it. Fix:
+unwrap the optional — a return target is slice-like if it is a slice OR an optional-of-slice.
+Test `tests/zer_fail/return_local_array_optslice.zer`.
+
+**5. `?[*]T` global store of a local array bypassed the same escape check — MEMORY SAFETY
+hole (checker.c).**
+`?[*]u8 g; g = buf;` (local `buf`) compiled a dangling global pointer; the non-optional form
+was rejected. Same root cause — the array→slice-into-global check gated on
+`target->kind == TYPE_SLICE`. Fix: widen to optional-of-slice targets (call-result carriers
+already covered this via `type_carries_data_pointer`; this aligns the direct-array-store
+path). Test `tests/zer_fail/store_local_array_optslice_global.zer`. (Both #4/#5 are concrete
+instances of the general optional/array pointer-carrier escape class that tracker #8 targets
+via `escape_type_carries_ref`; these are verified point-fixes, no conflict when #8 lands.)
+
+**6. Global array returned as `?[*]T` emitted a bare `return;` → caller saw None — silent
+miscompile (emitter.c).** Uncovered while fixing #3/#4. The array→slice-return coercion gated
+on `ret_eff->kind == TYPE_SLICE`, so an optional return fell through to the void branch.
+Fixed alongside #3. Covered by `tests/zer/optional_slice_return_global.zer`.
+
+Also verified CLEAN this session: the IR-path safety-wrapper parity (trap/bounds/shift/
+div/MMIO — the BUG-595..612 class), the freestanding/baremetal trap+bounds+`@critical`+
+atomic paths, and the rest of the uN/iN + optional + switch-exhaustiveness surface.
+make check green (all suites). Repo audits (walker-default, type-dispatch, fixed-buffer) clean.
+
+---
+
 ## 2026-07-14 — value-optional struct-field designated init dropped the value (emitter.c)
 
 Tracker #22 (source nifty-gates-ubjj9o `fb3315f2` F21). `Cfg c = { .baud = 9600 }` where

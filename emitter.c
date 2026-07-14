@@ -3191,8 +3191,15 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "; ");
                 emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
-                     tmp, tmp, tmp2, tmp, tmp);
+                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                     tmp, tmp, tmp2, tmp);
+                /* Non-native uN/iN target: mask/sign-extend the punned carrier
+                 * (twin of the IR-path fix — the memcpy keeps over-width bits). */
+                if (type_is_nonnative_intn(t)) {
+                    char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
+                    emit_intn_mask_lv(e, t, lv);
+                }
+                emit(e, "_zer_bco%d; })", tmp);
             } else {
                 emit(e, "0");
             }
@@ -6854,7 +6861,19 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, " = (");
                 emit_type(e, tgt_eff);
                 emit(e, "){ ");
-                emit_rewritten_node(e, node->assign.value, func);
+                /* Optional inner is a slice and the RHS is an array: build the
+                 * {ptr,len} slice inside the optional. Without this the array
+                 * decays to ptr-only and .len silently reads 0 (BUG: ?[*]T = arr
+                 * gave a zero-length slice). Covers var-decl-init too — it lowers
+                 * to this same IR_ASSIGN. */
+                Type *oinner = type_unwrap_distinct(tgt_eff->optional.inner);
+                if (oinner && oinner->kind == TYPE_SLICE && val_eff->kind == TYPE_ARRAY) {
+                    emit(e, "("); emit_type(e, oinner); emit(e, "){ ");
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, ", %u }", (unsigned)val_eff->array.size);
+                } else {
+                    emit_rewritten_node(e, node->assign.value, func);
+                }
                 emit(e, ", 1 }");
                 return;
             }
@@ -7131,8 +7150,17 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, "; ");
                 emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
-                     tmp, tmp, tmp2, tmp, tmp);
+                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                     tmp, tmp, tmp2, tmp);
+                /* Non-native uN/iN target: the memcpy copies the full carrier
+                 * (e.g. all 8 bits of a u5's uint8_t), leaving an over-width /
+                 * un-sign-extended value. Mask (uN) or sign-extend (iN) so the
+                 * result is a valid uN/iN — same treatment @truncate applies. */
+                if (type_is_nonnative_intn(t)) {
+                    char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
+                    emit_intn_mask_lv(e, t, lv);
+                }
+                emit(e, "_zer_bco%d; })", tmp);
             }
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
             /* @cast(T, val) → (T)(val) for distinct typedefs */
@@ -9898,7 +9926,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              * Use designated initializers to be robust
                              * to field order in _zer_opt_T struct. */
                             emit(e, ".value = ");
-                            emit_local_name(e, func, inst->call_arg_locals[i]);
+                            /* If the optional inner is a slice and the arg is an
+                             * array, build the {ptr,len} slice — a bare array
+                             * decays to ptr-only, zeroing .len (?[*]T param bug). */
+                            Type *oinner = type_unwrap_distinct(pt->optional.inner);
+                            if (oinner && oinner->kind == TYPE_SLICE &&
+                                at && at->kind == TYPE_ARRAY) {
+                                emit(e, "("); emit_type(e, oinner); emit(e, "){ ");
+                                emit_local_name(e, func, inst->call_arg_locals[i]);
+                                emit(e, ", %u }", (unsigned)at->array.size);
+                            } else {
+                                emit_local_name(e, func, inst->call_arg_locals[i]);
+                            }
                             emit(e, ", .has_value = 1 }");
                         }
                     } else if (at && pt && at->kind == TYPE_ARRAY && pt->kind == TYPE_SLICE) {
@@ -10067,7 +10106,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return (");
                     emit_type(e, ret_eff);
                     emit(e, "){ ");
-                    emit_local_name(e, func, inst->src1_local);
+                    /* Optional inner is a slice and src is an array: build the
+                     * {ptr,len} slice (a bare array decays to ptr-only → .len=0
+                     * on `return arr` from a `?[*]T` function). */
+                    Type *oinner = type_unwrap_distinct(ret_eff->optional.inner);
+                    if (oinner && oinner->kind == TYPE_SLICE &&
+                        src_eff && src_eff->kind == TYPE_ARRAY) {
+                        emit(e, "("); emit_type(e, oinner); emit(e, "){ ");
+                        emit_local_name(e, func, inst->src1_local);
+                        emit(e, ", %u }", (unsigned)src_eff->array.size);
+                    } else {
+                        emit_local_name(e, func, inst->src1_local);
+                    }
                     emit(e, ", 1 };\n");
                 }
             } else if (need_unwrap) {
@@ -10095,6 +10145,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return ");
                     emit_array_as_slice(e, inst->expr, expr_type, ret);
                     emit(e, ";\n");
+                } else if (expr_eff && ret_eff && expr_eff->kind == TYPE_ARRAY &&
+                           ret_eff->kind == TYPE_OPTIONAL && ret_eff->optional.inner &&
+                           type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_SLICE) {
+                    /* `return arr` from a `?[*]T` function where arr is a
+                     * global/static array (a local is rejected by the checker
+                     * escape pass): wrap the {ptr,len} slice in the optional.
+                     * Without this the array fell through to the void branch and
+                     * emitted a bare `return;` → the caller silently saw None. */
+                    emit(e, "return (");
+                    emit_type(e, ret_eff);
+                    emit(e, "){ ");
+                    emit_array_as_slice(e, inst->expr, expr_type,
+                                        type_unwrap_distinct(ret_eff->optional.inner));
+                    emit(e, ", 1 };\n");
                 } else {
                     /* Void expression in return — emit side effect, then bare return */
                     emit_rewritten_node(e, inst->expr, func);
@@ -10973,8 +11037,21 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else if (need_wrap) {
                 emit(e, "(");
                 emit_type(e, dst_eff);
-                emit(e, "){ %s%.*s, 1 };\n",
-                     sp, (int)src->name_len, src->name);
+                emit(e, "){ ");
+                /* Optional inner is a slice and src is an array: build the
+                 * {ptr,len} slice inside the optional. A bare array decays to
+                 * ptr-only, silently zeroing .len (?[*]T = arr / var-decl init). */
+                Type *oinner = type_unwrap_distinct(dst_eff->optional.inner);
+                if (oinner && oinner->kind == TYPE_SLICE &&
+                    src_eff && src_eff->kind == TYPE_ARRAY) {
+                    emit(e, "("); emit_type(e, oinner);
+                    emit(e, "){ %s%.*s, %u }",
+                         sp, (int)src->name_len, src->name,
+                         (unsigned)src_eff->array.size);
+                } else {
+                    emit(e, "%s%.*s", sp, (int)src->name_len, src->name);
+                }
+                emit(e, ", 1 };\n");
             } else if (need_unwrap) {
                 emit(e, "%s%.*s.value;\n",
                      sp, (int)src->name_len, src->name);

@@ -363,6 +363,7 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
 static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
+static bool orelse_block_diverges(Node *n);
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found);
@@ -4694,8 +4695,16 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* BUG-240/377: nested array→slice escape via assignment to global/static.
          * global_s = s.arr where s is local — walk value chain to root.
-         * BUG-377: also check orelse fallback — g_slice = opt orelse local_buf. */
-        if (node->assign.op == TOK_EQ && target && target->kind == TYPE_SLICE) {
+         * BUG-377: also check orelse fallback — g_slice = opt orelse local_buf.
+         * The slice target may be wrapped in an optional (`?[*]T g = buf`) — the
+         * optional previously hid the local-array-slice store from this check,
+         * compiling a dangling global pointer. Unwrap the optional here. */
+        Type *tgt_su = target ? type_unwrap_distinct(target) : NULL;
+        bool tgt_is_slice_like = tgt_su &&
+            (tgt_su->kind == TYPE_SLICE ||
+             (tgt_su->kind == TYPE_OPTIONAL && tgt_su->optional.inner &&
+              type_unwrap_distinct(tgt_su->optional.inner)->kind == TYPE_SLICE));
+        if (node->assign.op == TOK_EQ && tgt_is_slice_like) {
             /* collect value nodes to check: direct value + orelse fallback */
             Node *arr_checks[2] = { NULL, NULL };
             int arr_check_count = 0;
@@ -7065,12 +7074,20 @@ static Type *check_expr(Checker *c, Node *node) {
             result = unwrapped;
         } else if (node->orelse.fallback) {
             if (node->orelse.fallback->kind == NODE_BLOCK) {
-                /* orelse { block } — statement-only, no result type.
-                 * Yield inside: safe at var-decl level (BUG-481 state struct temps).
-                 * Unsafe at expression level — caught by GCC ("switch jumps into
-                 * statement expression"). No checker ban needed. */
+                /* orelse { block } — the block is statement-only; ZER blocks are
+                 * not expressions, so a block that FALLS THROUGH cannot supply the
+                 * unwrapped value on the None path. Historically this relied on GCC
+                 * rejecting a value-position use, but the IR path lowers the block
+                 * to basic blocks with an auto-zeroed result temp, so a fall-through
+                 * block silently yielded 0. Fix: type such an orelse `void` so the
+                 * normal "cannot initialize X with void" / return-type-mismatch
+                 * checks reject value-context use, while a bare-statement
+                 * `f() orelse { ... }` (value discarded) stays legal. A block that
+                 * DIVERGES on every path (return/break/continue/goto) never reaches
+                 * the consumer, so it keeps the unwrapped type. */
                 check_stmt(c, node->orelse.fallback);
-                result = unwrapped;
+                result = orelse_block_diverges(node->orelse.fallback)
+                             ? unwrapped : ty_void;
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
@@ -11718,9 +11735,19 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             /* scope escape: return local array as slice → dangling pointer
-             * BUG-237: walk field/index chains to catch s.arr, s.inner.arr etc. */
-            if (ret_type && ret_type->kind == TYPE_ARRAY &&
-                c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
+             * BUG-237: walk field/index chains to catch s.arr, s.inner.arr etc.
+             * The return target is a slice either directly (`[*]T`) OR wrapped
+             * in an optional (`?[*]T`) — the optional wrapper previously hid the
+             * array-slice-of-local from this check, silently compiling a dangling
+             * pointer / use-after-return. Unwrap the optional here too. */
+            Type *cfr_eff = c->current_func_ret ?
+                type_unwrap_distinct(c->current_func_ret) : NULL;
+            bool ret_target_is_slice = cfr_eff &&
+                (cfr_eff->kind == TYPE_SLICE ||
+                 (cfr_eff->kind == TYPE_OPTIONAL && cfr_eff->optional.inner &&
+                  type_unwrap_distinct(cfr_eff->optional.inner)->kind == TYPE_SLICE));
+            if (ret_type && type_dispatch_kind(ret_type) == TYPE_ARRAY &&
+                ret_target_is_slice) {
                 Node *root = node->ret.expr;
                 while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                     if (root->kind == NODE_FIELD) root = root->field.object;
@@ -15927,6 +15954,30 @@ static bool body_always_exits(Node *body) {
         body->expr_stmt.expr->kind == NODE_ORELSE &&
         (body->expr_stmt.expr->orelse.fallback_is_return ||
          body->expr_stmt.expr->orelse.fallback_is_break)) return true;
+    return false;
+}
+
+/* Does an `orelse { block }` fallback diverge on every control path (so it never
+ * falls through to supply a value)? Handles the tail statement being a
+ * return/break/continue/goto, a nested if with both arms diverging, and an
+ * `orelse return/break/continue` expression-statement tail. Written as an
+ * if-chain (not a kind-switch) so it stays outside the -Wswitch walker audit. */
+static bool orelse_block_diverges(Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_RETURN || n->kind == NODE_BREAK ||
+        n->kind == NODE_CONTINUE || n->kind == NODE_GOTO) return true;
+    if (n->kind == NODE_BLOCK)
+        return n->block.stmt_count > 0 &&
+               orelse_block_diverges(n->block.stmts[n->block.stmt_count - 1]);
+    if (n->kind == NODE_IF)
+        return n->if_stmt.else_body &&
+               orelse_block_diverges(n->if_stmt.then_body) &&
+               orelse_block_diverges(n->if_stmt.else_body);
+    if (n->kind == NODE_EXPR_STMT && n->expr_stmt.expr &&
+        n->expr_stmt.expr->kind == NODE_ORELSE)
+        return n->expr_stmt.expr->orelse.fallback_is_return ||
+               n->expr_stmt.expr->orelse.fallback_is_break ||
+               n->expr_stmt.expr->orelse.fallback_is_continue;
     return false;
 }
 

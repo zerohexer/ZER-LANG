@@ -1,0 +1,15 @@
+// Returning a global/static array as an optional slice `?[*]T` must build the
+// {ptr,len} slice inside the optional — it previously fell through to a bare
+// `return;` and the caller silently saw None. (Local arrays are rejected as
+// dangling; only a global/static array legitimately reaches this path.)
+// Fixed 2026-07-14.
+u8[5] src;
+?[*]u8 mk() { return src; }
+u32 main() {
+    ?[*]u8 s = mk();
+    if (s) |v| {
+        if (v.len == 5) { return 0; }  // slice, not None; correct length
+        return 1;
+    }
+    return 2;  // None => miscompile
+}

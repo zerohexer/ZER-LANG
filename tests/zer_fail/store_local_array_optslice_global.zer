@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Storing a local array as an OPTIONAL slice `?[*]T` into a global is a dangling
+// pointer, exactly like the non-optional `[*]T` global store. The optional
+// wrapper previously hid it from the escape check. Fixed 2026-07-14.
+?[*]u8 g;
+void f() {
+    u8[5] buf;
+    g = buf;
+}
+u32 main() { f(); return 0; }

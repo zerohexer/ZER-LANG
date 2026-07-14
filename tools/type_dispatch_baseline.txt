@@ -721,3 +721,19 @@ zercheck_ir.c:if (!pp->type || pp->type->kind != TYNODE_NAMED) continue;
 # locals (si_eff / ft_eff = type_unwrap_distinct(...)). Documented-safe.
 emitter.c:if (!ft_eff || ft_eff->kind != TYPE_OPTIONAL) return NULL;
 emitter.c:if (!si_eff || si_eff->kind != TYPE_STRUCT) return NULL;
+# audit 2026-07-14: ?[*]T optional-slice coercion + escape fixes. All reads below
+# are on ALREADY-UNWRAPPED _eff locals (cfr_eff/tgt_su/at/oinner/val_eff/ret_eff/
+# expr_eff = type_unwrap_distinct(...)) or explicit type_unwrap_distinct(...)->kind
+# / .inner reads. Documented-safe; double-unwrapping an _eff local is churn (CLAUDE).
+checker.c:(cfr_eff->kind == TYPE_OPTIONAL && cfr_eff->optional.inner &&
+checker.c:(cfr_eff->kind == TYPE_SLICE ||
+checker.c:(tgt_su->kind == TYPE_OPTIONAL && tgt_su->optional.inner &&
+checker.c:(tgt_su->kind == TYPE_SLICE ||
+checker.c:type_unwrap_distinct(cfr_eff->optional.inner)->kind == TYPE_SLICE));
+checker.c:type_unwrap_distinct(tgt_su->optional.inner)->kind == TYPE_SLICE));
+emitter.c:at && at->kind == TYPE_ARRAY) {
+emitter.c:if (oinner && oinner->kind == TYPE_SLICE &&
+emitter.c:if (oinner && oinner->kind == TYPE_SLICE && val_eff->kind == TYPE_ARRAY) {
+emitter.c:ret_eff->kind == TYPE_OPTIONAL && ret_eff->optional.inner &&
+emitter.c:type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_SLICE) {
+emitter.c:} else if (expr_eff && ret_eff && expr_eff->kind == TYPE_ARRAY &&

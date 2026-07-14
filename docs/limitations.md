@@ -138,6 +138,38 @@ absent from main.
 
 ---
 
+## OPEN — compiler build warnings: dead functions + a few latent hazards (LOW, tech-debt; no soundness impact)
+
+Surfaced during the 2026-07-14 audit sweep. The `make zerc` build is not
+warning-clean; none affect a shipped safety decision, but they should be cleaned
+in a focused pass (kept out of the audit-fix commit to keep that diff reviewable):
+
+- **Dead `static` functions** (`-Wunused-function`), confirmed unreferenced within
+  their TU: `has_atomic_or_barrier` (checker.c ~9561, comment marks it "LEGACY
+  wrapper — uses FuncProps internally now"), `stmt_writes_shared` /
+  `shared_needs_condvar` / `find_shared_root_in_stmt` / `collect_async_locals`
+  (emitter.c — superseded by the ir_lower.c per-statement lock emission),
+  `classify_builtin_call` (ir_lower.c), `ir_classify_method_call` (zercheck_ir.c —
+  superseded by the `_ex` variant). Each is safe to delete; verify with
+  `-Wunused-function` after removal. NOT accidentally-disconnected safety logic —
+  the live replacements exist (spot-checked `has_atomic_or_barrier` → FuncProps).
+- **`ir_lower.c:867` `-Wreturn-type`** — `lower_expr`'s NodeKind switch is
+  `-Werror=switch`-exhaustive and every case returns, so control only "reaches end"
+  on a corrupted (out-of-range) `expr->kind`; add a trailing `return -1;` to silence
+  and harden.
+- **`zercheck_ir.c:4996` `%.*s` with a `size_t` precision arg** — technically UB in
+  the varargs slot; behind `getenv("IR_SUMMARY_DEBUG")` (debug-only), works on
+  x86-64 for small lengths. Cast the precision to `int`.
+- **`ir.c:697` `-Walloc-size-larger-than=`** — `calloc(func->block_count, …)` where
+  the analyzer sees a wrapped range; benign in practice (block_count is small), but
+  a guarded cast would quiet it.
+
+These are the `bool ok` dead-store at checker.c:16387 (return uses `error_count`, so
+`ok` is harmless dead code) and friends — cosmetic, tracked here so a future session
+knows they were seen and triaged, not missed.
+
+---
+
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 
 Native arbitrary-width integers `uN`/`iN` shipped (BUGS-FIXED.md 2026-07-09,

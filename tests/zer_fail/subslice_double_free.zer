@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Freeing a heap slice and then freeing a subslice-view of it. 2026-07-09 [B].
+u32 main() {
+    [*]u8 b = alloc(u8, 16) orelse return;
+    [*]u8 sub = b[0..4];
+    free(b);
+    free(sub);
+    return 0;
+}

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// A subslice base[a..b] of a heap slice is a VIEW sharing the base's lifetime.
+// Using it after the base is freed is a use-after-free (ASan-confirmed). The
+// subslice must inherit the base's alloc_id. 2026-07-09 [B].
+u32 main() {
+    [*]u8 b = alloc(u8, 16) orelse return;
+    [*]u8 sub = b[0..4];
+    free(b);
+    sub[0] = 1;
+    return 0;
+}

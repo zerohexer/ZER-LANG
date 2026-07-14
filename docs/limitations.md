@@ -15,7 +15,7 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41), 22 remaining.**
++ §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id), 21 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -41,9 +41,13 @@ binary regen). To inspect any fix: `git show <sha>`.
 | nifty-gates-ziwscu | 54ecfc9e | 586507fb, a8968db0, ce9af8cb (+56497f28 doc) |
 
 ### A. Memory safety — UAF / double-free / move (🔴; absent in main)
+**✅ DONE: #1 subslice of a heap slice inherits the base `alloc_id` — view UAF/double-free
+now caught (var-decl + assign forms; walk RHS to root IDENT, alias iff `alloc_id != 0` so
+param/stack subslice untouched); `8d9514f3`, tests `subslice_{uaf,double_free,alive_ok}`,
+per-sink-matrix verified (param-subslice + alive-subslice compile; base-direct UAF still
+caught); 2026-07-15. make check 936/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
-| 1 | subslice of heap slice inherits base `alloc_id` (view UAF/DF) | 8d9514f3 | zercheck_ir.c |
 | 2 | cross-fn slice-param free tracked (`frees_param` += TYPE_SLICE) | bf29ffdc | zercheck_ir.c |
 | 3 | reject `free()` of non-heap (stack/arena/local-array) slice | bf29ffdc | checker.c |
 | 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |

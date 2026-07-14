@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — subslice of a heap slice inherits the base alloc_id (UAF/double-free) (zercheck_ir.c)
+
+Tracker §A #1 (source gifted-noether-5ergto `8d9514f3`). A subslice `sub = base[a..b]` of a
+tracked HEAP slice is a VIEW sharing the base's lifetime, but the zercheck_ir `IR_ASSIGN`
+handler registered alloc_id aliases only for `NODE_FIELD`/`NODE_INDEX` RHS (and `IR_CAST`),
+never `NODE_SLICE`. So `free(b); sub[0] = 1` and `free(b); free(sub)` compiled clean
+(ASan: heap-use-after-free / double-free) while the base-direct `free(b); b[0]=1` was caught
+— the UAF-through-a-view case `universal_alloc.md` §7.2 relies on.
+
+Fix (IR_ASSIGN, both var-decl-init `[*]u8 s = b[a..b]` and plain-assign `s = b[a..b]` forms):
+walk the RHS through slice/index steps to a root IDENT (bail on a FIELD — a compound base
+needs compound-key resolution, conservative = no alias); if the root has a tracked heap
+handle (`alloc_id != 0`), alias the destination to the base via
+`ir_snapshot_alias`/`ir_apply_alias` (+ inherit its state). Guarded on `alloc_id != 0`, so a
+subslice of a param/stack slice (no handle) is untouched.
+
+**Per-sink-matrix verification** (memory-safety discipline): UAF-view + double-free-view
+rejected (var-decl AND assign forms); alive-subslice + param-subslice (no handle) both
+compile+run (no over-reject); base-direct UAF still caught (no regression). Tests:
+`tests/zer_fail/{subslice_uaf,subslice_double_free}.zer`, `tests/zer/subslice_alive_ok.zer`.
+make check 936/0, all gates OK.
+
+---
+
 ## 2026-07-15 — @inttoptr aggregate span/alignment used type_width=0 (checker.c, emitter.c)
 
 Tracker #38 (source gifted-noether-jfrmer `5a6889df` F4). `@inttoptr`'s mmio range-overflow

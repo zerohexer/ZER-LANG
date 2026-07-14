@@ -15,7 +15,7 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ #33 `type_name` overflow, #34 `(*ptr & mask)`, #35 defer-abort), 29 remaining.**
++ §F crashes #32/#33/#34/#35), 28 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -112,10 +112,10 @@ heuristic misparses `(*ptr) + 3`) — all 8 QEMU examples parse again (2026-07-1
 + auto-guarded index compiler abort — `emit_defers_from` now fires the pending IR defers
 via `cur_ir_func` instead of `abort()`ing (`66332d39` #6, chosen over `a3e1f66c`'s per-site
 `emit_pending_ir_defers`; 2026-07-15). Tests `paren_deref_expr`, `defer_autoguard_earlyexit`.
-make check 925/0.**
-| # | Fix | Proper source (sha) | Files | Main |
-|---|---|---|---|---|
-| 32 | parser DoS: `parse_type` + prefix-modifier depth guard | a8968db0 (A7-13) | parser.c | ⚠️ partial (expr guard only) |
+make check 925/0. #32 parser stack-overflow DoS — `parse_type` + `parse_unary` wrapped in a
+shared `p->depth` guard (limit 256); deep `****…`/`----…`/`Box(Box(…))` now report "nesting
+too deep" instead of SIGSEGV (`a8968db0` A7-13; main already guarded `parse_primary`); tests
+`parser_deep_{type,unary}_recursion`; 2026-07-15. make check 927/0. **§F fully done.**
 
 ### G. Bare-metal / ISR / qualifier (absent)
 | # | Fix | Proper source (sha) | Files |
@@ -135,13 +135,15 @@ make check 925/0.**
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ✅ §D (miscompiles #17–#25), #33/#34/#35 (§F crashes) all landed
-2026-07-13/15. Remaining highest-value: #32 parser DoS (parse_type/prefix — main has only
-the expr-depth guard), then the memory-safety cluster (§A UAF/double-free, §B escape
-sinks — the higher-stakes fixes: they land in the same `zercheck_ir.c`/`checker.c` regions,
-several are conflict-group siblings, and a mistake there is a shipped UAF not an
-over-reject; verify each against the full escape-sink matrix per CLAUDE.md). All verified
-absent from main.
+**Next up (start here):** ✅ §D (miscompiles #17–#25) and §F (crashes/robustness
+#32/#33/#34/#35) FULLY DONE (2026-07-13/15). Remaining = the higher-stakes memory-safety
+clusters: §A UAF/double-free (#1–#7), §B escape sinks (#8–#12), §C VRP/bounds (#13–#16),
+§E concurrency (#26–#31), §G bare-metal/ISR (#36–#41). **Extra care required** — these land
+in the same `zercheck_ir.c`/`checker.c` regions (conflict-group siblings), and a mistake is
+a shipped UAF, not an over-reject; verify each against the full escape-sink matrix per
+CLAUDE.md "Escape/keep analysis is a PER-SINK PATCHWORK". §G (bare-metal, #36–#41) is
+lower-stakes (mostly `#error`/clobber/ISR-ban tightening) and could go before §A/§B. All
+verified absent from main.
 
 ---
 

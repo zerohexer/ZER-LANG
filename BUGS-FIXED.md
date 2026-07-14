@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — parser stack-overflow DoS: parse_type / parse_unary depth guard (parser.c)
+
+Tracker #32 (source nifty-gates-ziwscu `a8968db0` A7-13). `parse_type` and `parse_unary`
+recursed on every prefix modifier / operator with NO native-stack guard, so deep
+`****…u32` / `??…` / `[][]…` / `Box(Box(…))` / `*(*(…))` / `------…1` input overflowed the
+C stack (SIGSEGV) *before* the checker's AST-level nesting guard could fire — a
+batch-compile DoS and (same parser) an LSP/WASM-CLI crash. Main already had an
+expression-depth guard in `parse_primary` (for `(((…)))`), but `parse_type` and
+`parse_unary` were unguarded.
+
+Fix: wrap both in a thin guard (`parse_type`→`parse_type_inner`, `parse_unary`→
+`parse_unary_inner`) sharing `p->depth` with `parse_precedence`/`parse_primary` (combined
+nesting bound 256, balanced inc/dec). On overflow: report "nesting too deep" and return an
+error node (`TYNODE_VOID` / dummy `NODE_INT_LIT`) instead of crashing.
+
+Verified: deep input now exits with a clean "nesting too deep" error (exit 1, **not** 139
+SIGSEGV); a shallow `***u32` type does not trip the guard. (Only the parser A7-13 half of
+`a8968db0` is taken here; its A7-6 `@critical` clobber = tracker #36, separate.)
+
+Tests: `tests/zer_fail/{parser_deep_type_recursion,parser_deep_unary_recursion}.zer`
+(300-deep `*`/`-`). make check 927/0. Tracker #32 retired.
+
+---
+
 ## 2026-07-15 — defer + auto-guarded index no longer aborts the compiler (emitter.c, emitter.h)
 
 Tracker #35 (source nifty-gates-jkaz5c `66332d39` #6). The extremely common

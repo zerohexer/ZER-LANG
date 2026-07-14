@@ -2345,11 +2345,12 @@ When starting a new session or lacking context:
 fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
 soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
 merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 12 landed
-2026-07-13/15 (§D miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||` short-circuit,
-optional-None, designated-init, `@saturate`, signed-comptime, float-`_`; + §F crashes #33
-`type_name` overflow, #34 `(*ptr & mask)`, #35 defer-abort); 29 remaining. Next: #32 parser
-DoS, then the higher-stakes memory-safety cluster (§A UAF/double-free, §B escape sinks).
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 13 landed
+2026-07-13/15 — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 both FULLY DONE
+(uN/iN trio, `&&`/`||` short-circuit, optional-None, designated-init, `@saturate`,
+signed-comptime, float-`_`; `type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS);
+28 remaining. Next: §G bare-metal (#36–#41, lower-stakes), then the higher-stakes
+memory-safety clusters §A/§B/§C/§E (shipped-UAF risk — verify per-sink matrix).
 
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)

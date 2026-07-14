@@ -1167,6 +1167,20 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* Ring/Pool/Slab element-store escape (the "rare unverified sink" noted in
+ * BUG-764): pushing a BY-VALUE element into a GLOBAL container (Ring is always
+ * global) copies the element's bytes into storage that outlives the frame. If
+ * the element type carries a data pointer AND the pushed argument is
+ * local/arena-derived, that pointer dangles after the function returns — the
+ * exact escape the store-to-global sink catches for `g = m`, but the container
+ * push sink historically did not consult. Gated on `type_carries_data_pointer`
+ * so a pure-value element (no pointer to dangle) is never over-rejected. */
+static bool container_push_arg_escapes(Checker *c, Type *elem, Node *arg) {
+    if (!elem || !arg) return false;
+    if (!type_carries_data_pointer(elem, 0)) return false;
+    return arg_is_local_derived(c, arg, 0);
+}
+
 /* AU-3/AU-4 (2026-07-01): does a struct/union literal carry a pointer/slice
  * to a function-local, at ANY nesting depth? Returns true for a field value
  * that is &local (Case A), an is_local_derived alias ident (B), a slice over a
@@ -5540,6 +5554,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
+                        if (container_push_arg_escapes(c, elt, node->call.args[0]))
+                            checker_error(c, node->loc.line,
+                                "cannot push a local-derived pointer through Ring channel — "
+                                "the pointer dangles once this function returns "
+                                "(the Ring outlives the frame). Push a copy of the data, "
+                                "not a pointer to a local");
                     }
                     result = ty_void;
                     typemap_set(c, field_node,result);
@@ -5559,6 +5579,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
+                        if (container_push_arg_escapes(c, elt, node->call.args[0]))
+                            checker_error(c, node->loc.line,
+                                "cannot push a local-derived pointer through Ring channel — "
+                                "the pointer dangles once this function returns "
+                                "(the Ring outlives the frame). Push a copy of the data, "
+                                "not a pointer to a local");
                     }
                     result = type_optional(c->arena, ty_void);
                     typemap_set(c, field_node,result);

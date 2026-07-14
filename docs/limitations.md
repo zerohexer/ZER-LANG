@@ -18,8 +18,9 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 + §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id,
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
-escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX NOW CLEAN**),
-15 remaining.**
+escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
+Ring.push element-store escape), **~15 remaining** (§A #4–#7, §B #11, §B #13 spawn-by-value
+[re-scoped from #12], §C #13–#16, §E #27–#31).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -86,11 +87,16 @@ check 951/0. #8 optional/array/nested-slice pointer-carrier escape — shared
 (both via the precise `type_carries_data_pointer`, so `?u32`/scalar arrays stay excluded);
 `5a6889df` F1/F3 + `586507fb` D1, tests `escape_{nested_slice,optional_ptr_field}_launder` +
 `array_field_launder_escape` + positive `optional_ptr_field_global_ok`; 2026-07-15. make check
-955/0. **🎯 SINK MATRIX CLEAN (25 ok / 0 holes) — every escape/free hole closed.**
+955/0. **🎯 SINK MATRIX CLEAN — every escape/free hole closed.** #12 Ring.push of a
+local-derived pointer element — a Ring is always global, so `rx.push(m)` where `m.p = &local`
+dangles once the frame returns; new `container_push_arg_escapes` rejects at `push`/`push_checked`
+(gated on `type_carries_data_pointer` so a pure-value element compiles); `a3e1f66c`, matrix
+cell `p8__k8_ring_push` + baseline `safe_ring_value` (matrix now **27 ok / 0 holes**); tests
+`ring_push_local_escape` + `ring_push_value_ok`; 2026-07-15. make check 957/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
-| 12 | Ring.push / spawn of by-value aggregate carrying ptr-to-local | a3e1f66c | checker.c |
+| 13 | 🔴 OPEN (re-scoped from #12): spawn-by-value-aggregate — `Msg m; m.p=&local; spawn worker(m)` COMPILES. Store of `&local` into field `m.p` taints the field/compound-key (read-side sinks catch `g=m.p`) but NOT the parent SYMBOL `m`, which `spawn_arg_is_stack_derived` checks. Neither §B #9 nor a3e1f66c @@ -4096 fixes it (both set `tsym->is_local_derived`, but `tsym` for a field-target `m.p=&local` is not the parent `m`). Fix: on `o.field=&local` also taint the parent symbol, OR make `spawn_arg_is_stack_derived` consult field-level taint. | (new) | checker.c |
 
 ### C. VRP / bounds — silent OOB (🔴; absent)
 | # | Fix | Proper source (sha) | Files |
@@ -195,14 +201,15 @@ with un-taken halves already shipped (`66332d39` #4 frame-local free = §A ..; `
 already shipped). All verified absent from main.
 
 ### Per-sink verification matrix (`tools/sink_matrix.sh`) — RUN AFTER EVERY §A/§B/§C fix
-`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (25 cells)
+`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (27 cells)
 and classifies each: **ok** / **HOLE** (compiles but should reject = a shipped UAF/dangling
 escape) / **OVER-REJECT** (rejects a safe program). This is the regression baseline for the
 memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix must flip its
-own cell(s) to ok AND leave every other cell unchanged. **🎯 CLEAN 2026-07-15: 25 ok, 0 HOLES,
-0 over-rejects** (started this session at 17 ok / 6 HOLES @ 23 cells). ALL escape/free holes
-closed: `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9, added+closed), the 3 `p7×`
-optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step (§B #8). **WIRED into `make check`**
+own cell(s) to ok AND leave every other cell unchanged. **🎯 CLEAN 2026-07-15: 27 ok, 0 HOLES,
+0 over-rejects** (started this session at 17 ok / 6 HOLES @ 23 cells; grew to 27 as fixes added
+cells). ALL escape/free holes closed: `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9),
+the 3 `p7×` optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step (§B #8), `p8__k8_ring_push`
+(§B #12). **WIRED into `make check`**
 as a permanent gate 2026-07-15 (`make check` runs `tools/sink_matrix.sh ./zerc` after the
 build audits; standalone: `make check-sink-matrix`). **Add a new cell whenever a new
 escape/free sink or value shape is introduced** — the gate then enforces it forever; a fix

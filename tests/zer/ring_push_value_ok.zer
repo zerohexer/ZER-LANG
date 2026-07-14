@@ -1,0 +1,11 @@
+// Positive (no over-reject): pushing a pure-VALUE element (no pointer field)
+// through a Ring is fine — container_push_arg_escapes is gated on
+// type_carries_data_pointer, so a value-only element is never over-rejected.
+struct VMsg { u32 a; u32 b; }
+Ring(VMsg, 8) vrx;
+u32 main() {
+    VMsg m;
+    m.a = 1; m.b = 2;
+    vrx.push(m);
+    return 0;
+}

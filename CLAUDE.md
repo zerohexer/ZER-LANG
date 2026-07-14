@@ -2348,11 +2348,13 @@ merged to main) — with the proper version + commit sha per bug. Don't re-deriv
 consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **26 landed
 2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
 #36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit (§A #1/#2/#3, §B #10, §E #26); + §B #9
-reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier escape. **🎯 THE
-PER-SINK ESCAPE/FREE MATRIX (`tools/sink_matrix.sh`) IS NOW CLEAN — 25 ok / 0 holes** (every
-memory-safety hole this session's matrix surfaced is closed). **15 remaining** = §A #4–#7, §B
-#11/#12, §C VRP/bounds (#13–#16), §E #27–#31 (shipped-UAF risk); these are no longer matrix
-cells, so order by risk (see limitations.md tracker). **`tools/sink_matrix.sh` is now a
+reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier escape + §B #12
+Ring.push element-store escape. **🎯 THE PER-SINK ESCAPE/FREE MATRIX (`tools/sink_matrix.sh`)
+IS CLEAN — 27 ok / 0 holes** (every memory-safety hole this session's matrix surfaced is
+closed). **~15 remaining** = §A #4–#7, §B #11, §B #13 (spawn-by-value-aggregate, re-scoped
+from #12 — store of `&local` into a field taints the field but not the parent symbol that
+`spawn_arg_is_stack_derived` checks), §C VRP/bounds (#13–#16), §E #27–#31 (shipped-UAF risk);
+order by risk (see limitations.md tracker). **`tools/sink_matrix.sh` is now a
 permanent `make check` gate** (runs after the build audits; standalone `make check-sink-matrix`)
 — every remaining escape fix must keep it CLEAN + add a cell for its own shape. The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,

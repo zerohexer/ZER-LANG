@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — Ring.push of a local-derived pointer element escapes into the global Ring (checker.c)
+
+Tracker §B #12 (Ring.push half; source `a3e1f66c`). A Ring is ALWAYS global, so `rx.push(m)`
+copies the element bytes into storage that outlives the frame. If the element type carries a
+data pointer AND the pushed value is local/arena-derived (`Msg m; m.p = &local; rx.push(m)`),
+that pointer dangles after the function returns — the exact escape the store-to-global sink
+catches for `g = m`, but the Ring element-store sink only *warned* (channel safety), never
+rejected. Added `container_push_arg_escapes(c, elem, arg)` (elem `type_carries_data_pointer`
+AND arg `arg_is_local_derived`) at both `push` and `push_checked` sinks → compile error.
+Gated on `type_carries_data_pointer` so a pure-value element (`Ring(VMsg,8)` of `{u32 a; u32 b}`)
+is never over-rejected.
+
+Per-sink matrix: added cell `p8__k8_ring_push` (rejects) + `safe_ring_value` baseline
+(compiles) → still CLEAN (27 ok / 0 holes). Tests: `tests/zer_fail/ring_push_local_escape.zer`,
+`tests/zer/ring_push_value_ok.zer`. make check 957/0.
+
+**NOT closed here (re-scoped, now OPEN):** the tracker paired this with "spawn of a by-value
+struct carrying a ptr-to-local". `spawn_arg_is_stack_derived` already exists in main and checks
+the arg symbol's `is_local_derived`, BUT `Msg m; m.p = &local; spawn worker(m)` still compiles
+— because storing `&local` into a *field* `m.p` does not taint the *parent symbol* `m` as
+local-derived (only the field/compound-key is tainted, which the read-side sinks consult but
+`spawn_arg_is_stack_derived` does not). Neither §B #9's block nor a3e1f66c's @@ -4096 hunk fixes
+it (both set `tsym->is_local_derived`, but `tsym` for a field-target `m.p = &local` is not the
+parent `m`). Logged in docs/limitations.md as a distinct open hole (store-side parent-symbol
+taint gap).
+
+---
+
 ## 2026-07-15 — optional/array/nested-slice pointer-carrier escape — SINK MATRIX NOW CLEAN (checker.c)
 
 Tracker §B #8 (sources `5a6889df` F1/F3 + `586507fb` D1 + a sink-matrix-driven completion).

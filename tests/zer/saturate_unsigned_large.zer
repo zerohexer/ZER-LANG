@@ -1,0 +1,8 @@
+// @saturate to unsigned target from a large unsigned source must clamp to max, not 0
+u32 main() {
+    u64 big = 18000000000000000000;
+    for (u32 k = 0; k < 1; k += 1) { big += 0; }
+    u32 s = @saturate(u32, big);
+    if (s == 4294967295) { return 0; }
+    return 1;
+}

@@ -13,7 +13,9 @@ found + fixed overlapping soundness / miscompile / crash holes. **NONE are merge
 main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
 regression-test file is absent from main; signature helpers absent). The heavy overlap is
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
-dedup — **8 landed (uN/iN trio #17/#18/#19, #20 `&&`/`||` short-circuit, #21 optional-None, #22 designated-init, #33 `type_name` overflow, #34 `(*ptr & mask)` regression), 33 remaining.**
+dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
+short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
++ #33 `type_name` overflow, #34 `(*ptr & mask)`), 30 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -84,11 +86,13 @@ make check 919/0. #22 (2026-07-14): value-optional struct-field designated-init 
 the value (`{.baud=9600}` on a `?u32` field → `has_value=0`, so `orelse` took the
 fallback); fb3315f2's shared `struct_init_opt_wrap_type` wraps the scalar `{val,1}` on all
 3 struct-init emission paths (test `optional_field_designated_init`; make check 921/0).
-| # | Fix | Proper source (sha) | Files | Main |
-|---|---|---|---|---|
-| 23 | `@saturate` unsigned from ≥2^63 source | a3e1f66c | emitter.c | absent |
-| 24 | signed comptime return sign-extended | a3e1f66c | checker.c | absent |
-| 25 | float literal digit-group `_` not truncated | f40ca06b (F8-parser) | parser.c | absent |
+**#23/#24/#25 (2026-07-14):** `@saturate` unsigned from a ≥2^63 source returned 0 (the
+`(int64_t)` clamp misread it — now compared in the source's own type; a3e1f66c);
+signed comptime return not sign-extended → comptime-if compiled the wrong branch
+(checker.c, a3e1f66c); float literal digit-group `_` truncated at `strtod` — strip before
+parsing (parser.c, f40ca06b F8). Tests
+`saturate_unsigned_large`/`comptime_signed_return`/`float_underscore_literal`. make check
+924/0. **§D fully done.**
 
 ### E. Concurrency (🔴/🟠; absent)
 | # | Fix | Proper source (sha) | Files |
@@ -129,11 +133,10 @@ again. Test `paren_deref_expr`. make check 920/0.**
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ~~uN/iN trio #17/#18/#19, #20 short-circuit, #21 optional-None,
-#22 designated-init, #33 `type_name` overflow, #34 `(*ptr & mask)`~~ ✅ landed 2026-07-13/14.
-Remaining highest-value: #35 defer+auto-guard compiler abort, #23 `@saturate` unsigned,
-#24 signed-comptime-return, #25 float-underscore literal, #32 parser DoS (parse_type/prefix
-— main has only the expr-depth guard), and the memory-safety cluster (§A/§B). All verified
+**Next up (start here):** ✅ §D (miscompiles #17–#25), #33, #34 all landed 2026-07-13/14.
+Remaining highest-value: #35 defer+auto-guard compiler abort (crash), #32 parser DoS
+(parse_type/prefix — main has only the expr-depth guard), and then the memory-safety
+cluster (§A UAF/double-free, §B escape sinks — the higher-stakes fixes). All verified
 absent from main.
 
 ---

@@ -6237,6 +6237,15 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (w > 0 && w < 64) {
                                     uint64_t mask = (1ULL << w) - 1ULL;
                                     val = (int64_t)((uint64_t)val & mask);
+                                    /* SIGN-EXTEND for a signed return type: the mask
+                                     * above zero-extends, so a signed comptime result
+                                     * whose type-width sign bit is set (e.g. `comptime
+                                     * i16 F(){ return 40000; }` → -25536) stayed
+                                     * POSITIVE, silently flipping a `comptime if (F() <
+                                     * 0)` to the wrong branch (wrong code emitted). */
+                                    if (type_is_signed(ret_ty_check) &&
+                                        (val & (1LL << (w - 1))))
+                                        val |= (int64_t)(~mask);
                                 }
                             }
                             node->call.comptime_value = val;

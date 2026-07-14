@@ -5,6 +5,38 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-14 — three wrong-value miscompiles: `@saturate` unsigned, signed comptime-return, float underscores (emitter.c, checker.c, parser.c)
+
+Tracker #23 + #24 + #25 (independent; one pass). Sources: nifty-gates-m0v91c `a3e1f66c`
+(#23, #24) + nifty-gates-ubjj9o `f40ca06b` F8 (#25). All three silently produced wrong
+values.
+
+**#23 `@saturate` to an unsigned target from a ≥2⁶³ source returned 0** (emitter.c IR
+path). The clamp compared `(int64_t)_zer_sat`, which misread a large UNSIGNED source
+(e.g. `@saturate(u32, 18e18)`) as negative → clamped to 0 instead of the target max.
+`_zer_sat` is `__auto_type` (the source's own type), so the comparisons must be done in
+that type: a bare `_zer_sat < 0` is always-false for an unsigned source (no lower clamp)
+and correct for a signed one. Now uses width-specific max constants and no `(int64_t)`
+cast — mirrors the AST path. `@saturate(u32, 18e18)` → 4294967295.
+
+**#24 signed comptime return not sign-extended → comptime-if took the wrong branch**
+(checker.c). After masking a comptime result to the return-type width, a signed result
+whose type-width sign bit was set (e.g. `comptime i16 F(){ return 40000; }` → should be
+-25536) stayed POSITIVE, so `comptime if (F() < 0)` silently compiled the wrong branch.
+Added a sign-extend (`val |= ~mask`) when `type_is_signed(ret_ty_check)` and the sign
+bit is set.
+
+**#25 float literal digit-group `_` truncated the value** (parser.c). The lexer accepts
+`_` in float literals (`1_000.5`, `1e1_0`), but `strtod` on the raw token STOPS at the
+first `_` → `1_000.5` parsed as `1.0`. Copy the token minus underscores into a
+NUL-terminated buffer (stack-first, arena overflow) before `strtod`. (Integer literals
+already stripped underscores.)
+
+Tests: `tests/zer/{saturate_unsigned_large,comptime_signed_return,float_underscore_literal}.zer`.
+make check 924/0. Tracker #23/#24/#25 retired.
+
+---
+
 ## 2026-07-14 — value-optional struct-field designated init dropped the value (emitter.c)
 
 Tracker #22 (source nifty-gates-ubjj9o `fb3315f2` F21). `Cfg c = { .baud = 9600 }` where

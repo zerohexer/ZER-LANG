@@ -7110,12 +7110,22 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                              tmp, (long long)max_v, (long long)max_v);
                     }
                 } else {
-                    /* Unsigned target: clamp below 0 AND above max */
-                    uint64_t max_v = w >= 64 ? UINT64_MAX : ((1ULL << w) - 1);
-                    emit(e, "(int64_t)_zer_sat%d < 0 ? 0 : "
-                             "(int64_t)_zer_sat%d > %lluLL ? (%lluULL) : (",
-                         tmp, tmp, (unsigned long long)max_v,
-                         (unsigned long long)max_v);
+                    /* Unsigned target: clamp below 0 AND above max. The lower/upper
+                     * comparisons MUST be done in the SOURCE's own type — the old
+                     * `(int64_t)_zer_sat` cast misread a large UNSIGNED source (value
+                     * >= 2^63, e.g. `@saturate(u32, 18e18)`) as negative, clamping it
+                     * to 0 instead of the target max. `_zer_sat` is `__auto_type` (the
+                     * source type), so a bare `_zer_sat < 0` is always-false for an
+                     * unsigned source (no lower clamp) and true for a signed source
+                     * (BUG-546). Mirrors the AST path (emitter.c ~3040). */
+                    const char *max_cmp, *max_val;
+                    if (w == 8)       { max_cmp = "255";                    max_val = "255"; }
+                    else if (w == 16) { max_cmp = "65535";                  max_val = "65535"; }
+                    else if (w == 32) { max_cmp = "4294967295ULL";          max_val = "4294967295U"; }
+                    else              { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
+                    emit(e, "_zer_sat%d < 0 ? 0 : "
+                             "_zer_sat%d > %s ? (%s) : (",
+                         tmp, tmp, max_cmp, max_val);
                 }
                 emit_type(e, t);
                 emit(e, ")_zer_sat%d; })", tmp);

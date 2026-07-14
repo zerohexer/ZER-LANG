@@ -9951,7 +9951,24 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         return false;
     }
     case NODE_ORELSE:
-        return scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len);
+        /* BUG-772: both sides of an orelse can read a global. The primary .expr
+         * was scanned; .fallback (`maybe() orelse g`) was silently dropped —
+         * a spawned thread reading a global via the fallback raced clean. */
+        if (scan_unsafe_global_access(c, node->orelse.expr, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->orelse.fallback, out_name, out_len);
+    case NODE_TYPECAST:
+        /* wrapper: `(u32)g` hides the global read from the spawn race scan */
+        return scan_unsafe_global_access(c, node->typecast.expr, out_name, out_len);
+    case NODE_SLICE:
+        /* wrapper: `g_arr[a..b]` reads g_arr (and its bounds) */
+        if (scan_unsafe_global_access(c, node->slice.object, out_name, out_len)) return true;
+        if (scan_unsafe_global_access(c, node->slice.start, out_name, out_len)) return true;
+        return scan_unsafe_global_access(c, node->slice.end, out_name, out_len);
+    case NODE_STRUCT_INIT:
+        /* wrapper: `P{ .x = g }` reads g in a field initializer */
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            if (scan_unsafe_global_access(c, node->struct_init.fields[i].value, out_name, out_len)) return true;
+        return false;
     case NODE_DEFER:
         return scan_unsafe_global_access(c, node->defer.body, out_name, out_len);
     case NODE_SWITCH:
@@ -9973,8 +9990,11 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_AWAIT: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    /* NODE_IDENT handled above the switch; NODE_CAST is vestigial (unused,
+     * see ir_lower.c); NODE_SIZEOF operand is a compile-time type. NODE_SLICE
+     * / NODE_TYPECAST / NODE_STRUCT_INIT now recurse above (were wrapper-blind
+     * leaves that hid a global read from the spawn data-race scan). */
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
     return false;

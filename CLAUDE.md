@@ -2345,15 +2345,15 @@ When starting a new session or lacking context:
 fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
 soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
 merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **22 landed
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **23 landed
 2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
 #36–#41 ALL FULLY DONE, + §A #1 subslice-alloc_id + §A #3 free-non-heap-slice + §B #10
-assign-slice-of-local escape (uN/iN trio, `&&`/`||` short-circuit, optional-None,
-designated-init, `@saturate`, signed-comptime, float-`_`; `type_name` overflow,
-`(*ptr & mask)`, defer-abort, parser DoS; `@critical` clobber, mode-transition `#error`, ISR
-bans, mmio-span, `@container`-const; slice escape/free); **19 remaining** = the memory-safety
-cluster §A #2/#4–#7, §B escape sinks #8/#9/#11/#12, §C VRP/bounds, §E concurrency (shipped-UAF
-risk). The
+assign-slice-of-local escape + §E #26 spawn-scan wrapper-blind (uN/iN trio, `&&`/`||`
+short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
+`type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS; `@critical` clobber,
+mode-transition `#error`, ISR bans, mmio-span, `@container`-const; slice escape/free,
+spawn-scan); **18 remaining** = the memory-safety cluster §A #2/#4–#7, §B escape sinks
+#8/#9/#11/#12, §C VRP/bounds, §E #27–#31 (shipped-UAF risk). The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,
 `orelse return` is bare, a neg-test non-zero exit ≠ intended rejection / could be SIGSEGV,
 baseline new `_eff->kind` sites, make check FOREGROUND) are in **compiler-internals.md

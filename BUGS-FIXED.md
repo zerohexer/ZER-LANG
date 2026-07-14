@@ -5,6 +5,25 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — spawn data-race scan was wrapper-blind (cast / slice / struct-init / orelse-fallback) (checker.c)
+
+Tracker §E #26 (source `bf29ffdc` BUG-772). The spawn data-race scanner
+`scan_unsafe_global_access` (which flags a spawned thread reading a non-shared global with
+no sync) treated NODE_TYPECAST, NODE_SLICE, and NODE_STRUCT_INIT as non-recursing LEAF kinds
+(they sat in the exhaustive switch's "return false" group), and NODE_ORELSE recursed only
+`.expr`, dropping `.fallback`. So a worker reading a non-shared global through a wrapper —
+`(u32)g`, `g_arr[a..b]`, `P{ .x = g }`, or `maybe() orelse g` — raced clean (compiled with no
+error) while the bare `tl = g` form was caught.
+
+Fix: gave NODE_TYPECAST / NODE_SLICE / NODE_STRUCT_INIT their own recursing cases (moved out
+of the leaf group — the switch stays exhaustive under `-Werror=switch`, each kind appears
+once), and made NODE_ORELSE scan BOTH `.expr` and `.fallback`. Pure tightening (over-reject
+only). Test: `tests/zer_fail/{spawn_race_cast,spawn_race_orelse_fallback,spawn_race_struct_init}.zer`.
+make check 945/0, walker audit OK. (Only the BUG-772 hunk of `bf29ffdc` is taken here; its
+773/774 = §B #10 / §A #3 already shipped, 776 = §A #2 separate, 775 = §A #1 already shipped.)
+
+---
+
 ## 2026-07-15 — free() of a non-heap slice + assignment-form slice-of-local escape (checker.c)
 
 Tracker §A #3 + §B #10 (both from `bf29ffdc`; entangled — §A #3's reject reads the

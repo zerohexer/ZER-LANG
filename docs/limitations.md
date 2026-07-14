@@ -16,7 +16,8 @@ AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixe
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
 + §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id,
-+ §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape), 19 remaining.**
++ §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
+wrapper-blind), 18 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -108,9 +109,15 @@ parsing (parser.c, f40ca06b F8). Tests
 924/0. **§D fully done.**
 
 ### E. Concurrency (🔴/🟠; absent)
+**✅ DONE: #26 spawn data-race scanner was wrapper-blind — `scan_unsafe_global_access`
+treated NODE_TYPECAST/SLICE/STRUCT_INIT as non-recursing leaves and dropped the orelse
+`.fallback`, so a worker reading a non-shared global via `(u32)g` / `g_arr[a..b]` / `P{.x=g}`
+/ `maybe() orelse g` raced clean; gave them recursing cases (switch stays exhaustive) + scan
+both orelse sides; `bf29ffdc` (772), tests `spawn_race_{cast,orelse_fallback,struct_init}`;
+2026-07-15. make check 945/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
-| 26 | spawn data-race scanner recurses cast/slice/struct-init/orelse | 9edc49b8 (B) or bf29ffdc (772) | checker.c |
+| 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
 | 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
 | 28 | defer-body shared read emits the lock | 2c7645b9 | emitter.c |
 | 29 | shared-cond mutex unlock on orelse-return/break (no deadlock) | 586507fb (C-F3) | ir_lower.c |

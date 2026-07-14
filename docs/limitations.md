@@ -17,7 +17,8 @@ dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio,
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
 + §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id,
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
-wrapper-blind, + §A #2 cross-fn/by-value-field slice free), 17 remaining.**
+wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
+escape), 16 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -70,11 +71,16 @@ escaped a dangling stack slice — the NODE_ASSIGN taint was gated on FIELD/INDE
 excluding whole-ident slice targets; extracted the var-decl walk into a shared
 `mark_slice_local_derived_from_value` helper used by BOTH sinks (they can no longer drift);
 `bf29ffdc` (773), tests `{global,return}_reassigned_slice_local` + `return_reassigned_slice_ptr`
-+ positive `slice_reassign_heap_ok`; 2026-07-15. make check 942/0.**
++ positive `slice_reassign_heap_ok`; 2026-07-15. make check 942/0. #9 reassignment `p =
+&local[i]` / `p = &local.f` escaped the frame — the NODE_ASSIGN escape walker matched only a
+bare `&local` (NODE_IDENT), skipping the field/index chain; extracted `addr_of_is_local_derived`
+(with the pointer-into-nonlocal-ref relaxation preserved) shared by BOTH var-decl + assignment
+sinks; `66332d39` (#1), tests `reassign_addr_local_{index_return,field_global}` + positive
+`reassign_addr_param_slice_ok`, sink cells `p2/p3__k7_reassign` added+closed; 2026-07-15. make
+check 951/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 8 | optional/array pointer-carrier escape | 5a6889df (`escape_type_carries_ref`) **+ TYPE_ARRAY arm from** 586507fb (D1) | checker.c |
-| 9 | reassign `p = &local[i]/.f` escapes frame | 66332d39 (#1, `addr_of_is_local_derived`) | checker.c |
 | 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
 | 12 | Ring.push / spawn of by-value aggregate carrying ptr-to-local | a3e1f66c | checker.c |
 
@@ -167,10 +173,12 @@ overflows the range check (`5a6889df` F4, test `mmio_struct_range_overflow`). ma
 **Next up (start here):** ✅ §D/§F/§G FULLY DONE; §A #1 (subslice-alloc_id) + §A #3 / §B #10
 (slice escape/free from `bf29ffdc`) DONE 2026-07-15. Remaining memory-safety = §A #2 / #4–#7,
 §B #8/#9/#11/#12, §C VRP/bounds (#13–#16), §E concurrency (#26–#31). **Recommended order (by
-sink-matrix leverage; §E #26 + §A #2 DONE 2026-07-15):** → §B #9 (`addr_of_is_local_derived`,
-66332d39 #1 — closes the 2 `p2/p3__k2v_2step` holes) → §B #8 (optional carrier, 5a6889df
-`escape_type_carries_ref` + TYPE_ARRAY from 586507fb D1 — closes the 3 `p7` holes; would make
-the sink matrix CLEAN → wire into `make check`) → then §A #4–#7, §B #11/#12, §C, §E #27–#31.
+sink-matrix leverage; §E #26 + §A #2 + §B #9 DONE 2026-07-15):** → §B #8 (optional/array
+pointer-carrier, 5a6889df `escape_type_carries_ref` + TYPE_ARRAY from 586507fb D1) — this is
+the LAST matrix fix: it closes ALL 5 remaining holes (the 3 `p7` optional-field-carrier + the
+2 `p2/p3__k2v_2step` 2-step launders), making the sink matrix CLEAN → then wire it into
+`make check` as a permanent gate. After §B #8: §A #4–#7, §B #11/#12, §C VRP/bounds (#13–#16),
+§E #27–#31.
 **Extra care** — these land in the same `zercheck_ir.c`/`checker.c` regions (conflict-group
 siblings); a mistake in §A/§B ships a UAF, not an over-reject. Verify EACH against the full
 sink matrix (`bash tools/sink_matrix.sh ./zerc`) per CLAUDE.md "Escape/keep analysis is a
@@ -180,20 +188,22 @@ with un-taken halves already shipped (`66332d39` #4 frame-local free = §A ..; `
 already shipped). All verified absent from main.
 
 ### Per-sink verification matrix (`tools/sink_matrix.sh`) — RUN AFTER EVERY §A/§B/§C fix
-`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (23 cells)
+`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (25 cells)
 and classifies each: **ok** / **HOLE** (compiles but should reject = a shipped UAF/dangling
 escape) / **OVER-REJECT** (rejects a safe program). This is the regression baseline for the
 memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix must flip its
-own cell(s) to ok AND leave every other cell unchanged. **Current 2026-07-15: 18 ok, 5 HOLES**
-(started 17/6; §A #3 closed `p5__k6_free`). All SAFE baselines pass → no over-reject. The
-5 remaining holes map 1:1 to the remaining §B fixes:
-- ✅ `p5__k6_free` — `free(slice-of-local)` → §A #3 CLOSED 2026-07-15 (bf29ffdc 774).
+own cell(s) to ok AND leave every other cell unchanged. **Current 2026-07-15: 20 ok, 5 HOLES**
+(started 17/6 @ 23 cells; §A #3 closed `p5__k6_free`; §B #9 added+closed the 2 new
+`p2/p3__k7_reassign` cells). All SAFE baselines pass → no over-reject. The 5 remaining holes
+ALL map to §B #8 (the last matrix fix):
+- ✅ `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9) — CLOSED 2026-07-15.
 - `p7__k2_store_glob` / `p7__k3_field_store` / `p7__k2v_2step` — an optional-ptr FIELD (`?*T`)
   carrying `&local` escapes to a global/field → §B #8 (optional pointer-carrier; 5a6889df
   F1/F3 `escape_type_carries_ref` + TYPE_OPTIONAL, a3e1f66c, f40ca06b F4).
 - `p2__k2v_2step` / `p3__k2v_2step` — `&local[i]`/`&local.field` laundered through a `?*T`
-  var-decl (`?*u32 t = p; g = t`) → §B #9 (`addr_of_is_local_derived`, 66332d39 #1) then §B #8.
-Once the matrix is CLEAN (0 mismatch) wire it into `make check` as a permanent gate.
+  var-decl (`?*u32 t = p; g = t`) → §B #8 (the optional-carrier propagation — NOT §B #9,
+  which is the reassignment case, now done). §B #9 does NOT close these (verified empirically).
+**§B #8 closes all 5 remaining holes → matrix CLEAN → then wire it into `make check`.**
 
 ---
 

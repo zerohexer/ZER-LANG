@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — reassignment `p = &local[i]` / `p = &local.f` escaped the frame (checker.c)
+
+Tracker §B #9 (source `66332d39` #1). The ASSIGNMENT-path escape walker (NODE_ASSIGN) matched
+only a bare `&local` (a NODE_IDENT operand of `&`) and skipped the field/index chain that the
+var-decl path already walked. So a REASSIGNMENT `p = &local[i]` or `p = &local.f` did not
+re-mark `p` local-derived, and the subsequent `return p` / `g = p` shipped a dangling stack
+pointer (`*T p = &local[0]; p = &local[1]; return p;` escaped undetected).
+
+Fix: extracted the address-of-local decision into a shared `addr_of_is_local_derived(c,
+operand)` helper — walks the field/index chain to the root ident, then applies the
+pointer-into-nonlocal-ref RELAXATION (`&r[i]`/`&r.f` where r is a NON-local-derived
+slice/pointer points into r's POINTEE = caller's/heap memory, so it may escape; still local
+for `&local_array[i]`, `&local` scalar/struct, `&local-derived-slice[i]`). Now used by BOTH
+the var-decl sink (refactored — identical behavior) AND the NODE_ASSIGN sink (direct +
+orelse-fallback), so they can't diverge again. Relaxation preserved — the custom-allocator
+pattern `p = &param_slice[i]; return p` still compiles.
+
+Per-sink matrix: added 2 reassignment cells (`p2/p3__k7_reassign`) that were HOLES before this
+fix and are now ok (20 ok / 5 holes; the 5 remaining `p2/p3__k2v_2step` + `p7×3` are the
+optional-carrier §B #8 targets, NOT closed by this fix — §B #9 is the reassignment case). Only
+the #1 hunk of `66332d39` is taken here (#3 ISR-ban = §G #40, #6 defer-abort = §F #35 already
+shipped; #4 free-frame-local = a separate item; #5 paren-deref = §F #34 already shipped from
+ce9af8cb). Tests: `tests/zer_fail/{reassign_addr_local_index_return,reassign_addr_local_field_global}.zer`,
+`tests/zer/reassign_addr_param_slice_ok.zer`. make check 951/0. Tracker §B #9 retired.
+
+---
+
 ## 2026-07-15 — cross-fn / by-value-field heap-slice free untracked in FuncSummary (zercheck_ir.c)
 
 Tracker §A #2 (source `bf29ffdc` BUG-776). The per-function `frees_param` summary (which

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Reassignment `p = &local.f` (field operand) must re-mark p local-derived so
+// storing p in a global is rejected. Sibling of the index form; both were
+// missed by the assignment-path escape walker's NODE_IDENT-only match.
+struct T { u32 v; }
+struct W { T inner; }
+?*T g;
+void bad() {
+    W local;
+    *T p = &local.inner;
+    p = &local.inner;
+    g = p;                  // dangling global — local is stack memory
+}
+u32 main() { return 0; }

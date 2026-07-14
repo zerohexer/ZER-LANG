@@ -1,0 +1,11 @@
+// Relaxation preserved: reassigning p to point into a PARAM slice points into
+// the caller's memory, not this frame, so returning it is allowed (the
+// pointer-into-nonlocal-ref relaxation — custom allocators over a heap region).
+// Must compile (addr_of_is_local_derived must not over-reject).
+struct T { u32 v; }
+*T pick([*]T buf, u32 i) {
+    *T p = &buf[0];
+    p = &buf[i];
+    return p;
+}
+u32 main() { return 0; }

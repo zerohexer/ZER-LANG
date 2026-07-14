@@ -5,6 +5,23 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — ban universal alloc(T,n) / free(slice) in ISR / @critical (checker.c)
+
+Tracker #40 (source nifty-gates-jkaz5c `66332d39` #3). The universal `alloc(T, n)` and
+`free(slice)` DIRECT paths emit `calloc`/`free` inline and never desugar to a named-pool
+method — so unlike `slab.alloc`/`Task.alloc_ptr`/`slab.free` (which route through
+`check_isr_ban`), they were NOT banned inside an ISR or `@critical`, emitting calloc/free
+inside a `cpsid i` region (libc heap-lock deadlock). Added `check_isr_ban(c, …, "alloc(T,
+n)")` at the alloc-slice path and `check_isr_ban(c, …, "free(slice)")` at the slice-free
+path. `check_isr_ban` no-ops outside ISR/@critical, so normal alloc/free is unaffected
+(surgical — no over-reject). Only the #3 (ISR-ban) half of `66332d39` is taken here; its
+#4 (reject free of frame-local memory) = tracker §A #3, deferred to the memory-safety pass.
+
+Tests: `tests/zer_fail/{universal_alloc_slice_in_critical,universal_free_slice_in_critical,
+universal_alloc_slice_in_isr}.zer`. make check 932/0, all gates OK.
+
+---
+
 ## 2026-07-15 — ban blocking sync (@cond_wait/@barrier_wait/@sem_acquire) in an ISR (checker.c)
 
 Tracker #39 (source nifty-gates-jkaz5c `1fdaaffe`). A blocking wait inside an interrupt

@@ -5127,6 +5127,11 @@ static Type *check_expr(Checker *c, Node *node) {
                             "alloc(T, n): allocation count must be an integer");
                         result = ty_void;
                     }
+                    /* alloc(T, n) emits calloc directly — same libc-heap-lock
+                     * deadlock hazard as slab.alloc / Task.alloc_ptr (which route
+                     * through check_isr_ban). The direct path never desugars to a
+                     * banned method, so ban it here too (ISR + @critical). */
+                    check_isr_ban(c, node->loc.line, "alloc(T, n)");
                     break;  /* common tail sets node's type from result */
                 }
             }
@@ -5170,6 +5175,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* args unchanged [p]; fall through to field dispatch */
             } else if (ae && aek == TYPE_SLICE) {
                 /* free(s:[*]T) -> direct heap-slice free (handled in emitter) */
+                /* free() holds the libc heap lock — same deadlock hazard as
+                 * slab.free / Task.free_ptr (which route through check_isr_ban).
+                 * The direct slice-free path never desugars to a banned method,
+                 * so ban it here too (ISR + @critical). */
+                check_isr_ban(c, node->loc.line, "free(slice)");
                 result = ty_void;
                 break;
             }

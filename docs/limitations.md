@@ -138,6 +138,44 @@ absent from main.
 
 ---
 
+## OPEN — optional pointer-carrier escape via an intermediate local var (🟠 narrow residual; 2026-07-14)
+
+The 2026-07-14 audit closed the common `?[*]T`/`?*T` (optional pointer-carrier)
+escape holes — the optional wrapper was hiding a slice/pointer-of-local from four
+sinks, all now fixed: the array-slice **return** sink, the direct array-slice
+**global/struct-field store** sink, and **keep inference** on a `?[*]T`/`?*T`
+param stored to a global (param taint at registration + persist-sink recognition).
+See BUGS-FIXED.md 2026-07-14.
+
+**Residual (narrow):** a local array laundered through an INTERMEDIATE optional
+local var still slips:
+
+```zer
+?[*]u8 g;
+void stash(?[*]u8 s) { g = s; }     // s now correctly inferred keep
+void f() {
+    u8[5] b;
+    ?[*]u8 x = b;                   // x is a ?[*]u8 slice INTO local b …
+    stash(x);                       // … but x is not flagged is_local_derived,
+}                                   //     so the keep call-site check accepts it
+```
+
+`stash(b)` (direct local arg) IS rejected; only the `?[*]u8 x = b; stash(x)` form
+slips. Root cause: `is_local_derived` propagation at the var-decl-init site
+(checker.c ~10320-10404) recognizes array→slice-of-local for a plain `[*]T`
+target but not when the target is the optional `?[*]T` (the array→optional-slice
+coercion produces a local-derived slice that isn't flagged). This is the SAME
+optional-wrapper-hides-carrier class as the fixed sinks, at yet another per-sink
+site — the durable fix is the unified `escape_type_carries_ref`
+carrier-classification that tracker #8 (`5a6889df` + `586507fb` D1, still unmerged)
+targets, which would make every escape/keep sink optional-aware in one place
+instead of the current per-sink patchwork (CLAUDE.md "Escape/keep analysis is a
+PER-SINK PATCHWORK"). Point-fixing this one site would work but adds a 5th patch to
+the class; deferred to the unified fix. Tripwire:
+`?[*]u8 x = local_arr; keep_fn(x)` should error.
+
+---
+
 ## OPEN — compiler build warnings: dead functions + a few latent hazards (LOW, tech-debt; no soundness impact)
 
 Surfaced during the 2026-07-14 audit sweep. The `make zerc` build is not

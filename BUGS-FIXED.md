@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-14 — keep inference blind to `?[*]T`/`?*T` optional pointer-carrier params (checker.c)
+
+Follow-up to the same-day `?[*]T` escape sweep. Storing an OPTIONAL pointer-carrier
+param (`?[*]u8`/`?*u32`) into a global did NOT infer `keep` on that param — the plain
+`[*]u8`/`*u32` param did — so a local-array/`&local` caller was silently accepted and
+the global slice/pointer dangled after the caller's frame died. MEMORY-SAFETY hole.
+
+Root cause: two per-sink type-kind lists omitted `TYPE_OPTIONAL`. (1) Param registration
+(checker.c ~14589) tainted `is_nonkeep_derived` only for POINTER/OPAQUE/SLICE and
+carrying STRUCT/UNION params; (2) the keep-persist sink (~4517) recognized the same set.
+A `?[*]T` param (TYPE_OPTIONAL) fell through both. Fix: add an optional-carrier branch at
+registration (`pk == TYPE_OPTIONAL && type_carries_data_pointer(ptype, 0)` — the helper
+already recurses the optional inner, so `?u32`/`?bool` stay untainted) and accept
+`TYPE_OPTIONAL` at the persist sink (gated by `is_nonkeep_derived`, only set for carriers).
+
+Now `?[*]u8 g; stash(?[*]u8 s){ g = s; }` infers keep on `s`, so `stash(local_array)` and
+`stash(&local)` are rejected while `stash(global_slice)` compiles. Tests
+`tests/zer_fail/keep_optional_slice_param.zer` + `keep_optional_ptr_param.zer`. make check
+green. A narrow residual (launder through an intermediate `?[*]u8 x = b` var) is the same
+class at the var-decl `is_local_derived` site — tracked in docs/limitations.md, deferred to
+the unified `escape_type_carries_ref` fix (tracker #8).
+
+---
+
 ## 2026-07-14 — audit sweep: @bitcast uN/iN, orelse-block value gap, ?[*]T slice coercion + escape holes
 
 Fresh full-codebase audit (four parallel subsystem sweeps + direct probing). Six confirmed

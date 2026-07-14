@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Storing a `?[*]T` (nullable-borrow) param into a global must infer `keep` on
+// that param, so a local-array caller is rejected at the call site — exactly
+// like the plain `[*]T` param. The optional wrapper previously hid the carrier
+// from keep inference, silently compiling a dangling global slice. Fixed 2026-07-14.
+?[*]u8 g;
+void stash(?[*]u8 s) { g = s; }
+void f() {
+    u8[5] b;
+    stash(b);
+}
+u32 main() { f(); return 0; }

@@ -4515,7 +4515,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 TypeKind vk = type_dispatch_kind(val_sym ? val_sym->type : NULL);
                 bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
                     (vk == TYPE_POINTER || vk == TYPE_OPAQUE || vk == TYPE_SLICE ||
-                     vk == TYPE_STRUCT || vk == TYPE_UNION);
+                     vk == TYPE_STRUCT || vk == TYPE_UNION ||
+                     /* ?*T / ?[*]T nullable-borrow value (2026-07-14): gated by
+                      * is_nonkeep_derived, which is only set for carrier types,
+                      * so a scalar ?u32 never reaches here. */
+                     vk == TYPE_OPTIONAL);
                 if (is_nonkeep_value) {
                     /* keep-universalization 2a: a non-keep pointer param (or alias)
                      * persisted into a global OR a pointer-param field/nested sink
@@ -14613,6 +14617,18 @@ static void check_func_body(Checker *c, Node *node) {
                             sym->is_nonkeep_derived = true;
                             sym->nonkeep_root_param = i; /* keep inference: struct param is its own root */
                         }
+                    }
+                    /* Optional carrier (2026-07-14): a `?*T` / `?[*]T` param is a
+                     * NULLABLE borrow — the same non-keep contract as the plain
+                     * `*T`/`[*]T` param. The optional wrapper previously hid the
+                     * carrier from this taint, so a `?[*]T`-storing function never
+                     * inferred keep and a local-derived caller was not rejected →
+                     * silent dangling store (`?[*]u8 g; stash(?[*]u8 s){g=s;}` with
+                     * a local slice arg). `type_carries_data_pointer` recurses the
+                     * optional inner, so `?u32`/`?bool` (no ref) stay untainted. */
+                    else if (pk == TYPE_OPTIONAL && type_carries_data_pointer(ptype, 0)) {
+                        sym->is_nonkeep_derived = true;
+                        sym->nonkeep_root_param = i; /* keep inference: optional-carrier param is its own root */
                     }
                 }
                 /* field-level keep: a KEEP pointer param is a BORROW. Storing it

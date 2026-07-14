@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// Same as keep_optional_slice_param but for a `?*T` nullable-pointer param.
+// Fixed 2026-07-14.
+?*u32 g;
+void stash(?*u32 s) { g = s; }
+void f() {
+    u32 v;
+    stash(&v);
+}
+u32 main() { f(); return 0; }

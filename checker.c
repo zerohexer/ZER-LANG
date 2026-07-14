@@ -9084,6 +9084,15 @@ static Type *check_expr(Checker *c, Node *node) {
                     "@%.*s not allowed inside @critical — would release/wait on mutex with interrupts disabled (deadlock)",
                     (int)nlen, name);
             }
+            /* Ban BLOCKING waits inside an interrupt handler — a blocking wait
+             * hangs the ISR (hardware-constraint class, like the alloc/spawn ISR
+             * bans). Signal/broadcast are non-blocking wakes — legitimate from an
+             * ISR (the canonical "ISR signals a waiting thread" pattern). */
+            if ((is_wait || is_timedwait) && c->in_interrupt) {
+                checker_error(c, node->loc.line,
+                    "@%.*s not allowed in interrupt handler — a blocking wait hangs the ISR",
+                    (int)nlen, name);
+            }
             if (is_wait) {
                 if (node->intrinsic.arg_count != 2)
                     checker_error(c, node->loc.line,
@@ -9196,6 +9205,10 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@barrier_init count must be an integer");
                 }
             } else if (is_bwait) {
+                /* Blocking wait in an ISR hangs the handler (see @cond_wait). */
+                if (c->in_interrupt)
+                    checker_error(c, node->loc.line,
+                        "@barrier_wait not allowed in interrupt handler — a blocking wait hangs the ISR");
                 if (node->intrinsic.arg_count != 1)
                     checker_error(c, node->loc.line,
                         "@barrier_wait requires 1 argument: @barrier_wait(barrier_var)");
@@ -9213,6 +9226,11 @@ static Type *check_expr(Checker *c, Node *node) {
             result = ty_void;
         } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0) {
             /* @sem_acquire(semaphore_var) — decrement, block if zero */
+            /* Blocking acquire in an ISR hangs the handler (see @cond_wait).
+             * @sem_release (non-blocking) stays allowed from an ISR. */
+            if (c->in_interrupt)
+                checker_error(c, node->loc.line,
+                    "@sem_acquire not allowed in interrupt handler — a blocking acquire hangs the ISR");
             if (node->intrinsic.arg_count != 1)
                 checker_error(c, node->loc.line,
                     "@sem_acquire requires 1 argument");

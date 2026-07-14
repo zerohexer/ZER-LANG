@@ -5,6 +5,21 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — ban blocking sync (@cond_wait/@barrier_wait/@sem_acquire) in an ISR (checker.c)
+
+Tracker #39 (source nifty-gates-jkaz5c `1fdaaffe`). A blocking wait inside an interrupt
+handler HANGS the ISR — the same hardware-constraint class as the existing alloc/spawn ISR
+bans, but there was only a `@critical` ban for condvar ops, no `in_interrupt` ban. Banned
+the four BLOCKING ops (`@cond_wait`, `@cond_timedwait`, `@barrier_wait`, `@sem_acquire`)
+inside interrupt handlers (three `if (c->in_interrupt) checker_error(...)` gates).
+Non-blocking wakes (`@cond_signal`, `@cond_broadcast`, `@sem_release`) stay allowed — the
+canonical "ISR signals a waiting thread" pattern (untouched by this change → no
+over-reject). Pure tightening.
+
+Test: `tests/zer_fail/isr_cond_wait.zer`. make check 929/0, all gates OK.
+
+---
+
 ## 2026-07-15 — baremetal mode-transition `#else #error` + @container const-strip (emitter.c, checker.c)
 
 Tracker #37 + #41 (both from cool-johnson-53cbd5 `582920db`, independent parts).

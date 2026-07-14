@@ -15,7 +15,7 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ §F crashes #32/#33/#34/#35, + §G #36/#37/#41), 25 remaining.**
++ §F crashes #32/#33/#34/#35, + §G #36/#37/#39/#41), 24 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -122,11 +122,12 @@ too deep" instead of SIGSEGV (`a8968db0` A7-13; main already guarded `parse_prim
 A7-6); #37 baremetal `@cpu_syscall/sysret/iret/hypercall` `#else #error` (were silent no-ops
 on non-x86/ARM64/RISC-V targets; `582920db` #5, verified in emitted C); #41 `@container`
 const-strip check (last cast form missing the BUG-304-family const check; `582920db` #2, test
-`container_const_strip`). make check 928/0.**
+`container_const_strip`). #39 ISR ban on BLOCKING sync (`@cond_wait`/`@cond_timedwait`/
+`@barrier_wait`/`@sem_acquire`) — non-blocking wakes (`@cond_signal`/`@cond_broadcast`/
+`@sem_release`) stay allowed (`1fdaaffe`, test `isr_cond_wait`; 2026-07-15). make check 929/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 38 | `@inttoptr` aggregate span/alignment (drop `type_width`=0) | 5a6889df (F4) | checker.c, emitter.c |
-| 39 | ISR ban: `@cond_wait`/`@barrier_wait`/`@sem_acquire` | 1fdaaffe | checker.c |
 | 40 | ISR ban: universal `alloc(T,n)`/`free(slice)` in ISR/@critical | 66332d39 (#3) | checker.c |
 
 ### Conflict groups (apply per-family, re-verify after each)

@@ -2349,7 +2349,7 @@ consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 13
 2026-07-13/15 — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 both FULLY DONE
 (uN/iN trio, `&&`/`||` short-circuit, optional-None, designated-init, `@saturate`,
 signed-comptime, float-`_`; `type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS);
-+ §G #36/#37/#41; 25 remaining. Next: rest of §G (#38 @inttoptr aggregate, #39/#40 ISR bans),
++ §G #36/#37/#39/#41; 24 remaining. Next: rest of §G (#38 @inttoptr aggregate, #40 ISR alloc/free ban),
 then the higher-stakes memory-safety clusters §A/§B/§C/§E (shipped-UAF risk — verify per-sink matrix).
 
 When looking for bugs, do NOT read entire files. Instead:

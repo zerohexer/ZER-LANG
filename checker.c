@@ -7890,7 +7890,12 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (result && type_dispatch_kind(result) == TYPE_POINTER) {
                             Type *sinner = type_unwrap_distinct(result);
                             if (sinner->pointer.inner) {
-                                int wb = type_width(sinner->pointer.inner) / 8;
+                                /* F4: use compute_type_size (full byte size incl.
+                                 * struct/array/union) — type_width returns 0 for any
+                                 * aggregate, which collapsed a 16-byte peripheral
+                                 * struct to a 1-byte span and let it overflow the
+                                 * declared mmio range undetected. */
+                                int64_t wb = compute_type_size(sinner->pointer.inner);
                                 if (wb > 1) span = (uint64_t)wb;
                             }
                         }

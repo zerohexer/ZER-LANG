@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — @inttoptr aggregate span/alignment used type_width=0 (checker.c, emitter.c)
+
+Tracker #38 (source gifted-noether-jfrmer `5a6889df` F4). `@inttoptr`'s mmio range-overflow
+span and runtime alignment both used `type_width`, which returns 0 for any AGGREGATE — so a
+16-byte peripheral STRUCT mapped over an 8-byte-declared mmio range collapsed to a 1-byte
+span and slipped the overflow check, and a struct-typed MMIO pointer at a variable address
+got NO alignment trap.
+
+Fix, three sites (all silent accept-unsafe on bare-metal):
+- **checker.c** const-address span: `type_width/8` → `compute_type_size` (full byte size incl.
+  struct/array/union). A const struct address now overflows the range at compile time.
+- **emitter.c AST path + IR path** (both @inttoptr emissions): alignment → `type_alignment_bytes`
+  (aggregate-aware, recurses into fields); range-span → C `sizeof(target)` (GCC-evaluated,
+  correct for struct/array/union) instead of the `g2_align>1?..:1` that collapsed every
+  aggregate to 1 byte.
+
+Verified: const 16-byte struct over an 8-byte range is rejected; a struct that FITS compiles
+(no over-reject); a variable-address `@inttoptr(*USART, a)` emits
+`_zer_ma0 + (sizeof(struct USART) - 1ULL)` in the range check. Only the F4 half of `5a6889df`
+is taken here (F1/F3 escape = §B, F5/F6 uN/iN + F8 bitslice already shipped from k7l625/jfrmer).
+
+Test: `tests/zer_fail/mmio_struct_range_overflow.zer`. make check 933/0, all gates OK.
+
+---
+
 ## 2026-07-15 — ban universal alloc(T,n) / free(slice) in ISR / @critical (checker.c)
 
 Tracker #40 (source nifty-gates-jkaz5c `66332d39` #3). The universal `alloc(T, n)` and

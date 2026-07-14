@@ -2349,8 +2349,9 @@ consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 13
 2026-07-13/15 — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 both FULLY DONE
 (uN/iN trio, `&&`/`||` short-circuit, optional-None, designated-init, `@saturate`,
 signed-comptime, float-`_`; `type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS);
-+ §G #36/#37/#39/#40/#41; 23 remaining. Next: §G #38 (@inttoptr aggregate span/align, last §G),
-then the higher-stakes memory-safety clusters §A/§B/§C/§E (shipped-UAF risk — verify per-sink matrix).
++ §G bare-metal #36–#41 FULLY DONE; 22 remaining. Next: ONLY the higher-stakes memory-safety
+clusters §A UAF/double-free, §B escape sinks, §C VRP/bounds, §E concurrency (shipped-UAF risk
+— verify each against the full per-sink matrix, re-run after each; go slow).
 
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)

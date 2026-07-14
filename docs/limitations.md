@@ -15,7 +15,7 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ §F crashes #32/#33/#34/#35, + §G #36/#37/#39/#40/#41), 23 remaining.**
++ §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41), 22 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -126,10 +126,11 @@ const-strip check (last cast form missing the BUG-304-family const check; `58292
 `@barrier_wait`/`@sem_acquire`) — non-blocking wakes (`@cond_signal`/`@cond_broadcast`/
 `@sem_release`) stay allowed (`1fdaaffe`, test `isr_cond_wait`; 2026-07-15). #40 ISR/@critical ban on the universal `alloc(T,n)`/`free(slice)`
 DIRECT paths (emit calloc/free inline, never desugar to a banned method; `66332d39` #3, tests
-`universal_{alloc,free}_slice_in_{critical,isr}`). make check 932/0.**
-| # | Fix | Proper source (sha) | Files |
-|---|---|---|---|
-| 38 | `@inttoptr` aggregate span/alignment (drop `type_width`=0) | 5a6889df (F4) | checker.c, emitter.c |
+`universal_{alloc,free}_slice_in_{critical,isr}`). #38 `@inttoptr` aggregate span/alignment
+used `type_width` (=0 for aggregates) → `compute_type_size` (const span) + `type_alignment_bytes`
++ C `sizeof(target)` span (both emit paths); a 16-byte struct over an 8-byte mmio range now
+overflows the range check (`5a6889df` F4, test `mmio_struct_range_overflow`). make check 933/0.
+**§G FULLY DONE.**
 
 ### Conflict groups (apply per-family, re-verify after each)
 - checker.c escape sinks: #8, 9, 10, 11, 12 (same region)
@@ -139,15 +140,16 @@ DIRECT paths (emit calloc/free inline, never desugar to a banned method; `66332d
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ✅ §D (miscompiles #17–#25) and §F (crashes/robustness
-#32/#33/#34/#35) FULLY DONE (2026-07-13/15). Remaining = the higher-stakes memory-safety
-clusters: §A UAF/double-free (#1–#7), §B escape sinks (#8–#12), §C VRP/bounds (#13–#16),
-§E concurrency (#26–#31), §G bare-metal/ISR (#36–#41). **Extra care required** — these land
-in the same `zercheck_ir.c`/`checker.c` regions (conflict-group siblings), and a mistake is
-a shipped UAF, not an over-reject; verify each against the full escape-sink matrix per
-CLAUDE.md "Escape/keep analysis is a PER-SINK PATCHWORK". §G (bare-metal, #36–#41) is
-lower-stakes (mostly `#error`/clobber/ISR-ban tightening) and could go before §A/§B. All
-verified absent from main.
+**Next up (start here):** ✅ §D (miscompiles #17–#25), §F (crashes/robustness #32–#35), and
+§G (bare-metal/ISR #36–#41) all FULLY DONE (2026-07-13/15). Remaining = ONLY the higher-stakes
+memory-safety clusters: §A UAF/double-free (#1–#7), §B escape sinks (#8–#12), §C VRP/bounds
+(#13–#16), §E concurrency (#26–#31). **Extra care required** — these land in the same
+`zercheck_ir.c`/`checker.c` regions (conflict-group siblings), and a mistake is a shipped UAF,
+not an over-reject; verify each against the full escape-sink matrix per CLAUDE.md
+"Escape/keep analysis is a PER-SINK PATCHWORK", and re-run the sink matrix after each. Note:
+some of these overlap with fixes' un-taken halves already shipped (e.g. `66332d39` #4
+frame-local free = §A #3; `5a6889df` F1/F3 = §B; `582920db` #1/#3/#4 baseline lines already
+pre-added). All verified absent from main.
 
 ---
 

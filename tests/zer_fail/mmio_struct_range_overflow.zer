@@ -1,0 +1,9 @@
+// MUST FAIL: a 16-byte peripheral STRUCT mapped over an 8-byte-declared mmio range
+// overflows the range. F4: @inttoptr span used type_width (0 for aggregates), so a
+// struct target collapsed to a 1-byte span and slipped the range-overflow check.
+mmio 0x40011000..0x40011007;
+struct USART { u32 SR; u32 DR; u32 BRR; u32 CR1; }
+u32 main() {
+    volatile *USART u = @inttoptr(*USART, 0x40011000);
+    return u.SR;
+}

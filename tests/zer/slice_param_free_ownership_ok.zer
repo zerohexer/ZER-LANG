@@ -1,0 +1,12 @@
+// Ownership transfer: caller passes a heap slice to a callee that frees it, and
+// does NOT double-free. Must be accepted (frees_param slice support must not
+// break the transfer pattern).
+i32 puts(const *u8 s);
+struct B { u32 x; }
+void consume([*]B p) { p[0].x = 1; free(p); }
+u32 main() {
+    [*]B b = alloc(B, 4) orelse return;
+    consume(b);
+    puts("slice_param_free_ownership_ok: ok");
+    return 0;
+}

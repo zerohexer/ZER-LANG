@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Freeing a slice FIELD of a by-value struct param, then UAF at the caller.
+struct B { u32 x; }
+struct H { [*]B buckets; }
+void fb(H h) { free(h.buckets); }
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse return;
+    fb(h);
+    h.buckets[0].x = 1;
+    return 0;
+}

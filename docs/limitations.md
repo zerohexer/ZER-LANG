@@ -17,7 +17,7 @@ dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio,
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
 + §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id,
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
-wrapper-blind), 18 remaining.**
+wrapper-blind, + §A #2 cross-fn/by-value-field slice free), 17 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -51,10 +51,14 @@ caught); 2026-07-15. make check 936/0. #3 reject `free()` of a non-heap slice
 (stack-array/arena/local-derived) — raw libc `free()` on stack/arena memory was UB
 (`-Wfree-nonheap-object`); `bf29ffdc`, relies on §B #10's local-derived marking, tests
 `free_nonheap_slice_{direct,stack}`, sink cell `p5__k6_free` closed; 2026-07-15. make check
-942/0.**
+942/0. #2 cross-fn / by-value-field heap-slice free tracked — `frees_param` gate excluded
+TYPE_SLICE, so a callee freeing a heap-slice param (`sink([*]B p){free(p)}`) or a slice field
+of a by-value struct param (`fb(H h){free(h.buckets)}`) wasn't recorded → caller
+double-free/UAF passed; `bf29ffdc` (776), tests `alloc_crossfn_slice_double_free` +
+`alloc_byval_field_slice_uaf` + positive `slice_param_free_ownership_ok`; 2026-07-15. make
+check 948/0. **All applicable `bf29ffdc` fixes now landed (§A #1/#2/#3, §B #10, §E #26).**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
-| 2 | cross-fn slice-param free tracked (`frees_param` += TYPE_SLICE) | bf29ffdc | zercheck_ir.c |
 | 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |
 | 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
 | 6 | struct value-copy preserves compound handle (Pattern-4 replicate) | 59a968cb (A3) | zercheck_ir.c |
@@ -163,9 +167,10 @@ overflows the range check (`5a6889df` F4, test `mmio_struct_range_overflow`). ma
 **Next up (start here):** ✅ §D/§F/§G FULLY DONE; §A #1 (subslice-alloc_id) + §A #3 / §B #10
 (slice escape/free from `bf29ffdc`) DONE 2026-07-15. Remaining memory-safety = §A #2 / #4–#7,
 §B #8/#9/#11/#12, §C VRP/bounds (#13–#16), §E concurrency (#26–#31). **Recommended order (by
-sink-matrix leverage):** §E #26 (spawn-scan recursion, `bf29ffdc` BUG-772 — same commit,
-independent) → §A #2 (cross-fn slice free, `bf29ffdc` BUG-776) → §B #9 (`addr_of_is_local_derived`,
-66332d39 #1 — closes `p2/p3__k2v_2step`) → §B #8 (optional carrier — closes the 3 `p7` holes).
+sink-matrix leverage; §E #26 + §A #2 DONE 2026-07-15):** → §B #9 (`addr_of_is_local_derived`,
+66332d39 #1 — closes the 2 `p2/p3__k2v_2step` holes) → §B #8 (optional carrier, 5a6889df
+`escape_type_carries_ref` + TYPE_ARRAY from 586507fb D1 — closes the 3 `p7` holes; would make
+the sink matrix CLEAN → wire into `make check`) → then §A #4–#7, §B #11/#12, §C, §E #27–#31.
 **Extra care** — these land in the same `zercheck_ir.c`/`checker.c` regions (conflict-group
 siblings); a mistake in §A/§B ships a UAF, not an over-reject. Verify EACH against the full
 sink matrix (`bash tools/sink_matrix.sh ./zerc`) per CLAUDE.md "Escape/keep analysis is a

@@ -2345,15 +2345,14 @@ When starting a new session or lacking context:
 fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
 soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
 merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **23 landed
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **24 landed
 2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
-#36–#41 ALL FULLY DONE, + §A #1 subslice-alloc_id + §A #3 free-non-heap-slice + §B #10
-assign-slice-of-local escape + §E #26 spawn-scan wrapper-blind (uN/iN trio, `&&`/`||`
-short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-`type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS; `@critical` clobber,
-mode-transition `#error`, ISR bans, mmio-span, `@container`-const; slice escape/free,
-spawn-scan); **18 remaining** = the memory-safety cluster §A #2/#4–#7, §B escape sinks
-#8/#9/#11/#12, §C VRP/bounds, §E #27–#31 (shipped-UAF risk). The
+#36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit landed (§A #1 subslice-alloc_id, §A #2
+cross-fn slice free, §A #3 free-non-heap-slice, §B #10 assign-slice-of-local escape, §E #26
+spawn-scan wrapper-blind). **17 remaining** = §A #4–#7, §B #8/#9/#11/#12, §C VRP/bounds
+(#13–#16), §E #27–#31 (shipped-UAF risk). **Next by sink-matrix leverage: §B #9
+(`addr_of_is_local_derived`, 66332d39 #1 — closes 2 holes) then §B #8 (optional carrier,
+5a6889df — closes 3 holes → matrix CLEAN).** The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,
 `orelse return` is bare, a neg-test non-zero exit ≠ intended rejection / could be SIGSEGV,
 baseline new `_eff->kind` sites, make check FOREGROUND) are in **compiler-internals.md

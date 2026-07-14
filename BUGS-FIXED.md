@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — cross-fn / by-value-field heap-slice free untracked in FuncSummary (zercheck_ir.c)
+
+Tracker §A #2 (source `bf29ffdc` BUG-776). The per-function `frees_param` summary (which
+records "this callee frees param N", so a caller's `sink(b); free(b)` double-free or
+`sink(b); b[0]` UAF is caught cross-function) gated the recorded param on
+POINTER/HANDLE/OPAQUE — it EXCLUDED TYPE_SLICE. So a callee freeing a heap-slice param via
+the universal `free(p)` (`void sink([*]B p){ free(p); }`), or a slice FIELD of a by-value
+struct param (`void fb(H h){ free(h.buckets); }`), was NOT recorded — the caller's
+subsequent double-free / UAF passed silently.
+
+Fix: add `pt_eff->kind != TYPE_SLICE` to the gate (one condition). Additive — a callee that
+frees a slice param is now summarized like a pointer/handle param. The ownership-transfer
+pattern (caller passes a heap slice, callee frees it, caller does NOT touch it again) stays
+accepted (no over-reject). The `pt_eff->kind != TYPE_SLICE` read is on an already-unwrapped
+`_eff` local (documented-safe; added to `type_dispatch_baseline.txt` — the TYPE_OPAQUE line
+split into OPAQUE + SLICE).
+
+Verified: `sink(b); free(b)` (double-free) and `fb(h); h.buckets[0]` (by-value-field UAF)
+both reject; ownership-transfer positive compiles + runs. Sink matrix unchanged (18/5 — this
+is cross-fn free tracking, not a sink cell). Tests:
+`tests/zer_fail/{alloc_crossfn_slice_double_free,alloc_byval_field_slice_uaf}.zer`,
+`tests/zer/slice_param_free_ownership_ok.zer`. make check 948/0. Tracker §A #2 retired —
+completes all applicable `bf29ffdc` fixes (§A #1/#3, §B #10, §E #26, §A #2).
+
+---
+
 ## 2026-07-15 — spawn data-race scan was wrapper-blind (cast / slice / struct-init / orelse-fallback) (checker.c)
 
 Tracker §E #26 (source `bf29ffdc` BUG-772). The spawn data-race scanner

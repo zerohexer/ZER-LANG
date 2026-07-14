@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// A callee that frees its heap-slice param must be recorded in the FuncSummary
+// (frees_param) so a caller's double-free is caught. universal_alloc.md.
+struct B { u32 x; }
+void sink([*]B p) { free(p); }
+u32 main() {
+    [*]B b = alloc(B, 4) orelse return;
+    sink(b);
+    free(b);
+    return 0;
+}

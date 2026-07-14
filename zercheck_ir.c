@@ -5096,7 +5096,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (!pt_eff ||
                         (pt_eff->kind != TYPE_POINTER &&
                          pt_eff->kind != TYPE_HANDLE &&
-                         pt_eff->kind != TYPE_OPAQUE)) {
+                         pt_eff->kind != TYPE_OPAQUE &&
+                         /* §A #2 (H3): a heap-slice param freed via the universal
+                          * `free(p)` (ident-callee IRMC_FREE_PTR) must also be
+                          * recorded into frees_param, or a caller's
+                          * `sink(b); free(b)` double-free / `sink(b); b[0]` UAF
+                          * passes silently — the slice sibling of the typedef'd
+                          * destructor gap above. */
+                         pt_eff->kind != TYPE_SLICE)) {
                         all_return_blocks_freed[i] = false;
                         continue;
                     }

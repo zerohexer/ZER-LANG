@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// AUDIT-2026-07-02 — @container was the last cast form still missing the
+// const-strip check present in @ptrcast/@bitcast/@pun/@cast/(*T)e
+// (BUG-304 family). Silently accepted reverse-derive from a const field
+// pointer to a mutable struct pointer, then mutating the struct.
+struct Device { u32 id; u32 list; }
+void take(const *u32 cp) {
+    *Device dp = @container(*Device, cp, list);
+    dp.id = 999;
+}
+u32 main() {
+    Device d;
+    d.id = 1;
+    d.list = 42;
+    take(&d.list);
+    return 0;
+}

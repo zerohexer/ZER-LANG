@@ -7993,6 +7993,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"svc #0\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#else\n"
+                "#error \"@cpu_syscall: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 10 && memcmp(name, "cpu_sysret", 10) == 0) {
@@ -8008,6 +8010,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"eret\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"sret\");\n"
+                "#else\n"
+                "#error \"@cpu_sysret: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 8 && memcmp(name, "cpu_iret", 8) == 0) {
@@ -8022,6 +8026,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"eret\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"mret\");\n"
+                "#else\n"
+                "#error \"@cpu_iret: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 18 && memcmp(name, "cpu_set_priv_stack", 18) == 0 &&
@@ -8071,6 +8077,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"hvc #0\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"ecall\" ::: \"memory\");\n"
+                "#else\n"
+                "#error \"@cpu_hypercall: no implementation for target architecture\"\n"
                 "#endif\n"
                 "})");
         } else if (nlen == 15 && memcmp(name, "cpu_read_fsbase", 15) == 0) {

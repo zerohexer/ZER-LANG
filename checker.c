@@ -8976,6 +8976,24 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (ptr_type)
                         check_volatile_strip(c, node->intrinsic.args[0], ptr_type, result,
                                              node->loc.line, "@container");
+                    /* AUDIT-2026-07-02: const-strip check parallel to
+                     * @ptrcast/@bitcast/@pun/@cast (BUG-304 family). @container
+                     * was the last cast form still missing it — silently
+                     * accepted `@container(*Device, const_field_ptr, list)`
+                     * which reverse-derives a mutable struct pointer from a
+                     * const field, then mutates the struct. */
+                    if (ptr_type) {
+                        Type *src_eff = type_unwrap_distinct(ptr_type);
+                        Type *tgt_eff = type_unwrap_distinct(result);
+                        if (src_eff && src_eff->kind == TYPE_POINTER &&
+                            src_eff->pointer.is_const &&
+                            tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+                            !tgt_eff->pointer.is_const) {
+                            checker_error(c, node->loc.line,
+                                "@container cannot strip const qualifier — "
+                                "target must be const pointer");
+                        }
+                    }
                 }
             } else {
                 result = ty_void;

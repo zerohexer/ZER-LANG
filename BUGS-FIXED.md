@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — baremetal mode-transition `#else #error` + @container const-strip (emitter.c, checker.c)
+
+Tracker #37 + #41 (both from cool-johnson-53cbd5 `582920db`, independent parts).
+
+**#37 baremetal `@cpu_syscall`/`@cpu_sysret`/`@cpu_iret`/`@cpu_hypercall` silent no-op**
+(emitter.c, `582920db` #5). These 4 privileged mode-transitions had a `#if x86_64 / #elif
+aarch64 / #elif riscv / #endif` arch chain with NO `#else`, so on any other target
+(i386/MIPS/…) they compiled to `({})` = zero instructions — the kernel/guest silently
+continued past the transition. Added `#else\n#error "@cpu_X: no implementation for target
+architecture"\n` to all four (the other ~26 privileged intrinsics already had it). Verified
+in emitted C. Codegen change, no runtime test.
+
+**#41 `@container` was the last cast form missing the const-strip check** (checker.c,
+`582920db` #2). `@container(*Device, const_field_ptr, list)` reverse-derives a MUTABLE
+struct pointer from a CONST field pointer, then lets you mutate the struct — but `@container`
+lacked the BUG-304-family const check that `@ptrcast`/`@bitcast`/`@pun`/`@cast`/`(*T)e` all
+have. Added the mirror check (reject const src → non-const target). The `src_eff`/`tgt_eff`
+`->kind == TYPE_POINTER` reads are on already-`type_unwrap_distinct`'d locals
+(documented-safe; added to `type_dispatch_baseline.txt`).
+
+Test: `tests/zer_fail/container_const_strip.zer` (rejected with "cannot strip const
+qualifier"). make check 928/0, all gates OK.
+
+---
+
 ## 2026-07-15 — @critical missing `"memory"` clobber on ARM/AVR/RISC-V (emitter.c)
 
 Tracker #36 (source nifty-gates-ziwscu `a8968db0` A7-6). The `@critical` interrupt-disable

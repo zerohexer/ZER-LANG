@@ -752,6 +752,7 @@ static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
 }
 static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
+static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
 
 /* emit array→slice coercion: wraps array expr in slice compound literal */
 static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
@@ -3705,16 +3706,34 @@ static void emit_expr(Emitter *e, Node *node) {
 /* emit all accumulated defers in reverse order */
 /* emit defers from current count down to 'base' (exclusive) */
 static void emit_defers_from(Emitter *e, int base) {
-    /* Defer stack is populated only by AST-path function-body emission,
-     * which was removed 2026-04-19. defer_stack.count stays 0 in
-     * production (top-level doesn't use defers). The loop below runs
-     * zero iterations on that path; if it ever does run, the old
-     * emit_stmt is gone so we abort loudly instead of silently dropping. */
-    if (e->defer_stack.count > base) {
+    /* Fire pending IR defer bodies (LIFO, top down to `base`) WITHOUT popping —
+     * used by a mid-body CONDITIONAL early-exit (auto-guard bounds return, @cstr
+     * overflow return, orelse fallback return/break/continue) where the code path
+     * that continues AFTER the early-exit still owns the same pending defers.
+     * IR path: bodies live on e->defer_stack (pushed by IR_DEFER_PUSH) and are
+     * keyed to cur_ir_func's locals. Before this, the auto-guard early-return
+     * called emit_defers with a pending IR defer and the compiler ABORTED
+     * ("emit_defers_from reached with N pending defers") on the extremely common
+     * `defer free(x); arr[i]=…` idiom. */
+    if (e->defer_stack.count <= base) return;
+    if (!e->cur_ir_func) {
+        /* No IR function context (AST/global-init path) should never have a
+         * pending defer — that path has no defer statements. Loud if it does. */
         fprintf(stderr, "INTERNAL ERROR: emit_defers_from reached with %d pending "
-                        "defers but AST emit_stmt has been removed. Please report.\n",
+                        "defers but no IR function context. Please report.\n",
                         e->defer_stack.count - base);
         abort();
+    }
+    IRFunc *func = (IRFunc *)e->cur_ir_func;
+    for (int di = e->defer_stack.count - 1; di >= base; di--) {
+        Node *db = e->defer_stack.stmts[di];
+        if (!db) continue;
+        if (db->kind == NODE_BLOCK) {
+            for (int si = 0; si < db->block.stmt_count; si++)
+                emit_defer_stmt(e, db->block.stmts[si], func);
+        } else {
+            emit_defer_stmt(e, db, func);
+        }
     }
 }
 
@@ -11865,9 +11884,14 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
 void emit_func_from_ir(Emitter *e, void *ir_func_ptr) {
     IRFunc *func = (IRFunc *)ir_func_ptr;
     if (!func) return;
+    /* Expose the current func so a mid-body conditional early-exit can fire its
+     * pending IR defer bodies (emit_defers_from) instead of aborting. */
+    void *saved_ir_func = e->cur_ir_func;
+    e->cur_ir_func = func;
     if (func->is_async) {
         emit_async_func_from_ir(e, func);
     } else {
         emit_regular_func_from_ir(e, func);
     }
+    e->cur_ir_func = saved_ir_func;
 }

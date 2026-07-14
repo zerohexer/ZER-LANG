@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — defer + auto-guarded index no longer aborts the compiler (emitter.c, emitter.h)
+
+Tracker #35 (source nifty-gates-jkaz5c `66332d39` #6). The extremely common
+`defer free(x); arr[i] = …` idiom (with an unproven index `i`) ABORTED the compiler:
+`emit_auto_guards` inserts a silent early-return `if (oob) return;`, whose return path
+called `emit_defers` → `emit_defers_from`, which was a dead AST-path stub that `abort()`ed
+whenever any defer was pending ("INTERNAL ERROR: emit_defers_from reached with N pending
+defers"). Since 2026-04-19 function bodies are IR-only, so `emit_defers_from` had no way
+to fire the pending IR defer bodies.
+
+Fix: expose the current `IRFunc` on the emitter (`cur_ir_func`, typed `void*` to keep
+ir.h out of emitter.h), set/restored in `emit_func_from_ir`. `emit_defers_from` now fires
+the pending IR defer bodies (LIFO, via `emit_defer_stmt` keyed to `cur_ir_func`'s locals)
+instead of aborting. The guard's early-exit path and the normal-exit path are mutually
+exclusive, so the defer fires exactly once (no double-free). The abort is kept ONLY for
+the AST/global-init path (`cur_ir_func == NULL`), which legitimately has no defers.
+
+Chosen over m0v91c `a3e1f66c`'s `emit_pending_ir_defers`-at-each-site approach — fixing
+`emit_defers_from` at the root covers every conditional early-exit (auto-guard, @cstr
+overflow, orelse fallback) uniformly, not just the sites wired individually.
+
+Test: `tests/zer/defer_autoguard_earlyexit.zer` (in-range + OOB paths; the OOB path's
+guard returns 0 and the defer frees). make check 925/0. Tracker #35 retired.
+
+---
+
 ## 2026-07-14 — three wrong-value miscompiles: `@saturate` unsigned, signed comptime-return, float underscores (emitter.c, checker.c, parser.c)
 
 Tracker #23 + #24 + #25 (independent; one pass). Sources: nifty-gates-m0v91c `a3e1f66c`

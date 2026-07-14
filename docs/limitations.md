@@ -15,7 +15,7 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ #33 `type_name` overflow, #34 `(*ptr & mask)`), 30 remaining.**
++ #33 `type_name` overflow, #34 `(*ptr & mask)`, #35 defer-abort), 29 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -105,15 +105,17 @@ parsing (parser.c, f40ca06b F8). Tests
 | 31 | union variant write via `*Union` updates `_tag` | 586507fb | emitter.c |
 
 ### F. Parser / crashes / robustness
-**✅ DONE 2026-07-14: #33 `type_name` buffer overflow → SIGSEGV (`59a968cb` A5, clamping
-`tn_append`; UINT/SINT cases adapted for current main); #34 `(*ptr & mask)` parse
-regression (`ce9af8cb` A7-12, speculation + `token_can_start_unary`; chosen over
-`66332d39` #5 whose simpler heuristic misparses `(*ptr) + 3`). All 8 QEMU examples parse
-again. Test `paren_deref_expr`. make check 920/0.**
+**✅ DONE: #33 `type_name` buffer overflow → SIGSEGV (`59a968cb` A5, clamping `tn_append`;
+UINT/SINT cases adapted for current main); #34 `(*ptr & mask)` parse regression (`ce9af8cb`
+A7-12, speculation + `token_can_start_unary`; chosen over `66332d39` #5 whose simpler
+heuristic misparses `(*ptr) + 3`) — all 8 QEMU examples parse again (2026-07-14); #35 defer
++ auto-guarded index compiler abort — `emit_defers_from` now fires the pending IR defers
+via `cur_ir_func` instead of `abort()`ing (`66332d39` #6, chosen over `a3e1f66c`'s per-site
+`emit_pending_ir_defers`; 2026-07-15). Tests `paren_deref_expr`, `defer_autoguard_earlyexit`.
+make check 925/0.**
 | # | Fix | Proper source (sha) | Files | Main |
 |---|---|---|---|---|
 | 32 | parser DoS: `parse_type` + prefix-modifier depth guard | a8968db0 (A7-13) | parser.c | ⚠️ partial (expr guard only) |
-| 35 | defer + auto-guard compiler abort (`N pending defers`) | 66332d39 (#6, `emit_pending_ir_defers`) | emitter.c/.h | absent |
 
 ### G. Bare-metal / ISR / qualifier (absent)
 | # | Fix | Proper source (sha) | Files |
@@ -133,10 +135,12 @@ again. Test `paren_deref_expr`. make check 920/0.**
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ✅ §D (miscompiles #17–#25), #33, #34 all landed 2026-07-13/14.
-Remaining highest-value: #35 defer+auto-guard compiler abort (crash), #32 parser DoS
-(parse_type/prefix — main has only the expr-depth guard), and then the memory-safety
-cluster (§A UAF/double-free, §B escape sinks — the higher-stakes fixes). All verified
+**Next up (start here):** ✅ §D (miscompiles #17–#25), #33/#34/#35 (§F crashes) all landed
+2026-07-13/15. Remaining highest-value: #32 parser DoS (parse_type/prefix — main has only
+the expr-depth guard), then the memory-safety cluster (§A UAF/double-free, §B escape
+sinks — the higher-stakes fixes: they land in the same `zercheck_ir.c`/`checker.c` regions,
+several are conflict-group siblings, and a mistake there is a shipped UAF not an
+over-reject; verify each against the full escape-sink matrix per CLAUDE.md). All verified
 absent from main.
 
 ---

@@ -2345,15 +2345,20 @@ When starting a new session or lacking context:
 fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
 soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
 merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 13 landed
-2026-07-13/15 — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 both FULLY DONE
-(uN/iN trio, `&&`/`||` short-circuit, optional-None, designated-init, `@saturate`,
-signed-comptime, float-`_`; `type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS);
-+ §G bare-metal #36–#41 FULLY DONE, + §A #1 subslice-alloc_id; 21 remaining. Next: rest of
-memory-safety §A #2–#7, §B escape sinks, §C VRP/bounds, §E concurrency (shipped-UAF risk).
-**Verify every one with `bash tools/sink_matrix.sh ./zerc`** — the {shape×sink} grid; baseline
-6 HOLES (map to the remaining fixes), all SAFE baselines pass. A fix must flip its own
-cell(s) to ok and add NO new hole / over-reject. Go slow; re-run after each.
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **20 landed
+2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
+#36–#41 ALL FULLY DONE, + §A #1 subslice-alloc_id (uN/iN trio, `&&`/`||` short-circuit,
+optional-None, designated-init, `@saturate`, signed-comptime, float-`_`; `type_name`
+overflow, `(*ptr & mask)`, defer-abort, parser DoS; `@critical` clobber, mode-transition
+`#error`, ISR bans, mmio-span, `@container`-const); **21 remaining** = the memory-safety
+cluster §A #2–#7, §B escape sinks, §C VRP/bounds, §E concurrency (shipped-UAF risk). The
+per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,
+`orelse return` is bare, a neg-test non-zero exit ≠ intended rejection / could be SIGSEGV,
+baseline new `_eff->kind` sites, make check FOREGROUND) are in **compiler-internals.md
+"Merge-back methodology"** — read it before consuming the tracker. **Verify every
+memory-safety fix with `bash tools/sink_matrix.sh ./zerc`** — the {shape×sink} grid;
+baseline 17 ok / 6 HOLES (map 1:1 to the remaining fixes) / 0 over-rejects. A fix must flip
+its own cell(s) to ok and add NO new hole / over-reject. Go slow; re-run after each.
 
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)

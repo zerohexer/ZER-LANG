@@ -114,6 +114,11 @@ f32 temp = 36.6;
 f64 precise = 3.14159265358979;
 ```
 
+**NOTES**
+- Digit-group underscores are allowed in numeric literals for readability and
+  are ignored by the value: `1_000.5`, `3.141_592`, `1e1_0` (and `1_000_000`
+  for integers).
+
 ---
 
 ### bool

@@ -154,6 +154,106 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
+## Merge-back methodology — consuming the `claude/*` fix tracker (2026-07-13..15)
+
+There are **41 unique soundness/miscompile/crash fixes** already FOUND + FIXED across
+12 parallel `claude/*` audit branches, NONE merged to main. The full per-fix table
+(proper commit sha per bug, files, conflict-groups) is the TASK TRACKER in
+`docs/limitations.md` "## OPEN — unmerged audit fixes". As of 2026-07-15, **20 are
+landed** (§D miscompiles #17–#25, §F crashes #32–#35, §G bare-metal #36–#41, §A #1);
+**21 remain** (the higher-stakes memory-safety cluster §A #2–#7 / §B / §C / §E). This
+section is the HOW — the workflow + the gotchas that each cost a debug loop to
+rediscover, so a fresh session consuming the tracker doesn't re-pay them.
+
+### The per-fix workflow (proven over 20 fixes)
+
+1. **Take the tracker row, not the branch.** Read the row: proper source `sha`, files,
+   conflict-group. Do NOT `git cherry-pick`/`merge` the branch — a single audit commit
+   BUNDLES several tracker items (e.g. `66332d39` carries #6 defer-abort + #5 paren-deref
+   [rejected] + #3 ISR-ban [§G #40] + #4 frame-local-free [§A #3]; `5a6889df` carries
+   F4 mmio-span [§G #38] + F1/F3 escape [§B] + F5/F6 uN/iN [already shipped]). Pull ONLY
+   the hunk for the item you're doing: `git show <sha> -- <file>`.
+2. **Re-anchor by TEXT, never line numbers.** The branch's base is OLDER than current
+   main, so every line number in the diff is shifted (often by hundreds of lines — main
+   grew UINT/SINT cases, new intrinsics, etc.). Grep the anchor text in current main,
+   read the exact surrounding lines, and Edit against THAT. Twice this session the diff's
+   context didn't even exist in main the same way (e.g. `type_name_write` gained
+   UINT/SINT cases the old diff never saw — I had to convert those too to keep the switch
+   exhaustive under `-Werror=switch`).
+3. **Verify every dependency the hunk calls EXISTS in current main before editing.**
+   `grep` each helper the hunk references (`compute_type_size`, `type_alignment_bytes`,
+   `check_isr_ban`, `ir_snapshot_alias`, `escape_type_carries_ref`, …). A hunk that
+   assumes a helper the branch also introduced elsewhere will silently miscompile if you
+   apply it alone. `check_isr_ban` was a near-miss — it exists as `static bool` at a
+   different name/line than my first grep pattern expected.
+4. **Baseline new `_eff->kind == TYPE_X` reads.** A fix that reads `x_eff->kind == TYPE_Y`
+   on an ALREADY-`type_unwrap_distinct`'d local is documented-safe (see "Distinct-Unwrap
+   Structural Kill"), but `tools/audit_type_dispatch.sh` flags it as a NEW raw
+   type-dispatch site → `make check` exits 2 with the audit line ABSENT. Fix: add the
+   exact `file:content` lines to `tools/type_dispatch_baseline.txt` — the authoring branch
+   already did this, so `git show <sha> -- tools/type_dispatch_baseline.txt` gives you the
+   precise entries. Do NOT churn the code to `type_dispatch_kind()`; `_eff->kind` reads
+   correctly use `->kind`. (Hit on #22 designated-init and #41 @container-const.)
+5. **Verify, in this order:** (a) `bash tools/sink_matrix.sh <zerc>` for ANY escape/free
+   change (see below); (b) the fix's own negative + positive `.zer`; (c) `make check` in
+   the **FOREGROUND** with `timeout 600000` — background Docker runs get reaped by the
+   harness ("killed"). A green `make check` shows `MAKE_CHECK_EXIT=0` AND the audit lines
+   ("OK — no default:…", "OK — no new raw type-dispatch sites").
+6. **Ship + retire.** Commit (zerohexer only, no AI attribution), push, then in the SAME
+   pass: retire the tracker row (limitations.md), add the BUGS-FIXED.md entry, bump the
+   landed/remaining count in the CLAUDE.md pointer.
+
+### Gotchas that each cost a loop (do not rediscover)
+
+- **`orelse return` is BARE — no value.** `orelse return 0` / `orelse return 1` is a
+  PARSE ERROR. This bit test FIXTURES repeatedly: a negative test that "passes" may be
+  passing on the parse error (not the bug under test), and a positive test that
+  "over-rejects" may just carry this typo. `sink_matrix.sh` itself had 3 cells with
+  `orelse return 0` that produced 2 false "ok"s and 1 false OVER-REJECT until fixed to
+  bare `orelse return;` inside a `u32 main()`.
+- **A negative test's non-zero exit is NOT proof of the intended rejection.** The runner
+  accepts ANY non-zero, so a SIGSEGV (exit 139) or a parse error counts as "pass". Always
+  confirm the REASON: grep the expected error string, and for crash-class fixes assert
+  `exit != 139`. This was DECISIVE for #32 (parser DoS) — the whole point was "clean
+  'nesting too deep' error, NOT stack overflow", which a bare pass/fail check can't tell
+  apart.
+- **Two emitter dispatch paths per intrinsic — fix BOTH.** AST `emit_expr` (~2700–3300)
+  and IR `emit_rewritten_node` (~6400–11000). A codegen fix (`@inttoptr` span #38,
+  `@saturate` #23) usually needs the identical edit in both. When the two emit lines are
+  byte-identical, give each a distinguishing comment so exact-match Edit is unambiguous.
+- **Choosing the "proper version" when 2+ branches fixed the same bug — pick the more
+  central mechanism and NOTE the rejected one + why.** #21 optional-None: `ret_from_orelse`
+  flag (handles both `?T` and `?void`-orelse) over the `?T`-only fix. #34 `(*ptr & mask)`:
+  speculation + `token_can_start_unary` over the simpler "does `)` follow the type"
+  heuristic, which misparses `(*ptr) + 3` as a cast. #35 defer-abort: fix `emit_defers_from`
+  at the ROOT (covers every conditional early-exit) over per-site `emit_pending_ir_defers`.
+- **`git cherry -v main <branch>` all-`+`** confirms a branch's fixes are genuinely absent
+  from main (patch-id compare) — the heavy overlap is AMONG branches (same bug found 3–4×),
+  not with main.
+
+### The per-sink matrix — `tools/sink_matrix.sh` (the memory-safety regression gate)
+
+Escape/free analysis is a PER-SINK PATCHWORK: the "is this value frame-bound?" question is
+re-implemented at every sink (return, store-to-global, struct-field-store, keep-call,
+free, 2-step launder), so the same value SHAPE leaks through some sinks while caught at
+others. `sink_matrix.sh` makes that a grid of `{value-shape × sink}` cells, each with an
+expected `reject`/`compile`, and classifies mismatches as **HOLE** (compiles but should
+reject = a shipped UAF/dangling escape) or **OVER-REJECT**. Baseline vs current main
+(2026-07-15): **17 ok, 6 HOLES, 0 over-rejects** — every SAFE baseline passes (param-view,
+param-subslice, scalar-copy, alive-subslice), and the 6 holes map 1:1 to the remaining
+fixes:
+- `p5__k6_free` = `free(slice-of-local)` → §A #3.
+- `p7__k2_store_glob` / `p7__k3_field_store` / `p7__k2v_2step` = a `?*T` FIELD carrying
+  `&local` escaping to a global/field → §B #8.
+- `p2__k2v_2step` / `p3__k2v_2step` = `&local[i]`/`&local.field` laundered through a `?*T`
+  var-decl → §B #8/#9.
+Run it after EVERY escape/free change: a fix must flip its OWN cell(s) to ok and regress
+NONE (no new HOLE, no new OVER-REJECT). It is NOT yet wired into `make check` (it reports
+the known baseline holes); wire it in as a permanent gate once the matrix is CLEAN. This is
+also the discipline that made §A #1 (subslice inherits base `alloc_id`) safe — verified
+UAF-view + double-free-view caught AND param/alive subslice not over-rejected AND
+base-direct UAF still caught, not just its own test.
+
 ## ZER Safety Architecture — Read Before Any Safety Work
 
 **Mandatory reading before modifying ANY safety-relevant code** (checker.c

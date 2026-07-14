@@ -18,7 +18,8 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 + §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id,
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
-escape), 16 remaining.**
+escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX NOW CLEAN**),
+15 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -77,10 +78,17 @@ bare `&local` (NODE_IDENT), skipping the field/index chain; extracted `addr_of_i
 (with the pointer-into-nonlocal-ref relaxation preserved) shared by BOTH var-decl + assignment
 sinks; `66332d39` (#1), tests `reassign_addr_local_{index_return,field_global}` + positive
 `reassign_addr_param_slice_ok`, sink cells `p2/p3__k7_reassign` added+closed; 2026-07-15. make
-check 951/0.**
+check 951/0. #8 optional/array/nested-slice pointer-carrier escape — shared
+`escape_type_carries_ref` (pointer|slice|optional-of-those) replaces the enumerated
+{POINTER,SLICE} gates at the nested-call recursion (F1) + both NODE_ASSIGN field-descend sinks
++ the var-decl call-result sink (F3), + F3 two-step field-read propagation, +
+`type_can_carry_pointer` TYPE_ARRAY (D1, 586507fb) and TYPE_OPTIONAL (sink-matrix-driven) arms
+(both via the precise `type_carries_data_pointer`, so `?u32`/scalar arrays stay excluded);
+`5a6889df` F1/F3 + `586507fb` D1, tests `escape_{nested_slice,optional_ptr_field}_launder` +
+`array_field_launder_escape` + positive `optional_ptr_field_global_ok`; 2026-07-15. make check
+955/0. **🎯 SINK MATRIX CLEAN (25 ok / 0 holes) — every escape/free hole closed.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
-| 8 | optional/array pointer-carrier escape | 5a6889df (`escape_type_carries_ref`) **+ TYPE_ARRAY arm from** 586507fb (D1) | checker.c |
 | 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
 | 12 | Ring.push / spawn of by-value aggregate carrying ptr-to-local | a3e1f66c | checker.c |
 
@@ -172,13 +180,12 @@ overflows the range check (`5a6889df` F4, test `mmio_struct_range_overflow`). ma
 
 **Next up (start here):** ✅ §D/§F/§G FULLY DONE; §A #1 (subslice-alloc_id) + §A #3 / §B #10
 (slice escape/free from `bf29ffdc`) DONE 2026-07-15. Remaining memory-safety = §A #2 / #4–#7,
-§B #8/#9/#11/#12, §C VRP/bounds (#13–#16), §E concurrency (#26–#31). **Recommended order (by
-sink-matrix leverage; §E #26 + §A #2 + §B #9 DONE 2026-07-15):** → §B #8 (optional/array
-pointer-carrier, 5a6889df `escape_type_carries_ref` + TYPE_ARRAY from 586507fb D1) — this is
-the LAST matrix fix: it closes ALL 5 remaining holes (the 3 `p7` optional-field-carrier + the
-2 `p2/p3__k2v_2step` 2-step launders), making the sink matrix CLEAN → then wire it into
-`make check` as a permanent gate. After §B #8: §A #4–#7, §B #11/#12, §C VRP/bounds (#13–#16),
-§E #27–#31.
+§B #8/#9/#11/#12, §C VRP/bounds (#13–#16), §E concurrency (#26–#31). **Recommended order (§E #26 + §A #2 + §B #9 + §B #8 DONE 2026-07-15 → SINK MATRIX CLEAN):**
+the remaining fixes are NO LONGER sink-matrix cells (the matrix is clean), so order by risk:
+→ §B #11/#12 (arena/Ring-spawn launder — escape sinks, same file, add a matrix cell each) →
+§A #4–#7 (Level-B guard / struct-copy / move-alias — zercheck_ir.c) → §C VRP/bounds (#13–#16,
+checker.c/emitter.c) → §E #27–#31 (concurrency — ir_lower.c/emitter.c). Each still verified
+against the sink matrix (must stay CLEAN) + its own neg/pos + make check.
 **Extra care** — these land in the same `zercheck_ir.c`/`checker.c` regions (conflict-group
 siblings); a mistake in §A/§B ships a UAF, not an over-reject. Verify EACH against the full
 sink matrix (`bash tools/sink_matrix.sh ./zerc`) per CLAUDE.md "Escape/keep analysis is a
@@ -192,18 +199,13 @@ already shipped). All verified absent from main.
 and classifies each: **ok** / **HOLE** (compiles but should reject = a shipped UAF/dangling
 escape) / **OVER-REJECT** (rejects a safe program). This is the regression baseline for the
 memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix must flip its
-own cell(s) to ok AND leave every other cell unchanged. **Current 2026-07-15: 20 ok, 5 HOLES**
-(started 17/6 @ 23 cells; §A #3 closed `p5__k6_free`; §B #9 added+closed the 2 new
-`p2/p3__k7_reassign` cells). All SAFE baselines pass → no over-reject. The 5 remaining holes
-ALL map to §B #8 (the last matrix fix):
-- ✅ `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9) — CLOSED 2026-07-15.
-- `p7__k2_store_glob` / `p7__k3_field_store` / `p7__k2v_2step` — an optional-ptr FIELD (`?*T`)
-  carrying `&local` escapes to a global/field → §B #8 (optional pointer-carrier; 5a6889df
-  F1/F3 `escape_type_carries_ref` + TYPE_OPTIONAL, a3e1f66c, f40ca06b F4).
-- `p2__k2v_2step` / `p3__k2v_2step` — `&local[i]`/`&local.field` laundered through a `?*T`
-  var-decl (`?*u32 t = p; g = t`) → §B #8 (the optional-carrier propagation — NOT §B #9,
-  which is the reassignment case, now done). §B #9 does NOT close these (verified empirically).
-**§B #8 closes all 5 remaining holes → matrix CLEAN → then wire it into `make check`.**
+own cell(s) to ok AND leave every other cell unchanged. **🎯 CLEAN 2026-07-15: 25 ok, 0 HOLES,
+0 over-rejects** (started this session at 17 ok / 6 HOLES @ 23 cells). ALL escape/free holes
+closed: `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9, added+closed), the 3 `p7×`
+optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step (§B #8). Now that it is CLEAN it is
+being wired into `make check` as a permanent gate (invoked after the build). **Add a new cell
+whenever a new escape/free sink or value shape is introduced** — the gate then enforces it
+forever; a fix that regresses any cell fails `make check`.
 
 ---
 

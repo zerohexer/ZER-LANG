@@ -1,0 +1,11 @@
+// EXPECTED: compile error — a local array whose element carries a pointer can
+// launder a stack pointer to a global (arr[0].p = local slice; g = arr[0].p).
+struct Box { [*]u8 p; }
+[*]u8 g;
+void bad() {
+    u8[10] buf;
+    Box[2] arr;
+    arr[0].p = buf[0..10];
+    g = arr[0].p;           // dangling escape
+}
+u32 main() { bad(); return 0; }

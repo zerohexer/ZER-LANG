@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — optional/array/nested-slice pointer-carrier escape — SINK MATRIX NOW CLEAN (checker.c)
+
+Tracker §B #8 (sources `5a6889df` F1/F3 + `586507fb` D1 + a sink-matrix-driven completion).
+The escape taint-walks each re-implemented "does this value carry a reference into the frame?"
+gate as `{POINTER, SLICE}` only, and each site missed a DIFFERENT frame-carrying shape — a
+family of shipped return/global UAFs:
+
+- **F1 (nested slice-call launder):** `arg_is_local_derived` recursed into a nested call's
+  result only for TYPE_POINTER, so `stash(sub(local[..]))` where `sub([*]u8)->[*]u8` returns a
+  view of its param laundered a stack SLICE past the escape sinks.
+- **F3 (optional-pointer field/element launder):** the NODE_ASSIGN + keep-inference
+  field-descend gates were pointer/slice-only, skipping TYPE_OPTIONAL — so `g = b.p` where
+  `b.p : ?*u32` holds `&local` stored a stack pointer to a global undetected. Plus a var-decl
+  field-read propagation for the two-step form `?*u32 t = b.p; g = t`.
+- **D1 (array-of-pointers launder):** `type_can_carry_pointer` excluded TYPE_ARRAY, so
+  `Box[2] arr; arr[0].p = local_slice; g = arr[0].p;` never marked the array root local-derived.
+
+Fix: a shared `escape_type_carries_ref(vt)` predicate (pointer | slice | optional-of-those; a
+VALUE optional `?u32` is correctly excluded) replaces the enumerated gates at the
+nested-call recursion, both NODE_ASSIGN field-descend sinks, and the var-decl call-result
+sink; plus the F3 two-step var-decl field-read propagation. `type_can_carry_pointer` gains a
+TYPE_ARRAY arm (D1) and — sink-matrix-driven completion — a TYPE_OPTIONAL arm (both delegate
+to the precise recursive `type_carries_data_pointer`, so `?u32`/scalar arrays stay excluded).
+The optional arm closes the IDENT two-step `?*u32 t = p; g = t` (widen a local-derived `*u32`
+into a `?*u32` var, then store) that the field-read F3 hunk didn't cover. All additive (more
+taint) → sound, over-reject only.
+
+**SINK MATRIX NOW CLEAN — 25 ok / 0 holes** (started this session at 17 ok / 6 holes). §B #8
+closed the last 5 (`p7×3` optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step).
+No over-reject: the global-pointer-via-`?*T`-field positive compiles; make check 955/0. Tests:
+`tests/zer_fail/{escape_nested_slice_launder,escape_optional_ptr_field_launder,array_field_launder_escape}.zer`,
+`tests/zer/optional_ptr_field_global_ok.zer`. (Only the escape hunks of `5a6889df` are taken
+here — F4 mmio-span = §G #38, F5/F6/F8 uN/iN + F7 leak-relax are separate/shipped; only D1 of
+`586507fb`.) Tracker §B #8 retired.
+
+---
+
 ## 2026-07-15 — reassignment `p = &local[i]` / `p = &local.f` escaped the frame (checker.c)
 
 Tracker §B #9 (source `66332d39` #1). The ASSIGNMENT-path escape walker (NODE_ASSIGN) matched

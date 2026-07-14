@@ -1,0 +1,13 @@
+// Positive (no over-reject): a ?*T field holding a GLOBAL pointer (not &local)
+// read and stored to another global must compile — escape_type_carries_ref only
+// tightens the descend-to-root walk; the root here (b) is not local-derived
+// because &g_val points to a global, not this frame.
+u32 g_val;
+?*u32 g_out = null;
+struct Box { ?*u32 p; }
+u32 main() {
+    Box b;
+    b.p = &g_val;
+    g_out = b.p;
+    return 0;
+}

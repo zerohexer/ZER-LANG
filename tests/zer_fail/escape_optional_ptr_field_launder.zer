@@ -1,0 +1,6 @@
+// MUST FAIL: reading a ?*T (optional-pointer) struct field that holds &local and
+// storing it to a global launders a stack pointer. F3: the escape sink field-descend
+// gate was TYPE_POINTER/TYPE_SLICE-only, skipping TYPE_OPTIONAL(pointer).
+?*u32 g = null;
+struct Box { ?*u32 p; }
+void stash() { u32 local = 5151; Box b; b.p = &local; g = b.p; }

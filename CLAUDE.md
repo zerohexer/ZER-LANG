@@ -2345,14 +2345,15 @@ When starting a new session or lacking context:
 fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
 soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
 merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **25 landed
+consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **26 landed
 2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
-#36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit landed (§A #1/#2/#3, §B #10, §E #26); + §B
-#9 reassign-addr-of-local escape (66332d39 #1). **16 remaining** = §A #4–#7, §B #8/#11/#12, §C
-VRP/bounds (#13–#16), §E #27–#31 (shipped-UAF risk). **Next by sink-matrix leverage: §B #8
-(optional/array carrier, 5a6889df `escape_type_carries_ref` + TYPE_ARRAY from 586507fb D1) —
-the LAST matrix fix, closes all 5 remaining holes → matrix CLEAN → wire sink_matrix.sh into
-`make check`.** (sink matrix now 25 cells, 20 ok / 5 holes.) The
+#36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit (§A #1/#2/#3, §B #10, §E #26); + §B #9
+reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier escape. **🎯 THE
+PER-SINK ESCAPE/FREE MATRIX (`tools/sink_matrix.sh`) IS NOW CLEAN — 25 ok / 0 holes** (every
+memory-safety hole this session's matrix surfaced is closed). **15 remaining** = §A #4–#7, §B
+#11/#12, §C VRP/bounds (#13–#16), §E #27–#31 (shipped-UAF risk); these are no longer matrix
+cells, so order by risk (see limitations.md tracker). Every remaining escape fix must keep the
+matrix CLEAN (`bash tools/sink_matrix.sh ./zerc`) + add a cell for its own shape. The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,
 `orelse return` is bare, a neg-test non-zero exit ≠ intended rejection / could be SIGSEGV,
 baseline new `_eff->kind` sites, make check FOREGROUND) are in **compiler-internals.md

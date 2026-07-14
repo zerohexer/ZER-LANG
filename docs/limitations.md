@@ -15,7 +15,8 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id), 21 remaining.**
++ §F crashes #32/#33/#34/#35, + §G bare-metal FULLY DONE #36–#41, + §A #1 subslice-alloc_id,
++ §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape), 19 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -45,22 +46,30 @@ binary regen). To inspect any fix: `git show <sha>`.
 now caught (var-decl + assign forms; walk RHS to root IDENT, alias iff `alloc_id != 0` so
 param/stack subslice untouched); `8d9514f3`, tests `subslice_{uaf,double_free,alive_ok}`,
 per-sink-matrix verified (param-subslice + alive-subslice compile; base-direct UAF still
-caught); 2026-07-15. make check 936/0.**
+caught); 2026-07-15. make check 936/0. #3 reject `free()` of a non-heap slice
+(stack-array/arena/local-derived) — raw libc `free()` on stack/arena memory was UB
+(`-Wfree-nonheap-object`); `bf29ffdc`, relies on §B #10's local-derived marking, tests
+`free_nonheap_slice_{direct,stack}`, sink cell `p5__k6_free` closed; 2026-07-15. make check
+942/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 2 | cross-fn slice-param free tracked (`frees_param` += TYPE_SLICE) | bf29ffdc | zercheck_ir.c |
-| 3 | reject `free()` of non-heap (stack/arena/local-array) slice | bf29ffdc | checker.c |
 | 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |
 | 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
 | 6 | struct value-copy preserves compound handle (Pattern-4 replicate) | 59a968cb (A3) | zercheck_ir.c |
 | 7 | move-alias via `&arr[i]` / `&b.field` / spawn-arg | 582920db (#4) | zercheck_ir.c |
 
 ### B. Escape / dangling-pointer sinks (🔴; #8 base helper partial in main)
+**✅ DONE: #10 assignment-form slice-of-local (`[*]T s; s = arr; return s` / `g=s` / `&s[0]`)
+escaped a dangling stack slice — the NODE_ASSIGN taint was gated on FIELD/INDEX targets,
+excluding whole-ident slice targets; extracted the var-decl walk into a shared
+`mark_slice_local_derived_from_value` helper used by BOTH sinks (they can no longer drift);
+`bf29ffdc` (773), tests `{global,return}_reassigned_slice_local` + `return_reassigned_slice_ptr`
++ positive `slice_reassign_heap_ok`; 2026-07-15. make check 942/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 8 | optional/array pointer-carrier escape | 5a6889df (`escape_type_carries_ref`) **+ TYPE_ARRAY arm from** 586507fb (D1) | checker.c |
 | 9 | reassign `p = &local[i]/.f` escapes frame | 66332d39 (#1, `addr_of_is_local_derived`) | checker.c |
-| 10 | assignment-form slice-of-local (`r = arr; return r`) | bf29ffdc (773) | checker.c |
 | 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
 | 12 | Ring.push / spawn of by-value aggregate carrying ptr-to-local | a3e1f66c | checker.c |
 
@@ -144,30 +153,34 @@ overflows the range check (`5a6889df` F4, test `mmio_struct_range_overflow`). ma
 - emitter.c defer: #16, 35 (`emit_defer_stmt` / pending-defer)
 - checker.c VRP: #13, 14, 15 (var_range save/restore + return-range)
 
-**Next up (start here):** ✅ §D (miscompiles #17–#25), §F (crashes/robustness #32–#35), and
-§G (bare-metal/ISR #36–#41) all FULLY DONE (2026-07-13/15). Remaining = ONLY the higher-stakes
-memory-safety clusters: §A UAF/double-free (#1–#7), §B escape sinks (#8–#12), §C VRP/bounds
-(#13–#16), §E concurrency (#26–#31). **Extra care required** — these land in the same
-`zercheck_ir.c`/`checker.c` regions (conflict-group siblings), and a mistake is a shipped UAF,
-not an over-reject; verify each against the full escape-sink matrix per CLAUDE.md
-"Escape/keep analysis is a PER-SINK PATCHWORK", and re-run the sink matrix after each. Note:
-some of these overlap with fixes' un-taken halves already shipped (e.g. `66332d39` #4
-frame-local free = §A #3; `5a6889df` F1/F3 = §B; `582920db` #1/#3/#4 baseline lines already
-pre-added). All verified absent from main.
+**Next up (start here):** ✅ §D/§F/§G FULLY DONE; §A #1 (subslice-alloc_id) + §A #3 / §B #10
+(slice escape/free from `bf29ffdc`) DONE 2026-07-15. Remaining memory-safety = §A #2 / #4–#7,
+§B #8/#9/#11/#12, §C VRP/bounds (#13–#16), §E concurrency (#26–#31). **Recommended order (by
+sink-matrix leverage):** §E #26 (spawn-scan recursion, `bf29ffdc` BUG-772 — same commit,
+independent) → §A #2 (cross-fn slice free, `bf29ffdc` BUG-776) → §B #9 (`addr_of_is_local_derived`,
+66332d39 #1 — closes `p2/p3__k2v_2step`) → §B #8 (optional carrier — closes the 3 `p7` holes).
+**Extra care** — these land in the same `zercheck_ir.c`/`checker.c` regions (conflict-group
+siblings); a mistake in §A/§B ships a UAF, not an over-reject. Verify EACH against the full
+sink matrix (`bash tools/sink_matrix.sh ./zerc`) per CLAUDE.md "Escape/keep analysis is a
+PER-SINK PATCHWORK" — a fix must flip its own cell(s) and regress none. Note some overlaps
+with un-taken halves already shipped (`66332d39` #4 frame-local free = §A ..; `5a6889df` F1/F3
+= §B #8; `582920db` #1/#3/#4 baseline lines already pre-added; `bf29ffdc` BUG-775 = §A #1
+already shipped). All verified absent from main.
 
 ### Per-sink verification matrix (`tools/sink_matrix.sh`) — RUN AFTER EVERY §A/§B/§C fix
 `bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (23 cells)
 and classifies each: **ok** / **HOLE** (compiles but should reject = a shipped UAF/dangling
 escape) / **OVER-REJECT** (rejects a safe program). This is the regression baseline for the
 memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix must flip its
-own cell(s) to ok AND leave every other cell unchanged. **Baseline 2026-07-15 vs main: 17 ok,
-6 HOLES** (all SAFE baselines pass → no over-reject), mapping 1:1 to the remaining fixes:
-- `p5__k6_free` — `free(slice-of-local)` → §A #3 (free of non-heap slice, bf29ffdc 774).
+own cell(s) to ok AND leave every other cell unchanged. **Current 2026-07-15: 18 ok, 5 HOLES**
+(started 17/6; §A #3 closed `p5__k6_free`). All SAFE baselines pass → no over-reject. The
+5 remaining holes map 1:1 to the remaining §B fixes:
+- ✅ `p5__k6_free` — `free(slice-of-local)` → §A #3 CLOSED 2026-07-15 (bf29ffdc 774).
 - `p7__k2_store_glob` / `p7__k3_field_store` / `p7__k2v_2step` — an optional-ptr FIELD (`?*T`)
   carrying `&local` escapes to a global/field → §B #8 (optional pointer-carrier; 5a6889df
   F1/F3 `escape_type_carries_ref` + TYPE_OPTIONAL, a3e1f66c, f40ca06b F4).
 - `p2__k2v_2step` / `p3__k2v_2step` — `&local[i]`/`&local.field` laundered through a `?*T`
-  var-decl (`?*u32 t = p; g = t`) → §B #8 (F3 two-step-launder propagation) / §B #9.
+  var-decl (`?*u32 t = p; g = t`) → §B #9 (`addr_of_is_local_derived`, 66332d39 #1) then §B #8.
 Once the matrix is CLEAN (0 mismatch) wire it into `make check` as a permanent gate.
 
 ---

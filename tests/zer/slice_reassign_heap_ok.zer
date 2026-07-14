@@ -1,0 +1,13 @@
+// Reassigning a slice var to a HEAP slice (not a local array) must stay accepted
+// and escape correctly — the assignment-taint fix must not over-reject heap slices.
+i32 puts(const *u8 s);
+struct B { u32 x; }
+?[*]B mk() { [*]B r; r = alloc(B, 4) orelse return; return r; }
+u32 main() {
+    [*]B b = mk() orelse { return 1; };
+    b[0].x = 7;
+    if (b[0].x != 7) { free(b); return 2; }
+    free(b);
+    puts("slice_reassign_heap_ok: ok");
+    return 0;
+}

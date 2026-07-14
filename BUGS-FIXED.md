@@ -5,6 +5,44 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — free() of a non-heap slice + assignment-form slice-of-local escape (checker.c)
+
+Tracker §A #3 + §B #10 (both from `bf29ffdc`; entangled — §A #3's reject reads the
+local-derived flag that §B #10's shared helper sets). Two accept-unsafe escape/free holes,
+both pure TIGHTENINGS (a mistake can only over-reject).
+
+**§B #10 — assignment-form slice-of-local escaped a dangling stack slice.** The var-decl
+form `[*]T s = arr;` was tainted (marked `is_local_derived`) but the ASSIGNMENT form
+`[*]T s; s = arr;` was not — the array→slice / NODE_SLICE taint blocks in the NODE_ASSIGN
+handler were gated on NODE_FIELD/NODE_INDEX targets, excluding whole-ident slice targets.
+So `s = arr; return s;` (and `g = s`, and `*u8 p = &s[0]; return p` via the pointer-return
+relaxation) leaked. Fix: extracted the var-decl walk into a shared
+`mark_slice_local_derived_from_value(c, sym, sym_type, value)` helper (walks
+value/orelse-fallback through NODE_SLICE + field/index chains to a root ident) and call it
+from BOTH the var-decl sink AND the NODE_ASSIGN whole-ident sink — they can no longer drift.
+
+**§A #3 — free() of a non-heap slice emitted raw libc `free()` on stack/arena memory.**
+The emitter emits a raw `free()` with NO provenance guard (unlike the slab `free_ptr` path
+which runtime-traps a foreign pointer), so `free(buf[0..])` / `[*]u8 s = buf[0..]; free(s)`
+on a local array (or an arena slice) was UB (GCC's own `-Wfree-nonheap-object` flags it).
+Fix (universal-free branch): walk the arg to its root ident; if the root is local-derived,
+arena-derived, or a non-static/non-global local ARRAY, reject with "cannot free() a slice
+that views non-heap memory". Heap slices (`alloc(T,n)`) and param/global slices
+(caller-owned) stay allowed — relies on §B #10's marking so the intermediate-binding form
+is caught too.
+
+Baseline: the shared helper's `Node *roots[2]` replaces the removed inline `arr_roots[2]`
+(fixed-buffer baseline updated; both use `type_dispatch_kind`, no type-dispatch baseline).
+**Per-sink-matrix verified:** `p5__k6_free` flipped ok (18 ok / 5 holes; remaining 5 = §B
+#8/#9); no new hole, no over-reject; heap-slice reassign + ownership-transfer still compile.
+Tests: `tests/zer_fail/{free_nonheap_slice_direct,free_nonheap_slice_stack,
+global_reassigned_slice_local,return_reassigned_slice_local,return_reassigned_slice_ptr}.zer`,
+`tests/zer/slice_reassign_heap_ok.zer`. make check 942/0. Tracker §A #3 + §B #10 retired.
+(BUG-775 subslice-alloc_id from the same commit = §A #1, already shipped; BUG-772/776 =
+§E #26 / §A #2, separate commits.)
+
+---
+
 ## 2026-07-15 — subslice of a heap slice inherits the base alloc_id (UAF/double-free) (zercheck_ir.c)
 
 Tracker §A #1 (source gifted-noether-5ergto `8d9514f3`). A subslice `sub = base[a..b]` of a

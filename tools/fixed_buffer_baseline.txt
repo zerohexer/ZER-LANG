@@ -20,7 +20,7 @@
 checker.c:            Node *arr_checks[2] = { NULL, NULL };
 checker.c:                    Node *checks[2] = { node->var_decl.init, NULL };
 checker.c:                    Node *addr_exprs[4] = { NULL, NULL, NULL, NULL };
-checker.c:                Node *arr_roots[2] = { node->var_decl.init, NULL };
+checker.c:    Node *roots[2] = { value, NULL };
 checker.c:                Node *roots[2] = { node->ret.expr, NULL };
 checker.c:        Type *found[4];
 

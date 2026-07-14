@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// Assignment-form slice-of-local stored to a global — dangling stack slice.
+[*]u8 g;
+void leak() { u8[4] arr; [*]u8 r; r = arr; g = r; }
+u32 main() { return 0; }

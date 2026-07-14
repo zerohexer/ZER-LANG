@@ -1,0 +1,3 @@
+// EXPECTED: compile error
+// free() of a direct slice-of-local (no intermediate binding).
+u32 main() { u8[16] buf; free(buf[0..]); return 0; }

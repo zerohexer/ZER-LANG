@@ -1431,6 +1431,50 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_keep_derived) dst->is_keep_derived = true;
 }
 
+/* Escape taint for a slice assignment/decl `slice_sym = value` where `value`
+ * coerces a LOCAL array (or a local-derived slice) into a slice: the slice's
+ * .ptr points into this frame, so `sym` must be marked local-derived or a
+ * later `return sym` / `g = sym` / `&sym[i]` escapes a dangling stack slice.
+ *
+ * Shared by the var-decl path (BUG-203/207/377) and the ASSIGNMENT path (§B
+ * #10). The assignment form (`[*]T s; s = arr;`) was previously un-tainted —
+ * the array->slice / NODE_SLICE taint blocks in the NODE_ASSIGN handler were
+ * gated on NODE_FIELD/NODE_INDEX targets, excluding whole-ident slice targets
+ * — so `s = arr; return s;` (and the g=s / &s[i] siblings) leaked. Mirrors the
+ * var-decl walk exactly: roots = { value, orelse-fallback }, each walked
+ * through NODE_SLICE + field/index chains to a root ident. */
+static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
+                                                Type *sym_type, Node *value) {
+    if (!sym || !value || !sym_type) return;
+    if (type_dispatch_kind(sym_type) != TYPE_SLICE) return;
+    Node *roots[2] = { value, NULL };
+    int root_count = 1;
+    if (value->kind == NODE_ORELSE && value->orelse.fallback)
+        roots[root_count++] = value->orelse.fallback;
+    for (int ri = 0; ri < root_count; ri++) {
+        Node *sr = roots[ri];
+        if (!sr) continue;
+        if (sr->kind == NODE_SLICE) sr = sr->slice.object;
+        while (sr && (sr->kind == NODE_FIELD || sr->kind == NODE_INDEX)) {
+            if (sr->kind == NODE_FIELD) sr = sr->field.object;
+            else sr = sr->index_expr.object;
+        }
+        if (sr && sr->kind == NODE_IDENT) {
+            Type *root_type = typemap_get(c, sr);
+            Symbol *src = scope_lookup(c->current_scope, sr->ident.name,
+                (uint32_t)sr->ident.name_len);
+            if (src && src->is_local_derived) {
+                sym->is_local_derived = true;
+            } else if (type_dispatch_kind(root_type) == TYPE_ARRAY) {
+                bool is_global = src && scope_lookup_local(c->global_scope,
+                    src->name, src->name_len) != NULL;
+                if (src && !src->is_static && !is_global)
+                    sym->is_local_derived = true;
+            }
+        }
+    }
+}
+
 /* Recursively scan an expression for any identifier that refers to a
  * local-derived Symbol (i.e., a value originally obtained via
  * @ptrtoint(&local), or transitively through arithmetic / casts /
@@ -4173,6 +4217,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->container_struct = NULL;
                         tsym->container_field = NULL;
                         tsym->container_field_len = 0;
+                        /* HOLE FIX (§B #10): whole-ident slice target assigned a
+                         * local array / slice-of-local — mark local-derived so
+                         * `s = arr; return s;` (and g=s / &s[i]) is caught. The
+                         * var-decl path already does this; the assignment path
+                         * only handled FIELD/INDEX targets, leaving the whole-
+                         * ident form (the common one) leaking. */
+                        mark_slice_local_derived_from_value(c, tsym, tsym->type,
+                                                            node->assign.value);
                     }
                     /* check if new value is &local — also check orelse fallback (BUG-314) */
                     {
@@ -5180,6 +5232,41 @@ static Type *check_expr(Checker *c, Node *node) {
                  * The direct slice-free path never desugars to a banned method,
                  * so ban it here too (ISR + @critical). */
                 check_isr_ban(c, node->loc.line, "free(slice)");
+                /* HOLE FIX (§A #3): the emitter emits a raw libc free() with NO
+                 * provenance guard (unlike the slab free_ptr path, which
+                 * runtime-traps a foreign pointer). Reject at compile time a
+                 * free() of a slice that views NON-HEAP memory — a local array
+                 * (`free(buf[0..])`, or via a binding `[*]T s = buf[0..]`) or an
+                 * arena slice. Those are stack/arena memory: free() on them is
+                 * UB (GCC's own -Wfree-nonheap-object flags it). Heap slices
+                 * (alloc(T,n)) and param/global slices (caller-owned) stay
+                 * allowed. */
+                {
+                    Node *root = node->call.args[0];
+                    while (root && (root->kind == NODE_SLICE ||
+                                    root->kind == NODE_FIELD ||
+                                    root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_SLICE) root = root->slice.object;
+                        else if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        Symbol *rs = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        bool rs_global = rs && scope_lookup_local(c->global_scope,
+                            rs->name, rs->name_len) != NULL;
+                        bool root_is_local_array = rs && rs->type &&
+                            type_dispatch_kind(rs->type) == TYPE_ARRAY &&
+                            !rs->is_static && !rs_global;
+                        if (rs && (rs->is_local_derived || rs->is_arena_derived ||
+                                   root_is_local_array)) {
+                            checker_error(c, node->loc.line,
+                                "cannot free() a slice that views non-heap memory "
+                                "(stack array or arena); free is only for heap slices "
+                                "from alloc(T, n)");
+                        }
+                    }
+                }
                 result = ty_void;
                 break;
             }
@@ -10491,47 +10578,12 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* BUG-203/207/377: slice from local array — mark as local-derived.
-             * []T s = local_array OR []T s = local_array[1..4]
-             * Both create a slice pointing to stack memory.
-             * BUG-377: also check orelse fallback — s = opt orelse local_buf. */
-            if (node->var_decl.init && type && type->kind == TYPE_SLICE) {
-                /* collect nodes to check: direct init + orelse fallback */
-                Node *arr_roots[2] = { node->var_decl.init, NULL };
-                int arr_root_count = 1;
-                if (node->var_decl.init->kind == NODE_ORELSE &&
-                    node->var_decl.init->orelse.fallback) {
-                    arr_roots[arr_root_count++] = node->var_decl.init->orelse.fallback;
-                }
-                for (int ari = 0; ari < arr_root_count; ari++) {
-                    Node *slice_root = arr_roots[ari];
-                    /* walk through NODE_SLICE to find the object being sliced */
-                    if (slice_root->kind == NODE_SLICE)
-                        slice_root = slice_root->slice.object;
-                    /* walk field/index chains */
-                    while (slice_root && (slice_root->kind == NODE_FIELD ||
-                                           slice_root->kind == NODE_INDEX)) {
-                        if (slice_root->kind == NODE_FIELD) slice_root = slice_root->field.object;
-                        else slice_root = slice_root->index_expr.object;
-                    }
-                    if (slice_root && slice_root->kind == NODE_IDENT) {
-                        Type *root_type = typemap_get(c, slice_root);
-                        Symbol *src = scope_lookup(c->current_scope,
-                            slice_root->ident.name,
-                            (uint32_t)slice_root->ident.name_len);
-                        /* BUG-214: also propagate if source is already local-derived (slice-to-slice) */
-                        if (src && src->is_local_derived) {
-                            sym->is_local_derived = true;
-                        } else if (root_type && type_unwrap_distinct(root_type)->kind == TYPE_ARRAY) {
-                            bool is_global = src && scope_lookup_local(c->global_scope,
-                                src->name, src->name_len) != NULL;
-                            if (src && !src->is_static && !is_global) {
-                                sym->is_local_derived = true;
-                            }
-                        }
-                    }
-                }
-            }
+            /* BUG-203/207/377/214: slice from local array — mark local-derived.
+             * `[*]T s = local_array` OR `= local_array[1..4]` OR
+             * `= opt orelse local_buf` all create a slice into stack memory.
+             * Shared with the assignment sink via the helper (they must not
+             * drift — the assignment form was previously un-tainted). */
+            mark_slice_local_derived_from_value(c, sym, type, node->var_decl.init);
 
             /* @ptrcast provenance: track original type when casting to *opaque.
              * *opaque ctx = @ptrcast(*opaque, sensor_ptr) → provenance = Sensor type.

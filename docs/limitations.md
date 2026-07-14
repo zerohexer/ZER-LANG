@@ -155,6 +155,21 @@ some of these overlap with fixes' un-taken halves already shipped (e.g. `66332d3
 frame-local free = §A #3; `5a6889df` F1/F3 = §B; `582920db` #1/#3/#4 baseline lines already
 pre-added). All verified absent from main.
 
+### Per-sink verification matrix (`tools/sink_matrix.sh`) — RUN AFTER EVERY §A/§B/§C fix
+`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (23 cells)
+and classifies each: **ok** / **HOLE** (compiles but should reject = a shipped UAF/dangling
+escape) / **OVER-REJECT** (rejects a safe program). This is the regression baseline for the
+memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix must flip its
+own cell(s) to ok AND leave every other cell unchanged. **Baseline 2026-07-15 vs main: 17 ok,
+6 HOLES** (all SAFE baselines pass → no over-reject), mapping 1:1 to the remaining fixes:
+- `p5__k6_free` — `free(slice-of-local)` → §A #3 (free of non-heap slice, bf29ffdc 774).
+- `p7__k2_store_glob` / `p7__k3_field_store` / `p7__k2v_2step` — an optional-ptr FIELD (`?*T`)
+  carrying `&local` escapes to a global/field → §B #8 (optional pointer-carrier; 5a6889df
+  F1/F3 `escape_type_carries_ref` + TYPE_OPTIONAL, a3e1f66c, f40ca06b F4).
+- `p2__k2v_2step` / `p3__k2v_2step` — `&local[i]`/`&local.field` laundered through a `?*T`
+  var-decl (`?*u32 t = p; g = t`) → §B #8 (F3 two-step-launder propagation) / §B #9.
+Once the matrix is CLEAN (0 mismatch) wire it into `make check` as a permanent gate.
+
 ---
 
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)

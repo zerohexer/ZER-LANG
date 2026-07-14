@@ -2350,8 +2350,10 @@ consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). 13
 (uN/iN trio, `&&`/`||` short-circuit, optional-None, designated-init, `@saturate`,
 signed-comptime, float-`_`; `type_name` overflow, `(*ptr & mask)`, defer-abort, parser DoS);
 + §G bare-metal #36–#41 FULLY DONE, + §A #1 subslice-alloc_id; 21 remaining. Next: rest of
-memory-safety §A #2–#7, §B escape sinks, §C VRP/bounds, §E concurrency (shipped-UAF risk —
-verify each against the full per-sink matrix, re-run after each; go slow).
+memory-safety §A #2–#7, §B escape sinks, §C VRP/bounds, §E concurrency (shipped-UAF risk).
+**Verify every one with `bash tools/sink_matrix.sh ./zerc`** — the {shape×sink} grid; baseline
+6 HOLES (map to the remaining fixes), all SAFE baselines pass. A fix must flip its own
+cell(s) to ok and add NO new hole / over-reject. Go slow; re-run after each.
 
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)

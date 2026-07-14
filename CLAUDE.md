@@ -2352,8 +2352,9 @@ reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier esca
 PER-SINK ESCAPE/FREE MATRIX (`tools/sink_matrix.sh`) IS NOW CLEAN — 25 ok / 0 holes** (every
 memory-safety hole this session's matrix surfaced is closed). **15 remaining** = §A #4–#7, §B
 #11/#12, §C VRP/bounds (#13–#16), §E #27–#31 (shipped-UAF risk); these are no longer matrix
-cells, so order by risk (see limitations.md tracker). Every remaining escape fix must keep the
-matrix CLEAN (`bash tools/sink_matrix.sh ./zerc`) + add a cell for its own shape. The
+cells, so order by risk (see limitations.md tracker). **`tools/sink_matrix.sh` is now a
+permanent `make check` gate** (runs after the build audits; standalone `make check-sink-matrix`)
+— every remaining escape fix must keep it CLEAN + add a cell for its own shape. The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,
 `orelse return` is bare, a neg-test non-zero exit ≠ intended rejection / could be SIGSEGV,
 baseline new `_eff->kind` sites, make check FOREGROUND) are in **compiler-internals.md

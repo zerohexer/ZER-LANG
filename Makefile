@@ -193,10 +193,16 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/audit_type_dispatch.sh
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
+	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
+	@bash tools/sink_matrix.sh ./zerc
 
 # Stage 3 standalone target — run just the fixed-buffer linter.
 check-fixed-buffers:
 	@bash tools/audit_fixed_buffers.sh
+
+# Standalone — run just the per-sink escape/UAF matrix against a built zerc.
+check-sink-matrix: zerc
+	@bash tools/sink_matrix.sh ./zerc
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

@@ -202,10 +202,11 @@ memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix mu
 own cell(s) to ok AND leave every other cell unchanged. **🎯 CLEAN 2026-07-15: 25 ok, 0 HOLES,
 0 over-rejects** (started this session at 17 ok / 6 HOLES @ 23 cells). ALL escape/free holes
 closed: `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9, added+closed), the 3 `p7×`
-optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step (§B #8). Now that it is CLEAN it is
-being wired into `make check` as a permanent gate (invoked after the build). **Add a new cell
-whenever a new escape/free sink or value shape is introduced** — the gate then enforces it
-forever; a fix that regresses any cell fails `make check`.
+optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step (§B #8). **WIRED into `make check`**
+as a permanent gate 2026-07-15 (`make check` runs `tools/sink_matrix.sh ./zerc` after the
+build audits; standalone: `make check-sink-matrix`). **Add a new cell whenever a new
+escape/free sink or value shape is introduced** — the gate then enforces it forever; a fix
+that regresses any cell fails `make check`.
 
 ---
 

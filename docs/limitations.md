@@ -15,7 +15,7 @@ regression-test file is absent from main; signature helpers absent). The heavy o
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
-+ §F crashes #32/#33/#34/#35), 28 remaining.**
++ §F crashes #32/#33/#34/#35, + §G #36 @critical clobber), 27 remaining.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -117,10 +117,12 @@ shared `p->depth` guard (limit 256); deep `****…`/`----…`/`Box(Box(…))` no
 too deep" instead of SIGSEGV (`a8968db0` A7-13; main already guarded `parse_primary`); tests
 `parser_deep_{type,unary}_recursion`; 2026-07-15. make check 927/0. **§F fully done.**
 
-### G. Bare-metal / ISR / qualifier (absent)
+### G. Bare-metal / ISR / qualifier
+**✅ DONE: #36 `@critical` `"memory"` clobber added to all 6 non-x86 arms (ARM/AVR/RISC-V
+disable+enable; AVR END empty-asm barrier before `SREG=`) — `a8968db0` A7-6; verified in
+emitted C; 2026-07-15. make check 927/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
-| 36 | `@critical` `"memory"` clobber on ARM/AVR/RISC-V | a8968db0 (A7-6) | emitter.c |
 | 37 | baremetal `@cpu_syscall/sysret/iret/hypercall` `#else #error` | 582920db (#5) | emitter.c preamble |
 | 38 | `@inttoptr` aggregate span/alignment (drop `type_width`=0) | 5a6889df (F4) | checker.c, emitter.c |
 | 39 | ISR ban: `@cond_wait`/`@barrier_wait`/`@sem_acquire` | 1fdaaffe | checker.c |

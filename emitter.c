@@ -10272,15 +10272,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "#if defined(__ARM_ARCH)\n");
         emit_indent(e);
-        emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask));\n");
+        /* A7-6 (2026-07-03): the "memory" clobber makes the interrupt-disable a
+         * COMPILER barrier — without it GCC may hoist non-volatile loads/stores
+         * across `cpsid i`/`cli`/`csrrci`, defeating the critical section for
+         * anything the volatile-global rule misses. The x86 arms already had it
+         * (Gap 10, 2026-05-16); ARM/AVR/RISC-V did not. */
+        emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask) :: \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__AVR__)\n");
         emit_indent(e);
-        emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\");\n");
+        emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\" ::: \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__riscv)\n");
         emit_indent(e);
-        emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus));\n");
+        emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus) :: \"memory\");\n");
         emit_indent(e);
         /* Gap 10 fix (2026-05-16): bare-metal x86 (kernel/bootloader)
          * actually CAN disable interrupts via cli/sti — emit the real
@@ -10306,15 +10311,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "#if defined(__ARM_ARCH)\n");
         emit_indent(e);
-        emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask));\n");
+        emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask) : \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__AVR__)\n");
         emit_indent(e);
-        emit(e, "SREG = _zer_sreg;\n");
+        /* A7-6: empty-asm memory barrier BEFORE re-enabling so section stores
+         * complete before interrupts return (SREG= is not a compiler barrier). */
+        emit(e, "__asm__ __volatile__(\"\" ::: \"memory\"); SREG = _zer_sreg;\n");
         emit_indent(e);
         emit(e, "#elif defined(__riscv)\n");
         emit_indent(e);
-        emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus));\n");
+        emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus) : \"memory\");\n");
         emit_indent(e);
         /* Gap 10 fix: restore EFLAGS on bare-metal x86. The push/pop
          * order matches IR_CRITICAL_BEGIN's save/disable sequence. */

@@ -5,6 +5,24 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — @critical missing `"memory"` clobber on ARM/AVR/RISC-V (emitter.c)
+
+Tracker #36 (source nifty-gates-ziwscu `a8968db0` A7-6). The `@critical` interrupt-disable
+asm lacked the `"memory"` clobber on ARM/AVR/RISC-V (the x86 arms had it since Gap 10,
+2026-05-16), so GCC could hoist/sink non-volatile loads/stores across `cpsid i` / `cli` /
+`csrrci` — the critical section was not a COMPILER barrier for anything the volatile-global
+rule misses.
+
+Fix: add `"memory"` to all six non-x86 arms — ARM/RISC-V disable + enable get `:: "memory"`
+/ `: "memory"`; AVR disable gets `::: "memory"`; AVR enable emits an empty-asm barrier
+(`__asm__ __volatile__("" ::: "memory");`) BEFORE the `SREG =` C store (a plain C assignment
+is not a compiler barrier). Verified in emitted C: all six arms carry the clobber. Codegen
+change (no runtime `.zer` test — the clobber only matters on target hardware; the branch
+added none). make check 927/0, all gates OK. Only the A7-6 half of `a8968db0` (A7-13 parser
+DoS = #32 shipped separately).
+
+---
+
 ## 2026-07-15 — parser stack-overflow DoS: parse_type / parse_unary depth guard (parser.c)
 
 Tracker #32 (source nifty-gates-ziwscu `a8968db0` A7-13). `parse_type` and `parse_unary`

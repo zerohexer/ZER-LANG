@@ -20,8 +20,8 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
-VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body),
-**~10 remaining** (§A #4–#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB, §E #27–#31 concurrency).**
+VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF),
+**~9 remaining** (§A #4–#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB, §E #27/#28/#29/#31 concurrency).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -167,14 +167,17 @@ treated NODE_TYPECAST/SLICE/STRUCT_INIT as non-recursing leaves and dropped the 
 `.fallback`, so a worker reading a non-shared global via `(u32)g` / `g_arr[a..b]` / `P{.x=g}`
 / `maybe() orelse g` raced clean; gave them recursing cases (switch stays exhaustive) + scan
 both orelse sides; `bf29ffdc` (772), tests `spawn_race_{cast,orelse_fallback,struct_init}`;
-2026-07-15. make check 945/0.**
+2026-07-15. make check 945/0. #30 UAF across an await (orelse cond) undetected — `IR_AWAIT` was
+in `ir_compute_preds` `default`, dropping the resume predecessor edge when an orelse in the await
+cond inserts intermediate blocks, so zercheck_ir lost handle state across the suspend (silent
+UAF: `free(h); await (g orelse 0)==7; get(h)`); added `case IR_AWAIT:` to the IR_YIELD resume-edge
+case (`dfs_reachable`/`cfg_reaches_fire` already group them); `586507fb` (1-line), test
+`await_orelse_cond_uaf`; 2026-07-15. make check 968/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
-| 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
 | 28 | defer-body shared read emits the lock | 2c7645b9 | emitter.c |
 | 29 | shared-cond mutex unlock on orelse-return/break (no deadlock) | 586507fb (C-F3) | ir_lower.c |
-| 30 | `IR_AWAIT` keeps resume pred edge (UAF-across-await visible) | 586507fb (1-line) | ir.c |
 | 31 | union variant write via `*Union` updates `_tag` | 586507fb | emitter.c |
 
 ### F. Parser / crashes / robustness

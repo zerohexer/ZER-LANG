@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — UAF across an await (orelse cond) undetected — dropped resume pred edge (ir.c)
+
+Tracker §E #30 (source `586507fb`, 1-line class-consistency). `ir_compute_preds` builds the CFG
+predecessor edges that zercheck_ir walks to propagate handle state. `IR_AWAIT` was in the
+`default` fall-through, which only adds the `bi+1` (next-sequential) predecessor edge — but when
+an `orelse` in the await condition (`await (opt orelse d) == x`) inserts intermediate blocks
+between the await and its resume block, `bi+1` points at a fail-RETURN block instead of the
+resume. So the resume block lost its predecessor edge, zercheck_ir went blind across the suspend,
+and a handle freed BEFORE the await was NOT seen FREED at a use AFTER it → a silent
+use-after-free.
+
+Fix: add `case IR_AWAIT:` to the `IR_YIELD` case in `ir_compute_preds` so await uses the same
+resume-edge logic (`last->goto_block` = the real resume_bb). The two other CFG walkers
+(`dfs_reachable`, `cfg_reaches_fire`) already group YIELD/AWAIT — this makes `ir_compute_preds`
+consistent. One line + comment.
+
+Verified: `Handle h = alloc; free(h); await (g orelse 0)==7; get(h)` now rejects as
+use-after-free; normal async/await unaffected (async-matrix 10/10). Test:
+`tests/zer_fail/await_orelse_cond_uaf.zer`. make check 968/0. (Only the await-pred line of
+`586507fb` here — its VRP-JOIN = §C #13, D1 array = §B #8, C-F3/F4 shared-lock = §E #27/#29,
+union-tag = §E #31 are separate.)
+
+---
+
 ## 2026-07-15 — find_return_range mis-credited do-while + guard-body returns → silent OOB (checker.c)
 
 Tracker §C #14 (two arms: `f40ca06b` F1 + `59a968cb` A2). `find_return_range` computes a

@@ -252,13 +252,18 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
                 add_pred(&func->blocks[last->goto_block], arena, bi);
             break;
         case IR_YIELD:
-            /* Yield → resume point. ir_lower sets last->goto_block = resume_bb
+        case IR_AWAIT:
+            /* Yield/await → resume point. ir_lower sets last->goto_block = resume_bb
              * (ir_lower.c:2980). Pre-fix used `bi + 1`, which only matches when
              * the resume_bb is the next-sequential block — but when an orelse
-             * decomp inserts intermediate blocks between yield and resume,
+             * decomp inserts intermediate blocks between yield/await and resume,
              * bi+1 points at a fail-RETURN block instead. Result: missing CFG
-             * edge for the resume → false-positive "defer unreachable" trap
-             * AND lost zercheck_ir state across the yield. */
+             * edge for the resume → false-positive "defer unreachable" trap AND
+             * lost zercheck_ir state across the suspend (§E #30: a handle freed
+             * before an `await (opt orelse d) == x` was NOT seen FREED at a use
+             * after the await — a silent UAF). IR_AWAIT was previously in the
+             * `default` fall-through (only the bi+1 edge); dfs_reachable and
+             * cfg_reaches_fire already group YIELD/AWAIT — this makes it consistent. */
             if (last->goto_block >= 0 && last->goto_block < func->block_count)
                 add_pred(&func->blocks[last->goto_block], arena, bi);
             else if (bi + 1 < func->block_count)

@@ -1,0 +1,12 @@
+// EXPECTED: compile error — use-after-free across an await whose condition
+// inserts CFG blocks (orelse). zercheck must see `h` FREED at the use site.
+struct Item { u32 id; }
+Pool(Item, 4) gp;
+?u32 g_val;
+async void w() {
+    Handle(Item) h = gp.alloc() orelse return;
+    gp.free(h);
+    await (g_val orelse 0) == 7;
+    gp.get(h).id = 5;       // use-after-free
+}
+u32 main() { _zer_async_w t; _zer_async_w_init(&t); return 0; }

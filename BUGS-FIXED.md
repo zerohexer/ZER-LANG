@@ -5,6 +5,98 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — Full-codebase audit: 8 fixes (5 safety holes / crash, 3 miscompiles)
+
+A fresh full audit (5 parallel hunter agents over baremetal/emitter/crash/concurrency/VRP
+surfaces + direct review) found 8 confirmed, previously-unknown defects. Each was reproduced
+against `./zerc`, fixed, tested (positive + negative), and re-verified against the per-sink
+matrix + `make check`. Ordered most-severe first:
+
+1. **VRP-1 — conditional in-place range narrowing leaked past the join (SILENT OOB).**
+   `checker.c`. A conditional region (if branch / loop body / switch arm) that reassigns a
+   PRE-EXISTING variable narrows its `VarRange` entry in place (`i = i%N` → [0,N-1], `i =
+   call()` → return range). The region's var-range save/restore only pops entries ABOVE the
+   high-water mark, so it can't revert an in-place narrowing of an entry that predates the
+   region → the narrowing leaked onto the path where the region didn't execute → a later
+   `arr[i]` was wrongly proven in-bounds → the bounds check was elided → silent OOB read AND
+   write (hosted + bare-metal, no trap). Distinct from the known guard-COMPARISON leak (that
+   pushes above-mark entries the count-restore reverts). Fix: snapshot pre-region entry
+   values (`vrp_snapshot`), and after the region widen any changed pre-existing entry to a
+   sound join (`vrp_join_after_region`, conservative unknown → check kept). Guard-inverse and
+   loop-induction ranges live above the mark, so their precision is preserved. Test
+   `vrp_conditional_narrow_no_leak`.
+
+2. **§B #13 — spawn of a by-value aggregate carrying a stack-local pointer (cross-thread UAF).**
+   `checker.c`. `Msg m; m.p = &local; spawn worker(m)` compiled: the copied struct's pointer
+   field still points into the dead caller frame → the fire-and-forget worker dereferences
+   freed stack. The spawn-arg safety block was gated on `is_ptr_like` (POINTER/SLICE/OPAQUE)
+   and skipped by-value struct/union/array args entirely, so `spawn_arg_is_stack_derived` was
+   never consulted even though `m` is correctly `is_local_derived` (return/global-store sinks
+   already reject it). Fix: an aggregate-carrier arm rejects a stack-derived by-value arg that
+   `type_carries_data_pointer`; scoped spawn (join) still allowed. Tests
+   `spawn_byval_struct_local_ptr` / `spawn_byval_struct_scoped_ok`. (Closes the tracker's
+   §B #13, whose stale root-cause note is superseded — the parent symbol IS tainted now.)
+
+3. **SPAWN-FP — spawn race scanner blind to a global laundered via a local funcptr.**
+   `checker.c`. `scan_unsafe_global_access` followed a call transitively only when the callee
+   resolved to a global function; `*() fp = do_inc; fp();` (or a funcptr struct field) has a
+   local callee ident, so the target's non-shared global RMW raced clean (reproducible lost
+   update). Fix: descend into a function-name binding (var-decl init / assignment / struct-init
+   field), mirroring the existing function-name-as-arg descent; the depth budget is now shared
+   file-scope. Tests `spawn_funcptr_local_race` / `spawn_funcptr_shared_ok`.
+
+4. **ISR-TRANS — ISR global-access checks not transitive through callees (SILENT bare-metal).**
+   `checker.c`. The "shared between ISR and main → must be volatile" and "volatile compound
+   RMW → non-atomic" checks only saw globals lexically inside the `interrupt {}` body. An ISR
+   touching a global through a helper bypassed both — a non-volatile flag polled in main was
+   hoisted (hang), and a helper's `counter += 1` was a torn RMW. Fix: `record_isr_globals`
+   walks the interrupt body (in_interrupt set), follows direct calls into global-function
+   bodies (depth-guarded), records every global read + compound-assign target as an ISR
+   access. `test_modules/hal.zer` relied on the hole (non-volatile `irq_count` shared ISR/main)
+   and was updated to the safe pattern (volatile + explicit read/write). Tests
+   `isr_transitive_volatile` / `isr_transitive_rmw`.
+
+5. **UAF-IR — heap-use-after-free in the safety analyzer.** `zercheck_ir.c`. The non-move
+   alias branch of `ir_check_inst` (IR_ASSIGN) captured `src_h` as a raw pointer into
+   `ps->handles`, then called `ir_add_handle` which can realloc that array; the subsequent
+   invalid-handle check dereferenced the dangling `src_h` (ASan crash on valid input; stale
+   safety decision on the shipped build). The alive-add branch and the invalid check are
+   mutually exclusive (ALIVE ⟹ not invalid), so the second `if` became `else if`. Repro: two
+   `?Handle`/orelse + array-store pairs crossing capacity 8.
+
+6. **LIT-1 — negative / u32-overflowing integer literal into a 64-bit type computed in u32.**
+   `checker.c`. Literals default to u32/u64 by value width; `is_literal_compatible` accepts
+   `-3` for i64 but the value was still lowered in u32 → `i64 a = -3` = 4294967293, `u64 x =
+   100000*100000` wrapped at 2^32, `u64 s = 1<<40` truncated. The assignment path already
+   const-folds to the target width; the other value-flow sites lowered u32-typed temps.
+   Fix: `retype_const_int_to_target` retypes a PURE integer-literal expression
+   (`is_pure_int_literal_expr` — no variable operands) to the destination integer width (via
+   `int_retype_target`, which also unwraps a `?integer` to its inner) at every site: var-decl
+   init, return, call-arg, struct designated-init field, AND the binary-operand promotion (so
+   `i64 x=-7; x != -7` compares against a real i64, not a zero-extended u32 — i32/narrower
+   matched by same-width wrap, only 64-bit widths diverged). Narrow targets still wrap as
+   defined; non-fitting constants still rejected. Test `const_int_target_width`.
+
+7. **BITSHIFT — variable-index bit-extract emitted an unguarded position shift (UB).**
+   `emitter.c`. `reg[hi..lo]` with a runtime `lo` lowered to a raw `reg >> _zer_lo`, which is
+   C UB when `lo >= width` (u64 >> 64) — GCC folds it differently at -O0 vs -O2 and again on
+   ARM/RISC-V, violating ZER's "shift by >= width = 0" guarantee (the F8 fix guarded only the
+   mask). Fix: guard the shift on the object's declared bit width (`type_width`) in both emit
+   paths. Test `bitslice_read_runtime_shift_guard`.
+
+8. **VOL-1 — volatile qualifier dropped on scalar/aggregate locals (SILENT bare-metal).**
+   `emitter.c` / `ir_lower.c` / `ir.h`. `volatile` is carried in the Type only for
+   slice/pointer; a `volatile u32 d;` scalar local emitted a plain `uint32_t d`, so a volatile
+   delay/timing/keep-in-memory loop was optimized away on bare metal. Fix: `IRLocal.is_volatile`
+   set from the var-decl, emitted as the qualifier for non-pointer/non-slice locals. Test
+   `volatile_scalar_local`.
+
+Not-a-bug (agent false positive, discarded after verification): reading a union field value
+(`u32 v = u.num`) is rejected "must use switch" — that is the intentional union-type-confusion
+safety design, not an over-rejection.
+
+---
+
 ## 2026-07-15 — Ring.push of a local-derived pointer element escapes into the global Ring (checker.c)
 
 Tracker §B #12 (Ring.push half; source `a3e1f66c`). A Ring is ALWAYS global, so `rx.push(m)`

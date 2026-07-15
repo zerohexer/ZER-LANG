@@ -19,8 +19,12 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
-Ring.push element-store escape), **~15 remaining** (§A #4–#7, §B #11, §B #13 spawn-by-value
-[re-scoped from #12], §C #13–#16, §E #27–#31).**
+Ring.push element-store escape, + §B #13 spawn-by-value-aggregate [2026-07-15 audit, `5f78347`]),
+**~14 remaining** (§A #4–#7, §B #11, §C #13–#16, §E #27–#31). NOTE: the 2026-07-15 full-codebase
+audit ALSO fixed 7 defects NOT in this branch-import backlog (all NEW, now on main + in
+BUGS-FIXED.md 2026-07-15): VRP conditional-narrow silent OOB, spawn-funcptr-local race,
+ISR-global non-transitive, zercheck heap-UAF, negative/overflow-literal miscompile, bit-extract
+UB shift, volatile-scalar-local drop.
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -96,7 +100,7 @@ cell `p8__k8_ring_push` + baseline `safe_ring_value` (matrix now **27 ok / 0 hol
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
-| 13 | 🔴 OPEN (re-scoped from #12): spawn-by-value-aggregate — `Msg m; m.p=&local; spawn worker(m)` COMPILES. Store of `&local` into field `m.p` taints the field/compound-key (read-side sinks catch `g=m.p`) but NOT the parent SYMBOL `m`, which `spawn_arg_is_stack_derived` checks. Neither §B #9 nor a3e1f66c @@ -4096 fixes it (both set `tsym->is_local_derived`, but `tsym` for a field-target `m.p=&local` is not the parent `m`). Fix: on `o.field=&local` also taint the parent symbol, OR make `spawn_arg_is_stack_derived` consult field-level taint. | (new) | checker.c |
+| 13 | ✅ DONE (2026-07-15, audit): spawn-by-value-aggregate — `Msg m; m.p=&local; spawn worker(m)`. The stale root-cause note below is SUPERSEDED: `m` IS tainted `is_local_derived` now (the return + global-store sinks reject it), so the real gap was the SPAWN sink itself — its safety block was gated on `is_ptr_like` (POINTER/SLICE/OPAQUE) and skipped by-value struct/union/array args, never calling `spawn_arg_is_stack_derived`. Fixed by an aggregate-carrier arm (reject a stack-derived by-value arg that `type_carries_data_pointer`; scoped spawn still allowed). Commit `5f78347`, tests `spawn_byval_struct_{local_ptr,scoped_ok}`. make check green. | 5f78347 | checker.c |
 
 ### C. VRP / bounds — silent OOB (🔴; absent)
 | # | Fix | Proper source (sha) | Files |

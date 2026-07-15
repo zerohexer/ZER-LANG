@@ -1,0 +1,47 @@
+// LIT-1: integer literals default to u32/u64 by value width, so a constant
+// initializer/return/argument flowing into a WIDER integer type was computed in
+// u32 before widening — `i64 a = -3` negated a u32 3 (→ 4294967293 after
+// zero-extension) and `u64 x = 100000*100000` wrapped the product at 2^32. Pure
+// integer-literal constants are now retyped to the destination width so the
+// value (and any negation/arithmetic/shift) is computed correctly.
+u32 g_fail = 0;
+
+i64 ret_neg() { return -7; }
+
+void take(i64 v, u64 acc) {
+    if (v != -4) { g_fail = 1; }
+    if (acc != 10000000000) { g_fail = 2; }
+}
+
+u32 main() {
+    // negative literal into i64 var-decl
+    i64 a = -3;
+    if (a >= 0) { return 1; }
+
+    // u32-overflowing product into u64 var-decl
+    u64 x = 100000 * 100000;
+    if (x != 10000000000) { return 2; }
+
+    // wide shift into u64 (was truncated to 32 bits)
+    u64 s = 1 << 40;
+    if (s != 1099511627776) { return 3; }
+
+    // return of a negative literal from an i64 function
+    if (ret_neg() != -7) { return 4; }
+
+    // negative + wide-arithmetic literals as call arguments
+    take(-4, 100000 * 100000);
+    if (g_fail != 0) { return 5; }
+
+    // narrow target still wraps as defined (target IS u32)
+    u32 w = 100000 * 100000;
+    if (w != 1410065408) { return 6; }
+
+    // comparison of a 64-bit value against a negative literal: the literal must
+    // be retyped to i64, else `x != -7` compares against a zero-extended u32
+    // (-7 → 4294967289) and is always true.
+    i64 y = -7;
+    if (y != -7) { return 7; }
+    if ((y + 3) != -4) { return 8; }
+    return 0;
+}

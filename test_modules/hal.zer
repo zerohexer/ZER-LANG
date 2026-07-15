@@ -1,5 +1,10 @@
-u32 irq_count = 0;
-void inc_count() { irq_count += 1; }
+// A global shared between an ISR (via the inc_count helper) and main must be
+// volatile, and the ISR must not do a compound read-modify-write on it (that is
+// non-atomic). This is now enforced TRANSITIVELY through the helper call
+// (ISR-TRANS fix) — pre-fix the non-volatile / compound form compiled silently
+// and hoisted/torn on real hardware. Use volatile + an explicit read/write.
+volatile u32 irq_count = 0;
+void inc_count() { irq_count = irq_count + 1; }
 interrupt USART1 {
     inc_count();
 }

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// ISR-TRANS: the "volatile compound RMW shared between ISR and main is
+// non-atomic" check was also non-transitive. Here the ISR increments `counter`
+// through bump() and main does `counter += 2` — the read-modify-write is torn
+// between the ISR and main (lost interrupt counts). Now caught transitively.
+volatile u32 counter;
+void bump() { counter += 1; }
+interrupt TIM2 { bump(); }
+u32 main() {
+    counter += 2;
+    return 0;
+}

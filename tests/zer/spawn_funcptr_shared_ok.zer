@@ -1,0 +1,15 @@
+// Positive: the SPAWN-FP funcptr-binding descent must NOT over-reject a worker
+// whose local funcptr targets a function that only touches a SHARED global
+// (auto-locked). Only non-shared/non-const globals are a race.
+shared struct S { u32 v; }
+S g;
+void do_inc() { g.v = g.v + 1; }
+void worker() {
+    *() fp = do_inc;
+    fp();
+}
+u32 main() {
+    ThreadHandle a = spawn worker();
+    a.join();
+    return 0;
+}

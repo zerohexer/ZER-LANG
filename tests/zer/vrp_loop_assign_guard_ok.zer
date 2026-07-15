@@ -1,0 +1,16 @@
+// Regression (Finding B): loop-body pre-pass must JOIN (widen), not narrow to
+// the assigned literal. Without the fix, `arr[i]` before `i = 0` is proven safe
+// against [0,0] and the guard is elided -> OOB write at i==2000000000.
+u32 pick(u32 v) { return v; }
+u32 main() {
+    u32[4] arr;
+    arr[0] = 0;
+    u32 i = pick(2000000000);
+    u32 n = 1;
+    while (n > 0) {
+        arr[i] = 12345;   // must be guarded -> early return, no OOB
+        i = 0;
+        n = n - 1;
+    }
+    return arr[0];
+}

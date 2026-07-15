@@ -5,6 +5,49 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — VRP branch-assign + loop-body range narrowing leaked past the join → elided bounds guard (silent OOB) (checker.c) — §C COMPLETE, TRACKER COMPLETE
+
+Tracker §C #13 (source `586507fb`, Findings A+B — the LAST of the 41 audit fixes). The value-range
+map narrows an integer's range when an assignment gives it a known value; a proven-in-bounds index
+then ELIDES its runtime bounds guard (zero-overhead). Two ways a PATH-LOCAL narrowing leaked to a
+program point where it doesn't hold → the guard was elided → silent out-of-bounds write:
+
+- **Finding A (branch-assign scope leak):** an assignment inside an if-branch (`if (mode == 0) { x
+  = 1; }`) mutates x's VarRange struct IN PLACE. The if-handler's count-only restore (BH-18 #2)
+  rewinds entries the branch PUSHED but cannot undo an in-place mutation of a pre-existing entry, so
+  the branch-local range [1,1] leaked past the unconditional join. `arr[x]` after the if was then
+  proven safe against [1,1] and its guard elided → OOB write at x=2e9 (ASan-verified segfault). Fix:
+  snapshot pre-branch VALUES (`vrp_snap_take`), run each branch, restore for the other branch
+  (`vrp_snap_restore`), then JOIN (union) each branch's result at the merge (`vrp_snap_join`) so the
+  merged range over-approximates every path. Applied on BOTH the comparison/guard path and the
+  non-comparison path of the if-handler; guard-inverse entries (pushed at index ≥ saved_range_count)
+  are left untouched.
+- **Finding B (loop-body narrow-instead-of-widen):** the while/do-while body pre-pass (which widens
+  ranges for variables the body writes, so a body index isn't proven against a stale pre-loop range)
+  delegated to `vrp_invalidate_for_assign`, which for a LITERAL rhs (`i = 0`) NARROWS the entry to
+  [0,0]. So `arr[i]` executed BEFORE `i = 0` in the loop body was proven safe against the
+  post-assignment [0,0], not the (unknown) loop-carried value → guard elided → OOB write at i=2e9.
+  Fix: new `vrp_join_assign_range` UNIONS the write's value range with the loop-carried range
+  (never narrows); preserves `known_nonzero` only when both are nonzero (so a `d = 3` in a loop keeps
+  `100/d` provable while `i = 0` correctly widens the bound).
+
+Four new VRP helpers (`vrp_snap_take`/`vrp_snap_restore`/`vrp_snap_join`/`vrp_join_assign_range`),
+all touching only min/max/known_nonzero (address_taken — a permanent invalidation — left as the
+branch set it). Purely monotone: the join only widens (min lower, max higher), so it can only ADD
+guards, never remove one → sound (an unprovable index just gets a runtime guard). No new
+type-dispatch sites (helpers read struct fields + `NODE_INT_LIT`). Faithful application onto a
+line-identical base; the D1 `type_can_carry_pointer` array arm of the same commit is §B #8 (already
+landed), and its dead `has_atomic_or_barrier` scanner removal is orthogonal (skipped).
+
+Verified: both `arr[x=2e9]`/`arr[i=2e9]` OOB forms now emit the bounds guard (7 guard markers in
+the emitted C) → the guard early-returns → exit 0 (a pre-fix compiler ELIDES the guard → segfault at
+index 2 billion). Tests: `tests/zer/vrp_branch_assign_guard_ok.zer` (Finding A),
+`tests/zer/vrp_loop_assign_guard_ok.zer` (Finding B). make check 984/0, 0 over-rejections, sink
+matrix CLEAN. **§C (VRP / bounds silent-OOB #13–#16) FULLY DONE. 🎯 ALL 41 audit-tracker fixes across
+the 12 `claude/*` branches are now merged to main.**
+
+---
+
 ## 2026-07-15 — multi-root shared lock blind to field-projections + intrinsic/orelse/struct-init reads → data race (ir_lower.c) — §E COMPLETE
 
 Tracker §E #27 (sources `586507fb` C-F4 + `19471462` B1). `find_all_shared_roots_expr` is the

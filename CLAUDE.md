@@ -2341,28 +2341,20 @@ When starting a new session or lacking context:
 
 ### Bug Hunting Workflow (principle-first, not brute-force)
 
-**BEFORE any new audit/bug-hunt, read `docs/limitations.md` "## OPEN — unmerged audit
-fixes across 12 parallel `claude/*` branches" (2026-07-13 TASK TRACKER).** 41 unique
-soundness/miscompile/crash holes are ALREADY FOUND + FIXED on `claude/*` branches (NONE
-merged to main) — with the proper version + commit sha per bug. Don't re-derive them;
-consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **26 landed
-2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
-#36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit (§A #1/#2/#3, §B #10, §E #26); + §B #9
-reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier + §B #12 Ring.push +
-§B #13 spawn-by-value + §B #11 arena-launder. **🎯 §B ESCAPE SINKS FULLY DONE; the per-sink
-matrix (`tools/sink_matrix.sh`, a `make check` gate) is CLEAN — 32 ok / 0 holes.** **~1
-remaining** = §C #13 (VRP JOIN silent OOB, 586507fb A+B — the LAST one). **§A (memory safety
-#1–#7), §B (escape sinks #8–#13), §D, §E (concurrency #26–#31), §F, §G ALL FULLY DONE.** Any new
-escape fix must keep the matrix CLEAN + add a cell. **`tools/sink_matrix.sh` is now a
-permanent `make check` gate** (runs after the build audits; standalone `make check-sink-matrix`)
-— every remaining escape fix must keep it CLEAN + add a cell for its own shape. The
-per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,
-`orelse return` is bare, a neg-test non-zero exit ≠ intended rejection / could be SIGSEGV,
-baseline new `_eff->kind` sites, make check FOREGROUND) are in **compiler-internals.md
-"Merge-back methodology"** — read it before consuming the tracker. **Verify every
-memory-safety fix with `bash tools/sink_matrix.sh ./zerc`** — the {shape×sink} grid;
-baseline 17 ok / 6 HOLES (map 1:1 to the remaining fixes) / 0 over-rejects. A fix must flip
-its own cell(s) to ok and add NO new hole / over-reject. Go slow; re-run after each.
+**The 12-branch audit-fix merge-back is COMPLETE (2026-07-15).** All **41 unique
+soundness/miscompile/crash/bare-metal holes** found across the parallel `claude/*` audit branches
+are now merged to main, one verified fix at a time — §A memory-safety #1–#7, §B escape sinks #8–#13,
+§C VRP/bounds #13–#16, §D miscompiles #17–#25, §E concurrency #26–#31, §F crashes #32–#35, §G
+bare-metal #36–#41. **🎯 The per-sink escape/free matrix (`tools/sink_matrix.sh`) is CLEAN — 32 ok /
+0 holes / 0 over-rejects — and is a permanent `make check` gate.** make check 984/0. The historical
+ledger (source sha → applied form → regression test per fix) is `docs/limitations.md` "## ✅ DONE …
+TASK TRACKER COMPLETE" + the per-section **✅ DONE** paragraphs; two low-risk follow-ups remain as
+their own OPEN entries (NOT part of the 41): §E #28 `orelse-in-a-defer-body` loud-trap and §A #7
+HOLE-A4 `Tok b = *p;` move-via-deref. **Any NEW escape/free fix must keep the sink matrix CLEAN + add
+a cell for its own shape** (standalone `make check-sink-matrix`). The per-fix WORKFLOW + loop-costing
+gotchas (extract-hunk-not-branch, re-anchor-by-text, `orelse return` is bare, a neg-test non-zero
+exit ≠ intended rejection / could be SIGSEGV, baseline new `_eff->kind` sites, make check FOREGROUND)
+are in **compiler-internals.md "Merge-back methodology"**.
 
 When looking for bugs, do NOT read entire files. Instead:
 1. Find ONE instance of the bug (from user report, test failure, or targeted grep)

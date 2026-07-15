@@ -1,0 +1,13 @@
+// Regression (Finding A): an assignment inside an if-branch must not leak its
+// narrowed range past the join. Without the fix, `arr[x]` is proven "safe" with
+// x==1 and the bounds guard is elided -> OOB write at x==2000000000 (segfault).
+u32 pick(u32 v) { return v; }
+u32 main() {
+    u32[4] arr;
+    arr[0] = 0;
+    u32 x = pick(2000000000);
+    u32 mode = pick(5);
+    if (mode == 0) { x = 1; }   // comparison-branch in-place narrow
+    arr[x] = 42;                 // must be guarded -> early return, no OOB
+    return arr[0];
+}

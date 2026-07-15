@@ -5,13 +5,22 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — unmerged audit fixes across 12 parallel `claude/*` branches (2026-07-13) — TASK TRACKER
+## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
-**READ THIS BEFORE DOING ANY NEW AUDIT / BUG-HUNT.** Most holes are ALREADY FOUND and
-FIXED on a branch — don't re-derive them. Twelve parallel `claude/*` audit sessions each
-found + fixed overlapping soundness / miscompile / crash holes. **NONE are merged to
-main** (verified 2026-07-13: `git cherry -v main <branch>` is all `+`; every sampled
-regression-test file is absent from main; signature helpers absent). The heavy overlap is
+**🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),
+each cherry-picked as the PROPER version, rebased onto HEAD, re-verified (build + neg/pos test(s) +
+FOREGROUND make check + — for escape/free — the sink matrix). §A memory-safety #1–#7, §B escape
+sinks #8–#13, §C VRP/bounds #13–#16, §D miscompiles #17–#25, §E concurrency #26–#31, §F crashes
+#32–#35, §G bare-metal #36–#41 — ALL DONE. make check 984/0, sink matrix CLEAN (32 cells). The table
+rows below are retained as a historical index (which source sha → which fix); the per-section **✅
+DONE** paragraphs record the applied form + regression test for each. Two low-risk follow-ups remain
+tracked as their own OPEN entries (NOT part of the 41): the §E #28 `orelse-in-a-defer-body` loud-trap
+(recommend a checker-side ban) and the §A #7 HOLE-A4 `Tok b = *p;` move-via-deref (needs an IR_UNOP
+handler).
+
+**Historical note (kept for provenance).** Twelve parallel `claude/*` audit sessions each
+found + fixed overlapping soundness / miscompile / crash holes; NONE were merged to main
+originally (verified 2026-07-13: `git cherry -v main <branch>` all `+`). The heavy overlap was
 AMONG the branches (several bugs found 3–4×), NOT with main. **41 unique fixes** after
 dedup — **11 landed (§D uN/iN + miscompiles #17–#25 fully done: uN/iN trio, `&&`/`||`
 short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, float-`_`;
@@ -23,8 +32,11 @@ Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**],
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
 defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle
 + §A #7 move-alias compound-key + §A #4 Level-B complementary-free-pair + §A #5 Level-B copy-chain immutability [**§A FULLY
-DONE**] + §E #29 shared-cond unlock deadlock + §E #27 multi-root shared-lock [**§E FULLY DONE**]),
-**~1 remaining** (§C #13 VRP JOIN silent-OOB — the last one).**
+DONE**] + §E #29 shared-cond unlock deadlock + §E #27 multi-root shared-lock [**§E FULLY DONE**]
++ §C #13 VRP branch/loop JOIN [**§C FULLY DONE**]), **🎯 ALL 41 FIXES MERGED — TRACKER COMPLETE.**
+Every §A/§B/§C/§D/§E/§F/§G soundness/miscompile/crash/bare-metal hole found across the 12 `claude/*`
+audit branches is now on main, each with its own regression test(s) and (for escape/free) a sink-matrix
+cell. make check 984/0, sink matrix CLEAN.**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -155,10 +167,17 @@ OOB): F1 added NODE_DO_WHILE to the loop case (a do-while-body `return` escaped 
 `f40ca06b`); A2 threaded an `in_branch` param so a bare `return param` narrows ONLY at top level
 (a guard-BODY return was wrongly credited the guard's inverse range; `59a968cb`) — sound
 top-level narrowing kept. Tests `dowhile_return_range_oob` (trap) + `return_range_guard_body_bounds`
-(exit 0); 2026-07-15. make check 967/0.**
-| # | Fix | Proper source (sha) | Files |
-|---|---|---|---|
-| 13 | VRP guard-narrowing leaks past switch/if-capture/orelse/loop join | 586507fb (A+B, JOIN) | checker.c |
+(exit 0); 2026-07-15. make check 967/0. #13 VRP branch-assign + loop-body range narrowing leaked
+past the join → elided bounds guard (silent OOB): Finding A — an assignment inside an if-branch
+(`if(mode==0){x=1}`) mutates x's VarRange IN PLACE, which the count-only restore can't undo, so the
+branch-local [1,1] leaked past the join and `arr[x]` elided its guard (OOB at x=2e9); snapshot
+pre-branch VALUES + JOIN each branch's result at the merge (new `vrp_snap_take/restore/join`, on both
+comparison + non-comparison paths). Finding B — the loop-body widen pre-pass delegated to
+`vrp_invalidate_for_assign` which NARROWS a literal rhs (`i=0`→[0,0]), so `arr[i]` before `i=0` was
+proven against [0,0] not the carried value (OOB at i=2e9); new `vrp_join_assign_range` UNIONS
+(widens, never narrows). Monotone → can only ADD guards → sound. `586507fb` A+B, tests
+`vrp_branch_assign_guard_ok` + `vrp_loop_assign_guard_ok` (both exit 0, guard emitted); 2026-07-15.
+make check 984/0. **🎯 §C (VRP / bounds silent-OOB #13–#16) FULLY DONE.**
 
 ### D. uN/iN + miscompiles (🟠)
 **✅ DONE (merged to main): #17 assign/compound-assign mask, #18 `@truncate` mask

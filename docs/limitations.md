@@ -2253,6 +2253,19 @@ self-contained: minimal reproducer, exact observed/expected, the asymmetric
 control that proves it is a gap (not a design choice), root cause, and a fix
 sketch. A fresh session can reproduce every one with only the steps here.
 
+> **⚠️ This index PREDATES the 41-fix merge-back (completed 2026-07-15).** Several
+> BH-18 rows have since been CLOSED on main and must NOT be treated as still-open —
+> cross-check the "## ✅ DONE … TASK TRACKER COMPLETE" section at the top of this
+> file + `git log` before reproducing any row. Verified closed on main by the
+> merge-back: **#2 (VRP range-narrow scope leak → OOB) = §C #13** (`vrp_snap_*` /
+> `vrp_join_assign_range`, tests `vrp_{branch_assign,loop_assign}_guard_ok`);
+> **#1 (move-struct pointer-alias) = §A #7 + the FIXED-2026-07-01 subsections below**;
+> **#7 (shared multi-access via cast/intrinsic/index/orelse subexpr)** was closed
+> independently 2026-06-27 (`collect_shared_types_in_expr` no-default switch under
+> `-Werror=switch`, see CLAUDE.md). Remaining rows MAY overlap fixes merged in this
+> window (e.g. #5, #8, #9) — verify each against the tracker + `git log` before
+> treating it as open; do not assume open OR closed without checking.
+
 **How to reproduce (any fresh session):**
 ```
 # build the compiler (native or in Docker; Docker avoids Windows AV):

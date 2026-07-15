@@ -212,7 +212,12 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-ch
   grep -E "Passed:|FAIL|OK — no" /tmp/mc.log '
 ```
 The `:ro` mount means the container can't write binaries to the host. Host-side
-source edits ARE picked up (the tar copies the edited tree in).
+source edits ARE picked up (the tar copies the edited tree in). **When running
+this via the Bash tool's `run_in_background`, invoke the `docker run …` DIRECTLY
+— do NOT also append a manual `& > "$OUT" 2>&1`.** Double-backgrounding orphans the
+docker child when the tool's shell exits → 0-byte output. Pick one: harness
+backgrounding (no `&`/redirect) OR a foreground redirect. (compiler-internals.md
+"Merge-back COMPLETE" lesson 3.)
 
 **Ad-hoc VST verify (Level-3 proofs — `zer-vst` image, non-root gotcha).** To
 check a `proofs/vst/verif_*.v` edit WITHOUT the full ~5-min `make check-vst`,

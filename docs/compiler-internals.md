@@ -248,11 +248,50 @@ fixes:
 - `p2__k2v_2step` / `p3__k2v_2step` = `&local[i]`/`&local.field` laundered through a `?*T`
   var-decl → §B #8/#9.
 Run it after EVERY escape/free change: a fix must flip its OWN cell(s) to ok and regress
-NONE (no new HOLE, no new OVER-REJECT). It is NOT yet wired into `make check` (it reports
-the known baseline holes); wire it in as a permanent gate once the matrix is CLEAN. This is
-also the discipline that made §A #1 (subslice inherits base `alloc_id`) safe — verified
-UAF-view + double-free-view caught AND param/alive subslice not over-rejected AND
-base-direct UAF still caught, not just its own test.
+NONE (no new HOLE, no new OVER-REJECT). **Now WIRED into `make check` as a permanent gate
+(2026-07-15)** — CLEAN at 32 cells / 0 holes / 0 over-rejects (standalone
+`make check-sink-matrix`). This is also the discipline that made §A #1 (subslice inherits
+base `alloc_id`) safe — verified UAF-view + double-free-view caught AND param/alive subslice
+not over-rejected AND base-direct UAF still caught, not just its own test.
+
+### Merge-back COMPLETE (2026-07-16) — all 41 landed; three lessons a fresh session needs
+
+The whole tracker is done (§A #1–7, §B #8–13, §C #13–16, §D #17–25, §E #26–31, §F #32–35,
+§G #36–41), each with regression test(s) + (for escape/free) a sink-matrix cell. `make check`
+984/0. Three lessons from the hardest fixes — read before consuming ANY similar cross-branch
+diff, because they cost real loops:
+
+1. **A source hunk may be SUPERSEDED by a later main refactor — the anchors won't match, and
+   verbatim application re-introduces dead/duplicate logic (the §A #7 trap).** `582920db #4`
+   added a scattered `ir_propagate_alias_state` call at each of SIX `IR_HS_TRANSFERRED` sites,
+   but main had since unified ALL move-transfer through ONE `ir_mark_transferred` sink — only
+   TWO `IR_HS_TRANSFERRED` sites remained. **Before applying: grep the anchor COUNT in current
+   main; if it diverges from the diff's, a later refactor changed the structure.** Then build
+   current main and EMPIRICALLY test each shape the fix targets to find which are ALREADY caught
+   (§A #7: `*Tok p=&arr[0]; Tok b=arr[0]; use(p)` → exit 0 = HOLE; `&b.field` → exit 0 = HOLE;
+   `spawn &a` → exit 1 = ALREADY CAUGHT by the unified sink). Apply ONLY the genuine delta (the
+   compound-key alias block), skip the superseded part. Naively applying the 6 propagate calls
+   would have double-propagated on an already-propagating sink.
+
+2. **High-risk fixes: verify BASE IDENTITY first — then it's a faithful transcription, not a
+   re-derivation (the §C #13 method).** For the scariest fix (VRP branch-merge: 4 helpers
+   `vrp_snap_take/restore/join` + `vrp_join_assign_range` threaded through ~215 lines of
+   interleaved if-handler logic, where a snapshot/join ordering slip ships the exact silent OOB
+   it fixes) the de-risking move was to confirm the source commit's base is **line-for-line
+   identical** to current main — grep each `@@` anchor (`int saved_range_count = ...`, the
+   then-body restore, the else/join, the non-comparison branch) and confirm the surrounding
+   text matches the diff's context exactly. Once base identity holds, applying the diff behaves
+   identically to the already-tested commit — a textual transcription, NOT a from-scratch
+   semantic derivation. Verify by diffing your result's `+` lines back against the source hunk.
+   **If the base has diverged, do NOT transcribe — re-derive against the current logic** (that's
+   lesson 1's case).
+
+3. **Bash/harness gotcha: never DOUBLE-background.** Combining `run_in_background: true` (harness
+   backgrounding) with a manual `... & > "$OUT" 2>&1` redirect in the SAME command LOSES all
+   output (0-byte file): the manual `&` detaches the docker child from the tool's shell, which
+   exits and orphans it before output flushes. Use EITHER harness backgrounding (run the docker
+   command DIRECTLY, no `&`/redirect — the harness captures stdout to the task output file) OR a
+   foreground redirect — never both. (Cost a wasted re-run this session.)
 
 ## ZER Safety Architecture — Read Before Any Safety Work
 

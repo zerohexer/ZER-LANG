@@ -23,8 +23,8 @@ Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**],
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
 defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle
 + §A #7 move-alias compound-key + §A #4 Level-B complementary-free-pair + §A #5 Level-B copy-chain immutability [**§A FULLY
-DONE**] + §E #29 shared-cond unlock deadlock), **~2 remaining** (§C #13 VRP JOIN silent-OOB, §E
-#27 multi-root shared-lock ir_lower.c).**
+DONE**] + §E #29 shared-cond unlock deadlock + §E #27 multi-root shared-lock [**§E FULLY DONE**]),
+**~1 remaining** (§C #13 VRP JOIN silent-OOB — the last one).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -213,10 +213,15 @@ condition → deadlock (`if ((g.v orelse return) == 1){…}` on a shared struct 
 without releasing the cond mutex). Added `LowerCtx.cond_shared_saved`: `emit_shared_lock_around_cond`
 points `current_stmt_shared_root` at the cond root (so the in-cond orelse-exit emits the unlock),
 `emit_shared_unlock_after_cond` restores it (after the `!root` early-out). `586507fb` C-F3, test
-`shared_cond_orelse_unlock_ok` (runs exit 0, no deadlock); 2026-07-15. make check 980/0.**
-| # | Fix | Proper source (sha) | Files |
-|---|---|---|---|
-| 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
+`shared_cond_orelse_unlock_ok` (runs exit 0, no deadlock); 2026-07-15. make check 980/0. #27
+multi-root shared lock (`find_all_shared_roots_expr`, the SECONDARY-lock walker) blind to two
+forms → a second shared read emitted UNLOCKED (silent race): C-F4 field-projection — `wa.sp.v`
+where `wa.sp` is `*shared S` (root walked past it) now checks the OBJECT's type at EACH
+projection step + locks the outermost shared sub-expr; B1 wrapper forms — the walker recursed
+TYPECAST/SLICE but not NODE_INTRINSIC/ORELSE/STRUCT_INIT (`ga.v + @truncate(u32, gb.v)` etc.),
+added the 3 cases (condvar/barrier/once self-lock). `586507fb` C-F4 + `19471462` B1, tests
+`shared_multi_field_ptr_lock_ok` + `shared_rw_multi_lock_intrinsic`; 2026-07-15. make check 982/0.
+**🎯 §E (concurrency #26–#31) FULLY DONE.**
 
 **OPEN (from §E #28, low-risk — traps LOUDLY, not silent):** `defer { u32 z = maybe() orelse
 g.v; }` hits a separate emitter gap — `emit_rewritten_node` has no NODE_ORELSE handler in defer

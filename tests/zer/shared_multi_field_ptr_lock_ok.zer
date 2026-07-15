@@ -1,0 +1,17 @@
+// Regression (C-F4): two `*shared S` field-projection reads in one statement
+// must BOTH be locked (multi-root walker was blind to field projections).
+shared struct S { u32 v; }
+struct Wrap { *S sp; }
+S ga;
+S gb;
+u32 f() {
+    Wrap wa; wa.sp = &ga;
+    Wrap wb; wb.sp = &gb;
+    return wa.sp.v + wb.sp.v;   // both locked
+}
+u32 main() {
+    ga.v = 10;
+    gb.v = 32;
+    if (f() != 42) { return 1; }
+    return 0;
+}

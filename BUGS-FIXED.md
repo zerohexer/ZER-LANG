@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — multi-root shared lock blind to field-projections + intrinsic/orelse/struct-init reads → data race (ir_lower.c) — §E COMPLETE
+
+Tracker §E #27 (sources `586507fb` C-F4 + `19471462` B1). `find_all_shared_roots_expr` is the
+SECONDARY-lock walker: for a statement that reads MORE THAN ONE shared struct it finds every
+additional shared root so the emitter emits a rdlock for each (the primary walker locks the
+first; this locks the siblings). Two coverage gaps let a second shared read emit UNLOCKED — a
+silent data race that the multi-shared-TYPE deadlock check waves through (both reads are the same
+`shared(rw)` discipline):
+- **C-F4 (field-projection):** the NODE_FIELD handler walked to the innermost IDENT and checked
+  only its type, so `wa.sp.v` where `wa.sp` is a `*shared S` FIELD (root walked past it to plain
+  `wa`) was missed. Now checks the OBJECT's type at EACH projection step and locks the OUTERMOST
+  shared sub-expression (mirrors the primary `find_shared_root_expr`).
+- **B1 (wrapper forms):** the walker recursed NODE_TYPECAST/SLICE but not NODE_INTRINSIC /
+  NODE_ORELSE / NODE_STRUCT_INIT, so `ga.v + @truncate(u32, gb.v)`, `ga.v + (m() orelse gb.v)`,
+  and `Pair p = { .a = ga.v, .b = gb.v }` locked only `ga`. Added the three cases (condvar/
+  barrier/once intrinsics self-lock — not double-wrapped).
+
+No new type-dispatch sites (the C-F4 `eff->kind` reads reuse content lines already in the
+baseline). Verified: both multi-read forms run correctly (exit 0) and the emitted C carries the
+second rdlock (C-F4: both field-projections locked; B1: intrinsic/orelse/struct-init reads
+locked). Tests: `tests/zer/shared_multi_field_ptr_lock_ok.zer`,
+`tests/zer/shared_rw_multi_lock_intrinsic.zer`. make check 982/0, conc-matrix 15/15.
+**§E (concurrency #26–#31) FULLY DONE.**
+
+---
+
 ## 2026-07-15 — shared-cond mutex leaked on orelse-return/break inside a condition → deadlock (ir_lower.c)
 
 Tracker §E #29 (source `586507fb` C-F3). Reading a shared struct in an `if`/`while`/`for`/

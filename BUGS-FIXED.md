@@ -5,6 +5,35 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — shared read inside a defer body emitted UNLOCKED → silent data race (emitter.c)
+
+Tracker §E #28 (source `2c7645b9`). Two adjacent emitter gaps left a class of shared-struct
+reads inside defer bodies unlocked at defer-fire time (a silent data race):
+1. `emit_defer_shared_root` (the walker that finds the shared root to lock-wrap) missed
+   NODE_INTRINSIC / NODE_ORELSE / NODE_SLICE / NODE_STRUCT_INIT — so `defer { u32 z =
+   @truncate(u32, g.v); }` found no shared root and emitted the read with NO surrounding
+   `pthread_mutex_lock`.
+2. `emit_defer_stmt`'s NODE_VAR_DECL case emitted the init directly without ever calling the
+   walker — so even a plain `defer { u32 z = g.v; }` emitted no lock.
+
+Fix: add the four missing node kinds to `emit_defer_shared_root` (mirroring `find_shared_root_expr`;
+condvar/barrier/once intrinsics self-lock — not double-wrapped), and route the NODE_VAR_DECL init
+through the walker + a read-lock in `emit_defer_stmt` (recursive mutex, safe if a lock is already
+held). The walker is an if/else chain (no `default:`), so it stays walker-audit-clean; `NODE_`
+kinds don't trip the type-dispatch audit.
+
+Verified: `defer { u32 z = @truncate(u32, g.v); }` and `defer { Pair p = { .a = g.v }; }` now
+emit the lock (6 `pthread_mutex_lock` in the emitted C) and run correctly (exit 0). Test:
+`tests/zer/defer_shared_intrinsic_lock.zer`. make check 969/0, conc-matrix 15/15.
+
+**OPEN follow-up** (from the source, logged in limitations.md): `defer { u32 z = maybe() orelse
+g.v; }` hits a SEPARATE emitter gap — `emit_rewritten_node` has no NODE_ORELSE handler in defer
+bodies (they bypass IR lowering), so it traps LOUDLY at runtime with a compiler-bug diagnostic
+(not a silent hole). Recommended fix: checker-side reject `orelse in a defer body` (same class as
+the existing return/break/continue/goto-in-defer bans).
+
+---
+
 ## 2026-07-15 — UAF across an await (orelse cond) undetected — dropped resume pred edge (ir.c)
 
 Tracker §E #30 (source `586507fb`, 1-line class-consistency). `ir_compute_preds` builds the CFG

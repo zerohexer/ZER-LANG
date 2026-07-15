@@ -20,8 +20,9 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
-VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF),
-**~9 remaining** (§A #4–#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB, §E #27/#28/#29/#31 concurrency).**
+VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
+defer-body shared lock), **~8 remaining** (§A #4–#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB,
+§E #27/#29/#31 concurrency).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -172,13 +173,23 @@ in `ir_compute_preds` `default`, dropping the resume predecessor edge when an or
 cond inserts intermediate blocks, so zercheck_ir lost handle state across the suspend (silent
 UAF: `free(h); await (g orelse 0)==7; get(h)`); added `case IR_AWAIT:` to the IR_YIELD resume-edge
 case (`dfs_reachable`/`cfg_reaches_fire` already group them); `586507fb` (1-line), test
-`await_orelse_cond_uaf`; 2026-07-15. make check 968/0.**
+`await_orelse_cond_uaf`; 2026-07-15. make check 968/0. #28 shared read inside a defer body emitted
+UNLOCKED → silent data race: `emit_defer_shared_root` missed NODE_INTRINSIC/ORELSE/SLICE/STRUCT_INIT
+AND `emit_defer_stmt`'s NODE_VAR_DECL never called the walker (so even `defer { u32 z = g.v; }` had
+no lock); added the 4 node kinds (condvar/barrier/once self-lock skipped) + route var-decl init
+through the walker + rdlock; `2c7645b9`, test `defer_shared_intrinsic_lock` (positive, 6
+mutex_lock in emitted C); 2026-07-15. make check 969/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
-| 28 | defer-body shared read emits the lock | 2c7645b9 | emitter.c |
 | 29 | shared-cond mutex unlock on orelse-return/break (no deadlock) | 586507fb (C-F3) | ir_lower.c |
 | 31 | union variant write via `*Union` updates `_tag` | 586507fb | emitter.c |
+
+**OPEN (from §E #28, low-risk — traps LOUDLY, not silent):** `defer { u32 z = maybe() orelse
+g.v; }` hits a separate emitter gap — `emit_rewritten_node` has no NODE_ORELSE handler in defer
+bodies (they bypass IR lowering), so it emits a runtime compiler-bug trap rather than valid C.
+Recommended fix: checker-side reject `orelse in a defer body` (same class as the existing
+return/break/continue/goto-in-defer bans). Not a soundness hole (loud, not silent).
 
 ### F. Parser / crashes / robustness
 **✅ DONE: #33 `type_name` buffer overflow → SIGSEGV (`59a968cb` A5, clamping `tn_append`;

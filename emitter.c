@@ -9479,6 +9479,35 @@ static Node *emit_defer_shared_root(Emitter *e, Node *expr) {
         if (!found) found = emit_defer_shared_root(e, expr->index_expr.index);
     } else if (expr->kind == NODE_TYPECAST) {
         found = emit_defer_shared_root(e, expr->typecast.expr);
+    } else if (expr->kind == NODE_INTRINSIC) {
+        /* §E #28 form-coverage: a defer body reading a shared struct through an
+         * intrinsic (`@truncate(u32, g.v)`) must still emit the mutex lock at
+         * defer-fire — the walker previously returned NULL on NODE_INTRINSIC, so
+         * the deferred access was emitted UNLOCKED = silent race. Condvar/barrier/
+         * once intrinsics handle their own lock — don't double-wrap. */
+        const char *nm = expr->intrinsic.name;
+        size_t nlen = expr->intrinsic.name_len;
+        bool intrinsic_handles_own_lock =
+            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
+            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
+            (nlen == 4 && memcmp(nm, "once", 4) == 0);
+        if (!intrinsic_handles_own_lock) {
+            for (int i = 0; i < expr->intrinsic.arg_count && !found; i++)
+                found = emit_defer_shared_root(e, expr->intrinsic.args[i]);
+        }
+    } else if (expr->kind == NODE_ORELSE) {
+        /* §E #28: `defer { x = a() orelse g.v; }`. */
+        found = emit_defer_shared_root(e, expr->orelse.expr);
+        if (!found) found = emit_defer_shared_root(e, expr->orelse.fallback);
+    } else if (expr->kind == NODE_SLICE) {
+        /* §E #28: `defer { s = g.buf[0..n]; }`. */
+        found = emit_defer_shared_root(e, expr->slice.object);
+        if (!found) found = emit_defer_shared_root(e, expr->slice.start);
+        if (!found) found = emit_defer_shared_root(e, expr->slice.end);
+    } else if (expr->kind == NODE_STRUCT_INIT) {
+        /* §E #28: `defer { P p = { .x = g.v }; }`. */
+        for (int i = 0; i < expr->struct_init.field_count && !found; i++)
+            found = emit_defer_shared_root(e, expr->struct_init.fields[i].value);
     }
     return found;
 }
@@ -9661,6 +9690,13 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         emit(e, "}\n");
         return;
     case NODE_VAR_DECL: {
+        /* §E #28 form-coverage: lock-wrap deferred shared-struct reads in a
+         * var-decl init too (not only NODE_EXPR_STMT). `defer { u32 z = g.v; }`
+         * (or the intrinsic-wrapped form) must emit a rdlock, else the deferred
+         * read at fire-time races. Read lock; recursive mutex is safe if a lock
+         * is already held (BUG-473). */
+        Node *sroot = s->var_decl.init ? emit_defer_shared_root(e, s->var_decl.init) : NULL;
+        if (sroot) emit_shared_lock_mode(e, sroot, false);
         emit_indent(e);
         Type *t = checker_get_type(e->checker, s);
         if (t) emit_type(e, t);
@@ -9670,6 +9706,7 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
             emit_rewritten_node(e, s->var_decl.init, func);
         }
         emit(e, ";\n");
+        if (sroot) emit_shared_unlock(e, sroot);
         return;
     }
     default:

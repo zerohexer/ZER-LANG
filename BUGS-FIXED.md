@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — arena-over-local pointer laundered to a global/param — stack UAF (checker.c) — §B COMPLETE
+
+Tracker §B #11 (sources `85cc109e` D + `87a01415` #4). A pointer from a LOCAL arena
+(`Arena.over(local_backing)`) is frame-bound just like a `&local` — when the frame returns the
+backing (a stack array) is gone, so storing the arena pointer to a global/param is a stack UAF.
+Two escape paths were blind to it:
+
+- **85cc109e D — call-launder:** `arg_is_local_derived` (the "does this call arg carry a
+  frame-bound pointer?" predicate that gates every call-result escape sink) tested only
+  `is_local_derived`, never `is_arena_derived`. So `g = identity(arena_ptr)` laundered the
+  arena pointer through a call undetected. Added `|| src->is_arena_derived` at all 5
+  frame-bound-src sites in the predicate (IDENT, slice/index, orelse-fallback,
+  orelse-of-orelse, field-of-struct).
+- **87a01415 #4 (ESCAPE #1) — direct-call:** `g = arena.alloc_slice(...)` (the direct-call
+  assignment form) only TAINTED the target `is_arena_derived` and never rejected — rejection
+  lived only at the `g = arena_ptr` NODE_IDENT-value path. So the direct call laundered into a
+  global / struct-field-of-global / pointer-param-field silently. Now `classify_escape_sink`
+  the target: global/param → reject; plain local → taint for alias tracking (arena.reset()
+  invalidates all pointers).
+
+No over-reject: arena args to calls whose result stays local compile+run (positive). No new
+type-dispatch sites (arena arm reads the `is_arena_derived` FIELD; the direct-call fix uses
+`classify_escape_sink`). Sink matrix: shape p10 (`p10__k10_arena_call` + `p10__k10_arena_direct`
+reject) + `safe_arena_local` baseline → CLEAN 32 ok / 0 holes. Tests:
+`tests/zer_fail/{escape_arena_launder_global,escape_arena_direct_global,escape_arena_direct_param_field}.zer`,
+`tests/zer/escape_arena_launder_local_ok.zer`. make check 963/0. (The ESCAPE #2 half of
+`87a01415` — `p=&local[i]; g=p` — was already closed by §B #9.) **Tracker §B #11 retired — §B
+(escape/dangling-pointer sinks #8–#13) FULLY DONE.**
+
+---
+
 ## 2026-07-15 — spawn of a by-value struct carrying a ptr-to-local — cross-thread UAF (checker.c)
 
 Tracker §B #13 (re-scoped from §B #12; the hole I surfaced + closed while doing §B #12).

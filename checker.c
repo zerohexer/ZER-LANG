@@ -953,7 +953,13 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
         if (arg->kind == NODE_IDENT) {
             Symbol *src = scope_lookup(c->current_scope,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
-            if (src && src->is_local_derived)
+            /* §B #11 (is_arena_derived): a pointer from a LOCAL arena.alloc() is
+             * frame-bound just like a local — laundering it through a call and
+             * storing the result to a global/return escapes a stack pointer. The
+             * direct-store + keep sinks already reject arena-derived; this launder
+             * path was blind to it (only tested is_local_derived). Applied at all
+             * 5 "is this src frame-bound?" sites in this predicate. */
+            if (src && (src->is_local_derived || src->is_arena_derived))
                 return true;
             /* local array passed as slice → points to stack */
             if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
@@ -980,7 +986,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                 bool is_global = scope_lookup_local(c->global_scope,
                     root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                 if (src && !src->is_static && !is_global &&
-                    (src->is_local_derived ||
+                    (src->is_local_derived || src->is_arena_derived ||
                      (src->type &&
                       type_dispatch_kind(src->type) == TYPE_ARRAY)))
                     return true;
@@ -1020,7 +1026,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
             if (fb && fb->kind == NODE_IDENT) {
                 Symbol *src = scope_lookup(c->current_scope,
                     fb->ident.name, (uint32_t)fb->ident.name_len);
-                if (src && src->is_local_derived)
+                if (src && (src->is_local_derived || src->is_arena_derived))
                     return true;
             }
             /* recurse into nested orelse: o1 orelse o2 orelse &x */
@@ -1046,7 +1052,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                     if (ifb && ifb->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             ifb->ident.name, (uint32_t)ifb->ident.name_len);
-                        if (src && src->is_local_derived)
+                        if (src && (src->is_local_derived || src->is_arena_derived))
                             return true;
                     }
                     inner = ifb;
@@ -1085,7 +1091,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
             if (froot && froot->kind == NODE_IDENT && froot != arg) {
                 Symbol *src = scope_lookup(c->current_scope,
                     froot->ident.name, (uint32_t)froot->ident.name_len);
-                if (src && src->is_local_derived)
+                if (src && (src->is_local_derived || src->is_arena_derived))
                     return true;
             }
         }
@@ -4902,19 +4908,42 @@ static Type *check_expr(Checker *c, Node *node) {
                            (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))) {
                     Type *obj_type = typemap_get(c, obj);
                     if (obj_type && obj_type->kind == TYPE_ARENA) {
-                        /* mark target root as arena-derived — ALL arenas,
-                         * including global. arena.reset() invalidates all pointers. */
-                        Node *root = node->assign.target;
-                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                            if (root->kind == NODE_FIELD) root = root->field.object;
-                            else root = root->index_expr.object;
-                        }
-                        if (root && root->kind == NODE_IDENT) {
-                            Symbol *tsym = scope_lookup(c->current_scope,
-                                root->ident.name, (uint32_t)root->ident.name_len);
-                            if (tsym) {
-                                tsym->is_arena_derived = true;
-                                tsym->is_from_arena = true;
+                        /* ESCAPE #1 (§B #11): the DIRECT-call form
+                         * `g = arena.alloc_slice(...)` previously ONLY tainted the
+                         * target and never rejected — rejection lived at the
+                         * NODE_IDENT-value path below (`g = arena_ptr`), so the
+                         * direct call laundered an arena pointer into a global /
+                         * struct-field-of-global / pointer-param-field silently
+                         * (a local `Arena.over(local_backing)` → real stack UAF).
+                         * Classify the sink here: global/param → reject; plain
+                         * local → taint for alias tracking (arena.reset()
+                         * invalidates all pointers, ALL arenas incl. global). */
+                        Symbol *target_sym = NULL;
+                        bool tgt_global = false, tgt_param = false;
+                        classify_escape_sink(c, node->assign.target,
+                            &target_sym, &tgt_global, &tgt_param);
+                        if (tgt_global || tgt_param) {
+                            checker_error(c, node->loc.line,
+                                tgt_param ?
+                                "cannot store arena-derived pointer through pointer "
+                                "parameter '%.*s' — pointer will dangle when arena is reset" :
+                                "cannot store arena-derived pointer in global/static "
+                                "variable '%.*s' — pointer will dangle when arena is reset",
+                                (int)(target_sym ? target_sym->name_len : 1),
+                                target_sym ? target_sym->name : "?");
+                        } else {
+                            Node *root = node->assign.target;
+                            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                                if (root->kind == NODE_FIELD) root = root->field.object;
+                                else root = root->index_expr.object;
+                            }
+                            if (root && root->kind == NODE_IDENT) {
+                                Symbol *tsym = scope_lookup(c->current_scope,
+                                    root->ident.name, (uint32_t)root->ident.name_len);
+                                if (tsym) {
+                                    tsym->is_arena_derived = true;
+                                    tsym->is_from_arena = true;
+                                }
                             }
                         }
                     }

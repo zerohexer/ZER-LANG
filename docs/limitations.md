@@ -19,8 +19,8 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
-Ring.push + §B #13 spawn-by-value [**§B #12 COMPLETE**]), **~14 remaining** (§A #4–#7, §B #11,
-§C #13–#16, §E #27–#31).**
+Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**]), **~13 remaining**
+(§A #4–#7 zercheck_ir UAF, §C #13–#16 VRP/bounds silent-OOB, §E #27–#31 concurrency).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -103,10 +103,15 @@ is_ptr_like block for local-derived struct/union args (`eff->kind == TYPE_STRUCT
 baselined); pure-value struct not over-rejected; scoped spawns exempt. Matrix cell
 `p9__k9_spawn_val` + `safe_spawn_value` (matrix now **29 ok / 0 holes**); tests
 `spawn_value_struct_local_escape` + `spawn_value_struct_pure_ok`; 2026-07-15. make check 959/0.
-**§B #12 COMPLETE (Ring.push + spawn-by-value both closed).**
-| # | Fix | Proper source (sha) | Files |
-|---|---|---|---|
-| 11 | arena direct-assign launder (`g = arena.alloc_slice`) | 85cc109e (D) + 87a01415 (#4) | checker.c |
+**§B #12 COMPLETE (Ring.push + spawn-by-value both closed).** #11 arena-over-local pointer
+laundered to a global/param — `arg_is_local_derived` was blind to `is_arena_derived` (call-launder
+`g=identity(arena_ptr)`; +5 sites, `85cc109e` D) AND the direct-call form `g=arena.alloc_slice(...)`
+only TAINTED, never rejected (now `classify_escape_sink` → reject global/param; `87a01415` #4
+ESCAPE #1; the ESCAPE #2 half `p=&local[i]; g=p` was already closed by §B #9); matrix shape p10
+(`p10__k10_arena_call/direct`) + `safe_arena_local` (matrix now **32 ok / 0 holes**); tests
+`escape_arena_{launder_global,direct_global,direct_param_field}` + positive
+`escape_arena_launder_local_ok`; 2026-07-15. make check 963/0.
+**🎯 §B (escape / dangling-pointer sinks #8–#13) FULLY DONE.**
 
 ### C. VRP / bounds — silent OOB (🔴; absent)
 | # | Fix | Proper source (sha) | Files |
@@ -211,15 +216,16 @@ with un-taken halves already shipped (`66332d39` #4 frame-local free = §A ..; `
 already shipped). All verified absent from main.
 
 ### Per-sink verification matrix (`tools/sink_matrix.sh`) — RUN AFTER EVERY §A/§B/§C fix
-`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (29 cells)
+`bash tools/sink_matrix.sh ./zerc` runs the {value-shape × escape/free-sink} grid (32 cells)
 and classifies each: **ok** / **HOLE** (compiles but should reject = a shipped UAF/dangling
 escape) / **OVER-REJECT** (rejects a safe program). This is the regression baseline for the
 memory-safety cluster: escape/free analysis is a per-sink patchwork, so a fix must flip its
-own cell(s) to ok AND leave every other cell unchanged. **🎯 CLEAN 2026-07-15: 29 ok, 0 HOLES,
-0 over-rejects** (started this session at 17 ok / 6 HOLES @ 23 cells; grew to 29 as fixes added
+own cell(s) to ok AND leave every other cell unchanged. **🎯 CLEAN 2026-07-15: 32 ok, 0 HOLES,
+0 over-rejects** (started this session at 17 ok / 6 HOLES @ 23 cells; grew to 32 as fixes added
 cells). ALL escape/free holes closed: `p5__k6_free` (§A #3), `p2/p3__k7_reassign` (§B #9),
 the 3 `p7×` optional-field-carrier + `p2/p3__k2v_2step` IDENT two-step (§B #8), `p8__k8_ring_push`
-(§B #12 Ring), `p9__k9_spawn_val` (§B #12 spawn). **WIRED into `make check`**
+(§B #12 Ring), `p9__k9_spawn_val` (§B #12 spawn), `p10__k10_arena_call/direct` (§B #11 arena).
+**§B escape sinks FULLY DONE.** **WIRED into `make check`**
 as a permanent gate 2026-07-15 (`make check` runs `tools/sink_matrix.sh ./zerc` after the
 build audits; standalone: `make check-sink-matrix`). **Add a new cell whenever a new
 escape/free sink or value shape is introduced** — the gate then enforces it forever; a fix

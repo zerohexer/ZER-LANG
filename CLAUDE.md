@@ -2348,12 +2348,12 @@ merged to main) — with the proper version + commit sha per bug. Don't re-deriv
 consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **26 landed
 2026-07-13/15** — §D miscompiles #17–#25 AND §F crashes/robustness #32–#35 AND §G bare-metal
 #36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit (§A #1/#2/#3, §B #10, §E #26); + §B #9
-reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier escape + §B #12
-Ring.push + §B #13 spawn-by-value (§B #12 COMPLETE). **🎯 THE PER-SINK ESCAPE/FREE MATRIX
-(`tools/sink_matrix.sh`) IS CLEAN — 29 ok / 0 holes** (every memory-safety hole this session's
-matrix surfaced is closed). **~14 remaining** = §A #4–#7 (zercheck_ir.c UAF), §B #11 (arena
-launder), §C VRP/bounds (#13–#16, silent OOB), §E #27–#31 (concurrency); order by risk (see
-limitations.md tracker). Every escape fix must keep the matrix CLEAN + add a cell. **`tools/sink_matrix.sh` is now a
+reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier + §B #12 Ring.push +
+§B #13 spawn-by-value + §B #11 arena-launder. **🎯 §B ESCAPE SINKS FULLY DONE; the per-sink
+matrix (`tools/sink_matrix.sh`, a `make check` gate) is CLEAN — 32 ok / 0 holes.** **~13
+remaining** = §A #4–#7 (zercheck_ir.c UAF/double-free), §C VRP/bounds (#13–#16, silent OOB),
+§E #27–#31 (concurrency); order by risk (see limitations.md tracker). Any new escape fix must
+keep the matrix CLEAN + add a cell. **`tools/sink_matrix.sh` is now a
 permanent `make check` gate** (runs after the build audits; standalone `make check-sink-matrix`)
 — every remaining escape fix must keep it CLEAN + add a cell for its own shape. The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,

@@ -23,7 +23,8 @@ Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**],
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
 defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle
 + §A #7 move-alias compound-key + §A #4 Level-B complementary-free-pair + §A #5 Level-B copy-chain immutability [**§A FULLY
-DONE**]), **~3 remaining** (§C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock ir_lower.c).**
+DONE**] + §E #29 shared-cond unlock deadlock), **~2 remaining** (§C #13 VRP JOIN silent-OOB, §E
+#27 multi-root shared-lock ir_lower.c).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -207,11 +208,15 @@ confusion, silent for non-ptr variants): the tag-update emission's walk-up only 
 VALUE object, not a POINTER-to-union; now matches the pointer case (`obj_is_ptr`), unwraps
 `obj_type` through the pointer, and hoists the pointer directly (no `&`) so `_zer_up->_tag`
 writes through it; `586507fb`, test `union_ptr_write_tag_ok` (3 `_eff->kind` reads baselined);
-2026-07-15. make check 970/0.**
+2026-07-15. make check 970/0. #29 shared-cond mutex LEAKED on an `orelse return/break` inside a
+condition → deadlock (`if ((g.v orelse return) == 1){…}` on a shared struct took the early exit
+without releasing the cond mutex). Added `LowerCtx.cond_shared_saved`: `emit_shared_lock_around_cond`
+points `current_stmt_shared_root` at the cond root (so the in-cond orelse-exit emits the unlock),
+`emit_shared_unlock_after_cond` restores it (after the `!root` early-out). `586507fb` C-F3, test
+`shared_cond_orelse_unlock_ok` (runs exit 0, no deadlock); 2026-07-15. make check 980/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
-| 29 | shared-cond mutex unlock on orelse-return/break (no deadlock) | 586507fb (C-F3) | ir_lower.c |
 
 **OPEN (from §E #28, low-risk — traps LOUDLY, not silent):** `defer { u32 z = maybe() orelse
 g.v; }` hits a separate emitter gap — `emit_rewritten_node` has no NODE_ORELSE handler in defer

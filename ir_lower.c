@@ -110,6 +110,13 @@ typedef struct {
      * Single-level tracking — nested shared blocks accumulate locks
      * (recursive mutex), and only the outermost unlock fires here. */
     Node *current_stmt_shared_root;
+    /* §E #29 C-F3 (2026-07-03): prev value of current_stmt_shared_root saved
+     * while a condition's shared-read lock is active, so an `orelse return/break`
+     * INSIDE an if/while/for/switch/do-while CONDITION releases the cond mutex
+     * before the early exit (else the lock leaks → permanent deadlock). Cond
+     * locks do not nest within one condition (conditions are expressions), so
+     * one slot suffices. */
+    Node *cond_shared_saved;
 } LowerCtx;
 
 /* ---- Helpers ---- */
@@ -1454,11 +1461,18 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
      * every cond read, defeating shared(rw)'s reader concurrency. */
     lock.src2_local = 0;
     emit_inst(ctx, lock);
+    /* §E #29 C-F3: expose the cond's lock root so an `orelse return/break/continue`
+     * lowered from INSIDE the condition (lower_orelse_to_dest consults
+     * ctx->current_stmt_shared_root) releases the mutex on the early-exit path.
+     * Restored by emit_shared_unlock_after_cond on the normal path. */
+    ctx->cond_shared_saved = ctx->current_stmt_shared_root;
+    ctx->current_stmt_shared_root = root;
     return root;
 }
 
 static void emit_shared_unlock_after_cond(LowerCtx *ctx, Node *root, int line) {
     if (!root) return;
+    ctx->current_stmt_shared_root = ctx->cond_shared_saved;  /* §E #29 C-F3 restore */
     IRInst unlock = make_inst(IR_UNLOCK, line);
     unlock.expr = root;
     emit_inst(ctx, unlock);

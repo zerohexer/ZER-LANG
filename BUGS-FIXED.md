@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — shared-cond mutex leaked on orelse-return/break inside a condition → deadlock (ir_lower.c)
+
+Tracker §E #29 (source `586507fb` C-F3). Reading a shared struct in an `if`/`while`/`for`/
+`switch` CONDITION emits a lock around the cond and an unlock after it
+(`emit_shared_lock_around_cond` / `emit_shared_unlock_after_cond`). But an `orelse return/break/
+continue` lowered from INSIDE the condition (`if ((g.v orelse return) == 1) { … }`) took the
+early exit WITHOUT releasing the cond mutex — the lock leaked → permanent deadlock (the next
+lock attempt on that mutex blocks forever). The orelse lowering releases the current statement's
+shared lock by consulting `ctx->current_stmt_shared_root`, but that field wasn't set to the
+cond's lock root while the condition was being lowered.
+
+Fix: a new `LowerCtx.cond_shared_saved` slot. `emit_shared_lock_around_cond` now saves the prior
+`current_stmt_shared_root` and points it at the cond's root (so an in-cond orelse-exit emits the
+unlock); `emit_shared_unlock_after_cond` restores it on the normal path. Restore placed AFTER the
+`if (!root) return;` early-out, so it only fires when the lock was actually taken (matching the
+set). Cond locks don't nest within one condition (conditions are expressions), so one slot
+suffices.
+
+Verified: `if ((g.v orelse return) == 1) { g.w = 2; }` on a `shared struct` runs to completion
+(exit 0, no deadlock/timeout — 10s guard); the emitted C carries the unlock on the orelse path.
+Test: `tests/zer/shared_cond_orelse_unlock_ok.zer`. make check 980/0, conc-matrix 15/15. (Only the
+C-F3 line of `586507fb` here — C-F4 multi-root lock = §E #27, still open.)
+
+---
+
 ## 2026-07-15 — Level-B guard copy-chain defeated the immutability gate (reassigned intermediate) → UAF (zercheck_ir.c) — §A COMPLETE
 
 Tracker §A #5 (source `66332d39` #2). The Level-B guarded-free relaxation reaches a guard

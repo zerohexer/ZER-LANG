@@ -5259,6 +5259,40 @@ boundary is otherwise Rice-hard (Traps 1–2 are the witnesses).
 **Interim (unblocked TODAY):** the `usize` token (§36.12) needs neither path and already works. Do
 NOT ship a `can_alloc`- or param-trace-gated relaxation — both are accept-unsafe per Traps 1–2.
 
+### 36.16 Progress — PATH A chosen; the oracle is written + verified (2026-07-16)
+
+**Decision (owner, 2026-07-16): PATH A** (annotation-free, cross-boundary `alloc_id` inference).
+Rationale: if the compiler VERIFIES an explicit borrow marker (assume-user-wrong, as ZER always
+does), it is ALREADY doing the inference — so the marker is redundant, and Path B is just Rust's
+annotate-then-trust. ZER infers.
+
+**STEP 1 DONE — the Level-1 oracle:** `proofs/operational/lambda_zer_escape/erased_ownership_lattice.v`
+(compiles under the `zer-proofs` image, **0 admits**, registered in `_CoqProject`). It is
+`param_lattice.v` with `origin` (OFresh / OBorrow) instead of `region`, and it certifies exactly the
+finite states + transfer the C must realise:
+- **states** `origin = {OFresh, OBorrow}`; **decision** `treat_as_borrow` (the risky "don't track");
+  **order** `origin_le` with OBorrow as BOTTOM (over-approximate toward OWNED).
+- **T1** `subst_track_sound` — the call transfer is sound.
+- **T2** `param_resolve_exact` — `AOParam n` resolves to EXACTLY arg n's origin.
+- **T3** `precision_gain_borrow_through_param` — the map_get fix: a borrow flowing through a param
+  is over-tracked by the OLD "any-pointer-return = owned" rule, correctly NOT tracked by the new
+  one, and the new decision is sound.
+- **T4** `new_never_undertracks` — the CROWN JEWEL: a true OFresh origin is FORCED to owned; the
+  analysis can never drop a real ownership obligation.
+- **Trap 2 formalised** `buggy_param_undertracks` — "return-traces-to-param ⇒ borrow" (ignoring the
+  arg) under-tracks a laundered alloc (accept-unsafe); the origin-flowing rule does not.
+- **Trap 1 formalised** `join` / `join_owned_absorbs` / `unknown_defaults_owned` — MERGE = JOIN with
+  OWNED as the conservative default; an unrecognised allocator can only over-track (safe).
+
+**STEP 2 (next) — the C, against the oracle.** Realise `origin`/`aorigin` in the FuncSummary:
+record per-param "receives a value with alloc_id N into its field/pointee" (store-to-param-field)
+and "the return is param P's field/pointee" (`AOParam` / return-from-param-field); at the call site
+thread the actual arg's `alloc_id` (the `resolve` substitution). Then gate the two registration
+sites (zercheck_ir.c 4308 / 4352) on the DERIVED origin — `treat_as_borrow` ⇒ skip owned-tracking —
+with OFresh/UNKNOWN as the default (T4 / Trap-1 conservative). Incremental + the §36.13 test matrix
++ a `sink_matrix.sh` `p_erased` cell. STEP 3 — the sugar emits the inline `type_id` trap across the
+boundary. This is a real subsystem, done in careful increments, not a patch.
+
 ---
 
 # End of PART 6

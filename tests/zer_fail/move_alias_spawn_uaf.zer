@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// AUDIT-2026-07-02 — sibling of bh18_1b for spawn-arg move. `spawn worker(a)`
+// sets a's IR handle TRANSFERRED; the `&ident` alias + ir_mark_transferred
+// propagate the move to `*Tok p = &a`, so `p.kind` is a use-after-move.
+move struct Tok { u32 kind; }
+void worker(Tok t) { }
+u32 main() {
+    Tok a;
+    a.kind = 5;
+    *Tok p = &a;
+    spawn worker(a);
+    return p.kind;
+}

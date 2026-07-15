@@ -21,8 +21,9 @@ wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-ad
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
-defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle),
-**~6 remaining** (§A #4/#5/#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock).**
+defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle
++ §A #7 move-alias compound-key), **~5 remaining** (§A #4/#5 zercheck_ir Level-B guard, §C #13
+VRP JOIN silent-OOB, §E #27/#29 shared-lock ir_lower.c).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -67,12 +68,19 @@ compiled a UAF (b.p untracked). Regression of the documented Pattern-4 two-pass 
 src's tracked field is a compound entry (`path != NULL`), so `ir_find_handle` returns NULL and
 the `!src_h` early-break skipped it. Restored the two-pass replicate (snapshot then add+alias,
 realloc-safe) BEFORE the break; `59a968cb` A3, tests `struct_copy_compound_uaf` (neg) +
-`struct_copy_compound_ok` (pos, no false-leak); 2026-07-15. make check 972/0.
+`struct_copy_compound_ok` (pos, no false-leak); 2026-07-15. make check 972/0. #7 move-alias via a
+COMPOUND `&arr[i]`/`&b.field` — `*Tok p = &arr[0]; Tok b = arr[0]; use(p)` was a use-after-move
+that compiled (bh18_1b registered the pointer↔move alias only for bare `&ident`, not compound
+keys). Added the compound-key alias-registration block (register/alias the pointer against the
+COMPOUND handle, gate the ident path on `!used_compound`); `582920db` #4. NOTE: that commit's 6
+scattered `ir_propagate_alias_state` calls were SUPERSEDED by the unified `ir_mark_transferred`
+sink (spawn-arg A3 already caught in main — verified empirically); only the compound A1/A2 were
+holes. Tests `move_alias_{compound,field,spawn}_uaf`; 2026-07-15. make check 975/0. **(HOLE-A4
+`Tok b = *p;` move-via-deref still deferred — needs a new IR_UNOP handler.)**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |
 | 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
-| 7 | move-alias via `&arr[i]` / `&b.field` / spawn-arg | 582920db (#4) | zercheck_ir.c |
 
 ### B. Escape / dangling-pointer sinks (🔴; #8 base helper partial in main)
 **✅ DONE: #10 assignment-form slice-of-local (`[*]T s; s = arr; return s` / `g=s` / `&s[0]`)

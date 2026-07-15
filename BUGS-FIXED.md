@@ -5,6 +5,31 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — move-alias via `&arr[i]` / `&b.field` (compound-key) — use-after-move undetected (zercheck_ir.c)
+
+Tracker §A #7 (source `582920db` #4). Taking a pointer to a move-struct element/field
+(`*Tok p = &arr[0]` or `&b.inner`) and then moving that element out (`Tok b = arr[0]`) leaves
+`p` dangling — a use-after-move — but `p.kind` compiled clean. The bh18_1b alias-registration
+that links `p` to the moved-from location only handled the BARE `&ident` form; the COMPOUND
+forms (`&arr[LIT]`, `&b.field`) registered no alias, so when `ir_mark_transferred` marked the
+compound handle TRANSFERRED it had nothing to propagate to.
+
+Important: `582920db` #4's OTHER half — 6 scattered `ir_propagate_alias_state` calls at each
+TRANSFERRED site — was SUPERSEDED by a later refactor that unified all move-transfer through the
+single `ir_mark_transferred` sink (which already propagates). Verified empirically: the spawn-arg
+case (A3) is already caught in main; only the compound cases (A1/A2) were holes. So the fix taken
+here is ONLY the compound-key alias-registration block: for `&arr[i]`/`&b.field` on a
+move-tracked base, register/alias the pointer against the COMPOUND handle (shared alloc_id) and
+gate the bare-ident path on `!used_compound`. The `eff->kind == TYPE_STRUCT/UNION` reads are on a
+`type_unwrap_distinct`'d local (baselined).
+
+Verified: all 3 (`&arr[0]`, `&b.inner`, `&a`) now reject as use-after-move; a legit move (no
+alias taken first) still compiles. HOLE-A4 (`Tok b = *p;` move-via-deref) remains deferred (needs
+a new IR_UNOP handler; noted in the source). Tests:
+`tests/zer_fail/move_alias_{compound,field,spawn}_uaf.zer`. make check 975/0.
+
+---
+
 ## 2026-07-15 — struct value-copy dropped compound handle entries → UAF undetected (zercheck_ir.c)
 
 Tracker §A #6 (source `59a968cb` A3). A struct value-copy `Holder b = a` must replicate a's

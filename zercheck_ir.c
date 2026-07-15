@@ -3311,6 +3311,63 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * is_thread_handle — wrong-pool detection bypassed via
              * `*T fp = &b.field; Handle k = *fp;` interior pointer chain. */
             if (rhs && rhs->kind == NODE_UNARY && rhs->unary.op == TOK_AMP) {
+                Node *addr_target = rhs->unary.operand;
+                /* §A #7 (HOLE-A1/A2): if the address-taken expression is a
+                 * COMPOUND (`&arr[0]` or `&b.field`) on a move-tracking base,
+                 * alias the pointer against the COMPOUND handle so a later move
+                 * out of that same compound propagates TRANSFERRED to the pointer
+                 * (via ir_mark_transferred, the unified move sink). The bare
+                 * `&ident` form is handled by the NODE_IDENT path below; this adds
+                 * the compound-key form (`*Tok p = &arr[0]; Tok b = arr[0]`). */
+                int c_root_local = -1;
+                const char *c_path = NULL;
+                uint32_t c_path_len = 0;
+                bool used_compound = false;
+                /* `Tok[4]` (a move-struct array) isn't caught by
+                 * ir_should_track_move (walks STRUCT/UNION, not ARRAY); gate on
+                 * the target expression's own type yielding a move struct. */
+                Type *addr_target_ty = addr_target
+                    ? checker_get_type(zc->checker, addr_target) : NULL;
+                bool target_is_move_tracked = false;
+                if (addr_target_ty) {
+                    Type *eff = type_unwrap_distinct(addr_target_ty);
+                    if (eff && (ir_is_move_struct_type(eff) ||
+                                (eff->kind == TYPE_STRUCT &&
+                                 ir_contains_move_struct_field(eff)) ||
+                                (eff->kind == TYPE_UNION &&
+                                 ir_contains_move_struct_field(eff))))
+                        target_is_move_tracked = true;
+                }
+                if (addr_target && addr_target->kind != NODE_IDENT &&
+                    target_is_move_tracked &&
+                    ir_extract_compound_key(zc, func, addr_target,
+                                             &c_root_local, &c_path, &c_path_len) == 0 &&
+                    c_path_len > 0 && c_root_local >= 0 &&
+                    c_root_local < func->local_count) {
+                    IRHandleInfo *ch = ir_find_compound_handle(ps, c_root_local,
+                                                                 c_path, c_path_len);
+                    if (!ch) ch = ir_add_compound_handle(ps, c_root_local,
+                                                          c_path, c_path_len);
+                    if (ch) {
+                        ch->is_move_local = true;
+                        if (ch->state == IR_HS_UNKNOWN) {
+                            ch->state = IR_HS_ALIVE;
+                            ch->alloc_line = inst->source_line;
+                        }
+                        if (ch->alloc_id == 0)
+                            ch->alloc_id = _ir_next_alloc_id++;
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, ch);
+                        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                        if (dst_h) {
+                            ir_apply_alias(dst_h, &snap);
+                            dst_h->state = snap.state;
+                            dst_h->is_move_local = true;
+                        }
+                        used_compound = true;
+                    }
+                }
+
                 Node *target = rhs->unary.operand;
                 /* Walk field/index chain to the root ident */
                 while (target) {
@@ -3318,7 +3375,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     else if (target->kind == NODE_INDEX) target = target->index_expr.object;
                     else break;
                 }
-                if (target && target->kind == NODE_IDENT) {
+                if (target && target->kind == NODE_IDENT && !used_compound) {
                     int base_local = ir_find_local_exact_first(func,
                         target->ident.name, (uint32_t)target->ident.name_len);
                     if (base_local >= 0) {

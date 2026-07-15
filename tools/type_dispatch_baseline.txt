@@ -735,3 +735,7 @@ checker.c:(eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
 emitter.c:if (obj_is_ptr && obj_type && obj_type->kind == TYPE_POINTER)
 emitter.c:if (ot_eff && ot_eff->kind == TYPE_POINTER) {
 emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
+# §A #7 2026-07-15: move-alias compound-key gate — `eff` is type_unwrap_distinct(addr_target_ty).
+# Documented-safe (582920db #4 baseline lines).
+zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
+zercheck_ir.c:(eff->kind == TYPE_UNION &&

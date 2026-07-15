@@ -19,8 +19,9 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 + §A #3 free-non-heap-slice / §B #10 assign-slice-of-local escape, + §E #26 spawn-scan
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
-Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**]), **~13 remaining**
-(§A #4–#7 zercheck_ir UAF, §C #13–#16 VRP/bounds silent-OOB, §E #27–#31 concurrency).**
+Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
+VarRange leak), **~12 remaining** (§A #4–#7 zercheck_ir UAF, §C #13/#14/#16 VRP/bounds silent-OOB,
+§E #27–#31 concurrency).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -114,11 +115,15 @@ ESCAPE #1; the ESCAPE #2 half `p=&local[i]; g=p` was already closed by §B #9); 
 **🎯 §B (escape / dangling-pointer sinks #8–#13) FULLY DONE.**
 
 ### C. VRP / bounds — silent OOB (🔴; absent)
+**✅ DONE: #15 VarRange map leaked across functions (name-keyed, never reset) → a stale range
+from an earlier function elided a later same-named function's bounds guard (silent OOB);
+`c->var_range_count = 0` at each `check_func_body` entry (NOT restored — the post-body
+find_return_range pass reads it, next entry re-clears); `f40ca06b` F3, test
+`vrp_crossfunc_range_no_leak` (runtime, fixed=exit 0); 2026-07-15. make check 964/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 13 | VRP guard-narrowing leaks past switch/if-capture/orelse/loop join | 586507fb (A+B, JOIN) | checker.c |
 | 14 | `find_return_range` do-while body + guard-body over-credit | f40ca06b (F1) **+** 59a968cb (A2) — different arms | checker.c |
-| 15 | VarRange map reset per-function (cross-fn name-key leak) | f40ca06b (F3) | checker.c |
 | 16 | defer body keeps array bounds-guard (trapping mode) | 9edc49b8 (E, `guard_traps`) | emitter.c/.h |
 
 ### D. uN/iN + miscompiles (🟠)

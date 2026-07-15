@@ -1,0 +1,12 @@
+// audit 2026-07-06 F3: a VarRange leaked from guarded()'s param `i` (proven
+// [0,15] by its in-body guard) into unguarded()'s same-named param, eliding
+// unguarded's bounds guard -> OOB read of arr[1000000] (segfault/garbage).
+// After the per-function VarRange reset, unguarded auto-guards and safely
+// returns 0. Buggy compiler: SIGSEGV (non-zero). Fixed: exit 0.
+u32 guarded(u32[16] arr, u32 i) { if (i >= 16) { return 0; } return arr[i]; }
+u32 unguarded(u32[16] arr, u32 i) { return arr[i]; }
+u32 main() {
+    u32[16] a;
+    if (unguarded(a, 1000000) != 0) { return 1; }
+    return 0;
+}

@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — VarRange map leaked across functions → elided bounds guard (silent OOB) (checker.c)
+
+Tracker §C #15 (source `f40ca06b` F3). The value-range map (VarRange, used to prove an index
+in-bounds and elide the runtime bounds guard) is keyed by variable NAME with NO scope/function
+discriminator, and was never reset between functions. So a range derived in an EARLIER function
+(`u32 guarded(u32[16] arr, u32 i){ if (i>=16) return 0; return arr[i]; }` narrows `i` to [0,15])
+persisted into a LATER function reusing the name (`u32 unguarded(u32[16] arr, u32 i){ return
+arr[i]; }`), where the stale [0,15] range elided `unguarded`'s bounds guard → a real OOB read
+(`unguarded(a, 1000000)` → segfault/garbage).
+
+Fix: `c->var_range_count = 0;` at each `check_func_body` entry. NOT restored after the body —
+the post-body `find_return_range` cross-function range summary READS these ranges, and the next
+function's own entry reset re-clears them; functions never nest, so nothing between consults a
+stale range. One line + the reasoning comment.
+
+Verified: `unguarded(a, 1000000)` now auto-guards → safely returns 0 (fixed compiler exit 0; a
+buggy compiler OOB-segfaults). Test: `tests/zer/vrp_crossfunc_range_no_leak.zer` (runtime —
+fixed=exit 0). make check 964/0. (Only F3 of `f40ca06b` here — F4 escape = §B #8, F8 float-`_`
+= §D #25, F1 do-while = §C #14, SC short-circuit = §D #20, F2 Level-B = §A #4, all done/separate.)
+
+---
+
 ## 2026-07-15 — arena-over-local pointer laundered to a global/param — stack UAF (checker.c) — §B COMPLETE
 
 Tracker §B #11 (sources `85cc109e` D + `87a01415` #4). A pointer from a LOCAL arena

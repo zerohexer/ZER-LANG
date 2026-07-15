@@ -14924,6 +14924,16 @@ static void check_func_body(Checker *c, Node *node) {
          * after the body). */
         c->cur_ret_summary_complete = true;
         c->cur_ret_param_mask = 0;
+        /* §C #15: reset the value-range map at each function-body entry. VarRange
+         * is keyed by variable NAME with no scope discriminator, so ranges derived
+         * in an EARLIER function (e.g. `if (i >= 16) return;` narrowing param `i`
+         * to [0,15]) would otherwise persist into a LATER function that reuses the
+         * name, silently eliding its bounds guard (audit 2026-07-06). NOT restored
+         * after the body: the post-body find_return_range pass (cross-function
+         * range summary) READS these ranges, and the next function's own entry
+         * reset re-clears them. Functions never nest, so nothing between here and
+         * that next reset consults a stale range. */
+        c->var_range_count = 0;
         check_stmt(c, node->func_decl.body);
         c->after_spawn_in_func = saved_after_spawn;
         c->in_comptime_body = saved_comptime;

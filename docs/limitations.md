@@ -21,8 +21,8 @@ wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-ad
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
-defer-body shared lock), **~8 remaining** (§A #4–#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB,
-§E #27/#29/#31 concurrency).**
+defer-body shared lock + §E #31 union-tag-thru-pointer), **~7 remaining** (§A #4–#7 zercheck_ir
+UAF, §C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -178,12 +178,17 @@ UNLOCKED → silent data race: `emit_defer_shared_root` missed NODE_INTRINSIC/OR
 AND `emit_defer_stmt`'s NODE_VAR_DECL never called the walker (so even `defer { u32 z = g.v; }` had
 no lock); added the 4 node kinds (condvar/barrier/once self-lock skipped) + route var-decl init
 through the walker + rdlock; `2c7645b9`, test `defer_shared_intrinsic_lock` (positive, 6
-mutex_lock in emitted C); 2026-07-15. make check 969/0.**
+mutex_lock in emitted C); 2026-07-15. make check 969/0. #31 union variant write through a
+`*Union` pointer skipped the `_tag` update → caller's `switch(u)` read the WRONG arm (union type
+confusion, silent for non-ptr variants): the tag-update emission's walk-up only matched a union
+VALUE object, not a POINTER-to-union; now matches the pointer case (`obj_is_ptr`), unwraps
+`obj_type` through the pointer, and hoists the pointer directly (no `&`) so `_zer_up->_tag`
+writes through it; `586507fb`, test `union_ptr_write_tag_ok` (3 `_eff->kind` reads baselined);
+2026-07-15. make check 970/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 27 | multi-root shared lock: field-projection + intrinsic-wrapped reads | 586507fb (C-F4) **+** 19471462 (B1 intrinsic) | ir_lower.c |
 | 29 | shared-cond mutex unlock on orelse-return/break (no deadlock) | 586507fb (C-F3) | ir_lower.c |
-| 31 | union variant write via `*Union` updates `_tag` | 586507fb | emitter.c |
 
 **OPEN (from §E #28, low-risk — traps LOUDLY, not silent):** `defer { u32 z = maybe() orelse
 g.v; }` hits a separate emitter gap — `emit_rewritten_node` has no NODE_ORELSE handler in defer

@@ -730,3 +730,8 @@ checker.c:tgt_eff && tgt_eff->kind == TYPE_POINTER &&
 # type_unwrap_distinct'd spawn-arg type (same local as the pre-existing
 # `eff->kind == TYPE_POINTER` is_ptr_like read a few lines above). Documented-safe.
 checker.c:(eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+# §E #31 2026-07-15: union-tag set through a *Union pointer — ot_eff/pinner/obj_type
+# are all already-type_unwrap_distinct'd locals. Documented-safe.
+emitter.c:if (obj_is_ptr && obj_type && obj_type->kind == TYPE_POINTER)
+emitter.c:if (ot_eff && ot_eff->kind == TYPE_POINTER) {
+emitter.c:if (pinner && pinner->kind == TYPE_UNION) {

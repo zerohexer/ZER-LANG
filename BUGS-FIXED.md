@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — union variant write through a *Union pointer skipped the tag update (type confusion) (emitter.c)
+
+Tracker §E #31 (source `586507fb`). Writing a union variant updates the hidden discriminant
+`_tag` so a later `switch(u)` reads the right arm. The tag-update emission only recognised the
+variant-write when the object was a union VALUE (`u.small = 3`); through a `*Union` pointer
+(`vp.small = 3` where `vp : *Val`, ZER auto-deref) the walk-up didn't match, so the write went
+out WITHOUT the `_tag` update — the caller's `switch` then read the WRONG variant (union type
+confusion, silent for non-pointer variants: e.g. `a.big = 0x…; set_small(&a); switch(a)` read
+8 bytes as `.big` instead of `.small`).
+
+Fix (`emit_rewritten_node` union-write path): the walk-up now also matches a NODE_FIELD whose
+object is a POINTER-to-union (records `obj_is_ptr`); the emission unwraps `obj_type` through the
+pointer for the variant lookup, and for the pointer case hoists `obj_node` DIRECTLY (no `&`) so
+`_zer_up->_tag = i` writes through it. The 3 new `->kind == TYPE_` reads are on already-
+`type_unwrap_distinct`'d locals (`ot_eff`/`pinner`/`obj_type`; added to `type_dispatch_baseline.txt`).
+
+Verified: `set_small(*Val vp){ vp.small = 3; }` then `switch(a)` reads `.small` = 3 (exit 0);
+emitted C carries `_zer_up->_tag` through the pointer. Test: `tests/zer/union_ptr_write_tag_ok.zer`.
+make check 970/0. (Only the union-tag hunk of `586507fb` here — VRP-JOIN = §C #13, D1 = §B #8,
+C-F3/F4 = §E #27/#29, await-pred = §E #30 are separate.)
+
+---
+
 ## 2026-07-15 — shared read inside a defer body emitted UNLOCKED → silent data race (emitter.c)
 
 Tracker §E #28 (source `2c7645b9`). Two adjacent emitter gaps left a class of shared-struct

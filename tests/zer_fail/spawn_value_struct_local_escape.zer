@@ -1,0 +1,8 @@
+// EXPECTED: compile error — a by-value struct carrying a pointer to a stack local
+// passed to a fire-and-forget spawn is a cross-thread use-after-free. The
+// is_ptr_like spawn-arg check skipped by-value struct args; §B #13 adds an
+// else-branch that consults spawn_arg_is_stack_derived on struct/union args.
+struct Msg { *u32 p; }
+void worker(Msg m) { }
+void bad() { u32 local = 5; Msg m; m.p = &local; spawn worker(m); }
+u32 main() { return 0; }

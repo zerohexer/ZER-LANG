@@ -1,0 +1,12 @@
+// Positive (no over-reject): spawning with a by-value struct that carries NO
+// pointer into a local (a pure-value struct) must compile — spawn_arg_is_stack_derived
+// is false for a struct that isn't local-derived, so §B #13's check does not fire.
+struct VMsg { u32 a; u32 b; }
+void worker(VMsg m) { }
+u32 main() {
+    VMsg m;
+    m.a = 1;
+    m.b = 2;
+    spawn worker(m);
+    return 0;
+}

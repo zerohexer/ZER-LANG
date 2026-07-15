@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — spawn of a by-value struct carrying a ptr-to-local — cross-thread UAF (checker.c)
+
+Tracker §B #13 (re-scoped from §B #12; the hole I surfaced + closed while doing §B #12).
+`Msg m; m.p = &local; spawn worker(m);` compiled — a fire-and-forget thread gets a copy of a
+struct whose field points into a stack frame that returns immediately (cross-thread
+use-after-free). Root cause pinned by diagnostic: `m` IS correctly marked local-derived (the
+whole-struct store-to-global sink rejects `g = m`), but the spawn arg-safety check calls
+`spawn_arg_is_stack_derived` ONLY inside `if (is_ptr_like)` (pointer/slice/opaque). A by-VALUE
+struct/union arg (`eff->kind == TYPE_STRUCT`) fell straight through the check — the sink was
+never consulted for it. (Neither §B #9 nor a3e1f66c @@ -4096 was the fix — both are store-side
+taint, which already works here; the gap was the spawn CONSUMPTION side.)
+
+Fix: an `else`-branch on the `is_ptr_like` block — a NON-scoped spawn of a struct/union arg
+that `spawn_arg_is_stack_derived` flags (local/arena-derived) is a compile error. A pure-value
+struct is NOT local-derived, so it is not over-rejected; scoped spawns (ThreadHandle + join)
+are exempt. The `eff->kind == TYPE_STRUCT/UNION` read is on the already-`type_unwrap_distinct`'d
+spawn-arg local (same as the pre-existing `eff->kind == TYPE_POINTER` is_ptr_like read
+alongside it; added to `type_dispatch_baseline.txt`).
+
+Per-sink matrix: cell `p9__k9_spawn_val` (rejects) + `safe_spawn_value` baseline (compiles) →
+CLEAN 29 ok / 0 holes. Tests: `tests/zer_fail/spawn_value_struct_local_escape.zer`,
+`tests/zer/spawn_value_struct_pure_ok.zer`. make check 959/0. **§B #12 now COMPLETE (Ring.push
++ spawn-by-value both closed).**
+
+---
+
 ## 2026-07-15 — Ring.push of a local-derived pointer element escapes into the global Ring (checker.c)
 
 Tracker §B #12 (Ring.push half; source `a3e1f66c`). A Ring is ALWAYS global, so `rx.push(m)`

@@ -13517,6 +13517,28 @@ static void check_stmt(Checker *c, Node *node) {
                         i + 1);
                 }
             }
+            /* §B #13: a by-VALUE struct/union arg that CARRIES a pointer/slice
+             * FIELD pointing into a stack local (`Msg m; m.p = &local; spawn
+             * worker(m);`) copies that dangling pointer into the fire-and-forget
+             * thread — a cross-thread use-after-free once the frame returns.
+             * `is_ptr_like` above only covered bare pointer/slice/opaque args, so a
+             * value aggregate whose FIELD dangles fell straight through — the
+             * whole-struct store-to-global sink already marks such an arg
+             * local-derived (so `g = m` is caught), spawn just never consulted it.
+             * A pure-value struct (no pointer-to-local) is NOT local-derived, so
+             * it is not over-rejected. Scoped spawns are exempt (join bounds the
+             * lifetime). */
+            else if (!is_scoped &&
+                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+                     spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
+                checker_error(c, node->loc.line,
+                    "spawn argument %d: cannot pass a by-value struct/union that "
+                    "carries a pointer into a stack local to a fire-and-forget "
+                    "spawn — the field pointer dangles once the frame returns "
+                    "(cross-thread use-after-free). Use ThreadHandle + join, or "
+                    "copy the pointed-to data by value",
+                    i + 1);
+            }
             /* Handle args: ban — pool.get() not thread-safe.
              * Also reject ?Handle(T) — spawned thread can unwrap the optional
              * and have the same Handle, with the same non-thread-safe access. */

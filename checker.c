@@ -396,6 +396,8 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
                                        TokenType op, Node *value);
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
+static struct VarRange *vrp_snapshot(Checker *c, int count);
+static void vrp_join_after_region(Checker *c, struct VarRange *snap, int count);
 
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
@@ -11087,6 +11089,10 @@ static void check_stmt(Checker *c, Node *node) {
         /* Value range propagation: extract constraints from condition */
         {
             int saved_range_count = c->var_range_count;
+            /* VRP-1: snapshot pre-branch entry values so an in-place narrowing
+             * inside then/else (which the count-only restore can't revert) is
+             * widened to a sound join at the unconditional join below. */
+            struct VarRange *vrp_snap = vrp_snapshot(c, saved_range_count);
             Node *if_cond = node->if_stmt.cond;
 
             /* detect comparison pattern: ident OP const or const OP ident */
@@ -11297,6 +11303,8 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
             /* guard ranges stay — they're valid after the if */
+            /* VRP-1: reconcile pre-branch entries mutated inside then/else. */
+            vrp_join_after_region(c, vrp_snap, saved_range_count);
         }
         break;
     }
@@ -11329,6 +11337,9 @@ static void check_stmt(Checker *c, Node *node) {
 
         /* Value range propagation: for (i = 0; i < N; ...) → i in [0, N-1] */
         int saved_range_count = c->var_range_count;
+        /* VRP-1: snapshot before the body — a `j = k%N` inside the body narrows
+         * j's pre-existing entry, which leaks past the loop (body may run 0×). */
+        struct VarRange *vrp_snap = vrp_snapshot(c, saved_range_count);
         if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY) {
             Node *fc = node->for_stmt.cond;
             TokenType fop = fc->binary.op;
@@ -11367,6 +11378,8 @@ static void check_stmt(Checker *c, Node *node) {
         check_stmt(c, node->for_stmt.body);
         c->in_loop = prev_in_loop;
         c->var_range_count = saved_range_count; /* ranges invalid after loop */
+        /* VRP-1: reconcile pre-loop entries the body narrowed in place. */
+        vrp_join_after_region(c, vrp_snap, saved_range_count);
         pop_scope(c);
         break;
     }
@@ -11395,6 +11408,10 @@ static void check_stmt(Checker *c, Node *node) {
          * the cond (mirrors the for-loop pattern), then check body.
          * saved_range_count restores after the loop. */
         int saved_range_count = c->var_range_count;
+        /* VRP-1: snapshot BEFORE the widening pre-pass so both the pre-pass's
+         * and the body's in-place narrowings of pre-loop entries are reconciled
+         * to a sound join after the loop (body may run 0×). */
+        struct VarRange *vrp_snap = vrp_snapshot(c, saved_range_count);
         vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
 
         if (node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY) {
@@ -11419,6 +11436,8 @@ static void check_stmt(Checker *c, Node *node) {
         check_stmt(c, node->while_stmt.body);
         c->in_loop = prev_in_loop;
         c->var_range_count = saved_range_count;
+        /* VRP-1: reconcile pre-loop entries narrowed by the pre-pass or body. */
+        vrp_join_after_region(c, vrp_snap, saved_range_count);
         break;
     }
 
@@ -11426,6 +11445,10 @@ static void check_stmt(Checker *c, Node *node) {
         Type *expr = check_expr(c, node->switch_stmt.expr);
         /* BUG-271: unwrap distinct for union/enum switch dispatch */
         Type *expr_eff = expr ? type_unwrap_distinct(expr) : NULL;
+        /* VRP-1: an arm body may narrow a pre-existing entry in place; the
+         * arm is conditional, so reconcile to a sound join after the switch. */
+        int switch_saved_range = c->var_range_count;
+        struct VarRange *switch_vrp_snap = vrp_snapshot(c, switch_saved_range);
 
         /* BUG-226: reject float switch — spec says "switch on float: NOT ALLOWED" */
         if (expr && type_is_float(expr)) {
@@ -11843,6 +11866,8 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
         }
+        /* VRP-1: reconcile pre-switch entries any arm narrowed in place. */
+        vrp_join_after_region(c, switch_vrp_snap, switch_saved_range);
         break;
     }
 
@@ -15154,6 +15179,47 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
         r->max_val = INT64_MAX;
         r->known_nonzero = false;
     }
+}
+
+/* VRP-1 (silent-OOB class): a conditional region (if branch, loop body,
+ * switch arm) may narrow a PRE-EXISTING VarRange entry in place via an
+ * assignment (vrp_invalidate_for_assign narrows `i = i%N` to [0,N-1], etc.).
+ * The region's var-range save/restore only pops entries ABOVE the high-water
+ * mark — it cannot revert an in-place narrowing of an entry that predates the
+ * region. So the region-local narrowing leaked onto the JOIN, where the region
+ * may not have executed, and a later `arr[i]` was wrongly proven safe → the
+ * runtime bounds check was elided → silent out-of-bounds read/write on both
+ * hosted and bare-metal (no trap).
+ *
+ * Fix: snapshot the pre-region entry values, and after the region reconcile —
+ * any pre-existing entry whose value CHANGED inside the region is widened to
+ * the sound JOIN of its pre-region value and its post-region value. We use the
+ * conservative join (unknown range), which proves nothing so the bounds check
+ * is kept — over-approximate but sound (a wrongly-widened range only costs a
+ * ~0%-overhead runtime guard; a wrongly-narrowed one is a silent OOB). Entries
+ * the region did not touch keep their narrowing (guard-inverse ranges live
+ * ABOVE the mark and are never in the snapshotted [0,count) window). */
+static struct VarRange *vrp_snapshot(Checker *c, int count) {
+    if (count <= 0) return NULL;
+    struct VarRange *snap = malloc((size_t)count * sizeof(struct VarRange));
+    if (snap) memcpy(snap, c->var_ranges, (size_t)count * sizeof(struct VarRange));
+    return snap;
+}
+
+static void vrp_join_after_region(Checker *c, struct VarRange *snap, int count) {
+    if (!snap) return;
+    int n = count < c->var_range_count ? count : c->var_range_count;
+    for (int i = 0; i < n; i++) {
+        struct VarRange *r = &c->var_ranges[i];
+        if (r->min_val != snap[i].min_val ||
+            r->max_val != snap[i].max_val ||
+            r->known_nonzero != snap[i].known_nonzero) {
+            r->min_val = INT64_MIN;
+            r->max_val = INT64_MAX;
+            r->known_nonzero = false;
+        }
+    }
+    free(snap);
 }
 
 /* BUG-748 (2026-06-18): pre-pass for while/do-while bodies that widens

@@ -1,0 +1,33 @@
+// VRP-1 (silent-OOB class): a conditional in-place narrowing of a PRE-EXISTING
+// variable range must NOT leak onto the path where the branch/loop didn't run.
+// Pre-fix, `i = i % 4` inside the if narrowed i's range to [0,3] by mutating its
+// pre-existing VarRange entry; the branch's count-only restore couldn't revert an
+// in-place mutation of an entry that predates the branch, so i was "proven" [0,3]
+// even on x==0 (branch not taken, i stays 50) → arr[i] bounds check elided →
+// silent stack out-of-bounds read. Now the pre-branch entry is reconciled to a
+// sound join at the unconditional join, so the access gets an auto-guard.
+u32 if_branch_leak() {
+    u8[4] arr;
+    arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4;
+    u32 x = 0;                    // FALSE branch — i stays 50
+    u32 i = 50;
+    if (x > 0) { i = i % 4; }     // narrows i only on the taken path
+    u32 v = arr[i];               // guarded (i widened to unknown) → 0
+    return v;                     // must be 0, never OOB garbage
+}
+
+// Same class through a loop body that runs zero times.
+u32 loop_body_leak() {
+    u8[4] arr;
+    arr[0] = 9;
+    u32 i = 77;
+    u32 n = 0;                    // loop runs 0 times
+    for (u32 k = 0; k < n; k += 1) { i = k % 4; }
+    return arr[i];               // guarded → 0
+}
+
+u32 main() {
+    if (if_branch_leak() != 0) { return 1; }
+    if (loop_body_leak() != 0) { return 2; }
+    return 0;
+}

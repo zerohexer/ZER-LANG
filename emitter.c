@@ -2545,15 +2545,25 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->slice.object);
                     emit(e, " >> %lld) & ((1ull << %lld) - 1))", (long long)low, (long long)width);
                 } else {
-                    /* runtime — single-eval: hoist start/end into temps */
+                    /* runtime — single-eval: hoist start/end into temps.
+                     * The POSITION shift `obj >> _zer_lo` is UB in C when
+                     * _zer_lo >= the operand's bit width (e.g. u64 >> 64). The
+                     * F8 fix guarded the extract-width MASK but left the shift
+                     * unguarded — a silent miscompile violating ZER's "shift by
+                     * >= width = 0" guarantee (GCC -O0 vs -O2 diverge; a
+                     * different value again on ARM/RISC-V baremetal). Guard the
+                     * shift on the object's declared bit width so an
+                     * out-of-range runtime position yields 0. */
+                    int objbits = type_width(obj_type);
+                    if (objbits <= 0) objbits = 64;
                     int tmp = e->temp_count++;
                     emit(e, "({ int _zer_hi%d = (int)(", tmp);
                     emit_expr(e, node->slice.start);
                     emit(e, "); int _zer_lo%d = (int)(", tmp);
                     emit_expr(e, node->slice.end);
-                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", tmp, tmp, tmp, ucast);
+                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", tmp, tmp, tmp, tmp, objbits, ucast);
                     emit_expr(e, node->slice.object);
-                    emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                    emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                          tmp, tmp, tmp, tmp);
                 }
             }
@@ -9207,14 +9217,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             case TYPE_SEMAPHORE: case TYPE_DISTINCT:
                 break;
             }
+            /* Guard the POSITION shift on the object's bit width: `obj >> _zer_lo`
+             * is C UB when _zer_lo >= width (e.g. u64 >> 64). F8 guarded only the
+             * extract-width mask; the unguarded shift was a silent miscompile
+             * (violates "shift by >= width = 0"). Mirrors the AST path. */
+            int objbits = type_width(obj_eff);
+            if (objbits <= 0) objbits = 64;
             int t = e->temp_count++;
             emit(e, "({ int _zer_hi%d = (int)(", t);
             emit_rewritten_node(e, node->slice.start, func);
             emit(e, "); int _zer_lo%d = (int)(", t);
             emit_rewritten_node(e, node->slice.end, func);
-            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", t, t, t, ucast);
+            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", t, t, t, t, objbits, ucast);
             emit_rewritten_node(e, node->slice.object, func);
-            emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+            emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                  t, t, t, t);
             return;
         }

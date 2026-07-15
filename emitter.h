@@ -106,6 +106,13 @@ typedef struct {
      * defer was pending. NULL on the AST/global-init path (which has no defers). */
     void *cur_ir_func;
 
+    /* When true, a safety auto-guard emits a TRAP instead of an early-return.
+     * Set only while emitting a `defer` body: an early-return there would fire
+     * emit_defers() (re-entering the defer stack) and skip the rest of the
+     * function's cleanup — wrong. A trap aborts safely before the OOB access,
+     * matching how slice bounds-checks already behave inside defers. */
+    bool guard_traps;
+
 } Emitter;
 
 /* ---- API ---- */

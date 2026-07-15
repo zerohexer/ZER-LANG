@@ -20,8 +20,8 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
-VarRange leak), **~12 remaining** (§A #4–#7 zercheck_ir UAF, §C #13/#14/#16 VRP/bounds silent-OOB,
-§E #27–#31 concurrency).**
+VarRange leak + §C #16 defer bounds-guard), **~11 remaining** (§A #4–#7 zercheck_ir UAF,
+§C #13/#14 VRP/bounds silent-OOB, §E #27–#31 concurrency).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -119,12 +119,16 @@ ESCAPE #1; the ESCAPE #2 half `p=&local[i]; g=p` was already closed by §B #9); 
 from an earlier function elided a later same-named function's bounds guard (silent OOB);
 `c->var_range_count = 0` at each `check_func_body` entry (NOT restored — the post-body
 find_return_range pass reads it, next entry re-clears); `f40ca06b` F3, test
-`vrp_crossfunc_range_no_leak` (runtime, fixed=exit 0); 2026-07-15. make check 964/0.**
+`vrp_crossfunc_range_no_leak` (runtime, fixed=exit 0); 2026-07-15. make check 964/0. #16
+fixed-array index in a defer body dropped its bounds guard → silent OOB (defer bodies are
+raw-AST emitted, never reached the IR auto-guard pre-pass); new `Emitter.guard_traps` makes the
+auto-guard TRAP (an early-return in a defer re-fires the stack + skips cleanup), wired at the 3
+indexable defer-body sites (expr/return/if-cond); `9edc49b8` E, test `defer_array_oob`
+(compile-clean + runtime-trap); 2026-07-15. make check GREEN.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 13 | VRP guard-narrowing leaks past switch/if-capture/orelse/loop join | 586507fb (A+B, JOIN) | checker.c |
 | 14 | `find_return_range` do-while body + guard-body over-credit | f40ca06b (F1) **+** 59a968cb (A2) — different arms | checker.c |
-| 16 | defer body keeps array bounds-guard (trapping mode) | 9edc49b8 (E, `guard_traps`) | emitter.c/.h |
 
 ### D. uN/iN + miscompiles (🟠)
 **✅ DONE (merged to main): #17 assign/compound-assign mask, #18 `@truncate` mask

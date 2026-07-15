@@ -408,6 +408,15 @@ static void emit_zero_value(Emitter *e, Type *t) {
  * NODE_INDEX/NODE_FIELD callers want explicit braces+newline (statement form);
  * @cstr inline statement-expression already opened the brace via "if (...) { ". */
 static void emit_safety_early_return(Emitter *e, bool with_braces) {
+    /* §C #16: inside a defer body an early-return would re-fire the defer stack
+     * and skip the remaining function cleanup, so a bounds/UAF auto-guard traps
+     * instead (aborts safely before the out-of-bounds access). See guard_traps. */
+    if (e->guard_traps) {
+        if (with_braces) emit(e, "{ ");
+        emit(e, "_zer_trap(\"out-of-bounds array access in defer cleanup\", __FILE__, __LINE__);");
+        if (with_braces) emit(e, " }\n"); else emit(e, " ");
+        return;
+    }
     if (with_braces) emit(e, "{\n");
     emit_defers(e);
     if (e->in_async) {
@@ -9502,6 +9511,13 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
     }
     case NODE_EXPR_STMT:
         if (s->expr_stmt.expr) {
+            /* §C #16: defer bodies are raw AST emitted here and never reached the
+             * IR auto-guard pre-pass, so an unprovable fixed-array index in a defer
+             * (`defer arr[i]=x`) wrote raw (silent OOB). Emit guards in TRAP mode
+             * (early-return would re-fire the defer stack). Mirrors the IR gate. */
+            e->guard_traps = true;
+            emit_auto_guards(e, s->expr_stmt.expr);
+            e->guard_traps = false;
             /* Axis B5: lock-wrap a deferred shared-struct access (the IR-path
              * lock-emission doesn't reach raw defer bodies). Write lock if the
              * expression is an assignment, else read lock. Recursive mutex
@@ -9516,6 +9532,11 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         }
         return;
     case NODE_RETURN:
+        if (s->ret.expr) {
+            e->guard_traps = true;
+            emit_auto_guards(e, s->ret.expr);
+            e->guard_traps = false;
+        }
         emit_indent(e);
         emit(e, "return");
         if (s->ret.expr) {
@@ -9534,6 +9555,11 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         }
         return;
     case NODE_IF:
+        if (s->if_stmt.cond) {
+            e->guard_traps = true;
+            emit_auto_guards(e, s->if_stmt.cond);
+            e->guard_traps = false;
+        }
         emit_indent(e);
         emit(e, "if (");
         if (s->if_stmt.cond) emit_rewritten_node(e, s->if_stmt.cond, func);

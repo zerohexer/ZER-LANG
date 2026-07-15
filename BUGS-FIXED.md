@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — fixed-array index in a defer body dropped its bounds guard → silent OOB (emitter.c/.h)
+
+Tracker §C #16 (source `9edc49b8` E). Defer bodies are raw-AST emitted (via `emit_defer_stmt`)
+and never reached the IR auto-guard pre-pass, so an unprovable fixed-array index in a defer
+(`defer arr[i] = x` where `i` can't be range-proven) was written RAW — a silent out-of-bounds
+write during cleanup. Additionally, a normal auto-guard emits a silent EARLY-RETURN on OOB,
+which inside a defer would re-fire the defer stack and skip the rest of the function's cleanup.
+
+Fix: a new `Emitter.guard_traps` flag — when set, `emit_safety_early_return` emits a
+`_zer_trap("out-of-bounds array access in defer cleanup")` instead of the early-return. Set it
+around `emit_auto_guards(...)` at the three defer-body statement sites that carry indexable
+expressions (NODE_EXPR_STMT, NODE_RETURN, NODE_IF cond) — so defer bodies now get auto-guards
+AND those guards trap-abort rather than corrupt the cleanup flow.
+
+Verified: `defer arr[i]=…` with `i=30` (laundered through a loop so VRP can't prove it) on a
+`u32[8]` now compiles clean and TRAPS at runtime ("ZER TRAP: out-of-bounds array access in
+defer cleanup", SIGTRAP) instead of writing OOB; emitted C carries the trap at both guard
+sites. Test: `tests/zer_trap/defer_array_oob.zer` (compile-clean + runtime-trap). make check
+GREEN (all suites incl. the runtime-trap runner).
+
+---
+
 ## 2026-07-15 — VarRange map leaked across functions → elided bounds guard (silent OOB) (checker.c)
 
 Tracker §C #15 (source `f40ca06b` F3). The value-range map (VarRange, used to prove an index

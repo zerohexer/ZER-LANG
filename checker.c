@@ -365,7 +365,7 @@ static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
-static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found);
+static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch);
 /* classify_return_root result codes: a single return is STATIC (global/static/
  * null), UNKNOWN (local/unprovable — forces summary incomplete), or a param index
  * in [0,63]. See the function for the param_lattice.v ARStatic/ARParam(n) mapping. */
@@ -14969,7 +14969,7 @@ static void check_func_body(Checker *c, Node *node) {
             if (ret_eff && type_is_integer(ret_eff) && node->func_decl.body) {
                 int64_t rmin = 0, rmax = 0;
                 bool found = false;
-                if (find_return_range(c, node->func_decl.body, &rmin, &rmax, &found) && found) {
+                if (find_return_range(c, node->func_decl.body, &rmin, &rmax, &found, false) && found) {
                     Symbol *fsym = scope_lookup(c->current_scope,
                         node->func_decl.name, (uint32_t)node->func_decl.name_len);
                     if (fsym) {
@@ -15940,7 +15940,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 
 /* Scan a function body for return expressions with derivable range.
  * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
-static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found) {
+static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch) {
     if (!node) return true;
     if (node->kind == NODE_RETURN && node->ret.expr) {
         int64_t rmin, rmax;
@@ -15996,8 +15996,16 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         /* try parameter ident: return param — check if preceding guard
          * constrains it. Pattern: if (param >= N) { return C; } return param;
          * The guard ensures param < N at this return point.
-         * Use VarRange if available (set by check_stmt during body checking). */
-        if (node->ret.expr->kind == NODE_IDENT) {
+         * §C #14 A2: ONLY narrow at the TOP LEVEL of the body (in_branch==false).
+         * find_var_range reflects the range live at body-END, not at THIS return.
+         * A guard-BODY return `if (n >= 100) { return n; }` actually yields
+         * n >= 100, but the guard's persisted INVERSE ([0,99]) is what remains
+         * after the if — so it was wrongly credited [0,99] and the caller elided
+         * its bounds check on `arr[pick(150)]` → silent stack OOB. A TOP-LEVEL
+         * `return raw;` after `if (raw >= 16) return 0;` is sound (the inverse
+         * genuinely holds there). The in_branch gate keeps the sound case, drops
+         * the unsound one. */
+        if (!in_branch && node->ret.expr->kind == NODE_IDENT) {
             struct VarRange *r = find_var_range(c,
                 node->ret.expr->ident.name,
                 (uint32_t)node->ret.expr->ident.name_len);
@@ -16018,32 +16026,42 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
     }
     if (node->kind == NODE_BLOCK) {
         for (int i = 0; i < node->block.stmt_count; i++) {
-            if (!find_return_range(c, node->block.stmts[i], out_min, out_max, found))
+            /* a block preserves the caller's branch context (top-level function
+             * body block = in_branch false; a block nested in an if was reached
+             * via the IF arm below with in_branch true). */
+            if (!find_return_range(c, node->block.stmts[i], out_min, out_max, found, in_branch))
                 return false;
         }
         return true;
     }
     if (node->kind == NODE_IF) {
-        if (!find_return_range(c, node->if_stmt.then_body, out_min, out_max, found))
+        /* returns inside either arm are branch-local — in_branch=true (their
+         * VarRange snapshot at body-end does NOT reflect the arm's guard). */
+        if (!find_return_range(c, node->if_stmt.then_body, out_min, out_max, found, true))
             return false;
-        return find_return_range(c, node->if_stmt.else_body, out_min, out_max, found);
+        return find_return_range(c, node->if_stmt.else_body, out_min, out_max, found, true);
     }
     if (node->kind == NODE_SWITCH) {
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
-            if (!find_return_range(c, node->switch_stmt.arms[i].body, out_min, out_max, found))
+            if (!find_return_range(c, node->switch_stmt.arms[i].body, out_min, out_max, found, true))
                 return false;
         }
         return true;
     }
-    if (node->kind == NODE_FOR || node->kind == NODE_WHILE) {
+    if (node->kind == NODE_FOR || node->kind == NODE_WHILE ||
+        node->kind == NODE_DO_WHILE) {
+        /* §C #14 F1: NODE_DO_WHILE shares the while_stmt union field. Omitting it
+         * let a `return` inside a do-while body escape the scan, so the return
+         * range UNDER-approximated and call sites elided the bounds check on
+         * `arr[f()]` — a silent OOB. Loop-body returns are branch-local (true). */
         Node *body = (node->kind == NODE_FOR) ? node->for_stmt.body : node->while_stmt.body;
-        return find_return_range(c, body, out_min, out_max, found);
+        return find_return_range(c, body, out_min, out_max, found, true);
     }
     if (node->kind == NODE_CRITICAL) {
-        return find_return_range(c, node->critical.body, out_min, out_max, found);
+        return find_return_range(c, node->critical.body, out_min, out_max, found, true);
     }
     if (node->kind == NODE_ONCE) {
-        return find_return_range(c, node->once.body, out_min, out_max, found);
+        return find_return_range(c, node->once.body, out_min, out_max, found, true);
     }
     return true; /* non-return statement — ok */
 }

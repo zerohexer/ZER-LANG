@@ -20,8 +20,8 @@ short-circuit, optional-None, designated-init, `@saturate`, signed-comptime, flo
 wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-addr-of-local
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
-VarRange leak + §C #16 defer bounds-guard), **~11 remaining** (§A #4–#7 zercheck_ir UAF,
-§C #13/#14 VRP/bounds silent-OOB, §E #27–#31 concurrency).**
+VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body),
+**~10 remaining** (§A #4–#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB, §E #27–#31 concurrency).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -124,11 +124,16 @@ fixed-array index in a defer body dropped its bounds guard → silent OOB (defer
 raw-AST emitted, never reached the IR auto-guard pre-pass); new `Emitter.guard_traps` makes the
 auto-guard TRAP (an early-return in a defer re-fires the stack + skips cleanup), wired at the 3
 indexable defer-body sites (expr/return/if-cond); `9edc49b8` E, test `defer_array_oob`
-(compile-clean + runtime-trap); 2026-07-15. make check GREEN.**
+(compile-clean + runtime-trap); 2026-07-15. make check GREEN. #14 `find_return_range` mis-credited
+do-while + guard-body returns → too-narrow return range → caller elided its bounds check (silent
+OOB): F1 added NODE_DO_WHILE to the loop case (a do-while-body `return` escaped the scan;
+`f40ca06b`); A2 threaded an `in_branch` param so a bare `return param` narrows ONLY at top level
+(a guard-BODY return was wrongly credited the guard's inverse range; `59a968cb`) — sound
+top-level narrowing kept. Tests `dowhile_return_range_oob` (trap) + `return_range_guard_body_bounds`
+(exit 0); 2026-07-15. make check 967/0.**
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 13 | VRP guard-narrowing leaks past switch/if-capture/orelse/loop join | 586507fb (A+B, JOIN) | checker.c |
-| 14 | `find_return_range` do-while body + guard-body over-credit | f40ca06b (F1) **+** 59a968cb (A2) — different arms | checker.c |
 
 ### D. uN/iN + miscompiles (🟠)
 **✅ DONE (merged to main): #17 assign/compound-assign mask, #18 `@truncate` mask

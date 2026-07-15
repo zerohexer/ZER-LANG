@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — find_return_range mis-credited do-while + guard-body returns → silent OOB (checker.c)
+
+Tracker §C #14 (two arms: `f40ca06b` F1 + `59a968cb` A2). `find_return_range` computes a
+function's return-value range so a caller can prove `arr[f()]` in-bounds and elide the runtime
+guard. Two ways it produced a wrong (too-narrow) range → elided a caller guard → silent OOB:
+
+- **F1 (do-while under-approximation):** the loop case handled NODE_FOR/NODE_WHILE but NOT
+  NODE_DO_WHILE, so a `return` inside a do-while body escaped the scan. `pick(7)` (returns 999
+  from a do-while body) was seen as returning only [0,0], so `buf[pick(7)]` on a `u8[4]` elided
+  its bounds check → OOB read. Fix: add NODE_DO_WHILE to the loop case (shares the while_stmt
+  union field).
+- **A2 (guard-body over-credit):** a guard-BODY return `if (n >= 100) { return n; }` actually
+  yields n >= 100, but `find_var_range` reflects the range live at body-END — where the guard's
+  persisted INVERSE [0,99] remains — so that return was wrongly credited [0,99]; `arr[pick(150)]`
+  then elided its guard → stack OOB write. Fix: thread a new `in_branch` param through
+  `find_return_range` (block preserves context; if/switch/loop/critical/once arms pass true) and
+  narrow a bare `return param` ONLY at the TOP LEVEL (`!in_branch`). A top-level `return raw;`
+  after `if (raw >= 16) return 0;` stays sound (the inverse genuinely holds there — the
+  cross-module `range_lib.safe_slot` pattern is NOT over-rejected).
+
+Verified: `pick(7)` do-while → `buf[pick(7)]` now TRAPS (SIGTRAP) instead of OOB read;
+`arr[pick(150)]` guard-body now auto-guards (early-return, exit 0) instead of OOB write; the
+sound top-level narrowing still compiles (make check 967/0, no over-reject). Tests:
+`tests/zer_trap/dowhile_return_range_oob.zer` (F1, runtime-trap),
+`tests/zer/return_range_guard_body_bounds.zer` (A2, exit 0 post-fix).
+
+---
+
 ## 2026-07-15 — fixed-array index in a defer body dropped its bounds guard → silent OOB (emitter.c/.h)
 
 Tracker §C #16 (source `9edc49b8` E). Defer bodies are raw-AST emitted (via `emit_defer_stmt`)

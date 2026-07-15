@@ -2537,6 +2537,54 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
         }
 
+        /* §A #6: struct value-copy `Holder b = a` replicates the COMPOUND entries
+         * (a.p, a.h, …) onto the destination so b.p aliases a.p (same alloc_id).
+         * This was the documented "Pattern 4 two-pass replicate" that silently
+         * rotted out in a later refactor — without it, `Holder b = a; free(raw);
+         * use(b.p)` compiled a use-after-free (b.p untracked). Runs BEFORE the
+         * bare-alias path below: the src's tracked field is a COMPOUND entry
+         * (path != NULL), so `ir_find_handle` (bare-only) returns NULL and the
+         * `!src_h` early-break would otherwise skip this. Two-pass: snapshot every
+         * src compound row FIRST (ir_add_compound_handle may realloc ps->handles
+         * and invalidate pointers), then add + alias. A plain scalar copy has no
+         * compound rows, so this is a no-op there. */
+        {
+            int src_root = inst->src1_local;
+            int ccount = 0;
+            for (int hi = 0; hi < ps->handle_count; hi++) {
+                if (ps->handles[hi].local_id == src_root &&
+                    ps->handles[hi].path != NULL) ccount++;
+            }
+            if (ccount > 0) {
+                struct { const char *path; uint32_t path_len; IRAliasSnapshot snap; }
+                    stack_rows[16], *rows = stack_rows;
+                int cap = 16;
+                if (ccount > cap) {
+                    void *mem = malloc((size_t)ccount * sizeof(stack_rows[0]));
+                    if (mem) { rows = mem; cap = ccount; }
+                }
+                int ri = 0;
+                for (int hi = 0; hi < ps->handle_count && ri < cap; hi++) {
+                    IRHandleInfo *ch = &ps->handles[hi];
+                    if (ch->local_id == src_root && ch->path != NULL) {
+                        rows[ri].path = ch->path;
+                        rows[ri].path_len = ch->path_len;
+                        ir_snapshot_alias(&rows[ri].snap, ch);
+                        ri++;
+                    }
+                }
+                for (int k = 0; k < ri; k++) {
+                    IRHandleInfo *dch = ir_add_compound_handle(
+                        ps, inst->dest_local, rows[k].path, rows[k].path_len);
+                    if (dch) {
+                        ir_apply_alias(dch, &rows[k].snap);
+                        dch->state = rows[k].snap.state;
+                    }
+                }
+                if (rows != stack_rows) free(rows);
+            }
+        }
+
         IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
         if (!src_h) break;
         /* Error if source is invalid */

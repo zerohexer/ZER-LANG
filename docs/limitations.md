@@ -21,8 +21,8 @@ wrapper-blind, + §A #2 cross-fn/by-value-field slice free, + §B #9 reassign-ad
 escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX CLEAN** —, + §B #12
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
-defer-body shared lock + §E #31 union-tag-thru-pointer), **~7 remaining** (§A #4–#7 zercheck_ir
-UAF, §C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock).**
+defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle),
+**~6 remaining** (§A #4/#5/#7 zercheck_ir UAF, §C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -61,12 +61,17 @@ TYPE_SLICE, so a callee freeing a heap-slice param (`sink([*]B p){free(p)}`) or 
 of a by-value struct param (`fb(H h){free(h.buckets)}`) wasn't recorded → caller
 double-free/UAF passed; `bf29ffdc` (776), tests `alloc_crossfn_slice_double_free` +
 `alloc_byval_field_slice_uaf` + positive `slice_param_free_ownership_ok`; 2026-07-15. make
-check 948/0. **All applicable `bf29ffdc` fixes now landed (§A #1/#2/#3, §B #10, §E #26).**
+check 948/0. **All applicable `bf29ffdc` fixes now landed (§A #1/#2/#3, §B #10, §E #26).** #6
+struct value-copy `Holder b = a` dropped a's COMPOUND handle rows → `free(raw); use(b.p)`
+compiled a UAF (b.p untracked). Regression of the documented Pattern-4 two-pass replicate — the
+src's tracked field is a compound entry (`path != NULL`), so `ir_find_handle` returns NULL and
+the `!src_h` early-break skipped it. Restored the two-pass replicate (snapshot then add+alias,
+realloc-safe) BEFORE the break; `59a968cb` A3, tests `struct_copy_compound_uaf` (neg) +
+`struct_copy_compound_ok` (pos, no false-leak); 2026-07-15. make check 972/0.
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
 | 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |
 | 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
-| 6 | struct value-copy preserves compound handle (Pattern-4 replicate) | 59a968cb (A3) | zercheck_ir.c |
 | 7 | move-alias via `&arr[i]` / `&b.field` / spawn-arg | 582920db (#4) | zercheck_ir.c |
 
 ### B. Escape / dangling-pointer sinks (🔴; #8 base helper partial in main)

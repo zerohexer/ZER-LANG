@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Struct value-copy must replicate compound handle entries: `Holder b = a`
+// makes b.p alias a.p; freeing the underlying alloc then using b.p is UAF.
+// (Regression of the documented Pattern-4 replicate; restored 2026-07-04.)
+struct Task { u32 id; }
+struct Holder { ?*Task p; }
+Slab(Task) heap;
+u32 main() {
+    *Task raw = heap.alloc_ptr() orelse return;
+    Holder a; a.p = raw;
+    Holder b = a;
+    heap.free_ptr(raw);
+    *Task pb = b.p orelse return;
+    pb.id = 9;
+    return 0;
+}

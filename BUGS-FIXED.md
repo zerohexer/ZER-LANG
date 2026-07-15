@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — struct value-copy dropped compound handle entries → UAF undetected (zercheck_ir.c)
+
+Tracker §A #6 (source `59a968cb` A3). A struct value-copy `Holder b = a` must replicate a's
+COMPOUND handle rows (`a.p`, `a.h`, …) onto the destination so `b.p` aliases `a.p` (same
+alloc_id) — this is the documented "Pattern 4 two-pass replicate", which silently rotted out in
+a later zercheck_ir refactor. Without it, `Holder a; a.p = raw; Holder b = a; free(raw);
+use(b.p)` compiled a USE-AFTER-FREE (b.p untracked, so the free didn't propagate to it).
+
+Root cause of why it was skipped: in IR_COPY the src's tracked field is a COMPOUND entry
+(`path != NULL`), so `ir_find_handle` (bare-local only) returns NULL and the `if (!src_h) break;`
+early-break bailed before any replication. Fix: run the compound replicate BEFORE that break —
+two-pass (snapshot every src compound row first, because `ir_add_compound_handle` may realloc
+`ps->handles` and invalidate pointers; then add + alias on the destination). Stack-first
+`stack_rows[16]` with malloc overflow (an anonymous-struct array — not matched by the
+fixed-buffer audit patterns). A plain scalar copy has no compound rows → no-op, no over-reject.
+
+Verified: `Holder b = a; free(raw); use(b.p)` now rejects as UAF; an unused-copy `Holder b = a;
+free(raw)` still compiles + runs (no false leak / double-free). Tests:
+`tests/zer_fail/struct_copy_compound_uaf.zer`, `tests/zer/struct_copy_compound_ok.zer`. make
+check 972/0.
+
+---
+
 ## 2026-07-15 — union variant write through a *Union pointer skipped the tag update (type confusion) (emitter.c)
 
 Tracker §E #31 (source `586507fb`). Writing a union variant updates the hidden discriminant

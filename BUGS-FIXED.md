@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — Level-B guard copy-chain defeated the immutability gate (reassigned intermediate) → UAF (zercheck_ir.c) — §A COMPLETE
+
+Tracker §A #5 (source `66332d39` #2). The Level-B guarded-free relaxation reaches a guard
+through an IR_COPY/IR_UNOP(`!`) chain via `ir_resolve_cond_root`, which traced to the ROOT bool
+and checked only the ROOT's immutability. But a reassignment of an INTERMEDIATE copy variable
+hides in an expr-form IR_ASSIGN (`dest_local == -1`) that the unique-def scan can't see — so
+`bool c2 = c; if (c) { free } c2 = e; if (!c2) { use/free }` traced `c2 → c` and checked only
+`c`'s immutability. The disjointness "free under (c,+), use under (c,−)" was then a LIE (c2 was
+decoupled from c by `c2 = e`), so on the `c=true, e=false` path the use coincides with the free —
+a silent UAF + double-free.
+
+Fix: gate EACH COPY/UNOP hop in `ir_resolve_cond_root` on the INTERMEDIATE `cur`'s immutability —
+`if (!ir_local_is_immutable_bool(func, cur)) break;` before following the hop (+ a forward decl,
+since the helper is defined later). If `cur` is mutated/address-taken the trace stops there, and
+`ir_edge_label` re-checks that root and rejects it. This is the exact "operational-precondition
+is a finite variable" lesson (CLAUDE.md Level B) applied to the INTERMEDIATE, not just the final
+root.
+
+Verified: the reassigned-intermediate case rejects (UAF); a STABLE copy-chain (`bool c2 = c;`
+never reassigned, freed on all paths) still COMPILES — the immutability gate returns true for the
+stable intermediate, so the relaxation is preserved (no over-reject; proven by the passing
+positive). Tests: `tests/zer_fail/guarded_cond_copychain_reassigned.zer`,
+`tests/zer/guarded_cond_copychain_stable_ok.zer`. make check 979/0. **§A (memory safety —
+UAF/double-free/move #1–#7) FULLY DONE.**
+
+---
+
 ## 2026-07-15 — Level-B guard relaxation admitted UAF/double-free after a complementary free-pair (zercheck_ir.c)
 
 Tracker §A #4 (source `59a968cb` A1). The Level-B guarded-free relaxation

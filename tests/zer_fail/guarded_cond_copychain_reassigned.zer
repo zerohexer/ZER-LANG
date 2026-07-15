@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// Level-B guarded-MAYBE_FREED relaxation soundness: a guard reached through an
+// IR_COPY chain must have EVERY intermediate copy variable be stable, not just
+// the final root. `bool c2 = c; if(c){free} c2 = e; if(!c2){use}` used to trace
+// c2 -> c and check only c's immutability — but c2 was reassigned via an
+// expr-form IR_ASSIGN (dest_local == -1) invisible to the def-count, so the
+// disjointness "free under (c,+), use under (c,-)" was a lie → silent UAF +
+// double-free. Fixed: ir_resolve_cond_root now gates each COPY/UNOP hop on the
+// intermediate's immutability.
+struct Task { u32 id; }
+Slab(Task) slab;
+void f(bool c, bool e) {
+    *Task p = slab.alloc_ptr() orelse return;
+    p.id = 111;
+    bool c2 = c;
+    if (c) { slab.free_ptr(p); }
+    c2 = e;                       // decouples c2 from c
+    if (!c2) {
+        u32 v = p.id;            // use-after-free on the c=true,e=false path
+        slab.free_ptr(p);        // double-free
+    }
+}
+u32 main() { return 0; }

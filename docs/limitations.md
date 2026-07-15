@@ -22,8 +22,8 @@ escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX C
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
 defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle
-+ §A #7 move-alias compound-key + §A #4 Level-B complementary-free-pair), **~4 remaining** (§A #5
-Level-B immutability-gate, §C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock ir_lower.c).**
++ §A #7 move-alias compound-key + §A #4 Level-B complementary-free-pair + §A #5 Level-B copy-chain immutability [**§A FULLY
+DONE**]), **~3 remaining** (§C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock ir_lower.c).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -83,10 +83,14 @@ was wrongly judged disjoint from the *other* free and accepted). One-line gate `
 (h->freed_all_paths) return false;` at the top of `ir_use_guard_disjoint` (freed_all_paths set by
 `ir_free_completes_coverage`, propagates monotonically; legit single-free-then-disjoint-use
 preserved — provably transparent). `59a968cb` A1, tests `guarded_complement_{free_use,double_free}`;
-2026-07-15. make check 977/0.
-| # | Fix | Proper source (sha) | Files |
-|---|---|---|---|
-| 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
+2026-07-15. make check 977/0. #5 Level-B guard COPY-CHAIN defeated the immutability gate — a
+reassigned INTERMEDIATE copy (`bool c2 = c; if(c){free} c2 = e; if(!c2){use}`) hides in an
+expr-form IR_ASSIGN (dest_local == -1) the def-scan can't see, so `ir_resolve_cond_root` traced
+c2→c and checked only c's immutability → the disjointness was a lie → silent UAF + double-free.
+Gated each COPY/UNOP hop on the INTERMEDIATE's immutability (`ir_local_is_immutable_bool` +
+forward decl); a STABLE copy-chain still compiles (relaxation preserved — proven by positive).
+`66332d39` #2, tests `guarded_cond_copychain_reassigned` (neg) + `guarded_cond_copychain_stable_ok`
+(pos); 2026-07-15. make check 979/0. **🎯 §A (memory safety #1–#7) FULLY DONE.**
 
 ### B. Escape / dangling-pointer sinks (🔴; #8 base helper partial in main)
 **✅ DONE: #10 assignment-form slice-of-local (`[*]T s; s = arr; return s` / `g=s` / `&s[0]`)

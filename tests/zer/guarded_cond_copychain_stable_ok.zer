@@ -1,0 +1,16 @@
+// Positive: a STABLE intermediate copy (c2 = c, never reassigned) preserves the
+// Level-B copy-chain relaxation — the free under c and the use under !c2 (== !c)
+// are disjoint, so the use must NOT be flagged UAF. Guards §A #5 against
+// over-rejection: the immutability gate on the intermediate must reject only a
+// REASSIGNED c2, never a stable one. p is freed on all paths (c: under c;
+// !c: under !c2) so there is no leak.
+struct Task { u32 id; }
+Slab(Task) slab;
+void f(bool c) {
+    *Task p = slab.alloc_ptr() orelse return;
+    p.id = 1;
+    bool c2 = c;
+    if (c) { slab.free_ptr(p); }
+    if (!c2) { u32 v = p.id; slab.free_ptr(p); if (v > 0) { } }
+}
+u32 main() { f(false); return 0; }

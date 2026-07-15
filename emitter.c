@@ -11633,6 +11633,16 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         if (!l->type) continue;
         emit_indent(e);
         if (l->is_static) emit(e, "static ");
+        /* VOL-1: a `volatile` scalar/aggregate local carries no volatile in its
+         * Type (only slice/pointer types do, propagated by the checker), so emit
+         * the qualifier here. Skip pointer/slice — their volatile is already in
+         * the emitted type (`volatile uint32_t *`); an outer prefix would change
+         * meaning (volatile-pointer vs pointer-to-volatile). */
+        if (l->is_volatile && l->type) {
+            TypeKind vtk = type_dispatch_kind(l->type);
+            if (vtk != TYPE_POINTER && vtk != TYPE_SLICE)
+                emit(e, "volatile ");
+        }
         emit_type_and_name(e, l->type, l->name, l->name_len);
         if (l->is_static && l->static_init) {
             emit(e, " = ");

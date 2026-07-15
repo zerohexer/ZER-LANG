@@ -1,0 +1,19 @@
+// VOL-1: a `volatile` scalar local carries no volatile in its Type (only
+// slice/pointer types do), so the emitter dropped the qualifier — `volatile u32
+// d` became a plain `uint32_t d`. On bare metal a volatile local used as a
+// delay/timing counter or a "keep in memory" holder was then silently optimized
+// away. The IR local now records is_volatile and the emitter emits the qualifier
+// for scalar/aggregate locals (pointer/slice keep it in the type).
+u32 main() {
+    volatile u32 d = 0;
+    for (u32 k = 0; k < 1000; k += 1) {
+        d = d + 1;
+    }
+    if (d != 1000) { return 1; }
+
+    // a volatile MMIO-style pointer local must still work (volatile in the type)
+    volatile u32 acc = 5;
+    acc = acc * 2;
+    if (acc != 10) { return 2; }
+    return 0;
+}

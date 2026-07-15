@@ -2140,6 +2140,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 vt, false, false, false, node->loc.line);
             if (sid >= 0) {
                 ctx->func->locals[sid].is_static = true;
+                ctx->func->locals[sid].is_volatile = node->var_decl.is_volatile;
                 /* Store init for emitter — drops to silent zero otherwise.
                  * Checker enforces compile-time-constant init for static. */
                 ctx->func->locals[sid].static_init = node->var_decl.init;
@@ -2153,6 +2154,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int local_id = ir_add_local(ctx->func, ctx->arena,
             node->var_decl.name, (uint32_t)node->var_decl.name_len,
             vt, false, false, false, node->loc.line);
+        if (local_id >= 0) ctx->func->locals[local_id].is_volatile = node->var_decl.is_volatile;
         if (local_id >= 0 && node->var_decl.init) {
             /* Rewrite idents in init expression to use correct local names */
             rewrite_idents(ctx, node->var_decl.init);

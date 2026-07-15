@@ -34,6 +34,11 @@ typedef struct {
     bool is_capture;         /* if-unwrap |val| or switch arm |val| */
     bool is_temp;            /* compiler-generated temp (_zer_or0, _zer_uw0) */
     bool is_static;          /* static local — NOT promoted to async state struct */
+    bool is_volatile;        /* `volatile T x;` — VOL-1: scalar/aggregate locals
+                              * carry no volatile in their Type (only slice/pointer
+                              * do), so the emitter needs this to emit the qualifier.
+                              * Without it a `volatile u32 d;` delay/timing loop was
+                              * silently optimized away on bare metal. */
 
     /* BUG-590: scope tracking for variable shadowing.
      * `scope_depth` — depth at creation. Used only for dedup decisions

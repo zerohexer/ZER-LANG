@@ -13517,6 +13517,31 @@ static void check_stmt(Checker *c, Node *node) {
                         i + 1);
                 }
             }
+            /* §B #13: by-VALUE aggregate arg (struct/union/array) that CARRIES
+             * a pointer/slice into a stack local. `Msg m; m.p = &local; spawn
+             * worker(m)` copies `m` by value, but the copied pointer field
+             * still points into the caller's frame, so the spawned thread
+             * dereferences freed stack memory (cross-thread use-after-free)
+             * once the frame returns. The is_ptr_like gate above only covers
+             * bare pointer/slice/opaque args and skips aggregates, so `m`
+             * (correctly flagged is_local_derived by the field-store escape
+             * taint — verified by the return / global-store sinks) was never
+             * checked here. Gated on type_carries_data_pointer so a pure-value
+             * struct (no ref fields) is still copied freely; a scoped spawn
+             * (join before scope exit) bounds the lifetime, matching the
+             * ptr-like arm above. */
+            if (!is_ptr_like && !is_scoped &&
+                (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+                 eff->kind == TYPE_ARRAY) &&
+                type_carries_data_pointer(eff, 0) &&
+                spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass a by-value struct holding a "
+                    "pointer/slice into a stack local to a fire-and-forget "
+                    "spawn — the copied pointer dangles when the frame returns "
+                    "(cross-thread use-after-free). Point the field at a shared "
+                    "global, or use ThreadHandle + join", i + 1);
+            }
             /* Handle args: ban — pool.get() not thread-safe.
              * Also reject ?Handle(T) — spawned thread can unwrap the optional
              * and have the same Handle, with the same non-thread-safe access. */

@@ -726,3 +726,7 @@ emitter.c:if (!si_eff || si_eff->kind != TYPE_STRUCT) return NULL;
 # type_unwrap_distinct'd _eff locals. Documented-safe.
 checker.c:if (src_eff && src_eff->kind == TYPE_POINTER &&
 checker.c:tgt_eff && tgt_eff->kind == TYPE_POINTER &&
+# §B #13 spawn by-value aggregate carrier — eff = type_unwrap_distinct(arg_type)
+# (already unwrapped, same as the is_ptr_like eff->kind reads above).
+checker.c:(eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+checker.c:eff->kind == TYPE_ARRAY) &&

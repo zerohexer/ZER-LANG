@@ -1,0 +1,24 @@
+// Positive: the §B #13 aggregate-carrier spawn check must NOT over-reject a
+// SCOPED spawn (ThreadHandle + join). The join happens before start() returns,
+// so `local` outlives the thread — passing a by-value struct whose field points
+// into `local` is safe here. Exercises the `!is_scoped` exemption of the fix.
+struct Cell { u32 val; }
+struct Msg { *Cell p; }
+
+void worker(Msg m) {
+    u32 v = m.p.val;
+}
+
+void start() {
+    Cell local;
+    local.val = 5;
+    Msg m;
+    m.p = &local;
+    ThreadHandle th = spawn worker(m);
+    th.join();
+}
+
+u32 main() {
+    start();
+    return 0;
+}

@@ -1,0 +1,32 @@
+// EXPECTED: compile error
+// §B #13: a by-VALUE struct whose pointer field holds &local passed to a
+// fire-and-forget spawn. `m` is copied by value, but the copied `m.p` still
+// points into start()'s stack frame — the spawned worker dereferences freed
+// stack once start() returns (cross-thread use-after-free). The ptr-like
+// spawn-arg gate only covered bare pointer/slice/opaque args and skipped the
+// aggregate carrier, so this compiled clean pre-fix even though `m` is
+// correctly flagged is_local_derived (the return / global-store sinks reject
+// it). Fixed by checking spawn_arg_is_stack_derived on aggregate args that
+// carry a data pointer.
+shared struct Sink { u32 v; }
+Sink g_sink;
+
+struct Cell { u32 val; }
+struct Msg { *Cell p; }
+
+void worker(Msg m) {
+    g_sink.v = m.p.val;
+}
+
+void start() {
+    Cell local;
+    local.val = 42;
+    Msg m;
+    m.p = &local;
+    spawn worker(m);
+}
+
+u32 main() {
+    start();
+    return 0;
+}

@@ -5191,6 +5191,74 @@ erased pointer obeys the same rule as the rest of the family.
 - `cast_sugar_wrong.zer` — `(*Motor)o` from a `*Box` → **compile error** *"cast type mismatch:
   source has provenance '*Box' but target is '*Motor'"*. Proves the sugar is checked.
 
+### 36.15 Implementation attempt (2026-07-16) — the accept-unsafe traps + the borrow-inference limit
+
+First implementation pass. Traced the EXACT mechanism, then STOPPED before patching because
+this is a RELAXATION (reject→accept; a bug = a shipped UAF) and every quick fix has a **verified
+accept-unsafe hole**. Recording so a future session does not fall in them.
+
+**The mechanism (found):** `zercheck_ir.c` registers a pointer-returning CALL result as an owned
+allocation at TWO sites — the summary path (~4308) and the no-summary path (~4352, comment: *"any
+pointer-returning call treated as allocation … Applies to both extern (bodyless) and bodied
+functions"*). Both fire on `ret_eff->kind == TYPE_POINTER || TYPE_OPAQUE || TYPE_HANDLE` (and the
+`?`-wrapped forms). That is why `?*opaque map_get(...)` is treated as an allocator: the RETURN
+TYPE alone triggers it. This IS the "owned by type, not by provenance" anomaly from §36.7.
+
+**Trap 1 — gating on `FuncProps.can_alloc == false` is UNSOUND.** `can_alloc` (checker.c
+`scan_func_props`, ~9596) is scoped to ISR/`@critical` DEADLOCK detection: it sets true only for
+`slab/Task .alloc/.alloc_ptr/.free/.free_ptr` on a heap-backed receiver, plus transitive user
+calls / funcptr-args. It does NOT recognise **extern `malloc`** (bodyless → its own body has no
+`.alloc` method → `can_alloc` stays false) nor (likely) the **universal `alloc(T)`** builtin. So
+`*u8 mk(){ return malloc(16); }` has `can_alloc == false`; gating the relaxation on it would skip
+registering `mk()`'s result → the malloc'd buffer's leak/UAF goes UNDETECTED. (Today the
+"any-pointer-return = alloc" path DOES cover `mk()`; the naive relaxation REGRESSES that.)
+
+**Trap 2 — gating on "return traces to a param" is UNSOUND.** `*W f(*Map m){ *W w = alloc(W);
+m.slots[0].value = w; return m.slots[0].value; }` — the return traces to param `m` (a field read
+of a param), so `classify_return_root`/`ret_param_mask` says PARAM(0). But the returned pointer is
+a FRESH allocation `w` that `f` stashed into the param then read back. Treating "traces to param"
+as "borrow, not owned" would miss this leak/UAF. **A value can be alloc'd and laundered through a
+param field**, so return-traces-to-param does NOT imply borrow.
+
+**The genuinely sound mechanism (and why it is not a one-shot):** ownership must follow the
+returned value's **`alloc_id` across the call boundary** — `map_put(m, k, v)` stores `v` (carrying
+its `alloc_id`, which is 0/none for `(*opaque)&global` but nonzero for `alloc()`) into
+`m.slots[].value`; `map_get` returns that field; the caller connects put-alloc_id-X → get-returns-
+alloc_id-X. For Trap 1 the wrapped value has a real `alloc_id` → stays OWNED (safe). For Trap 2 the
+stashed `w` has a real `alloc_id` → stays OWNED (safe). For the legit borrow (`(*opaque)&global`,
+alloc_id 0) → BORROW → no false leak. This is **cross-function compound-handle-through-param-field
+provenance flow** — the summaries do NOT track store-to-param-field with alloc_id today. Building it
+is the substantial, sound path. Pure inference of borrow-vs-owned across an opaque container
+boundary is otherwise Rice-hard (Traps 1–2 are the witnesses).
+
+**THE DESIGN FORK (owner's call — this is where the next session picks up):**
+
+- **PATH A — cross-boundary `alloc_id` flow (annotation-free, bigger).** Keep the §36 promise
+  ("always correct even if intent wrong"): extend FuncSummary to record, per param, "this param's
+  field/pointee receives a value with alloc_id N" (store-to-param-field) and "the return is param
+  P's field/pointee" (return-from-param-field); at the call site, thread the actual arg's alloc_id
+  through. Then gate the two registration paths on the DERIVED result-provenance (owned iff the
+  connected alloc_id is a real allocation). Oracle FIRST (a `lambda_zer_erased/` subset: lattice
+  `{ERASED_OWNED, ERASED_BORROW}` keyed by alloc_id, crown-jewel theorem = Trap-2's launder is
+  FORCED to OWNED, merge = JOIN with OWNED as the conservative default). Then the C, incrementally,
+  with the §36.13 test matrix. This is the "unification" done right; it is a real subsystem, not a
+  patch.
+
+- **PATH B — explicit audit-visible borrow marker (smaller, user-declared).** Accept that
+  borrow-vs-owned across an opaque boundary is undecidable by inference, and make the user DECLARE
+  it at the erasure site — fitting ZER's "audit-visible primitive selection" (the same philosophy
+  as `@pun` making a type-claim visible, or `keep` having once been an annotation). A distinct
+  spelling (e.g. a `borrow`-qualified opaque / a new `anyref`) that zercheck NEVER owned-tracks; its
+  lifetime safety still rides the escape sinks; re-type still via the `type_id` trap. Costs: a
+  type-kind/qualifier + parser + checker + emitter + the zercheck skip (5 sites, the standard
+  new-type surface), and it gives up "correct even if intent wrong" for the ownership axis (a
+  mislabelled owned-as-borrow leaks — the user's explicit, greppable choice, exactly like C's
+  `void*` but with the re-type still checked). NOT a relaxation of an inference (no accept-unsafe
+  risk in the analyzer), so it can ship without the cross-boundary provenance work.
+
+**Interim (unblocked TODAY):** the `usize` token (§36.12) needs neither path and already works. Do
+NOT ship a `can_alloc`- or param-trace-gated relaxation — both are accept-unsafe per Traps 1–2.
+
 ---
 
 # End of PART 6

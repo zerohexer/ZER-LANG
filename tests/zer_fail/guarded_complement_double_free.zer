@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// A third free after a complementary free-pair (freed on all paths) is a double-free.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+void f(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+    if (!c) { pool.free(h); }
+}
+u32 main() { f(false); return 0; }

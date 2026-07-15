@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-15 — Level-B guard relaxation admitted UAF/double-free after a complementary free-pair (zercheck_ir.c)
+
+Tracker §A #4 (source `59a968cb` A1). The Level-B guarded-free relaxation
+(`ir_use_guard_disjoint`) recovers the idiomatic `if (c) { free(h) } if (!c) { use(h) }` by
+accepting a use that is guard-DISJOINT from the free. But it records only ONE free site
+(`free_block`). When a handle is freed under BOTH complementary guards — `if (c) { free }
+if (!c) { free }` — it is freed on ALL paths, yet a later `if (!c) { use/free }` was judged
+disjoint from the *other* (c-guarded) free and ACCEPTED — even though on its own (!c) path it
+coincides with the free. Accept-unsafe UAF (`… if (!c) { use(h) }`) and double-free (`… if (!c)
+{ free(h) }`).
+
+Fix: one line at the top of `ir_use_guard_disjoint` — `if (h->freed_all_paths) return false;`.
+`freed_all_paths` is set once a complementary free-pair completes its coverage
+(`ir_free_completes_coverage`) and propagates monotonically through the CFG merge, so once the
+handle is freed on every path NO subsequent use/free is admissible. A legit
+single-free-then-disjoint-use never sets `freed_all_paths`, so the relaxation is preserved (the
+gate is provably transparent to it — verified: make check green, no existing `guarded_*`
+positive regressed).
+
+Verified: `if (c) { free } if (!c) { free } if (!c) { use }` rejects as UAF; the third-free
+variant rejects as double-free. Tests: `tests/zer_fail/guarded_complement_free_use.zer`,
+`tests/zer_fail/guarded_complement_double_free.zer`. make check 977/0. (The @@ -2518 hunk of the
+same commit = §A #6 struct-copy compound handle, already landed.)
+
+---
+
 ## 2026-07-15 — move-alias via `&arr[i]` / `&b.field` (compound-key) — use-after-move undetected (zercheck_ir.c)
 
 Tracker §A #7 (source `582920db` #4). Taking a pointer to a move-struct element/field

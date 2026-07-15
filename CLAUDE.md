@@ -2350,10 +2350,10 @@ consume that table (cherry-pick the proper fix, rebase onto HEAD, re-verify). **
 #36–#41 ALL FULLY DONE; the whole `bf29ffdc` commit (§A #1/#2/#3, §B #10, §E #26); + §B #9
 reassign-addr-of-local + §B #8 optional/array/nested-slice pointer-carrier + §B #12 Ring.push +
 §B #13 spawn-by-value + §B #11 arena-launder. **🎯 §B ESCAPE SINKS FULLY DONE; the per-sink
-matrix (`tools/sink_matrix.sh`, a `make check` gate) is CLEAN — 32 ok / 0 holes.** **~5
-remaining** = §A #4/#5 (zercheck_ir.c Level-B guard; #1/#2/#3/#6/#7 DONE), §C #13 (VRP JOIN
-silent OOB; #14/#15/#16 DONE), §E #27/#29 (shared-lock ir_lower.c; #26/#28/#30/#31 DONE); order
-by risk (see limitations.md tracker). Any new escape fix must keep the matrix CLEAN + add a cell. **`tools/sink_matrix.sh` is now a
+matrix (`tools/sink_matrix.sh`, a `make check` gate) is CLEAN — 32 ok / 0 holes.** **~4
+remaining** = §A #5 (zercheck_ir.c Level-B immutability-gate; #1/#2/#3/#4/#6/#7 DONE), §C #13 (VRP
+JOIN silent OOB; #14/#15/#16 DONE), §E #27/#29 (shared-lock ir_lower.c; #26/#28/#30/#31 DONE);
+order by risk (see limitations.md tracker). Any new escape fix must keep the matrix CLEAN + add a cell. **`tools/sink_matrix.sh` is now a
 permanent `make check` gate** (runs after the build audits; standalone `make check-sink-matrix`)
 — every remaining escape fix must keep it CLEAN + add a cell for its own shape. The
 per-fix WORKFLOW + the loop-costing gotchas (extract-hunk-not-branch, re-anchor-by-text,

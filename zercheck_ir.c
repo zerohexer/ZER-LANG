@@ -568,6 +568,16 @@ static IRGuardSet *ir_compute_block_guards(IRFunc *func) {
  * So a wrong/absent guard can only OVER-reject, never accept an unsafe use. */
 static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
     if (!h || h->state != IR_HS_MAYBE_FREED) return false;
+    /* §A #4 SOUNDNESS (2026-07-04): once the handle has been freed on ALL paths
+     * (a complementary free-pair {(C,+),(C,-)} completed its coverage), NO
+     * subsequent use or free is admissible — every path reaches the freed
+     * handle. The single `free_block` only records ONE of the two frees, so
+     * without this gate a use/free under the complement guard is wrongly judged
+     * disjoint from the *other* free and accepted, though it coincides with the
+     * free on its own path (accept-unsafe UAF / double-free). `freed_all_paths`
+     * is set once coverage completes and propagates monotonically through the
+     * CFG merge, so a legit single-free-then-disjoint-use is preserved. */
+    if (h->freed_all_paths) return false;
     if (!zc->gr_block_guards) return false;
     int fb = h->free_block;
     int ub = zc->gr_cur_block;

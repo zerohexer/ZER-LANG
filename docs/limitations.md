@@ -22,8 +22,8 @@ escape, + §B #8 optional/array/nested-slice pointer-carrier — **SINK MATRIX C
 Ring.push + §B #13 spawn-by-value + §B #11 arena-launder [**§B FULLY DONE**], + §C #15 cross-fn
 VarRange leak + §C #16 defer bounds-guard + §C #14 find_return_range do-while/guard-body + §E #30 await resume-pred UAF + §E #28
 defer-body shared lock + §E #31 union-tag-thru-pointer + §A #6 struct-copy compound-handle
-+ §A #7 move-alias compound-key), **~5 remaining** (§A #4/#5 zercheck_ir Level-B guard, §C #13
-VRP JOIN silent-OOB, §E #27/#29 shared-lock ir_lower.c).**
++ §A #7 move-alias compound-key + §A #4 Level-B complementary-free-pair), **~4 remaining** (§A #5
+Level-B immutability-gate, §C #13 VRP JOIN silent-OOB, §E #27/#29 shared-lock ir_lower.c).**
 
 **Rules for consuming this:** (1) apply the PROPER version per bug (table below), not a
 whole branch; (2) cherry-pick/rebase onto current HEAD, then re-verify — each was green on
@@ -76,10 +76,16 @@ COMPOUND handle, gate the ident path on `!used_compound`); `582920db` #4. NOTE: 
 scattered `ir_propagate_alias_state` calls were SUPERSEDED by the unified `ir_mark_transferred`
 sink (spawn-arg A3 already caught in main — verified empirically); only the compound A1/A2 were
 holes. Tests `move_alias_{compound,field,spawn}_uaf`; 2026-07-15. make check 975/0. **(HOLE-A4
-`Tok b = *p;` move-via-deref still deferred — needs a new IR_UNOP handler.)**
+`Tok b = *p;` move-via-deref still deferred — needs a new IR_UNOP handler.)** #4 Level-B guarded-free
+relaxation admitted a UAF/double-free after a COMPLEMENTARY free-pair (`if(c){free} if(!c){free}`
+frees on ALL paths, but the single `free_block` recorded one free, so a later `if(!c){use/free}`
+was wrongly judged disjoint from the *other* free and accepted). One-line gate `if
+(h->freed_all_paths) return false;` at the top of `ir_use_guard_disjoint` (freed_all_paths set by
+`ir_free_completes_coverage`, propagates monotonically; legit single-free-then-disjoint-use
+preserved — provably transparent). `59a968cb` A1, tests `guarded_complement_{free_use,double_free}`;
+2026-07-15. make check 977/0.
 | # | Fix | Proper source (sha) | Files |
 |---|---|---|---|
-| 4 | Level-B: block 2nd free under complementary guards (stale `free_block`) | 59a968cb (A1) or f40ca06b (F2) | zercheck_ir.c |
 | 5 | Level-B: immutability gate defeated by reassigned intermediate copy | 66332d39 (#2) | zercheck_ir.c |
 
 ### B. Escape / dangling-pointer sinks (🔴; #8 base helper partial in main)

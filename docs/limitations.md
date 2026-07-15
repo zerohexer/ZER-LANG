@@ -318,6 +318,30 @@ that regresses any cell fails `make check`.
 
 ---
 
+## OPEN — type-erasure / safe `void*` (generic `*opaque` container over-rejected) (2026-07-16) (over-rejection, NOT a soundness hole)
+
+**Symptom:** a GLib-`GHashTable`-style generic container that stores `*opaque` VALUES and returns
+them (`?*opaque map_get(...)`) is rejected by zercheck — the `?*opaque` return trips the
+allocation/ghost-handle heuristic (*"result of alloc() … never used"*), and the borrowed value
+looks like an owned handle that must be freed. So the GLib `void*` pattern fights the safety layer.
+
+**Root cause:** `*opaque` owned-ness is **type-driven** ("any `*opaque` = an owned allocation"),
+whereas every OTHER ZER pointer (`*T`/`[*]T`) derives owned-ness from **provenance** (`alloc_id`).
+An erased borrow (`(*opaque)&global`) has no `alloc_id` but is still treated as owned.
+
+**Why the obvious workaround is fine for now:** `usize` value tokens (ZER's `gpointer` analog) work
+TODAY (VERIFIED), and `container(K,V)` monomorphization / a tagged union cover compile-time-known
+and closed-set cases. Only the SAFE re-type of an open-runtime erased value is missing.
+
+**The fix (planned, NOT implemented) — full design + reasoning + how-we-got-here + the C-cast
+sugar + Rust comparison + implementation plan + test matrix live in
+`docs/universal_pointer.md` PART 6 / §36.** One-line sketch: make `*opaque` owned-ness
+`alloc_id`-driven (not type-driven), so the erased pointer becomes the fifth citizen of the
+pointer family (`{ptr, type_id}` = the `[*]T` of erasure), governed by the same provenance+escape
+closure as `*T`/`[*]T`; re-type via the `type_id` trap; sugar is the C-cast `(*T)erased`
+(already works + already checked — verified). It is a RELAXATION (bug = shipped UAF/type-confusion),
+so oracle-first + the §36.13 test matrix + a new `sink_matrix.sh` `p_erased` cell.
+
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 
 Native arbitrary-width integers `uN`/`iN` shipped (BUGS-FIXED.md 2026-07-09,

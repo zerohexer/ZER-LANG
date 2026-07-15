@@ -4833,3 +4833,364 @@ convergence; PART 5 is the owner's decision.
 ---
 
 # End of PART 5
+
+---
+
+# PART 6 — Type Erasure: the Safe `void*` (erased ref `{ptr, type_id}`) — added 2026-07-16
+
+> **Read this if you are implementing "safe void\*" / a generic type-erased container.**
+> PARTS 1–5 are entirely about the OWNERSHIP + LIFETIME axes (borrow, keep, escape,
+> handle-vs-fat-pointer). This PART is a DIFFERENT, orthogonal axis: **type erasure** —
+> holding a pointer whose static type was thrown away and recovering it safely. It arose
+> from a concrete user task (a GLib-`GHashTable`-style generic map) and converged on a
+> design that is a UNIFICATION of the existing pointer family, not a new mechanism. This
+> is a PLAN (not yet implemented); the interim workarounds that WORK TODAY are in §36.12.
+
+## 36. Type Erasure — the erased ref `{ptr, type_id}` and the C-cast sugar
+
+### 36.1 How we got here (the originating problem)
+
+The user set out to build a **generic hash table like GLib's `GHashTable`**: `void*` keys/
+values plus pluggable `hash_func` / `equal_func` **function pointers**. ZER has no `void*`;
+its type-erased pointer is `*opaque`. The natural translation — store `*opaque` values,
+re-type on the way out with `@ptrcast` — was attempted and **fought the safety layer**. Working
+through *why* it fought produced the design below. The C starting point was literally:
+
+```c
+void* key = "A12";
+char* conv = (char*)key;   // erase, then re-type — unchecked in C
+```
+
+Two immediate ZER facts surfaced while translating (both VERIFIED, both cost a compile cycle —
+record them so a fresh session does not re-discover):
+
+- **A string literal needs `const [*]u8`, not `[*]u8`.** `[*]u8 key = "A12"` is rejected:
+  *"string literal is read-only … cannot initialize mutable slice from const."* Use
+  `const [*]u8 key = "A12";`.
+- **libc string funcs clash on the `u8` vs `char` prototype.** Declaring
+  `i32 snprintf(*u8, usize, const *u8, ...)` emits `int32_t snprintf(uint8_t*, …)` which is a
+  **hard GCC error** (*conflicting types for 'snprintf'*, its builtin prototype is `char*`). So
+  do string work in pure ZER; don't re-declare mismatched-sign libc string prototypes.
+
+### 36.2 The empirical evidence — what zercheck actually did with `*opaque` values
+
+A minimal `Map` storing `*opaque` values with `[*]u8` keys and funcptr hash/eq **compiled the
+structure fine**, then zercheck rejected it. The exact progression (verbatim), which IS the
+diagnosis:
+
+1. `?*opaque map_get(...)` used as a bare `if (map_get(..)) |x| { return 5; }` →
+   *"ghost handle: allocation discarded — result of alloc() … never assigned or used."*
+   **zercheck decided `map_get` is an allocator** purely because it returns `?*opaque`.
+2. Making `x` used → *"handle … allocated at line N but never freed — add defer pool.free()."*
+   **The borrowed `*opaque` is treated as an OWNED handle that must be freed.**
+
+The value stored was `@ptrcast(*opaque, &g_a)` — the address of a global, i.e. a **borrow**, not
+a `malloc`. zercheck could not tell, because it assumes **every `*opaque` is an owned
+allocation**. That single assumption is the whole problem.
+
+### 36.3 Diagnosis — `void*` conflates four jobs; ZER only breaks on ONE
+
+`*opaque` is doing four jobs that C's `void*` also conflates. ZER already handles three of them
+as well as or better than C; exactly one cell is broken:
+
+| Job of `void*` | ZER `*opaque` today | Verdict |
+|---|---|---|
+| Type **erasure** | erased, carries a `type_id` at the cinclude boundary | ✅ fine |
+| **Safe re-typing** | `@ptrcast`/`@pun` → runtime `type_id` trap OR compile-time provenance check | ✅ **better than C** (C's cast is blind) |
+| **Lifetime** | frame-escape analysis (the §B sink family) | ✅ same treatment as `*T` |
+| **Ownership** | **ASSUMED OWNED → leak/UAF-tracked as an allocation** | ❌ **the entire friction** |
+
+Everything about `void*` *except* ownership, ZER already does at least as well as C. The
+conflation "`*opaque` ⇒ owned" is the one anomaly.
+
+### 36.4 The key realization — a borrowed erased pointer is a `*T` that erased its `T`
+
+A borrowed, type-erased pointer is **just a `*T` whose `T` was dropped** (recoverable via
+`type_id`). And ZER **already** lets you store `*T` in structs/containers with escape checking
+(`container Wrapper(T){ *T ptr; }` is in the language, governed by the escape sinks). So an
+erased borrow should get the **same treatment as `*T`-in-a-struct** (escape-checked for
+dangling), **not** the owned-allocation treatment.
+
+The clincher that makes the fix *small*: **owned heap is already `Handle`/`alloc_ptr`/`Pool`/
+`Slab`'s job**, each with its own tracking. Pure-ZER code that owns heap uses those. `*opaque`'s
+ownership tracking really only earns its keep at the **cinclude/malloc boundary** (C handing you
+a `void*` from `malloc`). So letting `*opaque` be a borrow **loses nothing**: owned-C stays
+tracked (malloc-origin is provenance too — see §36.7), owned-ZER stays on `Handle`, and the
+borrow case that is currently over-rejected becomes expressible.
+
+### 36.5 The design DNA this obeys
+
+Straight from `docs/asm_lang_zer_safe.md` (read §3.6 "floor-by-subtraction" and §6.4 "same shape
+as ZER's existing closure argument"). The pattern ZER uses everywhere:
+
+> **"Safety by avoidance, not by verification."** Pick the finite primitive set; make safety
+> fall out of DERIVATION rather than a declaration; make the unsafe use structurally
+> inexpressible; NAME + fence the irreducible floor.
+
+Instances already in the language — this design is the next one:
+
+- **`[*]T = {ptr, len}`** — `len` is not overhead, it is *the information bounds-safety requires*
+  (you needed the size to allocate anyway). Zero waste.
+- **`*T`/`[*]T` ownership** is NOT a property of the type — it is DERIVED from **provenance**
+  (`alloc_id`: did it come from `alloc`?), tracked even through struct fields (the compound-handle
+  machinery, BUGS-FIXED §A #6).
+- **keep/escape** — lifetime is INFERRED, never annotated; the unsafe escape is structurally
+  rejected regardless of intent.
+- **ASM Tier A** — push ~95% of ops into GCC builtins where the effect row is DERIVED from the
+  substrate's contract; hand-verify only the irreducible leaves; taint what you can't derive.
+
+The distilled rule: *carry exactly the extra word the operation's safety requires — no more;
+derive ownership from provenance and lifetime from escape, never from the type or an annotation;
+make the unsafe use structurally inexpressible; name the residue you can't derive.*
+
+### 36.6 The chosen design — the erased ref `{ptr, type_id}` (the `[*]T` of erasure)
+
+The maximally-in-sync primitive is `{ptr, type_id}` — the same design shape as `[*]T`, carrying
+the one word ITS safety obligation needs. **`type_id` is to re-typing what `len` is to bounds:
+required information, not overhead.** ZER already has this representation (`_zer_opaque{ptr,
+type_id}` at the cinclude boundary).
+
+**Diagram 1 — the pointer family (siblings, NOT a pipeline; pick by "how many? + is the type
+known?"). CRITICAL: `len` and `type_id` NEVER coexist — different questions.**
+
+```
+   *T                    [*]T                     erased ref  ("safe void*")
+ ┌───────┐            ┌───────┬───────┐         ┌───────┬───────────┐
+ │  ptr  │            │  ptr  │  len  │         │  ptr  │  type_id  │
+ └───────┘            └───────┴───────┘         └───────┴───────────┘
+ one pointee          many pointees             one pointee
+ type KNOWN           type KNOWN                 type ERASED
+ extra word: none     extra word: len           extra word: type_id
+ safety q: —          safety q: "how long?"     safety q: "what type?"
+                      → bounds-check each index  → checked re-type (trap on wrong)
+```
+
+**Diagram 2 — two INDEPENDENT axes (the load-bearing insight).**
+
+```
+ AXIS 1 — which extra word?   (the SHAPE question — YOU choose it, at the type)
+   single + typed   →  *T        {ptr}
+   many   + typed   →  [*]T      {ptr, len}        len     = bounds safety
+   typed  erased    →  erased    {ptr, type_id}    type_id = re-type safety
+
+ AXIS 2 — owned or borrowed?  (the PROVENANCE question — DERIVED, not chosen)
+   came from  alloc()  →  OWNED    (alloc_id set → leak / UAF tracked, must free)
+   came from  &x       →  BORROW   (no alloc_id  → escape-checked only, no free)
+```
+
+Axis 1 and Axis 2 are orthogonal: any of `*T`/`[*]T`/`erased` can be owned OR borrowed, decided
+by the SAME provenance rule. **Today `*opaque` breaks this by forcing OWNED by type — that is the
+anomaly the unification removes.**
+
+**Diagram 3 — the hash-map flow.**
+
+```
+  YOU HAVE:   *Box p          (typed; type KNOWN)
+      │  (*opaque)p  /  @ptrcast(*opaque,p)   ERASE → drop T, remember type_id(Box)
+      ▼                                       OWNERSHIP decided here by p's provenance:
+  ┌───────┬────────────┐                        p = &g_box   → BORROW  (no alloc_id)
+  │  ptr  │ id = Box    │  ◄──────────────       p = alloc()  → OWNED   (has alloc_id)
+  └───────┴────────────┘
+      │  map_put(&m, key, erased)
+      ▼
+   Entry.value ───────────────────────────────►  lives in the map
+                                                       │  map_get(&m, key)
+                                                       ▼
+                                        ┌───────┬────────────┐
+                                        │  ptr  │ id = Box    │  ← returned erased ref
+                                        └───────┴────────────┘
+                                                       │  (*Box)erased   RE-TYPE
+                                                       ▼   stored id == Box ?
+                                        ┌──────────────────────────┐
+                                        │  match → *Box  (safe)    │
+                                        │  wrong → TRAP           │
+                                        └──────────────────────────┘
+```
+
+### 36.7 The unification — remove the anomaly, do NOT add a mode/type
+
+The most in-sync move is NOT a bolt-on `anyref`-with-an-ownership-mode. It is **"safety by
+avoidance": delete the type-driven-ownership heuristic and let the erased pointer fall into the
+exact provenance+escape closure that already governs `*T`/`[*]T`.**
+
+- Owned-ness becomes **`alloc_id`-driven** (as it already is for `*T`/`[*]T`), tracked through
+  struct fields via the existing compound-handle machinery. An erased ref from
+  `(*opaque)&g_a` has no `alloc_id` → BORROW → no leak check. From `alloc` → has `alloc_id` →
+  OWNED → must free. `map_get`'s return owned-ness is then derivable from the function's return
+  summary (Model 3), not short-circuited by "returns `?*opaque` ⇒ alloc."
+- The **cinclude/malloc** safety is UNCHANGED because malloc-origin *is* provenance: a `*opaque`
+  from a cinclude allocator carries alloc-provenance → still OWNED → still leak-checked. The
+  change only stops treating an address-of-erasure as owned.
+
+This is the fifth pointer citizen under ZER's existing memory-safety Closure Principle — no new
+closure, no new proof shape.
+
+### 36.8 Safety obligations — every one discharged by EXISTING machinery
+
+| Obligation | Discharged by | Same as |
+|---|---|---|
+| **re-type** (right type out) | the `type_id` trap (runtime) / provenance check (compile) | can't OOB without bounds check; can't write freeform asm in a composition |
+| **ownership** (free once, no leak) | `alloc_id` + compound-handle tracking | `[*]T` from `alloc` |
+| **lifetime** (borrow ≤ referent) | the escape analysis (§B sinks) — no annotation | `*T` stored in a struct |
+| **residual floor** | a borrow outliving its referent ACROSS an opaque storage boundary the analyzer can't see | the IDENTICAL floor `*T`-in-a-heap-struct already has; Rice-irreducible; named, not new |
+
+### 36.9 "Always correct even if intent is wrong" — to the `[*]T` standard
+
+Wrong re-type → traps/compile-errors. In-frame dangling borrow → compile error. Owned-and-
+forgotten → leak error. The ONLY spot user intent can be wrong and uncaught is the cross-boundary
+lifetime floor — which is exactly where `[*]T`-in-a-struct already sits. So the guarantee holds
+to ZER's existing standard, not a weaker one.
+
+### 36.10 The sugar — the C-style cast `(*T)erased` (VERIFIED)
+
+`@ptrcast` is the EXPLICIT alias; **the sugar already exists — it is the plain C-style cast.** ZER's
+cast design is two-tier, and the erased re-type belongs on the clean side:
+
+| | clean familiar syntax (safe/checked) | ugly `@` intrinsic (explicit/audit) |
+|---|---|---|
+| int convert | `(u32)x` | `@truncate` / `@saturate` |
+| pointer erase/re-type | `(*opaque)&x` / `(*Box)o` | `@pun` / `@bitcast` |
+
+The `@` ugliness is a FEATURE only for an **unchecked reinterpret** that can cause UB (audit-
+visibility for `@pun`/`@bitcast`). A re-type that **traps/compile-errors on mismatch cannot cause
+UB**, so it earns the clean C-cast — same reason `(u32)x` needs no `@`.
+
+**Verified this session (both):**
+- `*opaque o = (*opaque)&b;  *Box back = (*Box)o;  back.v` → compiles + runs, exit 0.
+- `*Motor m = (*Motor)o;` (o erased from a `*Box`) → **compile error:**
+  `cast type mismatch: source has provenance '*Box' but target is '*Motor'`.
+
+So the C-cast is NOT a blind reinterpret — it is checked. And it is *adaptive* (this is why the
+erased ref + the sugar reinforce each other):
+
+```
+  (*Box)erased  ─┬─ provenance KNOWN (same function)     → compile error if wrong  (0 runtime cost)
+                 └─ provenance UNKNOWN (crossed the map)  → runtime type_id trap    (inline id pays off)
+```
+
+The second row is the case that made `map_get` awkward: with the erased ref carrying `type_id`
+inline, `(*Box)raw` after a `map_get` becomes a real runtime-checked downcast, where bare
+`*opaque` had LOST the type by then. Do NOT add an `as` keyword — it fragments the cast story;
+the C-cast fits ZER's C-native syntax.
+
+### 36.11 Size/cost + Rust comparison (why the extra word is not "wasted")
+
+Yes, `{ptr, type_id}` is one word wider than a bare `void*`. It is NOT wasted:
+
+1. **Information-theoretically required** — you cannot check a type you never recorded; `type_id`
+   is the MINIMUM cost of safe erasure, exactly like `[*]T`'s `len` is the minimum for bounds.
+   C's `void*` is 1 word *because* it is unsafe.
+2. **Opt-out to 1 word exists** — the `usize` token (§36.12) is ZER's true `void*`-parity: 1 word,
+   zero checks. Pay-for-what-you-use, per container.
+3. **Amortizes to O(1)** — a HOMOGENEOUS map (all values one erased type — the 95% case) stores
+   `type_id` ONCE in the map header, not per entry → per-entry overhead 0. Only a genuinely
+   HETEROGENEOUS map pays per-entry `type_id`, and that word buys per-entry type safety `void*`
+   gives zero of. The runtime *check* can be stripped in release; the stored word stays (it is
+   data, not an assert) — same as Rust below.
+
+**Rust already ships this exact thing, at the same size:**
+
+```
+  ZER erased ref            Rust &dyn Any
+ ┌──────┬──────────┐       ┌──────┬───────────┐
+ │ ptr  │ type_id  │       │ ptr  │ *vtable   │   vtable identifies the concrete
+ └──────┴──────────┘       └──────┴───────────┘   type (+ drop/size/align)
+   2 words (16 B)            2 words (16 B)        ← SAME SIZE
+
+ (*Box)erased  /  @ptrcast   x.downcast_ref::<Box>()
+   match → *Box               match → Some(&Box)
+   wrong → TRAP               wrong → None          ← same check; we trap, Rust returns None
+```
+
+`std::any::TypeId` ≙ our `type_id`; `downcast_ref::<T>()` ≙ our checked `(*T)erased`. Difference:
+Rust **indirects through a vtable** (also carrying drop/size/align, so `Box<dyn Any>` drops
+correctly); we **inline the `type_id`** (leaner for the borrow case, no indirection to check the
+type; owned-erased frees via `alloc_id`/the alloc size, not a vtable). Both are 16 B on 64-bit,
+both do a runtime type check, both beat `void*`.
+
+**The full three-tier mapping (the clean picture):**
+
+| Need | C | Rust | ZER | size |
+|---|---|---|---|---|
+| **unsafe erasure** (no checks) | `void*` | `*mut ()` | `usize` token | 1 word |
+| **safe runtime erasure** | — (none) | `&dyn Any` `{ptr, vtable→TypeId}` | erased ref `{ptr, type_id}` | 2 words |
+| **compile-time generic** (0 cost) | macros | `<T>` monomorphization | `container(T)` | 0 extra |
+
+Rust and ZER give the identical two-tier answer; C only offers the unsafe 1-word option. You pay
+nothing Rust doesn't.
+
+### 36.12 What works TODAY (the interim — no waiting on implementation)
+
+Three options are already usable; pick by whether the type is known at compile time:
+
+1. **Compile-time-known types → `container HashMap(K,V)`** (monomorphization). Type-safe, zero
+   `*opaque`, zero cost. THE recommended path for most "generic container" needs; strictly better
+   than GLib's `void*`.
+2. **Runtime, closed set of types → a tagged union.** The discriminant IS the `type_id`, checked
+   at the `switch`. Safe heterogeneity from a known set.
+3. **Runtime, open types → the `usize` token** — ZER's `gpointer`/`guintptr` analog. **VERIFIED
+   WORKING this session**: a string-keyed map, `usize` values, funcptr djb2/`bytes_eq`, insert/
+   overwrite/lookup/absent — compiles + runs, all asserts pass. Store integers directly, or
+   `@ptrtoint(&x)` for a pointer (retrieve with `@inttoptr`, which needs an `mmio` decl or
+   `--no-strict-mmio`). Loses the `type_id` re-type check for those values (C-level for them) —
+   which is exactly what the §36 design would restore.
+
+The `usize` version proves the ONLY thing missing is the safe re-type of the erased value; the
+container plumbing (funcptr hash/eq over `[*]u8` keys) is already fine.
+
+Also-hit-this-session ZER gotchas for whoever writes the tests:
+- `orelse return N` is a **parse error** (bare `orelse return` takes no value). For a value use the
+  block form `orelse { return N; }`.
+- A **global struct designated-init** `Box g = { .v = 111 };` is rejected at global scope
+  (typed as void). Declare the global bare (auto-zeroed) and set the field in a function.
+- A `?*opaque`-returning lookup, when its capture is discarded (`if (m()) |x| { return; }`),
+  trips the ghost-handle check — see §36.2 (the very bug this PART fixes).
+
+### 36.13 The implementation plan
+
+Order (oracle-first, per the MAX-oracle standard in CLAUDE.md):
+
+1. **Write the oracle FIRST** (pure Coq/Iris, no C): a tiny lattice `{erased-owned, erased-borrow}`
+   keyed by `alloc_id`, with the `type_id` re-type obligation as an ORTHOGONAL fact. Theorems:
+   (T1) transfer soundness of borrow vs owned by provenance; (T4/crown-jewel) a genuine
+   malloc-origin erased value is FORCED to OWNED (no under-reject of the leak); merge = JOIN with
+   OWNED as the conservative default (an unclassifiable origin widens toward OWNED → can only
+   over-reject). Name the honest limit (cross-boundary lifetime = the Rice floor).
+2. **Flip the C**: change `*opaque` owned-ness from **type-driven to provenance-driven**. Find the
+   zercheck_ir sites that treat a `*opaque` value/return as an allocation BY TYPE and gate them on
+   `alloc_id` presence instead (mirror how `[*]T` owned-ness already works via compound handles).
+   The malloc/cinclude path stays owned because it carries alloc-provenance.
+3. **`type_can_carry_pointer`** must include the erased ref so the §B escape sinks catch a
+   dangling `(*opaque)&local` stored to a global (same as `*T`). It already carries pointers, so
+   this is inclusion, not new analysis.
+4. **The sugar**: make `(*T)erased` emit the **inline `type_id` runtime trap** when provenance is
+   NOT statically known (crossed a storage boundary), and keep the compile-time provenance error
+   when it IS known (§36.10). `@ptrcast`/`@pun` stay as the explicit forms.
+5. **Test matrix (the accept-unsafe discipline — this is a RELAXATION, so a bug = a shipped UAF/
+   type-confusion; go slow):**
+   - (a) a genuine `*opaque`-from-`malloc`/cinclude leak MUST still fire (no under-reject).
+   - (b) a borrow-in-a-container (`(*opaque)&global` stored in a map, returned by `map_get`) MUST
+     NOT false-flag a leak/ghost-handle (the §36.2 bug is gone).
+   - (c) a wrong re-type (`(*Motor)erased` from a `*Box`) MUST still be caught (compile OR trap).
+   - (d) a dangling `(*opaque)&local` stored to a GLOBAL MUST still be rejected by the escape
+     sinks (run `tools/sink_matrix.sh` — add a `p_erased` shape cell; keep it CLEAN).
+   - (e) the `usize` and `container` paths (§36.12) still compile (no regression).
+
+This is a bounded change concentrated in zercheck's `*opaque`-ownership sites + the cast emission,
+riding on machinery that is already hardened (compound handles §A #6, the escape sinks §B, the
+provenance/`type_id` cast path). It is NOT a rewrite; it is the removal of one anomaly so the
+erased pointer obeys the same rule as the rest of the family.
+
+### 36.14 Verified evidence (this session, against `./zerc` in Docker)
+
+- `hashmap_usize.zer` — string-keyed map, `usize` values, funcptr hash/eq, insert/overwrite/
+  lookup/absent → **COMPILE=0 RUN=0** (all asserts pass). Proves the plumbing.
+- `hashmap_demo.zer` — same with `*opaque` values → **rejected by zercheck** with the §36.2
+  errors. Proves the anomaly.
+- `cast_sugar_ok.zer` — `(*opaque)&b` then `(*Box)o` round-trip → **RUN=0**. Proves the C-cast sugar.
+- `cast_sugar_wrong.zer` — `(*Motor)o` from a `*Box` → **compile error** *"cast type mismatch:
+  source has provenance '*Box' but target is '*Motor'"*. Proves the sugar is checked.
+
+---
+
+# End of PART 6

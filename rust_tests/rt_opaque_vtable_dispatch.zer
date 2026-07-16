@@ -1,5 +1,7 @@
 // Rust pattern: trait object vtable dispatch — Box<dyn Trait>.method()
 // ZER: function pointer + *opaque context for type-erased dispatch.
+// NOTE: contexts are global — a funcptr call is worst-case `keep`, so a
+// stack-local context is rejected (see docs/limitations.md).
 
 struct Circle { u32 radius; }
 struct Square { u32 side; }
@@ -19,17 +21,18 @@ struct Shape {
     u32 (*area_fn)(*opaque);
 }
 
+Circle g_circle;
+Square g_square;
+
 u32 main() {
-    Circle c;
-    c.radius = 5;
+    g_circle.radius = 5;
     Shape s1;
-    s1.ctx = @ptrcast(*opaque, &c);
+    s1.ctx = @ptrcast(*opaque, &g_circle);
     s1.area_fn = circle_area;
 
-    Square sq;
-    sq.side = 4;
+    g_square.side = 4;
     Shape s2;
-    s2.ctx = @ptrcast(*opaque, &sq);
+    s2.ctx = @ptrcast(*opaque, &g_square);
     s2.area_fn = square_area;
 
     u32 a1 = s1.area_fn(s1.ctx);

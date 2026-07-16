@@ -5,6 +5,45 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — funcptr worst-case-keep over-rejection (a stack-local `*opaque` context to a callback) (2026-07-16) (over-rejection, NOT a soundness hole)
+
+**Symptom:** passing a pointer into stack-local memory as an argument to a
+FUNCTION-POINTER call is rejected — `fp(&local)` and, since the 2026-07-16
+escape fix, the laundered `struct{ *opaque ctx } a; a.ctx = @ptrcast(*opaque,
+&local); a.speak(a.ctx);` form too. Error: "local-derived pointer '…' cannot
+satisfy 'keep' parameter — points to stack memory".
+
+**Root cause (intentional, sound):** a funcptr call cannot see the target, so
+every POINTER parameter of a funcptr call is treated as worst-case `keep` (the
+target might retain the pointer) — `keep_edge_callee_keeps` / `keep_edge_propagates`
+in checker.c. This closes the funcptr-forwarding escape (a forwarder could pass a
+stack pointer to a retaining callback). The cost is that a READ-ONLY callback
+called with a stack-local context is rejected too.
+
+**Why it surfaced now:** the 5 `rust_tests/rt_opaque_*` vtable/callback tests used
+a stack-local `*opaque` context. They compiled ONLY because an escape hole (the
+intrinsic-launder field-store, Escape #1 in BUGS-FIXED 2026-07-16) hid the
+local-derived taint — the SAME hole that let `@ptrcast(&local)` escape to a global
+(ASan UAF). The direct `fp(&local)` equivalent was ALWAYS rejected, so the tests
+were relying on an inconsistency. Closing the hole made the laundered form
+consistent with the direct form. The tests were converted to the documented
+long-lived-context idiom (global/static context objects).
+
+**Workaround (the documented idiom):** give the type-erased context long-lived
+storage — a global, a `static`, a Pool/Slab/Arena slot, or a `shared struct`
+instance — never a bare stack local. This is the standard pattern for callback
+registration in real firmware anyway (the callback outlives the registering frame).
+
+**The relaxation that would recover it (payable, deferred):** track the CONCRETE
+funcptr target when it is statically known (`a.speak = dog_speak` is visible in the
+frame), then infer keep from `dog_speak`'s actual body (which doesn't retain ctx)
+instead of the worst-case. This is a flow-sensitive funcptr-value analysis — a
+re-architecture, not a local patch. Until then the worst-case keep is the sound
+floor. Rust accepts the stack-context trait object via lifetime analysis; ZER
+over-rejects it — a payable precision gap, not a soundness hole.
+
+---
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),

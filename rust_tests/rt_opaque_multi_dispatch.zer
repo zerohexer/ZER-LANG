@@ -1,6 +1,8 @@
 // Rust pattern: dynamic dispatch with multiple trait objects in array.
 // ZER: Op[N] array with *opaque context — each element has different provenance.
 // BUG-466: constant-indexed *opaque arrays now allow per-element provenance.
+// NOTE: contexts are global — a funcptr call is worst-case `keep`, so a
+// stack-local context is rejected (see docs/limitations.md).
 
 struct Adder { u32 base; }
 struct Multiplier { u32 factor; }
@@ -20,16 +22,17 @@ struct Op {
     u32 (*compute)(*opaque, u32);
 }
 
+Adder g_a;
+Multiplier g_m;
+
 u32 main() {
-    Adder a;
-    a.base = 10;
-    Multiplier m;
-    m.factor = 3;
+    g_a.base = 10;
+    g_m.factor = 3;
 
     Op[2] ops;
-    ops[0].ctx = @ptrcast(*opaque, &a);
+    ops[0].ctx = @ptrcast(*opaque, &g_a);
     ops[0].compute = add_compute;
-    ops[1].ctx = @ptrcast(*opaque, &m);
+    ops[1].ctx = @ptrcast(*opaque, &g_m);
     ops[1].compute = mul_compute;
 
     // Chain: 5 + 10 = 15, 15 * 3 = 45

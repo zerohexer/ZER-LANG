@@ -1510,6 +1510,26 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * diverge — the assignment path missing this field/index walk (it matched only
  * a bare `&local` NODE_IDENT operand) was a shipped return/global UAF:
  * `*T p = &local[0]; p = &local[1]; return p;` escaped undetected. */
+/* Unwrap value-side pointer-launder intrinsics (@ptrcast / @pun / @bitcast /
+ * @cast / @container) down to the underlying pointer expression, so escape
+ * taint sees THROUGH them. @container's pointer is args[0]; every other launder
+ * passes the pointer as its LAST arg. Shared by escape-taint sinks so an
+ * intrinsic-wrapped `&local` cannot slip a sink that only matched a bare
+ * NODE_UNARY (the stack-use-after-return hole where `b.p = @ptrcast(*u32,
+ * &local); g = b;` compiled clean — confirmed with ASan). Mirrors the unwrap
+ * loop already inlined at the direct store-to-global sink and the var-decl /
+ * struct-literal taint paths. */
+static Node *unwrap_ptr_launder(Node *v) {
+    while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+        if (v->intrinsic.name_len == 9 &&
+            memcmp(v->intrinsic.name, "container", 9) == 0)
+            v = v->intrinsic.args[0];
+        else
+            v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+    }
+    return v;
+}
+
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     Node *root = operand;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -4333,10 +4353,13 @@ static Type *check_expr(Checker *c, Node *node) {
                             /* &local / &local[i] / &local.f fallback — walk the
                              * field/index chain (addr_of_is_local_derived), same as
                              * the direct case, so `p = opt orelse &local[i]` is
-                             * caught (the old NODE_IDENT-only match missed it). */
-                            if (fb && fb->kind == NODE_UNARY &&
-                                fb->unary.op == TOK_AMP &&
-                                addr_of_is_local_derived(c, fb->unary.operand)) {
+                             * caught (the old NODE_IDENT-only match missed it).
+                             * unwrap_ptr_launder sees through @ptrcast(*T, &local)
+                             * and friends so an intrinsic-wrapped fallback taints too. */
+                            Node *fbu = unwrap_ptr_launder(fb);
+                            if (fbu && fbu->kind == NODE_UNARY &&
+                                fbu->unary.op == TOK_AMP &&
+                                addr_of_is_local_derived(c, fbu->unary.operand)) {
                                 tsym->is_local_derived = true;
                             }
                             if (fb && fb->kind == NODE_IDENT) {
@@ -4353,9 +4376,17 @@ static Type *check_expr(Checker *c, Node *node) {
                          * un-flagged → the dangling pointer escaped via
                          * return/global (shipped UAF). Shared with the var-decl
                          * path via the helper so they can't diverge again. */
-                        if (vcheck->kind == NODE_UNARY &&
-                            vcheck->unary.op == TOK_AMP &&
-                            addr_of_is_local_derived(c, vcheck->unary.operand)) {
+                        /* unwrap_ptr_launder: an intrinsic-wrapped `&local`
+                         * (`b.p = @ptrcast(*u32, &local)`) is NODE_INTRINSIC, not
+                         * NODE_UNARY, so the bare match below missed it and the
+                         * container root `b` escaped un-tainted via a later
+                         * `g = b` / `return b` (stack-use-after-return, ASan-
+                         * confirmed). See the var-decl / struct-literal paths
+                         * which already unwrap. */
+                        Node *vlaunder = unwrap_ptr_launder(vcheck);
+                        if (vlaunder && vlaunder->kind == NODE_UNARY &&
+                            vlaunder->unary.op == TOK_AMP &&
+                            addr_of_is_local_derived(c, vlaunder->unary.operand)) {
                             tsym->is_local_derived = true;
                         }
                     }
@@ -4555,8 +4586,15 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* escape_type_carries_ref: pointer|slice|optional-of-those. Was
                  * pointer/slice-only, so `g = b.p` where b.p is a ?*T field holding
                  * &local (type TYPE_OPTIONAL) skipped the descend-to-root walk and
-                 * laundered a stack pointer into a global undetected (F3). */
-                if (escape_type_carries_ref(vt)) {
+                 * laundered a stack pointer into a global undetected (F3).
+                 * type_can_carry_pointer additionally covers a STRUCT/UNION-by-value
+                 * that transitively contains a pointer — `g = arr[0]` where arr is a
+                 * local-derived array of pointer-carrying structs copies the whole
+                 * element (with its dangling pointer) into a global. The narrow
+                 * ref-only gate skipped that struct-copy shape (ASan-confirmed
+                 * stack-use-after-return); the root is_local_derived check below then
+                 * gates it, so a pointerless struct copy is still accepted. */
+                if (escape_type_carries_ref(vt) || type_can_carry_pointer(vt)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
@@ -11395,6 +11433,17 @@ static void check_stmt(Checker *c, Node *node) {
 
         /* Value range propagation: for (i = 0; i < N; ...) → i in [0, N-1] */
         int saved_range_count = c->var_range_count;
+        /* BUG (2026-07-16): the for-loop body was checked under any outer
+         * init-range for NON-loop variables it writes. The old comment here
+         * claimed `check_expr(step)` already invalidates — but step only
+         * re-invalidates the LOOP variable (`i`), never a different variable
+         * incremented inside the body. `u32 j = 0; for (i..) { arr[j]=..; j+=1; }`
+         * saw `j` as still [0,0] inside the body, falsely proving arr[j] safe
+         * and dropping the bounds check (silent stack OOB, ASan-confirmed).
+         * Mirror the while/do-while pre-pass: widen every var the body writes
+         * BEFORE checking it, then re-push the narrow loop-var range below so
+         * the loop counter keeps its proven [init, bound-1]. */
+        vrp_invalidate_loop_body_writes(c, node->for_stmt.body);
         if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY) {
             Node *fc = node->for_stmt.cond;
             TokenType fop = fc->binary.op;
@@ -11540,8 +11589,23 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* VRP branch-merge for switch arms (sibling of the if-handler Finding A
+         * fix, 2026-07-16): an assignment inside one arm mutates a variable's
+         * VarRange IN PLACE (vrp_invalidate_for_assign). Without a per-arm
+         * snapshot/restore/join the narrowed range leaked past the switch join,
+         * so a later `arr[idx]` was proven safe and its bounds guard elided —
+         * ASan-confirmed stack OOB write on the un-narrowed (default/other) path.
+         * Mirror NODE_IF: snapshot the pre-switch VALUES, restore before each
+         * arm so arms don't see each other's narrowing, and accumulate the UNION
+         * of every arm's outcome (seeded with the pre-switch state so the
+         * no-match fall-through path is included). Arm-local ranges (count beyond
+         * sw_saved) are dropped before each join. */
+        int sw_saved = c->var_range_count;
+        struct VarRange *sw_pre = vrp_snap_take(c, sw_saved);
+        struct VarRange *sw_acc = vrp_snap_take(c, sw_saved);
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
+            vrp_snap_restore(c, sw_pre, sw_saved); /* each arm starts from pre-switch */
 
             /* check match values — skip for enum/union dot syntax (.variant) */
             if (!arm->is_enum_dot) {
@@ -11763,7 +11827,18 @@ static void check_stmt(Checker *c, Node *node) {
             } else {
                 check_stmt(c, arm->body);
             }
+            /* drop arm-local ranges, then union this arm's outcome into the
+             * accumulator (current = current ⊔ acc; acc = union so far). */
+            c->var_range_count = sw_saved;
+            vrp_snap_join(c, sw_acc, sw_saved);
+            free(sw_acc);
+            sw_acc = vrp_snap_take(c, sw_saved);
         }
+        /* post-switch VRP state = union of all arm outcomes + fall-through. */
+        vrp_snap_restore(c, sw_acc, sw_saved);
+        c->var_range_count = sw_saved;
+        free(sw_pre);
+        free(sw_acc);
 
         /* exhaustiveness check — unwrap distinct for type dispatch */
         {

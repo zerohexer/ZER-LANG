@@ -5,6 +5,57 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-16 — Audit: 4 silent memory-safety holes (2 escape UAF + 2 VRP OOB), all ASan-confirmed (checker.c)
+
+Multi-agent audit sweep. Four independent silent soundness holes — a program the checker ACCEPTS
+that both compile-time and runtime miss (no diagnostic, no guard emitted) — each proven with
+AddressSanitizer on the emitted C. All fixes are TIGHTENINGS (reject/guard where the analysis was
+silent); the sink matrix (`tools/sink_matrix.sh`) grew from 32→41 cells and stays CLEAN.
+
+- **Escape #1 — intrinsic-wrapped `&local` into a struct field escapes un-tainted.**
+  `Box b; b.p = @ptrcast(*u32, &local); g_box = b;` compiled clean → `g_box.p` dangles after the
+  function returns (ASan: `stack-use-after-return`). The assign-sink taint that marks the container
+  root `is_local_derived` matched only a *bare* `&local` (NODE_UNARY); a `@ptrcast`/`@pun`/`@bitcast`/
+  `@cast`/`@container`-wrapped `&local` is NODE_INTRINSIC, so the taint never fired and the container
+  escaped via a later `g = b` / `return b`. The var-decl (`Box b = {.p=@ptrcast(&local)}`) and
+  struct-literal forms were already caught — asymmetry proved the gap. Fix: new `unwrap_ptr_launder`
+  helper (unwraps launder intrinsics to the underlying pointer, @container→args[0], else last arg)
+  applied at the assign taint site + its orelse-fallback. Sink-matrix shape `p11`.
+- **Escape #2 — struct-copy of a local-derived array/struct ELEMENT.**
+  `Box[2] arr; arr[0].p = &local; g = arr[0];` compiled clean (ASan: `stack-use-after-return`). The
+  store tainted the array root, but the read-side store-to-global sink gated its descend-to-root on
+  `escape_type_carries_ref(vt)` (pointer/slice/optional-of-those only) — `arr[0]` has value-type
+  `Box` (a struct-by-value that *transitively* carries a pointer), so the descend was skipped and the
+  taint never checked. Fix: widen the gate to `escape_type_carries_ref(vt) || type_can_carry_pointer(vt)`
+  so a pointer-carrying struct/union element copy descends to the root; the root `is_local_derived`
+  check still gates it (a pointerless struct copy and a scalar-field copy stay accepted). Shape `p12`.
+- **VRP #3 — switch-arm range narrowing leaked past the join.** Sibling of the 2026-07-15 Finding A
+  (which wired only NODE_IF). A range narrowed inside one switch arm (`switch(sel){ 7 => {idx = wild%4;}
+  default => {} }`) mutated the VarRange IN PLACE; the NODE_SWITCH handler had no snapshot/restore/join,
+  so [0,3] leaked to `arr[idx]` after the switch, proving it safe on the default path where idx is
+  still `wild%256` → bounds check elided → silent OOB (ASan: `stack-buffer-overflow`). Fix: mirror the
+  if-handler — snapshot pre-switch values, `vrp_snap_restore` before each arm (so arms don't see each
+  other's narrowing), accumulate the UNION of every arm outcome (seeded with the pre-switch state for
+  the no-match fall-through), restore the union as the post-switch state.
+- **VRP #4 — for-loop body range leak.** Sibling of the 2026-07-15 Finding B (which wired only
+  while/do-while). A non-loop var incremented in the for body (`u32 j=0; for(i..){ arr[j]=..; j+=1; }`)
+  was seen as its pre-loop range [0,0] inside the body — the for-handler's `check_expr(step)` only
+  re-invalidates the LOOP variable, not other body-written vars. `arr[j]` was proven safe → check
+  elided → silent OOB (ASan: `stack-buffer-overflow`). Fix: add the `vrp_invalidate_loop_body_writes`
+  pre-pass the while/do-while handler already has, before the loop-var range push.
+
+Regression tests: `tests/zer_fail/escape_intrinsic_field_store_global.zer`,
+`tests/zer_fail/escape_array_elem_struct_copy_global.zer`,
+`tests/zer_trap/vrp_switch_arm_range_leak.zer`, `tests/zer_trap/vrp_for_body_range_leak.zer`,
+plus sink-matrix cells p11/p12 + safe baselines. Side effect: the 5 `rust_tests/rt_opaque_*` vtable/
+callback tests used a stack-local `*opaque` context passed to a funcptr — accepted ONLY via the
+Escape #1 loophole (the direct `fp(&local)` equivalent was already rejected by the funcptr
+worst-case-keep rule). Converted to the documented long-lived-context idiom (global context objects);
+see docs/limitations.md "funcptr worst-case-keep over-rejection". `make check` GREEN, sink matrix
+41/0 CLEAN.
+
+---
+
 ## 2026-07-15 — VRP branch-assign + loop-body range narrowing leaked past the join → elided bounds guard (silent OOB) (checker.c) — §C COMPLETE, TRACKER COMPLETE
 
 Tracker §C #13 (source `586507fb`, Findings A+B — the LAST of the 41 audit fixes). The value-range

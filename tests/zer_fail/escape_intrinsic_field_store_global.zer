@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// @ptrcast-wrapped &local stored into a struct field, then the struct escapes
+// to a global — stack-use-after-return (ASan-confirmed). The bare &local and
+// var-decl forms were already caught; the field-STORE + intrinsic-launder form
+// slipped the taint until unwrap_ptr_launder was added at the assign sink.
+struct Box { *u32 p; }
+Box g_box;
+void c() {
+    u32 local = 0;
+    Box b;
+    b.p = @ptrcast(*u32, &local);
+    g_box = b;
+}
+u32 main() { c(); return 0; }

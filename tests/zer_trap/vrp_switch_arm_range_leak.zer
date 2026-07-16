@@ -1,0 +1,19 @@
+// Audit 2026-07-16: a range narrowed inside one switch arm leaked past the
+// join (switch handler had no vrp_snap restore/join, unlike the if handler),
+// proving arr[idx] safe on the default path where idx is still wild%256 —
+// the slice bounds check was elided → silent OOB read.
+// Fix: switch arms now snapshot/restore/join VRP like the if handler.
+// Expected: SIGTRAP "array index out of bounds" at runtime.
+u32 f(u32 sel, u32 wild) {
+    [*]u32 arr = alloc(u32, 4) orelse { return 0; };
+    u32 idx = wild % 256;
+    switch (sel) {
+        7 => { idx = wild % 4; }
+        default => { }
+    }
+    arr[idx] = 7;
+    u32 v = arr[idx];
+    free(arr);
+    return v;
+}
+u32 main() { return f(0, 100); }

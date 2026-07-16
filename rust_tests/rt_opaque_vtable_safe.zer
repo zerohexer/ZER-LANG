@@ -1,5 +1,10 @@
 // Rust pattern: trait object vtable dispatch — safe version.
 // ZER: function pointer + *opaque context with proper cleanup.
+// NOTE: the type-erased context must be long-lived (global/static). A
+// stack-local context passed to a funcptr callback is rejected — a funcptr
+// call is worst-case `keep` (the target is opaque, so it may retain the
+// pointer), exactly as the direct `fp(&local)` form is already rejected.
+// See docs/limitations.md "funcptr worst-case-keep over-rejection".
 
 struct Dog { u32 tricks; }
 struct Cat { u32 lives; }
@@ -19,17 +24,18 @@ struct Animal {
     u32 (*speak)(*opaque);
 }
 
+Dog g_dog;
+Cat g_cat;
+
 u32 main() {
-    Dog d;
-    d.tricks = 7;
+    g_dog.tricks = 7;
     Animal a1;
-    a1.ctx = @ptrcast(*opaque, &d);
+    a1.ctx = @ptrcast(*opaque, &g_dog);
     a1.speak = dog_speak;
 
-    Cat c;
-    c.lives = 9;
+    g_cat.lives = 9;
     Animal a2;
-    a2.ctx = @ptrcast(*opaque, &c);
+    a2.ctx = @ptrcast(*opaque, &g_cat);
     a2.speak = cat_speak;
 
     u32 r1 = a1.speak(a1.ctx);

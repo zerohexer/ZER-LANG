@@ -12514,7 +12514,22 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_LABEL:
-        /* labels are just markers — no type checking needed */
+        /* labels are just markers — no type checking needed. BUT a `goto` can
+         * jump to this label carrying ANY value, so a value-range narrowed on
+         * the fall-through path ABOVE the label does not hold at the label (the
+         * goto bypasses the narrowing). Single-pass VRP cannot collect the
+         * goto-source states, so widen every tracked range here — the sound
+         * over-approximation of the join over all incoming edges. Without this
+         * `idx = wild%256; goto skip; narrow: idx = wild%4; skip: arr[idx]`
+         * proved arr[idx] against the bypassed [0,3] narrowing → elided bounds
+         * check → silent stack OOB (ASan-confirmed). Also covers a backward goto
+         * loop (`label: arr[idx]; idx = wild%256; goto label;`). Labels exist
+         * only as goto targets, so the precision cost is confined to goto code. */
+        for (int vi = 0; vi < c->var_range_count; vi++) {
+            c->var_ranges[vi].min_val = INT64_MIN;
+            c->var_ranges[vi].max_val = INT64_MAX;
+            c->var_ranges[vi].known_nonzero = false;
+        }
         break;
 
     case NODE_CONTINUE:

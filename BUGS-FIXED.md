@@ -43,6 +43,15 @@ silent); the sink matrix (`tools/sink_matrix.sh`) grew from 32→41 cells and st
   re-invalidates the LOOP variable, not other body-written vars. `arr[j]` was proven safe → check
   elided → silent OOB (ASan: `stack-buffer-overflow`). Fix: add the `vrp_invalidate_loop_body_writes`
   pre-pass the while/do-while handler already has, before the loop-var range push.
+- **VRP #5 — goto/label control flow ignored by single-pass VRP.** Third sibling of the same class.
+  `idx = wild%256; goto skip; narrow: idx = wild%4; skip: arr[idx]` — the checker walks statements in
+  source order and narrows idx at `narrow:` even though the `goto skip` bypasses it at runtime, so
+  `arr[idx]` at `skip:` was proven against [0,3] while idx is actually wild%256 → check elided →
+  silent OOB (ASan: `stack-buffer-overflow`). Also affects a backward goto loop. Fix: the NODE_LABEL
+  handler now widens every tracked VRP range — a goto can enter the label carrying any value, so a
+  narrowing above the label doesn't hold at it; widening is the sound over-approximation of the join
+  over all incoming edges. Labels exist only as goto targets, so precision cost is confined to goto
+  code. Regression: `tests/zer_trap/vrp_goto_skip_narrow_leak.zer`.
 
 Regression tests: `tests/zer_fail/escape_intrinsic_field_store_global.zer`,
 `tests/zer_fail/escape_array_elem_struct_copy_global.zer`,

@@ -333,14 +333,29 @@ An erased borrow (`(*opaque)&global`) has no `alloc_id` but is still treated as 
 TODAY (VERIFIED), and `container(K,V)` monomorphization / a tagged union cover compile-time-known
 and closed-set cases. Only the SAFE re-type of an open-runtime erased value is missing.
 
-**The fix (planned, NOT implemented) — full design + reasoning + how-we-got-here + the C-cast
-sugar + Rust comparison + implementation plan + test matrix live in
-`docs/universal_pointer.md` PART 6 / §36.** One-line sketch: make `*opaque` owned-ness
-`alloc_id`-driven (not type-driven), so the erased pointer becomes the fifth citizen of the
-pointer family (`{ptr, type_id}` = the `[*]T` of erasure), governed by the same provenance+escape
-closure as `*T`/`[*]T`; re-type via the `type_id` trap; sugar is the C-cast `(*T)erased`
-(already works + already checked — verified). It is a RELAXATION (bug = shipped UAF/type-confusion),
-so oracle-first + the §36.13 test matrix + a new `sink_matrix.sh` `p_erased` cell.
+**The fix (Path A, IN PROGRESS) — full design + reasoning + how-we-got-here + the C-cast sugar +
+Rust comparison + implementation plan + test matrix live in `docs/universal_pointer.md` PART 6
+/ §36.** One-line sketch: make `*opaque` owned-ness `alloc_id`/provenance-driven (not type-driven),
+so the erased pointer becomes the fifth citizen of the pointer family (`{ptr, type_id}` = the
+`[*]T` of erasure); re-type via the `type_id` trap; sugar is the C-cast `(*T)erased` (already works
++ already checked — verified). RELAXATION (bug = shipped UAF), so oracle-first.
+
+**STATUS (2026-07-16):**
+- **Level-1 oracle DONE** — `proofs/operational/lambda_zer_escape/erased_ownership_lattice.v`
+  (0 admits, in `make check-proofs`), certifying the origin lattice + AOParam/AOBorrow split + both
+  accept-unsafe traps as witnesses.
+- **Step-2 Increment 0 SHIPPED (sound, inert)** — the `FuncSummary.ret_is_borrow` signal +
+  exhaustive `ir_expr_has_ptrish_call` walker; computed + verified, NOT consumed (zero behavior
+  change).
+- **Step-2 Increment 1 (the consumer) DEFERRED** — a naive `ret_is_borrow ⇒ leak-suppress` gate
+  (tried as both skip-registration AND `escaped=true`) is **accept-unsafe**: it breaks
+  interior-pointer UAF (`rust_tests/rt_drop_conflict_uaf`), because a param-VIEW borrow
+  (`return &s.field`) aliases the param's allocation and must stay UAF-tracked, yet is
+  indistinguishable from a content-borrow (`return m.slots[].value`) without the AOParam
+  view-vs-content signal. **Next session:** compute `ret_is_param_view` (the return is a
+  pointer INTO a param — address-of / projection / bare param pointer / subslice, traced back
+  through IR lowering) and gate the leak-suppress on `ret_is_borrow && !ret_is_param_view`. See
+  §36.17 for the full analysis. **Do NOT re-add a naive `ret_is_borrow` gate** — it ships a UAF.
 
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 

@@ -76,6 +76,16 @@ typedef struct {
     bool *maybe_frees_param;  /* conditional free (some paths) */
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
     int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
+    /* PART 6 (erased-ref ownership, 2026-07-16): the function's body makes NO
+     * pointer/opaque/handle-returning CALL, so any pointer it RETURNS is a
+     * borrow of caller/global memory, never a fresh allocation (every alloc
+     * form — pool.alloc/slab.alloc/alloc()/malloc/arena.alloc — is a
+     * pointer-ish-returning call; `&local` return is escape-rejected). The
+     * caller must then NOT register the call-result as a new owned allocation.
+     * SOUND polarity: true only when PROVEN (default false = conservative,
+     * still-track). Realises `aorigin = AOBorrow` from
+     * proofs/.../erased_ownership_lattice.v. NOT YET consulted (Increment 0). */
+    bool ret_is_borrow;
 } FuncSummary;
 
 /* ZER-CHECK context */

@@ -1224,6 +1224,82 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
  * is handled in the IR_RETURN handler above.
  * ================================================================ */
 
+/* PART 6 (erased-ref ownership): does a type unwrap to a pointer/opaque/handle
+ * (or an optional thereof)?  Used to detect whether a function's body makes an
+ * allocation-capable CALL (every alloc form returns a pointer-ish value).  Uses
+ * type_dispatch_kind (unwraps distinct, NULL-safe) so it adds no raw type-kind
+ * dispatch site (no literal kind comparison against a raw field). */
+static bool ir_type_is_ptrish(Type *t) {
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_POINTER || k == TYPE_OPAQUE || k == TYPE_HANDLE) return true;
+    if (k == TYPE_OPTIONAL) {
+        Type *e = type_unwrap_distinct(t);
+        TypeKind ik = type_dispatch_kind(e->optional.inner);
+        return ik == TYPE_POINTER || ik == TYPE_OPAQUE || ik == TYPE_HANDLE;
+    }
+    return false;
+}
+
+/* PART 6 (erased-ref ownership): does an expression TREE contain a
+ * pointer/opaque/handle-returning CALL anywhere?  This is the soundness gate
+ * for ret_is_borrow: every allocation form is such a call, and they hide in
+ * subexpressions — most importantly `alloc() orelse { ... }` (the call is
+ * NODE_ORELSE.expr, not the top node), but also call args, casts, binops.
+ * A flat `inst->expr->kind == NODE_CALL` check MISSED the orelse form and
+ * laundered a leak (found by tests/zer_fail/erased_wrapper_leak.zer).
+ * EXHAUSTIVE + CONSERVATIVE: recurse the kinds that can carry a call; leaf
+ * value kinds are false; ANY other/unhandled kind returns true (assume it may
+ * contain a call → ret_is_borrow stays false → still-tracked, sound). Written
+ * as an if/else chain (not a switch) to stay clear of the walker-default audit
+ * while keeping the conservative fall-through. */
+static bool ir_expr_has_ptrish_call(ZerCheck *zc, Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_CALL) {
+        if (ir_type_is_ptrish(checker_get_type(zc->checker, n))) return true;
+        if (ir_expr_has_ptrish_call(zc, n->call.callee)) return true;
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (ir_expr_has_ptrish_call(zc, n->call.args[i])) return true;
+        return false;
+    }
+    if (n->kind == NODE_ORELSE)
+        return ir_expr_has_ptrish_call(zc, n->orelse.expr) ||
+               ir_expr_has_ptrish_call(zc, n->orelse.fallback);
+    if (n->kind == NODE_BINARY)
+        return ir_expr_has_ptrish_call(zc, n->binary.left) ||
+               ir_expr_has_ptrish_call(zc, n->binary.right);
+    if (n->kind == NODE_UNARY)
+        return ir_expr_has_ptrish_call(zc, n->unary.operand);
+    if (n->kind == NODE_TYPECAST)
+        return ir_expr_has_ptrish_call(zc, n->typecast.expr);
+    if (n->kind == NODE_FIELD)
+        return ir_expr_has_ptrish_call(zc, n->field.object);
+    if (n->kind == NODE_INDEX)
+        return ir_expr_has_ptrish_call(zc, n->index_expr.object) ||
+               ir_expr_has_ptrish_call(zc, n->index_expr.index);
+    if (n->kind == NODE_SLICE)
+        return ir_expr_has_ptrish_call(zc, n->slice.object) ||
+               ir_expr_has_ptrish_call(zc, n->slice.start) ||
+               ir_expr_has_ptrish_call(zc, n->slice.end);
+    if (n->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (ir_expr_has_ptrish_call(zc, n->intrinsic.args[i])) return true;
+        return false;
+    }
+    if (n->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (ir_expr_has_ptrish_call(zc, n->struct_init.fields[i].value)) return true;
+        return false;
+    }
+    /* leaf value kinds that cannot contain a call */
+    if (n->kind == NODE_IDENT || n->kind == NODE_INT_LIT ||
+        n->kind == NODE_FLOAT_LIT || n->kind == NODE_STRING_LIT ||
+        n->kind == NODE_CHAR_LIT || n->kind == NODE_BOOL_LIT ||
+        n->kind == NODE_NULL_LIT || n->kind == NODE_SIZEOF)
+        return false;
+    /* CONSERVATIVE: any unhandled kind might carry a call → assume it does. */
+    return true;
+}
+
 /* Check if a call is to an extern function that returns a pointer-like
  * type (allocator heuristic). Returns true for malloc/fopen/create/etc. */
 static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
@@ -4344,6 +4420,21 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                              type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
                             h->escaped = true;
                         }
+                        /* PART 6 (erased-ref ownership) — Increment 1 (the
+                         * ret_is_borrow CONSUMER) is DEFERRED.  Two forms of
+                         * leak-suppression here (skip-registration AND
+                         * escaped=true) both broke interior-pointer UAF
+                         * detection (rust_tests/rt_drop_conflict_uaf: a
+                         * param-VIEW borrow `return &s.field` aliases the param's
+                         * allocation and must stay UAF-tracked, yet is
+                         * indistinguishable from a content-borrow like
+                         * `return m.slots[].value` at this decision point without
+                         * the AOParam view-vs-content signal from
+                         * erased_ownership_lattice.v).  The ret_is_borrow SUMMARY
+                         * (Increment 0) is computed + verified but NOT consumed
+                         * until that distinction exists.  See universal_pointer.md
+                         * §36.17.  Do NOT re-add a naive `if (ret_is_borrow)` gate
+                         * here — it is accept-unsafe for param-view borrows. */
                     }
                 }
             }
@@ -5356,6 +5447,33 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (inferred_param >= 0) returns_param_color_final = inferred_param + 1;
         }
 
+        /* PART 6 (erased-ref ownership, 2026-07-16): ret_is_borrow — the body
+         * makes NO pointer/opaque/handle-returning CALL, so any pointer this
+         * function RETURNS is a borrow of caller/global memory, never a fresh
+         * allocation.  Every allocation form (pool.alloc / slab.alloc / alloc()
+         * / malloc / arena.alloc) is a pointer-ish-returning call, and a
+         * `&local` return is escape-rejected, so a body with no such call can
+         * only return a param / global / param-content pointer = a borrow.
+         * SOUND + conservative: a body that DOES make a pointer-ish call
+         * (an allocation, OR a call whose result might be one — incl. the
+         * Trap-2 launder `w = alloc; m.f = w; return m.f`, and a wrapper
+         * `return make_widget()`) stays ret_is_borrow=false → still tracked.
+         * Realises AOBorrow (erased_ownership_lattice.v). NOT consulted yet. */
+        bool body_makes_ptr_call = false;
+        for (int bi = 0; bi < func->block_count && !body_makes_ptr_call; bi++) {
+            IRBlock *bb = &func->blocks[bi];
+            for (int ii = 0; ii < bb->inst_count; ii++) {
+                IRInst *inst = &bb->insts[ii];
+                /* EXHAUSTIVE walk of the instruction's expr tree — allocations
+                 * hide inside orelse / args / casts, not just at the top. */
+                if (inst->expr && ir_expr_has_ptrish_call(zc, inst->expr)) {
+                    body_makes_ptr_call = true;
+                    break;
+                }
+            }
+        }
+        bool ret_is_borrow_final = !body_makes_ptr_call;
+
         /* Update or create summary — same logic as zercheck.c:2320+ */
         FuncSummary *existing = NULL;
         for (int si = 0; si < zc->summary_count; si++) {
@@ -5377,6 +5495,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (existing->returns_color != returns_color_final) changed = true;
             if (existing->returns_param_color != returns_param_color_final) changed = true;
+            if (existing->ret_is_borrow != ret_is_borrow_final) changed = true;
             if (changed) {
                 free(existing->frees_param);
                 free(existing->maybe_frees_param);
@@ -5385,6 +5504,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->maybe_frees_param = maybe_frees;
                 existing->returns_color = returns_color_final;
                 existing->returns_param_color = returns_param_color_final;
+                existing->ret_is_borrow = ret_is_borrow_final;
             } else {
                 free(frees); free(maybe_frees);
             }
@@ -5408,6 +5528,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->maybe_frees_param = maybe_frees;
                 s->returns_color = returns_color_final;
                 s->returns_param_color = returns_param_color_final;
+                s->ret_is_borrow = ret_is_borrow_final;
             } else {
                 free(frees); free(maybe_frees);
             }

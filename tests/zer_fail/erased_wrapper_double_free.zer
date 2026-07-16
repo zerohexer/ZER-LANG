@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// PART 6 soundness guard (Increment 1): an ALLOCATING wrapper's result must
+// stay leak/UAF-tracked. `make()` returns a fresh slab allocation, so its body
+// contains a pointer-ish (alloc_ptr) call → ret_is_borrow(make)=FALSE → the
+// caller registers the result as an owned handle. Freeing it twice must be
+// caught as a double-free. If the erased-ref relaxation wrongly set
+// ret_is_borrow(make)=true, the result would go untracked and the double-free
+// (and any use-after-free) would be MISSED — accept-unsafe.
+struct Task { u32 id; }
+Slab(Task) heap;
+
+?*Task make() {
+    return heap.alloc_ptr();     // fresh allocation → ret_is_borrow(make)=false
+}
+
+u32 main() {
+    *Task a = make() orelse { return 1; };
+    heap.free_ptr(a);
+    heap.free_ptr(a);            // double free — must be rejected
+    return 0;
+}

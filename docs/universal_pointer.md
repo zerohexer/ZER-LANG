@@ -5293,6 +5293,52 @@ with OFresh/UNKNOWN as the default (T4 / Trap-1 conservative). Incremental + the
 + a `sink_matrix.sh` `p_erased` cell. STEP 3 — the sugar emits the inline `type_id` trap across the
 boundary. This is a real subsystem, done in careful increments, not a patch.
 
+### 36.17 Step 2 progress (2026-07-16) — Increment 0 SHIPPED (sound foundation); Increment 1 (consumer) DEFERRED pending the AOParam view/content split
+
+**Increment 0 — SHIPPED, sound, inert.** The `FuncSummary.ret_is_borrow` field (zercheck.h) +
+its computation in the summary build (zercheck_ir.c) + the EXHAUSTIVE expr walker
+`ir_expr_has_ptrish_call` + the helper `ir_type_is_ptrish`.  `ret_is_borrow = true` iff the body
+makes NO pointer/opaque/handle-returning CALL (every allocation form — pool.alloc / slab.alloc /
+alloc() / malloc / arena.alloc — is one).  Verified GREEN, NOT consumed by any decision (zero
+behavior change).  The walker is a recursive if/else chain with a CONSERVATIVE default (unknown
+kind ⇒ assume-may-contain-a-call), because a flat `inst->expr->kind == NODE_CALL` check MISSED the
+`alloc() orelse { ... }` form (the call is `NODE_ORELSE.expr`) and laundered an allocation — found
+by a negative test, the discipline working.
+
+**Increment 1 — the CONSUMER — DEFERRED (do not re-attempt naively; it is accept-unsafe).**  Two
+forms of leak-suppression on a `ret_is_borrow` call-result both broke interior-pointer UAF
+detection (`rust_tests/rt_drop_conflict_uaf`):
+- (a) SKIP registration of the result; and
+- (b) register but mark `escaped = true` (suppress only the leak).
+
+**Root cause — the AOParam vs AOBorrow split the oracle already models, missing in the C.**  A
+`ret_is_borrow` function has TWO kinds of return, indistinguishable at the leak-decision point:
+- **content-borrow** (`?*opaque map_get(*Map m){ … return m.slots[i].value; }`) — returns a pointer
+  VALUE stored in the param; it does NOT alias the param's own allocation → safe to leak-suppress.
+  This is oracle **AOBorrow**.
+- **param-VIEW borrow** (`*u32 extract(*Session s){ return &s.status; }`, also `return s`,
+  `return s[i..j]`) — returns a pointer INTO the param's allocation (an interior pointer / the param
+  pointer itself / a subslice); its result ALIASES the param and MUST stay UAF-tracked (free the
+  param → the view dangles). This is oracle **AOParam(n)**, whose `resolve` yields arg n's origin
+  (OFresh if the param is an allocation → still owned/aliased → track).
+
+`ret_is_borrow` (no-in-body-alloc) is true for BOTH; collapsing both to "leak-suppress" is sound for
+content-borrows but UNSOUND for param-views (it drops the alias that catches the UAF). The C has no
+view-vs-content signal at that point.
+
+**The correct consumer (next session).** Compute a per-function `ret_is_param_view` — the return
+produces a pointer INTO a param (address-of / projection / bare pointer param / subslice of a param),
+as opposed to a value-read of a pointer field/element.  This is the `classify_return_root` /
+`ret_param_mask` territory (checker.c), but note it must survive IR lowering: `return m.field` is
+lowered to a field-read into a temp then `return temp`, so the summary must trace the returned local
+back to its defining instruction to tell address-of from value-read.  Then leak-suppress ONLY when
+`ret_is_borrow && !ret_is_param_view` (pure AOBorrow); a param-view stays fully tracked (AOParam
+resolves to the param's origin).  Re-add `erased_map_get_ok.zer` as the positive and keep
+`rt_drop_conflict_uaf` as the standing guard, plus `tests/zer_fail/erased_wrapper_double_free.zer`
+(already shipped — an allocating wrapper's double-free, caught by baseline machinery, independent of
+this feature).  The oracle (`erased_ownership_lattice.v`) already certifies this split; the work is
+to realise `ret_is_param_view` in the C so the consumer matches AOParam vs AOBorrow.
+
 ---
 
 # End of PART 6

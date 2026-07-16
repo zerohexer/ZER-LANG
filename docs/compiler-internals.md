@@ -293,6 +293,58 @@ diff, because they cost real loops:
    command DIRECTLY, no `&`/redirect — the harness captures stdout to the task output file) OR a
    foreground redirect — never both. (Cost a wasted re-run this session.)
 
+## PART 6 — erased-ref ownership ("safe void\*") — the call-result leak axis (2026-07-16)
+
+Full design + reasoning + Rust comparison + the C-cast sugar: `docs/universal_pointer.md` PART 6
+(§36). This is the CODE-level map + the non-obvious facts a fresh session touching call-result
+ownership / leak tracking MUST know. Oracle: `proofs/operational/lambda_zer_escape/erased_ownership_lattice.v`
+(the AOBorrow-vs-AOParam origin lattice; 0 admits, in `make check-proofs`).
+
+**What it fixes.** A generic `*opaque` container (GLib-`GHashTable` style: `?*opaque map_get(*Map m,
+…)` returning a stored `*opaque` value) was falsely leak-flagged, because zercheck registers EVERY
+pointer-returning call result as a fresh OWNED allocation, keyed on the RETURN TYPE.
+
+**Where call-result ownership is decided (zercheck_ir.c IR_CALL/IR_ASSIGN handler).** TWO paths:
+1. `dest_aliased_from_param` (~4344) — if the callee summary has `returns_param_color > 0`, the
+   result ALIASES arg N (shares its alloc_id/state via `ir_apply_alias`). This is the param-alias
+   path. Runs first; sets `dest_aliased_from_param = true` so the next path is skipped.
+2. Fresh registration (~4386, gated `!dest_aliased_from_param`) — registers the result as a fresh
+   ALIVE handle (new alloc_id) for ANY pointer/opaque/handle return. This is the over-approximation.
+
+**The two FuncSummary signals (zercheck.h + computed in the summary build ~5460).**
+- `ret_is_borrow` — the body makes NO pointer/opaque/handle-returning CALL (EVERY allocation form —
+  `pool.alloc`/`slab.alloc`/`alloc()`/`malloc`/`arena.alloc` — is one). Computed via the EXHAUSTIVE
+  recursive walker `ir_expr_has_ptrish_call` (an if/else chain with a CONSERVATIVE default:
+  unknown kind ⇒ assume-may-contain-a-call). A flat `inst->expr->kind == NODE_CALL` check is
+  UNSOUND — allocations hide in `alloc() orelse {…}` (the call is `NODE_ORELSE.expr`).
+- `ret_is_content` — EVERY real return is a value-read of a field/element or null (`ir_is_content_return_expr`
+  on `ir_return_value_expr`), NOT a param-VIEW (address-of / bare pointer / subslice). Conservative
+  default false.
+- **Consumer** (in the fresh-registration path): only `ret_is_borrow && ret_is_content` marks the
+  result `escaped = true` — SUPPRESSING the false leak while keeping the handle REGISTERED
+  (double-free/UAF tracking untouched). This is oracle AOBorrow (suppress) vs AOParam (keep).
+
+**THE non-obvious fact that makes `ret_is_content` load-bearing (do NOT remove it).** The
+interior-pointer UAF `p = extract(&s); free(s); *p` (where `extract` returns `&s.field`) is NOT
+caught by any UAF check — it is rejected by a **LEAK false-positive** on `p` (a param-VIEW borrow
+that zercheck wrongly treats as an owned allocation; the alias to `s` is lost across the call
+because `returns_param_color` is only inferred when the param has a handle, which `s` doesn't). So
+a param-view and a content-borrow are indistinguishable by `ret_is_borrow` alone, and suppressing
+BOTH un-rejects the UAF. `rust_tests/rt_drop_conflict_uaf` is exactly this — it passes via the leak,
+not the UAF. Two naive gates (skip-registration; register + `escaped=true`) BOTH shipped this
+accept-unsafe hole before `ret_is_content` fixed it.
+
+**Relaxation case study (reinforces the CLAUDE.md "Sound relaxation" discipline).** This was a
+reject→accept change (a bug = a shipped UAF). The methodology that got it right: oracle FIRST
+(mirroring `param_lattice.v`), then Increment 0 (the summary signal, INERT — verified GREEN with
+zero behavior change), then Increment 1 (the consumer) — and TWO accept-unsafe holes were caught by
+negative tests, not by inspection (the orelse-hidden alloc, and the param-view UAF). Each drove the
+design to correctness. Never ship a relaxation on a green test suite alone; the negatives are the
+net. Tests: `tests/zer/erased_map_get_ok.zer` (positive), `tests/zer_fail/erased_wrapper_double_free.zer`
++ `rust_tests/rt_drop_conflict_uaf.zer` (the guards). Residual (documented, NOT a regression): a
+param-view return still over-rejects with the leak false-positive — kept deliberately (it catches
+the through-call interior-pointer UAF). universal_pointer.md §36.17 has the full ledger.
+
 ## ZER Safety Architecture — Read Before Any Safety Work
 
 **Mandatory reading before modifying ANY safety-relevant code** (checker.c

@@ -217,7 +217,11 @@ this via the Bash tool's `run_in_background`, invoke the `docker run …` DIRECT
 — do NOT also append a manual `& > "$OUT" 2>&1`.** Double-backgrounding orphans the
 docker child when the tool's shell exits → 0-byte output. Pick one: harness
 backgrounding (no `&`/redirect) OR a foreground redirect. (compiler-internals.md
-"Merge-back COMPLETE" lesson 3.)
+"Merge-back COMPLETE" lesson 3.) **Also: `test_modules/run_tests.sh` uses a
+RELATIVE `../zerc` — run it FROM `test_modules/` (`cd /build/test_modules && bash
+run_tests.sh`), NOT from `/build` (there `../zerc` = `/zerc`, missing → every test
+"zerc failed", a phantom regression). The other runners (`tests/test_zer.sh`,
+`rust_tests/`, `zig_tests/`) run fine from the repo root.**
 
 **Ad-hoc VST verify (Level-3 proofs — `zer-vst` image, non-root gotcha).** To
 check a `proofs/vst/verif_*.v` edit WITHOUT the full ~5-min `make check-vst`,
@@ -237,6 +241,24 @@ A `verif_X.v` importing only its own `zer_safety.X` is independent of the other
 ~29 predicate files (`grep "Require.*zer_safety" proofs/vst/*.v` to confirm), so
 the targeted run is authoritative for that change. Full recipe (incl. adding a new
 TypeKind/enum value to a verified predicate): docs/proof-internals.md.
+
+**Ad-hoc lattice-oracle verify (Level-1 `*_lattice.v` — `zer-proofs` image).** A
+self-contained oracle (only `From stdpp Require Import base list.`, no other project
+`.v` — like `param_lattice.v` / `erased_ownership_lattice.v`) verifies standalone
+without the full ~10-min `make check-proofs`:
+```
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-proofs bash -c '
+  eval $(opam env)
+  mkdir -p /tmp/build/lambda_zer_escape
+  cp /src/proofs/operational/lambda_zer_escape/erased_ownership_lattice.v /tmp/build/lambda_zer_escape/
+  cd /tmp/build && coqc -Q lambda_zer_escape zer_escape -w -notation-overridden lambda_zer_escape/erased_ownership_lattice.v && echo OK '
+```
+Same `-Q <dir> <ns>` mapping the full build uses ⇒ authoritative for that file.
+After it compiles, add the file to `proofs/operational/_CoqProject` (explicit list,
+not glob) so `make check-proofs` picks it up. **COQ COMMENT GOTCHA: Coq comments
+NEST**, so `(*opaque)` / `(*T)` / `(*Map` inside a `(* … *)` comment opens a NESTED
+comment → "Unterminated comment". Reword C-syntax examples in `.v` comments to drop
+the leading `(*<letter>` (write `opaque cast of &x`, `map_get(m,…)`). Cost 2 cycles.
 
 **Spawning agents (Agent/Workflow/Explore) for COMPILER work — two hazards
 (learned 2026-06-22, the hard way).** (1) Agents that compile **build NATIVELY on

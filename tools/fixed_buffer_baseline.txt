@@ -63,3 +63,10 @@ ir_lower.c:    Node *defer_bodies_inline[32];
 # stops at max, never overflowing. emit_shared_lock_if_needed +
 # emit_shared_unlock_if_needed re-derive the same set, so lock/unlock stay paired.
 ir_lower.c:        Node *roots[16]; int n = 0;
+# B1 orelse capture/replay (2026-07-16): the block-iterator and for-init capture
+# the extra shared roots locked for ONE statement so the unlock replays exactly
+# that set across the orelse rewrite (fixes the same-type two-instance orelse
+# data race). Same 16-bound as roots[16] above (find_all_shared_roots_expr caps
+# at 16); realistic max 2-3. Short-lived per-iteration scratch.
+ir_lower.c:            Node *shared_extra[16]; int shared_extra_n = 0;
+ir_lower.c:        Node *init_extra[16]; int init_extra_n = 0;

@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-16 — Audit: same-type two-instance shared read in an `orelse` statement under-locked → data race (ir_lower.c)
+
+TSan-confirmed cross-thread data race. `x = ga.maybe orelse gb.plain`, where `ga` and `gb` are two
+distinct instances of the SAME `shared struct S`, locked ONLY `ga` — `gb.plain` was read with no lock
+held. Another thread writing `gb.plain` under its auto-mutex races the unlocked read (torn/stale
+value; a cross-thread stale-pointer UAF if the raced field is pointer-like and later dereferenced).
+
+Two independent gaps let it through: (1) the same-statement deadlock check
+(`collect_shared_types_in_expr`) dedups by `struct_type.type_id`, so the same-type pair `ga`/`gb`
+collapses to one type and never trips the multi-lock guard (a DIFFERENT-type pair IS rejected). (2)
+the B1 extra-lock emitter (`emit_shared_lock_if_needed`, ir_lower.c) locked every additional distinct
+shared root in a statement (`x = ga.v + gb.v` locks both) but was gated `if (se && !find_orelse(se))`
+— skipped for orelse statements — because the unlock RE-DERIVED the root set and lowering
+destructively rewrites the NODE_ORELSE in between, so re-derivation would mismatch. Documented only as
+a code comment, not in the limitations.md ledger; the direct (non-orelse) form was already B1-locked.
+
+Fix: `emit_shared_lock_if_needed` now CAPTURES the extra locked roots into a caller array and
+`emit_shared_unlock_if_needed` REPLAYS exactly that captured set (reverse order) instead of
+re-deriving — balanced across the orelse rewrite — so the `!find_orelse` gate is removed and orelse
+statements lock every shared root too. Extras are always READ locks derived from EXPRESSION contexts
+(`find_all_shared_roots_expr` does not descend block-fallbacks), so they never coexist with a nested
+early-exit needing independent release; the primary root still flows through
+`ctx->current_stmt_shared_root` for nested exits. Same-type multi read locks compose (B1); only the
+pre-existing AB-BA liveness floor is unchanged. Verified: gb now locked/unlocked around the read
+(reverse order, balanced); TSan reports 0 races on the fixed build vs 2 when the gb lock is removed;
+different-type same-statement still rejected as a deadlock. Threaded through all 3 lock/unlock call
+sites (block iterator + for-init). Regression: `tests/zer/conc_orelse_multiroot_lock.zer`.
+make check GREEN, sink matrix 41/0 CLEAN.
+
+---
+
 ## 2026-07-16 — Audit: 4 silent memory-safety holes (2 escape UAF + 2 VRP OOB), all ASan-confirmed (checker.c)
 
 Multi-agent audit sweep. Four independent silent soundness holes — a program the checker ACCEPTS

@@ -1526,7 +1526,22 @@ static bool stmt_writes_shared_ir(Node *stmt) {
     return false;
 }
 
-static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_root) {
+/* B1 lock emission. Captures the EXTRA shared roots locked (beyond the primary)
+ * into extra_out[]/extra_n so the paired unlock can replay EXACTLY that set —
+ * re-deriving at unlock time is unsound because lowering destructively rewrites
+ * a NODE_ORELSE in between (the previous code sidestepped this by skipping
+ * extras entirely for orelse statements, leaving `x = ga.v orelse gb.v` with gb
+ * UN-LOCKED → data race / cross-thread stale-pointer UAF). Capture/replay lets
+ * orelse statements lock every root too. Extras are always READ locks derived
+ * from EXPRESSION contexts (find_all_shared_roots_expr does not descend
+ * block-fallbacks), so they never coexist with a nested early-exit that would
+ * need to release them independently — the primary root alone flows through
+ * ctx->current_stmt_shared_root for nested exits, as before. Same-type multi
+ * read locks compose (B1); only the pre-existing AB-BA liveness floor is
+ * unchanged. */
+static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_root,
+                                       Node **extra_out, int *extra_n) {
+    if (extra_n) *extra_n = 0;
     Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
     *out_root = root;
     if (!root) return;
@@ -1534,14 +1549,8 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     lock.expr = root;
     lock.src2_local = stmt_writes_shared_ir(stmt) ? 1 : 0;
     emit_inst(ctx, lock);
-    /* B1: also lock every OTHER distinct shared(rw) root in this statement
-     * (`x = ga.v + gb.v` must lock gb too). Extras are READ locks (a
-     * multi-root statement is all-reads — the multi-WRITE case is rejected by
-     * the same-statement deadlock check). Skipped for orelse statements:
-     * lowering rewrites NODE_ORELSE, so the unlock's re-derivation would
-     * mismatch — those stay single-root (a narrow documented residual). */
     Node *se = stmt_shared_expr_ir(stmt);
-    if (se && !find_orelse(se)) {
+    if (se) {
         Node *roots[16]; int n = 0;
         find_all_shared_roots_expr(ctx->checker, se, roots, &n, 16);
         for (int i = 0; i < n; i++) {
@@ -1550,26 +1559,25 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
             l2.expr = roots[i];
             l2.src2_local = 0; /* read lock for extras */
             emit_inst(ctx, l2);
+            if (extra_out && extra_n && *extra_n < 16)
+                extra_out[(*extra_n)++] = roots[i];
         }
     }
 }
 
-static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *stmt, Node *root) {
+static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
+                                         Node **extra, int extra_n) {
     if (!root) return;
-    /* B1: unlock the extras (reverse order), then the primary. Re-derive the
-     * root set — deterministic for the non-orelse statements that locked extras. */
-    Node *se = stmt_shared_expr_ir(stmt);
-    if (se && !find_orelse(se)) {
-        Node *roots[16]; int n = 0;
-        find_all_shared_roots_expr(ctx->checker, se, roots, &n, 16);
-        for (int i = n - 1; i >= 0; i--) {
-            if (roots[i] == root) continue;
-            IRInst u2 = make_inst(IR_UNLOCK, stmt->loc.line);
-            u2.expr = roots[i];
-            emit_inst(ctx, u2);
-        }
+    /* Unlock the CAPTURED extras (reverse order), then the primary. Replaying
+     * the captured set (not re-deriving) keeps lock/unlock balanced across the
+     * orelse rewrite. */
+    for (int i = extra_n - 1; i >= 0; i--) {
+        if (!extra || !extra[i]) continue;
+        IRInst u2 = make_inst(IR_UNLOCK, root->loc.line);
+        u2.expr = extra[i];
+        emit_inst(ctx, u2);
     }
-    IRInst unlock = make_inst(IR_UNLOCK, stmt->loc.line);
+    IRInst unlock = make_inst(IR_UNLOCK, root->loc.line);
     unlock.expr = root;
     emit_inst(ctx, unlock);
 }
@@ -2103,8 +2111,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->func->current_scope++;
         for (int i = 0; i < node->block.stmt_count; i++) {
             Node *shared_root;
+            Node *shared_extra[16]; int shared_extra_n = 0;
             Node *stmt = node->block.stmts[i];
-            emit_shared_lock_if_needed(ctx, stmt, &shared_root);
+            emit_shared_lock_if_needed(ctx, stmt, &shared_root, shared_extra, &shared_extra_n);
             /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
              * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
              * IR_RETURN terminates the block. Cross-thread access then
@@ -2120,7 +2129,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     ret.src1_local = lower_expr(ctx, ret_expr);
                     if (ret.src1_local < 0) ret.expr = ret_expr;
                 }
-                emit_shared_unlock_if_needed(ctx, stmt, shared_root);
+                emit_shared_unlock_if_needed(ctx, shared_root, shared_extra, shared_extra_n);
                 shared_root = NULL;
                 emit_defer_fire(ctx, stmt->loc.line);
                 emit_inst(ctx, ret);
@@ -2142,7 +2151,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
             lower_stmt(ctx, stmt);
             ctx->current_stmt_shared_root = prev_shared;
-            emit_shared_unlock_if_needed(ctx, stmt, shared_root);
+            emit_shared_unlock_if_needed(ctx, shared_root, shared_extra, shared_extra_n);
         }
         /* Fire defers pushed inside THIS block at block exit.
          *
@@ -2550,8 +2559,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * silently writes the shared field with no synchronization
          * (NODE_BLOCK's per-stmt lock wrapper doesn't fire on for-init). */
         Node *init_root = NULL;
+        Node *init_extra[16]; int init_extra_n = 0;
         if (node->for_stmt.init) {
-            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &init_root);
+            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &init_root, init_extra, &init_extra_n);
             /* Expose the active lock root so nested early-exits inside
              * the init (e.g., `for (u32 v = g.field orelse return; ...)`
              * — orelse fallback inside for-init) release the lock before
@@ -2561,7 +2571,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             lower_stmt(ctx, node->for_stmt.init);
             ctx->current_stmt_shared_root = prev_shared;
             if (init_root) {
-                emit_shared_unlock_if_needed(ctx, node->for_stmt.init, init_root);
+                emit_shared_unlock_if_needed(ctx, init_root, init_extra, init_extra_n);
             }
         }
 

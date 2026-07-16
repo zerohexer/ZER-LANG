@@ -1,0 +1,29 @@
+// Audit 2026-07-16: same-type two-instance shared read in an `orelse` statement
+// (`x = ga.maybe orelse gb.plain`, ga and gb both `shared S`) locked ONLY ga —
+// gb.plain was read with no lock held → data race (TSan-confirmed; the direct
+// `x = ga.v + gb.v` form was already B1-locked, orelse was the residual). The
+// deadlock check dedups by type_id so the same-type pair never fired it, and the
+// B1 extra-lock emitter was gated `!find_orelse`. Fix: capture the extra locked
+// roots at lock time and replay them at unlock (survives the orelse rewrite).
+// This test exercises the multi-root orelse concurrency path end to end.
+shared struct S { ?u32 maybe; u32 plain; }
+S ga;
+S gb;
+void writer() {
+    for (u32 n = 0; n < 10000; n += 1) { gb.plain = n; }
+}
+u32 reader() {
+    u32 acc = 0;
+    for (u32 n = 0; n < 10000; n += 1) {
+        u32 x = ga.maybe orelse gb.plain;
+        acc += (x & 1);
+    }
+    return acc;
+}
+u32 main() {
+    ThreadHandle th = spawn writer();
+    u32 r = reader();
+    th.join();
+    if (r > 100000) { return 1; }
+    return 0;
+}

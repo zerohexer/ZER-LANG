@@ -347,15 +347,21 @@ so the erased pointer becomes the fifth citizen of the pointer family (`{ptr, ty
 - **Step-2 Increment 0 SHIPPED (sound, inert)** — the `FuncSummary.ret_is_borrow` signal +
   exhaustive `ir_expr_has_ptrish_call` walker; computed + verified, NOT consumed (zero behavior
   change).
-- **Step-2 Increment 1 (the consumer) DEFERRED** — a naive `ret_is_borrow ⇒ leak-suppress` gate
-  (tried as both skip-registration AND `escaped=true`) is **accept-unsafe**: it breaks
-  interior-pointer UAF (`rust_tests/rt_drop_conflict_uaf`), because a param-VIEW borrow
-  (`return &s.field`) aliases the param's allocation and must stay UAF-tracked, yet is
-  indistinguishable from a content-borrow (`return m.slots[].value`) without the AOParam
-  view-vs-content signal. **Next session:** compute `ret_is_param_view` (the return is a
-  pointer INTO a param — address-of / projection / bare param pointer / subslice, traced back
-  through IR lowering) and gate the leak-suppress on `ret_is_borrow && !ret_is_param_view`. See
-  §36.17 for the full analysis. **Do NOT re-add a naive `ret_is_borrow` gate** — it ships a UAF.
+- **Step-2 Increment 1 (the consumer) SHIPPED (2026-07-16) — the content-borrow over-rejection is
+  FIXED.** Two FuncSummary signals + a leak-suppress: `ret_is_borrow` (no allocation-capable call
+  in the body) AND `ret_is_content` (every return is a value-read of a field/element or null — NOT
+  a param-VIEW). Only `ret_is_borrow && ret_is_content` marks the result `escaped=true` (suppress
+  the false leak) while keeping it REGISTERED (double-free/UAF intact). This IS the oracle's
+  AOBorrow (suppress) vs AOParam (keep). `map_get`'s `*opaque` container now compiles
+  (`erased_map_get_ok.zer`); `rt_drop_conflict_uaf` + `erased_wrapper_double_free` still reject.
+  Full `make check` GREEN. **A naive `ret_is_borrow`-only gate was accept-unsafe** (broke the
+  interior-pointer UAF); `ret_is_content` is load-bearing — see §36.17 + the zercheck_ir.c
+  consumer comment. **Residual (pre-existing, NOT a regression):** a param-VIEW return
+  (`return &s.field`) still over-rejects with a leak false-positive — deliberately kept because it
+  incidentally catches the through-call interior-pointer UAF (which zercheck does not otherwise
+  catch). Fixing that properly (infer `returns_param_color` for `&param.field` so the caller
+  aliases the result to the arg → a real UAF, then leak-suppress the view too) is a separate future
+  refinement.
 
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 

@@ -84,8 +84,15 @@ typedef struct {
      * caller must then NOT register the call-result as a new owned allocation.
      * SOUND polarity: true only when PROVEN (default false = conservative,
      * still-track). Realises `aorigin = AOBorrow` from
-     * proofs/.../erased_ownership_lattice.v. NOT YET consulted (Increment 0). */
+     * proofs/.../erased_ownership_lattice.v. */
     bool ret_is_borrow;
+    /* PART 6 Increment 1: EVERY real (non-early-exit) return is a CONTENT read —
+     * a value-read of a pointer field/element, or null — NOT a param-VIEW
+     * (address-of / bare pointer / subslice, which aliases a param's own
+     * allocation).  Only `ret_is_borrow && ret_is_content` is leak-suppressed
+     * (AOBorrow); a param-VIEW stays fully tracked (AOParam — the interior-
+     * pointer UAF class).  Default false = conservative (treat as a view). */
+    bool ret_is_content;
 } FuncSummary;
 
 /* ZER-CHECK context */

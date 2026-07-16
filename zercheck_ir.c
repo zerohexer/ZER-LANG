@@ -1300,6 +1300,41 @@ static bool ir_expr_has_ptrish_call(ZerCheck *zc, Node *n) {
     return true;
 }
 
+/* PART 6 (erased-ref ownership): is a return-VALUE expression a CONTENT read
+ * (a value-read of a pointer FIELD/ELEMENT, or null) rather than a param-VIEW
+ * (address-of `&x` / a bare pointer / a subslice — which aliases a param's own
+ * allocation)?  This is the AOBorrow (content) vs AOParam (view) split.  A
+ * content borrow may be leak-suppressed; a param-view must stay fully tracked
+ * (its result aliases the param — the interior-pointer UAF class).  CONSERVATIVE:
+ * ONLY null / field-value-read / index-value-read count as content; EVERYTHING
+ * else (address-of, bare ident, slice, call, cast, unknown) is treated as a
+ * view.  An orelse is content iff BOTH arms are.  Miss ⇒ over-reject (safe). */
+static bool ir_is_content_return_expr(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_ORELSE)
+        return ir_is_content_return_expr(e->orelse.expr) &&
+               ir_is_content_return_expr(e->orelse.fallback);
+    return e->kind == NODE_NULL_LIT ||
+           e->kind == NODE_FIELD ||
+           e->kind == NODE_INDEX;
+}
+
+/* Resolve a RETURN instruction's value expression: either carried directly on
+ * the IR_RETURN (last->expr, possibly an orelse) or, when the value is a temp
+ * local (return ident), the expr of the instruction that DEFINES that local. */
+static Node *ir_return_value_expr(IRFunc *func, IRInst *last) {
+    if (last->expr) return last->expr;
+    if (last->src1_local >= 0) {
+        for (int b = 0; b < func->block_count; b++) {
+            IRBlock *bb = &func->blocks[b];
+            for (int i = 0; i < bb->inst_count; i++)
+                if (bb->insts[i].dest_local == last->src1_local && bb->insts[i].expr)
+                    return bb->insts[i].expr;
+        }
+    }
+    return NULL;
+}
+
 /* Check if a call is to an extern function that returns a pointer-like
  * type (allocator heuristic). Returns true for malloc/fopen/create/etc. */
 static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
@@ -4420,21 +4455,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                              type_unwrap_distinct(ret_eff->optional.inner)->kind == TYPE_HANDLE))) {
                             h->escaped = true;
                         }
-                        /* PART 6 (erased-ref ownership) — Increment 1 (the
-                         * ret_is_borrow CONSUMER) is DEFERRED.  Two forms of
-                         * leak-suppression here (skip-registration AND
-                         * escaped=true) both broke interior-pointer UAF
-                         * detection (rust_tests/rt_drop_conflict_uaf: a
-                         * param-VIEW borrow `return &s.field` aliases the param's
-                         * allocation and must stay UAF-tracked, yet is
-                         * indistinguishable from a content-borrow like
-                         * `return m.slots[].value` at this decision point without
-                         * the AOParam view-vs-content signal from
-                         * erased_ownership_lattice.v).  The ret_is_borrow SUMMARY
-                         * (Increment 0) is computed + verified but NOT consumed
-                         * until that distinction exists.  See universal_pointer.md
-                         * §36.17.  Do NOT re-add a naive `if (ret_is_borrow)` gate
-                         * here — it is accept-unsafe for param-view borrows. */
+                        /* PART 6 (erased-ref ownership) — Increment 1 CONSUMER.
+                         * When the callee provably returns a CONTENT borrow
+                         * (ret_is_borrow: no allocation-capable call in its body;
+                         * AND ret_is_content: every return is a value-read of a
+                         * field/element or null — NOT a param-VIEW), the result
+                         * is NOT a fresh owned allocation to leak-check.  Mark it
+                         * escaped to SUPPRESS the false "ghost handle / never
+                         * freed" leak (the *opaque generic-container
+                         * over-rejection, `?*opaque map_get(...)`).  The handle
+                         * stays REGISTERED (double-free/UAF tracking intact).
+                         * CRITICAL: a param-VIEW borrow (`return &s.field`,
+                         * `return s`, subslice) has ret_is_content=FALSE, so it
+                         * is NOT suppressed — its result aliases the param's
+                         * allocation and MUST stay leak/UAF-tracked (the
+                         * rt_drop_conflict_uaf interior-pointer class).  This is
+                         * exactly AOBorrow (suppress) vs AOParam (keep) of
+                         * erased_ownership_lattice.v. */
+                        if (summary->ret_is_borrow && summary->ret_is_content)
+                            h->escaped = true;
                     }
                 }
             }
@@ -5474,6 +5513,29 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
         bool ret_is_borrow_final = !body_makes_ptr_call;
 
+        /* PART 6 Increment 1: ret_is_content — EVERY real return is a CONTENT
+         * read (value-read of a field/element, or null), NOT a param-VIEW.  A
+         * content borrow does not alias any param's allocation → safe to
+         * leak-suppress; a param-VIEW (`return &s.field`, `return s`, subslice)
+         * aliases the param and must stay tracked (interior-pointer UAF).
+         * Conservative: default true, but ANY non-content / unresolvable return
+         * flips it false; a function with NO real returns is not content. */
+        bool ret_is_content_final = true;
+        int real_return_count = 0;
+        for (int bi = 0; bi < func->block_count; bi++) {
+            IRBlock *bb = &func->blocks[bi];
+            if (bb->inst_count == 0) continue;
+            IRInst *last = &bb->insts[bb->inst_count - 1];
+            if (last->op != IR_RETURN) continue;
+            if (bb->is_early_exit || bb->is_orelse_fallback) continue;
+            /* void return (no value) — irrelevant to a pointer-return borrow */
+            if (last->src1_local < 0 && !last->expr) continue;
+            real_return_count++;
+            Node *ve = ir_return_value_expr(func, last);
+            if (!ir_is_content_return_expr(ve)) { ret_is_content_final = false; break; }
+        }
+        if (real_return_count == 0) ret_is_content_final = false;
+
         /* Update or create summary — same logic as zercheck.c:2320+ */
         FuncSummary *existing = NULL;
         for (int si = 0; si < zc->summary_count; si++) {
@@ -5496,6 +5558,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->returns_color != returns_color_final) changed = true;
             if (existing->returns_param_color != returns_param_color_final) changed = true;
             if (existing->ret_is_borrow != ret_is_borrow_final) changed = true;
+            if (existing->ret_is_content != ret_is_content_final) changed = true;
             if (changed) {
                 free(existing->frees_param);
                 free(existing->maybe_frees_param);
@@ -5505,6 +5568,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->returns_color = returns_color_final;
                 existing->returns_param_color = returns_param_color_final;
                 existing->ret_is_borrow = ret_is_borrow_final;
+                existing->ret_is_content = ret_is_content_final;
             } else {
                 free(frees); free(maybe_frees);
             }
@@ -5529,6 +5593,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->returns_color = returns_color_final;
                 s->returns_param_color = returns_param_color_final;
                 s->ret_is_borrow = ret_is_borrow_final;
+                s->ret_is_content = ret_is_content_final;
             } else {
                 free(frees); free(maybe_frees);
             }

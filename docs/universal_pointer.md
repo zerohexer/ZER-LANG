@@ -5305,11 +5305,28 @@ kind ⇒ assume-may-contain-a-call), because a flat `inst->expr->kind == NODE_CA
 `alloc() orelse { ... }` form (the call is `NODE_ORELSE.expr`) and laundered an allocation — found
 by a negative test, the discipline working.
 
-**Increment 1 — the CONSUMER — DEFERRED (do not re-attempt naively; it is accept-unsafe).**  Two
-forms of leak-suppression on a `ret_is_borrow` call-result both broke interior-pointer UAF
-detection (`rust_tests/rt_drop_conflict_uaf`):
-- (a) SKIP registration of the result; and
-- (b) register but mark `escaped = true` (suppress only the leak).
+**Increment 1 — the CONSUMER — SHIPPED (2026-07-16), sound, `make check` GREEN.**  The naive
+`ret_is_borrow`-only gate was accept-unsafe (below); the shipped consumer adds the AOParam split.
+Two FuncSummary signals + a leak-suppress: `ret_is_borrow` (no allocation-capable call in the body)
+AND `ret_is_content` (every real return is a value-read of a field/element or null — NOT a
+param-VIEW).  Only `ret_is_borrow && ret_is_content` marks the result `escaped = true` (suppress
+the false "ghost handle / never freed" leak) while keeping it REGISTERED (double-free/UAF tracking
+intact).  This IS the oracle's AOBorrow (suppress) vs AOParam (keep).  Result: `map_get`'s `*opaque`
+container compiles (`erased_map_get_ok.zer`, exit 0); `rt_drop_conflict_uaf` (a param-VIEW) still
+rejects; the allocating-wrapper double-free (`erased_wrapper_double_free.zer`) still rejects.
+
+**The trap that made `ret_is_content` load-bearing (do not remove it).**  A `ret_is_borrow`-only
+gate — tried as (a) SKIP registration and (b) register + `escaped = true` — BOTH broke
+`rust_tests/rt_drop_conflict_uaf`.  Diagnosis: that interior-pointer UAF (`p = extract(&s);
+free(s); *p`) is NOT caught by a UAF check — it is rejected by a LEAK false-positive on `p` (a
+param-VIEW borrow `return &s.status` that zercheck wrongly treats as an owned allocation; the alias
+to `s` is lost across the call because `returns_param_color` isn't inferred when the param has no
+handle).  So a param-view and a content-borrow (`return m.slots[].value`) are indistinguishable by
+`ret_is_borrow` alone; suppressing both un-rejects the UAF.  `ret_is_content` keeps param-views
+tracked (still over-rejected, exactly as before — the incidental-leak rejection is preserved), and
+suppresses only genuine content borrows.  Fixing the through-call interior-pointer UAF *properly*
+(infer `returns_param_color` for `&param.field` so the caller aliases `p` to `s` → a real UAF, and
+THEN the param-view could also be leak-suppressed) is a separate future refinement.
 
 **Root cause — the AOParam vs AOBorrow split the oracle already models, missing in the C.**  A
 `ret_is_borrow` function has TWO kinds of return, indistinguishable at the leak-decision point:

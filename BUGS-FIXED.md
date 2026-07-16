@@ -5,6 +5,39 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
+
+The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).
+A GLib-`GHashTable`-style generic map storing `*opaque` VALUES was rejected: `?*opaque
+map_get(*Map m, …)` returns a pointer VALUE stored in the param, but zercheck registered every
+pointer-returning call result as a fresh OWNED allocation (by return TYPE, zercheck_ir.c ~4386),
+so the borrowed result triggered a false "ghost handle / never freed" leak.
+
+Fix (oracle-driven — `proofs/operational/lambda_zer_escape/erased_ownership_lattice.v`, the
+AOBorrow-vs-AOParam split): two FuncSummary signals + a leak-suppress consumer.
+- **`ret_is_borrow`** — the body makes NO pointer/opaque/handle-returning CALL (every allocation
+  form is one). Computed via an EXHAUSTIVE recursive walker `ir_expr_has_ptrish_call` (a flat
+  `inst->expr->kind==NODE_CALL` check missed the `alloc() orelse {…}` form — the call is
+  `NODE_ORELSE.expr`; found by a negative test).
+- **`ret_is_content`** — every real return is a value-read of a field/element or null (AOBorrow),
+  NOT a param-VIEW (`return &s.field` / bare pointer / subslice = AOParam, which aliases the
+  param's allocation).
+- Consumer: only `ret_is_borrow && ret_is_content` → mark the result `escaped=true` (suppress the
+  false leak) while keeping it REGISTERED (double-free/UAF tracking intact).
+
+The `ret_is_content` split is load-bearing and was found the hard way (the discipline working): a
+naive `ret_is_borrow`-only gate — tried as skip-registration AND `escaped=true` — was
+ACCEPT-UNSAFE, un-rejecting `rust_tests/rt_drop_conflict_uaf` (an interior-pointer UAF whose `p =
+extract(&s); free(s); *p` is rejected by the leak false-positive on `p`, a param-VIEW borrow). A
+param-view stays fully tracked; only content borrows are suppressed.
+
+Verified: `erased_map_get_ok.zer` compiles+runs exit 0 (false leak gone); `rt_drop_conflict_uaf`
+still rejects (param-view kept); `erased_wrapper_double_free.zer` still rejects (allocating wrapper
+→ `ret_is_borrow=false`). Full `make check` GREEN — ZER 986/0, rust 784/0, zig 36/0, modules 28/0,
+fuzzer 200/0, all matrices, sink matrix CLEAN, no new type-dispatch sites.
+
+---
+
 ## 2026-07-15 — VRP branch-assign + loop-body range narrowing leaked past the join → elided bounds guard (silent OOB) (checker.c) — §C COMPLETE, TRACKER COMPLETE
 
 Tracker §C #13 (source `586507fb`, Findings A+B — the LAST of the 41 audit fixes). The value-range

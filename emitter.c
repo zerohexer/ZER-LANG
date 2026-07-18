@@ -125,11 +125,23 @@ static void emit_expr(Emitter *e, Node *node);
 /* B4: Emit value wrapped in optional struct: (Type){ val, 1 }.
  * Used for T → ?T wrapping at assignment, var-decl init.
  * opt_type is the target optional type (may be distinct). */
+static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type);
 static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
     emit(e, "(");
     emit_type(e, opt_type);
     emit(e, "){ ");
-    emit_expr(e, value_expr);
+    /* B: an array value into an optional-SLICE (?[*]T) must be coerced to a
+     * {ptr,len} slice literal first — a bare array flattens into .value.ptr /
+     * .value.len and defaults .has_value to 0 (a present optional built empty). */
+    Type *ot = opt_type ? type_unwrap_distinct(opt_type) : NULL;
+    Type *inner = (ot && ot->kind == TYPE_OPTIONAL && ot->optional.inner)
+                  ? type_unwrap_distinct(ot->optional.inner) : NULL;
+    Type *vt = value_expr ? checker_get_type(e->checker, value_expr) : NULL;
+    Type *vte = vt ? type_unwrap_distinct(vt) : NULL;
+    if (inner && inner->kind == TYPE_SLICE && vte && vte->kind == TYPE_ARRAY)
+        emit_array_as_slice(e, value_expr, vte, inner);
+    else
+        emit_expr(e, value_expr);
     emit(e, ", 1 }");
 }
 
@@ -157,6 +169,39 @@ static Type *struct_init_opt_wrap_type(Type *si_type, const char *fname,
     if (is_null_sentinel(ft_eff->optional.inner)) return NULL;
     if (val_type && type_dispatch_kind(val_type) == TYPE_OPTIONAL) return NULL;
     return ftype;
+}
+
+/* Look up a struct field's declared Type by name (NULL if not found / not a
+ * struct). Shared by the struct-init array→slice coercion below. */
+static Type *struct_field_type_by_name(Type *si_type, const char *fname,
+                                       uint32_t fname_len) {
+    Type *si_eff = si_type ? type_unwrap_distinct(si_type) : NULL;
+    if (!si_eff || si_eff->kind != TYPE_STRUCT) return NULL;
+    for (uint32_t j = 0; j < si_eff->struct_type.field_count; j++) {
+        if (si_eff->struct_type.fields[j].name_len == fname_len &&
+            memcmp(si_eff->struct_type.fields[j].name, fname, fname_len) == 0)
+            return si_eff->struct_type.fields[j].type;
+    }
+    return NULL;
+}
+
+/* If `field_type` is a slice (or an optional-of-slice) and `val_type` is a
+ * fixed array, return the effective SLICE type to coerce to; else NULL. The
+ * bare-array-into-slice-slot bug (B): an aggregate initializer emitted the raw
+ * array identifier, which C brace-flattens into `.ptr`/`.len` (and, for an
+ * optional-slice, swallows `has_value` → a present optional built empty). The
+ * scalar/call-arg paths coerce; the aggregate paths did not. */
+static Type *aggregate_slice_coerce_target(Type *field_type, Type *val_type) {
+    Type *ft = field_type ? type_unwrap_distinct(field_type) : NULL;
+    Type *vt = val_type ? type_unwrap_distinct(val_type) : NULL;
+    if (!vt || vt->kind != TYPE_ARRAY) return NULL;
+    if (!ft) return NULL;
+    if (ft->kind == TYPE_SLICE) return ft;
+    if (ft->kind == TYPE_OPTIONAL && ft->optional.inner) {
+        Type *inner = type_unwrap_distinct(ft->optional.inner);
+        if (inner && inner->kind == TYPE_SLICE) return inner;
+    }
+    return NULL;
 }
 
 /* Emit return-null for current function's return type.
@@ -2971,10 +3016,19 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
             emit(e, ".%.*s = ", (int)fname_len, fname);
             Node *fval = node->struct_init.fields[i].value;
-            Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len,
-                                                 checker_get_type(e->checker, fval));
-            if (wt) emit_opt_wrap_value(e, wt, fval);  /* F21 */
-            else    emit_expr(e, fval);
+            Type *fv_type = checker_get_type(e->checker, fval);
+            Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len, fv_type);
+            if (wt) emit_opt_wrap_value(e, wt, fval);  /* F21 (coerces ?slice inside) */
+            else {
+                /* B: bare array into a plain [*]T field → coerce to slice literal. */
+                Type *ftype = struct_field_type_by_name(si_type, fname, fname_len);
+                Type *slice_tgt = aggregate_slice_coerce_target(ftype, fv_type);
+                Type *vte = fv_type ? type_unwrap_distinct(fv_type) : NULL;
+                if (slice_tgt && vte && vte->kind == TYPE_ARRAY)
+                    emit_array_as_slice(e, fval, vte, slice_tgt);
+                else
+                    emit_expr(e, fval);
+            }
         }
         emit(e, " }");
         break;
@@ -3242,13 +3296,21 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* clamp: min(max(val, TYPE_MIN), TYPE_MAX) */
                 /* for unsigned targets, just clamp to max */
                 if (type_is_unsigned(t)) {
-                    /* unsigned: clamp to [0, max] — check both bounds for signed source */
+                    /* unsigned: clamp to [0, 2^N-1] — check both bounds for signed
+                     * source. Compute the max from the target WIDTH so non-native
+                     * uN (u7/u12/u21 …) clamp correctly; the old hardcoded
+                     * {8,16,32,else→64} switch sent every odd width to the u64
+                     * branch (max 2^64-1) so it never clamped (silent wrong result). */
                     int w = type_width(t);
-                    if (w == 8) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 16) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 32) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 4294967295ULL ? 4294967295U : (uint32_t)_zer_sat%d", tmp, tmp, tmp);
-                    /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
-                    else emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
+                    if (w >= 64) {
+                        /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
+                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
+                    } else {
+                        unsigned long long mx = (1ULL << w) - 1ULL;
+                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > %lluULL ? %lluULL : (", tmp, tmp, mx, mx);
+                        emit_type(e, t);   /* carrier cast (uint8_t for u7 …); clamped value fits */
+                        emit(e, ")_zer_sat%d", tmp);
+                    }
                 } else {
                     /* signed: clamp to [min, max] for target width */
                     int w = type_width(t);
@@ -6918,7 +6980,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, " = (");
                 emit_type(e, tgt_eff);
                 emit(e, "){ ");
-                emit_rewritten_node(e, node->assign.value, func);
+                /* B: array into ?[*]T must be coerced to a slice literal first. */
+                Type *aw_inner = tgt_eff->optional.inner
+                                 ? type_unwrap_distinct(tgt_eff->optional.inner) : NULL;
+                if (aw_inner && aw_inner->kind == TYPE_SLICE && val_eff->kind == TYPE_ARRAY)
+                    emit_array_as_slice(e, node->assign.value, val_eff, aw_inner);
+                else
+                    emit_rewritten_node(e, node->assign.value, func);
                 emit(e, ", 1 }");
                 return;
             }
@@ -7182,11 +7250,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                      * source type), so a bare `_zer_sat < 0` is always-false for an
                      * unsigned source (no lower clamp) and true for a signed source
                      * (BUG-546). Mirrors the AST path (emitter.c ~3040). */
+                    /* Compute the max from the target WIDTH so non-native uN
+                     * (u7/u12/u21 …) clamp to 2^N-1. The old hardcoded
+                     * {8,16,32,else→64} switch sent every odd width to the u64
+                     * branch (max 2^64-1) so it never clamped (silent wrong result). */
+                    char max_buf[32];
                     const char *max_cmp, *max_val;
-                    if (w == 8)       { max_cmp = "255";                    max_val = "255"; }
-                    else if (w == 16) { max_cmp = "65535";                  max_val = "65535"; }
-                    else if (w == 32) { max_cmp = "4294967295ULL";          max_val = "4294967295U"; }
-                    else              { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
+                    if (w >= 64) { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
+                    else {
+                        unsigned long long mx = (1ULL << w) - 1ULL;
+                        snprintf(max_buf, sizeof max_buf, "%lluULL", mx);
+                        max_cmp = max_buf; max_val = max_buf;
+                    }
                     emit(e, "_zer_sat%d < 0 ? 0 : "
                              "_zer_sat%d > %s ? (%s) : (",
                          tmp, tmp, max_cmp, max_val);
@@ -9815,7 +9890,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "(");
                 emit_type(e, dst_eff);
                 emit(e, "){ ");
-                emit_rewritten_node(e, inst->expr, func);
+                /* B: array into ?[*]T must be coerced to a slice literal first,
+                 * else the bare array flattens into .value.ptr/.len and
+                 * .has_value defaults to 0 (present optional built empty). */
+                Type *ow_inner = dst_eff->optional.inner
+                                 ? type_unwrap_distinct(dst_eff->optional.inner) : NULL;
+                if (ow_inner && ow_inner->kind == TYPE_SLICE &&
+                    src_eff && src_eff->kind == TYPE_ARRAY)
+                    emit_array_as_slice(e, inst->expr, src_eff, ow_inner);
+                else
+                    emit_rewritten_node(e, inst->expr, func);
                 emit(e, ", 1 }");
             } else if (need_slice) {
                 emit_array_as_slice(e, inst->expr, src_type, dst_type);
@@ -10202,11 +10286,30 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit_type(e, ret_eff);
                     emit(e, "){ 0, 0 };\n");
                 } else {
+                    Type *inner = type_unwrap_distinct(ret_eff->optional.inner);
                     emit(e, "return (");
                     emit_type(e, ret_eff);
                     emit(e, "){ ");
-                    emit_local_name(e, func, inst->src1_local);
-                    emit(e, ", 1 };\n");
+                    if (inner && inner->kind == TYPE_SLICE &&
+                        src_eff && src_eff->kind == TYPE_ARRAY) {
+                        /* array → ?slice: coerce the array local to a slice
+                         * compound literal FIRST. Without this, the bare array
+                         * flattens into `.value.ptr`, `1` into `.value.len`, and
+                         * `.has_value` defaults to 0 → a present optional built as
+                         * empty (silent wrong result). */
+                        emit(e, "(");
+                        emit_type(e, inner);
+                        emit(e, "){ (");
+                        if (inner->slice.is_volatile) emit(e, "volatile ");
+                        emit_type(e, src_eff->array.inner);
+                        emit(e, "*)");
+                        emit_local_name(e, func, inst->src1_local);
+                        emit(e, ", %llu }, 1 };\n",
+                             (unsigned long long)src_eff->array.size);
+                    } else {
+                        emit_local_name(e, func, inst->src1_local);
+                        emit(e, ", 1 };\n");
+                    }
                 }
             } else if (need_unwrap) {
                 emit(e, "return ");
@@ -11116,10 +11219,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "){ 0, 0 };\n");
                 }
             } else if (need_wrap) {
-                emit(e, "(");
-                emit_type(e, dst_eff);
-                emit(e, "){ %s%.*s, 1 };\n",
-                     sp, (int)src->name_len, src->name);
+                /* B: array into ?[*]T — coerce to a slice literal before the
+                 * optional wrap, else the bare array flattens into .value.ptr/.len
+                 * and .has_value defaults to 0 (present optional built empty). */
+                Type *cw_inner = (dst_eff->kind == TYPE_OPTIONAL && dst_eff->optional.inner)
+                                 ? type_unwrap_distinct(dst_eff->optional.inner) : NULL;
+                if (cw_inner && cw_inner->kind == TYPE_SLICE &&
+                    src_eff && src_eff->kind == TYPE_ARRAY) {
+                    emit(e, "(");
+                    emit_type(e, dst_eff);
+                    emit(e, "){ (");
+                    emit_type(e, cw_inner);
+                    emit(e, "){ (");
+                    if (cw_inner->slice.is_volatile) emit(e, "volatile ");
+                    emit_type(e, src_eff->array.inner);
+                    emit(e, "*)%s%.*s, %u }, 1 };\n",
+                         sp, (int)src->name_len, src->name,
+                         (unsigned)src_eff->array.size);
+                } else {
+                    emit(e, "(");
+                    emit_type(e, dst_eff);
+                    emit(e, "){ %s%.*s, 1 };\n",
+                         sp, (int)src->name_len, src->name);
+                }
             } else if (need_unwrap) {
                 emit(e, "%s%.*s.value;\n",
                      sp, (int)src->name_len, src->name);
@@ -11525,15 +11647,26 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *vt = (vloc < func->local_count) ? func->locals[vloc].type : NULL;
                     Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
                                                          fname_len, vt);
-                    if (wt) {
+                    /* B: a fixed-array value into a slice (or optional-slice)
+                     * field must be coerced to a {ptr,len} slice literal — a bare
+                     * array flattens into .ptr/.len (and swallows has_value). */
+                    Type *ftype = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                    Type *slice_tgt = aggregate_slice_coerce_target(ftype, vt);
+                    Type *vta = vt ? type_unwrap_distinct(vt) : NULL;
+                    if (wt) { emit(e, "("); emit_type(e, wt); emit(e, "){ "); }
+                    if (slice_tgt && vta && vta->kind == TYPE_ARRAY) {
                         emit(e, "(");
-                        emit_type(e, wt);
-                        emit(e, "){ ");
+                        emit_type(e, slice_tgt);
+                        emit(e, "){ (");
+                        if (slice_tgt->slice.is_volatile) emit(e, "volatile ");
+                        emit_type(e, vta->array.inner);
+                        emit(e, "*)");
                         emit_local_name(e, func, vloc);
-                        emit(e, ", 1 }");
+                        emit(e, ", %llu }", (unsigned long long)vta->array.size);
                     } else {
                         emit_local_name(e, func, vloc);
                     }
+                    if (wt) { emit(e, ", 1 }"); }
                 } else {
                     emit(e, "0"); /* fallback */
                 }

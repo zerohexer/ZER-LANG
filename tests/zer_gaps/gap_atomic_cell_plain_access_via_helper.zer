@@ -1,0 +1,15 @@
+// GAP (atomic-vs-nonatomic race, confirmed 2026-07-18): a global used with
+// @atomic_* in a concurrent context is an "atomic cell" — plain access must
+// also be atomic. The "is atomic cell?" determination is whole-program, but the
+// "flag plain access" check only fires for accesses lexically inside a
+// spawning/spawned function. Move the plain write into a helper → missed.
+// EXPECTED: compile error. OBSERVED: clean compile (TSan-confirmed race).
+// Control: the identical plain write placed directly in main() IS rejected.
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+void poke() { g_ctr = 5; }        // plain write to an atomic cell via helper
+u32 main() {
+    spawn worker();
+    poke();
+    return 0;
+}

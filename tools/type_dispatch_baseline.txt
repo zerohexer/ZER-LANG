@@ -739,3 +739,21 @@ emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
 # Documented-safe (582920db #4 baseline lines).
 zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
 zercheck_ir.c:(eff->kind == TYPE_UNION &&
+
+# 2026-07-18 (BUG-B array→slice coercion in aggregate initializers, emitter.c):
+# all reads are on already-unwrapped locals (type_unwrap_distinct results / _eff
+# locals) — the genuinely-safe idiom, not fresh checker_get_type results.
+emitter.c:Type *cw_inner = (dst_eff->kind == TYPE_OPTIONAL && dst_eff->optional.inner)
+emitter.c:Type *inner = (ot && ot->kind == TYPE_OPTIONAL && ot->optional.inner)
+emitter.c:if (!vt || vt->kind != TYPE_ARRAY) return NULL;
+emitter.c:if (aw_inner && aw_inner->kind == TYPE_SLICE && val_eff->kind == TYPE_ARRAY)
+emitter.c:if (cw_inner && cw_inner->kind == TYPE_SLICE &&
+emitter.c:if (ft->kind == TYPE_OPTIONAL && ft->optional.inner) {
+emitter.c:if (ft->kind == TYPE_SLICE) return ft;
+emitter.c:if (inner && inner->kind == TYPE_SLICE &&
+emitter.c:if (inner && inner->kind == TYPE_SLICE && vte && vte->kind == TYPE_ARRAY)
+emitter.c:if (inner && inner->kind == TYPE_SLICE) return inner;
+emitter.c:if (ow_inner && ow_inner->kind == TYPE_SLICE &&
+emitter.c:if (slice_tgt && vta && vta->kind == TYPE_ARRAY) {
+emitter.c:if (slice_tgt && vte && vte->kind == TYPE_ARRAY)
+emitter.c:src_eff && src_eff->kind == TYPE_ARRAY)

@@ -1,0 +1,22 @@
+// GAP (UAF, confirmed 2026-07-18): a heap pointer stored into a FIELD of a
+// struct global (`g.p = n`) then freed leaves `g.p` dangling, but the
+// "global left dangling at function exit" check only matches a BARE global
+// ident store (`g = n`, which IS caught). The `.field` projection sink is
+// missed — a per-sink patchwork gap (cf. the P9 by-value-field-launder fix).
+// Cross-thread amplification: storing into a `shared struct` field and reading
+// it from a spawned worker is a silent cross-thread use-after-free (reads a
+// reused slab slot). NOTE: extends the documented BUG-742 global-dangle
+// conservatism; a fix must avoid re-introducing the register-ctx-then-callback
+// false positive the maintainer deliberately avoids.
+// EXPECTED: compile error (as the bare-global form `g = n` is). OBSERVED: clean compile.
+struct Node { u32 v; }
+struct Box { ?*Node p; }
+Box g;
+u32 main() {
+    *Node n = alloc(Node) orelse return;
+    n.v = 7;
+    g.p = n;
+    free(n);
+    if (g.p) |np| { return np.v; }   // use-after-free via struct-global field
+    return 0;
+}

@@ -1,0 +1,26 @@
+// GAP (miscompile, confirmed 2026-07-18): a forward `goto` that jumps OVER a
+// defer registration still fires that defer at scope exit. ZER's documented
+// model is runtime-registration ("defer never pushed = no fire"), and a defer
+// in an untaken `if` or a block-scope defer skipped by goto correctly do NOT
+// fire — but a top-level function-scope defer crossed by a forward goto DOES.
+//
+// EXPECTED: g == 2 (only mark(2), registered at `mid:`, should fire).
+// OBSERVED: g == 231 (all three defers fire: 2, then 3, then 1).
+// Concrete harm: the acquire / `goto done` / `defer release()` idiom underflows
+// a lock counter (release fires on the error path where acquire never ran).
+// Root cause: ir_lower.c fires function-scope defers as a static set at every
+// exit/goto-target block; only defers registered AFTER the goto source are
+// runtime-skipped. Proper fix needs per-defer runtime "armed" flags (set at
+// DEFER_PUSH, checked at fire) — the same infrastructure the plt86m guard-flag
+// mechanism already uses for the fire-twice case.
+u32 g = 0;
+void mark(u32 v){ g = g*10+v; }
+void doit() {
+    goto mid;
+    defer mark(1);      // skipped by goto — must NOT fire
+    defer mark(3);      // skipped by goto — must NOT fire
+mid:
+    defer mark(2);      // registered — should fire
+    return;
+}
+u32 main() { doit(); return g; }   // expect 2, observed 231

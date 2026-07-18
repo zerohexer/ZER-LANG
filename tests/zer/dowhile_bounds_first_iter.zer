@@ -1,0 +1,23 @@
+// Regression: a do-while must NOT apply the bottom-condition range to the first
+// (unguarded) body iteration. `do { buf[i]; i+=1; } while(i<4)` with an
+// unprovable entry i was proven safe from the condition [0,3] and the bounds
+// guard was elided → first-iteration stack OOB (read AND write). The fix leaves
+// the loop var at full range for do-while so the guard is inserted.
+u32 seed() { return 10; }
+u32 sum_normal() {
+    u8[4] buf; buf[0]=1; buf[1]=2; buf[2]=3; buf[3]=4;
+    u32 i = 0; u32 s = 0;
+    do { s += buf[i]; i += 1; } while (i < 4);   // safe do-while, sum = 10
+    return s;
+}
+u32 main() {
+    // 1) normal do-while still works
+    if (sum_normal() != 10) { return 1; }
+    // 2) OOB first-iteration is guarded (no corruption) — auto-guard returns 0
+    u8[4] buf; buf[0]=9;
+    u32 i = seed();  // 10, unprovable
+    u32 s = 0;
+    do { s += buf[i]; i += 1; } while (i < 4);   // must be guarded, not OOB
+    // reached here safely (no crash/corruption)
+    return 0;
+}

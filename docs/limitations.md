@@ -318,6 +318,70 @@ that regresses any cell fails `make check`.
 
 ---
 
+## OPEN — 2026-07-18 audit: 5 confirmed gaps (1 miscompile, 4 concurrency/escape) — reproducers in `tests/zer_gaps/gap_*.zer`
+
+A fresh adversarial audit (4 parallel finders + verification) confirmed **3 silent
+miscompiles/OOB that are now FIXED** (see BUGS-FIXED.md 2026-07-18: `@saturate` odd-width
+unsigned, array→optional-slice/slice-field coercion, do-while first-iteration bounds guard)
+plus **5 gaps left open** below. Each has a self-contained reproducer in `tests/zer_gaps/`
+(they compile clean today = the gap; move to `tests/zer_fail/` when fixed). Also fixed this
+session: the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER translation that assumed
+cross-statement atomicity ZER's per-statement locking does not provide → intermittent
+lost-update failure ~12% of runs, breaking the `make check` gate; rewritten to accumulate via
+atomic compound-assign).
+
+**1. Forward `goto` fires a defer it textually skipped (🟡 miscompile).**
+`tests/zer_gaps/gap_goto_skips_defer.zer`. A forward `goto` that jumps OVER a function-scope
+defer registration still fires that defer at scope exit — contradicting ZER's documented
+runtime-registration model (a defer in an untaken `if`, or a block-scope defer skipped by
+goto, correctly do NOT fire). Concrete harm: the acquire / `goto done` / `defer release()`
+idiom underflows a lock counter (release fires on the error path where acquire never ran).
+Root cause: `ir_lower.c` fires function-scope defers as a static set at every exit/goto-target
+block; only defers registered AFTER the goto source are runtime-skipped (`defer_count_at_def`
+handles back-edges; the "goto BEFORE the defer, label AFTER" shape is unhandled). Proper fix
+needs per-defer runtime "armed" flags (set at `IR_DEFER_PUSH`, checked at fire) — the same kind
+of runtime flag the plt86m `defer_fire_guard_flag` already uses for the fire-twice case. A sound
+conservative interim would be to reject a forward goto that skips a defer registration (loud
+error instead of silent miscompile). NOT the documented back-edge/bh18_12 case.
+
+**2. Scoped-borrow exclusivity evaded by a helper laundering `&local` (🟠 race).**
+`tests/zer_gaps/gap_scoped_borrow_via_helper.zer`. A stack local borrowed by a scoped `spawn`
+is exclusive until `.join()`. The DIRECT access `local.v = 7;` between spawn and join IS
+rejected, but `poke(&local)` (passing the address to a helper) is not — the borrow check is
+intra-name and does not treat `&local` handed to another function as an access. Same-block,
+defeated purely by helper laundering (distinct from the known-open cross-block case). TSan-confirmed.
+
+**3. Atomic-cell plain-access check is not transitive through a helper (🟠 race).**
+`tests/zer_gaps/gap_atomic_cell_plain_access_via_helper.zer`. A global used with `@atomic_*` in
+a concurrent context is an "atomic cell" — plain access must also be atomic. The "is atomic
+cell?" determination is whole-program, but the "flag the plain access" check only fires for
+accesses lexically inside a spawning/spawned function; move the plain write into a helper
+(`poke(){ g_ctr = 5; }`) and it is missed. Control: the same plain write directly in `main` IS
+rejected. TSan-confirmed.
+
+**4. `threadlocal &`-escape to a SCOPED spawn establishes no borrow (🟠 race).**
+`tests/zer_gaps/gap_threadlocal_amp_escape_scoped_spawn.zer`. Passing `&tls` (a `threadlocal`
+global) to a scoped spawn registers no borrow, unlike a stack local, so main's concurrent write
+between spawn and join is unflagged — the spawned thread writes MAIN's TLS slot via the pointer.
+A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget spawn; the scoped-spawn path was
+not covered. TSan-confirmed.
+
+**5. Heap pointer stored into a struct-global FIELD dangles unflagged (🔴 UAF).**
+`tests/zer_gaps/gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` where `g` is a struct
+global leaves `g.p` dangling, but the "global left dangling at function exit" check
+(GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global ident store (`g = n`, which IS
+caught) — the `.field` projection sink is missed (a per-sink patchwork gap, cf. the P9
+by-value-field-launder fix that descended the projection to the root). Cross-thread
+amplification: storing into a `shared struct` field and reading it from a spawned worker is a
+silent cross-thread use-after-free reading a reused slab slot (observably reproduced, exit=999).
+CAUTION for the fixer: this extends the documented BUG-742 global-dangle conservatism — the
+maintainer deliberately does NOT flag MAYBE_FREED globals at exit to avoid noising the legit
+register-ctx-then-callback pattern; a field-projection fix must preserve that (flag only a
+definitely-freed target, mirror the bare-ident register/alias/exit-check machinery for the
+compound `(IR_GLOBAL_ROOT_ID, name.field)` key).
+
+---
+
 ## OPEN — type-erasure / safe `void*` (generic `*opaque` container over-rejected) (2026-07-16) (over-rejection, NOT a soundness hole)
 
 **Symptom:** a GLib-`GHashTable`-style generic container that stores `*opaque` VALUES and returns

@@ -1,0 +1,17 @@
+// Regression: @saturate to a non-native unsigned uN width (u4/u7/u12 …) must
+// clamp to 2^N-1. Before the fix the unsigned path hardcoded {8,16,32,else→64},
+// sending every odd width to the u64 branch (max 2^64-1) so it never clamped.
+u32 main() {
+    u4 a = @saturate(u4, 100);     // clamp to 15
+    u7 b = @saturate(u7, 200);     // clamp to 127
+    u12 c = @saturate(u12, 5000);  // clamp to 4095
+    u7 d = @saturate(u7, 50);      // in range → 50
+    // native widths unchanged
+    u8 e = @saturate(u8, 300);     // 255
+    if ((u32)a != 15) { return 1; }
+    if ((u32)b != 127) { return 2; }
+    if ((u32)c != 4095) { return 3; }
+    if ((u32)d != 50) { return 4; }
+    if ((u32)e != 255) { return 5; }
+    return 0;
+}

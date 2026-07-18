@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-18 — audit: 3 silent miscompiles/OOB fixed + flaky-test fix (emitter.c, checker.c, rust_tests)
+
+Adversarial audit (4 parallel finders). Three silent bugs fixed (clean compile, wrong at runtime
+on hosted, no crash on bare-metal); five further gaps documented in `docs/limitations.md`
+("2026-07-18 audit") with reproducers in `tests/zer_gaps/gap_*.zer`.
+
+**BUG-A — `@saturate(uN, v)` for a non-native UNSIGNED width never clamped (silent wrong result).**
+`@saturate(u7, 200)` returned 200, not 127. The unsigned emit path (both `emitter.c` paths, AST
+~3244 + IR ~7176) hardcoded the max on a `{8,16,32,else→64}` switch, so every odd width fell to
+the u64 branch (max 2^64-1) → no value ever clamped, and the result cast to the carrier with no
+N-bit mask. The SIGNED path already computed min/max from the width, so it was correct. Fix:
+compute the unsigned max as `(1ULL<<w)-1` for `w<64` (keep the `.0` double form for `w>=64`), cast
+to the carrier via `emit_type` — the clamped value fits in N bits. Native widths unchanged.
+Test: `tests/zer/saturate_unsigned_odd_width.zer`.
+
+**BUG-B — a fixed array placed into an optional-slice / slice struct field within an aggregate was
+not coerced to a `{ptr,len}` slice (silent wrong result / false trap).** `?[*]u8 s = a;`,
+`return a;` (from a `?[*]u8` fn), `W w = { .maybe = a };`, `Buf b = { .data = a };`, and the
+assignment form all emitted the bare array identifier. C brace-flattening then dropped the array
+into `.value.ptr` / `.len`; for an optional-slice it additionally swallowed the `has_value` literal
+into `.value.len`, leaving `has_value = 0` (a PRESENT optional silently built empty); for a plain
+slice field it left `.len = 0` (a false out-of-bounds trap). The scalar/var-decl/call-arg paths
+coerced; the AGGREGATE-construction paths (optional-wrap, return-into-optional, struct-init field —
+across the AST + IR + IR_STRUCT_INIT_DECOMP emitters, and the IR var-decl/assign wrap) did not.
+Fix (multi-site, the per-emitter-path shape): shared `struct_field_type_by_name` +
+`aggregate_slice_coerce_target` helpers; `emit_opt_wrap_value` coerces its `?slice` inner; all six
+aggregate sites (AST struct-init 2977, IR fallback N/A, DECOMP field, IR_RETURN opt-wrap, IR
+copy/var-decl wrap, IR NODE_ASSIGN opt-wrap) coerce array→slice before the wrap. Test:
+`tests/zer/optional_slice_from_array.zer`.
+
+**BUG-D — a `do-while` applied its bottom-condition range to the first (unguarded) body iteration
+→ silent stack OOB (read AND write).** `u32 i = seed(); do { s += buf[i]; i += 1; } while (i < 4);`
+with an unprovable entry `i` (=10) elided the bounds guard, because `checker.c`'s
+`NODE_WHILE`/`NODE_DO_WHILE` block narrowed the loop var to `[0,N-1]` from the condition for BOTH
+loop kinds. That is sound for `while` (condition checked before the body) but not for `do-while`
+(body runs first, so the loop var is unconstrained on the first pass). ASan-confirmed stack-buffer
+-overflow; the write variant is silent memory corruption. Fix: gate the condition-derived narrowing
+to `node->kind != NODE_DO_WHILE`; `vrp_invalidate_loop_body_writes` already widened the body-written
+vars, so for do-while the loop var stays full-range and the emitter inserts the runtime guard.
+Test: `tests/zer/dowhile_bounds_first_iter.zer`. (Distinct from §C #14, which was do-while
+`find_return_range`.)
+
+**Flaky-test fix — `rust_tests/rc_cond_004`** broke the `make check` gate intermittently (~12% of
+runs). It was a faithful-to-Rust but wrong-for-ZER translation: the Rust original holds ONE
+MutexGuard across the whole `enqueue`, but ZER locks PER-STATEMENT, so the `items[tail]=val` (reads
+`tail`) and `tail=(tail+1)%8` (updates it) statements interleave between producers → a lost update
+→ `sum != 60`. Rewritten to accumulate a shared `sum`/`count` via atomic compound-assign (each `+=`
+is one locked statement); 30/30 deterministic.
+
+Full `make check` green after each fix; the BUG-B fix added 14 new already-unwrapped `_eff` type
+reads to `tools/type_dispatch_baseline.txt` (justified — the safe unwrap-then-read idiom).
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

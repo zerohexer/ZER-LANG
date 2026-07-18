@@ -11463,7 +11463,16 @@ static void check_stmt(Checker *c, Node *node) {
         int saved_range_count = c->var_range_count;
         vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
 
-        if (node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY) {
+        /* The condition-derived range narrowing below is only sound for a
+         * `while` loop, where the condition is evaluated BEFORE the body — so
+         * `i < N` genuinely holds at body entry. A `do-while` evaluates the
+         * condition AFTER the body, so on the FIRST iteration the loop var is
+         * unconstrained (whatever it was on entry). Applying `[0,N-1]` there
+         * elided the bounds guard on a first-pass OOB access (silent stack
+         * overflow, read AND write). For do-while we leave the loop var at the
+         * widened full range so the emitter inserts the runtime guard. */
+        if (node->kind != NODE_DO_WHILE &&
+            node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY) {
             Node *wc = node->while_stmt.cond;
             TokenType wop = wc->binary.op;
             if (wc->binary.left->kind == NODE_IDENT) {

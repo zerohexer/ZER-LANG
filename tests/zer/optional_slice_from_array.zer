@@ -1,0 +1,31 @@
+// Regression: a fixed array placed into an optional-slice (?[*]T) or slice
+// struct field within an aggregate must be coerced to a {ptr,len} slice literal.
+// Before the fix the bare array flattened into .value.ptr/.len and .has_value
+// defaulted to 0 (a present optional silently built empty) or .len=0 (false trap).
+struct Buf { [*]u8 data; u32 n; }
+struct W { ?[*]u8 maybe; }
+?[*]u8 get(u8[4] a, bool ok) {
+    if (ok) { return a; }
+    return null;
+}
+u32 main() {
+    u8[4] a;
+    a[0]=1; a[1]=2; a[2]=3; a[3]=4;
+    // return-into-optional-slice
+    ?[*]u8 r = get(a, true);
+    if (r) |v| { if (v[1] != 2) { return 1; } } else { return 11; }
+    // designated plain slice field
+    Buf b = { .data = a, .n = 3 };
+    if (b.data[2] != 3) { return 2; }
+    // designated optional-slice field
+    W w = { .maybe = a };
+    if (w.maybe) |v| { if (v[3] != 4) { return 3; } } else { return 13; }
+    // var-decl ?slice = array
+    ?[*]u8 s = a;
+    if (s) |v| { if (v[0] != 1) { return 4; } } else { return 14; }
+    // assignment ?slice = array
+    ?[*]u8 s2;
+    s2 = a;
+    if (s2) |v| { if (v[1] != 2) { return 5; } } else { return 15; }
+    return 0;
+}

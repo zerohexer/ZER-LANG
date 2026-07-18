@@ -1,0 +1,19 @@
+// GAP (data race, confirmed 2026-07-18): a stack local borrowed by a scoped
+// `spawn` is exclusive until .join(). The DIRECT access `local.v = 7;` between
+// spawn and join IS rejected ("borrowed by a scoped spawn"), but passing
+// `&local` to a HELPER (poke) is NOT — the helper's write races the worker.
+// The borrow check is intra-name: it does not treat `&local` handed to another
+// function as an access to the borrowed variable. (Distinct from the known-open
+// cross-block case — this is same-block, defeated purely by helper laundering.)
+// EXPECTED: compile error. OBSERVED: clean compile (TSan-confirmed race).
+struct Data { u32 v; }
+void work(*Data d) { d.v = 1; }
+void poke(*Data d) { d.v = 7; }
+u32 main() {
+    Data local;
+    local.v = 0;
+    ThreadHandle th = spawn work(&local);
+    poke(&local);          // races work() — NOT flagged (direct `local.v=7` IS)
+    th.join();
+    return local.v;
+}

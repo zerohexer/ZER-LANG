@@ -1,0 +1,16 @@
+// GAP (data race on a TLS slot, confirmed 2026-07-18): passing `&tls` (a
+// `threadlocal` global) to a scoped spawn registers NO borrow, unlike a stack
+// local. So main's concurrent write between spawn and join is not flagged; the
+// spawned thread writes MAIN's TLS slot (via the pointer) while main writes it.
+// EXPECTED: compile error (as with a stack local). OBSERVED: clean compile
+// (TSan-confirmed race). A5 (BUG-757) fixed threadlocal &-escape for
+// fire-and-forget spawn; the SCOPED-spawn path was not covered.
+threadlocal u32 tls;
+void worker(*u32 p) { *p = 1; }
+u32 main() {
+    tls = 0;
+    ThreadHandle th = spawn worker(&tls);
+    tls = 99;              // races worker's *p=1 — NOT flagged
+    th.join();
+    return tls;
+}

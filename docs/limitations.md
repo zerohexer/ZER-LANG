@@ -502,6 +502,24 @@ paths); #19 `volatile` scalar/aggregate locals now emit the qualifier (new `IRLo
 set in ir_lower, emitted in emit_regular_func_from_ir). 4 positive tests in `tests/zer/` compile +
 run exit 0. **⏳ #14/#15/#16 STILL OPEN** (the `?[*]T`/array→slice aggregate coercion class — fxvnsu
 BUG-B superset + c4c09l #3/#6).
+  **Investigation 2026-07-19 (attempt reverted — do NOT half-apply):** this is a **7-site emitter
+  patchwork** — `emit_opt_wrap_value` coercion + two helpers (`struct_field_type_by_name`,
+  `aggregate_slice_coerce_target`) + AST struct-init + IR struct-init (both wrap/non-wrap branches) +
+  IR var-decl `need_wrap` + IR **assign** `need_wrap` + IR **return** `need_wrap` (the `emit_local_name`
+  path — structurally different, harder) + **call-arg**. 5 of these were applied audit-clean (via
+  `type_dispatch_kind`, no baseline coupling — fxvnsu's version instead baselined 14 raw `->kind` reads)
+  and BUILD-GREEN, but the 3 tests still failed: `optional_slice_coerce` (run≠0 — assign/call-arg site)
+  and `optional_slice_return_global` (run≠0 — the return `need_wrap` site) need the remaining sites.
+  **CHECKER INTERACTION (the real blocker):** the fxvnsu `optional_slice_from_array` test does
+  `?[*]u8 get(u8[4] a){ return a; }` (a is a PARAM array) — my just-landed **#8** fix (return an
+  array as `?[*]T` now hits the escape check, consistent with the pre-existing NON-optional check)
+  **rejects it**, where before #8 the optional wrapper hid it. Before finishing #14-16, DECIDE: is
+  `return param_array` as a slice safe? If ZER array params decay to a caller-memory pointer (like a
+  slice/pointer param — BUG-764 allows returning views of those), then #8 should be RELAXED for param
+  arrays and the test compiles; if array params are by-value copies, #8 correctly rejects and the test
+  must source from a global. Resolve that first, then apply the remaining 3 emitter sites + bring the 3
+  tests (`optional_slice_{from_array,coerce,return_global}.zer`). Silent-miscompile severity (wrong
+  `.len`), NOT memory-safety — lowest priority of the 22.
 - **#13 — `@saturate(uN, v)` for a non-native UNSIGNED width never clamps** (`fxvnsu` `9fea9990` BUG-A).
   `@saturate(u7, 200)` returns 200 not 127. The unsigned emit path (BOTH emitter paths) hardcoded the max
   on a `{8,16,32,else→u64}` switch → every odd width fell to the u64 branch (never clamps), result cast to

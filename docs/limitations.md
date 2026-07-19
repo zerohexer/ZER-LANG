@@ -5,6 +5,61 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — whole `shared struct` copied BY VALUE (var-decl / assignment / return) emits NO lock (2026-07-19) (data race + copied-mutex UB; MEDIUM; needs a design decision)
+
+**Symptom.** A shared struct is banned from being passed BY VALUE to a function (checker.c ~6173:
+*"cannot pass shared struct 'A' by value — embedded mutex would be copied, breaking auto-lock
+semantics"*), but the equivalent **whole-struct value copy** in a var-decl, an assignment RHS, or a
+return is silently accepted with NO lock on the source:
+```zer
+shared struct A { u32 x; u32 y; }
+A ga;
+u32 main() { A b = ga; return b.x; }   // reads ALL of ga unlocked; copies ga's mutex into b
+A getit()  { return ga; }               // same, on the return path
+```
+Emitted C: `_zer_t0 = ga;` — a non-atomic full-struct read while another thread may hold `ga`'s
+lock and mutate `ga.x`/`ga.y` → **torn read**. Secondarily, `b` receives a byte copy of `ga`'s
+`pthread_mutex_t` (and `_inited=1`), so a later `pthread_mutex_lock(&b._zer_mtx)` operates on a
+**copied mutex** — the exact POSIX-UB the by-value-PARAM ban exists to prevent. `grep -c
+"ga._zer_mtx"` = 0 in the emitted C.
+
+**Root cause.** `find_shared_root_expr` / `find_all_shared_roots_expr` (ir_lower.c ~1246/~1346)
+detect a shared lock root only while descending a FIELD/INDEX/deref projection (`if (expr->kind ==
+NODE_FIELD) …`). A **bare `NODE_IDENT` whose OWN type is `shared struct`** never enters that branch,
+so no lock root is found for a whole-object read/copy. All FIELD-projected reads (`ga.x`, cast,
+intrinsic arg, index, orelse, struct-init, slice) ARE covered (agent-verified each emits a lock);
+only the whole-object bare-ident copy slips through. `collect_shared_types_in_expr` (checker.c
+~17400) likewise lists bare `NODE_IDENT` among the no-op kinds, so the same-statement multi-lock
+deadlock check is also blind to a whole-struct read.
+
+**Why it is documented, not yet fixed (the design decision).** By the Ban Decision Framework this
+is a hardware/OS constraint (copying a `pthread_mutex_t` is UB) → **ban**, consistent with the
+existing by-value-param ban. The open question is SCOPE:
+- var-decl-init (`A b = ga`) and assignment (`gb = ga`) copy an EXISTING (possibly concurrently-
+  accessed) instance → clearly should be banned, exactly like the param case.
+- `return ga`/`return local_a` is the same mutex copy, but it is also the natural "constructor"
+  shape (`A make(){ A a; a.x=1; return a; }`). Banning the return blocks that idiom; not banning it
+  leaves the return-copy race. Deciding requires confirming whether by-value shared-struct
+  construction/return is a supported pattern (it may not be — shared structs are almost always
+  global) before choosing ban-vs-allow for the return path.
+A rushed ban risks either over-rejecting a legitimate constructor or under-covering the return
+race, so the concurrency-semantics decision is deferred rather than slipped in.
+
+**Fix sketch (when the scope decision is made).** Mirror the by-value-param ban: at the var-decl-
+init and assignment type-check, reject a whole-struct RHS whose effective type is a `shared`/
+`shared(rw)` struct AND the RHS is a value READ of an existing instance (NODE_IDENT resolving to a
+shared-struct var, NODE_FIELD, or deref) — NOT a struct literal / `{0}` (fresh construction, which
+legitimately declares a new shared struct). Also add bare-`NODE_IDENT`-of-shared-struct as a lock
+root in the two `find_*_shared_roots` walkers + `collect_shared_types_in_expr`, so any whole-object
+read that is NOT banned still locks. Tripwires: `tests/zer_fail/shared_struct_copy_{vardecl,assign}.zer`;
+positive `tests/zer/shared_struct_fresh_construct_ok.zer`.
+
+**Severity MEDIUM.** Real silent cross-thread race + copied-mutex UB, compiles clean, no crash on
+bare-metal. Mitigating: requires the less-common pattern of copying a whole shared struct rather
+than accessing its fields; all field access is already correctly locked.
+
+---
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),
@@ -406,16 +461,16 @@ Bugs found while building `alloc`/`free` (docs/universal_alloc.md) but out of th
 scope, so NOT fixed. Full write-ups (repro + root cause) in
 **docs/universal_alloc.md §11**. Triage:
 
-- **MEDIUM — bare `orelse return;` inside a `?T`-returning function yields a wrong
-  `None`.** `?u32 f(){ *E e = slot orelse return; return e.value; }` with `slot`
-  null: the caller sees `f()` as HAVING a value. Only the BARE form in a `?T`
-  function; the block form `orelse { …; return null; }` and explicit `return
-  null;` are fine. A correctness bug (wrong runtime behavior), narrow.
-- **MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
-  `handle.elem`.** Any `container` field shaped `Handle(T)`/`?Handle(T)` fails
-  with "undefined type 'T'" (breaks self-referential `container Chained(T){
-  ?Handle(Chained(T)) next; }` and more). Separate from the depth-32 recursion
-  guard. Would need `subst_typenode` to recurse HANDLE like POINTER/OPTIONAL do.
+- **✅ FIXED (verified 2026-07-19) — bare `orelse return;` inside a `?T`-returning function.**
+  Re-tested on current main: `?u32 wrap(){ u32 v = maybe() orelse return; … }` and the
+  pointer-optional shape both emit `return (_zer_opt_u32){0,0};` (correct None) at the bare-return
+  block. Fixed by later work after 2026-07-08; entry retained only as a resolved note.
+- **✅ FIXED (2026-07-19) — `subst_typenode` did not substitute `T` inside allocator/funcptr
+  container fields.** `container Box(T){ ?Handle(T) slot; Slab(T) store; *(T)->T fn; }` failed
+  "undefined type 'T'" for Handle(T)/Slab(T)/Pool(T,N)/Ring(T,N)/FUNC_PTR fields. Fixed by adding
+  recursion cases for all five in `subst_typenode` (checker.c ~2109). Depth-32 guard still rejects
+  genuine infinite self-recursion. See BUGS-FIXED.md 2026-07-19 FIX 3;
+  test `tests/zer/container_typeparam_wrappers.zer`.
 - **LOW — global `Arena` in-place `garena.over(buf)` does not initialize** → a
   later `garena.alloc_slice(...)` returns `None` at runtime. Only `Arena x =
   Arena.over(buf)` (capture the return) works.

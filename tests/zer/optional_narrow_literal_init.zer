@@ -1,0 +1,15 @@
+// Relaxation: a fitting int literal initializes/flows into a narrow optional
+// (?u8 = 200). Previously over-rejected: is_literal_compatible didn't unwrap
+// TYPE_OPTIONAL. `u8 x = 200` always compiled; `?u8 o = 200` did not.
+u32 take(?u8 o) { if (o) |v| { return v; } return 0; }
+?u8 ret() { return 200; }
+u32 main() {
+    ?u8 a = 200;                  // var-decl init
+    u32 r1 = take(200);            // call-arg into ?u8 param
+    u32 r2 = 0;
+    if (ret()) |v| { r2 = v; }     // return 200 from ?u8 function
+    if (a) |v| {
+        if (v == 200 && r1 == 200 && r2 == 200) { return 0; }
+    }
+    return 1;
+}

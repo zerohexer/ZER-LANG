@@ -1,0 +1,14 @@
+// Regression: signed / % >> by an integer literal must compute SIGNED (was
+// promoted to unsigned because the literal temp kept its default u32 type).
+i32 ext(i32 x) { return x; }
+u32 main() {
+    i32 a = ext(-8);
+    i8  b = -100;
+    i32 c = -7;
+    if (a % 3 != -2) { return 1; }     // was 2
+    if (a / 3 != -2) { return 2; }     // was huge unsigned
+    if ((i32)(b % 7) != -2) { return 3; }
+    if (c >> 1 != -4) { return 4; }
+    if (!(a < 3)) { return 5; }        // comparison already correct
+    return 0;
+}

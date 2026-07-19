@@ -1,0 +1,30 @@
+// Regression: subst_typenode must substitute the container type param T inside
+// Handle(T) / Slab(T) / Pool(T,N) / Ring(T,N) / funcptr fields (previously
+// "undefined type 'T'" during monomorphization). Positive test: exit 0.
+struct Data { u32 v; }
+
+container Box(T) {
+    ?Handle(T) slot;      // Handle(T) field
+    Slab(T) store;         // Slab(T) field
+    T item;                // plain T (already worked)
+    u32 count;
+}
+
+container Ops(T) {
+    *(T) -> T compute;     // funcptr field mentioning T
+    u32 n;
+}
+
+u32 dbl(u32 x) { return x + x; }
+
+Box(Data) b;
+Ops(u32) o;
+
+u32 main() {
+    b.item.v = 5;
+    b.count = 2;
+    o.compute = dbl;
+    u32 r = b.item.v + b.count + o.compute(10);   // 5 + 2 + 20 = 27
+    if (r == 27) { return 0; }
+    return 1;
+}

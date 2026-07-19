@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+?[*]u32 gs;
+void st(?[*]u32 q) { gs = q; }
+void c() { u32[4] a; a[0] = 1; st(a[0..2]); }   // slice-of-local escapes -> REJECT
+u32 main() { c(); return 0; }

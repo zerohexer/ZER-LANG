@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-19 — multi-agent audit: 3 fixes + 1 relaxation (checker.c)
+
+A parallel-agent audit (escape/keep, VRP/bounds+IR, zercheck_ir UAF, concurrency/bare-metal, type
+dispatch) plus direct IR-lowering review. zercheck_ir was found robust (no accept-unsafe). Three
+real bugs + one over-rejection fixed; `make check` GREEN (ZER 990/0, rust 784/0, zig 36/0, fuzz
+200/0, convert 139/0, all audits OK, sink matrix CLEAN). One concurrency finding documented as a
+new OPEN limitation (needs a design decision, not a rushed ban).
+
+### FIX 1 (HIGH, accept-unsafe UAF) — keep-inference blind to `?*T`/`?[*]T` params → `&local` escapes to a global
+`void st(?*u32 q){ g = q; } void c(){ u32 loc; st(&loc); }` compiled clean; `&loc` was stored to
+the global `g` and read dangling at runtime (verified: corrupted read). The plain `*u32 q` form
+correctly rejected — the **optional wrapper was the sole discriminator**. The per-sink patchwork
+omitted `TYPE_OPTIONAL` in two places:
+1. **Param taint** (checker.c ~14940): `is_nonkeep_derived` was set only for POINTER/OPAQUE/SLICE
+   (+ pointer-carrying struct). A `?*T`/`?[*]T`/`?*opaque` param carries the identical borrow.
+   Added a `TYPE_OPTIONAL` arm that unwraps the inner and taints on POINTER/OPAQUE/SLICE.
+2. **Persist sink** (checker.c ~4720): the `is_nonkeep_value` vk-membership set omitted
+   `TYPE_OPTIONAL`, so even a tainted optional value was not treated as an escape. Added it (gated
+   by the already-precise `is_nonkeep_derived` flag).
+Mirrors `escape_type_carries_ref` (value side), which already unwraps OPTIONAL. Pure tightening —
+over-reject risk only; passing a GLOBAL `?*T` still compiles; all 5 keep/escape sinks (var-decl,
+assign, param-field, deref-store, return) now reject a local-derived optional-ptr/slice arg;
+`sink_matrix.sh` still CLEAN. Tests: `tests/zer_fail/keep_optional_ptr_param_escape.zer`,
+`tests/zer_fail/keep_optional_slice_param_escape.zer`,
+`tests/zer/keep_optional_ptr_param_global_ok.zer` (over-reject guard).
+
+### FIX 2 (HIGH, silent miscompile) — signed `/` `%` `>>` by an integer literal computed UNSIGNED
+`i32 a = -8; a % 3` → **2** (want -2); `a / 3` → a huge unsigned garbage value; wrong for every
+signed width (i8/i16/i32/i64). Contradicts ZER's "no undefined behavior / defined results" and "no
+implicit sign conversion" guarantees. Root: the checker adopts a literal operand's type to the
+other (signed) operand for RESULT typing (checker.c:3555 `left=right`/`right=left`) but never wrote
+the adopted type back to the typemap. IR lowering emits each literal's temp from
+`checker_get_type(node)`, so the divisor temp stayed `uint32_t`; C's usual arithmetic conversions
+then promoted the signed dividend to unsigned. Benign for `+`/`-`/`*` (two's-complement bit
+patterns match AND the result was already truncated to the checker's signed result type) but wrong
+for `/`,`%`,`>>` (sign-dependent). The emission was even self-inconsistent — it emitted a *signed*
+division-overflow guard next to an *unsigned* compute. Fix: `checker_set_type(c, node->binary.<side>,
+<adopted>)` at both adoption lines so the literal's IR temp gets the signed type. Comparisons
+already cast their literal operand, so they stayed correct. Test: `tests/zer/signed_div_literal.zer`.
+
+### FIX 3 (over-rejection) — container monomorphization dropped `T` inside Handle(T)/Slab(T)/Pool/Ring/funcptr fields
+`container Box(T){ ?Handle(T) slot; Slab(T) store; *(T)->T fn; }` → "undefined type 'T'". Root:
+`subst_typenode` (checker.c ~2067) recursed POINTER/OPTIONAL/SLICE/ARRAY/CONTAINER but listed
+`TYNODE_HANDLE`/`SLAB`/`POOL`/`RING`/`FUNC_PTR` in the no-substitution leaf list — their inner
+`elem`/`return_type`/`param_types` never had `T` replaced. Fix: recurse into all five (the four
+allocator-family kinds recurse `.elem`; FUNC_PTR deep-copies `param_types[]` + `return_type`).
+SEMAPHORE stays leaf (count_expr is numeric). Pure completeness fix (accepts more valid programs,
+cannot cause unsoundness); the depth-32 monomorphization guard still rejects genuinely-infinite
+self-recursion. Test: `tests/zer/container_typeparam_wrappers.zer`.
+
+### RELAXATION (LOW, ergonomic) — fitting int literal into a narrow optional (`?u8 o = 200`)
+`u8 x = 200` compiled but `?u8 o = 200` did not. `is_literal_compatible` (checker.c:485) unwrapped
+DISTINCT but not OPTIONAL, so a fitting literal into a narrow-typed optional fell through to
+`can_implicit_coerce(u32, ?u8)` → narrowing reject. Fix: for a non-null literal against a
+`TYPE_OPTIONAL` target, recurse into `optional.inner`. Rice-safe (`?u8 = 300` still rejects). Works
+across var-decl / call-arg / return. Test: `tests/zer/optional_narrow_literal_init.zer`.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

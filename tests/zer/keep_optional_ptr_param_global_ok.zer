@@ -1,0 +1,6 @@
+// Over-reject guard: passing a GLOBAL to a ?*T keep-inferred param must still compile.
+?*u32 g;
+u32 gv;
+void st(?*u32 q) { g = q; }
+void c() { gv = 5; st(&gv); }
+u32 main() { c(); return 0; }

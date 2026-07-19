@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// Hole (fixed): a ?*T / ?[*]T param was never tainted non-keep, so keep-inference
+// was blind and &local escaped to a global through the callee's store.
+?*u32 g;
+void st(?*u32 q) { g = q; }              // stores optional-ptr param to a global -> infers keep
+void c() { u32 loc; loc = 111; st(&loc); }  // &loc cannot satisfy inferred keep -> REJECT
+u32 main() { c(); return 0; }

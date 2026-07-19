@@ -486,6 +486,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
     /* unwrap distinct for literal compatibility */
     Type *effective = type_unwrap_distinct(target);
+    /* A non-null value literal fits an OPTIONAL whose inner it fits: `?u8 o =
+     * 200` should behave like `u8 x = 200` (the optional wrapper only adds a
+     * has_value flag). is_literal_compatible unwraps DISTINCT but historically
+     * not OPTIONAL, so a fitting literal into a narrow-typed optional was
+     * over-rejected. `null` into `?T` is handled by the NODE_NULL_LIT arm. */
+    if (type_dispatch_kind(effective) == TYPE_OPTIONAL && expr->kind != NODE_NULL_LIT) {
+        Type *oinner = type_unwrap_optional(effective);
+        if (oinner) return is_literal_compatible(expr, oinner);
+    }
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
         /* range check: literal must fit in target type.
          * SAFETY: zer_literal_fits_u in src/safety/arith_rules.c (M08).
@@ -2112,16 +2121,67 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->container.type_arg = subst_typenode(a, tn->container.type_arg, param_name, param_len, replacement);
         return r;
     }
+    /* Allocator-family wrappers carry an element TypeNode that may be the
+     * container type param (a `container Box(T){ ?Handle(T) slot; }` field, a
+     * `Slab(T)`/`Pool(T,N)`/`Ring(T,N)` store). Previously these fell into the
+     * leaf list below and the `T` inside was never substituted → "undefined
+     * type 'T'" over-rejection during monomorphization. Recurse into `.elem`
+     * like POINTER/OPTIONAL/ARRAY do; the count_expr (Pool/Ring) is a numeric
+     * constant, never a type, so it needs no substitution. */
+    case TYNODE_HANDLE: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_SLAB: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->slab.elem = subst_typenode(a, tn->slab.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_POOL: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->pool.elem = subst_typenode(a, tn->pool.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_RING: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->ring.elem = subst_typenode(a, tn->ring.elem, param_name, param_len, replacement);
+        return r;
+    }
+    /* Function-pointer field of a container (`container Ops(T){ *(T)->T fn; }`):
+     * the return type and each param type may be the type param. Deep-copy the
+     * param_types array so the substituted funcptr is independent of the
+     * template. Other funcptr sub-arrays (names, keeps) are shared read-only. */
+    case TYNODE_FUNC_PTR: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->func_ptr.return_type = subst_typenode(a, tn->func_ptr.return_type,
+                                                 param_name, param_len, replacement);
+        int pc = tn->func_ptr.param_count;
+        if (pc > 0 && tn->func_ptr.param_types) {
+            TypeNode **np = (TypeNode **)arena_alloc(a, sizeof(TypeNode *) * (size_t)pc);
+            for (int i = 0; i < pc; i++) {
+                np[i] = subst_typenode(a, tn->func_ptr.param_types[i],
+                                       param_name, param_len, replacement);
+            }
+            r->func_ptr.param_types = np;
+        }
+        return r;
+    }
     /* Stage 2 Part B (2026-04-28): exhaustive — primitives and other
      * leaf TypeNode kinds need no substitution (they have no inner type
-     * param). NAMED is handled at the top via leaf check. */
+     * param). NAMED is handled at the top via leaf check. SEMAPHORE carries
+     * only a count_expr (numeric), never a type. */
     case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
     case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
-    case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_HANDLE: case TYNODE_BARRIER:
-    case TYNODE_SLAB: case TYNODE_SEMAPHORE:
+    case TYNODE_ARENA: case TYNODE_BARRIER:
+    case TYNODE_SEMAPHORE:
         return tn;
     }
     return tn;  /* defensive — unreachable with all cases enumerated */
@@ -3500,9 +3560,24 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* literal promotion: when one side is a literal and the other is
          * a known type, the literal adopts the other side's type.
-         * This allows: i32 x = -5; i32 y = x + 10; (10 becomes i32) */
-        if (is_literal_compatible(node->binary.left, right)) left = right;
-        if (is_literal_compatible(node->binary.right, left)) right = left;
+         * This allows: i32 x = -5; i32 y = x + 10; (10 becomes i32)
+         *
+         * The typemap MUST be updated too, not just the local `left`/`right`:
+         * IR lowering emits each literal's temp from checker_get_type(node), so
+         * a literal left at its default u32 type inside a SIGNED operation makes
+         * the emitted C perform UNSIGNED arithmetic (C usual conversions promote
+         * the signed operand to unsigned). Benign for +/-/* (two's-complement
+         * bit patterns match) but SILENTLY WRONG for `/` `%` and `>>` — e.g.
+         * `i32 a = -8; a % 3` computed `(2^32-8) % 3 = 2` instead of -2. Writing
+         * the adopted type back makes the divisor temp signed. */
+        if (is_literal_compatible(node->binary.left, right)) {
+            left = right;
+            checker_set_type(c, node->binary.left, right);
+        }
+        if (is_literal_compatible(node->binary.right, left)) {
+            right = left;
+            checker_set_type(c, node->binary.right, left);
+        }
 
         switch (node->binary.op) {
         /* arithmetic: both numeric, result = common type */
@@ -4668,7 +4743,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 TypeKind vk = type_dispatch_kind(val_sym ? val_sym->type : NULL);
                 bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
                     (vk == TYPE_POINTER || vk == TYPE_OPAQUE || vk == TYPE_SLICE ||
-                     vk == TYPE_STRUCT || vk == TYPE_UNION);
+                     vk == TYPE_STRUCT || vk == TYPE_UNION ||
+                     /* ?*T / ?[*]T value: the taint is precise (set only for
+                      * ref-carrying optionals at registration), so a tainted
+                      * TYPE_OPTIONAL persisted to a sink is the same escape. */
+                     vk == TYPE_OPTIONAL);
                 if (is_nonkeep_value) {
                     /* keep-universalization 2a: a non-keep pointer param (or alias)
                      * persisted into a global OR a pointer-param field/nested sink
@@ -14898,6 +14977,23 @@ static void check_func_body(Checker *c, Node *node) {
                          * at the persist sink (~4115). */
                         sym->is_nonkeep_derived = true;
                         sym->nonkeep_root_param = i; /* keep inference: this param is its own root */
+                    }
+                    /* An OPTIONAL pointer/slice param (?*T / ?[*]T / ?*opaque) is the
+                     * SAME {ptr}/{ptr,len} borrow as its non-optional form — the
+                     * optional wrapper only adds a null sentinel. Storing it to a
+                     * global/param-field launders the caller's memory identically.
+                     * Was a HOLE: the taint list omitted TYPE_OPTIONAL, so a function
+                     * `void st(?*u32 q){ g = q; }` never inferred keep and a
+                     * `st(&local)` caller was accepted → &local escapes to a global
+                     * (dangling read at runtime). Mirrors escape_type_carries_ref,
+                     * which already unwraps OPTIONAL on the value side. */
+                    else if (pk == TYPE_OPTIONAL) {
+                        Type *oi = type_unwrap_optional(ptype);
+                        TypeKind ik = oi ? type_dispatch_kind(oi) : TYPE_VOID;
+                        if (ik == TYPE_POINTER || ik == TYPE_OPAQUE || ik == TYPE_SLICE) {
+                            sym->is_nonkeep_derived = true;
+                            sym->nonkeep_root_param = i;
+                        }
                     }
                     /* GAP-8 (BUG-737, 2026-06-10, 6u360k audit): a by-value
                      * STRUCT/UNION param whose type carries raw data-pointer

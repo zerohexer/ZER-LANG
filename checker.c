@@ -4668,7 +4668,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 TypeKind vk = type_dispatch_kind(val_sym ? val_sym->type : NULL);
                 bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
                     (vk == TYPE_POINTER || vk == TYPE_OPAQUE || vk == TYPE_SLICE ||
-                     vk == TYPE_STRUCT || vk == TYPE_UNION);
+                     vk == TYPE_STRUCT || vk == TYPE_UNION ||
+                     /* #7 (2026-07-14): ?*T / ?[*]T nullable-borrow value — gated by
+                      * is_nonkeep_derived, only set for carrier types, so a scalar
+                      * ?u32 never reaches here. */
+                     vk == TYPE_OPTIONAL);
                 if (is_nonkeep_value) {
                     /* keep-universalization 2a: a non-keep pointer param (or alias)
                      * persisted into a global OR a pointer-param field/nested sink
@@ -5001,9 +5005,16 @@ static Type *check_expr(Checker *c, Node *node) {
         }
         } /* end TOK_EQ outer block wrapping the @ptrcast-aware path */
 
-        /* scope escape: assigning local array to global slice (implicit coercion) */
-        if (node->assign.op == TOK_EQ &&
-            target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
+        /* scope escape: assigning local array to global slice (implicit coercion).
+         * #9: target is slice-like if a slice OR an optional-of-slice — a `?[*]T`
+         * target (TYPE_OPTIONAL) previously hid the local-array-into-global dangling
+         * store from this check (which gated on bare TYPE_SLICE). */
+        Type *tgt_su_esc = target ? type_unwrap_distinct(target) : NULL;
+        bool tgt_slice_like_esc = tgt_su_esc &&
+            (type_dispatch_kind(tgt_su_esc) == TYPE_SLICE ||
+             (type_dispatch_kind(tgt_su_esc) == TYPE_OPTIONAL &&
+              type_dispatch_kind(tgt_su_esc->optional.inner) == TYPE_SLICE));
+        if (node->assign.op == TOK_EQ && tgt_slice_like_esc &&
             value && type_unwrap_distinct(value)->kind == TYPE_ARRAY &&
             node->assign.value->kind == NODE_IDENT) {
             const char *vname = node->assign.value->ident.name;
@@ -12066,8 +12077,17 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* scope escape: return local array as slice → dangling pointer
              * BUG-237: walk field/index chains to catch s.arr, s.inner.arr etc. */
+            /* #8: the return target is slice-like if a slice OR an optional-of-slice
+             * — a `?[*]T` return type (TYPE_OPTIONAL) previously hid a returned
+             * local-array dangling pointer from this check (which gated on bare
+             * TYPE_SLICE). */
+            Type *cfr_eff = c->current_func_ret ? type_unwrap_distinct(c->current_func_ret) : NULL;
+            bool cfr_slice_like = cfr_eff &&
+                (type_dispatch_kind(cfr_eff) == TYPE_SLICE ||
+                 (type_dispatch_kind(cfr_eff) == TYPE_OPTIONAL &&
+                  type_dispatch_kind(cfr_eff->optional.inner) == TYPE_SLICE));
             if (ret_type && ret_type->kind == TYPE_ARRAY &&
-                c->current_func_ret && c->current_func_ret->kind == TYPE_SLICE) {
+                cfr_slice_like) {
                 Node *root = node->ret.expr;
                 while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                     if (root->kind == NODE_FIELD) root = root->field.object;
@@ -14970,6 +14990,17 @@ static void check_func_body(Checker *c, Node *node) {
                             sym->is_nonkeep_derived = true;
                             sym->nonkeep_root_param = i; /* keep inference: struct param is its own root */
                         }
+                    }
+                    /* #7 (2026-07-14): a `?*T`/`?[*]T` param is a NULLABLE borrow —
+                     * same non-keep contract as `*T`/`[*]T`. The optional wrapper hid
+                     * the carrier from this taint, so a `?[*]T`-storing fn never
+                     * inferred keep → a local-derived caller was accepted → silent
+                     * dangling store (`?[*]u8 g; stash(?[*]u8 s){g=s;}`).
+                     * type_carries_data_pointer recurses the optional inner, so
+                     * `?u32`/`?bool` (no ref) stay untainted. */
+                    else if (pk == TYPE_OPTIONAL && type_carries_data_pointer(ptype, 0)) {
+                        sym->is_nonkeep_derived = true;
+                        sym->nonkeep_root_param = i; /* keep inference: optional-carrier param is its own root */
                     }
                 }
                 /* field-level keep: a KEEP pointer param is a BORROW. Storing it

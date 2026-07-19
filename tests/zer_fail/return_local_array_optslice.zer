@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Returning a local array as an OPTIONAL slice `?[*]T` is a dangling pointer /
+// use-after-return, exactly like the non-optional `[*]T` case. The optional
+// wrapper previously hid it from the escape check. Fixed 2026-07-14.
+?[*]u8 mk() {
+    u8[5] buf;
+    return buf;
+}
+u32 main() {
+    ?[*]u8 s = mk();
+    return 0;
+}

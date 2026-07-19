@@ -824,6 +824,16 @@ correspondence via SMT) and CompCertELF-style verified assembly/linking research
   semantic-preservation arguments.
 - **Per §8.2 (single-prover amendment): iris-lean is the DESIGNATED end-state home.**
   After the port at the trigger above, Coq is retired from ZER entirely.
+- **Clarification (so the name never misleads): using iris-lean IS "porting Iris to Lean
+  directly."** iris-lean is plain Lean 4 — no Coq anywhere in it; it fully satisfies the
+  single-prover mandate. And prover libraries are not trust delegations: the Lean kernel
+  RE-CHECKS every iris-lean lemma at build time, so "use the community port" and "rewrite
+  it ourselves" yield IDENTICAL assurance — the only difference is person-years of labor.
+  Policy: pin the iris-lean version (it tracks Lean releases; currently v4.32.0, same as
+  our toolchain); extend locally where ZER needs missing pieces. Recorded fallback if its
+  research churn ever becomes a burden: a bespoke minimal "ZER-Iris" — only the slice
+  λ-ZER instantiates (gen_heap/ghost_map/invariants/WP), informed by Iris's design — the
+  Stage-5 philosophy (rebuild only the needed subset) applied to separation logic.
 
 ---
 

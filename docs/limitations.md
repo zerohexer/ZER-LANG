@@ -396,14 +396,19 @@ silent OOB (read AND write; ASan-confirmed on the branches).
   `tests/zer/dowhile_bounds_first_iter.zer`. Distinct from §C #14 (do-while `find_return_range`).
   **In-main: NOT present** — main narrows for BOTH kinds (checker.c ~11464, no `!= NODE_DO_WHILE` gate).
 
-### B. Escape / dangling-pointer class → accept-unsafe UAF (5 sinks; the `?T`-hides-inner + intrinsic-launder cluster)
-**✅ #7/#8/#9 DONE (landed 2026-07-19, make check 994/0, sink matrix 32 CLEAN):** the c4c09l
-`?[*]T`/`?*T` optional-carrier sub-cluster — keep-registration + persist sink now taint
-TYPE_OPTIONAL carriers (#7); the return-dangling (#8) and array-store-to-global (#9) escape
-checks now accept optional-of-slice (via `type_dispatch_kind`, audit-clean). All 4 negatives in
-`tests/zer_fail/` reject; ground-truth-probed bug-present-on-main first. **⏳ #5/#6 STILL OPEN**
-(yd5ajq intrinsic-launder + struct-element-copy — needs the rt_opaque_* test conversions too).
-Same escape class as CLAUDE.md's per-sink patchwork note, at 5 sinks main's taint misses. All
+### B. Escape / dangling-pointer class → accept-unsafe UAF — ✅ ALL 5 DONE (landed 2026-07-19)
+**✅ #7/#8/#9 DONE (make check 994/0):** the c4c09l `?[*]T`/`?*T` optional-carrier sub-cluster —
+keep-registration + persist sink now taint TYPE_OPTIONAL carriers (#7); the return-dangling (#8)
+and array-store-to-global (#9) escape checks now accept optional-of-slice (via `type_dispatch_kind`,
+audit-clean). 4 negatives in `tests/zer_fail/` reject; ground-truth-probed bug-present-on-main first.
+**✅ #5/#6 DONE (make check 996/0, sink matrix 32→41 CLEAN):** yd5ajq intrinsic-launder (#5, new
+`unwrap_ptr_launder` helper at the assign + orelse-fallback taint sinks — `@ptrcast(&local)` is
+NODE_INTRINSIC, not NODE_UNARY) + struct-element-copy (#6, store-to-global descend gate widened to
+`escape_type_carries_ref(vt) || type_can_carry_pointer(vt)`). Tests
+`tests/zer_fail/escape_{intrinsic_field_store_global,array_elem_struct_copy_global}.zer` +
+sink-matrix cells p11/p12 (+ 3 safe baselines); the 5 `rust_tests/rt_opaque_*` were converted to the
+long-lived-context idiom (they had relied on the #5 loophole). Whole class closed.
+Same escape class as CLAUDE.md's per-sink patchwork note, at 5 sinks main's taint missed. All
 ASan-confirmed `stack-use-after-return`/`stack-buffer-overflow` on the branches. #7/#8/#9 are the
 `?[*]T`/`?*T` optional-carrier sub-cluster (the OPEN "optional-unwrap" class-kill).
 

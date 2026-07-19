@@ -1,5 +1,7 @@
 // Rust pattern: multiple layers of type erasure — wrapper around wrapper.
 // ZER: *opaque provenance tracked through function chain.
+// NOTE: contexts are global — a funcptr call is worst-case `keep`, so a
+// stack-local context is rejected (see docs/limitations.md).
 
 struct HwTimer { u32 prescaler; u32 period; }
 
@@ -23,29 +25,30 @@ u32 system_tick(*opaque ctx) {
     return d.read_period(d.hw);
 }
 
-u32 main() {
-    HwTimer timer;
-    timer.prescaler = 8;
-    timer.period = 1000;
+HwTimer g_timer;
+Driver g_drv;
 
-    Driver drv;
-    drv.hw = @ptrcast(*opaque, &timer);
-    drv.read_period = read_timer_period;
+u32 main() {
+    g_timer.prescaler = 8;
+    g_timer.period = 1000;
+
+    g_drv.hw = @ptrcast(*opaque, &g_timer);
+    g_drv.read_period = read_timer_period;
 
     // Verify direct call
-    u32 p = drv.read_period(drv.hw);
+    u32 p = g_drv.read_period(g_drv.hw);
     if (p != 1000) { return 1; }
 
     // Verify through System wrapper
     System sys;
-    sys.driver_ctx = @ptrcast(*opaque, &drv);
+    sys.driver_ctx = @ptrcast(*opaque, &g_drv);
     sys.get_tick = system_tick;
 
     u32 tick = sys.get_tick(sys.driver_ctx);
     if (tick != 1000) { return 2; }
 
     // Modify original, verify propagates
-    timer.period = 2000;
+    g_timer.period = 2000;
     tick = sys.get_tick(sys.driver_ctx);
     if (tick != 2000) { return 3; }
 

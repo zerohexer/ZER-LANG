@@ -1510,6 +1510,24 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * diverge — the assignment path missing this field/index walk (it matched only
  * a bare `&local` NODE_IDENT operand) was a shipped return/global UAF:
  * `*T p = &local[0]; p = &local[1]; return p;` escaped undetected. */
+/* #5: unwrap value-side pointer-launder intrinsics (@ptrcast / @pun / @bitcast /
+ * @cast / @container) down to the underlying pointer expression, so escape taint
+ * sees THROUGH them. @container's pointer is args[0]; every other launder passes
+ * the pointer as its LAST arg. An intrinsic-wrapped `&local` (`b.p = @ptrcast(
+ * *u32, &local)`) is NODE_INTRINSIC, not NODE_UNARY, so a taint sink that only
+ * matched a bare NODE_UNARY missed it and the container escaped un-tainted via a
+ * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
+static Node *unwrap_ptr_launder(Node *v) {
+    while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+        if (v->intrinsic.name_len == 9 &&
+            memcmp(v->intrinsic.name, "container", 9) == 0)
+            v = v->intrinsic.args[0];
+        else
+            v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+    }
+    return v;
+}
+
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     Node *root = operand;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -4334,9 +4352,13 @@ static Type *check_expr(Checker *c, Node *node) {
                              * field/index chain (addr_of_is_local_derived), same as
                              * the direct case, so `p = opt orelse &local[i]` is
                              * caught (the old NODE_IDENT-only match missed it). */
-                            if (fb && fb->kind == NODE_UNARY &&
-                                fb->unary.op == TOK_AMP &&
-                                addr_of_is_local_derived(c, fb->unary.operand)) {
+                            /* #5: unwrap_ptr_launder sees through @ptrcast(*T,
+                             * &local) and friends so an intrinsic-wrapped fallback
+                             * taints too (was a bare-NODE_UNARY-only match). */
+                            Node *fbu = unwrap_ptr_launder(fb);
+                            if (fbu && fbu->kind == NODE_UNARY &&
+                                fbu->unary.op == TOK_AMP &&
+                                addr_of_is_local_derived(c, fbu->unary.operand)) {
                                 tsym->is_local_derived = true;
                             }
                             if (fb && fb->kind == NODE_IDENT) {
@@ -4353,9 +4375,15 @@ static Type *check_expr(Checker *c, Node *node) {
                          * un-flagged → the dangling pointer escaped via
                          * return/global (shipped UAF). Shared with the var-decl
                          * path via the helper so they can't diverge again. */
-                        if (vcheck->kind == NODE_UNARY &&
-                            vcheck->unary.op == TOK_AMP &&
-                            addr_of_is_local_derived(c, vcheck->unary.operand)) {
+                        /* #5: an intrinsic-wrapped `&local` (`b.p = @ptrcast(*u32,
+                         * &local)`) is NODE_INTRINSIC, not NODE_UNARY — the bare
+                         * match missed it and the container root `b` escaped
+                         * un-tainted via a later `g = b` / `return b`
+                         * (stack-use-after-return, ASan-confirmed). */
+                        Node *vlaunder = unwrap_ptr_launder(vcheck);
+                        if (vlaunder && vlaunder->kind == NODE_UNARY &&
+                            vlaunder->unary.op == TOK_AMP &&
+                            addr_of_is_local_derived(c, vlaunder->unary.operand)) {
                             tsym->is_local_derived = true;
                         }
                     }
@@ -4556,7 +4584,14 @@ static Type *check_expr(Checker *c, Node *node) {
                  * pointer/slice-only, so `g = b.p` where b.p is a ?*T field holding
                  * &local (type TYPE_OPTIONAL) skipped the descend-to-root walk and
                  * laundered a stack pointer into a global undetected (F3). */
-                if (escape_type_carries_ref(vt)) {
+                /* #6: type_can_carry_pointer additionally covers a STRUCT/UNION-
+                 * by-value that transitively contains a pointer — `g = arr[0]` where
+                 * arr is a local-derived array of pointer-carrying structs copies the
+                 * whole element (with its dangling pointer) into a global. The narrow
+                 * ref-only gate skipped that struct-copy shape (ASan-confirmed
+                 * stack-use-after-return); the root is_local_derived check below then
+                 * gates it, so a pointerless struct copy is still accepted. */
+                if (escape_type_carries_ref(vt) || type_can_carry_pointer(vt)) {
                     while (vnode && (vnode->kind == NODE_FIELD ||
                                      vnode->kind == NODE_INDEX)) {
                         if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;

@@ -1,5 +1,7 @@
 // Rust pattern: callback with *opaque context — full lifecycle.
 // ZER: register callback, invoke it, cleanup properly.
+// NOTE: context is global — a funcptr callback is worst-case `keep`, so a
+// stack-local context is rejected (see docs/limitations.md).
 
 struct Timer { u32 interval; u32 count; }
 
@@ -13,13 +15,14 @@ struct Callback {
     void (*handler)(*opaque);
 }
 
+Timer g_timer;
+
 u32 main() {
-    Timer t;
-    t.interval = 100;
-    t.count = 0;
+    g_timer.interval = 100;
+    g_timer.count = 0;
 
     Callback cb;
-    cb.ctx = @ptrcast(*opaque, &t);
+    cb.ctx = @ptrcast(*opaque, &g_timer);
     cb.handler = timer_tick;
 
     // Simulate 5 ticks
@@ -29,8 +32,8 @@ u32 main() {
     cb.handler(cb.ctx);
     cb.handler(cb.ctx);
 
-    if (t.count != 5) { return 1; }
-    if (t.interval != 100) { return 2; }
+    if (g_timer.count != 5) { return 1; }
+    if (g_timer.interval != 100) { return 2; }
 
     return 0;
 }

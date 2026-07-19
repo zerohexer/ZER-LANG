@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// `g = arr[0]` where arr is a local-derived array of pointer-carrying structs
+// copies the whole element (with its &local pointer) into a global —
+// stack-use-after-return (ASan-confirmed). The read-side descend-to-root gate
+// was ref-type-only, skipping the struct-by-value element copy; widened to
+// type_can_carry_pointer.
+struct Box { *u32 p; }
+Box g;
+void c() {
+    u32 local = 0;
+    Box[2] arr;
+    arr[0].p = @ptrcast(*u32, &local);
+    g = arr[0];
+}
+u32 main() { c(); return 0; }

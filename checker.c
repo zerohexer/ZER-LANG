@@ -367,6 +367,7 @@ static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
+static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch);
@@ -587,6 +588,72 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             return true;
     }
     return false;
+}
+
+/* LIT-1: is `e` a PURE compile-time integer-literal expression — composed only
+ * of integer literals, unary +/-/~, and arithmetic/bitwise/shift binaries? Such
+ * an expression has no variable operands, so it can be safely retyped to a
+ * destination integer type (below). Excludes anything with an ident/call/field
+ * so we never retype a subtree whose value depends on a real variable. */
+static bool is_pure_int_literal_expr(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_INT_LIT) return true;
+    if (e->kind == NODE_UNARY &&
+        (e->unary.op == TOK_MINUS || e->unary.op == TOK_TILDE ||
+         e->unary.op == TOK_PLUS))
+        return is_pure_int_literal_expr(e->unary.operand);
+    if (e->kind == NODE_BINARY) {
+        switch (e->binary.op) {  /* op-switch — excluded from walker-default audit */
+        case TOK_PLUS: case TOK_MINUS: case TOK_STAR: case TOK_SLASH:
+        case TOK_PERCENT: case TOK_AMP: case TOK_PIPE: case TOK_CARET:
+        case TOK_LSHIFT: case TOK_RSHIFT:
+            return is_pure_int_literal_expr(e->binary.left) &&
+                   is_pure_int_literal_expr(e->binary.right);
+        default: return false;
+        }
+    }
+    return false;
+}
+
+/* LIT-1: retype every node of a pure integer-literal expression tree to
+ * `target`. Integer literals default to u32/u64 by value width, so `i64 a = -3`
+ * negated a u32 3 (→ 4294967293 after zero-extension) and `u64 x =
+ * 100000*100000` computed the product in u32 (wrapped at 2^32) before widening.
+ * The assignment path already folds the constant to the target width; the
+ * var-decl-init / return / call-arg paths lowered the literal into u32-typed IR
+ * temps. Retyping the tree makes ir_lower emit target-width temps so the
+ * computation (and any intermediate negation) happens in the declared width.
+ * Caller must gate on is_pure_int_literal_expr + integer target + the value
+ * being accepted (fits) — a non-fitting constant is rejected before this runs. */
+static void retype_const_int_to_target(Checker *c, Node *e, Type *target) {
+    if (!e || !target) return;
+    if (e->kind == NODE_INT_LIT) {
+        typemap_set(c, e, target);
+    } else if (e->kind == NODE_UNARY) {
+        retype_const_int_to_target(c, e->unary.operand, target);
+        typemap_set(c, e, target);
+    } else if (e->kind == NODE_BINARY) {
+        retype_const_int_to_target(c, e->binary.left, target);
+        retype_const_int_to_target(c, e->binary.right, target);
+        typemap_set(c, e, target);
+    }
+}
+
+/* LIT-1: the integer type a pure-literal constant should be retyped to for a
+ * given destination — the type itself if integer (keeping any distinct wrapper),
+ * or the inner integer of an optional-of-integer (so `return -9;` from a `?i64`
+ * function computes -9 in i64 before the optional wrap, not in u32). NULL = do
+ * not retype (non-integer / non-optional-integer target). */
+static Type *int_retype_target(Type *t) {
+    if (!t) return NULL;
+    Type *e = type_unwrap_distinct(t);
+    if (!e) return NULL;
+    if (type_is_integer(e)) return t;
+    if (type_dispatch_kind(e) == TYPE_OPTIONAL) {
+        Type *inner = type_unwrap_distinct(e->optional.inner);
+        if (inner && type_is_integer(inner)) return e->optional.inner;
+    }
+    return NULL;
 }
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
@@ -1743,6 +1810,11 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                         "field '.%.*s' expects '%s', got '%s'",
                         (int)df->name_len, df->name,
                         type_name(ft), type_name(vt));
+                } else if (df->value && is_pure_int_literal_expr(df->value)) {
+                    /* LIT-1: `.baud = -7` into a 64-bit field must compute -7 in
+                     * the field's width, not the literal's default u32. */
+                    Type *rt = int_retype_target(ft);
+                    if (rt) retype_const_int_to_target(c, df->value, rt);
                 }
                 break;
             }
@@ -3519,9 +3591,27 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* literal promotion: when one side is a literal and the other is
          * a known type, the literal adopts the other side's type.
-         * This allows: i32 x = -5; i32 y = x + 10; (10 becomes i32) */
-        if (is_literal_compatible(node->binary.left, right)) left = right;
-        if (is_literal_compatible(node->binary.right, left)) right = left;
+         * This allows: i32 x = -5; i32 y = x + 10; (10 becomes i32)
+         * LIT-1: also RETYPE the literal node (typemap) to the other side's
+         * integer width, not just the local Type var — otherwise the emitter
+         * still lowers it in u32 and `i64 x=-7; x != -7` compares against a
+         * zero-extended u32 (-7 → 4294967289) → wrong (i32/narrower happen to
+         * match by same-width wrap; only 64-bit widths diverge). Pure
+         * integer-literal operands only; non-integer sides yield NULL → no-op. */
+        if (is_literal_compatible(node->binary.left, right)) {
+            left = right;
+            if (is_pure_int_literal_expr(node->binary.left)) {
+                Type *rt = int_retype_target(right);
+                if (rt) retype_const_int_to_target(c, node->binary.left, rt);
+            }
+        }
+        if (is_literal_compatible(node->binary.right, left)) {
+            right = left;
+            if (is_pure_int_literal_expr(node->binary.right)) {
+                Type *rt = int_retype_target(left);
+                if (rt) retype_const_int_to_target(c, node->binary.right, rt);
+            }
+        }
 
         switch (node->binary.op) {
         /* arithmetic: both numeric, result = common type */
@@ -6170,6 +6260,11 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "argument %u: expected '%s', got '%s'",
                             i + 1, type_name(param), type_name(arg));
+                    } else if (is_pure_int_literal_expr(node->call.args[i])) {
+                        /* LIT-1: `f(-3)` where the param is i64 (or ?i64) must
+                         * pass -3 computed in i64, not the literal's default u32. */
+                        Type *rt = int_retype_target(param);
+                        if (rt) retype_const_int_to_target(c, node->call.args[i], rt);
                     }
                 }
 
@@ -7355,12 +7450,20 @@ static Type *check_expr(Checker *c, Node *node) {
             result = unwrapped;
         } else if (node->orelse.fallback) {
             if (node->orelse.fallback->kind == NODE_BLOCK) {
-                /* orelse { block } — statement-only, no result type.
-                 * Yield inside: safe at var-decl level (BUG-481 state struct temps).
-                 * Unsafe at expression level — caught by GCC ("switch jumps into
-                 * statement expression"). No checker ban needed. */
+                /* orelse { block } — #21: the block is statement-only; ZER blocks
+                 * are not expressions, so a block that FALLS THROUGH cannot supply
+                 * the unwrapped value on the None path. Historically this relied on
+                 * GCC rejecting a value-position use, but the IR path lowers the
+                 * block to basic blocks with an auto-zeroed result temp, so a
+                 * fall-through block silently yielded 0. Fix: type such an orelse
+                 * `void` so the normal "cannot initialize X with void" /
+                 * return-type-mismatch checks reject value-context use, while a
+                 * bare-statement `f() orelse { ... }` (value discarded) stays legal.
+                 * A block that DIVERGES on every path (return/break/continue/goto)
+                 * never reaches the consumer, so it keeps the unwrapped type. */
                 check_stmt(c, node->orelse.fallback);
-                result = unwrapped;
+                result = orelse_block_diverges(node->orelse.fallback)
+                             ? unwrapped : ty_void;
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
@@ -10550,6 +10653,13 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)node->var_decl.name_len, node->var_decl.name,
                         type_name(type), type_name(init_type));
                 }
+            } else if (is_pure_int_literal_expr(node->var_decl.init)) {
+                /* LIT-1: the initializer is accepted and is a pure integer-literal
+                 * constant — retype it to the declared width (or the inner width of
+                 * a ?integer) so the value (and any negation / arithmetic) is
+                 * computed in that width, not in the literal's default u32. */
+                Type *rt = int_retype_target(type);
+                if (rt) retype_const_int_to_target(c, node->var_decl.init, rt);
             }
             /* cross-platform portability: @ptrtoint to fixed-width type is fragile.
              * u32 x = @ptrtoint(ptr) works on 32-bit but loses bits on 64-bit.
@@ -12521,6 +12631,11 @@ static void check_stmt(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "return type '%s' doesn't match function return type '%s'",
                         type_name(ret_type), type_name(c->current_func_ret));
+                } else if (is_pure_int_literal_expr(node->ret.expr)) {
+                    /* LIT-1: `return -3;` from an i64 (or ?i64) function must
+                     * compute in i64, not the literal's default u32. */
+                    Type *rt = int_retype_target(c->current_func_ret);
+                    if (rt) retype_const_int_to_target(c, node->ret.expr, rt);
                 }
             }
         } else {
@@ -16640,6 +16755,30 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
             return c->prov_summaries[i].return_provenance;
     }
     return NULL;
+}
+
+/* #21: does an `orelse { block }` fallback diverge on every control path (so it
+ * never falls through to supply a value)? Handles the tail statement being a
+ * return/break/continue/goto, a nested if with both arms diverging, and an
+ * `orelse return/break/continue` expression-statement tail. Written as an if-chain
+ * (not a kind-switch) so it stays outside the -Wswitch walker audit. */
+static bool orelse_block_diverges(Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_RETURN || n->kind == NODE_BREAK ||
+        n->kind == NODE_CONTINUE || n->kind == NODE_GOTO) return true;
+    if (n->kind == NODE_BLOCK)
+        return n->block.stmt_count > 0 &&
+               orelse_block_diverges(n->block.stmts[n->block.stmt_count - 1]);
+    if (n->kind == NODE_IF)
+        return n->if_stmt.else_body &&
+               orelse_block_diverges(n->if_stmt.then_body) &&
+               orelse_block_diverges(n->if_stmt.else_body);
+    if (n->kind == NODE_EXPR_STMT && n->expr_stmt.expr &&
+        n->expr_stmt.expr->kind == NODE_ORELSE)
+        return n->expr_stmt.expr->orelse.fallback_is_return ||
+               n->expr_stmt.expr->orelse.fallback_is_break ||
+               n->expr_stmt.expr->orelse.fallback_is_continue;
+    return false;
 }
 
 /* Check if an if-body guarantees early exit (return/break/continue) */

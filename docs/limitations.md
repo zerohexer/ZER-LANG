@@ -547,7 +547,16 @@ BUG-B superset + c4c09l #3/#6).
   `is_volatile` IR-local flag (ir.h), set in ir_lower.c, emit the qualifier in emitter.c. Test
   `tests/zer/volatile_scalar_local.zer`. **In-main: NOT present** — `is_volatile` absent from ir.h.
 
-### E. Checker miscompiles (2)
+### E. Checker miscompiles (2) — ✅ BOTH DONE (landed 2026-07-19, make check 1009/0)
+**✅ #20/#21 DONE:** #20 LIT-1 — `retype_const_int_to_target` retypes a PURE integer-literal expr to
+the destination integer width (`is_pure_int_literal_expr` / `int_retype_target`) at var-decl init,
+return, call-arg, struct designated-init field, AND binary-operand promotion, so `i64 a=-3` /
+`u64=1<<40` compute in the target width (test `tests/zer/const_int_target_width.zer`). #21 orelse-block
+— a non-diverging `orelse { block }` in value position now types `void` (via `orelse_block_diverges`,
+an if-chain outside the -Wswitch audit) so the existing "cannot initialize with void" check rejects it,
+while a diverging block keeps the unwrapped type and a bare-statement `f() orelse {…}` stays legal
+(tests `tests/zer/orelse_block_diverge.zer` + `tests/zer_fail/orelse_block_value_nondiverge.zer`).
+Checker-miscompile class E COMPLETE.
 - **#20 — negative / u32-overflowing integer literal into a 64-bit type computed in u32** (`0h7oz9`
   `65fea9a9` LIT-1). `i64 a=-3` = 4294967293; `u64 x=100000*100000` wraps at 2^32; `u64 s=1<<40` truncated.
   Literals lowered in u32/u64 by value width; the assignment path already const-folds to the target width,

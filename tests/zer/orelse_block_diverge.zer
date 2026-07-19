@@ -1,0 +1,21 @@
+// A diverging `orelse { block }` (return/break/continue/goto on every path) may
+// be used in value position — its None path never reaches the value consumer.
+// Regression for the fix that types a FALL-THROUGH orelse block `void`.
+bool cond;
+?u32 maybe(bool b) { if (b) { return 5; } return; }
+u32 main() {
+    // diverging via return
+    u32 a = maybe(true) orelse { return 100; };
+    if (a != 5) { return 1; }
+    // diverging via goto
+    u32 c = maybe(true) orelse { goto err; };
+    if (c != 5) { return 2; }
+    // diverging via nested if (both arms return)
+    u32 d = maybe(true) orelse { if (cond) { return 3; } else { return 4; } };
+    if (d != 5) { return 5; }
+    // bare-statement non-diverging block is legal (value discarded)
+    maybe(false) orelse { cond = true; };
+    return 0;
+err:
+    return 9;
+}

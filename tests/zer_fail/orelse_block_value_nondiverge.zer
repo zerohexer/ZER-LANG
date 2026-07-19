@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// A non-diverging `orelse { block }` cannot supply a value on the None path
+// (ZER blocks are not expressions). Using it in value position must be rejected,
+// not silently yield 0. Fixed 2026-07-14.
+u32 g;
+?u32 maybe(bool b) { if (b) { return 5; } return; }
+u32 main() {
+    u32 x = maybe(false) orelse { g = 100; };
+    return x;
+}

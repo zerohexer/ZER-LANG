@@ -1,0 +1,36 @@
+// #14 (B): a fixed array placed into a plain-slice ([*]T) or optional-slice
+// (?[*]T) STRUCT FIELD must be coerced to a {ptr,len} slice literal. Before the
+// fix the bare array brace-flattened into .ptr/.len (leaving .len=0, a false OOB
+// trap) or, for an optional-slice field, swallowed has_value into .value.len
+// (a PRESENT optional silently built EMPTY). Covers the var-decl struct-init
+// (IR_STRUCT_INIT_DECOMP) and assignment forms, both field kinds. Exit 0.
+struct Buf { [*]u8 data; u32 n; }
+struct W { ?[*]u8 maybe; }
+
+u32 main() {
+    u8[5] a;
+    a[0]=1; a[1]=2; a[2]=3; a[3]=4; a[4]=5;
+
+    // plain-slice field via struct-init (var-decl → IR_STRUCT_INIT_DECOMP)
+    Buf b = { .data = a, .n = 5 };
+    if (b.data.len != 5) { return 1; }
+
+    // optional-slice field via struct-init (var-decl) — must be PRESENT + len 5
+    W w = { .maybe = a };
+    if (w.maybe) |v| {
+        if (v.len != 5) { return 2; }
+    } else {
+        return 3;  // built empty => the miscompile
+    }
+
+    // assignment form (compound literal)
+    W w2;
+    w2 = { .maybe = a };
+    if (w2.maybe) |v| {
+        if (v.len != 5) { return 4; }
+    } else {
+        return 5;
+    }
+
+    return 0;
+}

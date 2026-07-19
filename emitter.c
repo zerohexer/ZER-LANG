@@ -11704,14 +11704,43 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *vt = (vloc < func->local_count) ? func->locals[vloc].type : NULL;
                     Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
                                                          fname_len, vt);
+                    Type *vte = vt ? type_unwrap_distinct(vt) : NULL;
                     if (wt) {
                         emit(e, "(");
                         emit_type(e, wt);
                         emit(e, "){ ");
-                        emit_local_name(e, func, vloc);
+                        /* #14 (B): coerce array→slice INSIDE a `?[*]T` field wrap —
+                         * a bare array flattens into .value.ptr/.len (zeroing .len
+                         * and .has_value). Build the {ptr,len} slice from the local
+                         * name + array size (the var-decl struct-init DECOMP path). */
+                        Type *wt_eff = type_unwrap_distinct(wt);
+                        Type *wi = (type_dispatch_kind(wt_eff) == TYPE_OPTIONAL && wt_eff->optional.inner)
+                                   ? type_unwrap_distinct(wt_eff->optional.inner) : NULL;
+                        if (wi && type_dispatch_kind(wi) == TYPE_SLICE &&
+                            vte && type_dispatch_kind(vte) == TYPE_ARRAY) {
+                            emit(e, "(");
+                            emit_type(e, wi);
+                            emit(e, "){ ");
+                            emit_local_name(e, func, vloc);
+                            emit(e, ", %u }", (unsigned)vte->array.size);
+                        } else {
+                            emit_local_name(e, func, vloc);
+                        }
                         emit(e, ", 1 }");
                     } else {
-                        emit_local_name(e, func, vloc);
+                        /* #14 (B): bare array into a plain [*]T field → coerce to a
+                         * {ptr,len} slice literal (else it brace-flattens, .len=0). */
+                        Type *ftype = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                        Type *slice_tgt = aggregate_slice_coerce_target(ftype, vt);
+                        if (slice_tgt && vte && type_dispatch_kind(vte) == TYPE_ARRAY) {
+                            emit(e, "(");
+                            emit_type(e, slice_tgt);
+                            emit(e, "){ ");
+                            emit_local_name(e, func, vloc);
+                            emit(e, ", %u }", (unsigned)vte->array.size);
+                        } else {
+                            emit_local_name(e, func, vloc);
+                        }
                     }
                 } else {
                     emit(e, "0"); /* fallback */

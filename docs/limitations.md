@@ -507,12 +507,14 @@ AST/IR struct-init + IR var-decl `need_wrap` + IR assign-expression opt-wrap + *
 the **#16 array→`?[*]T` return** branch (was falling through to a bare `return;` → caller saw None) — all
 audit-clean via `type_dispatch_kind` (no baseline coupling). Verified: `optional_slice_coerce.zer`
 (var-decl / assignment / call-arg / param-slice-return, exit 0) + `optional_slice_return_global.zer`
-(global-array `?[*]T` return, exit 0). **⏳ RESIDUAL — one #14 sub-case:** the VAR-DECL struct-init
-field form (`W w = { .maybe = a };` / `Buf b = { .data = a };`) still emits the bare array — the
-*assignment* form (`w2 = { .maybe = a };`) coerces correctly, but in the var-decl struct-init path
-`checker_get_type(fval)` returns NULL (the field-value node's type isn't in the typemap there), so the
-`vte == ARRAY` guard can't fire. Fix needs the struct-init field-value types populated in the var-decl
-context (or a type source that doesn't depend on the node typemap). Low severity (silent `.len`).
+(global-array `?[*]T` return, exit 0). **✅ #14 struct-init field COMPLETE (landed 2026-07-20, make
+check 1012/0):** the missing site was the **IR_STRUCT_INIT_DECOMP** emitter (the var-decl struct-init
+`Buf b = { .data = a }` / `W w = { .maybe = a }` path — distinct from the emit_rewritten_node
+NODE_STRUCT_INIT path used by the assignment form). The DECOMP emitter has the field-value type
+directly as `func->locals[vloc].type` (no node-typemap dependency), so the coercion builds the
+`{ptr,len}` slice from the local name + `array.size` in both the optional-field-wrap and plain-slice-
+field branches. Test `tests/zer/optional_slice_struct_field.zer` (var-decl + assignment, both field
+kinds, exit 0). **The `?[*]T`/array→slice coercion class (#14/#15/#16) is now fully closed.**
   **Prior investigation 2026-07-19 (first attempt reverted — do NOT half-apply):** this is a **7-site emitter
   patchwork** — `emit_opt_wrap_value` coercion + two helpers (`struct_field_type_by_name`,
   `aggregate_slice_coerce_target`) + AST struct-init + IR struct-init (both wrap/non-wrap branches) +

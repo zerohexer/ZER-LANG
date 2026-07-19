@@ -1,0 +1,20 @@
+// Audit 2026-07-16: single-pass VRP ignores goto control flow — a range
+// narrowed at a label the goto SKIPS (`goto skip; narrow: idx=wild%4; skip:
+// arr[idx]`) leaked to the post-label use, proving arr[idx] safe against the
+// bypassed [0,3] narrowing while idx is actually wild%256 → the bounds check
+// was elided → silent OOB (ASan-confirmed). Also covers a backward goto loop.
+// Fix: widen all VRP ranges at every label (sound join over incoming edges).
+// Expected: SIGTRAP "array index out of bounds" at runtime.
+u32 f(u32 wild) {
+    [*]u32 arr = alloc(u32, 4) orelse { return 0; };
+    u32 idx = wild % 256;
+    goto skip;
+narrow:
+    idx = wild % 4;
+skip:
+    arr[idx] = 7;
+    u32 v = arr[idx];
+    free(arr);
+    return v;
+}
+u32 main() { return f(100); }

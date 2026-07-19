@@ -11395,6 +11395,15 @@ static void check_stmt(Checker *c, Node *node) {
 
         /* Value range propagation: for (i = 0; i < N; ...) → i in [0, N-1] */
         int saved_range_count = c->var_range_count;
+        /* VRP#4 (2026-07-16): the for body was checked under any outer init-range
+         * for NON-loop vars it writes. `check_expr(step)` re-invalidates only the
+         * LOOP var (`i`), never a different var incremented inside the body:
+         * `u32 j = 0; for (i..) { arr[j]=..; j+=1; }` saw `j` as still [0,0] →
+         * falsely proved arr[j] safe → dropped the guard (silent stack OOB,
+         * ASan-confirmed). Mirror the while/do-while pre-pass: widen every
+         * body-written var BEFORE checking, then re-push the narrow loop-var range
+         * below so the counter keeps its proven [init, bound-1]. */
+        vrp_invalidate_loop_body_writes(c, node->for_stmt.body);
         if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY) {
             Node *fc = node->for_stmt.cond;
             TokenType fop = fc->binary.op;
@@ -11463,7 +11472,15 @@ static void check_stmt(Checker *c, Node *node) {
         int saved_range_count = c->var_range_count;
         vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
 
-        if (node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY) {
+        /* BUG-D (2026-07-16): the cond-derived narrowing below is SOUND for
+         * `while` (condition checked BEFORE the body) but UNSOUND for `do-while`
+         * (the body runs FIRST, so the loop var is unconstrained on the first
+         * pass). `u32 i = seed(); do { s += buf[i]; i += 1; } while (i < 4);` with
+         * an unprovable entry i=10 wrongly proved buf[i] in [0,3] → elided guard →
+         * silent stack OOB (read AND write). For do-while leave the loop var at the
+         * widened full range so the emitter inserts the runtime guard. */
+        if (node->kind != NODE_DO_WHILE &&
+            node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY) {
             Node *wc = node->while_stmt.cond;
             TokenType wop = wc->binary.op;
             if (wc->binary.left->kind == NODE_IDENT) {
@@ -11540,8 +11557,21 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* VRP branch-merge for switch arms (VRP#3, sibling of the if-handler §C#13
+         * fix): an assignment inside one arm mutates a variable's VarRange IN PLACE
+         * (vrp_invalidate_for_assign). Without a per-arm snapshot/restore/join the
+         * narrowed range leaked past the switch join, so a later `arr[idx]` was
+         * proven safe and its bounds guard elided — ASan-confirmed stack OOB on the
+         * un-narrowed (default/other) path. Mirror NODE_IF: snapshot the pre-switch
+         * VALUES, restore before each arm so arms don't see each other's narrowing,
+         * accumulate the UNION of every arm's outcome (seeded with the pre-switch
+         * state so the no-match fall-through path is included). */
+        int sw_saved = c->var_range_count;
+        struct VarRange *sw_pre = vrp_snap_take(c, sw_saved);
+        struct VarRange *sw_acc = vrp_snap_take(c, sw_saved);
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *arm = &node->switch_stmt.arms[i];
+            vrp_snap_restore(c, sw_pre, sw_saved); /* each arm starts from pre-switch */
 
             /* check match values — skip for enum/union dot syntax (.variant) */
             if (!arm->is_enum_dot) {
@@ -11763,7 +11793,18 @@ static void check_stmt(Checker *c, Node *node) {
             } else {
                 check_stmt(c, arm->body);
             }
+            /* drop arm-local ranges, then union this arm's outcome into the
+             * accumulator (acc = acc ⊔ this-arm; sw_acc holds the union so far). */
+            c->var_range_count = sw_saved;
+            vrp_snap_join(c, sw_acc, sw_saved);
+            free(sw_acc);
+            sw_acc = vrp_snap_take(c, sw_saved);
         }
+        /* post-switch VRP state = union of all arm outcomes + fall-through. */
+        vrp_snap_restore(c, sw_acc, sw_saved);
+        c->var_range_count = sw_saved;
+        free(sw_pre);
+        free(sw_acc);
 
         /* exhaustiveness check — unwrap distinct for type dispatch */
         {
@@ -12439,7 +12480,22 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_LABEL:
-        /* labels are just markers — no type checking needed */
+        /* labels are just markers — no type checking needed. BUT a `goto` can
+         * jump to this label carrying ANY value, so a value-range narrowed on the
+         * fall-through path ABOVE the label does not hold at the label (the goto
+         * bypasses the narrowing). Single-pass VRP cannot collect the goto-source
+         * states, so widen every tracked range here — the sound over-approximation
+         * of the join over all incoming edges. Without this
+         * `idx = wild%256; goto skip; narrow: idx = wild%4; skip: arr[idx]` proved
+         * arr[idx] against the bypassed [0,3] narrowing → elided bounds check →
+         * silent stack OOB (VRP#5, ASan-confirmed). Also covers a backward goto
+         * loop. Labels exist only as goto targets, so the precision cost is
+         * confined to goto code. */
+        for (int vi = 0; vi < c->var_range_count; vi++) {
+            c->var_ranges[vi].min_val = INT64_MIN;
+            c->var_ranges[vi].max_val = INT64_MAX;
+            c->var_ranges[vi].known_nonzero = false;
+        }
         break;
 
     case NODE_CONTINUE:

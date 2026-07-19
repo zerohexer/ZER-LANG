@@ -360,7 +360,10 @@ Coverage was audit-found, not proof-found. The durable end-states are the class-
   & likely moot (by-value arrays coerce to slices at the call site). Core closed; ARRAY extension is
   low-value.
 
-### A. VRP range-JOIN class → silent OOB (4 open siblings; NODE_IF already closed via §C #13)
+### A. VRP range-JOIN class → silent OOB — ✅ ALL 4 DONE (landed 2026-07-19, make check 990/0)
+**✅ DONE 2026-07-19:** all four siblings (#1 switch, #2 for-body, #3 goto/label, #4 do-while)
+applied to `checker.c` + regression tests (3 in `tests/zer_trap/` compile-clean + TRAP=133, the
+do-while positive in `tests/zer/`). make check 990/0, all audits + sink matrix clean.
 The branch-merge JOIN is re-implemented per node-kind. Main has NODE_IF (§C #13) + while/do-while
 body-writes (`vrp_invalidate_loop_body_writes`, BUG-748). These four kinds still leak a narrowed range
 past the join → a later `arr[idx]` proven in-bounds on a path where idx is wild → bounds guard elided →

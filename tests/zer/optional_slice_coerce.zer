@@ -1,0 +1,21 @@
+// Coercing an array into an optional slice `?[*]T` must build the {ptr,len}
+// slice — a bare array decays to ptr-only, silently zeroing .len. Verified at
+// var-decl init, assignment, call-arg, and (param-derived) return. Fixed 2026-07-14.
+u32 take(?[*]u8 s) { if (s) |v| { return (u32)v.len; } return 0; }
+?[*]u8 pick(bool b, [*]u8 s) { if (b) { return s; } return; }
+u32 main() {
+    u8[5] buf;
+    // var-decl init
+    ?[*]u8 a = buf;
+    if (take(a) != 5) { return 1; }
+    // assignment
+    ?[*]u8 b;
+    b = buf;
+    if (take(b) != 5) { return 2; }
+    // call-arg direct
+    if (take(buf) != 5) { return 3; }
+    // return (param-derived slice, not a local) round-trips length
+    ?[*]u8 r = pick(true, buf);
+    if (take(r) != 5) { return 4; }
+    return 0;
+}

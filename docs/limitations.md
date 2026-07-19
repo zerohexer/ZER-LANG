@@ -500,9 +500,20 @@ paths); #17 `@bitcast(uN/iN)` now masks/sign-extends the punned carrier via `emi
 (both paths); #18 variable-index bit-extract now guards the POSITION shift on `type_width` (both
 paths); #19 `volatile` scalar/aggregate locals now emit the qualifier (new `IRLocal.is_volatile`,
 set in ir_lower, emitted in emit_regular_func_from_ir). 4 positive tests in `tests/zer/` compile +
-run exit 0. **⏳ #14/#15/#16 STILL OPEN** (the `?[*]T`/array→slice aggregate coercion class — fxvnsu
-BUG-B superset + c4c09l #3/#6).
-  **Investigation 2026-07-19 (attempt reverted — do NOT half-apply):** this is a **7-site emitter
+run exit 0. **✅ #15/#16 DONE + #14 mostly done (landed 2026-07-19, make check 1011/0, all audits +
+sink 41 CLEAN):** the array→optional-slice coercion is now applied at every value-flow site —
+`emit_opt_wrap_value` + two helpers (`struct_field_type_by_name`, `aggregate_slice_coerce_target`) +
+AST/IR struct-init + IR var-decl `need_wrap` + IR assign-expression opt-wrap + **call-arg** opt-wrap +
+the **#16 array→`?[*]T` return** branch (was falling through to a bare `return;` → caller saw None) — all
+audit-clean via `type_dispatch_kind` (no baseline coupling). Verified: `optional_slice_coerce.zer`
+(var-decl / assignment / call-arg / param-slice-return, exit 0) + `optional_slice_return_global.zer`
+(global-array `?[*]T` return, exit 0). **⏳ RESIDUAL — one #14 sub-case:** the VAR-DECL struct-init
+field form (`W w = { .maybe = a };` / `Buf b = { .data = a };`) still emits the bare array — the
+*assignment* form (`w2 = { .maybe = a };`) coerces correctly, but in the var-decl struct-init path
+`checker_get_type(fval)` returns NULL (the field-value node's type isn't in the typemap there), so the
+`vte == ARRAY` guard can't fire. Fix needs the struct-init field-value types populated in the var-decl
+context (or a type source that doesn't depend on the node typemap). Low severity (silent `.len`).
+  **Prior investigation 2026-07-19 (first attempt reverted — do NOT half-apply):** this is a **7-site emitter
   patchwork** — `emit_opt_wrap_value` coercion + two helpers (`struct_field_type_by_name`,
   `aggregate_slice_coerce_target`) + AST struct-init + IR struct-init (both wrap/non-wrap branches) +
   IR var-decl `need_wrap` + IR **assign** `need_wrap` + IR **return** `need_wrap` (the `emit_local_name`

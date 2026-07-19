@@ -449,6 +449,12 @@ ASan-confirmed `stack-use-after-return`/`stack-buffer-overflow` on the branches.
   line ~5006 gates on `type_unwrap_distinct(target)->kind == TYPE_SLICE` (unwraps distinct, NOT optional).
 
 ### C. Concurrency / ISR (3)
+**✅ #10 DONE (landed 2026-07-19, make check 1002/0):** the B1 extra-lock emitter now CAPTURES the
+locked roots into a caller array and the paired unlock REPLAYS exactly that set (reverse order)
+instead of re-deriving — balanced across the destructive orelse rewrite — so the `!find_orelse` gate
+is removed and `x = ga.maybe orelse gb.plain` locks gb too. Regression
+`tests/zer/conc_orelse_multiroot_lock.zer`; the two `[16]` scratch arrays baselined. **⏳ #11/#12 STILL
+OPEN** (ea8264f5 SPAWN-FP + ISR-TRANS).
 - **#10 — same-type two-instance shared read in an `orelse` under-locked → data race** (`yd5ajq`
   `c6b72dc0`, TSan-confirmed). `x = ga.maybe orelse gb.plain` where `ga`,`gb` are two instances of the
   SAME `shared struct S` locked only `ga` → `gb.plain` read unlocked. Two gaps: (1) the same-statement
@@ -550,7 +556,12 @@ BUG-B superset + c4c09l #3/#6).
   legal. Tests `tests/zer/orelse_block_diverge.zer` + `tests/zer_fail/orelse_block_value_nondiverge.zer`.
   **In-main: NOT present** — `orelse_block_diverges` = 0 hits.
 
-### F. Analyzer heap-UAF (1 — a crash / stale safety decision in zercheck itself)
+### F. Analyzer heap-UAF (1 — a crash / stale safety decision in zercheck itself) — ✅ DONE (2026-07-19)
+**✅ #22 DONE (make check 1002/0):** the IR_ASSIGN non-move alias branch's invalid-use check is now
+`else if` (mutually exclusive with the ALIVE-add branch that reallocs `ps->handles`), so the
+dangling `src_h` is never re-read. Regression `tests/zer/handle_alias_realloc_uaf.zer` (10 straight-line
+?Handle/orelse alias pairs to cross the capacity-8 realloc; compiles + runs exit 0 — the true guard is
+an ASan build).
 - **#22 — heap-use-after-free reading `src_h` after `ir_add_handle` realloc** (`0h7oz9` `12684dc4`). The
   non-move alias branch of `ir_check_inst` (IR_ASSIGN) captured `src_h` as a raw pointer into `ps->handles`,
   then called `ir_add_handle(dest_local)` which can realloc that array; the subsequent invalid-handle check

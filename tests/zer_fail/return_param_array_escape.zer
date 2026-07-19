@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// The relaxation (returning a u8[N] array PARAM as a slice) is sound ONLY because
+// the CALL SITE rejects a caller that passes a LOCAL array and lets the resulting
+// view escape to a global — that dangles when the caller's frame dies. This is the
+// accept-unsafe guard: classify_return_root records first()'s return as a view of
+// param 0, so g = first(local) must be rejected as a local-derived escape.
+?[*]u8 g;
+?[*]u8 first(u8[4] a) { return a; }
+void f() {
+    u8[4] x;
+    x[0] = 1;
+    g = first(x);   // view of local x laundered into a global → dangling
+}
+u32 main() { f(); return 0; }

@@ -515,6 +515,19 @@ directly as `func->locals[vloc].type` (no node-typemap dependency), so the coerc
 `{ptr,len}` slice from the local name + `array.size` in both the optional-field-wrap and plain-slice-
 field branches. Test `tests/zer/optional_slice_struct_field.zer` (var-decl + assignment, both field
 kinds, exit 0). **The `?[*]T`/array→slice coercion class (#14/#15/#16) is now fully closed.**
+  **✅ BONUS — param-array-return relaxation SHIPPED (2026-07-20, make check 1014/0, sink matrix 44
+  CLEAN):** returning a `u8[N]` array PARAM as a slice (`[*]u8 f(u8[N] a){ return a; }` / `?[*]u8`) is
+  now ACCEPTED — array params are by-reference (they decay to a pointer into the CALLER's array,
+  empirically verified), so the returned slice views caller memory, sound exactly like the BUG-764
+  slice/pointer-param view class. The return-escape check (checker.c ~12287) now skips its error when
+  the root ident is a param; the emitter (src1_local return path, both the `?[*]T`-wrap and plain
+  `[*]T` branches) builds the `{ptr,len}` slice from the local name + `array.size`. **Accept-unsafe
+  VERIFIED SAFE:** `classify_return_root` already records the param index in `ret_param_mask`, so the
+  CALL SITE rejects a caller that passes a LOCAL and lets the result escape (`g = f(local)` ->
+  "local-derived pointer argument ... may escape"). Tests `tests/zer/return_param_array_ok.zer` (local
+  use, exit 0) + `tests/zer_fail/return_param_array_escape.zer` (escape rejected) + sink-matrix cells
+  p13 (reject escape) + safe_return_param_arr_{opt,slice} (accept). A LOCAL array return still dangles
+  -> still rejected.
   **Prior investigation 2026-07-19 (first attempt reverted — do NOT half-apply):** this is a **7-site emitter
   patchwork** — `emit_opt_wrap_value` coercion + two helpers (`struct_field_type_by_name`,
   `aggregate_slice_coerce_target`) + AST struct-init + IR struct-init (both wrap/non-wrap branches) +

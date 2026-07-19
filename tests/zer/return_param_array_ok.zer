@@ -1,0 +1,23 @@
+// RELAXATION (2026-07-20): returning a u8[N] array PARAM as a slice is sound —
+// the param is passed BY-REFERENCE (decays to a pointer into the CALLER's array),
+// so the returned slice views caller memory, exactly the BUG-764 param-view class.
+// Used locally (result does not escape the caller's frame) → OK. Must exit 0.
+?[*]u8 first(u8[4] a) { return a; }
+[*]u8 firstp(u8[4] a) { return a; }        // non-optional form too
+
+u32 main() {
+    u8[4] x;
+    x[0]=1; x[1]=2; x[2]=3; x[3]=4;
+
+    ?[*]u8 r = first(x);
+    if (r) |v| {
+        if (v.len != 4) { return 1; }
+    } else {
+        return 2;
+    }
+
+    [*]u8 s = firstp(x);
+    if (s.len != 4) { return 3; }
+
+    return 0;
+}

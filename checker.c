@@ -12284,7 +12284,28 @@ static void check_stmt(Checker *c, Node *node) {
                     uint32_t vlen = (uint32_t)root->ident.name_len;
                     Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
                     bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-                    if (sym && !sym->is_static && !is_global) {
+                    /* RELAXATION (2026-07-20, BUG-764 class): a `u8[N]` array PARAM
+                     * is passed BY-REFERENCE (it decays to a pointer into the
+                     * CALLER's array — empirically verified: mutating the param is
+                     * visible to the caller), so returning it as a slice is a view
+                     * of caller memory, sound exactly like returning a sub-slice of
+                     * a slice/pointer param. classify_return_root already records the
+                     * param index in ret_param_mask, so the CALL SITE
+                     * (call_result_escapes) rejects a caller that passes a LOCAL and
+                     * lets the result escape (verified by return_param_array_escape).
+                     * Only a LOCAL array return still dangles → still rejected. */
+                    bool root_is_param = false;
+                    if (c->current_func_node) {
+                        Node *fn = c->current_func_node;
+                        for (int pi = 0; pi < fn->func_decl.param_count; pi++) {
+                            if (fn->func_decl.params[pi].name_len == vlen &&
+                                memcmp(fn->func_decl.params[pi].name, vname,
+                                       (size_t)vlen) == 0) {
+                                root_is_param = true; break;
+                            }
+                        }
+                    }
+                    if (sym && !sym->is_static && !is_global && !root_is_param) {
                         checker_error(c, node->loc.line,
                             "cannot return local array as slice — "
                             "pointer will dangle after function returns");

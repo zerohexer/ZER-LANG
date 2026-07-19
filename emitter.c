@@ -10354,7 +10354,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return (");
                     emit_type(e, ret_eff);
                     emit(e, "){ ");
-                    emit_local_name(e, func, inst->src1_local);
+                    /* #16b (relaxation 2026-07-20): an array LOCAL (a by-reference
+                     * u8[N] param) returned as ?[*]T → build the {ptr,len} slice
+                     * INSIDE the optional (else the decayed pointer is stored bare
+                     * into .value and GCC rejects the type). */
+                    Type *ri = ret_eff->optional.inner
+                        ? type_unwrap_distinct(ret_eff->optional.inner) : NULL;
+                    if (src_eff && type_dispatch_kind(src_eff) == TYPE_ARRAY &&
+                        ri && type_dispatch_kind(ri) == TYPE_SLICE) {
+                        emit(e, "(");
+                        emit_type(e, ri);
+                        emit(e, "){ ");
+                        emit_local_name(e, func, inst->src1_local);
+                        emit(e, ", %u }", (unsigned)src_eff->array.size);
+                    } else {
+                        emit_local_name(e, func, inst->src1_local);
+                    }
                     emit(e, ", 1 };\n");
                 }
             } else if (need_unwrap) {
@@ -10363,7 +10378,19 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ".value;\n");
             } else {
                 emit(e, "return ");
-                emit_local_name(e, func, inst->src1_local);
+                /* #16b (relaxation 2026-07-20): an array LOCAL (a by-reference
+                 * u8[N] param) returned as [*]T → build the {ptr,len} slice (else
+                 * the decayed pointer is returned bare, GCC type mismatch). */
+                if (src_eff && type_dispatch_kind(src_eff) == TYPE_ARRAY &&
+                    ret_eff && type_dispatch_kind(ret_eff) == TYPE_SLICE) {
+                    emit(e, "(");
+                    emit_type(e, ret_eff);
+                    emit(e, "){ ");
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, ", %u }", (unsigned)src_eff->array.size);
+                } else {
+                    emit_local_name(e, func, inst->src1_local);
+                }
                 emit(e, ";\n");
             }
         } else {

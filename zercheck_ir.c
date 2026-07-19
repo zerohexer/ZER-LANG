@@ -3814,9 +3814,19 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 ir_apply_alias(dst_h, &snap);
                                 dst_h->state = IR_HS_ALIVE;
                             }
+                            /* #22 HEAP-UAF FIX: ir_add_handle above may realloc
+                             * ps->handles, so src_h now DANGLES — do NOT read it
+                             * again below. This branch already established src is
+                             * ALIVE, and ALIVE is never invalid, so the invalid-use
+                             * check is mutually exclusive with it (else-if). Reading
+                             * the stale src_h in the old unconditional `if` was a
+                             * heap-use-after-free (ASan crash on valid input; a stale
+                             * safety decision on the shipped build, where the freed
+                             * region is still mapped). */
                         }
-                        /* Check use of invalid handle */
-                        if (src_h && ir_is_invalid(src_h)) {
+                        /* Check use of invalid handle — only reachable when the
+                         * alive-add branch did NOT run, so src_h is still valid. */
+                        else if (src_h && ir_is_invalid(src_h)) {
                             ir_zc_error(zc, inst->source_line,
                                 "use of %s handle %%%d",
                                 ir_state_name(src_h->state), src_local);

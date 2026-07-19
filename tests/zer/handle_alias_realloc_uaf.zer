@@ -1,0 +1,31 @@
+// #22 (analyzer heap-UAF regression): the IR_ASSIGN non-move alias branch in
+// zercheck captured src_h as a raw pointer into ps->handles, then called
+// ir_add_handle (which reallocs that array when handle_count crosses capacity 8)
+// and re-read the now-dangling src_h — a heap-use-after-free in the analyzer
+// (ASan crash on this valid input; a stale safety decision on the shipped -O2
+// build where the freed region is still mapped). Fixed by making the invalid-use
+// check an `else if` (ALIVE is never invalid → mutually exclusive with the add).
+// This exercises many ?Handle/orelse alias pairs to cross the capacity-8 realloc.
+// Must compile + run + exit 0.
+struct Item { u32 v; }
+Slab(Item) g_pool;
+
+u32 main() {
+    ?Handle(Item) m0 = g_pool.alloc(); Handle(Item) h0 = m0 orelse { return 1; };
+    ?Handle(Item) m1 = g_pool.alloc(); Handle(Item) h1 = m1 orelse { return 1; };
+    ?Handle(Item) m2 = g_pool.alloc(); Handle(Item) h2 = m2 orelse { return 1; };
+    ?Handle(Item) m3 = g_pool.alloc(); Handle(Item) h3 = m3 orelse { return 1; };
+    ?Handle(Item) m4 = g_pool.alloc(); Handle(Item) h4 = m4 orelse { return 1; };
+    ?Handle(Item) m5 = g_pool.alloc(); Handle(Item) h5 = m5 orelse { return 1; };
+    ?Handle(Item) m6 = g_pool.alloc(); Handle(Item) h6 = m6 orelse { return 1; };
+    ?Handle(Item) m7 = g_pool.alloc(); Handle(Item) h7 = m7 orelse { return 1; };
+    ?Handle(Item) m8 = g_pool.alloc(); Handle(Item) h8 = m8 orelse { return 1; };
+    ?Handle(Item) m9 = g_pool.alloc(); Handle(Item) h9 = m9 orelse { return 1; };
+
+    h0.v = 0; h1.v = 1; h2.v = 2; h3.v = 3; h4.v = 4;
+    h5.v = 5; h6.v = 6; h7.v = 7; h8.v = 8; h9.v = 9;
+
+    g_pool.free(h0); g_pool.free(h1); g_pool.free(h2); g_pool.free(h3); g_pool.free(h4);
+    g_pool.free(h5); g_pool.free(h6); g_pool.free(h7); g_pool.free(h8); g_pool.free(h9);
+    return 0;
+}

@@ -677,6 +677,35 @@ conveniently have, and it matches how certification actually works (per-artifact
 > the in-prover reference, and **eliminable per-artifact** by kernel-computed
 > certification of the final build.
 
+### 9.5 The performance dimension — Lean's runtime speed touches only chain 2
+
+The two-chain split governs *performance* exactly as it governs trust, and a reviewer's
+"isn't Lean slow?" objection dissolves the same way. Lean's managed runtime (Perceus RC,
+boxed `Nat`/`Int`/`Array`) carries a real, problem-dependent constant-factor tax over
+hand-tuned C — measured 2026-07-20 (KernelQ, a Li-Chao-tree program at n=2·10⁵): compiled
+Lean (`leanc -O3`) ran **~13×** slower than the equivalent hand C with scalar (`Int64`)
+types, **~45×** when it leaned on arbitrary-precision `Int` (the boxing). The constant is
+real. But it lands **entirely on chain 2 and never on chain 1**:
+
+- **Chain 2 (the `zerc` binary):** `zerc` IS a compiled-Lean program, so it runs on the
+  Lean runtime and pays the constant — as **compile time** (how long `zerc` takes to
+  compile a user's program). A slower *compiler*, nothing more.
+- **Chain 1 (the emitted C — the flight artifact):** freestanding C99, compiled by
+  CompCert/GCC, linking **none** of the Lean runtime. It runs at native C speed. Lean's
+  constant factor is *structurally absent* from ZER's output.
+
+So: **Lean's runtime speed bounds how fast ZER *compiles*, never how fast ZER's *output*
+runs.** And the compile-time cost is a non-issue for the target domain — DO-178C / avionics
+buyers optimize output correctness and output speed, not compiler wall-clock; a verified
+compiler that runs slower is the accepted trade (CompCert is not fast either). This is also
+why the constant never motivated self-hosting (§6 Tier C): shaving `zerc`'s own runtime
+buys a speed nobody in this market pays for, at TCB cost. It is the sharper statement of
+§13's "fine for a compiler workload" — the workload's slowness is confined to the one chain
+where slowness does not matter. (Empirical grounding + the emitted-C anatomy behind the
+constant — boxed `Array`, refcount, bounds checks, and why fixed-width types collapse
+45×→13× while a runtime floor remains — is in the KernelQ docs
+`docs/Lean4-context-internal.md` §5.1/§6.5 and `docs/kernelq-pedagogy-goal.md` LS.9.)
+
 ---
 
 ## §10 Backends — dual-backend strategy + verified CompCert facts

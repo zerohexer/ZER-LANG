@@ -479,6 +479,14 @@ ASan-confirmed `stack-use-after-return`/`stack-buffer-overflow` on the branches.
   hits.
 
 ### D. Emitter miscompiles (7; #14 is a class-pair with #15/#16)
+**✅ #13/#17/#18/#19 DONE (landed 2026-07-19, make check 1000/0, all matrices + sink 41 CLEAN):**
+#13 `@saturate(uN)` unsigned odd-width now clamps via `(1ULL<<w)-1` + carrier cast (both emitter
+paths); #17 `@bitcast(uN/iN)` now masks/sign-extends the punned carrier via `emit_intn_mask_lv`
+(both paths); #18 variable-index bit-extract now guards the POSITION shift on `type_width` (both
+paths); #19 `volatile` scalar/aggregate locals now emit the qualifier (new `IRLocal.is_volatile`,
+set in ir_lower, emitted in emit_regular_func_from_ir). 4 positive tests in `tests/zer/` compile +
+run exit 0. **⏳ #14/#15/#16 STILL OPEN** (the `?[*]T`/array→slice aggregate coercion class — fxvnsu
+BUG-B superset + c4c09l #3/#6).
 - **#13 — `@saturate(uN, v)` for a non-native UNSIGNED width never clamps** (`fxvnsu` `9fea9990` BUG-A).
   `@saturate(u7, 200)` returns 200 not 127. The unsigned emit path (BOTH emitter paths) hardcoded the max
   on a `{8,16,32,else→u64}` switch → every odd width fell to the u64 branch (never clamps), result cast to

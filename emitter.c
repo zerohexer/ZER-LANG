@@ -2554,15 +2554,24 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->slice.object);
                     emit(e, " >> %lld) & ((1ull << %lld) - 1))", (long long)low, (long long)width);
                 } else {
-                    /* runtime — single-eval: hoist start/end into temps */
+                    /* runtime — single-eval: hoist start/end into temps.
+                     * #18: the POSITION shift `obj >> _zer_lo` is UB in C when
+                     * _zer_lo >= the operand's bit width (e.g. u64 >> 64). The F8
+                     * fix guarded the extract-width MASK but left the shift
+                     * unguarded — a silent miscompile violating ZER's "shift by
+                     * >= width = 0" guarantee (GCC -O0 vs -O2 diverge; a different
+                     * value again on ARM/RISC-V baremetal). Guard the shift on the
+                     * object's declared bit width so an out-of-range position → 0. */
+                    int objbits = type_width(obj_type);
+                    if (objbits <= 0) objbits = 64;
                     int tmp = e->temp_count++;
                     emit(e, "({ int _zer_hi%d = (int)(", tmp);
                     emit_expr(e, node->slice.start);
                     emit(e, "); int _zer_lo%d = (int)(", tmp);
                     emit_expr(e, node->slice.end);
-                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", tmp, tmp, tmp, ucast);
+                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", tmp, tmp, tmp, tmp, objbits, ucast);
                     emit_expr(e, node->slice.object);
-                    emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                    emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                          tmp, tmp, tmp, tmp);
                 }
             }
@@ -3201,8 +3210,17 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "; ");
                 emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
-                     tmp, tmp, tmp2, tmp, tmp);
+                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                     tmp, tmp, tmp2, tmp);
+                /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
+                 * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
+                 * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
+                 * or sign-extend (iN), the same treatment @truncate applies. */
+                if (type_is_nonnative_intn(t)) {
+                    char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
+                    emit_intn_mask_lv(e, t, lv);
+                }
+                emit(e, "_zer_bco%d; })", tmp);
             } else {
                 emit(e, "0");
             }
@@ -3242,13 +3260,21 @@ static void emit_expr(Emitter *e, Node *node) {
                 /* clamp: min(max(val, TYPE_MIN), TYPE_MAX) */
                 /* for unsigned targets, just clamp to max */
                 if (type_is_unsigned(t)) {
-                    /* unsigned: clamp to [0, max] — check both bounds for signed source */
+                    /* unsigned: clamp to [0, 2^N-1] — check both bounds for signed
+                     * source. #13: compute the max from the target WIDTH so
+                     * non-native uN (u7/u12/u21 …) clamp correctly; the old hardcoded
+                     * {8,16,32,else→64} switch sent every odd width to the u64 branch
+                     * (max 2^64-1) so it never clamped (silent wrong result). */
                     int w = type_width(t);
-                    if (w == 8) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 255 ? 255 : (uint8_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 16) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 65535 ? 65535 : (uint16_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 32) emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 4294967295ULL ? 4294967295U : (uint32_t)_zer_sat%d", tmp, tmp, tmp);
-                    /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
-                    else emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
+                    if (w >= 64) {
+                        /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
+                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
+                    } else {
+                        unsigned long long mx = (1ULL << w) - 1ULL;
+                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > %lluULL ? %lluULL : (", tmp, tmp, mx, mx);
+                        emit_type(e, t);   /* carrier cast (uint8_t for u7 …); clamped value fits */
+                        emit(e, ")_zer_sat%d", tmp);
+                    }
                 } else {
                     /* signed: clamp to [min, max] for target width */
                     int w = type_width(t);
@@ -7183,10 +7209,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                      * unsigned source (no lower clamp) and true for a signed source
                      * (BUG-546). Mirrors the AST path (emitter.c ~3040). */
                     const char *max_cmp, *max_val;
-                    if (w == 8)       { max_cmp = "255";                    max_val = "255"; }
-                    else if (w == 16) { max_cmp = "65535";                  max_val = "65535"; }
-                    else if (w == 32) { max_cmp = "4294967295ULL";          max_val = "4294967295U"; }
-                    else              { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
+                    /* #13: compute the max from the target WIDTH so non-native uN
+                     * (u7/u12/u21 …) clamp to 2^N-1. The old {8,16,32,else→64} switch
+                     * sent every odd width to the u64 branch (never clamped). */
+                    char max_buf[32];
+                    if (w >= 64) { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
+                    else {
+                        unsigned long long mx = (1ULL << w) - 1ULL;
+                        snprintf(max_buf, sizeof max_buf, "%lluULL", mx);
+                        max_cmp = max_buf; max_val = max_buf;
+                    }
                     emit(e, "_zer_sat%d < 0 ? 0 : "
                              "_zer_sat%d > %s ? (%s) : (",
                          tmp, tmp, max_cmp, max_val);
@@ -7205,8 +7237,17 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
                 emit(e, "; ");
                 emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); _zer_bco%d; })",
-                     tmp, tmp, tmp2, tmp, tmp);
+                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                     tmp, tmp, tmp2, tmp);
+                /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
+                 * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
+                 * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
+                 * or sign-extend (iN), the same treatment @truncate applies. */
+                if (type_is_nonnative_intn(t)) {
+                    char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
+                    emit_intn_mask_lv(e, t, lv);
+                }
+                emit(e, "_zer_bco%d; })", tmp);
             }
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
             /* @cast(T, val) → (T)(val) for distinct typedefs */
@@ -9246,14 +9287,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             case TYPE_SEMAPHORE: case TYPE_DISTINCT:
                 break;
             }
+            /* #18: guard the POSITION shift on the object's bit width — `obj >>
+             * _zer_lo` is C UB when _zer_lo >= width (e.g. u64 >> 64). F8 guarded
+             * only the extract-width mask; the unguarded shift was a silent
+             * miscompile (violates "shift by >= width = 0"). Mirrors the AST path. */
+            int objbits = type_width(obj_eff);
+            if (objbits <= 0) objbits = 64;
             int t = e->temp_count++;
             emit(e, "({ int _zer_hi%d = (int)(", t);
             emit_rewritten_node(e, node->slice.start, func);
             emit(e, "); int _zer_lo%d = (int)(", t);
             emit_rewritten_node(e, node->slice.end, func);
-            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; ((%s", t, t, t, ucast);
+            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", t, t, t, t, objbits, ucast);
             emit_rewritten_node(e, node->slice.object, func);
-            emit(e, " >> _zer_lo%d) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+            emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                  t, t, t, t);
             return;
         }
@@ -11710,6 +11757,16 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         if (!l->type) continue;
         emit_indent(e);
         if (l->is_static) emit(e, "static ");
+        /* #19 (VOL-1): a `volatile` scalar/aggregate local carries no volatile in
+         * its Type (only slice/pointer do, propagated by the checker), so emit the
+         * qualifier here. Skip pointer/slice — their volatile is already in the
+         * emitted type (`volatile uint32_t *`); an outer prefix would change meaning
+         * (volatile-pointer vs pointer-to-volatile). */
+        if (l->is_volatile && l->type) {
+            TypeKind vtk = type_dispatch_kind(l->type);
+            if (vtk != TYPE_POINTER && vtk != TYPE_SLICE)
+                emit(e, "volatile ");
+        }
         emit_type_and_name(e, l->type, l->name, l->name_len);
         if (l->is_static && l->static_init) {
             emit(e, " = ");

@@ -1,0 +1,20 @@
+// @bitcast to a non-native uN/iN must mask (uN) / sign-extend (iN) the punned
+// carrier — a memcpy pun otherwise keeps the full carrier's high bits, yielding
+// an invalid uN/iN value (u5 holding 255). Fixed 2026-07-14.
+u32 main() {
+    // i5(-1) bits = 0b11111 -> reinterpret as u5 = 31 (NOT 255)
+    i5 y = -1;
+    u5 u = @bitcast(u5, y);
+    if (u != 31) { return 1; }
+    // inline in return position
+    if ((u32)@bitcast(u5, y) != 31) { return 2; }
+    // iN target: u5(31) bits 0b11111 -> i5 = -1 (sign-extended)
+    u5 v = 31;
+    i5 s = @bitcast(i5, v);
+    if ((i32)s != -1) { return 3; }
+    // native-width bitcast still identity (no mask applied)
+    u32 a = 1084227584;
+    f32 f = @bitcast(f32, a);
+    if ((u32)f != 5) { return 4; }
+    return 0;
+}

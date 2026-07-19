@@ -1,0 +1,20 @@
+// Variable-index bit extraction reg[hi..lo] must guard the POSITION shift on
+// the object's bit width. A runtime lo >= width previously emitted a raw
+// `reg >> lo` — C undefined behavior (u64 >> 64), which GCC folds differently
+// at -O0 vs -O2 and yields yet another value on ARM/RISC-V baremetal, violating
+// ZER's "shift by >= width = 0" guarantee. Now an out-of-range position yields 0.
+u32 main() {
+    volatile u32 lo = 64;
+    volatile u32 hi = 64;
+    u64 v = 0xFFFFFFFFFFFFFFFF;
+    u64 r = v[hi..lo];      // lo == 64 (== width) → must be 0, not UB
+    if (r != 0) { return 1; }
+
+    // in-range extraction still correct: bits [7..4] of 0xF3 == 0xF
+    u32 a = 0xF3;
+    volatile u32 l2 = 4;
+    volatile u32 h2 = 7;
+    u32 got = a[h2..l2];
+    if (got != 15) { return 2; }
+    return 0;
+}

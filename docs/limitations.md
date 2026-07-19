@@ -453,8 +453,17 @@ ASan-confirmed `stack-use-after-return`/`stack-buffer-overflow` on the branches.
 locked roots into a caller array and the paired unlock REPLAYS exactly that set (reverse order)
 instead of re-deriving — balanced across the destructive orelse rewrite — so the `!find_orelse` gate
 is removed and `x = ga.maybe orelse gb.plain` locks gb too. Regression
-`tests/zer/conc_orelse_multiroot_lock.zer`; the two `[16]` scratch arrays baselined. **⏳ #11/#12 STILL
-OPEN** (ea8264f5 SPAWN-FP + ISR-TRANS).
+`tests/zer/conc_orelse_multiroot_lock.zer`; the two `[16]` scratch arrays baselined.
+**✅ #11/#12 DONE (landed 2026-07-19, make check 1006/0):** #11 SPAWN-FP — `scan_unsafe_global_access`
+now descends into a function-name binding (var-decl init / assignment / struct-init field) via
+`scan_funcname_binding`, so a global RMW laundered through a local funcptr (`*() fp = do_inc; fp();`)
+is no longer race-blind (shared file-scope depth budget). #12 ISR-TRANS — new `record_isr_globals`
+walks the `interrupt {}` body and follows direct calls into global-function bodies (depth-guarded),
+recording every global read + compound-assign target, so the "shared ISR/main → must be volatile" +
+"volatile compound RMW → non-atomic" checks are transitive through helpers. Tests
+`tests/zer_fail/{isr_transitive_rmw,isr_transitive_volatile,spawn_funcptr_local_race}.zer` +
+`tests/zer/spawn_funcptr_shared_ok.zer`; `test_modules/hal.zer` updated to the safe pattern (it had
+relied on the hole). **Concurrency/ISR class C COMPLETE.**
 - **#10 — same-type two-instance shared read in an `orelse` under-locked → data race** (`yd5ajq`
   `c6b72dc0`, TSan-confirmed). `x = ga.maybe orelse gb.plain` where `ga`,`gb` are two instances of the
   SAME `shared struct S` locked only `ga` → `gb.plain` read unlocked. Two gaps: (1) the same-statement

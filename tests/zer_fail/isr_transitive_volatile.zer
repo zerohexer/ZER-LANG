@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// ISR-TRANS: the "global accessed from both interrupt and main → must be
+// volatile" check only saw globals lexically inside the interrupt {} body. Here
+// the ISR reaches `flag` through helper(), and main polls it — pre-fix this
+// compiled with `flag` non-volatile, so GCC -O2 hoisted the poll and main
+// looped forever, never observing the ISR write (silent bare-metal hang). The
+// ISR-global tracking is now transitive through callees (like the spawn scan).
+u32 flag;
+void helper() { flag = 1; }
+interrupt USART1 { helper(); }
+u32 main() {
+    while (flag == 0) { }
+    return 0;
+}

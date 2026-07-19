@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// SPAWN-FP: the spawn data-race scanner follows a call transitively only when
+// the callee resolves to a GLOBAL function. A function bound to a LOCAL funcptr
+// variable and then called (`*() fp = do_inc; fp();`) has callee ident `fp`
+// resolving to a local, so the descent was skipped and do_inc's non-shared
+// global RMW raced clean. Fixed by descending into a function-name binding.
+u32 g_counter = 0;
+void do_inc() { g_counter = g_counter + 1; }
+void worker() {
+    *() fp = do_inc;
+    fp();
+}
+u32 main() {
+    ThreadHandle a = spawn worker();
+    a.join();
+    return 0;
+}

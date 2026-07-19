@@ -379,6 +379,7 @@ static int classify_return_root(Checker *c, Node *rexpr);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
+static void record_isr_globals(Checker *c, Node *node, int depth);
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
 static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
@@ -9965,6 +9966,37 @@ static bool has_atomic_or_barrier(Node *node) {
     return false;
 }
 
+/* Shared recursion-depth budget for the transitive spawn-global scan: the
+ * direct-call descent, the function-name-arg descent, and the funcptr-binding
+ * descent (SPAWN-FP) all share ONE counter so mutual re-entry between them can
+ * never blow the stack (they descend into each other's callee bodies). */
+static int _scan_global_depth = 0;
+static bool scan_unsafe_global_access(Checker *c, Node *node,
+                                      const char **out_name, uint32_t *out_len);
+/* SPAWN-FP: if `n` is a function NAME (ident → a global function with a body),
+ * descend into that body. A function bound to a LOCAL funcptr and then called
+ * (`*() fp = do_inc; fp();`), or stored in a funcptr struct field, has callee
+ * ident `fp` resolving to a LOCAL — so the direct-call descent (which only
+ * follows global-function callees) skipped it and the funcptr target's
+ * non-shared global accesses raced clean. Mirrors the BH-18 #8
+ * function-name-as-arg descent; conservative (a bound-but-never-called funcptr
+ * is scanned too — sound, and the remediation is identical). */
+static bool scan_funcname_binding(Checker *c, Node *n,
+                                  const char **out_name, uint32_t *out_len) {
+    if (!n || n->kind != NODE_IDENT) return false;
+    Symbol *fs = scope_lookup(c->global_scope, n->ident.name,
+                              (uint32_t)n->ident.name_len);
+    if (!fs || !fs->is_function || !fs->func_node ||
+        fs->func_node->kind != NODE_FUNC_DECL ||
+        !fs->func_node->func_decl.body) return false;
+    if (_scan_global_depth >= 32) return false;
+    _scan_global_depth++;
+    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
+                                           out_name, out_len);
+    _scan_global_depth--;
+    return found;
+}
+
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
  * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -10025,6 +10057,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_EXPR_STMT:
         return scan_unsafe_global_access(c, node->expr_stmt.expr, out_name, out_len);
     case NODE_VAR_DECL:
+        /* SPAWN-FP: `*() fp = do_inc;` binds a function to a local funcptr;
+         * descend into do_inc so a later `fp()` reaching a non-shared global
+         * is caught (the direct-call scan can't resolve the local callee). */
+        if (scan_funcname_binding(c, node->var_decl.init, out_name, out_len)) return true;
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
         /* Axis A3 (2026-06-21): a COMPOUND assignment (RMW: +=, |=, etc.) on a
@@ -10048,6 +10084,8 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             }
         }
         if (scan_unsafe_global_access(c, node->assign.target, out_name, out_len)) return true;
+        /* SPAWN-FP: `s.fp = do_inc;` binds a function to a funcptr field. */
+        if (scan_funcname_binding(c, node->assign.value, out_name, out_len)) return true;
         return scan_unsafe_global_access(c, node->assign.value, out_name, out_len);
     case NODE_BINARY:
         if (scan_unsafe_global_access(c, node->binary.left, out_name, out_len)) return true;
@@ -10066,10 +10104,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         for (int i = 0; i < node->call.arg_count; i++)
             if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
         {
-            /* Depth limit shared between the direct-call and funcptr-arg
-             * transitive scans below — single counter is critical because
-             * both descend into bodies and could re-enter each other. */
-            static int _scan_depth = 0;
+            /* Depth limit shared between the direct-call, funcptr-arg, and
+             * funcptr-binding transitive scans — single counter is critical
+             * because all descend into bodies and could re-enter each other.
+             * (Hoisted to file scope as _scan_global_depth for SPAWN-FP.) */
             /* Transitive: follow direct function calls into callee body.
              * This catches helper() accessing non-shared globals from spawned context. */
             if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
@@ -10080,11 +10118,11 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                     csym->func_node->func_decl.body) {
                     /* Phase A3 fix: raised from 8 to 32. Real call graphs can easily
                      * exceed 8 levels (handler → validator → parser → helper → ...). */
-                    if (_scan_depth < 32) {
-                        _scan_depth++;
+                    if (_scan_global_depth < 32) {
+                        _scan_global_depth++;
                         bool found = scan_unsafe_global_access(c,
                             csym->func_node->func_decl.body, out_name, out_len);
-                        _scan_depth--;
+                        _scan_global_depth--;
                         if (found) return true;
                     }
                 }
@@ -10111,11 +10149,11 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 if (!asym || !asym->is_function || !asym->func_node ||
                     asym->func_node->kind != NODE_FUNC_DECL ||
                     !asym->func_node->func_decl.body) continue;
-                if (_scan_depth < 32) {
-                    _scan_depth++;
+                if (_scan_global_depth < 32) {
+                    _scan_global_depth++;
                     bool found = scan_unsafe_global_access(c,
                         asym->func_node->func_decl.body, out_name, out_len);
-                    _scan_depth--;
+                    _scan_global_depth--;
                     if (found) return true;
                 }
             }
@@ -10148,9 +10186,12 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         if (scan_unsafe_global_access(c, node->slice.start, out_name, out_len)) return true;
         return scan_unsafe_global_access(c, node->slice.end, out_name, out_len);
     case NODE_STRUCT_INIT:
-        /* wrapper: `P{ .x = g }` reads g in a field initializer */
-        for (int i = 0; i < node->struct_init.field_count; i++)
+        /* wrapper: `P{ .x = g }` reads g in a field initializer.
+         * SPAWN-FP: `Ops{ .cb = do_inc }` binds a function to a funcptr field. */
+        for (int i = 0; i < node->struct_init.field_count; i++) {
+            if (scan_funcname_binding(c, node->struct_init.fields[i].value, out_name, out_len)) return true;
             if (scan_unsafe_global_access(c, node->struct_init.fields[i].value, out_name, out_len)) return true;
+        }
         return false;
     case NODE_DEFER:
         return scan_unsafe_global_access(c, node->defer.body, out_name, out_len);
@@ -15206,6 +15247,12 @@ static void check_func_body(Checker *c, Node *node) {
         c->in_interrupt = true;
         push_scope(c);
         check_stmt(c, node->interrupt.body);
+        /* ISR-TRANS: also record globals reached through helper calls so the
+         * "accessed from both ISR and main → volatile" and "volatile compound
+         * RMW → non-atomic" checks are transitive (check_stmt above only records
+         * the globals lexically inside the ISR body). Runs with in_interrupt
+         * still set so track_isr_global tags them from_isr. */
+        record_isr_globals(c, node->interrupt.body, 0);
         pop_scope(c);
         c->in_interrupt = false;
         c->current_func_ret = NULL;
@@ -15565,6 +15612,134 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
     } else {
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
+    }
+}
+
+/* ISR-TRANS: the ISR global-access safety checks ("accessed from both ISR and
+ * main → must be volatile", "volatile compound RMW → non-atomic") only saw the
+ * globals lexically inside the `interrupt {}` body. If the ISR touched a global
+ * through a HELPER function, neither check fired — a silent bare-metal miscompile
+ * (a non-volatile flag polled in main was hoisted → hang; a torn RMW between ISR
+ * and main lost counts). The spawn data-race scan is transitive; ISR tracking
+ * was not. This recorder walks the interrupt body (run with c->in_interrupt set),
+ * follows direct calls into global-function bodies (depth-guarded), and records
+ * every global read (and compound-assign target) as an ISR access via
+ * track_isr_global. Switch has no default: so a new NodeKind is a build error
+ * (walker-default discipline); the kind coverage mirrors scan_unsafe_global_access
+ * plus @critical/@once bodies. */
+static void record_isr_globals(Checker *c, Node *node, int depth) {
+    if (!node || depth > 32) return;
+    switch (node->kind) {
+    case NODE_IDENT: {
+        Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
+                                  (uint32_t)node->ident.name_len);
+        if (gs && !gs->is_function)
+            track_isr_global(c, node->ident.name, (uint32_t)node->ident.name_len, false);
+        return;
+    }
+    case NODE_ASSIGN: {
+        if (node->assign.op != TOK_EQ) {
+            Node *r = node->assign.target;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                        (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+                if (r->kind == NODE_FIELD) r = r->field.object;
+                else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+                else r = r->unary.operand;
+            }
+            if (r && r->kind == NODE_IDENT) {
+                Symbol *gs = scope_lookup(c->global_scope, r->ident.name,
+                                          (uint32_t)r->ident.name_len);
+                if (gs && !gs->is_function)
+                    track_isr_global(c, r->ident.name, (uint32_t)r->ident.name_len, true);
+            }
+        }
+        record_isr_globals(c, node->assign.target, depth);
+        record_isr_globals(c, node->assign.value, depth);
+        return;
+    }
+    case NODE_CALL: {
+        record_isr_globals(c, node->call.callee, depth);
+        for (int i = 0; i < node->call.arg_count; i++)
+            record_isr_globals(c, node->call.args[i], depth);
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            Symbol *cs = scope_lookup(c->global_scope,
+                node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
+            if (cs && cs->is_function && cs->func_node &&
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+        }
+        return;
+    }
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            record_isr_globals(c, node->block.stmts[i], depth);
+        return;
+    case NODE_IF:
+        record_isr_globals(c, node->if_stmt.cond, depth);
+        record_isr_globals(c, node->if_stmt.then_body, depth);
+        record_isr_globals(c, node->if_stmt.else_body, depth);
+        return;
+    case NODE_FOR:
+        record_isr_globals(c, node->for_stmt.init, depth);
+        record_isr_globals(c, node->for_stmt.cond, depth);
+        record_isr_globals(c, node->for_stmt.step, depth);
+        record_isr_globals(c, node->for_stmt.body, depth);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        record_isr_globals(c, node->while_stmt.cond, depth);
+        record_isr_globals(c, node->while_stmt.body, depth);
+        return;
+    case NODE_RETURN:    record_isr_globals(c, node->ret.expr, depth); return;
+    case NODE_EXPR_STMT: record_isr_globals(c, node->expr_stmt.expr, depth); return;
+    case NODE_VAR_DECL:  record_isr_globals(c, node->var_decl.init, depth); return;
+    case NODE_BINARY:
+        record_isr_globals(c, node->binary.left, depth);
+        record_isr_globals(c, node->binary.right, depth);
+        return;
+    case NODE_UNARY:  record_isr_globals(c, node->unary.operand, depth); return;
+    case NODE_FIELD:  record_isr_globals(c, node->field.object, depth); return;
+    case NODE_INDEX:
+        record_isr_globals(c, node->index_expr.object, depth);
+        record_isr_globals(c, node->index_expr.index, depth);
+        return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            record_isr_globals(c, node->intrinsic.args[i], depth);
+        return;
+    case NODE_ORELSE:
+        record_isr_globals(c, node->orelse.expr, depth);
+        record_isr_globals(c, node->orelse.fallback, depth);
+        return;
+    case NODE_TYPECAST: record_isr_globals(c, node->typecast.expr, depth); return;
+    case NODE_SLICE:
+        record_isr_globals(c, node->slice.object, depth);
+        record_isr_globals(c, node->slice.start, depth);
+        record_isr_globals(c, node->slice.end, depth);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            record_isr_globals(c, node->struct_init.fields[i].value, depth);
+        return;
+    case NODE_DEFER:    record_isr_globals(c, node->defer.body, depth); return;
+    case NODE_CRITICAL: record_isr_globals(c, node->critical.body, depth); return;
+    case NODE_ONCE:     record_isr_globals(c, node->once.body, depth); return;
+    case NODE_SWITCH:
+        record_isr_globals(c, node->switch_stmt.expr, depth);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            record_isr_globals(c, node->switch_stmt.arms[i].body, depth);
+        return;
+    /* leaf / declaration kinds with no global-bearing subtree */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+        return;
     }
 }
 

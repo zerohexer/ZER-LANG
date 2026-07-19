@@ -73,6 +73,12 @@ Related context elsewhere:
 6. **Concurrency proofs** — the existing Coq/Iris corpus (~870 lines) remains valid; a port
    to iris-lean is empirically feasible today (days-scale) and becomes natural once the
    compiler lives in Lean. Not urgent; recorded in §14.
+7. **AMENDED same day (§8.2): SINGLE PROVER — Lean 4 only, end to end.** No Coq/Iris in
+   the final architecture. CompCert = reference + interim *standalone* certification
+   compiler (its guarantee stands beside ours; no cross-prover theorem composition is
+   claimed, so no seam). Endgame = **Stage 5**: ZER's own Lean-verified backend
+   (ZER-IR → RISC-V / ARMv7-M direct), making the composed full-pipeline theorem live
+   entirely in Lean — the first CompCert-class backend native to Lean.
 
 The one-liner: **proven wherever proof exists; trusted only in a residue that is small,
 diverse, watched — and bypassable for the one build that goes to the pad.**
@@ -546,6 +552,52 @@ Also noted: their **CompCertO** base (open-module / compositional correctness) i
 right reference point when ZER later needs *linking* theorems (multi-unit programs,
 separate compilation of certified modules).
 
+### §8.2 DECISION AMENDMENT (2026-07-19, same day) — single-prover Lean 4, end to end
+
+Confronted with the §8.1 seam, the decision is to **eliminate it at the root rather than
+engineer around it: the ENTIRE verified pipeline is Lean 4, single prover, no Coq/Iris
+anywhere in the final architecture.** SJTU-PLV's work is a *reference architecture*
+(pipeline shape, IR design, proof structure), not a dependency.
+
+Consequences, precisely:
+
+1. **CompCert is repositioned**: reference material + *interim pragmatic certification
+   compiler*. Using CompCert as the cert-build C compiler requires NO Coq work on our
+   side and creates NO seam — because no cross-prover theorem composition is claimed;
+   CompCert's guarantee stands on its own next to ours ("our C is proven-correct output;
+   their compilation of it is proven-correct separately"). The seam only ever existed for
+   the *composed single theorem* — which is now deferred to Stage 5 instead.
+2. **Stage 5 (new endgame): ZER's own Lean-verified backend** — ZER-IR → ISA directly
+   (RISC-V first, then ARMv7-M), replacing the need for CompCert composition entirely.
+   Notes that size this honestly:
+   - "Porting CompCert to Lean" is a **design-guided rebuild**, not a translation — no
+     production-grade Coq→Lean proof translator exists at that scale. CompCert's papers
+     and structure are the map; the proofs are re-done natively.
+   - ZER does **not** need CompCert's scope. CompCert's crown burden was *all of C99's
+     semantics*; ZER's backend consumes ZER-IR (small, UB-free, ours) and targets 1–2
+     ISAs. The rebuild is a small fraction of CompCert.
+   - For cert builds, the verified path can go **direct to assembly** (ZER-IR → asm in
+     Lean) — the C middle-man existed for portability and CompCert composition; C99
+     emission remains the daily/portable path (GCC/Clang), unchanged.
+   - **ISA semantics substrate is emerging in Lean**: `opencompl/sail-riscv-lean`
+     translates the official Sail RISC-V spec into Lean (full coverage, type-checks;
+     Sail's Lean backend still WIP/unreleased as of 2026-07). Same group as lean-mlir.
+     If matured, the target-semantics half of Stage 5 comes largely for free.
+   - Novelty, stated plainly: no CompCert-class verified backend native to Lean exists
+     yet (per the 2026-07 ecosystem research). Stage 5 would be the first — an
+     opportunity (flagship artifact, community/FRO interest) and a risk (no in-prover
+     prior art; CompCert's design is the only map).
+3. **Concurrency proofs**: the single-prover decision upgrades §14's "port when
+   convenient" to "iris-lean is the designated home" — the Coq/Iris corpus ports at the
+   §14 trigger and Coq is retired from ZER entirely at that point.
+4. The §8.1 escape hatch (emission pass in a Coq/CompCert fork) is **superseded** — kept
+   in the ledger only as a fallback if Stage 5 stalls AND a composed theorem is demanded
+   sooner.
+
+Sequencing is unchanged where it matters: **Stages 0–3 are untouched** (semantics,
+`checker_sound`, per-pass proofs, Grand Theorem to C99). Stage 5 is the endgame after
+them; the dual-backend strategy (§10) covers everything until it lands.
+
 ---
 
 ## §9 The two trust chains — the honest TCB analysis
@@ -770,6 +822,8 @@ correspondence via SMT) and CompCertELF-style verified assembly/linking research
 - Iris remains the right tool ONLY for the concurrent/heap reasoning; the compiler
   correctness proofs (§8) are plain Lean — separation logic is not involved in
   semantic-preservation arguments.
+- **Per §8.2 (single-prover amendment): iris-lean is the DESIGNATED end-state home.**
+  After the port at the trigger above, Coq is retired from ZER entirely.
 
 ---
 
@@ -834,7 +888,9 @@ on the Lean learning curve.
 | Making ZER itself proof-capable (refinement/dependent types) | Building a second Lean; a different mountain | a someday-research direction, not the plan |
 | "Fully safe" claims / trusting testing as proof | Testing bounds risk, never proves absence; trusted ≠ verified; no zero-trust floor exists | never |
 | Hard dependency on CompCert as the only backend | Commercial licensing (AbsInt); backend gaps (ARMv6-M, DSPs) | n/a — dual backend is strictly better |
-| Building ZER inside CompCert's Coq (SJTU-PLV-style, §8.1) | Yields the mechanical single-prover end-to-end theorem, but forfeits every §3 reason for Lean (one-language impl+proofs, ecosystem, KernelQ toolchain unification); the cross-prover seam is engineered small instead (§8.1, §11) | if the Stage-4 seam proves troublesome — then move ONLY the emission pass + proof into a Coq/CompCert fork (§8.1 escape hatch) |
+| Building ZER inside CompCert's Coq (SJTU-PLV-style, §8.1) | Yields the mechanical single-prover end-to-end theorem, but forfeits every §3 reason for Lean; superseded by §8.2 — the single-prover theorem is obtained IN LEAN via the Stage-5 backend instead | fallback only if Stage 5 stalls AND a composed theorem is demanded sooner |
+| Cross-prover composed theorem with CompCert (the original Stage-4 endgame) | The Clight interface semantics would exist in two provers — an argued link, not machine-checked (§8.1) | n/a — replaced by §8.2 (CompCert = standalone interim cert compiler; composition via Stage 5 in Lean) |
+| "Porting CompCert to Lean" as a mechanical translation | No production-grade Coq→Lean proof translator exists at that scale; Stage 5 is a design-guided REBUILD of only the needed subset (ZER-IR, 1–2 ISAs) — a small fraction of CompCert | n/a — this framing IS the plan, correctly sized |
 | Believing 2024-era iris-lean status ("no WP/adequacy") | Empirically false as of 2026-07 (§4.2 build + axiom probe on this machine) | never — re-verify against the repo instead |
 
 ---

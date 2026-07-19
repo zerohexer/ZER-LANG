@@ -499,6 +499,53 @@ Notes:
 - Until a pass's Stage-2 proof lands, Tier B covers it per-build (§6): the pass emits a
   witness; a small proven validator checks the instance.
 
+### §8.1 Precedent — and the cross-prover seam at Stage 4 (recorded 2026-07-19)
+
+**Precedent found:** SJTU-PLV maintains `github.com/SJTU-PLV/CompCert` branch
+`rust-verified-compiler` — a verified Rust(-subset) compiler built as a **frontend on
+CompCertO** (their compositional CompCert): `Rustsurface (OCaml) → Rustsyntax → Rustlight
+→ RustIR → Clight → CompCert backend`, in Coq (8.12), with a semantic-preservation theorem
+(`transf_rustlight_program_correct` in `driver/Compiler.v`). Status at reading: drop
+elaboration fully verified (`ElaborateDropProof.v`), lowering to Clight verified
+(`Clightgenproof.v`), move checking partially verified, **Polonius-based borrow checking
+still "working on"**; x86-64 only; active research project, ~4.3k commits on the branch.
+
+**What it validates for ZER (this is the closest existing artifact to this document's
+plan):** an ownership-semantics safety language, compiled by a verified frontend that
+lowers to Clight and inherits CompCert's backend theorem — `Rustlight`/`RustIR` are
+precisely the λ-ZER / ZER-IR analogues. The Stage-2/Stage-4 shape is not speculative;
+a university group is building exactly it, at effort well below CompCert-scale.
+
+**What it confirms about §5 (the certificate decision):** their hardest, still-unfinished
+component is verifying Polonius-based borrow *inference* — i.e., verifying a **finder**.
+ZER's certificate model verifies a **checker** (annotations at boundaries, finite modular
+rules) — deliberately the tractable side of the same problem. Their open struggle is
+empirical support for that design choice.
+
+**The seam it exposes in OUR plan (previously implicit — now recorded):** SJTU gets a
+*mechanical, single-prover* end-to-end theorem because everything lives in Coq inside
+CompCert. ZER's proofs live in Lean; CompCert's live in Coq. Therefore Stage 4's "compose
+with CompCert" is **not** mechanical theorem composition: the interface semantics
+(Clight / the C99 subset) would be formalized twice — once in our Lean target semantics,
+once in CompCert's Coq — and their agreement is an **argued-and-tested link, not a
+machine-checked one**. Position adopted:
+
+1. **Engineer the seam small** — this is exactly what the §11 emitter contract already
+   does: a tiny, UB-free, fully-defined C dialect leaves the two formalizations no room
+   to disagree. The seam is then a documented TCB item alongside §9's residue, of the
+   same character (small, inspectable, testable).
+2. **Escape hatch if the seam ever matters**: implement the Stage-4 emission pass and its
+   proof *in Coq inside a CompCert fork* (SJTU-style) while the rest of the frontend stays
+   Lean; the seam then moves up to the Lean-IR ↔ Coq-IR boundary, where per-artifact
+   validation of a small IR is straightforward.
+3. The fully-seamless alternative — building all of ZER inside CompCert's Coq — is the
+   "all-Coq" path already rejected for the §3 ecosystem reasons; the seam is part of the
+   Lean bet's price, accepted with eyes open (ledger entry added to §17).
+
+Also noted: their **CompCertO** base (open-module / compositional correctness) is the
+right reference point when ZER later needs *linking* theorems (multi-unit programs,
+separate compilation of certified modules).
+
 ---
 
 ## §9 The two trust chains — the honest TCB analysis
@@ -787,6 +834,7 @@ on the Lean learning curve.
 | Making ZER itself proof-capable (refinement/dependent types) | Building a second Lean; a different mountain | a someday-research direction, not the plan |
 | "Fully safe" claims / trusting testing as proof | Testing bounds risk, never proves absence; trusted ≠ verified; no zero-trust floor exists | never |
 | Hard dependency on CompCert as the only backend | Commercial licensing (AbsInt); backend gaps (ARMv6-M, DSPs) | n/a — dual backend is strictly better |
+| Building ZER inside CompCert's Coq (SJTU-PLV-style, §8.1) | Yields the mechanical single-prover end-to-end theorem, but forfeits every §3 reason for Lean (one-language impl+proofs, ecosystem, KernelQ toolchain unification); the cross-prover seam is engineered small instead (§8.1, §11) | if the Stage-4 seam proves troublesome — then move ONLY the emission pass + proof into a Coq/CompCert fork (§8.1 escape hatch) |
 | Believing 2024-era iris-lean status ("no WP/adequacy") | Empirically false as of 2026-07 (§4.2 build + axiom probe on this machine) | never — re-verify against the repo instead |
 
 ---
@@ -806,6 +854,8 @@ Web-verified 2026-07-19:
   AbsInt CompCert factsheet release 26.04 (2026-04)
 - iris-lean repository state: `github.com/leanprover-community/iris-lean` (+ its porting
   tracker at `leanprover-community.github.io/iris-lean`)
+- Verified-Rust-on-CompCert precedent (§8.1): `github.com/SJTU-PLV/CompCert`, branch
+  `rust-verified-compiler` (read 2026-07-19: pipeline, theorem names, verification status)
 - Lean ecosystem (research sweep, 13+ sources): AWS Cedar, SampCert, Veil, lean-mlir,
   Lean FRO roadmap — summarized in KernelQ doc LS.2/LS.3
 

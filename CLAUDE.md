@@ -327,6 +327,47 @@ callee may return position i. Grounded by `param_lattice.v`. Full map + the read
 compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
 slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
 
+**MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS — enumerate ALL sibling sites,
+never fix just the reported one, and gate the class so a new sibling can't silently
+regress.** The escape patchwork above is ONE instance of a GENERAL shape: the SAME
+semantic question is answered independently at N sites, so a fix at one site leaves the
+siblings broken AND a NEW site / node-kind / value-shape is silently missed (a "form →
+state coverage gap"). Every such hole to date was red-team-found, NOT proof-found — the
+two post-merge-back audit waves (40+ fixes) were almost entirely this class (escape ×N
+sinks, VRP-JOIN ×N node-kinds, array→slice coercion ×N value-flow sites, `?T`-hides-inner
+×N sinks, emitter AST+IR dual path). **Before editing ANY analysis with this shape:
+(1) ENUMERATE the full sibling set, (2) fix/verify EVERY member (a green test at one site
+proves NOTHING about the others), (3) wire/refresh a completeness gate.** Route the gate
+by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
+
+| Multi-site class | The N sites | Completeness gate (what to run / add) |
+|---|---|---|
+| Escape / keep ("frame-bound?") | store-global, return, keep-call, keep-infer, struct-field-store, spawn-arg | `tools/sink_matrix.sh` — **ADD A CELL per new shape** (a shape with no cell is INVISIBLE; yd5ajq grew it 32→41). `make check-sink-matrix` |
+| VRP range JOIN (merge at a control-flow join) | NODE_IF (§C#13 ✅), switch-arm, for-body, while/do-while body, do-while first-iter, goto/label | mirror `vrp_snap_take/restore/join` per node-kind; a missing kind = silent OOB. NO auto-gate — checklist every control-flow kind |
+| Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
+| Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
+| `?T` optional wrapper hiding the inner kind | keep-reg, escape sinks, array→slice coercion | **NO gate yet — OPEN class-kill** (an "optional-unwrap" analog of `type_dispatch_kind`). Until then, manually unwrap `?T` at EVERY `->kind == TYPE_{SLICE,POINTER}` safety dispatch |
+| Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
+
+**Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
+**`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →
+**an audit-script baseline** (`file:content`, line-number-agnostic — `sink_matrix.sh` /
+`audit_type_dispatch.sh` / `fixed_buffer_baseline.txt` are the templates; a new site must
+be a conscious add-or-justify). The question is "do the enumerated forms COVER the
+semantics?" (not "is each transfer sound?") → **a Coq/stdpp MAX-oracle** (`param_lattice.v`
+template) — this is the COVERAGE half the audits can't prove; it turns a missing form into
+a STUCK PROOF instead of a silent accept (the endgame direction). The durable end-state
+for ANY patchwork is **ONE query + a gate**, not N call sites (the `call_result_escapes` /
+`type_dispatch_kind` class-kills are the model).
+
+**Keep the gates CURRENT — a stale matrix is worse than none (false confidence).** When a
+sink/site is unified away, REMOVE its cell/baseline row; when a new shape/site/node-kind is
+added, ADD its cell/case in the SAME commit. Baselines are `file:content`
+(line-number-agnostic) so they survive unrelated edits but MUST be updated when the SITE
+SET itself changes. A green gate over an obsolete site set is the trap this rule exists to
+prevent.
+
 ---
 
 ## ZER Language — Complete Quick Reference

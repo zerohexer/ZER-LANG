@@ -739,3 +739,16 @@ emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
 # Documented-safe (582920db #4 baseline lines).
 zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
 zercheck_ir.c:(eff->kind == TYPE_UNION &&
+# 2026-07-20 audit: spawn-arg optional-carrier unwrap + container Pool/Ring/Slab ban.
+# `carrier` = eff (already type_unwrap_distinct'd) unwrapped one optional level;
+# `cf_eff` = type_unwrap_distinct(sf->type). Both are correct already-unwrapped
+# _eff-style locals (guidance: baseline these, do not churn to type_dispatch_kind).
+checker.c:(carrier->kind == TYPE_STRUCT || carrier->kind == TYPE_UNION) &&
+checker.c:bool is_ptr_like = (carrier->kind == TYPE_POINTER ||
+checker.c:carrier->kind == TYPE_OPAQUE);
+checker.c:carrier->kind == TYPE_SLICE ||
+checker.c:cf_eff->kind == TYPE_RING ||
+checker.c:cf_eff->kind == TYPE_SLAB) &&
+checker.c:if ((cf_eff->kind == TYPE_POOL ||
+checker.c:if (carrier && carrier->kind == TYPE_OPTIONAL) {
+checker.c:if (carrier->kind == TYPE_POINTER) {

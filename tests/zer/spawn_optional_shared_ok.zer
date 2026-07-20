@@ -1,0 +1,27 @@
+// optional-unwrap class (spawn-arg sink) positive: a `?*shared T` pointing at a
+// shared global that outlives the thread stays ACCEPTED (the fix unwraps the
+// optional but a shared, long-lived carrier is a valid fire-and-forget arg), and
+// a pure-value `?u32` stays ACCEPTED (no reference published). Only a `?*T` /
+// `?[*]T` into a stack-local / non-shared target is now rejected.
+shared struct S { u32 v; }
+S g;
+
+void bump(?*S s) {
+    if (s) |p| {
+        p.v += 1;
+    }
+}
+
+void take_val(?u32 v) {
+    if (v) |x| {
+        u32 y = x + 1;
+    }
+}
+
+u32 main() {
+    ?*S op = &g;
+    spawn bump(op);
+    ?u32 ov = 5;
+    spawn take_val(ov);
+    return 0;
+}

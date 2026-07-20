@@ -2203,6 +2203,52 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->container.type_arg = subst_typenode(a, tn->container.type_arg, param_name, param_len, replacement);
         return r;
     }
+    /* 2026-07-20: these container/funcptr TypeNodes ALSO carry inner type
+     * references that can be the type param T — they were incorrectly in the
+     * no-op group, so a `container` field shaped `*(T)->T` / `Pool(T,N)` /
+     * `Ring(T,N)` / `Handle(T)` / `Slab(T)` failed monomorphization with
+     * "undefined type 'T'" (the documented HANDLE gap generalized to all
+     * five). Recurse into every inner type; count_expr / non-type fields are
+     * copied by the `*r = *tn` shallow copy. */
+    case TYNODE_FUNC_PTR: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->func_ptr.return_type = subst_typenode(a, tn->func_ptr.return_type,
+            param_name, param_len, replacement);
+        if (tn->func_ptr.param_count > 0 && tn->func_ptr.param_types) {
+            TypeNode **np = (TypeNode **)arena_alloc(a,
+                sizeof(TypeNode *) * (size_t)tn->func_ptr.param_count);
+            for (int i = 0; i < tn->func_ptr.param_count; i++)
+                np[i] = subst_typenode(a, tn->func_ptr.param_types[i],
+                    param_name, param_len, replacement);
+            r->func_ptr.param_types = np;
+        }
+        return r;
+    }
+    case TYNODE_POOL: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->pool.elem = subst_typenode(a, tn->pool.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_RING: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->ring.elem = subst_typenode(a, tn->ring.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_HANDLE: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_SLAB: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->slab.elem = subst_typenode(a, tn->slab.elem, param_name, param_len, replacement);
+        return r;
+    }
     /* Stage 2 Part B (2026-04-28): exhaustive — primitives and other
      * leaf TypeNode kinds need no substitution (they have no inner type
      * param). NAMED is handled at the top via leaf check. */
@@ -2210,9 +2256,7 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
     case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
-    case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_HANDLE: case TYNODE_BARRIER:
-    case TYNODE_SLAB: case TYNODE_SEMAPHORE:
+    case TYNODE_ARENA: case TYNODE_BARRIER: case TYNODE_SEMAPHORE:
         return tn;
     }
     return tn;  /* defensive — unreachable with all cases enumerated */
@@ -2632,6 +2676,25 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                  * Handles: T, *T, ?T, []T, T[N], ?*Container(T), etc. */
                 sf->type = resolve_type(c, subst_typenode(c->arena, fd->type,
                     tmpl->type_param, tmpl->type_param_len, tn->container.type_arg));
+                /* BUG-287 parity: Pool/Ring/Slab cannot be container fields
+                 * either — must be global/static. The non-generic struct path
+                 * rejects this at NODE_STRUCT_DECL, but the stamped container
+                 * skips that path; without this, an invalid `container Q(T){
+                 * Pool(T,N) p; }` reached the emitter and produced an
+                 * incomplete-type gcc error instead of a clean checker reject.
+                 * (Now that subst_typenode recurses POOL/RING/SLAB, the field
+                 * resolves to a concrete Pool/Ring/Slab, so this fires.) */
+                if (sf->type) {
+                    Type *cf_eff = type_unwrap_distinct(sf->type);
+                    if ((cf_eff->kind == TYPE_POOL ||
+                         cf_eff->kind == TYPE_RING ||
+                         cf_eff->kind == TYPE_SLAB) &&
+                        zer_container_position_valid(ZER_DP_FIELD) == 0) {
+                        checker_error(c, tn->loc.line,
+                            "Pool/Ring/Slab cannot be container fields — must "
+                            "be global or static variables");
+                    }
+                }
             }
         } else {
             st->struct_type.fields = NULL;
@@ -13831,6 +13894,20 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
             Type *eff = type_unwrap_distinct(arg_type);
+            /* An OPTIONAL wrapper hides the carried pointer/slice/opaque kind:
+             * `?*T`, `?[*]T`, `?*opaque` publish the SAME reference a bare
+             * pointer/slice does (the spawned thread unwraps and dereferences
+             * it), so the fire-and-forget lifetime + data-race checks below
+             * MUST see through the optional. `carrier` is `eff` unwrapped
+             * through one `?` level (the documented "optional-unwrap" class:
+             * the spawn-arg sink was the last un-unwrapped site — §B #7/#8/#9
+             * closed the escape sinks; the `?Handle` sub-case stays on `eff`
+             * in the Handle block below). */
+            Type *carrier = eff;
+            if (carrier && carrier->kind == TYPE_OPTIONAL) {
+                Type *ci = type_unwrap_distinct(carrier->optional.inner);
+                if (ci) carrier = ci;
+            }
             /* Ptr-like args (pointer / slice / *opaque): a fire-and-forget
              * spawn requires a SYNCHRONIZED carrier (pointer to a shared
              * struct) whose lifetime OUTLIVES the thread (not a stack local);
@@ -13841,13 +13918,13 @@ static void check_stmt(Checker *c, Node *node) {
              * lifetime arm — `*shared T` to a stack local was accepted with no
              * check). See proofs/operational/lambda_zer_concurrency:
              * stack_not_publishable (lifetime) + is_shared (reach/discipline). */
-            bool is_ptr_like = (eff->kind == TYPE_POINTER ||
-                                eff->kind == TYPE_SLICE ||
-                                eff->kind == TYPE_OPAQUE);
+            bool is_ptr_like = (carrier->kind == TYPE_POINTER ||
+                                carrier->kind == TYPE_SLICE ||
+                                carrier->kind == TYPE_OPAQUE);
             if (is_ptr_like) {
                 bool shared_carrier = false;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                if (carrier->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(carrier->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT &&
                         inner->struct_type.is_shared)
                         shared_carrier = true;
@@ -13883,7 +13960,7 @@ static void check_stmt(Checker *c, Node *node) {
              * it is not over-rejected. Scoped spawns are exempt (join bounds the
              * lifetime). */
             else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+                     (carrier->kind == TYPE_STRUCT || carrier->kind == TYPE_UNION) &&
                      spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
                 checker_error(c, node->loc.line,
                     "spawn argument %d: cannot pass a by-value struct/union that "

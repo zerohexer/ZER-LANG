@@ -1,0 +1,24 @@
+// bit-slice WRITE on a native uN/iN carrier (u21, i48, …): the uN/iN store-mask
+// interceptor typed the bit-slice target `r[hi..lo]` as the carrier uN (the
+// checker types the extract as the carrier), so it wrongly intercepted the write
+// and emitted the ADDRESS of a bit-extract rvalue -> gcc "lvalue required".
+// Bit-slice (NODE_SLICE) targets are now excluded from the interceptor and fall
+// through to the dedicated bit-slice-set handler. Verified on both emit paths.
+u32 main() {
+    u21 r = 0;
+    r[7..0] = 0xFF;
+    r[15..8] = 0xAB;
+    u32 x = @truncate(u32, r[15..0]);
+    if (x != 0xABFF) { return 1; }
+
+    i48 s = 0;
+    s[7..0] = 0x7F;
+    u32 y = @truncate(u32, s[7..0]);
+    if (y != 0x7F) { return 2; }
+
+    // native-width carrier still works (regression)
+    u32 w = 0;
+    w[3..0] = 0xC;
+    if (w != 0xC) { return 3; }
+    return 0;
+}

@@ -1,0 +1,30 @@
+// subst_typenode recursion: a `container` field embedding the type-param T
+// inside a function pointer (`*(T)->T`) or a Handle (`?Handle(T)`) used to fail
+// monomorphization with "undefined type 'T'" — subst_typenode dumped
+// FUNC_PTR/HANDLE (and POOL/RING/SLAB) into the no-op group instead of
+// recursing into their inner type references. Now T substitutes correctly.
+struct Item { u32 v; }
+
+container Callback(T) {
+    *(T) -> T fn;
+    T val;
+}
+
+container Box(T) {
+    ?Handle(T) h;
+    u32 tag;
+}
+
+u32 dbl(u32 x) { return x + x; }
+
+u32 main() {
+    Callback(u32) c;
+    c.fn = dbl;
+    c.val = 5;
+    if (c.fn(c.val) != 10) { return 1; }
+
+    Box(Item) b;
+    b.tag = 7;
+    if (b.tag != 7) { return 2; }
+    return 0;
+}

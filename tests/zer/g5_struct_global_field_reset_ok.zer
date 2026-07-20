@@ -1,0 +1,37 @@
+// G5 positive: the register-ctx-then-keep store (g.p = n, never freed) and the
+// reset-before-return idiom (g.p = n; free(n); g.p = null;) must BOTH stay
+// accepted — the field-projection dangle fix flags only a DEFINITELY-freed
+// target, same conservatism as the bare-ident path (no false positive on the
+// legitimate hand-off pattern).
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+
+Holder keep_g;
+Holder reset_g;
+
+void observe() {
+    if (reset_g.p) |pp| {
+        u32 x = pp.val;
+    }
+}
+
+u32 main() {
+    // register-and-keep: stored, never freed -> alive, not flagged
+    ?*Node m1 = alloc(Node);
+    *Node a = m1 orelse { return 0; };
+    a.val = 1;
+    keep_g.p = a;
+
+    // reset-before-call: freed then nulled -> no dangle
+    ?*Node m2 = alloc(Node);
+    *Node b = m2 orelse { return 0; };
+    b.val = 2;
+    reset_g.p = b;
+    free(b);
+    reset_g.p = null;
+    observe();
+
+    free(a);
+    keep_g.p = null;
+    return 0;
+}

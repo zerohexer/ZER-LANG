@@ -1,0 +1,22 @@
+// funcptr-returning-call: pick(k)(a,b) — the callee of the outer call is itself
+// a CALL (pick(k)) that returns a funcptr. The IR indirect-call emitter had no
+// case for a NODE_CALL callee and DROPPED it (emitting an unknown-callee
+// placeholder), so the C collapsed to (a, b) — the comma operator — returning
+// the last arg instead of calling the result. A SILENT miscompile. The callee
+// is now emitted via the rewritten-node emitter.
+u32 add(u32 a, u32 b) { return a + b; }
+u32 sub(u32 a, u32 b) { return a - b; }
+typedef u32 (*BinOp)(u32, u32);
+
+BinOp pick(u32 k) {
+    if (k == 0) { return add; }
+    return sub;
+}
+
+u32 main() {
+    u32 r = pick(0)(10, 4);   // add -> 14
+    if (r != 14) { return 1; }
+    u32 s = pick(1)(10, 4);   // sub -> 6
+    if (s != 6) { return 2; }
+    return 0;
+}

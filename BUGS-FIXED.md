@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-20 — audit sweep: 5 fixes (2 silent UAF/race, 1 silent miscompile, 2 over-reject/invalid-C)
+
+Found by a codebase audit (4 parallel subsystem-audit agents + manual dig into the highest-severity
+documented-open gap). All five verified against the standalone build (neg + pos), then the full
+`make check` (all matrices + sink gate + type-dispatch gate). Each has a regression test.
+
+- **G5 — heap pointer stored into a GLOBAL STRUCT FIELD dangles unflagged (🔴 silent UAF).**
+  `struct Holder{?*Node p;} Holder g; g.p = n; free(n);` left `g.p` dangling and compiled CLEAN,
+  while the bare-ident equivalent `g = n; free(n)` was correctly rejected. The cross-function
+  global-dangle check (BUG-739/742) registered a pseudo-root only for a BARE global-ident store
+  (`target->kind == NODE_IDENT`); the `.field`/`[idx]` projection sink was missed (per-sink
+  patchwork). Cross-thread amplification: store into a `shared struct` field + read from a worker =
+  silent cross-thread UAF on a reused slab slot. **Fix (zercheck_ir.c):** new `ir_global_field_key`
+  builds the full dotted key `g.p` (root name + projection) for a FIELD/INDEX store whose root is an
+  unshadowed global and registers a compound `(IR_GLOBAL_ROOT_ID, "g.p")` entry sharing the RHS
+  alloc_id — the SAME machinery + SAME definitely-freed conservatism (`state == IR_HS_FREED`) as the
+  bare-ident path, so the existing exit + call-observe checks fire and MAYBE/never-freed stays
+  unflagged (register-ctx-then-callback not noised). Tests
+  `tests/zer_fail/g5_struct_global_field_dangle.zer` + `tests/zer/g5_struct_global_field_reset_ok.zer`.
+
+- **spawn-arg optional pointer hole (🔴 silent cross-thread UAF + data race).** A `?*T`/`?[*]T`/
+  `?*opaque` argument to a fire-and-forget `spawn` published the SAME reference a bare `*T`/`[*]T`
+  does (the thread unwraps and dereferences it), but the spawn pointer-safety dispatch
+  (checker.c ~13844) computed `is_ptr_like` on `eff = type_unwrap_distinct(arg_type)` WITHOUT
+  unwrapping `TYPE_OPTIONAL`, so `spawn worker(op)` with `?*T op = &stack_local` — or `&nonshared_g`
+  — compiled clean (the plain `*T` form is rejected). The documented "optional-unwrap class-kill" at
+  the last un-unwrapped sink (not covered by any sink-matrix cell). **Fix:** compute a `carrier` =
+  `eff` unwrapped one optional level, dispatch `is_ptr_like` + `shared_carrier` + the by-value
+  struct/union §B#13 check on `carrier`; the `?Handle` sub-case stays on `eff`. `?*shared` (long-lived)
+  and `?u32` (pure value) stay accepted. Tests `tests/zer_fail/spawn_optional_ptr_stack_race.zer` +
+  `tests/zer/spawn_optional_shared_ok.zer`.
+
+- **funcptr-returning-call `pick(0)(3,4)` dropped the callee (🔴 silent miscompile).** When the
+  callee of a call is itself a CALL returning a funcptr, the IR indirect-call emitter (emitter.c
+  `emit_ir_call`) had no case for a NODE_CALL callee and emitted an unknown-callee placeholder, so
+  the C collapsed to `(arg1, arg2)` — the comma operator — returning the last arg instead of calling
+  the result (`pick(0)(3,4)` returned 4, not 7). **Fix:** the three drop-the-callee fallbacks
+  (unknown callee, complex field callee, complex index callee) now emit the callee expression via
+  `emit_rewritten_node`, which handles nested calls / derefs. Test `tests/zer/funcptr_returning_call.zer`.
+
+- **subst_typenode no-recurse into FUNC_PTR/POOL/RING/HANDLE/SLAB (🟡 over-rejection).** A `container`
+  field embedding the type-param T inside a function pointer (`*(T)->T`), Pool/Ring/Slab, or Handle
+  failed monomorphization with "undefined type 'T'" — `subst_typenode` dumped these five kinds into
+  the no-op group instead of recursing their inner type references (the documented HANDLE gap
+  generalized). **Fix (checker.c):** recurse into `func_ptr.return_type` + every `param_types[i]`, and
+  `pool/ring/handle/slab.elem`; also added the Pool/Ring/Slab container-field ban (parity with the
+  non-generic struct rule — they must be global/static) so those reject cleanly instead of emitting an
+  "incomplete type" gcc error. Tests `tests/zer/container_funcptr_handle_field.zer` +
+  `tests/zer_fail/container_pool_field.zer`.
+
+- **bit-slice WRITE on a native uN/iN carrier emitted invalid C (🟡).** `u21 r; r[7..0] = 0xFF;` — the
+  uN/iN store-mask interceptor (emitter.c, both AST ~1596 + IR ~6645 paths) fired on the bit-slice
+  target because the checker types `r[hi..lo]` as the carrier uN, so it emitted `&(<bit-extract
+  read>)` — the address of an rvalue → gcc "lvalue required". **Fix:** exclude NODE_SLICE targets from
+  the interceptor in both paths so bit-slice writes fall through to the dedicated bit-slice-set handler
+  (native-width u32 carriers were unaffected and still pass). Test `tests/zer/bitslice_write_intn.zer`.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

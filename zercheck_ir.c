@@ -1202,6 +1202,35 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     return 0;
 }
 
+/* G5 (2026-07-20): build the FULL dotted key for a FIELD/INDEX store whose
+ * root is an UNSHADOWED GLOBAL — "g.p", "g.a.b", "garr[0]". Unlike
+ * ir_extract_compound_key (which requires a LOCAL root and returns the
+ * projection path WITHOUT the root name), this includes the global name so
+ * the (IR_GLOBAL_ROOT_ID, key) pseudo-root is unique across different
+ * globals and reads well in the dangle diagnostic. Returns an arena-owned
+ * NUL-terminated string + length, or NULL if `target` is not a keyable
+ * projection of an unshadowed global. */
+static const char *ir_global_field_key(ZerCheck *zc, IRFunc *func,
+                                        Node *target, uint32_t *out_len) {
+    *out_len = 0;
+    if (!target) return NULL;
+    if (target->kind != NODE_FIELD && target->kind != NODE_INDEX) return NULL;
+    Node *root = ir_key_root_ident(target);
+    if (!root || !ir_ident_is_unshadowed_global(zc, func, root)) return NULL;
+    int proj = ir_measure_key_path(target);   /* ".p" / "[0]" — root excluded */
+    if (proj <= 0) return NULL;
+    int rootlen = (int)root->ident.name_len;
+    int total = rootlen + proj;
+    char *buf = (char *)arena_alloc(zc->arena, total + 1);
+    if (!buf) return NULL;
+    memcpy(buf, root->ident.name, rootlen);
+    int wrote = ir_build_key_path(target, buf + rootlen, proj + 1, NULL);
+    if (wrote != proj) return NULL;
+    buf[total] = '\0';
+    *out_len = (uint32_t)total;
+    return buf;
+}
+
 /* ================================================================
  * *opaque / extern alloc-free recognition (Phase C2 — 9a/9b/9c)
  *
@@ -3253,6 +3282,55 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (gh) {
                         gh->state = IR_HS_UNKNOWN;
                         gh->alloc_id = 0;
+                    }
+                }
+            }
+
+            /* G5 (2026-07-20): struct/array-global FIELD/INDEX store —
+             * `g.p = n`, `g.a.b = n`, `garr[0] = n`. The bare-ident block
+             * above only covers `g = n`; a `.field`/`[idx]` projection of a
+             * global left its freed target dangling UNFLAGGED (documented
+             * gap G5 — a 🔴 UAF, incl. the cross-thread shared-struct-field
+             * variant). Register a compound pseudo-root entry keyed
+             * (IR_GLOBAL_ROOT_ID, "g.p") sharing the RHS alloc_id, so a later
+             * free propagates FREED to it and the exit / call-observe checks
+             * fire — SAME machinery, SAME definitely-freed conservatism as the
+             * bare-ident path (MAYBE_FREED stays unflagged; the legit
+             * register-ctx-then-callback store, never freed, stays ALIVE).
+             * The local-rooted field case is handled by the compound-handle
+             * registration above (ir_extract_compound_key, LOCAL root);
+             * ir_global_field_key returns NULL for a local root, so no
+             * double-registration. */
+            if (target_expr &&
+                (target_expr->kind == NODE_FIELD ||
+                 target_expr->kind == NODE_INDEX)) {
+                uint32_t gkey_len = 0;
+                const char *gkey = ir_global_field_key(zc, func, target_expr,
+                                                        &gkey_len);
+                if (gkey && gkey_len > 0) {
+                    IRHandleInfo *grh = (rhs_local >= 0)
+                        ? ir_find_handle(ps, rhs_local) : NULL;
+                    if (grh && grh->state == IR_HS_ALIVE &&
+                        grh->alloc_id != 0) {
+                        IRAliasSnapshot gsnap;
+                        ir_snapshot_alias(&gsnap, grh);
+                        IRHandleInfo *gh = ir_add_compound_handle(ps,
+                            IR_GLOBAL_ROOT_ID, gkey, gkey_len);
+                        if (gh) {
+                            ir_apply_alias(gh, &gsnap);
+                            gh->state = IR_HS_ALIVE;
+                            gh->escaped = true; /* INVARIANT — see IR_GLOBAL_ROOT_ID */
+                        }
+                    } else {
+                        /* Non-tracked value (null reset, param, unknown):
+                         * clear any stale binding so the reset idiom
+                         * `g.p = null;` after a free doesn't false-positive. */
+                        IRHandleInfo *gh = ir_find_compound_handle(ps,
+                            IR_GLOBAL_ROOT_ID, gkey, gkey_len);
+                        if (gh) {
+                            gh->state = IR_HS_UNKNOWN;
+                            gh->alloc_id = 0;
+                        }
                     }
                 }
             }

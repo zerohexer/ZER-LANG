@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// A Pool/Ring/Slab cannot be a container field (must be a global/static var),
+// same as the non-generic struct-field rule. Once subst_typenode was fixed to
+// recurse POOL/RING/SLAB, the stamped `Pool(Item,4)` field must hit the
+// container-position ban and reject CLEANLY — not slip through to the emitter
+// and produce an "incomplete type" gcc error.
+struct Item { u32 v; }
+container Q(T) {
+    Pool(T, 4) pool;
+    u32 n;
+}
+u32 main() {
+    Q(Item) q;
+    q.n = 3;
+    return q.n;
+}

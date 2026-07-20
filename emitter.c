@@ -1587,13 +1587,16 @@ static void emit_expr(Emitter *e, Node *node) {
          * and skip it → silent wrong value (`u3 y; y = a+b` keeps bit 3; `s-=1`
          * underflows to 255). Emit store + mask through ONE hoisted pointer so
          * the target lvalue (incl. a side-effecting index) is evaluated exactly
-         * once. Scalar targets only (array/union/bit-slice writes are handled by
-         * the dedicated cases below and don't carry a scalar uN/iN type here).
+         * once. Scalar targets only — a BIT-SLICE target `r[hi..lo]` (NODE_SLICE)
+         * DOES type as the carrier uN, so it is EXCLUDED here and falls through
+         * to the dedicated bit-slice-set case below (else this emitted the
+         * address of a bit-extract rvalue → gcc "lvalue required", 2026-07-20).
          * /= %= >>= can't exceed the width (result magnitude ≤ operand), so they
          * skip this and keep their existing div-guard / shift paths. */
         {
             Type *nn_t = checker_get_type(e->checker, node->assign.target);
-            if (type_is_nonnative_intn(nn_t)) {
+            if (type_is_nonnative_intn(nn_t) && node->assign.target &&
+                node->assign.target->kind != NODE_SLICE) {
                 TokenType aop = node->assign.op;
                 if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
                     aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
@@ -6638,11 +6641,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * compound-assign are AST-passthrough here and skip it → silent wrong
          * value (`u3 y; y = a+b` keeps bit 3; `s-=1` underflows to 255). Emit
          * store + mask through ONE hoisted pointer so a side-effecting index in
-         * the target evaluates once. Scalar targets only (array/union/bit-slice
-         * are handled by the dedicated cases below and don't carry a scalar
-         * uN/iN type here). /= %= >>= can't exceed the width (result magnitude ≤
-         * operand) so they keep their existing div-guard / shift paths. */
-        if (type_is_nonnative_intn(tgt_type)) {
+         * the target evaluates once. Scalar targets only — a BIT-SLICE target
+         * `r[hi..lo]` (NODE_SLICE) DOES type as the carrier uN (the checker types
+         * the extract as the carrier), so it must be EXCLUDED here and fall
+         * through to the dedicated bit-slice-set case below; otherwise this
+         * interceptor emitted `&(<bit-extract read>)` — an rvalue address → a
+         * gcc "lvalue required" error (2026-07-20). /= %= >>= can't exceed the
+         * width (result magnitude ≤ operand) so they keep their existing
+         * div-guard / shift paths. */
+        if (type_is_nonnative_intn(tgt_type) && node->assign.target &&
+            node->assign.target->kind != NODE_SLICE) {
             TokenType aop = node->assign.op;
             if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
                 aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
@@ -10069,7 +10077,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              (int)callee->field.field_name_len, callee->field.field_name);
                     }
                 } else {
-                    emit(e, "/* complex callee */(");
+                    /* Field callee with a non-ident object
+                     * (getobj().method, arr[i].method): emit the callee
+                     * expression itself rather than dropping it. */
+                    emit_rewritten_node(e, callee, func);
+                    emit(e, "(");
                 }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
@@ -10122,8 +10134,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     }
                     emit(e, "](");
                 } else {
-                    emit(e, "/* complex index callee */(");
+                    /* Indexed callee with a non-ident array object
+                     * (getarr()[i]): emit the callee expression itself. */
+                    emit_rewritten_node(e, idx_callee, func);
+                    emit(e, "(");
                 }
+            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+                       inst->expr->call.callee) {
+                /* Any other callee shape — most importantly a callee that is
+                 * itself a CALL returning a funcptr: pick(0)(3, 4). The old
+                 * unknown-callee fallback DROPPED the callee, so the C
+                 * collapsed to (arg1, arg2) (the comma operator) — a SILENT
+                 * miscompile (returned the last arg instead of calling the
+                 * result). Emit the callee expression via the rewritten-node
+                 * emitter, which handles nested calls, derefs, etc. */
+                emit_rewritten_node(e, inst->expr->call.callee, func);
+                emit(e, "(");
             } else {
                 emit(e, "/* unknown callee */(");
             }

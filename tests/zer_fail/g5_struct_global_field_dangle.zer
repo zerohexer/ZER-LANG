@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// G5 (2026-07-20): a heap pointer stored into a GLOBAL STRUCT FIELD (g.p = n)
+// then freed leaves g.p dangling. The bare-ident global-dangle check (BUG-739/742)
+// only matched `g = n`; the `.field` projection sink was missed — a silent UAF
+// (any later reader, incl. a worker thread through a shared-struct field,
+// observes the freed slab slot). Must now be rejected at the call-observe sink
+// AND at function exit, same as the bare-ident form.
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+
+Holder g;
+
+void observe() {
+    if (g.p) |pp| {
+        u32 x = pp.val;
+    }
+}
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse { return 0; };
+    n.val = 42;
+    g.p = n;
+    free(n);
+    observe();
+    return 0;
+}

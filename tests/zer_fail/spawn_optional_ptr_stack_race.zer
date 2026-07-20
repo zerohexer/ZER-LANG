@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// optional-unwrap class (spawn-arg sink): a `?*T` / `?[*]T` argument to a
+// fire-and-forget spawn published the SAME reference a bare `*T`/`[*]T` does,
+// but the spawn pointer-safety dispatch keyed on the raw arg kind and never
+// unwrapped the `?` — so `spawn worker(op)` with `?*T op = &stack_local`
+// compiled clean (cross-thread use-after-free). The optional wrapper must be
+// unwrapped so the stack-lifetime + data-race checks re-fire, exactly as for
+// the non-optional form.
+struct Data { u32 x; }
+void worker(?*Data d) { if (d) |p| { p.x += 1; } }
+u32 main() {
+    Data d;
+    d.x = 0;
+    ?*Data op = &d;
+    spawn worker(op);
+    return 0;
+}

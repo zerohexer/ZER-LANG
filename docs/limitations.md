@@ -656,17 +656,17 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
-  the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
-  ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
-  the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:
-  storing into a `shared struct` field + reading from a worker = silent cross-thread UAF on a reused slab
-  slot (observably reproduced, exit=999). CAUTION for the fixer: extends the BUG-742 global-dangle
-  conservatism — the maintainer deliberately does NOT flag MAYBE_FREED globals at exit (avoids noising the
-  legit register-ctx-then-callback pattern); a field-projection fix must flag only a DEFINITELY-freed
-  target, mirroring the bare-ident register/alias/exit machinery for the compound `(IR_GLOBAL_ROOT_ID,
-  name.field)` key.
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF). ✅ **DONE
+  (2026-07-20)** — new `ir_global_field_key` (zercheck_ir.c) builds the full dotted key `g.p` for a
+  FIELD/INDEX store whose root is an unshadowed global and registers a compound `(IR_GLOBAL_ROOT_ID,
+  "g.p")` pseudo-root sharing the RHS alloc_id, EXACTLY as the bare-ident `g = n` path does. A later
+  `free` then propagates FREED to it and the existing exit + call-observe checks fire. Followed the
+  CAUTION: gated on DEFINITELY-freed (`state == IR_HS_FREED`) only, so the legit register-ctx-then-callback
+  store (never freed → ALIVE) and conditional/MAYBE-freed stores stay unflagged; verified the reset idiom
+  `g.p = null;` clears the entry. Tests `tests/zer_fail/g5_struct_global_field_dangle.zer` (reject) +
+  `tests/zer/g5_struct_global_field_reset_ok.zer` (register-keep / reset-before-return / conditional-free
+  all accepted). The local-rooted field case (`ir_extract_compound_key`) is untouched — no
+  double-registration.
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%
@@ -674,6 +674,27 @@ lost-update failures breaking the `make check` gate; rewritten to accumulate via
 Main still has the flaky version.
 
 ---
+
+## OPEN — audit findings 2026-07-20 (loud / low-severity; none a silent soundness hole)
+
+Surfaced during the 2026-07-20 audit sweep (5 fixes landed same session: G5, spawn-arg
+optional, funcptr-returning-call, subst_typenode, uN/iN bit-slice write — see BUGS-FIXED.md).
+These two were deliberately NOT fixed (loud failures / delicate) and are queued here:
+
+- **2C inline funcptr ARRAY declaration fails to parse** (🟡 over-rejection; documented
+  feature broken). `*(u32, u32) -> u32 [2] ops;` — documented in `docs/reference.md` and
+  CLAUDE.md's Variant-2C section — errors "function pointer requires an initializer" then
+  "cannot index type 'fn(...)'". `parse_func_ptr_2c` (parser.c ~533) returns immediately and
+  never consumes a trailing `[N]` array suffix, so `ops` parses as a single scalar funcptr.
+  The typedef form (`BinOp[4] ops;`) works. **Why deferred:** the fix is genuinely ambiguous —
+  `*(u32)->u32[2]` could mean array-of-funcptr (documented intent) OR funcptr-returning-array,
+  and the return-type parse already consumes trailing type syntax; disambiguating safely needs
+  an architect decision, not a slip-in. Loud compile error (no unsafe code), lowest priority.
+  Reproducer: `*(u32,u32)->u32 [2] ops; ops[0]=add; ops[1]=sub; return ops[0](5,3);`.
+- **Dead async-lowering code in emitter.c** (tech debt, harmless). `collect_async_locals`,
+  `prescan_async_temps`, and the `async_temps[]` array (emitter.c ~4094-4258) have no live call
+  sites — the IR-locals path (`emit_async_func_from_ir`, ~12195) fully supersedes them by
+  rebuilding the promoted-local set from `func->locals`. Removable in a cleanup pass.
 
 ## OPEN — type-erasure / safe `void*` (generic `*opaque` container over-rejected) (2026-07-16) (over-rejection, NOT a soundness hole)
 
@@ -769,10 +790,16 @@ scope, so NOT fixed. Full write-ups (repro + root cause) in
   function; the block form `orelse { …; return null; }` and explicit `return
   null;` are fine. A correctness bug (wrong runtime behavior), narrow.
 - **MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
-  `handle.elem`.** Any `container` field shaped `Handle(T)`/`?Handle(T)` fails
-  with "undefined type 'T'" (breaks self-referential `container Chained(T){
-  ?Handle(Chained(T)) next; }` and more). Separate from the depth-32 recursion
-  guard. Would need `subst_typenode` to recurse HANDLE like POINTER/OPTIONAL do.
+  `handle.elem`.** ✅ **DONE (2026-07-20)** — `subst_typenode` now recurses
+  HANDLE (and the four siblings that shared the bug: FUNC_PTR return/params,
+  POOL/RING/SLAB elem), so a `container` field shaped `Handle(T)`/`?Handle(T)`/
+  `*(T)->T` substitutes T correctly. Pool/Ring/Slab container fields now hit a
+  clean container-position ban (they must be global/static — parity with the
+  non-generic struct rule) instead of an "incomplete type" gcc error. Tests
+  `tests/zer/container_funcptr_handle_field.zer` +
+  `tests/zer_fail/container_pool_field.zer`. (The self-referential
+  `container Chained(T){ ?Handle(Chained(T)) next; }` still needs the depth-32
+  monomorphization guard, unchanged — this fixed only the substitution.)
 - **LOW — global `Arena` in-place `garena.over(buf)` does not initialize** → a
   later `garena.alloc_slice(...)` returns `None` at runtime. Only `Arena x =
   Arena.over(buf)` (capture the return) works.

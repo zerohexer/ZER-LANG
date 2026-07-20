@@ -72,3 +72,6 @@ test_modules/main
 # Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
 rust_tests/rt_task_alloc_free
 rust_tests/rt_task_alloc_free_cycle
+
+# Claude Code agent worktrees / session state (harness-managed, never commit)
+.claude/

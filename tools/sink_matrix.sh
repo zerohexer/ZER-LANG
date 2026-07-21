@@ -78,6 +78,11 @@ echo "===== SHAPE p7 = optional-ptr FIELD carrying &local (?*T of a local struct
 cell p7__k2_store_glob  reject 'void c() { L loc; H h; h.mp = &loc.f; g_p = h.mp; } u32 main(){return 0;}'
 cell p7__k3_field_store reject 'void c() { L loc; H h; h.mp = &loc.f; g_h.p = h.mp; } u32 main(){return 0;}'
 cell p7__k2v_2step      reject 'void c() { L loc; H h; h.mp = &loc.f; ?*u32 t = h.mp; g_p = t; } u32 main(){return 0;}'
+# k_return_extract: return wrap(&local).mp where the extracted field is ?*T —
+# the RETURN-field-extraction sink must unwrap TYPE_OPTIONAL/TYPE_DISTINCT
+# (2026-07-21 fix; the ?T-hides-inner-kind class). The plain-*T variant was
+# already caught; the optional/distinct/slice field wrapper slipped.
+cell p7__k_return_extract reject 'H wrap(*u32 q){ H h; h.mp = q; return h; } ?*u32 c(){ u32 loc; return wrap(&loc).mp; } u32 main(){return 0;}'
 
 echo "===== SHAPE p8 = Ring element-store (by-value elem carrying a ptr into a local) ====="
 cell p8__k8_ring_push   reject 'struct RM { *u32 q; } Ring(RM, 4) g_rx; void c() { u32 loc; RM m; m.q = &loc; g_rx.push(m); } u32 main(){return 0;}'
@@ -130,11 +135,21 @@ cell safe_arena_local   compile 'struct AB { u32 v; } u32 rv(*AB b){return b.v;}
 cell safe_spawn_value   compile 'struct SV { u32 a; } void wk(SV m) { } void c() { SV m; m.a = 1; spawn wk(m); } u32 main(){return 0;}'
 cell safe_scalar_copy   compile 'void c() { L loc; loc.f = 5; u32 v = loc.f; g_p = null; if (v == 5) { return; } } u32 main(){return 0;}'
 cell safe_alive_subslice compile 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; s[0]=1; u8 v=s[0]; free(b); if (v != 1) { return 1; } return 0; }'
+# safe: return wrap(&global).mp — a GLOBAL-derived pointer through the same
+# return-extraction sink must still compile (no over-reject from the p7 fix).
+cell safe_return_extract_global compile 'u32 g_gv; H wrap(*u32 q){ H h; h.mp = q; return h; } ?*u32 c(){ return wrap(&g_gv).mp; } u32 main(){return 0;}'
+# safe: heap ptr into a struct-global FIELD, kept alive (NOT freed) — the
+# register-ctx pattern must compile (G5 flags only DEFINITELY-freed globals).
+cell safe_glob_field_keep compile 'struct N1 { u32 v; } struct HN1 { ?*N1 p; } HN1 g_hn1; void st(){ ?*N1 mn = alloc(N1); if (mn) |n| { n.v = 7; g_hn1.p = n; } } u32 main(){ st(); return 0; }'
 
 echo ""
 echo "===== HEAP-VIEW UAF / double-free (subslice shape) ====="
 cell heap_subslice_uaf  reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); s[0]=1; return 0; }'
 cell heap_subslice_df   reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); free(s); return 0; }'
+# heap_glob_field_dangle: heap ptr stored into a struct-GLOBAL field then freed
+# — g.p dangles (silent cross-fn UAF). The global-dangle exit check must
+# descend the .field projection, not just bare `g = n` (2026-07-21 G5 fix).
+cell heap_glob_field_dangle reject 'struct N0 { u32 v; } struct HN0 { ?*N0 p; } HN0 g_hn0; void st(){ ?*N0 mn = alloc(N0); if (mn) |n| { n.v = 7; g_hn0.p = n; free(n); } } u32 main(){ st(); return 0; }'
 
 echo ""
 echo "==================================================================="

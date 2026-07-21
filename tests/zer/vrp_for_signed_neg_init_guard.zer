@@ -1,0 +1,28 @@
+// Signed for-loop counter with a non-const (param) init: `i < 4` only bounds
+// ABOVE, so a negative start must NOT be proven in-bounds. The bounds
+// auto-guard now fires and returns the zero-value on the OOB path (no stack
+// OOB). Regression for the 2026-07-21 for-loop range-seeding silent OOB.
+// With the fix: sum_from(-2) returns 0 (guard fires on i=-2). Exits 0.
+i32 sum_from(i32 start) {
+    i32[4] a;
+    a[0]=10; a[1]=20; a[2]=30; a[3]=40;
+    i32 t = 0;
+    for (i32 i = start; i < 4; i += 1) { t += a[i]; }
+    return t;
+}
+// Positive control: an unsigned loop with a runtime start stays proven safe
+// (min=0 is a true type invariant) — must still compile and run.
+u32 usum(u32 start) {
+    u32[4] b;
+    b[0]=1; b[1]=2; b[2]=3; b[3]=4;
+    u32 s = 0;
+    for (u32 i = start; i < 4; i += 1) { s += b[i]; }
+    return s;
+}
+i32 main() {
+    i32 r = sum_from(-2);   // guard fires -> 0
+    u32 u = usum(0);            // 1+2+3+4 = 10
+    if (r != 0) { return 1; }
+    if (u != 10) { return 2; }
+    return 0;
+}

@@ -45,6 +45,52 @@ code); (3) fixes pile onto the same functions across branches → apply per-FAMI
 after each (conflict groups noted at the end); (4) drop junk commit `e4829572` (0-source
 binary regen). To inspect any fix: `git show <sha>`.
 
+---
+
+## OPEN — Audit session 2026-07-21 findings (3 FIXED, recorded above/in BUGS-FIXED.md; these remain)
+
+The 2026-07-21 codebase audit fixed 3 🔴 under-rejections (for-loop signed-init OOB,
+return-field `?T`/distinct escape, struct-global-field dangle = §G G5 — all in BUGS-FIXED.md).
+The following were confirmed LIVE but deferred (risk/scope), and one is NEW-undocumented:
+
+- **CONC-1 (🟠 race, NEW) — only the FIRST `&local` arg of a scoped spawn is borrow-tracked.**
+  `checker.c:14097-14117` loops over the spawn's `&ident` args, marks the FIRST non-shared local
+  `is_borrowed_by_thread`, then `break`s (line ~14116 `/* track the first borrowed local */`).
+  Second+ `&local` args are unguarded, so `ThreadHandle th = spawn w(&la, &lb); lb = 99;
+  th.join();` COMPILES (a data race on `*b`) while writing `la` is correctly rejected. Root: the
+  single-slot borrow representation (`Symbol.is_borrowed_by_thread` bool + one
+  `ThreadHandle.th_borrows_name`) can't represent ≥2 borrowed locals.
+- **CONC-2 (🟠 race, NEW) — two scoped spawns borrowing the SAME local: the first `.join()`
+  clears the borrow prematurely.** `is_borrowed_by_thread` is a bool (set `checker.c:~14113`);
+  join unconditionally clears it (`checker.c:5611-5616`). `t1=spawn w(&la); t2=spawn w(&la);
+  t1.join(); la=99; t2.join();` COMPILES — `la` is written while t2 still holds `&la`.
+  Fix (both): replace the single-slot borrow with a per-symbol borrow SET / refcount (drop the
+  `break`; a symbol stays borrowed until ALL borrowing handles join). Sound interim is possible
+  but a naive drop-the-break over-rejects (the single-name join can't clear the others). This is
+  the same single-slot design the documented cross-block scoped-borrow hole needs fixed; the
+  durable fix is the zercheck_ir borrow-set merge. NOT memory-corruption (stack data race).
+  Contradicts the ledger's "same-block read+write both covered (BUG-751+759)" claim — that holds
+  only for a SINGLE borrowed local.
+- **HOLE-A4 (🔴 use-after-move, confirmed live) — move-via-deref.** `*Tok p = &a; Tok b = *p;
+  consume(a);` COMPILES — reading a move struct through a pointer deref (`*p`) doesn't mark the
+  pointee `a` TRANSFERRED, so a later use of `a` is an undetected use-after-move (the direct
+  `Tok b = a;` IS caught). Already tracked at the top of this file as a deferred §A #7 follow-up;
+  re-confirmed against current main. Needs an IR_UNOP(deref) handler in the move-alias
+  registration (zercheck_ir.c move-tracking).
+- **G1 (🟡 miscompile, confirmed live) — forward `goto` fires a defer it textually skipped.**
+  Already documented in §G G1 below; re-confirmed live (spurious free of an unallocated pointer
+  in the `if(early){goto done;} r=alloc(); defer free(r); done:` idiom). Sound interim: reject a
+  forward goto that skips a defer registration.
+- **&packed_field misalignment (🟠 program-vs-hw boundary, NEW).** `packed struct P{u8 a; u32 b;}
+  P pkt; *u32 p = &pkt.b; *p = 9;` compiles with no ZER diagnostic (only GCC's non-fatal
+  `-Waddress-of-packed-member`), producing an aligned access through a misaligned address →
+  HardFault on strict-align MCUs (Cortex-M0, ARMv7-M/RISC-V unaligned-trap). ZER treats this same
+  misalignment as a rejectable program-level defect elsewhere — it rejects `@atomic_*(&packed.f)`
+  (checker.c:9193-9217, BUG-493) and unaligned `@inttoptr` — so the general `&packed.field → *T`
+  deref is an inconsistency worth closing (reject or warn on address-of a misaligned packed
+  field whose result is a typed pointer). Manifests as a crash, not silent corruption, so it sits
+  on the program/hardware boundary; ZER's own BUG-493 classifies it as program-side.
+
 ### Source branches (fork base → commits)
 | Branch | Base | Commits (short) |
 |---|---|---|
@@ -656,7 +702,13 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF) — **[FIXED
+  2026-07-21 — see BUGS-FIXED.md. The global-dangle store hook (zercheck_ir.c ~3259) now descends
+  the `.field`/`[i]` projection whose root is an unshadowed global, registering a compound
+  `(IR_GLOBAL_ROOT_ID, "g.p")` handle that shares the RHS alloc_id so free-propagation + the
+  DEFINITELY-FREED exit check reach it; reset via `g.p = null;`. Tests:
+  `tests/zer_fail/global_struct_field_dangle.zer` + sink cells `heap_glob_field_dangle` /
+  `safe_glob_field_keep`.]**
   `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
   the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
   ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.

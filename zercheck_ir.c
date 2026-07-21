@@ -3257,6 +3257,66 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
+            /* G5 (2026-07-21): heap pointer stored into a struct/array GLOBAL
+             * FIELD — `g.p = n` (g a global) — dangles UNFLAGGED when n is
+             * later freed. The bare-ident sink above matches only `g = n`; the
+             * `.field` / `[i]` projection sink was missing (the per-sink
+             * patchwork class — cf. the P9 by-value-field-launder fix that
+             * descended the projection to the root). Mirror the bare-ident
+             * machinery with a compound key `(IR_GLOBAL_ROOT_ID, "g.p")` so
+             * free-propagation + the exit dangling check reach it. Same
+             * conservatism as BUG-742: only DEFINITELY-FREED globals are
+             * flagged at exit (the exit-pass gates on IR_HS_FREED), so the
+             * legit register-ctx-then-callback pattern is not noised; a reset
+             * (`g.p = null;`) clears the entry via the else-branch. The path
+             * string is root-name + field/index suffix, arena-allocated
+             * (outlives this analysis; same lifetime argument as the ident
+             * path above). */
+            if (target_expr &&
+                (target_expr->kind == NODE_FIELD || target_expr->kind == NODE_INDEX)) {
+                Node *groot = ir_key_root_ident(target_expr);
+                if (groot && groot->kind == NODE_IDENT &&
+                    ir_ident_is_unshadowed_global(zc, func, groot)) {
+                    int suffix_len = ir_measure_key_path(target_expr);
+                    int root_len = (int)groot->ident.name_len;
+                    if (suffix_len > 0 && root_len > 0) {
+                        char *gpath = (char *)arena_alloc(zc->arena,
+                            (size_t)root_len + (size_t)suffix_len + 1);
+                        if (gpath) {
+                            memcpy(gpath, groot->ident.name, (size_t)root_len);
+                            int w = ir_build_key_path(target_expr,
+                                gpath + root_len, suffix_len + 1, NULL);
+                            if (w == suffix_len) {
+                                uint32_t gplen = (uint32_t)(root_len + suffix_len);
+                                IRHandleInfo *grh = (rhs_local >= 0)
+                                    ? ir_find_handle(ps, rhs_local) : NULL;
+                                if (grh && grh->state == IR_HS_ALIVE &&
+                                    grh->alloc_id != 0) {
+                                    IRAliasSnapshot gsnap;
+                                    ir_snapshot_alias(&gsnap, grh);
+                                    IRHandleInfo *gh = ir_add_compound_handle(ps,
+                                        IR_GLOBAL_ROOT_ID, gpath, gplen);
+                                    if (gh) {
+                                        ir_apply_alias(gh, &gsnap);
+                                        gh->state = IR_HS_ALIVE;
+                                        gh->escaped = true; /* INVARIANT — see IR_GLOBAL_ROOT_ID */
+                                    }
+                                } else {
+                                    /* non-tracked store (null reset / param /
+                                     * unknown) clears any stale binding. */
+                                    IRHandleInfo *gh = ir_find_compound_handle(ps,
+                                        IR_GLOBAL_ROOT_ID, gpath, gplen);
+                                    if (gh) {
+                                        gh->state = IR_HS_UNKNOWN;
+                                        gh->alloc_id = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Gap A2 (2026-05-06, sNsjM): move-struct field-write transfers
              * ownership. `b.field = t` where t is a move struct (or contains
              * move fields) MUST mark t as TRANSFERRED. Subsequent use of t =

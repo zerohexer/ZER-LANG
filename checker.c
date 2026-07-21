@@ -11617,19 +11617,38 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* try to get init value for min */
             int64_t init_val = 0; /* default min */
+            bool init_is_const = false;
             if (node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
                 node->for_stmt.init->var_decl.init) {
                 int64_t iv = eval_const_expr(node->for_stmt.init->var_decl.init);
-                if (iv != CONST_EVAL_FAIL) init_val = iv;
+                if (iv != CONST_EVAL_FAIL) { init_val = iv; init_is_const = true; }
             }
 
             if (loop_var && bound_val != CONST_EVAL_FAIL) {
+                /* VRP (2026-07-21): when the init is NOT a compile-time
+                 * constant, the true minimum of a SIGNED counter is unknown —
+                 * `i < N` only bounds it ABOVE, it never establishes i >= 0.
+                 * Seeding min = 0 (the old default) falsely proved `arr[i]`
+                 * in-bounds for `for (i32 i = start; i < 4; ...)` with a
+                 * negative `start` → the emitter elided the bounds guard →
+                 * silent stack OOB read AND write (ASan-confirmed). Mirror the
+                 * while/do-while conservative seed (INT64_MIN) so the index is
+                 * not falsely proven and the runtime auto-guard fires. An
+                 * UNSIGNED counter keeps min = 0 — that IS a true type
+                 * invariant (a huge unsigned start fails `i < N` so the body
+                 * never runs), preserving precision for the common case. */
+                int64_t seed_min = init_val;
+                if (!init_is_const) {
+                    Symbol *lv_sym = scope_lookup(c->current_scope, loop_var, loop_var_len);
+                    bool lv_signed = !lv_sym || !lv_sym->type || type_is_signed(lv_sym->type);
+                    seed_min = lv_signed ? INT64_MIN : 0;
+                }
                 if (fop == TOK_LT) {
-                    push_var_range(c, loop_var, loop_var_len, init_val, bound_val - 1,
-                                   init_val > 0);
+                    push_var_range(c, loop_var, loop_var_len, seed_min, bound_val - 1,
+                                   seed_min > 0);
                 } else if (fop == TOK_LTEQ) {
-                    push_var_range(c, loop_var, loop_var_len, init_val, bound_val,
-                                   init_val > 0);
+                    push_var_range(c, loop_var, loop_var_len, seed_min, bound_val,
+                                   seed_min > 0);
                 }
             }
         }
@@ -12597,8 +12616,15 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-383: return wrap(&x).p — struct wrapper bypasses BUG-360 because
              * the function returns a struct, not a pointer/slice. Walk through field/index
              * chains to find if root is a NODE_CALL with local-derived args.
-             * Fires when the final return type is a pointer OR slice. */
-            if (ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
+             * Fires when the final return type carries a data pointer.
+             * (2026-07-21) Gate widened from a raw pointer/slice type-kind
+             * comparison to `type_carries_data_pointer` — mirroring the
+             * sibling direct-call return sink above. The raw check did NOT unwrap
+             * TYPE_OPTIONAL / TYPE_DISTINCT, so `return wrap(&x).p` where the
+             * extracted field is `?*T`, `?[*]T`, or a `distinct typedef` of a
+             * pointer/slice slipped through → a shipped stack-use-after-return.
+             * The `?T`-wrapper-hides-inner-kind class the codebase warns about. */
+            if (ret_type && type_carries_data_pointer(ret_type, 0)) {
                 Node *rroot = node->ret.expr;
                 while (rroot && (rroot->kind == NODE_FIELD || rroot->kind == NODE_INDEX)) {
                     if (rroot->kind == NODE_FIELD) rroot = rroot->field.object;

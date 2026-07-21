@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Heap pointer stored into a struct-GLOBAL field then freed — g.p dangles.
+// The global-dangle exit check must descend the .field projection, not just
+// bare `g = n` (2026-07-21 G5 fix; per-sink patchwork).
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+void stash() {
+    ?*Node mn = alloc(Node);
+    if (mn) |n| {
+        n.val = 42;
+        g.p = n;
+        free(n);
+    }
+}
+u32 main() { stash(); return 0; }

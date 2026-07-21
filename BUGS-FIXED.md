@@ -5,6 +5,61 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-21 — Audit session: 3 soundness holes closed (for-loop OOB, return-field escape, struct-global-field dangle)
+
+Codebase audit (6 parallel subsystem sweeps + direct probing). Three under-rejection
+(accept-unsafe) holes found and fixed; deferred/lower-severity findings recorded in
+`docs/limitations.md`. `make check` 1017/0 green, sink matrix 48/0 CLEAN (4 new cells).
+
+### 1. 🔴 for-loop signed non-const init → silent stack OOB (checker.c NODE_FOR, ~11619)
+
+`for (i32 i = start; i < 4; i += 1) { a[i] }` with a NON-const-evaluable `start` (param /
+call / runtime) seeded the loop-var range MIN to `0` unconditionally. But `i < N` only bounds
+ABOVE — it never establishes `i >= 0`. A negative `start` was thus falsely proven in `[0,N-1]`,
+the emitter ELIDED the bounds auto-guard, and the loop read AND wrote below the array (silent
+stack OOB, ASan-confirmed). The while/do-while path was already sound (seeds `INT64_MIN`, BUG-D /
+BUG-748); the for-loop seeding was never given the same conservative min.
+
+Root cause: `init_val` defaults to `0` when `eval_const_expr(init)` fails, and the fall-through
+used it as the range min regardless of loop-var signedness. Fix: track whether the init was a
+successful const-eval; when it was NOT, seed `min = INT64_MIN` for a SIGNED loop var (so the
+index is not falsely proven → the auto-guard fires), and keep `min = 0` for an UNSIGNED var (a
+true type invariant — a huge unsigned start fails `i < N` so the body never runs). More precise
+than the while-loop (which always uses INT64_MIN even for unsigned) while equally sound. Const
+init (`for i=0`) and literal-negative init (`for i=-5`) are unchanged (already handled).
+Test: `tests/zer/vrp_for_signed_neg_init_guard.zer`.
+
+### 2. 🔴 return-field-extraction escape sink didn't unwrap `?T`/distinct → stack-use-after-return (checker.c ~12620)
+
+`return wrap(&x).p` where `wrap` returns a struct and the extracted field `p` is `?*T`, `?[*]T`,
+or a `distinct typedef` of a pointer/slice COMPILED — a shipped stack-use-after-return (`&x` is a
+local; after the function returns the pointer dangles). The plain-`*T`/`[*]T` field variant was
+correctly rejected. Root cause: the return-field sink gated on a raw `ret_type` pointer/slice
+type-kind comparison that does NOT unwrap `TYPE_OPTIONAL` / `TYPE_DISTINCT`; the sibling
+direct-call return sink (BUG-766) had already been widened to `type_carries_data_pointer`, but
+this projection-walking sibling was left on the old raw check (multi-site drift; the
+`?T`-hides-inner-kind class CLAUDE.md warns about). Fix: one-line gate change to
+`type_carries_data_pointer(ret_type, 0)`, mirroring the sibling. The global-store + keep sinks for
+this shape were already sound (they use `type_carries_data_pointer`). Global-arg variant still
+compiles (no over-reject). Tests: `tests/zer_fail/escape_return_field_optional.zer` +
+sink cells `p7__k_return_extract` / `safe_return_extract_global`.
+
+### 3. 🔴 heap pointer into a struct-GLOBAL field dangles unflagged → silent cross-fn UAF (zercheck_ir.c ~3259)
+
+`g.p = n; free(n)` (g a struct global) left `g.p` dangling with NO diagnostic; the bare-ident
+form `g = n; free(n)` was correctly rejected. Root cause: the global-dangle store hook (GAP-3 /
+BUG-739) matched only `target_expr->kind == NODE_IDENT`, so the `.field` / `[i]` projection sink
+was missing (per-sink patchwork; documented as §G G5). Fix: mirror the bare-ident machinery for a
+projection target whose root is an unshadowed global — build the full `"g.p"` path (root name +
+`ir_build_key_path` suffix), register a compound handle keyed `(IR_GLOBAL_ROOT_ID, "g.p")` sharing
+the RHS `alloc_id` + `escaped=true`, so free-propagation + the exit dangling check reach it; a
+non-tracked store (`g.p = null;`) clears the entry. Same BUG-742 conservatism — only
+DEFINITELY-FREED globals are flagged at exit (register-ctx-then-keep + reset-after-free +
+free-through-field all still compile). Tests: `tests/zer_fail/global_struct_field_dangle.zer` +
+sink cells `heap_glob_field_dangle` / `safe_glob_field_keep`.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

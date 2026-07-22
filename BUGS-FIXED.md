@@ -5,6 +5,35 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-22 (batch 2) — concurrency races G4 + G2 (checker.c)
+
+Two TSan-confirmed data races, both intra-function fixes with near-zero over-rejection.
+make check GREEN (sink matrix 44 CLEAN, all audits clean).
+
+- **BUG (🟠 data race) — G4: `&threadlocal` to a scoped spawn.** `ThreadHandle t = spawn
+  worker(&tls); tls = 9; t.join();` compiled — the scoped-borrow setup loop (checker.c ~14088)
+  SKIPS threadlocals (they live in global_scope, so `vglobal` is true → no borrow established),
+  so main's concurrent write in the spawn..join window was unflagged; worse, the child writes the
+  PARENT's thread-local slot, not its own. Fix: the scoped arm of the spawn-arg pointer-safety
+  check (checker.c ~13874) rejects `&threadlocal` outright, mirroring the A5/BUG-757
+  fire-and-forget rejection. By-value stays legal. Tests
+  `tests/zer_fail/g4_threadlocal_amp_scoped_spawn.zer` + `tests/zer/g4_threadlocal_byvalue_ok.zer`.
+- **BUG (🟠 data race) — G2: scoped-borrow evaded by a helper laundering `&local`.** `poke(&x)`
+  between `spawn worker(&x)` and `t.join()` compiled — the read/write borrow checks skip the
+  `&`-take (`in_amp`) and never inspect call arguments (the direct `x = 7;` IS rejected). Fix: the
+  NODE_CALL arg-check loop (checker.c ~5477) rejects `&x` passed to a call while x is
+  `is_borrowed_by_thread`. Intra-function (the flag lives in this frame, cleared at `.join()`),
+  zero transitivity, near-zero over-rejection (by-value copy stays legal; bare-value read already
+  caught). Tests `tests/zer_fail/g2_scoped_borrow_via_helper.zer` +
+  `tests/zer/g2_borrow_after_join_ok.zer`. Cross-block launder remains the documented CFG residual.
+
+Still OPEN after this wave (docs/limitations.md, reproducers in tests/zer_gaps/): G3 (atomic-cell
+plain access via a helper — needs a FuncSummary transitivity bit + preserves the after_spawn gate)
+and the new short-circuit miscompile (`orelse` in a `&&`/`||` RHS of a plain assignment eagerly
+evaluated — needs a passthrough→lower_shortcircuit_to_dest reroute).
+
+---
+
 ## 2026-07-22 — audit wave: G5 struct-global-field UAF + wrapped-slice escape + uN wide-assign wrap (zercheck_ir.c / checker.c / emitter.c)
 
 Multi-agent audit found three holes; all fixed, make check GREEN (1018/0), sink matrix +

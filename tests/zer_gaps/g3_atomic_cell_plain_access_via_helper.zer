@@ -1,0 +1,16 @@
+// GAP (open 2026-07-22): atomic-cell plain-access check is NOT transitive
+// through a helper. `g_ctr` is an atomic cell (worker uses @atomic_add); a
+// plain non-atomic write to it directly in main after the spawn IS rejected,
+// but hiding it in poke() is MISSED (after_spawn_in_func resets at each function
+// entry, so poke's body is checked as non-concurrent). TSan: mixed atomic/plain
+// race. Fix needs a FuncSummary "plainly accesses atomic cell" bit consulted at
+// the call site (depth-budgeted, per-file — matches the whole-program ban).
+u32 g_ctr;
+void poke() { g_ctr = 5; }               // plain write to an atomic cell — MISSED
+void worker() { @atomic_add(&g_ctr, 1); }
+u32 main() {
+    @atomic_store(&g_ctr, 0);
+    spawn worker();
+    poke();
+    return 0;
+}

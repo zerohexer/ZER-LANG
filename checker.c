@@ -5476,6 +5476,33 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->call.arg_count * sizeof(Type *));
             for (int i = 0; i < node->call.arg_count; i++) {
                 arg_types[i] = check_expr(c, node->call.args[i]);
+                /* G2 (2026-07-22): scoped-borrow launder via a helper. `&x`
+                 * handed to a call while x is borrowed by a scoped spawn lets
+                 * the callee access x concurrently with the thread. The
+                 * read/write borrow checks skip the `&`-take (in_amp) and never
+                 * inspect call args, so `poke(&x)` between spawn and .join()
+                 * slipped (the direct `x = 7;` IS caught). Reject the address of
+                 * a borrowed local as a call argument — the bare-value case is
+                 * already caught by the read-side check (a by-value copy is
+                 * safe). Intra-function: the borrow flag lives in this frame and
+                 * is cleared at .join(), so calls after the join are fine. */
+                Node *aa = node->call.args[i];
+                if (aa && aa->kind == NODE_UNARY && aa->unary.op == TOK_AMP &&
+                    aa->unary.operand &&
+                    aa->unary.operand->kind == NODE_IDENT) {
+                    Symbol *bs = scope_lookup(c->current_scope,
+                        aa->unary.operand->ident.name,
+                        (uint32_t)aa->unary.operand->ident.name_len);
+                    if (bs && bs->is_borrowed_by_thread) {
+                        checker_error(c, node->loc.line,
+                            "cannot pass '&%.*s' to a call while it is borrowed by "
+                            "a scoped spawn — the callee could access it "
+                            "concurrently with the thread (data race). Join first, "
+                            "or copy the value before spawning",
+                            (int)aa->unary.operand->ident.name_len,
+                            aa->unary.operand->ident.name);
+                    }
+                }
             }
         }
 
@@ -13872,7 +13899,37 @@ static void check_stmt(Checker *c, Node *node) {
                 bool stack_derived =
                     spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i]);
                 if (is_scoped) {
-                    /* OK — scoped spawn, thread joined before scope exit */
+                    /* OK — scoped spawn, thread joined before scope exit —
+                     * EXCEPT the address of a threadlocal: G4 (2026-07-22).
+                     * `&tls` handed to a scoped spawn is NOT bounded by join
+                     * the way a stack local is: the scoped-borrow setup loop
+                     * SKIPS threadlocals (they live in global_scope, so
+                     * `vglobal` is true → no borrow established), leaving a
+                     * parent write in the spawn..join window unflagged; and
+                     * semantically the child writes MAIN's thread-local slot,
+                     * not its own. Reject outright, mirroring the A5/BUG-757
+                     * fire-and-forget threadlocal-escape rejection. Passing
+                     * the threadlocal BY VALUE stays legal (a copy). */
+                    Node *ba = node->spawn_stmt.args[i];
+                    if (ba && ba->kind == NODE_UNARY && ba->unary.op == TOK_AMP &&
+                        ba->unary.operand &&
+                        ba->unary.operand->kind == NODE_IDENT) {
+                        Symbol *ts = scope_lookup(c->current_scope,
+                            ba->unary.operand->ident.name,
+                            (uint32_t)ba->unary.operand->ident.name_len);
+                        if (ts && ts->func_node &&
+                            (ts->func_node->kind == NODE_VAR_DECL ||
+                             ts->func_node->kind == NODE_GLOBAL_VAR) &&
+                            ts->func_node->var_decl.is_threadlocal) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass the address of a "
+                                "threadlocal to a spawn — the child would write "
+                                "the PARENT's thread-local slot and the scoped "
+                                "borrow does not cover it (data race). Pass the "
+                                "value by copy, or use a shared struct",
+                                i + 1);
+                        }
+                    }
                 } else if (stack_derived) {
                     checker_error(c, node->loc.line,
                         "argument %d: cannot pass a pointer/slice to a stack "

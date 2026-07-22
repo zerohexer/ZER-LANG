@@ -1,0 +1,15 @@
+// GAP (open 2026-07-22): `orelse` inside a && / || RHS of a PLAIN ASSIGNMENT
+// statement is eagerly evaluated (short-circuit violated). A plain `x = <expr>`
+// goes to lower_expr's passthrough (NODE_ASSIGN op==TOK_EQ), which hands the RHS
+// to pre_lower_orelse (hoists the orelse BEFORE the &&) instead of
+// lower_shortcircuit_to_dest. side_count becomes 1 (ping ran) though `a` is
+// false. The var-decl form `bool x = a && (ping() orelse false);` is correct.
+// Silent miscompile; a trap inside the orelse source would also fire spuriously.
+u32 side_count;
+?bool ping() { side_count += 1; return true; }
+u32 main() {
+    bool a = false;
+    bool x = false;
+    x = a && (ping() orelse false);   // passthrough — orelse eagerly evaluated
+    return side_count;                 // expected 0; actual 1
+}

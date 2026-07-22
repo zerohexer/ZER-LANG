@@ -691,23 +691,43 @@ an ASan build).
   DONE section at the top of this file). `ir_register_global_field_store` now registers `g.p`/`g[k]`
   projections under `IR_GLOBAL_ROOT_ID` at all three store sinks; `g.p = n; free(n); return` is rejected,
   `... g.p = null;` compiles.
-- **G2 — scoped-borrow exclusivity evaded by a helper laundering `&local`** (🟠 race, TSan-confirmed).
-  `gap_scoped_borrow_via_helper.zer`. A stack local borrowed by a scoped `spawn` is exclusive until
-  `.join()`; the DIRECT `local.v=7;` between spawn/join IS rejected but `poke(&local)` is not — the borrow
-  check is intra-name and does not treat `&local` handed to a helper as an access. Same-block (distinct from
-  the known-open cross-block case).
-- **G3 — atomic-cell plain-access check not transitive through a helper** (🟠 race, TSan-confirmed).
-  `gap_atomic_cell_plain_access_via_helper.zer`. "is atomic cell?" is whole-program, but "flag the plain
-  access" fires only for accesses lexically inside a spawning/spawned function; move the plain write into
-  `poke(){ g_ctr=5; }` and it is missed (the same plain write directly in `main` IS rejected).
-- **G4 — `threadlocal &`-escape to a SCOPED spawn establishes no borrow** (🟠 race, TSan-confirmed).
-  `gap_threadlocal_amp_escape_scoped_spawn.zer`. Passing `&tls` to a scoped spawn registers no borrow
-  (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
-  MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
-  was not covered.
-  (G5's original detailed description is retired — the fix landed exactly as the CAUTION prescribed:
-  the `(IR_GLOBAL_ROOT_ID, name.field)` key mirrors the bare-ident register/alias/exit machinery and flags
-  only a DEFINITELY-freed target, so the BUG-742 register-ctx-then-callback tolerance is preserved.)
+- **G2 — scoped-borrow exclusivity evaded by a helper laundering `&local`** — ✅ FIXED 2026-07-22. The
+  NODE_CALL arg-check loop (checker.c ~5477) now rejects `&x` passed to a call while x is borrowed by a
+  scoped spawn (the read/write borrow checks skipped the `&`-take via `in_amp` and never inspected call
+  args). Intra-function, zero transitivity, near-zero over-rejection (a by-value copy stays legal; the
+  bare-value read is already caught). Tests `tests/zer_fail/g2_scoped_borrow_via_helper.zer` +
+  `tests/zer/g2_borrow_after_join_ok.zer`. (Cross-block launder — `&x` stored then passed in another block —
+  remains the documented cross-block CFG residual.)
+- **G3 — atomic-cell plain-access check not transitive through a helper** (🟠 race, TSan-confirmed) — OPEN.
+  Reproducer `tests/zer_gaps/g3_atomic_cell_plain_access_via_helper.zer` (compile-clean = the gap). "is
+  atomic cell?" is whole-program (checker.c ~9107), but the plain-access RECORDING is gated on
+  `after_spawn_in_func` (checker.c ~3984/3929/3578), which resets at every function-body entry (~15272);
+  move the plain write into `poke(){ g_ctr=5; }` and poke's body is checked as non-concurrent → missed.
+  `scan_unsafe_global_access` scans only the SPAWNED function's body, not helpers `main` calls after the
+  spawn. Fix (deferred — the one that needs machinery): a FuncSummary bit "plainly accesses atomic cell X"
+  consulted at each post-spawn call site, OR a depth-budgeted descent (the `scan_unsafe_global_access`
+  template) over post-spawn callees — both per-file, ban-compliant. Must PRESERVE the `after_spawn_in_func`
+  gate (a strict-always model previously false-positived 21 safe pre-spawn inits) → real but bounded
+  over-rejection surface, hence deferred over the intra-function G2/G4.
+- **G4 — `threadlocal &`-escape to a SCOPED spawn establishes no borrow** — ✅ FIXED 2026-07-22. The
+  scoped-spawn arm of the spawn-arg pointer-safety check (checker.c ~13874) now rejects `&threadlocal`
+  outright (the borrow-setup loop skipped threadlocals as globals → no borrow; and the child writes the
+  PARENT's TLS slot). Mirrors the A5/BUG-757 fire-and-forget rejection; by-value stays legal. Tests
+  `tests/zer_fail/g4_threadlocal_amp_scoped_spawn.zer` + `tests/zer/g4_threadlocal_byvalue_ok.zer`.
+- **NEW — short-circuit `orelse` in a `&&`/`||` RHS of a plain assignment is eagerly evaluated** (🟡 silent
+  miscompile) — OPEN. Reproducer `tests/zer_gaps/shortcircuit_orelse_eager_assign.zer`. `x = a && (ping()
+  orelse false);` runs `ping()` even when `a` is false — a plain `x = <expr>` statement goes to lower_expr's
+  passthrough (NODE_ASSIGN op==TOK_EQ, ir_lower.c ~801) which hands the whole RHS to `pre_lower_orelse`
+  (hoists the nested orelse into an eagerly-computed temp BEFORE the `&&`) instead of routing through
+  `lower_shortcircuit_to_dest` (used by var-decl-init, call-args, cond, return — all correct). A trap inside
+  the orelse source (OOB/div-guard) would also fire spuriously. Fix: on the passthrough path, when the RHS
+  is a short-circuit `&&`/`||` carrying a nested orelse (anything `pre_lower_orelse` would hoist), route the
+  RHS through `lower_shortcircuit_to_dest` rather than passthrough. Narrow trigger (orelse explicitly
+  parenthesized into a `&&`/`||` RHS of a plain assignment), hence deferred behind the memory-safety fixes.
+
+(G5's original detailed §G description is retired — the fix landed exactly as the CAUTION prescribed:
+the `(IR_GLOBAL_ROOT_ID, name.field)` key mirrors the bare-ident register/alias/exit machinery and flags
+only a DEFINITELY-freed target, so the BUG-742 register-ctx-then-callback tolerance is preserved.)
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%

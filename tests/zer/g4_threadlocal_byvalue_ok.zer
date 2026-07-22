@@ -1,0 +1,9 @@
+// G4 positive: passing a threadlocal BY VALUE to a spawn is a copy — safe.
+threadlocal u32 tls;
+void worker(u32 v) { u32 y = v; if (y > 100) { return; } }
+u32 main() {
+    tls = 5;
+    ThreadHandle t = spawn worker(tls);
+    t.join();
+    return 0;
+}

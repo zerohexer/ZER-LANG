@@ -739,3 +739,9 @@ emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
 # Documented-safe (582920db #4 baseline lines).
 zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
 zercheck_ir.c:(eff->kind == TYPE_UNION &&
+# 2026-07-22 escape-sink wrapped-slice: intentional DISTINCT-wrapper detection.
+# The check is `target->kind == TYPE_DISTINCT && type_dispatch_kind(unwrapped)==TYPE_SLICE`
+# — it must test for the distinct wrapper SPECIFICALLY (type_dispatch_kind would
+# unwrap it and never return TYPE_DISTINCT), then dispatches the inner via
+# type_dispatch_kind. Safe: not the GAP-F skip-the-unwrap class.
+checker.c:(target && target->kind == TYPE_DISTINCT &&

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// G5 (2026-07-22): a heap pointer stored into a struct-GLOBAL FIELD and then
+// freed leaves g.p dangling — must be flagged like the bare `g = n` form.
+// Was a silent UAF (ir_extract_compound_key fails for a global root, so the
+// projection was never registered under IR_GLOBAL_ROOT_ID).
+struct Node { u32 val; }
+struct Ctx { *Node p; }
+Ctx g;
+void stash() {
+    *Node n = alloc(Node) orelse return;
+    n.val = 7;
+    g.p = n;
+    free(n);          // g.p now dangles
+}
+u32 main() { stash(); return g.p.val; }

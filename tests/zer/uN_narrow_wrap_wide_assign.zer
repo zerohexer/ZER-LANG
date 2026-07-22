@@ -1,0 +1,21 @@
+// Emitter (2026-07-22): plain `x = a + b` where a+b is a narrow/uN result and
+// x is a WIDER lvalue must apply the type-width wrap (var-decl path already
+// did). Was a silent miscompile: u3+u3 gave 14 not 6; u8 200+100 gave 300.
+u32 main() {
+    u3 a = 7; u3 b = 7;
+    u32 viaDecl = a + b;      // 6
+    u32 viaAssign; viaAssign = a + b;   // must also be 6
+    if (viaAssign != viaDecl) { return 1; }
+    if (viaAssign != 6) { return 2; }
+
+    u8 c = 200; u8 d = 100;
+    u32 wideDecl = c + d;     // 44 (u8 wrap)
+    u32 wideAssign; wideAssign = c + d;
+    if (wideAssign != wideDecl) { return 3; }
+    if (wideAssign != 44) { return 4; }
+
+    u8 z = 0;
+    u32 nots; nots = ~z;      // u8 ~0 = 255
+    if (nots != 255) { return 5; }
+    return 0;
+}

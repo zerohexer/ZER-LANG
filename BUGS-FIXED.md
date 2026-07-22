@@ -5,6 +5,54 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-22 — audit wave: G5 struct-global-field UAF + wrapped-slice escape + uN wide-assign wrap (zercheck_ir.c / checker.c / emitter.c)
+
+Multi-agent audit found three holes; all fixed, make check GREEN (1018/0), sink matrix +
+type-dispatch + walker audits clean.
+
+- **BUG (🔴 silent UAF) — G5: struct-global FIELD store dangle, 3-sink patchwork.** `g.p = n;
+  free(n); return;` where g is a struct global compiled clean — a use-after-free across the
+  exit/call boundary, silent on bare-metal (freed slab slot reused). Root cause:
+  `ir_extract_compound_key` resolves a chain root via `ir_find_local_exact_first`, which returns
+  -1 for a file-scope global (no IR local), so NONE of the three store sinks (IR_ASSIGN store,
+  IR_FIELD_WRITE, IR_INDEX_WRITE) ever registered the `g.p` projection under IR_GLOBAL_ROOT_ID.
+  The bare `g = n` form WAS caught (registered directly); only the `.field`/`[k]` projection
+  slipped (the P9-shaped per-sink hole). Fix: shared helper `ir_register_global_field_store`
+  (zercheck_ir.c) keys the projection as `(IR_GLOBAL_ROOT_ID, "g.p")` — FULL path incl. root
+  name to avoid cross-global collisions — sharing n's alloc_id, escaped=true; wired into all
+  three sinks (one query, not three copies). The generic free-propagation + exit rule (~5905) +
+  call-window rule (~2321) flow through unchanged; only DEFINITELY-freed is flagged (BUG-742
+  register-ctx-then-callback tolerance preserved). Tests
+  `tests/zer_fail/g5_struct_global_field_dangle.zer` (reject) +
+  `tests/zer/g5_struct_global_field_reset_ok.zer` (reset compiles).
+- **BUG (accept-unsafe stack-use-after-return) — array FIELD/INDEX of a LOCAL into a WRAPPED-slice
+  global.** `?[*]u8 g; g = s.arr;` (s a local struct) compiled → `g.value.ptr` dangles after
+  return. The wrapped-slice escape sink (checker.c ~5134) required a bare `NODE_IDENT` value, so
+  the field/index shape slipped; the bare `g = buf` form and the plain-`[*]T`-target sink (~4982,
+  which walks field/index) both handle their cases. Fix: the wrapped-slice sink is now the
+  `?[*]T` / `distinct [*]T` specialist (plain slice stays owned by ~4982 to avoid a double error)
+  and walks the value through FIELD/INDEX to the root ident. Test
+  `tests/zer_fail/escape_array_field_optslice_global.zer`.
+- **BUG (silent value miscompile) — uN/narrow arithmetic wrap DROPPED on plain `=` into a WIDER
+  lvalue.** `viaAssign = a + b;` (u3+u3 → u32) gave 14 not 6; `x = c + d;` (u8 200+100) gave 300
+  not 44; `x = ~z;` (u8) gave 0xFFFFFFFF not 255. A plain `x = a+b` is kept whole by lower_expr
+  (passthrough), emitted by emit_rewritten_node's NODE_BINARY/NODE_UNARY, which emitted a bare
+  `(l op r)` with no narrow_cast and no `emit_intn_mask`; the store-side mask (~6645) fires only
+  when the TARGET is a nonnative uN, not when it is wider. The var-decl path (IR_BINOP + mask)
+  and the AST path (emit_expr narrow_cast ~1443) both wrapped correctly. Fix: wrap the
+  width-wrapping ops (+,-,*,&,|,^ and unary -,~) in a carrier-typed GCC stmt-expr +
+  `emit_intn_mask_lv` on both handlers (idempotent with the store mask; precedent = the div
+  stmt-expr just above). Test `tests/zer/uN_narrow_wrap_wide_assign.zer`.
+
+Confirmed-but-NOT-fixed this wave (moved to docs/limitations.md OPEN with reproducers): G2
+(scoped-borrow evaded by a helper laundering `&local`), G3 (atomic-cell plain access via a
+helper), G4 (`&threadlocal` to a scoped spawn) — all TSan-confirmed races in checker.c; and a
+new short-circuit miscompile (`orelse` in a `&&`/`||` RHS of a plain assignment statement is
+eagerly evaluated — ir_lower.c passthrough path). G1 (forward-goto-fires-skipped-defer) was
+re-checked and does NOT reproduce (runtime armed-guard flags handle it).
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

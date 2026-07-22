@@ -6297,6 +6297,41 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  node->binary.op == TOK_SLASH ? "/" : "%", tmp);
             return;
         }
+        /* uN / narrow arithmetic wrap (audit 2026-07-22). A plain `x = a + b`
+         * is kept whole by lower_expr (passthrough — NODE_ASSIGN op==TOK_EQ),
+         * so it is emitted here rather than lowered to IR_BINOP; no
+         * emit_intn_mask runs and no narrow_cast is applied. A narrow/uN
+         * arithmetic result stored into a WIDER lvalue therefore kept the
+         * un-wrapped, C-integer-promoted value (u3+u3 -> 14 not 6; u8
+         * 200+100 -> 300 not 44) — a silent value miscompile the var-decl
+         * path (IR_BINOP + emit_intn_mask) and the AST path (emit_expr
+         * narrow_cast ~1443) both handle. Wrap the width-wrapping ops in a
+         * carrier-typed stmt-expr + emit_intn_mask_lv (idempotent with the
+         * store-side mask at ~6645). Comparisons/logical yield bool and are
+         * untouched. Precedent for the stmt-expr here: the div/mod path above. */
+        if (node->binary.op == TOK_PLUS || node->binary.op == TOK_MINUS ||
+            node->binary.op == TOK_STAR || node->binary.op == TOK_AMP ||
+            node->binary.op == TOK_PIPE || node->binary.op == TOK_CARET) {
+            Type *rtw = type_unwrap_distinct(checker_get_type(e->checker, node));
+            TypeKind rwk = type_dispatch_kind(rtw);
+            bool narrow_native = (rwk == TYPE_U8 || rwk == TYPE_I8 ||
+                rwk == TYPE_U16 || rwk == TYPE_I16);
+            if (narrow_native || type_is_nonnative_intn(rtw)) {
+                int tmp = e->temp_count++;
+                emit(e, "({ ");
+                emit_type(e, rtw);
+                emit(e, " _zer_bw%d = (", tmp);
+                emit_rewritten_node(e, node->binary.left, func);
+                emit(e, " %s ", op);
+                emit_rewritten_node(e, node->binary.right, func);
+                emit(e, "); ");
+                char lvbuf[32];
+                snprintf(lvbuf, sizeof(lvbuf), "_zer_bw%d", tmp);
+                emit_intn_mask_lv(e, rtw, lvbuf);
+                emit(e, "_zer_bw%d; })", tmp);
+                return;
+            }
+        }
         emit(e, "(");
         emit_rewritten_node(e, node->binary.left, func);
         emit(e, " %s ", op);
@@ -6305,7 +6340,32 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         return;
     }
 
-    case NODE_UNARY:
+    case NODE_UNARY: {
+        /* uN / narrow unary wrap (audit 2026-07-22) — same class as the
+         * NODE_BINARY wrap above: `x = ~a` / `x = -a` passthrough kept a raw
+         * C result (u8 ~0 gives 0xFFFFFFFF not 255). Only the value-producing
+         * ops (minus and bitwise-not); logical-not, deref and addr-of are
+         * left alone. */
+        if (node->unary.op == TOK_MINUS || node->unary.op == TOK_TILDE) {
+            Type *rtu = type_unwrap_distinct(checker_get_type(e->checker, node));
+            TypeKind ruk = type_dispatch_kind(rtu);
+            bool narrow_u = (ruk == TYPE_U8 || ruk == TYPE_I8 ||
+                ruk == TYPE_U16 || ruk == TYPE_I16);
+            if (narrow_u || type_is_nonnative_intn(rtu)) {
+                int tmp = e->temp_count++;
+                emit(e, "({ ");
+                emit_type(e, rtu);
+                emit(e, " _zer_uw%d = (%s", tmp,
+                     node->unary.op == TOK_MINUS ? "-" : "~");
+                emit_rewritten_node(e, node->unary.operand, func);
+                emit(e, "); ");
+                char lvbuf[32];
+                snprintf(lvbuf, sizeof(lvbuf), "_zer_uw%d", tmp);
+                emit_intn_mask_lv(e, rtu, lvbuf);
+                emit(e, "_zer_uw%d; })", tmp);
+                return;
+            }
+        }
         switch (node->unary.op) {
         case TOK_MINUS: emit(e, "-"); break;
         case TOK_BANG: emit(e, "!"); break;
@@ -6316,6 +6376,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         }
         emit_rewritten_node(e, node->unary.operand, func);
         return;
+    }
 
     case NODE_FIELD: {
         /* Check object type for accessor: struct uses '.', pointer uses '->' */

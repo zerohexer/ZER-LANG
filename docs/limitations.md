@@ -5,6 +5,52 @@ Entries removed once fixed.
 
 ---
 
+## ✅ DONE (2026-07-22) — audit wave: 3 fixed (G5 UAF + 2 new), 4 confirmed-open below
+
+Multi-agent audit (emitter / checker-escape / zercheck_ir / checker-concurrency /
+ir_lower). Three holes fixed + verified (make check GREEN 1018/0, sink matrix CLEAN,
+type-dispatch audit clean); four more CONFIRMED-reproducing and moved to the OPEN
+entries below with reproducers.
+
+- **G5 — struct-global FIELD store dangle (🔴 silent UAF), 3-sink patchwork.** `g.p = n;
+  free(n);` (g a struct global) left `g.p` dangling UNOBSERVED — `ir_extract_compound_key`
+  returns -1 for a global root (no IR local), so NONE of the three store sinks (IR_ASSIGN
+  store, IR_FIELD_WRITE, IR_INDEX_WRITE) registered the projection. The bare `g = n` form
+  WAS caught; only the `.field`/`[k]` projection slipped (P9-shaped). Fix: shared helper
+  `ir_register_global_field_store` (zercheck_ir.c) registers the projection under
+  `(IR_GLOBAL_ROOT_ID, "g.p")` sharing n's alloc_id, escaped=true — one query wired into
+  all three sinks; the generic free-propagation + exit rule (~5905) + call-window rule
+  (~2321) flow through unchanged; only DEFINITELY-freed flagged (BUG-742 conservatism
+  preserved). Tests `tests/zer_fail/g5_struct_global_field_dangle.zer` +
+  `tests/zer/g5_struct_global_field_reset_ok.zer`. (This closes the G5 that had been
+  listed under the old §G documented-gaps.)
+- **Checker escape — array FIELD/INDEX of a LOCAL into a WRAPPED-slice global (accept-unsafe
+  stack-use-after-return).** `?[*]u8 g; g = s.arr;` (s a local struct) compiled — the
+  wrapped-slice sink (checker.c ~5134) required a bare `NODE_IDENT` value, so the
+  field/index shape slipped, while the plain-`[*]T` sink (~4982) handles it. The bare
+  `g = buf` form WAS caught. Fix: the wrapped-slice sink (now the `?[*]T` / `distinct [*]T`
+  specialist; plain slice stays owned by the ~4982 sink to avoid a double error) walks the
+  value through FIELD/INDEX to the root ident. Test
+  `tests/zer_fail/escape_array_field_optslice_global.zer`.
+- **Emitter — uN/narrow arithmetic wrap DROPPED on a plain `=` into a WIDER lvalue (silent
+  value miscompile).** `viaAssign = a + b;` (u3+u3 → u32) yielded 14 not 6; `x = c + d;`
+  (u8 200+100) yielded 300 not 44; `x = ~z;` (u8) yielded 0xFFFFFFFF not 255. The var-decl
+  path lowers to IR_BINOP (masked); a plain `x = a+b` is kept whole by lower_expr
+  (passthrough) and emitted by emit_rewritten_node's NODE_BINARY/NODE_UNARY, which emitted a
+  bare `(l op r)` with no narrow_cast/mask, and the store-side mask (~6645) fires only for a
+  nonnative-uN TARGET (not a wider one). Fix: wrap the width-wrapping ops (+,-,*,&,|,^ and
+  unary -,~) in a carrier-typed stmt-expr + `emit_intn_mask_lv` on both handlers (idempotent
+  with the store mask). Test `tests/zer/uN_narrow_wrap_wide_assign.zer`.
+
+**Also this wave:** G1 (forward-goto-fires-skipped-defer) was re-checked and does NOT
+reproduce on current main — the runtime per-defer armed-guard flags correctly skip the
+unarmed defer (empirically lockc stays 0). The old §G "G1" and the stale limitations.md
+claim that "goto skipping a defer is correct" are both consistent with the guard-flag
+behavior; no fix needed. The documented bool↔int C-cast "gap" is likewise NOT a soundness
+hole — the emitter normalizes int→bool via `!!` (only {0,1} reachable).
+
+---
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),
@@ -634,14 +680,17 @@ an ASan build).
   aliasing assignment. (No dedicated test file — repro in the commit message.) **In-main: NOT present** —
   main zercheck_ir.c ~3819 still a plain `if` right after the reallocating `ir_add_handle` at ~3813.
 
-### G. Documented-but-unfixed gaps — `fxvnsu` `9fea9990` (reproducers in `tests/zer_gaps/`, compile-clean today = the gap; move to `tests/zer_fail/` when fixed) (5)
-- **G1 — forward `goto` fires a defer it textually skipped** (🟡 miscompile). `gap_goto_skips_defer.zer`.
-  The acquire / `goto done` / `defer release()` idiom underflows a lock counter (release fires on the error
-  path where acquire never ran). Root cause: `ir_lower.c` fires function-scope defers as a static set at
-  every exit/goto-target; only defers registered AFTER the goto source are runtime-skipped
-  (`defer_count_at_def` handles back-edges; the "goto BEFORE the defer, label AFTER" shape is unhandled).
-  Proper fix: per-defer runtime "armed" flags (like the plt86m `defer_fire_guard_flag`); sound interim:
-  reject a forward goto that skips a defer registration. NOT the documented back-edge/bh18_12 case.
+### G. Documented gaps — G5 FIXED 2026-07-22; G1 NOT-REPRO; G2/G3/G4 CONFIRMED-OPEN
+- **G1 — forward `goto` fires a defer it textually skipped** — ✅ NOT REPRODUCING (2026-07-22).
+  Re-checked empirically: `if(early){goto done;} defer release(); done: return;` on the `early` path leaves
+  the lock counter at 0 — the defer does NOT fire. The runtime per-defer armed-guard flags
+  (`defer_fire_guard_flag`) correctly skip the unarmed defer, so the static-snapshot over-fire the code
+  trace suggested does not occur. No fix needed. (Superseded the stale limitations.md line that claimed the
+  opposite reasoning but the same outcome.)
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** — ✅ FIXED 2026-07-22 (see the
+  DONE section at the top of this file). `ir_register_global_field_store` now registers `g.p`/`g[k]`
+  projections under `IR_GLOBAL_ROOT_ID` at all three store sinks; `g.p = n; free(n); return` is rejected,
+  `... g.p = null;` compiles.
 - **G2 — scoped-borrow exclusivity evaded by a helper laundering `&local`** (🟠 race, TSan-confirmed).
   `gap_scoped_borrow_via_helper.zer`. A stack local borrowed by a scoped `spawn` is exclusive until
   `.join()`; the DIRECT `local.v=7;` between spawn/join IS rejected but `poke(&local)` is not — the borrow
@@ -656,17 +705,9 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
-  the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
-  ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
-  the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:
-  storing into a `shared struct` field + reading from a worker = silent cross-thread UAF on a reused slab
-  slot (observably reproduced, exit=999). CAUTION for the fixer: extends the BUG-742 global-dangle
-  conservatism — the maintainer deliberately does NOT flag MAYBE_FREED globals at exit (avoids noising the
-  legit register-ctx-then-callback pattern); a field-projection fix must flag only a DEFINITELY-freed
-  target, mirroring the bare-ident register/alias/exit machinery for the compound `(IR_GLOBAL_ROOT_ID,
-  name.field)` key.
+  (G5's original detailed description is retired — the fix landed exactly as the CAUTION prescribed:
+  the `(IR_GLOBAL_ROOT_ID, name.field)` key mirrors the bare-ident register/alias/exit machinery and flags
+  only a DEFINITELY-freed target, so the BUG-742 register-ctx-then-callback tolerance is preserved.)
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%

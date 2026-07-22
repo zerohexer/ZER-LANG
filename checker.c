@@ -5131,41 +5131,58 @@ static Type *check_expr(Checker *c, Node *node) {
         }
         } /* end TOK_EQ outer block wrapping the @ptrcast-aware path */
 
-        /* scope escape: assigning local array to global slice (implicit coercion).
-         * #9: target is slice-like if a slice OR an optional-of-slice — a `?[*]T`
-         * target (TYPE_OPTIONAL) previously hid the local-array-into-global dangling
-         * store from this check (which gated on bare TYPE_SLICE). */
+        /* scope escape: assigning local array to a WRAPPED-slice global (implicit
+         * coercion). This is the specialist sibling of the plain-TYPE_SLICE sink
+         * above (block ~4982, which already walks FIELD/INDEX to the value root and
+         * also catches pointer-param targets). It covers the two wrappers that hide
+         * the inner slice kind so the plain-slice sink skips them:
+         *   `?[*]T`         (TYPE_OPTIONAL of slice), and
+         *   `distinct [*]T` (TYPE_DISTINCT of slice).
+         * Plain TYPE_SLICE is deliberately EXCLUDED here to avoid a double error —
+         * block 4982 owns it fully. The value root is walked through FIELD/INDEX so
+         * `g = s.arr` / `g = m[i]` (array field/index of a LOCAL) is rejected, not
+         * just a bare `g = buf` (the NODE_IDENT-only gate was the accept-unsafe hole:
+         * a stack-use-after-return slipped for the field/index shape). */
         Type *tgt_su_esc = target ? type_unwrap_distinct(target) : NULL;
-        bool tgt_slice_like_esc = tgt_su_esc &&
-            (type_dispatch_kind(tgt_su_esc) == TYPE_SLICE ||
-             (type_dispatch_kind(tgt_su_esc) == TYPE_OPTIONAL &&
-              type_dispatch_kind(tgt_su_esc->optional.inner) == TYPE_SLICE));
-        if (node->assign.op == TOK_EQ && tgt_slice_like_esc &&
-            value && type_unwrap_distinct(value)->kind == TYPE_ARRAY &&
-            node->assign.value->kind == NODE_IDENT) {
-            const char *vname = node->assign.value->ident.name;
-            uint32_t vlen = (uint32_t)node->assign.value->ident.name_len;
-            Symbol *val_sym = scope_lookup(c->current_scope, vname, vlen);
-            bool val_is_global = val_sym &&
-                scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-            if (val_sym && !val_sym->is_static && !val_is_global) {
-                /* check if target is global/static */
-                Node *root = node->assign.target;
-                while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-                    if (root->kind == NODE_FIELD) root = root->field.object;
-                    else root = root->index_expr.object;
-                }
-                if (root && root->kind == NODE_IDENT) {
-                    Symbol *tgt_sym = scope_lookup(c->current_scope,
-                        root->ident.name, (uint32_t)root->ident.name_len);
-                    bool tgt_is_global = tgt_sym &&
-                        (tgt_sym->is_static ||
-                         scope_lookup_local(c->global_scope, tgt_sym->name, tgt_sym->name_len) != NULL);
-                    if (tgt_is_global) {
-                        checker_error(c, node->loc.line,
-                            "cannot store local array '%.*s' in global/static slice — "
-                            "pointer will dangle after function returns",
-                            (int)vlen, vname);
+        bool tgt_wrapped_slice_esc = tgt_su_esc &&
+            ((type_dispatch_kind(tgt_su_esc) == TYPE_OPTIONAL &&
+              type_dispatch_kind(tgt_su_esc->optional.inner) == TYPE_SLICE) ||
+             (target && target->kind == TYPE_DISTINCT &&
+              type_dispatch_kind(tgt_su_esc) == TYPE_SLICE));
+        if (node->assign.op == TOK_EQ && tgt_wrapped_slice_esc &&
+            value && type_unwrap_distinct(value)->kind == TYPE_ARRAY) {
+            /* value root — walk FIELD/INDEX to the root ident (mirrors block 4982). */
+            Node *vroot = node->assign.value;
+            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
+                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
+                else vroot = vroot->index_expr.object;
+            }
+            if (vroot && vroot->kind == NODE_IDENT) {
+                const char *vname = vroot->ident.name;
+                uint32_t vlen = (uint32_t)vroot->ident.name_len;
+                Symbol *val_sym = scope_lookup(c->current_scope, vname, vlen);
+                bool val_is_global = val_sym &&
+                    (val_sym->is_static ||
+                     scope_lookup_local(c->global_scope, vname, vlen) != NULL);
+                if (val_sym && !val_is_global) {
+                    /* check if target is global/static */
+                    Node *root = node->assign.target;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        Symbol *tgt_sym = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        bool tgt_is_global = tgt_sym &&
+                            (tgt_sym->is_static ||
+                             scope_lookup_local(c->global_scope, tgt_sym->name, tgt_sym->name_len) != NULL);
+                        if (tgt_is_global) {
+                            checker_error(c, node->loc.line,
+                                "cannot store local array '%.*s' in global/static slice — "
+                                "pointer will dangle after function returns",
+                                (int)vlen, vname);
+                        }
                     }
                 }
             }

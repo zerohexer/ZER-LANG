@@ -5,6 +5,24 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-22 (batch 3) — short-circuit `orelse` in a `&&`/`||` RHS of a plain assignment (ir_lower.c)
+
+- **BUG (silent miscompile) — short-circuit violation.** `x = a && (ping() orelse false);` ran
+  `ping()` even when `a` was false; a trap (OOB/div-guard) inside the orelse source likewise fired
+  spuriously on the short-circuited path. Root cause: a plain `x = <expr>` statement goes to
+  lower_expr's passthrough (NODE_ASSIGN op==TOK_EQ, ir_lower.c ~801), which hands the whole RHS to
+  `pre_lower_orelse` — that hoists the nested orelse into an eagerly-computed temp BEFORE the `&&`,
+  rather than routing through `lower_shortcircuit_to_dest` (the path var-decl-init / call-args /
+  cond / return all use, all correct). `find_orelse` doesn't recurse into NODE_BINARY, so the
+  NODE_EXPR_STMT statement-level interceptor missed the shape. Fix: on the plain-`=` path, reroute
+  the RHS through lower_expr → lower_shortcircuit_to_dest when it is a `&&`/`||` binary CARRYING a
+  nested orelse (new `sc_expr_has_orelse` gate — the common `x = a && b` keeps its native
+  passthrough emission); the decompose returns the RHS value (`val_local`) so plain
+  assignment-as-expression (`y = (x = a && …)`) still yields correctly. Test
+  `tests/zer/shortcircuit_orelse_assign_ok.zer`.
+
+---
+
 ## 2026-07-22 (batch 2) — concurrency races G4 + G2 (checker.c)
 
 Two TSan-confirmed data races, both intra-function fixes with near-zero over-rejection.

@@ -714,16 +714,15 @@ an ASan build).
   outright (the borrow-setup loop skipped threadlocals as globals → no borrow; and the child writes the
   PARENT's TLS slot). Mirrors the A5/BUG-757 fire-and-forget rejection; by-value stays legal. Tests
   `tests/zer_fail/g4_threadlocal_amp_scoped_spawn.zer` + `tests/zer/g4_threadlocal_byvalue_ok.zer`.
-- **NEW — short-circuit `orelse` in a `&&`/`||` RHS of a plain assignment is eagerly evaluated** (🟡 silent
-  miscompile) — OPEN. Reproducer `tests/zer_gaps/shortcircuit_orelse_eager_assign.zer`. `x = a && (ping()
-  orelse false);` runs `ping()` even when `a` is false — a plain `x = <expr>` statement goes to lower_expr's
-  passthrough (NODE_ASSIGN op==TOK_EQ, ir_lower.c ~801) which hands the whole RHS to `pre_lower_orelse`
-  (hoists the nested orelse into an eagerly-computed temp BEFORE the `&&`) instead of routing through
-  `lower_shortcircuit_to_dest` (used by var-decl-init, call-args, cond, return — all correct). A trap inside
-  the orelse source (OOB/div-guard) would also fire spuriously. Fix: on the passthrough path, when the RHS
-  is a short-circuit `&&`/`||` carrying a nested orelse (anything `pre_lower_orelse` would hoist), route the
-  RHS through `lower_shortcircuit_to_dest` rather than passthrough. Narrow trigger (orelse explicitly
-  parenthesized into a `&&`/`||` RHS of a plain assignment), hence deferred behind the memory-safety fixes.
+- **short-circuit `orelse` in a `&&`/`||` RHS of a plain assignment eagerly evaluated** — ✅ FIXED
+  2026-07-22. `x = a && (ping() orelse false);` ran `ping()` even when `a` was false (and a trap inside the
+  orelse fired spuriously). Root: a plain `x = <expr>` goes to lower_expr's passthrough (NODE_ASSIGN
+  op==TOK_EQ, ir_lower.c ~801), which hands the RHS to `pre_lower_orelse` (hoists the nested orelse BEFORE
+  the `&&`) instead of `lower_shortcircuit_to_dest`. Fix: reroute a plain-`=` RHS through lower_expr →
+  lower_shortcircuit_to_dest when it is a `&&`/`||` binary CARRYING a nested orelse (`sc_expr_has_orelse`
+  gate — the common `x = a && b` keeps native passthrough); the decompose returns the RHS value so
+  assignment-as-expression (`y = (x = a && …)`) still yields correctly. Test
+  `tests/zer/shortcircuit_orelse_assign_ok.zer` (&&-skip, ||-skip, assign-as-expr value, no spurious trap).
 
 (G5's original detailed §G description is retired — the fix landed exactly as the CAUTION prescribed:
 the `(IR_GLOBAL_ROOT_ID, name.field)` key mirrors the bare-ident register/alias/exit machinery and flags

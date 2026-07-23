@@ -1,0 +1,21 @@
+// GAP (audit 2026-07-23): forward goto out of a loop carrying a loop-scoped defer
+// re-fires that defer on the NATURAL fall-through path -> double-free on success.
+// loop_d should be 3 (one per iteration); it is 4 (spurious fire at the label).
+// Compile-clean today = the bug. Move to tests/zer_fail/ (or a runtime assert) when fixed.
+i32 printf(const *u8 fmt, ...);
+i32 loop_d;
+void f(bool early) {
+    for (u32 i = 0; i < 3; i += 1) {
+        defer loop_d += 1;
+        if (early == true && i == 1) { goto done; }
+    }
+done:
+    return;
+}
+u32 main() {
+    loop_d = 0;
+    f(false);
+    // BUG: loop_d == 4 here, not 3.
+    if (loop_d != 3) { return 1; }
+    return 0;
+}

@@ -5131,25 +5131,50 @@ static Type *check_expr(Checker *c, Node *node) {
         }
         } /* end TOK_EQ outer block wrapping the @ptrcast-aware path */
 
-        /* scope escape: assigning local array to global slice (implicit coercion).
-         * #9: target is slice-like if a slice OR an optional-of-slice — a `?[*]T`
-         * target (TYPE_OPTIONAL) previously hid the local-array-into-global dangling
-         * store from this check (which gated on bare TYPE_SLICE). */
+        /* scope escape: assigning local array to an OPTIONAL-slice global
+         * (`?[*]T g`). The bare-slice-target case is handled by the sink above
+         * (BUG-240/377, checker.c ~4982) which walks FIELD/INDEX value chains via
+         * classify_escape_sink; this block owns ONLY the optional-slice target
+         * (TYPE_OPTIONAL wrapping a slice), which that sink's `target->kind ==
+         * TYPE_SLICE` gate skips. Split by target kind so the two never
+         * double-fire.
+         *
+         * audit 2026-07-23 (gifted-noether): #9 fixed the bare-ident value
+         * (`g = buf`) but gated on `value->kind == NODE_IDENT`, so a FIELD/INDEX-
+         * projected local array value (`g = local.arr`, `g = grid[0]`) into an
+         * optional-slice global slipped BOTH sinks → dangling global slice
+         * (ASan stack-use-after-return). Walk the value chain to its root ident
+         * like the return sink (checker.c ~12278) so projections are covered. */
         Type *tgt_su_esc = target ? type_unwrap_distinct(target) : NULL;
-        bool tgt_slice_like_esc = tgt_su_esc &&
-            (type_dispatch_kind(tgt_su_esc) == TYPE_SLICE ||
-             (type_dispatch_kind(tgt_su_esc) == TYPE_OPTIONAL &&
-              type_dispatch_kind(tgt_su_esc->optional.inner) == TYPE_SLICE));
-        if (node->assign.op == TOK_EQ && tgt_slice_like_esc &&
+        bool tgt_optslice_esc = tgt_su_esc &&
+            type_dispatch_kind(tgt_su_esc) == TYPE_OPTIONAL &&
+            type_dispatch_kind(tgt_su_esc->optional.inner) == TYPE_SLICE;
+        Node *ovroot = node->assign.value;
+        while (ovroot && (ovroot->kind == NODE_FIELD || ovroot->kind == NODE_INDEX)) {
+            ovroot = (ovroot->kind == NODE_FIELD) ? ovroot->field.object
+                                                  : ovroot->index_expr.object;
+        }
+        if (node->assign.op == TOK_EQ && tgt_optslice_esc &&
             value && type_unwrap_distinct(value)->kind == TYPE_ARRAY &&
-            node->assign.value->kind == NODE_IDENT) {
-            const char *vname = node->assign.value->ident.name;
-            uint32_t vlen = (uint32_t)node->assign.value->ident.name_len;
+            ovroot && ovroot->kind == NODE_IDENT) {
+            const char *vname = ovroot->ident.name;
+            uint32_t vlen = (uint32_t)ovroot->ident.name_len;
             Symbol *val_sym = scope_lookup(c->current_scope, vname, vlen);
             bool val_is_global = val_sym &&
                 scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-            if (val_sym && !val_sym->is_static && !val_is_global) {
-                /* check if target is global/static */
+            /* by-reference array PARAM decays to caller memory — the escape is
+             * gated at the CALL SITE (BUG-764 class, mirrors the return sink). */
+            bool val_is_param = false;
+            if (val_sym && c->current_func_node) {
+                Node *fn = c->current_func_node;
+                for (int pi = 0; pi < fn->func_decl.param_count; pi++) {
+                    if (fn->func_decl.params[pi].name_len == vlen &&
+                        memcmp(fn->func_decl.params[pi].name, vname,
+                               (size_t)vlen) == 0) { val_is_param = true; break; }
+                }
+            }
+            if (val_sym && !val_sym->is_static && !val_is_global && !val_is_param) {
+                /* check if target root is global/static */
                 Node *root = node->assign.target;
                 while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                     if (root->kind == NODE_FIELD) root = root->field.object;
@@ -5196,10 +5221,13 @@ static Type *check_expr(Checker *c, Node *node) {
              * only check that fires on the `?`-wrapped strip. */
             Type *tgv = type_unwrap_distinct(target);
             Type *vgv = type_unwrap_distinct(value);
-            while (tgv && vgv && tgv->kind == TYPE_OPTIONAL && vgv->kind == TYPE_OPTIONAL) {
+            /* Peel each side's optional INDEPENDENTLY — see the matching var-decl
+             * fix (audit 2026-07-23): the asymmetric `mp = <volatile *u32>` where
+             * mp is `?*u32` was missed by the lockstep peel and stripped volatile. */
+            while (tgv && type_dispatch_kind(tgv) == TYPE_OPTIONAL)
                 tgv = type_unwrap_distinct(tgv->optional.inner);
+            while (vgv && type_dispatch_kind(vgv) == TYPE_OPTIONAL)
                 vgv = type_unwrap_distinct(vgv->optional.inner);
-            }
             if (tgv && vgv && tgv->kind == TYPE_POINTER && vgv->kind == TYPE_POINTER &&
                 !tgv->pointer.is_volatile) {
                 bool val_volatile = vgv->pointer.is_volatile;
@@ -5607,7 +5635,17 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (node->call.arg_count != 0)
                             checker_error(c, node->loc.line, "ThreadHandle.join() takes no arguments");
                         /* Scoped-borrow exclusivity: join ends the borrow — the
-                         * thread is done, the parent may use the local again. */
+                         * thread is done, the parent may use the locals again.
+                         * Release EVERY borrowed local (audit 2026-07-23:
+                         * multi-arg spawns borrow all their &ident args). */
+                        for (int bk = 0; bk < osym2->th_borrow_count; bk++) {
+                            Symbol *bv = scope_lookup(c->current_scope,
+                                osym2->th_borrow_names[bk],
+                                osym2->th_borrow_name_lens[bk]);
+                            if (bv) bv->is_borrowed_by_thread = false;
+                        }
+                        osym2->th_borrow_count = 0;
+                        /* legacy single-slot (unused by the new list, kept clear) */
                         if (osym2->th_borrows_name) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrows_name, osym2->th_borrows_name_len);
@@ -10579,11 +10617,20 @@ static void check_stmt(Checker *c, Node *node) {
                 {
                     Type *tv = type_unwrap_distinct(type);
                     Type *itv = type_unwrap_distinct(init_type);
-                    while (tv && itv && tv->kind == TYPE_OPTIONAL &&
-                           itv->kind == TYPE_OPTIONAL) {
+                    /* Peel each side's optional wrappers INDEPENDENTLY (audit
+                     * 2026-07-23, gifted-noether): the prior lockstep peel
+                     * (`tv && itv && both OPTIONAL`) missed the ASYMMETRIC
+                     * `?*u32 mp = <volatile *u32>` (T→?T coercion) — target
+                     * optional, source a bare volatile pointer → loop never ran,
+                     * tv stayed OPTIONAL, the pointer check below never fired, and
+                     * volatile was silently stripped (emitted C reads MMIO
+                     * non-volatilely → hoistable). Independent peel catches it;
+                     * `?volatile *u32 = volatile *u32` still accepted (inner ptr
+                     * volatile on both). */
+                    while (tv && type_dispatch_kind(tv) == TYPE_OPTIONAL)
                         tv = type_unwrap_distinct(tv->optional.inner);
+                    while (itv && type_dispatch_kind(itv) == TYPE_OPTIONAL)
                         itv = type_unwrap_distinct(itv->optional.inner);
-                    }
                     if (tv && itv && tv->kind == TYPE_POINTER && itv->kind == TYPE_POINTER &&
                         !tv->pointer.is_volatile && !node->var_decl.is_volatile) {
                         bool src_volatile = itv->pointer.is_volatile;
@@ -14064,10 +14111,22 @@ static void check_stmt(Checker *c, Node *node) {
                 typemap_set(c, node, ty_u64);
                 /* Scoped-borrow exclusivity: a non-shared stack local lent via
                  * `&x` to a scoped spawn is exclusively borrowed by the thread
-                 * until `th.join()`. Mark the FIRST such arg borrowed (and
-                 * record it on the handle so join clears it); a parent WRITE to
-                 * it before join is a data race. Shared structs are excluded
-                 * (auto-locked); globals/statics outlive the thread. */
+                 * until `th.join()`. A parent WRITE to it before join is a data
+                 * race. Shared structs are excluded (auto-locked); globals/statics
+                 * outlive the thread.
+                 *
+                 * audit 2026-07-23 (gifted-noether): borrow EVERY `&ident` arg,
+                 * not just the first (`spawn w(&x,&y)` raced on y), and REJECT an
+                 * already-borrowed local (`spawn w(&x); spawn w(&x)` = two live
+                 * threads on one stack slot = worker-vs-worker race). The handle
+                 * records all borrowed locals so join() releases each. */
+                if (node->spawn_stmt.arg_count > 0) {
+                    sym->th_borrow_names = (const char **)arena_alloc(c->arena,
+                        (size_t)node->spawn_stmt.arg_count * sizeof(const char *));
+                    sym->th_borrow_name_lens = (uint32_t *)arena_alloc(c->arena,
+                        (size_t)node->spawn_stmt.arg_count * sizeof(uint32_t));
+                    sym->th_borrow_count = 0;
+                }
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
                     if (!ba || ba->kind != NODE_UNARY ||
@@ -14084,10 +14143,21 @@ static void check_stmt(Checker *c, Node *node) {
                     bool vshared = vt && vt->kind == TYPE_STRUCT &&
                         (vt->struct_type.is_shared || vt->struct_type.is_shared_rw);
                     if (vshared) continue;
+                    if (vs->is_borrowed_by_thread) {
+                        checker_error(c, node->loc.line,
+                            "'%.*s' is already borrowed by another live scoped "
+                            "thread — join that thread before lending it again "
+                            "(two threads sharing a stack local is a data race)",
+                            (int)vl, vn);
+                        continue;
+                    }
                     vs->is_borrowed_by_thread = true;
-                    sym->th_borrows_name = vn;
-                    sym->th_borrows_name_len = vl;
-                    break; /* track the first borrowed local (common case) */
+                    if (sym->th_borrow_names &&
+                        sym->th_borrow_count < node->spawn_stmt.arg_count) {
+                        sym->th_borrow_names[sym->th_borrow_count] = vn;
+                        sym->th_borrow_name_lens[sym->th_borrow_count] = vl;
+                        sym->th_borrow_count++;
+                    }
                 }
             }
         }

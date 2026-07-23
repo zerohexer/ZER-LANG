@@ -5,6 +5,80 @@ Entries removed once fixed.
 
 ---
 
+## audit 2026-07-23 (gifted-noether-3o10j6) — 5 memory-safety/correctness holes FIXED, 3 documented OPEN
+
+A fresh multi-agent adversarial audit (4 parallel finders + hand verification) against this
+branch. Every finding below was REPRODUCED and, for memory-safety holes, PROVEN (ASan
+stack-use-after-return / TSan data-race / observed freed-slot read). VRP/bounds + emitter
+dual-path were separately audited and found **CLEAN** (the §A range-JOIN fixes are genuinely
+present and working here; uN/iN masks complete; no AST-vs-IR wrapper divergence).
+
+### ✅ FIXED this session (make check 1023/0 ZER + 200/0 fuzz, sink matrix 44 CLEAN, all audits clean)
+- **G5 — heap ptr into struct-global FIELD dangles** (🔴 UAF). See the G5 entry below (now
+  marked ✅). Also closed the `g_arr[0] = n` array-element sibling.
+- **Opt-slice-global escape via projected value** (🔴 accept-unsafe stack-UAF). `?[*]u8 g;
+  g = local.arr;` (or `g = grid[0]`) — a FIELD/INDEX-projected LOCAL array stored into an
+  OPTIONAL-slice global slipped BOTH escape sinks (the bare-slice sink gated on
+  `target->kind == TYPE_SLICE`; the #9 optional sink gated on `value->kind == NODE_IDENT`).
+  Dangling global slice, ASan-confirmed. Fix (checker.c ~5134): the optional-slice-target sink
+  now walks the value chain to its root ident (mirroring the return sink) and excludes by-ref
+  array params (BUG-764 class); split by target kind so it never double-fires with the
+  bare-slice sink. Tests `tests/zer_fail/escape_optslice_projected_global.zer`.
+- **Volatile-strip via asymmetric optional wrap** (🟠 MMIO correctness). `volatile *u32 vp;
+  ?*u32 mp = vp;` (and the assignment form) silently stripped volatile — the BUG-747 lockstep
+  optional-peel required BOTH sides optional, so the `T → ?T` coercion was never peeled and the
+  emitted C read the register non-volatilely (hoistable). Fix (checker.c ~5197 assign, ~10580
+  var-decl): peel each side's optional INDEPENDENTLY (via `type_dispatch_kind`) before comparing
+  `pointer.is_volatile`. `?volatile *u32 = volatile *u32` stays accepted. Tests
+  `tests/zer_fail/volatile_strip_optional_{vardecl,assign}.zer`.
+- **Scoped-spawn double-borrow of the same `&local`** (🔴 worker-vs-worker race, TSan-confirmed).
+  `ThreadHandle t1 = spawn w(&local); ThreadHandle t2 = spawn w(&local);` — the borrow flag was
+  set UNCONDITIONALLY, so two live threads shared one stack slot with zero synchronization. Fix
+  (checker.c ~14071): reject an already-borrowed local at establishment.
+- **Scoped-spawn multi-arg borrow tracked only the FIRST arg** (🔴 race, TSan-confirmed). `spawn
+  w(&x, &y)` borrowed only `x`; a parent write to `y` compiled. Fix: the ThreadHandle now records
+  ALL borrowed `&ident` args (arena-backed list on the Symbol, types.h) and join() releases each.
+  Tests `tests/zer_fail/scoped_spawn_{double_borrow,multiarg_race}.zer` +
+  `tests/zer/scoped_spawn_{multiarg,sequential_borrow}_ok.zer`.
+
+  **BUILD NOTE for the next session:** adding fields to the `Symbol` struct in types.h caused a
+  layout-mismatch SEGFAULT under `make zerc` because the Makefile has NO header-dependency
+  tracking — only the `.c` files you touched rebuild, so every other `.o` kept the old struct
+  size. ANY types.h/checker.h/ast.h struct change REQUIRES `rm -f *.o src/safety/*.o` before
+  rebuild. (Symptom: broad `make check` segfaults on trivial programs — do not debug the source,
+  clean-rebuild first. Same class as the CLAUDE.md stale-`.o` trap, header-triggered.)
+
+### OPEN — found this session, NOT yet fixed (documented for a focused follow-up)
+- **goto-defer double-fire → double-FREE on the SUCCESS path** (🔴 miscompile, NEW — distinct
+  from G1). A forward `goto` out of a nested scope (loop/if body carrying a `defer`) to a label
+  AFTER that scope re-fires the nested-scope defer on the NATURAL fall-through path (where the
+  goto was never taken). Reproducer: `for(..){ defer d+=1; if(cond) goto done; } done:` runs the
+  loop defer N+1 times, not N; with `defer free(b)` inside the loop this emits a double-free on
+  the success path, and zercheck accepts it silently. Root: `ir_lower.c` NODE_LABEL `restore_count`
+  re-arm (~3547): the label bumps its exit-fire count to include the inner goto's live-defer
+  count, but those defers already fired+popped at loop-iteration exit on the fall-through path;
+  the guard flag suppresses the re-fire only on the goto path. The durable fix is per-defer
+  runtime "armed" flags (subsumes this, G1, and the eager-goto guard); the sound interim is to
+  reject a forward goto whose live-defer set mismatches the label's. NOT attempted here —
+  control-flow lowering is high-risk and warrants its own focused session. Reproducer preserved
+  in `tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer` (compile-clean today = the bug).
+- **ISR global access laundered through a funcptr bypasses the volatile/RMW checks** (🟠 silent
+  bare-metal, NEW — sibling of the shipped §C #12). `record_isr_globals` follows only DIRECT
+  calls into global functions; an ISR touching a shared global through a local funcptr binding
+  (`*() fp = bump; fp();`) never triggers "must be declared volatile" / non-atomic-RMW. Root:
+  checker.c ~15800 gates call-following on `callee->kind == NODE_IDENT` resolving to a function —
+  exactly the gap `scan_funcname_binding` closed for the spawn scanner (§C #11), never applied to
+  the ISR scanner. Clean fix: give `record_isr_globals` the same funcname-binding descent. Repro
+  `tests/zer_gaps/gap_isr_funcptr_launder.zer`.
+- **Scoped-borrow / atomic-cell exclusivity evaded through a HELPER** (🟠 races, TSan-confirmed —
+  the documented G2/G3/G4, still live). `poke(&local)` between spawn/join (G2), a plain
+  atomic-cell access moved into `poke(){ g_ctr=5; }` (G3), and `&threadlocal` handed to a scoped
+  spawn (G4) are all uncaught because the borrow/plain-access analysis is intra-name /
+  intra-function and does not treat `&x` handed to a helper as an access. Unified root with the
+  now-fixed double-borrow/multi-arg holes: the scoped-borrow establishment does not follow the
+  pointer THROUGH a helper call. Left open — needs the borrow-set to become inter-procedural
+  (a summary "does this callee access/borrow its pointer arg?"), a subsystem-scale change.
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),

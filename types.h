@@ -244,8 +244,20 @@ struct Symbol {
      * sound for the straight-line spawn→write→join pattern; conservative for
      * branches. */
     bool is_borrowed_by_thread;
-    const char *th_borrows_name;
+    const char *th_borrows_name;      /* legacy single-slot — superseded by th_borrow_* list below */
     uint32_t th_borrows_name_len;
+    /* Multi-arg scoped-borrow list (audit 2026-07-23, gifted-noether): a scoped
+     * spawn may borrow SEVERAL locals — `spawn w(&x, &y)` — and the SAME local
+     * must not be borrowed by two live threads at once (worker-vs-worker race on
+     * a shared stack slot). The prior single th_borrows_name tracked only the
+     * FIRST &ident arg (a `break` after the first match), so a write to any other
+     * borrowed arg raced clean, and a second `spawn w(&x)` re-borrowed x clean.
+     * The ThreadHandle now records ALL borrowed locals (arena-allocated, sized to
+     * the spawn arg count) so join() releases each; establishment rejects an
+     * already-borrowed local. */
+    const char **th_borrow_names;
+    uint32_t *th_borrow_name_lens;
+    int th_borrow_count;
     /* A6-full atomic-cell inclusion (2026-06-21): set on a scalar GLOBAL the
      * first time it is the target of an `@atomic_*`. Strict (Rust) model: once a
      * location is atomic, ALL access must be atomic — a plain access anywhere

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// audit 2026-07-23: two live scoped spawns borrowing the SAME &local = worker-vs-worker
+// data race on a shared stack slot (TSan-confirmed). The borrow was set unconditionally.
+struct W { u32 v; }
+void worker(*W w) { w.v += 1; }
+u32 main() {
+    W local; local.v = 0;
+    ThreadHandle t1 = spawn worker(&local);
+    ThreadHandle t2 = spawn worker(&local);
+    t1.join();
+    t2.join();
+    return local.v;
+}

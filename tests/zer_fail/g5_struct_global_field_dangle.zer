@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// G5 (gifted-noether audit 2026-07-23): a heap pointer stored into a struct-GLOBAL
+// FIELD then freed leaves the field dangling. The bare-global `g = n; free(n)` was
+// caught (BUG-739); the `.field` projection sink was missed → silent UAF (a later
+// `if (g.p) |np| np.val` reads freed slab memory). Now flagged: "global 'g.p' left
+// dangling at function exit".
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    n.val = 42;
+    g.p = n;
+    free(n);
+    return 0;
+}

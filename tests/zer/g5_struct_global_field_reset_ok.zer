@@ -1,0 +1,14 @@
+// Positive: resetting the struct-global field after free is safe (no dangle at exit).
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    n.val = 42;
+    g.p = n;
+    free(n);
+    g.p = null;
+    return 0;
+}

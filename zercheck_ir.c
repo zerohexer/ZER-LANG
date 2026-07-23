@@ -3257,6 +3257,70 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
+            /* G5 (2026-07-23, gifted-noether audit): struct/array GLOBAL FIELD
+             * store — `g.p = n`, `g.arr[0] = n` where g is a module-level
+             * global. The bare-ident block above catches `g = n`; the .field /
+             * [idx] projection sink was missed (per-sink patchwork — cf. the P9
+             * by-value-field launder that descended the projection). Without
+             * this, `g.p = n; free(n);` leaves g.p dangling at exit UNFLAGGED
+             * (verified UAF: a later `if (g.p) |np| np.val` reads freed slab
+             * memory). Mirror the bare-ident register/reset machinery for the
+             * compound (IR_GLOBAL_ROOT_ID, "<global><path>") key so a free of
+             * the stored pointer marks this entry FREED (via the shared
+             * alloc_id) and the exit-pass dangling check (DEFINITE-freed only,
+             * MAYBE deliberately not flagged — BUG-742) fires. Root must be an
+             * unshadowed global; only literal-index/field paths are keyable
+             * (ir_measure_key_path rejects the rest → conservatively skipped,
+             * no false positive). Distinct key space from the LOCAL-root
+             * compound handles at line ~3203 (which require a local root and so
+             * skip a global root). */
+            if (target_expr &&
+                (target_expr->kind == NODE_FIELD ||
+                 target_expr->kind == NODE_INDEX)) {
+                Node *groot = ir_key_root_ident(target_expr);
+                if (groot && ir_ident_is_unshadowed_global(zc, func, groot)) {
+                    int gplen = ir_measure_key_path(target_expr);
+                    if (gplen >= 0) {
+                        int grootlen = (int)groot->ident.name_len;
+                        int gkeylen = grootlen + gplen;
+                        char *gkey = (char *)arena_alloc(zc->arena, gkeylen + 1);
+                        int gwrote = gkey
+                            ? ir_build_key_path(target_expr, gkey + grootlen,
+                                                gplen + 1, NULL)
+                            : -1;
+                        if (gkey && gwrote == gplen) {
+                            memcpy(gkey, groot->ident.name, grootlen);
+                            gkey[gkeylen] = '\0';
+                            IRHandleInfo *gfrh = (rhs_local >= 0)
+                                ? ir_find_handle(ps, rhs_local) : NULL;
+                            if (gfrh && gfrh->state == IR_HS_ALIVE &&
+                                gfrh->alloc_id != 0) {
+                                IRAliasSnapshot gfsnap;
+                                ir_snapshot_alias(&gfsnap, gfrh);
+                                IRHandleInfo *gfh = ir_add_compound_handle(ps,
+                                    IR_GLOBAL_ROOT_ID, gkey, (uint32_t)gkeylen);
+                                if (gfh) {
+                                    ir_apply_alias(gfh, &gfsnap);
+                                    gfh->state = IR_HS_ALIVE;
+                                    gfh->escaped = true; /* INVARIANT — see IR_GLOBAL_ROOT_ID */
+                                }
+                            } else {
+                                /* Non-tracked value (null reset, param,
+                                 * unknown): clear any stale binding so
+                                 * `g.p = n; free(n); g.p = null;` doesn't
+                                 * false-positive. */
+                                IRHandleInfo *gfh = ir_find_compound_handle(ps,
+                                    IR_GLOBAL_ROOT_ID, gkey, (uint32_t)gkeylen);
+                                if (gfh) {
+                                    gfh->state = IR_HS_UNKNOWN;
+                                    gfh->alloc_id = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Gap A2 (2026-05-06, sNsjM): move-struct field-write transfers
              * ownership. `b.field = t` where t is a move struct (or contains
              * move fields) MUST mark t as TRANSFERRED. Subsequent use of t =

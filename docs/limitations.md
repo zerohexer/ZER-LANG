@@ -656,17 +656,22 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
-  the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
-  ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
-  the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:
-  storing into a `shared struct` field + reading from a worker = silent cross-thread UAF on a reused slab
-  slot (observably reproduced, exit=999). CAUTION for the fixer: extends the BUG-742 global-dangle
-  conservatism — the maintainer deliberately does NOT flag MAYBE_FREED globals at exit (avoids noising the
-  legit register-ctx-then-callback pattern); a field-projection fix must flag only a DEFINITELY-freed
-  target, mirroring the bare-ident register/alias/exit machinery for the compound `(IR_GLOBAL_ROOT_ID,
-  name.field)` key.
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF). **✅ FIXED
+  2026-07-23 (gifted-noether-3o10j6 audit, make check 1016/0, sink matrix 44 CLEAN).** `g.p = n; free(n);`
+  (g a struct global) left `g.p` dangling — the "global left dangling at exit" check (GAP-3/BUG-739,
+  zercheck_ir.c ~3231) matched only a BARE global ident store (`g = n`, caught); the `.field` / `[idx]`
+  projection sink was missed. Verified UAF: `if (g.p) |np| np.val` reads the freed slab slot (returned the
+  freed object's value 42; alias corruption on reuse). Fix: a new block right after the bare-ident
+  register/reset machinery (zercheck_ir.c ~3260) descends `NODE_FIELD`/`NODE_INDEX` targets whose root is an
+  unshadowed global, builds the compound key `"<global><path>"` (e.g. `g.p`, `g.slots[0]`) via
+  `ir_measure_key_path`/`ir_build_key_path`, and registers `(IR_GLOBAL_ROOT_ID, "g.p")` sharing the stored
+  pointer's alloc_id — so a later free marks the entry FREED and the exit-pass dangling check fires. Honors
+  the BUG-742 conservatism (DEFINITE-freed only; MAYBE stays unflagged — verified: reset / no-free /
+  conditional-free all stay clean). Only literal-index/field paths are keyable (variable index →
+  conservatively skipped). **Also closes the sibling `g_arr[0] = n; free(n)` global array-element dangle
+  (NODE_INDEX branch)** that surfaced in the same audit. Tests `tests/zer_fail/g5_struct_global_field_dangle.zer`
+  (negative) + `tests/zer/g5_struct_global_field_reset_ok.zer` (positive). The `shared struct` field
+  cross-thread amplification is subsumed (the store is now flagged before any worker reads it).
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%

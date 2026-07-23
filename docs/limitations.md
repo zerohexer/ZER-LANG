@@ -63,13 +63,14 @@ present and working here; uN/iN masks complete; no AST-vs-IR wrapper divergence)
   control-flow lowering is high-risk and warrants its own focused session. Reproducer preserved
   in `tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer` (compile-clean today = the bug).
 - **ISR global access laundered through a funcptr bypasses the volatile/RMW checks** (🟠 silent
-  bare-metal, NEW — sibling of the shipped §C #12). `record_isr_globals` follows only DIRECT
-  calls into global functions; an ISR touching a shared global through a local funcptr binding
-  (`*() fp = bump; fp();`) never triggers "must be declared volatile" / non-atomic-RMW. Root:
-  checker.c ~15800 gates call-following on `callee->kind == NODE_IDENT` resolving to a function —
-  exactly the gap `scan_funcname_binding` closed for the spawn scanner (§C #11), never applied to
-  the ISR scanner. Clean fix: give `record_isr_globals` the same funcname-binding descent. Repro
-  `tests/zer_gaps/gap_isr_funcptr_launder.zer`.
+  bare-metal, NEW — sibling of the shipped §C #12). **✅ FIXED this session.** `record_isr_globals`
+  followed only DIRECT calls into global functions; an ISR touching a shared global through a
+  local funcptr binding (`*() fp = bump; fp();`) never triggered "must be declared volatile" /
+  non-atomic-RMW. Fix (checker.c ~15836): new `record_isr_funcname_binding` descends into a
+  function bound to a funcptr at the var-decl/assignment binding site (mirrors
+  `scan_funcname_binding`, the spawn scanner's §C #11). Now the funcptr-laundered ISR access gets
+  the same volatile rejection as the direct-call form. Test
+  `tests/zer_fail/isr_funcptr_launder_volatile.zer`.
 - **Scoped-borrow / atomic-cell exclusivity evaded through a HELPER** (🟠 races, TSan-confirmed —
   the documented G2/G3/G4, still live). `poke(&local)` between spawn/join (G2), a plain
   atomic-cell access moved into `poke(){ g_ctr=5; }` (G3), and `&threadlocal` handed to a scoped

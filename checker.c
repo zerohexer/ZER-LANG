@@ -15833,6 +15833,21 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
  * track_isr_global. Switch has no default: so a new NodeKind is a build error
  * (walker-default discipline); the kind coverage mirrors scan_unsafe_global_access
  * plus @critical/@once bodies. */
+/* SPAWN-FP analog for the ISR scanner (audit 2026-07-23, gifted-noether): a
+ * function bound to a local/field funcptr (`*() fp = bump; fp();`) reaches its
+ * globals when later invoked, but record_isr_globals follows only DIRECT calls,
+ * so an ISR touching a shared global through a funcptr bypassed the
+ * must-be-volatile / non-atomic-RMW checks. Descend at the BINDING site,
+ * mirroring scan_funcname_binding for the spawn scanner (SC #11). */
+static void record_isr_funcname_binding(Checker *c, Node *val, int depth) {
+    if (!val || val->kind != NODE_IDENT || depth > 32) return;
+    Symbol *fs = scope_lookup(c->global_scope, val->ident.name,
+                              (uint32_t)val->ident.name_len);
+    if (fs && fs->is_function && fs->func_node &&
+        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+        record_isr_globals(c, fs->func_node->func_decl.body, depth + 1);
+}
+
 static void record_isr_globals(Checker *c, Node *node, int depth) {
     if (!node || depth > 32) return;
     switch (node->kind) {
@@ -15861,6 +15876,9 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         }
         record_isr_globals(c, node->assign.target, depth);
         record_isr_globals(c, node->assign.value, depth);
+        /* funcptr rebind `fp = bump;` — descend into bump's globals */
+        if (node->assign.op == TOK_EQ)
+            record_isr_funcname_binding(c, node->assign.value, depth);
         return;
     }
     case NODE_CALL: {
@@ -15897,7 +15915,11 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         return;
     case NODE_RETURN:    record_isr_globals(c, node->ret.expr, depth); return;
     case NODE_EXPR_STMT: record_isr_globals(c, node->expr_stmt.expr, depth); return;
-    case NODE_VAR_DECL:  record_isr_globals(c, node->var_decl.init, depth); return;
+    case NODE_VAR_DECL:
+        record_isr_globals(c, node->var_decl.init, depth);
+        /* funcptr binding `*() fp = bump;` — descend into bump's globals */
+        record_isr_funcname_binding(c, node->var_decl.init, depth);
+        return;
     case NODE_BINARY:
         record_isr_globals(c, node->binary.left, depth);
         record_isr_globals(c, node->binary.right, depth);

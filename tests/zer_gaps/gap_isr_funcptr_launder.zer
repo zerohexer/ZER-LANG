@@ -1,9 +1,0 @@
-// GAP (audit 2026-07-23): an ISR reaching a shared global through a LOCAL funcptr
-// binding bypasses the "must be declared volatile" / non-atomic-RMW checks
-// (record_isr_globals follows only DIRECT calls). Sibling of the shipped SC #12.
-// Compile-clean today = the gap (checker accepts; the direct-call form is rejected).
-u32 counter;
-void bump() { counter += 1; }
-void handler() { *() fp = bump; fp(); }
-interrupt TIM2 { handler(); }
-u32 main() { counter += 1; return counter; }

@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-24 — Audit sweep: 3 silent gaps (G5 UAF, G1 defer miscompile, distinct-const violation)
+
+Autonomous audit session. Three documented-but-unfixed *silent* gaps (compile clean AND no
+runtime trap AND no bare-metal crash) confirmed reproducing on this branch and fixed. Full
+`make check` green; sink matrix 44/0 CLEAN; walker / type-dispatch / fixed-buffer audits OK.
+
+**G5 — struct-global field dangle → cross-function UAF (🔴, zercheck_ir.c).** `struct Holder{?*Item p;}
+Holder g; ... g.p = alloc(); free(...);` left `g.p` dangling but compiled clean, while the bare-ident
+form `g = alloc()` was correctly flagged (BUG-742). Root cause: the IR_ASSIGN global-store dangle sink
+matched only `target_expr->kind == NODE_IDENT` — the `.field` / `[i]` projection was blind (per-sink
+patchwork). Fix: descend the projection to the root ident (`ir_key_root_ident`), and when it is an
+unshadowed global, register a compound handle keyed `(IR_GLOBAL_ROOT_ID, "g.p")` sharing the rhs
+alloc_id (built via `ir_measure_key_path` + `ir_build_key_path`). The exit-dangle + call-window checks
+then fire on a DEFINITE free; MAYBE stays unflagged (BUG-742 conservatism), and `g.p = null;` after the
+free clears it. Constant paths only. Test `tests/zer_fail/g5_struct_global_field_dangle.zer`.
+
+**G1 — forward goto fires a defer it textually skipped (🟡 miscompile, checker.c).** `if(err){goto done;}
+acq(); defer rel(); ... done:` fired `rel()` on the error path where `acq()` never ran (lock_count = -1).
+The straight-line C defer-fire has no per-defer runtime "armed" flag for a forward goto that jumps OVER a
+later defer registration. Sound-interim fix (documented as blessed): `check_goto_skips_defer_in_block`
+rejects the exact shape `gi < di < li` (goto lexically before a defer before the target label, same block)
+via `find_goto_to_label`. The legitimate cleanup idiom (`defer D; if(c){goto L;} … L:` — defer BEFORE the
+goto) is NOT caught; all 8 existing goto+defer positives still compile. Test
+`tests/zer_fail/g1_goto_skips_defer.zer`.
+
+**distinct-const deref-write + `@ptrcast`/`@pun`/`@cast` launder (silent const violation, checker.c).**
+`const MyPtr cg` (MyPtr = `distinct *u32`) dropped its const from the stored TYPE (the var-decl/global
+const branch matched only bare `TYPE_POINTER`/`TYPE_SLICE`, not `TYPE_DISTINCT`; the volatile branch right
+below already unwrapped). Every TYPE-based const check went blind: `*cg = 7` mutated read-only data, and
+`@ptrcast(*u32, cg)` laundered the const to a mutable alias — only the SYMBOL-based direct-assign check
+caught it (`*u32 m = cg` was rejected). The stored type cannot carry the const without breaking nominal
+distinct identity (pointer-identity based → `const MyPtr cg = g` would spuriously mismatch), so the const
+is read from `sym->is_const` at the deref-write check and in a NEW centralized `check_const_strip` helper
+(replacing 3 copy-pasted inline const-strip blocks at @cast/@ptrcast/@pun — a debt-reducing class-fix
+mirroring `check_volatile_strip`). The symbol fallback is GATED on a DISTINCT declared type
+(`ptr_type != ptr_eff` / `type_unwrap_distinct(src_type) != src_type`) so it does NOT fire on a
+binding-immutable if-unwrap capture `|node|` (pointee mutable, plain pointer type) — the false positive
+that broke `super_freelist_arena` in the first attempt. Tests
+`tests/zer_fail/distinct_const_deref_write.zer`, `tests/zer_fail/distinct_const_ptrcast_launder.zer`,
+`tests/zer/distinct_const_read_ok.zer`. Residual (LOW, over-rejection): a `const MyPtr` PARAM still
+collapses and rejects a `MyPtr` arg — pre-existing, param-path-only; see docs/limitations.md.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

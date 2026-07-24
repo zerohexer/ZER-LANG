@@ -1,0 +1,28 @@
+// EXPECTED: compile error
+// G5 (docs/limitations.md): a heap pointer stored into a struct-GLOBAL FIELD
+// (`g.p = n`) then freed leaves g.p dangling — a cross-function UAF. The
+// bare-ident global-dangle check (BUG-742) matched only `g = n`; the
+// `.field` projection sink was blind. Fix: register the projection under
+// (IR_GLOBAL_ROOT_ID, "g.p"), mirroring the bare-ident machinery.
+// Fix: reset g.p = null; after the free.
+struct Item { u32 value; }
+struct Holder { ?*Item p; }
+Slab(Item) heap;
+Holder g;
+
+void f() {
+    *Item p = heap.alloc_ptr() orelse return;
+    p.value = 99;
+    g.p = p;
+    heap.free_ptr(p);
+}
+
+u32 rd() {
+    *Item gp = g.p orelse return;
+    return gp.value;
+}
+
+i32 main() {
+    f();
+    return (i32)rd();
+}

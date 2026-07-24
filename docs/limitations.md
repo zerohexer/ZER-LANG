@@ -318,6 +318,47 @@ that regresses any cell fails `make check`.
 
 ---
 
+## ✅ FIXED (2026-07-24) — audit sweep: 3 silent gaps closed (G1, G5, distinct-const)
+
+Autonomous audit session. Three documented-but-unfixed silent gaps confirmed reproducing on
+this branch and fixed, each with a regression test + full `make check` green + all gates clean
+(sink matrix 44/0, walker/type-dispatch/fixed-buffer audits OK). Verification of the OTHER
+zer_gaps reproducers: the slice-constructor OOB (`audit_2026-06-02_slice_oob`) and arena-slice
+index OOB (`audit2_slice_oob`) now TRAP at runtime (exit 133 — stale/fixed), and
+`prec2_opaque_wrong_type` traps at runtime — none silent. Only the three below were genuinely
+silent (compile clean AND no runtime trap AND no bare-metal crash).
+
+- **G5 — struct-global field dangle (🔴 UAF)** — see the G-section entry below. zercheck_ir.c
+  global-store sink extended to projection stores `g.p = n` / `g[0] = n`.
+- **G1 — forward goto fires a skipped defer (🟡 miscompile)** — see the G-section entry below.
+  checker.c goto validation rejects the `gi < di < li` shape (sound interim).
+- **distinct-const deref-write + `@ptrcast`/`@pun`/`@cast` launder (silent const violation)** —
+  `const MyPtr` (MyPtr = distinct `*T`) dropped its const from the stored TYPE (the branch
+  matched only bare `TYPE_POINTER`/`TYPE_SLICE`, not `TYPE_DISTINCT`; the volatile branch right
+  below already unwrapped distinct). Every TYPE-based const check went blind: `*cg = 7`
+  (deref-write) mutated read-only data AND `@ptrcast(*u32, cg)` laundered the const to a mutable
+  alias (only the SYMBOL-based direct-assign check caught it). The stored type cannot carry the
+  const without losing nominal distinct identity (pointer-identity based → the init
+  `const MyPtr cg = g` would spuriously mismatch), so the const is read from `sym->is_const` at
+  the deref-write check and in a NEW centralized `check_const_strip` helper (replacing 3 copy-
+  pasted inline const-strip blocks at @cast/@ptrcast/@pun — a debt-reducing refactor that also
+  fixes the class). The symbol fallback is GATED on a DISTINCT declared type (`ptr_type != ptr_eff`)
+  so it does NOT fire on a binding-immutable if-unwrap capture `|node|` (pointee mutable, plain
+  pointer type) — the false-positive that broke `super_freelist_arena` in the first attempt.
+  Tests: `tests/zer_fail/distinct_const_deref_write.zer`, `tests/zer_fail/distinct_const_ptrcast_launder.zer`,
+  `tests/zer/distinct_const_read_ok.zer`. (zer_gaps reproducer `audit_2026-06-12_distinct_const_deref_write.zer`
+  superseded — now a permanent negative test.)
+
+**Residual OPEN (LOW, over-rejection — NOT a soundness hole):** a `const MyPtr` (distinct
+pointer) used as a **function PARAM** (`u32 f(const MyPtr p)`) collapses to `const *T` in the
+param path and then rejects a `MyPtr` argument ("expected '*u32', got 'MyPtr'"). Pre-existing
+(the param const-application path is separate from the var-decl/global paths and was NOT touched
+by the 2026-07-24 fix). Over-rejection only; work around by passing a non-const distinct param or
+a plain `const *T`. Fix would require the param path to preserve distinct identity like the
+var-decl path does.
+
+---
+
 ## OPEN — BUGS: fixes available on four `claude/*` branches (fxvnsu / yd5ajq / 0h7oz9 / c4c09l), verified NOT in main (2026-07-19)
 
 **What this is.** A SECOND set of `claude/*` audit branches, created AFTER the 41-fix tracker
@@ -634,8 +675,16 @@ an ASan build).
   aliasing assignment. (No dedicated test file — repro in the commit message.) **In-main: NOT present** —
   main zercheck_ir.c ~3819 still a plain `if` right after the reallocating `ir_add_handle` at ~3813.
 
-### G. Documented-but-unfixed gaps — `fxvnsu` `9fea9990` (reproducers in `tests/zer_gaps/`, compile-clean today = the gap; move to `tests/zer_fail/` when fixed) (5)
-- **G1 — forward `goto` fires a defer it textually skipped** (🟡 miscompile). `gap_goto_skips_defer.zer`.
+### G. Documented-but-unfixed gaps — `fxvnsu` `9fea9990` (reproducers in `tests/zer_gaps/`, compile-clean today = the gap; move to `tests/zer_fail/` when fixed) (5; **G1 + G5 FIXED 2026-07-24**, 3 remain: G2/G3/G4)
+- **G1 — forward `goto` fires a defer it textually skipped** (🟡 miscompile). ✅ **FIXED 2026-07-24 (sound
+  interim)** — `check_goto_skips_defer_in_block` (checker.c, goto validation) rejects a forward `goto L`
+  that is lexically BEFORE a `defer` registration that is BEFORE the target label `L` (positions
+  `gi < di < li`, same block) via `find_goto_to_label`. On the goto path that defer never registered, but
+  the straight-line C defer-fire has no per-defer "armed" flag, so it fires anyway (lock-underflow). The
+  legit cleanup idiom `defer D; if(c){goto L;} … L:` (defer BEFORE the goto) is NOT caught (all 8 existing
+  goto+defer positives still compile). Regression `tests/zer_fail/g1_goto_skips_defer.zer`. The proper fix
+  (per-defer runtime armed flags) is deferred; the reject is sound (over-rejection only). Original root
+  cause below.
   The acquire / `goto done` / `defer release()` idiom underflows a lock counter (release fires on the error
   path where acquire never ran). Root cause: `ir_lower.c` fires function-scope defers as a static set at
   every exit/goto-target; only defers registered AFTER the goto source are runtime-skipped
@@ -656,17 +705,20 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF). ✅ **FIXED
+  2026-07-24** — the IR_ASSIGN global-store sink (zercheck_ir.c) now also registers a projection store
+  `g.p = n` / `g[0] = n` (root ident an unshadowed global) under a compound handle keyed
+  `(IR_GLOBAL_ROOT_ID, "g.p")` sharing the rhs alloc_id, via `ir_key_root_ident` + `ir_measure_key_path` +
+  `ir_build_key_path`. The existing exit-dangle + call-window checks then fire on a DEFINITE free (MAYBE
+  stays unflagged, mirroring BUG-742; `g.p = null;` after the free clears it — no false positive on the
+  register-then-consume idiom). Constant field/index paths only (variable index stays unkeyed,
+  conservative). Regression `tests/zer_fail/g5_struct_global_field_dangle.zer`. Original analysis below.
+  `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
   the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
   ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
   the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:
   storing into a `shared struct` field + reading from a worker = silent cross-thread UAF on a reused slab
-  slot (observably reproduced, exit=999). CAUTION for the fixer: extends the BUG-742 global-dangle
-  conservatism — the maintainer deliberately does NOT flag MAYBE_FREED globals at exit (avoids noising the
-  legit register-ctx-then-callback pattern); a field-projection fix must flag only a DEFINITELY-freed
-  target, mirroring the bare-ident register/alias/exit machinery for the compound `(IR_GLOBAL_ROOT_ID,
-  name.field)` key.
+  slot (observably reproduced, exit=999).
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%

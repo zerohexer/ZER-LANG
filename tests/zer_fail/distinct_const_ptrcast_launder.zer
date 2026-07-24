@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// AUDIT 2026-07-24 (sibling of distinct_const_deref_write): the const on a
+// `const MyPtr` (distinct *u32) could be laundered to a mutable pointer via
+// @ptrcast because the const-strip checks (@cast/@ptrcast/@pun) read only the
+// TYPE's is_const, not the symbol. Fix: centralized check_const_strip also
+// consults sym->is_const.
+distinct typedef *u32 MyPtr;
+u32 STATIC_BUF = 0;
+MyPtr g = @cast(MyPtr, &STATIC_BUF);
+i32 main() {
+    const MyPtr cg = g;
+    *u32 m = @ptrcast(*u32, cg);
+    *m = 7;
+    return (i32)STATIC_BUF;
+}

@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// G1 (docs/limitations.md): a forward `goto` that jumps OVER a later `defer`
+// registration to a label past that defer causes the emitter to fire the
+// skipped defer unconditionally at the label — here `rel()` runs on the error
+// path though `acq()` never did, underflowing lock_count. The straight-line C
+// defer-fire has no per-defer runtime "armed" flag for this shape. Sound
+// interim: reject. Fix: move `defer rel();` before the goto, or restructure.
+i32 lock_count;
+void acq() { lock_count += 1; }
+void rel() { lock_count -= 1; }
+
+void f(u32 err) {
+    if (err == 1) { goto done; }
+    acq();
+    defer rel();
+    lock_count += 100;
+done:
+    return;
+}
+
+i32 main() {
+    f(1);
+    return lock_count;
+}

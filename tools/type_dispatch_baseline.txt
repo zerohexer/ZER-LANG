@@ -739,3 +739,8 @@ emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
 # Documented-safe (582920db #4 baseline lines).
 zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
 zercheck_ir.c:(eff->kind == TYPE_UNION &&
+# AUDIT 2026-07-24: distinct-const deref-write — `ptr_eff` is
+# type_unwrap_distinct(ptr_type), so both reads are already-unwrapped _eff
+# locals (safe). Consulting sym->is_const for a `const MyPtr` distinct pointer.
+checker.c:if (ptr_eff && ptr_eff->kind == TYPE_POINTER && ptr_eff->pointer.is_const) {
+checker.c:ptr_eff->kind == TYPE_POINTER && ptr_type != ptr_eff &&

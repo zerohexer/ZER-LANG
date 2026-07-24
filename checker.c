@@ -1939,6 +1939,51 @@ static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
     return false;
 }
 
+/* ---- Const stripping check helper (AUDIT 2026-07-24) ----
+ * Mirror of check_volatile_strip. A `const MyPtr` (MyPtr = distinct *T) carries
+ * its const on the SYMBOL, not the type — the distinct wrapper cannot hold
+ * is_const without losing its nominal (pointer-identity) match, so the stored
+ * type is a plain non-const distinct pointer. The three inline const-strip
+ * checks (@cast / @ptrcast / @pun) read only the TYPE's is_const, so a
+ * `@ptrcast(*u32, cg)` with `const MyPtr cg` silently laundered the const.
+ * Centralize (was 3 copy-pasted sites) + also consult the source symbol,
+ * exactly as check_volatile_strip does for volatile. Returns true on violation
+ * (error emitted). */
+static bool check_const_strip(Checker *c, Node *src_expr, Type *src_type,
+                              Type *tgt_type, int line, const char *context) {
+    Type *seff = type_unwrap_distinct(src_type);
+    Type *teff = type_unwrap_distinct(tgt_type);
+    /* peel matching optional wrappers in lockstep (same as volatile) */
+    while (seff && teff && seff->kind == TYPE_OPTIONAL &&
+           teff->kind == TYPE_OPTIONAL) {
+        seff = type_unwrap_distinct(seff->optional.inner);
+        teff = type_unwrap_distinct(teff->optional.inner);
+    }
+    if (!seff || seff->kind != TYPE_POINTER) return false;
+    if (!teff || teff->kind != TYPE_POINTER) return false;
+    if (teff->pointer.is_const) return false; /* target keeps const — ok */
+    bool src_const = seff->pointer.is_const;
+    /* GATE the symbol fallback on a DISTINCT declared type (src_type !=
+     * unwrapped): sym->is_const is overloaded — it also marks an if-unwrap
+     * capture `|node|` (binding-immutable, pointee-mutable) whose type is a
+     * PLAIN pointer, which must NOT count as a const-strip source (regression:
+     * `(*opaque)node` in super_freelist_arena). A `const MyPtr` (distinct)
+     * drops its const from the type, so the symbol is the only carrier. */
+    if (!src_const && src_expr && src_expr->kind == NODE_IDENT &&
+        src_type && type_unwrap_distinct(src_type) != src_type) {
+        Symbol *s = scope_lookup(c->current_scope,
+            src_expr->ident.name, (uint32_t)src_expr->ident.name_len);
+        if (s && s->is_const) src_const = true;
+    }
+    if (src_const) {
+        checker_error(c, line,
+            "%s cannot strip const qualifier — "
+            "target must be const pointer", context);
+        return true;
+    }
+    return false;
+}
+
 /* ================================================================
  * TYPE RESOLUTION: TypeNode (syntactic) → Type (semantic)
  * ================================================================ */
@@ -4225,8 +4270,32 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
                     /* deref: *p = val — check if p's type is const pointer */
                     Type *ptr_type = typemap_get(c, root->unary.operand);
-                    if (ptr_type && ptr_type->kind == TYPE_POINTER && ptr_type->pointer.is_const) {
+                    Type *ptr_eff = ptr_type ? type_unwrap_distinct(ptr_type) : NULL;
+                    if (ptr_eff && ptr_eff->kind == TYPE_POINTER && ptr_eff->pointer.is_const) {
                         through_const_pointer = true;
+                    }
+                    /* AUDIT 2026-07-24: a `const MyPtr` (MyPtr = distinct *T)
+                     * carries its const on the SYMBOL, not the type — the
+                     * distinct wrapper can't hold is_const without losing its
+                     * nominal (pointer-identity) match, so the stored type is a
+                     * plain non-const distinct pointer. In ZER a const
+                     * pointer-typed var means pointee-read-only (like
+                     * `const *T`), so consult the symbol. Was a silent hole:
+                     * `*cg = 7` mutated read-only data.
+                     * GATE (ptr_type != ptr_eff = the declared type was
+                     * DISTINCT): sym->is_const is OVERLOADED — it also marks a
+                     * binding-immutable if-unwrap capture `|node|` / Handle key,
+                     * whose POINTEE is mutable. Those have a PLAIN (non-distinct)
+                     * pointer type, so restricting the symbol fallback to a
+                     * distinct-typed operand excludes them (a plain `const *T`
+                     * already carries is_const on the type and fired above). */
+                    if (!through_const_pointer && ptr_eff &&
+                        ptr_eff->kind == TYPE_POINTER && ptr_type != ptr_eff &&
+                        root->unary.operand->kind == NODE_IDENT) {
+                        Symbol *psym = scope_lookup(c->current_scope,
+                            root->unary.operand->ident.name,
+                            (uint32_t)root->unary.operand->ident.name_len);
+                        if (psym && psym->is_const) through_const_pointer = true;
                     }
                     through_pointer = true;
                     root = root->unary.operand;
@@ -7507,12 +7576,10 @@ static Type *check_expr(Checker *c, Node *node) {
             (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE)) {
             valid = true;
 
-            /* BUG-448: const stripping — same check as @ptrcast BUG-304 */
-            if (src_eff->kind == TYPE_POINTER && src_eff->pointer.is_const &&
-                tgt_eff->kind == TYPE_POINTER && !tgt_eff->pointer.is_const) {
-                checker_error(c, node->loc.line,
-                    "cast cannot strip const qualifier — target must be const pointer");
-            }
+            /* BUG-448: const stripping — same check as @ptrcast BUG-304.
+             * AUDIT 2026-07-24: via check_const_strip so a `const MyPtr`
+             * (distinct *T, const on the symbol not the type) is caught. */
+            check_const_strip(c, node->typecast.expr, source, target, node->loc.line, "cast");
 
             /* BUG-447: volatile stripping — same check as @ptrcast BUG-258 */
             check_volatile_strip(c, node->typecast.expr, source, target, node->loc.line, "cast");
@@ -7841,14 +7908,11 @@ static Type *check_expr(Checker *c, Node *node) {
                          * so the strip check was silently skipped and the const
                          * qualifier was laundered through the distinct wrapper.
                          * Reproducer: tests/zer_fail/audit_ptrcast_distinct_const_strip.zer */
-                        Type *tgt_eff_strip = result ? type_unwrap_distinct(result) : NULL;
-                        if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
-                            tgt_eff_strip && tgt_eff_strip->kind == TYPE_POINTER &&
-                            !tgt_eff_strip->pointer.is_const) {
-                            checker_error(c, node->loc.line,
-                                "@ptrcast cannot strip const qualifier — "
-                                "target must be const pointer");
-                        }
+                        /* AUDIT 2026-07-24: via check_const_strip so a
+                         * `const MyPtr` (distinct *T, const on the symbol not
+                         * the type) is caught. */
+                        check_const_strip(c, node->intrinsic.args[0], val_type,
+                                          result, node->loc.line, "@ptrcast");
                         /* BUG-258: volatile stripping via @ptrcast.
                          * check_volatile_strip handles distinct-unwrap internally
                          * via type_unwrap_distinct in its implementation. */
@@ -8007,14 +8071,12 @@ static Type *check_expr(Checker *c, Node *node) {
                          * shape: distinct typedef *u32 PlainPtr; @pun(PlainPtr,
                          * const_ptr) silently laundered const through the
                          * distinct wrapper. */
+                        /* AUDIT 2026-07-24: via check_const_strip so a
+                         * `const MyPtr` (distinct *T, const on the symbol not
+                         * the type) is caught. */
                         Type *tgt_eff_pun_strip = result ? type_unwrap_distinct(result) : NULL;
-                        if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
-                            tgt_eff_pun_strip && tgt_eff_pun_strip->kind == TYPE_POINTER &&
-                            !tgt_eff_pun_strip->pointer.is_const) {
-                            checker_error(c, node->loc.line,
-                                "@pun cannot strip const qualifier — "
-                                "target must be const pointer");
-                        }
+                        check_const_strip(c, node->intrinsic.args[0], val_type,
+                                          result, node->loc.line, "@pun");
                         /* volatile stripping — same as @ptrcast BUG-258.
                          * check_volatile_strip handles distinct unwrap internally. */
                         check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
@@ -10472,6 +10534,13 @@ static void check_stmt(Checker *c, Node *node) {
             } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
+            /* NOTE: a `const` distinct-typedef pointer/slice (`const MyPtr`,
+             * MyPtr = distinct *T) is NOT collapsed here — doing so would drop
+             * the nominal distinct identity (pointer-identity based) and reject
+             * the legitimate init `const MyPtr cg = g`. The const is carried by
+             * the SYMBOL (sym->is_const, set below); the deref-write and
+             * @ptrcast const-strip checks consult it for distinct pointers
+             * (AUDIT 2026-07-24). */
         }
         /* propagate volatile from var qualifier to slice/pointer type.
          *
@@ -14545,6 +14614,13 @@ static void register_decl(Checker *c, Node *node) {
             } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
                 type = type_const_pointer(c->arena, type->pointer.inner);
             }
+            /* NOTE: a `const` distinct-typedef pointer/slice (`const MyPtr`,
+             * MyPtr = distinct *T) is NOT collapsed here — doing so would drop
+             * the nominal distinct identity (pointer-identity based) and reject
+             * the legitimate init `const MyPtr cg = g`. The const is carried by
+             * the SYMBOL (sym->is_const, set below); the deref-write and
+             * @ptrcast const-strip checks consult it for distinct pointers
+             * (AUDIT 2026-07-24). */
         }
         /* propagate volatile from var qualifier to slice/pointer type.
          * Pointer propagation (added 2026-05-18): see matching block in
@@ -14869,6 +14945,86 @@ static bool goto_path_covers_label(void **goto_arms, int goto_depth,
     return true;
 }
 
+/* G1 (docs/limitations.md, 2026-07-24): find the first `goto <name>` anywhere
+ * in a statement subtree. Used to detect a FORWARD goto that jumps OVER a
+ * `defer` registration to a later label in the SAME block — the emitter fires
+ * the skipped defer unconditionally at the label (a lock-underflow miscompile),
+ * because the straight-line C defer-fire has no per-defer runtime "armed" flag
+ * for this shape (the guard machinery only handles the goto-AFTER-defer case).
+ * Sound interim: reject at compile time. Written as an if-chain (not a switch)
+ * to stay clear of the walker-default audit; conservative — only the kinds that
+ * can contain statements recurse, everything else yields NULL. */
+static Node *find_goto_to_label(Node *n, const char *name, int len) {
+    if (!n) return NULL;
+    if (n->kind == NODE_GOTO) {
+        if (n->goto_stmt.label_len == len &&
+            memcmp(n->goto_stmt.label, name, (size_t)len) == 0)
+            return n;
+        return NULL;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *g = find_goto_to_label(n->block.stmts[i], name, len);
+            if (g) return g;
+        }
+        return NULL;
+    }
+    if (n->kind == NODE_IF) {
+        Node *g = find_goto_to_label(n->if_stmt.then_body, name, len);
+        if (g) return g;
+        return find_goto_to_label(n->if_stmt.else_body, name, len);
+    }
+    if (n->kind == NODE_FOR)
+        return find_goto_to_label(n->for_stmt.body, name, len);
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE)
+        return find_goto_to_label(n->while_stmt.body, name, len);
+    if (n->kind == NODE_SWITCH) {
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            Node *g = find_goto_to_label(n->switch_stmt.arms[i].body, name, len);
+            if (g) return g;
+        }
+        return NULL;
+    }
+    if (n->kind == NODE_CRITICAL)
+        return find_goto_to_label(n->critical.body, name, len);
+    if (n->kind == NODE_ONCE)
+        return find_goto_to_label(n->once.body, name, len);
+    /* NODE_DEFER body cannot contain a goto (goto is banned in defer). */
+    return NULL;
+}
+
+/* G1: within one block's direct statement list, reject a forward goto that is
+ * lexically BEFORE a defer registration that is BEFORE the target label
+ * (positions gi < di < li). On the goto path the defer never registered, but
+ * the emitter fires it at the label anyway. The legitimate cleanup idiom
+ * (`defer D; if(c){goto L;} ... L:` — defer BEFORE the goto, di < gi) is NOT
+ * caught: on the goto path the defer WAS armed, so firing it is correct. */
+static void check_goto_skips_defer_in_block(Checker *c, Node *block) {
+    if (!block || block->kind != NODE_BLOCK) return;
+    int n = block->block.stmt_count;
+    for (int li = 0; li < n; li++) {
+        Node *lab = block->block.stmts[li];
+        if (!lab || lab->kind != NODE_LABEL) continue;
+        for (int di = 0; di < li; di++) {
+            Node *def = block->block.stmts[di];
+            if (!def || def->kind != NODE_DEFER) continue;
+            for (int gi = 0; gi < di; gi++) {
+                Node *g = find_goto_to_label(block->block.stmts[gi],
+                    lab->label_stmt.name, (int)lab->label_stmt.name_len);
+                if (g) {
+                    checker_error(c, g->loc.line,
+                        "forward 'goto %.*s' skips the registration of a "
+                        "'defer' that fires at label '%.*s' — the defer would "
+                        "run on this path though it never registered; move the "
+                        "defer before the goto, or restructure the cleanup",
+                        (int)g->goto_stmt.label_len, g->goto_stmt.label,
+                        (int)lab->label_stmt.name_len, lab->label_stmt.name);
+                }
+            }
+        }
+    }
+}
+
 static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
                            int label_count, ArmStack *arms) {
     if (!node) return;
@@ -14898,6 +15054,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
         break;
     }
     case NODE_BLOCK:
+        check_goto_skips_defer_in_block(c, node);   /* G1 */
         for (int i = 0; i < node->block.stmt_count; i++)
             validate_gotos(c, node->block.stmts[i], labels, label_count, arms);
         break;

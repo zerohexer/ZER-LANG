@@ -3257,6 +3257,65 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
+            /* G5 (2026-07-24): struct-GLOBAL field/index store — `g.p = n` /
+             * `g.arr[0] = n` where the root ident `g` is an unshadowed global.
+             * The GAP-3 bare-ident sink above matches ONLY `g = n`; a PROJECTION
+             * store into a global left the global field dangling un-tracked →
+             * cross-function UAF (docs/limitations.md "G5"). Same per-sink
+             * patchwork shape as the P9 by-value-field-launder: descend the
+             * projection to the root and register a pseudo-root compound handle
+             * keyed (IR_GLOBAL_ROOT_ID, "g.p") sharing the rhs alloc_id, so the
+             * exit-dangle + call-window checks fire on a DEFINITE free (mirrors
+             * the bare-ident machinery; MAYBE stays deliberately unflagged, per
+             * BUG-742). ir_extract_compound_key can't reach this — it requires a
+             * LOCAL root and bails on a global root — so this is a distinct sink.
+             * Constant index / field paths only (ir_measure_key_path); a
+             * variable-index global-field store stays unkeyed (conservative). */
+            if (target_expr &&
+                (target_expr->kind == NODE_FIELD ||
+                 target_expr->kind == NODE_INDEX)) {
+                Node *groot = ir_key_root_ident(target_expr);
+                if (groot && ir_ident_is_unshadowed_global(zc, func, groot)) {
+                    int plen = ir_measure_key_path(target_expr);
+                    if (plen >= 0) {
+                        int rlen = (int)groot->ident.name_len;
+                        int total = rlen + plen;
+                        char *key = (char *)arena_alloc(zc->arena, total + 1);
+                        if (key) {
+                            memcpy(key, groot->ident.name, rlen);
+                            int wrote = ir_build_key_path(target_expr,
+                                key + rlen, plen + 1, NULL);
+                            if (wrote == plen) {
+                                IRHandleInfo *frh = (rhs_local >= 0)
+                                    ? ir_find_handle(ps, rhs_local) : NULL;
+                                if (frh && frh->state == IR_HS_ALIVE &&
+                                    frh->alloc_id != 0) {
+                                    IRAliasSnapshot fsnap;
+                                    ir_snapshot_alias(&fsnap, frh);
+                                    IRHandleInfo *fgh = ir_add_compound_handle(ps,
+                                        IR_GLOBAL_ROOT_ID, key, (uint32_t)total);
+                                    if (fgh) {
+                                        ir_apply_alias(fgh, &fsnap);
+                                        fgh->state = IR_HS_ALIVE;
+                                        fgh->escaped = true; /* INVARIANT */
+                                    }
+                                } else {
+                                    /* reset on null / non-tracked store, so
+                                     * `g.p = null;` after a free clears it. */
+                                    IRHandleInfo *fgh = ir_find_compound_handle(
+                                        ps, IR_GLOBAL_ROOT_ID, key,
+                                        (uint32_t)total);
+                                    if (fgh) {
+                                        fgh->state = IR_HS_UNKNOWN;
+                                        fgh->alloc_id = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Gap A2 (2026-05-06, sNsjM): move-struct field-write transfers
              * ownership. `b.field = t` where t is a move struct (or contains
              * move fields) MUST mark t as TRANSFERRED. Subsequent use of t =

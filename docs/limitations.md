@@ -806,6 +806,12 @@ k7l625/jfrmer branches); global-scope arithmetic needs no mask (verified safe by
 - **`>64`-bit `uN` uses emulated multi-word arithmetic** (carrier is `__int128`
   ≤128; the `emit_intn_mask` __int128 branch). For hand-tuned big-int use the
   `@addc`/`@subb`/`@mulw` carry primitives + a limb struct (library).
+- **C-style cast to an ODD-width `uN`/`iN` fails to parse (LOW — over-rejection, 2026-07-24).**
+  `(u8)x` / `(u32)f()` parse fine, but `(u7)200` / `(u21)x` / `(i5)f()` error "expected ';' after
+  variable declaration" — the parser's cast-target lookahead recognizes only the native-width integer
+  keywords, not arbitrary `u<N>`/`i<N>`. Workaround: `@truncate(u7, x)` (works, masks correctly — uN
+  arithmetic wrapping is sound). Over-rejection only; fix is to extend the cast-lookahead type-keyword
+  recognizer to `u<N>`/`i<N>`.
 
 ---
 

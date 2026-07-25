@@ -7277,22 +7277,45 @@ static Type *check_expr(Checker *c, Node *node) {
                     ptr_proven = true;
                 }
             }
-            if (!ptr_proven && !obj->pointer.is_volatile) {
-                /* A non-volatile `*T` is ONE object with no length, so indexing it
-                 * as an array can never be bounds-checked — it is either silent
-                 * memory corruption (overrun into mapped memory) or a raw fault.
-                 * Statically-known-unsafe with no tracking that can rescue it (the
-                 * length simply isn't stored) → a compile ERROR is the honest call,
-                 * not a warning that ships the hole. Use `[*]T` (a slice: carries a
-                 * length, bounds-checked). Volatile `*T` (MMIO) is handled above and
-                 * bounds-checked against the `mmio` declaration. */
+            if (!ptr_proven) {
+                /* A `*T` is ONE object with no length, so indexing it as an array
+                 * can never be bounds-checked — silent memory corruption (overrun
+                 * into mapped memory) or a raw fault. Statically-known-unsafe with
+                 * no tracking that can rescue it (the length simply isn't stored) →
+                 * a compile ERROR is the honest call. Use `[*]T` (a slice: carries a
+                 * length, bounds-checked).
+                 *
+                 * 2026-07-25: this now fires for a VOLATILE `*T` too when it has NO
+                 * compile-time mmio_bound. The prior `!is_volatile` exemption assumed
+                 * "volatile ⟹ mmio-bounds-checked", but the bound is derived ONLY for
+                 * a `volatile *T = @inttoptr(*T, CONST)` inside a declared `mmio`
+                 * range (→ ptr_proven above). A volatile pointer that is a PARAM, an
+                 * alias, a struct field, or a variable-address @inttoptr carries no
+                 * bound, so `reg[i]` shipped an UNGUARDED wild MMIO access — a
+                 * program-consequence OOB (read AND write) that faults on hosted but
+                 * silently corrupts adjacent memory/peripherals on bare-metal. The
+                 * non-volatile equivalent was already rejected; this closes the
+                 * asymmetry. The bounded direct-@inttoptr(const) MMIO idiom keeps its
+                 * mmio_bound and is unaffected. */
                 const char *inner = type_name(obj->pointer.inner);
-                checker_error(c, node->loc.line,
-                    "cannot index a single pointer '*%s' as an array — `*T` is one "
-                    "object and carries no length, so this access cannot be "
-                    "bounds-checked (it would be a silent buffer overflow). Use "
-                    "'[*]%s' (a slice — it carries a length and is bounds-checked).",
-                    inner, inner);
+                if (obj->pointer.is_volatile) {
+                    checker_error(c, node->loc.line,
+                        "cannot index the volatile single pointer '*%s' — it carries "
+                        "no length or MMIO bound here, so 'reg[i]' cannot be "
+                        "bounds-checked (a silent wild MMIO access, corrupting on "
+                        "bare-metal). Index a compile-time-constant "
+                        "'volatile *%s = @inttoptr(*%s, ADDR)' inside a declared "
+                        "'mmio' range (the range bounds the index), or use '[*]%s' "
+                        "(a slice — carries a length and is bounds-checked).",
+                        inner, inner, inner, inner);
+                } else {
+                    checker_error(c, node->loc.line,
+                        "cannot index a single pointer '*%s' as an array — `*T` is one "
+                        "object and carries no length, so this access cannot be "
+                        "bounds-checked (it would be a silent buffer overflow). Use "
+                        "'[*]%s' (a slice — it carries a length and is bounds-checked).",
+                        inner, inner);
+                }
             }
             result = obj->pointer.inner;
         } else {
@@ -13850,9 +13873,25 @@ static void check_stmt(Checker *c, Node *node) {
              * lifetime arm — `*shared T` to a stack local was accepted with no
              * check). See proofs/operational/lambda_zer_concurrency:
              * stack_not_publishable (lifetime) + is_shared (reach/discipline). */
+            /* TYPE_ARRAY included (2026-07-25): a bare local ARRAY passed to a
+             * [*]T slice param coerces to a slice aliasing the stack — the
+             * same cross-thread stack-UAF as a slice arg. It was UNCASED here
+             * (arg-type TYPE_ARRAY hit neither this gate nor the by-value
+             * struct arm), so the check never ran; the only thing rejecting it
+             * was an unrelated emitter limitation (no array→slice coercion at
+             * spawn args → malformed C). That mask would vanish the moment the
+             * spawn emitter is made consistent with the normal-call path,
+             * silently un-masking the UAF. spawn_arg_is_stack_derived already
+             * has the array branch to catch it. */
             bool is_ptr_like = (eff->kind == TYPE_POINTER ||
                                 eff->kind == TYPE_SLICE ||
                                 eff->kind == TYPE_OPAQUE);
+            /* eff is already type_unwrap_distinct'd; a bare local ARRAY arg
+             * coerces to a stack-aliasing slice at a [*]T spawn param (see the
+             * is_ptr_like comment above) — treat it as ptr-like so the
+             * stack-lifetime check runs. Kept as a separate statement so the
+             * three baselined sibling lines above are unchanged. */
+            if (eff->kind == TYPE_ARRAY) is_ptr_like = true;
             if (is_ptr_like) {
                 bool shared_carrier = false;
                 if (eff->kind == TYPE_POINTER) {

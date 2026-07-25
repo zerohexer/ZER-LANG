@@ -1564,6 +1564,29 @@ the `.v`/`check-vst` coupling asm_lang §10 underspecifies):
 **`docs/option_e_plan.md`** — fresh-session-executable. `tests/test_asm_matrix.c`
 is the regression net for the deletion.
 
+## OPEN — variable-index bit-slice WRITE: unclamped position shift is C UB (2026-07-25) (LOW — wrong value, not memory corruption)
+
+**Symptom.** `reg[hi..lo] = v` with a RUNTIME `lo` (bit position) lowers to
+`(uint64_t)(v) << _zer_bl` and `mask << _zer_bl` (emitter.c ~1708-1743, AST path;
+mirror in the IR path). When `lo >= 64` the shift count is out of range → C
+undefined behavior (x86 masks the count mod 64, other arches differ), violating
+ZER's stated "shift by ≥ width = 0 (defined)" guarantee. The WIDTH computation
+(`(hi-lo+1) >= 64 ? ... `) is already clamped; the POSITION shift is not. The
+companion bit-slice READ path was fixed for exactly this (audit #18, commit
+c9e4abca — guards the shift on `type_width`); the WRITE path was not.
+
+**Severity LOW.** The result is stored back through `*_zer_bp` typed to the
+carrier width, so the store truncates — this is a wrong VALUE / UB, NOT an
+out-of-bounds memory write. It also only bites when `lo` is a runtime value that
+reaches ≥ 64, which is unusual (a fitting literal `lo` is compile-checked). Not a
+memory-safety hole, so deprioritized behind the accept-unsafe fixes.
+
+**Fix sketch.** Clamp the position shift like the READ path (audit #18) and like
+`_zer_shl`: guard `<< _zer_bl` on the carrier `type_width` (0 when out of range)
+in BOTH the value-shift and the two mask-shift emissions, on BOTH the AST
+(~1708/1736) and IR emitter paths. Tripwire: a `tests/zer_trap/` or `tests/zer/`
+test with a runtime `lo = 70` on a u32 carrier asserting a defined (0) result.
+
 ## OPEN — asm S2 instruction-count `\n`-escape bypass (audit rule, not safety)
 
 The S2 rule (checker.c:10379) caps an asm block at 16 instructions for

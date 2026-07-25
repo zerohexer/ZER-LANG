@@ -739,3 +739,9 @@ emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
 # Documented-safe (582920db #4 baseline lines).
 zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
 zercheck_ir.c:(eff->kind == TYPE_UNION &&
+# 2026-07-25: spawn ptr-like gate — `eff` is type_unwrap_distinct(arg_type),
+# an already-unwrapped _eff local (not the distinct-unwrap bug class). A bare
+# local ARRAY arg coerces to a stack-aliasing slice at a [*]T spawn param, so
+# it must run the stack-lifetime check. Kept as a separate statement so the 3
+# baselined sibling is_ptr_like lines stay unchanged.
+checker.c:if (eff->kind == TYPE_ARRAY) is_ptr_like = true;

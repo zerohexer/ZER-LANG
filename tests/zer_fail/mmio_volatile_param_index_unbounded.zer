@@ -1,0 +1,12 @@
+// EXPECTED: compile error — indexing a volatile single pointer that has NO
+// compile-time mmio bound (here a PARAM) shipped an unguarded wild MMIO access
+// (reg[i], read AND write) — silent corruption on bare-metal. The `!is_volatile`
+// exemption assumed volatile => mmio-bounds-checked, but the bound exists only
+// for a direct `@inttoptr(*T, CONST)` inside a declared mmio range. Now rejected
+// exactly like the non-volatile `*T` case.
+mmio 0x40020000..0x40020FFF;
+u32 read_at(volatile *u32 reg, u32 i) { return reg[i]; }
+u32 main() {
+    volatile *u32 base = @inttoptr(*u32, 0x40020000);
+    return read_at(base, 999999);
+}

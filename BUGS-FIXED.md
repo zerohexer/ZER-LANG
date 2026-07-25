@@ -8,9 +8,12 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 ## 2026-07-25 — Autonomous audit: 4 soundness holes (accept-unsafe UAF / silent OOB) — checker.c, zercheck_ir.c
 
 Six-agent parallel audit (escape/keep, VRP/bounds, emitter dual-path, IR lowering, concurrency,
-bare-metal). Four confirmed accept-unsafe holes fixed this batch (make check 1018/0, sink matrix 44
-CLEAN); three lower-severity findings queued/documented. Every hole is the CLAUDE.md "`?T`-wrapper /
-per-node-kind / per-sink patchwork" class: the same question answered at N sites, a form silently missed.
+bare-metal). SIX confirmed holes fixed across two batches (make check 1020/0, all matrices + sink
+matrix 44 CLEAN); one LOW UB finding documented (limitations.md, variable-index bit-slice write shift).
+The emitter dual-path audit came back CLEAN. Every hole is the CLAUDE.md "`?T`-wrapper / per-node-kind
+/ per-sink patchwork" class: the same question answered at N sites, a form silently missed.
+
+**Batch 1 (4 accept-unsafe UAF/OOB):**
 
 - **Escape `?[*]T` optional-slice carrier UAF** (checker.c `mark_slice_local_derived_from_value`). The
   ONLY taint path for the array→slice coercion class early-returned on `TYPE_OPTIONAL`, so
@@ -37,6 +40,32 @@ per-node-kind / per-sink patchwork" class: the same question answered at N sites
   IR_STRUCT_INIT_DECOMP analyzer case registers `(dest, ".field")` for each field value that is an ALIVE
   tracked handle; the following IR_COPY temp→var replicates the compound rows (§A #6), so a later free
   propagates FREED and the read fires. Test `tests/zer_fail/struct_init_field_alias_uaf.zer`.
+
+**Batch 2 (bare-metal OOB + latent race):**
+
+- **volatile `*T` unbounded index — silent wild MMIO on bare-metal** (checker.c ~7280). Indexing a
+  single pointer `reg[i]` is rejected for a non-volatile `*T` ("carries no length"), but a VOLATILE `*T`
+  was exempted on the assumption "volatile ⟹ mmio-bounds-checked". That bound is derived ONLY for a
+  `volatile *T = @inttoptr(*T, CONST)` inside a declared `mmio` range. A volatile pointer that is a PARAM
+  (the most common HAL shape), an alias, a struct field, or a variable-address `@inttoptr` carries NO
+  bound → `reg[i]` shipped an unguarded wild MMIO access: faults on hosted, silently corrupts adjacent
+  memory/peripherals on bare-metal. Fix: drop the `!is_volatile` exemption when `!ptr_proven` (no
+  mmio_bound); the bounded direct-`@inttoptr(const)` idiom keeps its bound and is unaffected (verified
+  against `mmio_var_idx_guard`, the qemu multi-reg tests). Message guides to a bounded const `@inttoptr`
+  or a `[*]T` slice. Test `tests/zer_fail/mmio_volatile_param_index_unbounded.zer`.
+- **spawn bare-array-to-slice — latent cross-thread stack-UAF** (checker.c ~13853). A bare local ARRAY
+  passed to a `[*]T` fire-and-forget spawn param coerces to a slice aliasing the stack (the same UAF as a
+  slice arg), but arg-type `TYPE_ARRAY` was UNCASED in the spawn ptr-like gate — the check never ran;
+  only an unrelated emitter limitation (no array→slice coercion at spawn args) masked it, and that mask
+  would vanish the moment the emitter is made consistent. Fix: treat `TYPE_ARRAY` as ptr-like so
+  `spawn_arg_is_stack_derived`'s existing array branch fires (added as a separate statement to keep the
+  three baselined `is_ptr_like` sibling lines unchanged; the one new `eff->kind == TYPE_ARRAY` site is an
+  already-unwrapped `_eff` local, baselined in `tools/type_dispatch_baseline.txt`). Test
+  `tests/zer_fail/spawn_local_array_slice_race.zer`.
+
+**Documented (LOW, not fixed):** variable-index bit-slice WRITE emits an unclamped position shift
+`v << lo` — C UB when `lo >= 64` (wrong value, NOT memory corruption; the READ path was already guarded,
+audit #18). See limitations.md "variable-index bit-slice WRITE".
 
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 

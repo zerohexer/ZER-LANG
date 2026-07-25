@@ -1,0 +1,11 @@
+// EXPECTED: compile error — ?[*]T optional-slice carrier over a LOCAL array
+// must be tainted local-derived so the store-to-global escape sink rejects it.
+// Before the fix, mark_slice_local_derived_from_value early-returned on
+// TYPE_OPTIONAL, leaving `s` un-tainted → dangling stack slice into a global.
+?[*]u8 mg;
+void f() {
+    u8[16] buf;
+    ?[*]u8 s = buf[0..8];
+    mg = s;
+}
+u32 main() { f(); return 0; }

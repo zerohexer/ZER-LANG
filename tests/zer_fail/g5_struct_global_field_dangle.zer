@@ -1,0 +1,15 @@
+// EXPECTED: compile error — heap pointer stored into a struct-GLOBAL FIELD
+// (g.p = n) dangles after free(n). The bare-global sink caught `g = n` but
+// missed the `.field` projection; the IR_GLOBAL_ROOT_ID sink now covers
+// value-aggregate global field/index projections.
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+void stash() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    n.val = 42;
+    g.p = n;
+    free(n);
+}
+u32 main() { stash(); return 0; }

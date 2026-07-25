@@ -5,6 +5,39 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-25 — Autonomous audit: 4 soundness holes (accept-unsafe UAF / silent OOB) — checker.c, zercheck_ir.c
+
+Six-agent parallel audit (escape/keep, VRP/bounds, emitter dual-path, IR lowering, concurrency,
+bare-metal). Four confirmed accept-unsafe holes fixed this batch (make check 1018/0, sink matrix 44
+CLEAN); three lower-severity findings queued/documented. Every hole is the CLAUDE.md "`?T`-wrapper /
+per-node-kind / per-sink patchwork" class: the same question answered at N sites, a form silently missed.
+
+- **Escape `?[*]T` optional-slice carrier UAF** (checker.c `mark_slice_local_derived_from_value`). The
+  ONLY taint path for the array→slice coercion class early-returned on `TYPE_OPTIONAL`, so
+  `?[*]u8 s = local[0..n]` left `s` un-tainted → every escape sink (`g = s` / `return s` / `&s[i]`) let a
+  dangling stack slice escape. The non-optional `[*]u8` form was correctly rejected — the `?T` wrapper was
+  the differentiator (the OPEN "optional-unwrap" class). Fix: `type_unwrap_optional(sym_type)` before the
+  `TYPE_SLICE` kind check (mirrors `escape_type_carries_ref`, which already unwraps). Test
+  `tests/zer_fail/escape_optional_slice_store_global.zer`.
+- **G5 struct-global-field dangle** (zercheck_ir.c IR_ASSIGN). `g.p = n; free(n)` (g a value-aggregate
+  global) dangled unflagged — the IR_GLOBAL_ROOT_ID dangle sink matched only a bare `g = n` ident store.
+  Fix: a sibling sink registers a compound `(IR_GLOBAL_ROOT_ID, "<global><.field/[idx]>")` pseudo-root for
+  value-aggregate global projections; free propagates FREED, the exit-pass (definite-FREED only) flags it.
+  Documented gap G5 (limitations.md). Test `tests/zer_fail/g5_struct_global_field_dangle.zer`.
+- **`find_return_range` orelse-block silent OOB** (checker.c). The statement walker fell through to
+  `return true` for kinds it doesn't descend, so a `return BIG` hidden in a `orelse { return BIG; }`
+  fallback on a var-decl init / expr-stmt / assignment was never visited → dropped from the return-range
+  union → the summary under-approximated → a caller elided the bounds guard on `arr[f()]` (ASan-confirmed
+  silent OOB write). Fix: descend the orelse fallback of a var-decl/expr-stmt/assign (branch-local; the
+  block's own NODE_RETURN handling gives up the summary if the value has no derivable range, so it never
+  under-accepts). Trap regression `tests/zer_trap/vrp_orelse_block_return_range_leak.zer` (exit 133).
+- **struct-init `{ .field = ptr }` alias UAF** (zercheck_ir.c IR_STRUCT_INIT_DECOMP). `Holder h = { .t = t
+  }; free(t); h.t.id` compiled a use-after-free — the designated-initializer form was a no-op, so the field
+  never aliased t's allocation (the ASSIGNMENT form `h.t = t` IS caught via IR_FIELD_WRITE). Fix: an
+  IR_STRUCT_INIT_DECOMP analyzer case registers `(dest, ".field")` for each field value that is an ALIVE
+  tracked handle; the following IR_COPY temp→var replicates the compound rows (§A #6), so a later free
+  propagates FREED and the read fires. Test `tests/zer_fail/struct_init_field_alias_uaf.zer`.
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

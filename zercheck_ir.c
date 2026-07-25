@@ -3257,6 +3257,71 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
+            /* G5 (2026-07-25): heap pointer stored into a VALUE-AGGREGATE
+             * global's FIELD/INDEX projection — `g.p = n` / `garr[0] = n`
+             * (g an unshadowed struct/union/array global). Same dangle as the
+             * bare `g = n` sink above, but the target is a projection, not a
+             * bare ident, so that sink missed it and `g.p` dangled after
+             * `free(n)` with NO diagnostic. Silent on bare-metal: the slab slot
+             * stays mapped, so the stale read does not trap either. Register a
+             * compound pseudo-root keyed (IR_GLOBAL_ROOT_ID, "<global><.field>")
+             * sharing n's alloc_id; the free propagates FREED to it and the
+             * exit-pass dangle check (definite-FREED only, mirroring the
+             * bare-ident machinery — never MAYBE_FREED, so the legit
+             * register-ctx-then-callback pattern is untouched) flags it. A null
+             * reset (`g.p = null`) clears the binding, same as the bare sink.
+             * Gated to VALUE-AGGREGATE roots so the projection is genuinely
+             * within the global's own storage (a *T pointer global's `g.f` is an
+             * auto-deref into the pointee — a different, heap-rooted case). */
+            if (target_expr &&
+                (target_expr->kind == NODE_FIELD ||
+                 target_expr->kind == NODE_INDEX)) {
+                Node *groot = ir_key_root_ident(target_expr);
+                if (groot && ir_ident_is_unshadowed_global(zc, func, groot)) {
+                    Symbol *gsym = scope_lookup(zc->checker->global_scope,
+                        groot->ident.name, (uint32_t)groot->ident.name_len);
+                    TypeKind gk = gsym ? type_dispatch_kind(gsym->type)
+                                       : TYPE_VOID;
+                    int suffix = ir_measure_key_path(target_expr);
+                    if (gsym && suffix > 0 &&
+                        (gk == TYPE_STRUCT || gk == TYPE_UNION ||
+                         gk == TYPE_ARRAY)) {
+                        uint32_t glen = (uint32_t)groot->ident.name_len;
+                        char *gpath = (char *)arena_alloc(zc->arena,
+                            (size_t)glen + (size_t)suffix + 1);
+                        if (gpath) {
+                            memcpy(gpath, groot->ident.name, glen);
+                            int wrote = ir_build_key_path(target_expr,
+                                gpath + glen, suffix + 1, NULL);
+                            if (wrote == suffix) {
+                                uint32_t gplen = glen + (uint32_t)suffix;
+                                IRHandleInfo *grh = (rhs_local >= 0)
+                                    ? ir_find_handle(ps, rhs_local) : NULL;
+                                if (grh && grh->state == IR_HS_ALIVE &&
+                                    grh->alloc_id != 0) {
+                                    IRAliasSnapshot gsnap;
+                                    ir_snapshot_alias(&gsnap, grh);
+                                    IRHandleInfo *gh = ir_add_compound_handle(ps,
+                                        IR_GLOBAL_ROOT_ID, gpath, gplen);
+                                    if (gh) {
+                                        ir_apply_alias(gh, &gsnap);
+                                        gh->state = IR_HS_ALIVE;
+                                        gh->escaped = true;
+                                    }
+                                } else {
+                                    IRHandleInfo *gh = ir_find_compound_handle(ps,
+                                        IR_GLOBAL_ROOT_ID, gpath, gplen);
+                                    if (gh) {
+                                        gh->state = IR_HS_UNKNOWN;
+                                        gh->alloc_id = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             /* Gap A2 (2026-05-06, sNsjM): move-struct field-write transfers
              * ownership. `b.field = t` where t is a move struct (or contains
              * move fields) MUST mark t as TRANSFERRED. Subsequent use of t =
@@ -4953,8 +5018,51 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_ADDR_OF: case IR_DEREF_READ:
     case IR_CALL_DECOMP: case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP: case IR_SLICE_READ:
-    case IR_STRUCT_INIT_DECOMP:
         break;
+
+    /* G? (2026-07-25): `dest = { .f = v }` designated-init aliases v into
+     * dest.f. Was a no-op → `Holder h = { .t = t }; free(t); h.t.id` compiled a
+     * use-after-free: the field-ASSIGNMENT form `h.t = t` IS caught (via
+     * IR_FIELD_WRITE registering a compound handle), but the INITIALIZER form
+     * registered no alias, so the read of h.t was untracked. Mirror
+     * IR_FIELD_WRITE: for each field value that is an ALIVE tracked handle,
+     * register (dest, ".field") sharing its alloc_id. The struct-init lowers to
+     * a temp that the following IR_COPY replicates onto the real variable
+     * (§A #6 compound-row replication), so a later free propagates FREED to
+     * h.t and the read fires. */
+    case IR_STRUCT_INIT_DECOMP: {
+        Node *si = inst->expr;
+        if (si && si->kind == NODE_STRUCT_INIT && inst->dest_local >= 0 &&
+            inst->call_arg_locals &&
+            inst->call_arg_local_count == si->struct_init.field_count) {
+            for (int i = 0; i < inst->call_arg_local_count; i++) {
+                int vloc = inst->call_arg_locals[i];
+                if (vloc < 0) continue;
+                IRHandleInfo *vh = ir_find_handle(ps, vloc);
+                if (!vh || vh->state != IR_HS_ALIVE || vh->alloc_id == 0)
+                    continue;
+                const char *fname = si->struct_init.fields[i].name;
+                uint32_t fnlen = (uint32_t)si->struct_init.fields[i].name_len;
+                if (!fname || fnlen == 0) continue;
+                /* build ".field" path (dot-prefixed, no root) in the arena */
+                char *path = (char *)arena_alloc(zc->arena, (size_t)fnlen + 2);
+                if (!path) continue;
+                path[0] = '.';
+                memcpy(path + 1, fname, fnlen);
+                path[fnlen + 1] = '\0';
+                /* snapshot BEFORE ir_add_compound_handle (may realloc) */
+                IRAliasSnapshot snap;
+                ir_snapshot_alias(&snap, vh);
+                IRHandleInfo *ch = ir_add_compound_handle(ps, inst->dest_local,
+                    path, fnlen + 1);
+                if (ch) {
+                    ir_apply_alias(ch, &snap);
+                    ch->state = IR_HS_ALIVE;
+                }
+            }
+        }
+        break;
+    }
     }
 }
 

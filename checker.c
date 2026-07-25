@@ -1630,7 +1630,16 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
 static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
                                                 Type *sym_type, Node *value) {
     if (!sym || !value || !sym_type) return;
-    if (type_dispatch_kind(sym_type) != TYPE_SLICE) return;
+    /* Unwrap an optional carrier (?[*]T): this is the ONLY taint path for the
+     * array->slice coercion class, and it early-returned on TYPE_OPTIONAL, so
+     * `?[*]u8 s = local[0..n]` left `s` un-tainted and every escape sink
+     * (g = s / return s / &s[i]) let the dangling stack slice escape
+     * (accept-unsafe UAF). The escape sinks already unwrap the optional via
+     * escape_type_carries_ref; mirror that here so the taint fires for a
+     * ?[*]T destination exactly as for a bare [*]T one. A ?u32/?bool carrier
+     * unwraps to a non-slice inner and is (correctly) left untouched. */
+    Type *eff = type_unwrap_optional(sym_type);
+    if (type_dispatch_kind(eff) != TYPE_SLICE) return;
     Node *roots[2] = { value, NULL };
     int root_count = 1;
     if (value->kind == NODE_ORELSE && value->orelse.fallback)
@@ -16609,6 +16618,26 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
     }
     if (node->kind == NODE_ONCE) {
         return find_return_range(c, node->once.body, out_min, out_max, found, true);
+    }
+    /* orelse-block fallbacks in expression-position statements (2026-07-25):
+     * a `return BIG` hidden in `x orelse { return BIG; }` attached to a
+     * var-decl init / expr-stmt / assignment RHS is a real return path the
+     * scan above never reached — it fell to the `return true` default below
+     * and SILENTLY DROPPED from the union, so the summary UNDER-approximated
+     * and a caller elided its bounds guard on `arr[f()]` (ASan-confirmed silent
+     * OOB write). Descend the orelse fallback (branch-local → in_branch=true);
+     * the block's own NODE_RETURN handling gives up the summary if the returned
+     * value has no derivable range, so this never under-accepts. */
+    {
+        Node *ex = NULL;
+        if (node->kind == NODE_VAR_DECL) ex = node->var_decl.init;
+        else if (node->kind == NODE_EXPR_STMT) ex = node->expr_stmt.expr;
+        else if (node->kind == NODE_ASSIGN) ex = node->assign.value;
+        if (ex && ex->kind == NODE_ORELSE && ex->orelse.fallback) {
+            if (!find_return_range(c, ex->orelse.fallback,
+                                   out_min, out_max, found, true))
+                return false;
+        }
     }
     return true; /* non-return statement — ok */
 }

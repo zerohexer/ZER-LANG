@@ -1,0 +1,20 @@
+// Audit 2026-07-25: find_return_range silently returned `true` for statement
+// kinds it does not descend, so a `return BIG` hidden in an `orelse { return
+// BIG; }` fallback on a var-decl init was NEVER visited — it dropped out of the
+// return-range union, so pick() was credited [0,7] instead of [0,18] and the
+// caller elided the slice bounds check on s[idx] → silent OOB read (ASan-
+// confirmed). Fix: find_return_range descends the orelse fallback of a
+// var-decl/expr-stmt/assign (branch-local), so the 18 is unioned in and the
+// caller keeps the bounds check.
+// Expected: SIGTRAP "array index out of bounds" at runtime.
+?u32 maybe(u32 x) { if (x > 0) { return x; } return null; }
+u32 pick(u32 x) {
+    u32 v = maybe(x) orelse { return 18; };
+    return v & 7;
+}
+u32 main() {
+    u8[16] arr;
+    [*]u8 s = arr[0..16];
+    u32 idx = pick(0);
+    return s[idx];
+}

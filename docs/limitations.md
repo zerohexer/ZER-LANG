@@ -656,17 +656,17 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
-  the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
-  ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
-  the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:
-  storing into a `shared struct` field + reading from a worker = silent cross-thread UAF on a reused slab
-  slot (observably reproduced, exit=999). CAUTION for the fixer: extends the BUG-742 global-dangle
-  conservatism — the maintainer deliberately does NOT flag MAYBE_FREED globals at exit (avoids noising the
-  legit register-ctx-then-callback pattern); a field-projection fix must flag only a DEFINITELY-freed
-  target, mirroring the bare-ident register/alias/exit machinery for the compound `(IR_GLOBAL_ROOT_ID,
-  name.field)` key.
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF). **✅ DONE
+  2026-07-25** (make check 1018/0, sink matrix 44 CLEAN). `g.p = n; free(n);` (g a struct global) left
+  `g.p` dangling — the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c) matched only a
+  BARE global ident store (`g = n`); the `.field` projection was missed. Fix: a sibling sink at the same
+  IR_ASSIGN site registers a compound pseudo-root `(IR_GLOBAL_ROOT_ID, "<global><.field/[idx]>")` for a
+  FIELD/INDEX target whose root is an unshadowed **VALUE-AGGREGATE** global (struct/union/array — so the
+  projection is genuinely within the global's own storage; a `*T` pointer-global's `g.f` auto-deref is a
+  different, heap-rooted case, deliberately excluded), sharing n's alloc_id via `ir_snapshot_alias`. The
+  free propagates FREED to it and the existing exit-pass dangle check (definite-FREED only — mirrors the
+  bare-ident machinery, so the register-ctx-then-callback pattern is untouched) flags it; a `g.p = null`
+  reset clears the binding. Also covers `garr[0] = n`. Regression `tests/zer_fail/g5_struct_global_field_dangle.zer`.
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%

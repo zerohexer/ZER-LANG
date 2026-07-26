@@ -51,6 +51,18 @@ question answered independently at N sites, a new form/site silently missed) —
 new sink/value-shape cells, the VRP one is a per-node-kind JOIN gap, the shared-struct one is the
 4-value-flow-site coverage rule.
 
+Follow-up (same session) — 2 loud-failure bugs + 1 DoS:
+6. **defer BLOCK with a local declaration + multiple return paths → uncompilable C
+   (`redefinition`) (emitter.c).** A defer body is emitted at every exit path; the IR_DEFER_FIRE
+   handler (and `emit_defers_from`) flattened a NODE_BLOCK defer body WITHOUT braces, so
+   `defer { u32 z = ...; }` landed the declaration in the shared C function scope and the 2nd
+   exit path's copy was a gcc `redefinition of z`. Fix: brace-scope each block-form defer-body
+   emission. Test `tests/zer/defer_block_decl_multi_return.zer`.
+7. **O(errors×line_len) compile-time DoS: the source-line echo in the error printer was uncapped
+   (parser.c + checker.c).** A single very long line of garbage tokens emits one error per token,
+   each re-printing the whole line (an 80 KB one-liner took ~20s). Cap the echo at 200 chars (the
+   caret row was already capped at 60); now linear-ish (~3.9s @ 80 KB).
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

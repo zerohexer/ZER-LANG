@@ -31,7 +31,13 @@ static void print_source_line_p(FILE *out, const char *source, int line) {
         first_nonws++;
     int content_len = len - first_nonws;
     if (content_len <= 0) return;
-    fprintf(out, " %4d | %.*s\n", line, len, p);
+    /* Cap the echoed line length. Without this, a single very long line of
+     * garbage tokens costs O(tokens_on_line * line_length) — the recovery loop
+     * emits one error per token and each re-prints the whole line — a quadratic
+     * compile-time DoS on adversarial input (an 80 KB one-liner hung for ~20s).
+     * The caret row is already capped at 60; cap the echo similarly. */
+    int print_len = len > 200 ? 200 : len;
+    fprintf(out, " %4d | %.*s%s\n", line, print_len, p, print_len < len ? " …" : "");
     fprintf(out, "      | ");
     for (int i = 0; i < first_nonws; i++)
         fputc(p[i] == '\t' ? '\t' : ' ', out);

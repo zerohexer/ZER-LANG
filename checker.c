@@ -103,8 +103,10 @@ static void print_source_line(FILE *out, const char *source, int line) {
         first_nonws++;
     int content_len = len - first_nonws;
     if (content_len <= 0) return;
-    /* print: " line | source_text" */
-    fprintf(out, " %4d | %.*s\n", line, len, p);
+    /* print: " line | source_text" (cap the echo — a pathologically long line
+     * printed once per error is an O(errors*line_len) DoS; caret is capped at 60) */
+    int print_len = len > 200 ? 200 : len;
+    fprintf(out, " %4d | %.*s%s\n", line, print_len, p, print_len < len ? " …" : "");
     /* print: "      | ^^^^..." under the content */
     fprintf(out, "      | ");
     for (int i = 0; i < first_nonws; i++)

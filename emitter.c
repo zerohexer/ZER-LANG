@@ -3825,8 +3825,18 @@ static void emit_defers_from(Emitter *e, int base) {
         Node *db = e->defer_stack.stmts[di];
         if (!db) continue;
         if (db->kind == NODE_BLOCK) {
+            /* Wrap the block-form defer body in a C compound statement so any
+             * local declared inside it (`defer { u32 z = ...; }`) is scoped to
+             * this emission. A defer body is emitted at EVERY exit path of the
+             * function; without the braces, a declaration lands in the shared C
+             * function scope and the second exit path's copy is a `redefinition`
+             * gcc error — a multi-return function with a declaring block defer
+             * failed to compile (silent-until-gcc). The single-statement form
+             * below never declares, so it needs no brace. */
+            emit(e, "{\n");
             for (int si = 0; si < db->block.stmt_count; si++)
                 emit_defer_stmt(e, db->block.stmts[si], func);
+            emit(e, "}\n");
         } else {
             emit_defer_stmt(e, db, func);
         }
@@ -10700,9 +10710,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 e->indent++;
             }
             if (db->kind == NODE_BLOCK) {
+                /* Brace-scope the block-form defer body: it is emitted at EVERY
+                 * exit path, so a local declared inside (`defer { u32 z=..; }`)
+                 * would otherwise land in the shared C function scope and collide
+                 * (`redefinition`) across exit paths — a multi-return function
+                 * with a declaring block defer failed to compile. Flattening the
+                 * block here (rather than emit_defer_stmt(block)) is deliberate so
+                 * the `guarded` if-wrap can nest the whole body; the braces just
+                 * restore the missing scope. */
+                emit_indent(e);
+                emit(e, "{\n");
+                e->indent++;
                 for (int si = 0; si < db->block.stmt_count; si++) {
                     emit_defer_stmt(e, db->block.stmts[si], func);
                 }
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
             } else {
                 emit_defer_stmt(e, db, func);
             }

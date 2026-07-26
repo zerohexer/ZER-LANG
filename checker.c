@@ -993,6 +993,26 @@ static bool escape_type_carries_ref(Type *vt) {
     return false;
 }
 
+/* Copying a whole `shared struct` VALUE (not a field) byte-copies its embedded
+ * mutex — UB in C (a mutex must not be copied) AND a torn snapshot (the source's
+ * fields may be mid-update under its lock). The call-argument site already rejects
+ * this ("cannot pass shared struct by value"); the sibling value-flow sites
+ * (var-decl init, assignment RHS, return) did NOT, so `C x = g;` / `x = g;` /
+ * `return g;` silently produced an unlocked torn copy + mutex clone. This detects
+ * a READ of an EXISTING shared instance (ident/field/index/deref) whose type is a
+ * shared struct; a fresh construction (a struct-init literal) is intentionally
+ * allowed — it copies no live mutex. A locked field read (`g.v`) has scalar type,
+ * so it is not a shared-struct value and is correctly excluded. */
+static bool is_shared_struct_value_read(Node *expr, Type *t) {
+    if (!expr || !t) return false;
+    if (type_dispatch_kind(t) != TYPE_STRUCT) return false;
+    Type *e = type_unwrap_distinct(t);
+    if (!e || !(e->struct_type.is_shared || e->struct_type.is_shared_rw)) return false;
+    NodeKind k = expr->kind;
+    return k == NODE_IDENT || k == NODE_FIELD || k == NODE_INDEX ||
+           (k == NODE_UNARY && expr->unary.op == TOK_STAR);
+}
+
 /* BUG-374 + Stage 2 extraction (2026-06-22): does a SINGLE call argument carry a
  * pointer/slice derived from a caller LOCAL (frame memory)?  Behavior-preserving
  * split-out of the per-argument body of `call_has_local_derived_arg` so the
@@ -1071,7 +1091,17 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
          * A slice references frame memory exactly as a pointer does. */
         if (arg->kind == NODE_CALL) {
             Type *arg_type = typemap_get(c, arg);
-            if (escape_type_carries_ref(arg_type)) {
+            /* Gate on type_carries_data_pointer (pointer|slice|optional|ARRAY|
+             * STRUCT|UNION carrying a pointer transitively), NOT the narrower
+             * escape_type_carries_ref (pointer|slice|opt-of-those). A call that
+             * returns a struct/union BY VALUE carrying a pointer to a caller local
+             * (`makeRM(&local)` returning `RM { *u32 q; }`) is the same launder as
+             * a pointer-returning call — the returned aggregate views frame memory
+             * through its field. This predicate feeds the escape sinks (Ring.push,
+             * spawn-by-value, keep-call), which store/detach the arg, so the
+             * struct carrier must be followed too. Same widen the sibling sinks
+             * already got (BUG-762/766); this arg-launder predicate was missed. */
+            if (type_carries_data_pointer(arg_type, 0)) {
                 if (call_has_local_derived_arg(c, arg, depth + 1))
                     return true;
             }
@@ -3993,6 +4023,14 @@ static Type *check_expr(Checker *c, Node *node) {
          * target is a pointer type. Same logic as var_decl hook. */
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
+
+        if (is_shared_struct_value_read(node->assign.value, value)) {
+            checker_error(c, node->loc.line,
+                "cannot assign shared struct '%s' by value — the embedded mutex "
+                "would be cloned and the read is an unlocked torn snapshot. "
+                "Assign through a pointer, or copy individual fields.",
+                type_name(value));
+        }
 
         /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
          * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
@@ -7443,6 +7481,28 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* Ban VALUE-form orelse (`x orelse v` / `x orelse { block }`) inside a
+         * defer body. Defer bodies are emitted via raw-AST `emit_rewritten_node`
+         * (they bypass IR lowering), which has NO NODE_ORELSE handler → it emits a
+         * `_zer_trap("compiler bug: unhandled NODE kind")` and, because defer
+         * bodies are re-emitted at every exit path, a `redefinition` gcc error on
+         * the orelse temp. This is an EMISSION IMPOSSIBILITY on the raw-AST defer
+         * path (orelse needs branch+temp lowering the raw emitter can't express),
+         * so it is banned like the control-flow orelse forms above and like
+         * yield/await-in-defer. Without this the diagnostic is a confusing
+         * "compiler bug" trap instead of a clear source-level error.
+         * (The control-flow forms — orelse return/break/continue — are already
+         * rejected above; this covers only the value/block fallback.) */
+        if (c->defer_depth > 0 &&
+            !node->orelse.fallback_is_return &&
+            !node->orelse.fallback_is_break &&
+            !node->orelse.fallback_is_continue) {
+            checker_error(c, node->loc.line,
+                "cannot use 'orelse' with a value/block fallback inside a defer "
+                "body — defer bodies cannot express orelse's branch; move the "
+                "orelse before the defer");
+        }
+
         if (node->orelse.fallback_is_return ||
             node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
@@ -10423,7 +10483,16 @@ static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
             }
         }
     }
-    return false;
+    /* Fall through to the shared frame-bound predicate for the shapes this
+     * spawn-specific walker never enumerated: an INLINE struct-init literal
+     * carrying a &local field (`spawn wk({ .q = &local })`) and a CALL that
+     * launders a local into a returned pointer-carrying struct
+     * (`spawn wk(makeSM(&local))`). Both are cross-thread stack-UAF once the
+     * frame returns; the ident-form sibling (`SM m; m.q=&local; spawn wk(m)`)
+     * was already rejected, so these two divergent forms were per-sink patchwork
+     * holes. arg_is_local_derived returns false for a pure-value struct-init /
+     * a value-returning call (no over-rejection). */
+    return arg_is_local_derived(c, arg, 0);
 }
 
 static void check_stmt(Checker *c, Node *node) {
@@ -10524,6 +10593,15 @@ static void check_stmt(Checker *c, Node *node) {
             route_alloc_to_ptr_if_needed(c, node->var_decl.init, type);
 
             Type *init_type = check_expr(c, node->var_decl.init);
+
+            if (is_shared_struct_value_read(node->var_decl.init, init_type)) {
+                checker_error(c, node->loc.line,
+                    "cannot copy shared struct '%s' by value — the embedded mutex "
+                    "would be cloned and the read is an unlocked torn snapshot. "
+                    "Take a pointer ('*%s'), or read individual fields (each "
+                    "field read is auto-locked).",
+                    type_name(init_type), type_name(init_type));
+            }
 
             /* non-storable check: pool.get(h) pointer result.
              * BUG-405: only block when result is a pointer — scalar values
@@ -11601,6 +11679,21 @@ static void check_stmt(Checker *c, Node *node) {
          * body-written var BEFORE checking, then re-push the narrow loop-var range
          * below so the counter keeps its proven [init, bound-1]. */
         vrp_invalidate_loop_body_writes(c, node->for_stmt.body);
+        /* SILENT-OOB FIX (2026-07-26): the pre-pass above WIDENS every
+         * body-written pre-existing var to the union of its pre-loop range and
+         * all body writes — the sound post-loop range (a var holds either its
+         * pre-loop value on 0 iterations or a body value on >=1). But the body's
+         * `check_stmt` below then RE-NARROWS such a var IN PLACE via
+         * vrp_invalidate_for_assign (`idx = 0` -> [0,0]), and the count-only
+         * `var_range_count = saved_range_count` restore CANNOT undo an in-place
+         * mutation of an entry that existed BEFORE the loop. So a body-local
+         * narrowing leaked past the loop, eliding a later fixed-array bounds
+         * guard on a zero-trip loop (idx keeps its wild pre-loop value at
+         * runtime) -> silent OOB. IF/SWITCH already snap/restore; the three loop
+         * handlers only truncated the count. Snapshot the WIDENED ranges here
+         * (before the loop-var cond-narrow push, which lands at index >=
+         * saved_range_count) and restore them after the body. */
+        struct VarRange *for_loop_pre = vrp_snap_take(c, saved_range_count);
         if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY) {
             Node *fc = node->for_stmt.cond;
             TokenType fop = fc->binary.op;
@@ -11638,7 +11731,12 @@ static void check_stmt(Checker *c, Node *node) {
         c->in_loop = true;
         check_stmt(c, node->for_stmt.body);
         c->in_loop = prev_in_loop;
-        c->var_range_count = saved_range_count; /* ranges invalid after loop */
+        /* undo any in-place narrowing the body did to a pre-loop entry, replacing
+         * it with the widened union range captured before the body (sound
+         * post-loop over-approximation). */
+        vrp_snap_restore(c, for_loop_pre, saved_range_count);
+        free(for_loop_pre);
+        c->var_range_count = saved_range_count; /* drop loop-scoped entries */
         pop_scope(c);
         break;
     }
@@ -11668,6 +11766,12 @@ static void check_stmt(Checker *c, Node *node) {
          * saved_range_count restores after the loop. */
         int saved_range_count = c->var_range_count;
         vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
+        /* SILENT-OOB FIX (2026-07-26): same class as the NODE_FOR fix — snapshot
+         * the WIDENED post-pre-pass ranges (before the cond-narrow push, so an
+         * outer loop var stays widened post-loop, not stuck at the cond bound)
+         * and restore after the body so a body-local in-place narrowing cannot
+         * leak past the loop and elide a later bounds/div guard. */
+        struct VarRange *while_loop_pre = vrp_snap_take(c, saved_range_count);
 
         /* BUG-D (2026-07-16): the cond-derived narrowing below is SOUND for
          * `while` (condition checked BEFORE the body) but UNSOUND for `do-while`
@@ -11698,6 +11802,8 @@ static void check_stmt(Checker *c, Node *node) {
         c->in_loop = true;
         check_stmt(c, node->while_stmt.body);
         c->in_loop = prev_in_loop;
+        vrp_snap_restore(c, while_loop_pre, saved_range_count);
+        free(while_loop_pre);
         c->var_range_count = saved_range_count;
         break;
     }
@@ -12172,6 +12278,14 @@ static void check_stmt(Checker *c, Node *node) {
 
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
+
+            if (is_shared_struct_value_read(node->ret.expr, ret_type)) {
+                checker_error(c, node->loc.line,
+                    "cannot return shared struct '%s' by value — the embedded mutex "
+                    "would be cloned and the read is an unlocked torn snapshot. "
+                    "Return a pointer ('*%s') or the individual fields.",
+                    type_name(ret_type), type_name(ret_type));
+            }
 
             /* Stage 1->2 escape summary accumulator (2026-06-22): classify this
              * valued return's region. STATIC contributes nothing; ARParam(n) adds
@@ -13883,14 +13997,22 @@ static void check_stmt(Checker *c, Node *node) {
              * it is not over-rejected. Scoped spawns are exempt (join bounds the
              * lifetime). */
             else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
                      spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
+                /* Any non-ptr-like value arg that carries a pointer into a stack
+                 * local — a by-value struct/union field (`Msg m; m.p=&local`), an
+                 * INLINE struct-init literal (`spawn wk({ .q = &local })`, whose
+                 * type does not resolve to TYPE_STRUCT here — it is checked with no
+                 * target-type context and comes back TYPE_VOID, so the old
+                 * struct-kind gate silently missed it), a
+                 * call-laundered struct (`spawn wk(makeSM(&local))`), or a local
+                 * array. spawn_arg_is_stack_derived (→ arg_is_local_derived) is
+                 * false for a pure-value / scalar arg, so no over-rejection; the
+                 * eff->kind gate was both redundant and a hole. */
                 checker_error(c, node->loc.line,
-                    "spawn argument %d: cannot pass a by-value struct/union that "
-                    "carries a pointer into a stack local to a fire-and-forget "
-                    "spawn — the field pointer dangles once the frame returns "
-                    "(cross-thread use-after-free). Use ThreadHandle + join, or "
-                    "copy the pointed-to data by value",
+                    "spawn argument %d: cannot pass a value that carries a pointer "
+                    "into a stack local to a fire-and-forget spawn — the pointer "
+                    "dangles once the frame returns (cross-thread use-after-free). "
+                    "Use ThreadHandle + join, or copy the pointed-to data by value",
                     i + 1);
             }
             /* Handle args: ban — pool.get() not thread-safe.

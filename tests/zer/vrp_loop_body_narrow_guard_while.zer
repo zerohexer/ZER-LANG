@@ -1,0 +1,12 @@
+// Regression (while-loop sibling of vrp_loop_body_narrow_guard_for).
+u32 pick(u32 x) { return x; }
+u32 f() {
+    u8[4] arr; arr[0] = 1;
+    u32 idx = pick(4) % 100;
+    u32 n = pick(0);
+    u32 c = 0;
+    while (c < n) { idx = 0; c += 1; }
+    arr[idx] = 77;
+    return 42;
+}
+u32 main() { return f(); }

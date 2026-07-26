@@ -242,11 +242,13 @@ added the 3 cases (condvar/barrier/once self-lock). `586507fb` C-F4 + `19471462`
 `shared_multi_field_ptr_lock_ok` + `shared_rw_multi_lock_intrinsic`; 2026-07-15. make check 982/0.
 **🎯 §E (concurrency #26–#31) FULLY DONE.**
 
-**OPEN (from §E #28, low-risk — traps LOUDLY, not silent):** `defer { u32 z = maybe() orelse
-g.v; }` hits a separate emitter gap — `emit_rewritten_node` has no NODE_ORELSE handler in defer
-bodies (they bypass IR lowering), so it emits a runtime compiler-bug trap rather than valid C.
-Recommended fix: checker-side reject `orelse in a defer body` (same class as the existing
-return/break/continue/goto-in-defer bans). Not a soundness hole (loud, not silent).
+**✅ DONE (2026-07-26, from §E #28):** value/block-form `orelse` inside a defer body is now
+rejected in the NODE_ORELSE checker handler (`c->defer_depth > 0` and not one of the
+already-banned control-flow orelse forms). Emission impossibility on the raw-AST defer path
+(`emit_rewritten_node` has no NODE_ORELSE handler → a `_zer_trap` "compiler bug" + duplicate-temp
+gcc error), same class as the yield/return/break/continue/goto-in-defer bans. Test
+`tests/zer_fail/orelse_value_in_defer.zer`. Loud→loud (clear source error instead of a confusing
+compiler-bug trap).
 
 ### F. Parser / crashes / robustness
 **✅ DONE: #33 `type_name` buffer overflow → SIGSEGV (`59a968cb` A5, clamping `tn_append`;

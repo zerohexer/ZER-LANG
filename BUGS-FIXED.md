@@ -5,6 +5,52 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-26 — Audit session: 5 verified soundness/safety holes closed (checker.c)
+
+Fresh-eyes multi-agent audit (escape/VRP/emitter/concurrency/handle/uN subsystems). Five verified
+holes fixed, each with a regression test; `make check` GREEN (1019 integration + 784 Rust + 36
+Zig), sink matrix CLEAN, all audits pass.
+
+1. **VRP loop-body narrowing leaked past the loop → silent fixed-array OOB (HIGH).** The
+   FOR/WHILE/DO_WHILE handlers widened body-written vars via `vrp_invalidate_loop_body_writes`
+   (so uses INSIDE the body were safe) but then the body's `check_stmt` RE-NARROWED a pre-loop
+   entry in place (`idx = 0` → [0,0]), and the count-only `var_range_count = saved_range_count`
+   restore cannot undo an in-place mutation of a pre-loop entry. So on a zero-trip loop the
+   narrowed range leaked to a later `arr[idx]`, eliding the bounds guard while `idx` kept its wild
+   runtime value (ASan/stack-smashing-confirmed OOB read+write). IF/SWITCH were already immune
+   (snap/restore). Fix: snapshot the WIDENED ranges after the pre-pass (`vrp_snap_take`) and
+   `vrp_snap_restore` after the loop body — sound post-loop over-approximation, can only ADD
+   guards. Tests `tests/zer/vrp_loop_body_narrow_guard_{for,while}.zer`.
+2. **spawn of a by-value struct carrying a pointer-to-local via struct-init literal OR
+   call-launder → cross-thread stack-UAF (HIGH).** `spawn wk({ .q = &local })` and
+   `spawn wk(makeSM(&local))` compiled clean; only the ident form (`SM m; m.q=&local; spawn
+   wk(m)`) was rejected. `spawn_arg_is_stack_derived` (a private, narrower re-impl of the
+   frame-bound question) never handled NODE_STRUCT_INIT / NODE_CALL, AND the call-site gate keyed
+   on `eff->kind == TYPE_STRUCT` which a bare struct-init literal (typed void with no target-type
+   context) failed. Fix: delegate the walker's fall-through to the shared `arg_is_local_derived`
+   (handles both forms) and drop the redundant-and-holed struct-kind gate (`!is_ptr_like` +
+   the shared predicate already ensure precision — pure-value/scalar args return false).
+3. **Ring.push / keep-call of a call returning a by-value struct carrying a pointer-to-local →
+   silent stack-UAF (HIGH).** `arg_is_local_derived`'s NODE_CALL case gated on
+   `escape_type_carries_ref` (pointer/slice/opt only), excluding a call returning a struct/union
+   BY VALUE that carries a pointer (`makeRM(&local)`). Widened to `type_carries_data_pointer`
+   (the same widen the sibling sinks got in BUG-762/766; this arg-launder predicate was missed).
+4. **Whole-`shared struct` value copy at var-decl/assign/return → unlocked torn read + mutex
+   clone (MEDIUM).** `C x = g;` / `x = g;` / `return g;` byte-copied a shared struct's embedded
+   mutex (UB) and read its fields unlocked. The call-argument site already rejected by-value
+   shared-struct passing; the sibling value-flow sites did not. New `is_shared_struct_value_read`
+   helper (a READ of an existing shared instance — ident/field/index/deref — of shared-struct
+   type; a fresh struct-init literal is intentionally allowed) rejects at all three sites. Tests
+   `tests/zer_fail/shared_struct_copy_by_value.zer` + `tests/zer/shared_struct_field_read_ok.zer`.
+5. **value/block `orelse` inside a defer body → compiler-bug trap + broken gcc (§E #28,
+   loud).** Now a clean checker rejection (emission impossibility on the raw-AST defer path).
+   Test `tests/zer_fail/orelse_value_in_defer.zer`.
+
+Root-cause theme: all five are the documented MULTI-SITE / per-sink-patchwork class (a semantic
+question answered independently at N sites, a new form/site silently missed) — the escape ones are
+new sink/value-shape cells, the VRP one is a per-node-kind JOIN gap, the shared-struct one is the
+4-value-flow-site coverage rule.
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

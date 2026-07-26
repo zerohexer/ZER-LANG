@@ -1,0 +1,15 @@
+// Regression: a loop-body write narrowing a pre-loop VRP range must NOT leak
+// past the loop and elide a later fixed-array bounds guard (silent OOB).
+// idx is [0,99] pre-loop; the body narrows it to [0,0], but on a 0-trip loop
+// idx keeps its wild value (4). WITH the fix the auto-guard fires (returns 0);
+// WITHOUT it, arr[4]=77 is a silent OOB write and f returns 42.
+u32 pick(u32 x) { return x; }
+u32 f() {
+    u8[4] arr; arr[0] = 1;
+    u32 idx = pick(4) % 100;
+    u32 n = pick(0);
+    for (u32 i = 0; i < n; i += 1) { idx = 0; }
+    arr[idx] = 77;
+    return 42;
+}
+u32 main() { return f(); }

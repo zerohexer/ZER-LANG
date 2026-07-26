@@ -839,6 +839,21 @@ static void emit_intn_carrier(Emitter *e, uint32_t bits, bool is_signed) {
     }
 }
 
+/* Carrier typedef suffix for a uN/iN width — the native carrier is the smallest
+ * int >= bits, so a `?u5`/`[*]u5` has the EXACT C layout of a `?u8`/`[*]u8` and
+ * can reuse that already-emitted named typedef (`_zer_opt_u8`, `_zer_slice_u8`).
+ * Without this, non-native-width optional/slice compound types fell to an INLINE
+ * anonymous struct per use site → two instances were distinct incompatible C
+ * types → GCC "incompatible types" on any copy/assign (the feature was broken;
+ * the named-typedef invariant this restores is in compiler-internals.md). */
+static const char *intn_carrier_suffix(uint32_t bits, bool is_signed) {
+    if (is_signed)
+        return (bits <= 8) ? "i8" : (bits <= 16) ? "i16" :
+               (bits <= 32) ? "i32" : (bits <= 64) ? "i64" : "i128";
+    return (bits <= 8) ? "u8" : (bits <= 16) ? "u16" :
+           (bits <= 32) ? "u32" : (bits <= 64) ? "u64" : "u128";
+}
+
 /* Path C: after an arithmetic op, mask a uN/iN result to its bit width when the
  * carrier is wider than N (non-standard widths). Native 8/16/32/64/128 self-wrap.
  * uN -> bitmask; iN -> sign-extend (unsigned-shift then arithmetic >> to avoid
@@ -1018,13 +1033,19 @@ static void emit_type(Emitter *e, Type *t) {
                 break;
             /* Stage 2 Part B (2026-04-28): exhaustive — any other elem
              * type uses anonymous struct fallback (rare). */
+            /* ?[]uN → carrier's named optional-slice typedef (same layout) */
+            case TYPE_UINT:
+                emit(e, "_zer_opt_slice_%s", intn_carrier_suffix(elem->intn.bits, false));
+                break;
+            case TYPE_SINT:
+                emit(e, "_zer_opt_slice_%s", intn_carrier_suffix(elem->intn.bits, true));
+                break;
             case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
             case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
             case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
             case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
             case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
             case TYPE_DISTINCT:
-            case TYPE_UINT: case TYPE_SINT: /* Path C: ?[]uN → anonymous optional slice */
                 emit(e, "struct { ");
                 emit_type(e, opt_inner);
                 emit(e, " value; uint8_t has_value; }");
@@ -1035,11 +1056,20 @@ static void emit_type(Emitter *e, Type *t) {
         /* Stage 2 Part B (2026-04-28): exhaustive — fallback to
          * anonymous struct for any TYPE_KIND not handled above
          * (rare: ?FuncPtr, ?array, etc.). */
+        /* ?uN → the carrier's named optional typedef (same C layout), so all
+         * `?u5` instances are ONE compatible type (was inline anon → GCC
+         * incompatible-types error). Split UINT/SINT so signedness comes from the
+         * case label rather than a raw type-kind comparison. */
+        case TYPE_UINT:
+            emit(e, "_zer_opt_%s", intn_carrier_suffix(opt_inner->intn.bits, false));
+            break;
+        case TYPE_SINT:
+            emit(e, "_zer_opt_%s", intn_carrier_suffix(opt_inner->intn.bits, true));
+            break;
         case TYPE_OPTIONAL: case TYPE_ARRAY:
         case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
-        case TYPE_UINT: case TYPE_SINT: /* Path C: ?uN → anonymous optional */
             emit(e, "struct { ");
             emit_type(e, opt_inner);
             emit(e, " value; uint8_t has_value; }");
@@ -1074,13 +1104,19 @@ static void emit_type(Emitter *e, Type *t) {
             break;
         /* Stage 2 Part B (2026-04-28): exhaustive — anonymous struct
          * fallback for any other elem type. */
+        /* [*]uN → carrier's named slice typedef (same C layout) */
+        case TYPE_UINT:
+            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, false));
+            break;
+        case TYPE_SINT:
+            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, true));
+            break;
         case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
         case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
         case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
         case TYPE_DISTINCT:
-        case TYPE_UINT: case TYPE_SINT: /* Path C: [*]uN → anonymous slice */
             emit(e, "struct { ");
             if (t->slice.is_volatile) emit(e, "volatile ");
             emit_type(e, sl_inner);
@@ -5208,6 +5244,10 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { size_t value; uint8_t has_value; } _zer_opt_usize;\n");
     emit(e, "typedef struct { float value; uint8_t has_value; } _zer_opt_f32;\n");
     emit(e, "typedef struct { double value; uint8_t has_value; } _zer_opt_f64;\n");
+    /* uN/iN carriers wider than 64 bits (N in 65..128) — the smallest-carrier
+     * reuse for ?uN / [*]uN compound types (see intn_carrier_suffix). */
+    emit(e, "typedef struct { unsigned __int128 value; uint8_t has_value; } _zer_opt_u128;\n");
+    emit(e, "typedef struct { __int128 value; uint8_t has_value; } _zer_opt_i128;\n");
     emit(e, "typedef struct { uint8_t has_value; } _zer_opt_void;\n");
     emit(e, "\n");
 
@@ -5230,6 +5270,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { size_t* ptr; size_t len; } _zer_slice_usize;\n");
     emit(e, "typedef struct { float* ptr; size_t len; } _zer_slice_f32;\n");
     emit(e, "typedef struct { double* ptr; size_t len; } _zer_slice_f64;\n");
+    emit(e, "typedef struct { unsigned __int128* ptr; size_t len; } _zer_slice_u128;\n");
+    emit(e, "typedef struct { __int128* ptr; size_t len; } _zer_slice_i128;\n");
     emit(e, "\n");
     /* ZER volatile slice types — volatile []T for all primitives */
     emit(e, "typedef struct { volatile uint8_t* ptr; size_t len; } _zer_vslice_u8;\n");
@@ -5243,6 +5285,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { volatile size_t* ptr; size_t len; } _zer_vslice_usize;\n");
     emit(e, "typedef struct { volatile float* ptr; size_t len; } _zer_vslice_f32;\n");
     emit(e, "typedef struct { volatile double* ptr; size_t len; } _zer_vslice_f64;\n");
+    emit(e, "typedef struct { volatile unsigned __int128* ptr; size_t len; } _zer_vslice_u128;\n");
+    emit(e, "typedef struct { volatile __int128* ptr; size_t len; } _zer_vslice_i128;\n");
     emit(e, "\n");
     /* ZER optional-slice types — ?[]T for all primitives */
     emit(e, "typedef struct { _zer_slice_u8 value; uint8_t has_value; } _zer_opt_slice_u8;\n");
@@ -5256,6 +5300,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { _zer_slice_usize value; uint8_t has_value; } _zer_opt_slice_usize;\n");
     emit(e, "typedef struct { _zer_slice_f32 value; uint8_t has_value; } _zer_opt_slice_f32;\n");
     emit(e, "typedef struct { _zer_slice_f64 value; uint8_t has_value; } _zer_opt_slice_f64;\n");
+    emit(e, "typedef struct { _zer_slice_u128 value; uint8_t has_value; } _zer_opt_slice_u128;\n");
+    emit(e, "typedef struct { _zer_slice_i128 value; uint8_t has_value; } _zer_opt_slice_i128;\n");
     emit(e, "\n");
 
     /* ZER runtime: Pool helper macros */

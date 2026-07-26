@@ -51,7 +51,22 @@ question answered independently at N sites, a new form/site silently missed) —
 new sink/value-shape cells, the VRP one is a per-node-kind JOIN gap, the shared-struct one is the
 4-value-flow-site coverage rule.
 
-Follow-up (same session) — 2 loud-failure bugs + 1 DoS:
+Follow-up (same session) — uN compound types + bare-metal + 2 loud-failure bugs + 1 DoS:
+
+8. **`?uN` / `[*]uN` over a non-native width emitted duplicate inline anonymous structs → GCC
+   "incompatible types" (feature broken) (emitter.c).** Native widths get named typedefs
+   (`_zer_opt_u8`, `_zer_slice_u8`); non-native uN/iN (u5, u21, i48, …) fell to an INLINE anon
+   struct per use site, so any two instances were distinct incompatible C types (`?u5 o = av`
+   failed at gcc). Fix: a `?uN`/`[*]uN` has the EXACT C layout of its carrier (`?u5` = `?u8`), so
+   route to the carrier's already-emitted named typedef via `intn_carrier_suffix` (+ new
+   `__int128` carrier typedefs for N in 65..128). Zero semantic change; the feature was
+   non-compiling, so no regression risk. Test `tests/zer/intn_compound_types.zer`.
+9. **`@cache_flush/clean/invalidate_range` were a silent no-op on non-x86/ARM64 (emitter.c).**
+   `#if x86 / #elif aarch64 / #endif` with no `#else` → empty loop on RISC-V/ARM32 (stale DMA
+   data for invalidate). Added an `#elif !x86_64` fence fallback (matching the sibling single-line
+   ops); actual cache maintenance there is a hardware-consequence floor.
+
+Loud-failure bugs + DoS:
 6. **defer BLOCK with a local declaration + multiple return paths → uncompilable C
    (`redefinition`) (emitter.c).** A defer body is emitted at every exit path; the IR_DEFER_FIRE
    handler (and `emit_defers_from`) flattened a NODE_BLOCK defer body WITHOUT braces, so

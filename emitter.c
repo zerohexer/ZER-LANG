@@ -7682,6 +7682,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    }\n"
                 "#if defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#elif !defined(__x86_64__)\n"
+                "    /* No standard cache-range op on this arch (e.g. RISC-V base\n"
+                "       ISA needs the Zicbom extension); emit a full fence so\n"
+                "       ordering is preserved and this is NOT a SILENT no-op. Cache\n"
+                "       maintenance itself is a hardware-consequence floor. */\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
                 "#endif\n"
                 "})");
         } else if ((nlen == 17 && memcmp(name, "cache_clean_range", 17) == 0) &&
@@ -7701,6 +7707,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    }\n"
                 "#if defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#elif !defined(__x86_64__)\n"
+                "    /* No standard cache-range op on this arch (e.g. RISC-V base\n"
+                "       ISA needs the Zicbom extension); emit a full fence so\n"
+                "       ordering is preserved and this is NOT a SILENT no-op. Cache\n"
+                "       maintenance itself is a hardware-consequence floor. */\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
                 "#endif\n"
                 "})");
         } else if ((nlen == 22 && memcmp(name, "cache_invalidate_range", 22) == 0) &&
@@ -7720,6 +7732,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    }\n"
                 "#if defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#elif !defined(__x86_64__)\n"
+                "    /* No standard cache-range op on this arch (e.g. RISC-V base\n"
+                "       ISA needs the Zicbom extension); emit a full fence so\n"
+                "       ordering is preserved and this is NOT a SILENT no-op. Cache\n"
+                "       maintenance itself is a hardware-consequence floor. */\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
                 "#endif\n"
                 "})");
         } else if ((nlen == 23 && memcmp(name, "cache_invalidate_icache", 23) == 0) &&

@@ -320,6 +320,65 @@ that regresses any cell fails `make check`.
 
 ---
 
+## OPEN — cross-function free of a FIELD of a by-value struct/union param → double-free/UAF (🔴 HIGH, accept-unsafe; 2026-07-26)
+
+**Verified accept-unsafe soundness hole.** Pure ZER (no cinclude/`*opaque`/asm). Compiles clean;
+runtime glibc double-free abort / observable UAF.
+
+**Reproducers.**
+```zer
+// double-free (glibc abort, exit 134)
+struct B { u32 x; }
+struct H { [*]B buckets; }
+void fb(H h) { free(h.buckets); }        // frees a FIELD of a by-value struct param
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 0; };
+    fb(h);
+    free(h.buckets);                      // analyzer thinks this is the FIRST free
+    return 0;
+}
+```
+```zer
+// observable UAF (pointer field via Slab)
+struct T { u32 id; }  struct Box { *T p; }
+Slab(T) pool;  u32 result;
+void consume(Box b) { pool.free_ptr(b.p); }
+void run() {
+    Box a; *T got = pool.alloc_ptr() orelse return; got.id = 42; a.p = got;
+    consume(a);                                    // frees slot at runtime; analyzer: no-op
+    *T other = pool.alloc_ptr() orelse return; other.id = 999;
+    result = a.p.id;                               // UAF read → 999 (reused slot)
+    pool.free_ptr(got); pool.free_ptr(other);
+}
+u32 main() { run(); return result; }
+```
+
+**Root cause.** The FuncSummary free-of-param scan (`zercheck_ir.c` ~5352) gates on the param's
+resolved type being POINTER/HANDLE/OPAQUE/SLICE, so a by-value **STRUCT/UNION** param is dropped
+entirely; and even for the accepted kinds it inspects only the **bare** param handle
+(`ir_find_handle`, path_len==0), never a compound FIELD handle. There is no `frees_param_field`
+signal, so a callee freeing `h.buckets`/`b.p` records nothing, and the call-site application never
+widens the caller's `arg.field` to FREED. Distinct from BUG-737 (by-value field STORE-to-global
+escape), P9 (by-value field launder), §A #6 (`Holder b = a` intra-function compound copy), and §A #2
+(slice/pointer PARAM free). The existing negative test `tests/zer_fail/alloc_byval_field_slice_uaf.zer`
+passes for the WRONG reason (it is rejected as a leak, not because the field-free is tracked) — the
+moment a caller-side free satisfies the leak check (as in both reproducers), the double-free/UAF
+passes silently. So limitations' §A #2 claim that `fb(H h){free(h.buckets)}` "was recorded" is
+inaccurate.
+
+**Fix sketch (attempted 2026-07-26, reverted — not a safe single-session change).** Add a coarse
+`bool *frees_param_field` to FuncSummary (definite/all-path field free of an aggregate param);
+detect it in the scan by looking for a FREED compound handle rooted at the param local in every
+return block; consume it at the call site by marking every tracked compound handle rooted at the
+arg FREED (argument-precise barrier at field granularity). The attempt did NOT catch the
+double-free AND produced a false-positive leak — the callee's `free(h.buckets)` apparently does not
+leave a FREED compound handle keyed `(param_local, "buckets")` in the return-block path state the
+scan reads (by-value param field freeing keys handles differently than assumed), and the caller-side
+compound-handle lookup by arg-root did not match. A correct fix must first establish exactly how a
+by-value struct param's field handle is keyed in the callee (probe with `--emit-ir` / a debug dump
+of the return-block handle set) before wiring the scan+application. No sink-matrix cell exists for a
+by-value-field-**free** shape (only store/launder) — add one with the fix.
 ## OPEN — BUGS: fixes available on four `claude/*` branches (fxvnsu / yd5ajq / 0h7oz9 / c4c09l), verified NOT in main (2026-07-19)
 
 **What this is.** A SECOND set of `claude/*` audit branches, created AFTER the 41-fix tracker

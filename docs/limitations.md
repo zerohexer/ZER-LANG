@@ -5,6 +5,41 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — audit 2026-07-27 residuals (LOW; none an active soundness hole)
+
+Surfaced during the 2026-07-27 audit that fixed G5 + the VRP-join ×4 + keep-`&local.field`
+holes (BUGS-FIXED.md 2026-07-27). Not fixed this pass:
+
+- **G5 read-back sibling** (LOW, over-approx not a hole): a same-function `x = g.p orelse
+  return; use(x)` after `free` of a heap ptr stored in a struct-global FIELD is NOT flagged —
+  the optional field read lowers `g.p` to a temp before the orelse, so the read-back primary
+  isn't the field projection (the bare-ident `x = g orelse return` read-back IS caught). The
+  fixed exit-dangle catch covers the common escape; a full fix needs to trace the temp back to
+  its `g.p` load in ir_lower. See the §G5 FIXED note for detail.
+- **VRP `@once`-body leak fix is untested at runtime** (fix is sound + emitted-C-verified): the
+  leak (a range narrowed in an `@once` body, skipped by loser threads) is only observable
+  multi-threaded with per-thread locals, so no single-threaded trap test exists (the other 3
+  VRP-join fixes have `tests/zer_trap/` trap tests). The guard-presence was verified in emitted C.
+- **G1 goto-skips-defer** (🟡 miscompile) reproduced + still open — confirmed the `if(err){goto
+  done}` / `acquire()` / `defer release()` / `done:` shape fires `release()` on the error path
+  where `acquire()` never ran (counter underflow). Proper fix = per-defer runtime "armed" flags;
+  sound interim = reject a forward goto that skips a defer registration. Left unfixed: the
+  defer+goto lowering is the most bug-prone area (plt86m / bh18_12 history) and the interim risks
+  over-rejecting a legit "conditionally skip setup+its cleanup" idiom. Still tracked as §G1 below.
+
+### Tech debt (not compiler bugs)
+- **Tracked compiled test binaries churn on every `make check`** — ~100 `rust_tests/{conc_,gen_,…}`
+  + some `zig_tests/`, `test_modules/` executables are committed to git but NOT in `.gitignore`
+  (only a handful like `rt_task_alloc_free` are ignored), so `make check` rebuilds them and
+  `git status` shows binary diffs. They must be `git checkout --`-reverted before staging. Durable
+  fix: `git rm --cached` them + add the dirs' binary globs to `.gitignore`.
+- **Pre-existing benign compiler warnings** (not from the 2026-07-27 fixes): `checker.c` #include
+  lines carry trailing `/* … */` → `-Wcomment`/"extra tokens at end of #include"; a debug-gated
+  `fprintf(... "%.*s" ..., name_len, ...)` in `zc_ir_build_summary` passes a `uint32_t` to a `.*`
+  precision that expects `int` (`-Wformat`, `IR_SUMMARY_DEBUG` path only); several unused static
+  functions (`has_atomic_or_barrier`, `ir_classify_method_call`, emitter dead helpers). None affect
+  codegen; worth a cleanup pass under `-Werror` hardening.
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),

@@ -1,0 +1,17 @@
+// VRP leak (2026-07-27): a range narrowed inside an `if (opt) |v| { }` capture
+// body leaked past the merge (the capture path early-breaks BEFORE the NODE_IF
+// VRP-JOIN block), proving arr[idx] safe on the None path where idx is wild%256.
+// Fix: the capture path now snapshots/restores/joins VRP like the if handler.
+// Expected: SIGTRAP "array index out of bounds" at runtime.
+?u32 none_opt(bool b) { if (b) { return 5; } return null; }
+u32 f(u32 wildv) {
+    [*]u32 arr = alloc(u32, 4) orelse { return 0; };
+    u32 idx = wildv % 256;              // entry [0,255]; runtime idx = 100
+    ?u32 m = none_opt(false);           // None
+    if (m) |v| { idx = v % 4; }         // narrow [0,3] in capture; None -> not run
+    arr[idx] = 7;                       // idx=100 -> elided check would OOB -> TRAP
+    u32 r = arr[idx];
+    free(arr);
+    return r;
+}
+u32 main() { return f(100); }

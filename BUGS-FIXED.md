@@ -5,6 +5,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-27 — Audit: 3 soundness holes (global-field dangle, VRP-join leaks ×4 node kinds, keep-call-site &local.field) (zercheck_ir.c, checker.c)
+
+Three independent memory-safety holes found + fixed during a codebase audit. Each was the
+MULTI-SITE / per-node-kind patchwork class (CLAUDE.md "#1 recurring bug class"): the same safety
+question answered per site/kind, a new form silently missed.
+
+**1. G5 — heap pointer into a struct-GLOBAL FIELD dangles unflagged (🔴 UAF, zercheck_ir.c).**
+`g.p = n; free(n); return;` (g a struct global) left `g.p` pointing at freed memory. The
+exit-dangle check (BUG-739/742) matched only a BARE global-ident store (`g = n`); the `.field`
+projection sink was missed. Fix: new `ir_build_global_field_key` helper builds the full dotted
+projection key ("g.p", "g[0].slots") when the store target's root is an unshadowed global, and the
+IR_ASSIGN store sink registers a `(IR_GLOBAL_ROOT_ID, key)` compound pseudo-root sharing the RHS
+alloc_id (escaped=true) — the free propagates FREED to it and the exit check fires. DEFINITELY-freed
+only (never MAYBE → the register-ctx-then-callback pattern stays un-noised); a `g.p = null;` reset
+clears it. Tests `tests/zer_fail/g5_global_{field,arrfield}_dangle.zer`,
+`tests/zer/g5_global_field_reset_ok.zer`. (Was documented-unfixed as limitations.md §G5.)
+
+**2. VRP range-JOIN leak at 4 un-enumerated node kinds → elided bounds guard (🔴 silent OOB, checker.c).**
+A range narrowed inside a conditionally-executed body leaked past the merge, proving a later
+`arr[idx]` in-bounds on a path the narrowing never ran → the bounds guard was elided (ASan-class
+stack/heap OOB, same mechanism as the §A switch/for/goto/do-while fixes). The VRP snapshot/restore/join
+was wired per-node-kind and these four were not enumerated:
+- **`if (opt) \|v\| { }` capture** — the capture path early-`break`s BEFORE the NODE_IF VRP-JOIN block;
+  now snapshots/restores/joins like the non-comparison if branch.
+- **`orelse { block }`** — the fallback runs only on the None path; now snapshots+restores (discard, =
+  the sound join, since pre-state covers the Some path).
+- **`defer { }`** — the body runs at SCOPE EXIT (after all following code); now snapshots+restores
+  (discard — a defer-derived narrowing can never hold for preceding code).
+- **`@once { }`** — winner-thread only; now snapshots+restores (discard — losers skip the body).
+`@critical` correctly still elides (runs unconditionally). Trap tests
+`tests/zer_trap/vrp_{ifcapture,orelse_block,defer_body}_range_leak.zer` (TRAP=133); the @once leak is
+multi-threaded-only (fix verified via emitted-C guard presence, not a single-threaded trap).
+
+**3. keep-call-site `keepfn(&local.field)` / `keepfn(&arr[0])` direct escape (🔴 dangling ptr, checker.c).**
+A pointer to a LOCAL struct field / array element handed DIRECTLY to a `keep` parameter (the callee
+stores it into a global) escaped silently. The keep-call-site `&local` detector matched only a bare
+`&ident` operand, and the ld_nodes local-derived walk never unwraps a leading `&`; the
+intermediate-variable form (`*u32 p = &loc.f; keepfn(p)`) WAS caught. Fix: the detector now walks the
+`&` operand's field/index chain to the root ident (mirrors `arg_is_local_derived`), reusing the
+existing static/global/mangled logic. `keepfn(&global.field)` stays accepted (no over-rejection).
+Tests `tests/zer_fail/keep_direct_local_{field,arrelem}.zer`, `tests/zer/keep_direct_global_field_ok.zer`,
++ sink-matrix cells p2__k5_keep_direct / p3__k5_keep_direct / safe_keep_glob_{field,arr}_direct.
+
+Full `make check` GREEN; sink matrix 48 ok / 0 mismatch / 0 over-reject; all audits + matrices clean.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

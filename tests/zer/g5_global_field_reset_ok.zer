@@ -1,0 +1,15 @@
+// G5 positive: resetting the global field after free (`g.p = null;`), or
+// storing without freeing, must NOT false-positive (the register-ctx
+// pattern). Mirrors the BUG-739 bare-ident reset behavior.
+struct Item { u32 value; }
+struct Holder { ?*Item p; }
+Slab(Item) heap;
+Holder g;
+i32 main() {
+    *Item n = heap.alloc_ptr() orelse return;
+    n.value = 99;
+    g.p = n;
+    heap.free_ptr(n);
+    g.p = null;            // reset — no dangle
+    return 0;
+}

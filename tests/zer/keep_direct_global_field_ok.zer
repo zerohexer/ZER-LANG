@@ -1,0 +1,13 @@
+// Positive control for the keep_direct_local_field fix: a pointer to a GLOBAL
+// struct field (or global array element) DOES outlive the call, so passing it
+// directly to a keep parameter must remain ACCEPTED (no over-rejection).
+struct L { u32 f; u32 g; }
+?*u32 g_p;
+L g_holder;
+u32[4] g_arr;
+void keepfn(keep *u32 p) { g_p = p; }
+void c() {
+    keepfn(&g_holder.f);
+    keepfn(&g_arr[0]);
+}
+u32 main() { c(); return 0; }

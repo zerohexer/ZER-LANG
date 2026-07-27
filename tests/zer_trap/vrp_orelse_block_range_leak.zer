@@ -1,0 +1,16 @@
+// VRP leak (2026-07-27): a range narrowed inside an `orelse { block }` fallback
+// (runs only on the None path) leaked to code after the orelse on the Some path.
+// Fix: the orelse-block check now snapshots/restores VRP (discard the block's
+// narrowing). Expected: SIGTRAP at runtime.
+?u32 some_opt(bool b) { if (b) { return 7; } return null; }
+u32 f(u32 wildv) {
+    [*]u32 arr = alloc(u32, 4) orelse { return 0; };
+    u32 idx = wildv % 256;              // entry [0,255]; runtime idx = 100
+    ?u32 m = some_opt(true);            // Some -> block NOT run
+    u32 x = m orelse { idx = wildv % 4; return 0; };  // diverging block narrows idx
+    arr[idx] = 7;                       // Some path: idx=100 -> TRAP
+    u32 r = arr[idx] + x;
+    free(arr);
+    return r;
+}
+u32 main() { return f(100); }

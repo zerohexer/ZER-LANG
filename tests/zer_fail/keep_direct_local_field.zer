@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// Escape/keep gap (2026-07-27): the DIRECT `keepfn(&loc.f)` form — a pointer to
+// a LOCAL struct field handed straight to a `keep` parameter — escaped silently.
+// The keep-call-site &local detector matched only a bare `&ident` operand; the
+// intermediate-variable form (`*u32 p = &loc.f; keepfn(p)`) was caught, but the
+// direct projection slipped through. The callee stores it into a global, so it
+// dangles after the caller frame returns. Fix: the detector now walks the
+// operand's field/index chain to the root ident.
+?*u32 g_p;
+struct L { u32 f; u32 g; }
+void keepfn(keep *u32 p) { g_p = p; }
+void c() { L loc; loc.f = 1; keepfn(&loc.f); }
+u32 main() { c(); return 0; }

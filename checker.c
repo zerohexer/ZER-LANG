@@ -6336,12 +6336,31 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* walk into intrinsics */
                         while (karg && karg->kind == NODE_INTRINSIC && karg->intrinsic.arg_count > 0)
                             karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                        /* Escape/keep gap (2026-07-27): the DIRECT
+                         * `keepfn(&loc.f)` / `keepfn(&arr[0])` form escaped —
+                         * this detector matched only a BARE `&ident` operand, and
+                         * the ld_nodes local-derived walk below never unwraps a
+                         * leading `&`, so `&local.projection` handed directly to a
+                         * keep param slipped through (the intermediate-variable
+                         * form `*u32 p=&loc.f; keepfn(p)` WAS caught via
+                         * is_local_derived). Walk the operand's field/index chain
+                         * to the root ident (mirrors arg_is_local_derived's
+                         * &local.field handling) so a pointer to any part of a
+                         * local satisfies neither keep. */
                         if (karg && karg->kind == NODE_UNARY &&
-                            karg->unary.op == TOK_AMP &&
-                            karg->unary.operand->kind == NODE_IDENT) {
+                            karg->unary.op == TOK_AMP) {
+                            Node *aroot = karg->unary.operand;
+                            while (aroot && (aroot->kind == NODE_FIELD ||
+                                             aroot->kind == NODE_INDEX)) {
+                                if (aroot->kind == NODE_FIELD)
+                                    aroot = aroot->field.object;
+                                else
+                                    aroot = aroot->index_expr.object;
+                            }
+                            if (aroot && aroot->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
-                                karg->unary.operand->ident.name,
-                                (uint32_t)karg->unary.operand->ident.name_len);
+                                aroot->ident.name,
+                                (uint32_t)aroot->ident.name_len);
                             if (arg_sym && !arg_sym->is_static) {
                                 /* BUG-317: check both raw AND mangled keys for imported globals */
                                 bool is_global = scope_lookup_local(c->global_scope,
@@ -6364,6 +6383,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     edge_argname_len = arg_sym->name_len;
                                 }
                             }
+                            } /* end if (aroot && NODE_IDENT) */
                         }
                         } /* end keep_checks loop (BUG-339) */
                         /* BUG-221/370/387: also reject local-derived pointers.
@@ -7461,7 +7481,19 @@ static Type *check_expr(Checker *c, Node *node) {
                  * bare-statement `f() orelse { ... }` (value discarded) stays legal.
                  * A block that DIVERGES on every path (return/break/continue/goto)
                  * never reaches the consumer, so it keeps the unwrapped type. */
+                /* VRP leak (2026-07-27): the fallback block executes ONLY on the
+                 * None path; code AFTER the orelse runs on the Some path (block
+                 * skipped) too. Any range narrowing inside the block must NOT be
+                 * assumed afterward. Snapshot pre-block VALUES and restore them
+                 * (discard the block's in-place narrowing) — the sound join, since
+                 * the pre-state covers the Some path. Same class as the NODE_IF /
+                 * NODE_SWITCH VRP-JOIN fixes; orelse-block was un-enumerated. */
+                int orelse_saved = c->var_range_count;
+                struct VarRange *orelse_pre = vrp_snap_take(c, orelse_saved);
                 check_stmt(c, node->orelse.fallback);
+                c->var_range_count = orelse_saved;
+                vrp_snap_restore(c, orelse_pre, orelse_saved);
+                free(orelse_pre);
                 result = orelse_block_diverges(node->orelse.fallback)
                              ? unwrapped : ty_void;
             } else {
@@ -11299,11 +11331,30 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
+                /* VRP leak (2026-07-27): the `if (opt) |v| { }` capture path
+                 * early-breaks here, BEFORE the comparison/non-comparison
+                 * VRP-JOIN block below. A range narrowing inside the capture body
+                 * (`if (m) |v| { idx = v % 4; }`) runs only on the Some path but
+                 * leaked past the merge, eliding a later `arr[idx]` bounds guard
+                 * on the None path (ASan-class stack OOB). Mirror the NODE_IF
+                 * non-comparison branch: snapshot pre VALUES, capture then-result,
+                 * restore for else, JOIN both so the merged range over-
+                 * approximates every path. Same VRP-JOIN class; capture-unwrap
+                 * was un-enumerated. */
+                int cap_saved = c->var_range_count;
+                struct VarRange *cap_pre = vrp_snap_take(c, cap_saved);
                 check_stmt(c, node->if_stmt.then_body);
                 pop_scope(c);
-
-                if (node->if_stmt.else_body)
+                c->var_range_count = cap_saved;
+                struct VarRange *cap_thenv = vrp_snap_take(c, cap_saved);
+                vrp_snap_restore(c, cap_pre, cap_saved);
+                if (node->if_stmt.else_body) {
                     check_stmt(c, node->if_stmt.else_body);
+                    c->var_range_count = cap_saved;
+                }
+                vrp_snap_join(c, cap_thenv, cap_saved);
+                free(cap_pre);
+                free(cap_thenv);
                 break;
             }
         }
@@ -12766,7 +12817,20 @@ static void check_stmt(Checker *c, Node *node) {
             false, NULL,
             false, NULL);
         c->defer_depth++;
-        check_stmt(c, node->defer.body);
+        /* VRP leak (2026-07-27): a defer body executes at SCOPE EXIT, i.e. AFTER
+         * every statement following the `defer`. A range narrowing derived from
+         * the defer body (`defer { idx = wild() % 4; }`) must therefore NEVER
+         * apply to code after the defer statement — snapshot pre-body VALUES and
+         * restore them (discard the body's in-place narrowing). Same VRP-JOIN
+         * class as NODE_IF / NODE_SWITCH; the defer body was un-enumerated. */
+        {
+            int defer_saved = c->var_range_count;
+            struct VarRange *defer_pre = vrp_snap_take(c, defer_saved);
+            check_stmt(c, node->defer.body);
+            c->var_range_count = defer_saved;
+            vrp_snap_restore(c, defer_pre, defer_saved);
+            free(defer_pre);
+        }
         c->defer_depth--;
         break;
 
@@ -13730,7 +13794,16 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->once.body) {
             bool saved_in_once = c->in_once;
             c->in_once = true;
+            /* VRP leak (2026-07-27): the @once body runs on the WINNER thread
+             * only; loser threads skip it. A range narrowing inside it must not
+             * be assumed after the @once — snapshot pre-body VALUES and restore
+             * (discard the body's in-place narrowing). Same VRP-JOIN class. */
+            int once_saved = c->var_range_count;
+            struct VarRange *once_pre = vrp_snap_take(c, once_saved);
             check_stmt(c, node->once.body);
+            c->var_range_count = once_saved;
+            vrp_snap_restore(c, once_pre, once_saved);
+            free(once_pre);
             c->in_once = saved_in_once;
         }
         break;

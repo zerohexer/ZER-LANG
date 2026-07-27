@@ -656,8 +656,18 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF) — ✅ **FIXED 2026-07-27**.
+  The store sink (zercheck_ir.c IR_ASSIGN) now registers a `(IR_GLOBAL_ROOT_ID, "g.p")` compound pseudo-root
+  for `g.p = n` / `g[0].slots = n` via the new `ir_build_global_field_key` helper (builds the full dotted
+  projection key when the root is an unshadowed global), sharing the RHS alloc_id, escaped=true. The free
+  propagates FREED to it and the exit-dangle check fires — DEFINITELY-freed only (never MAYBE), exactly the
+  CAUTION below (the legit register-ctx pattern stays un-noised; a null-reset `g.p = null;` clears the entry).
+  Tests: `tests/zer_fail/g5_global_field_dangle.zer`, `tests/zer_fail/g5_global_arrfield_dangle.zer`,
+  `tests/zer/g5_global_field_reset_ok.zer`. RESIDUAL (rarer sibling, still open): a same-function
+  read-back `x = g.p orelse return; use(x)` after free is NOT caught — the optional field read lowers `g.p`
+  to a temp before the orelse, so the read-back primary isn't the field projection (the bare-ident read-back
+  `x = g orelse return` IS caught). Low priority; the exit-dangle catch covers the common escape.
+  ORIGINAL REPORT: `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
   the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
   ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
   the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:

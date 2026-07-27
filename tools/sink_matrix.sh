@@ -59,6 +59,7 @@ cell p2__k7_reassign    reject 'void c() { u32[4] arr; *u32 p = &arr[0]; p = &ar
 cell p2__k2v_2step      reject 'void c() { u32[4] arr; *u32 p = &arr[0]; ?*u32 t = p; g_p = t; } u32 main(){return 0;}'
 cell p2__k3_field_store reject 'void c() { u32[4] arr; *u32 p = &arr[0]; g_h.p = p; } u32 main(){return 0;}'
 cell p2__k5_keep        reject 'void c() { u32[4] arr; *u32 p = &arr[0]; keepfn(p); } u32 main(){return 0;}'
+cell p2__k5_keep_direct reject 'void c() { u32[4] arr; keepfn(&arr[0]); } u32 main(){return 0;}'
 
 echo "===== SHAPE p3 = &local.field  (address of a LOCAL struct field) ====="
 cell p3__k1_return      reject '*u32 c() { L loc; return &loc.f; } u32 main(){return 0;}'
@@ -67,6 +68,7 @@ cell p3__k7_reassign    reject 'void c() { L loc; *u32 p = &loc.f; p = &loc.g; g
 cell p3__k2v_2step      reject 'void c() { L loc; *u32 p = &loc.f; ?*u32 t = p; g_p = t; } u32 main(){return 0;}'
 cell p3__k3_field_store reject 'void c() { L loc; *u32 p = &loc.f; g_h.p = p; } u32 main(){return 0;}'
 cell p3__k5_keep        reject 'void c() { L loc; *u32 p = &loc.f; keepfn(p); } u32 main(){return 0;}'
+cell p3__k5_keep_direct reject 'void c() { L loc; keepfn(&loc.f); } u32 main(){return 0;}'
 
 echo "===== SHAPE p5 = slice-of-local  ([*]T view over a LOCAL array) ====="
 cell p5__k1_return      reject '[*]u32 c() { u32[4] arr; return arr[0..2]; } u32 main(){return 0;}'
@@ -130,6 +132,8 @@ cell safe_arena_local   compile 'struct AB { u32 v; } u32 rv(*AB b){return b.v;}
 cell safe_spawn_value   compile 'struct SV { u32 a; } void wk(SV m) { } void c() { SV m; m.a = 1; spawn wk(m); } u32 main(){return 0;}'
 cell safe_scalar_copy   compile 'void c() { L loc; loc.f = 5; u32 v = loc.f; g_p = null; if (v == 5) { return; } } u32 main(){return 0;}'
 cell safe_alive_subslice compile 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; s[0]=1; u8 v=s[0]; free(b); if (v != 1) { return 1; } return 0; }'
+cell safe_keep_glob_field_direct compile 'L g_lh; void keepg(keep *u32 p){ g_p = p; } void c() { keepg(&g_lh.f); } u32 main(){return 0;}'
+cell safe_keep_glob_arr_direct   compile 'u32[4] g_arrk; void keepg(keep *u32 p){ g_p = p; } void c() { keepg(&g_arrk[0]); } u32 main(){return 0;}'
 
 echo ""
 echo "===== HEAP-VIEW UAF / double-free (subslice shape) ====="

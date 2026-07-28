@@ -5,6 +5,44 @@ Entries removed once fixed.
 
 ---
 
+## ✅ DONE (2026-07-28) — audit sweep: 4 confirmed holes closed (see BUGS-FIXED.md 2026-07-28)
+
+A parallel adversarial audit against a fully-green tree found and fixed four distinct
+bugs. Full detail + root causes + tests in BUGS-FIXED.md "2026-07-28". Summary:
+- **defer double-free line-gate** (🔴 under-rejection, zercheck_ir.c) — the double-free
+  discriminator used SOURCE-LINE equality (`free_line != defer_line`); an explicit free /
+  second defer on the same physical line as the `defer` keyword evaded it. Replaced with a
+  per-defer-body instance id (`IRHandleInfo.freed_defer_id`).
+- **VRP `@once`/`defer` body leak** (🔴 SILENT fixed-array OOB, checker.c) — the f92c0e5
+  JOIN fix wired NODE_IF/FOR/WHILE/SWITCH/LABEL but missed `@once` and `defer`, whose
+  bodies were checked inline with no VRP snapshot; an in-body range narrowing leaked out
+  and elided a bounds guard. Fixed: `defer` restores (body runs at exit), `@once` joins
+  (body runs at most once); `@critical` correctly unaffected (always runs).
+- **spawn funcptr-arg race** (🔴/🟠, checker.c) — `spawn worker(bump)` where `worker`
+  invokes its funcptr param: the concrete `bump` bound at the spawn SITE was never scanned
+  (distinct from the BH-18 #8 / SPAWN-FP local-funcptr facet). Fixed by scanning each
+  function-name spawn arg's body at the spawn site.
+- **intrinsic global-init emit** (loud accept-then-GCC-fail, checker.c) —
+  `@saturate`/`@addc`/`@subb`/`@mulw` in a global initializer emit non-file-scope-legal C;
+  now rejected cleanly by the global-init gate (they still work in function bodies).
+
+---
+
+## OPEN — value-returning `async` has no result-retrieval API (LOW, silent footgun)
+
+`async u32 compute() { … return 42; }` compiles clean and the state machine now correctly
+finalizes (BH-18 #10, FIXED 2026-06-26: sets `_zer_state = -1`, poll returns the done-flag
+`1`, idempotent). BUT the returned value is stored in an internal temp (`self->_zer_t0`)
+with **no caller-accessible accessor** — a user who writes `async <non-void>` can never
+read the result. Neither rejected nor retrievable = a silent footgun. Per the #10 fix
+sketch, the resolution is either a real value-retrieval mechanism (a stable `.result`
+field + a `_zer_async_NAME_result(&task)` accessor, distinct from the `int` poll done-flag)
+or REJECT `async <non-void>` until such an API exists. Verified 2026-07-28 the finalization
+is correct; only the retrieval API is missing. Not memory-unsafe (no wrong output for any
+valid usage, because there is no valid usage today).
+
+---
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),

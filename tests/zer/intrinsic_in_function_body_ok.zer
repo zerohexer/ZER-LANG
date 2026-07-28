@@ -1,0 +1,8 @@
+// @saturate / @addc work fine in a function body (only global init is rejected).
+u32 main() {
+    u8 s = @saturate(u8, 300);       // 255
+    AddCarry64 a = @addc(1, 2, 0);   // sum 3
+    if (s != 255) { return 1; }
+    if (a.sum != 3) { return 2; }
+    return 0;
+}

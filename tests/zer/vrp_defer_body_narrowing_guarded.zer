@@ -1,0 +1,12 @@
+// Regression (2026-07-28): a range narrowing inside a defer body (which runs at
+// scope EXIT) leaked into the intervening code, eliding the fixed-array bounds
+// guard (silent OOB). Fixed compiler: idx stays [9,9], auto-guard fires, main
+// returns 0. Unfixed: idx proven [2,2], guard elided, garr[9]=7 OOB, returns 9.
+u8[4] garr;
+u32 wild() { return 9; }
+u32 main() {
+    u32 idx = wild();
+    defer { idx = 2; }
+    garr[idx] = 7;
+    return idx;
+}

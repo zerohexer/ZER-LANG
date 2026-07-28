@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// Regression (2026-07-28): @addc/@subb/@mulw in a global initializer emitted a
+// runtime _zer_do_*() call ("initializer element is not constant"). Now
+// rejected cleanly by the checker.
+AddCarry64 ac = @addc(1, 2, 0);
+u32 main() { return (u32)ac.sum; }

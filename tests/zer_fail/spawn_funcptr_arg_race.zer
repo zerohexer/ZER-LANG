@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// Regression (2026-07-28): a concrete function handed to a spawn target as a
+// funcptr argument (spawn worker(bump)) may be invoked through the target's
+// funcptr param. bump does a non-atomic RMW on a non-shared global -> data race.
+// The target-body scan couldn't see it (fp is a param); the spawn-site arg->param
+// binding was never scanned. Now the function-name spawn arg's body is scanned.
+u32 gcounter;
+void bump() { gcounter = gcounter + 1; }
+void worker(*() -> void fp) { fp(); }
+u32 main() {
+    ThreadHandle t1 = spawn worker(bump);
+    ThreadHandle t2 = spawn worker(bump);
+    t1.join();
+    t2.join();
+    return gcounter;
+}

@@ -5,6 +5,84 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-28 — audit sweep: 4 confirmed holes closed (defer double-free line-gate, VRP @once/defer leak, spawn funcptr-arg race, intrinsic global-init emit)
+
+A parallel adversarial audit (4 hunting agents + direct probing) against a fully-green
+tree found four distinct, confirmed bugs — two 🔴 soundness holes (one silent), one 🔴/🟠
+data race, and one loud accept-then-fail-to-compile. All four fixed, each with a
+regression test; full `make check` GREEN (ZER 1024/0, Rust 784/0, Zig 36/0, modules
+139/0), sink matrix CLEAN, all audits OK.
+
+### BUG-A — defer double-free evaded when the explicit free shares a SOURCE LINE with the defer (🔴 under-rejection, zercheck_ir.c)
+
+`defer g.free_ptr(p); g.free_ptr(p);` (both on one line) COMPILED — a double free at
+scope exit. The identical program with the two frees on SEPARATE lines was correctly
+rejected. **Root cause:** the BUG-727 double-free check used SOURCE-LINE equality
+(`h->free_line != defer_line`) as the discriminator between a REAL double free and the
+legitimate two-branch `defer { if(e){free(h)} else {free(h)} }` pattern (both branch
+frees carry the defer's own line). When the explicit body free — or a second defer —
+happened to sit on the same physical line as the `defer` keyword, `free_line ==
+defer_line` and the diagnostic was suppressed. A soundness check gated on source
+FORMATTING, exactly the line-number dependence CLAUDE.md warns against. **Fix:** a
+per-defer-body instance id (`IRHandleInfo.freed_defer_id`, `k+1` per defer body at the
+scope-exit LIFO scan; 0 = explicit/not-a-defer). The scan stamps the id on the freed
+handle AND its alias group; the check skips only when `freed_defer_id == defer_id` (this
+defer's own sibling branch). The field is written only in the post-fixpoint scope-exit
+scan (default 0 from the memset otherwise) so it needs no CFG-merge/snapshot handling.
+Tests: `tests/zer_fail/defer_double_free_sameline.zer`,
+`tests/zer_fail/defer_double_free_two_defers_sameline.zer`,
+`tests/zer/defer_two_branch_free_ok.zer` (over-rejection guard).
+
+### BUG-B — VRP range narrowing leaks past `@once`/`defer` body joins → silent fixed-array OOB (🔴 silent, checker.c)
+
+The f92c0e5 JOIN fix wired `vrp_snap_take/restore/join` into NODE_IF/FOR/WHILE/SWITCH/
+LABEL, but the `@once` and `defer` handlers still called `check_stmt(body)` inline with
+no snapshot. An assignment inside the body (`@once { idx = 2; }` / `defer { idx = 2; }`)
+narrowed a `VarRange` in place; the narrowing leaked into the following/parallel flow and
+wrongly ELIDED a fixed-array bounds guard (`garr[idx]` with `idx` actually out of range on
+the skip / at-exit path). No compile warning, no runtime trap — ASan-verified global OOB
+write. **Fix:** snapshot pre-body ranges and, for `defer`, RESTORE (body runs at scope
+exit — its mutations never affect intervening code); for `@once`, JOIN the pre-body ranges
+back (body runs AT MOST once — the skip path keeps the pre-value). `@critical` is
+correctly unaffected (its body always runs, so the narrowing is sound). After the fix the
+auto-guard is emitted and ASan is clean. Tests:
+`tests/zer/vrp_once_body_narrowing_guarded.zer`,
+`tests/zer/vrp_defer_body_narrowing_guarded.zer` (runtime tripwires: the fixed compiler's
+auto-guard returns 0; an unfixed compiler writes OOB and returns non-zero).
+
+### BUG-C — spawn data-race scan blind to a concrete function handed to the target as a funcptr ARGUMENT (🔴 heap-corruption / 🟠 race, checker.c)
+
+`spawn worker(bump)` where `worker(*()->void fp){ fp(); }` and `bump()` does a non-atomic
+RMW on a non-shared global COMPILED (TSan-verified data race). Higher-severity variants:
+`bump` reaching a global `Pool`/`Slab`/`Ring` → concurrent free-list/head-tail metadata
+mutation (heap corruption). **Distinct from BH-18 #8** (which follows a function name
+passed as a call ARG *inside* the scanned body): here the concrete function is bound to
+the target's funcptr param at the SPAWN SITE, and that arg→param binding was never fed
+into the scan — the target-body scan sees `fp()` whose callee resolves to a PARAM, not a
+global function, so the direct-call descent skips it. **Fix:** at the spawn site, mirror
+the BH-18 #8 conservative descent — scan the body of each function-NAME spawn argument for
+non-shared global access (error, or warn if the arg function has `@atomic`/`@barrier`
+sync). Sound over-approximation (an uninvoked funcname arg is scanned too; remediation
+identical). Tests: `tests/zer_fail/spawn_funcptr_arg_race.zer`,
+`tests/zer/spawn_funcptr_arg_safe_ok.zer`.
+
+### BUG-D — `@saturate`/`@addc`/`@subb`/`@mulw` in a global initializer accepted, then GCC fails (loud accept-then-fail, checker.c)
+
+`u8 g = @saturate(u8, 300);` / `AddCarry64 g = @addc(1,2,0);` at file scope passed the
+checker's "global initializer must be a constant expression" gate (which correctly rejects
+`g = f()`), but the emitter lowered them to a `({...})` statement-expression (illegal at
+file scope) resp. a `_zer_do_*_u64(...)` runtime call ("initializer element is not
+constant") — cryptic GCC failures. These four value intrinsics emit non-constant C EVEN
+with constant args (unlike `@truncate`/`@bitcast`/the bit-query family, which fold). **Fix:**
+extend the existing global-init intrinsic gate (which already rejects bit-query intrinsics
+with a non-constant arg) to reject these four unconditionally in a global initializer, with
+a clear ZER error pointing to a literal or a function body. They continue to work in
+function bodies. Enumerated the full sibling set by testing every value-returning intrinsic
+in global-init context. Tests: `tests/zer_fail/global_init_saturate.zer`,
+`tests/zer_fail/global_init_addc.zer`, `tests/zer/intrinsic_in_function_body_ok.zer`.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

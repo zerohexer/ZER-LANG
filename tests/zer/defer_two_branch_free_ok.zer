@@ -1,0 +1,9 @@
+// Legit two-branch defer: mutually-exclusive frees in one defer body are NOT a
+// double free. Must compile (guards against over-rejection from the id fix).
+struct N { u32 v; }
+Slab(N) g;
+void f(u32 e) {
+    *N h = g.alloc_ptr() orelse return;
+    defer { if (e == 1) { g.free_ptr(h); } else { g.free_ptr(h); } }
+}
+i32 main() { f(1); f(2); return 0; }

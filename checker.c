@@ -12766,7 +12766,21 @@ static void check_stmt(Checker *c, Node *node) {
             false, NULL,
             false, NULL);
         c->defer_depth++;
-        check_stmt(c, node->defer.body);
+        {
+            /* VRP (2026-07-28): the defer body runs at SCOPE EXIT, so its
+             * assignments NEVER affect code between the defer statement and the
+             * exit. Snapshot the pre-body ranges and RESTORE (fully discard the
+             * body's in-place narrowing) so `defer { idx = 2; }` cannot elide a
+             * later `garr[idx]` fixed-array bounds guard (agent-found silent OOB;
+             * the f92c0e5 JOIN fix wired NODE_IF/FOR/WHILE/SWITCH/LABEL but
+             * missed defer, whose body was checked inline with no snapshot). */
+            int vrp_saved = c->var_range_count;
+            struct VarRange *vrp_pre = vrp_snap_take(c, vrp_saved);
+            check_stmt(c, node->defer.body);
+            c->var_range_count = vrp_saved;
+            vrp_snap_restore(c, vrp_pre, vrp_saved);
+            free(vrp_pre);
+        }
         c->defer_depth--;
         break;
 
@@ -13730,7 +13744,19 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->once.body) {
             bool saved_in_once = c->in_once;
             c->in_once = true;
+            /* VRP (2026-07-28): the @once body runs AT MOST ONCE (skipped on
+             * every call after the first / on loser threads). So a range
+             * narrowed inside is only valid on the run path; the skip path keeps
+             * the pre-body value. JOIN (union) the pre-body ranges back in so a
+             * `@once { idx = 2; }` cannot elide a later `garr[idx]` bounds guard
+             * on the skip path (agent-found silent OOB). Same class as the defer
+             * fix above; @once needs JOIN (may-run) not full discard. */
+            int vrp_saved = c->var_range_count;
+            struct VarRange *vrp_pre = vrp_snap_take(c, vrp_saved);
             check_stmt(c, node->once.body);
+            c->var_range_count = vrp_saved;
+            vrp_snap_join(c, vrp_pre, vrp_saved);
+            free(vrp_pre);
             c->in_once = saved_in_once;
         }
         break;
@@ -14119,6 +14145,52 @@ static void check_stmt(Checker *c, Node *node) {
                         "or ordering)",
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
                         (int)bad_len, bad_name);
+                }
+            }
+        }
+        /* Agent-found 2026-07-28: a concrete function handed to the spawn target
+         * as a funcptr ARGUMENT (`spawn worker(bump)` where
+         * `worker(*()->void fp){ fp(); }`) may be invoked through the target's
+         * funcptr param — a data race on any non-shared global it touches (or
+         * heap corruption if it reaches a global Pool/Slab/Ring). The
+         * target-body scan above can't see it: `fp` resolves to a PARAM, not a
+         * global function, so the direct-call descent skips it, and the
+         * spawn-site arg→param binding was never fed into the scan. Mirror the
+         * BH-18 #8 conservative function-name-arg descent (which handles the same
+         * shape for calls INSIDE a scanned body) at the spawn site. Sound
+         * over-approximation: a function-name arg passed but never invoked is
+         * scanned too — remediation is identical (shared/threadlocal/@atomic_*). */
+        for (int ai = 0; ai < node->spawn_stmt.arg_count; ai++) {
+            Node *an = node->spawn_stmt.args[ai];
+            if (!an || an->kind != NODE_IDENT) continue;
+            Symbol *asym = scope_lookup(c->global_scope, an->ident.name,
+                                        (uint32_t)an->ident.name_len);
+            if (!asym || !asym->is_function || !asym->func_node ||
+                asym->func_node->kind != NODE_FUNC_DECL ||
+                !asym->func_node->func_decl.body) continue;
+            const char *abad_name = NULL;
+            uint32_t abad_len = 0;
+            if (scan_unsafe_global_access(c, asym->func_node->func_decl.body,
+                                          &abad_name, &abad_len)) {
+                ensure_func_props(c, asym);
+                if (asym->props.has_sync) {
+                    checker_warning(c, node->loc.line,
+                        "spawn target '%.*s' may invoke '%.*s' (passed as a "
+                        "function-pointer argument) which accesses non-shared "
+                        "global '%.*s' — potential data race (atomic/barrier "
+                        "present, verify ordering)",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        (int)an->ident.name_len, an->ident.name,
+                        (int)abad_len, abad_name);
+                } else {
+                    checker_error(c, node->loc.line,
+                        "spawn target '%.*s' may invoke '%.*s' (passed as a "
+                        "function-pointer argument) which accesses non-shared "
+                        "global '%.*s' — data race. Use shared struct, "
+                        "threadlocal, or @atomic_*",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        (int)an->ident.name_len, an->ident.name,
+                        (int)abad_len, abad_name);
                 }
             }
         }
@@ -17010,6 +17082,28 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     checker_error(c, decl->loc.line,
                         "global variable '%.*s' initializer must be a compile-time "
                         "constant — @%.*s requires a constant argument at global scope",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)gl, gn);
+                }
+                /* These value-producing intrinsics emit C that is NEVER a valid
+                 * file-scope initializer, EVEN with constant args: @saturate
+                 * lowers to a ({...}) statement-expression (illegal at file
+                 * scope) and @addc/@subb/@mulw lower to a runtime _zer_do_*()
+                 * call ("initializer element is not constant"). The checker
+                 * accepted them and GCC then failed with a cryptic error
+                 * (agent-found 2026-07-28). Reject cleanly here — same policy as
+                 * the bit-query gate above. (@truncate/@bitcast fold to a
+                 * constant cast and are intentionally NOT listed.) */
+                int is_nonconst_emit =
+                    (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
+                    (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
+                                 memcmp(gn, "subb", 4) == 0 ||
+                                 memcmp(gn, "mulw", 4) == 0));
+                if (is_nonconst_emit) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' initializer cannot use @%.*s — it "
+                        "does not lower to a compile-time-constant value at global "
+                        "scope. Use a literal, or compute it in a function body",
                         (int)decl->var_decl.name_len, decl->var_decl.name,
                         (int)gl, gn);
                 }

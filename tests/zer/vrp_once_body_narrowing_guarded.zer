@@ -1,0 +1,17 @@
+// Regression (2026-07-28): a range narrowing inside a @once body leaked past the
+// @once join, eliding the fixed-array bounds guard on the SKIP path (silent OOB).
+// On the fixed compiler the 2nd doit() skips @once, idx stays 100, the auto-guard
+// fires and returns 0. On an unfixed compiler idx is proven [2,2], the guard is
+// elided, garr[100]=7 corrupts memory and returns 100 -> test fails.
+u8[4] garr;
+u32 wild() { return 100; }
+u32 doit() {
+    u32 idx = wild();
+    @once { idx = 2; }
+    garr[idx] = 7;
+    return idx;
+}
+u32 main() {
+    doit();
+    return doit();
+}

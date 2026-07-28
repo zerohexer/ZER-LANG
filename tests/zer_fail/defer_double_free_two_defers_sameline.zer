@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// Two defers freeing the same handle on one source line = double free at exit.
+struct N { u32 v; }
+Slab(N) g;
+void c() {
+    *N h = g.alloc_ptr() orelse return;
+    defer g.free_ptr(h); defer g.free_ptr(h);
+}
+i32 main() { c(); return 0; }

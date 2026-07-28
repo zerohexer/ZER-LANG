@@ -137,6 +137,17 @@ cell heap_subslice_uaf  reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return
 cell heap_subslice_df   reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); free(s); return 0; }'
 
 echo ""
+echo "===== DEFER double-free — must be SOURCE-LINE-independent (2026-07-28) ====="
+# A deferred free on the SAME physical source line as the explicit free (or a
+# second defer) is a double free at scope exit; must reject regardless of
+# formatting. Was line-gated (free_line==defer_line suppressed the diagnostic);
+# now a per-defer-body id discriminates. The legit two-branch defer (both frees
+# in ONE defer body's mutually-exclusive arms) must still COMPILE.
+cell defer_df_sameline    reject  'struct DN { u32 v; } Slab(DN) gdf; void f() { *DN p = gdf.alloc_ptr() orelse return; defer gdf.free_ptr(p); gdf.free_ptr(p); } u32 main(){ f(); return 0; }'
+cell defer_df_two_defers  reject  'struct DN2 { u32 v; } Slab(DN2) gdf2; void f() { *DN2 p = gdf2.alloc_ptr() orelse return; defer gdf2.free_ptr(p); defer gdf2.free_ptr(p); } u32 main(){ f(); return 0; }'
+cell defer_df_two_branch  compile 'struct DN3 { u32 v; } Slab(DN3) gdf3; void f(u32 e) { *DN3 h = gdf3.alloc_ptr() orelse return; defer { if (e==1) { gdf3.free_ptr(h); } else { gdf3.free_ptr(h); } } } u32 main(){ f(1); return 0; }'
+
+echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

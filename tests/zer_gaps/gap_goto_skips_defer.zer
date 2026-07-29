@@ -1,0 +1,24 @@
+// GAP G1 (documented in limitations.md §G, reproducer added 2026-07-29): a FORWARD goto
+// that jumps OVER a defer registration into a label positioned AFTER the defer still fires
+// that defer at the label's exit — the defer runs on a path where it was never registered.
+// Here work(1) takes `goto done` before `counter += 1` / `defer release()`, yet release()
+// fires at the `done:` return → counter underflows (0 - 1). Expected: counter stays 0.
+// ir_lower.c fires function-scope defers as a static set at every exit/goto-target; the
+// "goto BEFORE the defer, label AFTER" shape is unhandled. Proper fix: per-defer runtime
+// "armed" flags; sound interim: reject a forward goto that skips a defer registration.
+// compile-clean + wrong runtime result (exit 255) = the gap.
+u32 counter;
+void release() { counter -= 1; }
+u32 work(u32 fail) {
+    if (fail == 1) { goto done; }
+    counter += 1;
+    defer release();
+    return 0;
+done:
+    return 7;
+}
+u32 main() {
+    counter = 0;
+    work(1);
+    return counter;
+}

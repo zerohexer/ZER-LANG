@@ -1039,11 +1039,28 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
-        case TYPE_UINT: case TYPE_SINT: /* Path C: ?uN → anonymous optional */
-            emit(e, "struct { ");
-            emit_type(e, opt_inner);
-            emit(e, " value; uint8_t has_value; }");
+        /* Path C: ?uN / ?iN — emit the CARRIER's NAMED opt typedef, NOT an
+         * anonymous struct. Each `struct { ... }` is a DISTINCT incompatible C
+         * type, so a return-type site and a var-decl site produced two unrelated
+         * types → GCC "incompatible types when assigning/returning" (2026-07-29).
+         * The carrier is the smallest native int holding N bits (u7→u8, u24→u32,
+         * i48→i64, …); the value field matches the carrier the uN uses elsewhere,
+         * and reads mask to N bits. Split by case label so the sign is taken from
+         * the label — no raw `->kind ==` dispatch (type-dispatch audit clean). */
+        case TYPE_UINT: {
+            uint32_t bits = opt_inner->intn.bits;
+            const char *cw = (bits <= 8) ? "8" : (bits <= 16) ? "16"
+                           : (bits <= 32) ? "32" : (bits <= 64) ? "64" : "128";
+            emit(e, "_zer_opt_u%s", cw);
             break;
+        }
+        case TYPE_SINT: {
+            uint32_t bits = opt_inner->intn.bits;
+            const char *cw = (bits <= 8) ? "8" : (bits <= 16) ? "16"
+                           : (bits <= 32) ? "32" : (bits <= 64) ? "64" : "128";
+            emit(e, "_zer_opt_i%s", cw);
+            break;
+        }
         }
         break;
 
@@ -5199,6 +5216,11 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { float value; uint8_t has_value; } _zer_opt_f32;\n");
     emit(e, "typedef struct { double value; uint8_t has_value; } _zer_opt_f64;\n");
     emit(e, "typedef struct { uint8_t has_value; } _zer_opt_void;\n");
+    /* Path C: 128-bit carrier optionals for ?uN/?iN with 64 < N <= 128 (rare). */
+    emit(e, "#if defined(__SIZEOF_INT128__)\n");
+    emit(e, "typedef struct { unsigned __int128 value; uint8_t has_value; } _zer_opt_u128;\n");
+    emit(e, "typedef struct { __int128 value; uint8_t has_value; } _zer_opt_i128;\n");
+    emit(e, "#endif\n");
     emit(e, "\n");
 
     /* BUG-393: tagged opaque pointer — runtime provenance checking */

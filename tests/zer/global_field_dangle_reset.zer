@@ -1,0 +1,15 @@
+// Positive: storing a heap pointer into a global field is fine when the field is
+// reset to null after the free (G5 fix must not false-positive the reset idiom).
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    n.val = 7;
+    g.p = n;
+    free(n);
+    g.p = null;
+    return 0;
+}

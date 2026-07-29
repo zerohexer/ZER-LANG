@@ -318,6 +318,51 @@ that regresses any cell fails `make check`.
 
 ---
 
+## OPEN — spawn target reaches a non-shared global through a funcptr FIELD callback (2026-07-29) (data race, silent)
+
+**Symptom (verified, `tests/zer_gaps/gap_spawn_funcptr_field_race.zer`, compile-clean = the gap):**
+a fire-and-forget spawn whose target invokes a function-pointer FIELD callback that writes a
+non-shared global is accepted with no error:
+```
+u32 g_ctr;
+void do_inc() { g_ctr = 5; }
+shared struct W { *() cb; u32 v; }
+W gw;
+void worker(*W w) { w.cb(); }              // call through funcptr FIELD
+u32 main() { gw.cb = do_inc; spawn worker(&gw); return 0; }   // ACCEPTED — g_ctr races
+```
+The DIRECT form (`void worker(*W w) { g_ctr = 5; }`) IS correctly rejected: *"spawn target 'worker'
+accesses non-shared global 'g_ctr' — data race"*. This is the register-in-setup / invoke-in-worker
+RTOS pattern, so the binding `gw.cb = do_inc` lives in `main`, outside the scanned `worker` body.
+
+**Root cause:** `scan_unsafe_global_access` (checker.c ~10113) resolves a transitive call only when
+the callee is a direct ident (global function), a funcname passed as an argument (BH-18 #8), or a
+funcname bound to a LOCAL funcptr in the scanned body (SPAWN-FP, #11). A call whose callee is a
+funcptr FIELD (`w.cb()`, callee is a `NODE_FIELD`) is not resolved, and the field's binding lives
+outside the body — so `do_inc`'s non-shared-global write is never reached. Same "check fires
+lexically but misses the access reached through a funcptr the sink doesn't match" shape as the
+closed SPAWN-FP / ISR-TRANS holes (#11/#12), one sink further out.
+
+**Why the obvious fix is wrong / what's needed:** resolving `w.cb` to `do_inc` requires knowing the
+field binding, which lives in a different function — that is whole-program funcptr-field-binding
+analysis, which is BANNED by ZER's per-file architecture (CLAUDE.md "Whole-program analysis — BANNED").
+The sound per-file options are both over-rejections to weigh: (a) reject any spawn target that calls
+through an unresolvable funcptr (field OR unresolved local) — conservative-on-unknown, but rejects
+legitimate workers whose callback only touches shared/atomic state; (b) require the funcptr field's
+declared pointee to be a "spawn-safe" function (one whose FuncProps show no non-shared global write) —
+needs a funcptr-target-signature effect annotation ZER doesn't have. Deferred pending a decision;
+documented + reproducer in tree so it is not silently lost.
+
+**Also observed (NOT a silent hole, a spurious diagnostic):** when an ISR body transitively reaches a
+function that has a funcptr PARAMETER (`void run_fn(*() fn){ fn(); }`), the checker emits
+*"interrupt service routine can only have a pointer argument and an optional integer argument"* at the
+`interrupt {}` line — a wrong/misleading message (the ISR has no arguments). The ISR global-volatile
+transitivity itself is sound for direct/transitive calls (the #12 fix): `interrupt X { helper(); }`
+where `helper` writes a shared global IS correctly rejected. Low priority — a loud wrong message, not
+a silent gap.
+
+---
+
 ## OPEN — BUGS: fixes available on four `claude/*` branches (fxvnsu / yd5ajq / 0h7oz9 / c4c09l), verified NOT in main (2026-07-19)
 
 **What this is.** A SECOND set of `claude/*` audit branches, created AFTER the 41-fix tracker
@@ -656,8 +701,14 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF) — ✅ FIXED 2026-07-29
+  (zercheck_ir.c; tests `tests/zer_fail/global_field_dangle.zer` + `global_array_elem_dangle.zer` +
+  `tests/zer/global_field_dangle_reset.zer`). The IR_ASSIGN handler now registers a compound global-root
+  handle `(IR_GLOBAL_ROOT_ID, "g.p")` for a field/index projection of an unshadowed global, mirroring the
+  bare-ident machinery; flags only a DEFINITELY-freed target at exit (BUG-742 conservatism kept). Two
+  laundered siblings were found+fixed in the same pass (see the dedicated OPEN→fixed note above): the
+  `@ptrcast`/launder and slice-`.ptr` store shapes (`ir_find_store_source_local`). Original report:
+  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) left `g.p` dangling, but
   the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
   ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
   the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:

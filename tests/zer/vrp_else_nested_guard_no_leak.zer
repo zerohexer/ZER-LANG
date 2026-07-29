@@ -1,0 +1,16 @@
+// Regression (2026-07-29): a guard nested inside the ELSE body of a comparison-if
+// pushed a guard-inverse range that leaked past the join to a later arr[i] reachable
+// on the THEN path where i is wild — the bounds auto-guard was wrongly elided → silent
+// stack OOB (ASan stack-buffer-overflow). The then body already reset var_range_count;
+// the else body did not. With the fix, arr[i] keeps its auto-guard, so the wild index
+// is caught (returns early) instead of writing out of bounds.
+// Pre-fix: SIGSEGV (raw arr[1000000] = 9). Post-fix: guarded, exit 0.
+u32 wild(u32 x) { return x; }
+
+u32 main() {
+    u8[4] arr;
+    u32 i = wild(1000000);
+    if (i < 100) {  } else { if (i >= 4) { return 0; } }
+    arr[i] = 9;
+    return (u32)arr[0];
+}

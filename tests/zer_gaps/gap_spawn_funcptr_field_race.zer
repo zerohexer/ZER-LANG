@@ -1,0 +1,12 @@
+// GAP (2026-07-29): a fire-and-forget spawn target reaches a NON-shared global through
+// a function-pointer FIELD callback (the register-in-setup / invoke-in-worker RTOS
+// pattern) → data race silently accepted. scan_unsafe_global_access (checker.c) resolves
+// direct-ident callees, funcname-as-arg, and in-body funcname bindings, but NOT a call
+// whose callee is a funcptr FIELD (w.cb()); the binding gw.cb = do_inc lives outside the
+// scanned body. The direct form (worker writes g_ctr directly) IS rejected. compile-clean.
+u32 g_ctr;
+void do_inc() { g_ctr = 5; }
+shared struct W { *() cb; u32 v; }
+W gw;
+void worker(*W w) { w.cb(); }
+u32 main() { gw.cb = do_inc; spawn worker(&gw); return 0; }

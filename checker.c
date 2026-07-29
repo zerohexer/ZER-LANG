@@ -4245,8 +4245,16 @@ static Type *check_expr(Checker *c, Node *node) {
                             through_const_pointer = true;
                     }
                     root = root->field.object;
-                } else {
+                } else if (root->kind == NODE_INDEX) {
                     root = root->index_expr.object;
+                } else {
+                    /* NODE_UNARY with a non-deref op — e.g. the `&x` in
+                     * `*(&x) = v`. Descend through the operand (NOT
+                     * index_expr.object — reading the wrong union member off a
+                     * unary node dereferenced garbage → SEGV, 2026-07-29).
+                     * through_pointer was already set by the enclosing deref,
+                     * so the const-ident check below is correctly skipped. */
+                    root = root->unary.operand;
                 }
             }
             if (through_const_pointer) {
@@ -11517,11 +11525,24 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
+                /* VRP-else-leak (2026-07-29): a guard NESTED inside the else
+                 * body (`else { if (idx >= 4) return; }`) pushes a guard-inverse
+                 * range entry at index >= this base. That narrowing is sound
+                 * ONLY on the else path (and only after the nested guard); it
+                 * must NOT survive the join to a later `arr[idx]` reachable on
+                 * the THEN path where idx is wild (silent stack OOB — ASan
+                 * confirmed). The then body already resets at line 11460; the
+                 * else body had no symmetric reset. Capture the count BEFORE the
+                 * else body (which includes THIS if's own guard-inverse entries
+                 * pushed above — those legitimately leak to following statements)
+                 * and restore it after, dropping only what the else body pushed. */
+                int else_range_base = c->var_range_count;
                 if (node->if_stmt.else_body) {
                     /* else-block gets the inverse of then-block's range
                      * (but we already restored, so just check else normally) */
                     check_stmt(c, node->if_stmt.else_body);
                 }
+                c->var_range_count = else_range_base;
                 /* Finding A: entries now hold the else-result (or the restored
                  * pre-branch values on fallthrough); union with the captured
                  * then-result so a branch-local narrowing cannot leak. Pushed

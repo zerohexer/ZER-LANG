@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// G5 (2026-07-29): a heap pointer stored into a global STRUCT FIELD then freed
+// leaves the field dangling. The bare-global form `g = n; free(n)` was already
+// caught (BUG-739); the `.field` projection sink was missed (per-sink patchwork).
+// If this compiles, the field-projection global-dangle check is broken.
+
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    n.val = 42;
+    g.p = n;
+    free(n);
+    return 0;
+}

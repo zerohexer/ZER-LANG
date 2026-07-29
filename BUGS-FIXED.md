@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-29 — Autonomous audit: 6 fixes (3 soundness holes, 1 crash, 2 codegen) — checker.c, zercheck_ir.c, emitter.c
+
+Broad codebase audit (heavy read + 4 parallel hunting agents + personal verification, all
+ASan-confirmed on this Linux container). Six distinct defects found, reproduced, fixed, and
+regression-tested. Four are the recurring MULTI-SITE / per-sink patchwork class (CLAUDE.md).
+
+### 1. G5 — heap pointer stored into a global STRUCT FIELD / ARRAY ELEMENT dangles unflagged (🔴 UAF, zercheck_ir.c)
+`g.p = n; free(n)` (g a global struct) left `g.p` dangling with no error, while the bare-global form
+`g = n; free(n)` was correctly caught (BUG-739). The GAP-3 dangle hook only matched a whole-global
+`NODE_IDENT` store; the `.field` / `[i]` projection sink was missed (was documented-open as G5). Fix:
+mirror the bare-ident register/alias/exit machinery on the compound key `(IR_GLOBAL_ROOT_ID, "g.p")` —
+build the full dotted path (root name + suffix), register sharing the RHS alloc_id, flag only a
+DEFINITELY-freed target at exit (BUG-742 MAYBE-conservatism preserved). Tests:
+`tests/zer_fail/global_field_dangle.zer`, `global_array_elem_dangle.zer`,
+`tests/zer/global_field_dangle_reset.zer`.
+
+### 2. HOLE1/HOLE2 — laundered store to a global dangles unflagged (🔴 UAF, zercheck_ir.c)
+Same sink family as G5, two more RHS shapes bypassed it: `g = @ptrcast(*T, n); free(n)` (the RHS is a
+NODE_INTRINSIC → raw source-local lookup returned -1 → global pseudo-root never inherited the
+alloc_id) and `g = s.ptr; free(s)` (a heap slice's own `.ptr` read didn't carry the slice alloc_id).
+Both ASan-confirmed heap-use-after-free. Fix: `ir_find_store_source_local` unwraps launder
+intrinsics (@ptrcast/@pun/@bitcast/@cast/@container — mirrors checker.c `unwrap_ptr_launder`) and a
+slice `.ptr` field-read, used at the two global-store sinks only. No false positives (param slices /
+param `@ptrcast` / null-reset all stay accepted — gated on an alive tracked handle with alloc_id).
+Tests: `tests/zer_fail/global_dangle_ptrcast_launder.zer`, `global_dangle_slice_ptr.zer`.
+
+### 3. VRP — else-body nested guard leaks its guard-inverse range past the join → silent OOB (🔴, checker.c)
+`if (i < 100) {} else { if (i >= 4) { return; } } arr[i] = 9;` compiled with NO bounds guard on
+`arr[i]` — the else-nested guard pushed a guard-inverse range `i∈[..,3]` that leaked to the THEN
+path (i wild), so the auto-guard was elided → ASan stack-buffer-overflow write. The comparison-path
+NODE_IF handler resets `var_range_count` after the THEN body (line ~11460) but had NO symmetric reset
+after the ELSE body. Fix: capture the count before the else body (which includes THIS if's own
+guard-inverse entries — those legitimately leak) and restore it after, dropping only what the else
+body pushed. Precise: a real top-level guard still elides; a within-else use after the nested guard
+still elides. Test: `tests/zer/vrp_else_nested_guard_no_leak.zer`.
+
+### 4. `*(&x) = v` crashed the checker with a SEGV (crash, checker.c)
+Any assignment target with an address-of node in its lvalue chain (`*(&x)=v`, `*(&arr[0])=v`,
+`*(&s.f)=v`) segfaulted the const-check lvalue walk: the loop admitted NODE_UNARY but the final else
+read `index_expr.object` off the `&` node (wrong union member → garbage deref). Fix: split the else
+into NODE_INDEX vs NODE_UNARY, descending `unary.operand` for the latter. `*(&const)=v` still errors
+"cannot write through const pointer". Test: `tests/zer/assign_through_addressof.zer`.
+
+### 5. `?uN` / `?iN` optional emitted anonymous incompatible structs → emitted C didn't compile (codegen, emitter.c)
+`?u7` / `?i5` / `?u24` optionals emitted a fresh `struct { <carrier> value; uint8_t has_value; }` at
+every site; C treats each anonymous struct as a distinct type → GCC "incompatible types when
+assigning/returning" between a return site and a var-decl site. Fix: emit the carrier's NAMED opt
+typedef (`_zer_opt_u8`/`_zer_opt_i8`/… by carrier width), added `_zer_opt_u128`/`i128` to the
+preamble for 64<N≤128. Test: `tests/zer/optional_intn_carrier.zer`.
+
+All fixes verified individually (ASan for the UAF/OOB), plus the full `make check` GREEN.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

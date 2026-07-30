@@ -3979,23 +3979,66 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
  * TOP-LEVEL DECLARATION EMISSION
  * ================================================================ */
 
-/* Emit all stamped container struct declarations */
+/* Find the container_instances[] index whose stamped struct IS `t` (pointer
+ * identity), or -1. */
+static int container_inst_index_of(Emitter *e, Type *t) {
+    for (int ci = 0; ci < e->checker->container_inst_count; ci++) {
+        if (e->checker->container_instances[ci].stamped_struct == t) return ci;
+    }
+    return -1;
+}
+
+/* Emit one stamped container struct, but FIRST (recursively, post-order) emit
+ * any stamped container it contains BY VALUE — a by-value field, or an array of
+ * a by-value struct, both need the complete type in C. Pointer / optional /
+ * slice fields do NOT create an ordering dependency (a pointer to an incomplete
+ * type is legal C — this is what lets `?*Node(T) next` linked lists work).
+ *
+ * Why this is needed: the tie-the-knot instance-cache registration in checker.c
+ * (resolve_type TYNODE_CONTAINER) records a container BEFORE resolving its
+ * fields, so container_instances[] creation order can place an OUTER stamp
+ * ahead of an INNER stamp it holds by value (`container Outer(T){Inner(T) x;}`)
+ * — emitting them in that order gives GCC "field 'x' has incomplete type". This
+ * DFS decouples emission order from registration order. (Fixed 2026-07-30.) */
+static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *inprog) {
+    if (emitted[ci] || inprog[ci]) return;  /* done, or a by-value cycle (rejected earlier) */
+    Type *st = e->checker->container_instances[ci].stamped_struct;
+    if (!st || type_dispatch_kind(st) != TYPE_STRUCT) { emitted[ci] = 1; return; }
+    inprog[ci] = 1;
+    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+        Type *ft = type_unwrap_distinct(st->struct_type.fields[fi].type);
+        while (type_dispatch_kind(ft) == TYPE_ARRAY) ft = type_unwrap_distinct(ft->array.inner);
+        if (type_dispatch_kind(ft) == TYPE_STRUCT) {
+            int dep = container_inst_index_of(e, ft);
+            if (dep >= 0 && dep != ci) emit_one_container_struct(e, dep, emitted, inprog);
+        }
+    }
+    inprog[ci] = 0;
+    if (emitted[ci]) return;
+    emitted[ci] = 1;
+    emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
+    e->indent++;
+    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+        SField *sf = &st->struct_type.fields[fi];
+        emit_indent(e);
+        emit_type_and_name(e, sf->type, sf->name, sf->name_len);
+        emit(e, ";\n");
+    }
+    e->indent--;
+    emit(e, "};\n\n");
+}
+
+/* Emit all stamped container struct declarations, topologically ordered so a
+ * by-value container field's struct is always complete before its user. */
 static void emit_container_structs(Emitter *e) {
     if (!e->checker || e->checker->container_inst_count == 0) return;
-    for (int ci = 0; ci < e->checker->container_inst_count; ci++) {
-        Type *st = e->checker->container_instances[ci].stamped_struct;
-        if (!st || st->kind != TYPE_STRUCT) continue;
-        emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
-        e->indent++;
-        for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
-            SField *sf = &st->struct_type.fields[fi];
-            emit_indent(e);
-            emit_type_and_name(e, sf->type, sf->name, sf->name_len);
-            emit(e, ";\n");
-        }
-        e->indent--;
-        emit(e, "};\n\n");
-    }
+    int n = e->checker->container_inst_count;
+    char *emitted = (char *)calloc((size_t)n, 1);
+    char *inprog = (char *)calloc((size_t)n, 1);
+    if (!emitted || !inprog) { free(emitted); free(inprog); return; }
+    for (int ci = 0; ci < n; ci++) emit_one_container_struct(e, ci, emitted, inprog);
+    free(emitted);
+    free(inprog);
 }
 
 static void emit_struct_decl(Emitter *e, Node *node) {

@@ -29,10 +29,12 @@ Related context elsewhere:
 - §2  The implementation-language question (why not C, OCaml, Rust — why Lean 4)
 - §3  The prover question (Coq vs Lean 4 — foundations identical, ecosystems differ)
 - §4  Iris-in-Lean — empirical status (verified locally, with commands)
-- §5  The certificate principle (P-vs-NP asymmetry; the design shift it forces)
+- §5  The certificate principle (P-vs-NP asymmetry; the design shift it forces; §5.3 the
+      annotation contract — CHECKED not TRUSTED, and the infer-vs-require rule)
 - §6  Assurance tiers A/B/C — and the decision: A primary, B bridge, C retired
 - §7  The architecture (whole ZER in Lean 4; strangler migration plan)
-- §8  The theorems (Stage 0–4 roadmap; the Grand Theorem)
+- §8  The theorems (Stage 0–3 roadmap; the Grand Theorem; §8.3 STAGE 5 RETIRED —
+      emit-C is permanent, backend stays delegated to GCC/CompCert)
 - §9  The two trust chains — TCB analysis, "fully safe" does not exist, the kernel hatch
 - §10 Backends — dual-backend strategy; verified CompCert facts (ISAs, pedigree, licensing)
 - §11 The emitter contract (C99, CompCert dialect, freestanding, Clight-friendly)
@@ -381,6 +383,89 @@ unprovability**.
 This shift is worth more to the NASA-grade story than any implementation-language decision;
 it is what makes Stage 1 tractable at all.
 
+### 5.3 The annotation contract — CHECKED, never TRUSTED (clarified 2026-07-29)
+
+§5.2's word "certificate" reads, on a fast pass, as *"the user supplies a property and the
+tool believes it"* — the contract model. **It is not.** This subsection pins the actual
+contract so a fresh session does not re-derive it (and does not conclude that §5.2
+contradicts CLAUDE.md's "the compiler must INFER everything" — it does not; see the
+reconciliation at the end).
+
+**Three models exist; ZER is the third.**
+
+| Model | Who states the property | Failure mode of a WRONG annotation | Example |
+|---|---|---|---|
+| **Trusted annotation** | user states, tool ASSUMES | you proved the WRONG THING, silently — soundness depends on user honesty | RefinedC, SPARK, contract systems |
+| **No annotation** | compiler alone | nothing to be wrong — but illegible, and a search heuristic is near-unprovable (§5.2) | Hindley–Milner; ZER before this shift |
+| **Checked annotation** | compiler INFERS the truth independently; user RESTATES it; compiler COMPARES | **compile error** | **ZER (adopted)**; Rust `fn` signatures; ML optional-but-checked types |
+
+The load-bearing property: **the annotation carries ZERO trust.** It is a restatement the
+compiler verifies against its own derivation, never an information source it relies on. A
+user who writes `*T` where the truth is `[*]T` gets an error telling them to switch — they
+cannot ship the wrong thing, and they also cannot make the checker unsound by lying. This is
+the single sentence that separates ZER from every contract-based system, and it is why
+`checker_sound` is provable at all: the judgment is a finite rule set over annotations the
+compiler itself derived, not a search whose output must be taken on faith.
+
+**The decision rule for whether an annotation is written or hidden.** One question:
+
+> **Does this annotation change the emitted C?**
+
+| Answer | Policy | Cases |
+|---|---|---|
+| **NO** — analysis-only, no runtime representation | **INFER it, hide it.** Keyword optional at most. | `keep` / non-keep (INFERRED since 2026-06-19), escape, provenance, handle state, alloc colour |
+| **YES** — changes layout, ABI, or codegen | **REQUIRE it explicitly, and CHECK it against inference.** | `*T` vs `[*]T`, `const`, `volatile`, `packed`, `mmio` |
+
+*Infer what is invisible; require what changes the machine.* This rule predicts every choice
+already made, which is the sign it is the real underlying principle rather than a post-hoc
+story. Apply it to any NEW annotation.
+
+**Worked case — why `*T` vs `[*]T` must stay explicit even though it is inferable.** The
+compiler *can* determine from use whether a pointer is a single object or a range. It must
+not silently choose, because the choice is a representation decision:
+
+```
+   *T      8 bytes   { ptr }
+   [*]T   16 bytes   { ptr, len }        (64-bit target)
+
+   struct of 4 pointers  32B   vs   struct of 4 slices  64B    -> DOUBLED
+   one 64B cache line    8 pointers  OR  4 slices
+   [*]T arr[100]         1600B  vs  800B
+   argument passing      TWO registers per slice, one per pointer
+                         -> real register pressure on ARM
+```
+
+Inferring it would let the compiler silently double struct sizes, stack frames and register
+pressure based on how a variable happened to be used in a distant function — i.e. silently
+choose the user's RAM budget and their C ABI. Unacceptable for the embedded/mission-critical
+target. (Rust makes the identical call: `&T` and `&[T]` are never inferred into each other.)
+Note also that `[*]T` is exactly the hand-rolled `{ptr, len}` pair a careful C programmer
+writes anyway; the type system only makes them inseparable and makes you say so.
+
+**Two distinct things live at a boundary — do not conflate them.** §5.2's "certificates"
+covers both, but only the first is user-facing:
+
+| Kind | Who writes it | Why it exists |
+|---|---|---|
+| **Representation certificates** | the USER writes them (`[*]T`, `const`, `volatile`) | they change the emitted code; checked against inference |
+| **Analysis facts** | the COMPILER derives and records them at the boundary | they exist so the check is MODULAR (separate compilation, local errors) and so the judgment is a finite rule set Stage 1 can be proven about |
+
+Both make the boundary judgment finite; only the first is an annotation in the user-facing
+sense. A reader who assumes the user writes all of it will badly undersell what ZER does.
+
+**Reconciliation with CLAUDE.md.** The two documents agree; state it this way:
+
+> ZER infers every safety property independently. Annotations at function boundaries are a
+> mandatory **restatement** of what the compiler already derived — **checked, never trusted**.
+> A wrong annotation is a compile error, so soundness never depends on the programmer being
+> right. Annotations exist for legibility, modularity and provability — not for information.
+
+**The cost, stated honestly.** ZER can only *require* an annotation for a property it can
+*infer*, so the annotation vocabulary is bounded by what is decidable. RefinedC is strictly
+more expressive precisely BECAUSE it trusts the user and makes them discharge the obligation.
+The trade is deliberate: **RefinedC can say more; ZER can never be wrong.** For a language
+whose target user may be careless and must still ship correct code, that is the right side.
+
 ---
 
 ## §6 Assurance tiers — the decision
@@ -597,6 +682,62 @@ Consequences, precisely:
 Sequencing is unchanged where it matters: **Stages 0–3 are untouched** (semantics,
 `checker_sound`, per-pass proofs, Grand Theorem to C99). Stage 5 is the endgame after
 them; the dual-backend strategy (§10) covers everything until it lands.
+
+### §8.3 DECISION AMENDMENT (2026-07-29) — STAGE 5 RETIRED. Emit-C is permanent; the backend stays delegated.
+
+**§8.2's Stage 5 (a ZER-native, Lean-verified backend emitting ISA directly) is RETIRED.**
+Its *reasoning* was sound — the §8.1 cross-prover seam is real, and a native backend is
+genuinely the only way to obtain ONE machine-checked theorem from ZER source to machine
+code. What is rejected is the **goal**, because of what it costs:
+
+| | Architectures supported | Backend maintained by |
+|---|---|---|
+| **Emit C → GCC** (the product today) | **every target GCC supports** (~50, and new ones arrive free) | the GCC project, forever |
+| **Emit C → CompCert** (certification path) | x86-64, AArch64, ARM, RISC-V, PowerPC — **already verified to assembly** | AbsInt / the CompCert project |
+| **Stage 5 native backend** | **2** (RISC-V, ARMv7-M) | **us, forever, per ISA** |
+
+**Architecture breadth IS the product.** "Targets every architecture GCC supports" is ZER's
+central portability claim; a native backend would trade ~50 targets for 2 and convert a
+zero-maintenance dependency into a permanent per-ISA obligation — including every new board
+a customer asks for. No verification gain justifies that for a one-maintainer project whose
+users are embedded shops with heterogeneous targets.
+
+**And Stage 5's function is already served.** CompCert *is* the verified backend Stage 5
+would rebuild, it already covers more ISAs than Stage 5 targeted, and §8.2 itself records
+that using it pragmatically creates **no seam**: *"no Coq work on our side and NO seam —
+because no cross-prover theorem composition is claimed."* Writing our own would be
+reimplementing CompCert, worse, for fewer targets, to recover a single composed statement.
+
+**Adopted end-state (replaces Stage 4 and Stage 5 both):**
+
+```
+   DAILY           ZER -> C99 -> GCC          every arch, free, unverified backend
+   CERTIFICATION   ZER -> C99 -> CompCert     verified to asm on CompCert's targets
+   NATIVE BACKEND  none, ever
+```
+
+**What is claimed, and what is not — the honest line:**
+
+- CLAIMED: `checker_sound` (the safety judgment is right) ∧ `emit_correct` (the emitted C
+  means what the source means) ∧ — when built with CompCert — that C is compiled to
+  assembly by a separately-proven compiler.
+- NOT CLAIMED: a single machine-checked theorem spanning ZER source → machine code. The
+  joint is the C-dialect agreement between our Lean target semantics and CompCert's Coq
+  one — an **argued-and-tested link** (§8.1), deliberately kept trivial by §11's tiny,
+  UB-free dialect, and listed in the TCB alongside §9's residue.
+- This is composed evidence rather than one theorem. Safety processes (DO-178C-style)
+  accept composed evidence; the single-theorem framing was an aesthetic goal, not a
+  certification requirement.
+
+**Do not re-derive Stage 5 from the seam argument.** A future session reading §8.1 will
+correctly conclude that a native Lean backend is the only route to a composed theorem.
+That conclusion is right and the goal is still declined — the cost is measured in lost
+target coverage, not in proof effort. Revisit ONLY if a customer requires end-to-end
+machine-checked assurance on a target CompCert does not support, and funds the backend.
+
+Consequential edits: §8.2's items 2 and 4 and §17's three Stage-5-referencing rows are
+superseded by this amendment; §10's dual-backend strategy becomes the permanent end-state
+rather than an interim one.
 
 ---
 
@@ -931,6 +1072,8 @@ on the Lean learning curve.
 | Cross-prover composed theorem with CompCert (the original Stage-4 endgame) | The Clight interface semantics would exist in two provers — an argued link, not machine-checked (§8.1) | n/a — replaced by §8.2 (CompCert = standalone interim cert compiler; composition via Stage 5 in Lean) |
 | "Porting CompCert to Lean" as a mechanical translation | No production-grade Coq→Lean proof translator exists at that scale; Stage 5 is a design-guided REBUILD of only the needed subset (ZER-IR, 1–2 ISAs) — a small fraction of CompCert | n/a — this framing IS the plan, correctly sized |
 | Believing 2024-era iris-lean status ("no WP/adequacy") | Empirically false as of 2026-07 (§4.2 build + axiom probe on this machine) | never — re-verify against the repo instead |
+| **A ZER-native backend emitting ISA directly (§8.2's Stage 5)** | **RETIRED 2026-07-29 (§8.3).** Trades ~50 GCC targets for 2, and a zero-maintenance dependency for a permanent per-ISA obligation. Architecture breadth IS the product. CompCert already is the verified backend it would rebuild, on more ISAs. | only if a customer requires end-to-end machine-checked assurance on a target CompCert does not support — AND funds it |
+| **A single machine-checked theorem spanning ZER source → machine code** | Requires either the cross-prover seam (§8.1) or Stage 5 (§8.3, retired). Replaced by COMPOSED EVIDENCE: `checker_sound` + `emit_correct` + CompCert's own theorem, jointed by §11's tiny UB-free dialect. Certification processes accept composed evidence. | as above |
 
 ---
 

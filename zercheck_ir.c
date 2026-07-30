@@ -1678,6 +1678,9 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         ir_zc_error(zc, line,
             "use after free: '%.*s' is %s (freed at line %d)",
             nlen, name, ir_state_name(h->state), h->free_line);
+        if (!zc->building_summary)
+            ZTRACE("CHECK    -> UAF FIRED: '%.*s' is %s (alloc_id %d, freed@line %d) used@line %d",
+                   nlen, name, ir_state_name(h->state), h->alloc_id, h->free_line, line);
         urs_add(rs, root_local);
     }
 }
@@ -2352,6 +2355,8 @@ static bool ir_callee_has_summary(ZerCheck *zc, const char *name,
 
 static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
     (void)zc; /* used for error reporting */
+    if (g_zer_trace && !zc->building_summary)
+        fprintf(stderr, "[check] %-8s @line %d\n", ir_op_name(inst->op), inst->source_line);
 
     switch (inst->op) {
 
@@ -5027,8 +5032,44 @@ static void ir_register_nested_handles(IRPathState *ps, void *arena_ptr,
     }
 }
 
+/* ZER_TRACE_STATES=1: after each instruction, print the handle-state table so you
+ * can WATCH the lattice move (alive -> freed -> maybe-freed). This is the one thing
+ * a call-graph filter can't show — the data, not the function names. Works in plain
+ * `zerc` too (no -finstrument-functions needed). Silent during convergence passes. */
+static void ir_trace_states(ZerCheck *zc, IRFunc *func, IRPathState *ps, IRInst *inst) {
+    static int  cfg = 0;              /* 0=unread, -1=off, 1=on(hide temps), 2=all */
+    static char last[1024] = "";      /* dedup: only print when the states CHANGE */
+    if (cfg == 0) {
+        const char *e = getenv("ZER_TRACE_STATES");
+        cfg = !e ? -1 : (strcmp(e, "all") == 0 ? 2 : 1);
+    }
+    if (cfg <= 0 || zc->building_summary || ps->handle_count == 0) return;
+
+    char line[1024];
+    int off = 0;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        const char *nm = (h->local_id >= 0 && h->local_id < func->local_count)
+            ? func->locals[h->local_id].name : "?";
+        int nlen = (h->local_id >= 0 && h->local_id < func->local_count)
+            ? (int)func->locals[h->local_id].name_len : 1;
+        /* hide compiler temporaries (_zer_*) unless ZER_TRACE_STATES=all */
+        if (cfg != 2 && nlen >= 4 && strncmp(nm, "_zer", 4) == 0) continue;
+        int n = snprintf(line + off, sizeof(line) - (size_t)off, "  %.*s%.*s=%s",
+                nlen, nm, (int)h->path_len, (h->path ? h->path : ""),
+                ir_state_name(h->state));
+        if (n > 0 && off + n < (int)sizeof(line)) off += n;
+    }
+    if (off == 0 || strcmp(line, last) == 0) return;   /* empty or unchanged */
+    strcpy(last, line);
+    fprintf(stderr, "[state] @line %d:%s\n", inst->source_line, line);
+}
+
 bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     if (!func || func->block_count == 0) return true;
+    if (!zc->building_summary)
+        ZTRACE("CHECK  zercheck_ir: '%.*s'  (%d blocks, %d locals) -- handle-lattice fixpoint",
+               (int)func->name_len, func->name, func->block_count, func->local_count);
 
     /* Allocate per-block states */
     IRPathState *block_states = (IRPathState *)calloc(func->block_count, sizeof(IRPathState));
@@ -5069,7 +5110,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * Fix: suppress via building_summary during convergence, then run
      * one more pass on the converged state with errors enabled. */
     bool saved_suppress = zc->building_summary;
+    int saved_converge = g_zer_in_converge;  /* also hide the inner fixpoint from --trace-calls */
     zc->building_summary = true;
+    g_zer_in_converge = 1;
 
     bool changed = true;
     int iterations = 0;
@@ -5218,6 +5261,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * for full pass), so re-running produces exactly the same final
      * errors, each emitted once instead of once per iteration. */
     zc->building_summary = saved_suppress;
+    g_zer_in_converge = saved_converge;
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
 
@@ -5274,6 +5318,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         zc->gr_cur_block = bi;
         for (int ii = 0; ii < bb->inst_count; ii++) {
             ir_check_inst(zc, &merged, &bb->insts[ii], func);
+            ir_trace_states(zc, func, &merged, &bb->insts[ii]);
         }
         /* Level B: tag handles freed in this block (the final pass also writes
          * block_states[bi], read by later blocks' merges in this same pass). */

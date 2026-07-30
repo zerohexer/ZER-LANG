@@ -26,6 +26,15 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 zerc: $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o zerc $^
 
+# ---- Call-graph tracer build (`zerc-trace --trace-calls`) ----
+# Every TU built with -finstrument-functions + -no-pie so ELF symbol values
+# equal runtime addresses; zer_trace.c resolves names from .symtab. Separate
+# binary — normal `zerc` stays un-instrumented and fast. Usage:
+#   ./zerc-trace prog.zer -o /dev/null --trace-calls
+#   ZER_TRACE_FILTER=parse,lower,ir_,zercheck,emit,check ./zerc-trace prog.zer -o /dev/null --trace-calls
+zerc-trace: $(CORE_SRCS) zer_trace.c
+	$(CC) $(CFLAGS) -finstrument-functions -g -no-pie -o zerc-trace $(CORE_SRCS) zer_trace.c
+
 # ---- Code index (for LLM context — query with grep, don't load fully) ----
 tags: $(CORE_SRCS) $(LIB_SRCS) *.h
 	ctags --fields=+nS --extras=+q -R $(CORE_SRCS) *.h

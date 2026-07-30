@@ -815,7 +815,7 @@ bool ir_validate(IRFunc *func) {
  * Pretty-Printer
  * ================================================================ */
 
-static const char *ir_op_name(IROpKind op) {
+const char *ir_op_name(IROpKind op) {
     switch (op) {
     case IR_ASSIGN:           return "ASSIGN";
     case IR_CALL:             return "CALL";

@@ -137,6 +137,8 @@ typedef enum {
     IR_NOP,              /* placeholder — no code emitted */
 } IROpKind;
 
+const char *ir_op_name(IROpKind op);  /* op enum -> "CALL"/"ASSIGN"/... (ir_print + --trace) */
+
 typedef struct IRInst {
     IROpKind op;
     int dest_local;          /* LOCAL id for result (-1 = no dest / void) */

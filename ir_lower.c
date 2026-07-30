@@ -361,6 +361,7 @@ static void emit_3ac(LowerCtx *ctx, IRInst inst) {
  * Returns the local ID holding the result, or -1 for void/error. */
 static int lower_expr(LowerCtx *ctx, Node *expr) {
     if (!expr) return -1;
+    ZTRACE("LOWER-EXPR  %-12s @ line %d", node_kind_name(expr->kind), expr->loc.line);
 
     switch (expr->kind) {
 
@@ -2081,6 +2082,8 @@ static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local,
 /* Lower a single statement */
 static void lower_stmt(LowerCtx *ctx, Node *node) {
     if (!node) return;
+    ZTRACE("LOWER  %-12s @ line %d  (into block %d)",
+           node_kind_name(node->kind), node->loc.line, ctx->current_block);
 
     /* Check if current block is already terminated — start new block */
     IRBlock *cur = &ctx->func->blocks[ctx->current_block];

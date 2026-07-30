@@ -2,6 +2,26 @@
 #define ZER_AST_H
 
 #include "lexer.h"
+#include <stdio.h>
+
+/* ================================================================
+ * Compilation trace (`zerc --trace`)
+ *
+ * A single global gate + a no-op-unless-enabled macro. Probes placed at
+ * the phase boundaries and key dispatchers (parse_declaration,
+ * parse_statement, lower_stmt, lower_orelse_to_dest, zercheck_ir) print
+ * the compilation flow to stderr — which function ran, which node/IR it
+ * touched — without disturbing stdout (emitted C). Defined in ast.c so
+ * every build target (zerc + all test_* binaries) links it.
+ * ================================================================ */
+extern int g_zer_trace;         /* 0 = silent (default); set to 1 by --trace */
+extern int g_zer_trace_calls;   /* set by --trace-calls; drives the full call-graph
+                                 * tracer in zer_trace.c (zerc-trace build only) */
+extern int g_zer_in_converge;   /* set by the driver around zercheck_ir's throwaway
+                                 * convergence passes; the tracer hides them unless
+                                 * ZER_TRACE_CONVERGE is set */
+#define ZTRACE(fmt, ...) \
+    do { if (g_zer_trace) fprintf(stderr, "[trace] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* ================================================================
  * ZER-LANG Abstract Syntax Tree

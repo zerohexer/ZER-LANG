@@ -251,6 +251,11 @@ int main(int argc, char **argv) {
             emit_c = true;
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             emit_ir = true;
+        } else if (strcmp(argv[i], "--trace") == 0) {
+            g_zer_trace = 1;   /* print the compilation flow to stderr */
+        } else if (strcmp(argv[i], "--trace-calls") == 0) {
+            g_zer_trace = 1;
+            g_zer_trace_calls = 1;   /* full function call-graph (zerc-trace build) */
         } else if (strcmp(argv[i], "--lib") == 0) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
@@ -440,6 +445,7 @@ int main(int argc, char **argv) {
     Scanner scanner;
     scanner_init(&scanner, main_mod->source);
     Parser parser;
+    ZTRACE("=== PARSE ===");
     parser_init(&parser, &scanner, &cc.arena, input_path);
     parser.source = main_mod->source;
     main_mod->ast = parse_file(&parser);
@@ -503,6 +509,7 @@ int main(int argc, char **argv) {
 
     /* type check — register all modules in topological order */
     Checker checker;
+    ZTRACE("=== TYPECHECK ===");
     checker_init(&checker, &cc.arena, input_path);
     checker.source = main_mod->source;
     checker.no_strict_mmio = no_strict_mmio;
@@ -657,6 +664,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    ZTRACE("=== LOWER + EMIT ===");
     Emitter emitter;
     emitter_init(&emitter, out, &cc.arena, &checker);
     emitter.lib_mode = no_preamble;
@@ -708,8 +716,10 @@ int main(int argc, char **argv) {
      * analysis on the collected IRFuncs. Same IR pointers — no re-
      * lowering, no AST re-mutation. */
     if (zerc_ir_hook_count > 0) {
+        ZTRACE("=== SAFETY ===");
         /* Iterative FuncSummary build for mutual recursion convergence. */
         zc_ir.building_summary = true;
+        g_zer_in_converge = 1;   /* --trace-calls hides these throwaway passes */
         for (int pass = 0; pass < 16; pass++) {
             int sc_before = zc_ir.summary_count;
             for (int i = 0; i < zerc_ir_hook_count; i++) {
@@ -718,6 +728,7 @@ int main(int argc, char **argv) {
             if (pass > 0 && zc_ir.summary_count == sc_before) break;
         }
         zc_ir.building_summary = false;
+        g_zer_in_converge = 0;   /* the real reporting pass — show it in the trace */
 
         /* Main analysis pass — errors now recorded */
         for (int i = 0; i < zerc_ir_hook_count; i++) {

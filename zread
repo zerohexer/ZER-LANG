@@ -1,0 +1,27 @@
+#!/bin/sh
+# zread — human-readable compilation trace: the semantic anchors (no call graph),
+#         with the ACTUAL SOURCE LINE appended after each "@ line N", so you read
+#         what the compiler did right next to the code that caused it.
+#
+# Usage:  ./zread FILE.zer
+#   ZER_TRACE_STATES=1 ./zread FILE.zer    # also show handle-state lines
+#   ZREAD_EXPR=1        ./zread FILE.zer    # also show LOWER-EXPR (expression detail)
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$1"
+"$DIR/zerc" "$@" -o /dev/null --trace 2>&1 1>/dev/null \
+  | { if [ -n "$ZREAD_EXPR" ]; then cat; else grep -vE 'LOWER-EXPR'; fi; } \
+  | awk -v SRC="$SRC" '
+      BEGIN { n = 0; while ((getline l < SRC) > 0) src[++n] = l }
+      {
+        if (match($0, /@ ?line[ ]+[0-9]+/)) {
+          m = substr($0, RSTART, RLENGTH); num = m; gsub(/[^0-9]/, "", num); ln = num + 0
+          if (ln >= 1 && ln <= n && src[ln] !~ /^[ \t]*$/) {
+            s = src[ln]
+            sub(/[ \t]*\/\/.*$/, "", s)     # drop trailing // comment
+            gsub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
+            if (length(s) > 60) s = substr(s, 1, 57) "..."
+            printf "%-48s  <- %s\n", $0, s; next
+          }
+        }
+        print
+      }'

@@ -3,6 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Compilation-trace gates (see ast.h). Default off. --trace sets g_zer_trace;
+ * --trace-calls sets both (call-graph tracer lives in zer_trace.c). */
+int g_zer_trace = 0;
+int g_zer_trace_calls = 0;
+int g_zer_in_converge = 0;
+
 /* ================================================================
  * Arena allocator — bump allocator for AST nodes.
  * One big block. Allocate by bumping pointer. Free everything at once.

@@ -1330,6 +1330,8 @@ static Node *parse_block(Parser *p) {
         }
         Token before = p->current;
         stmts[count++] = parse_statement(p);
+        if (stmts[count-1]) ZTRACE("PARSE    stmt     %-12s @ line %d",
+            node_kind_name(stmts[count-1]->kind), stmts[count-1]->loc.line);
         /* safety: if parse_statement didn't advance, skip token to avoid infinite loop */
         if (p->current.start == before.start && p->current.type == before.type) {
             advance(p);
@@ -3136,6 +3138,8 @@ Node *parse_file(Parser *p) {
         p->panic_mode = false;
         Token before = p->current;
         decls[count++] = parse_declaration(p);
+        if (decls[count-1]) ZTRACE("PARSE  top-level  %-12s @ line %d",
+            node_kind_name(decls[count-1]->kind), decls[count-1]->loc.line);
         if (p->current.start == before.start && p->current.type == before.type) {
             advance(p);
         }

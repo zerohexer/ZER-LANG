@@ -34,6 +34,14 @@ If you find yourself proposing a change that would let a wrong program-consequen
 ---
 
 ## Pipeline Overview
+
+> **To watch this pipeline run on a real program, see [`docs/tracing.md`](tracing.md).**
+> `./zerc f.zer --trace` narrates every phase/unit (declaration → statement → expression
+> → instruction → handle-state) with the source line beside each step; `./zread f.zer`
+> is the same annotated with source and no call graph; `./ztrace f.zer` adds the full
+> function call graph. All gated, zero-cost when off. The best way to *see* the sections
+> below in motion instead of just reading about them.
+
 ```
 source.zer → Scanner (lexer.c) → Parser (parser.c) → AST (ast.h)
            → Checker (checker.c) → ZER-CHECK (zercheck.c)

@@ -4391,6 +4391,7 @@ static void emit_func_attributes(Emitter *e, Node *fn) {
 }
 
 static void emit_func_decl(Emitter *e, Node *node) {
+    ZTRACE("EMIT  function '%.*s'", (int)node->func_decl.name_len, node->func_decl.name);
 
     /* Function bodies are IR-only (no AST fallback). The AST emission
      * path drifted behind IR as features landed — silent fallback

@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-30 — Regression: nested by-value container emitted before its inner stamp (emitter.c)
+
+Self-follow-up to the same-day tie-the-knot container fix below. Tie-the-knot
+registers a container instance in `container_instances[]` BEFORE resolving its
+fields, so an OUTER stamp holding an INNER stamp BY VALUE
+(`container Outer(T){ Inner(T) x; }`) landed ahead of the inner in creation
+order; `emit_container_structs` emitted in that order → GCC `field 'x' has
+incomplete type` (a valid-ZER → broken-C miscompile). Nested-as-type-arg
+(`Box(Box(u32))`) was unaffected (arg resolves inner-first). Fix:
+`emit_container_structs` emits via DFS post-order (`emit_one_container_struct`),
+forcing any stamped container held by value (bare field or array-of-struct
+field; pointer/optional/slice impose no ordering) to be emitted before its user.
+Kind tests use `type_dispatch_kind` (audit clean). Found by the comptime/container
+audit agent. Test: `tests/zer/container_nested_byvalue.zer`. make check green.
+
+Also this session (documented OPEN in docs/limitations.md, not fixed — both
+verified real): (1) 🔴 accept-unsafe **block-scoped `defer free/consume` UAF** —
+zercheck applies defer free/move effects only at function-exit (Phase C3) while
+the emitter fires block-scoped defers at block exit, so a use after the block but
+before return is a silently-accepted UAF/use-after-move; the naive forward-pass
+fix trips `ir_defer_scan_frees`'s `free_line != defer_line` double-free guard, so
+it needs Phase-C3 coordination (full analysis in limitations.md). (2) loud
+over-rejection: `container W(T){ Handle(T) h; }` drops the T substitution.
+
 ## 2026-07-30 — Audit sweep: 3 accept-unsafe soundness holes + 1 over-rejection (checker.c)
 
 Multi-agent + hands-on audit. Four independent fixes, each with a regression

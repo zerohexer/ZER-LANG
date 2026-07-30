@@ -675,6 +675,87 @@ Main still has the flaky version.
 
 ---
 
+## OPEN — 🔴 ACCEPT-UNSAFE: block-scoped `defer free/consume` UAF/use-after-move missed by zercheck (2026-07-30)
+
+**Severity: soundness hole (shipped use-after-free / use-after-move).** Found by
+the async/move/defer audit agent, verified by hand.
+
+**Symptom:** a `defer free(p)` (or `defer consume(m)` for a move struct) declared
+inside a NESTED block (`{}`, if-body, for/while-body, switch-arm) frees/moves the
+value at BLOCK EXIT (the intended ZER semantics — see `tests/zer/defer_scoped_blocks.zer`,
+BUG-544/556/557), and the emitter emits the free at the inner block's close. But a
+USE of that value AFTER the block but BEFORE the function returns is silently
+accepted — a use-after-free / use-after-move.
+
+**Repro (observable corruption, exit 0 = accepted):**
+```zer
+struct Node { u32 val; }
+u32 f() {
+    ?*Node mp = alloc(Node);
+    *Node p = mp orelse { return 0; };
+    p.val = 111;
+    { defer free(p); p.val = 222; }   // p freed HERE (inner-block exit)
+    ?*Node mq = alloc(Node);          // reuses the freed slot
+    *Node q = mq orelse { return 0; };
+    q.val = 999;
+    u32 r = p.val;                    // UAF read — accepted; reads 999
+    free(q);
+    return r;
+}
+u32 main() { return f(); }            // returns 231 = 999 mod 256 (slot aliased)
+```
+Move variant (`Tok a; { defer consume(a); } return a.k;`) is accepted the same way.
+
+**Root cause (emitter/zercheck semantic mismatch):**
+- `ir_lower.c` emits a block-scoped `IR_DEFER_FIRE` at each enclosing block's exit;
+  `IR_DEFER_FIRE.defer_fire_bodies[]` holds the bodies that fire there. The emitter
+  frees at that point (correct — block-scope is the intended semantics).
+- `zercheck_ir.c` forward pass (~line 4955) treats `IR_DEFER_FIRE` as a NO-OP — it
+  never applies the fired body's free/move effect at the block boundary.
+- Phase C3 (`zercheck_ir.c` ~5658-5718) applies defer bodies' frees/uses ONLY at
+  `IR_RETURN` blocks (function-exit / Go semantics, "Matches zercheck.c
+  defer_scan_all_frees at function exit"). So the analyzer only "knows" the free at
+  function exit, missing the mid-function use.
+
+Non-defer `free(p)` in the same inner block IS caught, so the gap is defer-specific.
+Function-level `defer free(p); return p.val;` remains CORRECT (fires after the use).
+
+**Why the obvious fix is not trivial (the trap):** applying the fired body's free at
+the `IR_DEFER_FIRE` point in the forward pass (using `defer_fire_bodies[]`) closes the
+UAF, BUT `ir_defer_scan_frees` (zercheck_ir.c:1987) has a double-free detector guarded
+on `free_line != defer_line`. Phase C3 ALSO applies every defer body at each return
+block. If the forward pass applies a block-scoped defer's free at the FIRE line and
+Phase C3 re-applies the SAME body at the return with the registration line, the two
+differing lines trip a FALSE "double free" report. So a correct fix must coordinate the
+two application points: either (a) make the forward pass handle ALL `IR_DEFER_FIRE`
+(uses+frees) and make Phase C3 skip defers whose FIRE was already processed before the
+return (avoiding re-application), or (b) tag each defer as block-scoped vs function-scoped
+and only forward-apply the block-scoped ones while Phase C3 keeps the function-scoped
+frees for leak detection. Must also handle the `defer_fire_guard_flag` conditional-fire
+case (defer-goto) as MAYBE_FREED, not unconditional FREED, to avoid over-rejecting the
+goto path. ~25 defer tests (`tests/zer/defer_*`, `async_defer_*`, `goto_defer*`) plus the
+LIFO use-ordering (AU-1) are the regression surface.
+
+**Fix sketch:** forward-pass `IR_DEFER_FIRE` handler that, for each
+`defer_fire_bodies[fb]` (LIFO), calls `ir_defer_scan_uses` then `ir_defer_scan_frees`
+against the current path state, with Phase C3 adjusted to not double-apply (option a/b
+above) and guarded fires downgraded to MAYBE_FREED. A tripwire negative test
+(`tests/zer_fail/defer_block_scope_uaf.zer`) is ready to add once the fix lands (it is
+NOT added yet because the compiler currently ACCEPTS it — adding it now would fail
+`make check`). Repro saved in this entry.
+
+## OPEN — container field of `Handle(T)`/`Pool(T)`/`Ring(T)`/`Slab(T)` drops the T substitution (2026-07-30) (loud over-rejection, NOT a soundness hole)
+
+Found by the comptime/container audit agent. `subst_typenode` (checker.c ~2158-2219)
+treats `TYNODE_HANDLE`/`POOL`/`RING`/`SLAB` as leaves and does NOT recurse into their
+`.elem` type, so `container W(T) { Handle(T) h; }` fails to substitute `T` and produces
+a LOUD `error: undefined type 'T'` at the template line. This is an incomplete-
+substitution limitation (fails loudly, no silent miscompile) — the documented
+`T`/`*T`/`?T`/`[*]T`/`T[N]` shapes substitute correctly. Fix: recurse into
+`.elem`/`.inner` for the HANDLE/POOL/RING/SLAB TypeNode kinds in `subst_typenode`.
+
+---
+
 ## OPEN — type-erasure / safe `void*` (generic `*opaque` container over-rejected) (2026-07-16) (over-rejection, NOT a soundness hole)
 
 **Symptom:** a GLib-`GHashTable`-style generic container that stores `*opaque` VALUES and returns

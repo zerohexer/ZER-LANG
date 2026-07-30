@@ -5,6 +5,71 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-30 — Audit sweep: 3 accept-unsafe soundness holes + 1 over-rejection (checker.c)
+
+Multi-agent + hands-on audit. Four independent fixes, each with a regression
+test running in `make check`; sink matrix grown 44→48 cells (all clean); type-
+dispatch audit clean (new kind reads use `type_dispatch_kind`).
+
+**HOLE 1 — `?*T`/`?[*]T` stack local to a fire-and-forget `spawn` (cross-thread UAF).**
+The spawn-arg lifetime/data-race dispatch computed `is_ptr_like` from
+`eff->kind` (distinct-unwrapped only). A `?*Work wp = &local; spawn worker(wp);`
+has `eff->kind == TYPE_OPTIONAL`, so the raw pointer kind was HIDDEN and the
+"pointer to a stack local to a fire-and-forget spawn" check was skipped — the
+thread outlived the frame with a dangling pointer, compiled clean. The
+documented "?T optional wrapper hiding the inner kind" class, at the spawn-arg
+sink. **Fix:** unwrap one optional level into `eff_pl` before the pointer-like /
+shared-carrier / struct-carrier dispatch (checker.c NODE_SPAWN arg loop). The
+stack-derived detection already operates on the argument EXPRESSION, so it fires
+once the kind reaches the check; a pure-value optional (`?u32`) is not
+pointer/struct-like so nothing is over-rejected (verified:
+`tests/zer/spawn_optional_arg_coercion` still passes, sink-matrix
+`safe_spawn_opt_shared` compiles). Test: `tests/zer_fail/spawn_optional_ptr_uaf.zer`
++ sink cell `p14__spawn_opt_ptr_local`.
+
+**HOLE 2 — `@inttoptr(@ptrtoint(&local))` laundered DIRECT return (dangling pointer).**
+`return @inttoptr(*u32, @ptrtoint(&loc))` (and its local-derived-var form)
+returned a stack address. The return-escape walk's intrinsic whitelist covered
+only `ptrcast`/`bitcast`/`cast` and its unwrap gate required
+`ret_type->kind == TYPE_POINTER` — so `@inttoptr`/`@ptrtoint` were never
+inspected AND the `?*u32` (optional) return type skipped the check entirely
+(the ?T-hides-inner-kind class again). Every OTHER sink (store-global, keep,
+struct-field, return-struct) already rejected the launder; only the bare direct
+return missed it. GCC's own `-Wreturn-local-addr` flagged the emitted C. **Fix:**
+in the general return-escape block, unwrap a CHAIN of pointer-laundering
+intrinsics (add `inttoptr`/`ptrtoint`, guarded ≤8) down to the underlying
+`&expr`/ident, and accept an optional-wrapped pointer return; the existing
+`&local`/region check then fires. No over-rejection: `@inttoptr(const_addr)` /
+`@inttoptr(param)` still compile (sink `safe_return_inttoptr_param`). Test:
+`tests/zer_fail/return_inttoptr_local_escape.zer` + sink cell
+`p15__return_inttoptr_local`.
+
+**HOLE 3 — optional-capture `if (o) |v| { ... }` skipped the VRP join (silent fixed-array OOB).**
+The optional-capture branch of `NODE_IF` `break`s BEFORE reaching the regular-if
+`vrp_snap_take`/`restore`/`join` machinery. An in-place range narrowing inside
+the capture body (`if (m) |v| { idx = wild % 4; }`) leaked past the merge, so a
+later fixed-array `buf[idx]` was proven safe against the narrowed range on the
+path where the capture body never ran — the bounds guard was elided → silent OOB
+write (ASan-confirmed; fixed arrays have no runtime length once the guard is
+gone). **Fix:** wrap the capture-if `then`/`else` in the same snapshot/restore/
+join used by the regular-if non-comparison path 240 lines below (and by the
+switch handler). Test: `tests/zer_trap/vrp_capture_if_range_leak.zer` (now traps
+"array index out of bounds" instead of leaking).
+
+**OVER-REJECTION — self-referential POINTER container (the canonical linked list) rejected.**
+`container LNode(T) { T val; ?*LNode(T) next; }` (a linked list) was spuriously
+rejected as a type collision. Root cause: the container instance cache was
+populated AFTER field resolution, so the self-referential `?*LNode(u32)` field
+re-entered the stamp path, missed the not-yet-cached instance, and tripped the
+"collides with an existing user-defined type" check against the `add_symbol` from
+the outer stamp. **Fix:** "tie the knot" — register the instance cache BEFORE
+resolving fields (so a self-reference resolves to the in-progress stamp) + add a
+by-value self-containment guard in the field loop so an infinite by-value
+self-reference still gets a clean ZER error (not a GCC incomplete-type error).
+Pointer/optional/slice self-references are finite and now compile. Tests:
+`tests/zer/container_self_ref_pointer.zer` (functional linked list),
+`tests/zer_fail/container_by_value_self.zer` (by-value still rejected).
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

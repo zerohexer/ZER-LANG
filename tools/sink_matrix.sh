@@ -115,6 +115,18 @@ echo "===== SHAPE p13 = return a u8[N] array PARAM as a slice (BUG-764-class rel
 # rejects a caller that passes a LOCAL and lets the result escape to a global.
 cell p13__return_param_arr_escape reject '?[*]u8 g13; ?[*]u8 rf(u8[4] a){ return a; } void c(){ u8[4] x; g13 = rf(x); } u32 main(){return 0;}'
 
+echo "===== SHAPE p14 = spawn of an OPTIONAL-wrapped ptr/slice to a LOCAL ====="
+# "?T hides inner kind" at the spawn-arg sink (2026-07-30): a ?*T / ?[*]T stack
+# local laundered through an optional evaded the fire-and-forget cross-thread
+# UAF check — is_ptr_like tested eff->kind without unwrapping TYPE_OPTIONAL.
+cell p14__spawn_opt_ptr_local reject 'struct SW { u32 x; } void wk(?*SW w) {} void c() { SW loc; ?*SW wp = &loc; spawn wk(wp); } u32 main(){return 0;}'
+
+echo "===== SHAPE p15 = @inttoptr(@ptrtoint(&local)) laundered DIRECT return ====="
+# A stack-local address laundered through @ptrtoint -> @inttoptr and returned
+# directly dangled — the return-escape intrinsic whitelist omitted inttoptr/
+# ptrtoint and its pointer gate skipped the ?*T (optional) return type.
+cell p15__return_inttoptr_local reject 'mmio 0x0..0xFFFFFFFFFFFFFFFF; ?*u32 leak(){ u32 loc; return @inttoptr(*u32, @ptrtoint(&loc)); } u32 main(){return 0;}'
+
 echo "===== SAFE baselines (MUST compile — over-reject guards) ====="
 # p13 accept side: returning a param array as a slice, result used locally (does
 # not escape the caller frame) — must compile (the relaxation).
@@ -128,6 +140,8 @@ cell safe_param_subslice compile '[*]u32 c([*]u32 p) { return p[0..2]; } u32 mai
 cell safe_ring_value    compile 'struct VM { u32 a; } Ring(VM, 4) g_vx; void c() { VM m; m.a = 1; g_vx.push(m); } u32 main(){return 0;}'
 cell safe_arena_local   compile 'struct AB { u32 v; } u32 rv(*AB b){return b.v;} void c() { u8[512] bk; Arena ar = Arena.over(bk); *AB b = ar.alloc(AB) orelse return; b.v = rv(b); } u32 main(){return 0;}'
 cell safe_spawn_value   compile 'struct SV { u32 a; } void wk(SV m) { } void c() { SV m; m.a = 1; spawn wk(m); } u32 main(){return 0;}'
+cell safe_spawn_opt_shared compile 'shared struct SS { u32 x; } SS g_ss; void wks(?*SS w) {} void c() { ?*SS wp = &g_ss; spawn wks(wp); } u32 main(){return 0;}'
+cell safe_return_inttoptr_param compile 'mmio 0x0..0xFFFFFFFFFFFFFFFF; *u32 thru(usize a){ return @inttoptr(*u32, a); } u32 main(){return 0;}'
 cell safe_scalar_copy   compile 'void c() { L loc; loc.f = 5; u32 v = loc.f; g_p = null; if (v == 5) { return; } } u32 main(){return 0;}'
 cell safe_alive_subslice compile 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; s[0]=1; u8 v=s[0]; free(b); if (v != 1) { return 1; } return 0; }'
 

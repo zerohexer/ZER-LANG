@@ -1,0 +1,19 @@
+// Audit 2026-07-30: a range narrowed inside an optional-CAPTURE if body
+// (`if (m) |v| { idx = wild % 4; }`) leaked past the join — the capture-if
+// path broke out before reaching the regular-if vrp_snap restore/join, so
+// idx was proven [0,3] on the path where the capture body never ran, and the
+// slice bounds check was elided -> silent OOB read.
+// Fix: the optional-capture if path now snapshots/restores/joins VRP like the
+// regular if and switch handlers.
+// Expected: SIGTRAP "array index out of bounds" at runtime.
+u32 f(u32 wild) {
+    [*]u32 arr = alloc(u32, 4) orelse { return 0; };
+    u32 idx = wild % 256;
+    ?u32 m;
+    if (m) |v| { idx = wild % 4; }
+    arr[idx] = 7;
+    u32 v = arr[idx];
+    free(arr);
+    return v;
+}
+u32 main() { return f(100); }

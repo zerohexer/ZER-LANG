@@ -2588,6 +2588,35 @@ the pattern used in real projects shipping production firmware.
 **Tracking:** when the asm-test migration lands, re-enable the
 attribute in `emit_func_attributes` (emitter.c) and remove this entry.
 
+**Re-confirmed still live 2026-07-30** (audit sweep). `emit_func_attributes`
+(emitter.c ~4387) still has the disabled `naked` branch; a `naked void reset()`
+emits plain `void reset(void)` and GCC injects `endbr64; pushq %rbp; movq %rsp,%rbp`.
+The companion rule #2 (ban `return expr;` in naked) is also still unimplemented
+(`return 42;` in a naked function compiles). The non-asm-statement ban DOES fire
+on the IR path, so only the attribute emission + the `return expr` rule remain.
+Deferral rationale above is unchanged — still a user-visible breaking change
+gated on the asm-test migration, not touched in this audit.
+
+## OPEN — `?T` optional-wrapper hiding the inner kind: durable class-kill still unbuilt (2 more instances closed 2026-07-30)
+
+The recurring "a safety dispatch tests `t->kind == TYPE_{POINTER,SLICE,STRUCT}`
+on a value whose static type is actually `?T` (TYPE_OPTIONAL wrapping that kind),
+so the check silently no-ops" class (CLAUDE.md multi-site table, "NO gate yet").
+Two more accept-unsafe instances were found and fixed 2026-07-30 (see
+BUGS-FIXED.md 2026-07-30):
+- spawn-arg cross-thread-UAF sink (`?*T`/`?[*]T` stack local to fire-and-forget
+  spawn) — fixed by unwrapping one optional level into `eff_pl`.
+- return-escape sink (`?*u32 leak(){ return @inttoptr(*u32, @ptrtoint(&local)); }`)
+  — the `ret_type->kind == TYPE_POINTER` gate skipped the whole check for the
+  optional return; fixed by unwrapping the optional return type.
+
+**Durable fix not yet built:** an `optional_dispatch_kind()` helper (the
+`type_dispatch_kind` analog that ALSO unwraps one `?` level), or a systematic
+sweep of every `->kind == TYPE_{POINTER,SLICE}` safety dispatch to unwrap
+`?T`. Until then each new sink must manually unwrap the optional. The sink
+matrix now has cells `p14__spawn_opt_ptr_local` and `p15__return_inttoptr_local`
+so these two shapes can't silently regress, but the class as a whole has no gate.
+
 ---
 
 ## FIXED (incidentally, 2026-07-01 — verified, was stale OPEN entry) — defer body uses a handle the function body then frees → silent UAF (2026-06-15)

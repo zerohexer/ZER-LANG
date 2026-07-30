@@ -2616,6 +2616,28 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         /* Register in scope so field access works */
         add_symbol(c, mname, (uint32_t)mlen, st, tn->loc.line);
 
+        /* Cache the instance BEFORE resolving fields — "tie the knot" so a
+         * self-referential field (the canonical linked list `?*Node(T) next`)
+         * resolves to THIS in-progress stamp instead of re-entering the stamp
+         * path, missing the not-yet-cached instance, and tripping the
+         * collision check above (over-rejection fixed 2026-07-30). A by-value
+         * self-reference is still rejected below, so tying the knot does not
+         * admit an infinite-size struct. */
+        if (c->container_inst_count >= c->container_inst_capacity) {
+            int nc = c->container_inst_capacity < 8 ? 8 : c->container_inst_capacity * 2;
+            struct ContainerInstance *na = (struct ContainerInstance *)arena_alloc(c->arena,
+                nc * sizeof(struct ContainerInstance));
+            if (c->container_instances && c->container_inst_count > 0)
+                memcpy(na, c->container_instances, c->container_inst_count * sizeof(struct ContainerInstance));
+            c->container_instances = na;
+            c->container_inst_capacity = nc;
+        }
+        struct ContainerInstance *ci = &c->container_instances[c->container_inst_count++];
+        ci->tmpl_name = cname;
+        ci->tmpl_name_len = cnlen;
+        ci->concrete_type = concrete;
+        ci->stamped_struct = st;
+
         /* Resolve fields with T substituted */
         if (tmpl->field_count > 0) {
             st->struct_type.fields = (SField *)arena_alloc(c->arena,
@@ -2632,26 +2654,28 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                  * Handles: T, *T, ?T, []T, T[N], ?*Container(T), etc. */
                 sf->type = resolve_type(c, subst_typenode(c->arena, fd->type,
                     tmpl->type_param, tmpl->type_param_len, tn->container.type_arg));
+                /* By-value self-containment guard (mirrors the NODE_STRUCT_DECL
+                 * check): a field that is the in-progress stamp BY VALUE (bare
+                 * or wrapped only in arrays / distinct) is an infinite-size
+                 * struct. Pointer / optional-pointer / slice self-references
+                 * (TYPE_POINTER/OPTIONAL/SLICE wrapping st) are finite and pass. */
+                {
+                    Type *inner = sf->type;
+                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+                    inner = type_unwrap_distinct(inner);
+                    if (inner == st) {
+                        checker_error(c, tn->loc.line,
+                            "container '%.*s(%s)' cannot contain itself by value "
+                            "in field '%.*s' — use '*%.*s(%s)' (pointer) instead",
+                            (int)cnlen, cname, ctype_name,
+                            (int)sf->name_len, sf->name,
+                            (int)cnlen, cname, ctype_name);
+                    }
+                }
             }
         } else {
             st->struct_type.fields = NULL;
         }
-
-        /* Cache the instance */
-        if (c->container_inst_count >= c->container_inst_capacity) {
-            int nc = c->container_inst_capacity < 8 ? 8 : c->container_inst_capacity * 2;
-            struct ContainerInstance *na = (struct ContainerInstance *)arena_alloc(c->arena,
-                nc * sizeof(struct ContainerInstance));
-            if (c->container_instances && c->container_inst_count > 0)
-                memcpy(na, c->container_instances, c->container_inst_count * sizeof(struct ContainerInstance));
-            c->container_instances = na;
-            c->container_inst_capacity = nc;
-        }
-        struct ContainerInstance *ci = &c->container_instances[c->container_inst_count++];
-        ci->tmpl_name = cname;
-        ci->tmpl_name_len = cnlen;
-        ci->concrete_type = concrete;
-        ci->stamped_struct = st;
 
         _container_depth--;
         return st;
@@ -11299,11 +11323,29 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
+                /* VRP JOIN for the optional-capture path (2026-07-30): the
+                 * capture body can narrow an OUTER var's range in place
+                 * (`if (m) |v| { idx = wild % 4; }`). Without a snapshot/join
+                 * that narrowing leaked past the merge and a later fixed-array
+                 * index was proven safe against the narrowed range on the path
+                 * where the capture body never ran — a silent OOB (no runtime
+                 * length on a fixed array once the guard is elided). Mirror the
+                 * regular-if non-comparison join below. */
+                int cap_saved = c->var_range_count;
+                struct VarRange *cap_pre = vrp_snap_take(c, cap_saved);
                 check_stmt(c, node->if_stmt.then_body);
                 pop_scope(c);
-
-                if (node->if_stmt.else_body)
+                c->var_range_count = cap_saved;
+                struct VarRange *cap_thenv = vrp_snap_take(c, cap_saved);
+                vrp_snap_restore(c, cap_pre, cap_saved);  /* reset for else / fallthrough */
+                if (node->if_stmt.else_body) {
                     check_stmt(c, node->if_stmt.else_body);
+                    c->var_range_count = cap_saved;
+                }
+                /* entries hold else-result (or pre on fallthrough); union with then */
+                vrp_snap_join(c, cap_thenv, cap_saved);
+                free(cap_pre);
+                free(cap_thenv);
                 break;
             }
         }
@@ -12328,17 +12370,36 @@ static void check_stmt(Checker *c, Node *node) {
                 for (int ri = 0; ri < root_count; ri++) {
                     Node *root = roots[ri];
                     /* BUG-317: walk into @ptrcast/@bitcast in orelse fallback.
-                     * Only when return type is pointer — value bitcasts are safe. */
-                    if (root && root->kind == NODE_INTRINSIC &&
-                        ret_type && ret_type->kind == TYPE_POINTER) {
-                        const char *iname = root->intrinsic.name;
-                        uint32_t ilen = (uint32_t)root->intrinsic.name_len;
-                        /* BUG-351: @cast also needs escape check */
-                        bool is_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
-                                       (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
-                                       (ilen == 4 && memcmp(iname, "cast", 4) == 0);
-                        if (is_cast && root->intrinsic.arg_count > 0)
-                            root = root->intrinsic.args[root->intrinsic.arg_count - 1];
+                     * Only when the return carries a pointer — value bitcasts
+                     * are safe. 2026-07-30: (a) accept an OPTIONAL-wrapped
+                     * pointer return (`?*T`) — the raw TYPE_POINTER gate skipped
+                     * the whole check for `?*u32 leak()` (the "?T hides inner
+                     * kind" class); (b) unwrap a CHAIN of pointer-laundering
+                     * intrinsics including @inttoptr / @ptrtoint, so a
+                     * `return @inttoptr(*T, @ptrtoint(&local))` (inline) and its
+                     * local-derived-var form reach the &expr / region escape
+                     * check below. Both previously compiled and returned a
+                     * dangling stack pointer (GCC -Wreturn-local-addr). */
+                    {
+                        Type *rt_uw = ret_type ? type_unwrap_distinct(ret_type) : NULL;
+                        if (type_dispatch_kind(rt_uw) == TYPE_OPTIONAL)
+                            rt_uw = type_unwrap_distinct(rt_uw->optional.inner);
+                        bool ret_carries_ptr = (type_dispatch_kind(rt_uw) == TYPE_POINTER);
+                        int _uw_guard = 0;
+                        while (ret_carries_ptr && root && root->kind == NODE_INTRINSIC &&
+                               _uw_guard++ < 8) {
+                            const char *iname = root->intrinsic.name;
+                            uint32_t ilen = (uint32_t)root->intrinsic.name_len;
+                            /* BUG-351: @cast also needs escape check */
+                            bool is_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
+                                           (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
+                                           (ilen == 4 && memcmp(iname, "cast", 4) == 0) ||
+                                           (ilen == 8 && memcmp(iname, "inttoptr", 8) == 0) ||
+                                           (ilen == 8 && memcmp(iname, "ptrtoint", 8) == 0);
+                            if (is_cast && root->intrinsic.arg_count > 0)
+                                root = root->intrinsic.args[root->intrinsic.arg_count - 1];
+                            else break;
+                        }
                     }
                     /* BUG-317: walk into &expr in orelse fallback */
                     if (root && root->kind == NODE_UNARY && root->unary.op == TOK_AMP) {
@@ -13831,6 +13892,23 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
             Type *eff = type_unwrap_distinct(arg_type);
+            /* Unwrap a single optional level for the lifetime / data-race
+             * dispatch below (2026-07-30). A `?*T` / `?[*]T` / `?Struct` arg is
+             * a TYPE_OPTIONAL wrapper, so the raw pointer/slice/struct kind was
+             * HIDDEN and the fire-and-forget cross-thread-UAF check was skipped
+             * — a stack-local pointer laundered through an optional
+             * (`?*Work wp = &local; spawn worker(wp);`) compiled clean and
+             * dangled once the frame returned. This is the documented "?T
+             * optional wrapper hiding the inner kind" class at the spawn-arg
+             * sink. The stack-derived detection operates on the argument
+             * EXPRESSION (the symbol's local-derived flag), so it already fires
+             * once the kind reaches the check; only the kind test needed the
+             * unwrap. A pure-value optional (?u32) is not pointer/struct-like,
+             * so nothing is over-rejected. */
+            Type *eff_pl = eff;
+            if (type_dispatch_kind(eff_pl) == TYPE_OPTIONAL)
+                eff_pl = type_unwrap_distinct(eff_pl->optional.inner);
+            if (!eff_pl) eff_pl = eff;
             /* Ptr-like args (pointer / slice / *opaque): a fire-and-forget
              * spawn requires a SYNCHRONIZED carrier (pointer to a shared
              * struct) whose lifetime OUTLIVES the thread (not a stack local);
@@ -13841,13 +13919,13 @@ static void check_stmt(Checker *c, Node *node) {
              * lifetime arm — `*shared T` to a stack local was accepted with no
              * check). See proofs/operational/lambda_zer_concurrency:
              * stack_not_publishable (lifetime) + is_shared (reach/discipline). */
-            bool is_ptr_like = (eff->kind == TYPE_POINTER ||
-                                eff->kind == TYPE_SLICE ||
-                                eff->kind == TYPE_OPAQUE);
+            bool is_ptr_like = (type_dispatch_kind(eff_pl) == TYPE_POINTER ||
+                                type_dispatch_kind(eff_pl) == TYPE_SLICE ||
+                                type_dispatch_kind(eff_pl) == TYPE_OPAQUE);
             if (is_ptr_like) {
                 bool shared_carrier = false;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                if (type_dispatch_kind(eff_pl) == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff_pl->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT &&
                         inner->struct_type.is_shared)
                         shared_carrier = true;
@@ -13883,7 +13961,8 @@ static void check_stmt(Checker *c, Node *node) {
              * it is not over-rejected. Scoped spawns are exempt (join bounds the
              * lifetime). */
             else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+                     (type_dispatch_kind(eff_pl) == TYPE_STRUCT ||
+                      type_dispatch_kind(eff_pl) == TYPE_UNION) &&
                      spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
                 checker_error(c, node->loc.line,
                     "spawn argument %d: cannot pass a by-value struct/union that "

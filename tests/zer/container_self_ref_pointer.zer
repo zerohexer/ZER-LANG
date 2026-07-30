@@ -1,0 +1,18 @@
+// Over-rejection fixed 2026-07-30: a self-referential POINTER container (the
+// canonical linked list) was spuriously rejected as a type collision because
+// the instance cache was populated AFTER field resolution, so the ?*Node(T)
+// field re-entered the stamp and tripped the collision check. Fix: tie the
+// knot (cache before fields) + keep a by-value self-containment guard.
+u32 printf(const *u8 fmt, ...);
+container LNode(T) { T val; ?*LNode(T) next; }
+u32 main() {
+    LNode(u32) a; LNode(u32) b;
+    a.val = 10; b.val = 20; a.next = &b;
+    u32 s = 0;
+    ?*LNode(u32) cur = &a;
+    for (u32 i = 0; i < 2; i += 1) {
+        if (cur) |n| { s += n.val; cur = n.next; }
+    }
+    if (s != 30) { return 1; }
+    return 0;
+}

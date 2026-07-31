@@ -1,0 +1,15 @@
+// Regression: loop-carried index mutated via &i passed to a call must NOT keep a
+// stale narrow VRP range (silent stack OOB). HOLE-A, 2026-07-31 audit.
+// With the fix: the auto-guard fires when i escapes [0,4) and returns 0.
+// Without the fix: buf[i] is wrongly proven in-bounds, the loop runs to
+// completion, and control reaches `return 42` (a silent OOB happened) -> exit 42.
+void bump(*u32 p) { *p = *p + 4; }
+u32 main() {
+    u8[4] buf;
+    u32 i = 0;
+    for (u32 k = 0; k < 6; k += 1) {
+        buf[i] = 99;
+        bump(&i);
+    }
+    return 42;
+}

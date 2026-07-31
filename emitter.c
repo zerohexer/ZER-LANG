@@ -324,6 +324,45 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
  * into NODE_INDEX.object but not NODE_INDEX.index, so `arr[fn()] <<= n`
  * silently evaluated `fn()` twice (BUG: indexed compound side-effect).
  */
+/* A field-access object needs C parentheses when its emitted form binds LOOSER
+ * than the postfix `.`/`->` operator, else `(*p).f` mis-emits as `*p.f` = C
+ * `*(p.f)` (uncompilable / wrong precedence). Miscompile found in the 2026-07-31
+ * audit: valid ZER `(*p).field` / `((T)x).field` / `(a orelse b).field` produced
+ * uncompilable C. Prefix-unary (`*`,`&`,`-`,`!`,`~`), casts, binary, and orelse
+ * all bind looser than the postfix accessor; primaries (ident/field/index/call/
+ * literals/intrinsic-calls) do not. Over-parenthesizing a primary is harmless, so
+ * default to false only for the known-tight kinds. */
+static bool field_obj_needs_parens(Node *obj) {
+    if (!obj) return false;
+    switch (obj->kind) {
+    /* Bind LOOSER than the postfix `.`/`->` accessor → need parentheses. */
+    case NODE_UNARY: case NODE_BINARY: case NODE_TYPECAST:
+    case NODE_CAST: case NODE_ORELSE:
+        return true;
+    /* Primaries / postfix / statements: bind at least as tight, or never appear
+     * as a field object. No-default (walker_default_audit + -Werror=switch): a
+     * new NodeKind forces a decision here. If a future kind is a looser-binding
+     * EXPRESSION, add it to the `true` set above. */
+    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX: case NODE_CALL:
+    case NODE_INTRINSIC: case NODE_SLICE: case NODE_STRUCT_INIT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_SIZEOF: case NODE_ASSIGN:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_DEFER: case NODE_CRITICAL: case NODE_ONCE: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_SPAWN: case NODE_VAR_DECL: case NODE_ASM:
+    case NODE_STATIC_ASSERT: case NODE_FILE: case NODE_FUNC_DECL:
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_CONTAINER_DECL:
+        return false;
+    }
+    return false;
+}
+
 static bool expr_has_side_effects(Node *n) {
     if (!n) return false;
     switch (n->kind) {
@@ -2426,7 +2465,12 @@ static void emit_expr(Emitter *e, Node *node) {
 
         /* check if object is a pointer → use -> instead of .
          * BUG-410: unwrap distinct — distinct typedef *T still uses -> */
-        emit_expr(e, node->field.object);
+        {
+            bool fp = field_obj_needs_parens(node->field.object);
+            if (fp) emit(e, "(");
+            emit_expr(e, node->field.object);
+            if (fp) emit(e, ")");
+        }
         if (obj_eff && obj_eff->kind == TYPE_POINTER) {
             emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
         } else {
@@ -6518,7 +6562,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     }
                 }
             }
-            emit_rewritten_node(e, node->field.object, func);
+            {
+                bool fp = field_obj_needs_parens(node->field.object);
+                if (fp) emit(e, "(");
+                emit_rewritten_node(e, node->field.object, func);
+                if (fp) emit(e, ")");
+            }
             emit(e, "%s%.*s", acc, (int)node->field.field_name_len, node->field.field_name);
         }
         return;

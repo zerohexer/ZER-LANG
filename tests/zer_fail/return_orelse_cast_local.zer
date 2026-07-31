@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// HOLE-B sibling (2026-07-31 audit): `return maybe orelse @cast(distinct-slice,
+// local)` — the orelse-fallback cast-unwrap gate was TYPE_POINTER-only, so a
+// distinct-slice return type skipped the unwrap and the local-derived root was
+// never checked (silent dangling-slice escape on the null-fallback path).
+distinct typedef [*]u8 MySlice;
+MySlice get(?MySlice maybe) {
+    u8[8] buf;
+    buf[0] = 5;
+    [*]u8 s = buf;
+    return maybe orelse @cast(MySlice, s);
+}
+u32 main() { return 0; }

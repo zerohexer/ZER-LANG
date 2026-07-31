@@ -318,6 +318,68 @@ that regresses any cell fails `make check`.
 
 ---
 
+## OPEN — 2026-07-31 audit: findings NOT yet fixed (3 core soundness holes + 1 miscompile were fixed this session — see BUGS-FIXED.md 2026-07-31)
+
+A multi-agent + hand audit closed HOLE-A (loop `&i`→call VRP OOB), HOLE-B (return-cast
+dangling slice/pointer, 2 sites), and the `(*p).field` emit miscompile (all in BUGS-FIXED.md).
+The following surfaced in the same sweep and are DEFERRED with rationale:
+
+### OPEN — HOLE-D: spawn target reaches a non-shared global through a RETURNED/local funcptr (data race, LOW-MEDIUM)
+Reproducer (genuine unsynchronized race, compiles clean with only a stack-depth *warning*):
+```zer
+u32 g_counter = 0;
+void touch() { for (u32 i=0;i<2000000;i+=1){ g_counter = g_counter + 1; } }
+*() get_fp() { return touch; }
+void worker() { *() fp = get_fp(); fp(); }   // indirect call — scanner gives up
+u32 main() { spawn worker(); for (u32 i=0;i<2000000;i+=1){ g_counter=g_counter+1; } return g_counter; }
+```
+Root cause: `scan_unsafe_global_access` (checker.c ~10203-10264) follows only calls whose callee
+is a named global function (and function-NAMES passed as args, BH-18 #8). A call through a funcptr
+obtained from a return value / local is unresolvable → the scanner gives up with only the
+stack-depth warning; the "spawn target touches non-shared global → data race" rule is bypassed.
+Direct `fp = touch; fp()`, a global funcptr, and a struct-field funcptr are all caught (the
+funcptr STORAGE is itself a flagged non-shared global). Only the returned/local funcptr leaks.
+Fix sketch: a spawn target (transitively) calling through an UNRESOLVABLE funcptr cannot be proven
+free of non-shared-global access → conservatively REJECT (the "can't-prove-safe ⇒ reject" barrier
+discipline). NOT done here because it risks broadly over-rejecting legitimate callback-in-thread
+patterns; the safe/ergonomic boundary is a design call for the user. Concurrency data-race is a
+partly-named floor and already tracked as an OPEN subsystem (see the concurrency section below).
+
+### OPEN — HOLE-C confirmed still open with a concrete trigger: cross-block scoped-borrow, join-in-branch (known)
+The documented cross-block scoped-borrow residual (see "Concurrency memory-safety" section) has a
+sharp trigger: `th.join()` inside a branch clears the per-Symbol `is_borrowed_by_thread` flag in
+AST-walk order, so an unguarded access on the OTHER (un-joined) path is not flagged:
+```zer
+void compute(*u32 p) { *p = 42; }
+u32 main() { u32 x=5; u32 cond=0; ThreadHandle th = spawn compute(&x);
+    if (cond>0) { th.join(); return 0; }
+    x = 99;         // reached with cond==0: thread NOT joined → concurrent write, RACE (compiles)
+    th.join(); return x; }
+```
+Proper fix is a zercheck_ir borrow-set CFG merge (like the `threads[]` merge) — subsystem-scale.
+Same-block / nested-if / loop-body / switch-arm / goto variants are all correctly caught.
+
+### OPEN — bit-extraction on a `volatile *u32` MMIO register is over-rejected (doc mismatch, NOT a soundness hole)
+The CLAUDE.md "Hardware Support" quick reference shows `volatile *u32 reg = @inttoptr(...); u32 bits
+= reg[9..8];` as bit-extraction, but `reg[hi..lo]` on a POINTER is parsed as a slice range
+(`start..end`) → `error: slice start (9) is greater than end (8)`. Bit-extraction only works on a
+scalar VALUE. Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either the docs should show
+the deref form, or `reg[hi..lo]` on a volatile scalar pointer should auto-deref for bit-extraction.
+
+### OPEN — struct-by-value return carrying a PARAM-view field is over-rejected (safe, conservative)
+`struct Sl { [*]u32 s; } Sl mk([*]u32 p) { Sl r; r.s = p[0..2]; return r; }` is rejected
+("return pointer to local 'r'") though safe — the struct copy carries a CALLER-memory view out.
+The bare-param-view relaxation (BUG-764) covers `return p[0..2];` but not a param view wrapped in
+a returned-by-value struct. Errs conservative (rejects) → no soundness threat.
+
+### OPEN — `vrp_ir.c` is fully dead code (debt, not a hole)
+`vrp_ir()` / `IRVRPResult` has ZERO callers and is not in the Makefile; all load-bearing
+bounds/division VRP is the AST VRP in checker.c (emitter reads `checker_is_proven`). The file is
+"FOUNDATION" infrastructure for a never-completed IR-VRP migration. Either wire it (the tracked
+"wire the orphaned vrp_ir.c" direction for bounds) or delete it to stop implying live coverage.
+
+---
+
 ## OPEN — BUGS: fixes available on four `claude/*` branches (fxvnsu / yd5ajq / 0h7oz9 / c4c09l), verified NOT in main (2026-07-19)
 
 **What this is.** A SECOND set of `claude/*` audit branches, created AFTER the 41-fix tracker

@@ -402,6 +402,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
                                        TokenType op, Node *value);
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
+static void vrp_widen_loop_addr_taken(Checker *c, Node *n);
 
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
@@ -11634,6 +11635,13 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* HOLE-A (2026-07-31): widen any local whose ADDRESS is taken in the
+         * body (e.g. `bump(&i)`) — the ASSIGN-only pass above and the cond
+         * narrowing above both miss it. Run AFTER the cond push so it also
+         * overrides a narrow range on an address-taken loop COUNTER
+         * (find_var_range returns the newest entry). */
+        vrp_widen_loop_addr_taken(c, node->for_stmt.body);
+
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
         check_stmt(c, node->for_stmt.body);
@@ -11693,6 +11701,11 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
         }
+
+        /* HOLE-A (2026-07-31): widen address-taken locals in the body (see the
+         * for-loop note). AFTER the cond push so it overrides a narrow range on
+         * an address-taken loop variable. */
+        vrp_widen_loop_addr_taken(c, node->while_stmt.body);
 
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
@@ -12328,9 +12341,16 @@ static void check_stmt(Checker *c, Node *node) {
                 for (int ri = 0; ri < root_count; ri++) {
                     Node *root = roots[ri];
                     /* BUG-317: walk into @ptrcast/@bitcast in orelse fallback.
-                     * Only when return type is pointer — value bitcasts are safe. */
+                     * Only when the return type CAN carry a pointer — value
+                     * bitcasts are safe. HOLE-B sibling (2026-07-31 audit): the
+                     * gate was a raw pointer-only type-kind comparison, so a
+                     * distinct-slice return `return maybe orelse @cast(MySlice, local)`
+                     * skipped the cast unwrap and the downstream local-derived
+                     * check never saw the local root (silent dangling-slice
+                     * escape on the null-fallback path). type_can_carry_pointer
+                     * unwraps distinct and covers slice/struct/union/opaque. */
                     if (root && root->kind == NODE_INTRINSIC &&
-                        ret_type && ret_type->kind == TYPE_POINTER) {
+                        type_can_carry_pointer(ret_type)) {
                         const char *iname = root->intrinsic.name;
                         uint32_t ilen = (uint32_t)root->intrinsic.name_len;
                         /* BUG-351: @cast also needs escape check */
@@ -12520,8 +12540,18 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                     /* BUG-256: check local/arena-derived ident through pointer cast.
-                     * Only applies when result is a pointer type (not value bitcast). */
-                    if (ret_type && ret_type->kind == TYPE_POINTER) {
+                     * Applies when the result CAN carry a pointer — not a value
+                     * bitcast. HOLE-B (2026-07-31 audit): the gate was a raw
+                     * pointer-only type-kind comparison, which excluded a
+                     * `distinct typedef [*]T` / `[*]T` (slice) return type — since
+                     * `@cast`'s target is always a distinct typedef, an inline
+                     * `return @cast(MySlice, local_slice);` slipped through
+                     * (silent dangling-slice escape; the non-inline
+                     * `MySlice s2 = @cast(..); return s2;` form was already
+                     * caught). type_can_carry_pointer unwraps distinct and covers
+                     * slice/struct/union/opaque while still excluding a value cast
+                     * (`@bitcast(u32, x)` -> TYPE_UINT -> false). */
+                    if (type_can_carry_pointer(ret_type)) {
                         Node *root = arg;
                         while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                             if (root->kind == NODE_FIELD) root = root->field.object;
@@ -15668,11 +15698,149 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     } else if (k == NODE_ONCE) {
         vrp_invalidate_loop_body_writes(c, body->once.body);
     }
-    /* All other NodeKind values: no assignment subtree to widen.
-     * Calls do not write the caller's locals (the callee's analysis
-     * owns its own ranges). VAR_DECL inner inits shadow rather than
-     * widen the outer range.  RETURN/BREAK/CONTINUE/GOTO/LABEL/YIELD/
-     * AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
+    /* All other NodeKind values: no assignment subtree to widen here.
+     * NOTE: a call CAN write a caller local via `&local` passed to a `*T`
+     * param — that address-of escape is NOT modeled by this ASSIGN-only
+     * pass; it is handled by the companion vrp_widen_loop_addr_taken below,
+     * which the loop drivers run alongside this one. VAR_DECL inner inits
+     * shadow rather than widen the outer range. RETURN/BREAK/CONTINUE/GOTO/
+     * LABEL/YIELD/AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
+}
+
+/* HOLE-A fix (2026-07-31 audit): widen (full-wipe) the VRP range of every local
+ * whose ADDRESS is taken anywhere in a loop body, BEFORE the body's single
+ * forward pass. Rationale: the per-call address-taken wipe (BUG-475, checker.c
+ * ~6688) runs at the call site in PROGRAM ORDER, so a `&i`-passing call that
+ * appears AFTER an index use in the same loop body (`arr[i] = 7; bump(&i);`)
+ * leaves `i` at its stale pre-loop range when `arr[i]` was proven — the
+ * loop-carried pointer mutation is missed and the bounds guard is silently
+ * elided (ASan-confirmed stack-buffer-overflow WRITE). The sibling pre-pass
+ * vrp_invalidate_loop_body_writes only JOINs direct ASSIGN writes and explicitly
+ * skips calls, so an address-of escape hidden in a call arg (or any expression)
+ * slips through. This companion pass closes that gap.
+ *
+ * Address-taken => FULL wipe (not a value JOIN) because a pointer write can set
+ * ANY value. Over-widening is always sound for VRP (it can only ADD a runtime
+ * guard, never remove one), so — unlike the ASSIGN join — this does not risk a
+ * precision regression on the value-carrying case. Only address-taken vars are
+ * touched, so plain loop-mutated counters keep the precise join from the sibling
+ * pass. No-default switch (mirrors ast_name_mutated_or_addrd in zercheck_ir.c):
+ * a NEW NodeKind forces a decision here so a future form cannot silently
+ * re-open the hole. */
+static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case NODE_UNARY:
+        if (n->unary.op == TOK_AMP && n->unary.operand) {
+            /* walk field/index chain to the root ident (matches BUG-475/479) */
+            Node *root = n->unary.operand;
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                if (root->kind == NODE_FIELD) root = root->field.object;
+                else root = root->index_expr.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                struct VarRange *r = find_var_range(c, root->ident.name,
+                    (uint32_t)root->ident.name_len);
+                if (r) {
+                    r->min_val = INT64_MIN;
+                    r->max_val = INT64_MAX;
+                    r->known_nonzero = false;
+                    r->address_taken = true;
+                }
+            }
+        }
+        vrp_widen_loop_addr_taken(c, n->unary.operand);
+        break;
+    case NODE_BINARY:
+        vrp_widen_loop_addr_taken(c, n->binary.left);
+        vrp_widen_loop_addr_taken(c, n->binary.right);
+        break;
+    case NODE_ASSIGN:
+        vrp_widen_loop_addr_taken(c, n->assign.target);
+        vrp_widen_loop_addr_taken(c, n->assign.value);
+        break;
+    case NODE_CALL:
+        vrp_widen_loop_addr_taken(c, n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->call.args[i]);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->intrinsic.args[i]);
+        break;
+    case NODE_FIELD:
+        vrp_widen_loop_addr_taken(c, n->field.object);
+        break;
+    case NODE_INDEX:
+        vrp_widen_loop_addr_taken(c, n->index_expr.object);
+        vrp_widen_loop_addr_taken(c, n->index_expr.index);
+        break;
+    case NODE_SLICE:
+        vrp_widen_loop_addr_taken(c, n->slice.object);
+        vrp_widen_loop_addr_taken(c, n->slice.start);
+        vrp_widen_loop_addr_taken(c, n->slice.end);
+        break;
+    case NODE_ORELSE:
+        vrp_widen_loop_addr_taken(c, n->orelse.expr);
+        vrp_widen_loop_addr_taken(c, n->orelse.fallback);
+        break;
+    case NODE_TYPECAST:
+        vrp_widen_loop_addr_taken(c, n->typecast.expr);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            vrp_widen_loop_addr_taken(c, n->struct_init.fields[i].value);
+        break;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            vrp_widen_loop_addr_taken(c, n->block.stmts[i]);
+        break;
+    case NODE_IF:
+        vrp_widen_loop_addr_taken(c, n->if_stmt.cond);
+        vrp_widen_loop_addr_taken(c, n->if_stmt.then_body);
+        vrp_widen_loop_addr_taken(c, n->if_stmt.else_body);
+        break;
+    case NODE_FOR:
+        vrp_widen_loop_addr_taken(c, n->for_stmt.init);
+        vrp_widen_loop_addr_taken(c, n->for_stmt.cond);
+        vrp_widen_loop_addr_taken(c, n->for_stmt.step);
+        vrp_widen_loop_addr_taken(c, n->for_stmt.body);
+        break;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        vrp_widen_loop_addr_taken(c, n->while_stmt.cond);
+        vrp_widen_loop_addr_taken(c, n->while_stmt.body);
+        break;
+    case NODE_SWITCH:
+        vrp_widen_loop_addr_taken(c, n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].body);
+        break;
+    case NODE_RETURN:    vrp_widen_loop_addr_taken(c, n->ret.expr); break;
+    case NODE_EXPR_STMT: vrp_widen_loop_addr_taken(c, n->expr_stmt.expr); break;
+    case NODE_VAR_DECL:  vrp_widen_loop_addr_taken(c, n->var_decl.init); break;
+    case NODE_DEFER:     vrp_widen_loop_addr_taken(c, n->defer.body); break;
+    case NODE_CRITICAL:  vrp_widen_loop_addr_taken(c, n->critical.body); break;
+    case NODE_ONCE:      vrp_widen_loop_addr_taken(c, n->once.body); break;
+    case NODE_AWAIT:     vrp_widen_loop_addr_taken(c, n->await_stmt.cond); break;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->spawn_stmt.args[i]);
+        break;
+    /* Leaves / declarations / opaque kinds — no descendable child that can carry
+     * `&loop_local`. NODE_CAST is inserted post-check (absent in this pre-check
+     * pass); NODE_STATIC_ASSERT/NODE_SIZEOF conditions are comptime constants.
+     * No-op is sound: none of these take the address of a loop-carried local. */
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_SIZEOF: case NODE_CAST: case NODE_ASM:
+    case NODE_STATIC_ASSERT: case NODE_FILE: case NODE_FUNC_DECL:
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        break;
+    }
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */

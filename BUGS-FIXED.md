@@ -5,6 +5,67 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-07-31 — audit sweep: 3 silent soundness holes + 1 emit miscompile (checker.c, emitter.c)
+
+A multi-agent + hand audit found four verified defects. Each fixed as a tighten-only
+change (no over-rejection regression; 441 pos / 430 neg / sink matrix CLEAN, and the
+tightened cases were confirmed against a pristine-HEAD binary).
+
+### HOLE-A — loop-carried index mutated via `&i`-to-call → silent stack OOB (checker.c)
+
+Reproducer (ASan: `stack-buffer-overflow WRITE`, but ZER compiled clean, ran with no trap):
+```zer
+void bump(*u32 p) { *p = *p + 4; }
+u32 main() {
+    u8[4] buf; u32 i = 0;
+    for (u32 k = 0; k < 6; k += 1) { buf[i] = 99; bump(&i); }  // i becomes 4,8,... OOB
+    return 42;
+}
+```
+Root cause: the loop VRP pre-pass `vrp_invalidate_loop_body_writes` (checker.c) widens only
+direct ASSIGN writes and *explicitly skipped calls* ("Calls do not write the caller's locals").
+That assumption is false when a call takes `&local` and writes `*p`. The per-call address-taken
+wipe (BUG-475) runs at the call site in program order, so when `buf[i]` textually PRECEDES
+`bump(&i)`, `buf[i]` was proven against the stale pre-loop range `[0,0]` and the bounds guard
+was elided — a loop-carried OOB the single forward pass never re-checked. Straight-line code
+was safe (BUG-479 wipes at the `&i`, which precedes the use).
+Fix: new companion pass `vrp_widen_loop_addr_taken` — a no-default exhaustive AST walk
+(`-Werror=switch` enforced, mirrors `ast_name_mutated_or_addrd`) that FULL-wipes the VRP range
+of every local whose address is taken anywhere in the loop body, run in the for/while/do-while
+drivers AFTER the cond-narrowing (so it also overrides a narrow range on an address-taken loop
+COUNTER; `find_var_range` returns the newest entry). Address-taken ⇒ full wipe (a pointer write
+can set any value); over-widening is always sound for VRP (only ADDS a guard) so no precision
+regression — only address-taken vars are touched, plain counters keep the precise join.
+Test: `tests/zer/vrp_loop_addrof_index.zer` (fixed → exit 0 via guard; regressed → exit 42).
+
+### HOLE-B — dangling slice/pointer escapes an inline `return @cast/@ptrcast(...)` (checker.c)
+
+```zer
+distinct typedef [*]u8 MySlice;
+MySlice get() { u8[8] buf; [*]u8 s = buf; return @cast(MySlice, s); }  // returns view of freed stack
+```
+Compiled clean, returned a dangling slice (`.ptr` into the freed frame, `.len`=8 → every
+bounds-checked index of the result silently reads/writes freed stack). The non-inline
+`MySlice s2 = @cast(..); return s2;` form was already caught.
+Root cause: the NODE_RETURN local-derived-ident-through-cast escape check gated on
+`ret_type->kind == TYPE_POINTER`, excluding `TYPE_SLICE` and (since `@cast`'s target is always a
+distinct typedef) the `TYPE_DISTINCT` wrapper. Same TYPE_POINTER-only gate also in the
+orelse-fallback cast-unwrap path (`return maybe orelse @cast(MySlice, local)`).
+Fix: both gates now use `type_can_carry_pointer(ret_type)` (unwraps distinct; covers
+slice/struct/union/opaque; still excludes a value `@bitcast(u32, x)`).
+Tests: `tests/zer_fail/return_cast_local_slice.zer`, `return_ptrcast_local_distinct.zer`,
+`return_orelse_cast_local.zer`. Param-view returns (BUG-764) still compile.
+
+### MISCOMPILE — `(*p).field` emitted as `*p.field` (emitter.c)
+
+Valid ZER `(*p).field` (explicit deref then field) emitted C `*p.field` = `*(p.field)` —
+uncompilable (GCC-caught, so not silent, but a valid program failed to build); affected read
+and write. Idiomatic auto-deref `p.field` (→ `p->field`) was fine.
+Root cause: both field-emission sites (AST `emit_expr` and IR `emit_rewritten_node`) emit the
+object then append `.`/`->` without parenthesizing an object that binds looser than the postfix
+accessor. Fix: `field_obj_needs_parens()` — parenthesize when the object is UNARY/BINARY/
+TYPECAST/CAST/ORELSE; applied on both paths. Test: `tests/zer/explicit_deref_field.zer`.
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

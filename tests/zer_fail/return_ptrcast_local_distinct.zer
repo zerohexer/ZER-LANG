@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// HOLE-B (2026-07-31 audit): inline `return @ptrcast(distinct-*T, local_ptr)`
+// dangling-pointer escape via a distinct-pointer return type.
+distinct typedef *u32 MyPtr;
+MyPtr get() {
+    u32 x = 5;
+    *u32 p = &x;
+    return @ptrcast(MyPtr, p);
+}
+u32 main() { return 0; }

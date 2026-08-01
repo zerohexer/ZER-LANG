@@ -190,6 +190,10 @@ Compare to language safety claims that obscure their boundaries (e.g., "memory
 safe" without specifying which code, "race-free" without specifying which
 concurrency model). Definition A forces the boundary to be explicit.
 
+**Scope of the claim.** This is a property of the ARCHITECTURE — Definition A makes
+language-level safety obtainable without contracts. Whether every structural rule is
+implemented is a separate question, tracked in §24 and `docs/limitations.md`.
+
 ### 2.5 The Three Categories of Errors
 
 A useful taxonomy for understanding what Definition A catches vs misses:
@@ -843,6 +847,13 @@ C has no closure over race-creating operations. ZER does.
 
 This is the closure argument. It's the foundation of ZER's data race safety
 claim.
+
+**Detectable is not detected.** The closure argument establishes that every
+race-creating operation is compiler-VISIBLE — a property C cannot claim, since
+`pthread_create` and raw pointer passing sit outside its model. It does not establish
+that the shipped checker catches every race the primitives permit; that is the
+"(some pending implementation)" clause above. Implementation status is tracked in §24 and
+`docs/limitations.md`.
 
 ---
 

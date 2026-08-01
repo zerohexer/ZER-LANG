@@ -3852,6 +3852,89 @@ read in a spawn body).
 
 ---
 
+### VERIFIED STILL OPEN 2026-08-01 — reproduced, with the exact mechanism
+
+Probed against the 2026-07-21 `zerc` (i.e. AFTER the 12-branch merge-back). The entry
+above is **accurate, not stale** — the cross-block scoped-borrow hole is live. Three
+shapes, all compiled clean or correctly rejected as marked:
+
+| Shape | Result |
+|---|---|
+| `join` in ONE arm of an `if`, access after the merge | **ACCEPTED — real data race** |
+| `join` inside a `while` body, access after the loop | **ACCEPTED — real data race** |
+| `join` on BOTH arms, access after (legal) | ACCEPTED — correct; this is the CONTROL |
+
+```zer
+struct Work { u32 x; }
+void worker(*Work w) { w.x = 1; }
+u32 flag_in;                       // NOTE: condition must NOT mention `work` (see gotcha)
+u32 main() {
+    Work work;
+    ThreadHandle th = spawn worker(&work);
+    if (flag_in == 99) {
+        th.join();                 // borrow cleared on ONE path only
+    }
+    work.x = 2;                    // other path: the thread is STILL running -> RACE
+    th.join();
+    return 0;
+}
+```
+
+**Root cause — the borrow was never migrated to the CFG.** Handles moved to
+`zercheck_ir.c` with a real `ir_merge_states`; the scoped-spawn borrow did not. It is
+still a single boolean on the `Symbol`, mutated by a linear AST walk:
+
+| Site | Code |
+|---|---|
+| `checker.c:14087` | `vs->is_borrowed_by_thread = true;` — set at `spawn` |
+| `checker.c:5614` | `bv->is_borrowed_by_thread = false;` — cleared at `join`, **unconditionally** |
+| `checker.c:3558` | read check |
+| `checker.c:3970` | write check |
+
+Walking into an `if` body clears the flag; walking out does not restore it. Everything
+after the merge therefore sees "not borrowed", including the path on which the thread is
+still live. There is no `preds[]`, so the state cannot be path-dependent — this is the
+AST-cannot-represent-a-merge problem, still resident in the concurrency layer.
+
+Note the `borrow` identifiers in `zercheck_ir.c` are `ret_is_borrow` — return-value
+analysis for leak suppression, an unrelated concern. Grepping "borrow" there does **not**
+find this.
+
+**GOTCHA for whoever writes the regression test.** A naive test accidentally PASSES.
+If the branch condition mentions the borrowed variable (`if (work.x == 0)`), the read
+*inside the condition* trips the checker at `checker.c:3558` before the interesting
+statement is reached, and the test looks like it rejects correctly. **The condition must
+reference an unrelated variable** for the hole to surface. Three of four first-attempt
+probes were masked this way.
+
+**Fix (unchanged from the entry above): a borrow-set merge in `zercheck_ir.c`.** Move
+the borrow from a `Symbol` boolean to a per-block set, union at joins, same shape as the
+`threads[]` merge that fixed the false-green scoped-spawn stack-UAF. Conservative
+direction at a join is UNION (still-borrowed wins), matching every other class's
+fail-closed discipline.
+
+**Why the obvious fix is wrong:** "never clear the flag" makes the CONTROL case above
+(join on both arms, then access) a false positive, rejecting correct code. The
+merge must be path-aware, not merely sticky.
+
+**Tripwire tests to add (none exist today):**
+
+```
+tests/zer_fail/borrow_join_one_arm.zer    must FAIL to compile — currently passes
+tests/zer_fail/borrow_join_in_loop.zer    must FAIL to compile — currently passes
+tests/zer/borrow_join_both_arms.zer       must COMPILE — pins against over-correction
+```
+
+The third is not optional: without it the sticky-flag "fix" would ship and nothing
+would catch the over-rejection.
+
+**Consequence for the soundness theorem:** this class currently fails OPEN at a CFG
+join. An analysis that fails open cannot discharge a forward-simulation obligation —
+the abstract state does not over-approximate the concrete one — so `checker_sound` is
+not merely unproven for scoped borrows, it would be **false**. Same standing as the
+provenance-at-indirect-call hole recorded elsewhere: these are prerequisites for the
+Lean port, not independent bugs.
+
 ## Tracking notes
 
 All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,

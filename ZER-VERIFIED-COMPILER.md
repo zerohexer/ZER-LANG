@@ -37,7 +37,9 @@ Related context elsewhere:
       emit-C is permanent, backend stays delegated to GCC/CompCert)
 - §9  The two trust chains — TCB analysis, "fully safe" does not exist, the kernel hatch
 - §10 Backends — dual-backend strategy; verified CompCert facts (ISAs, pedigree, licensing)
-- §11 The emitter contract (C99, CompCert dialect, freestanding, Clight-friendly)
+- §11 The emitter contract (C99, CompCert dialect, freestanding, Clight-friendly;
+      §11.1 MEASURED 2026-08-01 — the contract is NOT adopted; the CompCert path is
+      blocked by GCC extensions in the emitted preamble, not by licensing)
 - §12 Toolchain residue (assembler/linker/libc/startup ranking; porting; mitigations)
 - §13 Lean 4 implementation practicalities
 - §14 Concurrency proofs (Iris) — plan
@@ -918,6 +920,84 @@ or Diab). Those remain trusted (§12).
 5. Emitted code carries **no undefined behavior** by construction (that is the point of
    ZER); the emitter contract makes it *checkable*: the Stage-2 emission proof is against
    the formalized C99-subset semantics, which has no UB to fall into.
+
+### 11.1 MEASURED 2026-08-01 — the contract is NOT adopted today (the retrofit §11 warned about)
+
+§11 assumes *"machine-emitted C is naturally this boring; the constraint costs near-zero."*
+**Measured against the shipped emitter, that is false.** Every emitted file — including a
+hello-world — carries GCC-only constructs in the *preamble*, so `ccomp` rejects ZER output
+before reaching any user code.
+
+Measured by compiling a 5-line ZER function with the 2026-07-21 `zerc` and grepping the
+emitted C:
+
+| Construct | Count | Where | CompCert |
+|---|---|---|---|
+| `({ ... })` statement expressions | 2 | `_zer_shl` / `_zer_shr` macros (preamble ~L258-259) | **rejected** |
+| `__typeof__` | 2 | same macros | **rejected** |
+| `__builtin_add_overflow` / `__builtin_sub_overflow` | 2 | `@addc` / `@subb` runtime (preamble ~L31,33) | not GCC-compatible; CompCert has its own builtin set |
+| `__builtin_trap()` | 1 | trap path (~L129) | replace with `abort()` or an emitted trap |
+| `__attribute__` | 1 | packed/interrupt attributes | partially supported — verify per use |
+
+Consequence: **§10.1's claim that the certification path is "always available" does not
+hold as of this date.** The dual-backend strategy is sound in design and unimplemented in
+fact; the CompCert column is currently blocked by the emitter, not by licensing.
+
+**Fix — a `--portable` (CompCert-dialect) emission mode.** Not large, but it is real work
+and it is now a retrofit rather than the near-free v1 adoption §11 anticipated:
+
+1. `_zer_shl` / `_zer_shr`: statement-expression macros → per-width `static inline`
+   functions (no `({...})`, no `__typeof__`). Behaviour is already specified
+   ("0 for out-of-range"), so this is mechanical.
+2. `@addc` / `@subb`: `__builtin_*_overflow` → portable carry/borrow detection. The
+   `@mulw` `__int128` fallback is the existing template for a portable twin.
+3. `@trap`: `__builtin_trap()` → `abort()` or an emitted trap symbol.
+4. `__attribute__` uses: audit each against CompCert's supported attribute set.
+5. Gate it: a CI job that runs `ccomp -c` over the emitted C of the test corpus. Without
+   a gate this regresses immediately, exactly as it regressed silently to reach this state.
+
+**Why it matters beyond CompCert.** A GCC-extension-free output is also more portable
+across vendor toolchains (Diab, Keil, IAR) and is closer to something a certification
+reviewer can read — the reviewability problem noted in §15. The portable mode is therefore
+worth having even for programs that never touch CompCert.
+
+**How this lands in the Lean world (§7.2 M2).** Once the emitter moves to Lean, the §11
+dialect contract stops being a convention the emitter is *trusted* to honour and becomes a
+**property of the emitted AST type**: emit into a `CProg` inductive that cannot represent a
+statement expression or a `__typeof__` at all, and dialect conformance holds by
+construction rather than by discipline. This is the same move as §5.3's checked-annotation
+principle — make the illegal state unrepresentable instead of auditing for it. It is also
+the reason to emit to a **C AST rather than to strings** (§8 Stage 2): a string emitter can
+always concatenate an extension; a typed emitter cannot.
+
+**DECISION 2026-08-01 — the portable-mode work above is DEFERRED, possibly permanently.**
+The CompCert backend is declined on licensing grounds (§10.2: commercial use is a paid
+AbsInt licence), so the dialect violation is no longer blocking anything. GCC and Clang
+both accept statement expressions and `__typeof__`; if they are the only backends, the
+emitter is already correct and the fix list above is work with no consumer. Do NOT
+implement it speculatively. It becomes live again only if (a) a customer requires a
+CompCert-qualified build, or (b) a vendor toolchain that rejects GCC extensions (Diab,
+Keil, IAR) enters the target set.
+
+What is given up with it, stated honestly: CompCert brought *borrowed pedigree* — ATR
+42/72 qualification, DO-178C/330/333 credits, an existing answer to "who verified your
+backend." Dropping it means the backend is GCC, named as trusted in §9, with assurance
+coming from ZER's own checker rather than from the compiler below it.
+
+And a caution on the replacement: "free" means **no licence fee**, not cheaper. seL4-style
+binary translation validation is unqualified research-grade tooling; in an actual
+certification programme it would have to be qualified under DO-330 by whoever ships it —
+plausibly more expensive than an AbsInt licence, just denominated in engineering time
+rather than cash. The honest near-term position is therefore: *proven checker, tested
+emitter, trusted GCC* — and say so, per §9.4.
+
+**Free alternative to a paid CompCert, restated in one line** (the licensing pressure of
+§10.2): rather than buying a verified backend, *validate the unverified one per build* —
+seL4-style binary translation validation over GCC output (§12's "nuclear option"). That
+keeps the compiler GCC, keeps ZER unencumbered, and yields per-artifact evidence rather
+than a once-for-all theorem — the same assurance shape §8.3 already accepted when it
+declined the composed theorem. The validator itself would be Lean-hosted and proven, and
+is the one component where Tier B graduates from "bridge" to "permanent product feature."
 
 ---
 

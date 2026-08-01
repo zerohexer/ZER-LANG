@@ -1,0 +1,15 @@
+// Regression: a defer BLOCK that declares a local, in a function with multiple
+// return paths, must brace-scope each emission — otherwise the declaration
+// lands in the shared C function scope and gcc errors "redefinition of z" at
+// the second exit path (valid ZER failed to compile).
+u32 counter = 0;
+u32 pick(u32 x) {
+    defer { u32 z = x; counter += z; }
+    if (x > 3) { return 0; }
+    return 0;
+}
+u32 main() {
+    if (pick(5) != 0) { return 1; }
+    if (pick(1) != 0) { return 2; }
+    return 0;
+}

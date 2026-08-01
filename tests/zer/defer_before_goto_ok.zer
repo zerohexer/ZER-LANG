@@ -1,0 +1,56 @@
+// F2/G1 boundary (2026-08-02): the interim reject targets ONLY the
+// `goto` -> `defer` -> `label` order (gi < di < li), where the goto path never
+// registers the defer. The LEGITIMATE acquire/cleanup idiom — defer registered
+// BEFORE the goto — must keep compiling and stay balanced, because on the goto
+// path the defer WAS armed so firing it is correct.
+//
+// This positive is NOT in the source branch's test set; the tracker explicitly
+// flagged verifying it as a condition of taking the reject.
+i32 lock_count;
+void acq() { lock_count += 1; }
+void rel() { lock_count -= 1; }
+
+// defer BEFORE the goto — the canonical pattern
+void safe(u32 err) {
+    acq();
+    defer rel();
+    if (err == 1) { goto done; }
+    lock_count += 100;
+done:
+    return;
+}
+
+// a goto with NO defer after it in the block — untouched
+void plain(u32 err) {
+    if (err == 1) { goto out; }
+    lock_count += 5;
+out:
+    return;
+}
+
+// defer AFTER the label (no goto skips it)
+void after_label(u32 err) {
+    if (err == 1) { goto tail; }
+    lock_count += 7;
+tail:
+    defer rel();
+    acq();
+    return;
+}
+
+u32 main() {
+    lock_count = 0;
+    safe(1);                        // acq+rel balanced on the goto path
+    if (lock_count != 0) { return 1; }
+    safe(0);                        // acq+rel balanced on the fall-through path
+    if (lock_count != 100) { return 2; }
+
+    lock_count = 0;
+    plain(1);
+    if (lock_count != 0) { return 3; }
+
+    lock_count = 0;
+    after_label(1);                 // acq then rel at scope exit
+    if (lock_count != 0) { return 4; }
+    return 0;
+}

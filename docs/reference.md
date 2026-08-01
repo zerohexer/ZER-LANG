@@ -953,6 +953,42 @@ defer {
 }
 ```
 
+`orelse` with a **value or block fallback** is banned inside a defer body — the
+defer body cannot express orelse's branch. Compute the value before the defer.
+(`orelse return` / `break` / `continue` are already banned there too, because
+they corrupt cleanup flow.)
+
+```zer
+defer { u32 z = maybe() orelse g; }   // COMPILE ERROR
+u32 z = maybe() orelse g;             // OK — compute it first
+defer { use(z); }
+```
+
+A forward `goto` that jumps **over** a later `defer` to a label past it is a
+compile error: on that path the defer never registered, so firing it at the
+label would run cleanup that was never set up. Register the defer before the
+goto — the normal acquire/cleanup order:
+
+```zer
+void f(u32 err) {
+    if (err == 1) { goto done; }
+    acq();
+    defer rel();          // COMPILE ERROR — the goto above skips this
+    lock_count += 100;
+done:
+    return;
+}
+
+void ok(u32 err) {
+    acq();
+    defer rel();          // OK — registered before the goto, so it is armed
+    if (err == 1) { goto done; }
+    lock_count += 100;
+done:
+    return;
+}
+```
+
 **SYNTAX**
 ```zer
 defer statement;

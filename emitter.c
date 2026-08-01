@@ -3910,8 +3910,21 @@ static void emit_defers_from(Emitter *e, int base) {
         Node *db = e->defer_stack.stmts[di];
         if (!db) continue;
         if (db->kind == NODE_BLOCK) {
+            /* F4 (2026-08-02): brace-scope the block-form defer body. A defer
+             * body is emitted at EVERY exit path, so a local declared inside
+             * (`defer { u32 z = x; ... }`) otherwise lands in the SHARED C
+             * function scope and the second exit path's copy is a gcc
+             * "redefinition" error — valid ZER failed to compile, and only at
+             * the gcc stage. The single-statement form below never declares, so
+             * it needs no brace. */
+            emit_indent(e);
+            emit(e, "{\n");
+            e->indent++;
             for (int si = 0; si < db->block.stmt_count; si++)
                 emit_defer_stmt(e, db->block.stmts[si], func);
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}\n");
         } else {
             emit_defer_stmt(e, db, func);
         }
@@ -10984,9 +10997,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 e->indent++;
             }
             if (db->kind == NODE_BLOCK) {
+                /* F4 (2026-08-02): brace-scope — see the emit_defers_from
+                 * sibling. Flattening the block here rather than calling
+                 * emit_defer_stmt(block) is deliberate: the `guarded` if-wrap
+                 * above must be able to nest the whole body. These braces just
+                 * restore the scope the flattening removes. */
+                emit_indent(e);
+                emit(e, "{\n");
+                e->indent++;
                 for (int si = 0; si < db->block.stmt_count; si++) {
                     emit_defer_stmt(e, db->block.stmts[si], func);
                 }
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
             } else {
                 emit_defer_stmt(e, db, func);
             }

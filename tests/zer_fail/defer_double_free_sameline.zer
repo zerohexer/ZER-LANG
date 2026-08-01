@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Regression (2026-07-28): a deferred free on the SAME source line as the
+// explicit free evaded the double-free check, which used source-LINE equality
+// (free_line == defer_line) as its discriminator. Now uses a per-defer-body id.
+struct N { u32 v; }
+Slab(N) g;
+void f() {
+    *N p = g.alloc_ptr() orelse return;
+    defer g.free_ptr(p); g.free_ptr(p);
+}
+i32 main() { f(); return 0; }

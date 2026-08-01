@@ -311,7 +311,59 @@ Historical per-item detail retained below for provenance.
   **Complementary to main's shipped ISR-TRANS (§C #12), which closed only the direct-helper case.**
   Test `isr_funcptr_launder_volatile.zer` (promoted from `tests/zer_gaps/`).
 
-### F. Defer
+### F. Defer — **ALL 4 DONE 2026-08-02** (F2 = sound interim reject; durable fix OPEN below)
+
+**Landed 2026-08-02.** Every reproducer verified against main first:
+
+| | Verified on main before the fix | After |
+|---|---|---|
+| F1 | `defer g.free_ptr(p); g.free_ptr(p);` COMPILED — double free at scope exit | rejected |
+| F2 | exit **255** — the goto-skipped `rel()` fires, lock counter underflows | rejected (see below) |
+| F3 | emitted C carried TWO `_zer_trap("compiler bug: unhandled NODE kind")` | clean checker error |
+| F4 | gcc `redefinition of 'z'` — valid ZER failed to compile | compiles |
+
+**F1's replacement is a per-defer INSTANCE ID, not a line number.** The old guard used
+`free_line != defer_line` as a PROXY for "same defer body", which broke whenever the two frees shared
+a physical line. `IRHandleInfo.freed_defer_id` is stamped on the freed handle and mirrored across its
+alias group, written ONLY in the post-fixpoint scope-exit scan so no CFG-merge or snapshot handling
+is needed. Id 0 is reserved for "not freed by a defer" (the memset-zeroed slot / an explicit free),
+so the caller passes `k + 1`.
+
+**F2's boundary was verified, and the positive is NEW.** The tracker warned that `xxhbdg`'s test set
+has no positive for the legitimate idiom. `tests/zer/defer_before_goto_ok.zer` (written here) pins
+three shapes that must keep compiling — defer BEFORE the goto, a goto with no defer after it, and a
+defer after the label — and checks the lock counter stays BALANCED on both the goto and fall-through
+paths. The reject is structurally unable to fire on defer-before-goto: the goto scan only inspects
+statements at `gi < di`. Swept all 17 existing positives combining goto+defer: 0 regressions.
+
+**Why an interim REJECT and not a ban-framework violation.** The Ban Decision Framework governs
+banning VALID patterns. This shape currently MISCOMPILES — a silent lock underflow — so a compile
+error naming the workaround is strictly better than the status quo, not a feature removal.
+
+## OPEN — F2 durable fix: per-defer runtime "armed" flag (MEDIUM, over-rejection)
+
+**Symptom.** The `gi < di < li` shape (forward `goto` over a later `defer` to a label past it) is
+REJECTED rather than compiled correctly. The workaround is trivial (move the `defer` before the
+`goto`), so this is an ergonomics gap, not a safety gap.
+
+**Root cause.** The straight-line C defer-fire has no per-defer runtime "armed" flag for this shape.
+The existing `defer_fire_guard_flag` machinery does NOT cover it: that suppresses a
+goto-to-cleanup-label DOUBLE fire (the goto fires eagerly and sets the flag, so the label skips), but
+here the goto path registered nothing — there is nothing to fire eagerly and no flag is emitted.
+
+**Fix sketch.** Give each defer a zero-initialised `u8` armed flag local; set it to 1 at
+`IR_DEFER_PUSH`; emit the fire as `if (armed) { body }`. Emit the flag ONLY for defers a goto can
+skip (the same `gi < di < li` analysis the reject already performs), so the common case keeps its
+current zero-overhead unconditional fire.
+
+**Why it was NOT done in this pass.** The blast radius is the defer emission core — `defer_count` /
+`defer_fire_bodies` snapshots / `active_guard_below` / `restore_count` — which its own comment
+history records needing repeated fixes (see the 2026-06-29 entries in `ir_lower.c`). The new flag
+also has the OPPOSITE polarity to `defer_fire_guard_flag` and both can land on the same fire. The
+regression net is thin: only 17 positive tests combine goto and defer. Given a rare shape with a
+one-line workaround, the sound reject was the better trade for this pass. Do this behind a real
+goto x defer matrix, not ad hoc.
+
 
 - **F1 — defer double-free discriminated by SOURCE-LINE equality** (`7fxhb3` `31796ef8`, CRITICAL). The check
   separated a real double free from the legit two-branch `defer { if(e){free} else{free} }` using

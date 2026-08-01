@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — §F: four defer holes (zercheck_ir.c, checker.c, emitter.c)
+
+All four reproduced on main. Two were silent-until-gcc, one was a silent runtime miscompile, one let
+a double free compile clean.
+
+- **F1 — defer double-free discriminated by SOURCE-LINE equality (CRITICAL).** The check separated a
+  real double free from the legitimate two-branch `defer { if(e){free} else{free} }` using
+  `free_line != defer_line`. That is a PROXY for "same defer body" and it breaks whenever the two
+  frees share a physical line: `defer g.free_ptr(p); g.free_ptr(p);` and
+  `defer free(h); defer free(h);` both compiled clean, double-freeing at scope exit. Replaced with a
+  per-defer-body INSTANCE ID (`IRHandleInfo.freed_defer_id`), stamped on the freed handle and
+  mirrored across its alias group. Written ONLY in the post-fixpoint scope-exit scan, so no CFG-merge
+  or snapshot handling is needed. Id 0 is reserved for "not freed by a defer" (memset-zeroed slot /
+  explicit free), so the caller passes `k + 1`. From `7fxhb3` `31796ef8`. Tests
+  `defer_double_free_sameline.zer`, `defer_double_free_two_defers_sameline.zer`, positive
+  `defer_two_branch_free_ok.zer`.
+- **F2 — forward `goto` fires a defer it textually skipped.** On the goto path the defer never
+  registered, but the emitter fires it at the label anyway: `rel()` runs though `acq()` never did,
+  underflowing a lock counter — verified on main at exit 255. The existing `defer_fire_guard_flag`
+  machinery does not cover it (that suppresses a goto-to-label DOUBLE fire; here nothing was
+  registered to fire eagerly). Shipped as a SOUND INTERIM REJECT of exactly the `gi < di < li` shape.
+  From `xxhbdg` `f80166fd`. Test `g1_goto_skips_defer.zer`.
+  **This is not a Ban-Framework violation**: the framework governs banning VALID patterns, and this
+  shape currently MISCOMPILES, so a compile error naming the workaround is strictly better than a
+  silent resource bug. The durable fix (per-defer runtime "armed" flag) is recorded as an OPEN entry
+  in docs/limitations.md with a design sketch and an explicit account of why it was not attempted
+  here (blast radius = the defer emission core, whose own comment history records repeated fixes;
+  opposite flag polarity to the existing guard; only 17 goto+defer positives as a net).
+  **Boundary verified, and the positive is NEW.** `xxhbdg` ships no positive for the legitimate
+  idiom; the tracker flagged verifying it as a condition of taking the reject.
+  `tests/zer/defer_before_goto_ok.zer` pins defer-BEFORE-goto, a goto with no defer after it, and a
+  defer after the label, and checks the counter stays BALANCED on both paths. The reject is
+  structurally unable to fire on defer-before-goto (the goto scan only inspects `gi < di`). Swept all
+  17 existing goto+defer positives: 0 regressions.
+- **F3 — value/block `orelse` inside a defer body.** Defer bodies are emitted from raw AST via
+  `emit_rewritten_node`, which has no NODE_ORELSE handler, so the emitted C carried TWO
+  `_zer_trap("compiler bug: unhandled NODE kind")` calls — the user saw an internal-compiler-bug
+  message instead of a source-level error. This is the missing FOURTH arm of an existing family: the
+  three CONTROL-FLOW orelse forms (`orelse return/break/continue`) were already banned in a defer.
+  Ban criterion 2 (emission impossibility), same as yield/await-in-defer. From `rdh99l` `8af2573d`.
+  Test `orelse_value_in_defer.zer`.
+- **F4 — defer BLOCK declaring a local, in a multi-return function.** A defer body is emitted at
+  EVERY exit path; without braces the declaration lands in the shared C function scope and the second
+  exit path's copy is a gcc `redefinition` error — valid ZER failed to compile, and only at the gcc
+  stage. Brace-scope the block-form body at BOTH emission sites (`emit_defers_from` and the
+  IR_DEFER_FIRE handler). Flattening rather than `emit_defer_stmt(block)` is deliberate at the second
+  site so the `guarded` if-wrap can nest the whole body; the braces just restore the scope the
+  flattening removes. From `rdh99l` `d9060007`. Test `defer_block_decl_multi_return.zer`.
+
+Note the ORDER mattered: F4 changes defer-body emission, so F3 was re-verified AFTER F4 landed (the
+trap survives the brace fix — they are independent defects, not one bug seen twice).
+
+make check exit 0 — all audit gates, all matrix oracles, sink matrix clean.
+
+---
+
 ## 2026-08-02 — §J: four type-system holes + the paired G5 container-emission fix
 
 All four §J entries were live. G5 (§G's deferred container-emission-order entry) is landed HERE, not

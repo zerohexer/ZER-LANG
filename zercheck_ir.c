@@ -57,6 +57,15 @@ typedef struct {
     IRHandleState state;
     int alloc_line;        /* where allocated */
     int free_line;         /* where freed */
+    /* F1 (2026-08-02): which DEFER BODY instance freed this handle (0 = none).
+     * Replaces source-LINE equality (free_line != defer_line) as the way to
+     * tell a REAL double free from the legitimate two-branch
+     * `defer { if(e){free} else{free} }`. Line-equality wrongly SKIPPED a
+     * genuine double free whenever the explicit free — or a SECOND defer —
+     * happened to sit on the same physical line as the `defer` keyword.
+     * Written ONLY in the post-fixpoint scope-exit scan, so no CFG-merge or
+     * snapshot handling is needed. */
+    int freed_defer_id;
     /* Level B guarded refinement (2026-06-27): the BLOCK index where this handle
      * was freed (-1 = not freed / unknown). Paired with the per-block guard sets
      * (ZerCheck.gr_block_guards) to decide, at a MAYBE_FREED use, whether the
@@ -2017,7 +2026,7 @@ static Node *ir_defer_free_arg(Node *node) {
  * tracked handle (bare or compound) and mark it FREED at defer_line.
  * Recursively walks NODE_BLOCK so multi-statement defers are covered. */
 static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                 Node *body, int defer_line) {
+                                 Node *body, int defer_line, int defer_id) {
     if (!body) return;
 
     /* Try this node as a free statement */
@@ -2035,28 +2044,44 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                       h->state == IR_HS_MAYBE_FREED)) {
                 h->state = IR_HS_FREED;
                 h->free_line = defer_line;
+                h->freed_defer_id = defer_id;   /* F1 */
                 /* Phase E: propagate to aliases sharing alloc_id.
                  * Without this, `Handle h = mh orelse return; defer free(h);`
                  * only marks h FREED, leaving mh (the ?Handle alias with
                  * same alloc_id) as ALIVE at function exit → false leak. */
                 ir_propagate_alias_state(ps, h, IR_HS_FREED, defer_line);
+                /* F1: mirror the defer-instance id onto the alias group, so a
+                 * sibling alias freed via THIS same defer body is recognised as
+                 * the same instance and not reported as a double free. */
+                if (h->alloc_id != 0) {
+                    for (int _ai = 0; _ai < ps->handle_count; _ai++) {
+                        if (ps->handles[_ai].alloc_id == h->alloc_id)
+                            ps->handles[_ai].freed_defer_id = defer_id;
+                    }
+                }
             } else if (h && h->state == IR_HS_FREED &&
-                       h->free_line != defer_line &&
+                       h->freed_defer_id != defer_id &&
                        !h->defer_double_reported) {
                 /* Control-flow oracle CF_DEFER_DOUBLE (2026-06-07): the handle
                  * was already freed by something OTHER than this defer (an
                  * explicit body free, or a different defer), and this deferred
                  * free will free it AGAIN at scope exit = double free.
                  *
-                 * The `free_line != defer_line` guard distinguishes a REAL
+                 * F1 (2026-08-02): the discriminator is the per-defer-body
+                 * INSTANCE ID, not source-line equality. It distinguishes a REAL
                  * double free from the legitimate `defer { if (e) { free(h); }
-                 * else { free(h); } }` pattern: the recursive scan walks BOTH
+                 * else { free(h); } }`: the recursive scan walks BOTH
                  * mutually-exclusive branches linearly, so the second branch
-                 * sees h already FREED — but both frees carry THIS defer's line
-                 * (set at the ALIVE->FREED mark below), so free_line==defer_line
-                 * and we correctly skip. A genuine double free comes from an
-                 * explicit free (different source line) or another defer
-                 * (different defer line), so free_line!=defer_line.
+                 * sees h already FREED — but both frees carry THIS defer's id
+                 * (stamped at the ALIVE->FREED mark above), so
+                 * freed_defer_id==defer_id and we correctly skip. A genuine
+                 * double free comes from an explicit free (id 0) or a DIFFERENT
+                 * defer (different id), so freed_defer_id!=defer_id.
+                 *
+                 * The previous guard used `free_line != defer_line`, which was
+                 * a PROXY for "same defer body" and broke whenever the two frees
+                 * shared a physical line: `defer g.free_ptr(p); g.free_ptr(p);`
+                 * and `defer free(h); defer free(h);` both compiled clean.
                  *
                  * No ordering comparison: a defer registered AFTER an explicit
                  * free still fires at scope exit (`free(h); defer free(h);` IS a
@@ -2087,27 +2112,27 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     switch (body->kind) {
     case NODE_BLOCK:
         for (int i = 0; i < body->block.stmt_count; i++)
-            ir_defer_scan_frees(zc, func, ps, body->block.stmts[i], defer_line);
+            ir_defer_scan_frees(zc, func, ps, body->block.stmts[i], defer_line, defer_id);
         break;
     case NODE_IF:
-        ir_defer_scan_frees(zc, func, ps, body->if_stmt.then_body, defer_line);
-        ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->if_stmt.then_body, defer_line, defer_id);
+        ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line, defer_id);
         break;
     case NODE_FOR:
-        ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line, defer_id);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
-        ir_defer_scan_frees(zc, func, ps, body->while_stmt.body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->while_stmt.body, defer_line, defer_id);
         break;
     case NODE_SWITCH:
         for (int i = 0; i < body->switch_stmt.arm_count; i++)
-            ir_defer_scan_frees(zc, func, ps, body->switch_stmt.arms[i].body, defer_line);
+            ir_defer_scan_frees(zc, func, ps, body->switch_stmt.arms[i].body, defer_line, defer_id);
         break;
     case NODE_CRITICAL:
-        ir_defer_scan_frees(zc, func, ps, body->critical.body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->critical.body, defer_line, defer_id);
         break;
     case NODE_ONCE:
-        ir_defer_scan_frees(zc, func, ps, body->once.body, defer_line);
+        ir_defer_scan_frees(zc, func, ps, body->once.body, defer_line, defer_id);
         break;
     /* Stage 2 Part B (2026-04-28): exhaustive — leaf/non-control-flow
      * kinds have no scannable body for free detection. The defer scanner
@@ -5887,8 +5912,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         for (int k = dfn - 1; k >= 0; k--) {   /* LIFO fire order */
             ir_defer_scan_uses(zc, func, ret_ps, dfs[k]->defer_body,
                                dfs[k]->source_line, &defer_use_rs);
+            /* F1: k+1 as the per-defer instance id — 0 is reserved for
+             * "not freed by any defer" (memset-zeroed slot / explicit free). */
             ir_defer_scan_frees(zc, func, ret_ps, dfs[k]->defer_body,
-                                dfs[k]->source_line);
+                                dfs[k]->source_line, k + 1);
         }
     }
     free(dfs);

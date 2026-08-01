@@ -7665,6 +7665,29 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* F3 (2026-08-02): the missing FOURTH arm of the family above. The
+         * three CONTROL-FLOW orelse forms are banned in a defer body; the
+         * VALUE/BLOCK form (`x orelse v`, `x orelse { ... }`) was not, and it is
+         * an EMISSION IMPOSSIBILITY on this path — defer bodies are emitted from
+         * raw AST via emit_rewritten_node, which has no NODE_ORELSE handler
+         * (orelse needs the branch+temp lowering the raw emitter cannot
+         * express). Verified on main: the emitted C carried TWO
+         * `_zer_trap("compiler bug: unhandled NODE kind")` calls, so the user
+         * saw an internal-compiler-bug message instead of a source-level error.
+         *
+         * Ban criterion 2 (emission impossibility), same as yield/await in a
+         * defer — not a policy choice. The fix is to move the orelse before the
+         * defer, which the message says. */
+        if (c->defer_depth > 0 &&
+            !node->orelse.fallback_is_return &&
+            !node->orelse.fallback_is_break &&
+            !node->orelse.fallback_is_continue) {
+            checker_error(c, node->loc.line,
+                "cannot use 'orelse' with a value/block fallback inside a defer "
+                "body — defer bodies cannot express orelse's branch; compute the "
+                "value before the defer");
+        }
+
         if (node->orelse.fallback_is_return ||
             node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
@@ -15425,6 +15448,100 @@ static bool goto_path_covers_label(void **goto_arms, int goto_depth,
     return true;
 }
 
+/* F2/G1 (2026-08-02): find the first `goto <name>` anywhere in a statement
+ * subtree. Used to detect a FORWARD goto that jumps OVER a `defer` registration
+ * to a later label in the SAME block. If-chain (not a switch) deliberately —
+ * this is a partial walk, so a no-default switch would be a false promise of
+ * exhaustiveness; only kinds that can contain statements recurse and everything
+ * else yields NULL (conservative: a missed carrier means we do not reject, i.e.
+ * we fall back to today's behaviour, never to a new miscompile). */
+static Node *find_goto_to_label(Node *n, const char *name, int len) {
+    if (!n) return NULL;
+    if (n->kind == NODE_GOTO) {
+        if (n->goto_stmt.label_len == (size_t)len &&
+            memcmp(n->goto_stmt.label, name, (size_t)len) == 0)
+            return n;
+        return NULL;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *g = find_goto_to_label(n->block.stmts[i], name, len);
+            if (g) return g;
+        }
+        return NULL;
+    }
+    if (n->kind == NODE_IF) {
+        Node *g = find_goto_to_label(n->if_stmt.then_body, name, len);
+        if (g) return g;
+        return find_goto_to_label(n->if_stmt.else_body, name, len);
+    }
+    if (n->kind == NODE_FOR)
+        return find_goto_to_label(n->for_stmt.body, name, len);
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE)
+        return find_goto_to_label(n->while_stmt.body, name, len);
+    if (n->kind == NODE_SWITCH) {
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            Node *g = find_goto_to_label(n->switch_stmt.arms[i].body, name, len);
+            if (g) return g;
+        }
+        return NULL;
+    }
+    if (n->kind == NODE_CRITICAL)
+        return find_goto_to_label(n->critical.body, name, len);
+    if (n->kind == NODE_ONCE)
+        return find_goto_to_label(n->once.body, name, len);
+    /* a NODE_DEFER body cannot contain a goto — goto is banned inside defer. */
+    return NULL;
+}
+
+/* F2/G1: reject a forward `goto L` that jumps OVER a later `defer` registration
+ * to a label past it, in the SAME block (positions gi < di < li).
+ *
+ * THE MISCOMPILE (verified on main, exit 255): on the goto path the defer never
+ * registered, but the emitter fires it at the label anyway —
+ *     _zer_bb1: rel(); return;      // the label — UNCONDITIONAL fire
+ *     _zer_bb2: goto _zer_bb1;      // error path: acq() NEVER ran, yet rel() does
+ * so a lock counter underflows silently. The existing defer_fire_guard_flag
+ * machinery does NOT cover this: it suppresses a goto-to-cleanup-label DOUBLE
+ * fire (goto fires eagerly, sets the flag, label skips), but here the goto path
+ * registered nothing, so there is nothing to fire eagerly and no flag is emitted.
+ *
+ * This is a SOUND INTERIM REJECT, not the durable fix. It is NOT a ban on a
+ * valid pattern (Ban Decision Framework): the shape currently MISCOMPILES, so a
+ * compile error naming the workaround is strictly better than a silent resource
+ * bug. The durable fix is a per-defer runtime "armed" flag — tracked as an OPEN
+ * entry in docs/limitations.md with a design sketch.
+ *
+ * The legitimate cleanup idiom (`defer D; if(c){goto L;} ... L:` — defer BEFORE
+ * the goto, di < gi) is structurally UNREACHABLE here: the goto scan only looks
+ * at statements at gi < di. On that path the defer WAS armed, so firing it is
+ * correct. Pinned by tests/zer/defer_before_goto_ok.zer. */
+static void check_goto_skips_defer_in_block(Checker *c, Node *block) {
+    if (!block || block->kind != NODE_BLOCK) return;
+    int n = block->block.stmt_count;
+    for (int li = 0; li < n; li++) {
+        Node *lab = block->block.stmts[li];
+        if (!lab || lab->kind != NODE_LABEL) continue;
+        for (int di = 0; di < li; di++) {
+            Node *def = block->block.stmts[di];
+            if (!def || def->kind != NODE_DEFER) continue;
+            for (int gi = 0; gi < di; gi++) {
+                Node *g = find_goto_to_label(block->block.stmts[gi],
+                    lab->label_stmt.name, (int)lab->label_stmt.name_len);
+                if (g) {
+                    checker_error(c, g->loc.line,
+                        "forward 'goto %.*s' skips the registration of a "
+                        "'defer' that fires at label '%.*s' — the defer would "
+                        "run on this path though it never registered; move the "
+                        "defer before the goto, or restructure the cleanup",
+                        (int)g->goto_stmt.label_len, g->goto_stmt.label,
+                        (int)lab->label_stmt.name_len, lab->label_stmt.name);
+                }
+            }
+        }
+    }
+}
+
 static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
                            int label_count, ArmStack *arms) {
     if (!node) return;
@@ -15454,6 +15571,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
         break;
     }
     case NODE_BLOCK:
+        check_goto_skips_defer_in_block(c, node);   /* F2/G1 */
         for (int i = 0; i < node->block.stmt_count; i++)
             validate_gotos(c, node->block.stmts[i], labels, label_count, arms);
         break;

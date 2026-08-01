@@ -246,6 +246,15 @@ struct Symbol {
     bool is_borrowed_by_thread;
     const char *th_borrows_name;
     uint32_t th_borrows_name_len;
+    /* D7 (2026-08-01): a scoped spawn may borrow SEVERAL locals
+     * (`spawn w(&a, &b)`). Recording only the first (th_borrows_name above)
+     * left every later borrow un-tracked AND un-cleared at join — a race on
+     * `b` compiled clean. These arena-allocated parallel arrays record ALL
+     * borrowed args so join() releases each. th_borrows_name is kept as the
+     * first entry for backward compatibility with existing reads. */
+    const char **th_borrow_names;
+    uint32_t *th_borrow_lens;
+    int th_borrow_count;
     /* A6-full atomic-cell inclusion (2026-06-21): set on a scalar GLOBAL the
      * first time it is the target of an `@atomic_*`. Strict (Rust) model: once a
      * location is atomic, ALL access must be atomic — a plain access anywhere

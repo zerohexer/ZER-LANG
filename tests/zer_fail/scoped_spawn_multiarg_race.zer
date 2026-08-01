@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// audit 2026-07-23: multi-arg scoped spawn only borrow-tracked the FIRST pointer arg;
+// a parent write to a later borrowed arg (y) raced clean (TSan-confirmed).
+void worker(*u32 a, *u32 b) { *a += 1; *b += 1; }
+u32 main() {
+    u32 x = 0; u32 y = 0;
+    ThreadHandle th = spawn worker(&x, &y);
+    y += 1;
+    th.join();
+    return x + y;
+}

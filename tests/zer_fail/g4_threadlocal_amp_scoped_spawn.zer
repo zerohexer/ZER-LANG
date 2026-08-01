@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// G4 (2026-07-22): passing &threadlocal to a (scoped) spawn establishes no
+// borrow (threadlocals live in global_scope, skipped by the borrow-setup loop)
+// AND the child writes the PARENT's TLS slot — a data race. Must be rejected.
+threadlocal u32 tls;
+void worker(*u32 p) { *p = 1; }
+u32 main() {
+    ThreadHandle t = spawn worker(&tls);
+    tls = 9;
+    t.join();
+    return tls;
+}

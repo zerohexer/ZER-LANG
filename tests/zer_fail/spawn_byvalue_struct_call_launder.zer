@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// D1: spawn of a call returning a by-value struct carrying &local. spawn_arg_is_stack_derived
+// saw only &local / launder-intrinsics / bare local idents — never a CALL-launder — so it now
+// falls back to the centralised arg_is_local_derived, the same predicate every other escape
+// sink uses.
+struct Box { *u32 p; }
+void worker(Box b) { *b.p = 7; }
+Box mk(*u32 q) { Box b; b.p = q; return b; }
+u32 main() {
+    u32 loc = 1;
+    spawn worker(mk(&loc));   // call-launder: &local inside a by-value struct
+    return 0;
+}

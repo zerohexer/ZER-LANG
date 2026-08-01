@@ -246,7 +246,25 @@ Historical per-item detail retained below for provenance.
 - **C7 — Ring.push / keep-call of a call returning a pointer-carrying struct BY VALUE** (`rdh99l`
   `8af2573d`). Widen the NODE_CALL gate to `type_carries_data_pointer`.
 
-### D. Spawn / concurrency (CRITICAL/HIGH) — nine DISTINCT arg shapes, no dedup needed
+### D. Spawn / concurrency (CRITICAL/HIGH) — **ALL 9 DONE 2026-08-01**
+
+**LANDED (D1-D9).** All nine verified reproducing on main first. D3 is notable: the checker emitted
+NO diagnostic at all — the latent cross-thread stack-UAF was masked only by an emitter limitation
+(GCC rejected the slice assignment), so `zerc -o x.c` accepted it silently.
+
+D1 routes spawn through the CENTRALISED `arg_is_local_derived` instead of re-deriving a weaker
+answer, so spawn now agrees with every other escape sink (call-launder + struct-init literal).
+D2/D3 were one edit: unwrap the optional carrier and add TYPE_ARRAY to the ptr-like dispatch.
+D4/D6/D7 are the scoped-borrow cluster — threadlocal rejected, double-borrow rejected, and the
+borrow record generalised from a single name to a LIST (types.h) so join() releases every borrow.
+D5 closes the `&borrowed` call-arg launder the read-check deliberately skipped (`in_amp`).
+D8 scans a function-NAME spawn arg at the spawn site. D9 rejects copying a whole shared struct by
+value at var-decl (the call-arg form was already rejected).
+
+Closes §G **G2** (D5) and **G4** (D4). G1 and G3 remain open.
+
+Historical per-item detail retained below for provenance.
+
 
 - **D1 — spawn of a by-value struct carrying `&local`** via a struct-init literal or a call-launder
   (`rdh99l` `8af2573d`). Cross-thread stack-UAF. Route spawn through the shared `arg_is_local_derived`
@@ -451,6 +469,24 @@ awaiting §D; G3 has none).
 **G3** (atomic-cell plain access not transitive through a helper) remains OPEN and is re-confirmed live by
 `3o10j6` `d1a7d9cc` and `38z6wi` `d1ccb8aa` (reproducer
 `tests/zer_gaps/g3_atomic_cell_plain_access_via_helper.zer`). Update that section's counts when these land.
+
+---
+
+### Tech debt — the Makefile has NO header dependencies (found 2026-08-01)
+
+`grep -cE '^\S+\.o:.*\.h' Makefile` returns **0**: no object rule names a header. So editing a
+header does NOT rebuild the translation units that include it. This is benign for a
+declaration-only change, but changing a STRUCT LAYOUT silently produces a MIXED-ABI binary — the
+edited `.c` sees the new layout, every other stale `.o` sees the old one.
+
+Hit while adding the D7 borrow list to `struct Symbol` in `types.h`: `make zerc` reported 0 errors
+and then SEGFAULTED on a positive test. A `-O0` debug build of the same sources ran fine — the
+classic layout-fragile signature. `rm -f *.o src/safety/*.o && make zerc` fixed it.
+
+This generalises the documented stale-`.o` trap (CLAUDE.md blames an OOM-interrupted build); the
+root cause is systemic, not accidental. **Until the Makefile grows header deps, ALWAYS
+`rm -f *.o src/safety/*.o` after touching any `.h` — especially `types.h`/`ast.h`.** Proper fix:
+`-MMD -MP` depfiles, or at minimum a blanket `$(OBJS): $(HEADERS)` rule.
 
 ---
 

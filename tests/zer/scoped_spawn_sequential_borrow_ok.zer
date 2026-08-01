@@ -1,0 +1,12 @@
+// Positive: re-borrowing a local AFTER joining the first thread is safe.
+struct W { u32 v; }
+void worker(*W w) { w.v += 1; }
+u32 main() {
+    W local; local.v = 0;
+    ThreadHandle t1 = spawn worker(&local);
+    t1.join();
+    ThreadHandle t2 = spawn worker(&local);
+    t2.join();
+    if (local.v != 2) { return 1; }
+    return 0;
+}

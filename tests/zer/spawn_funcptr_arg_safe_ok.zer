@@ -1,0 +1,11 @@
+// A function-name spawn arg that touches no non-shared global is safe: must compile.
+threadlocal u32 tls;
+void bump() { tls = tls + 1; }
+void worker(*() -> void fp) { fp(); }
+u32 main() {
+    ThreadHandle t1 = spawn worker(bump);
+    ThreadHandle t2 = spawn worker(bump);
+    t1.join();
+    t2.join();
+    return 0;
+}

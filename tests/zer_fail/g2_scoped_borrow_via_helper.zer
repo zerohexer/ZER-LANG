@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// G2 (2026-07-22): &x handed to a helper while x is borrowed by a scoped spawn
+// lets the callee race the thread. The direct `x = 7` between spawn/join IS
+// rejected; the `poke(&x)` launder must be too.
+void worker(*u32 p) { *p = 1; }
+void poke(*u32 p)   { *p = 7; }
+u32 main() {
+    u32 x = 0;
+    ThreadHandle t = spawn worker(&x);
+    poke(&x);
+    t.join();
+    return x;
+}

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// Audit 2026-07-30 ("?T hides inner kind" at the spawn-arg sink): a pointer to
+// a stack local laundered through an OPTIONAL (?*T) evaded the fire-and-forget
+// cross-thread-UAF check — is_ptr_like tested eff->kind without unwrapping the
+// TYPE_OPTIONAL wrapper, so the thread outlived the frame with a dangling ptr.
+// Fix: unwrap one optional level before the lifetime/data-race dispatch.
+struct Work { u32 x; }
+void worker(?*Work w) { if (w) |p| { p.x = 1; } }
+void go() {
+    Work data;
+    ?*Work wp = &data;
+    spawn worker(wp);
+}
+u32 main() { return 0; }

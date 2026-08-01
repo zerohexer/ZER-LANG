@@ -1,0 +1,8 @@
+// EXPECTED: compile error — a bare local ARRAY passed to a [*]T slice param of a
+// fire-and-forget spawn coerces to a slice aliasing the stack; the thread may
+// outlive the frame (cross-thread use-after-free). arg-type TYPE_ARRAY was
+// UNCASED in the spawn ptr-like gate, so the check never ran (only an unrelated
+// emitter limitation masked it). TYPE_ARRAY now included.
+void worker([*]u32 s) { s[0] = 9; }
+void run() { u32[4] local; spawn worker(local); }
+u32 main() { run(); return 0; }

@@ -72,6 +72,58 @@ interior-pointer UAF. Unrelated to §C.
 
 ---
 
+## 2026-08-01 — §D: nine spawn / scoped-borrow / shared-copy holes (checker.c, types.h)
+
+All nine verified reproducing on main first. **D3 is the notable one:** the checker emitted NO
+diagnostic — the latent cross-thread stack-UAF was masked only by an emitter limitation (GCC
+rejected the emitted slice assignment), so `zerc -o x.c` accepted it silently.
+
+- **D1 spawn of a call-laundered by-value struct.** `spawn worker(mk(&loc))`.
+  `spawn_arg_is_stack_derived` recognised `&local`, a launder-intrinsic chain and a bare local
+  ident — but not a NODE_CALL or a struct-init literal. It now falls back to the CENTRALISED
+  `arg_is_local_derived`, the same predicate the store/return/keep sinks consult, so spawn agrees
+  with every other escape sink instead of re-deriving a weaker answer.
+- **D2 `?*T` / `?[*]T` spawn arg** — `is_ptr_like` tested `eff->kind` without unwrapping
+  TYPE_OPTIONAL, so an optional pointer to a stack local matched NO arm (not ptr-like, not a
+  struct) and fell through every check. The `?T`-hides-the-inner-kind class again.
+- **D3 bare local ARRAY at a `[*]T` spawn param** — TYPE_ARRAY was uncased in the same dispatch.
+- **D4 `&threadlocal` to a scoped spawn** — a threadlocal lives in `global_scope`, so the `vglobal`
+  skip dropped it: no borrow established, and the child writes the PARENT's TLS slot (each thread
+  has its own copy). Rejected outright, mirroring A5/BUG-757 for fire-and-forget. By-value stays legal.
+- **D5 borrow laundered through a helper** — `poke(&x)` between spawn and join. The NODE_IDENT
+  read-check deliberately SKIPS `&x` (`in_amp`) and the write-check only sees assignment targets,
+  so handing `&x` to a callee that writes through it was invisible. New call-arg check.
+- **D6 double-borrow** — the borrow flag was set UNCONDITIONALLY, so lending the same local to two
+  live scoped spawns was accepted (worker-vs-worker race the parent-write check cannot see).
+- **D7 multi-arg borrow** — only the FIRST `&ident` was recorded (then `break`), so later borrows
+  were neither tracked nor cleared at join. `struct Symbol` gains an arena-allocated borrow LIST
+  (`th_borrow_names`/`_lens`/`_count`); join() releases each. The legacy single-name field is kept
+  as the first entry.
+- **D8 funcptr ARG** — `spawn worker(bump)` where `worker` invokes its funcptr param. Inside
+  `worker`, `fp` resolves to a PARAM (not a global function) so the direct-call descent skips it,
+  and the spawn-site arg→param binding fed no scan. Now scans each function-NAME spawn arg's body
+  at the spawn site. Distinct from BH-18 #8 (same shape, but for calls inside an already-scanned body).
+- **D9 shared struct copied BY VALUE** at var-decl — clones the embedded mutex, so the copy
+  auto-locks a DIFFERENT lock and the multi-field read is torn. The call-ARG form was already
+  rejected; var-decl was not. Field reads (`u32 v = g.v;`) stay legal — that is the auto-locked path.
+
+**A crash I caused and what it taught.** Adding the D7 list changed `struct Symbol`'s SIZE. `make
+zerc` reported 0 errors and then SEGFAULTED on a positive test, while a `-O0` build of the same
+sources ran fine — the layout-fragile signature. Root cause: **the Makefile has ZERO header
+dependencies** (`grep -cE '^\S+\.o:.*\.h' Makefile` = 0), so no other translation unit was
+rebuilt and the binary mixed two `struct Symbol` layouts. `rm -f *.o src/safety/*.o` fixed it.
+This generalises the documented stale-`.o` trap — the root cause is systemic, not an
+OOM-interrupted build. Recorded as tech debt in limitations.md.
+
+**Type-dispatch gate.** The new `eff_pl->kind` reads are on an already-distinct-unwrapped local, so
+they are baselined in `tools/type_dispatch_baseline.txt` per the documented policy; the D9 check was
+converted to `type_dispatch_kind()` instead so it never trips the gate at all.
+
+**Tests.** 9 negatives + 6 positives. make check 0: ZER 1059/0, Rust 784/0, Zig 36/0, modules 28/0,
+fuzz 200/0, conc-matrix 15/15, all 8 oracles + every audit gate, sink matrix 54 CLEAN.
+
+---
+
 ## 2026-08-01 — VRP: 5 more range leaks (loop bodies, else-guard, &-in-loop, signed for-init, return-range) — §B now 9/9 (checker.c)
 
 Completes the §B family. Each verified REPRODUCING on main first, fixed, re-verified.

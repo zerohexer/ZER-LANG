@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// Copying a whole shared struct by value clones its embedded mutex (UB) and is
+// an unlocked torn snapshot. The call-arg site already rejected this; the
+// var-decl/assign/return value-flow sites did not (silent data race).
+shared struct C { u32 v; u32 w; }
+C g;
+u32 test() {
+    C x = g;
+    return x.v;
+}
+u32 main() { return test(); }

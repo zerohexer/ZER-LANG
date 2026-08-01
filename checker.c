@@ -5509,6 +5509,35 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* D5 (2026-08-01): scoped-borrow exclusivity laundered through a HELPER.
+         * `ThreadHandle t = spawn worker(&x); poke(&x); t.join();` compiled —
+         * the borrow read-check (NODE_IDENT, ~3579) deliberately SKIPS `&x`
+         * (`in_amp`, "the launder is rarer") and the write-check only sees
+         * assignment targets, so handing `&x` to a callee that writes through it
+         * was invisible. TSan-confirmed race. Reject `&borrowed` as a call
+         * argument: intra-function and cleared at .join(), so the sequential
+         * pattern still compiles, and passing the VALUE (`poke(x)`) stays legal.
+         * (§G "G2".) */
+        for (int i = 0; i < node->call.arg_count; i++) {
+            Node *a = node->call.args[i];
+            if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_AMP) continue;
+            Node *ar = a->unary.operand;
+            while (ar && (ar->kind == NODE_FIELD || ar->kind == NODE_INDEX)) {
+                ar = (ar->kind == NODE_FIELD) ? ar->field.object
+                                              : ar->index_expr.object;
+            }
+            if (!ar || ar->kind != NODE_IDENT) continue;
+            Symbol *bs = scope_lookup(c->current_scope, ar->ident.name,
+                                      (uint32_t)ar->ident.name_len);
+            if (bs && bs->is_borrowed_by_thread) {
+                checker_error(c, node->loc.line,
+                    "cannot pass '&%.*s' to a call while it is borrowed by a "
+                    "scoped spawn — the callee may write through it while the "
+                    "thread holds it (data race). join() first, or pass by value",
+                    (int)ar->ident.name_len, ar->ident.name);
+            }
+        }
+
         /* Universal free — free(p:*T) -> T.free_ptr(p) / free(s:[*]T) -> direct
          * heap-slice free. (alloc is handled BEFORE the arg loop, above, so its
          * type-name arg — possibly a primitive keyword — is never check_expr'd as
@@ -5655,6 +5684,16 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_error(c, node->loc.line, "ThreadHandle.join() takes no arguments");
                         /* Scoped-borrow exclusivity: join ends the borrow — the
                          * thread is done, the parent may use the local again. */
+                        /* D7: release EVERY borrow this handle took, not just
+                         * the first — otherwise a second borrowed local stayed
+                         * flagged forever and later legitimate use over-rejected. */
+                        for (int bi = 0; bi < osym2->th_borrow_count; bi++) {
+                            Symbol *bv = scope_lookup(c->current_scope,
+                                osym2->th_borrow_names[bi],
+                                osym2->th_borrow_lens[bi]);
+                            if (bv) bv->is_borrowed_by_thread = false;
+                        }
+                        osym2->th_borrow_count = 0;
                         if (osym2->th_borrows_name) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrows_name, osym2->th_borrows_name_len);
@@ -10509,7 +10548,16 @@ static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
             }
         }
     }
-    return false;
+    /* D1 (2026-08-01): fall back to the CENTRALISED escape predicate. The walk
+     * above only recognises `&local`, a launder-intrinsic chain, and a bare local
+     * ident — it does NOT see a CALL-LAUNDER (`spawn worker(mk(&loc))`, where mk
+     * returns a by-value struct carrying the stack pointer) or a struct-init
+     * literal carrying `&local`. arg_is_local_derived already handles both (plus
+     * orelse fallbacks and nested calls), and is the same predicate the store/
+     * return/keep sinks consult — so routing spawn through it makes spawn agree
+     * with every other escape sink instead of re-deriving a weaker answer.
+     * This is the "one query, not N sites" consolidation. */
+    return arg_is_local_derived(c, arg, 0);
 }
 
 static void check_stmt(Checker *c, Node *node) {
@@ -10610,6 +10658,26 @@ static void check_stmt(Checker *c, Node *node) {
             route_alloc_to_ptr_if_needed(c, node->var_decl.init, type);
 
             Type *init_type = check_expr(c, node->var_decl.init);
+            /* D9 (2026-08-01): copying a WHOLE shared struct by value clones its
+             * embedded mutex, so the copy auto-locks a DIFFERENT lock than the
+             * original — every access through it is unsynchronised, and the read
+             * itself is a torn multi-field read. The call-ARG form was already
+             * rejected (~6334); var-decl / assignment / return were not, so
+             * `C x = g;` silently defeated the whole auto-lock discipline.
+             * Reading a FIELD (`u32 v = g.v;`) stays legal — that is the
+             * auto-locked path. */
+            {
+                Type *ie = init_type ? type_unwrap_distinct(init_type) : NULL;
+                if (ie && type_dispatch_kind(init_type) == TYPE_STRUCT &&
+                    (ie->struct_type.is_shared || ie->struct_type.is_shared_rw)) {
+                    checker_error(c, node->loc.line,
+                        "cannot copy shared struct '%s' by value — the embedded "
+                        "mutex would be cloned, so the copy locks a different lock "
+                        "(breaking auto-lock) and the multi-field read is torn. "
+                        "Use a pointer '*%s', or read individual fields.",
+                        type_name(init_type), type_name(init_type));
+                }
+            }
 
             /* non-storable check: pool.get(h) pointer result.
              * BUG-405: only block when result is a pointer — scalar values
@@ -14113,13 +14181,29 @@ static void check_stmt(Checker *c, Node *node) {
              * lifetime arm — `*shared T` to a stack local was accepted with no
              * check). See proofs/operational/lambda_zer_concurrency:
              * stack_not_publishable (lifetime) + is_shared (reach/discipline). */
-            bool is_ptr_like = (eff->kind == TYPE_POINTER ||
-                                eff->kind == TYPE_SLICE ||
-                                eff->kind == TYPE_OPAQUE);
+            /* D2 (2026-08-01): unwrap ONE optional level first. `is_ptr_like`
+             * tested eff->kind directly, so a `?*T` / `?[*]T` pointing at a stack
+             * local is TYPE_OPTIONAL — not ptr-like, not a struct — and fell
+             * through EVERY arm: the cross-thread-UAF check never ran. Another
+             * instance of the `?T`-hides-the-inner-kind class.
+             *
+             * D3 (2026-08-01): TYPE_ARRAY added. A bare local array handed to a
+             * `[*]T` spawn param coerces to a slice over stack memory, but the
+             * arg type is TYPE_ARRAY and was UNCASED here — the latent
+             * cross-thread stack-UAF was masked only by an emitter limitation
+             * (GCC rejected the slice assignment), so the checker itself accepted
+             * it. Verified: `zerc -o x.c` emits NO diagnostic on main. */
+            Type *eff_pl = eff;
+            if (eff_pl->kind == TYPE_OPTIONAL)
+                eff_pl = type_unwrap_distinct(eff_pl->optional.inner);
+            bool is_ptr_like = (eff_pl->kind == TYPE_POINTER ||
+                                eff_pl->kind == TYPE_SLICE ||
+                                eff_pl->kind == TYPE_ARRAY ||
+                                eff_pl->kind == TYPE_OPAQUE);
             if (is_ptr_like) {
                 bool shared_carrier = false;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
+                if (eff_pl->kind == TYPE_POINTER) {
+                    Type *inner = type_unwrap_distinct(eff_pl->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT &&
                         inner->struct_type.is_shared)
                         shared_carrier = true;
@@ -14340,6 +14424,13 @@ static void check_stmt(Checker *c, Node *node) {
                  * record it on the handle so join clears it); a parent WRITE to
                  * it before join is a data race. Shared structs are excluded
                  * (auto-locked); globals/statics outlive the thread. */
+                int bcap = node->spawn_stmt.arg_count > 0
+                             ? node->spawn_stmt.arg_count : 1;
+                sym->th_borrow_names = (const char **)arena_alloc(c->arena,
+                    sizeof(const char *) * (size_t)bcap);
+                sym->th_borrow_lens = (uint32_t *)arena_alloc(c->arena,
+                    sizeof(uint32_t) * (size_t)bcap);
+                sym->th_borrow_count = 0;
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
                     if (!ba || ba->kind != NODE_UNARY ||
@@ -14351,15 +14442,57 @@ static void check_stmt(Checker *c, Node *node) {
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
                     bool vglobal = scope_lookup_local(c->global_scope,
                                        vn, vl) != NULL;
+                    /* D4 (2026-08-01): a THREADLOCAL lives in global_scope, so the
+                     * `vglobal` skip below silently dropped it — no borrow was
+                     * established, the parent's concurrent write between spawn and
+                     * join was unflagged, AND the child writes the PARENT's TLS
+                     * slot (each thread has its own copy, so `&tls` handed across
+                     * a thread boundary is meaningless). TSan-confirmed. Reject
+                     * outright, mirroring A5/BUG-757 which closed the same shape
+                     * for fire-and-forget. Passing the VALUE stays legal. */
+                    if (vs && vs->func_node &&
+                        vs->func_node->kind == NODE_GLOBAL_VAR &&
+                        vs->func_node->var_decl.is_threadlocal) {
+                        checker_error(c, node->loc.line,
+                            "cannot pass '&%.*s' (threadlocal) to a scoped spawn — "
+                            "each thread has its own copy, so the child would write "
+                            "the parent's slot (data race). Pass it by value",
+                            (int)vl, vn);
+                        continue;
+                    }
                     if (!vs || vs->is_static || vglobal || !vs->type) continue;
                     Type *vt = type_unwrap_distinct(vs->type);
                     bool vshared = vt && vt->kind == TYPE_STRUCT &&
                         (vt->struct_type.is_shared || vt->struct_type.is_shared_rw);
                     if (vshared) continue;
+                    /* D6 (2026-08-01): the flag was set UNCONDITIONALLY, so lending
+                     * the SAME local to a second live scoped spawn (`spawn a(&x);
+                     * spawn b(&x);` before either join) was accepted — two threads
+                     * mutating one stack local, a worker-vs-worker race the
+                     * parent-write check cannot see. Reject an already-borrowed
+                     * local; join() clears the flag, so sequential borrow (spawn,
+                     * join, spawn again) still compiles. */
+                    if (vs->is_borrowed_by_thread) {
+                        checker_error(c, node->loc.line,
+                            "'%.*s' is already borrowed by a live scoped spawn — "
+                            "lending it to a second thread is a data race. join() "
+                            "the first thread before spawning the second",
+                            (int)vl, vn);
+                        continue;
+                    }
                     vs->is_borrowed_by_thread = true;
-                    sym->th_borrows_name = vn;
-                    sym->th_borrows_name_len = vl;
-                    break; /* track the first borrowed local (common case) */
+                    /* D7: record EVERY borrow (was: first only, then `break`), so
+                     * join() releases each. First entry mirrors the legacy field. */
+                    if (sym->th_borrow_names && sym->th_borrow_lens &&
+                        sym->th_borrow_count < bcap) {
+                        sym->th_borrow_names[sym->th_borrow_count] = vn;
+                        sym->th_borrow_lens[sym->th_borrow_count] = vl;
+                        sym->th_borrow_count++;
+                    }
+                    if (!sym->th_borrows_name) {
+                        sym->th_borrows_name = vn;
+                        sym->th_borrows_name_len = vl;
+                    }
                 }
             }
         }
@@ -14391,6 +14524,50 @@ static void check_stmt(Checker *c, Node *node) {
                         "or ordering)",
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
                         (int)bad_len, bad_name);
+                }
+            }
+        }
+        /* D8 (2026-08-01): a concrete function handed to the spawn target as a
+         * funcptr ARGUMENT (`spawn worker(bump)` where `worker(*()->void fp)`
+         * calls `fp()`) may be invoked on the thread. The body scan above cannot
+         * see it: inside `worker`, `fp` resolves to a PARAM, not a global
+         * function, so the direct-call descent skips it — and the spawn-site
+         * arg→param binding was never fed into any scan. So a non-shared global
+         * RMW (or Pool/Slab/Ring metadata mutation) reached from the callback
+         * raced clean. Distinct from BH-18 #8, which handles the same shape for
+         * calls INSIDE an already-scanned body.
+         *
+         * Mirror that conservative function-name descent at the spawn site. Sound
+         * over-approximation: a function-name arg that is passed but never invoked
+         * is scanned too — the remediation is identical either way
+         * (shared / threadlocal / @atomic_*). */
+        for (int ai = 0; ai < node->spawn_stmt.arg_count; ai++) {
+            Node *an = node->spawn_stmt.args[ai];
+            if (!an || an->kind != NODE_IDENT) continue;
+            Symbol *asym = scope_lookup(c->global_scope, an->ident.name,
+                                        (uint32_t)an->ident.name_len);
+            if (!asym || !asym->is_function || !asym->func_node ||
+                asym->func_node->kind != NODE_FUNC_DECL ||
+                !asym->func_node->func_decl.body) continue;
+            const char *abad = NULL;
+            uint32_t ablen = 0;
+            if (scan_unsafe_global_access(c, asym->func_node->func_decl.body,
+                                          &abad, &ablen)) {
+                ensure_func_props(c, asym);
+                if (asym->props.has_sync) {
+                    checker_warning(c, node->loc.line,
+                        "spawn target may invoke '%.*s' (passed as a function-pointer "
+                        "argument) which accesses non-shared global '%.*s' — potential "
+                        "data race (atomic/barrier present, verify ordering)",
+                        (int)an->ident.name_len, an->ident.name,
+                        (int)ablen, abad);
+                } else {
+                    checker_error(c, node->loc.line,
+                        "spawn target may invoke '%.*s' (passed as a function-pointer "
+                        "argument) which accesses non-shared global '%.*s' — data race. "
+                        "Use shared struct, threadlocal, or @atomic_*",
+                        (int)an->ident.name_len, an->ident.name,
+                        (int)ablen, abad);
                 }
             }
         }

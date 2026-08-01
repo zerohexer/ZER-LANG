@@ -1,0 +1,11 @@
+// G2 positive: passing &x to a helper AFTER .join() (borrow cleared) is safe.
+void worker(*u32 p) { *p = 1; }
+void poke(*u32 p)   { *p = 7; }
+u32 main() {
+    u32 x = 0;
+    ThreadHandle t = spawn worker(&x);
+    t.join();
+    poke(&x);       // after join — borrow cleared; sets x = 7
+    if (x == 7) { return 0; }
+    return 1;
+}

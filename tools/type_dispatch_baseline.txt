@@ -739,3 +739,9 @@ emitter.c:if (pinner && pinner->kind == TYPE_UNION) {
 # Documented-safe (582920db #4 baseline lines).
 zercheck_ir.c:(eff->kind == TYPE_STRUCT &&
 zercheck_ir.c:(eff->kind == TYPE_UNION &&
+checker.c:bool is_ptr_like = (eff_pl->kind == TYPE_POINTER ||
+checker.c:eff_pl->kind == TYPE_ARRAY ||
+checker.c:eff_pl->kind == TYPE_OPAQUE);
+checker.c:eff_pl->kind == TYPE_SLICE ||
+checker.c:if (eff_pl->kind == TYPE_OPTIONAL)
+checker.c:if (eff_pl->kind == TYPE_POINTER) {

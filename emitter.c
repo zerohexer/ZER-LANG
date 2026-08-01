@@ -4064,23 +4064,75 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
  * TOP-LEVEL DECLARATION EMISSION
  * ================================================================ */
 
-/* Emit all stamped container struct declarations */
+/* Find the container_instances[] index whose stamped struct IS `t` (pointer
+ * identity), or -1. */
+static int container_inst_index_of(Emitter *e, Type *t) {
+    if (!e->checker || !t) return -1;
+    for (int ci = 0; ci < e->checker->container_inst_count; ci++)
+        if (e->checker->container_instances[ci].stamped_struct == t) return ci;
+    return -1;
+}
+
+/* G5 (2026-08-02): emit one stamped container struct, but FIRST (recursively,
+ * post-order) emit any stamped container it holds BY VALUE — a bare by-value
+ * field, or an array of one. Both need the COMPLETE type in C.
+ *
+ * Pointer / optional / slice fields impose NO ordering dependency: a pointer to
+ * an incomplete type is legal C, and that is precisely what lets the
+ * `?*LNode(T) next` linked list (J4) work.
+ *
+ * WHY THIS IS REQUIRED BY J4, and only by J4: the tie-the-knot registration in
+ * checker.c records a container in container_instances[] BEFORE resolving its
+ * fields, so creation order can now place an OUTER stamp ahead of an INNER
+ * stamp it holds by value (`container Outer(T){ Inner(T) x; }`). Emitting in
+ * registration order then gives GCC "field 'x' has incomplete type". Verified:
+ * with J4 applied and this fix absent, all three probe shapes (2-level nest,
+ * 3-level nest, array-of-container) fail; without J4 none of them do. This DFS
+ * decouples emission order from registration order.
+ *
+ * `inprog` guards a by-value cycle, which the checker already rejects (J4's
+ * self-containment guard) — the guard here just prevents infinite recursion if
+ * one ever slips through. */
+static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *inprog) {
+    if (emitted[ci] || inprog[ci]) return;
+    Type *st = e->checker->container_instances[ci].stamped_struct;
+    if (!st || type_dispatch_kind(st) != TYPE_STRUCT) { emitted[ci] = 1; return; }
+    inprog[ci] = 1;
+    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+        Type *ft = type_unwrap_distinct(st->struct_type.fields[fi].type);
+        while (type_dispatch_kind(ft) == TYPE_ARRAY)
+            ft = type_unwrap_distinct(ft->array.inner);
+        if (type_dispatch_kind(ft) == TYPE_STRUCT) {
+            int dep = container_inst_index_of(e, ft);
+            if (dep >= 0 && dep != ci) emit_one_container_struct(e, dep, emitted, inprog);
+        }
+    }
+    inprog[ci] = 0;
+    if (emitted[ci]) return;
+    emitted[ci] = 1;
+    emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
+    e->indent++;
+    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+        SField *sf = &st->struct_type.fields[fi];
+        emit_indent(e);
+        emit_type_and_name(e, sf->type, sf->name, sf->name_len);
+        emit(e, ";\n");
+    }
+    e->indent--;
+    emit(e, "};\n\n");
+}
+
+/* Emit all stamped container struct declarations, topologically ordered so a
+ * by-value container field's struct is always complete before its user. */
 static void emit_container_structs(Emitter *e) {
     if (!e->checker || e->checker->container_inst_count == 0) return;
-    for (int ci = 0; ci < e->checker->container_inst_count; ci++) {
-        Type *st = e->checker->container_instances[ci].stamped_struct;
-        if (!st || st->kind != TYPE_STRUCT) continue;
-        emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
-        e->indent++;
-        for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
-            SField *sf = &st->struct_type.fields[fi];
-            emit_indent(e);
-            emit_type_and_name(e, sf->type, sf->name, sf->name_len);
-            emit(e, ";\n");
-        }
-        e->indent--;
-        emit(e, "};\n\n");
-    }
+    int n = e->checker->container_inst_count;
+    char *emitted = (char *)calloc((size_t)n, 1);
+    char *inprog = (char *)calloc((size_t)n, 1);
+    if (!emitted || !inprog) { free(emitted); free(inprog); return; }
+    for (int ci = 0; ci < n; ci++) emit_one_container_struct(e, ci, emitted, inprog);
+    free(emitted);
+    free(inprog);
 }
 
 static void emit_struct_decl(Emitter *e, Node *node) {

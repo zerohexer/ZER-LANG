@@ -1,0 +1,12 @@
+// AUDIT 2026-07-24: the distinct-const fix must NOT over-reject the legitimate
+// `const MyPtr cg = g` init (distinct nominal identity preserved) nor a
+// deref-READ through it. Only writes/const-strips are rejected.
+distinct typedef *u32 MyPtr;
+u32 B = 5;
+MyPtr g = @cast(MyPtr, &B);
+i32 main() {
+    const MyPtr cg = g;
+    u32 x = *cg;
+    if (x == 5) { return 0; }
+    return 1;
+}

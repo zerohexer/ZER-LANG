@@ -1,0 +1,24 @@
+// G5 (2026-08-02): the branch test covers a 2-level by-value nest. These are
+// the two shapes it does NOT cover, both of which fail identically once J4 ties
+// the knot (verified: "field 'mid' has incomplete type" / "array type has
+// incomplete element type"). Pointer/optional/slice fields impose no ordering
+// dependency, so only by-value nesting and arrays-of need the DFS.
+container Inner(T) { T[4] data; u32 n; }
+container Mid(T)   { Inner(T) inner; u32 tag; }
+container Outer(T) { Mid(T) mid; u32 id; }
+
+container Leaf(T)   { T v; }
+container Holder(T) { Leaf(T)[3] arr; Leaf(T) one; }
+
+u32 main() {
+    Outer(u32) o;
+    o.mid.inner.data[0] = 7; o.mid.inner.n = 1; o.mid.tag = 2; o.id = 3;
+    if (o.mid.inner.data[0] != 7) { return 1; }
+    if (o.mid.tag != 2) { return 2; }
+
+    Holder(u32) h;
+    h.arr[0].v = 5; h.one.v = 9;
+    if (h.arr[0].v != 5) { return 3; }
+    if (h.one.v != 9) { return 4; }
+    return 0;
+}

@@ -370,10 +370,10 @@ implementing, and each new test verified DISCRIMINATING against a from-HEAD buil
 | G6 | compiles CLEAN, exits 1 — `ping()` ran on the short-circuited path | exit 0 |
 | G7 | checker emitted ZERO diagnostics; only GCC caught it, cryptically | rejected at the ZER line |
 
-**G5 is NOT done and is NOT a hole today.** Three probe shapes (2-level nest, 3-level nest,
-array-of-container) all compile and run clean on main. The entry itself records that G5 fixes a
-regression **J4** introduces — "take both or neither" — so shipping it now would be an unexercised
-change with no test that can fail. It stays here, paired with J4.
+**G5 landed 2026-08-02 WITH J4** (see §J), not here. At §G time all three probe shapes (2-level
+nest, 3-level nest, array-of-container) compiled and ran clean on main, so shipping it then would
+have been an unexercised change with no test that could fail. Applying J4 broke all three, and G5
+fixed all three — the "take both or neither" dependency confirmed empirically in both directions.
 
 Two DEVIATIONS from the source branches, both deliberate:
 - **G2**: `NODE_ASSIGN` is in the parenthesize set (the branch had it in the tight set). Assignment
@@ -450,7 +450,38 @@ emission forms.
   silent corruption on bare-metal. Reject those; the bounded const-`@inttoptr` idiom keeps its bound and is
   unaffected. Test `mmio_volatile_param_index_unbounded.zer`.
 
-### J. Type system / correctness
+### J. Type system / correctness — **ALL 4 DONE 2026-08-02 (+ the paired G5)**
+
+**Landed 2026-08-02.** Every reproducer verified against main BEFORE implementing:
+
+| | Verified on main before the fix | After |
+|---|---|---|
+| J1 | `*cg = 7` COMPILED and mutated a read-only global; `@ptrcast` laundered the const | both rejected |
+| J2 | `?*u32 mp = <volatile *u32>` COMPILED (var-decl and assign forms) | both rejected |
+| J3 | `Holder h = { .t = t }; free(t); h.t.id` COMPILED — UAF | rejected |
+| J4 | canonical linked list `?*LNode(T) next` REJECTED as a type collision | compiles |
+| G5 | (no repro standalone — see below) | — |
+
+**The J4 -> G5 dependency was MEASURED in both directions.** G5 was deliberately withheld from §G
+because none of three probe shapes reproduced on main. After J4 landed here, ALL THREE broke
+("field 'x' / 'mid' has incomplete type", "array type has incomplete element type") and G5 fixed
+all three. So the tracker's "take both or neither" is confirmed, and the §G decision to defer was
+correct rather than merely cautious.
+
+Two things worth carrying forward:
+- **J2's live sites are NOT `check_volatile_strip`.** That helper only runs for casts/intrinsics;
+  the asymmetric-wrap hole was in the var-decl-init and assignment coercion gates, which carry
+  their own copies of the lockstep peel. Fixing only the helper would have looked right and changed
+  nothing.
+- **J4 improved a diagnostic as a side effect.** `container_by_value_self` previously rejected with
+  the misleading "would stamp type ... collides with an existing user-defined type"; it now says
+  "cannot contain itself by value in field 'x' — use '*BNode(u32)' (pointer) instead".
+
+`check_const_strip` is the new centralized helper (mirror of `check_volatile_strip`) replacing three
+copy-pasted const-strip blocks at @cast / @ptrcast / @pun. Its symbol fallback is GATED on a
+DISTINCT declared type because `sym->is_const` is overloaded — it also marks an if-unwrap capture
+`|node|`, which is binding-immutable but pointee-MUTABLE.
+
 
 - **J1 — `const MyPtr` (distinct pointer typedef) dropped its const** (`xxhbdg` `f80166fd`, CRITICAL). The const
   branch matched only a bare pointer/slice, NOT distinct (the volatile branch already unwrapped), so

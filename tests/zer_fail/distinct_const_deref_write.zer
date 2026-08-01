@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// AUDIT 2026-07-24 (docs/limitations.md, was zer_gaps): writing through a
+// const-qualified distinct-typedef pointer silently mutated read-only data.
+// `const MyPtr` (MyPtr = distinct *u32) carries its const on the SYMBOL (the
+// distinct wrapper can't hold is_const without losing nominal identity); the
+// deref-write check read only the TYPE's is_const, so `*cg = 7` compiled and
+// STATIC_BUF became 7. Fix: the deref-write check consults sym->is_const for a
+// distinct pointer.
+distinct typedef *u32 MyPtr;
+u32 STATIC_BUF = 0;
+MyPtr g = @cast(MyPtr, &STATIC_BUF);
+i32 main() {
+    const MyPtr cg = g;
+    *cg = 7;
+    return (i32)STATIC_BUF;
+}

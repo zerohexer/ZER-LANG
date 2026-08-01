@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// audit 2026-07-23: asymmetric ?*T = <volatile *T> stripped volatile silently
+// (lockstep optional-peel required BOTH sides optional). MMIO read becomes hoistable.
+mmio 0x0..0xFFFFFFFF;
+u32 sink;
+void f() {
+    volatile *u32 vp = @inttoptr(*u32, 0x1000);
+    ?*u32 mp = vp;
+    if (mp) |p| { sink = *p; }
+}
+u32 main() { return 0; }

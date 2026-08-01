@@ -1936,11 +1936,23 @@ static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
      * innermost matched level. Keeping the qualifier check local to the
      * coercion site avoids making `type_equals` volatile-strict globally
      * (which would change type identity at every call site). */
-    while (seff && teff && seff->kind == TYPE_OPTIONAL &&
-           teff->kind == TYPE_OPTIONAL) {
+    /* J2 (2026-08-02): peel each side INDEPENDENTLY. The BUG-747 lockstep loop
+     * required BOTH sides optional, so the ASYMMETRIC wrap
+     * `?*u32 mp = <volatile *u32>` never peeled: seff was already a POINTER so
+     * the loop did not run, then teff (still OPTIONAL) failed the pointer test
+     * below and the function returned false — volatile stripped SILENTLY, which
+     * makes an MMIO read hoistable/elidable by GCC.
+     *
+     * Independent peeling cannot introduce a false positive: the
+     * "target keeps volatile" early-return still fires when the target's
+     * pointer is volatile at any depth, and if either side does not bottom out
+     * in a pointer we return false. Differing nesting depth is a real type
+     * mismatch reported elsewhere; erring toward CATCHING here is the safe
+     * direction for a qualifier check. */
+    while (seff && type_dispatch_kind(seff) == TYPE_OPTIONAL)
         seff = type_unwrap_distinct(seff->optional.inner);
+    while (teff && type_dispatch_kind(teff) == TYPE_OPTIONAL)
         teff = type_unwrap_distinct(teff->optional.inner);
-    }
 
     if (!seff || seff->kind != TYPE_POINTER) return false;
     if (!teff || teff->kind != TYPE_POINTER) return false;
@@ -1955,6 +1967,52 @@ static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
         checker_error(c, line,
             "%s cannot strip volatile qualifier — "
             "target must be volatile pointer", context);
+        return true;
+    }
+    return false;
+}
+
+/* ---- Const-stripping check (J1, 2026-08-02) ----
+ * Mirror of check_volatile_strip above. A `const MyPtr` (MyPtr = distinct *T)
+ * carries its const on the SYMBOL, not the type: the distinct wrapper cannot
+ * hold is_const without losing its nominal (pointer-identity) match, so the
+ * stored type is a plain NON-const distinct pointer. The inline const-strip
+ * checks read only the TYPE's is_const, so `@ptrcast(*u32, cg)` with
+ * `const MyPtr cg` silently laundered the const and the subsequent `*m = 7`
+ * mutated read-only data.
+ *
+ * The symbol fallback is GATED on a DISTINCT declared type (src_type differs
+ * from its unwrapped form). `sym->is_const` is overloaded — it also marks an
+ * if-unwrap capture `|node|`, which is BINDING-immutable but POINTEE-mutable
+ * and whose type is a PLAIN pointer. Without the gate, `(*opaque)node` inside
+ * an `if (opt) |node|` would be wrongly rejected. Only a distinct pointer drops
+ * its const from the type, so only there is the symbol the sole carrier.
+ *
+ * Returns true on violation (error already emitted). */
+static bool check_const_strip(Checker *c, Node *src_expr, Type *src_type,
+                              Type *tgt_type, int line, const char *context) {
+    Type *seff = type_unwrap_distinct(src_type);
+    Type *teff = type_unwrap_distinct(tgt_type);
+    /* same independent optional peel as the volatile sibling (J2) */
+    while (seff && type_dispatch_kind(seff) == TYPE_OPTIONAL)
+        seff = type_unwrap_distinct(seff->optional.inner);
+    while (teff && type_dispatch_kind(teff) == TYPE_OPTIONAL)
+        teff = type_unwrap_distinct(teff->optional.inner);
+
+    if (!seff || seff->kind != TYPE_POINTER) return false;
+    if (!teff || teff->kind != TYPE_POINTER) return false;
+    if (teff->pointer.is_const) return false; /* target keeps const — ok */
+    bool src_const = seff->pointer.is_const;
+    if (!src_const && src_expr && src_expr->kind == NODE_IDENT &&
+        src_type && type_unwrap_distinct(src_type) != src_type) {
+        Symbol *sc = scope_lookup(c->current_scope,
+            src_expr->ident.name, (uint32_t)src_expr->ident.name_len);
+        if (sc && sc->is_const) src_const = true;
+    }
+    if (src_const) {
+        checker_error(c, line,
+            "%s cannot strip const qualifier — "
+            "target must be const pointer", context);
         return true;
     }
     return false;
@@ -2637,6 +2695,34 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         /* Register in scope so field access works */
         add_symbol(c, mname, (uint32_t)mlen, st, tn->loc.line);
 
+        /* J4 (2026-08-02): TIE THE KNOT — cache the instance BEFORE resolving
+         * fields. A self-referential field (the canonical linked list
+         * `?*LNode(T) next`) re-enters this stamp path while resolving; with the
+         * cache populated only AFTER field resolution the lookup at the top
+         * missed the in-progress instance, stamped a second time, and tripped
+         * the collision check above — so the canonical linked list did not
+         * compile at all (over-rejection).
+         *
+         * Tying the knot does NOT admit an infinite-size struct: a BY-VALUE
+         * self-reference is rejected by the guard added in the field loop below.
+         * Pointer / optional-pointer / slice self-references are finite and are
+         * exactly what this enables. */
+        /* Cache the instance */
+        if (c->container_inst_count >= c->container_inst_capacity) {
+            int nc = c->container_inst_capacity < 8 ? 8 : c->container_inst_capacity * 2;
+            struct ContainerInstance *na = (struct ContainerInstance *)arena_alloc(c->arena,
+                nc * sizeof(struct ContainerInstance));
+            if (c->container_instances && c->container_inst_count > 0)
+                memcpy(na, c->container_instances, c->container_inst_count * sizeof(struct ContainerInstance));
+            c->container_instances = na;
+            c->container_inst_capacity = nc;
+        }
+        struct ContainerInstance *ci = &c->container_instances[c->container_inst_count++];
+        ci->tmpl_name = cname;
+        ci->tmpl_name_len = cnlen;
+        ci->concrete_type = concrete;
+        ci->stamped_struct = st;
+
         /* Resolve fields with T substituted */
         if (tmpl->field_count > 0) {
             st->struct_type.fields = (SField *)arena_alloc(c->arena,
@@ -2653,26 +2739,30 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                  * Handles: T, *T, ?T, []T, T[N], ?*Container(T), etc. */
                 sf->type = resolve_type(c, subst_typenode(c->arena, fd->type,
                     tmpl->type_param, tmpl->type_param_len, tn->container.type_arg));
+                /* J4: by-value self-containment guard (mirrors the
+                 * NODE_STRUCT_DECL check). Now that the knot is tied, a field
+                 * that IS the in-progress stamp by value — bare, or wrapped only
+                 * in arrays / distinct — would be an infinite-size struct, and
+                 * resolve_type happily returns it. Pointer / optional-pointer /
+                 * slice wrappers around `st` are finite and must still pass, so
+                 * only ARRAY and DISTINCT are peeled here. */
+                {
+                    Type *inner = sf->type;
+                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
+                    inner = type_unwrap_distinct(inner);
+                    if (inner == st) {
+                        checker_error(c, tn->loc.line,
+                            "container '%.*s(%s)' cannot contain itself by value "
+                            "in field '%.*s' — use '*%.*s(%s)' (pointer) instead",
+                            (int)cnlen, cname, ctype_name,
+                            (int)sf->name_len, sf->name,
+                            (int)cnlen, cname, ctype_name);
+                    }
+                }
             }
         } else {
             st->struct_type.fields = NULL;
         }
-
-        /* Cache the instance */
-        if (c->container_inst_count >= c->container_inst_capacity) {
-            int nc = c->container_inst_capacity < 8 ? 8 : c->container_inst_capacity * 2;
-            struct ContainerInstance *na = (struct ContainerInstance *)arena_alloc(c->arena,
-                nc * sizeof(struct ContainerInstance));
-            if (c->container_instances && c->container_inst_count > 0)
-                memcpy(na, c->container_instances, c->container_inst_count * sizeof(struct ContainerInstance));
-            c->container_instances = na;
-            c->container_inst_capacity = nc;
-        }
-        struct ContainerInstance *ci = &c->container_instances[c->container_inst_count++];
-        ci->tmpl_name = cname;
-        ci->tmpl_name_len = cnlen;
-        ci->concrete_type = concrete;
-        ci->stamped_struct = st;
 
         _container_depth--;
         return st;
@@ -4246,8 +4336,31 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
                     /* deref: *p = val — check if p's type is const pointer */
                     Type *ptr_type = typemap_get(c, root->unary.operand);
-                    if (ptr_type && ptr_type->kind == TYPE_POINTER && ptr_type->pointer.is_const) {
+                    Type *ptr_eff = ptr_type ? type_unwrap_distinct(ptr_type) : NULL;
+                    if (ptr_eff && type_dispatch_kind(ptr_eff) == TYPE_POINTER && ptr_eff->pointer.is_const) {
                         through_const_pointer = true;
+                    }
+                    /* J1 (2026-08-02): a `const MyPtr` (MyPtr = distinct *T)
+                     * keeps its const on the SYMBOL — the distinct wrapper
+                     * cannot carry is_const without losing nominal identity, so
+                     * the type here is a plain non-const distinct pointer. In
+                     * ZER a const pointer-typed variable means the POINTEE is
+                     * read-only (same as `const *T`), so consult the symbol.
+                     * Was a silent hole: `*cg = 7` compiled and mutated a
+                     * read-only global.
+                     *
+                     * Gated on the declared type being DISTINCT, for the same
+                     * reason as check_const_strip: sym->is_const also marks an
+                     * if-unwrap capture, which is binding-immutable but
+                     * pointee-MUTABLE and must keep compiling. */
+                    if (!through_const_pointer && ptr_eff &&
+                        type_dispatch_kind(ptr_eff) == TYPE_POINTER &&
+                        ptr_type && type_unwrap_distinct(ptr_type) != ptr_type &&
+                        root->unary.operand->kind == NODE_IDENT) {
+                        Symbol *ps = scope_lookup(c->current_scope,
+                            root->unary.operand->ident.name,
+                            (uint32_t)root->unary.operand->ident.name_len);
+                        if (ps && ps->is_const) through_const_pointer = true;
                     }
                     through_pointer = true;
                     root = root->unary.operand;
@@ -5243,10 +5356,12 @@ static Type *check_expr(Checker *c, Node *node) {
              * only check that fires on the `?`-wrapped strip. */
             Type *tgv = type_unwrap_distinct(target);
             Type *vgv = type_unwrap_distinct(value);
-            while (tgv && vgv && tgv->kind == TYPE_OPTIONAL && vgv->kind == TYPE_OPTIONAL) {
+            /* J2 (2026-08-02): independent peel — see the var-decl sibling. The
+             * lockstep form missed `?*u32 mp; mp = <volatile *u32>;`. */
+            while (tgv && type_dispatch_kind(tgv) == TYPE_OPTIONAL)
                 tgv = type_unwrap_distinct(tgv->optional.inner);
+            while (vgv && type_dispatch_kind(vgv) == TYPE_OPTIONAL)
                 vgv = type_unwrap_distinct(vgv->optional.inner);
-            }
             if (tgv && vgv && tgv->kind == TYPE_POINTER && vgv->kind == TYPE_POINTER &&
                 !tgv->pointer.is_volatile) {
                 bool val_volatile = vgv->pointer.is_volatile;
@@ -7966,14 +8081,12 @@ static Type *check_expr(Checker *c, Node *node) {
                          * so the strip check was silently skipped and the const
                          * qualifier was laundered through the distinct wrapper.
                          * Reproducer: tests/zer_fail/audit_ptrcast_distinct_const_strip.zer */
-                        Type *tgt_eff_strip = result ? type_unwrap_distinct(result) : NULL;
-                        if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
-                            tgt_eff_strip && tgt_eff_strip->kind == TYPE_POINTER &&
-                            !tgt_eff_strip->pointer.is_const) {
-                            checker_error(c, node->loc.line,
-                                "@ptrcast cannot strip const qualifier — "
-                                "target must be const pointer");
-                        }
+                        /* J1 (2026-08-02): centralized in check_const_strip, which
+                         * ALSO consults the source symbol. A `const MyPtr`
+                         * (distinct *T) keeps its const on the symbol, not the
+                         * type, so the type-only test here laundered it. */
+                        check_const_strip(c, node->intrinsic.args[0], val_type, result,
+                                          node->loc.line, "@ptrcast");
                         /* BUG-258: volatile stripping via @ptrcast.
                          * check_volatile_strip handles distinct-unwrap internally
                          * via type_unwrap_distinct in its implementation. */
@@ -8132,14 +8245,11 @@ static Type *check_expr(Checker *c, Node *node) {
                          * shape: distinct typedef *u32 PlainPtr; @pun(PlainPtr,
                          * const_ptr) silently laundered const through the
                          * distinct wrapper. */
+                        /* J1: centralized — see the @ptrcast sibling. The local
+                         * is kept: the @pun widening check below reuses it. */
                         Type *tgt_eff_pun_strip = result ? type_unwrap_distinct(result) : NULL;
-                        if (eff->kind == TYPE_POINTER && eff->pointer.is_const &&
-                            tgt_eff_pun_strip && tgt_eff_pun_strip->kind == TYPE_POINTER &&
-                            !tgt_eff_pun_strip->pointer.is_const) {
-                            checker_error(c, node->loc.line,
-                                "@pun cannot strip const qualifier — "
-                                "target must be const pointer");
-                        }
+                        check_const_strip(c, node->intrinsic.args[0], val_type, result,
+                                          node->loc.line, "@pun");
                         /* volatile stripping — same as @ptrcast BUG-258.
                          * check_volatile_strip handles distinct unwrap internally. */
                         check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
@@ -9560,18 +9670,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->intrinsic.arg_count > 0)
                         check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
                                              node->loc.line, "@cast");
-                    /* const check */
-                    {
-                        Type *veff = type_unwrap_distinct(val_type);
-                        Type *reff = type_unwrap_distinct(result);
-                        if (veff && veff->kind == TYPE_POINTER &&
-                            reff && reff->kind == TYPE_POINTER &&
-                            veff->pointer.is_const && !reff->pointer.is_const) {
-                            checker_error(c, node->loc.line,
-                                "@cast cannot strip const qualifier — "
-                                "target must be const pointer");
-                        }
-                    }
+                    /* J1: centralized — see the @ptrcast sibling. */
+                    if (node->intrinsic.arg_count > 0)
+                        check_const_strip(c, node->intrinsic.args[0], val_type, result,
+                                          node->loc.line, "@cast");
                 }
             } else {
                 result = ty_void;
@@ -10733,11 +10835,16 @@ static void check_stmt(Checker *c, Node *node) {
                 {
                     Type *tv = type_unwrap_distinct(type);
                     Type *itv = type_unwrap_distinct(init_type);
-                    while (tv && itv && tv->kind == TYPE_OPTIONAL &&
-                           itv->kind == TYPE_OPTIONAL) {
+                    /* J2 (2026-08-02): peel each side INDEPENDENTLY. The lockstep
+                     * loop required BOTH sides optional, so the ASYMMETRIC wrap
+                     * `?*u32 mp = <volatile *u32>` never peeled — the source was
+                     * already a POINTER so the loop did not run, the target stayed
+                     * OPTIONAL and failed the pointer test, and volatile was
+                     * stripped SILENTLY (an MMIO read then becomes hoistable). */
+                    while (tv && type_dispatch_kind(tv) == TYPE_OPTIONAL)
                         tv = type_unwrap_distinct(tv->optional.inner);
+                    while (itv && type_dispatch_kind(itv) == TYPE_OPTIONAL)
                         itv = type_unwrap_distinct(itv->optional.inner);
-                    }
                     if (tv && itv && tv->kind == TYPE_POINTER && itv->kind == TYPE_POINTER &&
                         !tv->pointer.is_volatile && !node->var_decl.is_volatile) {
                         bool src_volatile = itv->pointer.is_volatile;

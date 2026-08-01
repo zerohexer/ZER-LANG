@@ -1,0 +1,15 @@
+// Regression 2026-07-30: after the tie-the-knot container-cache fix, a stamped
+// container held BY VALUE inside another stamped container (Outer(T){Inner(T) x})
+// was emitted in the wrong order (Outer before Inner) -> GCC "field has
+// incomplete type". Fix: emit_container_structs topologically orders stamps.
+u32 printf(const *u8 fmt, ...);
+container Inner(T) { T v; }
+container Outer(T) { Inner(T) x; u32 tag; }
+u32 main() {
+    Outer(u32) o;
+    o.x.v = 42;
+    o.tag = 7;
+    if (o.x.v != 42) { return 1; }
+    if (o.tag != 7) { return 2; }
+    return 0;
+}

@@ -1,0 +1,15 @@
+// J3 positive control (2026-08-02): registering the designated-initializer
+// field alias must NOT over-reject the legitimate order — read through the
+// aliased field BEFORE the free.
+struct Task { u32 id; }
+struct Holder { *Task t; }
+u32 main() {
+    ?*Task mt = alloc(Task);
+    *Task t = mt orelse return;
+    t.id = 7;
+    Holder h = { .t = t };
+    u32 v = h.t.id;
+    free(t);
+    if (v != 7) { return 1; }
+    return 0;
+}

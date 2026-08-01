@@ -722,6 +722,17 @@ typedef, distinct typedef
 `typedef` creates an alias — interchangeable with the base type.
 `distinct typedef` creates a new type — NOT interchangeable. Use `@cast` to convert.
 
+A `const` distinct POINTER typedef makes the pointee read-only, exactly like
+`const *T` — writing through it, or laundering the const away with
+`@cast`/`@ptrcast`/`@pun`, is a compile error:
+```zer
+distinct typedef *u32 MyPtr;
+const MyPtr cg = g;
+*cg = 7;                        // COMPILE ERROR — write through const pointer
+*u32 m = @ptrcast(*u32, cg);    // COMPILE ERROR — cannot strip const
+u32 v = *cg;                    // OK — reading is fine
+```
+
 **SYNTAX**
 ```zer
 typedef u32 Milliseconds;              // alias — u32 and Milliseconds are same
@@ -2495,6 +2506,21 @@ void stack_push(*Stack(u32) s, u32 val) {
   — are a clean compile error with a wrapper-struct hint: wrap the
   composite in a named struct and instantiate with that. NESTED containers
   work — `Stack(Stack(u32))` resolves inner-first to `Stack_Stack_u32`.
+- SELF-REFERENCE through a pointer is supported — this is the canonical
+  linked list / tree node:
+```zer
+container LNode(T) { T val; ?*LNode(T) next; }
+
+LNode(u32) a; LNode(u32) b;
+a.val = 10; b.val = 20; a.next = &b;
+```
+  `*LNode(T)`, `?*LNode(T)` and `[*]LNode(T)` self-fields are all fine.
+- BY-VALUE self-reference is a compile error — it would be an infinite-size
+  struct. Use a pointer field instead:
+```zer
+container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR
+container BNode(T) { T val; ?*BNode(T) child; } // OK
+```
 
 ---
 

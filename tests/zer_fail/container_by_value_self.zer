@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// The by-value self-containment guard must survive the tie-the-knot cache fix:
+// a container containing itself BY VALUE is an infinite-size struct and must be
+// rejected with a ZER-source error (not a GCC incomplete-type error).
+container BNode(T) { T val; BNode(T) child; }
+u32 main() { BNode(u32) a; return 0; }

@@ -5091,8 +5091,53 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_ADDR_OF: case IR_DEREF_READ:
     case IR_CALL_DECOMP: case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP: case IR_SLICE_READ:
-    case IR_STRUCT_INIT_DECOMP:
         break;
+
+    /* J3 (2026-08-02): a DESIGNATED INITIALIZER that stores a tracked pointer
+     * into a field — `Holder h = { .t = t };` — registered NO alias, so after
+     * `free(t)` the read `h.t.id` was a use-after-free with no diagnostic. The
+     * field-ASSIGNMENT form `h.t = t` was already caught (IR_FIELD_WRITE
+     * registers a compound handle); the initializer form reached this case,
+     * which was a pure no-op. Same semantic question answered at two sites, one
+     * of them silent — the multi-site class this codebase keeps hitting.
+     *
+     * Register the same compound handle IR_FIELD_WRITE would: key ".field" on
+     * the destination local, sharing the value's alloc_id, so the free
+     * propagates FREED to it and the existing use-site check fires. */
+    case IR_STRUCT_INIT_DECOMP: {
+        Node *si = inst->expr;
+        if (si && si->kind == NODE_STRUCT_INIT && inst->dest_local >= 0 &&
+            inst->call_arg_locals &&
+            inst->call_arg_local_count == si->struct_init.field_count) {
+            for (int i = 0; i < inst->call_arg_local_count; i++) {
+                int vloc = inst->call_arg_locals[i];
+                if (vloc < 0) continue;
+                IRHandleInfo *vh = ir_find_handle(ps, vloc);
+                if (!vh || vh->state != IR_HS_ALIVE || vh->alloc_id == 0)
+                    continue;
+                const char *fname = si->struct_init.fields[i].name;
+                uint32_t fnlen = (uint32_t)si->struct_init.fields[i].name_len;
+                if (!fname || fnlen == 0) continue;
+                /* ".field" path (dot-prefixed, no root), arena-allocated */
+                char *path = (char *)arena_alloc(zc->arena, (size_t)fnlen + 2);
+                if (!path) continue;
+                path[0] = '.';
+                memcpy(path + 1, fname, fnlen);
+                path[fnlen + 1] = '\0';
+                /* snapshot BEFORE ir_add_compound_handle — it may realloc the
+                 * handle array and invalidate vh. */
+                IRAliasSnapshot snap;
+                ir_snapshot_alias(&snap, vh);
+                IRHandleInfo *ch = ir_add_compound_handle(ps, inst->dest_local,
+                    path, fnlen + 1);
+                if (ch) {
+                    ir_apply_alias(ch, &snap);
+                    ch->state = IR_HS_ALIVE;
+                }
+            }
+        }
+        break;
+    }
     }
 }
 

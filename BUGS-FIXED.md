@@ -5,6 +5,79 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — §J: four type-system holes + the paired G5 container-emission fix
+
+All four §J entries were live. G5 (§G's deferred container-emission-order entry) is landed HERE, not
+in §G, because the dependency turned out to be REAL and MEASURABLE, not just asserted.
+
+- **J1 — `const MyPtr` (distinct pointer typedef) dropped its const (CRITICAL).** A `const MyPtr`
+  (`MyPtr = distinct *u32`) carries its const on the SYMBOL, not the type: the distinct wrapper
+  cannot hold `is_const` without losing its nominal pointer-identity match, so the stored type is a
+  plain NON-const distinct pointer. Two sinks read only the type: (a) the deref-write check, so
+  `*cg = 7` compiled and MUTATED a read-only global; (b) the three copy-pasted const-strip blocks,
+  so `@ptrcast(*u32, cg)` laundered the const away and the subsequent `*m = 7` did the same. Fixed
+  by consulting `sym->is_const` at the deref-write check and in a new centralized
+  **`check_const_strip`** (mirror of `check_volatile_strip`) that replaces the @cast/@ptrcast/@pun
+  blocks. The symbol fallback is GATED on the declared type being DISTINCT — `sym->is_const` is
+  overloaded and also marks an if-unwrap capture `|node|`, which is binding-immutable but
+  pointee-MUTABLE and must keep compiling. From `xxhbdg` `f80166fd`. Tests
+  `distinct_const_deref_write.zer`, `distinct_const_ptrcast_launder.zer`, positive
+  `distinct_const_read_ok.zer`.
+- **J2 — volatile stripped via an ASYMMETRIC optional wrap (MMIO correctness).** The BUG-747
+  lockstep optional-peel required BOTH sides optional, so `?*u32 mp = <volatile *u32>` never peeled:
+  the source was already a POINTER (loop did not run), the target stayed OPTIONAL and failed the
+  pointer test, and volatile was dropped silently — the MMIO read then becomes hoistable/elidable by
+  GCC. Peel each side INDEPENDENTLY. NOTE: the fix is NOT in `check_volatile_strip` (that only runs
+  for casts/intrinsics); the live sites are the var-decl-init and assignment coercion gates, which
+  had their own copies of the lockstep loop. Independent peeling cannot false-positive — the
+  "target keeps volatile" early return still fires, and a non-pointer bottom returns false. From
+  `3o10j6` `d1a7d9cc` #2. Tests `volatile_strip_optional_{vardecl,assign}.zer`.
+- **J3 — `{ .field = ptr }` designated-init registered no alias (CRITICAL UAF).** The field
+  ASSIGNMENT form `h.t = t` was caught (IR_FIELD_WRITE registers a compound handle); the
+  INITIALIZER form reached `IR_STRUCT_INIT_DECOMP`, which was a pure no-op, so after `free(t)` the
+  read `h.t.id` was a use-after-free with no diagnostic. Same semantic question answered at two
+  sites, one silent — the multi-site class. Added the analyzer case, registering the same ".field"
+  compound handle sharing the value's alloc_id. From `n0odo5` `2d6ec421`. Test
+  `struct_init_field_alias_uaf.zer`, positive `struct_init_field_alias_ok.zer` (read BEFORE free
+  must still compile).
+- **J4 — self-referential pointer container `?*Node(T)` rejected as a type collision
+  (over-rejection).** The canonical linked list did not compile: the instance cache was populated
+  AFTER field resolution, so the self-referential field re-entered the stamp path, missed the
+  in-progress instance, stamped a second time and tripped the collision check. Fixed by TYING THE
+  KNOT (cache before fields) plus a by-value self-containment guard so an infinite-size struct still
+  gets a clean ZER error — and a better one: `container_by_value_self.zer` previously rejected with
+  the misleading "would stamp type ... collides with an existing user-defined type" and now says
+  "cannot contain itself by value in field 'x' — use '*BNode(u32)' (pointer) instead". From
+  `i0txin` `a9ba4c77`. Tests `container_self_ref_pointer.zer`, `container_by_value_self.zer`.
+- **G5 — nested by-value container emitted BEFORE the container it holds** -> gcc "field has
+  incomplete type". `emit_container_structs` now emits via DFS post-order, forcing any stamped
+  container held BY VALUE (bare field, or array-of) to be emitted before its user; pointer /
+  optional / slice fields impose no ordering dependency (a pointer to an incomplete type is legal C
+  — which is exactly what lets J4's linked list work). Decouples emission order from registration
+  order. From `i0txin` `cd9bc560`.
+
+**The J4 -> G5 dependency was MEASURED, not assumed.** During §G, G5 was deliberately NOT shipped
+because none of three probe shapes (2-level nest, 3-level nest, array-of-container) reproduced on
+main — it would have been an unexercised change with no test that could fail. After applying J4 in
+this commit, ALL THREE shapes broke ("field 'x' has incomplete type", "field 'mid' has incomplete
+type", "array type has incomplete element type"), and applying G5 fixed all three. That is the
+tracker's "take both or neither" confirmed empirically in both directions.
+
+**Coverage added beyond the branches.** `container_nested_byvalue_deep.zer` covers the two shapes the
+branch test omits — a 3-LEVEL by-value nest and an ARRAY-of-container field — both of which fail
+identically under J4-without-G5.
+
+Note the G5/J4 tests read as "controls" against a pre-fix build: their bug does not exist before J4.
+Their discriminating evidence is the J4-applied/G5-absent state recorded above.
+
+All 8 raw `->kind == TYPE_` sites introduced by the J1/J2 edits were converted to
+`type_dispatch_kind()` rather than baselined — they are unwrap loops where the accessor is exactly
+equivalent and never trips the gate.
+
+make check exit 0 — all audit gates, all matrix oracles, sink matrix clean.
+
+---
+
 ## 2026-08-01 — §G: six emitter/codegen miscompiles (emitter.c, ir_lower.c, checker.c)
 
 Six of the seven §G entries were live on main; **G5 (nested by-value container emission order) was

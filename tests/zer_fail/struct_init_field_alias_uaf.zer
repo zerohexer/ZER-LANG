@@ -1,0 +1,14 @@
+// EXPECTED: compile error — a heap pointer stored via a DESIGNATED INITIALIZER
+// field (Holder h = { .t = t }) aliases the same allocation as t. After
+// free(t), reading h.t.id is a use-after-free. The field-ASSIGNMENT form
+// (h.t = t) was already caught via IR_FIELD_WRITE; the initializer form was a
+// no-op (IR_STRUCT_INIT_DECOMP) so the alias was never registered.
+struct Task { u32 id; }
+struct Holder { *Task t; }
+u32 main() {
+    ?*Task mt = alloc(Task);
+    *Task t = mt orelse return;
+    Holder h = { .t = t };
+    free(t);
+    return h.t.id;
+}

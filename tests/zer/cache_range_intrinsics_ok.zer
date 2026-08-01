@@ -1,0 +1,17 @@
+// G4 (2026-08-01): the three cache-RANGE intrinsics had `#if x86 / #elif
+// aarch64 / #endif` with no fallback, so on RISC-V / ARM32 the loop body was
+// EMPTY — a silent no-op (stale DMA data for invalidate). A fence fallback now
+// runs on every other arch. This test pins the x86/aarch64 paths still work;
+// the fallback SELECTION is arch-conditional and is verified by the
+// preprocessor probe recorded in BUGS-FIXED.md (a runtime test on one host
+// cannot exercise another arch's preprocessor branch).
+u32 main() {
+    u8[128] buf;
+    buf[0] = 1; buf[64] = 2;
+    @cache_flush_range(&buf[0], 128);
+    @cache_clean_range(&buf[0], 128);
+    @cache_invalidate_range(&buf[0], 128);
+    if (buf[0] != 1) { return 1; }
+    if (buf[64] != 2) { return 2; }
+    return 0;
+}

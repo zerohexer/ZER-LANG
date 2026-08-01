@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// Regression (2026-07-28): @saturate in a global initializer emitted a ({...})
+// statement-expression, illegal at file scope -> GCC failure. Now rejected
+// cleanly by the checker.
+u8 sat = @saturate(u8, 300);
+u32 main() { return sat; }

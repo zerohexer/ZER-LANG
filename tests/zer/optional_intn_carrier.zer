@@ -1,0 +1,19 @@
+// Regression (2026-07-29): `?uN` / `?iN` (arbitrary-width optional) emitted a fresh
+// anonymous `struct { <carrier> value; uint8_t has_value; }` at every site. C treats
+// each anonymous struct as a distinct incompatible type, so the return-type site and
+// the var-decl/assign sites had unrelated types → GCC "incompatible types when
+// assigning/returning". Fix: emit the carrier's NAMED opt typedef (_zer_opt_u8, …).
+?u7 mk(u7 x) { return x; }
+?i5 mki(i5 x) { return x; }
+?u24 mkw(u24 x) { return x; }
+
+u32 main() {
+    ?u7 r = mk(100);
+    u7 v = r orelse 0;
+    ?i5 ri = mki(7);
+    i5 vi = ri orelse 0;
+    ?u24 rw = mkw(1000);
+    u24 vw = rw orelse 0;
+    if (v == 100 && vi == 7 && vw == 1000) { return 0; }
+    return 1;
+}

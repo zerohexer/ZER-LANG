@@ -1,0 +1,11 @@
+// Regression: explicit-deref-then-field `(*p).field` must emit `(*p).field`, not
+// `*p.field` (= C `*(p.field)`, uncompilable). Miscompile found 2026-07-31 audit.
+struct S { u32 a; u32 b; }
+u32 main() {
+    S x; x.a = 10; x.b = 20;
+    *S p = &x;
+    u32 r = (*p).b;      // read through explicit deref
+    (*p).a = 30;         // write through explicit deref
+    if (r == 20 && x.a == 30) { return 0; }
+    return 1;
+}

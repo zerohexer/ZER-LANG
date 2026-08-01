@@ -1,0 +1,45 @@
+// Short-circuit fix (2026-07-22): `orelse` nested in a && / || RHS of a PLAIN
+// assignment statement must NOT be eagerly evaluated. Was a silent miscompile
+// (passthrough handed the RHS to pre_lower_orelse, hoisting the orelse before
+// the &&). Covers: &&-skip, ||-skip, assignment-as-expression value, and a
+// trap-inside-orelse that must not fire on the short-circuited path.
+u32 sc;
+?bool ping() { sc += 1; return true; }
+
+?u32 risky(u32 i) {
+    u32[4] arr;
+    arr[0]=1; arr[1]=2; arr[2]=3; arr[3]=4;
+    return arr[i];
+}
+
+u32 main() {
+    // && short-circuit: a=false -> ping must not run
+    sc = 0;
+    bool a = false; bool x = false;
+    x = a && (ping() orelse false);
+    if (sc != 0) { return 1; }
+    if (x) { return 2; }
+
+    // || short-circuit: b=true -> RHS must not run
+    sc = 0;
+    bool b = true; bool y = false;
+    y = b || (ping() orelse false);
+    if (sc != 0) { return 3; }
+    if (!y) { return 4; }
+
+    // assignment-as-expression still yields the RHS value
+    sc = 0;
+    bool c = true; bool z = false; bool w = false;
+    w = (z = c && (ping() orelse false));
+    if (sc != 1) { return 5; }
+    if (!(w && z)) { return 6; }
+
+    // trap inside the orelse must NOT fire on the short-circuited path
+    u32 idx = 10;
+    for (u32 k = 0; k < 1; k += 1) { idx = 10; }
+    bool d = false; bool e = false;
+    e = d && (risky(idx) orelse 0) > 0;
+    if (e) { return 7; }
+
+    return 0;
+}

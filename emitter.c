@@ -309,6 +309,55 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
     return false;
 }
 
+/* A field-access OBJECT needs C parentheses when its emitted form binds LOOSER
+ * than the postfix `.`/`->` accessor. Without them valid ZER `(*p).field`
+ * mis-emits as `*p.field` = C `*(p.field)` — uncompilable, or (with a pointer
+ * field) a silent wrong access. Same for `((T)x).field` and
+ * `(a orelse b).field`. Found in the 2026-07-31 audit; verified on main by
+ * tests/zer/explicit_deref_field.zer (gcc: "'p' is a pointer; did you mean
+ * to use '->'?").
+ *
+ * Prefix-unary (`*` `&` `-` `!` `~`), casts, binary operators, orelse and
+ * assignment all bind looser than the postfix accessor; primaries and postfix
+ * forms (ident/field/index/call/literals) do not. Over-parenthesizing is
+ * always harmless in C, so when a kind is arguable the safe answer is `true`.
+ *
+ * NO `default:` — walker_default_audit.sh + -Werror=switch make a NEW NodeKind
+ * a hard build failure here, forcing an explicit decision instead of silently
+ * defaulting to "no parens" (which is the unsafe direction). */
+static bool field_obj_needs_parens(Node *obj) {
+    if (!obj) return false;
+    switch (obj->kind) {
+    /* Bind LOOSER than postfix `.`/`->` -> parenthesize.
+     * NODE_ASSIGN is here (the branch put it in the tight set): assignment is a
+     * real ZER expression (`y = (x = a && b)`) and binds looser than `.`, so if
+     * `(x = y).f` is ever constructible it needs the parens. Harmless if not. */
+    case NODE_UNARY: case NODE_BINARY: case NODE_TYPECAST:
+    case NODE_CAST: case NODE_ORELSE: case NODE_ASSIGN:
+        return true;
+    /* Primaries / postfix / statements: bind at least as tightly as the
+     * accessor, or can never appear as a field object. */
+    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX: case NODE_CALL:
+    case NODE_INTRINSIC: case NODE_SLICE: case NODE_STRUCT_INIT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_SIZEOF:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_DEFER: case NODE_CRITICAL: case NODE_ONCE: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_SPAWN: case NODE_VAR_DECL: case NODE_ASM:
+    case NODE_STATIC_ASSERT: case NODE_FILE: case NODE_FUNC_DECL:
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+    case NODE_CONTAINER_DECL:
+        return false;
+    }
+    return false;
+}
+
+
 /* Conservatively check if evaluating `n` may have observable side effects.
  * Used to decide whether to hoist a target/index into a temp before
  * duplicating it in the emitted C code.
@@ -839,6 +888,25 @@ static void emit_intn_carrier(Emitter *e, uint32_t bits, bool is_signed) {
     }
 }
 
+/* G1 (2026-08-01): carrier typedef suffix for a uN/iN width. The native carrier
+ * is the smallest int >= bits, so a `?u5` / `[*]u5` has the EXACT C layout of a
+ * `?u8` / `[*]u8` and can reuse that already-emitted NAMED typedef.
+ *
+ * Without this, non-native-width optional/slice compound types fell through to
+ * the anonymous-struct fallback, which emits a FRESH `struct { ... }` at every
+ * use site. Two such instances are distinct, incompatible C types, so any
+ * copy/assign/return failed at gcc ("incompatible types when assigning to type
+ * 'struct <anonymous>'") — `?uN` / `[*]uN` were simply unusable. This restores
+ * the named-typedef invariant (compiler-internals.md: "Named typedefs required
+ * for EVERY compound type — prevents anonymous struct duplication"). */
+static const char *intn_carrier_suffix(uint32_t bits, bool is_signed) {
+    if (is_signed)
+        return (bits <= 8) ? "i8" : (bits <= 16) ? "i16" :
+               (bits <= 32) ? "i32" : (bits <= 64) ? "i64" : "i128";
+    return (bits <= 8) ? "u8" : (bits <= 16) ? "u16" :
+           (bits <= 32) ? "u32" : (bits <= 64) ? "u64" : "u128";
+}
+
 /* Path C: after an arithmetic op, mask a uN/iN result to its bit width when the
  * carrier is wider than N (non-standard widths). Native 8/16/32/64/128 self-wrap.
  * uN -> bitmask; iN -> sign-extend (unsigned-shift then arithmetic >> to avoid
@@ -1024,10 +1092,16 @@ static void emit_type(Emitter *e, Type *t) {
             case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
             case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
             case TYPE_DISTINCT:
-            case TYPE_UINT: case TYPE_SINT: /* Path C: ?[]uN → anonymous optional slice */
-                emit(e, "struct { ");
-                emit_type(e, opt_inner);
-                emit(e, " value; uint8_t has_value; }");
+            /* G1: ?[*]uN → the carrier's named optional-slice typedef (same
+             * C layout). Split UINT/SINT so signedness comes from the case
+             * label, not a raw type-kind comparison. */
+            case TYPE_UINT:
+                emit(e, "_zer_opt_slice_%s",
+                     intn_carrier_suffix(elem->intn.bits, false));
+                break;
+            case TYPE_SINT:
+                emit(e, "_zer_opt_slice_%s",
+                     intn_carrier_suffix(elem->intn.bits, true));
                 break;
             }
             break;
@@ -1039,10 +1113,13 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
-        case TYPE_UINT: case TYPE_SINT: /* Path C: ?uN → anonymous optional */
-            emit(e, "struct { ");
-            emit_type(e, opt_inner);
-            emit(e, " value; uint8_t has_value; }");
+        /* G1: ?uN → the carrier's named optional typedef, so every `?u5`
+         * instance is ONE compatible C type. */
+        case TYPE_UINT:
+            emit(e, "_zer_opt_%s", intn_carrier_suffix(opt_inner->intn.bits, false));
+            break;
+        case TYPE_SINT:
+            emit(e, "_zer_opt_%s", intn_carrier_suffix(opt_inner->intn.bits, true));
             break;
         }
         break;
@@ -1080,11 +1157,13 @@ static void emit_type(Emitter *e, Type *t) {
         case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
         case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
         case TYPE_DISTINCT:
-        case TYPE_UINT: case TYPE_SINT: /* Path C: [*]uN → anonymous slice */
-            emit(e, "struct { ");
-            if (t->slice.is_volatile) emit(e, "volatile ");
-            emit_type(e, sl_inner);
-            emit(e, "* ptr; size_t len; }");
+        /* G1: [*]uN → the carrier's named slice typedef (prefix already
+         * selects _zer_slice_ vs _zer_vslice_ for volatile). */
+        case TYPE_UINT:
+            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, false));
+            break;
+        case TYPE_SINT:
+            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, true));
             break;
         }
         break;
@@ -2426,7 +2505,13 @@ static void emit_expr(Emitter *e, Node *node) {
 
         /* check if object is a pointer → use -> instead of .
          * BUG-410: unwrap distinct — distinct typedef *T still uses -> */
-        emit_expr(e, node->field.object);
+        {
+            /* G2 (2026-08-01): parenthesize a looser-binding object. */
+            bool fp = field_obj_needs_parens(node->field.object);
+            if (fp) emit(e, "(");
+            emit_expr(e, node->field.object);
+            if (fp) emit(e, ")");
+        }
         if (obj_eff && obj_eff->kind == TYPE_POINTER) {
             emit(e, "->%.*s", (int)node->field.field_name_len, node->field.field_name);
         } else {
@@ -5245,6 +5330,25 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { _zer_slice_i32 value; uint8_t has_value; } _zer_opt_slice_i32;\n");
     emit(e, "typedef struct { _zer_slice_i64 value; uint8_t has_value; } _zer_opt_slice_i64;\n");
     emit(e, "typedef struct { _zer_slice_usize value; uint8_t has_value; } _zer_opt_slice_usize;\n");
+
+    /* G1 (2026-08-01): 128-bit carriers, for uN/iN with 64 < N <= 128. Needed by
+     * intn_carrier_suffix's "i128"/"u128" arm.
+     *
+     * GUARDED — rdh99l emitted these unconditionally, which breaks any target
+     * without __int128 (32-bit ARM, most Cortex-M). The guard is 02nq43's
+     * contribution; taking it means a target lacking __int128 still compiles,
+     * it just cannot use a >64-bit uN compound type (which it could not have
+     * represented anyway). */
+    emit(e, "#if defined(__SIZEOF_INT128__)\n");
+    emit(e, "typedef struct { unsigned __int128 value; uint8_t has_value; } _zer_opt_u128;\n");
+    emit(e, "typedef struct { __int128 value; uint8_t has_value; } _zer_opt_i128;\n");
+    emit(e, "typedef struct { unsigned __int128* ptr; size_t len; } _zer_slice_u128;\n");
+    emit(e, "typedef struct { __int128* ptr; size_t len; } _zer_slice_i128;\n");
+    emit(e, "typedef struct { volatile unsigned __int128* ptr; size_t len; } _zer_vslice_u128;\n");
+    emit(e, "typedef struct { volatile __int128* ptr; size_t len; } _zer_vslice_i128;\n");
+    emit(e, "typedef struct { _zer_slice_u128 value; uint8_t has_value; } _zer_opt_slice_u128;\n");
+    emit(e, "typedef struct { _zer_slice_i128 value; uint8_t has_value; } _zer_opt_slice_i128;\n");
+    emit(e, "#endif\n");
     emit(e, "typedef struct { _zer_slice_f32 value; uint8_t has_value; } _zer_opt_slice_f32;\n");
     emit(e, "typedef struct { _zer_slice_f64 value; uint8_t has_value; } _zer_opt_slice_f64;\n");
     emit(e, "\n");
@@ -6298,6 +6402,47 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  node->binary.op == TOK_SLASH ? "/" : "%", tmp);
             return;
         }
+        /* G3 (2026-08-01): uN / narrow arithmetic WIDTH WRAP.
+         * A plain `x = a + b` is kept whole by lower_expr (passthrough —
+         * NODE_ASSIGN op==TOK_EQ), so it is emitted HERE rather than lowered to
+         * IR_BINOP. No emit_intn_mask runs and no narrow_cast is applied, so a
+         * narrow/uN result stored into a WIDER lvalue kept the un-wrapped,
+         * C-integer-promoted value: `u3 a=7,b=7; u32 x; x = a+b;` gave 14, not
+         * 6; `u8 200+100` gave 300, not 44. A SILENT value miscompile — it
+         * compiles clean and returns the wrong answer. Both sibling paths
+         * already wrap: the var-decl path via IR_BINOP + emit_intn_mask, the
+         * AST path via narrow_cast.
+         *
+         * This is the AST->IR emission-diff class (CLAUDE.md): a safety wrapper
+         * present on one emit path and missing on the other. emit_intn_mask was
+         * NOT in that audit's grep list — added in this commit.
+         *
+         * Comparisons and logical ops yield bool and are untouched. Shift is
+         * handled by _zer_shl/_zer_shr above; div/mod by the trap block above,
+         * whose stmt-expr is the precedent for this one. */
+        if (node->binary.op == TOK_PLUS || node->binary.op == TOK_MINUS ||
+            node->binary.op == TOK_STAR || node->binary.op == TOK_AMP ||
+            node->binary.op == TOK_PIPE || node->binary.op == TOK_CARET) {
+            Type *rtw = type_unwrap_distinct(checker_get_type(e->checker, node));
+            TypeKind rwk = type_dispatch_kind(rtw);
+            bool narrow_native = (rwk == TYPE_U8 || rwk == TYPE_I8 ||
+                                  rwk == TYPE_U16 || rwk == TYPE_I16);
+            if (narrow_native || type_is_nonnative_intn(rtw)) {
+                int tmp = e->temp_count++;
+                char lvbuf[32];
+                snprintf(lvbuf, sizeof(lvbuf), "_zer_bw%d", tmp);
+                emit(e, "({ ");
+                emit_type(e, rtw);
+                emit(e, " %s = (", lvbuf);
+                emit_rewritten_node(e, node->binary.left, func);
+                emit(e, " %s ", op);
+                emit_rewritten_node(e, node->binary.right, func);
+                emit(e, "); ");
+                emit_intn_mask_lv(e, rtw, lvbuf);
+                emit(e, "%s; })", lvbuf);
+                return;
+            }
+        }
         emit(e, "(");
         emit_rewritten_node(e, node->binary.left, func);
         emit(e, " %s ", op);
@@ -6307,6 +6452,30 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_UNARY:
+        /* G3 (2026-08-01): same width wrap for the VALUE-PRODUCING unaries.
+         * `u8 z = 0; u32 n; n = ~z;` kept the raw C result 0xFFFFFFFF instead
+         * of 255. Only `-` and `~` produce a width-sensitive value; logical-not
+         * yields bool, and deref / addr-of are not arithmetic. */
+        if (node->unary.op == TOK_MINUS || node->unary.op == TOK_TILDE) {
+            Type *rtu = type_unwrap_distinct(checker_get_type(e->checker, node));
+            TypeKind ruk = type_dispatch_kind(rtu);
+            bool narrow_u = (ruk == TYPE_U8 || ruk == TYPE_I8 ||
+                             ruk == TYPE_U16 || ruk == TYPE_I16);
+            if (narrow_u || type_is_nonnative_intn(rtu)) {
+                int tmp = e->temp_count++;
+                char lvbuf[32];
+                snprintf(lvbuf, sizeof(lvbuf), "_zer_uw%d", tmp);
+                emit(e, "({ ");
+                emit_type(e, rtu);
+                emit(e, " %s = (%s", lvbuf,
+                     node->unary.op == TOK_MINUS ? "-" : "~");
+                emit_rewritten_node(e, node->unary.operand, func);
+                emit(e, "); ");
+                emit_intn_mask_lv(e, rtu, lvbuf);
+                emit(e, "%s; })", lvbuf);
+                return;
+            }
+        }
         switch (node->unary.op) {
         case TOK_MINUS: emit(e, "-"); break;
         case TOK_BANG: emit(e, "!"); break;
@@ -6518,7 +6687,15 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     }
                 }
             }
-            emit_rewritten_node(e, node->field.object, func);
+            /* G2 (2026-08-01): same parenthesization on the IR path — the
+             * emitter's dual-dispatch rule (AST ~2400 + IR ~6500). Fixing only
+             * one path leaves the other mis-emitting. */
+            {
+                bool fp = field_obj_needs_parens(node->field.object);
+                if (fp) emit(e, "(");
+                emit_rewritten_node(e, node->field.object, func);
+                if (fp) emit(e, ")");
+            }
             emit(e, "%s%.*s", acc, (int)node->field.field_name_len, node->field.field_name);
         }
         return;
@@ -7671,8 +7848,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "        __asm__ __volatile__ (\"dc civac, %%0\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
                 "#endif\n"
                 "    }\n"
+                /* G4 (2026-08-01): the arch chain was `#if x86 / #elif aarch64 /
+                 * #endif` with NO fallback, so on RISC-V and ARM32 the loop body
+                 * was EMPTY — a SILENT no-op. For an invalidate before a DMA read
+                 * that means the CPU keeps serving stale cached data with no
+                 * diagnostic anywhere. Emit a full fence on every other arch so
+                 * ordering is at least preserved and the op is not silent.
+                 *
+                 * Placed AFTER the loop, not inside it (the source branch put it
+                 * in the loop body): one fence per CALL rather than one per
+                 * 64-byte line — same ordering guarantee, O(1) instead of
+                 * O(range/64). The now-empty loop is elided by GCC.
+                 *
+                 * Actual cache maintenance on those arches stays a
+                 * HARDWARE-consequence floor (RISC-V needs the Zicbom extension);
+                 * ZER does not claim to perform it, it just refuses to pretend
+                 * silently that it did. */
                 "#if defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#elif !defined(__x86_64__)\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
                 "#endif\n"
                 "})");
         } else if ((nlen == 17 && memcmp(name, "cache_clean_range", 17) == 0) &&
@@ -7690,8 +7885,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "        __asm__ __volatile__ (\"dc cvac, %%0\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
                 "#endif\n"
                 "    }\n"
+                /* G4 (2026-08-01): the arch chain was `#if x86 / #elif aarch64 /
+                 * #endif` with NO fallback, so on RISC-V and ARM32 the loop body
+                 * was EMPTY — a SILENT no-op. For an invalidate before a DMA read
+                 * that means the CPU keeps serving stale cached data with no
+                 * diagnostic anywhere. Emit a full fence on every other arch so
+                 * ordering is at least preserved and the op is not silent.
+                 *
+                 * Placed AFTER the loop, not inside it (the source branch put it
+                 * in the loop body): one fence per CALL rather than one per
+                 * 64-byte line — same ordering guarantee, O(1) instead of
+                 * O(range/64). The now-empty loop is elided by GCC.
+                 *
+                 * Actual cache maintenance on those arches stays a
+                 * HARDWARE-consequence floor (RISC-V needs the Zicbom extension);
+                 * ZER does not claim to perform it, it just refuses to pretend
+                 * silently that it did. */
                 "#if defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#elif !defined(__x86_64__)\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
                 "#endif\n"
                 "})");
         } else if ((nlen == 22 && memcmp(name, "cache_invalidate_range", 22) == 0) &&
@@ -7709,8 +7922,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "        __asm__ __volatile__ (\"dc ivac, %%0\" : : \"r\"(_zer_ca + _zer_i) : \"memory\");\n"
                 "#endif\n"
                 "    }\n"
+                /* G4 (2026-08-01): the arch chain was `#if x86 / #elif aarch64 /
+                 * #endif` with NO fallback, so on RISC-V and ARM32 the loop body
+                 * was EMPTY — a SILENT no-op. For an invalidate before a DMA read
+                 * that means the CPU keeps serving stale cached data with no
+                 * diagnostic anywhere. Emit a full fence on every other arch so
+                 * ordering is at least preserved and the op is not silent.
+                 *
+                 * Placed AFTER the loop, not inside it (the source branch put it
+                 * in the loop body): one fence per CALL rather than one per
+                 * 64-byte line — same ordering guarantee, O(1) instead of
+                 * O(range/64). The now-empty loop is elided by GCC.
+                 *
+                 * Actual cache maintenance on those arches stays a
+                 * HARDWARE-consequence floor (RISC-V needs the Zicbom extension);
+                 * ZER does not claim to perform it, it just refuses to pretend
+                 * silently that it did. */
                 "#if defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"dsb ish\" ::: \"memory\");\n"
+                "#elif !defined(__x86_64__)\n"
+                "    __atomic_thread_fence(__ATOMIC_SEQ_CST);\n"
                 "#endif\n"
                 "})");
         } else if ((nlen == 23 && memcmp(name, "cache_invalidate_icache", 23) == 0) &&

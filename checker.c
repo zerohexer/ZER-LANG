@@ -17591,6 +17591,34 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                         (int)decl->var_decl.name_len, decl->var_decl.name,
                         (int)gl, gn);
                 }
+                /* G7 (2026-08-01): these can NEVER appear in a file-scope
+                 * initializer, even with CONSTANT args — so unlike the bit-query
+                 * gate above there is no eval_const_expr condition. @saturate
+                 * lowers to a ({...}) statement-expression (illegal at file
+                 * scope); @addc/@subb/@mulw lower to a runtime _zer_do_*() call
+                 * ("initializer element is not constant").
+                 *
+                 * Verified on main: the CHECKER emitted ZERO diagnostics — the
+                 * program was only stopped by GCC, with a cryptic error naming
+                 * the generated .c file. Same shape as the §D3 spawn hole: an
+                 * accident of the C backend masking a silent checker. Reject
+                 * cleanly here so the message names the ZER line and the fix.
+                 *
+                 * @truncate/@bitcast fold to a constant cast and are
+                 * intentionally NOT listed — they remain valid global inits. */
+                int is_nonconst_emit =
+                    (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
+                    (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
+                                 memcmp(gn, "subb", 4) == 0 ||
+                                 memcmp(gn, "mulw", 4) == 0));
+                if (is_nonconst_emit) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' initializer cannot use @%.*s — it "
+                        "does not lower to a compile-time-constant value at global "
+                        "scope. Use a literal, or compute it in a function body",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)gl, gn);
+                }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */
             if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {

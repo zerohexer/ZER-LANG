@@ -1610,6 +1610,19 @@ i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
 u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
 ```
 
+**SAFETY**
+- Cannot be used in a GLOBAL variable initializer, even with a constant
+  argument — it does not produce a compile-time-constant value at file scope.
+  Use a literal, or compute it inside a function body. The same restriction
+  applies to `@addc`, `@subb` and `@mulw`.
+```zer
+u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
+u32 main() {
+    u8 ok = @saturate(u8, 300);    // OK — inside a function body
+    return ok;
+}
+```
+
 ---
 
 ### @bitcast(T, val)

@@ -359,6 +359,49 @@ static void emit_3ac(LowerCtx *ctx, IRInst inst) {
 /* Lower one expression to a local ID.
  * Creates temp locals and emits instructions for each sub-expression.
  * Returns the local ID holding the result, or -1 for void/error. */
+/* Does an expression subtree contain a NODE_ORELSE?  (G6, 2026-08-01)
+ * Gates the plain-assignment short-circuit reroute below. A plain
+ * `x = a && (f() orelse g)` takes the passthrough path, whose pre_lower_orelse
+ * HOISTS the nested orelse to BEFORE the `&&` — so `f()` runs (and any trap
+ * inside the orelse fires) even when `a` is already false. Verified on main:
+ * tests/zer/shortcircuit_orelse_assign_ok.zer compiles clean and exits 1
+ * because the side-effect counter is non-zero. `find_orelse` does not recurse
+ * into NODE_BINARY, so the NODE_EXPR_STMT statement-level interceptor never
+ * sees this shape.
+ *
+ * Gate it on an orelse ACTUALLY nested in the RHS so the common `x = a && b`
+ * keeps its native (already-correct) passthrough emission.
+ *
+ * If-chain, not a switch, deliberately: this is a partial carrier walk, and a
+ * no-default switch here would be a false promise of exhaustiveness. An
+ * unlisted kind returns false and falls back to the PRIOR passthrough
+ * behaviour — the pre-existing shape, never a crash — so a missed carrier
+ * degrades to today's bug rather than to a miscompile of working code. */
+static bool sc_expr_has_orelse(Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_ORELSE) return true;
+    if (n->kind == NODE_BINARY)
+        return sc_expr_has_orelse(n->binary.left) ||
+               sc_expr_has_orelse(n->binary.right);
+    if (n->kind == NODE_UNARY) return sc_expr_has_orelse(n->unary.operand);
+    if (n->kind == NODE_TYPECAST) return sc_expr_has_orelse(n->typecast.expr);
+    if (n->kind == NODE_CALL) {
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (sc_expr_has_orelse(n->call.args[i])) return true;
+        return false;
+    }
+    if (n->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (sc_expr_has_orelse(n->intrinsic.args[i])) return true;
+        return false;
+    }
+    if (n->kind == NODE_FIELD) return sc_expr_has_orelse(n->field.object);
+    if (n->kind == NODE_INDEX)
+        return sc_expr_has_orelse(n->index_expr.object) ||
+               sc_expr_has_orelse(n->index_expr.index);
+    return false;
+}
+
 static int lower_expr(LowerCtx *ctx, Node *expr) {
     if (!expr) return -1;
     ZTRACE("LOWER-EXPR  %-12s @ line %d", node_kind_name(expr->kind), expr->loc.line);
@@ -800,7 +843,20 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
      * Simple `x = Y` is handled at statement level; here we focus on
      * compound ops which need the original target + op preserved. */
     case NODE_ASSIGN: {
-        if (expr->assign.op == TOK_EQ) goto passthrough;
+        bool plain_sc = false;
+        if (expr->assign.op == TOK_EQ) {
+            /* G6 (2026-08-01): plain `x = Y` normally passes through. EXCEPTION:
+             * a short-circuit `&&`/`||` RHS carrying a nested `orelse` must be
+             * decomposed through lower_expr -> lower_shortcircuit_to_dest (the
+             * path var-decl-init, call args, conditions and return all use),
+             * else passthrough hands it to pre_lower_orelse which hoists the
+             * orelse before the `&&`. Narrowed to the exact trigger. */
+            Node *rhs = expr->assign.value;
+            bool rhs_sc = rhs && rhs->kind == NODE_BINARY &&
+                (rhs->binary.op == TOK_AMPAMP || rhs->binary.op == TOK_PIPEPIPE);
+            if (!(rhs_sc && sc_expr_has_orelse(rhs))) goto passthrough;
+            plain_sc = true;
+        }
         /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
          * passthrough emitter emits a simple compound assign with no nested
          * orelse visible. */
@@ -824,7 +880,10 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
         inst.expr = new_assign;
         emit_3ac(ctx, inst);
-        return -1;
+        /* G6: a plain `x = Y` in EXPRESSION position yields Y's value, so
+         * `y = (x = a && (f() orelse g))` still evaluates correctly. Compound
+         * `x op= Y` stays statement-like (-1), exactly as before. */
+        return plain_sc ? val_local : -1;
     }
 
     case NODE_INTRINSIC:

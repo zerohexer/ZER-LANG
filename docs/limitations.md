@@ -356,7 +356,37 @@ Historical per-item detail retained below for provenance.
   each block-form defer-body emission (IR_DEFER_FIRE handler + `emit_defers_from`).
   Test `defer_block_decl_multi_return.zer`.
 
-### G. Emitter / codegen miscompiles (MEDIUM)
+### G. Emitter / codegen miscompiles (MEDIUM) — **6 of 7 DONE 2026-08-01; G5 DEFERRED to J4**
+
+**Landed 2026-08-01** (G1, G2, G3, G4, G6, G7). Each reproducer was verified against main BEFORE
+implementing, and each new test verified DISCRIMINATING against a from-HEAD build:
+
+| | Verified on main before the fix | After |
+|---|---|---|
+| G1 | gcc `incompatible types ... struct <anonymous>` (both reproducers) | compiles + runs |
+| G2 | gcc `'p' is a pointer; did you mean to use '->'?` | compiles + runs |
+| G3 | compiles CLEAN, exits 1 — wrong value (`u3 7+7` = 14, not 6) | exit 0 |
+| G4 | riscv64/arm32 preprocessor selected `<EMPTY>` — silent no-op | `FENCE_SEQ_CST` |
+| G6 | compiles CLEAN, exits 1 — `ping()` ran on the short-circuited path | exit 0 |
+| G7 | checker emitted ZERO diagnostics; only GCC caught it, cryptically | rejected at the ZER line |
+
+**G5 is NOT done and is NOT a hole today.** Three probe shapes (2-level nest, 3-level nest,
+array-of-container) all compile and run clean on main. The entry itself records that G5 fixes a
+regression **J4** introduces — "take both or neither" — so shipping it now would be an unexercised
+change with no test that can fail. It stays here, paired with J4.
+
+Two DEVIATIONS from the source branches, both deliberate:
+- **G2**: `NODE_ASSIGN` is in the parenthesize set (the branch had it in the tight set). Assignment
+  is a real ZER expression and binds looser than `.`; over-parenthesizing is free.
+- **G4**: the fence goes AFTER the per-cache-line loop, not inside it — one fence per CALL instead
+  of one per 64 bytes, same ordering guarantee, O(1) vs O(range/64).
+
+**Gate outcome (see BUGS-FIXED.md).** `emit_intn_mask` added to the documented AST->IR emission-diff
+audit grep list — its absence is why G3 shipped. A mechanical "wrapper present in both emit regions"
+gate was MEASURED and rejected: it would have been GREEN on the live G3 bug, i.e. false confidence.
+The discriminating coverage is behavioural — `tests/zer/uN_width_wrap_all_forms.zer` over six
+emission forms.
+
 
 - **G1 — `?uN` / `?iN` / `[*]uN` / `?[*]uN` emitted a fresh ANONYMOUS struct per use site**
   (**`rdh99l` `23f34ab1` — PROPER**; `02nq43` `7aac453a` is the narrower duplicate). Two instances were

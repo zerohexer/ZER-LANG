@@ -1,0 +1,28 @@
+// Regression: optional/slice over a non-native-width uN/iN (?u5, [*]u5, ?u21,
+// ?i48, ?[*]u5) must use a NAMED carrier typedef, not an inline anonymous struct
+// (two anon instances are incompatible C types -> GCC "incompatible types").
+u32 main() {
+    u5 av = 1;
+    ?u5 o = av;
+    u5 ov = o orelse 0;
+    if ((u32)ov != 1) { return 1; }
+
+    u21 big = 100000;
+    ?u21 ob = big;
+    u21 vb = ob orelse 0;
+    if (vb != 100000) { return 2; }
+
+    u5[4] arr;
+    arr[0] = 7; arr[1] = 3;
+    [*]u5 s = arr;
+    ?[*]u5 os = s;
+    [*]u5 s2 = os orelse s;
+    if (s2.len != 4) { return 3; }
+    if (s2[0] != 7) { return 4; }
+
+    i48 neg = 5;
+    ?i48 oi = neg;
+    i48 vi = oi orelse 0;
+    if (vi != 5) { return 5; }
+    return 0;
+}

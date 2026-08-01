@@ -2869,9 +2869,25 @@ Two rules that survive any refactor:
    switch cases (NODE_BINARY vs NODE_ASSIGN); fixing one misses the other
    (BUG-608 vs BUG-612).
 2. Before committing an IR-emitter refactor, run:
-   `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe" emitter.c`
+   `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe|emit_intn_mask" emitter.c`
    (AST region, line < 4000) — every match needs an IR-path equivalent;
    a missing one is a silent miscompile.
+   **`emit_intn_mask` / `emit_intn_mask_lv` added to this list 2026-08-01** —
+   the uN/iN WIDTH WRAP is a safety wrapper in exactly the same class as
+   `_zer_shl`, and its absence from the list is why §G3 shipped: the var-decl
+   path (IR_BINOP + emit_intn_mask) wrapped, the plain-assign path
+   (`emit_rewritten_node` NODE_BINARY/NODE_UNARY) did not, so `u3 7+7` gave 14
+   instead of 6 — compiles clean, wrong answer.
+3. **Do NOT "upgrade" rule 2 into a region-presence gate** ("wrapper must appear
+   both before and after `emit_rewritten_node`"). MEASURED 2026-08-01: it would
+   have been GREEN on the live G3 bug — `emit_intn_mask` was already present in
+   both regions (AST=8, IR=12 via `emit_inst`); the gap was inside ONE function's
+   `NODE_BINARY`/`NODE_UNARY` arms. A green gate over a live bug is the
+   false-confidence failure this file warns about, and is worse than no gate.
+   What DOES discriminate is BEHAVIOURAL coverage across emission forms —
+   `tests/zer/uN_width_wrap_all_forms.zer` exercises var-decl init / plain assign
+   / return / call-arg / compound-assign / global-store and exits non-zero on the
+   pre-fix compiler. Add a form to that matrix when you add an emission path.
 
 Full audit protocol + the emit_expr→IR equivalence checklist table + the
 3-audit methodology (behavioral / code-inspection / diff):

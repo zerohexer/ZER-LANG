@@ -5,6 +5,95 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-01 — §G: six emitter/codegen miscompiles (emitter.c, ir_lower.c, checker.c)
+
+Six of the seven §G entries were live on main; **G5 (nested by-value container emission order) was
+NOT** — three probe shapes (2-level, 3-level, array-of-container) all compiled and ran clean. The
+tracker records it as fixing a regression that **J4** introduces, so it is deferred to land with J4
+rather than shipped as an unexercised change ("take both or neither").
+
+Two of the six are the valuable kind: they COMPILE CLEAN and return the WRONG ANSWER.
+
+- **G1 — `?uN` / `?iN` / `[*]uN` / `?[*]uN` emitted a fresh ANONYMOUS struct per use site.** Two
+  instances are distinct, incompatible C types, so any copy/assign/return failed at gcc
+  ("incompatible types when assigning to type 'struct <anonymous>'") — non-native-width compound
+  types were simply unusable. A `?u5` has the EXACT C layout of its carrier `?u8`, so route to the
+  carrier's already-emitted NAMED typedef via a new `intn_carrier_suffix(bits, is_signed)`; the
+  UINT/SINT switch arms are split so signedness comes from the case label, not a raw type-kind
+  comparison. Restores the "named typedef for EVERY compound type" invariant. SYNTHESIS: `rdh99l`
+  `23f34ab1` for the breadth (optional + slice + optional-slice), plus `02nq43` `7aac453a`'s
+  `#if defined(__SIZEOF_INT128__)` guard around the 128-bit carrier typedefs — rdh99l emits them
+  unguarded, which breaks any target without `__int128` (32-bit ARM, most Cortex-M).
+  Tests `intn_compound_types.zer`, `optional_intn_carrier.zer`.
+- **G2 — `(*p).field` emitted `*p.field`** = C `*(p.field)`, uncompilable ("'p' is a pointer; did
+  you mean to use '->'?"). New `field_obj_needs_parens` parenthesizes a field object that binds
+  looser than the postfix accessor, applied on BOTH emit paths (AST `emit_expr` + IR
+  `emit_rewritten_node`) per the emitter dual-dispatch rule. No-default exhaustive switch, so a new
+  NodeKind is a hard build failure rather than a silent default to "no parens" (the unsafe
+  direction). DEVIATION from `rvek5f` `00f3c2af`: `NODE_ASSIGN` is in the parenthesize set, not the
+  tight set — assignment is a real ZER expression (`y = (x = a && b)`) and binds looser than `.`;
+  over-parenthesizing is free. Test `explicit_deref_field.zer`.
+- **G3 — plain `x = a + b` / `x = ~a` of a narrow/uN result into a WIDER lvalue dropped the width
+  wrap.** SILENT miscompile: `u3 a=7,b=7; u32 x; x = a+b;` gave 14 instead of 6; `u8 200+100` gave
+  300 instead of 44; `u8 ~0` gave 0xFFFFFFFF instead of 255. A plain `x = Y` is kept whole by
+  lower_expr passthrough, so it is emitted by `emit_rewritten_node` and never reaches IR_BINOP's
+  `emit_intn_mask`. Wrap the width-sensitive ops (`+ - * & | ^`, unary `- ~`) in a carrier-typed
+  stmt-expr + `emit_intn_mask_lv`. From `38z6wi` `835eeb26`.
+- **G4 — `@cache_flush/clean/invalidate_range` had `#if x86 / #elif aarch64 / #endif` with NO
+  fallback**, so on RISC-V / ARM32 the per-cache-line loop body was EMPTY — a SILENT no-op (for an
+  invalidate before a DMA read, the CPU keeps serving stale data with no diagnostic). Added an
+  `#elif !defined(__x86_64__)` full-fence fallback to all three sites so ordering is preserved and
+  the op is not silent. DEVIATION from `rdh99l` `9a40ead4`: the fence goes AFTER the loop, not
+  inside it — one fence per CALL instead of one per 64-byte line, same ordering guarantee, O(1) vs
+  O(range/64); the now-empty loop is elided by GCC. Actual cache maintenance on those arches stays a
+  HARDWARE-consequence floor (RISC-V needs Zicbom). Verified by a header-free preprocessor probe:
+  x86_64 -> CLFLUSH, aarch64 -> DC CIVAC + DSB ISH, riscv64/arm32 -> FENCE_SEQ_CST (was `<EMPTY>`).
+  Reproduce with:
+  `gcc -E -nostdinc -U__x86_64__ -U__aarch64__ probe.c` — note a probe on the FULL emitted `.c`
+  does NOT work (`-U__x86_64__` makes glibc headers fail to preprocess, rc=1, so it never reaches
+  the block and reports a misleading zero). Test `cache_range_intrinsics_ok.zer` pins the
+  x86/aarch64 paths; the arch SELECTION is verified by the probe, which a runtime test on one host
+  cannot exercise.
+- **G6 — short-circuit violation: `orelse` in the RHS of a `&&`/`||` in a plain assignment.**
+  `x = a && (ping() orelse false);` ran `ping()` even when `a` was false, and a trap inside the
+  orelse fired spuriously — a SILENT miscompile. A plain `x = Y` goes to lower_expr's passthrough,
+  which hands the RHS to `pre_lower_orelse`; that HOISTS the nested orelse BEFORE the `&&` instead
+  of routing through `lower_shortcircuit_to_dest` (the path var-decl-init, call args, conditions and
+  return all use). `find_orelse` does not recurse into NODE_BINARY, so the statement-level
+  interceptor missed the shape. Reroute the plain-`=` RHS through lower_expr when it is a `&&`/`||`
+  binary CARRYING a nested orelse (new `sc_expr_has_orelse` gate, so the common `x = a && b` keeps
+  its native passthrough). The decompose returns the RHS value so `y = (x = a && ...)` still yields
+  correctly. From `38z6wi` `ddf6ac47`. Test `shortcircuit_orelse_assign_ok.zer`.
+- **G7 — `@saturate` / `@addc` / `@subb` / `@mulw` in a GLOBAL INITIALIZER.** They pass the
+  constant-expr gate but emit non-file-scope-legal C (`@saturate` -> a `({...})` statement
+  expression; `@addc`/`@subb`/`@mulw` -> a runtime `_zer_do_*()` call). Verified on main: the
+  CHECKER emitted ZERO diagnostics — the program was stopped only by GCC, with a cryptic error
+  naming the generated `.c`. Same shape as the §D3 spawn hole, an accident of the C backend masking
+  a silent checker. Now rejected cleanly at the ZER line, unconditionally (unlike the sibling
+  bit-query gate there is no `eval_const_expr` condition — these can never be constant at file
+  scope, even with constant args). `@truncate`/`@bitcast` fold to a constant cast and are
+  deliberately NOT listed. From `7fxhb3` `31796ef8`. Tests `global_init_{saturate,addc}.zer`,
+  positive `intrinsic_in_function_body_ok.zer`.
+
+**Coverage added beyond the branches.** `tests/zer/uN_width_wrap_all_forms.zer` exercises the G3
+class across SIX emission forms (var-decl init / plain assign / return / call arg / compound-assign
+RHS / global store) x the width-sensitive ops x u3/u8/u16. The branches only covered assignment.
+Every expected value is derived from the type's modulus, never from observed output. It exits 2 on
+the pre-fix compiler (the plain-assignment form) and 0 after.
+
+**Gate finding (NEGATIVE — recorded so it is not "fixed" later).** `emit_intn_mask` was missing from
+the documented AST->IR emission-diff audit grep list; it is now added, and that omission is why G3
+shipped. But the tempting mechanical upgrade — "a safety wrapper must appear both before and after
+`emit_rewritten_node`" — was MEASURED and would have been GREEN on the live bug: `emit_intn_mask`
+was already in both regions (AST=8, IR=12 via `emit_inst`), and the gap was inside one function's
+`NODE_BINARY`/`NODE_UNARY` arms. A green gate over a live bug is worse than no gate, so it was NOT
+built; behavioural form-coverage is what discriminates.
+
+All eight new positives/negatives verified DISCRIMINATING against a from-HEAD `git archive` build
+(6 fail pre-fix, 2 are intentional controls; both negatives showed 0 checker diagnostics pre-fix).
+
+---
+
 ## 2026-08-01 — §C: six escape/keep sinks accepted a dangling pointer (checker.c)
 
 Six independent accept-unsafe holes, all the same shape: a sink whose gate tested a RAW TYPE-KIND

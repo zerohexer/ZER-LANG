@@ -1,0 +1,89 @@
+// G3 coverage matrix (2026-08-01) — uN / narrow WIDTH WRAP across every
+// emission form, not just the one form the original reproducer happened to hit.
+//
+// WHY THIS EXISTS. G3 was a silent miscompile: `x = a + b` (plain assignment)
+// dropped the width wrap while `u32 x = a + b` (var-decl init) applied it, so
+// `u3 7+7` gave 14 instead of 6. The two forms take DIFFERENT emit paths
+// (passthrough/emit_rewritten_node vs IR_BINOP/emit_intn_mask), and only one
+// had the wrapper. The branch's reproducer covered assignment; nothing covered
+// return / call-arg / compound-assign, which are three more distinct paths.
+//
+// A source-level "does emit_intn_mask appear on both emit paths?" audit does
+// NOT catch this — it was already present in both regions; the gap was inside
+// one function's NODE_BINARY/NODE_UNARY arms. Behavioural coverage across the
+// forms is what discriminates, so that is what this test is.
+//
+// Every expected value below is derived from the type's modulus, never from
+// observed output:
+//   u3  wraps mod 8      u8 wraps mod 256      u16 wraps mod 65536
+
+u32 g_sink;
+
+u32 ret_u3_add(u3 a, u3 b) { return a + b; }      // form: return
+u32 ret_u8_mul(u8 a, u8 b) { return a * b; }
+u32 take(u32 v) { return v; }                      // form: call argument
+
+u32 main() {
+    // ---- form 1: var-decl init (the path that was already correct) ----
+    u3 a = 7; u3 b = 7;
+    u32 f1 = a + b;                 // 14 mod 8 = 6
+    if (f1 != 6) { return 1; }
+
+    // ---- form 2: plain assignment (the G3 bug) ----
+    u32 f2; f2 = a + b;
+    if (f2 != 6) { return 2; }
+    if (f2 != f1) { return 3; }     // the two forms must agree
+
+    // ---- form 3: return value ----
+    if (ret_u3_add(7, 7) != 6) { return 4; }
+
+    // ---- form 4: call argument ----
+    if (take(a + b) != 6) { return 5; }
+
+    // ---- form 5: compound assignment RHS ----
+    u32 f5 = 0; f5 += a + b;
+    if (f5 != 6) { return 6; }
+
+    // ---- form 6: store to a global ----
+    g_sink = a + b;
+    if (g_sink != 6) { return 7; }
+
+    // ---- op coverage on u3 (mod 8), plain-assignment form ----
+    u3 c = 7; u3 d = 5; u3 e2 = 2;
+    u32 o1; o1 = c * c;             // 49 mod 8 = 1
+    if (o1 != 1) { return 10; }
+    u32 o2; o2 = c ^ d;             // 0b111 ^ 0b101 = 0b010 = 2
+    if (o2 != 2) { return 11; }
+    u32 o3; o3 = c & d;             // 0b111 & 0b101 = 0b101 = 5
+    if (o3 != 5) { return 12; }
+    u32 o4; o4 = e2 | d;            // 0b010 | 0b101 = 0b111 = 7
+    if (o4 != 7) { return 13; }
+    u32 o5; o5 = ~c;                // ~0b111 in 3 bits = 0b000 = 0
+    if (o5 != 0) { return 14; }
+    u32 o6; o6 = ~e2;               // ~0b010 in 3 bits = 0b101 = 5
+    if (o6 != 5) { return 15; }
+
+    // ---- narrow NATIVE widths: u8 (mod 256) ----
+    u8 p = 200; u8 q = 100;
+    u32 n1; n1 = p + q;             // 300 mod 256 = 44
+    if (n1 != 44) { return 20; }
+    u8 three = 3;
+    u32 n2; n2 = p * three;         // 600 mod 256 = 88
+    if (n2 != 88) { return 21; }
+    u8 zero = 0;
+    u32 n3; n3 = ~zero;             // ~0 in 8 bits = 255
+    if (n3 != 255) { return 22; }
+    u32 n4; n4 = ~p;                // ~200 in 8 bits = 55
+    if (n4 != 55) { return 23; }
+    if (ret_u8_mul(200, 3) != 88) { return 24; }
+
+    // ---- u16 (mod 65536) ----
+    u16 r = 60000; u16 s = 10000;
+    u32 m1; m1 = r + s;             // 70000 mod 65536 = 4464
+    if (m1 != 4464) { return 30; }
+    u16 z16 = 0;
+    u32 m2; m2 = ~z16;              // ~0 in 16 bits = 65535
+    if (m2 != 65535) { return 31; }
+
+    return 0;
+}

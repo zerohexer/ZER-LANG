@@ -1,0 +1,16 @@
+// B9 (2026-08-01): a `return` hidden in an orelse-BLOCK fallback was dropped from
+// the find_return_range union, so the callee summary under-approximated ([0,7] instead
+// of [0,18]) and the caller elided its bounds guard. FIXED-ARRAY on purpose: the branch
+// reproducer used a heap slice, whose runtime check fires regardless, so it did NOT
+// discriminate. Broken: exit 18 (OOB write). Fixed: guard fires, exit 0.
+u8[8] garr;
+?u32 maybe(u32 x) { if (x > 0) { return x; } return null; }
+u32 pick(u32 x) {
+    u32 v = maybe(x) orelse { return 18; };   // return hidden in an orelse-BLOCK
+    return v & 7;                              // the only return the scan sees -> [0,7]
+}
+u32 main() {
+    u32 idx = pick(0);      // actually 18
+    garr[idx] = 5;          // [0,7] proven -> guard elided -> OOB write
+    return idx;
+}

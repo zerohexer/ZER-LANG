@@ -1,0 +1,14 @@
+// B6 (2026-08-01): a guard nested in the ELSE body pushed a guard-inverse range
+// that leaked past the unconditional join (the THEN body reset var_range_count, the
+// else body did not), proving a later garr[idx] in-bounds on the THEN path where idx
+// is wild. Broken: exit 100 (elided-guard OOB write). Fixed: guard fires, exit 0.
+u8[4] garr;
+u32 wild() { return 100; }
+u32 f(u32 sel) {
+    u32 idx = wild();
+    if (sel == 0) { garr[0] = 1; }
+    else { if (idx >= 4) { return 0; } garr[idx] = 2; }
+    garr[idx] = 7;
+    return idx;
+}
+u32 main() { return f(0); }

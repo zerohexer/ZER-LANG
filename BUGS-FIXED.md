@@ -72,6 +72,53 @@ interior-pointer UAF. Unrelated to §C.
 
 ---
 
+## 2026-08-01 — VRP: 5 more range leaks (loop bodies, else-guard, &-in-loop, signed for-init, return-range) — §B now 9/9 (checker.c)
+
+Completes the §B family. Each verified REPRODUCING on main first, fixed, re-verified.
+
+- **B1 — loop bodies (FOR / WHILE / DO_WHILE).** `var_range_count = saved_range_count` drops only
+  entries the body PUSHED; it cannot undo an IN-PLACE mutation of a pre-existing entry, so a body
+  narrowing leaked past the loop and elided a later fixed-array guard on the ZERO-TRIP path
+  (exit 42 -> 0). Snapshot the post-pre-pass VALUES and restore after the body — sound because the
+  body may run zero times and `vrp_invalidate_loop_body_writes` has already widened everything it
+  writes.
+- **B6 — else-body nested guard.** ASYMMETRY: the THEN body restores `var_range_count` after being
+  checked, the ELSE body did not — so a guard nested in the else (`else { if (idx >= 4) return; }`)
+  left its guard-inverse entry live past the unconditional join and proved a later `garr[idx]`
+  in-bounds on the THEN path (exit 100 -> 0). Reset to the count taken AFTER this if's OWN
+  guard-inverse pushes (not to `saved_range_count`) — those are sound for the following code and
+  must survive; only the else body's own pushes are dropped.
+- **B7 — loop index mutated via `&i` handed to a CALL.** New pre-pass `vrp_widen_loop_addr_taken`.
+  The sibling widening pass explicitly assumes "calls do not write the caller's locals"; `bump(&i)`
+  breaks exactly that. Both existing wipes (BUG-475 per-call, BUG-479 TOK_AMP) fire in PROGRAM ORDER
+  at the `&i` site, which is AFTER `buf[i]` in the body, so the first pass proved `buf[i]` against
+  the stale pre-loop range (exit 42 -> 0; ASan-confirmed stack overflow). The pre-pass marks every
+  address-taken local `address_taken` + full range before the body is checked. Over-widening is
+  SOUND for VRP (only ever ADDS a guard) and only address-taken vars are touched, so plain counters
+  keep their precise join. Written as an if/else chain, NOT a switch, so the walker-default audit is
+  untouched (same convention as `type_carries_data_pointer`).
+- **B8 — for-loop non-const signed init.** A non-const-evaluable init fell back to `min = 0`, but
+  `i < N` bounds only from ABOVE — `for (i32 i = start; i < 4; ...)` with a negative `start` was
+  falsely proven in [0,3] (exit 1 -> 0; ASan OOB read AND write). Seed `INT64_MIN` instead;
+  `push_var_range` CLAMPS min to 0 for an UNSIGNED variable, so unsigned counters keep their true
+  invariant and lose no precision — only the genuinely-unsound signed case widens.
+- **B9 — `find_return_range` dropped a return inside an orelse-BLOCK fallback.**
+  `u32 v = maybe(x) orelse { return 18; };` — that 18 never entered the union, so the callee summary
+  under-approximated ([0,7] instead of [0,18]) and the caller elided its guard (exit 18 -> 0).
+  Descend the fallback of a var-decl init / expr-stmt / assignment RHS, branch-local.
+
+**Test-quality note (again).** B9's branch reproducer, like B2's and B3's, indexes a HEAP SLICE whose
+runtime bounds check fires regardless of VRP — it passed on unfixed main and does NOT discriminate.
+It is also NOT at the path its commit message implies (it is
+`tests/zer_trap/vrp_orelse_block_return_range_leak.zer`). Committed version uses a fixed array and
+was confirmed failing on main first.
+
+**Tests.** `tests/zer/vrp_{loop_body_narrow_guard_for,for_signed_neg_init_guard,loop_addrof_index,
+else_nested_guard_no_leak,orelse_return_range_union}.zer`. make check 0: ZER 1044/0, Rust 784/0,
+Zig 36/0, modules 28/0, fuzz 200/0, all 8 oracles + every audit gate, sink matrix 54 CLEAN.
+
+---
+
 ## 2026-08-01 — VRP-JOIN leaks at 4 un-enumerated conditional bodies -> silent OOB (checker.c)
 
 **The class.** Main wires the `vrp_snap_take/restore/join` machinery at NODE_IF / FOR / WHILE /

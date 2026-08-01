@@ -402,6 +402,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
                                        TokenType op, Node *value);
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
+static void vrp_widen_loop_addr_taken(Checker *c, Node *n);
 
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
@@ -11630,8 +11631,26 @@ static void check_stmt(Checker *c, Node *node) {
 
                 if (node->if_stmt.else_body) {
                     /* else-block gets the inverse of then-block's range
-                     * (but we already restored, so just check else normally) */
+                     * (but we already restored, so just check else normally)
+                     *
+                     * B6 (2026-08-01): SYMMETRIC count reset. The THEN body above
+                     * restores `var_range_count` after being checked, dropping any
+                     * entry it PUSHED; the else body did not, so a guard nested in
+                     * the else (`else { if (idx >= 4) { return; } ... }`) left its
+                     * guard-inverse entry live past the unconditional join and
+                     * proved a later `garr[idx]` in-bounds on the THEN path, where
+                     * idx is wild → bounds guard elided → silent OOB write
+                     * (verified on main: exit 100 = the elided-guard write).
+                     *
+                     * Reset to the count taken AFTER this if's OWN guard-inverse
+                     * pushes, not to saved_range_count — those entries are sound
+                     * for the code following the if (that is the whole point of
+                     * the guard pattern) and must survive. Only the else body's
+                     * own pushes are dropped. In-place mutations by the else body
+                     * are still handled by the JOIN below (Finding A). */
+                    int cmp_after_guard = c->var_range_count;
                     check_stmt(c, node->if_stmt.else_body);
+                    c->var_range_count = cmp_after_guard;
                 }
                 /* Finding A: entries now hold the else-result (or the restored
                  * pre-branch values on fallthrough); union with the captured
@@ -11728,11 +11747,24 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* try to get init value for min */
             int64_t init_val = 0; /* default min */
+            bool init_known = false;
             if (node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
                 node->for_stmt.init->var_decl.init) {
                 int64_t iv = eval_const_expr(node->for_stmt.init->var_decl.init);
-                if (iv != CONST_EVAL_FAIL) init_val = iv;
+                if (iv != CONST_EVAL_FAIL) { init_val = iv; init_known = true; }
             }
+            /* B8 (2026-08-01): a NON-const-evaluable init previously fell back to
+             * min = 0 unconditionally. But `i < N` only bounds i from ABOVE — with
+             * `for (i32 i = start; i < 4; ...)` and a negative `start`, the loop var
+             * was falsely proven in [0,3] and the bounds auto-guard was elided
+             * (ASan-confirmed OOB read AND write; the while/do-while path was
+             * already sound because it seeds INT64_MIN).
+             *
+             * Seed INT64_MIN instead. push_var_range CLAMPS min to 0 for an
+             * UNSIGNED variable, so an unsigned counter keeps its true [0, N-1]
+             * invariant and loses no precision — only a signed loop var widens,
+             * which is exactly the unsound case. */
+            if (!init_known) init_val = INT64_MIN;
 
             if (loop_var && bound_val != CONST_EVAL_FAIL) {
                 if (fop == TOK_LT) {
@@ -11745,9 +11777,29 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* B7: widen any local whose address is taken in the body (e.g. `bump(&i)`)
+         * BEFORE checking it — the per-call/TOK_AMP wipes fire in program order,
+         * too late for a use that precedes the `&`. Runs AFTER the cond narrowing
+         * so it overrides a loop-var range the alias can invalidate. */
+        vrp_widen_loop_addr_taken(c, node->for_stmt.body);
+
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
+        /* B1 (2026-08-01): snapshot the post-pre-pass VALUES and restore them
+         * after the body. `var_range_count = saved_range_count` below only drops
+         * entries PUSHED by the body — it cannot undo an IN-PLACE mutation of an
+         * entry that already existed, so a range narrowed inside the body leaked
+         * past the loop and elided a later fixed-array bounds guard on the
+         * ZERO-TRIP path (verified on main: exit 42 = the elided-guard write).
+         * Restoring the post-pre-pass state is the sound post-loop value: the
+         * body may run zero times, and vrp_invalidate_loop_body_writes has
+         * already widened every var the body writes. */
+        int b1_saved = c->var_range_count;
+        struct VarRange *b1_pre = vrp_snap_take(c, b1_saved);
         check_stmt(c, node->for_stmt.body);
+        c->var_range_count = b1_saved;
+        vrp_snap_restore(c, b1_pre, b1_saved);
+        free(b1_pre);
         c->in_loop = prev_in_loop;
         c->var_range_count = saved_range_count; /* ranges invalid after loop */
         pop_scope(c);
@@ -11805,9 +11857,22 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
+        /* B7: see the for-loop driver. */
+        vrp_widen_loop_addr_taken(c, node->while_stmt.body);
+
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
+        /* B1 (2026-08-01): same in-place-mutation leak as the for-loop — see the
+         * comment there. `var_range_count = saved_range_count` drops only entries
+         * PUSHED by the body; a narrowing that mutated a pre-existing entry
+         * leaked past the loop (zero-trip path) and elided a later bounds guard.
+         * Restore the post-pre-pass VALUES. */
+        int b1w_saved = c->var_range_count;
+        struct VarRange *b1w_pre = vrp_snap_take(c, b1w_saved);
         check_stmt(c, node->while_stmt.body);
+        c->var_range_count = b1w_saved;
+        vrp_snap_restore(c, b1w_pre, b1w_saved);
+        free(b1w_pre);
         c->in_loop = prev_in_loop;
         c->var_range_count = saved_range_count;
         break;
@@ -15882,6 +15947,113 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
      * AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
 }
 
+/* B7 (2026-08-01): widen every local whose ADDRESS IS TAKEN anywhere in a loop
+ * body, BEFORE the body is checked.
+ *
+ * The sibling pass above widens direct ASSIGN writes and explicitly assumes
+ * "calls do not write the caller's locals". A call handed `&i` breaks exactly
+ * that assumption: `for (..) { buf[i] = 99; bump(&i); }` mutates `i` through the
+ * pointer. The per-call address-taken wipe (BUG-475) and the TOK_AMP handler
+ * (BUG-479) both fire in PROGRAM ORDER at the `&i` site — which is AFTER
+ * `buf[i]` in the body — so on the first pass `buf[i]` was proven against the
+ * stale pre-loop range and the bounds guard was elided (verified on main:
+ * exit 42 = the elided-guard write; ASan-confirmed stack overflow).
+ *
+ * Fix: a pre-pass that finds every `&x` in the body and marks x address_taken
+ * with a full range, so no later narrowing applies anywhere in the loop.
+ * Over-widening is SOUND for VRP — it can only ADD a guard, never remove one —
+ * and only address-taken vars are touched, so plain counters keep the precise
+ * join. Mirrors the sibling's if/else-chain form (NOT a switch) so the
+ * walker-default audit stays untouched. */
+static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
+    if (!n) return;
+    NodeKind k = n->kind;
+    if (k == NODE_UNARY) {
+        if (n->unary.op == TOK_AMP) {
+            Node *root = n->unary.operand;
+            while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                root = (root->kind == NODE_FIELD) ? root->field.object
+                                                  : root->index_expr.object;
+            }
+            if (root && root->kind == NODE_IDENT) {
+                struct VarRange *r = find_var_range(c, root->ident.name,
+                    (uint32_t)root->ident.name_len);
+                if (r) {
+                    r->min_val = INT64_MIN;
+                    r->max_val = INT64_MAX;
+                    r->known_nonzero = false;
+                    r->address_taken = true; /* blocks all later narrowing */
+                }
+            }
+        }
+        vrp_widen_loop_addr_taken(c, n->unary.operand);
+    } else if (k == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            vrp_widen_loop_addr_taken(c, n->block.stmts[i]);
+    } else if (k == NODE_IF) {
+        vrp_widen_loop_addr_taken(c, n->if_stmt.cond);
+        vrp_widen_loop_addr_taken(c, n->if_stmt.then_body);
+        vrp_widen_loop_addr_taken(c, n->if_stmt.else_body);
+    } else if (k == NODE_FOR) {
+        vrp_widen_loop_addr_taken(c, n->for_stmt.init);
+        vrp_widen_loop_addr_taken(c, n->for_stmt.cond);
+        vrp_widen_loop_addr_taken(c, n->for_stmt.step);
+        vrp_widen_loop_addr_taken(c, n->for_stmt.body);
+    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        vrp_widen_loop_addr_taken(c, n->while_stmt.cond);
+        vrp_widen_loop_addr_taken(c, n->while_stmt.body);
+    } else if (k == NODE_SWITCH) {
+        vrp_widen_loop_addr_taken(c, n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].body);
+    } else if (k == NODE_EXPR_STMT) {
+        vrp_widen_loop_addr_taken(c, n->expr_stmt.expr);
+    } else if (k == NODE_DEFER) {
+        vrp_widen_loop_addr_taken(c, n->defer.body);
+    } else if (k == NODE_CRITICAL) {
+        vrp_widen_loop_addr_taken(c, n->critical.body);
+    } else if (k == NODE_ONCE) {
+        vrp_widen_loop_addr_taken(c, n->once.body);
+    } else if (k == NODE_VAR_DECL) {
+        vrp_widen_loop_addr_taken(c, n->var_decl.init);
+    } else if (k == NODE_RETURN) {
+        vrp_widen_loop_addr_taken(c, n->ret.expr);
+    } else if (k == NODE_ASSIGN) {
+        vrp_widen_loop_addr_taken(c, n->assign.target);
+        vrp_widen_loop_addr_taken(c, n->assign.value);
+    } else if (k == NODE_CALL) {
+        /* THE case this pass exists for: `bump(&i)`. */
+        vrp_widen_loop_addr_taken(c, n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->call.args[i]);
+    } else if (k == NODE_INTRINSIC) {
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->intrinsic.args[i]);
+    } else if (k == NODE_BINARY) {
+        vrp_widen_loop_addr_taken(c, n->binary.left);
+        vrp_widen_loop_addr_taken(c, n->binary.right);
+    } else if (k == NODE_FIELD) {
+        vrp_widen_loop_addr_taken(c, n->field.object);
+    } else if (k == NODE_INDEX) {
+        vrp_widen_loop_addr_taken(c, n->index_expr.object);
+        vrp_widen_loop_addr_taken(c, n->index_expr.index);
+    } else if (k == NODE_ORELSE) {
+        vrp_widen_loop_addr_taken(c, n->orelse.expr);
+        vrp_widen_loop_addr_taken(c, n->orelse.fallback);
+    } else if (k == NODE_SLICE) {
+        vrp_widen_loop_addr_taken(c, n->slice.object);
+        vrp_widen_loop_addr_taken(c, n->slice.start);
+        vrp_widen_loop_addr_taken(c, n->slice.end);
+    } else if (k == NODE_TYPECAST) {
+        vrp_widen_loop_addr_taken(c, n->typecast.expr);
+    } else if (k == NODE_STRUCT_INIT) {
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            vrp_widen_loop_addr_taken(c, n->struct_init.fields[i].value);
+    }
+    /* All other NodeKind values are leaves (literals, idents, break/continue/
+     * goto/label/yield/await/spawn/asm/static_assert) — no `&` subtree. */
+}
+
 /* Mark a node as proven safe — emitter will skip runtime check */
 static void mark_proven(Checker *c, Node *node) {
     if (c->proven_safe_count >= c->proven_safe_capacity) {
@@ -16816,6 +16988,28 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
     }
     if (node->kind == NODE_ONCE) {
         return find_return_range(c, node->once.body, out_min, out_max, found, true);
+    }
+    /* B9 (2026-08-01): a `return` hidden in an orelse-BLOCK fallback attached to a
+     * var-decl init / expr-stmt / assignment RHS is a REAL return path this scan
+     * never reached — it fell through to the `return true` below and SILENTLY
+     * dropped from the union, so the summary UNDER-approximated the callee's
+     * range and a caller elided its bounds guard on `arr[f()]` (verified on main:
+     * exit 18 = the elided-guard OOB write, vs 0 with the guard).
+     *
+     * `u32 v = maybe(x) orelse { return 18; };` — the 18 must be unioned in.
+     * Branch-local (in_branch = true), and the recursive NODE_RETURN handling
+     * gives up the whole summary if the returned value has no derivable range,
+     * so this can only make the summary MORE conservative, never less. */
+    {
+        Node *oe = NULL;
+        if (node->kind == NODE_VAR_DECL)       oe = node->var_decl.init;
+        else if (node->kind == NODE_EXPR_STMT) oe = node->expr_stmt.expr;
+        else if (node->kind == NODE_ASSIGN)    oe = node->assign.value;
+        if (oe && oe->kind == NODE_ORELSE && oe->orelse.fallback) {
+            if (!find_return_range(c, oe->orelse.fallback, out_min, out_max,
+                                   found, true))
+                return false;
+        }
     }
     return true; /* non-return statement — ok */
 }

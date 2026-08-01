@@ -1,0 +1,11 @@
+// Audit 2026-08-01 (no-over-rejection companion of escape_container_vardecl_launder):
+// a @container-derived pointer into a LOCAL that does NOT escape stays legal.
+struct Node { u32 v; u32 list; }
+u32 use() {
+    Node local;
+    local.v = 111;
+    *u32 lp = &local.list;
+    *Node d = @container(*Node, lp, list);
+    return d.v;
+}
+u32 main() { u32 x = use(); if (x == 111) { return 0; } return 1; }

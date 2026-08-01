@@ -5,6 +5,74 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-01 — audit sweep: 8 fixes (1 UAF + 4 silent OOB + 1 escape UAF + 1 compiler SIGSEGV + 1 race), all multi-site / per-node-kind gaps
+
+A fresh adversarial audit (parallel finder agents + maintainer re-verification with ASan/TSan)
+found eight clean-compiling holes, each a member of a documented recurring class (CLAUDE.md
+"MULTI-SITE SAFETY … per-sink patchwork" and the VRP-JOIN-per-node-kind class). All fixed +
+regression-tested; `make check` GREEN, sink matrix CLEAN (44 ok).
+
+**1. G5 — heap pointer stored into a struct-GLOBAL FIELD dangles unflagged (🔴 UAF).**
+`Holder g; g.p = n; free(n);` (g a struct global) left `g.p` dangling; any later reader observes a
+use-after-free on a reused slab slot. The bare-global store `g = n` was already caught (BUG-739),
+but the `.field`/`[i]` projection sink was missed — the store hook matched only `NODE_IDENT`.
+Fix (zercheck_ir.c): new `ir_build_global_field_key` builds the full dotted key ("g.p") for a
+store into a field/index of an unshadowed global; the store handler registers a compound global
+pseudo-root `(IR_GLOBAL_ROOT_ID, "g.p")` sharing the rhs alloc_id, so a later free propagates
+FREED and the exit-pass flags the definite dangle (MAYBE_FREED stays unflagged, same conservatism
+as bare-ident, BUG-742). Test `tests/zer_fail/g5_struct_global_field_dangle.zer`.
+
+**2–5. VRP range-narrowing leaks past a conditionally/deferred-executed body → silent OOB (🔴×4).**
+Same class as the 2026-07-19 §A fixes (switch/for/goto/do-while), four node kinds still called
+`check_stmt(body)` with no VRP save/restore, so a bounds-guard narrowing inside a body that runs on
+only ONE path (or at scope exit, or only once program-wide) leaked to the always-run code, eliding a
+later `arr[idx]` bounds check (ASan-confirmed stack OOB write):
+- `orelse { block }` fallback (checker.c NODE_ORELSE, runs only on None path).
+- `if (opt) |v| {}` capture then/else body (checker.c optional-capture branch — it `break`s before
+  the regular-if VRP save/restore).
+- `defer { }` body (checker.c NODE_DEFER — narrows at the statement point but runs at scope EXIT).
+- `@once { }` body (checker.c NODE_ONCE — runs exactly once program-wide; a 2nd call runtime-skips
+  the body behind a `_zer_once` flag, but the leaked narrowing elided the always-run guard).
+Fix: each site snapshots (`vrp_snap_take`) + restores values and drops pushed entries around
+`check_stmt(body)`, discarding the body's path-specific VRP effects (sound; discard = the JOIN over
+the conditional/exit path). The full sibling set of conditionally-executed bodies is now covered
+(regular-if branches, switch arms, loop bodies, goto/label already had save/restore/join;
+comptime-if's taken branch and `@critical` run unconditionally). Tests
+`tests/zer/vrp_{orelse_block,ifcapture,defer_body,once_body}_range_leak.zer` (exit 0 only when the
+guard is emitted; the buggy compiler returns 55).
+
+**5. `@container`-derived local escapes un-tainted through a var-decl (🔴 UAF).**
+`*u32 lp = &local.list; *Node d = @container(*Node, lp, list); g = d;` compiled — `d` never inherited
+`is_local_derived`, so every escape sink (store-global / return / keep) trusted the unset flag
+(ASan stack-use-after-return). The var-decl escape chain-walker unwrapped intrinsics via the LAST
+arg, but `@container`'s pointer operand is `args[0]` (last arg = the field-name ident). Fix
+(checker.c ~10800): mirror `unwrap_ptr_launder`'s `@container→args[0]` special-case in the walker.
+Tests `tests/zer_fail/escape_container_vardecl_launder.zer` + `tests/zer/container_local_use_ok.zer`
+(no over-rejection of a non-escaping local use).
+
+**6. `*(&x) = v` crashes the COMPILER with SIGSEGV (robustness / DoS on valid input).**
+`u32 b=0; *(&b)=5;` (semantically `b = 5`) SEGV'd zerc. The NODE_ASSIGN const-check lvalue walker
+handled `NODE_UNARY(STAR)`, `NODE_FIELD`, and an `else` that assumed `NODE_INDEX` — a non-STAR
+`NODE_UNARY` (the `&`) fell into that `else` and read `root->index_expr.object`, a garbage union
+field → wild deref. Fix (checker.c ~4248): explicit `NODE_INDEX` branch, a `NODE_UNARY(AMP)` branch
+that walks the operand, and an `else break` (also hardens against other unary ops). Test
+`tests/zer/deref_addrof_assign_ok.zer`.
+
+**7. scoped-borrow exclusivity not established for an interior `&b.v` (🟠 race).**
+`ThreadHandle t = spawn worker(&b.v); b.v = 7; t.join();` compiled — the scoped-borrow matcher
+required a bare `NODE_IDENT` operand, so an interior field/index pointer registered no borrow and a
+parent write before join raced (TSan-confirmed). The whole-local `&b` form was already rejected.
+Fix (checker.c ~14127): walk the field/index chain to the root ident and borrow the whole local
+(sound over-approximation, consistent with `&b`). Test
+`tests/zer_fail/scoped_borrow_interior_field.zer`.
+
+Still OPEN from the same sweep (documented in docs/limitations.md, not fixed here): the spawn
+data-race scan is blind to a funcptr STRUCT-FIELD call whose binding is cross-function
+(`g_ops.cb = bad` in main, `g_ops.cb()` in the spawn target) — a cross-function funcptr-field
+resolution that borders the banned whole-program analysis.
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

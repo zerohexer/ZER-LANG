@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// G5 (audit 2026-08-01): a heap pointer stored into a struct-GLOBAL FIELD then
+// freed leaves the global field dangling — any later reader (this or another
+// function) observes a use-after-free on a reused slab slot. The bare-global
+// store `g = n` was already caught (BUG-739); the `.field` projection sink was
+// missed (per-sink patchwork). Fixed in zercheck_ir.c: store into a field/index
+// of an unshadowed global registers a compound global pseudo-root that a later
+// free marks FREED, flagged at function exit.
+struct Node { u32 val; }
+struct Holder { ?*Node p; }
+Holder g;
+u32 main() {
+    *Node n = alloc(Node) orelse return;
+    n.val = 42;
+    g.p = n;
+    free(n);
+    return 0;
+}

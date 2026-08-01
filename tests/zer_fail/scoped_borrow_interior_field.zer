@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Audit 2026-08-01: a scoped spawn lent an INTERIOR pointer `&b.v` established no
+// exclusive borrow (the matcher required a bare NODE_IDENT operand), so a parent
+// write `b.v = 7` before .join() raced (TSan-confirmed). The whole-local `&b`
+// form was already rejected. Fix: walk the field/index chain to the root ident
+// and borrow the whole local (sound over-approximation).
+struct Box { u32 v; u32 w; }
+void worker(*u32 p) { for (u32 i=0;i<100000;i+=1){ *p += 1; } }
+u32 main() {
+    Box b;
+    ThreadHandle t = spawn worker(&b.v);
+    b.v = 7;
+    t.join();
+    return b.v;
+}

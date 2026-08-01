@@ -4245,8 +4245,18 @@ static Type *check_expr(Checker *c, Node *node) {
                             through_const_pointer = true;
                     }
                     root = root->field.object;
-                } else {
+                } else if (root->kind == NODE_INDEX) {
                     root = root->index_expr.object;
+                } else if (root->kind == NODE_UNARY && root->unary.op == TOK_AMP) {
+                    /* `*(&x) = v` — the address-of cancels the enclosing deref;
+                     * the lvalue root is the operand of the `&`. Audit 2026-08-01:
+                     * a non-STAR NODE_UNARY (the `&` here) previously fell into the
+                     * NODE_INDEX `else` and read `root->index_expr.object`, a garbage
+                     * union field → compiler SIGSEGV on the valid input
+                     * `u32 b=0; *(&b)=5;`. Walk the operand instead. */
+                    root = root->unary.operand;
+                } else {
+                    break; /* other unary ops aren't an lvalue chain */
                 }
             }
             if (through_const_pointer) {
@@ -7461,7 +7471,21 @@ static Type *check_expr(Checker *c, Node *node) {
                  * bare-statement `f() orelse { ... }` (value discarded) stays legal.
                  * A block that DIVERGES on every path (return/break/continue/goto)
                  * never reaches the consumer, so it keeps the unwrapped type. */
-                check_stmt(c, node->orelse.fallback);
+                /* VRP (2026-08-01): the block runs ONLY on the None path, so any
+                 * range narrowing inside it (e.g. a nested `if (idx>=N) return;`
+                 * guard) must NOT leak to the always-run code after the orelse —
+                 * that code also runs on the Some path where the guard never
+                 * fired. Same class as the §A control-flow-join fixes; discard
+                 * the body's VRP effects (snapshot values + drop pushed entries).
+                 * ASan-verified stack-OOB otherwise. */
+                {
+                    int os_saved = c->var_range_count;
+                    struct VarRange *os_pre = vrp_snap_take(c, os_saved);
+                    check_stmt(c, node->orelse.fallback);
+                    c->var_range_count = os_saved;
+                    vrp_snap_restore(c, os_pre, os_saved);
+                    free(os_pre);
+                }
                 result = orelse_block_diverges(node->orelse.fallback)
                              ? unwrapped : ty_void;
             } else {
@@ -10781,9 +10805,21 @@ static void check_stmt(Checker *c, Node *node) {
                              * from the slice subject through a slice-via-intermediate-var, so
                              * a later keepfn(s) never infers keep on np's root param. */
                             else if (init_root->kind == NODE_SLICE) init_root = init_root->slice.object;
-                            /* BUG-338: walk into intrinsic args (ptrcast, bitcast) */
+                            /* BUG-338: walk into intrinsic args (ptrcast, bitcast).
+                             * Audit 2026-08-01: @container's pointer operand is
+                             * args[0], NOT the last arg (its last arg is the
+                             * field-name ident) — the naive last-arg unwrap landed
+                             * on the field name, so a local laundered through
+                             * `d = @container(*T, lp, field)` never inherited
+                             * is_local_derived and escaped un-tainted at every
+                             * downstream sink (store-global / return / keep;
+                             * ASan-confirmed stack-use-after-return). Mirror
+                             * unwrap_ptr_launder's @container special-case. */
                             else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
-                                init_root = init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                                init_root = (init_root->intrinsic.name_len == 9 &&
+                                    memcmp(init_root->intrinsic.name, "container", 9) == 0)
+                                    ? init_root->intrinsic.args[0]
+                                    : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;
@@ -11299,11 +11335,27 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
-                check_stmt(c, node->if_stmt.then_body);
-                pop_scope(c);
-
-                if (node->if_stmt.else_body)
-                    check_stmt(c, node->if_stmt.else_body);
+                /* VRP (2026-08-01): the `if (opt) |v| {}` capture then-body runs
+                 * only on the Some path and the else-body only on the None path;
+                 * neither's range narrowing is valid on the merged continuation.
+                 * This optional-capture branch `break`s before the regular-if VRP
+                 * save/restore below, so discard the bodies' VRP effects here
+                 * (snapshot values + drop pushed entries). ASan-verified stack-OOB
+                 * otherwise (a nested `if (idx>=N) return;` guard leaked). */
+                {
+                    int cap_saved = c->var_range_count;
+                    struct VarRange *cap_pre = vrp_snap_take(c, cap_saved);
+                    check_stmt(c, node->if_stmt.then_body);
+                    pop_scope(c);
+                    c->var_range_count = cap_saved;
+                    vrp_snap_restore(c, cap_pre, cap_saved);
+                    if (node->if_stmt.else_body) {
+                        check_stmt(c, node->if_stmt.else_body);
+                        c->var_range_count = cap_saved;
+                        vrp_snap_restore(c, cap_pre, cap_saved);
+                    }
+                    free(cap_pre);
+                }
                 break;
             }
         }
@@ -12766,7 +12818,20 @@ static void check_stmt(Checker *c, Node *node) {
             false, NULL,
             false, NULL);
         c->defer_depth++;
-        check_stmt(c, node->defer.body);
+        /* VRP (2026-08-01): a defer body executes at SCOPE EXIT, not at this
+         * statement point. Any range narrowing or assignment inside it (e.g.
+         * `defer { idx = 2; }`) must NOT narrow the intervening straight-line
+         * code, where the defer has not yet run. Discard the body's VRP effects
+         * (snapshot values + drop pushed entries). ASan-verified stack-OOB
+         * otherwise. */
+        {
+            int def_saved = c->var_range_count;
+            struct VarRange *def_pre = vrp_snap_take(c, def_saved);
+            check_stmt(c, node->defer.body);
+            c->var_range_count = def_saved;
+            vrp_snap_restore(c, def_pre, def_saved);
+            free(def_pre);
+        }
         c->defer_depth--;
         break;
 
@@ -13730,7 +13795,19 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->once.body) {
             bool saved_in_once = c->in_once;
             c->in_once = true;
+            /* VRP (2026-08-01): a @once body runs exactly once PROGRAM-WIDE — on
+             * every call after the first it is runtime-skipped (a `_zer_once`
+             * flag guards it). A range narrowing inside it must NOT leak to the
+             * always-run code after the @once, which executes on the skipped
+             * calls too. Same class as the orelse/if-capture/defer VRP fixes;
+             * discard the body's VRP effects. Verified: without this, a 2nd call
+             * elides a later bounds guard (leaked narrowing). */
+            int once_saved = c->var_range_count;
+            struct VarRange *once_pre = vrp_snap_take(c, once_saved);
             check_stmt(c, node->once.body);
+            c->var_range_count = once_saved;
+            vrp_snap_restore(c, once_pre, once_saved);
+            free(once_pre);
             c->in_once = saved_in_once;
         }
         break;
@@ -14071,11 +14148,25 @@ static void check_stmt(Checker *c, Node *node) {
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
                     if (!ba || ba->kind != NODE_UNARY ||
-                        ba->unary.op != TOK_AMP || !ba->unary.operand ||
-                        ba->unary.operand->kind != NODE_IDENT)
+                        ba->unary.op != TOK_AMP || !ba->unary.operand)
                         continue;
-                    const char *vn = ba->unary.operand->ident.name;
-                    uint32_t vl = (uint32_t)ba->unary.operand->ident.name_len;
+                    /* HOLE2 (audit 2026-08-01): `&b.v` / `&b[i]` — an interior
+                     * pointer lent to a scoped spawn. Walk the field/index chain
+                     * to the root ident so the borrow is registered on the whole
+                     * local (the write-side check also walks to root). The matcher
+                     * previously required a bare NODE_IDENT operand, so
+                     * `spawn worker(&b.v)` established NO borrow and a parent write
+                     * `b.v = 7` before join raced (TSan-confirmed). Borrowing the
+                     * whole local is a sound over-approximation, consistent with
+                     * the whole-`&b` case. */
+                    Node *bop = ba->unary.operand;
+                    while (bop && (bop->kind == NODE_FIELD || bop->kind == NODE_INDEX)) {
+                        if (bop->kind == NODE_FIELD) bop = bop->field.object;
+                        else bop = bop->index_expr.object;
+                    }
+                    if (!bop || bop->kind != NODE_IDENT) continue;
+                    const char *vn = bop->ident.name;
+                    uint32_t vl = (uint32_t)bop->ident.name_len;
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
                     bool vglobal = scope_lookup_local(c->global_scope,
                                        vn, vl) != NULL;

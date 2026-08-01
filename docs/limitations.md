@@ -656,22 +656,55 @@ an ASan build).
   (unlike a stack local) → main's concurrent write between spawn/join is unflagged → the thread writes
   MAIN's TLS slot. A5 (BUG-757) closed threadlocal `&`-escape for fire-and-forget; the scoped-spawn path
   was not covered.
-- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF).
-  `gap_struct_global_field_dangle.zer`. `g.p = n; free(n);` (g a struct global) leaves `g.p` dangling, but
-  the "global left dangling at exit" check (GAP-3/BUG-739, zercheck_ir.c ~3231) matches only a BARE global
-  ident store (`g = n`, which IS caught) — the `.field` projection sink is missed (per-sink patchwork; cf.
-  the P9 by-value-field-launder fix that descended the projection to the root). Cross-thread amplification:
-  storing into a `shared struct` field + reading from a worker = silent cross-thread UAF on a reused slab
-  slot (observably reproduced, exit=999). CAUTION for the fixer: extends the BUG-742 global-dangle
-  conservatism — the maintainer deliberately does NOT flag MAYBE_FREED globals at exit (avoids noising the
-  legit register-ctx-then-callback pattern); a field-projection fix must flag only a DEFINITELY-freed
-  target, mirroring the bare-ident register/alias/exit machinery for the compound `(IR_GLOBAL_ROOT_ID,
-  name.field)` key.
+- **G5 — heap pointer stored into a struct-global FIELD dangles unflagged** (🔴 UAF). **✅ FIXED
+  2026-08-01** (zercheck_ir.c) — see BUGS-FIXED.md 2026-08-01 #1. New `ir_build_global_field_key`
+  builds the full dotted key ("g.p") and the store handler registers a compound global pseudo-root
+  `(IR_GLOBAL_ROOT_ID, "g.p")` sharing the rhs alloc_id; a later free propagates FREED and the
+  exit-pass flags the DEFINITE dangle (MAYBE_FREED stays unflagged per the BUG-742 conservatism the
+  CAUTION below demanded). Test `tests/zer_fail/g5_struct_global_field_dangle.zer`. (Original report:
+  `g.p = n; free(n);` left `g.p` dangling because the exit-dangle check matched only a BARE global
+  ident store `g = n`; the `.field` projection sink was per-sink-patchwork-missed.)
 
 **Test-only (not a bug):** `fxvnsu` also rewrites the flaky `rust_tests/rc_cond_004` (a Rust-Mutex→ZER
 translation assuming cross-statement atomicity ZER's per-statement locking doesn't provide → ~12%
 lost-update failures breaking the `make check` gate; rewritten to accumulate via atomic compound-assign).
 Main still has the flaky version.
+
+---
+
+## OPEN — spawn race scan blind to a funcptr STRUCT-FIELD call bound cross-function (2026-08-01) (🟠 race)
+
+**Symptom (accept-unsafe, TSan-confirmed):** a spawned function that reaches a non-shared global
+through a funcptr **struct field** whose binding lives in a DIFFERENT function than the spawn target
+is not scanned — the race compiles clean.
+```zer
+u32 counter;
+shared struct Ops { *() cb; }
+Ops g_ops;
+void bad() { counter += 1; }
+void worker() { g_ops.cb(); }
+u32 main() { g_ops.cb = bad; spawn worker(); spawn worker(); return counter; }  // ACCEPTED, races
+```
+**Control (proves it is a shape/transitivity gap):** `worker` calling `bad()` DIRECTLY →
+`error: spawn target 'worker' accesses non-shared global 'counter' — data race`. And binding
+`g_ops.cb = bad` INSIDE `worker` is also caught (`scan_funcname_binding` fires on the assignment).
+The gap is specifically **cross-function binding + funcptr-field-call callee**.
+
+**Root cause:** `scan_unsafe_global_access` (checker.c ~10160) follows a call transitively only when
+`call.callee->kind == NODE_IDENT` resolving to a global function; a `g_ops.cb()` call has a
+`NODE_FIELD` callee, never descended, and because `g_ops` is a `shared struct` the read of it is
+excluded (`is_shared → return false`). This extends the KNOWN-FIXED #11 (2026-07-19), which covered
+only same-function LOCAL funcptr binding via `scan_funcname_binding`.
+
+**Why not fixed here:** a sound fix needs to resolve a GLOBAL funcptr-field's binding across all
+functions (find every `g_ops.cb = <funcname>` in the program, then scan each candidate target). That
+is bounded (globals are file-scope) but borders the whole-program funcptr dataflow that CLAUDE.md
+bans from the architecture ("zercheck is per-file with summaries; heuristics cover callbacks"), and a
+naive conservative reject (flag any spawn target that calls through a funcptr) would false-positive
+broadly. Needs design before implementing. Reproducer preserved: the snippet above.
+
+**Distinctness:** NOT #11 (same-function LOCAL funcptr binding — fixed). NOT the ISR-funcptr angle
+(an `interrupt {}` body rejects local funcptr bindings, so no clean-accept race there).
 
 ---
 

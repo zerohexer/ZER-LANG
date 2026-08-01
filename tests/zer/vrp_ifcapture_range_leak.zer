@@ -1,0 +1,18 @@
+// VRP if-capture body range leak (2026-08-01)
+// Regression: the guard-narrowing inside the conditionally/deferred-executed
+// body must NOT elide the later buf[idx] bounds guard. With the fix, idx stays
+// unprovable at buf[idx] -> auto-guard fires (idx==5 OOB) -> early return 0.
+// Without the fix the narrowing leaks, the guard is dropped, the OOB write
+// happens and the function returns buf[0]==55 (test FAILS). Must exit 0.
+?u32 make_none() { return null; }
+u32 f() {
+    u32[4] buf;
+    buf[0] = 55;
+    u32 idx = 0;
+    for (u32 k = 0; k < 5; k += 1) { idx += 1; }   // idx == 5
+    ?u32 opt = make_none();                        // None -> then-body skipped
+    if (opt) |v| { if (idx >= 4) { return 0; } }    // narrowing must not leak
+    buf[idx] = 2989;
+    return buf[0];
+}
+u32 main() { return f(); }

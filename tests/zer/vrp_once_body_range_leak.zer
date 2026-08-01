@@ -1,0 +1,16 @@
+// Audit 2026-08-01: a range narrowing inside a `@once { }` body leaked past it.
+// @once runs exactly once program-wide; on the 2nd call the body is runtime-
+// skipped (a _zer_once flag guards it), but the in-body narrowing (idx = wild%4
+// -> [0,3]) leaked to the always-run buf[idx], eliding its bounds guard -> silent
+// OOB on the 2nd call. Fix: NODE_ONCE snapshots/restores VRP around the body.
+// With the fix the guard fires on the skipped call and f returns 0; the buggy
+// compiler leaves buf[0]==55 unguarded. Must exit 0.
+u32 f(u32 wild) {
+    u32[4] buf;
+    buf[0] = 55;
+    u32 idx = wild % 256;
+    @once { idx = wild % 4; }
+    buf[idx] = 2989;
+    return buf[0];
+}
+u32 main() { u32 a = f(100); u32 b = f(100); return b; }

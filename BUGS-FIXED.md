@@ -5,6 +5,38 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — defer x goto ARMING matrix: the net for the durable §F2 fix (test infrastructure)
+
+Not a bug fix — the PRECONDITION recorded in §F2's OPEN entry ("do this behind a real goto x defer
+matrix, not ad hoc"), now satisfied. `tests/test_defer_goto_matrix.c`, 34 valid cells, in `make check`
+as the 9th grid.
+
+DeferPos {none, before-goto, between, after-label} x GotoKind {none, taken, not-taken} x
+Nest {flat, in-if, in-loop, in-switch}.
+
+**The only grid that asserts a RUNTIME VALUE** rather than accept/reject, because the class it guards
+emits no diagnostic at all: a defer firing on a path whose registration never executed just leaves an
+unbalanced acquire/release. Each cell pairs `acq()` with `defer rel()` plus a fall-through marker;
+a correct compiler always lands on bal=0 (goto taken) or bal=100 (not taken) — the SAME value for
+every defer position, because the property is balance, not placement. Exit 200 is the miscompile
+signature ("an unarmed defer fired"), so a failure names the defect.
+
+**Verified to CATCH the bug, not merely to pass.** Against a pre-§F compiler (`06c0ed9d`) with the
+reject-expectation disabled, all four `defer-between/goto-taken/*` cells report
+`MISCOMPILE — an UNARMED defer fired` across every nesting, and the `goto-not-taken` variants
+correctly pass: 30/34, 4 miscompiles, 0 false positives. A grid that has only ever passed is a
+script, not a net — the same standard applied to `audit_carrier_dispatch.sh`.
+
+**It is the acceptance test for the durable fix.** The cells the §F2 interim reject refuses are marked
+by `cell_currently_rejected()`, and each already records the semantically-correct balance. When the
+per-defer armed flag lands: delete that one function, and all 34 cells must assert values and pass.
+
+Harness gotcha worth remembering: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE SOURCE, not
+at the `-o` path (CLAUDE.md "zerc -o gotchas"). Getting it wrong gave exit 127 on all 26 value cells
+and looked exactly like a compiler failure.
+
+---
+
 ## 2026-08-02 — §E/§H/§I: the harvest tail — ISR funcptr, checker SEGV, error-echo DoS, unbounded MMIO index
 
 The last four entries of the 45-fix harvest. All reproduced on main.

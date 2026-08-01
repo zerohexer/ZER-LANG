@@ -1542,6 +1542,34 @@ All runners auto-detect positive vs negative tests. `make check` runs everything
 - `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
 - `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
 
+### Test-authoring constraints that are NOT obvious (cost real loops 2026-08-02)
+
+A `tests/zer/` positive must compile AND run AND exit 0 on a HOSTED x86-64 host. Three shapes cannot
+satisfy that, and each looks like a compiler bug until you know why:
+
+- **An `interrupt` block cannot appear in a runnable positive.** GCC refuses it on hosted x86-64
+  ("sorry, unimplemented: SSE instructions aren't allowed in interrupt service routine"). No existing
+  `tests/zer` positive contains one. Verify such a case COMPILE-ONLY (`zerc f.zer -o f.c`) and say so
+  in the test/commit; put the negative in `tests/zer_fail/` as usual (it fails at the CHECKER, before
+  gcc, so it works fine).
+- **An MMIO positive must never actually touch the address.** Follow `mmio_var_idx_guard.zer`: pass an
+  OUT-OF-BOUNDS index so the auto-guard fires and returns 0. A draft that indexed IN bounds SIGTRAPped
+  133/133. That the guard fires is itself the proof the bound was derived.
+- **A defect that is about OUTPUT SIZE or compile TIME has no home** in either harness (positive =
+  exit 0, negative = must-not-compile). Record the measurement + reproduction recipe in BUGS-FIXED.md
+  instead of forcing a test (see §H2, the quadratic error-echo DoS).
+
+**Sweeping for regressions: `rust_tests/` contains NEGATIVES too.** They are not all named
+`reject_*` — some carry `// EXPECTED: compile error` in the header (e.g. `gen_goto_002.zer`). A sweep
+that treats the whole directory as positives reports false regressions. Filter on BOTH the name and
+that marker. And ALWAYS baseline an apparent regression against a from-HEAD `git archive` build before
+believing it: on 2026-08-02 eight "regressions" plus all 8 firmware examples were identical pre and
+post (they need qemu/asm-flag/cross-compile invocation).
+
+**The firmware examples are NOT in `make check`** and do not run on the host (bare-metal Cortex-M3).
+`zerc examples/qemu-cortex-m3/hello.zer -o /tmp/h.c` succeeds with only a deprecation warning —
+`--run` failing is EXPECTED, not a defect.
+
 ### Test Organization Rules — Where to Put New Tests
 
 **By origin — which folder:**

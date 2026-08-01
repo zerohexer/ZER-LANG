@@ -353,15 +353,19 @@ net. Tests: `tests/zer/erased_map_get_ok.zer` (positive), `tests/zer_fail/erased
 param-view return still over-rejects with the leak false-positive — kept deliberately (it catches
 the through-call interior-pointer UAF). universal_pointer.md §36.17 has the full ledger.
 
-## The 2026-08-01 branch-harvest sweep — 26 fixes, and WHY they existed (read before any safety work)
+## The 2026-08-01/02 branch-harvest sweep — ALL 45 fixes, and WHY they existed (read before any safety work)
 
-Eleven `claude/gifted-noether-*` audit branches were harvested into main over one session:
-**§A (1) + §B (9) + §C (7) + §D (9) = 26 fixes**, each verified reproducing on main first, each with
-regression tests. The per-bug detail is in BUGS-FIXED.md 2026-08-01 and the harvest tracker at the top
-of `docs/limitations.md` (which also lists the 19 NOT yet taken: §E–§J). This section is the DURABLE
-part: the root-cause taxonomy and what it says about where the safety architecture actually leaks.
+Eleven `claude/gifted-noether-*` audit branches were harvested into main: **ALL 45 fixes** —
+§A 1 · §B 9 · §C 7 · §D 9 · §E 1 · §F 4 · §G 6 (+G5 with §J) · §H 2 · §I 1 · §J 4 — each verified
+reproducing on main FIRST, each with regression tests. Per-bug detail: BUGS-FIXED.md 2026-08-01/02;
+tracker: top of `docs/limitations.md`. This section is the DURABLE part — the root-cause taxonomy and
+what it says about where the safety architecture actually leaks.
 
-### The taxonomy (all 26 classified)
+**Exactly ONE item is deliberately still open**: the durable §F2 fix (per-defer runtime "armed"
+flag). §F2 shipped as a sound interim REJECT, and its precondition — an exhaustive goto x defer
+matrix — now exists (`tests/test_defer_goto_matrix.c`, below).
+
+### The taxonomy (the first 26 classified; §E–§J below fit the same shapes)
 
 | Pattern | Count | Shape | Examples |
 |---|---|---|---|
@@ -373,6 +377,60 @@ part: the root-cause taxonomy and what it says about where the safety architectu
 
 The first three patterns are ~18 of 26 and are all the SAME failure at different granularity: **a
 finite enumeration (of type kinds, of sinks, of node kinds) that nobody could prove complete.**
+
+**§E–§J (the remaining 19) fit the same taxonomy**, with two shapes worth naming because they recur:
+
+| Shape | Where it showed up |
+|---|---|
+| A PROXY standing in for the real predicate | §F1 used `free_line != defer_line` as a proxy for "same defer body" — correct until two frees share a physical line. §I1 used `is_volatile` as a proxy for "has an mmio bound" — correct only when the bound was actually DERIVED (a param/alias/field derives none) |
+| The check exists but is never REACHED | §E1 (`record_isr_globals` follows only DIRECT calls, so a funcptr binding defeats it at BOTH ends — the call sees a local, the binding sees a function and discards it); §J3 (`IR_STRUCT_INIT_DECOMP` was a pure no-op, so the designated-initializer form of an alias registration silently did nothing) |
+
+A PROXY is the most dangerous of these: it is right on every example anyone tried, and its failure
+mode is silent. When you find a discriminator that is not the property itself, ask what makes the two
+diverge.
+
+### The defer x goto matrix, and the shape of a "not yet" decision (2026-08-02)
+
+`tests/test_defer_goto_matrix.c` is the 9th grid and the only one that asserts a **RUNTIME VALUE**
+instead of accept/reject. Read this before touching defer emission OR before adding a new matrix.
+
+**Why a value.** The class it guards produces NO diagnostic: a `defer` that fires on a path whose
+registration never executed just leaves an unbalanced acquire/release — a lock underflow, a double
+close, a free of something never allocated. There is nothing for a reject-oracle to observe. So each
+cell pairs `acq()` with `defer rel()` plus a fall-through marker and checks the resulting BALANCE.
+
+**Two design choices that made it tractable, reusable for any future value-matrix:**
+1. **Pick a measurement INVARIANT across the axes.** Balance is identical for every defer position
+   (0 when the goto is taken, 100 when not), so the expected value is derivable from one axis instead
+   of hand-tabulated per cell. If your expected values need a 34-row table, the measurement is wrong.
+2. **Give each failure mode its own exit code.** 200 = "an unarmed defer fired"; the report names the
+   DEFECT, not "wrong value". A grid that says what broke is worth several that say something broke.
+
+**VERIFY A NEW GRID CATCHES ITS BUG.** Run it against a pre-fix build with the reject-expectation
+disabled. This one reports `MISCOMPILE — an UNARMED defer fired` on all four
+`defer-between/goto-taken/*` cells against `06c0ed9d`, 0 false positives on the not-taken variants. A
+grid that has only ever passed is a script, not a net — the same standard applied to
+`audit_carrier_dispatch.sh`.
+
+**The "not yet" decision, recorded because the reasoning generalises.** §F2's durable fix is a
+per-defer runtime armed flag: zero-init a `u8`, set it at `IR_DEFER_PUSH`, emit the fire as
+`if (armed) { body }`, and emit the flag ONLY for defers a goto can skip (the same `gi < di < li`
+analysis the reject already runs, so the common case keeps its zero-overhead unconditional fire).
+That sketch is easy. It was NOT done in the same pass, for reasons worth reusing as a checklist:
+
+- **Nothing needs to be UNDONE, and the flags COMPOSE** (`if (armed && !already_fired)`). The risk is
+  not a design conflict — it is COLLATERAL: the new flag reads and writes the same bookkeeping
+  (`defer_count` / `defer_fire_bodies` snapshots / `active_guard_below` / `restore_count`) that the
+  2026-06-29 fixes govern, and disturbing it yields a silently dropped cleanup on one path, not a
+  compile error.
+- **The net was 17 tests.** For an edit whose failure mode is silent resource mismanagement, that is
+  not enough — so the net was built FIRST and the fix goes in behind it.
+- **The interim REJECT is not a Ban-Framework violation.** That framework governs banning VALID
+  patterns; this shape currently MISCOMPILED, so an error naming the workaround is strictly better
+  than the status quo. Rejecting broken code is a safety improvement; rejecting working code is not.
+
+The matrix is now the ACCEPTANCE TEST for that fix: delete `cell_currently_rejected()` and all 34
+cells must assert values and pass. Nothing else about the grid changes.
 
 ### Why the proof stack did not catch ANY of these
 

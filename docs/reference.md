@@ -925,7 +925,7 @@ switch (ready) {
 **NOTES**
 - Union switch uses capture syntax: `.variant => |val| { ... }`
 - Mutable capture: `.variant => |*val| { val.field = 5; }`
-- Optional `?T` switch (2026-04-27): `default => |*v| { ... }` capture
+- Optional `?T` switch: `default => |*v| { ... }` capture
   pattern works. `switch (v) { .red => ... }` works when inner is enum
   or union. Dot-prefix arms on `?u32` / `?bool` (non-variant inner) are
   rejected — use `if (x) |v| { ... } else { ... }` instead.
@@ -2598,7 +2598,7 @@ zerc main.zer --run --stack-limit 2048
 
 ## C INTEROP
 
-### keep parameters (INFERRED — no annotation needed, 2026-06-19)
+### keep parameters (INFERRED — no annotation needed)
 
 **DESCRIPTION**
 `keep` marks a pointer parameter whose pointee the function retains beyond the
@@ -2687,9 +2687,9 @@ cinclude
 
 ### Bitwise
 `&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
-The 2026-04-27 fix added negative-shift handling: signed shift counts
-that are negative (e.g., `i32 n = -1; x << n`) now return 0 instead
-of falling into C undefined behavior.
+This covers negative shift counts too: a signed count that is negative
+(e.g. `i32 n = -1; x << n`) returns 0 rather than falling into C
+undefined behavior.
 
 ### Comparison
 `==  !=  <  >  <=  >=` — Returns bool.
@@ -2862,7 +2862,7 @@ borrowed by that thread until `.join()`:
 ```zer
 threadlocal u32 counter;    // each thread has its own copy
 ```
-- 2026-04-27: `threadlocal shared struct X g;` is rejected. The two
+- `threadlocal shared struct X g;` is rejected. The two
   annotations are mutually exclusive — `threadlocal` gives each thread
   its own copy + own mutex, so cross-thread synchronization is
   impossible. Use either `threadlocal` (per-thread isolation) OR

@@ -587,6 +587,15 @@ Notes:
   statement; strengthen to bisimulation where determinism allows.
 - Analyses (VRP) need correctness proofs **only where their results license
   transformations**; a pure-diagnostic analysis can stay unproven indefinitely.
+- **An analysis that fails OPEN cannot be proven sound.** Where a class cannot resolve an
+  operation (an indirect call, an unmerged CFG join) and falls back to "unknown, therefore
+  accept", its abstract state does not over-approximate the concrete one: the
+  forward-simulation diagram will not close, and that class's soundness theorem is not
+  merely unproven but **false**. Every class must widen toward its UNSAFE classification at
+  such points — the argument-precise barrier, applied uniformly. Consequence for
+  sequencing: converting a fail-open class to fail-closed is a **prerequisite for its
+  Stage-1 proof**, not follow-up work, and is far cheaper to do in C than to discover as an
+  unclosable diagram mid-port. Current instances: `docs/limitations.md`.
 - Stage 1 alone is a shippable, review-worthy product ("the safety judgment is
   machine-checked against the formal semantics"). Ship it before starting Stage 2.
 - Until a pass's Stage-2 proof lands, Tier B covers it per-build (§6): the pass emits a

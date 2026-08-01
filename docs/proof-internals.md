@@ -17,6 +17,20 @@ coverage/simulation bridge against a formal `step`). Architecture + sequencing:
 desugaring" and CLAUDE.md "The Verification Endgame". This file is the proof-
 writing MECHANICS for that plan; that section is the WHAT/WHY/ORDER.
 
+## Before you write a proof: does the class FAIL CLOSED?
+
+**An analysis that fails OPEN cannot be proven sound — do not start its proof.** Where a
+class cannot resolve an operation (an indirect call, a CFG join whose per-class state is
+not merged) and falls back to "unknown, therefore accept", its abstract state does not
+over-approximate the concrete one. The forward-simulation diagram will not close, and the
+class's soundness theorem is not merely unproven but **false**. The symptom is a stuck
+goal that no tactic reaches, arrived at after real effort.
+
+Check first that every unresolvable operation widens toward the class's UNSAFE
+classification (the argument-precise barrier), and fix the C if it does not. That is a
+prerequisite for the proof, not follow-up work. Known fail-open classes are tracked in
+`docs/limitations.md`.
+
 ## Fresh-session reading order (do this first)
 
 If you're picking up proof work cold, read these in order. Total ~65 minutes. After this, you have enough context to safely modify any `.v` file.

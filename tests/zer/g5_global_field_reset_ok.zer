@@ -1,0 +1,13 @@
+// G5 positive: resetting the struct-global field after the free is the fix the
+// rule teaches — must COMPILE and run.
+struct Node { u32 val; }
+struct Ctx { ?*Node p; }
+Ctx g;
+void stash() {
+    *Node n = alloc(Node) orelse return;
+    n.val = 7;
+    g.p = n;
+    free(n);
+    g.p = null;       // reset — no dangle
+}
+u32 main() { stash(); return 0; }

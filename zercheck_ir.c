@@ -887,6 +887,38 @@ static int ir_find_value_local(IRFunc *func, Node *val) {
     return -1;
 }
 
+/* G5 store-source launder-unwrap: recover the underlying handle-carrying local
+ * from a store RHS that was LAUNDERED, so the global-dangle sinks inherit the
+ * real alloc_id. Two shapes bypass the raw ir_find_value_local (which only sees
+ * a bare NODE_IDENT):
+ *   - `g = @ptrcast(*T, n)` / `@pun` / `@bitcast` / `@cast` / `@container` — a
+ *     NODE_INTRINSIC whose pointer operand is the source. Mirrors checker.c's
+ *     unwrap_ptr_launder; @container passes the pointer as args[0], the others
+ *     as the LAST arg (args[0] is the target TYPE).
+ *   - `g = s.ptr` — a slice's own heap `.ptr` field read; follow to the slice.
+ * Both are ASan-confirmed heap-UAF when missed (store to global, free the
+ * source, global left dangling unflagged).
+ *
+ * ONLY for the global-store dangle sinks. Do NOT swap this in for the general
+ * ir_find_value_local: the escape/compound-alias sinks intentionally treat a
+ * laundered value as untracked, and widening them here would change unrelated
+ * aliasing decisions. */
+static int ir_find_store_source_local(IRFunc *func, Node *val) {
+    if (!val) return -1;
+    if (val->kind == NODE_ORELSE) val = val->orelse.expr;
+    while (val && val->kind == NODE_INTRINSIC && val->intrinsic.arg_count > 0) {
+        if (val->intrinsic.name_len == 9 &&
+            memcmp(val->intrinsic.name, "container", 9) == 0)
+            val = val->intrinsic.args[0];
+        else
+            val = val->intrinsic.args[val->intrinsic.arg_count - 1];
+    }
+    if (val && val->kind == NODE_FIELD && val->field.field_name_len == 3 &&
+        memcmp(val->field.field_name, "ptr", 3) == 0)
+        val = val->field.object;
+    return ir_find_value_local(func, val);
+}
+
 /* ================================================================
  * CFG Merge — the key advantage over linear AST walk
  *
@@ -2353,6 +2385,83 @@ static bool ir_callee_has_summary(ZerCheck *zc, const char *name,
  * Instruction Analysis — process one IR instruction
  * ================================================================ */
 
+/* G5 — struct/array-GLOBAL FIELD/INDEX store dangle registration.
+ *
+ * `g.p = n` (g a file-scope struct global, n an ALIVE heap alloc) was
+ * UNTRACKED: ir_extract_compound_key resolves the chain root via
+ * ir_find_local_exact_first, which returns -1 for a global (no IR local), so
+ * NO (root, path) entry was registered at ANY of the three store sinks
+ * (IR_ASSIGN store, IR_FIELD_WRITE, IR_INDEX_WRITE). A later free(n) then left
+ * g.p dangling UNOBSERVED — a UAF across the exit / call boundary, silent on
+ * bare-metal (the freed slab slot gets reused). The BARE form `g = n` IS caught
+ * (registered directly under IR_GLOBAL_ROOT_ID at the IR_ASSIGN store, BUG-739);
+ * only the projection slipped — the per-sink patchwork class.
+ *
+ * Fix: register the projection under the GLOBAL pseudo-root, keyed by the FULL
+ * path INCLUDING the root name ("g.p", NOT the relative ".p" — a relative path
+ * would collide across two globals sharing a field name), sharing n's alloc_id
+ * with escaped=true. The generic free-propagation + the exit rule
+ * (ir_check_dangling_globals_at_exit) and call-window rule
+ * (ir_check_dangling_globals_at_call) then flow through UNCHANGED; both gate on
+ * IR_HS_FREED, so only a DEFINITELY-freed target is flagged and the BUG-742
+ * register-ctx-then-callback tolerance is preserved. A null / param / untracked
+ * store CLEARS any stale entry (mirrors the bare-ident branch), so the taught
+ * fix `g.p = null;` compiles.
+ *
+ * Literal field/index paths only — ir_measure_key_path returns <= 0 for a
+ * variable index, which is conservatively skipped (matches the bare-compound
+ * behaviour; a variable-index store already escape-untracks its value).
+ *
+ * Returns true iff it handled a global-rooted projection. Shared by all THREE
+ * store sinks — ONE query, not a per-sink copy (this bug existed because the
+ * question was answered independently at each sink). */
+static bool ir_register_global_field_store(ZerCheck *zc, IRPathState *ps,
+                                           IRFunc *func, Node *target_expr,
+                                           int rhs_local) {
+    if (!target_expr) return false;
+    if (target_expr->kind != NODE_FIELD && target_expr->kind != NODE_INDEX)
+        return false;
+    Node *root = ir_key_root_ident(target_expr);
+    if (!root) return false;
+    /* root must be an unshadowed global with NO local slot (a same-named
+     * function local shadows the global — locals win). */
+    if (!ir_ident_is_unshadowed_global(zc, func, root)) return false;
+    if (ir_find_local_exact_first(func, root->ident.name,
+                                  (uint32_t)root->ident.name_len) >= 0)
+        return false;
+    /* build the full key "g.p" = root name + relative path */
+    int rel = ir_measure_key_path(target_expr);
+    if (rel <= 0) return false;   /* unkeyable (e.g. variable index) */
+    uint32_t rootlen = (uint32_t)root->ident.name_len;
+    uint32_t total = rootlen + (uint32_t)rel;
+    char *gpath = (char *)arena_alloc(zc->arena, total + 1);
+    if (!gpath) return false;
+    memcpy(gpath, root->ident.name, rootlen);
+    int w = ir_build_key_path(target_expr, gpath + rootlen, rel + 1, NULL);
+    if (w != rel) return false;
+    gpath[total] = '\0';
+
+    IRHandleInfo *grh = (rhs_local >= 0) ? ir_find_handle(ps, rhs_local) : NULL;
+    if (grh && grh->state == IR_HS_ALIVE && grh->alloc_id != 0) {
+        IRAliasSnapshot gsnap;
+        ir_snapshot_alias(&gsnap, grh);
+        IRHandleInfo *gh = ir_add_compound_handle(ps, IR_GLOBAL_ROOT_ID,
+                                                  gpath, total);
+        if (gh) {
+            ir_apply_alias(gh, &gsnap);
+            gh->state = IR_HS_ALIVE;
+            gh->escaped = true; /* INVARIANT — see IR_GLOBAL_ROOT_ID */
+        }
+    } else {
+        /* null reset / param / untracked — clear a stale binding so
+         * `g.p = n; free(n); g.p = null;` doesn't false-positive. */
+        IRHandleInfo *gh = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID,
+                                                   gpath, total);
+        if (gh) { gh->state = IR_HS_UNKNOWN; gh->alloc_id = 0; }
+    }
+    return true;
+}
+
 static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
     (void)zc; /* used for error reporting */
     if (g_zer_trace && !zc->building_summary)
@@ -3184,6 +3293,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             Node *target_expr = inst->expr->assign.target;
             Node *value_expr = inst->expr->assign.value;
             int rhs_local = ir_find_value_local(func, value_expr);
+            /* G5: launder-aware source, used ONLY by the two global-store
+             * dangle sinks below (bare-ident + field/index projection) so a
+             * `@ptrcast`-wrapped or slice-`.ptr` RHS still yields the real
+             * alloc_id. Falls back to rhs_local when nothing was laundered. */
+            int store_src_local = (rhs_local >= 0)
+                ? rhs_local : ir_find_store_source_local(func, value_expr);
             if (target_expr && rhs_local >= 0 &&
                 ir_target_root_escapes(zc, target_expr)) {
                 ir_mark_local_escaped(ps, rhs_local);
@@ -3227,6 +3342,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
 
+            /* G5: struct/array-global FIELD/INDEX store — `g.p = n`, `g[0] = n`.
+             * Sibling of the bare-ident branch below; registers the projection
+             * under IR_GLOBAL_ROOT_ID so a later free is observed at exit /
+             * calls. Self-gates on a global-rooted field/index target.
+             * Uses the LAUNDER-AWARE source so `g.p = @ptrcast(*T, n)` and
+             * `g.p = s.ptr` inherit the real alloc_id. */
+            ir_register_global_field_store(zc, ps, func, target_expr,
+                                           store_src_local);
+
             /* GAP-3 (BUG-739): bare global ident store — `g_ptr = p`.
              * Register/overwrite the global's pseudo-root entry sharing
              * p's alloc_id, so a later free reaches it via
@@ -3235,8 +3359,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * analysis (same lifetime argument as pool_name). */
             if (target_expr && target_expr->kind == NODE_IDENT &&
                 ir_ident_is_unshadowed_global(zc, func, target_expr)) {
-                IRHandleInfo *grh = (rhs_local >= 0)
-                    ? ir_find_handle(ps, rhs_local) : NULL;
+                IRHandleInfo *grh = (store_src_local >= 0)
+                    ? ir_find_handle(ps, store_src_local) : NULL;
                 if (grh && grh->state == IR_HS_ALIVE && grh->alloc_id != 0) {
                     IRAliasSnapshot gsnap;
                     ir_snapshot_alias(&gsnap, grh);
@@ -4878,6 +5002,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
         }
+        /* G5: global-rooted field target `g.p = n` — the compound-key block
+         * above no-ops for a global root (ir_extract_compound_key can't resolve
+         * a root with no IR local). Register under IR_GLOBAL_ROOT_ID instead.
+         * Self-gating. */
+        ir_register_global_field_store(zc, ps, func, target_expr, rhs_local);
         break;
     }
 
@@ -4942,6 +5071,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
         }
+        /* G5: global-rooted const-index target `g_arr[0] = n` — same reason as
+         * the FIELD_WRITE sibling above. Self-gating; variable indices are
+         * skipped by ir_measure_key_path. */
+        ir_register_global_field_store(zc, ps, func, target_expr, rhs_local);
         break;
     }
 

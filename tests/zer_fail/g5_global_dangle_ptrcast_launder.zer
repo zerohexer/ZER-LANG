@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// HOLE1 (2026-07-29): a heap pointer laundered through @ptrcast (or @pun/@bitcast/
+// @cast/@container) then stored to a global defeats the dangling-global check —
+// the RHS is a NODE_INTRINSIC so the raw source-local lookup returned -1 and the
+// global pseudo-root never inherited the alloc_id, so free() didn't propagate.
+// ASan-confirmed heap-use-after-free. Must be flagged like the un-laundered `g = n`.
+
+struct Node { u32 x; }
+?*Node g;
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    g = @ptrcast(*Node, n);
+    free(n);
+    return 0;
+}

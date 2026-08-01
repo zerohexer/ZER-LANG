@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-01 — G5: heap pointer into a GLOBAL's FIELD/INDEX projection dangled unflagged (zercheck_ir.c)
+
+**The hole (🔴 silent UAF, long-documented as §G "G5").** `g.p = n; free(n);` where `g` is a
+struct/array global left `g.p` dangling with NO diagnostic. The BARE form `g = n` WAS caught
+(GAP-3/BUG-739): the IR_ASSIGN store sink registers the global under the `IR_GLOBAL_ROOT_ID (-2)`
+pseudo-root so free-propagation + the exit-dangle and call-window rules reach it. The `.field` /
+`[i]` PROJECTION was missed at ALL THREE store sinks, because `ir_extract_compound_key` resolves a
+chain root via `ir_find_local_exact_first`, which returns -1 for a global (no IR local) — so no
+`(root, path)` entry was ever registered. Cross-thread amplification: storing into a `shared struct`
+field + reading from a worker is a silent cross-thread UAF on a reused slab slot.
+
+This is the per-sink patchwork class (CLAUDE.md "MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS") —
+it was found and fixed SEVEN times independently across the 2026-07-21→31 audit branches, each time
+at only a subset of the sinks.
+
+**Fix — ONE shared helper at all three sinks, plus a launder-aware source.**
+- `ir_register_global_field_store(zc, ps, func, target_expr, rhs_local)` registers a global-rooted
+  FIELD/INDEX projection under `(IR_GLOBAL_ROOT_ID, "g.p")`, sharing the RHS's `alloc_id` with
+  `escaped = true`. Wired into **IR_ASSIGN store, IR_FIELD_WRITE and IR_INDEX_WRITE** — one query,
+  not a per-sink copy (answering it per-sink is exactly why the bug existed). Self-gating, so each
+  call site is a single unconditional line.
+- The key is the FULL path INCLUDING the root name (`"g.p"`, not the relative `".p"`) — a relative
+  path would COLLIDE across two globals sharing a field name.
+- `ir_find_store_source_local` unwraps a laundered RHS — `@ptrcast`/`@pun`/`@bitcast`/`@cast`
+  (last arg) and `@container` (args[0]), plus a slice's own `.ptr` read — so `g.p = @ptrcast(*T,n)`
+  and `g = s.ptr` inherit the real `alloc_id`. Used ONLY by the two global-dangle sinks; the
+  escape/compound-alias sinks intentionally treat a laundered value as untracked and widening them
+  there would change unrelated aliasing decisions.
+
+**Conservatism preserved.** The exit and call-window rules both gate on `IR_HS_FREED`, so only a
+DEFINITELY-freed target is flagged — the BUG-742 tolerance (MAYBE_FREED globals deliberately not
+flagged, so the legit register-ctx-then-callback pattern is not noised) is untouched. A null / param
+/ untracked store CLEARS a stale entry, so the taught fix `g.p = null;` compiles. Variable indices
+are skipped (`ir_measure_key_path` returns <= 0), matching the bare-compound behaviour.
+
+**Provenance + the synthesis.** Structure from `38z6wi` `835eeb26` (the only branch that wired all
+three sinks and used the collision-safe full key); launder-aware RHS from `02nq43` `7aac453a` (the
+only branch that unwrapped it, and only at the bare-ident sink). Neither alone catches a laundered
+RHS INTO a projection — `38z6wi` resolves the RHS with the raw `ir_find_value_local` (-1 for a
+NODE_INTRINSIC), `02nq43` never reaches a projection target. Combined, it is strictly stronger than
+any of the seven branch versions. The other five (`bz5q89` `ff38052a`, `3o10j6` `9c67c06b`,
+`xxhbdg` `f80166fd`, `n0odo5` `2d6ec421`, `8rv51h` `e920ffb9`) are single-sink subsets.
+
+**Tests.** `tests/zer_fail/g5_global_{field,array_elem}_dangle.zer`,
+`g5_global_dangle_{ptrcast_launder,slice_ptr}.zer`, `g5_global_field_launder_combined.zer` (the
+synthesis-only case); positives `tests/zer/g5_global_field_{reset_ok,maybe_free_ok}.zer` (the
+latter pins the BUG-742 conservatism). Sink matrix grown 44 -> 48 (`heap_glob_field_dangle`,
+`heap_glob_arrelem_dangle`, `heap_glob_launder_field`, `safe_glob_field_reset`) — CLEAN.
+make check 0 (ZER 1021/0, Rust 784/0, Zig 36/0, modules 28/0, all 8 oracles + all audit gates).
+
+---
+
 ## 2026-07-16 — PART 6 Step 2: generic `*opaque` container over-rejection fixed (content-borrow leak-suppress) (zercheck_ir.c)
 
 The `*opaque` "safe void*" relaxation, Path A, delivered soundly (universal_pointer.md PART 6).

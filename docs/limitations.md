@@ -52,7 +52,18 @@ Severity: ~31 memory-safety (UAF / OOB / race), ~10 miscompiles, 2 crash/DoS, 1 
 | gifted-noether-i0txin | 351860e4 | a9ba4c77, cd9bc560 (+84097263 doc) |
 | gifted-noether-rvek5f | 351860e4 | 00f3c2af |
 
-### A. G5 — heap pointer into a global's FIELD/INDEX dangles unflagged (🔴 UAF) — **fixed 7× independently**
+### A. G5 — heap pointer into a global's FIELD/INDEX dangles unflagged (🔴 UAF) — ✅ **DONE 2026-08-01**
+
+**✅ LANDED** as the 38z6wi⊕02nq43 synthesis described below (commit on main; see BUGS-FIXED.md
+2026-08-01). `ir_register_global_field_store` wired into all THREE store sinks + the launder-aware
+`ir_find_store_source_local` at the two global-dangle sinks. Verified strictly stronger than every
+branch version: the combined case (laundered RHS INTO a projection, `g.p = @ptrcast(*N, n)`) is
+caught, which NEITHER source branch catches alone. 5 negatives + 2 positives added, sink matrix
+grown 44 → 48 and CLEAN, make check 0 (ZER 1021/0). BUG-742 conservatism verified preserved
+(the conditional-free positive compiles). **This also closes §G "G5" in the 2026-07-19 tracker.**
+Historical comparison of the 7 branch impls retained below for provenance.
+
+**fixed 7× independently**
 
 `g.p = n; free(n)` (g a struct/array global) leaves `g.p` dangling with NO diagnostic. Bare `g = n`
 IS caught (GAP-3/BUG-739); only the projection sink was missed. This is §G's **G5** below — the

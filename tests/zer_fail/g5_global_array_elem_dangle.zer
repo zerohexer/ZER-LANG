@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// G5 sibling: heap pointer stored into a global-struct ARRAY ELEMENT then freed.
+// `g.arr[0] = n; free(n)` must be flagged (constant-index projection of a global).
+
+struct Node { u32 val; }
+struct Reg { ?*Node[4] arr; }
+Reg g;
+
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    g.arr[0] = n;
+    free(n);
+    return 0;
+}

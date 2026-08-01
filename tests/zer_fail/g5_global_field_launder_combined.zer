@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// G5 synthesis case: a heap pointer LAUNDERED through @ptrcast AND stored into a
+// global struct FIELD. Neither source branch caught this alone —
+//   - 38z6wi 835eeb26 registers the projection but resolves the RHS with the raw
+//     ir_find_value_local, which returns -1 for a NODE_INTRINSIC;
+//   - 02nq43 7aac453a unwraps the launder but only at the BARE-ident sink.
+// The combined fix routes the launder-aware source into the projection sink, so
+// the global pseudo-root (IR_GLOBAL_ROOT_ID, "g.p") inherits n's alloc_id and the
+// free propagates. Dangling-global-at-exit must fire.
+struct Node { u32 x; }
+struct Holder { ?*Node p; }
+Holder g;
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    g.p = @ptrcast(*Node, n);
+    free(n);
+    return 0;
+}

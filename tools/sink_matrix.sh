@@ -136,6 +136,16 @@ echo "===== HEAP-VIEW UAF / double-free (subslice shape) ====="
 cell heap_subslice_uaf  reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); s[0]=1; return 0; }'
 cell heap_subslice_df   reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); free(s); return 0; }'
 
+# G5 — heap pointer stored into a GLOBAL's field/index projection then freed.
+# The bare `g = n` store was already covered (BUG-739); these pin the projection
+# sink (all three store sites) and the launder-aware RHS. The reset cell pins the
+# BUG-742 conservatism: only a DEFINITELY-freed global is flagged.
+echo "===== G5 heap ptr -> GLOBAL field/index dangle ====="
+cell heap_glob_field_dangle   reject 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = n; free(n); return 0; }'
+cell heap_glob_arrelem_dangle reject 'struct N { u32 x; } struct HB { ?*N p; } HB gb2[2]; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb2[0].p = n; free(n); return 0; }'
+cell heap_glob_launder_field  reject 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = @ptrcast(*N, n); free(n); return 0; }'
+cell safe_glob_field_reset   compile 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = n; free(n); gb.p = null; return 0; }'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

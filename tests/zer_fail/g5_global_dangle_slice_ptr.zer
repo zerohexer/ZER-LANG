@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// HOLE2 (2026-07-29): storing a heap slice's own `.ptr` field into a global then
+// freeing the slice leaves the global dangling. The `.ptr` field-read produced an
+// RHS temp that didn't inherit the slice's alloc_id, so the store wasn't recorded
+// and free() never propagated to the global pseudo-root. ASan-confirmed heap-UAF.
+
+struct Node { u32 x; }
+?*Node g;
+
+u32 main() {
+    ?[*]Node m = alloc(Node, 1);
+    [*]Node s = m orelse return;
+    g = s.ptr;
+    free(s);
+    return 0;
+}

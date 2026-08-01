@@ -1,0 +1,17 @@
+// G5 conservatism guard: the exit-dangle check must flag only a DEFINITELY-freed
+// global projection. Here one path frees and returns, the other frees then RESETS
+// (`g.p = null;`), so no path exits with g.p dangling. Must COMPILE — this pins the
+// BUG-742 tolerance (MAYBE_FREED globals are deliberately not flagged, so the legit
+// register-ctx-then-callback pattern is not noised) against the new field sink.
+struct Node { u32 x; }
+struct Holder { ?*Node p; }
+Holder g;
+u32 main() {
+    ?*Node mn = alloc(Node);
+    *Node n = mn orelse return;
+    g.p = n;
+    if (n.x == 7) { free(n); return 0; }
+    free(n);
+    g.p = null;
+    return 0;
+}

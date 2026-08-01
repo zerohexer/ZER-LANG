@@ -1,0 +1,26 @@
+// Over-rejection guards for the §C escape-sink widenings (2026-08-01). Each of
+// these returns or stores a view of CALLER memory (a parameter), which is safe at
+// this frame — the escape is gated at the CALL SITE (the BUG-764 param-view
+// relaxation). If any §C widening is too broad, these stop compiling.
+//
+// NOT included: `*u8 f = firstp(b);` (a param-view POINTER return bound to a
+// local). That is rejected today by the documented leak false-positive in
+// limitations.md PART 6 §36.17 — a pre-existing residual kept deliberately
+// because it catches the through-call interior-pointer UAF, unrelated to §C.
+distinct typedef [*]u8 MySlice;
+?[*]u8 g;
+u8[4] g_src;
+[*]u8 trim([*]u8 s) { return s[1..3]; }             // C4: bare param subslice
+MySlice wrap([*]u8 m) { return @cast(MySlice, m); } // C4: distinct-slice param view
+void stash([*]u8 p) { g = p; }                      // C1/C2: param slice -> optional global
+                                                    // (body must compile; the call site needs a
+                                                    //  GLOBAL because stash INFERS keep)
+u32 main() {
+    u8[4] b; b[1] = 9;
+    [*]u8 r = trim(b);
+    MySlice m = wrap(b);
+    stash(g_src);
+    if (r[0] != 9) { return 1; }   /* param subslice must view b[1..3] */
+    if (m.len != 4) { return 2; }  /* distinct param view keeps the length */
+    return 0;
+}

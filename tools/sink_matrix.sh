@@ -136,6 +136,16 @@ echo "===== HEAP-VIEW UAF / double-free (subslice shape) ====="
 cell heap_subslice_uaf  reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); s[0]=1; return 0; }'
 cell heap_subslice_df   reject 'u32 main() { [*]u8 b = alloc(u8,8) orelse return; [*]u8 s = b[0..4]; free(b); free(s); return 0; }'
 
+# §C (2026-08-01) — escape-sink widenings. Each cell is a value shape that
+# slipped a sink whose gate tested a raw type-kind or required a bare NODE_IDENT.
+echo "===== C: escape-sink shape widenings ====="
+cell c1_projected_arr_optslice reject 'struct SB { u8[8] a; } ?[*]u8 gsl; void c() { SB s; gsl = s.a; } u32 main(){return 0;}'
+cell c2_optcarrier_local_slice reject '?[*]u8 gsl2; void c() { u8[16] buf; ?[*]u8 s = buf[0..8]; gsl2 = s; } u32 main(){return 0;}'
+cell c6_keep_local_field       reject 'struct LF { u32 f; } void c() { LF loc; keepfn(&loc.f); } u32 main(){return 0;}'
+cell c6_keep_local_arrelem     reject 'void c() { u32[4] a; keepfn(&a[0]); } u32 main(){return 0;}'
+cell safe_c6_keep_global_field compile 'struct LF { u32 f; } LF g_lf; void c() { keepfn(&g_lf.f); } u32 main(){return 0;}'
+cell safe_c1_param_slice_glob compile '?[*]u8 gsl3; void c([*]u8 p) { gsl3 = p; } u32 main(){return 0;}'
+
 # G5 — heap pointer stored into a GLOBAL's field/index projection then freed.
 # The bare `g = n` store was already covered (BUG-739); these pin the projection
 # sink (all three store sites) and the launder-aware RHS. The reset cell pins the

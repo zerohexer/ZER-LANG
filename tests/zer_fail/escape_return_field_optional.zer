@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// return wrap(&local).p where the extracted field is ?*T (optional) — a
+// stack-use-after-return. The return-field-extraction escape sink must unwrap
+// TYPE_OPTIONAL/TYPE_DISTINCT (2026-07-21 fix; ?T-hides-inner-kind class).
+struct W { ?*u32 p; }
+W wrap(*u32 q) { W w; w.p = q; return w; }
+?*u32 f() {
+    u32 x = 5;
+    return wrap(&x).p;
+}
+u32 main() { return 0; }

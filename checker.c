@@ -1630,7 +1630,17 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
 static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
                                                 Type *sym_type, Node *value) {
     if (!sym || !value || !sym_type) return;
-    if (type_dispatch_kind(sym_type) != TYPE_SLICE) return;
+    /* C2 (2026-08-01): unwrap an OPTIONAL carrier (`?[*]T`). This is the ONLY
+     * taint path for the array->slice coercion class, and it early-returned on
+     * TYPE_OPTIONAL — so `?[*]u8 s = local_buf[0..8];` left `s` completely
+     * UN-TAINTED and every downstream sink (`g = s`, `return s`, `&s[i]`) then
+     * let the dangling stack slice escape. The sinks themselves already unwrap
+     * the optional (escape_type_carries_ref), so the taint was the missing half.
+     * A `?u32` / `?bool` carrier unwraps to a non-slice inner and is correctly
+     * left alone. Another instance of the `?T`-hides-the-inner-kind class (the
+     * OPEN "optional-unwrap" class-kill). */
+    Type *sym_eff = type_unwrap_optional(sym_type);
+    if (type_dispatch_kind(sym_eff) != TYPE_SLICE) return;
     Node *roots[2] = { value, NULL };
     int root_count = 1;
     if (value->kind == NODE_ORELSE && value->orelse.fallback)
@@ -5140,15 +5150,41 @@ static Type *check_expr(Checker *c, Node *node) {
             (type_dispatch_kind(tgt_su_esc) == TYPE_SLICE ||
              (type_dispatch_kind(tgt_su_esc) == TYPE_OPTIONAL &&
               type_dispatch_kind(tgt_su_esc->optional.inner) == TYPE_SLICE));
+        /* C1 (2026-08-01): walk the VALUE through FIELD/INDEX to its root ident.
+         * The bare-NODE_IDENT gate meant an array field/element of a LOCAL
+         * (`g = s.arr`, `g = grid[0]`) slipped this sink entirely while the
+         * whole-ident form (`g = buf`) was caught — a dangling global slice
+         * (ASan stack-use-after-return). Mirrors the return sink's root walk. */
+        Node *vroot_esc = node->assign.value;
+        while (vroot_esc && (vroot_esc->kind == NODE_FIELD ||
+                             vroot_esc->kind == NODE_INDEX)) {
+            vroot_esc = (vroot_esc->kind == NODE_FIELD)
+                          ? vroot_esc->field.object
+                          : vroot_esc->index_expr.object;
+        }
         if (node->assign.op == TOK_EQ && tgt_slice_like_esc &&
             value && type_unwrap_distinct(value)->kind == TYPE_ARRAY &&
-            node->assign.value->kind == NODE_IDENT) {
-            const char *vname = node->assign.value->ident.name;
-            uint32_t vlen = (uint32_t)node->assign.value->ident.name_len;
+            vroot_esc && vroot_esc->kind == NODE_IDENT) {
+            const char *vname = vroot_esc->ident.name;
+            uint32_t vlen = (uint32_t)vroot_esc->ident.name_len;
             Symbol *val_sym = scope_lookup(c->current_scope, vname, vlen);
             bool val_is_global = val_sym &&
                 scope_lookup_local(c->global_scope, vname, vlen) != NULL;
-            if (val_sym && !val_sym->is_static && !val_is_global) {
+            /* A by-reference array PARAM points at CALLER memory, so storing a
+             * view of it is safe at this frame — the escape is gated at the CALL
+             * SITE instead (the BUG-764 param-view relaxation). Excluding it here
+             * keeps that relaxation intact now that projections are walked. */
+            bool val_is_param = false;
+            if (val_sym && c->current_func_node &&
+                c->current_func_node->kind == NODE_FUNC_DECL) {
+                Node *fn = c->current_func_node;
+                for (int pi = 0; pi < fn->func_decl.param_count; pi++) {
+                    if (fn->func_decl.params[pi].name_len == vlen &&
+                        memcmp(fn->func_decl.params[pi].name, vname,
+                               (size_t)vlen) == 0) { val_is_param = true; break; }
+                }
+            }
+            if (val_sym && !val_sym->is_static && !val_is_global && !val_is_param) {
                 /* check if target is global/static */
                 Node *root = node->assign.target;
                 while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -6337,11 +6373,31 @@ static Type *check_expr(Checker *c, Node *node) {
                         while (karg && karg->kind == NODE_INTRINSIC && karg->intrinsic.arg_count > 0)
                             karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
                         if (karg && karg->kind == NODE_UNARY &&
-                            karg->unary.op == TOK_AMP &&
-                            karg->unary.operand->kind == NODE_IDENT) {
+                            karg->unary.op == TOK_AMP) {
+                            /* C6 (2026-08-01): the DIRECT `keepfn(&loc.f)` /
+                             * `keepfn(&arr[0])` form escaped — this detector
+                             * matched only a BARE `&ident`, and the local-derived
+                             * walk below never unwraps a leading `&`, so a pointer
+                             * to any PART of a local handed straight to a keep
+                             * param slipped through. (The intermediate-variable
+                             * form `*u32 p = &loc.f; keepfn(p);` WAS caught, via
+                             * is_local_derived — so the hole was shape-specific,
+                             * the per-sink patchwork class.) Walk the &-operand's
+                             * field/index chain to the root ident, mirroring
+                             * arg_is_local_derived's &local.field handling: a
+                             * pointer into a local satisfies `keep` no better than
+                             * a pointer to the whole local. */
+                            Node *aroot = karg->unary.operand;
+                            while (aroot && (aroot->kind == NODE_FIELD ||
+                                             aroot->kind == NODE_INDEX)) {
+                                aroot = (aroot->kind == NODE_FIELD)
+                                          ? aroot->field.object
+                                          : aroot->index_expr.object;
+                            }
+                            if (aroot && aroot->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
-                                karg->unary.operand->ident.name,
-                                (uint32_t)karg->unary.operand->ident.name_len);
+                                aroot->ident.name,
+                                (uint32_t)aroot->ident.name_len);
                             if (arg_sym && !arg_sym->is_static) {
                                 /* BUG-317: check both raw AND mangled keys for imported globals */
                                 bool is_global = scope_lookup_local(c->global_scope,
@@ -6364,6 +6420,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     edge_argname_len = arg_sym->name_len;
                                 }
                             }
+                            } /* end if (aroot && NODE_IDENT) — C6 */
                         }
                         } /* end keep_checks loop (BUG-339) */
                         /* BUG-221/370/387: also reject local-derived pointers.
@@ -12536,12 +12593,29 @@ static void check_stmt(Checker *c, Node *node) {
                 const char *iname = node->ret.expr->intrinsic.name;
                 uint32_t ilen = (uint32_t)node->ret.expr->intrinsic.name_len;
                 /* BUG-351: @cast also needs escape check */
+                /* C5 (2026-08-01): `@inttoptr` added — `return @inttoptr(*u32,
+                 * @ptrtoint(&loc))` re-materialises a stack address as a pointer
+                 * and returned it, escaping a dangling pointer. The whitelist
+                 * omitted inttoptr entirely, so neither check below ran.
+                 * `@ptrtoint` is deliberately NOT listed: a bare
+                 * `return @ptrtoint(&x)` yields an INTEGER and already has its own
+                 * dedicated diagnostic above — listing it here would double-report. */
                 bool is_ptr_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
                                    (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
+                                   (ilen == 8 && memcmp(iname, "inttoptr", 8) == 0) ||
                                    (ilen == 4 && memcmp(iname, "cast", 4) == 0);
                 if (is_ptr_cast && node->ret.expr->intrinsic.arg_count > 0) {
                     Node *arg = node->ret.expr->intrinsic.args[
                         node->ret.expr->intrinsic.arg_count - 1];
+                    /* C5: unwrap a CHAIN of pointer-laundering intrinsics — the
+                     * local can sit several deep (`@inttoptr(*T, @ptrtoint(&loc))`).
+                     * Taking only one level left the innermost `&loc` unseen.
+                     * args[last] is the value operand for all of these (@container
+                     * is not a launder form and is handled elsewhere). */
+                    while (arg && arg->kind == NODE_INTRINSIC &&
+                           arg->intrinsic.arg_count > 0) {
+                        arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+                    }
                     /* check &local pattern */
                     if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
                         Node *root = arg->unary.operand;
@@ -12564,8 +12638,18 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                     /* BUG-256: check local/arena-derived ident through pointer cast.
-                     * Only applies when result is a pointer type (not value bitcast). */
-                    if (ret_type && ret_type->kind == TYPE_POINTER) {
+                     * Only applies when the result can carry a pointer (a value
+                     * @bitcast to an integer is safe and must stay accepted).
+                     *
+                     * C4 (2026-08-01): the raw TYPE_POINTER test excluded a SLICE
+                     * and a DISTINCT return type, so an inline
+                     * `return @cast(MySlice, local_slice)` / `@ptrcast` to a
+                     * distinct pointer escaped a dangling slice/pointer (the
+                     * NON-inline form was already caught via is_local_derived).
+                     * type_can_carry_pointer unwraps distinct and covers
+                     * slice/struct/union/opaque while still excluding a value
+                     * bitcast, so param-view returns (BUG-764) keep compiling. */
+                    if (ret_type && type_can_carry_pointer(ret_type)) {
                         Node *root = arg;
                         while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                             if (root->kind == NODE_FIELD) root = root->field.object;
@@ -12641,8 +12725,17 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-383: return wrap(&x).p — struct wrapper bypasses BUG-360 because
              * the function returns a struct, not a pointer/slice. Walk through field/index
              * chains to find if root is a NODE_CALL with local-derived args.
-             * Fires when the final return type is a pointer OR slice. */
-            if (ret_type && (ret_type->kind == TYPE_POINTER || ret_type->kind == TYPE_SLICE)) {
+             * Fires when the final return type is a pointer OR slice.
+             *
+             * C3 (2026-08-01): the raw pointer/slice type-kind test EXCLUDED an
+             * optional / distinct / pointer-carrying-struct return, so
+             * `return wrap(&x).p` where the field is `?*u32` (or a distinct
+             * pointer, or a struct carrying one) escaped a stack pointer while
+             * the plain-`*T` variant was caught. Widened to
+             * type_carries_data_pointer, matching the sibling direct-call return
+             * sink below — the question is "can the returned value carry a
+             * pointer?", not "is it spelled as one?". */
+            if (ret_type && type_carries_data_pointer(ret_type, 0)) {
                 Node *rroot = node->ret.expr;
                 while (rroot && (rroot->kind == NODE_FIELD || rroot->kind == NODE_INDEX)) {
                     if (rroot->kind == NODE_FIELD) rroot = rroot->field.object;
@@ -12661,7 +12754,30 @@ static void check_stmt(Checker *c, Node *node) {
             if (node->ret.expr->kind == NODE_ORELSE &&
                 node->ret.expr->orelse.fallback) {
                 Node *fb = node->ret.expr->orelse.fallback;
-                if (fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP) {
+                /* C4c (2026-08-01): unwrap launder intrinsics in the fallback —
+                 * `return maybe orelse @cast(MySlice, s)` (s a local-derived
+                 * slice) escaped because this gate matched only a BARE `&local`.
+                 * Mirrors the inline-cast return sink above; the ident branch
+                 * below then catches a local-derived operand as well. */
+                while (fb && fb->kind == NODE_INTRINSIC &&
+                       fb->intrinsic.arg_count > 0) {
+                    fb = fb->intrinsic.args[fb->intrinsic.arg_count - 1];
+                }
+                if (fb && fb->kind == NODE_IDENT && ret_type &&
+                    type_can_carry_pointer(ret_type)) {
+                    /* local-derived / arena-derived ident reached through the
+                     * (possibly laundered) fallback — same escape as the direct
+                     * `&local` form below. */
+                    Symbol *fsym = scope_lookup(c->current_scope,
+                        fb->ident.name, (uint32_t)fb->ident.name_len);
+                    if (fsym && (fsym->is_local_derived || fsym->is_arena_derived)) {
+                        checker_error(c, node->loc.line,
+                            "cannot return local-derived pointer '%.*s' via orelse "
+                            "fallback — stack memory is freed when function returns",
+                            (int)fb->ident.name_len, fb->ident.name);
+                    }
+                }
+                if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP) {
                     Node *root = fb->unary.operand;
                     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
                         if (root->kind == NODE_FIELD) root = root->field.object;

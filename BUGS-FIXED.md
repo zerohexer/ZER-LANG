@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-01 — §C: six escape/keep sinks accepted a dangling pointer (checker.c)
+
+Six independent accept-unsafe holes, all the same shape: a sink whose gate tested a RAW TYPE-KIND
+(`== TYPE_POINTER`) or required a BARE `NODE_IDENT`, so a wrapped type or a projected value slipped
+it while the plain form was caught. All ten reproducers verified COMPILING on main before the fix
+(a negative test that compiles is unambiguously a hole — no confound).
+
+- **C1 — projected local array into a wrapped-slice global.** `g = s.arr` / `g = grid[0]` into a
+  `?[*]T` (or `distinct [*]T`) global slipped: the sink required the value be a bare ident. Walk the
+  value through FIELD/INDEX to its root, mirroring the return sink. Plus a by-reference array PARAM
+  exclusion (`val_is_param`) so the BUG-764 param-view relaxation survives now that projections are
+  walked. From `38z6wi` `835eeb26` (breadth) + `3o10j6` `d1a7d9cc` (the param exclusion).
+- **C2 — the array->slice taint helper early-returned on `TYPE_OPTIONAL`.**
+  `mark_slice_local_derived_from_value` is the ONLY taint path for this class, so
+  `?[*]u8 s = local_buf[0..8];` left `s` completely un-tainted and every downstream sink then let
+  the dangling stack slice escape. Unwrap the optional carrier. Upstream of all sinks — complementary
+  to C1, not a duplicate. (`n0odo5` `2d6ec421`.)
+- **C3 — return-field extraction gate excluded `?T`/distinct.** `return wrap(&x).p` with an
+  optional/distinct/pointer-carrying-struct field escaped while the plain-`*T` form was caught.
+  Widened to `type_carries_data_pointer`. (`bz5q89` `ff38052a`.)
+- **C4 — inline `return @cast/@ptrcast(distinct-slice/ptr, local)`.** The BUG-256 gate was
+  `ret_type->kind == TYPE_POINTER`, excluding SLICE and DISTINCT returns. Widened to
+  `type_can_carry_pointer` (unwraps distinct; still excludes a value `@bitcast`). Also extended to
+  the **orelse-fallback** form (`return maybe orelse @cast(MySlice, s)`), which matched only a bare
+  `&local`. (`rvek5f` `00f3c2af` HOLE-B.)
+- **C5 — `return @inttoptr(*u32, @ptrtoint(&loc))`.** `@inttoptr` was absent from the
+  pointer-launder whitelist, AND the operand walk took only ONE level while the local sits two
+  intrinsics deep. Added `inttoptr` + a CHAIN unwrap. `@ptrtoint` deliberately NOT listed — a bare
+  `return @ptrtoint(&x)` yields an integer and has its own diagnostic; listing it would
+  double-report. (`i0txin` `a9ba4c77` HOLE 2.)
+- **C6 — `keepfn(&loc.f)` / `keepfn(&arr[0])` handed DIRECTLY to a keep param.** The detector
+  matched only a bare `&ident` and the local-derived walk never unwraps a leading `&`, so a pointer
+  to any PART of a local slipped (the intermediate-variable form WAS caught). Walk the &-operand's
+  field/index chain to the root. (`8rv51h` `e920ffb9`.)
+
+**Over-rejection guards.** The widenings are precisely scoped — verified that the BUG-764 param-view
+relaxations still compile (`trim(s) { return s[1..3]; }`, `@cast(MySlice, param)`, param slice stored
+to an optional global) and the C6 keep valve still accepts `&GLOBAL.field` / `&g_arr[0]`. A sweep of
+all 44 existing `tests/zer_fail/{keep,escape,return}_*.zer` shows 0 regressions.
+
+**Tests.** 10 negatives in `tests/zer_fail/` + `tests/zer/escape_param_view_relaxations_ok.zer` and
+`keep_direct_global_field_ok.zer`. Sink matrix grown 48 -> 54 (4 §C reject cells + 2 safe baselines)
+— CLEAN. make check 0: ZER 1037/0, Rust 784/0, Zig 36/0, modules 28/0, fuzz 200/0, all 8 oracles +
+every audit gate.
+
+**Note on the positive test.** It deliberately does NOT bind a param-view POINTER return
+(`*u8 f = firstp(b);`) — that is rejected today by the documented leak false-positive in
+limitations.md PART 6 §36.17, a pre-existing residual kept because it catches the through-call
+interior-pointer UAF. Unrelated to §C.
+
+---
+
 ## 2026-08-01 — VRP-JOIN leaks at 4 un-enumerated conditional bodies -> silent OOB (checker.c)
 
 **The class.** Main wires the `vrp_snap_take/restore/join` machinery at NODE_IF / FOR / WHILE /

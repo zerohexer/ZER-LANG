@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// Array FIELD of a LOCAL stored into a ?[*]T (optional-slice) global — the
+// wrapped-slice sink required a bare NODE_IDENT value, so the field/index
+// shape slipped (accept-unsafe stack-use-after-return).
+?[*]u8 g;
+struct Box { u8[8] arr; }
+?[*]u8 leak() {
+    Box s;
+    s.arr[0] = 42;
+    g = s.arr;        // array field of a LOCAL -> optional-slice global
+    return g;
+}
+u32 main() { ?[*]u8 r = leak(); if (r) |sl| { return sl[0]; } return 0; }

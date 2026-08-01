@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// audit 2026-07-23: a FIELD/INDEX-projected LOCAL array stored into an
+// OPTIONAL-slice global (?[*]u8) slipped both escape sinks -> dangling global
+// slice (ASan stack-use-after-return). Bare-ident value (g = buf) was caught (#9);
+// the projection (g = local.arr) was not.
+struct S { u8[5] arr; }
+?[*]u8 g;
+void f() { S local; g = local.arr; }
+u32 main() { f(); return 0; }

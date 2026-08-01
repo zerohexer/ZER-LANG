@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// Audit 2026-07-30: a stack-local address laundered through @ptrtoint ->
+// @inttoptr and returned directly dangled — the return-escape check's intrinsic
+// whitelist omitted inttoptr/ptrtoint and its pointer-type gate skipped the
+// ?*T (optional) return. Fix: unwrap the launder chain + accept optional-ptr
+// return types in the return-escape walk.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+?*u32 leak() {
+    u32 loc;
+    return @inttoptr(*u32, @ptrtoint(&loc));
+}
+u32 main() { return 0; }

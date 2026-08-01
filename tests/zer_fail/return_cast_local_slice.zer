@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// HOLE-B (2026-07-31 audit): inline `return @cast(distinct-slice, local_slice)`
+// dangling-slice escape. The escape gate excluded slice + distinct return types
+// (only TYPE_POINTER), so this silently compiled and returned a view of freed
+// stack. The non-inline form was already caught.
+distinct typedef [*]u8 MySlice;
+MySlice get() {
+    u8[8] buf;
+    buf[0] = 5;
+    [*]u8 s = buf;
+    return @cast(MySlice, s);
+}
+u32 main() { return 0; }

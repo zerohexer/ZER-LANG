@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// Sibling of keep_direct_local_field: `keepfn(&arr[0])` — address of a LOCAL
+// array element handed directly to a keep parameter — escaped silently.
+?*u32 g_p;
+void keepfn(keep *u32 p) { g_p = p; }
+void c() { u32[4] arr; arr[0] = 1; keepfn(&arr[0]); }
+u32 main() { c(); return 0; }

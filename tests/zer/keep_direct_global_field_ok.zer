@@ -1,0 +1,9 @@
+// C6 valve: a pointer to a GLOBAL's field/element satisfies `keep` (it outlives
+// the call). Only a LOCAL's projection is rejected. Guards the C6 root-walk from
+// over-rejecting.
+?*u32 g_p;
+struct L { u32 f; }
+L g_l;
+u32[4] g_arr;
+void keepfn(keep *u32 p) { g_p = p; }
+u32 main() { keepfn(&g_l.f); keepfn(&g_arr[0]); return 0; }

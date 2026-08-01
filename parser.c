@@ -31,7 +31,17 @@ static void print_source_line_p(FILE *out, const char *source, int line) {
         first_nonws++;
     int content_len = len - first_nonws;
     if (content_len <= 0) return;
-    fprintf(out, " %4d | %.*s\n", line, len, p);
+    /* H2 (2026-08-02): cap the echo — twin of print_source_line in checker.c,
+     * fixed together as a class. `panic_mode` limits the parser to one error
+     * per statement so its blowup is milder than the checker's (measured: 78 MB
+     * of stderr from a 32 KB single-line file), but an unbounded echo is the
+     * same defect and a multi-error parse across many long lines hits it. The
+     * caret run below was already capped at 60. */
+    int echo_len = len;
+    int echo_truncated = 0;
+    if (echo_len > 200) { echo_len = 200; echo_truncated = 1; }
+    fprintf(out, " %4d | %.*s%s\n", line, echo_len, p,
+            echo_truncated ? " ..." : "");
     fprintf(out, "      | ");
     for (int i = 0; i < first_nonws; i++)
         fputc(p[i] == '\t' ? '\t' : ' ', out);

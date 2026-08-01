@@ -103,8 +103,21 @@ static void print_source_line(FILE *out, const char *source, int line) {
         first_nonws++;
     int content_len = len - first_nonws;
     if (content_len <= 0) return;
+    /* H2 (2026-08-02): CAP the echoed line. It was printed in FULL, once per
+     * error, so a file with one very long line cost O(errors x line_len) — a
+     * quadratic compile-time DoS. Measured on main: 1200 undeclared idents on a
+     * single 32 KB line produced 2401 errors and **78 MB** of stderr in 2.1 s;
+     * the tracker records ~20 s on an 80 KB line. The caret run below was
+     * already capped at 60, so only the echo was unbounded.
+     *
+     * 200 chars keeps every realistic line intact (the longest line in this
+     * repo's own sources is well under it) and bounds the pathological case. */
+    int echo_len = len;
+    bool echo_truncated = false;
+    if (echo_len > 200) { echo_len = 200; echo_truncated = true; }
     /* print: " line | source_text" */
-    fprintf(out, " %4d | %.*s\n", line, len, p);
+    fprintf(out, " %4d | %.*s%s\n", line, echo_len, p,
+            echo_truncated ? " ..." : "");
     /* print: "      | ^^^^..." under the content */
     fprintf(out, "      | ");
     for (int i = 0; i < first_nonws; i++)
@@ -4379,8 +4392,23 @@ static Type *check_expr(Checker *c, Node *node) {
                             through_const_pointer = true;
                     }
                     root = root->field.object;
-                } else {
+                } else if (root->kind == NODE_INDEX) {
                     root = root->index_expr.object;
+                } else {
+                    /* H1 (2026-08-02): a NODE_UNARY that is NOT a deref — in
+                     * practice `&` (`*(&x) = 5`, `*(&arr[0]) = 7`,
+                     * `*(&s.f) = 9`) — reached this arm and read
+                     * `index_expr.object` off a unary node. Wrong union member,
+                     * garbage pointer, SEGV in the checker (verified on main:
+                     * exit 139). The loop condition admits NODE_UNARY but only
+                     * the TOK_STAR arm consumed it.
+                     *
+                     * Descend the operand: `&` does not go THROUGH a pointer
+                     * (it takes an address, it does not dereference one), so
+                     * neither through_pointer nor through_const_pointer is set
+                     * — the walk just continues to the root ident, which is the
+                     * correct const subject for `*(&x) = 5`. */
+                    root = root->unary.operand;
                 }
             }
             if (through_const_pointer) {
@@ -7489,6 +7517,32 @@ static Type *check_expr(Checker *c, Node *node) {
                         (unsigned long long)mmio_bound - 1);
                     ptr_proven = true;
                 }
+            }
+            /* I1 (2026-08-02): a VOLATILE `*T` with NO derived bound is just as
+             * unguarded as the non-volatile case. The exemption below assumed
+             * "volatile => mmio-bounds-checked", but a bound is derived ONLY for
+             * a pointer that came DIRECTLY from `@inttoptr(*T, CONST)` inside a
+             * declared mmio range (Paths 1 and 2 above). A PARAM, an alias, a
+             * struct field, or a variable-address `@inttoptr` derives nothing —
+             * `ptr_proven` stays false, `is_volatile` is true, and the check was
+             * skipped, shipping an UNGUARDED wild MMIO access: a fault on hosted,
+             * silent peripheral corruption on bare metal.
+             *
+             * Reject it, with the remedy that actually applies here — the
+             * non-volatile advice ("use [*]T") is wrong for MMIO, where the fix
+             * is to index the const-@inttoptr pointer directly (which keeps its
+             * bound) or to declare the mmio range covering it. */
+            if (!ptr_proven && obj->pointer.is_volatile) {
+                const char *vinner = type_name(obj->pointer.inner);
+                checker_error(c, node->loc.line,
+                    "cannot index volatile '*%s' — no compile-time MMIO bound is "
+                    "known for this pointer, so the access cannot be range-checked "
+                    "against any 'mmio' declaration. A bound is derived only for a "
+                    "pointer obtained directly from '@inttoptr(*%s, <const addr>)' "
+                    "inside a declared mmio range; a parameter, alias or struct "
+                    "field carries none. Index the '@inttoptr' pointer directly, "
+                    "or pass an index already proven in range.",
+                    vinner, vinner);
             }
             if (!ptr_proven && !obj->pointer.is_volatile) {
                 /* A non-volatile `*T` is ONE object with no length, so indexing it
@@ -16544,6 +16598,34 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
  * track_isr_global. Switch has no default: so a new NodeKind is a build error
  * (walker-default discipline); the kind coverage mirrors scan_unsafe_global_access
  * plus @critical/@once bodies. */
+static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
+    if (!c || !value || depth > 32) return;
+    if (value->kind != NODE_IDENT) return;
+    Symbol *fs = scope_lookup(c->global_scope, value->ident.name,
+                              (uint32_t)value->ident.name_len);
+    if (fs && fs->is_function && fs->func_node &&
+        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+        record_isr_globals(c, fs->func_node->func_decl.body, depth + 1);
+}
+
+/* E1 (2026-08-02): descend into a function BOUND to a function pointer.
+ *
+ * record_isr_globals follows only DIRECT calls (a NODE_CALL whose callee is a
+ * NODE_IDENT resolving to a global function). An ISR that reaches a shared
+ * global through a LOCAL funcptr binding — `*() fp = bump; fp();` — bypassed
+ * every ISR check: at the CALL, `fp` is a local so the global lookup fails and
+ * nothing is followed; at the BINDING, `bump` IS a global function so the
+ * `!gs->is_function` guard discards it. The global therefore never got its
+ * "must be declared volatile" / non-atomic-RMW treatment, and GCC -O2 is free
+ * to hoist the access — a silent hang or torn RMW on bare metal.
+ *
+ * Mirror the mechanism scan_funcname_binding gives the spawn scanner: at a
+ * binding site, treat a bare function NAME as if it were called. Sound
+ * over-approximation — a funcptr that is bound but never invoked is scanned
+ * too, and the remedy (declare the global volatile / use @atomic_*) is
+ * identical either way. */
+static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
+
 static void record_isr_globals(Checker *c, Node *node, int depth) {
     if (!node || depth > 32) return;
     switch (node->kind) {
@@ -16572,6 +16654,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         }
         record_isr_globals(c, node->assign.target, depth);
         record_isr_globals(c, node->assign.value, depth);
+        record_isr_funcname_binding(c, node->assign.value, depth);  /* E1 */
         return;
     }
     case NODE_CALL: {
@@ -16608,7 +16691,10 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         return;
     case NODE_RETURN:    record_isr_globals(c, node->ret.expr, depth); return;
     case NODE_EXPR_STMT: record_isr_globals(c, node->expr_stmt.expr, depth); return;
-    case NODE_VAR_DECL:  record_isr_globals(c, node->var_decl.init, depth); return;
+    case NODE_VAR_DECL:
+        record_isr_globals(c, node->var_decl.init, depth);
+        record_isr_funcname_binding(c, node->var_decl.init, depth);  /* E1 */
+        return;
     case NODE_BINARY:
         record_isr_globals(c, node->binary.left, depth);
         record_isr_globals(c, node->binary.right, depth);

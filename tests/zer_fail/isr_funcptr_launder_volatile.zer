@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// audit 2026-07-23: an ISR reaching a shared ISR/main global through a LOCAL
+// funcptr binding (*() fp = bump; fp();) bypassed the "must be volatile" /
+// non-atomic-RMW checks (record_isr_globals followed only DIRECT calls).
+// Sibling of the shipped SC #12; now transitive through funcptr bindings.
+u32 counter;
+void bump() { counter += 1; }
+void handler() { *() fp = bump; fp(); }
+interrupt TIM2 { handler(); }
+u32 main() { counter += 1; return counter; }

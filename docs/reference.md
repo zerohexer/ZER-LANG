@@ -2167,8 +2167,28 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 ```
 
 **NOTES**
-- Shared globals accessed from interrupt handlers must be volatile.
+- Shared globals accessed from interrupt handlers must be volatile. This holds
+  even when the ISR reaches the global INDIRECTLY — through a helper, or through
+  a function bound to a local function pointer (`*() fp = bump; fp();`).
 - Compound assign (`reg |= 1`) on shared volatile → compile error (non-atomic RMW).
+- INDEXING a volatile `*T` (`reg[i]`) is bounds-checked against the `mmio`
+  declaration, but only when the compiler can DERIVE the bound — which it can do
+  only for a pointer obtained directly from `@inttoptr(*T, <const addr>)` inside
+  a declared range. A parameter, alias or struct field carries no bound, so
+  indexing one is a compile error rather than an unguarded access:
+
+```zer
+mmio 0x40020000..0x40020FFF;
+
+u32 ok() {
+    volatile *u32 base = @inttoptr(*u32, 0x40020000);
+    return base[2];                       // OK — bound derived, range-checked
+}
+
+u32 bad(volatile *u32 reg, u32 i) {
+    return reg[i];                        // COMPILE ERROR — no bound for a param
+}
+```
 
 ---
 

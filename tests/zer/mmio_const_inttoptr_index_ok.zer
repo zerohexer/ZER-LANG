@@ -1,0 +1,23 @@
+// I1 positive control (2026-08-02): rejecting an UNBOUNDED volatile-pointer
+// index must NOT touch the bounded idiom. A pointer obtained directly from
+// `@inttoptr(*T, <const addr>)` inside a declared mmio range still derives its
+// compile-time bound, so indexing it stays legal and is range-checked.
+//
+// Safety convention (same as mmio_var_idx_guard.zer): pass an OUT-OF-BOUNDS
+// index so the auto-guard fires and returns 0 — the address is never actually
+// dereferenced, so this is safe to run on a hosted test host. That the guard
+// fires is itself proof the bound was derived: with no bound there would be no
+// guard to emit (and, after I1, no compile at all).
+
+mmio 0x4000_0000..0x4000_001F;
+
+u32 read_at(u32 i) {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x4000_0000);
+    return reg[i];          // bound = 32 bytes / 4 = 8 elements
+}
+
+u32 main() {
+    u32 v = read_at(100);   // OOB -> auto-guard returns 0, no access performed
+    if (v != 0) { return 1; }
+    return 0;
+}

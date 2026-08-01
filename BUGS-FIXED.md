@@ -5,6 +5,72 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — §E/§H/§I: the harvest tail — ISR funcptr, checker SEGV, error-echo DoS, unbounded MMIO index
+
+The last four entries of the 45-fix harvest. All reproduced on main.
+
+- **E1 — ISR global reached through a LOCAL funcptr binding (HIGH, silent bare-metal).**
+  `*() fp = bump; fp();` inside an ISR bypassed the "must be declared volatile" and
+  non-atomic-RMW checks. `record_isr_globals` follows only DIRECT calls (a NODE_CALL whose callee is
+  a NODE_IDENT resolving to a global function), and the shape defeats it at BOTH ends: at the call
+  `fp` is a LOCAL so the global lookup fails and nothing is followed; at the binding `bump` IS a
+  global function so the `!gs->is_function` guard discards it. GCC -O2 is then free to hoist the
+  access — a silent hang or torn RMW. New `record_isr_funcname_binding` treats a bare function NAME
+  at a var-decl/assignment binding site as if it were called, mirroring the mechanism
+  `scan_funcname_binding` gives the spawn scanner. Sound over-approximation: a funcptr bound but
+  never invoked is scanned too, and the remedy is identical either way. From `3o10j6` `d576ae2a`.
+  Test `isr_funcptr_launder_volatile.zer`.
+  **The positive is compile-only, deliberately.** A runnable `tests/zer` positive is impossible on a
+  hosted host — gcc refuses an `interrupt` function on x86-64 ("SSE instructions aren't allowed in
+  interrupt service routine"), and no existing `tests/zer` positive contains an interrupt block
+  either. Verified by hand that the volatile form is ACCEPTED by the checker
+  (`volatile u32 flag; void set_flag(){flag=1;} void handler(){ *() fp=set_flag; fp(); }
+  interrupt TIM2 { handler(); }` -> checker accepts), plus a sweep of the 4 existing ISR positives
+  showing 0 regressions.
+- **H1 — `*(&x) = v` SEGV'd the checker.** The const-check lvalue walk admits NODE_UNARY in its loop
+  condition but only the TOK_STAR arm consumed it, so a `&` fell to the `else` and read
+  `index_expr.object` off a unary node — wrong union member, garbage pointer, SEGV (verified on main:
+  exit 139, gdb bt at `check_expr`). Descend `unary.operand` instead. `&` does not go THROUGH a
+  pointer (it takes an address, it does not dereference one), so neither `through_pointer` nor
+  `through_const_pointer` is set; the walk just continues to the root ident. Verified the const rule
+  still fires through `&` (`const u32 x; *(&x) = 5;` is still rejected). From `02nq43` `7aac453a`.
+  Test `assign_through_addressof.zer`.
+- **H2 — uncapped error-line echo -> quadratic compile-time DoS.** The printer echoed the FULL source
+  line once per error: O(errors x line_len). MEASURED on main: 1200 undeclared idents on a single
+  32 KB line produced 2401 errors and **78 MB of stderr in 2.1 s**; after the fix, **841 KB in
+  454 ms**. Capped at 200 chars with a trailing " ..." marker (the caret run was already capped at
+  60). Fixed at BOTH printers — `print_source_line` (checker.c) and `print_source_line_p`
+  (parser.c) — as a class; the parser's `panic_mode` makes its blowup milder (one error per
+  statement) but the defect is identical. From `rdh99l` `d9060007`.
+  Reproduce with: 1200 x `u32 vN = undeclared_N;` joined on ONE line. NOTE a naive probe does not
+  show it — a single long garbage line produces only ONE error (the parse fails early) and compiles
+  in 13 ms. Many errors x one long line is the shape.
+  No `.zer` regression test: the defect is output SIZE, which neither the positive
+  (compile+run+exit 0) nor the negative (must-not-compile) harness can express.
+- **I1 — indexing a volatile single pointer with NO compile-time mmio bound (CRITICAL bare-metal).**
+  The `!is_volatile` exemption assumed "volatile => mmio-bounds-checked", but a bound is derived ONLY
+  for a pointer obtained DIRECTLY from `@inttoptr(*T, CONST)` inside a declared mmio range. A param,
+  alias, struct field, or variable-address `@inttoptr` derives nothing, so `ptr_proven` stayed false,
+  `is_volatile` was true, and the check was skipped entirely — an UNGUARDED wild MMIO access (fault
+  on hosted, silent peripheral corruption on bare metal). Now rejected, with a message giving the
+  remedy that actually applies to MMIO (index the const-`@inttoptr` pointer directly) rather than the
+  non-volatile advice ("use `[*]T`"), which is wrong here. From `n0odo5` `17ec74ca`. Test
+  `mmio_volatile_param_index_unbounded.zer`, positive `mmio_const_inttoptr_index_ok.zer`.
+  The positive follows `mmio_var_idx_guard.zer`'s convention — pass an OUT-OF-BOUNDS index so the
+  auto-guard fires and returns 0, never dereferencing the address (my first draft indexed in-bounds
+  and SIGTRAPped 133/133 on a hosted host). That the guard fires is itself proof the bound is still
+  derived.
+
+**Regression sweeps.** 50 volatile/mmio positives and 4 ISR positives checked. Eight files initially
+looked like regressions (3 asm, 4 rust_tests unsafe/qemu, 1 mmio) plus all 8 firmware examples — ALL
+were verified IDENTICAL against a from-HEAD `git archive` build (pre=post for every one), i.e.
+pre-existing and needing special invocation (qemu target, asm feature flags, cross-compilation), not
+caused by these changes. 0 real regressions.
+
+make check exit 0 — all audit gates, all matrix oracles, sink matrix clean.
+
+---
+
 ## 2026-08-02 — §F: four defer holes (zercheck_ir.c, checker.c, emitter.c)
 
 All four reproduced on main. Two were silent-until-gcc, one was a silent runtime miscompile, one let

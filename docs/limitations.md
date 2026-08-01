@@ -5,7 +5,32 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — BUGS: fixes available on eleven `claude/gifted-noether-*` branches, verified NOT in main (2026-08-01)
+## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
+
+**STATUS: all 45 landed.** §A 1/1 · §B 9/9 · §C 7/7 · §D 9/9 · §E 1/1 · §F 4/4 · §G 6/7 (+ G5 with
+§J) · §H 2/2 · §I 1/1 · §J 4/4. Commits: `60394142` `0d5aa553` `22b7c56d` `bc11a6cb` `342396e0`
+`213ee006` `f8374bc1` `06c0ed9d` `126bfb42` `2670c222` + this one.
+
+**Method used throughout — keep it for the next wave.** Every reproducer was run against current main
+BEFORE implementing, and every new test was verified DISCRIMINATING against a from-HEAD
+`git archive` build. That caught, in order: three NON-DISCRIMINATING branch tests (§B2/§B3/§B9 index
+a HEAP slice, whose runtime bounds check fires on a buggy AND a fixed compiler — rewritten against a
+FIXED ARRAY); a WRONG root-cause attribution (§C7's defect was upstream of where the commit message
+pointed, and its keep-call half was already fixed on main); a dependency that had to be MEASURED in
+both directions (§G5 does not reproduce standalone but DOES once §J4 ties the knot); and a family
+whose live sites were NOT the function the description named (§J2 is the var-decl/assignment gates,
+not `check_volatile_strip`).
+
+**One item remains OPEN and is tracked below, deliberately:** the durable fix for §F2
+(per-defer runtime "armed" flag). §F2 shipped as a sound interim REJECT.
+
+**The two class-kill gates built during this wave** (`tools/audit_carrier_dispatch.sh` + the
+`LD_OPTWRAP` escape-matrix axis) are described in CLAUDE.md; a THIRD was measured and deliberately
+NOT built (a region-presence gate for the AST→IR wrapper class would have been GREEN on the live
+§G3 bug — see BUGS-FIXED.md).
+
+### Original harvest analysis (retained for provenance)
+
 
 **What this is.** A THIRD wave of `claude/*` audit branches (2026-07-21 → 07-31), created after the
 2026-07-19 tracker below. Cross-referenced 2026-08-01 against current main (`31a355a3`):
@@ -300,7 +325,14 @@ Historical per-item detail retained below for provenance.
   its mutex + torn-read. Reject (mirrors the existing call-arg reject). Test
   `shared_struct_copy_by_value.zer`, positive `shared_struct_field_read_ok.zer`.
 
-### E. ISR
+### E. ISR — **DONE 2026-08-02**
+
+**Landed 2026-08-02.** E1 verified COMPILING on main before the fix; rejected after. The positive is
+COMPILE-ONLY by necessity — gcc refuses an `interrupt` function on hosted x86-64 ("SSE instructions
+aren't allowed in interrupt service routine"), and no existing `tests/zer` positive contains an
+interrupt block. Verified by hand that the `volatile` form is still accepted, plus 0 regressions
+across the 4 existing ISR positives.
+
 
 - **E1 — ISR global reached through a LOCAL funcptr binding** (`3o10j6` `d576ae2a`, HIGH silent bare-metal).
   `*() fp = bump; fp();` inside an ISR bypassed the "must be declared volatile" and non-atomic-RMW checks —
@@ -484,7 +516,18 @@ emission forms.
   failure. Now rejected cleanly; they still work in function bodies. Tests `global_init_{saturate,addc}.zer`,
   positive `intrinsic_in_function_body_ok.zer`.
 
-### H. Crash / DoS
+### H. Crash / DoS — **BOTH DONE 2026-08-02**
+
+**Landed 2026-08-02.** H1 verified SEGV'ing on main (exit 139, gdb bt at `check_expr`). H2 MEASURED:
+1200 undeclared idents on one 32 KB line gave 2401 errors and **78 MB of stderr in 2.1 s** before,
+**841 KB in 454 ms** after. H2 was fixed at BOTH printers (`print_source_line` in checker.c and
+`print_source_line_p` in parser.c) as a class.
+
+H2 has no `.zer` regression test — the defect is output SIZE, which neither the positive
+(compile+run+exit 0) nor the negative (must-not-compile) harness can express. The reproduction recipe
+is recorded in BUGS-FIXED.md instead, including the trap that a naive probe (one long garbage line)
+produces only ONE error and compiles in 13 ms.
+
 
 - **H1 — `*(&x) = v` SEGV'd the const-check walk** (`02nq43` `7aac453a`). Address-of in an lvalue chain: the
   walk read `index_expr.object` off a `&` unary node. Descend `unary.operand`.
@@ -493,7 +536,14 @@ emission forms.
   echoed the FULL source line once per error → O(errors × line_len), ~20s on an 80KB garbage line. Cap the
   echo at 200 chars (the caret was already capped at 60).
 
-### I. Bare-metal / MMIO
+### I. Bare-metal / MMIO — **DONE 2026-08-02**
+
+**Landed 2026-08-02.** I1 verified COMPILING on main; rejected after, and the bounded
+const-`@inttoptr` idiom is unaffected (50 volatile/mmio positives swept, 0 regressions). The positive
+follows `mmio_var_idx_guard.zer`'s convention — an OUT-OF-BOUNDS index so the auto-guard fires and
+returns 0 without ever dereferencing the address. A first draft that indexed IN bounds SIGTRAPped
+133/133 on the hosted host; do not write a runnable MMIO positive that actually touches the address.
+
 
 - **I1 — indexing a volatile single pointer `reg[i]` with NO compile-time `mmio_bound`** (`n0odo5`
   `17ec74ca`, CRITICAL bare-metal). The `!is_volatile` exemption assumed volatile ⇒ mmio-bounds-checked, but the

@@ -6,6 +6,10 @@ zerc
 zerc_debug
 NUL
 
+# Tracer binaries (extensionless — *.exe does not match them on Linux)
+/zerc-trace
+/ztrace
+
 # Test binaries (compiled by make check)
 test_lexer
 test_parser

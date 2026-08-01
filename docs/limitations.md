@@ -5,6 +5,539 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — BUGS: fixes available on eleven `claude/gifted-noether-*` branches, verified NOT in main (2026-08-01)
+
+**What this is.** A THIRD wave of `claude/*` audit branches (2026-07-21 → 07-31), created after the
+2026-07-19 tracker below. Cross-referenced 2026-08-01 against current main (`31a355a3`):
+**45 distinct fixes across 20 substantive commits, ALL absent from main.** Verified three ways:
+(1) `git cherry -v main <branch>` is `+` for every commit; (2) main gained **zero compiler fixes**
+since the common fork base `38b7a1e7` (2026-07-20) — its only post-fork commits are the compilation
+tracer, a `.gitignore`, and docs; (3) each fix's distinctive marker was grepped in main and returns
+0 hits (`ir_register_global_field_store`, `ir_find_store_source_local`, `intn_carrier_suffix`,
+`freed_defer_id`, `vrp_widen_loop_addr_taken`, `field_obj_needs_parens`, `check_const_strip`,
+`record_isr_funcname_binding`, `sc_expr_has_orelse`, `_zer_opt_u128`). Main still carries the OLD
+line-based defer double-free gate (`free_line != defer_line`, zercheck_ir.c ~2012) that §F1 replaces.
+
+**Nothing in this wave is already in main — there is no "do NOT re-open" list.** (Contrast the
+2026-07-19 tracker, which had M1/M2.) `ir_measure_key_path` / `ir_key_root_ident` DO exist in main
+and are reused by the §A fixes — that is a dependency, not a duplicate.
+
+**Root-cause pattern.** Same MULTI-SITE / per-sink patchwork class as the previous two waves
+(CLAUDE.md "MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS"). The clusters: (a) the global-dangle
+sink registered only a BARE ident store, so every `.field`/`[i]` projection slipped — found
+independently **seven times** (§A); (b) VRP-JOIN still wired per node-kind, so `@once`/defer/orelse/
+if-capture/loop-body/else-body each leak separately (§B); (c) pointer-only type-kind gates at the
+escape sinks that must widen to `type_can_carry_pointer`/`type_carries_data_pointer` (§C); (d) the
+spawn arg check missing one arg SHAPE per branch (§D). Coverage was audit-found, not proof-found.
+
+**Rules for consuming this:** (1) apply the PROPER version per bug (noted per row), not a whole
+branch — the duplication is extreme here (§A ×7, §B ×7 branches); (2) rebase onto current HEAD and
+re-verify — each was green on its own fork base; (3) fixes pile onto the SAME functions across
+branches → apply per-FAMILY, re-verify after each (conflict groups at the end); (4) drop junk commit
+`9c18deb7` (542 rebuilt test binaries, 0 source change). To inspect: `git show <sha>`.
+Severity: ~31 memory-safety (UAF / OOB / race), ~10 miscompiles, 2 crash/DoS, 1 over-rejection (J4).
+
+### Source branches (fork base → commits)
+| Branch | Base | Commits (short) |
+|---|---|---|
+| gifted-noether-bz5q89 | 38b7a1e7 | ff38052a |
+| gifted-noether-38z6wi | 38b7a1e7 | 835eeb26, d1ccb8aa, ddf6ac47 (+9c18deb7 junk) |
+| gifted-noether-3o10j6 | 38b7a1e7 | 9c67c06b, d1a7d9cc, d576ae2a |
+| gifted-noether-xxhbdg | 38b7a1e7 | f80166fd (+ddf58e8f doc) |
+| gifted-noether-n0odo5 | 38b7a1e7 | 2d6ec421, 17ec74ca |
+| gifted-noether-rdh99l | 38b7a1e7 | 8af2573d, d9060007, 9a40ead4, 23f34ab1 |
+| gifted-noether-8rv51h | 38b7a1e7 | e920ffb9 (+46cb1077 doc) |
+| gifted-noether-7fxhb3 | 38b7a1e7 | 31796ef8 |
+| gifted-noether-02nq43 | 38b7a1e7 | 7aac453a |
+| gifted-noether-i0txin | 351860e4 | a9ba4c77, cd9bc560 (+84097263 doc) |
+| gifted-noether-rvek5f | 351860e4 | 00f3c2af |
+
+### A. G5 — heap pointer into a global's FIELD/INDEX dangles unflagged (🔴 UAF) — **fixed 7× independently**
+
+`g.p = n; free(n)` (g a struct/array global) leaves `g.p` dangling with NO diagnostic. Bare `g = n`
+IS caught (GAP-3/BUG-739); only the projection sink was missed. This is §G's **G5** below — the
+long-standing documented gap. All seven register a compound `(IR_GLOBAL_ROOT_ID, "g.p")` pseudo-root
+sharing the RHS `alloc_id`, so free-propagation + the exit-dangle/call-window checks reach it, and
+all correctly preserve the BUG-742 conservatism (DEFINITELY-freed only; `g.p = null;` resets).
+
+| Impl | sha | Shape |
+|---|---|---|
+| bz5q89 | `ff38052a` | inline, 1 sink (IR_ASSIGN) |
+| **38z6wi** | **`835eeb26`** | **helper `ir_register_global_field_store`, wired into ALL 3 store sinks (IR_ASSIGN / IR_FIELD_WRITE / IR_INDEX_WRITE)** |
+| 3o10j6 | `9c67c06b` | inline, 1 sink |
+| xxhbdg | `f80166fd` | inline, 1 sink |
+| n0odo5 | `2d6ec421` | inline, 1 sink |
+| 8rv51h | `e920ffb9` | helper `ir_build_global_field_key` (next to `ir_extract_compound_key`), 2 sinks |
+| **02nq43** | **`7aac453a`** | **+ `ir_find_store_source_local`** — unwraps `@ptrcast/@pun/@bitcast/@cast/@container` and a slice `.ptr` read on the **RHS** |
+
+**PROPER VERSION = 38z6wi ⊕ 02nq43 (take BOTH, they are orthogonal).** 38z6wi has the correct
+structure: one shared helper at all three store sinks (the multi-site doctrine), the key built as
+the FULL path `"g.p"` INCLUDING the root name (a relative `".p"` would collide across globals sharing
+a field name), the `escaped=true` invariant preserved, and a null-reset branch. 02nq43 closes a facet
+**all six others miss** — a LAUNDERED RHS (`g = @ptrcast(*T,n)`, `g = s.ptr`), both ASan-confirmed
+heap-UAF. Synthesis: keep 38z6wi's helper, feed it 02nq43's `store_src_local` instead of `rhs_local`.
+Both reuse `ir_measure_key_path` / `ir_key_root_ident`, already present in main.
+Sink-matrix cells to add: `heap_glob_field_dangle` (bz5q89), `global_dangle_{ptrcast_launder,slice_ptr}` (02nq43).
+
+### B. VRP range-JOIN leaks → silent OOB (🔴)
+
+Main has the `vrp_snap_take/restore/join` machinery wired at NODE_IF / FOR / WHILE / SWITCH / LABEL
+(§C #13 + the 2026-07-19 §A batch). These are the still-un-enumerated sites. **Mostly DISTINCT — take
+nearly all.**
+
+- **B1 — loop bodies FOR/WHILE/DO_WHILE leak a body narrowing past the join** (`rdh99l` `8af2573d`).
+  Elides a later fixed-array bounds guard on a zero-trip loop. Snapshot the widened post-pre-pass
+  ranges, restore after the body. Tests `vrp_loop_body_narrow_guard_{for,while}.zer`.
+- **B2 — `if (o) |v| { }` capture path** (`8rv51h` `e920ffb9` ≡ `i0txin` `a9ba4c77`). The capture path
+  early-breaks BEFORE the comparison/non-comparison VRP-JOIN block, so an in-body narrowing leaks past
+  the merge. Both impls are the identical take/restore/join; take either. Tests
+  `vrp_ifcapture_range_leak.zer` (8rv51h, zer_trap) / `vrp_capture_if_range_leak.zer` (i0txin).
+- **B3 — `orelse { block }` fallback body** (`8rv51h` `e920ffb9`). ⚠️ see the JOIN-vs-RESTORE note below.
+  Test `vrp_orelse_block_range_leak.zer`.
+- **B4 — `defer { }` body** (`7fxhb3` `31796ef8` ≡ `8rv51h` `e920ffb9`). RESTORE is CORRECT here (the
+  body runs at scope exit, i.e. after all following statements — its narrowing must never apply to
+  them). Tests `vrp_defer_body_narrowing_guarded.zer` / `vrp_defer_body_range_leak.zer`.
+- **B5 — `@once { }` body** (**`7fxhb3` `31796ef8` — PROPER**; `8rv51h` `e920ffb9` is the weaker form).
+  ⚠️ 7fxhb3 uses **JOIN**, 8rv51h uses **RESTORE**. See the note below — take 7fxhb3.
+  Test `vrp_once_body_narrowing_guarded.zer`.
+- **B6 — else-body nested guard leaks its guard-inverse past the join** (`02nq43` `7aac453a`). The THEN
+  body reset `var_range_count`; the ELSE body did not, so a guard nested in the else leaked to a later
+  `arr[i]` on the THEN path (ASan stack-buffer-overflow). Fix is a symmetric reset that PRESERVES the
+  current-if's own guard-inverse entries. Test `vrp_else_nested_guard_no_leak.zer`.
+- **B7 — loop-carried index/divisor mutated via `&i` passed to a CALL keeps its stale narrow range**
+  (`rvek5f` `00f3c2af` HOLE-A). `vrp_invalidate_loop_body_writes` widens only direct ASSIGN writes and
+  skips calls; the per-call address-taken wipe (BUG-475) runs at the call site in program order, so
+  `buf[i]; bump(&i);` proved `buf[i]` against the PRE-loop range → silent loop stack-buffer-overflow
+  (ASan-confirmed, no compile error, no runtime trap). New companion pass `vrp_widen_loop_addr_taken`
+  (no-default exhaustive AST walk) full-wipes every local whose address is taken anywhere in the loop
+  body; run in the for/while/do-while drivers AFTER the cond narrowing. Over-widening is sound for VRP
+  (only adds a guard) and only address-taken vars are touched, so plain counters keep the precise join.
+  Test `vrp_loop_addrof_index.zer`.
+- **B8 — `for (i32 i = start; i < 4; ...)` with a non-const-evaluable signed init** (`bz5q89`
+  `ff38052a`). Seeded the loop-var range min to 0 unconditionally, but `i < N` only bounds ABOVE — a
+  negative start was falsely proven in-bounds and the guard elided (ASan OOB read+write). while/do-while
+  were already sound (INT64_MIN). Fix: for a non-const init seed `min = INT64_MIN` for a SIGNED loop var,
+  keep `min = 0` for UNSIGNED (a true type invariant — precision preserved).
+  Test `vrp_for_signed_neg_init_guard.zer`.
+- **B9 — `find_return_range` drops a return hidden in an orelse-block fallback** (`n0odo5` `2d6ec421`).
+  `x orelse { return BIG; }` attached to a var-decl init / expr-stmt / assignment RHS is a real return
+  path the scan never reached; it fell to the `return true` default and SILENTLY dropped from the union,
+  so the summary UNDER-approximated and a caller elided its bounds guard on `arr[f()]` (ASan-confirmed
+  silent OOB write). Descend the orelse fallback with `in_branch=true`.
+  Test `vrp_orelse_block_return_range_leak.zer`.
+
+> ⚠️ **JOIN vs RESTORE — resolve before implementing B3/B5.** `vrp_snap_restore` sets ranges back to
+> the pre-body values; `vrp_snap_join` unions pre with post. For a **may-run** body the sound post-state
+> is the UNION. RESTORE fixes the reported *narrowing* leak but not the widening direction: if `idx` is
+> `[1,1]` pre and the body does `idx = 99`, restore yields `[1,1]`, a later `garr[idx]` is "proven", the
+> guard is elided → OOB on the path where the body DID run. 7fxhb3 reasons about this explicitly
+> ("@once needs JOIN (may-run) not full discard") and is the version to take for B5. The same argument
+> applies to **B3** (an orelse block falls through on the Some path), where 8rv51h also used RESTORE —
+> recommend upgrading it to JOIN. **Not empirically confirmed** (both branches' tests exercise only the
+> narrowing direction); write a widening test case before committing either way. B4 (defer) is
+> genuinely RESTORE — no code follows the body.
+
+### C. Escape / dangling-pointer sinks (🔴 accept-unsafe)
+
+- **C1 — local array PROJECTED into a wrapped-slice global** (`38z6wi` `835eeb26` **⊕** `3o10j6`
+  `d1a7d9cc` #1). `g = local.arr` / `g = grid[0]` into a `?[*]T` (or `distinct [*]T`) global slipped
+  BOTH slice sinks: the bare-slice sink gates on `target->kind == TYPE_SLICE`, the wrapped sink gated on
+  `value->kind == NODE_IDENT` → dangling global slice (ASan stack-use-after-return). **38z6wi is the
+  broader fix** (covers `?[*]T` AND `distinct [*]T`, walks the value through FIELD/INDEX to the root,
+  deliberately EXCLUDES plain `TYPE_SLICE` so it can't double-fire with the sibling sink at ~4982).
+  **Take 3o10j6's by-ref array-PARAM exclusion on top** (`val_is_param`) — it prevents over-rejecting the
+  BUG-764-class param view. Tests `escape_array_field_optslice_global.zer` (38z6wi),
+  `escape_optslice_projected_global.zer` (3o10j6).
+- **C2 — taint helper early-returns on `TYPE_OPTIONAL`** (`n0odo5` `2d6ec421`). `addr_of_is_local_derived`
+  bailed on an optional carrier, so `?[*]u8 s = local[0..n]` left `s` UN-TAINTED and every downstream sink
+  (`g = s` / `return s` / `&s[i]`) let the dangling stack slice escape. Upstream of ALL sinks —
+  complementary to C1, not a duplicate. Unwrap the optional (mirrors `escape_type_carries_ref`); a
+  `?u32`/`?bool` carrier unwraps to a non-slice inner and is correctly untouched.
+  Test `escape_optional_slice_store_global.zer`.
+- **C3 — return-field extraction doesn't unwrap `?T`/distinct** (`bz5q89` `ff38052a`). `return wrap(&x).p`
+  with an optional/distinct/slice field escaped a local (stack-use-after-return); the plain-`*T` variant
+  WAS caught. The sink gated on a raw pointer/slice type-kind check → widen to `type_carries_data_pointer`
+  (matching the sibling direct-call return sink). Test `escape_return_field_optional.zer` + sink cell
+  `p7__k_return_extract`.
+- **C4 — inline `return @cast/@ptrcast(distinct-slice/ptr, local)`** (`rvek5f` `00f3c2af` HOLE-B). Plus the
+  orelse-fallback form. TWO return-escape gates were pointer-only type-kind comparisons, excluding slice
+  and distinct return types → both now use `type_can_carry_pointer` (unwraps distinct; covers
+  slice/struct/union/opaque; still excludes a value `@bitcast`). The NON-inline form was already caught;
+  param-view returns (BUG-764) still compile. Tests `return_cast_local_slice.zer`,
+  `return_orelse_cast_local.zer`, `return_ptrcast_local_distinct.zer`.
+- **C5 — `return @inttoptr(*u32, @ptrtoint(&local))`** (`i0txin` `a9ba4c77` HOLE 2). The intrinsic
+  whitelist omitted `inttoptr`/`ptrtoint` and the pointer gate skipped a `?*T` optional return. Unwrap the
+  chain of pointer-laundering intrinsics + accept an optional-wrapped pointer return type.
+  Test `return_inttoptr_local_escape.zer`.
+- **C6 — `keepfn(&loc.f)` / `keepfn(&arr[0])` handed DIRECTLY to a keep param** (`8rv51h` `e920ffb9`).
+  The detector matched only a BARE `&ident`, and the local-derived walk never unwraps a leading `&`, so
+  `&local.projection` slipped (the intermediate-variable form WAS caught via `is_local_derived`). Walk the
+  `&`-operand's field/index chain to the root ident. Tests `keep_direct_local_{field,arrelem}.zer`,
+  positive `keep_direct_global_field_ok.zer`, sink cells `p2/p3__k5_keep_direct` +
+  `safe_keep_glob_{field,arr}_direct`.
+- **C7 — Ring.push / keep-call of a call returning a pointer-carrying struct BY VALUE** (`rdh99l`
+  `8af2573d`). Widen the NODE_CALL gate to `type_carries_data_pointer`.
+
+### D. Spawn / concurrency (🔴/🟠) — nine DISTINCT arg shapes, no dedup needed
+
+- **D1 — spawn of a by-value struct carrying `&local`** via a struct-init literal or a call-launder
+  (`rdh99l` `8af2573d`). Cross-thread stack-UAF. Route spawn through the shared `arg_is_local_derived`
+  and drop the holed struct-kind gate.
+- **D2 — spawn `?*T` / `?[*]T` pointing at a stack local** (`i0txin` `a9ba4c77` HOLE 1). `is_ptr_like`
+  tested `eff->kind` WITHOUT unwrapping the `TYPE_OPTIONAL` wrapper → the fire-and-forget cross-thread-UAF
+  check never ran. Unwrap one optional level into `eff_pl` before the pointer/shared-carrier/struct-carrier
+  dispatch. Test `spawn_optional_ptr_uaf.zer`. (Another instance of the `?T`-hides-inner-kind class.)
+- **D3 — spawn bare local ARRAY arg at a `[*]T` param** (`n0odo5` `17ec74ca`). Arg-type `TYPE_ARRAY` was
+  uncased, so the cross-thread stack-lifetime check never ran; only an emitter limitation masked the latent
+  stack-UAF. Test `spawn_local_array_slice_race.zer`. Baselines one new already-unwrapped `_eff`
+  type-dispatch site.
+- **D4 — G4: `&threadlocal` to a SCOPED spawn** (`38z6wi` `d1ccb8aa`). The scoped-borrow setup loop skips
+  threadlocals (they live in `global_scope`), so no borrow was established → main's concurrent write races,
+  and the child writes the PARENT's TLS slot. Reject `&threadlocal` in the scoped arm (mirrors A5/BUG-757
+  for fire-and-forget). By-value stays legal. TSan-confirmed. Closes §G **G4**.
+- **D5 — G2: scoped-borrow laundered through a helper** (`38z6wi` `d1ccb8aa`). `poke(&x)` between
+  `spawn worker(&x)` and `t.join()` compiled — the borrow read/write checks skip the `&`-take (`in_amp`)
+  and never inspect call args. The NODE_CALL arg loop now rejects `&x` passed to a call while `x` is
+  borrowed by a scoped spawn. Intra-function, cleared at `.join()`. TSan-confirmed. Closes §G **G2**.
+- **D6 — scoped-spawn DOUBLE-borrow of the same `&local`** (`3o10j6` `d1a7d9cc` #3). The borrow flag was
+  set unconditionally → worker-vs-worker race. Reject an already-borrowed local.
+  Test `scoped_spawn_double_borrow.zer`, positive `scoped_spawn_sequential_borrow_ok.zer`.
+- **D7 — scoped-spawn multi-arg borrow tracked only the FIRST `&ident`** (`3o10j6` `d1a7d9cc` #4) → race on
+  the rest. The ThreadHandle now records ALL borrowed args (arena list on the Symbol, `types.h` change) and
+  `join()` releases each. Test `scoped_spawn_multiarg_race.zer`, positive `scoped_spawn_multiarg_ok.zer`.
+- **D8 — spawn funcptr ARGUMENT never scanned** (`7fxhb3` `31796ef8`). `spawn worker(bump)` where `worker`
+  invokes its funcptr param: the concrete `bump` bound at the spawn SITE was never scanned (distinct from
+  the BH-18 #8 local-funcptr facet), so a non-shared global RMW (or Pool/Slab/Ring metadata mutation) raced
+  clean. Scan each function-name spawn arg's body at the spawn site (mirrors the BH-18 #8 conservative
+  descent). Test `spawn_funcptr_arg_race.zer`, positive `spawn_funcptr_arg_safe_ok.zer`.
+- **D9 — whole `shared struct` copied BY VALUE at var-decl / assign / return** (`rdh99l` `8af2573d`) clones
+  its mutex + torn-read. Reject (mirrors the existing call-arg reject). Test
+  `shared_struct_copy_by_value.zer`, positive `shared_struct_field_read_ok.zer`.
+
+### E. ISR
+
+- **E1 — ISR global reached through a LOCAL funcptr binding** (`3o10j6` `d576ae2a`, 🟠 silent bare-metal).
+  `*() fp = bump; fp();` inside an ISR bypassed the "must be declared volatile" and non-atomic-RMW checks —
+  `record_isr_globals` follows only DIRECT calls into global functions, so a non-volatile global laundered
+  through a funcptr let GCC -O2 hoist the access (silent hang / torn RMW). New
+  `record_isr_funcname_binding` descends into a function bound to a funcptr at the var-decl/assignment
+  binding site — the same mechanism `scan_funcname_binding` gives the spawn scanner (§C #11).
+  **Complementary to main's shipped ISR-TRANS (§C #12), which closed only the direct-helper case.**
+  Test `isr_funcptr_launder_volatile.zer` (promoted from `tests/zer_gaps/`).
+
+### F. Defer
+
+- **F1 — defer double-free discriminated by SOURCE-LINE equality** (`7fxhb3` `31796ef8`, 🔴). The check
+  separated a real double free from the legit two-branch `defer { if(e){free} else{free} }` using
+  `free_line != defer_line`. An explicit `free` — or a SECOND `defer` — on the same physical line as the
+  `defer` keyword evaded it, and a double free at scope exit compiled clean. Replaced with a per-defer-body
+  instance id `IRHandleInfo.freed_defer_id`, stamped on the freed handle + its alias group, written only in
+  the post-fixpoint scope-exit scan so no CFG-merge handling is needed. **Main still has the line-based
+  gate** (zercheck_ir.c ~2012, with a comment defending it) — this is a direct replacement. Tests
+  `defer_double_free_sameline.zer`, `defer_double_free_two_defers_sameline.zer`, positive
+  `defer_two_branch_free_ok.zer`.
+- **F2 — G1: forward `goto` fires a defer it textually skipped** (`xxhbdg` `f80166fd`, 🟡). Interim SOUND
+  REJECT of the exact shape `gi < di < li` (goto before defer before label, same block); the legit
+  defer-before-goto cleanup idiom still compiles. **Not the durable fix** — that is per-defer runtime
+  "armed" flags (see §G G1 and the 3o10j6 finding in the OPEN list below).
+  ✅ **RESOLVED 2026-08-01 — G1 REPRODUCES on current main (`31a355a3`); `38z6wi`'s NOT-REPRO was wrong.**
+  Empirically re-verified with a clean build (`rm -f *.o src/safety/*.o && make zerc`): BOTH branch
+  reproducers (`xxhbdg` `f80166fd` `tests/zer_fail/g1_goto_skips_defer.zer`, `02nq43` `7aac453a`
+  `tests/zer_gaps/gap_goto_skips_defer.zer`) exit **255** — i.e. the skipped `rel()`/`release()` fires and
+  the counter underflows. The emitted C is unambiguous — the label block fires the defer with **no armed
+  guard**:
+  ```c
+  _zer_bb0:  if (err == 1) goto _zer_bb2; else goto _zer_bb3;
+  _zer_bb1:  rel();  return;          /* the `done:` label — UNCONDITIONAL fire */
+  _zer_bb2:  goto _zer_bb1;           /* error path: acq() NEVER ran, yet rel() does */
+  _zer_bb3:  acq(); lock_count += 100; goto _zer_bb1;
+  ```
+  The plt86m `defer_fire_guard_flag` machinery does NOT cover this shape: it suppresses a
+  goto-to-cleanup-label DOUBLE-fire (goto fires eagerly, then sets the flag so the label skips), but here
+  the goto path never registered the defer at all — there is nothing to fire eagerly and no flag is emitted.
+  **Boundary measured (2026-08-01) — the interim reject is correctly scoped:** only the `gi < di < li`
+  shape is broken; `defer` registered BEFORE the `goto` (the legit acquire/cleanup idiom) is correct
+  (exit 0, balanced), as is the same buggy shape with the goto NOT taken, and the no-goto baseline. So
+  `xxhbdg`'s reject does not touch the legit idiom. Likely explanation for the NOT-REPRO: `38z6wi`
+  reported "lockc stays 0", which is exactly what the **defer-before-goto** variant yields — they appear to
+  have tested the safe shape. ⚠️ Still verify, when implementing, that the reject predicate ACCEPTS the
+  defer-before-goto form (that positive case is not in `xxhbdg`'s test set).
+- **F3 — value/block `orelse` inside a defer body** (`rdh99l` `8af2573d`) hit a compiler-bug trap + broken
+  gcc; now a clean checker error. Test `orelse_value_in_defer.zer`. (This is the §E #28 follow-up the
+  2026-07-15 tracker left open — "recommend a checker-side ban". This IS that ban.)
+- **F4 — defer BLOCK declaring a local, in a multi-return function** (`rdh99l` `d9060007`). Emitted the
+  declaration unbraced at EVERY exit path → gcc `redefinition`; valid ZER failed to compile. Brace-scope
+  each block-form defer-body emission (IR_DEFER_FIRE handler + `emit_defers_from`).
+  Test `defer_block_decl_multi_return.zer`.
+
+### G. Emitter / codegen miscompiles (🟡)
+
+- **G1 — `?uN` / `?iN` / `[*]uN` / `?[*]uN` emitted a fresh ANONYMOUS struct per use site**
+  (**`rdh99l` `23f34ab1` — PROPER**; `02nq43` `7aac453a` is the narrower duplicate). Two instances were
+  distinct incompatible C types, so any copy/assign/return failed at gcc — non-native-width compound types
+  were simply broken. A `?u5` has the exact C layout of its carrier (`?u8`), so route to the carrier's
+  existing NAMED typedef. **rdh99l is strictly broader**: covers optional, slice AND optional-slice via an
+  extracted `intn_carrier_suffix` helper, and splits the UINT/SINT switch cases so signedness comes from
+  the case label (no raw type-kind dispatch). 02nq43 covers only `?uN`/`?iN` with an inline duplicated
+  ternary — **but take 02nq43's `#if defined(__SIZEOF_INT128__)` guard** around the 128-bit carrier
+  typedefs; rdh99l emits them unguarded, which breaks any target without `__int128` (e.g. 32-bit ARM).
+  Tests `intn_compound_types.zer` (rdh99l), `optional_intn_carrier.zer` (02nq43).
+- **G2 — `(*p).field` emitted `*p.field`** = C `*(p.field)`, uncompilable (`rvek5f` `00f3c2af`). New
+  `field_obj_needs_parens` parenthesizes a field object binding looser than the postfix accessor
+  (unary/binary/cast/orelse); applied on **BOTH** the AST and IR emit paths. Test `explicit_deref_field.zer`.
+- **G3 — plain `x = a + b` / `~a` of a narrow/uN result into a WIDER lvalue dropped the width wrap**
+  (`38z6wi` `835eeb26`). `emit_rewritten_node` NODE_BINARY/NODE_UNARY now wrap the width-wrapping ops in a
+  carrier-typed stmt-expr + `emit_intn_mask_lv`, matching the var-decl (IR_BINOP) path.
+  Test `uN_narrow_wrap_wide_assign.zer`.
+- **G4 — `@cache_flush/clean/invalidate_range` had `#if x86 / #elif aarch64 / #endif` with NO `#else`**
+  (`rdh99l` `9a40ead4`). On RISC-V / ARM32 the loop body was EMPTY — a silent no-op (stale DMA data for
+  invalidate). Add an `#elif !x86_64` fence fallback matching the sibling single-line ops so ordering is
+  preserved and it is not silent. Actual cache maintenance on those arches is a hardware-consequence floor
+  (RISC-V needs Zicbom).
+- **G5 — nested by-value container emitted BEFORE the container it holds** (`i0txin` `cd9bc560`) → gcc
+  "field has incomplete type". `emit_container_structs` now emits via DFS post-order, forcing any stamped
+  container held BY VALUE (bare field or array-of-struct field; pointer/optional/slice fields impose no
+  ordering) to be emitted before its user. Decouples emission order from registration order.
+  Test `container_nested_byvalue.zer`.
+  🔗 **HARD DEPENDENCY: G5 is required if and only if you take J4.** It fixes a regression that J4's
+  tie-the-knot container-cache change introduces. **Take both or neither.**
+- **G6 — short-circuit violation: `orelse` in the RHS of a `&&`/`||` in a plain assignment**
+  (`38z6wi` `ddf6ac47`). `x = a && (ping() orelse false);` ran `ping()` even when `a` was false (and a trap
+  inside the orelse fired spuriously). A plain `x = <expr>` goes to `lower_expr`'s passthrough, which hands
+  the RHS to `pre_lower_orelse` — that HOISTS the nested orelse BEFORE the `&&` instead of routing through
+  `lower_shortcircuit_to_dest` (the path var-decl-init, call-args, cond and return all use);
+  `find_orelse` doesn't recurse into NODE_BINARY so the statement-level interceptor missed the shape. Fix:
+  reroute the plain-`=` RHS through `lower_expr` → `lower_shortcircuit_to_dest` when it is a `&&`/`||`
+  binary CARRYING a nested orelse (new `sc_expr_has_orelse` gate so the common `x = a && b` keeps native
+  passthrough). The decompose returns the RHS value so `y = (x = a && ...)` still yields correctly.
+  Test `shortcircuit_orelse_assign_ok.zer`.
+- **G7 — `@saturate` / `@addc` / `@subb` / `@mulw` in a GLOBAL INITIALIZER** (`7fxhb3` `31796ef8`). They
+  pass the constant-expr gate but emit non-file-scope-legal C (stmt expr / runtime call) → cryptic GCC
+  failure. Now rejected cleanly; they still work in function bodies. Tests `global_init_{saturate,addc}.zer`,
+  positive `intrinsic_in_function_body_ok.zer`.
+
+### H. Crash / DoS
+
+- **H1 — `*(&x) = v` SEGV'd the const-check walk** (`02nq43` `7aac453a`). Address-of in an lvalue chain: the
+  walk read `index_expr.object` off a `&` unary node. Descend `unary.operand`.
+  Test `assign_through_addressof.zer`.
+- **H2 — uncapped error-line echo → quadratic compile-time DoS** (`rdh99l` `d9060007`). The error printer
+  echoed the FULL source line once per error → O(errors × line_len), ~20s on an 80KB garbage line. Cap the
+  echo at 200 chars (the caret was already capped at 60).
+
+### I. Bare-metal / MMIO
+
+- **I1 — indexing a volatile single pointer `reg[i]` with NO compile-time `mmio_bound`** (`n0odo5`
+  `17ec74ca`, 🔴 bare-metal). The `!is_volatile` exemption assumed volatile ⇒ mmio-bounds-checked, but the
+  bound is derived ONLY for a direct `@inttoptr(*T, CONST)` inside a declared mmio range. A param / alias /
+  struct field / variable-address `@inttoptr` shipped an UNGUARDED wild MMIO access — faults on hosted,
+  silent corruption on bare-metal. Reject those; the bounded const-`@inttoptr` idiom keeps its bound and is
+  unaffected. Test `mmio_volatile_param_index_unbounded.zer`.
+
+### J. Type system / correctness
+
+- **J1 — `const MyPtr` (distinct pointer typedef) dropped its const** (`xxhbdg` `f80166fd`, 🔴). The const
+  branch matched only a bare pointer/slice, NOT distinct (the volatile branch already unwrapped), so
+  `*cg = 7` mutated read-only data and `@ptrcast`/`@pun`/`@cast` laundered the const away. The type can't
+  carry const without breaking nominal distinct identity, so read `sym->is_const` at the deref-write check
+  and in a new centralized **`check_const_strip`** helper replacing 3 copy-pasted const-strip blocks. The
+  Symbol fallback is gated on a DISTINCT declared type so it never fires on a binding-immutable if-unwrap
+  capture `|node|` (pointee mutable). Tests `distinct_const_deref_write.zer`,
+  `distinct_const_ptrcast_launder.zer`, positive `distinct_const_read_ok.zer`.
+- **J2 — volatile-strip via an ASYMMETRIC optional wrap** (`3o10j6` `d1a7d9cc` #2, MMIO correctness). The
+  BUG-747 lockstep optional-peel required BOTH sides optional, so `?*u32 mp = <volatile *u32>` never peeled
+  and stripped volatile silently. Peel each side INDEPENDENTLY (var-decl + assignment) before comparing
+  volatile. Tests `volatile_strip_optional_{vardecl,assign}.zer`.
+- **J3 — `{ .field = ptr }` designated-init registered no alias** (`n0odo5` `2d6ec421`, 🔴 UAF) — unlike
+  `h.field = ptr`. Add an `IR_STRUCT_INIT_DECOMP` analyzer case.
+  Test `struct_init_field_alias_uaf.zer`.
+- **J4 — self-referential pointer container `?*Node(T)` rejected as a type collision** (`i0txin`
+  `a9ba4c77`, over-rejection). The canonical linked list did not compile — the instance cache was populated
+  AFTER field resolution. Fix: tie the knot (cache BEFORE fields) + a by-value self-containment guard so an
+  infinite by-value self-reference still gets a clean ZER error. Tests `container_self_ref_pointer.zer`,
+  `container_by_value_self.zer`.
+  🔗 **Take **G5** with this** — see the dependency note there.
+
+### Conflict groups (apply per-family, re-verify after each)
+1. **§A (all 7 impls)** land in the same `ir_check_inst` IR_ASSIGN region (~3257) — implement the
+   38z6wi⊕02nq43 synthesis ONCE, do not apply sequentially. 38z6wi additionally touches IR_FIELD_WRITE
+   (~4950) and IR_INDEX_WRITE (~5018).
+2. **§B (all 9)** land in `check_stmt` / `check_expr`, several adjacent (NODE_IF ~11331, defer ~12766,
+   @once ~13744, orelse ~7481). Apply as one VRP family.
+3. **§C1 + §C2** touch the same escape-sink block (~5131) from different angles (sink vs taint helper).
+4. **§D2/§D3/§D8** all edit the NODE_SPAWN arg loop; **§D4/§D5/§D6/§D7** all edit scoped-borrow tracking
+   (§D7 also changes `types.h`).
+5. **§G1** (rdh99l) and **§G3** (38z6wi) both touch `emit_type` / `emit_rewritten_node` uN paths.
+6. **J4 → G5** hard dependency (container).
+7. **Audit baselines:** 3 commits touch `tools/type_dispatch_baseline.txt` (38z6wi, xxhbdg, n0odo5) and
+   4 touch `tools/sink_matrix.sh` (bz5q89, 8rv51h, 7fxhb3, i0txin) — **re-baseline ONCE at the end**,
+   not per fix, or the gates will fight you.
+8. **Junk:** `38z6wi` `9c18deb7` is 542 rebuilt test binaries with zero source change — do NOT port.
+   (`8rv51h` `46cb1077` independently flags this tracked-binary churn as tech debt.)
+
+### Effect on the §G documented-gap tracker (2026-07-19 wave)
+This wave closes **G5** (§A, seven impls), **G2** (§D5), **G4** (§D4), and **G1** (§F2 — interim reject;
+G1 empirically re-confirmed LIVE on main 2026-08-01, see §F2).
+**G3** (atomic-cell plain access not transitive through a helper) remains OPEN and is re-confirmed live by
+`3o10j6` `d1a7d9cc` and `38z6wi` `d1ccb8aa` (reproducer
+`tests/zer_gaps/g3_atomic_cell_plain_access_via_helper.zer`). Update that section's counts when these land.
+
+---
+
+## OPEN — findings carried forward from the 2026-07-21→31 branch wave (documented, NOT fixed on any branch)
+
+These are the audit findings the eleven branches recorded but did **not** fix. Deduped against the rest
+of this file — items already tracked here (cross-block scoped-borrow, the `?T` optional-unwrap class-kill,
+`vrp_ir.c` dead code) are noted as cross-references rather than repeated.
+
+### 🔴 ACCEPT-UNSAFE — cross-function free of a FIELD of a by-value struct/union param (`rdh99l` `9a40ead4`, 2026-07-26)
+Pure ZER (no cinclude / `*opaque` / asm). Compiles clean; runtime glibc double-free abort or observable UAF.
+```zer
+struct B { u32 x; }  struct H { [*]B buckets; }
+void fb(H h) { free(h.buckets); }              // frees a FIELD of a by-value struct param
+u32 main() { H h; h.buckets = alloc(B, 4) orelse { return 0; };
+             fb(h); free(h.buckets); return 0; }   // analyzer thinks THIS is the first free
+```
+**Root cause.** The FuncSummary free-of-param scan (`zercheck_ir.c` ~5352) gates on the param's resolved
+type being POINTER/HANDLE/OPAQUE/SLICE, so a by-value **STRUCT/UNION** param is dropped entirely; and even
+for the accepted kinds it inspects only the BARE param handle (`ir_find_handle`, `path_len == 0`), never a
+compound FIELD handle. There is no `frees_param_field` signal, so a callee freeing `h.buckets` records
+nothing and the call site never widens `arg.field` to FREED. Distinct from BUG-737 (by-value field
+STORE-to-global escape), P9 (by-value field launder), §A #6 (intra-function compound copy) and §A #2
+(slice/pointer PARAM free).
+⚠️ **Doc correction:** the existing negative `tests/zer_fail/alloc_byval_field_slice_uaf.zer` passes for the
+WRONG reason (rejected as a LEAK, not because the field-free is tracked) — the moment a caller-side free
+satisfies the leak check, the double-free/UAF passes silently. The 2026-07-15 tracker's §A #2 claim that
+`fb(H h){free(h.buckets)}` "was recorded" is **inaccurate**.
+**Fix sketch (attempted 2026-07-26, REVERTED — not a safe single-session change):** a coarse
+`bool *frees_param_field` on FuncSummary (definite/all-path field free of an aggregate param), detected by
+looking for a FREED compound handle rooted at the param local in every return block.
+
+### 🔴 ACCEPT-UNSAFE — block-scoped `defer free/consume` UAF / use-after-move (`i0txin` `84097263`, 2026-07-30)
+A `defer free(p)` (or `defer consume(m)`) inside a NESTED block frees/moves at BLOCK EXIT (the intended ZER
+semantics), and the emitter emits the free there — but a USE after the block and before the function returns
+is silently accepted.
+```zer
+{ defer free(p); p.val = 222; }   // p freed HERE
+?*Node mq = alloc(Node);          // reuses the freed slot
+u32 r = p.val;                    // UAF read — ACCEPTED; reads 999
+```
+**Root cause (emitter/zercheck semantic mismatch).** `ir_lower.c` emits a block-scoped `IR_DEFER_FIRE` at
+each enclosing block exit and the emitter frees there (correct). But `zercheck_ir.c`'s forward pass (~4955)
+treats `IR_DEFER_FIRE` as a NO-OP, and Phase C3 (~5658-5718) applies defer bodies' frees ONLY at `IR_RETURN`
+blocks (function-exit / Go semantics) — so the analyzer only "knows" the free at function exit and misses the
+mid-function use. A non-defer `free(p)` in the same inner block IS caught, so the gap is defer-specific;
+function-level `defer free(p); return p.val;` remains CORRECT (fires after the use).
+⚠️ **The trap in the obvious fix:** applying the fired body's free at the `IR_DEFER_FIRE` point closes the
+UAF, but `ir_defer_scan_frees` (~1987) has a double-free detector guarded on `free_line != defer_line`, and
+Phase C3 ALSO re-applies every defer body at each return block — the two differing lines then trip a FALSE
+double-free. A correct fix must coordinate the two application points (either make the forward pass own ALL
+`IR_DEFER_FIRE` and have C3 skip already-processed fires, or tag each defer block-scoped vs function-scoped).
+🔗 Interacts with **§F1** (`freed_defer_id` replaces exactly that line-based guard) — land §F1 first and this
+fix gets easier.
+
+### 🔴/🟡 goto-defer double-fire → double-FREE on the SUCCESS path (`3o10j6` `d1a7d9cc`, 2026-07-23) — distinct from G1
+A forward `goto` out of a nested scope (loop/if body carrying a `defer`) to a label AFTER that scope re-fires
+the nested-scope defer on the NATURAL fall-through path (where the goto was never taken).
+`for(..){ defer d+=1; if(cond) goto done; } done:` runs the loop defer N+1 times, not N; with
+`defer free(b)` inside the loop this is a double-free on the success path, accepted silently.
+**Root:** `ir_lower.c` NODE_LABEL `restore_count` re-arm (~3547) bumps the label's exit-fire count to include
+the inner goto's live-defer count, but those defers already fired+popped at loop-iteration exit on the
+fall-through path; the guard flag suppresses the re-fire only on the goto path.
+**Durable fix:** per-defer runtime "armed" flags (subsumes this, G1 and the eager-goto guard). Sound interim:
+reject a forward goto whose live-defer set mismatches the label's. Reproducer preserved at
+`tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer`.
+
+### 🟠 spawn target reaches a non-shared global through a funcptr FIELD callback (`02nq43` `7aac453a`, 2026-07-29)
+```zer
+void worker(*W w) { w.cb(); }                                  // call through a funcptr FIELD
+u32 main() { gw.cb = do_inc; spawn worker(&gw); return 0; }     // ACCEPTED — g_ctr races
+```
+The DIRECT form (`worker` writing `g_ctr` itself) IS correctly rejected. This is the register-in-setup /
+invoke-in-worker RTOS pattern, so the binding `gw.cb = do_inc` lives in `main`, OUTSIDE the scanned `worker`
+body; a funcptr FIELD callee (`NODE_FIELD`) is not resolved. Same "check fires lexically but misses the access
+reached through a funcptr the sink doesn't match" shape as the closed SPAWN-FP / ISR-TRANS holes (#11/#12),
+one sink further out. **Sibling of §D8** (which closes the funcptr-ARG facet) — take §D8 first, then decide
+whether the FIELD facet warrants the same treatment.
+
+### 🟠 spawn target reaches a non-shared global through a RETURNED/local funcptr (`rvek5f` `00f3c2af` HOLE-D, 2026-07-31)
+```zer
+*() get_fp() { return touch; }
+void worker() { *() fp = get_fp(); fp(); }   // indirect call — scanner gives up
+```
+Genuine unsynchronized race; compiles clean with only a stack-depth *warning*. `scan_unsafe_global_access`
+(checker.c ~10203-10264) follows only calls whose callee is a named global function (plus function-NAMES
+passed as args, BH-18 #8). A call through a funcptr obtained from a return value / local is unresolvable →
+the scanner gives up and the data-race rule is bypassed. Direct `fp = touch; fp()`, a global funcptr, and a
+struct-field funcptr are all caught (the funcptr STORAGE is itself a flagged non-shared global) — only the
+returned/local funcptr leaks.
+**Fix sketch:** a spawn target (transitively) calling through an UNRESOLVABLE funcptr cannot be proven free of
+non-shared-global access → conservatively REJECT (the can't-prove-safe ⇒ reject barrier discipline). NOT done
+on the branch because it risks broadly over-rejecting legitimate callback-in-thread patterns; the
+safe/ergonomic boundary is a design call.
+📎 Together with the funcptr-FIELD item above and §D8, this completes the spawn-funcptr facet map:
+**ARG = fixed (§D8), FIELD = open, RETURNED/local = open, direct/global/struct-storage = already caught.**
+
+### 🟠 G3 — atomic-cell plain access not transitive through a helper (re-confirmed live, `3o10j6` + `38z6wi`)
+Already tracked as **G3** in the 2026-07-19 §G section — re-verified still open on both branches
+(TSan-confirmed). Recorded here only so the wave's coverage map is complete; do not duplicate the entry.
+The unified root with the now-fixed §D6/§D7 borrow holes: the scoped-borrow / plain-access analysis is
+intra-name and intra-function and does not treat `&x` handed to a helper as an access. Making it
+inter-procedural (a summary "does this callee access/borrow its pointer arg?") is subsystem-scale.
+
+### 🟠 LOW — variable-index bit-slice WRITE: unclamped position shift is C UB (`n0odo5` `17ec74ca`, 2026-07-25)
+`reg[hi..lo] = v` with a RUNTIME `lo` lowers to `(uint64_t)(v) << _zer_bl` and `mask << _zer_bl`
+(emitter.c ~1708-1743 AST path + the IR mirror). When `lo >= 64` the shift count is out of range → C UB
+(x86 masks mod 64, other arches differ), violating ZER's stated "shift by ≥ width = 0 (defined)" guarantee.
+The WIDTH computation is already clamped; the POSITION shift is not. The companion bit-slice READ path was
+fixed for exactly this (audit #18, commit `c9e4abca`); the WRITE path was not.
+**Severity LOW** — the result is stored back through `*_zer_bp` typed to the carrier width, so the store
+truncates: a wrong VALUE / UB, **not** an out-of-bounds memory write.
+
+### 🟢 LOW — value-returning `async` has no result-retrieval API (`7fxhb3` `31796ef8`, 2026-07-28)
+`async u32 compute() { … return 42; }` compiles clean and the state machine correctly finalizes (BH-18 #10,
+fixed 2026-06-26). But the returned value is stored in an internal temp (`self->_zer_t0`) with **no
+caller-accessible accessor** — a user who writes `async <non-void>` can never read the result. Neither
+rejected nor retrievable = a silent footgun. Resolution is either a real retrieval mechanism (a stable
+`.result` field + `_zer_async_NAME_result(&task)`, distinct from the `int` poll done-flag) or REJECT
+`async <non-void>` until such an API exists. Not memory-unsafe (there is no valid usage today).
+
+### 🟢 Over-rejection — container field of `Handle(T)`/`Pool(T)`/`Ring(T)`/`Slab(T)` drops T substitution (`i0txin` `84097263`, 2026-07-30)
+`subst_typenode` (checker.c ~2158-2219) treats `TYNODE_HANDLE`/`POOL`/`RING`/`SLAB` as LEAVES and does not
+recurse into their `.elem`, so `container W(T) { Handle(T) h; }` fails to substitute and emits a LOUD
+`error: undefined type 'T'` at the template line. Fails loudly — no silent miscompile. The documented
+`T`/`*T`/`?T`/`[*]T`/`T[N]` shapes substitute correctly. **Fix:** recurse into `.elem`/`.inner` for those
+four TypeNode kinds.
+
+### 🟢 Over-rejection — struct-by-value return carrying a PARAM-view field (`rvek5f` `00f3c2af`, 2026-07-31)
+`struct Sl { [*]u32 s; }  Sl mk([*]u32 p) { Sl r; r.s = p[0..2]; return r; }` is rejected
+("return pointer to local 'r'") though it is safe — the struct copy carries a CALLER-memory view out. The
+bare-param-view relaxation (BUG-764) covers `return p[0..2];` but not a param view wrapped in a
+returned-by-value struct. Errs conservative → no soundness threat.
+
+### 🟢 Doc mismatch — bit-extraction on a `volatile *u32` MMIO register is over-rejected (`rvek5f` `00f3c2af`)
+CLAUDE.md's "Hardware Support" quick reference shows
+`volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];`, but `reg[hi..lo]` on a POINTER parses as a slice
+range → `error: slice start (9) is greater than end (8)`. Bit-extraction only works on a scalar VALUE.
+Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to show the deref form, or make
+`reg[hi..lo]` on a volatile scalar pointer auto-deref for bit-extraction.
+
+### Cross-references (already tracked elsewhere in this file — do NOT duplicate)
+- **HOLE-C / cross-block scoped-borrow, join-in-branch** (`rvek5f` `00f3c2af`) — already the single open item
+  in "OPEN — Concurrency memory-safety" below. rvek5f adds a SHARP trigger worth appending there:
+  `th.join()` inside a branch clears the per-Symbol `is_borrowed_by_thread` flag in AST-walk order, so an
+  unguarded access on the OTHER (un-joined) path is not flagged. Same-block / nested-if / loop-body /
+  switch-arm / goto variants are all correctly caught. Proper fix remains a zercheck_ir borrow-set CFG merge.
+- **`?T` optional-wrapper class-kill still unbuilt** (`i0txin` `a9ba4c77`) — already tracked as the OPEN
+  "optional-unwrap" class-kill. This wave closed two MORE instances of it by hand (§D2 spawn `is_ptr_like`,
+  §C2 taint helper), reinforcing that the enforced-unwrap gate is the durable answer.
+- **`vrp_ir.c` is fully dead code** (`rvek5f` `00f3c2af`) — already noted here; rvek5f re-confirms `vrp_ir()`
+  / `IRVRPResult` have ZERO callers and are not in the Makefile, while all load-bearing bounds/division VRP
+  is the AST VRP in checker.c. Either wire it (the tracked "wire the orphaned vrp_ir.c" direction) or delete
+  it to stop implying live coverage.
+
+---
+
 ## ✅ DONE (2026-07-15) — audit fixes across 12 parallel `claude/*` branches — TASK TRACKER COMPLETE
 
 **🎯 ALL 41 unique fixes are now merged to main**, one verified fix at a time (2026-07-13 → 07-15),

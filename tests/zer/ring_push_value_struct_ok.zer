@@ -1,0 +1,6 @@
+// C7 over-rejection guard: a PURE-VALUE struct element (no pointer field) must
+// still be pushable from a local — type_carries_data_pointer gates the new walk.
+struct Pt { u32 x; u32 y; }
+Ring(Pt, 4) rp;
+Pt mkp(u32 v) { Pt p; p.x = v; p.y = v; return p; }
+u32 main() { u32 loc = 3; rp.push(mkp(loc)); return 0; }

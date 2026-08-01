@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// C7 (2026-08-01): Ring.push of a call returning a BY-VALUE struct that CARRIES a
+// pointer to a local. arg_is_local_derived followed a NODE_CALL arg only when the
+// result was a pointer/slice (escape_type_carries_ref), so a pointer-carrying
+// STRUCT laundered the stack pointer into the global Ring undetected. The struct
+// copy puts the dangling pointer field into storage that outlives the frame.
+struct Box { *u32 p; }
+Ring(Box, 4) rb;
+Box mk(*u32 q) { Box b; b.p = q; return b; }
+void c() { u32 loc = 5; rb.push(mk(&loc)); }
+u32 main() { c(); return 0; }

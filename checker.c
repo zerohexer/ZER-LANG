@@ -1071,7 +1071,17 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
          * A slice references frame memory exactly as a pointer does. */
         if (arg->kind == NODE_CALL) {
             Type *arg_type = typemap_get(c, arg);
-            if (escape_type_carries_ref(arg_type)) {
+            /* C7 (2026-08-01): also follow a call returning a BY-VALUE aggregate
+             * that CARRIES a pointer (`Box mk(*u32 q) { b.p = q; return b; }`).
+             * escape_type_carries_ref covers pointer / slice / optional-of-those
+             * only, so `rb.push(mk(&loc))` (Ring element `Box`) laundered a stack
+             * pointer into a global container undetected — the struct copies the
+             * bytes, and the pointer FIELD inside it dangles just as a bare
+             * pointer would. type_carries_data_pointer recurses struct/union/
+             * array/optional and excludes funcptrs + Handle, so a pure-value
+             * element is still never followed. */
+            if (escape_type_carries_ref(arg_type) ||
+                type_carries_data_pointer(arg_type, 0)) {
                 if (call_has_local_derived_arg(c, arg, depth + 1))
                     return true;
             }

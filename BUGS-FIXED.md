@@ -50,6 +50,21 @@ all 44 existing `tests/zer_fail/{keep,escape,return}_*.zer` shows 0 regressions.
 — CLEAN. make check 0: ZER 1037/0, Rust 784/0, Zig 36/0, modules 28/0, fuzz 200/0, all 8 oracles +
 every audit gate.
 
+**C7 (added 2026-08-01, completing §C).** `rb.push(mk(&loc))` — Ring.push of a call returning a
+BY-VALUE struct that CARRIES a pointer to a local — laundered the stack pointer into a global
+container. `container_push_arg_escapes` already existed and was correctly gated; the failure was
+UPSTREAM in `arg_is_local_derived`, whose NODE_CALL recursion fired only when the call's result was
+a pointer/slice (`escape_type_carries_ref`), excluding a pointer-carrying aggregate. Widened to
+`|| type_carries_data_pointer(arg_type, 0)`, which recurses struct/union/array/optional and excludes
+funcptrs + Handle, so a pure-value element is still never followed.
+
+Worth recording: rdh99l `8af2573d` describes C7 as "Ring.push/keep-call", but the **keep-call half
+was already rejected on current main** — only the Ring.push half was live. The commit shipped NO
+test for either facet (its five tests cover the other four fixes in that bundle), which is why this
+needed a written reproducer rather than a collected one. Tests:
+`tests/zer_fail/escape_ring_push_byvalue_struct.zer` + `tests/zer/ring_push_value_struct_ok.zer`
+(pure-value element still pushes).
+
 **Note on the positive test.** It deliberately does NOT bind a param-view POINTER return
 (`*u8 f = firstp(b);`) — that is rejected today by the documented leak false-positive in
 limitations.md PART 6 §36.17, a pre-existing residual kept because it catches the through-call

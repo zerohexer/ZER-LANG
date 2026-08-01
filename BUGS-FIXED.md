@@ -5,6 +5,49 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-01 — VRP-JOIN leaks at 4 un-enumerated conditional bodies -> silent OOB (checker.c)
+
+**The class.** Main wires the `vrp_snap_take/restore/join` machinery at NODE_IF / FOR / WHILE /
+SWITCH / LABEL (§C #13 + the 2026-07-19 batch). Four conditionally-executed bodies were never
+enumerated, so a range narrowed inside them mutated the VarRange entry IN PLACE and leaked past the
+merge — proving a later `garr[idx]` in-bounds on a path where `idx` is wild, eliding the fixed-array
+bounds guard = silent OOB write. All four verified reproducing on main before the fix:
+
+| site | main (broken) | fixed | operation |
+|---|---|---|---|
+| `if (opt) \|v\| { }` capture body | exit 100 (OOB write) | exit 0 (guard fires) | **JOIN** |
+| `orelse { block }` fallback | exit 107 (OOB write) | exit 0 (guard fires) | **JOIN** |
+| `defer { }` body | exit 2 | exit 0 | **RESTORE** |
+| `@once { }` body | exit 100 (OOB write) | exit 0 (guard fires) | **JOIN** |
+
+**JOIN vs RESTORE — the operation is not uniform.** A MAY-RUN body (@once, orelse-fallback,
+if-capture) must JOIN: the sound post-state is the union of the ran and skipped paths. The `defer`
+body is the exception and correctly RESTOREs — it executes at SCOPE EXIT, after every statement
+between the `defer` and the exit, so there is no following code on which its effect is observable
+and nothing to union. JOIN is also sound-by-construction: it only ever WIDENS a range, so it can add
+a guard but never remove one.
+
+`8rv51h` `e920ffb9` used RESTORE for @once and orelse; `7fxhb3` `31796ef8` used JOIN for @once and
+argued it explicitly ("@once needs JOIN (may-run) not full discard"). JOIN taken for all three
+may-run bodies. **Honest note on the evidence:** an attempt to exhibit RESTORE failing in the
+WIDENING direction (body assigns outside the pre-range) was INCONCLUSIVE — a control
+(`u32 idx = 1; garr[idx] = 5;` with no conditional body at all) shows a literal-init variable index
+into a fixed array is not proven-elided in the current build, so the probe never discriminated the
+two operations. JOIN is chosen on the sound-by-construction argument, not on a measured failure of
+RESTORE.
+
+**Test quality note (why the branch reproducers were replaced).** `8rv51h`'s if-capture and
+orelse reproducers index a HEAP SLICE (`alloc(u32,4)`), whose runtime bounds check fires regardless
+of VRP — they trap on a broken compiler AND a fixed one, so they do not discriminate (both passed on
+unfixed main). The committed versions use a FIXED ARRAY, where VRP elision is the actual mechanism;
+each was confirmed to FAIL on main before the fix and pass after.
+
+**Tests.** `tests/zer/vrp_{ifcapture,orelse_block}_narrowing_guarded.zer` (new, discriminating),
+`vrp_{defer_body,once_body}_narrowing_guarded.zer` (from `7fxhb3`). make check 0 (ZER 1025/0,
+Rust 784/0, Zig 36/0, modules 28/0, fuzz 200/0, all 8 oracles + audit gates, sink matrix 48 CLEAN).
+
+---
+
 ## 2026-08-01 — G5: heap pointer into a GLOBAL's FIELD/INDEX projection dangled unflagged (zercheck_ir.c)
 
 **The hole (🔴 silent UAF, long-documented as §G "G5").** `g.p = n; free(n);` where `g` is a

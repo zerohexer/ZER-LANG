@@ -1,0 +1,19 @@
+// VRP-JOIN (B2, 2026-08-01): a range narrowed inside an `if (opt) |v| { }` capture
+// body leaked past the merge — the capture path BREAKS before the NODE_IF VRP-JOIN
+// block — eliding the fixed-array bounds guard on the None path where idx is wild.
+// NOTE: uses a FIXED ARRAY deliberately. The original branch reproducer used a heap
+// slice, whose runtime bounds check fires regardless of VRP, so it did NOT
+// discriminate a fixed compiler from a broken one (it passed on buggy main).
+// Broken: idx proven [0,3], guard elided, garr[100]=7 corrupts memory, returns 100.
+// Fixed:  the auto-guard fires and f() returns 0.
+u8[4] garr;
+u32 wild() { return 100; }
+?u32 none_opt() { return null; }
+u32 f() {
+    u32 idx = wild();
+    ?u32 m = none_opt();
+    if (m) |v| { idx = v % 4; }
+    garr[idx] = 7;
+    return idx;
+}
+u32 main() { return f(); }

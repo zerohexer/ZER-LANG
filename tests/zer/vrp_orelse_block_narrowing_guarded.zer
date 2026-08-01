@@ -1,0 +1,16 @@
+// VRP-JOIN (B3, 2026-08-01): a range narrowed inside an `orelse { block }` fallback
+// (runs ONLY on the None path) leaked to code after the orelse on the Some path,
+// eliding the fixed-array bounds guard. Fixed-array (not heap-slice) so the test
+// actually discriminates — see the note in vrp_ifcapture_narrowing_guarded.zer.
+// Broken: idx proven [2,2], guard elided, garr[100]=7 corrupts memory, returns 107.
+// Fixed:  the auto-guard fires and f() returns 0.
+u8[4] garr;
+u32 wild() { return 100; }
+?u32 some_opt() { return 7; }
+u32 f() {
+    u32 idx = wild();
+    u32 x = some_opt() orelse { idx = 2; return 0; };
+    garr[idx] = 7;
+    return idx + x;
+}
+u32 main() { return f(); }

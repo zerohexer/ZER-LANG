@@ -7461,7 +7461,25 @@ static Type *check_expr(Checker *c, Node *node) {
                  * bare-statement `f() orelse { ... }` (value discarded) stays legal.
                  * A block that DIVERGES on every path (return/break/continue/goto)
                  * never reaches the consumer, so it keeps the unwrapped type. */
+                /* VRP (B3, 2026-08-01): the fallback block runs ONLY on the None
+                 * path, but code after the orelse runs on the Some path too — so
+                 * a range narrowed inside the block must not be assumed
+                 * afterwards. It was mutating entries IN PLACE and leaking past
+                 * the merge, eliding a later fixed-array bounds guard on the Some
+                 * path (verified on main: exit 107 = the elided-guard OOB write,
+                 * vs 7 with the guard).
+                 *
+                 * JOIN (union pre with post), matching the may-run treatment of
+                 * the @once body: sound whether or not the block ran. A diverging
+                 * block never reaches the following code at all, so joining its
+                 * (unreachable) state is harmless — it can only widen, never
+                 * narrow, so no guard is ever wrongly elided. */
+                int oe_saved = c->var_range_count;
+                struct VarRange *oe_pre = vrp_snap_take(c, oe_saved);
                 check_stmt(c, node->orelse.fallback);
+                c->var_range_count = oe_saved;
+                vrp_snap_join(c, oe_pre, oe_saved);
+                free(oe_pre);
                 result = orelse_block_diverges(node->orelse.fallback)
                              ? unwrapped : ty_void;
             } else {
@@ -11299,11 +11317,37 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
+                /* VRP-JOIN (B2, 2026-08-01): the `if (opt) |v| { }` capture path
+                 * BREAKS here, BEFORE the comparison / non-comparison VRP-JOIN
+                 * block below — so a range narrowed inside the capture body
+                 * (`if (m) |v| { idx = v % 4; }`) mutated the entry IN PLACE and
+                 * leaked past the merge, proving a later `garr[idx]` in-bounds on
+                 * the None path where idx is wild → fixed-array bounds guard
+                 * elided → silent OOB write (verified on main: exit 100 = the
+                 * elided-guard write, vs 0 with the guard).
+                 *
+                 * Mirror the NODE_IF non-comparison branch: snapshot pre VALUES,
+                 * capture the then-result, restore for the else / fallthrough,
+                 * then JOIN so the merged range over-approximates BOTH paths
+                 * (the capture body may or may not run). Same VRP-JOIN class as
+                 * §C #13; the capture-unwrap site was simply un-enumerated. */
+                int cap_saved = c->var_range_count;
+                struct VarRange *cap_pre = vrp_snap_take(c, cap_saved);
+
                 check_stmt(c, node->if_stmt.then_body);
                 pop_scope(c);
 
-                if (node->if_stmt.else_body)
+                c->var_range_count = cap_saved;
+                struct VarRange *cap_thenv = vrp_snap_take(c, cap_saved);
+                vrp_snap_restore(c, cap_pre, cap_saved); /* reset for else */
+
+                if (node->if_stmt.else_body) {
                     check_stmt(c, node->if_stmt.else_body);
+                    c->var_range_count = cap_saved;
+                }
+                vrp_snap_join(c, cap_thenv, cap_saved);
+                free(cap_pre);
+                free(cap_thenv);
                 break;
             }
         }
@@ -12766,7 +12810,25 @@ static void check_stmt(Checker *c, Node *node) {
             false, NULL,
             false, NULL);
         c->defer_depth++;
-        check_stmt(c, node->defer.body);
+        {
+            /* VRP (B4, 2026-08-01): a defer body runs at SCOPE EXIT, i.e. AFTER
+             * every statement between the `defer` and the exit. So a range
+             * derived inside it must NEVER apply to that following code —
+             * `defer { idx = 2; }` was eliding a later `garr[idx]` fixed-array
+             * bounds guard (verified on main: exit 2 instead of 0 = silent OOB).
+             * RESTORE (fully discard the body's in-place narrowing) is the
+             * correct operation here — unlike a may-run body there is no path on
+             * which the body's effect is observable by the following code, so
+             * there is nothing to JOIN. The §C #13 JOIN fix wired
+             * NODE_IF/FOR/WHILE/SWITCH/LABEL but the defer body was checked
+             * inline with no snapshot at all. */
+            int vrp_saved = c->var_range_count;
+            struct VarRange *vrp_pre = vrp_snap_take(c, vrp_saved);
+            check_stmt(c, node->defer.body);
+            c->var_range_count = vrp_saved;
+            vrp_snap_restore(c, vrp_pre, vrp_saved);
+            free(vrp_pre);
+        }
         c->defer_depth--;
         break;
 
@@ -13730,7 +13792,26 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->once.body) {
             bool saved_in_once = c->in_once;
             c->in_once = true;
+            /* VRP (B5, 2026-08-01): a @once body runs AT MOST ONCE — skipped on
+             * every later call and on loser threads. So a range narrowed inside
+             * is valid only on the RUN path; the SKIP path keeps the pre-body
+             * value. `@once { idx = 2; }` was eliding a later `garr[idx]`
+             * fixed-array bounds guard on the skip path (verified on main:
+             * exit 100 = the elided-guard OOB write, vs 0 with the guard).
+             *
+             * JOIN (union pre with post), NOT restore: this is a MAY-RUN body,
+             * so the sound post-state must cover BOTH the run and skip paths.
+             * A restore-only form would keep just the pre-range and therefore
+             * under-approximate whenever the body assigns OUTSIDE it (e.g. pre
+             * [1,1], body sets 99 → restore re-proves [1,1] → guard elided →
+             * OOB on the run path). Contrast the defer body above, where RESTORE
+             * is correct because no code follows it. */
+            int vrp_saved = c->var_range_count;
+            struct VarRange *vrp_pre = vrp_snap_take(c, vrp_saved);
             check_stmt(c, node->once.body);
+            c->var_range_count = vrp_saved;
+            vrp_snap_join(c, vrp_pre, vrp_saved);
+            free(vrp_pre);
             c->in_once = saved_in_once;
         }
         break;

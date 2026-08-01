@@ -100,7 +100,7 @@ static int run_neg(const char *name, const char *code) {
 /* ---- Grid axes ---- */
 typedef enum { ED_RETURN, ED_GLOBAL, ED_PARAM_FIELD, ED_NESTED_FIELD, EDEST_COUNT } EscDest;
 typedef enum { LD_DIRECT, LD_ALIAS, LD_PTRCAST, LD_PTRTOINT, LD_IDENTITY,
-               LD_WRAPPER, LD_ORELSE, LAUNDER_COUNT } Launder;
+               LD_WRAPPER, LD_ORELSE, LD_OPTWRAP, LAUNDER_COUNT } Launder;
 typedef enum { SR_VAR, SR_ARRAY, SR_ARENA, SRC_COUNT } Src;
 
 static const char *dest_name(EscDest d) {
@@ -122,6 +122,7 @@ static const char *launder_name(Launder l) {
         case LD_IDENTITY: return "id-wash";
         case LD_WRAPPER:  return "wrapper";
         case LD_ORELSE:   return "orelse-fb";
+        case LD_OPTWRAP:  return "opt-carrier";
         case LAUNDER_COUNT: break;
     }
     return "?";
@@ -152,6 +153,13 @@ static int cell_valid(EscDest d, Launder l, Src s) {
         case LD_IDENTITY: return s == SR_VAR;            /* all 4 dests */
         case LD_WRAPPER:  return s == SR_VAR;            /* all 4 dests */
         case LD_ORELSE:   return s == SR_VAR;            /* all 4 dests */
+        /* LD_OPTWRAP (2026-08-01): the escaping value is bound through an
+         * OPTIONAL CARRIER (`?*u32 m = &local;`) before reaching the sink. The
+         * wrapper hides the inner pointer kind, which is exactly the class that
+         * produced C2/D2 — a sink testing `kind == TYPE_POINTER` sees
+         * TYPE_OPTIONAL and skips. Valid for a local var and a local array
+         * (`?[*]u32` over a stack array — the C2 shape). */
+        case LD_OPTWRAP:  return s == SR_VAR || s == SR_ARRAY;
         case LD_PTRTOINT:
             /* integer-laundering path: @ptrtoint(&local) yields usize, not a
              * pointer; the escape only re-materializes via @inttoptr, which is
@@ -228,6 +236,22 @@ static void gen(EscDest d, Launder l, Src s, char *buf, size_t n) {
             RET = "*u32";
             snprintf(launSetup, sizeof(launSetup), "    ?*u32 mo = null;\n");
             snprintf(E, sizeof(E), "mo orelse %s", srcBase);
+            break;
+        case LD_OPTWRAP:
+            /* bind through an optional carrier, then unwrap at the sink. The
+             * carrier is what hides the inner kind from a syntactic gate. */
+            if (s == SR_ARRAY) {
+                RET = "[*]u32";
+                snprintf(launSetup, sizeof(launSetup),
+                         "    ?[*]u32 mw = %s;\n    [*]u32 w = mw orelse { return; };\n",
+                         srcBase);
+            } else {
+                RET = "*u32";
+                snprintf(launSetup, sizeof(launSetup),
+                         "    ?*u32 mw = %s;\n    *u32 w = mw orelse { return; };\n",
+                         srcBase);
+            }
+            snprintf(E, sizeof(E), "w");
             break;
         case LAUNDER_COUNT: RET = "*u32"; E[0] = 0; break;
     }

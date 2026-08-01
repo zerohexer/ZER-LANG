@@ -1,0 +1,52 @@
+# carrier_dispatch_baseline.txt — frozen surface for audit_carrier_dispatch.sh
+# (2026-08-01). Each line is a HAND-ROLLED reference-carrier disjunction in a
+# safety-decision file (checker.c / zercheck_ir.c), recorded file:content so the
+# baseline is line-number-agnostic.
+#
+# These 33 sites are GRANDFATHERED, not blessed. The gate's job is to stop the
+# 34th from being added silently — every one of the 2026-08-01 §C/§D holes
+# (C2/C3/C4/C7, D1/D2/D3) was a site of exactly this shape that forgot a wrapper.
+#
+# Whether the EXISTING 33 each handle every wrapper is a separate question, and
+# the answer comes from the matrix oracles (the WRAP_OPT axis added the same
+# day), not from this linter. Treat a line here as "known, untriaged", and when
+# you touch one, prefer converting it to a carrier predicate and DELETING its
+# row rather than leaving it frozen.
+#
+# Adding a row requires a justification in the commit message. The legitimate
+# reasons are: the site is REPRESENTATION not safety (emitting `.has_value`, a
+# null-sentinel test), the local is already fully unwrapped (`_eff`), or the
+# context is primitive-only.
+checker.c:bool is_ptr_like = (eff_pl->kind == TYPE_POINTER ||
+checker.c:(eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+checker.c:eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
+checker.c:eff_pl->kind == TYPE_ARRAY ||
+checker.c:eff_pl->kind == TYPE_SLICE ||
+checker.c:(eff_r->kind == TYPE_SLICE || eff_r->kind == TYPE_ARRAY)) {
+checker.c:if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+checker.c:if ((eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY) ||
+checker.c:if (et && (et->kind == TYPE_STRUCT || et->kind == TYPE_ENUM ||
+checker.c:if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return 4; /* null sentinel */
+checker.c:if (!ns_type || ns_type->kind == TYPE_POINTER || ns_type->kind == TYPE_SLICE ||
+checker.c:if (oi->kind == TYPE_POINTER || oi->kind == TYPE_FUNC_PTR)
+checker.c:if ((tgt_eff->kind == TYPE_POINTER || tgt_eff->kind == TYPE_OPAQUE) &&
+checker.c:if (type_is_integer(target) && (src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE) &&
+checker.c:int is_ptr_src = (eff->kind == TYPE_POINTER || eff->kind == TYPE_FUNC_PTR) ? 1 : 0;
+checker.c:ns_type->kind == TYPE_STRUCT || ns_type->kind == TYPE_UNION) {
+checker.c:return eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_SLICE ||
+checker.c:(src_eff->kind == TYPE_POINTER || src_eff->kind == TYPE_OPAQUE)) {
+checker.c:(tgt_eff->kind == TYPE_OPAQUE ||
+checker.c:type_name(eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY ? left : right));
+zercheck_ir.c:bool src_is_ptr = eff && (eff->kind == TYPE_POINTER ||
+zercheck_ir.c:} else if (ft->kind == TYPE_STRUCT || ft->kind == TYPE_UNION) {
+zercheck_ir.c:if (eff && (eff->kind == TYPE_POINTER || eff->kind == TYPE_OPAQUE) &&
+zercheck_ir.c:if (ft_eff && (ft_eff->kind == TYPE_STRUCT ||
+zercheck_ir.c:if (inner && (inner->kind == TYPE_POINTER ||
+zercheck_ir.c:if (inner && (inner->kind == TYPE_POINTER || inner->kind == TYPE_OPAQUE))
+zercheck_ir.c:if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
+zercheck_ir.c:if (ret->kind == TYPE_POINTER || ret->kind == TYPE_OPAQUE) return true;
+zercheck_ir.c:if (vt_eff && (vt_eff->kind == TYPE_STRUCT ||
+zercheck_ir.c:if (vt && (vt->kind == TYPE_STRUCT || vt->kind == TYPE_UNION)) {
+zercheck_ir.c:inner->kind == TYPE_OPAQUE ||
+zercheck_ir.c:ret_eff->kind == TYPE_OPAQUE ||
+zercheck_ir.c:return p0->kind == TYPE_POINTER || p0->kind == TYPE_OPAQUE;

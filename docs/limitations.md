@@ -634,9 +634,25 @@ Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to
   `th.join()` inside a branch clears the per-Symbol `is_borrowed_by_thread` flag in AST-walk order, so an
   unguarded access on the OTHER (un-joined) path is not flagged. Same-block / nested-if / loop-body /
   switch-arm / goto variants are all correctly caught. Proper fix remains a zercheck_ir borrow-set CFG merge.
-- **`?T` optional-wrapper class-kill still unbuilt** (`i0txin` `a9ba4c77`) — already tracked as the OPEN
-  "optional-unwrap" class-kill. This wave closed two MORE instances of it by hand (§D2 spawn `is_ptr_like`,
-  §C2 taint helper), reinforcing that the enforced-unwrap gate is the durable answer.
+- **`?T` optional-wrapper class-kill — BUILT 2026-08-01.** Was the OPEN "optional-unwrap" class-kill.
+  Closed as ONE gate for the whole wrapper family, not a `?T`-specific one: the wrapper set that hides
+  an inner kind is FINITE (`?T`, `distinct T`, array-of, by-value struct/union CARRYING a pointer) and
+  the 2026-08-01 sweep hit THREE of the four (C2/D2 optional, C7/D1 struct-carrier, C3/C4
+  slice+distinct) — an optional-only gate would have left the struct-carrier shape open.
+  - **Gate A (author-time)** `tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`:
+    freezes the 33 hand-rolled carrier disjunctions in checker.c/zercheck_ir.c and FAILS on a new one,
+    forcing either a carrier predicate (`type_carries_data_pointer` / `type_can_carry_pointer` /
+    `escape_type_carries_ref`) or a justified baseline row. Wired into `make check` (gate 6 of 6).
+    Verified to fire by injecting a violation.
+  - **Gate B (exhaustive)** `LD_OPTWRAP` axis in `tests/test_escape_matrix.c`: the escaping value is
+    bound through an optional carrier before reaching each sink. `-Wswitch` on the enum forces every
+    generator/name/validity site to handle it, so the grid cannot silently shrink. 35 -> 43 cells,
+    all reject, 0 false negatives.
+  - **NOT a blanket accessor** (the distinct playbook does not transfer): unwrapping `?T` is correct at
+    a safety sink but WRONG at the ~93 emitter sites that dispatch on TYPE_OPTIONAL to decide
+    `.has_value` / null-sentinel emission. Hence a linter that forces a per-site choice, not a rewrite.
+  - Residual: the 33 baselined rows are "known, untriaged" — Gate B answers whether each handles every
+    wrapper. Prefer converting a row to a predicate and DELETING it over leaving it frozen.
 - **`vrp_ir.c` is fully dead code** (`rvek5f` `00f3c2af`) — already noted here; rvek5f re-confirms `vrp_ir()`
   / `IRVRPResult` have ZERO callers and are not in the Makefile, while all load-bearing bounds/division VRP
   is the AST VRP in checker.c. Either wire it (the tracked "wire the orphaned vrp_ir.c" direction) or delete

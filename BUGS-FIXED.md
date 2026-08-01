@@ -72,6 +72,47 @@ interior-pointer UAF. Unrelated to §C.
 
 ---
 
+## 2026-08-01 — carrier-dispatch class-kill: one gate for the wrapper-hides-inner-kind family (tools/, tests/)
+
+Not a bug fix — the GATE that mechanically kills the bug family responsible for ~7 of the 26 fixes
+landed this day. Closes the long-standing OPEN "optional-unwrap" class-kill.
+
+**The shape it kills.** A safety sink asks a SEMANTIC question ("can this value carry a reference into
+my frame?") with a SYNTACTIC test (`k == TYPE_POINTER || k == TYPE_SLICE`). Every wrapper then slips
+it silently: a `?*T` is `TYPE_OPTIONAL`, matches no arm, and falls through every check. That is D2
+exactly; C2, C3, C4, C7, D1 and D3 are the same failure with a different wrapper.
+
+**Built for the whole family, not for `?T`.** The set of wrappers that hide an inner kind is FINITE —
+`?T`, `distinct T`, array-of, and a by-value struct/union CARRYING a pointer — and this sweep hit
+THREE of the four. An optional-only gate would have left the struct-carrier shape (C7/D1) wide open.
+
+- **Gate A (author-time)** — `tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`.
+  Freezes the 33 hand-rolled carrier disjunctions in `checker.c`/`zercheck_ir.c` (`file:content`,
+  line-number-agnostic, same design as the type-dispatch and fixed-buffer siblings) and FAILS the
+  build on a NEW one, forcing either a carrier PREDICATE (`type_carries_data_pointer` /
+  `type_can_carry_pointer` / `escape_type_carries_ref` — all already recurse
+  optional/array/struct/union) or a justified baseline row. Wired into `make check`, now **6** audit
+  gates. Proven to fire by injecting a violation and reverting.
+- **Gate B (exhaustive)** — the `LD_OPTWRAP` axis in `tests/test_escape_matrix.c`. The escaping value
+  is bound through an optional carrier (`?*u32` / `?[*]u32` over a stack array — the C2 shape) before
+  reaching each sink. `-Wswitch` on the enum forces every generator / name / validity site to handle
+  it, so the grid cannot silently shrink. **35 → 43 cells**, all reject, 0 false negatives. It passes
+  because C2/D2 were fixed earlier the same day — had it existed first, it would have found them.
+
+**Deliberately NOT a blanket accessor.** `type_dispatch_kind()` works for `distinct` because distinct
+never changes REPRESENTATION, so unwrapping is always right. `?T` DOES (`.has_value`), and ~93
+`emitter.c` sites legitimately dispatch on `TYPE_OPTIONAL` to choose an emission form. A blanket
+`type_optional_kind()` would have fixed the safety sinks and BROKEN emission — so `emitter.c` is
+excluded from Gate A and the linter forces a per-site choice instead of a rewrite. That asymmetry is
+why this needed a different mechanism, not a copy of the existing one.
+
+**Residual (recorded, not hidden).** The 33 baselined rows are "known, untriaged" — grandfathered, NOT
+blessed. Gate A stops the 34th; Gate B answers whether the existing 33 handle every wrapper. The
+baseline header says to prefer converting a row to a predicate and DELETING it over leaving it frozen,
+so the surface shrinks over time instead of ossifying.
+
+---
+
 ## 2026-08-01 — §D: nine spawn / scoped-borrow / shared-copy holes (checker.c, types.h)
 
 All nine verified reproducing on main first. **D3 is the notable one:** the checker emitted NO

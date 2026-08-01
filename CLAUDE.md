@@ -174,6 +174,15 @@ build/test.** This class is invisible to valgrind/ASan/UBSan (arena/stale data
 reads "defined"; wild writes hit mapped memory) and vanishes under any
 instrumentation — sanitizers will NOT find it; an `objdump` ABI check will.
 
+**The SYSTEMIC form (found 2026-08-01): the Makefile has ZERO header dependencies.**
+`grep -cE '^\S+\.o:.*\.h' Makefile` returns **0** — no object rule names a header, so editing a
+header does NOT rebuild the units that include it. Harmless for a declaration-only edit; changing a
+STRUCT LAYOUT silently produces a MIXED-ABI binary (the edited `.c` sees the new layout, every stale
+`.o` sees the old). Symptom is identical to the stale-`.o` trap above: `make zerc` reports 0 errors,
+then SEGFAULTS on a test that passed a minute ago, while a `-O0` build of the same sources runs fine.
+**RULE: after touching ANY `.h` — especially `types.h`/`ast.h` — run `rm -f *.o src/safety/*.o` before
+`make zerc`.** (Cost a debug cycle adding a field to `struct Symbol`.)
+
 **Layout-fragile Heisenbug debugging (when sanitizers come up empty).** If a
 bug only appears in one exact build and disappears under prints/ASan/`-O0`: (1)
 env-gate suspect functions (`if(getenv("NK"))return;`) so you toggle code paths
@@ -346,9 +355,16 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | VRP range JOIN (merge at a control-flow join) | NODE_IF (§C#13 ✅), switch-arm, for-body, while/do-while body, do-while first-iter, goto/label | mirror `vrp_snap_take/restore/join` per node-kind; a missing kind = silent OOB. NO auto-gate — checklist every control-flow kind |
 | Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
 | Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
-| `?T` optional wrapper hiding the inner kind | keep-reg, escape sinks, array→slice coercion | **NO gate yet — OPEN class-kill** (an "optional-unwrap" analog of `type_dispatch_kind`). Until then, manually unwrap `?T` at EVERY `->kind == TYPE_{SLICE,POINTER}` safety dispatch |
+| Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
+
+**Why the carrier class-kill is a LINTER, not a blanket accessor (2026-08-01).** `type_dispatch_kind()`
+works for `distinct` because distinct NEVER changes representation — unwrapping is always right. `?T`
+DOES change it (`.has_value`), and ~93 `emitter.c` sites legitimately dispatch on `TYPE_OPTIONAL` to
+pick an emission form. A blanket `type_optional_kind()` would fix the safety sinks and BREAK emission.
+So `emitter.c` is EXCLUDED from the gate and the linter forces a per-site choice instead of a rewrite.
+When two class-kills look alike, check whether the wrapper is representation-preserving first.
 
 **Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
 **`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →
@@ -2406,6 +2422,31 @@ When starting a new session or lacking context:
 5. **Use `make tags` + grep for code navigation** — generates ctags index (2,183 entries). Use `grep "function_name" tags` to find file+line+signature. NEVER read full source files speculatively. Read only the specific lines around grep results. This is 40x more efficient than brute-force reading.
 6. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
 7. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC. New IR path (v0.4): AST → Checker → IR (flat locals + basic blocks) → zercheck on IR → emit C from IR → GCC. Use `--emit-ir` to see IR output.
+
+### Consuming an audit branch — VERIFY THE REPRODUCTION FIRST (2026-08-01, cost several loops)
+
+Before implementing ANY fix harvested from a `claude/*` audit branch, run its reproducer against
+current main and confirm the bug is REAL and the test DISCRIMINATES. Three distinct traps, all hit
+in the 2026-08-01 sweep (26 fixes across §A–§D):
+
+1. **The branch's own test may not discriminate.** Four VRP reproducers (`8rv51h` if-capture +
+   orelse, `n0odo5` return-range, and the shipped trap variants) index a **heap slice**, whose
+   RUNTIME bounds check fires regardless of VRP — so they trap on a broken compiler AND a fixed one,
+   and PASSED on unfixed main. Rewrite against a **FIXED ARRAY**, where VRP elision is the actual
+   mechanism, and confirm the test FAILS on main before you fix anything. Same idea as the
+   "use values VRP cannot prove" rule in the AST→IR audit.
+2. **The bug may already be closed, or only half-live.** §C7 is described as "Ring.push/keep-call";
+   the keep-call half was ALREADY rejected on main — only Ring.push was live. Fixing the closed half
+   would have been pure churn.
+3. **The described root cause may point at the wrong layer.** §C7's real defect was NOT in
+   `container_push_arg_escapes` (which existed and was correctly gated) but upstream in
+   `arg_is_local_derived`, whose NODE_CALL recursion excluded pointer-carrying aggregates. Read the
+   code, not just the commit message.
+
+Also: a negative test that COMPILES is unambiguous (definitely a hole), but a negative test that
+REJECTS proves nothing until you check the REASON — several "rejections" on main were parse/type
+errors, or (§D3) a GCC codegen error masking a checker that emitted no diagnostic at all. Use
+`zerc f.zer -o out.c` to isolate the CHECKER verdict from the GCC one.
 
 ### Bug Hunting Workflow (principle-first, not brute-force)
 

@@ -519,9 +519,9 @@ a.kind;              // COMPILE ERROR — use after move
 ```
 
 **SAFETY**
-- Use after move → compile error (zercheck HS_TRANSFERRED)
+- Use after move → compile error
 - Double move (pass twice) → compile error
-- No interaction with other features — independent zercheck flag
+- No interaction with other features — tracked independently
 
 **SEE ALSO**
 struct, shared struct
@@ -1376,7 +1376,7 @@ u32 main() {
 **ERRORS**
 ```zer
 heap.free_ptr(t);
-t.id = 1;            // COMPILE ERROR — use-after-free (zercheck Level 9)
+t.id = 1;            // COMPILE ERROR — use-after-free
 
 heap.free_ptr(t);
 heap.free_ptr(t);     // COMPILE ERROR — double free
@@ -1384,16 +1384,16 @@ heap.free_ptr(t);     // COMPILE ERROR — double free
 // Cross-function:
 void destroy(*Task t) { heap.free_ptr(t); }
 destroy(t);
-t.id = 1;             // COMPILE ERROR — zercheck FuncSummary knows destroy frees param 0
+t.id = 1;             // COMPILE ERROR — the compiler knows destroy() frees its parameter
 ```
 
 **NOTES**
 - `alloc_ptr()` returns `?*T` (null sentinel). Use `orelse` to unwrap.
 - `free_ptr(*T)` finds the slot by pointer address and frees it. Argument type must match pool/slab element type — `*Motor` to `Task` pool is a compile error.
-- Interior pointers tracked: `*u32 p = &t.id; free_ptr(t); p[0]` → compile error. Field-derived pointers share alloc_id with parent allocation.
+- Interior pointers tracked: `*u32 p = &t.id; free_ptr(t); *p` → compile error. A pointer to a field shares the parent's allocation.
 - Can mix Handle and alloc_ptr on the same Slab/Pool.
 - `const Handle(Task)` prevents mutation through auto-deref — `h.id = 42` on const Handle is a compile error.
-- For `*opaque` (C interop), Level 2+3+5 runtime checks (~1ns) cover the remaining cases zercheck can't track.
+- For `*opaque` (C interop), runtime checks (~1ns) cover the remaining cases the compiler can't track.
 - GLOBALS: storing an `alloc_ptr` pointer in a global then
   freeing it requires resetting the global (`g = null;`) immediately after
   the free — before the function returns or calls another ZER function.
@@ -2686,6 +2686,11 @@ Counter g;
 g.value = 42;              // auto: lock → write → unlock
 g.total = g.value + 1;     // same lock scope (consecutive access grouped)
 ```
+- Copying a **whole shared struct by value** (`Counter c = g;`, an assignment, a
+  return, or a by-value argument) is a compile error — the embedded lock would be
+  cloned, so the copy would lock a different lock than the original, and the
+  multi-field read is torn. Read individual fields (`u32 v = g.value;`, each
+  auto-locked) or pass a pointer `*Counter`.
 - `switch` over a **union field of a shared struct** is safe: the union is copied
   out under the lock, so a value capture `.v => |x| { ... }` reads a private
   snapshot. A **mutable pointer capture `|*x|` of a shared union variant** is a
@@ -2708,12 +2713,31 @@ spawn handler(42, true);        // OK — value args copied
 
 // Scoped spawn (allows *T — thread joined before scope exit):
 ThreadHandle th = spawn compute(&local_data);
-th.join();                      // MUST join — zercheck error if not
+th.join();                      // MUST join — compile error if not
 ```
+
+**SCOPED-BORROW RULES** — a local lent to a scoped spawn via `&x` is exclusively
+borrowed by that thread until `.join()`:
+- Reading or writing `x` before the join → compile error (data race)
+- Passing `&x` to any call before the join → compile error (the callee could
+  write through it while the thread holds it). Passing `x` **by value** is fine.
+- Lending the same local to a **second** live scoped spawn → compile error. Join
+  the first thread, then spawn the second.
+- `&threadlocal` to a scoped spawn → compile error. Each thread has its own copy,
+  so the child would write the parent's slot. Pass it by value instead.
+- All `&` arguments are tracked, not just the first; `.join()` releases every one.
 
 **SAFETY CHECKS**
 - Non-shared `*T` to fire-and-forget spawn → compile error
+- Optional pointer/slice (`?*T`, `?[*]T`) to a stack local → compile error (same
+  rule as the bare pointer — the `?` wrapper does not exempt it)
+- A local **array** passed where the parameter is `[*]T` → compile error (it
+  coerces to a slice over stack memory)
+- A by-value **struct/union carrying a pointer into a local** → compile error,
+  including when the struct comes back from a call (`spawn w(mk(&loc))`)
 - Handle to spawn → compile error (pool.get not thread-safe)
+- A **function name** passed as a funcptr argument (`spawn worker(bump)`) is
+  scanned too — if the callback touches a non-shared global it is a data race
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)

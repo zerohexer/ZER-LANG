@@ -353,6 +353,109 @@ net. Tests: `tests/zer/erased_map_get_ok.zer` (positive), `tests/zer_fail/erased
 param-view return still over-rejects with the leak false-positive — kept deliberately (it catches
 the through-call interior-pointer UAF). universal_pointer.md §36.17 has the full ledger.
 
+## The 2026-08-01 branch-harvest sweep — 26 fixes, and WHY they existed (read before any safety work)
+
+Eleven `claude/gifted-noether-*` audit branches were harvested into main over one session:
+**§A (1) + §B (9) + §C (7) + §D (9) = 26 fixes**, each verified reproducing on main first, each with
+regression tests. The per-bug detail is in BUGS-FIXED.md 2026-08-01 and the harvest tracker at the top
+of `docs/limitations.md` (which also lists the 19 NOT yet taken: §E–§J). This section is the DURABLE
+part: the root-cause taxonomy and what it says about where the safety architecture actually leaks.
+
+### The taxonomy (all 26 classified)
+
+| Pattern | Count | Shape | Examples |
+|---|---|---|---|
+| Gate tests a type's **SPELLING**, not its PROPERTY | ~7 | asks "is it spelled `*T`?" when the question is "can it carry a reference into my frame?" | C3/C4 (`== TYPE_POINTER` excluded slice + distinct), C2/D2 (`?T` never unwrapped), D3 (`TYPE_ARRAY` uncased), C7 (`escape_type_carries_ref` excluded pointer-carrying struct) |
+| Same question answered at **N SITES** | ~5 | one sink fixed, siblings left | §A/G5 (3 store sinks, only bare-ident handled globals), C1, C6 (`&x` vs `&x.f`), D1 (spawn re-derived a weaker predicate), D5 (read + write checked, call-arg unowned) |
+| **Per-node-kind enumeration** incomplete | 6 | the list of places is just short | B1–B6: VRP-JOIN wired at IF/FOR/WHILE/SWITCH/LABEL, absent at defer / `@once` / orelse / if-capture / else-reset |
+| **Temporal / lifecycle** model wrong | ~5 | the state is right, the ORDER or the invariant isn't | B7 (the wipe fires in program order, AFTER the use), B9 (a return path the scan can't reach), D4/D6/D7 (borrow lifecycle: threadlocal skipped, not exclusive, first-only) |
+| **Scope decision** or proven-but-unwired | 2 | not really an implementation bug | D8 (whole-program funcptr reachability — architecturally BANNED), D9 (the concurrency closure IS proven in Iris; the compiler wiring was never started) |
+
+The first three patterns are ~18 of 26 and are all the SAME failure at different granularity: **a
+finite enumeration (of type kinds, of sinks, of node kinds) that nobody could prove complete.**
+
+### Why the proof stack did not catch ANY of these
+
+This is the load-bearing conclusion; do not re-derive it.
+
+**Zero of the 26 fixes touched `src/safety/`.** All 26 were in `checker.c` / `zercheck_ir.c` /
+`types.h` (verifiable: `git diff --name-only 31a355a3..213ee006 -- 'src/safety/*'` is empty). A
+COMPLETE VST proof of all 29 extracted predicates passes, unchanged, with every one of these bugs
+present.
+
+- **VST (Level 3) verifies a PURE FUNCTION**: "`zer_handle_state_valid` computes what its spec says,
+  for every input." None of these bugs are in a pure function. C6 is the clean example — no predicate
+  was wrong; the keep call-site matched `&ident` and not `&ident.field`, so the predicate was never
+  REACHED. VST has no vocabulary for "checker.c should call this at six places and calls it at five."
+- **The Level-1 oracles prove the transfer is sound over the states LISTED**, not that the listed
+  states COVER the semantics — the gap this file already states in "Verification endgame" §5. A
+  `?[*]T` carrying a stack slice is not a missing STATE in `param_lattice.v`; the lattice never
+  claimed to enumerate program syntax. So the oracle is sound, the C faithfully implements it, and the
+  form simply never arrives at the door.
+- **Partial exception — D6 (double-borrow)** is a missing PRECONDITION, not a missing form: the model
+  had the state (borrowed / not) but not the exclusivity invariant. That is exactly the
+  "OPERATIONAL PRECONDITIONS ARE FINITE VARIABLES" lesson from the Level-B post-mortem, recurring.
+
+**What WOULD catch them** is the forward simulation in the endgame plan (§1): case analysis on the
+concrete `step` rules means a concrete step storing a `?*T` into a global must exhibit a matching
+abstract transition — if the domain cannot represent it, the diagram does not close and the proof gets
+STUCK on exactly that configuration. That is precisely the machinery for converting patterns 1–3 from
+silent to loud. It is unbuilt (only the concurrency subset has an operational instance), and it still
+would not cover D8 (scope) or D9 (proven, unwired).
+
+**The empirical conclusion.** The gates that already exist WORK and are cheap:
+`audit_type_dispatch.sh` fired on this very session (7 new raw `->kind ==` reads in §D, blocked the
+build until justified), `-Werror=switch`, `sink_matrix.sh`. The `?T`/carrier class had NO gate, and
+that class alone accounted for ~7 of the 26. Building the gate took a fraction of the proof effort and
+mechanically kills the whole family. **Prefer a gate over a proof for coverage questions; use the
+proof stack for transfer-soundness questions.** They answer different halves.
+
+### Gate A / Gate B — the carrier-dispatch class-kill (commit `f8374bc1`)
+
+Built as ONE gate for the whole wrapper family, not a `?T`-specific one: the set of wrappers that hide
+an inner kind is FINITE (`?T`, `distinct T`, array-of, by-value struct/union carrying a pointer) and
+this sweep hit THREE of the four. An optional-only gate would have left the struct-carrier shape (C7,
+D1) wide open.
+
+- **Gate A (author-time)** — `tools/audit_carrier_dispatch.sh` + `tools/carrier_dispatch_baseline.txt`.
+  Freezes the 33 hand-rolled carrier disjunctions in `checker.c`/`zercheck_ir.c` (`file:content`,
+  line-number-agnostic — same design as its two siblings) and FAILS on a NEW one. Wired into
+  `make check`, which now runs **6** audit gates. Proven to fire by injecting a violation.
+- **Gate B (exhaustive)** — the `LD_OPTWRAP` axis in `tests/test_escape_matrix.c`: the escaping value
+  is bound through an optional carrier before reaching each sink. `-Wswitch` on the enum forces every
+  generator/name/validity site to handle it, so the grid cannot silently shrink. **35 → 43 cells**, all
+  reject. It passes only because C2/D2 were fixed first — had it existed earlier it would have found
+  them.
+
+**Why a LINTER and not a blanket accessor (the design call).** `type_dispatch_kind()` works for
+`distinct` because distinct never changes REPRESENTATION. `?T` does (`.has_value`), and ~93
+`emitter.c` sites legitimately dispatch on `TYPE_OPTIONAL` to choose an emission form. A blanket
+`type_optional_kind()` would have fixed the safety sinks and BROKEN emission. So `emitter.c` is
+EXCLUDED from Gate A, and the linter forces a per-site choice rather than a mass rewrite. **Before
+copying an existing class-kill, check whether the wrapper is representation-preserving.**
+
+**Residual, recorded not hidden.** The 33 baselined rows are "known, untriaged" — grandfathered, NOT
+blessed. Gate A stops the 34th; Gate B is what tells you whether the existing 33 handle every wrapper.
+The baseline header says to prefer converting a row to a predicate and DELETING it over leaving it
+frozen, so the surface shrinks over time instead of ossifying.
+
+### Methodology that paid for itself (reuse it)
+
+1. **Verify the reproduction before writing code.** Of the items examined, several were already
+   closed, half-live, or described with the wrong root cause (see CLAUDE.md "Consuming an audit
+   branch"). A negative test that COMPILES is unambiguous; one that REJECTS proves nothing until you
+   check the reason — use `zerc f.zer -o out.c` to isolate the CHECKER verdict from GCC's.
+2. **Distrust a branch's test before distrusting the compiler.** Four VRP reproducers used a heap
+   slice (runtime-checked regardless of VRP) and passed on unfixed main.
+3. **Prefer the synthesis to any single branch.** §A took `38z6wi`'s 3-sink structure ⊕ `02nq43`'s
+   launder-aware RHS; the combination catches a laundered RHS INTO a projection, which NEITHER branch
+   catches alone.
+4. **Land the family, then the docs, in the SAME commit.** Three of the first four fix commits updated
+   only BUGS-FIXED.md and left the tracker showing the work as open — the stale-gate failure this
+   file warns about elsewhere. Fixed retroactively; do not repeat.
+
+---
+
 ## ZER Safety Architecture — Read Before Any Safety Work
 
 **Mandatory reading before modifying ANY safety-relevant code** (checker.c

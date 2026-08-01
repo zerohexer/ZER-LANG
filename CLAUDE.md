@@ -366,6 +366,19 @@ pick an emission form. A blanket `type_optional_kind()` would fix the safety sin
 So `emitter.c` is EXCLUDED from the gate and the linter forces a per-site choice instead of a rewrite.
 When two class-kills look alike, check whether the wrapper is representation-preserving first.
 
+**A matrix can assert a RUNTIME VALUE, not just accept/reject — use that when the defect class is a
+silent MISCOMPILE.** Eight of the nine grids check a diagnostic; `tests/test_defer_goto_matrix.c`
+(2026-08-02) instead compiles, RUNS, and checks an acquire/release BALANCE, because the class it
+guards (a `defer` firing on a path whose registration never executed) produces no diagnostic at all —
+just an unbalanced lock/close/free. Two rules that made it work: pick a measurement that is INVARIANT
+across the axes (balance is identical for every defer position, so the expected value is trivially
+derivable rather than hand-tabulated per cell), and give each failure mode its own exit code so the
+report names the defect ("an UNARMED defer fired") instead of "wrong value". **Verify a new grid
+CATCHES its bug** by running it against a pre-fix build — a grid that has only ever passed is a
+script, not a net. GOTCHA: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE SOURCE, not at the
+`-o` path (CLAUDE.md "zerc -o gotchas") — getting this wrong yields exit 127 on every cell and looks
+like a compiler failure.
+
 **Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
 **`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →
 **an audit-script baseline** (`file:content`, line-number-agnostic — `sink_matrix.sh` /
@@ -1514,6 +1527,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 | `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
+| `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/hw/async/asm/**defer-goto**) | 9 grids | `make check` |
 | `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.

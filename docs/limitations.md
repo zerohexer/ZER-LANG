@@ -388,13 +388,32 @@ here the goto path registered nothing — there is nothing to fire eagerly and n
 skip (the same `gi < di < li` analysis the reject already performs), so the common case keeps its
 current zero-overhead unconditional fire.
 
-**Why it was NOT done in this pass.** The blast radius is the defer emission core — `defer_count` /
-`defer_fire_bodies` snapshots / `active_guard_below` / `restore_count` — which its own comment
-history records needing repeated fixes (see the 2026-06-29 entries in `ir_lower.c`). The new flag
-also has the OPPOSITE polarity to `defer_fire_guard_flag` and both can land on the same fire. The
-regression net is thin: only 17 positive tests combine goto and defer. Given a rare shape with a
-one-line workaround, the sound reject was the better trade for this pass. Do this behind a real
-goto x defer matrix, not ad hoc.
+**Why it was NOT done in the same pass.** The blast radius is the defer emission core —
+`defer_count` / `defer_fire_bodies` snapshots / `active_guard_below` / `restore_count` — which its
+own comment history records needing repeated fixes (see the 2026-06-29 entries in `ir_lower.c`).
+Nothing has to be UNDONE: the two flags compose (`if (armed && !already_fired)`), and the earlier
+fixes stay. The risk is COLLATERAL — the new flag reads and writes the same bookkeeping those fixes
+govern, and getting the interaction wrong yields a silently dropped cleanup or a double fire on one
+path, not a compile error. At the time the regression net was 17 tests.
+
+**PRECONDITION NOW SATISFIED — `tests/test_defer_goto_matrix.c` (2026-08-02).** The condition
+recorded here was "do this behind a real goto x defer matrix, not ad hoc". That matrix now exists and
+runs in `make check`: DeferPos {none, before-goto, between, after-label} x GotoKind {none, taken,
+not-taken} x Nest {flat, in-if, in-loop, in-switch} = **34 valid cells**.
+
+Unlike every other matrix in the repo it asserts a RUNTIME VALUE — acquire/release BALANCE — because
+this defect class is a silent miscompile, not a missing diagnostic. Exit 200 is the miscompile
+signature ("an unarmed defer fired").
+
+**It is verified to CATCH the bug, not merely to pass.** Run against a pre-§F compiler (`06c0ed9d`)
+with the reject-expectation disabled, all four `defer-between/goto-taken/*` cells report
+`MISCOMPILE — an UNARMED defer fired` across every nesting, while the `goto-not-taken` variants
+correctly pass: 30/34, 4 miscompiles, 0 false positives.
+
+**So this matrix IS the acceptance test for the durable fix.** The cells the interim reject refuses
+are marked by `cell_currently_rejected()`, and each already records the semantically-correct balance.
+When the armed flag lands: delete that one function, and all 34 cells must assert values and pass.
+Nothing else about the grid changes.
 
 
 - **F1 — defer double-free discriminated by SOURCE-LINE equality** (`7fxhb3` `31796ef8`, CRITICAL). The check

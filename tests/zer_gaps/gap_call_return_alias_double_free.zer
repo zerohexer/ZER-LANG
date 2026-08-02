@@ -1,0 +1,15 @@
+// GAP (2026-08-02): call-return alias defeats free/UAF tracking.
+// idents() returns its slice param, so b2 aliases buf, but the call result is
+// registered as a fresh unlinked handle (alloc_id not tied to buf). The second
+// free is a real double free (glibc abort 134) but compiles CLEAN.
+// The safety hole inside the BUG-764 return-a-view-of-a-param relaxation.
+// Move to tests/zer_fail/ when the call-result handle is linked to the arg
+// allocation per ret_param_mask. See docs/limitations.md "call-return alias".
+[*]u8 idents([*]u8 s) { return s; }
+u32 main() {
+    [*]u8 buf = alloc(u8, 16) orelse { return 0; };
+    [*]u8 b2 = idents(buf);
+    free(buf);
+    free(b2);
+    return 0;
+}

@@ -5,6 +5,71 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — CRITICAL ACCEPT-UNSAFE: call-return alias defeats free/UAF tracking (2026-08-02 audit)
+Pure ZER, compiles clean, runtime glibc double-free abort (134). When a function RETURNS (a view of) its
+pointer/slice argument, the call result is registered as a FRESH handle whose `alloc_id` is NOT linked to
+the argument's allocation, so a double-free / UAF reached through the returned alias is silently accepted.
+```zer
+[*]u8 idents([*]u8 s) { return s; }
+u32 main() {
+    [*]u8 buf = alloc(u8, 16) orelse { return 0; };
+    [*]u8 b2 = idents(buf);      // b2 IS buf, but tracked as an unlinked handle
+    free(buf);
+    free(b2);                    // double free — ACCEPTED (checker exit 0), abort 134
+}
+```
+Confirmed surface forms (all checker exit 0): direct return-of-param double free; `pick(c,a,b)` returning
+one of two params then freeing both; UAF read via the alias after free; sub-slice laundered through the
+call (`sub = idents(buf[0..8])`); the view wrapped in a BY-VALUE struct return
+(`Sl mk([*]u8 p){ Sl r; r.s=p; return r; } … free(buf); free(w.s);`). Direct aliases (`b2 = buf`),
+struct-field aliases, and `@ptrcast` round-trips ARE correctly linked and caught — only the CALL-RETURN
+path is missed.
+**Root.** The call-result provenance machinery (`ret_param_mask` / `call_result_static_given_args`, used by
+`call_result_escapes`) KNOWS the callee returns a view of param N — that is how the BUG-764 escape gate
+works — but the handle-aliasing / `alloc_id`-linking in `zercheck_ir.c` is NOT wired to that return summary.
+The call-result assignment creates an independent handle instead of linking it to the arg's `alloc_id` for
+the return positions named in the mask. Classic per-sink patchwork: the return-summary fact reaches the
+ESCAPE sink but not the FREE/UAF sink. **This is the safety hole INSIDE the BUG-764 relaxation** — its
+stated safety "rests on the escape-sink coverage," but the escape sink only checks whether the result
+escapes a LOCAL; it never links the returned alias to the arg allocation. So every
+`[*]T f([*]T s){ return s[...]; }` / `*T first([*]T s){ return &s[0]; }` helper (e.g. `lib/str.zer`'s
+`bytes_trim*`) is a laundering channel for free/UAF tracking.
+**Fix sketch.** At the call-result assignment, when the callee's `ret_param_mask` names param(s) as the
+return source, link the new handle's `alloc_id` to the ARG(s) passed for those params (make them an alias
+group) instead of allocating a fresh id. Safe direction (tightening — over-linking only over-rejects). It
+ALSO closes a paired LEAK FALSE-POSITIVE: the pointer-returning form (`*Node q = ident(p); free(p);
+return q.val;`) currently rejects with a false "`q` allocated but never freed" — same missing link,
+surfacing as over-rejection. Reproducers in `/tmp` during the audit; re-create from the snippets above.
+Interacts with `call_result_escapes` / the return-summary subsystem — a focused (not single-drive-by)
+session; the alias-linking must survive CFG merges.
+
+## OPEN — MEDIUM silent miscompile: uN/iN 128-bit-carrier literals ≥ 2^63 sign-extend (2026-08-02 audit)
+A large integer literal (≥ 2^63) assigned to a `uN`/`iN` whose carrier is `__int128` (widths 65–128) is
+carried as a SIGNED 64-bit value and, on the IR / expression emission path (function bodies), emitted as a
+negative decimal cast to the 128-bit carrier — which SIGN-EXTENDS 1-bits into the extra high 64 bits.
+Compiles clean, wrong value, no crash (baremetal-silent).
+```zer
+u64 main() {
+    u128 x = 18446744073709551615;   // 2^64 - 1
+    u128 hi128 = x >> 64;
+    u64 hi = (u64)hi128;             // want 0 (no bits above bit 63); GET 0xFFFFFFFFFFFFFFFF
+    if (hi != 0) { return 1; }        // returns 1 — miscompile
+    return 0;
+}
+```
+Emitted: `_zer_t0 = (unsigned __int128)-1;` (should be `(unsigned __int128)18446744073709551615ULL`). The
+GLOBAL-initializer path is CORRECT (emits raw digits); the local / return / call-arg / any-expression path
+is wrong. Threshold is exactly signed-64 max: literals ≥ 2^63 miscompile, ≤ 2^63−1 are fine; affects
+decimal AND hex; `i128` is worse (sign flips). `u64` and all ≤64-bit carriers are safe (two's-complement
+wrap coincides with the width). **Root.** The IR path materializes the literal's `int_lit.value` (int64_t)
+into an `IR_CAST` to the carrier and emits the operand SIGNED, bypassing the `%lluULL` NODE_INT_LIT path
+(emitter.c ~6316) that the AST/global path uses. **Caveat:** a full fix also needs the lexer to represent
+literals in [2^64, 2^128) at all (currently 64-bit) — values ≥ 2^64 into a `u128` are unrepresentable
+regardless. Narrow fix (the [2^63, 2^64) sign-extension) is emitter-local: emit the carrier-cast operand as
+unsigned. Niche feature; documented rather than fixed to avoid perturbing common literal emission.
+
+---
+
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
 
 **STATUS: all 45 landed.** §A 1/1 · §B 9/9 · §C 7/7 · §D 9/9 · §E 1/1 · §F 4/4 · §G 6/7 (+ G5 with

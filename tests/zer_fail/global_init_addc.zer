@@ -1,3 +1,4 @@
+// expect-error: initializer cannot use
 // EXPECTED: compile error
 // Regression (2026-07-28): @addc/@subb/@mulw in a global initializer emitted a
 // runtime _zer_do_*() call ("initializer element is not constant"). Now

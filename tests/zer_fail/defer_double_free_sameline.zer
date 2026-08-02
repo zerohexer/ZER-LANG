@@ -1,3 +1,4 @@
+// expect-error: double free
 // EXPECTED: compile error
 // Regression (2026-07-28): a deferred free on the SAME source line as the
 // explicit free evaded the double-free check, which used source-LINE equality

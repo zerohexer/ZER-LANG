@@ -4482,6 +4482,80 @@ tests/zer/borrow_join_both_arms.zer must COMPILE — pins against over-correctio
 The third is not optional: without it the sticky-flag "fix" would ship and nothing
 would catch the over-rejection.
 
+### RE-VERIFIED 2026-08-03 (HEAD `30a79744`, clean rebuild) — STILL OPEN, and the reproduction above is now MASKED
+
+Re-ran the recorded shapes against a clean rebuild of current main. **The hole is still
+live, and the recorded reproduction no longer exhibits it** — anyone re-running the old
+repro will wrongly conclude this entry is fixed.
+
+MEASURED per shape on `30a79744` (a first pass said "all three rejected for the wrong
+reason"; that was too strong — one is now rejected CORRECTLY, which is a real gain from
+the 2026-08-02/03 scoped-borrow work and should not be undone):
+
+| Shape | Result |
+|---|---|
+| write in a branch, condition references an UNRELATED variable | REJECTED by the **borrow** rule — correct, and newly so |
+| conditional join, no early return | REJECTED by the **ThreadHandle leak** rule — masked |
+| conditional join **+ early return** | **ACCEPTED — this is the live hole** |
+
+What actually happens now: a *conditionally* joined ThreadHandle trips the
+join-on-all-paths LEAK check —
+
+```
+zercheck: ThreadHandle 'th' not joined before function exit — add th.join() or detach explicitly
+```
+
+— which fires *before* the borrow check is ever consulted. So the leak rule masks the
+race rule. This is a SECOND instance of this entry's own test-design gotcha (the first
+was: a branch condition that mentions the borrowed variable trips the read check first).
+**The lesson generalizes: on this checker, a negative test proves nothing until you read
+the actual diagnostic — several rules can reject the same program, and only one of them
+is the one under test.**
+
+**CORRECTED reproduction — satisfies the join discipline and still races:**
+
+```zer
+struct Work { u32 x; }
+u32 flag_in = 0;
+u32 worker(*Work w) { w.x = 1; return 0; }
+u32 main() {
+    Work work;
+    ThreadHandle th = spawn worker(&work);
+    if (flag_in == 99) { th.join(); return 0; }   // path A: joined, then exits
+    work.x = 2;          // path B: thread STILL RUNNING -> REAL DATA RACE
+    th.join();
+    return 0;
+}
+```
+
+`ACCEPTED` — compiles clean. The race is visible in the emitted C:
+
+```c
+462:    pthread_join(th, NULL);      /* path A, inside the if */
+466:    _zer_t4 = work.x = 2;        /* path B, thread still running */
+467:    pthread_join(th, NULL);
+```
+
+The early `return` is what makes it legal to the leak rule (path A is joined and exits;
+path B joins at the end) while leaving the borrow live across the merge on path B.
+
+**Controls that still behave correctly** (so the fix must preserve both):
+- same-block write while borrowed -> REJECTED with the right message
+  (`cannot write to 'work' while it is borrowed by a scoped spawn`)
+- join on every path *before* the access -> ACCEPTED
+
+**Revised tripwire set** (supersedes the three above — the first two would now pass for
+the wrong reason and must be rewritten to this shape):
+
+```
+tests/zer_fail/borrow_join_one_arm_return.zer   must FAIL — currently ACCEPTED
+tests/zer/borrow_join_all_paths.zer             must COMPILE — pins against over-correction
+tests/zer_fail/borrow_same_block.zer            must FAIL — pins the rule still fires at all
+```
+
+The third is new and matters: it is the only one that would catch the borrow check being
+disabled outright while the leak check silently absorbs the negative tests.
+
 **Consequence for the soundness theorem:** this class currently fails OPEN at a CFG
 join. An analysis that fails open cannot discharge a forward-simulation obligation —
 the abstract state does not over-approximate the concrete one — so `checker_sound` is

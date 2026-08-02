@@ -1,3 +1,4 @@
+// expect-error: function-pointer field
 // EXPECTED: compile error
 // FIXED 2026-08-03 — sibling of spawn_funcptr_field_race.zer with the binding in
 // a DIFFERENT function (`install`). This is the variant that ruled out the cheap

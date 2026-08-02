@@ -1,3 +1,4 @@
+// expect-error: const pointer
 // EXPECTED: compile error
 // AUDIT 2026-07-24 (docs/limitations.md, was zer_gaps): writing through a
 // const-qualified distinct-typedef pointer silently mutated read-only data.

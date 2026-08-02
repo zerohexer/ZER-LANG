@@ -1,3 +1,4 @@
+// expect-error: use after free
 // EXPECTED: compile error
 // Fixed 2026-08-02: idents() returns its slice param, so b2 ALIASES buf. The
 // call result was registered as a fresh handle whose alloc_id was not tied to

@@ -1,3 +1,4 @@
+// expect-error: use after free
 // EXPECTED: compile error
 // Chain propagation: destroy2 calls destroy which frees a FIELD of the shared
 // pointer param; the outermost caller then frees the same field → double free.

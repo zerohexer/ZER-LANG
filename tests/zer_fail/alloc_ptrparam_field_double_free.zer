@@ -1,3 +1,4 @@
+// expect-error: use after free
 // EXPECTED: compile error
 // rdh99l sibling: a callee frees a FIELD of a *Struct POINTER param; the
 // caller then frees the same field → cross-function double free.

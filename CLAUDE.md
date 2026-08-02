@@ -1542,6 +1542,28 @@ All runners auto-detect positive vs negative tests. `make check` runs everything
 - `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
 - `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
 
+### A NEGATIVE TEST PROVES NOTHING UNTIL YOU READ THE DIAGNOSTIC — use `// expect-error:`
+
+`tests/zer_fail/` passes a test on ANY non-zero exit. Until 2026-08-03 the diagnostic went
+to `/dev/null`, so **an entire safety rule could be deleted and its negatives would keep
+passing**, as long as some OTHER rule happened to reject the same file. That is a
+silent-green generator sitting under ~476 negative tests — the same shape as a false-green
+checker hole, one level up in the harness.
+
+It was measured twice on ONE entry (cross-block scoped borrow): first a branch condition
+mentioning the borrowed variable tripped the READ check, then a conditionally-joined
+ThreadHandle tripped the LEAK check — both masking the borrow rule under test.
+
+**Put `// expect-error: <substring>` in the first 5 lines of a negative test.** The runner
+asserts the compiler's stderr contains it and reports the ACTUAL diagnostic on mismatch.
+The directive is OPTIONAL (a file without one keeps exit-code-only behaviour), so backfill
+highest-value-first. Assert the reason the rule is SUPPOSED to give, never paste whatever
+it currently prints — otherwise you freeze a wrong reason into the suite.
+
+Corollary for any hand-run probe: `zerc f.zer -o /dev/null` returning non-zero does NOT
+mean your rule fired. Read the message, or you will "confirm" a fix that is another rule
+masking the hole.
+
 ### Test-authoring constraints that are NOT obvious (cost real loops 2026-08-02)
 
 A `tests/zer/` positive must compile AND run AND exit 0 on a HOSTED x86-64 host. Three shapes cannot

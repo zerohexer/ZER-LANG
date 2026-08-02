@@ -1,3 +1,4 @@
+// expect-error: use after free
 // EXPECTED: compile error
 // Freeing a slice FIELD of a by-value struct param, then UAF at the caller.
 struct B { u32 x; }

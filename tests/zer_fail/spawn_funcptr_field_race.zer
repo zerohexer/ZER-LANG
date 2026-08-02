@@ -1,3 +1,4 @@
+// expect-error: function-pointer field
 // EXPECTED: compile error
 // FIXED 2026-08-03 (was tests/zer_gaps/): the spawn race scan could not see
 // through a funcptr STRUCT FIELD. `worker` touches no global directly — only

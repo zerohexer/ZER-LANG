@@ -1,3 +1,4 @@
+// expect-error: use after free
 // EXPECTED: compile error
 // A function that frees the same FIELD of its param twice → intra-function
 // double free. The free handler did not register a compound handle for an

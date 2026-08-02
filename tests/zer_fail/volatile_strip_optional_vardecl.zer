@@ -1,3 +1,4 @@
+// expect-error: volatile
 // EXPECTED: compile error
 // audit 2026-07-23: asymmetric ?*T = <volatile *T> stripped volatile silently
 // (lockstep optional-peel required BOTH sides optional). MMIO read becomes hoistable.

@@ -1,3 +1,4 @@
+// expect-error: double free
 // EXPECTED: compile error
 // Two defers freeing the same handle on one source line = double free at exit.
 struct N { u32 v; }

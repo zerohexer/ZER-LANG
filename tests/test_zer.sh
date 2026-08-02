@@ -102,15 +102,37 @@ for f in tests/zer_fail/*.zer; do
     # --probe-mode=disabled rejecting @probe usage).
     file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     # Compile only (not --run), expect failure
-    $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>/dev/null
+    # 2026-08-03: capture the diagnostic instead of discarding it, so a test can
+    # assert WHY it was rejected. Before this, a negative passed on ANY non-zero
+    # exit — so an entire safety rule could be deleted and its negatives would
+    # keep passing, as long as some OTHER rule happened to reject the same file.
+    # That is a silent-green generator under every negative test. Measured twice
+    # on the cross-block scoped-borrow entry: first a branch condition tripped
+    # the read check, then the ThreadHandle leak check fired before the borrow
+    # check was ever consulted.
+    #
+    # `// expect-error: <substring>` in the first 5 lines makes the reason an
+    # ASSERTION. The directive is OPTIONAL — a file without one keeps the old
+    # exit-code-only behaviour, so nothing breaks and it can be backfilled
+    # highest-value-first.
+    want=$(head -5 "$f" | grep -oE '// expect-error: .*$' | sed 's|// expect-error: ||')
+    $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>/tmp/_zer_neg_err.txt
     ret=$?
     if [ $ret -ne 0 ]; then
-        PASS=$((PASS + 1))
-        echo "  PASS: $name (correctly rejected)"
+        if [ -n "$want" ] && ! grep -qF "$want" /tmp/_zer_neg_err.txt; then
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $name (rejected, but for the WRONG REASON)"
+            echo "        expected to contain: $want"
+            echo "        actual: $(head -1 /tmp/_zer_neg_err.txt | cut -c1-100)"
+        else
+            PASS=$((PASS + 1))
+            echo "  PASS: $name (correctly rejected)"
+        fi
     else
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (should have been rejected but compiled!)"
     fi
+    rm -f /tmp/_zer_neg_err.txt 2>/dev/null
     rm -f "${f%.zer}.c" 2>/dev/null
 done
 

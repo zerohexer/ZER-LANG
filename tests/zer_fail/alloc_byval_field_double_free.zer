@@ -1,3 +1,4 @@
+// expect-error: use after free
 // EXPECTED: compile error
 // rdh99l original: a callee frees a FIELD of a BY-VALUE struct param; the
 // caller then frees the same field → cross-function double free (glibc abort).

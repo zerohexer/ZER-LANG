@@ -1,3 +1,4 @@
+// expect-error: no compile-time MMIO bound
 // EXPECTED: compile error — indexing a volatile single pointer that has NO
 // compile-time mmio bound (here a PARAM) shipped an unguarded wild MMIO access
 // (reg[i], read AND write) — silent corruption on bare-metal. The `!is_volatile`

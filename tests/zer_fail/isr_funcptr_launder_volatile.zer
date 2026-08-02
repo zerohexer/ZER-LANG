@@ -1,3 +1,4 @@
+// expect-error: interrupt
 // EXPECTED: compile error
 // audit 2026-07-23: an ISR reaching a shared ISR/main global through a LOCAL
 // funcptr binding (*() fp = bump; fp();) bypassed the "must be volatile" /

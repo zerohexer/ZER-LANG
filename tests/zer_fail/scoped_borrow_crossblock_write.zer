@@ -1,0 +1,15 @@
+// expect-error: borrowed by a scoped spawn
+// Cross-block write to a scoped-borrowed local, with the branch condition
+// referencing an UNRELATED variable (a condition mentioning the borrowed var
+// trips the read check first and masks this). Newly caught by the 2026-08-02/03
+// scoped-borrow work — pinned so it cannot silently regress.
+struct W { u32 x; }
+void worker(*W w) { w.x += 1; }
+u32 run(u32 f) {
+    W work; work.x = 0;
+    ThreadHandle th = spawn worker(&work);
+    if (f == 1) { work.x = 2; }
+    th.join();
+    return work.x;
+}
+u32 main() { return run(1); }

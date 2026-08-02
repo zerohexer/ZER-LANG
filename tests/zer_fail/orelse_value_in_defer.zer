@@ -1,3 +1,4 @@
+// expect-error: orelse
 // EXPECTED: compile error
 // orelse with a value/block fallback inside a defer body is banned:
 // defer bodies are raw-AST emitted and cannot express orelse's branch

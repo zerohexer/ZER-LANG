@@ -1,3 +1,4 @@
+// expect-error: borrowed by a scoped spawn
 // EXPECTED: compile error
 // Audit 2026-08-01: a scoped spawn lent an INTERIOR pointer `&b.v` established no
 // exclusive borrow (the matcher required a bare NODE_IDENT operand), so a parent

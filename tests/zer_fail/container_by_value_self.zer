@@ -1,3 +1,4 @@
+// expect-error: contain itself by value
 // EXPECTED: compile error
 // The by-value self-containment guard must survive the tie-the-knot cache fix:
 // a container containing itself BY VALUE is an infinite-size struct and must be

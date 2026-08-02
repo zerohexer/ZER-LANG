@@ -1,3 +1,4 @@
+// expect-error: initializer cannot use
 // EXPECTED: compile error
 // Regression (2026-07-28): @saturate in a global initializer emitted a ({...})
 // statement-expression, illegal at file scope -> GCC failure. Now rejected

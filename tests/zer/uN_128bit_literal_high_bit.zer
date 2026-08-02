@@ -1,0 +1,21 @@
+// Silent miscompile fixed 2026-08-02: a uN literal >= 2^63 with a 128-BIT
+// CARRIER was emitted as a signed decimal (0x8000000000000000 ->
+// -9223372036854775808) and the cast to `unsigned __int128` SIGN-EXTENDED it,
+// setting all the high bits. For a <= 64-bit target the cast wraps and is
+// harmless, which is why only the 128-bit carrier showed it. The GLOBAL-INIT
+// path already emitted `...ULL` and was correct, so the two paths disagreed on
+// the same literal — this test pins them to agree.
+u100 g = 0x8000000000000000;
+u32 main() {
+    u100 a = 0x8000000000000000;      // local / IR path
+    u100 b = a >> 60;
+    if ((u32)b != 8) { return 1; }
+    u100 c = g >> 60;                  // global-init path
+    if ((u32)c != 8) { return 2; }
+    // signedness must still be type-matched (BUG-592): a signed local stays signed
+    i64 s = -1;
+    if (s != -1) { return 3; }
+    u64 u = 0xFFFFFFFFFFFFFFFF;
+    if (u != 18446744073709551615) { return 4; }
+    return 0;
+}

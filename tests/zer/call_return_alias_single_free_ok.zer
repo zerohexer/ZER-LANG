@@ -1,0 +1,29 @@
+// Over-rejection guard for the call-return alias linking (2026-08-02): linking
+// the call result to the arg's allocation must NOT reject a correct program.
+// Both directions are legal — free through the ORIGINAL after using the alias,
+// and free through the ALIAS itself (the paired leak false-positive the linking
+// also closes).
+[*]u8 idents([*]u8 s) { return s; }
+u32 via_original() {
+    [*]u8 buf = alloc(u8, 16) orelse { return 1; };
+    [*]u8 b2 = idents(buf);
+    b2[0] = 7;
+    u32 v = buf[0];
+    free(buf);
+    if (v != 7) { return 2; }
+    return 0;
+}
+u32 via_alias() {
+    [*]u8 buf = alloc(u8, 16) orelse { return 1; };
+    [*]u8 b2 = idents(buf);
+    b2[0] = 9;
+    u32 v = b2[0];
+    free(b2);
+    if (v != 9) { return 2; }
+    return 0;
+}
+u32 main() {
+    if (via_original() != 0) { return 1; }
+    if (via_alias() != 0) { return 2; }
+    return 0;
+}

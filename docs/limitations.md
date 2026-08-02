@@ -372,48 +372,40 @@ statements at `gi < di`. Swept all 17 existing positives combining goto+defer: 0
 banning VALID patterns. This shape currently MISCOMPILES — a silent lock underflow — so a compile
 error naming the workaround is strictly better than the status quo, not a feature removal.
 
-## OPEN — call-return alias defeats free/UAF tracking (CRITICAL — accept-unsafe)
+## OPEN — spawn race scan blind to a funcptr STRUCT-FIELD call (MEDIUM)
 
-**Symptom.** A function returning a VIEW of its pointer/slice param yields a call result whose
-`alloc_id` is not linked to the argument's allocation, so a double free or UAF through that alias is
-ACCEPTED. Confirmed by compiling, and by runtime abort 134. A paired LEAK false-positive comes from
-the same missing link.
+**Symptom.** The spawn non-shared-global scan cannot see through a funcptr STRUCT FIELD, so a race
+reachable only via that indirection is missed.
 
-**Why this one matters beyond its own severity.** It is a safety hole INSIDE the BUG-764
-"returning a view of a param is allowed" relaxation, which several 2026-08-01/02 fixes lean on
-(§C1's `val_is_param` exclusion, §C4's scoping, the whole param-view story). Closing it is also a
-soundness patch to the foundation those rest on.
+**The shape is NARROWER than first recorded (isolated 2026-08-02).** Two nearby shapes ARE already
+caught, and isolating this one required avoiding both:
 
-**Fix sketch.** Link the call result's `alloc_id` to the argument allocation when the callee's return
-summary says the result may be a view of param n — the `ret_param_mask` / `call_result_static_given_args`
-machinery already computes exactly that fact for the ESCAPE question; this is the same query asked for
-the ALIAS question.
+| Variant | Result |
+|---|---|
+| struct passed by POINTER to spawn | caught — the non-shared-pointer rule |
+| worker reads the Ops struct from a GLOBAL | caught — the global-access scan |
+| worker calls a DIRECT function that races | caught — the existing body scan |
+| **struct passed BY VALUE, worker touches no global directly** | **MISSED — this gap** |
 
-**Tripwire.** `tests/zer_gaps/gap_call_return_alias_double_free.zer` (compile-clean today = the gap;
-move to `tests/zer_fail/` when fixed).
+So it fires only when the callback struct passes by value AND the spawn target touches no
+non-shared global on its own. Reproducers: `tests/zer_gaps/gap_spawn_funcptr_struct_field.zer`
+(binding in the same function) and `..._crossfn.zer` (binding in `install()`).
 
----
+**Why it is not simply "fix the scan", and why NO PARTIAL fix was taken.** Following the binding in
+general requires whole-program reachability, BANNED from the architecture (CLAUDE.md
+"Whole-program analysis — BANNED"). Same boundary as §D8 (2026-08-01), which took the conservative
+descent only at the spawn site.
 
-## OPEN — uN/iN 128-bit-carrier literals >= 2^63 sign-extend (MEDIUM — silent miscompile, niche)
+A cheap partial IS available — scan the CURRENT function for `ops.cb = <funcname>` before the spawn —
+but it catches only the same-function binding and misses the cross-function `install(&ops)` variant,
+which is the more realistic pattern. That would leave the class open while LOOKING covered, which is
+the stale-gate failure this ledger exists to prevent. Both reproducers are therefore committed
+together, so the sibling is visible to whoever takes it.
 
-**Symptom.** A `uN`/`iN` literal with a 128-bit carrier and value >= 2^63 sign-extends into the high
-64 bits on the IR/expression emission path. The GLOBAL-INIT path is correct, so the two disagree.
-
-**Fix sketch.** Mask/zero-extend at the 128-bit carrier emission site. A COMPLETE fix also needs
-128-bit literal LEXING — today the lexer cannot represent the literal exactly, so the emission fix
-alone only narrows the window.
-
----
-
-## OPEN — spawn race scan blind to a funcptr STRUCT-FIELD call bound cross-function (MEDIUM)
-
-**Symptom.** The spawn non-shared-global scan does not follow a function pointer stored in a STRUCT
-FIELD and bound in a different function, so a race reachable only through that indirection is missed.
-
-**Why it is not simply "fix the scan".** Following it in general requires whole-program reachability,
-which is BANNED from the architecture (CLAUDE.md "Whole-program analysis — BANNED"). Same boundary as
-§D8 (2026-08-01), which took the conservative descent only at the spawn site itself. Any fix must stay
-inside the per-file + summaries model.
+**Fix sketch (the real one).** A new FuncSummary axis: "stores function F into a funcptr field of
+param N", propagated at the call site — structurally the same shape as the `frees_param_field`
+summary added 2026-08-02. Then at a spawn whose target calls through a funcptr field of a param,
+scan the functions that summary says may be bound there. Stays inside the per-file + summaries model.
 
 ---
 

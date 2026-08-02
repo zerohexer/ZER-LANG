@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — call-return alias linking + uN 128-bit literal signedness
+
+Two of the three findings that were DOCUMENTED but fixed on no branch. Designed here; no reference
+implementation existed.
+
+- **Call-return alias defeated free/UAF tracking (CRITICAL — accept-unsafe).** A function returning a
+  view of its pointer/slice param yielded a call result whose `alloc_id` was not tied to the argument
+  allocation, so `b2 = idents(buf); free(buf); free(b2);` compiled CLEAN and double-freed at runtime
+  (glibc abort 134). This was a hole INSIDE the BUG-764 return-a-view-of-a-param relaxation that
+  several 2026-08-01/02 fixes lean on (§C1's `val_is_param` exclusion, §C4's scoping).
+  **The call-site machinery was already correct** — Phase F (`~4568`) applies `ir_apply_alias` so the
+  dest shares the arg's `alloc_id` and state, once `returns_param_color` is set. Only the INFERENCE
+  was short: it required the returned local to HAVE a handle and matched via shared `alloc_id`, but a
+  param is not an allocation and so has no handle — a plain `return s;` hit the `!rh` bail and the
+  summary stayed -1. Added an IDENTITY arm (the returned local IS the param's local), checked BEFORE
+  the handle is required. The existing alloc_id arm still covers "return a CAST of param".
+  Sound in both directions: the per-return-block loop already demands EVERY return path resolve to the
+  SAME param, so a conditional return of something else yields no inference. Verified the two legal
+  shapes still compile — free through the ORIGINAL after using the alias, and free through the ALIAS
+  (the paired leak false-positive the linking also closes). Tests
+  `call_return_alias_double_free.zer` (promoted from `tests/zer_gaps/` per its own instruction),
+  positive `call_return_alias_single_free_ok.zer`.
+
+- **uN/iN 128-bit-carrier literals >= 2^63 sign-extended (MEDIUM — silent miscompile).** The IR
+  literal emitter printed `%lld` unconditionally, so `0x8000000000000000` became
+  `-9223372036854775808` and the cast to `unsigned __int128` SIGN-EXTENDED it, setting all the high
+  bits. For a <= 64-bit target the cast WRAPS and the same emission is harmless (`(uint32_t)-1` is
+  correct), which is why only a 128-bit carrier exposed it. The GLOBAL-INIT path already emitted
+  `...ULL` and was correct, so the two paths disagreed on the same literal.
+  Fix: print with the DESTINATION's signedness — `%lluULL` for an unsigned integer target, `%lld`
+  otherwise. **BUG-592 is preserved**: it required a type-MATCHED literal (always-ULL broke
+  `signed_local < 0ULL`), and a signed destination still emits `%lld`. Guarded by a mixed
+  signed/unsigned literal test.
+  The remaining half — a literal >= 2^64 — needs 128-bit literal LEXING, but it is already a CLEAN
+  rejection ("integer literal exceeds u64 range"), not a silent miscompile. The silent part is fully
+  closed.
+
+**The third finding was NOT fixed, deliberately, and its entry was SHARPENED instead.** The spawn
+race scan's funcptr STRUCT-FIELD blindness turned out much narrower than recorded: passing the struct
+by POINTER is caught by the non-shared-pointer rule, reading the Ops struct from a GLOBAL is caught by
+the global scan, and a DIRECT racing call is caught by the body scan. It fires only when the callback
+struct passes BY VALUE and the spawn target touches no non-shared global itself. A cheap partial fix
+(scan the current function for `ops.cb = <funcname>`) would catch the same-function binding and miss
+the cross-function `install(&ops)` variant — leaving the class open while looking covered, the exact
+stale-gate failure the ledger exists to prevent. Both reproducers are committed to
+`tests/zer_gaps/` so the sibling is visible, and the entry now carries the real fix sketch (a
+FuncSummary axis, same shape as `frees_param_field`).
+
+make check exit 0 — 9 matrix grids, all audit gates, sink matrix clean.
+
+---
+
 ## 2026-08-02 — param-field free tracking, @container launder, scoped-borrow interior
 
 Three defects from `claude/gifted-noether-{dgbmqx,6doa71}`, each verified against main `207de7e1`

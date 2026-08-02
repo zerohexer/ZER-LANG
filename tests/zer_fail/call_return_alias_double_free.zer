@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// Fixed 2026-08-02: idents() returns its slice param, so b2 ALIASES buf. The
+// call result was registered as a fresh handle whose alloc_id was not tied to
+// buf's allocation, so the second free compiled CLEAN and double-freed at
+// runtime (glibc abort 134) — the safety hole inside the BUG-764
+// return-a-view-of-a-param relaxation.
+//
+// The call-site machinery (Phase F, ir_apply_alias) was already correct; only
+// the returns_param_color INFERENCE was short: it required the returned local
+// to HAVE a handle, and a param is not an allocation, so a plain `return s;`
+// had none. An identity arm (returned local IS the param local) fixes it.
+[*]u8 idents([*]u8 s) { return s; }
+u32 main() {
+    [*]u8 buf = alloc(u8, 16) orelse { return 0; };
+    [*]u8 b2 = idents(buf);
+    free(buf);
+    free(b2);
+    return 0;
+}

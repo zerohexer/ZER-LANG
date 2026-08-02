@@ -11666,7 +11666,26 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "(");
                 if (dst->type) emit_type(e, dst->type);
                 else emit(e, "uint64_t");
-                emit(e, ")%lld", (long long)inst->literal_int);
+                /* 2026-08-02: print the literal with the DESTINATION's
+                 * signedness. `%lld` unconditionally emitted a signed decimal,
+                 * so a value >= 2^63 became negative
+                 * (0x8000000000000000 -> -9223372036854775808) and the cast
+                 * SIGN-EXTENDED it. For a <= 64-bit target that is harmless —
+                 * `(uint32_t)-1` wraps to the same bits — but for a uN/iN with a
+                 * 128-BIT CARRIER the cast widens instead of wrapping, so
+                 * `u100 a = 0x8000000000000000;` set all the high bits. A silent
+                 * miscompile: the GLOBAL-INIT path emits `...ULL` and was
+                 * correct, so the two paths disagreed on the same literal.
+                 *
+                 * BUG-592 is preserved: it required a type-MATCHED literal
+                 * (always-ULL broke `signed_local < 0ULL`), and a SIGNED
+                 * destination still emits %lld here. */
+                bool lit_dst_unsigned = dst->type &&
+                    type_is_integer(dst->type) && !type_is_signed(dst->type);
+                if (lit_dst_unsigned)
+                    emit(e, ")%lluULL", (unsigned long long)(uint64_t)inst->literal_int);
+                else
+                    emit(e, ")%lld", (long long)inst->literal_int);
                 break;
             }
             case 1: /* float */

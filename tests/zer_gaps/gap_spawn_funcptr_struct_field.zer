@@ -1,0 +1,24 @@
+// GAP (isolated 2026-08-02, NOT fixed): the spawn race scan cannot see through
+// a funcptr STRUCT FIELD. `worker` touches no global directly — only `o.cb()` —
+// so the non-shared-global scan finds nothing, yet the child reaches `counter`
+// through the callback while the parent writes it.
+//
+// The shape is NARROWER than first documented. Two nearby shapes ARE caught, and
+// isolating this one required avoiding both:
+//   * passing the struct by POINTER  -> caught by the non-shared-pointer rule
+//   * reading the Ops struct from a GLOBAL -> caught by the global-access scan
+// So the struct must pass BY VALUE and the worker must touch no global directly.
+//
+// Compile-clean today = the gap. Move to tests/zer_fail/ when fixed.
+// See docs/limitations.md "spawn race scan blind to a funcptr STRUCT-FIELD call".
+u32 counter;
+void bump() { counter += 1; }
+struct Ops { *() cb; }
+void worker(Ops o) { o.cb(); }
+u32 main() {
+    Ops ops;
+    ops.cb = bump;
+    spawn worker(ops);
+    counter += 1;
+    return counter;
+}

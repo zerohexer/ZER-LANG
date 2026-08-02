@@ -5861,20 +5861,44 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     }
                 }
                 if (rlocal < 0) { inferred_param = -1; break; }
-                /* Check if rlocal's handle shares alloc_id with any param.
-                 * This captures the "return cast of param" alias pattern. */
-                IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
-                if (!rh) { inferred_param = -1; break; }
                 int match_param = -1;
+                /* (a) DIRECT return of the param itself — `[*]u8 f([*]u8 s)
+                 * { return s; }`. 2026-08-02: this arm is new and closes a
+                 * CRITICAL accept-unsafe hole. The alloc_id arm below requires
+                 * the returned local to HAVE a handle, but a param is not an
+                 * allocation, so a plain `return s;` had none: the scan bailed
+                 * at `!rh`, returns_param_color stayed -1, and the call site
+                 * never aliased the result to the argument. `b2 = idents(buf);
+                 * free(buf); free(b2);` therefore compiled CLEAN and
+                 * double-freed at runtime (glibc abort 134) — the safety hole
+                 * inside the BUG-764 return-a-view-of-a-param relaxation.
+                 *
+                 * Identity needs no handle, so it is checked FIRST. The
+                 * call-site application (Phase F, ~4568) already does the right
+                 * thing once the summary is set: ir_apply_alias makes the dest
+                 * share the arg's alloc_id and state. Only the inference was
+                 * short. */
                 for (int pi = 0; pi < pc; pi++) {
                     ParamDecl *p = &fn->func_decl.params[pi];
                     int plocal = ir_find_local_exact_first(func,
                         p->name, (uint32_t)p->name_len);
-                    if (plocal < 0) continue;
-                    IRHandleInfo *ph = ir_find_handle(&block_states[bi], plocal);
-                    if (!ph) continue;
-                    if (ph->alloc_id == rh->alloc_id && ph->alloc_id != 0) {
-                        match_param = pi; break;
+                    if (plocal >= 0 && plocal == rlocal) { match_param = pi; break; }
+                }
+                /* (b) the returned local's handle shares an alloc_id with a
+                 * param — the "return a CAST of param" alias pattern. */
+                if (match_param < 0) {
+                    IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
+                    if (!rh) { inferred_param = -1; break; }
+                    for (int pi = 0; pi < pc; pi++) {
+                        ParamDecl *p = &fn->func_decl.params[pi];
+                        int plocal = ir_find_local_exact_first(func,
+                            p->name, (uint32_t)p->name_len);
+                        if (plocal < 0) continue;
+                        IRHandleInfo *ph = ir_find_handle(&block_states[bi], plocal);
+                        if (!ph) continue;
+                        if (ph->alloc_id == rh->alloc_id && ph->alloc_id != 0) {
+                            match_param = pi; break;
+                        }
                     }
                 }
                 if (match_param < 0) { inferred_param = -1; break; }

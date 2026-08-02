@@ -1542,6 +1542,54 @@ All runners auto-detect positive vs negative tests. `make check` runs everything
 - `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
 - `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
 
+### VACUOUS TESTS — the #1 way this suite lies to you (both forms found 2026-08-03)
+
+**The name.** A test whose PASS CONDITION IS WEAKER THAN ITS CLAIM. Two forms, one root
+cause: *the verdict did not depend on the thing under test.* Both were live here, under
+~500 tests, and both are now gated.
+
+| Form | What it looks like | Found here |
+|---|---|---|
+| **Weak oracle** — passes for the WRONG reason | negative test asserts only "compiler exited non-zero" | 476 negatives; diagnostic went to `/dev/null` |
+| **Unexecuted** — never runs at all | a test directory no runner globs | `tests/zer_gaps/`, 43 files, wired to NOTHING |
+
+**Why the weak-oracle form is structural here, not sloppiness.** ZER has MANY INDEPENDENT
+SAFETY RULES OVER THE SAME PROGRAMS. When N rules can reject one file, "exit != 0" tests
+whichever fires FIRST, which is usually not yours. Measured instances: a branch condition
+mentioning the borrowed variable tripped the READ check; a conditionally-joined
+ThreadHandle tripped the LEAK check; the 2026-08-02 I1 unbounded-index rule now masks TWO
+older mmio/alignment gaps.
+
+**THIS GETS WORSE AS THE COMPILER GETS BETTER.** Every rule added increases the masking
+surface. The §A–§J sweep measurably made it worse — one of my own fixes masked two gaps.
+So the discipline has to tighten as coverage grows, not relax.
+
+**Why the unexecuted form happens.** A directory created with "documentation" semantics
+drifts into being TREATED as coverage. `tests/zer_gaps/` was a genuine convention
+(compile-clean = the gap) and still rotted: of 43 files, **18 had silently CLOSED** (a
+safety rule fixed with no regression test proving it), **5 were MASKED** (gap still open
+but invisible), **1 no longer parsed**. Nobody knew, because nothing ran it.
+
+**The generalization worth keeping: an un-executed test artifact decays to ZERO value, then
+to NEGATIVE value once people believe it covers something.** This is the same principle
+this file already states for GATES ("a stale matrix is worse than none — false
+confidence"), applied to TESTS. Treat them identically.
+
+**THE RULES.**
+1. A negative test states WHY: `// expect-error: <substring>` (first 5 lines). Assert the
+   reason the rule is SUPPOSED to give — never paste what it currently prints, or you
+   freeze a wrong reason into the suite.
+2. Every test directory is executed by a runner. If you add one, wire it in the SAME
+   commit, or it is documentation — label it as such and do not count it as coverage.
+3. `tests/zer_gaps/` runs with the expectation INVERTED (compile-clean = the gap holds).
+   A gap that closes FAILS LOUDLY telling you to promote it; a gap that becomes masked
+   needs `// gap-masked-by: <substring>` — the justification, same shape as an audit
+   baseline row.
+4. Same for hand probes: `zerc f.zer -o /dev/null` returning non-zero does NOT mean your
+   rule fired. Read the message.
+5. Verify a new test gate FIRES before trusting it (inject a wrong expectation / a fake
+   closure). A gate that has only ever passed is a script, not a net.
+
 ### A NEGATIVE TEST PROVES NOTHING UNTIL YOU READ THE DIAGNOSTIC — use `// expect-error:`
 
 `tests/zer_fail/` passes a test on ANY non-zero exit. Until 2026-08-03 the diagnostic went

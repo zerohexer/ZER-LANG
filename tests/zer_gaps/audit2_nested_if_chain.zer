@@ -1,3 +1,7 @@
+// gap-masked-by: wrong pool
+// MASKED, NOT CLOSED (recorded 2026-08-03). Rejected by the WRONG-POOL rule, not by the if/else-if partial-transfer analysis this
+// gap targets. The transfer question is untested.
+// Rewrite this probe to avoid the masking rule, or the gap stays invisible.
 // AUDIT2 #9 (2026-04-19 code-inspection audit)
 // CLAIM: zercheck if/else-if chain — each else-if body transfers
 //        handle at a different level. After the chain, what state?

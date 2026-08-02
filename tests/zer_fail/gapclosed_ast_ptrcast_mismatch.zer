@@ -1,0 +1,12 @@
+// expect-error: @ptrcast type mismatch
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
+struct A { u32 x; }
+struct B { u32 y; }
+u32 main() {
+    A a; a.x = 1;
+    *opaque o = @ptrcast(*opaque, &a);
+    *B b = @ptrcast(*B, o);  // wrong type — runtime should trap
+    return b.y;
+}

@@ -1,3 +1,7 @@
+// gap-masked-by: @inttoptr requires mmio range
+// MASKED, NOT CLOSED (recorded 2026-08-03). Rejected by the strict-mmio declaration requirement, not by the missing-runtime-check
+// behaviour this gap is about. Needs --no-strict-mmio to actually probe the gap.
+// Rewrite this probe to avoid the masking rule, or the gap stays invisible.
 // 2026-06-02 audit (Agent 3 Gap #1): `--no-strict-mmio` flag drops the
 // RUNTIME range/alignment check too, not just the compile-time one.
 //

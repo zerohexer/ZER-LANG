@@ -1,3 +1,7 @@
+// expect-error: use after free
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // AUDIT2 #2 (2026-04-19 code-inspection audit)
 // CLAIM: zercheck.c:1668 backward-goto fixed-point iteration only
 //        fires when label and goto are in the SAME block. A backward

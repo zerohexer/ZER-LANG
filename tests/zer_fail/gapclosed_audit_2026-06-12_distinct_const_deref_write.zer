@@ -1,3 +1,7 @@
+// expect-error: write through const pointer
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // AUDIT 2026-06-12 — HIGH severity
 //
 // Gap: write through a const-qualified distinct-typedef pointer is

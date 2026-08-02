@@ -1,3 +1,7 @@
+// expect-error: @ptrcast between unrelated
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // 2026-06-02 audit (Agent 1 Gap 4): @ptrcast between two unrelated
 // concrete struct pointers (no *opaque round-trip) is silently allowed
 // at both checker and emitter, producing type confusion.

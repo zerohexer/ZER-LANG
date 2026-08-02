@@ -1,3 +1,7 @@
+// gap-masked-by: use after free
+// MASKED, NOT CLOSED (recorded 2026-08-03). Rejected by a UAF elsewhere in the file, not by the slice/Pool bounds interaction this
+// gap is about.
+// Rewrite this probe to avoid the masking rule, or the gap stays invisible.
 // AUDIT2 #11 (verify [*]T / slice allocator safety)
 // CLAIM: CLAUDE.md says "[*]T = dynamic pointer to many, bounds
 //        checked". The only way to allocate one is via arena.alloc_slice(T, n)

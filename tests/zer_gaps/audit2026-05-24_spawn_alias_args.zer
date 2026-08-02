@@ -1,3 +1,8 @@
+// gap-masked-by: expected type at
+// BIT-ROTTED, NOT CLOSED (recorded 2026-08-03). This probe no longer PARSES —
+// it uses a `*shared T` spelling the grammar does not accept, so it has never
+// tested the spawn-alias-args gap it names. Rewrite it in current syntax; until
+// then the gap is unprobed. Found only because nothing executed this directory.
 // SUSPECTED GAP — spawn allows aliased pointers to the same global
 //
 // Pattern: `spawn worker(&g, &g);` — both args point to the same global.

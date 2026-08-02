@@ -1,3 +1,7 @@
+// gap-masked-by: no compile-time MMIO bound
+// MASKED, NOT CLOSED (recorded 2026-08-03). Same masking as ast_inttoptr_align: the I1 unbounded-index rule fires before the
+// mmio-range behaviour this gap targets is reached.
+// Rewrite this probe to avoid the masking rule, or the gap stays invisible.
 mmio 0x40000000..0x40000FFF;
 u32 main() {
     u64 addr = 0x50000000;  // outside declared range

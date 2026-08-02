@@ -137,6 +137,55 @@ for f in tests/zer_fail/*.zer; do
 done
 
 echo ""
+echo "=== ZER gap reproducers (tests/zer_gaps/) ==="
+# 2026-08-03: this directory was executed by NOTHING for its whole existence.
+# A triage found 23 of 43 files no longer exhibited their gap — 18 had been
+# silently CLOSED (a safety rule fixed with no regression test to prove it), 5
+# were MASKED by a different rule (the gap still open but invisible), and 1 no
+# longer parsed. A parking lot, not a net.
+#
+# Expectation is INVERTED: a gap file is supposed to COMPILE, because
+# compile-clean IS the gap. Three outcomes:
+#   compiles                      -> ok, gap still open as recorded
+#   rejected, gap-masked-by hits  -> ok, a KNOWN masking, deliberately recorded
+#   rejected, anything else       -> FAIL: triage it
+# so a gap closing is LOUD (promote it) and a gap becoming masked is loud too
+# (the probe stopped testing what it claims). `// gap-masked-by: <substring>`
+# in the header is the justification, same shape as an audit baseline row.
+GAP_TOTAL=0; GAP_OK=0; GAP_FAIL=0
+for f in tests/zer_gaps/*.zer; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .zer)
+    GAP_TOTAL=$((GAP_TOTAL + 1))
+    maskby=$(head -3 "$f" | grep -oE '// gap-masked-by: .*$' | sed 's|// gap-masked-by: ||')
+    $ZERC "$f" $EXTRA_FLAGS -o /dev/null 2>/tmp/_zer_gap_err.txt
+    gret=$?
+    # `-o /dev/null` is a NON-.c path, so zerc builds the exe NEXT TO THE SOURCE
+    # (CLAUDE.md "zerc -o gotchas"). Clean both artefacts or the tree fills with
+    # untracked binaries.
+    rm -f "${f%.zer}.c" "${f%.zer}" 2>/dev/null
+    if [ $gret -eq 0 ]; then
+        GAP_OK=$((GAP_OK + 1))
+        echo "  ok:   $name (gap still open)"
+    elif [ -n "$maskby" ] && grep -qF "$maskby" /tmp/_zer_gap_err.txt; then
+        GAP_OK=$((GAP_OK + 1))
+        echo "  ok:   $name (known masking: $maskby)"
+    else
+        GAP_FAIL=$((GAP_FAIL + 1))
+        echo "  FAIL: $name — no longer exhibits its gap"
+        echo "        $(head -1 /tmp/_zer_gap_err.txt | cut -c1-96)"
+        echo "        -> if the gap CLOSED: verify it is the right rule, move to"
+        echo "           tests/zer_fail/ with an // expect-error:, update limitations.md"
+        echo "        -> if a DIFFERENT rule now masks it: add // gap-masked-by: <substring>"
+    fi
+    rm -f /tmp/_zer_gap_err.txt 2>/dev/null
+done
+echo "  gaps: $GAP_OK/$GAP_TOTAL accounted for, $GAP_FAIL needing triage"
+if [ $GAP_FAIL -ne 0 ]; then
+    FAIL=$((FAIL + GAP_FAIL))
+fi
+
+echo ""
 echo "=== ZER Proof-linked tests (tests/zer_proof/) ==="
 # Each *.zer here exercises a proven Iris theorem.
 # *_bad.zer = violation program (must FAIL to compile).

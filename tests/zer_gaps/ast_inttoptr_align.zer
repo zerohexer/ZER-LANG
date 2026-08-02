@@ -1,3 +1,8 @@
+// gap-masked-by: no compile-time MMIO bound
+// MASKED, NOT CLOSED (recorded 2026-08-03). The ALIGNMENT check this gap is about (0x40000001 is not 4-byte aligned for u32)
+// is NOT what rejects it. The 2026-08-02 I1 fix rejects the INDEX first, because a
+// variable-address @inttoptr derives no mmio bound. The alignment gap is UNTESTED.
+// Rewrite this probe to avoid the masking rule, or the gap stays invisible.
 mmio 0x40000000..0x40000FFF;
 u32 main() {
     u64 addr = 0x40000001;  // u32 requires 4-byte align

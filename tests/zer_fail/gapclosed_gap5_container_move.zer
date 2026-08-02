@@ -1,3 +1,7 @@
+// expect-error: transferred
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // GAP #5 (2026-04-19 audit)
 // CLAIM: move struct transferred through a container field is not
 //        tracked — use after transfer via container field access

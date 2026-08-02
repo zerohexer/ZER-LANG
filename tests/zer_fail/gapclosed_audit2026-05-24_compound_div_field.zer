@@ -1,3 +1,7 @@
+// expect-error: not proven nonzero
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // SILENT GAP — Compound /= and %= div-by-zero only checks NODE_IDENT divisor
 //
 // ZER guarantees: division by zero must be proven nonzero at compile time

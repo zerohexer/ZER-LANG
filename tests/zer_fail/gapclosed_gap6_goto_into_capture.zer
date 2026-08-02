@@ -1,3 +1,7 @@
+// expect-error: jumps into
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // GAP #6 (2026-04-19 audit)
 // CLAIM: `goto` into the body of an if-unwrap without traversing
 //        the capture binding should error — jumping bypasses the

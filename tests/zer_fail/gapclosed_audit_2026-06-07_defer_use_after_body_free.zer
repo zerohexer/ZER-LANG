@@ -1,3 +1,7 @@
+// expect-error: use after free
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // KNOWN GAP — Session 2026-06-07 audit
 // This file COMPILES CLEAN today but should be rejected.
 // See docs/limitations.md "OPEN — defer body uses a handle the function

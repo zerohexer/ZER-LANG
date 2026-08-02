@@ -1,3 +1,7 @@
+// expect-error: container type argument
+// PROMOTED from tests/zer_gaps/ 2026-08-03: this gap is CLOSED and now has a
+// regression test. It sat closed-but-untested because nothing executed
+// tests/zer_gaps/ — see the gap runner added the same day.
 // 2026-06-02 audit (Agent 4 A1): container monomorphization with a
 // non-simple type argument (`?T`, `*T`, `[]T`) emits an invalid C
 // identifier `Box_?u32` containing `?`. GCC then errors with a

@@ -2830,7 +2830,16 @@ borrowed by that thread until `.join()`:
   coerces to a slice over stack memory)
 - A by-value **struct/union carrying a pointer into a local** → compile error,
   including when the struct comes back from a call (`spawn w(mk(&loc))`)
-- Handle to spawn → compile error (pool.get not thread-safe)
+- A by-value **struct/union carrying ANY non-shared pointer or slice** to a
+  fire-and-forget spawn → compile error, whether the pointee is stack or heap.
+  The thread receives a copy of the pointer, so parent and child both hold it.
+  A pointer to a `shared struct` is exempt (auto-locked), and a struct with no
+  pointers at all is always fine
+- Handle to spawn → compile error (pool.get not thread-safe). This covers a
+  Handle at **any nesting** — bare, inside a struct, inside a nested struct,
+  behind `?`, in an array — not just a bare `Handle(T)` argument
+- Scoped spawn: freeing a payload the child still holds **before** `.join()` →
+  compile error, including when the payload is carried inside a by-value struct
 - A **function name** passed as a funcptr argument (`spawn worker(bump)`) is
   scanned too — if the callback touches a non-shared global it is a data race
 - Spawn target body scanned for non-shared global access:

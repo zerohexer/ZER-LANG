@@ -2702,6 +2702,47 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         func->locals[root_local].name,
                         ir_state_name(h->state), h->free_line);
             }
+            /* 2026-08-03: the lookup above resolves the ARG ITSELF. Passing a
+             * by-value struct that CARRIES a tracked pointer
+             * (`struct B{*T t;} b.t = t; spawn w(b);`) finds NO handle for
+             * `b` — `b` is not an allocation — so the carried pointer was never
+             * marked transferred and `free(t)` before `join()` compiled clean.
+             * The bare form `spawn w(t)` was correctly rejected, so this is the
+             * wrapper-hides-the-inner-kind class (CLAUDE.md) at the transfer
+             * sink, the sibling of the checker-side spawn-arg gate fixed the
+             * same day.
+             *
+             * PRIMITIVES FRAMING (docs/primitives-data-races.md §7.2/§13.1):
+             * Share(P) — the set of memory reachable from two contexts — is
+             * bounded to `shared struct`, `*shared T`, globals-via-spawn-scanner
+             * and threadlocal escape. A heap pointer copied into the child
+             * inside a by-value struct is in NONE of those, so it is sharing
+             * OUTSIDE the sanctioned set and the closure argument requires it be
+             * rejected or tracked. Marking it transferred is the tracking half.
+             *
+             * The field store `b.t = t` already registers a COMPOUND handle
+             * (b, ".t") aliased to t's alloc_id — verified: freeing through
+             * either name marks the other freed. So marking every compound
+             * rooted at the arg propagates to the original pointer through the
+             * alias group. Indices are snapshotted first (the documented
+             * two-pass pattern) so alias propagation cannot invalidate the walk. */
+            if (path_len == 0) {
+                int _cap = ps->handle_count > 0 ? ps->handle_count : 1;
+                int *_idx = (int *)malloc((size_t)_cap * sizeof(int));
+                if (_idx) {
+                    int _n = 0;
+                    for (int _hi = 0; _hi < ps->handle_count; _hi++) {
+                        IRHandleInfo *_ch = &ps->handles[_hi];
+                        if (_ch->local_id == root_local && _ch->path_len > 0 &&
+                            _ch->state == IR_HS_ALIVE)
+                            _idx[_n++] = _hi;
+                    }
+                    for (int _k = 0; _k < _n; _k++)
+                        ir_mark_transferred(ps, &ps->handles[_idx[_k]],
+                                            inst->source_line);
+                    free(_idx);
+                }
+            }
             if (!h && root_local < func->local_count) {
                 /* Auto-register move-struct args (bare or compound) so
                  * TRANSFERRED can be observed. For compound paths, walk
@@ -3281,6 +3322,46 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 bdst_h->state = bsnap.state;
                             }
                         }
+                    }
+                }
+            }
+        }
+        /* 2026-08-03: a plain pointer ALIAS created by ASSIGNMENT
+         * (`b = src;`, `a = src;` where a is `?*T`) registered NO alias, so
+         * `free(src); use(b)` was accepted with no compile-time rejection AND
+         * no runtime check — the emitted C is a raw `q->v` deref of a recycled
+         * slab slot (ASan cannot see it; the page is still mapped).
+         *
+         * Only the VAR-DECL-INIT form (`*T b = src;`) registered the alias,
+         * because that lowers to IR_COPY where the alias logic lives. A plain
+         * assignment lowers to `IR_ASSIGN <expr>` targeting a TEMP — the store
+         * to the real destination stays inside the passthrough AST node
+         * (emitted as `_zer_t4 = a = src;`), so the IR_COPY handler never sees
+         * the destination. Found via the spawn carrier grid, but NOT
+         * concurrency-specific: it is a single-threaded UAF / double-free hole.
+         *
+         * Mirrors the subslice-view registration directly above: snapshot the
+         * source's alias group, add a handle for the destination, apply. Fires
+         * only when the source has a TRACKED allocation (alloc_id != 0), so
+         * assigning a param / stack pointer is unaffected. Self-assignment and
+         * compound ops (`+=`) are excluded. */
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+            inst->expr->assign.op == TOK_EQ &&
+            inst->expr->assign.value &&
+            inst->expr->assign.value->kind == NODE_IDENT) {
+            int a_dst = ir_find_value_local(func, inst->expr->assign.target);
+            int a_src = ir_find_local(func,
+                            inst->expr->assign.value->ident.name,
+                            (uint32_t)inst->expr->assign.value->ident.name_len);
+            if (a_dst >= 0 && a_src >= 0 && a_dst != a_src) {
+                IRHandleInfo *asrc_h = ir_find_handle(ps, a_src);
+                if (asrc_h && asrc_h->alloc_id != 0) {
+                    IRAliasSnapshot asnap;
+                    ir_snapshot_alias(&asnap, asrc_h);
+                    IRHandleInfo *adst_h = ir_add_handle(ps, a_dst);
+                    if (adst_h) {
+                        ir_apply_alias(adst_h, &asnap);
+                        adst_h->state = asnap.state;
                     }
                 }
             }

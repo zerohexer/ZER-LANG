@@ -356,6 +356,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
 | Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
+| **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
@@ -1033,7 +1034,15 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > copy-out (BUG-754), B3 `@cond_wait` foreign-shared reject (BUG-755), B4 `@once`
 > loser-wait (BUG-756), B5 defer-body lock (BUG-749); plus the TAIL — A5 threadlocal
 > `&`-escape (BUG-757), A6 micro-residuals (struct-field read/launder, BUG-758),
-> scoped-borrow read-side (BUG-759). **STILL OPEN (one item, do NOT claim ZER is
+> scoped-borrow read-side (BUG-759). **CLOSED 2026-08-03 — the CARRIER class at the
+> spawn-ARG sink:** three arms of the gate tested the BARE argument kind, so a
+> by-value struct (or nested struct) carrying a `Handle` / `*T` / `?*T` / `[*]T`
+> slipped ALL of them at BOTH sinks — 13 hazard cells accepted, verified
+> non-vacuous. Fixed with two carrier predicates (`type_carries_handle`,
+> `type_carries_nonshared_pointer`) + a compound-rooted transfer marking, and
+> gated by the CARRIER GRID in `tests/test_conc_matrix.c` (verified to fire: 13
+> false negatives pre-fix, 0 after). See primitives-data-races.md §24.5b.
+> **STILL OPEN (one item, do NOT claim ZER is
 > fully data-race-safe yet):** the scoped-borrow **CROSS-BLOCK** case (spawn and
 > access in different CFG blocks — same-block read+write are covered; the proper fix
 > is a zercheck_ir borrow-set merge like the `threads[]` merge, subsystem-scale).

@@ -1,0 +1,26 @@
+// Boundary for the 2026-08-03 spawn-arg CARRIER rules: the shapes that carry no
+// cross-thread hazard must still compile. Without these the carrier gate could
+// tighten into an over-rejection unnoticed — the gate rejects a value that
+// CARRIES a handle or a non-shared pointer, so a pure-value struct and a
+// pointer to a `shared struct` must both stay legal.
+shared struct C { u32 v; }
+C g;
+
+struct PureVal { u32 a; u32 b; }
+struct SharedRef { *C c; }
+
+void takes_value(PureVal p){ u32 x = p.a; }
+void takes_shared(SharedRef s){ s.c.v = 1; }
+
+u32 main(){
+    PureVal p;
+    p.a = 7;
+    p.b = 9;
+    spawn takes_value(p);          // pure value — no sharing at all
+
+    SharedRef s;
+    s.c = &g;
+    spawn takes_shared(s);         // pointer to a shared struct — auto-locked
+
+    return 0;
+}

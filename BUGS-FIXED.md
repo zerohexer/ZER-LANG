@@ -5,6 +5,66 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03b — concurrency carrier holes + an assignment-alias UAF
+
+Goal: make ZER-to-ZER concurrency (single- and multi-threaded) statically safe.
+Found by enumerating carrier x payload x sink rather than fixing the one hole
+that was reported — the multi-site rule from CLAUDE.md.
+
+**The class.** Three arms of the spawn-argument gate tested the BARE argument
+kind, so every WRAPPER that hides the inner kind slipped all of them. Measured
+before the fix: 13 grid cells accepted, each a genuine cross-thread hazard with
+the worker really dereferencing the payload while the parent freed it.
+
+| Hole | Before |
+|---|---|
+| by-value struct carrying `Handle` -> spawn | ACCEPTED (bare form rejected) |
+| nested struct (2 levels) carrying `Handle` | ACCEPTED |
+| by-value struct carrying heap `*T` / `?*T` / `[*]T` | ACCEPTED (bare form rejected as a data race) |
+| same shapes at a SCOPED spawn, free before join | ACCEPTED (bare form rejected as transferred) |
+
+**Fixes.**
+1. `checker.c` — two new predicates, `type_carries_handle` and
+   `type_carries_nonshared_pointer`, both recursing optional / array / struct /
+   union and unwrapping distinct. The Handle gate and the fire-and-forget
+   data-race gate now ask a predicate instead of testing the bare kind, so every
+   carrier shape is one call rather than N hand-rolled arms. `type_carries_handle`
+   is deliberately SEPARATE from `type_carries_data_pointer`: a Handle is an
+   index, not a frame pointer, and folding it in would over-reject at escape sinks.
+2. `zercheck_ir.c` (spawn-arg sink) — mark every COMPOUND handle rooted at the
+   arg local as transferred, so a by-value struct carrying a pointer propagates
+   to the original through the alias group. The bare lookup found no handle for
+   the struct itself, which is why the wrapped free-before-join compiled.
+3. `zercheck_ir.c` (IR_ASSIGN) — **a general single-threaded UAF**, surfaced by
+   the grid but not concurrency-specific. A pointer alias created by ASSIGNMENT
+   (`a = src;`) registered no alias at all, so `free(src); use(a)` was accepted
+   with NO compile-time rejection and NO runtime check — the emitted C is a raw
+   `q->v` deref of a recycled slab slot. Only the var-decl-init form registered
+   the alias, because that lowers to IR_COPY where the alias logic lives; a plain
+   assignment lowers to IR_ASSIGN targeting a TEMP with the real store nested in
+   the passthrough expr (`_zer_t4 = a = src;`). Now mirrors the subslice-view
+   registration directly above it.
+
+**Gate.** `tests/test_conc_matrix.c` gains a CARRIER GRID — carrier x payload x
+sink, C enums switched with no default so a new carrier fails `-Werror=switch`.
+Verified it FIRES: 13 false negatives on a from-HEAD build, 0 after. Its
+integrity guard now also accepts "is transferred" as a concurrency reason (a
+spawn arg marked transferred IS the ownership mechanism) while deliberately NOT
+matching bare "use after free", which would let an unrelated single-threaded UAF
+pass as coverage.
+
+**Primitives framing** (`docs/primitives-data-races.md` §7.2, §13.1). Share(P) —
+memory two contexts can reach — is bounded to `shared struct`, `*shared T`,
+globals-via-spawn-scanner and threadlocal escape. A payload copied into the child
+inside a by-value struct is in NONE of those, so it was sharing outside the
+sanctioned set. These fixes restore that bound; the doc's own "detectable is not
+detected" clause is what they move from detectable to detected.
+
+Tests: 4 negatives (all verified to COMPILE on a pre-fix build), 1 positive
+pinning the over-rejection boundary (pure-value struct, pointer-to-shared-struct),
+plus the 37-cell grid. One `tests/zer_gaps/` reproducer promoted to `zer_fail/`
+after the gap runner reported it closed.
+
 ## 2026-08-03 — F2 durable fix: per-defer runtime ARMED flag (a RELAXATION)
 
 The last open item from the branch survey, and the only RELAXATION in the whole sweep — the one

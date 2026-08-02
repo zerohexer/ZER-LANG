@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: carries a non-shared pointer/slice to a fire-and-forget
+// A by-value struct carrying a HEAP pointer handed to a fire-and-forget spawn.
+// The bare `*T` form was rejected as a data race; the wrapped form fell through
+// BOTH the is_ptr_like arm (arg kind is STRUCT) and the stack-derived carrier
+// arm (the pointer is heap, not stack), so it compiled. Same hazard as bare:
+// the thread receives a copy of the pointer, so parent and child both hold it.
+struct T{u32 v;}
+struct B{ *T t; }
+
+void w(B b){ u32 x = b.t.v; }
+
+u32 main(){
+    *T t = alloc(T) orelse { return 1; };
+    B b;
+    b.t = t;
+    spawn w(b);
+    free(t);
+    return 0;
+}

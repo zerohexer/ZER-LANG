@@ -46,7 +46,14 @@ static int has_conc_reason(const char *eb) {
     return strstr(eb, "data race") || strstr(eb, "deadlock") ||
            strstr(eb, "non-shared") || strstr(eb, "not joined") ||
            strstr(eb, "@critical") || strstr(eb, "spawn") ||
-           strstr(eb, "thread") || strstr(eb, "shared");
+           strstr(eb, "thread") || strstr(eb, "shared") ||
+           /* 2026-08-03: a spawn argument marked TRANSFERRED is the
+            * concurrency ownership mechanism (ir_mark_transferred at the
+            * spawn-arg sink), so "is transferred" IS a concurrency reason.
+            * Without this the carrier grid reported correct rejections as
+            * SUSPECT. Deliberately NOT matching bare "use after free", which
+            * would let an unrelated single-threaded UAF pass as coverage. */
+           strstr(eb, "is transferred");
 }
 
 /* NEGATIVE: must reject for a concurrency reason. */
@@ -261,6 +268,152 @@ static void gen(COScenario s, char *buf, size_t n) {
     }
 }
 
+
+/* ================================================================
+ * CARRIER GRID (2026-08-03) — the "wrapper hides the inner kind" class
+ * at the spawn ARGUMENT sink.
+ *
+ * WHY THIS EXISTS. The scenario list above is FLAT, and every one of its
+ * spawn cells hands the payload BARE. That is exactly the shape the gate
+ * already tested, so the grid was green while six real holes were open:
+ * wrapping the same Handle / heap pointer / slice in a by-value struct
+ * slipped every arm of the spawn-arg gate. Measured before the fix — all
+ * ACCEPTED, and the emitted worker really derefed across the thread
+ * boundary (`_zer_pool_get(..., b.h, 4)->v`) while the parent freed.
+ *
+ * PRIMITIVES FRAMING (docs/primitives-data-races.md §7.2, §13.1). Share(P),
+ * the set of memory two contexts can reach, is bounded to `shared struct`,
+ * `*shared T`, globals-via-spawn-scanner, and threadlocal escape. A payload
+ * copied into the child inside a by-value struct is in NONE of those, so it
+ * is sharing OUTSIDE the sanctioned set. The closure argument says such a
+ * program must be rejected; this grid is what keeps that true as new carrier
+ * shapes are added.
+ *
+ * THE AXES. carrier x payload x sink. The carrier axis is the bug class: a
+ * green BARE row proves nothing about the wrapped rows, which is precisely
+ * how this shipped. Cells are C enums switched with NO default, so adding a
+ * carrier or payload fails -Wswitch until every combination is handled.
+ *
+ * EVERY cell is a genuine hazard, so every cell must REJECT for a
+ * concurrency reason. run_neg's integrity guard rejects a cell that was only
+ * stopped by a parse/type error, so a mis-typed probe cannot pass as
+ * coverage (the vacuous-test class, CLAUDE.md).
+ * ================================================================ */
+
+typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_COUNT } CACarrier;
+typedef enum { PAY_HANDLE, PAY_PTR, PAY_SLICE, PAY_COUNT } CAPayload;
+typedef enum { SINK_FF, SINK_SCOPED_FREE_B4_JOIN, SINK_COUNT } CASink;
+
+static const char *car_name(CACarrier c) {
+    switch (c) {
+    case CAR_BARE:   return "bare";
+    case CAR_BYVAL:  return "byval-struct";
+    case CAR_NESTED: return "nested-struct";
+    case CAR_OPT:    return "optional";
+    case CAR_COUNT:  break;
+    }
+    return "?";
+}
+static const char *pay_name(CAPayload p) {
+    switch (p) {
+    case PAY_HANDLE: return "Handle";
+    case PAY_PTR:    return "heap-ptr";
+    case PAY_SLICE:  return "slice";
+    case PAY_COUNT:  break;
+    }
+    return "?";
+}
+static const char *sink_name(CASink s) {
+    switch (s) {
+    case SINK_FF:                   return "fire-and-forget";
+    case SINK_SCOPED_FREE_B4_JOIN:  return "scoped/free-before-join";
+    case SINK_COUNT: break;
+    }
+    return "?";
+}
+
+/* `?[*]T` and `?Handle` are spellable; a nested optional is not, and the
+ * optional carrier over a slice adds no distinct dispatch path. */
+static int carrier_cell_valid(CACarrier c, CAPayload p) {
+    if (c == CAR_OPT && p == PAY_SLICE) return 0;
+    return 1;
+}
+
+/* Build one cell. The worker ALWAYS derefs the payload and the parent ALWAYS
+ * frees it, so a passing cell reflects the gate, not an inert probe. */
+static void gen_carrier(CACarrier c, CAPayload p, CASink k,
+                        char *out, size_t n) {
+    const char *fld;              /* payload field / arg type            */
+    const char *alloc;            /* how the parent allocates it         */
+    const char *freecall;         /* how the parent frees it             */
+    switch (p) {
+    case PAY_HANDLE: fld = "Handle(T)"; alloc = "Handle(T) src = pl.alloc() orelse { return 1; };"; freecall = "pl.free(src);"; break;
+    case PAY_PTR:    fld = "*T";        alloc = "*T src = alloc(T) orelse { return 1; };";          freecall = "free(src);";    break;
+    case PAY_SLICE:  fld = "[*]T";      alloc = "[*]T src = alloc(T,4) orelse { return 1; };";      freecall = "free(src);";    break;
+    case PAY_COUNT:  fld = "*T"; alloc = ""; freecall = ""; break;
+    }
+
+    char decls[512]; decls[0] = 0;
+    char argty[128], setup[256], acc[128];
+    switch (c) {
+    case CAR_BARE:
+        snprintf(argty, sizeof(argty), "%s", fld);
+        snprintf(setup, sizeof(setup), "%s a = src;", fld);
+        snprintf(acc,   sizeof(acc),   "a");
+        break;
+    case CAR_BYVAL:
+        snprintf(decls, sizeof(decls), "struct B{ %s q; }\n", fld);
+        snprintf(argty, sizeof(argty), "B");
+        snprintf(setup, sizeof(setup), "B a; a.q = src;");
+        snprintf(acc,   sizeof(acc),   "a.q");
+        break;
+    case CAR_NESTED:
+        snprintf(decls, sizeof(decls), "struct I{ %s q; }\nstruct O{ I i; }\n", fld);
+        snprintf(argty, sizeof(argty), "O");
+        snprintf(setup, sizeof(setup), "O a; a.i.q = src;");
+        snprintf(acc,   sizeof(acc),   "a.i.q");
+        break;
+    case CAR_OPT:
+        snprintf(argty, sizeof(argty), "?%s", fld);
+        snprintf(setup, sizeof(setup), "?%s a; a = src;", fld);
+        snprintf(acc,   sizeof(acc),   "a");
+        break;
+    case CAR_COUNT: argty[0]=0; setup[0]=0; acc[0]=0; break;
+    }
+
+    /* The worker body: always a real dereference of the payload. */
+    char body[256];
+    if (c == CAR_OPT) {
+        if (p == PAY_HANDLE)
+            snprintf(body, sizeof(body), "Handle(T) u = %s orelse { return; }; u32 x = u.v;", acc);
+        else
+            snprintf(body, sizeof(body), "*T u = %s orelse { return; }; u32 x = u.v;", acc);
+    } else if (p == PAY_SLICE) {
+        snprintf(body, sizeof(body), "u32 x = %s[0].v;", acc);
+    } else {
+        snprintf(body, sizeof(body), "u32 x = %s.v;", acc);
+    }
+
+    const char *spawn_and_free =
+        (k == SINK_FF) ? "spawn w(a);\n    %s\n"
+                       : "ThreadHandle th = spawn w(a);\n    %s\n    th.join();\n";
+    char tail[256];
+    snprintf(tail, sizeof(tail), spawn_and_free, freecall);
+
+    snprintf(out, n,
+        "struct T{u32 v;}\n"
+        "%s"
+        "Pool(T,4) pl;\n"
+        "void w(%s a){ %s }\n"
+        "u32 main(){\n"
+        "    %s\n"
+        "    %s\n"
+        "    %s"
+        "    return 0;\n"
+        "}\n",
+        decls, argty, body, alloc, setup, tail);
+}
+
 int main(void) {
     find_zerc();
     fprintf(stderr, "=== Concurrency (data-race / spawn / deadlock) matrix ===\n");
@@ -279,6 +432,27 @@ int main(void) {
         fprintf(stderr, "  [%-3s][%-24s] %s\n",
                 neg ? "neg" : "pos", scen_name(s), ok ? "ok" : "*** FAIL ***");
         if (!ok) grid_ok = 0;
+    }
+
+    /* ---- carrier x payload x sink grid ---- */
+    fprintf(stderr, "\n  -- carrier grid (wrapper-hides-inner-kind at the spawn-arg sink) --\n");
+    char cbuf[2048];
+    for (CACarrier c = 0; c < CAR_COUNT; c++) {
+        for (CAPayload p = 0; p < PAY_COUNT; p++) {
+            if (!carrier_cell_valid(c, p)) continue;
+            for (CASink k = 0; k < SINK_COUNT; k++) {
+                valid_cells++;
+                char nm[192];
+                snprintf(nm, sizeof(nm), "carrier/%s/%s/%s",
+                         car_name(c), pay_name(p), sink_name(k));
+                gen_carrier(c, p, k, cbuf, sizeof(cbuf));
+                int ok = run_neg(nm, cbuf);
+                fprintf(stderr, "  [%-13s][%-9s][%-23s] %s\n",
+                        car_name(c), pay_name(p), sink_name(k),
+                        ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
     }
 
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);

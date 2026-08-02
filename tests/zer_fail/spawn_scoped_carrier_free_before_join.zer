@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: is transferred
+// Scoped spawn: freeing a payload the child still holds, BEFORE join().
+// The bare `*T` form was marked TRANSFERRED at the spawn-arg sink and rejected;
+// a by-value struct carrying the pointer found no handle for the struct itself,
+// so nothing was marked and the cross-thread use-after-free compiled clean.
+// Fixed by marking every COMPOUND handle rooted at the arg local, which
+// propagates to the original pointer through the alias group.
+struct T{u32 v;}
+struct B{ *T t; }
+
+void w(B b){ u32 x = b.t.v; }
+
+u32 main(){
+    *T t = alloc(T) orelse { return 1; };
+    B b;
+    b.t = t;
+    ThreadHandle th = spawn w(b);
+    free(t);
+    th.join();
+    return 0;
+}

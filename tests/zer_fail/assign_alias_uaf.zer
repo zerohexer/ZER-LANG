@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A pointer alias created by ASSIGNMENT (not var-decl init) was not tracked at
+// all, so freeing the original and using the alias was accepted with NO
+// compile-time rejection and NO runtime check — the emitted C is a raw `q->v`
+// deref of a recycled slab slot (ASan cannot see it: the page is still mapped).
+//
+// Only `*T b = src;` registered the alias, because that lowers to IR_COPY where
+// the alias logic lives. `a = src;` lowers to IR_ASSIGN targeting a TEMP, with
+// the real store nested inside the passthrough expr (`_zer_t4 = a = src;`), so
+// the IR_COPY handler never saw the destination.
+//
+// Found via the spawn CARRIER GRID but NOT concurrency-specific — this is a
+// single-threaded use-after-free.
+struct T{u32 v;}
+
+u32 main(){
+    *T src = alloc(T) orelse { return 1; };
+    ?*T a = null;
+    a = src;
+    free(src);
+    *T q = a orelse { return 2; };
+    return q.v;
+}

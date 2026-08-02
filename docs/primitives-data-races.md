@@ -2280,6 +2280,64 @@ reject with an optional boundary opt-out.
   (sweep 3, ~10 holes + Axis D). Inventory mirrored in `docs/limitations.md`
   "## OPEN — Concurrency memory-safety".
 
+### 24.5b The CARRIER form-coverage gap at the spawn-arg sink (CLOSED 2026-08-03, with a gate)
+
+An Axis-A instance, and a worked example of what "structural fix + its CI gate" in
+24.5 actually costs. Recorded because the shape recurs.
+
+**What was open.** Three arms of the spawn-ARGUMENT gate tested the BARE argument
+kind (`eff->kind == TYPE_HANDLE`, `is_ptr_like`, and a stack-derived carrier arm).
+Every WRAPPER that hides the inner kind therefore slipped all three:
+
+```
+spawn w(h)                          // bare Handle          -> REJECTED
+struct B{ Handle(T) h; } spawn w(b) // same handle, wrapped -> ACCEPTED
+```
+
+Measured non-vacuous before the fix: the emitted worker really ran
+`_zer_pool_get(..., b.h, 4)->v` while the parent ran `p.free(h)`. The same
+laundering worked for a heap `*T`, `?*T` and `[*]T`, at BOTH the fire-and-forget
+and scoped sinks — 13 hazard cells accepted.
+
+**Why it is an Axis-A (reachability) hole, not a new axis.** §7.2 bounds Share(P)
+— memory two contexts can reach — to `shared struct`, `*shared T`,
+globals-via-spawn-scanner, and threadlocal escape. A payload copied into the child
+inside a by-value struct is in NONE of those. So the sharing channel existed but
+the arg scan did not enumerate the form that creates it. The closure argument was
+intact; its implementation was not. This is exactly the doc's own "detectable is
+not detected" (§7.4).
+
+**The structural fix.** Two predicates — `type_carries_handle` and
+`type_carries_nonshared_pointer` — each recursing optional / array / struct /
+union and unwrapping distinct. The gate now asks a predicate rather than testing a
+kind, so bare / nested / optional / distinct / array / union carriers are ONE call
+instead of N hand-rolled arms, and a future carrier shape is covered without
+touching the gate. `type_carries_handle` is deliberately separate from
+`type_carries_data_pointer`: a Handle is an index, not a frame pointer, and folding
+them together would over-reject at escape sinks.
+
+The transfer sink needed the sibling fix — marking every COMPOUND handle rooted at
+the arg local, so a carried pointer propagates to the original through the alias
+group.
+
+**The gate.** `tests/test_conc_matrix.c` CARRIER GRID: carrier x payload x sink, C
+enums switched with no `default:` so a new carrier fails `-Werror=switch` until
+handled. **Verified to FIRE** — 13 false negatives against a from-HEAD build, 0
+after. A grid that has only ever passed is a script, not a net.
+
+**What it cost, for calibration against 24.5's "subsystem-scale" estimate:** two
+predicates, three gate arms, one transfer-sink arm, one grid. Small — because the
+axis's SHAPE was already known. 24.5's estimate is about the axes whose shape is
+still being discovered, not about a form gap in an axis already understood.
+
+**Dividend (§24.4, the dumb-user property).** The grid also surfaced a hole that is
+NOT concurrency at all: a pointer alias created by ASSIGNMENT (`a = src;`) was
+never registered, so `free(src); use(a)` had neither a compile-time rejection nor a
+runtime check. Only the var-decl-init form registered the alias. Fixed at
+`IR_ASSIGN`. Worth noting as evidence for the axis-crossed-grid method: a
+concurrency oracle found a single-threaded use-after-free, because the axis it
+crosses (carrier shape) is orthogonal to the domain it was written for.
+
 ### 24.6 Completeness — the four NECESSARY conditions, and how to PROVE it (Iris, not more sweeps)
 
 The four axes are NOT an empirical bucket-count — they are the negation of the four

@@ -65,6 +65,85 @@ static bool type_carries_data_pointer(Type *t, int depth) {
     }
     return false;
 }
+
+/* Does this type CARRY a Handle at any nesting depth?
+ *
+ * Sibling of type_carries_data_pointer, deliberately SEPARATE rather than an
+ * extension of it: a Handle is an INDEX (u64), not a pointer into a frame, so
+ * folding TYPE_HANDLE into the data-pointer predicate would over-reject at the
+ * escape sinks that legitimately ask "does this carry a reference into my
+ * stack frame?". Two questions, two predicates.
+ *
+ * Recurses optional / array / struct / union and unwraps distinct, so every
+ * member of the "wrapper hides the inner kind" family is covered by one call
+ * (CLAUDE.md, the class killed by tools/audit_carrier_dispatch.sh). */
+static bool type_carries_handle(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_HANDLE) return true;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_handle(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)
+        return type_carries_handle(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            if (type_carries_handle(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_handle(u->union_type.variants[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Does this type CARRY a pointer/slice/opaque whose pointee is NOT a shared
+ * struct? That is the exact hazard the bare fire-and-forget spawn rule tests
+ * ("non-shared pointer to spawn — data race"), lifted so it can be asked of a
+ * by-value struct/union that merely CARRIES such a pointer in a field.
+ *
+ * The shared exemption mirrors the bare-arg logic EXACTLY: only a POINTER whose
+ * pointee is a `shared struct` is exempt. A slice or opaque is a hazard
+ * regardless, because neither carries the auto-lock discipline. */
+static bool type_carries_nonshared_pointer(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_POINTER) {
+        Type *inner = type_unwrap_distinct(u->pointer.inner);
+        if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
+            return false;              /* pointer to shared struct — auto-locked */
+        return true;
+    }
+    if (k == TYPE_SLICE || k == TYPE_OPAQUE) return true;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_nonshared_pointer(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)
+        return type_carries_nonshared_pointer(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            if (type_carries_nonshared_pointer(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_nonshared_pointer(u->union_type.variants[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
 #include <math.h>
 
 /* ================================================================
@@ -14602,6 +14681,32 @@ static void check_stmt(Checker *c, Node *node) {
                     "copy the pointed-to data by value",
                     i + 1);
             }
+            /* 2026-08-03: §B #13 above only fires when the carried pointer is
+             * STACK-derived. A by-value struct carrying a HEAP pointer/slice
+             * (`struct B{*T t;} b.t = alloc(T); spawn w(b); free(t);`) is not
+             * stack-derived, so it fell through BOTH this and the is_ptr_like
+             * arm — the bare `*T` form is rejected as a data race but the
+             * wrapped form was accepted. Same hazard, same reasoning as the bare
+             * rule: the thread receives a copy of the pointer, so parent and
+             * child both hold it.
+             *
+             * Scoped spawns are exempt here exactly as they are for bare
+             * pointers (join bounds the lifetime); the free-before-join case is
+             * caught by the transfer marking instead. A pure-value struct, or
+             * one whose pointers all target `shared struct`s, is NOT rejected —
+             * the exemption mirrors the bare-arg logic. */
+            else if (!is_scoped &&
+                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+                     type_carries_nonshared_pointer(eff, 0)) {
+                checker_error(c, node->loc.line,
+                    "spawn argument %d: cannot pass a by-value struct/union that "
+                    "carries a non-shared pointer/slice to a fire-and-forget "
+                    "spawn — the thread gets a copy of the pointer, so parent and "
+                    "child both access the pointee (data race, and a "
+                    "use-after-free if the parent frees it). Use ThreadHandle + "
+                    "join, a shared struct, or copy the pointed-to data by value",
+                    i + 1);
+            }
             /* Handle args: ban — pool.get() not thread-safe.
              * Also reject ?Handle(T) — spawned thread can unwrap the optional
              * and have the same Handle, with the same non-thread-safe access. */
@@ -14618,6 +14723,25 @@ static void check_stmt(Checker *c, Node *node) {
                         "spawned thread can unwrap and use Handle (pool.get() not thread-safe)",
                         i + 1);
                 }
+            } else if (type_carries_handle(eff, 0)) {
+                /* 2026-08-03: the two arms above test the BARE argument kind, so
+                 * wrapping the SAME handle in a by-value struct slipped the gate
+                 * entirely — `struct B{Handle(T) h;} spawn w(b); p.free(h);`
+                 * compiled, and the emitted worker really ran
+                 * `_zer_pool_get(..., b.h, 4)->v` racing the parent's free.
+                 * Verified non-vacuous before the fix.
+                 *
+                 * This is the wrapper-hides-the-inner-kind family (the C7/D1
+                 * shape from the 2026-08-01 sweep) at a sink the carrier audit
+                 * did not cover. type_carries_handle recurses struct/union/
+                 * array/optional and unwraps distinct, so bare, nested, and every
+                 * future carrier shape are one call — not N hand-rolled arms. */
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass a value that CARRIES a Handle to "
+                    "spawn — the spawned thread gets a copy of the handle and "
+                    "pool.get() is not thread-safe. Pass the data by value, or "
+                    "use a shared struct",
+                    i + 1);
             }
         }
         /* BUG-491: type-check spawn args against function parameter types.

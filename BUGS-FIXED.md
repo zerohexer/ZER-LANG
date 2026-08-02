@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-03 — spawn race through a funcptr STRUCT FIELD (the last documented-open finding)
+
+**Symptom.** `spawn worker(ops)` where `worker(Ops o) { o.cb(); }` and `ops.cb` was bound to a racing
+function compiled CLEAN. The scan of `worker` finds nothing: it touches no global directly, and the
+callee `o.cb` is a FIELD rather than a global-function ident, so neither the direct-call descent nor
+`scan_funcname_binding` fires. The binding lives in the CALLER's context — `ops.cb = bump;` in the
+spawning function, or `install(&ops)` one level further out — which the target's scan never inspects.
+
+**The shape is narrow, and that mattered for the design.** Three nearby variants were ALREADY caught,
+so isolating this one required avoiding all three: passing the struct by POINTER (non-shared-pointer
+rule), reading the Ops struct from a GLOBAL (global-access scan), and making a DIRECT racing call
+(existing body scan). It fires only for a BY-VALUE struct whose target touches no global itself.
+
+**Fix — a two-sided gate at the spawn site, reusing existing machinery.** No new FuncSummary axis was
+needed after all (the sketch had assumed one):
+1. `body_calls_funcptr_field` — the target must transitively make a call whose callee is a FIELD.
+   Without this gate, any spawn in a function that binds a funcptr anywhere would be scanned.
+2. `scan_funcptr_field_bindings` — walk the ENCLOSING function for `X.f = <funcname>` and
+   `{ .f = <funcname> }` bindings, DESCENDING into called functions, and run the existing
+   `scan_unsafe_global_access` on each bound function.
+
+It collects BINDINGS ONLY, never global accesses — scanning the enclosing body wholesale would flag
+the spawning function's own `counter += 1`, which is not itself a race.
+
+**The cross-function variant drove the design.** A cheap fix (scan only the spawning function) catches
+`ops.cb = bump;` in `main` but misses `install(&ops)` — the more realistic pattern. Both reproducers
+are committed so the sibling stays visible: `spawn_funcptr_field_race.zer` and
+`..._crossfn.zer`, both promoted out of `tests/zer_gaps/`.
+
+**Manual-sync downgrade consults the BOUND function, not the target.** First cut checked
+`has_sync` on the spawn target, so a callback using `@barrier` still errored — the target itself does
+nothing but invoke. The binding walk now reports which function it bound, and the warning/error choice
+uses that symbol.
+
+**Over-rejection guarded** by `spawn_funcptr_field_safe_ok.zer`: a callback that touches no global, a
+callback touching only a THREADLOCAL, and a spawn whose target makes no funcptr-field call at all —
+all must compile. Swept 199 spawn positives; 7 apparent regressions were all verified IDENTICAL
+against a from-HEAD build (pre-existing negatives named `conc_reject_*` / `*_reject*`, not
+`reject_*` — the rust_tests naming trap recorded in CLAUDE.md).
+
+make check exit 0 — 9 matrix grids, conc-matrix 15/15, all audit gates, sink matrix clean.
+
+---
+
 ## 2026-08-02 — call-return alias linking + uN 128-bit literal signedness
 
 Two of the three findings that were DOCUMENTED but fixed on no branch. Designed here; no reference

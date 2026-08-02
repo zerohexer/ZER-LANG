@@ -1,0 +1,20 @@
+// Over-rejection guard for the funcptr-field spawn gate (2026-08-03). The gate
+// is conservative, so these four legitimate shapes must all keep compiling.
+struct Ops  { *(u32) -> u32 cb; }
+struct Ops2 { *() cb; }
+threadlocal u32 tls_ctr;
+
+u32 double_it(u32 x) { return x * 2; }      // touches no global
+void bump_tls() { tls_ctr += 1; }            // threadlocal — legal from a thread
+void unrelated() { }
+
+void w_safe(Ops o)  { u32 v = o.cb(21); if (v == 42) { } }
+void w_tls(Ops2 o)  { o.cb(); }
+void w_novalue(u32 x) { if (x == 0) { } }    // no funcptr-field call at all
+
+u32 main() {
+    Ops a;  a.cb = double_it;  spawn w_safe(a);      // callback is safe
+    Ops2 b; b.cb = bump_tls;   spawn w_tls(b);       // callback uses threadlocal
+    Ops2 c; c.cb = unrelated;  spawn w_novalue(1);   // target makes no field call
+    return 0;
+}

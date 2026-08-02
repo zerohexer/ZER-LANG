@@ -10404,6 +10404,158 @@ static bool scan_funcname_binding(Checker *c, Node *n,
     return found;
 }
 
+/* SPAWN funcptr-STRUCT-FIELD race (2026-08-03). Two helpers, used together as a
+ * two-sided gate at the spawn site.
+ *
+ * THE HOLE. `spawn worker(ops)` where `worker(Ops o) { o.cb(); }` and `ops.cb`
+ * was bound to a racing function. The scan of `worker` finds NOTHING: it touches
+ * no global directly, and the callee `o.cb` is a FIELD, not a global-function
+ * ident, so neither the direct-call descent nor scan_funcname_binding fires. The
+ * binding lives in the CALLER's context — `ops.cb = bump;` in the spawning
+ * function, or `install(&ops)` one level further out — which the target's scan
+ * never looks at.
+ *
+ * Three NEARBY shapes are already caught, so this gate must not duplicate them:
+ * passing the struct by POINTER (non-shared-pointer rule), reading the struct
+ * from a GLOBAL (global-access scan), and a DIRECT racing call (body scan). This
+ * fires only for a BY-VALUE struct whose target touches no global itself.
+ *
+ * If-chains, not switches: these are PARTIAL walks, so a no-default switch would
+ * be a false promise of exhaustiveness. An unlisted kind yields false = we do not
+ * flag = today's behaviour, never a new rejection. */
+static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
+    if (!n || depth > 8) return false;
+    if (n->kind == NODE_CALL) {
+        /* the tell: callee is a FIELD (`o.cb()`), not an ident */
+        if (n->call.callee && n->call.callee->kind == NODE_FIELD) return true;
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (body_calls_funcptr_field(c, n->call.args[i], depth)) return true;
+        /* descend into a directly-called global function */
+        if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
+            Symbol *fs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+                                      (uint32_t)n->call.callee->ident.name_len);
+            if (fs && fs->is_function && fs->func_node &&
+                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+                return body_calls_funcptr_field(c, fs->func_node->func_decl.body, depth + 1);
+        }
+        return false;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (body_calls_funcptr_field(c, n->block.stmts[i], depth)) return true;
+        return false;
+    }
+    if (n->kind == NODE_IF)
+        return body_calls_funcptr_field(c, n->if_stmt.cond, depth) ||
+               body_calls_funcptr_field(c, n->if_stmt.then_body, depth) ||
+               body_calls_funcptr_field(c, n->if_stmt.else_body, depth);
+    if (n->kind == NODE_FOR)
+        return body_calls_funcptr_field(c, n->for_stmt.init, depth) ||
+               body_calls_funcptr_field(c, n->for_stmt.cond, depth) ||
+               body_calls_funcptr_field(c, n->for_stmt.step, depth) ||
+               body_calls_funcptr_field(c, n->for_stmt.body, depth);
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE)
+        return body_calls_funcptr_field(c, n->while_stmt.cond, depth) ||
+               body_calls_funcptr_field(c, n->while_stmt.body, depth);
+    if (n->kind == NODE_SWITCH) {
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (body_calls_funcptr_field(c, n->switch_stmt.arms[i].body, depth)) return true;
+        return false;
+    }
+    if (n->kind == NODE_EXPR_STMT) return body_calls_funcptr_field(c, n->expr_stmt.expr, depth);
+    if (n->kind == NODE_VAR_DECL)  return body_calls_funcptr_field(c, n->var_decl.init, depth);
+    if (n->kind == NODE_ASSIGN)    return body_calls_funcptr_field(c, n->assign.value, depth);
+    if (n->kind == NODE_RETURN)    return body_calls_funcptr_field(c, n->ret.expr, depth);
+    if (n->kind == NODE_DEFER)     return body_calls_funcptr_field(c, n->defer.body, depth);
+    if (n->kind == NODE_CRITICAL)  return body_calls_funcptr_field(c, n->critical.body, depth);
+    if (n->kind == NODE_ONCE)      return body_calls_funcptr_field(c, n->once.body, depth);
+    return false;
+}
+
+/* Collect `X.field = <funcname>` / `{ .field = <funcname> }` bindings reachable
+ * from `n`, and scan each bound function for unsafe global access. Descends into
+ * directly-called global functions so a binding done in a helper
+ * (`install(&ops)`) is found — that variant is why a same-function-only fix
+ * would miss the realistic pattern.
+ *
+ * Collects BINDINGS ONLY, never global accesses: scanning the enclosing body
+ * wholesale would flag the spawning function's OWN global writes, which are not
+ * themselves a race. */
+static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
+                                        const char **out_name, uint32_t *out_len,
+                                        Symbol **out_fn) {
+    if (!n || depth > 8) return false;
+    if (n->kind == NODE_ASSIGN) {
+        if (n->assign.target && n->assign.target->kind == NODE_FIELD &&
+            scan_funcname_binding(c, n->assign.value, out_name, out_len)) {
+            /* record WHICH function was bound, so the caller can consult ITS
+             * props: an @atomic/@barrier in the CALLBACK is the manual-sync
+             * signal, not one in the spawn target. */
+            if (out_fn && n->assign.value && n->assign.value->kind == NODE_IDENT)
+                *out_fn = scope_lookup(c->global_scope, n->assign.value->ident.name,
+                                       (uint32_t)n->assign.value->ident.name_len);
+            return true;
+        }
+        return scan_funcptr_field_bindings(c, n->assign.value, depth, out_name, out_len, out_fn);
+    }
+    if (n->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (scan_funcname_binding(c, n->struct_init.fields[i].value, out_name, out_len)) {
+                Node *fv = n->struct_init.fields[i].value;
+                if (out_fn && fv && fv->kind == NODE_IDENT)
+                    *out_fn = scope_lookup(c->global_scope, fv->ident.name,
+                                           (uint32_t)fv->ident.name_len);
+                return true;
+            }
+        return false;
+    }
+    if (n->kind == NODE_CALL) {
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (scan_funcptr_field_bindings(c, n->call.args[i], depth, out_name, out_len, out_fn))
+                return true;
+        if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
+            Symbol *fs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+                                      (uint32_t)n->call.callee->ident.name_len);
+            if (fs && fs->is_function && fs->func_node &&
+                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+                return scan_funcptr_field_bindings(c, fs->func_node->func_decl.body,
+                                                   depth + 1, out_name, out_len, out_fn);
+        }
+        return false;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (scan_funcptr_field_bindings(c, n->block.stmts[i], depth, out_name, out_len, out_fn))
+                return true;
+        return false;
+    }
+    if (n->kind == NODE_IF)
+        return scan_funcptr_field_bindings(c, n->if_stmt.then_body, depth, out_name, out_len, out_fn) ||
+               scan_funcptr_field_bindings(c, n->if_stmt.else_body, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_FOR)
+        return scan_funcptr_field_bindings(c, n->for_stmt.init, depth, out_name, out_len, out_fn) ||
+               scan_funcptr_field_bindings(c, n->for_stmt.body, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE)
+        return scan_funcptr_field_bindings(c, n->while_stmt.body, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_SWITCH) {
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (scan_funcptr_field_bindings(c, n->switch_stmt.arms[i].body, depth,
+                                            out_name, out_len, out_fn)) return true;
+        return false;
+    }
+    if (n->kind == NODE_EXPR_STMT)
+        return scan_funcptr_field_bindings(c, n->expr_stmt.expr, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_VAR_DECL)
+        return scan_funcptr_field_bindings(c, n->var_decl.init, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_DEFER)
+        return scan_funcptr_field_bindings(c, n->defer.body, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_CRITICAL)
+        return scan_funcptr_field_bindings(c, n->critical.body, depth, out_name, out_len, out_fn);
+    if (n->kind == NODE_ONCE)
+        return scan_funcptr_field_bindings(c, n->once.body, depth, out_name, out_len, out_fn);
+    return false;
+}
+
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
  * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -14789,6 +14941,55 @@ static void check_stmt(Checker *c, Node *node) {
                         "Use shared struct, threadlocal, or @atomic_*",
                         (int)an->ident.name_len, an->ident.name,
                         (int)ablen, abad);
+                }
+            }
+        }
+        /* SPAWN funcptr-STRUCT-FIELD race (2026-08-03). Two-sided gate:
+         * (1) the target must actually CALL THROUGH a funcptr field — otherwise
+         *     there is no callback and we say nothing;
+         * (2) walk the ENCLOSING function for funcptr-field bindings and scan
+         *     each bound function, descending into helpers so a binding done in
+         *     `install(&ops)` is found.
+         *
+         * Both sides are required. Without (1) any spawn in a function that
+         * binds a funcptr anywhere would be scanned; without (2) the binding —
+         * which lives in the CALLER's context, not the target's — is invisible.
+         *
+         * Conservative in the sound direction: a funcptr bound but never
+         * actually placed in the field the target calls is scanned too, and the
+         * remediation is identical either way (shared / threadlocal /
+         * @atomic_*). */
+        if (func_sym && func_sym->func_node &&
+            func_sym->func_node->kind == NODE_FUNC_DECL &&
+            func_sym->func_node->func_decl.body &&
+            c->current_func_node &&
+            c->current_func_node->kind == NODE_FUNC_DECL &&
+            c->current_func_node->func_decl.body &&
+            body_calls_funcptr_field(c, func_sym->func_node->func_decl.body, 0)) {
+            const char *fpbad = NULL;
+            uint32_t fpblen = 0;
+            Symbol *fpfn = NULL;
+            if (scan_funcptr_field_bindings(c, c->current_func_node->func_decl.body,
+                                            0, &fpbad, &fpblen, &fpfn)) {
+                /* consult the BOUND function's props — an @atomic/@barrier in the
+                 * callback is the manual-sync signal; the spawn target itself may
+                 * do nothing but invoke it. */
+                Symbol *syncsym = fpfn ? fpfn : func_sym;
+                ensure_func_props(c, syncsym);
+                if (syncsym->props.has_sync) {
+                    checker_warning(c, node->loc.line,
+                        "spawn target '%.*s' calls through a function-pointer field "
+                        "whose bound function accesses non-shared global '%.*s' — "
+                        "potential data race (atomic/barrier present, verify ordering)",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        (int)fpblen, fpbad);
+                } else {
+                    checker_error(c, node->loc.line,
+                        "spawn target '%.*s' calls through a function-pointer field "
+                        "whose bound function accesses non-shared global '%.*s' — "
+                        "data race. Use shared struct, threadlocal, or @atomic_*",
+                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                        (int)fpblen, fpbad);
                 }
             }
         }

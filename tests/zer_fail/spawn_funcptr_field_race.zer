@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// FIXED 2026-08-03 (was tests/zer_gaps/): the spawn race scan could not see
+// through a funcptr STRUCT FIELD. `worker` touches no global directly — only
+// `o.cb()` — so the scan found nothing, yet the child reaches `counter` through
+// the callback while the parent writes it.
+//
+// Three NEARBY shapes were already caught, which is why isolating this needed a
+// BY-VALUE struct and a target that touches no global:
+//   * struct passed by POINTER      -> non-shared-pointer rule
+//   * Ops read from a GLOBAL        -> global-access scan
+//   * a DIRECT racing call          -> existing body scan
+// Fix: a two-sided gate at the spawn site — the target must CALL THROUGH a
+// funcptr field, and the ENCLOSING function is walked for funcptr-field bindings
+// (descending into helpers) with each bound function scanned.
+u32 counter;
+void bump() { counter += 1; }
+struct Ops { *() cb; }
+void worker(Ops o) { o.cb(); }
+u32 main() {
+    Ops ops;
+    ops.cb = bump;
+    spawn worker(ops);
+    counter += 1;
+    return counter;
+}

@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// FIXED 2026-08-03 — sibling of spawn_funcptr_field_race.zer with the binding in
+// a DIFFERENT function (`install`). This is the variant that ruled out the cheap
+// fix: scanning only the spawning function would catch the sibling and miss this
+// one, leaving the class open while looking covered. The binding walk therefore
+// descends into called functions.
+u32 counter;
+void bump() { counter += 1; }
+struct Ops { *() cb; }
+void install(*Ops o) { o.cb = bump; }
+void worker(Ops o) { o.cb(); }
+u32 main() {
+    Ops ops;
+    install(&ops);
+    spawn worker(ops);
+    counter += 1;
+    return counter;
+}

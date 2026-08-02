@@ -372,43 +372,6 @@ statements at `gi < di`. Swept all 17 existing positives combining goto+defer: 0
 banning VALID patterns. This shape currently MISCOMPILES — a silent lock underflow — so a compile
 error naming the workaround is strictly better than the status quo, not a feature removal.
 
-## OPEN — spawn race scan blind to a funcptr STRUCT-FIELD call (MEDIUM)
-
-**Symptom.** The spawn non-shared-global scan cannot see through a funcptr STRUCT FIELD, so a race
-reachable only via that indirection is missed.
-
-**The shape is NARROWER than first recorded (isolated 2026-08-02).** Two nearby shapes ARE already
-caught, and isolating this one required avoiding both:
-
-| Variant | Result |
-|---|---|
-| struct passed by POINTER to spawn | caught — the non-shared-pointer rule |
-| worker reads the Ops struct from a GLOBAL | caught — the global-access scan |
-| worker calls a DIRECT function that races | caught — the existing body scan |
-| **struct passed BY VALUE, worker touches no global directly** | **MISSED — this gap** |
-
-So it fires only when the callback struct passes by value AND the spawn target touches no
-non-shared global on its own. Reproducers: `tests/zer_gaps/gap_spawn_funcptr_struct_field.zer`
-(binding in the same function) and `..._crossfn.zer` (binding in `install()`).
-
-**Why it is not simply "fix the scan", and why NO PARTIAL fix was taken.** Following the binding in
-general requires whole-program reachability, BANNED from the architecture (CLAUDE.md
-"Whole-program analysis — BANNED"). Same boundary as §D8 (2026-08-01), which took the conservative
-descent only at the spawn site.
-
-A cheap partial IS available — scan the CURRENT function for `ops.cb = <funcname>` before the spawn —
-but it catches only the same-function binding and misses the cross-function `install(&ops)` variant,
-which is the more realistic pattern. That would leave the class open while LOOKING covered, which is
-the stale-gate failure this ledger exists to prevent. Both reproducers are therefore committed
-together, so the sibling is visible to whoever takes it.
-
-**Fix sketch (the real one).** A new FuncSummary axis: "stores function F into a funcptr field of
-param N", propagated at the call site — structurally the same shape as the `frees_param_field`
-summary added 2026-08-02. Then at a spawn whose target calls through a funcptr field of a param,
-scan the functions that summary says may be bound there. Stays inside the per-file + summaries model.
-
----
-
 ## OPEN — F2 durable fix: per-defer runtime "armed" flag (MEDIUM, over-rejection)
 
 **Symptom.** The `gi < di < li` shape (forward `goto` over a later `defer` to a label past it) is

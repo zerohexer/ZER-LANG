@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — CRITICAL: cross-function free of a param FIELD (rdh99l) — double-free / UAF closed
+
+**Symptom.** Pure ZER, compiles clean, glibc double-free abort at runtime:
+```zer
+struct B { u32 x; } struct H { [*]B buckets; }
+void fb(H h) { free(h.buckets); }        // frees a FIELD of a param
+u32 main() { H h; h.buckets = alloc(B,4) orelse {return 0;};
+             fb(h); free(h.buckets); return 0; }   // second free — accepted
+```
+Live for the by-value param (the documented `rdh99l`), the `*Struct` POINTER param
+(`destroy(*H h){ free(h.buckets); }` — the ubiquitous C destructor), the intra-function double
+`free(h.f); free(h.f)`, and the two-level wrapper `destroy2(*H h){ destroy(h); }`. The sibling UAF
+form (`destroy(&h); use(h.buckets[0])`) was "caught" only as a FALSE LEAK, which vanished the moment a
+caller-side free satisfied the leak check.
+
+**Root cause.** The `FuncSummary` free-of-param scan (`zercheck_ir.c`) inspected only the BARE param
+handle (`ir_find_handle`, `path_len==0`) under a POINTER/HANDLE/OPAQUE/SLICE type gate, so a callee
+freeing `param.field` recorded nothing. Deeper: the free handler's "register an untracked param free"
+(Phase E) was gated on `path_len==0`, so even WITHIN the callee `free(h.buckets)` created no handle —
+no FREED state existed to observe.
+
+**Fix (3 coordinated points).** (1) Free handler creates a FREED compound handle for a param-rooted
+FIELD free (`path_len>0`) at both the IR_CALL universal-free and IR_POOL_FREE sites — closes the
+intra-function case. (2) FuncSummary gains `frees_param_field` / `maybe_frees_param_field` (`zercheck.h`),
+built by a per-return-block scan for FREED compound handles rooted at each param (runs for every param
+kind, incl. by-value struct/union). (3) The call site widens the caller's tracked field handles rooted at
+the arg (unwrapping `&h`), with a `\x01` sentinel handle synthesized when the arg is the caller's own
+whole param so the fact propagates through a wrapper (transitive).
+
+**Also fixes an over-rejection:** the correct single-destructor pattern
+(`destroy(*H h){free(h.buckets);} ... destroy(&h);`) previously false-reported a leak; now clean.
+
+**Known bounded over-rejection (sound):** coarse — the callee's exact freed field set is not stored, so
+all of the arg's tracked fields are marked; a sibling field the callee did NOT free is falsely rejected
+if the caller frees it separately. Documented in limitations.md as a LOW precision follow-up.
+
+**Tests.** `tests/zer_fail/alloc_{byval,ptrparam}_field_double_free.zer`,
+`alloc_param_field_intra_double_free.zer`, `alloc_param_field_free_transitive.zer`; corrected
+`alloc_byval_field_slice_uaf.zer` (now rejects for the RIGHT reason); positives
+`tests/zer/destructor_field_free_ok.zer` + `destructor_field_free_transitive_ok.zer`.
+make check 1097/0, rust 784/0, zig 36/0, modules 139/0, sink matrix CLEAN.
+
+---
+
 ## 2026-08-02 — defer x goto ARMING matrix: the net for the durable §F2 fix (test infrastructure)
 
 Not a bug fix — the PRECONDITION recorded in §F2's OPEN entry ("do this behind a real goto x defer

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// rdh99l sibling: a callee frees a FIELD of a *Struct POINTER param; the
+// caller then frees the same field → cross-function double free.
+// Was accepted silently (FuncSummary tracked only bare-param frees).
+struct B { u32 x; }
+struct H { [*]B buckets; }
+void destroy(*H h) { free(h.buckets); }
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 0; };
+    destroy(&h);
+    free(h.buckets);
+    return 0;
+}

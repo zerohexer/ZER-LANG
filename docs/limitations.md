@@ -678,7 +678,35 @@ These are the audit findings the eleven branches recorded but did **not** fix. D
 of this file — items already tracked here (cross-block scoped-borrow, the `?T` optional-unwrap class-kill,
 `vrp_ir.c` dead code) are noted as cross-references rather than repeated.
 
-### CRITICAL ACCEPT-UNSAFE — cross-function free of a FIELD of a by-value struct/union param (`rdh99l` `9a40ead4`, 2026-07-26)
+### CRITICAL ACCEPT-UNSAFE — cross-function free of a FIELD of a struct/union/pointer param — **DONE 2026-08-02**
+**FIXED** (`rdh99l` `9a40ead4` root, closed properly this session). The by-value case AND the sibling
+`*Struct` POINTER-param case (`destroy(*H h){ free(h.buckets); }` — the ubiquitous C destructor), the
+intra-function double `free(h.f); free(h.f)`, and the TRANSITIVE two-level destructor
+(`destroy2(*H h){ destroy(h); }`) are all now rejected. Implementation (three coordinated points):
+1. **Free handler** (`zercheck_ir.c` IR_CALL universal-free ~4368 + IR_POOL_FREE ~2998): the Phase E
+   "create a handle for an untracked param free" path was gated on `path_len == 0` (bare param only), so
+   `free(h.buckets)` on an untracked param FIELD was a silent no-op. Extended to `path_len > 0` — it now
+   registers a FREED compound handle, which alone closes the intra-function param-field double free.
+2. **FuncSummary build** (~5625): a new per-return-block scan for FREED/MAYBE_FREED compound handles rooted
+   at each param sets the new `frees_param_field[i]` / `maybe_frees_param_field[i]` (`zercheck.h`) —
+   definite = every return path frees some field, runs for EVERY param kind (incl. by-value struct/union,
+   which the bare type gate skips).
+3. **Call-site consume** (~4817): a field-widening block marks the caller's tracked field handles rooted at
+   the arg (unwrapping `&h`) FREED/MAYBE_FREED; a `\x01` sentinel field handle is synthesized when the arg
+   is the caller's own whole param so a wrapper's summary picks up the fact (transitive chain).
+Regression tests: `tests/zer_fail/alloc_{byval,ptrparam}_field_double_free.zer`,
+`alloc_param_field_intra_double_free.zer`, `alloc_param_field_free_transitive.zer`, the corrected
+`alloc_byval_field_slice_uaf.zer` (now rejects for the RIGHT reason — UAF, not leak), and positives
+`tests/zer/destructor_field_free_ok.zer` / `destructor_field_free_transitive_ok.zer` (the latter also
+proves the former LEAK FALSE-POSITIVE is gone). make check 1097/0, sink matrix clean.
+**Known bounded over-rejection (NOT a soundness hole):** the widening is COARSE — the callee's exact freed
+field set is not stored, so ALL of the arg's tracked field handles are marked. A caller that frees a
+SIBLING field the callee did NOT free (`free_a(*H h){free(h.a);} ... free_a(&h); free(h.b);`) is falsely
+rejected as a double free. Sound (errs toward reject); rare (destructors free every member). Precision fix
+(store the freed paths per param) is a future accuracy upgrade, tracked as a LOW item below.
+
+<details><summary>Original report (retained for provenance)</summary>
+
 Pure ZER (no cinclude / `*opaque` / asm). Compiles clean; runtime glibc double-free abort or observable UAF.
 ```zer
 struct B { u32 x; } struct H { [*]B buckets; }
@@ -700,6 +728,15 @@ satisfies the leak check, the double-free/UAF passes silently. The 2026-07-15 tr
 **Fix sketch (attempted 2026-07-26, REVERTED — not a safe single-session change):** a coarse
 `bool *frees_param_field` on FuncSummary (definite/all-path field free of an aggregate param), detected by
 looking for a FREED compound handle rooted at the param local in every return block.
+</details>
+
+### LOW Over-rejection — coarse param-field-free widening marks sibling fields (introduced by the rdh99l fix, 2026-08-02)
+The rdh99l fix (above) does not store WHICH field a callee frees, so the call site marks ALL of the arg's
+tracked field handles freed. `free_a(*H h){ free(h.a); } ... free_a(&h); free(h.b);` falsely rejects
+`free(h.b)`. Sound (over-reject only); rare. **Fix:** store the definite freed field path(s) per param in
+the summary (arena/malloc-owned, freed in the same swap logic as the bool arrays) and widen only the
+matching caller handles. The callee already builds the exact compound handle (Phase E) — the build-side
+scan just needs to record its `path` instead of a bool.
 
 ### CRITICAL ACCEPT-UNSAFE — block-scoped `defer free/consume` UAF / use-after-move (`i0txin` `84097263`, 2026-07-30)
 A `defer free(p)` (or `defer consume(m)`) inside a NESTED block frees/moves at BLOCK EXIT (the intended ZER

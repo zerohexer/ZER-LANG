@@ -10989,10 +10989,30 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             int depth = base + di;
             bool guarded = (inst->defer_fire_guard_flag >= 0) &&
                            (depth < inst->defer_fire_guard_below);
+            /* F2 (2026-08-03): ARMED gate. A forward `goto` can jump OVER this
+             * defer's registration to a label past it; the compile-time defer
+             * stack still lists it as pending, so this fire ran a body whose
+             * registration never executed — `rel()` without `acq()`, a lock
+             * underflow, silent. The flag is set where the defer REGISTERS
+             * (ir_lower NODE_DEFER) and tested here, so it is right regardless
+             * of how control reached this fire.
+             *
+             * INDEPENDENT of `guarded`, and they nest rather than combine:
+             *   guarded  = "a goto already fired this eagerly, skip it"
+             *   armed    = "this registration never ran, skip it"
+             * Opposite polarities, both may apply to one fire. */
+            int armed_flag = inst->defer_fire_flags ? inst->defer_fire_flags[di] : -1;
             if (guarded) {
                 emit_indent(e);
                 emit(e, "if (!");
                 emit_local_name(e, func, inst->defer_fire_guard_flag);
+                emit(e, ") {\n");
+                e->indent++;
+            }
+            if (armed_flag >= 0) {
+                emit_indent(e);
+                emit(e, "if (");
+                emit_local_name(e, func, armed_flag);
                 emit(e, ") {\n");
                 e->indent++;
             }
@@ -11013,6 +11033,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "}\n");
             } else {
                 emit_defer_stmt(e, db, func);
+            }
+            if (armed_flag >= 0) {
+                e->indent--;
+                emit_indent(e);
+                emit(e, "}\n");
             }
             if (guarded) {
                 e->indent--;

@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-03 — F2 durable fix: per-defer runtime ARMED flag (a RELAXATION)
+
+The last open item from the branch survey, and the only RELAXATION in the whole sweep — the one
+change class where a bug ships a real defect rather than an over-rejection. Followed the documented
+accept-unsafe discipline (CLAUDE.md "Sound relaxation (reject->accept)").
+
+**History of this shape.** Silent miscompile (a forward `goto` over a defer's registration fired the
+body anyway — `rel()` without `acq()`, lock underflow, exit 255) -> sound interim REJECT (2026-08-02)
+-> now simply CORRECT.
+
+**LAYER DIAGNOSIS (rule 1).** Not a wrong theorem and not a C bug: the compile-time defer stack is a
+COARSE DOMAIN. It models "which defers are pending" statically, and on a goto path that jumped over a
+registration it says pending when the runtime truth is never-registered. It cannot represent
+"conditionally armed". The fix is a richer representation — add the missing runtime variable.
+
+**THE DESIGN CHOICE THAT REMOVED THE RISK.** The obvious plan is to emit the flag only for defers a
+`goto` provably skips, reusing the `gi < di < li` analysis. That was REJECTED: `find_goto_to_label`
+is a PARTIAL if-chain walk, so a missed carrier would mean no flag, an unconditional fire, and the
+ORIGINAL MISCOMPILE BACK — soundness would depend on a completeness property that cannot be proven.
+Instead the flag is emitted for EVERY defer in a function containing a LABEL. The flag is set where
+the registration executes and tested where the body fires, so it is correct regardless of how control
+reached the fire, and soundness is INDEPENDENT of the positional analysis (rule 2 — the gate is
+trivially complete rather than "complete if my walker enumerated every form").
+A label is the only way to desynchronise the static stack (structured break/continue/return keep it
+accurate), so a label-free function emits NO flag and pays nothing — verified: 0 armed-gate branches.
+
+**COMPOSITION.** The new flag and the existing `defer_fire_guard_flag` are independent conditions with
+OPPOSITE polarity, and they NEST rather than combine:
+  guarded = "a goto already fired this eagerly, skip it"; armed = "this registration never ran, skip it".
+
+**EMISSION, NOT THE FIXPOINT (rule 3).** The change lives in ir_lower + emitter, so the analyzer's
+convergence is untouched — materially lower risk than the Level B relaxation the discipline was
+written from.
+
+**INCREMENTAL WITH A NO-BEHAVIOR-CHANGE CHECKPOINT (rule 4).** Step 1 allocated the flag, set it at
+IR_DEFER_PUSH and snapshotted it into every fire, but did NOT read it — behaviour bit-identical, and
+`make check` GREEN there is what proved the defer_count / defer_fire_bodies / active_guard_below
+bookkeeping (repeatedly fixed, see the 2026-06-29 entries) was undisturbed. Only then did step 2 gate
+the fire, delete the interim reject, and flip the matrix.
+
+**THE ACCEPTANCE TEST PASSED WHOLESALE.** `tests/test_defer_goto_matrix.c` was BUILT against the
+interim reject (2026-08-02) precisely so this relaxation would have a net. Deleting
+`cell_currently_rejected()` flipped all 8 reject-expecting cells to assert runtime BALANCE, and all
+**34/34** pass — 0 miscompiles, 0 wrong balances. That the whole grid flipped at once, not just the
+reproducer, is the evidence the relaxation is correct across the axes (DeferPos x GotoKind x Nest).
+`cell_currently_rejected()` is kept as a documented no-op rather than deleted, so the grid's history
+stays legible.
+
+`tests/zer_fail/g1_goto_skips_defer.zer` moved to `tests/zer/goto_skips_defer_armed_ok.zer` — it is a
+POSITIVE now, checking the counter balances on BOTH the goto and fall-through paths.
+`defer_before_goto_ok.zer` (the boundary test written for the interim reject) still passes unchanged.
+
+make check exit 0 — ZER 1108/0, 9 matrix grids, 6/6 audit gates, sink matrix 54 clean.
+
+---
+
 ## 2026-08-03 — spawn race through a funcptr STRUCT FIELD (the last documented-open finding)
 
 **Symptom.** `spawn worker(ops)` where `worker(Ops o) { o.cb(); }` and `ops.cb` was bound to a racing

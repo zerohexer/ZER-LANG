@@ -175,6 +175,18 @@ typedef struct IRInst {
      * pop-only fires and non-fire ops (make_inst memsets). */
     Node **defer_fire_bodies;
     int    defer_fire_body_count;
+    /* F2 (2026-08-03): per-defer runtime ARMED flag local, parallel to
+     * defer_fire_bodies (-1 = no flag, fire unconditionally). A forward `goto`
+     * can jump OVER a defer's registration to a label past it; the compile-time
+     * defer stack still lists that defer as pending, so the fire ran a body
+     * whose registration never executed (lock underflow). The flag is set where
+     * the defer REGISTERS and tested where it FIRES, so it is correct regardless
+     * of how control reached the fire — soundness does not depend on the
+     * positional `gi < di < li` analysis being complete.
+     * Allocated only in functions that contain a LABEL: structured
+     * break/continue/return keep the static stack accurate, so an unstructured
+     * jump is the only way to desynchronise it. */
+    int   *defer_fire_flags;
     /* IR_DEFER_FIRE guard (plt86m defer-goto, both-reachable cleanup label):
      * snapshot bodies whose ORIGINAL defer depth < defer_fire_guard_below are
      * emitted as `if (!<flag local>) { body }` — the goto sets the flag, so the

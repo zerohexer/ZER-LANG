@@ -126,11 +126,14 @@ static int cell_valid(DeferPos d, GotoKind g, Nest n) {
     return 1;
 }
 
-/* The §F2 interim reject fires on the STATIC shape (goto -> defer -> label),
- * regardless of whether the goto is taken at runtime. Delete this function when
- * the durable armed-flag fix lands; the grid then asserts the value everywhere. */
+/* 2026-08-03: the durable armed-flag fix LANDED, so no cell expects a rejection
+ * any more — every one asserts a runtime BALANCE. This function is kept as a
+ * deliberate no-op rather than deleted: it documents that the grid was BUILT
+ * against the interim reject and flipped wholesale, which is the evidence the
+ * relaxation is correct across all 34 cells and not just the reproducer. */
 static int cell_currently_rejected(DeferPos d, GotoKind g) {
-    return d == DP_BETWEEN && g != GK_NONE;
+    (void)d; (void)g;
+    return 0;
 }
 
 /* Correct final balance. Identical for every defer position — that IS the
@@ -264,7 +267,8 @@ int main(void) {
     fprintf(stderr, "\n=== defer x goto ARMING matrix ===\n");
     fprintf(stderr, "    invariant: a defer body runs exactly once per EXECUTED\n");
     fprintf(stderr, "    registration, and never when its registration did not run.\n");
-    fprintf(stderr, "    measured as acquire/release BALANCE, not placement.\n\n");
+    fprintf(stderr, "    measured as acquire/release BALANCE, not placement.\n");
+    fprintf(stderr, "    (2026-08-03: armed-flag fix landed — ALL cells assert values.)\n\n");
 
     char buf[2048];
     int grid_ok = 1, valid_cells = 0;

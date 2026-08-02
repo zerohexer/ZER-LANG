@@ -75,6 +75,10 @@ typedef struct {
     Node *defer_bodies_inline[32];
     Node **defer_bodies;
     int defer_bodies_cap;
+    /* F2 (2026-08-03): armed-flag local per pending defer, parallel to
+     * defer_bodies (-1 = none). See ir.h defer_fire_flags. */
+    int defer_flags_inline[32];
+    int *defer_flags;
     /* Active runtime defer-fire guard (plt86m defer-goto, both-reachable cleanup
      * label). After such a label, subsequent fires of the goto-fired defers
      * (original depth < active_guard_below) emit `if (!flag) {...}` so the goto
@@ -143,6 +147,7 @@ static IRInst make_inst(IROpKind op, int line) {
     inst.obj_local = -1;
     inst.handle_local = -1;
     inst.defer_fire_guard_flag = -1;  /* no guard by default */
+    inst.defer_fire_flags = NULL;     /* F2: no armed flags by default */
     inst.source_line = line;
     return inst;
 }
@@ -1048,8 +1053,11 @@ static void ir_snapshot_defer_bodies(LowerCtx *ctx, IRInst *fire, int base) {
     int n = ctx->defer_count - base;
     if (n <= 0) return;
     fire->defer_fire_bodies = (Node **)arena_alloc(ctx->arena, (size_t)n * sizeof(Node *));
-    for (int i = 0; i < n; i++)
+    fire->defer_fire_flags = (int *)arena_alloc(ctx->arena, (size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) {
         fire->defer_fire_bodies[i] = ctx->defer_bodies[base + i];
+        fire->defer_fire_flags[i] = ctx->defer_flags[base + i];   /* F2 */
+    }
     fire->defer_fire_body_count = n;
     /* Attach the active both-reachable-cleanup-label guard: bodies whose
      * ORIGINAL depth (base+i) is < active_guard_below were fired eagerly by a
@@ -3643,9 +3651,36 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             Node **nb = (Node **)arena_alloc(ctx->arena, (size_t)nc * sizeof(Node *));
             memcpy(nb, ctx->defer_bodies, (size_t)ctx->defer_count * sizeof(Node *));
             ctx->defer_bodies = nb;
+            int *nf = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
+            memcpy(nf, ctx->defer_flags, (size_t)ctx->defer_count * sizeof(int));
+            ctx->defer_flags = nf;
             ctx->defer_bodies_cap = nc;
         }
         ctx->defer_bodies[ctx->defer_count] = node->defer.body;
+        /* F2 (2026-08-03): allocate + SET an armed flag for this defer, but only
+         * in a function that contains a LABEL. A label is the only way control
+         * can reach a fire point with the compile-time defer stack out of sync
+         * (structured break/continue/return keep it accurate), so a label-free
+         * function pays nothing at all.
+         *
+         * Emitting it for EVERY defer in such a function — rather than only for
+         * those a `goto` provably skips — is deliberate: it makes soundness
+         * independent of the partial `find_goto_to_label` walk. If that walk
+         * missed a carrier, a position-gated flag would be absent and the
+         * unarmed body would fire again; this way the flag is set where the
+         * registration runs and tested where the body fires, which is correct
+         * regardless of how control got there. */
+        int armed = -1;
+        if (ctx->label_count > 0) {
+            armed = create_temp(ctx, ty_bool, node->loc.line);
+            IRInst set = make_inst(IR_LITERAL, node->loc.line);
+            set.dest_local = armed;
+            set.literal_int = 1;
+            set.literal_kind = 0;
+            emit_3ac(ctx, set);
+        }
+        if (ctx->defer_count < ctx->defer_bodies_cap)
+            ctx->defer_flags[ctx->defer_count] = armed;
         ctx->defer_count++;
         break;
     }
@@ -3802,6 +3837,7 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
+    ctx.defer_flags = ctx.defer_flags_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
@@ -3914,6 +3950,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
+    ctx.defer_flags = ctx.defer_flags_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;

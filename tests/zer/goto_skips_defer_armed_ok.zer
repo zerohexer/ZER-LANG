@@ -1,0 +1,31 @@
+// F2 durable fix (2026-08-03): a forward `goto` that jumps OVER a defer's
+// registration to a label past it now COMPILES and behaves correctly. It used to
+// be a silent miscompile (`rel()` fired though `acq()` never ran — a lock
+// underflow, exit 255), then a sound interim REJECT, and now a per-defer runtime
+// ARMED flag makes it simply correct.
+//
+// This file was tests/zer_fail/g1_goto_skips_defer.zer. It is a POSITIVE now:
+// on the goto path neither acq() nor rel() runs, so the counter stays balanced.
+// The flag is emitted only in functions containing a LABEL, so a label-free
+// function pays nothing.
+i32 lock_count;
+void acq() { lock_count += 1; }
+void rel() { lock_count -= 1; }
+
+void f(u32 err) {
+    if (err == 1) { goto done; }
+    acq();
+    defer rel();          // registration SKIPPED on the goto path
+    lock_count += 100;
+done:
+    return;
+}
+
+u32 main() {
+    lock_count = 0;
+    f(1);                          // goto taken: defer never armed -> must not fire
+    if (lock_count != 0) { return 1; }
+    f(0);                          // fall-through: armed, acq+rel balance, +100 stays
+    if (lock_count != 100) { return 2; }
+    return 0;
+}

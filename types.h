@@ -241,11 +241,19 @@ struct Symbol {
      * on the borrowed local at the spawn and cleared at the join;
      * `th_borrows_name` records, on the ThreadHandle symbol, which local it
      * borrowed so join can clear it. Linear (statement-order) approximation —
-     * sound for the straight-line spawn→write→join pattern; conservative for
-     * branches. */
+     * sound for the straight-line spawn→write→join pattern. It was NOT
+     * "conservative for branches" as this comment previously claimed: it was
+     * UNSOUND, because a `join()` inside a branch cleared the borrow for code
+     * after the branch, on paths that never joined. `th_spawn_branch_depth`
+     * below is the guard that makes the branch case genuinely conservative. */
     bool is_borrowed_by_thread;
     const char *th_borrows_name;
     uint32_t th_borrows_name_len;
+    /* 2026-08-03: Checker.branch_depth at the SPAWN. A join is only allowed to
+     * release the borrow when it is no deeper in runtime-conditional nesting
+     * than the spawn was — otherwise the join is path-conditional and the
+     * borrow must survive the branch. */
+    int th_spawn_branch_depth;
     /* D7 (2026-08-01): a scoped spawn may borrow SEVERAL locals
      * (`spawn w(&a, &b)`). Recording only the first (th_borrows_name above)
      * left every later borrow un-tracked AND un-cleared at join — a race on

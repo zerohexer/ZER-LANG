@@ -2269,9 +2269,18 @@ reject with an optional boundary opt-out.
   indirect dispatch beyond the file — "safe" there = reject-the-unprovable (100%
   memory-safe, flexibility cost).
 - **Status:** spec NOT frozen (Axis D appeared in sweep 3; still-unprobed residue
-  remains — FFI callback tables, other emitter-runtime globals, a systematic
-  "merged vs first_live-only" audit of every `IRPathState` field, cross-module
-  spawn/extern interaction, NODE_STRUCT_INIT global read in a spawn body). Each
+  remains — **emitter-runtime globals** (compiler-generated globals such as the
+  auto-slab, which are ZER-domain because the EMITTER created the sharing), a
+  systematic "merged vs first_live-only" audit of every `IRPathState` field,
+  cross-module spawn/extern interaction between ZER modules, and NODE_STRUCT_INIT
+  global read in a spawn body).
+  **SCOPE CORRECTION 2026-08-03:** this list previously also named "FFI callback
+  tables". That is a FLOOR, not residue, and listing it here contradicted this
+  document's own scoping — §7.4 / §13.1 / §13.5 all state the closure claim only
+  for "pure ZER (no cinclude)", and a C library calling back on a C-created thread
+  requires cinclude by construction (it is D1, which CLAUDE.md already records as
+  "a named FLOOR, not a hole"). Counting a floor as unfinished work overstates the
+  remaining scope. The four items above are ZER-domain and genuinely in scope. Each
   axis's general SHAPE is known with a single structural fix, but individual sites
   still scatter until each structural fix + its CI gate lands. **This is subsystem-
   scale work (comparable to `keep` or the IR migration), not patches.**

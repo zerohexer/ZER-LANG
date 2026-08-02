@@ -5909,6 +5909,28 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* D7: release EVERY borrow this handle took, not just
                          * the first — otherwise a second borrowed local stayed
                          * flagged forever and later legitimate use over-rejected. */
+                        /* 2026-08-03 (cross-block race): release ONLY when this
+                         * join is no deeper in runtime-conditional nesting than
+                         * the spawn. A join inside a branch runs on SOME paths
+                         * only, so clearing the borrow let code after the branch
+                         * race the still-running thread:
+                         *
+                         *   ThreadHandle th = spawn worker(&work);
+                         *   if (c) { th.join(); return 0; }  // cleared it here
+                         *   work.x = 2;                      // path B: RACE
+                         *
+                         * Verified accept-unsafe before this guard — the store
+                         * preceded pthread_join in the emitted C. Keeping the
+                         * borrow is the conservative direction: a join on EVERY
+                         * arm is now over-rejected (safe, and the user can hoist
+                         * the join out of the branch), while no racing path is
+                         * ever accepted. The leak check still sees this as a
+                         * join, so "ThreadHandle not joined" does not regress. */
+                        if (c->branch_depth > osym2->th_spawn_branch_depth) {
+                            result = ty_void;
+                            typemap_set(c, field_node, result);
+                            break;
+                        }
                         for (int bi = 0; bi < osym2->th_borrow_count; bi++) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrow_names[bi],
@@ -10970,6 +10992,22 @@ static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
     return arg_is_local_derived(c, arg, 0);
 }
 
+/* Walk a RUNTIME-conditional body (if/else arm, loop body, switch arm) with
+ * Checker.branch_depth raised. The scoped-borrow tracker is a linear
+ * statement-order approximation; without this a `th.join()` nested in a branch
+ * released the borrow for code AFTER the branch, on paths that never joined —
+ * the cross-block scoped-borrow race (accept-unsafe, tests/zer_gaps).
+ *
+ * Use this for every body whose execution is conditional at RUNTIME. Do NOT use
+ * it for a comptime-if body: only the taken branch is checked and the other is
+ * stripped, so a join there is unconditional. */
+static void check_stmt_cond_body(Checker *c, Node *body) {
+    if (!body) return;
+    c->branch_depth++;
+    check_stmt(c, body);
+    c->branch_depth--;
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
@@ -11902,7 +11940,7 @@ static void check_stmt(Checker *c, Node *node) {
                 int cap_saved = c->var_range_count;
                 struct VarRange *cap_pre = vrp_snap_take(c, cap_saved);
 
-                check_stmt(c, node->if_stmt.then_body);
+                check_stmt_cond_body(c, node->if_stmt.then_body);
                 pop_scope(c);
 
                 c->var_range_count = cap_saved;
@@ -11910,7 +11948,7 @@ static void check_stmt(Checker *c, Node *node) {
                 vrp_snap_restore(c, cap_pre, cap_saved); /* reset for else */
 
                 if (node->if_stmt.else_body) {
-                    check_stmt(c, node->if_stmt.else_body);
+                    check_stmt_cond_body(c, node->if_stmt.else_body);
                     c->var_range_count = cap_saved;
                 }
                 vrp_snap_join(c, cap_thenv, cap_saved);
@@ -12068,7 +12106,7 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
 
-                check_stmt(c, node->if_stmt.then_body);
+                check_stmt_cond_body(c, node->if_stmt.then_body);
                 c->var_range_count = saved_range_count; /* restore */
                 /* Finding A: capture the then-body's in-place range mutations,
                  * then reset pre-existing entries to their pre-branch values so
@@ -12149,7 +12187,7 @@ static void check_stmt(Checker *c, Node *node) {
                      * own pushes are dropped. In-place mutations by the else body
                      * are still handled by the JOIN below (Finding A). */
                     int cmp_after_guard = c->var_range_count;
-                    check_stmt(c, node->if_stmt.else_body);
+                    check_stmt_cond_body(c, node->if_stmt.else_body);
                     c->var_range_count = cmp_after_guard;
                 }
                 /* Finding A: entries now hold the else-result (or the restored
@@ -12174,12 +12212,12 @@ static void check_stmt(Checker *c, Node *node) {
                  * merged range over-approximates every path. */
                 int local_saved = c->var_range_count;
                 struct VarRange *pre = vrp_snap_take(c, local_saved);
-                check_stmt(c, node->if_stmt.then_body);
+                check_stmt_cond_body(c, node->if_stmt.then_body);
                 c->var_range_count = local_saved;
                 struct VarRange *thenv = vrp_snap_take(c, local_saved);
                 vrp_snap_restore(c, pre, local_saved);  /* reset for else / fallthrough */
                 if (node->if_stmt.else_body) {
-                    check_stmt(c, node->if_stmt.else_body);
+                    check_stmt_cond_body(c, node->if_stmt.else_body);
                     c->var_range_count = local_saved;
                 }
                 /* entries hold else-result (or pre on fallthrough); union with then */
@@ -12296,7 +12334,7 @@ static void check_stmt(Checker *c, Node *node) {
          * already widened every var the body writes. */
         int b1_saved = c->var_range_count;
         struct VarRange *b1_pre = vrp_snap_take(c, b1_saved);
-        check_stmt(c, node->for_stmt.body);
+        check_stmt_cond_body(c, node->for_stmt.body);
         c->var_range_count = b1_saved;
         vrp_snap_restore(c, b1_pre, b1_saved);
         free(b1_pre);
@@ -12369,7 +12407,7 @@ static void check_stmt(Checker *c, Node *node) {
          * Restore the post-pre-pass VALUES. */
         int b1w_saved = c->var_range_count;
         struct VarRange *b1w_pre = vrp_snap_take(c, b1w_saved);
-        check_stmt(c, node->while_stmt.body);
+        check_stmt_cond_body(c, node->while_stmt.body);
         c->var_range_count = b1w_saved;
         vrp_snap_restore(c, b1w_pre, b1w_saved);
         free(b1w_pre);
@@ -12656,7 +12694,7 @@ static void check_stmt(Checker *c, Node *node) {
                         c->union_switch_key_len = 0;
                     }
                 }
-                check_stmt(c, arm->body);
+                check_stmt_cond_body(c, arm->body);
                 c->union_switch_var = saved_union_var;
                 c->union_switch_var_len = saved_union_var_len;
                 c->union_switch_key = saved_union_key;
@@ -12664,7 +12702,7 @@ static void check_stmt(Checker *c, Node *node) {
                 c->union_switch_type = saved_union_type;
                 pop_scope(c);
             } else {
-                check_stmt(c, arm->body);
+                check_stmt_cond_body(c, arm->body);
             }
             /* drop arm-local ranges, then union this arm's outcome into the
              * accumulator (acc = acc ⊔ this-arm; sw_acc holds the union so far). */
@@ -14987,6 +15025,7 @@ static void check_stmt(Checker *c, Node *node) {
                         sym->th_borrow_count++;
                     }
                     if (!sym->th_borrows_name) {
+                        sym->th_spawn_branch_depth = c->branch_depth;
                         sym->th_borrows_name = vn;
                         sym->th_borrows_name_len = vl;
                     }

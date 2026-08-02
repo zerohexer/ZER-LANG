@@ -1,0 +1,26 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// Promoted from tests/zer_gaps/ on 2026-08-03 — the CROSS-BLOCK scoped-borrow
+// race, open since the 2026-06-20 concurrency audit.
+//
+// A local lent to a scoped spawn via `&x` is exclusively borrowed until join().
+// The tracker is a linear statement-order approximation, and a `th.join()`
+// nested in a BRANCH cleared the borrow for code after the branch — on paths
+// that never joined. Path B below writes `work.x` while the worker is still
+// running; the store preceded pthread_join in the emitted C.
+//
+// Fixed by Checker.branch_depth + Symbol.th_spawn_branch_depth: a join only
+// releases the borrow when it is no deeper in runtime-conditional nesting than
+// the spawn was. NOT the "borrow-set merge in zercheck_ir.c" the original gap
+// note proposed — the borrow lives in checker.c, not the IR analyzer.
+struct W { u32 x; }
+void worker(*W w) { for (u32 i = 0; i < 200000; i += 1) { w.x += 1; } }
+u32 run(u32 flag_in) {
+    W work; work.x = 0;
+    ThreadHandle th = spawn worker(&work);
+    if (flag_in == 99) { th.join(); return 0; }   // path A: joined, exits
+    work.x = 2;                                    // path B: thread STILL RUNNING
+    th.join();
+    return work.x;
+}
+u32 main() { return run(1); }

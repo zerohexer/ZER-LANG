@@ -390,6 +390,41 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — scoped-borrow: a join on EVERY branch arm is over-rejected (LOW, precision)
+
+**Symptom.** Joining on every arm of a branch and then using the borrowed local is
+safe in reality, but rejected:
+
+```zer
+ThreadHandle th = spawn worker(&work);
+if (f == 3) { th.join(); } else { th.join(); }
+return work.x;              // rejected: "borrowed by a scoped spawn"
+```
+
+**Cause — deliberate.** The 2026-08-03 cross-block fix guards borrow release on
+`Checker.branch_depth <= Symbol.th_spawn_branch_depth`. A join nested deeper than
+the spawn is path-conditional, so the borrow survives the branch. That is what
+closes the accept-unsafe race; the price is that an all-arms join is not
+recognised as unconditional.
+
+**Workaround (one line).** Hoist the join out of the branch — `if (f == 3) { ... }
+th.join();`. The compiler error names the borrow, and this is the idiomatic shape
+anyway.
+
+**Why it was not fixed at the same time.** Recognising "joined on every arm"
+requires all-paths analysis of the branch, i.e. the borrow set must become a
+per-block lattice with a JOIN at merges (the shape CLAUDE.md's VRP-JOIN row
+describes). That is a real refinement, and it is a RELAXATION — the change class
+where a bug ships a race rather than an over-rejection. It should follow the
+documented accept-unsafe discipline: build the exhaustive branch x join-position
+grid FIRST, verify it fires against the pre-fix build, then relax. The
+over-rejection is safe to live with meanwhile.
+
+**Tripwire.** `tests/zer/scoped_borrow_branch_shapes.zer` pins the four shapes
+that must keep compiling, so the guard cannot broaden unnoticed.
+
+---
+
 ## OPEN — findings carried forward from the 2026-07-21→31 branch wave (documented, NOT fixed on any branch)
 
 These are the audit findings the eleven branches recorded but did **not** fix. Deduped against the rest
@@ -529,11 +564,17 @@ Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to
 `reg[hi..lo]` on a volatile scalar pointer auto-deref for bit-extraction.
 
 ### Cross-references (already tracked elsewhere in this file — do NOT duplicate)
-- **HOLE-C / cross-block scoped-borrow, join-in-branch** (`rvek5f` `00f3c2af`) — already the single open item
-  in "OPEN — Concurrency memory-safety" below. rvek5f adds a SHARP trigger worth appending there:
-  `th.join()` inside a branch clears the per-Symbol `is_borrowed_by_thread` flag in AST-walk order, so an
-  unguarded access on the OTHER (un-joined) path is not flagged. Same-block / nested-if / loop-body /
-  switch-arm / goto variants are all correctly caught. Proper fix remains a zercheck_ir borrow-set CFG merge.
+- **HOLE-C / cross-block scoped-borrow, join-in-branch** (`rvek5f` `00f3c2af`) — **FIXED 2026-08-03.**
+  rvek5f's trigger was exact: `th.join()` inside a branch cleared the per-Symbol `is_borrowed_by_thread`
+  flag in AST-walk order, so an unguarded access on the OTHER (un-joined) path was not flagged.
+  **Its proposed fix location was wrong** — the borrow lives in `checker.c` as a linear statement-order
+  approximation, NOT in the IR analyzer, so a "zercheck_ir borrow-set CFG merge" would have edited a
+  subsystem that never held the state. The actual fix is `Checker.branch_depth` +
+  `Symbol.th_spawn_branch_depth`: a join releases the borrow only when it is no deeper in
+  runtime-conditional nesting than the spawn. Regression test
+  `tests/zer_fail/scoped_borrow_crossblock_early_return.zer` (verified to COMPILE pre-fix); boundary
+  positives in `tests/zer/scoped_borrow_branch_shapes.zer`. The residual precision cost (a join on EVERY
+  arm is now over-rejected) is its own OPEN entry above.
 - **`?T` optional-wrapper class-kill — BUILT 2026-08-01.** Was the OPEN "optional-unwrap" class-kill.
   Closed as ONE gate for the whole wrapper family, not a `?T`-specific one: the wrapper set that hides
   an inner kind is FINITE (`?T`, `distinct T`, array-of, by-value struct/union CARRYING a pointer) and
@@ -1677,9 +1718,10 @@ from this ledger after the parallel workflow rate-limited).
 **Data-race (HIGH concurrency):** shared-struct multi-access hidden in a cast/intrinsic/
 index/orelse SUBEXPRESSION evades the same-statement deadlock/lock check (#7, ~1881); the
 `spawn` data-race scan is blind to function-pointer indirection (#8, ~1925); shared access
-in an `await` CONDITION is not locked (D02 false-negative, #9, ~1963); the one remaining
-**cross-block scoped-borrow** hole (spawn + access in different CFG blocks — needs a
-zercheck_ir borrow-set merge; concurrency entry ~2303).
+in an `await` CONDITION is not locked (D02 false-negative, #9, ~1963). The **cross-block
+scoped-borrow** hole (spawn + access in different CFG blocks) is **FIXED 2026-08-03** via
+`Checker.branch_depth` / `Symbol.th_spawn_branch_depth` — not the zercheck_ir borrow-set
+merge previously sketched here, which named the wrong subsystem.
 
 **Miscompile (MEDIUM — unsound OUTPUT, not a UAF):** value-returning `async` never finalizes
 its state machine (#10, ~2001); bit-query/byte-swap intrinsics emit `0` in global

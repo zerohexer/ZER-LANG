@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03c — cross-block scoped-borrow race (open since the 2026-06-20 audit)
+
+A local lent to a scoped spawn via `&x` is exclusively borrowed until `join()`.
+Same-block access was caught; a join nested in a BRANCH was not.
+
+```zer
+ThreadHandle th = spawn worker(&work);
+if (f == 99) { th.join(); return 0; }   // cleared the borrow HERE
+work.x = 2;                             // path B: thread STILL RUNNING -> RACE
+th.join();
+```
+
+Verified accept-unsafe: the store preceded `pthread_join` in the emitted C.
+
+**The long-standing fix sketch named the wrong subsystem.** Both CLAUDE.md and
+limitations.md proposed "a zercheck_ir borrow-set CFG merge, subsystem-scale". The
+borrow is not IR state — it is `Symbol.is_borrowed_by_thread`, a linear
+statement-order approximation in `checker.c` (types.h documented it as such). An IR
+merge would have edited a component that never held the flag. Reading the code
+before implementing is what caught this; the note had been carried forward
+unexamined across several sessions.
+
+**Actual defect + fix.** `join()` cleared the borrow unconditionally, regardless of
+whether the join was path-conditional. Added `Checker.branch_depth` (raised by a new
+`check_stmt_cond_body` helper at all 10 runtime-conditional body walks — if/else
+arms, loop bodies, switch arms; comptime-if bodies deliberately excluded since only
+the taken branch is checked) and `Symbol.th_spawn_branch_depth` (recorded at the
+spawn). A join releases the borrow only when `branch_depth <= th_spawn_branch_depth`.
+~40 lines, not subsystem-scale.
+
+Also corrected the stale types.h comment claiming the approximation was
+"conservative for branches" — it was UNSOUND for branches, which is the bug.
+
+**Residual, recorded as its own OPEN entry:** a join on EVERY arm is now
+over-rejected (safe direction; one-line workaround = hoist the join out of the
+branch). Recognising all-arms joins needs a per-block borrow lattice with a JOIN at
+merges — a RELAXATION, so it should follow the accept-unsafe discipline (build the
+grid first, verify it fires, then relax).
+
+The leak check is unaffected: a join in a branch still counts as a join, so
+"ThreadHandle not joined" does not regress.
+
+Tests: `tests/zer_fail/scoped_borrow_crossblock_early_return.zer` (promoted from
+`tests/zer_gaps/`, verified to COMPILE on a pre-fix build) and
+`tests/zer/scoped_borrow_branch_shapes.zer` pinning the four shapes that must keep
+compiling — straight-line, spawn+join at equal depth in a branch, same in a loop
+body, and a branch between spawn and join that does not touch the borrow.
+
+**Scope correction to `docs/primitives-data-races.md` §24.5** (same session): its
+residue list named "FFI callback tables" alongside genuinely in-scope items. That is
+the D1 cinclude floor — §7.4 / §13.1 / §13.5 all scope the closure claim to "pure
+ZER (no cinclude)" — so counting it as unfinished work overstated the remaining
+scope. The other four items are ZER-domain and remain in scope.
+
 ## Session 2026-08-03b — concurrency carrier holes + an assignment-alias UAF
 
 Goal: make ZER-to-ZER concurrency (single- and multi-threaded) statically safe.

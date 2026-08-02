@@ -50,6 +50,14 @@ typedef struct {
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int defer_depth;        /* > 0 when inside a defer block */
     int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */
+    /* 2026-08-03: > 0 when inside a RUNTIME-conditional body (if/else arm, loop
+     * body, switch arm). The scoped-borrow tracker is a linear statement-order
+     * approximation, so a `th.join()` nested in a branch must NOT release the
+     * borrow for code AFTER that branch — the other path never joined. Compared
+     * against Symbol.th_spawn_branch_depth at the join. Comptime-if bodies do
+     * NOT increment it: only the taken branch is checked and the other is
+     * stripped, so a join there is unconditional. */
+    int branch_depth;
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */

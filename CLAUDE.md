@@ -1042,10 +1042,21 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > `type_carries_nonshared_pointer`) + a compound-rooted transfer marking, and
 > gated by the CARRIER GRID in `tests/test_conc_matrix.c` (verified to fire: 13
 > false negatives pre-fix, 0 after). See primitives-data-races.md §24.5b.
-> **STILL OPEN (one item, do NOT claim ZER is
-> fully data-race-safe yet):** the scoped-borrow **CROSS-BLOCK** case (spawn and
-> access in different CFG blocks — same-block read+write are covered; the proper fix
-> is a zercheck_ir borrow-set merge like the `threads[]` merge, subsystem-scale).
+> **CLOSED 2026-08-03 — the scoped-borrow CROSS-BLOCK case** (spawn and access in
+> different CFG blocks). The long-standing sketch ("a zercheck_ir borrow-set merge
+> like the `threads[]` merge, subsystem-scale") named the WRONG SUBSYSTEM: the
+> borrow is a linear statement-order approximation in `checker.c`
+> (`Symbol.is_borrowed_by_thread`), not IR state, so an IR merge would have edited
+> a component that never held it. The real defect was that `th.join()` nested in a
+> branch cleared the borrow for code AFTER the branch, on paths that never joined.
+> Fix = `Checker.branch_depth` + `Symbol.th_spawn_branch_depth`: a join releases
+> the borrow only when it is no deeper in runtime-conditional nesting than the
+> spawn. ~40 lines, not subsystem-scale. **Residual (precision, not safety):** a
+> join on EVERY arm is now over-rejected — hoist the join out of the branch; see
+> `docs/limitations.md`. **Still do NOT claim ZER is fully data-race-safe** — the
+> §24.5 residue (emitter-runtime globals, the `IRPathState` merged-vs-first_live
+> audit, cross-module spawn, NODE_STRUCT_INIT global read in a spawn body) is
+> in-scope and unprobed; only cinclude/FFI is a floor.
 > **D1 (cinclude thread-capture) is a named FLOOR, not a hole** — C-domain behavior,
 > out of scope; the safe path exists today (hand capturing externs long-lived data —
 > global / `shared struct` instance / Pool/Slab — never `&stack_local`). Full

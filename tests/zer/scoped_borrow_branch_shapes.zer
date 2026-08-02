@@ -1,0 +1,42 @@
+// Boundary for the 2026-08-03 cross-block scoped-borrow fix. The guard keeps a
+// borrow alive across a branch that contains a join, so these legitimate shapes
+// must keep compiling — without them the guard could tighten into a broad
+// over-rejection unnoticed.
+struct W { u32 x; }
+
+void worker(*W w) { w.x += 1; }
+
+u32 main() {
+    u32 f = 3;
+
+    // 1. straight line: spawn -> join -> use
+    W a; a.x = 0;
+    ThreadHandle t1 = spawn worker(&a);
+    t1.join();
+    if (a.x != 1) { return 1; }
+
+    // 2. spawn AND join both inside the same branch (equal depth — releases)
+    W b; b.x = 0;
+    if (f == 3) {
+        ThreadHandle t2 = spawn worker(&b);
+        t2.join();
+        if (b.x != 1) { return 2; }
+    }
+
+    // 3. spawn AND join inside a loop body (equal depth — releases each pass)
+    W c; c.x = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        ThreadHandle t3 = spawn worker(&c);
+        t3.join();
+    }
+    if (c.x != 2) { return 3; }
+
+    // 4. a branch BETWEEN spawn and join that does not touch the borrow
+    W d; d.x = 0;
+    ThreadHandle t4 = spawn worker(&d);
+    if (f == 999) { f = 1; }
+    t4.join();
+    if (d.x != 1) { return 4; }
+
+    return 0;
+}

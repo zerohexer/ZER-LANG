@@ -2821,6 +2821,15 @@ borrowed by that thread until `.join()`:
 - `&threadlocal` to a scoped spawn → compile error. Each thread has its own copy,
   so the child would write the parent's slot. Pass it by value instead.
 - All `&` arguments are tracked, not just the first; `.join()` releases every one.
+- A `.join()` **inside a branch** does not release the borrow for code after that
+  branch — the other path never joined, so the thread may still be running:
+  ```zer
+  ThreadHandle th = spawn worker(&work);
+  if (err) { th.join(); return 0; }
+  work.x = 2;              // compile error — path 2 never joined
+  ```
+  This also means joining on *every* arm is not recognised as unconditional.
+  Hoist the join out of the branch instead: `if (err) { ... } th.join();`
 
 **SAFETY CHECKS**
 - Non-shared `*T` to fire-and-forget spawn → compile error

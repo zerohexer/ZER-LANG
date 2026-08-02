@@ -1,0 +1,16 @@
+// A cleanup function that calls two DIFFERENT field-freeing helpers on the
+// same pointer param frees two DISTINCT fields — must compile clean. Regression
+// for the rdh99l chain-propagation sentinel (a naive sentinel made the second
+// call look like a double free).
+struct B { u32 x; }
+struct H { [*]B a; [*]B b; }
+void free_a(*H h) { free(h.a); }
+void free_b(*H h) { free(h.b); }
+void cleanup(*H h) { free_a(h); free_b(h); }
+u32 main() {
+    H h;
+    h.a = alloc(B, 2) orelse { return 1; };
+    h.b = alloc(B, 2) orelse { return 1; };
+    cleanup(&h);
+    return 0;
+}

@@ -4936,7 +4936,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         if (ch->path_len < rpl) continue;
                         if (!ch->path || memcmp(ch->path, rp, rpl) != 0) continue;
                     }
-                    if (ir_is_invalid(ch)) {
+                    /* The "\x01" sentinel (below) is a summary-propagation
+                     * marker, NOT a real caller field — a second field-free
+                     * call on the same param would otherwise see the prior
+                     * call's sentinel as an already-freed handle and FALSE-
+                     * report a double free (`cleanup(*H h){ free_a(h);
+                     * free_b(h); }` frees two DIFFERENT fields). Skip the
+                     * invalid check for it; real caller field handles still
+                     * trigger the genuine double-free/UAF. */
+                    bool is_sentinel = (ch->path_len == 1 && ch->path &&
+                                        ch->path[0] == '\x01');
+                    if (!is_sentinel && ir_is_invalid(ch)) {
                         ir_zc_error(zc, inst->source_line,
                             "passing %s handle to a function that frees its field",
                             ir_state_name(ch->state));

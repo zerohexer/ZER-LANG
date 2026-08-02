@@ -390,6 +390,49 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — spawn-ARG gate is carrier-blind: a by-value struct laundering a Handle/pointer (HIGH, cross-thread UAF)
+
+**Symptom.** `spawn worker(h)` with a bare `Handle(T)` is correctly rejected
+("cannot pass Handle to spawn — pool.get() is not thread-safe"). Wrapping the SAME handle
+in a by-value struct is **ACCEPTED**:
+
+```zer
+struct Box{ Handle(T) h; }
+void worker(Box b){ u32 x = b.h.v; }        // derefs across the thread boundary
+u32 main(){ Handle(T) h = p.alloc() orelse { return 1; };
+            Box b; b.h = h; spawn worker(b); p.free(h); return 0; }
+```
+
+Verified non-vacuous — the emitted C really does
+`_zer_pool_get(p.slots, p.gen, p.used, ..., b.h, 4)->v` inside `worker` while `main` runs
+`p.free(h)`. The same laundering works for a raw heap `*T`.
+
+**Root cause.** The spawn-arg gate tests the BARE argument kind. It never descends into a
+by-value struct/union that CARRIES a handle or pointer. This is the documented
+"wrapper hides the inner kind" family (CLAUDE.md), specifically the
+by-value-struct-carrying-a-pointer shape — the same form as §C7 / §D1 in the 2026-08-01
+sweep. `tools/audit_carrier_dispatch.sh` was built for this class but does not cover the
+spawn-arg sink.
+
+**Not covered by the existing spawn analysis.** The RACE half is fine — a by-value struct
+arg whose target touches a non-shared global is still caught. It is specifically the
+lifetime/ownership arg gate that is carrier-blind.
+
+**Backstop (not a guarantee).** For `Handle` the runtime generation check still fires,
+subject to the wraparound in `docs/Linear-UAF.md` §2. For a raw heap `*T` only the Level
+2/3/5 malloc machinery remains. Neither is compile-time.
+
+**Fix sketch.** At the spawn-arg gate, replace the bare-kind test with an existing carrier
+predicate (`type_carries_data_pointer` / `type_can_carry_pointer`) so optional / distinct /
+array-of / by-value-struct carriers are all covered. Then extend
+`tools/audit_carrier_dispatch.sh` to include the spawn-arg sink, so the next carrier shape
+fails the build instead of regressing silently.
+
+**Tripwire.** `tests/zer_gaps/gap_spawn_arg_byvalue_struct_carrier.zer` — must COMPILE while
+the gap is open; the gap runner fails loudly when it starts being rejected.
+
+---
+
 ## OPEN — findings carried forward from the 2026-07-21→31 branch wave (documented, NOT fixed on any branch)
 
 These are the audit findings the eleven branches recorded but did **not** fix. Deduped against the rest

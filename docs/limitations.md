@@ -372,6 +372,129 @@ statements at `gi < di`. Swept all 17 existing positives combining goto+defer: 0
 banning VALID patterns. This shape currently MISCOMPILES — a silent lock underflow — so a compile
 error naming the workaround is strictly better than the status quo, not a feature removal.
 
+## OPEN — cross-function free of a param FIELD is untracked (CRITICAL — double free + UAF + false leak)
+
+**Symptom.** One root cause, SEVEN observable symptoms — all verified against main `207de7e1`:
+
+| Shape | Today |
+|---|---|
+| by-value struct param field double free (`void fb(H h){ free(h.buckets); }`, caller frees too) | **COMPILES** |
+| `*Struct` param field double free | **COMPILES** |
+| transitive wrapper `destroy2(*H h){ destroy(h); }` | **COMPILES** |
+| intra-function `free(h.f); free(h.f);` | rejects as a **LEAK** — wrong reason, the double free itself is undetected |
+| `void destroy(*H h){ free(h.buckets); }` called once, correctly | **FALSE LEAK — does not compile** |
+| the transitive destructor, used correctly | **FALSE LEAK** |
+| two DIFFERENT field-freers on one param (`free_a(h); free_b(h);`) | **FALSE LEAK** |
+
+**This is the highest-value open item.** `void destroy(*H h) { free(h.buckets); }` is THE canonical C
+destructor, and it does not compile.
+
+**Root cause.** The free handler's untracked-param registration and the FuncSummary free-of-param scan
+are both BARE-PARAM-ONLY (`path_len == 0`) under a POINTER/HANDLE/OPAQUE/SLICE type gate. So a param
+FIELD free creates no FREED state at all, and by-value struct/union params are dropped entirely.
+Another instance of the documented per-sink patchwork class.
+
+**Fix sketch** (3 points, from `claude/gifted-noether-dgbmqx` `e7539793`): (1) the free handler
+registers a FREED compound handle for a param-rooted field free at BOTH free sites; (2) FuncSummary
+gains `frees_param_field` / `maybe_frees_param_field`, built by a per-return-block scan for FREED
+compound handles rooted at each param, running for EVERY param kind (not just pointer-like);
+(3) the call site widens the caller's field handles rooted at the arg (unwrapping `&h`), with a
+sentinel handle for transitive chain propagation. Widening is coarse — it marks all of the arg's
+tracked fields — which is sound but yields bounded sibling-field over-rejection.
+
+**HARD DEPENDENCY — take the sentinel follow-up with it** (`f80b8a3f`). The `\x01` chain-propagation
+sentinel is also matched by the call-site invalid-handle check, so a cleanup function calling two
+DIFFERENT field-freers on the same param sees the first call's sentinel as already-freed and
+false-reports a double free. Skip the invalid check for the sentinel; real caller field handles still
+trigger the genuine double-free/UAF. Take both or neither.
+
+**Tripwires.** Negatives `alloc_byval_field_double_free`, `alloc_ptrparam_field_double_free`,
+`alloc_param_field_intra_double_free`, `alloc_param_field_free_transitive`; positives
+`destructor_field_free_ok`, `destructor_field_free_transitive_ok`, `destructor_two_field_freers_ok`.
+NOTE `alloc_byval_field_slice_uaf` currently passes for the WRONG reason (leak, not UAF) and needs
+correcting alongside.
+
+---
+
+## OPEN — `@container` var-decl launder escapes un-tainted (HIGH — escape UAF)
+
+**Symptom.** A local laundered through `@container(*T, lp, field)` into a `*T` variable never inherits
+`is_local_derived`, so it escapes un-tainted via store-to-global / return / keep — an ASan
+stack-use-after-return. Verified COMPILING on main `207de7e1`.
+
+**Root cause.** The escape chain-walker unwraps launder intrinsics via the **LAST** argument, but
+`@container`'s pointer operand is **`args[0]`**.
+
+**This one is a known miss, not a new discovery.** The §C5 chain-unwrap (2026-08-01) explicitly
+commented "@container is not a launder form and is handled elsewhere" — that was wrong. Mirror
+`unwrap_ptr_launder`'s existing `@container` special-case in the escape walker.
+
+**Tripwires.** Negative `escape_container_vardecl_launder.zer`; positive `container_local_use_ok.zer`
+(a `@container` result used locally must still compile).
+
+---
+
+## OPEN — scoped-borrow interior pointer establishes no borrow (HIGH — data race)
+
+**Symptom.** A scoped spawn lent an INTERIOR pointer (`spawn w(&b.v)`) establishes no exclusive
+borrow, so the parent can mutate the same object concurrently. Verified COMPILING on main `207de7e1`.
+
+**Root cause.** The borrow matcher requires a bare `NODE_IDENT` operand, so any field/index projection
+slips it. Direct sibling of the §D5/§D7 scoped-borrow work (2026-08-01) — same blind spot one
+projection level down, and the same `&x` vs `&x.f` shape as §C6.
+
+**Fix sketch.** Walk the `&`-operand's field/index chain to the root ident and borrow the WHOLE local,
+mirroring what §C6 did for the keep call-site.
+
+**Tripwire.** Negative `scoped_borrow_interior_field.zer`.
+
+---
+
+## OPEN — call-return alias defeats free/UAF tracking (CRITICAL — accept-unsafe)
+
+**Symptom.** A function returning a VIEW of its pointer/slice param yields a call result whose
+`alloc_id` is not linked to the argument's allocation, so a double free or UAF through that alias is
+ACCEPTED. Confirmed by compiling, and by runtime abort 134. A paired LEAK false-positive comes from
+the same missing link.
+
+**Why this one matters beyond its own severity.** It is a safety hole INSIDE the BUG-764
+"returning a view of a param is allowed" relaxation, which several 2026-08-01/02 fixes lean on
+(§C1's `val_is_param` exclusion, §C4's scoping, the whole param-view story). Closing it is also a
+soundness patch to the foundation those rest on.
+
+**Fix sketch.** Link the call result's `alloc_id` to the argument allocation when the callee's return
+summary says the result may be a view of param n — the `ret_param_mask` / `call_result_static_given_args`
+machinery already computes exactly that fact for the ESCAPE question; this is the same query asked for
+the ALIAS question.
+
+**Tripwire.** `tests/zer_gaps/gap_call_return_alias_double_free.zer` (compile-clean today = the gap;
+move to `tests/zer_fail/` when fixed).
+
+---
+
+## OPEN — uN/iN 128-bit-carrier literals >= 2^63 sign-extend (MEDIUM — silent miscompile, niche)
+
+**Symptom.** A `uN`/`iN` literal with a 128-bit carrier and value >= 2^63 sign-extends into the high
+64 bits on the IR/expression emission path. The GLOBAL-INIT path is correct, so the two disagree.
+
+**Fix sketch.** Mask/zero-extend at the 128-bit carrier emission site. A COMPLETE fix also needs
+128-bit literal LEXING — today the lexer cannot represent the literal exactly, so the emission fix
+alone only narrows the window.
+
+---
+
+## OPEN — spawn race scan blind to a funcptr STRUCT-FIELD call bound cross-function (MEDIUM)
+
+**Symptom.** The spawn non-shared-global scan does not follow a function pointer stored in a STRUCT
+FIELD and bound in a different function, so a race reachable only through that indirection is missed.
+
+**Why it is not simply "fix the scan".** Following it in general requires whole-program reachability,
+which is BANNED from the architecture (CLAUDE.md "Whole-program analysis — BANNED"). Same boundary as
+§D8 (2026-08-01), which took the conservative descent only at the spawn site itself. Any fix must stay
+inside the per-file + summaries model.
+
+---
+
 ## OPEN — F2 durable fix: per-defer runtime "armed" flag (MEDIUM, over-rejection)
 
 **Symptom.** The `gi < di < li` shape (forward `goto` over a later `defer` to a label past it) is

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// rdh99l original: a callee frees a FIELD of a BY-VALUE struct param; the
+// caller then frees the same field → cross-function double free (glibc abort).
+struct B { u32 x; }
+struct H { [*]B buckets; }
+void fb(H h) { free(h.buckets); }
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 0; };
+    fb(h);
+    free(h.buckets);
+    return 0;
+}

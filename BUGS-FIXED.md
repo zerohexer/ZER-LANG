@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## 2026-08-02 — param-field free tracking, @container launder, scoped-borrow interior
+
+Three defects from `claude/gifted-noether-{dgbmqx,6doa71}`, each verified against main `207de7e1`
+before implementing. Nothing merged — the branch patches were used as reference implementations.
+
+- **Cross-function free of a param FIELD was untracked (CRITICAL — double free + UAF + false leak).**
+  One root cause, SEVEN symptoms. Three double-frees COMPILED (by-value struct param field,
+  `*Struct` param field, transitive wrapper `destroy2(*H h){destroy(h);}`); the intra-function
+  `free(h.f); free(h.f);` rejected for the WRONG reason (a leak — the frees were silent no-ops, so the
+  allocation merely looked un-freed); and three correct destructor patterns were FALSE LEAKS —
+  including `void destroy(*H h){ free(h.buckets); }`, the canonical C destructor, which did not
+  compile at all.
+  Root: the free handler's untracked-param registration and the FuncSummary free-of-param scan were
+  both BARE-PARAM-ONLY (`path_len == 0`) under a POINTER/HANDLE/OPAQUE/SLICE type gate, so a param
+  FIELD free created no FREED state and by-value struct/union params were dropped entirely.
+  Fix (3 points): the free handler registers a FREED compound handle for a param-rooted field free at
+  both free sites; FuncSummary gains `frees_param_field` / `maybe_frees_param_field`, built by a
+  per-return-block scan for FREED compound handles rooted at each param and running for EVERY param
+  kind; the call site widens the caller's field handles rooted at the arg (unwrapping `&h`), with a
+  sentinel for transitive chain propagation. Widening is coarse (all of the arg's tracked fields) —
+  sound, with bounded sibling-field over-rejection.
+  Includes the mandatory sentinel follow-up: the `\x01` chain sentinel was also matched by the
+  call-site invalid-handle check, so two DIFFERENT field-freers on one param (`free_a(h); free_b(h);`)
+  false-reported a double free. From `dgbmqx` `e7539793` + `f80b8a3f` (a hard pair — take both or
+  neither). Tests: 4 negatives + 3 positives. `alloc_byval_field_slice_uaf.zer` needed no edit — the
+  fix alone changed its rejection from a leak to the correct UAF.
+
+- **`@container` var-decl launder escaped un-tainted (HIGH — escape UAF).** A local laundered through
+  `@container(*T, lp, field)` into a `*T` var never inherited `is_local_derived`, so it escaped to a
+  global / return / keep sink (ASan stack-use-after-return). Root: the var-decl escape chain-walker
+  unwraps intrinsics via the LAST arg, but `@container`'s pointer operand is `args[0]` — its last arg
+  is the field NAME, so the walk hit a non-ident and stopped. Mirrors the special-case
+  `unwrap_ptr_launder` already had.
+  **This was a KNOWN miss, recorded as such:** the §C5 chain-unwrap (2026-08-01) commented that
+  "@container is not a launder form and is handled elsewhere". It is a launder form, and it was not
+  handled here. From `6doa71` `d375185d`. Test `escape_container_vardecl_launder.zer`, positive
+  `container_local_use_ok.zer`.
+
+- **Scoped-borrow interior pointer established no borrow (HIGH — data race).** `spawn worker(&b.v)`
+  set no borrow, so a parent write to `b.v` before `join()` raced (TSan-confirmed), while the
+  whole-local `&b` form was correctly rejected. Root: the matcher required a bare `NODE_IDENT`
+  operand. Walk the field/index chain to the root and borrow the WHOLE local — a sound
+  over-approximation, since the thread holds a reference INTO that local's storage. Exactly the
+  `&x` vs `&x.f` shape as §C6, one level down from §D5/§D7. From `6doa71` `d375185d`. Test
+  `scoped_borrow_interior_field.zer`, positive `scoped_borrow_interior_after_join_ok.zer` (written
+  here — the branch ships no positive; a write AFTER join must still compile).
+
+**Six of `6doa71`'s eight claimed fixes were already in main** and were skipped: its G5 = §A, its four
+VRP leaks = §B2–B5, its `*(&x) = v` SEGV = §H1. Established by RUNNING each reproducer, not by reading
+the commit message — a marker grep would have gotten G5 wrong, since main implements it under a
+different identifier (`ir_register_global_field_store`, not `ir_build_global_field_key`).
+
+make check exit 0 — 9 matrix grids, all audit gates, sink matrix clean.
+
+---
+
 ## 2026-08-02 — defer x goto ARMING matrix: the net for the durable §F2 fix (test infrastructure)
 
 Not a bug fix — the PRECONDITION recorded in §F2's OPEN entry ("do this behind a real goto x defer

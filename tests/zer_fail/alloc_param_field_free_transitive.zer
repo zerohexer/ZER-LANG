@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// Chain propagation: destroy2 calls destroy which frees a FIELD of the shared
+// pointer param; the outermost caller then frees the same field → double free.
+// The field-free fact must propagate through the intermediate wrapper.
+struct B { u32 x; }
+struct H { [*]B buckets; }
+void destroy(*H h) { free(h.buckets); }
+void destroy2(*H h) { destroy(h); }
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 0; };
+    destroy2(&h);
+    free(h.buckets);
+    return 0;
+}

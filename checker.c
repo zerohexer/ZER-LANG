@@ -11119,9 +11119,26 @@ static void check_stmt(Checker *c, Node *node) {
                              * from the slice subject through a slice-via-intermediate-var, so
                              * a later keepfn(s) never infers keep on np's root param. */
                             else if (init_root->kind == NODE_SLICE) init_root = init_root->slice.object;
-                            /* BUG-338: walk into intrinsic args (ptrcast, bitcast) */
+                            /* BUG-338: walk into intrinsic args (ptrcast, bitcast).
+                             * S1 (2026-08-02): `@container`'s POINTER operand is
+                             * args[0] — its LAST arg is the field NAME. Taking
+                             * args[last] here walked to the field name, found no
+                             * root ident, and stopped, so
+                             * `*Node d = @container(*Node, lp, list);` never
+                             * inherited is_local_derived and the local escaped
+                             * un-tainted to a global / return / keep sink
+                             * (ASan stack-use-after-return). Mirrors the
+                             * special-case unwrap_ptr_launder already has.
+                             *
+                             * This was a KNOWN miss: the §C5 chain-unwrap
+                             * (2026-08-01) commented that "@container is not a
+                             * launder form and is handled elsewhere" — it is a
+                             * launder form, and it was not handled here. */
                             else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
-                                init_root = init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                                init_root = (init_root->intrinsic.name_len == 9 &&
+                                             memcmp(init_root->intrinsic.name, "container", 9) == 0)
+                                    ? init_root->intrinsic.args[0]
+                                    : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;
@@ -14618,11 +14635,31 @@ static void check_stmt(Checker *c, Node *node) {
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
                     if (!ba || ba->kind != NODE_UNARY ||
-                        ba->unary.op != TOK_AMP || !ba->unary.operand ||
-                        ba->unary.operand->kind != NODE_IDENT)
+                        ba->unary.op != TOK_AMP || !ba->unary.operand)
                         continue;
-                    const char *vn = ba->unary.operand->ident.name;
-                    uint32_t vl = (uint32_t)ba->unary.operand->ident.name_len;
+                    /* S2 (2026-08-02): walk the &-operand's field/index chain to
+                     * the root ident. The matcher required a BARE NODE_IDENT, so
+                     * an INTERIOR pointer (`spawn worker(&b.v)`) established NO
+                     * borrow at all — the parent could then write `b.v` before
+                     * join() and race (TSan-confirmed), while the whole-local
+                     * `&b` form was correctly rejected.
+                     *
+                     * Borrowing the WHOLE local for an interior pointer is a
+                     * sound over-approximation: the thread holds a reference
+                     * INTO that local's storage, so no part of it may be
+                     * concurrently written. Exactly the `&x` vs `&x.f` shape as
+                     * §C6 (keep call-site) — this is that same blind spot one
+                     * level down from §D5/§D7. */
+                    Node *broot = ba->unary.operand;
+                    while (broot && (broot->kind == NODE_FIELD ||
+                                     broot->kind == NODE_INDEX)) {
+                        broot = (broot->kind == NODE_FIELD)
+                                  ? broot->field.object
+                                  : broot->index_expr.object;
+                    }
+                    if (!broot || broot->kind != NODE_IDENT) continue;
+                    const char *vn = broot->ident.name;
+                    uint32_t vl = (uint32_t)broot->ident.name_len;
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
                     bool vglobal = scope_lookup_local(c->global_scope,
                                        vn, vl) != NULL;

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// Audit 2026-08-01: a stack local laundered through @container(*T, lp, field)
+// into a *T var-decl never inherited is_local_derived, so it escaped un-tainted
+// to a global (also to return / keep sinks). Root cause: the var-decl escape
+// chain-walker unwrapped intrinsics via the LAST arg, but @container's pointer
+// operand is args[0] (last arg = field name). ASan-confirmed stack-use-after-
+// return. Fix: chain-walker mirrors unwrap_ptr_launder's @container special-case.
+struct Node { u32 v; u32 list; }
+?*Node g = null;
+void bad() {
+    Node local;
+    local.v = 111;
+    *u32 lp = &local.list;
+    *Node d = @container(*Node, lp, list);   // d aliases &local
+    g = d;                                   // must reject: local escapes
+}
+u32 main() { bad(); return 0; }

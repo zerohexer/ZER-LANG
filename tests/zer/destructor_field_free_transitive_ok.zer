@@ -1,0 +1,13 @@
+// Two-level destructor (destroy2 -> destroy frees a heap field), called once,
+// no caller double free. Must compile clean and report no false leak.
+struct B { u32 x; }
+struct H { [*]B buckets; }
+void destroy(*H h) { free(h.buckets); }
+void destroy2(*H h) { destroy(h); }
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 1; };
+    h.buckets[0].x = 7;
+    destroy2(&h);
+    return 0;
+}

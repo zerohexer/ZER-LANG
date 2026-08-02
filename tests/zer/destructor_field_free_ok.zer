@@ -1,0 +1,15 @@
+// A destructor that frees a heap FIELD of its pointer param, called once,
+// with no caller-side double free. Must compile clean AND not report a false
+// leak (the field IS freed cross-function). Regression for rdh99l fix.
+struct B { u32 x; }
+struct H { [*]B buckets; u32 n; }
+void destroy(*H h) { free(h.buckets); }
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 1; };
+    h.n = 4;
+    h.buckets[0].x = 42;
+    u32 v = h.buckets[0].x;
+    destroy(&h);
+    return v - 42;
+}

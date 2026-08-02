@@ -74,6 +74,16 @@ typedef struct {
     int param_count;
     bool *frees_param;        /* definite free (all paths) */
     bool *maybe_frees_param;  /* conditional free (some paths) */
+    /* rdh99l (2026-08-02): the callee frees a FIELD of param i (a compound
+     * handle rooted at the param — `free(h.buckets)` where h is a by-value
+     * struct/union OR a `*Struct` pointer param). The whole-param frees_param
+     * arrays above only track a bare param free, so a cross-function
+     * double-free / UAF of a param FIELD compiled clean. definite = every
+     * return path frees some field; maybe = some path frees some field. The
+     * call site widens the caller's tracked field handles rooted at the arg.
+     * NULL when param_count == 0 (memset-zeroed). */
+    bool *frees_param_field;
+    bool *maybe_frees_param_field;
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
     int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
     /* PART 6 (erased-ref ownership, 2026-07-16): the function's body makes NO

@@ -1,0 +1,11 @@
+struct Box { u32 v; u32 w; }
+void worker(*u32 p) { *p += 1; }
+u32 main() {
+    Box b; b.v = 0; b.w = 5;
+    ThreadHandle t = spawn worker(&b.v);
+    t.join();
+    b.v = 7;                       // AFTER join — legal
+    if (b.v != 7) { return 1; }
+    if (b.w != 5) { return 2; }
+    return 0;
+}

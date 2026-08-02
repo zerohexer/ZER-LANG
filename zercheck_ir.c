@@ -3005,6 +3005,23 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                          &root_local, &path, &path_len) == 0) {
                 h = ir_find_compound_handle(ps, root_local, path, path_len);
                 if (h) target = root_local;  /* for error messages */
+                /* rdh99l (2026-08-02): mirror the universal-free path — a
+                 * param FIELD freed via `slab.free_ptr(p.field)` must
+                 * register a FREED compound handle so an intra-function
+                 * double free and the cross-function frees_param_field
+                 * inference both observe it. */
+                else if (path_len > 0 && root_local >= 0 &&
+                         root_local < func->local_count &&
+                         func->locals[root_local].is_param) {
+                    h = ir_add_compound_handle(ps, root_local, path, path_len);
+                    if (h) {
+                        h->state = IR_HS_ALIVE;
+                        h->alloc_line = inst->source_line;
+                        h->alloc_id = _ir_next_alloc_id++;
+                        h->source_color = ZC_COLOR_UNKNOWN;
+                        target = root_local;
+                    }
+                }
             }
         }
 
@@ -4364,11 +4381,19 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     /* Phase E: if freeing a param that was never registered
                      * as a handle, create one so FuncSummary can observe
                      * FREED state at return. Enables cross-function
-                     * frees_param[i] inference. */
-                    if (!h && path_len == 0 && root_local >= 0 &&
+                     * frees_param[i] inference.
+                     * rdh99l (2026-08-02): extended to path_len > 0 — a
+                     * param FIELD free (`free(h.buckets)` where h is a param)
+                     * must also register a FREED compound handle, or an
+                     * intra-function double `free(h.f); free(h.f)` and the
+                     * cross-function frees_param_field inference both go
+                     * silent. */
+                    if (!h && root_local >= 0 &&
                         root_local < func->local_count &&
                         func->locals[root_local].is_param) {
-                        h = ir_add_handle(ps, root_local);
+                        h = (path_len == 0)
+                            ? ir_add_handle(ps, root_local)
+                            : ir_add_compound_handle(ps, root_local, path, path_len);
                         if (h) {
                             h->state = IR_HS_ALIVE;
                             h->alloc_line = inst->source_line;
@@ -4790,9 +4815,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * compiled cleanly. Mirror the compound-key resolution that the
          * extern_free path already uses (see lines 2902-2942). */
         for (int pi = 0; pi < summary->param_count; pi++) {
-            if (!summary->frees_param[pi] && !summary->maybe_frees_param[pi])
+            bool bare = summary->frees_param[pi] || summary->maybe_frees_param[pi];
+            /* rdh99l (2026-08-02): the callee frees a FIELD of param pi. */
+            bool field = (summary->frees_param_field && summary->frees_param_field[pi]) ||
+                         (summary->maybe_frees_param_field && summary->maybe_frees_param_field[pi]);
+            if (!bare && !field)
                 continue;
 
+          if (bare) {
             int arg_local = -1;
             const char *compound_path = NULL;
             uint32_t compound_path_len = 0;
@@ -4835,8 +4865,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
             }
-            if (arg_local < 0) continue;
-
+            if (arg_local >= 0) {
             IRHandleInfo *h;
             if (compound_path_len > 0) {
                 h = ir_find_compound_handle(ps, arg_local,
@@ -4864,8 +4893,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     h->escaped = true;  /* external input */
                 }
             }
-            if (!h) continue;
-
+            if (h) {
             /* Error on using an already-invalid handle */
             if (ir_is_invalid(h)) {
                 ir_zc_error(zc, inst->source_line,
@@ -4881,6 +4909,76 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
 
             /* Propagate to aliases */
             ir_propagate_alias_state(ps, h, new_state, inst->source_line);
+            }
+            }
+          }
+
+          if (field && inst->args && pi < inst->arg_count && inst->args[pi]) {
+            /* rdh99l field widening: the callee frees `param.<f>`. The caller's
+             * arg is `h` / `&h` / `c.sub`; mark every tracked compound handle
+             * rooted at the arg (scoped by the arg's own base path) as
+             * FREED/MAYBE_FREED. Coarse — the callee's exact field set is not
+             * stored, so ALL of the arg's tracked fields are marked: sound for
+             * double-free/UAF, over-rejects a sibling field the callee did not
+             * free (rare; the common destructor frees every member). */
+            Node *ae = inst->args[pi];
+            if (ae->kind == NODE_UNARY && ae->unary.op == TOK_AMP && ae->unary.operand)
+                ae = ae->unary.operand;   /* &h -> h */
+            int rl; const char *rp; uint32_t rpl;
+            if (ir_extract_compound_key(zc, func, ae, &rl, &rp, &rpl) == 0 && rl >= 0) {
+                IRHandleState nf = (summary->frees_param_field &&
+                                    summary->frees_param_field[pi])
+                    ? IR_HS_FREED : IR_HS_MAYBE_FREED;
+                for (int hh = 0; hh < ps->handle_count; hh++) {
+                    IRHandleInfo *ch = &ps->handles[hh];
+                    if (ch->local_id != rl || ch->path_len == 0) continue;
+                    if (rpl > 0) {
+                        if (ch->path_len < rpl) continue;
+                        if (!ch->path || memcmp(ch->path, rp, rpl) != 0) continue;
+                    }
+                    /* The "\x01" sentinel (below) is a summary-propagation
+                     * marker, NOT a real caller field — a second field-free
+                     * call on the same param would otherwise see the prior
+                     * call's sentinel as an already-freed handle and FALSE-
+                     * report a double free (`cleanup(*H h){ free_a(h);
+                     * free_b(h); }` frees two DIFFERENT fields). Skip the
+                     * invalid check for it; real caller field handles still
+                     * trigger the genuine double-free/UAF. */
+                    bool is_sentinel = (ch->path_len == 1 && ch->path &&
+                                        ch->path[0] == '\x01');
+                    if (!is_sentinel && ir_is_invalid(ch)) {
+                        ir_zc_error(zc, inst->source_line,
+                            "passing %s handle to a function that frees its field",
+                            ir_state_name(ch->state));
+                    }
+                    ch->state = nf;
+                    ch->free_line = inst->source_line;
+                    ir_propagate_alias_state(ps, ch, nf, inst->source_line);
+                }
+                /* rdh99l chain propagation: when the arg IS the caller's own
+                 * whole param (`destroy2(*H h){ destroy(h); }`), synthesize a
+                 * FREED sentinel field handle rooted at that param so the
+                 * caller's OWN summary build observes "a field of param i was
+                 * freed" and sets frees_param_field — otherwise a two-level
+                 * destructor (destroy2 → destroy) leaks the fact and the
+                 * outermost caller's double-free/UAF goes silent. The sentinel
+                 * path "\x01" cannot collide with a real field path (those
+                 * start with '.' or '['); the coarse call-site widening marks
+                 * every rooted field regardless of path, so the exact sentinel
+                 * value is immaterial. */
+                if (rpl == 0 && rl < func->local_count &&
+                    func->locals[rl].is_param) {
+                    static const char field_sentinel[] = "\x01";
+                    IRHandleInfo *sh = ir_add_compound_handle(ps, rl,
+                                                              field_sentinel, 1);
+                    if (sh) {
+                        sh->state = nf;
+                        sh->free_line = inst->source_line;
+                        if (sh->alloc_id == 0) sh->alloc_id = _ir_next_alloc_id++;
+                    }
+                }
+            }
+          }
         }
         break;
     }
@@ -5582,12 +5680,23 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
          * must have returns_color=ARENA to propagate through callers. */
         bool *frees = NULL;
         bool *maybe_frees = NULL;
+        /* rdh99l (2026-08-02): per-param FIELD-free summary. See zercheck.h. */
+        bool *frees_field = NULL;
+        bool *maybe_frees_field = NULL;
         if (pc > 0) {
             frees = (bool *)calloc(pc, sizeof(bool));
             maybe_frees = (bool *)calloc(pc, sizeof(bool));
+            frees_field = (bool *)calloc(pc, sizeof(bool));
+            maybe_frees_field = (bool *)calloc(pc, sizeof(bool));
             bool *any_return_saw_alive = (bool *)calloc(pc, sizeof(bool));
             bool *all_return_blocks_freed = (bool *)malloc(pc * sizeof(bool));
             for (int i = 0; i < pc; i++) all_return_blocks_freed[i] = true;
+            /* Field-free accumulators: any_field_freed[i] = some return path
+             * freed a FIELD of param i; all_ret_field_freed[i] = every return
+             * block freed some field of param i (definite). */
+            bool *any_field_freed = (bool *)calloc(pc, sizeof(bool));
+            bool *all_ret_field_freed = (bool *)malloc(pc * sizeof(bool));
+            for (int i = 0; i < pc; i++) all_ret_field_freed[i] = true;
             int return_blocks = 0;
 
             for (int bi = 0; bi < func->block_count; bi++) {
@@ -5600,7 +5709,29 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 for (int i = 0; i < pc; i++) {
                     ParamDecl *p = &fn->func_decl.params[i];
                     int plocal = ir_find_local_exact_first(func, p->name, (uint32_t)p->name_len);
-                    if (plocal < 0) { all_return_blocks_freed[i] = false; continue; }
+                    if (plocal < 0) {
+                        all_return_blocks_freed[i] = false;
+                        all_ret_field_freed[i] = false;
+                        continue;
+                    }
+                    /* rdh99l field-free scan — runs for EVERY param kind
+                     * (including by-value STRUCT/UNION, which the bare type
+                     * gate below skips). A callee freeing `param.field`
+                     * registered a FREED compound handle rooted at plocal
+                     * (Phase E, path_len > 0). Definite = every return block
+                     * frees some field; maybe = some path does. */
+                    {
+                        bool block_field_freed = false;
+                        bool block_field_maybe = false;
+                        for (int hh = 0; hh < ps->handle_count; hh++) {
+                            IRHandleInfo *ch = &ps->handles[hh];
+                            if (ch->local_id != plocal || ch->path_len == 0) continue;
+                            if (ch->state == IR_HS_FREED) block_field_freed = true;
+                            else if (ch->state == IR_HS_MAYBE_FREED) block_field_maybe = true;
+                        }
+                        if (block_field_freed || block_field_maybe) any_field_freed[i] = true;
+                        if (!block_field_freed) all_ret_field_freed[i] = false;
+                    }
                     /* Use the RESOLVED Type from IR local rather than the syntactic
                      * TypeNode: `typedef *T TPtr; void destroy(TPtr p)` has
                      * tnode->kind == TYNODE_NAMED, but the resolved type is a
@@ -5647,9 +5778,18 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     && !any_return_saw_alive[i] && maybe_frees[i]) {
                     frees[i] = true;
                 }
+                /* rdh99l: field-free reduction. definite = every return block
+                 * freed some field; else maybe if any path did. */
+                if (return_blocks > 0 && all_ret_field_freed[i] && any_field_freed[i]) {
+                    frees_field[i] = true;
+                } else if (any_field_freed[i]) {
+                    maybe_frees_field[i] = true;
+                }
             }
             free(all_return_blocks_freed);
             free(any_return_saw_alive);
+            free(all_ret_field_freed);
+            free(any_field_freed);
         }
 
         /* Phase D7: Arena wrapper chain inference.
@@ -5809,6 +5949,12 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 for (int i = 0; i < pc; i++) {
                     if (existing->frees_param[i] != (frees ? frees[i] : false)) changed = true;
                     if (existing->maybe_frees_param[i] != (maybe_frees ? maybe_frees[i] : false)) changed = true;
+                    /* rdh99l: field-free arrays participate in fixpoint change
+                     * detection (existing arrays are NULL until first set). */
+                    bool ef = existing->frees_param_field ? existing->frees_param_field[i] : false;
+                    bool emf = existing->maybe_frees_param_field ? existing->maybe_frees_param_field[i] : false;
+                    if (ef != (frees_field ? frees_field[i] : false)) changed = true;
+                    if (emf != (maybe_frees_field ? maybe_frees_field[i] : false)) changed = true;
                 }
             } else {
                 changed = true;
@@ -5820,15 +5966,20 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (changed) {
                 free(existing->frees_param);
                 free(existing->maybe_frees_param);
+                free(existing->frees_param_field);
+                free(existing->maybe_frees_param_field);
                 existing->param_count = pc;
                 existing->frees_param = frees;
                 existing->maybe_frees_param = maybe_frees;
+                existing->frees_param_field = frees_field;
+                existing->maybe_frees_param_field = maybe_frees_field;
                 existing->returns_color = returns_color_final;
                 existing->returns_param_color = returns_param_color_final;
                 existing->ret_is_borrow = ret_is_borrow_final;
                 existing->ret_is_content = ret_is_content_final;
             } else {
                 free(frees); free(maybe_frees);
+                free(frees_field); free(maybe_frees_field);
             }
         } else {
             if (zc->summary_count >= zc->summary_capacity) {
@@ -5848,12 +5999,15 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->param_count = pc;
                 s->frees_param = frees;
                 s->maybe_frees_param = maybe_frees;
+                s->frees_param_field = frees_field;
+                s->maybe_frees_param_field = maybe_frees_field;
                 s->returns_color = returns_color_final;
                 s->returns_param_color = returns_param_color_final;
                 s->ret_is_borrow = ret_is_borrow_final;
                 s->ret_is_content = ret_is_content_final;
             } else {
                 free(frees); free(maybe_frees);
+                free(frees_field); free(maybe_frees_field);
             }
         }
     }

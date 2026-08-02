@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global
+// A volatile global STRUCT written from a spawned thread. An aggregate is never
+// a single-word access, so the volatile-flag rationale does not apply — this is
+// an ordinary unsynchronized data race that `volatile` cannot fix.
+struct S { u32 a; u32 b; }
+volatile S gs;
+
+void w(u32 a) { gs.a = 1; }
+
+u32 main() {
+    spawn w(1);
+    return 0;
+}

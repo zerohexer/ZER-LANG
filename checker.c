@@ -10669,7 +10669,30 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
              * shared, Pool/Slab/Ring/Arena/Barrier */
             if (sym->is_const) return false;
-            if (sym->is_volatile) return false;
+            /* volatile: an "explicit low-level opt-in" for the SINGLE-WORD
+             * volatile-flag idiom (see tests/zer/spawn_volatile_store_ok.zer).
+             * That rationale is width-bounded and the check never was:
+             * 2026-08-03 measured `volatile u64 big; big = <64-bit>;` from a
+             * spawned thread ACCEPTED on a 32-bit target, where the store lowers
+             * to TWO 32-bit stores and can TEAR — a reader may observe half of
+             * each write. "Single word" is doing real work in that sentence, so
+             * enforce it: skip only for a scalar no wider than the target word.
+             *
+             * Deliberately NOT tightened further. A single-word volatile store
+             * still provides no ORDERING, but banning it would break the
+             * universal embedded flag idiom, the ISR path treats it the same
+             * way, and the diagnostic already tells the user volatile is not
+             * synchronization. That part is a judgment call and stays as-is;
+             * a tearable multi-word store is not. */
+            if (sym->is_volatile) {
+                Type *vt = type_unwrap_distinct(sym->type);
+                bool scalar = vt && (type_is_integer(vt) ||
+                                     type_dispatch_kind(vt) == TYPE_BOOL ||
+                                     type_dispatch_kind(vt) == TYPE_POINTER);
+                int w = scalar ? type_width(vt) : 0;
+                if (scalar && w > 0 && w <= c->target_ptr_bits) return false;
+                /* wider than a word (or an aggregate) — fall through and flag */
+            }
             /* threadlocal: check the AST node for is_threadlocal flag */
             if (sym->func_node &&
                 (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&

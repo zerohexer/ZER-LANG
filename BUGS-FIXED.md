@@ -5,6 +5,52 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03d — probing the §24.5 concurrency residue; one width hole found
+
+`docs/primitives-data-races.md` §24.5 listed "still-unprobed residue". Probed all
+of it (~40 shapes), crossed with the carrier axis that produced the day's earlier
+holes. **All four in-scope residue items came back CLEAN:**
+
+| Residue item | Shapes probed | Result |
+|---|---|---|
+| emitter-runtime globals (auto-slab, Pool/Slab/Ring metadata) | direct, transitive, via funcptr, call-depth 1..20 | all rejected |
+| NODE_STRUCT_INIT global read in a spawn body | flat, nested, array-typed | all rejected |
+| cross-module spawn/extern interaction | imported fn writing its own module's global | rejected, names the global |
+| CFG-form coverage (the `IRPathState` merge proxy) | one-arm if, loop, switch arm, goto label, defer body, orelse fallback | all rejected |
+
+Also clean, beyond the list: the global reached through a wrapper expression
+(cast, intrinsic arg, array index, bit-slice, orelse operand), laundered through a
+pointer (`&g` -> `*p`, via a helper, via a `*opaque` @ptrcast round-trip, via a
+struct field, passed as a spawn arg), sibling threads, ISR x spawn, global struct
+with a pointer field, threadlocal `&`-escape, global array element, and a global
+write inside a callee's defer. Nothing accepted.
+
+**The one hole — the `volatile` exclusion is width-blind.** The spawn global scan
+skips volatile globals as an "explicit low-level opt-in". That is deliberate and
+pinned by `tests/zer/spawn_volatile_store_ok.zer`, whose comment states the
+rationale exactly: *"the established SINGLE-WORD volatile-flag idiom"*. The check
+never tested width. Measured: `volatile u64 big; big = 5;` from a spawned thread
+was ACCEPTED on a 32-bit target, where the store lowers to TWO 32-bit stores and a
+concurrent reader can observe half of each write.
+
+Fix: skip only for a scalar (integer / bool / pointer) no wider than
+`Checker.target_ptr_bits`. Target-aware — the same `volatile u64` is still accepted
+with `--target-bits 64`, where it really is single-word. `volatile u128` and a
+volatile aggregate are rejected at every target width.
+
+**Deliberately NOT tightened further.** A single-word volatile store still provides
+no ORDERING, so it is not "safe" in the memory-model sense. But banning it would
+break the universal embedded flag idiom, the ISR path treats it identically, and
+the diagnostic already tells the user volatile is not synchronization. That part is
+a judgment call and was left alone; a tearable multi-word store is not a judgment
+call. Zero blast radius: every volatile global in the positive suite is `u32` (37)
+or `u8` (1).
+
+Tests: `tests/zer_fail/spawn_volatile_wide_store_tear.zer` (uses
+`// zerc-flags: --target-bits 32`) and `spawn_volatile_struct_global.zer`, both
+verified to COMPILE on a pre-fix build; `tests/zer/spawn_volatile_word_widths_ok.zer`
+pins u8/u16/u32 so the idiom cannot be tightened away.
+
 ## Session 2026-08-03c — cross-block scoped-borrow race (open since the 2026-06-20 audit)
 
 A local lent to a scoped spawn via `&x` is exclusively borrowed until `join()`.

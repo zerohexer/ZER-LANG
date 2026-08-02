@@ -2269,11 +2269,11 @@ reject with an optional boundary opt-out.
   indirect dispatch beyond the file — "safe" there = reject-the-unprovable (100%
   memory-safe, flexibility cost).
 - **Status:** spec NOT frozen (Axis D appeared in sweep 3; still-unprobed residue
-  remains — **emitter-runtime globals** (compiler-generated globals such as the
-  auto-slab, which are ZER-domain because the EMITTER created the sharing), a
-  systematic "merged vs first_live-only" audit of every `IRPathState` field,
-  cross-module spawn/extern interaction between ZER modules, and NODE_STRUCT_INIT
-  global read in a spawn body).
+  remained — emitter-runtime globals, the "merged vs first_live-only" `IRPathState`
+  audit, cross-module spawn/extern interaction between ZER modules, and
+  NODE_STRUCT_INIT global read in a spawn body. **All four were PROBED CLEAN on
+  2026-08-03 — see §24.5c**, which also records the one hole the sweep did find
+  (a width-blind `volatile` exemption) and the failure mode it represents.
   **SCOPE CORRECTION 2026-08-03:** this list previously also named "FFI callback
   tables". That is a FLOOR, not residue, and listing it here contradicted this
   document's own scoping — §7.4 / §13.1 / §13.5 all state the closure claim only
@@ -2346,6 +2346,45 @@ runtime check. Only the var-decl-init form registered the alias. Fixed at
 `IR_ASSIGN`. Worth noting as evidence for the axis-crossed-grid method: a
 concurrency oracle found a single-threaded use-after-free, because the axis it
 crosses (carrier shape) is orthogonal to the domain it was written for.
+
+### 24.5c The residue of 24.5, PROBED (2026-08-03)
+
+24.5 called four items "still-unprobed residue". They were probed — ~40 shapes,
+deliberately crossed with the CARRIER axis that produced the same day's spawn-arg
+holes (24.5b), on the theory that an axis orthogonal to the domain is where a
+form-coverage gap hides.
+
+**All four came back clean.**
+
+| Item | Shapes | Result |
+|---|---|---|
+| emitter-runtime globals (auto-slab, Pool/Slab/Ring metadata) | direct, transitive, via funcptr, call depth 1..20 | all rejected |
+| NODE_STRUCT_INIT global read in a spawn body | flat / nested / array-typed initializer | all rejected |
+| cross-module spawn / extern interaction | imported fn writing its own module's global | rejected, names the global |
+| CFG-form coverage (the `IRPathState` merged-vs-first_live proxy) | one-arm if, loop body, switch arm, goto label, defer body, orelse fallback | all rejected |
+
+Also clean beyond the list: the global reached through a wrapper expression (cast,
+intrinsic arg, array index, bit-slice, orelse operand); laundered through a pointer
+(`&g` -> `*p`, via a helper, via a `*opaque` `@ptrcast` round-trip, via a struct
+field, passed as a spawn arg); sibling threads; ISR x spawn; a global struct with a
+pointer field; threadlocal `&`-escape; a global array element; and a global write
+inside a callee's `defer`.
+
+**One hole, and it was in an EXEMPTION rather than a scan.** The volatile
+exclusion (`if (sym->is_volatile) return false;`) is an "explicit low-level
+opt-in", deliberate and pinned by a positive test whose comment names the rationale:
+the **single-word** volatile-flag idiom. The check never tested width, so
+`volatile u64` written from a spawned thread was accepted on a 32-bit target, where
+the store lowers to two stores and can tear. Now width-limited to a scalar no wider
+than `target_ptr_bits`; target-aware, so the same program is still accepted at
+`--target-bits 64`.
+
+**The generalizable lesson.** Every other probe targeted whether a SCAN reaches a
+form. The hole was in an EXEMPTION whose written justification was narrower than
+its code. That is a distinct failure mode worth probing for directly: for each
+exemption in a safety gate, read its stated rationale and check the code actually
+enforces every qualifier in that sentence. Here the qualifier was one word —
+"single-word" — and it was load-bearing.
 
 ### 24.6 Completeness — the four NECESSARY conditions, and how to PROVE it (Iris, not more sweeps)
 

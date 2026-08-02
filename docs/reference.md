@@ -2855,7 +2855,15 @@ borrowed by that thread until `.join()`:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)
   - Transitive: follows callees 8 levels deep
-- Escape hatches: `volatile` global, `shared struct`, `threadlocal`, `@atomic_*`, `const`
+- Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
+  **single-word** `volatile` global
+- `volatile` is the narrowest of these and is **not synchronization** — it gives no
+  atomicity and no ordering. It is accepted only for the single-word flag idiom
+  (a plain store/load of a scalar no wider than the target word). Rejected:
+  a compound `g += 1` (non-atomic read-modify-write), a global wider than the
+  target word such as `volatile u64` on a 32-bit target (the store lowers to two
+  stores and can tear), and a volatile aggregate. For anything beyond a one-way
+  flag, use `shared struct` or `@atomic_*`
 - spawn inside `@critical` → compile error (direct + transitive via function summaries)
 - spawn inside `async` function → compile error (thread may outlive coroutine)
 - spawn inside interrupt handler → compile error (direct + transitive)

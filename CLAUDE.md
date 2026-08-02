@@ -1056,7 +1056,19 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 > `docs/limitations.md`. **Still do NOT claim ZER is fully data-race-safe** — the
 > §24.5 residue (emitter-runtime globals, the `IRPathState` merged-vs-first_live
 > audit, cross-module spawn, NODE_STRUCT_INIT global read in a spawn body) is
-> in-scope and unprobed; only cinclude/FFI is a floor.
+> **PROBED CLEAN 2026-08-03** (~40 shapes, crossed with the carrier axis) — see
+> primitives-data-races.md §24.5c. Only cinclude/FFI is a floor. The sweep found
+> ONE hole, and it was in an EXEMPTION rather than a scan: the `volatile` spawn
+> exclusion exists for the **single-word** flag idiom but never tested width, so a
+> `volatile u64` store from a thread was accepted on a 32-bit target (two stores,
+> tearable). Now width-limited to `target_ptr_bits`.
+>
+> **Generalizable, worth probing for directly: an EXEMPTION whose written
+> rationale is narrower than its code.** Every other probe asked "does the scan
+> reach this form?"; this one was a gate that correctly skipped a case its own
+> comment had already qualified ("single-word") without the code enforcing the
+> qualifier. For each exemption in a safety gate, read its stated justification and
+> check every qualifier in that sentence is actually tested.
 > **D1 (cinclude thread-capture) is a named FLOOR, not a hole** — C-domain behavior,
 > out of scope; the safe path exists today (hand capturing externs long-lived data —
 > global / `shared struct` instance / Pool/Slab — never `&stack_local`). Full

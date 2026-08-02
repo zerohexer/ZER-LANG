@@ -1,0 +1,23 @@
+// zerc-flags: --target-bits 32
+// EXPECTED: compile error
+// expect-error: accesses non-shared global
+// A volatile global WIDER than the target word, written from a spawned thread.
+//
+// The volatile exclusion in the spawn global scan exists for the SINGLE-WORD
+// volatile-flag idiom (see tests/zer/spawn_volatile_store_ok.zer, which stays
+// allowed). The rationale is width-bounded; the check was not. On a 32-bit
+// target a `volatile u64` store lowers to TWO 32-bit stores, so a concurrent
+// reader can observe half of one write and half of another — a torn read the
+// single-word argument never covered.
+//
+// Target-aware: the SAME program is accepted with --target-bits 64, where the
+// store really is single-word. Use a shared struct or @atomic_* instead.
+volatile u64 big;
+
+void w(u32 a) { big = 5; }
+
+u32 main() {
+    spawn w(1);
+    big = 0;
+    return 0;
+}

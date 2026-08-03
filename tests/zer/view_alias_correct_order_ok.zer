@@ -1,0 +1,35 @@
+// Boundary for the 2026-08-03e view-alias fix: linking a view to its base must
+// not reject the CORRECT orderings. Without these the alias arm could tighten
+// into an over-rejection unnoticed.
+struct B { u32 v; }
+struct H { *B p; }
+
+*B first([*]B s) { return &s[0]; }
+
+// A view of a PARAM is the caller's memory — never a local escape.
+u32 read_via_view([*]B s) { H h; h.p = &s[0]; return h.p.v; }
+
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+
+    // 1. use the view, THEN free
+    H h;
+    h.p = first(s);
+    u32 a = h.p.v;
+
+    // 2. view of a param inside a helper
+    u32 b = read_via_view(s);
+
+    // 3. subslice view used before the free
+    H g;
+    g.p = &s[1];
+    s[1].v = 4;
+    u32 c = g.p.v;
+
+    free(s);
+    if (a != 9) { return 2; }
+    if (b != 9) { return 3; }
+    if (c != 4) { return 4; }
+    return 0;
+}

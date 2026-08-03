@@ -336,6 +336,14 @@ callee may return position i. Grounded by `param_lattice.v`. Full map + the read
 compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
 slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
 
+**FORMING a reference aliases; READING a value does not (2026-08-03e).** When widening any
+alias/escape rule to "view" expressions, the outermost node must be `&expr` or a SLICE. A bare
+`h.field` / `s[0]` READS a value out of the allocation and must NOT inherit its alias — peeling
+those propagated a move-struct's TRANSFERRED state and broke `test_modules/move_user`
+("use of transferred handle" on a freshly created token). Below a `&`/slice root, index/field
+steps are navigation within the same allocation and peel freely. `make check` caught this;
+reasoning about it did not.
+
 **MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS — enumerate ALL sibling sites,
 never fix just the reported one, and gate the class so a new sibling can't silently
 regress.** The escape patchwork above is ONE instance of a GENERAL shape: the SAME

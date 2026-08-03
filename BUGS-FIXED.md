@@ -5,6 +5,61 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03f — VIEW aliases lost at a projected target and through a call (ASan-proven UAF)
+
+Reported by audit branch `claude/gifted-noether-8j6w19` as "through-call
+param-VIEW return"; independently reproduced, and the isolation showed it was
+TWO gaps that happen to meet, not one.
+
+**Gap 1 — projected target + view RHS.** Measured; both factors required:
+
+| target | RHS | before |
+|---|---|---|
+| bare local | `&s[0]` | tracked |
+| struct field | `s` (ident) | tracked |
+| **struct field** | **`&s[0]`** | **LOST — ASan heap-use-after-free** |
+
+A view RHS is not a `NODE_IDENT` so the existing alias arm skipped it, and a
+projected target emits no `IR_COPY` (where the alias logic lives) — the IR is a
+bare `ASSIGN <expr>`. The pair fell through everything.
+
+**Gap 2 — the return summary never recorded a partial view.** Arm (a) matches
+`return s` (identity, added 2026-08-02) and arm (b) matches `return (T)s` via
+alloc_id. `return &s[0]` returns a TEMP that is neither, so no summary existed.
+New arm (c) finds the instruction defining the returned temp and peels its
+expression to a root param.
+
+**Gap 2b — the call site.** `h.p = first(s)` emits NO separate `IR_CALL`; the
+call stays inside the passthrough `ASSIGN` expr, so Phase F's call-site aliasing
+never ran. The assign arm now mirrors that substitution (consult the callee
+summary, substitute the matching arg).
+
+Together these close the remaining half of the BUG-764 "return a view of a
+param" relaxation — the identity arm closed `return s`, this closes
+`return <view of s>`.
+
+**A regression I caused, and what it taught.** The first cut peeled a bare
+`h.field` / `s[0]` as a view too. Those are VALUE READS, not references —
+aliasing the target to the base propagated the base's state, and
+`test_modules/move_user` started reporting "use of transferred handle" on
+`Token t = create_token(42); verify_token(t);`. `make check` caught it; my
+reasoning had not. Fixed by requiring the expression to actually FORM a
+reference — the outermost node must be `&expr` or a SLICE. Below that root,
+index/field steps are navigation within the same allocation and peel freely.
+The same restriction was applied to arm (c).
+
+That distinction is the load-bearing one for anyone touching this: *forming a
+reference* (`&x.f`, `s[1..]`) aliases; *reading a value* (`x.f`, `s[0]`) does not.
+
+Tests: `tests/zer_fail/view_alias_struct_field_uaf.zer`,
+`view_alias_through_call_uaf.zer` (both verified to COMPILE on a pre-fix build),
+and `tests/zer/view_alias_correct_order_ok.zer` pinning the correct orderings
+(use-before-free, view of a param inside a helper, subslice used before free).
+
+**Noted, not fixed:** a view of a LOCAL ARRAY through a call
+(`B[4] a; *B p = first(a);`) is rejected as a LEAK. Verified PRE-EXISTING
+(identical before and after this change), so it is a separate false positive.
+
 ## Session 2026-08-03e — the ISR sibling of the volatile width hole (my own miss)
 
 The spawn-path `volatile` width guard shipped in a3d8879f. **`volatile` exempts a

@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A VIEW of a heap allocation stored into a STRUCT FIELD lost its alias, so
+// freeing the base and then reading through the field was accepted — ASan-
+// confirmed heap-use-after-free.
+//
+// Both factors were required; neither alone loses the alias:
+//     *B p = &s[0];       bare target,  view RHS   -> already tracked
+//     H h; h.p = s;       struct field, ident RHS  -> already tracked
+//     H h; h.p = &s[0];   struct field + view RHS  -> LOST
+//
+// A view RHS is not a NODE_IDENT, and a projected target emits no IR_COPY
+// (where the alias logic lives) — the IR is a bare `ASSIGN <expr>`. So the pair
+// fell through every arm.
+struct B { u32 v; }
+struct H { *B p; }
+
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+    H h;
+    h.p = &s[0];
+    free(s);
+    return h.p.v;
+}

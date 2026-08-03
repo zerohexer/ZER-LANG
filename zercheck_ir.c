@@ -3345,23 +3345,99 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * only when the source has a TRACKED allocation (alloc_id != 0), so
          * assigning a param / stack pointer is unaffected. Self-assignment and
          * compound ops (`+=`) are excluded. */
+        /* 2026-08-03e: WIDENED from "bare ident RHS into a bare local" to cover
+         * a VIEW expression assigned into a PROJECTED target. Measured, both
+         * factors required — neither alone loses the alias:
+         *
+         *     *B p = &s[0];       bare target,   view RHS   -> tracked
+         *     H h; h.p = s;       struct field,  ident RHS  -> tracked
+         *     H h; h.p = &s[0];   struct field + view RHS   -> LOST (ASan UAF)
+         *
+         * The view RHS (`&s[0]`, `s[1..]`, `&s.f`) is not a NODE_IDENT so the
+         * original arm skipped it, and a projected target emits no IR_COPY (where
+         * the alias logic otherwise lives) — the IR shows a bare
+         * `ASSIGN <expr>` with no COPY. So the pair fell through everything.
+         *
+         * Walk the RHS through &/index/slice/field to a root IDENT, resolve the
+         * TARGET with ir_extract_compound_key (handles bare AND compound), and
+         * link. Fires only when the root has a TRACKED allocation (alloc_id != 0),
+         * so a view of a param or stack local is unaffected. */
         if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
             inst->expr->assign.op == TOK_EQ &&
-            inst->expr->assign.value &&
-            inst->expr->assign.value->kind == NODE_IDENT) {
-            int a_dst = ir_find_value_local(func, inst->expr->assign.target);
-            int a_src = ir_find_local(func,
-                            inst->expr->assign.value->ident.name,
-                            (uint32_t)inst->expr->assign.value->ident.name_len);
-            if (a_dst >= 0 && a_src >= 0 && a_dst != a_src) {
-                IRHandleInfo *asrc_h = ir_find_handle(ps, a_src);
-                if (asrc_h && asrc_h->alloc_id != 0) {
-                    IRAliasSnapshot asnap;
-                    ir_snapshot_alias(&asnap, asrc_h);
-                    IRHandleInfo *adst_h = ir_add_handle(ps, a_dst);
-                    if (adst_h) {
-                        ir_apply_alias(adst_h, &asnap);
-                        adst_h->state = asnap.state;
+            inst->expr->assign.value) {
+            Node *rv = inst->expr->assign.value;
+            /* Peel to the root identifier — but ONLY for an expression that
+             * actually FORMS A REFERENCE into the allocation.
+             *
+             * 2026-08-03e: a first cut peeled a bare `h.field` / `s[0]` too, and
+             * that is a VALUE READ, not a view. Aliasing the target to the base
+             * then propagated the base's state — `Token t = create_token(42);
+             * verify_token(t);` started reporting "use of transferred handle"
+             * (test_modules/move_user). Caught by make check, not by reasoning.
+             *
+             * A reference is formed only by `&expr` or a SLICE expression. Below
+             * that root, index/field/deref steps are just navigation to the same
+             * allocation and are peeled freely. A plain ident RHS is handled as
+             * before (identity alias, peeled == 0). */
+            int peeled = 0;
+            bool forms_ref = (rv && ((rv->kind == NODE_UNARY && rv->unary.op == TOK_AMP) ||
+                                     rv->kind == NODE_SLICE));
+            if (forms_ref) {
+                while (rv && peeled < 32) {
+                    if (rv->kind == NODE_UNARY && rv->unary.op == TOK_AMP) rv = rv->unary.operand;
+                    else if (rv->kind == NODE_INDEX) rv = rv->index_expr.object;
+                    else if (rv->kind == NODE_SLICE) rv = rv->slice.object;
+                    else if (rv->kind == NODE_FIELD) rv = rv->field.object;
+                    else break;
+                    peeled++;
+                }
+            }
+            /* RHS is a CALL that returns a view of one of its args
+             * (`h.p = first(s)`). This shape emits NO separate IR_CALL — the
+             * call stays inside the passthrough ASSIGN expr — so Phase F's
+             * call-site aliasing (~4680) never runs for it. Mirror it here:
+             * consult the callee summary and substitute the matching ARG, so the
+             * projected target inherits the argument's alloc_id. Without this,
+             * `h.p = first(s); free(s); use(h.p)` was ASan-confirmed
+             * heap-use-after-free. */
+            if (rv && rv->kind == NODE_CALL && rv->call.callee &&
+                rv->call.callee->kind == NODE_IDENT) {
+                const char *cn = rv->call.callee->ident.name;
+                uint32_t cnl = (uint32_t)rv->call.callee->ident.name_len;
+                FuncSummary *cs = NULL;
+                for (int si = 0; si < zc->summary_count; si++) {
+                    if (zc->summaries[si].func_name_len == cnl &&
+                        memcmp(zc->summaries[si].func_name, cn, cnl) == 0) {
+                        cs = &zc->summaries[si]; break;
+                    }
+                }
+                if (cs && cs->returns_param_color > 0) {
+                    int pidx = cs->returns_param_color - 1;
+                    if (pidx >= 0 && pidx < rv->call.arg_count &&
+                        rv->call.args[pidx] &&
+                        rv->call.args[pidx]->kind == NODE_IDENT)
+                        rv = rv->call.args[pidx];   /* substitute the arg */
+                }
+            }
+            if (rv && rv->kind == NODE_IDENT) {
+                int a_src = ir_find_local(func, rv->ident.name,
+                                          (uint32_t)rv->ident.name_len);
+                int d_root; const char *d_path; uint32_t d_plen;
+                int okk = ir_extract_compound_key(zc, func, inst->expr->assign.target,
+                                                  &d_root, &d_path, &d_plen);
+                if (a_src >= 0 && okk == 0 &&
+                    !(d_plen == 0 && d_root == a_src)) {
+                    IRHandleInfo *asrc_h = ir_find_handle(ps, a_src);
+                    if (asrc_h && asrc_h->alloc_id != 0) {
+                        IRAliasSnapshot asnap;
+                        ir_snapshot_alias(&asnap, asrc_h);
+                        IRHandleInfo *adst_h = (d_plen == 0)
+                            ? ir_add_handle(ps, d_root)
+                            : ir_add_compound_handle(ps, d_root, d_path, d_plen);
+                        if (adst_h) {
+                            ir_apply_alias(adst_h, &asnap);
+                            adst_h->state = asnap.state;
+                        }
                     }
                 }
             }
@@ -5967,6 +6043,63 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 /* (b) the returned local's handle shares an alloc_id with a
                  * param — the "return a CAST of param" alias pattern. */
+                /* (c) 2026-08-03e: the return is a partial VIEW of a param —
+                 * `*B first([*]B s) { return &s[0]; }`, `s[1..]`, `&s.f`.
+                 *
+                 * Arm (a) needs the returned local to BE the param and (b) needs
+                 * it to share a param's alloc_id; a view returns a TEMP that is
+                 * neither, so both bailed and the summary stayed unset. The call
+                 * site then registered the result as an unrelated value:
+                 * `h.p = first(s); free(s); use(h.p)` compiled clean and was
+                 * ASan-confirmed heap-use-after-free.
+                 *
+                 * This is the remaining half of the BUG-764 relaxation hole — the
+                 * 2026-08-02 identity arm (a) closed `return s`, and this closes
+                 * `return <view of s>`. Both are views of caller memory, so both
+                 * must inherit the arg's alloc_id at the call site.
+                 *
+                 * The temp is defined by an earlier instruction in this block
+                 * (`%1 = ASSIGN <expr>` holding the &-expression), so find that
+                 * definition and peel its expr through &/index/slice/field to a
+                 * root ident. Conservative: only a root that IS a param matches;
+                 * anything else leaves match_param < 0 and the caller falls back
+                 * to "mixed", which over-rejects rather than under-rejects. */
+                if (match_param < 0) {
+                    Node *vexpr = NULL;
+                    for (int ii = bb->inst_count - 1; ii >= 0; ii--) {
+                        if (bb->insts[ii].dest_local == rlocal && bb->insts[ii].expr) {
+                            vexpr = bb->insts[ii].expr; break;
+                        }
+                    }
+                    if (vexpr && vexpr->kind == NODE_ASSIGN && vexpr->assign.value)
+                        vexpr = vexpr->assign.value;
+                    /* Same restriction as the assign arm: only `&expr` or a
+                     * SLICE returns a REFERENCE into the param. `return s.field`
+                     * / `return s[0]` return a VALUE and must not alias. */
+                    int peel = 0;
+                    if (vexpr && ((vexpr->kind == NODE_UNARY && vexpr->unary.op == TOK_AMP) ||
+                                  vexpr->kind == NODE_SLICE)) {
+                        while (vexpr && peel < 32) {
+                            if (vexpr->kind == NODE_UNARY && vexpr->unary.op == TOK_AMP)
+                                vexpr = vexpr->unary.operand;
+                            else if (vexpr->kind == NODE_INDEX) vexpr = vexpr->index_expr.object;
+                            else if (vexpr->kind == NODE_SLICE) vexpr = vexpr->slice.object;
+                            else if (vexpr->kind == NODE_FIELD) vexpr = vexpr->field.object;
+                            else break;
+                            peel++;
+                        }
+                    }
+                    if (peel > 0 && vexpr && vexpr->kind == NODE_IDENT) {
+                        int vroot = ir_find_local_exact_first(func,
+                            vexpr->ident.name, (uint32_t)vexpr->ident.name_len);
+                        for (int pi = 0; pi < pc && vroot >= 0; pi++) {
+                            ParamDecl *p = &fn->func_decl.params[pi];
+                            int plocal = ir_find_local_exact_first(func,
+                                p->name, (uint32_t)p->name_len);
+                            if (plocal >= 0 && plocal == vroot) { match_param = pi; break; }
+                        }
+                    }
+                }
                 if (match_param < 0) {
                     IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
                     if (!rh) { inferred_param = -1; break; }

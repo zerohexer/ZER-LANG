@@ -1,0 +1,29 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A function returning a partial VIEW of its param (`&s[0]`, not `s` itself),
+// with the result stored in a struct field. Two independent gaps met here:
+//
+// 1. The return-summary inference matched `return s` (identity, arm a) and
+//    `return (T)s` (alloc_id, arm b), but a view returns a TEMP that is
+//    neither — so no summary was recorded. New arm (c) peels &/index/slice/
+//    field to a root param.
+// 2. `h.p = first(s)` emits NO separate IR_CALL — the call stays inside the
+//    passthrough ASSIGN expr — so Phase F's call-site aliasing never ran. The
+//    assign arm now mirrors that substitution.
+//
+// This is the remaining half of the BUG-764 "return a view of a param"
+// relaxation: the 2026-08-02 identity arm closed `return s`, this closes
+// `return <view of s>`.
+struct B { u32 v; }
+struct H { *B p; }
+
+*B first([*]B s) { return &s[0]; }
+
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+    H h;
+    h.p = first(s);
+    free(s);
+    return h.p.v;
+}

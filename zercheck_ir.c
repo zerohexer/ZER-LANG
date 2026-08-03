@@ -2022,6 +2022,96 @@ static Node *ir_defer_free_arg(Node *node) {
     return NULL;
 }
 
+/* Is there REAL WORK reachable after this defer fire?
+ *
+ * The discriminator between a BLOCK-scoped fire (mid-function, whose frees must
+ * be applied in the forward pass so a later use is checked against them) and the
+ * FUNCTION-EXIT fire (which Phase C3 already handles correctly at return blocks,
+ * including the LIFO use/free interleave).
+ *
+ * Measured IR:
+ *   block-scoped   bb3: DEFER_FIRE          -> bb4: DEFER_FIRE, CALL use, RETURN
+ *   function-exit  bb1: DEFER_FIRE          -> bb3: DEFER_FIRE, RETURN
+ * so "anything after the fire that is not defer bookkeeping / control flow"
+ * separates them exactly.
+ *
+ * This matters because applying frees at a function-exit fire BREAKS the LIFO
+ * contract: `defer free(p); defer use_it(p);` fires the USE first (against a
+ * still-alive p), and a forward-pass free made C3's deferred-use scan report a
+ * false use-after-free (tests/zer/defer_lifo_safe, defer_free_pattern_ok).
+ * C3 owns that ordering; this only covers what C3 cannot see. */
+static bool ir_fire_has_work_after(IRFunc *func, IRInst *fire) {
+    if (!func || !fire) return false;
+    /* locate the fire by pointer — the walker does not carry its index */
+    int start_block = -1, start_inst = -1;
+    for (int bi0 = 0; bi0 < func->block_count && start_block < 0; bi0++) {
+        IRBlock *bb0 = &func->blocks[bi0];
+        for (int ii0 = 0; ii0 < bb0->inst_count; ii0++) {
+            if (&bb0->insts[ii0] == fire) { start_block = bi0; start_inst = ii0; break; }
+        }
+    }
+    if (start_block < 0) return false;
+    int seen_cap = func->block_count > 0 ? func->block_count : 1;
+    char *seen = (char *)calloc((size_t)seen_cap, 1);
+    if (!seen) return false;
+    int *stack = (int *)malloc((size_t)seen_cap * sizeof(int));
+    if (!stack) { free(seen); return false; }
+    int sp = 0;
+    bool found = false;
+    int bi = start_block, from_inst = start_inst + 1;
+    for (;;) {
+        if (bi >= 0 && bi < func->block_count && !seen[bi]) {
+            if (from_inst == 0) seen[bi] = 1;   /* only mark on a full visit */
+            IRBlock *bb = &func->blocks[bi];
+            for (int ii = from_inst; ii < bb->inst_count && !found; ii++) {
+                IROpKind op = bb->insts[ii].op;
+                if (op == IR_DEFER_FIRE || op == IR_DEFER_PUSH ||
+                    op == IR_GOTO || op == IR_RETURN || op == IR_BRANCH) continue;
+                found = true;
+            }
+            if (found) break;
+            /* IRBlock records PREDS, not succs — derive the successors of `bi`
+             * by finding every block that lists `bi` as a predecessor. */
+            for (int sb = 0; sb < func->block_count && sp < seen_cap; sb++) {
+                if (seen[sb]) continue;
+                IRBlock *cand = &func->blocks[sb];
+                for (int pi = 0; pi < cand->pred_count; pi++) {
+                    if (cand->preds[pi] == bi) { stack[sp++] = sb; break; }
+                }
+            }
+        }
+        if (sp == 0) break;
+        bi = stack[--sp];
+        from_inst = 0;
+    }
+    free(stack); free(seen);
+    return found;
+}
+
+/* PUSH-order index of a defer body, using the SAME ordering Phase C3 builds its
+ * dfs[] with (every IR_DEFER_PUSH, block order then instruction order). Returns
+ * index+1 as the per-defer instance id — 0 means "not found", matching C3's
+ * convention where 0 is reserved for "freed by something other than a defer".
+ *
+ * The ids MUST agree: C3 re-applies every defer's frees at each return block and
+ * only skips the double-free report when freed_defer_id == that defer's id. A
+ * mismatch would turn this fix into a false double-free on every block-scoped
+ * defer. */
+static int ir_defer_instance_id(IRFunc *func, Node *body) {
+    if (!func || !body) return 0;
+    int k = 0;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op != IR_DEFER_PUSH || !in->defer_body) continue;
+            if (in->defer_body == body) return k + 1;
+            k++;
+        }
+    }
+    return 0;
+}
+
 /* Walk a defer body. For each free found, resolve the argument to a
  * tracked handle (bare or compound) and mark it FREED at defer_line.
  * Recursively walks NODE_BLOCK so multi-statement defers are covered. */
@@ -5365,7 +5455,44 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_LOCK: case IR_UNLOCK:
     case IR_ARENA_RESET: case IR_RING_PUSH: case IR_RING_POP:
     case IR_RING_PUSH_CHECKED:
-    case IR_DEFER_PUSH: case IR_DEFER_FIRE:
+    case IR_DEFER_FIRE: {
+        /* 2026-08-03f: a BLOCK-scoped defer fires mid-function, and its frees
+         * were never applied in the forward pass — IR_DEFER_FIRE sat in the
+         * no-op list and Phase C3 applies defer frees only at RETURN blocks. So
+         *
+         *     { defer free(p); }      <- fires HERE
+         *     u32 r = use(p);         <- checked against a state where p is ALIVE
+         *
+         * compiled clean and read the freed slot (verified: returns 222; the
+         * emitted C frees at block exit, then calls use(p)).
+         *
+         * Apply the frees at the fire point, but only for a fire that actually
+         * EMITS its bodies (src2_local != 2 — the same flag ir_validate uses to
+         * decide a push has a reachable body-emitting fire). A non-emitting fire
+         * is bookkeeping and must not free anything.
+         *
+         * The instance id must match C3's k+1 so its return-block re-application
+         * sees freed_defer_id == id and skips the double-free report.
+         * Monotonic — FREED is idempotent — so the CFG fixpoint still converges.
+         *
+         * Return values are computed BEFORE their fire in IR order, so
+         * `defer free(h); return h.field;` is unaffected (pinned by a positive
+         * test). */
+        if (inst->src2_local != 2 && inst->defer_fire_bodies &&
+            ir_fire_has_work_after(func, inst)) {
+            /* LIFO: defers fire in reverse registration order, mirroring C3. */
+            for (int dbi = inst->defer_fire_body_count - 1; dbi >= 0; dbi--) {
+                Node *dbody = inst->defer_fire_bodies[dbi];
+                if (!dbody) continue;
+                int did = ir_defer_instance_id(func, dbody);
+                if (did > 0)
+                    ir_defer_scan_frees(zc, func, ps, dbody,
+                                        inst->source_line, did);
+            }
+        }
+        break;
+    }
+    case IR_DEFER_PUSH:
     case IR_INTRINSIC:
     case IR_BINOP: case IR_LITERAL:
     case IR_ADDR_OF: case IR_DEREF_READ:
@@ -5574,7 +5701,20 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
 
     bool changed = true;
     int iterations = 0;
-    const int MAX_ITERATIONS = 32;
+    /* 2026-08-03f: raised 32 -> 96. The block-scoped defer fix applies a fire's
+     * frees in the FORWARD pass, so a FREED state must now propagate outward
+     * through every enclosing scope instead of appearing only at return blocks.
+     * That costs roughly one extra iteration per nesting level, and a 32-level
+     * nested `if` chain with a defer at the innermost hit the old cap exactly
+     * (measured: depth <=28 converged, 32 did not).
+     *
+     * The cap is a FAIL-CLOSED safety valve against pathological input, not a
+     * correctness bound — exceeding it produces a loud error, never a silent
+     * accept. Raising it costs compile time only on input that was already
+     * near-pathological. 96 leaves ~3x headroom over the deepest shape in the
+     * suite; if this is ever hit again, investigate the propagation depth rather
+     * than raising it further. */
+    const int MAX_ITERATIONS = 96;
     while (changed && iterations < MAX_ITERATIONS) {
         changed = false;
         iterations++;

@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03g — block-scoped `defer free` then use-after-block (live UAF)
+
+Confirmed live before the fix: compiles clean, returns **222** — the emitted C
+frees at block exit and then calls `use(p)` on the recycled slot.
+
+```zer
+{ defer free(p); }      // fires HERE
+u32 r = use(p);         // checked against a state where p is still ALIVE
+```
+
+**Cause.** `IR_DEFER_FIRE` sat in zercheck_ir's NO-OP case list, and Phase C3
+applies defer frees only at RETURN blocks. A block-scoped fire happens
+mid-function, so nothing ever applied its frees before the later use.
+
+**Fix.** A real `IR_DEFER_FIRE` handler applies the fire's frees in the forward
+pass, via the existing `ir_defer_scan_frees`, using the SAME per-defer instance
+id Phase C3 uses (PUSH order + 1) so C3's return-block re-application sees
+`freed_defer_id == id` and does not report a false double free. Monotonic (FREED
+is idempotent), so the fixpoint still converges.
+
+**Two things the test suite caught that reasoning did not.**
+
+1. **LIFO.** The first cut applied every fire's frees, in registration order.
+   That broke `defer free(p); defer use_it(p);` — LIFO means the USE fires
+   FIRST, against a still-alive handle, and C3 owns that interleave.
+   `defer_lifo_safe` and `defer_free_pattern_ok` both started reporting a false
+   use-after-free. Fixed two ways: iterate bodies in reverse (LIFO), and gate the
+   whole application on `ir_fire_has_work_after` — apply only when real work is
+   reachable after the fire. The measured IR is what separates them:
+
+   ```
+   block-scoped   bb3: DEFER_FIRE  ->  bb4: DEFER_FIRE, CALL use, RETURN
+   function-exit  bb1: DEFER_FIRE  ->  bb3: DEFER_FIRE, RETURN
+   ```
+
+   So a function-exit fire is left entirely to C3, which handles it correctly.
+   (`IRBlock` records preds, not succs, so the helper derives successors by
+   finding blocks that list the current one as a predecessor.)
+
+2. **Fixpoint iteration depth.** Applying frees in the forward pass means a FREED
+   state now propagates outward through every enclosing scope instead of only
+   appearing at return blocks — roughly one extra iteration per nesting level. A
+   32-level nested `if` with a defer at the innermost hit the old
+   `MAX_ITERATIONS = 32` cap exactly (measured: depth <=28 converged, 32 did
+   not), turning a previously-compiling file into a non-convergence error.
+   Raised to 96. Verified parity: pre-fix and post-fix now give IDENTICAL results
+   at depths 32 / 48 / 64 / 96 — depth 64+ failed before this change too. The cap
+   is a FAIL-CLOSED valve (a loud, actionable error, never a silent accept), not a
+   correctness bound.
+
+Tests: `tests/zer_fail/defer_block_scoped_uaf.zer` (verified to COMPILE on a
+pre-fix build) and `tests/zer/defer_fire_position_ok.zer` pinning the four shapes
+where the use legally precedes the fire — BUG-442 (`defer free(h); return
+h.field`, the riskiest), use inside the block, a defer in a loop body, and two
+sibling blocks with independent allocations.
+
+Reported by audit branch `claude/gifted-noether-8j6w19` as a documented-not-fixed
+accept-unsafe; independently reproduced and fixed here.
+
 ## Session 2026-08-03f — VIEW aliases lost at a projected target and through a call (ASan-proven UAF)
 
 Reported by audit branch `claude/gifted-noether-8j6w19` as "through-call

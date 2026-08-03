@@ -1,0 +1,50 @@
+// Boundary for the 2026-08-03f block-scoped-defer fix. Applying a defer's frees
+// at the FIRE POINT must not false-positive on the shapes where the use legally
+// precedes the fire. The riskiest is BUG-442: a return expression is evaluated
+// BEFORE the function-exit defers run.
+struct T { u32 v; }
+
+// 1. BUG-442 — return value computed before the fire
+u32 ret_then_free() {
+    *T p = alloc(T) orelse { return 1; };
+    p.v = 7;
+    defer free(p);
+    return p.v;            // must be 7, not a UAF
+}
+
+// 2. use INSIDE the block, before its own fire
+u32 use_inside_block() {
+    *T p = alloc(T) orelse { return 1; };
+    p.v = 5;
+    u32 r = 0;
+    { defer free(p); r = p.v; }
+    return r;
+}
+
+// 3. defer in a loop body — fires each pass against that pass's allocation
+u32 loop_defers() {
+    u32 t = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        *T p = alloc(T) orelse { return 0; };
+        p.v = 2;
+        defer free(p);
+        t += p.v;
+    }
+    return t;
+}
+
+// 4. two sibling blocks, independent allocations
+u32 sibling_blocks() {
+    u32 t = 0;
+    { *T a = alloc(T) orelse { return 0; }; a.v = 1; defer free(a); t += a.v; }
+    { *T b = alloc(T) orelse { return 0; }; b.v = 2; defer free(b); t += b.v; }
+    return t;
+}
+
+u32 main() {
+    if (ret_then_free() != 7) { return 1; }
+    if (use_inside_block() != 5) { return 2; }
+    if (loop_defers() != 6) { return 3; }
+    if (sibling_blocks() != 3) { return 4; }
+    return 0;
+}

@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A BLOCK-scoped `defer free` fires at the end of its block, but its frees were
+// never applied in the forward pass: IR_DEFER_FIRE sat in zercheck_ir's no-op
+// list, and Phase C3 applies defer frees only at RETURN blocks. So the use after
+// the block was checked against a state where `p` was still ALIVE.
+//
+// Verified live before the fix: compiled clean and returned 222 — the emitted C
+// frees at block exit and then calls use(p) on the recycled slot.
+//
+// The fix applies a body-EMITTING fire's frees at the fire point, using the same
+// per-defer instance id Phase C3 uses (PUSH order + 1) so C3's return-block
+// re-application recognises the same instance and does not report a false
+// double free.
+struct T { u32 v; }
+
+u32 use(*T p) { return p.v; }
+
+u32 main() {
+    *T p = alloc(T) orelse { return 1; };
+    p.v = 222;
+    { defer free(p); }
+    u32 r = use(p);
+    return r;
+}

@@ -454,7 +454,17 @@ satisfies the leak check, the double-free/UAF passes silently. The 2026-07-15 tr
 `bool *frees_param_field` on FuncSummary (definite/all-path field free of an aggregate param), detected by
 looking for a FREED compound handle rooted at the param local in every return block.
 
-### CRITICAL ACCEPT-UNSAFE — block-scoped `defer free/consume` UAF / use-after-move (`i0txin` `84097263`, 2026-07-30)
+### CRITICAL ACCEPT-UNSAFE — block-scoped `defer free/consume` UAF / use-after-move (`i0txin` `84097263`, 2026-07-30; RE-VERIFIED LIVE 2026-08-03e)
+**Re-verified live 2026-08-03e** (`{ defer free(p); } r = use(p);` compiles clean; the emitted C
+frees at block exit and `use(p)` reads the freed slot, returning 222). The `--emit-ir` confirms the
+fix is TRACTABLE: the block-scoped `IR_DEFER_FIRE` (bodies emitted, `src2_local != 2`) precedes the
+post-block use, and return-values are computed BEFORE their fire (so `defer free(h); return h.field;`
+would NOT false-positive). The fix is to apply a body-emitting fire's frees/uses in the FORWARD PASS
+at the fire point, using the per-defer instance id that Phase C3 already uses (build the `dfs[]`
+PUSH-ordering once, share it, map each `defer_fire_bodies[i]` to its `dfs` index+1) so C3's
+return-block re-application sees `freed_defer_id == id` and skips the false double-free. Monotonic
+(FREED is idempotent) so the fixpoint still converges. Needs a defer × fire-position grid verified
+against a pre-fix build before landing (it mutates the #1 safety analyzer's transfer function).
 A `defer free(p)` (or `defer consume(m)`) inside a NESTED block frees/moves at BLOCK EXIT (the intended ZER
 semantics), and the emitter emits the free there — but a USE after the block and before the function returns
 is silently accepted.
@@ -526,14 +536,13 @@ The unified root with the now-fixed §D6/§D7 borrow holes: the scoped-borrow / 
 intra-name and intra-function and does not treat `&x` handed to a helper as an access. Making it
 inter-procedural (a summary "does this callee access/borrow its pointer arg?") is subsystem-scale.
 
-### HIGH LOW — variable-index bit-slice WRITE: unclamped position shift is C UB (`n0odo5` `17ec74ca`, 2026-07-25)
-`reg[hi..lo] = v` with a RUNTIME `lo` lowers to `(uint64_t)(v) << _zer_bl` and `mask << _zer_bl`
-(emitter.c ~1708-1743 AST path + the IR mirror). When `lo >= 64` the shift count is out of range → C UB
-(x86 masks mod 64, other arches differ), violating ZER's stated "shift by ≥ width = 0 (defined)" guarantee.
-The WIDTH computation is already clamped; the POSITION shift is not. The companion bit-slice READ path was
-fixed for exactly this (audit #18, commit `c9e4abca`); the WRITE path was not.
-**Severity LOW** — the result is stored back through `*_zer_bp` typed to the carrier width, so the store
-truncates: a wrong VALUE / UB, **not** an out-of-bounds memory write.
+### ~~HIGH LOW — variable-index bit-slice WRITE: unclamped position shift is C UB~~ (FIXED 2026-08-03e)
+`reg[hi..lo] = v` with a RUNTIME `lo` lowered to `(uint64_t)(v) << _zer_bl` and `mask << _zer_bl`
+with NO clamp on the POSITION shift (only the WIDTH was clamped). When `lo >= 64` the shift count was out
+of range → C UB, violating ZER's "shift by ≥ width = 0" guarantee. **FIXED** on BOTH emitter paths (AST
+~1776, IR ~7041): each runtime position shift is now guarded `(_zer_bl >= objbits) ? 0 : (X << _zer_bl)`
+(positioned mask AND value), mirroring the READ-path #18 guard — an out-of-range position is a no-op.
+Regression: `tests/zer/bitslice_write_oob_position.zer`.
 
 ### LOW LOW — value-returning `async` has no result-retrieval API (`7fxhb3` `31796ef8`, 2026-07-28)
 `async u32 compute() { … return 42; }` compiles clean and the state machine correctly finalizes (BH-18 #10,
@@ -1308,12 +1317,89 @@ so the erased pointer becomes the fifth citizen of the pointer family (`{ptr, ty
   (`erased_map_get_ok.zer`); `rt_drop_conflict_uaf` + `erased_wrapper_double_free` still reject.
   Full `make check` GREEN. **A naive `ret_is_borrow`-only gate was accept-unsafe** (broke the
   interior-pointer UAF); `ret_is_content` is load-bearing — see §36.17 + the zercheck_ir.c
-  consumer comment. **Residual (pre-existing, NOT a regression):** a param-VIEW return
-  (`return &s.field`) still over-rejects with a leak false-positive — deliberately kept because it
-  incidentally catches the through-call interior-pointer UAF (which zercheck does not otherwise
-  catch). Fixing that properly (infer `returns_param_color` for `&param.field` so the caller
-  aliases the result to the arg → a real UAF, then leak-suppress the view too) is a separate future
-  refinement.
+  consumer comment. **Residual — see the CORRECTION below: this is an ACTIVE ACCEPT-UNSAFE, not
+  merely an over-rejection.**
+
+## OPEN — CRITICAL ACCEPT-UNSAFE — through-call param-VIEW return loses the alias → UAF / dangling escape / double-free (verified 2026-08-03e, ASan-proven)
+
+**Correction of the entry above.** The `*opaque` residual note claimed a param-VIEW return
+"still over-rejects with a leak false-positive — deliberately kept because it incidentally catches
+the through-call interior-pointer UAF." **That framing is WRONG and this is a live soundness hole.**
+The incidental leak-catch only fires when the view LEAKS. The moment the view ESCAPES via `return`
+(an ordinary accessor/iterator pattern) or is FREED, the leak check does not fire and a UAF /
+dangling-pointer escape / double-free ships silently. Pure ZER, no cinclude/asm/`*opaque`.
+
+**Minimal repro (checker ACCEPTS; ASan: heap-use-after-free):**
+```zer
+struct B { u32 x; }
+*B first([*]B s) { return &s[0]; }        // partial param-view (&param[i])
+?*B make() {
+  [*]B s = alloc(B,4) orelse { return null; };
+  s[0].x = 111;
+  *B ip = first(s);   // ip aliases s's heap buffer — but the analyzer mints a FRESH alloc_id
+  free(s);            // s freed; ip NOT tainted (different alloc_id)
+  return ip;          // returns a dangling pointer; escape suppresses the leak check
+}
+u32 main(){ *B q = make() orelse { return 0; }; return q.x; }   // heap-use-after-free
+```
+The WHOLE-param view (`whole(s){return s[0..2];}` then `free(s); return &ip[0];`) is ALSO accepted —
+so the hole spans both whole and partial views at the free+return sink (the store-to-global sink IS
+caught via `ret_param_mask`).
+
+**Root cause.** `zercheck_ir.c` call-result registration (Phase C2 ~4712 / Phase E ~4789) gives ANY
+pointer-returning call result a BRAND-NEW `alloc_id`, so a result that actually aliases the argument's
+allocation is treated as an independent object. `free(arg)` never taints the view; `free(view)` is not
+a double-free; the view can be returned dangling.
+
+**Fix (the durable "unify call-result provenance" direction, subsystem-scale — NOT attempted this
+session).** Infer a param-VIEW return summary (a `ret_view_param_mask`: bit n = a return may be a
+view `&param[i]` / `param[i..j]` / `&param.field` of param n), and at the call site ALIAS the result
+handle to the argument's `alloc_id` (via the existing `ir_snapshot_alias`/`ir_apply_alias`) instead of
+minting a fresh one, then leak-suppress the aliased view. Mirrors the existing whole-param `return s`
+handling. This is a TIGHTENING (a bug can only over-reject, not ship a new UAF) but it touches the
+alias/alloc_id machinery in the #1 safety analyzer and coordinates with leak detection, so it needs its
+own grid-verified session (accept-unsafe discipline: build the shape grid, verify it fires pre-fix,
+then land). Verified live on 2026-08-03e (checker exit 0 for the repro; ASan heap-use-after-free from
+zerc's own emitted C — matches the escape agent's finding).
+
+## OPEN — MEDIUM (GCC-loud, not silent) — array→slice / `T`→`?T` arg coercion dropped when a call is the operand of `orelse` (verified 2026-08-03e)
+
+A valid program the checker ACCEPTS but the emitter compiles to C that gcc rejects
+(`incompatible type for argument`). The coercion that wraps `arr` (a `u32[N]`) into
+a `_zer_slice_u32` — or a `u32` into a `_zer_opt_u32` — for a call argument is
+DROPPED when that call is the operand of `orelse`.
+
+```zer
+u32 sumslice([*]u32 s) { u32 t=0; for(u32 i=0;i<s.len;i+=1){t+=s[i];} return t; }
+?u32 opt_sum([*]u32 s, bool ok) { if(ok){return sumslice(s);} return; }
+u32 main() {
+    u32[3] arr; arr[0]=10; arr[1]=20; arr[2]=30;
+    u32 v = opt_sum(arr, true) orelse 0;   // arr not coerced -> gcc: incompatible type
+    return v;
+}
+```
+Fails for array→slice and `T`→`?T`, in var-decl `orelse`, var-decl `orelse { }`
+block, and assignment `orelse`. The identical coercion works at every non-`orelse`
+call site (a normal call lowers to a decomposed `IR_CALL` whose per-arg coercion
+loop is in `emit_ir_inst`; `orelse` keeps the inner call as a whole AST node and
+re-emits it through `emit_rewritten_node`, whose `NODE_CALL` arg loop (emitter.c
+~7415) emits args verbatim with no param-driven coercion).
+**Severity MEDIUM — GCC-loud (a build failure, not a silent miscompile).** Fix:
+apply the same param-type-driven coercion (`emit_array_as_slice` for array→slice
+params, the `(_zer_opt_T){ .value=…, .has_value=1 }` wrap for `?T` params) inside
+`emit_rewritten_node`'s `NODE_CALL` arg loop, consulting the callee's param types —
+so every whole-call emission path inherits it, not just the decomposed path.
+
+## OPEN — LOW (over-rejection, sound) — read-only multi-word `volatile` global shared ISR/main flagged as tearable (2026-08-03e)
+
+The 2026-08-03e ISR width fix (BUGS-FIXED.md) rejects a `volatile` global wider
+than one machine word (or an aggregate) shared between an interrupt and main,
+because a plain STORE tears. `IsrGlobal` does not track plain reads vs writes
+separately, so a multi-word volatile global that is only READ in both contexts
+(no writer, so no tear) is also flagged. This is a sound over-rejection; the
+precise fix is to add write-tracking to `IsrGlobal` and gate the tear diagnostic
+on there being a writer. Low priority (the pattern is rare; the workaround is to
+split into word-sized fields or use `@atomic_*`).
 
 ## OPEN — native `uN`/`iN` follow-ups (2026-07-09) (none a soundness hole; polish only)
 
@@ -1363,11 +1449,20 @@ scope, so NOT fixed. Full write-ups (repro + root cause) in
   null: the caller sees `f()` as HAVING a value. Only the BARE form in a `?T`
   function; the block form `orelse { …; return null; }` and explicit `return
   null;` are fine. A correctness bug (wrong runtime behavior), narrow.
-- **MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
-  `handle.elem`.** Any `container` field shaped `Handle(T)`/`?Handle(T)` fails
-  with "undefined type 'T'" (breaks self-referential `container Chained(T){
-  ?Handle(Chained(T)) next; }` and more). Separate from the depth-32 recursion
-  guard. Would need `subst_typenode` to recurse HANDLE like POINTER/OPTIONAL do.
+- ~~**MEDIUM — `subst_typenode`'s `TYNODE_HANDLE` case does not recurse into
+  `handle.elem`.**~~ **FIXED 2026-08-03e** — `subst_typenode` now recurses into
+  `handle.elem`, so `container W(T) { Handle(T) h; }` substitutes T and
+  monomorphizes (Handle is always a u64). Regression:
+  `tests/zer/container_handle_field.zer`. **Pool/Ring/Slab container fields are
+  deliberately still rejected** at the checker — see the entry below.
+- **LOW — `container W(T) { Pool(T,N) p; }` (also Ring/Slab) rejected with
+  "undefined type 'T'" (over-rejection, loud).** `subst_typenode` intentionally
+  does NOT recurse into `pool.elem`/`ring.elem`/`slab.elem`: substituting T makes
+  the CHECKER accept, but the emitter never emits the concrete monomorphized
+  `_zer_pool_T_N` struct for a container field, so gcc fails with "incomplete
+  type" — strictly worse UX than the clean checker error. Full fix needs the
+  emitter to emit the monomorphized builtin-container struct for a container
+  field; until then the clean checker rejection is kept on purpose.
 - **LOW — global `Arena` in-place `garena.over(buf)` does not initialize** → a
   later `garena.alloc_slice(...)` returns `None` at runtime. Only `Arena x =
   Arena.over(buf)` (capture the return) works.

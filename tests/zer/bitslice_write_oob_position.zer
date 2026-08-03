@@ -1,0 +1,12 @@
+// A runtime bit-slice WRITE at a position >= carrier width must be a no-op
+// (ZER "shift by >= width = 0"), not C UB (was `x << lo` with lo>=64).
+u32 main() {
+    u32 reg = 5;
+    u32 hi = 70;
+    u32 lo = 70;
+    reg[hi..lo] = 1;   // out-of-range: no-op, reg stays 5
+    u32 p = 2;
+    reg[p..p] = 1;     // valid: set bit 2 of 5 -> 5 (bit already... 5=0b101, bit2 set) 
+    if (reg != 5) { return 1; }
+    return 0;
+}

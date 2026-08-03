@@ -2374,6 +2374,21 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->container.type_arg = subst_typenode(a, tn->container.type_arg, param_name, param_len, replacement);
         return r;
     }
+    /* `Handle(T)` is representation-independent (always a u64), so a container
+     * field `container W(T) { Handle(T) h; }` monomorphizes cleanly once T is
+     * substituted. Previously TYNODE_HANDLE was a leaf, so T was dropped and
+     * resolution failed with a loud "undefined type 'T'". Pool/Ring/Slab are
+     * deliberately NOT handled here: substituting T makes the CHECKER accept
+     * them, but the emitter does not emit the concrete monomorphized
+     * `_zer_pool_T_N` struct for a container field, so gcc fails with
+     * "incomplete type" — strictly worse UX than the clean checker error.
+     * See docs/limitations.md (container field of Pool/Ring/Slab). */
+    case TYNODE_HANDLE: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
+        return r;
+    }
     /* Stage 2 Part B (2026-04-28): exhaustive — primitives and other
      * leaf TypeNode kinds need no substitution (they have no inner type
      * param). NAMED is handled at the top via leaf check. */
@@ -2382,7 +2397,7 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
     case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_HANDLE: case TYNODE_BARRIER:
+    case TYNODE_ARENA: case TYNODE_BARRIER:
     case TYNODE_SLAB: case TYNODE_SEMAPHORE:
         return tn;
     }
@@ -17212,6 +17227,33 @@ static void check_interrupt_safety(Checker *c) {
                 "shared between interrupt and main code — "
                 "read-modify-write is not atomic, use explicit read/mask/write",
                 (int)g->name_len, g->name);
+        } else {
+            /* volatile is NOT atomicity: a plain store of a value wider than one
+             * machine word — or ANY aggregate (struct/union/array) — lowers to
+             * MULTIPLE stores and TEARS when the ISR fires mid-sequence (or main
+             * reads mid-ISR). The check historically enforced only "declared
+             * volatile" + "not compound", so `volatile u64` on a 32-bit target
+             * and `volatile Pair` on any target were accepted silently. This
+             * mirrors the spawn-path width guard (checker.c ~10716). A pointer
+             * is exactly one machine word, so it is safe (and type_width returns
+             * 0 for pointers, hence the explicit TYPE_POINTER allowance — do NOT
+             * let it fall through to the tear diagnostic and false-flag an MMIO
+             * register pointer). */
+            Type *vt = type_unwrap_distinct(sym->type);
+            bool ptr = vt && type_dispatch_kind(vt) == TYPE_POINTER;
+            bool scalar_int = vt && (type_is_integer(vt) ||
+                                     type_dispatch_kind(vt) == TYPE_BOOL);
+            int w = scalar_int ? type_width(vt) : 0;
+            bool single_word = ptr || (scalar_int && w > 0 && w <= c->target_ptr_bits);
+            if (!single_word) {
+                checker_error(c, sym->line,
+                    "volatile global '%.*s' is shared between interrupt and main "
+                    "code but is wider than one machine word (or an aggregate) — "
+                    "a plain store lowers to multiple stores and can tear; use "
+                    "@atomic_* on a single-word field, or split into word-sized "
+                    "volatile fields",
+                    (int)g->name_len, g->name);
+            }
         }
     }
 }
@@ -17332,10 +17374,23 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     }
     case NODE_CALL:
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *sym = scope_lookup(c->global_scope,
-                node->call.callee->ident.name,
-                (uint32_t)node->call.callee->ident.name_len);
-            if (sym && sym->is_function) {
+            const char *cn = node->call.callee->ident.name;
+            uint32_t cnl = (uint32_t)node->call.callee->ident.name_len;
+            /* Universal alloc/free builtins reach scan_frame as bare idents
+             * only when they were NOT rewritten to a method call: the array
+             * form `alloc(T,n)` and the slice form `free(s)`. They lower to a
+             * bounded calloc/free — a known runtime leaf, NOT an indirect
+             * call. Skip classification so they don't spuriously trip the
+             * "calls through function pointer with unknown target" stack-depth
+             * warning (which fired on every heap-slice program). */
+            bool is_alloc_free_builtin =
+                (cnl == 5 && memcmp(cn, "alloc", 5) == 0) ||
+                (cnl == 4 && memcmp(cn, "free", 4) == 0);
+            Symbol *sym = is_alloc_free_builtin ? NULL :
+                scope_lookup(c->global_scope, cn, cnl);
+            if (is_alloc_free_builtin) {
+                /* bounded runtime leaf; args still scanned below */
+            } else if (sym && sym->is_function) {
                 /* Direct function call */
                 add_callee(frame, node->call.callee->ident.name,
                            (uint32_t)node->call.callee->ident.name_len);

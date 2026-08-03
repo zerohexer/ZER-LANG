@@ -1773,9 +1773,18 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, lo_node);
                     emit(e, "); ");
                 }
+                /* n0odo5: the POSITION shift `X << _zer_bl` is C UB when
+                 * _zer_bl >= the carrier bit width. The WIDTH computation was
+                 * already clamped (>= 64 ? ~0 : ...) but the position was not,
+                 * so a runtime `reg[lo..lo] = v` with lo >= width was UB
+                 * (violating ZER's "shift by >= width = 0" guarantee). Mirror
+                 * the READ-path guard (#18): position >= objbits => no-op
+                 * (positioned mask 0, positioned value 0). */
+                int objbits = type_width(obj_type);
+                if (objbits <= 0) objbits = 64;
                 emit(e, "*_zer_bp%d = (*_zer_bp%d", btmp, btmp);
                 emit(e, " & ~(");
-                /* emit mask: safe for width >= 64 */
+                /* emit positioned clear-mask: safe for width >= 64 */
                 if (hi_node && lo_node) {
                     if (bits_const) {
                         int64_t width = const_hi - const_lo + 1;
@@ -1786,24 +1795,30 @@ static void emit_expr(Emitter *e, Node *node) {
                         }
                         emit(e, " << %lld", (long long)const_lo);
                     } else {
-                        /* runtime: use hoisted temps */
-                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
+                        /* runtime: guard the position shift */
+                        emit(e, "((_zer_bl%d >= %d) ? (uint64_t)0 : "
+                             "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
                              "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
-                             "<< _zer_bl%d)",
-                             btmp, btmp, btmp, btmp, btmp);
+                             "<< _zer_bl%d))",
+                             btmp, objbits, btmp, btmp, btmp, btmp, btmp);
                     }
                 }
-                emit(e, ")) | (((uint64_t)(");
-                emit_expr(e, node->assign.value);
-                emit(e, ") << ");
-                if (hi_node && lo_node) {
-                    if (bits_const) emit(e, "%lld", (long long)const_lo);
-                    else emit(e, "_zer_bl%d", btmp);
+                emit(e, ")) | (");
+                /* positioned value */
+                if (!bits_const && hi_node && lo_node) {
+                    emit(e, "((_zer_bl%d >= %d) ? (uint64_t)0 : ((uint64_t)(", btmp, objbits);
+                    emit_expr(e, node->assign.value);
+                    emit(e, ") << _zer_bl%d))", btmp);
                 } else {
-                    emit(e, "0");
+                    emit(e, "((uint64_t)(");
+                    emit_expr(e, node->assign.value);
+                    emit(e, ") << ");
+                    if (hi_node && lo_node && bits_const) emit(e, "%lld", (long long)const_lo);
+                    else emit(e, "0");
+                    emit(e, ")");
                 }
-                emit(e, ") & (");
-                /* re-emit mask */
+                emit(e, " & (");
+                /* re-emit positioned and-mask */
                 if (hi_node && lo_node) {
                     if (bits_const) {
                         int64_t width = const_hi - const_lo + 1;
@@ -1814,10 +1829,11 @@ static void emit_expr(Emitter *e, Node *node) {
                         }
                         emit(e, " << %lld", (long long)const_lo);
                     } else {
-                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
+                        emit(e, "((_zer_bl%d >= %d) ? (uint64_t)0 : "
+                             "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
                              "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
-                             "<< _zer_bl%d)",
-                             btmp, btmp, btmp, btmp, btmp);
+                             "<< _zer_bl%d))",
+                             btmp, objbits, btmp, btmp, btmp, btmp, btmp);
                     }
                 }
                 emit(e, ")); })");
@@ -7022,6 +7038,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Node *hi_node = node->assign.target->slice.start;
             Node *lo_node = node->assign.target->slice.end;
             int btmp = e->temp_count++;
+            /* n0odo5: guard the POSITION shift (`<< _zer_bl`) — C UB when the
+             * position >= carrier bit width; ZER guarantees shift by >= width
+             * = 0. Mirror of the AST-path fix (and the READ-path #18 guard). */
+            Type *obj_type = checker_get_type(e->checker, obj);
+            int objbits = obj_type ? type_width(obj_type) : 64;
+            if (objbits <= 0) objbits = 64;
             emit(e, "({ __typeof__(");
             emit_rewritten_node(e, obj, func);
             emit(e, ") *_zer_bp%d = &(", btmp);
@@ -7046,18 +7068,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     else emit(e, "((1ull << %lld) - 1)", (long long)width);
                     emit(e, " << %lld", (long long)const_lo);
                 } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                    emit(e, "((_zer_bl%d >= %d) ? (uint64_t)0 : "
+                         "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d))",
+                         btmp, objbits, btmp, btmp, btmp, btmp, btmp);
                 }
             }
-            emit(e, ")) | (((uint64_t)(");
-            emit_rewritten_node(e, node->assign.value, func);
-            emit(e, ") << ");
-            if (bits_const) emit(e, "%lld", (long long)const_lo);
-            else if (lo_node) emit(e, "_zer_bl%d", btmp);
-            else emit(e, "0");
-            emit(e, ") & (");
+            emit(e, ")) | (");
+            if (!bits_const && hi_node && lo_node) {
+                emit(e, "((_zer_bl%d >= %d) ? (uint64_t)0 : ((uint64_t)(", btmp, objbits);
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ") << _zer_bl%d))", btmp);
+            } else {
+                emit(e, "((uint64_t)(");
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ") << ");
+                if (bits_const) emit(e, "%lld", (long long)const_lo);
+                else emit(e, "0");
+                emit(e, ")");
+            }
+            emit(e, " & (");
             if (hi_node && lo_node) {
                 if (bits_const) {
                     int64_t width = const_hi - const_lo + 1;
@@ -7065,9 +7095,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     else emit(e, "((1ull << %lld) - 1)", (long long)width);
                     emit(e, " << %lld", (long long)const_lo);
                 } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                    emit(e, "((_zer_bl%d >= %d) ? (uint64_t)0 : "
+                         "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d))",
+                         btmp, objbits, btmp, btmp, btmp, btmp, btmp);
                 }
             }
             emit(e, ")); })");

@@ -1,0 +1,12 @@
+// container templates must substitute T inside a Handle(T) field;
+// previously dropped -> "undefined type 'T'". Handle is a u64 so it
+// monomorphizes cleanly. (Pool/Ring/Slab fields are a separate open gap.)
+struct Task { u32 id; }
+container W(T) { Handle(T) h; u32 n; }
+u32 apply(*W(Task) w) { w.n = 42; return w.n; }
+u32 main() {
+    W(Task) w;
+    u32 r = apply(&w);
+    if (r != 42) { return 1; }
+    return 0;
+}

@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03e — audit sweep: 4 fixes (1 bare-metal soundness, 1 codegen UB, 2 correctness/UX)
+
+Full-codebase audit (4 parallel subsystem hunters + documented-hole verification).
+Four fixes landed; several confirmed accept-unsafe holes documented for a
+follow-up session (see `docs/limitations.md`). `make check` GREEN (1140/0),
+sink matrix CLEAN, all audit gates OK.
+
+**BUG — ISR shared-global `volatile` exemption was width/shape-blind (bare-metal
+soundness).** `check_interrupt_safety` (checker.c ~17232) accepted ANY `volatile`
+shared global, checking only volatile + not-compound-assign. But `volatile` gives
+no atomicity: a `volatile u64` on a 32-bit target, or ANY `volatile` aggregate
+(`struct`/`union`/array), lowers to MULTIPLE stores and TEARS when the ISR fires
+mid-sequence (or main reads mid-ISR). Both were accepted silently. This is the
+exact sibling of the spawn-path width hole fixed the same day (commit a3d8879) —
+the spawn scan got the width guard, the ISR post-check never did (the
+"exemption narrower than its code" / "fix one sink, sibling broken" class).
+Fix: mirror the spawn guard — allow only a single-word scalar (`w > 0 && w <=
+target_ptr_bits`) or a pointer (exactly one word; `type_width` returns 0 for
+pointers, hence the explicit TYPE_POINTER allowance so an MMIO register pointer
+is not false-flagged); reject wider scalars and aggregates. Regression:
+`tests/zer_fail/isr_volatile_aggregate_tears.zer` (target-independent aggregate;
+the u64-on-32-bit case needs `--target-bits 32` so is not in the harness).
+
+**BUG — variable-position bit-slice WRITE emitted C UB (unclamped shift).**
+`reg[hi..lo] = v` with a RUNTIME `lo` lowered to `v << _zer_bl` and `mask <<
+_zer_bl` with NO clamp on the POSITION shift (only the WIDTH was clamped). When
+`lo >= 64` the shift count is out of range → C UB (x86 masks mod 64, other arches
+differ), violating ZER's "shift by >= width = 0" guarantee. The companion READ
+path was fixed for exactly this (audit #18); the WRITE path was missed, on BOTH
+emitter paths (AST ~1776, IR ~7041). Fix: guard each runtime position shift with
+`(_zer_bl >= objbits) ? 0 : (X << _zer_bl)` (positioned mask AND value), so an
+out-of-range position is a no-op — mirror of the READ-path guard. Regression:
+`tests/zer/bitslice_write_oob_position.zer` (runtime: OOB write is a no-op).
+
+**BUG — spurious "calls through function pointer" warning on every heap program.**
+The stack-depth scanner (`scan_frame`, checker.c ~17333) treated the `alloc`/`free`
+builtins as unknown-target indirect calls (they are not symbols in global scope, so
+`scope_lookup` returned NULL → `has_indirect_call = true`), producing a false
+"stack depth not verifiable" warning on the array-alloc `alloc(T,n)` and slice-free
+`free(s)` forms (the single `alloc(T)` and `free(*T)` forms are rewritten to method
+calls before scan_frame, so they escaped). The warning fired on the most common
+heap patterns, drowning out genuine indirect-call warnings and undermining the
+embedded stack-depth feature. Fix: recognize the `alloc`/`free` builtin idents as
+bounded runtime leaves (they lower to calloc/free), not indirect calls.
+
+**BUG — `container W(T) { Handle(T) h; }` failed with "undefined type 'T'"
+(over-rejection).** `subst_typenode` treated `TYNODE_HANDLE` as a leaf, so T was
+never substituted inside a container field. Fix: recurse into `handle.elem` (Handle
+is always a u64, so it monomorphizes cleanly). Pool/Ring/Slab container fields
+remain rejected at the checker on purpose — substituting T there makes the CHECKER
+accept but the emitter does not emit the concrete `_zer_pool_T_N` struct, so gcc
+fails with "incomplete type" (strictly worse UX than the clean checker error); see
+`docs/limitations.md`. Regression: `tests/zer/container_handle_field.zer`.
+
 ## Session 2026-08-03d — probing the §24.5 concurrency residue; one width hole found
 
 `docs/primitives-data-races.md` §24.5 listed "still-unprobed residue". Probed all

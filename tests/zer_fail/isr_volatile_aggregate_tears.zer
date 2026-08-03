@@ -1,0 +1,11 @@
+// expect-error: tear
+// EXPECTED: compile error
+// A multi-field volatile global written in an ISR and read in main tears on
+// ANY bus width: the store lowers to >=2 stores; a reader observes a mix.
+// The ISR volatile exemption was width/shape-blind (mirror of the spawn-path
+// width fix a3d8879); this pins the aggregate case (target-independent).
+struct Pair { u32 a; u32 b; }
+volatile Pair g;
+void reader() { u32 x = g.a; u32 y = g.b; }
+interrupt TIMER { g = { .a = 1, .b = 2 }; }
+u32 main() { reader(); return 0; }

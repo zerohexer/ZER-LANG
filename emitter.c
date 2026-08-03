@@ -7410,11 +7410,65 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
         }
+        /* Look up the callee's function type for param-driven arg coercion.
+         * A WHOLE-call emission (e.g. an `orelse` operand, which keeps the call
+         * as an AST node rather than lowering to a decomposed IR_CALL) reaches
+         * here and previously emitted args VERBATIM — dropping the array->slice
+         * and T->?T coercion that the decomposed IR_CALL arg loop applies. GCC
+         * then rejected the call ("incompatible type for argument"). Mirror that
+         * loop (~10458) so every whole-call path inherits the coercion. */
+        Type *rw_callee_ft = NULL;
+        {
+            Type *ct = checker_get_type(e->checker, node->call.callee);
+            if (ct && type_dispatch_kind(ct) == TYPE_FUNC_PTR)
+                rw_callee_ft = type_unwrap_distinct(ct);
+        }
         emit_rewritten_node(e, node->call.callee, func);
         emit(e, "(");
         for (int i = 0; i < node->call.arg_count; i++) {
             if (i > 0) emit(e, ", ");
-            emit_rewritten_node(e, node->call.args[i], func);
+            Node *arg = node->call.args[i];
+            Type *at_raw = checker_get_type(e->checker, arg);
+            Type *at = at_raw ? type_unwrap_distinct(at_raw) : NULL;
+            Type *pt = (rw_callee_ft && (uint32_t)i < rw_callee_ft->func_ptr.param_count) ?
+                type_unwrap_distinct(rw_callee_ft->func_ptr.params[i]) : NULL;
+            /* type_dispatch_kind() (not raw ->kind ==) keeps this off the
+             * distinct-unwrap audit baseline; at/pt are already unwrapped so it
+             * is a harmless re-unwrap. */
+            bool pt_is_opt_value = pt && type_dispatch_kind(pt) == TYPE_OPTIONAL &&
+                !is_null_sentinel(pt->optional.inner);
+            bool at_is_opt = at && type_dispatch_kind(at) == TYPE_OPTIONAL;
+            if (pt && at && type_dispatch_kind(at) == TYPE_ARRAY &&
+                type_dispatch_kind(pt) == TYPE_SLICE) {
+                /* array -> [*]T */
+                emit_array_as_slice(e, arg, at_raw, rw_callee_ft->func_ptr.params[i]);
+            } else if (pt_is_opt_value && !at_is_opt && at &&
+                       type_dispatch_kind(at) == TYPE_POINTER) {
+                /* null literal -> ?T value: has_value = 0 */
+                emit(e, "("); emit_type(e, pt); emit(e, "){ .has_value = 0 }");
+            } else if (pt_is_opt_value && !at_is_opt && at &&
+                       type_dispatch_kind(at) == TYPE_ARRAY &&
+                       pt->optional.inner &&
+                       type_dispatch_kind(pt->optional.inner) == TYPE_SLICE) {
+                /* array -> ?[*]T: build the slice INSIDE the optional */
+                Type *pi = type_unwrap_distinct(pt->optional.inner);
+                emit(e, "("); emit_type(e, pt); emit(e, "){ .value = (");
+                emit_type(e, pi); emit(e, "){ ");
+                emit_rewritten_node(e, arg, func);
+                emit(e, ", %u }, .has_value = 1 }", (unsigned)at->array.size);
+            } else if (pt_is_opt_value && !at_is_opt) {
+                /* value -> ?T value */
+                emit(e, "("); emit_type(e, pt); emit(e, "){ .value = ");
+                emit_rewritten_node(e, arg, func);
+                emit(e, ", .has_value = 1 }");
+            } else if (pt && at && type_dispatch_kind(at) == TYPE_SLICE &&
+                       type_dispatch_kind(pt) == TYPE_POINTER) {
+                /* slice -> *T (C interop) */
+                emit_rewritten_node(e, arg, func);
+                emit(e, ".ptr");
+            } else {
+                emit_rewritten_node(e, arg, func);
+            }
         }
         emit(e, ")");
         return;

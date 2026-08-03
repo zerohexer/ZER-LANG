@@ -487,7 +487,15 @@ double-free. A correct fix must coordinate the two application points (either ma
 DEPENDENCY: Interacts with **§F1** (`freed_defer_id` replaces exactly that line-based guard) — land §F1 first and this
 fix gets easier.
 
-### CRITICAL/MEDIUM goto-defer double-fire → double-FREE on the SUCCESS path (`3o10j6` `d1a7d9cc`, 2026-07-23) — distinct from G1
+### ~~CRITICAL/MEDIUM goto-defer double-fire → double-FREE on the SUCCESS path~~ (FIXED — verified closed 2026-08-03e by the F2 ARMED-flag commit 30a7974)
+**Verified CLOSED 2026-08-03e.** `for(..){ defer d+=1; if(i==1) goto done; } done:` now yields d=2
+(fires once per iteration that ran), and the double-FREE variant (`defer free(b)` in the loop) runs
+clean (no glibc abort). The durable per-defer runtime ARMED flag (`defer_fire_flags`, commit 30a7974)
+subsumes this — a fire tests the flag set at REGISTRATION, so a fall-through fire after a goto-path fire
+does not re-run. Entry retained as history; the reproducer file was removed when fixed.
+
+<!-- historical description below -->
+### CRITICAL/MEDIUM goto-defer double-fire (historical detail, `3o10j6` `d1a7d9cc`, 2026-07-23)
 A forward `goto` out of a nested scope (loop/if body carrying a `defer`) to a label AFTER that scope re-fires
 the nested-scope defer on the NATURAL fall-through path (where the goto was never taken).
 `for(..){ defer d+=1; if(cond) goto done; } done:` runs the loop defer N+1 times, not N; with

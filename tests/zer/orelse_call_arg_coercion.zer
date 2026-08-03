@@ -1,0 +1,17 @@
+// A call that is the OPERAND of orelse must still coerce its arguments
+// (array->[*]T, T->?T) — previously emit_rewritten_node's NODE_CALL arg loop
+// emitted args verbatim, so GCC rejected the call ("incompatible type").
+u32 sumslice([*]u32 s) { u32 t = 0; for (u32 i = 0; i < s.len; i += 1) { t += s[i]; } return t; }
+?u32 opt_sum([*]u32 s, bool ok) { if (ok) { return sumslice(s); } return; }
+?u32 id_opt(?u32 x) { return x; }
+u32 main() {
+    u32[3] arr; arr[0] = 10; arr[1] = 20; arr[2] = 30;
+    u32 v = opt_sum(arr, true) orelse 0;   // array->slice arg, var-decl orelse
+    u32 r = id_opt(5) orelse 99;           // u32->?u32 arg, var-decl orelse
+    u32 w = 0;
+    w = opt_sum(arr, true) orelse 0;       // array->slice arg, assignment orelse
+    if (v != 60) { return 1; }
+    if (r != 5) { return 2; }
+    if (w != 60) { return 3; }
+    return 0;
+}

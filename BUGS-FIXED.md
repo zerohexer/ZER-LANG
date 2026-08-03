@@ -50,6 +50,20 @@ heap patterns, drowning out genuine indirect-call warnings and undermining the
 embedded stack-depth feature. Fix: recognize the `alloc`/`free` builtin idents as
 bounded runtime leaves (they lower to calloc/free), not indirect calls.
 
+**BUG — array→slice / `T`→`?T` arg coercion dropped when a call is the operand of
+`orelse` (GCC-loud miscompile).** `emit_rewritten_node`'s `NODE_CALL` arg loop
+(emitter.c ~7415) emitted args verbatim with no param-driven coercion. A normal
+call lowers to a decomposed `IR_CALL` whose arg loop DOES coerce; but `orelse`
+keeps the inner call as a whole AST node and re-emits it through
+`emit_rewritten_node`, so `opt_sum(arr, ...) orelse 0` (array→slice) and
+`id_opt(5) orelse 99` (u32→?u32) emitted a `u32[N]`/`u32` where the callee wanted
+a slice/optional → gcc "incompatible type for argument". Fix: mirror the
+decomposed loop — look up the callee function type and coerce each arg against its
+param (array→slice, value/array optional-wrap, null→optional, slice→ptr), using
+`type_dispatch_kind()` so no new raw type-dispatch site is added. Fires for
+var-decl and assignment `orelse`. Regression:
+`tests/zer/orelse_call_arg_coercion.zer`.
+
 **BUG — `container W(T) { Handle(T) h; }` failed with "undefined type 'T'"
 (over-rejection).** `subst_typenode` treated `TYNODE_HANDLE` as a leaf, so T was
 never substituted inside a container field. Fix: recurse into `handle.elem` (Handle

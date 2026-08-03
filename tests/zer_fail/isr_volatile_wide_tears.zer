@@ -1,0 +1,23 @@
+// zerc-flags: --target-bits 32
+// EXPECTED: compile error
+// expect-error: not a single-word scalar
+// A volatile global WIDER than the target word, shared between an ISR and main.
+//
+// `volatile` exempts a shared global from the ISR data-race check, for the
+// SINGLE-WORD flag idiom. On a 32-bit target a u64 load/store lowers to TWO
+// 32-bit accesses, so main can read half of one ISR store and half of another —
+// a torn value the idiom argument never covered.
+//
+// This is the ISR SIBLING of the spawn-path hole fixed in a3d8879f. The spawn
+// site was fixed and this one was missed; both now call
+// volatile_global_exempt_from_race_check, and the SITE x SHAPE grid in
+// tests/test_hw_matrix.c fails the build if they ever disagree again.
+//
+// Target-aware: the same program is legitimately accepted at --target-bits 64.
+volatile u64 g;
+
+void reader() { u64 x = g; }
+
+interrupt TIMER { g = 1; }
+
+u32 main() { reader(); return 0; }

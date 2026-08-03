@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: not a single-word scalar
+// A volatile AGGREGATE shared between an ISR and main tears at ANY target width
+// — a multi-field store is always several stores, so main can observe a mix of
+// two ISR updates. The single-word volatile-flag exemption never applied here.
+struct P { u32 a; u32 b; }
+volatile P g;
+
+void reader() { u32 x = g.a; u32 y = g.b; }
+
+interrupt TIMER { g.a = 1; }
+
+u32 main() { reader(); return 0; }

@@ -5,6 +5,57 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-03e — the ISR sibling of the volatile width hole (my own miss)
+
+The spawn-path `volatile` width guard shipped in a3d8879f. **`volatile` exempts a
+shared global from a data-race check at TWO independent sites**, and only one was
+fixed:
+
+    spawn path -> scan_unsafe_global_access   (thread races main)   FIXED a3d8879f
+    ISR   path -> check_interrupt_safety      (ISR races main)      MISSED
+
+Textbook multi-site drift, and it was mine — the audit-branch `8j6w19` caught it.
+CLAUDE.md's own rule ("enumerate the full sibling set, fix EVERY member") is what I
+skipped: I found the spawn exemption, fixed it, and never asked where else
+`volatile` exempts.
+
+**Verified on main, checker verdict only** (`-o out.c` — hosted x86 gcc rejects the
+interrupt attribute, and that error MASKS the checker, which is why a casual probe
+looks like a rejection):
+
+| shape | checker before |
+|---|---|
+| non-volatile `u32` | rejected (correct) |
+| `volatile u32` (the idiom) | silent (correct) |
+| `volatile u64` @ 32-bit | **SILENT** — two stores, tears |
+| `volatile` struct | **SILENT** — tears at any width |
+| `volatile u128` | **SILENT** |
+
+**Fix — one predicate, not a second copy.** Extracted
+`volatile_global_exempt_from_race_check(Checker*, Symbol*)`; both sites now call
+it, and the spawn site's inline copy was replaced. A scalar (integer/bool/pointer)
+no wider than `target_ptr_bits` is exempt; anything wider, or any aggregate, is
+flagged. Target-aware — `volatile u64` stays accepted at `--target-bits 64`.
+
+**Gate — SITE x SHAPE, because the defect was DISAGREEMENT.** A single row would
+have pinned whichever site I happened to write it against. The new grid in
+`tests/test_hw_matrix.c` crosses site (spawn, isr) with shape (single-word,
+over-width, aggregate) so the two sites must return the SAME verdict for the same
+shape; fixing one and forgetting the other fails the build. Verified it FIRES
+against a from-HEAD build: 16/18 with both ISR cells reporting FALSE-NEGATIVE and
+all three spawn cells passing — the drift made visible. 18/18 after.
+
+The grid is emit-only (inherited from the hw-matrix), which is load-bearing here:
+gcc's interrupt-attribute error would otherwise mask every ISR cell.
+
+Tests: `tests/zer_fail/isr_volatile_wide_tears.zer` (`// zerc-flags:
+--target-bits 32`) and `isr_volatile_aggregate_tears.zer`, both verified to
+COMPILE on a pre-fix build and to be rejected by the CHECKER rather than gcc.
+
+Credit: reported by audit branch `claude/gifted-noether-8j6w19`; independently
+reproduced, and implemented here as a shared predicate + cross-product gate rather
+than a second inline width test.
+
 ## Session 2026-08-03d — probing the §24.5 concurrency residue; one width hole found
 
 `docs/primitives-data-races.md` §24.5 listed "still-unprobed residue". Probed all

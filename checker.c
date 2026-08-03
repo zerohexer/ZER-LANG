@@ -112,6 +112,38 @@ static bool type_carries_handle(Type *t, int depth) {
  * The shared exemption mirrors the bare-arg logic EXACTLY: only a POINTER whose
  * pointee is a `shared struct` is exempt. A slice or opaque is a hazard
  * regardless, because neither carries the auto-lock discipline. */
+/* Is a `volatile` global safe to EXEMPT from a concurrency data-race check?
+ *
+ * ONE query for both exemption sites — the spawned-thread scan
+ * (scan_unsafe_global_access) and the ISR shared-global check
+ * (check_interrupt_safety). They previously hand-rolled it, and the ISR copy was
+ * never written at all: the spawn width guard landed 2026-08-03 and the ISR site
+ * kept accepting a tearing store for another commit. Classic multi-site drift, so
+ * the two now share this predicate and a hw-matrix row pins them together.
+ *
+ * The exemption exists for the SINGLE-WORD volatile-flag idiom — a plain store or
+ * load of one machine word, which is atomic in practice on every real ISA. That
+ * rationale is width-bounded, so enforce the bound: a scalar (integer / bool /
+ * pointer) no wider than the target word. Anything wider lowers to MULTIPLE
+ * stores, so a concurrent reader (another thread, or main preempted by an ISR)
+ * can observe half of one write and half of another.
+ *
+ * NOT a claim that the exempted case is race-free: a single-word volatile access
+ * still provides no ORDERING. It is the established embedded idiom, the
+ * diagnostic already says volatile is not synchronization, and banning it is a
+ * separate judgment call. A tearable multi-word access is not a judgment call. */
+static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
+    if (!c || !sym || !sym->is_volatile) return false;
+    Type *vt = type_unwrap_distinct(sym->type);
+    if (!vt) return false;
+    TypeKind k = type_dispatch_kind(vt);
+    bool scalar = type_is_integer(vt) || k == TYPE_BOOL || k == TYPE_POINTER;
+    if (!scalar) return false;          /* aggregate — never one word */
+    int w = type_width(vt);
+    if (w <= 0) return false;
+    return w <= c->target_ptr_bits;
+}
+
 static bool type_carries_nonshared_pointer(Type *t, int depth) {
     if (!t || depth > 32) return false;
     TypeKind k = type_dispatch_kind(t);
@@ -10684,15 +10716,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * way, and the diagnostic already tells the user volatile is not
              * synchronization. That part is a judgment call and stays as-is;
              * a tearable multi-word store is not. */
-            if (sym->is_volatile) {
-                Type *vt = type_unwrap_distinct(sym->type);
-                bool scalar = vt && (type_is_integer(vt) ||
-                                     type_dispatch_kind(vt) == TYPE_BOOL ||
-                                     type_dispatch_kind(vt) == TYPE_POINTER);
-                int w = scalar ? type_width(vt) : 0;
-                if (scalar && w > 0 && w <= c->target_ptr_bits) return false;
-                /* wider than a word (or an aggregate) — fall through and flag */
-            }
+            if (sym->is_volatile &&
+                volatile_global_exempt_from_race_check(c, sym)) return false;
+            /* volatile but wider than a word (or an aggregate) — falls through
+             * and is flagged: the store lowers to several stores and tears. */
             /* threadlocal: check the AST node for is_threadlocal flag */
             if (sym->func_node &&
                 (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
@@ -17211,6 +17238,27 @@ static void check_interrupt_safety(Checker *c) {
                 "volatile global '%.*s' has compound assignment (+=, |=, etc.) "
                 "shared between interrupt and main code — "
                 "read-modify-write is not atomic, use explicit read/mask/write",
+                (int)g->name_len, g->name);
+        } else if (!volatile_global_exempt_from_race_check(c, sym)) {
+            /* 2026-08-03: `volatile` alone was accepted here at ANY width and
+             * shape. The exemption exists for the SINGLE-WORD flag idiom; a
+             * `volatile u64` on a 32-bit target, a `volatile u128`, or a volatile
+             * AGGREGATE all lower to several stores, so an ISR store racing a
+             * main-code read tears — the reader observes half of one write and
+             * half of another. Verified: the checker was SILENT on all three
+             * (the apparent rejection was GCC's x86 interrupt-attribute error
+             * masking it, so `-o out.c` is required to see the real verdict).
+             *
+             * This is the ISR SIBLING of the spawn-path hole fixed the same day.
+             * The spawn site was fixed first and this one was missed — both now
+             * call volatile_global_exempt_from_race_check, and
+             * tests/test_hw_matrix.c pins them together. */
+            checker_error(c, sym->line,
+                "volatile global '%.*s' is shared between interrupt and main "
+                "code but is not a single-word scalar — the access lowers to "
+                "several loads/stores, so a reader can TEAR (observe half of one "
+                "write and half of another). volatile gives no atomicity. Use a "
+                "single-word scalar flag, or @atomic_* on a *shared T",
                 (int)g->name_len, g->name);
         }
     }

@@ -229,6 +229,122 @@ static void gen(HWScenario s, char *buf, size_t n) {
     }
 }
 
+
+/* ================================================================
+ * VOLATILE-WIDTH GRID (2026-08-03) — SITE x SHAPE.
+ *
+ * WHY IT IS A CROSS-PRODUCT AND NOT A ROW. The defect this guards was not
+ * "a check was missing" — it was TWO SITES DRIFTING APART. `volatile` exempts a
+ * global from a data-race check at two independent places:
+ *
+ *     spawn path -> scan_unsafe_global_access   (thread races main)
+ *     ISR   path -> check_interrupt_safety      (ISR races main)
+ *
+ * The spawn site got a width guard on 2026-08-03; the ISR site was missed and
+ * kept accepting a tearing access for another commit. Crossing SITE with SHAPE
+ * makes DISAGREEMENT itself a failure: both sites must give the same verdict for
+ * the same shape, so fixing one and forgetting the other fails the build.
+ *
+ * THE RULE BEING PINNED. The exemption exists for the SINGLE-WORD volatile-flag
+ * idiom. A scalar no wider than the target word is exempt; anything wider (or an
+ * aggregate) lowers to several loads/stores, so a concurrent reader can TEAR —
+ * observe half of one write and half of another. Both sites now ask one
+ * predicate, volatile_global_exempt_from_race_check.
+ *
+ * TARGET-AWARE: the over-width cell runs at --target-bits 32, where u64 is two
+ * stores. The same program is legitimately ACCEPTED at 64 bits, so the cell
+ * carries the flag rather than assuming the host.
+ *
+ * EMIT-ONLY (inherited): ISR cells need `-o x.c`, because hosted x86 gcc rejects
+ * the interrupt attribute and would mask the checker verdict entirely — that
+ * masking is exactly why this hole survived a manual probe.
+ * ================================================================ */
+
+typedef enum { VSITE_SPAWN, VSITE_ISR, VSITE_COUNT } VSite;
+typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_COUNT } VShape;
+
+static const char *vsite_name(VSite s) {
+    switch (s) {
+    case VSITE_SPAWN: return "spawn";
+    case VSITE_ISR:   return "isr";
+    case VSITE_COUNT: break;
+    }
+    return "?";
+}
+static const char *vshape_name(VShape s) {
+    switch (s) {
+    case VSHAPE_WORD:      return "single-word-scalar";
+    case VSHAPE_OVERWIDTH: return "over-width(u64@32)";
+    case VSHAPE_AGGREGATE: return "aggregate-struct";
+    case VSHAPE_COUNT: break;
+    }
+    return "?";
+}
+/* A single-word scalar is the sanctioned idiom -> ACCEPT. Everything else tears. */
+static int vshape_is_negative(VShape s) { return s != VSHAPE_WORD; }
+static const char *vshape_flags(VShape s) {
+    return s == VSHAPE_OVERWIDTH ? "--target-bits 32" : "";
+}
+
+static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
+    const char *decl;
+    const char *wr;
+    const char *rd;
+    switch (shape) {
+    case VSHAPE_WORD:      decl = "volatile u32 g;";                      wr = "g = 1;";   rd = "u32 x = g;";   break;
+    case VSHAPE_OVERWIDTH: decl = "volatile u64 g;";                      wr = "g = 1;";   rd = "u64 x = g;";   break;
+    case VSHAPE_AGGREGATE: decl = "struct P{u32 a; u32 b;}\nvolatile P g;"; wr = "g.a = 1;"; rd = "u32 x = g.a;"; break;
+    case VSHAPE_COUNT:     decl = ""; wr = ""; rd = ""; break;
+    }
+    if (site == VSITE_SPAWN) {
+        snprintf(out, n,
+            "%s\nvoid w(u32 a){ %s }\nu32 main(){ %s spawn w(1); return 0; }\n",
+            decl, wr, rd);
+    } else {
+        snprintf(out, n,
+            "%s\nvoid reader(){ %s }\ninterrupt TIMER { %s }\n"
+            "u32 main(){ reader(); return 0; }\n",
+            decl, rd, wr);
+    }
+}
+
+/* run_neg/run_pos with per-cell zerc flags (the over-width cell needs a 32-bit
+ * target). Same EMIT-ONLY contract and integrity guard as the helpers above. */
+static int run_vol(const char *name, const char *code, const char *flags, int negative) {
+    total++;
+    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
+    fputs(code, f); fclose(f);
+    char cmd[640];
+    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer %s -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err",
+             zerc_path, flags);
+    int rc = system(cmd);
+    char eb[4096]; eb[0] = 0;
+    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
+    if (!negative) {
+        if (rc == 0) { passed++; return 1; }
+        failed++; over_reject++;
+        fprintf(stderr, "  FAIL [OVER-REJECT] %s — the sanctioned single-word idiom was REJECTED:\n    %.140s\n", name, eb);
+        return 0;
+    }
+    if (rc == 0) {
+        failed++; false_neg++;
+        fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — a TEARING volatile access COMPILED CLEAN\n", name);
+        fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
+        return 0;
+    }
+    if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
+        failed++; invalid_probe++;
+        fprintf(stderr, "  FAIL [INVALID-PROBE] %s — parse error, not a safety check:\n    %.140s\n", name, eb);
+        return 0;
+    }
+    if (has_hw_reason(eb)) { passed++; return 1; }
+    failed++;
+    fprintf(stderr, "  FAIL [SUSPECT] %s — rejected, but not for a hardware/concurrency reason:\n    %.140s\n", name, eb);
+    return 0;
+}
+
 int main(void) {
     find_zerc();
     fprintf(stderr, "=== ISR / atomics / MMIO matrix (program-consequence, NOT hardware floor) ===\n");
@@ -248,6 +364,24 @@ int main(void) {
         fprintf(stderr, "  [%-3s][%-24s] %s\n",
                 neg ? "neg" : "pos", scen_name(s), ok ? "ok" : "*** FAIL ***");
         if (!ok) grid_ok = 0;
+    }
+
+    /* ---- volatile-width grid: SITE x SHAPE (the two exemption sites must agree) ---- */
+    fprintf(stderr, "\n  -- volatile-width grid (spawn vs ISR exemption must agree) --\n");
+    char vbuf[1024];
+    for (VSite vs = 0; vs < VSITE_COUNT; vs++) {
+        for (VShape vp = 0; vp < VSHAPE_COUNT; vp++) {
+            valid_cells++;
+            int neg = vshape_is_negative(vp);
+            char nm[192];
+            snprintf(nm, sizeof(nm), "vol/%s/%s", vsite_name(vs), vshape_name(vp));
+            gen_vol(vs, vp, vbuf, sizeof(vbuf));
+            int ok = run_vol(nm, vbuf, vshape_flags(vp), neg);
+            fprintf(stderr, "  [%-5s][%-18s][%-3s] %s\n",
+                    vsite_name(vs), vshape_name(vp), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
     }
 
     fprintf(stderr, "\n=== hw-matrix: %d/%d cells correct ===\n", passed, valid_cells);

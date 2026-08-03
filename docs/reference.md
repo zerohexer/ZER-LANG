@@ -2857,6 +2857,11 @@ borrowed by that thread until `.join()`:
   - Transitive: follows callees 8 levels deep
 - Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
   **single-word** `volatile` global
+- The same single-word restriction applies to a global shared between an
+  **interrupt handler** and main code: `volatile` is required there, but a
+  `volatile u64` on a 32-bit target, a `volatile u128`, or a volatile struct is
+  rejected — the access lowers to several loads/stores, so main can read half of
+  one ISR update and half of another
 - `volatile` is the narrowest of these and is **not synchronization** — it gives no
   atomicity and no ordering. It is accepted only for the single-word flag idiom
   (a plain store/load of a scalar no wider than the target word). Rejected:

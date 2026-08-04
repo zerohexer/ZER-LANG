@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: CARRIES a Handle
+// Sibling of spawn_opt_carrier_stackptr: a `?Box` whose Box carries a Handle.
+// The Handle chain's `?Handle` arm matched ANY optional-kind arg and so
+// swallowed `?Box` (inner is a struct, not a Handle), did nothing, and blocked
+// the recursive type_carries_handle arm below it. The spawned worker would run
+// pool.get() on the copied handle, racing the parent's pool metadata.
+struct T { u32 v; }
+Pool(T, 4) gp;
+struct Box { Handle(T) h; }
+shared struct Keep { u32 x; }
+Keep g;
+
+void worker(?Box b) { if (b) |bb| { u32 x = bb.h.v; } }
+
+u32 main() {
+    Handle(T) h = gp.alloc() orelse { return 1; };
+    Box b; b.h = h;
+    ?Box ob = b;
+    spawn worker(ob);   // thread unwraps ?Box and uses the Handle — must reject
+    g.x = 1;
+    return 0;
+}

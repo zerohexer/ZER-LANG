@@ -300,7 +300,7 @@ static void gen(COScenario s, char *buf, size_t n) {
  * coverage (the vacuous-test class, CLAUDE.md).
  * ================================================================ */
 
-typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_COUNT } CACarrier;
+typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_OPT_BYVAL, CAR_COUNT } CACarrier;
 typedef enum { PAY_HANDLE, PAY_PTR, PAY_SLICE, PAY_COUNT } CAPayload;
 typedef enum { SINK_FF, SINK_SCOPED_FREE_B4_JOIN, SINK_COUNT } CASink;
 
@@ -310,6 +310,7 @@ static const char *car_name(CACarrier c) {
     case CAR_BYVAL:  return "byval-struct";
     case CAR_NESTED: return "nested-struct";
     case CAR_OPT:    return "optional";
+    case CAR_OPT_BYVAL: return "optional-of-byval-struct";
     case CAR_COUNT:  break;
     }
     return "?";
@@ -333,7 +334,14 @@ static const char *sink_name(CASink s) {
 }
 
 /* `?[*]T` and `?Handle` are spellable; a nested optional is not, and the
- * optional carrier over a slice adds no distinct dispatch path. */
+ * optional carrier over a slice adds no distinct dispatch path.
+ *
+ * CAR_OPT_BYVAL (`?B` where `struct B{ payload q; }`) is the D-gap shape: an
+ * optional wrapping a by-value STRUCT that carries the payload — distinct from
+ * CAR_OPT (`?payload`, optional over the BARE payload). The struct/union carrier
+ * arms and the Handle chain gated on the distinct-unwrapped kind only, so the
+ * outer `?` made every one skip it. All payloads are valid here (a struct
+ * carrying a slice, `struct B{ [*]T q; }`, is spellable). */
 static int carrier_cell_valid(CACarrier c, CAPayload p) {
     if (c == CAR_OPT && p == PAY_SLICE) return 0;
     return 1;
@@ -378,6 +386,14 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
         snprintf(setup, sizeof(setup), "?%s a; a = src;", fld);
         snprintf(acc,   sizeof(acc),   "a");
         break;
+    case CAR_OPT_BYVAL:
+        /* ?B where struct B{ payload q; } — optional wrapping a by-value carrier
+         * (the D gap). Worker unwraps the optional, then derefs the field. */
+        snprintf(decls, sizeof(decls), "struct B{ %s q; }\n", fld);
+        snprintf(argty, sizeof(argty), "?B");
+        snprintf(setup, sizeof(setup), "B tmp; tmp.q = src; ?B a; a = tmp;");
+        snprintf(acc,   sizeof(acc),   "a");
+        break;
     case CAR_COUNT: argty[0]=0; setup[0]=0; acc[0]=0; break;
     }
 
@@ -388,6 +404,12 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
             snprintf(body, sizeof(body), "Handle(T) u = %s orelse { return; }; u32 x = u.v;", acc);
         else
             snprintf(body, sizeof(body), "*T u = %s orelse { return; }; u32 x = u.v;", acc);
+    } else if (c == CAR_OPT_BYVAL) {
+        /* unwrap the optional to the by-value struct, then deref its field */
+        if (p == PAY_SLICE)
+            snprintf(body, sizeof(body), "if (%s) |bb| { u32 x = bb.q[0].v; }", acc);
+        else
+            snprintf(body, sizeof(body), "if (%s) |bb| { u32 x = bb.q.v; }", acc);
     } else if (p == PAY_SLICE) {
         snprintf(body, sizeof(body), "u32 x = %s[0].v;", acc);
     } else {
@@ -441,6 +463,15 @@ int main(void) {
         for (CAPayload p = 0; p < PAY_COUNT; p++) {
             if (!carrier_cell_valid(c, p)) continue;
             for (CASink k = 0; k < SINK_COUNT; k++) {
+                /* gap-masked-by: optional-of-byval carrier at the SCOPED
+                 * free-before-join sink is a KNOWN OPEN gap (docs/limitations.md
+                 * "?<by-value carrier> defeats the scoped free-before-join
+                 * transfer marking"). The FF sink — the primary danger, a
+                 * fire-and-forget thread outliving the frame — IS closed (checker
+                 * carrier gate). The scoped facet needs alias re-rooting through
+                 * the optional copy `a = tmp`, a deeper fix; tracked, not silent. */
+                if (c == CAR_OPT_BYVAL && k == SINK_SCOPED_FREE_B4_JOIN)
+                    continue;
                 valid_cells++;
                 char nm[192];
                 snprintf(nm, sizeof(nm), "carrier/%s/%s/%s",

@@ -390,6 +390,152 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — 2026-08-04 audit sweep: six findings (2 fixed same session, 6 here)
+
+A single-session audit sweep (real programs + ASan + the carrier/VRP/escape probe
+matrices). **Two fixes landed** (BUGS-FIXED.md 2026-08-04): the bit-slice
+compound-assign miscompile, and the `?<carrier>` fire-and-forget spawn-arg hole.
+The **six below are confirmed and OPEN.** Each has a verified repro; none is a
+re-report of a pre-existing entry (checked against the DONE/OPEN ledger).
+
+### B — 2-hop view-through-call into a struct field dangles unflagged (MEDIUM, soundness/UAF)
+
+**Confirmed ASan heap-use-after-free, compiles clean.** A function that returns a
+view of its param by CALLING ANOTHER view-returning function (not a direct
+projection) gets no view-of-param return summary, so a store of its result into a
+struct field is not aliased to the base — free the base, read the field = UAF.
+
+```zer
+struct B { u32 v; }
+struct H { *B p; }
+*B first([*]B s) { return &s[0]; }
+*B forward([*]B s) { return first(s); }   // returns a CALL result, not &s[..]
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+    H h; h.p = forward(s);   // struct-field target + view-through-2-hop-call
+    free(s);
+    return h.p.v;            // ASan: heap-use-after-free
+}
+```
+The ONE-hop form (`h.p = first(s)`) IS rejected (the 2026-08-03f fix, arm c). The
+bare-local target 2-hop form (`*B p = forward(s)`) IS rejected. Only
+struct-field-target + 2-hop-call slips. **Root cause.** `classify_return_root`'s
+view-of-param arm (arm c) peels `&`/index/slice/field to a root PARAM, but
+`forward`'s body `return first(s)` is a CALL, not a projection of a param — so
+`forward` records no view-of-param summary; the struct-field assign arm that
+mirrors call-site substitution then finds nothing to alias. **Fix sketch.** Make
+the return-summary inference transitive: `return <call>(param_i, ...)` inherits
+the callee's view-of-param summary substituted by the argument (the same
+substitution the bare-local Phase-F call-site aliasing already does — lift it
+into the summary). Repro: `/tmp/probe/x3.zer`.
+
+### C — return of a struct-FIELD of a by-value param launders the alloc_id (MEDIUM, soundness/UAF + double-free)
+
+**Confirmed: compiles clean, reads the freed slot (222); double-free also
+accepted.** Returning a pointer/slice FIELD of a by-value struct param does not
+propagate the heap `alloc_id` alias to the call result:
+
+```zer
+struct Node { u32 v; }
+struct Holder { *Node p; }
+*Node extract(Holder h) { return h.p; }   // returns a FIELD of a by-value param
+u32 main() {
+    *Node n = alloc(Node) orelse { return 1; };
+    n.v = 222;
+    Holder h; h.p = n;
+    *Node m = extract(h);   // m aliases n — alloc_id alias LOST
+    free(n);
+    return m.v;             // UAF (222); and free(m) after is an accepted double-free
+}
+```
+The direct-param launder (`*Node id(*Node x){return x;}`) IS rejected. **Root
+cause.** `classify_return_root` records `return h.p` in the ESCAPE ret_param_mask
+(dangling-stack axis), but the UAF `alloc_id` alias edge across a call is only
+formed when the returned value is the tracked handle ARGUMENT itself, never a
+FIELD of a struct arg (nor the whole struct carrying it). So `free(n)` does not
+reach `m`. **Near-miss masking warning:** the reverse order (free through `m`, use
+`n`) is rejected but for the WRONG reason (leak of `n`), so the natural
+free-the-original code ships the UAF/double-free silently — exactly the
+leak-masking failure mode CLAUDE.md warns about. **Fix sketch.** Extend the
+call-result alias propagation so a return whose root walks through a field of a
+struct arg (or returns a struct carrying an arg-derived pointer/handle field)
+forms the alloc_id alias from that arg's field to the call result — the same
+projection-descent that closed P9 for the escape sink, applied to the return-UAF
+sink. NOTE: B and C are the same subsystem (call-result alias incompleteness) and
+should be fixed together. Repro: `/tmp/probe/cfind.zer`.
+
+### D-scoped — `?<by-value carrier>` defeats the SCOPED free-before-join transfer marking (MEDIUM, soundness/UAF)
+
+Sibling of the fixed fire-and-forget carrier hole. For a SCOPED spawn
+(`ThreadHandle th = spawn w(a); free(src); th.join();`), a by-value carrier
+`Box{*T q}` is correctly caught by the free-before-join transfer marking, but the
+`?Box` optional wrapper is NOT. The bare `?*T` at the scoped sink IS caught, so
+this is specific to the optional-of-STRUCT copy. **Root cause.** The transfer
+marking (zercheck_ir.c ~2819) marks compound handles rooted at the spawn arg
+`a` — but for `?Box a`, the setup `Box tmp; tmp.q = src; ?B a; a = tmp;` roots the
+`(tmp, ".q")` alias at `tmp`, and the optional-wrap copy `a = tmp` does not
+re-root it onto `a`, so nothing rooted at `a` gets marked. **Fix sketch.** Re-root
+compound aliases when a struct value carrying tracked pointers is copied into an
+optional (or generally on struct-value copy). Gated in
+`tests/test_conc_matrix.c` by the new `CAR_OPT_BYVAL` axis; the scoped-sink cell
+is skipped with a `gap-masked-by` justification until this lands. Repro: the
+`optional-of-byval-struct` / `scoped/free-before-join` matrix cells.
+
+### E — funcptr bound to a local variable, passed as a spawn arg, defeats the spawn-race scan (MEDIUM, soundness/data race)
+
+```zer
+struct T { u32 v; }
+Pool(T, 4) gp;
+void doalloc() { Handle(T) h = gp.alloc() orelse return; gp.free(h); }
+void worker(*() fn) { fn(); }
+u32 main() {
+    *() f = doalloc;
+    spawn worker(f);          // CLEAN — no diagnostic
+    Handle(T) h2 = gp.alloc() orelse { return 1; };
+    gp.free(h2);              // main + thread both mutate gp metadata (non-atomic)
+    return 0;
+}
+```
+`spawn worker(doalloc)` (name direct) and the funcptr-struct-field variant BOTH
+reject with "accesses non-shared global 'gp' — data race"; the variable-binding
+variant compiles clean. **Root cause.** `scan_funcname_binding` only fires when
+the arg is a function-NAME ident; a variable holding the funcptr is not, and the
+target calls it via a parameter (neither a global-function ident nor a field), so
+no descent path covers it. **Fix sketch.** When a spawn arg is a funcptr-typed
+local, resolve its binding (last assignment / initializer) to the target function
+and run the same body scan; or, conservatively, treat any funcptr spawn arg
+invoked in the target as reaching whatever that funcptr's bound function reaches.
+Repro: `/tmp/probe/efind.zer`.
+
+### F1 — `goto` INTO a `@critical`/`defer` block is accepted (LOW, completeness; GCC-backstopped)
+
+The `@critical` guard rejects control-flow LEAVING the block (BUG-436) but nothing
+rejects a `goto` that targets a label INSIDE the block from outside. `zerc`
+accepts it silently and emits malformed C where the interrupt-DISABLE prologue
+lands in a block AFTER the goto target (dead code), running the critical body +
+re-enable epilogue without ever disabling interrupts. **Backstop:** in every
+arrangement tried, the emitted C is malformed enough that GCC rejects it (or the
+defer path hits a runtime `_zer_trap`), so it does NOT reach a silently-unsafe
+binary — but `zerc`, the layer that owns this property, should emit a clean
+diagnostic (the entry-side mirror of BUG-436), not hand GCC malformed output.
+**Fix sketch.** Extend the `@critical`/`defer` control-flow check to reject any
+`goto` whose target label is inside a `@critical`/`defer` block. Repro:
+`/tmp/scr/h36_goto_into_crit.zer`.
+
+### F2 — runtime-value over-width bit-field write silently truncates (LOW, design-arguable)
+
+A LITERAL over-width field write (`r[3..0] = 255`) is a compile error; the same
+with a runtime value (`u32 v = 255; r[3..0] = v;`) compiles, runs, and silently
+truncates to `r == 15`. **Memory-safe** (the `& mask` prevents neighbour-bit
+corruption — this is the standard C bit-field idiom), so LOW/arguable; the only
+issue is the asymmetry with the literal rejection and ZER's "no silent
+truncation" principle. Distinct from the runtime-`lo`-position UB entry. Could
+emit a fits-check `_zer_trap` (as bounds/division do). Repro:
+`/tmp/scr/bf_run.zer`.
+
+---
+
 ## OPEN — scoped-borrow: a join on EVERY branch arm is over-rejected (LOW, precision)
 
 **Symptom.** Joining on every arm of a branch and then using the borrowed local is

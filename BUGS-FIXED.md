@@ -5,6 +5,80 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-04 — audit sweep: bit-slice compound-assign miscompile + `?<carrier>` spawn-arg hole
+
+Two fixes landed this session (a third-party audit-branch style sweep run in one
+session). Six further findings were confirmed and are tracked in
+`docs/limitations.md` under "## OPEN — 2026-08-04 audit sweep" (not fixed here).
+
+### FIX 1 — compound assignment to a bit-slice silently stored the bare RHS (miscompile)
+
+`reg[hi..lo] OP= rhs` (any of `+= -= *= /= %= &= |= ^= <<= >>=`) was compiled as
+`reg[hi..lo] = rhs`, silently dropping BOTH the current field value AND the
+operator. `r[7..0]=20; r[7..0]+=3` returned **3**, not 23. This is the exact
+register read-modify-write idiom bit-slices exist for (`CTRL[3..0] |= ENABLE`),
+so it hit real firmware code.
+
+CAUSE. The IR-path bit-slice SET handler (`emitter.c`, `emit_rewritten_node`,
+the `NODE_SLICE` assign target arm) never consulted `node->assign.op` — it always
+emitted `(*_zer_bp & ~mask) | ((rhs << lo) & mask)`, the plain-store form. The
+AST-path sibling was correctly guarded by `op == TOK_EQ`, but bodies are IR-only,
+so the IR path is the live one. All 10 compound operators were affected; the
+value happened to be correct only when the RHS numerically equalled the intended
+result.
+
+FIX. For a compound op the handler now emits a read-modify-write: the inserted
+value is `current_field OP rhs`, where `current_field = ((uint64_t)(*_zer_bp) >>
+lo) & unshifted_mask`. `*_zer_bp` is a cached pointer (single-eval), so
+re-reading it is side-effect-free. Shifts route through `_zer_shl`/`_zer_shr`
+(shift-by->=width = 0 semantics); `/=`,`%=` are already divisor-nonzero-checked
+by the checker before emission. Two small helpers `emit_slice_lo` /
+`emit_slice_umask` were factored so the plain-store and RMW paths can never
+diverge on how the low bit / field mask is spelled. Plain `=` is byte-for-byte
+unchanged.
+
+Test: `tests/zer/bit_slice_compound_assign.zer` — asserts all 10 operators, a
+4-bit field-width wrap, neighbour-bit non-disturbance, and the plain-`=`
+regression; verified to exit non-zero on a pre-fix `git archive HEAD` build and
+0 after.
+
+### FIX 2 — `?<carrier>` defeated the fire-and-forget spawn-arg carrier gate (cross-thread UAF/race)
+
+Wrapping a by-value carrier struct in one optional layer (`?Box` where `struct
+Box { *Data p; }` / `{ Handle(T) h; }` / `{ [*]T s; }`) slipped the spawn-arg
+carrier gate entirely: the dangling stack pointer / non-thread-safe Handle was
+copied into the fire-and-forget thread with no diagnostic. The non-optional
+`Box` form was correctly rejected.
+
+CAUSE. `checker.c` spawn-arg checking: `eff = type_unwrap_distinct(arg_type)`
+unwraps distinct but NOT optional. The `is_ptr_like` arm was made optional-aware
+by D2 (a one-level `eff_pl` unwrap), but the struct/union carrier arms (§B#13
+stack-derived, and the non-shared-pointer carrier) plus the Handle chain all
+still gated on `eff->kind == TYPE_STRUCT/UNION/HANDLE`. A `?Box` reaches them as
+TYPE_OPTIONAL and matched none. The Handle chain was worse: its `?Handle` arm
+matched ANY optional kind, so `?Box` entered it (inner is a struct, not a
+Handle), did nothing, and BLOCKED the recursive `type_carries_handle` arm below.
+This is the `?T`-hides-the-inner-kind class (CLAUDE.md) at the spawn-arg sink.
+
+FIX. `eff_pl` now fully unwraps optional layers (while-loop, closing the
+double-optional `??Box` corner too). The two struct/union carrier arms gate on
+`type_dispatch_kind(eff_pl) == TYPE_STRUCT/UNION`; the Handle chain's `?Handle`
+arm gates on `type_dispatch_kind(eff_pl) == TYPE_HANDLE`, so a bare `?Handle`
+lands there and a `?<carrier>` falls through to `type_carries_handle` (which
+already recurses optional/struct/union/array). Pure-value `?Box` (no
+pointer/handle) is NOT rejected — no over-rejection. `type_dispatch_kind` keeps
+the distinct-unwrap CI gate green (no new raw `->kind ==` site).
+
+Tests: `tests/zer_fail/spawn_opt_carrier_stackptr.zer`,
+`spawn_opt_carrier_handle.zer`; plus a new `CAR_OPT_BYVAL` carrier axis in
+`tests/test_conc_matrix.c` (the class-completeness gate) — the 3 fire-and-forget
+cells were verified FALSE-NEGATIVE on the pre-fix compiler and pass after. The
+SCOPED free-before-join facet of the same shape is a deeper (alias-re-rooting)
+hole left OPEN and documented; that grid cell is explicitly skipped with a
+`gap-masked-by` justification.
+
+---
+
 ## Session 2026-08-03g — block-scoped `defer free` then use-after-block (live UAF)
 
 Confirmed live before the fix: compiles clean, returns **222** — the emitted C

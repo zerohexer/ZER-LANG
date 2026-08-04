@@ -1,0 +1,37 @@
+// Compound assignment to a bit-slice target (reg[hi..lo] OP= rhs) is a
+// READ-MODIFY-WRITE. The IR-path bit-slice SET handler in emitter.c used to
+// ignore node->assign.op and emit a plain store of the bare RHS, silently
+// dropping BOTH the current field value AND the operator — so `r[7..0] += 5`
+// stored 5 instead of `field + 5`. This is the exact register-RMW idiom
+// bit-slices exist for (CTRL[3..0] |= ENABLE), so it hit real firmware code.
+//
+// Every arm asserts the correct value and returns a distinct non-zero code on
+// mismatch. On the pre-fix compiler every compound arm returned the bare RHS,
+// so this exits non-zero (discriminating); post-fix it exits 0.
+u32 main() {
+    u32 r = 0;
+
+    r[7..0] = 20; r[7..0] += 3;   if (r[7..0] != 23)  { return 1; }   // add
+    r[7..0] = 20; r[7..0] -= 3;   if (r[7..0] != 17)  { return 2; }   // sub
+    r[7..0] = 20; r[7..0] *= 3;   if (r[7..0] != 60)  { return 3; }   // mul
+    r[7..0] = 20; r[7..0] /= 3;   if (r[7..0] != 6)   { return 4; }   // div
+    r[7..0] = 20; r[7..0] %= 3;   if (r[7..0] != 2)   { return 5; }   // mod
+    r[7..0] = 20; r[7..0] |= 3;   if (r[7..0] != 23)  { return 6; }   // or
+    r[7..0] = 20; r[7..0] &= 3;   if (r[7..0] != 0)   { return 7; }   // and
+    r[7..0] = 20; r[7..0] ^= 3;   if (r[7..0] != 23)  { return 8; }   // xor
+    r[7..0] = 20; r[7..0] <<= 3;  if (r[7..0] != 160) { return 9; }   // shl (fits 8-bit)
+    r[7..0] = 20; r[7..0] >>= 3;  if (r[7..0] != 2)   { return 10; }  // shr
+
+    // field-width wrap: 4-bit field, 10 + 10 = 20, masked to 20 & 15 = 4
+    r = 0; r[3..0] = 10; r[3..0] += 10; if (r[3..0] != 4) { return 11; }
+
+    // the RMW must not disturb neighbouring bits: set [15..8] then RMW [7..0]
+    r = 0; r[15..8] = 0xAB; r[7..0] = 20; r[7..0] |= 3;
+    if (r[15..8] != 0xAB) { return 12; }
+    if (r[7..0] != 23)    { return 13; }
+
+    // plain assignment (regression guard) still stores the bare value
+    r[7..0] = 42; if (r[7..0] != 42) { return 14; }
+
+    return 0;
+}

@@ -6237,6 +6237,38 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
  * DOES NOT CALL emit_expr. Each node type emitted directly.
  * For sub-expressions, calls itself recursively.
  * ================================================================ */
+
+/* Emit the low-bit shift amount for a bit-slice write (const or hoisted temp).
+ * Shared by the plain-store and the compound-RMW paths of the bit-slice SET
+ * handler so the two can never diverge on how the low bit is spelled. */
+static void emit_slice_lo(Emitter *e, bool bits_const, int64_t const_lo,
+                          Node *lo_node, int btmp) {
+    if (bits_const) emit(e, "%lld", (long long)const_lo);
+    else if (lo_node) emit(e, "_zer_bl%d", btmp);
+    else emit(e, "0");
+}
+
+/* Emit the UNSHIFTED field mask ((1<<width)-1, or ~0 for width>=64) for a
+ * bit-slice write. Used to read the current field value in the compound-RMW
+ * path: current = ((uint64_t)obj >> lo) & umask. */
+static void emit_slice_umask(Emitter *e, bool bits_const, int64_t const_hi,
+                             int64_t const_lo, Node *hi_node, Node *lo_node,
+                             int btmp) {
+    if (hi_node && lo_node) {
+        if (bits_const) {
+            int64_t width = const_hi - const_lo + 1;
+            if (width >= 64) emit(e, "~(uint64_t)0");
+            else emit(e, "((1ull << %lld) - 1)", (long long)width);
+        } else {
+            emit(e, "((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+                 "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1))",
+                 btmp, btmp, btmp, btmp);
+        }
+    } else {
+        emit(e, "~(uint64_t)0");
+    }
+}
+
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
@@ -7052,11 +7084,44 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
             emit(e, ")) | (((uint64_t)(");
-            emit_rewritten_node(e, node->assign.value, func);
+            /* Compound assign to a bit-slice (reg[hi..lo] OP= rhs) is a
+             * READ-MODIFY-WRITE, not a plain store: it must combine the CURRENT
+             * field value with the RHS via the operator. The handler used to
+             * ignore node->assign.op and emit the bare RHS, silently dropping
+             * both the read and the operator (reg[hi..lo] += 5 stored 5). The
+             * current field is ((uint64_t)(*_zer_bp) >> lo) & unshifted_mask;
+             * *_zer_bp is a cached pointer (single-eval), so re-reading is safe. */
+            const char *slice_cop = NULL, *slice_shmac = NULL;
+            switch (node->assign.op) {
+            case TOK_PLUSEQ:    slice_cop = "+"; break;
+            case TOK_MINUSEQ:   slice_cop = "-"; break;
+            case TOK_STAREQ:    slice_cop = "*"; break;
+            case TOK_SLASHEQ:   slice_cop = "/"; break;
+            case TOK_PERCENTEQ: slice_cop = "%"; break;
+            case TOK_AMPEQ:     slice_cop = "&"; break;
+            case TOK_PIPEEQ:    slice_cop = "|"; break;
+            case TOK_CARETEQ:   slice_cop = "^"; break;
+            case TOK_LSHIFTEQ:  slice_shmac = "_zer_shl"; break;
+            case TOK_RSHIFTEQ:  slice_shmac = "_zer_shr"; break;
+            default: break; /* TOK_EQ and any non-compound → plain store */
+            }
+            if (slice_cop || slice_shmac) {
+                if (slice_shmac) emit(e, "%s(", slice_shmac);
+                emit(e, "((((uint64_t)(*_zer_bp%d)) >> ", btmp);
+                emit_slice_lo(e, bits_const, const_lo, lo_node, btmp);
+                emit(e, ") & ");
+                emit_slice_umask(e, bits_const, const_hi, const_lo, hi_node, lo_node, btmp);
+                emit(e, ")");
+                if (slice_shmac) emit(e, ", (");
+                else emit(e, " %s (", slice_cop);
+                emit_rewritten_node(e, node->assign.value, func);
+                emit(e, ")");
+                if (slice_shmac) emit(e, ")");
+            } else {
+                emit_rewritten_node(e, node->assign.value, func);
+            }
             emit(e, ") << ");
-            if (bits_const) emit(e, "%lld", (long long)const_lo);
-            else if (lo_node) emit(e, "_zer_bl%d", btmp);
-            else emit(e, "0");
+            emit_slice_lo(e, bits_const, const_lo, lo_node, btmp);
             emit(e, ") & (");
             if (hi_node && lo_node) {
                 if (bits_const) {

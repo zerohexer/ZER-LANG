@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: carries a pointer into a stack local
+// The spawn-arg carrier gate rejects a by-value struct that carries a pointer
+// into a stack local, but the struct/union carrier arms gated on the
+// distinct-unwrapped kind only — NOT the optional-unwrapped kind. Wrapping the
+// carrier in one `?` layer (`?Box`) reached those arms as TYPE_OPTIONAL and
+// slipped every one: the dangling &d was copied into the fire-and-forget thread
+// with no diagnostic (cross-thread use-after-free). This is the
+// `?T`-hides-the-inner-kind class at the spawn-arg carrier sink; D2 fixed it
+// only for the `is_ptr_like` pointer dispatch, never the struct/union arms.
+struct Data { u32 v; }
+struct Box { *Data p; }
+shared struct Keep { u32 x; }
+Keep g;
+
+void worker(?Box b) { if (b) |bb| { u32 x = bb.p.v; } }
+
+u32 main() {
+    Data d; d.v = 5;
+    Box b; b.p = &d;
+    ?Box ob = b;
+    spawn worker(ob);   // dangling &d copied into the thread — must reject
+    g.x = 1;
+    return 0;
+}

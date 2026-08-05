@@ -390,6 +390,92 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — `&packed_field` silently forms a misaligned pointer (HIGH, bare-metal silent; policy decision deferred) (2026-08-05)
+
+**Symptom (compiles clean):** taking the address of a multi-byte field of a
+`packed struct` yields a naturally-aligned pointer type over a possibly-misaligned
+address. Dereferencing it is an aligned word access of a misaligned address.
+
+```zer
+packed struct Regs { u8 ctrl; u32 data; }   // data at BYTE offset 1 (packed)
+Regs g;
+u32 read_data() {
+    *u32 p = &g.data;   // p : *u32 (assumed 4-aligned) → address is offset-1
+    return *p;          // aligned LDR of a misaligned address
+}
+```
+
+**Observed:** ZER compiles clean (only an unrelated label warning). The emitted C
+is `uint32_t *_zer_t0 = &g.data;` and GCC's OWN `-Waddress-of-packed-member` fires
+on it — but that warning is on the emitted C, invisible to the ZER user, and is a
+warning not an error. On hosted x86-64 the deref succeeds (x86 permits unaligned),
+so the whole test suite (hosted) is green. On Cortex-M0/M0+ an `LDR` of a
+misaligned address → **HardFault**; RISC-V without misalignment support → trap or
+silently-wrong bytes (emulated). So: silent on hosted, faulting/corrupting on
+bare-metal — a program-consequence (forming + dereferencing a `*u32` over a
+misaligned address) that ZER's model should own but does not catch.
+
+**Root cause:** the `TOK_AMP` address-of handler (checker.c) propagates
+volatile/const and bans union/shared interior extraction, but never checks whether
+the operand is a field of a `packed struct`. The "packed field may be misaligned"
+fact is already recognized at TWO narrow sinks (`@atomic_*` on a packed field,
+BUG-493; sync primitives inside a packed struct, BUG-498) — the general
+address-of sink is the un-covered sibling (multi-site class).
+
+**Why DEFERRED not fixed (policy decision):** the only SOUND rule is GCC's — reject
+`&field` of a packed struct whenever the field type's alignment > 1 — because a
+packed struct has alignment 1, so NO multi-byte field address is guaranteed aligned
+regardless of byte offset. That over-rejects a very common firmware idiom (packed
+register/protocol structs whose field addresses are taken). There is no clean
+"definitely-misaligned only" subset that leaves the rest provably safe (the
+offset-aligned case is unsafe too, just less obviously — it depends on the struct
+base). Shipping this rejection autonomously would break existing valid code; the
+boundary (hard error vs warning vs opt-in `--strict-align`) is a judgment call for
+the author. Reproducer + emitted-C proof captured; fix is a ~15-line check in the
+`TOK_AMP` handler once the policy is chosen.
+
+## OPEN — ISR global reached through a funcptr FIELD / returned funcptr — race scan blind (MEDIUM; ISR sibling of documented spawn holes) (2026-08-05)
+
+`record_isr_globals` (checker.c) follows only `NODE_CALL` whose callee is a bare
+global-function ident, plus the local-funcptr-binding descent
+(`record_isr_funcname_binding`, which closed the E1 local case). It does NOT
+resolve a funcptr **FIELD** callee (`d.cb()`) or a **returned** funcptr
+(`fp = get_fp(); fp()`). An ISR that touches a non-volatile global through such an
+indirect call never sets `from_isr`, so the "must be volatile" / non-atomic-RMW
+checks (`check_interrupt_safety`) never fire → GCC -O2 may hoist/tear the access
+(silent hang / torn RMW on bare metal).
+
+```zer
+struct Disp { *() cb; }
+Disp d;
+u32 flag;                          // non-volatile
+void touch() { flag = 1; }
+void handler() { d.cb(); }         // funcptr FIELD — callee not resolved
+void arm() { d.cb = touch; }
+interrupt USART1 { handler(); }    // flag reached from ISR, never marked from_isr
+```
+
+This is the exact same sink-blindness as the documented OPEN spawn-path holes
+(funcptr FIELD `02nq43`; returned funcptr `rvek5f` HOLE-D) — `record_isr_globals`
+has the same structure and was not separately closed for these two shapes. The
+durable fix is to give the ISR scan the same funcptr-field-binding + returned-fn
+descent the spawn scanner is getting; tracked together with the spawn siblings.
+
+## OPEN — `vrp_ir.c` `x & MASK` / `% N` range has no positive-mask guard (LOW, latent dead code) (2026-08-05)
+
+`ir_derive_range` in `vrp_ir.c` sets `range = [0, mask]` for `x & MASK` (and
+`[0, N-1]` for `x % N`) with NO `mask > 0` / `N > 0` guard. A wide unsigned literal
+(`& 0xFFFFFFFFFFFFFFFF`) casts to `-1`; `ir_range_proves_safe` then reads
+`max(-1) < array_size` as true for ANY array (inverted range → universally
+in-bounds). The production AST path `derive_expr_range` (checker.c) has the
+`rval <= 0 → return false` guard; `vrp_ir.c` lacks it. **Not live:** `vrp_ir()`
+has no consumers (grep is empty; the file header says it does not yet replace the
+AST VRP), so no check is actually elided today. Add the positive-mask guard BEFORE
+`vrp_ir` is ever wired to elision, or the moment it is consumed this becomes a
+HIGH silent-OOB.
+
+---
+
 ## OPEN — scoped-borrow: a join on EVERY branch arm is over-rejected (LOW, precision)
 
 **Symptom.** Joining on every arm of a branch and then using the borrowed local is

@@ -1,0 +1,11 @@
+// for-loop sibling of vrp_orelse_loop_widen_ok — same NODE_ORELSE walker gap.
+?u32 none_val() { ?u32 r; return r; }
+u32[8] b;
+u32 main() {
+    u32 k = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        b[k] = 5;
+        none_val() orelse { k = 12; };
+    }
+    return 42;
+}

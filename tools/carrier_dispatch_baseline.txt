@@ -18,7 +18,7 @@
 # null-sentinel test), the local is already fully unwrapped (`_eff`), or the
 # context is primitive-only.
 checker.c:bool is_ptr_like = (eff_pl->kind == TYPE_POINTER ||
-checker.c:(eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+checker.c:(eff_pl->kind == TYPE_STRUCT || eff_pl->kind == TYPE_UNION) &&
 checker.c:eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
 checker.c:eff_pl->kind == TYPE_ARRAY ||
 checker.c:eff_pl->kind == TYPE_SLICE ||

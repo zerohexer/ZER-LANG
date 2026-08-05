@@ -1,0 +1,15 @@
+// expect-error: carries a pointer into a stack local
+// D4 (2026-08-05): an OUTER optional wrapping a pointer-carrying struct bypassed
+// the spawn-arg carrier gate (eff==TYPE_OPTIONAL skipped the STRUCT kind arms) —
+// a cross-thread stack UAF that compiled clean. `?Msg`-wrapped must reject like
+// the bare `spawn worker(msg)` form does.
+struct Node { u32 v; }
+struct Msg  { *Node p; }
+void worker(?Msg m) { if (m) |mm| { mm.p.v = 1; } }
+u32 main() {
+    Node n; n.v = 0;
+    Msg msg; msg.p = &n;
+    ?Msg om = msg;
+    spawn worker(om);
+    return 0;
+}

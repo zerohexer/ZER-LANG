@@ -139,7 +139,12 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
     TypeKind k = type_dispatch_kind(vt);
     bool scalar = type_is_integer(vt) || k == TYPE_BOOL || k == TYPE_POINTER;
     if (!scalar) return false;          /* aggregate — never one word */
-    int w = type_width(vt);
+    /* A pointer is exactly one machine word, but type_width() has no
+     * TYPE_POINTER case and returns 0 → the `w <= 0` guard below rejected a
+     * `volatile *T` global outright, contradicting the `scalar` set above that
+     * deliberately admits pointers. That over-rejected the legitimate single-word
+     * `volatile *u32 g_reg` ISR/main flag idiom. Give a pointer its true width. */
+    int w = (k == TYPE_POINTER) ? c->target_ptr_bits : type_width(vt);
     if (w <= 0) return false;
     return w <= c->target_ptr_bits;
 }
@@ -10162,10 +10167,23 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     case NODE_INTRINSIC: {
         const char *n = node->intrinsic.name;
         uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
+        /* @atomic_* and the memory FENCES (@barrier / @barrier_store /
+         * @barrier_load / @barrier_acq_rel) are manual synchronization: they give
+         * ordering for lock-free access to a shared global, so a non-shared-global
+         * access in such a body warns rather than errors. The prior exact list
+         * OMITTED barrier_acq_rel, so a spawn body fencing with it was
+         * hard-ERRORED (over-rejection) — add it.
+         *
+         * Match the fences EXACTLY, NOT by a "barrier" prefix: @barrier_init /
+         * @barrier_wait are thread-rendezvous primitives, not memory fences —
+         * using them does NOT make a racing non-shared global access safe, so
+         * they must NOT downgrade the diagnostic (a prefix match wrongly did, and
+         * rt_conc_barrier_with_defer caught it). */
+        if ((nl >= 7  && memcmp(n, "atomic_", 7) == 0) ||
+            (nl == 7  && memcmp(n, "barrier", 7) == 0) ||
             (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
+            (nl == 12 && memcmp(n, "barrier_load", 12) == 0) ||
+            (nl == 15 && memcmp(n, "barrier_acq_rel", 15) == 0))
             parent_sym->props.has_sync = true;
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             scan_func_props(c, node->intrinsic.args[i], parent_sym);
@@ -10426,85 +10444,6 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
 
 /* Shared recursion-depth budget for the transitive spawn-global scan: the
  * direct-call descent, the function-name-arg descent, and the funcptr-binding
@@ -14712,7 +14651,17 @@ static void check_stmt(Checker *c, Node *node) {
              * arg type is TYPE_ARRAY and was UNCASED here — the latent
              * cross-thread stack-UAF was masked only by an emitter limitation
              * (GCC rejected the slice assignment), so the checker itself accepted
-             * it. Verified: `zerc -o x.c` emits NO diagnostic on main. */
+             * it. Verified: `zerc -o x.c` emits NO diagnostic on main.
+             *
+             * D4 (2026-08-05): `eff_pl` (the one-level optional unwrap) is ALSO
+             * consumed by the by-value struct/union carrier arms below. An OUTER
+             * optional wrapping a carrier struct (`?Msg om = msg; spawn
+             * worker(om)`) makes eff == TYPE_OPTIONAL, so the STRUCT/UNION kind
+             * gates were skipped and a pointer / Handle into a stack local
+             * crossed the thread boundary clean (verified cross-thread stack
+             * UAF). The recursive carrier predicates already descend the
+             * optional; gating the arms on `eff_pl` reaches them — same
+             * `?T`-hides-the-inner-kind fix shape as D2. */
             Type *eff_pl = eff;
             if (eff_pl->kind == TYPE_OPTIONAL)
                 eff_pl = type_unwrap_distinct(eff_pl->optional.inner);
@@ -14759,7 +14708,7 @@ static void check_stmt(Checker *c, Node *node) {
              * it is not over-rejected. Scoped spawns are exempt (join bounds the
              * lifetime). */
             else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
+                     (eff_pl->kind == TYPE_STRUCT || eff_pl->kind == TYPE_UNION) &&
                      spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i])) {
                 checker_error(c, node->loc.line,
                     "spawn argument %d: cannot pass a by-value struct/union that "
@@ -14784,8 +14733,8 @@ static void check_stmt(Checker *c, Node *node) {
              * one whose pointers all target `shared struct`s, is NOT rejected —
              * the exemption mirrors the bare-arg logic. */
             else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
-                     type_carries_nonshared_pointer(eff, 0)) {
+                     (eff_pl->kind == TYPE_STRUCT || eff_pl->kind == TYPE_UNION) &&
+                     type_carries_nonshared_pointer(eff_pl, 0)) {
                 checker_error(c, node->loc.line,
                     "spawn argument %d: cannot pass a by-value struct/union that "
                     "carries a non-shared pointer/slice to a fire-and-forget "
@@ -14803,14 +14752,20 @@ static void check_stmt(Checker *c, Node *node) {
                     "argument %d: cannot pass Handle to spawn — "
                     "pool.get() is not thread-safe",
                     i + 1);
-            } else if (eff->kind == TYPE_OPTIONAL) {
-                Type *inner = type_unwrap_distinct(eff->optional.inner);
-                if (inner && inner->kind == TYPE_HANDLE) {
-                    checker_error(c, node->loc.line,
-                        "argument %d: cannot pass ?Handle to spawn — "
-                        "spawned thread can unwrap and use Handle (pool.get() not thread-safe)",
-                        i + 1);
-                }
+            } else if (eff->kind == TYPE_OPTIONAL &&
+                       type_unwrap_distinct(eff->optional.inner) &&
+                       type_unwrap_distinct(eff->optional.inner)->kind == TYPE_HANDLE) {
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass ?Handle to spawn — "
+                    "spawned thread can unwrap and use Handle (pool.get() not thread-safe)",
+                    i + 1);
+                /* D4 (2026-08-05): this branch previously matched ANY `?T`
+                 * (eff==OPTIONAL) and, when the inner was a struct carrying a
+                 * Handle (`?Struct{Handle}`), silently fell out without error —
+                 * intercepting the case before the `type_carries_handle`
+                 * fall-through below could catch it. Now it matches ONLY a bare
+                 * `?Handle`; a Handle-carrying optional struct reaches the
+                 * recursive carrier arm. */
             } else if (type_carries_handle(eff, 0)) {
                 /* 2026-08-03: the two arms above test the BARE argument kind, so
                  * wrapping the SAME handle in a by-value struct slipped the gate
@@ -16751,11 +16706,26 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
         vrp_invalidate_loop_body_writes(c, body->critical.body);
     } else if (k == NODE_ONCE) {
         vrp_invalidate_loop_body_writes(c, body->once.body);
+    } else if (k == NODE_ORELSE) {
+        /* 2026-08-05: an orelse FALLBACK is a statement block that can write an
+         * OUTER loop var (`f() orelse { k = 50; }`). The sibling
+         * vrp_widen_loop_addr_taken already recurses NODE_ORELSE; this pass
+         * omitted it, so a body index/divisor written in an orelse fallback kept
+         * its stale narrow pre-loop range and the bounds/div guard was ELIDED —
+         * ASan-confirmed silent global-buffer-overflow. Descend BOTH the tried
+         * expr (may nest assigns/orelse) and the fallback. */
+        vrp_invalidate_loop_body_writes(c, body->orelse.expr);
+        vrp_invalidate_loop_body_writes(c, body->orelse.fallback);
+    } else if (k == NODE_VAR_DECL) {
+        /* The DECLARED var is a shadow (not widened), but an orelse/compound
+         * INIT can write an OUTER var: `u32 x = f() orelse { k = 50; };` widens
+         * k, not x. Descend the init; only genuine NODE_ASSIGN subtrees (outer
+         * writes) are widened — the init-to-new-var is not a NODE_ASSIGN. */
+        vrp_invalidate_loop_body_writes(c, body->var_decl.init);
     }
     /* All other NodeKind values: no assignment subtree to widen.
      * Calls do not write the caller's locals (the callee's analysis
-     * owns its own ranges). VAR_DECL inner inits shadow rather than
-     * widen the outer range.  RETURN/BREAK/CONTINUE/GOTO/LABEL/YIELD/
+     * owns its own ranges). RETURN/BREAK/CONTINUE/GOTO/LABEL/YIELD/
      * AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
 }
 

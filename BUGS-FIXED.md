@@ -5,7 +5,82 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-03g — block-scoped `defer free` then use-after-block (live UAF)
+## Session 2026-08-05 — audit sweep: 2 soundness holes + 3 accuracy fixes
+
+Multi-agent adversarial audit (emitter dual-path, bare-metal, VRP/bounds,
+escape/carrier). Emitter dual-path came back CLEAN (the recent AST↔IR audits
+held); the two agent findings that survived my own verification were both real
+soundness holes, closed here. Three accuracy/cleanup fixes landed alongside.
+
+**BUG-A — spawn-arg carrier gate blind to an OUTER `?T` optional (CRITICAL
+soundness — cross-thread stack UAF, compiled clean).** The bare
+`spawn worker(msg)` where `Msg{*Node}` points into a stack local is correctly
+rejected, but wrapping the arg in an optional first — `?Msg om = msg; spawn
+worker(om)` — was ACCEPTED. Root cause: the by-value struct/union carrier arms
+(checker.c, spawn NODE_SPAWN handler) gated on `eff->kind == TYPE_STRUCT ||
+TYPE_UNION`, and the Handle block's `else if (eff==OPTIONAL)` matched only a
+*bare* inner Handle and swallowed the `?Struct{Handle}` case before the
+`type_carries_handle` fall-through. When the arg's static type is `?Struct`,
+`eff` is `TYPE_OPTIONAL`, so every carrier arm was skipped — the
+`?T`-hides-the-inner-kind class at a sink the 2026-08-03 carrier audit did not
+cover. The recursive carrier predicates (`type_carries_nonshared_pointer` /
+`type_carries_handle`) already descend the optional; the gate was the only
+blocker. **Fix:** gate the two struct/union arms on `eff_pl` (the existing
+one-level optional unwrap, already computed for `is_ptr_like`/D2), and make the
+Handle middle branch match ONLY a bare `?Handle` so a Handle-carrying optional
+struct reaches the recursive carrier arm. Verified: 1a (`?Struct{*T-to-stack}`)
+and 1b (`?Struct{Handle}`) now reject; bare struct, bare `?Handle`, and a
+pure-value `?Struct` (no over-reject) all behave correctly. Tests:
+`tests/zer_fail/spawn_opt_carrier_stack_ptr.zer`,
+`tests/zer_fail/spawn_opt_carrier_handle.zer`,
+`tests/zer/spawn_opt_pure_value_ok.zer`.
+
+**BUG-B — VRP loop-body write-widening skipped NODE_ORELSE (CRITICAL soundness
+— silent OOB / div-by-zero).** `vrp_invalidate_loop_body_writes` (checker.c)
+widens the range of any loop-body-written variable BEFORE the body is checked,
+so a `a[k]` earlier in the body is not proven against a stale narrow range. Its
+if/else chain covered ASSIGN/BLOCK/IF/FOR/WHILE/DO_WHILE/SWITCH/EXPR_STMT/DEFER/
+CRITICAL/ONCE but OMITTED NODE_ORELSE — while its sibling
+`vrp_widen_loop_addr_taken` already recursed it (the tell). An index/divisor
+written in an orelse FALLBACK (`a[k]=7; none_val() orelse { k = 9; };`) kept its
+`[0,0]` pre-loop range, so `a[k]`'s bounds guard was ELIDED → ASan-confirmed
+`global-buffer-overflow`; the control (direct `k=9`) correctly emits the
+auto-guard. **Fix:** add NODE_ORELSE (descend both tried-expr and fallback) and
+NODE_VAR_DECL (descend the init — a var-decl orelse init can write an outer var
+in its fallback) to the walker. Verified: all three reachable forms
+(expr-stmt→orelse, var-decl-init→orelse, assign-value→orelse) now widen `k` and
+insert the guard; ASan clean. Tests: `tests/zer/vrp_orelse_loop_widen_ok.zer`,
+`tests/zer/vrp_orelse_for_widen_ok.zer` (discriminating: pre-fix returns 42 with
+an OOB write en route, post-fix the guard fires and returns 0).
+
+**BUG-C — `@barrier_acq_rel` missing from `has_sync` (accuracy / over-reject).**
+`scan_func_props` recognized manual synchronization via an EXACT-name list of
+memory FENCES `{barrier, barrier_store, barrier_load}` that omitted the
+`barrier_acq_rel` fence, so a spawn body fencing with `@barrier_acq_rel` on a
+non-shared global was HARD-ERRORED instead of warned. **Fix:** add
+`barrier_acq_rel` (nl==15) to the exact list. NOTE: a first attempt used a
+`"barrier"` PREFIX match — WRONG, and `rust_tests/rt_conc_barrier_with_defer`
+caught it: `@barrier_init`/`@barrier_wait` are thread-rendezvous primitives, not
+memory fences; they don't make a racing non-shared global access safe, so they
+must NOT downgrade the diagnostic. The class boundary is "fences", not
+"barrier*", so an exact list is correct. Verified `@barrier_acq_rel` warns+
+compiles; `@barrier` and the barrier-primitive rejection both unaffected.
+
+**BUG-D — `volatile *T` global falsely rejected by the race exemption
+(accuracy / over-reject).** `volatile_global_exempt_from_race_check` admits
+"integer / bool / pointer" as single-word-scalar-eligible, but `type_width()`
+has no `TYPE_POINTER` case and returns 0, so the `w <= 0` guard rejected a
+`volatile *u32 g_reg` ISR/main flag — contradicting the predicate's own scalar
+set. **Fix:** give a pointer its true width (`c->target_ptr_bits`) in the
+exemption; localized, no `type_width` ripple.
+
+**Cleanup — removed dead `has_atomic_or_barrier`** (checker.c), superseded by
+`scan_func_props`'s `has_sync` detection; it was the source of a
+`-Wunused-function` warning and still carried the same incomplete barrier list.
+
+Full audit context (including a HIGH bare-metal gap left DEFERRED for a policy
+decision — `&packed_field` misalignment — and the ISR-funcptr-indirection gap)
+is in docs/limitations.md.
 
 Confirmed live before the fix: compiles clean, returns **222** — the emitted C
 frees at block exit and then calls `use(p)` on the recycled slot.

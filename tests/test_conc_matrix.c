@@ -300,7 +300,7 @@ static void gen(COScenario s, char *buf, size_t n) {
  * coverage (the vacuous-test class, CLAUDE.md).
  * ================================================================ */
 
-typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_COUNT } CACarrier;
+typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_OPT_BYVAL, CAR_COUNT } CACarrier;
 typedef enum { PAY_HANDLE, PAY_PTR, PAY_SLICE, PAY_COUNT } CAPayload;
 typedef enum { SINK_FF, SINK_SCOPED_FREE_B4_JOIN, SINK_COUNT } CASink;
 
@@ -310,6 +310,7 @@ static const char *car_name(CACarrier c) {
     case CAR_BYVAL:  return "byval-struct";
     case CAR_NESTED: return "nested-struct";
     case CAR_OPT:    return "optional";
+    case CAR_OPT_BYVAL: return "opt-byval-struct";
     case CAR_COUNT:  break;
     }
     return "?";
@@ -378,6 +379,17 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
         snprintf(setup, sizeof(setup), "?%s a; a = src;", fld);
         snprintf(acc,   sizeof(acc),   "a");
         break;
+    case CAR_OPT_BYVAL:
+        /* D4 (2026-08-05): an OUTER optional wrapping a by-value struct carrier
+         * (`?B` where `B{ payload q; }`) bypassed the spawn-arg carrier gate —
+         * eff==TYPE_OPTIONAL skipped the STRUCT arms and the Handle else-if
+         * swallowed the case. Distinct from CAR_OPT (optional DIRECTLY over the
+         * payload, always handled). */
+        snprintf(decls, sizeof(decls), "struct B{ %s q; }\n", fld);
+        snprintf(argty, sizeof(argty), "?B");
+        snprintf(setup, sizeof(setup), "B tmp; tmp.q = src; ?B a = tmp;");
+        snprintf(acc,   sizeof(acc),   "a");   /* unwrapped in body */
+        break;
     case CAR_COUNT: argty[0]=0; setup[0]=0; acc[0]=0; break;
     }
 
@@ -388,6 +400,14 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
             snprintf(body, sizeof(body), "Handle(T) u = %s orelse { return; }; u32 x = u.v;", acc);
         else
             snprintf(body, sizeof(body), "*T u = %s orelse { return; }; u32 x = u.v;", acc);
+    } else if (c == CAR_OPT_BYVAL) {
+        /* unwrap the optional STRUCT, then deref the payload field ub.q */
+        if (p == PAY_HANDLE)
+            snprintf(body, sizeof(body), "B ub = %s orelse { return; }; Handle(T) u = ub.q; u32 x = u.v;", acc);
+        else if (p == PAY_SLICE)
+            snprintf(body, sizeof(body), "B ub = %s orelse { return; }; u32 x = ub.q[0].v;", acc);
+        else
+            snprintf(body, sizeof(body), "B ub = %s orelse { return; }; *T u = ub.q; u32 x = u.v;", acc);
     } else if (p == PAY_SLICE) {
         snprintf(body, sizeof(body), "u32 x = %s[0].v;", acc);
     } else {

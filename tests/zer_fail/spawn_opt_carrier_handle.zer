@@ -1,0 +1,15 @@
+// expect-error: CARRIES a Handle to spawn
+// D4 (2026-08-05): `?Struct{Handle}` slipped the spawn Handle gate — the
+// eff==TYPE_OPTIONAL branch matched only a bare inner Handle and swallowed the
+// optional-struct case before the type_carries_handle fall-through.
+struct Node { u32 v; }
+Slab(Node) pool;
+struct H { Handle(Node) h; }
+void worker(?H x) { if (x) |xx| { xx.h.v = 1; } }
+u32 main() {
+    Handle(Node) hh = pool.alloc() orelse return;
+    H hs; hs.h = hh;
+    ?H oh = hs;
+    spawn worker(oh);
+    return 0;
+}

@@ -745,3 +745,11 @@ checker.c:eff_pl->kind == TYPE_OPAQUE);
 checker.c:eff_pl->kind == TYPE_SLICE ||
 checker.c:if (eff_pl->kind == TYPE_OPTIONAL)
 checker.c:if (eff_pl->kind == TYPE_POINTER) {
+# D4 (2026-08-05) spawn-arg optional-carrier fix — all reads are on an
+# already-distinct-unwrapped type: `eff = type_unwrap_distinct(arg_type)`,
+# `eff_pl` derived from eff (one-level optional unwrap), and an explicit
+# `type_unwrap_distinct(...)->kind`. Same safe class as the baselined
+# `ret_eff->kind == TYPE_OPTIONAL && type_unwrap_distinct(...)->kind == TYPE_HANDLE`.
+checker.c:(eff_pl->kind == TYPE_STRUCT || eff_pl->kind == TYPE_UNION) &&
+checker.c:type_unwrap_distinct(eff->optional.inner)->kind == TYPE_HANDLE) {
+checker.c:} else if (eff->kind == TYPE_OPTIONAL &&

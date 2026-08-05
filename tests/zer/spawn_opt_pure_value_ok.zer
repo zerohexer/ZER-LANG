@@ -1,0 +1,10 @@
+// A pure-value optional struct (no pointer/Handle) is safe to spawn — the D4
+// carrier fix must not over-reject it.
+struct P { u32 a; u32 b; }
+void worker(?P m) { if (m) |mm| { u32 z = mm.a; z += mm.b; } }
+u32 main() {
+    P p; p.a = 1; p.b = 2;
+    ?P op = p;
+    spawn worker(op);
+    return 0;
+}

@@ -1,0 +1,20 @@
+// Regression (2026-08-05): a loop-body index written in an orelse FALLBACK must
+// widen the index's VRP range, or the bounds guard on a preceding `a[k]` is
+// elided → silent OOB write (ASan-confirmed global-buffer-overflow on the
+// pre-fix compiler). vrp_invalidate_loop_body_writes omitted NODE_ORELSE.
+//
+// Discriminates: post-fix, k is widened, the auto-guard `if (k>=8) return;`
+// fires on iteration 2 (k=9) and main returns 0. Pre-fix, no guard, the loop
+// runs to completion and returns 42 (with an OOB write en route). Expect exit 0.
+?u32 none_val() { ?u32 r; return r; }
+u32[8] a;
+u32 main() {
+    u32 k = 0;
+    u32 n = 0;
+    while (n < 3) {
+        a[k] = 7;
+        none_val() orelse { k = 9; };
+        n += 1;
+    }
+    return 42;
+}

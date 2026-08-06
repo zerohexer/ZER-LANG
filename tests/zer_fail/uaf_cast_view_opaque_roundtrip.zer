@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// The 2-hop form: a view laundered out to *opaque and back. Same class as
+// uaf_cast_wrapped_view.zer — the peel loops, so any depth of pointer-preserving
+// cast is stripped.
+struct B { u32 v; }
+
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+    *opaque o = @ptrcast(*opaque, &s[0]);
+    *B p = @ptrcast(*B, o);
+    free(s);
+    return p.v;
+}

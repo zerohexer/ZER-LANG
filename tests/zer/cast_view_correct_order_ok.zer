@@ -1,0 +1,24 @@
+// Boundary for the 2026-08-06 cast-peel: linking a cast-wrapped view to its base
+// must not reject the correct orderings, nor a view of the CALLER's memory.
+struct B { u32 v; }
+
+// a view of a PARAM is the caller's allocation — never a local escape
+u32 read_via_cast_view([*]B s) { *B p = @ptrcast(*B, &s[0]); return p.v; }
+
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+
+    u32 a = read_via_cast_view(s);          // cast view of a param
+    *B p = @ptrcast(*B, &s[0]);
+    u32 b = p.v;                            // used BEFORE the free
+    *B q = @pun(*B, &s[1]);
+    s[1].v = 4;
+    u32 c = q.v;
+
+    free(s);
+    if (a != 9) { return 2; }
+    if (b != 9) { return 3; }
+    if (c != 4) { return 4; }
+    return 0;
+}

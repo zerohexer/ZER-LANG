@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A VIEW wrapped in a pointer-preserving CAST lost its heap alias, so freeing
+// the base left the pointer dangling unflagged — ASan heap-use-after-free.
+//
+// The interior-pointer sink tests `rhs->kind == NODE_UNARY` (the bare `&expr`
+// form). `@ptrcast(*B, &s[0])` is a NODE_INTRINSIC, so the whole branch was
+// skipped. ir_peel_cast_wrappers now strips @ptrcast / @pun / @bitcast / @cast /
+// @container — all of which yield a pointer to the SAME storage — before the
+// view test, at both view-alias sinks.
+//
+// Deliberately NOT folded into ir_find_store_source_local: that helper warns the
+// escape/compound sinks intentionally treat a laundered value as untracked. This
+// peel is used only where the question is "is this a VIEW of some allocation?".
+struct B { u32 v; }
+
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+    *B p = @ptrcast(*B, &s[0]);
+    free(s);
+    return p.v;
+}

@@ -896,6 +896,44 @@ static int ir_find_value_local(IRFunc *func, Node *val) {
     return -1;
 }
 
+/* Peel the POINTER-PRESERVING cast family off an expression, returning the
+ * underlying value expression.
+ *
+ * `@ptrcast` / `@pun` / `@bitcast` / `@cast` take the target TYPE as args[0] and
+ * the value as the LAST arg; `@container` passes the pointer as args[0]. All of
+ * them yield a pointer to the SAME storage, so a VIEW wrapped in one is still a
+ * view of the same allocation.
+ *
+ * 2026-08-06: `*B p = @ptrcast(*B, &s[0]); free(s); p.v` was ACCEPTED —
+ * ASan heap-use-after-free — because the interior-pointer sink tests
+ * `rhs->kind == NODE_UNARY` and a cast is a NODE_INTRINSIC, so the whole branch
+ * was skipped. The 2-hop `*opaque` round-trip is the same shape, hence the loop.
+ *
+ * DELIBERATELY NOT folded into ir_find_store_source_local, and not swapped in
+ * for ir_find_value_local: that helper's own comment warns the escape/compound
+ * sinks intentionally treat a laundered value as untracked, and widening them
+ * would change unrelated aliasing decisions. This is used ONLY where the
+ * question is "is this expression a VIEW of some allocation?". */
+static Node *ir_peel_cast_wrappers(Node *e) {
+    int guard = 0;
+    while (e && e->kind == NODE_INTRINSIC && e->intrinsic.arg_count > 0 &&
+           guard++ < 32) {
+        const char *n = e->intrinsic.name;
+        uint32_t nl = (uint32_t)e->intrinsic.name_len;
+        if (nl == 9 && memcmp(n, "container", 9) == 0) {
+            e = e->intrinsic.args[0];
+        } else if ((nl == 7 && memcmp(n, "ptrcast", 7) == 0) ||
+                   (nl == 3 && memcmp(n, "pun", 3) == 0) ||
+                   (nl == 7 && memcmp(n, "bitcast", 7) == 0) ||
+                   (nl == 4 && memcmp(n, "cast", 4) == 0)) {
+            e = e->intrinsic.args[e->intrinsic.arg_count - 1];
+        } else {
+            break;   /* not a pointer-preserving cast — stop */
+        }
+    }
+    return e;
+}
+
 /* G5 store-source launder-unwrap: recover the underlying handle-carrying local
  * from a store RHS that was LAUNDERED, so the global-dangle sinks inherit the
  * real alloc_id. Two shapes bypass the raw ir_find_value_local (which only sees
@@ -3455,7 +3493,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
             inst->expr->assign.op == TOK_EQ &&
             inst->expr->assign.value) {
-            Node *rv = inst->expr->assign.value;
+            Node *rv = ir_peel_cast_wrappers(inst->expr->assign.value);
             /* Peel to the root identifier — but ONLY for an expression that
              * actually FORMS A REFERENCE into the allocation.
              *
@@ -3901,7 +3939,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * audit 2026-06-04: pre-fix was missing pool_name+len, escaped,
              * is_thread_handle — wrong-pool detection bypassed via
              * `*T fp = &b.field; Handle k = *fp;` interior pointer chain. */
-            if (rhs && rhs->kind == NODE_UNARY && rhs->unary.op == TOK_AMP) {
+            /* 2026-08-06: peel the cast family first — `@ptrcast(*B, &s[0])` is a
+             * NODE_INTRINSIC, so without this the whole interior-pointer branch
+             * was skipped and the view lost its heap alias (ASan-confirmed). */
+            Node *rhs_pv = ir_peel_cast_wrappers(rhs);
+            if (rhs_pv && rhs_pv->kind == NODE_UNARY && rhs_pv->unary.op == TOK_AMP) {
+                Node *rhs = rhs_pv;   /* shadow: the peeled view drives this branch */
                 Node *addr_target = rhs->unary.operand;
                 /* §A #7 (HOLE-A1/A2): if the address-taken expression is a
                  * COMPOUND (`&arr[0]` or `&b.field`) on a move-tracking base,

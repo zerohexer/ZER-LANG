@@ -5,6 +5,42 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06d — a VIEW wrapped in a CAST lost its heap alias (ASan heap-UAF)
+
+From audit branch `t20b31`. First step of the view-provenance unification.
+
+```zer
+*B p = @ptrcast(*B, &s[0]); free(s); return p.v;   // ASan heap-use-after-free
+```
+
+**Cause.** The interior-pointer sink tests `rhs->kind == NODE_UNARY` — the bare `&expr` form.
+`@ptrcast(...)` is a `NODE_INTRINSIC`, so the entire branch was skipped and the view never
+inherited the base's `alloc_id`. The 2-hop `*opaque` round-trip is the same shape.
+
+**Fix.** `ir_peel_cast_wrappers` strips the pointer-preserving cast family — `@ptrcast`,
+`@pun`, `@bitcast`, `@cast` (value is the LAST arg; args[0] is the target type) and
+`@container` (pointer is args[0]) — before the view test, at BOTH view-alias sinks (the
+interior-pointer var-decl and the projected-target assignment). It loops, so any depth of cast
+is stripped.
+
+**Deliberately NOT folded into `ir_find_store_source_local`**, whose own comment warns that
+the escape/compound sinks intentionally treat a laundered value as untracked and that widening
+them would change unrelated aliasing decisions. This peel is used ONLY where the question is
+"is this expression a VIEW of some allocation?".
+
+Verified: all four cast variants closed (`@ptrcast`, the `*opaque` round-trip, `@pun`, and a
+cast view stored into a struct field), the three previously-fixed family members do not
+regress, and both controls still compile — a cast view of a PARAM (the caller's memory) and a
+cast view used before the free.
+
+Tests: `uaf_cast_wrapped_view.zer`, `uaf_cast_view_opaque_roundtrip.zer` (both verified to
+COMPILE on a pre-fix build) and `tests/zer/cast_view_correct_order_ok.zer`.
+
+**Family status — 4 of 7 now closed.** Still open, all ASan-proven: a by-value struct RETURN
+carrying a param-view field, a 2-hop through-call, and returning a FIELD of a by-value param.
+All three are RETURN-SUMMARY problems rather than caller-side peeling, so they are the next
+step of the same unification.
+
 ## Session 2026-08-06c — `volatile *T` global falsely rejected (my regression from a3d8879f)
 
 From audit branch `2sjyjj`. `volatile_global_exempt_from_race_check` admits POINTERS to its

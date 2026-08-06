@@ -3529,6 +3529,44 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             adst_h->state = asnap.state;
                         }
                     }
+                    /* 2026-08-06: a whole-STRUCT copy must also replicate the
+                     * source's CARRIED compound handles. `B bv; bv.q = src;`
+                     * registers a compound (bv, ".q") aliased to src, and the
+                     * var-decl form `B b2 = bv;` replicates it via IR_COPY — but
+                     * the ASSIGNMENT form (`b2 = bv;`) and both optional-wrapping
+                     * forms (`?B a = bv;`, `?B a; a = bv;`) did not, so
+                     * `free(src); b2.q.v` was accepted. A plain single-threaded
+                     * UAF, and the reason the `?B` carrier also slipped the
+                     * SCOPED spawn transfer marking (the marking looks for
+                     * compounds rooted at the ARG, and they were never created).
+                     *
+                     * Same root shape as every other alias defect this week: the
+                     * replication lived at one opcode. Indices are snapshotted
+                     * before adding, since ir_add_compound_handle may realloc. */
+                    if (d_plen == 0) {
+                        int ccap = ps->handle_count > 0 ? ps->handle_count : 1;
+                        int *cidx = (int *)malloc((size_t)ccap * sizeof(int));
+                        if (cidx) {
+                            int cn = 0;
+                            for (int ci = 0; ci < ps->handle_count; ci++) {
+                                IRHandleInfo *ch = &ps->handles[ci];
+                                if (ch->local_id == a_src && ch->path_len > 0 &&
+                                    ch->alloc_id != 0)
+                                    cidx[cn++] = ci;
+                            }
+                            for (int ck = 0; ck < cn; ck++) {
+                                IRAliasSnapshot csnap;
+                                ir_snapshot_alias(&csnap, &ps->handles[cidx[ck]]);
+                                IRHandleState cst = ps->handles[cidx[ck]].state;
+                                const char *cpath = ps->handles[cidx[ck]].path;
+                                uint32_t cplen = ps->handles[cidx[ck]].path_len;
+                                IRHandleInfo *nh =
+                                    ir_add_compound_handle(ps, d_root, cpath, cplen);
+                                if (nh) { ir_apply_alias(nh, &csnap); nh->state = cst; }
+                            }
+                            free(cidx);
+                        }
+                    }
                 }
             }
         }

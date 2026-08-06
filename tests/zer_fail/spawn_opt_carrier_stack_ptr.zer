@@ -1,0 +1,28 @@
+// EXPECTED: compile error
+// expect-error: carries a non-shared pointer
+// An OPTIONAL wrapping a by-value struct that carries a pointer into a STACK
+// local, handed to a fire-and-forget spawn. The bare `Msg` form was rejected;
+// the `?Msg` form was ACCEPTED — a cross-thread stack use-after-free.
+//
+// Cause: the carrier arm was gated behind a raw `eff->kind == STRUCT || UNION`
+// pre-check, which an optional wrapper fails, so type_carries_nonshared_pointer
+// was never consulted. That pre-guard re-created the exact class the predicate
+// was added to close (2026-08-03). It is gone — asking a syntactic kind BEFORE
+// a semantic predicate can only subtract coverage.
+//
+// PROBE NOTE: with a HEAP pointer plus free() this masks behind the transfer
+// rule and looks fixed. A STACK pointer (no free anywhere) isolates the gate.
+struct Msg { *u32 p; }
+
+void worker(?Msg om) { Msg m = om orelse { return; }; *m.p = 5; }
+
+u32 f() {
+    u32 local = 0;
+    Msg msg;
+    msg.p = &local;
+    ?Msg om = msg;
+    spawn worker(om);
+    return local;
+}
+
+u32 main() { return f(); }

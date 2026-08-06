@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A whole-struct COPY must replicate the source's carried compound handles.
+// `B bv; bv.q = src;` registers a compound (bv, ".q") aliased to src. The
+// var-decl form `B b2 = bv;` replicated it via IR_COPY, but the ASSIGNMENT form
+// did not — so freeing src and reading through the copy was accepted.
+//
+// A plain single-threaded UAF, surfaced by the concurrency carrier grid: it is
+// also why a `?B` carrier slipped the SCOPED spawn transfer marking, which looks
+// for compounds rooted at the arg that were never created.
+//
+// Same root shape as every other alias defect this week — the replication lived
+// at one opcode (IR_COPY) while the same meaning also reaches IR_ASSIGN.
+struct T { u32 v; }
+struct B { *T q; }
+
+u32 main() {
+    *T src = alloc(T) orelse { return 1; };
+    B bv;
+    bv.q = src;
+    B b2;
+    b2 = bv;
+    free(src);
+    return b2.q.v;
+}

@@ -300,7 +300,14 @@ static void gen(COScenario s, char *buf, size_t n) {
  * coverage (the vacuous-test class, CLAUDE.md).
  * ================================================================ */
 
-typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_COUNT } CACarrier;
+/* CAR_OPT_BYVAL added 2026-08-06: an OPTIONAL wrapping a by-value carrier
+ * struct. The grid had CAR_OPT (optional over a bare payload) and CAR_BYVAL
+ * (struct over a bare payload) but never their COMPOSITION, and that is exactly
+ * where the gate broke — a raw `eff->kind == STRUCT` pre-guard skipped the
+ * carrier predicate for anything optional-wrapped, and the `?Handle` arm
+ * swallowed every other optional before it could reach the recursive check.
+ * Two axes each covered individually is not the same as their product. */
+typedef enum { CAR_BARE, CAR_BYVAL, CAR_NESTED, CAR_OPT, CAR_OPT_BYVAL, CAR_COUNT } CACarrier;
 typedef enum { PAY_HANDLE, PAY_PTR, PAY_SLICE, PAY_COUNT } CAPayload;
 typedef enum { SINK_FF, SINK_SCOPED_FREE_B4_JOIN, SINK_COUNT } CASink;
 
@@ -310,6 +317,7 @@ static const char *car_name(CACarrier c) {
     case CAR_BYVAL:  return "byval-struct";
     case CAR_NESTED: return "nested-struct";
     case CAR_OPT:    return "optional";
+    case CAR_OPT_BYVAL: return "optional-of-struct";
     case CAR_COUNT:  break;
     }
     return "?";
@@ -335,7 +343,8 @@ static const char *sink_name(CASink s) {
 /* `?[*]T` and `?Handle` are spellable; a nested optional is not, and the
  * optional carrier over a slice adds no distinct dispatch path. */
 static int carrier_cell_valid(CACarrier c, CAPayload p) {
-    if (c == CAR_OPT && p == PAY_SLICE) return 0;
+    if (c == CAR_OPT && p == PAY_SLICE) return 0;   /* ?[*]T adds no new dispatch path */
+    (void)p;
     return 1;
 }
 
@@ -378,12 +387,24 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
         snprintf(setup, sizeof(setup), "?%s a; a = src;", fld);
         snprintf(acc,   sizeof(acc),   "a");
         break;
+    case CAR_OPT_BYVAL:
+        snprintf(decls, sizeof(decls), "struct B{ %s q; }\n", fld);
+        snprintf(argty, sizeof(argty), "?B");
+        snprintf(setup, sizeof(setup), "B bv; bv.q = src; ?B a; a = bv;");
+        snprintf(acc,   sizeof(acc),   "u.q");
+        break;
     case CAR_COUNT: argty[0]=0; setup[0]=0; acc[0]=0; break;
     }
 
     /* The worker body: always a real dereference of the payload. */
     char body[256];
-    if (c == CAR_OPT) {
+    if (c == CAR_OPT_BYVAL) {
+        /* unwrap the optional to a local, then reach the carried payload */
+        if (p == PAY_SLICE)
+            snprintf(body, sizeof(body), "B u = a orelse { return; }; u32 x = u.q[0].v;");
+        else
+            snprintf(body, sizeof(body), "B u = a orelse { return; }; u32 x = u.q.v;");
+    } else if (c == CAR_OPT) {
         if (p == PAY_HANDLE)
             snprintf(body, sizeof(body), "Handle(T) u = %s orelse { return; }; u32 x = u.v;", acc);
         else

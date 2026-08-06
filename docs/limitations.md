@@ -390,6 +390,40 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — an orelse-UNWRAP does not carry the optional's compound handles (MEDIUM, soundness/UAF)
+
+**Symptom.** Surfaced while closing the 2026-08-06 optional-carrier hole. The struct COPY
+replication now covers assignment and both optional-wrapping forms, but the UNWRAP does not:
+
+```zer
+struct B { *T q; }
+*T src = alloc(T) orelse { return 1; };
+B bv; bv.q = src;
+?B a = bv;
+free(src);
+B u = a orelse { return 2; };
+return u.q.v;                      // ACCEPTED — u.q is the freed pointer
+```
+
+**Cause.** `B u = a orelse {...}` creates a NEW local `u` from the optional's payload. The
+compound handles carried on `a` (`(a, ".q")`, aliased to `src`) are not replicated onto `u`,
+so the read through `u.q` sees no tracked allocation.
+
+**Why it is only MEDIUM.** ASan cannot confirm it — the slab slot stays mapped, so the read is
+a logical use-after-free of a recycled slot rather than an unmapped access. The concurrency
+facet IS closed: the spawn-arg carrier gate and the scoped transfer marking both catch the
+`?B` shapes (conc-matrix 43/43), so this is the single-threaded residue.
+
+**Fix sketch.** In the optional-unwrap lowering (the `orelse` capture var-decl), replicate the
+source optional's compound handles onto the destination local, exactly as the struct-copy
+replication added at `IR_ASSIGN` on 2026-08-06 does. Same shape, one more form.
+
+**Family.** This is another member of the "one meaning, N forms" class — see the 2026-08-06
+branch-survey entry's VIEW-ALIAS FAMILY note. Worth folding into the single view-provenance
+query rather than patching alone.
+
+---
+
 ## OPEN — branch survey 2026-08-06: 9 verified fixes + 4 open heap-UAFs (`t20b31` / `2sjyjj` / `icejal` / `8j6w19`)
 
 **What this is.** Five `claude/gifted-noether-*` audit branches surveyed on 2026-08-06.

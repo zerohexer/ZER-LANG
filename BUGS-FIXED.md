@@ -5,6 +5,62 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06a — an OPTIONAL wrapper defeated the spawn carrier gate (my own regression)
+
+Found independently by THREE audit branches (`t20b31`, `2sjyjj`, `icejal`) — a strong signal
+on its own. **This was a hole in the 2026-08-03 carrier fix (`0e71b613`).**
+
+```zer
+struct Msg{ *u32 p; }
+void worker(?Msg om){ Msg m = om orelse { return; }; *m.p = 5; }
+u32 f(){ u32 local = 0; Msg msg; msg.p = &local; ?Msg om = msg; spawn worker(om); return local; }
+```
+ACCEPTED — a cross-thread stack UAF — while the bare `Msg` form was correctly rejected.
+
+**Two independent causes, both self-inflicted.**
+
+1. The pointer carrier arm was gated behind a raw `eff->kind == TYPE_STRUCT || TYPE_UNION`
+   pre-check. An optional wrapper fails it, so `type_carries_nonshared_pointer` was never
+   consulted — re-creating the exact `?T`-hides-the-inner-kind class the predicate had been
+   added to close. **Asking a syntactic kind BEFORE a semantic predicate can only subtract
+   coverage.** The pre-guard is gone; the recursive predicate decides alone.
+2. The `?Handle` arm matched EVERY optional and only reported when the inner was a bare
+   Handle, so a `?Box` was swallowed there and never reached `type_carries_handle`. Narrowed
+   to a bare `?Handle` (via `type_dispatch_kind`, which also covers a distinct-wrapped
+   optional).
+
+**The grid then found two MORE holes** — the `CAR_OPT_BYVAL` axis (optional wrapping a
+by-value carrier) failed at the SCOPED free-before-join cells. Root cause was broader than
+concurrency: **a whole-struct COPY replicated its carried compound handles only on the
+var-decl path.**
+
+| form | before |
+|---|---|
+| `B b2 = bv;` var-decl | replicated |
+| `B b2; b2 = bv;` assignment | **lost** — plain single-threaded UAF |
+| `?B a = bv;` / `?B a; a = bv;` | **lost** |
+
+Fixed at `IR_ASSIGN` by replicating the source's compound handles onto the destination. Same
+root shape as every other alias defect this week: the logic lived at ONE opcode while the same
+meaning also reaches another.
+
+**Residual, recorded as its own OPEN entry:** the orelse-UNWRAP (`B u = a orelse {...}`) still
+does not carry compounds from `a` to `u`. Single-threaded only — the concurrency facet is
+closed (conc-matrix 43/43) — and ASan cannot confirm it because the slab slot stays mapped.
+
+**Gate.** `CAR_OPT_BYVAL` added to the conc carrier grid: 43/43. The axis matters because the
+grid already had CAR_OPT and CAR_BYVAL individually but never their COMPOSITION, which is
+exactly where the gate broke. Two axes covered separately is not their product.
+
+Tests: `spawn_opt_carrier_stack_ptr.zer`, `spawn_opt_carrier_handle.zer`,
+`struct_copy_assign_carried_uaf.zer` (all verified to COMPILE on a pre-fix build) and
+`tests/zer/spawn_opt_carrier_safe_ok.zer` pinning the boundary — optional-over-pure-value,
+optional-over-pointer-to-shared, and plain value args.
+
+**Probe note worth keeping:** with a HEAP pointer plus `free`, this masks behind the transfer
+rule and the gate looks fine. Only a STACK pointer isolates it. The type-dispatch audit also
+caught my first cut using a raw `eff->kind == TYPE_OPTIONAL` — the gate working as intended.
+
 ## Session 2026-08-03g — block-scoped `defer free` then use-after-block (live UAF)
 
 Confirmed live before the fix: compiles clean, returns **222** — the emitted C

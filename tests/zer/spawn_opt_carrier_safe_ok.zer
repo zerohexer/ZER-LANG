@@ -1,0 +1,27 @@
+// Boundary for the 2026-08-06 optional-carrier fix. Dropping the raw-kind
+// pre-guard means every spawn arg now reaches the recursive carrier predicate,
+// so the shapes that carry NO cross-thread hazard must still compile.
+shared struct C { u32 v; }
+C g;
+
+struct PureVal { u32 a; u32 b; }
+struct SharedRef { *C c; }
+
+void takes_opt_value(?PureVal op) { PureVal p = op orelse { return; }; u32 x = p.a; }
+void takes_opt_shared(?SharedRef os) { SharedRef s = os orelse { return; }; s.c.v = 1; }
+void takes_values(u32 a, bool b) { u32 x = a; }
+
+u32 main() {
+    PureVal p;
+    p.a = 1; p.b = 2;
+    ?PureVal op = p;
+    spawn takes_opt_value(op);          // optional over a pure-value struct
+
+    SharedRef s;
+    s.c = &g;
+    ?SharedRef os = s;
+    spawn takes_opt_shared(os);         // optional over a pointer-to-shared
+
+    spawn takes_values(42, true);       // plain value args
+    return 0;
+}

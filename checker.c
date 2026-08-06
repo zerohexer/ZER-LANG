@@ -14783,9 +14783,20 @@ static void check_stmt(Checker *c, Node *node) {
              * caught by the transfer marking instead. A pure-value struct, or
              * one whose pointers all target `shared struct`s, is NOT rejected —
              * the exemption mirrors the bare-arg logic. */
-            else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
-                     type_carries_nonshared_pointer(eff, 0)) {
+            /* 2026-08-06: the `eff->kind == STRUCT || UNION` pre-guard that used
+             * to sit here is GONE. It re-created the very class this arm was
+             * added to close: an OPTIONAL wrapper (`?Msg om = msg; spawn w(om)`)
+             * has kind TYPE_OPTIONAL, failed the pre-check, and skipped the
+             * carrier test entirely — a cross-thread stack UAF that compiled
+             * clean while the bare `spawn w(msg)` form was correctly rejected.
+             *
+             * type_carries_nonshared_pointer already recurses optional / array /
+             * struct / union, unwraps distinct, excludes scalars, and exempts a
+             * pointer to a `shared struct`. Asking a syntactic kind BEFORE the
+             * semantic predicate can only subtract coverage — so do not
+             * reintroduce a kind pre-check here. (Found independently by three
+             * audit branches; see the 2026-08-06 branch survey entry.) */
+            else if (!is_scoped && type_carries_nonshared_pointer(eff, 0)) {
                 checker_error(c, node->loc.line,
                     "spawn argument %d: cannot pass a by-value struct/union that "
                     "carries a non-shared pointer/slice to a fire-and-forget "
@@ -14803,14 +14814,18 @@ static void check_stmt(Checker *c, Node *node) {
                     "argument %d: cannot pass Handle to spawn — "
                     "pool.get() is not thread-safe",
                     i + 1);
-            } else if (eff->kind == TYPE_OPTIONAL) {
-                Type *inner = type_unwrap_distinct(eff->optional.inner);
-                if (inner && inner->kind == TYPE_HANDLE) {
-                    checker_error(c, node->loc.line,
-                        "argument %d: cannot pass ?Handle to spawn — "
-                        "spawned thread can unwrap and use Handle (pool.get() not thread-safe)",
-                        i + 1);
-                }
+            } else if (type_dispatch_kind(eff) == TYPE_OPTIONAL &&
+                       type_dispatch_kind(type_unwrap_distinct(eff)->optional.inner)
+                           == TYPE_HANDLE) {
+                /* 2026-08-06: this arm used to match EVERY optional and only
+                 * report when the inner was a bare Handle — so a `?Box` wrapping
+                 * a carrier struct was SWALLOWED here and never reached the
+                 * recursive arm below. Narrowed to a bare `?Handle` so anything
+                 * else falls through to type_carries_handle. */
+                checker_error(c, node->loc.line,
+                    "argument %d: cannot pass ?Handle to spawn — "
+                    "spawned thread can unwrap and use Handle (pool.get() not thread-safe)",
+                    i + 1);
             } else if (type_carries_handle(eff, 0)) {
                 /* 2026-08-03: the two arms above test the BARE argument kind, so
                  * wrapping the SAME handle in a by-value struct slipped the gate

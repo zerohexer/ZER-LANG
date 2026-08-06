@@ -418,6 +418,11 @@ facet IS closed: the spawn-arg carrier gate and the scoped transfer marking both
 source optional's compound handles onto the destination local, exactly as the struct-copy
 replication added at `IR_ASSIGN` on 2026-08-06 does. Same shape, one more form.
 
+**Still open after the 2026-08-06 view-provenance unification.** The pointer-typed
+`IR_FIELD_READ` alias added there covers `*B vw = kk.p` (a pointer field read out of a tracked
+struct), but the optional UNWRAP takes a different path and was measured still accepting.
+Worth folding into the view-alias matrix as an eighth FORM axis when fixed.
+
 **Family.** This is another member of the "one meaning, N forms" class — see the 2026-08-06
 branch-survey entry's VIEW-ALIAS FAMILY note. Worth folding into the single view-provenance
 query rather than patching alone.
@@ -545,10 +550,15 @@ family has at least SEVEN members:
 | `h.p = &s[0]` — projected target, view RHS | FIXED `86a5b7fa` |
 | `h.p = first(s)` — through-call, 1 hop | FIXED `86a5b7fa` |
 | `h.p = s[1..]` — subslice into a field | FIXED `86a5b7fa` |
-| `p = @ptrcast(*B, &s[0])` — cast-wrapped view | **OPEN** (= #2, `t20b31`) |
-| `H mk([*]B s){ h.p = &s[0]; return h; }` — by-value struct RETURN carrying a param-view field | **OPEN**, ASan (`t20b31`) |
-| `outer(s) -> inner(s) -> &s[0]` — 2-hop through-call | **OPEN**, ASan (`icejal` B) |
-| `*B get(H h){ return h.p; }` — return a FIELD of a by-value param | **OPEN**, ASan (`icejal` C) |
+| `p = @ptrcast(*B, &s[0])` — cast-wrapped view | FIXED `7c676758` |
+| `H mk([*]B s){ h.p = &s[0]; return h; }` — by-value struct RETURN carrying a param-view field | FIXED 2026-08-06 |
+| `outer(s) -> inner(s) -> &s[0]` — 2-hop through-call | FIXED 2026-08-06 |
+| `*B get(H h){ return h.p; }` — return a FIELD of a by-value param | FIXED 2026-08-06 |
+
+**ALL SEVEN CLOSED 2026-08-06**, and the class is now gated by
+`tests/test_view_alias_matrix.c` (view-FORM x CARRIER, 21 cells, verified firing: 12/21 with
+6 false negatives on a pre-fix build). An eighth form fails the build rather than becoming the
+next commit.
 
 **Recommendation: do NOT fix these one at a time.** Four separate patches to the same question
 is another four rounds of the same whack-a-mole (see CLAUDE.md, "MULTI-SITE SAFETY IS THE #1

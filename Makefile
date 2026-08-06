@@ -128,6 +128,9 @@ test_cflow_matrix: tests/test_cflow_matrix.c
 test_conc_matrix: tests/test_conc_matrix.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+test_view_alias_matrix: tests/test_view_alias_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 # ISR / atomics / MMIO soundness guard (frontier Domain 2). PROGRAM-CONSEQUENCE
 # only (not the hardware floor): MMIO range/alignment/decl, volatile-strip,
 # slab/spawn-in-ISR, ISR non-volatile shared global, ISR volatile compound-RMW.
@@ -163,7 +166,7 @@ test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -183,6 +186,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_keep_matrix
 	./test_cflow_matrix
 	./test_conc_matrix
+	./test_view_alias_matrix
 	./test_hw_matrix
 	./test_async_matrix
 	./test_asm_matrix

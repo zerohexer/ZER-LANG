@@ -5,6 +5,67 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06e — view-provenance UNIFIED: all 7 forms closed + a 10th matrix oracle
+
+Grid-first, as the accept-unsafe discipline requires: `tests/test_view_alias_matrix.c` was
+written and **verified firing** (12/21, 6 false negatives, on a pre-fix build) BEFORE any of
+the remaining fixes. 21/21 after.
+
+**The class.** "Does a reference to this allocation reach here?" is ONE semantic question that
+the codebase answered at a different place for each SYNTACTIC form. Seven forms surfaced over
+three days, each as its own bug:
+
+| form | closed by |
+|---|---|
+| `h.p = &s[0]` | `86a5b7fa` |
+| `h.p = first(s)` (1-hop call) | `86a5b7fa` |
+| `h.p = s[1..]` | `86a5b7fa` |
+| `p = @ptrcast(*B, &s[0])` | `7c676758` |
+| `outer(s) -> inner(s) -> &s[0]` (2-hop) | **here** |
+| `*B get(K k){ return k.p; }` (field of by-value param) | **here** |
+| `K mk([*]B s){ k.p = &s[0]; return k; }` (struct return carrying a view) | **here** |
+
+**What this session added.**
+- **(c2) multi-hop** — the summary follows `return inner(s)` through the callee's own
+  param-view summary, mapping its param index back through the argument. The iterative
+  FuncSummary build resolves a chain of any depth, one hop per pass. The subtlety: after
+  substitution the expression is a BARE param ident, and the existing peel requires a
+  reference-FORMING root, so the chain silently inferred nothing until identity was matched
+  explicitly.
+- **(c3) field of a by-value param** — reading `k.p` yields a value, but a by-value param has
+  no allocation of its own, so its pointer fields can only point at the CALLER's.
+- **(c4) by-value struct return carrying a view** — scan the return block for a field-store
+  into the returned local whose RHS is a view of a param. Conservative: the whole returned
+  value inherits the param's alloc_id (coarser than a field-keyed summary, but sound).
+- **`ir_arg_view_handle`** — the call-site application fell back to nothing when the ARG was a
+  by-value struct with no bare handle, only a carried COMPOUND. This is why (c3) inferred
+  correctly and still did nothing.
+- **pointer-typed `IR_FIELD_READ` alias** — `*B vw = kk.p` where `kk` is tracked.
+
+**THE SAME DISTINCTION BIT TWICE, AND IT IS THE LESSON.** The general rule is *forming a
+reference aliases; reading a value does not* (CLAUDE.md, added after this exact class broke
+`move_user` in `86a5b7fa`). Both new field-reading arms had to be gated on the field being
+**pointer/slice/opaque typed**:
+- ungated, (c3) summarised `u32 verify_token(Token t){ return t.id; }` — a SCALAR field of a
+  by-value param — as a param view, so the caller's result aliased the arg and a move struct's
+  TRANSFERRED state propagated. `move_user` went red with "use of transferred handle" a second
+  time.
+
+A pointer field read yields a reference; a scalar field read yields a value. `move_user`'s
+`Token` is scalar-only, which is why the gate is exactly the right discriminator.
+
+**The gate.** view-FORM x CARRIER, both no-default enums so an eighth form or a third carrier
+fails `-Werror=switch`. Positive cells pin the boundary that matters for a fix that ADDS
+aliasing — the same form used BEFORE the free must still compile — which is where an
+over-eager view rule shows up.
+
+**Also fixed this session (branch `t20b31` / `8j6w19`, #6 of the survey):** `alloc`/`free` are
+intercepted BUILTINS with no global Symbol, so `scan_frame`'s `!sym` arm classified them as
+unresolvable funcptr calls — a spurious "calls through function pointer" warning on 20
+positives and, under `--stack-limit`, a HARD rejection of any program that frees a slice. They
+are bounded runtime leaves. Positives emitting the warning: 20 -> 9, and all 9 genuinely use
+function pointers. Real funcptr calls (via a local and via a param) still warn.
+
 ## Session 2026-08-06d — a VIEW wrapped in a CAST lost its heap alias (ASan heap-UAF)
 
 From audit branch `t20b31`. First step of the view-provenance unification.

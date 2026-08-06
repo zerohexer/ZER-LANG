@@ -17522,8 +17522,29 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
                 }
                 if (!resolved) frame->has_indirect_call = true;
             } else if (!sym || !sym->is_function) {
-                /* Unknown callee (parameter, field, etc.) — can't compute stack depth */
-                frame->has_indirect_call = true;
+                /* Unknown callee (parameter, field, etc.) — can't compute stack
+                 * depth.
+                 *
+                 * 2026-08-06: the universal-alloc BUILTINS land here. `alloc(T)`,
+                 * `alloc(T,n)` and `free(x)` have a bare NODE_IDENT callee and NO
+                 * global Symbol (they are intercepted, not declared), so `!sym`
+                 * classified them as unresolvable funcptr calls. Effect: a
+                 * spurious "calls through function pointer with unknown target"
+                 * warning on ~20 positives, and under --stack-limit a HARD
+                 * rejection ("entry 'main' call chain contains function pointer
+                 * call with unknown target") of any program that frees a slice.
+                 *
+                 * They are bounded runtime leaves — a fixed-cost call into the
+                 * emitted slab runtime, no user frame beneath — so they neither
+                 * add stack depth nor obscure it. Recognised by name here rather
+                 * than by a type test, because there is no Symbol to consult.
+                 * (Reported by branches t20b31 and 8j6w19.) */
+                const char *cn = node->call.callee->ident.name;
+                uint32_t cnl = (uint32_t)node->call.callee->ident.name_len;
+                bool builtin_alloc_leaf =
+                    (cnl == 5 && memcmp(cn, "alloc", 5) == 0) ||
+                    (cnl == 4 && memcmp(cn, "free", 4) == 0);
+                if (!builtin_alloc_leaf) frame->has_indirect_call = true;
             }
         }
         for (int i = 0; i < node->call.arg_count; i++)

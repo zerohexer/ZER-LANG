@@ -336,6 +336,13 @@ callee may return position i. Grounded by `param_lattice.v`. Full map + the read
 compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
 slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
 
+**The pointer-vs-scalar refinement (2026-08-06).** The rule below is right, but "reading a
+value" needs the FIELD TYPE. Reading a POINTER/slice/opaque field out of a tracked struct
+yields a REFERENCE and must alias (`*B vw = kk.p`); reading a SCALAR field yields a value and
+must not. Ungated, a summary arm treated `u32 verify(Token t){ return t.id; }` as a param view
+and re-broke `test_modules/move_user` — the SECOND time this exact class did so. Gate every
+new field-reading alias arm on the field being pointer-carrying.
+
 **FORMING a reference aliases; READING a value does not (2026-08-03e).** When widening any
 alias/escape rule to "view" expressions, the outermost node must be `&expr` or a SLICE. A bare
 `h.field` / `s[0]` READS a value out of the allocation and must NOT inherit its alias — peeling
@@ -1574,7 +1581,7 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 | `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
-| `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/hw/async/asm/**defer-goto**) | 9 grids | `make check` |
+| `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/**view-alias**/hw/async/asm/defer-goto) | 10 grids | `make check` |
 | `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.

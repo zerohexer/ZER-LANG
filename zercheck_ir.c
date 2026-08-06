@@ -896,6 +896,29 @@ static int ir_find_value_local(IRFunc *func, Node *val) {
     return -1;
 }
 
+/* The handle an ARGUMENT contributes when a callee returns a view of it.
+ *
+ * A bare tracked pointer has its own handle. But a BY-VALUE STRUCT arg
+ * (`*B get(K k){ return k.p; }` called as `get(kk)`) has none — `kk` is not an
+ * allocation; the allocation is reached through the COMPOUND handle
+ * (kk, ".p") registered when `kk.p = &s[0]` ran. Without this fallback the
+ * call-site alias application found no handle and silently did nothing, so
+ * `free(s); vw.v` was accepted (ASan heap-use-after-free).
+ *
+ * Returns the first ALIVE-or-known compound carried by the local when there is
+ * no bare handle. Any one suffices: they all share the base's alloc_id, and
+ * ir_apply_alias propagates through the alias group. */
+static IRHandleInfo *ir_arg_view_handle(IRPathState *ps, int arg_local) {
+    IRHandleInfo *h = ir_find_handle(ps, arg_local);
+    if (h) return h;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *ch = &ps->handles[i];
+        if (ch->local_id == arg_local && ch->path_len > 0 && ch->alloc_id != 0)
+            return ch;
+    }
+    return NULL;
+}
+
 /* Peel the POINTER-PRESERVING cast family off an expression, returning the
  * underlying value expression.
  *
@@ -3289,6 +3312,43 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     }
 
     case IR_FIELD_READ: {
+        /* 2026-08-06: reading a POINTER-typed field out of a struct that has a
+         * tracked handle yields a VIEW of that allocation, so the destination
+         * must inherit the alias.
+         *
+         *     K kk = mk(s);      // kk aliases s via mk's param-view summary
+         *     *B vw = kk.p;      // vw is a view of s — was NOT linked
+         *     free(s); vw.v;     // accepted
+         *
+         * `free(s); kk.p.v` (read directly through kk) was already caught, so
+         * only the hop through a local was missing.
+         *
+         * TIGHTLY GATED ON THE FIELD'S TYPE. The general rule is the opposite —
+         * "forming a reference aliases, reading a value does not" (CLAUDE.md) —
+         * and peeling every field read is what broke test_modules/move_user by
+         * propagating a move-struct's TRANSFERRED state. A SCALAR field read
+         * still does not alias; only a pointer/slice/opaque field does, because
+         * the value read out IS a reference into whatever the struct carries.
+         * move_user's Token has only scalar fields, so it is unaffected. */
+        if (inst->expr && inst->expr->kind == NODE_FIELD && inst->dest_local >= 0) {
+            Type *ft = checker_get_type(zc->checker, inst->expr);
+            TypeKind fk = ft ? type_dispatch_kind(ft) : TYPE_VOID;
+            if (fk == TYPE_POINTER || fk == TYPE_SLICE || fk == TYPE_OPAQUE) {
+                int froot; const char *fpath; uint32_t fplen;
+                if (ir_extract_compound_key(zc, func, inst->expr->field.object,
+                                             &froot, &fpath, &fplen) == 0) {
+                    IRHandleInfo *fh = (fplen == 0)
+                        ? ir_find_handle(ps, froot)
+                        : ir_find_compound_handle(ps, froot, fpath, fplen);
+                    if (fh && fh->alloc_id != 0) {
+                        IRAliasSnapshot fsnap;
+                        ir_snapshot_alias(&fsnap, fh);
+                        IRHandleInfo *fd = ir_add_handle(ps, inst->dest_local);
+                        if (fd) { ir_apply_alias(fd, &fsnap); fd->state = fh->state; }
+                    }
+                }
+            }
+        }
         if (inst->expr && inst->expr->kind == NODE_FIELD) {
             /* Walk from full expression up to root, checking each prefix. */
             Node *cur = inst->expr;
@@ -3555,7 +3615,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                                   &d_root, &d_path, &d_plen);
                 if (a_src >= 0 && okk == 0 &&
                     !(d_plen == 0 && d_root == a_src)) {
-                    IRHandleInfo *asrc_h = ir_find_handle(ps, a_src);
+                    IRHandleInfo *asrc_h = ir_arg_view_handle(ps, a_src);
                     if (asrc_h && asrc_h->alloc_id != 0) {
                         IRAliasSnapshot asnap;
                         ir_snapshot_alias(&asnap, asrc_h);
@@ -4903,7 +4963,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     int arg_local = ir_find_local_exact_first(func,
                         arg->ident.name, (uint32_t)arg->ident.name_len);
                     if (arg_local >= 0) {
-                        IRHandleInfo *arg_h = ir_find_handle(ps, arg_local);
+                        IRHandleInfo *arg_h = ir_arg_view_handle(ps, arg_local);
                         if (arg_h) {
                             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                             if (dh) {
@@ -6294,6 +6354,144 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     }
                     if (vexpr && vexpr->kind == NODE_ASSIGN && vexpr->assign.value)
                         vexpr = vexpr->assign.value;
+                    vexpr = ir_peel_cast_wrappers(vexpr);
+
+                    /* (c2) 2026-08-06 — MULTI-HOP. `*B outer([*]B s){ return
+                     * inner(s); }`: the return is a CALL whose callee already has
+                     * a param-view summary. Map the callee's param index back to
+                     * OUR param by matching the argument it was given. The
+                     * FuncSummary build is iterative, so a chain of any depth
+                     * resolves one hop per pass. */
+                    if (vexpr && vexpr->kind == NODE_CALL && vexpr->call.callee &&
+                        vexpr->call.callee->kind == NODE_IDENT) {
+                        const char *hn = vexpr->call.callee->ident.name;
+                        uint32_t hnl = (uint32_t)vexpr->call.callee->ident.name_len;
+                        FuncSummary *hs = NULL;
+                        for (int si = 0; si < zc->summary_count; si++) {
+                            if (zc->summaries[si].func_name_len == hnl &&
+                                memcmp(zc->summaries[si].func_name, hn, hnl) == 0) {
+                                hs = &zc->summaries[si]; break;
+                            }
+                        }
+                        if (hs && hs->returns_param_color > 0) {
+                            int hp = hs->returns_param_color - 1;
+                            if (hp >= 0 && hp < vexpr->call.arg_count) {
+                                vexpr = ir_peel_cast_wrappers(vexpr->call.args[hp]);
+                                /* After substitution the expression is whatever
+                                 * WE handed the callee. If that is a bare param
+                                 * ident, the chain is an IDENTITY view of our own
+                                 * param — match it here. The peel below requires
+                                 * a reference-FORMING root (`&` / slice) and
+                                 * would reject a bare ident, which is why the
+                                 * 2-hop chain silently inferred nothing. */
+                                if (vexpr && vexpr->kind == NODE_IDENT) {
+                                    int hroot = ir_find_local_exact_first(func,
+                                        vexpr->ident.name,
+                                        (uint32_t)vexpr->ident.name_len);
+                                    for (int pi = 0; pi < pc && hroot >= 0; pi++) {
+                                        ParamDecl *pp = &fn->func_decl.params[pi];
+                                        int pl = ir_find_local_exact_first(func,
+                                            pp->name, (uint32_t)pp->name_len);
+                                        if (pl >= 0 && pl == hroot) { match_param = pi; break; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    /* (c3) 2026-08-06 — FIELD OF A BY-VALUE PARAM. `*B get(K k)
+                     * { return k.p; }`. Reading `k.p` yields a VALUE, but that
+                     * value is a pointer the CALLER stored, so the result is a
+                     * reference into the caller's allocation. The `&`/slice
+                     * restriction below is about not aliasing a value read out of
+                     * OUR OWN allocation; a by-value PARAM has no allocation of
+                     * its own, so its pointer fields can only point at the
+                     * caller's. Gate on the root being a param for exactly that
+                     * reason. */
+                    if (vexpr && vexpr->kind == NODE_FIELD &&
+                        /* ONLY a pointer-carrying field. `u32 verify(Token t)
+                         * { return t.id; }` returns a SCALAR read out of a
+                         * by-value param — a value, not a reference — and
+                         * summarising it as a param view made the caller's
+                         * result alias the arg, propagating a move struct's
+                         * TRANSFERRED state and breaking
+                         * test_modules/move_user ("use of transferred handle").
+                         * Same distinction as the IR_FIELD_READ arm: a pointer
+                         * field read yields a reference, a scalar field read
+                         * yields a value. */
+                        ({ Type *rt = checker_get_type(zc->checker, vexpr);
+                           TypeKind rk = rt ? type_dispatch_kind(rt) : TYPE_VOID;
+                           rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_OPAQUE; })) {
+                        Node *fr = vexpr;
+                        int fpeel = 0;
+                        while (fr && fpeel < 32 &&
+                               (fr->kind == NODE_FIELD || fr->kind == NODE_INDEX)) {
+                            fr = (fr->kind == NODE_FIELD) ? fr->field.object
+                                                          : fr->index_expr.object;
+                            fpeel++;
+                        }
+                        if (fr && fr->kind == NODE_IDENT) {
+                            int froot = ir_find_local_exact_first(func,
+                                fr->ident.name, (uint32_t)fr->ident.name_len);
+                            for (int pi = 0; pi < pc && froot >= 0; pi++) {
+                                ParamDecl *pp = &fn->func_decl.params[pi];
+                                int pl = ir_find_local_exact_first(func,
+                                    pp->name, (uint32_t)pp->name_len);
+                                if (pl >= 0 && pl == froot) { match_param = pi; break; }
+                            }
+                        }
+                    }
+
+                    /* (c4) 2026-08-06 — BY-VALUE STRUCT RETURN CARRYING A VIEW.
+                     * `K mk([*]B s){ K k; k.p = &s[0]; return k; }`. The returned
+                     * value is not itself a view, it CARRIES one in a field. Scan
+                     * this block for a field-store into the returned local whose
+                     * RHS is a view of a param. Conservative: the whole returned
+                     * value inherits the param's alloc_id, which is coarser than
+                     * a field-keyed summary but sound — freeing the arg then
+                     * touching anything reached through the result is caught. */
+                    if (match_param < 0) {
+                        for (int ii = 0; ii < bb->inst_count && match_param < 0; ii++) {
+                            Node *e = bb->insts[ii].expr;
+                            if (!e || e->kind != NODE_ASSIGN || !e->assign.target ||
+                                e->assign.target->kind != NODE_FIELD) continue;
+                            /* the store target must be a field OF the returned local */
+                            Node *tr = e->assign.target;
+                            int tpeel = 0;
+                            while (tr && tpeel < 32 &&
+                                   (tr->kind == NODE_FIELD || tr->kind == NODE_INDEX)) {
+                                tr = (tr->kind == NODE_FIELD) ? tr->field.object
+                                                              : tr->index_expr.object;
+                                tpeel++;
+                            }
+                            if (!tr || tr->kind != NODE_IDENT) continue;
+                            if (ir_find_local_exact_first(func, tr->ident.name,
+                                    (uint32_t)tr->ident.name_len) != rlocal) continue;
+                            /* the stored value must be a VIEW of a param */
+                            Node *sv = ir_peel_cast_wrappers(e->assign.value);
+                            if (!sv || !((sv->kind == NODE_UNARY && sv->unary.op == TOK_AMP) ||
+                                         sv->kind == NODE_SLICE)) continue;
+                            int speel = 0;
+                            while (sv && speel < 32) {
+                                if (sv->kind == NODE_UNARY && sv->unary.op == TOK_AMP) sv = sv->unary.operand;
+                                else if (sv->kind == NODE_INDEX) sv = sv->index_expr.object;
+                                else if (sv->kind == NODE_SLICE) sv = sv->slice.object;
+                                else if (sv->kind == NODE_FIELD) sv = sv->field.object;
+                                else break;
+                                speel++;
+                            }
+                            if (speel > 0 && sv && sv->kind == NODE_IDENT) {
+                                int sroot2 = ir_find_local_exact_first(func,
+                                    sv->ident.name, (uint32_t)sv->ident.name_len);
+                                for (int pi = 0; pi < pc && sroot2 >= 0; pi++) {
+                                    ParamDecl *pp = &fn->func_decl.params[pi];
+                                    int pl = ir_find_local_exact_first(func,
+                                        pp->name, (uint32_t)pp->name_len);
+                                    if (pl >= 0 && pl == sroot2) { match_param = pi; break; }
+                                }
+                            }
+                        }
+                    }
                     /* Same restriction as the assign arm: only `&expr` or a
                      * SLICE returns a REFERENCE into the param. `return s.field`
                      * / `return s[0]` return a VALUE and must not alias. */

@@ -390,6 +390,160 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — branch survey 2026-08-06: 9 verified fixes + 4 open heap-UAFs (`t20b31` / `2sjyjj` / `icejal` / `8j6w19`)
+
+**What this is.** Five `claude/gifted-noether-*` audit branches surveyed on 2026-08-06.
+`dgbmqx` was fully harvested earlier; `8j6w19` had 3 of 5 landed (`bbe907d7`, `86a5b7fa`,
+`20ef09cb`). `t20b31`, `2sjyjj` and `icejal` each forked from `20ef09cb` — current main at
+survey time — so everything they carry is new. **Every item below was independently
+reproduced on main before being listed**; nothing is repeated on the branch's word alone.
+NOT merged or pulled — implement from this description.
+
+**Two of the nine are regressions I introduced the same week** (#1 and #8), both marked.
+
+---
+
+### The 9 fixes to take
+
+**#1 — an OPTIONAL wrapper defeats the spawn carrier gate (CRITICAL accept-unsafe).**
+Found independently by all three branches. **This is a hole in the 2026-08-03 carrier fix
+(`0e71b613`)**: `type_carries_handle` / `type_carries_nonshared_pointer` were added, but the
+arms were gated behind a raw `eff->kind == TYPE_STRUCT || TYPE_UNION` pre-check, which an
+optional wrapper skips — the `?T`-hides-the-inner-kind class, at the sink that fix existed to
+close.
+
+```zer
+struct Msg{ *u32 p; }
+void worker(?Msg om){ Msg m = om orelse { return; }; *m.p = 5; }
+u32 f(){ u32 local = 0; Msg msg; msg.p = &local; ?Msg om = msg; spawn worker(om); return local; }
+```
+ACCEPTED; the bare `Msg` form is correctly rejected. Same for `?Box` carrying a `Handle`.
+
+**PROBE WARNING — this one masks easily.** With a HEAP pointer plus `free`, the transfer rule
+catches it and the gate looks fine. Only a STACK pointer (no free anywhere) isolates the gate.
+
+*Three implementations.* `t20b31` drops the raw-kind pre-guard entirely and lets the recursive
+predicate decide (cleanest, matches the class-kill philosophy); `2sjyjj` gates on a one-level
+optional unwrap; `icejal` fully unwraps and gates on `type_dispatch_kind`. **Take t20b31's
+shape plus icejal's `CAR_OPT_BYVAL` axis for `tests/test_conc_matrix.c`.**
+
+**#2 — a VIEW wrapped in a CAST loses its heap alias (CRITICAL, ASan-proven).** `t20b31`.
+```zer
+*B p = @ptrcast(*B, &s[0]); free(s); return p.v;      // ASan heap-use-after-free
+*opaque o = @ptrcast(*opaque, &s[0]); *B p = @ptrcast(*B, o); free(s); return p.v;   // also
+```
+Plain `&s[0]` is correctly rejected (fixed `86a5b7fa`), so the gap is precisely that the
+cast family is not peeled. `t20b31` adds `ir_peel_cast_wrappers` (strips
+`@ptrcast`/`@pun`/`@bitcast`/`@cast`/`@container`) at both view-alias sinks — the
+projected-target assignment and the var-decl interior-pointer. Param-pointer casts still
+compile. **See the FAMILY note below — do not fix this one in isolation.**
+
+**#3 — VRP loop-body widening skips an `orelse` FALLBACK (CRITICAL, ASan-proven).** `2sjyjj`.
+```zer
+u32[8] a;
+u32 main(){ u32 k = 0; u32 n = 0;
+  while (n < 3) { a[k] = 7; none_val() orelse { k = 9; }; n += 1; }
+  return 42; }
+```
+`vrp_invalidate_loop_body_writes` does not walk into an orelse fallback block, so the
+loop-body write is invisible, `k` keeps its stale pre-loop `[0,0]`, VRP proves `a[k]` safe and
+**elides the auto-guard**. ASan global-buffer-overflow.
+
+**PROBE WARNING — two ways to mis-measure this, both hit during the survey:**
+- The failing shape is a BARE `orelse` STATEMENT whose fallback block holds the write.
+  `k = f() orelse 9` (assignment RHS) IS handled and will not reproduce.
+- The guard here is the AUTO-GUARD (`if ((size_t)(k) >= 8u) { return 0; }`), not
+  `_zer_bounds_check`. Grepping for the latter — and counting its preamble DEFINITION —
+  reports guards where there are none. Compare against the control (`k = 9` written plainly),
+  which emits the auto-guard and warns "index 'k' not proven in range".
+
+Fix: add `NODE_ORELSE` (tried-expr + fallback) and `NODE_VAR_DECL` (init) to
+`vrp_invalidate_loop_body_writes`; the sibling widener already recurses `NODE_ORELSE`.
+
+**#4 — bit-slice WRITE at a runtime position >= width emits C UB.** `t20b31` (also `8j6w19`).
+`reg[hi..lo] = 1` with `lo = 70` left `reg = 69` instead of an unchanged 5; UBSan: *"shift
+exponent 70 is too large"*. The READ path is guarded
+(`(_zer_lo0 >= 32) ? 0 : (reg >> _zer_lo0)`), the WRITE path is not (bare `<< _zer_bl1`).
+`t20b31` clamps the position shift at BOTH emitter paths via `emit_bitslice_runtime_mask`.
+**`8j6w19`'s own test is a WEAK ORACLE** — it exits 0 on the broken compiler at `-O2`; only
+UBSan discriminates. Write a stronger test.
+
+**#5 — bit-slice COMPOUND assign compiled as a plain assign (miscompile).** `icejal`.
+`r[7..0] = 20; r[7..0] += 3;` yields 3, not 23. The IR-path bit-slice SET handler ignored
+`node->assign.op` and stored the bare RHS, dropping both the current field and the operator.
+All 10 compound ops broken — the register read-modify-write idiom bit-slices exist for.
+Distinct bug from #4, same feature.
+
+**#6 — `free([*]T)` misclassified as an unverifiable indirect call.** `t20b31` (also `8j6w19`).
+Spurious *"calls through function pointer with unknown target"* on ~20 positives, **and a HARD
+rejection under `--stack-limit`** (`error: entry 'main' call chain contains function pointer`)
+— verified. The slice-free form keeps a bare `NODE_IDENT` callee; `t20b31` has `scan_frame`
+consult the callee TYPE so only a real funcptr call is flagged (better than `8j6w19`'s
+special-casing of the builtins).
+
+**#7 — `@barrier_acq_rel` missing from `has_sync`.** `2sjyjj`. A spawn body fencing with it on
+a non-shared global is hard-ERRORED instead of warned. Add it to the EXACT fence list — NOT a
+`barrier` prefix match: `@barrier_init` / `@barrier_wait` are thread-rendezvous primitives,
+not fences (`rt_conc_barrier_with_defer` catches the prefix attempt).
+
+**#8 — `volatile *T` global falsely rejected (over-rejection). REGRESSION FROM `a3d8879f`.**
+`2sjyjj`. `volatile_global_exempt_from_race_check` admits pointers to its scalar set, but
+`type_width()` has **no `TYPE_POINTER` case** (verified: 0 hits) and returns 0, so the
+`w > 0` test fails and a volatile pointer global is never exempt. Give a pointer its true
+width in the exemption (or add the case to `type_width`).
+
+**#9 — `container W(T) { Handle(T) h; }` fails with "undefined type 'T'".** `8j6w19`.
+`subst_typenode` does not recurse into `handle.elem`. Handle is a `u64` so it monomorphizes
+cleanly; Pool/Ring/Slab container fields stay rejected at the checker on purpose (the emitter
+cannot emit the monomorphized struct yet).
+
+---
+
+### THE VIEW-ALIAS FAMILY — read this before fixing #2
+
+Four MORE heap-UAFs were verified live during the survey, all documented-not-fixed on the
+branches, and all the same semantic question (*"does a reference to this allocation reach
+here?"*) asked at a different syntactic form. With the three already fixed (`86a5b7fa`), the
+family has at least SEVEN members:
+
+| form | status |
+|---|---|
+| `h.p = &s[0]` — projected target, view RHS | FIXED `86a5b7fa` |
+| `h.p = first(s)` — through-call, 1 hop | FIXED `86a5b7fa` |
+| `h.p = s[1..]` — subslice into a field | FIXED `86a5b7fa` |
+| `p = @ptrcast(*B, &s[0])` — cast-wrapped view | **OPEN** (= #2, `t20b31`) |
+| `H mk([*]B s){ h.p = &s[0]; return h; }` — by-value struct RETURN carrying a param-view field | **OPEN**, ASan (`t20b31`) |
+| `outer(s) -> inner(s) -> &s[0]` — 2-hop through-call | **OPEN**, ASan (`icejal` B) |
+| `*B get(H h){ return h.p; }` — return a FIELD of a by-value param | **OPEN**, ASan (`icejal` C) |
+
+**Recommendation: do NOT fix these one at a time.** Four separate patches to the same question
+is another four rounds of the same whack-a-mole (see CLAUDE.md, "MULTI-SITE SAFETY IS THE #1
+RECURRING BUG CLASS"). The durable shape is ONE view-provenance query — peel casts, peel
+through-call summaries including by-value struct FIELDS and multi-hop — applied at every alias
+sink, plus a grid crossing **view-form x carrier x sink** that would have caught all seven at
+once.
+
+### Other documented-not-fixed items, verified
+
+- **funcptr bound to a LOCAL, passed as a spawn arg** (`icejal` E) — ACCEPTED; the callee
+  races a non-shared global. Sibling of the funcptr-struct-field hole fixed in `5ed17c2f`.
+- **`icejal` D-scoped (`?carrier` defeats the SCOPED free-before-join transfer)** — did NOT
+  reproduce; the transfer rule catches it correctly. Listed here so nobody re-chases it.
+- Not yet probed, lower severity: `&packed_field` forming a misaligned pointer (`2sjyjj`,
+  HIGH, bare-metal, policy decision deferred); ISR global reached through a funcptr FIELD
+  (`2sjyjj`, the ISR sibling of the spawn holes); `goto` INTO a `@critical`/`defer` block
+  (`icejal` F1, LOW, GCC-backstopped); runtime over-width bit-field write truncating silently
+  (`icejal` F2, LOW, design-arguable); `vrp_ir.c` `x & MASK` / `% N` missing a positive-mask
+  guard (`2sjyjj`, LOW, latent dead code).
+
+### Suggested order
+
+`#1`, `#3`, `#8` first — two are regressions from this week, and `#3` is a silent OOB write.
+Then the view-provenance unification covering `#2` and the three open family members together.
+Then `#4`, `#5` (miscompiles), then `#6`, `#7`, `#9` (ergonomics).
+
+---
+
 ## OPEN — scoped-borrow: a join on EVERY branch arm is over-rejected (LOW, precision)
 
 **Symptom.** Joining on every arm of a branch and then using the borrowed local is

@@ -139,7 +139,20 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
     TypeKind k = type_dispatch_kind(vt);
     bool scalar = type_is_integer(vt) || k == TYPE_BOOL || k == TYPE_POINTER;
     if (!scalar) return false;          /* aggregate — never one word */
-    int w = type_width(vt);
+    /* 2026-08-06: a POINTER is admitted to the scalar set above, but
+     * type_width() has NO TYPE_POINTER case and returns 0 via its default — so
+     * `w <= 0` rejected every volatile pointer global and the exemption never
+     * applied to one. A `volatile *T` shared with a spawned thread was falsely
+     * flagged as a data race (regression from a3d8879f, found by branch 2sjyjj).
+     *
+     * Fixed HERE rather than in type_width(): that helper has 39 call sites
+     * including integer PROMOTION (`type_width(a) >= type_width(b)`) and bit-slice
+     * index validation (`zer_bit_index_valid(type_width(obj), hi)`). Giving
+     * pointers a nonzero width there would silently make bit-slicing a pointer
+     * "valid" and change promotion for pointer operands. Do not "fix" type_width
+     * globally without auditing all 39. A pointer is exactly one target word by
+     * definition, which is all this predicate needs. */
+    int w = (k == TYPE_POINTER) ? c->target_ptr_bits : type_width(vt);
     if (w <= 0) return false;
     return w <= c->target_ptr_bits;
 }

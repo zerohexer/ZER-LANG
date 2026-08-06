@@ -1,0 +1,24 @@
+// A `volatile *T` global is a SINGLE-WORD scalar and must keep the volatile
+// race-check exemption, on both the spawn and ISR paths.
+//
+// Regression from a3d8879f: volatile_global_exempt_from_race_check admits
+// pointers to its scalar set, but type_width() has NO TYPE_POINTER case and
+// returns 0 via its default — so `w <= 0` rejected every volatile pointer and
+// the exemption never applied to one.
+//
+// Fixed in the predicate, NOT in type_width(): that helper has 39 call sites
+// including integer promotion and bit-slice index validation, where a nonzero
+// pointer width would silently change behaviour. A pointer is exactly one target
+// word by definition, which is all this predicate needs.
+struct T { u32 v; }
+T backing;
+volatile *T g = &backing;
+
+void reader(u32 a) { u32 x = g.v; }
+
+u32 main() {
+    backing.v = 7;
+    spawn reader(1);
+    if (g.v != 7) { return 1; }
+    return 0;
+}

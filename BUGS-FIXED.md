@@ -5,6 +5,29 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06c — `volatile *T` global falsely rejected (my regression from a3d8879f)
+
+From audit branch `2sjyjj`. `volatile_global_exempt_from_race_check` admits POINTERS to its
+scalar set, but `type_width()` has **no `TYPE_POINTER` case** and returns 0 via its `default:`
+— so the `w <= 0` bail rejected every volatile pointer global and the exemption never applied
+to one. A `volatile *T` shared with a spawned thread, or between an ISR and main, was falsely
+flagged as a data race.
+
+**Fixed in the PREDICATE, deliberately not in `type_width()`.** That helper has **39 call
+sites**, including integer PROMOTION (`type_width(a) >= type_width(b)`) and bit-slice index
+validation (`zer_bit_index_valid(type_width(obj), hi)`). Giving pointers a nonzero width there
+would silently make bit-slicing a pointer "valid" and change promotion for pointer operands.
+The rationale is recorded at the fix so a future session does not "correct" `type_width`
+globally without auditing all 39 — a pointer is exactly one target word by definition, which
+is all this predicate needs.
+
+Verified the width limit from `a3d8879f` / `bbe907d7` does NOT regress: `volatile u64` on a
+32-bit target and a volatile aggregate are still rejected on both the spawn and ISR paths, and
+the single-word `u32` flag idiom still compiles.
+
+Test: `tests/zer/volatile_pointer_global_exempt_ok.zer`, verified discriminating (rejected on
+a pre-fix build).
+
 ## Session 2026-08-06b — VRP loop-body widening skipped an orelse FALLBACK (silent OOB write)
 
 From audit branch `2sjyjj`. A loop-body index written in an orelse fallback kept its stale

@@ -928,6 +928,35 @@ static int ir_find_store_source_local(IRFunc *func, Node *val) {
     return ir_find_value_local(func, val);
 }
 
+/* Peel leading pointer-preserving cast wrappers (@ptrcast / @pun / @bitcast /
+ * @cast / @container) off a value expression, returning the inner node. Unlike
+ * ir_find_store_source_local (which resolves to a bare-ident LOCAL), this
+ * returns the NODE so the caller can still run its &/index/slice/field VIEW walk
+ * to the root — recovering the alias when a VIEW was wrapped in a cast.
+ * Without it `*B p = @ptrcast(*B, &s[0]); free(s); p.v` and
+ * `h.p = @ptrcast(*B, &s[0])` were accepted heap-use-after-free (ASan-proven):
+ * the cast made the outermost node a NODE_INTRINSIC, so `forms_ref` was false
+ * and no alias to `s` formed — the free never propagated. Restricted to the
+ * pointer-identity-preserving cast family (each yields the same address as its
+ * operand); a value-producing intrinsic like @atomic_load is NOT peeled. */
+static Node *ir_peel_cast_wrappers(Node *val) {
+    int guard = 0;
+    while (val && val->kind == NODE_INTRINSIC &&
+           val->intrinsic.arg_count > 0 && guard++ < 32) {
+        uint32_t nl = (uint32_t)val->intrinsic.name_len;
+        const char *nm = val->intrinsic.name;
+        if (nl == 9 && memcmp(nm, "container", 9) == 0)
+            val = val->intrinsic.args[0];              /* pointer operand */
+        else if ((nl == 7 && memcmp(nm, "ptrcast", 7) == 0) ||
+                 (nl == 3 && memcmp(nm, "pun", 3) == 0) ||
+                 (nl == 7 && memcmp(nm, "bitcast", 7) == 0) ||
+                 (nl == 4 && memcmp(nm, "cast", 4) == 0))
+            val = val->intrinsic.args[val->intrinsic.arg_count - 1];
+        else break;
+    }
+    return val;
+}
+
 /* ================================================================
  * CFG Merge — the key advantage over linear AST walk
  *
@@ -3456,6 +3485,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             inst->expr->assign.op == TOK_EQ &&
             inst->expr->assign.value) {
             Node *rv = inst->expr->assign.value;
+            /* 2026-08-06: peel a pointer-preserving cast wrapper first, so a
+             * VIEW hidden inside @ptrcast/@pun/@bitcast/@cast/@container
+             * (`h.p = @ptrcast(*B, &s[0])`, and the var-decl form which lowers
+             * to this same `ASSIGN <expr>`) still reaches the forms_ref view
+             * walk below. Without it the cast made rv a NODE_INTRINSIC → no
+             * alias → ASan-confirmed heap-use-after-free. A bare cast of an
+             * ident (`h.p = @ptrcast(*B, n)`) resolves to the ident identity
+             * alias, gated the same way (only aliases when the root has a
+             * tracked alloc_id, so params/stack are untouched). */
+            rv = ir_peel_cast_wrappers(rv);
             /* Peel to the root identifier — but ONLY for an expression that
              * actually FORMS A REFERENCE into the allocation.
              *
@@ -3863,8 +3902,18 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * audit 2026-06-04: pre-fix was missing pool_name+len, escaped,
              * is_thread_handle — wrong-pool detection bypassed via
              * `*T fp = &b.field; Handle k = *fp;` interior pointer chain. */
-            if (rhs && rhs->kind == NODE_UNARY && rhs->unary.op == TOK_AMP) {
-                Node *addr_target = rhs->unary.operand;
+            /* 2026-08-06: peel a pointer-preserving cast so a VIEW wrapped in
+             * @ptrcast/@pun/@bitcast/@cast/@container reaches the interior-
+             * pointer aliasing. The var-decl `*B p = @ptrcast(*B, &s[0])`
+             * lowers to IR_ASSIGN with expr = the intrinsic (NOT a bare
+             * NODE_UNARY), so `rhs` was a NODE_INTRINSIC and this handler was
+             * skipped — free(s) never propagated to p (ASan-confirmed
+             * heap-use-after-free, accepted). The peeled `view` is used only for
+             * the &-view aliasing here; `rhs` stays intact for the alloc/orelse
+             * paths above/below. */
+            Node *view = ir_peel_cast_wrappers(rhs);
+            if (view && view->kind == NODE_UNARY && view->unary.op == TOK_AMP) {
+                Node *addr_target = view->unary.operand;
                 /* §A #7 (HOLE-A1/A2): if the address-taken expression is a
                  * COMPOUND (`&arr[0]` or `&b.field`) on a move-tracking base,
                  * alias the pointer against the COMPOUND handle so a later move
@@ -3921,7 +3970,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
 
-                Node *target = rhs->unary.operand;
+                Node *target = view->unary.operand;
                 /* Walk field/index chain to the root ident */
                 while (target) {
                     if (target->kind == NODE_FIELD) target = target->field.object;

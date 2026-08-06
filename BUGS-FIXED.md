@@ -5,6 +5,75 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06 — audit sweep: 2 accept-unsafe holes, 1 UB miscompile, 1 over-rejection
+
+Four independent fixes found by a codebase audit (two via verify-then-fix agents,
+ASan-confirmed). Each has a discriminating regression test.
+
+### 1. CRITICAL accept-unsafe — `?Struct`/`?Union` carrying a non-shared pointer bypassed the spawn carrier gate
+
+`spawn worker(o)` where `o : ?Holder` and `Holder { *u32 p; }` (`p = &gv`) compiled
+clean — the child races/UAFs the pointee. The bare `Holder` form is correctly rejected.
+
+**Cause.** The two pointer/slice carrier arms (checker.c ~14761/14786) were gated on the
+RAW `eff->kind == TYPE_STRUCT || TYPE_UNION`, which is false for a `?Struct` (kind ==
+TYPE_OPTIONAL). `is_ptr_like` above unwraps ONE optional level but a struct-carrying-
+pointer is not ptr-like, so `?Struct{*T}` fell through every arm. The Handle sibling
+(0e71b61) already used `type_carries_handle(eff,0)` with no raw-kind pre-guard — the
+pointer/slice arm was left raw-kind-gated. Wrapper-hides-the-inner-kind (`?T`) at the one
+carrier sink the 2026-08-03 fix missed.
+
+**Fix.** Drop the raw-kind pre-guard on the heap-carrier arm; let
+`type_carries_nonshared_pointer(eff,0)` (which recurses optional/array/struct/union,
+unwraps distinct, and returns false for scalars + shared-struct pointers) decide — exactly
+like the Handle arm. No over-rejection: `?Struct` pure-value, value scalars, and
+`?Struct{*shared}` all still compile. Test: `tests/zer_fail/spawn_opt_struct_carrier.zer`.
+
+### 2. CRITICAL accept-unsafe — a VIEW wrapped in a cast intrinsic lost its heap alias (heap-UAF)
+
+`*B p = @ptrcast(*B, &s[0]); free(s); p.v` and `h.p = @pun(*B, &s[2]); free(s); h.p.v`
+compiled clean — ASan heap-use-after-free. The 2026-08-03 view-alias fix (86a5b7f) peels a
+view (`&s[i]`/slice) to the root allocation only when the OUTERMOST RHS node is `&`/SLICE;
+a `@ptrcast`/`@pun`/`@bitcast`/`@cast`/`@container` wrapper makes it a NODE_INTRINSIC, so
+`forms_ref` is false and no alias forms — the free never propagates.
+
+**Fix.** New `ir_peel_cast_wrappers` (zercheck_ir.c) strips the pointer-preserving cast
+family, applied at BOTH view-alias sinks: the projected-target assignment sink (~3512) and
+the var-decl interior-pointer handler (~3907, which is where a var-decl view actually
+lands — `inst->expr` is the intrinsic directly, not a NODE_ASSIGN). All variants now
+rejected incl. the 2-hop `*opaque` round-trip; a `@ptrcast` of a PARAM pointer still
+compiles (params untracked → no over-rejection). Tests:
+`tests/zer_fail/uaf_cast_view_heap.zer`, `uaf_pun_view_field.zer`.
+
+### 3. bit-slice WRITE with a runtime position — unclamped shift was C UB (silent wrong value)
+
+`reg[hi..lo] = v` with a runtime `lo >= 64` lowered to `mask << _zer_bl` / `val << _zer_bl`
+with no clamp — C UB (arch/-O dependent silent wrong value, no trap), violating ZER's
+"shift >= width = 0 (defined)" guarantee. The READ path was fixed for this (audit #18); the
+WRITE path was not (docs/limitations.md OPEN entry).
+
+**Fix.** New `emit_bitslice_runtime_mask` helper clamps the position shift so `lo >= 64`
+yields mask 0 (the write selects no bits → a defined no-op); the value shift is guarded
+inline the same way. Applied at BOTH emitter paths (AST ~1790, IR ~7049). Normal positions
+(0..63) unchanged. Test: `tests/zer/bitslice_write_runtime_pos.zer` (volatile positions
+force the runtime shift; pre-fix exit 2, post-fix exit 0).
+
+### 4. over-rejection — `free([*]T)` misclassified as an unverifiable indirect call
+
+The stack-depth verifier flagged `free(slice)` as "calls through function pointer with
+unknown target" (always a spurious warning; a HARD ERROR under `--stack-limit` — a valid
+bare-metal program falsely rejected). `free(*T struct)` rewrites its callee to `.free_ptr`
+(a NODE_FIELD, skipped by scan_frame), but `free([*]T)` keeps its bare NODE_IDENT callee,
+which isn't a registered global function → the `!sym` branch flagged it indirect.
+
+**Fix.** scan_frame (checker.c ~17407) now consults the callee's resolved type: only a
+FUNC_PTR callee is a genuine indirect call; a builtin (NULL global sym, no funcptr type) is
+not. Genuine funcptr param/local calls still flagged. Test: `test_checker_full.c`
+`test_stack_limit_free_slice` (discriminating under `--stack-limit`).
+
+
+---
+
 ## Session 2026-08-03g — block-scoped `defer free` then use-after-block (live UAF)
 
 Confirmed live before the fix: compiles clean, returns **222** — the emitted C

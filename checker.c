@@ -14783,8 +14783,22 @@ static void check_stmt(Checker *c, Node *node) {
              * caught by the transfer marking instead. A pure-value struct, or
              * one whose pointers all target `shared struct`s, is NOT rejected —
              * the exemption mirrors the bare-arg logic. */
+            /* 2026-08-06: the raw struct/union kind pre-guard (testing eff's
+             * kind for TYPE_STRUCT/TYPE_UNION directly) made a `?Struct`/
+             * `?Union` carrier (whose eff is TYPE_OPTIONAL) slip the gate
+             * entirely — `?Holder o; spawn
+             * worker(o)` where Holder carries a `*u32`/`[*]u32` compiled clean
+             * and the child raced/UAF'd the pointee (ASan/verified). The bare
+             * and optional-bare pointer forms are handled by the is_ptr_like
+             * arm above (which unwraps one optional level); a struct-carrying-
+             * pointer is NOT ptr-like, so `?Struct` fell through. Fix: drop the
+             * kind pre-guard and let `type_carries_nonshared_pointer` (which
+             * already recurses optional/array/struct/union and unwraps distinct,
+             * and returns false for scalars + shared-struct pointers) decide —
+             * exactly as the Handle arm below uses `type_carries_handle`. The
+             * wrapper-hides-the-inner-kind family at the one carrier sink the
+             * 2026-08-03 fix left raw-kind-gated. */
             else if (!is_scoped &&
-                     (eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION) &&
                      type_carries_nonshared_pointer(eff, 0)) {
                 checker_error(c, node->loc.line,
                     "spawn argument %d: cannot pass a by-value struct/union that "
@@ -17405,8 +17419,21 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
                 }
                 if (!resolved) frame->has_indirect_call = true;
             } else if (!sym || !sym->is_function) {
-                /* Unknown callee (parameter, field, etc.) — can't compute stack depth */
-                frame->has_indirect_call = true;
+                /* Unknown callee. A NULL global-scope symbol is EITHER a
+                 * builtin whose target is bounded and known (e.g. the
+                 * `free([*]T)` slice-free form keeps its bare NODE_IDENT
+                 * callee — it never rewrites to a `.free_ptr` field like the
+                 * `*T` form does) OR a genuine function-pointer call through a
+                 * param/local (not in global scope). Only the latter is
+                 * unverifiable. Discriminate on the callee's resolved type:
+                 * a funcptr param/local carries FUNC_PTR in the typemap
+                 * (check_expr ran on it during the normal-call path); a
+                 * builtin does not. This stops a valid `free(slice)` from
+                 * emitting a spurious "calls through function pointer" warning
+                 * — and, under --stack-limit, a hard false rejection. */
+                Type *ct = typemap_get(c, node->call.callee);
+                if (ct && type_dispatch_kind(ct) == TYPE_FUNC_PTR)
+                    frame->has_indirect_call = true;
             }
         }
         for (int i = 0; i < node->call.arg_count; i++)

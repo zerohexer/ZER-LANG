@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// Sibling of uaf_cast_view_heap: @pun-wrapped view stored into a struct FIELD.
+struct B { u32 v; }
+struct H { *B p; }
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    H h;
+    h.p = @pun(*B, &s[2]);
+    free(s);
+    return h.p.v;
+}

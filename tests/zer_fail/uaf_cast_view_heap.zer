@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// A VIEW (&s[i]) wrapped in @ptrcast lost its heap alias, so free(s) never
+// propagated to p — ASan-confirmed heap-use-after-free, accepted pre-fix.
+struct B { u32 v; }
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    s[0].v = 9;
+    *B p = @ptrcast(*B, &s[0]);
+    free(s);
+    return p.v;
+}

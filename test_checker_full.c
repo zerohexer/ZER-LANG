@@ -43,6 +43,59 @@ static void err(const char *src, const char *name) {
     arena_free(&a);
 }
 
+/* Drive the checker with --stack-limit N so the stack-depth / indirect-call
+ * verifier (check_stack_depth) runs its hard-error path. */
+static bool run_check_sl(const char *source, Arena *arena, uint32_t limit) {
+    Scanner s; scanner_init(&s, source);
+    Parser p; parser_init(&p, &s, arena, "test");
+    Node *f = parse_file(&p);
+    if (p.had_error) return false;
+    Checker c; checker_init(&c, arena, "test");
+    c.stack_limit = limit;
+    return checker_check(&c, f);
+}
+
+static void ok_sl(const char *src, uint32_t limit, const char *name) {
+    Arena a; arena_init(&a, 128*1024); tests_run++;
+    if (run_check_sl(src, &a, limit)) { tests_passed++; }
+    else { printf("  FAIL(ok_sl): %s\n", name); tests_failed++; }
+    arena_free(&a);
+}
+
+static void err_sl(const char *src, uint32_t limit, const char *name) {
+    Arena a; arena_init(&a, 128*1024); tests_run++;
+    if (!run_check_sl(src, &a, limit)) { tests_passed++; }
+    else { printf("  FAIL(err_sl): %s\n", name); tests_failed++; }
+    arena_free(&a);
+}
+
+/* Stack-depth verifier: a builtin `free([*]T)` keeps its bare NODE_IDENT
+ * callee (unlike `free(*T)` which rewrites to `T.free_ptr`), and must NOT be
+ * misclassified as an unverifiable indirect (function-pointer) call. Pre-fix
+ * this false-errored under --stack-limit. Genuine funcptr calls must still be
+ * flagged. */
+static void test_stack_limit_free_slice(void) {
+    printf("[stack-limit: free(slice) not an indirect call]\n");
+    ok_sl("struct B { u32 x; }\n"
+          "u32 main() {\n"
+          "    [*]B s = alloc(B, 4) orelse { return 0; };\n"
+          "    free(s);\n"
+          "    return 0;\n"
+          "}", 4096,
+          "free([*]B) under --stack-limit — valid, not indirect");
+    ok_sl("struct B { u32 x; }\n"
+          "struct H { [*]B b; }\n"
+          "void fb(H h) { free(h.b); }\n"
+          "u32 main() { return 0; }", 4096,
+          "free(field slice of by-value struct param) — valid");
+    err_sl("u32 add(u32 a) { return a; }\n"
+           "u32 main() {\n"
+           "    *(u32) -> u32 fp = add;\n"
+           "    return fp(3);\n"
+           "}", 4096,
+           "genuine funcptr call under --stack-limit — still rejected");
+}
+
 /* ================================================================
  * §5 TYPE SYSTEM
  * ================================================================ */
@@ -2438,6 +2491,7 @@ int main(void) {
     test_s18_comparison();
     test_s18_logical();
     test_s18_assignment();
+    test_stack_limit_free_slice();
     test_s19_defer();
     test_s22_pool();
     test_s22_ring();

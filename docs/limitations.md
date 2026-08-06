@@ -425,6 +425,38 @@ that must keep compiling, so the guard cannot broaden unnoticed.
 
 ---
 
+## OPEN — a by-value struct RETURN carrying a param-view field loses the alias (CRITICAL accept-unsafe, heap-UAF)
+
+**Symptom.** Compiles clean; ASan heap-use-after-free.
+```zer
+struct B { u32 v; }
+struct H { *B p; }
+H mk([*]B s) { H h; h.p = &s[0]; return h; }   // returns a by-value struct whose field views param 0
+u32 main() {
+    [*]B s = alloc(B, 4) orelse { return 1; };
+    H h = mk(s);
+    free(s);
+    return h.p.v;                               // UAF — accepted
+}
+```
+**Cause.** The 2026-08-03 through-call return-summary arm (zercheck_ir.c, the
+`returns_param_color` mechanism) peels a returned TEMP to a root param only when the return
+value IS a pointer/slice (`*B first([*]B s){ return &s[0]; }` — caught). A helper that
+returns a STRUCT BY VALUE whose FIELD is `&s[i]` records no partial-view summary, so the
+caller's returned struct does not inherit the arg's alloc_id; freeing the arg leaves the
+field dangling. Sibling of the cast-wrapped-view heap-alias holes fixed 2026-08-06 (which
+covered the intra-function var-decl/assignment forms), one call further out.
+**Fix sketch.** Extend FuncSummary to record a per-field param-view (field → param index),
+detected by walking each return block's returned struct value for `field = &param[view]`;
+at the call site, alias the returned struct's field-compound-key to the matching arg's
+alloc_id (mirror the existing `returns_param_color` substitution, but keyed by field). The
+by-value struct copy at the call site already replicates compound entries (IR_COPY §A #6),
+so the field key is available. Errs conservative if unimplemented (accept-unsafe) — this is
+a RELAXATION-inverse tightening, follow the accept-unsafe discipline (build the shape grid,
+verify it fires pre-fix, then land). Confirmed live 2026-08-06 (ASan).
+
+---
+
 ## OPEN — findings carried forward from the 2026-07-21→31 branch wave (documented, NOT fixed on any branch)
 
 These are the audit findings the eleven branches recorded but did **not** fix. Deduped against the rest
@@ -526,15 +558,12 @@ The unified root with the now-fixed §D6/§D7 borrow holes: the scoped-borrow / 
 intra-name and intra-function and does not treat `&x` handed to a helper as an access. Making it
 inter-procedural (a summary "does this callee access/borrow its pointer arg?") is subsystem-scale.
 
-### HIGH LOW — variable-index bit-slice WRITE: unclamped position shift is C UB (`n0odo5` `17ec74ca`, 2026-07-25)
-`reg[hi..lo] = v` with a RUNTIME `lo` lowers to `(uint64_t)(v) << _zer_bl` and `mask << _zer_bl`
-(emitter.c ~1708-1743 AST path + the IR mirror). When `lo >= 64` the shift count is out of range → C UB
-(x86 masks mod 64, other arches differ), violating ZER's stated "shift by ≥ width = 0 (defined)" guarantee.
-The WIDTH computation is already clamped; the POSITION shift is not. The companion bit-slice READ path was
-fixed for exactly this (audit #18, commit `c9e4abca`); the WRITE path was not.
-**Severity LOW** — the result is stored back through `*_zer_bp` typed to the carrier width, so the store
-truncates: a wrong VALUE / UB, **not** an out-of-bounds memory write.
-
+### DONE 2026-08-06 — variable-index bit-slice WRITE unclamped position shift (was C UB)
+`reg[hi..lo] = v` with a runtime `lo >= 64` lowered to `mask << _zer_bl` / `val << _zer_bl` with no clamp
+(C UB, arch/-O dependent silent wrong value). FIXED: `emit_bitslice_runtime_mask` clamps the position shift
+so `lo >= 64` yields mask 0 (a defined no-op), applied at both emitter paths (AST + IR); the value shift is
+guarded inline. Upholds ZER's "shift >= width = 0 (defined)" guarantee. Test
+`tests/zer/bitslice_write_runtime_pos.zer` (volatile positions; pre-fix exit 2, post-fix exit 0). See BUGS-FIXED.md 2026-08-06.
 ### LOW LOW — value-returning `async` has no result-retrieval API (`7fxhb3` `31796ef8`, 2026-07-28)
 `async u32 compute() { … return 42; }` compiles clean and the state machine correctly finalizes (BH-18 #10,
 fixed 2026-06-26). But the returned value is stored in an internal temp (`self->_zer_t0`) with **no

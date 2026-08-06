@@ -1,0 +1,25 @@
+// Bit-slice WRITE with a RUNTIME position must uphold ZER's "shift >= width = 0
+// (defined)" guarantee. Pre-fix, a runtime lo >= 64 lowered to `mask << lo` /
+// `val << lo` with no clamp = C UB. Positions are `volatile` so GCC cannot
+// const-fold the shift (forcing the real runtime path that discriminates).
+// Exits 0 iff all cases match the defined semantics.
+u32 main() {
+    volatile u64 lo = 4;
+    volatile u64 hi = 7;
+    u64 r = 5;
+    r[hi..lo] = 3;            // set bits [7..4] of 5 to 3 -> 53
+    if (r != 53) { return 1; }
+
+    volatile u64 lo2 = 64;    // out of range: defined no-op
+    volatile u64 hi2 = 67;
+    u64 r2 = 5;
+    r2[hi2..lo2] = 3;
+    if (r2 != 5) { return 2; }
+
+    volatile u64 lo3 = 0;
+    volatile u64 hi3 = 3;
+    u64 r3 = 0;
+    r3[hi3..lo3] = 10;
+    if (r3 != 10) { return 3; }
+    return 0;
+}

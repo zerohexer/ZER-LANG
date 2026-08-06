@@ -907,6 +907,22 @@ static const char *intn_carrier_suffix(uint32_t bits, bool is_signed) {
            (bits <= 32) ? "u32" : (bits <= 64) ? "u64" : "u128";
 }
 
+/* Runtime bit-slice WRITE mask: `reg[hi..lo] = v` with a RUNTIME lo lowers to
+ * `(WIDTHMASK << _zer_bl)`. Without a clamp, a runtime `lo >= 64` makes the
+ * position shift C UB (x86 masks mod 64, other arches differ) — a silent,
+ * arch-dependent wrong value with no trap, violating ZER's "shift >= width = 0
+ * (defined)" guarantee. Clamp the position shift so lo >= 64 yields mask 0 (the
+ * write selects no bits → a defined no-op). Emitted at the four mask sites of
+ * the AST + IR bit-set handlers; the value shift is guarded inline the same way.
+ * The const-position path needs no guard (an over-width const bit-slice write is
+ * already a compile error). Mirrors the read-path fix (audit #18). */
+static void emit_bitslice_runtime_mask(Emitter *e, int btmp) {
+    emit(e, "(_zer_bl%d >= 64 ? (uint64_t)0 : "
+         "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d))",
+         btmp, btmp, btmp, btmp, btmp, btmp);
+}
+
 /* Path C: after an arithmetic op, mask a uN/iN result to its bit width when the
  * carrier is wider than N (non-standard widths). Native 8/16/32/64/128 self-wrap.
  * uN -> bitmask; iN -> sign-extend (unsigned-shift then arithmetic >> to avoid
@@ -1786,21 +1802,23 @@ static void emit_expr(Emitter *e, Node *node) {
                         }
                         emit(e, " << %lld", (long long)const_lo);
                     } else {
-                        /* runtime: use hoisted temps */
-                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
-                             "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
-                             "<< _zer_bl%d)",
-                             btmp, btmp, btmp, btmp, btmp);
+                        /* runtime: use hoisted temps, position shift clamped */
+                        emit_bitslice_runtime_mask(e, btmp);
                     }
                 }
-                emit(e, ")) | (((uint64_t)(");
+                emit(e, ")) | ((");
+                /* value << lo, clamped so a runtime lo >= 64 is a defined 0
+                 * (not C UB) — the const path stays a plain shift. */
+                bool rt_pos = (!bits_const && hi_node && lo_node);
+                if (rt_pos) emit(e, "(_zer_bl%d >= 64 ? (uint64_t)0 : ((uint64_t)(", btmp);
+                else emit(e, "(uint64_t)(");
                 emit_expr(e, node->assign.value);
-                emit(e, ") << ");
-                if (hi_node && lo_node) {
-                    if (bits_const) emit(e, "%lld", (long long)const_lo);
-                    else emit(e, "_zer_bl%d", btmp);
+                if (rt_pos) {
+                    emit(e, ") << _zer_bl%d))", btmp);
                 } else {
-                    emit(e, "0");
+                    emit(e, ") << ");
+                    if (hi_node && lo_node && bits_const) emit(e, "%lld", (long long)const_lo);
+                    else emit(e, "0");
                 }
                 emit(e, ") & (");
                 /* re-emit mask */
@@ -1814,10 +1832,7 @@ static void emit_expr(Emitter *e, Node *node) {
                         }
                         emit(e, " << %lld", (long long)const_lo);
                     } else {
-                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
-                             "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
-                             "<< _zer_bl%d)",
-                             btmp, btmp, btmp, btmp, btmp);
+                        emit_bitslice_runtime_mask(e, btmp);
                     }
                 }
                 emit(e, ")); })");
@@ -7046,17 +7061,24 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     else emit(e, "((1ull << %lld) - 1)", (long long)width);
                     emit(e, " << %lld", (long long)const_lo);
                 } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                    emit_bitslice_runtime_mask(e, btmp);
                 }
             }
-            emit(e, ")) | (((uint64_t)(");
-            emit_rewritten_node(e, node->assign.value, func);
-            emit(e, ") << ");
-            if (bits_const) emit(e, "%lld", (long long)const_lo);
-            else if (lo_node) emit(e, "_zer_bl%d", btmp);
-            else emit(e, "0");
+            {
+                /* value << lo, clamped so a runtime lo >= 64 is a defined 0 */
+                bool rt_pos = (!bits_const && hi_node && lo_node);
+                emit(e, ")) | ((");
+                if (rt_pos) emit(e, "(_zer_bl%d >= 64 ? (uint64_t)0 : ((uint64_t)(", btmp);
+                else emit(e, "(uint64_t)(");
+                emit_rewritten_node(e, node->assign.value, func);
+                if (rt_pos) {
+                    emit(e, ") << _zer_bl%d))", btmp);
+                } else {
+                    emit(e, ") << ");
+                    if (bits_const) emit(e, "%lld", (long long)const_lo);
+                    else emit(e, "0");
+                }
+            }
             emit(e, ") & (");
             if (hi_node && lo_node) {
                 if (bits_const) {
@@ -7065,9 +7087,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     else emit(e, "((1ull << %lld) - 1)", (long long)width);
                     emit(e, " << %lld", (long long)const_lo);
                 } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                    emit_bitslice_runtime_mask(e, btmp);
                 }
             }
             emit(e, ")); })");

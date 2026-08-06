@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: carries a non-shared pointer/slice
+// A ?Struct carrying a non-shared *T bypassed the spawn carrier gate (the two
+// pointer/slice carrier arms were gated on the raw eff->kind == STRUCT/UNION,
+// which skips TYPE_OPTIONAL). The child races/UAFs the pointee.
+u32 gv;
+struct Holder { *u32 p; }
+void worker(?Holder h) { if (h) |v| { *v.p = *v.p + 1; } }
+u32 main() {
+    Holder hh;
+    hh.p = &gv;
+    ?Holder o = hh;
+    spawn worker(o);
+    gv = gv + 1;
+    return 0;
+}

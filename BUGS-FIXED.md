@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06b — VRP loop-body widening skipped an orelse FALLBACK (silent OOB write)
+
+From audit branch `2sjyjj`. A loop-body index written in an orelse fallback kept its stale
+pre-loop range, so VRP proved a preceding `a[k]` in range and **elided the auto-guard**.
+
+```zer
+u32[8] a;
+while (n < 3) { a[k] = 7; none_val() orelse { k = 9; }; n += 1; }
+```
+ASan `global-buffer-overflow`. Post-fix the guard fires on the second iteration and `main`
+returns 0 instead of 42.
+
+**Cause — the walker SHAPE, not a missing case.** `vrp_invalidate_loop_body_writes` was an
+`if/else-if` CHAIN ending in a catch-all comment ("All other NodeKind values: no assignment
+subtree to widen"). A kind the chain never named contributed nothing, silently, and
+`NODE_ORELSE` was such a kind. An if-chain is also invisible to
+`tools/walker_default_audit.sh`, which only inspects `switch (...->kind)`.
+
+**Fix.** Converted to a **no-default exhaustive switch** over all 53 NodeKinds, so
+`-Werror=switch` now forces every future kind to be considered and the walker audit covers
+it. Added the missing recursion: `NODE_ORELSE` (tried expr + fallback), `NODE_VAR_DECL` (init
+only — the declared name shadows rather than widens), `NODE_RETURN`, plus the expression kinds
+that can NEST an orelse (binary, unary, call/intrinsic args, index, field, slice, struct-init)
+and the previously-missing loop/if/switch CONDITIONS.
+
+Recursion policy recorded at the function: **widening more is the conservative direction** — a
+spurious widen costs a guard that would have been needed anyway, a missed widen is a silent
+OOB. So the walk is deliberately broad.
+
+**Over-rejection control is the important test here**, since the fix widens more: a genuinely
+provable loop index (`for (i = 0; i < 8; i += 1) a[i]`) must still emit **zero** guards.
+Verified.
+
+Tests: `tests/zer/vrp_orelse_loop_widen_ok.zer` (the branch's while-loop shape) and
+`vrp_orelse_forms_ok.zer` (for-loop form, var-decl-init form, and the guard-free control).
+Both verified discriminating — pre-fix they exit 42 and 1 respectively.
+
+**Probe warnings, both of which cost a wrong "does not reproduce" verdict during the survey:**
+- The failing shape is a BARE `orelse` STATEMENT whose fallback holds the write.
+  `k = f() orelse 9` (assignment RHS) IS handled and will not reproduce.
+- The guard here is the AUTO-GUARD (`if ((size_t)(k) >= 8u) { return 0; }`), not
+  `_zer_bounds_check`. Grepping the latter — and counting its preamble DEFINITION — reports
+  guards where there are none.
+
 ## Session 2026-08-06a — an OPTIONAL wrapper defeated the spawn carrier gate (my own regression)
 
 Found independently by THREE audit branches (`t20b31`, `2sjyjj`, `icejal`) — a strong signal

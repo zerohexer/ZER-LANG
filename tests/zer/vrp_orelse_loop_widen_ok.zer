@@ -1,0 +1,25 @@
+// A loop-body index written in an orelse FALLBACK must widen that index's VRP
+// range, or the bounds guard on a preceding `a[k]` is elided → silent OOB write
+// (ASan global-buffer-overflow on the pre-fix compiler).
+//
+// vrp_invalidate_loop_body_writes was an if/else-if CHAIN ending in a catch-all
+// comment, so NODE_ORELSE — a kind it never named — contributed nothing and the
+// write was invisible. It is now a no-default exhaustive switch, so a future
+// NodeKind fails -Werror=switch instead of silently reintroducing this.
+//
+// DISCRIMINATES: post-fix `k` is widened, the auto-guard fires on the second
+// iteration (k = 9) and main returns 0. Pre-fix there is no guard, the loop runs
+// to completion and returns 42, writing out of bounds on the way.
+?u32 none_val() { ?u32 r; return r; }
+u32[8] a;
+
+u32 main() {
+    u32 k = 0;
+    u32 n = 0;
+    while (n < 3) {
+        a[k] = 7;
+        none_val() orelse { k = 9; };
+        n += 1;
+    }
+    return 42;
+}

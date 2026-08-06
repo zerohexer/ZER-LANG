@@ -16723,8 +16723,23 @@ static void vrp_join_assign_range(Checker *c, const char *name, uint32_t name_le
  * recursed via NODE_ASSIGN's RHS walk and NODE_EXPR_STMT.  */
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     if (!body) return;
-    NodeKind k = body->kind;
-    if (k == NODE_ASSIGN) {
+    /* 2026-08-06: converted from an if/else-if CHAIN to a no-default exhaustive
+     * switch. The chain ended in a catch-all comment, so a node kind it did not
+     * name silently contributed nothing — and NODE_ORELSE was exactly such a
+     * kind. A loop-body index written in an orelse FALLBACK
+     * (`none_val() orelse { k = 9; };`) was therefore invisible: `k` kept its
+     * stale pre-loop range, VRP proved `a[k]` in range, and the auto-guard was
+     * ELIDED. ASan global-buffer-overflow.
+     *
+     * As a switch with no `default:`, -Werror=switch now forces every future
+     * NodeKind to be considered here, and tools/walker_default_audit.sh covers
+     * it (an if-chain was invisible to that gate).
+     *
+     * Recursion policy: widening MORE is the conservative direction (an extra
+     * widen costs a guard that was going to be needed anyway; a missed widen is
+     * a silent OOB). So every expression kind that can NEST an orelse is walked. */
+    switch (body->kind) {
+    case NODE_ASSIGN: {
         Node *t = body->assign.target;
         /* walk through field/index chains to root ident */
         while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX)) {
@@ -16741,37 +16756,111 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
         }
         /* RHS may also contain assignments (e.g., compound expr) */
         vrp_invalidate_loop_body_writes(c, body->assign.value);
-    } else if (k == NODE_BLOCK) {
-        for (int i = 0; i < body->block.stmt_count; i++) {
+        break;
+    }
+    case NODE_ORELSE:
+        /* THE 2026-08-06 FIX. Both halves: the tried expression and the
+         * FALLBACK (a value, a return/break/continue, or a BLOCK whose
+         * statements may assign an outer local). */
+        vrp_invalidate_loop_body_writes(c, body->orelse.expr);
+        vrp_invalidate_loop_body_writes(c, body->orelse.fallback);
+        break;
+    case NODE_VAR_DECL:
+        /* The DECLARED name shadows rather than widens, so it is not joined.
+         * But the INITIALIZER may contain a nested orelse whose fallback writes
+         * an OUTER local, so the subtree is still walked. */
+        vrp_invalidate_loop_body_writes(c, body->var_decl.init);
+        break;
+    case NODE_RETURN:
+        vrp_invalidate_loop_body_writes(c, body->ret.expr);
+        break;
+    case NODE_BLOCK:
+        for (int i = 0; i < body->block.stmt_count; i++)
             vrp_invalidate_loop_body_writes(c, body->block.stmts[i]);
-        }
-    } else if (k == NODE_IF) {
+        break;
+    case NODE_IF:
+        vrp_invalidate_loop_body_writes(c, body->if_stmt.cond);
         vrp_invalidate_loop_body_writes(c, body->if_stmt.then_body);
         vrp_invalidate_loop_body_writes(c, body->if_stmt.else_body);
-    } else if (k == NODE_FOR) {
+        break;
+    case NODE_FOR:
         vrp_invalidate_loop_body_writes(c, body->for_stmt.init);
+        vrp_invalidate_loop_body_writes(c, body->for_stmt.cond);
         vrp_invalidate_loop_body_writes(c, body->for_stmt.step);
         vrp_invalidate_loop_body_writes(c, body->for_stmt.body);
-    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        vrp_invalidate_loop_body_writes(c, body->while_stmt.cond);
         vrp_invalidate_loop_body_writes(c, body->while_stmt.body);
-    } else if (k == NODE_SWITCH) {
-        for (int i = 0; i < body->switch_stmt.arm_count; i++) {
+        break;
+    case NODE_SWITCH:
+        vrp_invalidate_loop_body_writes(c, body->switch_stmt.expr);
+        for (int i = 0; i < body->switch_stmt.arm_count; i++)
             vrp_invalidate_loop_body_writes(c, body->switch_stmt.arms[i].body);
-        }
-    } else if (k == NODE_EXPR_STMT) {
+        break;
+    case NODE_EXPR_STMT:
         vrp_invalidate_loop_body_writes(c, body->expr_stmt.expr);
-    } else if (k == NODE_DEFER) {
+        break;
+    case NODE_DEFER:
         vrp_invalidate_loop_body_writes(c, body->defer.body);
-    } else if (k == NODE_CRITICAL) {
+        break;
+    case NODE_CRITICAL:
         vrp_invalidate_loop_body_writes(c, body->critical.body);
-    } else if (k == NODE_ONCE) {
+        break;
+    case NODE_ONCE:
         vrp_invalidate_loop_body_writes(c, body->once.body);
+        break;
+    /* Expression kinds walked only so a NESTED orelse (or assignment) is
+     * reached — they write nothing themselves. */
+    case NODE_BINARY:
+        vrp_invalidate_loop_body_writes(c, body->binary.left);
+        vrp_invalidate_loop_body_writes(c, body->binary.right);
+        break;
+    case NODE_UNARY:
+        vrp_invalidate_loop_body_writes(c, body->unary.operand);
+        break;
+    case NODE_CALL:
+        for (int i = 0; i < body->call.arg_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->call.args[i]);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < body->intrinsic.arg_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->intrinsic.args[i]);
+        break;
+    case NODE_INDEX:
+        vrp_invalidate_loop_body_writes(c, body->index_expr.object);
+        vrp_invalidate_loop_body_writes(c, body->index_expr.index);
+        break;
+    case NODE_FIELD:
+        vrp_invalidate_loop_body_writes(c, body->field.object);
+        break;
+    case NODE_SLICE:
+        vrp_invalidate_loop_body_writes(c, body->slice.object);
+        vrp_invalidate_loop_body_writes(c, body->slice.start);
+        vrp_invalidate_loop_body_writes(c, body->slice.end);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < body->struct_init.field_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->struct_init.fields[i].value);
+        break;
+    /* No assignment subtree to widen. Calls do not write the CALLER's locals
+     * (the callee owns its own ranges); declarations, literals, jumps and the
+     * type-level kinds carry no writable expression. Listed explicitly so a new
+     * NodeKind fails -Werror=switch instead of silently contributing nothing —
+     * which is precisely how the NODE_ORELSE gap survived. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF:
+        break;
     }
-    /* All other NodeKind values: no assignment subtree to widen.
-     * Calls do not write the caller's locals (the callee's analysis
-     * owns its own ranges). VAR_DECL inner inits shadow rather than
-     * widen the outer range.  RETURN/BREAK/CONTINUE/GOTO/LABEL/YIELD/
-     * AWAIT/SPAWN/STATIC_ASSERT/ASM/expr-kinds are terminal here. */
 }
 
 /* B7 (2026-08-01): widen every local whose ADDRESS IS TAKEN anywhere in a loop

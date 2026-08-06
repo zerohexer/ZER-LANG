@@ -1,0 +1,37 @@
+// The other reachable orelse shapes for the same widener gap: a for-loop body,
+// an orelse in a var-decl INITIALIZER, and a guard-free control.
+//
+// The control matters most — widening MORE is the conservative direction, so the
+// fix could silently become an over-rejection that costs a guard on every loop.
+// A genuinely provable index must still emit NO guard.
+?u32 none_val() { ?u32 r; return r; }
+u32[8] b;
+u32[8] c;
+
+u32 for_form() {
+    u32 k = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        b[k] = 5;
+        none_val() orelse { k = 12; };
+    }
+    return 42;
+}
+
+u32 vardecl_init_form() {
+    u32 k = 0;
+    u32 n = 0;
+    while (n < 3) {
+        c[k] = 7;
+        u32 z = none_val() orelse 9;
+        k = z;
+        n += 1;
+    }
+    return 42;
+}
+
+u32 main() {
+    // both return 0 via the auto-guard rather than completing the loop
+    if (for_form() != 0) { return 1; }
+    if (vardecl_init_form() != 0) { return 2; }
+    return 0;
+}

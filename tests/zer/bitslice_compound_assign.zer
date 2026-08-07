@@ -1,0 +1,39 @@
+// `reg[hi..lo] OP= rhs` must be a read-modify-write of the FIELD, not a plain
+// store of the RHS.
+//
+// The IR-path bit-slice SET handler matched any assign with a NODE_SLICE target
+// and emitted the bare RHS, never consulting node->assign.op — so
+// `r[7..0] = 20; r[7..0] += 3;` produced 3, not 23. All ten compound ops were
+// affected. The AST path never had the bug because it is gated on
+// `op == TOK_EQ`, which is also why a compound bit-slice assign reaches the IR
+// path at all.
+//
+// Read-modify-write on a register field is the idiom bit-slices exist for.
+u32 main() {
+    u32 r = 0;
+
+    r[7..0] = 20;  r[7..0] += 3;   if (r[7..0] != 23) { return 1; }
+    r[7..0] = 20;  r[7..0] -= 4;   if (r[7..0] != 16) { return 2; }
+    r[7..0] = 5;   r[7..0] *= 3;   if (r[7..0] != 15) { return 3; }
+    r[7..0] = 20;  r[7..0] /= 4;   if (r[7..0] != 5)  { return 4; }
+    r[7..0] = 23;  r[7..0] %= 5;   if (r[7..0] != 3)  { return 5; }
+    r[7..0] = 12;  r[7..0] &= 10;  if (r[7..0] != 8)  { return 6; }
+    r[7..0] = 12;  r[7..0] |= 3;   if (r[7..0] != 15) { return 7; }
+    r[7..0] = 12;  r[7..0] ^= 10;  if (r[7..0] != 6)  { return 8; }
+    r[7..0] = 3;   r[7..0] <<= 2;  if (r[7..0] != 12) { return 9; }
+    r[7..0] = 12;  r[7..0] >>= 2;  if (r[7..0] != 3)  { return 10; }
+
+    // NEIGHBOUR BITS must survive a compound write
+    r = 0;
+    r[15..8] = 0xAB;
+    r[7..0]  = 0xCD;
+    if (r != 0xABCD) { return 11; }
+    r[7..0] += 1;
+    if (r != 0xABCE) { return 12; }
+
+    // plain `=` must be unchanged
+    r[7..0] = 7;
+    if (r != 0xAB07) { return 13; }
+
+    return 0;
+}

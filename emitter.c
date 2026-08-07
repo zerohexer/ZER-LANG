@@ -373,6 +373,10 @@ static bool field_obj_needs_parens(Node *obj) {
  * into NODE_INDEX.object but not NODE_INDEX.index, so `arr[fn()] <<= n`
  * silently evaluated `fn()` twice (BUG: indexed compound side-effect).
  */
+/* fwd: bit-slice emission helpers (defined next to the IR-path SET handler,
+ * but called from the AST path above it). */
+static void emit_bitslice_runtime_mask(Emitter *e, int btmp);
+
 static bool expr_has_side_effects(Node *n) {
     if (!n) return false;
     switch (n->kind) {
@@ -1787,21 +1791,18 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, " << %lld", (long long)const_lo);
                     } else {
                         /* runtime: use hoisted temps */
-                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
-                             "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
-                             "<< _zer_bl%d)",
-                             btmp, btmp, btmp, btmp, btmp);
+                        emit_bitslice_runtime_mask(e, btmp);
                     }
                 }
                 emit(e, ")) | (((uint64_t)(");
                 emit_expr(e, node->assign.value);
-                emit(e, ") << ");
-                if (hi_node && lo_node) {
-                    if (bits_const) emit(e, "%lld", (long long)const_lo);
-                    else emit(e, "_zer_bl%d", btmp);
-                } else {
-                    emit(e, "0");
-                }
+                /* clamp the VALUE shift as well — same UB as the mask shift */
+                if (!bits_const && hi_node && lo_node)
+                    emit(e, ") << ((_zer_bl%d >= 64) ? 0 : _zer_bl%d)", btmp, btmp);
+                else if (bits_const && hi_node && lo_node)
+                    emit(e, ") << %lld", (long long)const_lo);
+                else
+                    emit(e, ") << 0");
                 emit(e, ") & (");
                 /* re-emit mask */
                 if (hi_node && lo_node) {
@@ -1814,10 +1815,7 @@ static void emit_expr(Emitter *e, Node *node) {
                         }
                         emit(e, " << %lld", (long long)const_lo);
                     } else {
-                        emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? "
-                             "~(uint64_t)0 : ((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) "
-                             "<< _zer_bl%d)",
-                             btmp, btmp, btmp, btmp, btmp);
+                        emit_bitslice_runtime_mask(e, btmp);
                     }
                 }
                 emit(e, ")); })");
@@ -6237,6 +6235,91 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
  * DOES NOT CALL emit_expr. Each node type emitted directly.
  * For sub-expressions, calls itself recursively.
  * ================================================================ */
+/* Emit the VALUE that a bit-slice SET stores, honouring a COMPOUND operator.
+ *
+ * 2026-08-06: `reg[hi..lo] OP= rhs` was compiled as `reg[hi..lo] = rhs` — the
+ * IR-path handler matched any assign with a NODE_SLICE target and emitted the
+ * bare RHS, never consulting node->assign.op. Measured: `r[7..0] = 20;
+ * r[7..0] += 3;` produced 3, not 23. All ten compound ops were affected, and
+ * read-modify-write on a register field is the idiom bit-slices exist for.
+ *
+ * The AST path never had this bug because it is gated on `op == TOK_EQ`, which
+ * is also why a compound bit-slice assign reaches the IR path at all.
+ *
+ * For a compound op the stored value is `current_field OP rhs`, where
+ * current_field is the field read back out of the cached pointer:
+ *     ((*_zer_bp >> lo) & unshifted_mask)
+ * The position shift is clamped for the same UB reason as the mask
+ * (see emit_bitslice_runtime_mask). */
+static void emit_bitslice_ir_value(Emitter *e, Node *node, IRFunc *func, int btmp,
+                                   bool bits_const, int64_t const_hi, int64_t const_lo,
+                                   Node *hi_node, Node *lo_node) {
+    TokenType op = node->assign.op;
+    if (op == TOK_EQ) {                      /* plain store — unchanged */
+        emit_rewritten_node(e, node->assign.value, func);
+        return;
+    }
+    const char *cop = " + ";
+    switch (op) {
+    case TOK_PLUSEQ:    cop = " + ";  break;
+    case TOK_MINUSEQ:   cop = " - ";  break;
+    case TOK_STAREQ:    cop = " * ";  break;
+    case TOK_SLASHEQ:   cop = " / ";  break;
+    /* NOTE: cop is passed as a %s ARGUMENT to emit(), not as part of the format
+     * string, so it must contain a LITERAL "%". Writing " %% " here (correct for
+     * a format string, as the sibling switch at the plain-assign site does) emits
+     * a literal "%%" into the C and silently miscompiles: 23 %= 5 gave 1, not 3. */
+    case TOK_PERCENTEQ: cop = " % ";  break;
+    case TOK_AMPEQ:     cop = " & ";  break;
+    case TOK_PIPEEQ:    cop = " | ";  break;
+    case TOK_CARETEQ:   cop = " ^ ";  break;
+    case TOK_LSHIFTEQ:  cop = " << "; break;
+    case TOK_RSHIFTEQ:  cop = " >> "; break;
+    default:            cop = " + ";  break;
+    }
+    /* current field value, read back through the cached pointer */
+    emit(e, "((((uint64_t)(*_zer_bp%d) >> ", btmp);
+    if (bits_const) emit(e, "%lld", (long long)const_lo);
+    else if (lo_node) emit(e, "((_zer_bl%d >= 64) ? 0 : _zer_bl%d)", btmp, btmp);
+    else emit(e, "0");
+    emit(e, ") & (");
+    if (hi_node && lo_node) {
+        if (bits_const) {
+            int64_t width = const_hi - const_lo + 1;
+            if (width >= 64) emit(e, "~(uint64_t)0");
+            else emit(e, "((1ull << %lld) - 1)", (long long)width);
+        } else {
+            emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64) ? ~(uint64_t)0 : "
+                 "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1))",
+                 btmp, btmp, btmp, btmp);
+        }
+    } else {
+        emit(e, "~(uint64_t)0");
+    }
+    emit(e, "))%s(uint64_t)(", cop);
+    emit_rewritten_node(e, node->assign.value, func);
+    emit(e, "))");
+}
+
+/* Emit the runtime bit-slice MASK, positioned, with the POSITION SHIFT CLAMPED.
+ *
+ * 2026-08-06: `reg[hi..lo] = v` with a runtime `lo >= 64` emitted a bare
+ * `mask << _zer_bl` — C UB. UBSan: "shift exponent 70 is too large"; measured
+ * `reg` corrupted from 5 to 69. The WIDTH was already guarded
+ * (`(hi-lo+1) >= 64 ? ~0 : ...`); the POSITION never was. The READ path has the
+ * equivalent guard (`(_zer_lo >= N) ? 0 : (obj >> _zer_lo)`), so this only
+ * restores parity between read and write.
+ *
+ * An out-of-range position yields mask 0, which makes the whole write a defined
+ * no-op — upholding ZER's "shift by >= width is 0 (defined)" guarantee rather
+ * than inventing a trap. */
+static void emit_bitslice_runtime_mask(Emitter *e, int btmp) {
+    emit(e, "((_zer_bl%d >= 64) ? (uint64_t)0 : "
+         "((((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
+         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)))",
+         btmp, btmp, btmp, btmp, btmp, btmp);
+}
+
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
@@ -7046,17 +7129,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     else emit(e, "((1ull << %lld) - 1)", (long long)width);
                     emit(e, " << %lld", (long long)const_lo);
                 } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                    emit_bitslice_runtime_mask(e, btmp);
                 }
             }
             emit(e, ")) | (((uint64_t)(");
-            emit_rewritten_node(e, node->assign.value, func);
-            emit(e, ") << ");
-            if (bits_const) emit(e, "%lld", (long long)const_lo);
-            else if (lo_node) emit(e, "_zer_bl%d", btmp);
-            else emit(e, "0");
+            emit_bitslice_ir_value(e, node, func, btmp, bits_const, const_hi, const_lo,
+                                   hi_node, lo_node);
+            if (!bits_const && lo_node)
+                emit(e, ") << ((_zer_bl%d >= 64) ? 0 : _zer_bl%d)", btmp, btmp);
+            else if (bits_const)
+                emit(e, ") << %lld", (long long)const_lo);
+            else
+                emit(e, ") << 0");
             emit(e, ") & (");
             if (hi_node && lo_node) {
                 if (bits_const) {
@@ -7065,9 +7149,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     else emit(e, "((1ull << %lld) - 1)", (long long)width);
                     emit(e, " << %lld", (long long)const_lo);
                 } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                    emit_bitslice_runtime_mask(e, btmp);
                 }
             }
             emit(e, ")); })");

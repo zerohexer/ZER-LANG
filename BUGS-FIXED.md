@@ -5,6 +5,48 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06f — two bit-slice miscompiles (survey #4 and #5)
+
+Both silent wrong answers on bare metal, in the feature bit-slices exist for.
+
+**#4 — WRITE at a runtime position >= width emitted C UB** (`t20b31`, also `8j6w19`).
+`reg[hi..lo] = 1` with `lo = 70` emitted a bare `mask << _zer_bl`. UBSan: *"shift exponent 70
+is too large for 64-bit type"*; `reg` corrupted from 5 to 69. The WIDTH was already guarded
+(`(hi-lo+1) >= 64 ? ~0 : ...`) and the READ path already clamps its position
+(`(_zer_lo >= N) ? 0 : (obj >> _zer_lo)`) — only the WRITE position was unguarded.
+
+Fixed with `emit_bitslice_runtime_mask`, used at all four runtime-mask sites (2 AST + 2 IR),
+plus a clamp on the VALUE shift at both paths. An out-of-range position yields mask 0, making
+the write a defined no-op — upholding "shift by >= width is 0 (defined)" rather than inventing
+a trap.
+
+**#5 — COMPOUND assign compiled as a plain assign** (`icejal`). `r[7..0] = 20; r[7..0] += 3;`
+produced 3, not 23. The IR-path handler matched any assign with a `NODE_SLICE` target and
+emitted the bare RHS, never consulting `node->assign.op`. All ten compound ops were affected.
+The AST path never had the bug because it is gated on `op == TOK_EQ` — which is also why a
+compound bit-slice assign reaches the IR path at all.
+
+Fixed with `emit_bitslice_ir_value`: for a compound op the stored value is
+`current_field OP rhs`, where the current field is read back through the cached `_zer_bp`
+pointer (single-eval preserved) with the same clamped position shift.
+
+**A self-inflicted bug worth recording.** The `%=` case initially produced 1 instead of 3. I
+wrote `cop = " %% "` — correct for a FORMAT string, and the sibling switch at the plain-assign
+site does exactly that — but `cop` is passed as a `%s` ARGUMENT, so no format processing
+happens and a literal `%%` landed in the emitted C. Nine of ten ops were right, which is
+precisely the kind of near-miss a per-op test catches and a spot-check does not.
+
+**The position test needed care to discriminate at all.** `--run` compiles at `-O2`, and with
+a plain local for the position gcc constant-folds the expression so the UB is BENIGN there:
+measured pre-fix `reg=69` at `-O0` but `reg=5` at `-O2`. A test written that way PASSES on the
+broken compiler — that is the weak oracle the branch shipped. Reading the position through a
+VOLATILE global defeats the folding, and the test then discriminates at both `-O0` and `-O2`.
+The reasoning is recorded in the test itself so nobody "simplifies" the volatile away.
+
+Tests: `tests/zer/bitslice_write_runtime_position.zer` and
+`tests/zer/bitslice_compound_assign.zer` (all ten ops individually, plus neighbour-bit
+preservation and an unchanged plain `=`). Both verified discriminating.
+
 ## Session 2026-08-06e — view-provenance UNIFIED: all 7 forms closed + a 10th matrix oracle
 
 Grid-first, as the accept-unsafe discipline requires: `tests/test_view_alias_matrix.c` was

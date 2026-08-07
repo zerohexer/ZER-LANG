@@ -1,0 +1,36 @@
+// A bit-slice WRITE at a RUNTIME position >= the carrier width must be a defined
+// no-op, not C undefined behaviour.
+//
+// Pre-fix the emitted C was a bare `mask << _zer_bl` with no clamp on the
+// POSITION (the WIDTH was already guarded). UBSan: "shift exponent 70 is too
+// large for 64-bit type". The READ path already had the equivalent guard
+// (`(_zer_lo >= N) ? 0 : (obj >> _zer_lo)`), so this restores parity and upholds
+// ZER's "shift by >= width is 0 (defined)" guarantee.
+//
+// THE POSITION COMES FROM A VOLATILE GLOBAL ON PURPOSE. With a plain local, gcc
+// constant-folds the whole expression and the UB is benign at -O2 — measured
+// pre-fix reg=69 at -O0 but reg=5 at -O2. Since `--run` compiles at -O2, a test
+// using a plain local PASSES on the broken compiler; that is exactly the weak
+// oracle the original branch test shipped. Reading the position through a
+// volatile defeats the folding and the test discriminates at BOTH -O0 and -O2
+// (pre-fix reg=69, post-fix reg=5).
+volatile u32 gpos;
+
+u32 main() {
+    u32 reg = 5;
+
+    // position past the carrier width — the whole write must be a no-op
+    gpos = 70;
+    u32 hi = gpos;
+    u32 lo = gpos;
+    reg[hi..lo] = 1;
+    if (reg != 5) { return 1; }
+
+    // an in-range runtime position still works: set bit 1 (0b101 -> 0b111)
+    gpos = 1;
+    u32 q = gpos;
+    reg[q..q] = 1;
+    if (reg != 7) { return 2; }
+
+    return 0;
+}

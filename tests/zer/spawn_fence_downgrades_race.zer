@@ -1,0 +1,12 @@
+// Regression: @barrier_acq_rel and @barrier_dma are memory fences and count as
+// manual synchronization, so a spawn body using one is a race WARNING, not a
+// hard error (has_sync). limitations #7, 2026-08-07.
+u32 ga = 0;
+u32 gb = 0;
+void wa() { @barrier_acq_rel(); ga = 1; }
+void wb() { @barrier_dma();     gb = 1; }
+u32 main() {
+    spawn wa();
+    spawn wb();
+    return 0;
+}

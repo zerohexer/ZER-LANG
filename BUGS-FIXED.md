@@ -5,6 +5,52 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-07 — audit sweep: 4 verified fixes (bit-slice #4/#5, fence has_sync #7, container Handle(T) #9)
+
+Harvested from the 2026-08-06 branch-survey OPEN entry (limitations.md), each re-verified
+reproducing on main before the fix and each new test verified DISCRIMINATING against a
+pristine from-HEAD build (all 3 tests exit non-zero pre-fix, 0 post-fix).
+
+**#5 — bit-slice COMPOUND assign compiled as a plain assign (miscompile).** `r[7..0] = 20;
+r[7..0] += 3;` yielded 3, not 23. Root cause: the IR-path bit-slice SET handler
+(`emitter.c` ~7020) ignored `node->assign.op` and stored the bare RHS, dropping both the
+current field value and the operator. All 10 compound ops (`+= -= *= /= %= &= |= ^= <<= >>=`)
+were broken — the read-modify-write register idiom bit-slices exist for.
+
+**#4 — bit-slice WRITE at a runtime position >= width emitted C UB.** The store shifted the
+mask and value by the low-bit position with no guard; a runtime `lo >= 64` is a shift-count
+UB (`shift exponent too large`), and `lo` in `[width,64)` writes bits that truncate away. The
+READ path had the `(_zer_lo >= objbits) ? 0` guard since the F8 fix; the WRITE path did not.
+
+Fix (both #4/#5): the IR-path handler was rewritten to a fully-guarded read-modify-write —
+it hoists lo/hi/width/field-mask, reads the CURRENT field (position-guarded) for compound
+ops, applies the operator (`_zer_shl`/`_zer_shr` for shifts, a div-by-zero trap for `/=`/`%=`),
+and gates the whole store on `lo < objbits` via `?:` so an out-of-range position is a no-op
+and the UB shift in the untaken arm is never evaluated. Field math is unsigned in `uint64_t`,
+masked to width, so wrap/shift semantics fall out of the final mask. Added a `type_is_integer`
+guard so only an integer register (not an array-slice target) takes this path, matching the
+AST sibling. Test: `tests/zer/bitslice_compound_and_pos_guard.zer`.
+
+**#7 — `@barrier_acq_rel` / `@barrier_dma` missing from `has_sync` (over-rejection).** A spawn
+body fencing with either on a non-shared global was a HARD data-race error instead of a
+warning, while `@barrier` / `@barrier_store` / `@barrier_load` correctly warned. Root cause:
+the fence list is a MULTI-SITE class — the intrinsic type-resolution site (`checker.c` ~8805)
+listed all five fences, but the two `has_sync` sites (`scan_func_props` ~10178,
+`has_atomic_or_barrier` ~10450) listed only three. The doc named `barrier_acq_rel`; `barrier_dma`
+was a silent sibling with the same gap. Durable fix: one `intrinsic_name_is_fence()` predicate
+(single source of truth, EXACT-length matching so `barrier_init`/`barrier_wait` rendezvous
+primitives stay excluded) used at all three sites. Test:
+`tests/zer/spawn_fence_downgrades_race.zer`.
+
+**#9 — `container W(T) { Handle(T) h; }` failed with "undefined type 'T'".** `subst_typenode`
+(`checker.c` ~2374) listed `TYNODE_HANDLE` among the no-substitution leaves, so `Handle(T)`'s
+element type was never monomorphized. A Handle is a `u64` regardless of T, so it substitutes
+cleanly; Pool/Ring/Slab/Barrier/Semaphore stay leaf (rejected — their monomorphized struct
+emission is not wired). Fix: a `TYNODE_HANDLE` case recursing into `handle.elem`. Test:
+`tests/zer/container_handle_field.zer`.
+
+---
+
 ## Session 2026-08-06e — view-provenance UNIFIED: all 7 forms closed + a 10th matrix oracle
 
 Grid-first, as the accept-unsafe discipline requires: `tests/test_view_alias_matrix.c` was

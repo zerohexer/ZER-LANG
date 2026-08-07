@@ -7015,63 +7015,88 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         }
 
-        /* Bit extract SET: reg[hi..lo] = val → shift/mask.
-         * Replicates emit_expr's BUG-210/216 handler using emit_rewritten_node. */
+        /* Bit extract SET: reg[hi..lo] {op}= val → read-modify-write.
+         * Fully guarded form (2026-08-07): the position shift `<< lo` is C UB
+         * when lo >= the object's bit width; the whole RMW becomes a no-op in
+         * that case (matches the read path's `(lo >= objbits) ? 0` guard). And
+         * a compound op ({+,-,*,/,%,&,|,^,<<,>>}=) applies to the CURRENT field
+         * value — previously the operator was dropped and the bare RHS stored
+         * (limitations #4/#5, 2026-08-06). Field math is unsigned in uint64_t,
+         * masked to width, so wrap/shift semantics fall out of the final mask. */
         if (node->assign.target && node->assign.target->kind == NODE_SLICE) {
             Node *obj = node->assign.target->slice.object;
-            Node *hi_node = node->assign.target->slice.start;
-            Node *lo_node = node->assign.target->slice.end;
-            int btmp = e->temp_count++;
-            emit(e, "({ __typeof__(");
-            emit_rewritten_node(e, obj, func);
-            emit(e, ") *_zer_bp%d = &(", btmp);
-            emit_rewritten_node(e, obj, func);
-            emit(e, "); ");
-            int64_t const_hi = hi_node ? eval_const_expr(hi_node) : CONST_EVAL_FAIL;
-            int64_t const_lo = lo_node ? eval_const_expr(lo_node) : CONST_EVAL_FAIL;
-            bool bits_const = (const_hi != CONST_EVAL_FAIL && const_lo != CONST_EVAL_FAIL &&
-                               const_hi >= 0 && const_lo >= 0);
-            if (!bits_const && hi_node && lo_node) {
-                emit(e, "uint64_t _zer_bh%d = (uint64_t)(", btmp);
-                emit_rewritten_node(e, hi_node, func);
+            Type *bs_t = checker_get_type(e->checker, obj);
+            bs_t = bs_t ? type_unwrap_distinct(bs_t) : NULL;
+            if (bs_t && type_is_integer(bs_t)) {
+                Node *hi_node = node->assign.target->slice.start;
+                Node *lo_node = node->assign.target->slice.end;
+                int objbits = type_width(bs_t);
+                if (objbits <= 0) objbits = 64;
+                TokenType bop = node->assign.op;
+                int btmp = e->temp_count++;
+                emit(e, "({ __typeof__(");
+                emit_rewritten_node(e, obj, func);
+                emit(e, ") *_zer_bp%d = &(", btmp);
+                emit_rewritten_node(e, obj, func);
                 emit(e, "); uint64_t _zer_bl%d = (uint64_t)(", btmp);
-                emit_rewritten_node(e, lo_node, func);
+                if (lo_node) emit_rewritten_node(e, lo_node, func); else emit(e, "0");
+                emit(e, "); uint64_t _zer_bh%d = (uint64_t)(", btmp);
+                if (hi_node) emit_rewritten_node(e, hi_node, func);
+                else if (lo_node) emit_rewritten_node(e, lo_node, func);
+                else emit(e, "0");
                 emit(e, "); ");
-            }
-            emit(e, "*_zer_bp%d = (*_zer_bp%d & ~(", btmp, btmp);
-            if (hi_node && lo_node) {
-                if (bits_const) {
-                    int64_t width = const_hi - const_lo + 1;
-                    if (width >= 64) emit(e, "~(uint64_t)0");
-                    else emit(e, "((1ull << %lld) - 1)", (long long)width);
-                    emit(e, " << %lld", (long long)const_lo);
-                } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
+                /* field width (saturating) + unshifted field mask (guarded) */
+                emit(e, "uint64_t _zer_bw%d = (_zer_bh%d >= _zer_bl%d) ? "
+                     "(_zer_bh%d - _zer_bl%d + 1) : 0; ",
+                     btmp, btmp, btmp, btmp, btmp);
+                emit(e, "uint64_t _zer_bm%d = (_zer_bw%d >= 64) ? ~(uint64_t)0 : "
+                     "(_zer_bw%d == 0 ? (uint64_t)0 : ((1ull << _zer_bw%d) - 1)); ",
+                     btmp, btmp, btmp, btmp);
+                /* current field value, position-guarded (for compound ops) */
+                emit(e, "uint64_t _zer_bv%d = (_zer_bl%d >= %d) ? (uint64_t)0 : "
+                     "(((uint64_t)(*_zer_bp%d) >> _zer_bl%d) & _zer_bm%d); ",
+                     btmp, btmp, objbits, btmp, btmp, btmp);
+                /* new field value = current {op} rhs (bare rhs for plain '=') */
+                emit(e, "uint64_t _zer_brhs%d = (uint64_t)(", btmp);
+                switch (bop) {
+                case TOK_PLUSEQ:  emit(e, "_zer_bv%d + (", btmp); goto bs_close_rhs;
+                case TOK_MINUSEQ: emit(e, "_zer_bv%d - (", btmp); goto bs_close_rhs;
+                case TOK_STAREQ:  emit(e, "_zer_bv%d * (", btmp); goto bs_close_rhs;
+                case TOK_AMPEQ:   emit(e, "_zer_bv%d & (", btmp); goto bs_close_rhs;
+                case TOK_PIPEEQ:  emit(e, "_zer_bv%d | (", btmp); goto bs_close_rhs;
+                case TOK_CARETEQ: emit(e, "_zer_bv%d ^ (", btmp); goto bs_close_rhs;
+                case TOK_LSHIFTEQ: emit(e, "_zer_shl(_zer_bv%d, (", btmp); goto bs_close_shift;
+                case TOK_RSHIFTEQ: emit(e, "_zer_shr(_zer_bv%d, (", btmp); goto bs_close_shift;
+                case TOK_SLASHEQ:
+                case TOK_PERCENTEQ:
+                    emit(e, "({ uint64_t _zer_bd%d = (uint64_t)(", btmp);
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, "); if (_zer_bd%d == 0) _zer_trap(\"division by zero\", "
+                         "__FILE__, __LINE__); _zer_bv%d %s _zer_bd%d; })",
+                         btmp, btmp, bop == TOK_SLASHEQ ? "/" : "%", btmp);
+                    goto bs_rhs_done;
+                default: /* TOK_EQ and any non-compound */
+                    emit_rewritten_node(e, node->assign.value, func);
+                    goto bs_rhs_done;
+                bs_close_rhs:
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, ")");
+                    goto bs_rhs_done;
+                bs_close_shift:
+                    emit_rewritten_node(e, node->assign.value, func);
+                    emit(e, "))");
+                    goto bs_rhs_done;
                 }
+                bs_rhs_done:
+                emit(e, "); ");
+                /* store, position-guarded — out-of-range position = no-op, and
+                 * the shift-by->=width UB is never evaluated (untaken ?: arm) */
+                emit(e, "*_zer_bp%d = (_zer_bl%d >= %d) ? *_zer_bp%d : "
+                     "(__typeof__(*_zer_bp%d))((*_zer_bp%d & ~(_zer_bm%d << _zer_bl%d)) | "
+                     "((_zer_brhs%d & _zer_bm%d) << _zer_bl%d)); })",
+                     btmp, btmp, objbits, btmp, btmp, btmp, btmp, btmp, btmp, btmp, btmp);
+                return;
             }
-            emit(e, ")) | (((uint64_t)(");
-            emit_rewritten_node(e, node->assign.value, func);
-            emit(e, ") << ");
-            if (bits_const) emit(e, "%lld", (long long)const_lo);
-            else if (lo_node) emit(e, "_zer_bl%d", btmp);
-            else emit(e, "0");
-            emit(e, ") & (");
-            if (hi_node && lo_node) {
-                if (bits_const) {
-                    int64_t width = const_hi - const_lo + 1;
-                    if (width >= 64) emit(e, "~(uint64_t)0");
-                    else emit(e, "((1ull << %lld) - 1)", (long long)width);
-                    emit(e, " << %lld", (long long)const_lo);
-                } else {
-                    emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-                         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)",
-                         btmp, btmp, btmp, btmp, btmp);
-                }
-            }
-            emit(e, ")); })");
-            return;
         }
         /* Array assignment — memcpy/byte-loop */
         if (tgt_eff && tgt_eff->kind == TYPE_ARRAY) {

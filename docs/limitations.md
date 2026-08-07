@@ -444,6 +444,15 @@ NOT merged or pulled — implement from this description.
 
 ### The 9 fixes to take
 
+**STATUS 2026-08-07.** #1 (`e08a87d`), #2 (`7c67675`), #3 (`efae531`), #8 (`43126a1`) and
+the whole VIEW-ALIAS FAMILY (`5748e90`) landed on main in the days after this survey.
+**#4, #5, #7, #9 landed 2026-08-07** (this session) — bit-slice write position guard +
+compound-op, the `barrier_acq_rel`/`barrier_dma` fence-list, and `Handle(T)` container
+substitution. **#6 no longer reproduces on main** (re-checked 2026-08-07: neither the plain
+`free([*]T)` nor the `--stack-limit` form emits the spurious funcptr diagnostic). Remaining
+open from this survey: the orelse-UNWRAP compound-handle carry (its own entry above), the
+funcptr-bound-to-local spawn arg, and the lower-severity items in "Other documented-not-fixed".
+
 **#1 — an OPTIONAL wrapper defeats the spawn carrier gate (CRITICAL accept-unsafe).**
 Found independently by all three branches. **This is a hole in the 2026-08-03 carrier fix
 (`0e71b613`)**: `type_carries_handle` / `type_carries_nonshared_pointer` were added, but the

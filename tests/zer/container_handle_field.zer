@@ -1,0 +1,13 @@
+// Regression: subst_typenode now recurses into Handle(T).elem so a container
+// field Handle(T) monomorphizes (Handle is a u64). Before the fix this failed
+// at the checker with "undefined type 'T'". limitations #9, 2026-08-07.
+struct Task { u32 id; }
+container W(T) { Handle(T) h; u32 count; }
+void bump(*W(Task) w) { w.count += 1; }
+u32 main() {
+    W(Task) w;
+    bump(&w);
+    bump(&w);
+    if (w.count != 2) { return 1; }
+    return 0;
+}

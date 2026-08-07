@@ -1,0 +1,24 @@
+// Regression: bit-slice compound assign applied the operator to the current
+// field (limitations #5), and a runtime position >= width no longer emits a
+// C UB shift, becoming a no-op (limitations #4). 2026-08-07.
+u32 main() {
+    u32 r = 0;
+    r[7..0] = 20;
+    r[7..0] += 3;                 if (r != 23)        { return 1; }
+    r[15..8] = 5;
+    r[15..8] *= 4;                if ((r >> 8) != 20) { return 2; }
+    r = 0; r[7..0] = 20;
+    r[7..0] -= 5;                 if (r != 15)        { return 3; }
+    r[7..0] |= 0x80;              if (r != 143)       { return 4; }
+    r[7..0] &= 0x0F;              if (r != 15)        { return 5; }
+    r[7..0] ^= 0xFF;              if (r != 240)       { return 6; }
+    r = 0; r[3..0] = 3;
+    r[3..0] <<= 2;                if (r != 12)        { return 7; }
+    r[3..0] >>= 1;               if (r != 6)         { return 8; }
+    r = 100; r[7..0] /= 4;       if (r != 25)        { return 9; }
+    r[7..0] %= 7;                if (r != 4)         { return 10; }
+    // #4: runtime position >= 32 on a u32 must be a no-op, not C UB.
+    u32 reg = 5; u32 lo = 70; u32 hi = 71;
+    reg[hi..lo] = 1;             if (reg != 5)       { return 11; }
+    return 0;
+}

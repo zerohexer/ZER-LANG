@@ -2419,6 +2419,16 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->container.type_arg = subst_typenode(a, tn->container.type_arg, param_name, param_len, replacement);
         return r;
     }
+    case TYNODE_HANDLE: {
+        /* Handle(T) monomorphizes cleanly — a Handle is a u64 regardless of T,
+         * so `container W(T) { Handle(T) h; }` substitutes fine (limitations #9,
+         * 2026-08-06). Pool/Ring/Slab/Barrier/Semaphore stay leaf (rejected by
+         * the checker) — their monomorphized struct emission is not wired yet. */
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
+        return r;
+    }
     /* Stage 2 Part B (2026-04-28): exhaustive — primitives and other
      * leaf TypeNode kinds need no substitution (they have no inner type
      * param). NAMED is handled at the top via leaf check. */
@@ -2427,7 +2437,7 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
     case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_HANDLE: case TYNODE_BARRIER:
+    case TYNODE_ARENA: case TYNODE_BARRIER:
     case TYNODE_SLAB: case TYNODE_SEMAPHORE:
         return tn;
     }
@@ -2452,6 +2462,21 @@ static bool parse_intn_width(const char *name, uint32_t len,
     *out_bits = bits;
     *out_signed = (name[0] == 'i');
     return true;
+}
+
+/* Is this intrinsic name a MEMORY FENCE (not a rendezvous primitive)?
+ * Single source of truth for the fence set so the has_sync scan (Model 3) and
+ * the intrinsic type resolution stay in lockstep. EXACT-length matching on
+ * purpose: @barrier_init / @barrier_wait are Barrier RENDEZVOUS primitives,
+ * NOT fences, and a prefix match would wrongly fold them in (see limitations
+ * #7, 2026-08-06). Fences give ordering, so a spawn body using one is doing
+ * manual synchronization → race warning, not a hard error. */
+static bool intrinsic_name_is_fence(const char *n, uint32_t nl) {
+    return (nl == 7  && memcmp(n, "barrier", 7) == 0) ||
+           (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
+           (nl == 12 && memcmp(n, "barrier_load", 12) == 0) ||
+           (nl == 15 && memcmp(n, "barrier_acq_rel", 15) == 0) ||
+           (nl == 11 && memcmp(n, "barrier_dma", 11) == 0);
 }
 
 static Type *resolve_type(Checker *c, TypeNode *tn) {
@@ -8802,11 +8827,7 @@ static Type *check_expr(Checker *c, Node *node) {
             /* cross-platform warning: if @ptrtoint result is used in a context
              * that narrows to a fixed-width type, warn about portability.
              * Checked at NODE_VAR_DECL init below — flag the node here. */
-        } else if ((nlen == 7 && memcmp(name, "barrier", 7) == 0) ||
-                   (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||
-                   (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) ||
-                   (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) ||
-                   (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0)) {
+        } else if (intrinsic_name_is_fence(name, nlen)) {
             /* D-Alpha-2/7: fences. barrier_dma is DMA-coherence barrier for driver code. */
             result = ty_void;
         } else if ((nlen == 9 && memcmp(name, "cpu_pause", 9) == 0) ||
@@ -10176,9 +10197,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         const char *n = node->intrinsic.name;
         uint32_t nl = (uint32_t)node->intrinsic.name_len;
         if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
+            intrinsic_name_is_fence(n, nl))
             parent_sym->props.has_sync = true;
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             scan_func_props(c, node->intrinsic.args[i], parent_sym);
@@ -10448,9 +10467,7 @@ static bool has_atomic_or_barrier(Node *node) {
         const char *n = node->intrinsic.name;
         uint32_t nl = (uint32_t)node->intrinsic.name_len;
         if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
+            intrinsic_name_is_fence(n, nl))
             return true;
     }
     switch (node->kind) {

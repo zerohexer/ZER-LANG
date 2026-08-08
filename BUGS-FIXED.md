@@ -5,6 +5,38 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-08 — ledger reconciliation + the returned-funcptr spawn race
+
+**Ledger drift (7 stale entries, `d0f266af`).** `docs/limitations.md` listed as OPEN a set of
+holes that were already closed. Same false-confidence failure this repo documents for GATES
+("a stale matrix is worse than none"), one level up: a fresh session would have re-chased four
+CRITICAL/HIGH items and believed a closed concurrency hole was open. Every correction was a
+MEASUREMENT on main, not bookkeeping. Measured CLOSED: `rdh99l` free-of-a-field-of-a-by-value-
+struct-param (plus 2-hop / free-then-use / nested-field siblings, with four over-rejection
+controls still compiling), `i0txin` block-scoped defer-free UAF, `3o10j6` goto-defer double-fire
+(both variants), `02nq43` spawn-via-funcptr-FIELD. G3 downgraded to UNCERTAIN — did not reproduce
+in five shapes; the one accepted case had both sides atomic, which is correct acceptance.
+
+**Three of those reproducers were MASKED by stronger unrelated rules**, the `02nq43` one twice
+(non-shared-pointer-to-spawn, then non-shared-global-access — the carrier has to be a `shared
+struct` for the funcptr-field rule to be the one under test). A masked probe reads as "fixed"
+exactly like a real fix does. Each routing-around is now recorded in the entry.
+
+**BUG-767 — spawn target reaches a non-shared global through a RETURNED funcptr.** Third form of
+one question:
+
+    spawn w(bump)                     direct name       rejected
+    Ops o; o.cb = bump; spawn w(o)    struct FIELD      rejected (5ed17c2f)
+    *() fp = bump; spawn w(fp)        LOCAL binding     rejected (00dc785a)
+    *() fp = get_fp(); fp();          FACTORY return    ACCEPTED  <- this
+
+`scan_funcname_binding` required a `NODE_IDENT`; a factory call is a `NODE_CALL`, so it bailed and
+the callback was never scanned. New `scan_returned_funcname` resolves the callee's
+`return <global function name>` sites and scans each returned body. Flagging on ANY returned name
+is sound: if a racing function CAN be returned, the race is reachable. A computed or param return
+resolves to nothing, so no new rejection. Negative verified ACCEPTED pre-fix; four over-rejection
+controls (no-op, threadlocal, `@atomic_*`, factory outside `spawn`) pinned in a positive.
+
 ## Session 2026-08-06i — funcptr bound to a LOCAL, passed as a spawn arg (data race)
 
 From branch `icejal` (finding E), documented-not-fixed there. **Third form of the same

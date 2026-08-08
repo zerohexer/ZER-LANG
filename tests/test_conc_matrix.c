@@ -340,6 +340,102 @@ static const char *sink_name(CASink s) {
     return "?";
 }
 
+/* ================================================================
+ * FUNCPTR-REACH GRID (2026-08-08)
+ *
+ * ONE question — "does the callback this spawn target invokes touch a
+ * non-shared global?" — answered independently at SIX syntactic REACH forms.
+ * It was patched FOUR TIMES, one form per session, each time with the other
+ * forms unexamined:
+ *
+ *   direct name      `*() fp = bump; fp();`             long-rejected
+ *   struct FIELD     `o.cb = bump; o.cb();`             5ed17c2f
+ *   LOCAL arg        `*() fp = bump; spawn w(fp);`      00dc785a
+ *   factory 1-hop    `*() fp = get_fp(); fp();`         2026-08-08
+ *   factory 2-hop    `get_a(){ return get_b(); }`       2026-08-08 (found BY
+ *                                                       enumerating for this
+ *                                                       grid, not reported)
+ *
+ * That last one is the argument for the grid existing: four sequential fixes
+ * had not exhausted the class, and the fifth hole surfaced only when the forms
+ * were written down as an axis. Crossing REACH with PAYLOAD also pins the
+ * over-rejection boundary — the scan reaches MORE callbacks now, so a callback
+ * that is genuinely safe (threadlocal / @atomic_* / touches nothing) must keep
+ * compiling.
+ *
+ * A new reach form with no cell here is INVISIBLE. Add the cell in the same
+ * commit as the form. */
+typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
+               RCH_FACTORY1, RCH_FACTORY2, RCH_COUNT } CAReach;
+typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
+
+static const char *reach_name(CAReach r) {
+    switch (r) {
+    case RCH_DIRECT:   return "direct-name";
+    case RCH_REASSIGN: return "reassigned-local";
+    case RCH_FIELD:    return "struct-field";
+    case RCH_ARRAY:    return "array-element";
+    case RCH_FACTORY1: return "factory-1hop";
+    case RCH_FACTORY2: return "factory-2hop";
+    case RCH_COUNT:    break;
+    }
+    return "?";
+}
+static const char *rpay_name(CARPay p) {
+    switch (p) {
+    case RPAY_RACY:   return "racy-global";
+    case RPAY_TLS:    return "threadlocal";
+    case RPAY_ATOMIC: return "atomic";
+    case RPAY_NONE:   return "touches-nothing";
+    case RPAY_COUNT:  break;
+    }
+    return "?";
+}
+
+/* Only the racy payload must be REJECTED; the other three pin over-rejection. */
+static int reach_is_negative(CARPay p) { return p == RPAY_RACY; }
+
+static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
+    /* the callback body, per payload */
+    const char *decls, *body;
+    switch (p) {
+    case RPAY_RACY:   decls = "u32 g;";            body = "g += 1;"; break;
+    case RPAY_TLS:    decls = "threadlocal u32 g;";body = "g += 1;"; break;
+    case RPAY_ATOMIC: decls = "u32 g;";            body = "u32 o = @atomic_add(&g, 1);"; break;
+    case RPAY_NONE:   decls = "u32 g;";            body = "u32 z = 0; z += 1;"; break;
+    default:          decls = "u32 g;";            body = "g += 1;"; break;
+    }
+    /* how `worker` reaches the callback */
+    const char *extra = "", *wbody = "";
+    switch (r) {
+    case RCH_DIRECT:
+        wbody = "*() fp = cb; fp();"; break;
+    case RCH_REASSIGN:
+        extra = "void other() { }\n";
+        wbody = "*() fp = other; fp = cb; fp();"; break;
+    case RCH_FIELD:
+        extra = "struct Ops { *() h; }\n";
+        wbody = "Ops o; o.h = cb; o.h();"; break;
+    case RCH_ARRAY:
+        extra = "typedef *() Cb;\n";
+        wbody = "Cb[2] t; t[0] = cb; t[0]();"; break;
+    case RCH_FACTORY1:
+        extra = "*() mk() { return cb; }\n";
+        wbody = "*() fp = mk(); fp();"; break;
+    case RCH_FACTORY2:
+        extra = "*() mk2() { return cb; }\n*() mk() { return mk2(); }\n";
+        wbody = "*() fp = mk(); fp();"; break;
+    default: break;
+    }
+    snprintf(out, n,
+        "%s\n"
+        "void cb() { %s }\n"
+        "%s"
+        "void worker() { %s }\n"
+        "u32 main() { spawn worker(); return 0; }\n",
+        decls, body, extra, wbody);
+}
+
 /* `?[*]T` and `?Handle` are spellable; a nested optional is not, and the
  * optional carrier over a slice adds no distinct dispatch path. */
 static int carrier_cell_valid(CACarrier c, CAPayload p) {
@@ -473,6 +569,24 @@ int main(void) {
                         ok ? "ok" : "*** FAIL ***");
                 if (!ok) grid_ok = 0;
             }
+        }
+    }
+
+    /* ---- funcptr REACH x payload grid ---- */
+    fprintf(stderr, "\n  -- funcptr-reach grid (how the spawn target reaches its callback) --\n");
+    char rbuf[2048];
+    for (CAReach r = 0; r < RCH_COUNT; r++) {
+        for (CARPay p = 0; p < RPAY_COUNT; p++) {
+            valid_cells++;
+            int neg = reach_is_negative(p);
+            char nm[192];
+            snprintf(nm, sizeof(nm), "reach/%s/%s", reach_name(r), rpay_name(p));
+            gen_reach(r, p, rbuf, sizeof(rbuf));
+            int ok = neg ? run_neg(nm, rbuf) : run_pos(nm, rbuf);
+            fprintf(stderr, "  [%-16s][%-15s][%-3s] %s\n",
+                    reach_name(r), rpay_name(p), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
         }
     }
 

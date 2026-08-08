@@ -1,0 +1,27 @@
+// The over-rejection boundary for the returned-funcptr race scan. The fix
+// scans MORE callbacks, so these three must keep compiling: a factory whose
+// returned function touches nothing, one touching only threadlocal, and one
+// synchronising with @atomic_*. Fourth case: a factory used outside spawn.
+threadlocal u32 tl;
+u32 shared_ctr;
+
+void noop() { }
+void bump_tl() { tl += 1; }
+void bump_atomic() { u32 old = @atomic_add(&shared_ctr, 1); }
+
+*() get_noop() { return noop; }
+*() get_tl() { return bump_tl; }
+*() get_atomic() { return bump_atomic; }
+
+void w_noop()   { *() fp = get_noop();   fp(); }
+void w_tl()     { *() fp = get_tl();     fp(); }
+void w_atomic() { *() fp = get_atomic(); fp(); }
+
+u32 main() {
+    spawn w_noop();
+    spawn w_tl();
+    spawn w_atomic();
+    *() direct = get_tl();
+    direct();
+    return 0;
+}

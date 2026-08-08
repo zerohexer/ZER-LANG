@@ -1,0 +1,28 @@
+void printf(const *u8 s, ...);
+
+struct Task { 
+    u32 task_id; 
+    [*]u8 name; 
+    u32 priority; 
+    ?*Task next; 
+}
+
+struct TaskQueue { 
+    u32 num_lanes; 
+    [*]Task lanes; 
+}
+
+  u32 main() {
+      *TaskQueue q = alloc(TaskQueue) orelse return;          // ONE TaskQueue (was malloc(sizeof))
+      q.num_lanes = 4;
+      q.lanes = alloc(Task, q.num_lanes) orelse { free(q); return 1; };  // the [*]Task array
+      u32 i = 0;
+      while (i < q.num_lanes) {
+          q.lanes[i].task_id = i;
+          i += 1;
+      }
+      printf("queue has %d lanes\n", q.num_lanes);
+      free(q.lanes);
+      free(q);
+      return 0;
+  }

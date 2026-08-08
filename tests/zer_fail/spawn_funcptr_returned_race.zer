@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: spawn target 'worker' accesses non-shared global
+// A funcptr obtained from a FACTORY CALL. Third form of one question: the
+// direct name and the local `= func_name` binding were already rejected; a
+// factory return resolved to nothing, so the callback was never scanned.
+u32 g_ctr;
+
+void touch() { g_ctr += 1; }
+
+*() get_fp() { return touch; }
+
+void worker() {
+    *() fp = get_fp();
+    fp();
+}
+
+u32 main() {
+    spawn worker();
+    return 0;
+}

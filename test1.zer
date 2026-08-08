@@ -1,0 +1,7 @@
+void printf(const *u8 s, ...);
+
+u32 main(){
+	
+	printf("Hello");
+        return 0;
+}

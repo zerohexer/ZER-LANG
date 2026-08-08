@@ -10556,8 +10556,73 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
  * non-shared global accesses raced clean. Mirrors the BH-18 #8
  * function-name-as-arg descent; conservative (a bound-but-never-called funcptr
  * is scanned too — sound, and the remediation is identical). */
+/* Collect bare `return <global function name>` sites in a body. PARTIAL walk by
+ * design (if-chain, not a no-default switch): an unlisted kind yields nothing,
+ * which means we do not flag — today's behaviour, never a new rejection. */
+static bool scan_funcname_binding(Checker *c, Node *n,
+                                  const char **out_name, uint32_t *out_len);
+
+static bool scan_returned_funcname(Checker *c, Node *n, int depth,
+                                   const char **out_name, uint32_t *out_len) {
+    if (!n || depth > 8) return false;
+    if (n->kind == NODE_RETURN) {
+        Node *v = n->ret.expr;
+        /* A factory that returns ANOTHER factory's result (`return get_b();`).
+         * Recurse through the same binding resolver; _scan_global_depth bounds it. */
+        if (v && v->kind == NODE_CALL)
+            return scan_funcname_binding(c, v, out_name, out_len);
+        if (!v || v->kind != NODE_IDENT) return false;
+        Symbol *fs = scope_lookup(c->global_scope, v->ident.name,
+                                  (uint32_t)v->ident.name_len);
+        if (!fs || !fs->is_function || !fs->func_node ||
+            fs->func_node->kind != NODE_FUNC_DECL ||
+            !fs->func_node->func_decl.body) return false;
+        if (_scan_global_depth >= 32) return false;
+        _scan_global_depth++;
+        bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
+                                               out_name, out_len);
+        _scan_global_depth--;
+        return found;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (scan_returned_funcname(c, n->block.stmts[i], depth, out_name, out_len))
+                return true;
+        return false;
+    }
+    if (n->kind == NODE_IF) {
+        if (scan_returned_funcname(c, n->if_stmt.then_body, depth + 1, out_name, out_len))
+            return true;
+        return scan_returned_funcname(c, n->if_stmt.else_body, depth + 1, out_name, out_len);
+    }
+    if (n->kind == NODE_WHILE)
+        return scan_returned_funcname(c, n->while_stmt.body, depth + 1, out_name, out_len);
+    if (n->kind == NODE_FOR)
+        return scan_returned_funcname(c, n->for_stmt.body, depth + 1, out_name, out_len);
+    return false;
+}
+
 static bool scan_funcname_binding(Checker *c, Node *n,
                                   const char **out_name, uint32_t *out_len) {
+    /* A funcptr obtained from a FACTORY CALL (`*() fp = get_fp(); fp();`).
+     * Sibling of the direct-name and local-binding forms; the returned function
+     * is resolved through the callee's `return <name>` sites. Flagging on ANY
+     * returned name is the sound direction: if a racing function CAN be
+     * returned, the race is reachable. */
+    if (n && n->kind == NODE_CALL && n->call.callee &&
+        n->call.callee->kind == NODE_IDENT) {
+        Symbol *gs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+                                  (uint32_t)n->call.callee->ident.name_len);
+        if (gs && gs->is_function && gs->func_node &&
+            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body &&
+            _scan_global_depth < 32) {
+            _scan_global_depth++;
+            bool f = scan_returned_funcname(c, gs->func_node->func_decl.body, 0,
+                                            out_name, out_len);
+            _scan_global_depth--;
+            if (f) return true;
+        }
+    }
     if (!n || n->kind != NODE_IDENT) return false;
     Symbol *fs = scope_lookup(c->global_scope, n->ident.name,
                               (uint32_t)n->ident.name_len);

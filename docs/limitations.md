@@ -721,7 +721,24 @@ reached through a funcptr the sink doesn't match" shape as the closed SPAWN-FP /
 one sink further out. **Sibling of §D8** (which closes the funcptr-ARG facet) — take §D8 first, then decide
 whether the FIELD facet warrants the same treatment.
 
-### HIGH spawn target reaches a non-shared global through a RETURNED funcptr (`rvek5f` `00f3c2af` HOLE-D, 2026-07-31) — **LOCAL half FIXED `00dc785a` 2026-08-06; the RETURNED half is STILL OPEN**
+### ~~HIGH spawn target reaches a non-shared global through a RETURNED funcptr~~ (`rvek5f` `00f3c2af` HOLE-D) — **FIXED 2026-08-08** (LOCAL half was `00dc785a`)
+Third and last form of one question. `scan_funcname_binding` required a `NODE_IDENT`, so a funcptr
+obtained from a FACTORY CALL (`*() fp = get_fp(); fp();`) resolved to nothing and the callback was
+never scanned. New `scan_returned_funcname` walks the callee's `return <global function name>` sites
+and scans each returned body through the existing global-access scan. Flagging on ANY returned name
+is the sound direction — if a racing function CAN be returned, the race is reachable. Depth-guarded
+by the shared `_scan_global_depth`; a computed or param return resolves to nothing (no new rejection).
+Tests: `tests/zer_fail/spawn_funcptr_returned_race.zer` (verified ACCEPTED pre-fix) +
+`tests/zer/spawn_funcptr_returned_safe_ok.zer` (four over-rejection controls: no-op, threadlocal,
+`@atomic_*`, and a factory used outside `spawn`).
+
+**A FIFTH form was found by enumerating for the gate, not by any report:** a factory returning
+ANOTHER factory's result (`get_a(){ return get_b(); }`) — the return expr is a `NODE_CALL`, so the
+new resolver bailed exactly as the old one had. Closed by recursing through `scan_funcname_binding`
+(bounded by `_scan_global_depth`; a self-recursive factory terminates). Four sequential fixes had
+not exhausted this class. The whole REACH axis is now gated by the funcptr-reach grid in
+`tests/test_conc_matrix.c` (6 reach forms x 4 payloads, verified firing: 65/67 with 2 false
+negatives pre-fix, 67/67 after).
 ```zer
 *() get_fp() { return touch; }
 void worker() { *() fp = get_fp(); fp(); } // indirect call — scanner gives up

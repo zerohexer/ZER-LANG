@@ -1,0 +1,33 @@
+// The Handle(T) substitution must reach every position T can occupy — the leaf
+// grouping hid it from all of them at once, so covering only the bare field
+// would leave the others to fail separately later.
+struct P { u32 x; }
+Pool(P, 4) pl;
+
+container Bare(T)   { Handle(T) v; }
+container Opt(T)    { ?Handle(T) v; }
+container Arr(T)    { Handle(T)[4] v; }
+container Inner(T)  { Handle(T) h; }
+container Outer(T)  { Inner(T) i; u32 n; }   // nested container
+
+u32 main() {
+    Bare(P) b;
+    Opt(P)  o;  o.v = null;
+    Arr(P)  a;
+    Outer(P) ou; ou.n = 3;
+
+    Handle(P) h = pl.alloc() orelse { return 1; };
+    h.x = 5;
+
+    b.v = h;
+    a.v[0] = h;
+    ou.i.h = h;
+
+    if (b.v.x != 5)    { return 2; }
+    if (a.v[0].x != 5) { return 3; }
+    if (ou.i.h.x != 5) { return 4; }
+    if (ou.n != 3)     { return 5; }
+
+    pl.free(h);
+    return 0;
+}

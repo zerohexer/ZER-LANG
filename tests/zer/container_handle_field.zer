@@ -1,0 +1,40 @@
+// `container W(T) { Handle(T) h; }` must substitute T inside the Handle.
+//
+// TYNODE_HANDLE was grouped with the LEAF TypeNode kinds in subst_typenode and
+// returned unsubstituted, so the template failed with "undefined type 'T'" —
+// even though every other T-carrying field form (T, *T, ?T, T[N], [*]T) already
+// substituted correctly.
+//
+// Handle(T) monomorphizes cleanly BECAUSE a Handle is a u64 (index + generation):
+// the stamped struct needs no per-T layout. Pool/Ring/Slab fields are a separate
+// matter — the emitter cannot stamp their inline storage — and stay rejected.
+//
+// This test is FUNCTIONAL, not just a compile check: it allocates, reads and
+// writes through the container field, and confirms the write is visible via the
+// original handle.
+struct Task { u32 id; u32 pri; }
+Pool(Task, 4) pool;
+
+container Slot(T) { Handle(T) h; bool used; }
+
+u32 main() {
+    Slot(Task) s;
+    s.used = false;
+
+    Handle(Task) h = pool.alloc() orelse { return 1; };
+    h.id = 7;
+    h.pri = 3;
+
+    s.h = h;
+    s.used = true;
+
+    if (s.h.id != 7)  { return 2; }     // read through the field
+    if (s.h.pri != 3) { return 3; }
+
+    s.h.id = 9;                          // write through the field
+    if (h.id != 9)    { return 4; }      // visible via the original handle
+
+    pool.free(h);
+    if (!s.used)      { return 5; }
+    return 0;
+}

@@ -5,6 +5,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06g — `container W(T) { Handle(T) h; }` failed with "undefined type 'T'"
+
+From audit branch `8j6w19`. Survey item #9 — the last of the nine.
+
+`TYNODE_HANDLE` was grouped with the LEAF TypeNode kinds in `subst_typenode` and returned
+unsubstituted, even though it carries `struct { TypeNode *elem; } handle;`. Every other
+T-carrying field form (`T`, `*T`, `?T`, `T[N]`, `[*]T`) already substituted correctly — I
+measured all six before touching anything, which is what made the single odd one out obvious.
+
+`Handle(T)` monomorphizes cleanly BECAUSE a Handle is a `u64` (index + generation): the
+stamped struct needs no per-T layout.
+
+**Checked that enabling the feature did not open a blind spot.** A use-after-free THROUGH the
+container field is still caught (`tests/zer_fail/container_handle_field_uaf.zer`). Worth doing
+explicitly — a substitution fix silently widens what the rest of the analysis has to cover.
+
+**A claim from the branch I corrected.** It described Pool/Slab/Ring container fields as
+"rejected at the checker on purpose". They ARE correctly rejected — the emitter cannot stamp
+their inline storage — but not by a deliberate check: they fail with the SAME
+"undefined type 'T'" message, from the same missing substitution. So the rejection is right
+and the diagnostic blames the wrong thing. Recorded as its own LOW entry with the fix sketch,
+and the reason NOT to simply add substitution is now a comment at the case itself.
+
+Tests: `tests/zer/container_handle_field.zer` (FUNCTIONAL — allocates, reads and writes
+through the field, and confirms the write is visible via the original handle),
+`container_handle_shapes.zer` (bare / `?Handle` / `Handle[N]` / nested container — the leaf
+grouping hid the substitution from every position at once, so covering only the bare field
+would have left the others to fail separately later), and the negative above. All verified
+discriminating.
+
+`docs/reference.md` now lists `Handle(T)` among the supported substitution positions and
+states the Pool/Slab/Ring restriction with the workaround. Every documented claim was verified
+against the compiler before writing it.
+
 ## Session 2026-08-06f — two bit-slice miscompiles (survey #4 and #5)
 
 Both silent wrong answers on bare metal, in the feature bit-slices exist for.

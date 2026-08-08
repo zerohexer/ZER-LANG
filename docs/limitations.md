@@ -390,6 +390,31 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — `Pool`/`Slab`/`Ring` as a container FIELD reports "undefined type 'T'" (LOW, message quality)
+
+**Symptom.** `container C(T) { Pool(T,4) v; }` is rejected with `error: undefined type 'T'`.
+
+**Status — the rejection is CORRECT, the message is not.** The emitter cannot stamp their
+inline storage for a monomorphized container, so accepting them would produce a broken
+emission rather than a working feature. But they are rejected because `subst_typenode` leaves
+them unsubstituted, not by a deliberate check — so the diagnostic blames the type parameter
+instead of naming the real restriction.
+
+`Handle(T)` was in the same leaf group and was FIXED 2026-08-06: a Handle is a `u64`
+(index + generation), so the stamped struct needs no per-T layout. That is exactly the
+property Pool/Slab/Ring lack.
+
+**Fix sketch.** Either add the emitter support, or add an explicit check in the container-field
+validator that names the restriction ("Pool/Slab/Ring cannot be a container field — declare the
+allocator as a global and store `Handle(T)`"). The second is a few lines and is what a user
+actually needs. Do NOT simply add substitution in `subst_typenode` — the comment there records
+why, and doing so would swap a clear type error for a broken emission.
+
+**Documented for users** in `docs/reference.md` (container section), so the restriction is at
+least discoverable while the message is poor.
+
+---
+
 ## OPEN — an orelse-UNWRAP does not carry the optional's compound handles (MEDIUM, soundness/UAF)
 
 **Symptom.** Surfaced while closing the 2026-08-06 optional-carrier hole. The struct COPY

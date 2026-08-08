@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// Enabling Handle(T) as a container field must not create a tracking blind
+// spot: a use-after-free THROUGH the container field is still caught.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+container Slot(T) { Handle(T) h; }
+
+u32 main() {
+    Slot(Task) s;
+    Handle(Task) h = pool.alloc() orelse { return 1; };
+    s.h = h;
+    pool.free(h);
+    return s.h.id;
+}

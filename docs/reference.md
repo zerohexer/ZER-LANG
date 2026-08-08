@@ -2554,7 +2554,14 @@ void stack_push(*Stack(u32) s, u32 val) {
 ```
 
 **NOTES**
-- T substitution works in: T, *T, ?T, []T, T[N] field types.
+- T substitution works in: `T`, `*T`, `?T`, `[*]T`, `T[N]`, and `Handle(T)` field types
+  (including nested — `?Handle(T)`, `Handle(T)[N]`, and a container field holding
+  another container over the same T).
+- `Pool(T, N)`, `Slab(T)` and `Ring(T, N)` are NOT supported as container fields —
+  the compiler cannot stamp their inline storage for a monomorphized container.
+  `Handle(T)` works because a Handle is a `u64` (index + generation), so the
+  stamped struct needs no per-T layout. Declare the allocator as a global and
+  store `Handle(T)` in the container instead.
 - Instances cached — same `Stack(u32)` reuses cached stamp.
 - NOT generics — no type constraints, no SFINAE.
 - Type ARGUMENT must be a plain named type (primitive or struct/enum/union).

@@ -2422,12 +2422,34 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
     /* Stage 2 Part B (2026-04-28): exhaustive — primitives and other
      * leaf TypeNode kinds need no substitution (they have no inner type
      * param). NAMED is handled at the top via leaf check. */
+    case TYNODE_HANDLE: {
+        /* 2026-08-06: Handle(T) was grouped with the leaf kinds and returned
+         * unsubstituted, so `container W(T) { Handle(T) h; }` failed with
+         * "undefined type 'T'" — every other T-carrying field form (T, *T, ?T,
+         * T[N], [*]T) already substituted correctly.
+         *
+         * Handle(T) monomorphizes cleanly BECAUSE a Handle is a u64 (index+gen);
+         * the stamped struct needs no per-T layout, unlike Pool/Ring/Slab whose
+         * inline storage the emitter cannot yet stamp — see the case below. */
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
+        return r;
+    }
+    /* Pool/Ring/Slab DO carry an inner type (`.pool.elem` etc.) and are left
+     * unsubstituted DELIBERATELY: the emitter cannot stamp their inline storage
+     * for a monomorphized container, so substituting here would replace a clear
+     * type error with a broken emission. They therefore still report
+     * "undefined type 'T'" — accurate as far as it goes, though a dedicated
+     * "not supported as a container field" message would be kinder. Tracked in
+     * docs/limitations.md; do NOT add substitution here without the emitter
+     * work. Arena/Barrier/Semaphore carry no element type at all. */
     case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
     case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
     case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_HANDLE: case TYNODE_BARRIER:
+    case TYNODE_ARENA: case TYNODE_BARRIER:
     case TYNODE_SLAB: case TYNODE_SEMAPHORE:
         return tn;
     }

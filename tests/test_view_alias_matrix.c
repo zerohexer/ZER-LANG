@@ -113,6 +113,7 @@ typedef enum {
     VF_CALL2,         /* outer(s) -> inner(s) -> &s[0]           */
     VF_RET_STRUCT,    /* mk(s) returns a struct whose FIELD views */
     VF_FIELD_OF_PARAM,/* get(h) returns a FIELD of a by-value param */
+    VF_OPT_UNWRAP,    /* ?K a = kk; K u = a orelse {..}; u.p  — via an optional */
     VF_COUNT
 } ViewForm;
 
@@ -127,6 +128,7 @@ static const char *vf_name(ViewForm f) {
     case VF_CALL2:          return "call-2hop";
     case VF_RET_STRUCT:     return "ret-struct-field";
     case VF_FIELD_OF_PARAM: return "field-of-param";
+    case VF_OPT_UNWRAP:     return "optional-unwrap";
     case VF_COUNT: break;
     }
     return "?";
@@ -177,6 +179,18 @@ static void gen_neg(ViewForm f, ViewCarrier c, char *out, size_t n) {
         decls = "struct K{ *B p; }\n*B get(K k){ return k.p; }\n";
         snprintf(mk, sizeof(mk), "K kk; kk.p = &s[0]; *B vw = get(kk);");
         break;
+    case VF_OPT_UNWRAP:
+        /* The view reaches the local through an OPTIONAL and its orelse UNWRAP.
+         * Added 2026-08-06 as the eighth form: the unwrap lowers to
+         * `_zer_or = a` — an IR_ASSIGN whose expr is a bare NODE_IDENT, matching
+         * neither the NODE_ASSIGN arm nor a NODE_ORELSE test — so the optional's
+         * carried compound handles stopped at the temp. The if-capture form
+         * (`if (a) |u|`) copies straight from `a` and was already correct, which
+         * is what localised it. */
+        decls = "struct K{ *B p; }\n";
+        snprintf(mk, sizeof(mk),
+                 "K kk; kk.p = &s[0]; ?K oa = kk; K u = oa orelse { return 3; }; *B vw = u.p;");
+        break;
     case VF_COUNT: break;
     }
 
@@ -224,6 +238,9 @@ static void gen_pos_before_free(ViewForm f, char *out, size_t n) {
                       snprintf(mk, sizeof(mk), "K kk = mk(s); *B vw = kk.p;"); break;
     case VF_FIELD_OF_PARAM: decls = "struct K{ *B p; }\n*B get(K k){ return k.p; }\n";
                       snprintf(mk, sizeof(mk), "K kk; kk.p = &s[0]; *B vw = get(kk);"); break;
+    case VF_OPT_UNWRAP: decls = "struct K{ *B p; }\n";
+                      snprintf(mk, sizeof(mk),
+                               "K kk; kk.p = &s[0]; ?K oa = kk; K u = oa orelse { return 3; }; *B vw = u.p;"); break;
     case VF_COUNT: break;
     }
     snprintf(out, n,

@@ -5,6 +5,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06h — the orelse-UNWRAP dropped the optional's carried handles (last view form)
+
+The residual recorded when the optional-carrier hole was closed. Eighth and final member of
+the view-alias family.
+
+```zer
+?B a = bv;                    // (a, ".q") registered, aliased to src
+free(src);
+B u = a orelse { return 2; };
+return u.q.v;                 // ACCEPTED
+```
+
+**How it was localised.** The `if (a) |u|` capture form was already CORRECT, which made the
+difference measurable rather than speculative. Tracing compound counts through the copy chain:
+
+```
+if-capture:  [COPY] %8 <- %7   src_compounds=1     <- copies straight from `a`
+orelse:      [COPY] %9 <- %10  src_compounds=0     <- the temp never got them
+             [COPY] %8 <- %9   src_compounds=0
+```
+
+`IR_COPY` already replicates compounds, so the chain worked end to end EXCEPT the first hop.
+
+**The actual shape, which two wrong guesses preceded.** I first assumed the instruction's expr
+was a `NODE_ORELSE`, then that it was a `NODE_ASSIGN`. A one-line trace showed
+`expr_kind=39` — a bare **NODE_IDENT** (`_zer_or = a`). It matched neither existing arm, which
+is exactly why it was silent. Widened to accept either shape.
+
+**Gate.** `VF_OPT_UNWRAP` added to `tests/test_view_alias_matrix.c` as the eighth FORM axis —
+24 cells now. Verified firing: 13/24 with 8 false negatives on a pre-fix build, 24/24 after.
+
+Controls confirmed: unwrap-then-use-before-free, a pure-value optional, and the null-fallback
+path all still compile; `test_modules/move_user` unaffected.
+
 ## Session 2026-08-06g — `container W(T) { Handle(T) h; }` failed with "undefined type 'T'"
 
 From audit branch `8j6w19`. Survey item #9 — the last of the nine.

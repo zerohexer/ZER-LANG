@@ -3514,6 +3514,60 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             }
         }
+        /* 2026-08-06: the ORELSE TEMP must carry the optional's compound handles.
+         *
+         *     ?B a = bv;                  // (a, ".q") registered, aliased to src
+         *     free(src);
+         *     B u = a orelse { ... };     // u.q.v — was ACCEPTED
+         *
+         * `a orelse ...` lowers to `_zer_or = a` (this instruction), then a COPY
+         * of the unwrapped payload into the capture local, then a COPY into `u`.
+         * IR_COPY already replicates compounds, so the chain works END TO END —
+         * except the FIRST hop, which is an IR_ASSIGN whose expr is the ORELSE
+         * node rather than a NODE_ASSIGN, so the arm below never saw it. Traced:
+         * the copies reported src_compounds=0 all the way down, while the
+         * if-capture form (`if (a) |u|`, which copies straight from `a`) reported
+         * 1 and was already correct.
+         *
+         * Replicate from the tried expression's root so the rest of the existing
+         * chain does the work. */
+        if (inst->dest_local >= 0 && inst->expr) {
+            /* The orelse TEMP assignment lowers to an IR_ASSIGN whose expr is the
+             * tried expression itself — measured: a bare NODE_IDENT (`_zer_or = a`),
+             * not a NODE_ORELSE and not a NODE_ASSIGN, which is why both existing
+             * arms skipped it. Accept either shape. */
+            Node *oe = inst->expr;
+            if (oe->kind == NODE_ORELSE) oe = oe->orelse.expr;
+            oe = ir_peel_cast_wrappers(oe);
+            if (oe && oe->kind == NODE_IDENT) {
+                int o_src = ir_find_local(func, oe->ident.name,
+                                          (uint32_t)oe->ident.name_len);
+                if (o_src >= 0 && o_src != inst->dest_local) {
+                    int ocap = ps->handle_count > 0 ? ps->handle_count : 1;
+                    int *oidx = (int *)malloc((size_t)ocap * sizeof(int));
+                    if (oidx) {
+                        int on = 0;
+                        for (int oi = 0; oi < ps->handle_count; oi++) {
+                            IRHandleInfo *oh = &ps->handles[oi];
+                            if (oh->local_id == o_src && oh->path_len > 0 &&
+                                oh->alloc_id != 0)
+                                oidx[on++] = oi;
+                        }
+                        for (int ok2 = 0; ok2 < on; ok2++) {
+                            IRAliasSnapshot osnap;
+                            ir_snapshot_alias(&osnap, &ps->handles[oidx[ok2]]);
+                            IRHandleState ost = ps->handles[oidx[ok2]].state;
+                            const char *opath = ps->handles[oidx[ok2]].path;
+                            uint32_t oplen = ps->handles[oidx[ok2]].path_len;
+                            IRHandleInfo *onh = ir_add_compound_handle(
+                                ps, inst->dest_local, opath, oplen);
+                            if (onh) { ir_apply_alias(onh, &osnap); onh->state = ost; }
+                        }
+                        free(oidx);
+                    }
+                }
+            }
+        }
         /* 2026-08-03: a plain pointer ALIAS created by ASSIGNMENT
          * (`b = src;`, `a = src;` where a is `?*T`) registered NO alias, so
          * `free(src); use(b)` was accepted with no compile-time rejection AND

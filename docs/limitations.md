@@ -555,8 +555,11 @@ once.
 
 ### Other documented-not-fixed items, verified
 
-- **funcptr bound to a LOCAL, passed as a spawn arg** (`icejal` E) — ACCEPTED; the callee
-  races a non-shared global. Sibling of the funcptr-struct-field hole fixed in `5ed17c2f`.
+- **funcptr bound to a LOCAL, passed as a spawn arg** (`icejal` E) — **FIXED 2026-08-06.**
+  The scan looked the arg up in GLOBAL scope and required `is_function`, so a local binding
+  fell through. The local's initializer is now resolved to the bound function, mirroring
+  `scan_frame`'s indirect-call resolution. Only a directly-bound `= func_name` resolves —
+  anything reassigned or computed stays unresolved, keeping this inside the per-file model.
 - **`icejal` D-scoped (`?carrier` defeats the SCOPED free-before-join transfer)** — did NOT
   reproduce; the transfer rule catches it correctly. Listed here so nobody re-chases it.
 - Not yet probed, lower severity: `&packed_field` forming a misaligned pointer (`2sjyjj`,

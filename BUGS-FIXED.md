@@ -5,6 +5,37 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-06i — funcptr bound to a LOCAL, passed as a spawn arg (data race)
+
+From branch `icejal` (finding E), documented-not-fixed there. **Third form of the same
+question, third place it was asked:**
+
+| form | status before |
+|---|---|
+| `spawn w(bump)` — direct function name | rejected |
+| `Ops o; o.cb = bump; spawn w(o)` — struct FIELD | rejected (`5ed17c2f`) |
+| `*() fp = bump; spawn w(fp)` — **local variable** | **ACCEPTED** |
+
+**Cause.** The spawn-arg funcptr scan looked the argument up in GLOBAL scope and required
+`is_function`, so a local funcptr variable never resolved and the callback was never scanned.
+
+**Fix.** Resolve the local's initializer to the bound function, mirroring how `scan_frame`
+already resolves an indirect call target for stack-depth analysis. Only a directly-bound
+`= func_name` resolves; anything reassigned or computed stays unresolved and is left to the
+other gates. That keeps this inside the per-file + summaries model rather than requiring the
+whole-program points-to analysis the architecture bans.
+
+The error reports the BOUND function's name (`bump`), not the local's, which is what a user
+needs to act on.
+
+Controls verified: a local funcptr to a function that touches nothing, one that touches only
+`threadlocal` storage, and one that touches a `shared struct` all still compile. Both
+already-fixed siblings unaffected.
+
+Test: `tests/zer_fail/spawn_funcptr_local_binding_race.zer` (verified to COMPILE on a pre-fix
+build) and `tests/zer/spawn_funcptr_local_safe_ok.zer` pinning the three safe shapes — the fix
+scans MORE callbacks, so the over-rejection boundary is the one that matters here.
+
 ## Session 2026-08-06h — the orelse-UNWRAP dropped the optional's carried handles (last view form)
 
 The residual recorded when the optional-carrier hole was closed. Eighth and final member of

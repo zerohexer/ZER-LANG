@@ -15182,6 +15182,39 @@ static void check_stmt(Checker *c, Node *node) {
             if (!an || an->kind != NODE_IDENT) continue;
             Symbol *asym = scope_lookup(c->global_scope, an->ident.name,
                                         (uint32_t)an->ident.name_len);
+            /* 2026-08-06: the arg may be a LOCAL funcptr VARIABLE rather than a
+             * bare function name — `*() fp = bump; spawn w(fp);`. The lookup
+             * above searches GLOBAL scope for a FUNCTION, so a local binding fell
+             * straight through and the callback was never scanned: `bump`
+             * racing a non-shared global compiled clean, while both the direct
+             * name form and the struct-FIELD form (fixed 5ed17c2f) were
+             * correctly rejected.
+             *
+             * Resolve the local's initializer to the function it was bound to,
+             * the same way scan_frame already resolves an indirect call target
+             * for stack-depth analysis. Only a directly-bound `= func_name`
+             * resolves; anything reassigned or computed stays unresolved and is
+             * left to the other gates — conservative, and it keeps this to the
+             * per-file model rather than points-to analysis. */
+            if (!asym || !asym->is_function) {
+                Symbol *lsym = scope_lookup(c->current_scope, an->ident.name,
+                                            (uint32_t)an->ident.name_len);
+                if (lsym && !lsym->is_function && lsym->type &&
+                    type_dispatch_kind(lsym->type) == TYPE_FUNC_PTR &&
+                    lsym->func_node &&
+                    (lsym->func_node->kind == NODE_VAR_DECL ||
+                     lsym->func_node->kind == NODE_GLOBAL_VAR) &&
+                    lsym->func_node->var_decl.init &&
+                    lsym->func_node->var_decl.init->kind == NODE_IDENT) {
+                    Node *bnd = lsym->func_node->var_decl.init;
+                    Symbol *bsym = scope_lookup(c->global_scope, bnd->ident.name,
+                                                (uint32_t)bnd->ident.name_len);
+                    if (bsym && bsym->is_function) {
+                        asym = bsym;
+                        an = bnd;   /* report the bound function's name */
+                    }
+                }
+            }
             if (!asym || !asym->is_function || !asym->func_node ||
                 asym->func_node->kind != NODE_FUNC_DECL ||
                 !asym->func_node->func_decl.body) continue;

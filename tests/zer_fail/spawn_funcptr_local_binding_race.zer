@@ -1,0 +1,26 @@
+// EXPECTED: compile error
+// expect-error: passed as a function-pointer
+// A funcptr bound to a LOCAL variable and handed to spawn: the callback races a
+// non-shared global, and the callback was never scanned.
+//
+// The spawn-arg funcptr scan looked the argument up in GLOBAL scope and required
+// is_function, so a local binding fell straight through — while both the direct
+// name form (`spawn w(bump)`) and the struct-FIELD form (fixed 5ed17c2f) were
+// correctly rejected. Third form of the same question, third place it was asked.
+//
+// The local's initializer is now resolved to the bound function, mirroring how
+// scan_frame already resolves an indirect call target for stack-depth analysis.
+// Only a directly-bound `= func_name` resolves; anything reassigned or computed
+// stays unresolved, which keeps this inside the per-file model rather than
+// requiring points-to analysis.
+u32 counter;
+
+void bump() { counter += 1; }
+
+void worker(*() f) { f(); }
+
+u32 main() {
+    *() fp = bump;
+    spawn worker(fp);
+    return 0;
+}

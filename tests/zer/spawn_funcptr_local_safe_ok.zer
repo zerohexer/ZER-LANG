@@ -1,0 +1,25 @@
+// Boundary for the 2026-08-06 local-funcptr spawn scan. Resolving a local
+// binding means MORE callbacks get scanned, so the shapes that are genuinely
+// safe must still compile — otherwise the fix becomes an over-rejection.
+shared struct C { u32 v; }
+C g;
+threadlocal u32 tls;
+
+void safe()   { u32 x = 0; }      // touches nothing
+void tls_up() { tls += 1; }       // per-thread storage, not shared
+void sh_up()  { g.v = 1; }        // shared struct — auto-locked
+
+void worker(*() f) { f(); }
+
+u32 main() {
+    *() a = safe;
+    spawn worker(a);
+
+    *() b = tls_up;
+    spawn worker(b);
+
+    *() c = sh_up;
+    spawn worker(c);
+
+    return 0;
+}

@@ -415,7 +415,16 @@ least discoverable while the message is poor.
 
 ---
 
-## OPEN — branch survey 2026-08-06: 9 verified fixes + 4 open heap-UAFs (`t20b31` / `2sjyjj` / `icejal` / `8j6w19`)
+## ~~branch survey 2026-08-06: 9 fixes + the view-alias family~~ (ALL LANDED 2026-08-06/08)
+
+**FULLY HARVESTED — kept for the reproducers, the probe warnings, and the branch attribution.**
+All 9 survey items landed (`e08a87d0` `efae5313` `43126a1c` `7c676758` `5748e904` `ec64526e`
+`9ea6c864`), the view-alias family closed at **8 forms** (`5748e904` + `6f6d9186`, gated by
+`tests/test_view_alias_matrix.c`, 24 cells), and the funcptr-bound-to-a-LOCAL spawn arg fixed
+(`00dc785a`). Residuals that were NOT part of the 9 are listed under "Other documented-not-fixed
+items" below and remain OPEN.
+
+### (original entry follows)
 
 **What this is.** Five `claude/gifted-noether-*` audit branches surveyed on 2026-08-06.
 `dgbmqx` was fully harvested earlier; `8j6w19` had 3 of 5 landed (`bbe907d7`, `86a5b7fa`,
@@ -618,7 +627,14 @@ These are the audit findings the eleven branches recorded but did **not** fix. D
 of this file — items already tracked here (cross-block scoped-borrow, the `?T` optional-unwrap class-kill,
 `vrp_ir.c` dead code) are noted as cross-references rather than repeated.
 
-### CRITICAL ACCEPT-UNSAFE — cross-function free of a FIELD of a by-value struct/union param (`rdh99l` `9a40ead4`, 2026-07-26)
+### ~~CRITICAL ACCEPT-UNSAFE — cross-function free of a FIELD of a by-value struct/union param~~ (`rdh99l` `9a40ead4`) — **CLOSED, measured 2026-08-08**
+**Does NOT reproduce on main.** The reproducer below is rejected with `double free: local %0 already
+freed at line 7` + `use after free`. Siblings probed the same day and ALSO rejected: 2-hop
+(`outer(h) -> inner(h) -> free(h.f)`), free-then-USE (not double-free), and a NESTED field
+(`free(h.in.f)`). Four over-rejection controls still compile (single correct free; read-only callee;
+two independent allocs; plain by-value param). The union form is masked by the stronger
+union-variant-read rule, so it is not separately testable. Closed by the by-value-struct-field
+carrier work of 2026-08-06 (`5748e904`, `ir_arg_view_handle` + the (c3)/(c4) return-summary arms).
 Pure ZER (no cinclude / `*opaque` / asm). Compiles clean; runtime glibc double-free abort or observable UAF.
 ```zer
 struct B { u32 x; } struct H { [*]B buckets; }
@@ -641,7 +657,11 @@ satisfies the leak check, the double-free/UAF passes silently. The 2026-07-15 tr
 `bool *frees_param_field` on FuncSummary (definite/all-path field free of an aggregate param), detected by
 looking for a FREED compound handle rooted at the param local in every return block.
 
-### CRITICAL ACCEPT-UNSAFE — block-scoped `defer free/consume` UAF / use-after-move (`i0txin` `84097263`, 2026-07-30)
+### ~~CRITICAL ACCEPT-UNSAFE — block-scoped `defer free/consume` UAF~~ (`i0txin` `84097263`) — **CLOSED, measured 2026-08-08**
+**Does NOT reproduce on main.** The reproducer below is rejected: `use after free: local %0 is freed
+(freed at line 5)` — the SAME diagnostic and line as the non-defer control, i.e. the defer-specific
+gap the entry describes is gone. Closed by the defer instance-id work (`ir_defer_instance_id` /
+`ir_fire_has_work_after` in `zercheck_ir.c`), which is the `freed_defer_id` shape §F1 called for.
 A `defer free(p)` (or `defer consume(m)`) inside a NESTED block frees/moves at BLOCK EXIT (the intended ZER
 semantics), and the emitter emits the free there — but a USE after the block and before the function returns
 is silently accepted.
@@ -664,7 +684,13 @@ double-free. A correct fix must coordinate the two application points (either ma
 DEPENDENCY: Interacts with **§F1** (`freed_defer_id` replaces exactly that line-based guard) — land §F1 first and this
 fix gets easier.
 
-### CRITICAL/MEDIUM goto-defer double-fire → double-FREE on the SUCCESS path (`3o10j6` `d1a7d9cc`, 2026-07-23) — distinct from G1
+### ~~CRITICAL/MEDIUM goto-defer double-fire → double-FREE on the SUCCESS path~~ (`3o10j6` `d1a7d9cc`) — **CLOSED, measured 2026-08-08**
+**Does NOT reproduce on main**, in either variant: goto TAKEN mid-loop (`fires == 2`, correct) and goto
+NEVER taken so every iteration falls through (`fires == 3`, correct) — the entry's "N+1 on the natural
+fall-through path" does not occur. NOTE: the reproducer this entry says is "preserved at
+`tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer`" **does not exist** — that directory holds
+only `audit_2026-06-17_defer_goto_fallthrough_drops.zer` and `audit2_defer_scan_nested.zer`. Measured
+with a hand-written equivalent; if someone has the branch's exact file, re-probe before reopening.
 A forward `goto` out of a nested scope (loop/if body carrying a `defer`) to a label AFTER that scope re-fires
 the nested-scope defer on the NATURAL fall-through path (where the goto was never taken).
 `for(..){ defer d+=1; if(cond) goto done; } done:` runs the loop defer N+1 times, not N; with
@@ -676,7 +702,14 @@ fall-through path; the guard flag suppresses the re-fire only on the goto path.
 reject a forward goto whose live-defer set mismatches the label's. Reproducer preserved at
 `tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer`.
 
-### HIGH spawn target reaches a non-shared global through a funcptr FIELD callback (`02nq43` `7aac453a`, 2026-07-29)
+### ~~HIGH spawn target reaches a non-shared global through a funcptr FIELD callback~~ (`02nq43` `7aac453a`) — **CLOSED, measured 2026-08-08**
+**Does NOT reproduce on main** — rejected with an exact diagnostic: *"spawn target 'worker' calls through
+a function-pointer field whose bound function accesses non-shared global 'g_ctr'"*, both when the carrier
+is read as a global and when it is passed as a spawn arg. Closed by `5ed17c2f`
+(`scan_funcptr_field_bindings`). **PROBE WARNING — the entry's own reproducer is MASKED twice:**
+`spawn worker(&gw)` on a non-shared `W` is rejected by the non-shared-pointer-to-spawn rule, and reading
+a non-shared global `gw` inside the target is rejected by the global-access rule. The carrier must be a
+`shared struct` for the funcptr-field rule to be the one under test.
 ```zer
 void worker(*W w) { w.cb(); } // call through a funcptr FIELD
 u32 main() { gw.cb = do_inc; spawn worker(&gw); return 0; } // ACCEPTED — g_ctr races
@@ -688,7 +721,7 @@ reached through a funcptr the sink doesn't match" shape as the closed SPAWN-FP /
 one sink further out. **Sibling of §D8** (which closes the funcptr-ARG facet) — take §D8 first, then decide
 whether the FIELD facet warrants the same treatment.
 
-### HIGH spawn target reaches a non-shared global through a RETURNED/local funcptr (`rvek5f` `00f3c2af` HOLE-D, 2026-07-31)
+### HIGH spawn target reaches a non-shared global through a RETURNED funcptr (`rvek5f` `00f3c2af` HOLE-D, 2026-07-31) — **LOCAL half FIXED `00dc785a` 2026-08-06; the RETURNED half is STILL OPEN**
 ```zer
 *() get_fp() { return touch; }
 void worker() { *() fp = get_fp(); fp(); } // indirect call — scanner gives up
@@ -706,14 +739,21 @@ safe/ergonomic boundary is a design call.
 Together with the funcptr-FIELD item above and §D8, this completes the spawn-funcptr facet map:
 **ARG = fixed (§D8), FIELD = open, RETURNED/local = open, direct/global/struct-storage = already caught.**
 
-### HIGH G3 — atomic-cell plain access not transitive through a helper (re-confirmed live, `3o10j6` + `38z6wi`)
+### HIGH G3 — atomic-cell plain access not transitive through a helper (`3o10j6` + `38z6wi`) — **DID NOT REPRODUCE in 5 probed shapes, 2026-08-08 (status UNCERTAIN — needs the branch's exact reproducer)**
+Probed 2026-08-08: `&global` handed to a helper, the same two-hop (`worker -> mid -> helper`), and a
+plain struct write through a helper with the cell also touched atomically — **all three REJECTED**
+("spawn target accesses non-shared global"). The one shape that was accepted had BOTH sides atomic
+(`@atomic_add` + `@atomic_store`), which is correct acceptance, not a hole. Either the transitive scan
+now covers this, or the live shape is narrower than described. **Do not reopen without a reproducer that
+is verified to compile clean on main** — and check the rejection REASON, since the plain-global rule
+masks this one easily.
 Already tracked as **G3** in the 2026-07-19 §G section — re-verified still open on both branches
 (TSan-confirmed). Recorded here only so the wave's coverage map is complete; do not duplicate the entry.
 The unified root with the now-fixed §D6/§D7 borrow holes: the scoped-borrow / plain-access analysis is
 intra-name and intra-function and does not treat `&x` handed to a helper as an access. Making it
 inter-procedural (a summary "does this callee access/borrow its pointer arg?") is subsystem-scale.
 
-### HIGH LOW — variable-index bit-slice WRITE: unclamped position shift is C UB (`n0odo5` `17ec74ca`, 2026-07-25)
+### ~~HIGH — variable-index bit-slice WRITE: unclamped position shift is C UB~~ (`n0odo5` `17ec74ca`) — **FIXED `ec64526e` 2026-08-06** (`emit_bitslice_runtime_mask`, both emitter paths; test uses a `volatile` position so it discriminates at `-O2`)
 `reg[hi..lo] = v` with a RUNTIME `lo` lowers to `(uint64_t)(v) << _zer_bl` and `mask << _zer_bl`
 (emitter.c ~1708-1743 AST path + the IR mirror). When `lo >= 64` the shift count is out of range → C UB
 (x86 masks mod 64, other arches differ), violating ZER's stated "shift by ≥ width = 0 (defined)" guarantee.
@@ -730,14 +770,14 @@ rejected nor retrievable = a silent footgun. Resolution is either a real retriev
 `.result` field + `_zer_async_NAME_result(&task)`, distinct from the `int` poll done-flag) or REJECT
 `async <non-void>` until such an API exists. Not memory-unsafe (there is no valid usage today).
 
-### LOW Over-rejection — container field of `Handle(T)`/`Pool(T)`/`Ring(T)`/`Slab(T)` drops T substitution (`i0txin` `84097263`, 2026-07-30)
+### ~~LOW Over-rejection — container field of `Handle(T)` drops T substitution~~ (`i0txin` `84097263`) — **`Handle(T)` FIXED `9ea6c864` 2026-08-06**; `Pool`/`Ring`/`Slab` stay rejected (emitter cannot stamp inline storage) — message quality tracked as its own OPEN entry
 `subst_typenode` (checker.c ~2158-2219) treats `TYNODE_HANDLE`/`POOL`/`RING`/`SLAB` as LEAVES and does not
 recurse into their `.elem`, so `container W(T) { Handle(T) h; }` fails to substitute and emits a LOUD
 `error: undefined type 'T'` at the template line. Fails loudly — no silent miscompile. The documented
 `T`/`*T`/`?T`/`[*]T`/`T[N]` shapes substitute correctly. **Fix:** recurse into `.elem`/`.inner` for those
 four TypeNode kinds.
 
-### LOW Over-rejection — struct-by-value return carrying a PARAM-view field (`rvek5f` `00f3c2af`, 2026-07-31)
+### ~~LOW Over-rejection — struct-by-value return carrying a PARAM-view field~~ (`rvek5f` `00f3c2af`) — **FIXED `5748e904` 2026-08-06** (view-alias family form 5; gated by `tests/test_view_alias_matrix.c`)
 `struct Sl { [*]u32 s; } Sl mk([*]u32 p) { Sl r; r.s = p[0..2]; return r; }` is rejected
 ("return pointer to local 'r'") though it is safe — the struct copy carries a CALLER-memory view out. The
 bare-param-view relaxation (BUG-764) covers `return p[0..2];` but not a param view wrapped in a
@@ -4348,7 +4388,17 @@ silently dropped const — a real asymmetry, so it was fixed (reject), not waive
 
 ---
 
-## OPEN — Concurrency memory-safety: ~24/25 holes CLOSED, 1 open (cross-block scoped-borrow) + named floors (2026-06-22)
+## OPEN — Concurrency memory-safety: all ~25 audited holes CLOSED + named floors (2026-06-22, updated 2026-08-08)
+
+> **STATUS UPDATE 2026-08-08.** The "single remaining hole" named throughout this entry — the
+> **cross-block scoped-borrow** case — was **CLOSED 2026-08-03**. The fix was NOT the
+> subsystem-scale `zercheck_ir` borrow-set merge sketched below: the borrow is a linear
+> statement-order approximation in `checker.c` (`Symbol.is_borrowed_by_thread`), not IR state,
+> so an IR merge would have edited a component that never held it. Real defect: a `th.join()`
+> nested in a branch cleared the borrow for code AFTER the branch, on paths that never joined.
+> Fix = `Checker.branch_depth` + `Symbol.th_spawn_branch_depth` (~40 lines). Residual is
+> PRECISION only (a join on every arm is over-rejected) — tracked as its own OPEN entry.
+> **Text below is preserved as the historical audit record; read the sketch as superseded.**
 
 **Scope of this entry:** ZER's concurrency PRIMITIVES are all implemented
 (shared/spawn/atomics/Semaphore/Barrier/condvar/Ring/async/move). This entry is

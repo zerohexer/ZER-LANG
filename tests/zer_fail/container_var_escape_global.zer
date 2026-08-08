@@ -1,0 +1,15 @@
+// expect-error: local-derived pointer
+// EXPECTED: compile error
+// @container(*T, local_ptr, field) laundered a stack pointer to a global — the
+// escape peel took the LAST arg (field-name ident) instead of args[0] (pointer).
+// ASan stack-use-after-return before the fix. Sink: store-to-global.
+struct List { u32 n; }
+struct Device { u32 id; List list; }
+?*Device g;
+void stash() {
+    Device local;
+    local.id = 9;
+    *List lp = &local.list;
+    g = @container(*Device, lp, list);
+}
+u32 main() { stash(); if (g) |d| { return d.id; } return 0; }

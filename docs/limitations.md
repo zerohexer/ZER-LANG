@@ -5,6 +5,49 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — residuals from the 2026-08-08 audit sweep (three clusters CLOSED; these remain)
+
+The 2026-08-08 audit (BUGS-FIXED.md session 2026-08-08) closed three silent-gap clusters
+(`@container` escape peel, buried-orelse return-range OOB, ISR funcptr dispatch facets 1/2/3).
+These deliberately-scoped residuals remain:
+
+- **ISR funcptr FIELD *call* whose binding is not a same-scope struct init (LOW–MEDIUM, bare-metal).**
+  Facet 2 scans a function bound in a struct INITIALIZER (`Ops o = { .fn = bump }; o.fn();`). A
+  funcptr field bound elsewhere and then dispatched — `g_ops.fn = bump;` at global/other scope, then
+  `interrupt { g_ops.fn(); }` — is not traced from the ISR (the field-CALL `g_ops.fn()` has a
+  `NODE_FIELD` callee, and `record_isr_globals` does not resolve which function a field is bound to
+  across instances). The spawn path has `scan_funcptr_field_bindings` for exactly this; mirroring it
+  in the ISR scanner is the durable fix. Sound over-approximation available: seed a
+  global-funcptr-field → bound-function map from all `x.field = fn` assignments + struct inits and
+  consult it at every `expr.field()` call from an ISR.
+
+- **`naked` `__attribute__((naked))` silently dropped on the IR path (confirmed still live 2026-08-08).**
+  See the existing `naked attribute silently dropped` entry below. A naked function emits a plain
+  prologue/epilogue; on bare metal an ISR/reset/context-switch primitive that assumes no compiler
+  frame silently malfunctions. Documented intentional deferral (GCC naked + a C body is fragile).
+
+- **`&packed_field` forms a plain-aligned pointer, no diagnostic (confirmed + UBSan-reproduced
+  2026-08-08; HIGH, bare-metal, policy-deferred).** `packed struct P{u8 a; u32 b;} P g; *u32 p=&g.b;
+  *p=x;` emits a `uint32_t*` to a misaligned offset and a plain aligned store. `gcc
+  -fsanitize=alignment` reports "store to misaligned address … requires 4 byte alignment"; on
+  strict-alignment targets (Cortex-M0, many ARM/RISC-V) this faults or splits silently. GCC warns
+  `-Waddress-of-packed-member`; ZER emits nothing. Fix options: at `&NODE_FIELD` where the object is a
+  packed struct and `offsetof(field) % alignof(field_type) != 0`, either reject, or type the result
+  as `aligned(1)`/packed so the emitter produces byte-wise access. Promote from "not yet probed" to
+  "confirmed — needs a policy decision."
+
+- **`vrp_ir.c` is DEAD CODE (349 lines, LOW, tech debt).** Not linked in the Makefile, not called
+  anywhere (`grep vrp_ir *.c *.h` outside the file itself → 0 callers). It self-describes as a
+  "FOUNDATION … does NOT yet replace the AST VRP." The production VRP lives in `checker.c`. It also
+  carries a latent (unreachable) bug: `ir_derive_range` `x & MASK` with a NEGATIVE mask literal sets
+  `max` to a negative value (no positive-mask guard). Either wire it in (large) or delete it; until
+  then it is a maintenance hazard (looks like production VRP, isn't). Several small unused-function
+  dead-code warnings also remain (`ir_classify_method_call`, `collect_async_locals`,
+  `stmt_writes_shared`, `shared_needs_condvar`, `find_shared_root_in_stmt`, `has_atomic_or_barrier`,
+  `classify_builtin_call`, `arena_array`, `peek`, `tok_str`) — cleanup candidates.
+
+---
+
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
 
 **STATUS: all 45 landed.** §A 1/1 · §B 9/9 · §C 7/7 · §D 9/9 · §E 1/1 · §F 4/4 · §G 6/7 (+ G5 with

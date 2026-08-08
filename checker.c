@@ -1141,8 +1141,18 @@ static bool escape_type_carries_ref(Type *vt) {
  * local, an orelse fallback to &local/local, @cstr of a local, a field of a
  * local-derived struct. */
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
+static Node *unwrap_ptr_launder(Node *v);   /* fwd: defined below (~1740) */
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     if (!arg || depth > 8) return false;
+    /* Peel pointer-launder intrinsics (@ptrcast/@pun/@bitcast/@cast/@container) to
+     * the underlying pointer, so a laundered local — `f(@container(*T, local_ptr,
+     * field))`, whose pointer is args[0] (NOT the last arg = field-name ident) — is
+     * still recognised as local-derived at the keep-arg and call-launder sinks.
+     * Without this, @container laundered a stack pointer past the keep-param check
+     * (ASan stack-use-after-return). No over-rejection: a launder of a param/global
+     * pointer peels to a non-local root and returns false. */
+    arg = unwrap_ptr_launder(arg);
+    if (!arg) return false;
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
@@ -1735,8 +1745,14 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
 static Node *unwrap_ptr_launder(Node *v) {
     while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
-        if (v->intrinsic.name_len == 9 &&
-            memcmp(v->intrinsic.name, "container", 9) == 0)
+        /* @container(*T, ptr, field) and @cstr(buf, str) return a pointer INTO
+         * their FIRST arg (args[0]); every other launder (@ptrcast/@pun/@bitcast/
+         * @cast) passes the pointer as its LAST arg. Peeling @cstr to the last arg
+         * (the string literal) silently lost the local buffer at every escape sink. */
+        if ((v->intrinsic.name_len == 9 &&
+             memcmp(v->intrinsic.name, "container", 9) == 0) ||
+            (v->intrinsic.name_len == 4 &&
+             memcmp(v->intrinsic.name, "cstr", 4) == 0))
             v = v->intrinsic.args[0];
         else
             v = v->intrinsic.args[v->intrinsic.arg_count - 1];
@@ -4956,9 +4972,12 @@ static Type *check_expr(Checker *c, Node *node) {
          * NODE_SLICE here. Mirrors the var-decl walker at checker.c:8979. */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
-            /* BUG-355: walk through intrinsics to find root ident */
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* BUG-355: walk through intrinsics to find root ident.
+             * Use the shared unwrap_ptr_launder: @container's pointer is args[0],
+             * NOT the last arg (which is the field-name ident). A hand-rolled
+             * last-arg loop let `g = @container(*T, local_ptr, field)` launder a
+             * stack pointer into a global undetected (ASan stack-use-after-return). */
+            vnode = unwrap_ptr_launder(vnode);
             /* BUG-748: descend through `arr[a..b]` borrow shape */
             bool via_slice_borrow = false;
             if (vnode && vnode->kind == NODE_SLICE) {
@@ -5058,8 +5077,8 @@ static Type *check_expr(Checker *c, Node *node) {
          * Storing to global violates this contract — caller may pass &local. */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* @container-safe peel (see BUG-355 note above): args[0] is the pointer. */
+            vnode = unwrap_ptr_launder(vnode);
             /* P9 (BUG-737 field-launder, 2026-06-24): `g = param.field` (or
              * `param[i]`) where the stored value is a pointer/slice FIELD of a
              * non-keep-derived by-value struct param launders the caller's
@@ -6730,9 +6749,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         for (int kc = 0; kc < keep_check_count; kc++) {
                         Node *karg = keep_checks[kc];
-                        /* walk into intrinsics */
-                        while (karg && karg->kind == NODE_INTRINSIC && karg->intrinsic.arg_count > 0)
-                            karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                        /* walk into intrinsics (@container-safe: args[0] is the pointer) */
+                        karg = unwrap_ptr_launder(karg);
                         if (karg && karg->kind == NODE_UNARY &&
                             karg->unary.op == TOK_AMP) {
                             /* C6 (2026-08-01): the DIRECT `keepfn(&loc.f)` /
@@ -6889,6 +6907,22 @@ static Type *check_expr(Checker *c, Node *node) {
                                     edge_vkind = KV_LOCAL_ARRAY;
                                     edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                 }
+                            }
+                        }
+                        /* @container/@ptrcast/@pun-of-a-local launder into a keep
+                         * param: peel the launder wrapper (args[0] for @container)
+                         * and re-check the non-call local shapes via the shared
+                         * arg_is_local_derived. Restricted to a non-call peeled root
+                         * so the call-launder precision below (call_result_escapes'
+                         * static exception) is preserved. Without this a laundered
+                         * stack pointer satisfied `keep` (ASan stack-use-after-return). */
+                        if (edge_vkind == KV_NONE &&
+                            arg_node && arg_node->kind == NODE_INTRINSIC) {
+                            Node *pk = unwrap_ptr_launder(arg_node);
+                            if (pk && pk != arg_node && pk->kind != NODE_CALL &&
+                                arg_is_local_derived(c, pk, 0)) {
+                                edge_vkind = KV_LOCAL_DERIVED;
+                                edge_argname = "argument"; edge_argname_len = 8;
                             }
                         }
                         /* BUG-763: call-laundered local into a keep param —
@@ -13126,19 +13160,14 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 for (int ri = 0; ri < root_count; ri++) {
                     Node *root = roots[ri];
-                    /* BUG-317: walk into @ptrcast/@bitcast in orelse fallback.
-                     * Only when return type is pointer — value bitcasts are safe. */
-                    if (root && root->kind == NODE_INTRINSIC &&
-                        ret_type && ret_type->kind == TYPE_POINTER) {
-                        const char *iname = root->intrinsic.name;
-                        uint32_t ilen = (uint32_t)root->intrinsic.name_len;
-                        /* BUG-351: @cast also needs escape check */
-                        bool is_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
-                                       (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
-                                       (ilen == 4 && memcmp(iname, "cast", 4) == 0);
-                        if (is_cast && root->intrinsic.arg_count > 0)
-                            root = root->intrinsic.args[root->intrinsic.arg_count - 1];
-                    }
+                    /* BUG-317/351: peel launder intrinsics (@ptrcast/@pun/@bitcast/
+                     * @cast/@container) to the underlying pointer in the return root.
+                     * Only when return type is pointer — value bitcasts are safe.
+                     * unwrap_ptr_launder is @container-safe (pointer is args[0], not
+                     * the last arg which is the field-name ident) — the last-arg-only
+                     * peel let `return @container(*T, local_ptr, field)` escape. */
+                    if (root && ret_type && type_dispatch_kind(ret_type) == TYPE_POINTER)
+                        root = unwrap_ptr_launder(root);
                     /* BUG-317: walk into &expr in orelse fallback */
                     if (root && root->kind == NODE_UNARY && root->unary.op == TOK_AMP) {
                         Node *inner = root->unary.operand;
@@ -13456,11 +13485,9 @@ static void check_stmt(Checker *c, Node *node) {
                  * `return maybe orelse @cast(MySlice, s)` (s a local-derived
                  * slice) escaped because this gate matched only a BARE `&local`.
                  * Mirrors the inline-cast return sink above; the ident branch
-                 * below then catches a local-derived operand as well. */
-                while (fb && fb->kind == NODE_INTRINSIC &&
-                       fb->intrinsic.arg_count > 0) {
-                    fb = fb->intrinsic.args[fb->intrinsic.arg_count - 1];
-                }
+                 * below then catches a local-derived operand as well.
+                 * @container-safe peel: args[0] is the pointer, not the last arg. */
+                fb = unwrap_ptr_launder(fb);
                 if (fb && fb->kind == NODE_IDENT && ret_type &&
                     type_can_carry_pointer(ret_type)) {
                     /* local-derived / arena-derived ident reached through the
@@ -14953,9 +14980,8 @@ static void check_stmt(Checker *c, Node *node) {
                     const char *edge_argname = NULL;
                     uint32_t edge_argname_len = 0;
                     Node *karg = arg_node;
-                    while (karg && karg->kind == NODE_INTRINSIC &&
-                           karg->intrinsic.arg_count > 0)
-                        karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                    /* @container-safe peel: args[0] is the pointer, not the last arg */
+                    karg = unwrap_ptr_launder(karg);
                     /* &local — KV_LOCAL_ADDR */
                     if (karg && karg->kind == NODE_UNARY &&
                         karg->unary.op == TOK_AMP &&
@@ -17154,14 +17180,32 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     }
     case NODE_CALL: {
         record_isr_globals(c, node->call.callee, depth);
-        for (int i = 0; i < node->call.arg_count; i++)
+        for (int i = 0; i < node->call.arg_count; i++) {
             record_isr_globals(c, node->call.args[i], depth);
+            /* E2 facet 3 (2026-08-08): a bare function NAME passed as an ARG —
+             * `invoke(bump)` — may be invoked by the callee (`invoke(*() f){ f(); }`),
+             * reaching a shared global from the ISR. Sound over-approximation: scan
+             * the named function's body (same remedy whether or not it is called). */
+            record_isr_funcname_binding(c, node->call.args[i], depth);
+        }
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
             Symbol *cs = scope_lookup(c->global_scope,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+            /* E2 facet 1 (2026-08-08): an ISR dispatching through a GLOBAL funcptr
+             * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }`, the canonical
+             * bare-metal ISR-dispatch idiom. The callee IDENT resolves to a global
+             * VARIABLE (not a function), so the is_function descent above missed it
+             * and bump's body (touching a shared global) was never scanned → the
+             * global stayed non-volatile, GCC -O2 free to hoist/tear it. Follow the
+             * funcptr's global-init binding to its function and scan it. Precise:
+             * fires only when the ISR actually invokes the funcptr variable. */
+            else if (cs && !cs->is_function && cs->func_node &&
+                     cs->func_node->kind == NODE_GLOBAL_VAR &&
+                     cs->func_node->var_decl.init)
+                record_isr_funcname_binding(c, cs->func_node->var_decl.init, depth);
         }
         return;
     }
@@ -17215,8 +17259,15 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         record_isr_globals(c, node->slice.end, depth);
         return;
     case NODE_STRUCT_INIT:
-        for (int i = 0; i < node->struct_init.field_count; i++)
+        for (int i = 0; i < node->struct_init.field_count; i++) {
             record_isr_globals(c, node->struct_init.fields[i].value, depth);
+            /* E2 facet 2 (2026-08-08): a funcptr FIELD bound to a function name in
+             * a struct initializer — `Ops o = { .fn = bump }; o.fn();` — reaches a
+             * shared global via the field dispatch. Sound over-approximation: scan
+             * the bound function's body (the field-CALL resolution `o.fn()` is not
+             * traced, but scanning the binding is sufficient and conservative). */
+            record_isr_funcname_binding(c, node->struct_init.fields[i].value, depth);
+        }
         return;
     case NODE_DEFER:    record_isr_globals(c, node->defer.body, depth); return;
     case NODE_CRITICAL: record_isr_globals(c, node->critical.body, depth); return;
@@ -17891,9 +17942,74 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 
 /* Scan a function body for return expressions with derivable range.
  * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+/* B9-extended (2026-08-08): a `return` inside an orelse-BLOCK fallback can be
+ * BURIED inside a larger expression — `u32 v = (mb() orelse {return 9;}) + base;`,
+ * `id(mb() orelse {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The
+ * original B9 block only matched an orelse that was the statement's IMMEDIATE
+ * init/expr/RHS, so a nested one was silently dropped from the return-range union
+ * → the callee summary UNDER-approximated and a caller elided its bounds guard on
+ * `arr[callee()]` (ASan global-buffer-overflow). This walks the expression to
+ * every embedded NODE_ORELSE and unions its fallback's return range in. Descends
+ * the expression-COMPOSITION nodes only (a leaf carries no sub-expression that
+ * could hold an orelse); an if-chain mirrors find_return_range's own style.
+ * Returns false (giving up the whole summary → conservative) when a buried return
+ * has no derivable range, so this can only ADD guards, never elide one. */
+static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch);
+static bool scan_expr_orelse_returns(Checker *c, Node *e, int64_t *out_min,
+                                     int64_t *out_max, bool *found) {
+    if (!e) return true;
+    if (e->kind == NODE_ORELSE) {
+        if (e->orelse.fallback &&
+            !find_return_range(c, e->orelse.fallback, out_min, out_max, found, true))
+            return false;
+        return scan_expr_orelse_returns(c, e->orelse.expr, out_min, out_max, found);
+    }
+    if (e->kind == NODE_BINARY) {
+        if (!scan_expr_orelse_returns(c, e->binary.left, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->binary.right, out_min, out_max, found);
+    }
+    if (e->kind == NODE_UNARY)
+        return scan_expr_orelse_returns(c, e->unary.operand, out_min, out_max, found);
+    if (e->kind == NODE_CALL) {
+        if (!scan_expr_orelse_returns(c, e->call.callee, out_min, out_max, found)) return false;
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (!scan_expr_orelse_returns(c, e->call.args[i], out_min, out_max, found)) return false;
+        return true;
+    }
+    if (e->kind == NODE_INDEX) {
+        if (!scan_expr_orelse_returns(c, e->index_expr.object, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->index_expr.index, out_min, out_max, found);
+    }
+    if (e->kind == NODE_FIELD)
+        return scan_expr_orelse_returns(c, e->field.object, out_min, out_max, found);
+    if (e->kind == NODE_SLICE) {
+        if (!scan_expr_orelse_returns(c, e->slice.object, out_min, out_max, found)) return false;
+        if (!scan_expr_orelse_returns(c, e->slice.start, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->slice.end, out_min, out_max, found);
+    }
+    if (e->kind == NODE_TYPECAST)
+        return scan_expr_orelse_returns(c, e->typecast.expr, out_min, out_max, found);
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (!scan_expr_orelse_returns(c, e->intrinsic.args[i], out_min, out_max, found)) return false;
+        return true;
+    }
+    if (e->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (!scan_expr_orelse_returns(c, e->struct_init.fields[i].value, out_min, out_max, found)) return false;
+        return true;
+    }
+    return true; /* leaf / non-composition — no embedded orelse */
+}
+
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch) {
     if (!node) return true;
     if (node->kind == NODE_RETURN && node->ret.expr) {
+        /* buried orelse-block return in the return expression itself, e.g.
+         * `return (mb() orelse { return 9; }) & 3;` — the inner return is a
+         * separate path; union it before deriving the outer expr's range. */
+        if (!scan_expr_orelse_returns(c, node->ret.expr, out_min, out_max, found))
+            return false;
         int64_t rmin, rmax;
         if (derive_expr_range(c, node->ret.expr, &rmin, &rmax)) {
             if (!*found) {
@@ -18030,11 +18146,12 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         if (node->kind == NODE_VAR_DECL)       oe = node->var_decl.init;
         else if (node->kind == NODE_EXPR_STMT) oe = node->expr_stmt.expr;
         else if (node->kind == NODE_ASSIGN)    oe = node->assign.value;
-        if (oe && oe->kind == NODE_ORELSE && oe->orelse.fallback) {
-            if (!find_return_range(c, oe->orelse.fallback, out_min, out_max,
-                                   found, true))
-                return false;
-        }
+        /* scan_expr_orelse_returns reaches a BURIED orelse (nested in a binary /
+         * call arg / index / etc.), not just a top-level one — the narrow
+         * oe->kind==NODE_ORELSE check missed `u32 v = (mb() orelse {return 9;}) + b;`
+         * and silently dropped the buried return from the range union (silent OOB). */
+        if (oe && !scan_expr_orelse_returns(c, oe, out_min, out_max, found))
+            return false;
     }
     return true; /* non-return statement — ok */
 }

@@ -1,0 +1,6 @@
+// Sibling: orelse-block return buried in a CALL ARG.
+u8[4] tbl;
+?u32 mb() { return null; }
+u32 id(u32 x) { return x; }
+u32 pick() { u32 v = id(mb() orelse { return 9; }); return v & 3; }
+u32 main() { return tbl[pick()]; }

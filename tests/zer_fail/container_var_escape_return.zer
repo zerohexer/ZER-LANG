@@ -1,0 +1,12 @@
+// expect-error: return pointer to local
+// EXPECTED: compile error
+// Sibling sink: returning @container(*T, local_ptr, field).
+struct List { u32 n; }
+struct Device { u32 id; List list; }
+*Device leak() {
+    Device local;
+    local.id = 9;
+    *List lp = &local.list;
+    return @container(*Device, lp, list);
+}
+u32 main() { *Device d = leak(); return d.id; }

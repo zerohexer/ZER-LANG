@@ -1,0 +1,10 @@
+// expect-error: must be declared volatile
+// EXPECTED: compile error
+// E2 facet 1: ISR dispatches through a GLOBAL funcptr variable (the canonical
+// bare-metal ISR idiom). g_flag is touched by the ISR (via g_cb->bump) and main,
+// but was emitted non-volatile — GCC -O2 free to hoist/tear it (silent hang).
+u32 g_flag = 0;
+void bump() { g_flag = g_flag + 1; }
+*() g_cb = bump;
+interrupt USART1 { g_cb(); }
+u32 main() { u32 x = g_flag; return x; }

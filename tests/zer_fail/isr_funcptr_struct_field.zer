@@ -1,0 +1,8 @@
+// expect-error: must be declared volatile
+// EXPECTED: compile error
+// E2 facet 2: ISR dispatches through a funcptr FIELD bound in a struct init.
+u32 counter;
+void bump() { counter = counter + 1; }
+struct Ops { *() fn; }
+interrupt USART1 { Ops o = { .fn = bump }; o.fn(); }
+u32 main() { counter = 7; return counter; }

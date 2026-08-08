@@ -5,6 +5,67 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-08 — audit sweep: three silent-gap clusters closed (@container escape, buried-orelse OOB, ISR funcptr dispatch)
+
+Five parallel read-heavy audit agents (VRP/bounds, emitter AST↔IR, concurrency, bare-metal,
+escape/keep) each verified findings against the live compiler. Emitter AST↔IR came back CLEAN
+after a full wrapper cross-check. Three genuine silent-gap clusters were confirmed (ASan for two)
+and fixed; all fixes are TIGHTENINGS (accept→reject / add-a-guard), so the risk is over-rejection,
+not a new hole. `make check` green.
+
+### Cluster A — `@container(*T, ptr, field)` laundered a stack pointer past every escape sink (silent UAF, ASan-proven)
+
+`@container`'s pointer is `args[0]`; its LAST arg is the field-name ident. The escape sinks
+peeled intrinsics by taking the LAST arg (correct for `@ptrcast`/`@pun`/`@bitcast`/`@cast`,
+whose pointer IS the last arg), so `g = @container(*T, local_ptr, field)` peeled to the
+field-name and the local was never seen. ASan `stack-use-after-return`. Confirmed at FOUR sinks:
+store-to-global, struct-field-of-global, return, and keep-param.
+
+Root cause + fix: the shared `unwrap_ptr_launder` (checker.c ~1736) already peels `@container`→
+`args[0]`; the sinks had hand-rolled last-arg loops instead. Routed all six escape/taint peels
+through `unwrap_ptr_launder` (store-to-global 4961, non-keep-param 5064, keep-check 6737, keep
+inference edge 14952, return direct+orelse-fallback 13136/13462) and added a launder-peel at the
+top of the shared per-arg predicate `arg_is_local_derived` (the keep-arg sink). While fixing, a
+LATENT sibling in `unwrap_ptr_launder` surfaced: it peeled `@cstr(buf, str)` to the LAST arg (the
+string literal) instead of `args[0]` (the buffer) — `@cstr`, like `@container`, returns a pointer
+into `args[0]`. Fixed there too (this was masked because `arg_is_local_derived` had a dedicated
+`@cstr` case; the top-level peel exposed it — caught by `test_checker_full`).
+Tests: `tests/zer_fail/container_var_escape_{global,return,keep}.zer` (expect-error),
+`tests/zer/container_global_keep_ok.zer` (no over-rejection: `@container` of a GLOBAL compiles).
+
+### Cluster C — `find_return_range` missed a `return` buried in a nested orelse-block fallback (silent OOB, ASan-proven)
+
+B9 (2026-08-01) taught `find_return_range` to descend an orelse-block fallback, but ONLY when the
+orelse was the statement's IMMEDIATE init/expr/RHS. Buried one level deeper —
+`u32 v = (mb() orelse {return 9;}) + base;`, `id(mb() orelse {return 9;})`, or
+`return (mb() orelse {return 9;}) & 3;` — the inner `return 9` was silently dropped from the
+return-range union, the callee summary under-approximated, and the caller elided `arr[callee()]`'s
+bounds guard. ASan `global-buffer-overflow`. Fix: `scan_expr_orelse_returns` recursively walks the
+expression-composition nodes (binary/unary/call/index/field/slice/typecast/intrinsic/struct_init)
+to every embedded `NODE_ORELSE` and unions its fallback's return range; wired into both the
+`NODE_RETURN` handler and the general var-decl/expr/assign block. Returns false (whole summary
+gives up → conservative) on a non-derivable buried return, so it can only ADD guards.
+Tests: `tests/zer_trap/vrp_buried_orelse_{binary,callarg,return}.zer` (compile clean, trap at
+runtime), `tests/zer/vrp_return_range_provable.zer` (a provable range still elides the guard).
+
+### Cluster B — ISR dispatch through a function pointer was never scanned (silent bare-metal data race)
+
+`record_isr_globals` descended a call only when the callee IDENT resolved to a global FUNCTION.
+Three funcptr-dispatch forms — the canonical bare-metal ISR idioms — reached a non-volatile shared
+global with ZERO diagnostics, leaving GCC -O2 free to hoist/tear the access:
+- **facet 1** global funcptr variable: `*() g_cb = bump; interrupt { g_cb(); }`
+- **facet 2** funcptr field bound in a struct init: `Ops o = { .fn = bump }; o.fn();`
+- **facet 3** function name passed as an arg: `invoke(bump)` where `invoke(*() f){ f(); }`
+Fix (checker.c `record_isr_globals`): facet 1 follows the funcptr variable's global-init binding
+(`cs->func_node->var_decl.init`) via `record_isr_funcname_binding` (precise — fires only on
+invocation); facets 2/3 scan the bound function's body from the struct-init field value / call arg
+(sound over-approximation, same remedy either way). Tests: `tests/zer_fail/isr_funcptr_{global_var,
+arg,struct_field}.zer` (expect-error "must be declared volatile"). Residual (documented in
+limitations.md): a funcptr FIELD *call* `o.fn()` whose binding is not a same-scope struct init is
+not traced; and `naked`-drop / packed-`&field` remain deferred.
+
+---
+
 ## Session 2026-08-06h — the orelse-UNWRAP dropped the optional's carried handles (last view form)
 
 The residual recorded when the optional-carrier hole was closed. Eighth and final member of

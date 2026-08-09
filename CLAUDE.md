@@ -2633,6 +2633,11 @@ because a rejection is a rejection whether or not your patch caused it.
   line matches. Use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
 - **Never run a `tests/test_*_matrix` binary while `make check` runs** — several share the fixed
   temp path `/tmp/_zer_co.zer`; concurrent runs yield phantom failures.
+- **A RECONSTRUCTED reproducer can CONFIRM a hole, never REFUTE one.** If the branch/entry names a
+  file, fetch it: `git show origin/claude/<branch>:tests/zer_gaps/<file>.zer`. Measured 2026-08-09 —
+  G3 was recorded "did not reproduce in 5 shapes" from hand-written probes that all used a
+  POINTER-taking helper; the real shape wrote the global BY NAME, and the verbatim branch file
+  reproduced on the first run. Keep such a negative test BYTE-IDENTICAL to the original.
 - **Update the entry in the SAME commit as the fix.** The "a stale gate is worse than none" rule
   this file already states applies to the LEDGER; it had drifted ~3 weeks.
 

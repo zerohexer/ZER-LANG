@@ -756,7 +756,35 @@ safe/ergonomic boundary is a design call.
 Together with the funcptr-FIELD item above and §D8, this completes the spawn-funcptr facet map:
 **ARG = fixed (§D8), FIELD = open, RETURNED/local = open, direct/global/struct-storage = already caught.**
 
-### HIGH G3 — atomic-cell plain access not transitive through a helper (`3o10j6` + `38z6wi`) — **DID NOT REPRODUCE in 5 probed shapes, 2026-08-08 (status UNCERTAIN — needs the branch's exact reproducer)**
+### ~~HIGH G3 — atomic-cell plain access not transitive through a helper~~ (`3o10j6` + `38z6wi` + `fxvnsu` G3) — **REPRODUCED with the branch's exact file, then FIXED 2026-08-09**
+
+**The hand-written reconstruction was WRONG, and the "did not reproduce in 5 shapes" verdict it
+produced was wrong with it.** The probes used a helper taking a POINTER (`helper(*C p){ p.v += 1; }`);
+the real shape is a helper writing the global BY NAME (`poke(){ g_ctr = 5; }`). Pulling the verbatim
+file from `origin/claude/gifted-noether-fxvnsu:tests/zer_gaps/gap_atomic_cell_plain_access_via_helper.zer`
+reproduced it immediately. **This is the concrete cost of a missing reproducer file** — exactly the
+risk flagged when four G-probes had to be measured with reconstructions. Reconstruct only when you
+must, say so, and go get the original before trusting a NEGATIVE result.
+
+**The defect.** "Is this global an atomic cell?" is whole-program, but "flag the plain access" fired
+only for accesses LEXICALLY inside the spawning function (gated on the per-function
+`c->after_spawn_in_func`). So `spawn worker(); g_ctr = 5;` was rejected while `spawn worker(); poke();`
+with `poke(){ g_ctr = 5; }` was accepted — **moving a statement into a helper changed whether it
+raced.** TSan-confirmed on the branch.
+
+**The fix** mirrors the ISR-TRANS fix (#12) — the same per-function to transitive shape. New
+`record_atomic_plain_in_callee` (checker.c) descends a callee's body at a `NODE_CALL` made while a
+fire-and-forget spawn is live and records its plain global accesses; the existing post-check
+`check_atomic_cell_safety` still makes the decision, so a global that never becomes an atomic cell is
+unaffected and this adds no rejection on its own. `@atomic_*` arg0 is skipped (the blessed atomic
+access), mirroring `in_atomic_intrinsic_arg` on the direct path. Depth-8 bounded; 2-hop verified;
+plain READS caught as well as writes.
+
+**Over-rejection boundary pinned** by `tests/zer/atomic_cell_helper_safe_ok.zer`: a helper that
+synchronizes with `@atomic_*`, one touching an unrelated global, one where no spawn exists, and one
+called BEFORE the spawn all still compile. Negative =
+`tests/zer_fail/atomic_cell_plain_via_helper.zer`, kept **byte-identical to the branch file** so it
+pins the finding rather than a reconstruction; verified ACCEPTED on a pre-fix build.
 Probed 2026-08-08: `&global` handed to a helper, the same two-hop (`worker -> mid -> helper`), and a
 plain struct write through a helper with the cell also touched atomically — **all three REJECTED**
 ("spawn target accesses non-shared global"). The one shape that was accepted had BOTH sides atomic
@@ -1489,7 +1517,8 @@ an ASan build).
   scoped spawn — each thread has its own copy"*. The scoped path A5/BUG-757 left uncovered is covered.
 - **G5 heap ptr into a struct-global FIELD — CLOSED.** *"global 'g.p' left dangling at function
   exit"* — the `.field` projection sink is reached; the bare-ident control is also caught.
-- **G3 atomic-cell transitivity — UNCERTAIN**, see its own entry above (did not reproduce in 5 shapes).
+- **G3 atomic-cell transitivity — CLOSED 2026-08-09.** Reproduced with the branch's VERBATIM file
+  after a hand-written reconstruction had wrongly reported "does not reproduce"; see its own entry above.
 
 **The reproducer files this heading claims are "in `tests/zer_gaps/`" DO NOT EXIST** (`gap_goto_skips_defer.zer`,
 `gap_scoped_borrow_via_helper.zer`, `gap_threadlocal_amp_escape_scoped_spawn.zer`,

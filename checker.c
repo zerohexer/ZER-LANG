@@ -518,6 +518,7 @@ static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static void record_isr_globals(Checker *c, Node *node, int depth);
+static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth);
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
 static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
@@ -5734,6 +5735,19 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Function call ---- */
     case NODE_CALL: {
+        /* G3 (2026-08-09): a call made while a fire-and-forget spawn is live —
+         * descend the callee and record its plain global accesses, so moving a
+         * statement into a helper cannot change whether it races. The post-check
+         * (check_atomic_cell_safety) still decides; this only supplies accesses. */
+        if (c->after_spawn_in_func && node->call.callee &&
+            node->call.callee->kind == NODE_IDENT) {
+            Symbol *cs = scope_lookup(c->global_scope, node->call.callee->ident.name,
+                                      (uint32_t)node->call.callee->ident.name_len);
+            if (cs && cs->is_function && cs->func_node &&
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, 0);
+        }
+
         /* ===== Universal alloc — handled BEFORE the generic arg loop, because
          * alloc's type-name arg (which may be a primitive keyword like u8) must
          * NOT be check_expr'd as a value.
@@ -17361,6 +17375,99 @@ static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
             return gs;
     }
     return NULL;
+}
+
+/* G3 — atomic-cell plain access, TRANSITIVE through a helper (2026-08-09).
+ *
+ * THE HOLE. "is this global an atomic cell?" is whole-program, but "flag the
+ * plain access" fired only for accesses LEXICALLY inside the spawning function
+ * (gated on `c->after_spawn_in_func`, which is per-function state). So:
+ *
+ *     void poke() { g_ctr = 5; }                  // plain write, via helper
+ *     u32 main() { spawn worker(); poke(); }      // ACCEPTED
+ *     u32 main() { spawn worker(); g_ctr = 5; }   // the SAME write: REJECTED
+ *
+ * The asymmetry is the bug — moving a statement into a helper must not change
+ * whether it races. Same shape as the ISR-TRANS fix (#12): a per-function check
+ * made transitive by descending direct calls. This walker records the plain
+ * accesses; `check_atomic_cell_safety` still decides, so a global that never
+ * becomes an atomic cell is unaffected and this adds no rejection on its own.
+ *
+ * `@atomic_*` arg0 is the BLESSED atomic access and is skipped, mirroring
+ * `in_atomic_intrinsic_arg` on the direct path — otherwise a helper that
+ * correctly synchronizes would be flagged for doing the right thing.
+ *
+ * Partial if/switch walk with an explicit `default: return` — an unrecognised
+ * kind records NOTHING, i.e. today's behaviour, never a new rejection. */
+static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
+    if (!node || depth > 8) return;
+    switch (node->kind) {
+    case NODE_IDENT: {
+        Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
+                                  (uint32_t)node->ident.name_len);
+        if (gs && !gs->is_function)
+            record_atomic_plain_write(c, gs, node->loc.line);
+        return;
+    }
+    case NODE_INTRINSIC: {
+        bool atomic_intr = (node->intrinsic.name_len >= 7 &&
+                            memcmp(node->intrinsic.name, "atomic_", 7) == 0);
+        for (int i = 0; i < node->intrinsic.arg_count; i++) {
+            if (atomic_intr && i == 0) continue;   /* blessed target */
+            record_atomic_plain_in_callee(c, node->intrinsic.args[i], depth);
+        }
+        return;
+    }
+    case NODE_CALL: {
+        for (int i = 0; i < node->call.arg_count; i++)
+            record_atomic_plain_in_callee(c, node->call.args[i], depth);
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            Symbol *cs = scope_lookup(c->global_scope, node->call.callee->ident.name,
+                                      (uint32_t)node->call.callee->ident.name_len);
+            if (cs && cs->is_function && cs->func_node &&
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, depth + 1);
+        }
+        return;
+    }
+    case NODE_ASSIGN:
+        record_atomic_plain_in_callee(c, node->assign.target, depth);
+        record_atomic_plain_in_callee(c, node->assign.value, depth);
+        return;
+    case NODE_FIELD:  record_atomic_plain_in_callee(c, node->field.object, depth); return;
+    case NODE_INDEX:
+        record_atomic_plain_in_callee(c, node->index_expr.object, depth);
+        record_atomic_plain_in_callee(c, node->index_expr.index, depth);
+        return;
+    case NODE_UNARY:  record_atomic_plain_in_callee(c, node->unary.operand, depth); return;
+    case NODE_BINARY:
+        record_atomic_plain_in_callee(c, node->binary.left, depth);
+        record_atomic_plain_in_callee(c, node->binary.right, depth);
+        return;
+    case NODE_VAR_DECL: record_atomic_plain_in_callee(c, node->var_decl.init, depth); return;
+    case NODE_RETURN:   record_atomic_plain_in_callee(c, node->ret.expr, depth); return;
+    case NODE_EXPR_STMT: record_atomic_plain_in_callee(c, node->expr_stmt.expr, depth); return;
+    case NODE_BLOCK:
+        for (int i = 0; i < node->block.stmt_count; i++)
+            record_atomic_plain_in_callee(c, node->block.stmts[i], depth);
+        return;
+    case NODE_IF:
+        record_atomic_plain_in_callee(c, node->if_stmt.cond, depth);
+        record_atomic_plain_in_callee(c, node->if_stmt.then_body, depth);
+        record_atomic_plain_in_callee(c, node->if_stmt.else_body, depth);
+        return;
+    case NODE_WHILE:
+        record_atomic_plain_in_callee(c, node->while_stmt.cond, depth);
+        record_atomic_plain_in_callee(c, node->while_stmt.body, depth);
+        return;
+    case NODE_FOR:
+        record_atomic_plain_in_callee(c, node->for_stmt.init, depth);
+        record_atomic_plain_in_callee(c, node->for_stmt.cond, depth);
+        record_atomic_plain_in_callee(c, node->for_stmt.step, depth);
+        record_atomic_plain_in_callee(c, node->for_stmt.body, depth);
+        return;
+    default: return;
+    }
 }
 
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line) {

@@ -1,0 +1,20 @@
+// Over-rejection boundary for the transitive atomic-cell scan (G3 fix). The
+// scan now descends helpers called while a fire-and-forget spawn is live, so
+// these four must keep compiling: a helper that synchronizes properly, one
+// touching an unrelated global, one where no spawn exists at all, and one
+// called BEFORE the spawn (ordering must still matter).
+u32 cell;
+u32 unrelated;
+
+void worker() { u32 v = @atomic_add(&cell, 1); }
+
+void sync_poke() { @atomic_store(&cell, 5); }
+void other_poke() { unrelated += 1; }
+
+u32 main() {
+    other_poke();
+    spawn worker();
+    sync_poke();
+    other_poke();
+    return 0;
+}

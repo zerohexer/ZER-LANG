@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-09 — G3: atomic-cell plain access, transitive through a helper
+
+**BUG-769.** A global used with `@atomic_*` in a concurrent context is an "atomic cell": every access
+to it must also be atomic. The "is it an atomic cell?" determination is whole-program, but the "flag
+the plain access" half fired only for accesses LEXICALLY inside the spawning function (gated on the
+per-function `c->after_spawn_in_func`). The result was an asymmetry that should not exist:
+
+    spawn worker(); g_ctr = 5;                        REJECTED
+    spawn worker(); poke();   // poke(){ g_ctr = 5; } ACCEPTED
+
+Moving a statement into a helper changed whether it raced. TSan-confirmed on the branch.
+
+**Fix** mirrors ISR-TRANS (#12), the same per-function to transitive shape: new
+`record_atomic_plain_in_callee` descends a callee's body at a `NODE_CALL` made while a fire-and-forget
+spawn is live and records its plain global accesses. The existing post-check `check_atomic_cell_safety`
+still decides, so a global that never becomes an atomic cell is untouched and the walker adds no
+rejection by itself. `@atomic_*` arg0 is skipped — the blessed atomic access — mirroring
+`in_atomic_intrinsic_arg` on the direct path, so a helper that synchronizes correctly is not punished
+for it. Depth-8 bounded; 2-hop verified; plain READS caught as well as writes.
+
+**HOW THIS WAS NEARLY MISSED — the lesson is the point.** The day before, this same finding was probed
+with a HAND-WRITTEN reproducer and recorded as "did not reproduce in 5 shapes, status UNCERTAIN". That
+verdict was wrong. The reconstruction used a helper taking a POINTER (`helper(*C p){ p.v += 1; }`);
+the real shape is a helper writing the global BY NAME (`poke(){ g_ctr = 5; }`), and every pointer-shaped
+probe was masked by the plain-global-access rule. Fetching the branch's verbatim file
+(`origin/claude/gifted-noether-fxvnsu:tests/zer_gaps/gap_atomic_cell_plain_access_via_helper.zer`)
+reproduced it on the first run.
+
+**So: a reconstruction can only ever confirm a hole, never refute one.** A NEGATIVE result from a
+reconstructed reproducer is not evidence — go get the original first. The negative test here is kept
+BYTE-IDENTICAL to the branch file for exactly this reason, and says so in a header comment.
+
+Tests: `tests/zer_fail/atomic_cell_plain_via_helper.zer` (verbatim; verified ACCEPTED pre-fix by
+rebuilding HEAD's checker) + `tests/zer/atomic_cell_helper_safe_ok.zer` pinning four over-rejection
+controls — helper synchronizes with `@atomic_*`, helper touches an unrelated global, no spawn at all,
+and helper called BEFORE the spawn (ordering must still matter).
+
 ## Session 2026-08-08 — ledger reconciliation + the returned-funcptr spawn race
 
 **Ledger drift (7 stale entries, `d0f266af`).** `docs/limitations.md` listed as OPEN a set of

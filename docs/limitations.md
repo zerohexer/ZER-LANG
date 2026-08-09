@@ -1332,7 +1332,10 @@ relied on the hole). **Concurrency/ISR class C COMPLETE.**
   `tests/zer_fail/isr_transitive_{volatile,rmw}.zer`. **In-main: NOT present** — `record_isr_globals` = 0
   hits.
 
-### D. Emitter miscompiles (7; #14 is a class-pair with #15/#16)
+### ~~D. Emitter miscompiles (7)~~ — **ALL 7 DONE** (#13/#17/#18/#19 landed 2026-07-19; #14/#15/#16 measured CLOSED 2026-08-09)
+The array->`?[*]T` coercion family (#14 struct-init field, #15 var-decl/assign/call-arg/return, #16 global
+array returned as `?[*]T`) was measured on main 2026-08-09: **all four value-flow sites carry `.len`
+correctly** (`v.len == 4` at var-decl, call-arg, global return, and struct-init field; each run exits 0).
 **DONE: #13/#17/#18/#19 DONE (landed 2026-07-19, make check 1000/0, all matrices + sink 41 CLEAN):**
 #13 `@saturate(uN)` unsigned odd-width now clamps via `(1ULL<<w)-1` + carrier cast (both emitter
 paths); #17 `@bitcast(uN/iN)` now masks/sign-extends the punned carrier via `emit_intn_mask_lv`
@@ -1473,7 +1476,26 @@ an ASan build).
   aliasing assignment. (No dedicated test file — repro in the commit message.) **In-main: NOT present** —
   main zercheck_ir.c ~3819 still a plain `if` right after the reallocating `ir_add_handle` at ~3813.
 
-### G. Documented-but-unfixed gaps — `fxvnsu` `9fea9990` (reproducers in `tests/zer_gaps/`, compile-clean today = the gap; move to `tests/zer_fail/` when fixed) (5)
+### ~~G. Documented-but-unfixed gaps — `fxvnsu` `9fea9990`~~ — **4 of 5 CLOSED, measured 2026-08-09; G3 UNCERTAIN**
+
+**MEASURED, not assumed** — each probed on main and the REJECTION REASON read:
+- **G1 goto-skips-defer — CLOSED.** A `defer` registered after the goto source does not fire at the
+  label (`lock == 1`, correct). The sibling goto-defer double-fire (`3o10j6`) is closed too, both
+  variants.
+- **G2 helper launders `&local` past a scoped borrow — CLOSED.** *"cannot pass '&d' to a call while
+  it is borrowed by a scoped spawn"* — the exact rule, not a mask. Direct-write control also
+  rejected; the no-access-between-spawn-and-join control still COMPILES (no over-rejection).
+- **G4 `threadlocal &`-escape to a SCOPED spawn — CLOSED.** *"cannot pass '&tl' (threadlocal) to a
+  scoped spawn — each thread has its own copy"*. The scoped path A5/BUG-757 left uncovered is covered.
+- **G5 heap ptr into a struct-global FIELD — CLOSED.** *"global 'g.p' left dangling at function
+  exit"* — the `.field` projection sink is reached; the bare-ident control is also caught.
+- **G3 atomic-cell transitivity — UNCERTAIN**, see its own entry above (did not reproduce in 5 shapes).
+
+**The reproducer files this heading claims are "in `tests/zer_gaps/`" DO NOT EXIST** (`gap_goto_skips_defer.zer`,
+`gap_scoped_borrow_via_helper.zer`, `gap_threadlocal_amp_escape_scoped_spawn.zer`,
+`gap_struct_global_field_dangle.zer` — none present; that directory holds an unrelated 24). Measured with
+hand-written equivalents from the descriptions. **If someone still has `fxvnsu`, re-probe with its exact
+files before trusting these four closures.** The same claim was false for the `3o10j6` goto-defer entry.
 - **G1 — forward `goto` fires a defer it textually skipped** (MEDIUM miscompile). `gap_goto_skips_defer.zer`.
   The acquire / `goto done` / `defer release()` idiom underflows a lock counter (release fires on the error
   path where acquire never ran). Root cause: `ir_lower.c` fires function-scope defers as a static set at

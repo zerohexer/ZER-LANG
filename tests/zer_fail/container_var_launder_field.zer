@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: local
+// Struct-field-store sink of the @container variable-launder class.
+struct Dev { u32 a; u32 list; }
+struct Hold { ?*Dev p; }
+Hold gh;
+void c() { Dev d; *u32 lp = &d.list; gh.p = @container(*Dev, lp, list); }
+u32 main() { c(); return 0; }

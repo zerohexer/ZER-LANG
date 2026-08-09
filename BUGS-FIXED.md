@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-09 — audit: 4 fixes (1 data-race, 1 memory-safety ×3 sinks, 1 miscompile, 1 loud)
+
+A parallel red-team audit (5 subagents over uN/iN, comptime, emitter dual-path, concurrency,
+escape/UAF) surfaced these; each fix was reproduced on main first, and each new test verified to
+FIRE on the pre-fix build. Confirmed findings NOT fixed (comptime per-op width miscompile,
+frees-param-field-via-unwrap, HOLE-A4) are in `docs/limitations.md` "2026-08-09 audit".
+
+**BUG-768 — spawn race through a funcptr ARRAY-ELEMENT field callback.** `worker(Ops o){ o.fns[0](); }`
+where `o.fns` is a funcptr ARRAY field of a by-value struct, bound in the caller (`o.fns[0] = bump`)
+and reaching a non-shared global, compiled clean — a data race. The scalar sibling `o.cb()` was
+already rejected. Root cause: `body_calls_funcptr_field` (the tell) and `scan_funcptr_field_bindings`
+(the collector) matched only a bare `NODE_FIELD` callee/target; `o.fns[0]` is `NODE_INDEX` over a
+`NODE_FIELD`, so both bailed. Fix: new `funcptr_field_access()` helper (NODE_FIELD, or NODE_INDEX
+rooted transitively in a NODE_FIELD) used at both sites — one sink further out, exactly the funcptr
+REACH class. Tests `tests/zer_fail/spawn_funcptr_array_field_race.zer` (+ positive
+`tests/zer/spawn_funcptr_array_field_ok.zer`, a threadlocal callback stays accepted).
+
+**BUG-769 — `@container(var, field)` launders a stack pointer past 3 escape sinks.** The inline
+`g = @container(*Dev, &d.list, list)` was rejected, but the variable form `*u32 lp = &d.list; g =
+@container(*Dev, lp, list)` compiled — a dangling global. Root cause: the store-to-global (checker.c
+~4961), non-keep (~5062), and keep-call (~6738/~6834) sinks hand-rolled a LAST-ARG intrinsic unwrap;
+`@container`'s pointer is `args[0]`, not the last arg (which is the field NAME), so the unwrap
+resolved to the field ident and missed `lp`'s `is_local_derived`. `@ptrcast` worked because its
+pointer IS the last arg. Fix: route all four unwraps through the existing `unwrap_ptr_launder()`
+(already `@container`-aware). Closes glob/field/keep sinks (return + var-decl were already caught).
+Tests `tests/zer_fail/container_var_launder_{global,field,keep}.zer` + positive
+`tests/zer/container_var_global_ok.zer` (global-backed `@container` still compiles). Sink matrix
+stays CLEAN (54/54).
+
+**BUG-770 — uN/iN shift result not width-wrapped on the AST-passthrough store path (silent
+miscompile).** `u3 a=3; u32 x; x = a << 2;` gave 12, not 4; an iN shift kept the wrong sign. The G3
+self-mask (emitter.c ~6571) covered `+ - * & | ^` but excluded shifts on the (wrong) assumption that
+`_zer_shl`/`_zer_shr` width-wrap — they only guard shift-by-≥-carrier-width, they do NOT mask the
+result to N. The IR path already masked (emit_intn_mask after `_zer_shl` at IR_BINOP), so only the
+AST-passthrough sinks (plain assign / global / struct-field / array-elem store, and a shift feeding
+`/`/`%`/`>>`) were wrong. Fix: wrap the `_zer_shl`/`_zer_shr` result via `emit_intn_mask_lv` when the
+result type is narrow-native or nonnative uN/iN — mirrors the IR path. This is the AST→IR
+emission-diff class; `emit_intn_mask` for shifts is now behaviourally covered. Test: shift section
+added to `tests/zer/uN_width_wrap_all_forms.zer` (var-decl / assign / global / compound / shift-feeds-
+div / shift-feeds-shr / u8 / signed-i4, values laundered through `volatile` so they exercise the
+runtime mask).
+
+**BUG-771 — `@bitcast` / `@truncate`-to-uN in a global initializer: checker accepts, GCC rejects
+(loud).** The G7 global-init guard (checker.c ~18570) listed `@saturate`/`@addc`/`@subb`/`@mulw` but
+claimed `@truncate`/`@bitcast` "fold to a constant cast" — false: `@bitcast` ALWAYS emits a
+`({…memcpy…})` statement-expression, and `@truncate` to a non-native uN emits a masking
+statement-expression, both illegal at file scope. The checker emitted zero diagnostics; GCC then
+failed the emitted `.c` with "braced-group within expression allowed only inside a function". Fix:
+add `@bitcast` unconditionally and `@truncate` when the declared type is a non-native uN/iN to the
+reject list (native `@truncate` global still compiles). Tests
+`tests/zer_fail/global_init_{bitcast,truncate_uN}.zer`.
+
+---
+
 ## Session 2026-08-08 — ledger reconciliation + the returned-funcptr spawn race
 
 **Ledger drift (7 stale entries, `d0f266af`).** `docs/limitations.md` listed as OPEN a set of

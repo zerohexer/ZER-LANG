@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: local
+// @container(*T, <var holding &local.field>, field) launders a stack pointer into
+// a global. The inline `&d.list` form was caught; the variable form was not — the
+// escape sink hand-rolled a last-arg intrinsic unwrap, which for @container picks
+// the field-NAME, not the pointer. Fixed via unwrap_ptr_launder. (2026-08-09.)
+struct Dev { u32 a; u32 list; }
+?*Dev g;
+void c() { Dev d; *u32 lp = &d.list; g = @container(*Dev, lp, list); }
+u32 main() { c(); return 0; }

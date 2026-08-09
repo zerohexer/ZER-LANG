@@ -1,0 +1,10 @@
+// A funcptr array-element field callback that touches NO non-shared global must
+// still compile (over-rejection guard for the 2026-08-09 funcptr-array fix).
+u32 g_shared_total;
+threadlocal u32 tl;
+void safe_bump() { tl += 1; }          // threadlocal — no race
+typedef *() -> void VoidFn;
+struct Ops { VoidFn[2] fns; }
+void worker(Ops o) { o.fns[0](); }
+void setup() { Ops o; o.fns[0] = safe_bump; spawn worker(o); }
+u32 main() { setup(); return 0; }

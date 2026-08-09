@@ -85,5 +85,34 @@ u32 main() {
     u32 m2; m2 = ~z16;              // ~0 in 16 bits = 65535
     if (m2 != 65535) { return 31; }
 
+    // ---- SHIFT width-wrap (2026-08-09): the shift RESULT must wrap to N bits.
+    // _zer_shl/_zer_shr only guard shift-by->=carrier-width; they do NOT mask to
+    // N. The AST-passthrough store path (plain assign / global / struct-field /
+    // array-elem / shift-feeds-div-mod-shr) dropped the mask → `u3 3<<2` = 12
+    // not 4. var-decl / return / call-arg were safe (IR_BINOP + emit_intn_mask). ----
+    volatile u32 gv3 = 3; u3 sa = @truncate(u3, gv3);   // 3, launder so not folded
+    u32 s1; s1 = sa << 2;           // 3<<2=12 mod 8 = 4   (plain assign — the bug)
+    if (s1 != 4) { return 40; }
+    u32 s2 = sa << 2;               // var-decl form
+    if (s2 != 4) { return 41; }
+    if (s2 != s1) { return 42; }    // both forms must agree
+    g_sink = sa << 2;               // global-store form
+    if (g_sink != 4) { return 43; }
+    u32 s4 = 0; s4 += sa << 2;      // compound-assign RHS
+    if (s4 != 4) { return 44; }
+    u32 sc = 3;
+    u32 s5; s5 = (sa << 2) / sc;    // shift feeds '/' — intermediate must be masked (4/3=1)
+    if (s5 != 1) { return 45; }
+    u32 s6; s6 = (sa << 2) >> 1;    // shift feeds '>>' (4>>1=2)
+    if (s6 != 2) { return 46; }
+    // narrow-native u8 shift: 200<<4 = 3200 mod 256 = 128
+    volatile u32 gv8 = 200; u8 sb = @truncate(u8, gv8);
+    u32 s7; s7 = sb << 4;
+    if (s7 != 128) { return 47; }
+    // signed iN shift keeps sign: i4 7<<1 = 14 -> wraps to -2 (range -8..7)
+    volatile i32 gvi = 7; i4 si = @truncate(i4, gvi);
+    i32 s8; s8 = si << 1;
+    if (s8 != -2) { return 48; }
+
     return 0;
 }

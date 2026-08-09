@@ -5,6 +5,103 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-08-09 audit: confirmed findings NOT fixed this session (with reproducers)
+
+The 2026-08-09 audit fixed four bounded holes (see BUGS-FIXED.md 2026-08-09): the funcptr
+array-element-field spawn race, the `@container(var,field)` stack-launder across 3 sinks, the uN/iN
+shift width-wrap on the AST-passthrough store path, and the `@bitcast`/`@truncate`-to-uN global-init
+guard. The findings below were CONFIRMED the same session but deliberately NOT fixed (each is either
+value-correctness rather than a memory-safety hole, or a fix too invasive/risky to land unattended).
+
+### CONFIRMED silent MISCOMPILE — comptime / const integer fold ignores per-operation width wrapping (value-correctness, NOT a safety hole)
+
+**Symptom.** Compile-time integer evaluation computes in host `int64` and masks the result to the
+declared width in ONLY one place — the OUTERMOST comptime-call return (checker.c ~7029, the 2026-04-21
+Gemini fix). Every INTERMEDIATE value — a per-operation sub-result in a plain `const` fold, a comptime
+function LOCAL, and a NESTED comptime-call return — keeps full 64-bit precision. When an intermediate
+overflows the type width and then feeds a width-sensitive op (`>>`, `/`, `%`, a comparison), the folded
+constant disagrees with the value ZER's runtime (which types literal arithmetic to the DESTINATION width
+and wraps per-op) produces. Compiles clean, wrong value, no diagnostic.
+
+**The destination-width insight (sharpens the earlier analysis).** Verified empirically: at runtime
+`u32 r = (100000*100000) >> 16` = **21515** and `u64 r = (100000*100000) >> 16` = **152587** — ZER
+types the literals to the destination and wraps each op at that width. So for `const u32 W`, the
+spec-correct value is 21515 (u32 per-op wrap), but the fold gives 152587 (unmasked int64). This means
+the fix is a SINGLE destination-width mask applied to EVERY binary/unary result in the fold — not a
+per-node type lookup — because ZER already propagates the destination type to all literal operands.
+
+**Reproducers** (each: exit 1 = comptime/const value != the runtime u32/u8 oracle):
+```zer
+// find_ct_5 — plain const global fold:
+const u32 W = (100000 * 100000) >> 16;         // folds 152587; u32-correct 21515
+// find_ct_1 — comptime fn local:
+comptime u32 F(u32 a){ u32 x = a*a; return x >> 16; }   // F(100000) folds 152587; correct 21515
+// find_ct_3 — nested comptime call return unmasked (same numbers)
+// find_ct_6 — u8 width:   comptime u8 G(u8 a){ u8 x=a+a; return x>>1; }  G(200) folds 200; correct 72
+// find_ct_4 — comptime if picks the WRONG branch (F(100000)>100000 is false at u32, true at int64)
+//             => the wrong code is compiled/stripped (a real behavior change, not just a number)
+```
+Reproducers preserved at `/tmp/find_ct_{1,3,4,5,6}.zer` during the audit (regenerate from the snippets
+above — they are self-contained).
+
+**Why NOT a safety hole (probed).** The checker's safety proof and the emitter BOTH read the same folded
+value, so they agree (no check-vs-emit divergence to exploit): a `const` used as an array size makes the
+array match the folded size; a mis-folded divisor stays nonzero (conservative) and the div-guard was
+verified to still fire; positive-overflow const folds make the checker's range LARGER (more checks, not
+fewer). Could not construct a checker-small / runtime-large divergence.
+
+**Why deferred.** The correct fix threads a destination width into the const/comptime evaluator and
+masks each op. `eval_const_expr` (ast.h) is type-blind by design and is load-bearing for array sizes,
+enum values, mmio ranges, and bitmasks — a wrong mask there could break the build or (worst case)
+mis-size a safety-relevant constant. Too high a regression surface to land unattended in one pass. A
+partial fix (comptime-function path only, via `ct_ctx_set` masking to each local's declared width +
+masking nested-call returns) would fix find_ct_1/3/4/6 but leave the pure-const find_ct_5, so it is
+debt, not a clean fix. Fix plan: add `eval_const_expr_width(node, bits, is_signed)` in checker.c that
+mirrors the emitter's exact per-op wrap/sign semantics (unsigned wrap, signed wrap, shift-≥-width=0),
+call it where a typed const initializer / comptime-if condition / comptime return is folded, and add a
+positive `tests/zer/` matrix asserting the runtime-correct values (it will FAIL on today's build).
+
+### CONFIRMED accept-unsafe — frees-param-field via UNWRAP-TO-LOCAL (extends the "CLOSED 2026-08-08" frees-param-field entry)
+
+The 2026-08-08 fix (`5748e904`) catches a DIRECT `free(param.field)`. It does NOT catch a callee that
+first UNWRAPS the field into a bare local, then frees the local — the free targets a bare local, not a
+param-field compound handle, so the FuncSummary field-free scan records no `frees_param_field` signal and
+the caller's aliases of `param.field` are never widened to FREED. Runtime-proven: glibc double-free abort
+(exit 134) / observable UAF (dangling read of a reused slot).
+```zer
+struct B { u32 x; } struct H { ?[*]B buckets; }
+void fb(H h) { [*]B q = h.buckets orelse { return; }; free(q); }   // frees a LOCAL unwrapped from the field
+u32 main() { H h; h.buckets = alloc(B, 4);
+             [*]B q = h.buckets orelse { return 0; };
+             fb(h); free(q); return 0; }                            // caller double-frees, undiagnosed
+```
+Same-class sub-shapes that all compile clean: if-capture unwrap `if(b.p)|q|{free(q)}`; nested field;
+`*Box` pointer-to-struct param. Sink: FuncSummary free-of-param scan in `zercheck_ir.c` (~5352/~5658)
+follows a FREED compound handle rooted at the param but does not follow `q = h.buckets orelse …` /
+if-capture back to the param field. **Why deferred:** the BASE `frees_param_field` machinery was itself
+"attempted 2026-07-26, REVERTED — not a safe single-session change"; this alias-back variant is strictly
+harder and lands in the same accept-unsafe zercheck_ir region where a bug ships a UAF. Needs the
+def-use "this local aliases param.field" tracking the base fix deferred.
+
+### CONFIRMED still-open — HOLE-A4 move-via-deref (cross-ref)
+`move struct Tok; Tok a; *Tok p=&a; Tok b=*p; consume(a); consume(b);` compiles — the deref-copy
+`Tok b = *p` does not mark `a` transferred, so one resource is double-consumed. Already tracked as
+HOLE-A4 (needs a new IR_UNOP handler in the move/alias path); re-confirmed live 2026-08-09.
+
+### LOW over-rejection — a function returning a raw `*T` view of a global is flagged as a leaked handle
+`*Dev f(){ *u32 lp=&gd.list; return @container(*Dev, lp, list); }` (gd global) is rejected with
+"zercheck: handle 'p' … never freed" at the CALL SITE (`*Dev p = f();`). Identical with `@ptrcast`, so
+it is the general "function returning `*T` is treated as an allocation" leak heuristic, NOT specific to
+`@container` and NOT introduced by the 2026-08-09 `@container` fix (verified: the no-return form compiles
+clean). Over-rejection only (no safety impact). Workaround: return a `Handle`/`?*T`, or read the field.
+
+### SUSPICION (not a race) — `@atomic_load(&g)` on a plain non-shared global compiles clean
+CLAUDE.md states `@atomic_*` require a `*shared T` first arg, but `@atomic_load(&g)` on a non-shared
+global is accepted. By itself not a data race (a consistently-atomic global is safe), so not classified
+accept-unsafe — flagged only as a possible spec/enforcement divergence for a deliberate decision.
+
+---
+
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
 
 **STATUS: all 45 landed.** §A 1/1 · §B 9/9 · §C 7/7 · §D 9/9 · §E 1/1 · §F 4/4 · §G 6/7 (+ G5 with

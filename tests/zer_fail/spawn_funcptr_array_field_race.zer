@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: function-pointer field
+// A funcptr held in an ARRAY ELEMENT of a by-value struct field, bound in the
+// caller (`o.fns[0] = bump`) and invoked in the spawn target (`o.fns[0]()`),
+// reaches a non-shared global. The scalar-field sibling (`o.cb()`) was already
+// rejected; the NODE_INDEX-over-field callee shape slipped the funcptr-field gate
+// (2026-08-09 fix). Data race.
+shared struct Gate { u32 x; }
+Gate gate;
+u32 g_counter;
+void bump() { g_counter += 1; }
+typedef *() -> void VoidFn;
+struct Ops { VoidFn[2] fns; }
+void worker(Ops o) { o.fns[0](); }
+void setup() { Ops o; o.fns[0] = bump; spawn worker(o); }
+u32 main() { setup(); return 0; }

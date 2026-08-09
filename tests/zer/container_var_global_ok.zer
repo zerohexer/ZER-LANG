@@ -1,0 +1,6 @@
+// @container on a variable holding &GLOBAL.field must NOT be flagged as a stack
+// escape (over-rejection guard for the 2026-08-09 @container unwrap_ptr_launder fix).
+struct Dev { u32 a; u32 list; }
+Dev gd; u32 sink;
+void use_it() { *u32 lp = &gd.list; *Dev p = @container(*Dev, lp, list); sink = p.a; }
+u32 main() { use_it(); return 0; }

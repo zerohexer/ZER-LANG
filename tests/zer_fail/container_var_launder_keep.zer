@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: keep
+// keep-call sink of the @container variable-launder class.
+struct Dev { u32 a; u32 list; }
+?*Dev g;
+void stash(keep *Dev p) { g = p; }
+void c() { Dev d; *u32 lp = &d.list; stash(@container(*Dev, lp, list)); }
+u32 main() { c(); return 0; }

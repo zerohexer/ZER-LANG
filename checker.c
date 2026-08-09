@@ -4956,9 +4956,13 @@ static Type *check_expr(Checker *c, Node *node) {
          * NODE_SLICE here. Mirrors the var-decl walker at checker.c:8979. */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
-            /* BUG-355: walk through intrinsics to find root ident */
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* BUG-355: walk through intrinsics to find root ident. Use
+             * unwrap_ptr_launder (NOT a hand-rolled last-arg loop): @container's
+             * pointer is args[0], not the last arg (which is the field-NAME), so a
+             * hand-rolled last-arg unwrap resolved `g = @container(*T, lp, f)` to the
+             * field ident and MISSED that lp is local-derived → a stack pointer
+             * laundered into a global undetected (2026-08-09). */
+            vnode = unwrap_ptr_launder(vnode);
             /* BUG-748: descend through `arr[a..b]` borrow shape */
             bool via_slice_borrow = false;
             if (vnode && vnode->kind == NODE_SLICE) {
@@ -5058,8 +5062,8 @@ static Type *check_expr(Checker *c, Node *node) {
          * Storing to global violates this contract — caller may pass &local. */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* unwrap_ptr_launder: @container pointer is args[0], not last arg. */
+            vnode = unwrap_ptr_launder(vnode);
             /* P9 (BUG-737 field-launder, 2026-06-24): `g = param.field` (or
              * `param[i]`) where the stored value is a pointer/slice FIELD of a
              * non-keep-derived by-value struct param launders the caller's
@@ -6730,9 +6734,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         for (int kc = 0; kc < keep_check_count; kc++) {
                         Node *karg = keep_checks[kc];
-                        /* walk into intrinsics */
-                        while (karg && karg->kind == NODE_INTRINSIC && karg->intrinsic.arg_count > 0)
-                            karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                        /* walk into intrinsics (unwrap_ptr_launder: @container's
+                         * pointer is args[0], not the last arg) */
+                        karg = unwrap_ptr_launder(karg);
                         if (karg && karg->kind == NODE_UNARY &&
                             karg->unary.op == TOK_AMP) {
                             /* C6 (2026-08-01): the DIRECT `keepfn(&loc.f)` /
@@ -6828,6 +6832,11 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                             for (int ldi = 0; ldi < ld_count; ldi++) {
                                 Node *iarg = ld_nodes[ldi];
+                                /* unwrap launder intrinsics first (@container pointer
+                                 * is args[0]) so `keepfn(@container(*T, lp, f))` sees
+                                 * lp's local-derived flag instead of stalling on the
+                                 * NODE_INTRINSIC. (2026-08-09.) */
+                                iarg = unwrap_ptr_launder(iarg);
                                 /* BUG-751: descend NODE_SLICE so `store(local[0..])`
                                  * for a `keep` slice param is rejected (slice borrows
                                  * stack storage that doesn't outlive the call's keep
@@ -10656,11 +10665,26 @@ static bool scan_funcname_binding(Checker *c, Node *n,
  * If-chains, not switches: these are PARTIAL walks, so a no-default switch would
  * be a false promise of exhaustiveness. An unlisted kind yields false = we do not
  * flag = today's behaviour, never a new rejection. */
+/* A callee/target that reads or writes a funcptr HELD IN A STRUCT FIELD, whether
+ * accessed directly (`o.cb`) or as an ARRAY ELEMENT of a field (`o.fns[0]`,
+ * `o.grid[i][j]`). The NODE_INDEX form roots (transitively) in a NODE_FIELD; a bare
+ * local/global funcptr array is a DIFFERENT shape — a local one is caught by the
+ * in-body binding scan, a global one by the global-access scan — so it deliberately
+ * returns false here and is not double-armed. (2026-08-09: the array-element-of-field
+ * form `o.fns[0]()` was a spawn-race hole — the tell/collector matched only bare
+ * NODE_FIELD, so the NODE_INDEX-over-field callee slipped the funcptr-field gate.) */
+static bool funcptr_field_access(Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_FIELD) return true;
+    if (n->kind == NODE_INDEX) return funcptr_field_access(n->index_expr.object);
+    return false;
+}
+
 static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
     if (!n || depth > 8) return false;
     if (n->kind == NODE_CALL) {
-        /* the tell: callee is a FIELD (`o.cb()`), not an ident */
-        if (n->call.callee && n->call.callee->kind == NODE_FIELD) return true;
+        /* the tell: callee reads a funcptr field (`o.cb()` or `o.fns[0]()`) */
+        if (n->call.callee && funcptr_field_access(n->call.callee)) return true;
         for (int i = 0; i < n->call.arg_count; i++)
             if (body_calls_funcptr_field(c, n->call.args[i], depth)) return true;
         /* descend into a directly-called global function */
@@ -10719,7 +10743,7 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
                                         Symbol **out_fn) {
     if (!n || depth > 8) return false;
     if (n->kind == NODE_ASSIGN) {
-        if (n->assign.target && n->assign.target->kind == NODE_FIELD &&
+        if (n->assign.target && funcptr_field_access(n->assign.target) &&
             scan_funcname_binding(c, n->assign.value, out_name, out_len)) {
             /* record WHICH function was bound, so the caller can consult ITS
              * props: an @atomic/@barrier in the CALLBACK is the manual-sync
@@ -18550,10 +18574,28 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                  * accident of the C backend masking a silent checker. Reject
                  * cleanly here so the message names the ZER line and the fix.
                  *
-                 * @truncate/@bitcast fold to a constant cast and are
-                 * intentionally NOT listed — they remain valid global inits. */
+                 * @bitcast ALWAYS lowers to a ({...memcpy...}) statement-expression
+                 * (never a constant cast), so it can never be a file-scope init.
+                 * @truncate folds to a constant `(T)val` cast ONLY for a native-width
+                 * T; to a NON-NATIVE uN/iN it emits a masking ({...}) statement-expr.
+                 * Both were wrongly excluded (the prior comment claimed they "fold to
+                 * a constant cast" — false), so the checker accepted them and GCC then
+                 * rejected the emitted .c with "braced-group within expression allowed
+                 * only inside a function". Same silent-checker/loud-backend shape as
+                 * @saturate above. (2026-08-09.) */
+                bool tgt_nonnative_intn = false;
+                {
+                    TypeKind tk = type_dispatch_kind(type); /* unwraps distinct, NULL-safe */
+                    if (tk == TYPE_UINT || tk == TYPE_SINT) {
+                        uint32_t nb = type_unwrap_distinct(type)->intn.bits;
+                        tgt_nonnative_intn =
+                            !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
+                    }
+                }
                 int is_nonconst_emit =
                     (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
+                    (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
+                    (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||
                     (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
                                  memcmp(gn, "subb", 4) == 0 ||
                                  memcmp(gn, "mulw", 4) == 0));

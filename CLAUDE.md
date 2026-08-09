@@ -2615,6 +2615,33 @@ REJECTS proves nothing until you check the REASON — several "rejections" on ma
 errors, or (§D3) a GCC codegen error masking a checker that emitted no diagnostic at all. Use
 `zerc f.zer -o out.c` to isolate the CHECKER verdict from the GCC one.
 
+### A documented OPEN hole is a HYPOTHESIS — measure before implementing (2026-08-08)
+
+Measured over `docs/limitations.md`: of six entries listed OPEN CRITICAL/HIGH, **four were already
+closed**, one was live, one did not reproduce. Entries are honest when written; the compiler moves
+underneath them. Implementing from a stale description produces a no-op "fix" that looks successful,
+because a rejection is a rejection whether or not your patch caused it.
+
+- **Reproduce on main FIRST**, before reading the fix sketch. Already rejects → mark it closed with
+  the measurement; do not implement.
+- **Read the REASON, not the exit code.** `zerc f.zer -o out.c` exits 0 even on checker errors AND
+  prints a success line `zerc: in.zer -> out.c` — non-empty output is NOT an error. Grep for
+  `error`/`zercheck`, then check it is YOUR rule.
+- **Masking is the dominant failure mode.** 3 of the 6 reproducers were rejected by an unrelated
+  stronger rule (one masked TWICE). Route around it, then re-probe.
+- `grep -c 'error' build.log` **lies** — `CFLAGS` has `-Werror=switch`, so the echoed gcc command
+  line matches. Use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
+- **Never run a `tests/test_*_matrix` binary while `make check` runs** — several share the fixed
+  temp path `/tmp/_zer_co.zer`; concurrent runs yield phantom failures.
+- **Update the entry in the SAME commit as the fix.** The "a stale gate is worse than none" rule
+  this file already states applies to the LEDGER; it had drifted ~3 weeks.
+
+Full protocol + the masking table + the pre-fix rebuild recipe (proving a negative discriminates):
+`docs/compiler-internals.md` "Consuming a documented open hole — the MEASURE-FIRST protocol".
+The canonical multi-site worked example (one question, six syntactic forms, patched four times
+before anyone wrote the axis down — the 5th hole was found BY the enumeration): same file,
+"The funcptr REACH class".
+
 ### Bug Hunting Workflow (principle-first, not brute-force)
 
 **The 12-branch audit-fix merge-back is COMPLETE (2026-07-15).** All **41 unique

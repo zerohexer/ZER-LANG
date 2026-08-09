@@ -34,8 +34,30 @@ one question:
 the callback was never scanned. New `scan_returned_funcname` resolves the callee's
 `return <global function name>` sites and scans each returned body. Flagging on ANY returned name
 is sound: if a racing function CAN be returned, the race is reachable. A computed or param return
-resolves to nothing, so no new rejection. Negative verified ACCEPTED pre-fix; four over-rejection
-controls (no-op, threadlocal, `@atomic_*`, factory outside `spawn`) pinned in a positive.
+resolves to nothing, so no new rejection. Negative verified ACCEPTED pre-fix by rebuilding HEAD's
+checker (not assumed); four over-rejection controls (no-op, threadlocal, `@atomic_*`, factory
+outside `spawn`) pinned in a positive.
+
+**BUG-768 — the FIFTH form, found by enumerating for the gate rather than by any report.** A factory
+that returns ANOTHER factory's result (`get_a(){ return get_b(); }`) puts a `NODE_CALL` in the return
+position, so `scan_returned_funcname` bailed in exactly the way the OLD resolver had bailed on the
+factory call itself. Four sequential fixes across three sessions had not exhausted this class; the
+hole surfaced only once the reach forms were written down as a grid axis. Closed by recursing
+through `scan_funcname_binding` (bounded by the shared `_scan_global_depth`; a self-recursive
+factory terminates, verified). Three-hop also rejected; a two-hop factory to a no-op still compiles.
+
+**The gate: REACH x PAYLOAD in `tests/test_conc_matrix.c`** (6 reach forms x 4 payloads = 24 cells,
+conc-matrix now 67 cells). Verified FIRING — 65/67 with 2 false negatives on a pre-fix build, 67/67
+after. The PAYLOAD axis is not decoration: the fix scans strictly MORE callbacks, so `threadlocal` /
+`@atomic_*` / touches-nothing callbacks must keep compiling at EVERY reach form. Both resolvers are
+partial if-chain walks by design (unlisted kind → "not found" → today's behaviour, never a new
+rejection), which is why they are deliberately NOT no-`default:` switches.
+
+**Docs.** `docs/compiler-internals.md` gains two sections a fresh session cannot re-derive: the
+MEASURE-FIRST protocol (with the masking table and the pre-fix rebuild recipe) and the funcptr REACH
+class. `docs/reference.md` gains the user-visible halves — bit-slice compound assign, the defined
+no-op for an out-of-range runtime bit position, and the full list of ways a spawn target can reach a
+callback. `CLAUDE.md` gets only the on-demand rule + pointers.
 
 ## Session 2026-08-06i — funcptr bound to a LOCAL, passed as a spawn arg (data race)
 

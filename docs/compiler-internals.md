@@ -12017,6 +12017,121 @@ than breaking it — that's the design key for any future lock work:
 - **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
   deferred shared access.
 
+## Consuming a documented "open hole" — the MEASURE-FIRST protocol (2026-08-08)
+
+**Why this section exists.** A reconciliation pass over `docs/limitations.md` found that **four of
+six** entries listed as OPEN CRITICAL/HIGH were already closed, one was live, and one did not
+reproduce at all. That ratio is the point: **a documented hole is a HYPOTHESIS, not a fact.** The
+entries were honest when written; the compiler moved underneath them. Implementing from the
+description without measuring first would have produced four no-op "fixes" against code that
+already rejected the input — and each would have looked successful, because a rejection is a
+rejection whether your patch caused it or not.
+
+### The protocol
+
+1. **Reproduce on current main BEFORE reading the fix sketch.** If it already rejects, the entry is
+   stale — mark it closed with the measurement, do not implement.
+2. **Read the REJECTION REASON, never the exit code.** `zerc f.zer -o out.c` returns **0 even on
+   checker errors** (CLAUDE.md "zerc -o gotchas"), and it prints a progress line
+   `zerc: in.zer -> out.c` on success — so *non-empty output is not an error*. Grep for `error`/
+   `zercheck`, and read what fired.
+3. **If it rejects, prove YOUR rule fired.** Three of the six reproducers were rejected by a
+   DIFFERENT rule (see the masking table below). A masked probe is indistinguishable from a fix.
+4. **If you do implement, verify the negative DISCRIMINATES** by rebuilding the pre-fix compiler —
+   never by assuming (recipe below).
+5. **Whatever you learn, write the measurement back into the entry** — including "did not
+   reproduce, here are the 5 shapes I tried". The next session then starts from evidence.
+
+### Masking is the dominant failure mode — a worked table
+
+ZER has many independent rules over the same programs, so a reproducer often trips a *stronger*
+rule first. Measured 2026-08-08:
+
+| reproducer | masked by | routing-around |
+|---|---|---|
+| `spawn worker(&gw)`, funcptr FIELD | non-shared-pointer-to-spawn rule | make the carrier a `shared struct` |
+| same, reading `gw` in the target | non-shared-global-access rule | same — `shared struct` carrier |
+| union field free (`free(u.b)`) | union-variant-read-requires-switch | not separately testable; note it |
+| G3 atomic-cell via helper | plain-global-access rule | needs BOTH sides atomic to isolate |
+| `local ARRAY of funcptrs` at file scope | non-shared-global-access rule | declare the array LOCAL to the target |
+
+The funcptr-FIELD entry was masked **twice over** — two different rules, each of which had to be
+routed around before the rule under test could speak.
+
+### Rebuilding the pre-fix compiler to prove discrimination
+
+The only honest way to show a negative test would have passed on the broken compiler. Cheap enough
+to do every time:
+
+```sh
+cp checker.c /tmp/checker_fixed.c          # save your work FIRST
+git show HEAD:checker.c > checker.c
+rm -f checker.o && make zerc >/dev/null 2>&1
+./zerc tests/zer_fail/new_negative.zer -o /tmp/n.c 2>&1 | grep -q '<your expected substring>' \
+  && echo "PRE-FIX rejected -> DOES NOT discriminate" || echo "PRE-FIX accepted -> DISCRIMINATES"
+cp /tmp/checker_fixed.c checker.c
+rm -f checker.o && make zerc >/dev/null 2>&1
+```
+
+`rm -f checker.o` is load-bearing both times — the Makefile has no header dependencies and will
+happily relink a stale object (CLAUDE.md "STALE `src/safety/*.o`").
+
+### Two measurement traps that cost cycles this session
+
+- **`grep -c 'error' /tmp/build.log` is wrong.** `CFLAGS` contains `-Werror=switch`, so the gcc
+  *command line* echoed into the log matches. It reported "2 errors" on a clean build. Use
+  `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
+- **Never run a `tests/test_*_matrix` binary while `make check` is running.** Several matrices
+  generate through the same fixed temp path (`/tmp/_zer_co.zer`), so concurrent runs interleave and
+  produce phantom failures — error text attached to a program that could not have produced it.
+
+### The ledger is a gate, and it decays the same way
+
+CLAUDE.md already states *"a stale matrix is worse than none — false confidence"* for audit gates.
+It applies verbatim to `docs/limitations.md`, and had gone unapplied for roughly three weeks.
+**Closing a bug and updating the entry that tracks it are two separate acts, and only the first one
+feels like progress.** Do both in the same commit — the rule the file already carries for gates.
+
+---
+
+## The funcptr REACH class — one question, six syntactic forms (2026-08-06/08)
+
+Canonical worked example of the multi-site class, and the clearest evidence for why a GRID beats
+sequential fixes. The question — *"does the callback this spawn target invokes touch a non-shared
+global?"* — is asked at six forms. It was patched **four times, one form per session**:
+
+| form | closed by |
+|---|---|
+| `*() fp = bump; fp();` — direct name | long-standing |
+| `o.cb = bump; o.cb();` — struct FIELD | `5ed17c2f` |
+| `*() fp = bump; spawn w(fp);` — LOCAL as a spawn ARG | `00dc785a` |
+| `*() fp = get_fp(); fp();` — factory return, 1 hop | `ac97e11a` |
+| `get_a(){ return get_b(); }` — factory return, n hops | `ac97e11a` — **found by enumeration, never reported** |
+| `*() fp = other; fp = bump;` — reassigned local | already covered via the assignment sink |
+
+**The fifth form is the lesson.** Four sequential fixes had not exhausted the class; it surfaced
+only when the forms were written down as a grid axis. A `NODE_CALL` in the return position bailed
+out of the brand-new resolver in exactly the way it had bailed out of the old one.
+
+**Implementation shape.** `scan_funcname_binding` (checker.c) is the single resolver; it now handles
+a factory call by delegating to `scan_returned_funcname`, which walks the callee's
+`return <global function name>` sites and scans each returned body through the ordinary
+`scan_unsafe_global_access`. Recursion is bounded by the shared `_scan_global_depth`, so a
+self-recursive factory terminates. Both are **partial if-chain walks by design** (an unlisted kind
+yields "not found" = today's behaviour = never a new rejection), which is why they are NOT
+no-`default:` switches — a no-default switch there would be a false promise of exhaustiveness.
+
+**Soundness direction.** Flag on ANY returned name, not only an unconditional one: if a racing
+function *can* be returned, the race is reachable. A computed or param return resolves to nothing.
+
+**The gate.** REACH x PAYLOAD in `tests/test_conc_matrix.c` (6 forms x 4 payloads = 24 cells),
+verified firing at 65/67 with 2 false negatives on a pre-fix build. The PAYLOAD axis is not
+decoration: this fix scans strictly MORE callbacks, so `threadlocal` / `@atomic_*` /
+touches-nothing callbacks must keep compiling at every reach form. **A new reach form with no cell
+is invisible — add the cell in the same commit as the form.**
+
+---
+
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 
 ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow

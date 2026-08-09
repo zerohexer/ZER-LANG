@@ -2711,7 +2711,17 @@ undefined behavior.
 ```zer
 reg[9..8]                  // Extract bits 9:8
 reg[7..4] = 0x0F;          // Set bits 7:4
+reg[7..0] += 3;            // Compound assign — read-modify-write of the field
 ```
+Every compound operator works on a bit-slice target (`+= -= *= /= %= &= |= ^=
+<<= >>=`): the current field value is read, the operation applied, the result
+written back into those bits. This is the register read-modify-write idiom.
+
+Positions may be runtime values (`reg[hi..lo]`). If a runtime position is at or
+beyond the width of the target, the write is a **defined no-op** — the target is
+unchanged — matching ZER's rule that a shift of at least the type width is `0`
+rather than undefined. A position known at compile time to be out of range is a
+compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
@@ -2856,8 +2866,14 @@ borrowed by that thread until `.join()`:
   behind `?`, in an array — not just a bare `Handle(T)` argument
 - Scoped spawn: freeing a payload the child still holds **before** `.join()` →
   compile error, including when the payload is carried inside a by-value struct
-- A **function name** passed as a funcptr argument (`spawn worker(bump)`) is
-  scanned too — if the callback touches a non-shared global it is a data race
+- A callback the spawn target invokes is scanned too — if it touches a
+  non-shared global that is a data race, no matter how the target reaches it:
+  a function name passed as an argument (`spawn worker(bump)`), a local bound
+  to a function name (`*() fp = bump; fp();`), a funcptr struct field
+  (`o.cb = bump; o.cb();`), a funcptr array element, or a funcptr obtained from
+  a factory (`*() fp = get_fp(); fp();`, including a factory that returns
+  another factory's result). A callback that touches nothing, touches only
+  `threadlocal`, or synchronizes with `@atomic_*` compiles as usual
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)

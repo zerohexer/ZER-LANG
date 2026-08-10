@@ -1,0 +1,22 @@
+// The D02 async ban is per-STATEMENT, not per-function: locking is per-statement,
+// so a shared access followed by a SEPARATE yield releases the lock before the
+// suspend and must COMPILE. Pins the boundary against the ban being widened to
+// "no shared access inside an async fn", which CLAUDE.md wrongly stated until
+// 2026-08-10 and which would be a large, unnecessary over-rejection.
+// The unsafe direction (shared access in the SAME statement as yield/await) is
+// pinned by tests/zer_fail/bh18_9_await_shared_unlocked.zer.
+shared struct Flag { u32 ready; }
+Flag g;
+
+async void waiter() {
+    u32 x = g.ready;      // shared read — lock taken and RELEASED here
+    yield;                // separate statement: no lock is held across the suspend
+    if (x > 100) { return; }
+}
+
+u32 main() {
+    _zer_async_waiter t;
+    _zer_async_waiter_init(&t);
+    _zer_async_waiter_poll(&t);
+    return 0;
+}

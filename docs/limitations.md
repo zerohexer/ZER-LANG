@@ -390,6 +390,52 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — concurrency sweep 2026-08-10: NO holes found; two doc/impl mismatches corrected
+
+Systematic probe of the concurrency surface after BUG-783. **No accept-unsafe hole found.**
+Recorded so a fresh session does not re-run it blind, and because the sweep's own METHOD
+failed twice before it produced a trustworthy answer.
+
+### Probe-harness failures that produced FALSE "holes" (read before writing a sweep)
+
+1. **The detector missed `zercheck:` diagnostics.** The helper grepped `': error'`, which
+   matches neither `file:3: zercheck: ...` nor a line starting `error:`. ThreadHandle-not-joined
+   was reported as an accepted hole when it is caught. **Grep `-E 'error|zercheck:'`.**
+2. **Three probes did not exercise their rule.** `volatile u64` from a spawn needs
+   `--target-bits 32` (on a 64-bit target a u64 IS single-word, so acceptance is correct);
+   the Ring pointer-element probe used a struct VALUE element; the async probe used a shape
+   the rule deliberately allows. Each looked like a hole and was a malformed probe.
+
+### Verified CLOSED by this sweep (each caught, correct reason)
+
+ThreadHandle never joined; ISR non-atomic RMW via a pointer param; scoped-borrow write between
+spawn/join; scoped-borrow CROSS-BLOCK; `threadlocal &` to a spawn; Handle nested in an optional
+struct to a spawn; same-statement two-shared-type deadlock; spawn inside `@critical`; global
+Pool from a spawn body; `slab.alloc` in an ISR; `@cond_wait` on a foreign shared struct;
+`volatile u64` from a spawn at `--target-bits 32`; move-struct through a spawn arg; Ring push of
+a local-derived pointer; shared read in an `await` condition; shared read in a `yield` statement.
+
+### Doc/impl mismatch #1 — CORRECTED (CLAUDE.md)
+
+CLAUDE.md's safety table said *"Shared struct field access inside async function -> compile
+error"*. **That overstates the rule.** The real D02 ban is *shared access in a statement
+CONTAINING yield/await* (checker.c ~7496, gated on `in_async_yield_stmt`), because locking is
+PER-STATEMENT: `x = g.v; yield;` releases the lock before the suspend and is correctly
+ACCEPTED. The row now states the real rule. Left as-is this would have sent a session hunting
+a non-bug — or "fixing" a correct acceptance into an over-rejection.
+
+### Doc/impl mismatch #2 — NOT corrected, needs an owner decision
+
+`@atomic_load(&g)` on a **plain non-shared** global compiles clean. The docs describe atomics
+as requiring a `*shared T` operand. Probed: this is **not a race** — the atomic-cell rule
+(BUG-769/771) catches any MIXED plain+atomic access, so a purely-atomic access to a plain
+global is sound, and the emitted code is a real atomic instruction. So the question is
+whether to (a) enforce the documented `*shared T` requirement (a tightening; would reject
+working code), or (b) relax the docs to match. **Not a safety issue either way** — recorded so
+it is not re-probed as a suspected hole.
+
+---
+
 ## OPEN — residuals after the 2026-08-10 survey (measured; reproducers in `tests/zer_gaps/`)
 
 The 9 survey fixes + the 8th funcptr REACH form all landed. These are what the three

@@ -1194,7 +1194,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Naked non-asm code | Non-asm/non-return statements in naked function → compile error (stack not allocated without prologue). |
 | Comptime loop DoS | Nested comptime loops exceeding 1M total operations → compile error (global instruction budget). |
 | Move struct capture copy | `if (opt) \|k\|` value capture of move struct → compile error. Must use `\|*k\|` pointer capture. |
-| Async shared struct | Shared struct field access inside async function → compile error. Lock held across yield/await = deadlock. |
+| Async shared struct | Shared access in a statement CONTAINING yield/await → compile error (the lock would be held across the suspend). NOT a blanket ban on shared access inside an async fn: locking is PER-STATEMENT, so `x = g.v; yield;` releases before the suspend and is correctly ACCEPTED. Verified 2026-08-10 — the old wording overstated this and would have sent a session hunting a non-bug. |
 | Ghost handle (leaked alloc) | `pool.alloc()` / `slab.alloc()` as bare expression → compile error (handle discarded) |
 | Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
 | Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error. Allocation coloring: arena wrappers (chained, type-punned) excluded via source_color + param color inference |

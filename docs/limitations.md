@@ -395,7 +395,32 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 The 9 survey fixes + the 8th funcptr REACH form all landed. These are what the three
 branches documented but did NOT fix, each **re-verified live on main 2026-08-10**.
 
-### HIGH ACCEPT-UNSAFE — pointer-deref var-decl alias (`*T k = *pp;`) untracked -> UAF + double free
+### ~~HIGH ACCEPT-UNSAFE — pointer-deref var-decl alias (`*T k = *pp;`)~~ — **CLOSED 2026-08-10 (BUG-781)**
+
+Closed by REJECTING the form, not by tracking it — the Level-A stance: when the analyzer
+cannot prove which allocation an alias refers to, reject. Resolving `*pp` needs points-to
+over a pointer-to-pointer, which the per-file + summaries model deliberately lacks, so
+there is nothing to prove it WITH. **Cost measured before shipping: ZERO instances in the
+whole corpus** (tests/zer, zer_fail, test_modules, rust_tests, zig_tests) — every
+deref-init var-decl there is a SCALAR or struct-VALUE copy, which the predicate does not
+match because it requires a POINTER-typed result. Restructure is one line and teachable
+(`*T k = p;`), which is the bar CLAUDE.md sets for an acceptable false positive.
+Tests: `tests/zer_fail/deref_alias_uaf_double_free.zer` + `tests/zer/deref_scalar_ok.zer`.
+
+**Enumerating first found TWO more live forms the branch had not recorded** — deref into a
+struct FIELD (`h.p = *pp;`) and deref RETURNED through a function (`return *pp;`). Both
+still ACCEPTED; the var-decl sink is closed, those two sinks are not. Same predicate
+(`deref_ptr_launder`) applies — wire it at the assignment and return sinks. Kept OPEN below
+rather than claimed closed, because a partial fix that promotes the gap file is exactly the
+false-confidence failure this ledger exists to prevent.
+
+### HIGH ACCEPT-UNSAFE (RESIDUAL) — the same deref-launder at the FIELD-STORE and RETURN sinks
+
+`h.p = *pp;` and `*Node leak(**Node pp) { return *pp; }` are both still accepted. The
+predicate exists and the var-decl sink uses it; these two sinks need the same call. Verified
+live 2026-08-10 after the var-decl fix landed.
+
+### ~~(superseded — original entry text follows)~~ pointer-deref var-decl alias
 
 `tests/zer_gaps/deref_alias_uaf_double_free.zer`. **Measured live: the program RUNS and
 returns 7** — it reads `n.v` after `free(k)` (stale value) and then double-frees. Heap facet

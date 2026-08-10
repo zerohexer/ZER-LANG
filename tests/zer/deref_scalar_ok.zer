@@ -1,0 +1,20 @@
+// Over-rejection boundary for the deref-launder reject. Only a POINTER-typed
+// result is rejected; dereferencing to a scalar or a struct VALUE is a copy, not
+// an alias, and must keep compiling.
+struct S { u32 v; }
+
+u32 read_through(*u32 p) { u32 v = *p; return v; }
+
+u32 main() {
+    u32 a = 5;
+    *u32 p = &a;
+    u32 v = *p;                 // scalar copy
+    if (v != 5) { return 1; }
+    if (read_through(&a) != 5) { return 2; }
+
+    S s; s.v = 3;
+    *S sp = &s;
+    S copy = *sp;               // struct VALUE copy
+    if (copy.v != 3) { return 3; }
+    return 0;
+}

@@ -1758,6 +1758,38 @@ static Node *unwrap_ptr_launder(Node *v) {
     return v;
 }
 
+/* A POINTER-typed value produced by dereferencing a pointer-to-pointer creates an
+ * alias the analyzer cannot follow: `**Node pp = &n; *Node k = *pp;` makes k alias
+ * n's allocation, but resolving that needs points-to over pp, which the per-file +
+ * summaries model deliberately does not have. Measured live 2026-08-10: the
+ * reproducer RAN, read freed memory and double-freed.
+ *
+ * Level-A stance — when the analyzer cannot PROVE what an alias refers to, reject.
+ * Over-rejection is the accepted cost; the restructure is a teachable discipline
+ * ("alias the pointer directly so the compiler can follow it"), which is the bar
+ * CLAUDE.md sets for an acceptable false positive.
+ *
+ * Cost measured before shipping: ZERO instances in the whole corpus (tests/zer,
+ * zer_fail, test_modules, rust_tests, zig_tests). Every deref-init var-decl there
+ * is a SCALAR copy (`u32 v = *p`) or a Handle/move-struct, which are tracked and
+ * are NOT matched here — the gate requires the RESULT to be pointer-typed. */
+static bool deref_ptr_launder(Checker *c, Node *e) {
+    if (!e || e->kind != NODE_UNARY || e->unary.op != TOK_STAR) return false;
+    Node *inner = e->unary.operand;
+    if (!inner || inner->kind != NODE_IDENT) return false;
+    Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
+                              (uint32_t)inner->ident.name_len);
+    if (!sy || !sy->type) return false;
+    /* operand must be a pointer-to-pointer ... */
+    Type *ot = type_unwrap_distinct(sy->type);
+    if (type_dispatch_kind(ot) != TYPE_POINTER) return false;
+    Type *inner_t = ot->pointer.inner ? type_unwrap_distinct(ot->pointer.inner) : NULL;
+    if (!inner_t) return false;
+    TypeKind ik = type_dispatch_kind(inner_t);
+    /* ... yielding a POINTER (or slice/opaque): a scalar `u32 v = *p` is unaffected. */
+    return ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE;
+}
+
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     Node *root = operand;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -11367,6 +11399,19 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
+            /* Deref-launder: `*T k = *pp;` binds an alias the analyzer cannot
+             * follow — resolving it needs points-to over `pp`, which the per-file +
+             * summaries model deliberately lacks. Level-A stance: cannot prove =>
+             * REJECT. Measured live: the reproducer RAN, read freed memory and then
+             * double-freed. A scalar `u32 v = *p` is NOT matched (the predicate
+             * requires a POINTER-typed result); corpus cost measured at ZERO. */
+            if (node->var_decl.init && deref_ptr_launder(c, node->var_decl.init)) {
+                checker_error(c, node->loc.line,
+                    "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
+                    "— the compiler cannot prove which allocation it aliases, so a later "
+                    "free through either name would be a use-after-free. Alias the pointer "
+                    "directly ('*T k = p;') instead");
+            }
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
@@ -13746,6 +13791,14 @@ static void check_stmt(Checker *c, Node *node) {
                 if (validate_struct_init(c, node->ret.expr, c->current_func_ret, node->loc.line)) {
                     ret_type = c->current_func_ret;
                     typemap_set(c, node->ret.expr, c->current_func_ret);
+                }
+                /* Deref-launder: `return *pp;` hands the caller an alias the
+                 * analyzer cannot follow. See deref_ptr_launder. */
+                if (deref_ptr_launder(c, node->ret.expr)) {
+                    checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer-to-pointer — "
+                    "the compiler cannot prove which allocation it aliases, so a later "
+                    "free through either name would be a use-after-free. Alias the "
+                    "pointer directly (`*T k = p;`) or pass it as an argument");
                 }
                 /* Escape sink — this was the MISSING SIBLING of the var-decl and
                  * assign-to-global sinks, both of which already ran

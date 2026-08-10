@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: dereferencing a pointer-to-pointer
+// Heap facet of HOLE-A4. `*Node k = *pp;` bound an alias the analyzer could not
+// follow, so free(k) never marked n's allocation FREED. MEASURED LIVE before the
+// fix: this program RAN and returned 7 — it read n.v after free(k) (stale value)
+// and then double-freed. Resolving the alias needs points-to over pp, which the
+// per-file + summaries model deliberately lacks, so the Level-A stance applies:
+// cannot prove => reject. Corpus cost of the reject measured at ZERO.
+struct Node { u32 v; }
+
+u32 main() {
+    *Node n = alloc(Node) orelse { return 0; };
+    n.v = 7;
+    **Node pp = &n;
+    *Node k = *pp;
+    free(k);
+    u32 x = n.v;
+    free(n);
+    return x;
+}

@@ -414,11 +414,13 @@ still ACCEPTED; the var-decl sink is closed, those two sinks are not. Same predi
 rather than claimed closed, because a partial fix that promotes the gap file is exactly the
 false-confidence failure this ledger exists to prevent.
 
-### HIGH ACCEPT-UNSAFE (RESIDUAL) — the same deref-launder at the FIELD-STORE and RETURN sinks
+### ~~HIGH ACCEPT-UNSAFE (RESIDUAL) — deref-launder at the FIELD-STORE and RETURN sinks~~ — **CLOSED 2026-08-10 (BUG-782)**
 
-`h.p = *pp;` and `*Node leak(**Node pp) { return *pp; }` are both still accepted. The
-predicate exists and the var-decl sink uses it; these two sinks need the same call. Verified
-live 2026-08-10 after the var-decl fix landed.
+`h.p = *pp;` and `*Node leak(**Node pp) { return *pp; }` now reject via the same
+`deref_ptr_launder` predicate. **All three sinks of this class are closed** (var-decl,
+field-store/assign, return). Tests: `tests/zer_fail/deref_alias_{uaf_double_free,field_store,return}.zer`;
+`tests/zer/deref_scalar_ok.zer` pins the over-rejection boundary across all three sinks
+(scalar var-decl, scalar assign, struct-VALUE copy, scalar return).
 
 ### ~~(superseded — original entry text follows)~~ pointer-deref var-decl alias
 

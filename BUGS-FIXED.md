@@ -5,6 +5,26 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-10d — BUG-782: the deref-launder class closed at all three sinks
+
+Completes BUG-781. The same `deref_ptr_launder` predicate now runs at the FIELD-STORE /
+assignment sink (`h.p = *pp;`, `g = *pp;`) and the RETURN sink (`return *pp;`), not just the
+var-decl sink. Both forms were found by ENUMERATING the sinks before fixing the first one —
+neither was in the branch's report.
+
+**A note on the return sink, because it is a trap worth remembering.** The first attempt
+placed the check inside the `if (node->ret.expr->kind == NODE_STRUCT_INIT)` block, so it
+only ever fired for struct-literal returns and never for `return *pp;`. It built clean and
+looked applied. What exposed it was a one-line trace confirming the predicate was never
+REACHED — not reasoning about the code. Same lesson as the earlier `expr_kind=39` trace:
+when a fix silently does nothing, print whether it runs before theorising about why it
+doesn't work.
+
+Over-rejection boundary extended to all three sinks in `tests/zer/deref_scalar_ok.zer`:
+scalar var-decl (`u32 v = *p`), scalar assign (`x = *p`), struct-VALUE copy (`S b = *p`),
+and scalar return (`return *p`). The predicate requires a POINTER-typed result, so none of
+these match. Corpus cost remains ZERO.
+
 ## Session 2026-08-10c — BUG-780: the 8th funcptr REACH form (forwarded parameter)
 
 **BUG-780 — a CALLER-supplied funcptr FORWARDED to a spawn.** `run(bump)` where

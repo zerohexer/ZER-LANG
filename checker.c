@@ -4262,6 +4262,16 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Assignment ---- */
     case NODE_ASSIGN: {
+        /* Deref-launder sink: `h.p = *pp;` / `g = *pp;` stores an alias the
+         * analyzer cannot follow into a field or a global. Same predicate and
+         * Level-A stance as the var-decl and return sinks. */
+        if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
+            checker_error(c, node->loc.line,
+                "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
+                "— the compiler cannot prove which allocation it aliases, so a later "
+                "free through either name would be a use-after-free. Alias the pointer "
+                "directly ('*T k = p;') instead");
+        }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
@@ -13245,6 +13255,15 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
+        /* Deref-launder sink: `return *pp;` hands the CALLER an alias the analyzer
+         * cannot follow, so a free through either name is a UAF. Same predicate and
+         * Level-A stance as the var-decl sink. Scalar / struct-VALUE not matched. */
+        if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
+            checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
+                "— the compiler cannot prove which allocation it aliases, so a later "
+                "free through either name would be a use-after-free. Alias the pointer "
+                "directly ('*T k = p;') instead");
+        }
         /* B4: ban control flow that exits a @once body (would skip the done-publish). */
         if (c->in_once) {
             checker_error(c, node->loc.line,
@@ -13791,14 +13810,6 @@ static void check_stmt(Checker *c, Node *node) {
                 if (validate_struct_init(c, node->ret.expr, c->current_func_ret, node->loc.line)) {
                     ret_type = c->current_func_ret;
                     typemap_set(c, node->ret.expr, c->current_func_ret);
-                }
-                /* Deref-launder: `return *pp;` hands the caller an alias the
-                 * analyzer cannot follow. See deref_ptr_launder. */
-                if (deref_ptr_launder(c, node->ret.expr)) {
-                    checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer-to-pointer — "
-                    "the compiler cannot prove which allocation it aliases, so a later "
-                    "free through either name would be a use-after-free. Alias the "
-                    "pointer directly (`*T k = p;`) or pass it as an argument");
                 }
                 /* Escape sink — this was the MISSING SIBLING of the var-decl and
                  * assign-to-global sinks, both of which already ran

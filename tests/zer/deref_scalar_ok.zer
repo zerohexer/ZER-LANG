@@ -4,6 +4,7 @@
 struct S { u32 v; }
 
 u32 read_through(*u32 p) { u32 v = *p; return v; }
+u32 ret_through(*u32 p) { return *p; }
 
 u32 main() {
     u32 a = 5;
@@ -16,5 +17,10 @@ u32 main() {
     *S sp = &s;
     S copy = *sp;               // struct VALUE copy
     if (copy.v != 3) { return 3; }
+
+    u32 x = 0;
+    x = *p;                     // scalar ASSIGN (the field-store sink)
+    if (x != 5) { return 4; }
+    if (ret_through(&a) != 5) { return 5; }   // scalar RETURN sink
     return 0;
 }

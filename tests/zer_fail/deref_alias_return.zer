@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: dereferencing a pointer-to-pointer
+// Sibling sink: the laundered pointer is RETURNED, handing the caller an alias
+// the analyzer cannot follow. Also found by enumeration, not reported.
+struct Node { u32 v; }
+
+*Node leak(**Node pp) { return *pp; }
+
+u32 main() {
+    *Node n = alloc(Node) orelse { return 0; };
+    *Node k = leak(&n);
+    free(k);
+    u32 x = n.v;
+    free(n);
+    return x;
+}

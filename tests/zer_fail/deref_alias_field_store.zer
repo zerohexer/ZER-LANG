@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: dereferencing a pointer-to-pointer
+// Sibling sink of deref_alias_uaf_double_free: the laundered pointer is stored
+// into a STRUCT FIELD instead of bound to a new local. Found by enumerating the
+// sinks before fixing the var-decl one — it was not in the branch's report.
+struct Node { u32 v; }
+struct H { ?*Node p; }
+
+u32 main() {
+    *Node n = alloc(Node) orelse { return 0; };
+    **Node pp = &n;
+    H h;
+    h.p = *pp;
+    free(n);
+    return 0;
+}

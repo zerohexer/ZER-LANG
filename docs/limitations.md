@@ -641,8 +641,12 @@ From `2hg2v4`:
 - **SUSPICION (not confirmed)** — `@atomic_load(&g)` on a plain non-shared global compiles clean.
 
 From `l3vn1i`:
-- ISR funcptr FIELD *call* whose binding is NOT a same-scope struct init (LOW–MEDIUM) — the
-  residual after L3.
+- ~~ISR funcptr FIELD *call* / factory-return residual after L3~~ — **CLOSED 2026-08-10
+  (BUG-783).** All NINE reach forms are now covered at the ISR sink. Measuring first
+  corrected the premise: seven were ALREADY caught (`record_isr_globals` descends var-decl
+  inits, assignments and struct-init fields generically), and only the two FACTORY-return
+  forms were live. Gated by a 9-cell ISR sub-grid in `tests/test_conc_matrix.c`
+  (conc-matrix 84 cells, verified firing at 82/84 pre-fix).
 - `naked` attribute silently dropped on the IR path (confirmed still live).
 - `vrp_ir.c` DEAD CODE (349 lines) — cross-ref: this is Phase 0 of
   `docs/unified-oracle-proved-ZER.md`.

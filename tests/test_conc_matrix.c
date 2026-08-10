@@ -53,7 +53,16 @@ static int has_conc_reason(const char *eb) {
             * Without this the carrier grid reported correct rejections as
             * SUSPECT. Deliberately NOT matching bare "use after free", which
             * would let an unrelated single-threaded UAF pass as coverage. */
-           strstr(eb, "is transferred");
+           strstr(eb, "is transferred") ||
+           /* 2026-08-10: the ISR sink's diagnostic. A global reached from BOTH an
+            * interrupt handler and main code is the ISR-side data race, and its
+            * message is "accessed from both interrupt and main code — must be
+            * declared volatile". Without this the ISR reach grid reported nine
+            * correct rejections as SUSPECT. Deliberately matching the SPECIFIC
+            * phrase, not bare "interrupt": a loose substring matches the unrelated
+            * ISR-SIGNATURE error, which is exactly how a pre-fix build masked
+            * these tests when they were first written. */
+           strstr(eb, "accessed from both interrupt");
 }
 
 /* NEGATIVE: must reject for a concurrency reason. */
@@ -545,6 +554,70 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
         decls, argty, body, alloc, setup, tail);
 }
 
+/* ================================================================
+ * ISR REACH sub-grid (2026-08-10)
+ *
+ * The SAME nine reach forms, at the INTERRUPT sink instead of the spawn sink.
+ * This axis exists because the two sinks drifted: the spawn side was fixed
+ * seven times while the ISR side lagged, and every time that asymmetry existed
+ * it produced a bug (BUG-774 closed three ISR forms; the two factory forms were
+ * still live afterwards and are closed here).
+ *
+ * NEGATIVE cells only. An `interrupt` block cannot appear in a RUNNABLE positive
+ * — GCC refuses ISRs on hosted x86-64 ("SSE instructions aren't allowed in
+ * interrupt service routine") — so the safe-payload columns have no home in a
+ * run-based grid. The over-rejection boundary for the ISR sink is pinned instead
+ * by tests/zer_fail + the compile-only controls recorded in BUGS-FIXED.md.
+ *
+ * A new reach form must get a cell HERE as well as in the spawn grid. */
+typedef enum { IR_DIRECT, IR_GLOBAL_FP, IR_ARG, IR_STRUCT_INIT, IR_LOCAL_BIND,
+               IR_FIELD_ASSIGN, IR_FIELD_ARRAY, IR_FACTORY1, IR_FACTORY2,
+               IR_COUNT } IsrReach;
+
+static const char *isr_name(IsrReach r) {
+    switch (r) {
+    case IR_DIRECT:       return "direct-call";
+    case IR_GLOBAL_FP:    return "global-funcptr";
+    case IR_ARG:          return "funcname-arg";
+    case IR_STRUCT_INIT:  return "struct-init-field";
+    case IR_LOCAL_BIND:   return "local-binding";
+    case IR_FIELD_ASSIGN: return "field-assign";
+    case IR_FIELD_ARRAY:  return "field-array-elem";
+    case IR_FACTORY1:     return "factory-1hop";
+    case IR_FACTORY2:     return "factory-2hop";
+    case IR_COUNT:        break;
+    }
+    return "?";
+}
+
+static void gen_isr_reach(IsrReach r, char *out, size_t n) {
+    const char *extra = "", *body = "";
+    switch (r) {
+    case IR_DIRECT:       body = "bump();"; break;
+    case IR_GLOBAL_FP:    extra = "*() -> void gcb = bump;\n"; body = "gcb();"; break;
+    case IR_ARG:          extra = "void inv(*() -> void f) { f(); }\n"; body = "inv(bump);"; break;
+    case IR_STRUCT_INIT:  extra = "struct Ops { *() -> void cb; }\n";
+                          body = "Ops o = { .cb = bump }; o.cb();"; break;
+    case IR_LOCAL_BIND:   body = "*() -> void fp = bump; fp();"; break;
+    case IR_FIELD_ASSIGN: extra = "struct Ops { *() -> void cb; }\n";
+                          body = "Ops o; o.cb = bump; o.cb();"; break;
+    case IR_FIELD_ARRAY:  extra = "typedef *() -> void VFn;\nstruct Ops { VFn[2] fns; }\n";
+                          body = "Ops o; o.fns[0] = bump; o.fns[0]();"; break;
+    case IR_FACTORY1:     extra = "*() -> void mk() { return bump; }\n";
+                          body = "*() -> void fp = mk(); fp();"; break;
+    case IR_FACTORY2:     extra = "*() -> void mk2() { return bump; }\n*() -> void mk() { return mk2(); }\n";
+                          body = "*() -> void fp = mk(); fp();"; break;
+    default: break;
+    }
+    snprintf(out, n,
+        "u32 g;\n"
+        "void bump() { g += 1; }\n"
+        "%s"
+        "interrupt TIM1 { %s }\n"
+        "u32 main() { g = 1; return g; }\n",
+        extra, body);
+}
+
 int main(void) {
     find_zerc();
     fprintf(stderr, "=== Concurrency (data-race / spawn / deadlock) matrix ===\n");
@@ -602,6 +675,19 @@ int main(void) {
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
+    }
+
+    /* ---- ISR reach sub-grid (same forms, interrupt sink) ---- */
+    fprintf(stderr, "\n  -- ISR reach grid (same forms at the INTERRUPT sink) --\n");
+    char ibuf[1024];
+    for (IsrReach r = 0; r < IR_COUNT; r++) {
+        valid_cells++;
+        char nm[160];
+        snprintf(nm, sizeof(nm), "isr-reach/%s", isr_name(r));
+        gen_isr_reach(r, ibuf, sizeof(ibuf));
+        int ok = run_neg(nm, ibuf);
+        fprintf(stderr, "  [%-18s][isr] %s\n", isr_name(r), ok ? "ok" : "*** FAIL ***");
+        if (!ok) grid_ok = 0;
     }
 
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);

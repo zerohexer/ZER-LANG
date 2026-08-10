@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: accessed from both interrupt and main code
+// ISR sibling of the spawn factory-return form (ac97e11a). An ISR reaching a
+// shared global through a funcptr obtained from a FACTORY CALL. The spawn path
+// gained this resolution; the ISR path did not, leaving the last of the nine
+// REACH forms live on the ISR side — a silent bare-metal race (the global stays
+// non-volatile, GCC -O2 free to hoist or tear it).
+u32 g;
+
+void bump() { g += 1; }
+
+*() -> void mk() { return bump; }
+
+interrupt TIM1 { *() -> void fp = mk(); fp(); }
+
+u32 main() { g = 1; return g; }

@@ -5,6 +5,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-10e — BUG-783: the ISR/spawn REACH asymmetry closed, and gated
+
+**The asymmetry was real but SMALLER than I claimed.** I reported "eight spawn-side forms,
+three ISR-side" — wrong. Measuring all nine forms at the ISR sink found **seven already
+caught**; only the two FACTORY-return forms were live. The three the L3 fix (BUG-774)
+*named* are not the three it *covers* — `record_isr_globals` already descends var-decl
+inits, assignments and struct-init fields generically. Count what the code does, not what
+its commit message enumerates.
+
+**BUG-783 — an ISR reaching a global through a funcptr from a FACTORY CALL.**
+`*() fp = mk(); fp();` inside an `interrupt` block, where `mk()` returns the racing
+function (directly or via another factory). `record_isr_funcname_binding` required a
+`NODE_IDENT` — exactly the limitation `scan_funcname_binding` had before `ac97e11a`. Fixed
+with the ISR mirror of that resolution (`record_isr_returned_funcname`), so the ISR path
+now resolves factory returns the way the spawn path does. All nine forms covered at both
+sinks; the seven already-caught forms verified unchanged; two safe controls (factory
+returning a `volatile`-only toucher, factory returning a no-op) still compile.
+
+**THE GATE — an ISR axis on the REACH grid, so the drift cannot silently recur.**
+`tests/test_conc_matrix.c` gains a 9-cell ISR sub-grid: the same nine reach forms at the
+INTERRUPT sink. conc-matrix 75 -> **84 cells**, verified firing (82/84 pre-fix). NEGATIVE
+cells only — an `interrupt` block cannot appear in a runnable positive because GCC refuses
+ISRs on hosted x86-64, so the safe-payload columns have no home in a run-based grid; that
+constraint is written into the sub-grid's header comment.
+
+**A weak-oracle catch worth recording.** The two new negatives first carried
+`// expect-error: interrupt`, and both "passed" on a PRE-FIX build — the loose substring
+matched an unrelated **ISR-signature** error ("interrupt service routine can only have a
+pointer argument"). Tightening to the actual reason
+(`accessed from both interrupt and main code`) made both discriminate. The same trap then
+appeared one layer up: the grid's `has_conc_reason` needed the ISR phrase added, and it was
+added as the SPECIFIC phrase rather than bare `"interrupt"` for exactly this reason — noted
+inline so nobody loosens it later.
+
 ## Session 2026-08-10d — BUG-782: the deref-launder class closed at all three sinks
 
 Completes BUG-781. The same `deref_ptr_launder` predicate now runs at the FIELD-STORE /

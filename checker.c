@@ -17456,8 +17456,46 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
  * track_isr_global. Switch has no default: so a new NodeKind is a build error
  * (walker-default discipline); the kind coverage mirrors scan_unsafe_global_access
  * plus @critical/@once bodies. */
+/* Walk a FACTORY body for `return <global function name>` and record what each
+ * returned function reaches. ISR mirror of scan_returned_funcname on the spawn
+ * path (ac97e11a). Partial if-chain by design: an unlisted kind records nothing,
+ * which is today's behaviour and never a new rejection. */
+static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
+static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
+    if (!c || !n || depth > 8) return;
+    if (n->kind == NODE_RETURN) { record_isr_funcname_binding(c, n->ret.expr, depth); return; }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            record_isr_returned_funcname(c, n->block.stmts[i], depth);
+        return;
+    }
+    if (n->kind == NODE_IF) {
+        record_isr_returned_funcname(c, n->if_stmt.then_body, depth + 1);
+        record_isr_returned_funcname(c, n->if_stmt.else_body, depth + 1);
+        return;
+    }
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE) {
+        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1); return;
+    }
+    if (n->kind == NODE_FOR) { record_isr_returned_funcname(c, n->for_stmt.body, depth + 1); return; }
+}
+
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
     if (!c || !value || depth > 32) return;
+    /* ISR funcptr from a FACTORY CALL — `*() fp = mk(); fp();` inside an ISR,
+     * where `mk` returns the racing function (directly, or via another factory).
+     * The spawn path gained this in ac97e11a; the ISR path did not, leaving the
+     * last two of the nine REACH forms live on the ISR side. Resolve through the
+     * callee's return sites, exactly as the spawn resolver does. */
+    if (value->kind == NODE_CALL && value->call.callee &&
+        value->call.callee->kind == NODE_IDENT && depth < 8) {
+        Symbol *gs = scope_lookup(c->global_scope, value->call.callee->ident.name,
+                                  (uint32_t)value->call.callee->ident.name_len);
+        if (gs && gs->is_function && gs->func_node &&
+            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body)
+            record_isr_returned_funcname(c, gs->func_node->func_decl.body, depth + 1);
+        return;
+    }
     if (value->kind != NODE_IDENT) return;
     Symbol *fs = scope_lookup(c->global_scope, value->ident.name,
                               (uint32_t)value->ident.name_len);
@@ -17483,6 +17521,7 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
  * too, and the remedy (declare the global volatile / use @atomic_*) is
  * identical either way. */
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
+static void record_isr_returned_funcname(Checker *c, Node *n, int depth);
 
 static void record_isr_globals(Checker *c, Node *node, int depth) {
     if (!node || depth > 32) return;

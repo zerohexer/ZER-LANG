@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: accessed from both interrupt and main code
+// Same, through a factory that returns ANOTHER factory's result. Mirrors the
+// spawn-side n-hop form; the resolver recurses through return sites.
+u32 g;
+
+void bump() { g += 1; }
+
+*() -> void mk2() { return bump; }
+*() -> void mk() { return mk2(); }
+
+interrupt TIM1 { *() -> void fp = mk(); fp(); }
+
+u32 main() { g = 1; return g; }

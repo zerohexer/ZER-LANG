@@ -46,6 +46,10 @@ Related context elsewhere:
 - §15 Mission-critical / certification framing (the claim language that survives review)
 - §16 Roadmap and first steps
 - §17 Rejected-alternatives ledger (the no-reloop table)
+- §19 **The proof-carrying C pipeline — Tier B INSTANTIATED** (2026-08-11): the built
+      Lean→emit→CBMC mechanism, the four silent semantic traps, the guard checklist,
+      evalS's real coverage, the cost model, and §19.9 THE ARENA DECISION.
+      **Amends §0.1** — hot paths MAY be hand-written C, specified in Lean.
 - §18 Sources and provenance
 
 ---
@@ -55,7 +59,9 @@ Related context elsewhere:
 **ZER becomes a verified compiler, written in Lean 4, proven correct per pass.**
 
 1. **Implementation language: Lean 4** — the whole compiler core (checker, IR passes,
-   emitter), not just the proofs. One artifact where the theorem is about the code that runs.
+   emitter), not just the proofs. **AMENDED 2026-08-11 (§19.1): computational HOT
+   PATHS may be hand-written C, specified and proved in Lean and linked per build by
+   CBMC. Lean remains the DEFAULT; C is an escape hatch for a MEASURED bottleneck.** One artifact where the theorem is about the code that runs.
    Migrated from the current ~47k-line C core via the strangler pattern, checker first.
 2. **Assurance tier: A (CompCert-style verified passes)** — each compiler pass carries a
    machine-checked semantic-preservation theorem; composed into an end-to-end Grand Theorem.
@@ -1163,6 +1169,315 @@ on the Lean learning curve.
 | Believing 2024-era iris-lean status ("no WP/adequacy") | Empirically false as of 2026-07 (§4.2 build + axiom probe on this machine) | never — re-verify against the repo instead |
 | **A ZER-native backend emitting ISA directly (§8.2's Stage 5)** | **RETIRED 2026-07-29 (§8.3).** Trades ~50 GCC targets for 2, and a zero-maintenance dependency for a permanent per-ISA obligation. Architecture breadth IS the product. CompCert already is the verified backend it would rebuild, on more ISAs. | only if a customer requires end-to-end machine-checked assurance on a target CompCert does not support — AND funds it |
 | **A single machine-checked theorem spanning ZER source → machine code** | Requires either the cross-prover seam (§8.1) or Stage 5 (§8.3, retired). Replaced by COMPOSED EVIDENCE: `checker_sound` + `emit_correct` + CompCert's own theorem, jointed by §11's tiny UB-free dialect. Certification processes accept composed evidence. | as above |
+
+---
+
+## §19 The proof-carrying C pipeline — Tier B INSTANTIATED, and an amendment to §0.1 (2026-08-11)
+
+**Read this before touching the emitter, the implementation-language question, or anything about how translation correctness is obtained.** §6 adopted Tier B as "the bridge" but described it abstractly — *"a small proven validator checks source↔output equivalence."* It now has a concrete, built, debugged instantiation that has been running in production in KernelQ for a day, with every trap and guard measured rather than guessed.
+
+This does **not** re-propose §17's rejected "Tier B only". The checker-soundness theorem (§6 theorem 1) stays in Lean, unbounded, by induction — that is ZER's whole point and nothing here touches it. What changes is *how theorem 2 is obtained for code that must be fast*, and §17's stated objection — *"the validator still needs the same semantics work"* — is now satisfied evidence, not a promise: the semantics exists, is axiom-free, and is conformance-tested three ways.
+
+---
+
+### 19.1 DECISION AMENDMENT to §0.1 — hot paths MAY be hand-written C, specified in Lean
+
+```
+   §0.1 AS WRITTEN   "the whole compiler core (checker, IR passes, emitter),
+                     not just the proofs" — in Lean 4.
+
+   AMENDED           computational hot paths MAY be hand-written C, SPECIFIED
+                     and PROVED in Lean, and linked per build by CBMC against a
+                     Lean-emitted reference.
+```
+
+**Why the escape hatch is wanted:** compile time is a product feature, and a compiler that is slow to run is a compiler people route around. §9.5 already noted Lean's runtime speed touches chain 2 only; this makes the mitigation concrete rather than aspirational.
+
+**Why it is an ESCAPE HATCH and not the starting position — measure first:**
+
+```
+   CompCert is EXTRACTED OCaml and compiles real programs at acceptable speed.
+   A compiler is SYMBOLIC and ALLOCATION-HEAVY — precisely the workload profile
+   where Lean's GC costs least. The ~13x figure recorded in KernelQ LS.9 was
+   TIGHT NUMERIC LOOPS with boxed Ints, which is the opposite profile.
+```
+
+So: **default stays Lean.** Splitting a pass into Lean-spec + C-impl + CBMC harness is a permanent per-pass cost (two artifacts that must correspond, forever). Pay it for a *measured* bottleneck, never for an anticipated one. The pipeline exists so the option is available at the moment it is earned.
+
+---
+
+### 19.2 The pipeline, end to end, with the status of every link
+
+```
+   spec              a plain Lean function. The thing you prove ABOUT.
+     |  PROVED, using evalS
+   refProg : Prog    a term in the typed C AST
+     |  render       UNPROVED — conformance-TESTED (19.7)
+   reference.c
+     |  CBMC         BOUNDED equivalence, symbolic, not sampling
+   your fast C       hand-written, arbitrary: pointers, goto, unrolling, recursion
+     |  gcc          UNVERIFIED (chain 1; §9 already states this)
+   assembly
+```
+
+Each link's honest status, so nobody re-derives it:
+
+```
+   spec -> refProg     PROVED in Lean. Bridge lemmas make it ~one line per rung
+                       once the loop SHAPE has a lemma.
+   refProg -> C        render is the ONLY stringly part. ~40 lines, one line per
+                       constructor, no logic, fully parenthesised so it never
+                       decides precedence. NOT proved. Conformance-tested.
+   ref C <-> fast C    CBMC. Symbolic over ALL inputs within the bound.
+   C -> asm            gcc. Trusted, per §9. CompCert closes it for anyone who
+                       buys a licence — see 19.11.
+```
+
+---
+
+### 19.3 What already exists and transfers directly
+
+Built and debugged in KernelQ; none of this has to be re-invented.
+
+```
+   lean-prelude/CEmitFull.lean          ~600 lines. Typed AST indexed by SORT
+                                        (malformed C is UNREPRESENTABLE), evalS,
+                                        render, bridge lemmas, renderHarness,
+                                        renderMutant, renderDiffMain, renderPerfMain
+   lean-prelude/conformance/            6040 points, THREE voices (Lean/gcc/CBMC),
+                                        coverage-forced, gated against staleness
+   backend/Dockerfile.cbmc              cbmc 6.10.0 PINNED (+ z3, as an option)
+   backend/direct-kernel-compiler.js    leanEmit, cbmcVerify — flags server-fixed
+   backend/leetcode-style-validator.js  _runProofCarryingC — the stage orchestration
+```
+
+Full context: `KernelQ/docs/kernelq-pedagogy-goal.md` **LS.17–LS.22**, and `docs/Lean4-context-internal.md` §26.
+
+---
+
+### 19.4 FOUR SILENT TRAPS, all measured. Each type-checks, renders valid C, compiles, and is WRONG.
+
+This is the reason the semantics work is real work and not bookkeeping.
+
+```
+   1. INTEGER PROMOTION      C makes `u8 + u8` an `int`: 44 vs 300.
+                             -> ONE integer width everywhere. `long long`.
+                                A mixed-width AST is well-typed and wrong.
+
+   2. DIVISION               Lean's `/` on Int is EUCLIDEAN (-7/2 = -4); C
+                             TRUNCATES (-7/2 = -3). They agree only on
+                             non-negative operands.
+                             -> use Int.tdiv / Int.tmod, NEVER / and %.
+
+   3. THE BRIDGE LEMMA       the drop/take formulation was FALSE without
+                             `c + k <= length`, and looked fine ONLY because
+                             `sum` was the first instantiation (+0 is identity).
+                             -> reformulate over List.range': the mapped list has
+                                length EXACTLY k and the side condition vanishes.
+
+   4. INT64_MIN LITERAL      `-9223372036854775808LL` is unary minus applied to a
+                             constant that does not fit, so it is UNSIGNED.
+                             MEASURED: `(-92233...808LL) < 0` is TRUE to gcc and
+                             FALSE to CBMC. Two C frontends disagreeing about a
+                             constant we emit.
+                             -> emit `-MAX - 1`. INT64_MIN is not exotic: it is
+                                the natural seed for a max-accumulator.
+```
+
+Trap 4 is the one that generalises: **any Int → C-literal conversion is a narrowing that can lie.** Funnel it through one function and test the boundaries.
+
+---
+
+### 19.5 THE GOVERNING PRINCIPLE, and every guard that exists because of it
+
+```
+   A CHECK THAT CANNOT FAIL IS INDISTINGUISHABLE FROM A CHECK THAT PASSES.
+```
+
+Every bug found while building this had that shape. Not one was in CBMC or Lean; all were in the *invocation*.
+
+```
+   VACUOUS HARNESS       contradictory __CPROVER_assumes + a student returning
+                         424242 gave "0 of 10 failed, VERIFICATION SUCCESSFUL".
+                         -> emit a MUTANT (calls the reference, adds 1: wrong on
+                            EVERY input) and REQUIRE CBMC to reject it.
+
+   VACUITY PROBE THAT    any mutant failure counted as "vacuity ruled out", so a
+   FELL OVER             timeout silently restored the hole.
+                         -> the mutant must fail for a DISCRIMINATING reason.
+
+   BLAME MISATTRIBUTION  CBMC names properties `<function>.<check>.<n>`; the
+                         classifier ignored the prefix, so UB in the GENERATED
+                         reference was reported as the student's wrong answer.
+                         -> attribute by function against the emitted files.
+
+   SILENT UNSOUNDNESS    `--no-unwinding-assertions` turns "proved" into "did not
+                         check". MEASURED: unwind 2 fails loudly; with that flag
+                         it reports SUCCESSFUL on an under-approximation.
+                         -> every flag SERVER-CONSTRUCTED. Only range-clamped
+                            integers reach the command line. (AWS's published
+                            practice is the same guard.)
+
+   PATH-KILL BYPASSES    `__CPROVER_assume(0)`, `exit(0)`, `abort()` in the
+                         submitted C each made the assertion unreachable ->
+                         VERIFICATION SUCCESSFUL on code returning 424242.
+                         -> blocklist, comments/strings stripped first. A
+                            blocklist is incomplete by construction; the general
+                            guard is a reachability probe, not yet built.
+
+   FORGED ARTIFACTS      a student `main` could IO.FS.writeFile a forged
+                         reference.c.  -> the emitter entry point is
+                         SERVER-OWNED; leanEmit refuses any other.
+
+   ORACLE FALLING        a hand-written operator list goes stale the moment a
+   BEHIND THE LANGUAGE   constructor is added.
+                         -> total `exprTag`/`stmtTag` matches + #guards, so a new
+                            constructor BREAKS THE BUILD.
+
+   FIXES THAT NEVER      the INT64_MIN fix was probed, verified, committed — and
+   SHIPPED               absent from all three live rungs, because each embeds
+                         its own prelude copy.
+                         -> `prelude:propagate` + a sync-time drift gate.
+```
+
+**For ZER, read that list as a checklist, not as history.** Every one of them is reachable in a compiler pipeline that uses the same machinery.
+
+---
+
+### 19.6 GENERATED vs HAND-WRITTEN — decide by FAILURE MODE, not by taste
+
+The question recurs constantly and has a crisp answer:
+
+```
+   DRIFT FAILS SILENTLY  ->  MUST BE GENERATED
+     the CBMC harness. A hand-written one that disagrees with `refProg` still
+     prints VERIFICATION SUCCESSFUL — it just proved something else, and nothing
+     anywhere says so.
+
+   DRIFT FAILS LOUDLY    ->  MAY BE HAND-WRITTEN
+     behavioural/differential tests. Wrong signature = LINK ERROR.
+     It is TESTING, not proving; no proof obligation rides on it.
+```
+
+...with one rule that makes hand-written safe: **it must reject the mutant.** A hand-written test can be vacuous (compare the artifact to itself, forget to call it) and nothing would say so — the same class as an unsatisfiable harness. Running it against the mutant costs milliseconds and constrains the author's test *not at all*.
+
+---
+
+### 19.7 evalS's ACTUAL coverage — do not overstate it
+
+```
+   SOLID     all 12 operators, exhaustive over [-8,8] PLUS boundary values
+             (INT64_MIN/MAX, the 32-bit seams, each neighbour). THREE voices:
+             Lean vs gcc vs CBMC — because the VERDICT comes from CBMC, never
+             gcc, so a two-way suite is blind to the frontend that decides.
+             Axiom-free. Falsified: seeded bugs DO make it fail.
+
+   NOT YET   `setIdx` (array WRITES) and `ifE` (conditionals) are NEVER
+   COMPARED  differentially tested — they appear only in coverage-forcing tags
+             and Lean-side #guards. Nested loops untested. Deep expression
+             nesting untested (the sweep is one-operator programs).
+```
+
+And **"proven" is the wrong word regardless.** There is no theorem `evalS ≡ C`; there cannot be without a formal C semantics, which is CompCert's Clight — the thing §17 already declined as a hard dependency. What exists is exhaustive testing over a domain, three ways. Strong evidence. Not proof.
+
+---
+
+### 19.8 The cost model — the value RANGE is the only lever
+
+Full record and every dead end: KernelQ **LS.21**. Summary, all measured clean:
+
+```
+   64x64 mul  vlim +-100    151s SUCCESSFUL   <- the working recipe
+   64x64 mul  vlim +-1000   TIMEOUT
+   32x32 mul  vlim +-1000   TIMEOUT   width does NOT help
+   int32 storage, no limit  TIMEOUT   storage does NOT help
+   --refine / --refine-arith TIMEOUT
+   Z3 backend               TIMEOUT, and WORSE than the default SAT
+   no multiply at all       1s
+```
+
+**Why no solver-side route works:** C arithmetic is BIT-VECTOR arithmetic, not integer arithmetic. There is no integer-level inference to be had — range facts are clauses in a boolean circuit, not premises in arithmetic.
+
+**For ZER this mostly evaporates.** The expensive operation is variable×variable multiplication over wide ranges; a memory-safety or dataflow validation is pointer- and set-shaped, with no arithmetic of that kind. Bounds are small by construction, and semantic bugs surface at tiny scale.
+
+**One methodology rule, learned expensively:** never benchmark a solver while another solver is running. A contaminated number got published as fact, a design proposal was built on it, and `mul` was nearly deleted from the emission language before re-measurement.
+
+---
+
+### 19.9 THE ARENA DECISION — make it before any IR code exists
+
+The one architectural choice that is expensive to retrofit.
+
+`CEmitFull` speaks **int64 scalars and arrays**. No structs, no pointers, no trees — deliberately, because pointers in the AST break totality and totality is what keeps `evalS` structural and the proofs short.
+
+ZER's passes operate on ASTs, symbol tables, region lattices, CFGs. Those do not fit — **unless the IR is arena-flattened**:
+
+```
+   POINTER TREES     struct Node { Node *l, *r; }
+                     -> unrepresentable; would need pointers in the AST
+   ARENA + INDICES   int32 arrays: kind[], lhs[], rhs[], type[]
+                     a "pointer" is an INDEX into a flat array
+                     -> fits CEmitFull almost as-is
+```
+
+This is not a concession to the verifier. **Fast compilers represent IRs this way anyway** — cache-friendly, no allocator churn, trivially serialisable. It happens to also be the representation the proof pipeline can express.
+
+Same technique for fixpoint passes: dataflow on a lattice of height `h` converges in `≤ h·n` steps, so a bounded `forUp` with a proven-sufficient trip count replaces the unbounded `while` and `evalS` stays total.
+
+---
+
+### 19.10 TWO semantics, not one — they get conflated
+
+```
+   evalIR   what ZER PROGRAMS mean. The mother theorem (`check p -> Safe p`) is
+            stated over this. It is ZER's LANGUAGE DEFINITION — written
+            regardless, not a pipeline tax.
+   evalS    what the EMITTED C means. Needed only to PROVE that refProg computes
+            the spec. Pure pipeline machinery — and it already exists.
+```
+
+`evalS` is required exactly when the reference is **proved** rather than trusted. If a reference is merely trusted (small, readable), CBMC compares C to C and no `evalS` is needed anywhere — but then a mistranslation makes both sides wrong identically and nothing catches it.
+
+**That risk is much smaller in the chosen configuration**, because the two C artifacts are INDEPENDENT: one rendered from Lean, one written by a human from intent. A render bug makes them DISAGREE — a loud spurious rejection, not silent agreement. The residual is *correlated human error* (writing `a / b` in C to mirror Lean's `/`, trap 2 above), which is exactly what the per-operator conformance suite is for.
+
+---
+
+### 19.11 The trusted set in this configuration
+
+```
+   LEAN KERNEL        checks the proofs. Small, heavily scrutinised. The cheap one.
+   LEAN COMPILER      only because the EMITTER RUNS as compiled Lean. Distinct from
+                      the kernel and much bigger — but a miscompiled emitter makes
+                      the reference DISAGREE with the hand-written C, so it fails
+                      LOUDLY unless the same bug hits both producers.
+   CBMC               frontend, goto conversion, SAT encoding, solver.
+   render             ~40 lines, unproved, conformance-tested.
+   THE BOUND          CBMC covers inputs up to it. A SCOPE gap, not a soundness
+                      gap: too small a bound claims LESS, never something false,
+                      and it fails loudly (unwinding assertions).
+   gcc + THE LINKER   chain 1, per §9. Nobody verifies linkers — CompCert included.
+```
+
+**CompCert stays available without being shipped.** Emitting C that CompCert *accepts* costs nothing; distributing CompCert is what is licensed (free build is INRIA non-commercial; commercial via AbsInt). Anyone needing the closed chain buys their own licence and compiles — which is exactly §10's dual-backend strategy, and it means §11's emitter contract (standard C99, no GCC extensions, no VLAs) is now doubly load-bearing.
+
+---
+
+### 19.12 What is NOT built for ZER
+
+```
+   evalIR + the mother theorem        ZER's actual content. Nothing here supplies it.
+   bridge lemmas for COMPILER loop    `runFor_step` covers "accumulate over one
+   shapes                             array". A WORKLIST or FIXPOINT loop is a
+                                      different shape and needs its own lemma,
+                                      proved once. Finite work, not zero.
+   setIdx / ifE conformance           see 19.7 — untested before use.
+   a reachability probe               the general form of the path-kill guard.
+   arena-flattened IR                 the 19.9 decision.
+```
+
+---
+
+**Status: RECORDED 2026-08-11 (§19).** Amends §0.1 (implementation language). Instantiates §6's Tier B with a built mechanism. Does not touch §6 theorem 1 (checker soundness stays Lean, unbounded, inductive), does not re-propose any §17 entry. Cross-refs: §9 (the two trust chains this sits inside), §10 (dual backend), §11 (the emitter contract, now doubly load-bearing), §9.5 (Lean runtime speed — 19.1 is its concrete mitigation). KernelQ-side full record: `docs/kernelq-pedagogy-goal.md` LS.17 (design), LS.18 (as built), LS.19 (the language), LS.20 (soundness target + false-accept ledger), LS.21 (corrected cost model), LS.22 (behavioural stage); `docs/Lean4-context-internal.md` §26 (every measurement).
 
 ---
 

@@ -690,7 +690,14 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 @atomic_and_fetch(*T, val) -> T    [D-Alpha-1]
 @atomic_xor_fetch(*T, val) -> T    [D-Alpha-1]
 ```
-All atomics: first arg must be `*shared T` where T is integer of width 1/2/4/8 bytes.
+All atomics: first arg is the address of an INTEGER global or struct field, width
+1/2/4/8 bytes (u128 / non-native uN / float / struct are rejected). It does NOT need
+to be a `shared struct` — verified 2026-08-10 that `*shared T` is NOT CONSTRUCTIBLE
+(`shared` is struct-only, and you cannot take the address of a shared struct's
+interior), so the old wording described a rule no program could satisfy. The real
+safety net is the ATOMIC CELL rule: once a global is touched atomically in a
+concurrent context, every other access must be atomic too — enforced at plain-access
+sites including through helpers (BUG-769/771).
 Ordering parameter (relaxed/acquire/release/acq_rel/seq_cst) deferred to later batch.
 
 ### Bit Query / Byte Swap Intrinsics (D-Alpha-2)

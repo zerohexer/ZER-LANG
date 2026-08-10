@@ -1,0 +1,26 @@
+// The atomics operand contract, positive side. The target is the address of an
+// INTEGER global or struct field and does NOT need to be a `shared struct` —
+// `shared` is a mutex, and requiring one to perform a lock-free operation would
+// defeat the point. This is the intended lock-free idiom, and it is what 46 of
+// the 48 atomic-using tests in the corpus do.
+// The safety net is the ATOMIC CELL rule (BUG-769/771): once a global is touched
+// atomically in a concurrent context, every OTHER access must be atomic too —
+// a mixed plain+atomic access is rejected, including through a helper.
+struct Cell { u32 v; }
+
+u32 counter;
+u64 wide;
+u8 flag;
+Cell cell;
+
+u32 main() {
+    u32 a = @atomic_add(&counter, 1);       // 4 bytes
+    u64 b = @atomic_add(&wide, 1);          // 8 bytes
+    u8  c = @atomic_add(&flag, 1);          // 1 byte
+    u32 d = @atomic_add(&cell.v, 1);        // struct FIELD
+    @atomic_store(&counter, 7);
+    u32 e = @atomic_load(&counter);
+    if (e != 7) { return 1; }
+    if (a + (u32)b + (u32)c + d > 100) { return 2; }
+    return 0;
+}

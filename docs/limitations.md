@@ -424,7 +424,32 @@ PER-STATEMENT: `x = g.v; yield;` releases the lock before the suspend and is cor
 ACCEPTED. The row now states the real rule. Left as-is this would have sent a session hunting
 a non-bug — or "fixing" a correct acceptance into an over-rejection.
 
-### Doc/impl mismatch #2 — NOT corrected, needs an owner decision
+### ~~Doc/impl mismatch #2~~ — **RESOLVED 2026-08-10: the DOCS were wrong, the compiler is right**
+
+Asked to "enforce the docs", measuring first showed enforcement is **impossible and would be
+wrong**:
+- **`*shared T` is NOT CONSTRUCTIBLE.** `shared` is a struct-only qualifier (`shared u32 g;`
+  -> *"expected 'struct' after 'shared'"*) and you cannot take the address of a shared
+  struct's interior (*"cannot take address of a shared struct's interior"*). There is no way
+  to build the documented operand, so enforcing it would reject EVERY `@atomic_*` call with
+  no legal alternative.
+- **Corpus: 46 of 48** atomic-using test files operate on a plain global, including the whole
+  `rt_conc_atomic_*` Rust-translation set and the atomic-cell tests BUG-769/771 depend on.
+- **It inverts the feature.** `shared struct` is a MUTEX; requiring one to perform an atomic
+  operation means taking a lock to do lock-free programming.
+- **The plain-global form is already sound**: a real atomic instruction is emitted, and the
+  ATOMIC CELL rule rejects any MIXED plain+atomic access (that is exactly what BUG-769/771
+  were), so all-atomic access to a plain global has no race.
+
+**Everything ELSE in that doc sentence IS enforced** — verified: width must be 1/2/4/8 bytes
+(`u128` and a non-native `u24` both rejected with that exact message) and the operand must be
+an integer (`f32` and a struct both rejected). Only the `*shared T` phrase was wrong.
+
+Docs corrected in `docs/reference.md` and `CLAUDE.md` to state the real contract. Pinned by
+`tests/zer_fail/atomic_width_u128.zer` and `tests/zer/atomic_plain_global_contract_ok.zer`
+(1/2/4/8-byte globals + a struct field + load/store round-trip).
+
+### (superseded) original entry
 
 `@atomic_load(&g)` on a **plain non-shared** global compiles clean. The docs describe atomics
 as requiring a `*shared T` operand. Probed: this is **not a race** — the atomic-cell rule

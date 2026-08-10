@@ -2110,7 +2110,12 @@ u32 new_count = @atomic_add_fetch(&counter, 1);  // returns counter + 1
 ---
 
 **Atomic restrictions (all `@atomic_*` intrinsics):**
-- First argument must be `*shared T` where T is integer
+- First argument must be the address of an INTEGER global or struct field —
+  `@atomic_add(&counter, 1)`, `@atomic_store(&s.flag, 1)`. Width must be 1, 2, 4
+  or 8 bytes; `u128`, a non-native width like `u24`, a float, or a struct is
+  rejected. The target does NOT need to be a `shared struct` — `shared` is a
+  mutex, and taking a lock to perform a lock-free operation would defeat the
+  point. Atomics on a plain global are the intended lock-free idiom
 - Width must be 1, 2, 4, or 8 bytes
 - Not allowed on packed struct fields (alignment)
 - 64-bit atomics on 32-bit targets warn about libatomic dependency

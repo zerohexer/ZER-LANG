@@ -1,7 +1,7 @@
 // EXPECTED: compile error
-// '...' requires at least one named parameter before it. Must fail to compile.
+// expect-error: '...' requires at least one named parameter before it
+// '...' must be the final parameter and at least one named parameter must
+// precede it. Pins docs/reference.md "Variadic ... — and how to print".
 void f(...);
 
-i32 main() {
-    return 0;
-}
+u32 main() { return 0; }

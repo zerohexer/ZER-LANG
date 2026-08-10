@@ -2343,6 +2343,67 @@ u32 main() {
 - C macros (stderr, stdout, etc.) are NOT accessible. Wrap in a C helper function.
 - `_zer_` prefix is reserved — name helpers `zer_get_stderr`, not `_zer_stderr`.
 
+### Variadic `...` — and how to print
+
+ZER has no built-in `print`. Formatted output is C's `printf`, declared as a bodyless
+extern and called normally. That is what `...` exists for.
+
+**SYNTAX**
+```zer
+i32 printf(const *u8 fmt, ...);      // declare it once, bodyless
+
+u32 main() {
+    printf("x=%d y=%s\n", 42, "ok");  // prints: x=42 y=ok
+    printf("no args needed\n");        // fixed params alone are fine
+    return 0;
+}
+```
+
+No `cinclude` is required for `printf` — the declaration alone is enough, because the
+emitted C is compiled by GCC which already has it. Use `cinclude "<stdio.h>";` when you
+want the header's other declarations too.
+
+String literals are `[*]u8` and auto-coerce to `const *u8` at an extern call site, so
+`"hello"` can be passed directly. Passing a literal to a NON-const `*u8` parameter is
+rejected — that would allow a write into `.rodata`.
+
+**RULES**
+- `...` is allowed **only** on a bodyless extern declaration. A ZER function with a body
+  cannot be variadic — it would read untyped, unverified arguments, which is the
+  unchecked-boundary ban:
+  ```zer
+  void g(const *u8 s, ...) { }   // ERROR: variadic '...' is only allowed on bodyless
+                                 //        extern declarations, not on a ZER function
+                                 //        with a body
+  ```
+- `...` must be the final parameter, and at least one named parameter must precede it:
+  ```zer
+  void f(...);                   // ERROR: '...' requires at least one named parameter before it
+  ```
+- A call must supply at least the fixed parameters; the variadic tail may be empty.
+- Arguments in the variadic tail are **not type-checked against the format string.** This is
+  C's contract, not ZER's — a `%d` paired with a `f64` is undefined behaviour exactly as it
+  is in C. Everything else about the call (the pointer's validity, the slice's bounds, the
+  lifetime of what you pass) is still verified normally.
+
+**PRINTING WITHOUT VARIADICS**
+For a single string, `puts` needs no variadic declaration at all:
+```zer
+i32 puts(const *u8 s);
+
+u32 main() { puts("hello"); return 0; }
+```
+
+**NOTES**
+- `stdout` / `stderr` are C **macros**, not variables, so they cannot be declared in ZER.
+  To use `fprintf`, wrap them in a C helper:
+  ```c
+  /* my_io.h */
+  static inline FILE *zer_get_stderr(void) { return stderr; }
+  ```
+  then `cinclude "my_io.h";` and declare `*opaque zer_get_stderr();` in ZER. Name it
+  `zer_*`, never `_zer_*` — the `_zer_` prefix is reserved.
+
 ### Safe C Library Interop — `cinclude` + `*opaque` + `shared struct`
 
 Two keywords make ANY C library fully safe from ZER:

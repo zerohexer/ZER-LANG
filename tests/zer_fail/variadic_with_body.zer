@@ -1,11 +1,8 @@
 // EXPECTED: compile error
-// '...' is a C-interop boundary only — a ZER function with a body cannot be
-// variadic (it could read untyped, unverified arguments). Must fail to compile.
-void log_it(const *u8 fmt, ...) {
-    return;
-}
+// expect-error: variadic '...' is only allowed on bodyless
+// A ZER function with a body cannot be variadic — it would read untyped,
+// unverified arguments (the unchecked-boundary ban). Pins the rule stated in
+// docs/reference.md "Variadic ... — and how to print".
+void g(const *u8 s, ...) { }
 
-i32 main() {
-    log_it("hi");
-    return 0;
-}
+u32 main() { return 0; }

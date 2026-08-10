@@ -1,0 +1,13 @@
+// Pins the docs/reference.md "Variadic ... — and how to print" section.
+// Every claim there is exercised here: a bodyless extern printf with no
+// cinclude, a call with the variadic tail populated, a call with only the
+// fixed parameter, and a string literal auto-coercing to const *u8.
+i32 printf(const *u8 fmt, ...);
+i32 puts(const *u8 s);
+
+u32 main() {
+    printf("x=%d y=%s\n", 42, "ok");
+    printf("no args needed\n");
+    puts("hello");
+    return 0;
+}

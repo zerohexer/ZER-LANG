@@ -1,0 +1,15 @@
+// GAP (2026-08-10): pointer-deref var-decl alias `*T k = *pp;` is untracked, so
+// free(k) never marks n's allocation FREED -> silent use-after-free + double
+// free. Heap facet of HOLE-A4. Direct alias `*Node k = n;` IS rejected.
+// compile-clean = the UAF is accepted. See limitations.md 2026-08-10.
+struct Node { u32 v; }
+u32 main() {
+  *Node n = alloc(Node) orelse { return 0; };
+  n.v = 7;
+  **Node pp = &n;
+  *Node k = *pp;
+  free(k);
+  u32 x = n.v;
+  free(n);
+  return x;
+}

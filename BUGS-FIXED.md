@@ -5,6 +5,35 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-10c — BUG-780: the 8th funcptr REACH form (forwarded parameter)
+
+**BUG-780 — a CALLER-supplied funcptr FORWARDED to a spawn.** `run(bump)` where
+`run(*() fp) { spawn worker(fp); }`. Inside `run` the spawn argument is a PARAM, so no
+binding is visible; and nothing at the call site asked what `run` does with it. The direct
+sibling `spawn worker(bump)` IS rejected, so the identical race was accepted purely for
+crossing one call boundary.
+
+**Fix — a per-function SUMMARY, not whole-program points-to** (which the architecture
+bans). New `func_forwards_param_to_spawn(fn, pidx)` answers "can parameter *i* reach a
+spawn?" from the function's own body plus the same summary on its direct callees,
+depth-bounded at 8. The call site then asks that question for each argument that is a
+global function name, and on a hit runs the existing `scan_unsafe_global_access` on the
+named function — exactly what the direct spawn-arg path does. Warning (not error) when the
+callback itself has `@atomic`/`@barrier`, mirroring the established policy.
+
+Verified 2-hop (`run -> mid -> spawn`) also rejects, so the summary composes.
+
+**Over-rejection boundary** (`tests/zer/spawn_funcptr_forwarded_safe_ok.zer`) — all still
+compile: a forwarded callback that touches nothing, one touching only `threadlocal`, one
+using `@atomic_*`, a callee that forwards but never spawns, and a callee that ignores the
+argument entirely.
+
+**The REACH grid is now 8 forms, 75 cells** (`tests/test_conc_matrix.c`). Worth noting how
+this class has gone: direct name, struct field, local binding, factory 1-hop, factory
+n-hop, field-array element, forwarded param — seven fixes across four sessions, and the
+last two (n-hop factory, and this one) were found by *writing the axis down*, not by a bug
+report. The grid is what makes each new form cheap to add and impossible to forget.
+
 ## Session 2026-08-10b — branch survey p0w5lj / 2hg2v4 / l3vn1i: 9 fixes (BUG-771..779)
 
 Implemented from `docs/limitations.md` "branch survey 2026-08-10". Nothing merged or

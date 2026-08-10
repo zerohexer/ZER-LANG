@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: forwards this function-pointer argument to a spawn
+// 8th funcptr REACH form: a CALLER-supplied funcptr FORWARDED to a spawn.
+// Inside `run` the spawn arg is a PARAM so no binding is visible; nothing used
+// to ask what `run` does with it, so the same race the direct sibling
+// `spawn worker(bump)` rejects was accepted purely for crossing one call.
+u32 g;
+
+void bump() { g += 1; }
+
+void worker(*() -> void fp) { fp(); }
+
+void run(*() -> void fp) { spawn worker(fp); }
+
+u32 main() { run(bump); return 0; }

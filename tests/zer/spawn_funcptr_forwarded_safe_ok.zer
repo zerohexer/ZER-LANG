@@ -1,0 +1,25 @@
+// Over-rejection boundary for the forwarded-funcptr race scan. The scan asks a
+// per-function summary ("does the callee forward THIS param into a spawn?"), so
+// all of these must keep compiling: a forwarded callback that touches nothing,
+// one touching only threadlocal, one synchronising with @atomic_*, a callee that
+// forwards but never spawns, and a callee that ignores the argument entirely.
+threadlocal u32 tl;
+u32 shared_ctr;
+
+void noop() { }
+void bump_tl() { tl += 1; }
+void bump_atomic() { u32 old = @atomic_add(&shared_ctr, 1); }
+
+void worker(*() -> void fp) { fp(); }
+void spawner(*() -> void fp) { spawn worker(fp); }
+void plain(*() -> void fp) { worker(fp); }
+void ignores(*() -> void fp) { u32 z = 0; z += 1; }
+
+u32 main() {
+    spawner(noop);
+    spawner(bump_tl);
+    spawner(bump_atomic);
+    plain(bump_tl);
+    ignores(noop);
+    return 0;
+}

@@ -518,6 +518,10 @@ static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static void record_isr_globals(Checker *c, Node *node, int depth);
+static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
+static bool scan_unsafe_global_access(Checker *c, Node *node,
+                                      const char **out_name, uint32_t *out_len);
+static void ensure_func_props(Checker *c, Symbol *fn);
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth);
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
@@ -5757,6 +5761,56 @@ static Type *check_expr(Checker *c, Node *node) {
                 record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, 0);
         }
 
+        /* 8th funcptr REACH form (2026-08-10): a CALLER-supplied funcptr FORWARDED
+         * to a spawn. `run(bump)` where `run(*() fp){ spawn worker(fp); }` — inside
+         * `run` the spawn arg is a PARAM so no binding is visible, and nothing here
+         * used to ask what `run` does with it. The direct sibling `spawn worker(bump)`
+         * IS rejected, so the same race was accepted purely for crossing one call.
+         * Per-function summary, not whole-program points-to: ask whether the callee
+         * forwards THIS parameter position into a spawn, and if so scan the named
+         * function exactly as the direct spawn-arg path does. */
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            Symbol *tgt = scope_lookup(c->global_scope, node->call.callee->ident.name,
+                                       (uint32_t)node->call.callee->ident.name_len);
+            if (tgt && tgt->is_function) {
+                for (int ai = 0; ai < node->call.arg_count; ai++) {
+                    Node *an = node->call.args[ai];
+                    if (!an || an->kind != NODE_IDENT) continue;
+                    Symbol *fsym = scope_lookup(c->global_scope, an->ident.name,
+                                                (uint32_t)an->ident.name_len);
+                    if (!fsym || !fsym->is_function || !fsym->func_node ||
+                        fsym->func_node->kind != NODE_FUNC_DECL ||
+                        !fsym->func_node->func_decl.body) continue;
+                    if (!func_forwards_param_to_spawn(c, tgt, ai, 0)) continue;
+                    const char *fbad = NULL; uint32_t fblen = 0;
+                    if (scan_unsafe_global_access(c, fsym->func_node->func_decl.body,
+                                                  &fbad, &fblen)) {
+                        ensure_func_props(c, fsym);
+                        if (fsym->props.has_sync) {
+                            checker_warning(c, node->loc.line,
+                                "'%.*s' forwards this function-pointer argument to a "
+                                "spawn, and '%.*s' accesses non-shared global '%.*s' — "
+                                "potential data race (atomic/barrier present, verify "
+                                "ordering)",
+                                (int)node->call.callee->ident.name_len,
+                                node->call.callee->ident.name,
+                                (int)an->ident.name_len, an->ident.name,
+                                (int)fblen, fbad);
+                        } else {
+                            checker_error(c, node->loc.line,
+                                "'%.*s' forwards this function-pointer argument to a "
+                                "spawn, and '%.*s' accesses non-shared global '%.*s' — "
+                                "data race. Use shared struct, threadlocal, or @atomic_*",
+                                (int)node->call.callee->ident.name_len,
+                                node->call.callee->ident.name,
+                                (int)an->ident.name_len, an->ident.name,
+                                (int)fblen, fbad);
+                        }
+                    }
+                }
+            }
+        }
+
         /* ===== Universal alloc — handled BEFORE the generic arg loop, because
          * alloc's type-name arg (which may be a primitive keyword like u8) must
          * NOT be check_expr'd as a value.
@@ -10579,6 +10633,85 @@ static bool has_atomic_or_barrier(Node *node) {
         return false;
     }
     return false;
+}
+
+/* Does this function forward its parameter `pidx` into a `spawn` argument —
+ * directly, or transitively through another function that does?
+ *
+ * THE HOLE THIS CLOSES (the 8th funcptr REACH form). The data-race scan is
+ * intra-function: when checking `run(*() fp) { spawn worker(fp); }` the spawn arg
+ * is a PARAM, so no binding is visible; and when checking the caller `run(bump)`
+ * nothing looked at what `run` does with it. The direct sibling `spawn worker(bump)`
+ * IS rejected, so the same race was accepted purely because it crossed one call.
+ *
+ * This is a per-function SUMMARY question, not whole-program points-to (which the
+ * architecture bans): "can param i reach a spawn?" is answered from this function's
+ * own body plus the same summary on its direct callees, depth-bounded. */
+static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
+
+static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
+                                         uint32_t pnlen, int depth) {
+    if (!n || depth > 8) return false;
+    if (n->kind == NODE_SPAWN) {
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) {
+            Node *a = n->spawn_stmt.args[i];
+            if (a && a->kind == NODE_IDENT && a->ident.name_len == pnlen &&
+                memcmp(a->ident.name, pname, pnlen) == 0) return true;
+        }
+        return false;
+    }
+    if (n->kind == NODE_CALL) {
+        /* forwarded one hop further: `mid(fp)` where mid spawns with ITS param */
+        if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
+            Symbol *cs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+                                      (uint32_t)n->call.callee->ident.name_len);
+            if (cs && cs->is_function) {
+                for (int i = 0; i < n->call.arg_count; i++) {
+                    Node *a = n->call.args[i];
+                    if (a && a->kind == NODE_IDENT && a->ident.name_len == pnlen &&
+                        memcmp(a->ident.name, pname, pnlen) == 0 &&
+                        func_forwards_param_to_spawn(c, cs, i, depth + 1)) return true;
+                }
+            }
+        }
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (node_forwards_param_to_spawn(c, n->call.args[i], pname, pnlen, depth)) return true;
+        return false;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (node_forwards_param_to_spawn(c, n->block.stmts[i], pname, pnlen, depth)) return true;
+        return false;
+    }
+    if (n->kind == NODE_IF)
+        return node_forwards_param_to_spawn(c, n->if_stmt.then_body, pname, pnlen, depth) ||
+               node_forwards_param_to_spawn(c, n->if_stmt.else_body, pname, pnlen, depth);
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE)
+        return node_forwards_param_to_spawn(c, n->while_stmt.body, pname, pnlen, depth);
+    if (n->kind == NODE_FOR)
+        return node_forwards_param_to_spawn(c, n->for_stmt.body, pname, pnlen, depth);
+    if (n->kind == NODE_EXPR_STMT)
+        return node_forwards_param_to_spawn(c, n->expr_stmt.expr, pname, pnlen, depth);
+    if (n->kind == NODE_VAR_DECL)
+        return node_forwards_param_to_spawn(c, n->var_decl.init, pname, pnlen, depth);
+    if (n->kind == NODE_SWITCH) {
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (node_forwards_param_to_spawn(c, n->switch_stmt.arms[i].body, pname, pnlen, depth))
+                return true;
+        return false;
+    }
+    return false;   /* partial walk: unlisted kind -> no claim -> no new rejection */
+}
+
+static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth) {
+    if (!fn || !fn->is_function || !fn->func_node || depth > 8) return false;
+    Node *fd = fn->func_node;
+    if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return false;
+    if (pidx < 0 || pidx >= fd->func_decl.param_count) return false;
+    ParamDecl *pd = &fd->func_decl.params[pidx];
+    if (!pd->name || pd->name_len == 0) return false;
+    return node_forwards_param_to_spawn(c, fd->func_decl.body, pd->name,
+                                        (uint32_t)pd->name_len, depth);
 }
 
 /* Shared recursion-depth budget for the transitive spawn-global scan: the

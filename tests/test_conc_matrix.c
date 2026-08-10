@@ -366,7 +366,7 @@ static const char *sink_name(CASink s) {
  * A new reach form with no cell here is INVISIBLE. Add the cell in the same
  * commit as the form. */
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
-               RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_COUNT } CAReach;
+               RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM, RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
 static const char *reach_name(CAReach r) {
@@ -378,6 +378,7 @@ static const char *reach_name(CAReach r) {
     case RCH_FACTORY1: return "factory-1hop";
     case RCH_FACTORY2: return "factory-2hop";
     case RCH_FIELD_ARRAY: return "field-array-elem";
+    case RCH_FWD_PARAM:   return "forwarded-param";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -432,6 +433,12 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
     case RCH_FIELD_ARRAY:
         extra = "typedef *() -> void VoidFn;\nstruct Ops { VoidFn[2] fns; }\n";
         wbody = "Ops o; o.fns[0] = cb; o.fns[0]();"; break;
+    /* 8th form (2026-08-10): the funcptr arrives as a PARAMETER of the spawning
+     * function, supplied by ITS caller — no binding is visible inside the
+     * spawner, so the answer needs a per-function forwarding summary. */
+    case RCH_FWD_PARAM:
+        extra = "void inner(*() -> void f) { f(); }\n";
+        wbody = "spawn inner(cb);"; break;
     default: break;
     }
     snprintf(out, n,

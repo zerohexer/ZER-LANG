@@ -390,6 +390,77 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — residuals after the 2026-08-10 survey (measured; reproducers in `tests/zer_gaps/`)
+
+The 9 survey fixes + the 8th funcptr REACH form all landed. These are what the three
+branches documented but did NOT fix, each **re-verified live on main 2026-08-10**.
+
+### HIGH ACCEPT-UNSAFE — pointer-deref var-decl alias (`*T k = *pp;`) untracked -> UAF + double free
+
+`tests/zer_gaps/deref_alias_uaf_double_free.zer`. **Measured live: the program RUNS and
+returns 7** — it reads `n.v` after `free(k)` (stale value) and then double-frees. Heap facet
+of HOLE-A4.
+
+**Narrowed precisely 2026-08-10 — the gap is ONE form, not the whole class:**
+
+| shape | verdict on main |
+|---|---|
+| `*Node k = n; free(k); n.v` — direct alias | **caught** |
+| `*Node k = n; k = *pp;` — ASSIGN with a deref RHS | **caught** (k already had a handle) |
+| `*Node k = *pp;` — VAR-DECL with a deref init | **ACCEPTED — the hole** |
+| `... free(n); k.v` — same, use through k | **ACCEPTED** |
+
+**Why the obvious patch is wrong.** In the IR the deref lowers to `%8 = UNOP <expr>` and the
+var-decl to `%7 = COPY` from it; the UNOP temp carries no handle, so the copy inherits
+nothing. Making the COPY inherit requires resolving `*pp` -> `pp` -> its init `&n` -> `n`'s
+handle. That is a POINTS-TO question over a pointer-to-pointer, which the per-file +
+summaries model deliberately does not have (whole-program analysis is banned from the
+architecture). The enabling step is `&n` on a local that holds a tracked allocation.
+
+**Two sound directions, both needing design rather than a patch:**
+1. *Syntactic resolution* (cheap, narrow): if a var-decl init is `*X` and `X`'s own
+   var-decl init was `&Y` (a bare ident, not reassigned anywhere — reuse
+   `ast_name_mutated_or_addrd` as the stability gate), alias the new local to `Y`'s handle.
+   Same shape as the funcptr local-binding resolution in `00dc785a`. Covers the reproducer;
+   does NOT cover a reassigned or computed `pp`.
+2. *Conservative barrier* (broad, needs care): taking `&n` where `n` holds a tracked
+   allocation means aliases exist that the analyzer cannot follow — apply the
+   argument-precise barrier principle and widen `n` to MAYBE_FREED on any free through an
+   unresolved deref. Touches the CFG fixpoint; measure over-rejection first.
+
+### MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter
+
+Sibling of BUG-774: the ISR compound-RMW check is intra-body, so `interrupt { rmw(&g); }`
+with `void rmw(*u32 p) { p[0] += 1; }` is unchecked. The transitive machinery from BUG-774
+(`record_isr_globals` following calls) exists; what is missing is propagating the
+*compound-assign* fact through a pointer PARAM rather than a global name.
+
+### MEDIUM (POLICY, not a bug) — `&packed_field` forms a misaligned `*T`
+
+`tests/zer_gaps/packed_field_addr_misaligned.zer`. Confirmed + UBSan-reproduced.
+**Deferred pending an owner decision**: whether ZER permits forming a possibly-misaligned
+pointer at all. Options: ban `&` on a packed field, require an explicit unaligned-load
+intrinsic, or accept with a diagnostic. Not something to settle by patching.
+
+### LOW bare-metal — `volatile` lost through a `@ptrtoint -> @inttoptr` round-trip
+
+`tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer`. Audit-visible (both intrinsics
+are explicit at the use site), so it is a qualifier-propagation gap, not a silent one.
+
+### Cross-references (tracked elsewhere, do NOT duplicate)
+
+- **frees-param-field via UNWRAP-TO-LOCAL** (`2hg2v4`) — extends the frees-param-field entry
+  marked "CLOSED 2026-08-08"; **that closure is INCOMPLETE.** Re-probe before trusting it.
+- **comptime / const integer fold ignores per-operation width wrapping** (`2hg2v4`) —
+  value-correctness, explicitly probed and found NOT a safety hole (checker and emitter read
+  the same folded value). Deferred: the fix threads a destination width through the const
+  evaluator.
+- **`naked` attribute dropped on the IR path**, **`vrp_ir.c` dead code** (Phase 0 of
+  `docs/unified-oracle-proved-ZER.md`), **ISR funcptr FIELD call not bound in a same-scope
+  struct init** (the residual after BUG-774) — all already have entries.
+
+---
+
 ## ~~branch survey 2026-08-10: 9 verified fixes~~ (ALL LANDED 2026-08-10, BUG-771..779)
 
 **FULLY HARVESTED.** All 9 implemented and verified; `make check` breakage closed by P3.

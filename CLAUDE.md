@@ -2636,6 +2636,12 @@ because a rejection is a rejection whether or not your patch caused it.
   `error`/`zercheck`, then check it is YOUR rule.
 - **Masking is the dominant failure mode.** 3 of the 6 reproducers were rejected by an unrelated
   stronger rule (one masked TWICE). Route around it, then re-probe.
+- **`make check` REPORTS ITS OWN FAILURE ONLY IN THE EXIT CODE — echo it.** Measured 2026-08-10:
+  `make check` had been exiting **2** for four commits while being reported green. Make aborts at
+  the first failing audit, so every LATER gate (fixed-buffer, type-dispatch, carrier-dispatch,
+  emit-audit, sink matrix) silently never runs. The trap that hid it: verifying with
+  `grep -E 'OK — no'`, which matches **"OK — no gaps"** from a DIFFERENT audit that runs earlier.
+  Grep the SPECIFIC line you expect (`no default: clauses`), and always print `MAKE_CHECK_EXIT=$?`.
 - `grep -c 'error' build.log` **lies** — `CFLAGS` has `-Werror=switch`, so the echoed gcc command
   line matches. Use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
 - **Never run a `tests/test_*_matrix` binary while `make check` runs** — several share the fixed

@@ -390,6 +390,159 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — branch survey 2026-08-10: 9 verified fixes to implement (`p0w5lj` / `2hg2v4` / `l3vn1i`) + a LIVE `make check` breakage
+
+**READ THIS FIRST — `make check` IS CURRENTLY BROKEN AND HAS BEEN SINCE `65af3864`.**
+`MAKE_CHECK_EXIT=2`. Make aborts at the walker-default-clause audit, so **five gates never
+run**: fixed-buffer, type-dispatch, carrier-dispatch, emit-audit, and the sink matrix.
+Cause: the G3 fix (`65af3864`) shipped `record_atomic_plain_in_callee` with a
+`default: return;` in a `switch (node->kind)`, which CLAUDE.md forbids. **Fix P3 below closes
+both the coverage hole and the build breakage — land it FIRST or nothing else can be verified.**
+
+**HOW IT WAS MISSED, so nobody repeats it.** The verification grep was `grep -E 'OK — no'`,
+which matches **"OK — no gaps. IR emitter covers every node kind…"** — a DIFFERENT audit that
+runs EARLIER. That line was present, so four commits (`65af3864`, `88c012ac`, `dfccd3f5`,
+`d995dbac`, `36404262`) were reported "make check exit 0, all gates" when make had actually
+aborted. CLAUDE.md already warns *"exit=2 with those lines ABSENT means an earlier step
+aborted make before the audits"* — the trap is that a DIFFERENT audit's OK line satisfies a
+loose grep. **Grep for the SPECIFIC line (`no default: clauses`), and always echo the real
+`MAKE_CHECK_EXIT`.**
+
+---
+
+**Survey scope.** Three `claude/gifted-noether-*` branches, one squashed commit each, forked
+from recent main (`65af3864` / `ac97e11a` / `6f6d9186`). **Every fix below was independently
+reproduced against current main before being listed** — mostly by running the branch's OWN
+negative test with main's `zerc`. Nothing is repeated on a branch's word alone. NOT merged or
+pulled; implement from these descriptions.
+
+### The 9 fixes to take
+
+| # | fix | source | how verified on main |
+|---|---|---|---|
+| **P3** | G3 walker `default:` skips 9 child-carriers **+ unbreaks `make check`** | `p0w5lj` | `atomic_cell_plain_via_switch_arm.zer` ACCEPTED |
+| **L1** | `@container` launders a stack pointer past escape sinks | **`l3vn1i`** | `container_var_escape_global.zer` ACCEPTED |
+| **L2** | `find_return_range` misses a return buried in a NESTED orelse | `l3vn1i` | 3 `zer_trap` files exit 0 (guard elided) |
+| **L3** | ISR dispatch through a funcptr never scanned (3 idioms) | `l3vn1i` | 3 negatives ACCEPTED |
+| **P1** | `return { .p = &local }` struct-literal escape at the RETURN sink | `p0w5lj` | `return_struct_init_local_escape.zer` ACCEPTED |
+| **P2** | ISR body never resets the VarRange map -> elided bounds guard | `p0w5lj` | emit-C only (invisible on hosted) |
+| **H1** | funcptr ARRAY-ELEMENT field callback `o.fns[0]()` spawn race | `2hg2v4` | `spawn_funcptr_array_field_race.zer` ACCEPTED |
+| **H3** | uN/iN SHIFT result not width-wrapped on the AST-passthrough store path | `2hg2v4` | branch's `uN_width_wrap_all_forms.zer` exits 40 |
+| **H4** | `@bitcast` / `@truncate`-to-uN in a global initializer emit illegal C | `2hg2v4` | both negatives ACCEPTED |
+
+---
+
+**P3 — the G3 atomic-cell walker shipped with a `default:` (`p0w5lj`). CRITICAL + build-breaking.**
+`record_atomic_plain_in_callee` (checker.c, added `65af3864`) used `default: return;`, silently
+skipping **switch / defer / orelse / do-while / @critical / @once / spawn / slice / struct-init**
+child-carriers. A plain atomic-cell access inside any of those, in a helper called after a
+fire-and-forget spawn, is not recorded and the race slips. Fix: enumerate the switch (descend the
+child-carriers, explicit no-op leaves/decls, NO `default:`). This is a partial walk by intent, so
+the no-op cases must be listed explicitly — that is exactly what the audit demands.
+Test: `tests/zer_fail/atomic_cell_plain_via_switch_arm.zer`.
+
+**L1 — `@container` launders a stack pointer past the escape sinks. CRITICAL (ASan stack-UAF).**
+**DUPLICATE — `2hg2v4` also fixes this (its BUG-769, 3 sinks). TAKE `l3vn1i`'s:** it covers
+**4** sinks (store-global, struct-field-of-global, return, keep), routes all **six** escape peels
+through the shared `unwrap_ptr_launder`, peels launder intrinsics at the top of
+`arg_is_local_derived`, **and fixes a latent sibling** — `unwrap_ptr_launder` peeled
+`@cstr(buf, str)` to the string literal instead of its `args[0]` buffer.
+Root cause: `@container(*T, ptr, field)`'s pointer is **args[0]**, but the sinks hand-rolled a
+LAST-arg intrinsic unwrap (last arg = the field NAME), so `is_local_derived` was never consulted.
+**PROBE WARNING — one of the branch's own negatives is MASKED:** `container_var_escape_return.zer`
+IS rejected on main, but by the LEAK rule (`handle %0 (local 'd') allocated…`), not the escape
+rule. Reading the exit code alone scores this "already fixed". Check the REASON.
+
+**L2 — a return buried in a NESTED orelse fallback is dropped from the return range. CRITICAL
+(ASan global-buffer-overflow).** The earlier B9 fix only saw a TOP-LEVEL orelse. These three
+shapes drop the buried return, so the caller elides `arr[callee()]`'s guard:
+`(mb() orelse { return 9; }) + b`, the same inside a call arg, and inside a return-expr wrapper.
+Fix: `scan_expr_orelse_returns`, a recursive expr walker wired into the `NODE_RETURN` handler and
+the general block. Conservative — it can only ADD guards.
+Tests: `tests/zer_trap/vrp_buried_orelse_{binary,callarg,return}.zer` (all exit 0 on main = guard
+elided = the bug).
+
+**L3 — ISR dispatch through a function pointer is never scanned. HIGH (silent bare-metal race).**
+The ISR sibling of the spawn funcptr family (`5ed17c2f`, `00dc785a`, `ac97e11a`) — the pattern
+predicted and confirmed: spawn side fixed three times, ISR side never. A non-volatile global
+touched only through an ISR-dispatched funcptr is invisible, and GCC `-O2` is free to hoist/tear
+it. Three idioms now followed from `record_isr_globals` to the target body: a **global funcptr
+variable**, a **funcptr field in a struct init**, and a **function name passed as an arg**.
+Tests: `tests/zer_fail/isr_funcptr_{global_var,struct_field,arg}.zer` — all three ACCEPTED on main.
+
+**P1 — `return { .p = &local }` dangles. HIGH.** A struct/union **literal** returned BY VALUE
+carrying a pointer/slice to a frame-local. The var-decl and assign-to-global sinks already ran
+`struct_init_has_local_derived`; the RETURN sink was the missing sibling (the multi-site class
+again). Gate on `type_carries_data_pointer`. `p0w5lj` also adds sink-matrix shape **p14**
+(3 reject + 2 safe cells) — take the matrix cells with the fix.
+Tests: `return_struct_init_local_escape.zer` + two positives (`_global_ptr_ok`, `_param_ptr_ok`).
+
+**P2 — an ISR body never resets the name-keyed VarRange map. HIGH (silent bare-metal OOB).**
+Only `func_decl` reset it (per SS-C#15). A narrowed range from the preceding declaration leaks
+into the `interrupt {}` body, marks a fixed-array index "proven", and elides the bounds
+auto-guard -> stack OOB. One-line mirror of the `func_decl` reset.
+**TEST-AUTHORING NOTE:** invisible on hosted x86 and an `interrupt` block cannot appear in a
+runnable `tests/zer/` positive (GCC refuses ISRs on hosted x86-64). Verify **emit-C-only**
+(`zerc f.zer -o f.c`) and say so in the commit.
+
+**H1 — funcptr ARRAY-ELEMENT field callback evades the spawn race scan. HIGH.**
+`o.fns[0]()` bound in the CALLER was accepted while the scalar sibling `o.cb()` was rejected:
+`body_calls_funcptr_field` / `scan_funcptr_field_bindings` matched only a bare `NODE_FIELD`
+callee/target, never `NODE_INDEX`-over-`FIELD`. Fix: a recursive `funcptr_field_access()` helper
+used at BOTH sites. **This is a 7th form of the funcptr REACH class** — add its cell to the REACH
+grid in `tests/test_conc_matrix.c` in the same commit, or it is invisible.
+
+**H3 — uN/iN SHIFT result is not width-wrapped on the AST-passthrough store path. HIGH
+(silent miscompile).** `u3 3<<2` gives 12, not 4; iN keeps the wrong sign. The G3 self-mask
+EXCLUDED shifts, and `_zer_shl`/`_zer_shr` only guard shift-by->=carrier-width — they never mask
+to N. var-decl / return / call-arg were safe (IR_BINOP + `emit_intn_mask`); **plain assign,
+global store, struct-field, array-elem, and shift-feeding-div/mod/shr were not.** Fix: wrap via
+`emit_intn_mask_lv`, mirroring the IR path. Take the branch's EXTENDED
+`tests/zer/uN_width_wrap_all_forms.zer` (main already has the file; the branch appends the shift
+forms — it exits **40** on main).
+
+**H4 — `@bitcast` and `@truncate`-to-uN in a global initializer emit illegal C. MEDIUM (LOUD).**
+The checker accepts them but the emitter produces a statement-expression, which is illegal at
+file scope -> a GCC error the user cannot act on. Add both to the G7 global-init reject list so
+the diagnostic comes from the checker. A native `@truncate` global still compiles.
+
+### Suggested order
+
+**P3 FIRST** — until it lands, `make check` aborts before five gates and the sink matrix, so no
+subsequent fix can be properly verified. Then **L1 -> L2 -> L3** (largest safety surface, all
+CRITICAL/HIGH), then **P1 -> P2**, then **H1 -> H3 -> H4**.
+
+### Also on these branches: documented-but-NOT-fixed (verify before chasing)
+
+From `p0w5lj` (5 reproducers added to `tests/zer_gaps/` with tripwires):
+- **HIGH** cross-thread race via a **CALLER-supplied funcptr forwarded to `spawn`**
+  (`spawn_funcptr_forwarded_param_race.zer`) — an 8th REACH form; the target's funcptr comes in
+  as a PARAMETER, so no binding is visible in the file.
+- **HIGH** pointer-deref var-decl alias (`*T k = *pp;`) untracked -> UAF + double-free. This is
+  the HOLE-A4 heap facet, also confirmed independently by `2hg2v4`.
+- **MEDIUM** non-atomic RMW in an ISR laundered through a pointer parameter.
+- **MEDIUM** `&packed_field` misalignment (already tracked here; policy decision pending).
+- **LOW** `volatile` lost through a `@ptrtoint -> @inttoptr` round-trip (audit-visible).
+
+From `2hg2v4`:
+- **CONFIRMED silent miscompile** — comptime/const integer fold ignores per-operation width
+  wrapping. Computes in host `int64` and masks only the final result. Explicitly probed and found
+  NOT a safety hole (checker and emitter read the same folded value), but a VALUE-correctness bug.
+  Deferred because the correct fix threads a destination width through the const evaluator.
+- **CONFIRMED accept-unsafe** — frees-param-field via UNWRAP-TO-LOCAL, extending the
+  "CLOSED 2026-08-08" frees-param-field entry. **That earlier closure is therefore incomplete.**
+- **LOW over-rejection** — a function returning a raw `*T` view of a global flagged as a leaked handle.
+- **SUSPICION (not confirmed)** — `@atomic_load(&g)` on a plain non-shared global compiles clean.
+
+From `l3vn1i`:
+- ISR funcptr FIELD *call* whose binding is NOT a same-scope struct init (LOW–MEDIUM) — the
+  residual after L3.
+- `naked` attribute silently dropped on the IR path (confirmed still live).
+- `vrp_ir.c` DEAD CODE (349 lines) — cross-ref: this is Phase 0 of
+  `docs/unified-oracle-proved-ZER.md`.
+
+---
+
 ## OPEN — `Pool`/`Slab`/`Ring` as a container FIELD reports "undefined type 'T'" (LOW, message quality)
 
 **Symptom.** `container C(T) { Pool(T,4) v; }` is rejected with `error: undefined type 'T'`.

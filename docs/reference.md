@@ -1307,7 +1307,7 @@ variable is `Handle(T)` / `?Handle(T)`, and a pointer when the target is
 
 **EXAMPLE**
 ```zer
-struct Task { u32 id; [*]u8 name; ?*Task next; }
+struct Task { u32 id; const [*]u8 name; ?*Task next; }
 Slab(Task) heap;
 
 u32 main() {
@@ -2411,7 +2411,7 @@ Two keywords make ANY C library fully safe from ZER:
 **Memory safety** — wrap C pointers in `*opaque`:
 ```zer
 cinclude "sensor.h";
-*opaque sensor_open([*]u8 path);
+*opaque sensor_open(const [*]u8 path);
 void sensor_close(*opaque dev);
 u32 sensor_read(*opaque dev);
 
@@ -3033,6 +3033,9 @@ bool swapped = @atomic_cas(&lock, 0, 1);
 
 ### async/await — Stackless Coroutines
 ```zer
+void led_on();
+void led_off();
+
 async void blink() {
     while (true) {
         led_on();

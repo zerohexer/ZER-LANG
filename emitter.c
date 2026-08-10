@@ -6506,6 +6506,35 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * producing UB on n >= width. Mirrors emit_expr NODE_BINARY
          * shift handling. */
         if (node->binary.op == TOK_LSHIFT || node->binary.op == TOK_RSHIFT) {
+            /* uN/iN shift RESULT must be width-wrapped to N bits, exactly like
+             * +,-,*,&,|,^ and the IR path (emit_intn_mask after _zer_shl at
+             * IR_BINOP). _zer_shl/_zer_shr only guard shift-by->=CARRIER-width;
+             * they do NOT mask the result to N. So `u3 a = 3; u32 x; x = a << 2;`
+             * gave 12 instead of 4, and an iN shift kept the wrong SIGN. This
+             * AST-passthrough store path was the ONLY one missing the mask —
+             * var-decl / return / call-arg lower to IR_BINOP and were already
+             * correct. The mask is a value no-op on a right shift but keeps iN
+             * sign-extension right. */
+            Type *rts = type_unwrap_distinct(checker_get_type(e->checker, node));
+            TypeKind rsk = type_dispatch_kind(rts);
+            bool narrow_s = (rsk == TYPE_U8 || rsk == TYPE_I8 ||
+                             rsk == TYPE_U16 || rsk == TYPE_I16);
+            if (narrow_s || type_is_nonnative_intn(rts)) {
+                int tmp = e->temp_count++;
+                char lvbuf[32];
+                snprintf(lvbuf, sizeof(lvbuf), "_zer_sw%d", tmp);
+                emit(e, "({ ");
+                emit_type(e, rts);
+                emit(e, " %s = %s(", lvbuf,
+                     node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+                emit_rewritten_node(e, node->binary.left, func);
+                emit(e, ", ");
+                emit_rewritten_node(e, node->binary.right, func);
+                emit(e, "); ");
+                emit_intn_mask_lv(e, rts, lvbuf);
+                emit(e, "%s; })", lvbuf);
+                return;
+            }
             emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
             emit_rewritten_node(e, node->binary.left, func);
             emit(e, ", ");

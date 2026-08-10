@@ -1,0 +1,9 @@
+// A provable return range [0,3] still proves tbl[i] safe (no buried return) —
+// the B9-extended walker must not over-conservatively drop a genuine range.
+u8[4] tbl;
+u32 pick(u32 x) { return x & 3; }
+u32 main() {
+    u32 i = pick(100);   // proven [0,3] — tbl[i] needs no guard
+    tbl[i] = 5;
+    return 0;
+}

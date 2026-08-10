@@ -5,6 +5,89 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-10b — branch survey p0w5lj / 2hg2v4 / l3vn1i: 9 fixes (BUG-771..779)
+
+Implemented from `docs/limitations.md` "branch survey 2026-08-10". Nothing merged or
+pulled; each fix re-derived from the description and verified against the branch's own
+tests. Every negative was confirmed ACCEPTED on pre-fix main before being trusted.
+
+**BUG-771 (P3) — `make check` had been EXITING 2 since `65af3864`, and my reporting hid it.**
+The G3 walker `record_atomic_plain_in_callee` shipped with `default: return;` in a
+`switch (node->kind)`. Two consequences: (a) it silently skipped NINE child-carriers —
+switch, defer, orelse, do-while, `@critical`, `@once`, spawn, slice, struct-init — so a
+plain atomic-cell access inside any of them in a helper was never recorded and the race
+slipped; (b) `walker_default_audit.sh` failed, make aborted there, and **five later gates
+never ran** (fixed-buffer, type-dispatch, carrier-dispatch, emit-audit, sink matrix).
+Fixed by enumerating all 53 NodeKinds — carriers descended, leaves/decls listed explicitly
+as no-ops, NO `default:` — so a new kind now fails the `-Werror=switch` build.
+**The reporting failure is the durable lesson:** verification used `grep -E 'OK — no'`,
+which matches *"OK — no gaps"* from a DIFFERENT audit that runs EARLIER. Recorded in
+CLAUDE.md: grep the SPECIFIC line, and always echo `MAKE_CHECK_EXIT`.
+
+**BUG-772 (L1) — `@container` laundered a stack pointer past FOUR escape sinks.** CRITICAL,
+ASan stack-use-after-return. `@container(*T, ptr, field)`'s pointer is **args[0]**, but the
+sinks hand-rolled a LAST-arg intrinsic unwrap — and the last arg is the field NAME — so
+`is_local_derived` was never consulted. Routed store-to-global, assign, keep-call, the
+per-arg `arg_is_local_derived`, and the return root through the shared
+`unwrap_ptr_launder`, and added a keep-param launder check (peel, then re-check via
+`arg_is_local_derived`, restricted to a NON-CALL peeled root so `call_result_escapes`
+precision is preserved). **Latent sibling fixed:** `unwrap_ptr_launder` peeled
+`@cstr(buf, str)` to the STRING LITERAL instead of its `args[0]` buffer. The return sink's
+cast-name list also gained `@pun`/`@container`/`@cstr`.
+Chose `l3vn1i`'s shape over `2hg2v4`'s (4 sinks + the `@cstr` sibling, vs 3 sinks).
+
+**BUG-773 (L2) — a return buried in a NESTED `orelse` fallback was dropped from the return
+range.** CRITICAL, ASan global-buffer-overflow. The B9 fix only matched an orelse that was
+the statement's IMMEDIATE init/expr/RHS, so `(mb() orelse {return 9;}) + b`, the same in a
+call arg, and the same inside a return expression all under-approximated the callee summary
+— and the caller then elided `arr[callee()]`'s bounds guard. New `scan_expr_orelse_returns`
+walks expression-composition nodes to every embedded orelse and unions its fallback's
+range; returns false (conservative, gives up the summary) when a buried return has no
+derivable range, so it can only ADD guards.
+
+**BUG-774 (L3) — ISR dispatch through a function pointer was never scanned.** HIGH, silent
+bare-metal race. **The ISR sibling of the spawn funcptr family** — predicted and confirmed:
+the spawn side was fixed three times (`5ed17c2f`, `00dc785a`, `ac97e11a`), the ISR side
+never. Three idioms now followed from `record_isr_globals` to the target body: a global
+funcptr VARIABLE (`*() g_cb = bump; interrupt { g_cb(); }` — the canonical bare-metal
+idiom, whose callee IDENT resolves to a global VARIABLE so the `is_function` descent missed
+it), a funcptr FIELD in a struct init, and a function name passed as an ARG.
+
+**BUG-775 (P1) — `return { .p = &local }` dangled.** HIGH. A struct/union LITERAL returned
+BY VALUE carrying a pointer/slice to a frame-local. The var-decl and assign-to-global sinks
+already ran `struct_init_has_local_derived`; the RETURN sink was the missing sibling — the
+multi-site class again. Gated on `type_carries_data_pointer`.
+
+**BUG-776 (P2) — an ISR body never reset the name-keyed VarRange map.** HIGH, silent
+bare-metal OOB. Only `func_decl` reset it, so a narrowed range from the PRECEDING
+declaration leaked into the `interrupt {}` body, marked a fixed-array index "proven", and
+elided the bounds auto-guard. One-line mirror of the `func_decl` reset. **Verified emit-C
+only** — an `interrupt` block cannot appear in a runnable hosted positive (GCC refuses ISRs
+on x86-64). Measured: pre-fix 0 guards, post-fix the auto-guard warning fires.
+
+**BUG-777 (H1) — funcptr ARRAY-ELEMENT field callback evaded the spawn race scan.** HIGH.
+`o.fns[0]()` bound in the caller was accepted while the scalar sibling `o.cb()` was
+rejected: both the tell and the binding collector matched only a bare `NODE_FIELD`, never
+`NODE_INDEX`-over-`FIELD`. New recursive `funcptr_field_access()` used at both sites.
+**This is the 7th form of the funcptr REACH class** — its grid cell was added in the same
+commit (conc-matrix 67 -> 71 cells), because a form with no cell is invisible.
+
+**BUG-778 (H3) — uN/iN SHIFT result not width-wrapped on the AST-passthrough store path.**
+HIGH, silent miscompile: `u3 3<<2` gave 12 instead of 4, and an iN shift kept the wrong
+sign. The G3 self-mask EXCLUDED shifts, and `_zer_shl`/`_zer_shr` only guard
+shift-by->=CARRIER-width — they never mask to N. var-decl / return / call-arg were safe
+(they lower to IR_BINOP + `emit_intn_mask`); plain assign, global store, struct-field,
+array-elem and shift-feeding-div/mod/shr were not. Wrapped via `emit_intn_mask_lv`,
+mirroring the IR path.
+
+**BUG-779 (H4) — `@bitcast` and `@truncate`-to-uN in a global initializer emitted illegal
+C.** MEDIUM, loud. The prior comment claimed both "fold to a constant cast" — false.
+`@bitcast` ALWAYS lowers to a `({ ... memcpy ... })` statement-expression; `@truncate`
+folds to a constant cast only for a NATIVE width, and emits a masking statement-expr for a
+non-native uN/iN. Both are now in the G7 global-init reject list so the diagnostic names
+the ZER line instead of GCC naming the generated `.c`. A native-width `@truncate` global
+still compiles.
+
 ## Session 2026-08-10 — goto-defer double-fire on the SUCCESS path (BUG-770)
 
 **BUG-770.** A loop-scoped `defer` fired N+1 times when the loop body contained a forward `goto` out

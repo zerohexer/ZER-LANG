@@ -1,0 +1,8 @@
+// expect-error: must be declared volatile
+// EXPECTED: compile error
+// E2 facet 3: ISR passes a function NAME as an arg to a forwarder that invokes it.
+u32 counter;
+void bump() { counter = counter + 1; }
+void invoke(*() f) { f(); }
+interrupt USART1 { invoke(bump); }
+u32 main() { counter = 7; return counter; }

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: struct literal carrying a pointer to a local
+// A struct/union LITERAL returned by value carrying &local dangles in the caller.
+// The var-decl and assign-to-global sinks ran struct_init_has_local_derived;
+// the return sink was the missing sibling (audit 2026-08-10).
+struct Box { *u32 p; }
+Box mk() {
+    u32 loc = 5;
+    return { .p = &loc };
+}
+u32 main() { Box b = mk(); return 0; }

@@ -1,0 +1,9 @@
+// @container of a GLOBAL-derived pointer laundered to keep param must COMPILE
+// (no over-rejection from the escape-peel fix).
+struct List { u32 n; }
+struct Device { u32 id; List list; }
+Device g_dev;
+?*Device g_slot;
+void stash(keep *Device d) { g_slot = d; }
+void run() { *List lp = &g_dev.list; stash(@container(*Device, lp, list)); }
+u32 main() { run(); if (g_slot) |d| { return d.id; } return 0; }

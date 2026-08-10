@@ -1,0 +1,11 @@
+// B9-extended: a `return` buried in an orelse-block fallback nested inside a
+// BINARY expr must be unioned into the return-range summary, so the caller does
+// NOT elide tbl[pick()]'s bounds guard. Compiles clean; traps (index 9 on u8[4]).
+u8[4] tbl;
+?u32 mb() { return null; }
+u32 pick() {
+    u32 base = 0;
+    u32 v = (mb() orelse { return 9; }) + base;
+    return v & 3;
+}
+u32 main() { return tbl[pick()]; }

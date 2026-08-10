@@ -366,7 +366,7 @@ static const char *sink_name(CASink s) {
  * A new reach form with no cell here is INVISIBLE. Add the cell in the same
  * commit as the form. */
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
-               RCH_FACTORY1, RCH_FACTORY2, RCH_COUNT } CAReach;
+               RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
 static const char *reach_name(CAReach r) {
@@ -377,6 +377,7 @@ static const char *reach_name(CAReach r) {
     case RCH_ARRAY:    return "array-element";
     case RCH_FACTORY1: return "factory-1hop";
     case RCH_FACTORY2: return "factory-2hop";
+    case RCH_FIELD_ARRAY: return "field-array-elem";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -425,6 +426,12 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
     case RCH_FACTORY2:
         extra = "*() mk2() { return cb; }\n*() mk() { return mk2(); }\n";
         wbody = "*() fp = mk(); fp();"; break;
+    /* 7th form (2026-08-10): a funcptr ARRAY ELEMENT of a struct FIELD. The tell
+     * and the binding collector both matched only a bare NODE_FIELD, so the
+     * INDEX-over-FIELD callee slipped the gate while `o.cb()` was rejected. */
+    case RCH_FIELD_ARRAY:
+        extra = "typedef *() -> void VoidFn;\nstruct Ops { VoidFn[2] fns; }\n";
+        wbody = "Ops o; o.fns[0] = cb; o.fns[0]();"; break;
     default: break;
     }
     snprintf(out, n,

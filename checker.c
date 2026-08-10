@@ -1118,6 +1118,7 @@ static void classify_escape_sink(Checker *c, Node *target,
  * result laundered as an outer arg; an optional-pointer struct field/element read
  * stored to a global). A VALUE optional (?u32) copies a value, not a reference, so
  * it is correctly excluded (its unwrapped inner is not a pointer/slice). */
+static Node *unwrap_ptr_launder(Node *v);   /* fwd: defined below */
 static bool escape_type_carries_ref(Type *vt) {
     if (!vt) return false;
     TypeKind k = type_dispatch_kind(vt);
@@ -1491,9 +1492,10 @@ static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
     if (!call || call->kind != NODE_CALL || depth > 8) return false;
     for (int i = 0; i < call->call.arg_count; i++) {
         Node *arg = call->call.args[i];
-        /* unwrap value-side intrinsic launders (@ptrcast(*T, p)) */
-        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
-            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        /* unwrap value-side intrinsic launders. MUST use the shared helper:
+         * @container's pointer is args[0] (its LAST arg is the field NAME), so a
+         * hand-rolled last-arg loop peeled to the field ident and missed the local. */
+        arg = unwrap_ptr_launder(arg);
         /* BUG-766 (copied from cool-johnson-dfcqr9): descend SLICE/INDEX/FIELD to
          * the root ident — `g = idfn(np[0..16])` (direct slice of a non-keep
          * param) previously laundered the flag here and silently escaped. */
@@ -1736,8 +1738,15 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
 static Node *unwrap_ptr_launder(Node *v) {
     while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
-        if (v->intrinsic.name_len == 9 &&
-            memcmp(v->intrinsic.name, "container", 9) == 0)
+        /* @container(*T, ptr, field) and @cstr(buf, str) both return a pointer
+         * INTO their args[0]; every other launder (@ptrcast/@pun/@bitcast/@cast)
+         * passes the pointer as its LAST arg. Peeling @cstr to the last arg reached
+         * the STRING LITERAL instead of the caller's buffer — a local laundered
+         * through @cstr escaped unflagged. */
+        if ((v->intrinsic.name_len == 9 &&
+             memcmp(v->intrinsic.name, "container", 9) == 0) ||
+            (v->intrinsic.name_len == 4 &&
+             memcmp(v->intrinsic.name, "cstr", 4) == 0))
             v = v->intrinsic.args[0];
         else
             v = v->intrinsic.args[v->intrinsic.arg_count - 1];
@@ -4958,8 +4967,8 @@ static Type *check_expr(Checker *c, Node *node) {
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
             /* BUG-355: walk through intrinsics to find root ident */
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* @container-safe peel: its pointer is args[0] (last arg = field name). */
+            vnode = unwrap_ptr_launder(vnode);
             /* BUG-748: descend through `arr[a..b]` borrow shape */
             bool via_slice_borrow = false;
             if (vnode && vnode->kind == NODE_SLICE) {
@@ -5059,8 +5068,8 @@ static Type *check_expr(Checker *c, Node *node) {
          * Storing to global violates this contract — caller may pass &local. */
         if (node->assign.op == TOK_EQ) {
             Node *vnode = node->assign.value;
-            while (vnode && vnode->kind == NODE_INTRINSIC && vnode->intrinsic.arg_count > 0)
-                vnode = vnode->intrinsic.args[vnode->intrinsic.arg_count - 1];
+            /* @container-safe peel: its pointer is args[0] (last arg = field name). */
+            vnode = unwrap_ptr_launder(vnode);
             /* P9 (BUG-737 field-launder, 2026-06-24): `g = param.field` (or
              * `param[i]`) where the stored value is a pointer/slice FIELD of a
              * non-keep-derived by-value struct param launders the caller's
@@ -6745,8 +6754,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         for (int kc = 0; kc < keep_check_count; kc++) {
                         Node *karg = keep_checks[kc];
                         /* walk into intrinsics */
-                        while (karg && karg->kind == NODE_INTRINSIC && karg->intrinsic.arg_count > 0)
-                            karg = karg->intrinsic.args[karg->intrinsic.arg_count - 1];
+                        /* @container-safe peel: its pointer is args[0] (last arg = field name). */
+                        karg = unwrap_ptr_launder(karg);
                         if (karg && karg->kind == NODE_UNARY &&
                             karg->unary.op == TOK_AMP) {
                             /* C6 (2026-08-01): the DIRECT `keepfn(&loc.f)` /
@@ -6903,6 +6912,23 @@ static Type *check_expr(Checker *c, Node *node) {
                                     edge_vkind = KV_LOCAL_ARRAY;
                                     edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                 }
+                            }
+                        }
+                        /* @container/@ptrcast/@pun-of-a-local laundered into a
+                         * keep param: peel the launder wrapper (args[0] for
+                         * @container) and re-check the non-call local shapes via
+                         * the shared arg_is_local_derived. Restricted to a
+                         * NON-CALL peeled root so the call-launder precision below
+                         * (call_result_escapes' static exception) is preserved.
+                         * Without this a laundered stack pointer satisfied `keep`
+                         * — ASan stack-use-after-return. */
+                        if (edge_vkind == KV_NONE &&
+                            arg_node && arg_node->kind == NODE_INTRINSIC) {
+                            Node *pk = unwrap_ptr_launder(arg_node);
+                            if (pk && pk != arg_node && pk->kind != NODE_CALL &&
+                                arg_is_local_derived(c, pk, 0)) {
+                                edge_vkind = KV_LOCAL_DERIVED;
+                                edge_argname = "argument"; edge_argname_len = 8;
                             }
                         }
                         /* BUG-763: call-laundered local into a keep param —
@@ -10670,11 +10696,23 @@ static bool scan_funcname_binding(Checker *c, Node *n,
  * If-chains, not switches: these are PARTIAL walks, so a no-default switch would
  * be a false promise of exhaustiveness. An unlisted kind yields false = we do not
  * flag = today's behaviour, never a new rejection. */
+/* Does this expression READ a funcptr out of a struct field, at any index depth?
+ * `o.cb` is a bare NODE_FIELD; `o.fns[0]` is a NODE_INDEX over that field. The
+ * array-element-of-field form was a spawn-race hole — the tell and the collector
+ * both matched only a bare NODE_FIELD, so an INDEX-over-FIELD callee slipped the
+ * funcptr-field gate while its scalar sibling `o.cb()` was correctly rejected. */
+static bool funcptr_field_access(Node *n) {
+    if (!n) return false;
+    if (n->kind == NODE_FIELD) return true;
+    if (n->kind == NODE_INDEX) return funcptr_field_access(n->index_expr.object);
+    return false;
+}
+
 static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
     if (!n || depth > 8) return false;
     if (n->kind == NODE_CALL) {
-        /* the tell: callee is a FIELD (`o.cb()`), not an ident */
-        if (n->call.callee && n->call.callee->kind == NODE_FIELD) return true;
+        /* the tell: callee reads a funcptr field (`o.cb()` or `o.fns[0]()`) */
+        if (n->call.callee && funcptr_field_access(n->call.callee)) return true;
         for (int i = 0; i < n->call.arg_count; i++)
             if (body_calls_funcptr_field(c, n->call.args[i], depth)) return true;
         /* descend into a directly-called global function */
@@ -10733,7 +10771,7 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
                                         Symbol **out_fn) {
     if (!n || depth > 8) return false;
     if (n->kind == NODE_ASSIGN) {
-        if (n->assign.target && n->assign.target->kind == NODE_FIELD &&
+        if (n->assign.target && funcptr_field_access(n->assign.target) &&
             scan_funcname_binding(c, n->assign.value, out_name, out_len)) {
             /* record WHICH function was bound, so the caller can consult ITS
              * props: an @atomic/@barrier in the CALLBACK is the manual-sync
@@ -13205,19 +13243,15 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 for (int ri = 0; ri < root_count; ri++) {
                     Node *root = roots[ri];
-                    /* BUG-317: walk into @ptrcast/@bitcast in orelse fallback.
-                     * Only when return type is pointer — value bitcasts are safe. */
-                    if (root && root->kind == NODE_INTRINSIC &&
-                        ret_type && ret_type->kind == TYPE_POINTER) {
-                        const char *iname = root->intrinsic.name;
-                        uint32_t ilen = (uint32_t)root->intrinsic.name_len;
-                        /* BUG-351: @cast also needs escape check */
-                        bool is_cast = (ilen == 7 && memcmp(iname, "ptrcast", 7) == 0) ||
-                                       (ilen == 7 && memcmp(iname, "bitcast", 7) == 0) ||
-                                       (ilen == 4 && memcmp(iname, "cast", 4) == 0);
-                        if (is_cast && root->intrinsic.arg_count > 0)
-                            root = root->intrinsic.args[root->intrinsic.arg_count - 1];
-                    }
+                    /* BUG-317/351: peel launder intrinsics (@ptrcast/@pun/@bitcast/
+                     * @cast/@container/@cstr) to the underlying pointer in the return
+                     * root. Only when the return type is a pointer — value bitcasts
+                     * are safe. unwrap_ptr_launder is @container-safe (its pointer is
+                     * args[0], NOT the last arg, which is the field-name ident); the
+                     * old last-arg-only peel let `return @container(*T, local_ptr,
+                     * field)` escape. type_dispatch_kind unwraps a distinct return. */
+                    if (root && ret_type && type_dispatch_kind(ret_type) == TYPE_POINTER)
+                        root = unwrap_ptr_launder(root);
                     /* BUG-317: walk into &expr in orelse fallback */
                     if (root && root->kind == NODE_UNARY && root->unary.op == TOK_AMP) {
                         Node *inner = root->unary.operand;
@@ -13579,6 +13613,19 @@ static void check_stmt(Checker *c, Node *node) {
                 if (validate_struct_init(c, node->ret.expr, c->current_func_ret, node->loc.line)) {
                     ret_type = c->current_func_ret;
                     typemap_set(c, node->ret.expr, c->current_func_ret);
+                }
+                /* Escape sink — this was the MISSING SIBLING of the var-decl and
+                 * assign-to-global sinks, both of which already ran
+                 * struct_init_has_local_derived. A struct/union LITERAL returned
+                 * BY VALUE that carries a pointer/slice to a frame-local
+                 * (`return { .p = &local }`, a slice-of-local, or a call-launder)
+                 * dangles in the caller. Gate on the return type actually carrying
+                 * a data pointer, then run the shared walker. */
+                if (type_carries_data_pointer(c->current_func_ret, 0) &&
+                    struct_init_has_local_derived(c, node->ret.expr)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return a struct literal carrying a pointer to a "
+                        "local — stack memory is freed when the function returns");
                 }
             }
 
@@ -16628,6 +16675,13 @@ static void check_func_body(Checker *c, Node *node) {
         c->current_func_ret = ty_void;
         c->in_interrupt = true;
         push_scope(c);
+        /* SS-C #15 sibling: interrupt bodies are checked in the same source-order
+         * pass-2 loop as functions, but were the one checked body that never reset
+         * the name-keyed VarRange map. A narrowed range from the PRECEDING
+         * declaration (`if (n >= 4) return;` -> n=[0,3]) leaked in, marked a
+         * fixed-array index "proven", and elided the bounds auto-guard inside the
+         * ISR -> silent bare-metal stack OOB. Mirrors the func_decl reset. */
+        c->var_range_count = 0;
         check_stmt(c, node->interrupt.body);
         /* ISR-TRANS: also record globals reached through helper calls so the
          * "accessed from both ISR and main → volatile" and "volatile compound
@@ -17266,14 +17320,31 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     }
     case NODE_CALL: {
         record_isr_globals(c, node->call.callee, depth);
-        for (int i = 0; i < node->call.arg_count; i++)
+        for (int i = 0; i < node->call.arg_count; i++) {
             record_isr_globals(c, node->call.args[i], depth);
+            /* ISR funcptr facet 3: a bare function NAME passed as an ARG —
+             * `invoke(bump)` — may be invoked by the callee (`invoke(*() f){ f(); }`),
+             * reaching a shared global from the ISR. Sound over-approximation: scan
+             * the named function's body (the remedy is the same either way). */
+            record_isr_funcname_binding(c, node->call.args[i], depth);
+        }
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
             Symbol *cs = scope_lookup(c->global_scope,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+            /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
+             * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }` — the canonical
+             * bare-metal ISR-dispatch idiom. The callee IDENT resolves to a global
+             * VARIABLE, not a function, so the is_function descent above missed it
+             * and bump's body (touching a shared global) was never scanned: the
+             * global stayed non-volatile and GCC -O2 is free to hoist/tear it.
+             * Precise — fires only when the ISR actually invokes the funcptr. */
+            else if (cs && !cs->is_function && cs->func_node &&
+                     cs->func_node->kind == NODE_GLOBAL_VAR &&
+                     cs->func_node->var_decl.init)
+                record_isr_funcname_binding(c, cs->func_node->var_decl.init, depth);
         }
         return;
     }
@@ -17327,8 +17398,13 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         record_isr_globals(c, node->slice.end, depth);
         return;
     case NODE_STRUCT_INIT:
-        for (int i = 0; i < node->struct_init.field_count; i++)
+        for (int i = 0; i < node->struct_init.field_count; i++) {
             record_isr_globals(c, node->struct_init.fields[i].value, depth);
+            /* ISR funcptr facet 2: a funcptr FIELD bound to a function name in a
+             * struct initializer — `Ops o = { .fn = bump }; o.fn();` — reaches a
+             * shared global via the field dispatch. Sound over-approximation. */
+            record_isr_funcname_binding(c, node->struct_init.fields[i].value, depth);
+        }
         return;
     case NODE_DEFER:    record_isr_globals(c, node->defer.body, depth); return;
     case NODE_CRITICAL: record_isr_globals(c, node->critical.body, depth); return;
@@ -17447,6 +17523,56 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
     case NODE_VAR_DECL: record_atomic_plain_in_callee(c, node->var_decl.init, depth); return;
     case NODE_RETURN:   record_atomic_plain_in_callee(c, node->ret.expr, depth); return;
     case NODE_EXPR_STMT: record_atomic_plain_in_callee(c, node->expr_stmt.expr, depth); return;
+    /* --- child-carriers that the original `default:` silently skipped (2026-08-10).
+     * Each of these can hold a plain atomic-cell access in a helper body; without
+     * them the access was never recorded and the race slipped. --- */
+    case NODE_SWITCH:
+        record_atomic_plain_in_callee(c, node->switch_stmt.expr, depth);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            SwitchArm *a = &node->switch_stmt.arms[i];
+            for (int j = 0; j < a->value_count; j++)
+                record_atomic_plain_in_callee(c, a->values[j], depth);
+            record_atomic_plain_in_callee(c, a->body, depth);
+        }
+        return;
+    case NODE_DEFER:    record_atomic_plain_in_callee(c, node->defer.body, depth); return;
+    case NODE_CRITICAL: record_atomic_plain_in_callee(c, node->critical.body, depth); return;
+    case NODE_ONCE:     record_atomic_plain_in_callee(c, node->once.body, depth); return;
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            record_atomic_plain_in_callee(c, node->spawn_stmt.args[i], depth);
+        return;
+    case NODE_DO_WHILE:
+        record_atomic_plain_in_callee(c, node->while_stmt.cond, depth);
+        record_atomic_plain_in_callee(c, node->while_stmt.body, depth);
+        return;
+    case NODE_ORELSE:
+        record_atomic_plain_in_callee(c, node->orelse.expr, depth);
+        record_atomic_plain_in_callee(c, node->orelse.fallback, depth);
+        return;
+    case NODE_SLICE:
+        record_atomic_plain_in_callee(c, node->slice.object, depth);
+        record_atomic_plain_in_callee(c, node->slice.start, depth);
+        record_atomic_plain_in_callee(c, node->slice.end, depth);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            record_atomic_plain_in_callee(c, node->struct_init.fields[i].value, depth);
+        return;
+    case NODE_TYPECAST: record_atomic_plain_in_callee(c, node->typecast.expr, depth); return;
+    case NODE_AWAIT:    record_atomic_plain_in_callee(c, node->await_stmt.cond, depth); return;
+    /* --- leaves and declarations: nothing to descend. ENUMERATED, not `default:`,
+     * so a NEW NodeKind fails the -Werror=switch build instead of being skipped. --- */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_ASM: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return;
     case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
             record_atomic_plain_in_callee(c, node->block.stmts[i], depth);
@@ -17466,7 +17592,6 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
         record_atomic_plain_in_callee(c, node->for_stmt.step, depth);
         record_atomic_plain_in_callee(c, node->for_stmt.body, depth);
         return;
-    default: return;
     }
 }
 
@@ -18096,9 +18221,73 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 
 /* Scan a function body for return expressions with derivable range.
  * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+/* Union in the return ranges of any orelse-block fallback BURIED inside an
+ * expression: `u32 v = (mb() orelse {return 9;}) + b;`, `id(mb() orelse
+ * {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The original B9
+ * block only matched an orelse that was the statement's IMMEDIATE init/expr/RHS,
+ * so a nested one was silently dropped from the return-range union -> the callee
+ * summary UNDER-approximated and a caller elided its bounds guard on
+ * `arr[callee()]` (ASan global-buffer-overflow). Descends the expression-
+ * COMPOSITION nodes only (a leaf carries no sub-expression that could hold an
+ * orelse); an if-chain mirrors find_return_range's own style. Returns false
+ * (giving up the whole summary -> conservative) when a buried return has no
+ * derivable range, so this can only ADD guards, never elide one. */
+static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch);
+static bool scan_expr_orelse_returns(Checker *c, Node *e, int64_t *out_min,
+                                     int64_t *out_max, bool *found) {
+    if (!e) return true;
+    if (e->kind == NODE_ORELSE) {
+        if (e->orelse.fallback &&
+            !find_return_range(c, e->orelse.fallback, out_min, out_max, found, true))
+            return false;
+        return scan_expr_orelse_returns(c, e->orelse.expr, out_min, out_max, found);
+    }
+    if (e->kind == NODE_BINARY) {
+        if (!scan_expr_orelse_returns(c, e->binary.left, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->binary.right, out_min, out_max, found);
+    }
+    if (e->kind == NODE_UNARY)
+        return scan_expr_orelse_returns(c, e->unary.operand, out_min, out_max, found);
+    if (e->kind == NODE_CALL) {
+        if (!scan_expr_orelse_returns(c, e->call.callee, out_min, out_max, found)) return false;
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (!scan_expr_orelse_returns(c, e->call.args[i], out_min, out_max, found)) return false;
+        return true;
+    }
+    if (e->kind == NODE_INDEX) {
+        if (!scan_expr_orelse_returns(c, e->index_expr.object, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->index_expr.index, out_min, out_max, found);
+    }
+    if (e->kind == NODE_FIELD)
+        return scan_expr_orelse_returns(c, e->field.object, out_min, out_max, found);
+    if (e->kind == NODE_SLICE) {
+        if (!scan_expr_orelse_returns(c, e->slice.object, out_min, out_max, found)) return false;
+        if (!scan_expr_orelse_returns(c, e->slice.start, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->slice.end, out_min, out_max, found);
+    }
+    if (e->kind == NODE_TYPECAST)
+        return scan_expr_orelse_returns(c, e->typecast.expr, out_min, out_max, found);
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (!scan_expr_orelse_returns(c, e->intrinsic.args[i], out_min, out_max, found)) return false;
+        return true;
+    }
+    if (e->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (!scan_expr_orelse_returns(c, e->struct_init.fields[i].value, out_min, out_max, found)) return false;
+        return true;
+    }
+    return true; /* leaf / non-composition — no embedded orelse */
+}
+
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch) {
     if (!node) return true;
     if (node->kind == NODE_RETURN && node->ret.expr) {
+        /* buried orelse-block return in the return expression itself, e.g.
+         * `return (mb() orelse { return 9; }) & 3;` — the inner return is a
+         * separate path; union it before deriving the outer expr's range. */
+        if (!scan_expr_orelse_returns(c, node->ret.expr, out_min, out_max, found))
+            return false;
         int64_t rmin, rmax;
         if (derive_expr_range(c, node->ret.expr, &rmin, &rmax)) {
             if (!*found) {
@@ -18235,11 +18424,12 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         if (node->kind == NODE_VAR_DECL)       oe = node->var_decl.init;
         else if (node->kind == NODE_EXPR_STMT) oe = node->expr_stmt.expr;
         else if (node->kind == NODE_ASSIGN)    oe = node->assign.value;
-        if (oe && oe->kind == NODE_ORELSE && oe->orelse.fallback) {
-            if (!find_return_range(c, oe->orelse.fallback, out_min, out_max,
-                                   found, true))
-                return false;
-        }
+        /* scan_expr_orelse_returns reaches a BURIED orelse (nested in a binary /
+         * call arg / index / etc.), not just a top-level one — the narrow
+         * oe->kind==NODE_ORELSE check missed `u32 v = (mb() orelse {return 9;}) + b;`
+         * and silently dropped the buried return from the union (silent OOB). */
+        if (oe && !scan_expr_orelse_returns(c, oe, out_min, out_max, found))
+            return false;
     }
     return true; /* non-return statement — ok */
 }
@@ -18657,10 +18847,29 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                  * accident of the C backend masking a silent checker. Reject
                  * cleanly here so the message names the ZER line and the fix.
                  *
-                 * @truncate/@bitcast fold to a constant cast and are
-                 * intentionally NOT listed — they remain valid global inits. */
+                 * @bitcast ALWAYS lowers to a ({ ... memcpy ... }) statement-
+                 * expression (never a constant cast), so it can never be a
+                 * file-scope initializer. @truncate folds to a constant `(T)val`
+                 * cast ONLY for a NATIVE-width T; to a NON-NATIVE uN/iN it emits a
+                 * masking ({ ... }) statement-expr. Both were wrongly excluded — the
+                 * prior comment claimed they "fold to a constant cast", which is
+                 * false — so the checker accepted them and GCC then rejected the
+                 * emitted .c with "braced-group within expression allowed only
+                 * inside a function": the same silent-checker / loud-backend shape
+                 * as @saturate. A native-width @truncate global still compiles. */
+                bool tgt_nonnative_intn = false;
+                {
+                    TypeKind tk = type_dispatch_kind(type); /* unwraps distinct, NULL-safe */
+                    if (tk == TYPE_UINT || tk == TYPE_SINT) {
+                        uint32_t nb = type_unwrap_distinct(type)->intn.bits;
+                        tgt_nonnative_intn =
+                            !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
+                    }
+                }
                 int is_nonconst_emit =
                     (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
+                    (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
+                    (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||
                     (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
                                  memcmp(gn, "subb", 4) == 0 ||
                                  memcmp(gn, "mulw", 4) == 0));

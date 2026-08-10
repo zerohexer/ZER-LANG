@@ -1,0 +1,5 @@
+// Sibling: orelse-block return buried under a NODE_RETURN's own expression.
+u8[4] tbl;
+?u32 mb() { return null; }
+u32 pick() { return (mb() orelse { return 9; }) & 3; }
+u32 main() { return tbl[pick()]; }

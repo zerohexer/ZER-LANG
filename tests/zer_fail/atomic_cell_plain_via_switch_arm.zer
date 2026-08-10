@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: atomic cell
+// G3 coverage: a plain write to an atomic cell inside a SWITCH ARM of a helper
+// reached after a fire-and-forget spawn was silently accepted (the G3 walker
+// record_atomic_plain_in_callee had a `default:` that skipped NODE_SWITCH /
+// NODE_DEFER / etc.). Now descended. See BUGS-FIXED.md 2026-08-10.
+u32 g_ctr;
+void worker() { u32 v = @atomic_load(&g_ctr); }
+void poke(u32 k) {
+    switch (k) {
+        0 => { g_ctr = 5; }
+        default => { }
+    }
+}
+u32 main() {
+    spawn worker();
+    poke(0);
+    return 0;
+}

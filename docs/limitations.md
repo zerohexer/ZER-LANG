@@ -390,6 +390,14 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## ~~branch survey 2026-08-10: 9 verified fixes~~ (ALL LANDED 2026-08-10, BUG-771..779)
+
+**FULLY HARVESTED.** All 9 implemented and verified; `make check` breakage closed by P3.
+Kept for the reproducers, the probe/masking warnings, and the branch attribution. The
+"documented-but-NOT-fixed" list at the END of this entry is still OPEN — see there.
+
+### (original entry follows)
+
 ## OPEN — branch survey 2026-08-10: 9 verified fixes to implement (`p0w5lj` / `2hg2v4` / `l3vn1i`) + a LIVE `make check` breakage
 
 **READ THIS FIRST — `make check` IS CURRENTLY BROKEN AND HAS BEEN SINCE `65af3864`.**

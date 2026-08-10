@@ -12120,7 +12120,84 @@ feels like progress.** Do both in the same commit — the rule the file already 
 
 ---
 
-## The funcptr REACH class — one question, six syntactic forms (2026-08-06/08)
+## "Cannot prove => reject" — the Level-A tightening pattern (2026-08-10)
+
+The counterpart to the relaxation methodology. A relaxation (reject->accept) is the one
+change class where a bug ships a UAF; a **tightening** (accept->reject) is the opposite —
+a bug over-rejects, which is safe. Keep the direction straight, because it decides how much
+caution the change deserves. (Getting this backwards in a summary is easy: an accept-unsafe
+HOLE lives in the UAF subsystem, but the FIX for it is a tightening.)
+
+### When to reach for it
+
+When the analyzer cannot PROVE the property, and acquiring the ability to prove it would
+require machinery the architecture deliberately lacks. Worked case: BUG-781/782.
+
+```zer
+**Node pp = &n;
+*Node k = *pp;      // k aliases n's allocation
+free(k);  n.v       // ...and the analyzer cannot know that
+```
+
+Following `*pp` needs points-to over a pointer-to-pointer. The per-file + summaries model
+does not have it and is not going to (whole-program analysis is banned from the
+architecture). So there is nothing to prove it WITH — tracking was the wrong shape, and
+**rejecting the form is the correct answer, not a fallback.**
+
+### The discipline that makes it defensible
+
+1. **ENUMERATE the sinks first.** For BUG-781 the report described ONE form; enumerating
+   found THREE (var-decl, field-store, return). Fixing only the reported one and marking the
+   entry closed is the false-confidence failure this repo keeps re-learning.
+2. **MEASURE the corpus cost before shipping.** Count real occurrences across
+   `tests/zer tests/zer_fail test_modules rust_tests zig_tests`. The deref reject measured
+   **ZERO** — every deref-init var-decl in the corpus is a SCALAR or struct-VALUE copy, and
+   the predicate requires a POINTER-typed result. That number is the argument.
+3. **Make the predicate NARROW and typed.** `deref_ptr_launder` fires only when the operand
+   is a pointer-to-pointer AND the result is pointer/slice/opaque. A scalar `u32 v = *p` is
+   untouched — which is why the corpus cost is zero rather than "acceptable".
+4. **Check the restructure is teachable.** CLAUDE.md's bar for an acceptable false positive:
+   `*T k = p;` is one line and states the discipline ("alias directly so the compiler can
+   follow it"). If the restructure is not teachable, do not ship the reject.
+5. **Pin the boundary in ONE positive** covering every sink, so a later precision fix cannot
+   quietly re-open the hole at a sink nobody re-tested.
+
+---
+
+## Reachability is a per-function SUMMARY, not a type property (2026-08-10)
+
+Recorded because the obvious analogy is wrong and costs a wrong design.
+
+`Send`/`Sync` are TYPE properties: a type either carries a hazard or does not, and the answer
+composes structurally. ZER already has that shape for CARRIERS (`type_carries_handle`,
+`type_carries_nonshared_pointer`) — closed 2026-08-03, and that class has stayed closed.
+
+**Reachability is a different question and CANNOT be a type property:**
+
+```c
+TYPE_FUNC_PTR,      /* fn pointer — params + return type */
+```
+
+A funcptr's type carries params and return — **never its target**. So "does this callback
+touch a non-shared global?" is not derivable from the type, ever. Same for "what does this
+function reach after a spawn?" — that is a call-graph fact.
+
+**The right object is the per-function summary.** `func_forwards_param_to_spawn(fn, pidx)`
+(BUG-780) answers "can parameter *i* reach a spawn?" from the function's own body plus the
+same summary on its direct callees, depth-bounded. That is per-file + summaries — NOT
+whole-program points-to — so it fits the architecture, and it composes (2-hop verified).
+
+**The standing debt this exposes.** Five walkers re-derive "what does this function reach"
+independently, none cached: `scan_unsafe_global_access` (46 refs), `record_atomic_plain_in_callee`
+(44), `record_isr_globals` (42), `body_calls_funcptr_field` (22), `scan_funcname_binding` (10)
+— re-measure before quoting, these move. Every concurrency defect found 2026-08-08..10 was one of those five not descending
+somewhere another one did. `FuncProps` already exists as a cached per-function summary
+(`can_yield`, `can_spawn`, `can_alloc`, `has_sync`) — extending it with the reach facts and
+having all five consume it is the durable fix. See `docs/unified-oracle-proved-ZER.md`.
+
+---
+
+## The funcptr REACH class — one question, EIGHT syntactic forms (2026-08-06/10)
 
 Canonical worked example of the multi-site class, and the clearest evidence for why a GRID beats
 sequential fixes. The question — *"does the callback this spawn target invokes touch a non-shared
@@ -12133,6 +12210,8 @@ global?"* — is asked at six forms. It was patched **four times, one form per s
 | `*() fp = bump; spawn w(fp);` — LOCAL as a spawn ARG | `00dc785a` |
 | `*() fp = get_fp(); fp();` — factory return, 1 hop | `ac97e11a` |
 | `get_a(){ return get_b(); }` — factory return, n hops | `ac97e11a` — **found by enumeration, never reported** |
+| `o.fns[0]()` — funcptr ARRAY ELEMENT of a field | BUG-777 — scalar sibling `o.cb()` was rejected; `NODE_INDEX`-over-`FIELD` was not matched |
+| `run(bump)` where `run(*() fp){ spawn worker(fp); }` — FORWARDED PARAM | BUG-780 — **found by enumeration** |
 | `*() fp = other; fp = bump;` — reassigned local | already covered via the assignment sink |
 
 **The fifth form is the lesson.** Four sequential fixes had not exhausted the class; it surfaced

@@ -380,7 +380,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
-| **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, factory return (1-hop), factory return (n-hop), spawn-ARG binding | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload, 24 cells). Patched FOUR times one form at a time before anyone wrote the axis down; the 2-hop factory hole was found BY the enumeration, not by a report. Fix by extending `scan_funcname_binding` / `scan_returned_funcname`, never by adding a fifth ad-hoc resolver |
+| **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload, **8 forms / 75 cells**). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a separate sink set — fix it in the same commit** (`record_isr_globals`) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
@@ -2636,6 +2636,22 @@ because a rejection is a rejection whether or not your patch caused it.
   `error`/`zercheck`, then check it is YOUR rule.
 - **Masking is the dominant failure mode.** 3 of the 6 reproducers were rejected by an unrelated
   stronger rule (one masked TWICE). Route around it, then re-probe.
+- **AN EDIT THAT APPEARS TO APPLY AND DOESN'T — four distinct forms hit in ONE session
+  (2026-08-10). Verify the edit LANDED and RUNS, not that the script printed "ok".**
+  (a) a Python `assert` mid-script aborts BEFORE the file write, so every earlier "ok" was
+  printed from memory and NOTHING was written — write after each edit, or check `git diff`;
+  (b) a line-scan deletion whose end-marker had been re-wrapped ran **2,800 lines** past its
+  target (caught only by the build) — `cp file /tmp/backup` FIRST, delete by explicit count,
+  and assert the boundary lines; (c) a hook inserted by pattern landed in the WRONG FUNCTION
+  (`scan_frame` instead of `check_stmt`) — confirm the enclosing function, not just the line;
+  (d) a hook placed inside `if (kind == NODE_STRUCT_INIT)` compiled clean and never fired for
+  the target shape. **For (c)/(d) the only thing that exposed it was a one-line trace proving
+  the predicate was never REACHED.** When a fix silently does nothing, print whether it runs
+  before theorising about why it doesn't.
+- **Before shipping an over-rejection, MEASURE its corpus cost.** `grep -rhoE '<the form>'`
+  across `tests/zer tests/zer_fail test_modules rust_tests zig_tests` and count. The
+  deref-launder reject (BUG-781/782) shipped because that count was **ZERO** — that number,
+  not an argument, is what makes "cannot prove => reject" defensible.
 - **`make check` REPORTS ITS OWN FAILURE ONLY IN THE EXIT CODE — echo it.** Measured 2026-08-10:
   `make check` had been exiting **2** for four commits while being reported green. Make aborts at
   the first failing audit, so every LATER gate (fixed-buffer, type-dispatch, carrier-dispatch,

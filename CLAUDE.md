@@ -119,6 +119,13 @@ the execution half, not the whole core).
   emitter correctness; emit-C keeps GCC trusted (verify the emitter later, or
   trust it). NEVER conflate "sound checker" with "verified compiler to asm."
 
+**THE PLAN FOR THIS IS WRITTEN — read `docs/unified-oracle-proved-ZER.md` before doing any
+work on unification, oracles, or the per-class safety architecture.** 1100 lines, measured
+not recalled: why independent classes leak (every 2026-08 hole was one question answered at
+N sites), the Level A product spec, the shipped `handle_flow_lattice.v` template, the
+precondition trap that already cost two accept-unsafe holes, the AST->CFG migration table,
+and a phased sequence starting with the orphaned `vrp_ir.c`. Do NOT re-derive this.
+
 **Builds on what exists — not a rewrite.** The per-class oracles
 (`param_lattice.v`, `handle_flow_lattice.v`, bounds/qualifier/capture/volatile)
 ARE the abstract domains X; `lambda_zer_concurrency` is the one worked

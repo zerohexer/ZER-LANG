@@ -12032,6 +12032,17 @@ than breaking it — that's the design key for any future lock work:
 - **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
   deferred shared access.
 
+## Unified Level A product — the plan (2026-08-10)
+
+The architectural response to the multi-site bug class documented throughout this file is
+`docs/unified-oracle-proved-ZER.md`. Read it before any work on the safety-class
+architecture. Summary: ~29 independent tracking systems means one semantic question gets
+answered separately at N sites and nothing forces a site to answer all of them; the fix is a
+single forced judgment (a five-factor product with componentwise join and a conjunction at
+every use site) that deliberately over-rejects, with relaxations underneath. Not a new
+architecture — Level A and Level B both already ship for the handle/UAF class in
+`proofs/operational/lambda_zer_handle/handle_flow_lattice.v`, which is the template.
+
 ## Consuming a documented "open hole" — the MEASURE-FIRST protocol (2026-08-08)
 
 **Why this section exists.** A reconciliation pass over `docs/limitations.md` found that **four of

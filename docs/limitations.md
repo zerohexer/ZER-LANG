@@ -1962,6 +1962,16 @@ meant to be a static cross-check of them).
 
 ## OPEN — MAX-ORACLE GAP AUDIT (2026-06-23) — the master map: which safety classes are not-sound / not-flexible / coarse-or-no-oracle
 
+> **THE PLAN THAT CONSUMES THIS AUDIT: `docs/unified-oracle-proved-ZER.md` (2026-08-10).**
+> This entry is the per-class GAP MAP; that document is what to DO about it — the unified
+> Level A product (provenance x liveness x ownership x bounds x capability, componentwise
+> join, conjunction at every use site), with Level B relaxations underneath. Priority order
+> there is driven by a measured finding: **every defect found 2026-08-08..10 was in a class
+> with NO oracle, zero exceptions**, while handle/concurrency/escape/move/opaque produced
+> none. Phase 0 is wiring the orphaned `vrp_ir.c` (349 lines, 0 Makefile refs, 0 symbols in
+> the built binary — the sound CFG bounds analysis is not compiled).
+
+
 Audit of EVERY safety class against the MAX-ORACLE STANDARD (CLAUDE.md): a class is
 "at maximum" iff it is (a) SOUND (zero under-rejection — never accepts unsafe), (b)
 FLEXIBLE (minimal over-rejection), AND (c) backed by a MAX oracle (a Coq/Iris Level-1

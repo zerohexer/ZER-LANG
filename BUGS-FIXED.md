@@ -5,6 +5,71 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-10 — full-codebase audit: 2 soundness fixes + tech-debt cleanup
+
+Full-codebase audit (6 parallel subsystem sweeps + direct probing). Two verified soundness holes
+fixed; five other verified-open holes documented in `docs/limitations.md` "2026-08-10 audit session"
+with gap-runner tripwires. `make check` green; sink matrix CLEAN (59 cells).
+
+**BUG-770 — `return { .p = &local }` struct-literal escape sink was the missing sibling.**
+A struct/union LITERAL returned by value that carries a pointer/slice to a frame-local dangles in the
+caller:
+```zer
+struct Box { *u32 p; }
+Box mk() { u32 loc = 5; return { .p = &loc }; }   // was ACCEPTED — dangling *u32 in caller
+```
+The named-variable form (`Box b; b.p = &loc; return b;`) was correctly rejected (var-decl marks the
+carrier `is_local_derived`, the region check fires), but a direct struct LITERAL has no intermediate
+Symbol. `struct_init_has_local_derived` (checker.c) ran at the var-decl (~11670) and assign-to-global
+(~5045) sinks but NEVER in the NODE_RETURN handler — the textbook per-sink patchwork (fix landed at
+N-1 sinks, the Nth was the return sink). **Fix:** call `struct_init_has_local_derived` in the return
+handler's `NODE_STRUCT_INIT` block, gated on `type_carries_data_pointer(current_func_ret, 0)`. Tests:
+`tests/zer_fail/return_struct_init_local_escape.zer` (+ `// expect-error:`), positive controls
+`tests/zer/return_struct_init_{param,global}_ptr_ok.zer`, and sink-matrix shape `p14` (3 reject cells
++ 2 safe controls). Found by the escape/keep audit sweep.
+
+**BUG-771 — interrupt body never reset the name-keyed VarRange map → silent bare-metal OOB.**
+`VarRange` is keyed by variable NAME with no scope discriminator; §C#15 (2026-07-06) added a
+`c->var_range_count = 0` reset at each **function**-body entry so a narrowed range from an earlier
+function cannot leak into a later one that reuses the name and elide its bounds guard. Interrupt bodies
+are checked in the SAME source-order pass-2 loop but were the one checked body with no reset:
+```zer
+u32 warmup(u32 n) { if (n >= 4) { return 0; } return n; }  // narrows n to [0,3]
+interrupt TIMER0 { u8[4] buf; u32 n = g_idx; buf[n] = 1; } // n's leaked [0,3] -> buf[n] "proven",
+                                                            // auto-guard ELIDED -> silent stack OOB
+```
+The volatile-read `n` pushes no VRP entry, so `find_var_range("n")` returned warmup's stale `[0,3]`,
+`mark_proven` fired, and the emitter dropped both the `_zer_bounds_check` and the auto-guard — a real
+unchecked stack write on the bare-metal target (invisible on x86 host, where the auto-guard is present
+because a non-ISR function resets). **Fix:** one line — `c->var_range_count = 0;` before
+`check_stmt(c, node->interrupt.body)` at checker.c ~16643, mirroring §C#15. Verified in emitted C: the
+auto-guard `if (n >= 4) return;` is restored inside `TIMER0`. NO standard test (an ISR can't
+compile-run on hosted x86 — gcc rejects SSE-in-ISR); verify emit-C-only and grep for the guard. Found
+by the VRP/bounds audit sweep (the one un-patched sibling of §C#15).
+
+**BUG-772 — the last walker-default finding was ALSO a latent G3 coverage gap.**
+`make check` had been exiting 2 since the G3 commit (65af386, 2026-08-09): `record_atomic_plain_in_callee`
+— the G3 transitive atomic-cell scan — shipped with a `default: return;`, tripping
+`walker_default_audit.sh` (41/42). The default wasn't merely cosmetic: it silently SKIPPED every
+child-carrying kind the switch didn't name — `NODE_SWITCH`, `NODE_DEFER`, `NODE_ORELSE`, `NODE_DO_WHILE`,
+`NODE_CRITICAL`, `NODE_ONCE`, `NODE_AWAIT`, `NODE_SPAWN`, `NODE_SLICE`, `NODE_TYPECAST`, `NODE_STRUCT_INIT`
+— so a plain write to an atomic cell inside e.g. a switch arm or a defer body of a helper reached after a
+fire-and-forget spawn was NOT recorded and the race slipped:
+```zer
+void poke(u32 k) { switch (k) { 0 => { g_ctr = 5; } default => {} } }   // was ACCEPTED after spawn
+```
+**Fix:** enumerated the switch (no `default:`) — descend the child-carriers (mirroring the
+`scan_unsafe_global_access` sibling), no-op the true leaves + declaration kinds. Closes 42/42 Stage 2
+Part B AND the G3 coverage gap. `NODE_CAST` is vestigial (checker.c ~10962) → no-op. Verified: the
+switch-arm and defer-body cases now reject; conc-matrix 67/67 with 0 over-rejections; over-reject
+control (helper touching an unrelated global) still compiles. Test:
+`tests/zer_fail/atomic_cell_plain_via_switch_arm.zer`.
+
+**Tech debt.** Deleted the dead `has_atomic_or_barrier` (checker.c ~10478-10556): a `-Wunused-function`
+standalone scanner with no external callers (only self-recursion) and a stale comment claiming it "uses
+FuncProps internally now" — it was fully replaced by `scan_func_props` setting `props.has_sync`. Pure
+cleanup, zero behavior change.
+
 ## Session 2026-08-09 — G3: atomic-cell plain access, transitive through a helper
 
 **BUG-769.** A global used with `@atomic_*` in a concurrent context is an "atomic cell": every access

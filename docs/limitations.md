@@ -5,6 +5,104 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — 2026-08-10 audit session findings (verified reproducers)
+
+Full-codebase audit (6 parallel subsystem sweeps + direct probing). THREE holes FIXED this session
+(see BUGS-FIXED.md 2026-08-10): the `return { .p = &local }` struct-literal escape sink (BUG-770), the
+interrupt-body VarRange non-reset — silent bare-metal OOB (BUG-771), and the G3 atomic-cell walker's
+`default:` that silently skipped switch/defer/orelse/etc. child-carriers — a latent concurrency
+coverage gap that also tripped the walker-default audit (BUG-772), plus dead-code cleanup. The items
+below are VERIFIED-OPEN, each with a reproducer confirmed to compile clean on main; none fixed (each is
+subsystem-scale or an already-deferred class).
+
+### HIGH ACCEPT-UNSAFE — cross-thread data race via a CALLER-supplied funcptr forwarded to `spawn`
+A spawning function that forwards a funcptr **parameter** (or a funcptr-carrying struct field bound in
+its caller) to a spawn target escapes the data-race scan entirely — the scan is intra-function /
+callee-only and has no view of the caller-supplied value. The DIRECT sibling (`spawn worker(bump)`) is
+correctly rejected, proving coverage-gap not intent.
+```zer
+u32 g; void bump() { g += 1; }
+void worker(*() -> void fp) { fp(); }
+void run(*() -> void fp) { spawn worker(fp); }   // fp is a PARAM
+void main() { run(bump); }                        // ACCEPTED — g races, TSan-confirmable
+```
+Also as a by-value struct field carrier (`struct Ops{ *()->void cb; } ... ops.cb=bump` in the caller,
+`run(ops)` → `spawn worker(ops)` → `o.cb()`). Root: `checker.c` NODE_SPAWN scan (~15258-15390) +
+`scan_funcptr_field_bindings` (~10730) walk callees, never the caller frame; the D8 arg scan resolves a
+spawn-SITE arg but not a forwarded param. **Proper fix (subsystem-scale, additive/sound):** a
+per-function summary `spawn_invokes_param_mask` (bit n = F causes a spawned thread to invoke param n as
+a funcptr), resolved at each call site of F like `ret_param_mask` — scan the actual arg's body with the
+existing global-access scan. Conservative alt (reject a spawn target invoking an unresolvable funcptr)
+over-rejects legitimate callback-in-thread patterns → a design call, why the earlier branch deferred it.
+Tripwire: `tests/zer_gaps/spawn_funcptr_forwarded_param_race.zer`.
+
+### HIGH ACCEPT-UNSAFE — pointer-deref var-decl alias (`*T k = *pp;`) untracked → UAF + double-free (HOLE-A4 heap facet)
+The heap/Slab facet of the documented HOLE-A4 (`*T b = *p;` move-via-deref, previously framed ONLY as
+move-struct use-after-move). Initializing a pointer local from a pointer DEREFERENCE drops the alias, so
+freeing through it never marks the real allocation FREED.
+```zer
+struct Node { u32 v; }
+u32 main() {
+  *Node n = alloc(Node) orelse { return 0; };
+  **Node pp = &n;
+  *Node k = *pp;        // k aliases n — NOT tracked
+  free(k);              // frees n's allocation; analyzer thinks a separate thing was freed
+  u32 x = n.v;          // USE-AFTER-FREE — accepted
+  free(n);              // DOUBLE-FREE — accepted
+  return x;
+}
+```
+Direct-alias control `*Node k = n;` is correctly rejected → the `*pp` deref is the trigger. Root:
+`ir_find_value_local` (zercheck_ir.c ~889) and `ir_find_store_source_local` (~976) peel ORELSE / cast /
+`.ptr` but have no `NODE_UNARY(TOK_STAR)` deref case; the interior-pointer sink (~4059-4164) only handles
+`&expr`. Sound fix needs the deferred IR_UNOP-deref handler that resolves `*pp` through the `pp = &n`
+alias to `n` — not a conservative-cheap change (a coarse "free of unresolvable deref frees anything"
+over-rejects everything). Cross-ref: the move-struct facet already in this file under HOLE-A4.
+Tripwire: `tests/zer_gaps/deref_alias_uaf_double_free.zer`.
+
+### MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter
+`interrupt` compound-RMW-on-shared-volatile detection matches the target by ROOT IDENT only, so an RMW
+through a `volatile *u32` param in a helper is not flagged. The direct form is caught.
+```zer
+volatile u32 counter;
+void bump(volatile *u32 p) { *p += 1; }   // non-atomic RMW via param
+interrupt TIM2 { bump(&counter); }         // ACCEPTED — torn RMW vs main
+u32 main() { u32 x = counter; return x; }
+```
+`counter` IS volatile and IS marked accessed-from-ISR (that scan is transitive), but the
+"volatile compound RMW shared ISR↔main = non-atomic" check (`record_isr_globals` compound detection
+~17253; enforcement `check_interrupt_safety` ~17579) is not transitive through the pointer param — the
+`*p` root walks to param `p`, `scope_lookup(global_scope,…)` misses, `counter.compound_in_isr` stays
+false. Same per-sink patchwork one hop out. Fix: propagate the arg (`&counter`) through the ISR-TRANS
+scan so `*p += 1` records a compound RMW on `counter`. NO gap-runner tripwire — the gap runner
+builds an exe and hosted GCC rejects any ISR ("interrupt service routine can only have a pointer
+argument"), so the reproducer above is the record; verify emit-C-only with `zerc f.zer -o f.c`.
+
+### MEDIUM silent bare-metal — `&packed_field` forms a misaligned `*T`; ordinary deref is unchecked
+```zer
+packed struct P { u8 id; u32 v; u8 tail; }
+P g;
+u32 f() { *u32 p = &g.v; *p = 0xDEAD; return *p; }   // p is offset 1 — misaligned
+```
+Compiles clean; on x86 it works, on strict-align ARM Cortex-M it faults / is silently wrong. ZER claims
+alignment as a structural shadow and DOES check it at `@inttoptr` (checker.c ~8785) but not when the
+address of a packed field is taken into a non-packed `*T` (Rust rejects this as E0793). Fix: reject
+`&packed_struct.field` when the field's offset/alignment is under the pointee-type's required alignment
+(or require the resulting pointer be `packed`/byte-wise). Tripwire:
+`tests/zer_gaps/packed_field_addr_misaligned.zer`.
+
+### LOW bare-metal — `volatile` lost through a `@ptrtoint → @inttoptr` round-trip (audit-visible)
+`usize a = @ptrtoint(vreg); *u32 plain = @inttoptr(*u32, a);` re-materializes a NON-volatile pointer to
+the same MMIO address; under ZER's own `-O2` GCC invocation two stores through `plain` coalesce → the
+peripheral silently misses a write. Audit-visible (both intrinsics appear at the use site) and the user
+did choose a non-volatile target type, but the DIRECT strip `(*u32)vreg` is rejected while this
+round-trip is not — the same "strip volatile" question caught at the cast sink, missed at `@inttoptr`.
+Severity LOW (wrong value / dropped write, not memory corruption). Fix option: warn when `@inttoptr`'s
+address operand is a `@ptrtoint` of a volatile pointer and the target type is non-volatile. Tripwire:
+`tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer`.
+
+---
+
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
 
 **STATUS: all 45 landed.** §A 1/1 · §B 9/9 · §C 7/7 · §D 9/9 · §E 1/1 · §F 4/4 · §G 6/7 (+ G5 with

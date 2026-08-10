@@ -1,0 +1,14 @@
+// GAP (2026-08-10): volatile lost through @ptrtoint -> @inttoptr. `plain` is a
+// NON-volatile *u32 to an MMIO address; two stores coalesce under -O2 and the
+// peripheral misses a write. The DIRECT strip (*u32)vreg is rejected; this
+// round-trip is not. compile-clean = gap. See limitations.md 2026-08-10.
+mmio 0x40020000..0x40020FFF;
+u32 leak() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+    usize a = @ptrtoint(reg);
+    *u32 plain = @inttoptr(*u32, a);
+    *plain = 1;
+    *plain = 2;
+    return *plain;
+}
+u32 main() { return leak(); }

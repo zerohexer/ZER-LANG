@@ -1,0 +1,10 @@
+// A struct literal carrying a pointer to a GLOBAL is safe to return.
+u32 gv;
+struct Box { *u32 p; }
+Box mk() { return { .p = &gv }; }
+u32 main() {
+    Box b = mk();
+    *b.p = 7;
+    if (gv == 7) { return 0; }
+    return 1;
+}

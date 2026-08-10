@@ -12170,6 +12170,12 @@ slice-of-local arg, a pointer/slice FIELD of a local-derived struct). The sessio
   a pointer/slice (scalar fields must NOT be flagged).
 - **BUG-763** the keep call-site (~5468) didn't handle a NODE_CALL arg whose result is
   local-derived (`keepfn(f(local))`).
+- **BUG-770** (2026-08-10) the RETURN sink never ran `struct_init_has_local_derived`, so a
+  direct struct/union LITERAL return `return { .p = &local }` (no intermediate Symbol, so the
+  named-var region check can't fire) escaped un-checked. The var-decl (~11670) and
+  assign-to-global (~5045) sinks already ran it; the return handler's `NODE_STRUCT_INIT` block
+  was the missing sibling. Fixed there, gated on `type_carries_data_pointer(current_func_ret,0)`.
+  Sink-matrix shape `p14`.
 
 **The `keep` system (the inferred-`'a` for "this function retains the pointer"):**
 keep-INFERENCE marks a param keep when the body persists it to a global/static/

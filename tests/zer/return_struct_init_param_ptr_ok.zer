@@ -1,0 +1,10 @@
+// A struct literal carrying a pointer to a PARAM (caller memory) is safe to return.
+struct Box { *u32 p; }
+Box mk(*u32 q) { return { .p = q }; }
+u32 main() {
+    u32 v = 41;
+    Box b = mk(&v);
+    *b.p = 42;
+    if (v == 42) { return 0; }
+    return 1;
+}

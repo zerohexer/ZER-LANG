@@ -1,0 +1,10 @@
+// GAP (2026-08-10): cross-thread data race via a CALLER-supplied funcptr
+// forwarded to spawn. `run` forwards its funcptr PARAM to a spawn target; the
+// data-race scan is intra-function/callee-only and never sees the caller's
+// `run(bump)`. Direct sibling `spawn worker(bump)` IS rejected. compile-clean =
+// the race is accepted. See limitations.md 2026-08-10.
+u32 g;
+void bump() { g += 1; }
+void worker(*() -> void fp) { fp(); }
+void run(*() -> void fp) { spawn worker(fp); }
+void main() { run(bump); }

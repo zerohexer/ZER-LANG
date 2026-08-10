@@ -10475,85 +10475,6 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
 
 /* Shared recursion-depth budget for the transitive spawn-global scan: the
  * direct-call descent, the function-name-arg descent, and the funcptr-binding
@@ -13579,6 +13500,18 @@ static void check_stmt(Checker *c, Node *node) {
                 if (validate_struct_init(c, node->ret.expr, c->current_func_ret, node->loc.line)) {
                     ret_type = c->current_func_ret;
                     typemap_set(c, node->ret.expr, c->current_func_ret);
+                }
+                /* Escape sink (was the missing sibling of the var-decl @11670 and
+                 * assign-to-global @5045 sinks): a struct/union LITERAL returned
+                 * by value that carries a pointer/slice to a frame-local
+                 * (`return { .p = &local }`, slice-of-local, call-launder) dangles
+                 * in the caller. Gate on the return type actually carrying a data
+                 * pointer, then run the shared struct_init_has_local_derived walker. */
+                if (type_carries_data_pointer(c->current_func_ret, 0) &&
+                    struct_init_has_local_derived(c, node->ret.expr)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return a struct literal carrying a pointer to a "
+                        "local — stack memory is freed when the function returns");
                 }
             }
 
@@ -16628,6 +16561,13 @@ static void check_func_body(Checker *c, Node *node) {
         c->current_func_ret = ty_void;
         c->in_interrupt = true;
         push_scope(c);
+        /* §C #15 sibling: interrupt bodies are checked in the same source-order
+         * pass-2 loop as functions but were the one checked body that never reset
+         * the name-keyed VarRange map. A narrowed range from the PRECEDING decl
+         * (`if (n >= 4) return;` → n=[0,3]) leaked in and elided a fixed-array
+         * bounds guard inside the ISR → silent bare-metal stack OOB. Mirror the
+         * func_decl reset at ~16530. */
+        c->var_range_count = 0;
         check_stmt(c, node->interrupt.body);
         /* ISR-TRANS: also record globals reached through helper calls so the
          * "accessed from both ISR and main → volatile" and "volatile compound
@@ -17466,7 +17406,55 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
         record_atomic_plain_in_callee(c, node->for_stmt.step, depth);
         record_atomic_plain_in_callee(c, node->for_stmt.body, depth);
         return;
-    default: return;
+    /* Child-carriers the original `default:` silently skipped — a plain
+     * atomic-cell access inside a switch arm / defer / orelse / do-while /
+     * critical / once / spawn arg / slice / cast / struct-init of a helper was
+     * NOT recorded, so the G3 race slipped. Descend them (mirrors the
+     * scan_unsafe_global_access sibling). */
+    case NODE_DO_WHILE:
+        record_atomic_plain_in_callee(c, node->while_stmt.cond, depth);
+        record_atomic_plain_in_callee(c, node->while_stmt.body, depth);
+        return;
+    case NODE_SWITCH:
+        record_atomic_plain_in_callee(c, node->switch_stmt.expr, depth);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            record_atomic_plain_in_callee(c, node->switch_stmt.arms[i].body, depth);
+        return;
+    case NODE_ORELSE:
+        record_atomic_plain_in_callee(c, node->orelse.expr, depth);
+        record_atomic_plain_in_callee(c, node->orelse.fallback, depth);
+        return;
+    case NODE_DEFER:    record_atomic_plain_in_callee(c, node->defer.body, depth); return;
+    case NODE_CRITICAL: record_atomic_plain_in_callee(c, node->critical.body, depth); return;
+    case NODE_ONCE:     record_atomic_plain_in_callee(c, node->once.body, depth); return;
+    case NODE_AWAIT:    record_atomic_plain_in_callee(c, node->await_stmt.cond, depth); return;
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            record_atomic_plain_in_callee(c, node->spawn_stmt.args[i], depth);
+        return;
+    case NODE_SLICE:
+        record_atomic_plain_in_callee(c, node->slice.object, depth);
+        record_atomic_plain_in_callee(c, node->slice.start, depth);
+        record_atomic_plain_in_callee(c, node->slice.end, depth);
+        return;
+    case NODE_TYPECAST: record_atomic_plain_in_callee(c, node->typecast.expr, depth); return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            record_atomic_plain_in_callee(c, node->struct_init.fields[i].value, depth);
+        return;
+    /* True leaves + declaration kinds that never carry a descendable plain
+     * global access. Enumerated (no default:) so a new NodeKind trips
+     * -Werror=switch — closes the last Stage 2 Part B walker-default finding. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT: case NODE_SIZEOF:
+    case NODE_CAST:  /* vestigial/unused node kind (checker.c ~10962) */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return;
     }
 }
 

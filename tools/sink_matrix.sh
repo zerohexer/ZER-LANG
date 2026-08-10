@@ -115,7 +115,19 @@ echo "===== SHAPE p13 = return a u8[N] array PARAM as a slice (BUG-764-class rel
 # rejects a caller that passes a LOCAL and lets the result escape to a global.
 cell p13__return_param_arr_escape reject '?[*]u8 g13; ?[*]u8 rf(u8[4] a){ return a; } void c(){ u8[4] x; g13 = rf(x); } u32 main(){return 0;}'
 
+echo "===== SHAPE p14 = return a struct/union LITERAL carrying &local (direct, no intermediate) ====="
+# `return { .p = &local }` has no intermediate Symbol, so the named-var region
+# check never fires. The var-decl (@11670) and assign-to-global (@5045) sinks ran
+# struct_init_has_local_derived; the RETURN sink was the missing sibling
+# (audit 2026-08-10). Direct &local, slice-of-local, and call-launder forms.
+cell p14__return_lit_amp    reject 'struct Bp { *u32 p; } Bp c(){ u32 loc; return { .p = &loc }; } u32 main(){return 0;}'
+cell p14__return_lit_slice  reject 'struct Sp { [*]u32 s; } Sp c(){ u32[4] arr; return { .s = arr[0..2] }; } u32 main(){return 0;}'
+cell p14__return_lit_launder reject 'struct Bq { *u32 p; } *u32 idp(*u32 q){ return q; } Bq c(){ u32 loc; return { .p = idp(&loc) }; } u32 main(){return 0;}'
+
 echo "===== SAFE baselines (MUST compile — over-reject guards) ====="
+# p14 accept side: struct literal carrying a param-view / global pointer is safe.
+cell safe_return_lit_param  compile 'struct Bp { *u32 p; } Bp c(*u32 q){ return { .p = q }; } u32 main(){ u32 v = 1; Bp b = c(&v); return 0; }'
+cell safe_return_lit_global compile 'u32 g14; struct Bp { *u32 p; } Bp c(){ return { .p = &g14 }; } u32 main(){ Bp b = c(); return 0; }'
 # p13 accept side: returning a param array as a slice, result used locally (does
 # not escape the caller frame) — must compile (the relaxation).
 cell safe_return_param_arr_opt   compile '?[*]u8 rf(u8[4] a){ return a; } u32 main(){ u8[4] x; ?[*]u8 r = rf(x); return 0; }'

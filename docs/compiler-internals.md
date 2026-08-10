@@ -11845,9 +11845,24 @@ DE-RISK (all verified in Docker):
   (`!defined(__wasi__)` true) — `make check` GREEN. Verified: real emitted C → wasm
   → node-WASI prints correct output + exit 0. Concurrency under wasi = unsupported
   (WASI preview1 has no threads) → loud undefined-symbol at the use site (correct).
-- REMAINING (the build wiring): bundle a wasi-sdk subset (clang + wasm-ld +
-  wasi-sysroot) into the VSIX; rewire `lsp/zerc-cli.js` (`zer.wasm`→C, then
-  `clang-wasi`→wasm, then node-WASI run); update `Dockerfile.vsix`.
+- **PARKED — the bundling step has no shippable answer (investigated 2026-06-22,
+  do NOT re-attempt without new information).** The pipeline itself is PROVEN
+  end-to-end (3 in-container smoke tests: ZER→wasm→node-WASI runs; double-free
+  rejected; OOB slice read traps). Only bundling a C→wasm compiler failed, all
+  three ways: **native wasi-sdk clang** is correct but ~1.4 GB/platform (a fat
+  static LLVM — `llvm-strip --strip-debug` barely helps, it is code not debug), too
+  big for vsce; **`zig cc`** is small (341 MB) but REJECTS `-Wl,--wrap`
+  ("unsupported linker arg"), which would force `track_cptrs=0` — pure ZER stays
+  100% compile-time safe but cinclude'd C loses the ~2% runtime malloc net;
+  **clang.wasm via `@wasmer/sdk`** compiles but CANNOT LINK in node (clang's spawn
+  of `wasm-ld` fails, exit 45, even for `int main(){return 7;}` — so `--wrap` was
+  never even reached) and the WASIX runtime HANGS ~4 of 5 invocations under node.
+  clang.wasm would need a real WASIX-capable host (native `wasmtime`), which
+  re-introduces the native binary the whole exercise existed to remove.
+  `editors/vscode-WASI/` + `Dockerfile.vsix-WASI` + `make docker-vsix-wasi` remain
+  committed as the proven-pipeline harness (the smoke tests are the contract), at
+  0.5.7 and untouched since. The SHIPPING extension is `editors/vscode/` (0.6.6),
+  which is unaffected and uses bundled GCC.
 
 TEST RECIPE (baked image `zer-wasi:latest` = `emscripten/emsdk:3.1.74` +
 `/opt/wasi-sdk-22.0`; rebuild via `docker run --name t emscripten/emsdk:3.1.74

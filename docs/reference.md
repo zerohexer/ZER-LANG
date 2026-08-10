@@ -2110,6 +2110,10 @@ u32 new_count = @atomic_add_fetch(&counter, 1);  // returns counter + 1
 ---
 
 **Atomic restrictions (all `@atomic_*` intrinsics):**
+- The target must be SHARED-CAPABLE storage. A **stack local** is rejected — an
+  atomic on private frame memory is meaningless, since no other thread can hold a
+  stable reference to it. Use a global, a global struct field, or take the address
+  as a parameter (`void bump(*u32 p) { @atomic_add(p, 1); }`)
 - First argument must be the address of an INTEGER global or struct field —
   `@atomic_add(&counter, 1)`, `@atomic_store(&s.flag, 1)`. Width must be 1, 2, 4
   or 8 bytes; `u128`, a non-native width like `u24`, a float, or a struct is

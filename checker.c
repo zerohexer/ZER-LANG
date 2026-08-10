@@ -9698,6 +9698,47 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!is_load && !is_store && !is_cas && !is_arith) {
                 checker_error(c, node->loc.line, "unknown atomic intrinsic '@%.*s'", (int)nlen, name);
             }
+            /* Operand must be SHARED-CAPABLE storage. An atomic on a STACK LOCAL
+             * is meaningless: the frame is private, so no other thread can hold a
+             * stable reference to it (and if its address escaped to a thread, the
+             * escape/borrow rules reject that separately). Accepting it silently
+             * costs a real atomic instruction and hides a mistake — the author
+             * almost always meant a global. Corpus cost measured at ZERO before
+             * shipping: no test in tests/zer, zer_fail, zer_trap, test_modules,
+             * rust_tests or zig_tests atomically targets a stack local.
+             *
+             * NOT matched: a global, a global struct field, a global array element,
+             * or a POINTER PARAM (`bump(*u32 p){ @atomic_add(p,1); }`) — the address
+             * came from elsewhere and may well be shared, which is the idiom.
+             *
+             * Bonus: this also replaces a WRONG diagnostic. `u32 v = @atomic_load(&a)`
+             * on a local was previously rejected as "cannot return pointer to local"
+             * — the single-arg escape peel treated the u32 result as local-derived.
+             * Same rejection, correct reason. */
+            if (node->intrinsic.arg_count > 0 && (is_load || is_store || is_cas || is_arith)) {
+                Node *a0 = node->intrinsic.args[0];
+                if (a0 && a0->kind == NODE_UNARY && a0->unary.op == TOK_AMP) {
+                    Node *root = a0->unary.operand;
+                    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+                        if (root->kind == NODE_FIELD) root = root->field.object;
+                        else root = root->index_expr.object;
+                    }
+                    if (root && root->kind == NODE_IDENT) {
+                        bool is_glob = scope_lookup_local(c->global_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                        Symbol *rs = scope_lookup(c->current_scope,
+                            root->ident.name, (uint32_t)root->ident.name_len);
+                        if (!is_glob && rs && !rs->is_static)
+                            checker_error(c, node->loc.line,
+                                "@%.*s target '%.*s' is a stack local — an atomic on "
+                                "private frame memory is meaningless (no other thread "
+                                "can reference it). Use a global, a global struct "
+                                "field, or take the address as a parameter",
+                                (int)nlen, name,
+                                (int)root->ident.name_len, root->ident.name);
+                    }
+                }
+            }
             /* A6-full: a scalar global targeted by `@atomic_*` is an atomic cell —
              * mark it so any plain write elsewhere (recorded at NODE_ASSIGN) is
              * flagged post-check. */

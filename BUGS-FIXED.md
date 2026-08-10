@@ -5,6 +5,38 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
+
+Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)
+turned out to be **not constructible** and was corrected in the docs instead (2026-08-10).
+The coherent tightening — the one that IS expressible — is this: **the target must be
+shared-capable storage.**
+
+**BUG-784.** `@atomic_add(&local, 1)` on a stack local is now rejected. An atomic on private
+frame memory is meaningless: no other thread can hold a stable reference to it, and if its
+address escaped to a thread the escape/borrow rules reject that separately. Accepting it
+emitted a real atomic instruction and silently hid a mistake — the author meant a global.
+
+**Scope, deliberately narrow.** Matches only when the operand's ROOT is a non-static local:
+`&a`, `&local.field`, `&local[0]`. NOT matched — a global, a global struct field, a global
+array element, `threadlocal` (out of scope for this rule), or a **pointer PARAM**
+(`bump(*u32 p){ @atomic_add(p,1); }`), where the address came from elsewhere and may well be
+shared. That last exemption is the important one: it is the idiom.
+
+**Corpus cost measured at ZERO before shipping** — no test in tests/zer, zer_fail, zer_trap,
+test_modules, rust_tests or zig_tests atomically targets a stack local.
+
+**Bonus: it replaces a WRONG diagnostic.** `u32 v = @atomic_load(&a)` on a local was
+previously rejected as *"cannot return pointer to local"* — the single-arg escape peel takes
+the intrinsic's LAST argument, which for one-arg `@atomic_load` IS the pointer, so the `u32`
+result inherited "local-derived". (Two-arg `@atomic_add(&a,1)` peeled to the literal and was
+accepted — that asymmetry is what exposed it.) Same rejection now, correct reason. The
+underlying peel is still imprecise for a hypothetical future single-arg pointer-taking
+intrinsic with a scalar result; `@ptrtoint` and `@probe` were checked and are fine.
+
+Tests: `tests/zer_fail/atomic_stack_local.zer` (verified ACCEPTED pre-fix) +
+`tests/zer/atomic_operand_forms_ok.zer` pinning all five surviving operand forms.
+
 ## Session 2026-08-10e — BUG-783: the ISR/spawn REACH asymmetry closed, and gated
 
 **The asymmetry was real but SMALLER than I claimed.** I reported "eight spawn-side forms,

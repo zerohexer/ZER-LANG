@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: is a stack local
+// An atomic on a STACK LOCAL is meaningless: the frame is private, so no other
+// thread can hold a stable reference to it (and if its address escaped to a
+// thread, the escape/borrow rules reject that separately). Accepting it costs a
+// real atomic instruction and hides a mistake — the author meant a global.
+//
+// This also replaces a WRONG diagnostic: `u32 v = @atomic_load(&a)` on a local
+// was previously rejected as "cannot return pointer to local", because the
+// single-arg escape peel treated the u32 result as local-derived. Same
+// rejection, correct reason.
+u32 main() {
+    u32 a = 0;
+    u32 old = @atomic_add(&a, 1);
+    return old;
+}

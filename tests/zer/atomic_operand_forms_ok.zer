@@ -1,0 +1,24 @@
+// Over-rejection boundary for the stack-local atomic reject. Only a LOCAL root is
+// rejected; every shared-capable operand must keep working, because atomics on a
+// plain global are the intended lock-free idiom (46 of 48 atomic-using tests in
+// the corpus do exactly this).
+struct Cell { u32 v; }
+
+u32 counter;
+Cell cell;
+u32[4] table;
+threadlocal u32 tls;
+
+void bump_through_param(*u32 p) { u32 o = @atomic_add(p, 1); }
+
+u32 main() {
+    u32 a = @atomic_add(&counter, 1);      // global
+    u32 b = @atomic_add(&cell.v, 1);       // global struct FIELD
+    u32 c = @atomic_add(&table[0], 1);     // global ARRAY element
+    bump_through_param(&counter);           // pointer PARAM — address from elsewhere
+    u32 d = @atomic_add(&tls, 1);          // threadlocal (out of scope for this rule)
+    @atomic_store(&counter, 9);
+    if (@atomic_load(&counter) != 9) { return 1; }
+    if (a + b + c + d > 100) { return 2; }
+    return 0;
+}

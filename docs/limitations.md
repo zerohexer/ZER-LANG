@@ -2140,6 +2140,16 @@ floor).
 
 ## OPEN — WASM CLI: multi-file imports + macOS terminal zerc (LOW–MEDIUM)
 
+> **NOTE 2026-08-10 — the original Defender motivation no longer reproduces for the
+> maintainer.** The WASM bridge exists because unsigned mingw PEs tripped Defender
+> `Wacatac.B!ml` (CLAUDE.md "VS Code Extension (VSIX) Build"); the shipping VSIX is now
+> reported to install and run with no scan. That is a single-machine observation, not a
+> general guarantee — do NOT rip out the WASM bridge on the strength of it. **The two
+> gaps below are FUNCTIONAL and independent of the scanning question:** multi-file
+> `import` genuinely does not resolve through the wasm CLI/LSP regardless of why the
+> wasm path exists. This entry stays canon.
+
+
 The VS Code extension ships the compiler as WebAssembly (`zer_wasm.c` →
 `lsp/zer.wasm`, driven by `lsp/server.js` and `lsp/zerc-cli.js`). As of
 2026-06-16 the flag plumbing, `--emit-ir`, and full LSP safety parity are DONE

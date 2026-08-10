@@ -12197,43 +12197,95 @@ having all five consume it is the durable fix. See `docs/unified-oracle-proved-Z
 
 ---
 
-## The funcptr REACH class — one question, EIGHT syntactic forms (2026-08-06/10)
+## The funcptr REACH class — one question, NINE forms x TWO sinks (2026-08-06/10)
 
-Canonical worked example of the multi-site class, and the clearest evidence for why a GRID beats
-sequential fixes. The question — *"does the callback this spawn target invokes touch a non-shared
-global?"* — is asked at six forms. It was patched **four times, one form per session**:
+Canonical worked example of the multi-site class, and the clearest evidence for why a GRID
+beats sequential fixes. The question — *"does the callback this handler invokes touch a
+non-shared global?"* — is asked at NINE syntactic forms, at TWO independent sinks (`spawn`
+and `interrupt`). It was patched **eight times across four sessions** before the axis
+existed.
 
-| form | closed by |
-|---|---|
-| `*() fp = bump; fp();` — direct name | long-standing |
-| `o.cb = bump; o.cb();` — struct FIELD | `5ed17c2f` |
-| `*() fp = bump; spawn w(fp);` — LOCAL as a spawn ARG | `00dc785a` |
-| `*() fp = get_fp(); fp();` — factory return, 1 hop | `ac97e11a` |
-| `get_a(){ return get_b(); }` — factory return, n hops | `ac97e11a` — **found by enumeration, never reported** |
-| `o.fns[0]()` — funcptr ARRAY ELEMENT of a field | BUG-777 — scalar sibling `o.cb()` was rejected; `NODE_INDEX`-over-`FIELD` was not matched |
-| `run(bump)` where `run(*() fp){ spawn worker(fp); }` — FORWARDED PARAM | BUG-780 — **found by enumeration** |
-| `*() fp = other; fp = bump;` — reassigned local | already covered via the assignment sink |
+| form | spawn sink | ISR sink |
+|---|---|---|
+| `fp(); ` direct name | long-standing | long-standing |
+| `*() fp = bump; fp();` local binding | long-standing | BUG-774 |
+| `o.cb = bump; o.cb();` struct FIELD | `5ed17c2f` | BUG-774 |
+| `Ops o = { .cb = bump };` struct-init field | `5ed17c2f` | BUG-774 |
+| `spawn w(fp)` / `inv(bump)` funcname as ARG | `00dc785a` | BUG-774 |
+| `o.fns[0]()` field-ARRAY element | BUG-777 | already covered |
+| `*() fp = mk(); fp();` factory 1-hop | `ac97e11a` | **BUG-783** |
+| `mk(){ return mk2(); }` factory n-hop | `ac97e11a` — **found by enumeration** | **BUG-783** |
+| `run(bump)` forwarded PARAM | BUG-780 — **found by enumeration** | n/a (ISRs take no args) |
 
-**The fifth form is the lesson.** Four sequential fixes had not exhausted the class; it surfaced
-only when the forms were written down as a grid axis. A `NODE_CALL` in the return position bailed
-out of the brand-new resolver in exactly the way it had bailed out of the old one.
+**Three of the nine were found BY the enumeration, never by a bug report** — the n-hop
+factory, the field-array element, and the forwarded param. Each surfaced the moment the
+forms were written down as a grid axis, not before.
 
-**Implementation shape.** `scan_funcname_binding` (checker.c) is the single resolver; it now handles
-a factory call by delegating to `scan_returned_funcname`, which walks the callee's
-`return <global function name>` sites and scans each returned body through the ordinary
-`scan_unsafe_global_access`. Recursion is bounded by the shared `_scan_global_depth`, so a
-self-recursive factory terminates. Both are **partial if-chain walks by design** (an unlisted kind
-yields "not found" = today's behaviour = never a new rejection), which is why they are NOT
-no-`default:` switches — a no-default switch there would be a false promise of exhaustiveness.
+### The mirrored-sink lesson (the transferable part)
 
-**Soundness direction.** Flag on ANY returned name, not only an unconditional one: if a racing
-function *can* be returned, the race is reachable. A computed or param return resolves to nothing.
+**A sink PAIR drifts, and the drift is invisible until you cross the form axis WITH the
+sink axis.** The spawn side was fixed seven times while the ISR side lagged; every time
+that asymmetry existed it produced a bug. This is the same shape as:
 
-**The gate.** REACH x PAYLOAD in `tests/test_conc_matrix.c` (6 forms x 4 payloads = 24 cells),
-verified firing at 65/67 with 2 false negatives on a pre-fix build. The PAYLOAD axis is not
-decoration: this fix scans strictly MORE callbacks, so `threadlocal` / `@atomic_*` /
-touches-nothing callbacks must keep compiling at every reach form. **A new reach form with no cell
-is invisible — add the cell in the same commit as the form.**
+- the **`volatile` exemption** — granted at the spawn scan AND the ISR check; fixed at one,
+  missed at the sibling, shipped a tearing bare-metal access (2026-08-03)
+- the **emitter AST/IR dual dispatch** — every intrinsic needs a handler in both paths
+
+**And measuring the sibling first is not optional.** Going into BUG-783 the claim was
+"eight spawn forms, three ISR forms". Probing all nine at the ISR sink found **seven
+already caught** — `record_isr_globals` descends var-decl inits, assignments and
+struct-init fields generically, so the three forms BUG-774's *commit message* enumerated
+were not the three it *covered*. Only two were live. **Count what the code does, not what
+its commit message lists**; an over-estimate of the gap wastes work, and an under-estimate
+ships a hole.
+
+### Implementation shape
+
+Two resolvers, one per sink, deliberately mirrored:
+
+| | spawn | ISR |
+|---|---|---|
+| binding resolver | `scan_funcname_binding` | `record_isr_funcname_binding` |
+| factory-return walk | `scan_returned_funcname` | `record_isr_returned_funcname` |
+| forwarded param | `func_forwards_param_to_spawn` | n/a |
+| terminal action | `scan_unsafe_global_access` | `record_isr_globals` |
+
+The walks are **partial if-chains by design** — an unlisted kind yields "not found", which
+is today's behaviour and never a new rejection. That is why they are NOT no-`default:`
+switches: a no-default switch there would be a false promise of exhaustiveness. (Contrast
+`record_atomic_plain_in_callee`, which IS exhaustive because a missed carrier there loses a
+recorded ACCESS, not merely a resolution — see BUG-771.)
+
+Recursion is depth-bounded (the shared `_scan_global_depth` on the spawn side, an explicit
+depth on the ISR side), so a self-recursive factory terminates — verified.
+
+**Soundness direction.** Flag on ANY returned name, not only an unconditional one: if a
+racing function *can* be returned, the race is reachable. A computed or param return
+resolves to nothing, so the walk adds no rejection it cannot justify.
+
+### The gate
+
+`tests/test_conc_matrix.c` — REACH x PAYLOAD at the spawn sink, plus a 9-cell ISR sub-grid
+at the interrupt sink. **84 cells**, verified firing (82/84 against a pre-fix build).
+
+- The **PAYLOAD axis is not decoration**: each fix scans strictly MORE callbacks, so
+  `threadlocal` / `@atomic_*` / touches-nothing callbacks must keep compiling at every form.
+- The **ISR cells are NEGATIVE-only**. An `interrupt` block cannot appear in a runnable
+  positive — GCC refuses ISRs on hosted x86-64 ("SSE instructions aren't allowed in
+  interrupt service routine") — so the safe-payload columns have no home in a run-based
+  grid. Do not "fix" their absence; the ISR over-rejection boundary is pinned by
+  `tests/zer_fail` plus compile-only controls.
+- **A new reach form needs a cell at BOTH sinks, in the same commit as the form.**
+
+### A weak-oracle trap specific to the ISR sink
+
+Both BUG-783 negatives first carried `// expect-error: interrupt` and **passed on a pre-fix
+build**: that substring matches an unrelated **ISR-signature** error ("interrupt service
+routine can only have a pointer argument"). The discriminating substring is the actual
+reason — `accessed from both interrupt and main code`. The same trap then appeared one
+layer up in the grid's `has_conc_reason`, which needed the ISR phrase added; it was added as
+that SPECIFIC phrase, with an inline note, precisely so nobody later loosens it to
+`"interrupt"`.
 
 ---
 

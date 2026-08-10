@@ -1,0 +1,34 @@
+// A loop-scoped defer must fire exactly once per EXECUTED iteration, even when
+// the loop body contains a forward goto out of the loop. Reproducer shape taken
+// from claude/gifted-noether-3o10j6 tests/zer_gaps/
+// gap_goto_out_of_loop_defer_double_fire.zer.
+//
+// Pre-fix: the NODE_LABEL handler raised defer_count back to the goto's
+// fired-count, resurrecting the loop-scoped defer that had already fired AND
+// popped at each iteration exit -> 4 fires for 3 iterations, on the path where
+// the goto was NEVER taken. With `defer free(x)` that is a double free on the
+// success path.
+//
+// NOTE: the 34 balance-based cells of test_defer_goto_matrix.c passed both
+// before and after the fix — a balance is invariant to an extra fire that also
+// acquires. The raw FIRE COUNT is what discriminates.
+i32 fires;
+
+void f(bool early) {
+    for (u32 i = 0; i < 3; i += 1) {
+        defer fires += 1;
+        if (early == true && i == 1) { goto done; }
+    }
+done:
+    return;
+}
+
+u32 main() {
+    fires = 0;
+    f(false);                          // goto never taken -> 3 fires
+    if (fires != 3) { return 1; }
+    fires = 0;
+    f(true);                           // taken at i==1 -> i=0 exit + i=1 goto
+    if (fires != 2) { return 2; }
+    return 0;
+}

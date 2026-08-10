@@ -2638,6 +2638,11 @@ because a rejection is a rejection whether or not your patch caused it.
   G3 was recorded "did not reproduce in 5 shapes" from hand-written probes that all used a
   POINTER-taking helper; the real shape wrote the global BY NAME, and the verbatim branch file
   reproduced on the first run. Keep such a negative test BYTE-IDENTICAL to the original.
+- **A gate can cover the right FEATURE and still be blind — check what QUANTITY it measures.**
+  Measured 2026-08-10: the 34-cell defer-goto matrix passed both before and after a live
+  double-fire miscompile, because its cells assert an acquire/release BALANCE and a balance is
+  invariant to an extra fire that also acquires. The raw FIRE COUNT discriminated (35/36 pre-fix).
+  Before trusting a green gate over a bug you suspect, run it against a pre-fix build.
 - **Update the entry in the SAME commit as the fix.** The "a stale gate is worse than none" rule
   this file already states applies to the LEDGER; it had drifted ~3 weeks.
 

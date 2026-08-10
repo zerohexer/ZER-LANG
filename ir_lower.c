@@ -3616,8 +3616,28 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                  * is never cleared, so the snapshot mechanism still has them. */
                 int restore_count = get_label_goto_fired_count(ctx,
                     node->label_stmt.name, (uint32_t)node->label_stmt.name_len);
-                if (restore_count > ctx->defer_count)
-                    ctx->defer_count = restore_count;
+                /* 2026-08-10: the raise `if (restore_count > ctx->defer_count)
+                 * ctx->defer_count = restore_count;` was REMOVED — it
+                 * RESURRECTED defers whose scope had already exited.
+                 *
+                 * A goto inside a loop body records a fired-count that includes
+                 * the LOOP-SCOPED defer. On the fall-through path that defer has
+                 * already fired AND popped at every iteration exit, so raising
+                 * defer_count back to the goto's count re-armed it for one more
+                 * fire at the label: a 3-iteration loop fired its defer 4 times
+                 * (`defer free(x)` -> double free on the SUCCESS path, i.e. the
+                 * path where the goto was never taken).
+                 *
+                 * The raise's own comment justified it as "defers registered
+                 * AFTER what the goto fired ALSO need to fire" — but those are
+                 * already inside ctx->defer_count, so they never needed a raise.
+                 * The raise could only ever take effect when the goto had fired
+                 * MORE defers than are currently live, which is exactly the
+                 * popped-scope case. Code and rationale had diverged.
+                 *
+                 * ctx->defer_count at the label IS the live set on this path.
+                 * restore_count is still used below to position the guard. */
+                (void)0;
                 if (ctx->defer_count > 0) {
                     ctx->active_guard_flag = get_label_guard_flag(ctx,
                         node->label_stmt.name, (uint32_t)node->label_stmt.name_len,

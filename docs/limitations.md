@@ -684,23 +684,39 @@ double-free. A correct fix must coordinate the two application points (either ma
 DEPENDENCY: Interacts with **§F1** (`freed_defer_id` replaces exactly that line-based guard) — land §F1 first and this
 fix gets easier.
 
-### ~~CRITICAL/MEDIUM goto-defer double-fire → double-FREE on the SUCCESS path~~ (`3o10j6` `d1a7d9cc`) — **CLOSED, measured 2026-08-08**
-**Does NOT reproduce on main**, in either variant: goto TAKEN mid-loop (`fires == 2`, correct) and goto
-NEVER taken so every iteration falls through (`fires == 3`, correct) — the entry's "N+1 on the natural
-fall-through path" does not occur. NOTE: the reproducer this entry says is "preserved at
-`tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer`" **does not exist** — that directory holds
-only `audit_2026-06-17_defer_goto_fallthrough_drops.zer` and `audit2_defer_scan_nested.zer`. Measured
-with a hand-written equivalent; if someone has the branch's exact file, re-probe before reopening.
-A forward `goto` out of a nested scope (loop/if body carrying a `defer`) to a label AFTER that scope re-fires
-the nested-scope defer on the NATURAL fall-through path (where the goto was never taken).
-`for(..){ defer d+=1; if(cond) goto done; } done:` runs the loop defer N+1 times, not N; with
-`defer free(b)` inside the loop this is a double-free on the success path, accepted silently.
-**Root:** `ir_lower.c` NODE_LABEL `restore_count` re-arm (~3547) bumps the label's exit-fire count to include
-the inner goto's live-defer count, but those defers already fired+popped at loop-iteration exit on the
-fall-through path; the guard flag suppresses the re-fire only on the goto path.
-**Durable fix:** per-defer runtime "armed" flags (subsumes this, G1 and the eager-goto guard). Sound interim:
-reject a forward goto whose live-defer set mismatches the label's. Reproducer preserved at
-`tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer`.
+### ~~CRITICAL/MEDIUM goto-defer double-fire → double-FREE on the SUCCESS path~~ (`3o10j6` `d1a7d9cc`) — **REPRODUCED with the branch's exact file, then FIXED 2026-08-10**
+
+**Yesterday's "CLOSED, both variants" verdict was WRONG — it came from a hand-written
+reconstruction.** Second instance of that failure mode in two days (see G3). The reconstruction put
+the loop in `main` with an inline check; the real file has the label followed by `return;` in a
+SEPARATE function, and that is what triggers it. The verbatim file
+(`origin/claude/gifted-noether-3o10j6:tests/zer_gaps/gap_goto_out_of_loop_defer_double_fire.zer`)
+gave `loop_d == 4` for a 3-iteration loop on the FIRST run.
+
+**The defect.** `NODE_LABEL` (ir_lower.c) raised `defer_count` back to the goto's fired-count. A goto
+inside a loop body records a fired-count that INCLUDES the loop-scoped defer — but on the
+fall-through path that defer has already fired AND popped at every iteration exit. Raising re-armed
+it for one extra fire at the label, so a 3-iteration loop fired its defer **4 times, on the path
+where the goto was NEVER TAKEN** (the success path). With `defer free(x)` that is a double free.
+
+**The fix is a REMOVAL, and the evidence for it is that code and rationale had diverged.** The
+raise's own comment justified it as *"defers registered AFTER what the goto fired ALSO need to
+fire"* — but those are already inside `ctx->defer_count` and never needed a raise. The raise could
+only ever take effect when the goto had fired MORE defers than are currently live, which is exactly
+the popped-scope case. `ctx->defer_count` at the label IS the live set on that path. `restore_count`
+is still computed and still positions the guard flag; only the resurrecting assignment is gone.
+
+**Checked before removing, not after:** the raise was introduced by `6c368761` together with two
+regression tests (`defer_goto_fallthrough_zero_fire.zer`, `defer_goto_handle_leak_regression.zer`) —
+**both still pass without it**, as does the whole suite and all 12 defer+goto tests.
+
+**The 34 existing defer-goto matrix cells did NOT discriminate** — they measure an acquire/release
+BALANCE, which is invariant to an extra fire that also acquires, so they passed both before and
+after. Verified against a pre-fix build. Added a **fire-count sub-grid** (`LoopGoto` axis, 2 cells,
+matrix now 36) that does: **35/36 pre-fix (fires 4, want 3) → 36/36 after.** Regression test
+`tests/zer/defer_goto_loop_fire_count.zer` covers both arms (goto never taken = 3, taken at i==1 = 2)
+and was verified to FAIL pre-fix.
+
 
 ### ~~HIGH spawn target reaches a non-shared global through a funcptr FIELD callback~~ (`02nq43` `7aac453a`) — **CLOSED, measured 2026-08-08**
 **Does NOT reproduce on main** — rejected with an exact diagnostic: *"spawn target 'worker' calls through
@@ -1508,8 +1524,8 @@ an ASan build).
 
 **MEASURED, not assumed** — each probed on main and the REJECTION REASON read:
 - **G1 goto-skips-defer — CLOSED.** A `defer` registered after the goto source does not fire at the
-  label (`lock == 1`, correct). The sibling goto-defer double-fire (`3o10j6`) is closed too, both
-  variants.
+  label (`lock == 1`, correct). The sibling goto-defer double-fire (`3o10j6`) was NOT closed —
+  that reconstruction was wrong; it is fixed 2026-08-10, see its own entry.
 - **G2 helper launders `&local` past a scoped borrow — CLOSED.** *"cannot pass '&d' to a call while
   it is borrowed by a scoped spawn"* — the exact rule, not a mask. Direct-write control also
   rejected; the no-access-between-spawn-and-join control still COMPILES (no over-rejection).

@@ -262,6 +262,58 @@ static int run_reject(const char *nm, const char *src) {
     passed++; return 1;
 }
 
+/* ================================================================
+ * LOOP-SCOPED DEFER x GOTO-OUT-OF-LOOP sub-grid (2026-08-10)
+ *
+ * The 34 cells above measure a BALANCE (acquire/release), which is invariant
+ * to a defer firing an extra time on a path that also acquires an extra time.
+ * They therefore passed BOTH before and after the bug fixed here — verified by
+ * running them against the pre-fix compiler. What discriminates is the raw FIRE
+ * COUNT of a LOOP-SCOPED defer when the loop body contains a forward goto out
+ * of the loop.
+ *
+ * The bug: NODE_LABEL raised defer_count back to the goto's fired-count, which
+ * RESURRECTED the loop-scoped defer that had already fired and popped at each
+ * iteration exit. A 3-iteration loop fired its defer 4 times — on the path
+ * where the goto was NEVER TAKEN (the success path). With `defer free(x)` that
+ * is a double free.
+ *
+ * Both arms matter: goto-never-taken is the buggy path, goto-taken is the
+ * control that must not regress. */
+typedef enum { LG_NEVER, LG_TAKEN, LG_COUNT } LoopGoto;
+
+static const char *lg_name(LoopGoto g) {
+    switch (g) {
+    case LG_NEVER: return "goto-never-taken";
+    case LG_TAKEN: return "goto-taken-at-i1";
+    case LG_COUNT: break;
+    }
+    return "?";
+}
+/* 3 iterations: never taken -> one fire per iteration = 3.
+ * taken at i==1 -> i=0 iteration-exit fire + i=1 goto fire = 2. */
+static int lg_expected(LoopGoto g) { return g == LG_NEVER ? 3 : 2; }
+
+static void gen_loop_goto(LoopGoto g, char *out, size_t n) {
+    snprintf(out, n,
+        "i32 fires;\n"
+        "void f(bool early) {\n"
+        "    for (u32 i = 0; i < 3; i += 1) {\n"
+        "        defer fires += 1;\n"
+        "        if (early == true && i == 1) { goto done; }\n"
+        "    }\n"
+        "done:\n"
+        "    return;\n"
+        "}\n"
+        "u32 main() {\n"
+        "    fires = 0;\n"
+        "    f(%s);\n"
+        "    if (fires != %d) { return (u32)fires; }\n"   /* nonzero = actual count */
+        "    return 0;\n"
+        "}\n",
+        g == LG_TAKEN ? "true" : "false", lg_expected(g));
+}
+
 int main(void) {
     find_zerc();
     fprintf(stderr, "\n=== defer x goto ARMING matrix ===\n");
@@ -291,6 +343,20 @@ int main(void) {
                 if (!ok) grid_ok = 0;
             }
         }
+    }
+
+    /* ---- loop-scoped defer x goto-out-of-loop (FIRE COUNT, not balance) ---- */
+    fprintf(stderr, "\n  -- loop-scoped defer x goto-out-of-loop (raw fire count) --\n");
+    char lbuf[1024];
+    for (LoopGoto g = 0; g < LG_COUNT; g++) {
+        valid_cells++;
+        char nm[128];
+        snprintf(nm, sizeof(nm), "loopdefer/%s", lg_name(g));
+        gen_loop_goto(g, lbuf, sizeof(lbuf));
+        int ok = run_value(nm, lbuf, lg_expected(g));
+        fprintf(stderr, "  [%-18s] want %d  %s\n",
+                lg_name(g), lg_expected(g), ok ? "ok" : "*** FAIL ***");
+        if (!ok) grid_ok = 0;
     }
 
     fprintf(stderr, "\n=== defer-goto-matrix: %d/%d cells correct ===\n",

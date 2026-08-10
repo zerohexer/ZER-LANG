@@ -5,6 +5,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-10 — goto-defer double-fire on the SUCCESS path (BUG-770)
+
+**BUG-770.** A loop-scoped `defer` fired N+1 times when the loop body contained a forward `goto` out
+of the loop — on the path where the goto was **never taken**. A 3-iteration loop fired its defer 4
+times; with `defer free(x)` that is a double free on the success path.
+
+**Root cause.** `NODE_LABEL` (ir_lower.c) raised `defer_count` back to the goto's fired-count. A goto
+inside a loop body records a fired-count that INCLUDES the loop-scoped defer, but on the fall-through
+path that defer already fired AND popped at each iteration exit — so the raise RESURRECTED it.
+
+**The fix is a removal, and the evidence is that code and rationale had diverged.** The raise's own
+comment justified it as "defers registered AFTER what the goto fired ALSO need to fire" — those are
+already inside `ctx->defer_count` and never needed a raise. It could only take effect when the goto
+had fired MORE than are live, which is precisely the popped-scope bug. Checked BEFORE removing: the
+raise shipped in `6c368761` with two regression tests, and **both still pass without it**, as do all
+12 defer+goto tests and the full suite.
+
+**THE EXISTING GATE DID NOT DISCRIMINATE — this is the reusable lesson.** `test_defer_goto_matrix.c`
+had 34 cells over exactly this feature and passed BOTH before and after the fix, verified against a
+pre-fix build. Its cells measure an acquire/release BALANCE, and a balance is invariant to an extra
+fire that also acquires. A gate can cover the right FEATURE and still be blind to the defect because
+it measures the wrong QUANTITY. Added a fire-count sub-grid (`LoopGoto` axis, 2 cells, matrix now
+36): **35/36 pre-fix (fires 4, want 3) -> 36/36 after.**
+
+**HOW IT WAS NEARLY MISSED — second instance in two days.** This was recorded "CLOSED, both variants"
+the day before, from a hand-written reconstruction that put the loop in `main` with an inline check.
+The real file has the label followed by `return;` in a SEPARATE function, and that is what triggers
+it. Same failure mode as G3/BUG-769. The rule already added to CLAUDE.md after G3 — a reconstruction
+can CONFIRM a hole but never REFUTE one — is now confirmed twice; re-verifying all of yesterday's
+reconstruction-based closures against the branches' real files is what surfaced this one.
+
+Tests: `tests/zer/defer_goto_loop_fire_count.zer` (both arms: goto never taken = 3 fires, taken at
+i==1 = 2; verified to FAIL pre-fix) + the matrix sub-grid.
+
 ## Session 2026-08-09 — G3: atomic-cell plain access, transitive through a helper
 
 **BUG-769.** A global used with `@atomic_*` in a concurrent context is an "atomic cell": every access

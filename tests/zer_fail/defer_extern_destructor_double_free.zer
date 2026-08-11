@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-787, the other direction. Once `defer dev_close(d)` is recognised as a
+// free, closing explicitly AND deferring a close is a genuine double free.
+//
+// Pre-fix this was rejected too, but for the WRONG reason ("use after free") —
+// the defer body's `dev_close(d)` was scanned as a USE of an already-freed
+// handle rather than as a second free. Same verdict, misleading reason; the
+// `expect-error` here pins the accurate one.
+*opaque dev_open();
+void dev_close(*opaque d);
+
+u32 main() {
+    *opaque d = dev_open();
+    defer dev_close(d);
+    dev_close(d);          // closes it now; the defer closes it again at exit
+    return 0;
+}

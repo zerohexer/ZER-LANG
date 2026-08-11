@@ -1,0 +1,54 @@
+// BUG-787 (2026-08-11). "Is this call a free?" was answered by TWO predicates
+// that disagreed. The direct-call path asks `ir_is_extern_free_call`, which
+// covers the bodyless-destructor heuristic — a VOID-returning extern taking
+// `*T`/`*opaque`, or a NON-VOID one whose name matches a destructor keyword.
+// The defer-side matcher recognised only literal `free` and the `.free` /
+// `.free_ptr` methods.
+//
+// So `dev_close(d)` counted as a free but `defer dev_close(d)` did not, and the
+// canonical RAII idiom produced a FALSE LEAK — the exact shape
+// docs/reference.md advertises with the comment "zercheck: leak prevented".
+// Verified REJECTED on a pre-fix build.
+//
+// The resource pointers are `*u8` rather than `*opaque` so the C helpers can be
+// plain `unsigned char *` — ZER's `*opaque` emits as the fat `_zer_opaque`
+// struct, which a hand-written C prototype cannot spell. Tracking is identical:
+// zercheck flags the un-freed control either way.
+//
+// Both heuristic arms are exercised for real (they link and run):
+//   void-returning   -> dev_close()   from the companion header
+//   non-void by name -> res_release()  from the companion header (returns i32)
+cinclude "defer_extern_destructor_test.h";
+
+*u8 dev_open();
+void dev_close(*u8 d);
+u32 dev_read(*u8 d);
+
+*u8 res_acquire();
+i32 res_release(*u8 p);
+
+struct N { u32 v; }
+
+u32 gsink;
+
+u32 main() {
+    // --- arm 1: VOID-returning bodyless destructor, released by defer ---
+    *u8 d = dev_open();
+    defer dev_close(d);              // was: "allocated ... but never freed"
+    gsink = dev_read(d);             // use BEFORE scope exit is legal — defer fires after
+    if (gsink != 0) { return 1; }
+
+    // --- arm 2: NON-VOID destructor matched by NAME (res_release -> i32) ---
+    *u8 r = res_acquire();
+    defer res_release(r);
+    gsink = gsink + 1;
+
+    // --- control: the builtin forms, which already worked. Pinned so the
+    //     unification cannot regress them. ---
+    *N q = alloc(N) orelse { return 2; };
+    defer free(q);
+    gsink = gsink + q.v;
+
+    if (gsink != 1) { return 3; }
+    return 0;
+}

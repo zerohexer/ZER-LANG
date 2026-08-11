@@ -390,6 +390,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **"Is this call a free?"** | direct-call sink, `defer`-body scan | ONE predicate `ir_is_extern_free_call`. The defer scan had a SECOND, narrower copy (literal `free` + `.free`/`.free_ptr` only), so `defer dev_close(d)` was not a free while `dev_close(d)` was — the documented RAII idiom produced a false leak (BUG-787). Fix by ASKING the shared predicate, never by widening a second copy |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -1603,6 +1604,12 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Module tests: `ls test_modules/*.zer` (~28 including diamond imports, shared cross-module, opaque wrappers)
 - Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
 - Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
+
+**docs/reference.md examples are COMPILED by `make check`** (`tools/audit_reference_examples.sh`).
+Every ```zer block containing `main(` must compile; a block that cannot by design needs
+`// doc-example: not-compilable — <reason>` on its first line. It catches doc rot in BOTH
+directions — a wrong example, and a RIGHT example over a wrong compiler (that is how BUG-787
+was found). When you add a reference example, make it a whole program if you reasonably can.
 
 ### Test Locations Summary
 | Directory | What | Count | Runner |

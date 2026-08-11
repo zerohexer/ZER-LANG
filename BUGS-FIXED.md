@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-11d — BUG-787: `defer close(x)` was not a free — the documented RAII idiom produced a false leak
+
+**Found by compiling the documentation.** A sweep that extracts every full-program example
+from `docs/reference.md` and runs it through `zerc` failed on the `cinclude` + `*opaque`
+example — the one whose own comment reads *"zercheck: leak prevented"*. The doc was right;
+the compiler was wrong.
+
+**The defect.** "Is this call a free?" was answered by TWO predicates that disagreed:
+
+| | direct call | inside `defer` |
+|---|---|---|
+| `free(p)` | free | free |
+| `pool.free(h)` / `.free_ptr` | free | free |
+| bodyless `void dev_close(*opaque)` | **free** | **NOT a free** |
+| bodyless `i32 destroy(*N)` (name heuristic) | **free** | **NOT a free** |
+
+The direct path calls `ir_is_extern_free_call`, which implements the bodyless-destructor
+heuristic (a `void`-returning extern taking `*T`/`*opaque`, or a non-void one whose name
+matches one of the 12 destructor keywords). `ir_defer_free_arg` was a second, narrower
+implementation that only knew literal `free` and the two methods. So `dev_close(d)` counted
+as a free but `defer dev_close(d)` did not, and the canonical RAII shape — the entire point
+of `defer` for C interop — reported *"allocated … but never freed"*.
+
+**Fix: delete the second answer, don't widen it.** `ir_defer_free_arg` now asks
+`ir_is_extern_free_call` after its two builtin fast paths. Same heuristic, same coverage,
+one site — no new classification risk, because every call it now accepts was already
+accepted at the direct sink.
+
+**Both directions verified, and the claim kept honest.** The false leaks are gone
+(`defer dev_close(d)`, `defer destroy(p)`, `defer tp.free(h)` control still fine). The
+double-free direction: `defer dev_close(d); dev_close(d);` and the reverse order are
+rejected — but they were rejected *before* too, as a confusing *"use after free"* (the defer
+body's call was scanned as a USE of an already-freed handle). This is a **diagnostic-quality
+improvement, not a newly-detected bug** — worth stating precisely rather than claiming a
+soundness win. A legitimate use before scope exit (`defer dev_close(d); dev_read(d);`) still
+compiles, and a real UAF after an explicit close is still caught.
+
+**A gate so the docs cannot rot again:** `tools/audit_reference_examples.sh`, wired into
+`make check` (and `make check-reference-examples`). It compiles every ```zer block in
+reference.md that contains `main(`; a block that cannot compile by design must carry
+`// doc-example: not-compilable — <reason>` on its first line (two do: one deliberately
+demonstrating a compile error, one showing two source files in one block). Verified to fire
+by injecting a broken example. It has already caught defects in both directions — a wrong
+example (a `u64` intrinsic result assigned to `u32`) and a right example over a wrong
+compiler (this bug).
+
+`make check` exit 0, zero regressions. Tests:
+`tests/zer/defer_extern_destructor_ok.zer` + `defer_extern_destructor_test.h` (exercises BOTH
+heuristic arms with real linkable helpers — a void-returning destructor and a non-void one
+matched by name — verified REJECTED pre-fix, compiles and exits 0 now), and
+`tests/zer_fail/defer_extern_destructor_double_free.zer` pinning the accurate diagnostic.
+
 ## Session 2026-08-11c — BUG-786: unwrapping a param's pointer field into a local erased the free link (double free AND a false leak, from one missing edge)
 
 **The hole.** A callee that frees a pointer-carrying FIELD of a struct parameter is recorded

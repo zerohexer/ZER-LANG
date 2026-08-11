@@ -1663,6 +1663,7 @@ u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
   Use a literal, or compute it inside a function body. The same restriction
   applies to `@addc`, `@subb` and `@mulw`.
 ```zer
+// doc-example: not-compilable — deliberately shows a rejected global initializer
 u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
 u32 main() {
     u8 ok = @saturate(u8, 300);    // OK — inside a function body
@@ -2022,6 +2023,234 @@ u8[512] fpu;
 
 ---
 
+### Systems / kernel intrinsics — MMU, TLB, cache, port I/O, MSR, CPU state (96)
+
+**DESCRIPTION**
+The full low-level surface `zerc` accepts beyond the general-purpose intrinsics above.
+These are the bare-metal / kernel primitives: MMU and TLB control, cache maintenance,
+x86 port I/O, model-specific and control registers, CPU identification and state, power
+management, and privileged mode transitions.
+
+**Every signature in the tables below was measured against the compiler**, not
+transcribed from a design note — arity from the checker's own arity diagnostic, and the
+return type as the NARROWEST type the checker accepts (ZER widens implicitly but never
+narrows, so the narrowest accepted type IS the declared one).
+
+**MOST OF THESE ARE PRIVILEGED (CPL=0) AND WILL SIGSEGV IN USER MODE.** They are for
+kernel and bare-metal code. To verify that such code *compiles* without executing the
+privileged instruction, use the dead-branch pattern — a `volatile` guard the optimizer
+cannot fold away:
+
+```zer
+u32 gsink;
+
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {                 // never taken; still fully type-checked and emitted
+        @cpu_write_cr3(@cpu_read_cr3());
+        @tlb_flush_all();
+    }
+    gsink = 1;
+    return 0;
+}
+```
+
+Non-privileged members (the `@cpu_read_*` inspection group, `@cpu_pause`,
+`@cpu_idle_hint`, `@cpu_endbr`, `@cpu_umonitor`) run in user mode directly and need no
+dead branch.
+
+**ARGUMENT SHAPES.** A "1 arg" entry taking a buffer wants a `u8[N]` array or `*u8`
+(`@cpu_fxsave(buf)`); the rest take integers. A "2 arg" entry is either
+`(buffer, mask/length)` (`@cpu_xsave`, `@cache_flush_range`, `@nt_store`,
+`@wait_on_address`) or two integers (`@cpu_write_msr(msr, val)`, `@port_out32(port, val)`).
+
+**MMU control**
+
+| intrinsic | args | returns |
+|---|---|---|
+| `@mmu_disable` | 0 | (void) |
+| `@mmu_enable` | 0 | (void) |
+| `@mmu_get_fault_addr` | 0 | u64 |
+| `@mmu_get_fault_status` | 0 | u64 |
+| `@mmu_get_kernel_pt` | 0 | u64 |
+| `@mmu_get_pt` | 0 | u64 |
+| `@mmu_is_enabled` | 0 | bool |
+| `@mmu_set_kernel_pt` | 1 | (void) |
+| `@mmu_set_pt` | 1 | (void) |
+| `@mmu_sync` | 0 | (void) |
+
+**TLB maintenance**
+
+| intrinsic | args | returns |
+|---|---|---|
+| `@tlb_flush_addr` | 1 | (void) |
+| `@tlb_flush_all` | 0 | (void) |
+| `@tlb_flush_asid` | 1 | (void) |
+| `@tlb_flush_global` | 0 | (void) |
+| `@tlb_flush_range` | 2 | (void) |
+
+**Cache maintenance**
+
+| intrinsic | args | returns |
+|---|---|---|
+| `@cache_clean_range` | 2 | (void) |
+| `@cache_flush_line` | 1 | (void) |
+| `@cache_flush_range` | 2 | (void) |
+| `@cache_flushopt` | 1 | (void) |
+| `@cache_invalidate_icache` | 2 | (void) |
+| `@cache_invalidate_range` | 2 | (void) |
+| `@cache_writeback` | 1 | (void) |
+| `@cache_zero_line` | 1 | (void) |
+
+**Port I/O (x86)**
+
+| intrinsic | args | returns |
+|---|---|---|
+| `@port_in16` | 1 | u16 |
+| `@port_in32` | 1 | u32 |
+| `@port_in8` | 1 | u8 |
+| `@port_out16` | 2 | (void) |
+| `@port_out32` | 2 | (void) |
+| `@port_out8` | 2 | (void) |
+
+**CPU / other (67)**
+
+| intrinsic | args | returns |
+|---|---|---|
+| `@barrier_dma` | 0 | (void) |
+| `@cpu_breakpoint` | 0 | (void) |
+| `@cpu_cache_disable` | 0 | (void) |
+| `@cpu_cache_enable` | 0 | (void) |
+| `@cpu_cache_line_size` | 0 | u32 |
+| `@cpu_core_id` | 0 | u32 |
+| `@cpu_cpuid` | 2 | u64 |
+| `@cpu_cpuid_ecx` | 2 | u64 |
+| `@cpu_current_mode` | 0 | u32 |
+| `@cpu_deep_sleep` | 0 | (void) |
+| `@cpu_endbr` | 0 | (void) |
+| `@cpu_eoi` | 0 | (void) |
+| `@cpu_feature_bits` | 0 | u64 |
+| `@cpu_flush_pipeline` | 0 | (void) |
+| `@cpu_fpu_init` | 0 | (void) |
+| `@cpu_fxrstor` | 1 | (void) |
+| `@cpu_fxsave` | 1 | (void) |
+| `@cpu_get_pc` | 0 | u64 |
+| `@cpu_get_priv_level` | 0 | u32 |
+| `@cpu_hypercall` | 0 | (void) |
+| `@cpu_id` | 0 | u32 |
+| `@cpu_idle_hint` | 0 | (void) |
+| `@cpu_iret` | 0 | (void) |
+| `@cpu_model_id` | 0 | u32 |
+| `@cpu_monitor_addr` | 1 | (void) |
+| `@cpu_mwait` | 0 | (void) |
+| `@cpu_num_cores` | 0 | u32 |
+| `@cpu_pause` | 0 | (void) |
+| `@cpu_rdrand` | 0 | (void) |
+| `@cpu_rdseed` | 0 | (void) |
+| `@cpu_read_counter` | 0 | u64 |
+| `@cpu_read_cr0` | 0 | u64 |
+| `@cpu_read_cr2` | 0 | u64 |
+| `@cpu_read_cr3` | 0 | u64 |
+| `@cpu_read_cr4` | 0 | u64 |
+| `@cpu_read_dr` | 1 | u64 |
+| `@cpu_read_flags` | 0 | u64 |
+| `@cpu_read_fsbase` | 0 | u64 |
+| `@cpu_read_gsbase` | 0 | u64 |
+| `@cpu_read_msr` | 1 | u64 |
+| `@cpu_read_pmc` | 1 | u64 |
+| `@cpu_read_sp` | 0 | u64 |
+| `@cpu_read_tp` | 0 | u64 |
+| `@cpu_read_xcr0` | 0 | u64 |
+| `@cpu_reset` | 0 | (void) |
+| `@cpu_sbi_call` | 0 | (void) |
+| `@cpu_set_priv_stack` | 1 | (void) |
+| `@cpu_sev` | 0 | (void) |
+| `@cpu_smc_call` | 0 | (void) |
+| `@cpu_syscall` | 0 | (void) |
+| `@cpu_sysret` | 0 | (void) |
+| `@cpu_umonitor` | 1 | (void) |
+| `@cpu_umwait` | 2 | (void) |
+| `@cpu_vendor_id` | 0 | u64 |
+| `@cpu_wfe` | 0 | (void) |
+| `@cpu_write_cr0` | 1 | (void) |
+| `@cpu_write_cr3` | 1 | (void) |
+| `@cpu_write_cr4` | 1 | (void) |
+| `@cpu_write_dr` | 2 | (void) |
+| `@cpu_write_fsbase` | 1 | (void) |
+| `@cpu_write_gsbase` | 1 | (void) |
+| `@cpu_write_msr` | 2 | (void) |
+| `@cpu_write_xcr0` | 1 | (void) |
+| `@cpu_xrstor` | 2 | (void) |
+| `@cpu_xsave` | 2 | (void) |
+| `@nt_store` | 2 | (void) |
+| `@wait_on_address` | 2 | (void) |
+
+**EXAMPLE** (compiles as-is; the privileged calls sit in a dead branch)
+```zer
+u32 gsink;
+
+u32 main() {
+    u8[512] xbuf;                       // XSAVE / FXSAVE area
+    volatile u32 never = 0;
+
+    // --- non-privileged: safe to call directly ---
+    u32 line = @cpu_cache_line_size();
+    u32 cores = @cpu_num_cores();
+    u64 sp = @cpu_read_sp();
+    @cpu_pause();                        // spin-wait hint
+
+    if (never == 42) {
+        // --- MMU / TLB ---
+        u64 pt = @cpu_read_cr3();
+        @mmu_set_pt(pt);
+        @tlb_flush_all();
+        @tlb_flush_addr(0x1000);
+        @mmu_sync();
+        if (@mmu_is_enabled()) { gsink = (u32)@mmu_get_fault_addr(); }
+
+        // --- cache maintenance ---
+        @cache_flush_range(xbuf, 512);
+        @cache_writeback(xbuf);
+        @barrier_dma();
+
+        // --- port I/O (x86) ---
+        @port_out8(0x3F8, 0x41);
+        u8 status = @port_in8(0x3FD);
+        gsink = (u32)status;
+
+        // --- MSR / control registers ---
+        u64 apic = @cpu_read_msr(0x1B);
+        @cpu_write_msr(0x1B, apic);
+        @cpu_write_cr4(@cpu_read_cr4());
+
+        // --- extended state ---
+        @cpu_xsave(xbuf, 0x7);
+        @cpu_xrstor(xbuf, 0x7);
+    }
+
+    gsink = line + cores + (u32)sp;
+    return 0;
+}
+```
+
+**NOTES**
+- Non-x86 targets get a no-op or nearest-equivalent fallback for the x86-specific
+  members; `--target-arch` selects the emission. Nothing here is silently dropped.
+- `@cpu_core_id`, `@cpu_current_mode`, `@cpu_cache_line_size` and `@cpu_num_cores`
+  are STUBS returning a constant (0 / 0 / 64 / 1). They compile and run; they do not
+  yet query the hardware.
+- `@cpu_rdrand` / `@cpu_rdseed` currently execute the instruction and return `void` —
+  there is no result accessor yet. Measured, not a typo.
+- Buffer sizes: `@cpu_fxsave` / `@cpu_fxrstor` need >= 512 bytes, 16-byte aligned;
+  `@cpu_xsave` / `@cpu_xrstor` size depends on the feature mask.
+- Availability is a HARDWARE fact, not a program fact: `@cpu_read_fsbase` needs
+  `CR4.FSGSBASE`, `@cpu_read_pmc` needs `CR4.PCE`, `@cpu_umwait` needs WAITPKG,
+  `@cpu_endbr` is a multi-byte NOP without CET-IBT. ZER verifies the *use* of the
+  value in your program; whether the CPU supports the instruction is the
+  hardware-consequence floor.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2294,6 +2523,7 @@ import gpio;
 
 **EXAMPLE**
 ```zer
+// doc-example: not-compilable — two separate source FILES shown in one block
 // uart.zer:
 void uart_init(u32 baud) { }
 static void internal_helper() { }   // not visible to importers

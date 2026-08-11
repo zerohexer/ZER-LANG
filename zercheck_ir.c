@@ -2062,7 +2062,7 @@ static bool ir_defer_is_arena_reset(Node *node) {
  *   - bare free(x)    (plain cstdlib from cinclude)
  *   - Task.free(x) / Task.free_ptr(x)
  */
-static Node *ir_defer_free_arg(Node *node) {
+static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
     if (!node) return NULL;
     if (node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return NULL;
     Node *call = node->expr_stmt.expr;
@@ -2080,6 +2080,25 @@ static Node *ir_defer_free_arg(Node *node) {
         callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0)
         return call->call.args[0];
+    /* BUG-787 (2026-08-11): "is this call a free?" was answered by TWO
+     * predicates that disagreed. The direct-call path uses
+     * `ir_is_extern_free_call` — which covers the bodyless-destructor
+     * heuristic (a `void`-returning extern taking `*T`/`*opaque`, or a
+     * non-void one whose name matches the 12 destructor keywords) — while
+     * this defer-side matcher recognised only literal `free` and the
+     * `.free`/`.free_ptr` methods.
+     *
+     * So `dev_close(d)` counted as a free but `defer dev_close(d)` did not,
+     * and the canonical RAII idiom produced a FALSE LEAK:
+     *
+     *     *opaque d = dev_open();
+     *     defer dev_close(d);        // "allocated ... but never freed"
+     *
+     * docs/reference.md advertised exactly this shape (with the comment
+     * "zercheck: leak prevented"), so the documented C-interop idiom did not
+     * compile. Asking the shared predicate makes the two sites agree, and
+     * removes the second implementation rather than widening it. */
+    if (ir_is_extern_free_call(zc, call)) return call->call.args[0];
     return NULL;
 }
 
@@ -2181,7 +2200,7 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     /* Try this node as a free statement */
-    Node *farg = ir_defer_free_arg(body);
+    Node *farg = ir_defer_free_arg(zc, body);
     if (farg) {
         int root_local;
         const char *path;
@@ -2323,7 +2342,7 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
-        ir_defer_free_arg(body) == NULL) {
+        ir_defer_free_arg(zc, body) == NULL) {
         ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
     }
 

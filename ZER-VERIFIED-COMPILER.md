@@ -1470,14 +1470,23 @@ Same technique for fixpoint passes: dataflow on a lattice of height `h` converge
    shapes                             array". A WORKLIST or FIXPOINT loop is a
                                       different shape and needs its own lemma,
                                       proved once. Finite work, not zero.
-   setIdx / ifE conformance           see 19.7 — untested before use.
-   a reachability probe               the general form of the path-kill guard.
+   setIdx / ifE conformance           BUILT 2026-08-11 (KernelQ LS.23.1). `covered`
+                                      was CIRCULAR — a hand-written list the guards
+                                      checked themselves against. Now COMPUTED from
+                                      the programs that actually run. 6380 points.
+   a reachability probe               BUILT 2026-08-11 (KernelQ LS.23.4), and it
+                                      earned itself at once: an INFINITE LOOP makes
+                                      CBMC report VERIFICATION SUCCESSFUL, because
+                                      the assertion becomes unreachable and nothing
+                                      fails. A blocklist cannot catch that class.
+                                      Invert it: call, then assert FALSE — the probe
+                                      passes only when CBMC FAILS.
    arena-flattened IR                 the 19.9 decision.
 ```
 
 ---
 
-**Status: RECORDED 2026-08-11 (§19).** Amends §0.1 (implementation language). Instantiates §6's Tier B with a built mechanism. Does not touch §6 theorem 1 (checker soundness stays Lean, unbounded, inductive), does not re-propose any §17 entry. Cross-refs: §9 (the two trust chains this sits inside), §10 (dual backend), §11 (the emitter contract, now doubly load-bearing), §9.5 (Lean runtime speed — 19.1 is its concrete mitigation). KernelQ-side full record: `docs/kernelq-pedagogy-goal.md` LS.17 (design), LS.18 (as built), LS.19 (the language), LS.20 (soundness target + false-accept ledger), LS.21 (corrected cost model), LS.22 (behavioural stage); `docs/Lean4-context-internal.md` §26 (every measurement).
+**Status: RECORDED 2026-08-11 (§19).** Amends §0.1 (implementation language). Instantiates §6's Tier B with a built mechanism. Does not touch §6 theorem 1 (checker soundness stays Lean, unbounded, inductive), does not re-propose any §17 entry. Cross-refs: §9 (the two trust chains this sits inside), §10 (dual backend), §11 (the emitter contract, now doubly load-bearing), §9.5 (Lean runtime speed — 19.1 is its concrete mitigation). KernelQ-side full record: `docs/kernelq-pedagogy-goal.md` LS.17 (design), LS.18 (as built), LS.19 (the language), LS.20 (soundness target + false-accept ledger), LS.21 (corrected cost model), LS.22 (behavioural stage), LS.23 (completeness, the calibration trap, the reachability probe); `docs/Lean4-context-internal.md` §26 (every measurement).
 
 ---
 

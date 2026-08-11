@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: compound assignment
+// RMW-LAUNDER, main-code (`from_func`) half: main performs the laundered RMW
+// and the ISR only stores. main's read-modify-write can be interrupted between
+// its load and its store, so the ISR's write is silently clobbered.
+volatile u32 g;
+
+void bump(volatile *u32 p) { *p += 1; }
+
+interrupt TIM2 { g = 1; }
+
+u32 main() { bump(&g); return 0; }

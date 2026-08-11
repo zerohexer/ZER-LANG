@@ -5,6 +5,68 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-11b — BUG-785: a non-atomic RMW laundered through a pointer evaded the volatile exemption at BOTH sinks
+
+**Six accepted forms, two sinks, one question.** "Does this ISR/spawn-reachable code perform a
+non-atomic read-modify-write on volatile global `g`?" had **three** independent
+implementations — the main-path assign walk (`from_func`), `record_isr_globals` (`from_isr`),
+and the spawn scan's Axis-A3 arm — and all three matched only a compound assign whose target
+**root is a named global**. One pointer of indirection defeated all three:
+
+```zer
+volatile u32 g;
+void bump(volatile *u32 p) { *p += 1; }   // the RMW, one hop away
+interrupt TIM2 { bump(&g); }              // was ACCEPTED — torn RMW, lost interrupt counts
+void worker()  { bump(&g); }              // was ACCEPTED — TSan-confirmed data race
+```
+
+while `g += 1` written directly in either body was correctly rejected at both sinks. Measured
+accepted: in-body local alias / 1-hop / n-hop, crossed with ISR / spawn — **6 of 6**, plus the
+main-code (`from_func`) half. **Moving a statement into a helper decided whether the program
+was safe.**
+
+**Evidence.** TSan on the emitted C for the spawn/1-hop form: *"WARNING: ThreadSanitizer: data
+race … Read of size 4 … by main thread … Previous write of size 4 … by thread T1"*, both
+inside `bump`. On bare metal the ISR facet is fully silent — no trap, just lost counts.
+
+**Why the exemption is the culprit, and why this is the recurring shape.**
+`volatile_global_exempt_from_race_check` exists for the SINGLE-WORD flag idiom — *one plain
+load or one plain store*. A read-modify-write is neither. Axis A3 added a carve-out saying
+exactly that, but expressed it as a syntactic pattern (`assign.target->kind == NODE_IDENT`)
+rather than as the property. This is the third time this exemption has produced a hole
+(2026-08-03 width at the spawn site, then its ISR sibling, now the access KIND at both) and
+the second time the two sites disagreed. CLAUDE.md already names the probe that finds it:
+*an exemption whose written rationale is narrower than its code.*
+
+**The fix resolves the launder instead of adding a fourth name matcher.** One exhaustive
+walker (`rmw_scan`, no `default:`) walks a body carrying a may-alias map *name -> the global
+it addresses*, seeded by `*T p = &g` and extended at each direct call by binding the callee's
+parameter to the global its argument addresses. A compound assign whose target root maps to a
+global is then the same event as the by-name form, however many hops away. Three call sites
+(`rmw_record_launders` after each function body and after each `interrupt` body;
+`rmw_body_launders_rmw` at the spawn sink), one mechanism.
+
+**Sound direction by construction:** the map only ever ADDS bindings, so an unresolvable
+pointer yields no binding and therefore no NEW rejection — this can only catch races that were
+previously silent. It descends only when an argument actually carries a global's address
+(which also keeps it linear), and never into a bodyless/extern callee (the C-domain floor).
+
+**Over-rejection boundary measured, not argued.** A plain STORE through the identical pointer
+chain, an `@atomic_*` RMW (the remedy the diagnostic recommends), a RMW on a *local* through a
+pointer, and a RMW on a global in a program with no ISR and no spawn all still compile —
+8 positive cells in the grid plus `tests/zer/rmw_launder_boundary_ok.zer`. `make check`
+1200 -> 1208, zero regressions, all six gates green, sink matrix clean.
+
+**Gated so a new form cannot regress it silently:** a `SITE x LAUNDER x ACCESS` grid in
+`tests/test_hw_matrix.c` (16 cells; hw-matrix 18 -> 34). It crosses the two sites deliberately —
+the width axis was fixed at one site and missed at the other, and this axis repeated that
+exactly. `-Wswitch` on `VLaunder` forces a new launder form to be handled at every generator
+and name site. **Verified to fire against a pre-fix build: 28/34 (6 false negatives) -> 34/34.**
+
+Tests: `tests/zer_fail/{isr,spawn}_rmw_via_pointer_param.zer`,
+`{isr,spawn}_rmw_via_local_alias.zer`, `{isr,spawn}_rmw_via_pointer_2hop.zer`,
+`main_rmw_via_pointer_param.zer`, `tests/zer/rmw_launder_boundary_ok.zer`.
+
 ## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
 
 Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)

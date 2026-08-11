@@ -308,6 +308,97 @@ static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     }
 }
 
+/* ================================================================
+ * RMW-LAUNDER grid: SITE x LAUNDER x ACCESS (2026-08-11)
+ * ================================================================
+ * The volatile exemption above answers "is this global safely single-word?".
+ * This grid answers the OTHER half of the same exemption: "is this access a
+ * plain load/store, or a read-modify-write?" — because the exemption's written
+ * rationale covers only the former, and a RMW through a pointer was accepted at
+ * BOTH sites while the identical by-name RMW was rejected at both. TSan
+ * confirmed the race on the spawn/1-hop cell.
+ *
+ * Crossing SITE with LAUNDER is the point: the spawn and ISR checks must agree
+ * form-for-form, which is precisely what failed for the width axis (fixed at
+ * one site, missed at the other) and failed again here. ACCESS pins the
+ * over-rejection boundary in the same grid — a plain STORE through the very
+ * same pointer chain must keep compiling, or the fix has broken the flag idiom.
+ *
+ * ADD A LAUNDER FORM HERE when you add one anywhere: `-Wswitch` on the enum
+ * forces every generator and name site to handle it, so the grid cannot
+ * silently shrink. */
+typedef enum {
+    VLAUND_NAME,        /* g += 1            — by name (was already caught) */
+    VLAUND_LOCAL_ALIAS, /* p = &g; *p += 1   — alias in the same body */
+    VLAUND_PTR_PARAM,   /* f(&g), f RMWs *p  — one hop */
+    VLAUND_PTR_2HOP,    /* f(&g) -> h(p)     — forwarded */
+    VLAUND_COUNT
+} VLaunder;
+typedef enum { VACC_RMW, VACC_STORE, VACC_COUNT } VAccess;
+
+static const char *vlaund_name(VLaunder l) {
+    switch (l) {
+    case VLAUND_NAME:        return "by-name";
+    case VLAUND_LOCAL_ALIAS: return "local-alias";
+    case VLAUND_PTR_PARAM:   return "ptr-param";
+    case VLAUND_PTR_2HOP:    return "ptr-2hop";
+    case VLAUND_COUNT: break;
+    }
+    return "?";
+}
+static const char *vacc_name(VAccess a) {
+    switch (a) {
+    case VACC_RMW:   return "rmw";
+    case VACC_STORE: return "plain-store";
+    case VACC_COUNT: break;
+    }
+    return "?";
+}
+/* A RMW is never covered by the single-word exemption -> must REJECT.
+ * A plain store IS the sanctioned flag idiom -> must COMPILE, however it is
+ * reached. */
+static int vacc_is_negative(VAccess a) { return a == VACC_RMW; }
+
+/* Emit the touching code plus whatever helper it needs. `op` is "+=" or "=". */
+static void gen_launder(VSite site, VLaunder l, VAccess a, char *out, size_t n) {
+    const char *op = (a == VACC_RMW) ? "+=" : "=";
+    char helpers[512]; helpers[0] = 0;
+    char touch[256];
+    switch (l) {
+    case VLAUND_NAME:
+        snprintf(touch, sizeof(touch), "g %s 1;", op);
+        break;
+    case VLAUND_LOCAL_ALIAS:
+        snprintf(touch, sizeof(touch), "volatile *u32 p = &g; *p %s 1;", op);
+        break;
+    case VLAUND_PTR_PARAM:
+        snprintf(helpers, sizeof(helpers),
+                 "void touch1(volatile *u32 p) { *p %s 1; }\n", op);
+        snprintf(touch, sizeof(touch), "touch1(&g);");
+        break;
+    case VLAUND_PTR_2HOP:
+        snprintf(helpers, sizeof(helpers),
+                 "void inner(volatile *u32 p) { *p %s 1; }\n"
+                 "void mid(volatile *u32 p) { inner(p); }\n", op);
+        snprintf(touch, sizeof(touch), "mid(&g);");
+        break;
+    case VLAUND_COUNT: touch[0] = 0; break;
+    }
+    if (site == VSITE_SPAWN) {
+        snprintf(out, n,
+            "volatile u32 g;\n%s"
+            "void w() { %s }\n"
+            "u32 main() { spawn w(); u32 x = g; return x & 1; }\n",
+            helpers, touch);
+    } else {
+        snprintf(out, n,
+            "volatile u32 g;\n%s"
+            "interrupt TIMER { %s }\n"
+            "u32 main() { u32 x = g; return x & 1; }\n",
+            helpers, touch);
+    }
+}
+
 /* run_neg/run_pos with per-cell zerc flags (the over-width cell needs a 32-bit
  * target). Same EMIT-ONLY contract and integrity guard as the helpers above. */
 static int run_vol(const char *name, const char *code, const char *flags, int negative) {
@@ -381,6 +472,27 @@ int main(void) {
                     vsite_name(vs), vshape_name(vp), neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* ---- RMW-launder grid: SITE x LAUNDER x ACCESS ---- */
+    fprintf(stderr, "\n  -- rmw-launder grid (a RMW is not a single-word access, at EITHER site) --\n");
+    char lbuf[1024];
+    for (VSite vs = 0; vs < VSITE_COUNT; vs++) {
+        for (VLaunder vl = 0; vl < VLAUND_COUNT; vl++) {
+            for (VAccess va = 0; va < VACC_COUNT; va++) {
+                valid_cells++;
+                int neg = vacc_is_negative(va);
+                char nm[192];
+                snprintf(nm, sizeof(nm), "rmw/%s/%s/%s",
+                         vsite_name(vs), vlaund_name(vl), vacc_name(va));
+                gen_launder(vs, vl, va, lbuf, sizeof(lbuf));
+                int ok = run_vol(nm, lbuf, "", neg);
+                fprintf(stderr, "  [%-5s][%-12s][%-11s][%-3s] %s\n",
+                        vsite_name(vs), vlaund_name(vl), vacc_name(va),
+                        neg ? "neg" : "pos", ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
         }
     }
 

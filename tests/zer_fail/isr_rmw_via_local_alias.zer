@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: compound assignment
+// RMW-LAUNDER, ISR sink, no call at all: the alias is a local pointer in the
+// ISR body itself. The weakest form of the class, and it was accepted too.
+volatile u32 counter;
+
+interrupt TIM2 { volatile *u32 p = &counter; *p += 1; }
+
+u32 main() { u32 x = counter; return x & 1; }

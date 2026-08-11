@@ -518,6 +518,53 @@ static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static void record_isr_globals(Checker *c, Node *node, int depth);
+
+/* ================================================================
+ * RMW-LAUNDER (2026-08-11) — "is there a non-atomic read-modify-write on a
+ * global here?" asked ONCE instead of at three blind sites.
+ * ================================================================
+ * That question had three independent implementations — the main-path assign
+ * walk (`from_func`, checker.c NODE_ASSIGN), `record_isr_globals` (`from_isr`),
+ * and the spawn scan's Axis-A3 arm — and ALL THREE matched only a compound
+ * assign whose target ROOT IS A NAMED GLOBAL. Every pointer indirection
+ * defeated all three, at BOTH the ISR and the spawn sink:
+ *
+ *     volatile u32 g;
+ *     void bump(volatile *u32 p) { *p += 1; }   // the RMW, one hop away
+ *     interrupt TIM2 { bump(&g); }              // ACCEPTED (torn RMW, lost counts)
+ *     void worker()  { bump(&g); }              // ACCEPTED — TSan-confirmed race
+ *
+ * while the by-name form `g += 1` was correctly rejected at both. Six forms
+ * measured accepted (in-body alias / 1-hop / n-hop, x ISR / spawn); moving a
+ * statement into a helper decided whether the program was safe.
+ *
+ * The fix resolves the LAUNDER instead of adding a fourth name matcher: walk
+ * the body carrying a may-alias map `local-or-param name -> the global it
+ * addresses`, seeded by `*T p = &g` and extended at each direct call by binding
+ * the callee's parameter to the global its argument addresses. A compound
+ * assign whose target root maps to a global is then the same event as the
+ * by-name form, however many hops away it happened.
+ *
+ * Sound direction: the map is may-alias and only ever ADDS, so an unresolvable
+ * pointer yields no binding and no NEW rejection — this can only catch races
+ * that were previously silent, never invent one. A bodyless/extern callee is
+ * not descended (C-domain floor, same as every other transitive scan here). */
+struct RmwBind {                       /* name -> the global whose address it holds */
+    const char *name;  uint32_t name_len;
+    const char *gname; uint32_t gname_len;
+};
+struct RmwCtx {
+    Node *fn;                          /* enclosing NODE_FUNC_DECL (for params), or NULL */
+    struct RmwBind *binds;             /* may-alias map; heap, grows, never shrinks */
+    int bind_count, bind_cap;
+    bool report;                       /* true = track_isr_global; false = out_name only */
+    const char *out_name; uint32_t out_len;
+    bool hit;
+};
+static void rmw_scan(Checker *c, Node *n, struct RmwCtx *cx, int depth);
+static void rmw_record_launders(Checker *c, Node *body);
+static bool rmw_body_launders_rmw(Checker *c, Node *body,
+                                  const char **out_name, uint32_t *out_len);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
                                       const char **out_name, uint32_t *out_len);
@@ -15525,6 +15572,23 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
                         (int)bad_len, bad_name);
                 }
+            } else if (rmw_body_launders_rmw(c, func_sym->func_node->func_decl.body,
+                                             &bad_name, &bad_len)) {
+                /* RMW-LAUNDER sink 3. The scan above skipped this global because
+                 * it is `volatile` and single-word — the flag-idiom exemption,
+                 * which covers a plain load or store. A read-modify-write is
+                 * neither, and Axis A3's carve-out for it matched only a compound
+                 * assign written by NAME, so `bump(&g)` with `bump(*u32 p){*p+=1;}`
+                 * was accepted while `g += 1` in the same target was rejected.
+                 * TSan-confirmed race on exactly this shape. */
+                checker_error(c, node->loc.line,
+                    "spawn target '%.*s' performs a read-modify-write on volatile "
+                    "global '%.*s' through a pointer — the load/modify/store is not "
+                    "atomic, so increments race and are lost. volatile exempts a "
+                    "single-word load or store, not a RMW. Use @atomic_* "
+                    "(@atomic_add(&%.*s, 1)) or a shared struct",
+                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                    (int)bad_len, bad_name, (int)bad_len, bad_name);
             }
         }
         /* D8 (2026-08-01): a concrete function handed to the spawn target as a
@@ -16802,6 +16866,12 @@ static void check_func_body(Checker *c, Node *node) {
          * that next reset consults a stale range. */
         c->var_range_count = 0;
         check_stmt(c, node->func_decl.body);
+        /* RMW-LAUNDER sink 1: the main-code (`from_func`) half. `main(){bump(&g);}`
+         * with `bump(*u32 p){*p += 1;}` is a non-atomic read-modify-write on `g`
+         * from main just as `g += 1` is; the by-name walk cannot see it because
+         * the RMW's target root is a parameter. in_interrupt is false here, so
+         * this records compound_in_func. */
+        rmw_record_launders(c, node->func_decl.body);
         c->after_spawn_in_func = saved_after_spawn;
         c->in_comptime_body = saved_comptime;
         c->in_async = saved_async;
@@ -16927,6 +16997,11 @@ static void check_func_body(Checker *c, Node *node) {
          * the globals lexically inside the ISR body). Runs with in_interrupt
          * still set so track_isr_global tags them from_isr. */
         record_isr_globals(c, node->interrupt.body, 0);
+        /* RMW-LAUNDER sink 2: a compound RMW the ISR performs THROUGH A POINTER
+         * (`bump(&g)` / `*u32 p = &g; *p += 1;`) is the same non-atomic
+         * read-modify-write as `g += 1`, which record_isr_globals only matches
+         * by name. Runs with in_interrupt still set → compound_in_isr. */
+        rmw_record_launders(c, node->interrupt.body);
         pop_scope(c);
         c->in_interrupt = false;
         c->current_func_ret = NULL;
@@ -17483,6 +17558,257 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
     }
+}
+
+/* ---- RMW-LAUNDER implementation (see the design note at the forward decl) ---- */
+
+static void rmw_bind_add(struct RmwCtx *cx, const char *name, uint32_t name_len,
+                         const char *gname, uint32_t gname_len) {
+    if (!name || !gname) return;
+    for (int i = 0; i < cx->bind_count; i++) {           /* dedup exact pairs */
+        if (cx->binds[i].name_len == name_len &&
+            cx->binds[i].gname_len == gname_len &&
+            memcmp(cx->binds[i].name, name, name_len) == 0 &&
+            memcmp(cx->binds[i].gname, gname, gname_len) == 0) return;
+    }
+    if (cx->bind_count >= cx->bind_cap) {
+        int nc = cx->bind_cap * 2; if (nc < 8) nc = 8;
+        cx->binds = realloc(cx->binds, (size_t)nc * sizeof(struct RmwBind));
+        cx->bind_cap = nc;
+    }
+    struct RmwBind *b = &cx->binds[cx->bind_count++];
+    b->name = name; b->name_len = name_len;
+    b->gname = gname; b->gname_len = gname_len;
+}
+
+/* The global `name` may hold the address of, or NULL. May-alias: the FIRST
+ * binding wins for reporting purposes (any one hit is enough to flag). */
+static const struct RmwBind *rmw_bind_find(struct RmwCtx *cx,
+                                           const char *name, uint32_t name_len) {
+    for (int i = 0; i < cx->bind_count; i++) {
+        if (cx->binds[i].name_len == name_len &&
+            memcmp(cx->binds[i].name, name, name_len) == 0) return &cx->binds[i];
+    }
+    return NULL;
+}
+
+/* Which global does expression `e` denote the ADDRESS of?  `&g` directly, or a
+ * name already bound to one. Anything else is unresolvable -> NULL -> no
+ * binding -> no new rejection. */
+static const char *rmw_expr_global(Checker *c, struct RmwCtx *cx, Node *e,
+                                   uint32_t *out_len) {
+    if (!e) return NULL;
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_AMP && e->unary.operand &&
+        e->unary.operand->kind == NODE_IDENT) {
+        Node *id = e->unary.operand;
+        Symbol *gs = scope_lookup(c->global_scope, id->ident.name,
+                                  (uint32_t)id->ident.name_len);
+        if (gs && !gs->is_function) {
+            *out_len = (uint32_t)id->ident.name_len;
+            return id->ident.name;
+        }
+        return NULL;
+    }
+    if (e->kind == NODE_IDENT) {
+        const struct RmwBind *b = rmw_bind_find(cx, e->ident.name,
+                                                (uint32_t)e->ident.name_len);
+        if (b) { *out_len = b->gname_len; return b->gname; }
+    }
+    return NULL;
+}
+
+/* The global that a compound-assign TARGET ultimately writes through, when it
+ * is reached via a pointer rather than named. Returns NULL for the by-name form
+ * (already handled by the three existing sites — reporting it here too would
+ * only duplicate a diagnostic and move its line attribution). */
+static const char *rmw_target_global(Checker *c, struct RmwCtx *cx, Node *target,
+                                     uint32_t *out_len) {
+    Node *r = target;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                 (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else r = r->unary.operand;
+    }
+    if (!r || r->kind != NODE_IDENT) return NULL;
+    if (scope_lookup(c->global_scope, r->ident.name,
+                     (uint32_t)r->ident.name_len)) return NULL;  /* by-name form */
+    const struct RmwBind *b = rmw_bind_find(cx, r->ident.name,
+                                            (uint32_t)r->ident.name_len);
+    if (!b) return NULL;
+    *out_len = b->gname_len;
+    return b->gname;
+}
+
+static void rmw_report(Checker *c, struct RmwCtx *cx,
+                       const char *gname, uint32_t gname_len) {
+    if (!gname) return;
+    if (cx->report) { track_isr_global(c, gname, gname_len, true); return; }
+    if (!cx->hit) { cx->hit = true; cx->out_name = gname; cx->out_len = gname_len; }
+}
+
+/* At a direct call, bind the callee's parameters to the globals its arguments
+ * address, then walk the callee body under those bindings. Descends ONLY when
+ * at least one argument resolves to a global address — without one the callee
+ * can learn nothing new here, and its own by-name accesses are already recorded
+ * when that function is checked in its own right. That prune keeps this linear
+ * in practice. */
+static void rmw_descend_call(Checker *c, Node *call, struct RmwCtx *cx, int depth) {
+    if (!call->call.callee || call->call.callee->kind != NODE_IDENT) return;
+    Symbol *cs = scope_lookup(c->global_scope, call->call.callee->ident.name,
+                              (uint32_t)call->call.callee->ident.name_len);
+    if (!cs || !cs->is_function || !cs->func_node ||
+        cs->func_node->kind != NODE_FUNC_DECL || !cs->func_node->func_decl.body) return;
+    struct RmwCtx sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.fn = cs->func_node;
+    sub.report = cx->report;
+    int np = cs->func_node->func_decl.param_count;
+    for (int i = 0; i < call->call.arg_count && i < np; i++) {
+        uint32_t glen = 0;
+        const char *g = rmw_expr_global(c, cx, call->call.args[i], &glen);
+        if (!g) continue;
+        ParamDecl *p = &cs->func_node->func_decl.params[i];
+        if (!p->name) continue;
+        rmw_bind_add(&sub, p->name, (uint32_t)p->name_len, g, glen);
+    }
+    if (sub.bind_count > 0) {
+        rmw_scan(c, cs->func_node->func_decl.body, &sub, depth + 1);
+        if (!cx->report && sub.hit && !cx->hit) {
+            cx->hit = true; cx->out_name = sub.out_name; cx->out_len = sub.out_len;
+        }
+    }
+    free(sub.binds);
+}
+
+/* Exhaustive — no `default:`, so a new NodeKind is a build error under
+ * -Werror=switch (walker-default discipline). Case coverage mirrors
+ * record_isr_globals. */
+static void rmw_scan(Checker *c, Node *n, struct RmwCtx *cx, int depth) {
+    if (!n || depth > 16) return;
+    if (!cx->report && cx->hit) return;                  /* first hit is enough */
+    switch (n->kind) {
+    case NODE_ASSIGN: {
+        uint32_t glen = 0;
+        if (n->assign.op != TOK_EQ) {
+            const char *g = rmw_target_global(c, cx, n->assign.target, &glen);
+            rmw_report(c, cx, g, glen);
+        } else if (n->assign.target && n->assign.target->kind == NODE_IDENT) {
+            /* `p = &g;` — a later binding of an existing pointer local. */
+            const char *g = rmw_expr_global(c, cx, n->assign.value, &glen);
+            if (g) rmw_bind_add(cx, n->assign.target->ident.name,
+                                (uint32_t)n->assign.target->ident.name_len, g, glen);
+        }
+        rmw_scan(c, n->assign.target, cx, depth);
+        rmw_scan(c, n->assign.value, cx, depth);
+        return;
+    }
+    case NODE_VAR_DECL: {
+        uint32_t glen = 0;
+        const char *g = rmw_expr_global(c, cx, n->var_decl.init, &glen);
+        if (g && n->var_decl.name)
+            rmw_bind_add(cx, n->var_decl.name, (uint32_t)n->var_decl.name_len, g, glen);
+        rmw_scan(c, n->var_decl.init, cx, depth);
+        return;
+    }
+    case NODE_CALL:
+        rmw_scan(c, n->call.callee, cx, depth);
+        for (int i = 0; i < n->call.arg_count; i++) rmw_scan(c, n->call.args[i], cx, depth);
+        rmw_descend_call(c, n, cx, depth);
+        return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) rmw_scan(c, n->block.stmts[i], cx, depth);
+        return;
+    case NODE_IF:
+        rmw_scan(c, n->if_stmt.cond, cx, depth);
+        rmw_scan(c, n->if_stmt.then_body, cx, depth);
+        rmw_scan(c, n->if_stmt.else_body, cx, depth);
+        return;
+    case NODE_FOR:
+        rmw_scan(c, n->for_stmt.init, cx, depth);
+        rmw_scan(c, n->for_stmt.cond, cx, depth);
+        rmw_scan(c, n->for_stmt.step, cx, depth);
+        rmw_scan(c, n->for_stmt.body, cx, depth);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        rmw_scan(c, n->while_stmt.cond, cx, depth);
+        rmw_scan(c, n->while_stmt.body, cx, depth);
+        return;
+    case NODE_SWITCH:
+        rmw_scan(c, n->switch_stmt.expr, cx, depth);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            rmw_scan(c, n->switch_stmt.arms[i].body, cx, depth);
+        return;
+    case NODE_RETURN:    rmw_scan(c, n->ret.expr, cx, depth); return;
+    case NODE_EXPR_STMT: rmw_scan(c, n->expr_stmt.expr, cx, depth); return;
+    case NODE_DEFER:     rmw_scan(c, n->defer.body, cx, depth); return;
+    case NODE_CRITICAL:  rmw_scan(c, n->critical.body, cx, depth); return;
+    case NODE_ONCE:      rmw_scan(c, n->once.body, cx, depth); return;
+    case NODE_BINARY:
+        rmw_scan(c, n->binary.left, cx, depth);
+        rmw_scan(c, n->binary.right, cx, depth);
+        return;
+    case NODE_UNARY: rmw_scan(c, n->unary.operand, cx, depth); return;
+    case NODE_FIELD: rmw_scan(c, n->field.object, cx, depth); return;
+    case NODE_INDEX:
+        rmw_scan(c, n->index_expr.object, cx, depth);
+        rmw_scan(c, n->index_expr.index, cx, depth);
+        return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            rmw_scan(c, n->intrinsic.args[i], cx, depth);
+        return;
+    case NODE_ORELSE:
+        rmw_scan(c, n->orelse.expr, cx, depth);
+        rmw_scan(c, n->orelse.fallback, cx, depth);
+        return;
+    case NODE_TYPECAST: rmw_scan(c, n->typecast.expr, cx, depth); return;
+    case NODE_SLICE:
+        rmw_scan(c, n->slice.object, cx, depth);
+        rmw_scan(c, n->slice.start, cx, depth);
+        rmw_scan(c, n->slice.end, cx, depth);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            rmw_scan(c, n->struct_init.fields[i].value, cx, depth);
+        return;
+    /* leaf / declaration kinds that cannot carry a laundered RMW */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return;
+    }
+}
+
+/* Sink 1+2 (ISR / main): record every laundered RMW in `body` as a compound
+ * access. `c->in_interrupt` selects the from_isr / from_func bucket exactly as
+ * the by-name path does. */
+static void rmw_record_launders(Checker *c, Node *body) {
+    struct RmwCtx cx;
+    memset(&cx, 0, sizeof(cx));
+    cx.report = true;
+    rmw_scan(c, body, &cx, 0);
+    free(cx.binds);
+}
+
+/* Sink 3 (spawn): does `body` launder a non-atomic RMW onto a global? */
+static bool rmw_body_launders_rmw(Checker *c, Node *body,
+                                  const char **out_name, uint32_t *out_len) {
+    struct RmwCtx cx;
+    memset(&cx, 0, sizeof(cx));
+    cx.report = false;
+    rmw_scan(c, body, &cx, 0);
+    free(cx.binds);
+    if (!cx.hit) return false;
+    *out_name = cx.out_name; *out_len = cx.out_len;
+    return true;
 }
 
 /* ISR-TRANS: the ISR global-access safety checks ("accessed from both ISR and

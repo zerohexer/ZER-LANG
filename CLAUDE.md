@@ -288,10 +288,17 @@ blame` the touched lines (a 2026-06-22 design agent left an unnamed
 before relying on it. For pure code-reading/design, the workflow IS efficient (keeps
 file content out of the parent context) — just gate it.
 
-**`zerc -o <path>` gotchas when testing by hand.** (a) `zerc f.zer -o /tmp/out.c`
-(emit-C mode) returns **exit 0 even on checker errors** — useless for negative
-tests; use `-o /tmp/exe` (compile-to-exe) which returns non-zero on error, or just
-rely on `make check`. (b) `zerc f.zer -o /tmp/exe` for a non-`.c` path builds the
+**`zerc -o <path>` gotchas when testing by hand.** (a) **CORRECTED 2026-08-11 — this
+entry used to claim emit-C mode "returns exit 0 even on checker errors". MEASURED
+FALSE:** `zerc f.zer -o /tmp/out.c` returns **1** on a checker error AND on a
+`zercheck:` error, 0 only when clean (verified across both phases). Emit-C mode is
+therefore the RIGHT way to get a negative verdict by hand — and it is what
+limitations.md's MEASURE-FIRST protocol already tells you to use, precisely because
+it isolates the CHECKER verdict from a GCC error that would otherwise mask it. The
+real trap is different and still applies: **a clean run PRINTS a success line**
+(`zerc: in.zer -> out.c`), so non-empty output is not an error — grep for
+`error`/`zercheck:`, and then check it is YOUR rule and not a masking one.
+(b) `zerc f.zer -o /tmp/exe` for a non-`.c` path builds the
 exe **next to the source** (`f`), not at the `-o` path — to run, `cp f.zer /tmp/ &&
 zerc /tmp/f.zer && /tmp/f`, or just trust `make check`.
 
@@ -379,6 +386,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
+| **Non-atomic RMW on a global ("is this access a plain load/store, or a read-modify-write?")** — the OTHER half of the same `volatile` exemption | main-path assign walk (`from_func`), `record_isr_globals` (`from_isr`), spawn scan Axis-A3 arm | ONE walker `rmw_scan` (name -> global-it-addresses may-alias map, extended at each direct call) + the **SITE x LAUNDER x ACCESS grid** in `tests/test_hw_matrix.c`. All three sites matched only a compound assign naming a global, so ANY pointer indirection was accepted at BOTH sinks (BUG-785, TSan-confirmed). `-Wswitch` on `VLaunder` forces a new launder form into every cell |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |

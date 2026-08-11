@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: compound assignment
+// RMW-LAUNDER, ISR sink, n-hop: the pointer is forwarded through an
+// intermediate function before the RMW. Binding the callee's parameter at each
+// direct call makes the depth irrelevant.
+volatile u32 counter;
+
+void inner(volatile *u32 p) { *p += 1; }
+void mid(volatile *u32 p) { inner(p); }
+
+interrupt TIM2 { mid(&counter); }
+
+u32 main() { u32 x = counter; return x & 1; }

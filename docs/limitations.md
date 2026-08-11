@@ -526,12 +526,34 @@ architecture). The enabling step is `&n` on a local that holds a tracked allocat
    argument-precise barrier principle and widen `n` to MAYBE_FREED on any free through an
    unresolved deref. Touches the CFG fixpoint; measure over-rejection first.
 
-### MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter
+### ~~MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter~~ — **CLOSED 2026-08-11 (BUG-785), and it was BIGGER than recorded**
 
-Sibling of BUG-774: the ISR compound-RMW check is intra-body, so `interrupt { rmw(&g); }`
-with `void rmw(*u32 p) { p[0] += 1; }` is unchecked. The transitive machinery from BUG-774
-(`record_isr_globals` following calls) exists; what is missing is propagating the
-*compound-assign* fact through a pointer PARAM rather than a global name.
+Reproduced, then **enumerated before fixing** — which is what turned a MEDIUM one-sink note
+into a 6-form, 2-sink accept-unsafe class:
+
+| form | ISR sink | spawn sink |
+|---|---|---|
+| `g += 1` by name | caught | caught |
+| `*u32 p = &g; *p += 1` (in-body alias) | **accepted** | **accepted** |
+| `bump(&g)`, `bump(*u32 p){*p+=1;}` (1 hop) | **accepted** | **accepted** |
+| `mid(&g) -> inner(p)` (n hop) | **accepted** | **accepted** |
+
+The **spawn facet was never recorded** and is the more severe one: it is a plain hosted data
+race, **TSan-confirmed** on the emitted C. The main-code (`from_func`) half was live too, so
+the question had THREE blind implementations, not one.
+
+Closed by resolving the launder rather than adding a fourth name matcher — one exhaustive
+walker carrying a *name -> global it addresses* may-alias map, extended at each direct call by
+binding the callee's parameter. Only ever adds bindings, so it can introduce no new rejection.
+Gated by the `SITE x LAUNDER x ACCESS` grid in `tests/test_hw_matrix.c` (verified firing
+28/34 -> 34/34). Full detail: BUGS-FIXED.md 2026-08-11b.
+
+**The durable lesson (third hole from the same exemption).** `volatile`'s exemption has now
+produced three: the WIDTH at the spawn site (2026-08-03), its ISR sibling (missed, same day),
+and now the ACCESS KIND at both. Every time, the code expressed the exemption as a syntactic
+pattern while its comment expressed it as a property ("a single-word plain load or store").
+When you touch this exemption, check both qualifiers in that sentence — *single-word* AND
+*plain load or store* — at **both** sites.
 
 ### MEDIUM (POLICY, not a bug) — `&packed_field` forms a misaligned `*T`
 

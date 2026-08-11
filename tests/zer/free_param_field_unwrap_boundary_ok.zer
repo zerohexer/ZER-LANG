@@ -1,0 +1,30 @@
+// The over-rejection boundary for BUG-786. Registering `param.field` as a
+// tracked compound must not turn ordinary callees into leaks or double frees.
+//
+//  1. read-only callee: unwraps the field, reads through it, frees nothing
+//  2. ownership handed over: callee frees, caller does NOT free again
+//  3. SCALAR field unwrap: must NOT alias (the pointer-vs-scalar rule — peeling
+//     scalars is what broke test_modules/move_user, twice)
+struct B { u32 x; }
+struct H { [*]B buckets; u32 n; }
+
+u32 read_only(H h) { [*]B l = h.buckets; return l[0].x; }   /* 1 */
+void takes_over(H h) { [*]B l = h.buckets; free(l); }        /* 2 */
+u32 scalar_only(H h) { u32 v = h.n; return v; }              /* 3 */
+
+u32 main() {
+    H h1;
+    h1.buckets = alloc(B, 4) orelse { return 1; };
+    h1.n = 7;
+    u32 a = read_only(h1);
+    u32 c = scalar_only(h1);
+    free(h1.buckets);                 /* the ONLY free of h1 — no double free */
+
+    H h2;
+    h2.buckets = alloc(B, 4) orelse { return 1; };
+    h2.n = 0;
+    takes_over(h2);                   /* callee owns it now — no leak, no 2nd free */
+
+    if (a == 0 && c == 7) { return 0; }
+    return 0;
+}

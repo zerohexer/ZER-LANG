@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-11c — BUG-786: unwrapping a param's pointer field into a local erased the free link (double free AND a false leak, from one missing edge)
+
+**The hole.** A callee that frees a pointer-carrying FIELD of a struct parameter is recorded
+in the FuncSummary, and the caller's second free is caught — *unless the callee reads the
+field into a local first*:
+
+```zer
+void fb(H h) { [*]B local = h.buckets; free(local); }   // ACCEPTED
+... fb(h); free(h.buckets);                             // glibc double-free abort
+```
+
+Measured: compiles clean, then aborts at runtime with *"free(): double free detected in
+tcache 2"*. Three variants were live — by-value struct param, by-POINTER struct param, and a
+single `*T` field instead of a slice field. All three verified ACCEPTED on a pre-fix build.
+Tracked in limitations.md as *"frees-param-field via UNWRAP-TO-LOCAL … that earlier closure is
+therefore incomplete"*; this is the closure.
+
+**Root cause — one missing edge, not a missing rule.** `IR_FIELD_READ` aliases the destination
+to the field's tracked compound handle, but resolves it with `ir_find_compound_handle`, which
+only matches a key some EARLIER instruction registered. Inside `fb`, `h` is a PARAMETER: the
+allocation happened in the caller, so nothing ever registered `h.buckets` and the lookup
+returned NULL. No alias was built, so `free(local)` marked only `local`, and the summary's
+field scan — which looks for a FREED compound rooted at the param — found nothing. Writing
+`free(h.buckets)` directly works because the FREE path registers the compound on demand; only
+the hop through a local was missing.
+
+**Fix.** Register the compound handle for `param.field` at the field read, before the free, so
+`free(local)` has something to propagate into. Gated to a pointer-CARRYING field
+(`type_dispatch_kind` in {POINTER, SLICE, OPAQUE}) per the CLAUDE.md pointer-vs-scalar rule —
+peeling scalar field reads is what broke `test_modules/move_user` twice. Marked `escaped`
+because the allocation is the caller's; without that, every callee that merely reads a pointer
+field out of a struct parameter would be flagged as leaking it.
+
+**It closes an OVER-rejection at the same time**, which is the tell that the edge was genuinely
+missing rather than a rule being absent: handing ownership to the callee
+(`takes_over(h2)`, no second free) was previously reported as *"handle %9 (local 'h2') …
+never freed"*, because the caller's field was never marked freed either. One missing edge, two
+opposite symptoms — accept-unsafe in one direction, false-positive in the other.
+
+**Debugging note worth keeping.** The first attempt patched the arm directly above the right
+one and silently did nothing. A one-line `getenv` trace showed the hook WAS reached but with
+`fplen == 0` — that arm keys the field's OBJECT (`h`), not the field (`h.buckets`). CLAUDE.md
+already prescribes exactly this ("when a fix silently does nothing, print whether it runs
+before theorising about why it doesn't"); it took one minute and would have cost a cycle of
+reasoning otherwise.
+
+**Known residual (pre-existing, NOT introduced).** `frees_param_field[]` is one bool per
+PARAM, not per FIELD, so freeing field `a` in the callee and field `b` in the caller is
+falsely flagged. Verified this is inherited: the DIRECT form (`free(h.a)` in the callee) was
+already rejected the same way on a pre-fix build, and the unwrap form was already rejected as
+a false leak. Only the diagnostic's wording changes. Same `alloc_id` fate-sharing family as
+BUG-741; needs a per-field summary to fix.
+
+`make check` exit 0, 1208 passing, zero regressions, six gates green, sink matrix clean.
+Tests: `tests/zer_fail/free_param_field_unwrap_{byvalue,byptr,ptrfield}.zer` (all three
+verified ACCEPTED pre-fix) + `tests/zer/free_param_field_unwrap_boundary_ok.zer`
+(read-only callee / ownership handover / scalar-field unwrap — verified REJECTED pre-fix,
+compiles and exits 0 now).
+
 ## Session 2026-08-11b — BUG-785: a non-atomic RMW laundered through a pointer evaded the volatile exemption at BOTH sinks
 
 **Six accepted forms, two sinks, one question.** "Does this ISR/spawn-reachable code perform a

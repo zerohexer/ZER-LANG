@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-786 (2026-08-11). A callee frees a POINTER-CARRYING FIELD of a struct
+// parameter, but reads the field into a LOCAL first. Freeing `h.buckets`
+// directly IS recorded in the FuncSummary and the caller's second free is
+// caught; unwrapping into a local erased the link, because the summary's field
+// scan looks for a FREED compound rooted at the param and nothing in the callee
+// ever registered `h.buckets` as tracked (it is a PARAMETER — the allocation
+// happened in the caller).
+//
+// Measured before the fix: compiles clean, then aborts at runtime with
+// "free(): double free detected in tcache 2".
+struct B { u32 x; }
+struct H { [*]B buckets; }
+
+void fb(H h) { [*]B local = h.buckets; free(local); }
+
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 0; };
+    fb(h);
+    free(h.buckets);          // the analyzer thought THIS was the first free
+    return 0;
+}

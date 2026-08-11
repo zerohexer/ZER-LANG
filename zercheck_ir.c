@@ -3340,6 +3340,36 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     IRHandleInfo *fh = (fplen == 0)
                         ? ir_find_handle(ps, froot)
                         : ir_find_compound_handle(ps, froot, fpath, fplen);
+                    /* 2026-08-11 (BUG-786): the field's owner may be a PARAMETER,
+                     * in which case nothing in THIS function ever registered
+                     * `param.field`, so `fh` is NULL and no alias is built. That
+                     * is what made the cross-function double-free below compile:
+                     *
+                     *     void fb(H h) { [*]B l = h.buckets; free(l); }
+                     *     ... fb(h); free(h.buckets);      // second free
+                     *
+                     * `free(h.buckets)` written directly in `fb` IS recorded (the
+                     * free path registers the compound on demand) and the caller
+                     * is warned; unwrapping the field into a local first erased
+                     * the link, because the summary's field scan looks for a FREED
+                     * compound rooted at the param and there was none.
+                     *
+                     * Register it here so the alias exists BEFORE the free, giving
+                     * `free(l)` something to propagate into. Only for a
+                     * pointer/slice/opaque field of a PARAM (the gate above
+                     * already restricted the field type), and marked `escaped`
+                     * because the allocation is the CALLER's — without that the
+                     * exit-time leak check would flag every read-only callee that
+                     * merely looks at a pointer field. */
+                    if (!fh && fplen > 0 && froot >= 0 && froot < func->local_count &&
+                        func->locals[froot].is_param) {
+                        fh = ir_add_compound_handle(ps, froot, fpath, fplen);
+                        if (fh) {
+                            fh->state = IR_HS_ALIVE;
+                            fh->alloc_id = _ir_next_alloc_id++;
+                            fh->escaped = true;   /* caller-owned — never a leak here */
+                        }
+                    }
                     if (fh && fh->alloc_id != 0) {
                         IRAliasSnapshot fsnap;
                         ir_snapshot_alias(&fsnap, fh);
@@ -3411,6 +3441,43 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 src_path_len > 0) {
                 IRHandleInfo *src_h = ir_find_compound_handle(ps, src_root,
                     src_path, src_path_len);
+                /* 2026-08-11 (BUG-786): the field's owner may be a PARAMETER, so
+                 * nothing in THIS function ever registered `param.field` and
+                 * `src_h` is NULL — no alias is built, and the cross-function
+                 * double-free below compiled clean:
+                 *
+                 *     void fb(H h) { [*]B l = h.buckets; free(l); }
+                 *     ... fb(h); free(h.buckets);        // glibc double-free abort
+                 *
+                 * `free(h.buckets)` written DIRECTLY in `fb` is recorded (the free
+                 * path registers the compound on demand) and the caller is warned;
+                 * unwrapping the field into a local first erased the link, because
+                 * the FuncSummary field scan looks for a FREED compound rooted at
+                 * the param and there was none. Register the compound HERE, before
+                 * the free, so `free(l)` has something to propagate into.
+                 *
+                 * Gated to a POINTER-CARRYING field (`type_dispatch_kind` in
+                 * {POINTER, SLICE, OPAQUE}) — the CLAUDE.md pointer-vs-scalar rule:
+                 * reading a pointer field yields a reference and must alias;
+                 * reading a SCALAR field yields a value and must not (peeling
+                 * scalars is what broke test_modules/move_user, twice).
+                 *
+                 * `escaped` because the allocation is the CALLER's: without it the
+                 * exit-time leak check would flag every callee that merely reads a
+                 * pointer field out of a struct parameter. */
+                if (!src_h && src_root >= 0 && src_root < func->local_count &&
+                    func->locals[src_root].is_param) {
+                    Type *sft = checker_get_type(zc->checker, inst->expr);
+                    TypeKind sfk = sft ? type_dispatch_kind(sft) : TYPE_VOID;
+                    if (sfk == TYPE_POINTER || sfk == TYPE_SLICE || sfk == TYPE_OPAQUE) {
+                        src_h = ir_add_compound_handle(ps, src_root, src_path, src_path_len);
+                        if (src_h) {
+                            src_h->state = IR_HS_ALIVE;
+                            src_h->alloc_id = _ir_next_alloc_id++;
+                            src_h->escaped = true;   /* caller-owned — never a leak here */
+                        }
+                    }
+                }
                 if (src_h && src_h->alloc_id != 0) {
                     IRAliasSnapshot snap;
                     ir_snapshot_alias(&snap, src_h);

@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-786 sibling: the struct arrives BY POINTER rather than by value. Same
+// erased link, same double free.
+struct B { u32 x; }
+struct H { [*]B buckets; }
+
+void fb(*H h) { [*]B local = h.buckets; free(local); }
+
+u32 main() {
+    H h;
+    h.buckets = alloc(B, 4) orelse { return 0; };
+    fb(&h);
+    free(h.buckets);
+    return 0;
+}

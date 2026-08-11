@@ -569,8 +569,18 @@ are explicit at the use site), so it is a qualifier-propagation gap, not a silen
 
 ### Cross-references (tracked elsewhere, do NOT duplicate)
 
-- **frees-param-field via UNWRAP-TO-LOCAL** (`2hg2v4`) — extends the frees-param-field entry
-  marked "CLOSED 2026-08-08"; **that closure is INCOMPLETE.** Re-probe before trusting it.
+- ~~**frees-param-field via UNWRAP-TO-LOCAL**~~ (`2hg2v4`) — **CLOSED 2026-08-11 (BUG-786).**
+  Re-probed live and reproduced (runtime glibc double-free abort), in THREE variants the entry
+  did not record: by-value struct param, by-POINTER struct param, and a single `*T` field
+  rather than a slice field. Cause was one missing edge, not a missing rule: `IR_FIELD_READ`
+  resolves the field's handle with `ir_find_compound_handle`, which only matches a key an
+  EARLIER instruction registered — and inside the callee the struct is a PARAMETER, so
+  `param.field` was never registered. Registering it at the field read (gated to a
+  pointer-carrying field, marked `escaped` as caller-owned) also **removed an over-rejection**:
+  handing ownership to the callee was previously a false "never freed" leak. Residual, pre-existing:
+  `frees_param_field[]` is one bool per PARAM not per FIELD, so freeing field `a` in the callee
+  and field `b` in the caller is falsely flagged — verified inherited (the DIRECT form was
+  already rejected the same way pre-fix). Same `alloc_id` fate-sharing family as BUG-741.
 - **comptime / const integer fold ignores per-operation width wrapping** (`2hg2v4`) —
   value-correctness, explicitly probed and found NOT a safety hole (checker and emitter read
   the same folded value). Deferred: the fix threads a destination width through the const

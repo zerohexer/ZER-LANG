@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-786 sibling: a single `*T` field rather than a slice field. Pins that the
+// gate is "pointer-CARRYING field", not "slice field".
+struct B { u32 x; }
+struct H { *B p; }
+
+void fb(H h) { *B local = h.p; free(local); }
+
+u32 main() {
+    H h;
+    h.p = alloc(B) orelse { return 0; };
+    fb(h);
+    free(h.p);
+    return 0;
+}

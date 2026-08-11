@@ -7,8 +7,37 @@
  *
  * Phase 7 of IR implementation. See docs/IR_Implementation.md Part 6.
  *
- * Status: FOUNDATION — core range tracking framework. Does NOT yet
- * replace the AST VRP. Both coexist during migration.
+ * ============================================================
+ * STATUS: DEAD CODE. THIS FILE IS NOT COMPILED. (measured 2026-08-11)
+ * ============================================================
+ * The previous banner said "Does NOT yet replace the AST VRP. Both coexist
+ * during migration." That was misleading in the direction that matters: it
+ * reads as though this analysis is RUNNING alongside the AST one. It is not
+ * running at all.
+ *
+ *   grep -c vrp_ir Makefile      -> 0    (no build rule, no link)
+ *   grep -rn 'vrp_ir(' *.c *.h   -> 0    (no callers anywhere)
+ *   nm zerc | grep -c vrp_ir     -> 0    (no symbol in the binary)
+ *
+ * It DOES still compile cleanly (`gcc -Wall -Wextra -Werror=switch -c
+ * vrp_ir.c`), so it has not bit-rotted — but note that BOTH of its decision
+ * predicates, `ir_range_proves_safe` and `ir_range_proves_nonzero`, are
+ * `-Wunused-function` even within this file. The range LATTICE was built; the
+ * half that answers "may I elide this bounds check?" was never wired to
+ * anything. Wiring is more than adding a Makefile line.
+ *
+ * WHY IT MATTERS. All load-bearing bounds/division VRP is the FLAT, AST-based
+ * pass in checker.c. The known VRP scope-leak class (a branch-local narrowing
+ * surviving a control-flow join -> an elided bounds check -> silent OOB) is a
+ * direct consequence: the sound CFG version is this file, and this file is not
+ * built. Every VRP-JOIN fix to date has been a per-node-kind snapshot/restore
+ * bolted onto the flat pass instead.
+ *
+ * DO NOT DELETE. This is Phase 0 of the locked plan in
+ * docs/unified-oracle-proved-ZER.md; the oracle that specifies it is
+ * proofs/operational/lambda_zer_bounds/bounds_lattice.v (`elide_on_join_sound`).
+ * Either wire it per that plan, or delete it deliberately — but do not leave a
+ * banner implying live coverage.
  */
 
 #include "ir.h"

@@ -390,6 +390,45 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — audit sweep 2026-08-11: 3 holes found + fixed; these areas probed CLEAN
+
+Recorded so a fresh session does not re-run the clean probes blind. The three defects this
+sweep DID find (BUG-785 RMW-launder, BUG-786 field-unwrap free link, BUG-787 defer-close)
+have their own entries / BUGS-FIXED sections.
+
+### Probed CLEAN — do not re-probe without a new reason
+
+- **Division-by-zero guard vs laundering.** All five forms reject with a precise diagnostic:
+  literal-zero local, pointer PARAM (`a / b`), struct FIELD (`s.d`), pointer DEREF (`*p`),
+  array element (`a[0]`). The rule is prove-or-reject, which is why laundering cannot defeat
+  it — the opposite structure to the volatile exemption that produced BUG-785.
+- **VRP bounds guard vs a pointer-laundered index widening.** `i = 0; *p = &i; *p = 99;
+  a[i]` and the `widen(&i)` helper form both still emit the guard — the `&`-taken widening
+  (B7) covers them. Verified by counting `_zer_bounds_check` in the emitted C, not by the
+  exit code.
+- **uN/iN WIDTH WRAP across 10 further emission forms** beyond the ones
+  `tests/zer/uN_width_wrap_all_forms.zer` already pins: struct-field store, local array
+  element, GLOBAL array element, optional wrap, orelse fallback position, condition position,
+  struct designated initializer, and shift-into-{struct-field, array-element,
+  designated-init}. All wrap correctly (a run-and-check probe, one distinct exit code per
+  form). The G3/H3 family looks closed.
+- **The wrapper/carrier family at the concurrency sinks.** `distinct typedef` over a volatile
+  global, a volatile ARRAY global, and a volatile STRUCT-FIELD global are each caught at the
+  ISR sink; a `distinct` volatile global is caught at the spawn sink, including through the
+  new RMW-launder path.
+
+### Doc/impl mismatch CORRECTED — `zerc -o out.c` exit code
+
+CLAUDE.md's "zerc -o gotchas" claimed emit-C mode *"returns exit 0 even on checker errors —
+useless for negative tests"*. **Measured FALSE:** it returns **1** on a checker error AND on a
+`zercheck:` error, 0 only when clean (verified across both phases). The claim also contradicted
+this file's own MEASURE-FIRST protocol, which tells you to use `-o out.c` precisely to isolate
+the checker verdict from a masking GCC error. Corrected in CLAUDE.md. The real trap, which
+does still apply, is that a CLEAN run prints a success line (`zerc: in.zer -> out.c`), so
+non-empty output is not evidence of an error.
+
+---
+
 ## OPEN — concurrency sweep 2026-08-10: NO holes found; two doc/impl mismatches corrected
 
 Systematic probe of the concurrency surface after BUG-783. **No accept-unsafe hole found.**
@@ -1248,10 +1287,16 @@ Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to
     `.has_value` / null-sentinel emission. Hence a linter that forces a per-site choice, not a rewrite.
   - Residual: the 33 baselined rows are "known, untriaged" — Gate B answers whether each handles every
     wrapper. Prefer converting a row to a predicate and DELETING it over leaving it frozen.
-- **`vrp_ir.c` is fully dead code** (`rvek5f` `00f3c2af`) — already noted here; rvek5f re-confirms `vrp_ir()`
-  / `IRVRPResult` have ZERO callers and are not in the Makefile, while all load-bearing bounds/division VRP
-  is the AST VRP in checker.c. Either wire it (the tracked "wire the orphaned vrp_ir.c" direction) or delete
-  it to stop implying live coverage.
+- **`vrp_ir.c` is fully dead code** (`rvek5f` `00f3c2af`) — **re-measured 2026-08-11 and still true**:
+  `grep -c vrp_ir Makefile` = 0, zero callers in any `.c`/`.h`, zero symbols in the built `zerc`.
+  Two NEW measured facts for whoever picks up Phase 0: (a) it still COMPILES cleanly under the
+  project's `-Wall -Wextra -Werror=switch`, so it has not bit-rotted; (b) but BOTH of its decision
+  predicates — `ir_range_proves_safe` and `ir_range_proves_nonzero` — are `-Wunused-function`
+  *within the file itself*. The range LATTICE was built; the half that answers "may I elide this
+  bounds check?" was never wired to anything, so **wiring it is more than adding a Makefile line**.
+  The file's own banner used to say "Both coexist during migration", which reads as live coverage;
+  it now states the measured status. Either wire it per `docs/unified-oracle-proved-ZER.md` Phase 0
+  (oracle: `lambda_zer_bounds/bounds_lattice.v` `elide_on_join_sound`) or delete it deliberately.
 
 ---
 

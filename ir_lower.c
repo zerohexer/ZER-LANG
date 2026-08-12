@@ -1312,84 +1312,15 @@ static Node *find_shared_root_expr(Checker *c, Node *expr);
 static Node *find_orelse(Node *expr); /* B1: defined below, used by the lock emitter */
 
 static Node *find_shared_root_expr(Checker *c, Node *expr) {
-    if (!expr) return NULL;
-    if (expr->kind == NODE_FIELD) {
-        /* AUDIT-2026-06-28: at each FIELD/INDEX/deref step, check if the
-         * CURRENT object's type is `shared struct` or `*shared struct`. The
-         * old walker descended all the way to NODE_IDENT and only checked the
-         * innermost ident; `w.sp.v` where `w.sp` is `*shared S` was silently
-         * missed, emitting `w.sp->v = X` with no mutex_lock — a real
-         * data race. Return the OUTERMOST shared sub-expression so the
-         * emitter locks the right struct (the pointed-to S, via `w.sp`). */
-        Node *cur = expr;
-        while (cur) {
-            Node *next;
-            if (cur->kind == NODE_FIELD) next = cur->field.object;
-            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
-            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
-            else break;
-            Type *nt = checker_get_type(c, next);
-            if (nt) {
-                Type *eff = type_unwrap_distinct(nt);
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return next;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        return next;
-                }
-            }
-            cur = next;
-        }
-    }
-    /* Recurse into sub-expressions */
-    Node *found = NULL;
-    if (expr->kind == NODE_BINARY) {
-        found = find_shared_root_expr(c, expr->binary.left);
-        if (!found) found = find_shared_root_expr(c, expr->binary.right);
-    } else if (expr->kind == NODE_ASSIGN) {
-        found = find_shared_root_expr(c, expr->assign.target);
-        if (!found) found = find_shared_root_expr(c, expr->assign.value);
-    } else if (expr->kind == NODE_CALL) {
-        for (int i = 0; i < expr->call.arg_count && !found; i++)
-            found = find_shared_root_expr(c, expr->call.args[i]);
-    } else if (expr->kind == NODE_UNARY) {
-        found = find_shared_root_expr(c, expr->unary.operand);
-    } else if (expr->kind == NODE_INDEX) {
-        found = find_shared_root_expr(c, expr->index_expr.object);
-        if (!found) found = find_shared_root_expr(c, expr->index_expr.index);
-    } else if (expr->kind == NODE_ORELSE) {
-        found = find_shared_root_expr(c, expr->orelse.expr);
-        if (!found) found = find_shared_root_expr(c, expr->orelse.fallback);
-    } else if (expr->kind == NODE_TYPECAST) {
-        found = find_shared_root_expr(c, expr->typecast.expr);
-    } else if (expr->kind == NODE_SLICE) {
-        /* Slices: `shared.buf[a..b]` — recurse into object + bounds. */
-        found = find_shared_root_expr(c, expr->slice.object);
-        if (!found && expr->slice.start)
-            found = find_shared_root_expr(c, expr->slice.start);
-        if (!found && expr->slice.end)
-            found = find_shared_root_expr(c, expr->slice.end);
-    } else if (expr->kind == NODE_INTRINSIC) {
-        /* Intrinsic args may touch shared roots:
-         * `@inttoptr(*u32, shared.addr)`, `@cast(T, shared.field)`.
-         * EXCEPT condvar/barrier/once intrinsics which acquire/release the
-         * mutex internally — wrapping them with an outer lock deadlocks. */
-        const char *nm = expr->intrinsic.name;
-        size_t nlen = expr->intrinsic.name_len;
-        bool intrinsic_handles_own_lock =
-            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
-            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
-            (nlen == 4 && memcmp(nm, "once", 4) == 0);
-        if (!intrinsic_handles_own_lock) {
-            for (int i = 0; i < expr->intrinsic.arg_count && !found; i++)
-                found = find_shared_root_expr(c, expr->intrinsic.args[i]);
-        }
-    } else if (expr->kind == NODE_STRUCT_INIT) {
-        /* Struct init field values: `Wrapper { .field = shared.x }`. */
-        for (int i = 0; i < expr->struct_init.field_count && !found; i++)
-            found = find_shared_root_expr(c, expr->struct_init.fields[i].value);
-    }
-    return found;
+    /* BUG-789 (2026-08-12): delegated to the ONE unified shared-chain walk in
+     * checker.c. This used to be a hand-rolled if/else recursion — one of FIVE
+     * with identical intent that had drifted apart. Every one of them omitted
+     * the CALL CALLEE position, so `g.cb()` (a funcptr FIELD of a shared struct)
+     * read `cb` out of `g` with NO lock while `g.cb = f` locked correctly:
+     * a silent unsynchronized read. The unified walker is a no-`default:`
+     * switch over NodeKind, so a new node kind is now a build failure rather
+     * than a silently unlocked access. */
+    return checker_find_shared_root(c, expr);
 }
 
 /* B1 (2026-06-21): collect ALL distinct shared(rw) roots in an expr (dedup by
@@ -1398,105 +1329,13 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
  * multi-shared-TYPE deadlock check already rejects the multi-WRITE case, so any
  * statement that reaches here with >1 root is all-reads. Uses if/else (not a
  * switch) to avoid the walker-default audit. */
-static void add_shared_root_unique(Node *root, Node **out, int *count, int max) {
-    if (!root || *count >= max) return;
-    for (int i = 0; i < *count; i++) {
-        if (out[i] == root) return;
-        if (out[i]->kind == NODE_IDENT && root->kind == NODE_IDENT &&
-            out[i]->ident.name_len == root->ident.name_len &&
-            memcmp(out[i]->ident.name, root->ident.name,
-                   root->ident.name_len) == 0)
-            return;
-    }
-    out[(*count)++] = root;
-}
-
+/* BUG-789 (2026-08-12): both the dedup helper and the multi-root walk are now
+ * the unified query in checker.c. Read locks compose, so a statement reading
+ * several shared structs locks each; the dedup (by node identity and root ident
+ * name) moved with it. */
 static void find_all_shared_roots_expr(Checker *c, Node *expr,
                                        Node **out, int *count, int max) {
-    if (!expr || *count >= max) return;
-    if (expr->kind == NODE_FIELD) {
-        /* §E #27 C-F4: check the OBJECT's type at EACH projection step, not just
-         * the innermost ident — mirrors the primary lock emitter
-         * find_shared_root_expr. `wa.sp.v` where `wa.sp` is `*shared S` was
-         * silently missed (the root walked to plain `wa`), so a second
-         * `*shared S` field read in a multi-root statement emitted with NO lock
-         * (race). Add the OUTERMOST shared sub-expression as the lock root. */
-        Node *cur = expr;
-        Node *shared_sub = NULL;
-        while (cur) {
-            Node *next;
-            if (cur->kind == NODE_FIELD) next = cur->field.object;
-            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
-            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
-            else break;
-            Type *nt = checker_get_type(c, next);
-            if (nt) {
-                Type *eff = type_unwrap_distinct(nt);
-                if (eff->kind == TYPE_STRUCT &&
-                    (eff->struct_type.is_shared || eff->struct_type.is_shared_rw)) {
-                    shared_sub = next; break;
-                }
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT &&
-                        (inner->struct_type.is_shared || inner->struct_type.is_shared_rw)) {
-                        shared_sub = next; break;
-                    }
-                }
-            }
-            cur = next;
-        }
-        if (shared_sub)
-            add_shared_root_unique(shared_sub, out, count, max);
-    }
-    if (expr->kind == NODE_BINARY) {
-        find_all_shared_roots_expr(c, expr->binary.left, out, count, max);
-        find_all_shared_roots_expr(c, expr->binary.right, out, count, max);
-    } else if (expr->kind == NODE_ASSIGN) {
-        find_all_shared_roots_expr(c, expr->assign.target, out, count, max);
-        find_all_shared_roots_expr(c, expr->assign.value, out, count, max);
-    } else if (expr->kind == NODE_CALL) {
-        for (int i = 0; i < expr->call.arg_count; i++)
-            find_all_shared_roots_expr(c, expr->call.args[i], out, count, max);
-    } else if (expr->kind == NODE_UNARY) {
-        find_all_shared_roots_expr(c, expr->unary.operand, out, count, max);
-    } else if (expr->kind == NODE_INDEX) {
-        find_all_shared_roots_expr(c, expr->index_expr.object, out, count, max);
-        find_all_shared_roots_expr(c, expr->index_expr.index, out, count, max);
-    } else if (expr->kind == NODE_TYPECAST) {
-        find_all_shared_roots_expr(c, expr->typecast.expr, out, count, max);
-    } else if (expr->kind == NODE_SLICE) {
-        find_all_shared_roots_expr(c, expr->slice.object, out, count, max);
-        if (expr->slice.start)
-            find_all_shared_roots_expr(c, expr->slice.start, out, count, max);
-        if (expr->slice.end)
-            find_all_shared_roots_expr(c, expr->slice.end, out, count, max);
-    } else if (expr->kind == NODE_INTRINSIC) {
-        /* §E #27 B1: the secondary-lock walker must recurse intrinsic args
-         * (`@truncate(u32, gb.v)`) like the primary find_shared_root_expr does.
-         * Without this, `ga.v + @truncate(u32, gb.v)` (both shared(rw) reads, so
-         * the deadlock check passes) emits only ga's rdlock; gb.v reads unlocked
-         * → silent race. condvar/barrier/once intrinsics self-lock; don't wrap. */
-        const char *nm = expr->intrinsic.name;
-        size_t nlen = expr->intrinsic.name_len;
-        bool intrinsic_handles_own_lock =
-            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
-            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
-            (nlen == 4 && memcmp(nm, "once", 4) == 0);
-        if (!intrinsic_handles_own_lock) {
-            for (int i = 0; i < expr->intrinsic.arg_count; i++)
-                find_all_shared_roots_expr(c, expr->intrinsic.args[i], out, count, max);
-        }
-    } else if (expr->kind == NODE_ORELSE) {
-        /* §E #27 B1: an orelse fallback reading another shared struct
-         * (`maybe_v() orelse gb.v`) needs gb locked too. */
-        find_all_shared_roots_expr(c, expr->orelse.expr, out, count, max);
-        find_all_shared_roots_expr(c, expr->orelse.fallback, out, count, max);
-    } else if (expr->kind == NODE_STRUCT_INIT) {
-        /* §E #27 B1: `Pair p = { .a = ga.v, .b = gb.v }` needs both locks. */
-        for (int i = 0; i < expr->struct_init.field_count; i++)
-            find_all_shared_roots_expr(c, expr->struct_init.fields[i].value, out, count, max);
-    }
+    checker_collect_shared_roots(c, expr, out, count, max);
 }
 
 /* The shared-root-bearing expression of a simple statement (EXPR_STMT / VAR_DECL

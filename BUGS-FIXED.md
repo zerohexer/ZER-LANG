@@ -5,6 +5,145 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-12 — audit sweep: 5 accept-unsafe holes + one 5-way walker unification (BUG-785..789)
+
+Systematic audit (emitter dual-path parity, bare-metal/ISR/MMIO, memory-safety sink x shape
+matrix, docs). Every finding below was **measured on main before being fixed** and every
+regression test was **verified to fail pre-fix**. Full open-but-unfixed findings are in
+`docs/limitations.md`.
+
+### BUG-785 — a C-style cast launders a stack pointer past EVERY escape sink (CRITICAL)
+
+`g_p = (*u32)p;` was **ACCEPTED** while the identical `g_p = p;` was rejected. ASan:
+stack-use-after-return. `(*u32)p` is an IDENTITY cast the emitter ELIDES entirely — it does
+not even appear in the emitted C — yet it defeated: store-to-global, struct-field-of-global,
+return, return-of-field, keep call site, **keep INFERENCE**, Ring.push, `@container` chains,
+arena, threadlocal, defer body, and call-result launder.
+
+**Root cause and why it is the familiar shape.** `unwrap_ptr_launder` (checker.c) peels
+`@ptrcast/@pun/@bitcast/@cast/@container/@cstr` — every launder that existed when it was
+written. C-style casts were added to the language LATER and no one revisited the peel list.
+The SPAWN sink survived only because `spawn_arg_is_stack_derived` peels `NODE_TYPECAST` by
+hand: one sink had the knowledge and the shared helper did not, which is exactly the
+mirrored-sink drift this project keeps paying for. **The peel now lives in
+`unwrap_ptr_launder` once**, plus at the entry of `arg_is_local_derived` (which does its own
+shape matching and so needs its own peel).
+
+**A SIXTH sink was found by the GRID, not by the report.** Adding sink-matrix shape `p15`
+(launder wrappers x 6 sinks + 3 boundary cells) surfaced `keepfn((*u32)p)` — the keep CALL
+SITE — still accepting a frame-local pointer after the other five were closed: its
+local-derived collection starts from the RAW argument and descended only SLICE/FIELD/INDEX,
+so the ident was never reached. That is the entire argument for writing the grid before
+declaring a class closed. `tools/sink_matrix.sh` is now 66 cells (was 54) and CLEAN.
+
+Test: `tests/zer_fail/escape_typecast_launder_global.zer` + sink-matrix shape `p15`.
+
+### BUG-786 — an `orelse` hid a local-derived pointer at the store-to-global sink (HIGH)
+
+Both arms were blind, in different places:
+- **Primary.** `g_p = t orelse &g_dummy;` with `t` a local-derived `?*u32` was ACCEPTED
+  (ASan stack-use-after-return); the sink never looked through an orelse, and
+  `arg_is_local_derived`'s orelse arm inspected only the FALLBACK.
+- **Fallback.** `g_p = mk() orelse &loc.f;` stores a frame-local address on the null path —
+  also ACCEPTED, found by checking the *other* arm rather than stopping at the reported one.
+
+Fixed both at the assignment sink and the primary in `arg_is_local_derived`.
+Tests: `tests/zer_fail/escape_orelse_primary_local.zer`,
+`tests/zer_fail/escape_orelse_fallback_local.zer`.
+
+### BUG-787 — a wrapped free ARGUMENT was silently untracked -> UAF + double-free (CRITICAL)
+
+`free((*N)n)` produced **no tracking key at all**: `ir_extract_compound_key` (zercheck_ir.c)
+accepts only IDENT / FIELD / INDEX-with-literal, so the free was never registered — while the
+emitter still emitted the real `_zer_slab_free_ptr`. The subsequent use-after-free AND a later
+double-free were both accepted. Measured: the program runs, reads the recycled slot, frees
+twice. Same for `@ptrcast` / `@pun` wrappers.
+
+**Only ADDRESS-PRESERVING launders are peeled** (`NODE_TYPECAST`, `@ptrcast`, `@pun`,
+`@bitcast`, `@cast`). `@container` and `@cstr` compute a DIFFERENT address, and an `orelse`
+with a value fallback can yield either operand — keying those to the wrong allocation would be
+worse than not keying at all. An `orelse` whose fallback DIVERGES (return/break/continue) has
+no alternative value, so peeling its primary is exact and is done.
+
+Test: `tests/zer_fail/free_typecast_launder_uaf.zer`.
+
+### BUG-788 — `@inttoptr` did not require `volatile`: GCC deletes MMIO stores (HIGH, silent bare-metal)
+
+```zer
+mmio 0x40020000..0x40020FFF;
+*u32 reg = @inttoptr(*u32, 0x40020014);   // NOT volatile — zero diagnostics
+reg[0] = 1; reg[0] = 2; return reg[0];
+```
+GCC `-O2` emitted **one** store and a constant-folded read: the first peripheral write silently
+deleted, the status read never performed. On hardware that is a lost FIFO push / lost
+clear-then-set and a stale status value. Every other mmio machine (range, alignment, access
+span, const-index bound, variable-address runtime trap) passed — the one qualifier that makes
+MMIO actually *work* was optional and unenforced. Invisible on hosted x86-64 (no peripheral)
+and invisible at runtime on the target: nothing traps, the code simply does not do what was
+written. Same defect via the struct-overlay idiom (`*Regs r = @inttoptr(*Regs, ...)`).
+
+**Fixed by making the intrinsic's RESULT TYPE volatile**, not by adding a volatile check at
+each binding sink — that routes every sink through the qualifier machinery that already exists
+("cannot initialize non-volatile pointer from volatile") instead of an N-site check the next
+sink would be missing from. The documented form `volatile *u32 reg = @inttoptr(*u32, ADDR)` is
+unaffected: the TYPE ARGUMENT stays unqualified, exactly as every example writes it. A fresh
+`Type` is allocated because `resolve_type` caches.
+
+**Corpus cost measured before shipping:** of 59 `= @inttoptr` bindings across tests/,
+test_modules/, rust_tests/, zig_tests/, examples/ and lib/, **57 already declare the
+destination volatile**; the 2 that do not are negative tests.
+
+Test: `tests/zer_fail/mmio_inttoptr_nonvolatile.zer`.
+
+### BUG-789 — "which shared struct does this expression touch?" was FIVE walkers; all five missed the CALL CALLEE
+
+`g.cb()` — calling a function-pointer FIELD of a `shared struct` — emitted **no lock**, while
+`g.cb = f` one line earlier locked correctly. An unsynchronized read of a shared field that
+neither the checker nor the runtime reported. This is the register-in-setup / invoke-in-worker
+RTOS idiom.
+
+The question was answered independently by five if/else walkers with identical intent, and they
+had drifted:
+
+| walker | role | state found |
+|---|---|---|
+| `find_shared_root_expr` (ir_lower.c) | primary lock emitter | no callee |
+| `find_all_shared_roots_expr` (ir_lower.c) | multi-root lock | no callee |
+| `collect_shared_types_in_expr` (checker.c) | same-statement deadlock rule | no callee |
+| `find_shared_root` (emitter.c) | **spawn-arg** lock | no callee **+ still the pre-AUDIT-2026-06-28 root-ident-only form** |
+| `emit_defer_shared_root` (emitter.c) | defer-body lock | no callee |
+
+The spawn-arg one cost three more silent races, all measured against a locking control
+(`spawn w(gs.v)` locks): `spawn w(wa.sp.v)` (nested `*shared` field), `spawn w(@truncate(u32,
+gs.v))` and `spawn w(m() orelse gs.v)` **all emitted no lock**.
+
+**The fix is a unification, not five patches.** New `checker_walk_shared_chains` (checker.c,
+exported in checker.h) is ONE recursion over every expression position that can touch a shared
+struct; all five sites delegate to it. The split that makes this safe: the RECURSION is common
+to every site and is where the bugs lived, while the HEAD processing legitimately differs —
+lock emitters take the OUTERMOST shared sub-expression, the deadlock rule needs EVERY shared
+type in the chain — so each site supplies a visitor.
+
+**And it is now GATED.** The unified walk is a no-`default:` switch over `NodeKind`, so a new
+node kind is a `-Werror=switch` BUILD FAILURE instead of a silently unlocked shared access.
+That is precisely what the old copies had given up; one of them said so out loud in its own
+comment: *"Uses if/else (not a switch) to avoid the walker-default audit."*
+
+Also fixed by the same walk: a shared read buried in a subscript inside a projection chain
+(`g.arr[h.v].f`) — the head-walk steps over subscripts, so nothing visited `h.v`.
+
+Tests: `tests/zer_fail/shared_callee_multi_type_deadlock.zer` (the discriminating one — it can
+only be rejected if the callee is collected) + `tests/zer/shared_lock_completeness_ok.zer`.
+
+### Dead code removed
+
+- `has_atomic_or_barrier` (checker.c, ~90 lines) — superseded by `FuncProps.has_sync`, zero
+  callers, warned on every build.
+- `find_shared_root_in_stmt` (emitter.c, ~45 lines) — zero callers; the AST statement-level
+  lock dispatcher, superseded when function bodies went IR-only in 2026-04-19.
+
+Both read as coverage that was not there.
+
 ## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
 
 Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)

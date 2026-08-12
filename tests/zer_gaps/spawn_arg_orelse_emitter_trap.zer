@@ -1,0 +1,15 @@
+// GAP (2026-08-12, verified live): `spawn f(opt orelse v)` compiles clean and
+// then TRAPS at runtime with "compiler bug: unhandled NODE kind in
+// emit_rewritten_node". Spawn arguments are emitted from RAW AST (they never
+// pass through IR lowering, so pre_lower_orelse never rewrites them), and
+// emit_rewritten_node has no NODE_ORELSE arm — the fallback emits the
+// unhandled-kind trap. Independent of shared structs (this file has none).
+// LOUD, not silent, so it is a gap file rather than a shipped fix.
+// Emitted C contains:
+//   _sa->a0 = (_zer_trap("compiler bug: unhandled NODE kind ...", ...), 0);
+void w1(u32 x) { }
+?u32 none() { return null; }
+u32 main() {
+    spawn w1(none() orelse 3);
+    return 0;
+}

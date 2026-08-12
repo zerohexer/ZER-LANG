@@ -1252,6 +1252,47 @@ static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_l
     return -1;
 }
 
+/* BUG-787 (2026-08-12): peel ADDRESS-PRESERVING launders before keying.
+ *
+ * `free((*N)n)` produced NO tracking key at all — ir_key_root_ident accepts
+ * only IDENT/FIELD/INDEX, so the free was silently never registered while the
+ * emitter still emitted the real `_zer_slab_free_ptr`. The following
+ * use-after-free AND a later double-free were both ACCEPTED (measured: the
+ * program runs, reads the recycled slot and frees twice). Same for
+ * `free(@ptrcast(*N, n))` / `free(@pun(*N, n))`.
+ *
+ * ONLY address-preserving forms are peeled. `@container` and `@cstr` compute a
+ * DIFFERENT address, and an `orelse` with a value fallback can yield either
+ * operand — peeling those would key the wrong allocation, which is worse than
+ * not keying at all. An `orelse` whose fallback DIVERGES (return/break/continue)
+ * has no alternative value, so the primary is the only thing that can reach the
+ * sink and peeling it is exact. */
+static Node *ir_unwrap_launder(Node *v) {
+    for (;;) {
+        if (v && v->kind == NODE_TYPECAST) { v = v->typecast.expr; continue; }
+        if (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+            const char *n = v->intrinsic.name;
+            size_t nl = v->intrinsic.name_len;
+            bool addr_preserving =
+                (nl == 7 && memcmp(n, "ptrcast", 7) == 0) ||
+                (nl == 3 && memcmp(n, "pun", 3) == 0) ||
+                (nl == 7 && memcmp(n, "bitcast", 7) == 0) ||
+                (nl == 4 && memcmp(n, "cast", 4) == 0);
+            if (addr_preserving) {
+                v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+                continue;
+            }
+        }
+        if (v && v->kind == NODE_ORELSE && v->orelse.expr &&
+            (v->orelse.fallback_is_return || v->orelse.fallback_is_break ||
+             v->orelse.fallback_is_continue)) {
+            v = v->orelse.expr;
+            continue;
+        }
+        return v;
+    }
+}
+
 /* Walk to the root IDENT of a field/index chain. Returns the NODE_IDENT,
  * or NULL if the chain doesn't bottom out at an identifier. */
 static Node *ir_key_root_ident(Node *expr) {
@@ -1276,6 +1317,8 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     *out_local = -1;
     *out_path = NULL;
     *out_path_len = 0;
+    if (!expr) return -1;
+    expr = ir_unwrap_launder(expr);   /* BUG-787 — see ir_unwrap_launder */
     if (!expr) return -1;
 
     Node *root = ir_key_root_ident(expr);

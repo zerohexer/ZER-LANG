@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: orelse fallback
+// BUG-786 (2026-08-12), other arm: the null path of an orelse stores a
+// frame-local address into a global. Both arms of the same statement must be
+// checked or the class is only half-closed.
+struct L { u32 f; }
+?*u32 g_p;
+?*u32 mk() { return null; }
+void stash() {
+    L loc;
+    loc.f = 1;
+    g_p = mk() orelse &loc.f;
+}
+u32 main() { stash(); return 0; }

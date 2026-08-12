@@ -390,6 +390,224 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — audit sweep 2026-08-12: findings VERIFIED LIVE and NOT fixed
+
+Companion to BUGS-FIXED.md "Session 2026-08-12" (BUG-785..789, which ARE fixed). Everything
+below was **measured on main** — reproducer, verdict, and for the silent ones the emitted C or
+the GCC asm. Each is a hypothesis only in the sense that the compiler moves; the measurement
+date is 2026-08-12. **Re-measure before implementing** (this file's own MEASURE-FIRST rule).
+
+### CRITICAL/HIGH — silent bare-metal
+
+**1. The ISR / spawn non-atomic-RMW rule is keyed on the compound-assign TOKEN, not on
+read-modify-write.** `counter += 1` in an ISR sharing a `volatile u32` with main is rejected.
+Every other spelling of the same hazard is accepted with **zero diagnostics**, at BOTH sinks:
+
+| form (global is `volatile u32`) | ISR sink | spawn sink |
+|---|---|---|
+| `counter += 1;` | rejected | rejected |
+| `counter = counter + 1;` | **ACCEPTED** | **ACCEPTED** |
+| `flags = flags \| 4;` | **ACCEPTED** | — |
+| `reg[3..0] = 5;` (bit-slice write) | **ACCEPTED** | **ACCEPTED** |
+| `void bump(volatile *u32 p){ *p += 1; }` + `bump(&counter)` | **ACCEPTED** | — |
+
+Emitted C is an unambiguous split RMW (`_zer_t0 = counter = (counter + 1);` -> `movl / addl /
+movl`). Bit-slice emits a volatile read AND a volatile write (plus a spurious extra read on a
+read-to-clear register).
+
+**Worse than an ordinary miss: the diagnostic's own remedy lands in the hole.** The message
+says *"use explicit read/mask/write"* — which is exactly the accepted form.
+
+Sites: `checker.c` ~4443 / `record_isr_globals` NODE_ASSIGN (both gate on
+`assign.op != TOK_EQ`); `checker.c` ~11157 calls the VST-verified
+`zer_volatile_compound_valid(is_volatile, node->assign.op != TOK_EQ)`.
+
+**Oracle implication, worth reading twice.** The verified predicate models *"compound-assignment
+token"* when the real variable is *"does this statement both read and write the global"*. The
+proof is sound over the states listed and **can never fail on this** — a missing finite variable
+in the spec, exactly the coverage-vs-soundness split the CLAUDE.md endgame section describes.
+Found by probing, not by a stuck proof.
+
+**Fix shape:** a single assignment statement whose RHS reads the same global it assigns IS a
+read-modify-write. That is precise (it rejects only genuine one-statement RMW), fixes both
+sinks, and the oracle should model the RMW variable rather than the token. Fix BOTH sinks in
+one commit — the exemption/multi-site rule.
+
+**2. A global shared between TWO ISRs gets no checks at all.** `struct IsrGlobal` carries a
+single `from_isr` bit with no per-handler identity, and `check_interrupt_safety`
+(`checker.c` ~17969) requires `from_isr && from_func`. So:
+```zer
+u32 shared_ctr;
+interrupt USART1 { shared_ctr += 1; }
+interrupt TIM2   { shared_ctr = 0; }
+```
+compiles with **no diagnostic** and emits a NON-volatile `uint32_t shared_ctr`. Measured
+consequence: GCC folds a loop of `shared_ctr += 1` into one `addl $8`. On Cortex-M with NVIC
+priority grouping this is the classic nested-interrupt race.
+
+**3. `@inttoptr` volatile residuals (BUG-788 scope).** Two, both deliberate:
+(a) a `distinct` pointer typedef as the type argument is not wrapped — rebuilding a volatile
+pointer from a `TYPE_DISTINCT` wrapper would DROP the distinct identity, which is worse than
+not wrapping (baselined in `tools/type_dispatch_baseline.txt` with that justification);
+(b) the address-shape scoping below.
+
+**3b. Computed peripheral addresses.** The shipped fix requires `volatile` only
+when the address is a compile-time CONSTANT inside a declared `mmio` range. A **computed**
+peripheral address (`base + offset` through `@ptrtoint`/`@inttoptr`) is still not required to
+be volatile. Scoping was deliberate: `@ptrtoint` + arithmetic + `@inttoptr` is the documented
+stand-in for pointer arithmetic on ordinary memory, and forcing volatile there breaks it (the
+`tests/zer` roundtrip test is the witness). Closing the residual needs a way to distinguish a
+computed MMIO address from a computed ordinary one.
+
+**4. Freestanding is broken by the preamble in two places (both LOUD, both easy).**
+- `<string.h>`, `<stdio.h>`, `<stdlib.h>` are emitted with **no `__STDC_HOSTED__` guard**, so
+  even `u32 main(){return 0;}` fails `gcc -ffreestanding -nostdinc`. The adjacent
+  `<pthread.h>/<time.h>/<sched.h>` block IS guarded. With stubs supplied the rest compiles
+  freestanding cleanly and links with zero undefined symbols — these three includes are the
+  only blocker for the minimal case. (Newlib ships them, which is why it has not been noticed;
+  a kernel / `-nostdinc` build fails.)
+- **`shared struct` breaks freestanding — the 2026-05-05 "FIXED" entry is incomplete.** The
+  pthread helper functions and the include are guarded; the **struct FIELD and the call sites
+  are not**: `pthread_mutex_t _zer_mtx;` in the emitted struct, and
+  `_zer_mtx_ensure_init(...)` / `pthread_mutex_lock(...)` at every access. Barrier and
+  Semaphore runtime structs ARE inside a `__STDC_HOSTED__` block — the guarding is
+  inconsistent within one preamble.
+
+**5. `naked`, beyond the tracked attribute drop.** `return <expr>` inside a `naked` function is
+ACCEPTED and materialises a stack temp (`-O0` emits `movl $0, -4(%rbp)` BEFORE the asm block).
+The gate tests `s->kind != NODE_ASM && s->kind != NODE_RETURN` and so cannot tell bare
+`return;` from `return 7;`. This matters because "ban `return expr` in naked" is listed here as
+a PREREQUISITE for re-enabling the attribute — it is still missing, so the deferral cannot be
+lifted by a one-line emitter change. Also accepted silently: `naked void f() { }` with no asm
+at all, and `naked void f(u32 a)` (parameters need a prologue to bind).
+
+### CRITICAL/HIGH — hosted, silent
+
+**6. Defer-body auto-guard is wired at 3 of 6 statement sites -> silent OOB.**
+`emit_defer_stmt` calls `emit_auto_guards` for `NODE_EXPR_STMT`, `NODE_RETURN` and `NODE_IF`.cond.
+**Missing: `NODE_VAR_DECL`.init, `NODE_WHILE`.cond, `NODE_FOR`.init/cond/step.** The compiler
+prints *"auto-guard inserted"* and then emits the raw access.
+```zer
+u32[4] arr; u32 idx; u32 sink;
+u32 DV() { defer { u32 v = arr[idx]; sink = v; } return 0; }
+```
+ASan: `global-buffer-overflow ... 12 bytes after global variable 'arr'`. Same for the `while`
+and `for` forms, and for the MMIO variant (`defer { u32 v = r[idx]; }` on an `@inttoptr`
+pointer — a bare-metal read past the declared range). This is an incomplete site enumeration of
+the §C #16 fix (`9edc49b8`), which claims "the 3 indexable defer-body sites". Add
+`defer x {var-decl, while, for}` cells to `tests/test_defer_goto_matrix.c` with the fix.
+
+**7. Bit-slice compound shift emits raw C `<<` / `>>`, not `_zer_shl`/`_zer_shr`.**
+`emit_bitslice_ir_value` maps `TOK_LSHIFTEQ`/`TOK_RSHIFTEQ` to literal operators. Every other
+shift form uses the macro (12 forms verified clean). `reg[7..0] <<= sh` with `sh = 70` is C UB:
+UBSan *"shift exponent 70 is too large"*, and it evaluates to **20 at -O2, 0 at -O0** — the
+classic optimization-level divergence. ZER's spec says 0. The same helper also emits raw `/`
+and `%` for `reg[hi..lo] /= z`, with no division-by-zero trap (every other div path has one;
+the exploitable runtime path was NOT demonstrated because the checker's forced guard rejected
+every divisor shape tried — the missing wrapper is confirmed, the exploit is not).
+
+**8. `(bool)x` truthy conversion is missing in `emit_rewritten_node`'s NODE_TYPECAST.** The AST
+path and `IR_CAST` both emit `((uint8_t)!!(x))` (BUG-586); the raw-AST fallback emits a plain
+cast. Reached from defer bodies, spawn args and await conditions — all three are emitted from
+raw AST. Measured: `defer { gb = (bool)five; }` with `five == 5` stores 5 into a `bool`, and
+`gb == true` then evaluates **0 on the defer path and 1 on the normal path**.
+
+**9. uN/iN width mask is never applied to a division/modulo result.** Three independent sites
+skip it (`IR_BINOP` breaks before `emit_intn_mask`; `emit_rewritten_node`'s NODE_BINARY mask
+list omits `/ %`; the NODE_ASSIGN uN intercept excludes `/= %=` with the comment *"result
+magnitude <= operand"*, true for unsigned and **false for signed MIN/-1**). `i3 m = -4;
+i3 n = -1; m / n` gives **4**; the i3 range is [-4,3].
+
+**10. A free of a pointer READ BACK OUT of a global compound slot does not propagate FREED.**
+`w.p = n; *N r = w.p orelse return; free(r);` then a later `*N r2 = w.p orelse return;` reads
+the recycled slot un-flagged (`aliased=1` measured). Direction matters: freeing the ORIGINAL
+after storing IS caught by the exit dangling-check; freeing the READ-BACK is not, and the exit
+check then goes silent too. Same for a global ARRAY element, both literal and variable index.
+A global scalar and a LOCAL array are tracked correctly.
+
+**11. `_zer_check_alive` is emitted only on the DEAD AST path.** The Level-3/4/5 `*opaque`
+runtime liveness check has exactly one emission site — inside `emit_expr`, which is dead for
+function bodies. Compiling all 10 `tests/zer/opaque*.zer` with `--track-cptrs` yields **0 call
+sites** while the function is `static inline`-defined in every preamble.
+`docs/compiler-internals.md` (~3624 and ~9056) describes it as the live "2% runtime" backstop
+for `*opaque` UAF. Either port the gate into `emit_rewritten_node`'s `@ptrcast` handler or
+delete the definition and correct those two doc claims — it currently reads as coverage that
+is not there.
+
+### MEDIUM — loud (fails visibly, but the feature is broken or the message is wrong)
+
+**12. `spawn f(opt orelse v)` compiles clean and TRAPS at runtime** with *"compiler bug:
+unhandled NODE kind in emit_rewritten_node"*. Spawn args are emitted from raw AST (they never
+pass through IR lowering, so `pre_lower_orelse` never rewrites them) and `emit_rewritten_node`
+has no `NODE_ORELSE` arm. Independent of shared structs. Reproducer:
+`tests/zer_gaps/spawn_arg_orelse_emitter_trap.zer`.
+
+**13. `(*opaque)ptr` and `(*T)opaque_val` emit invalid C.** `g_op = (*opaque)&g_v;` emits
+`(_zer_opaque)&g_v` -> GCC *"conversion to non-scalar type requested"*; the reverse direction
+gives *"cannot convert to a pointer type"*. Both directions are documented as supported in
+CLAUDE.md ("`(*opaque)sensor` — OK", "`(*Motor)ctx` — OK"). Loud, but the feature is
+non-functional.
+
+**14. Type NAMES are tracked as ISR globals.** `record_isr_globals`' NODE_IDENT case does a
+global-scope lookup and skips only `is_function`, so a struct/enum type mentioned in an ISR
+(e.g. `@size(T)`) produces *"global 'T' is accessed from both interrupt and main code — must be
+declared volatile"*. The remedy is impossible (a type cannot be volatile) and **it MASKS other
+diagnostics** — it pre-empted the real verdict on an unrelated ISR probe during this audit.
+
+**15. The ISR error's second remedy (`@atomic_*`) is rejected at the ISR sink** while the spawn
+scan exempts it. `interrupt { @atomic_add(&counter, 1); }` on a non-volatile global gives
+*"must be declared volatile"*. `volatile u32 counter` + `@atomic_add` IS accepted, so the
+working path exists but is undiscoverable from the message. Same question, two sites, different
+answers.
+
+**16. No aggregate can be shared between an ISR and main at all**, and every remedy the
+diagnostics name is itself rejected: `u8[64]`, `volatile u32[4]`, `Ring(Byte,64)`, `Pool(T,8)`,
+`volatile Pool(T,8)`, a `shared struct`, and a main-side access wrapped in `@critical` — all
+rejected. Only a single-word `volatile` scalar works, so the **UART-RX ring buffer, the single
+most common firmware idiom, is not expressible** except through `cinclude`. Not a soundness
+hole; a total-blockage over-rejection whose error text names remedies the compiler then
+rejects.
+
+**17. `&packed_field` — measured, sharpening the tracked policy question.** ZER emits **no
+diagnostic** and an **unqualified** `uint32_t*`; the only signal is GCC's
+`-Waddress-of-packed-member`, which (a) appears only in compile-to-exe mode — in the
+`zerc f.zer -o f.c` workflow gcc never runs, so there is no signal at all, (b) is a warning, so
+it ships, and (c) never recurs at the dereference site because the emitted pointer type carries
+no trace of the misalignment. On ARMv6-M an unaligned word access HardFaults. Field *access*
+(`gp.b = x`) is fine — GCC byte-splits it.
+
+**18. `--release` is parsed into `release_mode` and that variable is never read anywhere.** A
+silent no-op flag. Either implement it or remove it; do NOT document it.
+
+**19. The IR unknown-intrinsic fallback still emits `/* @name */ 0`** — a silent zero, the
+placeholder class CLAUDE.md warns about. Currently unreachable (all 142 checker-accepted
+intrinsics have an IR handler — verified by `comm`), but adding an intrinsic to `checker.c`
+without an emitter handler would silently substitute 0. The AST path was made loud by BUG-767;
+mirror that.
+
+### SUSPECTED (code reading only — reproduce before acting)
+
+- `call_has_nonkeep_derived_arg` calls `unwrap_ptr_launder` (now typecast-aware after BUG-785)
+  but then walks SLICE/INDEX/FIELD itself; it may still miss a `NODE_TYPECAST` in an interior
+  position. Not separately probed.
+- `ir_extract_compound_key` is the key path for ALIAS registration as well as frees, so the
+  BUG-787 blindness may extend beyond the free site to any wrapped alias source.
+- `@critical`'s ARM arm is gated on `defined(__ARM_ARCH)` and emits `mrs %0, primask` /
+  `cpsid i`. `primask` exists only on Cortex-M; on ARMv7-A or AArch64 (where `__ARM_ARCH` is
+  also defined) this is an assembler error — LOUD, so it fails safely, but the guard is a proxy
+  for "Cortex-M" rather than a test for it.
+
+### The cross-cutting shape, worth internalising
+
+**Most of the bare-metal findings above are a SYNTACTIC PROXY standing in for a SEMANTIC
+property**, and every one is invisible on hosted x86-64: #1 uses "compound-assign token" for
+"read-modify-write"; #2 uses one `from_isr` bit for "which handler"; the pre-BUG-788 mmio code
+used "has an mmio bound" for "is a volatile MMIO access"; the `@critical` guard uses
+`__ARM_ARCH` for "Cortex-M". A targeted sweep worth running once: **for each safety diagnostic,
+compile its own suggested remedy** — #1 and #15 both fail that test.
+
+---
+
 ## OPEN — concurrency sweep 2026-08-10: NO holes found; two doc/impl mismatches corrected
 
 Systematic probe of the concurrency surface after BUG-783. **No accept-unsafe hole found.**

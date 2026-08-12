@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: local-derived pointer
+// BUG-785 (2026-08-12): a C-style cast is a launder. `(*u32)p` is an IDENTITY
+// cast the emitter elides entirely, yet it hid a frame-local pointer from every
+// escape sink — this store was ACCEPTED while the identical `g_p = p;` was
+// rejected. ASan-confirmed stack-use-after-return.
+struct L { u32 f; u32 g; }
+?*u32 g_p;
+void stash() {
+    L loc;
+    loc.f = 3735928559;
+    *u32 p = &loc.f;
+    g_p = (*u32)p;
+}
+u32 main() { stash(); return 0; }

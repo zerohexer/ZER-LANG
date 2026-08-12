@@ -12289,6 +12289,83 @@ that SPECIFIC phrase, with an inline note, precisely so nobody later loosens it 
 
 ---
 
+## The unified shared-struct chain walk (2026-08-12)
+
+**Read this before touching ANY lock-emission, spawn-arg-lock, defer-lock or
+same-statement-deadlock code.**
+
+"Which shared struct does this expression touch?" used to be answered by **five** independent
+if/else walkers with identical intent:
+
+| walker | role |
+|---|---|
+| `find_shared_root_expr` (ir_lower.c) | primary per-statement lock emitter |
+| `find_all_shared_roots_expr` (ir_lower.c) | multi-root lock (read locks compose) |
+| `collect_shared_types_in_expr` (checker.c) | same-statement multi-shared-type deadlock rule |
+| `find_shared_root` (emitter.c) | spawn-argument lock |
+| `emit_defer_shared_root` (emitter.c) | defer-body lock |
+
+They drifted, exactly as the multi-site class predicts. Measured 2026-08-12: **all five omitted
+the CALL CALLEE position**, so `g.cb()` — invoking a function-pointer FIELD of a `shared struct`
+— read `cb` out of `g` with no lock while `g.cb = f` one line earlier locked correctly. And the
+emitter's spawn-arg copy was still the **pre-AUDIT-2026-06-28 root-ident-only** form, so
+`spawn w(wa.sp.v)` (nested `*shared` field), `spawn w(@truncate(u32, gs.v))` and
+`spawn w(m() orelse gs.v)` emitted no lock either — three more silent races at one sink, all
+measured against a control (`spawn w(gs.v)`) that DOES lock.
+
+### The decomposition that makes unification safe
+
+**The RECURSION is common to every site and is where the bugs lived. The HEAD PROCESSING
+legitimately differs.** Lock emitters need the OUTERMOST shared sub-expression (the node to
+take the lock on); the deadlock rule needs EVERY shared type in a projection chain, because
+`gb.pa.v` accesses both the `*shared A` reached through `gb.pa` and shared `B` (`gb` itself).
+
+So the recursion lives in `checker.c` once, and each site supplies a visitor:
+
+```c
+typedef void (*ZerSharedVisitFn)(Checker *c, Node *node, void *ud);
+void  checker_walk_shared_chains(Checker *c, Node *expr, ZerSharedVisitFn fn, void *ud);
+Node *checker_shared_lock_root_of_chain(Checker *c, Node *chain);  /* head: outermost */
+Node *checker_find_shared_root(Checker *c, Node *expr);            /* first root */
+void  checker_collect_shared_roots(Checker *c, Node *expr, Node **out, int *count, int max);
+```
+
+The visitor is called on `NODE_FIELD` (a projection chain that may have a shared root) and on
+`NODE_CALL` (so the deadlock collector can still do its transitive callee-summary lookup).
+
+### The gate — do NOT add a `default:`
+
+`checker_walk_shared_chains` is a **no-`default:` switch over `NodeKind`**, so a new node kind
+is a `-Werror=switch` BUILD FAILURE instead of a silently unlocked shared access. That is
+precisely what the old copies had given up, and one of them said so in its own comment:
+*"Uses if/else (not a switch) to avoid the walker-default audit."* If you add a NodeKind, decide
+whether it can carry a shared projection and add it to the right arm — the no-op leaves are
+enumerated explicitly for exactly this reason.
+
+### Two things the unified walk fixed beyond the callee
+
+- A shared read buried in a **subscript inside a projection chain** (`g.arr[h.v].f`): the
+  head-walk steps OVER subscripts, so nothing ever visited `h.v`. The walker now descends each
+  subscript on the chain.
+- `find_shared_root_in_stmt` (emitter.c, ~45 lines) was **deleted** — zero callers. It was the
+  AST statement-level lock dispatcher, superseded when function bodies went IR-only in
+  2026-04-19. Dead safety code reads as coverage that is not there.
+
+### Notes for future edits
+
+- Locking is still **per-statement**, and the emitted mutex is **`PTHREAD_MUTEX_RECURSIVE`** —
+  which is why holding a lock across a call (the pre-existing behaviour for `f(g.v)`, and now
+  for `g.cb()`) does not self-deadlock. Verified 2026-08-12.
+- The "never hold two DIFFERENT shared-struct locks at once" invariant is enforced by the
+  deadlock rule wherever the callee is resolvable. It is **already** violated for an
+  unresolvable funcptr callee (`fp(g.v)` where `fp`'s target touches another shared struct) —
+  measured, pre-existing, unchanged by the unification.
+- `is_shared` is set for `shared(rw)` too (parser.c), so testing `is_shared` alone covers both
+  lock flavours. Several of the old copies tested `is_shared || is_shared_rw` and several tested
+  only `is_shared`; they were equivalent, but do not "fix" one into the other and assume a
+  behaviour change.
+
+
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 
 ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow

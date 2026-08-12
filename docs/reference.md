@@ -164,6 +164,39 @@ void do_work() { }
 
 ---
 
+### Literals
+
+**SYNTAX**
+```zer
+i32 printf(const *u8 fmt, ...);
+u32 main() {
+    u32 dec  = 255;            // decimal
+    u32 hexv = 0xFF;           // hexadecimal
+    u32 bin  = 0b1010_1010;    // binary — 170
+    u32 big  = 1_000_000;      // `_` digit separators work in INTEGER literals too,
+    f32 rate = 1_000.5;        // not just in floats
+    bool on  = true;
+
+    u8 letter  = 'A';          // character literal — a u8, value 65
+    u8 newline = '\n';
+    u8 tab     = '\t';
+    u8 nul     = '\0';
+    u8 backsl  = '\\';
+    u8 quote   = '\'';
+
+    const [*]u8 msg = "hello"; // string literal — a read-only SLICE, not char*
+    printf("%c %u %u\n", letter, bin, big);
+    return 0;
+}
+```
+
+**NOTES**
+- Character literals are `u8` values. Escapes: `\n \t \r \0 \\ \' \" \xNN`.
+- String literals are `[*]u8` slices with `.ptr` and `.len` — never `char*`.
+- `null` is the only literal for `?*T`; `?T` value optionals take a real value or `null`.
+
+---
+
 ## COMPOUND TYPES
 
 ### T[N] — Fixed Array
@@ -665,7 +698,9 @@ struct Ops { *(u32) -> u32 compute; }       // struct field
 u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y);  // parameter
 ?*(u32) -> u32 on_event = null;             // nullable funcptr
 *(u32) -> ?u32 lookup;                      // funcptr returning optional
-*(keep *Handler) register;                   // keep modifier on a param
+*(keep *Handler) register_fn;                // keep modifier on a param
+                                             // (avoid the name `register` — the checker
+                                             //  accepts it but the emitted C does not)
 
 // Cases that REQUIRED typedef in 2A — now inline in 2C:
 *(u32, u32) -> u32 [4] ops;                  // array of funcptrs — INLINE
@@ -865,7 +900,7 @@ Execute body at least once, then check condition. C-style `do { } while (cond);`
 ```zer
 do {
     val = read_register();
-} while (val & BUSY_FLAG);
+} while ((val & BUSY_FLAG) != 0);   // `bool` is NOT an integer — compare explicitly
 ```
 
 **NOTES**
@@ -1603,7 +1638,6 @@ a.id = 1;
 
 *Node b = ar.alloc(Node) orelse { return 2; };
 b.id = 2;
-a.next = b;
 
 defer ar.reset();      // free everything at scope exit
 ```
@@ -1622,6 +1656,10 @@ ar.alloc_slice(Byte, 64);
 
 **NOTES**
 - Arena-derived pointers cannot be stored in global/static variables (compile error).
+- An arena-derived pointer also cannot be stored into a field reached THROUGH another
+  pointer (`a.next = b;` where `a` is `*Node`) — *"cannot store arena-derived pointer
+  through pointer parameter"*. Storing into a stack-resident struct's field
+  (`Node head; head.next = b;`) is allowed.
 - No individual free — arena is all-or-nothing.
 - Use `defer ar.reset()` to ensure cleanup on all exit paths.
 
@@ -1653,8 +1691,8 @@ Clamp val to the min/max of type T. No data loss — just capped.
 
 **EXAMPLE**
 ```zer
-i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
-u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
+i8 clamped_hi = @saturate(i8, 200);   // 127 (i8 max)
+u8 clamped_lo = @saturate(u8, -5);    // 0 (u8 min)
 ```
 
 **SAFETY**
@@ -1722,15 +1760,31 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 ```zer
 @inttoptr(*u32, 0x12345678)        // COMPILE ERROR — no mmio range declared
 @inttoptr(*u32, 0x40020001)        // COMPILE ERROR — misaligned for u32
+*u32 reg = @inttoptr(*u32, 0x40020014);   // COMPILE ERROR — destination must be
+                                          // `volatile *u32` (see NOTES)
 ```
 
 **NOTES**
+- **The destination must be `volatile`** when the address is a compile-time CONSTANT
+  inside a declared `mmio` range: such an `@inttoptr` yields a `volatile *T`, so
+  binding it to a plain `*T` is rejected with *"cannot initialize non-volatile
+  pointer from volatile"*. Without `volatile`, GCC is free to delete a repeated
+  peripheral store and constant-fold a status read — measured at `-O2`: of
+  `reg[0]=1; reg[0]=2; return reg[0];` only ONE store survived and the read never
+  happened. Write the documented form: `volatile *u32 reg = @inttoptr(*u32, ADDR);`
+  (the TYPE ARGUMENT stays unqualified).
+- A VARIABLE address is not forced volatile — `@ptrtoint` + arithmetic +
+  `@inttoptr` is the supported stand-in for pointer arithmetic on ordinary memory,
+  and it must remain able to produce a plain `*T`.
 - `--no-strict-mmio` flag allows @inttoptr without mmio declarations —
   it relaxes the RANGE strictness only. The runtime ALIGNMENT trap is
   still emitted for variable addresses (alignment is a property of the
   target pointer type, not of mmio declarations), and constant
   addresses are alignment-checked at compile time regardless.
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
+- Under `--no-strict-mmio` no range is declared, so no `mmio_bound` is derived and
+  `reg[i]` (indexed access) is REJECTED — only `*reg` works. The flag relaxes the
+  range requirement, not the indexing rule.
 
 **SEE ALSO**
 @ptrtoint, mmio
@@ -2022,6 +2076,204 @@ u8[512] fpu;
 
 ---
 
+### Kernel / bare-metal intrinsics (96)
+
+**DESCRIPTION**
+The privileged and CPU-inspection surface. Every name below is accepted by the checker
+today. Most are **privileged (CPL=0)** and SIGSEGV in user mode — test them with the
+**dead-branch pattern** (`volatile u32 never = 0; if (never == 42) { ... }`), which
+compiles and type-checks the call without executing it. The inspection group is
+non-privileged and runs directly.
+
+Non-x86 targets get a no-op or per-arch fallback where no equivalent instruction exists.
+
+**GROUPS**
+
+| group | intrinsics |
+|---|---|
+| Port I/O (x86, privileged) | `@port_in8(u16)->u8` `@port_in16(u16)->u16` `@port_in32(u16)->u32` `@port_out8/16/32(u16, val)` |
+| MSR / CR / XCR0 / DR / FS-GS | `@cpu_read_msr(u32)->u64` `@cpu_write_msr(u32,u64)` `@cpu_read_cr0/cr2/cr3/cr4/xcr0()->u64` `@cpu_write_cr0/cr3/cr4/xcr0(u64)` `@cpu_read_dr(u32)->u64` `@cpu_write_dr(u32,u64)` `@cpu_read_pmc(u32)->u64` `@cpu_read_fsbase/gsbase()->u64` `@cpu_write_fsbase/gsbase(u64)` |
+| Inspection (NOT privileged) | `@cpu_read_sp/read_tp/read_flags/vendor_id/feature_bits/get_pc/read_counter()->u64` `@cpu_cpuid(u32,u32)->u64` `@cpu_cpuid_ecx(u32,u32)->u64` `@cpu_model_id/core_id/id/current_mode/cache_line_size/num_cores/get_priv_level()->u32` |
+| Hardware RNG | `@cpu_rdrand()->?u64` `@cpu_rdseed()->?u64` — **optional**, the instruction can fail |
+| MMU | `@mmu_enable/disable/sync()` `@mmu_is_enabled()->bool` `@mmu_get_pt/get_kernel_pt/get_fault_addr/get_fault_status()->u64` `@mmu_set_pt(u64)` `@mmu_set_kernel_pt(u64)` |
+| TLB | `@tlb_flush_all/flush_global()` `@tlb_flush_addr(u64)` `@tlb_flush_asid(u64)` `@tlb_flush_range(u64,u64)` |
+| Cache maintenance | `@cache_flush_line/flushopt/writeback/zero_line(*u8)` `@cache_flush_range/clean_range/invalidate_range/invalidate_icache(*u8, len)` `@nt_store(*u8,u64)` `@barrier_dma()` |
+| Power / wait | `@cpu_pause()` `@cpu_idle_hint()` `@cpu_deep_sleep()` `@cpu_monitor_addr(*u8)` `@cpu_mwait()` `@cpu_umonitor(*u8)` `@cpu_umwait(u32,u64)` `@cpu_wfe()` `@cpu_sev()` `@cpu_reset()` `@wait_on_address(*u8,u64)` |
+| Privileged transitions / misc | `@cpu_syscall/sysret/iret/hypercall/sbi_call/smc_call()` `@cpu_set_priv_stack(u64)` `@cpu_eoi()` `@cpu_cache_disable/cache_enable()` `@cpu_flush_pipeline()` `@cpu_breakpoint()` `@cpu_endbr()` |
+| Legacy FPU / XSAVE | `@cpu_fxsave/fxrstor(*u8)` `@cpu_fpu_init()` `@cpu_xsave/xrstor(*u8, u64 mask)` |
+
+**EXAMPLE — inspection (non-privileged; this one runs)**
+```zer
+i32 printf(const *u8 fmt, ...);
+u32 main() {
+    u64 sp     = @cpu_read_sp();
+    u64 tp     = @cpu_read_tp();
+    u64 flags  = @cpu_read_flags();
+    u64 vendor = @cpu_vendor_id();
+    u64 feats  = @cpu_feature_bits();
+    u64 leaf0  = @cpu_cpuid(0, 0);
+    u64 leaf1  = @cpu_cpuid_ecx(1, 0);
+    u64 pc     = @cpu_get_pc();
+    u64 tsc    = @cpu_read_counter();
+    u32 model  = @cpu_model_id();
+    u32 core   = @cpu_core_id();
+    u32 cpu    = @cpu_id();
+    u32 mode   = @cpu_current_mode();
+    u32 line   = @cpu_cache_line_size();
+    u32 cores  = @cpu_num_cores();
+    u32 priv   = @cpu_get_priv_level();
+    printf("cache line = %u, cores = %u\n", line, cores);
+    return 0;
+}
+```
+
+**EXAMPLE — hardware RNG (note the optional return)**
+```zer
+u32 main() {
+    u64 r = @cpu_rdrand() orelse 0;   // the instruction can fail — unwrap it
+    u64 s = @cpu_rdseed() orelse 0;
+    return 0;
+}
+```
+
+**EXAMPLE — port I/O (privileged; dead-branch pattern)**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u8  b = @port_in8(0x60);
+        u16 w = @port_in16(0x60);
+        u32 d = @port_in32(0xCFC);
+        @port_out8(0x20, 0x20);
+        @port_out16(0x60, 0xFFFF);
+        @port_out32(0xCF8, 0x80000000);
+    }
+    return 0;
+}
+```
+
+**EXAMPLE — MSR / control registers (privileged)**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u64 v  = @cpu_read_msr(0xC0000080);  @cpu_write_msr(0xC0000080, v);
+        u64 c0 = @cpu_read_cr0();            @cpu_write_cr0(c0);
+        u64 c2 = @cpu_read_cr2();
+        u64 c3 = @cpu_read_cr3();            @cpu_write_cr3(c3);
+        u64 c4 = @cpu_read_cr4();            @cpu_write_cr4(c4);
+        u64 x  = @cpu_read_xcr0();           @cpu_write_xcr0(x);
+        u64 dr = @cpu_read_dr(0);            @cpu_write_dr(0, dr);
+        u64 fs = @cpu_read_fsbase();         @cpu_write_fsbase(fs);
+        u64 gs = @cpu_read_gsbase();         @cpu_write_gsbase(gs);
+        u64 pmc = @cpu_read_pmc(0);
+    }
+    return 0;
+}
+```
+
+**EXAMPLE — MMU + TLB (privileged)**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @mmu_enable();
+        if (@mmu_is_enabled()) { @mmu_sync(); }
+        u64 pt  = @mmu_get_pt();         @mmu_set_pt(pt);
+        u64 kpt = @mmu_get_kernel_pt();  @mmu_set_kernel_pt(kpt);
+        u64 fa  = @mmu_get_fault_addr();
+        u64 fs  = @mmu_get_fault_status();
+        @mmu_disable();
+        @tlb_flush_all();
+        @tlb_flush_global();
+        @tlb_flush_addr(0x1000);
+        @tlb_flush_asid(1);
+        @tlb_flush_range(0x1000, 0x2000);
+    }
+    return 0;
+}
+```
+
+**EXAMPLE — cache maintenance / non-temporal store**
+```zer
+u32 main() {
+    u8[256] buf;
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cache_flush_line(&buf[0]);
+        @cache_flush_range(&buf[0], 256);
+        @cache_clean_range(&buf[0], 256);
+        @cache_invalidate_range(&buf[0], 256);
+        @cache_invalidate_icache(&buf[0], 256);
+        @cache_zero_line(&buf[0]);
+        @cache_flushopt(&buf[0]);
+        @cache_writeback(&buf[0]);
+        @nt_store(&buf[0], 0x1234);
+        @barrier_dma();
+    }
+    return 0;
+}
+```
+
+**EXAMPLE — power / wait** (`@cpu_pause` and `@cpu_idle_hint` are non-blocking, safe to call directly)
+```zer
+u32 main() {
+    u8[64] buf;
+    @cpu_pause();
+    @cpu_idle_hint();
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_deep_sleep();
+        @cpu_monitor_addr(&buf[0]);  @cpu_mwait();
+        @cpu_umonitor(&buf[0]);      @cpu_umwait(0, 0);
+        @cpu_wfe();  @cpu_sev();  @cpu_reset();
+        @wait_on_address(&buf[0], 0);
+    }
+    return 0;
+}
+```
+
+**EXAMPLE — privileged transitions / misc**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_syscall();  @cpu_sysret();  @cpu_iret();
+        @cpu_hypercall();  @cpu_sbi_call();  @cpu_smc_call();
+        @cpu_set_priv_stack(0);
+        @cpu_eoi();
+        @cpu_cache_disable();  @cpu_cache_enable();
+        @cpu_flush_pipeline();  @cpu_breakpoint();  @cpu_endbr();
+    }
+    return 0;
+}
+```
+
+**EXAMPLE — legacy FPU / XSAVE**
+```zer
+u32 main() {
+    u8[512] fpu_buf;
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_fxsave(&fpu_buf[0]);   @cpu_fxrstor(&fpu_buf[0]);
+        @cpu_fpu_init();
+        @cpu_xsave(&fpu_buf[0], 3); @cpu_xrstor(&fpu_buf[0], 3);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- The transitions in the last group require correctly-set system register context
+  (CS/RIP/RFLAGS on x86; ELR/SPSR on ARM; sepc/sstatus on RISC-V) before the
+  instruction — the intrinsic emits the instruction, it does not set up the state.
+- `@cpu_core_id`, `@cpu_current_mode`, `@cpu_cache_line_size`, `@cpu_num_cores` return
+  fixed stub values on hosted targets (0 / 0 / 64 / 1).
+- `@cpu_umwait` / `@cpu_umonitor` need the WAITPKG feature; `@cpu_read_pmc` needs
+  `CR4.PCE=1`; the FS/GS-base intrinsics need `CR4.FSGSBASE=1`.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2076,9 +2328,15 @@ Uses GCC `__atomic_load_n` / `__atomic_store_n` / `__atomic_compare_exchange_n`.
 
 **EXAMPLE**
 ```zer
-u32 val = @atomic_load(&shared);
-@atomic_store(&shared, 42);
-bool swapped = @atomic_cas(&lock, 0, 1);
+u32 counter;        // must be a GLOBAL — an atomic on a stack local is rejected
+u32 lock_word;
+
+u32 main() {
+    u32 val = @atomic_load(&counter);
+    @atomic_store(&counter, 42);
+    bool swapped = @atomic_cas(&lock_word, 0, 1);
+    return val;
+}
 ```
 
 ---
@@ -2426,11 +2684,10 @@ u32 sensor_read(*opaque dev);
 
 u32 main() {
     *opaque dev = sensor_open("/dev/spi0");
-    defer sensor_close(dev);          // zercheck: leak prevented
     u32 val = sensor_read(dev);       // zercheck: dev is ALIVE
+    sensor_close(dev);                // DIRECT call — zercheck sees the release
     return 0;
 }
-// sensor_close(dev) fires via defer
 // sensor_read(dev) after close = COMPILE ERROR (use after free)
 ```
 
@@ -2523,23 +2780,34 @@ comptime if (DEBUG) {
 Accepted: literals (`1`, `0`), `const` variables, comptime function calls, expressions combining these.
 ```zer
 comptime if (1) { ... }                    // literal
-comptime if (DEBUG) { ... }                // const bool
+comptime if (DEBUG) { ... }                // const u32 (see NOT ACCEPTED below)
 comptime if (PLATFORM()) { ... }           // comptime function call
 comptime if (VER() > 1) { ... }            // expression with comptime call
 const u32 P = PLATFORM();
 comptime if (P) { ... }                    // const from comptime result
 ```
 
+NOT accepted: a `bool` condition. `const bool D = true; comptime if (D)` and even
+`comptime if (true)` are rejected with *"comptime if condition must be a compile-time
+constant"* — the constant folder handles integers, not bool literals. Use
+`const u32 DEBUG = 1;`.
+
 **EXAMPLE**
 ```zer
-const bool DEBUG = true;
+const u32 DEBUG = 1;
 
-comptime if (DEBUG) {
-    void log([*]u8 msg) { puts(msg.ptr); }
-} else {
-    void log([*]u8 msg) { }    // no-op in release
+u32 main() {
+    comptime if (DEBUG) {
+        return 0;
+    } else {
+        return 1;
+    }
 }
 ```
+
+**NOTE — `comptime if` is a STATEMENT.** It cannot appear at file scope and cannot select
+between two top-level declarations, so the C `#ifdef`-around-alternative-function-bodies
+idiom is not expressible. Put the `comptime if` inside the one function body instead.
 
 ---
 
@@ -2651,7 +2919,8 @@ a.val = 10; b.val = 20; a.next = &b;
 - BY-VALUE self-reference is a compile error — it would be an infinite-size
   struct. Use a pointer field instead:
 ```zer
-container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR
+container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR on instantiation
+BNode(u32) n;                                  // <- the error fires HERE
 container BNode(T) { T val; ?*BNode(T) child; } // OK
 ```
 
@@ -2732,9 +3001,17 @@ Convert a `[*]u8` slice to a NUL-terminated C string in a buffer.
 
 **EXAMPLE**
 ```zer
-u8[64] buf;
-const [*]u8 name = "hello";
-?*opaque f = c_fopen(@cstr(buf, name), "rb");
+cinclude "stdio.h";
+?*opaque c_fopen(const *u8 path, const *u8 mode);
+
+u32 main() {
+    u8[64] buf;
+    const [*]u8 name = "hello";
+    // unwrap immediately — binding a tracked *opaque allocation to an OPTIONAL
+    // variable without unwrapping trips zercheck's ghost-handle rule
+    *opaque f = c_fopen(@cstr(buf, name), "rb") orelse { return 1; };
+    return 0;
+}
 ```
 
 **SEE ALSO**
@@ -2778,10 +3055,23 @@ undefined behavior.
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
 ### Bit Extraction
+
+Bit-slice applies to an integer **VALUE**, never to a pointer. On a `volatile *u32`
+MMIO register you must dereference first — `reg[9..8]` on a pointer parses as a SLICE
+RANGE and fails with *"slice start (9) is greater than end (8)"*.
+
 ```zer
-reg[9..8]                  // Extract bits 9:8
-reg[7..4] = 0x0F;          // Set bits 7:4
-reg[7..0] += 3;            // Compound assign — read-modify-write of the field
+mmio 0x40020000..0x40020FFF;
+u32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+    u32 field = (*reg)[9..8];      // deref FIRST — bit-slice needs an integer value
+    u32 also  = reg[0][9..8];      // equivalent
+
+    u32 shadow = 0;
+    shadow[7..4] = 0x0F;           // Set bits 7:4
+    shadow[7..0] += 3;             // Compound assign — read-modify-write of the field
+    return 0;
+}
 ```
 Every compound operator works on a bit-slice target (`+= -= *= /= %= &= |= ^=
 <<= >>=`): the current field value is read, the operation applied, the result
@@ -2795,9 +3085,11 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- `?:` — ternary. Use `if`/`else`, or `orelse` for optionals.
+
+(`(T)x` C-style casts and `goto` DO exist — see *(Type)expr — C-Style Cast* and
+*goto + labels*.)
 
 ---
 
@@ -2849,6 +3141,11 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 2048       # error if estimated stack usage exceeds N bytes
+zerc source.zer --emit-ir                # print the lowered IR and exit (debugging)
+zerc source.zer --trace                  # trace the compilation flow to stderr
+zerc source.zer --trace-calls            # trace + full function call graph
+zerc source.zer --track-cptrs            # runtime *opaque tracking (implied by --run)
 ```
 
 ### Pipeline
@@ -3100,7 +3397,7 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator
-- No C-style casts
+- No IMPLICIT casts — `(T)x` exists but is explicit and checked
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

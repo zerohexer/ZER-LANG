@@ -1149,6 +1149,14 @@ static bool escape_type_carries_ref(Type *vt) {
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     if (!arg || depth > 8) return false;
+    /* BUG-785 (2026-08-12): a C-style cast is a pure launder — an identity
+     * `(*u32)p` is even ELIDED by the emitter — so it must be peeled before any
+     * shape test below. Without this, `g = idp((*u32)&loc.f)` laundered a stack
+     * pointer through a call to a global. Mirrors the peel now in
+     * unwrap_ptr_launder; this predicate does its own shape matching, so it
+     * needs the peel at its own entry. */
+    while (arg && arg->kind == NODE_TYPECAST) arg = arg->typecast.expr;
+    if (!arg) return false;
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
@@ -1232,6 +1240,15 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
         }
         /* orelse: identity(opt orelse &x) — check fallback for &local */
         if (arg->kind == NODE_ORELSE) {
+            /* BUG-786 (2026-08-12): only the FALLBACK was inspected, so a
+             * local-derived PRIMARY escaped: `?*u32 t = &loc.f; g_p = t orelse
+             * &g_dummy;` was accepted at the store-to-global, struct-field and
+             * call-arg sinks (ASan stack-use-after-return) while the identical
+             * `g_p = t;` was rejected. The primary is the value that flows on the
+             * has-value path — it is at least as escaping as the fallback. */
+            if (arg->orelse.expr &&
+                arg_is_local_derived(c, arg->orelse.expr, depth + 1))
+                return true;
             Node *fb = arg->orelse.fallback;
             /* check fallback for direct &local */
             if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP) {
@@ -1741,21 +1758,36 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * matched a bare NODE_UNARY missed it and the container escaped un-tainted via a
  * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
 static Node *unwrap_ptr_launder(Node *v) {
-    while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
-        /* @container(*T, ptr, field) and @cstr(buf, str) both return a pointer
-         * INTO their args[0]; every other launder (@ptrcast/@pun/@bitcast/@cast)
-         * passes the pointer as its LAST arg. Peeling @cstr to the last arg reached
-         * the STRING LITERAL instead of the caller's buffer — a local laundered
-         * through @cstr escaped unflagged. */
-        if ((v->intrinsic.name_len == 9 &&
-             memcmp(v->intrinsic.name, "container", 9) == 0) ||
-            (v->intrinsic.name_len == 4 &&
-             memcmp(v->intrinsic.name, "cstr", 4) == 0))
-            v = v->intrinsic.args[0];
-        else
-            v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+    for (;;) {
+        if (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+            /* @container(*T, ptr, field) and @cstr(buf, str) both return a pointer
+             * INTO their args[0]; every other launder (@ptrcast/@pun/@bitcast/@cast)
+             * passes the pointer as its LAST arg. Peeling @cstr to the last arg reached
+             * the STRING LITERAL instead of the caller's buffer — a local laundered
+             * through @cstr escaped unflagged. */
+            if ((v->intrinsic.name_len == 9 &&
+                 memcmp(v->intrinsic.name, "container", 9) == 0) ||
+                (v->intrinsic.name_len == 4 &&
+                 memcmp(v->intrinsic.name, "cstr", 4) == 0))
+                v = v->intrinsic.args[0];
+            else
+                v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+            continue;
+        }
+        /* BUG-785 (2026-08-12): a C-style cast is a launder too, and it was the
+         * ONE peel this function never did. C-style casts postdate the escape
+         * analysis, so `(*u32)p` — an IDENTITY cast the emitter ELIDES entirely —
+         * hid a frame-local pointer from EVERY escape sink: store-to-global,
+         * struct-field-of-global, return, return-of-field, keep call site, keep
+         * INFERENCE, Ring.push, arena, threadlocal, defer, @container chains and
+         * call-result launder all accepted `g_p = (*u32)p;` while the identical
+         * `g_p = p;` was correctly rejected. ASan-confirmed stack-use-after-return.
+         * The spawn sink was the sole survivor because spawn_arg_is_stack_derived
+         * peels NODE_TYPECAST by hand — the mirrored-sink drift this project keeps
+         * paying for, which is exactly why the peel belongs HERE, once. */
+        if (v && v->kind == NODE_TYPECAST) { v = v->typecast.expr; continue; }
+        return v;
     }
-    return v;
 }
 
 /* A POINTER-typed value produced by dereferencing a pointer-to-pointer creates an
@@ -5015,6 +5047,40 @@ static Type *check_expr(Checker *c, Node *node) {
             /* BUG-355: walk through intrinsics to find root ident */
             /* @container-safe peel: its pointer is args[0] (last arg = field name). */
             vnode = unwrap_ptr_launder(vnode);
+            /* BUG-786 (2026-08-12): `g_p = t orelse &dummy;` where `t` is a
+             * local-derived `?*T` was ACCEPTED here while the identical
+             * `g_p = t;` was rejected — this sink never looked through an
+             * orelse. The PRIMARY is the value that flows on the has-value
+             * path, so it escapes exactly as the bare ident would.
+             * (A `&local` FALLBACK at this sink is a different shape and is
+             * tracked separately in docs/limitations.md — do not assume it is
+             * covered by this peel.) */
+            Node *orelse_src = NULL;
+            if (vnode && vnode->kind == NODE_ORELSE && vnode->orelse.expr) {
+                orelse_src = vnode;
+                vnode = unwrap_ptr_launder(vnode->orelse.expr);
+            }
+            /* ...and the FALLBACK arm: `g_p = mk() orelse &loc.f;` stores a
+             * frame-local address on the null path. Same statement, other
+             * branch — both arms must be checked or the class is half-closed. */
+            if (orelse_src) {
+                Node *fb = unwrap_ptr_launder(orelse_src->orelse.fallback);
+                if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP &&
+                    addr_of_is_local_derived(c, fb->unary.operand)) {
+                    Symbol *ot_sym = NULL;
+                    bool ot_global = false, ot_param = false;
+                    classify_escape_sink(c, node->assign.target,
+                                         &ot_sym, &ot_global, &ot_param);
+                    if ((ot_global || ot_param) && ot_sym) {
+                        checker_error(c, node->loc.line,
+                            "cannot store local-derived pointer through an orelse "
+                            "fallback in %s '%.*s' — pointer will dangle when "
+                            "function returns",
+                            ot_param ? "pointer parameter" : "global/static variable",
+                            (int)ot_sym->name_len, ot_sym->name);
+                    }
+                }
+            }
             /* BUG-748: descend through `arr[a..b]` borrow shape */
             bool via_slice_borrow = false;
             if (vnode && vnode->kind == NODE_SLICE) {
@@ -6946,7 +7012,15 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (ld_count < ld_cap) ld_nodes[ld_count++] = ld_walk;
                             }
                             for (int ldi = 0; ldi < ld_count; ldi++) {
-                                Node *iarg = ld_nodes[ldi];
+                                /* BUG-785 (2026-08-12): peel launders BEFORE the
+                                 * projection descent. This collection starts from the
+                                 * RAW arg and descended only SLICE/FIELD/INDEX, so
+                                 * `keepfn((*u32)p)` never reached the ident and the
+                                 * keep CALL SITE accepted a frame-local pointer while
+                                 * the uncast `keepfn(p)` was rejected. Found by the
+                                 * sink-matrix cell, not by the original report — the
+                                 * reason the grid exists. */
+                                Node *iarg = unwrap_ptr_launder(ld_nodes[ldi]);
                                 /* BUG-751: descend NODE_SLICE so `store(local[0..])`
                                  * for a `keep` slice param is rejected (slice borrows
                                  * stack storage that doesn't outlive the call's keep
@@ -6959,6 +7033,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                         ld_via_slice = true; iarg = iarg->slice.object;
                                     } else if (iarg->kind == NODE_FIELD) iarg = iarg->field.object;
                                     else iarg = iarg->index_expr.object;
+                                    iarg = unwrap_ptr_launder(iarg);  /* BUG-785: interior peel */
                                 }
                                 if (!iarg || iarg->kind != NODE_IDENT) continue;
                                 Symbol *arg_sym = scope_lookup(c->current_scope,
@@ -8837,6 +8912,63 @@ static Type *check_expr(Checker *c, Node *node) {
                             type_name(result));
                     }
                 }
+                /* BUG-788 (2026-08-12): an @inttoptr result IS volatile.
+                 *
+                 * Measured: `*u32 reg = @inttoptr(*u32, 0x40020014); reg[0]=1;
+                 * reg[0]=2; return reg[0];` compiled with ZERO diagnostics and
+                 * GCC -O2 emitted a SINGLE store plus a constant-folded read —
+                 * the first peripheral write silently deleted, the status read
+                 * never performed. Every other mmio machine (range, alignment,
+                 * span, index bound, variable-address trap) passed; the one
+                 * qualifier that makes MMIO actually work was optional. Invisible
+                 * on hosted x86-64 (no peripheral) and invisible at runtime on
+                 * the target (nothing traps — the code simply does not do what
+                 * was written). Same defect via the struct-overlay idiom.
+                 *
+                 * Fixed HERE rather than at each binding sink: making the result
+                 * type volatile routes every sink through the qualifier machinery
+                 * that already exists ("cannot initialize non-volatile pointer
+                 * from volatile"), instead of adding an N-site volatile check
+                 * that the next sink would be missing from. The documented form
+                 * `volatile *u32 reg = @inttoptr(*u32, ADDR)` is unaffected —
+                 * the TYPE ARGUMENT stays unqualified, as every example writes it.
+                 *
+                 * Corpus cost measured before shipping: of 59 `= @inttoptr`
+                 * bindings in tests/, test_modules/, rust_tests/, zig_tests/,
+                 * examples/ and lib/, 57 already declare the destination
+                 * volatile; the 2 that do not are negative tests.
+                 *
+                 * A fresh Type is allocated — resolve_type CACHES, so setting
+                 * is_volatile in place would poison the shared `*u32` entry. */
+                if (result && result->kind == TYPE_POINTER &&
+                    !result->pointer.is_volatile &&
+                    node->intrinsic.arg_count > 0 && c->mmio_range_count > 0) {
+                    /* SCOPED to a CONSTANT address inside a declared mmio range —
+                     * that is unambiguously a peripheral register. A VARIABLE
+                     * address is left alone because `@ptrtoint(&x)` + arithmetic +
+                     * `@inttoptr` is the documented stand-in for pointer arithmetic
+                     * on ordinary memory (CLAUDE.md "No pointer arithmetic"), and
+                     * forcing volatile there would make the round-trip unusable —
+                     * the result could no longer initialize a plain `*u32`.
+                     * Residual, deliberately documented rather than papered over:
+                     * a COMPUTED peripheral address (base + offset) is still not
+                     * required to be volatile. See docs/limitations.md. */
+                    int64_t caddr = eval_const_expr(node->intrinsic.args[0]);
+                    bool in_mmio = false;
+                    if (caddr != CONST_EVAL_FAIL) {
+                        uint64_t a = (uint64_t)caddr;
+                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                            if (a >= c->mmio_ranges[ri][0] &&
+                                a <= c->mmio_ranges[ri][1]) { in_mmio = true; break; }
+                        }
+                    }
+                    if (in_mmio) {
+                        Type *vp = type_pointer(c->arena, result->pointer.inner);
+                        vp->pointer.is_volatile = true;
+                        vp->pointer.is_const = result->pointer.is_const;
+                        result = vp;
+                    }
+                }
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
@@ -10638,85 +10770,11 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
+/* has_atomic_or_barrier() DELETED 2026-08-12 — dead since FuncProps absorbed it
+ * (see the "Sync detection (absorbs has_atomic_or_barrier)" arm in
+ * scan_func_props). It had zero callers and produced a -Wunused-function
+ * warning on every build; a ~90-line superseded copy of a live analysis reads
+ * as coverage that is not there. Use `Symbol.props.has_sync`. */
 
 /* Does this function forward its parameter `pidx` into a `spawn` argument —
  * directly, or transitively through another function that does?
@@ -19834,175 +19892,333 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
     return NULL;
 }
 
-static int collect_shared_types_in_expr(Checker *c, Node *expr,
-                                         Type **types, int max_types, int count) {
-    if (!expr || count >= max_types) return count;
+/* ================================================================
+ * UNIFIED shared-struct chain walker (2026-08-12)
+ * ================================================================
+ * ONE recursion answering "which sub-expressions of this expression can
+ * touch a `shared struct`?", shared by every site that used to roll its
+ * own: the primary lock emitter and the multi-root lock collector
+ * (ir_lower.c), the spawn-arg and defer-body lock emitters (emitter.c),
+ * and the same-statement deadlock type collector (below).
+ *
+ * WHY IT EXISTS. Those five walkers were independent if/else chains with
+ * identical intent, and they drifted — the classic multi-site shape this
+ * project keeps paying for. Measured 2026-08-12, all five omitted the
+ * CALL CALLEE position, so `g.cb()` (calling a function-pointer FIELD of
+ * a shared struct) read `cb` out of `g` with NO lock while `g.cb = f`
+ * one line earlier locked correctly: a silent unsynchronized read that
+ * neither the checker nor the runtime reported. The emitter's spawn-arg
+ * walker was additionally still the pre-AUDIT-2026-06-28 root-ident-only
+ * form, so `spawn w(wa.sp.v)` (nested `*shared`), `spawn w(@truncate(u32,
+ * gs.v))` and `spawn w(m() orelse gs.v)` all emitted no lock either.
+ *
+ * THE SPLIT that makes unification safe: the RECURSION (which positions
+ * to descend) is common to every site and is where the bugs lived; the
+ * HEAD processing (outermost-shared-sub-expression for locking vs
+ * every-shared-type-in-the-chain for deadlock detection) legitimately
+ * differs. So the recursion lives here once, exhaustively, and each site
+ * supplies a visitor.
+ *
+ * THE GATE: this is a no-`default:` switch over NodeKind, so a new node
+ * kind is a `-Werror=switch` BUILD FAILURE instead of a silently
+ * unlocked shared access. That is what the old if/else chains gave up —
+ * one of them said so out loud ("uses if/else ... to avoid the
+ * walker-default audit"). Do NOT add a `default:` here.
+ *
+ * The visitor is called on NODE_FIELD (a projection chain that may have a
+ * shared root) and on NODE_CALL (so the deadlock collector can do its
+ * transitive callee lookup). Callers ignore the kinds they do not need. */
+void checker_walk_shared_chains(Checker *c, Node *expr,
+                                ZerSharedVisitFn fn, void *ud) {
+    if (!expr || !fn) return;
     switch (expr->kind) {
-    case NODE_FIELD: {
-        /* AUDIT-2026-06-28: at each FIELD/INDEX step, check the OBJECT's
-         * type — that's the struct (or *shared struct pointer) being
-         * dereferenced for the field access. The old walker descended all
-         * the way to the innermost IDENT and checked only that, missing
-         * intermediate `*shared S` fields: `w.sp.v` where `w.sp` is `*S`
-         * silently compiled, emitting an unlocked `w.sp->v = X` race, and
-         * the multi-shared `gb.pa.v` (B shared + *shared A) escaped the
-         * deadlock check entirely. Class is the BH-18 #7 sibling — same
-         * form-coverage shape, different node level.
-         *
-         * IMPORTANT: only the FIELD OBJECT (not the outer expression
-         * itself) is shared-checked. `gb.pa = &ga` reads/writes `gb`'s
-         * field-`.pa`; the *shared type of `gb.pa` does NOT mean A is
-         * accessed (no deref). Walking object-by-object preserves that
-         * distinction. */
-        Node *cur = expr;
-        while (cur && cur->kind == NODE_FIELD) {
-            Node *obj = cur->field.object;
-            Type *ot = typemap_get(c, obj);
-            if (!ot && obj && obj->kind == NODE_IDENT) {
-                Symbol *sym = scope_lookup(c->current_scope,
-                    obj->ident.name, (uint32_t)obj->ident.name_len);
-                if (sym) ot = sym->type;
-            }
-            if (ot) {
-                Type *eff = type_unwrap_distinct(ot);
-                Type *shared = NULL;
-                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) shared = eff;
-                if (!shared && eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        shared = inner;
-                }
-                if (shared) {
-                    bool dup = false;
-                    for (int i = 0; i < count; i++) {
-                        if (types[i]->struct_type.type_id == shared->struct_type.type_id) {
-                            dup = true; break;
-                        }
-                    }
-                    if (!dup && count < max_types) {
-                        types[count++] = shared;
-                    }
+    case NODE_FIELD:
+        fn(c, expr, ud);
+        /* The visitor's head-walk steps OVER index subscripts inside the
+         * projection chain, so a shared read buried in a subscript
+         * (`g.arr[h.v].f`) would never be visited. Walk the chain here and
+         * descend into each subscript expression. */
+        {
+            Node *cur = expr;
+            while (cur) {
+                if (cur->kind == NODE_FIELD) {
+                    cur = cur->field.object;
+                } else if (cur->kind == NODE_INDEX) {
+                    checker_walk_shared_chains(c, cur->index_expr.index, fn, ud);
+                    cur = cur->index_expr.object;
+                } else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) {
+                    cur = cur->unary.operand;
+                } else {
+                    break;
                 }
             }
-            cur = obj;
+        }
+        break;
+    case NODE_CALL:
+        /* THE CALLEE IS AN EXPRESSION POSITION LIKE ANY OTHER. `g.cb()`
+         * reads the funcptr field `cb` out of shared `g` and must lock it.
+         * All five legacy walkers descended only into `args`. */
+        checker_walk_shared_chains(c, expr->call.callee, fn, ud);
+        for (int i = 0; i < expr->call.arg_count; i++)
+            checker_walk_shared_chains(c, expr->call.args[i], fn, ud);
+        fn(c, expr, ud);
+        break;
+    case NODE_BINARY:
+        checker_walk_shared_chains(c, expr->binary.left, fn, ud);
+        checker_walk_shared_chains(c, expr->binary.right, fn, ud);
+        break;
+    case NODE_ASSIGN:
+        checker_walk_shared_chains(c, expr->assign.target, fn, ud);
+        checker_walk_shared_chains(c, expr->assign.value, fn, ud);
+        break;
+    case NODE_UNARY:
+        checker_walk_shared_chains(c, expr->unary.operand, fn, ud);
+        break;
+    case NODE_INDEX:
+        checker_walk_shared_chains(c, expr->index_expr.object, fn, ud);
+        checker_walk_shared_chains(c, expr->index_expr.index, fn, ud);
+        break;
+    case NODE_SLICE:
+        checker_walk_shared_chains(c, expr->slice.object, fn, ud);
+        checker_walk_shared_chains(c, expr->slice.start, fn, ud);
+        checker_walk_shared_chains(c, expr->slice.end, fn, ud);
+        break;
+    case NODE_ORELSE:
+        checker_walk_shared_chains(c, expr->orelse.expr, fn, ud);
+        /* A `return`/`break`/`continue` fallback carries no value expression
+         * (fallback is the marker); a block fallback is lowered to its own
+         * statements, each of which gets its own per-statement lock. */
+        if (!expr->orelse.fallback_is_return &&
+            !expr->orelse.fallback_is_break &&
+            !expr->orelse.fallback_is_continue)
+            checker_walk_shared_chains(c, expr->orelse.fallback, fn, ud);
+        break;
+    case NODE_TYPECAST:
+        checker_walk_shared_chains(c, expr->typecast.expr, fn, ud);
+        break;
+    case NODE_INTRINSIC: {
+        /* condvar / barrier / once intrinsics acquire and release the
+         * struct's own mutex internally — wrapping them in an outer lock
+         * would deadlock (or, with the recursive mutex, release early). */
+        const char *nm = expr->intrinsic.name;
+        size_t nlen = expr->intrinsic.name_len;
+        bool self_locking =
+            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
+            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
+            (nlen == 4 && memcmp(nm, "once", 4) == 0);
+        if (!self_locking) {
+            for (int i = 0; i < expr->intrinsic.arg_count; i++)
+                checker_walk_shared_chains(c, expr->intrinsic.args[i], fn, ud);
         }
         break;
     }
-    case NODE_BINARY:
-        count = collect_shared_types_in_expr(c, expr->binary.left, types, max_types, count);
-        count = collect_shared_types_in_expr(c, expr->binary.right, types, max_types, count);
-        break;
-    case NODE_ASSIGN:
-        count = collect_shared_types_in_expr(c, expr->assign.target, types, max_types, count);
-        count = collect_shared_types_in_expr(c, expr->assign.value, types, max_types, count);
-        break;
-    case NODE_UNARY:
-        count = collect_shared_types_in_expr(c, expr->unary.operand, types, max_types, count);
-        break;
-    /* BH-18 #7 (copied from cool-johnson-t8vr3h): the collector skipped node
-     * kinds that hide shared reads in subexpressions. The plain `pa.x = pb.y`
-     * form was rejected with the deadlock multi-shared-type error, but wrapping
-     * ONE side in any of these node kinds evaded the check — the emitter
-     * (lock-per-statement) then locked one struct and read the other unlocked,
-     * a real cross-struct race (TSan-confirmed). Recurse into them. */
-    case NODE_TYPECAST:
-        count = collect_shared_types_in_expr(c, expr->typecast.expr, types, max_types, count);
-        break;
-    case NODE_INTRINSIC:
-        for (int i = 0; i < expr->intrinsic.arg_count && count < max_types; i++)
-            count = collect_shared_types_in_expr(c, expr->intrinsic.args[i], types, max_types, count);
-        break;
-    case NODE_INDEX:
-        count = collect_shared_types_in_expr(c, expr->index_expr.object, types, max_types, count);
-        count = collect_shared_types_in_expr(c, expr->index_expr.index, types, max_types, count);
-        break;
-    case NODE_ORELSE:
-        count = collect_shared_types_in_expr(c, expr->orelse.expr, types, max_types, count);
-        if (expr->orelse.fallback && !expr->orelse.fallback_is_return &&
-            !expr->orelse.fallback_is_break && !expr->orelse.fallback_is_continue)
-            count = collect_shared_types_in_expr(c, expr->orelse.fallback, types, max_types, count);
-        break;
-    case NODE_SLICE:
-        count = collect_shared_types_in_expr(c, expr->slice.object, types, max_types, count);
-        count = collect_shared_types_in_expr(c, expr->slice.start, types, max_types, count);
-        count = collect_shared_types_in_expr(c, expr->slice.end, types, max_types, count);
-        break;
     case NODE_STRUCT_INIT:
-        for (int i = 0; i < expr->struct_init.field_count && count < max_types; i++)
-            count = collect_shared_types_in_expr(c, expr->struct_init.fields[i].value, types, max_types, count);
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            checker_walk_shared_chains(c, expr->struct_init.fields[i].value, fn, ud);
         break;
-    /* Statement nodes that may appear when scanning callee bodies transitively */
-    case NODE_RETURN:
-        count = collect_shared_types_in_expr(c, expr->ret.expr, types, max_types, count);
-        break;
+    /* Statement kinds a caller may hand in directly (the deadlock collector
+     * scans callee bodies transitively). */
     case NODE_EXPR_STMT:
-        count = collect_shared_types_in_expr(c, expr->expr_stmt.expr, types, max_types, count);
+        checker_walk_shared_chains(c, expr->expr_stmt.expr, fn, ud);
+        break;
+    case NODE_RETURN:
+        checker_walk_shared_chains(c, expr->ret.expr, fn, ud);
         break;
     case NODE_VAR_DECL:
-        count = collect_shared_types_in_expr(c, expr->var_decl.init, types, max_types, count);
+        checker_walk_shared_chains(c, expr->var_decl.init, fn, ud);
         break;
-    case NODE_CALL: {
-        for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
-            count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
-        /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
-         * Uses DFS with memoization — no depth limit, handles mutual recursion.
-         * Each function computed once via compute_func_shared_types(). */
-        if (count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
-            const char *cn = expr->call.callee->ident.name;
-            uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
-            compute_func_shared_types(c, cn, cl);
-            struct FuncSharedTypes *fsc = find_func_shared_cache(c, cn, cl);
-            if (fsc) {
-                for (int fi = 0; fi < fsc->type_count && count < max_types; fi++) {
-                    /* Check if already in the output list */
-                    bool dup = false;
-                    for (int di = 0; di < count; di++) {
-                        if (types[di]->struct_type.type_id == fsc->type_ids[fi]) {
-                            dup = true; break;
-                        }
+    /* Leaves and kinds that cannot themselves carry a shared projection.
+     * Enumerated explicitly — NO default: (see the gate note above). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_ASM:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    }
+}
+
+/* The shared-struct type reached by projecting through `obj`, or NULL.
+ * `obj` is the OBJECT of a field/index/deref step — the thing being
+ * dereferenced — so a `*shared S` field counts (the step derefs it) while
+ * merely naming it does not. Shared `is_shared` is set for `shared(rw)`
+ * too (parser.c), so testing it alone covers both lock flavours. */
+static Type *shared_type_of_step(Checker *c, Node *obj) {
+    if (!obj) return NULL;
+    Type *ot = checker_get_type(c, obj);
+    if (!ot && obj->kind == NODE_IDENT) {
+        Symbol *sym = scope_lookup(c->current_scope,
+            obj->ident.name, (uint32_t)obj->ident.name_len);
+        if (sym) ot = sym->type;
+    }
+    if (!ot) return NULL;
+    Type *eff = type_unwrap_distinct(ot);
+    if (eff->kind == TYPE_STRUCT &&
+        (eff->struct_type.is_shared || eff->struct_type.is_shared_rw))
+        return eff;
+    if (eff->kind == TYPE_POINTER) {
+        Type *inner = type_unwrap_distinct(eff->pointer.inner);
+        if (inner && inner->kind == TYPE_STRUCT &&
+            (inner->struct_type.is_shared || inner->struct_type.is_shared_rw))
+            return inner;
+    }
+    return NULL;
+}
+
+/* The OUTERMOST sub-expression of a NODE_FIELD projection chain whose
+ * type is a shared struct (or pointer to one) — i.e. the node the lock
+ * must be taken on. Returns NULL if the chain has no shared step.
+ * This is the head processing shared by all four LOCK-EMITTING sites. */
+Node *checker_shared_lock_root_of_chain(Checker *c, Node *chain) {
+    if (!chain || chain->kind != NODE_FIELD) return NULL;
+    Node *cur = chain;
+    while (cur) {
+        Node *next;
+        if (cur->kind == NODE_FIELD) next = cur->field.object;
+        else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
+        else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR)
+            next = cur->unary.operand;
+        else break;
+        if (shared_type_of_step(c, next)) return next;
+        cur = next;
+    }
+    return NULL;
+}
+
+/* Visitor state for the "first lock root" query used by the single-root
+ * lock emitters. */
+struct SharedRootFirst { Node *found; };
+
+static void shared_root_first_visit(Checker *c, Node *node, void *ud) {
+    struct SharedRootFirst *st = (struct SharedRootFirst *)ud;
+    if (st->found || node->kind != NODE_FIELD) return;
+    Node *r = checker_shared_lock_root_of_chain(c, node);
+    if (r) st->found = r;
+}
+
+Node *checker_find_shared_root(Checker *c, Node *expr) {
+    struct SharedRootFirst st;
+    st.found = NULL;
+    checker_walk_shared_chains(c, expr, shared_root_first_visit, &st);
+    return st.found;
+}
+
+/* Visitor state for the multi-root query (read locks compose, so a
+ * statement reading several shared structs locks each). Dedup is by node
+ * identity and by root ident name — two syntactic reads of `ga` are one
+ * lock. */
+struct SharedRootAll { Node **out; int *count; int max; };
+
+static void shared_root_all_visit(Checker *c, Node *node, void *ud) {
+    struct SharedRootAll *st = (struct SharedRootAll *)ud;
+    if (node->kind != NODE_FIELD || *st->count >= st->max) return;
+    Node *root = checker_shared_lock_root_of_chain(c, node);
+    if (!root) return;
+    for (int i = 0; i < *st->count; i++) {
+        if (st->out[i] == root) return;
+        if (st->out[i]->kind == NODE_IDENT && root->kind == NODE_IDENT &&
+            st->out[i]->ident.name_len == root->ident.name_len &&
+            memcmp(st->out[i]->ident.name, root->ident.name,
+                   root->ident.name_len) == 0)
+            return;
+    }
+    st->out[(*st->count)++] = root;
+}
+
+void checker_collect_shared_roots(Checker *c, Node *expr,
+                                  Node **out, int *count, int max) {
+    struct SharedRootAll st;
+    st.out = out; st.count = count; st.max = max;
+    checker_walk_shared_chains(c, expr, shared_root_all_visit, &st);
+}
+
+/* Visitor state for the same-statement deadlock check: which shared TYPES does
+ * this statement touch? Differs from the lock-root query on purpose — locking
+ * takes the OUTERMOST shared sub-expression, while the deadlock rule must see
+ * EVERY shared type in a projection chain (`gb.pa.v` accesses the *shared A
+ * reached through `gb.pa` AND shared B, i.e. `gb` itself). The RECURSION is
+ * shared (checker_walk_shared_chains); only this head processing differs. */
+struct SharedTypeCollect { Type **types; int count; int max; };
+
+static void shared_type_add(struct SharedTypeCollect *st, Type *shared) {
+    if (!shared || st->count >= st->max) return;
+    for (int i = 0; i < st->count; i++)
+        if (st->types[i]->struct_type.type_id == shared->struct_type.type_id) return;
+    st->types[st->count++] = shared;
+}
+
+static void shared_type_visit(Checker *c, Node *node, void *ud) {
+    struct SharedTypeCollect *st = (struct SharedTypeCollect *)ud;
+    if (st->count >= st->max) return;
+    if (node->kind == NODE_FIELD) {
+        Node *cur = node;
+        while (cur && cur->kind == NODE_FIELD) {
+            shared_type_add(st, shared_type_of_step(c, cur->field.object));
+            cur = cur->field.object;
+        }
+        return;
+    }
+    if (node->kind != NODE_CALL) return;
+    {
+        Type **types = st->types;
+        int count = st->count;
+        int max_types = st->max;
+        Node *expr = node;
+    /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
+     * Uses DFS with memoization — no depth limit, handles mutual recursion.
+     * Each function computed once via compute_func_shared_types(). */
+    if (count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
+        const char *cn = expr->call.callee->ident.name;
+        uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
+        compute_func_shared_types(c, cn, cl);
+        struct FuncSharedTypes *fsc = find_func_shared_cache(c, cn, cl);
+        if (fsc) {
+            for (int fi = 0; fi < fsc->type_count && count < max_types; fi++) {
+                /* Check if already in the output list */
+                bool dup = false;
+                for (int di = 0; di < count; di++) {
+                    if (types[di]->struct_type.type_id == fsc->type_ids[fi]) {
+                        dup = true; break;
                     }
-                    if (!dup) {
-                        /* Find the Type* for this type_id — scan global scope */
-                        for (uint32_t si = 0; si < c->global_scope->symbol_count; si++) {
-                            Symbol *s = &c->global_scope->symbols[si];
-                            if (s->type) {
-                                Type *eff = type_unwrap_distinct(s->type);
-                                if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared &&
-                                    eff->struct_type.type_id == fsc->type_ids[fi]) {
-                                    types[count++] = eff;
-                                    break;
-                                }
+                }
+                if (!dup) {
+                    /* Find the Type* for this type_id — scan global scope */
+                    for (uint32_t si = 0; si < c->global_scope->symbol_count; si++) {
+                        Symbol *s = &c->global_scope->symbols[si];
+                        if (s->type) {
+                            Type *eff = type_unwrap_distinct(s->type);
+                            if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared &&
+                                eff->struct_type.type_id == fsc->type_ids[fi]) {
+                                types[count++] = eff;
+                                break;
                             }
                         }
                     }
                 }
             }
         }
-        break;
     }
-    /* No-op kinds — these cannot hide a shared-struct field read that the
-     * per-statement deadlock check must see (literals, idents, declarations,
-     * and control-flow statements whose bodies are scanned elsewhere). Listed
-     * explicitly with NO default: clause so -Wswitch / -Werror=switch forces a
-     * conscious decision here whenever a new NodeKind is added. This is the
-     * structural defense against the BH-18 #7 form-coverage gap class — a new
-     * expression form that could carry a shared read can no longer be silently
-     * skipped; it becomes a build failure until handled. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
-    case NODE_SWITCH: case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
-    case NODE_GOTO: case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
-        break;
+
+        st->count = count;
     }
-    return count;
+}
+
+/* BUG-789 (2026-08-12): the fifth divergent walker. Its NODE_CALL arm descended
+ * only into `args`, so `g.cb()` never registered `G` — no deadlock check AND
+ * (via the sibling lock emitters) no lock. Now rides the unified recursion. */
+static int collect_shared_types_in_expr(Checker *c, Node *expr,
+                                         Type **types, int max_types, int count) {
+    struct SharedTypeCollect st;
+    st.types = types; st.count = count; st.max = max_types;
+    checker_walk_shared_chains(c, expr, shared_type_visit, &st);
+    return st.count;
 }
 
 static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, int max_types) {

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-787 (2026-08-12): `free((*N)n)` produced NO tracking key at all — the key
+// extractor accepted only IDENT/FIELD/INDEX — so the free was never registered
+// while the emitter still emitted the real free. The following use-after-free
+// AND the double-free below were both ACCEPTED (measured: the program ran, read
+// the recycled slot and freed twice).
+struct N { u32 x; }
+u32 main() {
+    ?*N m = alloc(N);
+    *N n = m orelse { return 1; };
+    n.x = 1111;
+    free((*N)n);
+    u32 v = n.x;
+    free(n);
+    return v;
+}

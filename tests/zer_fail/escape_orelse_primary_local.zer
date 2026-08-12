@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: local-derived pointer
+// BUG-786 (2026-08-12): the orelse arm of arg_is_local_derived inspected only
+// the FALLBACK, so a local-derived PRIMARY escaped at the store-to-global,
+// struct-field and call-arg sinks. The primary is the value that flows on the
+// has-value path — it is at least as escaping as the fallback.
+struct L { u32 f; u32 g; }
+?*u32 g_p;
+u32 g_dummy;
+void stash() {
+    L loc;
+    loc.f = 3235823873;
+    ?*u32 t = &loc.f;
+    g_p = t orelse &g_dummy;
+}
+u32 main() { stash(); return 0; }

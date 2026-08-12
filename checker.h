@@ -324,4 +324,31 @@ uint64_t checker_auto_guard_size(Checker *c, Node *node);
 /* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
 Symbol *find_unique_allocator(Scope *s, Type *elem_type);
 
+/* ---- Unified shared-struct chain walk (2026-08-12) ----
+ * ONE recursion over every expression position that can touch a
+ * `shared struct`, replacing five divergent per-site if/else walkers in
+ * ir_lower.c, emitter.c and checker.c. See the block comment on
+ * checker_walk_shared_chains in checker.c for why (all five omitted the
+ * CALL CALLEE position, so `g.cb()` read a shared funcptr field with no
+ * lock) and for the -Werror=switch gate that now protects it.
+ *
+ * The visitor is called on NODE_FIELD nodes (projection chains that may
+ * have a shared root) and on NODE_CALL nodes (for transitive callee
+ * analysis). Ignore the kinds you do not need. */
+typedef void (*ZerSharedVisitFn)(Checker *c, Node *node, void *ud);
+void checker_walk_shared_chains(Checker *c, Node *expr,
+                                ZerSharedVisitFn fn, void *ud);
+
+/* The outermost sub-expression of a NODE_FIELD chain whose type is a
+ * shared struct (or pointer to one) — the node to take the lock on. */
+Node *checker_shared_lock_root_of_chain(Checker *c, Node *chain);
+
+/* First shared lock root anywhere in `expr`, or NULL. */
+Node *checker_find_shared_root(Checker *c, Node *expr);
+
+/* Every distinct shared lock root in `expr` (deduped by node identity and
+ * by root ident name); appends to out[*count], never exceeding max. */
+void checker_collect_shared_roots(Checker *c, Node *expr,
+                                  Node **out, int *count, int max);
+
 #endif /* ZER_CHECKER_H */

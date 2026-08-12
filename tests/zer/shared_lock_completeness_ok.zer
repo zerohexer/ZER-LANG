@@ -1,0 +1,46 @@
+// BUG-789 (2026-08-12): the four shared-read forms that used to emit NO lock.
+// "which shared struct does this expression touch?" was answered by five
+// divergent walkers; all five omitted the CALL CALLEE position, and the
+// spawn-arg one was still the pre-AUDIT-2026-06-28 root-ident-only form.
+// This pins that all four still COMPILE and RUN after unification (the
+// discriminating proof that the callee is now seen is the deadlock negative
+// tests/zer_fail/shared_callee_multi_type_deadlock.zer).
+shared struct S { u32 v; }
+struct W { *S sp; }
+S gs;
+
+shared struct Ops { *() cb; u32 n; }
+Ops go;
+u32 hits;
+void bump() { hits += 1; }
+
+void w1(u32 x) { }
+?u32 none() { return null; }
+
+u32 main() {
+    gs.v = 7;
+    go.n = 1;
+
+    // form 1: funcptr FIELD of a shared struct in CALLEE position
+    go.cb = bump;
+    go.cb();
+
+    // form 2: nested `*shared S` field as a spawn argument
+    W wa;
+    wa.sp = &gs;
+    spawn w1(wa.sp.v);
+
+    // form 3: shared read wrapped in an intrinsic, as a spawn argument
+    spawn w1(@truncate(u32, gs.v));
+
+    // form 4: shared read in an orelse FALLBACK. NOT exercised through a spawn
+    // argument here — `spawn f(opt orelse v)` hits a PRE-EXISTING emitter gap
+    // (NODE_ORELSE unhandled in emit_rewritten_node's raw-AST spawn-arg path,
+    // emits a runtime "compiler bug" trap); see docs/limitations.md. The lock
+    // walk itself is exercised through a plain statement.
+    u32 f4 = none() orelse gs.v;
+    if (f4 != 7) { return 2; }
+
+    if (hits != 1) { return 1; }
+    return 0;
+}

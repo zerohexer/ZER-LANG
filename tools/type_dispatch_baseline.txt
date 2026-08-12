@@ -745,3 +745,13 @@ checker.c:eff_pl->kind == TYPE_OPAQUE);
 checker.c:eff_pl->kind == TYPE_SLICE ||
 checker.c:if (eff_pl->kind == TYPE_OPTIONAL)
 checker.c:if (eff_pl->kind == TYPE_POINTER) {
+# BUG-789 2026-08-12: shared_type_of_step (checker.c) — `eff` is the local
+# `type_unwrap_distinct(ot)` result on the line above; already-unwrapped _eff-style
+# read, same shape as the zercheck_ir move-alias lines above.
+checker.c:if (eff->kind == TYPE_STRUCT &&
+# BUG-788 2026-08-12: the @inttoptr volatile wrap (checker.c) — DELIBERATELY matches
+# a DIRECT pointer only. `result` is resolve_type() of the intrinsic's TYPE ARGUMENT;
+# rebuilding a volatile pointer from a TYPE_DISTINCT wrapper would DROP the distinct
+# identity, which is worse than not wrapping. Residual (a `distinct *u32` MMIO
+# typedef is not forced volatile) is recorded in docs/limitations.md.
+checker.c:if (result && result->kind == TYPE_POINTER &&

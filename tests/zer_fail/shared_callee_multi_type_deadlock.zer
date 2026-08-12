@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: shared
+// BUG-789 (2026-08-12): the CALL CALLEE position was invisible to all five
+// shared-struct walkers. `g.cb(...)` reads the funcptr field `cb` out of shared
+// `g`, so this statement touches TWO shared structs and must trip the
+// same-statement multi-shared-type deadlock rule. Before the unified walk it
+// was accepted, and the emitter locked only `h` — reading `g.cb` unlocked.
+shared struct G { *(u32) cb; u32 v; }
+shared struct H { u32 w; }
+G g;
+H h;
+void t(u32 x) {}
+u32 main() {
+    g.cb = t;
+    g.cb(h.w);
+    return 0;
+}

@@ -156,6 +156,26 @@ cell heap_glob_arrelem_dangle reject 'struct N { u32 x; } struct HB { ?*N p; } H
 cell heap_glob_launder_field  reject 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = @ptrcast(*N, n); free(n); return 0; }'
 cell safe_glob_field_reset   compile 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = n; free(n); gb.p = null; return 0; }'
 
+# p15 — LAUNDER SHAPES (2026-08-12, BUG-785/786/787). The question "is this value
+# frame-bound?" is answered after PEELING launders; a peel present at one sink and
+# absent from the shared peeler is the same hole. `(*T)x` was missing from
+# unwrap_ptr_launder for the entire life of C-style casts, and `orelse` was peeled
+# at neither arm. The safe cells pin the boundary so the peel cannot be widened
+# into an over-rejection.
+echo "===== SHAPE p15 = launder wrappers around a local-derived pointer ====="
+cell p15__cast_store_glob   reject 'void c() { L loc; *u32 p = &loc.f; g_p = (*u32)p; } u32 main(){return 0;}'
+cell p15__cast_ret          reject '*u32 c() { L loc; return (*u32)&loc.f; } u32 main(){return 0;}'
+cell p15__cast_field_store  reject 'void c() { L loc; *u32 p = &loc.f; g_h.p = (*u32)p; } u32 main(){return 0;}'
+cell p15__cast_keep         reject 'void c() { L loc; *u32 p = &loc.f; keepfn((*u32)p); } u32 main(){return 0;}'
+cell p15__cast_keepinfer    reject 'void st(*u32 p) { g_p = (*u32)p; } void c() { L loc; st(&loc.f); } u32 main(){return 0;}'
+cell p15__orelse_primary    reject 'u32 g_d; void c() { L loc; ?*u32 t = &loc.f; g_p = t orelse &g_d; } u32 main(){return 0;}'
+cell p15__orelse_fallback   reject '?*u32 mk() { return null; } void c() { L loc; g_p = mk() orelse &loc.f; } u32 main(){return 0;}'
+cell p15__free_cast         reject 'struct N { u32 x; } u32 main(){ ?*N m = alloc(N); *N n = m orelse return; free((*N)n); u32 v = n.x; return v; }'
+cell p15__free_ptrcast      reject 'struct N { u32 x; } u32 main(){ ?*N m = alloc(N); *N n = m orelse return; free(@ptrcast(*N, n)); u32 v = n.x; return v; }'
+cell safe_p15_cast_global   compile 'u32 g_v; void c() { g_p = (*u32)&g_v; } u32 main(){return 0;}'
+cell safe_p15_orelse_global compile 'u32 g_v2; u32 g_d2; ?*u32 gt; void c() { g_p = gt orelse &g_d2; } u32 main(){return 0;}'
+cell safe_p15_free_cast_ok  compile 'struct N { u32 x; } u32 main(){ ?*N m = alloc(N); *N n = m orelse return; free((*N)n); return 0; }'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

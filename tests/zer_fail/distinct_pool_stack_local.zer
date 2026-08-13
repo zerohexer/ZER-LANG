@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: must be declared as global or static
+// BUG-787. `distinct typedef Pool(T,N)` has kind TYPE_DISTINCT, so the three
+// container-POSITION checks — which compared a raw `->kind` — skipped it. The
+// declaration was then accepted by the checker and emitted C referencing an
+// only-forward-declared struct, so GCC failed with "storage size of 'p' isn't
+// known" pointing at ZER source: a diagnostic the user cannot act on.
+// The plain `Pool(Task,4) p;` sibling was always rejected here.
+struct Task { u32 id; }
+distinct typedef Pool(Task, 4) DPool;
+u32 main() { DPool p; return 0; }

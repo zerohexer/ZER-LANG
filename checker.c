@@ -2533,6 +2533,50 @@ static Type *resolve_type(Checker *c, TypeNode *tn) {
     return t;
 }
 
+/* Fold a declaration's `const` / `volatile` keyword into the slice/pointer TYPE.
+ *
+ * MULTI-SITE CLASS (BUG-785, 2026-08-13). The question "what type does this
+ * declaration actually have?" was answered independently at THREE sites:
+ *   1. check_stmt   NODE_VAR_DECL / NODE_GLOBAL_VAR body check  (had it)
+ *   2. register_decl NODE_GLOBAL_VAR                            (had it)
+ *   3. checker_check_bodies, the global-INITIALIZER compatibility check (did NOT)
+ * Site 3 called bare `resolve_type`, so a global's declared type lost its
+ * qualifier before being compared against the initializer. Effect: the natural
+ * `const [*]u8 g = "hello";` — a global const string — was REJECTED with
+ * `cannot initialize 'g' of type '[]u8' with 'const []u8'`, while the identical
+ * declaration as a LOCAL compiled. The two type names printed identically until
+ * type_name learned to render qualifiers (same commit), which is what exposed it.
+ *
+ * Pointer volatile propagation matters beyond diagnostics: without it a
+ * `volatile *u32 reg` reference yields a non-volatile type, IR copies it into a
+ * plain temp, and the emitter strips volatile — a silent MMIO miscompile on
+ * bare metal (BUG-643/664/665). Keeping ONE implementation is what stops the
+ * three copies drifting apart again. */
+static Type *apply_decl_qualifiers(Checker *c, Node *decl, Type *type) {
+    if (!type || !decl) return type;
+    if (decl->var_decl.is_const) {
+        if (type->kind == TYPE_SLICE && !type->slice.is_const) {
+            type = type_const_slice(c->arena, type->slice.inner);
+        } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
+            type = type_const_pointer(c->arena, type->pointer.inner);
+        }
+    }
+    if (decl->var_decl.is_volatile) {
+        Type *teff = type_unwrap_distinct(type);
+        if (teff && teff->kind == TYPE_SLICE && !teff->slice.is_volatile) {
+            type = type_volatile_slice(c->arena, teff->slice.inner);
+            if (decl->var_decl.is_const) type->slice.is_const = true;
+        } else if (teff && teff->kind == TYPE_POINTER && !teff->pointer.is_volatile) {
+            Type *vp = type_pointer(c->arena, teff->pointer.inner);
+            vp->pointer.is_volatile = true;
+            if (teff->pointer.is_const || decl->var_decl.is_const)
+                vp->pointer.is_const = true;
+            type = vp;
+        }
+    }
+    return type;
+}
+
 static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
     switch (tn->kind) {
     case TYNODE_U8:     return ty_u8;
@@ -11469,44 +11513,26 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "cannot declare variable of type 'void'");
         }
-        /* Pool/Ring/Slab must be global or static — not on the stack */
-        if (node->kind == NODE_VAR_DECL && type &&
-            (type->kind == TYPE_POOL || type->kind == TYPE_RING || type->kind == TYPE_SLAB) &&
-            !node->var_decl.is_static) {
-            checker_error(c, node->loc.line,
-                "%s must be declared as global or static — "
-                "stack allocation risks overflow",
-                type->kind == TYPE_POOL ? "Pool" : type->kind == TYPE_RING ? "Ring" : "Slab");
-        }
-        /* propagate const from var qualifier to slice/pointer type */
-        if (node->var_decl.is_const && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
-                type = type_const_slice(c->arena, type->slice.inner);
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
-                type = type_const_pointer(c->arena, type->pointer.inner);
+        /* Pool/Ring/Slab must be global or static — not on the stack.
+         * type_dispatch_kind, NOT raw ->kind (BUG-787): a `distinct typedef
+         * Pool(T,N)` has kind TYPE_DISTINCT, so the raw comparison silently
+         * skipped this check and the emitter then produced C referencing an
+         * only-forward-declared struct — GCC failed with "storage size isn't
+         * known" pointing at ZER source, an error the user cannot act on. */
+        {
+            TypeKind pk = type ? type_dispatch_kind(type) : TYPE_VOID;
+            if (node->kind == NODE_VAR_DECL &&
+                (pk == TYPE_POOL || pk == TYPE_RING || pk == TYPE_SLAB) &&
+                !node->var_decl.is_static) {
+                checker_error(c, node->loc.line,
+                    "%s must be declared as global or static — "
+                    "stack allocation risks overflow",
+                    pk == TYPE_POOL ? "Pool" : pk == TYPE_RING ? "Ring" : "Slab");
             }
         }
-        /* propagate volatile from var qualifier to slice/pointer type.
-         *
-         * Pointer propagation (BUG-643/664/665): without this, the type
-         * stored in the typemap for `volatile *u32 reg = ...` is plain
-         * `*u32`. Subsequent uses of `reg` (via NODE_IDENT) returned this
-         * non-volatile type; IR lowering copied `reg` into a temp typed
-         * `*u32`, and the emitter declared `uint32_t* _zer_t0 = reg;` —
-         * stripping volatile. GCC warned but the temp-routed reads/writes
-         * were not volatile in C — silent MMIO miscompile on baremetal. */
-        if (node->var_decl.is_volatile && type) {
-            Type *teff = type_unwrap_distinct(type);
-            if (teff && teff->kind == TYPE_SLICE && !teff->slice.is_volatile) {
-                type = type_volatile_slice(c->arena, teff->slice.inner);
-                if (node->var_decl.is_const) type->slice.is_const = true;
-            } else if (teff && teff->kind == TYPE_POINTER && !teff->pointer.is_volatile) {
-                Type *vp = type_pointer(c->arena, teff->pointer.inner);
-                vp->pointer.is_volatile = true;
-                if (teff->pointer.is_const || node->var_decl.is_const) vp->pointer.is_const = true;
-                type = vp;
-            }
-        }
+        /* Fold the decl's const/volatile into the slice/pointer type.
+         * ONE shared implementation — see apply_decl_qualifiers (BUG-785). */
+        type = apply_decl_qualifiers(c, node, type);
         /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
          * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR).
          * AUDIT 2026-06-12: unwrap TYPE_DISTINCT so `distinct typedef *u32 P; P p;`
@@ -15753,7 +15779,13 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
                 /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T02) */
-                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB) &&
+                /* type_dispatch_kind, not raw ->kind — a `distinct Pool(T,N)`
+                 * field evaded this and emitted incomplete-type C (BUG-787).
+                 * The sync-in-packed check two blocks down already unwraps. */
+                if (sf->type &&
+                    (type_dispatch_kind(sf->type) == TYPE_POOL ||
+                     type_dispatch_kind(sf->type) == TYPE_RING ||
+                     type_dispatch_kind(sf->type) == TYPE_SLAB) &&
                     zer_container_position_valid(ZER_DP_FIELD) == 0) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
@@ -15915,7 +15947,12 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-386: Pool/Ring/Slab in union not supported (same as BUG-287 for structs) */
                 /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T03) */
-                if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB) &&
+                /* type_dispatch_kind, not raw ->kind — see the struct-field
+                 * sibling above (BUG-787). */
+                if (sv->type &&
+                    (type_dispatch_kind(sv->type) == TYPE_POOL ||
+                     type_dispatch_kind(sv->type) == TYPE_RING ||
+                     type_dispatch_kind(sv->type) == TYPE_SLAB) &&
                     zer_container_position_valid(ZER_DP_VARIANT) == 0) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be union variants — must be global or static variables");
@@ -16068,34 +16105,7 @@ static void register_decl(Checker *c, Node *node) {
     }
 
     case NODE_GLOBAL_VAR: {
-        Type *type = resolve_type(c, node->var_decl.type);
-        /* propagate const from var qualifier to slice/pointer type */
-        if (node->var_decl.is_const && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
-                type = type_const_slice(c->arena, type->slice.inner);
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
-                type = type_const_pointer(c->arena, type->pointer.inner);
-            }
-        }
-        /* propagate volatile from var qualifier to slice/pointer type.
-         * Pointer propagation (added 2026-05-18): see matching block in
-         * the NODE_VAR_DECL/NODE_GLOBAL_VAR body-check case — globals are
-         * registered here in register_decl BEFORE bodies are checked, so
-         * sym->type must carry the volatile flag from this entry point.
-         * Without this, NODE_IDENT references to a global volatile pointer
-         * return the non-volatile sym->type and downstream IR temps strip
-         * volatile (silent miscompile on MMIO reads/writes). */
-        if (node->var_decl.is_volatile && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
-                type = type_volatile_slice(c->arena, type->slice.inner);
-                if (node->var_decl.is_const) type->slice.is_const = true;
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
-                Type *vp = type_pointer(c->arena, type->pointer.inner);
-                vp->pointer.is_volatile = true;
-                vp->pointer.is_const = type->pointer.is_const;
-                type = vp;
-            }
-        }
+        Type *type = apply_decl_qualifiers(c, node, resolve_type(c, node->var_decl.type));
         /* Gap 43 (2026-04-27): reject threadlocal shared struct combination.
          * `threadlocal` puts each thread on its own copy with its own mutex;
          * cross-thread synchronization is impossible because threads never
@@ -19070,7 +19080,10 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             }
         }
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
-            Type *type = resolve_type(c, decl->var_decl.type);
+            /* BUG-785: must fold the decl's const/volatile into the type before
+             * comparing against the initializer — see apply_decl_qualifiers. */
+            Type *type = apply_decl_qualifiers(c, decl,
+                                               resolve_type(c, decl->var_decl.type));
             Type *init = check_expr(c, decl->var_decl.init);
             /* global initializers must be constant expressions in C */
             Node *ginit = decl->var_decl.init;

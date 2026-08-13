@@ -12426,3 +12426,28 @@ call-result sink must use this helper, not re-inline the predicate.** The litera
 compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape analysis
 = under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
+
+## Container-POSITION checks and the distinct gap (BUG-787, 2026-08-13)
+
+The three "where may a `Pool`/`Ring`/`Slab` appear?" checks — stack local
+(`check_stmt` NODE_VAR_DECL), struct field and union variant (both in
+`register_decl`) — are ONE question answered at three sites, and all three used
+raw `->kind == TYPE_POOL || ... TYPE_RING || ... TYPE_SLAB`. A `distinct typedef
+Pool(T,N)` therefore passed all three.
+
+Two things worth carrying forward:
+
+1. **A raw-`->kind` site can sit directly beside a correct one.** The
+   struct-field check and the sync-primitive-in-packed-struct check are two blocks
+   apart in the same loop over the same `sf->type`; the second already unwrapped
+   with `type_unwrap_distinct`. Proximity is not evidence of consistency — the
+   audit baseline is.
+2. **A checker gap does not have to be silent to be worth fixing.** Here the
+   emitted C referenced an only-forward-declared struct and GCC failed loudly, so
+   nothing unsafe shipped. But the diagnostic named a C type the user never wrote.
+   The rule this codebase already applies (BUG-767's loud fallback, H4's global-init
+   reject list) is that **the checker owns the rejection** — a GCC error standing in
+   for a checker error is a defect even when it is loud.
+
+Fix shape: `type_dispatch_kind()` at all three sites. This REMOVES rows from
+`tools/type_dispatch_baseline.txt` rather than adding any, so the audit stays green.

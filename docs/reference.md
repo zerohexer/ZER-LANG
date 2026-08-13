@@ -2019,6 +2019,777 @@ u8[512] fpu;
 - Callee-saved only (rbx/r12-r15 x86; x19-x28 ARM64; s0-s11 RISC-V).
 - Full RSP/RIP save-restore needs a naked function — kernel-integration scope.
 - `fxsave` on x86-64 requires 16-byte aligned buffer.
+---
+
+### @mmu_enable(), @mmu_disable(), @mmu_is_enabled(), @mmu_sync()
+
+**DESCRIPTION**
+Memory-management-unit control. `@mmu_is_enabled()` returns `bool`; the
+other three return `void`. `@mmu_sync()` issues the architectural barrier
+required after a page-table edit before the new mapping may be relied on
+(x86 `mfence`+TLB semantics, ARM `dsb ish`+`isb`, RISC-V `sfence.vma`).
+All are privileged — SIGSEGV in user mode, kernel code only.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {          // dead branch: compiles, never executes on host
+        @mmu_set_pt(0x1000);
+        @mmu_sync();
+        @mmu_enable();
+        if (@mmu_is_enabled()) { @mmu_disable(); }
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Always `@mmu_sync()` after changing a page table and before relying on it.
+- Non-x86/ARM/RISC-V targets get a no-op fallback.
+
+---
+
+### @mmu_set_pt(root), @mmu_get_pt(), @mmu_set_kernel_pt(root), @mmu_get_kernel_pt()
+
+**DESCRIPTION**
+Page-table root registers. `set` takes a `u64` physical root address and
+returns `void`; `get` takes no arguments and returns `u64`. The `kernel`
+pair addresses the kernel-half root on architectures that keep two
+(ARM64 `TTBR1_EL1`); on x86 both map to `CR3`. Privileged.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u64 user_root = @mmu_get_pt();
+        u64 kern_root = @mmu_get_kernel_pt();
+        @mmu_set_pt(user_root);
+        @mmu_set_kernel_pt(kern_root);
+        @mmu_sync();
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Writing the root switches address space and flushes non-global TLB entries.
+- `@mmu_set_pt` is the portable spelling of `@cpu_write_cr3` on x86.
+
+---
+
+### @mmu_get_fault_addr(), @mmu_get_fault_status()
+
+**DESCRIPTION**
+Read the faulting address and fault-status word after a page fault, for a
+page-fault handler. Both take no arguments and return `u64`.
+x86: `CR2` / error code. ARM64: `FAR_EL1` / `ESR_EL1`. RISC-V: `stval` /
+`scause`. Privileged.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u64 addr   = @mmu_get_fault_addr();
+        u64 status = @mmu_get_fault_status();
+        if (addr != 0 && status != 0) { @trap(); }
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Valid only inside a fault handler, before anything else can overwrite the register.
+- `@cpu_read_cr2()` is the x86-specific spelling of `@mmu_get_fault_addr()`.
+
+---
+
+### @tlb_flush_all(), @tlb_flush_global(), @tlb_flush_asid(asid), @tlb_flush_addr(addr), @tlb_flush_range(addr, len)
+
+**DESCRIPTION**
+Translation-lookaside-buffer invalidation. All return `void`.
+`@tlb_flush_all()` and `@tlb_flush_global()` take no arguments;
+`@tlb_flush_asid(asid)` and `@tlb_flush_addr(addr)` take one `u64`;
+`@tlb_flush_range(addr, len)` takes two. `all` leaves global (kernel)
+entries in place, `global` drops those too. Privileged.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @tlb_flush_addr(0x40000000);
+        @tlb_flush_range(0x40000000, 4096);
+        @tlb_flush_asid(7);
+        @tlb_flush_all();
+        @tlb_flush_global();
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Flush AFTER the page-table store and its `@mmu_sync()`, not before.
+- Prefer the narrowest form — a full flush costs every later translation a walk.
+
+---
+
+### @cache_flush_range(addr, len), @cache_clean_range(addr, len), @cache_invalidate_range(addr, len), @cache_invalidate_icache(addr, len)
+
+**DESCRIPTION**
+Data- and instruction-cache maintenance over an address range. All take a
+pointer and a `u64` length and return `void`.
+- `clean` — write dirty lines out, keep them valid (before a DMA **read** of your buffer)
+- `invalidate` — drop lines without writing back (after a DMA **write** into your buffer)
+- `flush` — clean **and** invalidate
+- `invalidate_icache` — instruction cache, after writing code at runtime
+
+**EXAMPLE**
+```zer
+u8[256] dma_buf;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cache_clean_range(&dma_buf[0], 256);        // before device reads
+        @cache_invalidate_range(&dma_buf[0], 256);   // after device writes
+        @cache_flush_range(&dma_buf[0], 256);
+        @cache_invalidate_icache(&dma_buf[0], 256);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Picking the wrong direction is a silent data-corruption bug that ZER cannot
+  catch — it is a hardware-consequence fact, not a program-consequence one.
+- `invalidate` on a partially-dirty line can discard your own writes; use
+  `flush` when unsure.
+
+---
+
+### @cache_flush_line(addr), @cache_zero_line(addr), @cache_flushopt(addr), @cache_writeback(addr)
+
+**DESCRIPTION**
+Single-cache-line operations. Each takes one pointer and returns `void`.
+- `@cache_flush_line` — evict one line (x86 `CLFLUSH`)
+- `@cache_flushopt` — the ordered/pipelined variant (x86 `CLFLUSHOPT`)
+- `@cache_writeback` — write back without invalidating (x86 `CLWB`, NVDIMM)
+- `@cache_zero_line` — zero a whole line without reading it first
+  (ARM `DC ZVA`); avoids a read-for-ownership on large memsets
+
+**EXAMPLE**
+```zer
+u8[256] buf;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cache_flush_line(&buf[0]);
+        @cache_flushopt(&buf[64]);
+        @cache_writeback(&buf[128]);
+        @cache_zero_line(&buf[192]);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Line size is not fixed — query it with `@cpu_cache_line_size()`.
+- `@cache_zero_line` writes a whole line: passing an address that is not
+  line-aligned zeroes neighbouring bytes.
+
+---
+
+### @cpu_pause(), @cpu_wfe(), @cpu_sev(), @cpu_breakpoint(), @cpu_flush_pipeline()
+
+**DESCRIPTION**
+Non-privileged CPU hints, all `void`, all zero-argument.
+- `@cpu_pause()` — spin-wait hint (x86 `PAUSE`, ARM `YIELD`); use in a spin loop
+- `@cpu_wfe()` / `@cpu_sev()` — ARM wait-for-event / send-event pair
+- `@cpu_breakpoint()` — debugger trap (x86 `INT3`, ARM `BRK`)
+- `@cpu_flush_pipeline()` — instruction-barrier (ARM `ISB`), after changing
+  system state that affects instruction fetch
+
+**EXAMPLE**
+```zer
+u32 g_flag;
+u32 main() {
+    u32 spins = 0;
+    while (@atomic_load(&g_flag) == 0 && spins < 3) {
+        @cpu_pause();
+        spins += 1;
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- `@cpu_pause()` is safe in user mode and is the right call in any spin loop.
+- `@cpu_breakpoint()` **will** stop the process when no debugger is attached.
+
+---
+
+### @cpu_id(), @cpu_get_pc(), @cpu_read_counter()
+
+**DESCRIPTION**
+Non-privileged inspection reads.
+- `@cpu_id()` -> `u32` — current core identifier
+- `@cpu_get_pc()` -> `u64` — current program counter
+- `@cpu_read_counter()` -> `u64` — free-running cycle counter (x86 `RDTSC`,
+  ARM `CNTVCT_EL0`, RISC-V `rdcycle`)
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 t0 = @cpu_read_counter();
+    u32 core = @cpu_id();
+    u64 t1 = @cpu_read_counter();
+    if (t1 < t0) { return 1; }
+    if (core > 4096) { return 2; }
+    return 0;
+}
+```
+
+**NOTES**
+- The cycle counter is not wall-clock and is not guaranteed to be
+  synchronised across cores.
+- `@cpu_core_id()` is a separate intrinsic and currently returns a stub `0`.
+
+---
+
+### @cpu_rdrand(), @cpu_rdseed()
+
+**DESCRIPTION**
+Hardware random number generation. **Both return `?u64`** (an optional) —
+`null` when the generator has no entropy available, which is a normal and
+expected outcome, not an error. Non-privileged, but the instruction must
+exist on the target.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 r = @cpu_rdrand() orelse 0;
+    u64 s = @cpu_rdseed() orelse 0;
+    if (r == 0 && s == 0) { return 0; }
+    return 0;
+}
+```
+
+**NOTES**
+- The optional is the whole point — a hardware RNG legitimately fails and
+  ZER makes you handle it. Retry a bounded number of times; never spin forever.
+- `@cpu_rdseed` is the seeding-grade source and fails more often than `@cpu_rdrand`.
+
+---
+
+### @wait_on_address(addr, expected)
+
+**DESCRIPTION**
+Block until the value at `addr` differs from `expected`. Takes a pointer
+and an integer, returns `void`. Lowers to the platform's wait primitive
+where one exists and to a spin-with-pause fallback where it does not.
+
+**EXAMPLE**
+```zer
+u32 g_futex;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { @wait_on_address(&g_futex, 0); }
+    return 0;
+}
+```
+
+**NOTES**
+- Pair with an `@atomic_store` + wake on the writer side; this intrinsic
+  only covers the waiting half.
+- Always re-check the condition after it returns (spurious wakeups).
+
+---
+
+### @barrier_dma()
+
+**DESCRIPTION**
+Device-visible memory barrier — orders CPU accesses with respect to a DMA
+engine or other bus master, which a plain CPU-to-CPU fence does not
+guarantee on every architecture. Takes no arguments, returns `void`.
+
+**EXAMPLE**
+```zer
+mmio 0x40020000..0x40020FFF;
+u8[64] tx;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        tx[0] = 1;
+        @cache_clean_range(&tx[0], 64);
+        @barrier_dma();                 // publish before the device is told to go
+        volatile *u32 ctrl = @inttoptr(*u32, 0x40020000);
+        *ctrl = 1;
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- `@barrier()` orders CPU observers only. Use `@barrier_dma()` when the other
+  observer is a device.
+- On a non-coherent target a barrier is not enough on its own — pair it with
+  the matching cache-maintenance call.
+
+---
+
+### @cpu_endbr()
+
+**DESCRIPTION**
+Emit a control-flow-integrity landing pad (x86 CET-IBT `ENDBR64`). Takes no
+arguments, returns `void`. Assembles to a multi-byte NOP when the CPU has no
+CET-IBT, so it is always safe to emit.
+
+**EXAMPLE**
+```zer
+u32 handler() {
+    @cpu_endbr();
+    return 7;
+}
+u32 main() { if (handler() != 7) { return 1; } return 0; }
+```
+
+**NOTES**
+- Needed as the first instruction of any function reached by an indirect
+  branch when CET-IBT is enforced.
+- Non-privileged and non-x86-safe (no-op elsewhere).
+
+---
+
+### @config(...)
+
+**DESCRIPTION**
+Compile-time configuration passthrough. With arguments it evaluates to its
+**last** argument (and has that argument's type); with no arguments it is
+`void`. It exists so build-time knobs can be threaded through code without a
+preprocessor.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u32 v = @config(1, 2, 99);   // evaluates to 99
+    if (v != 99) { return 1; }
+    return 0;
+}
+```
+
+**NOTES**
+- Not a general-purpose intrinsic — prefer `comptime` functions and
+  `comptime if` for configuration, which are type-checked and documented.
+- Kept for compatibility; may be removed.
+
+---
+
+---
+
+### @cpu_read_msr(msr), @cpu_write_msr(msr, val)
+
+**DESCRIPTION**
+x86 Model-Specific Register access. `@cpu_read_msr(u32 msr) -> u64`;
+`@cpu_write_msr(u32 msr, u64 val) -> void`. Privileged (CPL=0) — SIGSEGV in
+user mode. No-op fallback on non-x86.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u64 efer = @cpu_read_msr(0xC0000080);
+        @cpu_write_msr(0xC0000080, efer | 1);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Writing a reserved or unimplemented MSR raises #GP — the MSR number is a
+  hardware fact ZER cannot verify.
+
+---
+
+### @cpu_read_cr0/cr2/cr3/cr4/xcr0(), @cpu_write_cr0/cr3/cr4/xcr0(val)
+
+**DESCRIPTION**
+x86 control-register access. Each `read` takes no arguments and returns `u64`;
+each `write` takes one `u64` and returns `void`. `CR2` is read-only (page-fault
+address — see also `@mmu_get_fault_addr()`). `@cpu_write_xcr0` emits `XSETBV`.
+All privileged.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u64 cr0 = @cpu_read_cr0();
+        u64 cr3 = @cpu_read_cr3();
+        u64 cr4 = @cpu_read_cr4();
+        u64 xcr0 = @cpu_read_xcr0();
+        u64 fault = @cpu_read_cr2();
+        @cpu_write_cr0(cr0);
+        @cpu_write_cr3(cr3);
+        @cpu_write_cr4(cr4);
+        @cpu_write_xcr0(xcr0);
+        if (fault != 0) { @trap(); }
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Writing `CR3` switches address space and flushes non-global TLB entries.
+- `CR4` carries feature-enable bits (SSE, PAE, SMEP, `FSGSBASE`, `PCE`).
+- `@mmu_set_pt()` / `@mmu_get_pt()` are the portable spellings of CR3 access.
+
+---
+
+### @cpu_read_dr(idx), @cpu_write_dr(idx, val)
+
+**DESCRIPTION**
+x86 debug-register access. `@cpu_read_dr(u32 idx) -> u64`,
+`@cpu_write_dr(u32 idx, u64 val) -> void`. Valid indices are 0-3 (linear
+breakpoint addresses), 6 (status) and 7 (control); the index is dispatched at
+runtime. Privileged.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_write_dr(0, 0x400000);
+        @cpu_write_dr(7, 1);
+        u64 status = @cpu_read_dr(6);
+        if (status != 0) { @cpu_write_dr(6, 0); }
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Indices 4 and 5 alias 6 and 7 on modern CPUs; do not rely on it.
+
+---
+
+### @cpu_read_fsbase(), @cpu_read_gsbase(), @cpu_write_fsbase(val), @cpu_write_gsbase(val)
+
+**DESCRIPTION**
+x86-64 FS/GS segment-base access. Reads return `u64`; writes take one `u64`
+and return `void`. Requires the FSGSBASE CPU feature **and** `CR4.FSGSBASE = 1`
+— without both, these instructions raise #UD.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u64 fs = @cpu_read_fsbase();
+        u64 gs = @cpu_read_gsbase();
+        @cpu_write_fsbase(fs);
+        @cpu_write_gsbase(gs);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- GS base is the usual per-CPU-data pointer in a kernel; swapping it is what
+  `swapgs` does on the syscall path.
+- For thread-local storage in ordinary code use `threadlocal`, not these.
+
+---
+
+### @port_in8(port), @port_in16(port), @port_in32(port), @port_out8(port, val), @port_out16(port, val), @port_out32(port, val)
+
+**DESCRIPTION**
+x86 port I/O. The `in` forms take a `u16` port and return `u8` / `u16` / `u32`
+**respectively** — the return type matches the width in the name, so a 32-bit
+read cannot be silently truncated into a `u8`. The `out` forms take
+`(port, value)` and return `void`. Privileged (requires CPL <= IOPL).
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        u8  status = @port_in8(0x64);        // keyboard controller status
+        u16 w      = @port_in16(0x1F0);
+        u32 d      = @port_in32(0xCFC);      // PCI config data
+        @port_out8(0x60, status);
+        @port_out16(0x1F0, w);
+        @port_out32(0xCF8, d);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Port I/O is x86-only; other targets get a no-op fallback.
+- Prefer memory-mapped I/O (`mmio` + `@inttoptr`) where the device offers it —
+  MMIO addresses are range-checked by ZER, port numbers are not.
+
+---
+
+### @cpu_xsave(buf, mask), @cpu_xrstor(buf, mask), @cpu_fxsave(buf), @cpu_fxrstor(buf), @cpu_fpu_init()
+
+**DESCRIPTION**
+Extended-processor-state save/restore. `@cpu_xsave` / `@cpu_xrstor` take a
+`*u8` buffer and a `u64` feature mask; `@cpu_fxsave` / `@cpu_fxrstor` are the
+legacy pre-XSAVE pair and take only a buffer; `@cpu_fpu_init()` emits `FNINIT`.
+All return `void`.
+
+**EXAMPLE**
+```zer
+u8[1024] xbuf;
+u8[512]  fbuf;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_fpu_init();
+        @cpu_xsave(&xbuf[0], 7);
+        @cpu_xrstor(&xbuf[0], 7);
+        @cpu_fxsave(&fbuf[0]);
+        @cpu_fxrstor(&fbuf[0]);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- `fxsave`/`fxrstor` need a **16-byte-aligned** 512-byte buffer; `xsave` needs
+  64-byte alignment and a buffer sized for the mask. Alignment is a hardware
+  requirement ZER does not verify.
+- For ordinary scheduler work prefer `@cpu_save_fpu` / `@cpu_restore_fpu`.
+
+---
+
+### @cpu_syscall(), @cpu_sysret(), @cpu_iret(), @cpu_hypercall(), @cpu_set_priv_stack(sp), @cpu_get_priv_level()
+
+**DESCRIPTION**
+Privilege-mode transitions, all zero-argument and `void` except
+`@cpu_set_priv_stack(u64 sp)` (`void`) and `@cpu_get_priv_level() -> u32`
+(0 = user, higher = more privileged).
+`@cpu_syscall` traps user->kernel (`syscall` / `svc #0` / `ecall`);
+`@cpu_sysret` returns kernel->user; `@cpu_iret` returns from an interrupt;
+`@cpu_hypercall` traps guest->hypervisor (`vmcall` / `hvc #0`).
+
+**EXAMPLE**
+```zer
+u8[4096] kstack;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_set_priv_stack(@ptrtoint(&kstack[4095]));
+        if (@cpu_get_priv_level() == 0) { @cpu_syscall(); }
+        @cpu_hypercall();
+        @cpu_sysret();
+        @cpu_iret();
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Every transition instruction requires correctly-set system registers first
+  (x86 CS/RIP/RFLAGS, ARM ELR/SPSR, RISC-V sepc/sstatus). ZER checks none of
+  that — it is hardware-consequence, not program-consequence.
+- `@cpu_get_priv_level()` currently returns a stub `0`.
+
+---
+
+### @cpu_sbi_call(), @cpu_smc_call()
+
+**DESCRIPTION**
+Firmware calls, both zero-argument and `void`. `@cpu_sbi_call()` is the RISC-V
+`ecall` into M-mode SBI firmware; `@cpu_smc_call()` is the ARM `smc #0`
+TrustZone secure-monitor call.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { @cpu_sbi_call(); @cpu_smc_call(); }
+    return 0;
+}
+```
+
+**NOTES**
+- Arguments and return values travel in architecture-specific registers that
+  these intrinsics do not model — set them with `asm` in a `naked` function.
+
+---
+
+### @cpu_cpuid(leaf, subleaf), @cpu_cpuid_ecx(leaf, subleaf), @cpu_vendor_id(), @cpu_feature_bits(), @cpu_model_id()
+
+**DESCRIPTION**
+x86 CPUID. Because one intrinsic cannot return four registers, the pair
+`@cpu_cpuid` / `@cpu_cpuid_ecx` splits them: both take `(u32 leaf, u32 subleaf)`
+and return `u64`, packed as `(EBX << 32) | EAX` and `(EDX << 32) | ECX`
+respectively. The convenience reads take no arguments:
+`@cpu_vendor_id() -> u64` (leaf 0 EBX), `@cpu_feature_bits() -> u64`
+(leaf 1 ECX:EDX), `@cpu_model_id() -> u32` (leaf 1 EAX). Non-privileged.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 lo = @cpu_cpuid(1, 0);
+    u64 hi = @cpu_cpuid_ecx(1, 0);
+    u32 eax = (u32)(lo & 0xFFFFFFFF);
+    u32 ebx = (u32)(lo >> 32);
+    u32 model = @cpu_model_id();
+    if (eax != model) { return 1; }
+    if (ebx == 0 && hi == 0) { return 0; }
+    return 0;
+}
+```
+
+**NOTES**
+- Always check the maximum supported leaf (leaf 0 EAX) before querying a
+  higher one; an unsupported leaf returns another leaf's data, not zero.
+
+---
+
+### @cpu_read_sp(), @cpu_read_tp(), @cpu_read_flags(), @cpu_core_id(), @cpu_current_mode(), @cpu_cache_line_size(), @cpu_num_cores()
+
+**DESCRIPTION**
+Non-privileged inspection reads — safe to call in ordinary user code.
+`@cpu_read_sp() -> u64` stack pointer; `@cpu_read_tp() -> u64` thread
+pointer / TLS base; `@cpu_read_flags() -> u64` RFLAGS / NZCV;
+`@cpu_core_id() -> u32`; `@cpu_current_mode() -> u32`;
+`@cpu_cache_line_size() -> u32`; `@cpu_num_cores() -> u32`.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 sp = @cpu_read_sp();
+    u64 tp = @cpu_read_tp();
+    u64 fl = @cpu_read_flags();
+    u32 line = @cpu_cache_line_size();
+    u32 cores = @cpu_num_cores();
+    if (sp == 0) { return 1; }
+    if (line == 0) { return 2; }
+    if (cores == 0) { return 3; }
+    if (tp == 0 && fl == 0) { return 0; }
+    return 0;
+}
+```
+
+**NOTES**
+- `@cpu_core_id()`, `@cpu_current_mode()`, `@cpu_num_cores()` are currently
+  **stubs** returning `0`, `0` and `1`. `@cpu_cache_line_size()` returns a
+  fixed `64`. Do not treat them as authoritative topology.
+
+---
+
+### @cpu_read_pmc(idx)
+
+**DESCRIPTION**
+Read a hardware performance counter (`RDPMC`). Takes a `u32` counter index and
+returns `u64`. Readable from user mode only when `CR4.PCE = 1`; otherwise #GP.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) { u64 cycles = @cpu_read_pmc(0); if (cycles == 0) { return 1; } }
+    return 0;
+}
+```
+
+**NOTES**
+- For simple timing prefer `@cpu_read_counter()`, which needs no configuration.
+
+---
+
+### @cpu_reset(), @cpu_deep_sleep(), @cpu_idle_hint(), @cpu_monitor_addr(addr), @cpu_mwait(), @cpu_umonitor(addr), @cpu_umwait(hint, deadline)
+
+**DESCRIPTION**
+Power management, all `void`.
+`@cpu_reset()` — a safe halt-forever fallback (a real reset is
+platform-specific and is **not** performed).
+`@cpu_deep_sleep()` — deepest idle state (`WFI` / `HLT`), privileged.
+`@cpu_idle_hint()` — a **non-blocking** low-power hint, safe to call.
+`@cpu_monitor_addr(addr)` + `@cpu_mwait()` — the privileged x86 MONITOR/MWAIT
+pair. `@cpu_umonitor(addr)` + `@cpu_umwait(hint, deadline)` — the user-mode
+WAITPKG equivalents; `hint` is `0` for C0.2 (optimized) or `1` for C0.1 (fast).
+
+**EXAMPLE**
+```zer
+u8[64] watch;
+u32 main() {
+    @cpu_idle_hint();                       // non-blocking, always safe
+    volatile u32 never = 0;
+    if (never == 42) {
+        @cpu_monitor_addr(&watch[0]);
+        @cpu_mwait();
+        @cpu_umonitor(&watch[0]);
+        @cpu_umwait(1, 0);
+        @cpu_deep_sleep();
+        @cpu_reset();
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- MONITOR/MWAIT and UMONITOR/UMWAIT must be paired, and the monitored address
+  must be written by the other party or the wait can hang until an interrupt.
+- `@cpu_umwait` requires the WAITPKG feature.
+
+---
+
+### @cpu_eoi(), @cpu_cache_disable(), @cpu_cache_enable()
+
+**DESCRIPTION**
+`@cpu_eoi()` signals end-of-interrupt to the LAPIC / GICv3 — call it at the end
+of an interrupt handler. `@cpu_cache_disable()` sets `CR0.CD` and issues
+`WBINVD`; `@cpu_cache_enable()` clears it. All zero-argument, `void`, privileged.
+
+**EXAMPLE**
+```zer
+u32 g_ticks;
+interrupt TIM1 {
+    g_ticks = g_ticks + 1;
+    @cpu_eoi();
+}
+u32 main() { return 0; }
+```
+
+**NOTES**
+- This example is **compile-only** — GCC refuses interrupt handlers on hosted
+  x86-64, so an `interrupt` block cannot appear in a runnable host program.
+- Running with caches disabled is drastically slow; re-enable promptly.
+
+---
+
+### @nt_store(addr, val)
+
+**DESCRIPTION**
+Non-temporal store (`MOVNTI`) — write straight to memory, bypassing the cache,
+so a large streaming write does not evict useful data. Takes a pointer and a
+`u64` value; returns `void`.
+
+**EXAMPLE**
+```zer
+u8[256] stream;
+u32 main() {
+    volatile u32 never = 0;
+    if (never == 42) {
+        @nt_store(&stream[0], 0x1122334455667788);
+        @barrier_store();                    // publish before another core reads
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Non-temporal stores are **weakly ordered** even on x86. A fence
+  (`@barrier_store()` or `@barrier_dma()`) is required before anything else may
+  observe the write — omitting it is a silent ordering bug on real hardware.
 
 ---
 

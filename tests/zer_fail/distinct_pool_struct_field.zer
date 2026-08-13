@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot be struct fields
+// BUG-787 sibling: same distinct-unwrap gap at the struct-FIELD position check.
+struct Task { u32 id; }
+distinct typedef Pool(Task, 4) DPool;
+struct Holder { DPool p; }
+u32 main() { return 0; }

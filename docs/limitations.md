@@ -461,6 +461,68 @@ it is not re-probed as a suspected hole.
 
 ---
 
+## OPEN — comptime const-fold ignores per-operation width wrapping (CONFIRMED live 2026-08-13; value-correctness, NOT a safety hole)
+
+Previously carried as a one-line cross-reference ("deferred; the fix threads a destination
+width through the const evaluator"). **Re-measured live on main 2026-08-13 and characterised
+properly** — the earlier note understated it in two ways.
+
+**The defect.** `eval_const_expr_subst` (checker.c, `NODE_BINARY` arm) computes in host
+`int64_t`: `case TOK_PLUS: return l + r;` and so on, with no mask at any operation. ZER's
+runtime semantics wrap every operation at its operand width. So the SAME source text means
+different things depending on whether it sits in a `comptime` function or an ordinary one.
+
+**Finding 1 — it is not one shape, it is all of them.** Six shapes probed, six diverge:
+
+| shape | comptime | runtime |
+|---|---|---|
+| `u8 a=200; u8 b=100; u8 c=a+b;` | 300 | 44 |
+| `u8 a=200; u8 b=100; u32 c=a+b;` | 300 | 44 |
+| `return (a+b)/2` (no store) | 150 | 22 |
+| `u3 a=7; u3 b=7; u3 c=a+b;` | 14 | 6 |
+| `u16 60000+10000` | 70000 | 4464 |
+| `u8 200*3` | 600 | 88 |
+
+This matters for the fix: masking only on **store to a typed comptime local** would repair
+four of the six and leave the two that have no store — a partial fix that promotes the entry
+while the class stays open, which is the false-confidence failure this ledger exists to
+prevent. Do not ship it.
+
+**Finding 2 — signed wrapping flips SIGN, not just magnitude.**
+`comptime i32 f() { i8 a=100; i8 b=100; i8 c=a+b; return c; }` folds to **+200**; the same
+body as a runtime function yields **-56**. Magnitude-only divergence is benign in the
+direction that matters (a too-large folded index over-rejects, which is safe); a sign flip is
+not obviously so, which is why the safety question was re-opened rather than inherited.
+
+**Still NOT a safety hole — verified, not assumed.** The checker and the emitter read the
+SAME folded value, so there is no site where one component believes 200 and the other -56.
+For a folded value to elide a bounds guard the compiler would have to prove an index with
+comptime semantics and emit it with runtime semantics; comptime calls are replaced by their
+folded constant on both paths, so that split does not occur. The earlier classification was
+right. Recorded here so a future session does not have to re-derive it — and so that if the
+fold is ever consumed by a *separate* analysis (VRP over a comptime-derived range), this
+entry is the reason to re-check.
+
+**Why the obvious fix is wrong.** Masking at the destination type is not ZER's rule: `u32 c =
+a + b` with `u8` operands wraps at **u8** (verified — runtime gives 44, not 300). The width
+belongs to the OPERANDS, so the evaluator needs expression typing, which `eval_const_expr_subst`
+does not have (it is a pure AST walk with no `Checker*`). `ComptimeParam` (checker.c ~2340) has
+no width/signedness field either. That is the real reason this is deferred, and it is a design
+step, not a patch.
+
+**Two sound directions:**
+1. *Thread the type.* Give `ComptimeParam` `{ int bits; bool is_signed; }`, populate it from
+   the declared type in the `NODE_VAR_DECL` arm of `eval_comptime_block`, and mask each binary
+   op by the wider of its two operand widths. Correct for all six shapes.
+2. *Refuse rather than diverge.* When an operation on narrow-typed operands produces a value
+   that does not fit the operand width, fail the fold with a clear error. Sound and much
+   smaller, but it REJECTS currently-compiling code — measure the corpus cost first, as
+   BUG-781/782 did.
+
+Reproducers: the six shapes above; the sign-flip case is the sharpest single test.
+
+---
+
 ## OPEN — residuals after the 2026-08-10 survey (measured; reproducers in `tests/zer_gaps/`)
 
 The 9 survey fixes + the 8th funcptr REACH form all landed. These are what the three

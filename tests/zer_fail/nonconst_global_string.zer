@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize
+// The BUG-785 fix must NOT relax the real rule: a string literal is read-only,
+// so a MUTABLE global slice may not be initialized from one. If this ever
+// compiles, the qualifier fold has gone too far and .rodata is writable.
+[*]u8 mutable_global = "hello";
+u32 main() { return 0; }

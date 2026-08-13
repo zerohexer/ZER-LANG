@@ -513,7 +513,17 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_ARENA:   return tn_append(buf, pos, max, "Arena");
     case TYPE_BARRIER: return tn_append(buf, pos, max, "Barrier");
     case TYPE_SEMAPHORE: return tn_append(buf, pos, max, "Semaphore(%u)", t->semaphore.count);
+    /* Qualifiers MUST be rendered. Without them a const/volatile mismatch
+     * diagnostic prints the SAME name on both sides — measured 2026-08-13:
+     * "expected '[]u8', got '[]u8'", "cannot initialize 'cs' of type '[]u8'
+     * with '[]u8'", "return type '?*u8' doesn't match ... '?*u8'". That makes
+     * the qualifier-strip safety family (one of the 15 guarantees) undebuggable
+     * for the user, since the error names no difference at all. Rendered in ZER
+     * source order (`const *u8`, `volatile [*]u8`) so the printed name is the
+     * spelling the user would write. */
     case TYPE_POINTER:
+        if (t->pointer.is_volatile) pos = tn_append(buf, pos, max, "volatile ");
+        if (t->pointer.is_const)    pos = tn_append(buf, pos, max, "const ");
         pos = tn_append(buf, pos, max, "*");
         return type_name_write(t->pointer.inner, buf, pos, max);
     case TYPE_OPTIONAL:
@@ -521,6 +531,7 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         return type_name_write(t->optional.inner, buf, pos, max);
     case TYPE_SLICE:
         if (t->slice.is_volatile) pos = tn_append(buf, pos, max, "volatile ");
+        if (t->slice.is_const)    pos = tn_append(buf, pos, max, "const ");
         pos = tn_append(buf, pos, max, "[]");
         return type_name_write(t->slice.inner, buf, pos, max);
     case TYPE_ARRAY:

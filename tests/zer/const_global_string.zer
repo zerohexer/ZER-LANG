@@ -1,0 +1,24 @@
+// BUG-785 regression. A global `const` string is the natural way to declare a
+// message table, and it was REJECTED while the identical LOCAL declaration
+// compiled — the global-initializer compatibility check called bare
+// resolve_type() and so compared the initializer against a type whose `const`
+// had been dropped. Both spellings of the slice syntax are covered, plus the
+// pointer form and the volatile carrier, because apply_decl_qualifiers now
+// answers this for every declaration site.
+const [*]u8 GREETING = "hello";
+const []u8  LEGACY   = "world";      // deprecated spelling, same type
+const [*]u8 EMPTY    = "";
+
+u32 slen(const [*]u8 s) { return (u32)s.len; }
+
+u32 main() {
+    if (slen(GREETING) != 5) { return 1; }
+    if (slen(LEGACY)   != 5) { return 2; }
+    if (slen(EMPTY)    != 0) { return 3; }
+    if (GREETING[0] != 104) { return 4; }   // 'h'
+    if (LEGACY[0]   != 119) { return 5; }   // 'w'
+    // a local const string must still work (it always did — pins the pair)
+    const [*]u8 local = "hi";
+    if (slen(local) != 2) { return 6; }
+    return 0;
+}

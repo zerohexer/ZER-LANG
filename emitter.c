@@ -3525,8 +3525,14 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "))");
-        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
-            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission */
+        } else if (nlen >= 9 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission.
+             * nlen >= 9, NOT >= 10: `@atomic_or` is exactly 9 chars. BUG-427
+             * fixed this in checker.c (which carries the explanatory comment)
+             * but the AST emitter kept the old bound, so @atomic_or fell past
+             * this arm to the unsupported-in-constant-context fallback — a
+             * half-applied fix, latent for the same reachability reason as the
+             * barrier case above. The IR path already used >= 7. */
             const char *op = name + 7;
             int oplen = nlen - 7;
             bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
@@ -3751,8 +3757,26 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_cond); (void)0; })", ar);
             } else {
-                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+                /* BUG-767 rule applied to a PREFIX helper (2026-08-13): this
+                 * `cond_`-family else swallows before control can reach the
+                 * loud fallback at the end of the chain, so an unrecognised
+                 * member emitted a silent literal 0. Fail loudly instead. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
+        /* @barrier_acq_rel / @barrier_dma MUST be matched before the generic
+         * `barrier_` prefix helper below, which otherwise swallows them (they
+         * are neither `init` nor `wait`) and emitted a silent literal 0 — a
+         * memory fence becoming nothing. Mirrors the IR path, which matches
+         * both by exact name. Latent, not live: swept all 1967 corpus files
+         * with the fallthrough instrumented and it never fired, because the AST
+         * path is only reached from emit_expr contexts (global initializers,
+         * guard index expressions) where a void fence cannot appear. Fixed so a
+         * future `@barrier_*` addition cannot land in the silent bucket. */
+        } else if (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_ACQ_REL)");
+        } else if (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0) {
+            emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST)");
         } else if (nlen >= 8 && memcmp(name, "barrier_", 8) == 0) {
             const char *bop = name + 8;
             int boplen = nlen - 8;
@@ -3774,7 +3798,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ")");
             } else {
-                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+                /* See the cond_ helper above — same BUG-767 rule. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 &&
                    node->intrinsic.arg_count >= 1) {

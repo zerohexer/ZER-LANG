@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot be union variants
+// BUG-787 sibling: same gap at the union-VARIANT position check, and on Ring
+// rather than Pool — the three container kinds share one disjunction, so the
+// fix has to hold for each of them.
+struct Msg { u32 v; }
+distinct typedef Ring(Msg, 8) DRing;
+union U { DRing r; u32 n; }
+u32 main() { return 0; }

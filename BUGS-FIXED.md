@@ -5,6 +5,143 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-13 — BUG-787: `distinct Pool/Ring/Slab` evaded all three container-POSITION checks
+
+Another instance of the repo's documented #1 historical bug class (raw `->kind ==
+TYPE_X` without unwrapping `TYPE_DISTINCT`), in a corner the 2026-06-07 class-kill
+did not sweep.
+
+**Symptom.** These three are rejected for plain `Pool(Task,4)` and were **accepted**
+through a `distinct typedef`:
+
+| position | plain | `distinct typedef Pool(Task,4) DPool` |
+|---|---|---|
+| stack local `DPool p;` | rejected | **accepted** |
+| struct field `struct H { DPool p; }` | rejected | **accepted** |
+| union variant `union U { DRing r; }` | rejected | **accepted** |
+
+**Consequence — LOUD, not silent (measured, not assumed).** The accepted declaration
+reaches an emitter that cannot stamp the container's inline storage, so it emits
+`typedef struct _zer_pool_Task_N DPool;` with the struct only ever forward-declared.
+GCC then fails with *"variable 'p' has initializer but incomplete type"* / *"storage
+size of 'p' isn't known"*, pointed at the ZER source line. So no unsafe binary is
+produced — but the user gets a C-level error about a C type they never wrote and
+cannot act on. That is exactly the class BUG-767 and the H4 global-init rejects
+exist to eliminate: **if the checker will not accept the program, the checker must
+be the one to say so.**
+
+A second, smaller effect: the `distinct` container was also unusable once declared
+(`p.alloc()` fails with *"cannot call non-function type"*, since method dispatch does
+not unwrap distinct either), so the feature was never usable — only mis-diagnosed.
+
+**Fix.** All three sites now use `type_dispatch_kind()`, the prescribed class-kill,
+instead of raw `->kind`. Note the struct-field site's own neighbour — the
+sync-primitive-in-packed-struct check two blocks below — already unwrapped via
+`type_unwrap_distinct`, so the two adjacent checks disagreed about the same type.
+Using `type_dispatch_kind` also removes three rows from the raw-dispatch audit
+baseline rather than adding any.
+
+Tests: `tests/zer_fail/distinct_pool_stack_local.zer`,
+`distinct_pool_struct_field.zer`, `distinct_ring_union_variant.zer` — all three
+carry `// expect-error:` naming the checker rule (not the old GCC text), and all
+three were verified ACCEPTED pre-fix. Ring is used for the union case deliberately:
+the three container kinds share one disjunction, so the fix must hold for each.
+
+## Session 2026-08-13 — BUG-786: two LATENT silent-emission defects in the AST intrinsic path
+
+Both found by a dual-path audit (`grep -n '"name"' emitter.c` must show TWO hits), both
+**verified latent, not live** — and reported as latent rather than dressed up, because the
+reachability question was settled by measurement, not argument.
+
+**How latency was established.** The suspect fallthrough was instrumented with an `fprintf`
+and the whole corpus recompiled — **1967 files, 0 hits**. The AST path (`emit_expr`) is
+reached only from global initializers and auto-guard index expressions, and a `void` fence
+cannot appear in either. Fixed anyway: both defects put a *new* intrinsic into a silent
+bucket, which is precisely the "gate the class so a new sibling cannot silently regress"
+rule. Neither fix changes the output of any currently-compilable program.
+
+**BUG-786a — a prefix helper swallowed unknown family members and emitted `0`.**
+The AST path matches `@barrier` / `@barrier_store` / `@barrier_load` by exact name, then
+falls into a generic `nlen >= 8 && "barrier_"` helper that recognises only `init` and `wait`.
+`@barrier_acq_rel` (15 chars) and `@barrier_dma` (11) match the prefix, fail both sub-checks,
+and hit its else — `emit(e, "/* @%.*s — missing args */0")`. **A memory fence becomes the
+literal `0`.** The `cond_` helper has the identical else.
+
+This is the same defect BUG-767 already fixed for the *outer* fallback, where a silent `0`
+was deliberately replaced with an undeclared identifier so GCC errors loudly. The prefix
+helpers swallow *before* control can reach that fallback, so they never got the treatment.
+Fix: match `barrier_acq_rel` / `barrier_dma` by exact name ahead of the helper (mirroring the
+IR path), and change both helpers' else-branches to the same loud undeclared-identifier form.
+
+**Generalizable:** when a dispatch chain ends in a deliberately-loud fallback, any *earlier*
+prefix arm with a catch-all else silently defeats it. Audit prefix arms, not just the tail.
+
+**BUG-786b — BUG-427 was only half-applied.** `@atomic_or` is exactly 9 characters. The AST
+emitter's arm was `nlen >= 10 && memcmp(name, "atomic_", 7)`, so `@atomic_or` never matched
+and fell through to the unsupported-in-constant-context fallback. checker.c had been
+corrected to `>= 9` and carries the comment *"BUG-427: was >= 10, but @atomic_or is 9
+chars"* — the emitter was missed. The IR path already used `>= 7`, which is why every real
+program works. Now `>= 9`, with a comment naming the other two bounds so the three cannot
+drift again.
+
+Verified after the fix: `@atomic_or` and `@barrier_acq_rel` still emit
+`__atomic_fetch_or(..., __ATOMIC_SEQ_CST)` and `__atomic_thread_fence(__ATOMIC_ACQ_REL)` on
+the IR path (unchanged), and `make check` is green.
+
+## Session 2026-08-13 — BUG-785: a global's `const` was dropped before the initializer check (+ the diagnostic bug that hid it)
+
+Found while auditing the qualifier-strip safety family. Two defects, one of which
+was masking the other.
+
+**BUG-785 (over-rejection, multi-site).** `const [*]u8 GREETING = "hello";` — a global
+const string, the most ordinary declaration in the language — did **not compile**, while
+the identical declaration as a LOCAL did. The question "what type does this declaration
+actually have?" was answered independently at THREE sites, and only two of them folded the
+declaration's `const`/`volatile` keyword into the slice/pointer TYPE:
+
+| # | site | folded the qualifier? |
+|---|---|---|
+| 1 | `check_stmt`, NODE_VAR_DECL / NODE_GLOBAL_VAR body check | yes |
+| 2 | `register_decl`, NODE_GLOBAL_VAR | yes |
+| 3 | `checker_check_bodies`, the global-INITIALIZER compatibility check | **no — bare `resolve_type`** |
+
+Site 3 compared the initializer against a type whose `const` had been stripped, so a
+`const []u8` string literal "did not match" its own declared type. Textbook instance of the
+multi-site class this repo already tracks: same semantic question, N independent answers, a
+new/forgotten site silently wrong.
+
+**Fix — one query, not three.** New `apply_decl_qualifiers(Checker*, Node *decl, Type*)`
+(checker.c, next to `resolve_type`); all three sites now call it. This is the durable
+end-state CLAUDE.md prescribes for a patchwork, not a fourth copy. Net −45 lines.
+
+**Why it survived: the diagnostic named no difference.** `type_name()` rendered
+`TYPE_POINTER` as `*T` with no qualifier at all, and `TYPE_SLICE` rendered `volatile` but
+not `const` — despite both types carrying the flags. So every const/volatile mismatch in the
+language printed the SAME name on both sides. Measured, verbatim, pre-fix:
+
+```
+cannot initialize 'g' of type '[]u8' with '[]u8'
+spawn argument 1: expected '[]u8', got '[]u8'
+return type '?*u8' doesn't match function return type '?*u8'
+```
+
+That is unreadable for the user *and* it is why this bug sat unnoticed — the error text
+contained no evidence of what was wrong. `type_name_write` now renders both qualifiers in
+ZER source order (`const *u8`, `volatile []u8`). The same three cases now read
+`... of type '[]u8' with 'const []u8'`, and fixing the diagnostic is literally what exposed
+BUG-785 within one probe. No test matched on the old strings (checked before changing).
+
+**Generalizable, worth keeping:** a diagnostic that prints both sides of a type mismatch
+identically is not merely a cosmetic bug — it is a *bug-concealment* mechanism, because it
+removes the signal a maintainer would use to notice the mismatch is spurious. Whenever a
+Type field participates in a comparison, `type_name` must render it.
+
+Tests: `tests/zer/const_global_string.zer` (positive — both slice spellings, pointer form,
+and the local pair; verified REJECTED pre-fix) and
+`tests/zer_fail/nonconst_global_string.zer` with `// expect-error:` (pins that the fold did
+NOT relax the real read-only rule — a mutable global slice still may not take a string
+literal, so `.rodata` stays unwritable).
+
 ## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
 
 Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)

@@ -164,6 +164,20 @@ messages show the wrong type name in the third slot. Fix: capture each
 Discovered in BUG-700 (session 2026-06-06); same hazard exists everywhere
 `type_name` is composed in a single expression.
 
+**`type_name()` must render EVERY Type field that participates in a comparison —
+a diagnostic that prints both sides identically is a BUG-CONCEALMENT mechanism
+(BUG-785, 2026-08-13).** `type_name_write` rendered `TYPE_POINTER` as `*T` with no
+qualifier and `TYPE_SLICE` with `volatile` but not `const`, although both Type
+structs carry `is_const`/`is_volatile`. So every const/volatile mismatch in the
+language printed the SAME name on both sides — measured verbatim: `cannot
+initialize 'g' of type '[]u8' with '[]u8'`, `expected '[]u8', got '[]u8'`,
+`return type '?*u8' doesn't match function return type '?*u8'`. That is not merely
+poor UX: it is why a real over-rejection (a global `const [*]u8 s = "hi";` failing
+to compile) sat unnoticed — the error text contained no evidence the mismatch was
+spurious. Fixing the renderer exposed the underlying bug within ONE probe. **When
+you add a field to `Type` that any check compares on, render it in
+`type_name_write` in the same commit.**
+
 **STALE `src/safety/*.o` — the #1 phantom-bug trap (cost a full session 2026-06-19).**
 If a `make zerc`-built compiler spuriously rejects TRIVIAL valid programs
 (e.g. `error: expression nesting too deep` on `u32 main(){u32 x=5;return x;}`)

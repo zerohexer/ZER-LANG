@@ -14,6 +14,49 @@ a hang.
 
 ---
 
+### BUG-790 — reversed VARIABLE bit-slice range clobbered unrelated bits (HIGH, silent miscompile)
+
+**Symptom.**
+
+```zer
+u32 main() { u32 r = 0xFFFFFFFF; u32 hi = 3; u32 lo = 7; r[hi..lo] = 1; return r; }
+```
+
+Measured: `r` becomes **`0x000000FF`** — 24 unrelated bits cleared, with no diagnostic and
+no trap. The LITERAL form of the identical thing is a compile error (*"bit extraction high
+index (3) must be >= low index (7)"*).
+
+**Root cause — a guard that fired and produced the WRONG answer.** The emitted width is
+`_zer_bh - _zer_bl + 1` with both operands `uint64_t`, so a reversed range UNDERFLOWS to a
+huge value; that value then satisfied the existing `>= 64` guard, which selects
+`~(uint64_t)0` — an ALL-ONES mask. Every validation the literal form gets (reversed range,
+index beyond the type width, over-width value) sits inside an
+`eval_const_expr != CONST_EVAL_FAIL` guard, so a variable index gets none of it.
+
+A 2026-08-06 fix in the same helper had clamped the out-of-range POSITION and stated in its
+comment that "the WIDTH was already guarded" — that width guard is exactly what underflows.
+
+**Why it matters on bare metal.** This is the table-driven register-field idiom
+(`reg[fld.hi..fld.lo] = value`, with `hi`/`lo` read from a field descriptor). A swapped
+descriptor entry silently clears the top of a control register; the resulting peripheral
+misconfiguration is indistinguishable from a hardware fault.
+
+**Fix.** An invalid range now yields mask 0 — a defined no-op, the same treatment the
+out-of-range position already gets and the same `(_zer_w <= 0) ? 0` the READ path uses.
+Four of the five emission sites share `emit_bitslice_runtime_mask` (both AST and IR write
+paths), so one edit covers them; the fifth, the compound-assign read-back, got the same
+guard inline.
+
+**Test.** `tests/zer/bitslice_runtime_range_guard.zer` — checks a VALID variable range
+still writes correctly, plus two reversed-range no-ops. **Verified to discriminate**: exit
+2 on a pre-fix `git archive HEAD` build, exit 0 after.
+
+**Not fixed (recorded in limitations.md):** a variable `hi` beyond the TYPE WIDTH still
+overwrites the whole word, and an over-width VALUE through a variable is still silently
+masked — both are compile errors in their literal spelling.
+
+---
+
 ### BUG-786 — a pointer CAST laundered a stack pointer past the escape analysis (CRITICAL, accept-unsafe)
 
 **Symptom.** Wrapping an escaping pointer in an identity C-style cast made the compiler

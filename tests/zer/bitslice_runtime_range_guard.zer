@@ -1,0 +1,32 @@
+// BUG-790: a bit-slice write with VARIABLE indices got none of the validation the
+// literal form gets, and the emitted width `hi - lo + 1` was computed in uint64_t
+// — so a REVERSED range underflowed to a huge value, satisfied the `>= 64` guard,
+// and selected an ALL-ONES mask. Measured pre-fix: `r[3..7] = 1` on 0xFFFFFFFF
+// left 0x000000FF — 24 unrelated bits cleared, silently. The literal form
+// `r[3..7] = 1` is a compile error, so only the table-driven register-field idiom
+// (`reg[fld.hi..fld.lo] = v`) was exposed.
+//
+// An invalid range is now a defined no-op (mask 0), matching how an out-of-range
+// POSITION is already treated and what the READ path does.
+u32 main() {
+    // valid variable range still works: bits 11..8 of 0x0000 set to 0xA
+    u32 ok = 0;
+    u32 vhi = 11;
+    u32 vlo = 8;
+    ok[vhi..vlo] = 10;
+    if (ok != 0x00000A00) { return 1; }
+
+    // reversed variable range: must change NOTHING
+    u32 rev = 0xFFFFFFFF;
+    u32 rhi = 3;
+    u32 rlo = 7;
+    rev[rhi..rlo] = 1;
+    if (rev != 0xFFFFFFFF) { return 2; }
+
+    // reversed range on a zero word must not set anything either
+    u32 z = 0;
+    z[rhi..rlo] = 0xFF;
+    if (z != 0) { return 3; }
+
+    return 0;
+}

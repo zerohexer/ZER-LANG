@@ -398,7 +398,7 @@ evidence is — **VERIFIED HERE** means reproduced directly with the command sho
 **AGENT-REPORTED** means it came from a sub-audit and must be reproduced before acting on
 it (this ledger's own measure-first rule).
 
-### HIGH silent miscompile — bit-slice write with VARIABLE indices has NO validation (VERIFIED HERE)
+### ~~HIGH silent miscompile — bit-slice write with VARIABLE indices has NO validation~~ — **FIXED 2026-08-14 (BUG-790)**
 
 Literal indices are fully checked (reversed range, index beyond type width, over-width
 value — all compile errors). Those checks sit inside `eval_const_expr != CONST_EVAL_FAIL`
@@ -424,6 +424,22 @@ fault.
 (emitter.c ~1786-1813, ~6295-6331, ~7159-7180): compute the width in a SIGNED int and emit
 a no-op when `w <= 0` or when `hi >= type_width`. Both the AST and IR write paths need it —
 the dual-dispatch rule applies.
+
+**FIXED (BUG-790).** The reversed-range case is closed: an invalid runtime range now
+yields mask 0, i.e. a defined no-op, matching how an out-of-range POSITION is already
+handled and what the READ path does. One shared helper (`emit_bitslice_runtime_mask`)
+covers four of the five emission sites (both AST and IR write paths); the fifth — the
+compound-assign read-back — got the same guard inline. Test:
+`tests/zer/bitslice_runtime_range_guard.zer`, **verified to FAIL (exit 2) on a pre-fix
+`git archive HEAD` build** and pass after.
+
+**STILL OPEN — the other half of this entry.** A variable `hi` beyond the TYPE WIDTH is
+still unguarded: `u32 hi = 40; r[hi..0] = 1;` on `r = 0xFFFFFFFF` overwrites the whole word
+(measured `0x00000001`), where the literal form is a compile error ("bit index 40 out of
+range for 32-bit type"). It is defined behaviour rather than a bit-spill, so it is a lower
+severity than the reversed-range case, but it is the same missing-validation class: clamp
+`hi` to the object width in the same helper. Likewise an over-width VALUE through a
+variable is silently masked where the literal form errors with "would silently truncate".
 
 ### MEDIUM — BUG-789 residual: `@once` and a user `@sem_acquire`/`@sem_release` pair
 

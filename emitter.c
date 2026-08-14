@@ -6301,9 +6301,12 @@ static void emit_bitslice_ir_value(Emitter *e, Node *node, IRFunc *func, int btm
             if (width >= 64) emit(e, "~(uint64_t)0");
             else emit(e, "((1ull << %lld) - 1)", (long long)width);
         } else {
-            emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64) ? ~(uint64_t)0 : "
-                 "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1))",
-                 btmp, btmp, btmp, btmp);
+            /* BUG-790: same underflow as emit_bitslice_runtime_mask — a reversed
+             * runtime range must extract NOTHING, not everything. */
+            emit(e, "((_zer_bh%d < _zer_bl%d) ? (uint64_t)0 : "
+                 "(((_zer_bh%d - _zer_bl%d + 1) >= 64) ? ~(uint64_t)0 : "
+                 "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)))",
+                 btmp, btmp, btmp, btmp, btmp, btmp);
         }
     } else {
         emit(e, "~(uint64_t)0");
@@ -6326,10 +6329,28 @@ static void emit_bitslice_ir_value(Emitter *e, Node *node, IRFunc *func, int btm
  * no-op — upholding ZER's "shift by >= width is 0 (defined)" guarantee rather
  * than inventing a trap. */
 static void emit_bitslice_runtime_mask(Emitter *e, int btmp) {
-    emit(e, "((_zer_bl%d >= 64) ? (uint64_t)0 : "
+    /* BUG-790 (2026-08-14): a REVERSED runtime range (`hi < lo`) made the width
+     * `_zer_bh - _zer_bl + 1` UNDERFLOW — both operands are uint64_t, so
+     * `3 - 7 + 1` is a huge value, which then satisfied the `>= 64` guard and
+     * selected `~(uint64_t)0`: an ALL-ONES mask. The guard fired and produced
+     * the WRONG answer.
+     *
+     * Measured before the fix: `u32 r = 0xFFFFFFFF; u32 hi = 3; u32 lo = 7;
+     * r[hi..lo] = 1;` left `r == 0x000000FF` — 24 unrelated bits cleared, with
+     * no diagnostic and no trap. The LITERAL form of the same thing is a compile
+     * error ("bit extraction high index (3) must be >= low index (7)"), so only
+     * the variable-index form — the table-driven register-field idiom
+     * `reg[fld.hi..fld.lo] = v` — was affected. On bare metal the symptom is a
+     * silently mis-programmed peripheral, indistinguishable from a hardware
+     * fault.
+     *
+     * An invalid range now yields mask 0, making the whole write a defined
+     * no-op — the same treatment the out-of-range POSITION already gets above,
+     * and the same `(_zer_w <= 0) ? 0` the READ path uses. */
+    emit(e, "((_zer_bl%d >= 64 || _zer_bh%d < _zer_bl%d) ? (uint64_t)0 : "
          "((((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
          "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)))",
-         btmp, btmp, btmp, btmp, btmp, btmp);
+         btmp, btmp, btmp, btmp, btmp, btmp, btmp, btmp);
 }
 
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {

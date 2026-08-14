@@ -1,105 +1,196 @@
-# ZER Verified Compiler — Full Architecture & Decision Record (Lean 4 / Tier A)
+# ZER Verified Compiler — Full Architecture & Decision Record (Coq / RefinedC / Tier A)
 
-**Status: ADOPTED ARCHITECTURE, 2026-07-19.** This document is the complete, self-contained
-record of the decision to rebuild ZER as a **formally verified compiler written in Lean 4**,
-CompCert-style (Tier A: per-pass semantic-preservation proofs), with a **dual C backend**
-(mainline GCC/Clang daily, CompCert for certification builds) and a fully analyzed trust chain.
+**Status: ADOPTED ARCHITECTURE, 2026-08-15.** This document is the complete, self-contained
+record of the decision to verify ZER as **two linked artifacts** — the mathematics in **Coq**
+and the implementation in **C, proved against that mathematics by RefinedC** — with a dual C
+backend (mainline GCC/Clang daily, CompCert for certification builds) and a fully analyzed
+trust chain.
 
-**Why this document exists:** every decision below was reached through a long, evidence-heavy
-session (2026-07-19) that included web research, LOCAL empirical verification (building and
-axiom-checking iris-lean on this machine; probing Lean 4 CLI behavior in Docker), codebase
-measurement, and several rounds of adversarial reasoning about trust. A fresh session — human
-or Claude — must NOT re-derive, re-litigate, or re-research any of it from scratch. Read this
-document first. Where a claim is empirical, the exact command and result are recorded so it can
-be re-verified rather than re-discovered. Where an alternative was REJECTED, the alternative and
-the reason are recorded so it is not re-proposed.
+**It supersedes the 2026-07-19 record**, which adopted a rewrite of the whole compiler into
+**Lean 4** and later instantiated its translation-validation tier with **CBMC**. Lean and CBMC
+are removed from the architecture entirely. §0.1 records exactly what changed, what the old
+decision got right, and which of its recorded problems this one dissolves — read it before
+concluding that anything here is a re-litigation.
+
+**Why this document exists:** every decision below was reached through evidence-heavy working
+sessions with LOCAL empirical verification (building and axiom-checking provers on this
+machine; measuring RefinedC against real C; codebase measurement) and several rounds of
+adversarial reasoning about trust. A fresh session — human or Claude — must NOT re-derive,
+re-litigate, or re-research any of it from scratch. Read this document first. Where a claim is
+empirical, the exact command and result are recorded so it can be re-verified rather than
+re-discovered. Where an alternative was REJECTED, the alternative and the reason are recorded
+so it is not re-proposed.
 
 Related context elsewhere:
-- KernelQ's prover switch to Lean 4 (same day, shared reasoning + shared toolchain):
-  `KernelQ/docs/kernelq-pedagogy-goal.md` § "Coq-Synthesize", subsections **LS.0–LS.5**.
-- The `kernelq-lean` Docker image (Lean v4.32.0 pinned, works under hard sandboxing):
-  `KernelQ/backend/Dockerfile.lean`. iris-lean pins the SAME toolchain version.
+- KernelQ's synthesize track — the same Coq + RefinedC stack, built and measured end to end:
+  `KernelQ/docs/kernelq-pedagogy-goal.md` **LS.26** (architecture + elimination ledger),
+  **LS.27** (the linked spec, measured), **LS.28** (the pipeline as built + authoring
+  contract), **LS.29** (porting traps).
+- The `kernelq-refinedc` Docker image (Rocq 9.1.0 + RefinedC, works under `--network=none`,
+  read-only FS, arbitrary-uid): `KernelQ/backend/Dockerfile.refinedc`.
 
 ---
 
 ## Table of contents
 
 - §0  The decision in one page
+- §0.1 **What changed from the 2026-07-19 Lean record, and why** — read this first
 - §1  ZER today — inventory (code, proofs, sizes)
-- §2  The implementation-language question (why not C, OCaml, Rust — why Lean 4)
-- §3  The prover question (Coq vs Lean 4 — foundations identical, ecosystems differ)
-- §4  Iris-in-Lean — empirical status (verified locally, with commands)
-- §5  The certificate principle (P-vs-NP asymmetry; the design shift it forces; §5.3 the
-      annotation contract — CHECKED not TRUSTED, and the infer-vs-require rule)
-- §6  Assurance tiers A/B/C — and the decision: A primary, B bridge, C retired
-- §7  The architecture (whole ZER in Lean 4; strangler migration plan)
-- §8  The theorems (Stage 0–3 roadmap; the Grand Theorem; §8.3 STAGE 5 RETIRED —
-      emit-C is permanent, backend stays delegated to GCC/CompCert)
+- §2  The implementation-language question (why C STAYS, and how the model gap closes anyway)
+- §3  The prover question (Coq — and why the 2026-07 answer inverted)
+- §4  RefinedC — what it is, what it proves, and its measured envelope
+- §5  The certificate principle (§5.3 the annotation contract; §5.4 the RefinedC tension, resolved)
+- §6  Assurance tiers A/B/C — and the decision
+- §7  The architecture (two artifacts, one link; no rewrite)
+- §8  The theorems (Stage 0–4 roadmap; the Grand Theorem)
 - §9  The two trust chains — TCB analysis, "fully safe" does not exist, the kernel hatch
-- §10 Backends — dual-backend strategy; verified CompCert facts (ISAs, pedigree, licensing)
-- §11 The emitter contract (C99, CompCert dialect, freestanding, Clight-friendly;
-      §11.1 MEASURED 2026-08-01 — the contract is NOT adopted; the CompCert path is
-      blocked by GCC extensions in the emitted preamble, not by licensing)
-- §12 Toolchain residue (assembler/linker/libc/startup ranking; porting; mitigations)
-- §13 Lean 4 implementation practicalities
-- §14 Concurrency proofs (Iris) — plan
-- §15 Mission-critical / certification framing (the claim language that survives review)
+- §10 Backends — dual-backend strategy; verified CompCert facts
+- §11 The emitter contract (C99, CompCert dialect, freestanding)
+- §12 Toolchain residue (assembler/linker/libc/startup, ranked honestly)
+- §13 Coq / RefinedC implementation practicalities
+- §14 Concurrency proofs (Iris) — no port, no trigger
+- §15 Mission-critical / certification framing
 - §16 Roadmap and first steps
 - §17 Rejected-alternatives ledger (the no-reloop table)
-- §19 **The proof-carrying C pipeline — Tier B INSTANTIATED** (2026-08-11): the built
-      Lean→emit→CBMC mechanism, the four silent semantic traps, the guard checklist,
-      evalS's real coverage, the cost model, and §19.9 THE ARENA DECISION.
-      **Amends §0.1** — hot paths MAY be hand-written C, specified in Lean.
+- §19 **The linked pipeline as built** — the measured mechanism, its guards, its envelope
 - §18 Sources and provenance
 
 ---
 
 ## §0 The decision in one page
 
-**ZER becomes a verified compiler, written in Lean 4, proven correct per pass.**
+**ZER becomes a verified compiler by proving its existing C implementation against Coq
+semantics, not by rewriting itself into a prover's language.**
 
-1. **Implementation language: Lean 4** — the whole compiler core (checker, IR passes,
-   emitter), not just the proofs. **AMENDED 2026-08-11 (§19.1): computational HOT
-   PATHS may be hand-written C, specified and proved in Lean and linked per build by
-   CBMC. Lean remains the DEFAULT; C is an escape hatch for a MEASURED bottleneck.** One artifact where the theorem is about the code that runs.
-   Migrated from the current ~47k-line C core via the strangler pattern, checker first.
-2. **Assurance tier: A (CompCert-style verified passes)** — each compiler pass carries a
-   machine-checked semantic-preservation theorem; composed into an end-to-end Grand Theorem.
-   Tier B (per-build translation validation) is the *bridge* for not-yet-proven passes.
-   Tier C (CakeML-style verified self-hosting) is *retired* — the self-hosting dream is
-   traded for the proof flag, deliberately.
-3. **Certificate-based checking model** — ZER's safety judgment moves from implicit
-   whole-program inference toward *infer within functions, certify between them*:
-   user annotations at boundaries are the certificates; the proven checker only verifies.
-   (Checking is P; finding is undecidable — Rice. Rust's model, adopted knowingly.)
-4. **Target: C99, dual backend** — the emitter produces C99 (as ZER already does),
-   constrained to CompCert's supported dialect and the freestanding profile.
-   Daily builds: latest mainline GCC/Clang. Certification builds: **CompCert**
-   (ZER →proven→ C99 →CompCert-proven→ assembly = verified chain to machine code).
-5. **Trust chain, stated honestly** — the compiler binary itself carries the standard
-   prover-toolchain residual TCB (same shape as CompCert's own), monitored by dual-compiler
-   builds + differential testing, and **bypassable per-artifact** by kernel-computed
-   certification (`by decide`) for the build that matters.
-6. **Concurrency proofs** — the existing Coq/Iris corpus (~870 lines) remains valid; a port
-   to iris-lean is empirically feasible today (days-scale) and becomes natural once the
-   compiler lives in Lean. Not urgent; recorded in §14.
-7. **AMENDED same day (§8.2): SINGLE PROVER — Lean 4 only, end to end.** No Coq/Iris in
-   the final architecture. CompCert = reference + interim *standalone* certification
-   compiler (its guarantee stands beside ours; no cross-prover theorem composition is
-   claimed, so no seam). Endgame = **Stage 5**: ZER's own Lean-verified backend
-   (ZER-IR → RISC-V / ARMv7-M direct), making the composed full-pipeline theorem live
-   entirely in Lean — the first CompCert-class backend native to Lean.
+1. **Implementation language: C — it stays.** The ~47k-line C core is not migrated. The
+   model–implementation gap that motivated a rewrite is closed by **RefinedC**, which proves
+   the actual `.c` file, not a transcription of it.
+2. **Prover: Coq (Rocq 9.1).** ZER already has **94 `.v` files** — λ-ZER operational
+   semantics, the per-class MAX oracles, the Iris concurrency corpus, and 23 VST files. That
+   corpus stops being a legacy asset and becomes the foundation.
+3. **The link: RefinedC.** Author-owned Coq definitions state what a function computes; the C
+   carries `[[rc::...]]` annotations; `refinedc check` proves the C meets that specification
+   for **all** inputs, kernel-checked, in seconds. This is the automation-first successor to
+   the `proofs/vst/` effort, which the 2026-07 record itself called *"brutal"*.
+4. **Assurance tier: A (per-pass semantic preservation)**, with the per-pass theorem stated in
+   Coq over λ-ZER and the pass's C implementation proved to realise it. Tier B (per-build
+   validation) remains the bridge for passes not yet proven. Tier C (verified self-hosting)
+   stays retired.
+5. **Certificate-based checking model — unchanged and unaffected by the prover switch.**
+   ZER infers every safety property; boundary annotations are a **restatement the compiler
+   verifies against its own derivation** — checked, never trusted (§5.3).
+6. **Target: C99, dual backend** — daily GCC/Clang, certification CompCert. **CompCert is
+   Coq**, so the cross-prover seam that the Lean record spent three amendments engineering
+   around (§8.1→§8.2→§8.3 in the old document) **does not exist here**.
+7. **Trust chain, stated honestly** — the residual TCB is Coq's kernel, RefinedC's frontend
+   and automation, one C compiler, and hardware; monitored by differential testing and the
+   mutant discipline, and bypassable per-artifact by kernel-computed certification.
+8. **Concurrency proofs stay where they are.** The Iris corpus is already Coq. No port, no
+   trigger, no second formalization of ZER's semantics.
 
 The one-liner: **proven wherever proof exists; trusted only in a residue that is small,
-diverse, watched — and bypassable for the one build that goes to the pad.**
+watched, and bypassable for the one build that goes to the pad — and obtained without
+rewriting a working compiler.**
 
 ---
 
-## §1 ZER today — inventory (measured 2026-07-19)
+## §0.1 What changed from the 2026-07-19 Lean record, and why
 
-### 1.1 The C implementation
+This is the section a fresh session must read before assuming anything above is a mistake.
 
-Measured with `wc -l` in the repo root:
+### What the old record got RIGHT, and this one keeps unchanged
+
+```
+§5   the CERTIFICATE PRINCIPLE          checking is P, finding is undecidable; infer within,
+                                        certify between; checked-never-trusted annotations.
+                                        Prover-independent. Untouched.
+§6   the TIER TAXONOMY                  A / B / C, and the decision A-primary, B-bridge,
+                                        C-retired. Untouched.
+§9   the TWO-CHAIN TCB analysis         "fully safe is not a state that exists". The chains
+                                        change contents, not shape.
+§10  the DUAL BACKEND                   GCC daily, CompCert for certification.
+§11  the EMITTER CONTRACT               C99, CompCert dialect, freestanding, deterministic.
+§12  the TOOLCHAIN RESIDUE ranking      linker script > libc > linker > assembler.
+§15  CERTIFICATION framing              per-artifact, composed evidence, the claim language.
+```
+
+### What is REMOVED, and the specific reason
+
+```
+LEAN 4 as the implementation language
+    The rewrite existed to close ONE gap: "the proofs are about a MODEL of checker.c, not
+    about checker.c" (old §2.2). RefinedC closes that gap on the C directly. Once the gap is
+    closed without a rewrite, a 47k-line migration of a working compiler buys nothing and
+    costs everything -- and old §7.2 knew it, opening with "big-bang rewrites of ~47k working
+    lines are the classic self-inflicted wound."
+
+LEAN 4 as the prover
+    Old §3.3's five reasons for Lean: (1) no extraction gap, (2) ergonomics for writing a
+    compiler, (3) ecosystem trajectory, (4) shared toolchain with KernelQ, (5) Iris is the
+    only thing Coq holds. Under the new architecture: (1) and (2) evaporate because nothing
+    is being written in the prover -- the compiler stays C; (4) INVERTS, because KernelQ's
+    synthesize track is now Coq + RefinedC; (5) becomes decisive in Coq's favour, since ZER's
+    Iris corpus already exists and would have to be ported. Only (3) survives, and an
+    ecosystem-trajectory argument does not outweigh 94 existing .v files.
+
+CBMC, and the whole §19 Lean-emit -> CBMC mechanism
+    It was Tier B instantiated: emit a reference C from Lean, then ask a BOUNDED model checker
+    whether hand-written C agrees with it. RefinedC replaces it with something strictly
+    stronger on the axis that matters -- UNBOUNDED proof for all inputs rather than
+    equivalence up to a bound -- and removes the reference-emission half entirely, which was
+    the part carrying the unproved `render` function and the four silent semantic traps.
+    The GUARDS discovered while building it are NOT removed: they are prover-independent and
+    are ported into §19 below, because every one of them is reachable here.
+
+The CROSS-PROVER SEAM, and everything built to survive it
+    Old §8.1 recorded that composing with CompCert would mean formalising the C interface
+    TWICE (once in Lean, once in CompCert's Coq) -- "an argued-and-tested link, not a
+    machine-checked one." §8.2 then eliminated the seam by declaring a Lean-native backend
+    (Stage 5); §8.3 retired Stage 5 because it traded ~50 GCC targets for 2, and accepted
+    COMPOSED EVIDENCE instead of one theorem.
+    ALL OF THAT DISSOLVES. CompCert is Coq. ZER's proofs are Coq. The interface semantics is
+    formalised ONCE. A composed, machine-checked theorem from ZER source to assembly is
+    available in principle without a native backend and without a seam -- see §8 Stage 4.
+    This is the single largest structural gain of the switch, and it was not the reason for
+    making it.
+```
+
+### What is genuinely LOST
+
+Stated plainly, because a decision record that only lists gains is a sales document:
+
+```
+MATHLIB              Coq's mathematics library is narrower than Lean's. Irrelevant to a
+                     compiler: ZER's proofs are operational semantics and simulation
+                     arguments, not analysis or algebra.
+ONE ARTIFACT         Lean's "the function you run IS the object you prove" is genuinely
+                     elegant. Here there are two artifacts -- Coq definitions and C code --
+                     and RefinedC is what makes them one claim. If RefinedC cannot prove a
+                     given function, the two artifacts drift apart with nothing to stop it.
+                     That is the real cost, and §4.4 gives it an honest envelope.
+TOOL MEMORY SAFETY   the "cobbler's children" regret (a memory-safety tool written in a
+                     memory-unsafe language) is NOT resolved by a rewrite any more. It is
+                     answered differently and, where RefinedC reaches, more strongly:
+                     RefinedC PROVES memory safety of the C, rather than a runtime providing
+                     it. Where RefinedC does not reach, the regret stands. Do not pretend
+                     otherwise.
+ECOSYSTEM MOMENTUM   the Lean FRO / industrial-Lean trajectory argument is given up. Recorded
+                     as a real cost, not argued away.
+```
+
+### The rule for a fresh session
+
+**Do not re-propose Lean.** The question is settled by the fact that nothing is written in the
+prover: once the implementation stays in C, the prover choice is decided by which one has the
+libraries that verify C (Iris, RefinedC, VST, CompCert — all Coq) and by which one already
+holds ZER's corpus (Coq). Revisit only if RefinedC's envelope (§4.4) proves too narrow for
+ZER's actual passes **and** a measured alternative exists — not on ecosystem grounds.
+
+---
+
+## §1 ZER today — inventory
+
+### 1.1 The C implementation (measured 2026-07-19)
 
 | Component | Files | Lines |
 |---|---|---|
@@ -108,371 +199,399 @@ Measured with `wc -l` in the repo root:
 | Peripherals | `zer_lsp.c zer_wasm.c` | 1,844 |
 | Everything `.c/.h` in root | | 63,713 |
 
-Interpretation: the checker is ~half the core. It is also the component whose correctness IS
-the product — which is why the migration is checker-first (§7). Functional-style rewrites of
-this class of code typically shrink it 3–5× (ADTs + pattern matching vs hand-rolled C tagged
-unions and manual memory), so the Lean core is expected around 10–15k lines.
+Interpretation, and it changes with this decision: the checker is ~half the core and its
+correctness IS the product. Under the Lean plan that made it the *first thing to rewrite*.
+Under this plan it makes it the **first thing to specify and prove in place** — the same
+priority, without the rewrite.
 
-### 1.2 The existing proof corpus (Coq)
+### 1.2 The existing proof corpus — 94 `.v` files (measured 2026-08-15)
 
 ```
-proofs/
+proofs/                                              94 .v files total
 ├── composition.v
 ├── model1_handle_states.v … model4_static_annotations.v
-├── vst/verif_*.v                      # ~26 files: per-rule verifications of checker rules
-│                                      #   (arith, atomic, cast, coerce, comptime, concurrency,
-│                                      #    container, context bans, escape, handle state, isr,
-│                                      #    mmio, move, optional, provenance, range checks,
-│                                      #    stack, variant, zer checks, type kind …)
-└── operational/
-    ├── lambda_zer_concurrency/        # ~870 lines total, 11 files:
-    │   syntax.v semantics.v iris_lang.v iris_state.v iris_wp_heap.v
-    │   iris_shared_inv.v iris_shared_specs.v iris_region_join.v
-    │   iris_boundary.v iris_concurrency_theorems.v DESIGN.md
-    ├── lambda_zer_handle/  (incl. iris_concurrency.v, iris_resources.v)
-    └── lambda_zer_move/    (iris_move_theorems.v)
+├── vst/verif_*.v                      23 files: per-rule verifications of checker rules
+│                                      (arith, atomic, cast, coerce, comptime, concurrency,
+│                                       container, context bans, escape, handle state, isr,
+│                                       mmio, move, optional, provenance, range checks,
+│                                       stack, variant, zer checks, type kind …)
+└── operational/                       66 files
+    ├── lambda_zer_concurrency/        ~870 lines, 11 files, zero admits — the ONE worked
+    │   syntax.v semantics.v iris_lang.v iris_state.v iris_wp_heap.v …   Iris instance
+    ├── lambda_zer_handle/             handle_flow_lattice.v — the UAF MAX oracle
+    ├── lambda_zer_escape/             param_lattice.v, join_lattice.v
+    ├── lambda_zer_{bounds,qualifier,capture,volatile}/   the four late oracles
+    └── lambda_zer_move/, lambda_zer_disjoint/
 ```
 
-What the concurrency proofs actually are (read 2026-07-19): they **instantiate Iris's
-weakest-precondition framework over ZER's own operational semantics** — the classic pattern
-(`syntax.v` → `semantics.v` → `iris_lang.v` builds a `LanguageMixin`; `ESpawn` emits an
-expression into the threadpool of the step relation; locks are invariant-opening proof
-devices). There is no library spinlock and no runtime concurrency in the proofs — it is a
-transition system plus a logic over all its interleavings. Iris imports used:
+**Under the Lean plan this corpus was a liability** — old §3.4 promised it "remains valid Coq
+and is not deleted", §8 Stage 0 planned to *rebuild* λ-ZER in Lean, and §14 scheduled the Iris
+port. Three formalization-maintenance obligations, all now cancelled.
 
-```
-From iris.base_logic.lib Require Import gen_heap ghost_map invariants.
-From iris.program_logic  Require Import language weakestpre lifting.
-From iris.proofmode      Require Import proofmode.
-From stdpp               Require Import gmap …
-```
+**Under this plan it is the foundation.** The oracles ARE the abstract domains the checker's C
+must be proved to implement; `lambda_zer_concurrency` is the worked operational instance;
+`composition.v` is the shape Stage 3 composes into. Nothing is ported, nothing is rebuilt.
 
-This import list is the exact checklist used in §4.3 to establish iris-lean portability.
+### 1.3 The `vst/` directory is the predecessor of this architecture, not a dead end
 
-The `vst/` files are evidence of the **model–implementation gap** being fought by hand:
-verifying C code against the rules via VST is brutal, which is one of the drivers for moving
-the implementation into the prover (§7.1).
+Old §1.2 read the 23 `verif_*.v` files as *"evidence of the model–implementation gap being
+fought by hand: verifying C code against the rules via VST is brutal, which is one of the
+drivers for moving the implementation into the prover."*
 
-### 1.3 The current checking model (and its structural weakness)
+That reading was right about the pain and wrong about the conclusion. The pain is **VST's
+interaction model** (interactive Coq tactics, days per function), not the goal. The goal —
+prove the shipped `.c` against a Coq spec — is exactly what this architecture adopts, with an
+automation-first tool in place of a tactic-first one. Everything already learned writing
+`verif_*.v` (VST-friendly C style: flat cascades of early-return ifs, no nesting, no compound
+conditions) transfers directly; RefinedC's C subset wants the same shape for the same reason.
 
-ZER's checker today establishes safety **by inference**: it derives the safety facts itself
-from the program (multiple analysis classes, checked implicitly against each other), rather
-than verifying user-supplied annotations. §5 records why this is on the wrong side of the
-checking-vs-finding asymmetry for mission-critical use, and the design shift adopted.
+### 1.4 The current checking model (unchanged)
+
+ZER's checker establishes safety **by inference**. §5 records why the design shifts to
+*infer within functions, certify between them*, and that shift is prover-independent.
 
 ---
 
-## §2 The implementation-language question
+## §2 The implementation-language question — RESOLVED DIFFERENTLY: C stays
 
-### 2.1 History: why ZER is in C, and the regret
+### 2.1 History: why ZER is in C, and what the regret actually was
 
-C was chosen initially because (a) "ZER should be simple like C, so build it in C," and
-(b) the bootstrap romance — C descends from B; building a systems language in C felt like
-joining that lineage. Both reasons dissolved under examination:
+C was chosen because "ZER should be simple like C, so build it in C" and for the bootstrap
+romance. Both dissolve under examination — a compiler is allocation-heavy, recursion-heavy and
+pointer-graph-heavy, which is precisely the workload where C's simplicity inverts.
 
-- "Simple like C" is a surface truth that inverts for compilers: a compiler is
-  allocation-heavy, recursion-heavy, pointer-graph-heavy (ASTs, symbol tables, IR).
-  C's "simplicity" means carrying all of that by hand. For this *specific* workload,
-  a GC'd/managed functional language is simpler *to write correctly*, not harder.
-- The bootstrap romance is not C-exclusive (OCaml self-hosts; Rust bootstrapped from OCaml;
-  Lean 4 self-hosts), and the stronger flag for a memory-safety language was always
-  self-hosting in ZER itself — which is itself later traded for an even stronger flag (§6).
-- The founder did not know, when choosing C, that OCaml-class languages eliminate the
-  memory-vulnerability classes wholesale. Knowing it, C became a *choice* rather than a
-  default — and then a choice to move away from.
+But separate two complaints that the 2026-07 record ran together:
 
-The cobbler's-children tension (a memory-safety tool written in a memory-unsafe language) is
-real but was never fatal: ZER-written-in-C still produces safe output, because the guarantee
-lives in ZER's design, not its implementation language. What C costs is ZER-the-tool's own
-robustness and, decisively, any possibility of machine-checked implementation correctness.
-
-### 2.2 The options considered
-
-| Option | Memory safety | Provability of the implementation | Verdict |
-|---|---|---|---|
-| Stay C | ✗ | ✗ (VST-style verification of C is brutal — see `proofs/vst/`) | Rejected as end-state |
-| OCaml | ✓ | ✗ (proofs live elsewhere; extraction gap) | Good tool language; superseded |
-| Rust | ✓ | ✗ (borrow checker ≠ theorems; graph-shaped compiler data fights the borrow checker — arenas/indices) | Good tool language; superseded |
-| **Lean 4** | ✓ (RC runtime, compiles via C) | **✓ — the theorem is about the code that runs** | **ADOPTED** |
-
-The decisive property is the last column. In every split architecture (implementation in X,
-proofs in a prover about a *model* of X), the model–implementation gap is unverified: the
-hand-transcription of the rules into `checker.c` is exactly where correctness leaks, and
-exactly what the VST effort was fighting. When the checker is *written in Lean*, the function
-you run **is** the object you prove:
-
-```lean
-theorem checker_sound : check p = true → Safe p   -- about the ACTUAL shipped code
+```
+COMPLAINT A   the tool itself is memory-unsafe            -> a real robustness cost
+COMPLAINT B   the implementation cannot be machine-checked -> the DECISIVE one
 ```
 
-That is CompCert-class assurance ("verified implementation"), not "verified model."
+**B was decisive and B is what a rewrite was for.** A alone never justified 47k lines of
+migration; old §2.1 says so itself (*"ZER-written-in-C still produces safe output, because the
+guarantee lives in ZER's design, not its implementation language"*).
 
-### 2.3 What Lean-hosted does NOT mean
+RefinedC answers B directly — and answers A wherever it reaches, since its type system proves
+absence of UB, out-of-bounds access and integer overflow as side conditions, independent of
+whether the functional specification is strong (measured; see §4.2).
 
-Writing ZER in Lean does **not** obligate proving everything. Unproven Lean (using
-`partial def` where termination proofs are not worth it) is simply a memory-safe,
-OCaml-grade implementation — and every component can be *upgraded to proven* incrementally,
-in place, in the same language. The strategic value is the **option** to prove any part,
-exercised on the roadmap's schedule (§8), not a day-one obligation.
+### 2.2 The options, re-scored
+
+| Option | Memory safety | Provability of the implementation | Cost | Verdict |
+|---|---|---|---|---|
+| Stay C, unverified | ✗ | ✗ | 0 | Rejected (the status quo ante) |
+| Rewrite in OCaml / Rust | ✓ | ✗ (proofs live elsewhere; model gap remains) | 47k lines | Rejected |
+| Rewrite in Lean 4 | ✓ | ✓ (theorem about the running code) | 47k lines + permanent proof-language coupling | **Superseded — the gap it closed is closable without it** |
+| **Stay C + RefinedC** | **✓ where proved** | **✓ — the theorem is about the actual `.c`** | **annotation + spec work, incremental, per function** | **ADOPTED** |
+
+The decisive column is now the last one. A rewrite is a step function: nothing is verified
+until a component has been fully migrated. RefinedC is incremental at the granularity of a
+**function**: `checker.c` can have five proved functions and the rest unproved, shipping the
+whole time, with the proved set growing. For a one-maintainer project that difference is not a
+preference — it is the difference between a plan that happens and a plan that does not.
+
+### 2.3 What "C stays" does NOT mean
+
+It does not mean the C is exempt from discipline. RefinedC accepts a **subset** of C, and code
+written outside it cannot be verified at all (§4.3). The practical consequence is a style
+constraint on newly-written safety-critical C — the same constraint `proofs/vst/` already
+imposed, now with a faster tool behind it. Peripheral code (`zer_lsp.c`, `zer_wasm.c`, the
+conversion tools) is under no such constraint and is never proved.
 
 ---
 
-## §3 The prover question — Coq vs Lean 4
+## §3 The prover question — Coq
 
 ### 3.1 Foundations: identical
 
-Both are the Calculus of Inductive Constructions (dependent types + inductive types).
-**Expressiveness is identical**: anything provable in one is provable in the other; the
-theories are of the same logical strength (each models the other modulo mild axioms; both
-consistent relative to set theory). There is no theorem ZER will ever need that one prover
-can state and the other cannot. Encoding differences exist but are not expressiveness gaps:
-Coq has primitive coinduction (Lean re-encodes via quotients); Lean has primitive quotients
-(Coq encodes via setoids); universe cumulativity differs. "Expressed differently," never
-"inexpressible."
+Coq (Rocq) and Lean 4 are both the Calculus of Inductive Constructions. **Expressiveness is
+identical**; anything provable in one is provable in the other. Encoding differences exist
+(Coq has primitive coinduction, Lean primitive quotients) and are not expressiveness gaps.
+This section is retained verbatim in substance from the old record because it was correct and
+because it is what makes the switch cheap: no theorem ZER needs becomes unstatable.
 
 ### 3.2 The governing principle: capability in the kernel, convenience in libraries
 
-**Iris is not a Coq primitive.** It is ~200k lines of ordinary Coq *library* — separation
-logic DEFINED as step-indexed predicates over resource algebras, every rule PROVED as a
-theorem, the proof mode being tactic-layer sugar. No prover anywhere has concurrency-proof
-primitives, and that is a *feature*: tiny trusted kernel, everything above it derived.
-Symmetrically, Mathlib is ordinary Lean. The provers differ ONLY in which libraries are
-built out:
+**Iris is not a Coq primitive** — it is ~200k lines of ordinary Coq library. Neither is
+RefinedC, nor VST, nor CompCert. No prover has program-verification primitives; that is a
+feature (tiny trusted kernel, everything above derived). The provers differ ONLY in which
+libraries are built out, so the governing question is never *"can it be done"* but **"who
+already built the library, and how much porting do I pay."**
 
-- Coq: mature Iris, CompCert, VST, Software Foundations; narrower math.
-- Lean 4: mature Mathlib (where formalized mathematics is consolidating), industrial
-  verified software (AWS Cedar in production, SampCert, Veil, lean-mlir), a funded FRO;
-  Iris at ~69% ported (§4 — more usable than that number suggests).
+### 3.3 Why Coq for ZER specifically — the 2026-07 reasoning, re-run
 
-**Proof-by-existence:** iris-lean is written in PLAIN Lean 4 — zero new primitives, zero
-kernel extensions, zero new axioms. Its existence constructively proves that Lean 4
-expresses full Iris.
+The old record's five reasons for Lean, each re-scored under "the compiler stays in C":
 
-The one-liner that governs every prover comparison: **never "can it be done" — always
-"who already built the library, and how much porting do I pay."**
+| Old reason for Lean | Status now |
+|---|---|
+| 1. One language for programs and proofs; no extraction gap | **Void.** Nothing is written in the prover. There is no extraction, in either prover. |
+| 2. Programmer ergonomics for writing a compiler | **Void.** Same reason. |
+| 3. Ecosystem trajectory (Mathlib, FRO funding) | **Survives, and is given up.** Real, and outweighed by the four `.v`-shaped facts below. |
+| 4. Shared toolchain with KernelQ | **INVERTED.** KernelQ's synthesize track is Coq + RefinedC as of 2026-08. The shared-toolchain argument now points at Coq. |
+| 5. Coq holds only *mature Iris*, which binds concurrency not the compiler | **Decisive for Coq.** ZER's Iris corpus already exists, in Coq, working, zero-admit. |
 
-### 3.3 Why Lean 4 for ZER specifically
+And four things only Coq has, all of which ZER specifically needs:
 
-1. **One language for programs and proofs, no extraction gap.** Coq's path to an executable
-   is extraction to OCaml (unverified extraction + unverified OCaml compiler in the TCB
-   anyway — see §9). Lean compiles to C natively; the definitions you prove are the
-   definitions you compile.
-2. **Programmer ergonomics for a compiler**: ADTs, pattern matching, `partial def` (no
-   totality fights for worklist algorithms), tactics written in Lean itself, do-notation.
-3. **Ecosystem trajectory** (see LS.2 in the KernelQ doc): math and new industrial
-   verification are consolidating on Lean; funding asymmetry (Lean FRO vs a 2-engineer
-   Rocq Consortium) is the strongest leading indicator.
-4. **Shared toolchain with KernelQ**: the founder's Lean training track (KernelQ synthesize)
-   and ZER's proofs now use one prover, one skill ramp, one Docker image family. The KernelQ
-   ramp is literally the training program toward ZER's simulation proofs.
-5. The one thing Coq holds that Lean lacks — *mature* Iris — binds ZER's concurrency
-   proofs, not the compiler; and §4 shows even that gap is nearly closed for a corpus of
-   ZER's size.
+```
+RefinedC     verifies C against Coq specs, automation-first.       BSD licensed.
+VST          the predecessor effort; 23 files already written.
+Iris         mature, and ZER's concurrency corpus is built on it.
+CompCert     Coq -- which makes Stage 4 composition SINGLE-PROVER (§8).
+```
 
-### 3.4 What stays Coq
+The last one deserves emphasis because it was invisible in 2026-07: the entire §8.1/§8.2/§8.3
+amendment chain in the old document existed to manage a seam that **only existed because the
+prover was Lean**. Choosing Coq removes the problem rather than engineering around it.
 
-The existing proof corpus (§1.2) remains valid Coq and is not deleted. The λ-ZER
-formalization gets rebuilt/ported in Lean as Stage 0 (§8) because the compiler now lives
-there; the Iris concurrency corpus ports when convenient (§14). Nothing is stranded —
-both directions of the Coq↔Lean street are open at translation cost.
+### 3.4 What this costs in practice
+
+Coq's tactic language and ergonomics are, by most accounts, less pleasant than Lean's. Since
+ZER's proof work is *specification plus simulation arguments over its own semantics*, and
+since 94 files of it already exist in Coq written by this project, the ergonomic delta is a
+known quantity rather than a risk. Recorded as a cost, not argued away.
 
 ---
 
-## §4 Iris-in-Lean — empirical status (verified locally, 2026-07-19)
+## §4 RefinedC — what it is, what it proves, and its measured envelope
 
-### 4.1 Warning: do not trust 2024-era write-ups or LLM training data
+**Everything in this section is measured, in the `kernelq-refinedc` image (Rocq 9.1.0,
+RefinedC `dev.2026-07-16`), on this machine, during 2026-08-14/15. Do not re-derive it.**
 
-Status pages from 2024 (and LLM knowledge derived from them) say iris-lean is "mainly a
-formalization of the MoSeL frontend" with **no program logic, no adequacy, never
-instantiated**. That was true in 2024 and is **FALSE now**. (During the session, a
-context-free Claude instance confidently repeated the stale claim — "the WP+adequacy tower
-is what iris-lean hasn't finished porting" — and was refuted by the local build below within
-the hour. Verify against the repository, not memory.)
+### 4.1 The mechanism — it converts C into Coq, and proves a theorem about it
 
-### 4.2 What was verified, with commands
-
-Repository: `github.com/leanprover-community/iris-lean` (very active: commits within days,
-releases tracking Lean versions, invited talk at Iris Workshop 2026, Mario Carneiro among
-top contributors; porting tracker ~69% of Rocq-Iris definitions).
-
-**Build (Lean kernel re-checks the entire concurrency tower):**
+This is the single most-misunderstood point, so it is stated first and precisely.
 
 ```
-git clone --depth 1 https://github.com/leanprover-community/iris-lean.git
-# inside the kernelq-lean Docker image (deps: Qq + batteries; git must be installed):
-cd iris-lean/Iris && lake build Iris.HeapLang.Lib.SpinLock
-# RESULT: 201/201 modules built, 0 errors, 0 sorry-warnings.
-# Chain: base logic → cameras → proof mode → invariants → WeakestPre → ThreadPool
-#        → Adequacy → HeapLang → SpinLock
+   your .c
+     |  Cerberus frontend (frontend/ail_to_coq.ml) -- "Ail" is Cerberus's C AST
+     v
+   generated_code.v     the C as a CAESIUM PROGRAM TERM. A transcript, carrying source
+                        locations. NOT a function.
+   generated_spec.v     your rc:: annotations, elaborated into a REFINEMENT TYPE:
+                          given <precondition>, returns a value refined by <Coq function>
+                                                                          ^ the CITATION
+   generated_proof_f.v  a Coq THEOREM to prove: `type_f : typed_function f_def f_spec`
+     |
+     |  LITHIUM runs as a Coq TACTIC: walks the program symbolically -- loop entry, one
+     |  body, loop exit -- emitting SIDE CONDITIONS, which are pure mathematical goals.
+     v
+   coqc CHECKS THE WHOLE THING. Qed or nothing.
+   Print Assumptions type_f  ->  "Closed under the global context"
 ```
 
-**Axiom oracle (the un-fakeable check — same oracle KernelQ uses on students):**
+**Nothing is compared.** There is no AST diff, in RefinedC or anywhere in this pipeline. A
+program term (Caesium) and a function (`nat -> nat`) are different types; you cannot write `=`
+between them. The specification **names** the Coq function, and the proof shows the program's
+result equals it. The link is by citation, and that is why the generated `.v` being a
+"transcript, not a function" stopped mattering.
 
-```lean
-import Iris.HeapLang.Lib.SpinLock
-open Iris.HeapLang
-#print axioms SpinLock.newlock_spec
-#print axioms SpinLock.try_acquire_spec
-#print axioms SpinLock.acquire_spec
-#print axioms SpinLock.release_spec
--- ALL FOUR: depends on axioms: [propext, Classical.choice, Quot.sound]
--- (the three standard Lean axioms; NO sorryAx anywhere in the dependency chain)
+Consequence for the ZER architecture: relating the checker's C to λ-ZER is **not** a
+translation-validation problem and does not need a reference implementation, a rendered
+artifact, or a bounded equivalence check. It is one Hoare triple per function.
+
+### 4.2 What is proved regardless of the specification's strength
+
+Measured: the obligation `(i + 8 <= max_int i64)` was raised against a specification that says
+nothing whatsoever about overflow. So the type system's own side conditions give, for free:
+
+```
+absence of undefined behaviour, out-of-bounds access, and integer overflow
 ```
 
-Meaning: a complete concurrent-lock verification — mutual exclusion via invariants, under a
-weakest-precondition logic with threadpool adequacy — **kernel-checks in Lean 4 today**.
+This matters more for ZER than the functional half, at least initially. `checker.c` has never
+had a machine-checked memory-safety argument; RefinedC gives one function-by-function without
+requiring anyone to first write down what that function computes.
 
-Also verified: iris-lean pins `leanprover/lean4:v4.32.0` — the same toolchain as the
-`kernelq-lean` image. The static `sorry` grep over the whole library finds only
-comment-enclosed occurrences (zero live).
+**Worked example of the value, measured.** An 8-way-unrolled counting loop whose condition is
+`k + 8 <= n` was REJECTED with exactly that obligation. The C is functionally correct — gcc
+over `n ∈ [0,5000]` under UBSan reports `ALL AGREE` — but when `n` is within 8 of `LLONG_MAX`,
+`k + 8` overflows:
 
-### 4.3 ZER-import mapping (every facility ZER's proofs need, present)
+```
+runtime error: signed integer overflow: 9223372036854775803 + 8
+               cannot be represented in type 'long long int'
+```
 
-| ZER's Coq import | iris-lean counterpart | Verified how |
-|---|---|---|
-| `program_logic` `language`/`weakestpre`/`lifting` | `Iris/ProgramLogic/{Language, EctxLanguage, EctxiLanguage, WeakestPre, Lifting, EctxLifting, Adequacy, ThreadPool}` | listed + built |
-| `base_logic.lib.invariants` | `Instances/Lib/Invariants.lean` (+ `CInvariants`, `NaInvariants`) | listed + built |
-| `base_logic.lib.gen_heap` | `BI/Lib/GenHeap.lean` (used by HeapLang's own `PrimitiveLaws`) | import chain read |
-| `base_logic.lib.ghost_map` | `Instances/Lib/GhostMap.lean` | listed |
-| `proofmode` | `Iris/ProofMode` (MoSeL port: `istart`, `iintro`, `iframe`, `imod`, …) | built + used in SpinLock |
-| `stdpp` `gmap` | `Std.ExtTreeMap` + `Algebra/{Heap,HeapView}` cameras | listed |
+No finite behavioural test reaches that input. `n - k >= 8` is the non-overflowing idiom and
+proves immediately. **This is the class of bug ZER's own C is full of and its test suite
+cannot see.**
 
-Note: the porting tracker's "gmap/gmap_view **0%**" is misleading — the same machinery was
-**rebuilt under different names** rather than ported file-by-file. There is no missing wall.
+### 4.3 The C subset — measured, and it constrains style not capability
 
-**Conclusion:** a port of ZER's 870-line concurrency corpus to iris-lean is a days-scale
-*structural translation* (not a copy — syntax and tactic names differ). ZER's use of
-Coq/Iris is a **preference** (maturity, existing fluency), not a constraint. See §14.
+RefinedC's frontend accepts a subset. Measured directly:
+
+```
+ACCEPTED    r += a;      k++ in a for-header      a > b ? a : b       plain statements
+REJECTED    return a = b;      "Forbidden: nested assignment"
+            -- assignment used as an EXPRESSION
+```
+
+Rejections of this kind come back in **1–2 seconds**; a real proof attempt takes 5–30s. That
+timing difference is the reliable tell that a verdict is a *parse* refusal rather than a proof
+outcome, and any tooling built around RefinedC should classify on it (KernelQ's does).
+
+The style this forces — one operation per statement, no assignment-in-expression — is the same
+style `docs/proof-internals.md` already mandates for VST-friendly C. No new discipline.
+
+### 4.4 THE ENVELOPE — where it stalls, honestly, with numbers
+
+This is the cost of giving up "one artifact" (§0.1) and must not be softened.
+
+RefinedC is a proof **search**. It can fail to close on code that is correct. Two distinct
+modes, and they look identical to the caller:
+
+```
+GIVES UP    finishes FAST, reports "Cannot solve side condition". The common one.
+BLOWS UP    the obligation count or solver time explodes. Bounded only by a timeout.
+```
+
+Measured verdicts (`refinedc/logs/VERDICTS` in the KernelQ repo):
+
+```
+plain accumulation loop         ACCEPT       16s
+chunked loop                    ACCEPT       52s
+counting loop, 8x unrolled      ACCEPT        6s     same annotation as 1x
+counting loop, 32x unrolled     ACCEPT       23s     same annotation as 1x
+list/fold, 32x unrolled         ACCEPT      226s     needs a vocabulary prelude
+pointer-walking variant         NOT PROVED   12s     no annotation is expressible
+```
+
+Three findings that shape the ZER plan:
+
+1. **Unrolling is not a stall.** A 32-wide body needs no more invariant than a 1-wide one,
+   because the invariant is about the *loop*, not the body. Cost scales with obligation count
+   (6s → 23s), not with difficulty.
+2. **Pointer-walking is a real, structural stall.** The residual is a separation-logic goal
+   that no annotation reaches. **This is the one that matters for ZER**, whose passes are
+   pointer-graph-shaped — and it is exactly what §19.4's arena decision answers.
+3. **The annotation burden is the ongoing cost.** Loop invariants are written by hand, per
+   loop. That is the honest recurring price.
+
+### 4.5 The specification cost — it follows what the SPEC CITES, not the algorithm
+
+Measured across the KernelQ rungs, and this corrects a figure that was widely mis-quoted:
+
+```
+spec cites a LITERAL            0 lines of author Coq.  ...and links to NOTHING.
+spec cites ONE Coq function     ~6 lines of substance:
+                                  1 Definition (the Z-level twin of the nat-level function)
+                                  2 Lemmas
+                                  1 Ltac + its enrich_context_hook registration
+spec uses LISTS / FOLDS         a vocabulary prelude, paid ONCE per vocabulary
+```
+
+Two rules that cost real iterations to learn:
+
+- **DEFINING A LEMMA IS NOT REGISTERING IT.** A prelude carrying the lemmas but no
+  `enrich_context_hook` registration changes *nothing* — same unsolved goals before and after.
+  This is the single easiest way to wrongly conclude RefinedC cannot do something it can.
+- **The lemma must match the term shape the automation PRODUCES**, not the shape you would
+  write. Measured: a lemma about `fZ` never fired because the automation had already unfolded
+  `fZ` into `fN ∘ Z.to_nat`. The loop is: run → read `Cannot solve side condition` → look at
+  the goal → restate the lemma over ITS shape → repeat. Two rounds for a simple function.
+
+### 4.6 Licensing and provenance
+
+RefinedC is **BSD**; Iris is BSD; Coq/Rocq is LGPL-2.1. There is no per-seat licence anywhere
+in the verification stack, which is a different position from the CompCert backend (§10.2) and
+is worth stating in any certification conversation.
 
 ---
 
 ## §5 The certificate principle — the design shift in ZER's checking model
 
-### 5.1 The asymmetry (the deepest principle in the field)
+**This section is prover-independent and is carried forward unchanged in substance.** It is
+the deepest design commitment in the document and nothing in the Lean→Coq switch touches it.
+
+### 5.1 The asymmetry
 
 **Checking a given answer is P; finding the answer is NP-hard at best — and for semantic
-properties of programs, undecidable (Rice's theorem).** Every serious verification system is
-built around this asymmetry:
+properties of programs, undecidable (Rice).** Every serious verification system is built
+around this asymmetry:
 
 - Proof assistants: humans/tactics FIND the proof; a tiny kernel only CHECKS it.
-- Rust: the function signature (lifetimes, ownership) is a **certificate the user supplies**;
-  the borrow checker verifies each function *locally* against the signatures of what it
-  calls — never whole-program inference. Fast, modular, predictable, errors local.
-- Proof-carrying code (Necula): ship the certificate with the program; the consumer runs
-  only the cheap checker. Invented for mission-critical mobile code.
+- Rust: the function signature is a **certificate the user supplies**; the borrow checker
+  verifies each function *locally*. Never whole-program inference.
+- Proof-carrying code (Necula): ship the certificate; the consumer runs only the cheap checker.
 - Conversely: a static analyzer over C/C++ is a bug-FINDER on the undecidable side — hence
-  unsound (Coverity-class, misses bugs by design) or subset-restricted (Astrée-class).
-  This is why "extreme analyzer on C++" is *structurally* weaker than a safe language:
-  analyzers fight the language; certificates are checked by it.
+  unsound (Coverity-class) or subset-restricted (Astrée-class).
 
 ### 5.2 Applied to ZER
 
-ZER's current implicit-inference checking does the FIND. It can be sound-but-conservative
-(safe!), but it inherits the finder's curse: heuristic cliffs, unpredictability, poor error
-locality, and — decisive for mission-critical — **near-impossibility of proving the checker
-itself sound**, because the object to prove is a search heuristic rather than a finite rule
-set. The mission-critical sin of inference is not danger; it is **illegibility and
-unprovability**.
+ZER's current implicit-inference checking does the FIND. Sound-but-conservative is safe, but
+it inherits the finder's curse: heuristic cliffs, poor error locality, and — decisive here —
+**near-impossibility of proving the checker sound**, because the object to prove is a search
+heuristic rather than a finite rule set.
 
 **Adopted design shift: infer WITHIN functions, certify BETWEEN them.**
 
-- Inside a function body: inference remains free (Rust does the same).
-- At function/module boundaries: user annotations (ownership, region, handle-state,
-  escape contracts — ZER's existing vocabulary) become the **certificates**. The checker
-  *verifies* them modularly: each function checked against the annotations of what it calls.
-- Consequences: (a) the safety judgment becomes a finite rule set over annotations —
-  exactly the shape that Stage 1's `checker_sound` theorem can be proven about;
-  (b) checking is polynomial, deterministic, reproducible; (c) errors localize to the
-  failing annotation; (d) the annotation IS readable intent — IV&V reviewers audit the
-  certificate, not the search; (e) separate compilation becomes natural.
-- Precedent for the proof step: Rust's model was proven sound *post-hoc* by RustBelt —
-  in Iris. ZER does it with the model designed for proof from the start, which is easier.
+- Inside a function body: inference remains free.
+- At function/module boundaries: annotations (ownership, region, handle-state, escape) become
+  the certificates; the checker *verifies* them modularly.
+- Consequences: the safety judgment becomes a finite rule set — exactly the shape Stage 1's
+  `checker_sound` can be proven about; checking is polynomial and reproducible; errors
+  localize; the annotation IS readable intent for IV&V; separate compilation becomes natural.
 
-This shift is worth more to the NASA-grade story than any implementation-language decision;
-it is what makes Stage 1 tractable at all.
+### 5.3 The annotation contract — CHECKED, never TRUSTED
 
-### 5.3 The annotation contract — CHECKED, never TRUSTED (clarified 2026-07-29)
-
-§5.2's word "certificate" reads, on a fast pass, as *"the user supplies a property and the
-tool believes it"* — the contract model. **It is not.** This subsection pins the actual
-contract so a fresh session does not re-derive it (and does not conclude that §5.2
-contradicts CLAUDE.md's "the compiler must INFER everything" — it does not; see the
-reconciliation at the end).
-
-**Three models exist; ZER is the third.**
+Three models exist; ZER is the third.
 
 | Model | Who states the property | Failure mode of a WRONG annotation | Example |
 |---|---|---|---|
-| **Trusted annotation** | user states, tool ASSUMES | you proved the WRONG THING, silently — soundness depends on user honesty | RefinedC, SPARK, contract systems |
-| **No annotation** | compiler alone | nothing to be wrong — but illegible, and a search heuristic is near-unprovable (§5.2) | Hindley–Milner; ZER before this shift |
-| **Checked annotation** | compiler INFERS the truth independently; user RESTATES it; compiler COMPARES | **compile error** | **ZER (adopted)**; Rust `fn` signatures; ML optional-but-checked types |
+| **Trusted annotation** | user states, tool ASSUMES | you proved the WRONG THING, silently | RefinedC, SPARK, contract systems |
+| **No annotation** | compiler alone | nothing to be wrong — but illegible and near-unprovable | ZER before this shift |
+| **Checked annotation** | compiler INFERS independently; user RESTATES; compiler COMPARES | **compile error** | **ZER (adopted)**; Rust `fn` signatures |
 
 The load-bearing property: **the annotation carries ZERO trust.** It is a restatement the
-compiler verifies against its own derivation, never an information source it relies on. A
-user who writes `*T` where the truth is `[*]T` gets an error telling them to switch — they
-cannot ship the wrong thing, and they also cannot make the checker unsound by lying. This is
-the single sentence that separates ZER from every contract-based system, and it is why
-`checker_sound` is provable at all: the judgment is a finite rule set over annotations the
-compiler itself derived, not a search whose output must be taken on faith.
+compiler verifies against its own derivation, never an information source it relies on.
 
-**The decision rule for whether an annotation is written or hidden.** One question:
-
-> **Does this annotation change the emitted C?**
+**The decision rule for whether an annotation is written or hidden.** One question — *does
+this annotation change the emitted C?*
 
 | Answer | Policy | Cases |
 |---|---|---|
-| **NO** — analysis-only, no runtime representation | **INFER it, hide it.** Keyword optional at most. | `keep` / non-keep (INFERRED since 2026-06-19), escape, provenance, handle state, alloc colour |
-| **YES** — changes layout, ABI, or codegen | **REQUIRE it explicitly, and CHECK it against inference.** | `*T` vs `[*]T`, `const`, `volatile`, `packed`, `mmio` |
+| **NO** — analysis-only | **INFER it, hide it.** | `keep`, escape, provenance, handle state, alloc colour |
+| **YES** — changes layout, ABI, codegen | **REQUIRE it, and CHECK it against inference.** | `*T` vs `[*]T`, `const`, `volatile`, `packed`, `mmio` |
 
-*Infer what is invisible; require what changes the machine.* This rule predicts every choice
-already made, which is the sign it is the real underlying principle rather than a post-hoc
-story. Apply it to any NEW annotation.
+*Infer what is invisible; require what changes the machine.*
 
-**Worked case — why `*T` vs `[*]T` must stay explicit even though it is inferable.** The
-compiler *can* determine from use whether a pointer is a single object or a range. It must
-not silently choose, because the choice is a representation decision:
+### 5.4 The RefinedC tension — resolved explicitly, because the table above names it
+
+**§5.3's first row lists RefinedC as the model ZER rejects.** Adopting RefinedC as ZER's
+verification tool therefore looks, on a fast read, like adopting the thing the design refuses.
+It is not, and the distinction is sharp:
 
 ```
-   *T      8 bytes   { ptr }
-   [*]T   16 bytes   { ptr, len }        (64-bit target)
+ZER's USERS      write ZER programs. Their annotations are CHECKED against the compiler's
+                 own inference. A wrong one is a compile error. This is §5.3 and it is
+                 UNCHANGED -- RefinedC is nowhere near this layer.
 
-   struct of 4 pointers  32B   vs   struct of 4 slices  64B    -> DOUBLED
-   one 64B cache line    8 pointers  OR  4 slices
-   [*]T arr[100]         1600B  vs  800B
-   argument passing      TWO registers per slice, one per pointer
-                         -> real register pressure on ARM
+ZER's AUTHORS    write the compiler, and the Coq specification of what it should do. The
+                 rc:: annotations on checker.c are AUTHOR-side: they say what this C
+                 function computes, so RefinedC can prove it does.
 ```
 
-Inferring it would let the compiler silently double struct sizes, stack frames and register
-pressure based on how a variable happened to be used in a distant function — i.e. silently
-choose the user's RAM budget and their C ABI. Unacceptable for the embedded/mission-critical
-target. (Rust makes the identical call: `&T` and `&[T]` are never inferred into each other.)
-Note also that `[*]T` is exactly the hand-rolled `{ptr, len}` pair a careful C programmer
-writes anyway; the type system only makes them inseparable and makes you say so.
+A wrong *user* annotation cannot happen — the compiler catches it. A wrong *author*
+specification absolutely can, and would mean the C was proved to compute the wrong thing. That
+risk is real and is managed by three rules, all of which cost minutes:
 
-**Two distinct things live at a boundary — do not conflate them.** §5.2's "certificates"
-covers both, but only the first is user-facing:
+1. **The specification cites λ-ZER, it is not written free-hand.** The Coq function a
+   `rc::returns` names must be a definition from `proofs/operational/`, i.e. the same object
+   the soundness theorem is stated over — not a fresh definition transcribed alongside the C.
+   Single-home the definition; splice it, never re-type it. (Measured trap: writing the
+   function twice — once in the semantics, once in the prelude — lets both halves pass while
+   grading different functions. Same multi-site class CLAUDE.md calls the #1 recurring bug.)
+2. **A vacuous specification is a specification that proves anything.** Measured: a
+   precondition pair `{0 <= n}` and `{n < 0}` is contradictory, so the triple is vacuously
+   true and `return 12345;` PROVES against `returns n` — **ACCEPT in 3 seconds.** RefinedC
+   will not warn you.
+3. **Therefore: every proved function keeps a MUTANT.** A deliberately wrong version that must
+   be REJECTED. If the mutant also proves, the specification is the bug. This is §19.2's
+   governing principle applied to authoring, and it is the only defence against 2.
 
-| Kind | Who writes it | Why it exists |
-|---|---|---|
-| **Representation certificates** | the USER writes them (`[*]T`, `const`, `volatile`) | they change the emitted code; checked against inference |
-| **Analysis facts** | the COMPILER derives and records them at the boundary | they exist so the check is MODULAR (separate compilation, local errors) and so the judgment is a finite rule set Stage 1 can be proven about |
-
-Both make the boundary judgment finite; only the first is an annotation in the user-facing
-sense. A reader who assumes the user writes all of it will badly undersell what ZER does.
-
-**Reconciliation with CLAUDE.md.** The two documents agree; state it this way:
-
-> ZER infers every safety property independently. Annotations at function boundaries are a
-> mandatory **restatement** of what the compiler already derived — **checked, never trusted**.
-> A wrong annotation is a compile error, so soundness never depends on the programmer being
-> right. Annotations exist for legibility, modularity and provability — not for information.
-
-**The cost, stated honestly.** ZER can only *require* an annotation for a property it can
-*infer*, so the annotation vocabulary is bounded by what is decidable. RefinedC is strictly
-more expressive precisely BECAUSE it trusts the user and makes them discharge the obligation.
-The trade is deliberate: **RefinedC can say more; ZER can never be wrong.** For a language
-whose target user may be careless and must still ship correct code, that is the right side.
+**The honest summary line:** *RefinedC can say more; ZER can never be wrong* — the old §5.3
+closing line — remains exactly true, because it was always about ZER's user-facing contract,
+not about how ZER's own implementation is verified.
 
 ---
 
@@ -480,101 +599,117 @@ whose target user may be careless and must still ship correct code, that is the 
 
 Two distinct theorems live in a compiler:
 
-1. **Checking correctness** — `check p = true → Safe p` (the safety judgment is right).
-2. **Translation correctness** — `compile p = c → c behaves as p` (semantic preservation).
-   A buggy emitter can take a *safe* source program and emit *wrong* code. This is real:
-   Csmith-class fuzzing found 300+ miscompilation bugs in GCC/LLVM — and famously **zero**
-   in CompCert's verified middle-end.
+1. **Checking correctness** — `check p = true → Safe p`.
+2. **Translation correctness** — `compile p = c → c behaves as p`. A buggy emitter can take a
+   *safe* source program and emit *wrong* code. Csmith-class fuzzing found 300+ miscompilation
+   bugs in GCC/LLVM and famously **zero** in CompCert's verified middle-end.
 
-The tiers for obtaining theorem 2, and the decision:
+| Tier | What | Decision |
+|---|---|---|
+| **A — verified passes** | Per-pass semantic-preservation theorem in Coq over λ-ZER, with the pass's C implementation proved to realise it by RefinedC | **ADOPTED — primary** |
+| **B — translation validation** | Per-build correspondence witness checked by a small proven validator | **ADOPTED — the bridge**, for passes not yet proven and for anything outside RefinedC's envelope (§4.4). Precedent: CompCert validates register allocation; seL4 validates its binary. |
+| **C — verified self-hosting** | Compiler in ZER, deeply embedded, bootstrapped | **RETIRED.** Unchanged from the old record. |
 
-| Tier | What | Cost | Decision |
-|---|---|---|---|
-| **A — verified passes** (CompCert-style) | Each pass written in Lean with a per-pass semantic-preservation proof; composed end-to-end | CompCert ≈ 100k lines Coq, team, ~decade — but §6.1 explains why ZER's instance is far smaller | **ADOPTED — primary** |
-| **B — translation validation** (per-run) | Unproven compiler emits a correspondence witness per build; a small proven validator checks source↔output equivalence for that artifact | Small validator; per-artifact assurance | **ADOPTED — as the bridge**: covers passes not yet proven, and optimizations, until their once-for-all proofs land. (Precedent: CompCert itself *validates* rather than verifies register allocation; seL4 validates its binary.) |
-| **C — verified self-hosting** (CakeML-style) | Compiler written in ZER, deeply embedded in the prover, every pass proven, bootstrapping itself into a verified binary | The hardest artifact in the field (CakeML: team, ~decade) | **RETIRED.** The self-hosting flag is traded for the proof flag — for a safety company, "our compiler is proven" beats "our compiler compiles itself," and it is the claim certification authorities can use. ZER-in-ZER survives only as an option for unproven periphery (LSP, tooling), never for the core. |
+**What changed inside Tier A.** Under the Lean plan, "the theorem is about the code that runs"
+came from writing the pass in the prover. Here it comes from RefinedC proving the C. The
+theorem statement is identical; the mechanism differs, and the mechanism no longer requires a
+rewrite.
 
-Note the permanence consequence, accepted with eyes open: **proofs are about specific
-code, so every proven pass lives in Lean permanently.** Proofs never live *in* the running
-language — they live in the prover, *about* the code (even CakeML's theorems live in HOL4).
-"Assurance in the compiler" always means "the compiler stays within the prover's reach."
+**What changed inside Tier B.** Its old instantiation (Lean-emitted reference C + CBMC bounded
+equivalence) is gone. Tier B's role shrinks accordingly: it covers what RefinedC's envelope
+does not reach, and it is per-artifact evidence rather than a once-for-all theorem.
 
-### 6.1 Why Tier A is far more tractable for ZER than it was for CompCert
+### 6.1 Why Tier A is more tractable for ZER than it was for CompCert
 
-1. **CompCert's hardest problem was C's semantics** — decades of legacy weirdness to
-   formalize before proving anything. **ZER owns its own semantics** and can *co-design*
-   the language with its formalization: when a construct is hell to prove, the construct
-   can change. CompCert never had that power. λ-ZER already exists (§1.2).
-2. **ZER emits C, not assembly.** The heroic backend passes (register allocation,
-   instruction selection, scheduling) are simply not in the pipeline; they are delegated
-   to the C backend (§10). The proof surface is: source → IR → C. A much shorter chain.
-3. **A safety-first source language has simpler semantics** than a legacy one; the
-   safety judgment (Stage 1) and the preservation proofs (Stage 2) share the same
-   formal substrate.
-4. **Per-pass staging ships value at every stage** (§8): a verified checker alone is
-   already a product.
+1. **CompCert's hardest problem was C's semantics.** ZER owns its own semantics and can
+   co-design the language with its formalization. λ-ZER already exists.
+2. **ZER emits C, not assembly.** The heroic backend passes are not in the pipeline.
+3. **A safety-first source language has simpler semantics** than a legacy one.
+4. **Per-pass staging ships value at every stage** — a verified checker alone is a product.
+5. **NEW: no migration precedes any of it.** Under the Lean plan, Stage 1 was gated behind
+   porting ~24k lines of checker to Lean. Here Stage 1 is gated behind specifying and proving
+   functions *that already exist*, one at a time, with the compiler shipping throughout.
 
 ### 6.2 The cost of A, stated honestly
 
-- **Development velocity changes character permanently.** Every change to a proven pass
-  requires re-proving it. CompCert evolves slowly *by design*; that is what
-  mission-critical maturity looks like. Iteration speed is traded for the right to make
-  the strongest claim in the field.
-- **The daily proof work is forward-simulation arguments** ("each source step is matched
-  by target steps preserving a relation") — a real skill jump from arithmetic lemmas.
-  The KernelQ Lean ramp is the deliberate training path toward exactly this.
-- **Proof-to-code ratio** historically runs ~3–10× per pass. With an expected ~10–15k-line
-  Lean core, the mature proof corpus will be the large majority of the repository. That is
-  normal for this class of artifact.
+- **Development velocity changes character permanently.** Every change to a proved function
+  requires re-proving it. That is what mission-critical maturity looks like.
+- **The daily proof work is simulation arguments** plus, now, **annotation maintenance**: a
+  refactor that changes a loop changes its invariant.
+- **The envelope is a hard constraint, not a slope** (§4.4). A function RefinedC cannot reach
+  is not "expensive to prove" — it is *unproved*, and stays under Tier B.
 
 ---
 
 ## §7 The architecture
 
-### 7.1 Whole ZER in Lean 4 — what it buys
-
-- Kills the model–implementation gap (§2.2): `checker_sound` is about the shipped function.
-  The VST effort (verifying C against the rules) becomes unnecessary — the rules and the
-  implementation are the same Lean definitions.
-- Memory safety of the tool itself (the original C regret, resolved).
-- The proofs and the program grow in one artifact; any component upgrades from
-  unproven-but-safe to proven without changing language or repo.
-
-### 7.2 Migration: strangler pattern, checker-first
-
-Big-bang rewrites of ~47k working lines are the classic self-inflicted wound. The pipeline
-has natural process-level seams; migrate along them, keeping a working system at every step:
+### 7.1 Two artifacts, one link
 
 ```
-Phase M1 (checker):    C frontend parses → dumps AST/IR (file/JSON)
-                       → LEAN CHECKER validates → C backend continues.
-                       Ports checker.c + zercheck*.c + types.c (~24k C → ~5–8k Lean).
-                       This is the crown jewel: the component where provability pays first.
-Phase M2 (IR+emitter): ir.c / ir_lower.c / vrp_ir.c / emitter.c move into Lean,
-                       one pass at a time, each arriving with (or ahead of) its proof.
-Phase M3 (frontend):   lexer/parser last (or never — parsing can stay C behind a
-                       validated AST dump; CompCert itself validated its parser).
-Keep in C longest:     zer_lsp.c, zer_wasm.c (~1.8k) — the WASM story via Lean's C output
-                       + emscripten is the roughest edge; do not let the tail block the dog.
+   proofs/operational/          COQ. λ-ZER semantics, the per-class oracles, the
+     lambda_zer_*.v             soundness theorems. What SAFE MEANS.
+        |
+        |  cited by name in the specification -- never transcribed
+        v
+   spec/checker_*.rch           AUTHOR-OWNED RefinedC specs: for each proved C function,
+                                what it computes, in terms of the Coq definitions above.
+        |
+        |  refinedc check  ->  Lithium  ->  coqc  ->  Print Assumptions
+        v
+   checker.c, zercheck_ir.c     THE SHIPPED C. Annotated with loop invariants.
+     ir_lower.c, emitter.c      Proved, function by function, for ALL inputs.
+        |
+        |  gcc / CompCert
+        v
+   zerc binary
 ```
 
-Interop notes: Lean 4 compiles to C; Lean-emitted C links with ZER's existing C at the
-object level (`@[extern]` for C→Lean calls). "Main pipeline in Lean + C periphery as
-libraries" needs no process boundaries once M1's file-based seam is retired.
+**There is no migration phase and no seam between the halves.** A function is either proved or
+not; the compiler works either way; the proved set grows monotonically.
+
+### 7.2 Sequencing — by verifiability, not by subsystem
+
+The old §7.2 sequenced a *migration* (checker → IR/emitter → frontend). This plan sequences
+*proof effort*, and the ordering principle is different: start where RefinedC's envelope is
+widest and the safety payoff is highest.
+
+```
+P1  THE PURE PREDICATES        src/safety/*.c -- ALREADY extracted, already VST-verified,
+                               already flat-cascade style. 85/85 predicates. This is the
+                               warm start: re-prove them with RefinedC, measure the delta
+                               against the VST effort, and calibrate everything else on
+                               real numbers rather than on this document's estimates.
+P2  THE ORACLE TRANSFERS       each MAX oracle (param_lattice, handle_flow_lattice, the
+                               four late ones) already specifies a transfer function. Prove
+                               the C that implements it computes the certified transfer.
+                               This is where "the oracle certifies the DOMAIN but nothing
+                               proves the C implements it" -- CLAUDE.md's stated current
+                               gap -- actually closes.
+P3  ARENA-FLATTEN THE IR       §19.4. The prerequisite for anything pointer-shaped. Do it
+                               before P4, not after.
+P4  THE FIXPOINT PASSES        zercheck_ir's CFG lattice, VRP. Bounded-trip-count form
+                               (§19.4) so the loop invariant is expressible.
+P5  THE EMITTER                Stage 2's `emit_correct`. Largest, last, and the one most
+                               likely to need Tier B for parts.
+NEVER                          zer_lsp.c, zer_wasm.c, tools/. Peripheral, unproved, fine.
+```
 
 ### 7.3 The pipeline (target state)
 
 ```
 ZER source
-  → [Lean] lexer/parser            (unproven initially; AST well-formedness validated)
-  → [Lean] CHECKER                 (PROVEN, Stage 1: certificate verification, §5)
-  → [Lean] AST → IR lowering       (PROVEN, Stage 2)
-  → [Lean] VRP / analyses          (proofs only where they license transformations)
-  → [Lean] IR → C99 emission       (PROVEN, Stage 2; dialect contract §11)
+  → [C] lexer/parser              unproved (AST well-formedness validated)
+  → [C, PROVED] CHECKER           Stage 1: certificate verification (§5)
+  → [C, PROVED] AST → IR          Stage 2
+  → [C, PROVED] VRP / analyses    proofs where they license transformations
+  → [C, PROVED] IR → C99 emission Stage 2; dialect contract §11
   → emitted C99
       → daily:        latest mainline GCC/Clang
-      → certification: CompCert → assembly   (verified chain, §10)
+      → certification: CompCert → assembly (verified chain, §10)
 ```
+
+Every "PROVED" above means: *a Coq theorem over λ-ZER, realised by this C, checked by
+RefinedC, axiom-free under `Print Assumptions`.*
 
 ---
 
@@ -582,287 +717,146 @@ ZER source
 
 | Stage | Artifact | Theorem (shape) |
 |---|---|---|
-| **0** | **Semantics in Lean**: λ-ZER source semantics; IR semantics; target C99-subset semantics | (definitions — the ground truth everything refers to; port/rebuild of the Coq λ-ZER) |
-| **1** | **Verified checker** | `theorem checker_sound : check p = true → Safe p` — soundness of the certificate-checking judgment (§5.2) against λ-ZER semantics |
-| **2** | **Verified passes**, one at a time | per pass, forward simulation: `theorem lower_correct : Safe p → SemIR (lower p) ≼ SemZER p` ; `theorem emit_correct : SemC (emit ir) ≼ SemIR ir` |
-| **3** | **Composition** | the ZER Grand Theorem: `check p = true ∧ compile p = some c → MemSafe c ∧ SemC c ≼ SemZER p` — "compiled programs are memory-safe and mean what the source means" |
-| **4** | (later) Retarget emitter to **Clight**, compose with CompCert's own theorem | verified from ZER source to machine code; TCB shrinks to CompCert's residue + Lean's (§9) |
+| **0** | **Semantics in Coq**: λ-ZER source semantics; IR semantics; the C99-subset target semantics | definitions — **and most of it already exists** (`proofs/operational/`), which is the largest single schedule change from the old record |
+| **1** | **Verified checker** | `Theorem checker_sound : check p = true -> Safe p` — over λ-ZER, realised by `checker.c` |
+| **2** | **Verified passes**, one at a time | per pass, forward simulation: `lower_correct : Safe p -> SemIR (lower p) ≼ SemZER p` ; `emit_correct : SemC (emit ir) ≼ SemIR ir` |
+| **3** | **Composition** | the ZER Grand Theorem: `check p = true /\ compile p = Some c -> MemSafe c /\ SemC c ≼ SemZER p` |
+| **4** | **Compose with CompCert** — **single-prover, no seam** | verified from ZER source to machine code; TCB shrinks to CompCert's residue + Coq's |
 
 Notes:
-- `≼` is behavioral refinement (target behaviors allowed by source), the CompCert-style
-  statement; strengthen to bisimulation where determinism allows.
-- Analyses (VRP) need correctness proofs **only where their results license
-  transformations**; a pure-diagnostic analysis can stay unproven indefinitely.
-- **An analysis that fails OPEN cannot be proven sound.** Where a class cannot resolve an
-  operation (an indirect call, an unmerged CFG join) and falls back to "unknown, therefore
-  accept", its abstract state does not over-approximate the concrete one: the
-  forward-simulation diagram will not close, and that class's soundness theorem is not
-  merely unproven but **false**. Every class must widen toward its UNSAFE classification at
-  such points — the argument-precise barrier, applied uniformly. Consequence for
-  sequencing: converting a fail-open class to fail-closed is a **prerequisite for its
-  Stage-1 proof**, not follow-up work, and is far cheaper to do in C than to discover as an
-  unclosable diagram mid-port. Current instances: `docs/limitations.md`.
-- Stage 1 alone is a shippable, review-worthy product ("the safety judgment is
-  machine-checked against the formal semantics"). Ship it before starting Stage 2.
-- Until a pass's Stage-2 proof lands, Tier B covers it per-build (§6): the pass emits a
-  witness; a small proven validator checks the instance.
 
-### §8.1 Precedent — and the cross-prover seam at Stage 4 (recorded 2026-07-19)
+- `≼` is behavioral refinement, the CompCert-style statement.
+- Analyses need correctness proofs **only where their results license transformations**.
+- **An analysis that fails OPEN cannot be proven sound.** Where a class falls back to "unknown,
+  therefore accept", its abstract state does not over-approximate the concrete one; the
+  forward-simulation diagram will not close and the soundness theorem is not merely unproven
+  but **false**. Converting a fail-open class to fail-closed is a **prerequisite** for its
+  Stage-1 proof, not follow-up work. Current instances: `docs/limitations.md`.
+- Stage 1 alone is a shippable, review-worthy product. Ship it before starting Stage 2.
+- Until a pass's Stage-2 proof lands, Tier B covers it per-build.
 
-**Precedent found:** SJTU-PLV maintains `github.com/SJTU-PLV/CompCert` branch
-`rust-verified-compiler` — a verified Rust(-subset) compiler built as a **frontend on
-CompCertO** (their compositional CompCert): `Rustsurface (OCaml) → Rustsyntax → Rustlight
-→ RustIR → Clight → CompCert backend`, in Coq (8.12), with a semantic-preservation theorem
-(`transf_rustlight_program_correct` in `driver/Compiler.v`). Status at reading: drop
-elaboration fully verified (`ElaborateDropProof.v`), lowering to Clight verified
-(`Clightgenproof.v`), move checking partially verified, **Polonius-based borrow checking
-still "working on"**; x86-64 only; active research project, ~4.3k commits on the branch.
+### §8.1 Stage 4 is now ordinary — the seam is gone
 
-**What it validates for ZER (this is the closest existing artifact to this document's
-plan):** an ownership-semantics safety language, compiled by a verified frontend that
-lowers to Clight and inherits CompCert's backend theorem — `Rustlight`/`RustIR` are
-precisely the λ-ZER / ZER-IR analogues. The Stage-2/Stage-4 shape is not speculative;
-a university group is building exactly it, at effort well below CompCert-scale.
+**The 2026-07 record's three-amendment chain (§8.1 seam → §8.2 single-prover-Lean → §8.3
+Stage-5-retired) does not apply and must not be carried forward.** Its entire content was:
+*ZER's proofs are in Lean, CompCert's are in Coq, therefore the C interface semantics would be
+formalised twice and their agreement is argued rather than machine-checked.*
 
-**What it confirms about §5 (the certificate decision):** their hardest, still-unfinished
-component is verifying Polonius-based borrow *inference* — i.e., verifying a **finder**.
-ZER's certificate model verifies a **checker** (annotations at boundaries, finite modular
-rules) — deliberately the tractable side of the same problem. Their open struggle is
-empirical support for that design choice.
+Both sides are Coq here. The C99-subset semantics is formalised once. Composing
+`emit_correct` with CompCert's `transf_c_program_correct` is a Coq-level composition like any
+other.
 
-**The seam it exposes in OUR plan (previously implicit — now recorded):** SJTU gets a
-*mechanical, single-prover* end-to-end theorem because everything lives in Coq inside
-CompCert. ZER's proofs live in Lean; CompCert's live in Coq. Therefore Stage 4's "compose
-with CompCert" is **not** mechanical theorem composition: the interface semantics
-(Clight / the C99 subset) would be formalized twice — once in our Lean target semantics,
-once in CompCert's Coq — and their agreement is an **argued-and-tested link, not a
-machine-checked one**. Position adopted:
+Three consequences, recorded so nobody re-derives them:
 
-1. **Engineer the seam small** — this is exactly what the §11 emitter contract already
-   does: a tiny, UB-free, fully-defined C dialect leaves the two formalizations no room
-   to disagree. The seam is then a documented TCB item alongside §9's residue, of the
-   same character (small, inspectable, testable).
-2. **Escape hatch if the seam ever matters**: implement the Stage-4 emission pass and its
-   proof *in Coq inside a CompCert fork* (SJTU-style) while the rest of the frontend stays
-   Lean; the seam then moves up to the Lean-IR ↔ Coq-IR boundary, where per-artifact
-   validation of a small IR is straightforward.
-3. The fully-seamless alternative — building all of ZER inside CompCert's Coq — is the
-   "all-Coq" path already rejected for the §3 ecosystem reasons; the seam is part of the
-   Lean bet's price, accepted with eyes open (ledger entry added to §17).
-
-Also noted: their **CompCertO** base (open-module / compositional correctness) is the
-right reference point when ZER later needs *linking* theorems (multi-unit programs,
-separate compilation of certified modules).
-
-### §8.2 DECISION AMENDMENT (2026-07-19, same day) — single-prover Lean 4, end to end
-
-Confronted with the §8.1 seam, the decision is to **eliminate it at the root rather than
-engineer around it: the ENTIRE verified pipeline is Lean 4, single prover, no Coq/Iris
-anywhere in the final architecture.** SJTU-PLV's work is a *reference architecture*
-(pipeline shape, IR design, proof structure), not a dependency.
-
-Consequences, precisely:
-
-1. **CompCert is repositioned**: reference material + *interim pragmatic certification
-   compiler*. Using CompCert as the cert-build C compiler requires NO Coq work on our
-   side and creates NO seam — because no cross-prover theorem composition is claimed;
-   CompCert's guarantee stands on its own next to ours ("our C is proven-correct output;
-   their compilation of it is proven-correct separately"). The seam only ever existed for
-   the *composed single theorem* — which is now deferred to Stage 5 instead.
-2. **Stage 5 (new endgame): ZER's own Lean-verified backend** — ZER-IR → ISA directly
-   (RISC-V first, then ARMv7-M), replacing the need for CompCert composition entirely.
-   Notes that size this honestly:
-   - "Porting CompCert to Lean" is a **design-guided rebuild**, not a translation — no
-     production-grade Coq→Lean proof translator exists at that scale. CompCert's papers
-     and structure are the map; the proofs are re-done natively.
-   - ZER does **not** need CompCert's scope. CompCert's crown burden was *all of C99's
-     semantics*; ZER's backend consumes ZER-IR (small, UB-free, ours) and targets 1–2
-     ISAs. The rebuild is a small fraction of CompCert.
-   - For cert builds, the verified path can go **direct to assembly** (ZER-IR → asm in
-     Lean) — the C middle-man existed for portability and CompCert composition; C99
-     emission remains the daily/portable path (GCC/Clang), unchanged.
-   - **ISA semantics substrate is emerging in Lean**: `opencompl/sail-riscv-lean`
-     translates the official Sail RISC-V spec into Lean (full coverage, type-checks;
-     Sail's Lean backend still WIP/unreleased as of 2026-07). Same group as lean-mlir.
-     If matured, the target-semantics half of Stage 5 comes largely for free.
-   - Novelty, stated plainly: no CompCert-class verified backend native to Lean exists
-     yet (per the 2026-07 ecosystem research). Stage 5 would be the first — an
-     opportunity (flagship artifact, community/FRO interest) and a risk (no in-prover
-     prior art; CompCert's design is the only map).
-3. **Concurrency proofs**: the single-prover decision upgrades §14's "port when
-   convenient" to "iris-lean is the designated home" — the Coq/Iris corpus ports at the
-   §14 trigger and Coq is retired from ZER entirely at that point.
-4. The §8.1 escape hatch (emission pass in a Coq/CompCert fork) is **superseded** — kept
-   in the ledger only as a fallback if Stage 5 stalls AND a composed theorem is demanded
-   sooner.
-
-Sequencing is unchanged where it matters: **Stages 0–3 are untouched** (semantics,
-`checker_sound`, per-pass proofs, Grand Theorem to C99). Stage 5 is the endgame after
-them; the dual-backend strategy (§10) covers everything until it lands.
-
-### §8.3 DECISION AMENDMENT (2026-07-29) — STAGE 5 RETIRED. Emit-C is permanent; the backend stays delegated.
-
-**§8.2's Stage 5 (a ZER-native, Lean-verified backend emitting ISA directly) is RETIRED.**
-Its *reasoning* was sound — the §8.1 cross-prover seam is real, and a native backend is
-genuinely the only way to obtain ONE machine-checked theorem from ZER source to machine
-code. What is rejected is the **goal**, because of what it costs:
-
-| | Architectures supported | Backend maintained by |
-|---|---|---|
-| **Emit C → GCC** (the product today) | **every target GCC supports** (~50, and new ones arrive free) | the GCC project, forever |
-| **Emit C → CompCert** (certification path) | x86-64, AArch64, ARM, RISC-V, PowerPC — **already verified to assembly** | AbsInt / the CompCert project |
-| **Stage 5 native backend** | **2** (RISC-V, ARMv7-M) | **us, forever, per ISA** |
-
-**Architecture breadth IS the product.** "Targets every architecture GCC supports" is ZER's
-central portability claim; a native backend would trade ~50 targets for 2 and convert a
-zero-maintenance dependency into a permanent per-ISA obligation — including every new board
-a customer asks for. No verification gain justifies that for a one-maintainer project whose
-users are embedded shops with heterogeneous targets.
-
-**And Stage 5's function is already served.** CompCert *is* the verified backend Stage 5
-would rebuild, it already covers more ISAs than Stage 5 targeted, and §8.2 itself records
-that using it pragmatically creates **no seam**: *"no Coq work on our side and NO seam —
-because no cross-prover theorem composition is claimed."* Writing our own would be
-reimplementing CompCert, worse, for fewer targets, to recover a single composed statement.
-
-**Adopted end-state (replaces Stage 4 and Stage 5 both):**
-
-```
-   DAILY           ZER -> C99 -> GCC          every arch, free, unverified backend
-   CERTIFICATION   ZER -> C99 -> CompCert     verified to asm on CompCert's targets
-   NATIVE BACKEND  none, ever
-```
-
-**What is claimed, and what is not — the honest line:**
-
-- CLAIMED: `checker_sound` (the safety judgment is right) ∧ `emit_correct` (the emitted C
-  means what the source means) ∧ — when built with CompCert — that C is compiled to
-  assembly by a separately-proven compiler.
-- NOT CLAIMED: a single machine-checked theorem spanning ZER source → machine code. The
-  joint is the C-dialect agreement between our Lean target semantics and CompCert's Coq
-  one — an **argued-and-tested link** (§8.1), deliberately kept trivial by §11's tiny,
-  UB-free dialect, and listed in the TCB alongside §9's residue.
-- This is composed evidence rather than one theorem. Safety processes (DO-178C-style)
-  accept composed evidence; the single-theorem framing was an aesthetic goal, not a
-  certification requirement.
-
-**Do not re-derive Stage 5 from the seam argument.** A future session reading §8.1 will
-correctly conclude that a native Lean backend is the only route to a composed theorem.
-That conclusion is right and the goal is still declined — the cost is measured in lost
-target coverage, not in proof effort. Revisit ONLY if a customer requires end-to-end
-machine-checked assurance on a target CompCert does not support, and funds the backend.
-
-Consequential edits: §8.2's items 2 and 4 and §17's three Stage-5-referencing rows are
-superseded by this amendment; §10's dual-backend strategy becomes the permanent end-state
-rather than an interim one.
+1. **A single machine-checked theorem from ZER source to assembly is available in principle** —
+   without a native backend, and without the "composed evidence" fallback §8.3 accepted.
+2. **Stage 5 (a ZER-native verified backend) stays retired, and for its own reason** — it
+   traded ~50 GCC targets for 2 and a zero-maintenance dependency for a permanent per-ISA
+   obligation. **Architecture breadth IS the product.** That argument never depended on the
+   prover and survives intact. Do not revive Stage 5 on the strength of §8.1's disappearance.
+3. **The precedent is directly usable now.** `SJTU-PLV/CompCert` branch `rust-verified-compiler`
+   builds a verified Rust-subset compiler as a Coq frontend on CompCertO
+   (`Rustsurface → Rustsyntax → Rustlight → RustIR → Clight → CompCert backend`). Under the
+   Lean plan that was a *reference architecture we could not use*. Under this plan it is the
+   same prover, the same shape, and `Rustlight`/`RustIR` are precisely the λ-ZER / ZER-IR
+   analogues. Their hardest unfinished component is verifying Polonius-based borrow
+   *inference* — a **finder** — which is empirical support for §5's decision to verify a
+   **checker** instead. Their CompCertO base is the right reference when ZER later needs
+   linking theorems for separate compilation.
 
 ---
 
 ## §9 The two trust chains — the honest TCB analysis
 
-This section is the answer to "is it fully safe?" — and the first thing a hostile reviewer
-will probe. Two separate chains, with different status:
-
 ```
 CHAIN 1 — the flight artifact:
 ZER source ──(checker: PROVEN)──(passes/emitter: PROVEN)──▶ emitted C99
    emitted C99 ──(CompCert: PROVEN — their small TCB)──▶ flight binary
-   STATUS: closed by Stages 1–3 (+ CompCert), i.e. proven end-to-end
+   STATUS: closed by Stages 1–3 (+ CompCert), and at Stage 4 COMPOSABLE into one
+           machine-checked theorem (§8.1) — the seam that blocked this is gone
            [daily builds swap the last link for GCC/Clang — trusted, see §10]
 
 CHAIN 2 — the compiler binary itself:
-Lean definitions (theorems PROVEN, kernel-checked)
-   ──(Lean compiler: UNVERIFIED)──(C compiler: UNVERIFIED)──▶ zerc binary
+Coq definitions (theorems PROVEN, kernel-checked)
+   ──(RefinedC's frontend + automation)──(C compiler: UNVERIFIED)──▶ zerc binary
    STATUS: residual TCB — trusted, not verified
 ```
 
-### 9.1 Chain 2 honestly stated
+### 9.1 Chain 2 honestly stated — and how it DIFFERS from the Lean version
 
-The theorems are about the Lean *definitions*; the running `zerc` binary is produced by
-Lean's unverified compiler plus an unverified C compiler. If that toolchain miscompiled the
-checker, the binary could deviate from the proven function — theorems intact. **"We check
-the whole semantics" is true of the mathematics and NOT of the executable.**
+Under the Lean plan, chain 2 read: *theorems are about Lean definitions; the binary comes from
+Lean's unverified compiler plus an unverified C compiler.* The gap was **extraction-shaped**.
 
-This is the **universal residual TCB** — CompCert itself has the same structure (proofs in
-Coq; executable via unverified extraction + unverified OCaml compiler) and ships to Airbus
-that way, certified. Every verified system terminates in trust:
+Here it is **frontend-shaped**, and that is a genuinely different risk with a different profile:
+
+```
+GONE          the Lean compiler. Nothing in ZER is compiled from a prover's language.
+GONE          "the theorem is about a definition, the binary is about something else."
+              The theorem is about THIS .c file. gcc compiles that same file.
+NEW           the CERBERUS FRONTEND. RefinedC proves things about `generated_code.v`,
+              its Coq rendering of your C. If that rendering does not faithfully capture
+              what the C means, the theorem is about a different program.
+NEW           LITHIUM + the Coq automation. Bugs here cost SOUNDNESS only if they close
+              a goal that is false; the coqc kernel re-checks the resulting proof term,
+              which is exactly what makes this residue small.
+```
+
+The mitigating structure is the same shape as everywhere else in this document: **the kernel
+re-checks.** Lithium is a tactic; a tactic that "proves" something invalid produces a proof
+term the kernel rejects. So Lithium's size does not enter the TCB the way the Lean compiler's
+did. What DOES enter is the frontend's C-to-Caesium translation and Caesium's model of C.
+
+**Every verified system terminates in trust:**
 
 - CompCert trusts: Coq's kernel, extraction, the OCaml compiler, the assembler, hardware.
-- CakeML (the only system to close the compiler link, via in-prover bootstrap — our
-  retired Tier C) still trusts: HOL4's kernel, and hardware-model-vs-silicon.
 - seL4 trusts: hardware, and that its spec captures "correct."
-- ZER trusts: Lean's kernel, Lean's compiler, one C compiler, hardware.
-- Lean's kernel itself is trusted, not proven-by-something-else — the regress must stop
-  (mitigated by being small and by independent re-implementations cross-checking it).
+- **ZER trusts: Coq's kernel, RefinedC's frontend + Caesium's C model, one C compiler, hardware.**
 
 **"Fully safe" is not a state that exists — for anyone.** The floor is always trust;
 engineering is making the trusted part small, simple, inspectable, and diverse.
 
-### 9.2 Why the chain-2 residue is acceptable, and its mitigations
+### 9.2 Mitigations
 
-- The dangerous failure mode is not "a compiler bug" — it is a *silent* miscompilation
-  that *precisely* inverts a checked property (accept↔reject) without crashing. Random
-  toolchain bugs overwhelmingly crash or produce grossly wrong output caught instantly.
-- **Mitigations (cheap, adopted):**
-  - build `zerc` with two different C compilers; cross-check outputs on corpora;
-  - **differential testing against the in-prover reference**: `#eval` runs the checker
-    *inside Lean* (interpreter path), bypassing the native pipeline; divergence from the
-    binary = toolchain bug caught. Testing *bounds* this risk; it does not prove absence
-    (Dijkstra; the §5 asymmetry — testing samples, proof covers).
+- **Differential testing of the frontend's model against reality.** Caesium's C semantics and
+  what GCC emits are different objects. Running the proved C — with sanitizers — is a check ON
+  THE MODEL, and it is cheap. Precedent for why this is not paranoia: a bounded model checker
+  in the same family proved `malloc`-alignment facts that are FALSE on the real machine (glibc
+  returned three different bases mod 64).
+- **Build `zerc` with two different C compilers; cross-check on corpora.**
+- **The mutant discipline (§5.4 rule 3)** as a permanent CI gate, not an authoring habit.
 
-### 9.3 The kernel-computation escalation hatch (per-artifact chain-2 bypass)
+### 9.3 The kernel-computation escalation hatch
 
-For the build that matters most, Lean allows the check to be established **by the proof
-kernel itself**, not by any compiled binary:
+For the build that matters most, the check can be established **by the proof kernel itself**:
 
-```lean
-theorem flight_build_safe : check flightProgram = true := by decide
--- (or native-free kernel reduction / rfl-style evaluation)
+```coq
+Theorem flight_build_safe : check flightProgram = true.
+Proof. vm_compute. reflexivity. Qed.
 ```
 
-The result is then a *kernel-checked theorem*: Lean's compiler and the C compiler drop out
-of the trust chain for that artifact; the residue is kernel + hardware. Honest caveat:
-kernel evaluation is slow — feasible for moderate inputs, potentially painful for very
-large programs; it is the **per-artifact certification hatch** (used once, for the final
-flight build), not the daily path. This hatch is something CompCert's users do not
-conveniently have, and it matches how certification actually works (per-artifact).
+Coq's `vm_compute`/`native_compute` reduce inside the kernel's trust story. The result is a
+*kernel-checked theorem*: the C compiler drops out of the trust chain for that artifact.
+
+Honest caveats, both larger here than the old record implied for Lean:
+- This requires the checker to exist as a **Coq function**, not only as proved C. Where a
+  function is specified in Coq and realised in C (the normal case here), the hatch applies to
+  the Coq function, and the C's agreement with it is what RefinedC proved. That is still a
+  bypass of the C compiler, but it is a two-step argument rather than one.
+- Kernel evaluation is slow. Feasible for moderate inputs; it is the **per-artifact
+  certification hatch**, not the daily path.
 
 ### 9.4 The claim language that survives review
 
-> Chain 1 (source → emitted C → binary via CompCert): **proven end-to-end.**
-> Chain 2 (Lean definitions → `zerc` binary): **trusted residue** — same shape as
-> CompCert's own — *monitored* by dual-compiler builds and differential testing against
-> the in-prover reference, and **eliminable per-artifact** by kernel-computed
-> certification of the final build.
+> Chain 1 (source → emitted C → binary via CompCert): **proven end-to-end**, and composable
+> into a single machine-checked theorem since both halves are Coq.
+> Chain 2 (Coq definitions → `zerc` binary): **trusted residue** — Coq's kernel, RefinedC's
+> C frontend, one C compiler — *monitored* by differential testing and dual-compiler builds,
+> and **eliminable per-artifact** by kernel-computed certification of the final build.
 
-### 9.5 The performance dimension — Lean's runtime speed touches only chain 2
-
-The two-chain split governs *performance* exactly as it governs trust, and a reviewer's
-"isn't Lean slow?" objection dissolves the same way. Lean's managed runtime (Perceus RC,
-boxed `Nat`/`Int`/`Array`) carries a real, problem-dependent constant-factor tax over
-hand-tuned C — measured 2026-07-20 (KernelQ, a Li-Chao-tree program at n=2·10⁵): compiled
-Lean (`leanc -O3`) ran **~13×** slower than the equivalent hand C with scalar (`Int64`)
-types, **~45×** when it leaned on arbitrary-precision `Int` (the boxing). The constant is
-real. But it lands **entirely on chain 2 and never on chain 1**:
-
-- **Chain 2 (the `zerc` binary):** `zerc` IS a compiled-Lean program, so it runs on the
-  Lean runtime and pays the constant — as **compile time** (how long `zerc` takes to
-  compile a user's program). A slower *compiler*, nothing more.
-- **Chain 1 (the emitted C — the flight artifact):** freestanding C99, compiled by
-  CompCert/GCC, linking **none** of the Lean runtime. It runs at native C speed. Lean's
-  constant factor is *structurally absent* from ZER's output.
-
-So: **Lean's runtime speed bounds how fast ZER *compiles*, never how fast ZER's *output*
-runs.** And the compile-time cost is a non-issue for the target domain — DO-178C / avionics
-buyers optimize output correctness and output speed, not compiler wall-clock; a verified
-compiler that runs slower is the accepted trade (CompCert is not fast either). This is also
-why the constant never motivated self-hosting (§6 Tier C): shaving `zerc`'s own runtime
-buys a speed nobody in this market pays for, at TCB cost. It is the sharper statement of
-§13's "fine for a compiler workload" — the workload's slowness is confined to the one chain
-where slowness does not matter. (Empirical grounding + the emitted-C anatomy behind the
-constant — boxed `Array`, refcount, bounds checks, and why fixed-width types collapse
-45×→13× while a runtime floor remains — is in the KernelQ docs
-`docs/Lean4-context-internal.md` §5.1/§6.5 and `docs/kernelq-pedagogy-goal.md` LS.9.)
+Note what is no longer claimed and no longer needed: nothing about a prover's *runtime speed*.
+Old §9.5 existed to answer "isn't Lean slow?" because `zerc` was going to BE a compiled-Lean
+program. `zerc` is a C program. The question does not arise, and ZER's compile-time
+performance is unchanged by this entire architecture — which is a real product benefit, quietly.
 
 ---
 
@@ -870,283 +864,213 @@ constant — boxed `Array`, refcount, bounds checks, and why fixed-width types c
 
 ### 10.1 The strategy
 
-- **Daily backend: latest mainline GCC/Clang.** ZER already emits C99; developers compile
-  with current toolchains, full speed, zero licensing friction. Trust status: chain-1's
-  last link becomes "trusted compiler," acceptable for development and non-certified use,
-  optionally hardened per-build by Tier B validation.
-- **Certification backend: CompCert.** For certified builds, the same emitted C99
-  (constrained to the CompCert dialect, §11) is compiled by CompCert, closing chain 1
-  end-to-end with proofs. Customers running DO-178C programs bring their own CompCert
-  license (they are buying qualification material anyway; the license is a rounding error
-  in a certification program). ZER itself stays unencumbered.
+- **Daily backend: latest mainline GCC/Clang.** ZER already emits C99. Trust status: chain-1's
+  last link is "trusted compiler," acceptable for development, optionally hardened per-build
+  by Tier B.
+- **Certification backend: CompCert.** The same emitted C99 (constrained to the CompCert
+  dialect, §11) compiled by CompCert closes chain 1 end-to-end with proofs. Customers running
+  DO-178C programs bring their own licence. ZER itself stays unencumbered.
 
-### 10.2 CompCert facts (verified 2026-07-19 against compcert.org / AbsInt / the repo)
+**What changed:** CompCert is now the *same prover* as ZER's proofs, so it is no longer only a
+pragmatic standalone certification compiler — it is a composable theorem (§8.1). That raises
+its value without changing the licensing position.
 
-**Backends (from `AbsInt/CompCert` `configure`, master):**
+### 10.2 CompCert facts (verified 2026-07-19; unchanged)
+
+**Backends** (from `AbsInt/CompCert` `configure`, master):
 
 | Target | Variants |
 |---|---|
-| ARM 32 | `armv6`, `armv6t2`, `armv7a` (default), `armv7r` (Cortex-R), **`armv7m` (Cortex-M3/M4/M7)** — each `-eabi`/`-eabihf`/`-linux`, plus big-endian `armeb*` mirrors |
+| ARM 32 | `armv6`, `armv6t2`, `armv7a`, `armv7r`, **`armv7m` (Cortex-M3/M4/M7)** — each `-eabi`/`-eabihf`/`-linux`, plus big-endian mirrors |
 | AArch64 | `aarch64-linux`, `aarch64-macos` |
-| PowerPC | `ppc-eabi`, **`ppc-eabi-diab`** (Wind River Diab — the VxWorks/avionics toolchain), `ppc-linux`, `ppc64-*`, `e5500-*` |
+| PowerPC | `ppc-eabi`, **`ppc-eabi-diab`** (Wind River Diab), `ppc-linux`, `ppc64-*`, `e5500-*` |
 | RISC-V | `rv32-linux`, `rv64-linux` |
 | x86 | `x86_32-{linux,bsd}`, `x86_64-{linux,bsd,macos,cygwin}` |
-| AURIX/TriCore | **commercial edition only** (on AbsInt's page; not in the open repo) |
-| Gaps | Cortex-M0/M0+ (ARMv6-M), DSPs, anything exotic → fallback: GCC path (+ Tier B) |
+| AURIX/TriCore | commercial edition only |
+| Gaps | Cortex-M0/M0+ (ARMv6-M), DSPs → fallback: GCC path (+ Tier B) |
 
-The supported map ≈ the mission-critical embedded map (Cortex-M/R, PowerPC-with-Diab,
-RISC-V) — because avionics is CompCert's market.
+**Pedigree:** qualified on the **ATR 42/72 aircraft (2026)** with credits under **DO-178C,
+DO-333, DO-330**; **IEC 60880 Category A** and **IEC 61508 SIL-3** (MTU, 2017). v3.16
+(Sept 2025), AbsInt release 26.04 (April 2026).
 
-**Pedigree (current):** qualified on the **ATR 42/72 aircraft (2026)** with certification
-credits under **DO-178C, DO-333, DO-330**; **IEC 60880 Category A** (nuclear) and
-**IEC 61508 SIL-3** qualification (MTU, 2017); the Airbus lineage throughout. Actively
-maintained: v3.16 (Sept 2025; PIC/PIE on x86-64/AArch64/RISC-V), AbsInt release 26.04
-(April 2026), manual at v3.17.
+**Licensing:** free for research/education; **commercial use is a paid AbsInt licence**. This
+is exactly why the dual-backend strategy exists — ZER must not hard-depend on CompCert.
 
-**Licensing:** free for research/education; **commercial use is a paid AbsInt license**
-(INRIA-licensed). This is exactly why the dual-backend strategy exists — ZER must not
-hard-depend on CompCert.
+**Performance:** ≈ GCC `-O1` class. Not a loss for certified code.
 
-**Performance:** ≈ GCC `-O1` class. Not a loss for certified code: certification shops
-often *reduce* optimization for traceability anyway; CompCert provides modest optimization
-*with a proof*.
-
-**Boundary of CompCert's proof:** it ends at assembly generation. An external
-preprocessor, assembler, linker, and C library are required (vendor toolchain — binutils
-or Diab). Those remain trusted (§12).
+**Boundary of CompCert's proof:** it ends at assembly generation. Preprocessor, assembler,
+linker and C library remain trusted (§12).
 
 ---
 
-## §11 The emitter contract (adopt at emitter v1 — cheap now, painful to retrofit)
+## §11 The emitter contract
 
-1. **C99** (already ZER's target standard), restricted to **CompCert's supported dialect**:
-   no VLAs, no `setjmp`/`longjmp`, no computed goto, plain constructs. Machine-emitted C
-   is naturally this boring; the constraint costs near-zero and guarantees the
-   certification path is *always available*.
-2. **Freestanding profile**: no or minimal libc. Needed primitives (`memcpy`-class) are
-   emitted or provided as a tiny audited runtime. This kills the largest non-primitive
-   trusted component (§12) and is idiomatic for MCU targets anyway.
-3. **Clight-friendliness**: keep emitted constructs within easy reach of CompCert's Clight
-   input language, so the Stage-4 retarget (emit Clight directly, compose theorems) is an
-   emitter refactor, not a redesign.
-4. **Determinism**: byte-identical output for identical input (no timestamps, no iteration
-   over unordered containers into output) — required for reproducible certification builds
-   and for dual-compiler differential testing.
-5. Emitted code carries **no undefined behavior** by construction (that is the point of
-   ZER); the emitter contract makes it *checkable*: the Stage-2 emission proof is against
-   the formalized C99-subset semantics, which has no UB to fall into.
+1. **C99**, restricted to **CompCert's supported dialect**: no VLAs, no `setjmp`/`longjmp`, no
+   computed goto.
+2. **Freestanding profile**: no or minimal libc. Kills the largest non-primitive trusted
+   component (§12) and is idiomatic for MCU targets.
+3. **Clight-friendliness**: keep emitted constructs within reach of CompCert's Clight input,
+   so the Stage-4 composition is an emitter refactor, not a redesign. **This is now
+   substantially more valuable than it was**, because Stage 4 is a real composed theorem
+   rather than an argued link (§8.1).
+4. **Determinism**: byte-identical output for identical input.
+5. Emitted code carries **no undefined behavior** by construction; the Stage-2 emission proof
+   is against the formalized C99-subset semantics, which has no UB to fall into.
 
-### 11.1 MEASURED 2026-08-01 — the contract is NOT adopted today (the retrofit §11 warned about)
+### 11.1 MEASURED 2026-08-01 — the contract is NOT adopted today
 
-§11 assumes *"machine-emitted C is naturally this boring; the constraint costs near-zero."*
-**Measured against the shipped emitter, that is false.** Every emitted file — including a
-hello-world — carries GCC-only constructs in the *preamble*, so `ccomp` rejects ZER output
-before reaching any user code.
-
-Measured by compiling a 5-line ZER function with the 2026-07-21 `zerc` and grepping the
-emitted C:
+Every emitted file — including hello-world — carries GCC-only constructs in the *preamble*, so
+`ccomp` rejects ZER output before reaching any user code:
 
 | Construct | Count | Where | CompCert |
 |---|---|---|---|
-| `({ ... })` statement expressions | 2 | `_zer_shl` / `_zer_shr` macros (preamble ~L258-259) | **rejected** |
+| `({ ... })` statement expressions | 2 | `_zer_shl` / `_zer_shr` macros | **rejected** |
 | `__typeof__` | 2 | same macros | **rejected** |
-| `__builtin_add_overflow` / `__builtin_sub_overflow` | 2 | `@addc` / `@subb` runtime (preamble ~L31,33) | not GCC-compatible; CompCert has its own builtin set |
-| `__builtin_trap()` | 1 | trap path (~L129) | replace with `abort()` or an emitted trap |
-| `__attribute__` | 1 | packed/interrupt attributes | partially supported — verify per use |
+| `__builtin_add_overflow` / `__builtin_sub_overflow` | 2 | `@addc` / `@subb` runtime | CompCert has its own builtin set |
+| `__builtin_trap()` | 1 | trap path | replace with `abort()` or an emitted trap |
+| `__attribute__` | 1 | packed/interrupt | partially supported — verify per use |
 
-Consequence: **§10.1's claim that the certification path is "always available" does not
-hold as of this date.** The dual-backend strategy is sound in design and unimplemented in
-fact; the CompCert column is currently blocked by the emitter, not by licensing.
+**Fix — a `--portable` (CompCert-dialect) emission mode:** per-width `static inline` shift
+functions; portable carry/borrow detection (the `@mulw` `__int128` fallback is the template);
+`abort()` for `@trap`; audit `__attribute__` uses; and **gate it** with a CI job running
+`ccomp -c` over the emitted corpus, or it regresses immediately, exactly as it regressed
+silently to reach this state.
 
-**Fix — a `--portable` (CompCert-dialect) emission mode.** Not large, but it is real work
-and it is now a retrofit rather than the near-free v1 adoption §11 anticipated:
+**DECISION 2026-08-01 — DEFERRED, and this decision is now WEAKER than it was.** The portable
+mode was deferred because CompCert was declined on licensing grounds, making the dialect
+violation non-blocking. That reasoning stands on licensing but **not on architecture**: with
+the seam gone, CompCert composition is the difference between "composed evidence" and "one
+machine-checked theorem from source to assembly." Re-weigh the deferral when Stage 3 lands;
+it does not need re-weighing before then.
 
-1. `_zer_shl` / `_zer_shr`: statement-expression macros → per-width `static inline`
-   functions (no `({...})`, no `__typeof__`). Behaviour is already specified
-   ("0 for out-of-range"), so this is mechanical.
-2. `@addc` / `@subb`: `__builtin_*_overflow` → portable carry/borrow detection. The
-   `@mulw` `__int128` fallback is the existing template for a portable twin.
-3. `@trap`: `__builtin_trap()` → `abort()` or an emitted trap symbol.
-4. `__attribute__` uses: audit each against CompCert's supported attribute set.
-5. Gate it: a CI job that runs `ccomp -c` over the emitted C of the test corpus. Without
-   a gate this regresses immediately, exactly as it regressed silently to reach this state.
-
-**Why it matters beyond CompCert.** A GCC-extension-free output is also more portable
-across vendor toolchains (Diab, Keil, IAR) and is closer to something a certification
-reviewer can read — the reviewability problem noted in §15. The portable mode is therefore
-worth having even for programs that never touch CompCert.
-
-**How this lands in the Lean world (§7.2 M2).** Once the emitter moves to Lean, the §11
-dialect contract stops being a convention the emitter is *trusted* to honour and becomes a
-**property of the emitted AST type**: emit into a `CProg` inductive that cannot represent a
-statement expression or a `__typeof__` at all, and dialect conformance holds by
-construction rather than by discipline. This is the same move as §5.3's checked-annotation
-principle — make the illegal state unrepresentable instead of auditing for it. It is also
-the reason to emit to a **C AST rather than to strings** (§8 Stage 2): a string emitter can
-always concatenate an extension; a typed emitter cannot.
-
-**DECISION 2026-08-01 — the portable-mode work above is DEFERRED, possibly permanently.**
-The CompCert backend is declined on licensing grounds (§10.2: commercial use is a paid
-AbsInt licence), so the dialect violation is no longer blocking anything. GCC and Clang
-both accept statement expressions and `__typeof__`; if they are the only backends, the
-emitter is already correct and the fix list above is work with no consumer. Do NOT
-implement it speculatively. It becomes live again only if (a) a customer requires a
-CompCert-qualified build, or (b) a vendor toolchain that rejects GCC extensions (Diab,
-Keil, IAR) enters the target set.
-
-What is given up with it, stated honestly: CompCert brought *borrowed pedigree* — ATR
-42/72 qualification, DO-178C/330/333 credits, an existing answer to "who verified your
-backend." Dropping it means the backend is GCC, named as trusted in §9, with assurance
-coming from ZER's own checker rather than from the compiler below it.
-
-And a caution on the replacement: "free" means **no licence fee**, not cheaper. seL4-style
-binary translation validation is unqualified research-grade tooling; in an actual
-certification programme it would have to be qualified under DO-330 by whoever ships it —
-plausibly more expensive than an AbsInt licence, just denominated in engineering time
-rather than cash. The honest near-term position is therefore: *proven checker, tested
-emitter, trusted GCC* — and say so, per §9.4.
-
-**Free alternative to a paid CompCert, restated in one line** (the licensing pressure of
-§10.2): rather than buying a verified backend, *validate the unverified one per build* —
-seL4-style binary translation validation over GCC output (§12's "nuclear option"). That
-keeps the compiler GCC, keeps ZER unencumbered, and yields per-artifact evidence rather
-than a once-for-all theorem — the same assurance shape §8.3 already accepted when it
-declined the composed theorem. The validator itself would be Lean-hosted and proven, and
-is the one component where Tier B graduates from "bridge" to "permanent product feature."
+**How this lands under the new plan.** Old §11 anticipated that once the emitter moved to
+Lean, dialect conformance would become a property of an emitted-AST type — illegal states
+unrepresentable. **There is no move, so that mechanism is not available.** The equivalent here
+is a `--portable` mode plus the `ccomp -c` CI gate: conformance by *gate* rather than by
+*construction*. Weaker, and the honest reason to keep the gate mandatory rather than advisory.
 
 ---
 
-## §12 Toolchain residue — assembler/linker/libc/startup, ranked honestly
+## §12 Toolchain residue — ranked honestly
 
-The "it's so primitive it's safe" intuition is *directionally correct* and is the actual
-argument for why CompCert stops at assembly — but it needs precision. Risk scales with
-**semantic freedom** (how much the tool transforms meaning):
+Risk scales with **semantic freedom** (how much the tool transforms meaning):
 
 | Trusted component | Semantic freedom | Real-world risk | Notes |
 |---|---|---|---|
-| **Your linker script + startup code (crt0, vector tables, memory maps)** | n/a (human config) | **HIGHEST** | This is where embedded projects actually die. No proof anywhere covers your linker script. "Porting to a board" is 90% this. |
+| **Linker script + startup code (crt0, vector tables, memory maps)** | n/a (human config) | **HIGHEST** | This is where embedded projects actually die. No proof anywhere covers your linker script. |
 | libc (if linked) | large library | high | **Killed by the freestanding profile (§11.2)** |
 | Linker | relocation, layout | low-medium | |
-| **Assembler** | ~1:1 table-driven encoding | **LOWEST** | Almost no room to be *subtly* wrong; encoding bugs tend to crash, not silently misbehave. This is why the "primitive → safe" intuition holds *here*, at the bottom. |
+| **Assembler** | ~1:1 table-driven encoding | **LOWEST** | Almost no room to be *subtly* wrong. |
 
-Mitigations (boring and effective): keep startup code tiny and reviewed; review the map
-file; checksum the image; hardware-in-the-loop tests per board; for the pad build, a
-disassembly review of the final image. Nuclear options if a program ever demands closing
-even these links: seL4-style **binary translation validation** (decompile the ELF, prove
-correspondence via SMT) and CompCertELF-style verified assembly/linking research — cite as
-"available if required," do not build day one.
+Mitigations: keep startup code tiny and reviewed; review the map file; checksum the image;
+hardware-in-the-loop per board; disassembly review for the pad build. Nuclear options if a
+programme ever demands closing even these: seL4-style **binary translation validation** and
+CompCertELF-style verified assembly/linking — cite as "available if required," do not build.
 
-**Porting, both senses:**
-- Porting ZER's output to a new *board* = linker scripts + startup + memory maps =
-  configuration risk (above), not tool risk.
-- Porting *CompCert* to a new ISA = a formalized ISA semantics + fresh proofs =
-  person-years per target. Strategy: stay on the supported map; exotic targets take the
-  GCC path plus Tier B.
+**Porting, both senses:** porting ZER's *output* to a new board is linker scripts + startup =
+configuration risk. Porting *CompCert* to a new ISA is person-years. Stay on the supported map;
+exotic targets take the GCC path plus Tier B.
 
 ---
 
-## §13 Lean 4 implementation practicalities
+## §13 Coq / RefinedC implementation practicalities
 
-- **Compilation model**: Lean 4 compiles via C to native code; memory is reference-counted
-  (Perceus-style, no tracing-GC pauses). Fine for a compiler workload (Lean's own ~500k-line
-  self-hosted compiler is the proof), and the RC model keeps latency predictable.
-- **Totality escape hatch**: `partial def` for worklist/fixpoint algorithms — no
-  termination-proof fights for ordinary code; upgrade to total+proven selectively.
-- **C interop**: `@[extern]` bridges to existing C; Lean-emitted C links at object level
-  with ZER's C during the strangler migration (§7.2).
-- **Toolchain**: pin the Lean version explicitly (channel defaults phone home; pinned
-  versions do not — empirically bitten and fixed in the `kernelq-lean` image, which pins
-  `leanprover/lean4:v4.32.0` with `ELAN_HOME=/opt/elan`, working under `--network=none`,
-  read-only FS, and arbitrary-uid Docker). Reuse that image family for ZER CI.
-- **The empirical Lean contract that bites** (verified in-container; full detail in the
-  KernelQ doc LS.4): `sorry` **exits 0** with only a warning — any CI gate on Lean proofs
-  must check `#print axioms` (a sorried theorem depends on `sorryAx`), never exit codes.
-- **Process/certification friction, stated honestly**: Lean's toolchain is young and not
-  DO-qualified. For a *ground-based development tool* this is acceptable — DO-330 tool
-  qualification asks for understood failure modes, and "the rule set is machine-checked;
-  the binary is differentially tested against the in-prover reference; the final build can
-  be kernel-certified" is the strongest available answer. Flight code itself is ZER's
-  *output* (C99 → CompCert), never Lean.
-- **Precedents for production Lean**: AWS Cedar (authorization, verified in Lean, in
-  production), SampCert (verified differential privacy, deployed), the Lean compiler
-  itself.
+- **Toolchain**: pin explicitly. The `kernelq-refinedc` image is **Rocq 9.1.0** with RefinedC
+  `dev.2026-07-16`, working under `--network=none`, read-only root, and arbitrary-uid Docker.
+  Reuse that image family for ZER CI.
+- **The axiom oracle is the gate, never the exit code.** `Admitted` **exits 0** — measured. A
+  CI gate on Coq proofs must check `Print Assumptions` (an admitted theorem shows an `Axioms:`
+  block) exactly as `make check-proofs` already does for the existing corpus. The same applies
+  to RefinedC: `refinedc check` exit 0 is **not** a verdict on its own, because two measured
+  cheats pass it (§19.2).
+- **The C subset is a style rule, not a capability limit** (§4.3). One operation per statement;
+  no assignment used as an expression. Same shape `docs/proof-internals.md` already mandates.
+- **Coq comments NEST**, so `(*opaque)` inside a `(* … *)` comment opens a nested comment and
+  breaks the file. Reword C-syntax examples in `.v` comments. (Cost two cycles historically.)
+- **Iteration loop for a new proved function**: annotate → `refinedc check` → read the residual
+  goal → register a lemma over ITS term shape → repeat. Two rounds is normal; four means the
+  vocabulary is wrong, not the lemma.
+- **Verdict timing is diagnostic.** 1–2s = the frontend refused to parse the C; 5–30s = the
+  prover actually ran. Any wrapper tooling should classify on this, and should never report a
+  parse refusal as a failed proof.
 
 ---
 
-## §14 Concurrency proofs (Iris) — plan
+## §14 Concurrency proofs (Iris) — no port, no trigger
 
-- The existing Coq/Iris corpus (§1.2) **remains the current home** of ZER's concurrency
-  reasoning. Nothing forces a move; Coq-Iris is the mature choice today.
-- The empirical door is open (§4): every facility the corpus imports exists in iris-lean,
-  the concurrency tower kernel-checks locally, and the toolchain matches ours. A port is
-  days-scale translation.
-- **Trigger for porting**: when Stage 0–1 put λ-ZER and the checker in Lean, keeping the
-  concurrency model in Coq means maintaining two formalizations of ZER's semantics. At
-  that point, port the corpus to iris-lean so there is ONE formal semantics with both the
-  compiler proofs and the concurrency theorems over it.
-- Iris remains the right tool ONLY for the concurrent/heap reasoning; the compiler
-  correctness proofs (§8) are plain Lean — separation logic is not involved in
-  semantic-preservation arguments.
-- **Per §8.2 (single-prover amendment): iris-lean is the DESIGNATED end-state home.**
-  After the port at the trigger above, Coq is retired from ZER entirely.
-- **Clarification (so the name never misleads): using iris-lean IS "porting Iris to Lean
-  directly."** iris-lean is plain Lean 4 — no Coq anywhere in it; it fully satisfies the
-  single-prover mandate. And prover libraries are not trust delegations: the Lean kernel
-  RE-CHECKS every iris-lean lemma at build time, so "use the community port" and "rewrite
-  it ourselves" yield IDENTICAL assurance — the only difference is person-years of labor.
-  Policy: pin the iris-lean version (it tracks Lean releases; currently v4.32.0, same as
-  our toolchain); extend locally where ZER needs missing pieces. Recorded fallback if its
-  research churn ever becomes a burden: a bespoke minimal "ZER-Iris" — only the slice
-  λ-ZER instantiates (gen_heap/ghost_map/invariants/WP), informed by Iris's design — the
-  Stage-5 philosophy (rebuild only the needed subset) applied to separation logic.
+The existing Coq/Iris corpus (`proofs/operational/lambda_zer_concurrency/`, ~870 lines, 11
+files, zero admits) **is the concurrency reasoning, in the same prover as everything else.**
+
+Under the Lean plan this section carried a scheduled obligation: a port to iris-lean, triggered
+when λ-ZER moved to Lean, to avoid maintaining two formalizations of ZER's semantics.
+**That obligation is cancelled.** There is one formalization, it is in Coq, and the compiler
+proofs and the concurrency theorems live over it.
+
+- Iris remains the right tool ONLY for the concurrent/heap reasoning; the compiler-correctness
+  proofs (§8) are plain Coq — separation logic is not involved in semantic-preservation
+  arguments.
+- What the corpus actually is: it **instantiates Iris's weakest-precondition framework over
+  ZER's own operational semantics** (`syntax.v` → `semantics.v` → `iris_lang.v` builds a
+  `LanguageMixin`; `ESpawn` emits into the threadpool of the step relation; locks are
+  invariant-opening proof devices). No library spinlock, no runtime concurrency — a transition
+  system plus a logic over all its interleavings.
+- Remaining work is unchanged and unaffected: operational adequacy, `wp_store`/shared specs,
+  formal necessity. Compiler implementation of the closure not started.
+- **Note a structural adjacency worth exploiting later:** RefinedC is itself built on Iris.
+  The concurrency corpus and the C-verification stack sit on the same logical foundation, which
+  is the natural route if ZER ever needs to verify *concurrent* C in its own runtime. Not
+  scheduled; recorded so it is not missed.
 
 ---
 
 ## §15 Mission-critical / certification framing
 
-- **Certification is per-artifact** (DO-178C verifies specific builds of specific
-  software; DO-330 qualifies tools by understood failure modes; DO-333 admits formal
-  methods for certification credit — and CompCert already *has* DO-178C/DO-333/DO-330
-  credits from the 2026 ATR qualification). ZER's architecture is deliberately shaped for
-  per-artifact claims: Tier B witnesses per build, the kernel hatch per flight build,
-  deterministic emission for reproducibility.
-- **What evaluators probe first** is the two-chain distinction (§9). Lead with it; never
-  claim "fully safe"; use the §9.4 claim language.
+- **Certification is per-artifact.** DO-178C verifies specific builds; DO-330 qualifies tools
+  by understood failure modes; DO-333 admits formal methods for credit — and CompCert already
+  *has* DO-178C/DO-333/DO-330 credits from the 2026 ATR qualification. ZER's architecture is
+  shaped for per-artifact claims: Tier B witnesses per build, the kernel hatch per flight
+  build, deterministic emission for reproducibility.
+- **What evaluators probe first** is the two-chain distinction (§9). Lead with it; never claim
+  "fully safe"; use the §9.4 claim language.
 - **What IV&V can audit**: with the §5 certificate model, the annotations are the
-  specification — reviewers read intent at boundaries instead of reverse-engineering an
-  inference.
-- **The trusted-base summary for a review slide**: Lean kernel + (daily: one C compiler |
-  certified: CompCert's residue) + vendor assembler/linker + board config + hardware —
-  with the §12 mitigations attached to each.
+  specification — reviewers read intent at boundaries instead of reverse-engineering inference.
+- **The trusted-base summary for a review slide**: Coq kernel + RefinedC's C frontend +
+  (daily: one C compiler | certified: CompCert's residue) + vendor assembler/linker + board
+  config + hardware — with §12's mitigations attached to each.
+- **A framing advantage worth using**: the verification stack is BSD/LGPL with no per-seat
+  licence (§4.6), and the *prover* under ZER's proofs is the same one under CompCert's. "Same
+  prover as the compiler Airbus qualified" is a sentence that does real work in a review, and
+  it was not available under the Lean plan.
 
 ---
 
 ## §16 Roadmap and first steps
 
-Ordered by leverage; every stage ships standalone value:
+Ordered by leverage; every stage ships standalone value.
 
-1. **Emitter contract adoption** (§11) in the *current C emitter* — dialect + freestanding
-   + determinism. Cheap now; unlocks the CompCert path immediately for today's ZER.
-   - Smoke test: compile ZER's emitted C for a sample program with CompCert
-     (`ccomp`, research license) on `armv7m-eabi` or `rv32`; fix dialect violations.
-2. **Certificate-model design** (§5.2): specify the boundary-annotation vocabulary against
-   the existing checker's rule classes (ownership, regions, handle states, escape, ISR/MMIO
-   contexts — the `verif_*` taxonomy is the checklist). This is a design doc + λ-ZER
-   extension, before any code.
-3. **Stage 0**: λ-ZER semantics in Lean (port/rebuild from `proofs/operational/`), plus IR
-   semantics and the C99-subset target semantics.
-4. **Phase M1 migration** (§7.2): the checker in Lean behind the AST/IR-dump seam;
-   differential-test it against the C checker on the full test suite until parity.
-5. **Stage 1**: `checker_sound` — the first headline theorem. Ship/announce.
-6. **Stages 2–3** pass by pass (lowering → emission → composition), with Tier B validation
-   covering whatever is not yet proven.
-7. **Stage 4** (when justified): Clight retarget + CompCert composition.
-8. Ongoing: dual-compiler builds + `#eval`-differential harness in CI (§9.2); port the Iris
-   corpus at the §14 trigger.
+1. **Calibrate on `src/safety/*.c`** (P1 in §7.2). 85 already-extracted, already-VST-verified
+   pure predicates, already in the flat style RefinedC wants. Prove a handful with RefinedC and
+   **measure**: annotation lines per function, iterations to close, wall-clock. Every estimate
+   in this document is from KernelQ-scale code; ZER-scale numbers replace them.
+2. **Build the authoring gate before the second function.** Spec + mutant + `Print Assumptions`
+   in CI (§5.4, §19.2). A pipeline whose green light cannot fail is worth nothing, and this is
+   the cheapest moment to prevent that.
+3. **The arena decision** (§19.4) — before any new IR code exists. It is the prerequisite for
+   proving anything pointer-shaped and it is expensive to retrofit.
+4. **Certificate-model design** (§5.2): specify the boundary-annotation vocabulary against the
+   existing rule classes; the `verif_*` taxonomy is the checklist. Design doc + λ-ZER
+   extension, before code. *No prover work required — do not block this on proof skills.*
+5. **Stage 0 completion**: whatever λ-ZER still lacks (IR semantics, the C99-subset target
+   semantics). Much of Stage 0 already exists, which is the biggest schedule change.
+6. **Stage 1**: `checker_sound` — the first headline theorem. Ship/announce.
+7. **Stages 2–3** pass by pass, with Tier B covering whatever is not yet proven.
+8. **Stage 4** when justified: the CompCert composition — now a real theorem (§8.1). Gated on
+   the §11 portable-emission mode, which is the concrete cost of taking it.
+9. Ongoing: dual-compiler builds, differential testing of the proved C against its Coq spec,
+   and the `ccomp -c` dialect gate.
 
-Skill note: the founder's KernelQ Lean track is the deliberate on-ramp; the simulation
-proofs of Stage 2 are its destination. Do not block roadmap steps 1–2 (no Lean required)
-on the Lean learning curve.
+Skill note: the founder's KernelQ track is the deliberate on-ramp and it is now **the same
+stack** — Coq proofs plus RefinedC-linked C. Steps 1–4 need no new prover skill.
 
 ---
 
@@ -1154,369 +1078,235 @@ on the Lean learning curve.
 
 | Alternative | Why rejected | Revisit if |
 |---|---|---|
-| Stay in C permanently | No provable implementation; VST-against-C is brutal (lived experience, `proofs/vst/`); tool itself memory-unsafe | never (as end-state) |
-| Rewrite in OCaml or Rust (tool-safety only) | Solves memory safety but not provability; proofs would live in a prover about a *model* → the model–implementation gap remains | if the Lean bet fails wholesale |
-| Coq as the prover for new work | Same expressiveness; loses one-language programs+proofs (extraction gap), ecosystem trajectory, and toolchain unification with KernelQ | if Lean FRO collapses AND Rocq resurges |
-| Tier B only (validation, no verified passes) | Per-build assurance without once-for-all theorems; weaker headline claim; validator still needs the same semantics work | n/a — B is kept as the bridge |
-| Tier C (CakeML-style verified self-hosting) | Hardest artifact in the field (team-decade); the self-hosting flag is worth less than the proof flag for a safety company | if ZER becomes a funded team effort with years of runway |
-| ZER-in-ZER self-hosting as a goal for the core | Loses provability (ZER is not a prover) and orphans the proofs (proofs are about specific code) | periphery only (LSP/tooling), never the proven core |
-| Making ZER itself proof-capable (refinement/dependent types) | Building a second Lean; a different mountain | a someday-research direction, not the plan |
-| "Fully safe" claims / trusting testing as proof | Testing bounds risk, never proves absence; trusted ≠ verified; no zero-trust floor exists | never |
-| Hard dependency on CompCert as the only backend | Commercial licensing (AbsInt); backend gaps (ARMv6-M, DSPs) | n/a — dual backend is strictly better |
-| Building ZER inside CompCert's Coq (SJTU-PLV-style, §8.1) | Yields the mechanical single-prover end-to-end theorem, but forfeits every §3 reason for Lean; superseded by §8.2 — the single-prover theorem is obtained IN LEAN via the Stage-5 backend instead | fallback only if Stage 5 stalls AND a composed theorem is demanded sooner |
-| Cross-prover composed theorem with CompCert (the original Stage-4 endgame) | The Clight interface semantics would exist in two provers — an argued link, not machine-checked (§8.1) | n/a — replaced by §8.2 (CompCert = standalone interim cert compiler; composition via Stage 5 in Lean) |
-| "Porting CompCert to Lean" as a mechanical translation | No production-grade Coq→Lean proof translator exists at that scale; Stage 5 is a design-guided REBUILD of only the needed subset (ZER-IR, 1–2 ISAs) — a small fraction of CompCert | n/a — this framing IS the plan, correctly sized |
-| Believing 2024-era iris-lean status ("no WP/adequacy") | Empirically false as of 2026-07 (§4.2 build + axiom probe on this machine) | never — re-verify against the repo instead |
-| **A ZER-native backend emitting ISA directly (§8.2's Stage 5)** | **RETIRED 2026-07-29 (§8.3).** Trades ~50 GCC targets for 2, and a zero-maintenance dependency for a permanent per-ISA obligation. Architecture breadth IS the product. CompCert already is the verified backend it would rebuild, on more ISAs. | only if a customer requires end-to-end machine-checked assurance on a target CompCert does not support — AND funds it |
-| **A single machine-checked theorem spanning ZER source → machine code** | Requires either the cross-prover seam (§8.1) or Stage 5 (§8.3, retired). Replaced by COMPOSED EVIDENCE: `checker_sound` + `emit_correct` + CompCert's own theorem, jointed by §11's tiny UB-free dialect. Certification processes accept composed evidence. | as above |
+| Stay in C with no verification | No provable implementation; the tool is memory-unsafe with nothing checking it | never (as end-state) |
+| Rewrite in OCaml or Rust (tool-safety only) | Solves memory safety but not provability; the model–implementation gap remains | if the RefinedC bet fails wholesale |
+| **Rewrite the compiler into Lean 4 (the 2026-07-19 decision)** | **SUPERSEDED 2026-08-15 (§0.1).** It existed to close the model–implementation gap; RefinedC closes that gap on the shipped C without migrating 47k working lines. It also stranded 94 `.v` files, scheduled an Iris port, and created a cross-prover seam with CompCert that cost three amendments to manage. | only if RefinedC's envelope (§4.4) proves too narrow for ZER's real passes AND no Tier-B route covers the remainder |
+| **CBMC / bounded translation validation as the Tier B mechanism** | **SUPERSEDED 2026-08-15.** Bounded equivalence up to an unwind depth, requiring an emitted reference C (an unproved `render` step) and carrying four measured silent semantic traps. RefinedC proves the real C for ALL inputs with no reference artifact. | for a specific function outside RefinedC's envelope where a bounded claim is genuinely enough — as Tier B, per §6 |
+| Lean 4 as the prover for new work | Same expressiveness; but nothing is written in the prover, so its ergonomic and no-extraction-gap advantages do not apply; and it strands Iris/VST/RefinedC/CompCert and 94 existing files | if all four Coq libraries ZER depends on are matched in Lean AND the corpus is already ported |
+| Tier B only (validation, no verified passes) | Per-build assurance without once-for-all theorems; weaker headline claim | n/a — B is kept as the bridge |
+| Tier C (CakeML-style verified self-hosting) | Hardest artifact in the field; the self-hosting flag is worth less than the proof flag | if ZER becomes a funded team effort with years of runway |
+| ZER-in-ZER self-hosting for the core | Loses provability and orphans the proofs | periphery only (LSP/tooling), never the proven core |
+| Making ZER itself proof-capable (refinement/dependent types) | Building a second Coq; a different mountain | someday-research, not the plan |
+| "Fully safe" claims / trusting testing as proof | Testing bounds risk, never proves absence | never |
+| Hard dependency on CompCert as the only backend | Commercial licensing; backend gaps (ARMv6-M, DSPs) | n/a — dual backend is strictly better |
+| **A ZER-native backend emitting ISA directly (the old Stage 5)** | **RETIRED, and the retirement SURVIVES the prover switch.** Trades ~50 GCC targets for 2 and a zero-maintenance dependency for a permanent per-ISA obligation. Architecture breadth IS the product. Note the seam argument that once motivated it is now void (§8.1) — that makes it *less* attractive, not more. | only if a customer requires end-to-end assurance on a target CompCert does not support — AND funds it |
+| Verifying `checker.c` with **VST** instead of RefinedC | Same goal, same prover, 23 files of lived experience: interactive tactics, days per function. The pain was the interaction model, not the target | for a specific function whose shape RefinedC's automation cannot reach but VST's tactics can — a real fallback, not a competitor |
+| Writing the RefinedC specification free-hand alongside the C | A specification transcribed rather than cited can drift from λ-ZER, and both halves then pass while proving the wrong thing (§5.4 rule 1) | never — cite `proofs/operational/`, single-home the definition |
+| Trusting `refinedc check` exit 0 as the verdict | Two measured cheats pass it: `rc::trust_me` emits a "proof" that is literally a comment; an injected axiom discharges everything (§19.2) | never — `Print Assumptions` + the surface allow-list |
 
 ---
 
-## §19 The proof-carrying C pipeline — Tier B INSTANTIATED, and an amendment to §0.1 (2026-08-11)
+## §19 The linked pipeline as built — the mechanism, its guards, its envelope
 
-**Read this before touching the emitter, the implementation-language question, or anything about how translation correctness is obtained.** §6 adopted Tier B as "the bridge" but described it abstractly — *"a small proven validator checks source↔output equivalence."* It now has a concrete, built, debugged instantiation that has been running in production in KernelQ for a day, with every trap and guard measured rather than guessed.
+**Read this before building any verification automation around RefinedC.** The mechanism below
+is running in production in KernelQ and every trap in it was *measured*, not anticipated. The
+KernelQ-side full record is `docs/kernelq-pedagogy-goal.md` **LS.26–LS.29**.
 
-This does **not** re-propose §17's rejected "Tier B only". The checker-soundness theorem (§6 theorem 1) stays in Lean, unbounded, by induction — that is ZER's whole point and nothing here touches it. What changes is *how theorem 2 is obtained for code that must be fast*, and §17's stated objection — *"the validator still needs the same semantics work"* — is now satisfied evidence, not a promise: the semantics exists, is axiom-free, and is conformance-tested three ways.
-
----
-
-### 19.1 DECISION AMENDMENT to §0.1 — hot paths MAY be hand-written C, specified in Lean
+### 19.1 The three stages, and what each is worth
 
 ```
-   §0.1 AS WRITTEN   "the whole compiler core (checker, IR passes, emitter),
-                     not just the proofs" — in Lean 4.
+STAGE 1   coqc over the Coq definitions + the theorem      is the MATH right?
+          + Print Assumptions                              ALL inputs. Kernel-checked.
 
-   AMENDED           computational hot paths MAY be hand-written C, SPECIFIED
-                     and PROVED in Lean, and linked per build by CBMC against a
-                     Lean-emitted reference.
+STAGE 2   refinedc check over the annotated C              does the C compute that math?
+          + Print Assumptions type_<fn>                    ALL inputs. Kernel-checked.
+
+STAGE 3   gcc -Wall -Wextra -fsanitize=undefined,          does the REAL BINARY behave,
+          run it, time it                                  and how fast?  SAMPLED.
 ```
 
-**Why the escape hatch is wanted:** compile time is a product feature, and a compiler that is slow to run is a compiler people route around. §9.5 already noted Lean's runtime speed touches chain 2 only; this makes the mitigation concrete rather than aspirational.
-
-**Why it is an ESCAPE HATCH and not the starting position — measure first:**
-
-```
-   CompCert is EXTRACTED OCaml and compiles real programs at acceptable speed.
-   A compiler is SYMBOLIC and ALLOCATION-HEAVY — precisely the workload profile
-   where Lean's GC costs least. The ~13x figure recorded in KernelQ LS.9 was
-   TIGHT NUMERIC LOOPS with boxed Ints, which is the opposite profile.
-```
-
-So: **default stays Lean.** Splitting a pass into Lean-spec + C-impl + CBMC harness is a permanent per-pass cost (two artifacts that must correspond, forever). Pay it for a *measured* bottleneck, never for an anticipated one. The pipeline exists so the option is available at the moment it is earned.
-
----
-
-### 19.2 The pipeline, end to end, with the status of every link
+**Stage 3 does not become vestigial when Stage 2 exists — its JOB changes.** Stage 2 proves
+things inside Caesium's model of C. Stage 3 covers what that model does not:
 
 ```
-   spec              a plain Lean function. The thing you prove ABOUT.
-     |  PROVED, using evalS
-   refProg : Prog    a term in the typed C AST
-     |  render       UNPROVED — conformance-TESTED (19.7)
-   reference.c
-     |  CBMC         BOUNDED equivalence, symbolic, not sampling
-   your fast C       hand-written, arbitrary: pointers, goto, unrolling, recursion
-     |  gcc          UNVERIFIED (chain 1; §9 already states this)
-   assembly
+1  MODEL vs REALITY    Caesium's C semantics is not what gcc emits. Running the binary is a
+                       check ON THE MODEL. Not hypothetical: a sibling tool proved
+                       malloc-alignment facts that are FALSE on glibc.
+2  DOES IT EVEN BUILD  the prover accepting the source does not mean gcc does.
+3  UB AT -O2           the optimiser exploits UB in ways a model may permit. Measured: UBSan
+                       caught an `int` accumulator that the proof layer had no opinion on.
+4  THE CLOCK           Stage 2 says nothing about speed, and compile time is a product
+                       feature (§2). This is the whole reason C is here at all.
 ```
 
-Each link's honest status, so nobody re-derives it:
-
-```
-   spec -> refProg     PROVED in Lean. Bridge lemmas make it ~one line per rung
-                       once the loop SHAPE has a lemma.
-   refProg -> C        render is the ONLY stringly part. ~40 lines, one line per
-                       constructor, no logic, fully parenthesised so it never
-                       decides precedence. NOT proved. Conformance-tested.
-   ref C <-> fast C    CBMC. Symbolic over ALL inputs within the bound.
-   C -> asm            gcc. Trusted, per §9. CompCert closes it for anyone who
-                       buys a licence — see 19.11.
-```
-
----
-
-### 19.3 What already exists and transfers directly
-
-Built and debugged in KernelQ; none of this has to be re-invented.
-
-```
-   lean-prelude/CEmitFull.lean          ~600 lines. Typed AST indexed by SORT
-                                        (malformed C is UNREPRESENTABLE), evalS,
-                                        render, bridge lemmas, renderHarness,
-                                        renderMutant, renderDiffMain, renderPerfMain
-   lean-prelude/conformance/            6040 points, THREE voices (Lean/gcc/CBMC),
-                                        coverage-forced, gated against staleness
-   backend/Dockerfile.cbmc              cbmc 6.10.0 PINNED (+ z3, as an option)
-   backend/direct-kernel-compiler.js    leanEmit, cbmcVerify — flags server-fixed
-   backend/leetcode-style-validator.js  _runProofCarryingC — the stage orchestration
-```
-
-Full context: `KernelQ/docs/kernelq-pedagogy-goal.md` **LS.17–LS.22**, and `docs/Lean4-context-internal.md` §26.
-
----
-
-### 19.4 FOUR SILENT TRAPS, all measured. Each type-checks, renders valid C, compiles, and is WRONG.
-
-This is the reason the semantics work is real work and not bookkeeping.
-
-```
-   1. INTEGER PROMOTION      C makes `u8 + u8` an `int`: 44 vs 300.
-                             -> ONE integer width everywhere. `long long`.
-                                A mixed-width AST is well-typed and wrong.
-
-   2. DIVISION               Lean's `/` on Int is EUCLIDEAN (-7/2 = -4); C
-                             TRUNCATES (-7/2 = -3). They agree only on
-                             non-negative operands.
-                             -> use Int.tdiv / Int.tmod, NEVER / and %.
-
-   3. THE BRIDGE LEMMA       the drop/take formulation was FALSE without
-                             `c + k <= length`, and looked fine ONLY because
-                             `sum` was the first instantiation (+0 is identity).
-                             -> reformulate over List.range': the mapped list has
-                                length EXACTLY k and the side condition vanishes.
-
-   4. INT64_MIN LITERAL      `-9223372036854775808LL` is unary minus applied to a
-                             constant that does not fit, so it is UNSIGNED.
-                             MEASURED: `(-92233...808LL) < 0` is TRUE to gcc and
-                             FALSE to CBMC. Two C frontends disagreeing about a
-                             constant we emit.
-                             -> emit `-MAX - 1`. INT64_MIN is not exotic: it is
-                                the natural seed for a max-accumulator.
-```
-
-Trap 4 is the one that generalises: **any Int → C-literal conversion is a narrowing that can lie.** Funnel it through one function and test the boundaries.
-
----
-
-### 19.5 THE GOVERNING PRINCIPLE, and every guard that exists because of it
+### 19.2 THE GOVERNING PRINCIPLE, and every guard that exists because of it
 
 ```
    A CHECK THAT CANNOT FAIL IS INDISTINGUISHABLE FROM A CHECK THAT PASSES.
 ```
 
-Every bug found while building this had that shape. Not one was in CBMC or Lean; all were in the *invocation*.
+Every bug found building this had that shape, and **not one was in the prover** — all were in
+the *invocation*. This list is a checklist for ZER, not history.
 
 ```
-   VACUOUS HARNESS       contradictory __CPROVER_assumes + a student returning
-                         424242 gave "0 of 10 failed, VERIFICATION SUCCESSFUL".
-                         -> emit a MUTANT (calls the reference, adds 1: wrong on
-                            EVERY input) and REQUIRE CBMC to reject it.
+EXIT CODE IS NOT A VERDICT   `refinedc check` exit 0 passes two MEASURED cheats:
+                             [[rc::trust_me]] emits a proof file that is literally a
+                             comment (no theorem at all), and an injected
+                             //@rc::inlined_final Axiom ... : False discharges everything.
+                             -> Print Assumptions type_<fn> must read "Closed under the
+                                global context", AND a surface allow-list must refuse
+                                every attribute outside the intended set, BEFORE a
+                                container starts. Same discipline as `Admitted` exiting 0.
 
-   VACUITY PROBE THAT    any mutant failure counted as "vacuity ruled out", so a
-   FELL OVER             timeout silently restored the hole.
-                         -> the mutant must fail for a DISCRIMINATING reason.
+VACUOUS SPECIFICATION        contradictory preconditions make the triple vacuously true.
+                             MEASURED: {0 <= n} with {n < 0} PROVES `return 12345;`
+                             against `returns n`. ACCEPT in 3s.
+                             -> every proved function keeps a MUTANT that must be REJECTED.
 
-   BLAME MISATTRIBUTION  CBMC names properties `<function>.<check>.<n>`; the
-                         classifier ignored the prefix, so UB in the GENERATED
-                         reference was reported as the student's wrong answer.
-                         -> attribute by function against the emitted files.
+MISATTRIBUTED VERDICT        a PARSER refusal is not a failed proof, and reporting it as one
+                             sends the reader to the wrong place entirely. MEASURED: a
+                             `return a = b;` produced "the loop annotation may be too weak"
+                             on a function with no loop.
+                             -> classify frontend rejections as their own stage. The timing
+                                tell (1-2s vs 5-30s) is a reliable secondary signal.
 
-   SILENT UNSOUNDNESS    `--no-unwinding-assertions` turns "proved" into "did not
-                         check". MEASURED: unwind 2 fails loudly; with that flag
-                         it reports SUCCESSFUL on an under-approximation.
-                         -> every flag SERVER-CONSTRUCTED. Only range-clamped
-                            integers reach the command line. (AWS's published
-                            practice is the same guard.)
+DISCARDED DIAGNOSTIC         the prover states EXACTLY what it could not establish -- the
+                             goal, with hypotheses above the line and the target below.
+                             Summarising it away is the same defect class as misattributing
+                             it: the answer was in the log and the message said something
+                             else.
+                             -> surface the residual goal verbatim.
 
-   PATH-KILL BYPASSES    `__CPROVER_assume(0)`, `exit(0)`, `abort()` in the
-                         submitted C each made the assertion unreachable ->
-                         VERIFICATION SUCCESSFUL on code returning 424242.
-                         -> blocklist, comments/strings stripped first. A
-                            blocklist is incomplete by construction; the general
-                            guard is a reachability probe, not yet built.
+WRONG LINE NUMBERS,          two different coordinate systems, MEASURED:
+TWO KINDS                      Cerberus FRONTEND errors are in SPLICED-file coordinates --
+                               subtract the author prefix or you point 15 lines past the
+                               mistake.
+                               Lithium `Location:` numbers are in PREPROCESSED coordinates
+                               -- an 18-line unit reported line 132, true offset 118, and
+                               the offset depends on the image's headers.
+                             -> map the first; DO NOT SURFACE the second. A confidently
+                                wrong line is worse than none.
 
-   FORGED ARTIFACTS      a student `main` could IO.FS.writeFile a forged
-                         reference.c.  -> the emitter entry point is
-                         SERVER-OWNED; leanEmit refuses any other.
+MULTI-HOMED DEFINITION       the Coq function written twice -- once in the semantics, once
+                             in the RefinedC prelude -- lets both stages pass while grading
+                             DIFFERENT functions.
+                             -> single-home it and splice. This is CLAUDE.md's documented
+                                #1 recurring bug class, in a new location.
 
-   ORACLE FALLING        a hand-written operator list goes stale the moment a
-   BEHIND THE LANGUAGE   constructor is added.
-                         -> total `exprTag`/`stmtTag` matches + #guards, so a new
-                            constructor BREAKS THE BUILD.
-
-   FIXES THAT NEVER      the INT64_MIN fix was probed, verified, committed — and
-   SHIPPED               absent from all three live rungs, because each embeds
-                         its own prelude copy.
-                         -> `prelude:propagate` + a sync-time drift gate.
+FIXES THAT NEVER SHIP        a verified fix absent from every live artifact because each
+                             embeds its own copy of the prelude.
+                             -> one propagation step plus a drift gate at sync time.
 ```
 
-**For ZER, read that list as a checklist, not as history.** Every one of them is reachable in a compiler pipeline that uses the same machinery.
-
----
-
-### 19.6 GENERATED vs HAND-WRITTEN — decide by FAILURE MODE, not by taste
-
-The question recurs constantly and has a crisp answer:
+### 19.3 GENERATED vs HAND-WRITTEN — decide by FAILURE MODE, not by taste
 
 ```
-   DRIFT FAILS SILENTLY  ->  MUST BE GENERATED
-     the CBMC harness. A hand-written one that disagrees with `refProg` still
-     prints VERIFICATION SUCCESSFUL — it just proved something else, and nothing
-     anywhere says so.
+DRIFT FAILS SILENTLY  ->  MUST BE GENERATED
+  anything the proof obligation rides on. A hand-written artifact that disagrees with the
+  specification still reports success -- it just proved something else, and nothing says so.
 
-   DRIFT FAILS LOUDLY    ->  MAY BE HAND-WRITTEN
-     behavioural/differential tests. Wrong signature = LINK ERROR.
-     It is TESTING, not proving; no proof obligation rides on it.
+DRIFT FAILS LOUDLY    ->  MAY BE HAND-WRITTEN
+  behavioural/differential tests. Wrong signature = link error. It is TESTING, not proving.
 ```
 
-...with one rule that makes hand-written safe: **it must reject the mutant.** A hand-written test can be vacuous (compare the artifact to itself, forget to call it) and nothing would say so — the same class as an unsatisfiable harness. Running it against the mutant costs milliseconds and constrains the author's test *not at all*.
+…with one rule that makes hand-written safe: **it must reject the mutant.** A hand-written
+test can be vacuous (compare the artifact to itself, forget to call it) and nothing would say
+so. Running it against the mutant costs milliseconds.
 
----
+### 19.4 THE ARENA DECISION — make it before any new IR code exists
 
-### 19.7 evalS's ACTUAL coverage — do not overstate it
+**The one architectural choice that is expensive to retrofit, and it is now load-bearing for a
+second reason.**
 
-```
-   SOLID     all 12 operators, exhaustive over [-8,8] PLUS boundary values
-             (INT64_MIN/MAX, the 32-bit seams, each neighbour). THREE voices:
-             Lean vs gcc vs CBMC — because the VERDICT comes from CBMC, never
-             gcc, so a two-way suite is blind to the frontend that decides.
-             Axiom-free. Falsified: seeded bugs DO make it fail.
-
-   NOT YET   `setIdx` (array WRITES) and `ifE` (conditionals) are NEVER
-   COMPARED  differentially tested — they appear only in coverage-forcing tags
-             and Lean-side #guards. Nested loops untested. Deep expression
-             nesting untested (the sweep is one-operator programs).
-```
-
-And **"proven" is the wrong word regardless.** There is no theorem `evalS ≡ C`; there cannot be without a formal C semantics, which is CompCert's Clight — the thing §17 already declined as a hard dependency. What exists is exhaustive testing over a domain, three ways. Strong evidence. Not proof.
-
----
-
-### 19.8 The cost model — the value RANGE is the only lever
-
-Full record and every dead end: KernelQ **LS.21**. Summary, all measured clean:
+Under the old record this decision existed because the emission AST spoke int64 scalars and
+arrays, and pointers in the AST break totality. **The reason has changed and strengthened**:
+§4.4 measured that **pointer-walking is RefinedC's one structural stall** — the residual is a
+separation-logic goal no annotation reaches. ZER's passes operate on ASTs, symbol tables,
+region lattices and CFGs, which are exactly that shape.
 
 ```
-   64x64 mul  vlim +-100    151s SUCCESSFUL   <- the working recipe
-   64x64 mul  vlim +-1000   TIMEOUT
-   32x32 mul  vlim +-1000   TIMEOUT   width does NOT help
-   int32 storage, no limit  TIMEOUT   storage does NOT help
-   --refine / --refine-arith TIMEOUT
-   Z3 backend               TIMEOUT, and WORSE than the default SAT
-   no multiply at all       1s
+POINTER TREES     struct Node { Node *l, *r; }
+                  -> the shape that does not close. Verification stops here.
+ARENA + INDICES   int32 arrays: kind[], lhs[], rhs[], type[]
+                  a "pointer" is an INDEX into a flat array
+                  -> integer and array reasoning, which is where the automation is strongest
 ```
 
-**Why no solver-side route works:** C arithmetic is BIT-VECTOR arithmetic, not integer arithmetic. There is no integer-level inference to be had — range facts are clauses in a boolean circuit, not premises in arithmetic.
+This is not a concession to the verifier. **Fast compilers represent IRs this way anyway** —
+cache-friendly, no allocator churn, trivially serialisable. It happens to also be the
+representation the proof pipeline can express.
 
-**For ZER this mostly evaporates.** The expensive operation is variable×variable multiplication over wide ranges; a memory-safety or dataflow validation is pointer- and set-shaped, with no arithmetic of that kind. Bounds are small by construction, and semantic bugs surface at tiny scale.
+Same technique for fixpoint passes: dataflow on a lattice of height `h` converges in `≤ h·n`
+steps, so a bounded loop with a proven-sufficient trip count replaces the unbounded `while`,
+and its invariant is expressible.
 
-**One methodology rule, learned expensively:** never benchmark a solver while another solver is running. A contaminated number got published as fact, a design proposal was built on it, and `mul` was nearly deleted from the emission language before re-measurement.
+### 19.5 The specification-side traps that survive the prover switch
 
----
-
-### 19.9 THE ARENA DECISION — make it before any IR code exists
-
-The one architectural choice that is expensive to retrofit.
-
-`CEmitFull` speaks **int64 scalars and arrays**. No structs, no pointers, no trees — deliberately, because pointers in the AST break totality and totality is what keeps `evalS` structural and the proofs short.
-
-ZER's passes operate on ASTs, symbol tables, region lattices, CFGs. Those do not fit — **unless the IR is arena-flattened**:
+Two of the four semantic traps recorded in the old §19.4 were about emitting C from a prover
+and are gone with it. Two are about the *relationship between a prover's arithmetic and C's*,
+and they apply here unchanged:
 
 ```
-   POINTER TREES     struct Node { Node *l, *r; }
-                     -> unrepresentable; would need pointers in the AST
-   ARENA + INDICES   int32 arrays: kind[], lhs[], rhs[], type[]
-                     a "pointer" is an INDEX into a flat array
-                     -> fits CEmitFull almost as-is
+INTEGER PROMOTION   C makes `u8 + u8` an `int`. A mixed-width specification is well-typed
+                    and wrong. -> be explicit about widths in the spec; the C's own type is
+                    not the specification's type.
+
+DIVISION            Coq's `Z.div` is EUCLIDEAN; C TRUNCATES toward zero. They agree only on
+                    non-negative operands. -> `Z.quot`/`Z.rem` mirror C; `Z.div`/`Z.modulo`
+                    do not. Getting this wrong produces a proof of the wrong theorem, and
+                    the C is fine.
 ```
 
-This is not a concession to the verifier. **Fast compilers represent IRs this way anyway** — cache-friendly, no allocator churn, trivially serialisable. It happens to also be the representation the proof pipeline can express.
+A third, added from measurement here: **you type ASCII, the prover prints Unicode.** Coq
+displays `≤` for `<=` and `¬` for `~`. Specifications should be written in ASCII (measured
+working) so that what an author types matches what a reviewer can reproduce; the divergence in
+output is display only.
 
-Same technique for fixpoint passes: dataflow on a lattice of height `h` converges in `≤ h·n` steps, so a bounded `forUp` with a proven-sufficient trip count replaces the unbounded `while` and `evalS` stays total.
-
----
-
-### 19.10 TWO semantics, not one — they get conflated
-
-```
-   evalIR   what ZER PROGRAMS mean. The mother theorem (`check p -> Safe p`) is
-            stated over this. It is ZER's LANGUAGE DEFINITION — written
-            regardless, not a pipeline tax.
-   evalS    what the EMITTED C means. Needed only to PROVE that refProg computes
-            the spec. Pure pipeline machinery — and it already exists.
-```
-
-`evalS` is required exactly when the reference is **proved** rather than trusted. If a reference is merely trusted (small, readable), CBMC compares C to C and no `evalS` is needed anywhere — but then a mistranslation makes both sides wrong identically and nothing catches it.
-
-**That risk is much smaller in the chosen configuration**, because the two C artifacts are INDEPENDENT: one rendered from Lean, one written by a human from intent. A render bug makes them DISAGREE — a loud spurious rejection, not silent agreement. The residual is *correlated human error* (writing `a / b` in C to mirror Lean's `/`, trap 2 above), which is exactly what the per-operator conformance suite is for.
-
----
-
-### 19.11 The trusted set in this configuration
+### 19.6 What is NOT built for ZER
 
 ```
-   LEAN KERNEL        checks the proofs. Small, heavily scrutinised. The cheap one.
-   LEAN COMPILER      only because the EMITTER RUNS as compiled Lean. Distinct from
-                      the kernel and much bigger — but a miscompiled emitter makes
-                      the reference DISAGREE with the hand-written C, so it fails
-                      LOUDLY unless the same bug hits both producers.
-   CBMC               frontend, goto conversion, SAT encoding, solver.
-   render             ~40 lines, unproved, conformance-tested.
-   THE BOUND          CBMC covers inputs up to it. A SCOPE gap, not a soundness
-                      gap: too small a bound claims LESS, never something false,
-                      and it fails loudly (unwinding assertions).
-   gcc + THE LINKER   chain 1, per §9. Nobody verifies linkers — CompCert included.
-```
-
-**CompCert stays available without being shipped.** Emitting C that CompCert *accepts* costs nothing; distributing CompCert is what is licensed (free build is INRIA non-commercial; commercial via AbsInt). Anyone needing the closed chain buys their own licence and compiles — which is exactly §10's dual-backend strategy, and it means §11's emitter contract (standard C99, no GCC extensions, no VLAs) is now doubly load-bearing.
-
----
-
-### 19.12 What is NOT built for ZER
-
-```
-   evalIR + the mother theorem        ZER's actual content. Nothing here supplies it.
-   bridge lemmas for COMPILER loop    `runFor_step` covers "accumulate over one
-   shapes                             array". A WORKLIST or FIXPOINT loop is a
-                                      different shape and needs its own lemma,
-                                      proved once. Finite work, not zero.
-   setIdx / ifE conformance           BUILT 2026-08-11 (KernelQ LS.23.1). `covered`
-                                      was CIRCULAR — a hand-written list the guards
-                                      checked themselves against. Now COMPUTED from
-                                      the programs that actually run. 6380 points.
-   a reachability probe               BUILT 2026-08-11 (KernelQ LS.23.4), and it
-                                      earned itself at once: an INFINITE LOOP makes
-                                      CBMC report VERIFICATION SUCCESSFUL, because
-                                      the assertion becomes unreachable and nothing
-                                      fails. A blocklist cannot catch that class.
-                                      Invert it: call, then assert FALSE — the probe
-                                      passes only when CBMC FAILS.
-   arena-flattened IR                 the 19.9 decision.
+λ-ZER completion                  IR semantics + the C99-subset target semantics. ZER's own
+                                  content; nothing in the tooling supplies it.
+the SPEC->C link for real passes  measured only on small functions. The §16.1 calibration on
+                                  src/safety/*.c is what replaces estimates with numbers.
+arena-flattened IR                the 19.4 decision.
+the authoring gate                spec + mutant + Print Assumptions in CI. §16.2. Cheapest
+                                  now; the thing whose absence makes everything else a
+                                  green light that cannot fail.
+a portable emission mode          §11.1. Gated on wanting Stage 4.
 ```
 
 ---
 
-**Status: RECORDED 2026-08-11 (§19).** Amends §0.1 (implementation language). Instantiates §6's Tier B with a built mechanism. Does not touch §6 theorem 1 (checker soundness stays Lean, unbounded, inductive), does not re-propose any §17 entry. Cross-refs: §9 (the two trust chains this sits inside), §10 (dual backend), §11 (the emitter contract, now doubly load-bearing), §9.5 (Lean runtime speed — 19.1 is its concrete mitigation). KernelQ-side full record: `docs/kernelq-pedagogy-goal.md` LS.17 (design), LS.18 (as built), LS.19 (the language), LS.20 (soundness target + false-accept ledger), LS.21 (corrected cost model), LS.22 (behavioural stage), LS.23 (completeness, the calibration trap, the reachability probe); `docs/Lean4-context-internal.md` §26 (every measurement).
+**Status: ADOPTED 2026-08-15 (§0–§19).** Supersedes the 2026-07-19 Lean-4 record in full.
+Retains §5 (certificate principle), §6 (tiers), §9 (two chains), §10 (dual backend), §11
+(emitter contract), §12 (residue), §15 (certification framing) in substance. Removes Lean 4
+and CBMC entirely, with the reasons in §0.1. Does not re-propose any §17 entry.
 
 ---
 
 ## §18 Sources and provenance
 
-Empirical results produced on this machine, 2026-07-19 (commands recorded inline above):
-iris-lean clone/build/axiom-probe (§4.2); ZER code measurements (§1.1); ZER proof-corpus
-reading (§1.2); Lean v4.32.0 CLI contract probes (via the KernelQ `kernelq-lean` image —
-full contract in `KernelQ/docs/kernelq-pedagogy-goal.md` LS.4).
+Empirical results produced on this machine:
 
-Web-verified 2026-07-19:
+- **2026-08-14/15** — RefinedC measured end to end in the `kernelq-refinedc` image
+  (Rocq 9.1.0, RefinedC `dev.2026-07-16`): the free counting-loop spec; the linked spec at
+  ~6 lines of author Coq; the unroll series (8x ACCEPT 6s, 32x ACCEPT 23s, uncapped); the
+  `k + 8 <= n` overflow catch and its UBSan confirmation at `LLONG_MAX - 4`; the pointer-walking
+  stall; the C-subset probes (`+=`, `k++`, ternary accepted; nested assignment refused); the
+  two cheats that pass exit 0; the vacuous-precondition ACCEPT; the two line-number coordinate
+  systems. Verdict log: `KernelQ/refinedc/logs/VERDICTS`.
+- **2026-08-15** — repo measurement: **94 `.v` files** (23 `proofs/vst/`, 66
+  `proofs/operational/`); RefinedC licence **BSD**; Rocq **9.1.0**.
+- **2026-07-19** — ZER code measurement (§1.1); ZER proof-corpus reading (§1.2).
+
+Web-verified 2026-07-19 (unchanged and still load-bearing):
+
 - CompCert targets: `github.com/AbsInt/CompCert` (`configure`, master)
 - CompCert product/qualification/licensing: `absint.com/compcert` (ATR 42/72 2026 with
-  DO-178C/DO-333/DO-330 credits; MTU IEC 60880 Cat A / IEC 61508 SIL-3, 2017;
-  free-for-research, commercial via AbsInt), `compcert.org` (v3.16 2025-09; manual v3.17),
-  AbsInt CompCert factsheet release 26.04 (2026-04)
-- iris-lean repository state: `github.com/leanprover-community/iris-lean` (+ its porting
-  tracker at `leanprover-community.github.io/iris-lean`)
+  DO-178C/DO-333/DO-330 credits; MTU IEC 60880 Cat A / IEC 61508 SIL-3, 2017), `compcert.org`
+  (v3.16 2025-09; manual v3.17), AbsInt factsheet release 26.04 (2026-04)
 - Verified-Rust-on-CompCert precedent (§8.1): `github.com/SJTU-PLV/CompCert`, branch
-  `rust-verified-compiler` (read 2026-07-19: pipeline, theorem names, verification status)
-- Lean ecosystem (research sweep, 13+ sources): AWS Cedar, SampCert, Veil, lean-mlir,
-  Lean FRO roadmap — summarized in KernelQ doc LS.2/LS.3
+  `rust-verified-compiler`
 
-Session provenance: the full reasoning chain (including the refuted stale-Iris claim and
-the "fully safe" correction) occurred in the 2026-07-19 KernelQ/ZER working session; the
-KernelQ-side record is `kernelq-pedagogy-goal.md` LS.0–LS.5.
+Superseded provenance, kept so the reasoning can be audited rather than re-run: the 2026-07-19
+Lean decision (iris-lean build + axiom probe, Lean v4.32.0 CLI contract) and the 2026-08-11
+Lean→CBMC pipeline record. Both are in git history and in the KernelQ doc's LS.0–LS.25; LS.26
+onward is the current stack.
 
 ---
 
 *End of decision record. If you are a fresh session about to work on ZER's compiler,
-verification, backends, or trust story: this document plus KernelQ LS.0–LS.5 is the
-complete context. Verify empirical claims by re-running the recorded commands — do not
-re-derive the decisions, and do not re-propose entries from §17 without new evidence.*
+verification, backends, or trust story: this document is the complete context. Verify
+empirical claims by re-running the recorded commands — do not re-derive the decisions, do not
+re-propose entries from §17, and do not re-propose Lean or CBMC without reading §0.1 first.*

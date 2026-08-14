@@ -9,6 +9,45 @@
  *
  * Status: FOUNDATION — core range tracking framework. Does NOT yet
  * replace the AST VRP. Both coexist during migration.
+ *
+ * ================================================================
+ * STATE OF THIS FILE, MEASURED 2026-08-14 — read before "just wiring it up"
+ * ================================================================
+ *
+ * This file is **DEAD CODE**. It is not in the Makefile and nothing references
+ * `vrp_ir` / `vrp_ir_free` anywhere in the tree (`grep -rn vrp_ir --include=*.c
+ * --include=*.h --include=Makefile .` matches only this file). It is Phase 0 of
+ * docs/unified-oracle-proved-ZER.md, so it is kept deliberately rather than
+ * deleted — but a future session should know exactly what it is inheriting:
+ *
+ * 1. **It still compiles** against the current headers (`gcc -Wall -Wextra
+ *    -std=c99 -I. -c vrp_ir.c`, exit 0), so it has not bit-rotted against the IR
+ *    API. That is the good news, and it is the only part that was verified to
+ *    still hold.
+ *
+ * 2. **The two functions that answer the actual safety questions are unused even
+ *    WITHIN this file** — `ir_range_proves_safe` and `ir_range_proves_nonzero`
+ *    are `-Wunused-function`. The pass computes ranges and then discards the
+ *    answers; nothing ever asks "is this index in bounds?".
+ *
+ * 3. **`IRVRPResult` cannot answer the question a consumer needs.** It records
+ *    `(local_id, block_id, array_size = range.max + 1)`, conflating "the largest
+ *    value this local can hold" with "the size of the array it is safe to index".
+ *    The emitter's real query is per-INDEX-NODE ("may I elide the guard at THIS
+ *    access?"), which this shape cannot express. Wiring it up therefore means
+ *    redesigning the result type, not just calling it.
+ *
+ * 4. **The merge comment contradicts the merge code — the CODE is right.** The
+ *    block comment below says "intersect ranges from predecessors"; the
+ *    implementation takes the UNION (min of mins, max of maxes). Union is the
+ *    correct, SOUND direction for a join: it widens, so it can only ever ADD a
+ *    bounds guard, never remove one. Do not "fix" the code to match the comment —
+ *    that would make the analysis unsound. (The comment is left in place with
+ *    this note rather than edited, so the discrepancy stays visible to anyone
+ *    reading the two side by side.)
+ *
+ * Consequence: this is a SKELETON, not a working pass held back by a missing
+ * call site. Treat items 2 and 3 as the actual Phase 0 work.
  */
 
 #include "ir.h"

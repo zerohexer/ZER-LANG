@@ -1,0 +1,7 @@
+// expect-error: read-modify-written in a single statement
+// BUG-785 transitivity: the parameter is forwarded one more call before the RMW.
+volatile u32 counter;
+void inner(volatile *u32 p) { *p += 1; }
+void outer(volatile *u32 q) { inner(q); }
+interrupt TIM2 { outer(&counter); }
+u32 main() { u32 v = counter; return v; }

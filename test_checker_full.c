@@ -2710,11 +2710,25 @@ int main(void) {
         "void f() { u32 x = counter; }\n",
         "ISR safety: shared global without volatile");
 
+    /* BUG-788: this case used to write `counter = counter + 1` in the ISR — a
+     * read-modify-write, which the very next assertion declares an ERROR in its
+     * `+=` spelling. It passed only because the RMW rule keyed on the compound
+     * TOKEN rather than on the semantics, so the written-out form slipped
+     * through. The intent here is "a volatile global shared between ISR and main
+     * compiles"; a pure STORE demonstrates exactly that without colliding with
+     * the RMW rule. The RMW forms are asserted below and in
+     * tests/zer_fail/isr_rmw_written_out.zer. */
     printf("[ISR safety: shared volatile global → ok]\n");
     ok("volatile u32 counter = 0;\n"
-       "interrupt TIMER1 { counter = counter + 1; }\n"
+       "interrupt TIMER1 { counter = 1; }\n"
        "void f() { u32 x = counter; }\n",
        "ISR safety: volatile shared global OK");
+
+    printf("[ISR safety: volatile + written-out RMW → error (race)]\n");
+    err("volatile u32 counter2 = 0;\n"
+        "interrupt TIMER1 { counter2 = counter2 + 1; }\n"
+        "void f() { u32 x = counter2; }\n",
+        "ISR safety: written-out RMW on shared volatile = race");
 
     printf("[ISR safety: volatile + compound assign → error (race)]\n");
     err("volatile u32 flags = 0;\n"

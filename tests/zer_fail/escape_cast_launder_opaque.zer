@@ -1,0 +1,5 @@
+// expect-error: local
+// BUG-786 sibling: laundered through *opaque instead of an identity cast.
+?*opaque g = null;
+void f() { u32 x = 5; g = (*opaque)(&x); }
+u32 main() { f(); return 0; }

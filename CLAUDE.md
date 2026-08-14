@@ -382,6 +382,8 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **Reference LAUNDER peel ("what does this pointer expression designate?")** | var-decl `&local` detect, orelse fallback, struct-literal field walk, assign-to-global escape, keep-inference arg walk, every escape sink | ONE function — **`unwrap_ptr_launder`**. A hand-rolled copy IS the defect: five copies existed and all five missed `NODE_TYPECAST`, so `(*T)(&local)` laundered a stack pointer past nine of ten sinks (BUG-786, ASan `stack-use-after-return`). Peel only REFERENCE-producing casts (`tynode_is_reference_producing`) — a value cast yields a fresh scalar |
+| **Compiler-inserted early `return` vs a scope EPILOGUE** | bounds auto-guard, UAF field guard, `@cstr` guard — crossed with defer / `IR_LOCK` / `IR_CRITICAL_BEGIN` / `@once` / user sem pairs | `emit_safety_early_return` must not return out of a scope whose epilogue it would skip. `guard_traps` (defer) + `guard_scope_depth` (lock/critical) make it TRAP instead (BUG-789 — it silently leaked the auto-lock and HUNG). The language bans a USER return in these scopes; the compiler must hold itself to the same rule. `@once` + user `@sem_acquire`/`@sem_release` still uncovered — see limitations.md |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -1619,6 +1621,33 @@ All runners auto-detect positive vs negative tests. `make check` runs everything
 - `async_sensor.zer` — async/yield, comptime, container(T), move struct, designated init (v0.3)
 - `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
 - `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
+
+### A THIRD VACUOUS FORM: a test that ASSERTS THE BUG (found 2026-08-14)
+
+The two forms below are "passes for the wrong reason" and "never runs". There is a third,
+and it is the nastiest, because it actively defends the defect: **a positive test that
+asserts a buggy behaviour is CORRECT.** When you then fix the bug, your own suite reports a
+regression, and the obvious move — "make the test pass again" — reverts the fix.
+
+Both instances found by BUG-788 (the ISR read-modify-write rule keyed on the `+=` TOKEN, so
+the written-out `g = g + 1` was accepted):
+
+- `test_checker_full.c` "ISR safety: volatile shared global OK" used `counter = counter + 1`
+  in the ISR — and the assertion *immediately below it* declares the `|=` spelling an ERROR.
+  The suite contradicted itself and nobody noticed, because the RMW form was incidental to
+  what the test thought it was checking.
+- `test_modules/hal.zer` was worse: its comment explicitly presented
+  `irq_count = irq_count + 1` as **the fix** for the racy form. The compiler's own
+  diagnostic ("use explicit read/mask/write") is what taught the test to write it.
+
+**The tell.** When a fix breaks a positive test, ask "is this test asserting the thing I
+just proved wrong?" BEFORE weakening the fix. Read the neighbouring assertions — if a
+sibling declares a semantically identical form an error, the test is the bug. Then fix the
+test to the idiom that is ACTUALLY safe (here `@atomic_add`), not to whatever silences it.
+
+**And the deeper one:** a diagnostic that recommends a remedy is a spec. If the remedy is
+wrong, it propagates into user code AND into your own tests. When writing a "do X instead"
+message, verify X is actually safe and actually accepted.
 
 ### VACUOUS TESTS — the #1 way this suite lies to you (both forms found 2026-08-03)
 

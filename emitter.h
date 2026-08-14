@@ -113,6 +113,18 @@ typedef struct {
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
 
+    /* BUG-789: nesting depth of a compiler-BRACKETED scope whose epilogue an
+     * early `return` would skip — a `shared struct` auto-lock (IR_LOCK/IR_UNLOCK),
+     * an `@critical` block (IR_CRITICAL_BEGIN/END), or an `@once` body. While
+     * this is nonzero a safety auto-guard must TRAP rather than return, exactly
+     * as it already does inside a `defer` body (`guard_traps`).
+     *
+     * The language BANS a user `return` in these scopes for this very reason
+     * ("cannot use 'return' inside @critical block — interrupts would not be
+     * re-enabled"); the compiler was inserting one itself, leaking the mutex /
+     * leaving interrupts masked / leaving the once-flag stuck at "in progress". */
+    int guard_scope_depth;
+
 } Emitter;
 
 /* ---- API ---- */

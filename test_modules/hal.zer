@@ -1,10 +1,20 @@
 // A global shared between an ISR (via the inc_count helper) and main must be
-// volatile, and the ISR must not do a compound read-modify-write on it (that is
-// non-atomic). This is now enforced TRANSITIVELY through the helper call
-// (ISR-TRANS fix) — pre-fix the non-volatile / compound form compiled silently
-// and hoisted/torn on real hardware. Use volatile + an explicit read/write.
+// volatile, and the ISR must not do a non-atomic read-modify-write on it. Both
+// rules are enforced TRANSITIVELY through the helper call (ISR-TRANS fix) —
+// pre-fix the non-volatile / RMW form compiled silently and hoisted/torn on real
+// hardware.
+//
+// BUG-788 (2026-08-14): this file used to increment with
+// `irq_count = irq_count + 1`, believing that to be the safe alternative to
+// `irq_count += 1`. It is not — both lower to the same load/add/store, and an
+// interrupt landing between the load and the store loses the count. The old
+// diagnostic's advice ("use explicit read/mask/write") is what led this test to
+// the racy form, which is precisely why the RMW rule now asks whether the
+// right-hand side READS the object rather than looking for a `+=` token.
+//
+// The genuinely correct increment is atomic.
 volatile u32 irq_count = 0;
-void inc_count() { irq_count = irq_count + 1; }
+void inc_count() { @atomic_add(&irq_count, 1); }
 interrupt USART1 {
     inc_count();
 }

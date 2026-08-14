@@ -519,6 +519,9 @@ static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Ty
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
+static bool func_rmw_through_param(Checker *c, Symbol *fn, int pidx, int depth);
+static Node *call_arg_global_root(Checker *c, Node *arg);
+static void track_rmw_through_call_args(Checker *c, Node *call, Symbol *callee);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
                                       const char **out_name, uint32_t *out_len);
 static void ensure_func_props(Checker *c, Symbol *fn);
@@ -1123,6 +1126,7 @@ static void classify_escape_sink(Checker *c, Node *target,
  * stored to a global). A VALUE optional (?u32) copies a value, not a reference, so
  * it is correctly excluded (its unwrapped inner is not a pointer/slice). */
 static Node *unwrap_ptr_launder(Node *v);   /* fwd: defined below */
+static bool tynode_is_reference_producing(TypeNode *t);  /* fwd: defined below */
 static bool escape_type_carries_ref(Type *vt) {
     if (!vt) return false;
     TypeKind k = type_dispatch_kind(vt);
@@ -1149,6 +1153,16 @@ static bool escape_type_carries_ref(Type *vt) {
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     if (!arg || depth > 8) return false;
+    /* BUG-786: a pointer-producing C-style cast designates the same object it
+     * wraps, so ask the question of the operand. Without this arm every
+     * call-argument sink (keep inference, the call-result launder, Ring.push,
+     * the spawn/keep enforcement that routes through here) saw `(*T)(&local)` as
+     * an opaque expression and returned false. Peeling is gated on the cast
+     * producing a REFERENCE — a value cast like `(u32)local_int` yields a fresh
+     * scalar and must not be treated as a view of the local. */
+    if (arg->kind == NODE_TYPECAST &&
+        tynode_is_reference_producing(arg->typecast.target_type))
+        return arg_is_local_derived(c, arg->typecast.expr, depth + 1);
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
@@ -1433,10 +1447,9 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             if (struct_init_has_local_derived(c, fv)) return true;
             continue;
         }
-        /* unwrap intrinsic chains (mirror the direct case) */
-        Node *fu = fv;
-        while (fu && fu->kind == NODE_INTRINSIC && fu->intrinsic.arg_count > 0)
-            fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+        /* unwrap launder chains (mirror the direct case) — BUG-786: shared peel,
+         * so a struct literal field `{ .p = (*u32)(&local) }` is seen too. */
+        Node *fu = unwrap_ptr_launder(fv);
         /* Case A: &local — direct address-of */
         if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
             Node *root = fu->unary.operand;
@@ -1563,9 +1576,7 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
         /* skip positions the callee provably never returns (no result-launder there) */
         bool may_return_i = !complete || (i < 64 && (mask & (1ull << i)));
         if (!may_return_i) continue;
-        Node *arg = call->call.args[i];
-        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
-            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        Node *arg = unwrap_ptr_launder(call->call.args[i]);   /* BUG-786: shared peel */
         /* BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
          * descent — without it, `g = idfn(np[0..16])` records the launder but
          * skips keep inference (no propagation to np's root param). */
@@ -1740,22 +1751,55 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * *u32, &local)`) is NODE_INTRINSIC, not NODE_UNARY, so a taint sink that only
  * matched a bare NODE_UNARY missed it and the container escaped un-tainted via a
  * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
-static Node *unwrap_ptr_launder(Node *v) {
-    while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
-        /* @container(*T, ptr, field) and @cstr(buf, str) both return a pointer
-         * INTO their args[0]; every other launder (@ptrcast/@pun/@bitcast/@cast)
-         * passes the pointer as its LAST arg. Peeling @cstr to the last arg reached
-         * the STRING LITERAL instead of the caller's buffer — a local laundered
-         * through @cstr escaped unflagged. */
-        if ((v->intrinsic.name_len == 9 &&
-             memcmp(v->intrinsic.name, "container", 9) == 0) ||
-            (v->intrinsic.name_len == 4 &&
-             memcmp(v->intrinsic.name, "cstr", 4) == 0))
-            v = v->intrinsic.args[0];
-        else
-            v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+/* BUG-786 (2026-08-14): a C-style cast to a POINTER type is a launder too.
+ *
+ * `(*T)expr` designates the very same object `expr` does — ZER only admits an
+ * identity pointer cast or a `*T` <-> `*opaque` conversion (a cast between two
+ * different struct pointers is already an error directing the user to `@pun`), so
+ * peeling it never changes which allocation is referred to. Until this was added,
+ * `(*u32)(&x)` was invisible to every escape predicate and the taint was lost at
+ * the BINDING site, so a single identity cast — a no-op the emitter elides —
+ * defeated the escape analysis at nine of ten sinks. Verified with ASan:
+ * `stack-use-after-return`.
+ *
+ * Gated on the cast TARGET being reference-producing (pointer / slice / opaque).
+ * A VALUE cast must NOT be peeled: `(u32)local_int` produces a fresh integer that
+ * carries no reference, and treating it as a view of `local_int` would over-reject
+ * ordinary arithmetic. This is the same pointer-vs-scalar refinement that governs
+ * field reads — forming a reference aliases, reading a value does not. */
+static bool tynode_is_reference_producing(TypeNode *t) {
+    while (t && (t->kind == TYNODE_CONST || t->kind == TYNODE_VOLATILE)) {
+        t = t->qualified.inner;
     }
-    return v;
+    if (!t) return false;
+    return t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
+           t->kind == TYNODE_OPAQUE  || t->kind == TYNODE_FUNC_PTR;
+}
+
+static Node *unwrap_ptr_launder(Node *v) {
+    for (;;) {
+        if (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+            /* @container(*T, ptr, field) and @cstr(buf, str) both return a pointer
+             * INTO their args[0]; every other launder (@ptrcast/@pun/@bitcast/@cast)
+             * passes the pointer as its LAST arg. Peeling @cstr to the last arg reached
+             * the STRING LITERAL instead of the caller's buffer — a local laundered
+             * through @cstr escaped unflagged. */
+            if ((v->intrinsic.name_len == 9 &&
+                 memcmp(v->intrinsic.name, "container", 9) == 0) ||
+                (v->intrinsic.name_len == 4 &&
+                 memcmp(v->intrinsic.name, "cstr", 4) == 0))
+                v = v->intrinsic.args[0];
+            else
+                v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+            continue;
+        }
+        if (v && v->kind == NODE_TYPECAST &&
+            tynode_is_reference_producing(v->typecast.target_type)) {
+            v = v->typecast.expr;
+            continue;
+        }
+        return v;
+    }
 }
 
 /* A POINTER-typed value produced by dereferencing a pointer-to-pointer creates an
@@ -4676,15 +4720,11 @@ static Type *check_expr(Checker *c, Node *node) {
          * Fix: for @container specifically, take args[0] (the pointer);
          * everything else continues to use the last-arg unwrap. */
         {
-            Node *aval = node->assign.value;
-            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0) {
-                const char *iname = aval->intrinsic.name;
-                size_t inlen = aval->intrinsic.name_len;
-                if (inlen == 9 && memcmp(iname, "container", 9) == 0)
-                    aval = aval->intrinsic.args[0];
-                else
-                    aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
-            }
+            /* BUG-786: routed through the SHARED peel. This site had the fourth
+             * hand-rolled copy of the launder walk, so it also missed a pointer
+             * CAST: `g = (*u32)(&local)` was accepted at the global-store and
+             * global-struct-field sinks while the uncast form was rejected. */
+            Node *aval = unwrap_ptr_launder(node->assign.value);
             /* AUDIT 2026-06-12: walk &(...) through NODE_FIELD / NODE_INDEX to
              * the root ident so `&local.field` / `&local.field.sub` / `&local[k]`
              * are detected (previously only bare `&local` was caught). The
@@ -5801,6 +5841,21 @@ static Type *check_expr(Checker *c, Node *node) {
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
                 record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, 0);
+        }
+
+        /* BUG-785 — the MAIN-side sibling of the ISR recorder's call-site
+         * substitution. The RMW fact is recorded at TWO sites and both read the
+         * assignment target's root ident, so `bump(&counter)` from ordinary code
+         * lost it exactly as the ISR side did. Fixing one and not the other is
+         * the drift this codebase names as its top recurring defect, so both
+         * sites call the SAME helper. Guarded on being inside a function body
+         * (current_func_ret) to match the neighbouring ISR-tracking site. */
+        if (c->current_func_ret != NULL && node->call.callee &&
+            node->call.callee->kind == NODE_IDENT) {
+            Symbol *rs = scope_lookup(c->global_scope, node->call.callee->ident.name,
+                                      (uint32_t)node->call.callee->ident.name_len);
+            if (rs && rs->is_function)
+                track_rmw_through_call_args(c, node, rs);
         }
 
         /* 8th funcptr REACH form (2026-08-10): a CALLER-supplied funcptr FORWARDED
@@ -10797,6 +10852,162 @@ static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int d
                                         (uint32_t)pd->name_len, depth);
 }
 
+/* BUG-785 (2026-08-14) — ISR/main non-atomic RMW LAUNDERED THROUGH A POINTER
+ * PARAMETER.
+ *
+ * THE HOLE. The read-modify-write check ("a `volatile` global compound-assigned
+ * on both the interrupt and the main side is a torn RMW") is recorded at exactly
+ * two places, and BOTH read the compound-assign target's ROOT IDENT and ask
+ * whether that name is a global (checker.c NODE_ASSIGN for the main side,
+ * record_isr_globals for the ISR side). One call of indirection defeats both:
+ *
+ *     volatile u32 counter;
+ *     void bump(volatile *u32 p) { *p += 1; }   // root is `p` — a PARAM, not a global
+ *     interrupt TIM2 { bump(&counter); }
+ *     u32 main() { u32 v = counter; return v; }
+ *
+ * Measured live before the fix: the direct form `interrupt { counter += 1; }` is
+ * REJECTED, the call-laundered form above is ACCEPTED. Both compile to a
+ * load/add/store triple that the ISR can interleave, so the increment is lost.
+ * Nothing traps: `counter` is volatile, so it is not even a data race the
+ * sanitizers model, and on bare metal the only symptom is a slowly-drifting
+ * counter. Exactly the silent class this rule exists to prevent.
+ *
+ * THE SHAPE OF THE FIX. "Does this code RMW global G?" is one question answered
+ * at N sites — the multi-site class. Rather than teach each site to chase
+ * pointers (whole-program points-to, which the architecture bans), ask a
+ * PER-FUNCTION SUMMARY question at the CALL SITE, exactly as
+ * func_forwards_param_to_spawn does for the spawn/funcptr class: "does the callee
+ * read-modify-write through parameter i?" — then substitute the actual argument.
+ * If the argument resolves to a global, the compound is recorded against THAT
+ * global, and the existing post-check fires unchanged.
+ *
+ * Sound and bounded: the summary is computed from the callee's own body plus the
+ * same summary on its direct callees (depth-capped, like its template), so a
+ * two-hop forward `outer(p){ inner(p); }` is covered. An unlisted node kind makes
+ * no claim, so a form this walker cannot see keeps today's behaviour and never
+ * invents a rejection.
+ *
+ * NOT covered, deliberately: an RMW through a GLOBAL pointer variable
+ * (`*gp += 1` where `gp` points at G). Resolving that is points-to over a global
+ * pointer — the same question the model declines everywhere else. Recorded in
+ * docs/limitations.md rather than half-answered here. */
+static bool node_rmw_through_param(Checker *c, Node *n, const char *pname,
+                                   uint32_t pnlen, int depth) {
+    if (!n || depth > 8) return false;
+    if (n->kind == NODE_ASSIGN) {
+        if (n->assign.op != TOK_EQ) {
+            /* Walk the target to its root through field / index / deref steps —
+             * `*p += 1`, `p.field |= 1`, `p[i] += 1` are all an RMW of whatever
+             * `p` designates. Mirrors the root walk both recording sites use. */
+            Node *r = n->assign.target;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                         (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+                if (r->kind == NODE_FIELD) r = r->field.object;
+                else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+                else r = r->unary.operand;
+            }
+            if (r && r->kind == NODE_IDENT && r->ident.name_len == pnlen &&
+                memcmp(r->ident.name, pname, pnlen) == 0) return true;
+        }
+        return node_rmw_through_param(c, n->assign.target, pname, pnlen, depth) ||
+               node_rmw_through_param(c, n->assign.value, pname, pnlen, depth);
+    }
+    if (n->kind == NODE_CALL) {
+        /* forwarded one hop further: `mid(p)` where mid RMWs through ITS param */
+        if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
+            Symbol *cs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+                                      (uint32_t)n->call.callee->ident.name_len);
+            if (cs && cs->is_function) {
+                for (int i = 0; i < n->call.arg_count; i++) {
+                    Node *a = n->call.args[i];
+                    if (a && a->kind == NODE_UNARY && a->unary.op == TOK_AMP)
+                        a = a->unary.operand;
+                    if (a && a->kind == NODE_IDENT && a->ident.name_len == pnlen &&
+                        memcmp(a->ident.name, pname, pnlen) == 0 &&
+                        func_rmw_through_param(c, cs, i, depth + 1)) return true;
+                }
+            }
+        }
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (node_rmw_through_param(c, n->call.args[i], pname, pnlen, depth)) return true;
+        return false;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (node_rmw_through_param(c, n->block.stmts[i], pname, pnlen, depth)) return true;
+        return false;
+    }
+    if (n->kind == NODE_IF)
+        return node_rmw_through_param(c, n->if_stmt.then_body, pname, pnlen, depth) ||
+               node_rmw_through_param(c, n->if_stmt.else_body, pname, pnlen, depth);
+    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE)
+        return node_rmw_through_param(c, n->while_stmt.body, pname, pnlen, depth);
+    if (n->kind == NODE_FOR)
+        return node_rmw_through_param(c, n->for_stmt.body, pname, pnlen, depth);
+    if (n->kind == NODE_EXPR_STMT)
+        return node_rmw_through_param(c, n->expr_stmt.expr, pname, pnlen, depth);
+    if (n->kind == NODE_VAR_DECL)
+        return node_rmw_through_param(c, n->var_decl.init, pname, pnlen, depth);
+    if (n->kind == NODE_CRITICAL)
+        return node_rmw_through_param(c, n->critical.body, pname, pnlen, depth);
+    if (n->kind == NODE_ONCE)
+        return node_rmw_through_param(c, n->once.body, pname, pnlen, depth);
+    if (n->kind == NODE_DEFER)
+        return node_rmw_through_param(c, n->defer.body, pname, pnlen, depth);
+    if (n->kind == NODE_SWITCH) {
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (node_rmw_through_param(c, n->switch_stmt.arms[i].body, pname, pnlen, depth))
+                return true;
+        return false;
+    }
+    return false;   /* partial walk: unlisted kind -> no claim -> no new rejection */
+}
+
+static bool func_rmw_through_param(Checker *c, Symbol *fn, int pidx, int depth) {
+    if (!fn || !fn->is_function || !fn->func_node || depth > 8) return false;
+    Node *fd = fn->func_node;
+    if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return false;
+    if (pidx < 0 || pidx >= fd->func_decl.param_count) return false;
+    ParamDecl *pd = &fd->func_decl.params[pidx];
+    if (!pd->name || pd->name_len == 0) return false;
+    return node_rmw_through_param(c, fd->func_decl.body, pd->name,
+                                  (uint32_t)pd->name_len, depth);
+}
+
+/* Resolve a call ARGUMENT to the global variable it designates, or NULL.
+ * Peels the launder intrinsics (@ptrcast/@pun/@container/@cstr — shared with the
+ * escape sinks so the two agree on what "the same object" means), then `&`, then
+ * field/index navigation: `&g`, `g`, `&g.field`, `&g.arr[0]` all designate `g`. */
+static Node *call_arg_global_root(Checker *c, Node *arg) {
+    if (!c || !arg) return NULL;
+    arg = unwrap_ptr_launder(arg);
+    if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
+        arg = arg->unary.operand;
+    while (arg && (arg->kind == NODE_FIELD || arg->kind == NODE_INDEX)) {
+        if (arg->kind == NODE_FIELD) arg = arg->field.object;
+        else arg = arg->index_expr.object;
+    }
+    if (!arg || arg->kind != NODE_IDENT) return NULL;
+    Symbol *gs = scope_lookup(c->global_scope, arg->ident.name,
+                              (uint32_t)arg->ident.name_len);
+    if (!gs || gs->is_function) return NULL;
+    return arg;
+}
+
+/* The call-site substitution, shared by the ISR-side and main-side recorders so
+ * the two sites cannot drift apart (the failure mode CLAUDE.md names for every
+ * exemption/gate answered at N sites). */
+static void track_rmw_through_call_args(Checker *c, Node *call, Symbol *callee) {
+    if (!c || !call || !callee) return;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        Node *g = call_arg_global_root(c, call->call.args[i]);
+        if (!g) continue;
+        if (!func_rmw_through_param(c, callee, i, 0)) continue;
+        track_isr_global(c, g->ident.name, (uint32_t)g->ident.name_len, true);
+    }
+}
+
 /* Shared recursion-depth budget for the transitive spawn-global scan: the
  * direct-call descent, the function-name-arg descent, and the funcptr-binding
  * descent (SPAWN-FP) all share ONE counter so mutual re-entry between them can
@@ -11839,6 +12050,13 @@ static void check_stmt(Checker *c, Node *node) {
                                              memcmp(init_root->intrinsic.name, "container", 9) == 0)
                                     ? init_root->intrinsic.args[0]
                                     : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                            /* BUG-786: a pointer-producing cast designates the same
+                             * object, so `*u32 q = (*u32)p` must inherit p's
+                             * arena/local-derived flags. A VALUE cast is skipped —
+                             * `u32 n = (u32)local_int` yields a fresh scalar. */
+                            else if (init_root->kind == NODE_TYPECAST &&
+                                     tynode_is_reference_producing(init_root->typecast.target_type))
+                                init_root = init_root->typecast.expr;
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;
@@ -11888,11 +12106,13 @@ static void check_stmt(Checker *c, Node *node) {
                     /* check both direct &local AND orelse fallback &local */
                     Node *addr_exprs[4] = { NULL, NULL, NULL, NULL };
                     int addr_count = 0;
-                    /* BUG-338: walk into intrinsics to find &local */
-                    Node *init_unwrap = init;
-                    while (init_unwrap && init_unwrap->kind == NODE_INTRINSIC &&
-                           init_unwrap->intrinsic.arg_count > 0)
-                        init_unwrap = init_unwrap->intrinsic.args[init_unwrap->intrinsic.arg_count - 1];
+                    /* BUG-338: walk into intrinsics to find &local.
+                     * BUG-786: route through the SHARED peel so a pointer cast is
+                     * peeled here too. This site had its own copy of the intrinsic
+                     * walk, so `*u32 p = (*u32)(&x)` never tainted `p` and every
+                     * downstream sink then saw a clean pointer. One helper, one
+                     * definition of "what launders a reference". */
+                    Node *init_unwrap = unwrap_ptr_launder(init);
                     if (init_unwrap && init_unwrap->kind == NODE_UNARY && init_unwrap->unary.op == TOK_AMP) {
                         addr_exprs[addr_count++] = init_unwrap;
                     }
@@ -11901,9 +12121,7 @@ static void check_stmt(Checker *c, Node *node) {
                             addr_exprs[addr_count++] = init;
                     }
                     if (init->kind == NODE_ORELSE && init->orelse.fallback) {
-                        Node *fb = init->orelse.fallback;
-                        while (fb && fb->kind == NODE_INTRINSIC && fb->intrinsic.arg_count > 0)
-                            fb = fb->intrinsic.args[fb->intrinsic.arg_count - 1];
+                        Node *fb = unwrap_ptr_launder(init->orelse.fallback);  /* BUG-786 */
                         if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP)
                             addr_exprs[addr_count++] = fb;
                     }
@@ -17450,7 +17668,148 @@ uint64_t checker_auto_guard_size(Checker *c, Node *node) {
 /* ================================================================
  * INTERRUPT SAFETY — track globals shared between ISR and regular code
  * ================================================================ */
+/* BUG-788 (2026-08-14): the RMW rule was SYNTACTIC — it keyed on the `+=` token.
+ *
+ * `counter = counter + 1` compiles to the identical load/add/store triple as
+ * `counter += 1`, and an interrupt landing between the load and the store loses
+ * the increment either way. Only the second form was rejected. Worse, the
+ * diagnostic for the rejected form reads "use explicit read/mask/write", so a
+ * user following the compiler's own advice within one statement lands exactly on
+ * the accepted form and keeps the bug. Measured on both sides (ISR body and main
+ * body): `+=` rejected, `= g + 1` accepted, identical emitted C.
+ *
+ * The fix asks the SEMANTIC question instead of the syntactic one: does this
+ * assignment's right-hand side READ the object being written? A plain `g = 5` or
+ * `g = other + 1` is a pure store and stays accepted, which keeps the sanctioned
+ * remedy available — decompose across statements (`u32 t = g; t += 1; g = t;`),
+ * where the non-atomicity is visible at the use site, or use `@atomic_*`.
+ *
+ * Root-ident granularity, matching the compound path it joins (`g_state.flags |=`
+ * already tracks root `g_state`). The scan is a partial walk: an unlisted node
+ * kind makes no claim, so it can only miss, never invent a rejection. */
+/* if/else-chain form, NOT a switch — a partial walk with a `default:` would trip
+ * the walker-default audit, and the sibling partial walkers in this file
+ * (node_forwards_param_to_spawn, record_isr_returned_funcname) use this shape for
+ * exactly that reason. */
+static bool expr_reads_ident(Node *e, const char *name, uint32_t name_len, int depth) {
+    if (!e || depth > 16) return false;
+    if (e->kind == NODE_IDENT)
+        return e->ident.name_len == name_len &&
+               memcmp(e->ident.name, name, name_len) == 0;
+    if (e->kind == NODE_BINARY)
+        return expr_reads_ident(e->binary.left, name, name_len, depth + 1) ||
+               expr_reads_ident(e->binary.right, name, name_len, depth + 1);
+    if (e->kind == NODE_UNARY)
+        return expr_reads_ident(e->unary.operand, name, name_len, depth + 1);
+    if (e->kind == NODE_FIELD)
+        return expr_reads_ident(e->field.object, name, name_len, depth + 1);
+    if (e->kind == NODE_INDEX)
+        return expr_reads_ident(e->index_expr.object, name, name_len, depth + 1) ||
+               expr_reads_ident(e->index_expr.index, name, name_len, depth + 1);
+    if (e->kind == NODE_TYPECAST)
+        return expr_reads_ident(e->typecast.expr, name, name_len, depth + 1);
+    if (e->kind == NODE_SLICE)
+        return expr_reads_ident(e->slice.object, name, name_len, depth + 1) ||
+               expr_reads_ident(e->slice.start, name, name_len, depth + 1) ||
+               expr_reads_ident(e->slice.end, name, name_len, depth + 1);
+    if (e->kind == NODE_ORELSE)
+        return expr_reads_ident(e->orelse.expr, name, name_len, depth + 1) ||
+               expr_reads_ident(e->orelse.fallback, name, name_len, depth + 1);
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (expr_reads_ident(e->intrinsic.args[i], name, name_len, depth + 1)) return true;
+        return false;
+    }
+    if (e->kind == NODE_CALL) {
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (expr_reads_ident(e->call.args[i], name, name_len, depth + 1)) return true;
+        return false;
+    }
+    return false;   /* partial walk: no claim -> never a new rejection */
+}
+
+/* Is this assignment a single-statement read-modify-write of `root`? True for a
+ * compound assign (`+=`, `|=`, ...) and for a plain `=` whose RHS reads `root`. */
+static bool assign_is_rmw_of_root(Node *assign, Node *root) {
+    if (!assign || !root || root->kind != NODE_IDENT) return false;
+    if (assign->assign.op != TOK_EQ) return true;
+    return expr_reads_ident(assign->assign.value, root->ident.name,
+                            (uint32_t)root->ident.name_len, 0);
+}
+
+/* BUG-787 (2026-08-14): follow a GLOBAL ALIAS to the object it designates.
+ *
+ * THE HOLE. `check_interrupt_safety` matches globals BY NAME. An ISR that only
+ * ever names an alias therefore never marks the pointee, and the pointee is
+ * emitted NON-VOLATILE while an ISR writes it:
+ *
+ *     u32 counter;                       // emitted `uint32_t counter = 0;`
+ *     *u32 gp = &counter;
+ *     interrupt USART1 { *gp += 1; }     // ISR writes it ...
+ *     u32 main() { return counter; }     // ... main reads it, un-volatile
+ *
+ * Measured: no diagnostic, and `counter` is emitted without `volatile`. GCC -O2
+ * is then free to hoist main's read out of a loop — the canonical firmware
+ * "polling loop never sees the flag" hang. Nothing traps; on bare metal there is
+ * no symptom but the hang.
+ *
+ * WHY THIS IS TRACTABLE WITHOUT POINTS-TO. The general question (what does an
+ * arbitrary pointer designate?) is whole-program analysis, which the architecture
+ * bans. But a GLOBAL whose own declaration initialiser is `&other_global` (or a
+ * slice of a global array) is a SYNTACTIC binding readable from the declaration —
+ * the same resolution `record_isr_funcname_binding` already performs on a global
+ * funcptr's initialiser. Resolve only that; anything else keeps today's behaviour.
+ *
+ * Placed inside track_isr_global rather than at the recording sites so BOTH sites
+ * (ISR-side and main-side) and both flavours (plain access and compound RMW)
+ * inherit it from one definition — the multi-site discipline.
+ *
+ * NOT covered: a global pointer REASSIGNED at runtime (`gp = &other;`). The
+ * initialiser is then not the whole story, so nothing is claimed. */
+static void track_isr_global_record(Checker *c, const char *name, uint32_t name_len,
+                                    bool is_compound);
+
+static void track_isr_global_alias(Checker *c, const char *name, uint32_t name_len,
+                                   bool is_compound, int depth) {
+    if (depth > 4) return;                       /* cycle / chain guard */
+    Symbol *s = scope_lookup(c->global_scope, name, name_len);
+    if (!s || s->is_function || !s->func_node) return;
+    if (s->func_node->kind != NODE_GLOBAL_VAR) return;
+    Node *init = s->func_node->var_decl.init;
+    if (!init) return;
+    /* only a REFERENCE-carrying global can alias another object */
+    Type *st = s->type ? type_unwrap_distinct(s->type) : NULL;
+    TypeKind sk = type_dispatch_kind(st);
+    if (sk != TYPE_POINTER && sk != TYPE_SLICE && sk != TYPE_OPAQUE) return;
+
+    Node *r = unwrap_ptr_launder(init);
+    if (r && r->kind == NODE_UNARY && r->unary.op == TOK_AMP) r = r->unary.operand;
+    if (r && r->kind == NODE_SLICE) r = r->slice.object;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else r = r->index_expr.object;
+    }
+    if (!r || r->kind != NODE_IDENT) return;
+    if (r->ident.name_len == name_len &&
+        memcmp(r->ident.name, name, name_len) == 0) return;   /* self */
+    Symbol *ps = scope_lookup(c->global_scope, r->ident.name,
+                              (uint32_t)r->ident.name_len);
+    if (!ps || ps->is_function) return;
+    /* record the pointee, then keep following the chain. Calls the RECORDER, not
+     * the public entry, so a cyclic pair of aliases terminates on `depth` rather
+     * than bouncing between the two functions. */
+    track_isr_global_record(c, r->ident.name, (uint32_t)r->ident.name_len, is_compound);
+    track_isr_global_alias(c, r->ident.name, (uint32_t)r->ident.name_len,
+                           is_compound, depth + 1);
+}
+
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound) {
+    track_isr_global_record(c, name, name_len, is_compound);
+    track_isr_global_alias(c, name, name_len, is_compound, 0);
+}
+
+static void track_isr_global_record(Checker *c, const char *name, uint32_t name_len,
+                                    bool is_compound) {
     /* find existing entry */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
@@ -17575,7 +17934,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         return;
     }
     case NODE_ASSIGN: {
-        if (node->assign.op != TOK_EQ) {
+        {
             Node *r = node->assign.target;
             while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
                         (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
@@ -17583,7 +17942,8 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                 else if (r->kind == NODE_INDEX) r = r->index_expr.object;
                 else r = r->unary.operand;
             }
-            if (r && r->kind == NODE_IDENT) {
+            /* BUG-788: `g = g + 1` is the same RMW as `g += 1` */
+            if (r && r->kind == NODE_IDENT && assign_is_rmw_of_root(node, r)) {
                 Symbol *gs = scope_lookup(c->global_scope, r->ident.name,
                                           (uint32_t)r->ident.name_len);
                 if (gs && !gs->is_function)
@@ -17609,8 +17969,13 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
             Symbol *cs = scope_lookup(c->global_scope,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+                /* BUG-785: the callee's body names its PARAM, not the global, so
+                 * the descent above records the access but loses the RMW fact.
+                 * Substitute the actual arguments here. */
+                track_rmw_through_call_args(c, node, cs);
+            }
             /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
              * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }` — the canonical
              * bare-metal ISR-dispatch idiom. The callee IDENT resolves to a global
@@ -17981,9 +18346,14 @@ static void check_interrupt_safety(Checker *c) {
         } else if (g->compound_in_isr || g->compound_in_func) {
             /* volatile but compound assignment — race condition */
             checker_error(c, sym->line,
-                "volatile global '%.*s' has compound assignment (+=, |=, etc.) "
-                "shared between interrupt and main code — "
-                "read-modify-write is not atomic, use explicit read/mask/write",
+                "volatile global '%.*s' is read-modify-written in a single "
+                "statement (`%.*s += ...` or `%.*s = %.*s ...`) and is shared "
+                "between interrupt and main code — the load/modify/store is not "
+                "atomic, so an interrupt between the load and the store loses the "
+                "update. Use @atomic_* (e.g. @atomic_add(&%.*s, 1)), or read into "
+                "a local, modify it, and store it back in separate statements",
+                (int)g->name_len, g->name, (int)g->name_len, g->name,
+                (int)g->name_len, g->name, (int)g->name_len, g->name,
                 (int)g->name_len, g->name);
         } else if (!volatile_global_exempt_from_race_check(c, sym)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and

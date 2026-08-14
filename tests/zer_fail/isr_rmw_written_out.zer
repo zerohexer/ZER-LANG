@@ -1,0 +1,7 @@
+// expect-error: read-modify-written in a single statement
+// BUG-788: `g = g + 1` is the same load/add/store as `g += 1`. Only the compound
+// token was checked, so following the old diagnostic's own advice ("use explicit
+// read/mask/write") within one statement kept the torn RMW.
+volatile u32 counter;
+interrupt USART1 { counter = counter + 1; }
+u32 main() { counter = counter + 1; return 0; }

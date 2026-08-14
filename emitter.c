@@ -515,6 +515,18 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
         if (with_braces) emit(e, " }\n"); else emit(e, " ");
         return;
     }
+    /* BUG-789: same reasoning one scope out — returning from inside a
+     * compiler-bracketed lock / @critical / @once skips its epilogue. Measured
+     * before the fix: the guard returned while holding the auto-lock, and a
+     * second thread blocked on that mutex forever (the test program hung; it
+     * emitted no diagnostic and never trapped). */
+    if (e->guard_scope_depth > 0) {
+        if (with_braces) emit(e, "{ ");
+        emit(e, "_zer_trap(\"out-of-bounds array access inside a lock/@critical/@once "
+                "scope — cannot return without skipping the unlock\", __FILE__, __LINE__);");
+        if (with_braces) emit(e, " }\n"); else emit(e, " ");
+        return;
+    }
     if (with_braces) emit(e, "{\n");
     emit_defers(e);
     if (e->in_async) {
@@ -10942,6 +10954,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->expr) {
             emit_shared_lock_mode(e, inst->expr, inst->src2_local != 0);
         }
+        e->guard_scope_depth++;      /* BUG-789 */
         break;
     }
 
@@ -10949,6 +10962,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->expr) {
             emit_shared_unlock(e, inst->expr);
         }
+        if (e->guard_scope_depth > 0) e->guard_scope_depth--;   /* BUG-789 */
         break;
     }
 
@@ -10972,6 +10986,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CRITICAL_BEGIN: {
+        e->guard_scope_depth++;      /* BUG-789 */
         emit_indent(e);
         emit(e, "{ /* @critical */\n");
         e->indent++;
@@ -11014,6 +11029,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CRITICAL_END: {
+        if (e->guard_scope_depth > 0) e->guard_scope_depth--;   /* BUG-789 */
         emit_indent(e);
         emit(e, "#if defined(__ARM_ARCH)\n");
         emit_indent(e);

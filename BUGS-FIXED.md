@@ -5,6 +5,164 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-14 — Audit sweep: 5 accept-unsafe / silent-miscompile holes (BUG-785..789)
+
+Broad audit. Every finding below was reproduced live on main BEFORE any edit, and each
+"accepted" verdict was taken from the DIAGNOSTIC, never the exit code (`zerc -o out.c`
+returns 0 even on checker errors). Three are proven by an actual run — two by ASan, one by
+a hang.
+
+---
+
+### BUG-786 — a pointer CAST laundered a stack pointer past the escape analysis (CRITICAL, accept-unsafe)
+
+**Symptom.** Wrapping an escaping pointer in an identity C-style cast made the compiler
+forget it was frame-bound:
+
+```zer
+?*u32 g = null;
+void f() { u32 x = 5; *u32 p = (*u32)(&x); g = p; }   // ACCEPTED
+void f() { u32 x = 5; *u32 p = &x;         g = p; }   // correctly rejected
+```
+
+The cast is a no-op the emitter elides, so both forms compile to identical C. ASan on the
+accepted form: **`stack-use-after-return`**. Direct forms (`g = (*u32)(&x)`,
+`gb.p = (*u32)(&x)`, `return (*u32)(&x)`, `(*opaque)(&x)`) were accepted at their sinks too.
+
+**Root cause — one missing form in a SHARED predicate, plus four hand-rolled copies of it.**
+`unwrap_ptr_launder` (the peel the escape sinks share) walked only `NODE_INTRINSIC`. So
+`@ptrcast`/`@pun`/`@container`/`@cstr` were peeled and `(*T)expr` was not — even though the
+same file already peels `NODE_TYPECAST` in its `nonkeep_root_param` walk. Worse, FOUR other
+sites had their own copies of the peel (the var-decl `&local` detection, the orelse fallback,
+the struct-literal field walk, the assign-to-global escape check, the keep-inference arg
+walk), so the missing form had to be added five times to be fixed once.
+
+**Fix.** `unwrap_ptr_launder` now peels a `NODE_TYPECAST` as well, and the five hand-rolled
+copies were DELETED in favour of calling it. One definition of "what launders a reference".
+Peeling is gated on the cast producing a REFERENCE (`tynode_is_reference_producing`:
+pointer / slice / opaque / funcptr) — a VALUE cast like `(u32)local_int` yields a fresh
+scalar and must not be treated as a view of the local, the same pointer-vs-scalar refinement
+that governs field reads.
+
+**Tests.** `tests/zer_fail/escape_cast_launder_{global,return,opaque}.zer`;
+`tests/zer/cast_launder_boundary_ok.zer` pins the boundary (value cast, `f32` cast, a
+pointer cast rooted at a GLOBAL, `*opaque` cast passed as an argument — all still accepted).
+
+---
+
+### BUG-789 — the bounds auto-guard returned from inside a lock, leaking it (HIGH, silent hang)
+
+**Symptom.** A `shared struct` write with a VRP-unprovable index compiled to:
+
+```c
+    pthread_mutex_lock(&g._zer_mtx);
+    if ((size_t)(i) >= 4u) {
+return; }                                  /* <-- skips the unlock */
+    _zer_t0 = g.a[i] = 777;
+    pthread_mutex_unlock(&g._zer_mtx);
+```
+
+Measured: the program compiles clean, emits no diagnostic, and **hangs forever** as soon as
+another thread touches the same shared struct (`timeout 6` -> exit 124). The auto-lock mutex
+is `PTHREAD_MUTEX_RECURSIVE`, so the same thread re-locking succeeds — which is exactly why
+this hides in single-threaded testing and only wedges a second thread.
+
+**Root cause.** `emit_safety_early_return` knows about four exit obligations (the defer
+stack, async state, the return value, `main` promotion) and nothing about a lock or an
+interrupt epilogue. The same guard sits inside `@critical` (where the `cli` is then never
+undone on ARM/AVR/RISC-V/bare-metal x86) and inside `@once` (leaving the flag stuck at
+"in progress" so every other caller spins forever).
+
+**Sharpest framing: the compiler broke a rule it enforces against the user.** A user `return`
+inside `@critical` is a hard compile error — *"interrupts would not be re-enabled"* — while
+the compiler inserted one there itself.
+
+**Fix.** `Emitter.guard_scope_depth` counts compiler-BRACKETED scopes (`IR_LOCK`/`IR_UNLOCK`,
+`IR_CRITICAL_BEGIN`/`END`); while it is nonzero the auto-guard TRAPS instead of returning.
+This is the established remedy — `guard_traps` already does exactly this inside a `defer`
+body — and it is consistent with the language's own ban on returning from these scopes. The
+OOB access is still prevented; the failure is now loud instead of a hang.
+
+**Test.** `tests/zer_trap/bounds_guard_in_shared_lock.zer` (hung before, traps now).
+
+**Deliberately NOT covered, recorded in limitations.md:** `@once` (its body is a block range
+reached by `goto`, not an emission-order bracket) and a user-written
+`@sem_acquire`/`@sem_release` pair (the compiler cannot see the pairing). Same defect class,
+both need block-range knowledge rather than a depth counter.
+
+---
+
+### BUG-788 — the ISR read-modify-write rule was SYNTACTIC (HIGH, silent bare-metal)
+
+**Symptom.** `counter += 1` in an ISR sharing a volatile global with main is rejected;
+`counter = counter + 1` — the identical load/add/store — was accepted. Same emitted C.
+
+**The part that makes it worse than an ordinary gap:** the diagnostic for the rejected form
+read *"use explicit read/mask/write"*. A user following the compiler's own advice within one
+statement lands exactly on the accepted form and keeps the torn RMW.
+
+**Fix.** `assign_is_rmw_of_root` asks the semantic question — does this assignment's RHS READ
+the object being written? — instead of testing the `+=` token. `g = 5` and `g = other + 1`
+stay accepted, so the sanctioned remedy (decompose across statements, where the
+non-atomicity is visible at the use site) still works. The diagnostic was rewritten to name
+both forms and to point at `@atomic_*` first.
+
+**Tests.** `tests/zer_fail/isr_rmw_written_out.zer`; boundary in
+`tests/zer/isr_rmw_boundary_ok.zer` (pure store, store-through-param, read of a DIFFERENT
+global).
+
+---
+
+### BUG-785 — the RMW fact was lost through a pointer PARAMETER (MEDIUM, silent bare-metal)
+
+**Symptom.** `interrupt TIM2 { bump(&counter); }` with `void bump(volatile *u32 p){ *p += 1; }`
+was accepted; the direct `interrupt TIM2 { counter += 1; }` is rejected. Inside the callee
+the compound-assign root is a PARAM, so neither recording site (the main-side NODE_ASSIGN
+handler, the ISR-side `record_isr_globals`) saw a global.
+
+**Fix.** A per-function summary + call-site substitution — `func_rmw_through_param(callee, i)`
+asks "does the callee read-modify-write through parameter i?", and `track_rmw_through_call_args`
+resolves the actual argument to the global it designates. Modelled exactly on
+`func_forwards_param_to_spawn`, the existing answer to the same shape on the spawn/funcptr
+axis. Transitive (a forwarded param is followed one more hop) and depth-bounded. **Both**
+recording sites call the one helper, so they cannot drift.
+
+**Tests.** `tests/zer_fail/isr_rmw_via_param.zer`, `isr_rmw_via_param_2hop.zer`.
+
+---
+
+### BUG-787 — an ISR reaching a global through a GLOBAL ALIAS escaped the volatile rule (HIGH, silent bare-metal)
+
+**Symptom.**
+
+```zer
+u32 counter;
+*u32 gp = &counter;
+interrupt USART1 { *gp += 1; }
+u32 main() { u32 v = counter; return v; }
+```
+
+No diagnostic, and `counter` is emitted **`uint32_t counter = 0;`** — not volatile — while an
+ISR writes it. GCC -O2 is then free to hoist main's read out of a loop: the canonical
+firmware "polling loop never sees the flag" hang. `check_interrupt_safety` matches globals
+BY NAME, and the ISR names only the alias.
+
+**Why this is fixable without the banned whole-program analysis.** A global whose own
+declaration initialiser is `&other_global` (or a slice of a global array) is a SYNTACTIC
+binding readable straight from the declaration — the same resolution
+`record_isr_funcname_binding` already performs on a global funcptr's initialiser.
+
+**Fix.** `track_isr_global_alias`, called from inside `track_isr_global` itself so BOTH
+recording sites and both flavours (plain access, compound RMW) inherit it from one
+definition. Chain-following with a depth guard; a cyclic pair of aliases terminates on
+depth. A global pointer REASSIGNED at runtime is not claimed.
+
+**Test.** `tests/zer_fail/isr_global_alias_volatile.zer`.
+
+---
+
+---
+
 ## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
 
 Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)

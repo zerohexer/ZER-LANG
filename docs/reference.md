@@ -23,7 +23,14 @@ u64 d = 123456789;
 
 **NOTES**
 - No implicit narrowing: `u8 x = 300;` is a compile error. Use `@truncate(u8, 300)` or `@saturate(u8, 300)`.
-- No implicit sign conversion: `u32 x = -1;` is a compile error. Use `@bitcast(u32, -1)`.
+- No implicit sign conversion **through a variable**: `i32 s = -1; u32 x = s;` is a compile error.
+  Use `@bitcast(u32, s)`.
+- **A negative LITERAL into a wide unsigned type is currently ACCEPTED and wraps**:
+  `u32 x = -1;` compiles and yields `4294967295` (measured). This is consistent with ZER's
+  "overflow wraps, always defined" arithmetic, but it is *not* symmetric with the
+  through-a-variable rule above, and `u8 b = -1;` IS rejected (by the narrowing rule, not the
+  sign rule). Write `@bitcast(u32, -1)` when you mean all-ones, so the intent is visible.
+  Tracked in `docs/limitations.md` as a candidate tightening.
 - Shift by >= width returns 0 (defined, not UB).
 
 **SEE ALSO**
@@ -274,6 +281,30 @@ buf[..5]                   // elements 0-4
 - String literals are `const [*]u8`, not `char*`.
 - Cannot be null. Use `?[*]T` for nullable.
 
+**CHARACTER LITERALS**
+
+A single-quoted character literal is a `u8`:
+
+```zer
+u32 main() {
+    u8 nl  = '\n';
+    u8 tab = '\t';
+    u8 cr  = '\r';
+    u8 bs  = '\\';
+    u8 nul = '\0';
+    u8 hex = '\x41';      // 'A'
+    u8 quo = '\'';
+    u8 dq  = '\"';
+    u8 a   = 'A';
+    if (a == 65 && hex == 65 && nl == 10) { return 0; }
+    return 1;
+}
+```
+
+The supported escapes are exactly `\n  \t  \r  \\  \"  \0  \xHH`, plus `\'` inside a
+character literal. Anything else is a compile error (*"invalid escape sequence"*). An empty
+literal `''` is rejected. The same escape set applies inside string literals.
+
 **SEE ALSO**
 T[N], *T, []T
 
@@ -446,7 +477,7 @@ All fields auto-zeroed.
 ```zer
 struct Task {
     u32 id;
-    [*]u8 name;
+    const [*]u8 name;      // `const` — a string literal is read-only
     u32 priority;
     ?*Task next;
 }
@@ -460,6 +491,10 @@ t.name = "worker";
 t.priority = 3;
 t.next = null;
 ```
+
+A field that will hold a **string literal** must be `const [*]u8`. A literal lives in
+read-only memory, so assigning one to a mutable `[*]u8` is rejected — *"string literal is
+read-only"* — which would otherwise let you write through it.
 
 **NOTES**
 - No semicolon after closing `}` (unlike C).
@@ -2147,6 +2182,221 @@ Per-architecture interrupt disable/enable.
 // interrupts re-enabled
 ```
 
+
+---
+
+### Systems / bare-metal intrinsics (CPU, MMU, TLB, cache, port I/O)
+
+**DESCRIPTION**
+The intrinsics below expose CPU and platform facilities directly. Every one is listed with
+its verified signature. Non-x86 targets get a no-op or a portable fallback where the
+operation has no equivalent, so a program using them still compiles for every supported
+`--target-arch`.
+
+**PRIVILEGE.** Entries marked *privileged* execute a CPL=0 instruction and will **SIGSEGV in
+user mode**. To verify that such code compiles without executing it, use the dead-branch
+pattern:
+
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @cpu_write_cr3(0x1000);      // compiled, never executed
+    }
+    return 0;
+}
+```
+
+**BUFFER ARGUMENTS.** Where a signature shows `&buf[0]`, pass the address of the first
+element of a `u8[N]` array (or any `*u8`). The buffer-size and alignment requirements are
+noted per entry and are **not** checked by the compiler — they are hardware contracts.
+
+### CPU state — inspection (non-privileged, safe to call directly)
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@cpu_id()` | `u32` | logical CPU / APIC id |
+| `@cpu_core_id()` | `u32` | physical core id |
+| `@cpu_num_cores()` | `u32` | logical core count |
+| `@cpu_current_mode()` | `u32` | privilege mode (0 = user) |
+| `@cpu_get_priv_level()` | `u32` | privilege level (0 = user, higher = privileged) |
+| `@cpu_cache_line_size()` | `u32` | L1 cache line size in bytes |
+| `@cpu_model_id()` | `u32` | CPUID leaf 1 EAX — family/model/stepping |
+| `@cpu_vendor_id()` | `u64` | CPUID leaf 0 EBX — first chars of the vendor string |
+| `@cpu_feature_bits()` | `u64` | CPUID leaf 1 ECX:EDX packed |
+| `@cpu_cpuid(leaf, subleaf)` | `u64` | CPUID — (EBX << 32) | EAX |
+| `@cpu_cpuid_ecx(leaf, subleaf)` | `u64` | CPUID — (EDX << 32) | ECX |
+| `@cpu_read_sp()` | `u64` | stack pointer |
+| `@cpu_read_tp()` | `u64` | thread pointer / TLS base |
+| `@cpu_get_pc()` | `u64` | current program counter |
+| `@cpu_read_flags()` | `u64` | RFLAGS / NZCV |
+| `@cpu_read_counter()` | `u64` | cycle counter (RDTSC / CNTVCT / rdcycle) |
+
+### CPU control — hints and barriers (non-privileged)
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@cpu_pause()` | `void` | spin-loop hint (PAUSE / YIELD) |
+| `@cpu_idle_hint()` | `void` | non-blocking low-power hint |
+| `@cpu_wfe()` | `void` | wait for event (ARM WFE) |
+| `@cpu_sev()` | `void` | send event (ARM SEV) |
+| `@cpu_breakpoint()` | `void` | debugger trap (INT3 / BKPT / ebreak) |
+| `@cpu_endbr()` | `void` | ENDBR64 landing pad for CET-IBT (a NOP without it) |
+| `@cpu_flush_pipeline()` | `void` | serialize the instruction pipeline |
+| `@cpu_umonitor(&buf[0])` | `void` | arm a user-mode address monitor (WAITPKG) |
+| `@cpu_umwait(hint, deadline)` | `void` | user-mode wait; hint 0 = C0.2, 1 = C0.1 |
+| `@cpu_monitor_addr(&buf[0])` | `void` | x86 MONITOR — arm an address watch |
+| `@cpu_mwait()` | `void` | x86 MWAIT — wait for a monitored write or interrupt |
+| `@cpu_rdrand()` | `?u64` | hardware RNG — **null on failure, must be unwrapped** |
+| `@cpu_rdseed()` | `?u64` | hardware entropy seed — **null on failure** |
+
+### CPU — privileged (kernel mode only; SIGSEGV in user mode)
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@cpu_disable_int()` | `void` | disable interrupts globally |
+| `@cpu_enable_int()` | `void` | enable interrupts globally |
+| `@cpu_wait_int()` | `void` | halt until the next interrupt |
+| `@cpu_save_int_state()` | `u64` | read the current interrupt-flag state |
+| `@cpu_restore_int_state(state)` | `void` | restore a saved interrupt-flag state |
+| `@cpu_eoi()` | `void` | end-of-interrupt to the LAPIC / GICv3 |
+| `@cpu_iret()` | `void` | interrupt return |
+| `@cpu_syscall()` | `void` | user -> kernel trap |
+| `@cpu_sysret()` | `void` | kernel -> user return |
+| `@cpu_hypercall()` | `void` | guest -> hypervisor |
+| `@cpu_sbi_call()` | `void` | RISC-V ecall to M-mode firmware |
+| `@cpu_smc_call()` | `void` | ARM TrustZone smc #0 |
+| `@cpu_set_priv_stack(sp)` | `void` | set the kernel stack for syscall entry |
+| `@cpu_reset()` | `void` | safe halt-forever fallback |
+| `@cpu_deep_sleep()` | `void` | enter the deepest idle state |
+| `@cpu_read_msr(msr)` | `u64` | RDMSR |
+| `@cpu_write_msr(msr, val)` | `void` | WRMSR |
+| `@cpu_read_cr0()` | `u64` | CR0 |
+| `@cpu_write_cr0(val)` | `void` | CR0 |
+| `@cpu_read_cr2()` | `u64` | CR2 — page-fault address |
+| `@cpu_read_cr3()` | `u64` | CR3 — page directory base |
+| `@cpu_write_cr3(val)` | `void` | CR3 — switches address space |
+| `@cpu_read_cr4()` | `u64` | CR4 — feature enables |
+| `@cpu_write_cr4(val)` | `void` | CR4 |
+| `@cpu_read_xcr0()` | `u64` | XSAVE feature mask |
+| `@cpu_write_xcr0(val)` | `void` | XSETBV |
+| `@cpu_read_dr(idx)` | `u64` | debug register DR0-DR3/DR6/DR7 |
+| `@cpu_write_dr(idx, val)` | `void` | debug register |
+| `@cpu_read_pmc(idx)` | `u64` | RDPMC (needs CR4.PCE for user access) |
+| `@cpu_read_fsbase()` | `u64` | FS base (needs CR4.FSGSBASE) |
+| `@cpu_write_fsbase(val)` | `void` | FS base |
+| `@cpu_read_gsbase()` | `u64` | GS base |
+| `@cpu_write_gsbase(val)` | `void` | GS base |
+| `@cpu_cache_disable()` | `void` | CR0.CD = 1 + WBINVD |
+| `@cpu_cache_enable()` | `void` | CR0.CD = 0 |
+
+### CPU — context and FPU save/restore
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@cpu_save_context(&buf[0])` | `void` | save callee-saved GPRs (>= 128-byte buffer) |
+| `@cpu_restore_context(&buf[0])` | `void` | restore callee-saved GPRs |
+| `@cpu_save_fpu(&buf[0])` | `void` | save SIMD/FP state (>= 512 bytes, 16-byte aligned) |
+| `@cpu_restore_fpu(&buf[0])` | `void` | restore SIMD/FP state |
+| `@cpu_xsave(&buf[0], mask)` | `void` | XSAVE extended state |
+| `@cpu_xrstor(&buf[0], mask)` | `void` | XRSTOR extended state |
+| `@cpu_fxsave(&buf[0])` | `void` | legacy FXSAVE (512 bytes, 16-byte aligned) |
+| `@cpu_fxrstor(&buf[0])` | `void` | legacy FXRSTOR |
+| `@cpu_fpu_init()` | `void` | FNINIT |
+
+### MMU / page tables (privileged)
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@mmu_enable()` | `void` | enable the MMU |
+| `@mmu_disable()` | `void` | disable the MMU |
+| `@mmu_is_enabled()` | `bool` | is the MMU on? |
+| `@mmu_set_pt(base)` | `void` | set the user page-table base |
+| `@mmu_get_pt()` | `u64` | read the user page-table base |
+| `@mmu_set_kernel_pt(base)` | `void` | set the kernel page-table base |
+| `@mmu_get_kernel_pt()` | `u64` | read the kernel page-table base |
+| `@mmu_get_fault_addr()` | `u64` | faulting address |
+| `@mmu_get_fault_status()` | `u64` | fault status register |
+| `@mmu_sync()` | `void` | page-table synchronization barrier |
+
+### TLB (privileged)
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@tlb_flush_all()` | `void` | flush the entire TLB |
+| `@tlb_flush_global()` | `void` | flush global entries too |
+| `@tlb_flush_addr(addr)` | `void` | flush one address |
+| `@tlb_flush_asid(asid)` | `void` | flush one address-space id |
+| `@tlb_flush_range(start, end)` | `void` | flush an address range |
+
+### Cache maintenance
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@cache_flush_line(&buf[0])` | `void` | flush one cache line (CLFLUSH) |
+| `@cache_flushopt(&buf[0])` | `void` | CLFLUSHOPT — ordered alternative |
+| `@cache_writeback(&buf[0])` | `void` | CLWB — write back without invalidating (NVDIMM) |
+| `@cache_zero_line(&buf[0])` | `void` | zero a cache line without reading it |
+| `@cache_flush_range(&buf[0], len)` | `void` | flush a range |
+| `@cache_clean_range(&buf[0], len)` | `void` | clean (write back) a range |
+| `@cache_invalidate_range(&buf[0], len)` | `void` | invalidate a range |
+| `@cache_invalidate_icache(&buf[0], len)` | `void` | invalidate the instruction cache — **takes 2 args** |
+
+### Port I/O (x86, privileged: CPL <= IOPL)
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@port_in8(port)` | `u8` | read a byte from an I/O port |
+| `@port_in16(port)` | `u16` | read a halfword |
+| `@port_in32(port)` | `u32` | read a word |
+| `@port_out8(port, val)` | `void` | write a byte |
+| `@port_out16(port, val)` | `void` | write a halfword |
+| `@port_out32(port, val)` | `void` | write a word |
+
+### Miscellaneous
+
+| intrinsic | returns | description |
+|---|---|---|
+| `@nt_store(&buf[0], val)` | `void` | non-temporal store — bypasses the cache (MOVNTI) |
+| `@barrier_dma()` | `void` | DMA-visibility barrier |
+| `@wait_on_address(&flag, expected)` | `void` | block until the word at the address changes |
+| `@config("key", default)` | `*same type as `default`*` | build-time configuration hook; currently evaluates to `default` |
+
+**EXAMPLE** (non-privileged only — this compiles *and runs* on a hosted target)
+
+```zer
+u32 main() {
+    u32 cores = @cpu_num_cores();
+    u32 line  = @cpu_cache_line_size();
+    u64 vend  = @cpu_vendor_id();
+    @cpu_pause();
+    if (cores >= 1 && line > 0 && vend != 0) { return 0; }
+    return 1;
+}
+```
+
+`@cpu_rdrand` / `@cpu_rdseed` return `?u64` because the hardware RNG is allowed to fail —
+the failure is in the type, so you must unwrap it and handle the failing path:
+
+```zer
+u32 main() {
+    u64 r = @cpu_rdrand() orelse { return 0; };   // no entropy this call
+    if (r == 0) { return 0; }
+    return 0;
+}
+```
+
+**NOTES**
+- `@cpu_rdrand` and `@cpu_rdseed` return `?u64`, not `u64` — the hardware RNG can fail, so
+  the failure is in the type. `u64 r = @cpu_rdrand();` is a type error.
+- `@cache_invalidate_icache` takes **two** arguments `(addr, size)`, unlike its
+  single-argument `cache_*_line` siblings.
+- `@config(key, default)` is a build-time configuration hook. It type-checks as its
+  `default` argument and currently always evaluates to it.
+
+**SEE ALSO**
+@critical, interrupt, mmio, asm
+
 ---
 
 ## HARDWARE SUPPORT
@@ -2795,9 +3045,11 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- `?:` — Ternary conditional. Use an `if` statement, or `orelse` for optionals.
+
+(`(T)x` C-style casts and `goto` ARE in ZER — see "(Type)expr — C-Style Cast" and the
+`goto` section. They were listed here in error.)
 
 ---
 
@@ -2849,6 +3101,12 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 4096       # error if estimated stack usage exceeds N bytes
+zerc source.zer --emit-ir                # print the IR to stdout and exit (debugging)
+zerc source.zer --release                # release build settings
+zerc source.zer --trace                  # compiler trace output (debugging)
+zerc source.zer --trace-calls            # trace call lowering (debugging)
+zerc source.zer --track-cptrs            # track C-interop pointers
 ```
 
 ### Pipeline
@@ -2866,8 +3124,23 @@ source.zer → Lexer → Parser → AST → Checker → ZER-CHECK → Emitter �
 shared struct Counter { u32 value; u32 total; }
 Counter g;
 g.value = 42;              // auto: lock → write → unlock
-g.total = g.value + 1;     // same lock scope (consecutive access grouped)
+g.total = g.value + 1;     // a SEPARATE lock scope — see below
 ```
+
+**Locking is PER-STATEMENT, and consecutive statements are NOT grouped.** The two lines
+above emit two independent `lock … unlock` pairs, and the lock IS RELEASED between them
+(verified in the emitted C). That is what makes cross-statement lock ordering
+deadlock-free — but it also means a multi-statement **check-then-act is not atomic**:
+
+```zer
+if (g.value == 0) {        // lock, read, UNLOCK  ← another thread can run here
+    g.value = 1;           // lock, write, unlock
+}
+```
+
+Another thread can observe and modify `g.value` between the test and the assignment. For an
+atomic read-modify-write use `@atomic_cas` / `@atomic_add` on a plain global, or restructure
+so the decision and the update happen in one statement.
 - Copying a **whole shared struct by value** (`Counter c = g;`, an assignment, a
   return, or a by-value argument) is a compile error — the embedded lock would be
   cloned, so the copy would lock a different lock than the original, and the
@@ -3099,8 +3372,7 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No garbage collector
 - No implicit narrowing or sign conversion
 - No undefined behavior
-- No `++` / `--`, no comma operator
-- No C-style casts
+- No `++` / `--`, no comma operator, no ternary `?:`
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

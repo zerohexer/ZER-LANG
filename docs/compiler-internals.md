@@ -12289,6 +12289,69 @@ that SPECIFIC phrase, with an inline note, precisely so nobody later loosens it 
 
 ---
 
+## The LAUNDER PEEL is one function — hand-rolled copies ARE the bug class (BUG-786, 2026-08-14)
+
+Every escape/keep decision starts by answering **"what object does this pointer expression
+designate?"**, i.e. by peeling the wrappers that hide a value's origin. That peel is
+`unwrap_ptr_launder` (checker.c). Until 2026-08-14 **five other sites had their own copy**
+of it — the var-decl `&local` detection, the orelse-fallback variant, the struct-literal
+field walk, the assign-to-global escape check, and the keep-inference argument walk.
+
+Every copy peeled `NODE_INTRINSIC` and none peeled `NODE_TYPECAST`. So an identity C-style
+cast — a no-op the emitter elides entirely — hid a stack pointer from the escape analysis
+at nine of ten sinks:
+
+```zer
+?*u32 g = null;
+void f() { u32 x = 5; *u32 p = (*u32)(&x); g = p; }   // was ACCEPTED
+void f() { u32 x = 5; *u32 p = &x;         g = p; }   // correctly rejected
+```
+
+ASan on the accepted form: `stack-use-after-return`. The same file had ALREADY been peeling
+`NODE_TYPECAST` in its `nonkeep_root_param` walk since long before — one walker knew about
+the node kind and the escape predicates did not.
+
+**Rules that follow:**
+
+1. **Never hand-roll the peel.** Call `unwrap_ptr_launder`. If it does not handle a form you
+   need, add the form THERE — that is the point of having it.
+2. **Peel a cast only when it produces a REFERENCE** (`tynode_is_reference_producing`:
+   pointer / slice / opaque / funcptr). `(u32)local_int` yields a fresh scalar that carries
+   no reference; treating it as a view of the local would over-reject ordinary arithmetic.
+   Identical in spirit to the pointer-vs-scalar rule for field reads (forming a reference
+   aliases; reading a value does not).
+3. **A peel that is a `while` over one node kind is a smell.** The shape
+   `while (v->kind == NODE_X) v = v->x.child;` silently makes every OTHER wrapper opaque. It
+   should be a loop over ALL launder forms, which is what `unwrap_ptr_launder` now is.
+
+Why the existing gates missed it: `tools/sink_matrix.sh` enumerates SINKS, and this was a
+missing *shape* that every sink shared — a cell that no row asked for. The escape-matrix
+axis to extend is the value-form axis, not the sink axis.
+
+## Compiler-inserted `return` vs a scope EPILOGUE (BUG-789, 2026-08-14)
+
+`emit_safety_early_return` (emitter.c) builds the early-out for a bounds auto-guard, the UAF
+field guard and the `@cstr` guard. It knows four exit obligations — the defer stack, async
+state, the return value, `main` promotion. It knew nothing about a **lock or interrupt
+epilogue**, so the guard emitted a bare `return;` between a `pthread_mutex_lock` and its
+`unlock`. Measured: compiles clean, no diagnostic, and the program **hangs forever** the
+moment a second thread touches the same `shared struct` (the auto-lock mutex is RECURSIVE,
+which is exactly why single-threaded testing never sees it).
+
+The sharpest way to state the defect: **the compiler broke a rule it enforces against the
+user.** A user `return` inside `@critical` is a hard compile error — *"interrupts would not
+be re-enabled"* — while the compiler inserted one there itself.
+
+Fix: `Emitter.guard_scope_depth`, incremented on `IR_LOCK` / `IR_CRITICAL_BEGIN` and
+decremented on their partners; while nonzero the guard TRAPS instead of returning. That is
+the established remedy — `guard_traps` already does exactly this inside a `defer` body — and
+it keeps the OOB access prevented while making the failure loud.
+
+**When adding ANY new compiler-inserted control flow, ask what epilogues lie between it and
+the function exit.** Two remain uncovered and are recorded in limitations.md: `@once` (a
+block RANGE reached by `goto`, so a depth counter cannot see it) and a user-written
+`@sem_acquire`/`@sem_release` pair (the compiler cannot see the pairing).
+
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 
 ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow

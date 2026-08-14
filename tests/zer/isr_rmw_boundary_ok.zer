@@ -1,0 +1,14 @@
+// BUG-787/788 boundary: the tightened RMW rule must NOT reject a pure STORE, and
+// the alias resolution must not fire on a global that aliases nothing.
+volatile u32 flag;
+volatile u32 other;
+u32 plain;
+void set_only(volatile *u32 p) { *p = 1; }      // store through a param, no read
+u32 main() {
+    flag = 1;                    // pure store — not an RMW
+    other = flag + 1;            // reads a DIFFERENT global — not an RMW of `other`
+    set_only(&flag);
+    plain = plain + 1;           // RMW, but no interrupt in this file — allowed
+    if (flag == 1 && other == 2) { return 0; }
+    return 1;
+}

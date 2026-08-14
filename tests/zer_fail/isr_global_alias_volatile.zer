@@ -1,0 +1,8 @@
+// expect-error: must be declared volatile
+// BUG-787: the ISR names only the alias `gp`, so `counter` was never marked as
+// ISR-accessed and was emitted NON-volatile while an ISR writes it — GCC -O2 may
+// then hoist main's read out of a loop (the classic firmware polling hang).
+u32 counter;
+*u32 gp = &counter;
+interrupt USART1 { *gp += 1; }
+u32 main() { u32 v = counter; return v; }

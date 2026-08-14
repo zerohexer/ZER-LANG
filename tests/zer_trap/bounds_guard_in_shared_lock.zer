@@ -1,0 +1,15 @@
+// BUG-789: an unprovable index inside a `shared struct` auto-locked statement.
+// The bounds auto-guard used to emit a bare `return;` BETWEEN the lock and the
+// unlock, leaking the mutex — the program compiled clean and then hung forever
+// when any other thread touched the same shared struct (measured: timeout, no
+// diagnostic, no trap). The language already bans a USER return in such a scope;
+// the guard now traps instead, which both prevents the OOB write and is loud.
+shared struct Cnt { u32 v; u32[4] a; }
+Cnt g;
+void leaker(u32 i) { g.a[i] = 777; }
+u32 main() {
+    volatile u32 vi = 9;
+    u32 i = vi;
+    leaker(i);
+    return 0;
+}

@@ -390,6 +390,163 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — 2026-08-14 audit sweep: what was found and NOT fixed
+
+Five holes from this sweep were fixed (BUG-785..789, see BUGS-FIXED.md). The items below
+were confirmed or reported in the same sweep and left open. Each states how strong the
+evidence is — **VERIFIED HERE** means reproduced directly with the command shown;
+**AGENT-REPORTED** means it came from a sub-audit and must be reproduced before acting on
+it (this ledger's own measure-first rule).
+
+### HIGH silent miscompile — bit-slice write with VARIABLE indices has NO validation (VERIFIED HERE)
+
+Literal indices are fully checked (reversed range, index beyond type width, over-width
+value — all compile errors). Those checks sit inside `eval_const_expr != CONST_EVAL_FAIL`
+guards, so a **variable** index gets none of them, and the emitted width expression
+`_zer_bh - _zer_bl + 1` is computed in `uint64_t` — so `hi < lo` UNDERFLOWS to a huge
+value, trips the `>= 64` guard, and yields an all-ones mask shifted left by `lo`.
+
+```zer
+u32 main() { u32 r = 0xFFFFFFFF; u32 hi = 3; u32 lo = 7; r[hi..lo] = 1; return r; }
+```
+
+Measured: **`r` becomes `0x000000FF`** — 24 unrelated bits cleared. The literal form
+`r[3..7] = 1` is a compile error (*"bit extraction high index (3) must be >= low index"*).
+
+**Why it matters on bare metal:** this is the table-driven register-field idiom
+(`reg[fld.hi..fld.lo] = value`, with `hi`/`lo` read from a field descriptor). A swapped or
+out-of-range descriptor silently clears the top of a control register — no diagnostic, no
+trap, and the resulting peripheral misconfiguration is indistinguishable from a hardware
+fault.
+
+**Fix sketch.** The READ path already handles this correctly (`int _zer_w` with a
+`(_zer_w <= 0) ? 0` guard — emitter.c ~2712 and ~9784). Mirror it on the WRITE path
+(emitter.c ~1786-1813, ~6295-6331, ~7159-7180): compute the width in a SIGNED int and emit
+a no-op when `w <= 0` or when `hi >= type_width`. Both the AST and IR write paths need it —
+the dual-dispatch rule applies.
+
+### MEDIUM — BUG-789 residual: `@once` and a user `@sem_acquire`/`@sem_release` pair
+
+BUG-789 made the bounds auto-guard TRAP instead of returning inside a compiler-BRACKETED
+scope, via a depth counter on `IR_LOCK`/`IR_UNLOCK` and `IR_CRITICAL_BEGIN`/`END`. Two
+siblings of the same class are NOT covered:
+
+- **`@once`** — its body is a block RANGE reached by `goto`, not an emission-order bracket,
+  so a depth counter cannot see it. A guard returning there leaves the once-flag stuck at
+  `1` ("in progress"), and every other caller spins forever in the loser-wait loop.
+- **`@sem_acquire` / `@sem_release`** — an ordinary user-written pair; the compiler cannot
+  see the pairing without dataflow.
+
+Both need block-range knowledge (which blocks lie inside the scope) rather than a counter.
+
+### MEDIUM — non-atomic RMW in an ISR through a GLOBAL POINTER variable (VERIFIED HERE, deliberately not fixed)
+
+BUG-785 closed the RMW-through-a-pointer-PARAMETER form; BUG-787 closed the global-alias
+form for the *volatile* rule. What remains: `*u32 gp = &counter;` with
+`interrupt { *gp += 1; }` records the compound against `gp`, not `counter`. BUG-787's alias
+resolution now marks `counter` as ISR-accessed (so the volatile rule fires), but the
+COMPOUND flag is still recorded on the alias name, so the torn-RMW rule does not. Closing
+it means propagating the compound fact across the alias edge — doable inside the same
+`track_isr_global_alias` resolution, but it needs its own over-rejection measurement first.
+A global pointer REASSIGNED at runtime stays out of scope (that is points-to, which the
+architecture bans).
+
+### MEDIUM (loud, not silent) — global-scope `@inttoptr` with a non-literal address emits invalid C (AGENT-REPORTED)
+
+```zer
+mmio 0x40020000..0x40020FFF;
+const u32 ADDR = 0x40020000;
+volatile *u32 reg = @inttoptr(*u32, ADDR);
+```
+
+The checker accepts it; the emitter emits the runtime range/alignment guard as a GCC
+statement-expression at FILE SCOPE → *"braced-group within expression allowed only inside a
+function"*. A build break rather than a silent gap, but it means the canonical firmware
+idiom (MMIO base as a named `const`, register pointer as a global) does not compile. Same
+class as the already-tracked H4 entry (`@bitcast`/`@truncate`-to-uN in a global
+initializer): reject it in the checker with an actionable message, or const-fold the
+address at global scope.
+
+### LOW (asymmetry, not unsafety) — a negative LITERAL into a wide unsigned type is accepted (VERIFIED HERE)
+
+`u32 x = -1;` compiles and yields `4294967295` (compiled and RAN to confirm); `u64 q = -1`
+likewise. But `u8 b = -1` IS rejected (by the NARROWING rule, not the sign rule), and
+`i32 s = -1; u32 x = s;` is correctly rejected. So the "no implicit sign conversion"
+guarantee holds through a variable but not for a literal.
+
+Not a memory-safety hole — the value is well-defined under ZER's "overflow wraps, always
+defined" model. It is an inconsistency, and reference.md asserted the strict rule, so the
+DOC was corrected to state measured behaviour (2026-08-14) rather than shipping an
+unmeasured change to the core coercion path late in a session.
+
+**Corpus cost of the tightening is already measured: ZERO** — the grep
+`\b(u8|u16|u32|u64|usize) +[A-Za-z_][A-Za-z_0-9]* *= *-[0-9]` over tests/zer, zer_fail,
+zer_trap, test_modules, rust_tests, zig_tests, examples and lib returns nothing. Note that
+`-1` parses as `NODE_UNARY(MINUS, INT_LIT)`, not `NODE_INT_LIT`, so `is_literal_compatible`
+never sees it; the fix belongs where the unary-minus result type meets the unsigned target.
+
+### LOW (test-harness) — `rust_tests/run_tests.sh` uses a hard `timeout 10`, so pthread tests flake under load (VERIFIED HERE)
+
+`rc_cond_004` (three `spawn`s + `@cond_wait`) FAILED once inside a full `make check` and
+then passed **0/40 standalone**, **0/25 via the runner's own `--run` path**, and **0/25 on
+a pristine `git archive HEAD` build** — i.e. not a regression, a load-induced timeout. The
+runner compiles, links and runs each test under `timeout 10` (rust_tests/run_tests.sh:49);
+during a full `make check` the machine is busy enough that a pthread test can exceed it.
+
+Why this matters beyond one test: a gate that fails randomly trains people to re-run until
+green, which is exactly how a REAL failure gets waved through. Same "a stale/unreliable
+gate is worse than none" principle this file states for matrices. Options: raise the
+timeout for the handful of concurrency tests, or report a timeout distinctly from a
+FAIL so a flake is never confused with a rejection.
+
+### Reference-doc defects that are really COMPILER over-rejections (AGENT-REPORTED — reproduce before acting)
+
+Found while auditing `docs/reference.md` against the compiler. Each is a documented idiom
+that does not compile, so the doc cannot honestly be "fixed" without first deciding whether
+the compiler or the prose is wrong.
+
+- **`?*T` bound to a local is treated as a leaked allocation.** `?*T found = find_task(1);`
+  → *"handle %0 (local 'found') allocated at line N but never freed"*, even when the callee
+  returns `&global`. Reported boundary: only the `orelse`-unwrap form
+  (`*T t = f() orelse { return 0; };`) is clean. This is the headline nullable-pointer
+  idiom, so the blast radius on new users is large.
+- **`defer` + a bodyless-extern destructor does not fire the destructor heuristic.**
+  `sensor_close(dev);` direct is clean; `defer sensor_close(dev);` reports a leak. `defer`
+  works for `p.free(h)` and `free(t)`, so the gap is specific to bodyless externs — i.e.
+  exactly the C-interop example in the docs.
+- **`Ring` has no working ISR↔main producer/consumer form.** Without `volatile` the ISR
+  sharing rule rejects it; with `volatile` the tearing rule rejects it (a Ring is not a
+  single-word scalar); and a Ring cannot be a struct field, so a `shared struct` wrapper is
+  unavailable. reference.md advertised Ring as "ISR-safe … used for UART RX/TX". Either
+  Ring needs an ISR-safe story or the claim has to go.
+- **`comptime if (const_bool)` is rejected** (`const u32` works, `const bool` does not) —
+  checker.c comments intend to support it.
+- **`comptime if` is statement-only**, so it cannot wrap declarations at file scope — the
+  `#ifdef` replacement story is narrower than documented.
+- **2C funcptr ARRAY (`*(u32,u32) -> u32 [4] ops;`) does not parse**, though the doc lists
+  it under "now inline in 2C". Every other 2C position works, and the 2A typedef array
+  works.
+
+### Emitter defects found alongside BUG-789 (AGENT-REPORTED — loud, not silent)
+
+- A doubly-call-indexed nested array (`gp.r[unk(i)].c[unk(j)] = v;`) emits C that GCC
+  rejects (a statement-expression yielding a pointer, then used with `.`).
+- `g = a[9..8];` (bit-slice on the ASSIGNMENT path) is misparsed as a slice-of-local and
+  rejected, while `u32 r = a[9..8];` (var-decl path) is a correct bit-slice. The same
+  var-decl-vs-assignment path split that produced the G3 uN bug.
+
+### Escape-analysis over-rejections found while fixing BUG-786 (AGENT-REPORTED)
+
+- A sub-slice of a HEAP allocation is rejected as stack-derived: with
+  `?[*]u32 m = alloc(u32, 4); if (m) |s| { g = s[0..2]; }` the diagnostic claims the pointer
+  "will dangle when function returns". The whole-slice (`g = s;`) and single-object forms
+  are correctly accepted, so only the interior/sub-slice form is affected.
+- `void take(*T p) { g = &p.w; }` is rejected while `void take(*T p) { g = p; }` is accepted
+  (keep is inferred and enforcement moves to the call site). `&p.w` has exactly `p`'s
+  lifetime, so the same keep inference should apply.
+
+---
+
 ## OPEN — concurrency sweep 2026-08-10: NO holes found; two doc/impl mismatches corrected
 
 Systematic probe of the concurrency surface after BUG-783. **No accept-unsafe hole found.**
@@ -3053,6 +3210,31 @@ See full entry near the bottom of this file ("`naked` attribute
 silently dropped on IR path (deferred 2026-05-02)") — kept in original
 location to preserve the more detailed analysis added in the
 2026-05-02 fix session.
+
+**Re-measured 2026-08-14 — the cost of honouring it is now KNOWN, and it is real.**
+The old deferral rested on "existing `tests/zer/asm_*.zer` rely on the implicit
+prologue/epilogue". Measured:
+
+- **GCC 13.3 on x86-64 DOES honour `__attribute__((naked))`** — it compiles without a
+  warning and emits no prologue (`objdump`: `endbr64`, the asm body, then `ud2`). So this
+  is not "the attribute is ignored on the host anyway"; emitting it changes host codegen.
+- **48 test files use `naked`, and at least 10 CALL their naked function** (`asm_syntax.zer`,
+  `asm_pointer_input.zer`, `asm_f4_mfence_compiles.zer`, `asm_z3_vrp_invalidate.zer`,
+  `asm_c8_clwb_classified.zer`, `asm_f7_bsr_nonzero_proven.zer`, `asm_f4_bsr_works.zer`,
+  `asm_f7_movaps_aligned.zer`, `asm_simd_register.zer`, `asm_avx512_register.zer`, …).
+  With real `naked` semantics each of those falls through to `ud2` and crashes at runtime,
+  because their asm bodies have no explicit `ret`.
+
+So honouring `naked` requires rewriting those tests to emit an architecture-specific
+return instruction, which makes them non-portable across `--target-arch` — that is the
+actual blocker, and it is a test-suite design problem, not a one-line emitter change.
+
+**Meanwhile the current behaviour violates this project's own rule** ("either handle it or
+reject it at compile time with a clear error — never silently produce wrong behaviour"): a
+user writing `naked` for a reset vector or a context-switch trampoline gets a function WITH
+a prologue and no diagnostic, which on real hardware corrupts the frame silently. The
+cheap interim step, if honouring it stays deferred, is to make `naked` a **diagnostic**
+(warning or error) so the dropped attribute is at least loud.
 
 ## ~~Codebase audit 2026-05-07 — 5 silent gaps closed~~ (FIXED 2026-05-07)
 

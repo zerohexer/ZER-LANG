@@ -209,6 +209,24 @@ typedef struct {
     int isr_global_count;
     int isr_global_capacity;
 
+    /* BUG-787: parameter->global binding stack for the ISR reachability walk.
+     * `interrupt { rmw(&g); }` with `void rmw(*u32 p) { *p += 1; }` performs a
+     * non-atomic read-modify-write on g, but the compound-assign fact is recorded
+     * against the ROOT IDENT ("p"), which is a parameter, not a global — so the
+     * ISR RMW rule saw nothing and the lost-update raced silently on bare metal.
+     * record_isr_globals pushes a frame per descended call so a compound assign
+     * rooted at a bound param resolves back to the caller's global. Entries chain
+     * (an arg that is itself a bound param binds to the same global), so an n-hop
+     * launder resolves too. */
+    struct IsrParamBind {
+        const char *pname;
+        uint32_t pname_len;
+        const char *gname;
+        uint32_t gname_len;
+    } *isr_binds;
+    int isr_bind_count;
+    int isr_bind_capacity;
+
     /* A6-full atomic-cell inclusion: plain (non-atomic) writes to scalar globals,
      * recorded during check; post-check flags any whose symbol got marked
      * is_atomic_cell (an `@atomic_*` target). Collect-then-check, like ISR. */
@@ -223,10 +241,15 @@ typedef struct {
      * global struct. One list, two flags (mirrors IsrGlobal): a (struct, field)
      * that is BOTH @atomic'd and plain-accessed in a concurrent context is a
      * mixed atomic/non-atomic race. */
+    /* BUG-786: keyed on the full ACCESS PATH (`g.i.n`, `garr[0]`, `g.n[0]`), not
+     * on a single field name — see atomic_cell_path_target. `wild` marks a cell
+     * whose path could not be resolved (a variable index): it may-aliases every
+     * path under the same root. */
     struct AtomicFieldEntry {
         struct Symbol *s;
-        const char *field;
-        uint32_t field_len;
+        const char *key;
+        uint32_t key_len;
+        bool wild;
         bool atomic_used;
         bool plain_used;
         int plain_line;

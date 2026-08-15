@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: has compound assignment
+// BUG-787 — n-hop launder. The parameter->global binding frames chain, so the
+// global is recovered however many helpers the RMW is buried under (an arg that is
+// itself a bound parameter binds to the same global).
+volatile u32 g_flags;
+
+void inner(volatile *u32 q) { *q |= 1; }
+void outer(volatile *u32 p) { inner(p); }
+
+interrupt IRQ0 { outer(&g_flags); }
+
+u32 main() {
+    u32 x = g_flags;
+    return x;
+}

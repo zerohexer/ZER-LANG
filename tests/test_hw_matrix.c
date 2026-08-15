@@ -107,11 +107,15 @@ typedef enum {
     HW_SPAWN_IN_ISR,        /* spawn inside interrupt handler */
     HW_ISR_GLOBAL_NONVOLATILE, /* non-volatile global shared interrupt+main */
     HW_ISR_COMPOUND_RMW,    /* volatile global compound-assign shared ISR+main */
+    HW_ISR_RMW_VIA_PARAM,   /* BUG-787: same RMW, laundered through a pointer param */
+    HW_ISR_RMW_VIA_PARAM_2HOP, /* BUG-787: ... two calls deep (binding frames chain) */
     /* POSITIVE — structurally-valid hardware access (must compile) */
     HW_MMIO_OK,             /* @inttoptr in range, aligned, volatile */
     HW_POOL_IN_ISR_OK,      /* pool.alloc() in interrupt (Pool is ISR-safe) */
     HW_ATOMIC_GLOBAL_OK,    /* @atomic_store(&g, 0) on a u32 global */
     HW_ISR_VOLATILE_OK,     /* volatile global shared ISR+main, plain assign */
+    HW_ISR_PLAIN_STORE_VIA_PARAM_OK, /* BUG-787 boundary: a plain STORE through a
+                                      * param is not an RMW — must stay accepted */
     HWSCEN_COUNT
 } HWScenario;
 
@@ -120,9 +124,10 @@ static int scenario_is_negative(HWScenario s) {
         case HW_MMIO_NO_DECL: case HW_MMIO_OOB: case HW_MMIO_MISALIGNED:
         case HW_VOLATILE_STRIP: case HW_SLAB_IN_ISR: case HW_SPAWN_IN_ISR:
         case HW_ISR_GLOBAL_NONVOLATILE: case HW_ISR_COMPOUND_RMW:
+        case HW_ISR_RMW_VIA_PARAM: case HW_ISR_RMW_VIA_PARAM_2HOP:
             return 1;
         case HW_MMIO_OK: case HW_POOL_IN_ISR_OK: case HW_ATOMIC_GLOBAL_OK:
-        case HW_ISR_VOLATILE_OK:
+        case HW_ISR_VOLATILE_OK: case HW_ISR_PLAIN_STORE_VIA_PARAM_OK:
             return 0;
         case HWSCEN_COUNT: break;
     }
@@ -139,6 +144,9 @@ static const char *scen_name(HWScenario s) {
         case HW_SPAWN_IN_ISR:           return "spawn-in-isr";
         case HW_ISR_GLOBAL_NONVOLATILE: return "isr-global-nonvolatile";
         case HW_ISR_COMPOUND_RMW:       return "isr-compound-rmw";
+        case HW_ISR_RMW_VIA_PARAM:      return "isr-rmw-via-param";
+        case HW_ISR_RMW_VIA_PARAM_2HOP: return "isr-rmw-via-param-2hop";
+        case HW_ISR_PLAIN_STORE_VIA_PARAM_OK: return "isr-plain-store-via-param-ok";
         case HW_MMIO_OK:                return "mmio-in-range-aligned";
         case HW_POOL_IN_ISR_OK:         return "pool-in-isr-ok";
         case HW_ATOMIC_GLOBAL_OK:       return "atomic-global-ok";
@@ -199,6 +207,28 @@ static void gen(HWScenario s, char *buf, size_t n) {
             snprintf(buf, n,
                 "volatile u32 g_cnt;\n"
                 "interrupt UART { g_cnt += 1; }\n"
+                "u32 main() { u32 x = g_cnt; return x; }\n");
+            break;
+        case HW_ISR_RMW_VIA_PARAM:
+            snprintf(buf, n,
+                "volatile u32 g_cnt;\n"
+                "void bump(volatile *u32 p) { *p += 1; }\n"
+                "interrupt UART { bump(&g_cnt); }\n"
+                "u32 main() { u32 x = g_cnt; return x; }\n");
+            break;
+        case HW_ISR_RMW_VIA_PARAM_2HOP:
+            snprintf(buf, n,
+                "volatile u32 g_cnt;\n"
+                "void inner(volatile *u32 q) { *q |= 1; }\n"
+                "void outer(volatile *u32 p) { inner(p); }\n"
+                "interrupt UART { outer(&g_cnt); }\n"
+                "u32 main() { u32 x = g_cnt; return x; }\n");
+            break;
+        case HW_ISR_PLAIN_STORE_VIA_PARAM_OK:
+            snprintf(buf, n,
+                "volatile u32 g_cnt;\n"
+                "void setv(volatile *u32 p) { *p = 5; }\n"
+                "interrupt UART { setv(&g_cnt); }\n"
                 "u32 main() { u32 x = g_cnt; return x; }\n");
             break;
         case HW_MMIO_OK:

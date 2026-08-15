@@ -221,7 +221,7 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
+    bool release_mode = false;   /* accepted, no effect — see the --release arm */
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -263,7 +263,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
-            release_mode = true;
+            /* Accepted for compatibility, but it has NO effect: the *opaque
+             * runtime tracking it used to disable (Level 3+4+5) is now
+             * unconditional for --run, deliberately — "compiled-in safety, not
+             * debug" (see the emitter.track_cptrs assignment below). Saying so
+             * beats silently ignoring the flag, which is how it read as
+             * "optimised build" for four releases. */
+            release_mode = true;   /* recorded only so -Wunused stays quiet */
+            (void)release_mode;
+            fprintf(stderr, "warning: --release has no effect — pointer-tracking "
+                    "safety is always compiled in; use -o out.c + your own gcc "
+                    "flags for a custom build\n");
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             zer_target_ptr_bits = atoi(argv[++i]);
             target_bits_explicit = true;
@@ -331,7 +341,22 @@ int main(int argc, char **argv) {
                 zer_target_arch_id = 3;
                 zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
                 zer_target_features = 0;  /* clear x86 baseline */
+            } else {
+                /* 2026-08-15: an unrecognised arch used to be SILENTLY IGNORED,
+                 * so `--target-arch=arm64` (the natural typo for aarch64) built
+                 * an x86_64 binary while the user believed they had
+                 * cross-compiled. Mirror --probe-mode: fail loudly. */
+                fprintf(stderr, "error: unknown --target-arch '%s' "
+                        "(use x86_64, aarch64, or riscv64)\n", a);
+                return 1;
             }
+        } else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            /* 2026-08-15: unknown long options were silently ignored. In a
+             * safety compiler that is a real hazard, not a nicety: a mistyped
+             * `--stack-limt 1024` or `--target-bits 32` left the option OFF
+             * while the user believed a check was enabled. Unknown = error. */
+            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            return 1;
         }
     }
 
@@ -402,9 +427,8 @@ int main(int argc, char **argv) {
         use_temp_c = true;
     }
 
-    /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    /* for temp .c mode, set up the exe path (the temp .c name is built later,
+     * next to its use — the two buffers that used to be declared here were dead). */
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

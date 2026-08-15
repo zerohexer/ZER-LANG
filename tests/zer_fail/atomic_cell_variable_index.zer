@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'garr' in a concurrent context
+// BUG-786 — an UNRESOLVABLE path (variable index) is recorded `wild`, which
+// may-aliases every cell under the same root. That is the sound direction: a
+// form the key builder cannot resolve must over-approximate the alias set, never
+// silently match nothing.
+u32[4] garr;
+volatile u32 vi = 1;
+
+void worker() { u32 o = @atomic_add(&garr[0], 1); }
+
+u32 main() {
+    spawn worker();
+    u32 i = vi;
+    garr[i] = 5;    // could be garr[0] — must be treated as the same cell
+    return 0;
+}

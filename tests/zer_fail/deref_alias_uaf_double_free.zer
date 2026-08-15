@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: dereferencing a pointer-to-pointer
+// expect-error: obtained by dereferencing a pointer to a pointer
 // Heap facet of HOLE-A4. `*Node k = *pp;` bound an alias the analyzer could not
 // follow, so free(k) never marked n's allocation FREED. MEASURED LIVE before the
 // fix: this program RAN and returned 7 — it read n.v after free(k) (stale value)

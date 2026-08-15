@@ -1,0 +1,104 @@
+// Compile+run coverage for the SYSTEM / PRIVILEGED intrinsic surface — the 79
+// intrinsics (MMU / TLB / cache maintenance / port I/O / MSR-CR-XCR0 / CPUID /
+// power / privileged transitions) that the compiler implements and that had NO
+// user-facing documentation until 2026-08-15. This file is the executable proof
+// that every signature in docs/reference.md "SYSTEM & PRIVILEGED INTRINSICS"
+// actually compiles.
+//
+// Privileged instructions live in a dead branch (the `volatile never == 42`
+// pattern from CLAUDE.md): they must be COMPILED, never EXECUTED, on a hosted
+// host or they SIGSEGV/SIGILL. The non-privileged half runs for real.
+volatile u32 never = 0;
+u8[512] fpu_buf;
+u8[128] ctx_buf;
+
+u32 main() {
+    if (never == 42) {
+        // --- MMU (D-Alpha-5) ---
+        @mmu_enable(); @mmu_disable(); @mmu_sync();
+        u64 pt = @mmu_get_pt();
+        u64 kpt = @mmu_get_kernel_pt();
+        @mmu_set_pt(pt); @mmu_set_kernel_pt(kpt);
+        u64 fa = @mmu_get_fault_addr();
+        u64 fs = @mmu_get_fault_status();
+        bool on = @mmu_is_enabled();
+        // --- TLB (D-Alpha-6) ---
+        @tlb_flush_all(); @tlb_flush_global();
+        @tlb_flush_asid(1); @tlb_flush_addr(fa);
+        @tlb_flush_range(0, 4096);
+        // --- cache maintenance (D-Alpha-6/13) ---
+        @cache_flush_range(&fpu_buf[0], 64);
+        @cache_clean_range(&fpu_buf[0], 64);
+        @cache_invalidate_range(&fpu_buf[0], 64);
+        @cache_invalidate_icache(&fpu_buf[0], 64);
+        @cache_flush_line(&fpu_buf[0]);
+        @cache_zero_line(&fpu_buf[0]);
+        @cache_flushopt(&fpu_buf[0]);
+        @cache_writeback(&fpu_buf[0]);
+        @nt_store(&fpu_buf[0], 7);
+        // --- MSR / CR / XCR0 (D-Alpha-9) ---
+        u64 m = @cpu_read_msr(0x1B);
+        @cpu_write_msr(0x1B, m);
+        u64 c0 = @cpu_read_cr0(); @cpu_write_cr0(c0);
+        u64 c2 = @cpu_read_cr2();
+        u64 c3 = @cpu_read_cr3(); @cpu_write_cr3(c3);
+        u64 c4 = @cpu_read_cr4(); @cpu_write_cr4(c4);
+        u64 xc = @cpu_read_xcr0(); @cpu_write_xcr0(xc);
+        // --- port I/O (D-Alpha-13) ---
+        u8 b = @port_in8(0x60);
+        u16 w = @port_in16(0x60);
+        u32 d = @port_in32(0x60);
+        @port_out8(0x60, b); @port_out16(0x60, w); @port_out32(0x60, d);
+        // --- extended state / debug regs / firmware (D-Alpha-13) ---
+        @cpu_xsave(&fpu_buf[0], 7); @cpu_xrstor(&fpu_buf[0], 7);
+        u64 dr = @cpu_read_dr(0); @cpu_write_dr(0, dr);
+        @cpu_sbi_call(); @cpu_smc_call();
+        u64 pmc = @cpu_read_pmc(0);
+        u64 fsb = @cpu_read_fsbase(); @cpu_write_fsbase(fsb);
+        u64 gsb = @cpu_read_gsbase(); @cpu_write_gsbase(gsb);
+        // --- privileged transitions (D-Alpha-12) ---
+        @cpu_syscall(); @cpu_sysret(); @cpu_iret(); @cpu_hypercall();
+        @cpu_set_priv_stack(0);
+        // --- power (D-Alpha-11) ---
+        @cpu_reset(); @cpu_deep_sleep();
+        @cpu_monitor_addr(&fpu_buf[0]); @cpu_mwait();
+        // --- misc (D-Alpha-14) ---
+        @cpu_eoi(); @cpu_cache_disable(); @cpu_cache_enable();
+        @cpu_fxsave(&fpu_buf[0]); @cpu_fxrstor(&fpu_buf[0]); @cpu_fpu_init();
+        @cpu_umonitor(&fpu_buf[0]); @cpu_umwait(0, 0);
+        @cpu_save_context(&ctx_buf[0]); @cpu_restore_context(&ctx_buf[0]);
+        if (pt + kpt + fa + fs + m + c0 + c2 + c3 + c4 + xc + dr + pmc + fsb + gsb + (u64)b + (u64)w + (u64)d > 0) { return 1; }
+        if (on) { return 2; }
+    }
+    // --- non-privileged: safe to actually run ---
+    u32 lvl = @cpu_get_priv_level();
+    u32 core = @cpu_id();
+    u32 cid = @cpu_core_id();
+    u32 mode = @cpu_current_mode();
+    u32 cls = @cpu_cache_line_size();
+    u32 nc = @cpu_num_cores();
+    u64 sp = @cpu_read_sp();
+    u64 tp = @cpu_read_tp();
+    u64 fl = @cpu_read_flags();
+    u64 vid = @cpu_vendor_id();
+    u64 feat = @cpu_feature_bits();
+    u32 mdl = @cpu_model_id();
+    u64 cyc = @cpu_read_counter();
+    u64 pc = @cpu_get_pc();
+    u64 lo = @cpu_cpuid(0, 0);
+    u64 hi = @cpu_cpuid_ecx(1, 0);
+    @cpu_pause(); @cpu_wfe(); @cpu_sev(); @cpu_flush_pipeline(); @cpu_idle_hint();
+    @cpu_endbr();
+    @barrier_dma();
+    ?u64 r = @cpu_rdrand();
+    ?u64 s = @cpu_rdseed();
+    u64 rv = r orelse 0;
+    u64 sv = s orelse 0;
+    if (cls == 0) { return 3; }
+    if (nc == 0) { return 4; }
+    if (sp == 0) { return 5; }
+    if (lvl + core + cid + mode == 999999) { return 6; }
+    if (mdl == 1 && cls == 3) { return 8; }
+    if (tp + fl + vid + feat + cyc + pc + lo + hi + rv + sv == 12345) { return 7; }
+    return 0;
+}

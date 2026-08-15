@@ -10,9 +10,10 @@
 #include "src/safety/arith_rules.h"        /* zer_div_valid/narrowing_valid/literal_fits — M */
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
+#include "src/safety/move_rules.h"         /* zer_type_kind_is_move_struct / _should_track — B */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
-#include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
-#include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
+#include "src/safety/comptime_rules.h"     /* zer_comptime_* / _static_assert / _expr_nesting — R */
+#include "src/safety/cast_rules.h"         /* zer_conversion_safe / _bitcast_* / _saturate / _ptrtoint — J-ext */
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include "src/safety/asm_instruction_table.h" /* zer_asm_instruction_info — F4 per-instruction safety dispatch */
@@ -97,6 +98,45 @@ static bool type_carries_handle(Type *t, int depth) {
     if (k == TYPE_UNION) {
         for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
             if (type_carries_handle(u->union_type.variants[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Does this type CARRY move-struct OWNERSHIP at any nesting depth?
+ *
+ * Third sibling of type_carries_data_pointer / type_carries_handle, same
+ * "wrapper hides the inner kind" recursion. The question is distinct from both:
+ * neither a frame reference nor an allocation index, but a UNIQUE RESOURCE whose
+ * consume must happen exactly once. Used by deref_identity_launder — copying a
+ * move-carrying value OUT of a dereference produces a second owner the analyzer
+ * cannot connect back to the first.
+ *
+ * The leaf test delegates to the VST-verified pair in src/safety/move_rules.c
+ * (zer_type_kind_is_move_struct + zer_move_should_track) so the "what counts as
+ * a move type" decision has exactly one definition. */
+static bool type_carries_move(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_move(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)
+        return type_carries_move(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        bool direct = zer_type_kind_is_move_struct((int)TYPE_STRUCT,
+                                                  u->struct_type.is_move ? 1 : 0) != 0;
+        bool nested = false;
+        for (uint32_t i = 0; i < u->struct_type.field_count && !nested; i++)
+            nested = type_carries_move(u->struct_type.fields[i].type, depth + 1);
+        return zer_move_should_track(direct ? 1 : 0, nested ? 1 : 0) != 0;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_move(u->union_type.variants[i].type, depth + 1))
                 return true;
         }
         return false;
@@ -525,17 +565,19 @@ static void ensure_func_props(Checker *c, Symbol *fn);
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth);
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
-static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
-                                       const char **out_field, uint32_t *out_flen);
-static void track_atomic_field(Checker *c, Symbol *s, const char *field,
-                               uint32_t flen, bool is_atomic, int line);
+static bool atomic_cell_path_target(Checker *c, Node *e, Symbol **out_s,
+                                    const char **out_key, uint32_t *out_klen,
+                                    bool *out_wild);
+static void track_atomic_field(Checker *c, Symbol *s, const char *key,
+                               uint32_t klen, bool wild, bool is_atomic, int line);
+static void track_atomic_path(Checker *c, Node *e, bool is_atomic, int line);
 static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
                                       const char *cond_root, uint32_t cond_root_len);
 static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len);
 
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
- * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+ * Returns true and sets out_min / out_max if a bounded range was derived. */
 /* Refactor 1: unified VRP range invalidation for assignments.
  * Handles both simple ident keys and compound keys (s.x).
  * For TOK_EQ: tries literal, derive_expr_range, call return range.
@@ -1625,7 +1667,7 @@ static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
 }
 
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
- * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
+ * through address-of, deref, field, index, slice, orelse, intrinsic or cast. If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
  * callee position makes the caller param escape too). Else -1. */
 static int keep_arg_caller_root(Checker *c, Node *arg) {
@@ -1758,36 +1800,62 @@ static Node *unwrap_ptr_launder(Node *v) {
     return v;
 }
 
-/* A POINTER-typed value produced by dereferencing a pointer-to-pointer creates an
- * alias the analyzer cannot follow: `**Node pp = &n; *Node k = *pp;` makes k alias
- * n's allocation, but resolving that needs points-to over pp, which the per-file +
- * summaries model deliberately does not have. Measured live 2026-08-10: the
- * reproducer RAN, read freed memory and double-freed.
+/* THE DEREFERENCE IDENTITY BOUNDARY (BUG-785, generalising BUG-781/782).
  *
- * Level-A stance — when the analyzer cannot PROVE what an alias refers to, reject.
- * Over-rejection is the accepted cost; the restructure is a teachable discipline
- * ("alias the pointer directly so the compiler can follow it"), which is the bar
- * CLAUDE.md sets for an acceptable false positive.
+ * Reading a value OUT of a pointer dereference produces a copy the analyzer
+ * cannot connect back to the original allocation: in the IR `*p` lowers to a
+ * UNOP temp that carries no handle, so whatever the copy is bound to inherits
+ * NOTHING. Three value kinds lose a safety-relevant identity that way:
  *
- * Cost measured before shipping: ZERO instances in the whole corpus (tests/zer,
- * zer_fail, test_modules, rust_tests, zig_tests). Every deref-init var-decl there
- * is a SCALAR copy (`u32 v = *p`) or a Handle/move-struct, which are tracked and
- * are NOT matched here — the gate requires the RESULT to be pointer-typed. */
-static bool deref_ptr_launder(Checker *c, Node *e) {
+ *   - POINTER / SLICE / OPAQUE  — the ALIAS is lost: `*Node k = *pp; free(n);`
+ *     leaves k dangling with no diagnostic (BUG-781, measured: ran, read freed
+ *     memory, then double-freed).
+ *   - HANDLE                    — the ALLOCATION is lost: `Handle(T) k = *p;
+ *     pool.free(k);` in a callee is not recorded in its frees-param summary, so
+ *     the caller's own free is an unflagged DOUBLE FREE.
+ *   - move-carrying             — the OWNERSHIP is lost: `Tok b = *p;` yields a
+ *     second owner, so `consume(a); consume(b);` double-consumes one resource
+ *     (this is HOLE-A4, open since 2026-07).
+ *
+ * Recovering any of them needs points-to over the dereferenced pointer, which
+ * the per-file + summaries model deliberately does not have (whole-program
+ * analysis is banned from the architecture). Level-A stance: when the analyzer
+ * cannot PROVE what a copy refers to, REJECT. The restructure is one line and
+ * teachable ("bind the pointer directly so the compiler can follow it"), which
+ * is the bar CLAUDE.md sets for an acceptable false positive.
+ *
+ * FORM AXIS (the 2026-08-15 fix). The original predicate required the operand
+ * to be a bare NODE_IDENT and resolved it through scope_lookup, so `*h.pp`,
+ * `**ppp` and `*factory()` walked straight past all three sinks — the same
+ * "one question, N syntactic forms" shape CLAUDE.md names as the #1 recurring
+ * bug class. It now asks the TYPEMAP for the operand's type, which covers every
+ * form uniformly (ident / field / index / nested deref / call result), so a new
+ * expression kind cannot reopen the hole. Callers must therefore run it AFTER
+ * check_expr has typed the value; the bare-ident symbol lookup is kept as a
+ * fallback for the (currently none) callers that cannot.
+ *
+ * Scalars are NOT matched (`u32 v = *p`, `S copy = *sp` for a plain struct S):
+ * the gate requires the dereference to YIELD one of the three identity kinds. */
+static bool deref_identity_launder(Checker *c, Node *e) {
     if (!e || e->kind != NODE_UNARY || e->unary.op != TOK_STAR) return false;
     Node *inner = e->unary.operand;
-    if (!inner || inner->kind != NODE_IDENT) return false;
-    Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
-                              (uint32_t)inner->ident.name_len);
-    if (!sy || !sy->type) return false;
-    /* operand must be a pointer-to-pointer ... */
-    Type *ot = type_unwrap_distinct(sy->type);
+    if (!inner) return false;
+    Type *ot = checker_get_type(c, inner);
+    if (!ot && inner->kind == NODE_IDENT) {
+        Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
+                                  (uint32_t)inner->ident.name_len);
+        ot = sy ? sy->type : NULL;
+    }
+    if (!ot) return false;
+    ot = type_unwrap_distinct(ot);
     if (type_dispatch_kind(ot) != TYPE_POINTER) return false;
     Type *inner_t = ot->pointer.inner ? type_unwrap_distinct(ot->pointer.inner) : NULL;
     if (!inner_t) return false;
     TypeKind ik = type_dispatch_kind(inner_t);
-    /* ... yielding a POINTER (or slice/opaque): a scalar `u32 v = *p` is unaffected. */
-    return ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE;
+    if (ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE) return true;
+    if (type_carries_handle(inner_t, 0)) return true;
+    if (type_carries_move(inner_t, 0)) return true;
+    return false;
 }
 
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
@@ -3077,6 +3145,66 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
 /* Forward declare for recursive comptime calls */
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count);
 
+/* ---- BUG-789: per-OPERATION width wrapping in the comptime evaluator ----
+ *
+ * The comptime evaluator computes in host int64 and masked only the FINAL
+ * result, so a comptime function silently produced a DIFFERENT value than the
+ * identical expression written at runtime:
+ *
+ *     comptime u32 shifted(u32 a) { return (a * 4) >> 3; }
+ *     shifted(4000000000)   -> 2000000000   (int64: 16e9 >> 3)
+ *     runtime (a * 4) >> 3  ->  500000000   (u32:  16e9 wraps first)
+ *
+ * Compile-time and runtime both "succeed" and disagree — no diagnostic, no
+ * trap, wrong constant burned into the emitted C. Masking the final result
+ * cannot fix it: >> , / and % read the bits that were already lost.
+ *
+ * The fix wraps after every operation that can LEAVE the declared width
+ * (+ - * << ~ unary-), which is exactly ZER's defined semantics ("integer
+ * overflow wraps, never UB"). Comparisons and the bit ops that cannot widen
+ * are left alone. Width comes from the comptime function's RETURN type; when
+ * it cannot be determined the width is 0 and nothing is masked, i.e. the old
+ * behaviour, so an unknown form can only fail to improve, never break.
+ *
+ * The full fix stays as documented in limitations.md: thread a destination
+ * width through the SHARED evaluator so `const` folding outside comptime
+ * functions gets the same treatment. This closes the comptime-function path,
+ * which is the one that substitutes a value into emitted code. */
+static int _ct_op_width = 0;      /* 0 = unknown -> no masking */
+static bool _ct_op_signed = false;
+
+static int64_t ct_wrap(int64_t v) {
+    if (_ct_op_width <= 0 || _ct_op_width >= 64) return v;
+    uint64_t mask = (1ULL << _ct_op_width) - 1ULL;
+    int64_t r = (int64_t)((uint64_t)v & mask);
+    if (_ct_op_signed && (r & (1LL << (_ct_op_width - 1))))
+        r |= (int64_t)(~mask);
+    return r;
+}
+
+/* Width of a PRIMITIVE integer type node, without needing a resolved Type
+ * (eval_comptime_call_subst has no Checker). Returns 0 for anything else —
+ * distinct/typedef/struct/float — which disables masking for that call. */
+static int ct_typenode_int_width(TypeNode *tn, bool *out_signed) {
+    *out_signed = false;
+    if (!tn || tn->kind != TYNODE_NAMED || !tn->named.name) return 0;
+    const char *n = tn->named.name;
+    uint32_t l = (uint32_t)tn->named.name_len;
+    if (l < 2 || l > 4) {
+        if (!(l == 5 && memcmp(n, "usize", 5) == 0)) return 0;
+        return zer_target_ptr_bits > 0 ? zer_target_ptr_bits : 32;
+    }
+    if (n[0] != 'u' && n[0] != 'i') return 0;
+    int w = 0;
+    for (uint32_t k = 1; k < l; k++) {
+        if (n[k] < '0' || n[k] > '9') return 0;
+        w = w * 10 + (n[k] - '0');
+    }
+    if (w < 1 || w > 64) return 0;   /* u128 and friends: leave unmasked */
+    *out_signed = (n[0] == 'i');
+    return w;
+}
+
 /* Resolve a comptime NODE_CALL within eval_const_expr_subst.
  * Looks up the callee as a comptime function and recursively evaluates.
  * Uses _comptime_global_scope (declared above, line ~1082) and _comptime_call_depth. */
@@ -3130,7 +3258,14 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     }
     ComptimeCtx cctx;
     ct_ctx_init(&cctx, cparams, pc);
+    /* BUG-789: the callee's own return width governs ITS arithmetic. Saved and
+     * restored so a nested call cannot leak its width to the caller's ops. */
+    int saved_w = _ct_op_width; bool saved_s = _ct_op_signed;
+    bool nsigned = false;
+    int nw = ct_typenode_int_width(fn->func_decl.return_type, &nsigned);
+    _ct_op_width = nw; _ct_op_signed = nsigned;
     int64_t result = eval_comptime_block(fn->func_decl.body, &cctx);
+    _ct_op_width = saved_w; _ct_op_signed = saved_s;
     ct_ctx_free(&cctx);
     if (need_free) free(cparams);
     _comptime_call_depth--;
@@ -3195,8 +3330,9 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
-        if (n->unary.op == TOK_MINUS) return -v;
-        if (n->unary.op == TOK_TILDE) return ~v;
+        /* BUG-789: wrap ops that can leave the declared width. */
+        if (n->unary.op == TOK_MINUS) return ct_wrap(-v);
+        if (n->unary.op == TOK_TILDE) return ct_wrap(~v);
         if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
         return CONST_EVAL_FAIL;
     }
@@ -3205,12 +3341,15 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         int64_t r = eval_const_expr_subst(n->binary.right, params, param_count);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         switch (n->binary.op) {
-        case TOK_PLUS:   return l + r;
-        case TOK_MINUS:  return l - r;
-        case TOK_STAR:   return l * r;
+        /* BUG-789: wrap after every operation that can leave the declared
+         * width, so the folded constant equals what the same expression
+         * computes at runtime. / % >> & | ^ cannot widen in-range operands. */
+        case TOK_PLUS:   return ct_wrap(l + r);
+        case TOK_MINUS:  return ct_wrap(l - r);
+        case TOK_STAR:   return ct_wrap(l * r);
         case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : l / r;
         case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : l % r;
-        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : (int64_t)((uint64_t)l << r);
+        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : ct_wrap((int64_t)((uint64_t)l << r));
         case TOK_RSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : l >> r;
         case TOK_AMP:    return l & r;
         case TOK_PIPE:   return l | r;
@@ -4247,9 +4386,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (acell) record_atomic_plain_write(c, acell, node->loc.line);
                 /* A6 micro-residual: same launder ban for a struct-field atomic
                  * cell — `&s.f` for non-atomic use after a spawn strips the lock. */
-                Symbol *lfs; const char *lff; uint32_t lfl;
-                if (atomic_struct_field_target(c, node, &lfs, &lff, &lfl))
-                    track_atomic_field(c, lfs, lff, lfl, false, node->loc.line);
+                track_atomic_path(c, node, false, node->loc.line);
             }
             break;
 
@@ -4262,16 +4399,6 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Assignment ---- */
     case NODE_ASSIGN: {
-        /* Deref-launder sink: `h.p = *pp;` / `g = *pp;` stores an alias the
-         * analyzer cannot follow into a field or a global. Same predicate and
-         * Level-A stance as the var-decl and return sinks. */
-        if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
-            checker_error(c, node->loc.line,
-                "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                "— the compiler cannot prove which allocation it aliases, so a later "
-                "free through either name would be a use-after-free. Alias the pointer "
-                "directly ('*T k = p;') instead");
-        }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
@@ -4311,14 +4438,25 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *aw = atomic_scalar_global_target(c, node->assign.target);
             if (aw) record_atomic_plain_write(c, aw, node->loc.line);
             /* Slice 3: plain WRITE to a global-struct field after a spawn. */
-            Symbol *fs; const char *ff; uint32_t fl;
-            if (atomic_struct_field_target(c, node->assign.target, &fs, &ff, &fl))
-                track_atomic_field(c, fs, ff, fl, false, node->loc.line);
+            track_atomic_path(c, node->assign.target, false, node->loc.line);
         }
         /* V3: route Task.new()/slab.alloc() RHS to _ptr variant when
          * target is a pointer type. Same logic as var_decl hook. */
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
+
+        /* Deref-identity sink: `h.p = *pp;` / `g = *pp;` / `b = *movep;` stores a
+         * copy whose alias / allocation / ownership the analyzer cannot follow.
+         * Runs AFTER check_expr so the operand's type is in the typemap and every
+         * operand FORM is covered (see deref_identity_launder). */
+        if (node->assign.value && deref_identity_launder(c, node->assign.value)) {
+            checker_error(c, node->loc.line,
+                "cannot bind a value obtained by dereferencing a pointer to a "
+                "pointer, Handle or move struct — the compiler cannot prove which "
+                "allocation it refers to, so a later free/consume through either "
+                "name would be a use-after-free or double-consume. Bind the "
+                "pointer directly ('*T k = p;') or pass the value by name instead");
+        }
 
         /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
          * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
@@ -5917,6 +6055,32 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* Deref-identity sink #4 — the CALL ARGUMENT (BUG-785). `tasks.free(*p)`
+         * and `consume(*p)` hand a callee a Handle / move-struct value read out
+         * of a dereference: the callee's frees-param summary records nothing
+         * (the freed thing is an IR temp, not the param local), so the caller's
+         * own free/consume of the same allocation is an unflagged DOUBLE FREE /
+         * double-consume. Measured live 2026-08-15.
+         *
+         * Deliberately NARROWER than the three value-binding sinks: only
+         * HANDLE-carrying and MOVE-carrying results are rejected here, because
+         * those are the two kinds whose consumption is a one-shot transfer.
+         * Passing `*pp` where the result is a plain pointer/slice stays legal —
+         * it is a borrow for the duration of the call, not a transfer. */
+        for (int i = 0; i < node->call.arg_count; i++) {
+            Node *a = node->call.args[i];
+            if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_STAR) continue;
+            Type *at = arg_types ? arg_types[i] : NULL;
+            if (!at) continue;
+            if (!type_carries_handle(at, 0) && !type_carries_move(at, 0)) continue;
+            checker_error(c, node->loc.line,
+                "cannot pass a Handle or move struct obtained by dereferencing a "
+                "pointer — the callee's free/consume of it cannot be attributed to "
+                "any allocation the caller knows about, so a second free/consume "
+                "would go unreported. Take the value by name (pass the Handle "
+                "itself, not a pointer to it)");
+        }
+
         /* D5 (2026-08-01): scoped-borrow exclusivity laundered through a HELPER.
          * `ThreadHandle t = spawn worker(&x); poke(&x); t.join();` compiled —
          * the borrow read-check (NODE_IDENT, ~3579) deliberately SKIPS `&x`
@@ -7140,7 +7304,19 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (!ret_is_float) {
                             ComptimeCtx cctx;
                             ct_ctx_init(&cctx, cparams, pc);
+                            /* BUG-789: per-operation wrapping at the declared
+                             * return width, so the folded constant equals the
+                             * runtime value of the same expression. */
+                            int saved_w = _ct_op_width; bool saved_s = _ct_op_signed;
+                            if (ret_ty_check && type_is_integer(ret_ty_check)) {
+                                int rw = type_width(ret_ty_check);
+                                _ct_op_width = (rw > 0 && rw < 64) ? rw : 0;
+                                _ct_op_signed = type_is_signed(ret_ty_check);
+                            } else {
+                                _ct_op_width = 0; _ct_op_signed = false;
+                            }
                             val = eval_comptime_block(fn->func_decl.body, &cctx);
+                            _ct_op_width = saved_w; _ct_op_signed = saved_s;
                             ct_ctx_free(&cctx);
                         }
                         /* Gap 33: surface explicit error if depth limit hit. */
@@ -7282,9 +7458,7 @@ static Type *check_expr(Checker *c, Node *node) {
          * (in_assign_target — the write path records those). Mirrors the scalar
          * read hook at NODE_IDENT. */
         if (c->after_spawn_in_func && !c->in_amp && !c->in_assign_target) {
-            Symbol *rfs; const char *rff; uint32_t rfl;
-            if (atomic_struct_field_target(c, node, &rfs, &rff, &rfl))
-                track_atomic_field(c, rfs, rff, rfl, false, node->loc.line);
+            track_atomic_path(c, node, false, node->loc.line);
         }
 
         /* BUG-432: module-qualified variable access: config.VERSION
@@ -7670,6 +7844,14 @@ static Type *check_expr(Checker *c, Node *node) {
         /* BUG-410: unwrap distinct for array/slice/pointer index dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
         Type *idx = check_expr(c, node->index_expr.index);
+
+        /* BUG-786: plain READ of a global array element in a concurrent context.
+         * The scalar (NODE_IDENT) and field (NODE_FIELD) read hooks existed; the
+         * ELEMENT one did not, so `garr[0]` read after a spawn was never recorded
+         * against an @atomic_* on the same element. Same skips as its siblings. */
+        if (c->after_spawn_in_func && !c->in_amp && !c->in_assign_target) {
+            track_atomic_path(c, node, false, node->loc.line);
+        }
 
         if (!type_is_integer(idx)) {
             checker_error(c, node->loc.line,
@@ -8344,7 +8526,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * to a wrong line.
                  *
                  * Two parse paths:
-                 *  (a) type keyword (u32/*T/etc.) → type_arg set, args carry values
+                 *  (a) type keyword (u32, pointer types, etc.) -> type_arg set, args carry values
                  *  (b) named type as TOK_IDENT for intrinsics NOT in force_type_arg
                  *      (currently only @size) → type_arg NULL, args[0] is the type ident
                  *      (see parser.c:931-936 + BUG-316 path). The checker dispatch at
@@ -9746,10 +9928,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *acell = atomic_scalar_global_target(c, node->intrinsic.args[0]);
                 if (acell) acell->is_atomic_cell = true;
                 /* Slice 3: struct-field atomic cell `@atomic_*(&s.f)`. */
-                Symbol *fs; const char *ff; uint32_t fl;
-                if (atomic_struct_field_target(c, node->intrinsic.args[0],
-                                               &fs, &ff, &fl))
-                    track_atomic_field(c, fs, ff, fl, true, node->loc.line);
+                track_atomic_path(c, node->intrinsic.args[0], true, node->loc.line);
             }
             if (is_load) {
                 /* @atomic_load(&var) → T */
@@ -10638,85 +10817,12 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
+/* has_atomic_or_barrier() was DELETED 2026-08-15. It was a legacy wrapper whose
+ * job (does this body do manual synchronisation?) is now answered by
+ * FuncProps.has_sync, computed once per function by scan_func_props and reused
+ * transitively. Nothing had called it since that migration — a dead duplicate of
+ * a safety question is exactly the multi-site drift CLAUDE.md warns about, so it
+ * is removed rather than left to be "fixed" out of sync with the live copy. */
 
 /* Does this function forward its parameter `pidx` into a `spawn` argument —
  * directly, or transitively through another function that does?
@@ -11450,19 +11556,6 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
-            /* Deref-launder: `*T k = *pp;` binds an alias the analyzer cannot
-             * follow — resolving it needs points-to over `pp`, which the per-file +
-             * summaries model deliberately lacks. Level-A stance: cannot prove =>
-             * REJECT. Measured live: the reproducer RAN, read freed memory and then
-             * double-freed. A scalar `u32 v = *p` is NOT matched (the predicate
-             * requires a POINTER-typed result); corpus cost measured at ZERO. */
-            if (node->var_decl.init && deref_ptr_launder(c, node->var_decl.init)) {
-                checker_error(c, node->loc.line,
-                    "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                    "— the compiler cannot prove which allocation it aliases, so a later "
-                    "free through either name would be a use-after-free. Alias the pointer "
-                    "directly ('*T k = p;') instead");
-            }
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
@@ -11537,6 +11630,19 @@ static void check_stmt(Checker *c, Node *node) {
             route_alloc_to_ptr_if_needed(c, node->var_decl.init, type);
 
             Type *init_type = check_expr(c, node->var_decl.init);
+
+            /* Deref-identity sink: `*T k = *pp;` / `Handle(T) k = *hp;` /
+             * `Tok b = *movep;` binds a copy whose alias / allocation / ownership
+             * the analyzer cannot follow. Runs AFTER check_expr so every operand
+             * FORM is typed (see deref_identity_launder). */
+            if (deref_identity_launder(c, node->var_decl.init)) {
+                checker_error(c, node->loc.line,
+                    "cannot bind a value obtained by dereferencing a pointer to a "
+                    "pointer, Handle or move struct — the compiler cannot prove which "
+                    "allocation it refers to, so a later free/consume through either "
+                    "name would be a use-after-free or double-consume. Bind the "
+                    "pointer directly ('*T k = p;') or pass the value by name instead");
+            }
             /* D9 (2026-08-01): copying a WHOLE shared struct by value clones its
              * embedded mutex, so the copy auto-locks a DIFFERENT lock than the
              * original — every access through it is unsynchronised, and the read
@@ -11734,7 +11840,7 @@ static void check_stmt(Checker *c, Node *node) {
             /* Walk parent scope chain to check if name matches a param */
             Symbol *existing = scope_lookup(c->current_scope,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len);
-            if (existing && existing->line != node->loc.line) {
+            if (existing && existing->line != (uint32_t)node->loc.line) {
                 checker_error(c, node->loc.line,
                     "variable '%.*s' shadows function parameter in async function — "
                     "async locals share state struct with params, shadowing overwrites param value. "
@@ -13296,15 +13402,6 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
-        /* Deref-launder sink: `return *pp;` hands the CALLER an alias the analyzer
-         * cannot follow, so a free through either name is a UAF. Same predicate and
-         * Level-A stance as the var-decl sink. Scalar / struct-VALUE not matched. */
-        if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
-            checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                "— the compiler cannot prove which allocation it aliases, so a later "
-                "free through either name would be a use-after-free. Alias the pointer "
-                "directly ('*T k = p;') instead");
-        }
         /* B4: ban control flow that exits a @once body (would skip the done-publish). */
         if (c->in_once) {
             checker_error(c, node->loc.line,
@@ -13326,6 +13423,18 @@ static void check_stmt(Checker *c, Node *node) {
 
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
+
+            /* Deref-identity sink: `return *pp;` hands the CALLER a copy whose
+             * alias / allocation / ownership the analyzer cannot follow. Runs
+             * AFTER check_expr so every operand FORM is typed. */
+            if (deref_identity_launder(c, node->ret.expr)) {
+                checker_error(c, node->loc.line,
+                    "cannot bind a value obtained by dereferencing a pointer to a "
+                    "pointer, Handle or move struct — the compiler cannot prove which "
+                    "allocation it refers to, so a later free/consume through either "
+                    "name would be a use-after-free or double-consume. Bind the "
+                    "pointer directly ('*T k = p;') or pass the value by name instead");
+            }
 
             /* Stage 1->2 escape summary accumulator (2026-06-22): classify this
              * valued return's region. STATIC contributes nothing; ARParam(n) adds
@@ -16760,6 +16869,26 @@ static void check_func_body(Checker *c, Node *node) {
 
         if (node->func_decl.is_naked) {
             c->in_naked = true;
+            /* BUG-788: `naked` is ACCEPTED and gates the asm rules, but the IR
+             * emission path does not emit __attribute__((naked)) — GCC therefore
+             * wraps the body in a normal prologue/epilogue. That is a SILENT
+             * bare-metal miscompile for the three idioms `naked` exists for (a
+             * reset handler running before SP is set up, a context switch that
+             * saves its own callee-saved registers, an ISR returning via iret):
+             * the code appears to compile and then corrupts a stack that does not
+             * exist yet, or restores registers the user already restored.
+             *
+             * Restoring the attribute is a user-visible breaking change (every
+             * tests/zer/asm_*.zer omits an explicit `ret` and would SIGILL) and is
+             * tracked in docs/limitations.md. Until that migration lands, the
+             * honest behaviour is AUDIT-VISIBLE, not silent: say so at the
+             * declaration, which is ZER's stated stance for anything the compiler
+             * cannot verify — surface it at the narrowest boundary. */
+            checker_warning(c, node->loc.line,
+                "'naked' is not enforced by the current backend — this function "
+                "still gets a compiler-generated prologue/epilogue. Do not rely on "
+                "it for reset/context-switch/iret code; write those in C and link "
+                "via cinclude (see docs/limitations.md)");
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
             if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {
@@ -17521,6 +17650,70 @@ static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
     if (n->kind == NODE_FOR) { record_isr_returned_funcname(c, n->for_stmt.body, depth + 1); return; }
 }
 
+/* ---- BUG-787: parameter -> global bindings across the ISR reachability walk ----
+ *
+ * The ISR non-atomic read-modify-write rule ("volatile global shared with main
+ * and compound-assigned = lost update") is recorded against the ROOT IDENT of
+ * the assignment target. Inside a helper the root is a PARAMETER, so
+ * `interrupt { rmw(&g); }` + `void rmw(*u32 p) { *p += 1; }` recorded g as
+ * merely ACCESSED, never as compound — the tearing RMW compiled clean and
+ * nothing at runtime can observe it (an interrupt between the load and the
+ * store just loses the update). Measured live 2026-08-15.
+ *
+ * record_isr_globals already descends into callee bodies; these helpers give
+ * that descent a binding frame so a param root resolves back to the caller's
+ * global. Sound in the conservative direction: an arg that does not resolve to
+ * a global binds nothing, so an unresolvable form can only fail to ADD a
+ * diagnostic that was never there before — never suppress one. */
+static const char *isr_bind_lookup(Checker *c, const char *name, uint32_t len,
+                                   uint32_t *out_len) {
+    for (int i = c->isr_bind_count - 1; i >= 0; i--) {
+        if (c->isr_binds[i].pname_len == len &&
+            memcmp(c->isr_binds[i].pname, name, len) == 0) {
+            *out_len = c->isr_binds[i].gname_len;
+            return c->isr_binds[i].gname;
+        }
+    }
+    return NULL;
+}
+
+static void isr_bind_push(Checker *c, const char *pname, uint32_t plen,
+                          const char *gname, uint32_t glen) {
+    if (c->isr_bind_count >= c->isr_bind_capacity) {
+        int nc = c->isr_bind_capacity < 8 ? 8 : c->isr_bind_capacity * 2;
+        struct IsrParamBind *nb = (struct IsrParamBind *)realloc(
+            c->isr_binds, nc * sizeof(*nb));
+        if (!nb) return;
+        c->isr_binds = nb;
+        c->isr_bind_capacity = nc;
+    }
+    struct IsrParamBind *b = &c->isr_binds[c->isr_bind_count++];
+    b->pname = pname; b->pname_len = plen;
+    b->gname = gname; b->gname_len = glen;
+}
+
+/* Resolve a call ARGUMENT to the global it ultimately names: `&g` / `g`, or an
+ * ident that is itself a bound parameter (the n-hop chain). Field/index steps
+ * are peeled — a compound assign through `&g.f` still tears `g`. */
+static const char *isr_arg_global(Checker *c, Node *arg, uint32_t *out_len) {
+    Node *a = arg;
+    while (a) {
+        if (a->kind == NODE_UNARY &&
+            (a->unary.op == TOK_AMP || a->unary.op == TOK_STAR)) a = a->unary.operand;
+        else if (a->kind == NODE_FIELD) a = a->field.object;
+        else if (a->kind == NODE_INDEX) a = a->index_expr.object;
+        else break;
+    }
+    if (!a || a->kind != NODE_IDENT) return NULL;
+    Symbol *gs = scope_lookup(c->global_scope, a->ident.name,
+                              (uint32_t)a->ident.name_len);
+    if (gs && !gs->is_function) {
+        *out_len = (uint32_t)a->ident.name_len;
+        return a->ident.name;
+    }
+    return isr_bind_lookup(c, a->ident.name, (uint32_t)a->ident.name_len, out_len);
+}
+
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
     if (!c || !value || depth > 32) return;
     /* ISR funcptr from a FACTORY CALL — `*() fp = mk(); fp();` inside an ISR,
@@ -17588,6 +17781,15 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                                           (uint32_t)r->ident.name_len);
                 if (gs && !gs->is_function)
                     track_isr_global(c, r->ident.name, (uint32_t)r->ident.name_len, true);
+                else {
+                    /* BUG-787: the root is a PARAMETER — resolve it through the
+                     * binding frame the caller pushed, so an RMW laundered
+                     * through a helper still marks the caller's global. */
+                    uint32_t glen = 0;
+                    const char *gname = isr_bind_lookup(c, r->ident.name,
+                                                        (uint32_t)r->ident.name_len, &glen);
+                    if (gname) track_isr_global(c, gname, glen, true);
+                }
             }
         }
         record_isr_globals(c, node->assign.target, depth);
@@ -17609,8 +17811,23 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
             Symbol *cs = scope_lookup(c->global_scope,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
+                /* BUG-787: bind each parameter to the global its argument names,
+                 * so a compound assign rooted at that parameter inside the callee
+                 * resolves back here. Popped after the descent (DFS discipline). */
+                int saved_binds = c->isr_bind_count;
+                int np = cs->func_node->func_decl.param_count;
+                if (np > node->call.arg_count) np = node->call.arg_count;
+                for (int pi = 0; pi < np; pi++) {
+                    uint32_t glen = 0;
+                    const char *gname = isr_arg_global(c, node->call.args[pi], &glen);
+                    if (!gname) continue;
+                    ParamDecl *pd = &cs->func_node->func_decl.params[pi];
+                    isr_bind_push(c, pd->name, (uint32_t)pd->name_len, gname, glen);
+                }
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+                c->isr_bind_count = saved_binds;
+            }
             /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
              * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }` — the canonical
              * bare-metal ISR-dispatch idiom. The callee IDENT resolves to a global
@@ -17888,33 +18105,77 @@ static void record_atomic_plain_write(Checker *c, Symbol *sym, int line) {
     c->atomic_plain_write_count++;
 }
 
-/* Slice 3: the (global-struct, field) named by `&s.f` / `s.f`, else false.
- * Only a NODE_FIELD on a non-shared global-struct IDENT (shared structs are
- * auto-locked, not atomic cells). */
-static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
-                                       const char **out_field, uint32_t *out_flen) {
+/* The (global root, ACCESS PATH) named by `&g.f` / `g.i.n` / `garr[0]` /
+ * `g.n[0]`, else false. Shared structs are excluded — they are auto-locked, not
+ * atomic cells.
+ *
+ * BUG-786 (2026-08-15): this used to be `atomic_struct_field_target`, matching
+ * exactly ONE form — a NODE_FIELD whose object is a bare global IDENT. So the
+ * atomic-cell rule (mixed plain + @atomic_* access = data race) covered only
+ * `g` and `g.f`; a NESTED field `g.i.n`, an array element `garr[0]` and a
+ * field-array element `g.n[0]` were all invisible, and a plain write racing an
+ * @atomic_* on any of them compiled clean. One question, N syntactic forms —
+ * the class CLAUDE.md names as the #1 recurring bug shape. Keying on the full
+ * path via the shared build_expr_key_a walker covers every form uniformly.
+ *
+ * A NON-CONSTANT index (`garr[i]`) is not keyable, so the entry falls back to
+ * the ROOT name with `wild` set: a wildcard may-aliases every path under the
+ * same root. That is the sound direction (over-approximate the alias set), and
+ * it is what makes an unkeyable form over-reject rather than slip through. */
+static bool atomic_cell_path_target(Checker *c, Node *e, Symbol **out_s,
+                                    const char **out_key, uint32_t *out_klen,
+                                    bool *out_wild) {
     if (e && e->kind == NODE_UNARY && e->unary.op == TOK_AMP)
         e = e->unary.operand;
-    if (!e || e->kind != NODE_FIELD) return false;
-    if (!e->field.object || e->field.object->kind != NODE_IDENT) return false;
-    Symbol *gs = scope_lookup(c->global_scope, e->field.object->ident.name,
-                              (uint32_t)e->field.object->ident.name_len);
+    if (!e) return false;
+    /* Must be a PATH. The bare-ident scalar global is the other predicate
+     * (atomic_scalar_global_target) and keeps its own Symbol-keyed list. */
+    if (e->kind != NODE_FIELD && e->kind != NODE_INDEX) return false;
+    bool wild = false;
+    Node *root = e;
+    while (root) {
+        if (root->kind == NODE_FIELD) root = root->field.object;
+        else if (root->kind == NODE_INDEX) {
+            if (!root->index_expr.index ||
+                root->index_expr.index->kind != NODE_INT_LIT) wild = true;
+            root = root->index_expr.object;
+        } else break;
+    }
+    if (!root || root->kind != NODE_IDENT) return false;
+    Symbol *gs = scope_lookup(c->global_scope, root->ident.name,
+                              (uint32_t)root->ident.name_len);
     if (!gs || gs->is_function || !gs->type) return false;
     Type *st = type_unwrap_distinct(gs->type);
-    if (!st || st->kind != TYPE_STRUCT) return false;
-    if (st->struct_type.is_shared || st->struct_type.is_shared_rw) return false;
+    if (st && type_dispatch_kind(gs->type) == TYPE_STRUCT &&
+        (st->struct_type.is_shared || st->struct_type.is_shared_rw)) return false;
+    ExprKey k = wild ? (ExprKey){ NULL, 0 } : build_expr_key_a(c, e);
+    if (!k.str) {                    /* unkeyable (variable index) → whole-root cell */
+        wild = true;
+        k = build_expr_key_a(c, root);
+        if (!k.str) return false;
+    }
     *out_s = gs;
-    *out_field = e->field.field_name;
-    *out_flen = (uint32_t)e->field.field_name_len;
+    *out_key = k.str;
+    *out_klen = (uint32_t)k.len;
+    *out_wild = wild;
     return true;
 }
 
-static void track_atomic_field(Checker *c, Symbol *s, const char *field,
-                               uint32_t flen, bool is_atomic, int line) {
+/* May two recorded cells denote the same location? Same global root, and either
+ * side wild (an unresolved index anywhere under that root) or identical paths. */
+static bool atomic_cell_may_alias(const struct AtomicFieldEntry *a,
+                                  const struct AtomicFieldEntry *b) {
+    if (a->s != b->s) return false;
+    if (a->wild || b->wild) return true;
+    return a->key_len == b->key_len && memcmp(a->key, b->key, a->key_len) == 0;
+}
+
+static void track_atomic_field(Checker *c, Symbol *s, const char *key,
+                               uint32_t klen, bool wild, bool is_atomic, int line) {
     for (int i = 0; i < c->atomic_field_count; i++) {
         struct AtomicFieldEntry *e = &c->atomic_fields[i];
-        if (e->s == s && e->field_len == flen &&
-            memcmp(e->field, field, flen) == 0) {
+        if (e->s == s && e->wild == wild && e->key_len == klen &&
+            memcmp(e->key, key, klen) == 0) {
             if (is_atomic) e->atomic_used = true;
             else { e->plain_used = true; if (!e->plain_line) e->plain_line = line; }
             return;
@@ -17929,27 +18190,41 @@ static void track_atomic_field(Checker *c, Symbol *s, const char *field,
         c->atomic_field_capacity = nc;
     }
     struct AtomicFieldEntry *e = &c->atomic_fields[c->atomic_field_count++];
-    e->s = s; e->field = field; e->field_len = flen;
+    e->s = s; e->key = key; e->key_len = klen; e->wild = wild;
     e->atomic_used = is_atomic;
     e->plain_used = !is_atomic;
     e->plain_line = is_atomic ? 0 : line;
+}
+
+/* Convenience wrapper: record `e` (an access path) as an atomic or plain use. */
+static void track_atomic_path(Checker *c, Node *e, bool is_atomic, int line) {
+    Symbol *s; const char *k; uint32_t kl; bool wild;
+    if (!atomic_cell_path_target(c, e, &s, &k, &kl, &wild)) return;
+    track_atomic_field(c, s, k, kl, wild, is_atomic, line);
 }
 
 /* Post-check: a scalar global used atomically (is_atomic_cell) must be accessed
  * atomically EVERYWHERE — a plain write to it is a mixed atomic/non-atomic data
  * race. Strict (Rust) model: even init must use @atomic_store. */
 static void check_atomic_cell_safety(Checker *c) {
-    /* Slice 3: struct-field atomic cells — (struct, field) both @atomic'd and
-     * plain-accessed in a concurrent context. */
+    /* Path-keyed atomic cells — a path both @atomic'd and plain-accessed in a
+     * concurrent context. BUG-786: the two uses need not be the SAME entry, so
+     * this is a may-alias cross product rather than a per-entry flag test. That
+     * is what makes an unresolvable path (`garr[i]`, recorded wild) taint every
+     * cell under its root instead of silently matching nothing. */
     for (int i = 0; i < c->atomic_field_count; i++) {
-        struct AtomicFieldEntry *e = &c->atomic_fields[i];
-        if (e->atomic_used && e->plain_used && e->s) {
-            checker_error(c, e->plain_line,
-                "plain access to '%.*s.%.*s' in a concurrent context — the field "
-                "is used with @atomic_* elsewhere (atomic cell), so access it "
-                "atomically here too (@atomic_load(&%.*s.%.*s) / @atomic_*)",
-                (int)e->s->name_len, e->s->name, (int)e->field_len, e->field,
-                (int)e->s->name_len, e->s->name, (int)e->field_len, e->field);
+        struct AtomicFieldEntry *pe = &c->atomic_fields[i];
+        if (!pe->plain_used || !pe->s) continue;
+        for (int j = 0; j < c->atomic_field_count; j++) {
+            struct AtomicFieldEntry *ae = &c->atomic_fields[j];
+            if (!ae->atomic_used) continue;
+            if (!atomic_cell_may_alias(pe, ae)) continue;
+            checker_error(c, pe->plain_line,
+                "plain access to '%.*s' in a concurrent context — it is used with "
+                "@atomic_* elsewhere (atomic cell), so access it atomically here "
+                "too (@atomic_load(&%.*s) / @atomic_*)",
+                (int)pe->key_len, pe->key, (int)pe->key_len, pe->key);
+            break;      /* one diagnostic per plain access */
         }
     }
     for (int i = 0; i < c->atomic_plain_write_count; i++) {
@@ -18497,7 +18772,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 }
 
 /* Scan a function body for return expressions with derivable range.
- * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+ * If ALL return expressions have the same derivable range, set out_min / out_max. */
 /* Union in the return ranges of any orelse-block fallback BURIED inside an
  * expression: `u32 v = (mb() orelse {return 9;}) + b;`, `id(mb() orelse
  * {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The original B9
@@ -19418,12 +19693,15 @@ bool checker_check(Checker *c, Node *file_node) {
         register_decl(c, file_node->file.decls[i]);
     }
 
-    /* Pass 2: type-check all function bodies and global initializers */
-    bool ok = checker_check_bodies(c, file_node);
+    /* Pass 2: type-check all function bodies and global initializers.
+     * The bool result is subsumed by c->error_count (the single source of truth
+     * this function returns on), so it is deliberately not stored — every later
+     * pass still runs so the user sees ALL diagnostics in one compile, not one
+     * per rebuild. */
+    (void)checker_check_bodies(c, file_node);
 
     /* Pass 2.5: keep inference — transitive escape fixpoint + deferred enforcement */
     check_keep_inference(c);
-    if (c->error_count > 0) ok = false;
 
     /* Pass 3: whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {

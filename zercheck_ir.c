@@ -1489,8 +1489,8 @@ static bool ir_name_looks_like_destructor(const char *name, uint32_t len) {
 }
 
 /* Check if a call is to a function that frees its first argument.
- * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
- * param (signature heuristic — catches destroy/close/cleanup patterns)
+ * Either explicitly named "free" OR a bodyless void fn whose first param is an
+ * opaque or T pointer (signature heuristic — catches destroy/close/cleanup)
  * OR bodyless non-void fn whose name matches a destructor convention
  * (Gap 17 / AUDIT 2026-06-06 GAP-D — catches `i32 destroy_resource(*R)`). */
 static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
@@ -1501,7 +1501,7 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     /* Explicit "free" */
     if (callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0) return true;
-    /* Signature heuristic: bodyless fn(*opaque/*T ...).
+    /* Signature heuristic: a bodyless fn taking an opaque or T pointer first.
      * Void return: always free-classified.
      * Non-void return: free-classified only if name looks like a destructor. */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
@@ -1676,12 +1676,12 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
-/* Backward-compat wrapper for callsites that don't have Checker handy.
- * Without checker, receiver-type validation is skipped (current behavior).
- * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
-static IRMethodKind ir_classify_method_call(Node *call) {
-    return ir_classify_method_call_ex(NULL, call);
-}
+/* The unchecked ir_classify_method_call(call) wrapper was DELETED 2026-08-15.
+ * CLAUDE.md's Stage-1 rule 4 said to migrate every callsite to the _ex form
+ * (which validates the RECEIVER TYPE before matching a method NAME) and then
+ * retire the wrapper; the last caller is gone. Keeping a name-only classifier
+ * around invites a new callsite to skip the type check — the exact shape that
+ * made `pool.free()` on a non-Pool receiver classify as a free. */
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
@@ -6150,13 +6150,13 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         func->ast_node->kind == NODE_FUNC_DECL) {
         fprintf(stderr, "ZCIR: building=%d fn='%.*s' pc=%d blocks=%d sumcount=%d\n",
             zc->building_summary,
-            func->ast_node->func_decl.name_len,
+            (int)func->ast_node->func_decl.name_len,
             func->ast_node->func_decl.name ? func->ast_node->func_decl.name : "?",
             func->ast_node->func_decl.param_count, func->block_count,
             zc->summary_count);
         for (int si = 0; si < zc->summary_count; si++) {
             fprintf(stderr, "  SUMM[%d]: %.*s pc=%d frees=%s rc=%d\n", si,
-                zc->summaries[si].func_name_len,
+                (int)zc->summaries[si].func_name_len,
                 zc->summaries[si].func_name ? zc->summaries[si].func_name : "?",
                 zc->summaries[si].param_count,
                 (zc->summaries[si].param_count > 0 && zc->summaries[si].frees_param && zc->summaries[si].frees_param[0]) ? "y" : "n",

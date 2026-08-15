@@ -1,0 +1,36 @@
+// BUG-789 — a comptime function must fold to the SAME value the identical
+// expression computes at runtime. The evaluator worked in host int64 and masked
+// only the FINAL result, so any operation that READS the bits an overflow already
+// discarded (>>, /, %) diverged: `(a * 4) >> 3` for a = 4e9 folded to 2000000000
+// while the runtime u32 computation gives 500000000. Compile-time and runtime both
+// "succeeded" and disagreed — no diagnostic, no trap, wrong constant emitted.
+//
+// Each pair below computes the same thing twice, once folded and once at runtime,
+// and requires agreement. Verified to FAIL (exit 2) on the pre-fix compiler.
+comptime u32 shifted(u32 a)  { return (a * 4) >> 3; }
+comptime u32 halved(u32 a)   { return (a * 3) / 2; }
+comptime u32 modded(u32 a)   { return (a * 3) % 1000; }
+comptime u32 summed(u32 a)   { return (a + a) >> 1; }
+comptime u16 narrow(u16 a)   { return (a * 4) >> 2; }
+comptime i16 negwrap(i16 a)  { return (a * 4) / 2; }
+
+u32 main() {
+    const u32 BIG = 4000000000;
+    u32 a = BIG;
+
+    if (shifted(BIG) != (a * 4) >> 3)  { return 1; }
+    if (halved(BIG)  != (a * 3) / 2)   { return 2; }
+    if (modded(BIG)  != (a * 3) % 1000){ return 3; }
+    if (summed(BIG)  != (a + a) >> 1)  { return 4; }
+
+    u16 h = 40000;
+    if (narrow(40000) != (h * 4) >> 2) { return 5; }
+
+    i16 n = 30000;
+    if (negwrap(30000) != (n * 4) / 2) { return 6; }
+
+    // Ordinary in-range folding is unchanged.
+    if (shifted(8) != 4)  { return 7; }
+    if (halved(4)  != 6)  { return 8; }
+    return 0;
+}

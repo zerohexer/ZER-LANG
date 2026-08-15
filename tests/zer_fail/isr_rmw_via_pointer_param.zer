@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: has compound assignment
+// BUG-787 — the ISR non-atomic read-modify-write rule was INTRA-BODY. The fact is
+// recorded against the assignment target's ROOT IDENT, which inside a helper is a
+// PARAMETER, not a global — so laundering the RMW one call deep made it invisible.
+// Silent on bare metal in both directions: no diagnostic, and no runtime check can
+// see a lost update (an interrupt landing between the load and the store just
+// discards main's write).
+volatile u32 g_ticks;
+
+void bump(volatile *u32 p) { *p += 1; }   // read-modify-write through a param
+
+interrupt IRQ0 { bump(&g_ticks); }
+
+u32 main() {
+    u32 x = g_ticks;    // main also touches it — shared ISR/main state
+    return x;
+}

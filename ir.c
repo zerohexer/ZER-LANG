@@ -698,8 +698,14 @@ bool ir_validate(IRFunc *func) {
      * This is a true safety check — a missed defer is a leak or an
      * unreleased lock at runtime. Logged as ERROR, aborts compilation. */
     {
-        /* Pre-compute which blocks contain ≥1 emit-bodies FIRE. */
-        bool *fire_in_block = (bool *)calloc(func->block_count, sizeof(bool));
+        /* Pre-compute which blocks contain ≥1 emit-bodies FIRE.
+         * The count is signed; a negative (corrupt) value would convert to a
+         * huge size_t at the calloc — guard rather than trust the field.
+         * (block_count == 0 already returned false at the top of the function;
+         * a NEGATIVE count is corruption, so fail validation rather than
+         * converting it to a huge size_t.) */
+        if (func->block_count < 0) return false;
+        bool *fire_in_block = (bool *)calloc((size_t)func->block_count, sizeof(bool));
         if (fire_in_block) {
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *block = &func->blocks[bi];
@@ -712,7 +718,7 @@ bool ir_validate(IRFunc *func) {
                 }
             }
             /* For every PUSH, verify a reachable FIRE exists. */
-            bool *visited = (bool *)calloc(func->block_count, sizeof(bool));
+            bool *visited = (bool *)calloc((size_t)func->block_count, sizeof(bool));
             if (visited) {
                 for (int bi = 0; bi < func->block_count; bi++) {
                     IRBlock *block = &func->blocks[bi];

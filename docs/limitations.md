@@ -5,6 +5,183 @@ Entries removed once fixed.
 
 ---
 
+## DONE — audit 2026-08-15: THE DEREFERENCE IDENTITY BOUNDARY + 4 more (BUG-785..789)
+
+Full-codebase audit. **Five accept-unsafe / silent-miscompile holes closed, each verified
+ACCEPTED by a from-HEAD `git archive` build before the fix and REJECTED after.** Plus a
+technical-debt pass and the first documentation of 79 shipped-but-undocumented intrinsics.
+
+### BUG-785 — the dereference identity boundary (HIGH, accept-unsafe, 3 facets x 4 sinks)
+
+**One question the analyzer answers at N sites, in N syntactic forms** — the shape CLAUDE.md
+names as the #1 recurring bug class, found here in BOTH axes at once.
+
+Reading a value OUT of a pointer dereference produces a copy the analyzer cannot connect back
+to the original allocation (in the IR `*p` is a UNOP temp carrying no handle). BUG-781/782
+closed THREE SINKS for ONE form (a bare-ident operand yielding a pointer). The audit found the
+predicate was also blind along two other axes:
+
+| axis | live forms found | verdict pre-fix |
+|---|---|---|
+| **FORM** (operand shape) | `*h.pp` (field), `**ppp` (nested deref), `*factory()` (call result) | ACCEPTED at all 3 sinks |
+| **TYPE** (what is laundered) | move-struct ownership (`Tok b = *p;` = HOLE-A4), Handle allocation (`Handle k = *p;`) | ACCEPTED |
+| **SINK** | the CALL ARGUMENT (`tasks.free(*p)`, `consume(*p)`) | ACCEPTED |
+
+Measured consequences, all silent at compile time AND runtime:
+- `*Node k = *h.pp;` — program RAN, returned a read of freed memory (7), then double-freed.
+- `Tok b = *p; consume(a); consume(b);` — one resource released twice.
+- `void sneak(*Handle(T) p) { Handle(T) k = *p; pool.free(k); }` — the callee's free is not
+  recorded in its frees-param summary, so the caller's own free is an unflagged DOUBLE FREE,
+  which mangles the pool generation counter (a later `get()` on the reused slot then returns
+  the WRONG object with no trap).
+
+**Fix — one predicate, `deref_identity_launder` (checker.c).** It asks the TYPEMAP for the
+operand's type instead of pattern-matching a bare ident, so every operand form is covered
+uniformly and a new expression kind cannot reopen the hole; and it rejects when the dereference
+YIELDS any of the three identity kinds (pointer/slice/opaque alias, Handle allocation,
+move-carrying ownership) via the shared carrier predicates. The three value-binding sinks now
+run it AFTER `check_expr` has typed the value. The call-argument sink is deliberately NARROWER
+— Handle and move only — because those are the two kinds whose consumption is a one-shot
+transfer; passing `*pp` as a plain pointer is a borrow for the duration of the call and stays
+legal.
+
+Level-A stance, as for BUG-781/782: recovering any of these needs points-to over the
+dereferenced pointer, which the per-file + summaries model deliberately lacks. Cannot prove =>
+reject; the restructure is one line.
+
+**Corpus cost measured before shipping: ZERO** new rejections across tests/zer, rust_tests,
+zig_tests, lib and examples.
+
+Tests: `tests/zer_fail/deref_identity_{field_operand,move_copy,handle_copy,handle_arg}.zer`
+(all four verified ACCEPTED pre-fix) + `tests/zer/deref_scalar_ok.zer` extended with the
+over-rejection boundary for the new form axis (scalar/struct-VALUE through field, index and
+call-result operands; a plain-pointer deref as a call argument).
+
+**Also fixed a VACUOUS test found on the way**: `tests/zer_fail/sneak_free_via_deref.zer`
+documents "EXPECTED: zercheck use-after-free" but was passing on a LEAK diagnostic — the
+free-through-deref propagation it claims to test was never happening. It now fails for the
+reason it documents.
+
+### BUG-786 — atomic-cell rule covered 2 of 5 access forms (HIGH, silent data race)
+
+The mixed plain + `@atomic_*` rule keyed on `(global Symbol, ONE field name)`. So a NESTED field
+`g.i.n`, an array element `garr[0]` and a field-array element `g.n[0]` were not cells at all: a
+plain write racing an atomic on any of them compiled clean, and nothing at runtime can observe
+it (a data race is not a fault). There was also no plain-READ hook on `NODE_INDEX` at all.
+
+**Fix — key on the full ACCESS PATH** via the shared `build_expr_key_a` walker
+(`atomic_cell_path_target`), plus a may-alias cross product at post-check instead of a
+per-entry flag test. An unresolvable path (variable index) is recorded `wild` and may-aliases
+every cell under the same root — the sound direction, so a form the key builder cannot resolve
+over-approximates rather than silently matching nothing.
+
+Tests: `tests/zer_fail/atomic_cell_{nested_field,array_elem,field_array_elem,variable_index}.zer`
+(all verified ACCEPTED pre-fix) + `tests/zer/atomic_cell_disjoint_paths_ok.zer` pinning that two
+DIFFERENT paths under one root stay independent cells.
+
+### BUG-787 — ISR non-atomic RMW laundered through a pointer parameter (MEDIUM, silent bare-metal)
+
+Closes the entry previously listed as OPEN under "residuals after the 2026-08-10 survey".
+
+`interrupt { bump(&g); }` with `void bump(volatile *u32 p) { *p += 1; }` performs a tearing
+read-modify-write on a global shared with main. The rule records the RMW against the assignment
+target's ROOT IDENT, which inside the helper is a PARAMETER, so nothing was recorded. Silent in
+both directions: no diagnostic, and no runtime check can see a lost update (an interrupt landing
+between the load and the store just discards main's write).
+
+**Fix — a parameter->global binding frame** pushed by `record_isr_globals` when it descends into
+a callee (the walker already descends; it just had no way to map a param root back to the
+caller's argument). Frames chain, so an n-hop launder resolves. Conservative: an argument that
+does not resolve to a global binds nothing, so an unhandled form can only fail to ADD a
+diagnostic, never suppress one.
+
+Gate: **hw-matrix grew 18 -> 21 cells** (`isr-rmw-via-param`, `isr-rmw-via-param-2hop`, and the
+over-rejection boundary `isr-plain-store-via-param-ok`). Verified DISCRIMINATING: **19/21 on a
+pre-fix build (2 false negatives) -> 21/21 after.**
+Tests: `tests/zer_fail/isr_rmw_via_pointer_param.zer`, `tests/zer_fail/isr_rmw_via_param_2hop.zer`.
+
+### BUG-788 — `naked` was silently unenforced (MEDIUM, silent bare-metal) -> now AUDIT-VISIBLE
+
+`naked` is accepted and gates the asm rules, but the IR path does not emit
+`__attribute__((naked))`, so GCC wraps the body in a normal prologue/epilogue. For the three
+idioms `naked` exists for (a reset handler running before SP is set up, a context switch that
+saves its own registers, an ISR returning via `iret`) that is a silent miscompile.
+
+Restoring the attribute is still the user-visible breaking change described further down this
+file (every `tests/zer/asm_*.zer` omits an explicit `ret` and would SIGILL). Until that
+migration lands the honest behaviour is not silence: the declaration now emits a WARNING naming
+the limitation and the workaround. That is ZER's stated stance for anything the compiler cannot
+verify — surface it at the narrowest boundary.
+
+### BUG-789 — comptime fold ignored per-operation width wrapping (MEDIUM, silent miscompile)
+
+Closes the "CONFIRMED silent miscompile" carried from the `2hg2v4` branch survey.
+
+The comptime evaluator computed in host int64 and masked only the FINAL result, so a comptime
+function silently produced a DIFFERENT value than the identical expression at runtime:
+
+```zer
+comptime u32 shifted(u32 a) { return (a * 4) >> 3; }
+shifted(4000000000)     // folded to 2000000000  (int64: 16e9 >> 3)
+(a * 4) >> 3            // runtime u32:  500000000  (16e9 wraps first)
+```
+
+Masking the final result cannot fix this — `>>`, `/` and `%` read bits the overflow already
+discarded. **Fix:** wrap after every operation that can LEAVE the declared width (`+ - * << ~`
+and unary minus) in `eval_const_expr_subst`, at the comptime function's declared RETURN width.
+Comparisons and the bit ops that cannot widen are untouched. When the width cannot be determined
+the mask is disabled, i.e. exactly the old behaviour — an unknown form can only fail to improve.
+
+Test: `tests/zer/comptime_width_wrap_agreement.zer` — six folded/runtime pairs that must agree;
+verified to FAIL (exit 1) on the pre-fix compiler.
+
+**Still OPEN (narrower than before):** the same wrapping for `const` folding OUTSIDE comptime
+functions, which needs the destination width threaded through the SHARED `eval_const_expr_ex` in
+ast.h (used by array sizes, `static_assert`, mmio ranges and VRP). The comptime-function path
+fixed here is the one that substitutes a value into emitted code.
+
+### Technical debt closed in the same pass
+
+- **`lower_expr` fell off the end of a non-void function** (`ir_lower.c`) — the exhaustive switch
+  is complete, but C still returned an INDETERMINATE int that callers use as a LOCAL ID (a wild
+  index into `func->locals`). Now returns the well-defined `-1` sentinel.
+- **Four dead functions deleted**, each a stale DUPLICATE of a live safety question — the exact
+  drift risk this codebase keeps paying for: `has_atomic_or_barrier` (checker.c; superseded by
+  `FuncProps.has_sync`), `ir_classify_method_call` (zercheck_ir.c; the no-Checker wrapper that
+  skips receiver-TYPE validation — CLAUDE.md's Stage-1 rule 4 said to retire it once callsites
+  migrated), `classify_builtin_call` (ir_lower.c; dead since the CFG migration),
+  `find_shared_root_in_stmt` (emitter.c; the AST-side copy of per-statement lock placement, which
+  now lives in ir_lower).
+- **`ir_validate` calloc guard** — `func->block_count` is signed; a negative value converted to a
+  huge `size_t`. Now fails validation instead.
+- **Compiler warning noise cut from ~15 to 7** (all remaining are pre-existing dead functions
+  listed below). This mattered: a REAL latent bug (the `lower_expr` fallthrough above) was buried
+  among cosmetic `-Wcomment` warnings.
+- **Silent CLI misconfiguration closed** — unknown long options and an unknown `--target-arch=`
+  were SILENTLY IGNORED, so `--target-arch=arm64` built an x86_64 binary and a mistyped
+  `--stack-limt 1024` left the check off while the user believed it was on. Both are now hard
+  errors (mirroring `--probe-mode`). `--release`, parsed but dead since the pointer-tracking
+  safety became unconditional, now says so instead of pretending.
+
+### Documentation: 79 intrinsics were shipping with NO user-facing documentation
+
+`docs/reference.md` documented ~60 intrinsics; the checker dispatches 139. Entire families were
+undiscoverable: MMU (10), TLB (5), cache maintenance (9), port I/O (6), MSR/CR/XCR0 (12), CPUID
+and inspection, power management, and the privileged transitions. Added as a "SYSTEM & PRIVILEGED
+INTRINSICS" section with signatures, the privileged/non-privileged split, the dead-branch test
+pattern, and a compiling example; `tests/zer/system_intrinsics_surface.zer` is the executable
+proof that every documented signature compiles (privileged ones in a dead branch, the rest
+actually run).
+
+### Still OPEN after this pass (unchanged, listed so nothing reads as closed)
+
+- Pre-existing dead functions that still warn: `collect_async_locals`, `shared_needs_condvar`,
+  `stmt_writes_shared` (emitter.c), `peek`, `tok_str`, `arena_array`, `ident_tok` (parser.c).
+  Left alone deliberately — removing them is churn with no safety content, unlike the four above
+  which each duplicated a live safety question.
+- `&packed_field` misalignment policy, `volatile` through a `@ptrtoint -> @inttoptr` round-trip,
+  `naked` attribute restoration, `vrp_ir.c` dead code — see their own entries.
+
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
 
 **STATUS: all 45 landed.** §A 1/1 · §B 9/9 · §C 7/7 · §D 9/9 · §E 1/1 · §F 4/4 · §G 6/7 (+ G5 with
@@ -485,6 +662,14 @@ still ACCEPTED; the var-decl sink is closed, those two sinks are not. Same predi
 rather than claimed closed, because a partial fix that promotes the gap file is exactly the
 false-confidence failure this ledger exists to prevent.
 
+**POSTSCRIPT 2026-08-15 (BUG-785): closing SINKS was still only one third of the class.** With
+all three sinks closed, the predicate was still matching ONE FORM (a bare-ident operand) and ONE
+TYPE (a pointer result). `*h.pp`, `**ppp` and `*factory()` walked past all three sinks, and the
+move-struct and Handle facets of the same launder were never covered at all. The durable fix
+makes the predicate type-driven rather than shape-matched. Lesson for the next entry of this
+shape: enumerate FORM x TYPE x SINK before declaring a class closed — a sink-complete fix reads
+as finished and is not.
+
 ### ~~HIGH ACCEPT-UNSAFE (RESIDUAL) — deref-launder at the FIELD-STORE and RETURN sinks~~ — **CLOSED 2026-08-10 (BUG-782)**
 
 `h.p = *pp;` and `*Node leak(**Node pp) { return *pp; }` now reject via the same
@@ -526,12 +711,14 @@ architecture). The enabling step is `&n` on a local that holds a tracked allocat
    argument-precise barrier principle and widen `n` to MAYBE_FREED on any free through an
    unresolved deref. Touches the CFG fixpoint; measure over-rejection first.
 
-### MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter
+### ~~MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter~~ — **CLOSED 2026-08-15 (BUG-787)**
 
-Sibling of BUG-774: the ISR compound-RMW check is intra-body, so `interrupt { rmw(&g); }`
-with `void rmw(*u32 p) { p[0] += 1; }` is unchecked. The transitive machinery from BUG-774
-(`record_isr_globals` following calls) exists; what is missing is propagating the
-*compound-assign* fact through a pointer PARAM rather than a global name.
+Was: the ISR compound-RMW check is intra-body, so `interrupt { rmw(&g); }` with
+`void rmw(volatile *u32 p) { *p += 1; }` was unchecked. Closed by giving
+`record_isr_globals`' existing call descent a parameter->global BINDING FRAME, so a
+compound assign rooted at a param resolves back to the caller's global (frames chain,
+so n-hop launders resolve too). Gated by 3 new hw-matrix cells, verified discriminating
+19/21 pre-fix -> 21/21. See the 2026-08-15 audit entry at the top of this file.
 
 ### MEDIUM (POLICY, not a bug) — `&packed_field` forms a misaligned `*T`
 
@@ -702,10 +889,11 @@ From `p0w5lj` (5 reproducers added to `tests/zer_gaps/` with tripwires):
 - **LOW** `volatile` lost through a `@ptrtoint -> @inttoptr` round-trip (audit-visible).
 
 From `2hg2v4`:
-- **CONFIRMED silent miscompile** — comptime/const integer fold ignores per-operation width
-  wrapping. Computes in host `int64` and masks only the final result. Explicitly probed and found
-  NOT a safety hole (checker and emitter read the same folded value), but a VALUE-correctness bug.
-  Deferred because the correct fix threads a destination width through the const evaluator.
+- ~~**CONFIRMED silent miscompile** — comptime/const integer fold ignores per-operation width
+  wrapping.~~ **CLOSED for the comptime-FUNCTION path 2026-08-15 (BUG-789)** — that is the path
+  whose value is substituted into emitted code. `const` folding outside comptime functions still
+  needs the destination width threaded through the SHARED `eval_const_expr_ex` in ast.h; that
+  narrower remainder is described in the 2026-08-15 audit entry at the top of this file.
 - **CONFIRMED accept-unsafe** — frees-param-field via UNWRAP-TO-LOCAL, extending the
   "CLOSED 2026-08-08" frees-param-field entry. **That earlier closure is therefore incomplete.**
 - **LOW over-rejection** — a function returning a raw `*T` view of a global flagged as a leaked handle.

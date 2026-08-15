@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'garr[0]' in a concurrent context
+// BUG-786 — array-element form of the atomic cell. Neither the write hook (which
+// only matched a field of a global struct) nor any read hook (NODE_INDEX had
+// none) recorded an element access, so this compiled clean.
+u32[4] garr;
+
+void worker() { u32 o = @atomic_add(&garr[0], 1); }
+
+u32 main() {
+    spawn worker();
+    garr[0] = 5;
+    return 0;
+}

@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: obtained by dereferencing a pointer to a pointer
+// BUG-785 — the FORM axis of the deref-identity class. BUG-781/782 closed three
+// SINKS but the predicate matched only a bare-IDENT operand (`*pp`), so the same
+// launder through a struct FIELD (`*h.pp`) walked past all three. MEASURED LIVE
+// 2026-08-15 before the fix: this program COMPILED, RAN, returned 7 (a read of
+// freed memory) and then double-freed. The predicate is now type-driven, so
+// every operand form — field, index, nested deref, call result — is covered.
+struct Node { u32 v; }
+struct H { **Node pp; }
+
+u32 main() {
+    *Node n = alloc(Node) orelse { return 1; };
+    n.v = 7;
+    H h;
+    h.pp = &n;
+    *Node k = *h.pp;    // operand is a FIELD, not an ident — was accepted
+    free(n);
+    u32 r = k.v;        // use-after-free
+    free(k);            // double free
+    return r;
+}

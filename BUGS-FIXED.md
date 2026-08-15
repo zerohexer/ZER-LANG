@@ -5,6 +5,142 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-15 — full-codebase audit: BUG-785..789 (5 holes) + tech debt + 79 undocumented intrinsics
+
+Audit session. Method throughout: probe -> reproduce on a from-HEAD `git archive` build ->
+fix -> re-verify the reproducer -> measure corpus cost -> gate. **Every one of the ten new
+negative tests was verified ACCEPTED by the pre-fix compiler**, so none is vacuous.
+
+### BUG-785 — the dereference identity boundary (HIGH, accept-unsafe)
+
+**Symptom (three programs, all compiled clean, all silent at runtime too):**
+```zer
+struct H { **Node pp; }
+*Node k = *h.pp;  free(n);  u32 r = k.v;  free(k);   // ran, returned 7, then double-freed
+Tok b = *p;       consume(a); consume(b);            // one move resource consumed twice
+void sneak(*Handle(T) p) { Handle(T) k = *p; pool.free(k); }   // caller's free = double free
+```
+
+**Root cause.** In the IR, `*p` lowers to a UNOP temp that carries no handle, so anything bound
+from it inherits nothing. BUG-781/782 closed three SINKS for ONE form/type combination; the
+predicate still required a bare `NODE_IDENT` operand (resolved via `scope_lookup`) and still only
+matched a POINTER result. Three axes, one covered:
+
+| axis | live forms | pre-fix |
+|---|---|---|
+| FORM | `*h.pp`, `**ppp`, `*factory()` | ACCEPTED at all 3 sinks |
+| TYPE | move-struct ownership (HOLE-A4), Handle allocation | ACCEPTED |
+| SINK | call argument — `tasks.free(*p)`, `consume(*p)` | ACCEPTED |
+
+**Fix.** `deref_ptr_launder` -> `deref_identity_launder`: asks the TYPEMAP for the operand's type
+(covers every form uniformly — a new expression kind cannot reopen it) and rejects when the
+dereference YIELDS a pointer/slice/opaque alias, a Handle, or a move-carrying value (via the
+shared carrier predicates; new `type_carries_move` delegates its leaf test to the VST-verified
+`zer_type_kind_is_move_struct` / `zer_move_should_track`). The three value-binding sinks moved to
+run AFTER `check_expr` types the value. A fourth, deliberately narrower sink covers call arguments
+for Handle/move only — those are the one-shot transfers; a plain-pointer deref argument is a
+borrow for the duration of the call and stays legal.
+
+**Corpus cost measured before shipping: ZERO** new rejections across tests/zer, rust_tests,
+zig_tests, lib, examples.
+
+**Tests.** `tests/zer_fail/deref_identity_{field_operand,move_copy,handle_copy,handle_arg}.zer`;
+over-rejection boundary extended in `tests/zer/deref_scalar_ok.zer`.
+
+**Also: a VACUOUS test found and fixed.** `tests/zer_fail/sneak_free_via_deref.zer` documents
+"EXPECTED: zercheck use-after-free" but passed on a LEAK diagnostic — the free-through-deref
+propagation it claims to test never happened. It now fails for the reason it documents. (Same
+weak-oracle shape CLAUDE.md warns about; the `// expect-error:` directive would have caught it.)
+
+### BUG-786 — atomic-cell rule covered 2 of 5 access forms (HIGH, silent data race)
+
+**Symptom.** `@atomic_add(&g.i.n, 1)` in a spawned thread + plain `g.i.n = 5` in main compiled
+clean. Same for `garr[0]` and `g.n[0]`. A data race is not a fault, so runtime cannot see it either.
+
+**Root cause.** `atomic_struct_field_target` matched exactly one shape: a `NODE_FIELD` whose object
+is a bare global IDENT. Nested fields, array elements and field-array elements were not cells at
+all, and `NODE_INDEX` had no plain-READ hook.
+
+**Fix.** Key on the full ACCESS PATH via the shared `build_expr_key_a` walker
+(`atomic_cell_path_target`), and decide with a may-alias CROSS PRODUCT at post-check rather than a
+per-entry flag test (the plain use and the atomic use need not be the same entry). An unresolvable
+path (variable index) is recorded `wild` and may-aliases every cell under its root — so a form the
+key builder cannot resolve over-approximates instead of silently matching nothing.
+
+**Tests.** `tests/zer_fail/atomic_cell_{nested_field,array_elem,field_array_elem,variable_index}.zer`
++ `tests/zer/atomic_cell_disjoint_paths_ok.zer` (sibling paths stay independent cells).
+
+### BUG-787 — ISR non-atomic RMW laundered through a pointer parameter (MEDIUM, silent bare-metal)
+
+**Symptom.** `interrupt { bump(&g); }` with `void bump(volatile *u32 p) { *p += 1; }` — a tearing
+read-modify-write on ISR/main-shared state, accepted. No diagnostic; no runtime check can see a
+lost update.
+
+**Root cause.** The RMW fact is recorded against the assignment target's ROOT IDENT, which inside
+the helper is a PARAMETER, not a global.
+
+**Fix.** `record_isr_globals` already descends into callees; it now pushes a parameter->global
+BINDING FRAME per descent, so a param root resolves back to the caller's argument. Frames chain
+(an argument that is itself a bound param binds to the same global), so n-hop launders resolve.
+Conservative: an unresolvable argument binds nothing.
+
+**Gate.** hw-matrix 18 -> 21 cells; verified DISCRIMINATING at **19/21 pre-fix -> 21/21 after**.
+**Tests.** `tests/zer_fail/isr_rmw_via_pointer_param.zer`, `.../isr_rmw_via_param_2hop.zer`.
+
+### BUG-788 — `naked` silently unenforced -> now audit-visible (MEDIUM, silent bare-metal)
+
+The IR path does not emit `__attribute__((naked))`, so GCC adds a prologue/epilogue to a function
+the user believes has none. Restoring the attribute remains a user-visible breaking change (every
+`tests/zer/asm_*.zer` omits an explicit `ret`), so the fix here is honesty, not enforcement: the
+declaration now WARNS, naming the limitation and the workaround. Silent -> audit-visible is ZER's
+stated stance for anything the compiler cannot verify.
+
+### BUG-789 — comptime fold ignored per-operation width wrapping (MEDIUM, silent miscompile)
+
+**Symptom.** `comptime u32 shifted(u32 a) { return (a * 4) >> 3; }` folds `shifted(4000000000)` to
+2000000000; the identical runtime expression gives 500000000. Both "succeed", they disagree, and
+the wrong constant is burned into the emitted C.
+
+**Root cause.** The evaluator computes in host int64 and masked only the FINAL result. That is
+enough for `+ - *` (they distribute over the modulus) but not for `>> / %`, which read the bits the
+overflow already discarded.
+
+**Fix.** Wrap after every operation that can LEAVE the declared width (`+ - * << ~`, unary minus)
+in `eval_const_expr_subst`, at the comptime function's declared RETURN width, saved/restored around
+nested comptime calls. Width unknown => no masking => exactly the old behaviour, so an unhandled
+form can only fail to improve.
+
+**Test.** `tests/zer/comptime_width_wrap_agreement.zer` — six folded/runtime pairs that must agree;
+verified to FAIL (exit 1) pre-fix. Remaining (narrower) gap: `const` folding outside comptime
+functions, which needs a destination width threaded through the shared `eval_const_expr_ex`.
+
+### Technical debt
+
+- **`lower_expr` fell off the end of a non-void function** — the switch is exhaustive under
+  `-Werror=switch`, but C still returned an INDETERMINATE int, and callers use the result as a
+  LOCAL ID (a wild index into `func->locals`). Now returns `-1`. This was the one REAL bug hiding
+  among the warning noise, which is why the noise was worth cutting.
+- **Four dead functions deleted**, each a stale duplicate of a live safety question:
+  `has_atomic_or_barrier` (checker.c), `ir_classify_method_call` (zercheck_ir.c — the no-Checker
+  wrapper that SKIPS receiver-type validation), `classify_builtin_call` (ir_lower.c),
+  `find_shared_root_in_stmt` (emitter.c).
+- **`ir_validate`**: guard the `calloc(func->block_count, ...)` against a negative count.
+- **Silent CLI misconfiguration**: unknown long options and unknown `--target-arch=` values were
+  SILENTLY IGNORED — `--target-arch=arm64` built an x86_64 binary, a mistyped `--stack-limt` left
+  the check off. Both now hard errors. `--release` (parsed but dead) now says it has no effect.
+- Warnings cut from ~15 to 7 (remaining are pre-existing dead functions, listed in limitations.md).
+
+### Documentation
+
+`docs/reference.md` documented ~60 intrinsics; the checker dispatches **139**. Added the
+"SYSTEM & PRIVILEGED INTRINSICS" section covering the 79 that had no user-facing documentation at
+all — MMU, TLB, cache maintenance, port I/O, MSR/CR/XCR0, CPUID/inspection, power management,
+privilege transitions — with signatures, the privileged/non-privileged split, the dead-branch test
+pattern and a compiling example. `tests/zer/system_intrinsics_surface.zer` is the executable proof
+that every documented signature compiles.
+
+---
+
 ## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
 
 Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)

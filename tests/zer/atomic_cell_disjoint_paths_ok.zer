@@ -1,0 +1,22 @@
+// Over-rejection boundary for the path-keyed atomic cell (BUG-786). Two DIFFERENT
+// paths under the same global root are different cells and must keep compiling —
+// the may-alias test is path equality, not root equality.
+struct In { u32 a; u32 b; }
+struct C { In i; u32[4] n; }
+C g;
+u32[4] garr;
+
+void worker() {
+    u32 o = @atomic_add(&g.i.a, 1);
+    u32 p = @atomic_add(&g.n[0], 1);
+    u32 q = @atomic_add(&garr[0], 1);
+}
+
+u32 main() {
+    spawn worker();
+    g.i.b = 5;          // sibling field of an atomic cell — not the cell
+    g.n[1] = 6;         // sibling element — not the cell
+    garr[1] = 7;        // sibling element of a different root — not the cell
+    if (g.i.b + g.n[1] + garr[1] != 18) { return 1; }
+    return 0;
+}

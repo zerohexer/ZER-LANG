@@ -3042,6 +3042,16 @@ therefore "cannot prove => reject". **The fix is always to bind the pointer dire
 void take(Handle(T) h)  // take the Handle BY VALUE, not a pointer to it
 ```
 
+The one ordinary pattern this costs you is READING a pointer or slice back out of an
+out-parameter. WRITING through one is unaffected:
+
+```zer
+void fill(*u32 out)     { *out = 7; }        // OK — writing through an out-param
+void grab(*[*]u8 out)   { [*]u8 s = *out; }  // ERROR — reading a slice back out
+
+[*]u8 grab()            { return g_buf; }    // do this instead: return the value
+```
+
 ---
 
 ## COMPILER

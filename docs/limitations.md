@@ -140,6 +140,46 @@ functions, which needs the destination width threaded through the SHARED `eval_c
 ast.h (used by array sizes, `static_assert`, mmio ranges and VRP). The comptime-function path
 fixed here is the one that substitutes a value into emitted code.
 
+### RELAXATION (accuracy, not a hole) — a call result that provably returns a STATIC
+
+`T g; *T view() { return &g; }` then `*T p = view();` was REJECTED: *"handle %0 (local
+'p') allocated at line N but never freed"*. Nothing was allocated. An accessor returning
+the address of a global is one of the most ordinary shapes in systems code and there was
+no spelling of it the leak check accepted.
+
+The registration path treats any pointer-returning call as a fresh owned allocation, with
+two existing suppressions (an ARENA color, and PART-6's `ret_is_borrow && ret_is_content`
+for a content borrow). The third arm was missing: **ARStatic**. The fact needed to prove
+it was already computed and already proven sound — the checker's per-function return
+summary, where `ret_summary_complete && ret_param_mask == 0` is exactly ARStatic of
+`lambda_zer_escape/param_lattice.v` ("every valued return roots at a global / static /
+null"). Its default is `{false, 0}`, so consulting it can only ACCEPT MORE, never accept
+something unproven.
+
+Suppression is leak-only (`escaped`), identical in mechanism and strength to the PART-6
+arm: the handle stays REGISTERED, so double-free and UAF through the returned pointer are
+untouched. A callee that allocates cannot reach it — `return alloc(T)` classifies
+RET_UNKNOWN, which clears the summary.
+
+Verified DISCRIMINATING: `tests/zer/call_result_static_view_ok.zer` draws FOUR spurious
+leak errors from a pre-fix build and compiles + runs clean after; the soundness control
+`tests/zer_fail/call_result_alloc_still_tracked.zer` (double free through a genuinely
+allocated return) still rejects.
+
+**Known cost of the deref-identity rule (BUG-785), for the record:** reading a pointer or
+slice back out of an OUT-PARAMETER (`void grab(*[*]u8 out) { [*]u8 s = *out; }`) is now
+rejected. Writing through an out-param is unaffected; the restructure is to RETURN the
+value instead. Measured at zero occurrences in the corpus and documented in
+`docs/reference.md`.
+
+### Still OPEN — freeing a pointer with STATIC provenance is not rejected (LOW)
+
+Found while validating the relaxation above, and **pre-existing** (verified on a from-HEAD
+build): `T g; *T view() { return &g; } ... free(view())` compiles. Freeing a pointer to a
+global is always a bug, and the ARStatic fact that would reject it is now consulted one
+line away, in the same registration path. Not taken in this pass because it is a
+TIGHTENING and deserves its own corpus measurement.
+
 ### Technical debt closed in the same pass
 
 - **`lower_expr` fell off the end of a non-void function** (`ir_lower.c`) — the exhaustive switch

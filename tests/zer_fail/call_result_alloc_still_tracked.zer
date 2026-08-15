@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// SOUNDNESS CONTROL for the ARStatic relaxation (see
+// tests/zer/call_result_static_view_ok.zer). Suppressing the leak check for a
+// provably-static call result must NOT weaken tracking of a call result that IS a
+// fresh allocation: the handle stays REGISTERED, only the leak flag is suppressed,
+// and only when the callee's return summary proves every return roots at a global.
+// A callee that allocates classifies RET_UNKNOWN, which clears the summary.
+struct T { u32 v; }
+
+?*T make() { ?*T p = alloc(T); return p; }
+
+u32 main() {
+    *T p = make() orelse { return 1; };
+    free(p);
+    free(p);        // double free — must still be caught
+    return 0;
+}

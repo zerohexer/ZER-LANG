@@ -5105,6 +5105,40 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * erased_ownership_lattice.v. */
                         if (summary->ret_is_borrow && summary->ret_is_content)
                             h->escaped = true;
+
+                        /* RELAXATION 2026-08-15 — the ARStatic arm.
+                         *
+                         * `T g; *T view() { return &g; }` had its call RESULT
+                         * registered as a fresh owned allocation, so
+                         * `*T p = view();` was rejected: "handle %0 (local 'p')
+                         * allocated but never freed". Nothing was allocated —
+                         * an accessor returning the address of a global is one
+                         * of the most ordinary shapes there is, and there was no
+                         * way to write it that the leak check accepted.
+                         *
+                         * The FACT needed to prove it was already computed and
+                         * already proven sound: the checker's per-function return
+                         * summary, whose `ret_summary_complete && ret_param_mask
+                         * == 0` is exactly ARStatic of
+                         * lambda_zer_escape/param_lattice.v ("every valued return
+                         * roots at a global / static / null"). Its default is
+                         * {false, 0} — unprovable stays tainted — so consulting it
+                         * can only ACCEPT more, never accept something unproven.
+                         *
+                         * Suppression is leak-only (`escaped`), the same mechanism
+                         * and the same strength as the ret_is_borrow arm above:
+                         * the handle stays REGISTERED, so double-free and UAF
+                         * tracking through this pointer are untouched. A callee
+                         * that allocates cannot reach here — `return alloc(T)`
+                         * classifies RET_UNKNOWN, which clears the summary. */
+                        if (!h->escaped && inst->expr->call.callee &&
+                            inst->expr->call.callee->kind == NODE_IDENT) {
+                            Symbol *cs = scope_lookup(zc->checker->global_scope,
+                                inst->expr->call.callee->ident.name,
+                                (uint32_t)inst->expr->call.callee->ident.name_len);
+                            if (cs && cs->ret_summary_complete && cs->ret_param_mask == 0)
+                                h->escaped = true;
+                        }
                     }
                 }
             }

@@ -1,0 +1,52 @@
+// RELAXATION 2026-08-15 — the ARStatic arm of the call-result registration.
+//
+// `T g; *T view() { return &g; }` had the call RESULT registered as a fresh owned
+// allocation, so `*T p = view();` was rejected with "handle %0 (local 'p')
+// allocated at line N but never freed". Nothing was allocated — and an accessor
+// returning the address of a global is one of the most ordinary shapes there is,
+// with no way to write it that the leak check accepted.
+//
+// The fact that proves it was already computed and already proven sound: the
+// checker's per-function return summary, where `ret_summary_complete &&
+// ret_param_mask == 0` is exactly ARStatic of lambda_zer_escape/param_lattice.v.
+// Its default is {false, 0}, so consulting it can only accept MORE, never accept
+// something unproven.
+//
+// The soundness controls for this relaxation live in
+// tests/zer_fail/call_result_alloc_still_tracked.zer — a real allocation returned
+// the same way must still be double-free / UAF tracked.
+struct T { u32 v; }
+struct Cfg { u32 baud; u32 bits; }
+
+T g;
+Cfg g_cfg;
+u32[4] g_tab;
+
+*T view()            { return &g; }              // address of a global
+*Cfg cfg()           { return &g_cfg; }          // ... a different global
+*u32 first()         { return &g_tab[0]; }       // ... an element of one
+*T pick(u32 which)   { if (which == 0) { return &g; } return &g; }   // both arms static
+*T chained()         { return view(); }          // a call that itself returns a static
+
+u32 main() {
+    *T p = view();
+    p.v = 7;
+    if (g.v != 7) { return 1; }
+
+    *Cfg c = cfg();
+    c.baud = 9600;
+    if (g_cfg.baud != 9600) { return 2; }
+
+    *u32 e = first();
+    *e = 3;
+    if (g_tab[0] != 3) { return 3; }
+
+    *T q = pick(1);
+    q.v = 8;
+    if (g.v != 8) { return 4; }
+
+    *T r = chained();
+    r.v = 9;
+    if (g.v != 9) { return 5; }
+    return 0;
+}

@@ -5,6 +5,36 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-16b — BUG-786: &packed_field deref rejected (extending BUG-493)
+
+**Recorded as a POLICY decision for weeks; it was not one.** BUG-493 already rejects
+`@atomic_*(&packed.field)` for exactly this hazard (misaligned on ARM/RISC-V). The rule
+existed at ONE sink and nowhere else — the one-question-many-sinks pattern, not an open
+design choice. Recognising that turned a design debate into a coverage fix.
+
+**Measured first.** The emitter drops the packed-ness completely — `*u32 q = &p.b` emits
+`uint32_t* _zer_t0 = &p.b;` — so a later `*q` is a plain aligned load and nothing downstream
+can recover the fact. Corpus: only ONE real `.zer` file took a packed field's address (the gap
+reproducer); the only other was BUG-493's negative, which already rejects.
+
+**Fixed by TRACKING, not banning**, per the Ban Decision Framework — none of the four ban
+conditions applies (not a hardware constraint the compiler cannot see, not emission-impossible,
+no runtime needed, no missing type system), so rule 5 says track. New
+`Symbol.is_packed_derived`, a Model-4 static annotation on the same rails as `volatile`/`const`,
+set at the var-decl that binds `&packed.field` and consumed at the DEREF sink. Index was already
+covered by the `*T`-indexing rule; atomics remain BUG-493's cell.
+
+**The type-dispatch audit caught my own shortcut.** The first version of the predicate used a raw
+`st->kind == TYPE_STRUCT`; `tools/audit_type_dispatch.sh` failed the build with *"1 NEW raw
+'->kind == TYPE_' site"*. Switched to `type_dispatch_kind(st)`, which unwraps distinct and is
+NULL-safe. Worth noting the gate fired on a line that was arguably safe (the type had already
+been unwrapped) — that is the linter working as designed: it forces a conscious choice rather
+than trusting the author's local reasoning.
+
+Tests: `tests/zer_fail/packed_field_addr_deref.zer` (the promoted gap file) +
+`tests/zer/packed_field_direct_ok.zer` pinning the supported ways to touch a packed member —
+direct read/write, copy-to-aligned-local, and a NON-packed `&field` deref.
+
 ## Session 2026-08-16 — BUG-785: free-of-a-param-field through an unwrap-to-local
 
 Closes the entry that was marked "CLOSED 2026-08-08" and was NOT — `2hg2v4` was right.

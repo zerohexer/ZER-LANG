@@ -1790,6 +1790,30 @@ static bool deref_ptr_launder(Checker *c, Node *e) {
     return ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE;
 }
 
+/* Is this expression `&<packed struct>.field` (at any field/index depth)?
+ * The address of a packed field is not naturally aligned, so a deref or index
+ * through the resulting pointer faults on ARM/RISC-V. BUG-493 already rejects
+ * this at the @atomic_* sink; this is the same question, hoisted so the general
+ * pointer sinks can ask it too — the multi-site pattern. */
+static bool addr_of_is_packed_field(Checker *c, Node *expr) {
+    if (!expr || expr->kind != NODE_UNARY || expr->unary.op != TOK_AMP) return false;
+    Node *op = expr->unary.operand;
+    if (!op || op->kind != NODE_FIELD) return false;   /* must be a FIELD access */
+    Node *root = op;
+    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
+        if (root->kind == NODE_FIELD) root = root->field.object;
+        else root = root->index_expr.object;
+    }
+    if (!root || root->kind != NODE_IDENT) return false;
+    Symbol *sym = scope_lookup(c->current_scope, root->ident.name,
+                               (uint32_t)root->ident.name_len);
+    if (!sym || !sym->type) return false;
+    Type *st = type_unwrap_distinct(sym->type);
+    /* type_dispatch_kind, not a raw ->kind read: unwraps distinct and is
+     * NULL-safe, so this never trips the type-dispatch audit. */
+    return st && type_dispatch_kind(st) == TYPE_STRUCT && st->struct_type.is_packed;
+}
+
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     Node *root = operand;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -4142,6 +4166,28 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = ty_void;
             } else {
                 result = deref_inner->pointer.inner;
+                /* Dereferencing a pointer formed by `&packed_struct.field` is a
+                 * MISALIGNED load/store — a hard fault on ARM/RISC-V, silently
+                 * slow on x86. BUG-493 already rejects the same address at the
+                 * @atomic_* sink; this is that question at the deref sink, which
+                 * had no answer (the emitter drops the packed-ness and emits a
+                 * plain `uint32_t*`). Direct field access `p.field` is unaffected
+                 * and remains the correct way to touch a packed member. */
+                if (node->unary.operand &&
+                    node->unary.operand->kind == NODE_IDENT) {
+                    Symbol *ds = scope_lookup(c->current_scope,
+                        node->unary.operand->ident.name,
+                        (uint32_t)node->unary.operand->ident.name_len);
+                    if (ds && ds->is_packed_derived) {
+                        checker_error(c, node->loc.line,
+                            "dereferencing '%.*s' — it points into a PACKED struct "
+                            "field and may be misaligned (a hard fault on ARM/RISC-V). "
+                            "Access the field directly (`s.field`) or copy it to an "
+                            "aligned local first",
+                            (int)node->unary.operand->ident.name_len,
+                            node->unary.operand->ident.name);
+                    }
+                }
             }
             }
             break;
@@ -11915,6 +11961,12 @@ static void check_stmt(Checker *c, Node *node) {
                          * docs/universal_alloc.md. */
                         if (addr_of_is_local_derived(c, addr_exprs[ai]->unary.operand))
                             sym->is_local_derived = true;
+                        /* &packed_struct.field yields a possibly-MISALIGNED pointer.
+                         * Carry that on the symbol so the deref/index sinks can
+                         * reject it — BUG-493 already rejects the @atomic_* sink,
+                         * and this is the same question at the general sinks. */
+                        if (addr_of_is_packed_field(c, addr_exprs[ai]))
+                            sym->is_packed_derived = true;
                     }
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:

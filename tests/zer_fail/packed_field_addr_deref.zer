@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: points into a PACKED struct field
+// A pointer formed by &packed_struct.field is not naturally aligned, so a deref
+// through it is a hard fault on ARM/RISC-V (silently slow on x86). The emitter
+// drops the packed-ness entirely — it emits a plain `uint32_t*` — so nothing
+// downstream can recover it.
+//
+// NOT a new policy: BUG-493 already rejects the SAME address at the @atomic_*
+// sink for the same reason. This is that question asked at the deref sink, which
+// had no answer — the one-question-many-sinks pattern.
+packed struct P { u8 a; u32 b; }
+P p;
+
+u32 main() {
+    *u32 q = &p.b;
+    u32 v = *q;
+    return v;
+}

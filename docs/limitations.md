@@ -444,7 +444,24 @@ the arm MUST be gated on the field being pointer-carrying, or a scalar field rea
 (*"handle %0 (local 'h') allocated ... never freed"*) — read the reason, not the exit code.
 The unmasked discriminator is `free(h.b); use(lp);`.
 
-### CONFIRMED LIVE — `&packed_field` forms a possibly-misaligned `*T` (POLICY, not a bug)
+### ~~`&packed_field` forms a possibly-misaligned `*T`~~ — **CLOSED 2026-08-16 (BUG-786)**
+
+**It was never a policy question — ZER had already decided it.** `tests/zer_fail/atomic_packed_field.zer`
+(BUG-493) rejects `@atomic_add(&r.counter)` on a packed field precisely because it is misaligned
+on ARM/RISC-V. The same question simply had no answer at the other sinks, which is the
+one-question-many-sinks pattern, not an open design choice.
+
+Resolved by TRACKING, per the Ban Decision Framework (rule 5: none of the four ban conditions
+applies, so track). New `Symbol.is_packed_derived` — a Model-4 static annotation on the same
+rails as `volatile`/`const` — set when a var-decl binds `&packed.field`, and consumed at the
+DEREF sink. Index was already covered by the `*T`-indexing rule; atomics stay on BUG-493.
+
+Measured: the emitter drops the packed-ness entirely (`uint32_t* _zer_t0 = &p.b;`), so nothing
+downstream could recover it. Corpus cost ONE file — the gap reproducer, now promoted to
+`tests/zer_fail/packed_field_addr_deref.zer`. Direct access `p.field` is unaffected and is what
+the diagnostic points users to; pinned by `tests/zer/packed_field_direct_ok.zer`.
+
+### (superseded) CONFIRMED LIVE — `&packed_field`
 
 `packed struct P { u8 a; u32 b; } ... *u32 q = &p.b;` compiles with no diagnostic. The
 non-packed control behaves identically, which is the point: the compiler cannot distinguish

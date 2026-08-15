@@ -1,0 +1,24 @@
+// The over-rejection boundary for the packed-pointer rule. Only a pointer FORMED
+// by &packed.field is rejected; the supported ways to touch a packed member must
+// keep working, and they are what the diagnostic points users to.
+packed struct P { u8 a; u32 b; u16 c; }
+struct Plain { u8 a; u32 b; }
+
+P pk;
+Plain pl;
+
+u32 main() {
+    pk.b = 7;                      // direct write to a packed field
+    u32 v = pk.b;                  // direct read
+    if (v != 7) { return 1; }
+    pk.c = 3;
+    if (pk.c != 3) { return 2; }
+
+    u32 copy = pk.b;               // copy to an aligned local, then use freely
+    if (copy != 7) { return 3; }
+
+    *u32 q = &pl.b;                // NON-packed &field — naturally aligned, fine
+    pl.b = 9;
+    if (*q != 9) { return 4; }
+    return 0;
+}

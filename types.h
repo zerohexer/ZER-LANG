@@ -229,6 +229,11 @@ struct Symbol {
     bool is_static;         /* static storage duration */
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
+    bool is_packed_derived; /* pointer formed by &packed_struct.field — may be MISALIGNED,
+                             * so a deref/index through it is a fault on ARM/RISC-V.
+                             * Extends BUG-493 (which gated only the @atomic_* sink) to
+                             * the general pointer sinks. Model 4: a static annotation
+                             * carried on the pointer, same rails as volatile/const. */
     bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
     bool is_nonkeep_derived; /* pointer traces to a non-keep param — cannot be persisted (keep axis) */
     int nonkeep_root_param;  /* keep inference: index of the param this pointer traces to (valid only when is_nonkeep_derived) */

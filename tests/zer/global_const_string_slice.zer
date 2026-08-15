@@ -1,0 +1,30 @@
+// BUG-790 — a global string constant could not be declared AT ALL.
+//
+// `const [*]u8 NAME = "ZER";` is documented in docs/reference.md ("const") and is
+// the ordinary way to put a string in .rodata / flash. It was rejected with the
+// self-contradictory message "cannot initialize 'NAME' of type '[]u8' with '[]u8'"
+// — both sides print the same because type_name does not render the qualifier.
+//
+// Root cause: a declaration's const/volatile qualifier is a flag on the DECL node,
+// not part of the type node, so it must be re-applied to the resolved slice or
+// pointer type. Three sites needed that and only ONE had it in full; the global
+// initializer type check had NEITHER, so the declared type came back a MUTABLE
+// slice, and a string literal (`const []u8`) cannot coerce to it — that guard
+// exists to stop .rodata writes and is correct. Fixed by ONE shared helper
+// (apply_decl_qualifiers) used at all three sites.
+//
+// The .rodata protection this interacts with is pinned by
+// tests/zer_fail/global_string_slice_mutable.zer and ..._const_to_mutable_param.zer.
+const [*]u8 NAME  = "ZER";
+const [*]u8 GREET = "hello";
+
+u32 count(const [*]u8 s) { return (u32)s.len; }
+
+u32 main() {
+    if (NAME.len != 3)      { return 1; }
+    if (GREET.len != 5)     { return 2; }
+    if (NAME[0] != 90)      { return 3; }   // 'Z'
+    if (count(NAME) != 3)   { return 4; }   // const -> const param
+    if (count(GREET) != 5)  { return 5; }
+    return 0;
+}

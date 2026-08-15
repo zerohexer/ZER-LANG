@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot pass const slice to mutable parameter
+// BUG-790 boundary #2: a const global string may not be laundered into a mutable
+// slice parameter — the callee could then write .rodata through it.
+const [*]u8 NAME = "ZER";
+
+u32 shout([*]u8 s) { s[0] = 65; return (u32)s.len; }
+
+u32 main() { return shout(NAME); }

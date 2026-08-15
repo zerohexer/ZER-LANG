@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: string literal is read-only
+// BUG-790 boundary. Making the global CONST form compile must not open the
+// MUTABLE one: a string literal lives in .rodata, so binding it to a mutable
+// global slice would let `NAME[0] = 65` write read-only memory (a SIGSEGV on
+// hosted, a silent no-op or fault on bare metal).
+//
+// This also pins the DIAGNOSTIC. The generic path printed "cannot initialize
+// 'NAME' of type '[]u8' with '[]u8'" — the same type on both sides, because
+// type_name does not render the qualifier — which reads as a compiler bug rather
+// than as the actionable "add const" it is.
+[*]u8 NAME = "ZER";
+
+u32 main() { return (u32)NAME.len; }

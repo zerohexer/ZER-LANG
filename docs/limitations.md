@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-## DONE — audit 2026-08-15: THE DEREFERENCE IDENTITY BOUNDARY + 4 more (BUG-785..789)
+## DONE — audit 2026-08-15: THE DEREFERENCE IDENTITY BOUNDARY + 5 more (BUG-785..790)
 
 Full-codebase audit. **Five accept-unsafe / silent-miscompile holes closed, each verified
 ACCEPTED by a from-HEAD `git archive` build before the fix and REJECTED after.** Plus a
@@ -139,6 +139,47 @@ verified to FAIL (exit 1) on the pre-fix compiler.
 functions, which needs the destination width threaded through the SHARED `eval_const_expr_ex` in
 ast.h (used by array sizes, `static_assert`, mmio ranges and VRP). The comptime-function path
 fixed here is the one that substitutes a value into emitted code.
+
+### BUG-790 — a global string constant could not be declared at all (MEDIUM, over-rejection + bad diagnostic)
+
+Found by compiling every complete example in `docs/reference.md`. The "const" section
+documents
+
+```zer
+const [*]u8 NAME = "ZER";    // in .rodata (flash on embedded)
+```
+
+which was REJECTED — with the self-contradictory message *"cannot initialize 'NAME' of
+type '[]u8' with '[]u8'"* (both sides print the same because `type_name` does not render
+the qualifier). There was NO spelling of a global string constant that compiled; the LOCAL
+form worked, which is what hid it.
+
+**Root cause — the same question at three sites, one complete.** A declaration's
+`const`/`volatile` is a FLAG ON THE DECL NODE, not part of the type node, so it must be
+re-applied to the resolved slice/pointer type:
+
+| site | had it |
+|---|---|
+| `check_stmt` NODE_VAR_DECL / NODE_GLOBAL_VAR | const + volatile (complete) |
+| `register_decl` | volatile only |
+| the global-INITIALIZER type check | NEITHER |
+
+At the third site the declared type came back a MUTABLE slice, and a string literal is
+`const []u8`; const->mutable coercion is refused to protect .rodata (correctly), so the
+initialization failed. Fixed by ONE shared helper `apply_decl_qualifiers`, plus the
+actionable diagnostic the local path already gave.
+
+Boundaries pinned, because making the const form compile must not open the mutable one:
+`tests/zer_fail/global_string_slice_mutable.zer` (mutable global slice from a literal) and
+`tests/zer_fail/global_string_const_to_mutable_param.zer` (laundering a const global into
+a mutable slice param). The three .rodata launder paths — to a mutable local, to a mutable
+struct field, and via a mutable return — were verified still rejected.
+Test: `tests/zer/global_const_string_slice.zer` (verified REJECTED pre-fix).
+
+**Note on `register_decl` (site 2, still volatile-only):** measured, and it has no
+observable consequence today — the const enforcement at every launder site keys on
+`Symbol.is_const`, not on the type's `slice.is_const`. Left as-is rather than changed
+speculatively; the shared helper now exists if a future site needs it.
 
 ### RELAXATION (accuracy, not a hole) — a call result that provably returns a STATIC
 

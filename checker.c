@@ -144,6 +144,59 @@ static bool type_carries_move(Type *t, int depth) {
     return false;
 }
 
+/* Apply a declaration's `const` / `volatile` QUALIFIERS to its resolved slice or
+ * pointer TYPE (BUG-790).
+ *
+ * The qualifier is parsed as a flag on the declaration node, not as part of the
+ * type node, so `const [*]u8 NAME = "ZER";` resolves to a NON-const slice unless
+ * something re-applies the flag. Three sites needed the answer and only ONE had
+ * it in full — the multi-site shape CLAUDE.md warns about:
+ *
+ *   check_stmt NODE_VAR_DECL/NODE_GLOBAL_VAR  const + volatile   (complete)
+ *   register_decl                              volatile only
+ *   the global-initializer type check          NEITHER
+ *
+ * The consequence at the third site was that a documented, ordinary declaration
+ * simply could not compile: a string literal is `const []u8`, the declared type
+ * came back as a MUTABLE `[]u8`, and const->mutable coercion is (correctly)
+ * refused to protect .rodata — so every global string constant was rejected with
+ * the self-contradictory message "cannot initialize 'NAME' of type '[]u8' with
+ * '[]u8'" (both sides print the same because type_name does not render the
+ * qualifier). There was NO spelling of a global string constant that compiled.
+ *
+ * One helper, three callers. Returns the adjusted type (or the original). */
+static Type *apply_decl_qualifiers(Checker *c, Node *decl, Type *type) {
+    if (!decl || !type) return type;
+    if (decl->var_decl.is_const) {
+        Type *eff = type_unwrap_distinct(type);
+        TypeKind k = type_dispatch_kind(type);   /* unwraps distinct; never a raw read */
+        if (eff && k == TYPE_SLICE && !eff->slice.is_const) {
+            Type *cs = type_const_slice(c->arena, eff->slice.inner);
+            cs->slice.is_volatile = eff->slice.is_volatile;
+            type = cs;
+        } else if (eff && k == TYPE_POINTER && !eff->pointer.is_const) {
+            Type *cp = type_const_pointer(c->arena, eff->pointer.inner);
+            cp->pointer.is_volatile = eff->pointer.is_volatile;
+            type = cp;
+        }
+    }
+    if (decl->var_decl.is_volatile) {
+        Type *eff = type_unwrap_distinct(type);
+        TypeKind k = type_dispatch_kind(type);
+        if (eff && k == TYPE_SLICE && !eff->slice.is_volatile) {
+            Type *vs = type_volatile_slice(c->arena, eff->slice.inner);
+            vs->slice.is_const = eff->slice.is_const;
+            type = vs;
+        } else if (eff && k == TYPE_POINTER && !eff->pointer.is_volatile) {
+            Type *vp = type_pointer(c->arena, eff->pointer.inner);
+            vp->pointer.is_volatile = true;
+            vp->pointer.is_const = eff->pointer.is_const;
+            type = vp;
+        }
+    }
+    return type;
+}
+
 /* Does this type CARRY a pointer/slice/opaque whose pointee is NOT a shared
  * struct? That is the exact hazard the bare fire-and-forget spawn rule tests
  * ("non-shared pointer to spawn — data race"), lifted so it can be asked of a
@@ -19346,6 +19399,12 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
         }
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
             Type *type = resolve_type(c, decl->var_decl.type);
+            /* BUG-790: a global's const/volatile qualifier lives on the DECL, not
+             * the type node. Without this the declared type of `const [*]u8 NAME`
+             * is a MUTABLE slice, so initializing it from a string literal (which
+             * is `const []u8`) failed the const->mutable coercion guard and NO
+             * global string constant could be declared at all. */
+            type = apply_decl_qualifiers(c, decl, type);
             Type *init = check_expr(c, decl->var_decl.init);
             /* global initializers must be constant expressions in C */
             Node *ginit = decl->var_decl.init;
@@ -19444,10 +19503,24 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             if (!type_equals(type, init) &&
                 !can_implicit_coerce(init, type) &&
                 !is_literal_compatible(decl->var_decl.init, type)) {
-                checker_error(c, decl->loc.line,
-                    "cannot initialize '%.*s' of type '%s' with '%s'",
-                    (int)decl->var_decl.name_len, decl->var_decl.name,
-                    type_name(type), type_name(init));
+                /* BUG-790: name the ACTUAL problem for the commonest case. A
+                 * string literal is `const []u8`; assigning it to a MUTABLE
+                 * global slice is refused to protect .rodata, but the generic
+                 * message printed the same type on both sides (type_name does
+                 * not render the qualifier), which reads as a compiler bug.
+                 * This is the message the local path already gives. */
+                if (decl->var_decl.init->kind == NODE_STRING_LIT &&
+                    type_dispatch_kind(type) == TYPE_SLICE) {
+                    checker_error(c, decl->loc.line,
+                        "string literal is read-only — declare '%.*s' as "
+                        "'const [*]u8' instead of '[*]u8'",
+                        (int)decl->var_decl.name_len, decl->var_decl.name);
+                } else {
+                    checker_error(c, decl->loc.line,
+                        "cannot initialize '%.*s' of type '%s' with '%s'",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        type_name(type), type_name(init));
+                }
             }
             /* BUG-373: integer literal range check for globals */
             if (decl->var_decl.init->kind == NODE_INT_LIT &&

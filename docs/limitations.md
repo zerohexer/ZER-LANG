@@ -390,6 +390,67 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
+
+Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a
+POLICY decision. **Every probe below was routed around its masking rule** — the first pass
+scored two of them "closed" on masked evidence.
+
+### ~~ISR non-atomic RMW laundered through a pointer parameter~~ — **CLOSED (measured)**
+
+`interrupt { rmw(&g); }` with `void rmw(*C p){ p.v += 1; }` is rejected on both routes:
+with a plain param the QUALIFIER gate fires (*"cannot pass volatile pointer to non-volatile
+param"*); with a `volatile *C` param the ISR rule fires (*"volatile global 'g' is shared
+between interrupt and main"*). The hazard has no unblocked path.
+**PROBE WARNING:** the obvious reproducer uses `p[0] += 1`, which is rejected by the
+single-pointer-indexing rule and masks both. Use a struct field (`p.v += 1`).
+
+### CONFIRMED LIVE — `free`-of-a-param-field through an UNWRAP-TO-LOCAL (accept-unsafe)
+
+The entry marked *"CLOSED 2026-08-08"* IS incomplete, as `2hg2v4` reported. Narrowed:
+
+| shape | verdict |
+|---|---|
+| `void fb(H h){ free(h.b); }` — direct | **caught** |
+| `void fb(H h){ [*]B lp = h.b; free(lp); }` | **LIVE** |
+| `void fb(H h){ [*]B a = h.b; [*]B c = a; free(c); }` | **LIVE** |
+
+**Root cause, measured — it is WIDER than the summary.** The summary scan
+(`zercheck_ir.c` ~6220) looks for a compound handle rooted at the param
+(`ch->local_id == plocal && ch->path_len > 0`). An unwrap-to-local frees a DIFFERENT local,
+so the compound is never marked. But the alias is missing INTRA-function too, in BOTH
+directions: `free(h.b); use(lp)` is also accepted. So `lp = h.b` registers no alias with the
+compound at all — fixing only the summary scan would leave the intra-function half open.
+
+**Fix shape:** register a var-decl/COPY whose source is a POINTER-CARRYING field of a
+by-value struct param as an alias of the compound `(plocal, ".field")`, so the existing
+alias-group propagation carries frees both ways. **DANGER — this is the exact class that
+broke `test_modules/move_user` TWICE** (see CLAUDE.md "The pointer-vs-scalar refinement"):
+the arm MUST be gated on the field being pointer-carrying, or a scalar field read
+(`u32 v = t.id;`) inherits the parent's transferred/freed state.
+**PROBE WARNING:** two of the three shapes are MASKED by the LEAK rule
+(*"handle %0 (local 'h') allocated ... never freed"*) — read the reason, not the exit code.
+The unmasked discriminator is `free(h.b); use(lp);`.
+
+### CONFIRMED LIVE — `&packed_field` forms a possibly-misaligned `*T` (POLICY, not a bug)
+
+`packed struct P { u8 a; u32 b; } ... *u32 q = &p.b;` compiles with no diagnostic. The
+non-packed control behaves identically, which is the point: the compiler cannot distinguish
+them at the `&` site today.
+**PROBE WARNING:** `return q[0]` masks this via the single-pointer-indexing rule; use `*q`.
+**Still an owner decision** — ban `&` on a packed field, require an explicit unaligned-load
+intrinsic, or accept with a diagnostic. Not something to settle by patching.
+
+### deref-launder residual (LOW, latent)
+
+The escape peel takes an intrinsic's LAST argument, so a hypothetical single-arg
+pointer-taking intrinsic with a SCALAR result would mis-mark its result local-derived. The
+one live instance (`@atomic_load(&local)`) is now unreachable — BUG-784 rejects atomics on a
+stack local first. `@ptrtoint` and `@probe` were checked and are unaffected. Fixing it would
+be a RELAXATION (the dangerous direction) for no currently-reachable gain.
+
+---
+
 ## OPEN — concurrency sweep 2026-08-10: NO holes found; two doc/impl mismatches corrected
 
 Systematic probe of the concurrency surface after BUG-783. **No accept-unsafe hole found.**

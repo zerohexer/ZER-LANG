@@ -1,0 +1,18 @@
+// The over-rejection boundary for the compound-fallback alias arm, and the
+// canary for the class that broke test_modules/move_user TWICE: reading a SCALAR
+// field out of a by-value struct param yields a VALUE, not a reference, so it
+// must NOT inherit the parent's freed/transferred state. Only a POINTER-carrying
+// field aliases (CLAUDE.md "The pointer-vs-scalar refinement").
+move struct Tok { u32 id; }
+struct Plain { u32 v; }
+
+u32 verify(Tok t) { return t.id; }          // scalar field of a MOVE struct param
+u32 read_plain(Plain p) { u32 x = p.v; return x; }
+
+u32 main() {
+    Tok a; a.id = 7;
+    if (verify(a) != 7) { return 1; }
+    Plain p; p.v = 3;
+    if (read_plain(p) != 3) { return 2; }
+    return 0;
+}

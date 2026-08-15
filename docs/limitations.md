@@ -405,7 +405,19 @@ between interrupt and main"*). The hazard has no unblocked path.
 **PROBE WARNING:** the obvious reproducer uses `p[0] += 1`, which is rejected by the
 single-pointer-indexing rule and masks both. Use a struct field (`p.v += 1`).
 
-### CONFIRMED LIVE — `free`-of-a-param-field through an UNWRAP-TO-LOCAL (accept-unsafe)
+### ~~`free`-of-a-param-field through an UNWRAP-TO-LOCAL~~ — **CLOSED 2026-08-16 (BUG-785)**
+
+`lp = h.b` now registers an alias with the compound `(param, ".b")`, so a free propagates in
+BOTH directions and the cross-function `frees_param_field` summary sees it. The existing
+FIELD_READ alias arm linked the dest to the BASE object's handle; a by-value struct param
+carries no allocation identity on the base — it lives on the COMPOUND — so the arm silently
+did nothing. Added a fallback that mints a shared `alloc_id` on the compound and aliases the
+unwrapped local into that group. Same POINTER-CARRYING gate as the existing arm, which is
+what keeps `test_modules/move_user` green (verified: 0 errors).
+Tests: `tests/zer_fail/frees_param_field_unwrap{,_reverse}.zer` +
+`tests/zer/field_read_scalar_no_alias_ok.zer` (the scalar canary).
+
+### (superseded) CONFIRMED LIVE — `free`-of-a-param-field through an UNWRAP-TO-LOCAL
 
 The entry marked *"CLOSED 2026-08-08"* IS incomplete, as `2hg2v4` reported. Narrowed:
 

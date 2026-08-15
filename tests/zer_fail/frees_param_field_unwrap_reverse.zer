@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// The REVERSE direction of the same missing alias, and the UNMASKED
+// discriminator for it: free the field directly, then use the unwrapped local.
+// (The forward shape is masked by the LEAK rule, so it alone does not prove the
+// alias exists — this one does.)
+struct B { u32 x; }
+struct H { [*]B b; }
+
+void fb(H h) {
+    [*]B lp = h.b;
+    free(h.b);
+    u32 z = lp[0].x;
+    if (z > 0) { return; }
+}
+
+u32 main() {
+    H h;
+    h.b = alloc(B, 4) orelse { return 0; };
+    fb(h);
+    return 0;
+}

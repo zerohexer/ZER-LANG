@@ -5,6 +5,35 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-16 — BUG-785: free-of-a-param-field through an unwrap-to-local
+
+Closes the entry that was marked "CLOSED 2026-08-08" and was NOT — `2hg2v4` was right.
+
+**The hole.** `void fb(H h){ [*]B lp = h.b; free(lp); }` left `h.b` unmarked, so the caller's
+later `free(h.b)` was a silent DOUBLE FREE. Narrowing first showed it was WIDER than the
+reported "summary scan misses an unwrapped local": the alias was missing INTRA-function in
+both directions — `free(h.b); use(lp);` was equally accepted — so patching only the summary
+would have left half the hole open while marking the entry closed.
+
+**Root cause.** The FIELD_READ alias arm (added 2026-08-06) links the destination to the
+handle of the BASE OBJECT. For a by-value struct param the base carries no allocation
+identity — it lives on the COMPOUND `(param, ".field")` — so the arm found nothing and
+silently did nothing. Fix: fall back to the full expression's compound key, minting a fresh
+`alloc_id` when absent so the compound and the unwrapped local share one alias group. A
+freshly-created compound has `alloc_id == 0`, and aliasing to zero shares nothing — that was
+the second false start, found by tracing rather than reasoning.
+
+**Direction and risk, worth stating because it was initially misjudged.** This is a
+TIGHTENING (accept -> reject), so the failure mode is over-rejection, which is LOUD and
+caught by `make check` in minutes — not a relaxation, where a mistake ships UB silently. The
+danger is entirely that the arm is too broad: this is the class that broke
+`test_modules/move_user` TWICE. Kept safe by the existing POINTER-CARRYING gate, so a scalar
+field read never reaches it. Verified: move_user 0 errors, plus a dedicated canary positive.
+
+**A flake, correctly diagnosed as one.** The first suite run failed `rc_cond_004` (a
+timing-sensitive condvar test). It passed standalone on BOTH the fixed and pre-fix builds,
+and a clean re-run was 0 failures — so it was not attributed to the change.
+
 ## Session 2026-08-11 — BUG-784: atomics on a stack local rejected (a tightening)
 
 Asked to enforce the documented atomics operand rule. The documented rule (`*shared T`)

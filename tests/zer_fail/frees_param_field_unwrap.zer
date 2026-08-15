@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// The frees-param-field entry marked "CLOSED 2026-08-08" was INCOMPLETE. The
+// direct form `void fb(H h){ free(h.b); }` was caught, but unwrapping the field
+// into a local first was not — the caller's later free(h.b) was a silent DOUBLE
+// FREE. Root cause: `lp = h.b` registered no alias with the compound
+// (param, ".b"), so nothing propagated in EITHER direction.
+struct B { u32 x; }
+struct H { [*]B b; }
+
+void fb(H h) {
+    [*]B lp = h.b;
+    free(lp);
+}
+
+u32 main() {
+    H h;
+    h.b = alloc(B, 4) orelse { return 0; };
+    fb(h);
+    free(h.b);
+    return 0;
+}

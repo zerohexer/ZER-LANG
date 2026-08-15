@@ -3345,6 +3345,45 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         ir_snapshot_alias(&fsnap, fh);
                         IRHandleInfo *fd = ir_add_handle(ps, inst->dest_local);
                         if (fd) { ir_apply_alias(fd, &fsnap); fd->state = fh->state; }
+                    } else {
+                        /* 2026-08-16: the BASE carries no allocation identity — the
+                         * common case being a BY-VALUE STRUCT PARAM, where the
+                         * allocation lives on the COMPOUND `(param, ".field")` and
+                         * not on the param local itself. Without this, an
+                         * unwrap-to-local
+                         *
+                         *     void fb(H h) { [*]B lp = h.b; free(lp); }
+                         *
+                         * left `h.b` unmarked (so the caller's later `free(h.b)` was
+                         * a silent DOUBLE FREE), and the reverse direction
+                         * `free(h.b); use(lp);` was equally unlinked. Bind the two
+                         * to one identity by creating the compound if absent, so the
+                         * existing alias-group propagation carries frees BOTH ways
+                         * and the cross-function frees_param_field summary (which
+                         * scans for a compound rooted at the param) sees it too.
+                         *
+                         * Same pointer-carrying gate as above — a SCALAR field read
+                         * never reaches here, which is what keeps move_user green. */
+                        int wroot; const char *wpath; uint32_t wplen;
+                        if (ir_extract_compound_key(zc, func, inst->expr,
+                                                     &wroot, &wpath, &wplen) == 0
+                            && wplen > 0) {
+                            IRHandleInfo *wh = ir_find_compound_handle(ps, wroot,
+                                                                       wpath, wplen);
+                            if (!wh) wh = ir_add_compound_handle(ps, wroot, wpath, wplen);
+                            /* A freshly-created compound carries NO allocation
+                             * identity, and aliasing to alloc_id 0 shares nothing.
+                             * Mint one so the compound and the unwrapped local land
+                             * in the SAME alias group — that group is what carries a
+                             * free in either direction. */
+                            if (wh && wh->alloc_id == 0) wh->alloc_id = _ir_next_alloc_id++;
+                            if (wh) {
+                                IRAliasSnapshot wsnap;
+                                ir_snapshot_alias(&wsnap, wh);
+                                IRHandleInfo *wd = ir_add_handle(ps, inst->dest_local);
+                                if (wd) { ir_apply_alias(wd, &wsnap); wd->state = wh->state; }
+                            }
+                        }
                     }
                 }
             }

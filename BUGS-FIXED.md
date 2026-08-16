@@ -5,6 +5,79 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-16d — BUG-788: the driver silently ignored unknown and malformed arguments
+
+Found by clearing compiler warnings, not by a safety probe — `--release` was parsed into a
+variable that was never read (`-Wunused-but-set-variable`), and pulling that thread showed the
+option loop had **no final `else` at all**. Every argument it did not recognise was dropped
+without a word.
+
+**Why this is a safety issue and not a papercut.** The flags it swallows configure the safety
+analysis:
+
+| invocation | what the user asked for | what they got |
+|---|---|---|
+| `--no-strict-mmi` (one char short) | relaxed mmio range checks | STRICT, silently |
+| `--target-bit 32` (typo) | 32-bit pointer width | host width, silently |
+| `--target-bits abc` / `0` / `128` | a width | width **0** — `atoi`, unvalidated |
+| `--stack-limit -5` | a limit | `(uint32_t)(-5)` = 4294967291 |
+| `--target-arch=sparc` | that arch | x86_64, silently |
+| `--target-bits -o out.c` | width + output path | the option NAME eaten as the value |
+| `zerc a.zer b.zer` | compile both | only `a.zer`, `b.zer` dropped |
+
+`target_ptr_bits` is exactly what the `volatile u64` single-word race exemption compares
+against (the 2026-08-03 tearing fix), so a mistyped width flag silently moves that decision.
+`--probe-mode=` already errored on a bad value; nothing else did.
+
+**Fixed:** a final `else` rejecting unknown options and unexpected positional arguments,
+`strtol`-with-validation for `--target-bits` (16/32/64) and `--stack-limit` (positive), an
+error for unknown `--target-arch=`, a distinct "requires a value" message for a value-less
+option, and `--release` now warns that it does nothing rather than pretending.
+
+**Gate: `tools/audit_cli_flags.sh`**, wired into `make check`. This class has no home in
+`tests/zer*` — those harnesses are about SOURCE, not invocation. Each row asserts the exit code
+AND that the message names the offending argument. **Verified to FAIL on a pre-fix build: 13 of
+22 checks red.**
+
+**Writing the gate found one more bug than the audit had.** The first draft tested the
+missing-value case as `want_reject --target-bits`, but the helper appends `-o <file>` — so the
+option was not value-less at all, it ate `-o` as its value. That malformed probe is what
+exposed the swallowed-option behaviour; the two helpers stay separate in the script with a note
+saying why. A second self-inflicted one: `grep -qF "$want"` with a `--`-prefixed pattern makes
+grep parse it as an option, which reported five passing cells as failures. `grep -qF --`.
+
+## Session 2026-08-16d — dead code and warning noise removed (10 functions, ~320 lines)
+
+`make zerc` emitted 22 warnings, and the noise was load-bearing: a genuine
+**`-Wreturn-type` in `lower_expr` (ir_lower.c)** sat in the middle of it. That switch is
+exhaustive over `NodeKind` with no `default:`, but GCC cannot prove an enum-typed value is in
+range, so the function **fell off the end and returned an indeterminate int — which the caller
+uses as a LOCAL ID**. A garbage local id indexes `func->locals[]` out of bounds: precisely the
+layout-fragile corruption CLAUDE.md describes as invisible to every sanitizer. Now follows the
+emitter's `ir_validate` convention — an `INTERNAL ERROR` message and `abort()`, because
+reaching it means memory corruption, never a language feature.
+
+Also from the same sweep:
+- **`ir.c` `-Walloc-size-larger-than`**: `calloc(func->block_count, ...)` where GCC could not
+  rule out a negative count wrapping to a huge `size_t`. The entry guard now rejects `<= 0`
+  (was `== 0`), and the allocation reads a local the compiler can see is non-negative — `func`
+  is a pointer, so the entry-guard fact could not be carried across the intervening loops.
+- **`zercheck_ir.c` `-Wformat`**: `%.*s` was handed a `size_t` precision. `%.*s` reads its
+  precision as an `int` from varargs, so this misaligned every argument after it — the
+  `IR_SUMMARY_DEBUG` trace printed garbage and could read past the name.
+- **Six nested-comment warnings** and **two `#include` "extra tokens"** — the latter from a
+  `*/` inside the include's own trailing comment, closing it early.
+- **Ten dead functions** (~320 lines), all AST-era leftovers from the IR migration:
+  `stmt_writes_shared`, `shared_needs_condvar`, `find_shared_root_in_stmt`,
+  `collect_async_locals` (emitter.c), `has_atomic_or_barrier` (checker.c — its own comment says
+  it was "absorbed"), `tok_str`, `peek`, `arena_array` (parser.c),
+  `ir_classify_method_call` (zercheck_ir.c — the deprecated compat wrapper CLAUDE.md said to
+  retire), `classify_builtin_call` (ir_lower.c). Each verified unreferenced first; two were
+  self-recursive orphans that only *look* used. Removal asserted the closing brace and refused
+  any span over 200 lines, per the deletion-overrun lesson.
+
+`zerc` now builds with one warning left (a benign `-Wsign-compare` on a line number).
+
 ## Session 2026-08-16c — BUG-787: a provably-out-of-bounds index compiled to a SILENT early return
 
 **The shape.** `u32 i = 10; arr[i] = 1;` on a `u32[4]`. VRP knows `i` is exactly 10 and the

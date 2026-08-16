@@ -380,7 +380,13 @@ static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
 bool ir_validate(IRFunc *func) {
     bool valid = true;
 
-    if (func->block_count == 0) {
+    /* `<= 0`, not `== 0`: block_count is a signed int, and the defer-balance
+     * pass below sizes a calloc with it. GCC's -Walloc-size-larger-than could
+     * not rule out a negative count reaching that calloc (it reported the range
+     * as the full negative-to-size_t wrap), which would be a huge allocation
+     * request from a single sign error. Rejecting a non-positive count here
+     * makes the invariant explicit instead of relying on every caller. */
+    if (func->block_count <= 0) {
         fprintf(stderr, "IR VALIDATION ERROR: function '%.*s' has no basic blocks\n",
                 (int)func->name_len, func->name);
         return false;
@@ -698,8 +704,15 @@ bool ir_validate(IRFunc *func) {
      * This is a true safety check — a missed defer is a leak or an
      * unreleased lock at runtime. Logged as ERROR, aborts compilation. */
     {
+        /* Snapshot the count into a local before allocating. `func` is a pointer,
+         * so GCC cannot carry the `block_count > 0` fact from the entry guard
+         * across the intervening loops — it kept reporting the calloc argument's
+         * range as the negative-to-size_t wrap. A local the compiler can see is
+         * non-negative both silences that and documents the invariant at the
+         * allocation itself. */
+        const int nblocks = func->block_count > 0 ? func->block_count : 0;
         /* Pre-compute which blocks contain ≥1 emit-bodies FIRE. */
-        bool *fire_in_block = (bool *)calloc(func->block_count, sizeof(bool));
+        bool *fire_in_block = (bool *)calloc((size_t)nblocks, sizeof(bool));
         if (fire_in_block) {
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *block = &func->blocks[bi];
@@ -712,7 +725,7 @@ bool ir_validate(IRFunc *func) {
                 }
             }
             /* For every PUSH, verify a reachable FIRE exists. */
-            bool *visited = (bool *)calloc(func->block_count, sizeof(bool));
+            bool *visited = (bool *)calloc((size_t)nblocks, sizeof(bool));
             if (visited) {
                 for (int bi = 0; bi < func->block_count; bi++) {
                     IRBlock *block = &func->blocks[bi];

@@ -222,6 +222,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/audit_type_dispatch.sh
 	@echo "=== Carrier-dispatch audit (wrapper-hides-inner-kind class kill) ==="
 	@bash tools/audit_carrier_dispatch.sh
+	@echo "=== CLI argument audit (no silently-ignored flags) ==="
+	@bash tools/audit_cli_flags.sh ./zerc
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="

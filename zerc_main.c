@@ -221,7 +221,6 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -263,9 +262,28 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
-            release_mode = true;
+            /* Parsed since forever, wired to nothing — `release_mode` was set and
+             * never read (-Wunused-but-set-variable). Accepting a flag that does
+             * nothing is worse than not having it: a user passing --release
+             * believes something changed. Kept accepted so existing scripts do not
+             * break, but it now says what it is. */
+            fprintf(stderr, "warning: --release currently has no effect "
+                            "(zerc always emits -O2 through gcc)\n");
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
-            zer_target_ptr_bits = atoi(argv[++i]);
+            /* Validated, not just atoi'd. Unchecked, `--target-bits abc` and
+             * `--target-bits 0` both produced a pointer width of ZERO, which
+             * silently changes every width-dependent decision (the `volatile u64`
+             * single-word race exemption compares against exactly this value).
+             * `--target-bits -o out.c` was worse still: the option NAME was eaten
+             * as the value, giving 0 AND losing the -o. */
+            const char *bv = argv[++i];
+            char *bend = NULL;
+            long bits = strtol(bv, &bend, 10);
+            if (!bend || *bend != '\0' || (bits != 16 && bits != 32 && bits != 64)) {
+                fprintf(stderr, "error: --target-bits expects 16, 32 or 64 (got '%s')\n", bv);
+                return 1;
+            }
+            zer_target_ptr_bits = (int)bits;
             target_bits_explicit = true;
         } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
             gcc_override = argv[++i];
@@ -280,7 +298,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
-            zer_stack_limit = (uint32_t)atoi(argv[++i]);
+            /* Same reasoning as --target-bits: a garbage or negative value used
+             * to become a limit of 0 (or a huge one via the unsigned cast), which
+             * either flags every function or none — silently, either way. */
+            const char *sv = argv[++i];
+            char *send = NULL;
+            long lim = strtol(sv, &send, 10);
+            if (!send || *send != '\0' || lim <= 0) {
+                fprintf(stderr, "error: --stack-limit expects a positive byte count "
+                                "(got '%s')\n", sv);
+                return 1;
+            }
+            zer_stack_limit = (uint32_t)lim;
         } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
             /* F4.2 (2026-04-29): comma-separated CPU features. Each match
              * sets a bit in zer_target_features (matches ZerCpuFeature
@@ -331,7 +360,43 @@ int main(int argc, char **argv) {
                 zer_target_arch_id = 3;
                 zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
                 zer_target_features = 0;  /* clear x86 baseline */
+            } else {
+                /* Silently keeping the x86_64 default here meant a typo'd arch
+                 * compiled for the WRONG TARGET with no diagnostic. --probe-mode
+                 * already errored on a bad value; this one did not. */
+                fprintf(stderr, "error: unknown --target-arch '%s' "
+                                "(use x86_64, aarch64, or riscv64)\n", a);
+                return 1;
             }
+        } else if (argv[i][0] == '-') {
+            /* UNKNOWN OPTION — reject rather than ignore.
+             *
+             * The chain above had no final else, so any argument it did not
+             * recognise was silently dropped. That is quiet in the worst way for
+             * the safety-relevant flags: `--no-strict-mmi` (one character short)
+             * compiled under STRICT mmio, and a mistyped `--target-bit 32`
+             * compiled for the host's pointer width — the exact configuration
+             * axis a `volatile u64` tearing check depends on. The user asked for
+             * one thing and got the opposite with no way to tell.
+             *
+             * A missing REQUIRED VALUE lands here too (the arms above are guarded
+             * on `i + 1 < argc`), so name that case separately rather than
+             * reporting a valid flag as unknown. */
+            if (strcmp(argv[i], "-o") == 0 ||
+                strcmp(argv[i], "--target-bits") == 0 ||
+                strcmp(argv[i], "--gcc") == 0 ||
+                strcmp(argv[i], "--stack-limit") == 0) {
+                fprintf(stderr, "error: option '%s' requires a value\n", argv[i]);
+            } else {
+                fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            }
+            return 1;
+        } else {
+            /* A bare extra argument. `zerc a.zer b.zer` used to compile only
+             * a.zer and drop b.zer without a word. */
+            fprintf(stderr, "error: unexpected argument '%s' — zerc compiles one "
+                            "source file per invocation\n", argv[i]);
+            return 1;
         }
     }
 
@@ -402,9 +467,7 @@ int main(int argc, char **argv) {
         use_temp_c = true;
     }
 
-    /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    /* for temp .c mode, set up the exe path */
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

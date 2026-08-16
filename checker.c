@@ -503,6 +503,15 @@ static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
 static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
+/* Bounded-index verdict (2026-08-16) — ONE query, asked at every bounded-index
+ * sink. See index_range_verdict for the class it kills. */
+typedef enum {
+    IDXV_UNKNOWN = 0,   /* range unknown, or straddles the bound -> runtime guard */
+    IDXV_IN_BOUNDS,     /* EVERY value in the range is a valid index -> no guard */
+    IDXV_ALWAYS_OOB,    /* NO value in the range is a valid index -> compile error */
+} IndexVerdict;
+static IndexVerdict index_range_verdict(Checker *c, Node *idx_expr, uint64_t bound,
+                                        int64_t *out_min, int64_t *out_max);
 static bool body_always_exits(Node *body);
 static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
@@ -7738,12 +7747,24 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* range propagation: check if index ident has proven range */
             if (node->index_expr.index->kind == NODE_IDENT) {
-                struct VarRange *r = find_var_range(c,
-                    node->index_expr.index->ident.name,
-                    (uint32_t)node->index_expr.index->ident.name_len);
-                if (r && r->min_val >= 0 && r->max_val >= 0 &&
-                    (uint64_t)r->max_val < obj->array.size) {
+                int64_t vmin = 0, vmax = 0;
+                IndexVerdict v = index_range_verdict(c, node->index_expr.index,
+                                                     obj->array.size, &vmin, &vmax);
+                if (v == IDXV_IN_BOUNDS) {
                     mark_proven(c, node);
+                } else if (v == IDXV_ALWAYS_OOB) {
+                    /* Sibling of the NODE_INT_LIT arm above and the NODE_CALL arm
+                     * below: the range proves the access can NEVER be in bounds.
+                     * Before this, it fell through to the auto-guard and the OOB
+                     * store silently returned from the function at runtime. */
+                    checker_error(c, node->loc.line,
+                        "array index '%.*s' has range [%lld, %lld], which is always "
+                        "out of bounds for array of size %llu",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (long long)vmin, (long long)vmax,
+                        (unsigned long long)obj->array.size);
+                    mark_proven(c, node);  /* error reported — no auto-guard on top */
                 }
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
@@ -7856,15 +7877,37 @@ static Type *check_expr(Checker *c, Node *node) {
                     ptr_proven = true;
                     mark_proven(c, node);
                 } else {
-                    /* variable index — auto-guard using mmio_bound as array size */
-                    mark_auto_guard(c, node, mmio_bound);
-                    checker_warning(c, node->loc.line,
-                        "MMIO index '%.*s' not proven in range (max %llu) — auto-guard inserted",
-                        node->index_expr.index->kind == NODE_IDENT ?
-                            (int)node->index_expr.index->ident.name_len : 1,
-                        node->index_expr.index->kind == NODE_IDENT ?
-                            node->index_expr.index->ident.name : "?",
-                        (unsigned long long)mmio_bound - 1);
+                    /* variable index. Same ONE query the fixed-array sink uses
+                     * (index_range_verdict) — this sink previously had NEITHER
+                     * arm: a provably in-range index still paid for a guard, and
+                     * a provably out-of-range one got the silent guard whose
+                     * runtime form is an early `return`. On an MMIO sink that
+                     * means a peripheral write that never happens, on bare metal
+                     * with no fault at all. */
+                    int64_t mmin = 0, mmax = 0;
+                    IndexVerdict mv = index_range_verdict(c, node->index_expr.index,
+                                                          mmio_bound, &mmin, &mmax);
+                    if (mv == IDXV_IN_BOUNDS) {
+                        mark_proven(c, node);   /* relaxation: zero-overhead access */
+                    } else if (mv == IDXV_ALWAYS_OOB) {
+                        checker_error(c, node->loc.line,
+                            "MMIO index '%.*s' has range [%lld, %lld], which is always "
+                            "out of range (max %llu from mmio declaration)",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (long long)mmin, (long long)mmax,
+                            (unsigned long long)mmio_bound - 1);
+                        mark_proven(c, node);
+                    } else {
+                        mark_auto_guard(c, node, mmio_bound);
+                        checker_warning(c, node->loc.line,
+                            "MMIO index '%.*s' not proven in range (max %llu) — auto-guard inserted",
+                            node->index_expr.index->kind == NODE_IDENT ?
+                                (int)node->index_expr.index->ident.name_len : 1,
+                            node->index_expr.index->kind == NODE_IDENT ?
+                                node->index_expr.index->ident.name : "?",
+                            (unsigned long long)mmio_bound - 1);
+                    }
                     ptr_proven = true;
                 }
             }
@@ -17071,6 +17114,62 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
     r->max_val = max_val;
     r->known_nonzero = known_nonzero;
     r->address_taken = false;
+}
+
+/* ================================================================
+ * index_range_verdict — the ONE bounded-index query (2026-08-16)
+ *
+ * THE CLASS THIS KILLS. "Does this index's proven range settle the access?"
+ * was answered independently at four sinks, and only the two LITERAL/CALL ones
+ * had the ALWAYS-OOB arm. The two IDENT sinks (fixed array, MMIO-derived
+ * pointer) had the safe arm only, so a provably-always-out-of-bounds access
+ * compiled with a *warning* and fell into the auto-guard — whose runtime form
+ * is `if (i >= N) { return <zero>; }`. That is silent at BOTH ends: no compile
+ * error, and at runtime the function returns early instead of trapping. On bare
+ * metal an init routine just stops half-way with no fault. (Measured: `u32 i=10;
+ * buf[i]=1;` on `u8[4]` compiled, and the statement AFTER it never ran.)
+ *
+ * The MMIO ident sink additionally had no safe arm at all, so an index the
+ * checker could prove in range still paid for a guard.
+ *
+ * Both directions now come from ONE function so a sink cannot drift again:
+ *   max <  bound (and min >= 0)  -> IN_BOUNDS   (elide the guard)
+ *   min >= bound, or max < 0     -> ALWAYS_OOB  (compile error)
+ *   anything else                -> UNKNOWN     (guard, as before)
+ *
+ * SOUNDNESS. The safe arm needs `max` to be a sound UPPER bound; the error arm
+ * needs `min` to be a sound LOWER bound. VRP maintains both (merges take the
+ * union — vrp_snap_join; a label or an `&x` widens to the full range), so the
+ * error direction rests on the same invariant the long-shipping safe direction
+ * already does.
+ *
+ * EMPTY RANGES ARE NOT AN ERROR. push_var_range INTERSECTS, so contradictory
+ * narrowings (`u32 i = 0; if (i > 5) { buf[i] = 1; }`) leave min > max. That
+ * region is unreachable, so it gets no diagnostic — reporting it would reject
+ * dead code. This is the one guard that keeps the new error arm free of false
+ * positives.
+ * ================================================================ */
+static IndexVerdict index_range_verdict(Checker *c, Node *idx_expr, uint64_t bound,
+                                        int64_t *out_min, int64_t *out_max) {
+    if (out_min) *out_min = 0;
+    if (out_max) *out_max = 0;
+    if (!idx_expr || bound == 0) return IDXV_UNKNOWN;
+    if (idx_expr->kind != NODE_IDENT) return IDXV_UNKNOWN;
+
+    struct VarRange *r = find_var_range(c, idx_expr->ident.name,
+                                        (uint32_t)idx_expr->ident.name_len);
+    if (!r) return IDXV_UNKNOWN;
+    if (r->min_val > r->max_val) return IDXV_UNKNOWN;  /* empty == unreachable */
+
+    if (out_min) *out_min = r->min_val;
+    if (out_max) *out_max = r->max_val;
+
+    if (r->min_val >= 0 && r->max_val >= 0 && (uint64_t)r->max_val < bound)
+        return IDXV_IN_BOUNDS;
+    if (r->max_val < 0) return IDXV_ALWAYS_OOB;              /* every value negative */
+    if (r->min_val >= 0 && (uint64_t)r->min_val >= bound)
+        return IDXV_ALWAYS_OOB;                              /* every value past the end */
+    return IDXV_UNKNOWN;
 }
 
 /* Refactor 1: unified VRP range update on assignment.

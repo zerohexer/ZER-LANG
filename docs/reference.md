@@ -170,8 +170,24 @@ void do_work() { }
 
 **DESCRIPTION**
 Fixed-size array. Size goes between type and name (NOT after name like C).
-Every index access is bounds-checked. Out-of-bounds traps at runtime.
-Compile-time constant indices are checked at compile time.
+Every index access is bounds-checked; no access can read or write past the end.
+
+The compiler asks one question at each access — *what does the index's proven
+range say?* — and there are exactly **three** answers:
+
+| verdict | when | what you get |
+|---|---|---|
+| **in bounds** | every value in the range is a valid index | no check emitted, zero overhead |
+| **always out of bounds** | no value in the range is a valid index | **compile error** |
+| **can't tell** | the range straddles the end | a runtime check |
+
+The "can't tell" check takes one of two forms. A bare identifier index gets an
+**auto-guard** — `if (i >= N) { return <zero value>; }` inserted before the
+access, so the function returns early rather than trapping. Any other index
+expression gets a **trapping** bounds check. Both are memory-safe; the
+auto-guard is the quieter of the two, which is why an index that is *provably*
+out of bounds is a compile error instead — otherwise the program would compile,
+run, and silently skip the rest of the function.
 
 **SYNTAX**
 ```zer
@@ -187,8 +203,16 @@ scores[0] = 100;
 scores[3] = 200;          // OK — index 3 < 4
 scores[4] = 300;          // COMPILE ERROR — index 4 >= 4
 
-u32 i = get_index();
-scores[i] = 50;           // runtime bounds check — traps if i >= 4
+u32 i = 10;
+scores[i] = 50;           // COMPILE ERROR — range [10,10] is always out of bounds
+                          // (same verdict as the literal above; the value being
+                          //  in a variable does not hide it)
+
+i32 neg = -1;
+scores[neg] = 50;         // COMPILE ERROR — every value in the range is negative
+
+u32 k = get_index();      // range unknown
+scores[k] = 50;           // auto-guard: if (k >= 4) { return; } before the access
 
 // Range propagation: proven-safe indices have ZERO overhead
 for (u32 j = 0; j < 4; j += 1) {
@@ -198,6 +222,18 @@ for (u32 j = 0; j < 4; j += 1) {
 // Inline call range: function return range proves index safe
 u32 hash(u32 key) { return key % 4; }
 scores[hash(42)] = 10;    // hash returns [0,3] — no bounds check, zero overhead
+
+u32 bad() { return 100; }
+scores[bad()] = 1;        // COMPILE ERROR — returns [100,100], always out of bounds
+```
+
+**NOTE — an unreachable access is not diagnosed.** Range narrowings intersect,
+so contradictory ones leave an empty range; that code cannot run, so it gets no
+error:
+
+```zer
+u32 d = 0;
+if (d > 5) { scores[d] = 1; }   // unreachable — no diagnostic, guard emitted
 ```
 
 **FIELDS**
@@ -2196,6 +2232,25 @@ u32 ok() {
 
 u32 bad(volatile *u32 reg, u32 i) {
     return reg[i];                        // COMPILE ERROR — no bound for a param
+}
+```
+
+- Once a bound IS derived, an MMIO index gets the SAME three-verdict treatment as
+  a fixed array (see the array section): provably in range costs nothing,
+  provably out of range is a compile error, and only a straddling range pays for
+  a guard. This matters more on MMIO than on an array — the guard's runtime form
+  is an early `return`, so a wild peripheral write would otherwise just silently
+  never happen, with no fault on bare metal to notice it by.
+
+```zer
+mmio 0x40000000..0x4000000F;              // 16 bytes = 4 u32 words
+
+u32 verdicts() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+    u32 a = 2;
+    u32 x = reg[a];                       // proven in range — no guard emitted
+    u32 b = 100;
+    return reg[b];                        // COMPILE ERROR — always out of range
 }
 ```
 

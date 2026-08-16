@@ -390,6 +390,23 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## ~~PRECISION GAP #1 (2026-04-19) — VRP literal not propagated to the index~~ — **CLOSED 2026-08-16 (BUG-787)**
+
+Recorded since the 2026-04-19 audit as "just a precision/message difference" because the
+auto-guard keeps the program memory-safe. **That framing understated it.** The auto-guard's
+runtime form is `if (i >= N) { return <zero>; }` — an early RETURN, not a trap — so the
+program compiled, ran, skipped the access AND everything after it in the function, with no
+diagnostic at either end. Measured: `side = 77; return 5;` after the access produced neither
+the store nor the 5.
+
+Closed by `index_range_verdict()` — ONE query returning IN_BOUNDS / ALWAYS_OOB / UNKNOWN,
+called from both ident sinks (fixed array, MMIO-derived pointer). Enumerating first found the
+MMIO ident sink was missing BOTH arms, not just the error one: a provably in-range MMIO index
+still paid for a guard. Gate: the 14-cell `tests/test_bounds_matrix.c`, verified to fail on a
+pre-fix build (3 red cells). See BUGS-FIXED.md 2026-08-16c.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a

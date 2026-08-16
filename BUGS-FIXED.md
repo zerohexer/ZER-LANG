@@ -5,6 +5,77 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-16c — BUG-787: a provably-out-of-bounds index compiled to a SILENT early return
+
+**The shape.** `u32 i = 10; arr[i] = 1;` on a `u32[4]`. VRP knows `i` is exactly 10 and the
+array holds 4, so the access can NEVER be in bounds. The compiler emitted a *warning* saying
+the index was "not proven in range" — which is the wrong verdict; it was proven, proven
+WRONG — and fell into the auto-guard. The auto-guard's runtime form is
+`if (i >= 4) { return <zero>; }`, so the program compiled, ran, skipped the store, **and
+returned from the function**. Measured: the statement after the access never executed and
+`main` returned 0 instead of 5. Silent at both ends — no compile error, no runtime trap. On
+bare metal an init routine just stops half-way with nothing to notice it by.
+
+**One question, five sinks, two of them wrong.** "Does this index's proven range settle the
+access?" was answered independently per sink, and the answers had drifted:
+
+| sink | in-bounds | always-OOB | straddling |
+|---|---|---|---|
+| `array[literal]` | proven | hard error | n/a |
+| `array[ident]` | proven | **MISSING** | guard |
+| `array[call()]` | proven | hard error | guard |
+| `mmio[literal]` | proven | hard error | n/a |
+| `mmio[ident]` | **MISSING** | **MISSING** | guard |
+
+The `array[call()]` sink already carried the ALWAYS-OOB arm, and its comment even records
+why: *"Pre-fix only (a) was handled and (b) silently corrupted memory at runtime."* The same
+lesson was never carried to the IDENT sibling. The MMIO ident sink had neither arm — so a
+provably in-range MMIO index also paid for a guard it did not need.
+
+**Fixed with ONE query, not N call sites** — `index_range_verdict()` returns
+IN_BOUNDS / ALWAYS_OOB / UNKNOWN and both sinks call it. That is the durable end-state
+CLAUDE.md prescribes for a patchwork, and it means a future sink gets both directions by
+construction rather than by remembering.
+
+**The one thing that keeps the new error arm free of false positives.** `push_var_range`
+INTERSECTS, so contradictory narrowings (`u32 i = 0; if (i > 5) { arr[i] = 1; }`) leave
+`min > max`. That region is unreachable; diagnosing it would reject legal dead code. An empty
+range therefore returns UNKNOWN. Soundness of the error direction rests on `min` being a
+sound LOWER bound, which VRP already maintains for the same reason the long-shipping safe
+direction can trust `max` (merges union, a label or an `&x` widens to the full range).
+
+**Four positive tests were rejected — and every one of them was a malformed probe, not a
+false positive.** Each used a "wild" helper that `return`s a CONSTANT, which
+`find_return_range` derives as a singleton; `async_auto_guard`'s "defeat VRP" trick (`i = 5`
+inside a one-trip loop) also fails now because the loop-body JOIN of [5,5] with [5,5] is
+still [5,5]. They were rewritten to read a mutable global, which is genuinely underivable, so
+each still exercises the mechanism it was written for. A `test_emit.c` case had gone further
+and *codified the bug as the contract* ("auto-guard: idx=10 >= 4 -> function returns 0 before
+access"); it now asserts the rejection, with a separate case keeping auto-guard coverage for a
+genuinely unprovable index.
+
+**Gate: `tests/test_bounds_matrix.c`** — SINK x RANGE-CLASS, no-`default:` enums so a new sink
+or range class fails `-Werror=switch` until every cell is filled. It measures WHICH VERDICT is
+reached, not merely whether a diagnostic appeared, because two of the three failure modes
+(silent guard instead of error; guard instead of elision) produce a program that compiles and
+runs — an exit-code-only probe scores both "fine". **Verified to FAIL on a pre-fix build from
+HEAD: 3 cells red** (array[ident]/always-oob SILENT, mmio[ident]/always-oob SILENT,
+mmio[ident]/in-bounds LOST-ELISION). A gate that has only ever passed is a script, not a net.
+
+**Its own first run was a vacuous pass**, worth recording: the guard detector did a whole-file
+`strstr` for `_zer_bounds_check`, which is defined as a static inline in the preamble of every
+emitted file — so every elision cell reported "guarded" and that half of the grid could never
+have failed. The detector is now scoped to the body of `main`.
+
+Tests: `tests/zer_fail/{bounds_ident_always_oob,mmio_ident_always_oob,bounds_ident_negative_idx}.zer`
+(the first promoted from `tests/zer_gaps/prec1_vrp_literal_i.zer`, which had recorded this exact
+shape since the 2026-04-19 audit) + `tests/zer/bounds_ident_proven_ok.zer` for the
+over-rejection boundary + the 14-cell matrix.
+
+**The MMIO relaxation cannot be a runnable positive.** With the guard correctly elided the
+program really reads `0x40001000` and SIGTRAPs on a hosted host — the first draft did exactly
+that (exit 133). That half is asserted compile-only, against the emitted C, in the matrix.
+
 ## Session 2026-08-16b — BUG-786: &packed_field deref rejected (extending BUG-493)
 
 **Recorded as a POLICY decision for weeks; it was not one.** BUG-493 already rejects

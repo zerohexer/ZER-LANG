@@ -1,0 +1,35 @@
+// The OVER-REJECTION boundary for index_range_verdict (2026-08-16). Every access
+// here must compile AND run: the new ALWAYS-OOB error arm must not fire on a
+// provably-safe index, on a range that straddles the bound, or on dead code.
+//
+// NO MMIO HERE ON PURPOSE. The companion relaxation (a provably in-range MMIO
+// index no longer pays for an auto-guard) cannot be exercised by a runnable
+// positive: with the guard correctly elided the program would really read
+// 0x40001000 and SIGTRAP on a hosted host — which is exactly what the first
+// draft of this file did (exit 133). That half is asserted compile-only, on the
+// emitted C, by tests/test_bounds_matrix.c cell [mmio[ident]][in-bounds].
+
+u32 seed() { return 9; }
+
+u32 main() {
+    u32[4] arr;
+
+    // provably in bounds -> compiles, guard elided
+    u32 a = 1;
+    arr[a] = 11;
+    if (arr[a] != 11) { return 1; }
+
+    // range STRADDLES the bound -> guard kept, no error
+    u32 b = 10;
+    if (seed() > 0) { b = 2; }
+    arr[b] = 22;
+    if (arr[b] != 22) { return 2; }
+
+    // EMPTY range (contradictory narrowing) = unreachable -> no diagnostic.
+    // push_var_range intersects, so `d` is [0,0] then narrowed by `d > 5` to
+    // min=6/max=0. Diagnosing that would be rejecting dead code.
+    u32 d = 0;
+    if (d > 5) { arr[d] = 33; }
+
+    return 0;
+}

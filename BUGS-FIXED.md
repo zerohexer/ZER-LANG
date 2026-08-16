@@ -5,6 +5,64 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-16e — BUG-789: `volatile` laundered away through a @ptrtoint -> @inttoptr round trip
+
+**The direct strip has always been an error; the round trip was the way around it.**
+
+```zer
+volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+usize a  = @ptrtoint(reg);       // the qualifier leaves the type system
+*u32 p   = @inttoptr(*u32, a);   // ... and does not come back
+*p = 1;  *p = 2;                 // gcc -O2 coalesces; the peripheral misses a write
+```
+
+`(*u32)reg` is rejected. This was not. Silent at both ends and invisible where it matters:
+on bare metal the device simply does not see the first store, and there is no fault to trace
+it by.
+
+Fixed on the `is_packed_derived` rails (BUG-786): a Model-2 `Symbol.is_volatile_addr` set
+where a var-decl binds `@ptrtoint(<volatile ptr>)`, consumed at the `@inttoptr` sink when the
+requested pointer type is not volatile. **BOTH shapes are covered in the same commit** — the
+inline `@inttoptr(*u32, @ptrtoint(reg))` and the through-a-local form — because closing only
+whichever one the reproducer used is how this class keeps reappearing.
+
+Direction: a TIGHTENING, so a shape the propagation cannot follow produces no diagnostic and
+can never turn a previously-rejected program into an accepted one. **Corpus cost measured
+before shipping: ZERO.** Of nine files using `@ptrtoint`, only four also use `@inttoptr`, and
+of those the only volatile round trip is this rule's own reproducer; the rest launder `&local`,
+which is untouched.
+
+**The type-dispatch audit caught my own shortcut again** — the same way it did on BUG-786.
+Both new sites read `->kind == TYPE_POINTER` off an already-`type_unwrap_distinct`ed local, so
+they were arguably safe, and the gate failed the build anyway. That is the linter working:
+it forces a conscious choice rather than trusting the author's local reasoning. Switched to
+`type_dispatch_kind()`.
+
+Tests: `tests/zer_fail/volatile_launder_ptrtoint_{roundtrip,inline}.zer` (the first promoted
+from `tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer`) +
+`tests/zer/volatile_ptrtoint_roundtrip_ok.zer` for the boundary — a round trip that KEEPS
+volatile, and one on a non-volatile address, must both still compile. That positive forms and
+discards the addresses rather than dereferencing them: reading 0x40020010 on a hosted host
+would trap, which is the MMIO-positive trap CLAUDE.md warns about and which BUG-787's first
+draft walked straight into.
+
+## Session 2026-08-16e — `naked` is no longer SILENTLY dropped (warning; semantics still deferred)
+
+`naked void reset_handler() { asm(...) }` emitted `void reset_handler(void)` with **no
+`__attribute__((naked))`**, so gcc generated a prologue and epilogue anyway — and said nothing.
+A reset handler running before the stack exists, an `iret`/`eret` handler, or a context switch
+that saves callee-saved registers itself then misbehaves with no diagnostic and no fault.
+
+**The deferral is deliberate and stays.** Restoring the attribute is a user-visible breaking
+change: every existing `tests/zer/asm_*.zer` omits an explicit `ret` and would SIGILL. That
+decision belongs to the owner, not to an audit, so this commit does not make it.
+
+What it does change is the SILENCE. ZER's stated position is that the user's hardware claim
+must be visible at the use site rather than hidden; a warning is the whole of that here. It
+emits zero difference in the generated C, so it breaks nothing, and it names the workaround
+(write the function in C, link it via `cinclude`). To be removed in the same commit that
+re-enables the attribute.
+
 ## Session 2026-08-16d — BUG-788: the driver silently ignored unknown and malformed arguments
 
 Found by clearing compiler warnings, not by a safety probe — `--release` was parsed into a

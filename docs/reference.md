@@ -2235,6 +2235,20 @@ u32 bad(volatile *u32 reg, u32 i) {
 }
 ```
 
+- `volatile` cannot be laundered off through an integer. The direct strip
+  `(*u32)vreg` is an error, and so is the round trip that used to get around it:
+
+```zer
+volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+usize a = @ptrtoint(reg);
+*u32 plain = @inttoptr(*u32, a);      // COMPILE ERROR — qualifier stripped
+volatile *u32 ok = @inttoptr(volatile *u32, a);   // OK — qualifier kept
+```
+
+  Without the rule, `*plain = 1; *plain = 2;` coalesces under `-O2` and the
+  peripheral never sees the first store — with no fault on bare metal to notice
+  it by. A round trip on a NON-volatile address is unaffected.
+
 - Once a bound IS derived, an MMIO index gets the SAME three-verdict treatment as
   a fixed array (see the array section): provably in range costs nothing,
   provably out of range is a compile error, and only a straddling range pays for
@@ -2308,8 +2322,26 @@ grep -rnE "\basm\s*[(]" src/
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+Declares a function whose body must be pure `asm(...)` statements plus `return`.
+The checker enforces that (non-asm code would use a stack frame that a genuinely
+naked function never allocates).
+
+**⚠ CURRENT LIMITATION — the attribute is NOT emitted.** `__attribute__((naked))`
+was dropped during the IR migration and has not been restored, so gcc still
+generates a normal prologue and epilogue for the function. The checker warns at
+every `naked` declaration to say so.
+
+This matters wherever the point of `naked` is exact control of the frame:
+
+- a reset/boot handler that runs before the stack pointer is set up
+- an interrupt handler returning via `iret` / `eret` rather than an implicit `ret`
+- a context switch that saves and restores callee-saved registers itself
+
+In those cases the implicit prologue silently corrupts or leaks registers while
+the asm still "compiles". **Until this is restored, write such a function in C
+and link it via `cinclude`** — the pattern real firmware projects use. Restoring
+the attribute is a breaking change (every existing asm test omits an explicit
+`ret` and would SIGILL), tracked in `docs/limitations.md`.
 
 **SYNTAX**
 ```zer

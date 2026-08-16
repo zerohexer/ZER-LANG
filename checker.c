@@ -512,6 +512,9 @@ typedef enum {
 } IndexVerdict;
 static IndexVerdict index_range_verdict(Checker *c, Node *idx_expr, uint64_t bound,
                                         int64_t *out_min, int64_t *out_max);
+/* Volatile-address laundering (2026-08-16) — see the definition. */
+static bool expr_is_ptrtoint_of_volatile(Checker *c, Node *e);
+static bool addr_expr_is_volatile_derived(Checker *c, Node *e);
 static bool body_always_exits(Node *body);
 static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
@@ -8937,6 +8940,25 @@ static Type *check_expr(Checker *c, Node *node) {
                                 type_name(val_type));
                         }
                     }
+                    /* Qualifier laundering through the integer round trip. The
+                     * DIRECT strip `(*u32)vreg` is already an error; going out
+                     * through @ptrtoint and back was the way around it, and the
+                     * result is coalesced MMIO stores with nothing to notice
+                     * them by. */
+                    if (result) {
+                        Type *res_q = type_unwrap_distinct(result);
+                        if (res_q && type_dispatch_kind(result) == TYPE_POINTER &&
+                            !res_q->pointer.is_volatile &&
+                            addr_expr_is_volatile_derived(c, node->intrinsic.args[0])) {
+                            checker_error(c, node->loc.line,
+                                "@inttoptr produces a NON-volatile '%s' from the address of "
+                                "a VOLATILE object — the round trip through @ptrtoint would "
+                                "strip the qualifier, and gcc may then coalesce or drop the "
+                                "accesses so a peripheral misses a write. Ask for a volatile "
+                                "pointer type here, or keep using the original volatile pointer.",
+                                type_name(result));
+                        }
+                    }
                     /* mmio range validation: @inttoptr REQUIRES mmio declarations
                      * unless --no-strict-mmio flag is set */
                     if (c->mmio_range_count == 0 && !c->no_strict_mmio) {
@@ -11933,6 +11955,12 @@ static void check_stmt(Checker *c, Node *node) {
                         if (addr_of_is_packed_field(c, addr_exprs[ai]))
                             sym->is_packed_derived = true;
                     }
+                    /* Carry "this integer holds a VOLATILE object's address" onto
+                     * the symbol so the @inttoptr sink can see it. Set at the
+                     * declaration, checked at the use — the same shape as
+                     * is_packed_derived directly above. */
+                    if (expr_is_ptrtoint_of_volatile(c, init))
+                        sym->is_volatile_addr = true;
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:
                      *   `Box b = { .ptr = &local };`        (Case `&local`)
@@ -16777,6 +16805,31 @@ static void check_func_body(Checker *c, Node *node) {
 
         if (node->func_decl.is_naked) {
             c->in_naked = true;
+            /* The `naked` ATTRIBUTE is not emitted (emitter.c ~4388): the IR
+             * migration dropped it, and restoring it is a user-visible breaking
+             * change (every existing asm test omits an explicit `ret` and would
+             * SIGILL). That deferral is deliberate and documented — but until
+             * 2026-08-16 it was also SILENT, which is the part that was wrong:
+             * the user writes `naked`, GCC emits a prologue and epilogue anyway,
+             * and nothing says so. A reset handler running before the stack
+             * exists, or a context-switch routine that saves callee-saved
+             * registers itself, then malfunctions with no diagnostic and no
+             * fault to trace it by.
+             *
+             * ZER's stated position is that the user's hardware claim must be
+             * VISIBLE AT THE USE SITE rather than hidden. A warning is the whole
+             * of that here: it does not change a single byte of output, so it
+             * breaks nothing, and it stops the gap being invisible. Remove it in
+             * the same commit that re-enables the attribute. */
+            checker_warning(c, node->loc.line,
+                "'naked' on '%.*s' is accepted but the "
+                "__attribute__((naked)) is NOT emitted — gcc will still generate "
+                "a prologue and epilogue for this function. Code that requires a "
+                "genuinely naked frame (a reset handler, an 'iret'/'eret' "
+                "handler, a context switch) will misbehave. Write it in C and "
+                "link it via 'cinclude' until this is restored. "
+                "See docs/limitations.md 'naked attribute silently dropped'.",
+                (int)node->func_decl.name_len, node->func_decl.name);
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
             if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {
@@ -17092,6 +17145,53 @@ static IndexVerdict index_range_verdict(Checker *c, Node *idx_expr, uint64_t bou
     if (r->min_val >= 0 && (uint64_t)r->min_val >= bound)
         return IDXV_ALWAYS_OOB;                              /* every value past the end */
     return IDXV_UNKNOWN;
+}
+
+
+/* ================================================================
+ * Volatile-address laundering (2026-08-16)
+ *
+ * `(*u32)vreg` — stripping volatile with a cast — has always been an error.
+ * The ROUND TRIP was not:
+ *
+ *     volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+ *     usize a  = @ptrtoint(reg);          // qualifier leaves the type system
+ *     *u32 p   = @inttoptr(*u32, a);      // ... and does not come back
+ *     *p = 1;  *p = 2;                    // gcc -O2 coalesces; the peripheral
+ *                                         // misses a write
+ *
+ * Silent at both ends and invisible on bare metal: no diagnostic, no fault, the
+ * device just does not see the first store.
+ *
+ * Both halves are needed because the address can arrive at @inttoptr two ways —
+ * inline, or through a local that carries the fact on its Symbol. This is a
+ * TIGHTENING, so a shape the propagation cannot follow simply produces no
+ * diagnostic; it can never turn a previously-rejected program into an accepted
+ * one. Measured before shipping: ZERO legitimate volatile round-trips in the
+ * corpus — the only one is this rule's own reproducer.
+ * ================================================================ */
+static bool expr_is_ptrtoint_of_volatile(Checker *c, Node *e) {
+    if (!e || e->kind != NODE_INTRINSIC) return false;
+    if (e->intrinsic.name_len != 8 ||
+        memcmp(e->intrinsic.name, "ptrtoint", 8) != 0) return false;
+    if (e->intrinsic.arg_count < 1) return false;
+    Type *pt = typemap_get(c, e->intrinsic.args[0]);
+    if (!pt) return false;
+    Type *eff = type_unwrap_distinct(pt);
+    return eff && type_dispatch_kind(pt) == TYPE_POINTER && eff->pointer.is_volatile;
+}
+
+/* Is this @inttoptr address argument known to hold a volatile object's address?
+ * Either it IS the @ptrtoint call, or it is an ident carrying the flag. */
+static bool addr_expr_is_volatile_derived(Checker *c, Node *e) {
+    if (!e) return false;
+    if (expr_is_ptrtoint_of_volatile(c, e)) return true;
+    if (e->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                 (uint32_t)e->ident.name_len);
+        return s && s->is_volatile_addr;
+    }
+    return false;
 }
 
 /* Refactor 1: unified VRP range update on assignment.

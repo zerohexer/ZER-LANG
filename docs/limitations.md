@@ -407,6 +407,17 @@ pre-fix build (3 red cells). See BUGS-FIXED.md 2026-08-16c.
 
 ---
 
+## ~~LOW bare-metal — `volatile` lost through a `@ptrtoint` -> `@inttoptr` round-trip~~ — **CLOSED 2026-08-16 (BUG-789)**
+
+Filed LOW because "both intrinsics are explicit at the use site, so it is audit-visible rather
+than silent". Re-reading that: what is visible at the use site is the ROUND TRIP, not the
+QUALIFIER LOSS — the whole point is that the type system stops carrying volatile, and the
+consequence (coalesced MMIO stores, a peripheral missing a write) has no fault on bare metal.
+Closed by `Symbol.is_volatile_addr`, on the `is_packed_derived` rails, covering the inline and
+through-a-local shapes together. Corpus cost measured at ZERO. See BUGS-FIXED.md 2026-08-16e.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a
@@ -3833,10 +3844,17 @@ clearer code intent.
 
 ---
 
-## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+## `naked` attribute dropped on IR path — still deferred, but NO LONGER SILENT (2026-08-16)
 
 **Status:** known regression from IR migration; not fixed because fixing
 breaks every existing `tests/zer/asm_*.zer` test.
+
+**2026-08-16 — the SILENCE is closed, the semantics are not.** The checker now emits a
+warning at every `naked` declaration saying the attribute is not applied, what will go wrong
+(reset handler / `iret` handler / context switch), and the `cinclude` workaround. That is a
+diagnostic only — the emitted C is byte-identical — so it breaks nothing while the migration
+below remains the owner's call. **Remove the warning in the same commit that re-enables the
+attribute.**
 
 **Symptom:** ZER source declaring `naked void f() { asm { ... } }`
 emits C without `__attribute__((naked))`. GCC therefore generates a

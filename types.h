@@ -234,6 +234,15 @@ struct Symbol {
                              * Extends BUG-493 (which gated only the @atomic_* sink) to
                              * the general pointer sinks. Model 4: a static annotation
                              * carried on the pointer, same rails as volatile/const. */
+    bool is_volatile_addr;  /* INTEGER holding the address of a VOLATILE object, from
+                             * @ptrtoint(volatile *T). Feeding it back through
+                             * @inttoptr to a NON-volatile pointer launders the
+                             * qualifier away: the direct strip `(*u32)vreg` is
+                             * rejected, the round trip was not, and the result is
+                             * coalesced MMIO stores — a peripheral that misses a
+                             * write, silently, with no fault on bare metal.
+                             * Model 2: a property of the value at a program point,
+                             * carried the same way is_packed_derived is. */
     bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
     bool is_nonkeep_derived; /* pointer traces to a non-keep param — cannot be persisted (keep axis) */
     int nonkeep_root_param;  /* keep inference: index of the param this pointer traces to (valid only when is_nonkeep_derived) */

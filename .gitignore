@@ -67,6 +67,7 @@ test_shape_matrix
 test_escape_matrix
 test_keep_matrix
 test_cflow_matrix
+test_bounds_matrix
 test_conc_matrix
 test_hw_matrix
 test_async_matrix
@@ -78,3 +79,32 @@ rust_tests/rt_task_alloc_free
 rust_tests/rt_task_alloc_free_cycle
 test_defer_goto_matrix
 test_view_alias_matrix
+
+# Test-suite build artifacts (2026-08-16). 562 compiled executables were
+# TRACKED under rust_tests/ (11 MB), test_modules/ and tests/zer_fail/, because
+# the runners build an exe next to each .zer and never removed it — so every
+# `make check` rewrote committed files and left the tree dirty. The runners now
+# clean up after themselves; these patterns keep any stragglers out of git.
+# .zer sources are matched by the negations below, never by these rules.
+rust_tests/*
+!rust_tests/*.zer
+!rust_tests/*.sh
+!rust_tests/*.md
+!rust_tests/qemu/
+test_modules/*
+!test_modules/*.zer
+!test_modules/*.sh
+!test_modules/*.md
+tests/zer_fail/*
+!tests/zer_fail/*.zer
+tests/zer/*
+!tests/zer/*.zer
+tests/zer_trap/*
+!tests/zer_trap/*.zer
+tests/zer_gaps/*
+!tests/zer_gaps/*.zer
+!tests/zer_gaps/*.md
+zig_tests/*
+!zig_tests/*.zer
+!zig_tests/*.sh
+!zig_tests/*.md

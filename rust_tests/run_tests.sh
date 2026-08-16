@@ -57,6 +57,11 @@ for f in "$(dirname "$0")"/*.zer; do
             FAIL=$((FAIL + 1))
         fi
     fi
+    # Both paths leave an executable NEXT TO THE SOURCE: `--run` builds one there
+    # by design, and `-o /dev/null` does too because /dev/null is a non-.c path
+    # (CLAUDE.md "zerc -o gotchas"). Nothing removed them, so 554 of these ended
+    # up COMMITTED and every run rewrote them. Mirrors zig_tests/run_tests.sh.
+    rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
 done
 
 echo "=== Rust test results: $PASS passed, $FAIL failed, $SKIP skipped ==="

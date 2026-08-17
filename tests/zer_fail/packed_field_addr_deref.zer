@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: points into a PACKED struct field
+// expect-error: pointer into a PACKED struct field
 // A pointer formed by &packed_struct.field is not naturally aligned, so a deref
 // through it is a hard fault on ARM/RISC-V (silently slow on x86). The emitter
 // drops the packed-ness entirely — it emits a plain `uint32_t*` — so nothing

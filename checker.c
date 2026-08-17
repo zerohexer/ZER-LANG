@@ -2243,6 +2243,53 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     return true;
 }
 
+/* Does this VALUE expression yield a possibly-MISALIGNED pointer into a packed
+ * struct field? (BUG-804, 2026-08-17)
+ *
+ * `addr_of_is_packed_field` answers it for a literal `&p.f`; this adds the ALIAS
+ * hop, so a pointer copied from a packed-derived local answers too. Before this,
+ * `Symbol.is_packed_derived` was written at exactly ONE site (the var-decl
+ * `addr_exprs` loop) and read at exactly ONE site (the deref of a bare ident) —
+ * so of the five ways to reach the same misaligned store, only one was gated:
+ *
+ *     *u32 q = &g.b; *q = 7;      var-decl  -> REJECTED (the only guarded form)
+ *     q = &g.b; *q = 7;           assign    -> accepted
+ *     poke(&g.b);                 call-arg  -> accepted   (no Symbol exists at all)
+ *     *u32 r = q; *r = 7;         alias     -> accepted
+ *     return &g.b;                return    -> accepted
+ *
+ * Measured on the assignment form: `movl $7, 1+g(%rip)` — a 32-bit store at an
+ * ODD address. A hard fault on ARMv7-M / RISC-V, a silent split access on
+ * Cortex-M0+, and merely slow on x86 — so no hosted test could ever have caught
+ * it. GCC's own -Waddress-of-packed-member does fire, but it is a warning, its
+ * `#line` mapping points at the wrong line, and zerc deletes the .c in a normal
+ * build. */
+static bool value_is_packed_derived(Checker *c, Node *v, int depth) {
+    if (!v || depth > 8) return false;
+    v = unwrap_ptr_launder(v);
+    if (!v) return false;
+    if (v->kind == NODE_ORELSE)
+        return value_is_packed_derived(c, v->orelse.expr, depth + 1) ||
+               value_is_packed_derived(c, v->orelse.fallback, depth + 1);
+    if (addr_of_is_packed_field(c, v)) return true;
+    if (v->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                 (uint32_t)v->ident.name_len);
+        return s && s->is_packed_derived;
+    }
+    return false;
+}
+
+/* The one diagnostic for the class — four sinks now raise it, so the wording
+ * lives once. `what` names the position so the message stays actionable. */
+static void packed_misalign_error(Checker *c, int line, const char *what) {
+    checker_error(c, line,
+        "%s a pointer into a PACKED struct field — it may be misaligned, which is "
+        "a hard fault on ARM/RISC-V and a silent split access on Cortex-M0+. "
+        "Access the field directly (`s.field`) or copy it to an aligned local first",
+        what);
+}
+
 /* Scan-local pointer aliases: `*u32 p = &counter;` inside the body being scanned.
  * The scan walks ANOTHER function's AST from the CALLER's scope, so scope_lookup
  * cannot see that function's locals — the alias has to be recorded when the scan
@@ -4798,13 +4845,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->unary.operand->ident.name,
                         (uint32_t)node->unary.operand->ident.name_len);
                     if (ds && ds->is_packed_derived) {
-                        checker_error(c, node->loc.line,
-                            "dereferencing '%.*s' — it points into a PACKED struct "
-                            "field and may be misaligned (a hard fault on ARM/RISC-V). "
-                            "Access the field directly (`s.field`) or copy it to an "
-                            "aligned local first",
-                            (int)node->unary.operand->ident.name_len,
-                            node->unary.operand->ident.name);
+                        packed_misalign_error(c, node->loc.line, "dereferencing");
                     }
                 }
             }
@@ -4932,6 +4973,22 @@ static Type *check_expr(Checker *c, Node *node) {
          * Level-A stance as the var-decl and return sinks. */
         if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
             deref_launder_error(c, node->loc.line);
+        }
+        /* BUG-804 — the ASSIGNMENT sink of the packed-misalignment class. The
+         * flag was written ONLY in the var-decl path, so re-pointing an existing
+         * pointer at a packed field (`q = &g.b;`) left it unflagged and the
+         * following `*q = 7` compiled to an unaligned 32-bit store. Set on a
+         * packed-derived RHS and CLEAR otherwise, so `q = &aligned.z;` re-clears
+         * — a sticky flag would over-reject every later deref of a reused
+         * pointer. */
+        if (node->assign.op == TOK_EQ && node->assign.target &&
+            node->assign.target->kind == NODE_IDENT) {
+            Symbol *ats = scope_lookup(c->current_scope,
+                node->assign.target->ident.name,
+                (uint32_t)node->assign.target->ident.name_len);
+            if (ats)
+                ats->is_packed_derived =
+                    value_is_packed_derived(c, node->assign.value, 0);
         }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
@@ -6490,6 +6547,13 @@ static Type *check_expr(Checker *c, Node *node) {
         for (int dli = 0; dli < node->call.arg_count; dli++) {
             if (deref_ptr_launder(c, node->call.args[dli]))
                 deref_launder_error(c, node->loc.line);
+            /* BUG-804 — the CALL-ARG sink of the packed-misalignment class. This
+             * one CANNOT be reached by the Symbol flag at all: `poke(&g.b)` binds
+             * no name, so there is nothing to carry the fact. The predicate has to
+             * be asked directly on the argument expression. That is why the flag
+             * route was structurally incomplete rather than merely under-wired. */
+            if (value_is_packed_derived(c, node->call.args[dli], 0))
+                packed_misalign_error(c, node->loc.line, "passing");
         }
 
         /* G3 (2026-08-09): a call made while a fire-and-forget spawn is live —
@@ -12780,6 +12844,13 @@ static void check_stmt(Checker *c, Node *node) {
                         if (addr_of_is_packed_field(c, addr_exprs[ai]))
                             sym->is_packed_derived = true;
                     }
+                    /* BUG-804: the ALIAS hop. `*u32 q = &g.b; *u32 r = q;` — the
+                     * addr_exprs loop above only sees a literal `&`, so `r` was
+                     * never flagged and `*r = 7` compiled to the same misaligned
+                     * store. One shared predicate answers both forms. */
+                    if (!sym->is_packed_derived && node->var_decl.init &&
+                        value_is_packed_derived(c, node->var_decl.init, 0))
+                        sym->is_packed_derived = true;
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:
                      *   `Box b = { .ptr = &local };`        (Case `&local`)
@@ -14185,6 +14256,12 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
             deref_launder_error(c, node->loc.line);
         }
+        /* BUG-804 — the RETURN sink. `return &g.b;` hands the CALLER a misaligned
+         * pointer, and the caller's deref has no way to know (the fact does not
+         * cross the function boundary). Reject at the source, where the packedness
+         * is visible. */
+        if (node->ret.expr && value_is_packed_derived(c, node->ret.expr, 0))
+            packed_misalign_error(c, node->loc.line, "returning");
         /* B4: ban control flow that exits a @once body (would skip the done-publish). */
         if (c->in_once) {
             checker_error(c, node->loc.line,

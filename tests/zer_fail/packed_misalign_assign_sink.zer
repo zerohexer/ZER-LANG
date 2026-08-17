@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: pointer into a PACKED struct field
+// BUG-804 (2026-08-17): `Symbol.is_packed_derived` was written at exactly ONE site
+// (the var-decl addr_exprs loop) and read at exactly ONE site (the deref of a bare
+// ident), so of the five ways to reach the same misaligned store only the var-decl
+// form was gated. This is the ASSIGNMENT form: re-pointing an existing pointer at a
+// packed field left it unflagged.
+//
+// Measured: `movl $7, 1+g(%rip)` — a 32-bit store at an ODD address. A hard fault
+// on ARMv7-M / RISC-V, a silent split access on Cortex-M0+, and merely slow on x86,
+// so no hosted test could ever have caught it. GCC's own
+// -Waddress-of-packed-member does fire, but it is a warning, its #line mapping
+// points at the wrong line, and zerc deletes the .c in a normal build.
+packed struct P { u8 a; u32 b; }
+struct Q { u32 z; }
+Q ok;
+P g;
+u32 main() {
+    *u32 q = &ok.z;
+    q = &g.b;        // assignment sink — flag was never set
+    *q = 7;
+    return 0;
+}

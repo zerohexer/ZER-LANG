@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: pointer into a PACKED struct field
+// BUG-804 — the CALL-ARG sink, and the one that proves the Symbol-flag route was
+// structurally incomplete rather than merely under-wired: `poke(&g.b)` binds no
+// name, so there is no Symbol to carry the fact at all. The predicate has to be
+// asked directly on the argument expression.
+packed struct P { u8 a; u32 b; }
+P g;
+void poke(*u32 p) { *p = 7; }
+u32 main() {
+    poke(&g.b);
+    return 0;
+}

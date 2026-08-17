@@ -1,0 +1,23 @@
+// BUG-804 boundary: the four new packed-misalignment sinks must not touch the
+// ALIGNED forms, and the flag must CLEAR when a pointer is re-pointed at an aligned
+// field — a sticky flag would over-reject every later deref of a reused pointer.
+// Direct packed-field access (`s.field`) stays the correct, unaffected way to touch
+// a packed member: the compiler emits the byte-wise access GCC knows how to do.
+packed struct P { u8 a; u32 b; }
+struct Q { u32 z; }
+Q aligned;
+P g;
+
+void poke(*u32 p) { *p = 7; }
+*u32 aligned_field_ptr() { return &aligned.z; }
+
+u32 main() {
+    *u32 q = &g.b;          // FORMING the pointer is fine — only using it is not
+    q = &aligned.z;         // re-point at an ALIGNED field: must CLEAR the flag
+    *q = 3;                 // ... so this deref must be allowed
+    poke(&aligned.z);       // aligned call-arg allowed
+    u32 v = g.b;            // DIRECT packed field read — the correct way
+    g.b = v + 1;
+    if (g.b != 1) { return 1; }
+    return aligned.z - 7;   // poke() wrote 7
+}

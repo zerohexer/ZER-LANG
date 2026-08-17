@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: pointer into a PACKED struct field
+// BUG-804 — the RETURN sink. Handing the CALLER a misaligned pointer is worse than
+// the local forms: the fact does not cross the function boundary, so the caller's
+// deref has no way to know. Rejected at the source, where the packedness is visible.
+packed struct P { u8 a; u32 b; }
+P g;
+*u32 leak() { return &g.b; }
+u32 main() {
+    return 0;
+}

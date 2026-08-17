@@ -20452,6 +20452,13 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
         count = collect_shared_types_in_expr(c, expr->var_decl.init, types, max_types, count);
         break;
     case NODE_CALL: {
+        /* BUG-795: the CALLEE expression is part of the statement and can touch a
+         * SECOND shared type — `g.cb(h.w)` reads shared G in callee position and
+         * shared H in the argument, which is exactly the same-statement two-lock
+         * deadlock this check exists to reject. Only the args were walked, so the
+         * check saw ONE type and passed. */
+        if (count < max_types)
+            count = collect_shared_types_in_expr(c, expr->call.callee, types, max_types, count);
         for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
         /* Transitive: look up callee's cached shared types (BUG-474 proper fix).

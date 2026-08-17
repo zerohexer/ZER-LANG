@@ -1350,6 +1350,10 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
         found = find_shared_root_expr(c, expr->assign.target);
         if (!found) found = find_shared_root_expr(c, expr->assign.value);
     } else if (expr->kind == NODE_CALL) {
+        /* BUG-795: the CALLEE expression touches shared state too — `g.cb()` reads
+         * a funcptr field out of shared struct `g`, and that read needs the same
+         * lock an argument read needs. Callee position was never walked. */
+        found = find_shared_root_expr(c, expr->call.callee);
         for (int i = 0; i < expr->call.arg_count && !found; i++)
             found = find_shared_root_expr(c, expr->call.args[i]);
     } else if (expr->kind == NODE_UNARY) {
@@ -1456,6 +1460,8 @@ static void find_all_shared_roots_expr(Checker *c, Node *expr,
         find_all_shared_roots_expr(c, expr->assign.target, out, count, max);
         find_all_shared_roots_expr(c, expr->assign.value, out, count, max);
     } else if (expr->kind == NODE_CALL) {
+        /* BUG-795: see find_shared_root_expr — callee position was never walked. */
+        find_all_shared_roots_expr(c, expr->call.callee, out, count, max);
         for (int i = 0; i < expr->call.arg_count; i++)
             find_all_shared_roots_expr(c, expr->call.args[i], out, count, max);
     } else if (expr->kind == NODE_UNARY) {

@@ -1,0 +1,23 @@
+// BUG-799 (2026-08-17): `find_return_range` never scanned control-flow CONDITION
+// expressions, so `orelse { return N; }` in an if/while/for condition or a switch
+// scrutinee was a real return path silently dropped from the callee's range union.
+// The summary UNDER-approximated ([1,2] instead of [1,9]) and the CALLER elided
+// its bounds guard — ASan-confirmed silent stack-buffer-overflow WRITE, exit 0.
+//
+// VALUE-ASSERTING: guard present => early return 0; guard absent => 42.
+// Measured against a from-HEAD pre-fix build: 42 before, 0 after.
+?u32 mb() { return null; }
+
+u32 pick() {
+    if ((mb() orelse { return 9; }) > 0) { return 1; }
+    return 2;
+}
+
+u32 probe() {
+    u8[4] a;
+    u32 i = pick();
+    a[i] = 7;
+    return 42;
+}
+
+u32 main() { return probe(); }

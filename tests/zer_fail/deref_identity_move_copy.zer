@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: obtained by dereferencing a pointer to a pointer
+// BUG-785 — the move-struct facet (HOLE-A4, open since 2026-07). Copying a move
+// struct OUT of a dereference produces a SECOND owner with no link to the first,
+// so both can be consumed. The alias-then-consume order was already caught
+// (tests/zer_fail/move_double_close_via_alias.zer); copy-out FIRST, then consume
+// both, was not. Silent: no diagnostic, no runtime check — the resource
+// (fd/handle/one-shot token) is released twice.
+move struct Tok { u32 k; }
+i32 g_consumed;
+
+void consume(Tok t) { g_consumed += 1; }
+
+u32 main() {
+    Tok a;
+    a.k = 1;
+    *Tok p = &a;
+    Tok b = *p;      // second owner of a's resource — was accepted
+    consume(a);
+    consume(b);      // double-consume
+    return (u32)g_consumed;
+}

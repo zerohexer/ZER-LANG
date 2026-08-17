@@ -1,0 +1,24 @@
+// BUG-797 (2026-08-17): a `for` whose CONDITION variable differs from its INIT
+// variable pushed the init clause's lower bound onto the condition variable —
+// one it never initialises. `for (i32 q = 0; k < 4; q += 1)` proved `k` in
+// [0,3], eliding the bounds guard on `a[k]` inside the body. With k negative
+// that is an ASan-confirmed stack-buffer-UNDERFLOW write, with NO compile error
+// and NO runtime trap; on bare metal, silent corruption of the adjacent frame.
+//
+// VALUE-ASSERTING, because the defect emits no diagnostic a negative test could
+// hold: the guard's early return yields 0, its ABSENCE falls through to 42.
+// Measured against a from-HEAD pre-fix build: 42 before, 0 after.
+volatile i32 g_start = -3;
+i32 seed() { return g_start; }
+
+u32 probe() {
+    u8[4] a;
+    i32 k = seed();
+    for (i32 q = 0; k < 4; q += 1) {
+        a[k] = 7;
+        k += 1;
+    }
+    return 42;
+}
+
+u32 main() { return probe(); }

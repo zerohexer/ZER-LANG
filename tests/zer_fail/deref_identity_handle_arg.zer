@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: obtained by dereferencing a pointer
+// BUG-785 — the CALL-ARGUMENT sink (the 4th sink of the class). Freeing the
+// dereferenced handle DIRECTLY, without binding it to a name first, skipped the
+// three value-binding sinks entirely. Same consequence as the copy form: the
+// caller's free is an unreported double free.
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void norm_free(*Handle(Task) p) {
+    tasks.free(*p);         // deref feeds the free directly — was accepted
+}
+
+u32 main() {
+    ?Handle(Task) mh = tasks.alloc();
+    Handle(Task) h = mh orelse return;
+    norm_free(&h);
+    tasks.free(h);          // double free
+    return 0;
+}

@@ -1,0 +1,26 @@
+// BUG-798 (2026-08-17): `vrp_widen_loop_addr_taken` was a hand-rolled if/else
+// chain that did not name NODE_SPAWN — and whose trailing comment asserted
+// spawn/await/asm were leaves with "no `&` subtree", which is false. So
+// `spawn bump(&i)` in a loop body did not widen `i`'s range while the plain-call
+// control `bump(&i)` did, and `a[i]` earlier in the body was proven against the
+// stale pre-loop range: ASan-confirmed silent stack-buffer-overflow write.
+//
+// The walker is now an exhaustive no-`default:` switch, so a NEW NodeKind that
+// can hold `&x` is a BUILD FAILURE rather than another silently-missed alias.
+//
+// VALUE-ASSERTING: guard present => early return 0; guard absent => 42.
+// Measured against a from-HEAD pre-fix build: 42 before, 0 after.
+void bump(*u32 p) { *p += 9; }
+
+u32 probe() {
+    u8[4] a;
+    u32 i = 0;
+    for (u32 q = 0; q < 2; q += 1) {
+        a[i] = 1;
+        ThreadHandle th = spawn bump(&i);
+        th.join();
+    }
+    return 42;
+}
+
+u32 main() { return probe(); }

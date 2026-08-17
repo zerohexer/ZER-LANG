@@ -1794,6 +1794,150 @@ static Node *unwrap_ptr_launder(Node *v) {
     return v;
 }
 
+/* Does this type carry a MOVE STRUCT at any nesting depth? The move-struct
+ * sibling of type_carries_data_pointer / type_carries_handle — a move struct
+ * copied out of a place the analyzer cannot follow creates a SECOND owner of the
+ * same one-shot resource, which is the same hazard as an untrackable pointer
+ * alias. Recurses optional/array/struct/union so a wrapper cannot hide it
+ * (the "wrapper hides the inner kind" multi-site class). */
+static bool type_carries_move(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_STRUCT) {
+        if (u->struct_type.is_move) return true;
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            if (type_carries_move(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    if (k == TYPE_OPTIONAL) return type_carries_move(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)    return type_carries_move(u->array.inner, depth + 1);
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_move(u->union_type.variants[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Would a VALUE of this type, copied out of a place the analyzer cannot resolve,
+ * create a second alias/owner of a TRACKED allocation?
+ *
+ * BUG-796 (2026-08-17): this replaces a hand-rolled three-kind disjunction
+ * (`ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE`) that answered
+ * the question for pointers only. The three shapes it missed are each a live
+ * accept-unsafe hole with an identical consequence — an untracked second owner:
+ *   - Handle(T)  — `Handle(T) k = *p; pool.free(k);` in a callee records NOTHING
+ *     in the frees-param summary (the freed thing is an IR temp, not the param),
+ *     so the caller's own free is an unflagged DOUBLE FREE that mangles the
+ *     generation counter, and a later get() on the reused slot silently returns
+ *     the WRONG object.
+ *   - move struct — `Tok b = *p;` yields a second owner, so both can be
+ *     consumed; the one-shot resource is released twice with no diagnostic and
+ *     no runtime check.
+ *   - a struct CARRYING either at any depth — the wrapper-hides-the-inner-kind
+ *     class; a bare-kind test lets `Wrap{ Handle h; }` through.
+ * Asking ONE type-level question instead of enumerating kinds is what makes a
+ * new carrier shape covered by construction rather than by the next audit. */
+static bool deref_yields_tracked_identity(Type *t) {
+    if (!t) return false;
+    return type_carries_data_pointer(t, 0) ||
+           type_carries_handle(t, 0) ||
+           type_carries_move(t, 0);
+}
+
+/* Static type of an lvalue/launder PATH, resolved WITHOUT calling check_expr.
+ *
+ * BUG-796: the deref-launder predicate used to `scope_lookup` a BARE NODE_IDENT
+ * operand, so the identical launder through any other operand form — a struct
+ * FIELD (`*h.pp`), an array element (`*a[0]`), a nested deref (`**ppp`), or a
+ * laundering cast — walked past every sink while the ident form was rejected.
+ * That is the FORM axis of the multi-site class: one question, N spellings.
+ *
+ * check_expr is not usable at these sinks (the var-decl sink runs before the
+ * init is checked, and a second traversal would double-emit diagnostics), so
+ * this resolves the path structurally instead. Conservative by construction:
+ * an unhandled form returns NULL, which makes the caller's predicate false. */
+static Type *deref_operand_type(Checker *c, Node *e, int depth) {
+    if (!e || depth > 32) return NULL;
+    e = unwrap_ptr_launder(e);
+    if (!e) return NULL;
+    switch (e->kind) {
+    case NODE_IDENT: {
+        Symbol *sy = scope_lookup(c->current_scope, e->ident.name,
+                                  (uint32_t)e->ident.name_len);
+        return sy ? sy->type : NULL;
+    }
+    case NODE_FIELD: {
+        Type *ot = deref_operand_type(c, e->field.object, depth + 1);
+        /* auto-deref / optional-unwrap to reach the aggregate */
+        for (int i = 0; i < 8 && ot; i++) {
+            TypeKind k = type_dispatch_kind(ot);
+            Type *u = type_unwrap_distinct(ot);
+            if (!u) return NULL;
+            if (k == TYPE_POINTER)       { ot = u->pointer.inner; continue; }
+            if (k == TYPE_OPTIONAL)      { ot = u->optional.inner; continue; }
+            if (k == TYPE_HANDLE)        { ot = u->handle.elem; continue; }
+            break;
+        }
+        Type *u = type_unwrap_distinct(ot);
+        if (!u || type_dispatch_kind(u) != TYPE_STRUCT) return NULL;
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            if (u->struct_type.fields[i].name_len == (uint32_t)e->field.field_name_len &&
+                memcmp(u->struct_type.fields[i].name, e->field.field_name,
+                       e->field.field_name_len) == 0)
+                return u->struct_type.fields[i].type;
+        }
+        return NULL;
+    }
+    case NODE_INDEX: {
+        Type *ot = deref_operand_type(c, e->index_expr.object, depth + 1);
+        Type *u = type_unwrap_distinct(ot);
+        if (!u) return NULL;
+        TypeKind k = type_dispatch_kind(u);
+        if (k == TYPE_ARRAY)   return u->array.inner;
+        if (k == TYPE_SLICE)   return u->slice.inner;
+        if (k == TYPE_POINTER) return u->pointer.inner;
+        return NULL;
+    }
+    case NODE_UNARY: {
+        if (e->unary.op != TOK_STAR) return NULL;
+        Type *ot = deref_operand_type(c, e->unary.operand, depth + 1);
+        Type *u = type_unwrap_distinct(ot);
+        if (!u || type_dispatch_kind(u) != TYPE_POINTER) return NULL;
+        return u->pointer.inner;
+    }
+    /* Every other form (call result, binary, literal, …) is deliberately
+     * unresolved => NULL => predicate false. Conservative direction: this can
+     * only under-reject, never mis-reject a safe program.
+     *
+     * Enumerated with NO `default:` so -Werror=switch makes a NEW node kind a
+     * BUILD FAILURE rather than a silent unresolved form — the same discipline
+     * that caught NODE_ORELSE going missing from the VRP loop walker. A new
+     * kind that can hold a dereferenceable path must be added above. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE:
+    case NODE_STATIC_ASSERT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT:
+        return NULL;
+    }
+    return NULL;
+}
+
 /* A POINTER-typed value produced by dereferencing a pointer-to-pointer creates an
  * alias the analyzer cannot follow: `**Node pp = &n; *Node k = *pp;` makes k alias
  * n's allocation, but resolving that needs points-to over pp, which the per-file +
@@ -1811,19 +1955,28 @@ static Node *unwrap_ptr_launder(Node *v) {
  * are NOT matched here — the gate requires the RESULT to be pointer-typed. */
 static bool deref_ptr_launder(Checker *c, Node *e) {
     if (!e || e->kind != NODE_UNARY || e->unary.op != TOK_STAR) return false;
-    Node *inner = e->unary.operand;
-    if (!inner || inner->kind != NODE_IDENT) return false;
-    Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
-                              (uint32_t)inner->ident.name_len);
-    if (!sy || !sy->type) return false;
-    /* operand must be a pointer-to-pointer ... */
-    Type *ot = type_unwrap_distinct(sy->type);
-    if (type_dispatch_kind(ot) != TYPE_POINTER) return false;
-    Type *inner_t = ot->pointer.inner ? type_unwrap_distinct(ot->pointer.inner) : NULL;
-    if (!inner_t) return false;
-    TypeKind ik = type_dispatch_kind(inner_t);
-    /* ... yielding a POINTER (or slice/opaque): a scalar `u32 v = *p` is unaffected. */
-    return ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE;
+    /* BUG-796: operand type resolved from the PATH, so every operand form is
+     * covered — bare ident, struct field, array element, nested deref, cast. */
+    Type *ot = deref_operand_type(c, e->unary.operand, 0);
+    if (!ot) return false;
+    Type *otu = type_unwrap_distinct(ot);
+    if (!otu || type_dispatch_kind(otu) != TYPE_POINTER) return false;
+    /* ... and the RESULT must carry a tracked identity (pointer / slice / opaque /
+     * Handle / move struct, at any wrapper depth). A scalar `u32 v = *p` and a
+     * pure-value struct copy are unaffected. */
+    return deref_yields_tracked_identity(otu->pointer.inner);
+}
+
+/* The one diagnostic for the whole class. It was pasted at three sinks before
+ * BUG-796 added a fourth; one emitter means a wording fix lands everywhere and a
+ * new sink cannot drift into its own phrasing. */
+static void deref_launder_error(Checker *c, int line) {
+    checker_error(c, line,
+        "cannot bind a value obtained by dereferencing a pointer to a pointer, "
+        "Handle or move struct — the compiler cannot prove which allocation it "
+        "aliases, so a later free or consume through either name would be a "
+        "use-after-free or double release. Alias the pointer directly "
+        "('*T k = p;') or pass the value, not the location");
 }
 
 /* Is this expression `&<packed struct>.field` (at any field/index depth)?
@@ -4494,11 +4647,7 @@ static Type *check_expr(Checker *c, Node *node) {
          * analyzer cannot follow into a field or a global. Same predicate and
          * Level-A stance as the var-decl and return sinks. */
         if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
-            checker_error(c, node->loc.line,
-                "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                "— the compiler cannot prove which allocation it aliases, so a later "
-                "free through either name would be a use-after-free. Alias the pointer "
-                "directly ('*T k = p;') instead");
+            deref_launder_error(c, node->loc.line);
         }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
@@ -6047,6 +6196,17 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Function call ---- */
     case NODE_CALL: {
+        /* Deref-launder sink #4 (BUG-796, 2026-08-17). The three value-BINDING
+         * sinks (var-decl / assignment / return) are skipped entirely when the
+         * dereferenced value is handed straight to a call: `pool.free(*p)` frees
+         * an allocation the analyzer cannot attribute, and the caller's own free
+         * of the same slot is then an unreported double free. Covers user calls
+         * and builtin methods alike — both are NODE_CALL. */
+        for (int dli = 0; dli < node->call.arg_count; dli++) {
+            if (deref_ptr_launder(c, node->call.args[dli]))
+                deref_launder_error(c, node->loc.line);
+        }
+
         /* G3 (2026-08-09): a call made while a fire-and-forget spawn is live —
          * descend the callee and record its plain global accesses, so moving a
          * statement into a helper cannot change whether it races. The post-check
@@ -11780,11 +11940,7 @@ static void check_stmt(Checker *c, Node *node) {
              * double-freed. A scalar `u32 v = *p` is NOT matched (the predicate
              * requires a POINTER-typed result); corpus cost measured at ZERO. */
             if (node->var_decl.init && deref_ptr_launder(c, node->var_decl.init)) {
-                checker_error(c, node->loc.line,
-                    "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                    "— the compiler cannot prove which allocation it aliases, so a later "
-                    "free through either name would be a use-after-free. Alias the pointer "
-                    "directly ('*T k = p;') instead");
+                deref_launder_error(c, node->loc.line);
             }
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
@@ -13047,8 +13203,27 @@ static void check_stmt(Checker *c, Node *node) {
             /* try to get init value for min */
             int64_t init_val = 0; /* default min */
             bool init_known = false;
+            /* BUG-797 (2026-08-17): the init clause's value may only be used as
+             * the lower bound of the variable it actually INITIALISES. The name
+             * check was absent, so `for (i32 q = 0; k < 4; q += 1)` pushed q's
+             * lower bound 0 onto **k** — a variable the loop never initialises —
+             * and `a[k]` inside the body was falsely proven in [0,3]. With k
+             * negative that elided the bounds guard entirely: no diagnostic, no
+             * runtime trap, an ASan-confirmed stack-buffer-UNDERFLOW write, and
+             * on bare metal silent corruption of the adjacent frame. The
+             * semantically identical `while (k < 4)` was always guarded, which is
+             * what makes the mismatch the trigger rather than the shape.
+             *
+             * On mismatch fall through to the INT64_MIN seed below (B8's sound
+             * default) — `k < 4` bounds k from ABOVE only, so nothing is known
+             * about its lower bound. push_var_range clamps min to 0 for an
+             * UNSIGNED var, so the common `for (u32 i = 0; k < N; ...)` keeps its
+             * true type invariant and no precision is lost. */
             if (node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
-                node->for_stmt.init->var_decl.init) {
+                node->for_stmt.init->var_decl.init && loop_var &&
+                node->for_stmt.init->var_decl.name &&
+                (uint32_t)node->for_stmt.init->var_decl.name_len == loop_var_len &&
+                memcmp(node->for_stmt.init->var_decl.name, loop_var, loop_var_len) == 0) {
                 int64_t iv = eval_const_expr(node->for_stmt.init->var_decl.init);
                 if (iv != CONST_EVAL_FAIL) { init_val = iv; init_known = true; }
             }
@@ -13630,10 +13805,7 @@ static void check_stmt(Checker *c, Node *node) {
          * cannot follow, so a free through either name is a UAF. Same predicate and
          * Level-A stance as the var-decl sink. Scalar / struct-VALUE not matched. */
         if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
-            checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                "— the compiler cannot prove which allocation it aliases, so a later "
-                "free through either name would be a use-after-free. Alias the pointer "
-                "directly ('*T k = p;') instead");
+            deref_launder_error(c, node->loc.line);
         }
         /* B4: ban control flow that exits a @once body (would skip the done-publish). */
         if (c->in_once) {
@@ -17666,12 +17838,12 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
  * with a full range, so no later narrowing applies anywhere in the loop.
  * Over-widening is SOUND for VRP — it can only ADD a guard, never remove one —
  * and only address-taken vars are touched, so plain counters keep the precise
- * join. Mirrors the sibling's if/else-chain form (NOT a switch) so the
- * walker-default audit stays untouched. */
+ * join. Exhaustive no-`default:` switch (BUG-798) so -Werror=switch turns a new
+ * NodeKind into a build failure rather than a silently-missed alias. */
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
     if (!n) return;
-    NodeKind k = n->kind;
-    if (k == NODE_UNARY) {
+    switch (n->kind) {
+    case NODE_UNARY:
         if (n->unary.op == TOK_AMP) {
             Node *root = n->unary.operand;
             while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -17690,71 +17862,111 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
             }
         }
         vrp_widen_loop_addr_taken(c, n->unary.operand);
-    } else if (k == NODE_BLOCK) {
+        break;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             vrp_widen_loop_addr_taken(c, n->block.stmts[i]);
-    } else if (k == NODE_IF) {
+        break;
+    case NODE_IF:
         vrp_widen_loop_addr_taken(c, n->if_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->if_stmt.then_body);
         vrp_widen_loop_addr_taken(c, n->if_stmt.else_body);
-    } else if (k == NODE_FOR) {
+        break;
+    case NODE_FOR:
         vrp_widen_loop_addr_taken(c, n->for_stmt.init);
         vrp_widen_loop_addr_taken(c, n->for_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->for_stmt.step);
         vrp_widen_loop_addr_taken(c, n->for_stmt.body);
-    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
         vrp_widen_loop_addr_taken(c, n->while_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->while_stmt.body);
-    } else if (k == NODE_SWITCH) {
+        break;
+    case NODE_SWITCH:
         vrp_widen_loop_addr_taken(c, n->switch_stmt.expr);
         for (int i = 0; i < n->switch_stmt.arm_count; i++)
             vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].body);
-    } else if (k == NODE_EXPR_STMT) {
-        vrp_widen_loop_addr_taken(c, n->expr_stmt.expr);
-    } else if (k == NODE_DEFER) {
-        vrp_widen_loop_addr_taken(c, n->defer.body);
-    } else if (k == NODE_CRITICAL) {
-        vrp_widen_loop_addr_taken(c, n->critical.body);
-    } else if (k == NODE_ONCE) {
-        vrp_widen_loop_addr_taken(c, n->once.body);
-    } else if (k == NODE_VAR_DECL) {
-        vrp_widen_loop_addr_taken(c, n->var_decl.init);
-    } else if (k == NODE_RETURN) {
-        vrp_widen_loop_addr_taken(c, n->ret.expr);
-    } else if (k == NODE_ASSIGN) {
+        break;
+    case NODE_EXPR_STMT: vrp_widen_loop_addr_taken(c, n->expr_stmt.expr); break;
+    case NODE_DEFER:     vrp_widen_loop_addr_taken(c, n->defer.body); break;
+    case NODE_CRITICAL:  vrp_widen_loop_addr_taken(c, n->critical.body); break;
+    case NODE_ONCE:      vrp_widen_loop_addr_taken(c, n->once.body); break;
+    case NODE_VAR_DECL:  vrp_widen_loop_addr_taken(c, n->var_decl.init); break;
+    case NODE_RETURN:    vrp_widen_loop_addr_taken(c, n->ret.expr); break;
+    case NODE_ASSIGN:
         vrp_widen_loop_addr_taken(c, n->assign.target);
         vrp_widen_loop_addr_taken(c, n->assign.value);
-    } else if (k == NODE_CALL) {
+        break;
+    case NODE_CALL:
         /* THE case this pass exists for: `bump(&i)`. */
         vrp_widen_loop_addr_taken(c, n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->call.args[i]);
-    } else if (k == NODE_INTRINSIC) {
+        break;
+    /* BUG-798 (2026-08-17): a SPAWN argument is a call argument in every way
+     * that matters here — `spawn bump(&i)` hands a callee the address of the
+     * loop's index exactly as `bump(&i)` does. The old if/else chain did not
+     * name NODE_SPAWN and its trailing comment asserted spawn/await/asm were
+     * "leaves … no `&` subtree", which is simply false. Measured live: the
+     * spawn form got NO diagnostic and NO guard while the plain-call control
+     * was guarded — an ASan-confirmed silent stack-buffer-overflow write.
+     * The `asm` operand bindings are ZER expressions and can hold `&x` too. */
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:         vrp_widen_loop_addr_taken(c, n->await_stmt.cond); break;
+    case NODE_STATIC_ASSERT: vrp_widen_loop_addr_taken(c, n->static_assert_stmt.cond); break;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++)
+            vrp_widen_loop_addr_taken(c, n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            vrp_widen_loop_addr_taken(c, n->asm_stmt.outputs[i].expr);
+        break;
+    case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->intrinsic.args[i]);
-    } else if (k == NODE_BINARY) {
+        break;
+    case NODE_BINARY:
         vrp_widen_loop_addr_taken(c, n->binary.left);
         vrp_widen_loop_addr_taken(c, n->binary.right);
-    } else if (k == NODE_FIELD) {
-        vrp_widen_loop_addr_taken(c, n->field.object);
-    } else if (k == NODE_INDEX) {
+        break;
+    case NODE_FIELD: vrp_widen_loop_addr_taken(c, n->field.object); break;
+    case NODE_INDEX:
         vrp_widen_loop_addr_taken(c, n->index_expr.object);
         vrp_widen_loop_addr_taken(c, n->index_expr.index);
-    } else if (k == NODE_ORELSE) {
+        break;
+    case NODE_ORELSE:
         vrp_widen_loop_addr_taken(c, n->orelse.expr);
         vrp_widen_loop_addr_taken(c, n->orelse.fallback);
-    } else if (k == NODE_SLICE) {
+        break;
+    case NODE_SLICE:
         vrp_widen_loop_addr_taken(c, n->slice.object);
         vrp_widen_loop_addr_taken(c, n->slice.start);
         vrp_widen_loop_addr_taken(c, n->slice.end);
-    } else if (k == NODE_TYPECAST) {
-        vrp_widen_loop_addr_taken(c, n->typecast.expr);
-    } else if (k == NODE_STRUCT_INIT) {
+        break;
+    case NODE_TYPECAST: vrp_widen_loop_addr_taken(c, n->typecast.expr); break;
+    case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++)
             vrp_widen_loop_addr_taken(c, n->struct_init.fields[i].value);
+        break;
+    /* Genuine leaves — no sub-expression that can hold `&x`. Enumerated with NO
+     * `default:` so -Werror=switch makes a NEW NodeKind a BUILD FAILURE instead
+     * of a silently-missed alias. The if/else-chain form this replaces is the
+     * one its sibling vrp_invalidate_loop_body_writes was converted away from
+     * for exactly this reason (a dropped NODE_ORELSE); the header comment
+     * claiming the chain form was deliberate is now obsolete. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
     }
-    /* All other NodeKind values are leaves (literals, idents, break/continue/
-     * goto/label/yield/await/spawn/asm/static_assert) — no `&` subtree. */
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */
@@ -19167,6 +19379,18 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         return true;
     }
     if (node->kind == NODE_IF) {
+        /* BUG-799 (2026-08-17): the CONDITION is a return position too. B9 taught
+         * this scan to find `orelse { return N; }` buried in a var-decl init /
+         * expr-stmt / assignment RHS, but not in a control-flow condition —
+         * `if ((mb() orelse { return 9; }) > 0)` is a real return path that fell
+         * to the `return true` catch-all and SILENTLY dropped from the union, so
+         * the callee summary under-approximated and the caller elided its bounds
+         * guard (ASan-confirmed silent stack-buffer-overflow WRITE, exit 0).
+         * Measured live at four positions: if cond, while cond, for cond, switch
+         * scrutinee. Propagating `false` gives up the whole summary, so this can
+         * only make a summary MORE conservative. */
+        if (!scan_expr_orelse_returns(c, node->if_stmt.cond, out_min, out_max, found))
+            return false;
         /* returns inside either arm are branch-local — in_branch=true (their
          * VarRange snapshot at body-end does NOT reflect the arm's guard). */
         if (!find_return_range(c, node->if_stmt.then_body, out_min, out_max, found, true))
@@ -19174,6 +19398,8 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         return find_return_range(c, node->if_stmt.else_body, out_min, out_max, found, true);
     }
     if (node->kind == NODE_SWITCH) {
+        if (!scan_expr_orelse_returns(c, node->switch_stmt.expr, out_min, out_max, found))
+            return false;
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             if (!find_return_range(c, node->switch_stmt.arms[i].body, out_min, out_max, found, true))
                 return false;
@@ -19186,6 +19412,18 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
          * let a `return` inside a do-while body escape the scan, so the return
          * range UNDER-approximated and call sites elided the bounds check on
          * `arr[f()]` — a silent OOB. Loop-body returns are branch-local (true). */
+        /* BUG-799: the loop's cond (and a for's init/step) are return positions. */
+        if (node->kind == NODE_FOR) {
+            if (!find_return_range(c, node->for_stmt.init, out_min, out_max, found, true))
+                return false;
+            if (!scan_expr_orelse_returns(c, node->for_stmt.cond, out_min, out_max, found))
+                return false;
+            if (!find_return_range(c, node->for_stmt.step, out_min, out_max, found, true))
+                return false;
+        } else {
+            if (!scan_expr_orelse_returns(c, node->while_stmt.cond, out_min, out_max, found))
+                return false;
+        }
         Node *body = (node->kind == NODE_FOR) ? node->for_stmt.body : node->while_stmt.body;
         return find_return_range(c, body, out_min, out_max, found, true);
     }
@@ -19215,8 +19453,17 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
          * call arg / index / etc.), not just a top-level one — the narrow
          * oe->kind==NODE_ORELSE check missed `u32 v = (mb() orelse {return 9;}) + b;`
          * and silently dropped the buried return from the union (silent OOB). */
+        else if (node->kind == NODE_AWAIT)  oe = node->await_stmt.cond;
         if (oe && !scan_expr_orelse_returns(c, oe, out_min, out_max, found))
             return false;
+        /* spawn args are expressions too and can carry a buried orelse-return. */
+        if (node->kind == NODE_SPAWN) {
+            for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
+                if (!scan_expr_orelse_returns(c, node->spawn_stmt.args[i],
+                                              out_min, out_max, found))
+                    return false;
+            }
+        }
     }
     return true; /* non-return statement — ok */
 }

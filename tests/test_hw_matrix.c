@@ -311,6 +311,13 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                 * while every `+=` spelling above was caught. The SPELLING axis
                 * of the same question. */
                RFORM_BIT_RANGE,
+               /* BUG-806 (2026-08-17): the RMW is performed by a HELPER, attributed
+                * to the caller via the MEMOISED per-function summary. The ISR side of
+                * this family was already closed by ISR-TRANS; the MAIN side had no
+                * equivalent. Distinct from RFORM_PTR_PARAM above, which the ISR sink
+                * reaches by walking the interrupt body — this cell exercises the
+                * SUMMARY path, so both sinks must answer. */
+               RFORM_HELPER_SUMMARY,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -321,6 +328,7 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
     case RFORM_BIT_RANGE:       return "bitrange g[3..0]=v";
+    case RFORM_HELPER_SUMMARY:  return "helper summary";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -336,6 +344,7 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
     case RFORM_BIT_RANGE:      *helper = "";                                    *body = "g[3..0] = 5;";   break;
+    case RFORM_HELPER_SUMMARY: *helper = "void h_bump(volatile *u32 p){ *p += 1; }"; *body = "h_bump(&g);"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

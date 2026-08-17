@@ -347,6 +347,17 @@ struct Symbol {
      * special case `ret_summary_complete && ret_param_mask == 0`. Defaults
      * {false, 0} → the taint stays unless proven (no under-rejection, T4). */
     bool ret_summary_complete;
+    /* BUG-806: MEMOISED per-function RMW summary. Bit n = "this function performs a
+     * non-atomic read-modify-write on the object reached through parameter n."
+     * Same shape as ret_param_mask, and for the same reason: the question has to be
+     * answered at CALL SITES, and answering it by re-walking the callee at every
+     * site is what made the first attempt exponential (the transitive walk over
+     * every regular function body was implemented and REVERTED — with the depth-32
+     * call descent it hung test_firmware_patterns for >4 minutes to buy ONE form).
+     * Computed once per function: O(F), not O(F x B^32).
+     * State: 0 = not computed, 1 = in progress (recursion guard), 2 = complete. */
+    uint64_t rmw_param_mask;
+    unsigned char rmw_summary_state;
     uint64_t ret_param_mask;
 
     /* module prefix for name mangling (NULL = main module) */

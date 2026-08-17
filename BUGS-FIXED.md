@@ -293,6 +293,38 @@ surfaced them:
 reported "expected SIGTRAP/133, got exit 0", and one that hangs reported "TIMED OUT — a
 hang is not a trap". A gate that has only ever passed is a script, not a net.
 
+### BUG-806 — a helper's RMW was not attributed to the caller (the memoised summary)
+
+`interrupt TIM2 { g = 1; }` with `main(){ bump(&g); }` and
+`void bump(volatile *u32 p){ *p += 1; }` was ACCEPTED. The ISR side of this family is
+closed by ISR-TRANS, which walks the interrupt body transitively; the MAIN side had no
+equivalent, so `g` was never recorded as compound-in-main and "shared between interrupt
+and main" never fired. main's read can be split from its store by the interrupt,
+silently clobbering the ISR's write — and on bare metal nothing notices.
+
+**The interesting part is why the obvious fix was wrong.** The mirror of ISR-TRANS — a
+transitive walk over every regular function body at every call site — had already been
+implemented and REVERTED: with the walker's depth-32 call descent it is exponential and
+hung `test_firmware_patterns` for over four minutes to buy this ONE form. So the fix is
+a MEMOISED per-function summary, `Symbol.rmw_param_mask` + `rmw_summary_state`, computed
+once and queried O(1) at call sites. This is deliberately the `ret_param_mask` pattern
+reused rather than reinvented — same shape, same reason (the question must be answered
+at call sites), same defaults discipline.
+
+**Soundness direction on recursion.** A cycle saturates the mask to ALL parameters
+rather than leaving it empty. An empty mask means "no RMW", which is the ACCEPT-UNSAFE
+direction, and a mutually-recursive pointer-taking helper is exactly the shape that
+would hide one. Over-claiming can only over-reject, and only for a recursive helper
+handed a global an ISR also touches.
+
+The body walker is an exhaustive no-`default:` switch — BUG-798 in this same session was
+the cost of skipping that discipline once.
+
+Measured: 2.5s on `test_firmware_patterns` (vs >4min for the reverted version), corpus
+cost ZERO (1260/1260). `RFORM_HELPER_SUMMARY` added to the RMW FORM grid so both the ISR
+and spawn sinks must answer. `tests/zer_gaps/main_rmw_via_pointer_param.zer` CLOSED and
+promoted.
+
 ### Method notes worth keeping
 
 - **Three VRP defects emit only a WARNING**, so neither harness can hold them. Their

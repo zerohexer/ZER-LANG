@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// expect-error: read-modify-writ
+// BUG-806 (2026-08-17). Promoted from tests/zer_gaps/main_rmw_via_pointer_param.zer.
+//
+// main performs the read-modify-write through a HELPER and the ISR only stores. The
+// ISR side of this family was closed by ISR-TRANS (which walks the interrupt body
+// transitively); the MAIN side had no equivalent, so `g` was never recorded as
+// compound-in-main and "shared between interrupt and main" never fired. main's read
+// can be split from its store by the interrupt, silently clobbering the ISR's write —
+// and on bare metal there is nothing to notice it by.
+//
+// Closed by a MEMOISED per-function RMW summary (bit n = performs an RMW through
+// param n), queried at call sites. The obvious implementation — a transitive walk
+// over every regular function body, mirroring ISR-TRANS — was implemented and
+// REVERTED earlier: with the walker's depth-32 call descent it is exponential and hung
+// test_firmware_patterns for >4 minutes to buy this one form. The summary is O(F):
+// measured 2.5s for that same test.
+//
+// NEGATIVE-only by necessity: gcc refuses __attribute__((interrupt)) on hosted
+// x86-64, so this cannot be a running positive. It fails at the CHECKER, before gcc.
+volatile u32 g;
+
+void bump(volatile *u32 p) { *p += 1; }
+
+interrupt TIM2 { g = 1; }
+
+u32 main() { bump(&g); return 0; }

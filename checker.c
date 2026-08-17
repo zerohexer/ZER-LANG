@@ -518,6 +518,10 @@ static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static void record_isr_globals(Checker *c, Node *node, int depth);
+static void ensure_rmw_summary(Checker *c, Symbol *fs);            /* BUG-806 */
+static void track_isr_global(Checker *c, const char *name, uint32_t name_len,
+                             bool is_compound);                    /* BUG-806 */
+static Symbol *rmw_arg_target_global(Checker *c, Node *arg);       /* BUG-806 */
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
                                       const char **out_name, uint32_t *out_len);
@@ -6554,6 +6558,33 @@ static Type *check_expr(Checker *c, Node *node) {
              * route was structurally incomplete rather than merely under-wired. */
             if (value_is_packed_derived(c, node->call.args[dli], 0))
                 packed_misalign_error(c, node->loc.line, "passing");
+        }
+
+        /* BUG-806 (2026-08-17): attribute a helper's RMW to the CALLER. The ISR side
+         * of this family is closed by ISR-TRANS, which walks the interrupt body
+         * transitively; the MAIN side had no equivalent, so
+         *   interrupt TIM2 { g = 1; }   main() { bump(&g); }
+         * with `void bump(volatile *u32 p){ *p += 1; }` was ACCEPTED — main's RMW
+         * happens inside the helper, so `g` was never recorded as compound-in-main
+         * and "shared between interrupt and main" never fired. main's read can be
+         * split from its store by the interrupt, silently clobbering the ISR's write.
+         *
+         * Queried from the MEMOISED per-function summary, not by re-walking the
+         * callee: the transitive-walk version was implemented and REVERTED for being
+         * exponential (see ensure_rmw_summary). O(1) per call site here. */
+        if (!c->in_interrupt && node->call.callee &&
+            node->call.callee->kind == NODE_IDENT) {
+            Symbol *rs = scope_lookup(c->global_scope, node->call.callee->ident.name,
+                                      (uint32_t)node->call.callee->ident.name_len);
+            if (rs && rs->is_function) {
+                ensure_rmw_summary(c, rs);
+                for (int ri = 0; ri < node->call.arg_count && ri < 64; ri++) {
+                    if (!(rs->rmw_param_mask & ((uint64_t)1 << ri))) continue;
+                    Symbol *tgt = rmw_arg_target_global(c, node->call.args[ri]);
+                    if (tgt && !tgt->is_function)
+                        track_isr_global(c, tgt->name, tgt->name_len, true);
+                }
+            }
         }
 
         /* G3 (2026-08-09): a call made while a fire-and-forget spawn is live —
@@ -18461,6 +18492,232 @@ uint64_t checker_auto_guard_size(Checker *c, Node *node) {
         if (c->auto_guards[i].node == node) return c->auto_guards[i].array_size;
     }
     return 0;
+}
+
+/* ---- MEMOISED per-function RMW summary (BUG-806, 2026-08-17) ----------------
+ *
+ * THE HOLE IT CLOSES. `interrupt TIM2 { g = 1; }` plus `main(){ bump(&g); }` with
+ * `void bump(volatile *u32 p){ *p += 1; }` was ACCEPTED. The ISR side of this family
+ * is closed by ISR-TRANS (which walks the interrupt body transitively), but the
+ * MAIN side had no equivalent: main's read-modify-write happens inside a helper, so
+ * `g` was never recorded as compound-in-main and "shared between interrupt and main"
+ * never fired. main's RMW can be interrupted between its load and its store, and the
+ * ISR's write is then silently clobbered.
+ *
+ * WHY A SUMMARY AND NOT A WALK. The mirror of ISR-TRANS — a transitive walk over
+ * every regular function body at every call site — was implemented and REVERTED:
+ * with the walker's depth-32 call descent it is exponential and hung
+ * test_firmware_patterns for over four minutes to buy this one form. A summary
+ * computed ONCE per function and queried at call sites is O(F). This is the
+ * `ret_param_mask` pattern, reused deliberately rather than reinvented.
+ *
+ * SOUNDNESS DIRECTION. On a recursion cycle the mask is saturated to ALL parameters
+ * rather than left empty: an empty mask means "no RMW", which is the ACCEPT-UNSAFE
+ * direction, and a mutually-recursive pointer-taking helper is exactly the shape that
+ * would hide one. Over-claiming there can only over-reject, and only for a recursive
+ * helper handed a global that an ISR also touches. */
+static bool expr_mentions_name(Node *e, const char *nm, uint32_t nlen, int depth) {
+    if (!e || !nm || depth > 12) return false;
+    if (e->kind == NODE_IDENT)
+        return e->ident.name_len == nlen && memcmp(e->ident.name, nm, nlen) == 0;
+    if (e->kind == NODE_BINARY)
+        return expr_mentions_name(e->binary.left, nm, nlen, depth + 1) ||
+               expr_mentions_name(e->binary.right, nm, nlen, depth + 1);
+    if (e->kind == NODE_UNARY)    return expr_mentions_name(e->unary.operand, nm, nlen, depth + 1);
+    if (e->kind == NODE_FIELD)    return expr_mentions_name(e->field.object, nm, nlen, depth + 1);
+    if (e->kind == NODE_INDEX)    return expr_mentions_name(e->index_expr.object, nm, nlen, depth + 1) ||
+                                         expr_mentions_name(e->index_expr.index, nm, nlen, depth + 1);
+    if (e->kind == NODE_SLICE)    return expr_mentions_name(e->slice.object, nm, nlen, depth + 1);
+    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nlen, depth + 1);
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (expr_mentions_name(e->intrinsic.args[i], nm, nlen, depth + 1)) return true;
+        return false;
+    }
+    return false;   /* partial by design: an unlisted kind yields "no", never a new reject */
+}
+
+/* Which PARAMETER of `fn` does this write TARGET land on? -1 if none. The param
+ * analogue of resolve_write_target_global, peeling the same node kinds — including
+ * NODE_SLICE, so a bit-range write through a param answers too (BUG-803's sibling
+ * question one level up). */
+static int param_index_of_write_target(Node *fn, Node *target) {
+    Node *r = target;
+    int guard = 0;
+    while (r && guard++ < 16 &&
+           (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE ||
+            (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        if (r->kind == NODE_FIELD)      r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_SLICE) r = r->slice.object;
+        else                            r = r->unary.operand;
+    }
+    if (!r || r->kind != NODE_IDENT || !fn || fn->kind != NODE_FUNC_DECL) return -1;
+    for (int i = 0; i < fn->func_decl.param_count && i < 64; i++) {
+        if (fn->func_decl.params[i].name_len == r->ident.name_len &&
+            memcmp(fn->func_decl.params[i].name, r->ident.name,
+                   (size_t)r->ident.name_len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Which parameter of `fn` does this call ARGUMENT designate? `p` or `&p`. */
+static int param_index_of_arg(Node *fn, Node *arg) {
+    arg = unwrap_ptr_launder(arg);
+    if (!arg) return -1;
+    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) arg = arg->unary.operand;
+    if (!arg || arg->kind != NODE_IDENT || !fn || fn->kind != NODE_FUNC_DECL) return -1;
+    for (int i = 0; i < fn->func_decl.param_count && i < 64; i++) {
+        if (fn->func_decl.params[i].name_len == arg->ident.name_len &&
+            memcmp(fn->func_decl.params[i].name, arg->ident.name,
+                   (size_t)arg->ident.name_len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void ensure_rmw_summary(Checker *c, Symbol *fs);
+
+/* Body walk accumulating the mask. Exhaustive no-`default:` switch, so a new
+ * NodeKind that can hold a write or a call is a BUILD FAILURE rather than a
+ * silently-missed RMW — the discipline that BUG-798 was the cost of skipping. */
+static void rmw_scan_body(Checker *c, Node *fn, Node *n, uint64_t *mask, int depth) {
+    if (!n || depth > 24) return;
+    switch (n->kind) {
+    case NODE_ASSIGN: {
+        int pi = param_index_of_write_target(fn, n->assign.target);
+        if (pi >= 0) {
+            bool is_rmw = (n->assign.op != TOK_EQ) ||
+                          target_is_bit_range(c, n->assign.target);
+            if (!is_rmw && fn->kind == NODE_FUNC_DECL && pi < fn->func_decl.param_count)
+                is_rmw = expr_mentions_name(n->assign.value,
+                                            fn->func_decl.params[pi].name,
+                                            (uint32_t)fn->func_decl.params[pi].name_len, 0);
+            if (is_rmw) *mask |= (uint64_t)1 << pi;
+        }
+        rmw_scan_body(c, fn, n->assign.target, mask, depth + 1);
+        rmw_scan_body(c, fn, n->assign.value, mask, depth + 1);
+        break;
+    }
+    case NODE_CALL: {
+        /* forwarding: if the callee RMWs through its param j, and we hand it our
+         * param i, then we RMW through param i. */
+        if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
+            Symbol *cs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+                                      (uint32_t)n->call.callee->ident.name_len);
+            if (cs && cs->is_function) {
+                ensure_rmw_summary(c, cs);
+                for (int j = 0; j < n->call.arg_count && j < 64; j++) {
+                    if (!(cs->rmw_param_mask & ((uint64_t)1 << j))) continue;
+                    int pi = param_index_of_arg(fn, n->call.args[j]);
+                    if (pi >= 0) *mask |= (uint64_t)1 << pi;
+                }
+            }
+        }
+        rmw_scan_body(c, fn, n->call.callee, mask, depth + 1);
+        for (int i = 0; i < n->call.arg_count; i++)
+            rmw_scan_body(c, fn, n->call.args[i], mask, depth + 1);
+        break;
+    }
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            rmw_scan_body(c, fn, n->block.stmts[i], mask, depth + 1);
+        break;
+    case NODE_IF:
+        rmw_scan_body(c, fn, n->if_stmt.cond, mask, depth + 1);
+        rmw_scan_body(c, fn, n->if_stmt.then_body, mask, depth + 1);
+        rmw_scan_body(c, fn, n->if_stmt.else_body, mask, depth + 1);
+        break;
+    case NODE_FOR:
+        rmw_scan_body(c, fn, n->for_stmt.init, mask, depth + 1);
+        rmw_scan_body(c, fn, n->for_stmt.cond, mask, depth + 1);
+        rmw_scan_body(c, fn, n->for_stmt.step, mask, depth + 1);
+        rmw_scan_body(c, fn, n->for_stmt.body, mask, depth + 1);
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        rmw_scan_body(c, fn, n->while_stmt.cond, mask, depth + 1);
+        rmw_scan_body(c, fn, n->while_stmt.body, mask, depth + 1);
+        break;
+    case NODE_SWITCH:
+        rmw_scan_body(c, fn, n->switch_stmt.expr, mask, depth + 1);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            rmw_scan_body(c, fn, n->switch_stmt.arms[i].body, mask, depth + 1);
+        break;
+    case NODE_DEFER:    rmw_scan_body(c, fn, n->defer.body, mask, depth + 1); break;
+    case NODE_CRITICAL: rmw_scan_body(c, fn, n->critical.body, mask, depth + 1); break;
+    case NODE_ONCE:     rmw_scan_body(c, fn, n->once.body, mask, depth + 1); break;
+    case NODE_VAR_DECL: rmw_scan_body(c, fn, n->var_decl.init, mask, depth + 1); break;
+    case NODE_RETURN:   rmw_scan_body(c, fn, n->ret.expr, mask, depth + 1); break;
+    case NODE_EXPR_STMT:rmw_scan_body(c, fn, n->expr_stmt.expr, mask, depth + 1); break;
+    case NODE_AWAIT:    rmw_scan_body(c, fn, n->await_stmt.cond, mask, depth + 1); break;
+    case NODE_ORELSE:
+        rmw_scan_body(c, fn, n->orelse.expr, mask, depth + 1);
+        rmw_scan_body(c, fn, n->orelse.fallback, mask, depth + 1);
+        break;
+    case NODE_BINARY:
+        rmw_scan_body(c, fn, n->binary.left, mask, depth + 1);
+        rmw_scan_body(c, fn, n->binary.right, mask, depth + 1);
+        break;
+    case NODE_UNARY:    rmw_scan_body(c, fn, n->unary.operand, mask, depth + 1); break;
+    case NODE_FIELD:    rmw_scan_body(c, fn, n->field.object, mask, depth + 1); break;
+    case NODE_INDEX:
+        rmw_scan_body(c, fn, n->index_expr.object, mask, depth + 1);
+        rmw_scan_body(c, fn, n->index_expr.index, mask, depth + 1);
+        break;
+    case NODE_SLICE:
+        rmw_scan_body(c, fn, n->slice.object, mask, depth + 1);
+        rmw_scan_body(c, fn, n->slice.start, mask, depth + 1);
+        rmw_scan_body(c, fn, n->slice.end, mask, depth + 1);
+        break;
+    case NODE_TYPECAST: rmw_scan_body(c, fn, n->typecast.expr, mask, depth + 1); break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            rmw_scan_body(c, fn, n->intrinsic.args[i], mask, depth + 1);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            rmw_scan_body(c, fn, n->struct_init.fields[i].value, mask, depth + 1);
+        break;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            rmw_scan_body(c, fn, n->spawn_stmt.args[i], mask, depth + 1);
+        break;
+    /* Leaves and declaration kinds: nothing that can hold a write or a call. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT: case NODE_MMIO:
+    case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    }
+}
+
+static void ensure_rmw_summary(Checker *c, Symbol *fs) {
+    if (!fs || !fs->is_function) return;
+    if (fs->rmw_summary_state == 2) return;              /* memoised */
+    if (fs->rmw_summary_state == 1) {                     /* recursion: saturate */
+        Node *fn = fs->func_node;
+        if (fn && fn->kind == NODE_FUNC_DECL) {
+            for (int i = 0; i < fn->func_decl.param_count && i < 64; i++)
+                fs->rmw_param_mask |= (uint64_t)1 << i;
+        }
+        return;
+    }
+    Node *fn = fs->func_node;
+    if (!fn || fn->kind != NODE_FUNC_DECL || !fn->func_decl.body) {
+        fs->rmw_summary_state = 2;                        /* bodyless: nothing known */
+        return;
+    }
+    fs->rmw_summary_state = 1;
+    uint64_t mask = fs->rmw_param_mask;
+    rmw_scan_body(c, fn, fn->func_decl.body, &mask, 0);
+    fs->rmw_param_mask = mask;
+    fs->rmw_summary_state = 2;
 }
 
 /* ================================================================

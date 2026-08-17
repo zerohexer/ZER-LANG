@@ -28,14 +28,15 @@ Extract any branch file with:
     git show origin/claude/vigilant-tesla-<id>:tests/zer_fail/<name>.zer
 
 ## OPEN — residuals after 2026-08-17b (measured, none an accept-unsafe hole)
-- **RMW reached from MAIN through a helper** —
-  `tests/zer_gaps/main_rmw_via_pointer_param.zer`. The ISR side of this family is
-  CLOSED. The mirror of ISR-TRANS (a transitive walk over every regular function
-  body) was implemented and REVERTED: with the walker's depth-32 call descent it is
-  exponential and hung `test_firmware_patterns` for >4 minutes to buy this one form.
-  **Fix sketch:** a MEMOISED per-function RMW summary (bit n = performs an RMW
-  through param n), computed once per function like `ret_param_mask`, then queried
-  at call sites — O(F), not O(F x B^32).
+- ~~**RMW reached from MAIN through a helper**~~ — **CLOSED 2026-08-17 (BUG-806)** by
+  exactly the sketched fix: a MEMOISED per-function summary
+  (`Symbol.rmw_param_mask` / `rmw_summary_state`, bit n = performs an RMW through
+  param n), computed once per function like `ret_param_mask` and queried O(1) at call
+  sites. Measured 2.5s on `test_firmware_patterns` versus the >4 minutes that got the
+  transitive-walk version reverted. Recursion saturates the mask to ALL params rather
+  than leaving it empty, because empty means "no RMW" — the accept-unsafe direction.
+  Promoted to `tests/zer_fail/rmw_main_via_pointer_param.zer`; `RFORM_HELPER_SUMMARY`
+  added to the RMW FORM grid so both sinks must answer. Corpus cost: ZERO.
 - **No automated gate for the MISSING-LOCK half of BUG-795.** The deadlock half is
   pinned by a negative; a missing lock produces NO diagnostic and a
   nondeterministic runtime effect, so neither harness can hold it (same shape as the

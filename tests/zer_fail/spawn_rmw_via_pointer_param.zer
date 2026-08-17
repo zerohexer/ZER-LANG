@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: read-modify-write on volatile global
+// RMW-LAUNDER (2026-08-11), spawn sink. TSan-CONFIRMED data race on this exact
+// program before the fix ("Read of size 4 ... Previous write of size 4 by
+// thread T1", both inside bump).
+//
+// `volatile` exempts a global from the spawn race scan for the SINGLE-WORD flag
+// idiom — one plain load or one plain store. A read-modify-write is neither.
+// Axis A3 added a carve-out for exactly that, but matched only a compound
+// assign whose target is a NAMED global, so moving the `+= 1` one hop behind a
+// pointer parameter made the program compile. `counter += 1` written directly
+// in `worker` is rejected; this was not.
+volatile u32 counter;
+
+void bump(volatile *u32 p) { *p += 1; }
+void worker() { bump(&counter); }
+
+u32 main() { spawn worker(); u32 x = counter; return x & 1; }

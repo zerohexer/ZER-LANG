@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement
+// RMW-LAUNDER (2026-08-11), ISR sink. The ISR's non-atomic read-modify-write on
+// `counter` happens one hop away, through a pointer parameter, so no compound
+// assign names the global. The by-name form (`counter += 1` inside the ISR, or
+// inside a helper that names it) was rejected; this was ACCEPTED — a torn RMW
+// between the ISR and main that loses interrupt counts, silent on bare metal.
+volatile u32 counter;
+
+void bump(volatile *u32 p) { *p += 1; }
+
+interrupt TIM2 { bump(&counter); }
+
+u32 main() { u32 x = counter; return x & 1; }

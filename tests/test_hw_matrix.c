@@ -286,6 +286,61 @@ static const char *vshape_flags(VShape s) {
     return s == VSHAPE_OVERWIDTH ? "--target-bits 32" : "";
 }
 
+/* ---------------------------------------------------------------------------
+ * RMW FORM grid (BUG-792) — site x HOW THE READ-MODIFY-WRITE IS SPELLED/REACHED.
+ *
+ * One question: "does this perform a non-atomic read-modify-write on a volatile
+ * global?" It was answered SYNTACTICALLY — only `g += 1` with `g` named directly
+ * — so five other spellings of the identical operation compiled clean. The spawn
+ * variant of RFORM_PTR_PARAM is TSan-CONFIRMED racy.
+ *
+ * Crossed with SITE because spawn and ISR are mirrored sinks: this project's
+ * recurring defect is fixing a form at one and leaving it broken at the other
+ * (the `volatile` exemption did exactly that and shipped a tearing bare-metal
+ * access). Every cell is NEGATIVE — each is a genuine lost-update race.
+ *
+ * No `default:` in the switches, so adding an RFORM value fails the build until
+ * both sinks are taught it.
+ * ------------------------------------------------------------------------- */
+typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
+               RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               RFORM_COUNT } RForm;
+static const char *rform_name(RForm f) {
+    switch (f) {
+    case RFORM_NAMED_COMPOUND:  return "named g+=1";
+    case RFORM_WRITTEN_OUT:     return "written g=g+1";
+    case RFORM_LOCAL_ALIAS:     return "local *p+=1";
+    case RFORM_PTR_PARAM:       return "param *p+=1";
+    case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
+    case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_COUNT: break;
+    }
+    return "?";
+}
+/* The RMW body, and any helper it needs, for one form. */
+static void rform_parts(RForm f, const char **helper, const char **body) {
+    switch (f) {
+    case RFORM_NAMED_COMPOUND: *helper = "";                                    *body = "g += 1;";        break;
+    case RFORM_WRITTEN_OUT:    *helper = "";                                    *body = "g = g + 1;";     break;
+    case RFORM_LOCAL_ALIAS:    *helper = "";                                    *body = "volatile *u32 p = &g; *p += 1;"; break;
+    case RFORM_PTR_PARAM:      *helper = "void bump(volatile *u32 p){ *p += 1; }"; *body = "bump(&g);";   break;
+    case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
+                                                                                 *body = "mid(&g);";      break;
+    case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    case RFORM_COUNT:          *helper = ""; *body = ""; break;
+    }
+}
+static void gen_rmw(VSite site, RForm f, char *out, size_t n) {
+    const char *helper; const char *body;
+    rform_parts(f, &helper, &body);
+    if (site == VSITE_SPAWN)
+        snprintf(out, n, "volatile u32 g;\n%s\nvoid w(){ %s }\n"
+                         "u32 main(){ spawn w(); u32 x = g; return x & 1; }\n", helper, body);
+    else
+        snprintf(out, n, "volatile u32 g;\n%s\ninterrupt TIMER { %s }\n"
+                         "u32 main(){ u32 x = g; return x & 1; }\n", helper, body);
+}
+
 static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     const char *decl;
     const char *wr;
@@ -380,6 +435,21 @@ int main(void) {
             fprintf(stderr, "  [%-5s][%-18s][%-3s] %s\n",
                     vsite_name(vs), vshape_name(vp), neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* RMW FORM grid (BUG-792) — every cell negative; both sinks must agree. */
+    fprintf(stderr, "\n--- RMW form grid (site x spelling) ---\n");
+    for (VSite vs = 0; vs < VSITE_COUNT; vs++) {
+        for (RForm rf = 0; rf < RFORM_COUNT; rf++) {
+            valid_cells++;
+            char rbuf[1024], rnm[192];
+            snprintf(rnm, sizeof(rnm), "rmw/%s/%s", vsite_name(vs), rform_name(rf));
+            gen_rmw(vs, rf, rbuf, sizeof(rbuf));
+            int ok = run_vol(rnm, rbuf, "", 1);
+            fprintf(stderr, "  [%-5s][%-15s][neg] %s\n",
+                    vsite_name(vs), rform_name(rf), ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
     }

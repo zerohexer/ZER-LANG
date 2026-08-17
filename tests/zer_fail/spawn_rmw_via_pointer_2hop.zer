@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: read-modify-write on volatile global
+// RMW-LAUNDER, spawn sink, n-hop forward.
+volatile u32 counter;
+
+void inner(volatile *u32 p) { *p += 1; }
+void mid(volatile *u32 p) { inner(p); }
+void worker() { mid(&counter); }
+
+u32 main() { spawn worker(); u32 x = counter; return x & 1; }

@@ -2710,9 +2710,18 @@ int main(void) {
         "void f() { u32 x = counter; }\n",
         "ISR safety: shared global without volatile");
 
+    /* BUG-792: this used `counter = counter + 1`, a written-out read-modify-write.
+     * The compiler ALREADY rejected the compound spelling `counter += 1` of the
+     * very same operation ("volatile global has compound assignment ... not
+     * atomic"), so the test only passed by exercising a SYNTACTIC gap in that
+     * rule — it was asserting the gap, not the property it names. The gap is now
+     * closed, so the body is a plain volatile STORE, which is what "a volatile
+     * shared global is OK" actually means. The non-volatile sibling above still
+     * discriminates, and the RMW form is pinned as a negative in
+     * tests/zer_fail/isr_rmw_written_out.zer. */
     printf("[ISR safety: shared volatile global → ok]\n");
     ok("volatile u32 counter = 0;\n"
-       "interrupt TIMER1 { counter = counter + 1; }\n"
+       "interrupt TIMER1 { counter = 1; }\n"
        "void f() { u32 x = counter; }\n",
        "ISR safety: volatile shared global OK");
 

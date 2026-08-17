@@ -1,0 +1,8 @@
+// expect-error: read-modify-written in a single statement
+// BUG-785: the RMW is laundered one call deep through a pointer parameter, so
+// the compound-assign target's root is a PARAM and neither recording site saw a
+// global. Direct `counter += 1` in the ISR was rejected; this was accepted.
+volatile u32 counter;
+void bump(volatile *u32 p) { *p += 1; }
+interrupt TIM2 { bump(&counter); }
+u32 main() { u32 v = counter; return v; }

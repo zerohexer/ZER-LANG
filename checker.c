@@ -1867,6 +1867,109 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     return true;
 }
 
+/* Scan-local pointer aliases: `*u32 p = &counter;` inside the body being scanned.
+ * The scan walks ANOTHER function's AST from the CALLER's scope, so scope_lookup
+ * cannot see that function's locals — the alias has to be recorded when the scan
+ * VISITS the declaration (statements are walked in order, so the decl always
+ * precedes the use). Reset at each scan entry point: a stale row could only
+ * produce a false positive, and this table must never invent a rejection. */
+#define RMW_ALIAS_MAX 16
+static struct { const char *name; uint32_t len; Symbol *global; } _rmw_alias[RMW_ALIAS_MAX];
+static int _rmw_alias_count = 0;
+/* Set when the spawn scan flags a global specifically because of a non-atomic
+ * read-modify-write, so the diagnostic can name THAT rather than the generic
+ * "accesses non-shared global" (which reads as if any access were the problem). */
+static bool _rmw_flagged_rmw = false;
+static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false; }
+static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
+    for (int i = 0; i < _rmw_alias_count; i++)
+        if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
+            return _rmw_alias[i].global;
+    return NULL;
+}
+
+static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth);
+/* Which global does this call ARGUMENT designate? `&counter` directly, or an
+ * ident already bound to one (so `mid(p)` forwards the binding to `inner`). */
+static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
+    arg = unwrap_ptr_launder(arg);
+    if (!arg) return NULL;
+    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
+        return resolve_write_target_global(c, arg->unary.operand, 0);
+    if (arg->kind == NODE_IDENT)
+        return rmw_alias_lookup(arg->ident.name, (uint32_t)arg->ident.name_len);
+    return NULL;
+}
+
+/* Is this assignment a read-modify-write? `x += 1` is one, and so is the
+ * written-out `x = x + 1` — identical semantics, identical non-atomicity. The
+ * rule was SYNTACTIC (it tested only the compound operator), so spelling the RMW
+ * out in full evaded it at every sink. */
+static bool assign_reads_own_target(Node *value, Symbol *tgt);
+static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
+    if (!e || !g || depth > 12) return false;
+    if (e->kind == NODE_IDENT)
+        return e->ident.name_len == g->name_len &&
+               memcmp(e->ident.name, g->name, g->name_len) == 0;
+    if (e->kind == NODE_BINARY)
+        return expr_mentions_global(e->binary.left, g, depth + 1) ||
+               expr_mentions_global(e->binary.right, g, depth + 1);
+    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
+    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
+    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
+                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
+    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
+    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+}
+static bool assign_reads_own_target(Node *value, Symbol *tgt) {
+    return expr_mentions_global(value, tgt, 0);
+}
+
+/* THE single query for "which GLOBAL does this write actually land on?"
+ *
+ * A compound assignment names its target syntactically, but the object written may
+ * be reached through a pointer. Every one of these is the SAME non-atomic
+ * read-modify-write on `counter`:
+ *
+ *     counter += 1     named directly     (the ONLY form the rule used to match)
+ *     *p += 1          `*u32 p = &counter`      -- local alias
+ *     *gp += 1         `*u32 gp = &counter`     -- global alias
+ *     p[0] += 1 / p.f  navigation inside that same object
+ *
+ * Both sinks previously walked deref/field/index to a root ident and looked THAT
+ * up as the global -- so `*gp += 1` tracked `gp` (a pointer that is never itself
+ * raced) and the rule on `counter` never fired, while a LOCAL `p` resolved to
+ * nothing at all. Resolving the pointer to its referent is what collapses the
+ * syntactic forms back into one question.
+ *
+ * Returns the global Symbol written, or NULL. Conservative: an unresolvable
+ * pointer yields NULL = today's behaviour, never a new rejection. */
+static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) {
+    if (!target || depth > 6) return NULL;
+    Node *r = target;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                 (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else r = r->unary.operand;
+    }
+    if (!r || r->kind != NODE_IDENT) return NULL;
+    Symbol *aliased = rmw_alias_lookup(r->ident.name, (uint32_t)r->ident.name_len);
+    if (aliased) return aliased;   /* a local of the body being scanned */
+    Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                             (uint32_t)r->ident.name_len);
+    if (!s || s->is_function) return NULL;
+    Type *st = s->type ? type_unwrap_distinct(s->type) : NULL;
+    if (st && type_dispatch_kind(st) == TYPE_POINTER && s->func_node &&
+        (s->func_node->kind == NODE_VAR_DECL ||
+         s->func_node->kind == NODE_GLOBAL_VAR)) {
+        Node *init = unwrap_ptr_launder(s->func_node->var_decl.init);
+        if (init && init->kind == NODE_UNARY && init->unary.op == TOK_AMP)
+            return resolve_write_target_global(c, init->unary.operand, depth + 1);
+    }
+    return scope_lookup_local(c->global_scope, s->name, s->name_len);
+}
+
 /* THE single query for "may this value expression evaluate to something FRAME-BOUND?"
  * Returns the offending local Symbol (for the diagnostic) or NULL.
  *
@@ -4556,23 +4659,14 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* interrupt safety: track compound assignment (|=, +=, etc.) on globals.
          * Walk field/index chains to root ident (catches g_state.flags |= 1). */
-        if (node->assign.op != TOK_EQ) {
-            Node *isr_root = node->assign.target;
-            while (isr_root && (isr_root->kind == NODE_FIELD ||
-                                isr_root->kind == NODE_INDEX ||
-                                (isr_root->kind == NODE_UNARY && isr_root->unary.op == TOK_STAR))) {
-                if (isr_root->kind == NODE_FIELD) isr_root = isr_root->field.object;
-                else if (isr_root->kind == NODE_INDEX) isr_root = isr_root->index_expr.object;
-                else isr_root = isr_root->unary.operand;
-            }
-            if (isr_root && isr_root->kind == NODE_IDENT) {
-                Symbol *gs = scope_lookup(c->global_scope, isr_root->ident.name,
-                                          (uint32_t)isr_root->ident.name_len);
-                if (gs && !gs->is_function) {
-                    track_isr_global(c, isr_root->ident.name,
-                                     (uint32_t)isr_root->ident.name_len, true);
-                }
-            }
+        {
+            /* BUG-792: ask the shared resolver (sees through `*p` / `*gp` to the
+             * pointee), and treat a WRITTEN-OUT `g = g + 1` as the RMW it is. */
+            Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
+            bool is_rmw = (node->assign.op != TOK_EQ) ||
+                          (gs && assign_reads_own_target(node->assign.value, gs));
+            if (is_rmw && gs && !gs->is_function)
+                track_isr_global(c, gs->name, gs->name_len, true);
         }
 
         /* BUG-294/302: reject assignment to non-lvalue.
@@ -5976,6 +6070,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         !fsym->func_node->func_decl.body) continue;
                     if (!func_forwards_param_to_spawn(c, tgt, ai, 0)) continue;
                     const char *fbad = NULL; uint32_t fblen = 0;
+                    rmw_alias_reset();
                     if (scan_unsafe_global_access(c, fsym->func_node->func_decl.body,
                                                   &fbad, &fblen)) {
                         ensure_func_props(c, fsym);
@@ -10986,7 +11081,8 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
             !fs->func_node->func_decl.body) return false;
         if (_scan_global_depth >= 32) return false;
         _scan_global_depth++;
-        bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
+        rmw_alias_reset();
+    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                                out_name, out_len);
         _scan_global_depth--;
         return found;
@@ -11038,6 +11134,7 @@ static bool scan_funcname_binding(Checker *c, Node *n,
         !fs->func_node->func_decl.body) return false;
     if (_scan_global_depth >= 32) return false;
     _scan_global_depth++;
+    rmw_alias_reset();
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                            out_name, out_len);
     _scan_global_depth--;
@@ -11290,6 +11387,21 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
          * descend into do_inc so a later `fp()` reaching a non-shared global
          * is caught (the direct-call scan can't resolve the local callee). */
         if (scan_funcname_binding(c, node->var_decl.init, out_name, out_len)) return true;
+        /* BUG-792: remember `*u32 p = &counter` so a later `*p += 1` in this body
+         * resolves to counter. Recorded here because the scan cannot look up
+         * another function's locals through the scope chain. */
+        if (node->var_decl.name && _rmw_alias_count < RMW_ALIAS_MAX) {
+            Node *vi = unwrap_ptr_launder(node->var_decl.init);
+            if (vi && vi->kind == NODE_UNARY && vi->unary.op == TOK_AMP) {
+                Symbol *tg = resolve_write_target_global(c, vi->unary.operand, 0);
+                if (tg) {
+                    _rmw_alias[_rmw_alias_count].name = node->var_decl.name;
+                    _rmw_alias[_rmw_alias_count].len = (uint32_t)node->var_decl.name_len;
+                    _rmw_alias[_rmw_alias_count].global = tg;
+                    _rmw_alias_count++;
+                }
+            }
+        }
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
         /* Axis A3 (2026-06-21): a COMPOUND assignment (RMW: +=, |=, etc.) on a
@@ -11300,15 +11412,23 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
          * oracle zer_volatile_compound_valid (concurrency_rules.c, previously
          * never called): invalid iff (is_volatile AND is_compound). A simple
          * volatile load/store of a flag stays allowed (not a RMW). */
-        if (node->assign.target && node->assign.target->kind == NODE_IDENT) {
-            Symbol *ts = scope_lookup(c->global_scope,
-                node->assign.target->ident.name,
-                (uint32_t)node->assign.target->ident.name_len);
+        /* BUG-792: gated on a NAMED-global target, so moving the `+= 1` one hop
+         * behind a pointer (`*p += 1`) made the program compile. The spawn
+         * variant is TSan-CONFIRMED racy. Resolve the referent instead. */
+        if (node->assign.target) {
+            Symbol *ts = resolve_write_target_global(c, node->assign.target, 0);
+            /* BUG-792: `g = g + 1` is the same non-atomic RMW as `g += 1`. The
+             * ISR sink learned the written-out form; teaching only that sink is
+             * the mirrored-sink drift this grid exists to catch (it caught this
+             * one immediately). */
+            bool _is_rmw = (node->assign.op != TOK_EQ) ||
+                           (ts && assign_reads_own_target(node->assign.value, ts));
             if (ts && !ts->is_function && !ts->is_const &&
                 zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,
-                                            node->assign.op != TOK_EQ ? 1 : 0) == 0) {
-                *out_name = node->assign.target->ident.name;
-                *out_len = (uint32_t)node->assign.target->ident.name_len;
+                                            _is_rmw ? 1 : 0) == 0) {
+                _rmw_flagged_rmw = true;
+                *out_name = ts->name;
+                *out_len = ts->name_len;
                 return true;
             }
         }
@@ -11349,8 +11469,30 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                      * exceed 8 levels (handler → validator → parser → helper → ...). */
                     if (_scan_global_depth < 32) {
                         _scan_global_depth++;
+                        /* BUG-792: bind each `f(&counter)` argument to the callee's
+                         * PARAM name before descending, so a `*p += 1` inside the
+                         * callee resolves to `counter`. Without this the RMW fact was
+                         * lost at the very first hop, which is how moving `+= 1`
+                         * behind a parameter made a TSan-confirmed race compile.
+                         * Scoped: the count is restored after the descent, so a
+                         * binding cannot leak into a sibling call. */
+                        int _saved_alias = _rmw_alias_count;
+                        Node *_cfd = csym->func_node;
+                        for (int _ai = 0; _ai < node->call.arg_count &&
+                                          _ai < _cfd->func_decl.param_count; _ai++) {
+                            if (_rmw_alias_count >= RMW_ALIAS_MAX) break;
+                            ParamDecl *_pd = &_cfd->func_decl.params[_ai];
+                            if (!_pd->name || _pd->name_len == 0) continue;
+                            Symbol *_tg = rmw_arg_target_global(c, node->call.args[_ai]);
+                            if (!_tg) continue;
+                            _rmw_alias[_rmw_alias_count].name = _pd->name;
+                            _rmw_alias[_rmw_alias_count].len = (uint32_t)_pd->name_len;
+                            _rmw_alias[_rmw_alias_count].global = _tg;
+                            _rmw_alias_count++;
+                        }
                         bool found = scan_unsafe_global_access(c,
                             csym->func_node->func_decl.body, out_name, out_len);
+                        _rmw_alias_count = _saved_alias;
                         _scan_global_depth--;
                         if (found) return true;
                     }
@@ -15674,6 +15816,11 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)bad_len, bad_name);
                 } else {
                     checker_error(c, node->loc.line,
+                        _rmw_flagged_rmw ?
+                        "spawn target '%.*s' performs a non-atomic read-modify-write on "
+                        "volatile global '%.*s' — data race. volatile gives NO atomicity, "
+                        "so the read and the write can interleave with another thread; "
+                        "use @atomic_add / @atomic_* or a shared struct" :
                         "spawn target '%.*s' accesses non-shared global '%.*s' — "
                         "data race. Use shared struct, threadlocal, or @atomic_* "
                         "(volatile is NOT synchronization — it gives no atomicity "
@@ -16958,6 +17105,15 @@ static void check_func_body(Checker *c, Node *node) {
          * that next reset consults a stale range. */
         c->var_range_count = 0;
         check_stmt(c, node->func_decl.body);
+        /* NOT DONE — the mirror of ISR-TRANS (a transitive global-access walk over
+         * every REGULAR function body, so an RMW reached from main through a
+         * helper is attributed to main) was implemented and REVERTED: with the
+         * walker's depth-32 call descent applied to every function it is
+         * exponential, and it hung test_firmware2 for >4 minutes. It bought
+         * exactly one form (main_rmw_via_pointer_param). Doing it properly needs a
+         * MEMOISED per-function RMW summary (bit n = performs an RMW through
+         * param n), like ret_param_mask, computed once per function instead of
+         * re-walking callee bodies per caller. Tracked in docs/limitations.md. */
         c->after_spawn_in_func = saved_after_spawn;
         c->in_comptime_body = saved_comptime;
         c->in_async = saved_async;
@@ -17732,19 +17888,22 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     }
     case NODE_ASSIGN: {
         if (node->assign.op != TOK_EQ) {
-            Node *r = node->assign.target;
-            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
-                        (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
-                if (r->kind == NODE_FIELD) r = r->field.object;
-                else if (r->kind == NODE_INDEX) r = r->index_expr.object;
-                else r = r->unary.operand;
-            }
-            if (r && r->kind == NODE_IDENT) {
-                Symbol *gs = scope_lookup(c->global_scope, r->ident.name,
-                                          (uint32_t)r->ident.name_len);
-                if (gs && !gs->is_function)
-                    track_isr_global(c, r->ident.name, (uint32_t)r->ident.name_len, true);
-            }
+            /* BUG-792 (the MIRRORED SINK): this walked deref/field/index to a root
+             * ident and then looked THAT up as the global — so `*gp += 1` recorded
+             * `gp`, a pointer that is never itself raced, and the rule on the
+             * pointee never fired; a LOCAL alias resolved to nothing at all. The
+             * spawn sink had the identical defect. Both now ask the SAME resolver,
+             * so a form fixed at one sink cannot stay broken at the other. */
+            Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
+            if (gs && !gs->is_function)
+                track_isr_global(c, gs->name, gs->name_len, true);
+        } else {
+            /* BUG-792: `counter = counter + 1` is the same non-atomic RMW as
+             * `counter += 1`; the rule tested the OPERATOR, so writing it out
+             * evaded it. */
+            Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
+            if (gs && !gs->is_function && assign_reads_own_target(node->assign.value, gs))
+                track_isr_global(c, gs->name, gs->name_len, true);
         }
         record_isr_globals(c, node->assign.target, depth);
         record_isr_globals(c, node->assign.value, depth);
@@ -17765,8 +17924,26 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
             Symbol *cs = scope_lookup(c->global_scope,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
+                /* BUG-792 (mirrored sink): bind `f(&counter)` args to the callee's
+                 * params before descending, so `*p += 1` one (or n) hops away still
+                 * names counter. Scoped — restored after the descent. */
+                int _sv = _rmw_alias_count;
+                for (int _ai = 0; _ai < node->call.arg_count &&
+                                  _ai < cs->func_node->func_decl.param_count; _ai++) {
+                    if (_rmw_alias_count >= RMW_ALIAS_MAX) break;
+                    ParamDecl *_pd = &cs->func_node->func_decl.params[_ai];
+                    if (!_pd->name || _pd->name_len == 0) continue;
+                    Symbol *_tg = rmw_arg_target_global(c, node->call.args[_ai]);
+                    if (!_tg) continue;
+                    _rmw_alias[_rmw_alias_count].name = _pd->name;
+                    _rmw_alias[_rmw_alias_count].len = (uint32_t)_pd->name_len;
+                    _rmw_alias[_rmw_alias_count].global = _tg;
+                    _rmw_alias_count++;
+                }
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+                _rmw_alias_count = _sv;
+            }
             /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
              * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }` — the canonical
              * bare-metal ISR-dispatch idiom. The callee IDENT resolves to a global
@@ -17803,6 +17980,21 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     case NODE_RETURN:    record_isr_globals(c, node->ret.expr, depth); return;
     case NODE_EXPR_STMT: record_isr_globals(c, node->expr_stmt.expr, depth); return;
     case NODE_VAR_DECL:
+        /* BUG-792 (mirrored sink): remember `*u32 p = &counter` so a later
+         * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
+         * scan's var-decl arm — the two sinks must learn a form together. */
+        if (node->var_decl.name && _rmw_alias_count < RMW_ALIAS_MAX) {
+            Node *vi = unwrap_ptr_launder(node->var_decl.init);
+            if (vi && vi->kind == NODE_UNARY && vi->unary.op == TOK_AMP) {
+                Symbol *tg = resolve_write_target_global(c, vi->unary.operand, 0);
+                if (tg) {
+                    _rmw_alias[_rmw_alias_count].name = node->var_decl.name;
+                    _rmw_alias[_rmw_alias_count].len = (uint32_t)node->var_decl.name_len;
+                    _rmw_alias[_rmw_alias_count].global = tg;
+                    _rmw_alias_count++;
+                }
+            }
+        }
         record_isr_globals(c, node->var_decl.init, depth);
         record_isr_funcname_binding(c, node->var_decl.init, depth);  /* E1 */
         return;
@@ -18137,9 +18329,14 @@ static void check_interrupt_safety(Checker *c) {
         } else if (g->compound_in_isr || g->compound_in_func) {
             /* volatile but compound assignment — race condition */
             checker_error(c, sym->line,
-                "volatile global '%.*s' has compound assignment (+=, |=, etc.) "
-                "shared between interrupt and main code — "
-                "read-modify-write is not atomic, use explicit read/mask/write",
+                /* BUG-792: no longer only `+=` and no longer only a NAMED target —
+                 * the rule now also sees `g = g + 1` and writes reaching g through a
+                 * pointer — so the message must describe the OPERATION, not one
+                 * spelling of it. */
+                "volatile global '%.*s' is read-modify-written in a single "
+                "statement and is shared between interrupt and main code — "
+                "the read and the write can be split by an interrupt, losing an "
+                "update; use an explicit read/mask/write or @atomic_*",
                 (int)g->name_len, g->name);
         } else if (!volatile_global_exempt_from_race_check(c, sym)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and

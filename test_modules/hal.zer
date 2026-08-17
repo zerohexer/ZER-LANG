@@ -1,10 +1,16 @@
 // A global shared between an ISR (via the inc_count helper) and main must be
-// volatile, and the ISR must not do a compound read-modify-write on it (that is
-// non-atomic). This is now enforced TRANSITIVELY through the helper call
-// (ISR-TRANS fix) — pre-fix the non-volatile / compound form compiled silently
-// and hoisted/torn on real hardware. Use volatile + an explicit read/write.
+// volatile, and the ISR must not read-modify-write it (that is non-atomic). This
+// is enforced TRANSITIVELY through the helper call (ISR-TRANS fix) — pre-fix the
+// non-volatile form compiled silently and hoisted/torn on real hardware.
+//
+// BUG-792: this helper used to be `irq_count = irq_count + 1`, which is exactly
+// the read-modify-write the comment above forbids — it only compiled because the
+// rule tested for a compound OPERATOR (`+=`) rather than for the OPERATION, so
+// writing the RMW out in full evaded it. The rule now catches both spellings, so
+// the fixture is a plain volatile STORE: still an ISR->helper->global access
+// (which is what this test exercises), no longer a torn RMW.
 volatile u32 irq_count = 0;
-void inc_count() { irq_count = irq_count + 1; }
+void inc_count() { irq_count = 1; }
 interrupt USART1 {
     inc_count();
 }

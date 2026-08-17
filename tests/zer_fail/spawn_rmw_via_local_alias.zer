@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: read-modify-write on volatile global
+// RMW-LAUNDER, spawn sink, no call: the alias is a local pointer in the spawn
+// target's own body. Axis A3 required the compound target to be a bare
+// NODE_IDENT, so it did not even walk the deref.
+volatile u32 counter;
+
+void worker() { volatile *u32 p = &counter; *p += 1; }
+
+u32 main() { spawn worker(); u32 x = counter; return x & 1; }

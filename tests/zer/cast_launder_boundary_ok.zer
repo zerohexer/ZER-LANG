@@ -1,0 +1,22 @@
+// BUG-786 boundary: the launder fix peels a cast only when the cast PRODUCES A
+// REFERENCE. A value cast yields a fresh scalar and must keep compiling, and a
+// pointer cast rooted at a GLOBAL is not an escape at all.
+u32 g_val = 7;
+?*u32 g = null;
+struct S { u32 a; }
+void take(*opaque p) { }
+u32 scale(u32 x) { return (u32)(x * 2); }
+void ok_global_ptr() { g = (*u32)(&g_val); }
+u32 main() {
+    S s;
+    s.a = 1;
+    take((*opaque)(&s));          // *opaque cast of a local, passed (not stored)
+    ok_global_ptr();
+    u32 n = 5;
+    u32 m = (u32)n;               // value cast — must NOT be treated as a view
+    f32 fv = (f32)n;
+    u32 r = scale(3);
+    if (g) |p| { r = r + *p; }
+    if (r == 13 && m == 5 && fv > 0.0) { return 0; }
+    return 1;
+}

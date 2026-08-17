@@ -1269,6 +1269,30 @@ static Node *ir_key_root_ident(Node *expr) {
  * -1 if the expression isn't keyable. Caller gets (out_local, out_path,
  * out_path_len). Bare local: path=NULL, path_len=0. Compound: path is
  * arena-allocated string like ".handle" or "[0].val". */
+/* Mirror of checker.c's `tynode_is_reference_producing` — a cast to `*T` / `[]T` /
+ * `*opaque` (or `?` of those) designates the SAME object, so it is transparent to
+ * allocation identity; a value cast manufactures a fresh value and is not. */
+static bool ir_tynode_is_ref_producing(TypeNode *t) {
+    if (!t) return false;
+    if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
+        t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
+    if (t->kind == TYNODE_OPTIONAL) return ir_tynode_is_ref_producing(t->optional.inner);
+    return false;
+}
+
+/* BUG-791: `free((*N)n)` names the SAME allocation as `free(n)` — the emitter elides
+ * the cast entirely — but the key extractor bottomed out on NODE_TYPECAST and
+ * returned "unkeyable", so the free was SILENTLY UNTRACKED: no double-free, no UAF,
+ * no leak report. Peeled HERE rather than at each caller so every consumer of the
+ * key (free arg, defer-free arg, alloc tracking, alias registration) gains it at
+ * once — the same one-query discipline as checker.c's shared peeler. */
+static Node *ir_peel_ref_cast(Node *v) {
+    while (v && v->kind == NODE_TYPECAST &&
+           ir_tynode_is_ref_producing(v->typecast.target_type))
+        v = v->typecast.expr;
+    return v;
+}
+
 static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
                                     int *out_local,
                                     const char **out_path,
@@ -1276,6 +1300,8 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     *out_local = -1;
     *out_path = NULL;
     *out_path_len = 0;
+    if (!expr) return -1;
+    expr = ir_peel_ref_cast(expr);   /* BUG-791: casts are identity for allocations */
     if (!expr) return -1;
 
     Node *root = ir_key_root_ident(expr);

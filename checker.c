@@ -1740,8 +1740,27 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * *u32, &local)`) is NODE_INTRINSIC, not NODE_UNARY, so a taint sink that only
  * matched a bare NODE_UNARY missed it and the container escaped un-tainted via a
  * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
+/* Is a cast TARGET reference-producing — does `(T)x` designate the same object it
+ * was given, or manufacture a fresh value? `*T` / `[]T` / `*opaque` (and `?` of
+ * those) are pointers into an existing object, so the cast is an ALIAS and every
+ * provenance question must see through it. `(u32)x` is a fresh value carrying no
+ * reference to the frame; peeling it would taint unrelated integers.
+ *
+ * Deliberately NOT a `switch` on ->kind: this is a 3-way membership test, not an
+ * exhaustive dispatch, so a `default:` would trip walker_default_audit.sh for no
+ * safety gain. A new TYNODE kind defaults to "not a reference" = conservative
+ * (no peel = no missed taint; at worst an over-rejection). */
+static bool tynode_is_reference_producing(TypeNode *t) {
+    if (!t) return false;
+    if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
+        t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
+    if (t->kind == TYNODE_OPTIONAL) return tynode_is_reference_producing(t->optional.inner);
+    return false;
+}
+
 static Node *unwrap_ptr_launder(Node *v) {
-    while (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+    for (;;) {
+    if (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
         /* @container(*T, ptr, field) and @cstr(buf, str) both return a pointer
          * INTO their args[0]; every other launder (@ptrcast/@pun/@bitcast/@cast)
          * passes the pointer as its LAST arg. Peeling @cstr to the last arg reached
@@ -1754,6 +1773,21 @@ static Node *unwrap_ptr_launder(Node *v) {
             v = v->intrinsic.args[0];
         else
             v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+        continue;
+    }
+    /* BUG-791 (2026-08-17): a C-style cast to a reference-producing type is a
+     * launder too, and it was the ONE peel this shared function never did —
+     * C-style casts postdate the escape analysis. `(*u32)p` is an IDENTITY cast
+     * the emitter ELIDES ENTIRELY (the emitted C is byte-identical), yet
+     * `g_p = (*u32)p` laundered a stack pointer into a global past EVERY escape
+     * sink while the identical `g_p = p` was correctly rejected. Peeling here
+     * fixes all callers at once instead of at N hand-rolled sites. */
+    if (v && v->kind == NODE_TYPECAST &&
+        tynode_is_reference_producing(v->typecast.target_type)) {
+        v = v->typecast.expr;
+        continue;
+    }
+    break;
     }
     return v;
 }
@@ -1832,6 +1866,49 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     if (root_is_ref && !src->is_local_derived) return false;
     return true;
 }
+
+/* THE single query for "may this value expression evaluate to something FRAME-BOUND?"
+ * Returns the offending local Symbol (for the diagnostic) or NULL.
+ *
+ * Handles in ONE place what every escape sink previously re-derived: the launder
+ * peel (intrinsics + reference-producing C-style casts, via unwrap_ptr_launder),
+ * the `&local` / `&local.f` / `&local[i]` chain (via addr_of_is_local_derived), an
+ * ident already carrying is_local_derived, and — the case no sink handled at all —
+ * `orelse`, which is a JOIN: the value may be EITHER arm, so a frame-bound value in
+ * EITHER makes the store an escape.
+ *
+ * The join is precisely why a peeler is not enough. Every other launder collapses an
+ * expression to ONE node, so peeling suffices; `a orelse b` collapses to TWO, and a
+ * sink that peels to the primary silently drops the fallback. Both directions were
+ * live: `g = t orelse &g_dummy` (primary local) and `g = mk() orelse &loc.f`
+ * (fallback local) each compiled. */
+static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth) {
+    if (!v || depth > 8) return NULL;
+    v = unwrap_ptr_launder(v);
+    if (!v) return NULL;
+    if (v->kind == NODE_ORELSE) {
+        Symbol *s = value_frame_bound_symbol(c, v->orelse.expr, depth + 1);
+        if (s) return s;
+        return value_frame_bound_symbol(c, v->orelse.fallback, depth + 1);
+    }
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) {
+        if (!addr_of_is_local_derived(c, v->unary.operand)) return NULL;
+        Node *r = v->unary.operand;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+            r = (r->kind == NODE_FIELD) ? r->field.object : r->index_expr.object;
+        if (r && r->kind == NODE_IDENT)
+            return scope_lookup(c->current_scope, r->ident.name,
+                                (uint32_t)r->ident.name_len);
+        return NULL;
+    }
+    if (v->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                 (uint32_t)v->ident.name_len);
+        if (s && s->is_local_derived) return s;
+    }
+    return NULL;
+}
+
 
 /* Escape taint for a slice assignment/decl `slice_sym = value` where `value`
  * coerces a LOCAL array (or a local-derived slice) into a slice: the slice's
@@ -4736,14 +4813,42 @@ static Type *check_expr(Checker *c, Node *node) {
              * are detected (previously only bare `&local` was caught). The
              * @container reproducer hits this — `@container(*T, &local.lh, lh)`
              * unwraps to `&local.lh` whose operand is NODE_FIELD, not NODE_IDENT. */
-            Node *opv = (aval && aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP)
-                        ? aval->unary.operand : NULL;
+            /* BUG-791 (JOIN): `g = a orelse b` — no sink below matches an orelse
+             * node, so both arms escaped unchecked. Asked through the shared
+             * predicate so the arms cannot diverge from the direct case. */
+            if (node->assign.op == TOK_EQ && aval) {
+                Node *ap = unwrap_ptr_launder(aval);
+                if (ap && ap->kind == NODE_ORELSE) {
+                    Symbol *ots = NULL; bool og = false, op_ = false;
+                    classify_escape_sink(c, node->assign.target, &ots, &og, &op_);
+                    if (og || op_) {
+                        Symbol *bad = value_frame_bound_symbol(c, aval, 0);
+                        if (bad && ots)
+                            checker_error(c, node->loc.line,
+                                op_ ?
+                                "cannot store local-derived pointer '%.*s' through pointer parameter "
+                                "'%.*s' — reachable through an orelse arm; the pointer dangles when "
+                                "the frame returns" :
+                                "cannot store local-derived pointer '%.*s' in static/global variable "
+                                "'%.*s' — reachable through an orelse arm; the pointer dangles when "
+                                "the frame returns",
+                                (int)bad->name_len, bad->name,
+                                (int)ots->name_len, ots->name);
+                    }
+                }
+            }
+            /* BUG-791: peel launders (intrinsic + reference-producing C-style cast)
+             * before the shape test — `g = (*opaque)(&x)` is the same store as
+             * `g = &x`, and only the latter was caught. */
+            Node *avalu = unwrap_ptr_launder(aval);
+            Node *opv = (avalu && avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP)
+                        ? avalu->unary.operand : NULL;
             while (opv && (opv->kind == NODE_FIELD || opv->kind == NODE_INDEX)) {
                 opv = (opv->kind == NODE_FIELD) ? opv->field.object
                                                 : opv->index_expr.object;
             }
-            if (node->assign.op == TOK_EQ && aval &&
-                aval->kind == NODE_UNARY && aval->unary.op == TOK_AMP &&
+            if (node->assign.op == TOK_EQ && avalu &&
+                avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP &&
                 opv && opv->kind == NODE_IDENT) {
                 Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
@@ -11935,10 +12040,11 @@ static void check_stmt(Checker *c, Node *node) {
                     Node *addr_exprs[4] = { NULL, NULL, NULL, NULL };
                     int addr_count = 0;
                     /* BUG-338: walk into intrinsics to find &local */
-                    Node *init_unwrap = init;
-                    while (init_unwrap && init_unwrap->kind == NODE_INTRINSIC &&
-                           init_unwrap->intrinsic.arg_count > 0)
-                        init_unwrap = init_unwrap->intrinsic.args[init_unwrap->intrinsic.arg_count - 1];
+                    /* BUG-791: was a hand-rolled copy of the intrinsic peel — it missed
+                     * the @container/@cstr args[0] case the shared peeler handles AND
+                     * could never learn the C-style-cast peel. Call the ONE peeler so
+                     * this sink cannot drift from the others again. */
+                    Node *init_unwrap = unwrap_ptr_launder(init);
                     if (init_unwrap && init_unwrap->kind == NODE_UNARY && init_unwrap->unary.op == TOK_AMP) {
                         addr_exprs[addr_count++] = init_unwrap;
                     }
@@ -11947,9 +12053,7 @@ static void check_stmt(Checker *c, Node *node) {
                             addr_exprs[addr_count++] = init;
                     }
                     if (init->kind == NODE_ORELSE && init->orelse.fallback) {
-                        Node *fb = init->orelse.fallback;
-                        while (fb && fb->kind == NODE_INTRINSIC && fb->intrinsic.arg_count > 0)
-                            fb = fb->intrinsic.args[fb->intrinsic.arg_count - 1];
+                        Node *fb = unwrap_ptr_launder(init->orelse.fallback); /* BUG-791: shared peeler */
                         if (fb && fb->kind == NODE_UNARY && fb->unary.op == TOK_AMP)
                             addr_exprs[addr_count++] = fb;
                     }

@@ -1,0 +1,8 @@
+// expect-error: local-derived pointer
+// BUG-786: an identity C-style pointer cast laundered a stack pointer past the
+// escape analysis. The emitter elides the cast entirely, so this compiled to the
+// same code as the (correctly rejected) uncast form and ASan reported
+// stack-use-after-return.
+?*u32 g = null;
+void f() { u32 x = 5; *u32 p = (*u32)(&x); g = p; }
+u32 main() { f(); return 0; }

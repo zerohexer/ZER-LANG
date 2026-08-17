@@ -39,9 +39,19 @@ pass=0; fail=0; holes=""; overrej=""
 cell() {
   local name="$1" expect="$2" code="$3"
   printf '%s\n%s\n' "$PRE" "$code" > "$DIR/$name.zer"
-  "$ZERC" "$DIR/$name.zer" -o "$DIR/$name.exe" >/dev/null 2>&1
-  local ec=$?
-  local actual; if [ $ec -ne 0 ]; then actual=reject; else actual=compile; fi
+  # A `reject` cell asserts the CHECKER rejects. Compiling to an .exe let GCC's
+  # opinion count, so a cell could score "ok" because GCC choked on the emitted C
+  # while the checker said nothing — a weak oracle inside the gate itself. Measured
+  # 2026-08-17: 3 of the 7 new p15 cells passed pre-fix for exactly that reason.
+  # `compile` cells still go through GCC: they must produce a REAL working binary.
+  local actual
+  if [ "$expect" = reject ]; then
+    if "$ZERC" "$DIR/$name.zer" -o "$DIR/$name.c" 2>&1 | grep -vE '^zerc: ' \
+       | grep -qE '(^|[: ])(error|zercheck):'; then actual=reject; else actual=compile; fi
+  else
+    "$ZERC" "$DIR/$name.zer" -o "$DIR/$name.exe" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then actual=reject; else actual=compile; fi
+  fi
   local st
   if [ "$actual" = "$expect" ]; then st="ok"; pass=$((pass+1))
   else
@@ -155,6 +165,28 @@ cell heap_glob_field_dangle   reject 'struct N { u32 x; } struct HB { ?*N p; } H
 cell heap_glob_arrelem_dangle reject 'struct N { u32 x; } struct HB { ?*N p; } HB gb2[2]; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb2[0].p = n; free(n); return 0; }'
 cell heap_glob_launder_field  reject 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = @ptrcast(*N, n); free(n); return 0; }'
 cell safe_glob_field_reset   compile 'struct N { u32 x; } struct HB { ?*N p; } HB gb; u32 main(){ ?*N m = alloc(N); *N n = m orelse return; gb.p = n; free(n); gb.p = null; return 0; }'
+
+# p15 — LAUNDER SHAPES (2026-08-17, BUG-791). "Is this value frame-bound?" is answered
+# AFTER peeling launders. A peel present at one sink and absent from the shared peeler
+# is the same hole wearing a different syntax. `(*T)x` was missing from
+# unwrap_ptr_launder for the entire life of C-style casts — and the emitter ELIDES that
+# cast, so the emitted C is byte-identical to the form that was correctly rejected.
+# `orelse` is the JOIN case: it collapses to TWO nodes, not one, so peeling to the
+# primary silently drops the fallback; it needs a predicate, not a peel.
+# The safe cells pin the boundary so the peel cannot be widened into an over-rejection.
+echo "===== SHAPE p15 = launder wrappers around a local-derived pointer ====="
+cell p15_cast_store_glob    reject 'void c(){ L loc; *u32 p=&loc.f; g_p=(*u32)p; } u32 main(){c();return 0;}'
+cell p15_cast_direct_glob   reject 'void c(){ u32 x=5; g_p=(*u32)(&x); } u32 main(){c();return 0;}'
+cell p15_cast_opaque_glob   reject '?*opaque g_op15=null; void c(){ u32 x=5; g_op15=(*opaque)(&x); } u32 main(){c();return 0;}'
+cell p15_cast_vardecl_glob  reject 'void c(){ u32 x=5; *u32 p=(*u32)(&x); g_p=p; } u32 main(){c();return 0;}'
+cell p15_orelse_primary     reject 'u32 gd15=0; void c(){ L loc; ?*u32 t=&loc.f; g_p=t orelse &gd15; } u32 main(){c();return 0;}'
+cell p15_orelse_fallback    reject '?*u32 mk15(){return null;} void c(){ L loc; loc.f=1; g_p=mk15() orelse &loc.f; } u32 main(){c();return 0;}'
+cell p15_cast_free_arg      reject 'struct N15{u32 x;} u32 main(){ ?*N15 m=alloc(N15); *N15 n=m orelse {return 1;}; n.x=1; free((*N15)n); u32 v=n.x; free(n); return v; }'
+# BOUNDARY: a VALUE cast manufactures a fresh value and must NOT be peeled; an orelse
+# whose arms are both non-local must still compile; a cast of a GLOBAL address too.
+cell p15_safe_value_cast    compile 'u32 gv15=0; void c(){ u32 x=5; gv15=(u32)x; } u32 main(){c();return 0;}'
+cell p15_safe_orelse_global compile 'u32 gd15b=1; ?*u32 mk15b(){return null;} void c(){ g_p=mk15b() orelse &gd15b; } u32 main(){c();return 0;}'
+cell p15_safe_cast_global   compile 'u32 gd15c=1; void c(){ g_p=(*u32)(&gd15c); } u32 main(){c();return 0;}'
 
 echo ""
 echo "==================================================================="

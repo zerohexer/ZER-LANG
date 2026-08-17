@@ -745,3 +745,17 @@ checker.c:eff_pl->kind == TYPE_OPAQUE);
 checker.c:eff_pl->kind == TYPE_SLICE ||
 checker.c:if (eff_pl->kind == TYPE_OPTIONAL)
 checker.c:if (eff_pl->kind == TYPE_POINTER) {
+# BUG-791 (2026-08-17): TypeNode (SYNTAX) reads, not semantic Type reads.
+# `type_dispatch_kind()` takes a `Type *` and exists to unwrap TYPE_DISTINCT;
+# a TypeNode is the parsed syntax of a type annotation and can NEVER be a
+# distinct wrapper (distinct is resolved later, into a Type). So there is no
+# unwrap to forget here and the helper does not even typecheck on these.
+# Used by tynode_is_reference_producing / ir_tynode_is_ref_producing — the gate
+# deciding whether a C-style cast designates the same object (peelable) or
+# manufactures a fresh value (not peelable).
+checker.c:if (t->kind == TYNODE_OPTIONAL) return tynode_is_reference_producing(t->optional.inner);
+checker.c:if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
+checker.c:t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
+zercheck_ir.c:if (t->kind == TYNODE_OPTIONAL) return ir_tynode_is_ref_producing(t->optional.inner);
+zercheck_ir.c:if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
+zercheck_ir.c:t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;

@@ -5,6 +5,308 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-17b — ten silent holes: BUG-796..805 (bounds, volatile, packed, RMW, guard scopes)
+
+Independent audit + the ten reproducers left open by the 2026-08-17 harvest. Every
+one was measured LIVE on main before implementing, and every new test was verified
+DISCRIMINATING against a from-HEAD `git archive` build. Two harness weak-oracle holes
+were found and closed on the way.
+
+**What the ten had in common.** Nine of the ten are the SAME shape this codebase keeps
+paying for: ONE semantic question answered at N sites, with site k missed. The counts
+are worth recording because they are the argument for the structural fix over the local
+one:
+
+| Question | Sites | Gated before | Gated now |
+|---|---|---|---|
+| "does deref-ing this create an untrackable alias?" | 4 sinks x N operand forms x N result types | 1 form, 3 types, 3 sinks | all forms/types, 4 sinks |
+| "is this index provably out of bounds?" | 4 index sinks | 1 (the call sink) | 4 |
+| "does this coercion strip `volatile`?" | pointer + slice carriers | slice only | both |
+| "does `&packed.field` reach a misaligned store?" | 5 sinks | 1 (var-decl) | 5 |
+| "is this a non-atomic RMW?" | 2 sinks x N spellings | every spelling but bit-range | all |
+| "may a `return` leave this scope?" | defer + @critical + held lock | defer only | all three |
+
+### BUG-796 — the deref-identity boundary (4 accept-unsafe forms)
+
+`deref_ptr_launder` asked two hand-rolled questions, both too narrow. The OPERAND had
+to be a bare `NODE_IDENT`, so `*h.pp` / `*a[0]` / `**ppp` / a laundering cast walked
+past all three sinks while `*pp` was rejected. The RESULT had to be pointer/slice/opaque,
+so a `Handle(T)` and a `move struct` slipped — each an untracked SECOND OWNER with the
+same consequence as an untrackable pointer alias.
+
+Both replaced by ONE type-level question. `deref_operand_type` resolves the operand's
+type from the PATH without calling `check_expr` (which is unusable here: the var-decl
+sink runs before the init is checked, and a second traversal would double-emit
+diagnostics); an unhandled form returns NULL, which can only under-reject.
+`deref_yields_tracked_identity` = `type_carries_data_pointer || type_carries_handle ||
+type_carries_move` (the third is new, the move sibling of the other two), so a wrapper
+cannot hide the carrier. Added the missing FOURTH sink — call arguments, where
+`pool.free(*p)` skipped all three value-binding sinks — and folded the diagnostic
+pasted at three sinks into one emitter.
+
+Measured live: the field-operand form RAN, returned a read of freed memory, then
+double-freed. The two Handle forms double-free a pool slot, which mangles the
+generation counter so a later `get()` on the reused slot silently returns the WRONG
+object. The move form releases a one-shot resource twice.
+
+`deref_operand_type`'s switch is exhaustive with NO `default:` — the first version had
+one and `tools/walker_default_audit.sh` failed the build, which is the gate working.
+
+Tests: `tests/zer_fail/deref_identity_{field_operand,handle_arg,handle_copy,move_copy}.zer`.
+
+### BUG-797 — `for` cond-narrowing applied to the WRONG variable (silent OOB)
+
+The `for` driver took the lower bound from the INIT clause's variable and pushed it
+onto whatever ident was on the left of the CONDITION, with no check that they are the
+same variable. `for (i32 q = 0; k < 4; q += 1)` proved `k` in [0,3] and elided the
+bounds guard on `a[k]` in the body. With `k` negative: no diagnostic, no runtime trap,
+an ASan-confirmed stack-buffer-UNDERFLOW write, and on bare metal silent corruption of
+the adjacent frame. The semantically identical `while (k < 4)` was always guarded,
+which is what makes the mismatch the trigger rather than the shape.
+
+On name mismatch it now falls to B8's `INT64_MIN` seed — `k < 4` bounds `k` from ABOVE
+only, so nothing is known below. `push_var_range` clamps min to 0 for an UNSIGNED var,
+so `for (u32 i = 0; k < N; ...)` keeps its true type invariant and loses no precision.
+
+### BUG-798 — `vrp_widen_loop_addr_taken` did not name NODE_SPAWN
+
+The loop pre-pass that marks every `&x` in a body as address-taken was a hand-rolled
+if/else chain — the exact form its sibling `vrp_invalidate_loop_body_writes` was
+converted AWAY from on 2026-08-06 after `NODE_ORELSE` was found silently dropped. Its
+trailing comment asserted spawn/await/asm were leaves with "no `&` subtree", which is
+false. So `spawn bump(&i)` in a loop body did not widen `i` while the plain-call
+control `bump(&i)` did, and `a[i]` earlier in the body was proven against the stale
+pre-loop range: ASan-confirmed silent stack-buffer-overflow write.
+
+Now an exhaustive no-`default:` switch with SPAWN / AWAIT / ASM / STATIC_ASSERT arms,
+so a new NodeKind that can hold `&x` is a BUILD FAILURE rather than another silent miss.
+
+### BUG-799 — `find_return_range` never scanned control-flow CONDITIONS
+
+B9 (2026-08-01) taught this scan to find `orelse { return N; }` buried in a var-decl
+init / expr-stmt / assignment RHS, but not in a CONDITION. `if ((mb() orelse { return 9; }) > 0)`
+is a real return path that fell to the `return true` catch-all and was SILENTLY dropped
+from the union, so the callee summary under-approximated ([1,2] instead of [1,9]) and
+the CALLER elided its bounds guard — ASan-confirmed silent stack-buffer-overflow write.
+Measured live at all four positions: if cond, while cond, for cond, switch scrutinee.
+`for` init/step, spawn args and await conds wired at the same time.
+
+### BUG-800 — a provably-OOB index was silent at BOTH ends; and `&&` now narrows
+
+A fixed-array or MMIO index whose PROVEN RANGE is entirely out of bounds only WARNED
+and fell into the auto-guard, whose runtime form is `if (i >= 4) { return 0; }`. So the
+access was silent at both ends: no compile error, no runtime trap, and every statement
+after it never ran. The LITERAL spelling `arr[10]` was always a hard error — this was
+its IDENT sibling. On bare metal it is a peripheral write that simply never happens.
+
+Four indexing sinks each answered a DIFFERENT subset of one question. The array-IDENT
+sink asked only "provably SAFE?"; the MMIO sink asked NEITHER half (so a provably-OOB
+index was silent AND a provably-IN-RANGE index paid a guard VRP could already
+eliminate); only the CALL sink had the always-OOB verdict. Now one classifier,
+`index_range_verdict`, and all four agree by construction. The MMIO sink gains the
+precision the array sink already had.
+
+**The relaxation this forced.** Promoting the verdict to an error exposed that VRP never
+applied a short-circuit LHS to its RHS, so `if (i < 4 && arr[i] > 0)` — the canonical
+guarded-access idiom, and the exact shape the auto-guard warning tells users to write —
+carried an unnecessary guard, and would have been REJECTED. `vrp_narrow_from_cond`
+handles `ident <op> const` and conjunctions (De Morgan for the inverted disjunction),
+refuses volatile operands, and is a no-op otherwise. Deliberately NOT a second copy of
+the NODE_IF narrowing: that path stays authoritative and keeps field keys, guard-body
+detection, `known_nonzero` and the then/else JOIN; this covers only the position it
+structurally cannot reach — inside a condition EXPRESSION, where there is no statement
+body to hang a snapshot on.
+
+**The reachability gate, produced by measurement.** An ALWAYS_OOB range only says "if
+reached, definitely wrong"; promoting it to an error needs reachability, which the
+compiler does not analyse. Measured over the guarded idioms, the naive verdict
+over-rejected the standard DYNAMIC-bounds pattern at both levels —
+`if (i < len) { arr[i] }` and `if (i < len && arr[i] > 0)` with a runtime `len`. Both
+are valid: the guard may exclude the access and the compiler cannot evaluate it. The
+error now fires only at UNCONDITIONAL position (`branch_depth == 0 && sc_rhs_depth == 0`);
+elsewhere it falls back to the guard, which is the status quo and never worse.
+
+**Four existing tests had to change, each for a stated reason.** `test_emit.c`'s
+"auto-guard returns 0 for OOB variable index" ASSERTED THE BUG — its own expectation
+(`return arr[0]` == 0, not 42) was the early return, not the guard "handling" anything.
+`async_auto_guard.zer` used `u32 i = 5; while(...){i=5;} // defeat VRP`, which did not
+defeat it (the range stayed [5,5]); the index now comes from a volatile global so the
+coroutine-termination property it exists for is unchanged. `vrp_defer_body_narrowing_guarded.zer`
+and `vrp_else_nested_guard_no_leak.zer` moved to `zer_fail` — both put a provably-OOB
+index at unconditional position, and they still discriminate MORE strongly than before:
+with the leak present the index is proven SAFE, so no error fires and the negative FAILS.
+
+`tests/zer_gaps/prec1_vrp_literal_i.zer` CLOSED. Its own text claimed this was "just a
+precision/message difference" and "safe at runtime" — wrong, and the README row says why.
+
+### BUG-801 — the POINTER carrier was missing from `type_equals` (bare-metal miscompile)
+
+`type_equals` checked `pointer.is_const` but NOT `pointer.is_volatile`, while its
+TYPE_SLICE arm three lines away had always checked both. So every sink deciding a
+volatile strip through `type_equals` missed the pointer carrier while catching the slice
+one: a designated struct initializer (`Dev d = { .reg = volatile_ptr }`, all four
+value-flow sinks) and a function-pointer param match both accepted the strip with ZERO
+diagnostics. Measured: two stores to one MMIO register emitted a single `movl $2` — the
+first store DELETED. The plain-assignment sibling `d.reg = volatile_ptr` was correctly
+rejected the whole time, which makes this the CARRIER axis of one question.
+
+Fixed at the root: one line in `type_equals`, plus the pointer sibling of the slice arm
+in `can_implicit_coerce` delegating to the same VST-verified predicates
+(`zer_coerce_preserves_volatile` / `_const`). Closes all four struct-init sinks AND the
+funcptr param match together, and subsumes the old const-only pointer coerce case.
+
+**Diagnostic quality, because the fix surfaced unreadable messages.** `type_name` never
+rendered pointer qualifiers (only slices did), so the new errors read "expects '*u32',
+got '*u32'". And every funcptr mismatch printed "expects 'fn(...)', got 'fn(...)'".
+Pointers now render volatile/const and funcptrs render their signature.
+
+**Measured cost of a deep type-system edit: ZERO.** 1250/1250 ZER, all gates green.
+
+### BUG-802 — `@inttoptr` yielded a NON-volatile pointer
+
+The intrinsic exists to address device registers and is gated on an `mmio` declaration,
+yet its result type was whatever the user wrote — so `*u32 reg = @inttoptr(*u32, 0x40020014)`
+compiled with zero diagnostics and its stores were deletable. Silent on hosted x86-64
+(no peripheral) and silent on the target (nothing traps; the code just does not do what
+was written).
+
+The result is now volatile when the address is PROVABLY hardware — two provenances asked
+as ONE question, because a rule that closes one spelling of a launder is the multi-site
+bug again: (a) a constant address inside a declared mmio range; (b) derived from
+`@ptrtoint` of a VOLATILE pointer, inline, through arithmetic, or across a local (the new
+`Symbol.is_volatile_addr`) — the round trip that was the documented way around the
+direct-strip error.
+
+**Why the result type and not a required `volatile` target.** Measured first: 36 corpus
+files write `volatile *u32 reg = @inttoptr(*u32, ADDR)`, already correct at the binding.
+Demanding `volatile` inside the type arg would have broken all 36 for no safety gain.
+Widening the RESULT is the conservative direction — plain -> volatile still coerces via
+BUG-801's coerce arm.
+
+**The representation split this exposed, fixed rather than worked around.**
+`volatile *u32 reg = ...` is parsed by consuming the keyword into a FLAG and resolving
+the type as PLAIN `*u32`; `@inttoptr(volatile *u32, A)` sets `pointer.is_volatile`. One
+intent, two representations, and every rule had to consult both — the LOCAL var-decl
+strip sink did, the GLOBAL one did not. So once @inttoptr began yielding volatile,
+`volatile *u32 gpio = @inttoptr(...)` at file scope failed with "cannot initialize 'gpio'
+of type '*u32' with 'volatile *u32'" — the declared type printing as non-volatile is the
+tell. `decl_apply_volatile_qualifier` now makes the type honest at all three
+declared-type sites, so rules get ONE answer and a sink that forgets the flag cannot exist.
+
+The BOUNDARY is pinned compile-only: an address with NO hardware provenance must NOT be
+forced volatile, since under `--no-strict-mmio` @inttoptr is also the pointer-arithmetic
+escape hatch on ordinary memory.
+
+`tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer` CLOSED.
+
+### BUG-803 — a bit-range write is an implicit RMW, missed at BOTH sinks
+
+`flags[3..0] = 5` lowers to `*p = (*p & ~mask) | (v << lo)` — a literal
+read-modify-write. Neither the ISR nor the spawn sink rejected it. Two independent
+reasons, both fixed: `resolve_write_target_global` — THE shared "which global does this
+write land on?" resolver — peeled FIELD/INDEX/deref but not NODE_SLICE, which is what a
+bit-range target parses as, so the walk returned NULL and the write was invisible to
+every caller; and both `is_rmw` gates test whether the OPERATOR is compound or whether
+the RHS mentions the target, while a bit-range write is spelled `=` with an RHS that
+never names the global.
+
+The `+=` spelling of the identical operation was correctly rejected the whole time —
+the SPELLING axis of one question, which is why both sinks are fixed in one commit.
+GATED: `RFORM_BIT_RANGE` in the RMW FORM grid (`tests/test_hw_matrix.c`); the enum has
+no `default:`, so a future form cannot be added without teaching both sinks.
+
+### BUG-804 — `&packed.field` reached the same misaligned store at 5 sinks, 1 gated
+
+`Symbol.is_packed_derived` was written at exactly ONE site (the var-decl `addr_exprs`
+loop) and read at exactly ONE site (the deref of a bare ident). Of the five ways to
+reach the identical misaligned store, only var-decl was gated: assignment, call-arg,
+alias and return all compiled. Measured: `movl $7, 1+g(%rip)` — a 32-bit store at an
+ODD address. Hard fault on ARMv7-M / RISC-V, silent split access on Cortex-M0+, merely
+SLOW on x86 — which is why no hosted test could have caught it. GCC's own
+`-Waddress-of-packed-member` does fire, but it is a warning, its `#line` mapping points
+at the wrong line, and zerc deletes the `.c` in a normal build.
+
+`addr_of_is_packed_field` already existed and its own comment said it had been hoisted
+"so the general pointer sinks can ask it too" — they were never wired. Now one shared
+predicate `value_is_packed_derived` (adding the ALIAS hop the literal-`&` scan could not
+see) and one shared diagnostic.
+
+**The call-arg sink is why the flag route was structurally incomplete, not merely
+under-wired:** `poke(&g.b)` binds no name, so no Symbol exists to carry the fact. Same
+from the other side for RETURN — the fact does not cross the function boundary, so the
+caller's deref cannot know.
+
+**Not sticky:** the assignment sink SETS on a packed-derived RHS and CLEARS otherwise, so
+`q = &aligned.z;` re-clears. A sticky flag would over-reject every later deref of a
+reused pointer. The boundary positive pins that, plus: forming the pointer is still fine,
+aligned call-args pass, and direct `s.field` access stays the correct way to touch a
+packed member.
+
+**A trap worth recording:** checker errors echo the offending SOURCE LINE, which here
+contains the words "packed struct", so a loose case-insensitive grep for "packed" matched
+the ECHO rather than the diagnostic and made all four negatives look non-discriminating.
+Grepping the diagnostic phrase is what discriminates — the "read the message, not the
+exit code" rule one level down.
+
+### BUG-805 — the auto-guard's `return` leaked a lock and the interrupt-disable
+
+`emit_safety_early_return` already had a `guard_traps` mode so it would not early-return
+out of a `defer` body, but nothing covered the two OTHER scopes a `return` must never
+leave. The compiler emitted, verbatim, the construct it BANS users from writing:
+
+    __asm__("mrs %0, primask\n cpsid i" ...);     // interrupts OFF
+    if ((size_t)(i) >= 4u) { return 0; }          // <-- leaves them OFF forever
+    __asm__("msr primask, %0" ...);               // never reached
+
+    pthread_mutex_lock(&g._zer_mtx);
+    if ((size_t)(i) >= 4u) { return; }            // <-- mutex never released
+    pthread_mutex_unlock(&g._zer_mtx);
+
+Measured: the lock form HANGS FOREVER (exit 124). The @critical form returned 0
+silently, because hosted x86-64 degrades the critical section to a compiler fence; on
+bare metal it leaves interrupts disabled forever with no fault to notice it by. That
+asymmetry is why no existing test could have caught either half.
+
+New `Emitter.noreturn_scope_depth`, counted INSIDE `emit_shared_lock_mode` /
+`emit_shared_unlock` so all five lock call sites are covered by construction rather than
+by remembering to bracket each, and in the two IR_CRITICAL handlers. While non-zero the
+guard degrades to `_zer_trap` — the same trade-off already accepted for defer bodies, and
+consistent with slices, which already TRAP on an out-of-range index. Outside those scopes
+nothing changes.
+
+### Two weak-oracle holes closed in the TRAP harness
+
+Found while trying to land BUG-805's regression, and worth more than the fix that
+surfaced them:
+
+- **NO TIMEOUT.** A trap test whose program HANGS did not pass vacuously — it hung
+  `make check` forever. BUG-805's pre-fix reproducer does exactly that, so the
+  regression test could not have lived in the suite at all. `timeout 20` is applied and
+  124 is an explicit FAIL: a hang is not a trap.
+- **"ANY non-zero exit" is a weak oracle** — a hang, a SIGSEGV, a wrong-answer exit code
+  and a genuine safety trap were indistinguishable, over ~30 trap tests. Optional
+  `// expect-trap` now demands SIGTRAP (133) specifically, the same opt-in shape as
+  `// expect-error` for negatives, so existing tests that abort by other means keep
+  working and it is backfillable highest-value-first.
+
+**Both gates verified to FIRE, not merely to pass:** an injected trap test that exits 0
+reported "expected SIGTRAP/133, got exit 0", and one that hangs reported "TIMED OUT — a
+hang is not a trap". A gate that has only ever passed is a script, not a net.
+
+### Method notes worth keeping
+
+- **Three VRP defects emit only a WARNING**, so neither harness can hold them. Their
+  tests are VALUE-ASSERTING in the `test_defer_goto_matrix` style: the guard's early
+  return yields 0, its absence falls through to 42. Measured 42 -> 0 across a from-HEAD
+  pre-fix build, and ASan error -> clean.
+- **A `tests/zer` positive cannot contain an `interrupt` block** (gcc refuses it on
+  hosted x86-64), so the ISR half of BUG-803 is negative-only. It fails at the CHECKER,
+  before gcc, so it is unaffected.
+- **`rc_cond_004` is a documented `timeout 10` pthread flake**, not a regression —
+  measured 3/3 and 5/5 standalone across the session.
+
+---
+
 ## Session 2026-08-17 — five STRUCTURAL fixes: BUG-791..795 (26 accept-unsafe holes)
 
 Harvested from seven `claude/*` audit branches. The bugs were NOT independent: of

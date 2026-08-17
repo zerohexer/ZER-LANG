@@ -768,6 +768,73 @@ descriptions.
 
 ---
 
+
+## VRP's real shape, and why three defects landed there in one session (2026-08-17)
+
+Read this before touching any range-propagation code.
+
+**The shipped analysis is NOT `vrp_ir.c`.** `vrp_ir.c` is orphaned — no caller, absent
+from both Makefile source lists, `strings zerc | grep -c vrp_ir` is 0. What ships is the
+AST/name-keyed `VarRange` stack in `checker.c`, and its "merge at a control-flow join" is
+not a merge function: it is a set of hand-placed `vrp_snap_take` / `vrp_snap_restore` /
+`vrp_snap_join` calls **replicated per node kind**, plus two hand-rolled body walkers
+(`vrp_invalidate_loop_body_writes`, `vrp_widen_loop_addr_taken`).
+
+That architecture is the reason three of the four VRP defects closed in one session were
+in it, and each is a different way for a per-node-kind design to lose information:
+
+| Defect | The shape |
+|---|---|
+| BUG-797 | a narrowing rule that never checked WHICH variable it was narrowing (`for` took the lower bound from the init clause's variable and pushed it onto the condition's) |
+| BUG-798 | a missing KIND in a hand-rolled walker (`NODE_SPAWN` absent, so `spawn f(&i)` did not widen `i` while `f(&i)` did) |
+| BUG-799 | a missing POSITION in another walker (`find_return_range` scanned statement bodies but never control-flow CONDITIONS) |
+
+All three were silent: no diagnostic, no runtime trap, an ASan-confirmed stack OOB.
+
+**Three rules that follow.**
+
+1. **Any new walker over node kinds here MUST be a no-`default:` exhaustive switch.**
+   `vrp_invalidate_loop_body_writes` was converted from an if/else chain on 2026-08-06
+   after `NODE_ORELSE` was found silently dropped; `vrp_widen_loop_addr_taken` kept the
+   chain form — with a comment claiming that was deliberate — and lost `NODE_SPAWN` the
+   same way. Both are switches now. `-Werror=switch` turns the next missing kind into a
+   build failure instead of a silent miss.
+2. **A narrowing must verify the IDENTITY of what it narrows,** not just that a name was
+   found in the condition. BUG-797 is one `memcmp` away from never having existed.
+3. **A "scan for return paths" function must enumerate POSITIONS, not just statements.**
+   `find_return_range`'s bottom `return true` is a silent catch-all for every position it
+   does not name; conditions, `for` init/step, spawn args and await conds all had to be
+   added by hand. The durable fix is an exhaustive dispatch there too.
+
+**The precision work that came with it.** `vrp_narrow_from_cond` narrows the RHS of a
+short-circuit `&&`/`||` from the LHS comparison — the position the NODE_IF path
+structurally cannot reach, because there is no statement body to hang a snapshot on. It is
+deliberately SMALLER than the NODE_IF narrowing (no field keys, no variable bound, no
+`known_nonzero`, no then/else JOIN) so it cannot become a second drifting copy; see
+docs/limitations.md for what that costs. The honest end-state is ONE narrowing routine
+serving both positions, and above that, wiring `vrp_ir.c` so the merge is a function
+rather than a convention.
+
+## An auto-guard is a `return`, and a `return` is not always legal (2026-08-17)
+
+`emit_safety_early_return` emits `<fire defers>; return <zero>;`. That is control flow the
+compiler INSERTS, so it is subject to every rule ZER enforces on control flow the user
+writes — and it was not. ZER hard-errors `return` inside `@critical` ("would skip
+interrupt re-enable"); the compiler emitted exactly that, between `cpsid i` and
+`msr primask`. It also emitted it between `pthread_mutex_lock` and its unlock, which
+measurably HANGS.
+
+`guard_traps` already existed for the `defer`-body case, which is the same question asked
+once. The general form is `Emitter.noreturn_scope_depth`, counted **inside**
+`emit_shared_lock_mode` / `emit_shared_unlock` — not at their five call sites — so a new
+lock site is covered by construction. While it is non-zero the guard degrades to
+`_zer_trap`.
+
+**The generalizable rule: when the compiler synthesises control flow, ask whether the
+scope it is in permits it.** The three scopes today are defer bodies, `@critical`, and a
+held shared lock. A fourth scoped resource must increment the same counter, and the fact
+that the counter lives in the resource's own emitter is what makes that hard to forget.
+
 ## Verification endgame — core λZER + verified desugaring (the 100%-sound-checker plan)
 
 This is the full technical context for the locked direction stated in CLAUDE.md

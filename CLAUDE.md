@@ -388,6 +388,11 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
 | **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
+| **Index-range verdict ("what do we know about this index?")** | fixed-array literal, fixed-array ident, `arr[f()]` call, MMIO pointer | ONE classifier `index_range_verdict` (SAFE / ALWAYS_OOB / UNKNOWN). Before BUG-800 each sink answered a DIFFERENT SUBSET, so a provably-OOB ident was silent at both ends. A new index sink must call it, not re-derive a comparison |
+| **Qualifier carrier in `type_equals` / `can_implicit_coerce`** | pointer, slice (and every sink that decides a strip THROUGH them: struct-init x4, funcptr param match, var-decl, assign, call-arg, return) | the two arms must check the SAME qualifier set. BUG-801: the slice arm checked const+volatile, the pointer arm only const, so every strip sink missed the pointer carrier. Fix at the ROOT in types.c, never per-sink |
+| **Declaration qualifier vs TYPE qualifier** | `volatile *T x = ...` (flag on the decl) vs `@inttoptr(volatile *T, A)` (bit on the type) | ONE representation. `decl_apply_volatile_qualifier` at all three declared-type sites. Two representations of one intent means every rule must consult both, and BUG-802 measured that the local strip sink did and the global one did not |
+| **"May a `return` leave this scope?"** | `defer` body, `@critical`, a held shared-struct lock | `Emitter.noreturn_scope_depth`, counted INSIDE `emit_shared_lock_mode`/`emit_shared_unlock` so all five lock call sites are covered by construction. BUG-805: the compiler EMITTED the `return` it hard-errors users for writing — measured, the lock form hangs forever |
+| **Misaligned-pointer provenance (`&packed.field`)** | var-decl, assignment, alias hop, call-arg, return | ONE predicate `value_is_packed_derived` + one diagnostic. BUG-804: the flag was written at 1 site and read at 1 site. The CALL-ARG sink cannot be reached by a Symbol flag at all (`poke(&g.b)` binds no name) — that is why a flag route is structurally incomplete here, not merely under-wired |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
@@ -1675,6 +1680,30 @@ confidence"), applied to TESTS. Treat them identically.
 5. Verify a new test gate FIRES before trusting it (inject a wrong expectation / a fake
    closure). A gate that has only ever passed is a script, not a net.
 
+### GREP THE DIAGNOSTIC, NOT THE ECHO — checker errors print the source line (2026-08-17)
+
+`checker_error` calls `print_source_line`, so every diagnostic is followed by the
+OFFENDING SOURCE TEXT and a caret. A loose grep over the compiler's output therefore
+matches the user's own code, not the compiler's verdict. Measured: probing four
+`&packed.field` negatives with `grep -qi "packed"` reported all four "already
+rejected" on a PRE-FIX build — the match was `packed struct P` echoed from line 1 of
+each test. Ten minutes were spent concluding the tests were non-discriminating when
+they were perfect. Grep the DIAGNOSTIC PHRASE (`"PACKED struct field"`), not a word
+that also appears in the program. This is the "read the message, not the exit code"
+rule one level down: the message is there, and a sloppy pattern still misses it.
+
+### A TRAP TEST NEEDS A TIMEOUT AND A SPECIFIC EXIT CODE (2026-08-17)
+
+`tests/zer_trap/` passed on ANY non-zero exit and had NO timeout. Two consequences,
+both closed: a test whose program HANGS did not pass vacuously, it hung `make check`
+FOREVER (BUG-805's pre-fix reproducer does exactly that, so its regression test could
+not have lived in the suite at all); and a hang, a SIGSEGV, a wrong-answer exit code
+and a genuine safety trap were indistinguishable across ~30 tests. The runner now
+applies `timeout 20`, FAILS on 124 ("a hang is not a trap"), and supports an optional
+`// expect-trap` directive in the first 5 lines demanding SIGTRAP (133) specifically —
+same opt-in, backfillable shape as `// expect-error`. **Both gates were verified to
+FIRE** by injecting a trap test that exits 0 and one that hangs.
+
 ### A NEGATIVE TEST PROVES NOTHING UNTIL YOU READ THE DIAGNOSTIC — use `// expect-error:`
 
 `tests/zer_fail/` passes a test on ANY non-zero exit. Until 2026-08-03 the diagnostic went
@@ -2932,6 +2961,25 @@ After any bug fix or feature change that passes `make check`, update ALL relevan
 - `README.md` — if test counts, features, or status changed
 - `ZER-LANG.md` — if spec behavior changed
 - `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed
+
+**`docs/reference.md` EXAMPLES ARE GATED — `make check` runs them (2026-08-17).**
+reference.md is the user-facing reference and users have nothing else to check it
+against; a stale example is a confidently wrong instruction, which is strictly worse
+than a missing one. `tools/audit_reference_examples.sh` compiles every MARKED example
+and asserts its annotation. Marking is opt-in via an HTML comment before the fence
+(invisible when rendered, keeps syntax highlighting):
+
+    <!-- verify: ok -->                      block must COMPILE
+    <!-- verify: error "substring" -->       must be REJECTED, diagnostic must contain it
+
+The substring is REQUIRED on error cases for the same reason `// expect-error` is
+required on negative tests: many independent rules reject the same programs, so "it
+failed to compile" is a weak oracle and whichever rule fires first is usually not the
+one the prose teaches. **Do not gate by heuristic** — most blocks in the file are
+deliberate FRAGMENTS; a "is this a whole program?" detector produced 9 false failures
+out of 48 on the first run, one of them a block whose COMPILE-ERROR note was on a
+commented-out line. When you document a new rule, mark its examples in the SAME commit.
+Verified to FIRE by injecting a weakened marker and a wrong reason.
 
 **GAPS / LIMITATIONS / TECH DEBT GO IN `docs/limitations.md` — MANDATORY.**
 Any open bug, deferred fix, over-rejection, coverage gap, known-flaky test, or

@@ -5,34 +5,29 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — harvested 2026-08-17 from seven audit branches: 13 holes NOT yet closed
+## DONE 2026-08-17b — the 10 branch holes above are CLOSED (BUG-796..805 + 4 new)
 
-Five structural fixes (BUG-791..795) closed 26 of 39 measurably-live holes. These
-13 remain. Each was VERIFIED LIVE on main using the branches' OWN test files (a
-reconstruction can confirm a hole but never refute one), in CHECKER-ONLY mode
-(`-o out.c`), because GCC refuses `__attribute__((interrupt))` on hosted x86-64 and
-masks every ISR test in exe mode.
+All ten reproducers from the seven-branch harvest were re-measured LIVE on main, then
+closed. Full detail: BUGS-FIXED.md "Session 2026-08-17b". Summary:
+
+| Was open | Closed by | Verification |
+|---|---|---|
+| provably-OOB index silent at both ends (3 forms) | BUG-800 `index_range_verdict` at all 4 index sinks | accepted -> hard error; 8 guarded idioms re-measured to confirm no over-rejection |
+| `@inttoptr` not volatile | BUG-802 result is volatile when the address is provably hardware | accepted -> rejected; 36-file corpus cost measured FIRST and avoided |
+| `volatile` lost through `@ptrtoint`->`@inttoptr` (2 forms) | BUG-802 `Symbol.is_volatile_addr` carries the provenance across a local | both spellings rejected |
+| the deref-identity boundary (4 forms) | BUG-796 type-driven predicate + the 4th (call-arg) sink | all four rejected, naming the intended rule |
+
+FOUR MORE, found by independent audit in the same session and NOT on any branch:
+BUG-797 (`for` cond-narrowing on the wrong variable), BUG-798 (`vrp_widen_loop_addr_taken`
+missing NODE_SPAWN), BUG-799 (`find_return_range` never scanning control-flow conditions),
+BUG-801 (`type_equals` missing `pointer.is_volatile`), BUG-803 (bit-range write is an
+implicit RMW), BUG-804 (`&packed.field` at 5 sinks, 1 gated), BUG-805 (the auto-guard's
+`return` leaking a held lock / the interrupt-disable).
 
 Extract any branch file with:
     git show origin/claude/vigilant-tesla-<id>:tests/zer_fail/<name>.zer
 
-### HIGH — silent miscompile / bare-metal
-- **A provably-OOB index compiles to a SILENT early return** (hefb6x, BUG-787
-  there): `bounds_ident_always_oob`, `bounds_ident_negative_idx`,
-  `mmio_ident_always_oob`. Also closes the long-standing "PRECISION GAP #1".
-- **`@inttoptr` does not require `volatile`** so GCC deletes the MMIO store
-  (j8f9t7): `mmio_inttoptr_nonvolatile`.
-- **`volatile` lost through a `@ptrtoint` -> `@inttoptr` round trip** (hefb6x):
-  `volatile_launder_ptrtoint_inline`, `..._roundtrip`. Supersedes the older
-  `tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer` gap file.
-
-### HIGH — accept-unsafe
-- **The dereference identity boundary** (t6dfxt, BUG-785 there), 4 forms:
-  `deref_identity_field_operand`, `_handle_arg`, `_handle_copy`, `_move_copy`.
-  Distinct from the deref-launder rule already in main (BUG-781/782), which those
-  tests do NOT trip.
-
-### Residuals of the five structures (stated so nothing reads as complete)
+## OPEN — residuals after 2026-08-17b (measured, none an accept-unsafe hole)
 - **RMW reached from MAIN through a helper** —
   `tests/zer_gaps/main_rmw_via_pointer_param.zer`. The ISR side of this family is
   CLOSED. The mirror of ISR-TRANS (a transitive walk over every regular function
@@ -55,6 +50,55 @@ Extract any branch file with:
   in the sources). Harmless for correctness — the audit only fails on NEW sites —
   but it is a gate drifting from its site set. The 4 rows BUG-793 made stale were
   removed; these 45 predate it and were left alone rather than bulk-edited unverified.
+
+### NEW 2026-08-17b — found while closing the ten, deliberately NOT fixed
+
+- **`vrp_ir.c` is ORPHANED — dead code, not compiled into anything.** Measured:
+  `grep -rn "vrp_ir" --include=*.c --include=*.h .` hits only the file itself; its
+  entry point `IRVRPResult *vrp_ir(IRFunc *)` has NO caller; it is absent from both
+  Makefile source lists (`CORE_SRCS`, `LIB_SRCS`); `strings zerc | grep -c vrp_ir`
+  is 0. **What is lost:** a per-block/per-local range state with a REAL merge at
+  join points (`ir_merge_ranges`) and SCOPED `address_taken`. The shipping analysis
+  is instead the AST/name-keyed `VarRange` stack in checker.c, whose "merge" is a
+  set of hand-placed `vrp_snap_take/restore/join` calls replicated PER NODE KIND.
+  **Three of the four VRP defects closed this session are consequences of exactly
+  that** — BUG-797 is a per-node-kind narrowing rule that never checked which
+  variable it narrowed, BUG-798 a missing kind in a hand-rolled walker, BUG-799 a
+  missing position in another. Wiring `vrp_ir.c` is the phase-1 item in
+  `docs/unified-oracle-proved-ZER.md`; until then every new control-flow form needs
+  a hand-placed snapshot and the class regenerates.
+  **Who would call it:** `zerc_main.c`, over the collected `IRFunc`s, alongside the
+  `zercheck_ir` pass.
+
+- **The `&&`/`||` RHS narrowing is deliberately SMALLER than the NODE_IF narrowing**
+  (BUG-800, precision not safety). `vrp_narrow_from_cond` handles `ident <op> const`
+  and conjunctions only. It does NOT handle field keys (`s.len`), a variable bound
+  (`i < len`), `known_nonzero` for the division guard, or the then/else JOIN — all of
+  which the NODE_IF path does. Duplicating those would be the multi-site mistake, so
+  the honest end-state is ONE narrowing routine used by both positions. Cost today:
+  `if (i < len && arr[i])` with a runtime `len` keeps its guard (correct, just not
+  zero-overhead).
+
+- **The provably-OOB verdict is gated on UNCONDITIONAL position** (BUG-800,
+  precision not safety). `branch_depth == 0 && sc_rhs_depth == 0` is a proxy for
+  reachability, which the compiler does not analyse. So a provably-OOB index INSIDE
+  any branch still gets the silent-early-return auto-guard rather than an error.
+  Measured necessary: without the gate, `if (i < len) { arr[i] }` with a runtime
+  `len` — the standard dynamic-bounds idiom — was rejected. A real reachability
+  analysis (or the guard-disjointness machinery `handle_flow_lattice.v` Level B
+  already specifies for handles) would let the verdict fire inside a branch too.
+
+- **`Emitter.noreturn_scope_depth` counts, it does not UNWIND** (BUG-805, behaviour
+  choice). Inside `@critical` or a held shared lock the bounds guard now TRAPS rather
+  than returning. The nicer behaviour is to emit the unwind (restore primask /
+  `pthread_mutex_unlock`) and THEN return, keeping the guard non-fatal. That needs the
+  restore sequence emitted from a second place, so it was deferred; the trap is sound,
+  loud, and matches what slices already do on an out-of-range index.
+
+- **`// expect-trap` is opt-in and only 2 of ~30 trap tests declare it.** The
+  strengthened oracle (SIGTRAP 133 specifically, not "any non-zero exit") is
+  backfillable highest-value-first, exactly like `// expect-error` on negatives. Until
+  backfilled, most trap tests still pass on a SIGSEGV or a wrong exit code.
 
 ### Unverified — reproduce before acting
 - j8f9t7's limitations.md carries a **SUSPECTED** block (code-reading only).

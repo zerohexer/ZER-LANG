@@ -1731,9 +1731,34 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   target pointer type, not of mmio declarations), and constant
   addresses are alignment-checked at compile time regardless.
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
+- **The result is `volatile` when the address is provably hardware.** Two
+  provenances qualify: a constant address inside a declared `mmio` range, or an
+  address derived from `@ptrtoint` of a volatile pointer (inline, through
+  arithmetic, or via a local). A device register that is NOT volatile lets the C
+  compiler delete, reorder and coalesce your accesses — three stores to one
+  register can become one, silently, with nothing to trap on. So the pointer must
+  be bound to a `volatile *T`:
+
+```zer
+mmio 0x40020000..0x40020FFF;
+
+u32 configure() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);   // OK — volatile destination
+    *reg = 1;
+    *reg = 2;                                           // both stores survive
+    return 0;
+}
+```
+
+  Writing the qualifier inside the type argument is equivalent and clearer:
+  `@inttoptr(volatile *u32, 0x40020014)`.
+- **Non-hardware addresses are NOT forced volatile.** Under `--no-strict-mmio`,
+  `@ptrtoint` + arithmetic + `@inttoptr` is also the pointer-arithmetic escape hatch
+  on ordinary memory; forcing volatile there would cost every such access its
+  optimisation for no safety gain.
 
 **SEE ALSO**
-@ptrtoint, mmio
+@ptrtoint, mmio, volatile
 
 ---
 
@@ -2798,6 +2823,318 @@ compile error instead.
 - `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
 - `goto` — Use structured control flow
+
+---
+
+## SAFETY RULES YOU WILL HIT
+
+The rules below reject code that *looks* fine. Each exists because the alternative
+is a defect with no diagnostic at compile time AND no fault at runtime — on bare
+metal in particular, where nothing traps and the program simply does not do what was
+written. Every example here compiles (or fails) exactly as annotated.
+
+---
+
+### Bounds: three verdicts, not two
+
+An index gets one of three verdicts from its proven range:
+
+| Verdict | When | Result |
+|---|---|---|
+| PROVEN SAFE | the whole range is inside the bound | no check emitted — zero overhead |
+| PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
+| UNKNOWN | the range straddles the bound | auto-guard inserted (runtime check) |
+
+The middle verdict is the one that surprises people. `arr[10]` on a `u32[4]` was
+always an error; so is the same index reached through a variable, and so is a range
+that is entirely negative:
+
+<!-- verify: error "always out of bounds" -->
+```zer
+u32 bad_past_end() {
+    u32[4] arr;
+    u32 i = 10;
+    return arr[i];      // COMPILE ERROR — proven range [10, 10], always out of bounds
+}
+```
+
+<!-- verify: error "always out of bounds" -->
+```zer
+u32 bad_negative() {
+    u32[4] arr;
+    i32 i = -1;
+    return arr[i];      // COMPILE ERROR — proven range [-1, -1], no valid index exists
+}
+```
+
+The same verdict applies to an MMIO pointer, bounded by its `mmio` declaration:
+
+<!-- verify: error "always out of range" -->
+```zer
+mmio 0x40000000..0x4000000F;        // 16 bytes = 4 u32 words
+
+u32 bad_mmio() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40000000);
+    u32 i = 100;
+    return reg[i];      // COMPILE ERROR — proven range [100, 100], max index is 3
+}
+```
+
+**Why an error and not a runtime guard.** The auto-guard's runtime form is
+`if (i >= 4) { return 0; }` — it makes the function RETURN EARLY, so every statement
+after the access silently never runs. That is not a safe program, it is a silent one;
+on bare metal it is a peripheral write that never happens.
+
+**A guarded access is never rejected.** The verdict only fires at unconditional
+position, because a guard the compiler cannot evaluate may exclude the access
+entirely. All of these compile:
+
+<!-- verify: ok -->
+```zer
+volatile u32 g_len = 0;
+
+u32 guarded_forms() {
+    u8[4] arr;
+    u32 len = g_len;                          // runtime length
+    u32 i = 10;
+    if (i < len) { return arr[i]; }            // OK — guarded by an if
+    if (i < len && arr[i] > 0) { return 1; }   // OK — guarded by short-circuit
+    if (i >= 4) { return 0; }
+    return arr[i];                             // OK — guard proves i < 4 here
+}
+```
+
+The short-circuit form is also the one to prefer: the RHS of `&&` is narrowed by the
+LHS, so `if (i < 4 && arr[i] > 0)` needs no runtime check at all when the bound is a
+constant.
+
+---
+
+### `volatile` cannot be dropped, through any carrier
+
+Dropping `volatile` lets the C compiler optimise away accesses to a device register.
+The rule is checked wherever a value flows, and — this is the part that bites —
+through the **pointer** carrier as well as the slice one, including inside a
+designated struct initializer and a function-pointer signature:
+
+<!-- verify: error "volatile" -->
+```zer
+mmio 0x40020000..0x40020FFF;
+
+struct Dev { *u32 reg; }                        // NOTE: field is NOT volatile
+
+u32 strip_via_struct_init() {
+    volatile *u32 r = @inttoptr(volatile *u32, 0x40020014);
+    Dev d = { .reg = r };                       // COMPILE ERROR — strips volatile
+    *d.reg = 1;
+    return 0;
+}
+```
+
+<!-- verify: error "fn(volatile *u32)" -->
+```zer
+mmio 0x40020000..0x40020FFF;
+
+void plain(*u32 p) { *p = 1; }                  // param is NOT volatile
+struct Ops { *(volatile *u32) cb; }
+
+u32 strip_via_funcptr() {
+    Ops o = { .cb = plain };                    // COMPILE ERROR — fn(volatile *u32) vs fn(*u32)
+    return 0;
+}
+```
+
+Going out through an integer and back does not launder it either:
+
+<!-- verify: error "non-volatile pointer from volatile" -->
+```zer
+mmio 0x40020000..0x40020FFF;
+
+u32 strip_via_roundtrip() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+    usize a = @ptrtoint(reg);
+    *u32 plain = @inttoptr(*u32, a);            // COMPILE ERROR — volatile provenance kept
+    *plain = 1;
+    return 0;
+}
+```
+
+**The safe direction always widens.** Plain -> volatile and mutable -> const coerce
+at every value-flow site, so declaring the destination `volatile` is the fix:
+
+<!-- verify: ok -->
+```zer
+u32 g_target;
+struct Dev2 { volatile *u32 reg; }
+
+void takes_vol(volatile *u32 p) { *p = 1; }
+
+u32 widening_ok() {
+    *u32 p = &g_target;
+    Dev2 d = { .reg = p };          // OK — plain into a volatile field
+    volatile *u32 vp = p;           // OK
+    const *u32 cp = p;              // OK
+    takes_vol(p);                   // OK
+    *d.reg = 7;
+    if (*cp != 7) { return 1; }
+    if (*vp != 7) { return 2; }
+    return 0;
+}
+```
+
+---
+
+### A pointer into a packed field may not be used
+
+`&packed.field` is not naturally aligned. Dereferencing it is a hard fault on
+ARMv7-M and RISC-V, a silent split access on Cortex-M0+, and merely slow on x86 —
+so a hosted test will never show you the problem. FORMING the pointer is allowed;
+using it is not, at any of the five places it can be used:
+
+<!-- verify: error "PACKED struct field" -->
+```zer
+packed struct P { u8 a; u32 b; }
+P g;
+
+void poke(*u32 p) { *p = 7; }
+
+u32 packed_misuse() {
+    *u32 q = &g.b;      // forming it is fine
+    *q = 7;             // COMPILE ERROR — dereferencing a pointer into a PACKED field
+    poke(&g.b);         // COMPILE ERROR — passing one
+    *u32 r = q;         // (alias also carries the fact)
+    *r = 7;             // COMPILE ERROR
+    return 0;
+}
+```
+
+Returning one is rejected at the source, because the fact cannot cross a function
+boundary and the caller's deref would have no way to know:
+
+<!-- verify: error "PACKED struct field" -->
+```zer
+packed struct P2 { u8 a; u32 b; }
+P2 g2;
+
+*u32 leak() { return &g2.b; }   // COMPILE ERROR — returning a pointer into a PACKED field
+```
+
+**Access the field directly instead** — that is what the compiler is for:
+
+<!-- verify: ok -->
+```zer
+packed struct P3 { u8 a; u32 b; }
+P3 g3;
+
+u32 packed_correct() {
+    u32 v = g3.b;       // OK — direct read, compiler emits the safe access
+    g3.b = v + 1;       // OK — direct write
+    return g3.b - 1;    // 0 on success
+}
+```
+
+---
+
+### A bit-range write is a read-modify-write
+
+`reg[hi..lo] = v` lowers to `*p = (*p & ~mask) | (v << lo)`. It reads, modifies and
+writes, even though it is spelled with `=` and its right-hand side never mentions
+the target. So it is rejected on a global shared between an interrupt and main code,
+or between a spawned thread and main — exactly like `+=`:
+
+<!-- verify: error "read-modify-write" -->
+```zer
+volatile u32 flags;
+
+void bump() { flags[3..0] = 5; }
+
+u32 racy() {
+    spawn bump();
+    flags[3..0] = 1;    // COMPILE ERROR — non-atomic read-modify-write on a shared global
+    return 0;
+}
+```
+
+Use an atomic, or keep the global to one context:
+
+<!-- verify: ok -->
+```zer
+u32 counter;
+
+u32 atomic_ok() {
+    @atomic_store(&counter, 5);
+    return @atomic_load(&counter) - 5;
+}
+```
+
+---
+
+### Dereferencing a pointer to a pointer, Handle or move struct
+
+When a value is read out of a place the compiler cannot resolve, it cannot tell which
+allocation the result refers to — so a later `free` or consume through either name
+would be a use-after-free or a double release. Rejected for every result type that
+carries a tracked identity, and at every operand form:
+
+<!-- verify: error "dereferencing a pointer" -->
+```zer
+struct Node { u32 v; }
+struct H { **Node pp; }
+
+u32 alias_via_deref() {
+    *Node n = alloc(Node) orelse { return 1; };
+    n.v = 7;
+    H h;
+    h.pp = &n;
+    *Node k = *h.pp;    // COMPILE ERROR — cannot prove which allocation this aliases
+    free(n);
+    return k.v;
+}
+```
+
+The same applies to a `Handle(T)` copied out of a `*Handle(T)`, to a `move struct`
+copied out of a `*T` (which would create a second owner of a one-shot resource), and
+to handing the dereference straight to a call (`pool.free(*p)`).
+
+**Alias the pointer directly** so the compiler can follow it:
+
+<!-- verify: ok -->
+```zer
+struct Node2 { u32 v; }
+
+u32 alias_ok() {
+    *Node2 n = alloc(Node2) orelse { return 1; };
+    n.v = 7;
+    *Node2 k = n;       // OK — a direct alias the compiler can track
+    u32 r = k.v;
+    free(n);
+    return r - 7;
+}
+```
+
+---
+
+### An out-of-bounds access inside `@critical` or a held lock traps
+
+Where the compiler cannot prove an index it inserts a guard, and that guard normally
+returns early. Inside `@critical` or while a `shared struct` lock is held a `return`
+would leak the interrupt-disable or the mutex — so the guard **traps** instead
+(`SIGTRAP`), aborting before both the access and the leak. This is why an unprovable
+index inside those scopes is worth eliminating with an explicit check:
+
+<!-- verify: ok -->
+```zer
+shared struct S { u32 v; }
+S g;
+volatile u32 g_idx = 9;
+
+void safe_copy() {
+    u8[4] a;
+    u32 i = g_idx;
+    if (i >= 4) { return; }     // explicit check — the guard is then unnecessary
+    g.v = a[i];
+}
+```
 
 ---
 

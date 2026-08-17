@@ -3128,6 +3128,40 @@ int main(void) {
         "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
         "void f() { gpio[8] = 0xFF; }",
         "MMIO index 8 out of range (max 7) — rejected");
+
+    /* ---- BUG-802: @inttoptr volatility, and its boundary ---- */
+    printf("[@inttoptr hardware address is volatile (BUG-802)]\n");
+    /* A constant address inside a declared mmio range is PROVABLY a device
+     * register, so the result is volatile and binding it to a plain *T is the
+     * strip that GCC -O2 turns into a deleted peripheral store. */
+    err("mmio 0x40020000..0x4002001F;\n"
+        "u32 f() { *u32 reg = @inttoptr(*u32, 0x40020000); *reg = 1; *reg = 2; return 0; }",
+        "@inttoptr in an mmio range bound to a NON-volatile pointer — rejected");
+    /* Declaring the destination volatile is the fix, and must still compile —
+     * this is the shape 36 corpus files already use. */
+    ok("mmio 0x40020000..0x4002001F;\n"
+       "u32 f() { volatile *u32 reg = @inttoptr(*u32, 0x40020000); *reg = 1; return 0; }",
+       "@inttoptr bound to a volatile pointer — valid (plain -> volatile widens)");
+    /* THE BOUNDARY: an address with NO hardware provenance — not const-in-range,
+     * and derived from @ptrtoint of a NON-volatile pointer — must NOT be forced
+     * volatile. Under --no-strict-mmio @inttoptr is also the pointer-arithmetic
+     * escape hatch on ordinary memory; forcing volatile there would cost every
+     * such access its optimisation for no safety gain. Compile-only: with strict
+     * mmio this program also carries a runtime range check, so it cannot be a
+     * running positive. */
+    ok("mmio 0x40020000..0x4002001F;\n"
+       "u32 g_cell;\n"
+       "u32 f() { *u32 p = &g_cell; usize a = @ptrtoint(p);\n"
+       "          *u32 back = @inttoptr(*u32, a); *back = 42; return 0; }",
+       "@inttoptr from a NON-volatile ptrtoint — plain pointer kept (boundary)");
+    /* The same round trip from a VOLATILE pointer DOES carry the provenance —
+     * across a local, which is the spelling that was the documented way around
+     * the direct-strip error. */
+    err("mmio 0x40020000..0x4002001F;\n"
+        "u32 f() { volatile *u32 reg = @inttoptr(volatile *u32, 0x40020000);\n"
+        "          usize a = @ptrtoint(reg);\n"
+        "          *u32 plain = @inttoptr(*u32, a); *plain = 1; return 0; }",
+        "@ptrtoint -> local -> @inttoptr laundering volatile away — rejected");
     err("mmio 0x40020000..0x4002001F;\n"
         "volatile *u32 gpio = @inttoptr(*u32, 0x40020000);\n"
         "void f() { gpio[100] = 0xFF; }",

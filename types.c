@@ -304,6 +304,20 @@ bool type_equals(Type *a, Type *b) {
      * direction (mutable→const) is handled by can_implicit_coerce. */
     case TYPE_POINTER:
         if (a->pointer.is_const != b->pointer.is_const) return false;
+        /* BUG-801 (2026-08-17): `pointer.is_volatile` was absent here while the
+         * TYPE_SLICE arm three lines down has always checked its sibling. Every
+         * sink that decides a volatile strip through type_equals therefore missed
+         * the POINTER carrier while catching the SLICE one — a designated struct
+         * initializer (`Dev d = { .reg = volatile_ptr }`) and a function-pointer
+         * param match both accepted the strip with ZERO diagnostics, and GCC -O2
+         * then DELETED the first MMIO store. Measured: two stores to a peripheral
+         * register emitted one `movl`. The plain-assignment sibling
+         * (`d.reg = volatile_ptr`) was correctly rejected the whole time, which is
+         * what makes this the carrier axis of one question, not a new rule.
+         * The SAFE direction (plain -> volatile) is handled by
+         * can_implicit_coerce, whose pointer arm now delegates to the same
+         * VST-verified predicate the slice arm uses. */
+        if (a->pointer.is_volatile != b->pointer.is_volatile) return false;
         return type_equals(a->pointer.inner, b->pointer.inner);
     case TYPE_OPTIONAL:
         return type_equals(a->optional.inner, b->optional.inner);
@@ -447,10 +461,21 @@ bool can_implicit_coerce(Type *from, Type *to) {
         }
     }
 
-    /* mutable pointer to const pointer */
+    /* pointer qualifier widening — the exact sibling of the slice arm above,
+     * delegating to the same VST-verified predicates (BUG-801). Subsumes the old
+     * const-only special case: mutable -> const still widens, plain -> volatile
+     * now widens too, and volatile -> plain is refused (which is the whole point:
+     * type_equals no longer treats them as identical). */
     if (from->kind == TYPE_POINTER && to->kind == TYPE_POINTER) {
-        if (to->pointer.is_const && !from->pointer.is_const) {
-            return type_equals(from->pointer.inner, to->pointer.inner);
+        int v_ok = zer_coerce_preserves_volatile(
+            from->pointer.is_volatile ? 1 : 0,
+            to->pointer.is_volatile ? 1 : 0);
+        int c_ok = zer_coerce_preserves_const(
+            from->pointer.is_const ? 1 : 0,
+            to->pointer.is_const ? 1 : 0);
+        if (v_ok != 0 && c_ok != 0 &&
+            type_equals(from->pointer.inner, to->pointer.inner)) {
+            return true;
         }
     }
 
@@ -514,6 +539,13 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
     case TYPE_BARRIER: return tn_append(buf, pos, max, "Barrier");
     case TYPE_SEMAPHORE: return tn_append(buf, pos, max, "Semaphore(%u)", t->semaphore.count);
     case TYPE_POINTER:
+        /* BUG-801: render the qualifiers. The SLICE arm below always has; without
+         * the pointer sibling, the qualifier diagnostics this fix enables read
+         * "field '.reg' expects '*u32', got '*u32'" — two identical spellings and
+         * no way for the reader to see what differs. A message that cannot be
+         * acted on is nearly as costly as no message. */
+        if (t->pointer.is_volatile) pos = tn_append(buf, pos, max, "volatile ");
+        if (t->pointer.is_const)    pos = tn_append(buf, pos, max, "const ");
         pos = tn_append(buf, pos, max, "*");
         return type_name_write(t->pointer.inner, buf, pos, max);
     case TYPE_OPTIONAL:
@@ -536,7 +568,22 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         return tn_append(buf, pos, max, "%.*s",
                               (int)t->union_type.name_len, t->union_type.name);
     case TYPE_FUNC_PTR:
-        return tn_append(buf, pos, max, "fn(...)");
+        /* BUG-801: render the signature. Every funcptr mismatch used to print
+         * "expects 'fn(...)', got 'fn(...)'" — an error the reader cannot act on,
+         * which is what the qualifier fix now surfaces for volatile params. */
+        pos = tn_append(buf, pos, max, "fn(");
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
+            if (i) pos = tn_append(buf, pos, max, ", ");
+            pos = type_name_write(t->func_ptr.params[i], buf, pos, max);
+        }
+        if (t->func_ptr.is_variadic)
+            pos = tn_append(buf, pos, max, t->func_ptr.param_count ? ", ..." : "...");
+        pos = tn_append(buf, pos, max, ")");
+        if (t->func_ptr.ret && type_dispatch_kind(t->func_ptr.ret) != TYPE_VOID) {
+            pos = tn_append(buf, pos, max, " -> ");
+            pos = type_name_write(t->func_ptr.ret, buf, pos, max);
+        }
+        return pos;
     case TYPE_POOL:
         pos = tn_append(buf, pos, max, "Pool(");
         pos = type_name_write(t->pool.elem, buf, pos, max);

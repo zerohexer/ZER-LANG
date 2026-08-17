@@ -1,0 +1,20 @@
+// expect-error: non-volatile pointer from volatile
+// EXPECTED: compile error
+//
+// Promoted from tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer
+// (2026-08-16). The DIRECT strip `(*u32)vreg` has always been an error; going
+// out through @ptrtoint and back in through @inttoptr was the way around it.
+// Both stores below coalesce under -O2 and the peripheral misses a write —
+// silent at both ends, and on bare metal there is no fault to notice it by.
+mmio 0x40020000..0x40020FFF;
+
+u32 leak() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+    usize a = @ptrtoint(reg);
+    *u32 plain = @inttoptr(*u32, a);
+    *plain = 1;
+    *plain = 2;
+    return *plain;
+}
+
+u32 main() { return leak(); }

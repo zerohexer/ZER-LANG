@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: volatile
+// BUG-801 (2026-08-17): a DESIGNATED STRUCT INITIALIZER stripped `volatile` off a
+// pointer with ZERO diagnostics, and GCC -O2 then DELETED the first MMIO store —
+// measured: two stores to the peripheral register emitted a single `movl $2`.
+// Silent on hosted x86-64 (no peripheral) and silent on the target (nothing
+// traps; the code just does not do what was written).
+//
+// The plain-assignment sibling `d.reg = r;` was correctly rejected the whole
+// time. Root cause: `type_equals` checked `pointer.is_const` but not
+// `pointer.is_volatile`, while its TYPE_SLICE arm had always checked both — so
+// every sink deciding a strip through type_equals missed the POINTER carrier
+// while catching the SLICE one. Fixed at the root, which closes all four
+// struct-init value-flow sinks and the funcptr param match together.
+mmio 0x40020000..0x40020FFF;
+struct Dev { *u32 reg; }
+u32 main() {
+    volatile *u32 r = @inttoptr(volatile *u32, 0x40020014);
+    Dev d = { .reg = r };
+    *d.reg = 1;
+    *d.reg = 2;
+    return 0;
+}

@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: fn(volatile *u32)
+// BUG-801 — the FUNCPTR sibling of volatile_strip_struct_init.zer. Binding a
+// function whose param is a plain `*u32` to a funcptr slot declared
+// `*(volatile *u32)` let the callee's body drop the qualifier: measured, `plain`
+// compiled to a single `movl $2, (%rdi)` — the first peripheral store deleted.
+// The DIRECT call `plain(r)` was correctly rejected ("cannot pass volatile
+// pointer to non-volatile parameter"); only the funcptr indirection escaped,
+// because TYPE_FUNC_PTR matching recurses into the volatile-blind TYPE_POINTER
+// arm of type_equals. Same one-line root as the struct-init form.
+//
+// The expect-error string also pins the DIAGNOSTIC QUALITY fix: before this,
+// every funcptr mismatch printed "expects 'fn(...)', got 'fn(...)'" — two
+// identical spellings the reader could not act on.
+mmio 0x40020000..0x40020FFF;
+void plain(*u32 p) { *p = 1; *p = 2; }
+struct Ops { *(volatile *u32) cb; }
+u32 main() {
+    volatile *u32 r = @inttoptr(volatile *u32, 0x40020014);
+    Ops o = { .cb = plain };
+    o.cb(r);
+    return 0;
+}

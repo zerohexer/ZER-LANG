@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize non-volatile pointer from volatile
+// BUG-788 (2026-08-12): an @inttoptr result IS volatile. Bound to a plain *u32
+// this compiled with ZERO diagnostics and GCC -O2 deleted the first peripheral
+// store and constant-folded the status read — silent on hosted x86-64 (no
+// peripheral) and silent on the target (nothing traps; the code just does not
+// do what was written).
+mmio 0x40020000..0x40020FFF;
+u32 main() {
+    *u32 reg = @inttoptr(*u32, 0x40020014);
+    reg[0] = 1;
+    reg[0] = 2;
+    return reg[0];
+}

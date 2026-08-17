@@ -226,6 +226,13 @@ struct Symbol {
     bool is_keep;           /* keep parameter — can be stored */
     bool is_const;          /* const qualifier */
     bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
+    /* BUG-802: this INTEGER holds the address of a volatile (device) pointer,
+     * obtained via @ptrtoint. Carries the hardware provenance across the
+     * @ptrtoint -> local -> @inttoptr round trip that was the documented way
+     * around the direct volatile-strip error. Without it only the INLINE
+     * spelling answers, and a rule that closes one spelling of a launder is the
+     * multi-site bug this codebase keeps paying for. */
+    bool is_volatile_addr;
     bool is_static;         /* static storage duration */
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */

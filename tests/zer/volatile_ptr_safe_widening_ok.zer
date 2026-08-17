@@ -1,0 +1,27 @@
+// BUG-801 boundary: the SAFE qualifier direction must keep widening after
+// type_equals started distinguishing volatile pointers. The pointer arm of
+// can_implicit_coerce now delegates to the same VST-verified predicates the slice
+// arm uses (zer_coerce_preserves_volatile / _const), so plain -> volatile and
+// mutable -> const still coerce at every value-flow site while volatile -> plain
+// is refused. Without the coerce arm this file would fail to compile.
+u32 g_target;
+struct Dev { volatile *u32 reg; }
+struct RO  { const *u32 p; }
+
+void takes_vol(volatile *u32 p) { *p = 1; }
+void takes_const(const *u32 p) { }
+
+u32 main() {
+    *u32 p = &g_target;
+    Dev d = { .reg = p };        // plain -> volatile field: widening, OK
+    RO  r = { .p = p };          // plain -> const field:    widening, OK
+    volatile *u32 vp = p;        // var-decl init widening
+    const *u32 cp = p;           // var-decl init widening
+    takes_vol(p);                // call-arg widening
+    takes_const(p);              // call-arg widening
+    *vp = 3;                     // use the widened locals so none is dead
+    if (*cp != 3) { return 1; }
+    if (*r.p != 3) { return 2; }
+    *d.reg = 7;                  // write through the volatile field
+    return g_target - 7;         // 0 iff every widening above compiled
+}

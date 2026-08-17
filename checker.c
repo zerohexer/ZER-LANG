@@ -1794,6 +1794,102 @@ static Node *unwrap_ptr_launder(Node *v) {
     return v;
 }
 
+/* Make a declaration's `volatile` reach its TYPE (BUG-802).
+ *
+ * `volatile *u32 reg = ...` is parsed by consuming the keyword into a FLAG
+ * (`var_decl.is_volatile`) and resolving the type as a PLAIN `*u32`, whereas
+ * `@inttoptr(volatile *u32, A)` — the qualifier written INSIDE the type — does set
+ * `pointer.is_volatile`. So the same user intent had two representations, and
+ * every rule had to remember to consult both. That split is exactly the bug class
+ * this file keeps paying for: the declaration-flag half was checked at the local
+ * var-decl strip sink and NOT at the global one, so once @inttoptr began yielding a
+ * volatile pointer, `volatile *u32 gpio = @inttoptr(*u32, ADDR)` at FILE scope
+ * failed with "cannot initialize 'gpio' of type '*u32' with 'volatile *u32'" —
+ * the declared type printing as non-volatile is the tell.
+ *
+ * Making the type honest is the fix rather than adding the missing consult: rules
+ * then get ONE answer from the type, and a sink that forgets the flag cannot exist.
+ * Conservative — this only ever ADDS the qualifier the user wrote. */
+static Type *decl_apply_volatile_qualifier(Checker *c, Type *type, Node *node) {
+    if (!type || !node->var_decl.is_volatile) return type;
+    if (type_dispatch_kind(type) != TYPE_POINTER) return type;
+    Type *u = type_unwrap_distinct(type);
+    if (!u || u->pointer.is_volatile) return type;
+    Type *vp = type_pointer(c->arena, u->pointer.inner);
+    vp->pointer.is_const = u->pointer.is_const;
+    vp->pointer.is_volatile = true;
+    return vp;
+}
+
+/* Is this @inttoptr's ADDRESS argument provably a hardware address? (BUG-802)
+ *
+ * Two provenances, asked as one question so neither can be fixed without the
+ * other (the multi-site lesson):
+ *   (a) a compile-time-constant address inside a declared `mmio` range;
+ *   (b) an address derived from `@ptrtoint` of a VOLATILE pointer — either inline
+ *       (`@inttoptr(*u32, @ptrtoint(reg))`) or through a local that carries the
+ *       fact on its Symbol (`usize a = @ptrtoint(reg); @inttoptr(*u32, a)`).
+ *       BOTH shapes must answer, or the fix only closes whichever spelling the
+ *       reproducer happened to use.
+ *
+ * Deliberately says NO for an unknown/computed address with no volatile
+ * provenance and no declared range: under --no-strict-mmio @inttoptr is also the
+ * pointer-arithmetic escape hatch on ordinary memory, and forcing volatile there
+ * would cost every such access its optimisation for no safety gain. */
+static bool expr_is_ptrtoint_of_volatile(Checker *c, Node *e, int depth) {
+    if (!e || depth > 8) return false;
+    if (e->kind == NODE_INTRINSIC && e->intrinsic.name_len == 8 &&
+        memcmp(e->intrinsic.name, "ptrtoint", 8) == 0 &&
+        e->intrinsic.arg_count > 0) {
+        Node *p = unwrap_ptr_launder(e->intrinsic.args[0]);
+        /* the operand's own type is the authority; fall back to the Symbol so an
+         * ident operand answers even before its expression is re-checked. */
+        Type *pt = typemap_get(c, e->intrinsic.args[0]);
+        if (!pt && p && p->kind == NODE_IDENT) {
+            Symbol *ps = scope_lookup(c->current_scope, p->ident.name,
+                                      (uint32_t)p->ident.name_len);
+            if (ps) pt = ps->type;
+        }
+        Type *pu = pt ? type_unwrap_distinct(pt) : NULL;
+        if (pu && type_dispatch_kind(pu) == TYPE_POINTER && pu->pointer.is_volatile)
+            return true;
+        if (p && p->kind == NODE_IDENT) {
+            Symbol *ps = scope_lookup(c->current_scope, p->ident.name,
+                                      (uint32_t)p->ident.name_len);
+            if (ps && ps->is_volatile) return true;
+        }
+        return false;
+    }
+    /* an arithmetic expression over such an address keeps the provenance:
+     * `@inttoptr(*u32, @ptrtoint(reg) + 4)` is still a device address. */
+    if (e->kind == NODE_BINARY)
+        return expr_is_ptrtoint_of_volatile(c, e->binary.left, depth + 1) ||
+               expr_is_ptrtoint_of_volatile(c, e->binary.right, depth + 1);
+    if (e->kind == NODE_TYPECAST)
+        return expr_is_ptrtoint_of_volatile(c, e->typecast.expr, depth + 1);
+    if (e->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                 (uint32_t)e->ident.name_len);
+        if (s && s->is_volatile_addr) return true;
+    }
+    return false;
+}
+
+static bool inttoptr_addr_is_hardware(Checker *c, Node *node) {
+    if (node->intrinsic.arg_count == 0) return false;
+    Node *addr_arg = node->intrinsic.args[0];
+    if (expr_is_ptrtoint_of_volatile(c, addr_arg, 0)) return true;
+    if (c->mmio_range_count == 0) return false;
+    int64_t cval = eval_const_expr(addr_arg);
+    if (cval == CONST_EVAL_FAIL) return false;
+    uint64_t addr = (uint64_t)cval;
+    for (int ri = 0; ri < c->mmio_range_count; ri++) {
+        if (addr >= c->mmio_ranges[ri][0] && addr <= c->mmio_ranges[ri][1])
+            return true;
+    }
+    return false;
+}
+
 /* Narrow the live ranges implied by a boolean CONDITION expression (BUG-800).
  *
  * A deliberately SMALL, purely-additive helper for the short-circuit RHS: it
@@ -9451,6 +9547,41 @@ static Type *check_expr(Checker *c, Node *node) {
             /* @inttoptr(*T, addr) — addr must be an integer, target must be pointer */
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-802 (2026-08-17): the pointer @inttoptr produces addresses a
+                 * DEVICE REGISTER — the intrinsic exists for that and is gated on an
+                 * `mmio` declaration. A non-volatile result lets GCC -O2 delete,
+                 * reorder and coalesce peripheral accesses. Measured: three stores
+                 * to one register emitted a single `movl`, with ZERO diagnostics;
+                 * silent on hosted x86-64 (no peripheral) and silent on the target
+                 * (nothing traps — the code just does not do what was written).
+                 *
+                 * Two provenances make the address PROVABLY hardware, and the fix
+                 * covers both because they are one question:
+                 *   (a) a constant address inside a declared mmio range;
+                 *   (b) an address derived from @ptrtoint of a VOLATILE pointer —
+                 *       the round trip `@inttoptr(*u32, @ptrtoint(vreg))` that was
+                 *       the documented way around the direct-strip error, inline or
+                 *       through a local carrying the fact on its Symbol.
+                 *
+                 * The result TYPE is made volatile rather than the written target
+                 * being REQUIRED to say `volatile` — measured, a hard error there
+                 * would have broken 36 corpus files, most of which write
+                 * `volatile *u32 reg = @inttoptr(*u32, ADDR)` and are already
+                 * correct at the binding. Widening the result is the conservative
+                 * direction: plain -> volatile still coerces at every value-flow
+                 * site (BUG-801's coerce arm), so those files keep compiling, while
+                 * binding to a NON-volatile pointer now hits the strip check that
+                 * every other volatile carrier already had. */
+                if (result && type_dispatch_kind(result) == TYPE_POINTER) {
+                    Type *ru = type_unwrap_distinct(result);
+                    if (ru && !ru->pointer.is_volatile &&
+                        inttoptr_addr_is_hardware(c, node)) {
+                        Type *vp = type_pointer(c->arena, ru->pointer.inner);
+                        vp->pointer.is_const = ru->pointer.is_const;
+                        vp->pointer.is_volatile = true;
+                        result = vp;
+                    }
+                }
                 /* BUG-375: target type must be a pointer */
                 if (result) {
                     Type *res_eff = type_unwrap_distinct(result);
@@ -12148,6 +12279,7 @@ static void check_stmt(Checker *c, Node *node) {
                 deref_launder_error(c, node->loc.line);
             }
         Type *type = resolve_type(c, node->var_decl.type);
+        type = decl_apply_volatile_qualifier(c, type, node);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
             checker_error(c, node->loc.line,
@@ -12440,6 +12572,13 @@ static void check_stmt(Checker *c, Node *node) {
             sym->is_const = node->var_decl.is_const;
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
+            /* BUG-802: carry the hardware provenance of a @ptrtoint'd volatile
+             * pointer across the local, so the ROUND-TRIP spelling
+             * `usize a = @ptrtoint(reg); @inttoptr(*u32, a)` answers the same as
+             * the inline one. */
+            if (node->var_decl.init &&
+                expr_is_ptrtoint_of_volatile(c, node->var_decl.init, 0))
+                sym->is_volatile_addr = true;
             /* BUG-430: store AST node for const init lookup (enables
              * const u32 perms = ...; comptime if (FUNC(perms)) pattern) */
             sym->func_node = node;
@@ -16785,6 +16924,7 @@ static void register_decl(Checker *c, Node *node) {
 
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        type = decl_apply_volatile_qualifier(c, type, node);
         /* propagate const from var qualifier to slice/pointer type */
         if (node->var_decl.is_const && type) {
             if (type->kind == TYPE_SLICE && !type->slice.is_const) {
@@ -20033,6 +20173,10 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
         }
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
             Type *type = resolve_type(c, decl->var_decl.type);
+            /* BUG-802: the GLOBAL path resolves the declared type here, and this is
+             * the third site that must see a declaration's `volatile`. Same helper
+             * as the two var-decl sites — one answer, no per-sink consult. */
+            type = decl_apply_volatile_qualifier(c, type, decl);
             Type *init = check_expr(c, decl->var_decl.init);
             /* global initializers must be constant expressions in C */
             Node *ginit = decl->var_decl.init;

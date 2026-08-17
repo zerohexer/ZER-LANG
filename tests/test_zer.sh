@@ -78,9 +78,31 @@ for f in tests/zer_trap/*.zer; do
     # Per-file flags via '// zerc-flags: ...' first line (same as positive/negative
     # sections) — e.g. BUG-736's --no-strict-mmio alignment-trap test.
     file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
-    $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
+    # 2026-08-17: two weak-oracle holes closed here (CLAUDE.md "VACUOUS TESTS").
+    #
+    # (1) NO TIMEOUT. A trap test whose program HANGS instead of trapping used to
+    #     hang `make check` forever — not merely pass vacuously. BUG-805's
+    #     reproducer does exactly that on a pre-fix compiler (a bounds guard
+    #     returning with a shared-struct mutex held), so without this the
+    #     regression test could not live in the suite at all. A timeout is now
+    #     applied and 124 is an explicit FAIL: a hang is not a trap.
+    #
+    # (2) "ANY non-zero exit" is a WEAK ORACLE — a hang, a SIGSEGV, a wrong-answer
+    #     exit code and a genuine safety trap were indistinguishable. Optional
+    #     `// expect-trap` (first 5 lines) now demands SIGTRAP (133) specifically,
+    #     the same shape as `// expect-error` for negatives: opt-in, so existing
+    #     tests that abort by other means keep working, and backfillable
+    #     highest-value-first.
+    want_trap=$(head -5 "$f" | grep -c '^// expect-trap' || true)
+    timeout 20 $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
     ret=$?
-    if [ $ret -ne 0 ]; then
+    if [ $ret -eq 124 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (TIMED OUT — a hang is not a trap)"
+    elif [ "$want_trap" != "0" ] && [ $ret -ne 133 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (expected SIGTRAP/133, got exit $ret)"
+    elif [ $ret -ne 0 ]; then
         PASS=$((PASS + 1))
         echo "  PASS: $name (correctly trapped, exit $ret)"
     else

@@ -112,6 +112,16 @@ typedef struct {
      * function's cleanup — wrong. A trap aborts safely before the OOB access,
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
+    /* BUG-805: nesting depth of a scope that MUST NOT be left by a `return` —
+     * a held shared-struct lock, or an @critical interrupt-disable. The bounds/UAF
+     * auto-guard emits `<fire defers>; return <zero>;`, which inside such a scope
+     * leaks the resource: measured, the lock case HANGS (the mutex is never
+     * unlocked) and the @critical case leaves interrupts disabled forever on bare
+     * metal. ZER hard-errors a USER-written return in @critical for exactly this
+     * reason, so the compiler was emitting the construct it bans. Counted inside
+     * the shared lock/unlock emitters themselves so every call site is covered by
+     * construction rather than by remembering to bracket each one. */
+    int noreturn_scope_depth;
 
 } Emitter;
 

@@ -515,6 +515,23 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
         if (with_braces) emit(e, " }\n"); else emit(e, " ");
         return;
     }
+    /* BUG-805 (2026-08-17): the same reasoning as guard_traps, for the two scopes
+     * a `return` must never leave. Measured on main: the guard's `return` was
+     * emitted BETWEEN `cpsid i` and `msr primask` (interrupts disabled forever on
+     * bare metal — silent, since hosted x86 degrades the critical section to a
+     * fence) and BETWEEN `pthread_mutex_lock` and its unlock (measured HANG,
+     * exit 124). Trapping aborts BEFORE the out-of-bounds access and BEFORE the
+     * resource is leaked — the same trade-off already accepted for defer bodies,
+     * and consistent with slices, which already TRAP on an out-of-range index
+     * rather than returning early. */
+    if (e->noreturn_scope_depth > 0) {
+        if (with_braces) emit(e, "{ ");
+        emit(e, "_zer_trap(\"out-of-bounds array access inside @critical or a held "
+                "shared-struct lock — returning would leak the interrupt-disable or "
+                "the mutex\", __FILE__, __LINE__);");
+        if (with_braces) emit(e, " }\n"); else emit(e, " ");
+        return;
+    }
     if (with_braces) emit(e, "{\n");
     emit_defers(e);
     if (e->in_async) {
@@ -804,6 +821,7 @@ static bool stmt_writes_shared(Node *stmt) {
 /* Emit lock acquire for shared struct variable.
  * For shared(rw) structs, is_write determines rdlock vs wrlock. */
 static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
+    e->noreturn_scope_depth++;   /* BUG-805: a held lock must not be left by return */
     Type *rt = checker_get_type(e->checker, root);
     bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
     const char *arrow = is_ptr ? "->" : ".";
@@ -833,6 +851,7 @@ static void emit_shared_lock(Emitter *e, Node *root) {
 
 /* Emit lock release for shared struct variable */
 static void emit_shared_unlock(Emitter *e, Node *root) {
+    if (e->noreturn_scope_depth > 0) e->noreturn_scope_depth--;
     Type *rt = checker_get_type(e->checker, root);
     bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
     const char *arrow = is_ptr ? "->" : ".";
@@ -10972,6 +10991,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CRITICAL_BEGIN: {
+        e->noreturn_scope_depth++;   /* BUG-805: interrupts are disabled in here */
         emit_indent(e);
         emit(e, "{ /* @critical */\n");
         e->indent++;
@@ -11014,6 +11034,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CRITICAL_END: {
+        if (e->noreturn_scope_depth > 0) e->noreturn_scope_depth--;
         emit_indent(e);
         emit(e, "#if defined(__ARM_ARCH)\n");
         emit_indent(e);

@@ -1,0 +1,32 @@
+// expect-trap
+// Runtime trap. BUG-805 (2026-08-17): the bounds auto-guard emitted
+// `<fire defers>; return <zero>;` while a shared-struct lock was HELD — between
+// `pthread_mutex_lock` and its unlock — so the mutex was never released.
+//
+// MEASURED on a from-HEAD pre-fix build: this program HANGS FOREVER (timeout,
+// exit 124). The join waits on a worker that can never take the lock. Post-fix it
+// traps (SIGTRAP) before both the out-of-bounds access and the leak.
+//
+// No diagnostic existed for it at either end, which is why it needs the trap
+// harness rather than zer_fail: the defect is what the COMPILER emits, not what it
+// accepts. ZER hard-errors a USER-written `return` inside @critical for exactly this
+// class of reason — the compiler was emitting the construct it bans.
+shared struct S { u32 v; }
+S g;
+volatile u32 gs = 9;
+
+u32 seed() { return gs; }
+
+void leak(u32 i) {
+    u8[4] a;
+    g.v = a[i];          // i is 9: the guard fires WITH THE LOCK HELD
+}
+
+void worker(*S p) { p.v = 1; }
+
+u32 main() {
+    leak(seed());
+    ThreadHandle th = spawn worker(&g);
+    th.join();
+    return 0;
+}

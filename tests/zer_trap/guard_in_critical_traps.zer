@@ -1,0 +1,21 @@
+// expect-trap
+// Runtime trap. BUG-805 — the @critical sibling of guard_in_shared_lock_traps.zer.
+//
+// The auto-guard's `return` was emitted BETWEEN the interrupt-disable and the
+// restore. On bare metal that leaves interrupts DISABLED FOREVER — a silent hang
+// with no fault to notice it by. On hosted x86-64 the critical section degrades to
+// a compiler fence, so pre-fix this program simply returned 0 and NO test could
+// have caught the bare-metal consequence; the trap is what makes it observable at
+// both ends.
+//
+// MEASURED: exit 0 pre-fix, SIGTRAP post-fix.
+volatile u32 gs = 9;
+
+u32 seed() { return gs; }
+
+u32 main() {
+    u8[4] a;
+    u32 i = seed();
+    @critical { a[i] = 1; }   // i is 9: the guard fires with interrupts disabled
+    return 0;
+}

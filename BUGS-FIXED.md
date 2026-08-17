@@ -5,6 +5,67 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-17 — five STRUCTURAL fixes: BUG-791..795 (26 accept-unsafe holes)
+
+Harvested from seven `claude/*` audit branches. The bugs were NOT independent: of
+19 distinct classes across the branches, **11 were one shape** — the same semantic
+question answered at N sites, with site k missed. Five structural changes closed
+26 of the 39 holes that were measurably live on main.
+
+The measurement that framed it: `tools/sink_matrix.sh` reported **54 ok, SINK
+MATRIX CLEAN** while a stack pointer was being stored into a global one line away,
+and the only difference was an identity cast the emitter DELETES (`g_p = p`
+rejected, `g_p = (*u32)p` accepted, byte-identical emitted C). A green gate over a
+live CRITICAL bug — the false-confidence failure CLAUDE.md warns about.
+
+### BUG-791 — one shared peeler for "is this value frame-bound?" (6 holes)
+`unwrap_ptr_launder` peeled intrinsics but never a C-style cast; two var-decl sites
+held hand-rolled COPIES of it that had already drifted (missing its @container/@cstr
+case). Added a reference-producing cast peel (gated by `tynode_is_reference_producing`
+so a VALUE cast is not peeled), replaced both copies with calls, peeled at the
+store-to-global arm, and peeled in `ir_extract_compound_key` so `free((*N)n)` names
+the same allocation as `free(n)` (it previously returned "unkeyable" and the free was
+SILENTLY UNTRACKED). `orelse` needed a PREDICATE, not a peel: every other launder
+collapses to ONE node, `a orelse b` to TWO, so peeling to the primary drops the
+fallback — new `value_frame_bound_symbol()` ORs both arms.
+Gate: sink_matrix p15 axis, 54 -> 64 cells, 7/7 fire pre-fix.
+**The gate's own oracle was weak and is fixed**: `reject` cells compiled to an .exe,
+so GCC's opinion counted; 3 of 7 new cells passed pre-fix for that reason alone.
+
+### BUG-792 — one resolver for "is this a non-atomic RMW?", at BOTH sinks (10 holes)
+The rule matched `g += 1` with `g` named directly. Five other spellings of the same
+operation compiled: `g = g + 1`, `*p += 1` (local alias), through a pointer PARAM,
+2-hop, and through a GLOBAL pointer. The spawn variant is TSan-CONFIRMED racy.
+`resolve_write_target_global()` resolves a pointer to its referent; a scan-local
+alias table binds `&g` at declarations and at call arguments (the scan walks another
+function's AST from the CALLER's scope, so its locals are unreachable via scope).
+Both diagnostics rewrote — they said "compound assignment (+=, |=)", false for every
+new form. Gate: RMW FORM grid, site x spelling, 12 cells, 10 fire pre-fix. It caught
+spawn+written-out immediately — a form I had fixed at the ISR sink and missed at the
+spawn sink.
+**Two existing tests were ASSERTING THE GAP** and were corrected, not deleted:
+test_checker_full's "volatile shared global OK" and `test_modules/hal.zer`, whose own
+comment forbids the very RMW its fixture performed.
+
+### BUG-793 — `distinct Pool/Ring/Slab` evaded all 3 container-position checks (3 holes)
+Raw `->kind == TYPE_POOL` at each; a distinct typedef has kind TYPE_DISTINCT. The #1
+historical bug class recurring where the class-kill never reached: the type-dispatch
+audit freezes the SITE SET but cannot tell that a frozen site is wrong.
+
+### BUG-794 — the atomic-cell key is a PATH, not a symbol (4 holes)
+Only a scalar global and a ONE-LEVEL field were recognised; array element, nested
+field and field-array element matched neither, so the global never became a cell.
+Marking the whole root is sound but rejects a sibling access (`g.i.b` beside atomic
+`g.i.a`) — I built that first and t6dfxt's own positive rejected it. Key is now the
+access path with a `[?]` wildcard for variable indices, matched cross-entry.
+The fixed-buffer audit caught my first depth-capped walk and was right to: bailing
+out returned "no key", and no key means NO cell tracking — a missed race.
+
+### BUG-795 — the shared-state walkers never looked at the CALLEE (1 hole + a silent race)
+All five walkers descended `call.args`, none descended `call.callee`. Two live
+consequences: a MISSING LOCK (pre-fix `go.cb()` emitted with no mutex at all —
+verified by diffing emitted C) and a MISSED DEADLOCK.
+
 ## Session 2026-08-16b — BUG-786: &packed_field deref rejected (extending BUG-493)
 
 **Recorded as a POLICY decision for weeks; it was not one.** BUG-493 already rejects

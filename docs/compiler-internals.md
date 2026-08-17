@@ -12289,6 +12289,72 @@ that SPECIFIC phrase, with an inline note, precisely so nobody later loosens it 
 
 ---
 
+
+## The multi-site tax, measured (2026-08-17)
+
+Harvesting seven audit branches produced a number worth keeping: of **19 distinct
+defect classes**, **11 were the same shape** — one semantic question answered
+independently at N sites, with site k missed. Not 19 unrelated bugs; one structural
+cause repeating, plus 8 genuinely independent defects.
+
+**Why the shape exists here specifically.** Rust encodes "is this value frame-bound"
+IN THE TYPE (`&'a T`). One artifact holds the answer; every use site reads it. ZER
+is annotation-free by design, so it must INFER that from AST shape at each sink.
+The tax is the direct cost of the position ZER occupies — not sloppiness — and it
+has to be paid down structurally, not per-bug.
+
+The debt is countable. At the start of this session:
+
+    hand-rolled peel sites in checker.c      33
+    uses of the shared peeler                13
+    sites querying the call-result summary    9   <- ZERO bugs across all 7 branches
+    sites re-deriving the peel by hand       33   <- produced the CRITICALs
+
+`Symbol.ret_param_mask` / `ret_summary_complete` IS Rust's `'a`, inferred instead of
+written. Where that pattern was applied (`call_result_escapes`, 9 query sites) the
+harvest found nothing. Where it was not, it found the criticals. **ZER does not need
+annotations to get Rust's property; it needs each question to get one artifact.**
+
+### Why the gates did not catch these
+
+The gates are per-MECHANISM, not per-QUESTION:
+
+  -Werror=switch      "you added an enum value and missed a case"
+  audit baselines     "you added a new dispatch SITE"
+  matrices            "this CELL regressed"
+
+None asks *"is the axis your bug lives on even a cell?"* So `tools/sink_matrix.sh`
+reported **54 ok, SINK MATRIX CLEAN** while a stack pointer was stored into a global
+one line away — no cell existed for launder shapes. The fix was an AXIS (p15), not a
+cell. When adding a gate, ask what axis is missing, not what case is missing.
+
+Corollary found the same day: a gate can also have a WEAK ORACLE. sink_matrix's
+`reject` cells compiled to an .exe, so GCC's opinion counted as the checker's — 3 of
+7 new cells passed pre-fix for that reason. `reject` now asserts the CHECKER's
+verdict; `compile` cells still build a real binary.
+
+### Three traps this session, worth internalising
+
+1. **GCC masks checker holes.** It refuses `__attribute__((interrupt))` on hosted
+   x86-64, so EVERY test containing an `interrupt` block "rejects" in exe mode no
+   matter what the checker did — 11 ISR negatives passed for that reason. Measure
+   ISR behaviour with `-o out.c`. (And emit-C mode DOES return non-zero on checker
+   errors; the old CLAUDE.md note claiming exit 0 was wrong and is corrected.)
+
+2. **An existing test can be ASSERTING THE GAP.** Two tests broke when the
+   written-out RMW hole closed — `test_checker_full`'s "volatile shared global OK"
+   and `test_modules/hal.zer` — because both spelled an RMW out in full to dodge a
+   rule that only matched the compound OPERATOR. `hal.zer`'s own comment forbade the
+   operation its fixture performed. When a tightening breaks a test, check whether
+   the test was encoding the bug before assuming the fix is wrong.
+
+3. **A conservative-looking bail-out can be the unsafe direction.** The atomic-cell
+   path walk originally capped depth and returned "no key" beyond it. No key means
+   the access is never tracked as a cell AT ALL — a missed race, not a safe
+   over-rejection. The fixed-buffer audit caught it. Before calling a fallback
+   "conservative", ask which way the failure actually rounds.
+
+
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 
 ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow

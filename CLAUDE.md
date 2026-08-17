@@ -288,10 +288,15 @@ blame` the touched lines (a 2026-06-22 design agent left an unnamed
 before relying on it. For pure code-reading/design, the workflow IS efficient (keeps
 file content out of the parent context) — just gate it.
 
-**`zerc -o <path>` gotchas when testing by hand.** (a) `zerc f.zer -o /tmp/out.c`
-(emit-C mode) returns **exit 0 even on checker errors** — useless for negative
-tests; use `-o /tmp/exe` (compile-to-exe) which returns non-zero on error, or just
-rely on `make check`. (b) `zerc f.zer -o /tmp/exe` for a non-`.c` path builds the
+**`zerc -o <path>` gotchas when testing by hand.** (a) **CORRECTED 2026-08-17 —
+emit-C mode DOES return non-zero on checker errors** (measured: `zerc oob.zer -o
+out.c` exits 1). The old note here claimed exit 0 and is wrong. Prefer `-o out.c`
+for a negative probe: it isolates the CHECKER's verdict from GCC's, which matters
+because **GCC masks checker holes** — it refuses `__attribute__((interrupt))` on
+hosted x86-64, so EVERY test containing an `interrupt` block "rejects" regardless
+of what the checker did. Measured 2026-08-17: 11 ISR negatives and 3 sink-matrix
+cells passed for that reason alone. Still read the DIAGNOSTIC, never the exit code
+(see the `// expect-error:` rule). (b) `zerc f.zer -o /tmp/exe` for a non-`.c` path builds the
 exe **next to the source** (`f`), not at the `-o` path — to run, `cp f.zer /tmp/ &&
 zerc /tmp/f.zer && /tmp/f`, or just trust `make check`.
 
@@ -381,6 +386,8 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
+| **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
+| **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 

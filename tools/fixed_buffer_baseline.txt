@@ -70,3 +70,9 @@ ir_lower.c:        Node *roots[16]; int n = 0;
 # at 16); realistic max 2-3. Short-lived per-iteration scratch.
 ir_lower.c:            Node *shared_extra[16]; int shared_extra_n = 0;
 ir_lower.c:        Node *init_extra[16]; int init_extra_n = 0;
+# BUG-794 (2026-08-17): stack FAST PATH for the atomic-cell access-path walk, with
+# arena overflow doubling right below it (the prescribed Rule #7 shape, same as
+# parser.c stack_decls / zercheck_ir.c fast_stack). Not a cap: a deeper chain grows
+# into the arena, because bailing out would yield "no key" and an untracked atomic
+# cell is a MISSED race, not a safe over-rejection.
+checker.c:    Node *fast[16];

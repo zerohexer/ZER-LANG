@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'g.n[0]' in a concurrent context
+// BUG-786 — field-array element: `g.n[0]` is a NODE_INDEX over a NODE_FIELD, so
+// it matched neither the field form nor a bare global.
+struct C { u32[4] n; }
+C g;
+
+void worker() { u32 o = @atomic_add(&g.n[0], 1); }
+
+u32 main() {
+    spawn worker();
+    g.n[0] = 5;
+    return 0;
+}

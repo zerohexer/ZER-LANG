@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'g.i.n' in a concurrent context
+// BUG-786 — the atomic-cell FORM axis. The rule keyed on (global, ONE field
+// name), so a NESTED field was not a cell at all: the @atomic_add below and the
+// plain store in main raced with no diagnostic on either side, and nothing at
+// runtime can see it (mixed atomic/plain is a data race, not a fault).
+struct In { u32 n; }
+struct C { In i; }
+C g;
+
+void worker() { u32 o = @atomic_add(&g.i.n, 1); }
+
+u32 main() {
+    spawn worker();
+    g.i.n = 5;      // races the atomic in the spawned thread
+    return 0;
+}

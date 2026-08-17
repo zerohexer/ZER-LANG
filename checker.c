@@ -524,6 +524,8 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
 static void ensure_func_props(Checker *c, Symbol *fn);
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth);
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
+static bool atomic_path_key(Checker *c, Node *e, Symbol **out_s,
+                            const char **out_path, uint32_t *out_len);
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line);
 static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
                                        const char **out_field, uint32_t *out_flen);
@@ -4536,6 +4538,16 @@ static Type *check_expr(Checker *c, Node *node) {
         if (c->after_spawn_in_func) {
             Symbol *aw = atomic_scalar_global_target(c, node->assign.target);
             if (aw) record_atomic_plain_write(c, aw, node->loc.line);
+            /* BUG-794: a write through an array element / nested field / field-array
+             * element lands on the same object an atomic may be using. Recorded
+             * unconditionally here; check_atomic_cell_safety only reports it if the
+             * root actually became an atomic cell. A VARIABLE index must be assumed
+             * to alias the atomic element, so it resolves to the same root. */
+            {
+                Symbol *ps; const char *pp; uint32_t pl;
+                if (atomic_path_key(c, node->assign.target, &ps, &pp, &pl))
+                    track_atomic_field(c, ps, pp, pl, false, node->loc.line);
+            }
             /* Slice 3: plain WRITE to a global-struct field after a spawn. */
             Symbol *fs; const char *ff; uint32_t fl;
             if (atomic_struct_field_target(c, node->assign.target, &fs, &ff, &fl))
@@ -9993,9 +10005,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (acell) acell->is_atomic_cell = true;
                 /* Slice 3: struct-field atomic cell `@atomic_*(&s.f)`. */
                 Symbol *fs; const char *ff; uint32_t fl;
-                if (atomic_struct_field_target(c, node->intrinsic.args[0],
-                                               &fs, &ff, &fl))
+                bool matched_field = atomic_struct_field_target(c, node->intrinsic.args[0],
+                                                                &fs, &ff, &fl);
+                if (matched_field)
                     track_atomic_field(c, fs, ff, fl, true, node->loc.line);
+                /* BUG-794: those two forms are a SCALAR global and a ONE-LEVEL struct
+                 * field. An atomic on an array element (`&garr[0]`), a NESTED field
+                 * (`&g.i.n`) or a field-array element (`&g.n[0]`) matched NEITHER, so
+                 * the global never became an atomic cell and a plain write racing it
+                 * from another thread was accepted — a silent data race.
+                 *
+                 * Fall back to marking the ROOT global. Coarser than the per-field
+                 * key (a plain access to a DIFFERENT part of the same global is also
+                 * flagged) but sound, and it is what makes the VARIABLE-index form
+                 * `garr[i]` work at all: `i` is not statically known, so `garr[i]`
+                 * must be assumed to alias `garr[0]`. Corpus cost measured at ZERO
+                 * before shipping. */
+                if (!acell && !matched_field) {
+                    Symbol *ps; const char *pp; uint32_t pl;
+                    if (atomic_path_key(c, node->intrinsic.args[0], &ps, &pp, &pl))
+                        track_atomic_field(c, ps, pp, pl, true, node->loc.line);
+                }
             }
             if (is_load) {
                 /* @atomic_load(&var) → T */
@@ -11764,12 +11794,14 @@ static void check_stmt(Checker *c, Node *node) {
         }
         /* Pool/Ring/Slab must be global or static — not on the stack */
         if (node->kind == NODE_VAR_DECL && type &&
-            (type->kind == TYPE_POOL || type->kind == TYPE_RING || type->kind == TYPE_SLAB) &&
+            (type_dispatch_kind(type) == TYPE_POOL || type_dispatch_kind(type) == TYPE_RING ||
+             type_dispatch_kind(type) == TYPE_SLAB) &&
             !node->var_decl.is_static) {
             checker_error(c, node->loc.line,
                 "%s must be declared as global or static — "
                 "stack allocation risks overflow",
-                type->kind == TYPE_POOL ? "Pool" : type->kind == TYPE_RING ? "Ring" : "Slab");
+                type_dispatch_kind(type) == TYPE_POOL ? "Pool" :
+                type_dispatch_kind(type) == TYPE_RING ? "Ring" : "Slab");
         }
         /* propagate const from var qualifier to slice/pointer type */
         if (node->var_decl.is_const && type) {
@@ -16056,7 +16088,9 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
                 /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T02) */
-                if (sf->type && (sf->type->kind == TYPE_POOL || sf->type->kind == TYPE_RING || sf->type->kind == TYPE_SLAB) &&
+                if (sf->type && (type_dispatch_kind(sf->type) == TYPE_POOL ||
+                                 type_dispatch_kind(sf->type) == TYPE_RING ||
+                                 type_dispatch_kind(sf->type) == TYPE_SLAB) &&
                     zer_container_position_valid(ZER_DP_FIELD) == 0) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
@@ -16218,7 +16252,9 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-386: Pool/Ring/Slab in union not supported (same as BUG-287 for structs) */
                 /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T03) */
-                if (sv->type && (sv->type->kind == TYPE_POOL || sv->type->kind == TYPE_RING || sv->type->kind == TYPE_SLAB) &&
+                if (sv->type && (type_dispatch_kind(sv->type) == TYPE_POOL ||
+                                 type_dispatch_kind(sv->type) == TYPE_RING ||
+                                 type_dispatch_kind(sv->type) == TYPE_SLAB) &&
                     zer_container_position_valid(ZER_DP_VARIANT) == 0) {
                     checker_error(c, node->loc.line,
                         "Pool/Ring/Slab cannot be union variants — must be global or static variables");
@@ -18066,6 +18102,98 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
 /* The scalar GLOBAL targeted by `&g` (or a bare `g` assign target), or NULL.
  * Only direct integer scalar globals — struct-field atomics (`&s.f`) are a
  * later slice (they'd need the per-field carrier taint). */
+/* BUG-794: an atomic-cell key that is a PATH, not just a symbol.
+ *
+ * The two existing matchers recognise a SCALAR global and a ONE-LEVEL struct
+ * field. An atomic on an array element (`&garr[0]`), a NESTED field (`&g.i.n`) or
+ * a field-array element (`&g.n[0]`) matched NEITHER, so the global never became an
+ * atomic cell and a plain write racing it from another thread was accepted.
+ *
+ * Marking the whole ROOT global instead is sound but far too coarse: it rejects a
+ * plain access to a SIBLING (`g.i.b` next to an atomic `g.i.a`), which is a
+ * legitimate, race-free pattern. So the key is the full access path — ".i.a",
+ * ".n[0]", "[0]" — and two accesses conflict only if their paths may alias.
+ *
+ * A VARIABLE index is written "[?]" and aliases ANY index at that position:
+ * `garr[i]` must be assumed to hit the atomic `garr[0]`. That is the conservative
+ * direction — it can only over-reject, never miss a race. */
+static bool atomic_path_key(Checker *c, Node *e, Symbol **out_s,
+                            const char **out_path, uint32_t *out_len) {
+    if (e && e->kind == NODE_UNARY && e->unary.op == TOK_AMP) e = e->unary.operand;
+    /* Stack-first with arena overflow (Rule #7). NOT a fixed cap: bailing out on a
+     * deep chain would return "no key", and no key means the access is never
+     * tracked as an atomic cell at all — a MISSED race, not a safe over-rejection.
+     * So the depth must be unbounded. */
+    Node *fast[16];
+    Node **stack = fast; int cap = 16; int n = 0;
+    Node *cur = e;
+    while (cur && (cur->kind == NODE_FIELD || cur->kind == NODE_INDEX)) {
+        if (n >= cap) {
+            int ncap = cap * 2;
+            Node **grown = (Node **)arena_alloc(c->arena, (size_t)ncap * sizeof(Node *));
+            if (!grown) return false;
+            memcpy(grown, stack, (size_t)n * sizeof(Node *));
+            stack = grown; cap = ncap;
+        }
+        stack[n++] = cur;
+        cur = (cur->kind == NODE_FIELD) ? cur->field.object : cur->index_expr.object;
+    }
+    if (!cur || cur->kind != NODE_IDENT || n == 0) return false;
+    Symbol *gs = scope_lookup_local(c->global_scope, cur->ident.name,
+                                    (uint32_t)cur->ident.name_len);
+    if (!gs || gs->is_function) return false;
+    /* measure, then fill (no fixed buffer — Rule #7) */
+    uint32_t need = 1;
+    for (int i = n - 1; i >= 0; i--) {
+        Node *k = stack[i];
+        if (k->kind == NODE_FIELD) need += 1 + (uint32_t)k->field.field_name_len;
+        else need += 18;                          /* "[" + up to 16 digits + "]" */
+    }
+    char *buf = (char *)arena_alloc(c->arena, need + 1);
+    if (!buf) return false;
+    uint32_t w = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        Node *k = stack[i];
+        if (k->kind == NODE_FIELD) {
+            buf[w++] = '.';
+            memcpy(buf + w, k->field.field_name, k->field.field_name_len);
+            w += (uint32_t)k->field.field_name_len;
+        } else {
+            int64_t iv = eval_const_expr(k->index_expr.index);
+            if (k->index_expr.index && iv != CONST_EVAL_FAIL && iv >= 0)
+                w += (uint32_t)snprintf(buf + w, need + 1 - w, "[%lld]", (long long)iv);
+            else
+                w += (uint32_t)snprintf(buf + w, need + 1 - w, "[?]");
+        }
+    }
+    buf[w] = 0;
+    *out_s = gs; *out_path = buf; *out_len = w;
+    return true;
+}
+
+/* Do two atomic-cell paths MAY-alias? Equal, or equal up to a "[?]" wildcard. */
+static bool atomic_paths_may_alias(const char *a, uint32_t al,
+                                   const char *b, uint32_t bl) {
+    uint32_t i = 0, j = 0;
+    while (i < al && j < bl) {
+        if (a[i] == '[' && b[j] == '[') {
+            uint32_t ie = i, je = j;
+            while (ie < al && a[ie] != ']') ie++;
+            while (je < bl && b[je] != ']') je++;
+            bool aw = (ie - i == 2 && a[i+1] == '?');
+            bool bw = (je - j == 2 && b[j+1] == '?');
+            if (!aw && !bw) {
+                if (ie - i != je - j || memcmp(a + i, b + j, ie - i) != 0) return false;
+            }
+            i = ie + 1; j = je + 1;
+            continue;
+        }
+        if (a[i] != b[j]) return false;
+        i++; j++;
+    }
+    return i == al && j == bl;
+}
+
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
     if (e && e->kind == NODE_UNARY && e->unary.op == TOK_AMP)
         e = e->unary.operand;
@@ -18289,8 +18417,37 @@ static void track_atomic_field(Checker *c, Symbol *s, const char *field,
 static void check_atomic_cell_safety(Checker *c) {
     /* Slice 3: struct-field atomic cells — (struct, field) both @atomic'd and
      * plain-accessed in a concurrent context. */
+    /* BUG-794: entries are keyed by ACCESS PATH, and two different paths can name
+     * the same storage (`garr[?]` — a variable index — may be `garr[0]`). Exact
+     * per-entry matching therefore misses the cross-entry conflict, so pair every
+     * ATOMIC path against every PLAIN path on the same symbol. O(n^2) over a list
+     * that holds one row per distinct accessed path. */
+    for (int i = 0; i < c->atomic_field_count; i++) {
+        struct AtomicFieldEntry *a = &c->atomic_fields[i];
+        if (!a->atomic_used || !a->s) continue;
+        /* PATH-keyed rows only (".f", "[0]"); the bare one-level field key is the
+         * legacy loop's, and mixing them printed `gf` for `g.f`. */
+        if (!(a->field_len && (a->field[0] == '.' || a->field[0] == '['))) continue;
+        for (int j = 0; j < c->atomic_field_count; j++) {
+            struct AtomicFieldEntry *b = &c->atomic_fields[j];
+            if (!b->plain_used || b->s != a->s) continue;
+            if (!(b->field_len && (b->field[0] == '.' || b->field[0] == '['))) continue;
+            if (!atomic_paths_may_alias(a->field, a->field_len, b->field, b->field_len))
+                continue;
+            checker_error(c, b->plain_line,
+                "plain access to '%.*s%.*s' in a concurrent context — '%.*s%.*s' is "
+                "used with @atomic_* elsewhere (atomic cell) and these may be the "
+                "same storage, so access it atomically here too",
+                (int)a->s->name_len, a->s->name, (int)b->field_len, b->field,
+                (int)a->s->name_len, a->s->name, (int)a->field_len, a->field);
+        }
+    }
     for (int i = 0; i < c->atomic_field_count; i++) {
         struct AtomicFieldEntry *e = &c->atomic_fields[i];
+        /* BUG-794: path-keyed entries (".f", "[0]") carry their own separator and
+         * are reported by the may-alias pass above; this legacy loop is for the
+         * one-level field key, which is stored bare. */
+        if (e->field_len && (e->field[0] == '.' || e->field[0] == '[')) continue;
         if (e->atomic_used && e->plain_used && e->s) {
             checker_error(c, e->plain_line,
                 "plain access to '%.*s.%.*s' in a concurrent context — the field "

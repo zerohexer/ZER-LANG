@@ -2323,10 +2323,17 @@ static bool assign_reads_own_target(Node *value, Symbol *tgt) {
 static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) {
     if (!target || depth > 6) return NULL;
     Node *r = target;
+    /* BUG-803 (2026-08-17): NODE_SLICE was missing from this peel. A BIT-RANGE
+     * write `reg[3..0] = v` parses as NODE_SLICE over the global, so the walk
+     * stopped immediately and returned NULL — the write was invisible to every
+     * caller. Bit-range and real-slice targets share the node kind; peeling to
+     * `.object` is correct for both (it is the written aggregate either way). */
     while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                 r->kind == NODE_SLICE ||
                  (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
         if (r->kind == NODE_FIELD) r = r->field.object;
         else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_SLICE) r = r->slice.object;
         else r = r->unary.operand;
     }
     if (!r || r->kind != NODE_IDENT) return NULL;
@@ -2344,6 +2351,31 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) 
             return resolve_write_target_global(c, init->unary.operand, depth + 1);
     }
     return scope_lookup_local(c->global_scope, s->name, s->name_len);
+}
+
+/* Is this assignment TARGET a bit-range (`reg[hi..lo] = v`)? (BUG-803)
+ *
+ * A bit-range write is an IMPLICIT read-modify-write no matter which operator is
+ * written: the emitter lowers it to `*p = (*p & ~mask) | (v << lo)`. The RMW gates
+ * asked only whether the OPERATOR was compound, or whether the RHS mentioned the
+ * target — and a bit-range write is spelled `=` with an RHS that never names the
+ * global, so both disjuncts were false and it slipped at every sink. The `+=`
+ * spelling of the same operation was correctly rejected the whole time, which
+ * makes this the SPELLING axis of one question.
+ *
+ * Distinguished from a real slice by the target's TYPE: a bit range is taken over
+ * an INTEGER, a slice over an array/slice/pointer. */
+static bool target_is_bit_range(Checker *c, Node *target) {
+    if (!target || target->kind != NODE_SLICE) return false;
+    Node *obj = target->slice.object;
+    if (!obj) return false;
+    Type *ot = typemap_get(c, obj);
+    if (!ot && obj->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, obj->ident.name,
+                                 (uint32_t)obj->ident.name_len);
+        if (s) ot = s->type;
+    }
+    return ot && type_is_integer(ot);
 }
 
 /* THE single query for "may this value expression evaluate to something FRAME-BOUND?"
@@ -5077,6 +5109,7 @@ static Type *check_expr(Checker *c, Node *node) {
              * pointee), and treat a WRITTEN-OUT `g = g + 1` as the RMW it is. */
             Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
             bool is_rmw = (node->assign.op != TOK_EQ) ||
+                          target_is_bit_range(c, node->assign.target) ||
                           (gs && assign_reads_own_target(node->assign.value, gs));
             if (is_rmw && gs && !gs->is_function)
                 track_isr_global(c, gs->name, gs->name_len, true);
@@ -11948,6 +11981,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * the mirrored-sink drift this grid exists to catch (it caught this
              * one immediately). */
             bool _is_rmw = (node->assign.op != TOK_EQ) ||
+                           target_is_bit_range(c, node->assign.target) ||
                            (ts && assign_reads_own_target(node->assign.value, ts));
             if (ts && !ts->is_function && !ts->is_const &&
                 zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,

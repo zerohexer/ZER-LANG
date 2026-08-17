@@ -304,6 +304,13 @@ static const char *vshape_flags(VShape s) {
  * ------------------------------------------------------------------------- */
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               /* BUG-803 (2026-08-17): a BIT-RANGE write is an IMPLICIT RMW —
+                * the emitter lowers `g[3..0] = v` to `*p = (*p & ~mask) | v`.
+                * It is spelled with `=` and its RHS never names the global, so
+                * both is_rmw disjuncts were false and it slipped at BOTH sinks
+                * while every `+=` spelling above was caught. The SPELLING axis
+                * of the same question. */
+               RFORM_BIT_RANGE,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -313,6 +320,7 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_BIT_RANGE:       return "bitrange g[3..0]=v";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -327,6 +335,7 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    case RFORM_BIT_RANGE:      *helper = "";                                    *body = "g[3..0] = 5;";   break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

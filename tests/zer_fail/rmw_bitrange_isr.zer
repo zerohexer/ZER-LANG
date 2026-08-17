@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: read-modify-writ
+// BUG-803 — the ISR sibling of rmw_bitrange_spawn.zer. Fixing one sink and missing
+// the other is the exemption/multi-site failure CLAUDE.md names explicitly, so both
+// land in the same commit and both have a cell in the RMW FORM grid
+// (tests/test_hw_matrix.c, RFORM_BIT_RANGE).
+//
+// NEGATIVE-only by necessity: gcc refuses __attribute__((interrupt)) on hosted
+// x86-64, so no `interrupt` block can appear in a RUNNING positive. This test
+// fails at the CHECKER, before gcc, so it is unaffected.
+volatile u32 flags;
+void bump() { flags[3..0] = 5; }
+interrupt USART1 { bump(); }
+u32 main() { flags[3..0] = 1; return 0; }

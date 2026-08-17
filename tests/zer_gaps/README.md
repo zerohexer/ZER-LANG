@@ -22,7 +22,7 @@ fix estimates.
 | `gap5_container_move.zer` | move struct transferred through container field not tracked |
 | `gap6_goto_into_capture.zer` | goto into if-unwrap scope skips capture binding |
 | `gap7_defer_in_defer.zer` | defer nested in defer body accepted (spec says reject) |
-| `prec1_vrp_literal_i.zer` | VRP precision: `u32 i = 10; arr[i]` not proven OOB |
+| ~~`prec1_vrp_literal_i.zer`~~ | **CLOSED 2026-08-17 (BUG-800)** — promoted to `tests/zer_fail/bounds_ident_always_oob.zer`. Its own claim that this was "just a precision/message difference" and "safe at runtime" was WRONG: the auto-guard's runtime form is `if (i >= 4) { return 0; }`, so the function returns EARLY and every statement after the access never runs — silent at both ends, and on bare metal a peripheral write that simply never happens. |
 | `prec2_opaque_wrong_type.zer` | *opaque cast to wrong type inside same function |
 | `audit_2026-06-02_slice_oob.zer` | `arr[0..end]` with end > arr.len silently constructs OOB slice |
 | `audit_2026-06-02_ptrcast_unrelated.zer` | `@ptrcast(*B, &a)` between unrelated concrete struct pointers accepted |

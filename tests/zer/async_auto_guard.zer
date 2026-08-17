@@ -16,6 +16,14 @@
 
 u32 result;
 u32 finished_steps;
+// BUG-800 (2026-08-17): the index must be genuinely UNPROVEN, not provably OOB.
+// This test previously used `u32 i = 5;` with a `// defeat VRP` loop that did not
+// in fact defeat it — the range stayed [5,5] and the guard fired only because
+// [5,5] is not provably SAFE for a u32[4]. A range that is provably OOB is now a
+// hard compile error (it is silent at both ends otherwise), so the index comes
+// from a volatile global: its range is unknown, the auto-guard is inserted, and
+// the coroutine-termination behaviour this test exists to check is unchanged.
+volatile u32 g_wild_idx = 5;
 
 async void worker() {
     u32[4] arr;
@@ -24,9 +32,7 @@ async void worker() {
     arr[2] = 300;
     arr[3] = 400;
     finished_steps = 1;
-    u32 i = 5;
-    u32 j = 0;
-    while (j < 1) { i = 5; j = j + 1; } // defeat VRP
+    u32 i = g_wild_idx;
     yield;
     finished_steps = 2;
     // OOB on u32[4] arr — auto-guard must fire and exit the coroutine.

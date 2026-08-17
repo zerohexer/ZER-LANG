@@ -1105,19 +1105,55 @@ int main(void) {
         arena_free(&a);
     }
 
-    printf("[bounds check — auto-guard returns 0 for OOB variable index]\n");
-    /* With auto-guard: idx=10 on arr[4] → auto-guard fires, returns 0.
-     * The auto-guard handles OOB invisibly at compile time. */
+    printf("[bounds check — PROVABLY OOB variable index rejected (BUG-800)]\n");
+    /* This test previously asserted the SILENT behaviour and therefore encoded
+     * the bug: `u32 idx = 10; arr[idx]` on a u32[4] has the proven range
+     * [10,10], so no value of idx can be a valid index — yet it only WARNED and
+     * fell into the auto-guard, whose runtime form is `if (idx >= 4) return 0;`.
+     * That is silent at both ends: no compile error, no runtime trap, and every
+     * statement after the access never runs (which is why the old expectation
+     * `return arr[0]` was 0 rather than 42 — the early return, not the guard
+     * "handling" anything). On bare metal it is a peripheral write that simply
+     * never happens, with no fault to notice it by.
+     *
+     * The literal spelling `arr[10]` was always a hard error (BUG-196, above);
+     * this is its IDENT sibling and is now the same hard error. The gap file
+     * tests/zer_gaps/prec1_vrp_literal_i.zer recorded exactly this shape. */
+    {
+        tests_run++;
+        Arena a; arena_init(&a, 128*1024);
+        if (!zer_to_c(
+            "u32 main() {\n"
+            "    u32[4] arr;\n"
+            "    arr[0] = 42;\n"
+            "    u32 idx = 10;\n"
+            "    arr[idx] = 99;\n"
+            "    return arr[0];\n"
+            "}\n", "_zer_test_out.c")) {
+            tests_passed++; /* compile error = expected behavior */
+        } else {
+            printf("  FAIL: provably-OOB variable index should be compile error\n");
+            tests_failed++;
+        }
+        arena_free(&a);
+    }
+
+    printf("[bounds check — UNPROVEN variable index still auto-guards]\n");
+    /* The boundary of BUG-800: a genuinely UNPROVEN index (range straddles the
+     * bound) must keep the auto-guard, not become an error. `idx` is 10 or 1
+     * depending on a volatile read, so its range straddles 4. */
     test_compile_and_run(
+        "volatile u32 g_sel = 0;\n"
         "u32 main() {\n"
         "    u32[4] arr;\n"
         "    arr[0] = 42;\n"
-        "    u32 idx = 10;\n"
+        "    u32 idx = 1;\n"
+        "    if (g_sel == 7) { idx = 10; }\n"
         "    arr[idx] = 99;\n"
         "    return arr[0];\n"
         "}\n",
-        0,
-        "auto-guard: idx=10 >= 4 → function returns 0 before access");
+        42,
+        "unproven index keeps the auto-guard and the access succeeds = 42");
 
     printf("[combo: defer + orelse continue in for]\n");
     test_compile_and_run(

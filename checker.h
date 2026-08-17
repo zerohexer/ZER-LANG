@@ -58,6 +58,16 @@ typedef struct {
      * NOT increment it: only the taken branch is checked and the other is
      * stripped, so a join there is unconditional. */
     int branch_depth;
+
+    /* BUG-800: depth of CONDITIONALLY-EVALUATED expression positions — the RHS of
+     * a short-circuit `&&` / `||`. Combined with branch_depth it answers "is this
+     * position unconditionally reached?", which the provably-out-of-bounds index
+     * verdict needs: an ALWAYS_OOB range only says "if reached, definitely wrong",
+     * so promoting it from a guard to a hard ERROR requires reachability. Where an
+     * enclosing guard exists whose condition the compiler could not evaluate
+     * (`if (i < len)` with a runtime len — the standard dynamic-bounds idiom), the
+     * access may never happen and must keep the guard instead. */
+    int sc_rhs_depth;
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */

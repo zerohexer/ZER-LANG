@@ -1794,6 +1794,131 @@ static Node *unwrap_ptr_launder(Node *v) {
     return v;
 }
 
+/* Narrow the live ranges implied by a boolean CONDITION expression (BUG-800).
+ *
+ * A deliberately SMALL, purely-additive helper for the short-circuit RHS: it
+ * handles the shape that matters for bounds — `ident <op> const` (and the
+ * mirrored `const <op> ident`) — plus a conjunction of those. Everything else is
+ * a no-op, which leaves the existing (guarded) behaviour untouched.
+ *
+ * This is NOT a second copy of the `if`-statement narrowing at NODE_IF: that one
+ * also handles field keys, guard-body detection, known_nonzero for the division
+ * check and the then/else JOIN. Duplicating it would be the multi-site mistake
+ * this codebase keeps paying for. The `if` path stays authoritative; this covers
+ * only the position it structurally cannot reach — inside a condition EXPRESSION,
+ * where there is no statement body to hang a snapshot on.
+ *
+ * `invert` maps `||` to the negation of the LHS (the RHS runs only when the LHS
+ * is false). Ranges are pushed with known_nonzero=false: this helper exists for
+ * bounds, and claiming nonzero-ness here would feed the division-guard decision
+ * from a narrower analysis than the one that owns it. */
+static void vrp_narrow_from_cond(Checker *c, Node *cond, bool invert) {
+    if (!cond || cond->kind != NODE_BINARY) return;
+    TokenType op = cond->binary.op;
+    /* A conjunction narrows by BOTH halves: `i < 4 && j < 4 && arr[i]+arr[j]`. */
+    if (op == TOK_AMPAMP && !invert) {
+        vrp_narrow_from_cond(c, cond->binary.left, false);
+        vrp_narrow_from_cond(c, cond->binary.right, false);
+        return;
+    }
+    /* De Morgan: !(a || b) == !a && !b — so an inverted disjunction narrows by
+     * the negation of both halves. */
+    if (op == TOK_PIPEPIPE && invert) {
+        vrp_narrow_from_cond(c, cond->binary.left, true);
+        vrp_narrow_from_cond(c, cond->binary.right, true);
+        return;
+    }
+    Node *lhs = cond->binary.left, *rhs = cond->binary.right;
+    const char *var = NULL; uint32_t var_len = 0;
+    int64_t val = CONST_EVAL_FAIL;
+    bool var_on_left = true;
+    if (lhs && lhs->kind == NODE_IDENT) {
+        val = eval_const_expr(rhs);
+        if (val != CONST_EVAL_FAIL) {
+            var = lhs->ident.name; var_len = (uint32_t)lhs->ident.name_len;
+        }
+    }
+    if (!var && rhs && rhs->kind == NODE_IDENT) {
+        val = eval_const_expr(lhs);
+        if (val != CONST_EVAL_FAIL) {
+            var = rhs->ident.name; var_len = (uint32_t)rhs->ident.name_len;
+            var_on_left = false;
+        }
+    }
+    if (!var) return;
+    /* A VOLATILE variable can change between the test and the use — never narrow
+     * it (the NODE_IF path refuses this too). */
+    Symbol *vs = scope_lookup(c->current_scope, var, var_len);
+    if (vs && vs->is_volatile) return;
+    /* Normalise so the comparison always reads `var <op> val`. */
+    if (!var_on_left) {
+        switch (op) {
+        case TOK_LT:   op = TOK_GT;   break;
+        case TOK_GT:   op = TOK_LT;   break;
+        case TOK_LTEQ: op = TOK_GTEQ; break;
+        case TOK_GTEQ: op = TOK_LTEQ; break;
+        default: break;   /* ==, != are symmetric */
+        }
+    }
+    if (invert) {
+        switch (op) {
+        case TOK_LT:   op = TOK_GTEQ; break;
+        case TOK_GTEQ: op = TOK_LT;   break;
+        case TOK_GT:   op = TOK_LTEQ; break;
+        case TOK_LTEQ: op = TOK_GT;   break;
+        case TOK_EQEQ: op = TOK_BANGEQ; break;
+        case TOK_BANGEQ: op = TOK_EQEQ; break;
+        default: return;
+        }
+    }
+    switch (op) {
+    case TOK_LT:   push_var_range(c, var, var_len, INT64_MIN, val - 1, false); break;
+    case TOK_LTEQ: push_var_range(c, var, var_len, INT64_MIN, val,     false); break;
+    case TOK_GT:   push_var_range(c, var, var_len, val + 1, INT64_MAX, false); break;
+    case TOK_GTEQ: push_var_range(c, var, var_len, val,     INT64_MAX, false); break;
+    case TOK_EQEQ: push_var_range(c, var, var_len, val,     val,       false); break;
+    default: break;   /* != and everything else: no usable interval */
+    }
+}
+
+/* ---- Index-range verdict (BUG-800, 2026-08-17) -----------------------------
+ *
+ * ONE classifier for "given a proven index range [min,max] and a bound, what do
+ * we know?", asked at every indexing sink. Before this, each sink answered a
+ * DIFFERENT subset of the same question and the gaps were silent:
+ *
+ *   - the fixed-array IDENT sink asked only "is it PROVABLY SAFE?", so a range
+ *     PROVABLY OUT of bounds (`u32 i = 10; arr[i]` on a u32[4]) fell into the
+ *     auto-guard. The guard's runtime form is `if (i >= 4) { return 0; }` — so
+ *     the access was silent at BOTH ends: no compile error, no runtime trap, the
+ *     function just returns early and every statement after it never runs. The
+ *     LITERAL spelling `arr[10]` was always a hard error; this was its ident
+ *     sibling. On bare metal it is a peripheral write that never happens.
+ *   - the same sink never considered a range that is entirely NEGATIVE
+ *     (`i32 i = -1`), where no value can possibly be a valid index.
+ *   - the MMIO pointer sink asked NEITHER question: a variable index always got
+ *     the guard, so a provably-OOB index was silent AND a provably-IN-RANGE
+ *     index paid a runtime guard it did not need.
+ *   - only the CALL sink (`arr[f()]`) had the always-OOB verdict.
+ *
+ * The verdict is derived from the range alone, so all four sinks now agree by
+ * construction, and the MMIO sink gains the precision the array sink already had.
+ * A range is only ever pushed when derivable, and an address-taken variable is
+ * widened to the full range, so UNKNOWN — the auto-guard — stays the default. */
+typedef enum { IDXV_UNKNOWN = 0, IDXV_SAFE, IDXV_ALWAYS_OOB } IndexVerdict;
+
+static IndexVerdict index_range_verdict(int64_t min_val, int64_t max_val,
+                                        uint64_t bound) {
+    if (min_val > max_val) return IDXV_UNKNOWN;      /* inverted => no information */
+    if (bound == 0) return IDXV_UNKNOWN;             /* no bound => nothing to say */
+    /* Every value in the range is negative: no value can be a valid index. */
+    if (max_val < 0) return IDXV_ALWAYS_OOB;
+    if (min_val < 0) return IDXV_UNKNOWN;            /* straddles zero => guard */
+    if ((uint64_t)max_val < bound) return IDXV_SAFE;
+    if ((uint64_t)min_val >= bound) return IDXV_ALWAYS_OOB;
+    return IDXV_UNKNOWN;                             /* straddles the bound => guard */
+}
+
 /* Does this type carry a MOVE STRUCT at any nesting depth? The move-struct
  * sibling of type_carries_data_pointer / type_carries_handle — a move struct
  * copied out of a place the analyzer cannot follow creates a SECOND owner of the
@@ -4262,7 +4387,38 @@ static Type *check_expr(Checker *c, Node *node) {
     /* ---- Binary expression ---- */
     case NODE_BINARY: {
         Type *left = check_expr(c, node->binary.left);
+        /* BUG-800 (2026-08-17): the RHS of `&&` / `||` is CONDITIONALLY evaluated,
+         * so the LHS comparison narrows it exactly as an `if` condition narrows a
+         * then-body. VRP never did this, which made
+         *
+         *     if (i < 4 && arr[i] > 0) { ... }
+         *
+         * — the canonical bounds-guarded-access idiom, and the very shape the
+         * auto-guard warning tells users to write — carry a runtime guard it did
+         * not need. It only surfaced as a correctness question once a provably-OOB
+         * range became a hard error: without the narrowing, `i`'s range at `arr[i]`
+         * is still the unnarrowed [10,10] and the idiom would be REJECTED.
+         *
+         * Two gains, one mechanism: the guarded idiom becomes zero-overhead
+         * (relaxation), and the always-OOB verdict stays sound because it now sees
+         * the range that actually holds where the access happens. When the LHS
+         * bound is itself a variable (`i < len`) nothing is derivable and the
+         * narrowing is a no-op, so the access keeps its guard — the conservative
+         * direction. An UNSATISFIABLE narrowed range (min > max, i.e. the RHS is
+         * unreachable) is classified UNKNOWN by index_range_verdict, so dead code
+         * is never diagnosed.
+         *
+         * `||` narrows by the INVERSE of the LHS: the RHS runs only when the LHS
+         * is false, which is why `if (i >= 4 || arr[i] > 0)` is equally safe. */
+        int sc_saved = -1;
+        if (node->binary.op == TOK_AMPAMP || node->binary.op == TOK_PIPEPIPE) {
+            sc_saved = c->var_range_count;
+            vrp_narrow_from_cond(c, node->binary.left,
+                                 node->binary.op == TOK_PIPEPIPE /* invert */);
+            c->sc_rhs_depth++;
+        }
         Type *right = check_expr(c, node->binary.right);
+        if (sc_saved >= 0) { c->sc_rhs_depth--; c->var_range_count = sc_saved; }
 
         /* literal promotion: when one side is a literal and the other is
          * a known type, the literal adopts the other side's type.
@@ -8113,9 +8269,26 @@ static Type *check_expr(Checker *c, Node *node) {
                 struct VarRange *r = find_var_range(c,
                     node->index_expr.index->ident.name,
                     (uint32_t)node->index_expr.index->ident.name_len);
-                if (r && r->min_val >= 0 && r->max_val >= 0 &&
-                    (uint64_t)r->max_val < obj->array.size) {
+                IndexVerdict iv = r ? index_range_verdict(r->min_val, r->max_val,
+                                                          obj->array.size)
+                                    : IDXV_UNKNOWN;
+                if (iv == IDXV_SAFE) {
                     mark_proven(c, node);
+                } else if (iv == IDXV_ALWAYS_OOB &&
+                           c->branch_depth == 0 && c->sc_rhs_depth == 0) {
+                    /* BUG-800: provably OOB is a HARD ERROR, matching the literal
+                     * spelling `arr[10]` and the call sink `arr[f()]`. Previously
+                     * it fell into the auto-guard, whose runtime form silently
+                     * returns early — no error, no trap, and on bare metal no
+                     * fault to notice it by. */
+                    checker_error(c, node->loc.line,
+                        "array index '%.*s' has proven range [%lld, %lld], which is "
+                        "always out of bounds for array of size %llu",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (long long)r->min_val, (long long)r->max_val,
+                        (unsigned long long)obj->array.size);
+                    mark_proven(c, node);   /* error reported: no guard on top of it */
                 }
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
@@ -8228,6 +8401,37 @@ static Type *check_expr(Checker *c, Node *node) {
                     ptr_proven = true;
                     mark_proven(c, node);
                 } else {
+                    /* BUG-800: ask the SAME verdict the array sink asks. This sink
+                     * previously asked neither half — a provably-OOB index was
+                     * silent (guard returns early; on bare metal the peripheral
+                     * write just never happens) and a provably-IN-RANGE index paid
+                     * a runtime guard VRP could already have eliminated. */
+                    IndexVerdict miv = IDXV_UNKNOWN;
+                    struct VarRange *mr = NULL;
+                    if (node->index_expr.index->kind == NODE_IDENT) {
+                        mr = find_var_range(c, node->index_expr.index->ident.name,
+                                            (uint32_t)node->index_expr.index->ident.name_len);
+                        if (mr) miv = index_range_verdict(mr->min_val, mr->max_val, mmio_bound);
+                    }
+                    if (miv == IDXV_ALWAYS_OOB &&
+                        c->branch_depth == 0 && c->sc_rhs_depth == 0) {
+                        checker_error(c, node->loc.line,
+                            "MMIO index '%.*s' has proven range [%lld, %lld], which is "
+                            "always out of range (max %llu from mmio declaration)",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (long long)mr->min_val, (long long)mr->max_val,
+                            (unsigned long long)mmio_bound - 1);
+                        mark_proven(c, node);
+                        ptr_proven = true;
+                        goto mmio_idx_done;
+                    }
+                    if (miv == IDXV_SAFE) {
+                        /* Relaxation: proven in range => zero-overhead, no guard. */
+                        mark_proven(c, node);
+                        ptr_proven = true;
+                        goto mmio_idx_done;
+                    }
                     /* variable index — auto-guard using mmio_bound as array size */
                     mark_auto_guard(c, node, mmio_bound);
                     checker_warning(c, node->loc.line,
@@ -8239,6 +8443,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         (unsigned long long)mmio_bound - 1);
                     ptr_proven = true;
                 }
+                mmio_idx_done: ;
             }
             /* I1 (2026-08-02): a VOLATILE `*T` with NO derived bound is just as
              * unguarded as the non-volatile case. The exemption below assumed

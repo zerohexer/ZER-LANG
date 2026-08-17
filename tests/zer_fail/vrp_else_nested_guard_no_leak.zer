@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: always out of bounds
+// B6 (2026-08-01): a guard nested in the ELSE body pushed a guard-inverse range
+// that leaked past the unconditional join (the THEN body reset var_range_count, the
+// else body did not), proving a later garr[idx] in-bounds on the THEN path where idx
+// is wild. Broken: exit 100 (elided-guard OOB write).
+//
+// MOVED to zer_fail 2026-08-17 (BUG-800). The trailing `garr[idx] = 7;` sits at
+// UNCONDITIONAL position with idx proven [100,100] on a u8[4] — provably out of
+// bounds, now a hard error rather than a guard that silently returns early. Still
+// discriminating, and more strongly: with the leak idx is proven [0,3], which is
+// SAFE, so no error fires and this negative FAILS. Only the absence of the leak
+// can produce the error. Note the in-ELSE access at line 10 correctly keeps its
+// guard — the reachability gate means a genuine guard is never over-rejected.
+u8[4] garr;
+u32 wild() { return 100; }
+u32 f(u32 sel) {
+    u32 idx = wild();
+    if (sel == 0) { garr[0] = 1; }
+    else { if (idx >= 4) { return 0; } garr[idx] = 2; }
+    garr[idx] = 7;
+    return idx;
+}
+u32 main() { return f(0); }

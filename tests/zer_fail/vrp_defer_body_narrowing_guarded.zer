@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: always out of bounds
+// Regression (2026-07-28): a range narrowing inside a defer body (which runs at
+// scope EXIT) leaked into the intervening code, eliding the fixed-array bounds
+// guard (silent OOB). Fixed compiler: idx stays [9,9]. Unfixed: idx proven [2,2].
+//
+// MOVED to zer_fail 2026-08-17 (BUG-800). `garr[idx]` with idx proven [9,9] on a
+// u8[4] is UNCONDITIONALLY and provably out of bounds, which is now a hard error
+// instead of an auto-guard that silently returns early. The test still
+// discriminates on exactly the property it was written for — and more strongly:
+// with the leak, idx is proven [2,2], which is SAFE, so NO error fires and this
+// negative FAILS. The error can only appear if the defer-body narrowing did not
+// leak.
+u8[4] garr;
+u32 wild() { return 9; }
+u32 main() {
+    u32 idx = wild();
+    defer { idx = 2; }
+    garr[idx] = 7;
+    return idx;
+}

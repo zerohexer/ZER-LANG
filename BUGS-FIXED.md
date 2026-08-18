@@ -678,6 +678,39 @@ Documented in `docs/reference.md` ("Bare-metal builds — `-DZER_FREESTANDING`")
 including what each branch changes and the note that ARM/RISC-V/AVR never needed
 it.
 
+### BUG-813 — `break` in a for-INITIALISER bound to the enclosing loop (MEDIUM, silent wrong branch)
+
+**Found by this audit.** The lowerer runs a for-loop's INIT before installing
+that loop's exit/continue targets, so a `break` reached from the init resolved
+against the ENCLOSING loop.
+
+```zer
+for (u32 i = 0; i < 3; i += 1) {
+    for (u32 v = maybe(i) orelse break; v < 10; v += 1) { n += 1; }
+}
+```
+
+Measured: the program exited the OUTER loop and returned 10, where
+inner-binding gives 18. Silent, and the opposite of what `break` means everywhere
+else in ZER, where it always binds to the innermost loop.
+
+**REJECTED rather than rebound**, deliberately. The language has never said which
+loop it should be, and neither answer is obviously right: binding to the loop
+being initialised makes `break` consistent, but `continue` would then jump to the
+STEP of a loop whose induction variable was never initialised, which is
+incoherent. Picking a semantics silently is the actual defect; a diagnostic that
+names the ambiguity and gives the one-line workaround (hoist the initialiser
+above the loop) is the honest answer until the spec makes the call. The spec
+decision is recorded in `docs/limitations.md`.
+
+Corpus cost measured at ZERO before shipping — no file in `tests/`,
+`test_modules/`, `rust_tests/`, `zig_tests/`, `lib/` or `examples/` puts `break`
+or `continue` in a for-init; the two corpus hits for that grep are both in a loop
+BODY, which is unaffected and verified still working.
+
+Test: `tests/zer_fail/for_init_orelse_break_ambiguous.zer`, producing ZERO
+diagnostics on a from-HEAD build.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

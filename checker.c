@@ -8666,6 +8666,18 @@ static Type *check_expr(Checker *c, Node *node) {
         if (node->orelse.fallback_is_continue && !c->in_loop) {
             checker_error(c, node->loc.line, "'orelse continue' outside of loop");
         }
+        /* BUG-813 — see the NODE_FOR handler for the full rationale. */
+        if (c->in_for_init &&
+            (node->orelse.fallback_is_break || node->orelse.fallback_is_continue)) {
+            checker_error(c, node->loc.line,
+                "'orelse %s' in a for-loop INITIALISER is ambiguous — it binds to "
+                "the ENCLOSING loop, not the one being initialised, which is the "
+                "opposite of what 'break'/'continue' mean everywhere else. Hoist "
+                "the initialiser above the loop ('%s v = <expr> orelse %s;' then "
+                "'for (; cond; step)') so the target is explicit",
+                node->orelse.fallback_is_break ? "break" : "continue",
+                "u32", node->orelse.fallback_is_break ? "break" : "continue");
+        }
 
         /* Hardware/defer-safety bans for control flow via orelse fallback.
          * `x orelse return/break/continue` lowers to a conditional jump that
@@ -13417,6 +13429,27 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_FOR: {
         push_scope(c); /* for loop has its own scope */
         if (node->for_stmt.init) {
+            /* BUG-813: `break` / `continue` reached from a for-INIT binds to the
+             * ENCLOSING loop, not the one being initialised — the lowerer runs
+             * the init before installing this loop's exit/continue targets.
+             * Measured: `for (u32 v = maybe(i) orelse break; …)` nested inside an
+             * outer for exited the OUTER loop. Silent, and the opposite of what
+             * `break` means everywhere else in the language, where it always
+             * binds to the innermost loop.
+             *
+             * REJECTED rather than rebound, because the language has never said
+             * which loop it should be and neither answer is obviously right:
+             * binding to the loop being initialised makes `break` consistent, but
+             * `continue` would then jump to the STEP of a loop whose induction
+             * variable was never initialised, which is incoherent. Picking a
+             * semantics silently is the actual defect; a diagnostic that names
+             * the ambiguity and gives the one-line workaround is the honest
+             * answer until the spec makes the call (docs/limitations.md).
+             *
+             * Corpus cost measured at ZERO — no file in tests/, test_modules/,
+             * rust_tests/, zig_tests/, lib/ or examples/ puts break or continue
+             * in a for-init. */
+            c->in_for_init = true;
             /* Parser emits either NODE_VAR_DECL (for `u32 i = 0`) or an
              * expression (for `i = 0`, `i += 5`, etc., via parse_expression).
              * VAR_DECL needs check_stmt; expressions need check_expr.
@@ -13430,6 +13463,7 @@ static void check_stmt(Checker *c, Node *node) {
             } else {
                 check_expr(c, node->for_stmt.init);
             }
+            c->in_for_init = false;
         }
         if (node->for_stmt.cond) {
             Type *fcond = check_expr(c, node->for_stmt.cond);

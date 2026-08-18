@@ -48,6 +48,12 @@ typedef struct {
     bool cur_ret_summary_complete; /* false once any return is not classifiable (STATIC/PARAM(n)) */
     uint64_t cur_ret_param_mask;   /* bit n: a return may be a view of parameter n */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
+    bool in_for_init;       /* true while checking a for-loop INITIALISER. break/continue
+                             * reached from there binds to the ENCLOSING loop, not the one
+                             * being initialised (the lowerer installs this loop's targets
+                             * AFTER the init), which is the opposite of what they mean
+                             * everywhere else — so it is rejected rather than silently
+                             * resolved. BUG-813. */
     int defer_depth;        /* > 0 when inside a defer block */
     int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */
     /* 2026-08-03: > 0 when inside a RUNTIME-conditional body (if/else arm, loop

@@ -87,6 +87,40 @@ earlier ledger. Full detail: BUGS-FIXED.md "Session 2026-08-18".
   the generic `__zer_intrinsic_<name>_unsupported_in_constant_context` marker
   keeps the untriaged tail loud in the meantime.
 
+- **BUG-813 — the spec decision this fix DEFERS.** `break` / `continue` in a
+  for-INITIALISER is now a compile error because the lowerer bound it to the
+  enclosing loop, silently and opposite to every other use of `break`. Two
+  defensible resolutions exist and the language has never chosen: (a) bind to the
+  loop being initialised, which makes `break` consistent but leaves `continue`
+  jumping to the STEP of a loop whose induction variable was never initialised;
+  (b) keep the rejection permanently and require the hoisted form. **This is an
+  owner call, not an audit call.** If (a) is chosen, the lowering change is small
+  — install `loop_exit_block` / `loop_continue_block` BEFORE lowering the init in
+  `ir_lower.c`'s `NODE_FOR` handler — plus a separate rejection for `continue`.
+
+- **BUG-812 residual — `--freestanding` is a MACRO, not a compiler flag.**
+  `-DZER_FREESTANDING` is passed to gcc, not to `zerc`, so `zerc --run` on a
+  freestanding target still builds hosted. That is correct today (a freestanding
+  binary cannot run on the host anyway), but a `zerc --freestanding` flag that
+  both defines the macro and adjusts the gcc invocation would be the natural
+  completion. Low value until someone cross-compiles through `zerc --run`.
+
+- **Latent, not live: three more sequential FIELD-then-INDEX root walks.** BUG-804
+  fixed five sites; the four that were not demonstrably live are fixed too, but
+  the class returns whenever someone hand-rolls the walk again. `expr_root_ident`
+  in `ast.h` is the shared answer. There is no automated gate for "did someone
+  write the loop by hand again" — a grep for two adjacent `while (…NODE_FIELD)` /
+  `while (…NODE_INDEX)` loops on the same variable is the check, and wiring it as
+  an audit script is the obvious next step if the class recurs.
+
+- **`is_early_exit` is still a decision-layer approximation.** BUG-809 fixed the
+  three ways it lost a leak, but the flag remains "this return is not canonical,
+  skip it", which is a heuristic over a real CFG question ("does any path reach a
+  return with this handle alive?"). The principled version is a per-return-block
+  liveness query rather than a tag. Not attempted here: the tag is load-bearing
+  for the `if (err) { free(h); return; } use(h);` pattern and replacing it needs
+  its own corpus measurement.
+
 ### Unverified — reproduce before acting
 - j8f9t7's limitations.md carries a **SUSPECTED** block (code-reading only).
 - jjfk1k verified-and-deliberately-skipped: `@once` + a user `@sem_acquire`/`release`

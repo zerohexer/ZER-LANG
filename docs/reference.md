@@ -3103,6 +3103,13 @@ compile error instead.
 | Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
 | Division by zero (call) | `x / func()` where func() return range unknown → compile error |
 | Wrong pointer cast | Provenance tracking through *opaque round-trips |
+| Alias/ownership laundered through a deref | Binding a pointer, `Handle(T)` or move struct read out of `*p` → compile error. The compiler cannot prove which allocation the copy refers to (that needs points-to, which the per-file model deliberately lacks), so a later free through either name would be a UAF or double-consume. Bind the pointer directly. Every operand form is covered — `*p`, `*h.pp`, `**ppp`, `*factory()` — and so is passing one as a call argument. A SCALAR or plain-struct copy (`u32 v = *p`) is unaffected. |
+| Aggregate comparison | `==` `!=` `<` `>` `<=` `>=` on a struct or union → compile error. An aggregate has no defined ordering and its padding bytes make whole-value equality meaningless (C rejects it for the same reason). Compare the fields you care about. |
+| Provably out-of-bounds index | An index whose PROVEN range cannot intersect the bound → compile error, not a silent runtime guard. `u32 i = 10; arr[i]` on a `u32[4]` is an error; an index the compiler cannot settle still gets the auto-guard. Same rule for MMIO indices against the `mmio` bound. |
+| `volatile` laundered off | Stripping `volatile` is rejected at EVERY value-flow sink — var-decl, assignment, call argument, return, spawn argument and struct-literal field — including through an optional wrapper (`?*T`) and through a `@ptrtoint` → `@inttoptr` round trip. An `@inttoptr` to a constant address inside a declared `mmio` range yields a VOLATILE pointer, so binding it to a plain `*T` is an error. |
+| Allocation size overflow | `arena.alloc_slice(T, n)` computes `sizeof(T) * n` with an overflow guard; an overflowing request fails the allocation (null `?[*]T`) instead of wrapping to a small byte count and handing back a slice with a bogus length. `alloc(T, n)` uses `calloc`, which is overflow-safe by the C standard. |
+| Compile-time / run-time disagreement | A `comptime` function folds at its DECLARED width, wrapping after every operation that can leave it, so the folded constant equals what the same expression computes at run time. |
+| Concurrent stack overflow | With `--stack-limit N`, `main`'s call chain plus every interrupt handler's chain must fit — on bare metal they share ONE stack. Each entry point fitting on its own is not enough. |
 
 ---
 

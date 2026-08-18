@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: initializer cannot use @atomic_xchg
+// BUG-806 — an atomic is a MEMORY OPERATION on a live address and can never be a
+// compile-time constant, but `@atomic_*` was missing from the global-initializer
+// rejection list. What the user got instead depended on how many characters the
+// name happened to have: the AST atomic branch is gated `nlen >= 10`, so
+// `@atomic_or` (9 chars) fell through to the generic "unsupported in constant
+// context" marker — loud, and at least NAMED — while `@atomic_xchg` and the five
+// `_fetch` forms entered the branch, matched none of its arms, and emitted
+// NOTHING: `uint32_t gres = ;`, a C syntax error in generated code the user never
+// wrote, reported at a line in a file they never opened.
+//
+// All fifteen now get the same message at the ZER line. The emitter arm that
+// produced the empty string is now unreachable AND loud.
+u32 gv = 1;
+u32 gres = @atomic_xchg(&gv, 2);
+
+u32 main() { return gres; }

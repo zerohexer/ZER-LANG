@@ -75,6 +75,18 @@ earlier ledger. Full detail: BUGS-FIXED.md "Session 2026-08-18".
   destination width through the shared evaluator so every fold, not just the
   comptime-call path, computes at the declared width.
 
+- **BUG-806 residual — the global-initializer intrinsic rule is a BLACKLIST.**
+  `is_nonconst_emit` enumerates the intrinsics that do NOT fold to a compile-time
+  constant (`@saturate`, `@bitcast`, non-native `@truncate`, `@addc`/`@subb`/
+  `@mulw`, and now every `@atomic_*`). That is the enumeration shape that missed
+  atomics for as long as atomics have existed. **Fix sketch:** invert it to a
+  WHITELIST of the intrinsics that genuinely fold (`@size`, `@offset`,
+  native-width `@truncate`, `@cast`, constant `@inttoptr`, the `@bswap`/bit-query
+  family) and reject everything else. Not attempted here because it would reject
+  every intrinsic not enumerated and the over-rejection cost was not measured;
+  the generic `__zer_intrinsic_<name>_unsupported_in_constant_context` marker
+  keeps the untriaged tail loud in the meantime.
+
 ### Unverified — reproduce before acting
 - j8f9t7's limitations.md carries a **SUSPECTED** block (code-reading only).
 - jjfk1k verified-and-deliberately-skipped: `@once` + a user `@sem_acquire`/`release`

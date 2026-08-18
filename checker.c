@@ -20107,7 +20107,20 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||
                     (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
                                  memcmp(gn, "subb", 4) == 0 ||
-                                 memcmp(gn, "mulw", 4) == 0));
+                                 memcmp(gn, "mulw", 4) == 0)) ||
+                    /* BUG-806: every `@atomic_*`. An atomic is a MEMORY OPERATION
+                     * on a live address — it can never be a compile-time constant,
+                     * at any width, for any of the fifteen. They were missing from
+                     * this list, and what the user got instead depended on how many
+                     * characters the name happened to have: the AST atomic branch
+                     * is gated `nlen >= 10`, so `@atomic_or` (9) fell through to
+                     * the generic "unsupported in constant context" marker (loud,
+                     * and at least NAMED), while `@atomic_xchg` and the five
+                     * `_fetch` forms entered the branch, matched none of its arms,
+                     * and emitted NOTHING — `uint32_t g = ;`, a C syntax error in
+                     * generated code the user never wrote. Rejecting here gives all
+                     * fifteen the same message, at the ZER line, with the fix. */
+                    (gl >= 7 && memcmp(gn, "atomic_", 7) == 0);
                 if (is_nonconst_emit) {
                     checker_error(c, decl->loc.line,
                         "global variable '%.*s' initializer cannot use @%.*s — it "

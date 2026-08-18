@@ -384,6 +384,47 @@ the DECLARATION is the error, when the error is reported at the INSTANTIATION,
 because a `container` is a template and the layout only has to be finite once it
 is stamped. Example corrected to show where the diagnostic actually appears.
 
+### BUG-806 — `@atomic_*` in a global initializer emitted broken C (MEDIUM, diagnostic quality)
+
+**Found by this audit.** An atomic is a memory operation on a live address and can
+never be a compile-time constant — but `@atomic_*` was missing from the
+global-initializer rejection list, which is a hand-enumerated BLACKLIST
+(`@saturate`, `@bitcast`, non-native `@truncate`, `@addc`/`@subb`/`@mulw`).
+
+What the user got instead depended on how many characters the name happened to
+have. The AST atomic branch is gated `nlen >= 10`:
+
+| form | length | outcome |
+|---|---|---|
+| `@atomic_or` | 9 | missed the gate -> generic `__zer_intrinsic_atomic_or_unsupported_in_constant_context` (loud, and at least NAMED) |
+| `@atomic_xchg`, the five `_fetch` forms | >= 10 | entered the branch, matched none of its arms, and the arm had NO `else` -> emitted the EMPTY STRING: `uint32_t gres = ;` |
+
+A C syntax error in generated code the user never wrote, reported at a line in a
+file they never opened. Not silent, but the diagnostic is useless — and the IR
+gate is `nlen >= 7`, so the two paths disagreed about which names are even atomics.
+
+Fixed at both layers: the checker now rejects every `@atomic_*` global initializer
+with the same message the other non-constant intrinsics get, and the emitter arm
+that produced the empty string is now unreachable AND loud (an emitter that
+answers a VALUE position with nothing is the failure mode that hid this).
+
+Atomics in a function body are unaffected — verified with all three shapes
+(`@atomic_or`, `@atomic_xchg`, `@atomic_add_fetch`) compiling and running.
+
+Corpus cost ZERO. Tests:
+`tests/zer_fail/atomic_{,or_}in_global_initializer.zer` — two cells because the
+two halves of the length axis failed DIFFERENTLY, and a fix that closed only the
+one the reproducer used is how this class comes back. Both produce ZERO
+diagnostics on a from-HEAD build.
+
+**Residual, deliberately not fixed:** the list is still a BLACKLIST, which is the
+enumeration shape that missed atomics in the first place. Inverting it to a
+whitelist of intrinsics that DO fold to a constant is the durable fix; it is
+tracked in `docs/limitations.md` rather than attempted here, because it would
+reject every intrinsic not enumerated and the over-rejection cost was not
+measured. The generic `__zer_intrinsic_<name>_unsupported_in_constant_context`
+marker keeps the remaining tail loud in the meantime.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

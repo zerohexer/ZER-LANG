@@ -3492,6 +3492,20 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
                 emit(e, ", __ATOMIC_SEQ_CST)");
+            } else {
+                /* BUG-806: this arm had NO else, so an atomic whose op this AST
+                 * path does not map (xchg, nand, and the five *_fetch forms) fell
+                 * through emitting the EMPTY STRING — `uint32_t g = ;`, a C syntax
+                 * error in generated code the user never wrote. The checker now
+                 * rejects every @atomic_* in a global initializer (the only way to
+                 * reach this path), so this is unreachable; make it LOUD rather
+                 * than empty, because an emitter that answers a VALUE position
+                 * with nothing is the failure mode that hid the bug. */
+                fprintf(stderr, "zerc: internal: @%.*s reached the constant-context "
+                        "emitter at line %d — the checker should have rejected it\n",
+                        (int)nlen, name, node->loc.line);
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field))

@@ -1,10 +1,17 @@
-// Over-rejection boundary for the deref-launder reject. Only a POINTER-typed
-// result is rejected; dereferencing to a scalar or a struct VALUE is a copy, not
-// an alias, and must keep compiling.
+// Over-rejection boundary for the deref-IDENTITY reject (BUG-781/782/785).
+// Rejected: a dereference that YIELDS a pointer/slice/opaque (alias), a Handle
+// (allocation) or a move struct (ownership). Everything else is a plain copy and
+// must keep compiling — including through the operand forms the 2026-08-15 form
+// axis fix added (field / index / call-result operands).
 struct S { u32 v; }
+struct Node { u32 v; }
+struct HS { *u32 sp; }
+struct Box { u32 n; }
 
 u32 read_through(*u32 p) { u32 v = *p; return v; }
 u32 ret_through(*u32 p) { return *p; }
+*u32 give(*u32 p) { return p; }
+u32 use_ptr(*Node n) { return n.v; }
 
 u32 main() {
     u32 a = 5;
@@ -22,5 +29,27 @@ u32 main() {
     x = *p;                     // scalar ASSIGN (the field-store sink)
     if (x != 5) { return 4; }
     if (ret_through(&a) != 5) { return 5; }   // scalar RETURN sink
+
+    // FORM axis: a scalar deref whose OPERAND is a field / a call result.
+    HS hs; hs.sp = &a;
+    u32 f = *hs.sp;             // operand is a FIELD, result is scalar
+    if (f != 5) { return 6; }
+    u32 g = *give(&a);          // operand is a CALL result, result is scalar
+    if (g != 5) { return 7; }
+
+    // Struct-VALUE copy through a field operand (still a copy, not an alias).
+    Box[2] boxes;
+    boxes[0].n = 9;
+    *Box bp = &boxes[0];
+    Box bcopy = *bp;
+    if (bcopy.n != 9) { return 8; }
+
+    // A dereference yielding a plain POINTER is legal as a CALL ARGUMENT: the
+    // narrow arg sink rejects only Handle / move results (a one-shot transfer),
+    // not a borrow for the duration of the call.
+    Node nd; nd.v = 11;
+    *Node np = &nd;
+    **Node npp = &np;
+    if (use_ptr(*npp) != 11) { return 9; }
     return 0;
 }

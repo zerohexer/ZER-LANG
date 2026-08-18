@@ -1106,18 +1106,26 @@ int main(void) {
     }
 
     printf("[bounds check — auto-guard returns 0 for OOB variable index]\n");
-    /* With auto-guard: idx=10 on arr[4] → auto-guard fires, returns 0.
-     * The auto-guard handles OOB invisibly at compile time. */
+    /* With auto-guard: an unprovable idx on arr[4] → auto-guard fires, returns 0.
+     * The auto-guard handles OOB invisibly at compile time.
+     *
+     * BUG-796: this used a literal `u32 idx = 10;`, which VRP proves is [10,10] —
+     * so index_range_verdict now rejects it outright ("always out of bounds"),
+     * which is the right verdict for THAT program but stops this test exercising
+     * the auto-guard it is named for. Reading a mutable global keeps the index
+     * genuinely underivable, so the guard path under test is still the one taken. */
     test_compile_and_run(
+        "u32 wild_seed = 10;\n"
+        "u32 wild() { return wild_seed; }\n"
         "u32 main() {\n"
         "    u32[4] arr;\n"
         "    arr[0] = 42;\n"
-        "    u32 idx = 10;\n"
+        "    u32 idx = wild();\n"
         "    arr[idx] = 99;\n"
         "    return arr[0];\n"
         "}\n",
         0,
-        "auto-guard: idx=10 >= 4 → function returns 0 before access");
+        "auto-guard: unprovable idx >= 4 → function returns 0 before access");
 
     printf("[combo: defer + orelse continue in for]\n");
     test_compile_and_run(

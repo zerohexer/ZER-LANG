@@ -229,6 +229,10 @@ struct Symbol {
     bool is_static;         /* static storage duration */
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
+    bool is_volatile_addr_derived; /* usize produced by @ptrtoint(<volatile ptr>) — the
+                                    * volatile fact lives on the VALUE once the type
+                                    * became an integer, and @inttoptr back to a
+                                    * non-volatile pointer would silently drop it */
     bool is_packed_derived; /* pointer formed by &packed_struct.field — may be MISALIGNED,
                              * so a deref/index through it is a fault on ARM/RISC-V.
                              * Extends BUG-493 (which gated only the @atomic_* sink) to
@@ -341,6 +345,13 @@ struct Symbol {
      * {false, 0} → the taint stays unless proven (no under-rejection, T4). */
     bool ret_summary_complete;
     uint64_t ret_param_mask;
+    /* BUG-801: bit n set iff this function performs a NON-ATOMIC read-modify-write
+     * through pointer parameter n (directly or transitively). Memoised, exactly like
+     * ret_param_mask above — the naive alternative (re-walking every callee body per
+     * caller, with the ISR walker's depth-32 descent) is exponential and hung
+     * test_firmware_patterns for >4 minutes. */
+    bool rmw_summary_done;
+    uint64_t rmw_param_mask;
 
     /* module prefix for name mangling (NULL = main module) */
     const char *module_prefix;

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement
+// BUG-801: an RMW reached from MAIN through a helper. The ISR side of this family
+// closed with BUG-792; this form needed a MEMOISED per-function RMW summary
+// (bit n = performs an RMW through param n), because the naive alternative --
+// a transitive walk over every regular function body -- is exponential with the
+// walker's depth-32 call descent and hung test_firmware_patterns for >4 minutes.
+volatile u32 g;
+
+void bump(volatile *u32 p) { *p += 1; }
+
+interrupt TIM2 { g = 1; }
+
+u32 main() { bump(&g); return 0; }

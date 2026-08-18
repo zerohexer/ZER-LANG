@@ -9916,6 +9916,49 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         return;
     }
 
+    case NODE_ORELSE: {
+        /* BUG-800: SPAWN ARGUMENTS are emitted from RAW AST — they never pass
+         * through IR lowering, so pre_lower_orelse never rewrites them and this
+         * function is the only emitter that sees them. It had no NODE_ORELSE arm,
+         * so `spawn w(none() orelse 3)` fell to the unhandled-kind fallback and
+         * emitted a runtime `_zer_trap("compiler bug: ...")`. Loud, but a shipped
+         * trap on valid code.
+         *
+         * Emitted as a GCC statement expression so the optional is evaluated ONCE
+         * (the argument may have side effects), matching the AST emitter's shape. */
+        Type *ot = checker_get_type(e->checker, node->orelse.expr);
+        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+        if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
+            node->orelse.fallback_is_continue) {
+            /* Control flow out of an argument list has no meaning here; the
+             * checker rejects it, so reaching this is a compiler bug. */
+            fprintf(stderr, "compiler bug: orelse with control-flow fallback in a "
+                            "spawn argument at line %d\n", node->loc.line);
+            emit(e, "(_zer_trap(\"orelse control-flow fallback in spawn arg\", "
+                 "__FILE__, __LINE__), 0)");
+            return;
+        }
+        if (oe && type_dispatch_kind(oe) == TYPE_OPTIONAL && is_null_sentinel(oe->optional.inner)) {
+            /* ?*T — NULL sentinel, no wrapper struct */
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, node->orelse.expr, func);
+            emit(e, ") _zer_oe = ");
+            emit_rewritten_node(e, node->orelse.expr, func);
+            emit(e, "; _zer_oe ? _zer_oe : ");
+            emit_rewritten_node(e, node->orelse.fallback, func);
+            emit(e, "; })");
+            return;
+        }
+        emit(e, "({ __typeof__(");
+        emit_rewritten_node(e, node->orelse.expr, func);
+        emit(e, ") _zer_oe = ");
+        emit_rewritten_node(e, node->orelse.expr, func);
+        emit(e, "; _zer_oe.has_value ? _zer_oe.value : ");
+        emit_rewritten_node(e, node->orelse.fallback, func);
+        emit(e, "; })");
+        return;
+    }
+
     case NODE_STRUCT_INIT: {
         /* Should be handled by IR_STRUCT_INIT_DECOMP, but fallback */
         Type *si_type = checker_get_type(e->checker, node);

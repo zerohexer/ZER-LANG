@@ -2,8 +2,16 @@
 // scope EXIT) leaked into the intervening code, eliding the fixed-array bounds
 // guard (silent OOB). Fixed compiler: idx stays [9,9], auto-guard fires, main
 // returns 0. Unfixed: idx proven [2,2], guard elided, garr[9]=7 OOB, returns 9.
+//
+// 2026-08-16: `wild()` used to `return 9;`, which find_return_range derives as
+// the singleton [9,9] — so index_range_verdict now proves the access can NEVER
+// be in bounds and rejects it outright. That is the right verdict for THAT
+// program, but it stops this test exercising what it is for (the defer-body
+// narrowing leak). Reading a mutable global keeps the index genuinely
+// underivable, so the auto-guard path under test is still the one taken.
 u8[4] garr;
-u32 wild() { return 9; }
+u32 wild_seed = 9;
+u32 wild() { return wild_seed; }
 u32 main() {
     u32 idx = wild();
     defer { idx = 2; }

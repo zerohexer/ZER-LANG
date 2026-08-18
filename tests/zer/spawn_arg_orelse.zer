@@ -1,0 +1,31 @@
+// BUG-800: a spawn ARGUMENT containing `orelse`. Spawn args are emitted from RAW
+// AST (they never pass through IR lowering, so pre_lower_orelse never rewrites
+// them), and emit_rewritten_node had no NODE_ORELSE arm. Originally that emitted
+// `/* unhandled node 47 */0` — a SILENT wrong value handed to the worker — later
+// hardened into a runtime _zer_trap("compiler bug: unhandled NODE kind"). Both
+// forms shipped on valid code.
+//
+// Asserts the VALUE, not just that it compiles: a wrong-value miscompile is the
+// original failure mode, so checking compilation alone would not discriminate.
+// The counter proves the optional is evaluated EXACTLY ONCE (the statement
+// expression must not re-run a side-effecting argument).
+u32 seen;
+u32 calls;
+void w1(u32 x) { @atomic_store(&seen, x); }
+?u32 none() { return null; }
+?u32 some() { return 7; }
+?u32 counted() { calls += 1; return null; }
+u32 main() {
+    ThreadHandle t1 = spawn w1(none() orelse 3);
+    t1.join();
+    if (@atomic_load(&seen) != 3) { return 1; }     // fallback taken
+    ThreadHandle t2 = spawn w1(some() orelse 3);
+    t2.join();
+    if (@atomic_load(&seen) != 7) { return 2; }     // primary taken
+    calls = 0;
+    ThreadHandle t3 = spawn w1(counted() orelse 5);
+    t3.join();
+    if (calls != 1) { return 3; }                    // evaluated exactly once
+    if (@atomic_load(&seen) != 5) { return 4; }
+    return 0;
+}

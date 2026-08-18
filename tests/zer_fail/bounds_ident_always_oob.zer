@@ -1,0 +1,15 @@
+// expect-error: always out of bounds
+// EXPECTED: compile error
+//
+// Promoted from tests/zer_gaps/prec1_vrp_literal_i.zer (2026-08-16). The gap
+// file recorded this exact shape: "u32 i = 10; arr[i]" only WARNED and fell into
+// the auto-guard, whose runtime form is `if (i >= 4) { return 0; }` — so the
+// access was silent at both ends (no compile error, no runtime trap, the
+// function just returns early and the statements after it never run).
+//
+// The literal form `arr[10]` was always a hard error; this is its IDENT sibling.
+u32 main() {
+    u32[4] arr;
+    u32 i = 10;
+    return arr[i];
+}

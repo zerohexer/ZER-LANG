@@ -1,0 +1,10 @@
+// expect-error: always out of bounds
+// EXPECTED: compile error
+//
+// Every value in the index's range is negative, so no value can be a valid
+// index. Same verdict path as the past-the-end case (index_range_verdict).
+u32 main() {
+    u32[4] arr;
+    i32 i = -1;
+    return arr[i];
+}

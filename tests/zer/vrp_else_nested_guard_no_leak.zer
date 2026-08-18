@@ -2,8 +2,14 @@
 // that leaked past the unconditional join (the THEN body reset var_range_count, the
 // else body did not), proving a later garr[idx] in-bounds on the THEN path where idx
 // is wild. Broken: exit 100 (elided-guard OOB write). Fixed: guard fires, exit 0.
+//
+// 2026-08-16: `wild()` returned the constant 100, which VRP now derives as a
+// singleton and rejects as always-OOB before this test's mechanism runs. A
+// mutable global keeps the index underivable so the guard-leak path is still
+// what is measured.
 u8[4] garr;
-u32 wild() { return 100; }
+u32 wild_seed = 100;
+u32 wild() { return wild_seed; }
 u32 f(u32 sel) {
     u32 idx = wild();
     if (sel == 0) { garr[0] = 1; }

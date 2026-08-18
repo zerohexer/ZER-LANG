@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: packed struct field
+// BUG-804, second half: the check asked only whether the ROOT SYMBOL's type was
+// packed, so a packed struct NESTED inside a plain one escaped — `&o.pi.f`
+// addresses a packed field even though Outer is not packed. The shared helper
+// now tests each FIELD step against the type it selects from, so the packed
+// struct is found wherever it sits in the chain.
+packed struct Inner { u8 pad; u32 f; }
+struct Outer { u8 pad0; Inner pi; }
+Outer g_o;
+
+u32 main() { return @atomic_load(&g_o.pi.f); }

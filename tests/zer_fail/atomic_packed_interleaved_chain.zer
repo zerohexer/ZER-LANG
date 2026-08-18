@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: packed struct field
+// BUG-804 — the root-ident walk was written as three SEQUENTIAL loops:
+//
+//     while (r->kind == NODE_FIELD) r = r->field.object;
+//     while (r->kind == NODE_INDEX) r = r->index_expr.object;
+//
+// which is wrong for any chain that ALTERNATES. `g_s.arr[0].f` peels `.f`, stops
+// the first loop at the INDEX, peels `[0]`, then stops the second loop at the
+// FIELD — leaving a FIELD node, so the caller's `== NODE_IDENT` test fails and
+// the packed check SILENTLY does not run. Measured live: this file compiled
+// clean while the simple `&g_s.f` form was rejected.
+//
+// A misaligned atomic hard-faults on ARM/RISC-V and is silently non-atomic
+// elsewhere — and x86 permits the unaligned access, so it is invisible on the
+// dev host at both ends.
+packed struct Inner { u8 pad; u32 f; }
+packed struct Outer { u8 pad0; Inner[2] arr; }
+Outer g_s;
+
+u32 main() {
+    u32 v = @atomic_load(&g_s.arr[0].f);
+    return v;
+}

@@ -1957,23 +1957,62 @@ static void deref_identity_error(Checker *c, int line) {
  * through the resulting pointer faults on ARM/RISC-V. BUG-493 already rejects
  * this at the @atomic_* sink; this is the same question, hoisted so the general
  * pointer sinks can ask it too — the multi-site pattern. */
+/* Is this `&<chain>` the address of a field of a PACKED struct — i.e. possibly
+ * MISALIGNED, which is a hard fault for an atomic on ARM/RISC-V and a silent
+ * non-atomic access elsewhere?
+ *
+ * Two things this answers that the hand-rolled copies did not (BUG-804):
+ *
+ *  - The walk is INTERLEAVED. A hand-rolled `while(FIELD)…; while(INDEX)…;`
+ *    peels all the fields, stops at the first index, then peels indices and
+ *    stops at the next field — so `&s.arr[0].f` exits with the root still a
+ *    FIELD node, the `root->kind == NODE_IDENT` test fails, and the check
+ *    SILENTLY does not fire. Measured live: `@atomic_load(&g_s.arr[0].f)` on a
+ *    packed struct compiled clean while the simple `&g_s.f` was rejected.
+ *
+ *  - The packed struct may be NESTED. Asking only whether the ROOT symbol's type
+ *    is packed misses `struct Outer { PackedInner pi; }` — `&o.pi.f` addresses a
+ *    packed field even though Outer is not packed. Every FIELD step is checked
+ *    against its OBJECT's type instead.
+ *
+ * Conservative on unknown types (no diagnostic), so a shape this cannot resolve
+ * can only fail to reject — never accept something previously rejected. */
 static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     if (!expr || expr->kind != NODE_UNARY || expr->unary.op != TOK_AMP) return false;
     Node *op = expr->unary.operand;
     if (!op || op->kind != NODE_FIELD) return false;   /* must be a FIELD access */
-    Node *root = op;
-    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-        if (root->kind == NODE_FIELD) root = root->field.object;
-        else root = root->index_expr.object;
+    /* Walk the chain, checking each FIELD step against the type it selects from.
+     * INDEX steps stay inside the same object, so they are pure navigation. */
+    for (Node *cur = op; cur; ) {
+        if (cur->kind == NODE_FIELD) {
+            Node *obj = cur->field.object;
+            Type *ot = obj ? checker_get_type(c, obj) : NULL;
+            if (!ot && obj && obj->kind == NODE_IDENT) {
+                Symbol *osym = scope_lookup(c->current_scope, obj->ident.name,
+                                            (uint32_t)obj->ident.name_len);
+                ot = osym ? osym->type : NULL;
+            }
+            if (ot) {
+                Type *ost = type_unwrap_distinct(ot);
+                /* a pointer/array to the struct selects from the pointee */
+                if (ost && type_dispatch_kind(ot) == TYPE_POINTER)
+                    ost = type_unwrap_distinct(ost->pointer.inner);
+                else if (ost && type_dispatch_kind(ot) == TYPE_ARRAY)
+                    ost = type_unwrap_distinct(ost->array.inner);
+                /* type_dispatch_kind, not a raw ->kind read: unwraps distinct and
+                 * is NULL-safe, so this never trips the type-dispatch audit. */
+                if (ost && type_dispatch_kind(ost) == TYPE_STRUCT &&
+                    ost->struct_type.is_packed)
+                    return true;
+            }
+            cur = obj;
+        } else if (cur->kind == NODE_INDEX) {
+            cur = cur->index_expr.object;
+        } else {
+            break;
+        }
     }
-    if (!root || root->kind != NODE_IDENT) return false;
-    Symbol *sym = scope_lookup(c->current_scope, root->ident.name,
-                               (uint32_t)root->ident.name_len);
-    if (!sym || !sym->type) return false;
-    Type *st = type_unwrap_distinct(sym->type);
-    /* type_dispatch_kind, not a raw ->kind read: unwraps distinct and is
-     * NULL-safe, so this never trips the type-dispatch audit. */
-    return st && type_dispatch_kind(st) == TYPE_STRUCT && st->struct_type.is_packed;
+    return false;
 }
 
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
@@ -10517,29 +10556,21 @@ static Type *check_expr(Checker *c, Node *node) {
              * Packed fields can be misaligned. GCC __atomic builtins
              * require natural alignment — misaligned = hard fault on ARM/RISC-V. */
             if (node->intrinsic.arg_count >= 1) {
-                Node *aarg = node->intrinsic.args[0];
-                if (aarg->kind == NODE_UNARY && aarg->unary.op == TOK_AMP &&
-                    aarg->unary.operand->kind == NODE_FIELD) {
-                    /* Walk to root ident to find if struct is packed */
-                    Node *root = aarg->unary.operand;
-                    while (root->kind == NODE_FIELD) root = root->field.object;
-                    while (root->kind == NODE_INDEX) root = root->index_expr.object;
-                    if (root->kind == NODE_IDENT) {
-                        Symbol *sym = scope_lookup(c->current_scope,
-                            root->ident.name, (uint32_t)root->ident.name_len);
-                        if (sym && sym->type) {
-                            Type *st = type_unwrap_distinct(sym->type);
-                            /* SAFETY: zer_atomic_on_packed_valid in src/safety/atomic_rules.c (E03) */
-                            int is_packed = (st->kind == TYPE_STRUCT && st->struct_type.is_packed) ? 1 : 0;
-                            if (zer_atomic_on_packed_valid(is_packed) == 0) {
-                                checker_error(c, node->loc.line,
-                                    "@%.*s on packed struct field — may be misaligned. "
-                                    "Atomic operations require natural alignment. "
-                                    "Use a non-packed struct or copy to aligned local first",
-                                    (int)nlen, name);
-                            }
-                        }
-                    }
+                /* BUG-804: this site used to hand-roll the walk — and hand-roll
+                 * it WRONG (sequential FIELD-then-INDEX loops, so `&s.arr[0].f`
+                 * escaped; and it asked only whether the ROOT type was packed, so
+                 * a packed struct nested in a plain one escaped too). The shared
+                 * helper `addr_of_is_packed_field` already answered this question
+                 * correctly for the deref/index sinks; asking it here is the
+                 * one-query discipline that keeps the two from drifting again. */
+                int is_packed = addr_of_is_packed_field(c, node->intrinsic.args[0]) ? 1 : 0;
+                /* SAFETY: zer_atomic_on_packed_valid in src/safety/atomic_rules.c (E03) */
+                if (zer_atomic_on_packed_valid(is_packed) == 0) {
+                    checker_error(c, node->loc.line,
+                        "@%.*s on packed struct field — may be misaligned. "
+                        "Atomic operations require natural alignment. "
+                        "Use a non-packed struct or copy to aligned local first",
+                        (int)nlen, name);
                 }
             }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
@@ -10860,12 +10891,12 @@ static Type *check_expr(Checker *c, Node *node) {
                  * caught, while the legit pointer-param `b`/`b.field` case passes).
                  * Locking the 2nd struct inside the cond mutex is not an option
                  * (AB-BA deadlock + cond_wait sleeps holding the extra lock). */
-                Node *croot = node->intrinsic.args[0];
-                while (croot->kind == NODE_FIELD) croot = croot->field.object;
-                while (croot->kind == NODE_INDEX) croot = croot->index_expr.object;
-                while (croot->kind == NODE_UNARY && croot->unary.op == TOK_STAR)
-                    croot = croot->unary.operand;
-                if (croot->kind == NODE_IDENT) {
+                /* BUG-804: shared interleaved walk. The three sequential loops
+                 * this replaces left `croot` a FIELD node for any ALTERNATING
+                 * chain (`g.arr[0].f`), so the IDENT test failed and the whole
+                 * foreign-shared check below was silently skipped. */
+                Node *croot = expr_root_ident(node->intrinsic.args[0]);
+                if (croot) {
                     Node *bad = cond_pred_foreign_shared(c, node->intrinsic.args[1],
                         croot->ident.name, (uint32_t)croot->ident.name_len);
                     if (bad) {
@@ -20676,13 +20707,12 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
                         is_shared = true;
                 }
                 if (is_shared) {
-                    /* Find the bare root ident for the cond-name comparison. */
-                    Node *root = cur;
-                    while (root->kind == NODE_FIELD) root = root->field.object;
-                    while (root->kind == NODE_INDEX) root = root->index_expr.object;
-                    while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-                        root = root->unary.operand;
-                    if (root->kind == NODE_IDENT &&
+                    /* Find the bare root ident for the cond-name comparison.
+                     * BUG-804: shared interleaved walk — the sequential loops this
+                     * replaces bailed on an alternating chain, and bailing here
+                     * means NOT reporting a foreign shared read. */
+                    Node *root = expr_root_ident(cur);
+                    if (root &&
                         !((uint32_t)root->ident.name_len == cond_root_len &&
                           memcmp(root->ident.name, cond_root, cond_root_len) == 0)) {
                         return pred; /* foreign shared read */

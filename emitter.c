@@ -661,12 +661,10 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {
         /* Walk to root of field chain */
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
+        /* BUG-804: shared interleaved walk. Bailing here returns NULL, which
+         * the caller reads as "no shared struct" — i.e. no lock. */
+        Node *root = expr_root_ident(expr);
+        if (root) {
             Type *t = checker_get_type(e->checker, root);
             if (t) {
                 Type *eff = type_unwrap_distinct(t);
@@ -707,15 +705,10 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
 static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
 static bool is_async_local(Emitter *e, const char *name, size_t len); /* forward decl */
 
-/* Check if a shared struct type uses condvar (needs mutex instead of spinlock) */
-static bool shared_needs_condvar(Emitter *e, Type *t) {
-    if (!t) return false;
-    Type *eff = type_unwrap_distinct(t);
-    if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
-    if (eff && eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
-        return is_condvar_type(e, eff->struct_type.type_id);
-    return false;
-}
+/* shared_needs_condvar() was DELETED 2026-08-18 — dead since before this audit
+ * (definition only, zero callers). The condvar-vs-plain-mutex decision is made
+ * where the lock is actually emitted, via is_condvar_type; this was a second,
+ * unreachable copy of that question. */
 
 /* Check if a shared struct type uses reader-writer lock */
 static bool shared_is_rw(Type *t) {

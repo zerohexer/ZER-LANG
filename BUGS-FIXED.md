@@ -266,6 +266,52 @@ verified to produce ZERO diagnostics on the pre-fix compiler.
 The p16 row exists because the axis is durable: any future escape sink must answer
 for BOTH lifetimes, and a cell is how that stays true.
 
+### BUG-804 — the root-ident walk was written FIVE times, and written WRONG (HIGH on bare metal)
+
+**Found by this audit.** The same three lines appear in checker.c (x2), emitter.c,
+zercheck_ir.c and — the one that was live — the `@atomic_*` packed-field check:
+
+```
+while (r->kind == NODE_FIELD) r = r->field.object;
+while (r->kind == NODE_INDEX) r = r->index_expr.object;
+```
+
+Two SEQUENTIAL loops. Correct for `a.b.c` and for `a[0][1]`, wrong for anything
+that ALTERNATES: `s.arr[0].f` peels `.f`, stops the first loop at the INDEX, peels
+`[0]`, then stops the second loop at the FIELD — leaving `r` a FIELD node. Every
+caller then tests `r->kind == NODE_IDENT`, which fails, and the safety check
+SILENTLY does not run. None of the five had a NULL guard on the dereference
+either.
+
+Measured live at the atomic sink: `@atomic_load(&g_s.arr[0].f)` on a packed struct
+compiled clean while `@atomic_load(&g_s.f)` was rejected one line away. A
+misaligned atomic hard-faults on ARM/RISC-V and is silently non-atomic elsewhere
+— and x86 permits the unaligned access, so it is invisible on the dev host at
+BOTH ends.
+
+A second, independent defect at the same site: it asked only whether the ROOT
+SYMBOL's type was packed, so a packed struct NESTED in a plain one escaped
+(`struct Outer { PackedInner pi; }`, `&o.pi.f`). The shared helper now tests each
+FIELD step against the type it selects from.
+
+**Honest scope.** Of the five sites, ONE was demonstrably live (the atomic sink).
+The other four are LATENT — each is masked today by other machinery
+(`cond_pred_foreign_shared` recovers via its recursive descent; `find_shared_root`
+is not the path that decides locking, `ir_lower`'s per-statement root is; the
+zercheck_ir one fails toward OVER-rejection). They are fixed anyway, because a
+wrong walk sitting in four safety helpers is exactly what regenerates this class
+the next time one of those maskings is removed.
+
+Fix: ONE `expr_root_ident()` in `ast.h` (inline, so all four translation units
+share the single definition), with every peel step in one loop and every
+dereference NULL-guarded; `addr_of_is_packed_field` widened to find a packed
+struct anywhere in the chain; the atomic site routed through that shared helper
+instead of its own wrong copy.
+
+Corpus cost ZERO. Tests:
+`tests/zer_fail/atomic_packed_{interleaved_chain,nested_struct}.zer`, both
+verified to produce ZERO diagnostics on a from-HEAD build.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

@@ -3800,10 +3800,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
             inst->expr->assign.target &&
             inst->expr->assign.target->kind == NODE_FIELD) {
-            Node *root = inst->expr->assign.target;
-            while (root && root->kind == NODE_FIELD) root = root->field.object;
-            while (root && root->kind == NODE_INDEX) root = root->index_expr.object;
-            if (root && root->kind == NODE_IDENT) {
+            /* BUG-804: shared interleaved walk. Bailing here skips the
+             * TRANSFERRED->ALIVE reset, which over-rejects a re-initialised move
+             * struct — the safe direction, but the same wrong shape. */
+            Node *root = expr_root_ident(inst->expr->assign.target);
+            if (root) {
                 int root_local = ir_find_local_exact_first(func,
                     root->ident.name, (uint32_t)root->ident.name_len);
                 if (root_local >= 0 && root_local < func->local_count &&

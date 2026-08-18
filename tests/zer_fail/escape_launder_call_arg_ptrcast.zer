@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: local-derived pointer argument
+// BUG-807 — arg_is_local_derived was the ONE frame-bound question that never
+// called the shared launder peeler. It is the leaf of call_result_escapes (and
+// of the Ring-push and spawn-arg gates), so every one of those sinks was blind
+// to a laundered ARGUMENT:
+//
+//     g = idfn(&x);                  // correctly REJECTED
+//     g = idfn(@ptrcast(*u32, &x));   // ACCEPTED — same pointer
+//
+// Here the launder is an @ptrcast.
+// ASan-confirmed stack-use-after-return on the accepted form.
+?*u32 g;
+*u32 idfn(*u32 p) { return p; }
+
+void leak() {
+    u32 x = 5;
+    g = idfn(@ptrcast(*u32, &x));
+}
+
+u32 main() { leak(); return 0; }

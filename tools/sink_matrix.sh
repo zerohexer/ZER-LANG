@@ -213,6 +213,29 @@ cell p16_arena_lit_return    reject 'struct N16{u32 v;} struct B16{ *N16 p; } B1
 cell p16_safe_arena_local    compile 'struct N16{u32 v;} u32 main(){ u8[256] bk; Arena ar=Arena.over(bk); ?*N16 m16=ar.alloc(N16); if (m16) |a| { a.v=7; if (a.v != 7) { return 1; } } return 0; }'
 cell p16_safe_lit_global_ptr compile 'struct N16{u32 v;} struct B16{ *N16 p; } N16 gn16; B16 gb16b; void c(){ gb16b={ .p=&gn16 }; } u32 main(){c();return 0;}'
 
+# ---------------------------------------------------------------------------
+# SHAPE p17 (BUG-807): the launder peel applied to a CALL ARGUMENT rather than
+# to the stored value. p15 above covers `g = <launder>(&local)` — the launder
+# wrapping the value at the sink. This row covers `g = f(<launder>(&local))` —
+# the launder wrapping an ARGUMENT, one level further in, where
+# arg_is_local_derived is the leaf that decides. That predicate was the one
+# frame-bound question that never called the shared peeler, so all three wrapper
+# forms walked past call_result_escapes and reached a global. ASan-confirmed
+# stack-use-after-return on each. The C-style cast is the worst of the three:
+# the emitter DELETES it, so the emitted C is byte-identical to the bare form
+# one line away that IS rejected.
+echo "===== SHAPE p17 = a launder wrapping a CALL ARGUMENT (not the stored value) ====="
+cell p17_arg_bare          reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17(&x); } u32 main(){c();return 0;}'
+cell p17_arg_ptrcast       reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17(@ptrcast(*u32,&x)); } u32 main(){c();return 0;}'
+cell p17_arg_ccast         reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17((*u32)(&x)); } u32 main(){c();return 0;}'
+cell p17_arg_pun           reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17(@pun(*u32,&x)); } u32 main(){c();return 0;}'
+cell p17_arg_field_launder reject 'struct L17{u32 f;} *u32 id17(*u32 p){return p;} void c(){ L17 l; g_p=id17(@ptrcast(*u32,&l.f)); } u32 main(){c();return 0;}'
+# BOUNDARY: a launder over a GLOBAL address is not frame-bound, and a laundered
+# arg to a callee that returns a STATIC is settled by the return summary — the
+# peel must not turn every wrapped argument into an escape.
+cell p17_safe_arg_global   compile 'u32 gx17=1; *u32 id17b(*u32 p){return p;} void c(){ g_p=id17b(@ptrcast(*u32,&gx17)); } u32 main(){c();return 0;}'
+cell p17_safe_arg_static   compile 'u32 gs17=2; *u32 pick17(*u32 p){return &gs17;} void c(){ u32 x=5; g_p=pick17(@ptrcast(*u32,&x)); } u32 main(){c();return 0;}'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

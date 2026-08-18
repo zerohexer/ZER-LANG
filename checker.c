@@ -1203,6 +1203,24 @@ static bool escape_type_carries_ref(Type *vt) {
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     if (!arg || depth > 8) return false;
+    /* BUG-807: peel the launder wrappers FIRST. This predicate is the leaf of
+     * `call_result_escapes` (and of the Ring-push and spawn-arg gates), and it
+     * was the ONE frame-bound question that never called the shared peeler — so
+     * every one of those sinks was blind to a laundered ARGUMENT:
+     *
+     *     g = idfn(&x);                      // correctly REJECTED
+     *     g = idfn(@ptrcast(*u32, &x));      // ACCEPTED
+     *     g = idfn((*u32)(&x));              // ACCEPTED  (the cast is ELIDED)
+     *     g = idfn(@pun(*u32, &x));          // ACCEPTED
+     *
+     * All three ASan-confirmed stack-use-after-return. The C-style cast form is
+     * the worst of them: the emitter deletes the cast entirely, so the emitted C
+     * is byte-identical to the form one line above that IS rejected.
+     *
+     * Peeled here rather than at the callers so every sink that reaches this
+     * predicate gains it at once — the same one-query discipline as BUG-791. */
+    arg = unwrap_ptr_launder(arg);
+    if (!arg) return false;
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {

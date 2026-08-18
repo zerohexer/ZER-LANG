@@ -425,6 +425,39 @@ reject every intrinsic not enumerated and the over-rejection cost was not
 measured. The generic `__zer_intrinsic_<name>_unsupported_in_constant_context`
 marker keeps the remaining tail loud in the meantime.
 
+### BUG-807 — the one frame-bound question that never called the shared peeler (HIGH, accept-unsafe)
+
+**Found by this audit.** `arg_is_local_derived` is the LEAF of `call_result_escapes`
+— and of the Ring-push and spawn-arg gates — and it was the only "is this value
+frame-bound?" predicate in the file that never called `unwrap_ptr_launder`. So
+every sink that reaches it was blind to a laundered ARGUMENT:
+
+```zer
+g = idfn(&x);                  // correctly REJECTED
+g = idfn(@ptrcast(*u32, &x));  // ACCEPTED
+g = idfn((*u32)(&x));          // ACCEPTED  — and the emitter DELETES this cast
+g = idfn(@pun(*u32, &x));      // ACCEPTED
+```
+
+All three ASan-confirmed `stack-use-after-return`. The C-style cast form is the
+worst: the emitter elides it entirely, so the emitted C is byte-identical to the
+bare form one line above that IS rejected — the same signature as BUG-791, one
+level further in (that fix peeled the STORED VALUE; this is the ARGUMENT).
+
+Fixed by peeling at the top of the predicate, so every sink gains it at once
+rather than at N call sites. Corpus cost ZERO.
+
+Gate: **SHAPE p17 in `tools/sink_matrix.sh`** — five reject cells (bare, ptrcast,
+C-cast, pun, and a field-rooted launder) plus two boundary compile cells that pin
+the peel against becoming an over-rejection: a launder over a GLOBAL address must
+still compile, and a laundered arg to a callee that provably returns a STATIC must
+still be settled by the return summary. Verified NON-VACUOUS: 4 HOLES against a
+from-HEAD build, 0 after, with the bare cell passing on both — which is exactly
+the asymmetry that made this invisible.
+
+Tests: `tests/zer_fail/escape_launder_call_arg_{ptrcast,cast,pun}.zer`, each
+producing ZERO diagnostics on the pre-fix compiler.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

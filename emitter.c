@@ -5879,9 +5879,44 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
                 e->checker->mmio_ranges[i][1] >= 0xFFFFFFFF) continue;
             real_ranges++;
         }
-        if (real_ranges > 0) {
-            emit(e, "/* MMIO startup validation — verify declared ranges have real hardware */\n");
-            emit(e, "#if !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)\n");
+        /* BUG-814: this validator could NEVER fire, and the attempt was not free.
+         *
+         * It is gated to non-Linux/macOS/Windows — i.e. exactly the targets where
+         * `_zer_probe` is the DIRECT-READ form that hardcodes `has_value = 1`
+         * (freestanding, and `--probe-mode=raw`). So `if (!…has_value)` is a
+         * compile-time constant `if (0)` and the trap is unreachable: a user who
+         * typos a base address, which is the stated purpose ("catches wrong
+         * datasheet addresses at first power-on"), gets nothing.
+         *
+         * Worse than nothing, in fact. The read itself still happens, from a
+         * `__attribute__((constructor))` — i.e. BEFORE `main`, and therefore
+         * before any RCC clock-enable. On an STM32 that is a BusFault on a
+         * clock-gated peripheral: a boot hang with no message, produced by a
+         * check that cannot report anything.
+         *
+         * Emit it only when the probe can ACTUALLY FAIL. Written as a condition
+         * on the probe form rather than deleting the feature, so that if a
+         * fault-detecting freestanding probe is ever added (a BusFault handler
+         * on Cortex-M), the validator comes back on its own. */
+        bool probe_can_fail = (e->probe_mode == 0);   /* 0 = hosted setjmp form */
+        if (real_ranges > 0 && !probe_can_fail) {
+            emit(e, "/* MMIO startup validation SUPPRESSED: with the current probe mode the\n");
+            emit(e, "   probe cannot report a fault (it is a direct read that always reports\n");
+            emit(e, "   success), so the check would be a compile-time `if (0)` whose only\n");
+            emit(e, "   effect is an unguarded peripheral read before main() — before any\n");
+            emit(e, "   clock-enable. See BUG-814. */\n\n");
+        }
+        if (real_ranges > 0 && probe_can_fail) {
+            emit(e, "/* MMIO startup validation — verify declared ranges have real hardware.\n");
+            emit(e, "   The `_ZER_HOSTED` term is load-bearing (BUG-814): the fault-DETECTING\n");
+            emit(e, "   probe is the setjmp/signal form, which needs a hosted libc. Without it\n");
+            emit(e, "   this compiled on freestanding targets where _zer_probe is a direct read\n");
+            emit(e, "   that always reports success — so the trap was unreachable, and the only\n");
+            emit(e, "   surviving effect was a peripheral read from a constructor, i.e. BEFORE\n");
+            emit(e, "   main() and before any clock-enable. On an STM32 that is a BusFault on a\n");
+            emit(e, "   clock-gated peripheral: a boot hang, produced by a check that could not\n");
+            emit(e, "   report anything. */\n");
+            emit(e, "#if _ZER_HOSTED && !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)\n");
             emit(e, "__attribute__((constructor))\n");
             emit(e, "static void _zer_mmio_validate(void) {\n");
             for (int i = 0; i < e->checker->mmio_range_count; i++) {

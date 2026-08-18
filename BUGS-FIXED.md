@@ -711,6 +711,36 @@ BODY, which is unaffected and verified still working.
 Test: `tests/zer_fail/for_init_orelse_break_ambiguous.zer`, producing ZERO
 diagnostics on a from-HEAD build.
 
+### BUG-814 — the MMIO boot validator could never fire, and trying cost a boot hang (MEDIUM, bare-metal)
+
+**Found by this audit.** The emitted `__attribute__((constructor))`
+`_zer_mmio_validate` traps if a declared `mmio` range has no hardware. It is
+gated to non-Linux/macOS/Windows — i.e. exactly the targets where `_zer_probe` is
+the DIRECT-READ form that hardcodes `has_value = 1`. So `if (!…has_value)` is a
+compile-time constant `if (0)`: the trap is unreachable, and a user who typos a
+base address — the stated purpose, *"catches wrong datasheet addresses at first
+power-on"* — gets nothing.
+
+Worse than nothing. The read itself still happens, from a constructor, i.e.
+BEFORE `main` and therefore before any RCC clock-enable. On an STM32 that is a
+BusFault on a clock-gated peripheral: a boot hang with no message, produced by a
+check that could not report anything.
+
+Fixed by emitting it only where the probe can actually fail, expressed at both
+layers: the emitter skips it under `--probe-mode=raw`/`disabled` (leaving a
+comment saying why), and the C guard gained the `_ZER_HOSTED` term, because the
+fault-DETECTING probe is the `setjmp`/`signal` form and that needs a hosted libc.
+Written as a condition on the probe FORM rather than deleting the feature, so a
+future fault-detecting freestanding probe (a BusFault handler on Cortex-M) brings
+the validator back on its own.
+
+Gate: a cell in `tools/audit_freestanding.sh`. **The cell needs `-U__linux__` and
+the audit says so** — the validator's own guard already excludes `__linux__`, so
+on this Linux host the cell would pass no matter what the compiler emitted.
+Measured both ways: with the flag it FAILS on a pre-fix build, without it passes
+on both. That is the vacuous-cell shape caught inside the gate that was written
+to catch vacuous behaviour.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

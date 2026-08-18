@@ -37,6 +37,7 @@ trap 'rm -rf "$DIR"' EXIT
 if [ ! -x "$ZERC" ]; then echo "freestanding audit: no zerc at $ZERC" >&2; exit 1; fi
 
 cat > "$DIR/fs.zer" <<'ZEOF'
+mmio 0x40020000..0x40020FFF;
 volatile u32 counter;
 u32[4] table;
 
@@ -55,6 +56,9 @@ u32 read_at(u32 i) {
 u32 main() {
     bump();
     @once { counter = 0; }
+    // an mmio binding, so the boot-validator emission path is exercised
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40020014);
+    if (counter == 0xFFFFFFFF) { reg[0] = 1; }
     return read_at(0);
 }
 ZEOF
@@ -105,6 +109,29 @@ else
         fail=1
     else
         note "ok: no hosted libc header under ZER_FREESTANDING"
+    fi
+    # BUG-814: the MMIO boot validator must not compile on a freestanding target.
+    # There, _zer_probe is a direct read that always reports success, so the trap
+    # is unreachable — while the read itself still happens from a constructor,
+    # BEFORE main() and before any clock-enable. A check that cannot report
+    # anything but can hang the boot is worse than no check.
+    # -U__linux__ is REQUIRED, not cosmetic: the validator's own guard already
+    # excludes __linux__, so on this Linux host the cell would pass no matter
+    # what the compiler emitted — a vacuous cell. Undefining it simulates the
+    # non-Linux (bare-metal) target the guard is actually about. Measured: with
+    # the flag the cell FAILS on a pre-fix build; without it, it passes on both.
+    if gcc -U__linux__ -ffreestanding -DZER_FREESTANDING -E "$DIR/fs.c" \
+           > "$DIR/fs_bm.i" 2>/dev/null; then
+        if grep -q '_zer_mmio_validate' "$DIR/fs_bm.i"; then
+            note "FAIL: the MMIO boot validator still compiles for a freestanding,"
+            note "      non-Linux target — its trap is unreachable there (the probe is"
+            note "      a direct read that always reports success) while the read itself"
+            note "      still runs from a constructor, before main() and before any"
+            note "      clock-enable"
+            fail=1
+        else
+            note "ok: MMIO boot validator correctly absent on a bare-metal target"
+        fi
     fi
     for sym in fprintf abort pthread_mutex_lock sched_yield; do
         if grep -q "\b$sym\b" "$DIR/fs.i"; then

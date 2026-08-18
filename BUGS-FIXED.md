@@ -458,6 +458,91 @@ the asymmetry that made this invisible.
 Tests: `tests/zer_fail/escape_launder_call_arg_{ptrcast,cast,pun}.zer`, each
 producing ZERO diagnostics on the pre-fix compiler.
 
+### BUG-808 — a `default` arm that is not LAST made every later arm dead code (HIGH, silent miscompile)
+
+**Found by this audit.** The switch dispatch chain is built arm-by-arm, and the
+default arm's entry is an UNCONDITIONAL goto (it matches everything). Emitting
+that goto in the MIDDLE of the chain terminated the chain there: every later
+arm's comparison and `IR_BRANCH` were appended to the already-terminated tail
+block of the default BODY — dead C after a `goto` — and the arm bodies they
+guarded became unreachable.
+
+```zer
+switch (x) { default => { r = 9; } 1 => { r = 1; } }   // x == 1 gave r == 9
+```
+
+Measured, and confirmed in the emitted C: the dispatch block ends
+`goto bb_default`, and the `x == 1` comparison sits below it, unreachable. No
+diagnostic at compile time and no fault at run time — the program just takes the
+wrong branch.
+
+Nothing rejected it either: `parser.c` accepts `default` in any position, and
+neither the enum-exhaustiveness check nor the integer-needs-default check
+constrains ordering. Every existing test happens to put `default` last, so the
+shape was untested.
+
+Fixed with a PERMUTATION — process the default arm last whatever position it
+holds. That is the whole fix because ZER switch arms are MUTUALLY EXCLUSIVE with
+no fallthrough: testing the specific arms first and falling through to `default`
+is exactly what the source means, and is what a trailing `default` already
+lowered to. Block ids stay allocated in processing order and each arm's blocks
+stay contiguous, so the forward-edge topological order `ir_compute_block_guards`
+relies on is preserved. `elide_compare` is unaffected — it requires
+`is_exhaustive_enum`, which requires `!has_default`, so the two are mutually
+exclusive by construction.
+
+Test: `tests/zer/switch_default_arm_position.zer` — a cell per switch FLAVOUR
+(integer equality, enum variant, multi-value OR, optional `has_value`) because
+each builds its dispatch comparison differently, plus the trailing-default form
+as the unchanged control. Verified to FAIL on a from-HEAD build.
+
+**A measurement note worth keeping.** My first run of this reproducer reported
+PASS. The command was `zerc … --run 2>&1 | tail -1; echo $?` — which reads
+`tail`'s exit status, not the program's. Same family as the rule CLAUDE.md
+already states for diagnostics ("read the message, not the exit code"), one layer
+down: in a PIPELINE, `$?` is not the exit code you think you are reading.
+
+### BUG-809 — a leak inside an if/else where BOTH arms return was never reported (HIGH, missed diagnostic)
+
+**Found by this audit.** THREE layers, each necessary and none sufficient — worth
+recording because fixing only the first two left the bug fully alive and looking
+fixed:
+
+1. **CROSS-ARM TAG CONTAMINATION.** `bb_then` / `bb_else` / `bb_join` are
+   allocated consecutively, and the then-body's early-exit sweep ran
+   `[bb_then, block_count)` skipping only `bb_join` — so it tagged **bb_else**,
+   which is not part of the then body at all. The else sweep had the mirror
+   defect: it swept from `bb_else` and swallowed every block the THEN body had
+   created (their ids are all above `bb_join`). Both now use the block-count
+   boundary that the already-present — and until now DEAD, `(void)`-cast away —
+   `then_start_block_count` variable was written for.
+
+2. **NO CANONICAL EXIT.** The `is_early_exit` skip in the leak scan rests on an
+   assumption its own comment states: *"the fall-through return holds the
+   authoritative leak state"*. When every return block is an early exit, that
+   fall-through does not exist and the scan ran over an EMPTY set.
+
+3. **AN UNREACHABLE JOIN COUNTS AS CANONICAL.** When both arms return, the join
+   block is still emitted and still ends in a `RETURN` — with zero predecessors.
+   It satisfied the "a canonical exit exists" test while carrying no state, so
+   fix 2 never fired. The canonical exit must also be REACHABLE.
+
+Only after all three does `if (c) { return 1; } else { <leak>; return 2; }`
+report, in both arm directions. The route to layer 3 was a one-line trace
+printing the tag at the scan site — CLAUDE.md's "print whether it runs before
+theorising about why it doesn't", earning its place for the second time this
+session. (The first probe was also masked: the ghost-handle rule rejected the
+draft reproducer for an unrelated reason, so the leak rule under test never ran —
+route around a masking rule, do not accept its rejection as a pass.)
+
+Corpus cost ZERO — 1267 .zer tests green, including every existing early-exit and
+leak-coverage test, so the tag still does its original job.
+
+Tests: `tests/zer_fail/leak_both_arms_return.zer` and
+`tests/zer_fail/leak_then_arm_else_returns.zer` — both arms get a cell because
+the two sweeps held independent copies of the tagging bug and a fix to one would
+not have moved the other. Both produce ZERO diagnostics on a from-HEAD build.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

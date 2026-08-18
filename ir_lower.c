@@ -2506,14 +2506,29 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * correctly handles if-unwrap early-exits via alias
          * propagation to the canonical return's state. */
         if (then_always_exits && !has_capture) {
-            /* Tag blocks created during then-body lowering plus bb_then.
-             * Skip bb_join — that's the canonical fall-through target. */
-            for (int bi = then_start_bi; bi < ctx->func->block_count; bi++) {
-                if (bi == bb_join) continue;
+            /* Tag bb_then plus every block CREATED DURING then-body lowering.
+             *
+             * BUG-809: this used to sweep `[then_start_bi, block_count)` and skip
+             * only bb_join — but bb_then, bb_else and bb_join are allocated
+             * CONSECUTIVELY (just above), so bb_else sits inside that range and
+             * was tagged `is_early_exit` even though it is not part of the then
+             * body at all. zercheck_ir skips early-exit return blocks when it
+             * collects and reports leak coverage, so a handle leaked on the ELSE
+             * path went UNREPORTED whenever the then body happened to end in a
+             * `return`. Measured: the identical leak IS reported without the
+             * if-wrapper.
+             *
+             * `then_start_block_count` — captured after all three blocks exist,
+             * and until now dead (`(void)`-cast away) — is exactly the right
+             * boundary: anything at or above it was created while lowering the
+             * then body, and bb_else/bb_join are both below it by construction.
+             * Using it removes the need to special-case bb_join too. */
+            if (!ctx->func->blocks[then_start_bi].is_early_exit)
+                ctx->func->blocks[then_start_bi].is_early_exit = true;
+            for (int bi = then_start_block_count; bi < ctx->func->block_count; bi++) {
                 if (!ctx->func->blocks[bi].is_early_exit)
                     ctx->func->blocks[bi].is_early_exit = true;
             }
-            (void)then_start_block_count;
         }
 
         ensure_terminated(ctx, bb_join);
@@ -2523,6 +2538,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
             else_start_bi = bb_else;
+            /* BUG-809 mirror: the boundary for "created during ELSE-body
+             * lowering". Without it the else sweep ran from bb_else to
+             * block_count and swallowed every block the THEN body created
+             * (their ids are all above bb_join > bb_else), so a leak in the THEN
+             * body went unreported whenever the ELSE body ended in a `return`.
+             * Same defect, opposite arm — measured live in both directions. */
+            int else_start_block_count = ctx->func->block_count;
             int else_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* else-body block: we manage */
             lower_stmt(ctx, node->if_stmt.else_body);
@@ -2542,9 +2564,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 }
             }
             if (else_always_exits) {
-                for (int bi = else_start_bi; bi < ctx->func->block_count; bi++) {
-                    /* Don't tag bb_join if we accidentally reach it */
-                    if (bi == bb_join) continue;
+                if (!ctx->func->blocks[else_start_bi].is_early_exit)
+                    ctx->func->blocks[else_start_bi].is_early_exit = true;
+                for (int bi = else_start_block_count; bi < ctx->func->block_count; bi++) {
                     if (!ctx->func->blocks[bi].is_early_exit)
                         ctx->func->blocks[bi].is_early_exit = true;
                 }
@@ -2966,12 +2988,49 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool is_exhaustive_enum = is_enum && !has_default &&
                                   node->switch_stmt.arm_count > 0;
 
-        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+        /* BUG-808: process the DEFAULT arm LAST, whatever position it holds in
+         * the source.
+         *
+         * The dispatch chain is built arm-by-arm, and the default arm's entry is
+         * an UNCONDITIONAL goto (it matches everything). Emitting that goto in
+         * the middle of the chain terminated the chain there: every later arm's
+         * comparison and IR_BRANCH were appended to the already-terminated tail
+         * block of the default BODY, i.e. dead code after a `goto`, and the arm
+         * bodies they guarded became unreachable. `switch (x) { default => {r=9;}
+         * 1 => {r=1;} }` returned 9 for x==1 — a silent miscompile with no
+         * diagnostic. `default` is legal in any position: parser.c accepts it,
+         * and neither the enum-exhaustiveness check nor the integer-needs-default
+         * check constrains ordering.
+         *
+         * A permutation is the whole fix because ZER switch arms are MUTUALLY
+         * EXCLUSIVE with no fallthrough — testing the specific arms first and
+         * letting the chain fall through to `default` is exactly what the source
+         * means, and is what a source-ordered switch with a trailing `default`
+         * already lowers to. Block ids stay allocated in processing order and
+         * each arm's blocks stay contiguous, so the forward-edge topological
+         * order that ir_compute_block_guards relies on is preserved.
+         *
+         * `elide_compare` is unaffected: it requires is_exhaustive_enum, which
+         * requires !has_default, so the two are mutually exclusive by
+         * construction. */
+        int arm_n = node->switch_stmt.arm_count;
+        int *arm_order = (int *)arena_alloc(ctx->arena,
+                                            (size_t)(arm_n > 0 ? arm_n : 1) * sizeof(int));
+        {
+            int w = 0;
+            for (int i = 0; i < arm_n; i++)
+                if (!node->switch_stmt.arms[i].is_default) arm_order[w++] = i;
+            for (int i = 0; i < arm_n; i++)
+                if (node->switch_stmt.arms[i].is_default) arm_order[w++] = i;
+        }
+
+        for (int oi = 0; oi < arm_n; oi++) {
+            int i = arm_order[oi];
             SwitchArm *arm = &node->switch_stmt.arms[i];
             int bb_arm = ir_add_block(ctx->func, ctx->arena);
-            int bb_next = (i + 1 < node->switch_stmt.arm_count) ?
+            int bb_next = (oi + 1 < arm_n) ?
                           ir_add_block(ctx->func, ctx->arena) : bb_exit;
-            bool is_last_arm = (i + 1 == node->switch_stmt.arm_count);
+            bool is_last_arm = (oi + 1 == arm_n);
             bool elide_compare = (is_exhaustive_enum && is_last_arm &&
                                   !arm->is_default);
 

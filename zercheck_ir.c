@@ -7038,6 +7038,41 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      *   - early-exit (if-then-always-exits path, bypasses canonical flow)
      *
      * Mirrors zercheck.c's block_always_exits semantic. */
+    /* BUG-809: the `is_early_exit` skip in BOTH loops below rests on an
+     * assumption the comment states outright — "the fall-through return holds
+     * the authoritative leak state". When EVERY return block is tagged, that
+     * fall-through does not exist, and the skip silently leaves NO block to scan:
+     * the leak check runs over an empty set and reports nothing.
+     *
+     * `if (c) { return 1; } else { <leak>; return 2; }` is exactly that shape —
+     * both arms return, so both are early exits, and a handle leaked in either
+     * arm vanished. Measured: the identical leak IS reported once the if-wrapper
+     * is removed.
+     *
+     * When no canonical return survives the filters, scan the early-exit returns
+     * instead — they ARE the function's exits. Both loops use the same flag so
+     * the coverage half stays symmetric with the reporting half: a handle freed
+     * on one exit still suppresses the report, exactly as before. */
+    bool ir_has_canonical_return = false;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        if (bb->inst_count == 0) continue;
+        if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
+        if (bb->is_orelse_fallback) continue;
+        if (bb->is_early_exit) continue;
+        /* REACHABLE only. When both arms of an `if` return, the join block is
+         * still emitted and still ends in a RETURN, but nothing branches to it —
+         * `pred_count == 0` and it is not the entry. Counting that dead block as
+         * the canonical exit is what kept the fallback from firing: the scan had
+         * a "canonical" return whose state is empty, so it found nothing and the
+         * real exits stayed skipped. This is the third layer of the same bug;
+         * the first two (cross-arm tag contamination, no-canonical-exit) were
+         * each necessary and neither was sufficient. */
+        if (bi != 0 && bb->pred_count == 0) continue;
+        ir_has_canonical_return = true;
+        break;
+    }
+
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -7045,7 +7080,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (bb->inst_count == 0) continue;
         if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
         if (bb->is_orelse_fallback) continue;
-        if (bb->is_early_exit) continue;
+        if (bb->is_early_exit && ir_has_canonical_return) continue;
         IRPathState *ps2 = &block_states[bi];
         for (int hi = 0; hi < ps2->handle_count; hi++) {
             IRHandleInfo *h = &ps2->handles[hi];
@@ -7079,8 +7114,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         /* Phase E: skip early-exit blocks for leak checking too —
          * they represent conditional bypass paths whose state isn't
          * canonical. The fall-through return holds the authoritative
-         * leak state. */
-        if (bb->is_early_exit) continue;
+         * leak state — UNLESS there isn't one (BUG-809, see above), in which
+         * case these ARE the function's exits and skipping them scans nothing. */
+        if (bb->is_early_exit && ir_has_canonical_return) continue;
 
         IRPathState *ps = &block_states[bi];
         for (int hi = 0; hi < ps->handle_count; hi++) {

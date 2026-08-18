@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: cannot be initialized from a volatile pointer
+// BUG-810 — a designated initializer had NO qualifier check at all. Every other
+// value-flow sink (var-decl, assignment, call arg, return, spawn arg) rejects a
+// volatile-stripping store; validate_struct_init had only a type-compat test,
+// and `type_equals` deliberately ignores `pointer.is_volatile` so it says
+// nothing about qualifiers.
+//
+// MEASURED CONSEQUENCE, not a theoretical one: with the field declared plain
+// `*u32`, three source-level MMIO stores through `g_uart.dr` compiled to a
+// SINGLE store under -O2 (verified in the generated assembly). Two peripheral
+// writes silently gone. No compile error, and on the target no fault either —
+// the device just never sees them. On a UART data register that is two dropped
+// characters; on a write-1-to-clear status register it is an interrupt that
+// never gets acknowledged.
+mmio 0x40020000..0x40020FFF;
+
+struct Uart { *u32 dr; }        // NOT declared volatile — that is the bug
+Uart g_uart;
+
+u32 main() {
+    g_uart = { .dr = @inttoptr(*u32, 0x40020004) };
+    return 0;
+}

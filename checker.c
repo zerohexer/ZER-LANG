@@ -2366,6 +2366,10 @@ static bool check_isr_ban(Checker *c, int line, const char *method) {
 /* Validates a NODE_STRUCT_INIT against a target struct type.
  * Checks: all field names exist, all field value types match.
  * Used at 4 value-flow sites: var-decl, assignment, call arg, return. */
+/* BUG-810: shared volatile-strip DETECTION — defined below, used here. */
+static bool volatile_strip_detected(Checker *c, Node *src_expr, Type *src_type,
+                                    Type *tgt_type);
+
 static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int line) {
     Type *st = type_unwrap_distinct(target_type);
     if (st->kind != TYPE_STRUCT) {
@@ -2396,6 +2400,26 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     break;
                 }
                 Type *vt = checker_get_type(c, df->value);
+                /* BUG-810: the QUALIFIER check this sink never had. Every other
+                 * value-flow sink (var-decl, assignment, call arg, return, spawn
+                 * arg) rejects a volatile-stripping store; a designated
+                 * initializer had only the type-compat test above, and
+                 * `type_equals` deliberately ignores `pointer.is_volatile`
+                 * (types.c) so it says nothing about qualifiers.
+                 *
+                 * Measured: `struct Uart { *u32 dr; }` with
+                 * `g_uart = { .dr = @inttoptr(*u32, 0x40020004) };` compiled with
+                 * ZERO diagnostics, and three source-level MMIO stores through
+                 * `g_uart.dr` collapsed to a SINGLE store under -O2. Two
+                 * peripheral writes silently gone — no compile error, and on the
+                 * target no fault either. */
+                if (vt && ft && volatile_strip_detected(c, df->value, vt, ft)) {
+                    checker_error(c, line,
+                        "field '.%.*s' cannot be initialized from a volatile pointer — "
+                        "the field type is not volatile, so writes through it may be "
+                        "coalesced or dropped. Declare the field 'volatile'",
+                        (int)df->name_len, df->name);
+                }
                 if (vt && ft && !type_equals(ft, vt) &&
                     !can_implicit_coerce(vt, ft) &&
                     !is_literal_compatible(df->value, ft)) {
@@ -2497,6 +2521,41 @@ static Type *alloc_resolve_elem_type(Checker *c, const char *name, uint32_t len)
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
  * Returns true if violation detected (error emitted). */
+/* BUG-810: the DETECTION half of check_volatile_strip, split out so every sink
+ * can ask the one question while keeping its own wording.
+ *
+ * The peel matters and is why the hand-rolled copies were wrong: a raw
+ * raw pointer-kind comparison is FALSE for `?*T`, so three sinks (call
+ * argument, return, spawn argument) skipped the check entirely whenever either
+ * side was optional-wrapped — and `can_implicit_coerce` happily converts
+ * `volatile *T -> ?*T`, while the emitter lowers a null-sentinel `?*T` to a bare
+ * non-volatile pointer. Measured: passing a `volatile *u32` to a `?*u32`
+ * parameter compiled clean, where the identical `*u32` parameter is rejected.
+ *
+ * Each side is peeled INDEPENDENTLY (the J2 rule): requiring BOTH sides optional
+ * misses the asymmetric wrap, which is the shape that actually occurs. */
+static bool volatile_strip_detected(Checker *c, Node *src_expr, Type *src_type,
+                                    Type *tgt_type) {
+    Type *seff = type_unwrap_distinct(src_type);
+    Type *teff = type_unwrap_distinct(tgt_type);
+    while (seff && type_dispatch_kind(seff) == TYPE_OPTIONAL)
+        seff = type_unwrap_distinct(seff->optional.inner);
+    while (teff && type_dispatch_kind(teff) == TYPE_OPTIONAL)
+        teff = type_unwrap_distinct(teff->optional.inner);
+    if (!seff || type_dispatch_kind(seff) != TYPE_POINTER) return false;
+    if (!teff || type_dispatch_kind(teff) != TYPE_POINTER) return false;
+    if (teff->pointer.is_volatile) return false;   /* target keeps volatile — ok */
+    if (seff->pointer.is_volatile) return true;
+    /* Symbol-level volatile: `volatile *u32 p` marks the SYMBOL, and a bare
+     * ident source carries the fact there rather than on the type. */
+    if (src_expr && src_expr->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope,
+            src_expr->ident.name, (uint32_t)src_expr->ident.name_len);
+        if (s && s->is_volatile) return true;
+    }
+    return false;
+}
+
 static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
                                   Type *tgt_type, int line, const char *context) {
     Type *seff = type_unwrap_distinct(src_type);
@@ -7243,20 +7302,13 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         /* BUG-263: volatile pointer → non-volatile param strips volatile.
                          * Check both type-level and symbol-level volatile. */
-                        if (arg->kind == TYPE_POINTER && param->kind == TYPE_POINTER &&
-                            !param->pointer.is_volatile) {
-                            bool arg_volatile = arg->pointer.is_volatile;
-                            if (!arg_volatile && node->call.args[i]->kind == NODE_IDENT) {
-                                Symbol *as = scope_lookup(c->current_scope,
-                                    node->call.args[i]->ident.name,
-                                    (uint32_t)node->call.args[i]->ident.name_len);
-                                if (as && as->is_volatile) arg_volatile = true;
-                            }
-                            if (arg_volatile) {
-                                checker_error(c, node->loc.line,
-                                    "argument %d: cannot pass volatile pointer to non-volatile parameter",
-                                    i + 1);
-                            }
+                        /* BUG-810: one shared query. The raw pointer-kind
+                         * comparison this replaces was FALSE for a `?*T`
+                         * parameter, so the check was skipped entirely. */
+                        if (volatile_strip_detected(c, node->call.args[i], arg, param)) {
+                            checker_error(c, node->loc.line,
+                                "argument %d: cannot pass volatile pointer to non-volatile parameter",
+                                i + 1);
                         }
                     }
                     /* const array → mutable slice coercion: check if arg var is const */
@@ -14066,21 +14118,13 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot return const slice as mutable — would allow writing to read-only memory");
                 }
                 /* BUG-281: volatile stripping on return */
-                if (ret_type->kind == TYPE_POINTER && c->current_func_ret->kind == TYPE_POINTER &&
-                    !c->current_func_ret->pointer.is_volatile) {
-                    /* check both type-level and symbol-level volatile */
-                    bool ret_volatile = ret_type->pointer.is_volatile;
-                    if (!ret_volatile && node->ret.expr->kind == NODE_IDENT) {
-                        Symbol *rs = scope_lookup(c->current_scope,
-                            node->ret.expr->ident.name,
-                            (uint32_t)node->ret.expr->ident.name_len);
-                        if (rs && rs->is_volatile) ret_volatile = true;
-                    }
-                    if (ret_volatile) {
-                        checker_error(c, node->loc.line,
-                            "cannot return volatile pointer as non-volatile — "
-                            "writes through result may be optimized away");
-                    }
+                /* BUG-810: one shared query — the raw kind test this replaces
+                 * was FALSE for a `?*T` return type. */
+                if (volatile_strip_detected(c, node->ret.expr, ret_type,
+                                            c->current_func_ret)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return volatile pointer as non-volatile — "
+                        "writes through result may be optimized away");
                 }
             }
 
@@ -15960,19 +16004,16 @@ static void check_stmt(Checker *c, Node *node) {
                         "spawn argument %d: cannot pass const pointer to mutable parameter",
                         i + 1);
                 }
-                /* volatile pointer → non-volatile param: reject */
-                if (arg_type->kind == TYPE_POINTER && param_type->kind == TYPE_POINTER &&
-                    !param_type->pointer.is_volatile) {
-                    bool arg_vol = arg_type->pointer.is_volatile;
-                    if (!arg_vol && node->spawn_stmt.args[i]->kind == NODE_UNARY &&
-                        node->spawn_stmt.args[i]->unary.op == TOK_AMP &&
-                        node->spawn_stmt.args[i]->unary.operand->kind == NODE_IDENT) {
-                        Symbol *as = scope_lookup(c->current_scope,
-                            node->spawn_stmt.args[i]->unary.operand->ident.name,
-                            (uint32_t)node->spawn_stmt.args[i]->unary.operand->ident.name_len);
-                        if (as && as->is_volatile) arg_vol = true;
-                    }
-                    if (arg_vol) {
+                /* volatile pointer → non-volatile param: reject.
+                 * BUG-810: one shared query. The outer raw kind test this
+                 * replaces was FALSE for a `?*T` parameter, skipping the check.
+                 * The `&ident` unwrap stays because spawn args are commonly `&g`,
+                 * where the volatile fact lives on the SYMBOL, not the type. */
+                {
+                    Node *sa = node->spawn_stmt.args[i];
+                    Node *sa_src = (sa && sa->kind == NODE_UNARY &&
+                                    sa->unary.op == TOK_AMP) ? sa->unary.operand : sa;
+                    if (volatile_strip_detected(c, sa_src, arg_type, param_type)) {
                         checker_error(c, node->loc.line,
                             "spawn argument %d: cannot pass volatile pointer to non-volatile parameter",
                             i + 1);

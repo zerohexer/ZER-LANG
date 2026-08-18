@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: cannot pass volatile pointer to non-volatile parameter
+// BUG-810, the OPTIONAL-WRAPPER axis. The call-argument, return and spawn-argument
+// sinks tested `->kind == TYPE_POINTER` on both sides, which is FALSE for `?*T`,
+// so the whole check was skipped — while `can_implicit_coerce` happily converts
+// `volatile *T -> ?*T` and the emitter lowers a null-sentinel `?*T` to a bare
+// non-volatile pointer. The identical `*u32` parameter has always been rejected.
+//
+// The shared helper check_volatile_strip already peels each side independently
+// (that is the J2 fix, applied to the var-decl and assignment sinks in 2026-08);
+// these three sinks hand-rolled the test instead of asking it. They ask it now.
+mmio 0x40020000..0x40020FFF;
+
+void clear_flag(?*u32 reg) { if (reg) |r| { *r = 0; } }
+
+u32 main() {
+    volatile *u32 sr = @inttoptr(volatile *u32, 0x40020004);
+    if (false) { clear_flag(sr); }   // never executed: the address is unmapped hosted
+    return 0;
+}

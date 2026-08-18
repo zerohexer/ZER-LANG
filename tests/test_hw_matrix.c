@@ -107,6 +107,24 @@ typedef enum {
     HW_SPAWN_IN_ISR,        /* spawn inside interrupt handler */
     HW_ISR_GLOBAL_NONVOLATILE, /* non-volatile global shared interrupt+main */
     HW_ISR_COMPOUND_RMW,    /* volatile global compound-assign shared ISR+main */
+    /* BUG-810 — the VOLATILE-STRIP SINK axis. "Does this store/pass drop
+     * `volatile`?" is asked at six value-flow sinks, and it drifted twice:
+     * three sinks tested a RAW `->kind == TYPE_POINTER`, which is FALSE for
+     * `?*T`, and the struct-literal sink had no qualifier check at all.
+     * Measured on the struct-literal form: three source-level MMIO stores
+     * compiled to ONE under -O2. A cell per sink, so a future sink cannot pick
+     * up half the question. */
+    HW_VOLATILE_STRIP_STRUCT_FIELD, /* volatile ptr into a plain-*T struct field */
+    HW_VOLATILE_STRIP_OPT_PARAM,    /* volatile ptr into a `?*T` parameter */
+    HW_VOLATILE_STRIP_OPT_RETURN,   /* volatile ptr out through a `?*T` return */
+    /* MASKED, and recorded as such rather than counted as coverage: the
+     * spawn sink rejects this shape anyway via "cannot pass non-shared
+     * pointer/slice to spawn", so the cell passed on a pre-fix build too. It
+     * is kept because the spawn sink shares the unified query and a future
+     * relaxation of the non-shared rule must not silently reopen the
+     * qualifier hole — but only the three cells above are evidence that
+     * BUG-810 was live. */
+    HW_VOLATILE_STRIP_OPT_SPAWN,    /* volatile ptr into a `?*T` spawn parameter */
     /* POSITIVE — structurally-valid hardware access (must compile) */
     HW_MMIO_OK,             /* @inttoptr in range, aligned, volatile */
     HW_POOL_IN_ISR_OK,      /* pool.alloc() in interrupt (Pool is ISR-safe) */
@@ -120,6 +138,8 @@ static int scenario_is_negative(HWScenario s) {
         case HW_MMIO_NO_DECL: case HW_MMIO_OOB: case HW_MMIO_MISALIGNED:
         case HW_VOLATILE_STRIP: case HW_SLAB_IN_ISR: case HW_SPAWN_IN_ISR:
         case HW_ISR_GLOBAL_NONVOLATILE: case HW_ISR_COMPOUND_RMW:
+        case HW_VOLATILE_STRIP_STRUCT_FIELD: case HW_VOLATILE_STRIP_OPT_PARAM:
+        case HW_VOLATILE_STRIP_OPT_RETURN: case HW_VOLATILE_STRIP_OPT_SPAWN:
             return 1;
         case HW_MMIO_OK: case HW_POOL_IN_ISR_OK: case HW_ATOMIC_GLOBAL_OK:
         case HW_ISR_VOLATILE_OK:
@@ -139,6 +159,10 @@ static const char *scen_name(HWScenario s) {
         case HW_SPAWN_IN_ISR:           return "spawn-in-isr";
         case HW_ISR_GLOBAL_NONVOLATILE: return "isr-global-nonvolatile";
         case HW_ISR_COMPOUND_RMW:       return "isr-compound-rmw";
+        case HW_VOLATILE_STRIP_STRUCT_FIELD: return "volatile-strip-struct-field";
+        case HW_VOLATILE_STRIP_OPT_PARAM:    return "volatile-strip-opt-param";
+        case HW_VOLATILE_STRIP_OPT_RETURN:   return "volatile-strip-opt-return";
+        case HW_VOLATILE_STRIP_OPT_SPAWN:    return "volatile-strip-opt-spawn";
         case HW_MMIO_OK:                return "mmio-in-range-aligned";
         case HW_POOL_IN_ISR_OK:         return "pool-in-isr-ok";
         case HW_ATOMIC_GLOBAL_OK:       return "atomic-global-ok";
@@ -173,6 +197,33 @@ static void gen(HWScenario s, char *buf, size_t n) {
                 "void f() { volatile *u32 r = @inttoptr(*u32, 0x40000000);\n"
                 "    *u32 plain = @ptrcast(*u32, r); plain[0] = 1; }\n"
                 "u32 main() { return 0; }\n");
+            break;
+        case HW_VOLATILE_STRIP_STRUCT_FIELD:
+            snprintf(buf, n,
+                "mmio 0x40000000..0x40000FFF;\n"
+                "struct U { *u32 dr; }\n"
+                "U g_u;\n"
+                "u32 main() { g_u = { .dr = @inttoptr(*u32, 0x40000000) }; return 0; }\n");
+            break;
+        case HW_VOLATILE_STRIP_OPT_PARAM:
+            snprintf(buf, n,
+                "mmio 0x40000000..0x40000FFF;\n"
+                "void clr(?*u32 p) { if (p) |q| { *q = 0; } }\n"
+                "u32 main() { volatile *u32 r = @inttoptr(volatile *u32, 0x40000000);\n"
+                "    if (false) { clr(r); } return 0; }\n");
+            break;
+        case HW_VOLATILE_STRIP_OPT_RETURN:
+            snprintf(buf, n,
+                "mmio 0x40000000..0x40000FFF;\n"
+                "?*u32 get() { return @inttoptr(volatile *u32, 0x40000000); }\n"
+                "u32 main() { return 0; }\n");
+            break;
+        case HW_VOLATILE_STRIP_OPT_SPAWN:
+            snprintf(buf, n,
+                "mmio 0x40000000..0x40000FFF;\n"
+                "void wk(?*u32 p) { if (p) |q| { *q = 1; } }\n"
+                "u32 main() { volatile *u32 r = @inttoptr(volatile *u32, 0x40000000);\n"
+                "    if (false) { spawn wk(r); } return 0; }\n");
             break;
         case HW_SLAB_IN_ISR:
             snprintf(buf, n,

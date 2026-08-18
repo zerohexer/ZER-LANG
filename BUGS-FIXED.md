@@ -543,6 +543,52 @@ Tests: `tests/zer_fail/leak_both_arms_return.zer` and
 the two sweeps held independent copies of the tagging bug and a fix to one would
 not have moved the other. Both produce ZERO diagnostics on a from-HEAD build.
 
+### BUG-810 — `volatile` stripped at four of six value-flow sinks (HIGH, bare-metal silent)
+
+**Found by this audit.** "Does this store/pass drop `volatile`?" is asked at six
+value-flow sinks, and it had drifted in two independent ways:
+
+| sink | before |
+|---|---|
+| var-decl, assignment | correct (they call the shared helper, which peels each side independently — the J2 fix) |
+| call argument, return, spawn argument | hand-rolled a RAW pointer-kind comparison, which is FALSE for `?*T` — so the whole check was skipped whenever either side was optional-wrapped |
+| struct-literal field | **no qualifier check at all** — `validate_struct_init` had only a type-compat test, and `type_equals` deliberately ignores `pointer.is_volatile` |
+
+The optional axis is reachable because `can_implicit_coerce` converts
+`volatile *T -> ?*T`, and the emitter lowers a null-sentinel `?*T` to a bare
+non-volatile pointer — so the qualifier is gone in the emitted C while the
+identical `*T` form has always been rejected.
+
+**Measured consequence, in generated assembly.** With
+
+```zer
+struct Uart { *u32 dr; }          // plain *u32 field
+g_uart = { .dr = @inttoptr(*u32, 0x40020004) };
+```
+
+three source-level stores through `g_uart.dr` compiled to a SINGLE store under
+`-O2`. Two peripheral writes silently gone: no compile error, and on the target
+no fault either — the device just never sees them. On a UART data register that
+is two dropped characters; on a write-1-to-clear status register it is an
+interrupt that is never acknowledged.
+
+Fixed by splitting the DETECTION half out of the existing `check_volatile_strip`
+(`volatile_strip_detected`) so every sink asks the one question while keeping its
+own wording, and routing all four sinks through it. The spawn sink keeps its
+`&ident` unwrap, because spawn args are commonly `&g` where the volatile fact
+lives on the SYMBOL rather than the type.
+
+Corpus cost ZERO. Gate: four new cells in `tests/test_hw_matrix.c` (30 -> 34
+cells), one per sink. Verified NON-VACUOUS: **3 false negatives** against a
+from-HEAD build, 0 after. The fourth cell (spawn) passed on both, because the
+spawn sink already rejects that shape via "cannot pass non-shared pointer/slice
+to spawn" — it is annotated as MASKED in the matrix source rather than counted as
+evidence, and kept only so a future relaxation of the non-shared rule cannot
+silently reopen the qualifier hole.
+
+Tests: `tests/zer_fail/volatile_strip_{struct_literal_field,optional_param,
+optional_return}.zer`, each producing ZERO diagnostics on the pre-fix compiler.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

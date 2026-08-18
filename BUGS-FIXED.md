@@ -5,6 +5,240 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-18 — full-codebase audit: 7 fixes (BUG-796..802), 3 found here
+
+Two of the seven were found by this audit and were in NO ledger; five close the
+HIGH rows the 2026-08-17 harvest left open. All seven were verified LIVE on main
+before any code was written, and every new test was verified DISCRIMINATING
+against a from-HEAD `git archive` build, so none of them is vacuous.
+
+`make check` exit **0** — 1250 .zer tests, all ten matrices, sink matrix 64 ok /
+0 mismatch, every audit reached and green.
+
+### BUG-796 — the DEREFERENCE IDENTITY boundary: three axes at once (HIGH, accept-unsafe)
+
+Reading a value out of `*p` yields a copy the analyzer cannot connect back to any
+allocation — in the IR it is a UNOP temp carrying no handle. BUG-781/782 had closed
+three SINKS for ONE form and ONE type; the predicate still required a bare-ident
+operand and a pointer result, so THREE axes were open simultaneously:
+
+| axis | what slipped |
+|---|---|
+| FORM | `*h.pp`, `**ppp`, `*factory()` — anything but a bare ident |
+| TYPE | move-struct ownership (HOLE-A4, open since 2026-07), `Handle` allocation |
+| SINK | the call argument — `pool.free(*p)`, `consume(*p)` |
+
+Measured before the fix: `*Node k = *h.pp` COMPILED, RAN, returned a read of freed
+memory and then double-freed. `Tok b = *p` double-consumed one resource. A callee
+freeing `*p` records NOTHING in its frees-param summary (the freed thing is an IR
+temp, not the param local), so the caller's own free is an unflagged double free —
+which mangles the pool generation counter, so a later `get()` on the reused slot
+silently returns the WRONG object.
+
+Fix: ONE type-driven predicate, `deref_identity_launder`, asking the TYPEMAP for the
+operand type so every operand form is covered uniformly and a new expression kind
+cannot reopen the hole; it rejects when the dereference YIELDS an alias, a Handle or
+move ownership. The three value-binding sinks moved to run AFTER `check_expr` (the
+typemap must be populated), and the call-argument sink was added — deliberately
+NARROWER there: only Handle/move results are refused, because a plain pointer read
+out of a deref is a borrow for the duration of the call, not a transfer. New
+`type_carries_move` is the third sibling of `type_carries_data_pointer` /
+`type_carries_handle`, with its leaf test delegating to the VST-verified pair in
+`src/safety/move_rules.c` so "what counts as a move type" keeps one definition.
+
+Corpus cost measured at ZERO (1250 .zer tests, all matrices).
+Tests: `tests/zer_fail/deref_identity_{field_operand,handle_arg,handle_copy,move_copy}.zer`,
+boundary `tests/zer/deref_scalar_ok.zer` (scalar and struct-VALUE copies through
+field / index / call-result operands must keep compiling).
+`tests/zer_fail/sneak_free_via_deref.zer` had been VACUOUS since 2026-04: its header
+claimed a use-after-free but it was passing on a LEAK diagnostic — a symptom of the
+very hole it documents. Expectation corrected.
+
+### BUG-797 — `arena.alloc_slice` size-overflow guard was DEAD CODE (HIGH, silent OOB)
+
+**Found by this audit.** BUG-266 added `__builtin_mul_overflow` around `sizeof(T)*n`
+in 2026 — on the AST emission path only. Function bodies have been IR-ONLY since
+2026-04-19, so the guard has been unreachable ever since and the IR twin multiplied
+raw. Measured: with a 1024-byte arena, `alloc_slice(Big, 0x2000000000000000)` wrapped
+the byte count to 0, the zero-size bump succeeded, and the caller received a slice
+reporting **2305843009213693952** elements. Every later bounds check then passes — it
+compares against the bogus length — so every access through that slice is an
+unchecked OOB. Silent at compile time and silent at run time. On a 32-bit target
+(ZER's default `usize`) a plain `u32` count reaches the same wrap.
+
+This is the AST→IR emission diff class (CLAUDE.md "AST→IR emission diff audit"), and
+`__builtin_mul_overflow` was NOT on that section's grep list. It is now.
+
+Also hardened `_zer_arena_alloc` itself: both `offset + align - 1` and `off + size`
+could wrap, and a wrap makes the capacity test PASS for a request that does not fit.
+Both are now compared against the capacity before any addition that can overflow.
+
+Test: `tests/zer/arena_alloc_slice_size_overflow.zer` — VALUE-asserting, because an
+overflowing request is a runtime condition whose correct outcome is a failed
+allocation, not a diagnostic. Verified exit 1 on a pre-fix build, exit 0 after.
+
+### BUG-798 — comparing two aggregates was silently ALWAYS FALSE (MEDIUM, miscompile)
+
+**Found by this audit.** `a == b` on two structs compiled with ZERO diagnostics and
+the IR emitter answered with a literal `0` plus the comment "struct/union compare
+unsupported". So `a == b` was always false — and so was `a != b`, which is the tell
+that the emitted value is a placeholder rather than an answer. Wrong branch taken,
+no compile error, no trap.
+
+The checker already rejected the SLICE and ARRAY forms of exactly this rule ("C
+compares struct/pointer, not content"); struct and union were simply left out of
+that list — one question, N type kinds, two kinds missed. Per the ban-decision
+framework this needs a type-system feature ZER does not have, so the ban is the
+correct verdict; C rejects aggregate `==` for the same reason (padding bytes make a
+byte-wise answer meaningless). All SIX comparison operators are covered, not just
+`==`/`!=`: the emitter's placeholder branch keys on the operand TYPE, not the
+operator, so `a < b` was silently `0` too. The emitter fallback is now LOUD
+(stderr + `_zer_trap`) rather than a silent `0`.
+
+Corpus cost ZERO. Tests: `tests/zer_fail/struct_compare_silent_false.zer`,
+`tests/zer_fail/union_compare_ordering.zer`.
+
+### BUG-799 — a provably-OOB index compiled to a SILENT early return (HIGH, bare-metal)
+
+`u32 i = 10; arr[i] = 1;` on a `u32[4]`. VRP knows i is exactly 10 and the array
+holds 4, so the access can never be in bounds. The compiler warned that the index
+was "not proven in range" — the wrong verdict, it WAS proven, proven WRONG — and
+fell into the auto-guard, whose runtime form is `if (i >= 4) { return <zero>; }`. So
+the program compiled, ran, skipped the store AND everything after it in the
+function. Silent at both ends. On bare metal an init routine just stops half-way.
+
+One question, five sinks, two of them wrong: `array[literal]`, `array[call()]` and
+`mmio[literal]` all had the ALWAYS-OOB arm; `array[ident]` had none, and
+`mmio[ident]` had NEITHER arm — so a provably in-range MMIO index also paid for a
+guard it did not need.
+
+Fixed with ONE query, not N call sites: `index_range_verdict()` returns
+IN_BOUNDS / ALWAYS_OOB / UNKNOWN and both ident sinks call it, so a future sink gets
+both directions by construction. An EMPTY range returns UNKNOWN — `push_var_range`
+INTERSECTS, so contradictory narrowings leave min > max and that region is
+unreachable; diagnosing it would reject legal dead code. That is the one guard
+keeping the new error arm free of false positives.
+
+Four positive tests were rejected and every one was a malformed probe, not a false
+positive: each used a "wild" helper returning a CONSTANT, which `find_return_range`
+derives as a singleton, and `async_auto_guard`'s "defeat VRP" trick fails because
+the loop-body JOIN of [5,5] with [5,5] is still [5,5]. They now read a mutable
+global, so each still exercises its own mechanism. A `test_emit.c` case had gone
+further and codified the bug AS the contract ("auto-guard: idx=10 >= 4 → function
+returns 0 before access"); it now asserts the rejection, with a separate case
+keeping auto-guard coverage for a genuinely unprovable index.
+
+`tests/zer_gaps/prec1_vrp_literal_i.zer` had recorded this exact shape since the
+2026-04-19 audit, filed as "just a precision/message difference"; the inverted gap
+harness is what turned the fix into a loud "promote me". Promoted to
+`tests/zer_fail/bounds_ident_always_oob.zer` (+ `_negative_idx`, `mmio_ident_always_oob`),
+with `tests/zer/bounds_ident_proven_ok.zer` as the elision boundary.
+
+### BUG-800 — `volatile` laundered off through @ptrtoint → @inttoptr (HIGH, bare-metal)
+
+```
+volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+usize a  = @ptrtoint(reg);      // the qualifier leaves the type system
+*u32 p   = @inttoptr(*u32, a);  // ... and does not come back
+*p = 1; *p = 2;                 // -O2 coalesces; the peripheral misses a write
+```
+
+The DIRECT strip `(*u32)reg` has always been an error; this round trip was the way
+around it. Filed LOW originally as "audit-visible because both intrinsics are
+explicit" — but what is visible at the use site is the round trip, not the qualifier
+loss, and the consequence is a device that silently never sees a store. Silent at
+BOTH ends: no compile error, and on bare metal no fault either.
+
+Fixed on the `is_packed_derived` rails: a Model-2 `Symbol.is_volatile_addr` set
+where a var-decl binds `@ptrtoint(<volatile ptr>)`, consumed at the `@inttoptr` sink
+when the requested pointer type is not volatile. BOTH shapes closed in the same
+change — inline, and through a local — since closing only whichever shape the
+reproducer used is how this class keeps coming back. Purely a TIGHTENING: a shape
+the propagation cannot follow just produces no diagnostic, so it can never accept
+something previously rejected.
+
+Tests: `tests/zer_fail/volatile_launder_ptrtoint_{inline,roundtrip}.zer`, boundary
+`tests/zer/volatile_ptrtoint_roundtrip_ok.zer`. The gap file
+`tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer` reported itself CLOSED —
+the inverted gap harness working exactly as designed — and was promoted.
+
+### BUG-801 — `@inttoptr` into a declared mmio range did not require `volatile` (HIGH, bare-metal)
+
+Measured: `*u32 reg = @inttoptr(*u32, 0x40020014); reg[0]=1; reg[0]=2; return reg[0];`
+compiled with ZERO diagnostics and GCC -O2 emitted a SINGLE store plus a
+constant-folded read — the first peripheral write silently deleted, the status read
+never performed. Every other mmio machine (range, alignment, span, index bound,
+variable-address trap) passed; the one qualifier that makes MMIO actually work was
+optional. Invisible on hosted x86-64 (no peripheral) and invisible at runtime on the
+target — nothing traps, the code simply does not do what was written.
+
+Fixed at the INTRINSIC rather than at each binding sink: making the result type
+volatile routes every sink through the qualifier machinery that already exists
+("cannot initialize non-volatile pointer from volatile"), instead of adding an
+N-site volatile check that the next sink would be missing from. SCOPED to a CONSTANT
+address inside a declared mmio range — that is unambiguously a peripheral register.
+A VARIABLE address is left alone because `@ptrtoint(&x)` + arithmetic + `@inttoptr`
+is the documented stand-in for pointer arithmetic on ordinary memory, and forcing
+volatile there would make the round trip unusable. The documented form
+`volatile *u32 reg = @inttoptr(*u32, ADDR)` is unaffected — the TYPE ARGUMENT stays
+unqualified, as every example writes it.
+
+Residual, deliberately documented rather than papered over: a COMPUTED peripheral
+address (base + offset) is still not required to be volatile. See
+`docs/limitations.md`.
+
+Test: `tests/zer_fail/mmio_inttoptr_nonvolatile.zer`.
+
+### BUG-802 — a comptime function folded to a DIFFERENT value than the same expression at runtime (MEDIUM, miscompile)
+
+**Found by this audit.**
+
+```
+comptime u32 shifted(u32 a) { return (a * 4) >> 3; }
+shifted(4000000000)   ->  2000000000   (host int64: 16e9 >> 3)
+runtime (a * 4) >> 3  ->   389387264   (u32: 16e9 wraps to 3115098112 first)
+```
+
+Compile-time and runtime both "succeeded" and disagreed — no diagnostic, no trap,
+wrong constant burned into the emitted C. The evaluator computed in host int64 and
+masked only the FINAL result, which cannot fix it: `>>`, `/` and `%` read the bits
+the overflow already discarded.
+
+The fix wraps after every operation that can LEAVE the declared width
+(`+ - * << ~` and unary `-`), which is exactly ZER's defined semantics ("integer
+overflow wraps, never UB"). Comparisons and the bit ops that cannot widen an
+in-range operand are left alone. Width comes from the comptime function's RETURN
+type; when it cannot be determined the width is 0 and nothing is masked, i.e. the
+old behaviour, so an unknown form can only fail to improve, never break.
+
+Multi-site discipline: the width is established at ALL THREE comptime-folding sinks
+in the same change — the `check_expr` NODE_CALL sink (the one that substitutes a
+value into emitted code), `eval_comptime_call_subst` (nested calls), and the
+array-size sink inside `resolve_type`. The first attempt set it only in
+`eval_comptime_call_subst` and a one-line trace proved that function was never
+REACHED for the reproducer — CLAUDE.md's "print whether it runs before theorising
+about why it doesn't", earning its place again.
+
+Test: `tests/zer/comptime_width_wrap_agreement.zer` — six comptime/runtime pairs
+that must agree, plus two in-range foldings that must be unchanged. Verified exit 1
+on a pre-fix build.
+
+### Tech debt paid
+
+- **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was
+  permanently dirty after any `make check`: the runners build an exe next to each
+  `.zer` (the `zerc -o` gotcha CLAUDE.md already documents) and `rust_tests/` never
+  cleaned up, while the negative-test branch of `tests/test_zer.sh` removed only the
+  `.c`. Both runners now clean up, and `.gitignore` uses per-directory allow-list
+  patterns (ignore everything, un-ignore `*.zer`/`*.sh`/`*.md`) so a future artifact
+  cannot be added by accident. Verified file-by-file that every removed path is an
+  ELF binary, that all 2187 tracked `.zer` sources are intact, and that
+  `git ls-files | git check-ignore --stdin` is empty.
+- Three dead functions removed (`has_atomic_or_barrier`, `find_shared_root_in_stmt`,
+  `ir_classify_method_call`) and two live warnings fixed. Details below.
+
+---
+
 ## Session 2026-08-17 — five STRUCTURAL fixes: BUG-791..795 (26 accept-unsafe holes)
 
 Harvested from seven `claude/*` audit branches. The bugs were NOT independent: of

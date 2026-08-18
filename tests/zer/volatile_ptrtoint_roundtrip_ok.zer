@@ -1,0 +1,27 @@
+// The over-rejection boundary for the volatile-laundering rule (2026-08-16).
+// A round trip that KEEPS volatile is fine, and a round trip on a NON-volatile
+// address is untouched — the rule must key on the qualifier, not on the mere
+// presence of @ptrtoint/@inttoptr.
+//
+// Nothing here dereferences an MMIO address: reading 0x40020010 on a hosted
+// host would trap. The addresses are formed and discarded, which is all this
+// test needs to observe.
+mmio 0x40020000..0x40020FFF;
+
+u32 keeps_volatile() {
+    volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+    usize a = @ptrtoint(reg);
+    volatile *u32 back = @inttoptr(volatile *u32, a);
+    usize b = @ptrtoint(back);
+    if (b != a) { return 1; }
+    return 0;
+}
+
+u32 plain_roundtrip() {
+    u32 x = 7;
+    usize a = @ptrtoint(&x);
+    if (a == 0) { return 2; }
+    return 0;
+}
+
+u32 main() { return keeps_volatile() + plain_roundtrip(); }

@@ -1515,7 +1515,8 @@ static bool ir_name_looks_like_destructor(const char *name, uint32_t len) {
 }
 
 /* Check if a call is to a function that frees its first argument.
- * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
+ * Either explicitly named "free" OR a bodyless void fn whose first param is
+ * a pointer or an opaque pointer
  * param (signature heuristic — catches destroy/close/cleanup patterns)
  * OR bodyless non-void fn whose name matches a destructor convention
  * (Gap 17 / AUDIT 2026-06-06 GAP-D — catches `i32 destroy_resource(*R)`). */
@@ -1527,7 +1528,7 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     /* Explicit "free" */
     if (callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0) return true;
-    /* Signature heuristic: bodyless fn(*opaque/*T ...).
+    /* Signature heuristic: a bodyless fn taking a pointer or opaque first param.
      * Void return: always free-classified.
      * Non-void return: free-classified only if name looks like a destructor. */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
@@ -1702,12 +1703,14 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
-/* Backward-compat wrapper for callsites that don't have Checker handy.
- * Without checker, receiver-type validation is skipped (current behavior).
- * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
-static IRMethodKind ir_classify_method_call(Node *call) {
-    return ir_classify_method_call_ex(NULL, call);
-}
+/* ir_classify_method_call() was DELETED 2026-08-18. It was the no-Checker
+ * backward-compat wrapper kept during the Gap-32 migration, which CLAUDE.md
+ * already said to 'deprecate as you go' — every call site now passes a Checker
+ * and uses ir_classify_method_call_ex, so the wrapper had no callers left. It
+ * mattered that it went: without a Checker the receiver-TYPE validation is
+ * skipped, so any surviving use would silently classify a user method named
+ * `alloc`/`free` as a builtin allocator call. */
+
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
@@ -6215,7 +6218,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         func->ast_node->kind == NODE_FUNC_DECL) {
         fprintf(stderr, "ZCIR: building=%d fn='%.*s' pc=%d blocks=%d sumcount=%d\n",
             zc->building_summary,
-            func->ast_node->func_decl.name_len,
+            /* `%.*s` takes an int precision; name_len is a size_t, and passing it
+             * raw is undefined at the varargs boundary (it worked by ABI luck). */
+            (int)func->ast_node->func_decl.name_len,
             func->ast_node->func_decl.name ? func->ast_node->func_decl.name : "?",
             func->ast_node->func_decl.param_count, func->block_count,
             zc->summary_count);

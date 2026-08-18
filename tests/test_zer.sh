@@ -133,7 +133,12 @@ for f in tests/zer_fail/*.zer; do
         echo "  FAIL: $name (should have been rejected but compiled!)"
     fi
     rm -f /tmp/_zer_neg_err.txt 2>/dev/null
-    rm -f "${f%.zer}.c" 2>/dev/null
+    # `-o /dev/null` is a non-.c path, so zerc builds the exe NEXT TO THE SOURCE
+    # (CLAUDE.md "zerc -o gotchas") — same note the gap loop below already
+    # carries. This branch cleaned only the .c, which is how three executables
+    # ended up committed under tests/zer_fail/: a negative that gets past the
+    # checker and is rejected later still leaves a binary behind.
+    rm -f "${f%.zer}.c" "${f%.zer}.exe" "${f%.zer}" 2>/dev/null
 done
 
 echo ""

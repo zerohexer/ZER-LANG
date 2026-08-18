@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: has no defined ordering
+// BUG-798 — comparing two aggregates compiled with ZERO diagnostics and the IR
+// emitter answered with a literal `0` plus a comment ("struct/union compare
+// unsupported"). So `a == b` was ALWAYS false — and `a != b` was ALSO always
+// false, which is the tell that the emitted value is a placeholder rather than
+// an answer. Wrong branch taken, no compile error, no trap.
+//
+// The checker already rejected the SLICE and ARRAY forms of exactly this rule
+// ("C compares struct/pointer, not content"); struct and union were simply left
+// out of that list — one question, N type kinds, two kinds missed.
+//
+// The emitter's placeholder branch keys on the operand TYPE, not the operator,
+// so `<` `>` `<=` `>=` were silently `0` as well; the rule covers all six.
+struct P { u32 x; u32 y; }
+
+u32 main() {
+    P a; a.x = 1; a.y = 2;
+    P b; b.x = 1; b.y = 2;
+    if (a == b) { return 0; }
+    return 1;
+}

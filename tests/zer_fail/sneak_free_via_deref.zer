@@ -1,8 +1,20 @@
-// Gap 41 negative test (2026-04-27, Stage 2): function that frees a
-// handle via pointer-deref alias (Handle k = *p; free(k);) must propagate
-// to the param's frees_param summary. Caller using h after sneak_free(&h)
-// is then a use-after-free.
-// EXPECTED: zercheck use-after-free error
+// EXPECTED: compile error
+// expect-error: obtained by dereferencing a pointer
+// Gap 41 negative test (2026-04-27, Stage 2): a function that frees a handle via a
+// pointer-deref alias (`Handle k = *p; free(k);`).
+//
+// VACUOUS UNTIL 2026-08-15 — read this before changing the expectation. The header
+// used to claim "EXPECTED: zercheck use-after-free error", but the file was passing
+// on a LEAK diagnostic ("handle %0 allocated ... but never freed"): the deref-alias
+// free was never propagated to the param's frees_param summary, so the analyzer did
+// not know sneak_free() frees anything — which is the very gap the test claims to
+// cover. The leak error IS a symptom of the hole, so the test looked green while the
+// double-free/UAF it documents passed silently.
+//
+// Now rejected by the deref-identity rule (BUG-785): binding a Handle read out of a
+// dereference is refused outright, because the analyzer cannot prove which allocation
+// it owns. The teachable restructure is to take the Handle BY VALUE
+// (`void sneak_free(Handle(Task) h)`), which the frees_param summary does track.
 struct Task { u32 id; }
 
 Pool(Task, 4) tasks;

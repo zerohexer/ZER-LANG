@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: obtained by dereferencing a pointer to a pointer
+// BUG-785 — the Handle facet. A callee that frees a handle it read out of a
+// `*Handle(T)` param records NOTHING in its frees-param summary (the freed thing
+// is an IR temp, not the param local), so the caller's own free is an unflagged
+// DOUBLE FREE of the same pool slot — which mangles the generation counter and
+// makes a later get() on the reused slot return the WRONG object silently.
+struct Task { u32 id; }
+Pool(Task, 4) tasks;
+
+void sneak_free(*Handle(Task) p) {
+    Handle(Task) k = *p;    // handle copied out of a deref — was accepted
+    tasks.free(k);
+}
+
+u32 main() {
+    ?Handle(Task) mh = tasks.alloc();
+    Handle(Task) h = mh orelse return;
+    sneak_free(&h);
+    tasks.free(h);          // double free
+    return 0;
+}

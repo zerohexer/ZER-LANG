@@ -648,45 +648,14 @@ static void emit_auto_guards(Emitter *e, Node *node) {
 
 static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
 
-/* Find shared struct variable accessed in a statement or expression.
- * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
- * Used to auto-insert lock/unlock around statements. */
-static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_root(e, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
-    case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Node *r = find_shared_root(e, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
-     * cond/init/expr that could read a shared struct. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return NULL;
-    }
-    return NULL;
-}
+/* find_shared_root_in_stmt() was DELETED 2026-08-18 — dead since the per-statement
+ * lock model moved into ir_lower.c (`current_stmt_shared_root`). It was an
+ * emitter-side second answer to 'which shared struct does this statement touch?',
+ * and a WEAKER one: a partial switch over statement kinds against the lowerer's
+ * exhaustive walk. A dead duplicate of a safety question is the multi-site drift
+ * CLAUDE.md warns about, so it is removed rather than left to rot. find_shared_root
+ * (the EXPRESSION-level helper it called) is still live and stays. */
+
 
 static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
@@ -757,49 +726,11 @@ static bool shared_is_rw(Type *t) {
     return false;
 }
 
-/* Check if a statement WRITES to a shared struct (vs read-only).
- * Write = assignment target, compound assign, mutating method call.
- * Used to determine rdlock vs wrlock for shared(rw) structs. */
-static bool stmt_writes_shared(Node *stmt) {
-    if (!stmt) return false;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT:
-        /* x.field = ...; or x.field += ...; */
-        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_ASSIGN)
-            return true;
-        /* Method calls that mutate (push, free, etc.) */
-        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_CALL)
-            return true; /* conservative: any call might mutate */
-        return false;
-    case NODE_VAR_DECL:
-        return false; /* reading into a variable is read-only */
-    case NODE_RETURN:
-        return false; /* reading for return */
-    /* Stage 2 Part B (2026-04-28): exhaustive — only EXPR_STMT/VAR_DECL/
-     * RETURN distinguish read-vs-write at the statement level. Other
-     * kinds either don't access shared (block, control flow) or are
-     * handled per-cond elsewhere. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
-    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_BREAK:
-    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
-    case NODE_AWAIT: case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
+/* stmt_writes_shared() was DELETED 2026-08-18 — dead alongside
+ * find_shared_root_in_stmt above, and for the same reason: the per-statement
+ * shared-lock decision moved into ir_lower.c. Left in place it was a second,
+ * unreachable answer to 'does this statement write a shared struct?'. */
+
 
 /* Emit lock acquire for shared struct variable.
  * For shared(rw) structs, is_write determines rdlock vs wrlock. */
@@ -4364,46 +4295,16 @@ static void add_async_local(Emitter *e, const char *name, size_t name_len) {
     e->async_local_count++;
 }
 
-/* BUG-490: collect local variable declarations RECURSIVELY from all blocks.
- * Sub-block locals must be promoted to state struct — they live on the C stack
- * which is destroyed on yield. Same fix as Rust's MIR generator transform. */
-static void collect_async_locals(Emitter *e, Node *node) {
-    if (!node) return;
-    if (node->kind == NODE_VAR_DECL && !node->var_decl.is_static) {
-        add_async_local(e, node->var_decl.name, node->var_decl.name_len);
-    }
-    if (node->kind == NODE_BLOCK) {
-        for (int i = 0; i < node->block.stmt_count; i++)
-            collect_async_locals(e, node->block.stmts[i]);
-    }
-    if (node->kind == NODE_IF) {
-        /* Async capture promotion: if (opt) |val| introduces implicit local 'val'.
-         * Must be promoted to state struct — lives on C stack, invalid after yield. */
-        if (node->if_stmt.capture_name) {
-            add_async_local(e, node->if_stmt.capture_name,
-                            node->if_stmt.capture_name_len);
-        }
-        collect_async_locals(e, node->if_stmt.then_body);
-        collect_async_locals(e, node->if_stmt.else_body);
-    }
-    if (node->kind == NODE_FOR) {
-        collect_async_locals(e, node->for_stmt.init);
-        collect_async_locals(e, node->for_stmt.body);
-    }
-    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE)
-        collect_async_locals(e, node->while_stmt.body);
-    if (node->kind == NODE_SWITCH) {
-        /* Switch arm captures in async deferred to v0.4 (type resolution complex) */
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            collect_async_locals(e, node->switch_stmt.arms[i].body);
-    }
-    if (node->kind == NODE_DEFER)
-        collect_async_locals(e, node->defer.body);
-    if (node->kind == NODE_CRITICAL)
-        collect_async_locals(e, node->critical.body);
-    if (node->kind == NODE_ONCE)
-        collect_async_locals(e, node->once.body);
-}
+/* collect_async_locals() was DELETED 2026-08-18. BUG-490's concern (a local
+ * declared in a SUB-BLOCK of an async function lives on the C stack, which is
+ * destroyed at a yield, so it must be promoted to the state struct) is now
+ * handled STRUCTURALLY rather than by this recursive AST walk: IR lowering
+ * flattens every local at every nesting depth into func->locals[], and
+ * emit_async_func_from_ir registers all of them. That is strictly stronger — a
+ * nesting shape this walker forgot to descend cannot exist in the flat list.
+ * Verified before removal with tests/zer/async_subblock_local_survives_yield.zer,
+ * which reads a sub-block local AFTER a yield and requires its value intact. */
+
 
 /* Check if an ident name is an async-promoted local */
 static bool is_async_local(Emitter *e, const char *name, size_t len) {
@@ -5739,8 +5640,18 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { uint8_t *buf; size_t capacity; size_t offset; } _zer_arena;\n\n");
 
     emit(e, "static inline void *_zer_arena_alloc(_zer_arena *a, size_t size, size_t align) {\n");
+    /* BUG-797: both address computations here can WRAP, and a wrap makes the
+     * capacity test pass for a request that does not fit. `off + align - 1`
+     * wraps when offset is near SIZE_MAX; `off + size` wraps for a large size
+     * (which `alloc_slice` can still produce legitimately after its own overflow
+     * guard — e.g. sizeof(T)=1, n=SIZE_MAX-8). Both are checked against the
+     * capacity BEFORE the addition rather than after, so no arithmetic that can
+     * wrap ever feeds the decision. Failure returns null, the same signal an
+     * exhausted arena already gives, so callers need no change. */
+    emit(e, "    if (align == 0) align = 1;\n");
+    emit(e, "    if (a->offset > (size_t)-1 - (align - 1)) return (void*)0;\n");
     emit(e, "    size_t off = (a->offset + align - 1) & ~(align - 1);\n");
-    emit(e, "    if (off + size > a->capacity) return (void*)0;\n");
+    emit(e, "    if (off > a->capacity || size > a->capacity - off) return (void*)0;\n");
     emit(e, "    a->offset = off + size;\n");
     emit(e, "    memset(a->buf + off, 0, size);\n");
     emit(e, "    return a->buf + off;\n");
@@ -6198,9 +6109,25 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
             if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
                 emit(e,"({size_t _zer_an%d=",t); BA(1); emit(e,";");
-                emit(e,"uint8_t *_zer_ap%d=(uint8_t*)_zer_arena_alloc(&%.*s,",t,(int)ol,on);
-                /* sizeof(T)*n */
-                emit(e,"sizeof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,")*_zer_an%d,",t);
+                /* BUG-797: the `sizeof(T)*n` SIZE-OVERFLOW guard. BUG-266 added
+                 * `__builtin_mul_overflow` here, but only on the AST path
+                 * (emitter.c ~2279) — and function bodies have been IR-ONLY
+                 * since 2026-04-19, so the guard has been DEAD CODE and this
+                 * path multiplied raw. Measured live: with a 1024-byte arena,
+                 * `alloc_slice(Big, 0x2000000000000000)` wrapped the byte count
+                 * to 0, the zero-size bump succeeded, and the caller got a slice
+                 * claiming 2^61 elements. Every later bounds check then passes
+                 * (it checks against the BOGUS len), so every access is an
+                 * unchecked OOB — silent at compile time and silent at run time.
+                 * On a 32-bit target (ZER's default `usize`) a plain u32 count
+                 * reaches the same wrap. Overflow => allocate nothing, so the
+                 * `?[*]T` is null and the caller's `orelse` handles it, exactly
+                 * as an out-of-space arena already does. See CLAUDE.md
+                 * "AST->IR emission diff audit". */
+                emit(e,"size_t _zer_asz%d;",t);
+                emit(e,"uint8_t *_zer_ap%d=__builtin_mul_overflow(sizeof(",t);
+                if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);}
+                emit(e,"),_zer_an%d,&_zer_asz%d)?(uint8_t*)0:(uint8_t*)_zer_arena_alloc(&%.*s,_zer_asz%d,",t,t,(int)ol,on,t);
                 /* _Alignof(T) */
                 emit(e,"_Alignof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,"));");
                 /* wrap in ?[]T */
@@ -6483,9 +6410,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     return;
                 }
             }
-            /* Struct, union can't use == in C — not supported in IR path */
+            /* Struct/union comparison. The CHECKER now rejects this outright
+             * (BUG-798), so reaching here means the checker missed a form —
+             * that is a compiler bug, not a user error. Answering it with a
+             * silent `0` is what made the original defect invisible (both
+             * `a == b` AND `a != b` evaluated false with no diagnostic), so
+             * this fallback is LOUD: same stance as emit_rewritten_node's
+             * unhandled-kind default. Never silently placeholder a VALUE. */
             if (le->kind == TYPE_STRUCT || le->kind == TYPE_UNION) {
-                emit(e, "/* struct/union compare unsupported */ 0");
+                fprintf(stderr, "zerc: internal: struct/union comparison reached "
+                        "the emitter at line %d — the checker should have "
+                        "rejected it\n", node->loc.line);
+                emit(e, "(_zer_trap(\"compiler bug: struct/union comparison\"), 0)");
                 return;
             }
             if (le->kind == TYPE_POINTER && le->pointer.inner &&

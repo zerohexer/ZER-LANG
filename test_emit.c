@@ -1105,19 +1105,50 @@ int main(void) {
         arena_free(&a);
     }
 
-    printf("[bounds check — auto-guard returns 0 for OOB variable index]\n");
-    /* With auto-guard: idx=10 on arr[4] → auto-guard fires, returns 0.
-     * The auto-guard handles OOB invisibly at compile time. */
+    printf("[bounds check — PROVABLY-OOB variable index rejected (BUG-799)]\n");
+    /* This case used to assert the OPPOSITE: that idx=10 on arr[4] compiled and
+     * "returns 0 before access". That WAS the behaviour, and it was the bug —
+     * the test had codified a silent gap as the contract. VRP knows idx is
+     * exactly 10 and the array holds 4, so the access can never be in bounds;
+     * falling into the auto-guard meant no compile error AND no runtime trap,
+     * just an early `return` that skipped `arr[idx] = 99` and the `return
+     * arr[0]` behind it (observably: 0 instead of 42). The literal form
+     * `arr[10]` above has always been a hard error; this is its ident sibling. */
+    {
+        tests_run++;
+        Arena a; arena_init(&a, 128*1024);
+        if (!zer_to_c(
+            "u32 main() {\n"
+            "    u32[4] arr;\n"
+            "    arr[0] = 42;\n"
+            "    u32 idx = 10;\n"
+            "    arr[idx] = 99;\n"
+            "    return arr[0];\n"
+            "}\n", "_zer_test_out.c")) {
+            tests_passed++; /* compile error = expected behavior */
+        } else {
+            printf("  FAIL: provably-OOB variable index should be a compile error\n");
+            tests_failed++;
+        }
+        arena_free(&a);
+    }
+
+    printf("[bounds check — auto-guard still covers an UNPROVABLE index]\n");
+    /* The auto-guard's real job: an index the checker cannot settle either way.
+     * `wild` straddles the bound, so the guard fires at runtime and main returns
+     * 0 without touching memory out of range. */
     test_compile_and_run(
+        "u32 wild() { return 10; }\n"
         "u32 main() {\n"
         "    u32[4] arr;\n"
         "    arr[0] = 42;\n"
-        "    u32 idx = 10;\n"
+        "    u32 idx = 0;\n"
+        "    if (wild() > 0) { idx = wild(); }\n"
         "    arr[idx] = 99;\n"
         "    return arr[0];\n"
         "}\n",
         0,
-        "auto-guard: idx=10 >= 4 → function returns 0 before access");
+        "auto-guard: unprovable idx >= 4 → function returns 0 before access");
 
     printf("[combo: defer + orelse continue in for]\n");
     test_compile_and_run(

@@ -3125,7 +3125,7 @@ Two rules that survive any refactor:
    switch cases (NODE_BINARY vs NODE_ASSIGN); fixing one misses the other
    (BUG-608 vs BUG-612).
 2. Before committing an IR-emitter refactor, run:
-   `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe|emit_intn_mask" emitter.c`
+   `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe|emit_intn_mask|__builtin_mul_overflow|__builtin_add_overflow|__builtin_sub_overflow" emitter.c`
    (AST region, line < 4000) — every match needs an IR-path equivalent;
    a missing one is a silent miscompile.
    **`emit_intn_mask` / `emit_intn_mask_lv` added to this list 2026-08-01** —
@@ -3134,6 +3134,17 @@ Two rules that survive any refactor:
    path (IR_BINOP + emit_intn_mask) wrapped, the plain-assign path
    (`emit_rewritten_node` NODE_BINARY/NODE_UNARY) did not, so `u3 7+7` gave 14
    instead of 6 — compiles clean, wrong answer.
+   **`__builtin_*_overflow` added 2026-08-18 (BUG-797)** — an ALLOCATION-SIZE
+   guard is the same class again, and its absence from this list is why
+   `arena.alloc_slice`'s `sizeof(T)*n` overflow check (BUG-266, AST-only) sat
+   DEAD for four months while the IR twin multiplied raw. The tell was not a
+   failing test: `alloc_slice(Big, 2^61)` wrapped the byte count to zero, the
+   bump succeeded, and the caller got a slice claiming 2^61 elements — after
+   which every bounds check PASSES, because it compares against the bogus
+   length. The lesson generalises past the grep: **a wrapper whose absence
+   produces a WRONG LENGTH rather than a missing check defeats every downstream
+   guard silently.** Prefer a VALUE-asserting test for that shape
+   (`tests/zer/arena_alloc_slice_size_overflow.zer`).
 3. **Do NOT "upgrade" rule 2 into a region-presence gate** ("wrapper must appear
    both before and after `emit_rewritten_node`"). MEASURED 2026-08-01: it would
    have been GREEN on the live G3 bug — `emit_intn_mask` was already present in

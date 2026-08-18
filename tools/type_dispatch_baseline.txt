@@ -755,3 +755,7 @@ checker.c:t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
 zercheck_ir.c:if (t->kind == TYNODE_OPTIONAL) return ir_tynode_is_ref_producing(t->optional.inner);
 zercheck_ir.c:if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
 zercheck_ir.c:t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
+# BUG-802 (2026-08-18) — ct_typenode_int_width reads a TypeNode (syntax node), not a
+# resolved Type. TypeNode has no distinct wrapper to unwrap and there is no
+# type_dispatch_kind equivalent for it; same class as the TYNODE_NAMED rows above.
+checker.c:if (!tn || tn->kind != TYNODE_NAMED || !tn->named.name) return 0;

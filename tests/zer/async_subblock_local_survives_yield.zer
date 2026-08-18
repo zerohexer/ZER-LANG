@@ -1,0 +1,53 @@
+// A local declared in a SUB-BLOCK of an async function must survive a yield.
+//
+// BUG-490 originally fixed this with a recursive AST walk (collect_async_locals)
+// that descended every block shape to find declarations to promote into the
+// coroutine state struct. That walk was DELETED 2026-08-18 because the IR path
+// supersedes it structurally: lowering flattens every local at every nesting
+// depth into func->locals[], and the async emitter registers all of them — a
+// nesting shape the old walker forgot to descend cannot exist in a flat list.
+//
+// This test is the evidence for that claim. It reads a sub-block local AFTER a
+// yield; if the local were left on the C stack instead of promoted to the state
+// struct, the value would be garbage after the suspend/resume. Written when the
+// walk was removed, so the guarantee is not left resting on an argument alone.
+i32 printf(const *u8 fmt, ...);
+
+u32 g_out = 0;
+u32 g_deep = 0;
+
+async void worker() {
+    u32 outer = 1;
+    if (outer == 1) {
+        u32 inner = 77;              // depth 1
+        yield;
+        g_out = inner + outer;       // 78 iff `inner` was promoted
+    }
+}
+
+async void deep() {
+    u32 acc = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        u32 lvl1 = i + 10;           // depth 1 (loop body)
+        if (lvl1 > 9) {
+            u32 lvl2 = lvl1 * 2;     // depth 2
+            yield;
+            acc += lvl2;             // 20 then 22 iff both survived
+        }
+    }
+    g_deep = acc;
+}
+
+u32 main() {
+    _zer_async_worker t;
+    _zer_async_worker_init(&t);
+    while (_zer_async_worker_poll(&t) == 0) { }
+    if (g_out != 78) { printf("g_out=%u (want 78)\n", g_out); return 1; }
+
+    _zer_async_deep d;
+    _zer_async_deep_init(&d);
+    while (_zer_async_deep_poll(&d) == 0) { }
+    if (g_deep != 42) { printf("g_deep=%u (want 42)\n", g_deep); return 2; }
+
+    return 0;
+}

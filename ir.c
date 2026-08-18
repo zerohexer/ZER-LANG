@@ -698,8 +698,14 @@ bool ir_validate(IRFunc *func) {
      * This is a true safety check — a missed defer is a leak or an
      * unreleased lock at runtime. Logged as ERROR, aborts compilation. */
     {
-        /* Pre-compute which blocks contain ≥1 emit-bodies FIRE. */
-        bool *fire_in_block = (bool *)calloc(func->block_count, sizeof(bool));
+        /* Pre-compute which blocks contain ≥1 emit-bodies FIRE.
+         * The three block_count allocations in this function clamp to >= 1: a
+         * signed count reaching calloc as a size_t turns any negative value into
+         * a ~2^64 request (GCC warns on exactly that range), and calloc(0) is
+         * allowed to return NULL, which the `if (ptr)` guards would then read as
+         * "allocation failed" and silently skip the check. Clamping makes both
+         * degenerate cases behave. */
+        bool *fire_in_block = (bool *)calloc((size_t)(func->block_count > 0 ? func->block_count : 1), sizeof(bool));
         if (fire_in_block) {
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *block = &func->blocks[bi];
@@ -712,7 +718,7 @@ bool ir_validate(IRFunc *func) {
                 }
             }
             /* For every PUSH, verify a reachable FIRE exists. */
-            bool *visited = (bool *)calloc(func->block_count, sizeof(bool));
+            bool *visited = (bool *)calloc((size_t)(func->block_count > 0 ? func->block_count : 1), sizeof(bool));
             if (visited) {
                 for (int bi = 0; bi < func->block_count; bi++) {
                     IRBlock *block = &func->blocks[bi];
@@ -792,7 +798,7 @@ bool ir_validate(IRFunc *func) {
      * Enabled by ZER_IR_WARN_UNREACHABLE=1 (off by default — too noisy
      * for normal builds, useful for lowerer refactor sessions). */
     if (getenv("ZER_IR_WARN_UNREACHABLE")) {
-        bool *reachable = (bool *)calloc(func->block_count, sizeof(bool));
+        bool *reachable = (bool *)calloc((size_t)(func->block_count > 0 ? func->block_count : 1), sizeof(bool));
         if (reachable) {
             dfs_reachable(func, 0, reachable);
             for (int bi = 0; bi < func->block_count; bi++) {

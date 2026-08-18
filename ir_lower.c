@@ -936,6 +936,14 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         return tmp;
     }
     }
+    /* Unreachable: the switch above is exhaustive over NodeKind with no
+     * `default:` (enforced by -Werror=switch + walker_default_audit.sh) and every
+     * arm returns. GCC cannot prove that, because a switch on an enum can always
+     * be handed an out-of-range value — and if one ever IS (the stale-`.o`
+     * mixed-ABI class CLAUDE.md documents), falling off the end returns whatever
+     * happens to be in the return register and the caller uses it as a local id.
+     * Return the "no value produced" sentinel instead of garbage. */
+    return -1;
 }
 
 /* Check if a block always exits (return/break/continue/goto)
@@ -955,95 +963,16 @@ static bool block_always_exits(Node *node) {
 }
 #endif
 
-/* Detect if a call is a builtin method (pool.alloc, ring.push, etc.)
- * Returns the IROpKind or IR_NOP if not a builtin */
-static IROpKind classify_builtin_call(LowerCtx *ctx, Node *call,
-                                       int *out_obj_local, int *out_handle_local) {
-    *out_obj_local = -1;
-    *out_handle_local = -1;
+/* classify_builtin_call() was DELETED 2026-08-18. It classified pool/slab/ring/
+ * arena method calls into IR_POOL_ALLOC / IR_SLAB_FREE / ... — opcodes this
+ * lowerer has NEVER emitted (Phase 8d collapsed them all to IR_ASSIGN /
+ * IR_CALL, as zercheck_ir.c's own header records). Nothing had called it since,
+ * so it was a DEAD DUPLICATE of the live classifier
+ * `ir_classify_method_call_ex` in zercheck_ir.c — the same semantic question
+ * with a second, unreachable answer, which is precisely the multi-site drift
+ * CLAUDE.md names as the #1 recurring bug class. Removed rather than left to
+ * be 'fixed' out of sync with the copy that actually runs. */
 
-    if (!call || call->kind != NODE_CALL) return IR_NOP;
-    Node *callee = call->call.callee;
-    if (!callee || callee->kind != NODE_FIELD) return IR_NOP;
-    if (!callee->field.object || callee->field.object->kind != NODE_IDENT) return IR_NOP;
-
-    const char *mn = callee->field.field_name;
-    uint32_t ml = (uint32_t)callee->field.field_name_len;
-    const char *on = callee->field.object->ident.name;
-    uint32_t ol = (uint32_t)callee->field.object->ident.name_len;
-
-    /* Look up object type */
-    Type *obj_type = checker_get_type(ctx->checker, callee->field.object);
-    if (!obj_type) {
-        Symbol *sym = scope_lookup(ctx->checker->global_scope, on, ol);
-        if (sym) obj_type = sym->type;
-    }
-    if (!obj_type) return IR_NOP;
-
-    int obj_id = ir_find_local(ctx->func, on, ol);
-    *out_obj_local = obj_id;
-
-    Type *ot = type_unwrap_distinct(obj_type);
-
-    /* Pool methods */
-    if (ot->kind == TYPE_POOL) {
-        if (ml == 5 && memcmp(mn, "alloc", 5) == 0) return IR_POOL_ALLOC;
-        if (ml == 4 && memcmp(mn, "free", 4) == 0) {
-            if (call->call.arg_count > 0 && call->call.args[0]->kind == NODE_IDENT) {
-                *out_handle_local = ir_find_local(ctx->func,
-                    call->call.args[0]->ident.name,
-                    (uint32_t)call->call.args[0]->ident.name_len);
-            }
-            return IR_POOL_FREE;
-        }
-        if (ml == 3 && memcmp(mn, "get", 3) == 0) {
-            if (call->call.arg_count > 0 && call->call.args[0]->kind == NODE_IDENT) {
-                *out_handle_local = ir_find_local(ctx->func,
-                    call->call.args[0]->ident.name,
-                    (uint32_t)call->call.args[0]->ident.name_len);
-            }
-            return IR_POOL_GET;
-        }
-    }
-
-    /* Slab methods */
-    if (ot->kind == TYPE_SLAB) {
-        if (ml == 5 && memcmp(mn, "alloc", 5) == 0) return IR_SLAB_ALLOC;
-        if (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) return IR_SLAB_ALLOC_PTR;
-        if (ml == 4 && memcmp(mn, "free", 4) == 0) {
-            if (call->call.arg_count > 0 && call->call.args[0]->kind == NODE_IDENT) {
-                *out_handle_local = ir_find_local(ctx->func,
-                    call->call.args[0]->ident.name,
-                    (uint32_t)call->call.args[0]->ident.name_len);
-            }
-            return IR_SLAB_FREE;
-        }
-        if (ml == 8 && memcmp(mn, "free_ptr", 8) == 0) {
-            if (call->call.arg_count > 0 && call->call.args[0]->kind == NODE_IDENT) {
-                *out_handle_local = ir_find_local(ctx->func,
-                    call->call.args[0]->ident.name,
-                    (uint32_t)call->call.args[0]->ident.name_len);
-            }
-            return IR_SLAB_FREE_PTR;
-        }
-    }
-
-    /* Ring methods */
-    if (ot->kind == TYPE_RING) {
-        if (ml == 4 && memcmp(mn, "push", 4) == 0) return IR_RING_PUSH;
-        if (ml == 3 && memcmp(mn, "pop", 3) == 0) return IR_RING_POP;
-        if (ml == 12 && memcmp(mn, "push_checked", 12) == 0) return IR_RING_PUSH_CHECKED;
-    }
-
-    /* Arena methods */
-    if (ot->kind == TYPE_ARENA) {
-        if (ml == 5 && memcmp(mn, "alloc", 5) == 0) return IR_ARENA_ALLOC;
-        if (ml == 11 && memcmp(mn, "alloc_slice", 11) == 0) return IR_ARENA_ALLOC_SLICE;
-        if (ml == 5 && memcmp(mn, "reset", 5) == 0) return IR_ARENA_RESET;
-    }
-
-    return IR_NOP; /* Not a builtin — regular method call */
-}
 
 /* Capture-on-FIRE (plt86m defer-goto): snapshot the live defer bodies
  * [base, defer_count) into a fire instruction (arena-allocated), so the emitter

@@ -5,34 +5,25 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — harvested 2026-08-17 from seven audit branches: 13 holes NOT yet closed
+## DONE (2026-08-18) — the 2026-08-17 harvest's HIGH rows are CLOSED
 
-Five structural fixes (BUG-791..795) closed 26 of 39 measurably-live holes. These
-13 remain. Each was VERIFIED LIVE on main using the branches' OWN test files (a
-reconstruction can confirm a hole but never refute one), in CHECKER-ONLY mode
-(`-o out.c`), because GCC refuses `__attribute__((interrupt))` on hosted x86-64 and
-masks every ISR test in exe mode.
+All ten HIGH holes listed by the 2026-08-17 entry were re-measured LIVE on main on
+2026-08-18 (checker-only mode, `-o out.c`, reading the DIAGNOSTIC not the exit code)
+and then closed. Three further holes were found by the same audit and are in no
+earlier ledger. Full detail: BUGS-FIXED.md "Session 2026-08-18".
 
-Extract any branch file with:
-    git show origin/claude/vigilant-tesla-<id>:tests/zer_fail/<name>.zer
+| was | now | fix |
+|---|---|---|
+| provably-OOB index -> silent early return (3 forms) | CLOSED | BUG-799 `index_range_verdict` — ONE query at all five bounded-index sinks |
+| `@inttoptr` did not require `volatile` | CLOSED | BUG-801 — result type IS volatile for a CONSTANT address in a declared mmio range |
+| `volatile` lost through @ptrtoint -> @inttoptr (2 shapes) | CLOSED | BUG-800 `Symbol.is_volatile_addr`, both inline and through-a-local |
+| the dereference identity boundary (4 forms) | CLOSED | BUG-796 `deref_identity_launder` — FORM x TYPE x SINK closed together |
+| `arena.alloc_slice` overflow guard dead on the IR path | CLOSED (new) | BUG-797 |
+| aggregate comparison silently always false | CLOSED (new) | BUG-798 |
+| comptime folds a different value than runtime | CLOSED (new) | BUG-802 |
 
-### HIGH — silent miscompile / bare-metal
-- **A provably-OOB index compiles to a SILENT early return** (hefb6x, BUG-787
-  there): `bounds_ident_always_oob`, `bounds_ident_negative_idx`,
-  `mmio_ident_always_oob`. Also closes the long-standing "PRECISION GAP #1".
-- **`@inttoptr` does not require `volatile`** so GCC deletes the MMIO store
-  (j8f9t7): `mmio_inttoptr_nonvolatile`.
-- **`volatile` lost through a `@ptrtoint` -> `@inttoptr` round trip** (hefb6x):
-  `volatile_launder_ptrtoint_inline`, `..._roundtrip`. Supersedes the older
-  `tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer` gap file.
+### STILL OPEN — residuals, carried forward verbatim
 
-### HIGH — accept-unsafe
-- **The dereference identity boundary** (t6dfxt, BUG-785 there), 4 forms:
-  `deref_identity_field_operand`, `_handle_arg`, `_handle_copy`, `_move_copy`.
-  Distinct from the deref-launder rule already in main (BUG-781/782), which those
-  tests do NOT trip.
-
-### Residuals of the five structures (stated so nothing reads as complete)
 - **RMW reached from MAIN through a helper** —
   `tests/zer_gaps/main_rmw_via_pointer_param.zer`. The ISR side of this family is
   CLOSED. The mirror of ISR-TRANS (a transitive walk over every regular function
@@ -53,8 +44,36 @@ Extract any branch file with:
   standing debt that keeps regenerating this class.
 - **45 stale rows in `tools/type_dispatch_baseline.txt`** (content no longer present
   in the sources). Harmless for correctness — the audit only fails on NEW sites —
-  but it is a gate drifting from its site set. The 4 rows BUG-793 made stale were
-  removed; these 45 predate it and were left alone rather than bulk-edited unverified.
+  but it is a gate drifting from its site set.
+
+### NEW residuals opened by the 2026-08-18 fixes (each deliberate, none a soundness hole)
+
+- **BUG-801 residual — a COMPUTED peripheral address is still not required to be
+  `volatile`.** The rule is scoped to a CONSTANT `@inttoptr` address inside a
+  declared mmio range, because `@ptrtoint(&x)` + arithmetic + `@inttoptr` is the
+  documented stand-in for pointer arithmetic on ordinary memory (CLAUDE.md "No
+  pointer arithmetic") and forcing volatile there would make the round trip
+  unusable — the result could no longer initialize a plain `*u32`. So
+  `@inttoptr(*u32, BASE + off)` with a runtime `off` still yields a non-volatile
+  pointer. **Fix sketch:** propagate an "mmio-derived" fact along the integer the
+  way BUG-800 propagates "volatile-derived", so a computed address inherits it from
+  its base. Needs a small interval/provenance join on the integer, not just a flag.
+- **BUG-799 residual — a provably-OOB index behind a short-circuit guard is now
+  rejected.** `u32 i = 10; if (i < len && arr[i] > 0)` on a `u32[4]` errors even
+  though `&&` means the access never executes. Practical cost is near zero (the
+  common case has an unprovable index, which is UNKNOWN -> auto-guard as before);
+  it only bites when the index is a provable constant that is out of bounds, which
+  is dead code either way. **Fix sketch:** narrow VRP through the LHS of `&&` into
+  its RHS, so `i < len` with `len` known intersects `i`'s range to EMPTY and the
+  verdict falls back to UNKNOWN by the existing empty-range rule. That would also
+  buy a real precision win — eliding the auto-guard for the idiomatic
+  `if (i < len && arr[i] == x)`.
+- **BUG-802 residual — plain `const` folding outside a comptime function does not
+  get per-operation width wrapping.** The width is established from the comptime
+  function's RETURN type at the three comptime-folding sinks; a bare
+  `const u32 X = (A * 4) >> 3;` still folds in host int64. **Fix sketch:** thread a
+  destination width through the shared evaluator so every fold, not just the
+  comptime-call path, computes at the declared width.
 
 ### Unverified — reproduce before acting
 - j8f9t7's limitations.md carries a **SUSPECTED** block (code-reading only).

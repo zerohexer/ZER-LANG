@@ -10,9 +10,10 @@
 #include "src/safety/arith_rules.h"        /* zer_div_valid/narrowing_valid/literal_fits — M */
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
+#include "src/safety/move_rules.h"         /* zer_type_kind_is_move_struct / _should_track — B */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
-#include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
-#include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
+#include "src/safety/comptime_rules.h"     /* zer_comptime_* / _static_assert / _expr_nesting — R */
+#include "src/safety/cast_rules.h"         /* zer_conversion_safe / _bitcast_* / _saturate / _ptrtoint — J-ext */
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include "src/safety/asm_instruction_table.h" /* zer_asm_instruction_info — F4 per-instruction safety dispatch */
@@ -97,6 +98,45 @@ static bool type_carries_handle(Type *t, int depth) {
     if (k == TYPE_UNION) {
         for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
             if (type_carries_handle(u->union_type.variants[i].type, depth + 1))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Does this type CARRY move-struct OWNERSHIP at any nesting depth?
+ *
+ * Third sibling of type_carries_data_pointer / type_carries_handle, same
+ * "wrapper hides the inner kind" recursion. The question is distinct from both:
+ * neither a frame reference nor an allocation index, but a UNIQUE RESOURCE whose
+ * consume must happen exactly once. Used by deref_identity_launder — copying a
+ * move-carrying value OUT of a dereference produces a second owner the analyzer
+ * cannot connect back to the first.
+ *
+ * The leaf test delegates to the VST-verified pair in src/safety/move_rules.c
+ * (zer_type_kind_is_move_struct + zer_move_should_track) so the "what counts as
+ * a move type" decision has exactly one definition. */
+static bool type_carries_move(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_move(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)
+        return type_carries_move(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        bool direct = zer_type_kind_is_move_struct((int)TYPE_STRUCT,
+                                                  u->struct_type.is_move ? 1 : 0) != 0;
+        bool nested = false;
+        for (uint32_t i = 0; i < u->struct_type.field_count && !nested; i++)
+            nested = type_carries_move(u->struct_type.fields[i].type, depth + 1);
+        return zer_move_should_track(direct ? 1 : 0, nested ? 1 : 0) != 0;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_move(u->union_type.variants[i].type, depth + 1))
                 return true;
         }
         return false;
@@ -503,6 +543,18 @@ static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
 static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
+/* Bounded-index verdict — ONE query, asked at every bounded-index sink.
+ * See index_range_verdict for the class it kills. */
+typedef enum {
+    IDXV_UNKNOWN = 0,   /* range unknown, or straddles the bound -> runtime guard */
+    IDXV_IN_BOUNDS,     /* EVERY value in the range is a valid index -> no guard */
+    IDXV_ALWAYS_OOB,    /* NO value in the range is a valid index -> compile error */
+} IndexVerdict;
+static IndexVerdict index_range_verdict(Checker *c, Node *idx_expr, uint64_t bound,
+                                        int64_t *out_min, int64_t *out_max);
+/* Volatile-address laundering (BUG-800) — see the definitions. */
+static bool expr_is_ptrtoint_of_volatile(Checker *c, Node *e);
+static bool addr_expr_is_volatile_derived(Checker *c, Node *e);
 static bool body_always_exits(Node *body);
 static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
@@ -537,7 +589,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
- * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+ * Returns true and sets out_min / out_max if a bounded range was derived. */
 /* Refactor 1: unified VRP range invalidation for assignments.
  * Handles both simple ident keys and compound keys (s.x).
  * For TOK_EQ: tries literal, derive_expr_range, call return range.
@@ -1627,7 +1679,8 @@ static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
 }
 
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
- * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
+ * through address-of, deref, field, index, slice, orelse, intrinsic or cast.
+ * If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
  * callee position makes the caller param escape too). Else -1. */
 static int keep_arg_caller_root(Checker *c, Node *arg) {
@@ -1794,36 +1847,75 @@ static Node *unwrap_ptr_launder(Node *v) {
     return v;
 }
 
-/* A POINTER-typed value produced by dereferencing a pointer-to-pointer creates an
- * alias the analyzer cannot follow: `**Node pp = &n; *Node k = *pp;` makes k alias
- * n's allocation, but resolving that needs points-to over pp, which the per-file +
- * summaries model deliberately does not have. Measured live 2026-08-10: the
- * reproducer RAN, read freed memory and double-freed.
+/* THE DEREFERENCE IDENTITY BOUNDARY (BUG-796, generalising BUG-781/782).
  *
- * Level-A stance — when the analyzer cannot PROVE what an alias refers to, reject.
- * Over-rejection is the accepted cost; the restructure is a teachable discipline
- * ("alias the pointer directly so the compiler can follow it"), which is the bar
- * CLAUDE.md sets for an acceptable false positive.
+ * Reading a value OUT of a pointer dereference produces a copy the analyzer
+ * cannot connect back to the original allocation: in the IR `*p` lowers to a
+ * UNOP temp that carries no handle, so whatever the copy is bound to inherits
+ * NOTHING. Three value kinds lose a safety-relevant identity that way:
  *
- * Cost measured before shipping: ZERO instances in the whole corpus (tests/zer,
- * zer_fail, test_modules, rust_tests, zig_tests). Every deref-init var-decl there
- * is a SCALAR copy (`u32 v = *p`) or a Handle/move-struct, which are tracked and
- * are NOT matched here — the gate requires the RESULT to be pointer-typed. */
-static bool deref_ptr_launder(Checker *c, Node *e) {
+ *   - POINTER / SLICE / OPAQUE  — the ALIAS is lost: `*Node k = *pp; free(n);`
+ *     leaves k dangling with no diagnostic (BUG-781, measured: ran, read freed
+ *     memory, then double-freed).
+ *   - HANDLE                    — the ALLOCATION is lost: `Handle(T) k = *p;
+ *     pool.free(k);` in a callee is not recorded in its frees-param summary, so
+ *     the caller's own free is an unflagged DOUBLE FREE (and a double free
+ *     mangles the pool generation counter, so a later get() on the reused slot
+ *     silently returns the WRONG object).
+ *   - move-carrying             — the OWNERSHIP is lost: `Tok b = *p;` yields a
+ *     second owner, so `consume(a); consume(b);` double-consumes one resource
+ *     (this is HOLE-A4, open since 2026-07).
+ *
+ * Recovering any of them needs points-to over the dereferenced pointer, which
+ * the per-file + summaries model deliberately does not have (whole-program
+ * analysis is banned from the architecture). Level-A stance: when the analyzer
+ * cannot PROVE what a copy refers to, REJECT. The restructure is one line and
+ * teachable ("bind the pointer directly so the compiler can follow it"), which
+ * is the bar CLAUDE.md sets for an acceptable false positive.
+ *
+ * FORM AXIS. The original predicate required the operand to be a bare
+ * NODE_IDENT and resolved it through scope_lookup, so `*h.pp`, `**ppp` and
+ * `*factory()` walked straight past all three sinks — the same "one question, N
+ * syntactic forms" shape CLAUDE.md names as the #1 recurring bug class. It now
+ * asks the TYPEMAP for the operand's type, which covers every form uniformly
+ * (ident / field / index / nested deref / call result), so a new expression kind
+ * cannot reopen the hole. Callers must therefore run it AFTER check_expr has
+ * typed the value; the bare-ident symbol lookup is kept as a fallback for a
+ * caller that cannot.
+ *
+ * Scalars are NOT matched (`u32 v = *p`, `S copy = *sp` for a plain struct S):
+ * the gate requires the dereference to YIELD one of the three identity kinds. */
+static bool deref_identity_launder(Checker *c, Node *e) {
     if (!e || e->kind != NODE_UNARY || e->unary.op != TOK_STAR) return false;
     Node *inner = e->unary.operand;
-    if (!inner || inner->kind != NODE_IDENT) return false;
-    Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
-                              (uint32_t)inner->ident.name_len);
-    if (!sy || !sy->type) return false;
-    /* operand must be a pointer-to-pointer ... */
-    Type *ot = type_unwrap_distinct(sy->type);
+    if (!inner) return false;
+    Type *ot = checker_get_type(c, inner);
+    if (!ot && inner->kind == NODE_IDENT) {
+        Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
+                                  (uint32_t)inner->ident.name_len);
+        ot = sy ? sy->type : NULL;
+    }
+    if (!ot) return false;
+    ot = type_unwrap_distinct(ot);
     if (type_dispatch_kind(ot) != TYPE_POINTER) return false;
     Type *inner_t = ot->pointer.inner ? type_unwrap_distinct(ot->pointer.inner) : NULL;
     if (!inner_t) return false;
     TypeKind ik = type_dispatch_kind(inner_t);
-    /* ... yielding a POINTER (or slice/opaque): a scalar `u32 v = *p` is unaffected. */
-    return ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE;
+    if (ik == TYPE_POINTER || ik == TYPE_SLICE || ik == TYPE_OPAQUE) return true;
+    if (type_carries_handle(inner_t, 0)) return true;
+    if (type_carries_move(inner_t, 0)) return true;
+    return false;
+}
+
+/* The shared diagnostic for every deref-identity sink — one message, one place,
+ * so the four sinks cannot drift apart in what they tell the user. */
+static void deref_identity_error(Checker *c, int line) {
+    checker_error(c, line,
+        "cannot bind a value obtained by dereferencing a pointer to a "
+        "pointer, Handle or move struct — the compiler cannot prove which "
+        "allocation it refers to, so a later free/consume through either "
+        "name would be a use-after-free or double-consume. Bind the "
+        "pointer directly ('*T k = p;') or pass the value by name instead");
 }
 
 /* Is this expression `&<packed struct>.field` (at any field/index depth)?
@@ -2611,6 +2703,67 @@ static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, in
     ctx->count++;
 }
 
+/* ---- BUG-802: per-OPERATION width wrapping in the comptime evaluator ----
+ *
+ * The comptime evaluator computes in host int64 and masked only the FINAL
+ * result, so a comptime function silently produced a DIFFERENT value than the
+ * identical expression written at runtime:
+ *
+ *     comptime u32 shifted(u32 a) { return (a * 4) >> 3; }
+ *     shifted(4000000000)   -> 2000000000   (int64: 16e9 >> 3)
+ *     runtime (a * 4) >> 3  ->  151969024   (u32:  16e9 wraps first)
+ *
+ * Compile-time and runtime both "succeed" and disagree — no diagnostic, no
+ * trap, wrong constant burned into the emitted C. Masking the final result
+ * cannot fix it: >>, / and % read the bits that were already lost.
+ *
+ * The fix wraps after every operation that can LEAVE the declared width
+ * (+ - * << ~ unary-), which is exactly ZER's defined semantics ("integer
+ * overflow wraps, never UB"). Comparisons and the bit ops that cannot widen
+ * an in-range operand are left alone. Width comes from the comptime function's
+ * RETURN type; when it cannot be determined the width is 0 and nothing is
+ * masked, i.e. the old behaviour, so an unknown form can only fail to improve,
+ * never break.
+ *
+ * Scope: the comptime-FUNCTION path, which is the one that substitutes a value
+ * into emitted code. Threading a destination width through the shared evaluator
+ * so plain `const` folding gets the same treatment is tracked in
+ * docs/limitations.md. */
+static int _ct_op_width = 0;      /* 0 = unknown -> no masking */
+static bool _ct_op_signed = false;
+
+static int64_t ct_wrap(int64_t v) {
+    if (_ct_op_width <= 0 || _ct_op_width >= 64) return v;
+    uint64_t mask = (1ULL << _ct_op_width) - 1ULL;
+    int64_t r = (int64_t)((uint64_t)v & mask);
+    if (_ct_op_signed && (r & (1LL << (_ct_op_width - 1))))
+        r |= (int64_t)(~mask);
+    return r;
+}
+
+/* Width of a PRIMITIVE integer type node, without needing a resolved Type
+ * (eval_comptime_call_subst has no Checker). Returns 0 for anything else —
+ * distinct/typedef/struct/float — which disables masking for that call. */
+static int ct_typenode_int_width(TypeNode *tn, bool *out_signed) {
+    *out_signed = false;
+    if (!tn || tn->kind != TYNODE_NAMED || !tn->named.name) return 0;
+    const char *n = tn->named.name;
+    uint32_t l = (uint32_t)tn->named.name_len;
+    if (l < 2 || l > 4) {
+        if (!(l == 5 && memcmp(n, "usize", 5) == 0)) return 0;
+        return zer_target_ptr_bits > 0 ? zer_target_ptr_bits : 32;
+    }
+    if (n[0] != 'u' && n[0] != 'i') return 0;
+    int w = 0;
+    for (uint32_t k = 1; k < l; k++) {
+        if (n[k] < '0' || n[k] > '9') return 0;
+        w = w * 10 + (n[k] - '0');
+    }
+    if (w < 1 || w > 64) return 0;   /* u128 and friends: leave unmasked */
+    *out_signed = (n[0] == 'i');
+    return w;
+}
+
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx);
 static Scope *_comptime_global_scope; /* set before eval for nested comptime calls */
 
@@ -2875,7 +3028,19 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                         _comptime_diag_line = 0;
                         ComptimeCtx cctx;
                         ct_ctx_init(&cctx, cparams, pc);
+                        /* BUG-802, sink 3/3 — the ARRAY-SIZE comptime call. Same
+                         * question as the two call-expression sinks: evaluate the
+                         * body at the DECLARED return width so an intermediate
+                         * cannot silently exceed it. Uses the TypeNode-based width
+                         * helper because this runs inside resolve_type, where the
+                         * return type may not be resolvable yet. */
+                        int saved_w = _ct_op_width; bool saved_s = _ct_op_signed;
+                        bool asigned = false;
+                        _ct_op_width = ct_typenode_int_width(fn->func_decl.return_type,
+                                                             &asigned);
+                        _ct_op_signed = asigned;
                         val = eval_comptime_block(fn->func_decl.body, &cctx);
+                        _ct_op_width = saved_w; _ct_op_signed = saved_s;
                         ct_ctx_free(&cctx);
                         /* Gap 33: surface explicit error if depth limit hit. */
                         if (val == CONST_EVAL_FAIL && _comptime_depth_exceeded) {
@@ -3336,7 +3501,16 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     }
     ComptimeCtx cctx;
     ct_ctx_init(&cctx, cparams, pc);
+    /* BUG-802: evaluate this call's body at the DECLARED width, so every
+     * intermediate wraps the way the same expression would at runtime. Saved
+     * and restored around the call so a nested comptime call with a different
+     * return width does not leak its width to the caller. */
+    int saved_w = _ct_op_width; bool saved_s = _ct_op_signed;
+    bool nsigned = false;
+    int nw = ct_typenode_int_width(fn->func_decl.return_type, &nsigned);
+    _ct_op_width = nw; _ct_op_signed = nsigned;
     int64_t result = eval_comptime_block(fn->func_decl.body, &cctx);
+    _ct_op_width = saved_w; _ct_op_signed = saved_s;
     ct_ctx_free(&cctx);
     if (need_free) free(cparams);
     _comptime_call_depth--;
@@ -3401,8 +3575,9 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
-        if (n->unary.op == TOK_MINUS) return -v;
-        if (n->unary.op == TOK_TILDE) return ~v;
+        /* BUG-802: wrap ops that can leave the declared width. */
+        if (n->unary.op == TOK_MINUS) return ct_wrap(-v);
+        if (n->unary.op == TOK_TILDE) return ct_wrap(~v);
         if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
         return CONST_EVAL_FAIL;
     }
@@ -3411,12 +3586,15 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         int64_t r = eval_const_expr_subst(n->binary.right, params, param_count);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
         switch (n->binary.op) {
-        case TOK_PLUS:   return l + r;
-        case TOK_MINUS:  return l - r;
-        case TOK_STAR:   return l * r;
+        /* BUG-802: wrap after every operation that can leave the declared
+         * width, so the folded constant equals what the same expression
+         * computes at runtime. / % >> & | ^ cannot widen in-range operands. */
+        case TOK_PLUS:   return ct_wrap(l + r);
+        case TOK_MINUS:  return ct_wrap(l - r);
+        case TOK_STAR:   return ct_wrap(l * r);
         case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : l / r;
         case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : l % r;
-        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : (int64_t)((uint64_t)l << r);
+        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : ct_wrap((int64_t)((uint64_t)l << r));
         case TOK_RSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : l >> r;
         case TOK_AMP:    return l & r;
         case TOK_PIPE:   return l | r;
@@ -4261,6 +4439,36 @@ static Type *check_expr(Checker *c, Node *node) {
                         type_name(eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY ? left : right));
                 }
             }
+            /* BUG-798: the STRUCT / UNION siblings of the rule directly above.
+             * Aggregates were left out of that list, and the emitter's IR path
+             * answers an aggregate comparison with a literal `0` and a comment
+             * (emitter.c "struct/union compare unsupported"). So `a == b` was
+             * ALWAYS false — and so was `a != b`, which is the tell that the
+             * value is a placeholder rather than an answer. No diagnostic, no
+             * trap, wrong branch taken: exactly the silent class this rule
+             * family exists to prevent. C rejects `==` on aggregates for the
+             * same reason (padding bytes make a byte-wise answer meaningless),
+             * and there is no tracking system that could make it safe, so the
+             * ban is the correct verdict per CLAUDE.md's ban-decision framework
+             * (needs a type-system feature ZER does not have).
+             *
+             * All SIX comparison operators are covered, not just == / != : the
+             * emitter's placeholder branch is keyed on the operand type, not on
+             * the operator, so `a < b` was silently `0` too. */
+            {
+                TypeKind lk = type_dispatch_kind(left);
+                TypeKind rk = type_dispatch_kind(right);
+                bool l_agg = (lk == TYPE_STRUCT || lk == TYPE_UNION);
+                bool r_agg = (rk == TYPE_STRUCT || rk == TYPE_UNION);
+                if (l_agg || r_agg) {
+                    checker_error(c, node->loc.line,
+                        "cannot compare '%s' with a comparison operator — a struct "
+                        "or union has no defined ordering and its padding bytes make "
+                        "a whole-value equality meaningless. Compare the fields you "
+                        "care about individually",
+                        type_name(l_agg ? left : right));
+                }
+            }
             if (!type_equals(left, right) &&
                 !can_implicit_coerce(left, right) &&
                 !can_implicit_coerce(right, left)) {
@@ -4490,16 +4698,6 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Assignment ---- */
     case NODE_ASSIGN: {
-        /* Deref-launder sink: `h.p = *pp;` / `g = *pp;` stores an alias the
-         * analyzer cannot follow into a field or a global. Same predicate and
-         * Level-A stance as the var-decl and return sinks. */
-        if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
-            checker_error(c, node->loc.line,
-                "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                "— the compiler cannot prove which allocation it aliases, so a later "
-                "free through either name would be a use-after-free. Alias the pointer "
-                "directly ('*T k = p;') instead");
-        }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
@@ -4557,6 +4755,13 @@ static Type *check_expr(Checker *c, Node *node) {
          * target is a pointer type. Same logic as var_decl hook. */
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
+
+        /* Deref-identity sink 2/4 — STORE. `h.p = *pp;` / `g = *pp;` /
+         * `b = *movep;` stores a copy whose alias / allocation / ownership the
+         * analyzer cannot follow into a field or a global. Runs AFTER check_expr
+         * so every operand FORM is typed. */
+        if (node->assign.value && deref_identity_launder(c, node->assign.value))
+            deref_identity_error(c, node->loc.line);
 
         /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
          * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
@@ -6175,6 +6380,32 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* Deref-identity sink 4/4 — the CALL ARGUMENT. `tasks.free(*p)` and
+         * `consume(*p)` hand a callee a Handle / move-struct value read out of a
+         * dereference: the callee's frees-param summary records nothing (the
+         * freed thing is an IR temp, not the param local), so the caller's own
+         * free/consume of the same allocation is an unflagged DOUBLE FREE /
+         * double-consume.
+         *
+         * Deliberately NARROWER than the three value-binding sinks: only
+         * HANDLE-carrying and MOVE-carrying results are rejected here, because
+         * those are the two kinds whose consumption is a one-shot transfer.
+         * Passing `*pp` where the result is a plain pointer/slice stays legal —
+         * that is a borrow for the duration of the call, not a transfer. */
+        for (int i = 0; i < node->call.arg_count; i++) {
+            Node *a = node->call.args[i];
+            if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_STAR) continue;
+            Type *at = arg_types ? arg_types[i] : NULL;
+            if (!at) continue;
+            if (!type_carries_handle(at, 0) && !type_carries_move(at, 0)) continue;
+            checker_error(c, node->loc.line,
+                "cannot pass a Handle or move struct obtained by dereferencing a "
+                "pointer — the callee's free/consume of it cannot be attributed to "
+                "any allocation the caller knows about, so a second free/consume "
+                "would go unreported. Take the value by name (pass the Handle "
+                "itself, not a pointer to it)");
+        }
+
         /* D5 (2026-08-01): scoped-borrow exclusivity laundered through a HELPER.
          * `ThreadHandle t = spawn worker(&x); poke(&x); t.join();` compiled —
          * the borrow read-check (NODE_IDENT, ~3579) deliberately SKIPS `&x`
@@ -7398,7 +7629,22 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (!ret_is_float) {
                             ComptimeCtx cctx;
                             ct_ctx_init(&cctx, cparams, pc);
+                            /* BUG-802: evaluate the body AT THE DECLARED WIDTH so
+                             * every intermediate wraps the way the same expression
+                             * would at runtime. Masking only the final result (just
+                             * below) cannot fix `>>`, `/` or `%`, which read bits
+                             * that were already lost. Saved/restored so a nested
+                             * comptime call cannot leak its width to this one. */
+                            int saved_w = _ct_op_width; bool saved_s = _ct_op_signed;
+                            if (ret_ty_check) {
+                                int rw = type_width(ret_ty_check);
+                                _ct_op_width = (rw > 0 && rw < 64) ? rw : 0;
+                                _ct_op_signed = type_is_signed(ret_ty_check);
+                            } else {
+                                _ct_op_width = 0; _ct_op_signed = false;
+                            }
                             val = eval_comptime_block(fn->func_decl.body, &cctx);
+                            _ct_op_width = saved_w; _ct_op_signed = saved_s;
                             ct_ctx_free(&cctx);
                         }
                         /* Gap 33: surface explicit error if depth limit hit. */
@@ -7950,12 +8196,24 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* range propagation: check if index ident has proven range */
             if (node->index_expr.index->kind == NODE_IDENT) {
-                struct VarRange *r = find_var_range(c,
-                    node->index_expr.index->ident.name,
-                    (uint32_t)node->index_expr.index->ident.name_len);
-                if (r && r->min_val >= 0 && r->max_val >= 0 &&
-                    (uint64_t)r->max_val < obj->array.size) {
+                int64_t vmin = 0, vmax = 0;
+                IndexVerdict v = index_range_verdict(c, node->index_expr.index,
+                                                     obj->array.size, &vmin, &vmax);
+                if (v == IDXV_IN_BOUNDS) {
                     mark_proven(c, node);
+                } else if (v == IDXV_ALWAYS_OOB) {
+                    /* Sibling of the NODE_INT_LIT arm above and the NODE_CALL arm
+                     * below: the range proves the access can NEVER be in bounds.
+                     * Before this it fell through to the auto-guard and the OOB
+                     * store silently returned from the function at runtime. */
+                    checker_error(c, node->loc.line,
+                        "array index '%.*s' has range [%lld, %lld], which is always "
+                        "out of bounds for array of size %llu",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (long long)vmin, (long long)vmax,
+                        (unsigned long long)obj->array.size);
+                    mark_proven(c, node);  /* error reported — no auto-guard on top */
                 }
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
@@ -8068,15 +8326,37 @@ static Type *check_expr(Checker *c, Node *node) {
                     ptr_proven = true;
                     mark_proven(c, node);
                 } else {
-                    /* variable index — auto-guard using mmio_bound as array size */
-                    mark_auto_guard(c, node, mmio_bound);
-                    checker_warning(c, node->loc.line,
-                        "MMIO index '%.*s' not proven in range (max %llu) — auto-guard inserted",
-                        node->index_expr.index->kind == NODE_IDENT ?
-                            (int)node->index_expr.index->ident.name_len : 1,
-                        node->index_expr.index->kind == NODE_IDENT ?
-                            node->index_expr.index->ident.name : "?",
-                        (unsigned long long)mmio_bound - 1);
+                    /* variable index. Same ONE query the fixed-array sink uses
+                     * (index_range_verdict) — this sink previously had NEITHER
+                     * arm: a provably in-range index still paid for a guard, and
+                     * a provably out-of-range one got the silent guard whose
+                     * runtime form is an early `return`. On an MMIO sink that
+                     * means a peripheral write that never happens, on bare metal
+                     * with no fault at all. */
+                    int64_t mmin = 0, mmax = 0;
+                    IndexVerdict mv = index_range_verdict(c, node->index_expr.index,
+                                                          mmio_bound, &mmin, &mmax);
+                    if (mv == IDXV_IN_BOUNDS) {
+                        mark_proven(c, node);   /* relaxation: zero-overhead access */
+                    } else if (mv == IDXV_ALWAYS_OOB) {
+                        checker_error(c, node->loc.line,
+                            "MMIO index '%.*s' has range [%lld, %lld], which is always "
+                            "out of range (max %llu from mmio declaration)",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (long long)mmin, (long long)mmax,
+                            (unsigned long long)mmio_bound - 1);
+                        mark_proven(c, node);
+                    } else {
+                        mark_auto_guard(c, node, mmio_bound);
+                        checker_warning(c, node->loc.line,
+                            "MMIO index '%.*s' not proven in range (max %llu) — auto-guard inserted",
+                            node->index_expr.index->kind == NODE_IDENT ?
+                                (int)node->index_expr.index->ident.name_len : 1,
+                            node->index_expr.index->kind == NODE_IDENT ?
+                                node->index_expr.index->ident.name : "?",
+                            (unsigned long long)mmio_bound - 1);
+                    }
                     ptr_proven = true;
                 }
             }
@@ -8602,7 +8882,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * to a wrong line.
                  *
                  * Two parse paths:
-                 *  (a) type keyword (u32/*T/etc.) → type_arg set, args carry values
+                 *  (a) type keyword (u32, pointer types, etc.) -> type_arg set, args carry values
                  *  (b) named type as TOK_IDENT for intrinsics NOT in force_type_arg
                  *      (currently only @size) → type_arg NULL, args[0] is the type ident
                  *      (see parser.c:931-936 + BUG-316 path). The checker dispatch at
@@ -9095,6 +9375,60 @@ static Type *check_expr(Checker *c, Node *node) {
                             type_name(result));
                     }
                 }
+                /* BUG-801: an @inttoptr result into a declared mmio range IS
+                 * volatile.
+                 *
+                 * Measured: `*u32 reg = @inttoptr(*u32, 0x40020014); reg[0]=1;
+                 * reg[0]=2; return reg[0];` compiled with ZERO diagnostics and
+                 * GCC -O2 emitted a SINGLE store plus a constant-folded read —
+                 * the first peripheral write silently deleted, the status read
+                 * never performed. Every other mmio machine (range, alignment,
+                 * span, index bound, variable-address trap) passed; the one
+                 * qualifier that makes MMIO actually work was optional. Invisible
+                 * on hosted x86-64 (no peripheral) and invisible at runtime on
+                 * the target (nothing traps — the code simply does not do what
+                 * was written).
+                 *
+                 * Fixed HERE rather than at each binding sink: making the result
+                 * type volatile routes every sink through the qualifier machinery
+                 * that already exists ("cannot initialize non-volatile pointer
+                 * from volatile"), instead of adding an N-site volatile check
+                 * that the next sink would be missing from. The documented form
+                 * `volatile *u32 reg = @inttoptr(*u32, ADDR)` is unaffected —
+                 * the TYPE ARGUMENT stays unqualified, as every example writes it.
+                 *
+                 * A fresh Type is allocated — resolve_type CACHES, so setting
+                 * is_volatile in place would poison the shared `*u32` entry. */
+                Type *itp_eff = result ? type_unwrap_distinct(result) : NULL;
+                if (itp_eff && type_dispatch_kind(result) == TYPE_POINTER &&
+                    !itp_eff->pointer.is_volatile &&
+                    node->intrinsic.arg_count > 0 && c->mmio_range_count > 0) {
+                    /* SCOPED to a CONSTANT address inside a declared mmio range —
+                     * that is unambiguously a peripheral register. A VARIABLE
+                     * address is left alone because `@ptrtoint(&x)` + arithmetic +
+                     * `@inttoptr` is the documented stand-in for pointer arithmetic
+                     * on ordinary memory (CLAUDE.md "No pointer arithmetic"), and
+                     * forcing volatile there would make the round-trip unusable —
+                     * the result could no longer initialize a plain `*u32`.
+                     * Residual, deliberately documented rather than papered over:
+                     * a COMPUTED peripheral address (base + offset) is still not
+                     * required to be volatile. See docs/limitations.md. */
+                    int64_t caddr = eval_const_expr(node->intrinsic.args[0]);
+                    bool in_mmio = false;
+                    if (caddr != CONST_EVAL_FAIL) {
+                        uint64_t a = (uint64_t)caddr;
+                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
+                            if (a >= c->mmio_ranges[ri][0] &&
+                                a <= c->mmio_ranges[ri][1]) { in_mmio = true; break; }
+                        }
+                    }
+                    if (in_mmio) {
+                        Type *vp = type_pointer(c->arena, itp_eff->pointer.inner);
+                        vp->pointer.is_volatile = true;
+                        vp->pointer.is_const = itp_eff->pointer.is_const;
+                        result = vp;
+                    }
+                }
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = typemap_get(c, node->intrinsic.args[0]);
                     if (val_type) {
@@ -9103,6 +9437,25 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_error(c, node->loc.line,
                                 "@inttoptr address must be an integer, got '%s'",
                                 type_name(val_type));
+                        }
+                    }
+                    /* BUG-800: qualifier laundering through the integer round
+                     * trip. The DIRECT strip `(*u32)vreg` is already an error;
+                     * going out through @ptrtoint and back was the way around
+                     * it, and the result is coalesced MMIO stores with nothing
+                     * to notice them by. */
+                    if (result) {
+                        Type *res_q = type_unwrap_distinct(result);
+                        if (res_q && type_dispatch_kind(result) == TYPE_POINTER &&
+                            !res_q->pointer.is_volatile &&
+                            addr_expr_is_volatile_derived(c, node->intrinsic.args[0])) {
+                            checker_error(c, node->loc.line,
+                                "@inttoptr produces a NON-volatile '%s' from the address of "
+                                "a VOLATILE object — the round trip through @ptrtoint would "
+                                "strip the qualifier, and gcc may then coalesce or drop the "
+                                "accesses so a peripheral misses a write. Ask for a volatile "
+                                "pointer type here, or keep using the original volatile pointer.",
+                                type_name(result));
                         }
                     }
                     /* mmio range validation: @inttoptr REQUIRES mmio declarations
@@ -10914,85 +11267,14 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
+/* has_atomic_or_barrier() was DELETED 2026-08-18. Its question — does this body
+ * do manual synchronisation? — is answered by FuncProps.has_sync, computed once
+ * per function by scan_func_props and reused transitively (see the 'absorbs
+ * has_atomic_or_barrier' note there). Nothing had called it since that
+ * migration, so it was a dead DUPLICATE of a live safety question — exactly the
+ * multi-site drift CLAUDE.md warns about. Removed rather than left to be 'fixed'
+ * out of sync with the copy that actually runs. */
+
 
 /* Does this function forward its parameter `pidx` into a `spawn` argument —
  * directly, or transitively through another function that does?
@@ -11773,19 +12055,6 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
-            /* Deref-launder: `*T k = *pp;` binds an alias the analyzer cannot
-             * follow — resolving it needs points-to over `pp`, which the per-file +
-             * summaries model deliberately lacks. Level-A stance: cannot prove =>
-             * REJECT. Measured live: the reproducer RAN, read freed memory and then
-             * double-freed. A scalar `u32 v = *p` is NOT matched (the predicate
-             * requires a POINTER-typed result); corpus cost measured at ZERO. */
-            if (node->var_decl.init && deref_ptr_launder(c, node->var_decl.init)) {
-                checker_error(c, node->loc.line,
-                    "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                    "— the compiler cannot prove which allocation it aliases, so a later "
-                    "free through either name would be a use-after-free. Alias the pointer "
-                    "directly ('*T k = p;') instead");
-            }
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
@@ -11862,6 +12131,14 @@ static void check_stmt(Checker *c, Node *node) {
             route_alloc_to_ptr_if_needed(c, node->var_decl.init, type);
 
             Type *init_type = check_expr(c, node->var_decl.init);
+
+            /* Deref-identity sink 1/4 — VALUE BINDING. `*T k = *pp;` /
+             * `Handle(T) k = *hp;` / `Tok b = *movep;` binds a copy whose alias /
+             * allocation / ownership the analyzer cannot follow. Runs AFTER
+             * check_expr so every operand FORM is typed (see
+             * deref_identity_launder). */
+            if (deref_identity_launder(c, node->var_decl.init))
+                deref_identity_error(c, node->loc.line);
             /* D9 (2026-08-01): copying a WHOLE shared struct by value clones its
              * embedded mutex, so the copy auto-locks a DIFFERENT lock than the
              * original — every access through it is unsynchronised, and the read
@@ -12246,6 +12523,12 @@ static void check_stmt(Checker *c, Node *node) {
                         if (addr_of_is_packed_field(c, addr_exprs[ai]))
                             sym->is_packed_derived = true;
                     }
+                    /* Carry "this integer holds a VOLATILE object's address" onto
+                     * the symbol so the @inttoptr sink can see it. Set at the
+                     * declaration, checked at the use — the same shape as
+                     * is_packed_derived directly above. (BUG-800) */
+                    if (expr_is_ptrtoint_of_volatile(c, init))
+                        sym->is_volatile_addr = true;
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:
                      *   `Box b = { .ptr = &local };`        (Case `&local`)
@@ -13626,15 +13909,6 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
-        /* Deref-launder sink: `return *pp;` hands the CALLER an alias the analyzer
-         * cannot follow, so a free through either name is a UAF. Same predicate and
-         * Level-A stance as the var-decl sink. Scalar / struct-VALUE not matched. */
-        if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
-            checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer-to-pointer "
-                "— the compiler cannot prove which allocation it aliases, so a later "
-                "free through either name would be a use-after-free. Alias the pointer "
-                "directly ('*T k = p;') instead");
-        }
         /* B4: ban control flow that exits a @once body (would skip the done-publish). */
         if (c->in_once) {
             checker_error(c, node->loc.line,
@@ -13656,6 +13930,12 @@ static void check_stmt(Checker *c, Node *node) {
 
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
+
+            /* Deref-identity sink 3/4 — RETURN. `return *pp;` hands the CALLER a
+             * copy whose alias / allocation / ownership the analyzer cannot
+             * follow. Runs AFTER check_expr so every operand FORM is typed. */
+            if (deref_identity_launder(c, node->ret.expr))
+                deref_identity_error(c, node->loc.line);
 
             /* Stage 1->2 escape summary accumulator (2026-06-22): classify this
              * valued return's region. STATIC contributes nothing; ARParam(n) adds
@@ -17369,6 +17649,105 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
     r->address_taken = false;
 }
 
+/* ================================================================
+ * ONE query for "does this index's proven range settle the access?" (BUG-799)
+ *
+ * The question was answered independently at five sinks and the answers drifted.
+ * `array[literal]`, `array[call()]` and `mmio[literal]` all had the ALWAYS-OOB
+ * arm; `array[ident]` had none, and `mmio[ident]` had NEITHER arm. So
+ * `u32 i = 10; arr[i] = 1;` on a `u32[4]` — where VRP knows i is exactly 10 and
+ * the array holds 4, i.e. the access is proven, proven WRONG — merely warned
+ * "not proven in range" and fell into the auto-guard, whose runtime form is
+ * `if (i >= 4) { return <zero>; }`. The program compiled, ran, skipped the store
+ * AND everything after it in the function. Silent at both ends; on bare metal an
+ * init routine just stops half-way. The MMIO sink additionally made a provably
+ * in-range index pay for a guard it did not need.
+ *
+ * Verdicts:
+ *   max <  bound (and min >= 0)  -> IN_BOUNDS   (elide the guard)
+ *   min >= bound, or max < 0     -> ALWAYS_OOB  (compile error)
+ *   anything else                -> UNKNOWN     (guard, as before)
+ *
+ * SOUNDNESS. The safe arm needs `max` to be a sound UPPER bound; the error arm
+ * needs `min` to be a sound LOWER bound. VRP maintains both (merges take the
+ * union — vrp_snap_join; a label or an `&x` widens to the full range), so the
+ * error direction rests on the same invariant the long-shipping safe direction
+ * already does.
+ *
+ * EMPTY RANGES ARE NOT AN ERROR. push_var_range INTERSECTS, so contradictory
+ * narrowings (`u32 i = 0; if (i > 5) { buf[i] = 1; }`) leave min > max. That
+ * region is unreachable, so it gets no diagnostic — reporting it would reject
+ * dead code. This is the one guard that keeps the new error arm free of false
+ * positives.
+ * ================================================================ */
+static IndexVerdict index_range_verdict(Checker *c, Node *idx_expr, uint64_t bound,
+                                        int64_t *out_min, int64_t *out_max) {
+    if (out_min) *out_min = 0;
+    if (out_max) *out_max = 0;
+    if (!idx_expr || bound == 0) return IDXV_UNKNOWN;
+    if (idx_expr->kind != NODE_IDENT) return IDXV_UNKNOWN;
+
+    struct VarRange *r = find_var_range(c, idx_expr->ident.name,
+                                        (uint32_t)idx_expr->ident.name_len);
+    if (!r) return IDXV_UNKNOWN;
+    if (r->min_val > r->max_val) return IDXV_UNKNOWN;  /* empty == unreachable */
+
+    if (out_min) *out_min = r->min_val;
+    if (out_max) *out_max = r->max_val;
+
+    if (r->min_val >= 0 && r->max_val >= 0 && (uint64_t)r->max_val < bound)
+        return IDXV_IN_BOUNDS;
+    if (r->max_val < 0) return IDXV_ALWAYS_OOB;              /* every value negative */
+    if (r->min_val >= 0 && (uint64_t)r->min_val >= bound)
+        return IDXV_ALWAYS_OOB;                              /* every value past the end */
+    return IDXV_UNKNOWN;
+}
+
+/* BUG-800 — `volatile` laundered off through a @ptrtoint -> @inttoptr round trip.
+ *
+ *   volatile *u32 reg = @inttoptr(volatile *u32, 0x40020010);
+ *   usize a  = @ptrtoint(reg);      // the qualifier leaves the type system
+ *   *u32 p   = @inttoptr(*u32, a);  // ... and does not come back
+ *   *p = 1; *p = 2;                 // -O2 coalesces; the peripheral misses a write
+ *
+ * The DIRECT strip `(*u32)reg` has always been an error; this round trip was the
+ * way around it. Filed LOW originally as "audit-visible because both intrinsics
+ * are explicit" — but what is visible at the use site is the round trip, not the
+ * qualifier loss, and the consequence is a device that silently never sees a
+ * store. Silent at BOTH ends: no compile error, and on bare metal no fault either.
+ *
+ * Model-2 (program-point property): the fact is recorded on the Symbol at the
+ * DECLARATION that binds `@ptrtoint(<volatile ptr>)`, and consumed at the
+ * @inttoptr USE — the same shape as `is_packed_derived`. Purely a TIGHTENING: a
+ * shape the propagation cannot follow simply produces no diagnostic, so it can
+ * never accept something previously rejected. */
+static bool expr_is_ptrtoint_of_volatile(Checker *c, Node *e) {
+    if (!e || e->kind != NODE_INTRINSIC) return false;
+    if (e->intrinsic.name_len != 8 ||
+        memcmp(e->intrinsic.name, "ptrtoint", 8) != 0) return false;
+    if (e->intrinsic.arg_count < 1) return false;
+    Type *pt = typemap_get(c, e->intrinsic.args[0]);
+    if (!pt) return false;
+    Type *eff = type_unwrap_distinct(pt);
+    return eff && type_dispatch_kind(pt) == TYPE_POINTER && eff->pointer.is_volatile;
+}
+
+/* Is this @inttoptr address argument known to hold a volatile object's address?
+ * Either it IS the @ptrtoint call (the INLINE shape), or it is an ident carrying
+ * the flag (the THROUGH-A-LOCAL shape). Both are closed together — closing only
+ * whichever shape the reproducer happened to use is how this class keeps coming
+ * back (CLAUDE.md, the multi-site rule). */
+static bool addr_expr_is_volatile_derived(Checker *c, Node *e) {
+    if (!e) return false;
+    if (expr_is_ptrtoint_of_volatile(c, e)) return true;
+    if (e->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                 (uint32_t)e->ident.name_len);
+        return s && s->is_volatile_addr;
+    }
+    return false;
+}
+
 /* Refactor 1: unified VRP range update on assignment.
  * One function handles both simple ident keys ("i") and compound keys ("s.x").
  * For TOK_EQ: try literal → derive_expr_range → call return range → wipe.
@@ -19007,7 +19386,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 }
 
 /* Scan a function body for return expressions with derivable range.
- * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+ * If ALL return expressions have the same derivable range, set out_min / out_max. */
 /* Union in the return ranges of any orelse-block fallback BURIED inside an
  * expression: `u32 v = (mb() orelse {return 9;}) + b;`, `id(mb() orelse
  * {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The original B9
@@ -19952,7 +20331,12 @@ bool checker_check(Checker *c, Node *file_node) {
     /* Pass 5: stack depth analysis — detect recursion */
     check_stack_depth(c, file_node);
 
-    return c->error_count == 0;
+    /* `ok` was previously computed and then DISCARDED — the return read only
+     * error_count. Harmless today (checker_check_bodies' single false-without-an-
+     * error path is a malformed file node, which this function already rejects at
+     * entry), but a verdict thrown away is a verdict that stops being true the
+     * moment someone adds a `return false` to it. Both are consulted now. */
+    return ok && c->error_count == 0;
 }
 
 /* ---- Per-function shared type cache for deadlock detection (BUG-474 proper fix) ----

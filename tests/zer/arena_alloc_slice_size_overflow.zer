@@ -1,0 +1,52 @@
+// BUG-797 — `arena.alloc_slice(T, n)` multiplied `sizeof(T) * n` with no
+// overflow guard on the IR path, so an overflowing count wrapped the BYTE
+// count to something small (or zero), the bump allocator happily satisfied
+// it, and the caller received a slice whose `.len` was the ORIGINAL huge
+// count. Every later bounds check then passes — it compares against the bogus
+// length — so every access through that slice is an unchecked out-of-bounds
+// read/write. Silent at compile time and silent at run time.
+//
+// BUG-266 added the `__builtin_mul_overflow` guard back in 2026, but only on
+// the AST emission path; function bodies have been IR-ONLY since 2026-04-19,
+// so the guard had been dead code ever since. This is the AST->IR emission
+// diff class (CLAUDE.md "AST->IR emission diff audit protocol").
+//
+// VALUE-ASSERTING, not diagnostic-asserting: an overflowing request is a
+// runtime condition, so the correct behaviour is not a compile error but a
+// FAILED allocation (null `?[*]T`), which is what an exhausted arena already
+// returns. This test therefore checks the runtime outcome.
+//
+// DISCRIMINATING: measured exit 1 on a pre-fix build (the allocation
+// succeeded and reported len == 2305843009213693952 over a 1024-byte arena).
+
+struct Big { u64 a; }
+
+u32 main() {
+    u8[1024] backing;
+    Arena ar = Arena.over(backing);
+
+    // sizeof(Big) is 8, so 8 * 2^61 == 2^64, which wraps to a zero byte count.
+    u64 huge = 0x2000000000000000;
+    ?[*]Big s = ar.alloc_slice(Big, huge);
+    if (s) |sl| {
+        // Pre-fix: reached, with sl.len == huge over a 1024-byte arena.
+        if (sl.len > 128) { return 1; }
+        return 2;
+    }
+
+    // A request that overflows must fail the allocation, exactly like one that
+    // simply does not fit.
+    ?[*]Big too_big = ar.alloc_slice(Big, 4096);
+    if (too_big) |tb| {
+        if (tb.len > 128) { return 3; }
+        return 4;
+    }
+
+    // ... and an ordinary request must still succeed and be usable.
+    ?[*]Big ok = ar.alloc_slice(Big, 8);
+    if (ok) |o| {
+        if (o.len != 8) { return 5; }
+        return 0;
+    }
+    return 6;
+}

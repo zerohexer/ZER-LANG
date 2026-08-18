@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: dereferencing a pointer-to-pointer
+// expect-error: dereferencing a pointer to a pointer
 // Sibling sink: the laundered pointer is RETURNED, handing the caller an alias
 // the analyzer cannot follow. Also found by enumeration, not reported.
 struct Node { u32 v; }

@@ -220,6 +220,12 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
+	@echo "=== docs/reference.md example audit (the docs must match the compiler) ==="
+	@bash tools/audit_reference_examples.sh ./zerc docs/reference.md
+
+# Standalone target — check only that reference.md agrees with the compiler.
+check-reference:
+	@bash tools/audit_reference_examples.sh ./zerc docs/reference.md
 
 # Stage 3 standalone target — run just the fixed-buffer linter.
 check-fixed-buffers:
@@ -506,4 +512,4 @@ check-safety-coverage:
 	    echo "OK: safety_coverage_raw.md up to date"; \
 	fi
 
-.PHONY: check check-all clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix docker-vsix-wasi check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst
+.PHONY: check check-all check-reference clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix docker-vsix-wasi check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst

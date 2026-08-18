@@ -312,6 +312,78 @@ Corpus cost ZERO. Tests:
 `tests/zer_fail/atomic_packed_{interleaved_chain,nested_struct}.zer`, both
 verified to produce ZERO diagnostics on a from-HEAD build.
 
+### BUG-805 — `defer <extern destructor>(p)` was not a free, so the documented C-interop idiom failed to compile
+
+**Found by this audit, by compiling the documentation.** The main-body IR_CALL
+handler classifies `sensor_close(dev)` as a free through `ir_is_extern_free_call`
+(bodyless, void, pointer/opaque first param — or a destructor-conventional name).
+The DEFER-body scanner asked a narrower NAME-ONLY question: literally `free`, or a
+`.free` / `.free_ptr` method. So the SAME call inside a `defer` was not a free:
+
+```zer
+*opaque dev = sensor_open("/dev/spi0");
+defer sensor_close(dev);        // "allocated ... but never freed"
+```
+
+One semantic question, two answers, two sites — the multi-site class, here
+producing an OVER-rejection rather than a hole. The cost was not academic: this is
+the flagship "Safe C Library Interop" example in `docs/reference.md`, which the
+documentation asserted compiles and which did not. Verified that the DIRECT call
+IS recognised (the use-after-close negative rejects correctly), which is what
+localised the defect to the defer scanner rather than the heuristic.
+
+Risk review, since this is a RELAXATION (reject → accept), the one change class
+where a bug is a shipped UAF: widening what counts as a free inside a defer marks
+the handle FREED, which is the CONSERVATIVE direction for the use checks — a later
+use errors MORE, not less. It relaxes only the LEAK check, and only by trusting
+the exact classifier the main-body path already trusts. Double-free through a
+defer still fires (verified: `defer close(p); close(p);` reports both the UAF and
+the deferred double free).
+
+Corpus cost ZERO. Test:
+`tests/zer/defer_extern_destructor_no_false_leak.zer` with a self-contained C
+shim (`tests/zer/zer_test_sensor.h`), verified to report the false leak on a
+from-HEAD build. The shim carries a note for the next cinclude test: ZER's
+`*opaque` crosses the C boundary as the `_zer_opaque` struct, not a bare `void *`.
+
+### docs/reference.md — 98 undocumented intrinsics, and a gate so it stays true
+
+The reference documented ~67 intrinsic names while the compiler dispatches ~165.
+ZER users cannot look anything up on the web, so an undocumented intrinsic is
+effectively an absent one. Added **SYSTEM & PRIVILEGED INTRINSICS** (MMU, TLB,
+cache maintenance, port I/O, MSR/CR/XCR0, CPUID, power, privilege transitions,
+spin-wait and RNG) with the privilege marking and the dead-branch test pattern
+each one needs, plus **@config**, documented honestly: no configuration source is
+wired, so it emits the default unconditionally and ignores the key.
+
+Verified BOTH directions afterwards: nothing the compiler dispatches is
+undocumented except register names and libc heuristics, and nothing documented is
+absent from the compiler.
+
+**`tools/audit_reference_examples.sh`** (NEW, in `make check`, standalone
+`make check-reference`) keeps it true. It extracts every ```zer block and checks
+both directions:
+
+- a complete program the docs present as working MUST compile — that is what
+  caught BUG-805;
+- a block whose LIVE code carries a `COMPILE ERROR` marker MUST be rejected —
+  the vacuous-test rule applied to documentation, since a doc claiming a rule the
+  compiler no longer enforces is worse than silence.
+
+Fragments (no `main`) cannot be compiled as-is, and 115 of 154 genuinely need
+context the prose supplies, so they are skipped WITH THE COUNT PRINTED rather than
+silently — except for error-annotated fragments, which are checked under two
+wrappings because that direction decays silently as the compiler relaxes. Coverage
+is 42 of 170 blocks.
+
+Verified NON-VACUOUS by injecting one fault of each kind; both were reported and
+the gate exited 1. On its first real run it found two of its own false positives
+(error markers on COMMENTED-OUT lines are positives, not negatives) and one real
+documentation inaccuracy: the container by-value self-reference example implied
+the DECLARATION is the error, when the error is reported at the INSTANTIATION,
+because a `container` is a template and the layout only has to be finite once it
+is stamped. Example corrected to show where the diagnostic actually appears.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

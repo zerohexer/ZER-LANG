@@ -2091,7 +2091,7 @@ static bool ir_defer_is_arena_reset(Node *node) {
  *   - bare free(x)    (plain cstdlib from cinclude)
  *   - Task.free(x) / Task.free_ptr(x)
  */
-static Node *ir_defer_free_arg(Node *node) {
+static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
     if (!node) return NULL;
     if (node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return NULL;
     Node *call = node->expr_stmt.expr;
@@ -2108,6 +2108,17 @@ static Node *ir_defer_free_arg(Node *node) {
     if (callee && callee->kind == NODE_IDENT &&
         callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0)
+        return call->call.args[0];
+    /* BUG-805: an EXTERN destructor. The main-body IR_CALL handler classifies
+     * `sensor_close(dev)` as a free via ir_is_extern_free_call (bodyless, void,
+     * pointer/opaque first param — or a destructor-conventional name), but this
+     * scanner asked a NARROWER name-only question, so the SAME call inside a
+     * `defer` was not a free. Result: `*opaque dev = open(); defer close(dev);`
+     * — the canonical C-interop cleanup idiom, and the flagship example in
+     * docs/reference.md "Safe C Library Interop" — failed to compile with a
+     * FALSE leak. One question, two answers, two sites; they ask the same one
+     * now. */
+    if (zc && ir_is_extern_free_call(zc, call))
         return call->call.args[0];
     return NULL;
 }
@@ -2210,7 +2221,7 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     /* Try this node as a free statement */
-    Node *farg = ir_defer_free_arg(body);
+    Node *farg = ir_defer_free_arg(zc, body);
     if (farg) {
         int root_local;
         const char *path;
@@ -2352,7 +2363,7 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
-        ir_defer_free_arg(body) == NULL) {
+        ir_defer_free_arg(zc, body) == NULL) {
         ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
     }
 

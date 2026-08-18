@@ -2022,6 +2022,219 @@ u8[512] fpu;
 
 ---
 
+### @config(key, default)
+
+**DESCRIPTION**
+Build-configuration lookup with a fallback. The key is a string literal naming a
+configuration entry; the last argument is the default value, and the result takes
+that value's type.
+
+```zer
+u32 main() {
+    u32 baud = @config("uart.baud", 115200);
+    if (baud != 115200) { return 1; }
+    return 0;
+}
+```
+
+**CURRENT BEHAVIOUR — read this before using it.** No configuration SOURCE is
+wired up yet: both emission paths emit the DEFAULT unconditionally, so `@config`
+is today an identity on its last argument. It is documented here because the
+compiler accepts it and will silently ignore the key, which is worth knowing
+before you build a config system on top of it. Tracked in `docs/limitations.md`.
+
+**NOTES**
+- The key argument is not validated — a typo produces no diagnostic, because the
+  key is not consulted at all.
+- The result type is the DEFAULT's type, so `@config("x", 0)` is a `u32` and
+  `@config("x", 0.0)` is an `f64`.
+
+---
+
+### SYSTEM & PRIVILEGED INTRINSICS (MMU / TLB / cache / port I/O / MSR / CPUID)
+
+**DESCRIPTION**
+The kernel- and driver-facing half of the intrinsic set. Every one of these is a
+real instruction (or a GCC builtin) on the selected `--target-arch`; non-x86
+targets get a documented no-op fallback where the instruction does not exist.
+
+**PRIVILEGE.** Entries marked *(privileged)* require CPL=0 / EL1+ / M-mode. They
+SIGSEGV or SIGILL in a hosted user-mode process, so a test may only COMPILE them,
+never execute them — use the dead-branch pattern:
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    if (never == 42) {          // never true, but still compiled
+        @tlb_flush_all();       // privileged — compiled, not executed
+    }
+    return 0;
+}
+```
+
+`tests/zer/system_intrinsics_surface.zer` is the executable proof that every
+signature below compiles.
+
+**MMU (D-Alpha-5)** — all *(privileged)*
+```zer
+@mmu_enable()                    // void
+@mmu_disable()                   // void
+@mmu_sync()                      // void — barrier after a page-table edit
+@mmu_is_enabled()      -> bool
+@mmu_set_pt(u64 base)            // void — set the page-table base
+@mmu_set_kernel_pt(u64 base)     // void
+@mmu_get_pt()          -> u64
+@mmu_get_kernel_pt()   -> u64
+@mmu_get_fault_addr()  -> u64    // faulting address (CR2 on x86, FAR on ARM)
+@mmu_get_fault_status()-> u64    // fault status register
+```
+
+**TLB (D-Alpha-6)** — all *(privileged)*
+```zer
+@tlb_flush_all()                 // void
+@tlb_flush_global()              // void — includes global pages
+@tlb_flush_asid(u64 asid)        // void
+@tlb_flush_addr(u64 addr)        // void — single page
+@tlb_flush_range(u64 start, u64 end_exclusive)   // void
+```
+
+**Cache maintenance (D-Alpha-6 / D-Alpha-13)**
+```zer
+@cache_flush_range(*u8 buf, usize len)        // clean + invalidate
+@cache_clean_range(*u8 buf, usize len)        // write back only
+@cache_invalidate_range(*u8 buf, usize len)   // discard only
+@cache_invalidate_icache(*u8 buf, usize len)  // after writing code
+@cache_flush_line(*u8 addr)                   // CLFLUSH / DC CIVAC
+@cache_zero_line(*u8 addr)                    // DC ZVA / stores
+@cache_flushopt(*u8 addr)                     // CLFLUSHOPT (ordered)
+@cache_writeback(*u8 addr)                    // CLWB — NVDIMM/pmem
+@nt_store(*u8 addr, u64 val)                  // MOVNTI — bypass cache
+@cpu_cache_disable()   // (privileged) CR0.CD=1 + WBINVD
+@cpu_cache_enable()    // (privileged) CR0.CD=0
+@cpu_cache_line_size() -> u32                 // non-privileged
+```
+
+**Port I/O (D-Alpha-13)** — x86, *(privileged: CPL <= IOPL)*
+```zer
+@port_in8(u16 port)  -> u8      @port_out8(u16 port, u8 val)
+@port_in16(u16 port) -> u16     @port_out16(u16 port, u16 val)
+@port_in32(u16 port) -> u32     @port_out32(u16 port, u32 val)
+```
+
+**MSR / control registers / XSAVE mask (D-Alpha-9)** — all *(privileged)*
+```zer
+@cpu_read_msr(u32 msr) -> u64    @cpu_write_msr(u32 msr, u64 val)
+@cpu_read_cr0()  -> u64          @cpu_write_cr0(u64)
+@cpu_read_cr2()  -> u64          // page-fault address
+@cpu_read_cr3()  -> u64          @cpu_write_cr3(u64)   // address-space switch
+@cpu_read_cr4()  -> u64          @cpu_write_cr4(u64)
+@cpu_read_xcr0() -> u64          @cpu_write_xcr0(u64)  // XSETBV
+```
+
+**Segment bases, debug registers, extended state, firmware (D-Alpha-13)**
+```zer
+@cpu_read_fsbase()  -> u64       @cpu_write_fsbase(u64)   // (privileged) needs CR4.FSGSBASE
+@cpu_read_gsbase()  -> u64       @cpu_write_gsbase(u64)   // (privileged)
+@cpu_read_dr(u32 idx) -> u64     @cpu_write_dr(u32 idx, u64 val)  // (privileged) DR0-3/6/7
+@cpu_xsave(*u8 buf, u64 mask)    @cpu_xrstor(*u8 buf, u64 mask)   // (privileged)
+@cpu_fxsave(*u8 buf)             @cpu_fxrstor(*u8 buf)    // legacy 512-byte, 16-byte aligned
+@cpu_fpu_init()                  // FNINIT
+@cpu_read_pmc(u32 idx) -> u64    // (privileged unless CR4.PCE=1)
+@cpu_sbi_call()                  // RISC-V ecall to M-mode firmware
+@cpu_smc_call()                  // ARM TrustZone smc #0
+```
+
+**Privilege transitions (D-Alpha-12)** — all *(privileged)*
+```zer
+@cpu_syscall()                   // user -> kernel  (syscall / svc / ecall)
+@cpu_sysret()                    // kernel -> user
+@cpu_iret()                      // interrupt return (iretq / eret / mret)
+@cpu_hypercall()                 // guest -> hypervisor (vmcall / hvc)
+@cpu_set_priv_stack(u64 sp)      // kernel stack for syscall entry
+@cpu_get_priv_level() -> u32     // non-privileged: 0 = user
+@cpu_eoi()                       // end-of-interrupt to LAPIC/GICv3
+```
+All of these require correct system-register context (CS/RIP/RFLAGS on x86,
+ELR/SPSR on ARM, sepc/sstatus on RISC-V) BEFORE the transition instruction. That
+context is hardware state, not program data — ZER cannot verify it (see CLAUDE.md
+"hardware-consequence is floor").
+
+**CPU inspection (D-Alpha-10 / D-Alpha-14)** — all NON-privileged, safe to run
+```zer
+@cpu_read_sp()       -> u64      // stack pointer
+@cpu_read_tp()       -> u64      // thread pointer / TLS base
+@cpu_read_flags()    -> u64      // RFLAGS / NZCV
+@cpu_read_counter()  -> u64      // cycle counter (RDTSC / CNTVCT / rdcycle)
+@cpu_get_pc()        -> u64      // current instruction pointer
+@cpu_vendor_id()     -> u64      // CPUID leaf 0 EBX
+@cpu_feature_bits()  -> u64      // CPUID leaf 1 ECX:EDX packed
+@cpu_model_id()      -> u32      // CPUID leaf 1 EAX
+@cpu_cpuid(u32 leaf, u32 subleaf)     -> u64   // (EBX << 32) | EAX
+@cpu_cpuid_ecx(u32 leaf, u32 subleaf) -> u64   // (EDX << 32) | ECX
+@cpu_id()            -> u32      // current core number
+@cpu_core_id()       -> u32      // physical core id
+@cpu_num_cores()     -> u32
+@cpu_current_mode()  -> u32
+@cpu_endbr()                     // ENDBR64 — CET-IBT landing pad
+```
+
+**Spin-wait, power and RNG (D-Alpha-7 / D-Alpha-8 / D-Alpha-11)**
+```zer
+@cpu_pause()                     // PAUSE / YIELD — spin-loop hint
+@cpu_wfe()                       // wait for event
+@cpu_sev()                       // send event
+@cpu_idle_hint()                 // non-blocking low-power hint
+@cpu_breakpoint()                // INT3 / BRK
+@cpu_flush_pipeline()            // ISB / serialize
+@barrier_dma()                   // DMA-coherence barrier for driver code
+@wait_on_address(*u32 addr, u32 expected)   // efficient poll until *addr != expected
+@cpu_deep_sleep()                // (privileged) deepest idle (WFI / HLT)
+@cpu_reset()                     // (privileged) safe halt-forever fallback
+@cpu_monitor_addr(*u8 addr)      // (privileged) x86 MONITOR — pairs with @cpu_mwait
+@cpu_mwait()                     // (privileged)
+@cpu_umonitor(*u8 addr)          // user-mode MONITOR (WAITPKG)
+@cpu_umwait(u32 hint, u64 deadline)  // hint: 0 = C0.2, 1 = C0.1
+@cpu_rdrand() -> ?u64            // OPTIONAL — the instruction can fail
+@cpu_rdseed() -> ?u64            // OPTIONAL — the instruction can fail
+```
+
+**EXAMPLE** (a driver-shaped fragment — compiles and runs)
+```zer
+volatile u32 never = 0;
+u8[64] dma_buf;
+
+u32 main() {
+    // A hardware RNG can FAIL, so it returns ?u64 — you must unwrap it.
+    u64 seed = @cpu_rdrand() orelse 0;
+
+    // Spin-wait politely; non-privileged, safe on a hosted host.
+    @cpu_pause();
+    u64 t0 = @cpu_read_counter();
+
+    if (never == 42) {                      // privileged: compiled, not executed
+        @cache_clean_range(&dma_buf[0], 64);  // publish the buffer to the device
+        @barrier_dma();
+        @port_out8(0x60, 1);                  // kick the device
+        @tlb_flush_addr(0x1000);
+    }
+    if (t0 == 1 && seed == 2) { return 1; }
+    return 0;
+}
+```
+
+**NOTES**
+- Every *(privileged)* entry traps in user mode. Verify with the dead-branch
+  pattern; do not put one in a runnable `tests/zer/` positive.
+- `@cpu_rdrand` / `@cpu_rdseed` return `?u64`, not `u64` — the instruction has a
+  documented failure mode, so the optional is the honest type.
+- `@cpu_core_id`, `@cpu_current_mode`, `@cpu_num_cores` are stubs on hosted
+  targets (0 / 0 / 1); `@cpu_cache_line_size` returns the common default 64.
+- These are ACCESS MECHANISMS. ZER verifies the operation (type, qualifier,
+  bounds, context); whether the MSR number, port or page-table entry is the right
+  one for your silicon is datasheet truth — hardware-consequence, out of scope.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2651,8 +2864,25 @@ a.val = 10; b.val = 20; a.next = &b;
 - BY-VALUE self-reference is a compile error — it would be an infinite-size
   struct. Use a pointer field instead:
 ```zer
-container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR
-container BNode(T) { T val; ?*BNode(T) child; } // OK
+container BNode(T) { T val; BNode(T) child; }
+u32 main() {
+    BNode(u32) b;    // COMPILE ERROR — reported HERE, at the instantiation
+    b.val = 1;
+    return b.val;
+}
+```
+  A `container` is a template, so the DECLARATION alone is accepted; the error
+  is reported where the template is STAMPED with a concrete type, because that
+  is the point at which the layout would have to be infinite. The pointer form
+  is fine at both places:
+```zer
+container BNode(T) { T val; ?*BNode(T) child; }
+u32 main() {
+    BNode(u32) b;
+    b.val = 1;
+    b.child = null;
+    return b.val;
+}
 ```
 
 ---

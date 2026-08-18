@@ -1,0 +1,31 @@
+// BUG-805 — `defer <extern destructor>(p)` was not recognised as a free, so the
+// canonical C-interop cleanup idiom failed to compile with a FALSE leak:
+//
+//     *opaque dev = sensor_open(...);
+//     defer sensor_close(dev);        // "allocated ... but never freed"
+//
+// The DIRECT call `sensor_close(dev)` WAS recognised — the main-body IR_CALL
+// handler classifies it through ir_is_extern_free_call (bodyless, void,
+// pointer/opaque first param, or a destructor-conventional name). The defer-body
+// scanner asked a narrower NAME-ONLY question. One semantic question, two
+// answers, two sites: the multi-site class this project treats as its #1 bug
+// shape, here producing an over-rejection rather than a hole.
+//
+// This is docs/reference.md's flagship "Safe C Library Interop" example, which
+// the documentation asserted compiles and which did not. It does now.
+//
+// Uses a LOCAL C shim rather than a real vendor header so the test is
+// self-contained and actually links.
+cinclude "zer_test_sensor.h";
+
+*opaque sensor_open(u32 id);
+void sensor_close(*opaque dev);
+u32 sensor_read(*opaque dev);
+
+u32 main() {
+    *opaque dev = sensor_open(1);
+    defer sensor_close(dev);       // must NOT be reported as a leak
+    u32 v = sensor_read(dev);      // dev is still ALIVE here
+    if (v != 7) { return 1; }
+    return 0;
+}

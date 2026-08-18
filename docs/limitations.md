@@ -5,6 +5,54 @@ Entries removed once fixed.
 
 ---
 
+## DONE (2026-08-18) — full-codebase audit: 19 fixes (BUG-796..814)
+
+Nine were found by this audit and appear in no earlier ledger; ten close the HIGH
+rows the 2026-08-17 harvest left open. Every one was verified LIVE on main before
+any code was written, and every new test was verified DISCRIMINATING against a
+from-HEAD `git archive` build. Full per-bug detail: BUGS-FIXED.md
+"Session 2026-08-18".
+
+`make check` exit **0** — 1273 .zer tests, all ten matrices (hw 34/34, conc
+84/84), sink matrix 78 ok / 0 mismatch, every audit reached and green.
+
+| # | class | severity |
+|---|---|---|
+| 796 | deref identity boundary — FORM x TYPE x SINK | accept-unsafe |
+| 797 | `arena.alloc_slice` overflow guard dead on the IR path | silent OOB |
+| 798 | aggregate comparison silently always false | miscompile |
+| 799 | provably-OOB index compiled to a silent early return | bare-metal silent |
+| 800 | `volatile` laundered through @ptrtoint -> @inttoptr | bare-metal silent |
+| 801 | `@inttoptr` into an mmio range did not require `volatile` | bare-metal silent |
+| 802 | comptime folded a different value than runtime | miscompile |
+| 803 | the ARENA lifetime missing from both shared frame-bound helpers | accept-unsafe |
+| 804 | the root-ident walk written five times, and written wrong | bare-metal silent |
+| 805 | `defer <extern destructor>` was not a free | over-rejection |
+| 806 | `@atomic_*` in a global initializer emitted broken C | diagnostic |
+| 807 | the one frame-bound question that never called the shared peeler | accept-unsafe |
+| 808 | a non-final `default` arm made every later arm dead code | miscompile |
+| 809 | a leak in a both-arms-return `if` was never reported | missed diagnostic |
+| 810 | `volatile` stripped at four of six value-flow sinks | bare-metal silent |
+| 811 | `--stack-limit` never summed `main` and the ISRs | bare-metal silent |
+| 812 | a bare-metal target had no way to SAY so; `@critical` degraded silently | bare-metal silent |
+| 813 | `break` in a for-INITIALISER bound to the enclosing loop | silent wrong branch |
+| 814 | the MMIO boot validator could never fire, and trying cost a boot hang | bare-metal |
+
+**Four new gates**, each verified to FIRE against a pre-fix build before being
+trusted: SHAPE p16 + p17 in `tools/sink_matrix.sh` (64 -> 78 cells), four
+volatile-strip cells in `tests/test_hw_matrix.c` (30 -> 34),
+`tools/audit_reference_examples.sh`, and `tools/audit_freestanding.sh`.
+
+**The dominant shape, again: one question answered at N sites.** 11 of the 19
+were that — the arena lifetime asked at 2 of 4 helpers, the root-ident walk
+written 5 times, `volatile` checked at 2 of 6 sinks, the launder peel called by
+every frame-bound predicate except the one that is their leaf. Each was closed by
+naming the question once (`symbol_is_frame_bound_ptr`, `expr_root_ident`,
+`volatile_strip_detected`, `index_range_verdict`) rather than patching the
+reported site.
+
+---
+
 ## DONE (2026-08-18) — the 2026-08-17 harvest's HIGH rows are CLOSED
 
 All ten HIGH holes listed by the 2026-08-17 entry were re-measured LIVE on main on

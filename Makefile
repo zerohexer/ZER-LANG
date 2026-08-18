@@ -222,6 +222,12 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/sink_matrix.sh ./zerc
 	@echo "=== docs/reference.md example audit (the docs must match the compiler) ==="
 	@bash tools/audit_reference_examples.sh ./zerc docs/reference.md
+	@echo "=== Freestanding preamble audit (bare-metal branches must be selectable) ==="
+	@bash tools/audit_freestanding.sh ./zerc
+
+# Standalone target — check only the freestanding preamble.
+check-freestanding:
+	@bash tools/audit_freestanding.sh ./zerc
 
 # Standalone target — check only that reference.md agrees with the compiler.
 check-reference:
@@ -512,4 +518,4 @@ check-safety-coverage:
 	    echo "OK: safety_coverage_raw.md up to date"; \
 	fi
 
-.PHONY: check check-all check-reference clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix docker-vsix-wasi check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst
+.PHONY: check check-all check-reference check-freestanding clean release install docker-check docker-build docker-test-convert docker-shell docker-release docker-release-win docker-release-all docker-install docker-vsix docker-vsix-wasi check-proofs-image check-proofs check-safety-coverage check-vst-image check-vst

@@ -5205,18 +5205,53 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#if defined(__GNUC__) && !defined(__clang__)\n");
     emit(e, "#pragma GCC optimize(\"wrapv\")\n");
     emit(e, "#endif\n");
+    /* BUG-812: give the user a way to SAY "this is a freestanding target".
+     *
+     * Every bare-metal gate in this preamble keys on __STDC_HOSTED__ — but that
+     * is a COMPILER-FLAG property (it is what -ffreestanding sets), not a target
+     * property, and ZER never learns which C flags the emitted file will be
+     * compiled with. A bare-metal x86 build without -ffreestanding therefore
+     * reports __STDC_HOSTED__ == 1 and takes every hosted branch.
+     *
+     * Most of those failures are LOUD: the libc includes and the fprintf-based
+     * trap simply fail to link. One is not. `@critical` on x86 falls through to
+     * `__atomic_thread_fence(SEQ_CST)` — a memory fence that does NOT disable
+     * interrupts — so an interrupt landing inside a @critical block runs anyway
+     * and every invariant the block was protecting is unprotected, with no
+     * diagnostic and no fault. That is the gap this closes.
+     *
+     * `-DZER_FREESTANDING` is an ADDITIONAL way to select the freestanding
+     * branches, never a way to leave them: the predicate is a pure OR with the
+     * existing test, so a build that does not define it behaves exactly as
+     * before. Documented in docs/reference.md. */
+    emit(e, "/* Freestanding predicate: -DZER_FREESTANDING declares a bare-metal target\n");
+    emit(e, "   explicitly, for toolchains where __STDC_HOSTED__ does not (it reflects\n");
+    emit(e, "   -ffreestanding, not the target). Pure widening — never disables a\n");
+    emit(e, "   freestanding branch that __STDC_HOSTED__ would have selected. */\n");
+    emit(e, "#if defined(ZER_FREESTANDING) || !defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0\n");
+    emit(e, "#define _ZER_HOSTED 0\n");
+    emit(e, "#else\n");
+    emit(e, "#define _ZER_HOSTED 1\n");
+    emit(e, "#endif\n");
+    emit(e, "#if _ZER_HOSTED\n");
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
     emit(e, "#include <string.h>\n");
     emit(e, "#include <stdio.h>\n");
     emit(e, "#include <stdlib.h>\n");
+    emit(e, "#else\n");
+    /* Freestanding: stdint.h and stddef.h are FREESTANDING headers (C99 4.6),
+     * guaranteed present with -ffreestanding; string.h/stdio.h/stdlib.h are not. */
+    emit(e, "#include <stdint.h>\n");
+    emit(e, "#include <stddef.h>\n");
+    emit(e, "#endif\n");
     /* wasm32-wasi defines __STDC_HOSTED__==1 (it has a libc) but lacks
      * pthread/sched (WASI preview1 is single-threaded). Gate the POSIX-thread
      * headers + helpers on !__wasi__ (clang defines __wasi__ for that target)
      * so single-threaded ZER compiles to wasm; hosted (Linux/gcc) is
      * unaffected since !defined(__wasi__) is true there. Concurrency under
      * wasi stays unsupported (a loud undefined-symbol error at the use site). */
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
+    emit(e, "#if _ZER_HOSTED && !defined(__wasi__)\n");
     emit(e, "#include <pthread.h>\n");
     emit(e, "#include <time.h>\n");
     emit(e, "#include <sched.h>\n");
@@ -5225,7 +5260,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* B4: @once loser-wait relax — yield so the winner (running the @once body)
      * makes progress while losers spin on the done flag. Hosted only; freestanding
      * @once stays single-core (loser does not wait). */
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
+    emit(e, "#if _ZER_HOSTED && !defined(__wasi__)\n");
     emit(e, "static inline void _zer_once_relax(void) { sched_yield(); }\n");
     emit(e, "#endif\n");
     emit(e, "\n");
@@ -5360,7 +5395,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * Generic freestanding fallback uses __builtin_trap() so user code
      * still halts on a violation. */
     emit(e, "static void _zer_trap(const char *msg, const char *file, int line) {\n");
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "#if _ZER_HOSTED\n");
     emit(e, "    fprintf(stderr, \"ZER TRAP: %%s at %%s:%%d\\n\", msg, file, line);\n");
     emit(e, "#else\n");
     emit(e, "    (void)msg; (void)file; (void)line;\n");
@@ -5376,7 +5411,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * and prevents falling through to undefined execution if SIGTRAP is masked
      * or no IDT #BP handler is installed. */
     emit(e, "    __asm__ volatile(\"int3\"); for(;;) {}\n");
-    emit(e, "#elif defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+    emit(e, "#elif _ZER_HOSTED\n");
     emit(e, "    abort();\n");
     emit(e, "#else\n");
     emit(e, "    __builtin_trap();\n");
@@ -5396,7 +5431,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * call site (undefined function) — there is no portable lock primitive
      * ZER can fabricate without a runtime. */
     emit(e, "/* ZER shared struct auto-locking (recursive mutex) */\n");
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
+    emit(e, "#if _ZER_HOSTED && !defined(__wasi__)\n");
     /* BUG-483: accept optional condvar pointer — init alongside mutex in CAS winner.
      * Fixes race where condvar init after ensure_init was always false. */
     emit(e, "static inline void _zer_mtx_ensure_init_cv(pthread_mutex_t *mtx, uint8_t *inited, pthread_cond_t *cond) {\n");
@@ -5423,7 +5458,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
 
     /* ZER thread barrier — portable (mutex + condvar, like Rust) */
     emit(e, "/* ZER thread barrier */\n");
-    emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ && !defined(__wasi__)\n");
+    emit(e, "#if _ZER_HOSTED && !defined(__wasi__)\n");
     emit(e, "typedef struct {\n");
     emit(e, "    pthread_mutex_t mtx;\n");
     emit(e, "    pthread_cond_t cond;\n");
@@ -5508,7 +5543,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         emit(e, "}\n\n");
     } else {
         /* HOSTED mode (default) — current behavior with __STDC_HOSTED__ dispatch. */
-        emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 1 && !defined(__wasi__)\n");
+        emit(e, "#if _ZER_HOSTED && !defined(__wasi__)\n");
         emit(e, "#include <setjmp.h>\n");
         emit(e, "#include <signal.h>\n\n");
         emit(e, "/* Universal memory fault handler — catches bad MMIO at runtime */\n");
@@ -10602,7 +10637,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_indent(e);
             emit(e, "{\n");
             emit_indent(e);
-            emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+            emit(e, "#if _ZER_HOSTED\n");
             emit_indent(e);
             emit(e, "uint32_t _zer_once_exp_%d = 0;\n", oid);
             emit_indent(e);
@@ -10942,7 +10977,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * __STDC_HOSTED__ == 0 (freestanding) + x86 arch macro. On
          * hosted user-mode x86, cli/sti would SIGSEGV (CPL != 0), so
          * the fence-only fallback is correct there. */
-        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)\n");
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && !_ZER_HOSTED\n");
         emit_indent(e);
         emit(e, "uintptr_t _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
         emit_indent(e);
@@ -10974,7 +11009,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         /* Gap 10 fix: restore EFLAGS on bare-metal x86. The push/pop
          * order matches IR_CRITICAL_BEGIN's save/disable sequence. */
-        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__ == 0)\n");
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && !_ZER_HOSTED\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"push %%0\\n\\tpopf\" :: \"r\"(_zer_x86_flags) : \"memory\", \"cc\");\n");
         emit_indent(e);
@@ -12416,7 +12451,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                 }
             }
             if (is_once_join) {
-                emit(e, "#if defined(__STDC_HOSTED__) && __STDC_HOSTED__\n");
+                emit(e, "#if _ZER_HOSTED\n");
                 emit_indent(e);
                 emit(e, "__atomic_store_n(&_zer_once_%d, 2u, __ATOMIC_RELEASE);\n", bb->id);
                 emit(e, "#endif\n");

@@ -630,6 +630,54 @@ decided. Measured on a pre-fix build in CHECKER-ONLY mode: **zero diagnostics**.
 Without the assertion this test would pass on a compiler that had never heard of
 the rule — the exact vacuous-negative shape CLAUDE.md documents.
 
+### BUG-812 — a bare-metal target had no way to SAY so, and `@critical` degraded silently (HIGH, bare-metal silent)
+
+**Found by this audit.** Every bare-metal branch in the emitted preamble keyed on
+`__STDC_HOSTED__` — which is a **compiler-flag property** (it is what
+`-ffreestanding` sets), not a target property. `zerc` never learns which C flags
+the emitted file will be compiled with, and there was no flag or macro for the
+user to declare it either. So a bare-metal build whose flags leave
+`__STDC_HOSTED__` at 1 — `gcc -m64 -nostdlib` does exactly that — took every
+hosted branch.
+
+Most of those failures are LOUD: the libc includes and the `fprintf`-based trap
+fail to link. **One is not.** `@critical` on x86 fell through to
+`__atomic_thread_fence(SEQ_CST)` — a memory fence that does NOT disable
+interrupts. An interrupt landing inside a `@critical` block runs anyway and every
+invariant the block was protecting is unprotected, with no diagnostic and no
+fault.
+
+**Scope, measured rather than assumed.** The original report claimed every
+freestanding branch is unreachable on the mainstream embedded toolchain. That is
+wrong and worth recording: ARM, RISC-V and AVR `@critical` key on the ARCH macro
+(`__ARM_ARCH`, `__riscv`, `__AVR__`) and have always emitted the correct
+interrupt-disable sequence regardless of `__STDC_HOSTED__`. Only the **x86**
+branch was gated on it. The real exposure is bare-metal x86 — a kernel, a
+bootloader, an EFI application.
+
+Fixed by emitting one predicate, `_ZER_HOSTED`, that ORs the existing
+`__STDC_HOSTED__` test with a user-declarable `ZER_FREESTANDING`, and routing all
+nine hosted gates through it. A **pure widening**: a build that does not define
+the macro preprocesses identically, and defining it can never turn a freestanding
+branch back into a hosted one. The libc include block is now split so the two
+FREESTANDING headers (`stdint.h`, `stddef.h` — C99 §4.6 guarantees them) are
+still available on both paths.
+
+Gate: **`tools/audit_freestanding.sh`** (in `make check`, standalone
+`make check-freestanding`). It needs no cross-toolchain — it preprocesses with
+the host gcc and inspects which branches survive, checking three configurations:
+`-DZER_FREESTANDING` ALONE (the case that motivated the fix), both flags
+together, and plain hosted (the regression half).
+
+Verified NON-VACUOUS: 4 failures against a from-HEAD build, 0 after. The
+alone-case matters and the audit says why: under `-ffreestanding` the OLD and NEW
+predicates agree, so a gate testing only that combination would have scored the
+pre-fix compiler as PASSING on the `@critical` half — measured, it does.
+
+Documented in `docs/reference.md` ("Bare-metal builds — `-DZER_FREESTANDING`"),
+including what each branch changes and the note that ARM/RISC-V/AVR never needed
+it.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

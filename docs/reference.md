@@ -2022,6 +2022,54 @@ u8[512] fpu;
 
 ---
 
+### Bare-metal builds — `-DZER_FREESTANDING`
+
+**DESCRIPTION**
+Define `ZER_FREESTANDING` when compiling the emitted C for a target with no
+hosted C library (a kernel, a bootloader, an EFI application, bare-metal
+firmware). It selects the freestanding form of every runtime branch in the
+emitted preamble.
+
+```
+zerc kernel.zer -o kernel.c
+gcc -std=c99 -O2 -fwrapv -ffreestanding -nostdlib -DZER_FREESTANDING -c kernel.c
+```
+
+**WHY IT EXISTS.** The preamble's bare-metal branches used to key on
+`__STDC_HOSTED__` alone. That macro is a **compiler-flag property** — it is what
+`-ffreestanding` sets — not a property of the target, and `zerc` never learns
+which C flags the emitted file will be compiled with. A bare-metal build whose
+flags leave `__STDC_HOSTED__` at 1 (`gcc -m64 -nostdlib` does exactly that) took
+every hosted branch.
+
+Most of those failures are LOUD — the libc includes and the `fprintf`-based trap
+simply fail to link. One was not: **`@critical` on x86 fell through to
+`__atomic_thread_fence(SEQ_CST)`**, a memory fence that does *not* disable
+interrupts. An interrupt landing inside a `@critical` block ran anyway and every
+invariant the block was protecting was unprotected, with no diagnostic and no
+fault. `-DZER_FREESTANDING` is how you say what the compiler cannot infer.
+
+**WHAT IT CHANGES**
+- Hosted libc headers (`stdio.h`, `stdlib.h`, `string.h`) are not included; the
+  freestanding headers `stdint.h` and `stddef.h` still are (C99 §4.6 guarantees
+  those two).
+- `_zer_trap` uses `__builtin_trap()` instead of `fprintf` + `abort`.
+- `@once` uses the single-core form (no `sched_yield` loser-wait).
+- `@probe` uses the direct-read form (no `setjmp`/`longjmp` fault handler).
+- `@critical` on x86 emits `pushf` / `cli` … `popf` instead of a fence.
+- Shared-struct locking and `spawn` require `pthread` and stay unavailable.
+
+**NOTES**
+- It is a **pure widening**: a build that does not define it behaves exactly as
+  before, and `-ffreestanding` alone still selects the same branches. Defining it
+  can never turn a freestanding branch back into a hosted one.
+- On ARM, RISC-V and AVR, `@critical` keys on the ARCH macro (`__ARM_ARCH`,
+  `__riscv`, `__AVR__`) and has always emitted the correct interrupt-disable
+  sequence regardless of this flag. Only the x86 branch needed it.
+- `make check-freestanding` audits that the emitted preamble honours it.
+
+---
+
 ### @config(key, default)
 
 **DESCRIPTION**

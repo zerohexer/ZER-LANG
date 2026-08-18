@@ -1467,6 +1467,37 @@ static bool container_push_arg_escapes(Checker *c, Type *elem, Node *arg) {
     return arg_is_local_derived(c, arg, 0);
 }
 
+/* THE leaf test behind every "is this value frame-bound?" question: does this
+ * SYMBOL hold a pointer whose pointee dies before a global/static/param sink can
+ * legitimately hold it?
+ *
+ * Two ways a pointee dies, and BOTH count (BUG-803):
+ *   - `is_local_derived`  — the pointee is this frame's stack; it dies at return.
+ *   - `is_arena_derived` / `is_from_arena` — the pointee lives in an Arena; it
+ *     dies at `arena.reset()`, and when the arena's backing is itself a stack
+ *     array it also dies at return. That is why the rule covers ALL arenas,
+ *     global ones included (CLAUDE.md "Arena pointer escape").
+ *
+ * Before this existed, the arena half was tested at the DIRECT ident sinks but
+ * missing from the two SHARED helpers below, so the identical program escaped
+ * whenever it went through a struct literal, a launder local, or an orelse arm.
+ * ASan-confirmed stack-use-after-return on `g = { .p = arena_ptr }` while the
+ * byte-identical `g.p = arena_ptr` was correctly rejected one line away.
+ * Asking it in ONE place is what keeps the two halves from drifting again. */
+static bool symbol_is_frame_bound_ptr(const Symbol *s) {
+    if (!s) return false;
+    return s->is_local_derived || s->is_arena_derived || s->is_from_arena;
+}
+
+/* Which of the two lifetimes fired, for the diagnostic. A message that says
+ * "local" about an ARENA pointer sends the reader looking for a stack variable
+ * that is not there, so the reason travels with the predicate. */
+static const char *frame_bound_reason(const Symbol *s) {
+    if (s && !s->is_local_derived && (s->is_arena_derived || s->is_from_arena))
+        return "arena-derived";
+    return "local-derived";
+}
+
 /* AU-3/AU-4 (2026-07-01): does a struct/union literal carry a pointer/slice
  * to a function-local, at ANY nesting depth? Returns true for a field value
  * that is &local (Case A), an is_local_derived alias ident (B), a slice over a
@@ -1506,11 +1537,14 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
                 if (src && !src->is_static && !is_global) return true;
             }
         }
-        /* Case B: alias ident already flagged is_local_derived */
+        /* Case B: alias ident already flagged frame-bound. BUG-803: this tested
+         * only is_local_derived, so an ARENA-derived pointer walked through
+         * every struct-literal sink (global store, return, launder-then-store)
+         * that correctly rejects the identical `&local` shape. */
         if (fv->kind == NODE_IDENT) {
             Symbol *fsym = scope_lookup(c->current_scope,
                 fv->ident.name, (uint32_t)fv->ident.name_len);
-            if (fsym && fsym->is_local_derived) return true;
+            if (symbol_is_frame_bound_ptr(fsym)) return true;
         }
         /* Case C: slice over a local array (local[0..]) */
         if (fv->kind == NODE_SLICE) {
@@ -2101,7 +2135,7 @@ static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth) {
     if (v->kind == NODE_IDENT) {
         Symbol *s = scope_lookup(c->current_scope, v->ident.name,
                                  (uint32_t)v->ident.name_len);
-        if (s && s->is_local_derived) return s;
+        if (symbol_is_frame_bound_ptr(s)) return s;   /* BUG-803: incl. the arena axis */
     }
     return NULL;
 }
@@ -5137,12 +5171,13 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (bad && ots)
                             checker_error(c, node->loc.line,
                                 op_ ?
-                                "cannot store local-derived pointer '%.*s' through pointer parameter "
+                                "cannot store %s pointer '%.*s' through pointer parameter "
                                 "'%.*s' — reachable through an orelse arm; the pointer dangles when "
-                                "the frame returns" :
-                                "cannot store local-derived pointer '%.*s' in static/global variable "
+                                "the frame returns (or when the arena is reset)" :
+                                "cannot store %s pointer '%.*s' in static/global variable "
                                 "'%.*s' — reachable through an orelse arm; the pointer dangles when "
-                                "the frame returns",
+                                "the frame returns (or when the arena is reset)",
+                                frame_bound_reason(bad),
                                 (int)bad->name_len, bad->name,
                                 (int)ots->name_len, ots->name);
                     }
@@ -5564,8 +5599,10 @@ static Type *check_expr(Checker *c, Node *node) {
             classify_escape_sink(c, node->assign.target, &tgt_sym, &tgt_g, &tgt_p);
             if ((tgt_g || tgt_p) && tgt_sym) {
                 checker_error(c, node->loc.line,
-                    "cannot store struct/union literal carrying a pointer to a "
-                    "local in %s '%.*s' — pointer will dangle when function returns",
+                    "cannot store struct/union literal carrying a pointer that does "
+                    "not outlive this frame (a local, or memory from an Arena) in %s "
+                    "'%.*s' — the pointer dangles when the function returns or the "
+                    "arena is reset",
                     tgt_p ? "pointer-parameter field" : "global/static variable",
                     (int)tgt_sym->name_len, tgt_sym->name);
             }
@@ -14472,8 +14509,9 @@ static void check_stmt(Checker *c, Node *node) {
                 if (type_carries_data_pointer(c->current_func_ret, 0) &&
                     struct_init_has_local_derived(c, node->ret.expr)) {
                     checker_error(c, node->loc.line,
-                        "cannot return a struct literal carrying a pointer to a "
-                        "local — stack memory is freed when the function returns");
+                        "cannot return a struct literal carrying a pointer that does "
+                        "not outlive this frame (a local, or memory from an Arena) — "
+                        "the memory is gone once the function returns");
                 }
             }
 

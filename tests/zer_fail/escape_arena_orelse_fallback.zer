@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: arena-derived pointer
+// BUG-803, the ORELSE-JOIN sink. `value_frame_bound_symbol` — the single query
+// that exists precisely because an orelse is a JOIN and a peeler cannot express
+// it — tested only `is_local_derived`. So a fallback arm holding an ARENA
+// pointer reached a global unflagged, while the identical `orelse &local` was
+// correctly rejected one rule over.
+struct Node { u32 v; }
+?*Node g;
+?*Node none() { return null; }
+
+void stash() {
+    u8[256] backing;
+    Arena scratch = Arena.over(backing);
+    *Node a = scratch.alloc(Node) orelse return;
+    g = none() orelse a;
+}
+
+u32 main() { stash(); return 0; }

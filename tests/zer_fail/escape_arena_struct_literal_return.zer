@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: memory from an Arena
+// BUG-803, the RETURN sink of the same missing arena axis. The caller receives a
+// struct whose pointer field addresses an arena whose backing store died with
+// this frame. The `&local` form of this exact shape was already rejected
+// ("cannot return a struct literal carrying a pointer ..."); the arena form was
+// not, which is the asymmetry the fix removes.
+struct Node { u32 v; }
+struct Box { *Node p; }
+
+Box mkbox() {
+    u8[256] backing;
+    Arena scratch = Arena.over(backing);
+    ?*Node ma = scratch.alloc(Node);
+    *Node a = ma orelse return;
+    return { .p = a };
+}
+
+u32 main() { Box x = mkbox(); return 0; }

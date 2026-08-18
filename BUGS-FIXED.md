@@ -223,6 +223,49 @@ Test: `tests/zer/comptime_width_wrap_agreement.zer` — six comptime/runtime pai
 that must agree, plus two in-range foldings that must be unchanged. Verified exit 1
 on a pre-fix build.
 
+### BUG-803 — the ARENA lifetime was missing from the two SHARED frame-bound helpers (HIGH, accept-unsafe)
+
+**Found by this audit.** "Frame-bound" has TWO causes with DIFFERENT deaths: a
+stack local dies at return, and Arena memory dies at `arena.reset()` AND at return
+when the arena's backing is a stack array. The DIRECT ident sinks tested both
+(`val_sym->is_arena_derived || val_sym->is_from_arena`). The two SHARED helpers
+tested only the first. So the byte-identical program escaped through whichever
+syntax happened to route through a shared helper:
+
+```
+g.p = a;              // correctly REJECTED — "arena-derived pointer ... will dangle"
+g   = { .p = a };     // ACCEPTED — same pointer, same global, one line away
+```
+
+ASan on the accepted form: `stack-use-after-return` reading `g.p.v` after the
+function returns. Four sinks were live, each of which rejects the identical
+`&local` shape:
+
+| sink | shape |
+|---|---|
+| global store, struct literal | `g = { .p = arena_ptr }` |
+| return, struct literal | `return { .p = arena_ptr }` |
+| launder through a local | `Box t = { .p = arena_ptr }; g = t;` |
+| orelse JOIN | `g = x orelse arena_ptr` |
+
+Root cause was exactly two lines: `struct_init_has_local_derived`'s alias-ident
+case and `value_frame_bound_symbol`'s ident case each read `is_local_derived`
+directly. Fixed by giving the leaf test a NAME — `symbol_is_frame_bound_ptr` —
+and asking it in one place, so a future sink cannot pick up half the question.
+The diagnostics now say which lifetime fired (`frame_bound_reason`) instead of
+reporting "local" about an arena pointer, which would send the reader looking for
+a stack variable that is not there.
+
+Corpus cost ZERO. Gate: **SHAPE p16 in `tools/sink_matrix.sh`** — five reject
+cells (one per sink, plus the direct-field control that was already correct) and
+two boundary compile cells. Verified NON-VACUOUS: 4 HOLES against a from-HEAD
+build, 0 after. Tests: `tests/zer_fail/escape_arena_{struct_literal_global,
+struct_literal_return,orelse_fallback,launder_local_then_store}.zer`, each
+verified to produce ZERO diagnostics on the pre-fix compiler.
+
+The p16 row exists because the axis is durable: any future escape sink must answer
+for BOTH lifetimes, and a cell is how that stays true.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

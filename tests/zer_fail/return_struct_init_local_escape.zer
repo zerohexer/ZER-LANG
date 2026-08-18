@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: struct literal carrying a pointer to a local
+// expect-error: struct literal carrying a pointer
 // A struct/union LITERAL returned by value carrying &local dangles in the caller.
 // The var-decl and assign-to-global sinks ran struct_init_has_local_derived;
 // the return sink was the missing sibling (audit 2026-08-10).

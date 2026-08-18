@@ -5,6 +5,44 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-17b — BUG-796..801: the remaining 13 harvested holes (39/39 closed)
+
+Six independent classes, the ones the five structural fixes did not collapse.
+
+### BUG-796 — a provably-OOB index compiled to a SILENT early return (3 holes)
+Two outcomes existed (PROVEN SAFE / NOT PROVEN); an ALWAYS-OOB range fell into the
+second and got the auto-guard, whose runtime form is `if (i >= 4) { return 0; }`.
+`arr[10]` was a hard error, `u32 i = 10; arr[i]` was silent at both ends. New
+three-way `index_range_verdict()` at the array sink AND its MMIO mirror.
+
+### BUG-797 — `volatile` laundered through @ptrtoint -> @inttoptr (2 holes)
+The fact has to ride the VALUE once the type became an integer
+(`Symbol.is_volatile_addr_derived`), and be recognised inline too.
+
+### BUG-798 — the dereference identity boundary (4 holes)
+Type-driven operand (covers field/index/call-result) + Handle and move-struct
+results + a fourth sink (a deref passed straight to a callee). The arg sink is
+narrower on purpose: only a one-shot TRANSFER, never a borrow.
+
+### BUG-799 — @inttoptr bound to a non-volatile destination (1 hole)
+Scoped to CONSTANT addresses so the pointer round-trip stays legal.
+
+### BUG-800 — spawn-argument `orelse` emitted a compiler-bug trap (1 hole)
+Spawn args are emitted from RAW AST; `emit_rewritten_node` had no NODE_ORELSE arm.
+
+### BUG-801 — RMW reached from MAIN through a helper (1 hole)
+MEMOISED `Symbol.rmw_param_mask`, like `ret_param_mask`. 1s vs >4 minutes for the
+naive transitive walk.
+
+### Process notes worth keeping
+- **Five existing tests were asserting the old behaviour**, using a literal index
+  with a "// defeat VRP" trick VRP has since seen through. Corrected, not deleted.
+- **A corpus sweep over `.zer` files only is incomplete** — several hundred ZER
+  programs live INLINE in the C unit tests, and BUG-799 over-rejected one.
+- **types.h edits need `rm -f *.o src/safety/*.o`.** Skipping it produced a
+  mixed-ABI binary that emitted `__helper()` for `helper()` and failed 156/200
+  semantic-fuzz cases — the trap CLAUDE.md documents.
+
 ## Session 2026-08-17 — five STRUCTURAL fixes: BUG-791..795 (26 accept-unsafe holes)
 
 Harvested from seven `claude/*` audit branches. The bugs were NOT independent: of

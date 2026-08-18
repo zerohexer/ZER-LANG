@@ -5,64 +5,35 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — harvested 2026-08-17 from seven audit branches: 13 holes NOT yet closed
+## ~~harvested 2026-08-17 from seven audit branches~~ — **ALL 39 CLOSED 2026-08-17**
 
-Five structural fixes (BUG-791..795) closed 26 of 39 measurably-live holes. These
-13 remain. Each was VERIFIED LIVE on main using the branches' OWN test files (a
-reconstruction can confirm a hole but never refute one), in CHECKER-ONLY mode
-(`-o out.c`), because GCC refuses `__attribute__((interrupt))` on hosted x86-64 and
-masks every ISR test in exe mode.
+Five structural fixes (BUG-791..795) closed 26; the six remaining independent
+classes closed with BUG-796..801. Every hole was verified live on main using the
+branches' OWN test files, in CHECKER-ONLY mode, and every one now has a regression
+test. Corpus cost measured at zero for each tightening.
 
-Extract any branch file with:
-    git show origin/claude/vigilant-tesla-<id>:tests/zer_fail/<name>.zer
+Residuals of this work that are still open are listed below.
 
-### HIGH — silent miscompile / bare-metal
-- **A provably-OOB index compiles to a SILENT early return** (hefb6x, BUG-787
-  there): `bounds_ident_always_oob`, `bounds_ident_negative_idx`,
-  `mmio_ident_always_oob`. Also closes the long-standing "PRECISION GAP #1".
-- **`@inttoptr` does not require `volatile`** so GCC deletes the MMIO store
-  (j8f9t7): `mmio_inttoptr_nonvolatile`.
-- **`volatile` lost through a `@ptrtoint` -> `@inttoptr` round trip** (hefb6x):
-  `volatile_launder_ptrtoint_inline`, `..._roundtrip`. Supersedes the older
-  `tests/zer_gaps/volatile_stripped_ptrtoint_roundtrip.zer` gap file.
-
-### HIGH — accept-unsafe
-- **The dereference identity boundary** (t6dfxt, BUG-785 there), 4 forms:
-  `deref_identity_field_operand`, `_handle_arg`, `_handle_copy`, `_move_copy`.
-  Distinct from the deref-launder rule already in main (BUG-781/782), which those
-  tests do NOT trip.
-
-### Residuals of the five structures (stated so nothing reads as complete)
-- **RMW reached from MAIN through a helper** —
-  `tests/zer_gaps/main_rmw_via_pointer_param.zer`. The ISR side of this family is
-  CLOSED. The mirror of ISR-TRANS (a transitive walk over every regular function
-  body) was implemented and REVERTED: with the walker's depth-32 call descent it is
-  exponential and hung `test_firmware_patterns` for >4 minutes to buy this one form.
-  **Fix sketch:** a MEMOISED per-function RMW summary (bit n = performs an RMW
-  through param n), computed once per function like `ret_param_mask`, then queried
-  at call sites — O(F), not O(F x B^32).
-- **No automated gate for the MISSING-LOCK half of BUG-795.** The deadlock half is
-  pinned by a negative; a missing lock produces NO diagnostic and a
-  nondeterministic runtime effect, so neither harness can hold it (same shape as the
-  defer-goto double-fire, which needed a bespoke value-asserting harness).
-  Currently verified only by diffing emitted C against a pre-fix build.
+### Still OPEN — residuals
+- **No automated gate for the MISSING-LOCK half of BUG-795.** A missing lock emits
+  no diagnostic and has a nondeterministic runtime effect, so neither harness holds
+  it; currently verified only by diffing emitted C against a pre-fix build.
   **Fix sketch:** assert lock/unlock PAIR COUNT around a statement, the way
-  `test_defer_goto_matrix.c` asserts an acquire/release balance.
+  `tests/test_defer_goto_matrix.c` asserts an acquire/release balance.
 - **~30 hand-rolled launder-peel sites remain** in checker.c against ~15 uses of the
   shared peeler. BUG-791 converted the ones that were live holes; the rest are the
   standing debt that keeps regenerating this class.
-- **45 stale rows in `tools/type_dispatch_baseline.txt`** (content no longer present
-  in the sources). Harmless for correctness — the audit only fails on NEW sites —
-  but it is a gate drifting from its site set. The 4 rows BUG-793 made stale were
-  removed; these 45 predate it and were left alone rather than bulk-edited unverified.
+- **45 stale rows in `tools/type_dispatch_baseline.txt`** (content no longer in the
+  sources). Harmless — the audit only fails on NEW sites — but it is a gate drifting
+  from its site set. Rows made stale by BUG-793/796..801 were removed; these 45
+  predate them and were left rather than bulk-edited unverified.
 
-### Unverified — reproduce before acting
+### Unverified — reproduce before acting (unchanged)
 - j8f9t7's limitations.md carries a **SUSPECTED** block (code-reading only).
 - jjfk1k verified-and-deliberately-skipped: `@once` + a user `@sem_acquire`/`release`
   pair; global-scope `@inttoptr` with a non-literal address emits invalid C; a
   negative literal into a wide unsigned type is accepted; `rust_tests/run_tests.sh`
   uses a hard `timeout 10` so pthread tests flake under load.
-- `tests/zer_gaps/spawn_arg_orelse_emitter_trap.zer` (j8f9t7) — still open.
 
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)
 

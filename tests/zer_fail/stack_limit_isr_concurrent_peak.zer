@@ -1,0 +1,44 @@
+// EXPECTED: compile error
+// expect-error: concurrent stack peak
+// zerc-flags: --stack-limit 256
+// BUG-811 — `--stack-limit N` measured each entry point against the FULL limit
+// and never summed them. On bare metal `main` and every ISR share ONE stack: an
+// interrupt frame is pushed ON TOP of whatever main had already used. So a
+// program whose main chain needs N and whose ISR chain needs N passed
+// `--stack-limit N` while the real peak is 2N.
+//
+// Measured: two 200-byte chains sailed through `--stack-limit 256`. The overflow
+// then writes off the end of the stack region into `.bss` — on an MPU-less part,
+// with no fault, corrupting globals. The tool did not merely fail to notice; it
+// positively AFFIRMED a budget the target cannot honour, which is worse than not
+// checking at all.
+//
+// Silent at both ends: the compiler reported success, and `interrupt` blocks
+// never execute on hosted x86-64 at all (GCC refuses the attribute there), so
+// the double-stacking scenario cannot be reached on the dev machine even in
+// principle.
+//
+// MASKING NOTE — this is why the `// expect-error:` line above is load-bearing.
+// The runner compiles negatives with `-o /dev/null`, which is not a `.c` path,
+// so zerc runs GCC — and GCC refuses `__attribute__((interrupt))` on hosted
+// x86-64. Every ISR-containing negative therefore "fails to compile" whatever
+// the checker decided. Measured on a pre-fix build in CHECKER-ONLY mode
+// (`-o out.c`): ZERO diagnostics. Without the expect-error assertion this test
+// would pass on a compiler that had never heard of the rule.
+mmio 0x40020000..0x40020FFF;
+
+volatile u32 tick;
+
+void main_work() {
+    u8[200] scratch;
+    scratch[0] = 1;
+    tick = scratch[0];
+}
+
+interrupt TIM2 {
+    u8[200] isr_scratch;
+    isr_scratch[0] = 2;
+    tick = isr_scratch[0];
+}
+
+u32 main() { main_work(); return 0; }

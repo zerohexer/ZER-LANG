@@ -589,6 +589,47 @@ silently reopen the qualifier hole.
 Tests: `tests/zer_fail/volatile_strip_{struct_literal_field,optional_param,
 optional_return}.zer`, each producing ZERO diagnostics on the pre-fix compiler.
 
+### BUG-811 — `--stack-limit` never summed `main` and the ISRs, which share one stack (HIGH, bare-metal silent)
+
+**Found by this audit.** Every existing check measures ONE entry point against
+the FULL limit, and they are never summed. On bare metal `main` and every ISR
+share ONE stack: an interrupt frame is pushed ON TOP of whatever main had already
+used. So a program whose main chain needs N and whose ISR chain needs N passed
+`--stack-limit N` while the real peak is 2N.
+
+Measured: two 200-byte chains sailed through `--stack-limit 256`. The overflow
+then writes off the end of the stack region into `.bss` — on an MPU-less part,
+with no fault, corrupting globals.
+
+The severity is not "failed to notice". The tool positively AFFIRMED a budget the
+target cannot honour, which is worse than not checking at all: the user set the
+limit precisely so they would not have to reason about this.
+
+Worst case = main's chain + the sum of every ISR's chain. Without priority
+information any ISR may preempt any other, so summing all of them is the sound
+bound; that is conservative for a design that assigns priorities so only some can
+nest, which is recoverable by raising the limit and visible because the
+diagnostic prints the arithmetic. The hardware exception frame (32 bytes on
+Cortex-M, 104 with FPU lazy stacking) is deliberately NOT added — the size is
+arch- and configuration-specific, i.e. datasheet truth rather than program data,
+so the diagnostic NAMES it instead of guessing (CLAUDE.md, hardware-consequence
+is floor).
+
+Tests: `tests/zer_fail/stack_limit_isr_concurrent_peak.zer` (negative) and
+`tests/zer/stack_limit_isr_peak_fits_ok.zer` (the boundary — the rule must not
+reject every program that has both a `main` and an interrupt). The runner gained
+support for `// zerc-flags:` in the FIRST FIVE LINES rather than line 1 only, so
+a negative can carry `// EXPECTED:`, `// expect-error:` AND a flag without them
+fighting for the same line.
+
+**The `expect-error` directive is load-bearing here, and the test says so.** The
+runner compiles negatives with `-o /dev/null`, which is not a `.c` path, so zerc
+runs GCC — and GCC refuses `__attribute__((interrupt))` on hosted x86-64. Every
+ISR-containing negative therefore "fails to compile" whatever the checker
+decided. Measured on a pre-fix build in CHECKER-ONLY mode: **zero diagnostics**.
+Without the assertion this test would pass on a compiler that had never heard of
+the rule — the exact vacuous-negative shape CLAUDE.md documents.
+
 ### Tech debt paid
 
 - **560 tracked test EXECUTABLES removed from git** (11 MB). `git status` was

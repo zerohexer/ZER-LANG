@@ -35,10 +35,14 @@ for f in tests/zer/*.zer; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .zer)
     TOTAL=$((TOTAL + 1))
-    # Per-file flags: first line `// zerc-flags: --foo --bar=baz` is parsed
+    # Per-file flags: `// zerc-flags: --foo --bar=baz` in the FIRST 5 LINES is parsed
+    # (widened from line 1 only, 2026-08-18, to match the `// expect-error:` window —
+    # a negative that needs a flag also needs `// EXPECTED:` and `// expect-error:`
+    # above it, and forcing the flags onto line 1 made those two directives fight
+    # for the same line)
     # and appended to ZERC invocation. Used for tests that need specific
     # target features (e.g., --target-features=avx512f).
-    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    file_flags=$(head -5 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     # Timeout (2026-06-21): a positive test must compile + run + exit 0 within
     # ZER_RUN_TIMEOUT seconds. A DEADLOCK (e.g. a botched auto-lock leaving a
     # mutex held) would otherwise hang the whole `make check`; `timeout` makes
@@ -77,7 +81,7 @@ for f in tests/zer_trap/*.zer; do
     # Runtime-trap tests: compile clean, run, EXPECT non-zero exit (SIGTRAP = 133).
     # Per-file flags via '// zerc-flags: ...' first line (same as positive/negative
     # sections) — e.g. BUG-736's --no-strict-mmio alignment-trap test.
-    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    file_flags=$(head -5 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
     ret=$?
     if [ $ret -ne 0 ]; then
@@ -100,7 +104,7 @@ for f in tests/zer_fail/*.zer; do
     # Per-file flags directive (same as positive branch). Some negatives
     # only fail under specific compiler configurations (e.g.,
     # --probe-mode=disabled rejecting @probe usage).
-    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    file_flags=$(head -5 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     # Compile only (not --run), expect failure
     # 2026-08-03: capture the diagnostic instead of discarding it, so a test can
     # assert WHY it was rejected. Before this, a negative passed on ANY non-zero

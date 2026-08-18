@@ -19469,6 +19469,69 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                     (int)f->name_len, f->name);
             }
         }
+
+        /* BUG-811: the CONCURRENT PEAK. Every check above measures ONE entry
+         * point against the FULL limit, and they are never summed — but on bare
+         * metal `main` and every ISR share ONE stack, and an interrupt frame is
+         * pushed ON TOP of whatever `main` had already used. So a program whose
+         * main chain needs N bytes and whose ISR chain needs N bytes passed
+         * `--stack-limit N` while the real peak is 2N.
+         *
+         * Measured: two 200-byte chains sailed through `--stack-limit 256`. The
+         * overflow then writes off the end of the stack region into `.bss` — on
+         * an MPU-less part, with no fault, corrupting globals. The tool did not
+         * merely fail to notice; it positively AFFIRMED a budget the target
+         * cannot honour, which is worse than not checking at all.
+         *
+         * Worst case = main's chain + the sum of every ISR's chain: without
+         * priority information any ISR may preempt any other, so summing all of
+         * them is the sound bound. That is conservative for a design that
+         * assigns priorities so only some can nest — recoverable by raising the
+         * limit, and visible because the diagnostic prints the arithmetic.
+         *
+         * The hardware exception frame (32 bytes on Cortex-M, 104 with FPU lazy
+         * stacking) is NOT added: the size is arch- and configuration-specific,
+         * i.e. datasheet truth rather than program data, so the diagnostic names
+         * it instead of guessing (CLAUDE.md, hardware-consequence is floor). */
+        if (c->stack_limit > 0) {
+            uint32_t main_depth = 0, isr_total = 0;
+            int isr_count = 0;
+            for (int i = 0; i < c->stack_frame_count; i++) {
+                struct StackFrame *f = &c->stack_frames[i];
+                if (f->is_recursive) continue;   /* already warned: unbounded */
+                uint32_t d = compute_max_depth(c, f, visited, 0);
+                if (f->name_len == 4 && memcmp(f->name, "main", 4) == 0) {
+                    main_depth = d;
+                    continue;
+                }
+                for (int dd = 0; dd < file_node->file.decl_count; dd++) {
+                    Node *decl = file_node->file.decls[dd];
+                    if (decl->kind == NODE_INTERRUPT &&
+                        decl->interrupt.name_len == f->name_len &&
+                        memcmp(decl->interrupt.name, f->name, f->name_len) == 0) {
+                        isr_total += d;
+                        isr_count++;
+                        break;
+                    }
+                }
+            }
+            if (isr_count > 0 && (uint64_t)main_depth + (uint64_t)isr_total >
+                                 (uint64_t)c->stack_limit) {
+                checker_error(c, 0,
+                    "concurrent stack peak %u bytes exceeds --stack-limit %u — "
+                    "main's call chain needs %u and %d interrupt handler%s %u "
+                    "more, and on bare metal they share ONE stack (an interrupt "
+                    "frame is pushed on top of whatever main was using). Each "
+                    "entry point fits on its own, which is why this was not "
+                    "reported before. The hardware exception frame is NOT included "
+                    "in this figure — add your target's (32 bytes on Cortex-M, 104 "
+                    "with FPU lazy stacking) on top",
+                    (unsigned)(main_depth + isr_total), (unsigned)c->stack_limit,
+                    (unsigned)main_depth,
+                    isr_count, isr_count == 1 ? " needs" : "s need",
+                    (unsigned)isr_total);
+            }
+        }
         free(visited);
     }
 }

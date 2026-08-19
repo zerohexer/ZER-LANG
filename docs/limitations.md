@@ -499,6 +499,39 @@ with the `u32` result truncated at the return, which is what the exit status alr
 does) and `-Wpointer-sign` (emit a `(const char *)` cast when a `[*]u8` reaches a
 variadic C parameter).
 
+### PROBED CLEAN 2026-08-19 — recorded so nobody re-runs these blind
+
+Roughly 60 hand probes across seven axes found **no accept-unsafe hole** outside the
+five fixed this session. Recording the negative result with its shapes, because an
+unrecorded clean sweep gets repeated.
+
+- **UAF / aliasing** — whole-struct copy carrying a pointer field, field-store then
+  local use (both directions), identity-function launder, slice free then index,
+  optional-unwrap free then re-unwrap, double free through a struct copy, defer-free
+  in a loop. All rejected.
+- **Cross-module** — transitive `keep` two functions deep through an import,
+  cross-module free summary, cross-module alias-then-double-free, cross-module
+  return-of-local. All rejected, and identical to the same-file control.
+  *Masking warning:* the obvious `*N g;` global in the library file is rejected by
+  the non-null-initializer rule first — use `?*N g;` or you are testing that instead.
+- **ISR / bare metal** — non-volatile global from an ISR, volatile RMW, `volatile u64`
+  tearing (correctly ACCEPTED at 64-bit, rejected at `--target-bits 32`), volatile
+  struct field, alloc reached from an ISR, unaligned `@inttoptr`, an MMIO span that
+  overruns its declared range, volatile-strip through a param. All correct.
+- **Numeric** — negative runtime index (the auto-guard casts to `size_t`, so it
+  fires), `u64` index truncation, shift by ≥ width and by a negative amount,
+  `INT_MIN / -1`, division and modulo by zero, comptime constant folding matching
+  runtime wrapping. All correct.
+- **Escape** — container-monomorphised pointer field to a global, arena pointer to a
+  global, `Ring.push` of a local-derived pointer, slice-of-local return, nested
+  struct field to a global. All rejected.
+- **Comptime / async / container** — division by an unproven comptime divisor,
+  recursion past depth 16, zero-size array, `yield` inside `defer`, a non-plain
+  container type argument, failing `static_assert`, deep container nesting. All
+  correct.
+- **The whole `tests/zer` corpus under `tools/ub_sweep.sh`** — 420 tests, both axes,
+  **0 divergences**.
+
 ### NEW (LOW, tooling) — `zerc f.zer -o out.c` reports trap sites at the EMITTED C line
 
 `_zer_trap` call sites pass `__FILE__, __LINE__`, and the emitted C carries only ONE

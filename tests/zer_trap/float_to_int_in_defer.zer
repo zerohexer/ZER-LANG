@@ -1,0 +1,22 @@
+// BUG-802 — the float->integer guard must be on the DEFER-BODY emission path too.
+//
+// A cast has THREE emission sites: emit_expr's NODE_TYPECAST (used for global
+// initializers), IR_CAST (the normal function-body path), and
+// emit_rewritten_node's own NODE_TYPECAST arm — which is the one a DEFER BODY
+// goes through, because a defer body is emitted from raw AST. The first cut of
+// this fix patched the first two, so `defer take((u32)f);` still emitted a bare
+// unguarded `((uint32_t)f)`. That is the same multi-site tax that produced the
+// AST/IR @saturate divergence in the same session; this test pins the third site.
+//
+// The companion positive (tests/zer/float_to_int_range_ok.zer) covers the
+// IN-RANGE case in every emission context, including this one.
+f64 opaque_f(f64 v) { return v; }
+
+u32 g_sink;
+void take(u32 v) { g_sink = v; }
+
+u32 main() {
+    f64 bad = opaque_f(-1.5);
+    defer take((u32)bad);
+    return 0;
+}

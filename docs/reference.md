@@ -1638,10 +1638,23 @@ All intrinsics start with `@`.
 
 **DESCRIPTION**
 Keep the low bits of val to fit into type T. For big-to-small conversions.
+`T` must be an integer type, and so must `val` — a float has no low bits to
+keep, so `@truncate` on one is a compile error naming the two defined
+alternatives (`@saturate` to clamp, `(T)v` to convert with a range check).
 
 **EXAMPLE**
 ```zer
 u8 low = @truncate(u8, 0x1234);    // 0x34
+```
+
+**SAFETY**
+```zer
+u32 main() {
+    f64 pi = 3.14159;
+    u32 bad = @truncate(u32, pi);  // COMPILE ERROR — float has no low bits
+    u32 good = (u32)pi;            // OK — 3, range-checked
+    return good + bad;
+}
 ```
 
 ---
@@ -1651,10 +1664,22 @@ u8 low = @truncate(u8, 0x1234);    // 0x34
 **DESCRIPTION**
 Clamp val to the min/max of type T. No data loss — just capped.
 
+For a FLOAT source `@saturate` is **total**: it is defined for every input, so
+it never traps and never produces an implementation-defined value. Out-of-range
+magnitudes clamp to the target's min/max, and `NaN` — which has no integer value
+at all — yields `0`. This is what makes it the explicit alternative to the
+trapping `(T)v` conversion: use `(T)v` when an out-of-range float is a bug you
+want to catch, `@saturate(T, v)` when clamping is the intended behaviour.
+
 **EXAMPLE**
 ```zer
 i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
-u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
+u8 floor   = @saturate(u8, -5);    // 0 (u8 min)
+u32 huge   = @saturate(u32, 1.0e30);  // 4294967295 — clamped, never traps
+u32 low    = @saturate(u32, -1.0e30); // 0
+// A NaN reaching @saturate yields 0 (it has no integer value). ZER's division
+// guard makes a NaN hard to construct in-language; it arrives from `cinclude`
+// math or from hardware.
 ```
 
 **SAFETY**
@@ -1681,6 +1706,28 @@ Checks qualifier preservation (const, volatile).
 **EXAMPLE**
 ```zer
 u32 bits = @bitcast(u32, my_i32);  // same bits, different type
+```
+
+**ENUM TARGETS ARE VARIANT-CHECKED**
+
+`@bitcast` is the only way to turn an integer into an enum — there is no
+int→enum cast, and `@cast` requires a distinct typedef. That makes it the one
+route that could produce an enum value which is not any declared variant, and
+silently break the exhaustive-`switch` guarantee (the value would fall into the
+last arm). So a bitcast whose TARGET is an enum carries a variant check and
+**traps** on a value that is not declared. Reading an enum out of a hardware
+register field therefore stays available, and a corrupt field is loud instead of
+taking a wrong branch. The reverse direction (enum → integer) is unchecked —
+every variant is a valid integer.
+
+```zer
+enum State { idle, running, done }
+
+u32 main() {
+    State ok  = @bitcast(State, 2);   // State.done
+    State bad = @bitcast(State, 7);   // TRAPS — 7 is not a declared variant
+    return (u32)@bitcast(u32, ok) + (u32)@bitcast(u32, bad);
+}
 ```
 
 ---
@@ -2056,6 +2103,7 @@ u8 small = 42;
 u32 big = (u32)small;          // widening
 u16 trunc = (u16)big;          // narrowing (truncate)
 f32 ratio = (f32)big;          // int → float value convert
+u32 back = (u32)ratio;         // float → int, RANGE-CHECKED (see below)
 (*Motor)opaque_ctx             // pointer cast (provenance checked)
 (*opaque)sensor_ptr            // type erase
 ```
@@ -2065,6 +2113,33 @@ f32 ratio = (f32)big;          // int → float value convert
 - Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
 - `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
 - `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+
+**FLOAT → INTEGER IS RANGE-CHECKED**
+
+C leaves float→integer conversion *undefined* when the truncated value does not
+fit the destination, and the result differs by compiler, optimization level and
+target — on x86-64, `(u32)(-1.5)` answers `0` at `-O2` and `4294967295` at
+`-O0`; on ARM the hardware saturates instead. ZER defines the operation, the
+same way it defines division by zero and out-of-bounds indexing:
+
+- The value truncates toward zero, exactly, whenever the result fits.
+- Otherwise the program **traps** — including for `NaN`, which has no integer
+  value at all.
+- A float **literal** that provably cannot fit is a **compile error**.
+- `@saturate(T, v)` is the clamping alternative and never traps.
+
+```zer
+u32 main() {
+    f64 v = 42.75;
+    u32 a = (u32)v;                  // 42 — in range, exact
+    u32 b = @saturate(u32, -1.0e30); // 0  — clamped, defined
+    u32 c = (u32)(-1.5);             // COMPILE ERROR — literal cannot fit
+    return a + b + c;
+}
+```
+
+The guard is two comparisons and a branch — the same cost class as the division
+guard. Conversions the compiler can see are in range fold away entirely.
 
 ---
 
@@ -2146,6 +2221,230 @@ Per-architecture interrupt disable/enable.
 }
 // interrupts re-enabled
 ```
+
+---
+
+## SYSTEMS & PRIVILEGED INTRINSICS
+
+The intrinsics above cover ordinary program code. The families below exist for
+kernel, hypervisor, driver and bare-metal work: CPU state, MMU and TLB, cache
+maintenance, port I/O, power management and privileged mode transitions.
+
+Three rules apply to every intrinsic in this section:
+
+1. **PRIVILEGE.** Most of these compile to privileged instructions (x86 CPL=0).
+   Calling one from user space raises `SIGSEGV`/`SIGILL`. That is the hardware
+   floor, not a ZER check — the compiler cannot know which ring your code runs
+   in. To *compile-test* one without executing it, use the dead-branch pattern:
+   ```zer
+   u32 main() {
+       volatile u32 never = 0;
+       if (never == 42) { @cpu_disable_int(); }   // compiled, never executed
+       return 0;
+   }
+   ```
+2. **ARCHITECTURE.** Each lowers to per-target inline asm chosen by
+   `--target-arch={x86_64,aarch64,riscv64}`. An intrinsic with no meaning on the
+   selected target lowers to a no-op rather than failing the build, so a
+   portable driver compiles everywhere and only *does* something where the
+   instruction exists.
+3. **HARDWARE-CONSEQUENCE IS THE FLOOR.** ZER verifies the *program* side of
+   these calls (types, arity, argument provenance, qualifiers, the surrounding
+   context bans). Whether the value you write to `CR3` is the right page table
+   for your board is a datasheet question no compiler can answer. That is why
+   each of these is an explicit, greppable intrinsic rather than sugar: the
+   claim is visible at the use site.
+
+---
+
+### CPU identity and inspection (non-privileged)
+
+These read CPU state that user code may read, so they need no dead-branch
+wrapper.
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_id()` | `u32` | Logical CPU / hart id |
+| `@cpu_core_id()` | `u32` | Physical core id |
+| `@cpu_num_cores()` | `u32` | Logical core count |
+| `@cpu_model_id()` | `u32` | CPUID leaf 1 EAX (family/model/stepping) |
+| `@cpu_vendor_id()` | `u64` | CPUID leaf 0 EBX — first 4 vendor chars |
+| `@cpu_feature_bits()` | `u64` | CPUID leaf 1, `(EDX << 32) | ECX` |
+| `@cpu_cpuid(leaf, sub)` | `u64` | `(EBX << 32) | EAX` |
+| `@cpu_cpuid_ecx(leaf, sub)` | `u64` | `(EDX << 32) | ECX` |
+| `@cpu_cache_line_size()` | `u32` | L1 line size in bytes |
+| `@cpu_current_mode()` | `u32` | Privilege mode (0 = user) |
+| `@cpu_get_priv_level()` | `u32` | Current privilege level |
+| `@cpu_read_sp()` | `u64` | Stack pointer |
+| `@cpu_read_tp()` | `u64` | Thread pointer / TLS base |
+| `@cpu_read_flags()` | `u64` | RFLAGS / NZCV |
+| `@cpu_get_pc()` | `u64` | Instruction pointer |
+| `@cpu_read_counter()` | `u64` | Cycle / timestamp counter |
+
+```zer
+i32 printf(const *u8 fmt, ...);
+
+u32 main() {
+    u32 cores = @cpu_num_cores();
+    u32 line  = @cpu_cache_line_size();
+    u64 tsc   = @cpu_read_counter();
+    printf("cores=%u line=%u tsc_nonzero=%d\n", cores, line, tsc != 0);
+    return 0;
+}
+```
+
+---
+
+### Spin-wait, hints and randomness
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_pause()` | `void` | Spin-loop hint (`pause` / `yield` / `pause`) |
+| `@cpu_wfe()` | `void` | Wait-for-event |
+| `@cpu_sev()` | `void` | Send-event |
+| `@cpu_idle_hint()` | `void` | Non-blocking low-power hint |
+| `@cpu_deep_sleep()` | `void` | Enter the deepest idle state (privileged) |
+| `@cpu_breakpoint()` | `void` | Debugger trap instruction |
+| `@cpu_flush_pipeline()` | `void` | Instruction-pipeline sync barrier |
+| `@cpu_endbr()` | `void` | CET-IBT landing pad (multi-byte nop without CET) |
+| `@cpu_reset()` | `void` | Halt forever (a real reset is platform-specific) |
+| `@cpu_rdrand()` | `?u64` | Hardware RNG — `null` when the instruction fails |
+| `@cpu_rdseed()` | `?u64` | Hardware entropy seed — `null` on failure |
+| `@wait_on_address(*T addr, expected)` | `void` | Efficient poll until `*addr != expected` |
+
+`@cpu_rdrand` / `@cpu_rdseed` return an **optional**, because the instruction is
+documented to fail under entropy pressure — the failure is in the type, so it
+cannot be ignored:
+
+```zer
+u32 main() {
+    u64 r = @cpu_rdrand() orelse return;   // retry / fall back on failure
+    return (u32)(r & 255);
+}
+```
+
+---
+
+### Interrupt control and mode transitions (privileged)
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_disable_int()` | `void` | Mask interrupts globally |
+| `@cpu_enable_int()` | `void` | Unmask interrupts globally |
+| `@cpu_wait_int()` | `void` | Halt until the next interrupt (`hlt`/`wfi`) |
+| `@cpu_save_int_state()` | `u64` | Read the current interrupt-enable state |
+| `@cpu_restore_int_state(s)` | `void` | Restore a saved state |
+| `@cpu_eoi()` | `void` | End-of-interrupt to LAPIC / GICv3 |
+| `@cpu_iret()` | `void` | Interrupt return (`iretq`/`eret`/`mret`) |
+| `@cpu_syscall()` | `void` | User→kernel trap (`syscall`/`svc`/`ecall`) |
+| `@cpu_sysret()` | `void` | Kernel→user return |
+| `@cpu_hypercall()` | `void` | Guest→hypervisor (`vmcall`/`hvc`/`ecall`) |
+| `@cpu_sbi_call()` | `void` | RISC-V `ecall` to M-mode firmware |
+| `@cpu_smc_call()` | `void` | ARM TrustZone `smc #0` |
+| `@cpu_set_priv_stack(sp)` | `void` | Kernel stack for syscall entry |
+
+Prefer `@critical { }` over a bare `@cpu_disable_int()`/`@cpu_enable_int()`
+pair: the block form is checked, so `return`/`break`/`continue`/`goto` out of it
+(which would leave interrupts masked forever) is a compile error.
+
+Every transition instruction requires the corresponding system registers to be
+set up first (`CS`/`RIP`/`RFLAGS` on x86, `ELR`/`SPSR` on ARM, `sepc`/`sstatus`
+on RISC-V). That setup is hardware-consequence — ZER does not verify it.
+
+---
+
+### Control registers, MSRs, debug and performance registers (privileged, x86)
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_read_cr0()` / `@cpu_write_cr0(v)` | `u64` / `void` | Paging, WP, cache-disable bits |
+| `@cpu_read_cr2()` | `u64` | Faulting address of the last page fault |
+| `@cpu_read_cr3()` / `@cpu_write_cr3(v)` | `u64` / `void` | Page-directory base — a write switches address space |
+| `@cpu_read_cr4()` / `@cpu_write_cr4(v)` | `u64` / `void` | Feature-enable bits (SSE, PAE, SMEP, …) |
+| `@cpu_read_xcr0()` / `@cpu_write_xcr0(v)` | `u64` / `void` | XSAVE feature mask (`XSETBV`) |
+| `@cpu_read_msr(msr)` / `@cpu_write_msr(msr, v)` | `u64` / `void` | Model-specific register |
+| `@cpu_read_dr(idx)` / `@cpu_write_dr(idx, v)` | `u64` / `void` | Debug registers DR0–DR3, DR6, DR7 |
+| `@cpu_read_pmc(idx)` | `u64` | Performance counter (`RDPMC`; needs `CR4.PCE`) |
+| `@cpu_read_fsbase()` / `@cpu_write_fsbase(v)` | `u64` / `void` | FS segment base (needs `CR4.FSGSBASE`) |
+| `@cpu_read_gsbase()` / `@cpu_write_gsbase(v)` | `u64` / `void` | GS segment base |
+| `@cpu_cache_disable()` / `@cpu_cache_enable()` | `void` | `CR0.CD` + `WBINVD` |
+
+---
+
+### Processor state save/restore
+
+| Intrinsic | Returns | Buffer |
+|---|---|---|
+| `@cpu_save_context(buf)` / `@cpu_restore_context(buf)` | `void` | 128+ bytes — callee-saved GPRs |
+| `@cpu_save_fpu(buf)` / `@cpu_restore_fpu(buf)` | `void` | 512+ bytes, 16-byte aligned |
+| `@cpu_fxsave(buf)` / `@cpu_fxrstor(buf)` | `void` | 512 bytes, 16-byte aligned (legacy FPU) |
+| `@cpu_xsave(buf, mask)` / `@cpu_xrstor(buf, mask)` | `void` | Extended state (AVX / AVX-512) |
+| `@cpu_fpu_init()` | `void` | `FNINIT` |
+
+The buffer argument may be `*u8` or `u8[N]`. Sizes above are the minimum the
+instruction writes; ZER checks the argument's TYPE, not that your buffer is big
+enough for the CPU's XSAVE area — size that from `@cpu_feature_bits()`.
+
+---
+
+### MMU and TLB (privileged)
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@mmu_enable()` / `@mmu_disable()` | `void` | Turn address translation on/off |
+| `@mmu_is_enabled()` | `bool` | Query translation state |
+| `@mmu_sync()` | `void` | Barrier after a page-table edit |
+| `@mmu_set_pt(root)` / `@mmu_get_pt()` | `void` / `u64` | User page-table root |
+| `@mmu_set_kernel_pt(root)` / `@mmu_get_kernel_pt()` | `void` / `u64` | Kernel page-table root |
+| `@mmu_get_fault_addr()` | `u64` | Faulting virtual address |
+| `@mmu_get_fault_status()` | `u64` | Fault status / error code |
+| `@tlb_flush_all()` | `void` | Flush the whole TLB |
+| `@tlb_flush_global()` | `void` | Flush including global entries |
+| `@tlb_flush_addr(va)` | `void` | Flush one page |
+| `@tlb_flush_range(va, len)` | `void` | Flush a range |
+| `@tlb_flush_asid(asid)` | `void` | Flush one address-space id |
+
+---
+
+### Cache maintenance
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cache_flush_line(addr)` | `void` | Clean + invalidate one line (`clflush`) |
+| `@cache_flushopt(addr)` | `void` | `CLFLUSHOPT` — the ordered alternative |
+| `@cache_writeback(addr)` | `void` | `CLWB` — write back, keep the line valid (NVDIMM) |
+| `@cache_zero_line(addr)` | `void` | Zero one cache line without a read-for-ownership |
+| `@cache_flush_range(addr, len)` | `void` | Clean + invalidate a range |
+| `@cache_clean_range(addr, len)` | `void` | Clean (write back) a range |
+| `@cache_invalidate_range(addr, len)` | `void` | Invalidate a range without writing back |
+| `@cache_invalidate_icache(addr, len)` | `void` | Invalidate the instruction cache |
+| `@nt_store(addr, val)` | `void` | Non-temporal store — bypass the cache (`MOVNTI`) |
+| `@barrier_dma()` | `void` | DMA-coherence barrier for driver code |
+
+`@cache_invalidate_range` discards dirty lines. On a buffer the CPU has written
+but not yet flushed, that loses data — pair it with `@cache_clean_range` or use
+`@cache_flush_range`. This is a hardware-consequence choice: the compiler emits
+what you name.
+
+---
+
+### Port I/O (x86, privileged — needs `CPL <= IOPL`)
+
+| Intrinsic | Returns |
+|---|---|
+| `@port_in8(port)` / `@port_in16(port)` / `@port_in32(port)` | `u8` / `u16` / `u32` |
+| `@port_out8(port, v)` / `@port_out16(port, v)` / `@port_out32(port, v)` | `void` |
+
+---
+
+### Monitor / wait
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_monitor_addr(addr)` | `void` | `MONITOR` — arm an address watch |
+| `@cpu_mwait()` | `void` | `MWAIT` — sleep until the watched line is written |
+| `@cpu_umonitor(addr)` | `void` | User-mode `UMONITOR` (needs WAITPKG) |
+| `@cpu_umwait(hint, deadline)` | `void` | User-mode `UMWAIT`; hint 0 = C0.2, 1 = C0.1 |
 
 ---
 
@@ -2813,7 +3112,7 @@ compile error instead.
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must use @truncate or @saturate explicitly |
-| Missing switch case | Exhaustive check for enums, bools, unions |
+| Missing switch case | Exhaustive check for enums, bools, unions. `@bitcast` into an enum is variant-checked so the guarantee cannot be forged. |
 | Dangling pointer | Scope escape analysis on return, assign, keep, orelse |
 | Union type confusion | Cannot mutate union variant during switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in globals |
@@ -2825,6 +3124,8 @@ compile error instead.
 | Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
 | Division by zero (call) | `x / func()` where func() return range unknown → compile error |
 | Wrong pointer cast | Provenance tracking through *opaque round-trips |
+| Float→int out of range | Compile error for a literal; range-check trap otherwise. `@saturate` clamps. |
+| Signed overflow / type-punning UB | The emitted C self-enforces `wrapv` and `no-strict-aliasing` via `#pragma GCC optimize`, so it is correct under any caller flags |
 
 ---
 
@@ -2849,7 +3150,24 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 4096       # error when estimated stack usage exceeds N bytes
+zerc source.zer --track-cptrs            # force *opaque runtime tracking (on by default with --run)
+zerc source.zer --emit-ir                # print the IR and exit (debugging)
+zerc source.zer --trace                  # print the compilation flow to stderr
+zerc --help                              # list every option
 ```
+
+**Options follow the input file**, and **every option is validated**. An
+unrecognised option, an unknown `--target-arch` / `--probe-mode` value, a
+non-numeric `--target-bits`, or a zero `--stack-limit` is a hard error — none of
+them is ignored. That matters most for `--target-arch`: a typo there used to
+fall through to the `x86_64` default and produce a successful build of the wrong
+ISA for someone who asked for ARM, with nothing said at compile time or run
+time.
+
+`--release` is reserved and currently has NO effect — it prints a note saying
+so. The `*opaque` tracking it once gated is compiled-in safety rather than a
+debug mode, so there is nothing for it to switch off.
 
 ### Pipeline
 
@@ -3098,9 +3416,9 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No exceptions, try/catch
 - No garbage collector
 - No implicit narrowing or sign conversion
-- No undefined behavior
+- No undefined behavior — overflow wraps, over-width shifts give 0, division and float→int conversion are guarded
 - No `++` / `--`, no comma operator
-- No C-style casts
+- No *unchecked* casts — `(Type)expr` exists, but int↔pointer needs `@inttoptr`/`@ptrtoint`, unrelated pointer types need `@pun`, and float→int is range-checked
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

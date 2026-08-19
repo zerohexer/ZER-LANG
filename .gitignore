@@ -73,8 +73,55 @@ test_async_matrix
 test_asm_matrix
 test_modules/main
 
-# Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
-rust_tests/rt_task_alloc_free
-rust_tests/rt_task_alloc_free_cycle
+# Compiled test binaries — EVERY test runner builds an executable next to its
+# .zer source, so a `make check` used to dirty ~558 TRACKED ELF files (~9.1 MB)
+# and make `git status` / `git diff` useless for reviewing an actual change.
+# Two of them were listed here by name; the rest were being swept into unrelated
+# commits. Ignore the whole shape instead: in these directories, anything that
+# is not a source or a doc is build output. (2026-08-19)
+rust_tests/*
+!rust_tests/*.zer
+!rust_tests/*.md
+!rust_tests/*.h
+!rust_tests/*.c
+!rust_tests/*.sh
+!rust_tests/qemu/
+zig_tests/*
+!zig_tests/*.zer
+!zig_tests/*.md
+!zig_tests/*.h
+!zig_tests/*.c
+!zig_tests/*.sh
+tests/zer/*
+!tests/zer/*.zer
+!tests/zer/*.md
+!tests/zer/*.h
+!tests/zer/*.c
+tests/zer_fail/*
+!tests/zer_fail/*.zer
+!tests/zer_fail/*.md
+!tests/zer_fail/*.h
+!tests/zer_fail/*.c
+tests/zer_trap/*
+!tests/zer_trap/*.zer
+!tests/zer_trap/*.md
+!tests/zer_trap/*.h
+!tests/zer_trap/*.c
+tests/zer_gaps/*
+!tests/zer_gaps/*.zer
+!tests/zer_gaps/*.md
+!tests/zer_gaps/*.h
+!tests/zer_gaps/*.c
+tests/zer_proof/*
+!tests/zer_proof/*.zer
+!tests/zer_proof/*.md
+!tests/zer_proof/*.h
+!tests/zer_proof/*.c
+test_modules/*
+!test_modules/*.zer
+!test_modules/*.md
+!test_modules/*.h
+!test_modules/*.c
+!test_modules/*.sh
 test_defer_goto_matrix
 test_view_alias_matrix

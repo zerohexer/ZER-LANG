@@ -1621,7 +1621,9 @@ int main(void) {
         "u32 main() {\n"
         "    f64 pi = 3.141592653589793;\n"
         "    f64 check = pi * 1000000.0;\n"
-        "    u32 result = @truncate(u32, check);\n"
+        /* BUG-802: @truncate is integer-only (a float has no low bits to keep).
+         * The range-checked conversion is the plain cast. */
+        "    u32 result = (u32)check;\n"
         "    return result - 3141550;\n"
         "}\n",
         42,

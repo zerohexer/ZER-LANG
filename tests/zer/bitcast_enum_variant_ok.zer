@@ -1,0 +1,38 @@
+// BUG-804 — @bitcast INTO an enum lands on a declared variant, and the guard
+// must not reject a valid one (contiguous OR sparse explicit values), nor touch
+// the safe reverse direction (enum -> integer).
+//
+// The rejecting half is tests/zer_trap/bitcast_enum_invalid_variant.zer.
+i32 printf(const *u8 fmt, ...);
+
+enum State { idle, running, done }
+enum Sparse { a = 10, b = 20, c = 30 }
+
+u32 opaque_u32(u32 v) { return v; }
+
+u32 main() {
+    State s = @bitcast(State, opaque_u32(2));
+    if (s != State.done) { return 1; }
+
+    State first = @bitcast(State, opaque_u32(0));
+    if (first != State.idle) { return 2; }
+
+    // Explicit, non-contiguous variant values are checked against the declared
+    // values, not against a 0..N-1 range.
+    Sparse p = @bitcast(Sparse, opaque_u32(20));
+    if (p != Sparse.b) { return 3; }
+    Sparse q = @bitcast(Sparse, opaque_u32(30));
+    if (q != Sparse.c) { return 4; }
+
+    // enum -> integer is always safe: every variant IS a valid integer.
+    u32 back = @bitcast(u32, s);
+    if (back != 2) { return 5; }
+
+    // The exhaustiveness guarantee the guard protects.
+    switch (s) {
+        .idle => { return 6; }
+        .running => { return 7; }
+        .done => { printf("bitcast_enum_variant_ok: ok\n"); }
+    }
+    return 0;
+}

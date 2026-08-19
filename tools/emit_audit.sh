@@ -44,6 +44,22 @@ SAMPLES=(
     "test_modules/diamond.zer"
 )
 
+# Self-enforcing semantic pragmas the emitted C MUST carry (BUG-803).
+#
+# ZER defines signed overflow as wrapping and hands out sanctioned
+# type-punning primitives (@pun, @ptrcast through *opaque). BOTH require a
+# non-default GCC flag for the emitted C to mean what ZER says it means, and a
+# user compiling the .c themselves (the --emit-c and bare-metal cross-compile
+# workflows) does not pass them. The preamble therefore self-enforces each with
+# a `#pragma GCC optimize`. Losing either is a SILENT miscompile — measured:
+# without no-strict-aliasing, a @pun'd read returns the stale value at -O2 with
+# no diagnostic at compile time or run time. Freeze both here so an edit to the
+# preamble cannot drop one unnoticed.
+REQUIRED=(
+    '#pragma GCC optimize("wrapv")'
+    '#pragma GCC optimize("no-strict-aliasing")'
+)
+
 FOUND=0
 TMP=$(mktemp /tmp/emit_audit.XXXXXX.c)
 trap "rm -f $TMP" EXIT
@@ -62,10 +78,17 @@ for sample in "${SAMPLES[@]}"; do
             FOUND=$((FOUND + 1))
         fi
     done
+    for req in "${REQUIRED[@]}"; do
+        if ! grep -Fq "$req" "$TMP"; then
+            echo "MISSING REQUIRED PRAGMA in $sample emission: $req"
+            FOUND=$((FOUND + 1))
+        fi
+    done
 done
 
 if [ $FOUND -eq 0 ]; then
     echo "OK — no dead-stub markers in emitted C across ${#SAMPLES[@]} samples."
+    echo "OK — every sample carries the ${#REQUIRED[@]} self-enforcing semantic pragmas."
     exit 0
 else
     echo ""

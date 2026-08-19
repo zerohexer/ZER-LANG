@@ -276,6 +276,61 @@ nowarn_check tests/zer/guard_clamp_range.zer "no-autoguard-guard-clamp"
 nowarn_check tests/zer/no_warn_u64_atomic_64bit.zer "no-warn-u64-atomic-64bit-target"
 
 echo ""
+echo "=== CLI option validation (BUG-805 — an ignored option is a silent gap) ==="
+#
+# Until 2026-08-19 the argument loop had no `else`: EVERY unrecognised option
+# was silently dropped, so a compilation-mode request the user typed slightly
+# wrong took effect as its opposite with no diagnostic. The worst instance was
+# `--target-arch=<typo>`, which fell through to the x86_64 default and produced
+# a SUCCESSFUL build of the wrong ISA for someone who asked for ARM — silent at
+# compile time, silent at run time, and on bare metal exactly the failure that
+# does not announce itself. These cells pin that each malformed option now
+# EXITS NON-ZERO, and that each well-formed one still works.
+cli_reject() {
+    local desc="$1"; shift
+    TOTAL=$((TOTAL + 1))
+    $ZERC "$@" -o /tmp/_zer_cli_out.c >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        PASS=$((PASS + 1)); echo "  PASS: cli-reject $desc"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: cli-reject $desc (accepted, expected an error)"
+    fi
+    rm -f /tmp/_zer_cli_out.c
+}
+cli_accept() {
+    local desc="$1"; shift
+    TOTAL=$((TOTAL + 1))
+    $ZERC "$@" -o /tmp/_zer_cli_out.c >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        PASS=$((PASS + 1)); echo "  PASS: cli-accept $desc"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: cli-accept $desc (rejected, expected success)"
+    fi
+    rm -f /tmp/_zer_cli_out.c
+}
+
+CLI_SRC=tests/zer/float_to_int_range_ok.zer
+cli_reject "unknown option"        "$CLI_SRC" --no-strict-mmi
+cli_reject "unknown --target-arch" "$CLI_SRC" --target-arch=arm64
+cli_reject "bad --target-bits"     "$CLI_SRC" --target-bits abc
+cli_reject "zero --stack-limit"    "$CLI_SRC" --stack-limit 0
+# CONTROL: --probe-mode= already errored before the fix. Keeping it proves the
+# gate is validating, not blanket-rejecting anything with a '--'.
+cli_reject "unknown --probe-mode"  "$CLI_SRC" --probe-mode=bogus
+cli_accept "plain compile"         "$CLI_SRC"
+cli_accept "--target-arch=x86_64"  "$CLI_SRC" --target-arch=x86_64
+cli_accept "--target-bits 32"      "$CLI_SRC" --target-bits 32
+cli_accept "--stack-limit 4096"    "$CLI_SRC" --stack-limit 4096
+cli_accept "--no-strict-mmio"      "$CLI_SRC" --no-strict-mmio
+
+TOTAL=$((TOTAL + 1))
+if $ZERC --help 2>&1 | grep -q -- "--target-arch"; then
+    PASS=$((PASS + 1)); echo "  PASS: cli --help lists options"
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: cli --help does not list options"
+fi
+
+echo ""
 echo "=== Results ==="
 echo "  Passed:  $PASS"
 echo "  Failed:  $FAIL"

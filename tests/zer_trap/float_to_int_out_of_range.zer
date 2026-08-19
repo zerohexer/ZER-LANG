@@ -1,0 +1,16 @@
+// BUG-802 — a float whose truncation does not fit the destination integer
+// TRAPS instead of producing an arch- and optimization-dependent garbage value.
+//
+// C11 6.3.1.4p1 leaves this conversion undefined. Measured before the fix:
+// (u32)(-1.5) was 0 at -O2 and 4294967295 at -O0 on the same x86-64 host, with
+// no diagnostic from the checker and none at run time. ZER's answer is the one
+// it already gives for division by zero, signed-division overflow and an
+// out-of-bounds index: trap. `@saturate(u32, v)` is the clamping alternative.
+//
+// The source is a local (not a literal) so the CHECKER's compile-time literal
+// check does not fire and the RUN-TIME guard is what is under test.
+u32 main() {
+    f64 v = -1.5;
+    u32 x = (u32)v;
+    return x;
+}

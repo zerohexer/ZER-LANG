@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: float-to-integer conversion is out of range
+//
+// BUG-802 — a float LITERAL that provably has no representable integer part is
+// rejected at compile time, the same stance as the always-out-of-bounds index
+// rule. This also covers the one context where the run-time guard cannot be
+// emitted: a module-level initializer must stay a C constant expression.
+u32 g = (u32)(-1.5);
+
+u32 main() { return g; }

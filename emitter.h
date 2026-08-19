@@ -113,6 +113,13 @@ typedef struct {
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
 
+    /* True while emitting a module-level variable's initializer. C requires a
+     * constant expression there, so no safety wrapper that needs a statement
+     * expression (`({ ... })`) may be emitted — the float→integer range guard
+     * checks this. Compile-time literal checks in checker.c cover that context
+     * instead. */
+    bool in_const_init;
+
 } Emitter;
 
 /* ---- API ---- */

@@ -147,11 +147,24 @@ never against current C).
 
 ### Critical Compiler-Implementation Gotchas (avoid wasted-cycle rediscovery)
 
-**Two emitter dispatch paths for intrinsics.** Every intrinsic needs a handler
-in BOTH `emitter.c` paths or the IR-rewriter falls through to a placeholder
-emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
+**Two emitter dispatch paths for intrinsics — but THREE for a CAST.** Every
+intrinsic needs a handler in BOTH `emitter.c` paths or the IR-rewriter falls
+through to a placeholder emission (typically `/* @intrinsic_name */ 0`) that
+segfaults at runtime:
 1. AST path — search `emitter.c` around line 2754 onward
 2. IR-rewritten path — search `emitter.c` around line 6451 onward
+
+**`NODE_TYPECAST` has a THIRD site (2026-08-19, BUG-802).** `emit_rewritten_node`
+carries its OWN `NODE_TYPECAST` arm, labelled "should be handled by IR_CAST" —
+and it is NOT dead: a **defer body is emitted from raw AST**, so every cast
+inside one lands there. A safety wrapper added to the two obvious arms left
+`defer take((u32)f);` emitting a bare unguarded cast, with the whole suite still
+green. **Grep the EMITTED C for the operation, not the emitter source for the
+handler** — `zerc x.zer -o /tmp/x.c && grep -n '(uint32_t)' /tmp/x.c` found it in
+one command. Same applies to any future cast-site wrapper (`@saturate`,
+`@bitcast` and the other intrinsics ride the intrinsic arm of
+`emit_rewritten_node`, so they are covered by the two-path rule; the plain cast
+is the one with three).
 
 When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
 `@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
@@ -214,6 +227,54 @@ should always do this). A genuinely-green run shows `MAKE_CHECK_EXIT=0` AND the
 audit lines ("OK — no default: clauses…", "OK — no new raw type-dispatch
 sites"). exit=2 with those lines ABSENT means an earlier step (often CRLF)
 aborted make before the audits — investigate, don't wave it off.
+
+**THE `-O0` vs `-O2` DIFF IS THE CHEAPEST DETECTOR FOR EMITTED-C UB (found BUG-802 and
+BUG-803 in one run, 2026-08-19).** Compile the SAME emitted `.c` twice and compare the
+output:
+```
+zerc f.zer -o /tmp/f.c && gcc -std=c99 -O2 -fwrapv -fno-strict-aliasing -o /tmp/a /tmp/f.c && /tmp/a
+                          gcc -std=c99 -O0 -fwrapv -fno-strict-aliasing -o /tmp/b /tmp/f.c && /tmp/b
+```
+Any difference is UB in the emitted C, by definition. Measured that day:
+`(u32)(-1.5)` was `0` at -O2 and `4294967295` at -O0. **Know which axis you are
+probing**: the -O level splits only when the value is a compile-time CONSTANT
+(GCC folds with saturation, the hardware `CVTTSD2SI` does not); with an OPAQUE
+runtime value both levels agree on x86-64 and the divergence moves to the TARGET
+axis (ARM saturates in hardware, a third answer). Probe constants for the -O
+axis. **The whole suite is structurally blind to this class** —
+every runner builds ONE configuration, and both answers are "what the program did", so
+no assertion fails. Run the diff whenever you touch a conversion, an arithmetic
+wrapper, or the preamble. The FLAG axis is the second half of the same detector: drop
+`-fno-strict-aliasing` and re-run — a difference there means the emitted C depends on a
+flag the user may not pass (that is exactly BUG-803).
+
+**Both axes are scripted: `bash tools/ub_sweep.sh [opt|alias|both] [test-dir]`** — it
+compiles every `tests/zer` case twice along the chosen axis and reports any test whose
+stdout or exit code differs. NOT in `make check` (it builds and runs two binaries per
+test, ~10 min); it is an on-demand audit like `tools/agreement_audit.sh`. Baseline
+2026-08-19 after BUG-802/803: **420 ran, 0 diverged on both axes.** The detector needs
+no expected values — a divergence IS the defect — which is what makes re-running it
+after any emitter change cheap.
+
+**A REQUIRED COMPILER FLAG IS A SAFETY WRAPPER — and no source-level gate can see it.**
+The preamble banner had declared `-fwrapv -fno-strict-aliasing` required for a long
+time, and only the first was self-enforced with `#pragma GCC optimize`. Nothing looking
+at `.zer` source, at emitted statements, or at the checker could notice the second was
+missing, which is why it survived years of audits: the defect lives in the CONTRACT
+between the emitted file and whoever compiles it. `--emit-c` and every bare-metal
+cross-compile hand that contract to the user. **Rule: any semantic guarantee ZER makes
+that depends on a non-default compiler flag must be self-enforced inside the emitted
+file AND frozen in `tools/emit_audit.sh`'s `REQUIRED` list** (verified 2026-08-19 that
+two `#pragma GCC optimize` lines STACK — the second does not reset the first).
+
+**AUDIT THE ALTERNATIVE A DIAGNOSTIC POINTS AT.** When a rule rejects X and the message
+says "use Y instead", Y is now load-bearing and inherits the traffic. Writing the exact
+float→int bounds for BUG-802 made the ROUNDED bound literals inside `@saturate` (its
+named alternative) obviously wrong — `INT64_MAX` converts to double as 2^63, so a value
+exactly equal to it fell through the clamp into the raw undefined cast, as did NaN. The
+same read found a live AST↔IR divergence: the AST path's signed-64 clamp was
+`(int64_t)_zer_sat` with no clamp at all. Neither would have been found by testing the
+rule that was actually being changed.
 
 **Ad-hoc Docker verify (binary-safe — binaries stay in-container, no Wacatac).**
 The Makefile `docker-*` targets are best, but for a quick targeted build+test of
@@ -1194,8 +1255,10 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Null dereference | `*T` non-null by default, `?T` requires unwrapping, local function pointer requires initializer |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
+| Float→int out of range | BUG-802: `(T)f` is RANGE-CHECKED — compile error for a literal that cannot fit, runtime trap otherwise (NaN included). `@truncate` on a float is rejected (no low bits to keep); `@saturate(T, f)` clamps and is TOTAL (NaN → 0). Emitted in BOTH dispatch paths from one helper. |
+| Type-punning / wrapping miscompile | BUG-803: the emitted C self-enforces `#pragma GCC optimize("wrapv")` AND `#pragma GCC optimize("no-strict-aliasing")` — both are REQUIRED for the emitted C to mean what ZER says, and a user compiling the `.c` themselves (`--emit-c`, bare-metal cross-gcc) passes neither. Frozen by `tools/emit_audit.sh`. |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
-| Missing switch case | Exhaustive check for enums and bools |
+| Missing switch case | Exhaustive check for enums and bools. BUG-804: `@bitcast` into an enum is VARIANT-CHECKED (traps on an undeclared value) — it was the only route that could forge an out-of-variant enum and silently mis-dispatch the switch to its last arm. |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
@@ -1674,6 +1737,19 @@ confidence"), applied to TESTS. Treat them identically.
    rule fired. Read the message.
 5. Verify a new test gate FIRES before trusting it (inject a wrong expectation / a fake
    closure). A gate that has only ever passed is a script, not a net.
+6. **Run `bash tools/negative_reason_audit.sh` when touching `tests/zer_fail/`.** It
+   compiles every negative that lacks `// expect-error:`, captures the first
+   diagnostic, and flags the file when the diagnostic shares no significant word with
+   its name. Weak on purpose — most flags are vocabulary mismatches (`*_uaf` vs "use
+   after free") — but it is exactly right for the two shapes that matter: a PARSE/TYPE
+   error where a SAFETY rule was intended, and a diagnostic naming a DIFFERENT rule
+   (the intended one is masked). Its first run found a **committed git merge conflict**
+   in `compound_field_maybe_freed.zer`: the file did not parse, so BUG-650's regression
+   guard had been passing on `expected type at '<<'` — testing the parser, not the
+   compound-key CFG merge (BUG-806). Standing exposure it also reports: **125 of 575
+   negatives carry the directive; the other 450 still pass on ANY non-zero exit**, and
+   that surface GROWS with every rule added. Do NOT auto-backfill from the tool's
+   output — that freezes whatever is printed today, wrong reasons included (rule 1).
 
 ### A NEGATIVE TEST PROVES NOTHING UNTIL YOU READ THE DIAGNOSTIC — use `// expect-error:`
 
@@ -1939,6 +2015,14 @@ resolved (8 → 0).
 new NODE_KIND / TYNODE_KIND / TYPE_KIND / IR_OPKIND value is added
 without a case label in any safety-critical walker. The "missing case
 in safety walker" gap class is mechanically prevented going forward.
+
+**`make zerc` IS WARNING-CLEAN as of 2026-08-19 — keep it that way.** The build
+carried 27 standing warnings, which meant a NEW one was invisible; `-Werror=switch`
+only hard-gates the kind-switch class. They are now 0 (six self-closing comments, a
+`size_t`-into-`%.*s` varargs mismatch, a missing return in `lower_expr`, a
+sign-compare, two `calloc(int, …)` clamps, and ~350 lines of provably-dead code
+removed with a note pointing at the live logic). **If your change adds a warning,
+fix it in the same commit** — the value of a clean build is entirely in the delta.
 
 **HARD GATE since 2026-06-27 — `-Werror=switch` in the Makefile.** Until
 2026-06-27 this was a *warning* only (`CFLAGS = -Wall -Wextra`), so the

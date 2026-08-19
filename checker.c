@@ -11,8 +11,8 @@
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
-#include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
-#include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
+#include "src/safety/comptime_rules.h"     /* zer_comptime_* + _static_assert + _expr_nesting — R */
+#include "src/safety/cast_rules.h"         /* zer_conversion_safe, _bitcast_*, _saturate, _ptrtoint — J-ext */
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include "src/safety/asm_instruction_table.h" /* zer_asm_instruction_info — F4 per-instruction safety dispatch */
@@ -20,6 +20,50 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+
+/* BUG-802 (2026-08-19) — float -> integer conversion range.
+ *
+ * C leaves the conversion UNDEFINED when the truncated value does not fit
+ * (C11 6.3.1.4p1). The emitter guards the general case at run time; these two
+ * helpers close the one context where a statement-expression guard is illegal
+ * (a module-level initializer, which must be a C constant expression) and give
+ * a literal that provably cannot fit a compile-time diagnostic instead.
+ *
+ * float_literal_value folds only SYNTACTIC float constants — a literal or a
+ * negated literal. Everything else returns false and is left to the run-time
+ * guard (never to silence). Deliberately narrow: `eval_const_expr` is int64
+ * based and has no float path, so widening this would mean building one, and
+ * the run-time guard already covers every non-literal case except the global
+ * initializer — where only a literal is legal C anyway. */
+static bool float_literal_value(Node *e, double *out) {
+    if (!e) return false;
+    if (e->kind == NODE_FLOAT_LIT) { *out = e->float_lit.value; return true; }
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_MINUS) {
+        double inner;
+        if (float_literal_value(e->unary.operand, &inner)) { *out = -inner; return true; }
+        return false;
+    }
+    return false;
+}
+
+/* Does `v`'s truncation toward zero fit the integer type `t`?
+ * Exactly: v fits iff  v > MIN-1  &&  v < MAX+1.  MAX+1 is a power of two, so
+ * ldexp-style bounds are exact; NaN fails every comparison and correctly does
+ * not fit. Mirrors emit_f2i_bounds in emitter.c — keep the two in sync. */
+static bool float_fits_integer(double v, Type *t) {
+    int w = type_width(t);
+    if (w <= 0 || w > 64) return true;   /* unknown width — do not claim a verdict */
+    double hi = 1.0;
+    bool sgn = type_is_signed(t);
+    int bits = sgn ? w - 1 : w;
+    for (int i = 0; i < bits; i++) hi *= 2.0;
+    if (!sgn) return v > -1.0 && v < hi;
+    /* MIN-1 is exactly representable only while it fits the 53-bit mantissa;
+     * beyond that `v >= MIN` accepts exactly the same set (double spacing at
+     * that magnitude is >= 2, so nothing lies strictly between MIN-1 and MIN). */
+    if (bits > 53) return v >= -hi && v < hi;
+    return v > -hi - 1.0 && v < hi;
+}
 
 /* Convert checker's per-Symbol flags to a region tag. */
 static int zer_sym_region_tag(bool is_local_derived, bool is_arena_derived) {
@@ -563,7 +607,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
- * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+ * Returns true and sets out_min / out_max if a bounded range was derived. */
 /* Refactor 1: unified VRP range invalidation for assignments.
  * Handles both simple ident keys and compound keys (s.x).
  * For TOK_EQ: tries literal, derive_expr_range, call return range.
@@ -1653,9 +1697,10 @@ static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
 }
 
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
- * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
- * non-keep caller param, return that param's index (so passing it to a keep
- * callee position makes the caller param escape too). Else -1. */
+ * through address-of, deref, field, index, slice, orelse, intrinsic and cast.
+ * If the root traces to a non-keep caller param, return that param's index (so
+ * passing it to a keep callee position makes the caller param escape too).
+ * Else -1. */
 static int keep_arg_caller_root(Checker *c, Node *arg) {
     Node *n = arg;
     for (int guard = 0; n && guard < 64; guard++) {
@@ -8859,6 +8904,25 @@ static Type *check_expr(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "cannot cast pointer to integer — use @ptrtoint(ptr)");
         }
+        /* BUG-802: float -> integer with a LITERAL source that cannot fit.
+         * The emitter guards the general case at run time, but a module-level
+         * initializer must stay a C constant expression, so no guard can be
+         * emitted there — and a literal that provably cannot fit deserves a
+         * compile error anyway (same stance as the always-out-of-bounds index
+         * rule). Only syntactic float constants are folded here; anything else
+         * falls through to the run-time guard. */
+        if (type_is_integer(target) && type_is_float(source)) {
+            double fv;
+            if (float_literal_value(node->typecast.expr, &fv) &&
+                !float_fits_integer(fv, target)) {
+                checker_error(c, node->loc.line,
+                    "float-to-integer conversion is out of range for '%s' — "
+                    "the value has no representable integer part. "
+                    "Use '@saturate(%s, v)' to clamp",
+                    type_name(target), type_name(target));
+            }
+        }
+
         /* distinct typedef: (Celsius)raw_u32, (u32)celsius */
         if (target->kind == TYPE_DISTINCT || source->kind == TYPE_DISTINCT) valid = true;
 
@@ -8957,7 +9021,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * to a wrong line.
                  *
                  * Two parse paths:
-                 *  (a) type keyword (u32/*T/etc.) → type_arg set, args carry values
+                 *  (a) type keyword (u32, pointer, etc.) -> type_arg set, args carry values
                  *  (b) named type as TOK_IDENT for intrinsics NOT in force_type_arg
                  *      (currently only @size) → type_arg NULL, args[0] is the type ident
                  *      (see parser.c:931-936 + BUG-316 path). The checker dispatch at
@@ -9404,6 +9468,18 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (effective && zer_saturate_operand_valid(type_is_numeric(effective) ? 1 : 0) == 0) {
                         checker_error(c, node->loc.line,
                             "@truncate requires numeric source, got '%s'", type_name(val_type));
+                    }
+                    /* BUG-802: a FLOAT source has no "low bits" to keep, so
+                     * @truncate has no meaning on one. It used to emit a bare C
+                     * cast, which is UNDEFINED whenever the value does not fit
+                     * (C11 6.3.1.4) — measured as an -O0/-O2 divergence. Reject
+                     * and name the two defined conversions. */
+                    if (effective && type_is_float(effective) && type_is_integer(result)) {
+                        checker_error(c, node->loc.line,
+                            "@truncate has no meaning on a float — a float has no "
+                            "low bits to keep. Use '@saturate(%s, v)' to clamp, or "
+                            "'(%s)v' for a range-checked conversion",
+                            type_name(result), type_name(result));
                     }
                 }
                 /* anqp95 (copied): target must be an integer — mirrors @saturate.
@@ -11283,85 +11359,8 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
+/* `has_atomic_or_barrier` removed 2026-08-19 — dead code. The spawn scan
+ * decides error-vs-warning from its own per-access classification. */
 
 /* Does this function forward its parameter `pidx` into a `spawn` argument —
  * directly, or transitively through another function that does?
@@ -12440,7 +12439,7 @@ static void check_stmt(Checker *c, Node *node) {
             /* Walk parent scope chain to check if name matches a param */
             Symbol *existing = scope_lookup(c->current_scope,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len);
-            if (existing && existing->line != node->loc.line) {
+            if (existing && existing->line != (uint32_t)node->loc.line) {
                 checker_error(c, node->loc.line,
                     "variable '%.*s' shadows function parameter in async function — "
                     "async locals share state struct with params, shadowing overwrites param value. "
@@ -19394,7 +19393,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 }
 
 /* Scan a function body for return expressions with derivable range.
- * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+ * If ALL return expressions have the same derivable range, set out_min / out_max. */
 /* Union in the return ranges of any orelse-block fallback BURIED inside an
  * expression: `u32 v = (mb() orelse {return 9;}) + b;`, `id(mb() orelse
  * {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The original B9
@@ -20315,12 +20314,13 @@ bool checker_check(Checker *c, Node *file_node) {
         register_decl(c, file_node->file.decls[i]);
     }
 
-    /* Pass 2: type-check all function bodies and global initializers */
-    bool ok = checker_check_bodies(c, file_node);
+    /* Pass 2: type-check all function bodies and global initializers.
+     * The bool result is subsumed by `c->error_count` (every failure path in
+     * checker_check_bodies raises it), which is what this function returns. */
+    (void)checker_check_bodies(c, file_node);
 
     /* Pass 2.5: keep inference — transitive escape fixpoint + deferred enforcement */
     check_keep_inference(c);
-    if (c->error_count > 0) ok = false;
 
     /* Pass 3: whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {

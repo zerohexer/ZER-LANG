@@ -1,0 +1,65 @@
+// BUG-802 — float -> integer conversion is RANGE-CHECKED, and @saturate is TOTAL.
+//
+// Before the fix, `(T)f` emitted a bare C cast, which is UNDEFINED whenever the
+// truncated value does not fit (C11 6.3.1.4p1). Measured on x86-64: the same
+// program answered (u32)(-1.5) == 0 at -O2 and 4294967295 at -O0 — silent at
+// compile time AND at run time, and different again on ARM (hardware saturates).
+//
+// This test pins the DEFINED half: every in-range conversion is exact, and
+// @saturate clamps (and is defined for every input, NaN included) so users who
+// want clamping instead of a trap keep a zero-diagnostic path. The trapping
+// half is tests/zer_trap/float_to_int_out_of_range.zer; the compile-time half
+// is tests/zer_fail/float_to_int_literal_out_of_range.zer.
+i32 printf(const *u8 fmt, ...);
+
+u32 to_u32(f64 v) { return (u32)v; }
+i32 to_i32(f64 v) { return (i32)v; }
+u8  to_u8(f64 v)  { return (u8)v; }
+u64 to_u64(f64 v) { return (u64)v; }
+
+u32 g_sink;
+void sink_u32(u32 v) { g_sink = v; }
+
+u32 main() {
+    // ---- in-range conversions truncate toward zero, exactly ----
+    if (to_u32(42.75) != 42) { return 1; }
+    if (to_u32(0.0) != 0) { return 2; }
+    if (to_u32(4294967295.0) != 4294967295) { return 3; }
+    if (to_i32(-42.75) != -42) { return 4; }
+    if (to_i32(2147483647.0) != 2147483647) { return 5; }
+    if (to_u8(255.75) != 255) { return 6; }
+    if (to_u64(1099511627776.0) != 1099511627776) { return 7; }
+
+    // -0.5 truncates to 0 and is IN range for an unsigned target — the guard
+    // must not reject it (the lower bound is > -1.0, not >= 0.0).
+    if (to_u32(-0.5) != 0) { return 8; }
+
+    // ---- @saturate stays the explicit clamping alternative, and is total ----
+    if (@saturate(u32, -1.0e30) != 0) { return 9; }
+    if (@saturate(u32, 1.0e30) != 4294967295) { return 10; }
+    if (@saturate(i32, 1.0e30) != 2147483647) { return 11; }
+    i32 i32_min = -2147483647;
+    i32_min -= 1;
+    if (@saturate(i32, -1.0e30) != i32_min) { return 12; }
+    if (@saturate(u8, 300.0) != 255) { return 13; }
+    if (@saturate(u8, -7.5) != 0) { return 14; }
+    if (@saturate(u32, 42.75) != 42) { return 15; }
+
+    // ---- EVERY emission context, because the cast has THREE emission paths ----
+    // The guard must be on all of them. The first cut of BUG-802 patched only
+    // two (emit_expr's NODE_TYPECAST and IR_CAST) and left a DEFER BODY — which
+    // is emitted from raw AST through emit_rewritten_node's own NODE_TYPECAST
+    // arm — emitting a bare unguarded cast. A passing test did not reveal that;
+    // grepping the emitted C for conversion sites did.
+    f64 v = 42.75;
+    u32 acc = 0;
+    acc += to_u32(v);                              // call argument / return
+    for (u32 i = 0; i < 2; i += 1) { acc += (u32)v; }   // loop body
+    switch (acc) { default => { acc += (u32)v; } }      // switch arm
+    if (acc > 0) { acc += (u32)v; }                     // branch
+    defer sink_u32((u32)v);                             // DEFER BODY
+    if (acc != 42 * 5) { return 16; }
+
+    printf("float_to_int_range_ok: ok\n");
+    return 0;
+}

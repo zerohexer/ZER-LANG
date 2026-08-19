@@ -1497,7 +1497,7 @@ This makes `eval_const_expr` work universally for comptime results — no specia
 
 ### *opaque Test Coverage (2026-04-05)
 
-**Finding: raw `malloc/free` with `*opaque` and `--track-cptrs`:** When `--track-cptrs` is active (default for `--run`), `*opaque` emits as `_zer_opaque` (struct with type_id), not `void*`. C's `malloc()` returns `void*` — type mismatch with `_zer_opaque`. Positive tests using raw malloc/free must use `--release` mode OR (preferred) use Slab/Pool instead. The existing negative tests work because they fail at zercheck before reaching GCC.
+**Finding: raw `malloc/free` with `*opaque` and `--track-cptrs`:** When `--track-cptrs` is active (default for `--run`), `*opaque` emits as `_zer_opaque` (struct with type_id), not `void*`. C's `malloc()` returns `void*` — type mismatch with `_zer_opaque`. Positive tests using raw malloc/free must use Slab/Pool instead. **CORRECTED 2026-08-19 (BUG-805):** the old advice here — "use `--release` mode" — never worked, because `--release` is a no-op (see the Flags note below). MEASURED the same day: `*opaque` emits as `_zer_opaque` under EVERY flag combination tried (default, `--lib`, `--track-cptrs`), so the premise "when `--track-cptrs` is active" is also stale — the wrapping is unconditional. There is no flag that turns it off; use Slab/Pool, or declare the C function with a concrete pointer type instead of `*opaque`. The existing negative tests work because they fail at zercheck before reaching GCC.
 
 **Finding: Task.alloc() + explicit Slab for same type = ambiguous allocator.** `Slab(Task) heap;` + `Task.alloc()` creates two Slabs for the same struct type. Handle auto-deref can't pick which one → compile error. This is correct behavior — use one or the other, not both.
 
@@ -3627,8 +3627,14 @@ The `[]T → *T` auto-coerce for extern functions must check const: if arg is st
 
 **Flags (zerc_main.c):**
 - `--track-cptrs`: explicitly enable Level 3+4+5
-- `--release`: disable Level 3+4+5 (Level 1+2 always active)
-- `--run` without `--release`: Level 3+4+5 enabled by default (`track_cptrs || (!release_mode && do_run)`)
+- **CORRECTED 2026-08-19 (BUG-805): `--release` does NOT disable anything.** The
+  gating expression this section described (`track_cptrs || (!release_mode && do_run)`)
+  no longer exists; the live code is `emitter.track_cptrs = track_cptrs || do_run`,
+  with the deliberate rationale in its own comment — the instrumentation is
+  "compiled-in safety, not debug". `release_mode` was parsed and never read, so
+  `--release` was accepted and silently ignored. It now prints a note saying it has
+  no effect. Do not write code (or tests) that relies on `--release` switching
+  something off.
 - `emitter.track_cptrs` flag on Emitter struct controls preamble emission
 
 **Full design document:** `docs/ZER_OPAQUE.md` — 601 lines covering all levels, edge cases, performance, Ada/SPARK comparison, implementation plan.

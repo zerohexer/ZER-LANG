@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: @truncate has no meaning on a float
+//
+// BUG-802 — @truncate means "keep the low bits"; a float has none. It used to
+// emit a bare C cast, i.e. the same undefined out-of-range conversion the plain
+// cast had. The diagnostic names both defined replacements: @saturate (clamp)
+// and (T)v (range-checked).
+u32 main() {
+    f64 v = 3.5;
+    u32 x = @truncate(u32, v);
+    return x - 3;
+}

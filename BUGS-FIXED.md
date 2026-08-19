@@ -5,6 +5,303 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-19 — BUG-802..806: five silent classes (three in the emitted C, one in the driver, one in the test harness)
+
+Audit session. All three are the shape the ledger keeps asking for: **compile-time
+and run-time BOTH silent**, and worst on bare metal, where the wrong answer arrives
+without a crash. Each was MEASURED (two produced different answers at `-O0` and
+`-O2` on the same host) before anything was changed. `make check` green,
+1252 integration tests, every gate line present.
+
+### BUG-802 — float → integer conversion was C UNDEFINED behaviour
+
+`(T)f` emitted a bare C cast. C11 6.3.1.4p1 leaves that undefined whenever the
+truncated value does not fit, and the divergence is not theoretical:
+
+| expression | `gcc -O2` | `gcc -O0` |
+|---|---|---|
+| `(u32)(-1.5)` | 0 | 4294967295 |
+| `(i32)1.0e30` | 2147483647 | -2147483648 |
+| `(u32)4294967296.0` | 4294967295 | 0 |
+| `@truncate(u32, 4294967296.0)` | 4294967295 | 0 |
+
+**Which axis produces which divergence, measured precisely.** The `-O0` vs `-O2`
+split above needs the value to be a compile-time CONSTANT: GCC then folds the
+conversion with saturation, while at `-O0` the hardware `CVTTSD2SI` runs and
+yields the "integer indefinite" value. With an OPAQUE runtime float both levels
+agree on x86-64 (both are the hardware answer) — and diverge on the TARGET axis
+instead, because ARM saturates in hardware. So the operation had no single
+answer along either axis. Nothing in the checker or the runtime said a word. This contradicts ZER's
+unconditional "no undefined behavior" claim, which until now covered signed
+overflow, over-width shifts, division and indexing but not this.
+
+**Fix — ZER defines it, three layers.**
+1. **Run-time guard** on every float→integer conversion, at all **THREE** emitter
+   sites for a cast. Traps when the truncated value does not fit — NaN included,
+   since NaN fails every comparison and has no integer value. Shared helpers
+   `f2i_guard_applies` + `emit_f2i_bounds` so the sites cannot drift.
+   *The third site was nearly missed, and that is the lesson.* The obvious two
+   are `NODE_TYPECAST` in `emit_expr` (global initializers) and `IR_CAST` in
+   `emit_inst` (function bodies). But a **defer body is emitted from raw AST**
+   through `emit_rewritten_node`, which has its own `NODE_TYPECAST` arm labelled
+   "should be handled by IR_CAST" — so `defer take((u32)f);` kept emitting a bare
+   unguarded `((uint32_t)f)` after the first two were patched. Every test still
+   passed. It was found by grepping the EMITTED C for conversion sites, not by a
+   failing assertion. Pinned by `tests/zer_trap/float_to_int_in_defer.zer`
+   (verified: exit 0 on the two-site build, 133 now) and by the in-range contexts
+   in the positive test (call arg, return, loop body, switch arm, branch, defer).
+   *Bounds are exact, not approximate.* `v` fits iff `v > MIN-1 && v < MAX+1`;
+   `MAX+1` is a power of two, written as a C99 hex-float literal (`0x1p32`), so
+   there is no rounding slop. `MIN-1` is exact only up to the 53-bit mantissa, so
+   wider signed targets use the equivalent `v >= -2^(N-1)` (no double lies
+   strictly between the two at that magnitude).
+2. **Compile-time rejection** for a float LITERAL that provably cannot fit
+   (`float_literal_value` + `float_fits_integer` in checker.c). This is also the
+   only protection available in a module-level initializer, which must stay a C
+   constant expression — hence the new `Emitter.in_const_init`, which suppresses
+   the statement-expression guard there.
+3. **`@truncate` on a float is now a compile error.** "Keep the low bits" has no
+   meaning for a float; it emitted the same undefined cast. The diagnostic names
+   both defined replacements. Corpus cost: exactly ONE site (`test_emit.c`'s
+   float-precision test), corrected to the plain cast.
+
+**`@saturate` is now TOTAL.** It was the documented clamping alternative but had
+two undefined edges of its own for a float source: the bound literals convert to
+double and round UP (`INT64_MAX` → 2^63, `UINT64_MAX` → 2^64), so a value exactly
+equal to the rounded bound fell through to a raw out-of-range cast — as did NaN.
+Float sources now take a half-open power-of-two tail with NaN → 0 (the answer
+Rust's saturating `as` gives). Same fix in both paths, which also closed a live
+**AST↔IR divergence**: the AST path's signed-64 arm was `(int64_t)_zer_sat` with
+NO clamp at all, while the IR path clamped correctly.
+
+Tests: `tests/zer/float_to_int_range_ok.zer` (in-range exactness at seven widths,
+the `-0.5` lower-boundary case, and @saturate totality),
+`tests/zer_trap/float_to_int_out_of_range.zer`,
+`tests/zer_fail/float_to_int_literal_out_of_range.zer`,
+`tests/zer_fail/truncate_on_float.zer` (both with `// expect-error:`).
+
+### BUG-803 — the emitted C required `-fno-strict-aliasing` and never enforced it
+
+The preamble's own banner has said `/* Compile with: gcc -std=c99 -fwrapv
+-fno-strict-aliasing */` for a long time, and `#pragma GCC optimize("wrapv")` was
+added precisely so a user compiling the `.c` themselves could not silently lose
+wrapping semantics. **The identical argument for the second flag was never
+applied.** ZER's sanctioned type-punning primitives — `@pun`, and `@ptrcast`
+through `*opaque` between primitives, where the runtime `type_id` is 0 and the
+check is deliberately skipped for C interop — hand out two differently-typed
+pointers to one object. Under GCC's default `-fstrict-aliasing` at `-O2` that is
+UB and IS miscompiled.
+
+Measured, same emitted `.c`:
+```zer
+u32 storage = 0; *u32 pa = &storage; *f32 pb = @pun(*f32, pa);
+*pa = 1; *pb = 2.0; return *pa;
+```
+→ `1` with `gcc -std=c99 -O2 -fwrapv`, `1073741824` with `-fno-strict-aliasing`.
+
+This is the `--emit-c` and bare-metal cross-compile workflow, where the user drives
+their own `arm-none-eabi-gcc` and the flag is most likely to be absent — a silently
+wrong value with no crash.
+
+**Fix:** the preamble now self-enforces both, `#pragma GCC optimize("wrapv")` plus
+`#pragma GCC optimize("no-strict-aliasing")`. Verified the two pragmas STACK (a
+second `#pragma GCC optimize` does not reset the first): with both present, signed
+overflow still wraps AND the aliased read returns the written bits.
+
+**Gate:** `tools/emit_audit.sh` (already in `make check`) now freezes both pragmas
+as REQUIRED content of every emitted sample, so a preamble edit cannot drop one
+unnoticed. Verified to FIRE by mangling the pragma name: 5 samples flagged, exit 1.
+
+### BUG-804 — `@bitcast` could forge an enum value and silently mis-dispatch a switch
+
+ZER guarantees an enum `switch` is exhaustive, and enforces it over the DECLARED
+variants. The guarantee rests on an implicit premise — an enum-typed value always
+IS one of those variants — which ZER upholds everywhere else: there is no int→enum
+cast (`(State)raw` does not even parse) and `@cast` demands a distinct typedef.
+`@bitcast` was the one unintended way in.
+
+Measured on a three-variant enum: `State s = @bitcast(State, 7); switch (s) {…}`
+ran the `.done` arm — the lowering makes the final arm the catch-all — while
+`s == State.done` was correctly false. Wrong branch, no diagnostic at either end.
+On bare metal a state machine takes a wrong path and nothing crashes.
+
+**Fix — TRACK, don't ban** (Ban Decision Framework rule 5: none of the four ban
+conditions applies). Reading an enum out of a hardware register field is a real
+firmware need, so the conversion stays and the VALUE is checked: a bitcast whose
+target is an enum now carries a variant check against the declared values and
+traps otherwise. Works for sparse explicit values, not just `0..N-1`. The reverse
+direction (enum → integer) is untouched — every variant is a valid integer.
+Emitted from ONE shared helper (`emit_enum_variant_guard`) called from both
+dispatch paths. Corpus cost: ZERO — no `@bitcast` in the whole corpus targets an
+enum.
+
+Tests: `tests/zer/bitcast_enum_variant_ok.zer` (contiguous + sparse + the reverse
+direction + the exhaustive switch it protects),
+`tests/zer_trap/bitcast_enum_invalid_variant.zer`.
+
+### BUG-805 — every unrecognised CLI option was silently ignored, `--target-arch` typo included
+
+`zerc_main.c`'s argument loop had no `else`. An option that matched none of the
+branches simply fell out of the loop, so **a compilation-mode request the user
+typed slightly wrong took effect as its opposite, with no diagnostic**:
+
+| invocation | what happened |
+|---|---|
+| `--target-arch=arm64` | **silently kept x86_64** — a SUCCESSFUL build of the wrong ISA, with x86 register validation and x86 inline asm, for someone who asked for ARM |
+| `--no-strict-mmi` (one letter short) | compiled in STRICT mmio mode, no diagnostic |
+| `--target-bits abc` | `atoi` → 0 → `zer_target_ptr_bits = 0`, so `type_width(usize)` is 0 |
+| `--stack-limit abc` / `0` | silently means "no limit" |
+| `--release` | accepted; nothing reads `release_mode` |
+
+The `--target-arch` case is the one that matters: on bare metal, code built for
+the wrong architecture is precisely the failure that does not announce itself.
+And the inconsistency was visible inside the same loop — `--probe-mode=` already
+errored on an unknown value while `--target-arch=` fell through to the default.
+The codebase even half-knew: `tests/test_semantic_fuzz.c` carries a comment that
+"zerc treats unknown flags as input filenames", which is true only of `argv[1]`;
+everything after it was dropped in silence.
+
+**Fix:** validate every option. Unknown `-`-prefixed option, unknown
+`--target-arch` value, non-`{16,32,64}` `--target-bits`, non-positive
+`--stack-limit` → error + exit 1. Added `--help` / `-h` (there was none) printing
+the full option list, which is also what the unknown-option error prints.
+`--release` now prints a note saying it has no effect rather than pretending.
+
+**Gate:** a `CLI option validation` section in `tests/test_zer.sh` (11 cells:
+5 malformed must exit non-zero, 5 well-formed must still work, plus `--help`).
+Verified against the pre-fix binary: 4 of the 5 reject cells were ACCEPTED there (rc=0) and are now rejected; the 5th (`--probe-mode=bogus`) already errored, and is kept as the control showing the gate is not simply rejecting everything.
+
+**Doc corrections shipped with it, both MEASURED rather than reasoned:**
+`docs/compiler-internals.md` still described `--release` as disabling the
+`*opaque` tracking levels and quoted a gating expression
+(`track_cptrs || (!release_mode && do_run)`) that no longer exists — the live
+code is `track_cptrs || do_run`, deliberately, per its own comment ("compiled-in
+safety, not debug"). The same section told users to reach for `--release` to get
+raw `malloc`/`free` working. Probing for a replacement flag found that `*opaque`
+emits as `_zer_opaque` under EVERY combination tried (default, `--lib`,
+`--track-cptrs`), so that section's premise was stale too. Both corrected with
+the measurement rather than a substitute claim.
+
+### BUG-806 — a committed GIT MERGE CONFLICT made BUG-650's regression guard vacuous
+
+`tests/zer_fail/compound_field_maybe_freed.zer` still contained
+`<<<<<<< HEAD` / `=======` / `>>>>>>> a432b3f` markers. It is a NEGATIVE test, so
+"the compiler rejected it" was recorded as a pass — and the compiler was
+rejecting `error: expected type at '<<'`, a PARSE error on the conflict marker.
+The safety rule the file exists to guard (BUG-650: compound `struct.field`
+handle state must widen to MAYBE_FREED at a CFG join, or a freed
+`b.h` is silently reusable) had therefore been testing **nothing but the parser**
+since that merge, while reporting green.
+
+This is the textbook vacuous-negative shape CLAUDE.md names — the pass condition
+(non-zero exit) was weaker than the claim (the compound-merge rule fires) — with
+the twist that the weakening was a merge artefact nobody could see, because the
+harness never prints the reason for a directive-less negative.
+
+**Fix:** resolved the conflict (the two sides were the same test with different
+comment depth; kept the fuller one) and added `// expect-error: use after free`.
+The file now rejects with `use after free: 'b' is maybe-freed (freed at line 35)`
+— the compound-merge rule, asserted rather than assumed. Repo-wide sweep for
+conflict markers: this was the only one.
+
+**Found by a new tool, not by reading.** `tools/negative_reason_audit.sh`
+compiles every directive-less negative, captures the first diagnostic, and flags
+the file when the diagnostic shares no significant word with its name. That is a
+weak heuristic on purpose — most flags are vocabulary mismatches (`*_uaf` vs
+"use after free") — but it is very good at the two shapes that matter: a
+PARSE/TYPE error where a SAFETY rule was intended, and a diagnostic naming a
+different rule than the file's name. It reports the standing exposure too:
+
+> **125 of 575 negatives carry `// expect-error:`. The other 450 still pass on
+> ANY non-zero exit.**
+
+The tool deliberately does NOT backfill the directives. Generating them from
+current output is the move CLAUDE.md forbids — it would freeze whatever the
+compiler prints today, wrong reasons included. Triage is the deliverable.
+
+### Technical debt closed in the same pass
+
+**558 compiled test binaries were TRACKED in git (~9.1 MB), and every `make check`
+dirtied them.** Each runner builds an executable next to its `.zer` source, so a
+routine test run left ~558 modified ELF files in `git status` — which is exactly
+the command CLAUDE.md tells a session to run to review what an agent changed, and
+what the merge-back methodology depends on. Two of them were listed in
+`.gitignore` by name; the rest were being swept into unrelated commits (the most
+recent one to touch `rust_tests/rt_spawn` is a concurrency fix). Replaced the
+two by-name entries with the shape — in the eight test directories, anything that
+is not `.zer` / `.md` / `.sh` / `.c` / `.h` is build output — and `git rm
+--cached`'d the binaries (four stale Windows `.exe` files included). Sources are
+untouched: 791 files still tracked in `rust_tests`, 531 in `tests/zer`, 71 in
+`test_modules`.
+
+**Build warnings: 27 → 0.** `make zerc` is now warning-clean, which is the point:
+27 standing warnings hide the 28th, and `-Werror=switch` only covers the
+kind-switch class. Two groups.
+
+*Not cosmetic, fixed:*
+- `zercheck_ir.c` passed a `size_t` to a `%.*s` precision, which expects `int` —
+  a varargs type mismatch (undefined) on the `IR_SUMMARY_DEBUG` path.
+- `ir_lower.c`'s expression lowerer could fall out of a non-void function.
+  The `switch` is exhaustive over `NodeKind` so it is unreachable, but falling
+  off returns whatever is in the register rather than the `-1` "no value"
+  sentinel every caller checks. Now returns `-1` explicitly.
+- A `uint32_t` vs `int` line comparison in the async-shadowing check.
+- `checker_check`'s `bool ok` was assigned twice and never read (the function
+  returns `c->error_count == 0`); made the discard explicit.
+- Six comments whose text closed the comment early (`/* … *T/… */`), including
+  two `#include` lines where the payload became "extra tokens at end of
+  `#include` directive".
+- Two `calloc(func->block_count, …)` in `ir_validate` where the `int` count
+  converts to `size_t`; clamped, so GCC stops warning that a negative value
+  would request a >SSIZE_MAX allocation.
+
+*Dead code, removed* (each provably unreferenced — GCC is the proof, and a
+deletion that was wrong would have failed the build immediately). Every removal
+leaves a one-line note saying where the live logic is, so nobody resurrects it:
+- `ir_classify_method_call` (zercheck_ir.c) — the Gap-32 backward-compat wrapper
+  that called the `_ex` form with a NULL Checker, skipping receiver-type
+  validation. All call sites had migrated; CLAUDE.md's Stage-1 rule 4 said to
+  deprecate it as they did. Removing it completes Gap 32 and takes away an entry
+  point that still looked sanctioned.
+- `classify_builtin_call` (ir_lower.c, 89 lines) — implied a lowering path that
+  does not exist. `ir_lower.c` never emits `IR_POOL_ALLOC`/`IR_SLAB_FREE`/…;
+  builtin methods collapse to `IR_ASSIGN`/`IR_CALL` and are classified later
+  from the carried AST. Dead code that documents a wrong architecture is worse
+  than none.
+- `stmt_writes_shared`, `shared_needs_condvar`, `find_shared_root_in_stmt`,
+  `collect_async_locals` (emitter.c, ~131 lines) — AST-era shared-lock and
+  async-state helpers, superseded by IR lowering.
+- `has_atomic_or_barrier` (checker.c, 79 lines) — superseded by the spawn scan's
+  own per-access classification.
+- `peek`, `arena_array`, `tok_str` and an `ident_tok` local (parser.c); two
+  unused 512-byte path buffers in `zerc_main.c`.
+
+### Method notes worth keeping
+
+- **The `-O0` vs `-O2` diff is the cheapest detector for this whole class,**
+  and it is now scripted as `tools/ub_sweep.sh` (two axes: optimization level,
+  and with/without `-fno-strict-aliasing`). Compile the emitted `.c` twice and
+  compare output — a divergence IS the defect, so there are no expected values
+  to maintain. Two of the four findings fell out of one such run; a
+  single-configuration test suite cannot see them by construction, because both
+  answers are "what the program did". Post-fix baseline over `tests/zer`:
+  **420 ran, 0 diverged on both axes.**
+- **`@saturate`'s bug was found by fixing its neighbour.** Writing the exact
+  bounds for the cast made the rounded bound literals in the clamp obviously
+  wrong. Auditing the *alternative* a diagnostic points users to is part of
+  shipping the diagnostic.
+- **Two of three fixes had to be written twice** (AST path + IR path) and the
+  third would have, had it not been extracted into a helper first. That multi-site
+  tax is real and measurable: the AST/IR `@saturate` divergence found here is what
+  it costs when the two copies drift. Every new wrapper in this session is ONE
+  function called from both sites.
+- **A required compiler FLAG is a safety wrapper.** It is invisible to every
+  gate that looks at ZER source or at emitted statements, which is why it survived
+  years of audits. `tools/emit_audit.sh` now treats the preamble's declared
+  requirements as content to freeze.
+
+---
+
 ## Session 2026-08-17b — BUG-796..801: the remaining 13 harvested holes (39/39 closed)
 
 Six independent classes, the ones the five structural fixes did not collapse.

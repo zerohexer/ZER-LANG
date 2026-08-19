@@ -1,0 +1,25 @@
+// BUG-804 — a value punned into an enum that is NOT a declared variant traps.
+//
+// ZER guarantees an enum `switch` is exhaustive over the declared variants.
+// That rests on an enum value always BEING one of them — which ZER enforces
+// everywhere else (there is no int->enum cast; `@cast` needs a distinct
+// typedef). `@bitcast` was the one way in, and it was silent: measured before
+// the fix, `@bitcast(State, 7)` on this three-variant enum ran the `.done` arm
+// (the lowering makes the final arm the catch-all) while `s == State.done` was
+// correctly false. Wrong branch, no diagnostic anywhere, and on bare metal a
+// state machine takes a wrong path without crashing.
+i32 printf(const *u8 fmt, ...);
+
+enum State { idle, running, done }
+
+u32 opaque_u32(u32 v) { return v; }
+
+u32 main() {
+    State s = @bitcast(State, opaque_u32(7));
+    switch (s) {
+        .idle => { printf("idle\n"); }
+        .running => { printf("running\n"); }
+        .done => { printf("done\n"); }
+    }
+    return 0;
+}

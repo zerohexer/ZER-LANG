@@ -207,10 +207,41 @@ void zerc_ir_hook(void *ctx, void *ir_func) {
 
 /* ================================================================ */
 
+/* BUG-805 (2026-08-19): the full option list, printed by --help AND by the
+ * unknown-option error. Keep in sync with the parse loop below — an option that
+ * parses but is not listed here is invisible to users; one listed but not
+ * parsed now fails loudly instead of being silently ignored. */
+static void zerc_usage(FILE *out) {
+    fprintf(out,
+        "Usage: zerc <input.zer> [options]\n"
+        "\n"
+        "  -o <path>                 output path (.c keeps the C; anything else builds an executable)\n"
+        "  --run                     compile and execute\n"
+        "  --emit-c                  keep the emitted C\n"
+        "  --emit-ir                 print the IR and exit\n"
+        "  --lib                     no preamble/runtime (for C interop)\n"
+        "  --no-strict-mmio          allow @inttoptr without an mmio declaration\n"
+        "  --track-cptrs             force *opaque runtime tracking (on by default with --run)\n"
+        "  --target-bits <16|32|64>  usize width (default: probed from gcc)\n"
+        "  --target-arch=<arch>      x86_64 | aarch64 | riscv64\n"
+        "  --target-features=<list>  comma-separated CPU features (avx512f, aes, bmi2, ...)\n"
+        "  --probe-mode=<mode>       hosted | raw | disabled\n"
+        "  --stack-limit <bytes>     error when estimated stack usage exceeds this\n"
+        "  --gcc <path>              compiler to use for the emitted C\n"
+        "  --trace / --trace-calls   print the compilation flow to stderr\n"
+        "  --help                    this message\n"
+        "\n"
+        "Options must follow the input file.\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: zerc <input.zer> [-o output] [--run] [--emit-c] [--emit-ir]\n");
+        zerc_usage(stderr);
         return 1;
+    }
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        zerc_usage(stdout);
+        return 0;
     }
 
     const char *input_path = argv[1];
@@ -221,7 +252,6 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -260,12 +290,28 @@ int main(int argc, char **argv) {
             no_preamble = true;
         } else if (strcmp(argv[i], "--no-strict-mmio") == 0) {
             no_strict_mmio = true;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            zerc_usage(stdout);
+            return 0;
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
-            release_mode = true;
+            /* BUG-805: reserved, and currently a NO-OP. It once gated the
+             * *opaque tracking levels, but that instrumentation is now
+             * unconditional under --run by design ("compiled-in safety, not
+             * debug" — see the track_cptrs comment below), so nothing reads
+             * this. Say so rather than accept it silently: docs elsewhere still
+             * describe it as switching something off. */
+            fprintf(stderr, "zerc: note: --release currently has no effect — "
+                            "safety instrumentation is compiled-in, not a debug mode\n");
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
-            zer_target_ptr_bits = atoi(argv[++i]);
+            const char *bits_s = argv[++i];
+            int bits = atoi(bits_s);
+            if (bits != 16 && bits != 32 && bits != 64) {
+                fprintf(stderr, "error: --target-bits must be 16, 32 or 64 (got '%s')\n", bits_s);
+                return 1;
+            }
+            zer_target_ptr_bits = bits;
             target_bits_explicit = true;
         } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
             gcc_override = argv[++i];
@@ -280,7 +326,13 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
-            zer_stack_limit = (uint32_t)atoi(argv[++i]);
+            const char *lim_s = argv[++i];
+            int lim = atoi(lim_s);
+            if (lim <= 0) {
+                fprintf(stderr, "error: --stack-limit must be a positive byte count (got '%s')\n", lim_s);
+                return 1;
+            }
+            zer_stack_limit = (uint32_t)lim;
         } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
             /* F4.2 (2026-04-29): comma-separated CPU features. Each match
              * sets a bit in zer_target_features (matches ZerCpuFeature
@@ -331,7 +383,29 @@ int main(int argc, char **argv) {
                 zer_target_arch_id = 3;
                 zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
                 zer_target_features = 0;  /* clear x86 baseline */
+            } else {
+                /* BUG-805: an unknown arch used to fall through SILENTLY and
+                 * keep the x86_64 default — so `--target-arch=arm64` (the
+                 * natural typo for aarch64) produced a SUCCESSFUL build of x86
+                 * code, with x86 register validation and x86 inline asm, for a
+                 * user who asked for ARM. Nothing said a word at compile time
+                 * or at run time, and on bare metal the wrong ISA is exactly the
+                 * failure that does not announce itself. --probe-mode= in this
+                 * same loop already errored on an unknown value; this now
+                 * matches it. */
+                fprintf(stderr, "error: unknown --target-arch '%s' "
+                                "(use x86_64, aarch64, or riscv64)\n", a);
+                return 1;
             }
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            /* BUG-805: there was no else — EVERY unrecognised option was
+             * silently ignored, so `--no-strict-mmi` (one letter short) or
+             * `--emitc` compiled cleanly in the mode the user did not ask for.
+             * A compilation-mode request that is dropped without a diagnostic is
+             * the same class of silent gap this compiler exists to remove. */
+            fprintf(stderr, "error: unknown option '%s'\n\n", argv[i]);
+            zerc_usage(stderr);
+            return 1;
         }
     }
 
@@ -402,9 +476,9 @@ int main(int argc, char **argv) {
         use_temp_c = true;
     }
 
-    /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    /* for temp .c mode, create temp path and set up exe path.
+     * (`temp_c_path` / `exe_from_input` buffers removed 2026-08-19 — both were
+     * unused; the paths are built in `default_output` / `output_path`.) */
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

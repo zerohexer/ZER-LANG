@@ -24,6 +24,146 @@ static void emit(Emitter *e, const char *fmt, ...) {
     va_end(args);
 }
 
+static void emit_type(Emitter *e, Type *t);   /* defined below */
+
+/* ================================================================
+ * Float -> integer conversion guard (BUG-802, 2026-08-19)
+ *
+ * C leaves float->integer conversion UNDEFINED when the truncated value does
+ * not fit the destination (C11 6.3.1.4p1), and the manifestation is silent:
+ * the SAME ZER program measured on x86-64 gives
+ *     (u32)(-1.5)         == 0            at -O2   and 4294967295 at -O0
+ *     (i32)1.0e30         == 2147483647   at -O2   and -2147483648 at -O0
+ *     (u32)4294967296.0   == 4294967295   at -O2   and 0           at -O0
+ * because GCC constant-folds with saturation while the hardware CVTTSD2SI
+ * yields the "integer indefinite" value; ARM saturates in hardware, so the
+ * answer changes again per target. Neither the checker nor the runtime said
+ * anything — exactly the silent, arch-dependent divergence ZER's "no undefined
+ * behavior" guarantee exists to exclude.
+ *
+ * ZER defines it: TRAP, the same answer already given for division by zero,
+ * signed-division overflow and out-of-bounds indexing. The explicit
+ * alternative stays `@saturate(T, f)`, which clamps and is total.
+ *
+ * BOUNDS ARE EXACT (no rounding slop). Truncation-toward-zero of v fits iff
+ *     v > MIN-1  &&  v < MAX+1.
+ * MAX+1 is 2^N (unsigned) / 2^(N-1) (signed) — powers of two, written as C99
+ * hex-float literals so they are exactly representable. MIN-1 is -1 (unsigned)
+ * or -(2^(N-1))-1 (signed); the latter is exactly representable only while it
+ * fits the 53-bit mantissa, so for wider signed targets the EQUIVALENT test
+ * `v >= -2^(N-1)` is used — at that magnitude double spacing is >= 2, so no
+ * double lies strictly between -(2^(N-1))-1 and -(2^(N-1)) and the two tests
+ * accept exactly the same set.
+ * NaN fails every comparison, so it traps too (it has no integer value).
+ * ================================================================ */
+
+/* Does a conversion from `src` to `tgt` need the range guard? Only a genuine
+ * float source with an INTEGER destination. bool is excluded (it is emitted as
+ * `!!x`, which is defined for every float including NaN). */
+static bool f2i_guard_applies(Type *src, Type *tgt) {
+    if (!src || !tgt) return false;
+    if (!type_is_float(src)) return false;
+    if (!type_is_integer(tgt)) return false;
+    if (type_dispatch_kind(tgt) == TYPE_BOOL) return false;
+    return type_width(tgt) > 0;
+}
+
+/* Emit the in-range predicate over the already-declared double named `var`. */
+static void emit_f2i_bounds(Emitter *e, Type *tgt, const char *var) {
+    int w = type_width(tgt);
+    if (w <= 0) w = 32;
+    if (!type_is_signed(tgt)) {
+        emit(e, "%s > -1.0 && %s < 0x1p%d", var, var, w);
+    } else if (w <= 53) {
+        emit(e, "%s > (-0x1p%d - 1.0) && %s < 0x1p%d", var, w - 1, var, w - 1);
+    } else {
+        emit(e, "%s >= -0x1p%d && %s < 0x1p%d", var, w - 1, var, w - 1);
+    }
+}
+
+/* BUG-802: the tail of `@saturate(T, <float>)` — exact and TOTAL.
+ *
+ * The generic clamp compares in the SOURCE's own type. That is right for an
+ * integer source but leaves two UNDEFINED edges for a float one:
+ *   - the bound literals convert to double and ROUND UP (INT64_MAX -> 2^63,
+ *     UINT64_MAX -> 2^64), so a value exactly equal to the rounded bound fails
+ *     the `>` test and falls through to a raw out-of-range cast;
+ *   - NaN fails every comparison and reaches that same raw cast.
+ * Both are C UB. This tail uses HALF-OPEN power-of-two bounds (exact as C99
+ * hex-float literals, no rounding slop) and defines NaN as 0 — the same answer
+ * Rust's saturating `as` gives. The result: @saturate is total, i.e. defined
+ * for every double on every target, which is what makes it the sound explicit
+ * alternative to the trapping `(T)f` conversion.
+ *
+ * `var` names an already-declared `double` holding the source value. */
+static void emit_saturate_float_tail(Emitter *e, Type *t, const char *var) {
+    int w = type_width(t);
+    if (w <= 0) w = 32;
+    #define ZER_ST_CAST() do { emit(e, "("); emit_type(e, t); emit(e, ")"); } while (0)
+    emit(e, "%s != %s ? ", var, var);          /* NaN */
+    ZER_ST_CAST(); emit(e, "0 : ");
+    if (!type_is_signed(t)) {
+        emit(e, "%s < 0.0 ? ", var);
+        ZER_ST_CAST(); emit(e, "0 : ");
+        if (w >= 64) {
+            emit(e, "%s >= 0x1p64 ? ", var);
+            ZER_ST_CAST(); emit(e, "18446744073709551615ULL : ");
+        } else {
+            unsigned long long mx = (1ULL << w) - 1ULL;
+            emit(e, "%s >= 0x1p%d ? ", var, w);
+            ZER_ST_CAST(); emit(e, "%lluULL : ", mx);
+        }
+    } else if (w >= 64) {
+        emit(e, "%s < -0x1p63 ? ", var);
+        ZER_ST_CAST(); emit(e, "(-9223372036854775807LL - 1) : ");
+        emit(e, "%s >= 0x1p63 ? ", var);
+        ZER_ST_CAST(); emit(e, "9223372036854775807LL : ");
+    } else {
+        long long mn = -(1LL << (w - 1));
+        long long mx = (1LL << (w - 1)) - 1LL;
+        emit(e, "%s < -0x1p%d ? ", var, w - 1);
+        ZER_ST_CAST(); emit(e, "(%lldLL) : ", mn);
+        emit(e, "%s >= 0x1p%d ? ", var, w - 1);
+        ZER_ST_CAST(); emit(e, "(%lldLL) : ", mx);
+    }
+    ZER_ST_CAST(); emit(e, "%s", var);
+    #undef ZER_ST_CAST
+}
+
+/* BUG-804 (2026-08-19): guard a value punned INTO an enum.
+ *
+ * ZER guarantees a `switch` over an enum is EXHAUSTIVE, and enforces it at
+ * compile time over the DECLARED variants. That guarantee rests on an implicit
+ * premise — an enum-typed value always IS one of those variants — and ZER
+ * upholds it everywhere else: there is no int->enum cast (`(State)raw` does not
+ * even parse) and `@cast` demands a distinct typedef. `@bitcast` was the one
+ * unintended way in, and it was silent: measured, `@bitcast(State, 7)` on a
+ * three-variant enum ran the `.done` arm (the lowering makes the final arm the
+ * catch-all) while `s == State.done` was correctly false. Wrong branch, no
+ * diagnostic at compile time, none at run time, and on bare metal a state
+ * machine takes a wrong path without crashing.
+ *
+ * Resolved by TRACKING, not banning (CLAUDE.md Ban Decision Framework rule 5):
+ * reading an enum out of a hardware register field is a legitimate firmware
+ * need, so the conversion stays available and the value is CHECKED. A value
+ * that is not a declared variant traps, exactly like an out-of-range index.
+ *
+ * Emits nothing for a non-enum target, or for an enum with no variants. */
+static void emit_enum_variant_guard(Emitter *e, Type *t, const char *lv) {
+    if (type_dispatch_kind(t) != TYPE_ENUM) return;
+    Type *eff = type_unwrap_distinct(t);
+    if (!eff) return;
+    uint32_t n = eff->enum_type.variant_count;
+    if (n == 0) return;
+    emit(e, "if (!(");
+    for (uint32_t i = 0; i < n; i++) {
+        if (i > 0) emit(e, " || ");
+        emit(e, "(int32_t)%s == %d", lv, (int)eff->enum_type.variants[i].value);
+    }
+    emit(e, ")) _zer_trap(\"bitcast to enum: value is not a declared variant\", "
+            "__FILE__, __LINE__); ");
+}
+
 /* emit a user-defined type name with optional module prefix for namespace mangling.
  * If prefix is set: emits "prefix_name". If NULL: emits "name". */
 static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
@@ -648,45 +788,8 @@ static void emit_auto_guards(Emitter *e, Node *node) {
 
 static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
 
-/* Find shared struct variable accessed in a statement or expression.
- * Returns the root ident node if any NODE_FIELD chain leads to a shared struct.
- * Used to auto-insert lock/unlock around statements. */
-static Node *find_shared_root_in_stmt(Emitter *e, Node *stmt) {
-    if (!stmt) return NULL;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT: return find_shared_root(e, stmt->expr_stmt.expr);
-    case NODE_VAR_DECL: return find_shared_root(e, stmt->var_decl.init);
-    case NODE_RETURN: return find_shared_root(e, stmt->ret.expr);
-    case NODE_IF: return find_shared_root(e, stmt->if_stmt.cond);
-    case NODE_WHILE: case NODE_DO_WHILE: return find_shared_root(e, stmt->while_stmt.cond);
-    case NODE_FOR: {
-        Node *r = find_shared_root(e, stmt->for_stmt.init);
-        if (!r && stmt->for_stmt.cond) r = find_shared_root(e, stmt->for_stmt.cond);
-        return r;
-    }
-    case NODE_SWITCH: return find_shared_root(e, stmt->switch_stmt.expr);
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without a single
-     * cond/init/expr that could read a shared struct. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return NULL;
-    }
-    return NULL;
-}
+/* `find_shared_root_in_stmt` removed 2026-08-19 — dead code. The shared root
+ * is tracked during IR lowering, not rediscovered at emission. */
 
 static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
@@ -738,15 +841,8 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
 static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
 static bool is_async_local(Emitter *e, const char *name, size_t len); /* forward decl */
 
-/* Check if a shared struct type uses condvar (needs mutex instead of spinlock) */
-static bool shared_needs_condvar(Emitter *e, Type *t) {
-    if (!t) return false;
-    Type *eff = type_unwrap_distinct(t);
-    if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
-    if (eff && eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
-        return is_condvar_type(e, eff->struct_type.type_id);
-    return false;
-}
+/* `shared_needs_condvar` removed 2026-08-19 — dead code. The condvar upgrade
+ * is decided from the registered condvar-type list, not per emission site. */
 
 /* Check if a shared struct type uses reader-writer lock */
 static bool shared_is_rw(Type *t) {
@@ -757,49 +853,9 @@ static bool shared_is_rw(Type *t) {
     return false;
 }
 
-/* Check if a statement WRITES to a shared struct (vs read-only).
- * Write = assignment target, compound assign, mutating method call.
- * Used to determine rdlock vs wrlock for shared(rw) structs. */
-static bool stmt_writes_shared(Node *stmt) {
-    if (!stmt) return false;
-    switch (stmt->kind) {
-    case NODE_EXPR_STMT:
-        /* x.field = ...; or x.field += ...; */
-        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_ASSIGN)
-            return true;
-        /* Method calls that mutate (push, free, etc.) */
-        if (stmt->expr_stmt.expr && stmt->expr_stmt.expr->kind == NODE_CALL)
-            return true; /* conservative: any call might mutate */
-        return false;
-    case NODE_VAR_DECL:
-        return false; /* reading into a variable is read-only */
-    case NODE_RETURN:
-        return false; /* reading for return */
-    /* Stage 2 Part B (2026-04-28): exhaustive — only EXPR_STMT/VAR_DECL/
-     * RETURN distinguish read-vs-write at the statement level. Other
-     * kinds either don't access shared (block, control flow) or are
-     * handled per-cond elsewhere. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
-    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_BREAK:
-    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
-    case NODE_AWAIT: case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
+/* `stmt_writes_shared` removed 2026-08-19 — dead code. Shared-struct locking
+ * is decided per statement during IR lowering (ir_lower.c's
+ * current_stmt_shared_root), not by an emitter-side statement scan. */
 
 /* Emit lock acquire for shared struct variable.
  * For shared(rw) structs, is_write determines rdlock vs wrlock. */
@@ -3081,6 +3137,23 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "((uint8_t)!!(");
             emit_expr(e, node->typecast.expr);
             emit(e, "))");
+        } else if (f2i_guard_applies(src_eff, tgt_eff) && !e->in_const_init) {
+            /* BUG-802: float -> integer is UB in C when the value does not fit.
+             * Guard it (see f2i_guard_applies). Suppressed inside a global
+             * initializer, which must stay a C constant expression — a
+             * statement expression is illegal there; the checker's
+             * compile-time literal-range check covers that context instead. */
+            int tmp = e->temp_count++;
+            char var[32];
+            snprintf(var, sizeof(var), "_zer_fc%d", tmp);
+            emit(e, "({ double %s = (double)(", var);
+            emit_expr(e, node->typecast.expr);
+            emit(e, "); if (!(");
+            emit_f2i_bounds(e, tgt, var);
+            emit(e, ")) _zer_trap(\"float-to-integer conversion out of range\", "
+                    "__FILE__, __LINE__); (");
+            emit_type(e, tgt);
+            emit(e, ")%s; })", var);
         } else {
             /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
             emit(e, "((");
@@ -3358,6 +3431,11 @@ static void emit_expr(Emitter *e, Node *node) {
                     char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
                     emit_intn_mask_lv(e, t, lv);
                 }
+                /* BUG-804: an ENUM target must land on a declared variant. */
+                {
+                    char elv[40]; snprintf(elv, sizeof elv, "_zer_bco%d", tmp);
+                    emit_enum_variant_guard(e, t, elv);
+                }
                 emit(e, "_zer_bco%d; })", tmp);
             } else {
                 emit(e, "0");
@@ -3391,6 +3469,18 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
+                /* BUG-802: a FLOAT source takes the exact + total tail. */
+                Type *sat_src = (node->intrinsic.arg_count > 0)
+                    ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+                if (sat_src && type_is_float(sat_src) && type_is_integer(t)) {
+                    char sv[32];
+                    snprintf(sv, sizeof(sv), "_zer_sat%d", tmp);
+                    emit(e, "({ double %s = (double)(", sv);
+                    emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, "); ");
+                    emit_saturate_float_tail(e, t, sv);
+                    emit(e, "; })");
+                } else {
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
@@ -3423,9 +3513,14 @@ static void emit_expr(Emitter *e, Node *node) {
                     else if (w == 32)
                         emit(e, "_zer_sat%d < -2147483648LL ? -2147483648LL : _zer_sat%d > 2147483647LL ? 2147483647LL : (int32_t)_zer_sat%d", tmp, tmp, tmp);
                     else
-                        emit(e, "(int64_t)_zer_sat%d", tmp);
+                        emit(e, "_zer_sat%d < (-9223372036854775807LL - 1) ? "
+                                "(-9223372036854775807LL - 1) : "
+                                "_zer_sat%d > 9223372036854775807LL ? "
+                                "(9223372036854775807LL) : (int64_t)_zer_sat%d",
+                             tmp, tmp, tmp);
                 }
                 emit(e, "; })");
+                }
             } else {
                 emit(e, "0");
             }
@@ -4364,46 +4459,8 @@ static void add_async_local(Emitter *e, const char *name, size_t name_len) {
     e->async_local_count++;
 }
 
-/* BUG-490: collect local variable declarations RECURSIVELY from all blocks.
- * Sub-block locals must be promoted to state struct — they live on the C stack
- * which is destroyed on yield. Same fix as Rust's MIR generator transform. */
-static void collect_async_locals(Emitter *e, Node *node) {
-    if (!node) return;
-    if (node->kind == NODE_VAR_DECL && !node->var_decl.is_static) {
-        add_async_local(e, node->var_decl.name, node->var_decl.name_len);
-    }
-    if (node->kind == NODE_BLOCK) {
-        for (int i = 0; i < node->block.stmt_count; i++)
-            collect_async_locals(e, node->block.stmts[i]);
-    }
-    if (node->kind == NODE_IF) {
-        /* Async capture promotion: if (opt) |val| introduces implicit local 'val'.
-         * Must be promoted to state struct — lives on C stack, invalid after yield. */
-        if (node->if_stmt.capture_name) {
-            add_async_local(e, node->if_stmt.capture_name,
-                            node->if_stmt.capture_name_len);
-        }
-        collect_async_locals(e, node->if_stmt.then_body);
-        collect_async_locals(e, node->if_stmt.else_body);
-    }
-    if (node->kind == NODE_FOR) {
-        collect_async_locals(e, node->for_stmt.init);
-        collect_async_locals(e, node->for_stmt.body);
-    }
-    if (node->kind == NODE_WHILE || node->kind == NODE_DO_WHILE)
-        collect_async_locals(e, node->while_stmt.body);
-    if (node->kind == NODE_SWITCH) {
-        /* Switch arm captures in async deferred to v0.4 (type resolution complex) */
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            collect_async_locals(e, node->switch_stmt.arms[i].body);
-    }
-    if (node->kind == NODE_DEFER)
-        collect_async_locals(e, node->defer.body);
-    if (node->kind == NODE_CRITICAL)
-        collect_async_locals(e, node->critical.body);
-    if (node->kind == NODE_ONCE)
-        collect_async_locals(e, node->once.body);
-}
+/* `collect_async_locals` removed 2026-08-19 — dead code. Async state-struct
+ * members come from the IR local table, not from a separate AST walk. */
 
 /* Check if an ident name is an async-promoted local */
 static bool is_async_local(Emitter *e, const char *name, size_t len) {
@@ -5061,7 +5118,11 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         break;
 
     case NODE_GLOBAL_VAR:
+        /* A module-level initializer must stay a C constant expression — no
+         * statement-expression safety wrapper may appear inside it. */
+        e->in_const_init = true;
         emit_global_var(e, decl);
+        e->in_const_init = false;
         break;
 
     case NODE_UNION_DECL: {
@@ -5294,8 +5355,22 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * flag may be missing — silent UB at any optimization level. The pragma
      * enforces wrapv inside the .c file itself. Compilers without pragma
      * support (e.g., clang older than 18) ignore unknown pragmas silently. */
+    /* BUG-803 (2026-08-19): the SAME argument applies to -fno-strict-aliasing,
+     * which the banner one line above already declares REQUIRED — but nothing
+     * enforced it. ZER's sanctioned type-punning primitives (`@pun`, and
+     * `@ptrcast` through `*opaque` between primitives, where the runtime
+     * type_id is 0 and the check is deliberately skipped for C interop) hand
+     * the user two differently-typed pointers to one object; under GCC's
+     * default -fstrict-aliasing at -O2 that access is UB and IS miscompiled.
+     * Measured: `*u32 pa = &storage; *f32 pb = @pun(*f32, pa); *pa = 1;
+     * *pb = 2.0; return *pa;` yields 1 with a bare `gcc -O2` and 1073741824
+     * with -fno-strict-aliasing. Silent at compile time and at run time, and
+     * worst on bare metal, where the user drives their own cross-gcc and the
+     * flag is the most likely to be absent. Self-enforce it here, exactly like
+     * wrapv, so the emitted .c is correct under ANY caller flags. */
     emit(e, "#if defined(__GNUC__) && !defined(__clang__)\n");
     emit(e, "#pragma GCC optimize(\"wrapv\")\n");
+    emit(e, "#pragma GCC optimize(\"no-strict-aliasing\")\n");
     emit(e, "#endif\n");
     emit(e, "#include <stdint.h>\n");
     emit(e, "#include <stddef.h>\n");
@@ -7592,6 +7667,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
+                /* BUG-802: a FLOAT source takes the exact + total tail (IR-path
+                 * mirror of the emit_expr site). */
+                Type *sat_src = (node->intrinsic.arg_count > 0)
+                    ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+                if (sat_src && type_is_float(sat_src) && type_is_integer(t)) {
+                    char sv[32];
+                    snprintf(sv, sizeof(sv), "_zer_sat%d", tmp);
+                    emit(e, "({ double %s = (double)(", sv);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, "); ");
+                    emit_saturate_float_tail(e, t, sv);
+                    emit(e, "; })");
+                    return;
+                }
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -7663,6 +7752,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (type_is_nonnative_intn(t)) {
                     char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
                     emit_intn_mask_lv(e, t, lv);
+                }
+                /* BUG-804: an ENUM target must land on a declared variant. */
+                {
+                    char elv[40]; snprintf(elv, sizeof elv, "_zer_bco%d", tmp);
+                    emit_enum_variant_guard(e, t, elv);
                 }
                 emit(e, "_zer_bco%d; })", tmp);
             }
@@ -9904,15 +9998,38 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_TYPECAST: {
-        /* Should be handled by IR_CAST, but in case it reaches here */
-        emit(e, "((");
-        if (node->typecast.target_type) {
-            Type *t = resolve_tynode(e, node->typecast.target_type);
-            emit_type(e, t);
+        /* Mostly handled by IR_CAST — but this arm is NOT dead: a DEFER BODY is
+         * emitted from raw AST through emit_rewritten_node, so every cast inside
+         * one lands here. BUG-802's first cut patched only the emit_expr and
+         * IR_CAST arms and left `defer take((u32)f);` emitting a bare,
+         * UNGUARDED `((uint32_t)f)` — the same multi-site tax that produced the
+         * AST/IR @saturate divergence, caught by grepping the emitted C for
+         * conversion sites rather than by a passing test. Any safety wrapper on
+         * a cast belongs at all THREE sites. */
+        {
+            Type *t = node->typecast.target_type
+                ? resolve_tynode(e, node->typecast.target_type) : NULL;
+            Type *src = checker_get_type(e->checker, node->typecast.expr);
+            if (t && f2i_guard_applies(src, t)) {
+                int tmp = e->temp_count++;
+                char var[32];
+                snprintf(var, sizeof(var), "_zer_fc%d", tmp);
+                emit(e, "({ double %s = (double)(", var);
+                emit_rewritten_node(e, node->typecast.expr, func);
+                emit(e, "); if (!(");
+                emit_f2i_bounds(e, t, var);
+                emit(e, ")) _zer_trap(\"float-to-integer conversion out of range\", "
+                        "__FILE__, __LINE__); (");
+                emit_type(e, t);
+                emit(e, ")%s; })", var);
+                return;
+            }
+            emit(e, "((");
+            if (t) emit_type(e, t);
+            emit(e, ")");
+            emit_rewritten_node(e, node->typecast.expr, func);
+            emit(e, ")");
         }
-        emit(e, ")");
-        emit_rewritten_node(e, node->typecast.expr, func);
-        emit(e, ")");
         return;
     }
 
@@ -12201,6 +12318,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "((uint8_t)!!(");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "))");
+            }
+            /* BUG-802: float -> integer range guard (IR path — the mirror of the
+             * AST NODE_TYPECAST arm; both dispatch paths must carry every safety
+             * wrapper, CLAUDE.md "AST→IR emission diff audit"). */
+            else if (inst->src1_local >= 0 &&
+                     f2i_guard_applies(src_eff, tgt_eff)) {
+                int tmp = e->temp_count++;
+                char var[32];
+                snprintf(var, sizeof(var), "_zer_fc%d", tmp);
+                emit(e, "({ double %s = (double)(", var);
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, "); if (!(");
+                emit_f2i_bounds(e, tgt, var);
+                emit(e, ")) _zer_trap(\"float-to-integer conversion out of range\", "
+                        "__FILE__, __LINE__); (");
+                emit_type(e, tgt);
+                emit(e, ")%s; })", var);
             }
             /* Simple C cast */
             else if (inst->src1_local >= 0) {

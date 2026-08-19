@@ -420,6 +420,97 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — measured 2026-08-19 (audit session that produced BUG-802..804)
+
+Everything below was REPRODUCED on main this session, not carried over on a previous
+entry's word. Two are re-confirmations of existing entries (kept there, cross-referenced
+here with the fresh measurement); three are new.
+
+### RE-VERIFIED LIVE — `naked` attribute is still silently dropped on the IR path
+
+The deferral entry further down this file is ACCURATE and still applies. Fresh
+measurement 2026-08-19:
+```zer
+naked void reset_handler() { asm("nop"); }
+```
+emits `void reset_handler(void) { … }` with **no** `__attribute__((naked))`. GCC
+therefore wraps the body in a normal prologue/epilogue.
+
+Why it matters more than the entry's own framing suggests: this is a **silent**
+semantic substitution. The user writes `naked`, the compiler accepts it, and produces a
+function with the opposite property, with no diagnostic. On a reset handler that runs
+before the stack pointer is valid, the implicit prologue faults or corrupts; on a
+context-switch primitive it clobbers the frame the asm is managing. Neither the checker
+nor the runtime says anything.
+
+**Not fixed here on purpose.** Applying the attribute SIGILLs the ~48 corpus files that
+declare `naked` and rely on the implicit epilogue for their `ret`; the entry's own
+migration plan calls it a user-visible breaking change. That is an owner decision, not
+an audit-session change.
+
+**The minimum that does NOT require the migration** is to stop being silent: warn at
+every `naked` function that the attribute is not applied on this build. The
+no-warning verification set is only 5 files and contains no `asm_*` test, so a warning
+is harness-safe; the cost is noise across ~48 corpus files. Recorded as the cheap
+option if the migration stays deferred.
+
+### RE-VERIFIED LIVE — scoped-borrow: a join on EVERY branch arm is over-rejected
+
+The existing LOW/precision entry is accurate. Exact reproducer measured this session:
+```zer
+ThreadHandle th = spawn compute(&w);
+if (c == 1) { th.join(); } else { th.join(); }
+printf("%u", w.v);   // error: cannot read 'w' while it is borrowed by a scoped spawn
+```
+Hoisting the join out of the branch compiles. **Deliberately NOT relaxed here.** The
+borrow is a linear statement-order approximation in `checker.c`, so "joined on every
+arm" is an all-paths (CFG) question being asked of a walker that has no CFG; getting it
+wrong is accept-unsafe, and accept-unsafe on a concurrency rule is the worst failure
+class this file tracks. The workaround is one line and teachable. Any future fix must
+handle a `goto` out of an arm into the post-branch code, an arm whose own nested `if`
+joins on only one path, and a missing `else` — each of which silently defeats the naive
+"both arms joined" flag.
+
+### NEW (LOW, latent) — `f64` → `f32` narrowing overflow is C UB
+
+C11 6.3.1.5p2 makes a float→float conversion undefined when the value is outside the
+destination's range, and ZER emits a bare cast. Measured: `(f32)1.0e300` gives `inf` at
+both `-O0` and `-O2` on x86-64, which is the IEEE answer every practical target gives,
+so unlike BUG-802 there is no observed divergence to point at.
+
+Not guarded, deliberately: the guard would sit on every float narrowing (the hot path in
+any DSP or graphics code) to defend a case with no measured misbehaviour, and `inf` is
+already the value a programmer expects. Recorded so a future session does not "discover"
+it as a new hole, and so that the BUG-802 claim stays precise — **float→INTEGER is
+guarded; float→float is not.**
+
+### NEW (LOW, ergonomics of `--emit-c`) — the emitted C is not `-Wall -Wextra` clean
+
+Compiling emitted C with `gcc -Wall -Wextra` produces a handful of warnings per file:
+`-Wmain` (ZER's `u32 main()` emits `uint32_t main(void)`, and C requires `int`),
+`-Wpointer-sign` (a `[*]u8` slice `.ptr` passed to `printf("%s")`),
+`-Wformat-security`, plus unused-label / unused-parameter / unused-function noise from
+the preamble and the basic-block labels.
+
+None is a safety defect — but a user who compiles the emitted `.c` inside their own
+build with `-Werror` (common in firmware) cannot, and the `--emit-c` workflow is
+supposed to be a first-class path. The cheap subset is `-Wmain` (emit `int main(void)`
+with the `u32` result truncated at the return, which is what the exit status already
+does) and `-Wpointer-sign` (emit a `(const char *)` cast when a `[*]u8` reaches a
+variadic C parameter).
+
+### NEW (LOW, tooling) — `zerc f.zer -o out.c` reports trap sites at the EMITTED C line
+
+`_zer_trap` call sites pass `__FILE__, __LINE__`, and the emitted C carries only ONE
+`#line` directive, so a trap in `-o out.c` output reports e.g. `f4.zer:14` for a
+two-line source. This is pre-existing and shared by every trap (bounds, division,
+`@inttoptr`, `@pun`, and now the float→int and enum-variant guards); `_zer_bounds_check`
+already takes explicit `file, line` parameters and could be the model for threading the
+real source line through the rest. Cosmetic, but it makes a trap harder to locate
+exactly when the user most needs it.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a

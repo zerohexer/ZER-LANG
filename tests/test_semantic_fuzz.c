@@ -88,6 +88,11 @@ static void run_test(const char *name, const char *code, int expect_fail) {
 static void gen_safe_arena_chain(char *buf, int depth) {
     char *p = buf;
     p += sprintf(p, "struct Block%d { u32 a; u32 b; }\n", depth);
+    /* 2026-08-20: back the arena. It used to be a bare `Arena arN;`, which has
+     * capacity 0 — so every allocation in these "safe" programs returned null
+     * and the generated test proved nothing about the wrapper chain it builds.
+     * The backing-store check now rejects that shape, which is what surfaced it. */
+    p += sprintf(p, "u8[1024] armem%d;\n", depth);
     p += sprintf(p, "Arena ar%d;\n", depth);
 
     /* Build wrapper chain */
@@ -102,6 +107,7 @@ static void gen_safe_arena_chain(char *buf, int depth) {
     }
 
     p += sprintf(p, "u32 test_arena_chain_%d() {\n", depth);
+    p += sprintf(p, "    ar%d = Arena.over(armem%d);\n", depth, depth);
     p += sprintf(p, "    ?*Block%d mb = wrap%d_%d();\n", depth, depth, depth - 1);
     p += sprintf(p, "    *Block%d b = mb orelse return;\n", depth);
     p += sprintf(p, "    b.a = %d;\n", depth * 10);
@@ -601,9 +607,14 @@ static void gen_unsafe_nonkeep_global(char *buf, int id) {
 static void gen_unsafe_arena_global(char *buf, int id) {
     char *p = buf;
     p += sprintf(p, "struct Ag%d { u32 v; }\n", id);
+    /* Backed on purpose: without a backing store the new check would reject this
+     * program for the WRONG reason and the arena-ESCAPE rule under test would
+     * never fire — a negative passing for an unrelated cause. */
+    p += sprintf(p, "u8[256] agmem%d;\n", id);
     p += sprintf(p, "Arena ag_arena%d;\n", id);
     p += sprintf(p, "?*Ag%d ag_global%d = null;\n", id, id);
     p += sprintf(p, "u32 test_arena_esc_%d() {\n", id);
+    p += sprintf(p, "    ag_arena%d = Arena.over(agmem%d);\n", id, id);
     p += sprintf(p, "    ?*Ag%d ma = ag_arena%d.alloc(Ag%d);\n", id, id, id);
     p += sprintf(p, "    *Ag%d a = ma orelse return;\n", id);
     p += sprintf(p, "    ag_global%d = a;\n", id); /* arena escape to global */

@@ -409,24 +409,30 @@ static void test_s22_arena(void) {
     ok("Arena scratch;\nvoid f() { defer scratch.reset(); }",
        "arena reset inside defer OK (no warning)");
 
-    /* BUG-026: arena.alloc(T) → ?*T */
-    ok("struct Task { u32 id; }\nArena a;\n"
-       "void f() { *Task t = a.alloc(Task) orelse return; t.id = 1; }",
+    /* BUG-026: arena.alloc(T) → ?*T
+     * 2026-08-20: these arenas gained a real backing store. They used to be a
+     * bare `Arena a;`, which has capacity 0 — so every alloc() they "tested"
+     * would have returned null at runtime. The new backing-store check makes
+     * that a compile error, and these four are the reason it is worth having:
+     * even a unit test written to exercise arena.alloc() had declared an arena
+     * that could never allocate. */
+    ok("struct Task { u32 id; }\nu8[256] amem;\nArena a;\n"
+       "void f() { a = Arena.over(amem); *Task t = a.alloc(Task) orelse return; t.id = 1; }",
        "arena.alloc(Task) returns ?*Task — unwrap to *Task OK");
 
-    err("struct Task { u32 id; }\nArena a;\n"
-        "void f() { u32 t = a.alloc(Task) orelse return; }",
+    err("struct Task { u32 id; }\nu8[256] amem;\nArena a;\n"
+        "void f() { a = Arena.over(amem); u32 t = a.alloc(Task) orelse return; }",
         "arena.alloc(Task) returns ?*Task, assign to u32 REJECT");
 
     /* BUG-027: arena.alloc_slice(T, n) → ?[]T
      * Note: uses struct type since primitive keywords (u32 etc.) can't be
      * passed as arguments — they're keywords, not identifiers */
-    ok("struct Elem { u32 v; }\nArena a;\n"
-       "void f() { []Elem buf = a.alloc_slice(Elem, 10) orelse return; }",
+    ok("struct Elem { u32 v; }\nu8[256] amem;\nArena a;\n"
+       "void f() { a = Arena.over(amem); []Elem buf = a.alloc_slice(Elem, 10) orelse return; }",
        "arena.alloc_slice(Elem, 10) returns ?[]Elem — unwrap to []Elem OK");
 
-    err("struct Elem { u32 v; }\nArena a;\n"
-        "void f() { u32 buf = a.alloc_slice(Elem, 10) orelse return; }",
+    err("struct Elem { u32 v; }\nu8[256] amem;\nArena a;\n"
+        "void f() { a = Arena.over(amem); u32 buf = a.alloc_slice(Elem, 10) orelse return; }",
         "arena.alloc_slice(Elem, 10) returns ?[]Elem, assign to u32 REJECT");
 }
 

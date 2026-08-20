@@ -1,13 +1,20 @@
 // Arena: global escape check — arena ptr cannot escape to global — compile error
 // EXPECTED: compile error
+//
+// 2026-08-20: this test was MASKED. It declared `?*Box g_box;` — a non-null
+// global with no initializer — which an unrelated rule rejects first, so the
+// file "passed" without the arena-escape rule ever firing, and would have kept
+// passing if that rule were deleted. `?*Box` lets the rule under test be the
+// one that rejects: "cannot store arena-derived pointer 'b' in global/static
+// variable 'g_box' — pointer will dangle".
 
 struct Box { u32 v; }
 Arena ar;
 u8[128] mem;
-*Box g_box;
+?*Box g_box;
 
 u32 main() {
-    ar.over(mem);
+    ar = Arena.over(mem);
     ?*Box mb = ar.alloc(Box);
     *Box b = mb orelse return;
     b.v = 5;

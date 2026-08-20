@@ -6,8 +6,7 @@ Arena arena;
 u8[512] mem;
 
 u32 main() {
-    arena.over(mem);
-
+    arena = Arena.over(mem);
     ?*Point pa = arena.alloc(Point);
     *Point a = pa orelse return;
     a.x = 1; a.y = 2;

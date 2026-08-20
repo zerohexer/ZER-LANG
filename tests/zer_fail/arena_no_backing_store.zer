@@ -1,0 +1,21 @@
+// expect-error: never given a backing store
+//
+// An `Arena` with no backing store has capacity 0, so EVERY alloc() returns
+// null — forever. Before 2026-08-20 that compiled with no diagnostic at either
+// end and produced no crash: the null just flows into the caller's `orelse`
+// path and the program quietly does nothing. Silent on hosted and on bare metal
+// alike, which is the class ZER refuses to ship.
+//
+// It also generated vacuous tests. `orelse return` in a `u32 main()` returns 0
+// — PASS — so tests/zer/super_freelist_arena.zer reported success after
+// executing four of its ~120 lines, with the freelist it exists to test never
+// running. That file was the ONLY corpus casualty of this rule.
+struct Block { u32 data; }
+
+Arena scratch;          // declared, never given a backing store
+
+u32 main() {
+    *Block b = scratch.alloc(Block) orelse { return 1; };
+    b.data = 7;
+    return 0;
+}

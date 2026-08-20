@@ -420,6 +420,33 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — two arena allocations cannot be LINKED (over-rejection, found 2026-08-20)
+
+```zer
+*Node a = ar.alloc(Node) orelse { return 1; };
+*Node b = ar.alloc(Node) orelse { return 2; };
+a.next = b;   // error: cannot store arena-derived pointer 'b' through pointer parameter 'a'
+```
+
+Both pointers have EXACTLY the same lifetime — the arena's — so this cannot dangle
+relative to `a`. The escape analysis treats any store of an arena-derived pointer through
+a pointer as an escape, without asking whether the DESTINATION is itself arena-derived
+from the SAME arena. Conservative, so not a soundness concern; it does block the canonical
+arena use case (an arena-backed linked structure).
+
+**Found because the documentation showed it.** `docs/reference.md`'s Arena EXAMPLE
+contained `a.next = b;` and had never been compiled — it was a fragment. Turning it into a
+complete program so it could be checked rejected immediately. The doc now shows the
+working shape (link by INDEX through `alloc_slice`) and states the limitation.
+
+**Fix sketch:** at the arena-escape sink, permit the store when the destination root is
+itself arena-derived. `Symbol.is_arena_derived` already exists on both sides; what is
+missing is comparing ARENA IDENTITY rather than treating "arena-derived" as one taint.
+Two different arenas must still be rejected — `ar1.reset()` would dangle a pointer stored
+inside an `ar2` object — so the relaxation needs identity, not just the flag.
+
+---
+
 ## OPEN — extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id` (found 2026-08-20)
 
 **Severity: HIGH.** Non-deterministic. Usually a FALSE TRAP on correct code; in the other

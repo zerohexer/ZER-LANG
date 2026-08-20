@@ -5,6 +5,105 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20b — BUG-804/805: an Arena that can never allocate, and the five vacuous tests it hid
+
+### BUG-804 — `Arena a;` with no backing store: every alloc() returns null, silently
+
+An `Arena` lowers to `_zer_arena { buf, capacity, offset }` and a bare
+declaration emits `= {0}` — capacity 0. So EVERY `a.alloc(T)` returns null,
+forever. No diagnostic at compile time, no trap at runtime: the null flows into
+the caller's `orelse` and the program quietly does nothing, on hosted and on
+bare metal alike.
+
+**The vacuity it generated is the real story.** `orelse return` in a
+`u32 main()` returns 0 — PASS. So a test whose arena never allocated reported
+success:
+
+| file | what it claimed to test | what it actually ran |
+|---|---|---|
+| `tests/zer/super_freelist_arena.zer` | "Real program: freelist allocator built on Arena", *opaque round-trips, recycling, defer | 4 of ~120 lines |
+| `rust_tests/gen_arena_001.zer` | arena alloc + reset | first alloc returned null |
+| `rust_tests/gen_arena_002.zer` | two allocations distinct | same |
+| `rust_tests/gen_arena_004.zer` | arena reuse | same |
+| `test_checker_full.c` §22 (x4) | `arena.alloc(T)` return TYPE | type-checks only; the arena could never allocate |
+| `tests/test_semantic_fuzz.c` `gen_safe_arena_chain` | a wrapper chain returning `?*T` | every generated "safe" program allocated nothing |
+
+**Fix:** `check_arena_backing`, a deferred whole-file pass. An arena is flagged
+only when all three facts hold locally — DECLARED in this file, ALLOCATED from,
+and never BACKED anywhere. Deferred because `.over()` legitimately comes after
+the allocations (the declare-global / init-in-`main` RTOS idiom,
+`examples/qemu-cortex-m3/rtos.zer`). Keyed by NAME, since locals are out of
+scope by then; a name collision therefore reads as BACKED, the conservative
+direction.
+
+### BUG-805 — `a.over(buf);` as a bare statement is a silent no-op
+
+`.over` is a CONSTRUCTOR returning an `Arena` **by value**, not a mutator. As a
+statement it builds the new arena into a discarded temp:
+
+```c
+_zer_t0 = ((_zer_arena){(uint8_t*)mem,sizeof(mem),0});   /* thrown away */
+```
+
+so the receiver keeps capacity 0. It reads exactly like initialisation, which is
+what makes it dangerous — measured, `a.over(mem); a.alloc(B)` yields null while
+`a = Arena.over(mem); a.alloc(B)` succeeds, and the ONLY difference is the
+discarded assignment. Six files in the tree used the no-op form.
+
+**Someone already knew.** `rust_tests/gen_arena_005.zer` carries a comment
+saying *"Bare `ar.over(mem)` discards the return value and does nothing useful"*
+— while `gen_arena_001..004`, sitting beside it, all used the broken form. A
+comment in one file is not a gate.
+
+**Fix:** extend the existing discarded-result check (the `pool.alloc()` ghost
+handle) to `.over` on an Arena receiver.
+
+### What the fixes then exposed
+
+- **`super_freelist_arena.zer` type-punned `Block` <-> `FreeNode` through
+  `*opaque`** — the classic C freelist trick, which ZER refuses: `@ptrcast`
+  carries a runtime type_id and the pun TRAPS. With the arena backed, the trap
+  was immediate. The freelist link now lives inside `Block`, which is the
+  type-safe expression of the same structure; the `*opaque` round-trip is kept
+  at its legitimate use (Block in, Block out).
+- **`rust_tests/gen_arena_003.zer` was a MASKED negative.** It claims to test
+  arena-escape-to-global but declared `*Box g_box;` — a non-null global with no
+  initializer — which an unrelated rule rejects first. It would have kept
+  passing with the arena-escape rule deleted. Now `?*Box`, and it rejects with
+  *"cannot store arena-derived pointer 'b' in global/static variable 'g_box'"*.
+- **Linking two arena allocations is over-rejected** (`a.next = b`). Both have
+  the arena's lifetime, so it cannot dangle. Its own OPEN entry in
+  limitations.md; `docs/reference.md` now shows the index-linked workaround.
+
+### Corpus cost, measured twice
+
+`.zer` files: 6. Then `make check` found **18 more** in ZER programs generated
+inline by the semantic fuzzer and embedded in `test_checker_full.c` — the
+"a corpus sweep over `.zer` files only is incomplete" lesson, live. Every one
+was a program whose arena could not allocate.
+
+### Also fixed: the duplicated post-pass list
+
+`checker_check` carried its own COPY of the after-all-bodies pass list instead
+of calling `checker_post_passes`, and the copy had drifted — it was missing
+`check_lock_ordering` entirely, so deadlock detection ran for `zerc` and
+silently did not for the LSP and the C unit tests. Collapsed to one call.
+
+### Process note
+
+Editing `checker.h` and rebuilding only `checker.o` produced a MIXED-ABI binary
+whose symptom was 18 `asm_*` tests failing with a bogus *"requires CPU feature
+not enabled in --target-features"*. Exactly the trap CLAUDE.md documents:
+**after touching any `.h`, `rm -f *.o src/safety/*.o`.**
+
+Tests: `tests/zer_fail/arena_no_backing_store.zer`,
+`tests/zer_fail/arena_over_discarded.zer` (both verified ACCEPTED on a pre-fix
+build), `tests/zer/arena_backing_shapes_ok.zer` (the over-rejection boundary —
+all three working backing forms, each asserted to actually allocate).
+`make check` exit 0, all six gates, 1252 ZER tests.
+
+---
+
 ## Session 2026-08-20 — BUG-802/803: the comptime interpreter answered a different question than the emitted code
 
 Found by a differential probe: evaluate the SAME expression at compile time and at

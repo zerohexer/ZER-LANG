@@ -1,0 +1,52 @@
+// Over-rejection boundary for the "arena never given a backing store" rule
+// (2026-08-20). Every legitimate way to back an arena must still compile, and
+// each one must actually allocate — the assertions below fail if any shape
+// silently produced a capacity-0 arena.
+//
+// The three shapes exist because the backing can be established from either
+// side of the call: `Arena.over(buf)` has the TYPE NAME as its receiver, so for
+// that form the arena is identified by the assignment/declaration TARGET, while
+// `a.over(buf)` names the arena directly.
+struct Block { u32 data; }
+
+u8[1024] global_mem;
+Arena g_late;           // declared here, backed inside main (the RTOS idiom)
+Arena g_method;         // same, but via the method form
+
+u32 main() {
+    // ---- shape 1: local declaration initialised with Arena.over ----
+    u8[512] local_mem;
+    Arena local = Arena.over(local_mem);
+    *Block b1 = local.alloc(Block) orelse { return 1; };
+    b1.data = 11;
+
+    // ---- shape 2: global declared, ASSIGNED later (backing follows the
+    //      allocations lexically in plenty of real programs, which is why the
+    //      check has to be deferred to after all bodies) ----
+    g_late = Arena.over(global_mem);
+    *Block b2 = g_late.alloc(Block) orelse { return 2; };
+    b2.data = 22;
+
+    // ---- shape 3: the METHOD form, ASSIGNED. `.over` is a constructor that
+    //      returns an Arena by value, so `g_method.over(mem);` on its own is a
+    //      no-op and is now a compile error (tests/zer_fail/arena_over_discarded.zer).
+    //      The assigned form is the one that actually backs it. ----
+    u8[512] more_mem;
+    g_method = g_method.over(more_mem);
+    *Block b3 = g_method.alloc(Block) orelse { return 3; };
+    b3.data = 33;
+
+    // Each arena really allocated, and the three are distinct allocations.
+    if (b1.data != 11) { return 4; }
+    if (b2.data != 22) { return 5; }
+    if (b3.data != 33) { return 6; }
+
+    // A second allocation from a backed arena must also succeed and be distinct.
+    *Block b4 = local.alloc(Block) orelse { return 7; };
+    b4.data = 44;
+    if (b1.data != 11) { return 8; }   // b4 must not have aliased b1
+    if (b4.data != 44) { return 9; }
+
+    local.reset();
+    return 0;
+}

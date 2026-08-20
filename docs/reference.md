@@ -1580,12 +1580,56 @@ Cannot free individual allocations.
 
 **SYNOPSIS**
 ```zer
+struct Node { u32 id; }
+
+u32 main() {
+    u8[4096] backing;
+    Arena ar = Arena.over(backing);        // at FUNCTION scope
+    *Node a = ar.alloc(Node) orelse { return 1; };
+    a.id = 1;
+    return 0;
+}
+```
+
+**GIVING AN ARENA ITS BACKING STORE — read this before anything else**
+
+`Arena.over(buf)` is a **CONSTRUCTOR**: it returns a new `Arena` **by value**. You
+must ASSIGN it. An arena that never receives one has capacity 0, so every
+`alloc()` returns null — forever.
+
+| form | works? |
+|---|---|
+| `Arena ar = Arena.over(buf);` at **function** scope | yes |
+| `ar = Arena.over(buf);` (declared global, assigned in a function) | yes |
+| `ar = ar.over(buf);` | yes |
+| `Arena ar = Arena.over(buf);` at **global** scope | **rejected** — a global initializer must be a constant expression |
+| `ar.over(buf);` as a bare statement | **rejected** — builds an Arena and throws it away |
+| `Arena ar;` and never backing it | **rejected** at the first `alloc()` |
+
+The last two used to compile silently and produce an arena that could never
+allocate. Both are compile errors as of 2026-08-20; the checks exist because
+six programs in this repository — including four tests written specifically to
+exercise arenas — had that dead line and were passing without ever allocating.
+
+For a global arena, the working shape is declare-then-initialise:
+
+```zer
+struct Node { u32 id; }
+
 u8[4096] backing;
-Arena ar = Arena.over(backing);
+Arena ar;                                   // global: no initializer
+
+u32 main() {
+    ar = Arena.over(backing);               // back it before first use
+    *Node a = ar.alloc(Node) orelse { return 1; };
+    a.id = 1;
+    return 0;
+}
 ```
 
 **METHODS**
-- `Arena.over(buf)` → `Arena` — Create arena over an array or slice.
+- `Arena.over(buf)` → `Arena` — Build an arena over an array or slice. **Returns
+  a value; assign it.**
 - `.alloc(T)` → `?*T` — Allocate one T (aligned). T must be struct/enum name.
 - `.alloc_slice(T, n)` → `?[*]T` — Allocate n elements. T must be struct/enum name.
 - `.reset()` → `void` — Reset offset to 0 (frees everything).
@@ -1593,19 +1637,51 @@ Arena ar = Arena.over(backing);
 
 **EXAMPLE**
 ```zer
-struct Node { u32 id; ?*Node next; }
+struct Node { u32 id; }
 
-u8[4096] backing;
-Arena ar = Arena.over(backing);
+u32 main() {
+    u8[4096] backing;
+    Arena ar = Arena.over(backing);
+    defer ar.reset();      // free everything at scope exit
 
-*Node a = ar.alloc(Node) orelse { return 1; };
-a.id = 1;
+    *Node a = ar.alloc(Node) orelse { return 1; };
+    a.id = 1;
 
-*Node b = ar.alloc(Node) orelse { return 2; };
-b.id = 2;
-a.next = b;
+    *Node b = ar.alloc(Node) orelse { return 2; };
+    b.id = 2;
 
-defer ar.reset();      // free everything at scope exit
+    if (a.id + b.id != 3) { return 3; }
+    return 0;
+}
+```
+
+**LIMITATION — you cannot LINK two arena allocations today**
+
+```zer
+a.next = b;    // rejected: "cannot store arena-derived pointer 'b'
+               //            through pointer parameter 'a'"
+```
+
+Both pointers have exactly the same lifetime (the arena's), so this is safe in
+principle — the escape analysis is being conservative, not catching a real
+dangle. It is an over-rejection, tracked in `docs/limitations.md`. Until it is
+relaxed, build arena-backed structures out of a **slice** and link by INDEX
+rather than by pointer:
+
+```zer
+struct Node { u32 id; u32 next; }   // `next` is an INDEX, not a pointer
+
+u32 main() {
+    u8[4096] backing;
+    Arena ar = Arena.over(backing);
+    [*]Node ns = ar.alloc_slice(Node, 4) orelse { return 1; };
+
+    ns[0].id = 1; ns[0].next = 1;
+    ns[1].id = 2; ns[1].next = 0;
+
+    if (ns[ns[0].next].id != 2) { return 2; }
+    return 0;
+}
 ```
 
 **ERRORS**
@@ -3273,6 +3349,9 @@ range, so it fails with *"slice start (9) is greater than end (8)"* or
 *"cannot slice type '\*u32'"*. Read the register into a value, then slice it:
 
 ```zer
+// Compiles anywhere; RUNS only where 0x40000000 is real memory-mapped I/O.
+// On a hosted machine the dereference traps ("memory access fault"), which is
+// the MMIO guard doing its job, not a compile problem.
 mmio 0x40000000..0x40000FFF;
 
 u32 main() {

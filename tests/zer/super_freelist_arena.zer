@@ -3,17 +3,34 @@
 // ?*T linked list, defer cleanup
 // Tests: cast safety, interior pointer concepts, arena + linked list
 
-struct FreeNode {
-    ?*FreeNode next;
-}
-
+// The freelist link lives INSIDE Block. The original version kept a separate
+// FreeNode and type-punned Block <-> FreeNode through *opaque — the classic C
+// freelist trick. ZER refuses that: @ptrcast carries a runtime type_id and the
+// pun TRAPS ("type mismatch in cast"). Nobody noticed, because the arena had no
+// backing store, so the first alloc returned null and the punning code never
+// ran. Fixing the arena made the trap immediate. Keeping the link in Block is
+// the type-safe expression of the same data structure, and the *opaque
+// round-trip below is preserved at its LEGITIMATE use (Block -> *opaque ->
+// Block, same type in and out).
 struct Block {
     u32 data_a;
     u32 data_b;
     u32 data_c;
     u32 data_d;
+    ?*Block next;      // freelist link
 }
 
+// 2026-08-20: this file used to declare `Arena backing;` with NO backing store.
+// An unbacked arena has capacity 0, so the very first `backing.alloc(Block)`
+// returned null and `orelse return` returned from `u32 main()` — which yields 0,
+// i.e. PASS. The test therefore executed four of its ~120 lines and reported
+// success, while every one of the things its header advertises (the *opaque
+// round-trips, the freelist, the recycling, the defer) never ran. Textbook
+// vacuous test: the pass condition was weaker than the claim.
+//
+// Found by the new "arena allocated from but never given a backing store" check,
+// whose corpus cost across the whole tree was exactly this one file.
+u8[4096] arena_mem;
 Arena backing;
 
 // Helper: cast *opaque to *Block — function boundary clears provenance
@@ -21,12 +38,9 @@ Arena backing;
     return (*Block)raw;
 }
 
-*FreeNode opaque_to_freenode(*opaque raw) {
-    return (*FreeNode)raw;
-}
-
 u32 main() {
-    ?*FreeNode free_head = null;
+    backing = Arena.over(arena_mem);   // WITHOUT this the whole body below is skipped
+    ?*Block free_head = null;
     u32 alloc_count = 0;
     u32 free_count = 0;
 
@@ -57,10 +71,11 @@ u32 main() {
     if (b1.data_a != 10) { return 2; }
     if (b2.data_b != 40) { return 3; }
 
-    // === "Free" b2 — add to freelist via *opaque type-pun ===
+    // === "Free" b2 — push onto the freelist (round-tripped through *opaque,
+    //     Block in and Block out, which is the legitimate erasure) ===
     {
         *opaque raw = (*opaque)b2;
-        *FreeNode node = opaque_to_freenode(raw);
+        *Block node = opaque_to_block(raw);
         node.next = free_head;
         free_head = node;
         free_count += 1;
@@ -69,7 +84,7 @@ u32 main() {
     // === "Free" b3 ===
     {
         *opaque raw = (*opaque)b3;
-        *FreeNode node = opaque_to_freenode(raw);
+        *Block node = opaque_to_block(raw);
         node.next = free_head;
         free_head = node;
         free_count += 1;

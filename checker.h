@@ -168,6 +168,23 @@ typedef struct {
     int param_expect_count;
     int param_expect_capacity;
 
+    /* Arena backing check (2026-08-20). An `Arena a;` with no backing store has
+     * capacity 0, so EVERY a.alloc() returns null, forever, with no diagnostic
+     * at either end — a silent logic failure. Collected here and decided after
+     * all bodies (check_arena_backing), because `.over()` may lexically follow
+     * the allocations (the RTOS init-later idiom). Names, not Symbols: locals
+     * go out of scope before the deferred pass runs. */
+    struct ZerArenaUse {
+        const char *name;
+        uint32_t name_len;
+        int line;               /* first alloc site, for the diagnostic */
+        bool declared;          /* seen as `Arena x;` in THIS file */
+        bool backed;            /* seen as x.over(..) / x = Arena.over(..) */
+        bool allocated;         /* seen as x.alloc(..) / x.alloc_slice(..) */
+    } *arena_uses;
+    int arena_use_count;
+    int arena_use_capacity;
+
     /* keep inference (Site 1, 2026-06-19): deferred call-site keep enforcement +
      * transitive escape fixpoint. Edges are recorded during the single body pass
      * and resolved afterwards in check_keep_inference (param_keeps is final only

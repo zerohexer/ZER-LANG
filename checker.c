@@ -4499,6 +4499,82 @@ static void route_free_to_ptr_if_needed(Checker *c, Node *call) {
     callee->field.field_name_len = new_len;
 }
 
+/* ---- Arena backing check (2026-08-20) --------------------------------------
+ * `Arena a;` compiles to `_zer_arena a = {0}` — capacity 0 — so every
+ * a.alloc() returns null forever. Neither the checker nor the runtime said
+ * anything, and the null flows into the caller's `orelse` path, so the program
+ * simply does nothing. That is a silent logic failure on hosted AND bare metal,
+ * and it made tests/zer/super_freelist_arena.zer vacuous: `orelse return` in
+ * `u32 main()` returns 0, so a test whose arena never allocated reported PASS
+ * after executing four of its ~120 lines.
+ *
+ * Decided AFTER all bodies because `.over()` legitimately comes later than the
+ * allocations (the RTOS declare-global / init-in-main idiom, examples/rtos.zer).
+ * Keyed by NAME because locals are out of scope by then; a name collision
+ * between a backed global and an unbacked local therefore reads as BACKED,
+ * which is the conservative direction (no new rejection). */
+static struct ZerArenaUse *arena_use_slot(Checker *c, const char *name, uint32_t nlen) {
+    if (!name || nlen == 0) return NULL;
+    for (int i = 0; i < c->arena_use_count; i++) {
+        if (c->arena_uses[i].name_len == nlen &&
+            memcmp(c->arena_uses[i].name, name, nlen) == 0)
+            return &c->arena_uses[i];
+    }
+    if (c->arena_use_count >= c->arena_use_capacity) {
+        int nc = c->arena_use_capacity ? c->arena_use_capacity * 2 : 8;
+        struct ZerArenaUse *nl = (struct ZerArenaUse *)arena_alloc(c->arena,
+            (size_t)nc * sizeof(struct ZerArenaUse));
+        if (!nl) return NULL;
+        if (c->arena_use_count > 0)
+            memcpy(nl, c->arena_uses, (size_t)c->arena_use_count * sizeof(struct ZerArenaUse));
+        c->arena_uses = nl;
+        c->arena_use_capacity = nc;
+    }
+    struct ZerArenaUse *u = &c->arena_uses[c->arena_use_count++];
+    memset(u, 0, sizeof(*u));
+    u->name = name; u->name_len = nlen;
+    return u;
+}
+
+static void arena_note_declared(Checker *c, const char *name, uint32_t nlen) {
+    struct ZerArenaUse *u = arena_use_slot(c, name, nlen);
+    if (u) u->declared = true;
+}
+static void arena_note_backed(Checker *c, const char *name, uint32_t nlen) {
+    struct ZerArenaUse *u = arena_use_slot(c, name, nlen);
+    if (u) u->backed = true;
+}
+static void arena_note_alloc(Checker *c, const char *name, uint32_t nlen, int line) {
+    struct ZerArenaUse *u = arena_use_slot(c, name, nlen);
+    if (!u) return;
+    if (!u->allocated) { u->allocated = true; u->line = line; }
+}
+
+/* An expression that hands an arena its backing store: `Arena.over(buf)` or
+ * `x.over(buf)`. Used to mark an assignment/var-decl TARGET as backed, since
+ * for `Arena.over(...)` the receiver is the TYPE NAME, not the variable. */
+static void check_arena_backing(Checker *c) {
+    for (int i = 0; i < c->arena_use_count; i++) {
+        struct ZerArenaUse *u = &c->arena_uses[i];
+        if (!u->declared || !u->allocated || u->backed) continue;
+        checker_error(c, u->line,
+            "arena '%.*s' is allocated from but never given a backing store — "
+            "every alloc() will return null. Add '%.*s = Arena.over(buf);' "
+            "(or declare it as 'Arena %.*s = Arena.over(buf);' at function scope) "
+            "before the first allocation",
+            (int)u->name_len, u->name, (int)u->name_len, u->name,
+            (int)u->name_len, u->name);
+    }
+}
+
+static bool expr_is_arena_over_call(Node *n) {
+    if (!n || n->kind != NODE_CALL) return false;
+    Node *callee = n->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return false;
+    return callee->field.field_name_len == 4 &&
+           memcmp(callee->field.field_name, "over", 4) == 0;
+}
+
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
@@ -4987,6 +5063,14 @@ static Type *check_expr(Checker *c, Node *node) {
                 "— the compiler cannot prove which allocation it aliases, so a later "
                 "free through either name would be a use-after-free. Alias the pointer "
                 "directly ('*T k = p;') instead");
+        }
+        /* Arena backing: `a = Arena.over(buf);` — the .over receiver is the TYPE
+         * NAME, so the backing is recorded from the assignment target. This is
+         * the declare-global / init-in-main idiom (examples/rtos.zer). */
+        if (node->assign.target && node->assign.target->kind == NODE_IDENT &&
+            expr_is_arena_over_call(node->assign.value)) {
+            arena_note_backed(c, node->assign.target->ident.name,
+                              (uint32_t)node->assign.target->ident.name_len);
         }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
@@ -7167,8 +7251,25 @@ static Type *check_expr(Checker *c, Node *node) {
                 break;
             }
 
+            
+
             /* Arena methods */
             if (obj->kind == TYPE_ARENA) {
+                /* Arena backing bookkeeping — decided in check_arena_backing. */
+                if (field_node->field.object->kind == NODE_IDENT) {
+                    const char *arn = field_node->field.object->ident.name;
+                    uint32_t arl = (uint32_t)field_node->field.object->ident.name_len;
+                    /* NOTE: a `.over` RECEIVER is deliberately NOT recorded as
+                     * backed. `x.over(buf)` returns a new Arena by value; only
+                     * the form that ASSIGNS it (`x = Arena.over(buf)` /
+                     * `x = x.over(buf)` / `Arena x = Arena.over(buf)`) actually
+                     * backs x, and those are recorded from the assignment and
+                     * declaration sites. Marking the receiver here would have
+                     * made the check bless the exact no-op it exists to catch. */
+                    if ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                        (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))
+                        arena_note_alloc(c, arn, arl, node->loc.line);
+                }
                 if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "Arena.over() takes exactly 1 argument");
@@ -12360,6 +12461,18 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "cannot declare variable of type 'void'");
         }
+        /* Arena backing bookkeeping — an Arena DECLARED here is one we can
+         * reason about (a param never reaches this site, so it is never
+         * flagged). An initializer that is `Arena.over(buf)` backs it; the
+         * receiver of that call is the TYPE NAME, not this variable, so the
+         * backing has to be recorded from the declaration side. */
+        if (type && type_dispatch_kind(type) == TYPE_ARENA) {
+            arena_note_declared(c, node->var_decl.name,
+                                (uint32_t)node->var_decl.name_len);
+            if (expr_is_arena_over_call(node->var_decl.init))
+                arena_note_backed(c, node->var_decl.name,
+                                  (uint32_t)node->var_decl.name_len);
+        }
         /* Pool/Ring/Slab must be global or static — not on the stack */
         if (node->kind == NODE_VAR_DECL && type &&
             (type_dispatch_kind(type) == TYPE_POOL || type_dispatch_kind(type) == TYPE_RING ||
@@ -14977,6 +15090,32 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)call_obj->ident.name_len, call_obj->ident.name);
                 }
             }
+            /* Same class, different builtin: `a.over(buf);` as a bare statement.
+             * `.over` is a CONSTRUCTOR returning an Arena by value, not a mutator,
+             * so discarding the result leaves the receiver at capacity 0 and every
+             * later alloc() returns null — forever, with no diagnostic at either
+             * end. It reads exactly like initialisation, which is what makes it
+             * dangerous: measured, `a.over(mem); a.alloc(B)` yields null while
+             * `a = Arena.over(mem); a.alloc(B)` succeeds, and the only difference
+             * is the discarded assignment. */
+            if (mlen == 4 && memcmp(mname, "over", 4) == 0 && call_obj &&
+                call_obj->kind == NODE_IDENT) {
+                Type *ot = checker_get_type(c, call_obj);
+                if (!ot) {
+                    Symbol *s = scope_lookup(c->current_scope, call_obj->ident.name,
+                        (uint32_t)call_obj->ident.name_len);
+                    if (s) ot = s->type;
+                }
+                if (ot && type_dispatch_kind(ot) == TYPE_ARENA) {
+                    checker_error(c, node->loc.line,
+                        "discarded Arena.over() result — this does NOT give '%.*s' a "
+                        "backing store, so every alloc() would return null. "
+                        "'.over' builds a new Arena; assign it: "
+                        "'%.*s = Arena.over(buf);'",
+                        (int)call_obj->ident.name_len, call_obj->ident.name,
+                        (int)call_obj->ident.name_len, call_obj->ident.name);
+                }
+            }
         }
         break;
 
@@ -16997,6 +17136,17 @@ static void register_decl(Checker *c, Node *node) {
 
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
+        /* Arena backing bookkeeping: globals are registered HERE, in Pass 1,
+         * not through the body-check NODE_VAR_DECL/NODE_GLOBAL_VAR case — so
+         * the declaration has to be recorded from both sites or a global
+         * `Arena a;` is never marked declared and never checked. */
+        if (type && type_dispatch_kind(type) == TYPE_ARENA) {
+            arena_note_declared(c, node->var_decl.name,
+                                (uint32_t)node->var_decl.name_len);
+            if (expr_is_arena_over_call(node->var_decl.init))
+                arena_note_backed(c, node->var_decl.name,
+                                  (uint32_t)node->var_decl.name_len);
+        }
         /* propagate const from var qualifier to slice/pointer type */
         if (node->var_decl.is_const && type) {
             if (type->kind == TYPE_SLICE && !type->slice.is_const) {
@@ -20552,22 +20702,18 @@ bool checker_check(Checker *c, Node *file_node) {
     check_keep_inference(c);
     if (c->error_count > 0) ok = false;
 
-    /* Pass 3: whole-program *opaque param provenance validation */
-    if (c->param_expect_count > 0) {
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            check_call_provenance(c, file_node->file.decls[i]);
-        }
-    }
-
-    /* Pass 4: interrupt safety — validate shared globals */
-    if (c->isr_global_count > 0) {
-        check_interrupt_safety(c);
-    }
-    /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
-    check_atomic_cell_safety(c);
-
-    /* Pass 5: stack depth analysis — detect recursion */
-    check_stack_depth(c, file_node);
+    /* Passes 3-6 are the SHARED deferred list — call it, do not restate it.
+     *
+     * This function used to carry its own copy of that list, and the copy had
+     * already drifted: it was missing check_lock_ordering entirely, so the
+     * deadlock check ran for `zerc` (which goes through checker_post_passes)
+     * and silently did not run for anything using checker_check — the LSP and
+     * the C unit tests. Two hand-maintained copies of "what runs after all
+     * bodies" is the one-question-answered-at-N-sites shape CLAUDE.md warns
+     * about; a new post-pass added to one was invisible to the other. */
+    checker_post_passes(c, file_node);
+    if (c->error_count > 0) ok = false;
+    (void)ok;
 
     return c->error_count == 0;
 }
@@ -21296,6 +21442,12 @@ static void check_lock_ordering(Checker *c, Node *file_node) {
 
 void checker_post_passes(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
+
+    /* Arena backing (2026-08-20) — see arena_use_slot. Deferred because `.over()`
+     * legitimately comes after the allocations (the declare-global / init-in-main
+     * idiom). Fires only when the arena was DECLARED in this file, allocated
+     * from, and never backed anywhere. */
+    check_arena_backing(c);
 
     /* Whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {

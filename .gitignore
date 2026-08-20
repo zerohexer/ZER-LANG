@@ -79,3 +79,36 @@ rust_tests/rt_task_alloc_free_cycle
 test_defer_goto_matrix
 test_view_alias_matrix
 test_vrp_join_matrix
+
+# Test executables that `make check` produces but nothing ignored (2026-08-20).
+# These 23 were swept into a commit by a `git add -A` and had to be removed
+# again. `test_modules/main` was already listed; its siblings were not.
+#
+# REPO HYGIENE NOTE: 542 test executables ARE tracked in this repository, and
+# every compiler change rebuilds them, so any `git add -A` produces hundreds of
+# binary diffs that bury the source change. Untracking them is an owner call
+# (`git rm --cached` over the set + a pattern rule here); this section only
+# stops the set from growing.
+examples/cve-demos/baron_samedit_safe
+examples/cve-demos/heartbleed_safe
+test_modules/app
+test_modules/collision_test
+test_modules/comptime_user
+test_modules/cross_handle
+test_modules/defer_deep_user
+test_modules/defer_user
+test_modules/diamond
+test_modules/diamond2
+test_modules/enum_user
+test_modules/gcoll
+test_modules/handle_user
+test_modules/opaque_deep_ok
+test_modules/opaque_wrap
+test_modules/qualified_call
+test_modules/static_coll
+test_modules/stress_diamond
+test_modules/transitive
+test_modules/use_defs
+test_modules/use_types
+tests/zer_fail/probe_disabled_mode
+tests/zer_fail/spawn_volatile_wide_store_tear

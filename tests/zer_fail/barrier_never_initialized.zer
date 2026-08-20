@@ -1,0 +1,18 @@
+// expect-error: never initialised
+//
+// A `Barrier` keeps its party count in a runtime field, not in its type, so a
+// bare declaration zero-initialises it. `_zer_barrier_wait` then evaluates
+// `count >= target` as `1 >= 0` on the very first caller, broadcasts, and
+// returns — the synchronisation point silently does not synchronise. Threads
+// that believe they are rendezvousing are not, and nothing anywhere says so:
+// it compiles, it runs, it exits 0.
+//
+// Same shape as the unbacked Arena (arena_no_backing_store.zer); these two are
+// the whole class, since every other builtin states its size in its type
+// (Pool(T,N), Ring(T,N), Semaphore(N)) or grows on demand (Slab).
+Barrier gate;
+
+u32 main() {
+    @barrier_wait(gate);      // returns immediately — no rendezvous
+    return 0;
+}

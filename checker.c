@@ -4499,74 +4499,74 @@ static void route_free_to_ptr_if_needed(Checker *c, Node *call) {
     callee->field.field_name_len = new_len;
 }
 
-/* ---- Arena backing check (2026-08-20) --------------------------------------
- * `Arena a;` compiles to `_zer_arena a = {0}` — capacity 0 — so every
- * a.alloc() returns null forever. Neither the checker nor the runtime said
- * anything, and the null flows into the caller's `orelse` path, so the program
- * simply does nothing. That is a silent logic failure on hosted AND bare metal,
- * and it made tests/zer/super_freelist_arena.zer vacuous: `orelse return` in
- * `u32 main()` returns 0, so a test whose arena never allocated reported PASS
- * after executing four of its ~120 lines.
+/* ---- "was this builtin given its required initialisation?" (2026-08-20) ----
+ * Two builtins keep their capacity in a runtime field instead of their type, so
+ * a bare declaration zero-initialises them into something that compiles, runs,
+ * and silently does nothing:
  *
- * Decided AFTER all bodies because `.over()` legitimately comes later than the
- * allocations (the RTOS declare-global / init-in-main idiom, examples/rtos.zer).
- * Keyed by NAME because locals are out of scope by then; a name collision
- * between a backed global and an unbacked local therefore reads as BACKED,
- * which is the conservative direction (no new rejection). */
-static struct ZerArenaUse *arena_use_slot(Checker *c, const char *name, uint32_t nlen) {
+ *   Arena   `Arena a;`   -> capacity 0 -> EVERY a.alloc() returns null, forever.
+ *                          The null flows into the caller's `orelse` and the
+ *                          program quietly does nothing. It made five tests
+ *                          vacuous, because `orelse return` in a `u32 main()`
+ *                          returns 0 = PASS.
+ *   Barrier `Barrier b;` -> target 0 -> `count >= target` is immediately true,
+ *                          so @barrier_wait returns WITHOUT waiting. Threads
+ *                          that believe they are synchronised are not.
+ *
+ * Every other builtin states its size in its type (Pool(T,N), Ring(T,N),
+ * Semaphore(N)) or grows on demand (Slab), so the class has exactly these two
+ * members — hence one shared mechanism rather than two parallel ones.
+ *
+ * Decided AFTER all bodies (check_builtin_init): the initialisation
+ * legitimately comes later in the file than the use, which is the
+ * declare-global / init-in-main RTOS idiom (examples/qemu-cortex-m3/rtos.zer).
+ * Keyed by NAME + kind because locals are out of scope by then; a name
+ * collision therefore reads as INITIALISED, the conservative direction. */
+#define ZER_INIT_ARENA   0
+#define ZER_INIT_BARRIER 1
+
+static struct ZerInitUse *init_use_slot(Checker *c, int kind,
+                                        const char *name, uint32_t nlen) {
     if (!name || nlen == 0) return NULL;
-    for (int i = 0; i < c->arena_use_count; i++) {
-        if (c->arena_uses[i].name_len == nlen &&
-            memcmp(c->arena_uses[i].name, name, nlen) == 0)
-            return &c->arena_uses[i];
+    for (int i = 0; i < c->init_use_count; i++) {
+        if (c->init_uses[i].kind == kind &&
+            c->init_uses[i].name_len == nlen &&
+            memcmp(c->init_uses[i].name, name, nlen) == 0)
+            return &c->init_uses[i];
     }
-    if (c->arena_use_count >= c->arena_use_capacity) {
-        int nc = c->arena_use_capacity ? c->arena_use_capacity * 2 : 8;
-        struct ZerArenaUse *nl = (struct ZerArenaUse *)arena_alloc(c->arena,
-            (size_t)nc * sizeof(struct ZerArenaUse));
+    if (c->init_use_count >= c->init_use_capacity) {
+        int nc = c->init_use_capacity ? c->init_use_capacity * 2 : 8;
+        struct ZerInitUse *nl = (struct ZerInitUse *)arena_alloc(c->arena,
+            (size_t)nc * sizeof(struct ZerInitUse));
         if (!nl) return NULL;
-        if (c->arena_use_count > 0)
-            memcpy(nl, c->arena_uses, (size_t)c->arena_use_count * sizeof(struct ZerArenaUse));
-        c->arena_uses = nl;
-        c->arena_use_capacity = nc;
+        if (c->init_use_count > 0)
+            memcpy(nl, c->init_uses, (size_t)c->init_use_count * sizeof(struct ZerInitUse));
+        c->init_uses = nl;
+        c->init_use_capacity = nc;
     }
-    struct ZerArenaUse *u = &c->arena_uses[c->arena_use_count++];
+    struct ZerInitUse *u = &c->init_uses[c->init_use_count++];
     memset(u, 0, sizeof(*u));
-    u->name = name; u->name_len = nlen;
+    u->name = name; u->name_len = nlen; u->kind = kind;
     return u;
 }
 
-static void arena_note_declared(Checker *c, const char *name, uint32_t nlen) {
-    struct ZerArenaUse *u = arena_use_slot(c, name, nlen);
+static void init_note_declared(Checker *c, int kind, const char *name, uint32_t nlen) {
+    struct ZerInitUse *u = init_use_slot(c, kind, name, nlen);
     if (u) u->declared = true;
 }
-static void arena_note_backed(Checker *c, const char *name, uint32_t nlen) {
-    struct ZerArenaUse *u = arena_use_slot(c, name, nlen);
-    if (u) u->backed = true;
+static void init_note_initialized(Checker *c, int kind, const char *name, uint32_t nlen) {
+    struct ZerInitUse *u = init_use_slot(c, kind, name, nlen);
+    if (u) u->initialized = true;
 }
-static void arena_note_alloc(Checker *c, const char *name, uint32_t nlen, int line) {
-    struct ZerArenaUse *u = arena_use_slot(c, name, nlen);
+static void init_note_used(Checker *c, int kind, const char *name, uint32_t nlen, int line) {
+    struct ZerInitUse *u = init_use_slot(c, kind, name, nlen);
     if (!u) return;
-    if (!u->allocated) { u->allocated = true; u->line = line; }
+    if (!u->used) { u->used = true; u->line = line; }
 }
 
 /* An expression that hands an arena its backing store: `Arena.over(buf)` or
- * `x.over(buf)`. Used to mark an assignment/var-decl TARGET as backed, since
- * for `Arena.over(...)` the receiver is the TYPE NAME, not the variable. */
-static void check_arena_backing(Checker *c) {
-    for (int i = 0; i < c->arena_use_count; i++) {
-        struct ZerArenaUse *u = &c->arena_uses[i];
-        if (!u->declared || !u->allocated || u->backed) continue;
-        checker_error(c, u->line,
-            "arena '%.*s' is allocated from but never given a backing store — "
-            "every alloc() will return null. Add '%.*s = Arena.over(buf);' "
-            "(or declare it as 'Arena %.*s = Arena.over(buf);' at function scope) "
-            "before the first allocation",
-            (int)u->name_len, u->name, (int)u->name_len, u->name,
-            (int)u->name_len, u->name);
-    }
-}
-
+ * `x.over(buf)`. Used to mark an assignment/var-decl TARGET as initialised,
+ * since for `Arena.over(...)` the receiver is the TYPE NAME, not the variable. */
 static bool expr_is_arena_over_call(Node *n) {
     if (!n || n->kind != NODE_CALL) return false;
     Node *callee = n->call.callee;
@@ -4574,6 +4574,30 @@ static bool expr_is_arena_over_call(Node *n) {
     return callee->field.field_name_len == 4 &&
            memcmp(callee->field.field_name, "over", 4) == 0;
 }
+
+static void check_builtin_init(Checker *c) {
+    for (int i = 0; i < c->init_use_count; i++) {
+        struct ZerInitUse *u = &c->init_uses[i];
+        if (!u->declared || !u->used || u->initialized) continue;
+        if (u->kind == ZER_INIT_ARENA) {
+            checker_error(c, u->line,
+                "arena '%.*s' is allocated from but never given a backing store — "
+                "every alloc() will return null. Add '%.*s = Arena.over(buf);' "
+                "(or declare it as 'Arena %.*s = Arena.over(buf);' at function scope) "
+                "before the first allocation",
+                (int)u->name_len, u->name, (int)u->name_len, u->name,
+                (int)u->name_len, u->name);
+        } else {
+            checker_error(c, u->line,
+                "barrier '%.*s' is waited on but never initialised — an "
+                "uninitialised Barrier has a party count of 0, so @barrier_wait "
+                "returns IMMEDIATELY and the threads are never synchronised. "
+                "Add '@barrier_init(%.*s, <thread_count>);' before the first wait",
+                (int)u->name_len, u->name, (int)u->name_len, u->name);
+        }
+    }
+}
+
 
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
@@ -5069,8 +5093,8 @@ static Type *check_expr(Checker *c, Node *node) {
          * the declare-global / init-in-main idiom (examples/rtos.zer). */
         if (node->assign.target && node->assign.target->kind == NODE_IDENT &&
             expr_is_arena_over_call(node->assign.value)) {
-            arena_note_backed(c, node->assign.target->ident.name,
-                              (uint32_t)node->assign.target->ident.name_len);
+            init_note_initialized(c, ZER_INIT_ARENA, node->assign.target->ident.name,
+                                  (uint32_t)node->assign.target->ident.name_len);
         }
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
@@ -7255,7 +7279,7 @@ static Type *check_expr(Checker *c, Node *node) {
 
             /* Arena methods */
             if (obj->kind == TYPE_ARENA) {
-                /* Arena backing bookkeeping — decided in check_arena_backing. */
+                /* Arena initialisation bookkeeping — decided in check_builtin_init. */
                 if (field_node->field.object->kind == NODE_IDENT) {
                     const char *arn = field_node->field.object->ident.name;
                     uint32_t arl = (uint32_t)field_node->field.object->ident.name_len;
@@ -7268,7 +7292,7 @@ static Type *check_expr(Checker *c, Node *node) {
                      * made the check bless the exact no-op it exists to catch. */
                     if ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
                         (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0))
-                        arena_note_alloc(c, arn, arl, node->loc.line);
+                        init_note_used(c, ZER_INIT_ARENA, arn, arl, node->loc.line);
                 }
                 if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
                     if (node->call.arg_count != 1)
@@ -11166,6 +11190,30 @@ static Type *check_expr(Checker *c, Node *node) {
             int boplen = nlen - 8;
             bool is_binit = (boplen == 4 && memcmp(bop, "init", 4) == 0);
             bool is_bwait = (boplen == 4 && memcmp(bop, "wait", 4) == 0);
+            /* Required-initialisation bookkeeping — decided in check_builtin_init.
+             * A Barrier declared and never @barrier_init'ed has a party count of
+             * 0, so @barrier_wait returns immediately and never synchronises.
+             * Only a plain ident receiver is tracked; a `*Barrier` parameter is
+             * initialised by the caller and must not be flagged, and it does not
+             * reach here as a bare ident of Barrier type. */
+            if (node->intrinsic.arg_count >= 1 &&
+                node->intrinsic.args[0]->kind == NODE_IDENT) {
+                Node *bid = node->intrinsic.args[0];
+                Type *bt0 = checker_get_type(c, bid);
+                if (!bt0) {
+                    Symbol *bs = scope_lookup(c->current_scope, bid->ident.name,
+                                              (uint32_t)bid->ident.name_len);
+                    if (bs) bt0 = bs->type;
+                }
+                if (bt0 && type_dispatch_kind(bt0) == TYPE_BARRIER) {
+                    if (is_binit)
+                        init_note_initialized(c, ZER_INIT_BARRIER, bid->ident.name,
+                                              (uint32_t)bid->ident.name_len);
+                    else if (is_bwait)
+                        init_note_used(c, ZER_INIT_BARRIER, bid->ident.name,
+                                       (uint32_t)bid->ident.name_len, node->loc.line);
+                }
+            }
             if (!is_binit && !is_bwait) {
                 checker_error(c, node->loc.line,
                     "unknown barrier intrinsic '@%.*s' — use @barrier_init or @barrier_wait",
@@ -12467,11 +12515,15 @@ static void check_stmt(Checker *c, Node *node) {
          * receiver of that call is the TYPE NAME, not this variable, so the
          * backing has to be recorded from the declaration side. */
         if (type && type_dispatch_kind(type) == TYPE_ARENA) {
-            arena_note_declared(c, node->var_decl.name,
-                                (uint32_t)node->var_decl.name_len);
+            init_note_declared(c, ZER_INIT_ARENA, node->var_decl.name,
+                               (uint32_t)node->var_decl.name_len);
             if (expr_is_arena_over_call(node->var_decl.init))
-                arena_note_backed(c, node->var_decl.name,
-                                  (uint32_t)node->var_decl.name_len);
+                init_note_initialized(c, ZER_INIT_ARENA, node->var_decl.name,
+                                      (uint32_t)node->var_decl.name_len);
+        }
+        if (type && type_dispatch_kind(type) == TYPE_BARRIER) {
+            init_note_declared(c, ZER_INIT_BARRIER, node->var_decl.name,
+                               (uint32_t)node->var_decl.name_len);
         }
         /* Pool/Ring/Slab must be global or static — not on the stack */
         if (node->kind == NODE_VAR_DECL && type &&
@@ -17141,11 +17193,15 @@ static void register_decl(Checker *c, Node *node) {
          * the declaration has to be recorded from both sites or a global
          * `Arena a;` is never marked declared and never checked. */
         if (type && type_dispatch_kind(type) == TYPE_ARENA) {
-            arena_note_declared(c, node->var_decl.name,
-                                (uint32_t)node->var_decl.name_len);
+            init_note_declared(c, ZER_INIT_ARENA, node->var_decl.name,
+                               (uint32_t)node->var_decl.name_len);
             if (expr_is_arena_over_call(node->var_decl.init))
-                arena_note_backed(c, node->var_decl.name,
-                                  (uint32_t)node->var_decl.name_len);
+                init_note_initialized(c, ZER_INIT_ARENA, node->var_decl.name,
+                                      (uint32_t)node->var_decl.name_len);
+        }
+        if (type && type_dispatch_kind(type) == TYPE_BARRIER) {
+            init_note_declared(c, ZER_INIT_BARRIER, node->var_decl.name,
+                               (uint32_t)node->var_decl.name_len);
         }
         /* propagate const from var qualifier to slice/pointer type */
         if (node->var_decl.is_const && type) {
@@ -21443,11 +21499,11 @@ static void check_lock_ordering(Checker *c, Node *file_node) {
 void checker_post_passes(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
 
-    /* Arena backing (2026-08-20) — see arena_use_slot. Deferred because `.over()`
+    /* Required-initialisation check (2026-08-20) — see init_use_slot. Deferred because `.over()` /
      * legitimately comes after the allocations (the declare-global / init-in-main
      * idiom). Fires only when the arena was DECLARED in this file, allocated
      * from, and never backed anywhere. */
-    check_arena_backing(c);
+    check_builtin_init(c);
 
     /* Whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {

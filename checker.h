@@ -168,22 +168,36 @@ typedef struct {
     int param_expect_count;
     int param_expect_capacity;
 
-    /* Arena backing check (2026-08-20). An `Arena a;` with no backing store has
-     * capacity 0, so EVERY a.alloc() returns null, forever, with no diagnostic
-     * at either end — a silent logic failure. Collected here and decided after
-     * all bodies (check_arena_backing), because `.over()` may lexically follow
-     * the allocations (the RTOS init-later idiom). Names, not Symbols: locals
-     * go out of scope before the deferred pass runs. */
-    struct ZerArenaUse {
+    /* "Was this builtin given the initialisation it REQUIRES?" (2026-08-20).
+     *
+     * Two builtins carry their capacity in a runtime field rather than in their
+     * type, so a bare declaration zero-initialises them into something that
+     * compiles, runs, and silently does nothing:
+     *   Arena   — capacity 0, so EVERY alloc() returns null, forever.
+     *   Barrier — target 0, so `count >= target` is immediately true and
+     *             @barrier_wait returns without waiting. The synchronisation
+     *             point silently does not synchronise.
+     * Neither produced a diagnostic or a crash. Every other builtin states its
+     * size in its type (Pool(T,N), Ring(T,N), Semaphore(N)) or grows on demand
+     * (Slab), so this class has exactly these two members — one mechanism, not
+     * two parallel ones.
+     *
+     * Decided after all bodies (check_builtin_init), because the initialisation
+     * legitimately comes later in the file than the use (the declare-global /
+     * init-in-main RTOS idiom). Keyed by NAME + kind: locals are out of scope by
+     * then, and a name collision therefore reads as INITIALISED, which is the
+     * conservative direction. */
+    struct ZerInitUse {
         const char *name;
         uint32_t name_len;
-        int line;               /* first alloc site, for the diagnostic */
-        bool declared;          /* seen as `Arena x;` in THIS file */
-        bool backed;            /* seen as x.over(..) / x = Arena.over(..) */
-        bool allocated;         /* seen as x.alloc(..) / x.alloc_slice(..) */
-    } *arena_uses;
-    int arena_use_count;
-    int arena_use_capacity;
+        int kind;               /* ZER_INIT_ARENA / ZER_INIT_BARRIER */
+        int line;               /* first USE site, for the diagnostic */
+        bool declared;          /* declared in THIS file */
+        bool initialized;       /* given its backing store / party count */
+        bool used;              /* allocated from / waited on */
+    } *init_uses;
+    int init_use_count;
+    int init_use_capacity;
 
     /* keep inference (Site 1, 2026-06-19): deferred call-site keep enforcement +
      * transitive escape fixpoint. Edges are recorded during the single body pass

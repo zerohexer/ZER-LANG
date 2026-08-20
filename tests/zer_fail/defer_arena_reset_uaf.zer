@@ -1,11 +1,19 @@
 // EXPECTED: compile error
+// expect-error: use after free
 // AU-2: `defer arena.reset()` must invalidate arena handles. Combined with the
 // AU-1 LIFO ordering: reset (registered last) fires first, then use_it(p) fires
 // against the reset (freed) arena pointer → use-after-reset.
+//
+// 2026-08-20: this negative was FULLY MASKED. Its arena had no backing store,
+// so the new "never given a backing store" error was the ONLY diagnostic and
+// the AU-2 rule under test never ran — it would have kept passing with that
+// rule deleted. Backed; the intended "use after free" now fires.
 struct R { u32 v; }
+u8[256] armem;
 Arena ar;
 void use_it(*R p) { p.v = p.v + 1; }
 void f() {
+    ar = Arena.over(armem);
     *R p = ar.alloc(R) orelse return;
     p.v = 5;
     defer use_it(p);

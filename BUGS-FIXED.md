@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20c — BUG-806: an uninitialised Barrier silently does not synchronise
+
+Found by asking the generalisation of BUG-804 rather than by a report: **which
+other builtins keep their capacity in a RUNTIME FIELD instead of in their TYPE?**
+A bare declaration zero-initialises those, producing something that compiles,
+runs, and silently does nothing. The answer is exactly two — `Arena` and
+`Barrier` — because every other builtin states its size in its type
+(`Pool(T,N)`, `Ring(T,N)`, `Semaphore(N)`) or grows on demand (`Slab`).
+
+```zer
+Barrier gate;
+u32 main() { @barrier_wait(gate); return 0; }   // compiles, runs, exits 0
+```
+
+`Barrier gate;` emits `_zer_barrier gate = {0}`, so `target` is 0 and
+`_zer_barrier_wait` evaluates `count >= target` as `1 >= 0` on the very first
+caller: it broadcasts and returns. **The rendezvous never happens.** Threads that
+believe they are synchronised are not, and nothing at either end says so.
+
+Worse than the Arena case in one respect: an unbacked arena at least returns
+null, which the caller must handle. A dead barrier returns *success*.
+
+**Fix — one mechanism, not two.** The `Arena` checker from BUG-804 was
+generalised rather than copied: `ZerArenaUse` -> `ZerInitUse` with a `kind`, and
+`check_arena_backing` -> `check_builtin_init`. The question ("was this builtin
+given the initialisation it requires?") is answered once, for both members of
+the class, so adding the barrier case was three call sites and no new machinery.
+Had it been copied, this would have been the two-hand-maintained-copies shape
+that the `checker_check` / `checker_post_passes` duplication (fixed the same day)
+demonstrates the cost of.
+
+Still deferred to after all bodies, for the same reason: `@barrier_init` in
+`main` legitimately follows a `@barrier_wait` that appears earlier in the file.
+A `*Barrier` PARAMETER is never flagged — it is initialised by the caller.
+
+**Corpus cost: 3 files, all negatives in `tests/zer_fail/`, and two of them were
+already broken:**
+- `defer_arena_reset_uaf.zer` was **FULLY MASKED**. Its arena had no backing
+  store, so the new error was the ONLY diagnostic and the AU-2 rule it exists to
+  test never ran — it would have kept passing with that rule deleted. Backed; the
+  intended *"use after free: 'p' is freed"* now fires.
+- `arena_escape_struct_param.zer` produced its own error first but gained a
+  second. Backed, so only the keep-parameter escape remains.
+Both now carry `// expect-error:` so they cannot be masked again.
+
+Tests: `tests/zer_fail/barrier_never_initialized.zer` (verified ACCEPTED on a
+pre-fix build) and `tests/zer/barrier_init_shapes_ok.zer` — the over-rejection
+boundary: a `*Barrier` param, an `@barrier_init` lexically LATER than the wait,
+and a local barrier.
+
+`make check` exit 0, all six gates, 1254 ZER tests.
+
+---
+
 ## Session 2026-08-20b — BUG-804/805: an Arena that can never allocate, and the five vacuous tests it hid
 
 ### BUG-804 — `Arena a;` with no backing store: every alloc() returns null, silently

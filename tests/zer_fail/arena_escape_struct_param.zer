@@ -1,4 +1,5 @@
 // EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
 // BUG-737 (6u360k audit GAP-8): arena-derived pointer laundered through a
 // struct field copy + by-value parameter. `local.ptr = p` taints the carrier
 // (prior struct-copy work); the missing piece was the by-value struct param:
@@ -16,8 +17,13 @@ void take(Container ct) {
     c = ct;
 }
 
+u8[256] amem;
+
 void make() {
-    Arena a;
+    // 2026-08-20: backed. An unbacked arena is now itself an error, which would
+    // have added a SECOND diagnostic and left this negative able to pass on the
+    // wrong one. The rule under test is the keep-parameter escape.
+    Arena a = Arena.over(amem);
     *Item p = a.alloc(Item) orelse return;
     p.v = 99;
     Container local;

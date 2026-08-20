@@ -420,6 +420,126 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id` (found 2026-08-20)
+
+**Severity: HIGH.** Non-deterministic. Usually a FALSE TRAP on correct code; in the other
+direction a WRONG `@ptrcast` passes silently, which is a soundness hole.
+
+**It has NO HOME in either harness, deliberately** — the same call CLAUDE.md makes for
+compile-time / output-size defects. Exhibiting it requires LINKING against a separate C
+translation unit that defines the function with its real `void *` signature;
+`tests/zer/` runs a self-contained program, `tests/zer_fail/` must not compile, and the
+`tests/zer_gaps/` runner builds an executable (`-o /dev/null` is a non-`.c` path), so an
+extern with no definition fails to link there and the file would read as "gap closed".
+A `zer_gaps` file was written and then REMOVED for exactly that reason rather than left
+failing. The reproduction recipe below is the artifact; run it by hand.
+
+**Found by** compiling every example in `docs/reference.md` and linking the ones that are
+complete programs — the documented C-interop example failed to build.
+
+### Reproduction recipe (measured 2026-08-20)
+
+`lib4.c` — a real C translation unit:
+```c
+static char store[64];
+void *zzz_ptr(void)      { return store; }
+void  zzz_close(void *p) { (void)p; }
+```
+`prov.zer`:
+```zer
+struct Motor { u32 rpm; }
+*opaque zzz_ptr();
+void zzz_close(*opaque p);
+u32 main() {
+    *opaque p = zzz_ptr();
+    *Motor m = @ptrcast(*Motor, p);
+    m.rpm = 7;
+    u32 r = m.rpm;
+    zzz_close(p);
+    if (r != 7) { return 1; }
+    return 0;
+}
+```
+```
+zerc prov.zer -o prov.c && gcc -c lib4.c -o lib4.o && gcc -o prov prov.c lib4.o && ./prov
+```
+Observed: `ZER TRAP: @ptrcast type mismatch` (exit 133). The emitted check is
+`if (_pc.type_id != 4 && _pc.type_id != 0) _zer_trap(...)` and `type_id` is register
+residue. Note the two heuristics that get in the way while reducing this: a bodyless
+function returning `*opaque` is treated as an ALLOCATOR (so the result must be freed or
+zercheck reports a leak), and a bodyless function taking `*opaque` can be treated as
+consuming it (so a later use reports use-after-free).
+
+### The measurement
+
+`*opaque` lowers to `_zer_opaque { void *ptr; uint32_t type_id; }`. For a BODYLESS (extern
+C) declaration the emitter emits **that struct** as the C prototype:
+
+```
+_zer_opaque zzz_ptr(void);      <- what ZER emits (measured)
+void       *zzz_ptr(void);      <- what the real C function is
+```
+
+On all three supported target ABIs a `<=16`-byte struct is returned in / passed through the
+first two registers (SysV x86-64 RAX:RDX, AArch64 X0:X1, RISC-V a0:a1), so **`.ptr` arrives
+correctly by luck** and the pointer value works. **Nothing initialises `.type_id`** — it is
+whatever the callee left in the second register.
+
+`@ptrcast` then emits:
+```c
+if (_pc.type_id != 4 && _pc.type_id != 0) _zer_trap("@ptrcast type mismatch", ...);
+```
+The `!= 0` arm is the design's documented "unknown provenance from C -> allow" escape
+(CLAUDE.md: *"extern/cinclude pointers get type_id=0"*). The value is not 0, it is garbage:
+
+- **usually neither** -> false trap. Measured, on the exact reproducer:
+  `ZER TRAP: @ptrcast type mismatch`.
+- **sometimes a live type_id** -> the wrong cast passes with no trap. type_ids are small
+  consecutive integers, so this is not a remote coincidence — it is whatever small value
+  happened to be in RDX.
+
+**It is not a toy.** 32 declarations in the tree put `*opaque` in a bodyless signature,
+including the standard library: `lib/io.zer` (fopen/fread/fwrite/fseek/fclose),
+`lib/compat.zer` (malloc/calloc/realloc/free/memcpy/memset/memcmp), `lib/fmt.zer`
+(fputc, zer_get_stderr/stdout), and `examples/http_server.zer`. `docs/reference.md`
+documented this shape as *the* C-interop pattern; that example has been changed to the
+form that actually works (`?*u8`), and the `*opaque` C-boundary caveat is now stated there.
+
+**Why no test caught it:** no test in the suite declares a C function with `*opaque` in its
+signature. The five `tests/zer_fail/opaque_*.zer` files do, but they are NEGATIVES — they
+must fail to compile, so they never link and never run.
+
+### Two candidate fixes, each with its own trap
+
+1. **Correct the ABI (the proper fix).** For a bodyless declaration, emit `void *` where the
+   ZER type is `*opaque`, and marshal at the call site: pass `arg.ptr` in, wrap the result as
+   `{ .ptr = <call>, .type_id = 0 }` out.
+   *Trap:* the call sites are the DUAL-DISPATCH hazard CLAUDE.md warns about — `IR_CALL`
+   (emitter.c ~10423) and the `emit_rewritten_node` NODE_CALL path both emit calls, and a fix
+   in one is invisible to the other.
+2. **Normalise only the metadata at the boundary** (leave the ABI, which works on all three
+   supported arches): wrap an extern call's result so `type_id` is forced to 0.
+   *Trap, and the reason this was NOT shipped blind:* the predicate must be exactly
+   "no ZER definition exists anywhere", and misclassifying a ZER function as extern would
+   ERASE its provenance — `type_id = 0` makes `@ptrcast` permissive, so the failure mode is
+   an **under-rejection**, the one class where a mistake is a shipped unsafe accept.
+   `sym->func_node->func_decl.body == NULL` looks like the right predicate (the checker
+   deliberately re-points `func_node` at the definition when a forward decl is later
+   completed — checker.c ~16918), but it needs verifying across module imports before being
+   trusted.
+
+Either way this is a relaxation-adjacent change and belongs behind the full negative matrix
+CLAUDE.md's "Sound relaxation" methodology requires, not a same-session patch.
+
+### Related, and separately worth cleaning up
+
+The extern prototype path carries a hardcoded 17-name `is_cstdlib` list (emitter.c ~5036)
+used to suppress a conflicting prototype for well-known libc names. It is a name-matching
+heuristic in a correctness path: a user function named `qsort` is silently given no
+prototype, and any libc function NOT on the list still collides.
+
+---
+
 ## OPEN — `vrp_ir.c` orphan: Phase 0's premise is STALE (re-measured 2026-08-20)
 
 `vrp_ir.c` is still not compiled — `grep -c vrp_ir Makefile` = 0, `nm zerc | grep -ci vrp_ir`

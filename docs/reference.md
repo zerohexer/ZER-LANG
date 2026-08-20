@@ -2799,11 +2799,13 @@ cinclude "my_header.h";
 ```zer
 cinclude "<stdlib.h>";
 
-*opaque malloc(usize size);
-void free(*opaque ptr);
+// Declare the C function with a TYPED pointer. `?*T` because malloc can
+// return NULL, and `*T` in ZER is non-null by definition.
+?*u8 malloc(usize size);
+void free(?*u8 ptr);
 
 u32 main() {
-    *opaque raw = malloc(64);
+    ?*u8 raw = malloc(64);
     free(raw);
     return 0;
 }
@@ -2812,6 +2814,18 @@ u32 main() {
 **NOTES**
 - C macros (stderr, stdout, etc.) are NOT accessible. Wrap in a C helper function.
 - `_zer_` prefix is reserved — name helpers `zer_get_stderr`, not `_zer_stderr`.
+- **Do not put `*opaque` in the signature of an extern C function.** ZER lowers
+  `*opaque` to a two-field struct (`{ void *ptr; uint32_t type_id; }`) and emits
+  *that* as the C prototype, but the real C function takes and returns `void *`.
+  The pointer half survives on the supported ABIs, so it looks like it works —
+  but nothing initialises `type_id`, so `@ptrcast`'s provenance check reads
+  register residue and either traps on correct code or, if the residue happens to
+  match a live type id, lets a wrong cast through. Use a typed pointer (`?*u8`,
+  `*Sensor`, …) at the C boundary, and convert to `*opaque` on the ZER side with
+  `@ptrcast` once the value is already inside ZER. Tracked in
+  `docs/limitations.md` ("extern `*opaque` crosses the C boundary with an
+  uninitialised `type_id`"), reproducer in
+  `tests/zer_gaps/opaque_extern_type_id_uninit.zer`.
 
 ### Variadic `...` — and how to print
 

@@ -1155,7 +1155,10 @@ Uses zercheck's existing HS_TRANSFERRED state — zero new infrastructure.
 ### Hardware Support
 ```
 volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);  // MMIO register
-u32 bits = reg[9..8];                               // bit extraction
+u32 v = *reg;                                       // read the register FIRST
+u32 bits = v[9..8];                                 // then bit-extract from the VALUE
+// NOT `reg[9..8]` — on a POINTER, [a..b] parses as a slice range and errors
+// ("slice start (9) is greater than end (8)"). Bit-slices apply to scalars.
 interrupt USART1 { handle_rx(); }                    // interrupt handler
 packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ```

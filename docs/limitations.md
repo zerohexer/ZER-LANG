@@ -1346,12 +1346,15 @@ four TypeNode kinds.
 bare-param-view relaxation (BUG-764) covers `return p[0..2];` but not a param view wrapped in a
 returned-by-value struct. Errs conservative → no soundness threat.
 
-### LOW Doc mismatch — bit-extraction on a `volatile *u32` MMIO register is over-rejected (`rvek5f` `00f3c2af`)
-CLAUDE.md's "Hardware Support" quick reference shows
-`volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];`, but `reg[hi..lo]` on a POINTER parses as a slice
-range → `error: slice start (9) is greater than end (8)`. Bit-extraction only works on a scalar VALUE.
-Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to show the deref form, or make
-`reg[hi..lo]` on a volatile scalar pointer auto-deref for bit-extraction.
+### ~~LOW Doc mismatch — bit-extraction on a `volatile *u32` MMIO register~~ — **DOCS FIXED 2026-08-20**
+Re-measured: `reg[9..8]` on a `volatile *u32` still errors (*"slice start (9) is greater than end (8)"*
+then *"cannot slice type '*u32'"*) — `[a..b]` on a POINTER parses as a slice range, and bit-slices apply
+to a scalar VALUE. Resolved on the DOCS side rather than by making the pointer form auto-deref, because
+the deref form is the better hardware idiom anyway: it makes the number of volatile accesses explicit, so
+reading three fields out of one register is one bus read rather than three. Both wrong examples corrected
+(CLAUDE.md "Hardware Support" and docs/reference.md "Bit Extraction"), each now showing
+`u32 v = *reg; u32 field = v[9..8];` and each verified to compile. The auto-deref relaxation remains
+possible but is no longer needed to make the documentation true.
 
 ### Cross-references (already tracked elsewhere in this file — do NOT duplicate)
 - **HOLE-C / cross-block scoped-borrow, join-in-branch** (`rvek5f` `00f3c2af`) — **FIXED 2026-08-03.**

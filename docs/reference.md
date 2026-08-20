@@ -2022,6 +2022,425 @@ u8[512] fpu;
 
 ---
 
+## SYSTEM / KERNEL INTRINSICS
+
+> Every signature in this section was **measured against the compiler**
+> (2026-08-20) by probing arity, argument kinds and return type, not copied
+> from a design note. If a signature here disagrees with `zerc`, the doc is
+> wrong — please report it.
+>
+> **Privilege.** Most of these execute privileged instructions (CPL 0 / EL1 /
+> M-mode). Calling one from user space raises SIGSEGV/SIGILL. To verify that
+> such code *compiles* without executing it, use the dead-branch pattern:
+> ```zer
+> u32 main() {
+>     volatile u32 never_true = 0;
+>     if (never_true == 42) { @cpu_write_cr3(0); }
+>     return 0;
+> }
+> ```
+> The `volatile` is load-bearing — without it the branch is folded away.
+>
+> **Portability.** Non-x86 targets get an architecture-appropriate instruction
+> where one exists and a safe no-op fallback where one does not. These are
+> hardware-domain operations: ZER verifies the *program* use of the value
+> (types, bounds, qualifiers, provenance), never the *hardware* meaning. See
+> CLAUDE.md's program-consequence vs hardware-consequence split.
+
+### CPU identity and inspection (non-privileged)
+
+**SIGNATURES**
+```
+@cpu_id()               -> u32     raw CPU identifier
+@cpu_get_pc()           -> u64     current program counter
+@cpu_read_sp()          -> u64     stack pointer
+@cpu_read_tp()          -> u64     thread pointer / TLS base
+@cpu_read_flags()       -> u64     RFLAGS / NZCV
+@cpu_read_counter()     -> u64     cycle / timestamp counter (RDTSC-class)
+@cpu_vendor_id()        -> u64     CPUID leaf 0 EBX (first 4 vendor chars)
+@cpu_feature_bits()     -> u64     CPUID leaf 1 ECX:EDX packed
+@cpu_model_id()         -> u32     CPUID leaf 1 EAX (family/model/stepping)
+@cpu_core_id()          -> u32     physical core id
+@cpu_num_cores()        -> u32     logical core count
+@cpu_cache_line_size()  -> u32     L1 line size in bytes
+@cpu_current_mode()     -> u32     privilege mode (0 = user)
+@cpu_get_priv_level()   -> u32     privilege level
+@cpu_cpuid(leaf, subleaf)     -> u64   (EBX << 32) | EAX
+@cpu_cpuid_ecx(leaf, subleaf) -> u64   (EDX << 32) | ECX
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 sp = @cpu_read_sp();
+    u32 cores = @cpu_num_cores();
+    u32 line = @cpu_cache_line_size();
+    if (cores == 0) { return 1; }
+    if (line == 0) { return 2; }
+    if (sp == 0) { return 3; }
+    return 0;
+}
+```
+
+**NOTES**
+- All non-privileged — safe to call from user code.
+- `@cpu_cpuid` packs two 32-bit registers into one `u64`; split with
+  `(u32)v` for the low half and `(u32)(v >> 32)` for the high half.
+
+---
+
+### Hardware random numbers
+
+**SIGNATURES**
+```
+@cpu_rdrand() -> ?u64      RDRAND — null when the hardware declines
+@cpu_rdseed() -> ?u64      RDSEED — null when the hardware declines
+```
+
+**DESCRIPTION**
+These return an **optional**, not a raw integer, because the instruction can
+legitimately fail (the entropy pool is momentarily empty) and reports that in
+the carry flag. The optional makes the failure impossible to ignore — a caller
+must unwrap, which is exactly the point.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    // retry a bounded number of times, then fall back
+    u64 seed = 0;
+    for (u32 i = 0; i < 10; i += 1) {
+        if (@cpu_rdrand()) |v| { seed = v; }
+    }
+    if (seed == 0) { return 0; }   // no entropy available — caller decides
+    return 0;
+}
+```
+
+**NOTES**
+- Non-privileged on x86 when the CPU supports RDRAND/RDSEED.
+- Never write `@cpu_rdrand() orelse 0` in security-sensitive code — a zero
+  "random" value is a silent weakness. Retry, or fail loudly.
+
+---
+
+### Spin-wait, idle and power
+
+**SIGNATURES**
+```
+@cpu_pause()                       PAUSE / YIELD — spin-loop hint
+@cpu_wfe()                         ARM WFE — wait for event
+@cpu_sev()                         ARM SEV — signal event
+@cpu_idle_hint()                   non-blocking low-power hint
+@cpu_deep_sleep()                  enter deepest idle state (WFI / HLT)
+@cpu_reset()                       safe halt-forever fallback
+@cpu_flush_pipeline()              instruction-pipeline sync barrier
+@cpu_breakpoint()                  trap to the debugger (INT3 / BKPT / EBREAK)
+@cpu_monitor_addr(ptr)             x86 MONITOR — arm an address watch
+@cpu_mwait()                       x86 MWAIT — wait for a monitored write
+@cpu_umonitor(ptr)                 user-mode MONITOR (WAITPKG)
+@cpu_umwait(hint, deadline)        user-mode MWAIT (0 = C0.2, 1 = C0.1)
+@wait_on_address(ptr, expected)    block while *ptr == expected
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 flagv = 1; u32 flag = flagv;
+    u32 spins = 0;
+    while (flag == 0) { @cpu_pause(); spins += 1; }
+    @cpu_idle_hint();
+    return 0;
+}
+```
+
+**NOTES**
+- `@cpu_pause` and `@cpu_idle_hint` are non-blocking and non-privileged.
+- `@cpu_monitor_addr` / `@cpu_umonitor` take a **pointer or array**, not an
+  integer address; use `@inttoptr` first if you have a raw address.
+- `@wait_on_address` requires a pointer first argument.
+
+---
+
+### MMU / paging
+
+**SIGNATURES**
+```
+@mmu_enable()                  turn the MMU on
+@mmu_disable()                 turn the MMU off
+@mmu_is_enabled()   -> bool    query
+@mmu_get_pt()       -> u64     current page-table base
+@mmu_set_pt(base)              set page-table base (switches address space)
+@mmu_get_kernel_pt() -> u64    kernel page-table base
+@mmu_set_kernel_pt(base)       set kernel page-table base
+@mmu_get_fault_addr()   -> u64 faulting address
+@mmu_get_fault_status() -> u64 fault status register
+@mmu_sync()                    paging-structure sync barrier
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {          // dead branch: compiles, never executes
+        u64 pt = @mmu_get_pt();
+        @mmu_set_pt(pt);
+        @mmu_sync();
+        if (@mmu_is_enabled()) { return 1; }
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- **All of these are privileged, `@mmu_is_enabled` included** — it reads a
+  control register, so calling it from user space traps just like the others.
+  (Measured: an earlier draft of this page called it non-privileged and put it
+  outside the dead branch; the example trapped at runtime.) Keep every MMU
+  intrinsic inside the dead branch when you only want to check that it
+  compiles.
+- `@mmu_set_pt` takes an **integer** physical address, not a pointer.
+- `@mmu_is_enabled` returns `bool`, so it is usable directly as a condition.
+
+---
+
+### TLB maintenance
+
+**SIGNATURES**
+```
+@tlb_flush_all()               flush the whole TLB
+@tlb_flush_global()            flush global entries too
+@tlb_flush_addr(addr)          flush one address
+@tlb_flush_range(addr, len)    flush an address range
+@tlb_flush_asid(asid)          flush one address-space id
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @tlb_flush_addr(0x1000);
+        @tlb_flush_range(0x1000, 0x2000);
+        @tlb_flush_all();
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- All arguments are **integers** (addresses / ids), not pointers.
+- All privileged.
+
+---
+
+### Cache maintenance
+
+**SIGNATURES**
+```
+@cache_flush_line(ptr)                  flush one line (CLFLUSH)
+@cache_flushopt(ptr)                    CLFLUSHOPT — ordered alternative
+@cache_writeback(ptr)                   CLWB — write back, keep valid (NVDIMM)
+@cache_zero_line(ptr)                   zero a whole cache line (DC ZVA)
+@cache_flush_range(ptr, size)           flush a range
+@cache_clean_range(ptr, size)           clean (write back) a range
+@cache_invalidate_range(ptr, size)      invalidate a range
+@cache_invalidate_icache(ptr, size)     invalidate the instruction cache
+@cpu_cache_disable()                    CR0.CD = 1 + WBINVD (privileged)
+@cpu_cache_enable()                     CR0.CD = 0 (privileged)
+@nt_store(ptr, value)                   non-temporal store (MOVNTI)
+@barrier_dma()                          barrier ordering CPU vs DMA accesses
+```
+
+**EXAMPLE**
+```zer
+u8[256] dma_buf;
+
+u32 main() {
+    @cache_clean_range(&dma_buf, 256);   // make writes visible to the device
+    @barrier_dma();
+    @cache_invalidate_range(&dma_buf, 256);  // discard stale lines before reading
+    return 0;
+}
+```
+
+**NOTES**
+- The pointer argument is a **pointer or array**, and the size a plain integer.
+- `@cache_invalidate_icache` is what you need after writing instructions
+  (JIT, bootloader relocation) before jumping to them.
+- `@barrier_dma` is a distinct barrier from `@barrier()` — it orders CPU
+  accesses against a device master, which on some targets is a different
+  instruction from a plain memory fence.
+
+---
+
+### Model-specific, control and debug registers (x86, privileged)
+
+**SIGNATURES**
+```
+@cpu_read_msr(msr)      -> u64      RDMSR
+@cpu_write_msr(msr, v)              WRMSR
+@cpu_read_cr0()  -> u64             CR0 (paging, WP, cache disable)
+@cpu_write_cr0(v)
+@cpu_read_cr2()  -> u64             CR2 — page-fault address
+@cpu_read_cr3()  -> u64             CR3 — page-directory base
+@cpu_write_cr3(v)                   switches address space
+@cpu_read_cr4()  -> u64             CR4 — feature enables
+@cpu_write_cr4(v)
+@cpu_read_xcr0() -> u64             XSAVE feature mask
+@cpu_write_xcr0(v)                  XSETBV
+@cpu_read_dr(idx)  -> u64           debug register DR0-DR3, DR6, DR7
+@cpu_write_dr(idx, v)
+@cpu_read_pmc(idx) -> u64           RDPMC (needs CR4.PCE = 1 for user access)
+@cpu_read_fsbase()  -> u64          needs CR4.FSGSBASE = 1
+@cpu_read_gsbase()  -> u64
+@cpu_write_fsbase(v)
+@cpu_write_gsbase(v)
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        u64 cr3 = @cpu_read_cr3();
+        @cpu_write_cr3(cr3);
+        u64 v = @cpu_read_msr(0xC0000080);   // IA32_EFER
+        @cpu_write_msr(0xC0000080, v);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Every argument is an **integer**. All privileged; non-x86 targets fall back
+  to a no-op.
+- `@cpu_read_cr2` is how a page-fault handler learns the faulting address on
+  x86; the ARM/RISC-V equivalent is `@mmu_get_fault_addr`.
+
+---
+
+### Port I/O (x86)
+
+**SIGNATURES**
+```
+@port_in8(port)   -> u8
+@port_in16(port)  -> u16
+@port_in32(port)  -> u32
+@port_out8(port, value)
+@port_out16(port, value)
+@port_out32(port, value)
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @port_out8(0x3F8, 65);          // write 'A' to COM1
+        u8 status = @port_in8(0x3FD);
+        if (status == 0) { return 1; }
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- The return widths differ per variant (`u8` / `u16` / `u32`) — the compiler
+  will reject an assignment that would narrow silently.
+- Privileged: requires CPL <= IOPL.
+
+---
+
+### Extended processor state (XSAVE / FXSAVE)
+
+**SIGNATURES**
+```
+@cpu_xsave(buf, mask)      XSAVE   — buf is a pointer/array, mask an integer
+@cpu_xrstor(buf, mask)     XRSTOR
+@cpu_fxsave(buf)           FXSAVE  — legacy, 512-byte 16-byte-aligned buffer
+@cpu_fxrstor(buf)          FXRSTOR
+@cpu_fpu_init()            FNINIT
+```
+
+**EXAMPLE**
+```zer
+u8[512] fpu_area;
+
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @cpu_fxsave(&fpu_area);
+        @cpu_fpu_init();
+        @cpu_fxrstor(&fpu_area);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- Buffer must be large enough and correctly aligned — ZER checks that the
+  argument *is* a pointer or array, not that it is big enough. Sizing is a
+  hardware-domain fact (it depends on the enabled XSAVE features).
+
+---
+
+### Privileged transitions and interrupt lifecycle
+
+**SIGNATURES**
+```
+@cpu_syscall()             user -> kernel trap (syscall / svc #0 / ecall)
+@cpu_sysret()              kernel -> user return (sysretq / eret / sret)
+@cpu_iret()                interrupt return (iretq / eret / mret)
+@cpu_set_priv_stack(sp)    set the kernel stack used on syscall entry
+@cpu_hypercall()           guest -> hypervisor (vmcall / hvc #0 / ecall)
+@cpu_sbi_call()            RISC-V ecall to M-mode firmware
+@cpu_smc_call()            ARM TrustZone smc #0
+@cpu_eoi()                 end-of-interrupt to LAPIC / GICv3
+@cpu_endbr()               ENDBR64 — CET-IBT landing pad (a NOP without CET)
+```
+
+**EXAMPLE**
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @cpu_set_priv_stack(0x8000);
+        @cpu_eoi();
+        @cpu_iret();
+    }
+    @cpu_endbr();          // non-privileged: a multi-byte NOP without CET
+    return 0;
+}
+```
+
+**NOTES**
+- These require correctly-set system-register context **before** the
+  transition instruction (CS/RIP/RFLAGS on x86; ELR/SPSR on ARM;
+  sepc/sstatus on RISC-V). ZER cannot verify that — it is a hardware-domain
+  precondition, and getting it wrong is a hardware-consequence failure.
+- `@cpu_set_priv_stack` takes an **integer** stack address.
+
+---
+
+### @config(key, default)
+
+**DESCRIPTION**
+Build-configuration hook. **Currently a passthrough: it always evaluates to
+the `default` argument**, and its type is the type of that default. There is
+no mechanism yet to supply a value for `key` from the build, so today it is
+only useful as a marker for a knob you intend to make configurable later.
+
+**SYNTAX**
+```zer
+u32 main() {
+    u32 baud = @config("uart.baud", 115200);   // always 115200 today
+    if (baud != 115200) { return 1; }
+    return 0;
+}
+```
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2820,11 +3239,40 @@ undefined behavior.
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
 ### Bit Extraction
+
+Bit-slices operate on a scalar **value**, not on a pointer:
+
 ```zer
-reg[9..8]                  // Extract bits 9:8
-reg[7..4] = 0x0F;          // Set bits 7:4
-reg[7..0] += 3;            // Compound assign — read-modify-write of the field
+u32 main() {
+    u32 reg = 0x0300;
+    u32 field = reg[9..8];     // extract bits 9:8  -> 3
+    reg[7..4] = 0x0F;          // set bits 7:4
+    reg[7..0] += 3;            // compound assign — read-modify-write of the field
+    if (field != 3) { return 1; }
+    return 0;
+}
 ```
+
+**On an MMIO register, dereference first.** `reg[hi..lo]` where `reg` is a
+`volatile *u32` does NOT bit-extract — `[a..b]` on a pointer parses as a slice
+range, so it fails with *"slice start (9) is greater than end (8)"* or
+*"cannot slice type '\*u32'"*. Read the register into a value, then slice it:
+
+```zer
+mmio 0x40000000..0x40000FFF;
+
+u32 main() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+    u32 v = *reg;              // one volatile read
+    u32 field = v[9..8];       // then bit-extract from the value
+    if (field > 3) { return 1; }
+    return 0;
+}
+```
+
+Reading into a value first is also the correct hardware idiom: it makes the
+number of volatile accesses explicit, so extracting three fields from one
+register is one read rather than three.
 Every compound operator works on a bit-slice target (`+= -= *= /= %= &= |= ^=
 <<= >>=`): the current field value is read, the operation applied, the result
 written back into those bits. This is the register read-modify-write idiom.

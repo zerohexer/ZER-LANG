@@ -420,6 +420,40 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — a bodyless declaration reusing a libc NAME gets a confusing GCC error (LOW, loud)
+
+`emitter.c` (~5036) carries a hardcoded 17-name `is_cstdlib` list and suppresses ZER's own
+prototype for those names, so the one in the runtime preamble's `<stdlib.h>` / `<stdio.h>`
+is used instead. That is what makes `i32 printf(const *u8 fmt, ...);` — the documented way
+to print — work.
+
+The cost: a ZER program declaring its OWN function with one of those names and a different
+signature gets a C-level error naming the generated file:
+
+```zer
+bool qsort(u32 n);          // error: too few arguments to function 'qsort'
+u32 main() { if (qsort(1)) { return 0; } return 1; }
+```
+
+**Loud, not silent** — GCC catches it — so this is a diagnostic-quality issue, not a
+soundness one. It is nevertheless the same invariant BUG-808 was about: *the checker may
+never accept a program GCC then rejects.*
+
+**Why it is not simply fixed by rejecting those names:** `printf`, `puts`, `memcpy` and the
+rest are the documented C-interop pattern, so the names must stay declarable. What is
+actually wrong is a SIGNATURE MISMATCH with the real libc function, and the checker has no
+way to know libc's signatures — an inherent limit of the emit-C architecture rather than an
+oversight. Recorded so a future session does not mistake it for a checker hole.
+
+**Measured 2026-08-20 alongside it, and worth keeping:** compiling every corpus program
+that the checker ACCEPTS and feeding the emitted C to GCC gives **1168 of 1173 accepted**.
+The five are all environmental — two need `--target-features=avx512f` (their `zerc-flags`
+line is line 2, not line 1), one needs an include path for its `cinclude` header, and two
+contain an `interrupt` block, which GCC refuses on hosted x86-64 (the masking effect
+CLAUDE.md already documents). So the emitter produces valid C for the whole corpus.
+
+---
+
 ## OPEN — two arena allocations cannot be LINKED (over-rejection, found 2026-08-20)
 
 ```zer

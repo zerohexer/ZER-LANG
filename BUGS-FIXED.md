@@ -5,6 +5,59 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20g — BUG-808: the global-initializer guard never ran for a ZERO-ARG intrinsic
+
+A file-scope initializer must be a C constant expression. The checker's list of
+intrinsics that cannot be one was hand-maintained, and it had already drifted
+once: G7 (2026-08-01) found six names the checker accepted and only GCC rejected,
+and added them — recording the exact rationale, *"the CHECKER emitted ZERO
+diagnostics — the program was only stopped by GCC … Reject cleanly here so the
+message names the ZER line and the fix."*
+
+**The structural defect underneath it survived that fix.** The whole guard sits
+inside
+
+```c
+if (ginit->kind == NODE_INTRINSIC && ginit->intrinsic.arg_count >= 1 && …)
+```
+
+— a precondition that belongs to the BIT-QUERY check, which inspects `args[0]`.
+The name-based "does not lower to a constant" check was nested inside it and
+inherited a condition it has nothing to do with, so **every ZERO-ARG intrinsic
+skipped the guard entirely**. That is every runtime CPU query:
+
+```zer
+const u32 G = @cpu_model_id();     // checker exits 0; only GCC stops it
+```
+
+`zerc f.zer -o out.c` reported SUCCESS for a program that cannot be compiled.
+Adding the eleven names without splitting the condition would have changed
+nothing for seven of them — which is exactly what happened on the first attempt,
+and what the new grid caught.
+
+**Measured, not guessed.** Probing all 141 intrinsics the compiler recognises in
+a global-initializer position and compiling the emitted C:
+- **121** correctly rejected by the checker,
+- **7** genuinely fold and are valid C (`popcount`, `ctz`, `clz`, `ffs`,
+  `parity`, `bswap16`, `bswap32`),
+- **11** accepted by the checker and rejected by GCC — `@expect`, `@cpu_id`,
+  `@port_in8/16/32`, and the six `cpu_*` identity queries.
+
+**Fix:** scope the `arg_count >= 1` precondition to the check that needs it, and
+add the eleven runtime reads.
+
+**The durable part is the gate.** `tests/test_global_init_matrix.c` DERIVES the
+intrinsic set from the compiler at run time (probe each candidate, keep the ones
+it does not call *"unknown intrinsic"*) and asserts, for every one, that the
+checker's verdict agrees with GCC's — the checker may never accept what GCC
+rejects. A new intrinsic is covered the day it lands, with nobody having to
+remember the file. That is the property both hand-maintained lists lacked.
+**Verified to fire: 7 failures before the fix, 54/54 after.**
+
+`make check` exit 0, all six gates, 1256 ZER tests.
+
+---
+
 ## Session 2026-08-20f — a value-returning `async` is no longer silent
 
 `async u32 compute() { yield; return 42; }` compiles, runs, finalises its state

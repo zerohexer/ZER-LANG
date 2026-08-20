@@ -20501,11 +20501,20 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * ZER emits as a real C `const` var) does not. NODE_FIELD is skipped
              * to avoid over-rejecting an enum constant (State.x) which IS a C
              * constant but which eval_const_expr can't see (checker.c:2768). */
-            if (ginit->kind == NODE_INTRINSIC && ginit->intrinsic.arg_count >= 1 &&
-                ginit->intrinsic.args[0] &&
-                ginit->intrinsic.args[0]->kind != NODE_FIELD) {
+            if (ginit->kind == NODE_INTRINSIC) {
                 const char *gn = ginit->intrinsic.name;
                 uint32_t gl = (uint32_t)ginit->intrinsic.name_len;
+                /* The bit-query check below inspects args[0], so it needs an
+                 * argument to look at. The "does not lower to a constant" check
+                 * further down does NOT — it depends only on the intrinsic's
+                 * NAME. It used to live inside this same `arg_count >= 1` guard
+                 * and therefore never ran for a ZERO-ARG intrinsic, which is
+                 * every runtime CPU query. `const u32 G = @cpu_model_id();`
+                 * sailed past the checker and was stopped only by GCC. The
+                 * precondition now scopes just the check that needs it. */
+                bool has_inspectable_arg =
+                    ginit->intrinsic.arg_count >= 1 && ginit->intrinsic.args[0] &&
+                    ginit->intrinsic.args[0]->kind != NODE_FIELD;
                 int is_bitq =
                     (gl == 8 && memcmp(gn, "popcount", 8) == 0) ||
                     (gl == 3 && memcmp(gn, "ctz", 3) == 0) ||
@@ -20515,7 +20524,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     (gl == 7 && (memcmp(gn, "bswap16", 7) == 0 ||
                                  memcmp(gn, "bswap32", 7) == 0 ||
                                  memcmp(gn, "bswap64", 7) == 0));
-                if (is_bitq &&
+                if (has_inspectable_arg && is_bitq &&
                     eval_const_expr(ginit->intrinsic.args[0]) == CONST_EVAL_FAIL) {
                     checker_error(c, decl->loc.line,
                         "global variable '%.*s' initializer must be a compile-time "
@@ -20555,7 +20564,40 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
                     }
                 }
+                /* 2026-08-20: the list above covered SIX names. Probing every
+                 * intrinsic the checker knows (141) in a global-initializer
+                 * position and compiling the emitted C found ELEVEN MORE that
+                 * the checker ACCEPTED and GCC then rejected — so `zerc f.zer
+                 * -o out.c` exited 0 for a program that cannot be compiled.
+                 *
+                 * They are the RUNTIME reads: a value that only exists while the
+                 * program is running cannot be a file-scope initializer. The
+                 * emitter already knew (it emits an undeclared
+                 * `__zer_intrinsic_X_unsupported_in_constant_context` so GCC
+                 * errors loudly — BUG-767), but that knowledge lived in a
+                 * FALL-THROUGH at the end of emit_expr's intrinsic chain rather
+                 * than in a predicate the checker could ask.
+                 *
+                 * A hand-maintained list is what let this drift once already, so
+                 * `tests/test_global_init_matrix.c` now derives the intrinsic set
+                 * FROM THE COMPILER and asserts, for every one of them, that the
+                 * checker's verdict agrees with GCC's. A new intrinsic that is
+                 * not constant-foldable is caught there without being added
+                 * here. */
+                int is_runtime_read =
+                    (gl == 6 && memcmp(gn, "expect", 6) == 0) ||
+                    (gl == 6 && memcmp(gn, "cpu_id", 6) == 0) ||
+                    (gl == 9 && memcmp(gn, "port_in16", 9) == 0) ||
+                    (gl == 9 && memcmp(gn, "port_in32", 9) == 0) ||
+                    (gl == 8 && memcmp(gn, "port_in8", 8) == 0) ||
+                    (gl == 12 && memcmp(gn, "cpu_model_id", 12) == 0) ||
+                    (gl == 11 && memcmp(gn, "cpu_core_id", 11) == 0) ||
+                    (gl == 13 && memcmp(gn, "cpu_num_cores", 13) == 0) ||
+                    (gl == 16 && memcmp(gn, "cpu_current_mode", 16) == 0) ||
+                    (gl == 18 && memcmp(gn, "cpu_get_priv_level", 18) == 0) ||
+                    (gl == 19 && memcmp(gn, "cpu_cache_line_size", 19) == 0);
                 int is_nonconst_emit =
+                    is_runtime_read ||
                     (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
                     (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
                     (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||

@@ -112,3 +112,4 @@ test_modules/use_defs
 test_modules/use_types
 tests/zer_fail/probe_disabled_mode
 tests/zer_fail/spawn_volatile_wide_store_tear
+test_global_init_matrix

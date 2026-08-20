@@ -736,9 +736,23 @@ plan is abandoned halfway, everything landed so far still improved the compiler.
 
 ### Phase 0 — wire `vrp_ir.c` (prerequisite, small, high value)
 
-**Why first:** it is 349 lines, already written, retires a CRITICAL live under-rejection,
-and is the first real migration of a flow class onto the CFG. It proves the migration
-pattern on the smallest possible surface before anything depends on it.
+> **RE-MEASURED 2026-08-20 — THE HEADLINE JUSTIFICATION BELOW IS STALE. READ THIS FIRST.**
+> "Retires a CRITICAL live under-rejection" was true when written; it is not true now. The
+> under-rejection is BH-18 #2, **fixed 2026-06-26**. Probed across 13 shapes — all 8
+> control-flow join kinds in the NARROWING direction plus 5 WIDENING shapes — the post-join
+> index is auto-guarded in every one, with no OOB under ASan. Phase 0's exit criterion
+> *"the flat-pass scope-leak reproducer rejected"* therefore **cannot be met: there is no
+> live reproducer left**, and a session following this text literally will hunt a fixed bug.
+> The class is now gated by `tests/test_vrp_join_matrix.c` (32 cells, in `make check`,
+> verified to fire by disabling the NODE_IF range restore). What survives is the
+> ARCHITECTURAL reason — bounds cannot join the product while it is not in the binary —
+> which lowers this phase's priority without changing its correctness. Full measurement:
+> `docs/limitations.md` "OPEN — `vrp_ir.c` orphan: Phase 0's premise is STALE".
+
+**Why first:** it is 349 lines, already written, ~~retires a CRITICAL live
+under-rejection~~ (see the box above), and is the first real migration of a flow class onto
+the CFG. It proves the migration pattern on the smallest possible surface before anything
+depends on it.
 
 **Work:** add to the Makefile; reconcile its interface with the flat pass; run both in
 parallel behind an env flag and diff their verdicts across the whole test corpus; then cut

@@ -2,13 +2,40 @@
  * ZER VRP on IR — Value Range Propagation on basic blocks
  *
  * Tracks {min, max, known_nonzero} per LOCAL id per basic block.
- * Merges at join points (intersect ranges from predecessors).
- * Replaces the checker's manual VarRange tracking.
+ * Merges at join points by taking the UNION (join/LUB) of the predecessors'
+ * ranges — see ir_merge_ranges.
  *
  * Phase 7 of IR implementation. See docs/IR_Implementation.md Part 6.
  *
- * Status: FOUNDATION — core range tracking framework. Does NOT yet
- * replace the AST VRP. Both coexist during migration.
+ * ============================================================================
+ * STATUS (re-measured 2026-08-20): THIS FILE IS NOT COMPILED.
+ *
+ *     grep -c vrp_ir Makefile   -> 0
+ *     nm zerc | grep -ci vrp_ir -> 0
+ *
+ * `vrp_ir()` and `vrp_ir_free()` have ZERO callers. Every load-bearing bounds
+ * and division range check in the shipping compiler is the AST VRP in
+ * checker.c. Nothing below runs. Do not read this file as coverage.
+ *
+ * Wiring it is Phase 0 of docs/unified-oracle-proved-ZER.md. NOTE, before you
+ * act on that plan: its stated justification — "the flat AST pass has a known
+ * live under-rejection (a branch-local narrowing leaks past a control-flow
+ * join)" — was RE-MEASURED on 2026-08-20 and does NOT reproduce. That was
+ * BH-18 #2, fixed 2026-06-26. The post-join index is auto-guarded at all eight
+ * control-flow join kinds, in both the narrowing and the widening direction,
+ * and `tests/test_vrp_join_matrix.c` now gates all 32 of those cells (verified
+ * to fire by disabling the NODE_IF range restore). So the remaining case for
+ * wiring this file is ARCHITECTURAL (bounds is one of the five factors and
+ * cannot join a product while it is not in the binary), not a live bug — which
+ * changes its priority, not its correctness.
+ *
+ * TWO COMMENTS IN THIS FILE USED TO SAY THE MERGE "INTERSECTS". They were
+ * wrong, and dangerously so: intersecting predecessor ranges at a join is
+ * UNSOUND (it yields a range narrower than reality, which proves out-of-bounds
+ * indices safe — exactly the BH-18 #2 failure). The CODE was always correct and
+ * takes the union; only the prose diverged. Corrected here so that nobody
+ * "fixes" the code to match the comment.
+ * ============================================================================
  */
 
 #include "ir.h"
@@ -100,7 +127,12 @@ static bool ir_range_proves_nonzero(IRRangeState *rs, int local_id) {
  * Merge at Join Points
  *
  * At a block with multiple predecessors, merge ranges:
- * - Both valid + overlap → intersect (wider range)
+ * - All predecessors valid → UNION (min of mins, max of maxes). The union is
+ *   the only sound direction: a value reaching this block may have come from
+ *   ANY predecessor, so the range must cover all of them. Intersecting would
+ *   produce a range narrower than reality and prove OOB indices safe.
+ * - Any predecessor missing a range → the merged range is invalid (unknown),
+ *   which is the conservative answer.
  * - One valid, one invalid → invalid (conservative)
  * - Both address_taken → address_taken
  * ================================================================ */

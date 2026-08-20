@@ -78,3 +78,4 @@ rust_tests/rt_task_alloc_free
 rust_tests/rt_task_alloc_free_cycle
 test_defer_goto_matrix
 test_view_alias_matrix
+test_vrp_join_matrix

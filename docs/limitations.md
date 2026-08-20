@@ -420,6 +420,54 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — `vrp_ir.c` orphan: Phase 0's premise is STALE (re-measured 2026-08-20)
+
+`vrp_ir.c` is still not compiled — `grep -c vrp_ir Makefile` = 0, `nm zerc | grep -ci vrp_ir`
+= 0, `vrp_ir()`/`vrp_ir_free()` have zero callers. That part of the ledger is unchanged.
+
+**What IS new: the justification for wiring it does not reproduce.**
+`docs/unified-oracle-proved-ZER.md` §3.2 / Phase 0 says the flat AST pass has *"a known
+live under-rejection (a branch-local narrowing leaks past a control-flow join; the compiler
+then proves an OOB index safe and emits no bounds check)"* and prices Phase 0 as *"retires a
+CRITICAL live under-rejection"*. That was BH-18 #2, **fixed 2026-06-26**. Probed 2026-08-20
+across 13 shapes — 8 control-flow join kinds in the NARROWING direction (if / if-else /
+while / for / do-while / switch-arm / goto-label / nested-if) plus 5 in the WIDENING
+direction (branch assignment, else-branch assignment, loop-carried increment, switch-arm
+assignment, write through a pointer param) — **every one is auto-guarded**; ASan reports no
+OOB in any of them. The emitted form is `if ((size_t)(i) >= 4u) { return 0; }` at the
+post-join use, with the in-branch use correctly left unguarded.
+
+So the remaining case for wiring `vrp_ir.c` is **architectural** (bounds is one of the five
+factors and cannot join a product while it is not in the binary), not a live bug. That
+changes its PRIORITY, not its correctness. Phase 0's exit criterion *"the flat-pass
+scope-leak reproducer rejected"* can no longer be met, because there is no such live
+reproducer — a fresh session following the plan literally will hunt a fixed bug.
+
+**Two things landed instead of a speculative wiring:**
+1. **The gate that was missing.** CLAUDE.md's multi-site table listed this class as *"NO
+   auto-gate — checklist every control-flow kind"*. `tests/test_vrp_join_matrix.c` (32
+   cells: 8 join kinds x narrow/widen x hazard/control) is now in `make check`. **Verified
+   to fire**, not merely to pass: disabling the NODE_IF range restore behind an env flag
+   reproduced BH-18 #2 exactly (the guard vanished) and the grid reported 30/32 with the two
+   `if`-shaped cells naming the leak. It also localised the defect to the injected kind,
+   which is the property that makes it useful for a *missing* kind.
+2. **A correction inside `vrp_ir.c` itself.** Its header said the merge *"intersect[s]
+   ranges from predecessors"* and an inline comment repeated it. Intersecting at a join is
+   **unsound** — narrower than reality, which is precisely how BH-18 #2 proved an OOB index
+   safe. The code was always right (it unions); only the prose diverged. Left uncorrected,
+   the single most likely accident when wiring this file is someone making the code match
+   its own comment.
+
+**Still open, and an owner call:** whether to wire it (Phase 0, now without its headline
+justification) or delete it. 349 lines that are not compiled but read as coverage are the
+false-confidence shape this ledger exists to prevent; the file now says so in its own
+header, which bounds the damage until the decision is made.
+
+**Do not re-derive the "13 shapes are clean" measurement** — re-run the grid instead:
+`make test_vrp_join_matrix && ./test_vrp_join_matrix`.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a

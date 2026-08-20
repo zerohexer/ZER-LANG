@@ -5,6 +5,104 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20 — BUG-802/803: the comptime interpreter answered a different question than the emitted code
+
+Found by a differential probe: evaluate the SAME expression at compile time and at
+runtime in one program, and compare. Both bugs are silent value-correctness
+divergences — no diagnostic at either end, on hosted or bare-metal.
+
+### BUG-802 — comptime interpreter evaluated in int64 with NO declared width
+
+```zer
+comptime u32 f() { u8 x = 200; u8 y = 100; return x + y; }
+```
+folded to **300**. The identical expression at runtime computes **44**, because
+the checker types `u8 + u8` as `u8` and the emitter masks to 8 bits. `ComptimeParam`
+carried only an `int64_t value` — no width — so nothing in the interpreter could
+wrap.
+
+Not merely a wrong number. Four measured manifestations, all silent:
+
+| manifestation | before | correct |
+|---|---|---|
+| value | 300 | 44 |
+| `comptime if (f() > 255)` | took the `then` branch, **discarding the other entirely** | `else` |
+| `static_assert(f() == 44, …)` | **failed** on a true assertion | passes |
+| `comptime u32 N(){u8 c=0; return c-1;}` as an array size | `uint8_t buf[4294967295]` (4 GB) | `buf[255]` |
+
+The `comptime if` case is the worst: conditional compilation selected the wrong
+code and threw the right code away. On bare-metal that silently picks the wrong
+driver path with nothing to observe.
+
+**This was a MULTI-SITE class, not a one-off.** The comptime *return*-type width
+was already masked (`check_expr` NODE_CALL, 2026-04-21 Gemini audit) with this
+exact rationale in its comment — *"ZER semantics: integer overflow WRAPS at the
+declared type's width"*. The same question at the *operand* sites was never
+answered. That is the shape CLAUDE.md calls the #1 recurring bug class.
+
+**Fix — one shared wrapper, every binding site.** New `ct_wrap_to_width()`; the
+pre-existing return-mask site now calls it too, so the two ends cannot drift.
+`ComptimeParam` gains `width`/`is_signed`; `ct_typenode_width()` reads the declared
+width straight off the syntactic TypeNode (including native `uN`/`iN` via
+`parse_intn_width`). Width is threaded through the evaluator by
+`eval_const_expr_subst_w()`; the old `eval_const_expr_subst()` is a wrapper, so no
+existing call site changed.
+
+Binding sites covered — enumerated, not just the reported one: var-decl locals,
+parameters (**all three** `cparams` construction sites), for-init, loop
+accumulators / compound assignment (`ct_ctx_set` re-wraps on every update), array
+elements (read and write), and nested comptime calls (the inner return width now
+applies before the outer call consumes it).
+
+**Join rule measured, not assumed** — a probe printed the runtime answers first:
+`u8+u8`=8 bits, `u8+u32`=32, `u8+u16`=16, `u8*3`=8, `3*u8`=8, `i8+i8`=8 signed.
+So: result width = max(operand widths); an untyped literal has width 0 and takes
+the other operand's width; a shift takes the LEFT operand's width; a
+comparison/logical result is a bool and is never wrapped.
+
+**Sound-by-construction fallback:** any type whose width is not readable off the
+syntax (user typedef, `usize`, float, pointer, container) gets width 0 = *do not
+wrap* = exactly the pre-fix behaviour. An unrecognised type can only keep the old
+answer, never invent a new one.
+
+### BUG-803 — compound assignment to a comptime ARRAY element dropped the operator
+
+Found *by the regression test for BUG-802*, not reported. The array-element branch
+of `ct_eval_assign` stored `asgn->assign.value` directly and never looked at
+`asgn->assign.op`:
+
+```zer
+comptime u32 f() { u8[1] v; u8 h = 10; v[0] = h; v[0] += h; return v[0]; }  // folded to 10, not 20
+comptime u32 g() { u32[1] v; v[0] = 5; v[0] *= 4; return v[0]; }            // folded to 4, not 20
+```
+
+The scalar branch two dozen lines below had the full operator switch. Same
+one-question-two-sites shape. Fixed by extracting `ct_apply_assign_op()` and
+calling it from BOTH branches — the duplicate switch is gone, so they cannot
+answer differently again.
+
+### Test
+
+`tests/zer/comptime_width_wrap_all_forms.zer` — one positive covering every
+binding form, each expectation derived from the type's modulus AND cross-checked
+against the runtime computation of the identical expression in the same program
+(so it fails whichever side moves). Includes the over-rejection controls that a
+too-eager mask would break (`u8+u32`→400, `u8+u16`→60200, `u32+u32`→140000, a
+comparison staying a bool) and the array sized by a wrapping comptime expression.
+**Verified to discriminate**: exit 1 on a from-HEAD pre-fix build, exit 0 after;
+the emitted array declaration goes `uint8_t sized[4294967295]` → `uint8_t sized[255]`.
+
+`make check` exit 0, all six gates ran, 1249 ZER tests.
+
+### Process note
+
+The walker-default audit **caught my own violation** mid-fix: `ct_typenode_width`
+was first written with a `default:` in a `switch (tn->kind)`. Enumerated all 21
+remaining TypeNode kinds explicitly so a new integer-like kind trips `-Wswitch`
+rather than silently falling into "width 0". The gate works.
+
+---
+
 ## Session 2026-08-17b — BUG-796..801: the remaining 13 harvested holes (39/39 closed)
 
 Six independent classes, the ones the five structural fixes did not collapse.

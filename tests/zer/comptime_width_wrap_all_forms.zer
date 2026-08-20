@@ -1,0 +1,158 @@
+// Comptime-interpreter WIDTH WRAP across every binding form (2026-08-20).
+//
+// WHY THIS EXISTS. The comptime interpreter evaluated every expression in
+// host int64 with no notion of the declared width, while the checker and the
+// emitter both wrap at it. So the SAME source expression answered differently
+// depending on WHEN it was evaluated:
+//
+//     u8 x = 200; u8 y = 100; x + y      comptime -> 300      runtime -> 44
+//
+// That is not merely a wrong number. Measured manifestations, all silent:
+//   * `comptime if (f() > 255)` selected the WRONG BRANCH and discarded the
+//     other one, so conditional compilation picked the wrong code.
+//   * `static_assert(f() == 44, ...)` FAILED on a true assertion.
+//   * `comptime u32 N(){ u8 c = 0; return c - 1; }` used as an array size
+//     emitted `uint8_t buf[4294967295]` (4 GB) instead of `buf[255]`.
+//
+// This is a MULTI-SITE class, not a one-off: the comptime RETURN-type width
+// was already masked (check_expr NODE_CALL, 2026-04-21 Gemini audit) with this
+// exact rationale. The same question at the OPERAND sites — locals, params,
+// loop accumulators, nested calls — was never answered. Both ends now call the
+// one shared ct_wrap_to_width().
+//
+// EVERY expectation below is derived from the type's modulus and cross-checked
+// against the RUNTIME computation of the identical expression in the same
+// program — never from observed compiler output. If the two ever disagree
+// again, this test fails regardless of which side moved.
+//
+// Values are laundered through `volatile` on the runtime side so the runtime
+// arm cannot itself be constant-folded into the comptime arm's answer.
+
+comptime u32 ct_add()   { u8 x = 200; u8 y = 100; return x + y; }   // 300 mod 256 = 44
+comptime u32 ct_shift() { u8 x = 200; return x << 4; }              // 3200 mod 256 = 128
+comptime u32 ct_mul()   { u8 x = 200; return x * 3; }               // 600 mod 256 = 88
+comptime u32 ct_not()   { u8 x = 0;   return ~x; }                  // ~0 in 8 bits = 255
+comptime u32 ct_sub()   { u8 c = 0;   return c - 1; }               // 0-1 in 8 bits = 255
+
+// --- form: PARAMETER width (the argument wraps into the declared param type) ---
+comptime u32 p_add(u8 a, u8 b) { return a + b; }
+comptime u32 p_mul(u8 a)       { return a * 3; }
+
+// --- form: LOOP ACCUMULATOR width (ct_ctx_set re-wraps on every update) ---
+comptime u32 l_acc() { u8 s = 0; for (u32 i = 0; i < 300; i += 1) { s += 1; } return s; }
+
+// --- form: COMPOUND ASSIGNMENT on a narrow local ---
+comptime u32 c_compound() { u8 s = 200; s += 100; return s; }
+comptime u32 c_shleq()    { u8 s = 200; s <<= 4;  return s; }
+
+// --- form: SIGNED widths (mask must SIGN-EXTEND, not zero-extend) ---
+comptime i32 s_i8()  { i8 x = 100; i8 y = 100; return x + y; }      // 200 -> -56
+comptime i32 s_i8n() { i8 x = -128; return -x; }                    // 128 -> -128
+comptime i32 s_u16() { u16 x = 60000; u16 y = 10000; return x + y; } // 70000 mod 65536 = 4464
+
+// --- form: ARRAY ELEMENT width (the binding carries the ELEMENT type, so a
+//     write wraps into it and a read reports it) ---
+comptime u32 a_elem() { u8[2] v; v[0] = 200; v[1] = 100; return v[0] + v[1]; }
+// a compound store into an element must wrap at the ELEMENT width, not int64.
+// (A direct `v[0] = 300` is not expressible: the checker rejects the implicit
+// u32->u8 narrowing, which is why the store has to be built arithmetically.)
+comptime u32 a_store() { u8[1] v; u8 h = 200; v[0] = h; v[0] += h; return v[0]; } // 400 mod 256 = 144
+
+// --- form: NESTED comptime call (the inner call's RETURN width must apply
+//     before the outer one consumes it) ---
+comptime u8  n_inner(u8 a, u8 b) { return a + b; }
+comptime u32 n_outer()           { return n_inner(200, 100); }
+
+// --- OVER-REJECTION BOUNDARY: wrapping must happen at the JOINED width, so a
+//     wider operand still wins and nothing narrower is imposed. These are the
+//     controls that a too-eager mask would break. ---
+comptime u32 w_mix32() { u8 a = 200; u32 b = 200;   return a + b; }  // 32-bit: 400
+comptime u32 w_mix16() { u8 a = 200; u16 b = 60000; return a + b; }  // 16-bit: 60200
+comptime u32 w_wide()  { u32 a = 70000; u32 b = 70000; return a + b; } // 140000, no wrap
+comptime u32 w_cmp()   { u8 a = 200; u8 b = 100; if (a + b > 255) { return 1; } return 0; }
+
+// An array size derived from a wrapping comptime expression. Pre-fix this
+// declared 4294967295 bytes; the correct size is 255, which is what indexing
+// element 254 below proves.
+u8[ct_sub()] sized;
+
+u32 main() {
+    // Runtime counterparts of the exact same expressions.
+    volatile u32 g200 = 200; volatile u32 g100 = 100; volatile u32 g0 = 0;
+    volatile u32 g60k = 60000; volatile u32 g10k = 10000; volatile u32 g70k = 70000;
+    volatile i32 gi100 = 100; volatile i32 gim128 = -128;
+
+    u8  x = @truncate(u8,  g200); u8  y = @truncate(u8,  g100);
+    u8  z = @truncate(u8,  g0);
+    u16 p = @truncate(u16, g60k); u16 q = @truncate(u16, g10k);
+    i8  a = @truncate(i8,  gi100); i8 m = @truncate(i8, gim128);
+    u32 wide200 = g200;    // u32 holding 200 — the wider operand in the mix test
+    u32 wide70k = g70k;
+
+    // ---- comptime vs runtime must AGREE, expression by expression ----
+    if (ct_add()   != x + y)  { return 1; }
+    if (ct_shift() != x << 4) { return 2; }
+    if (ct_mul()   != x * 3)  { return 3; }
+    if (ct_not()   != ~z)     { return 4; }
+    if (ct_sub()   != z - 1)  { return 5; }
+
+    // ---- and each must equal the value the modulus predicts ----
+    if (ct_add()   != 44)  { return 10; }
+    if (ct_shift() != 128) { return 11; }
+    if (ct_mul()   != 88)  { return 12; }
+    if (ct_not()   != 255) { return 13; }
+    if (ct_sub()   != 255) { return 14; }
+
+    // ---- parameters ----
+    if (p_add(200, 100) != x + y) { return 20; }
+    if (p_add(200, 100) != 44)    { return 21; }
+    if (p_mul(200)      != x * 3) { return 22; }
+
+    // ---- loop accumulator: 300 increments of a u8 ----
+    u8 s = 0;
+    for (u32 i = 0; i < 300; i += 1) { s += 1; }
+    if (l_acc() != s)  { return 30; }
+    if (l_acc() != 44) { return 31; }
+
+    // ---- compound assignment ----
+    u8 cs = x; cs += y;
+    if (c_compound() != cs) { return 40; }
+    if (c_compound() != 44) { return 41; }
+    u8 sh = x; sh <<= 4;
+    if (c_shleq() != sh)  { return 42; }
+    if (c_shleq() != 128) { return 43; }
+
+    // ---- signed ----
+    if (s_i8()  != a + a) { return 50; }
+    if (s_i8()  != -56)   { return 51; }
+    if (s_i8n() != -m)    { return 52; }
+    if (s_u16() != p + q) { return 53; }
+    if (s_u16() != 4464)  { return 54; }
+
+    // ---- array elements ----
+    u8[2] ra; ra[0] = x; ra[1] = y;
+    if (a_elem()  != ra[0] + ra[1]) { return 55; }
+    if (a_elem()  != 44)            { return 56; }
+    u8 rh = x; u8[1] rv; rv[0] = rh; rv[0] += rh;
+    if (a_store() != rv[0])         { return 57; }
+    if (a_store() != 144)           { return 58; }
+
+    // ---- nested call ----
+    if (n_outer() != 44) { return 60; }
+
+    // ---- over-rejection boundary: the WIDER operand still decides ----
+    if (w_mix32() != x + wide200)     { return 70; }
+    if (w_mix32() != 400)             { return 71; }
+    if (w_mix16() != x + p)           { return 72; }
+    if (w_mix16() != 60200)           { return 73; }
+    if (w_wide()  != wide70k + wide70k) { return 74; }
+    if (w_wide()  != 140000)          { return 75; }
+    // a comparison result is a bool: width 0, never wrapped to an operand width
+    if (w_cmp()   != 0)               { return 76; }
+
+    // ---- array sized by a wrapping comptime expression: 255 elements ----
+    sized[254] = 7;
+    if (sized[254] != 7) { return 80; }
+
+    return 0;
+}

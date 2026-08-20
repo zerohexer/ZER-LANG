@@ -705,6 +705,13 @@ ir_lower.c:if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared) return ne
 # array var-decl). A NEW TYNODE dispatch must resolve-then-check or be
 # justified here.
 checker.c:(tn->container.type_arg->kind == TYNODE_CONST ||
+# ct_typenode_width (comptime interpreter wrapping width, 2026-08-20): peels the
+# declared qualifiers off a SYNTACTIC type node before reading its primitive
+# width. Deliberately does NOT resolve — it runs during resolve_type for array
+# sizes, before user typedefs are necessarily resolvable — and every
+# unrecognised kind returns width 0 ("do not wrap" = the pre-fix behaviour), so
+# a missed resolution can only keep the old answer, never invent a new one.
+checker.c:while (tn && (tn->kind == TYNODE_CONST || tn->kind == TYNODE_VOLATILE))
 checker.c:if (stmt->var_decl.type && stmt->var_decl.type->kind == TYNODE_ARRAY) {
 checker.c:if (tn->kind == TYNODE_NAMED &&
 checker.c:sf->is_volatile = (fd->type && fd->type->kind == TYNODE_VOLATILE);

@@ -2836,6 +2836,12 @@ typedef struct {
     int64_t value;
     int64_t *array_values;  /* non-NULL for array bindings */
     int array_size;         /* element count (0 = scalar) */
+    /* Declared integer width of the binding, for ZER's wrapping semantics.
+     * 0 = untyped/unknown (evaluate in full int64 — the pre-2026-08-20
+     * behaviour, which is what a non-integer or unresolvable type gets).
+     * See ct_wrap_to_width / ct_typenode_width. */
+    uint16_t width;
+    uint8_t  is_signed;
 } ComptimeParam;
 
 /* Mutable comptime evaluation context — shared across block/loop boundaries.
@@ -2873,12 +2879,32 @@ static void ct_ctx_free(ComptimeCtx *ctx) {
     if (ctx->locals != ctx->stack) free(ctx->locals);
 }
 
+/* Wrap `val` to a declared integer width, matching ZER's runtime semantics
+ * (overflow WRAPS at the declared width; a signed type sign-extends).
+ * width 0 or >= 64 means "untyped / full precision" — returned unchanged.
+ *
+ * This is the SHARED wrapper for the comptime interpreter. The comptime
+ * RETURN-type mask (check_expr NODE_CALL, added by the 2026-04-21 Gemini
+ * audit) applies the same rule at the other end of the same question and
+ * now calls this helper, so the two sites cannot drift apart. */
+static int64_t ct_wrap_to_width(int64_t val, int width, bool is_signed) {
+    if (width <= 0 || width >= 64) return val;
+    uint64_t mask = (1ULL << width) - 1ULL;
+    val = (int64_t)((uint64_t)val & mask);
+    if (is_signed && (val & (1LL << (width - 1))))
+        val |= (int64_t)(~mask);
+    return val;
+}
+
 static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, int64_t value) {
-    /* update existing */
+    /* update existing — the DECLARED width is a property of the binding, so it
+     * survives assignment; the stored value is re-wrapped to it (`u8 s; s += 1`
+     * must wrap at 8 bits on every iteration, not only at the declaration). */
     for (int i = 0; i < ctx->count; i++) {
         if (ctx->locals[i].name_len == name_len &&
             memcmp(ctx->locals[i].name, name, name_len) == 0) {
-            ctx->locals[i].value = value;
+            ctx->locals[i].value = ct_wrap_to_width(value, ctx->locals[i].width,
+                                                    ctx->locals[i].is_signed != 0);
             return;
         }
     }
@@ -2897,7 +2923,27 @@ static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, in
     ctx->locals[ctx->count].value = value;
     ctx->locals[ctx->count].array_values = NULL;
     ctx->locals[ctx->count].array_size = 0;
+    ctx->locals[ctx->count].width = 0;
+    ctx->locals[ctx->count].is_signed = 0;
     ctx->count++;
+}
+
+/* Declare a comptime local WITH its source-declared integer width, then store
+ * the (wrapped) value. Used at the sites that know the declared type: var-decl,
+ * for-init and comptime-function parameters. */
+static void ct_ctx_set_typed(ComptimeCtx *ctx, const char *name, uint32_t name_len,
+                             int64_t value, int width, bool is_signed) {
+    ct_ctx_set(ctx, name, name_len, value);
+    for (int i = 0; i < ctx->count; i++) {
+        if (ctx->locals[i].name_len == name_len &&
+            memcmp(ctx->locals[i].name, name, name_len) == 0) {
+            ctx->locals[i].width = (uint16_t)(width > 0 && width < 64 ? width : 0);
+            ctx->locals[i].is_signed = is_signed ? 1u : 0u;
+            /* re-wrap: ct_ctx_set stored it under the OLD (possibly absent) width */
+            ctx->locals[i].value = ct_wrap_to_width(value, ctx->locals[i].width, is_signed);
+            return;
+        }
+    }
 }
 
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx);
@@ -3015,6 +3061,71 @@ static bool parse_intn_width(const char *name, uint32_t len,
     *out_bits = bits;
     *out_signed = (name[0] == 'i');
     return true;
+}
+
+/* Declared integer width (bits) + signedness of a SYNTACTIC type node, for the
+ * comptime interpreter's wrapping semantics.
+ *
+ * Returns 0 for anything that is not a fixed-width integer we can read straight
+ * off the syntax — a named typedef, a pointer, a float, `usize`, a container.
+ * Width 0 means "do not wrap", i.e. exactly the pre-fix full-precision
+ * behaviour, so an unrecognised type can only ever keep the old answer and
+ * never invent a new one. Deliberately does NOT resolve names through a scope:
+ * this runs during resolve_type for array sizes, before user typedefs are
+ * necessarily resolvable, and a wrong width here would be a silent miscompile
+ * rather than a missed narrowing. */
+static int ct_typenode_width(TypeNode *tn, bool *out_signed) {
+    *out_signed = false;
+    while (tn && (tn->kind == TYNODE_CONST || tn->kind == TYNODE_VOLATILE))
+        tn = tn->qualified.inner;
+    if (!tn) return 0;
+    switch (tn->kind) {
+    case TYNODE_U8:  return 8;
+    case TYNODE_U16: return 16;
+    case TYNODE_U32: return 32;
+    case TYNODE_U64: return 64;   /* >= 64 → ct_wrap_to_width leaves it alone */
+    case TYNODE_I8:  *out_signed = true; return 8;
+    case TYNODE_I16: *out_signed = true; return 16;
+    case TYNODE_I32: *out_signed = true; return 32;
+    case TYNODE_I64: *out_signed = true; return 64;
+    case TYNODE_NAMED: {
+        /* native arbitrary-width uN/iN spell as a bare name (u3, i48, ...) */
+        uint32_t bits = 0; bool sgn = false;
+        if (parse_intn_width(tn->named.name, (uint32_t)tn->named.name_len, &bits, &sgn)) {
+            *out_signed = sgn;
+            return (int)bits;
+        }
+        return 0;   /* a user typedef/struct/enum name — not width-resolvable here */
+    }
+    /* Everything below has NO fixed integer width we may wrap at. Enumerated
+     * rather than defaulted so -Wswitch (and tools/walker_default_audit.sh)
+     * force a decision when a new TypeNodeKind is added — a new integer-like
+     * kind silently falling into "width 0" is precisely the miscompile this
+     * function exists to remove. */
+    case TYNODE_USIZE:      /* target-dependent width; resolve_type owns it */
+    case TYNODE_F32: case TYNODE_F64:
+    case TYNODE_BOOL: case TYNODE_VOID: case TYNODE_OPAQUE:
+    case TYNODE_POINTER: case TYNODE_OPTIONAL: case TYNODE_SLICE:
+    case TYNODE_ARRAY: case TYNODE_FUNC_PTR:
+    case TYNODE_POOL: case TYNODE_RING: case TYNODE_ARENA:
+    case TYNODE_BARRIER: case TYNODE_HANDLE: case TYNODE_SLAB:
+    case TYNODE_SEMAPHORE: case TYNODE_CONTAINER:
+    case TYNODE_CONST: case TYNODE_VOLATILE:  /* unwrapped above; unreachable */
+        return 0;
+    }
+    return 0;
+}
+
+/* Join rule for a binary operation's result width, matching what the checker
+ * types and the emitter masks at runtime (measured, not assumed):
+ *   u8+u8 -> 8, u8+u32 -> 32, u8+u16 -> 16, u8*3 -> 8, 3*u8 -> 8.
+ * An untyped literal has width 0 and contributes nothing, so it takes the
+ * other operand's width. Mixing signednesses of different widths is rejected
+ * by the checker before we get here; the wider operand decides the sign. */
+static int ct_join_width(int lw, bool ls, int rw, bool rs, bool *out_signed) {
+    if (lw >= rw) { *out_signed = (lw > 0) ? ls : rs; return lw; }
+    *out_signed = rs;
+    return rw;
 }
 
 static Type *resolve_type(Checker *c, TypeNode *tn) {
@@ -3155,6 +3266,13 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                         if (cv == CONST_EVAL_FAIL) { all_const = false; break; }
                         cparams[ci].name = fn->func_decl.params[ci].name;
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
+                        {   /* declared param width — see ct_typenode_width */
+                            bool _psg = false;
+                            int _pw = ct_typenode_width(fn->func_decl.params[ci].type, &_psg);
+                            cparams[ci].width = (uint16_t)(_pw > 0 && _pw < 64 ? _pw : 0);
+                            cparams[ci].is_signed = _psg ? 1u : 0u;
+                            cv = ct_wrap_to_width(cv, _pw, _psg);
+                        }
                         cparams[ci].value = cv;
                     }
                     if (all_const && fn->func_decl.body) {
@@ -3578,7 +3696,8 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
 static int _comptime_call_depth = 0;  /* recursion guard for nested comptime calls */
 /* _comptime_depth_exceeded / _comptime_diag_line declared at line ~1172
  * (forward-hoisted for resolve_type_inner — Gap 33). */
-static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params, int outer_count) {
+static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params, int outer_count,
+                                        int *out_w, bool *out_s) {
     if (!call || call->kind != NODE_CALL || !call->call.callee ||
         call->call.callee->kind != NODE_IDENT || !_comptime_global_scope)
         return CONST_EVAL_FAIL;
@@ -3621,7 +3740,14 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
         if (av == CONST_EVAL_FAIL) { if (need_free) free(cparams); _comptime_call_depth--; return CONST_EVAL_FAIL; }
         cparams[i].name = fn->func_decl.params[i].name;
         cparams[i].name_len = (uint32_t)fn->func_decl.params[i].name_len;
-        cparams[i].value = av;
+        /* a parameter has a DECLARED width — the argument wraps into it */
+        {
+            bool psgn = false;
+            int pw = ct_typenode_width(fn->func_decl.params[i].type, &psgn);
+            cparams[i].width = (uint16_t)(pw > 0 && pw < 64 ? pw : 0);
+            cparams[i].is_signed = psgn ? 1u : 0u;
+            cparams[i].value = ct_wrap_to_width(av, pw, psgn);
+        }
     }
     ComptimeCtx cctx;
     ct_ctx_init(&cctx, cparams, pc);
@@ -3629,17 +3755,36 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     ct_ctx_free(&cctx);
     if (need_free) free(cparams);
     _comptime_call_depth--;
+    /* A call's value has the callee's RETURN type, so it wraps at that width.
+     * check_expr applies this at the OUTERMOST call; without it here a NESTED
+     * call (`g(f(x))`) would carry an unwrapped intermediate into g. */
+    if (result != CONST_EVAL_FAIL) {
+        bool rsgn = false;
+        int rw = ct_typenode_width(fn->func_decl.return_type, &rsgn);
+        result = ct_wrap_to_width(result, rw, rsgn);
+        if (out_w) { *out_w = rw; *out_s = rsgn; }
+    }
     return result;
 }
 
-static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
+/* Value evaluator with the expression's declared integer WIDTH threaded out.
+ * `*out_w` is 0 for an untyped value (literal, bool, unresolvable), otherwise
+ * the declared bit width; `*out_s` is its signedness. Callers that do not care
+ * use the eval_const_expr_subst() wrapper below, so no existing call site had
+ * to change. */
+static int64_t eval_const_expr_subst_w(Node *n, ComptimeParam *params, int param_count,
+                                       int *out_w, bool *out_s) {
+    *out_w = 0; *out_s = false;
     if (!n) return CONST_EVAL_FAIL;
     /* substitute parameter references */
     if (n->kind == NODE_IDENT) {
         for (int i = 0; i < param_count; i++) {
             if (n->ident.name_len == params[i].name_len &&
-                memcmp(n->ident.name, params[i].name, params[i].name_len) == 0)
+                memcmp(n->ident.name, params[i].name, params[i].name_len) == 0) {
+                *out_w = (int)params[i].width;
+                *out_s = params[i].is_signed != 0;
                 return params[i].value;
+            }
         }
         return CONST_EVAL_FAIL;
     }
@@ -3655,6 +3800,8 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
                 int64_t idx = eval_const_expr_subst(n->index_expr.index, params, param_count);
                 if (idx == CONST_EVAL_FAIL || idx < 0 || idx >= params[i].array_size)
                     return CONST_EVAL_FAIL;
+                *out_w = (int)params[i].width;
+                *out_s = params[i].is_signed != 0;
                 return params[i].array_values[idx];
             }
         }
@@ -3683,33 +3830,51 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     if (n->kind == NODE_CALL) {
         static int _subst_depth = 0;
         if (++_subst_depth > 32) { _subst_depth--; return CONST_EVAL_FAIL; }
-        int64_t r = eval_comptime_call_subst(n, params, param_count);
+        int64_t r = eval_comptime_call_subst(n, params, param_count, out_w, out_s);
         _subst_depth--;
         return r;
     }
     if (n->kind == NODE_UNARY) {
-        int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
+        int vw = 0; bool vs = false;
+        int64_t v = eval_const_expr_subst_w(n->unary.operand, params, param_count, &vw, &vs);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
-        if (n->unary.op == TOK_MINUS) return -v;
-        if (n->unary.op == TOK_TILDE) return ~v;
+        /* `-x` / `~x` produce a value of the OPERAND's type, so they wrap at
+         * its width (`u8 z=0; ~z` is 255, not -1). `!x` is a bool. */
+        if (n->unary.op == TOK_MINUS) { *out_w = vw; *out_s = vs; return ct_wrap_to_width(-v, vw, vs); }
+        if (n->unary.op == TOK_TILDE) { *out_w = vw; *out_s = vs; return ct_wrap_to_width(~v, vw, vs); }
         if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
         return CONST_EVAL_FAIL;
     }
     if (n->kind == NODE_BINARY) {
-        int64_t l = eval_const_expr_subst(n->binary.left, params, param_count);
-        int64_t r = eval_const_expr_subst(n->binary.right, params, param_count);
+        int lw = 0, rw = 0; bool ls = false, rs = false;
+        int64_t l = eval_const_expr_subst_w(n->binary.left,  params, param_count, &lw, &ls);
+        int64_t r = eval_const_expr_subst_w(n->binary.right, params, param_count, &rw, &rs);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        bool js = false;
+        int jw = ct_join_width(lw, ls, rw, rs, &js);
+        /* An ARITHMETIC/BITWISE result carries the joined type, so it wraps at
+         * the joined width. A SHIFT result carries the LEFT operand's type (the
+         * right operand is a count, not a value). A COMPARISON/LOGICAL result is
+         * a bool — width 0, no wrapping. Without this the interpreter answered a
+         * different question than the emitted code: `u8 x=200,y=100; x+y` folded
+         * to 300 while the running program computed 44. */
         switch (n->binary.op) {
-        case TOK_PLUS:   return l + r;
-        case TOK_MINUS:  return l - r;
-        case TOK_STAR:   return l * r;
-        case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : l / r;
-        case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : l % r;
-        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : (int64_t)((uint64_t)l << r);
-        case TOK_RSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : l >> r;
-        case TOK_AMP:    return l & r;
-        case TOK_PIPE:   return l | r;
-        case TOK_CARET:  return l ^ r;
+        case TOK_PLUS:   *out_w = jw; *out_s = js; return ct_wrap_to_width(l + r, jw, js);
+        case TOK_MINUS:  *out_w = jw; *out_s = js; return ct_wrap_to_width(l - r, jw, js);
+        case TOK_STAR:   *out_w = jw; *out_s = js; return ct_wrap_to_width(l * r, jw, js);
+        case TOK_SLASH:  if (r == 0) return CONST_EVAL_FAIL;
+                         *out_w = jw; *out_s = js; return ct_wrap_to_width(l / r, jw, js);
+        case TOK_PERCENT: if (r == 0) return CONST_EVAL_FAIL;
+                         *out_w = jw; *out_s = js; return ct_wrap_to_width(l % r, jw, js);
+        case TOK_LSHIFT: if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+                         *out_w = lw; *out_s = ls;
+                         return ct_wrap_to_width((int64_t)((uint64_t)l << r), lw, ls);
+        case TOK_RSHIFT: if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+                         *out_w = lw; *out_s = ls;
+                         return ct_wrap_to_width(l >> r, lw, ls);
+        case TOK_AMP:    *out_w = jw; *out_s = js; return ct_wrap_to_width(l & r, jw, js);
+        case TOK_PIPE:   *out_w = jw; *out_s = js; return ct_wrap_to_width(l | r, jw, js);
+        case TOK_CARET:  *out_w = jw; *out_s = js; return ct_wrap_to_width(l ^ r, jw, js);
         case TOK_GT:     return l > r ? 1 : 0;
         case TOK_LT:     return l < r ? 1 : 0;
         case TOK_GTEQ:   return l >= r ? 1 : 0;
@@ -3724,8 +3889,36 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     return CONST_EVAL_FAIL;
 }
 
+static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
+    int w = 0; bool s = false;
+    return eval_const_expr_subst_w(n, params, param_count, &w, &s);
+}
+
 
 /* Evaluate a comptime assignment: compute RHS, apply operator, update ctx */
+/* Apply a ZER assignment operator to (cur, rhs). Shared by BOTH branches of
+ * ct_eval_assign — the scalar one and the array-element one. The array branch
+ * used to store `rhs` directly and never look at `assign.op`, so a comptime
+ * `v[0] += h` silently behaved as `v[0] = h` (measured: `v[0]=10; v[0]+=10`
+ * folded to 10). One applier means the two cannot answer differently again.
+ * Returns false when the operator is not a compound/simple assignment. */
+static bool ct_apply_assign_op(TokenType op, int64_t cur, int64_t rhs, int64_t *out) {
+    switch (op) {
+    case TOK_EQ:        *out = rhs; return true;
+    case TOK_PLUSEQ:    *out = cur + rhs; return true;
+    case TOK_MINUSEQ:   *out = cur - rhs; return true;
+    case TOK_STAREQ:    *out = cur * rhs; return true;
+    case TOK_SLASHEQ:   *out = rhs ? cur / rhs : 0; return true;
+    case TOK_PERCENTEQ: *out = rhs ? cur % rhs : 0; return true;
+    case TOK_LSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; return true;
+    case TOK_RSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? cur >> rhs : 0; return true;
+    case TOK_AMPEQ:     *out = cur & rhs; return true;
+    case TOK_PIPEEQ:    *out = cur | rhs; return true;
+    case TOK_CARETEQ:   *out = cur ^ rhs; return true;
+    default: return false;
+    }
+}
+
 static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
     if (!asgn || asgn->kind != NODE_ASSIGN) return CONST_EVAL_FAIL;
 
@@ -3742,7 +3935,13 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
             if (ctx->locals[k].name_len == alen &&
                 memcmp(ctx->locals[k].name, aname, alen) == 0 &&
                 ctx->locals[k].array_values && idx >= 0 && idx < ctx->locals[k].array_size) {
-                ctx->locals[k].array_values[idx] = rhs;
+                int64_t nv;
+                if (!ct_apply_assign_op(asgn->assign.op,
+                                        ctx->locals[k].array_values[idx], rhs, &nv))
+                    return CONST_EVAL_FAIL;
+                ctx->locals[k].array_values[idx] =
+                    ct_wrap_to_width(nv, (int)ctx->locals[k].width,
+                                     ctx->locals[k].is_signed != 0);
                 return 0;
             }
         }
@@ -3763,20 +3962,9 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
         }
     }
     int64_t newval;
-    switch (asgn->assign.op) {
-    case TOK_EQ:        newval = rhs; break;
-    case TOK_PLUSEQ:    newval = cur + rhs; break;
-    case TOK_MINUSEQ:   newval = cur - rhs; break;
-    case TOK_STAREQ:    newval = cur * rhs; break;
-    case TOK_SLASHEQ:   newval = rhs ? cur / rhs : 0; break;
-    case TOK_PERCENTEQ: newval = rhs ? cur % rhs : 0; break;
-    case TOK_LSHIFTEQ:  newval = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; break;
-    case TOK_RSHIFTEQ:  newval = (rhs >= 0 && rhs < 64) ? cur >> rhs : 0; break;
-    case TOK_AMPEQ:     newval = cur & rhs; break;
-    case TOK_PIPEEQ:    newval = cur | rhs; break;
-    case TOK_CARETEQ:   newval = cur ^ rhs; break;
-    default: return CONST_EVAL_FAIL;
-    }
+    if (!ct_apply_assign_op(asgn->assign.op, cur, rhs, &newval))
+        return CONST_EVAL_FAIL;
+    /* ct_ctx_set re-wraps into the binding's declared width */
     ct_ctx_set(ctx, name, nlen, newval);
     return 0; /* success (not a return value) */
 }
@@ -3874,7 +4062,7 @@ static Node *eval_comptime_struct_return(Arena *arena, Node *struct_init,
 
 /* Create an array binding in comptime context */
 static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_len,
-                              int64_t *values, int size) {
+                              int64_t *values, int size, int elem_width, bool elem_signed) {
     /* grow if needed */
     if (ctx->count >= ctx->capacity) {
         int nc = ctx->capacity * 2;
@@ -3890,6 +4078,10 @@ static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_l
     ctx->locals[ctx->count].value = 0;
     ctx->locals[ctx->count].array_values = values;
     ctx->locals[ctx->count].array_size = size;
+    /* for an array binding, width/is_signed describe the ELEMENT type — an
+     * element read reports it and an element write wraps into it */
+    ctx->locals[ctx->count].width = (uint16_t)(elem_width > 0 && elem_width < 64 ? elem_width : 0);
+    ctx->locals[ctx->count].is_signed = elem_signed ? 1u : 0u;
     ctx->count++;
 }
 
@@ -3917,8 +4109,10 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                     if (sz > 0 && sz <= 1024) {
                         int64_t *arr = (int64_t *)calloc((size_t)sz, sizeof(int64_t));
                         if (arr) {
+                            bool esgn = false;
+                            int ew = ct_typenode_width(stmt->var_decl.type->array.elem, &esgn);
                             ct_ctx_set_array(ctx, stmt->var_decl.name,
-                                (uint32_t)stmt->var_decl.name_len, arr, (int)sz);
+                                (uint32_t)stmt->var_decl.name_len, arr, (int)sz, ew, esgn);
                         }
                     }
                     continue;
@@ -3926,7 +4120,10 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 if (stmt->var_decl.init) {
                     int64_t val = eval_const_expr_subst(stmt->var_decl.init, ctx->locals, ctx->count);
                     if (val == CONST_EVAL_FAIL) { goto ct_done; }
-                    ct_ctx_set(ctx, stmt->var_decl.name, (uint32_t)stmt->var_decl.name_len, val);
+                    bool vsgn = false;
+                    int vw = ct_typenode_width(stmt->var_decl.type, &vsgn);
+                    ct_ctx_set_typed(ctx, stmt->var_decl.name,
+                        (uint32_t)stmt->var_decl.name_len, val, vw, vsgn);
                 }
                 continue;
             }
@@ -3945,8 +4142,10 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                     stmt->for_stmt.init->var_decl.init) {
                     int64_t val = eval_const_expr_subst(stmt->for_stmt.init->var_decl.init, ctx->locals, ctx->count);
                     if (val == CONST_EVAL_FAIL) { goto ct_done; }
-                    ct_ctx_set(ctx, stmt->for_stmt.init->var_decl.name,
-                        (uint32_t)stmt->for_stmt.init->var_decl.name_len, val);
+                    bool fsgn = false;
+                    int fw = ct_typenode_width(stmt->for_stmt.init->var_decl.type, &fsgn);
+                    ct_ctx_set_typed(ctx, stmt->for_stmt.init->var_decl.name,
+                        (uint32_t)stmt->for_stmt.init->var_decl.name_len, val, fw, fsgn);
                 }
                 {
                 /* GAP fix 2026-04-19: previously the 10k iter cap silently
@@ -7689,6 +7888,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         cparams[ci].name = fn->func_decl.params[ci].name;
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
+                        {   /* declared param width. ct_typenode_width returns 0 for
+                             * f32/f64, so a bit-punned float argument (above) is left
+                             * exactly as-is. */
+                            bool _psg = false;
+                            int _pw = ct_typenode_width(fn->func_decl.params[ci].type, &_psg);
+                            cparams[ci].width = (uint16_t)(_pw > 0 && _pw < 64 ? _pw : 0);
+                            cparams[ci].is_signed = _psg ? 1u : 0u;
+                            v = ct_wrap_to_width(v, _pw, _psg);
+                        }
                         cparams[ci].value = v;
                     }
                     /* SAFETY: zer_comptime_arg_valid in src/safety/comptime_rules.c (R02) */
@@ -7743,20 +7951,14 @@ static Type *check_expr(Checker *c, Node *node) {
                              * of leaking int64 values into the emitted C
                              * where GCC would truncate with warnings. */
                             if (ret_ty_check) {
-                                int w = type_width(ret_ty_check);
-                                if (w > 0 && w < 64) {
-                                    uint64_t mask = (1ULL << w) - 1ULL;
-                                    val = (int64_t)((uint64_t)val & mask);
-                                    /* SIGN-EXTEND for a signed return type: the mask
-                                     * above zero-extends, so a signed comptime result
-                                     * whose type-width sign bit is set (e.g. `comptime
-                                     * i16 F(){ return 40000; }` → -25536) stayed
-                                     * POSITIVE, silently flipping a `comptime if (F() <
-                                     * 0)` to the wrong branch (wrong code emitted). */
-                                    if (type_is_signed(ret_ty_check) &&
-                                        (val & (1LL << (w - 1))))
-                                        val |= (int64_t)(~mask);
-                                }
+                                /* Shared with the interpreter's operand wrapping
+                                 * (ct_wrap_to_width). The mask zero-extends, so a
+                                 * signed return type must sign-extend or `comptime
+                                 * i16 F(){ return 40000; }` (-25536) stays POSITIVE
+                                 * and silently flips `comptime if (F() < 0)` to the
+                                 * wrong branch. */
+                                val = ct_wrap_to_width(val, type_width(ret_ty_check),
+                                                       type_is_signed(ret_ty_check));
                             }
                             node->call.comptime_value = val;
                             node->call.is_comptime_resolved = true;

@@ -9,7 +9,16 @@
  * Post-fix: value-returning async emits `self->_zer_state = -1; return 1;`
  * (matching the void path). The user value is discarded — the poll
  * protocol is `int` done-flag; a separate value-retrieval mechanism would
- * be additive when needed. Idempotence is restored. */
+ * be additive when needed. Idempotence is restored.
+ *
+ * 2026-08-20: this file is EXPECTED to emit
+ *   "async function 'compute' returns a value, but the poll protocol has no
+ *    way to retrieve it"
+ * and is the only file in the tree that does. The warning exists because
+ * `async <non-void>` was neither rejected nor retrievable — a silent footgun.
+ * It is a WARNING rather than an error precisely so this regression guard
+ * keeps working: rejecting the shape would delete the guard along with the
+ * footgun. */
 u32 side;
 async u32 compute() {
     yield;

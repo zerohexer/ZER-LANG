@@ -17993,7 +17993,32 @@ static void check_func_body(Checker *c, Node *node) {
         bool saved_comptime = c->in_comptime_body;
         bool saved_async = c->in_async;
         if (node->func_decl.is_comptime) c->in_comptime_body = true;
-        if (node->func_decl.is_async) c->in_async = true;
+        if (node->func_decl.is_async) {
+            c->in_async = true;
+            /* A value-returning async has NO way to hand that value back. The
+             * poll protocol is an `int` done-flag, and the returned value lands
+             * in an internal temp (`self->_zer_t0`) whose name depends on how
+             * the body happened to lower — there is no accessor and no stable
+             * field. So `async u32 f() { ... return 42; }` compiles, runs,
+             * finalises correctly, and the 42 is simply unreachable. Neither
+             * rejected nor retrievable is the worst of both, so say it.
+             *
+             * A WARNING rather than an error on purpose: the shape must stay
+             * expressible, because tests/zer/bh18_10_async_value_return_idempotent.zer
+             * is the regression guard for BH-18 #10 (a value-returning async
+             * that failed to finalise its state machine, re-running its tail on
+             * every subsequent poll). Rejecting the shape would delete that
+             * guard along with the footgun. */
+            Type *aret = resolve_type(c, node->func_decl.return_type);
+            if (aret && type_dispatch_kind(aret) != TYPE_VOID) {
+                checker_warning(c, node->loc.line,
+                    "async function '%.*s' returns a value, but the poll protocol "
+                    "has no way to retrieve it — the value is computed and then "
+                    "discarded. Return 'void' and write the result to a global or "
+                    "to a struct the caller owns",
+                    (int)node->func_decl.name_len, node->func_decl.name);
+            }
+        }
         /* A6-full atomic-cell: reset the per-function "after a spawn" flag.
          * A plain write to an atomic cell is only flagged when it could be
          * concurrent — i.e. AFTER a spawn in this function. Pre-spawn init and

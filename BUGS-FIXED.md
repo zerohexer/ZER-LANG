@@ -5,6 +5,33 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20f — a value-returning `async` is no longer silent
+
+`async u32 compute() { yield; return 42; }` compiles, runs, finalises its state
+machine correctly — and the 42 is **unreachable**. The poll protocol is an `int`
+done-flag; the returned value lands in `self->_zer_t0`, an internal temp whose
+NAME depends on how the body happened to lower, so there is not even an unstable
+thing to reach for. Re-measured: still exactly that.
+
+Documented as OPEN LOW since 2026-07-28 with two proposed resolutions — build a
+retrieval API, or REJECT the shape. **Measured the reject: corpus cost 1 file,
+and it is the one file that must keep compiling** —
+`tests/zer/bh18_10_async_value_return_idempotent.zer`, the regression guard for
+BH-18 #10 (a value-returning async that failed to finalise and re-ran its tail on
+every later poll). Rejecting would have deleted the guard along with the
+footgun.
+
+So: a WARNING at the declaration, the same shape as the `naked` fix earlier
+today — remove the silence without removing the ability to express the shape.
+Exactly one file in the tree emits it, and it is annotated to say so.
+
+`docs/reference.md` now tells users to return `void` and write the result to a
+global or a caller-owned struct, with a verified example.
+
+`make check` exit 0, all six gates, 1256 ZER tests.
+
+---
+
 ## Session 2026-08-20e — the emitter's five give-up paths are no longer silent
 
 Not a live bug — a live RISK, of exactly the class `tools/emit_audit.sh` exists

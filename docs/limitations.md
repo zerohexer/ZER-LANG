@@ -1472,13 +1472,26 @@ fixed for exactly this (audit #18, commit `c9e4abca`); the WRITE path was not.
 **Severity LOW** — the result is stored back through `*_zer_bp` typed to the carrier width, so the store
 truncates: a wrong VALUE / UB, **not** an out-of-bounds memory write.
 
-### LOW LOW — value-returning `async` has no result-retrieval API (`7fxhb3` `31796ef8`, 2026-07-28)
+### LOW — value-returning `async` has no result-retrieval API — **NO LONGER SILENT (2026-08-20)**
 `async u32 compute() { … return 42; }` compiles clean and the state machine correctly finalizes (BH-18 #10,
 fixed 2026-06-26). But the returned value is stored in an internal temp (`self->_zer_t0`) with **no
-caller-accessible accessor** — a user who writes `async <non-void>` can never read the result. Neither
-rejected nor retrievable = a silent footgun. Resolution is either a real retrieval mechanism (a stable
-`.result` field + `_zer_async_NAME_result(&task)`, distinct from the `int` poll done-flag) or REJECT
-`async <non-void>` until such an API exists. Not memory-unsafe (there is no valid usage today).
+caller-accessible accessor** — and that temp's NAME depends on how the body happened to lower, so there is
+not even an unstable thing to reach for. Re-measured 2026-08-20: still true (`self->_zer_t0 = 42`, no
+`_zer_async_compute_result`).
+
+**Neither rejected nor retrievable was the worst of both, so it is now WARNED at the declaration:**
+*"async function 'compute' returns a value, but the poll protocol has no way to retrieve it — the value is
+computed and then discarded."* Exactly one file in the tree emits it, and that file is
+`tests/zer/bh18_10_async_value_return_idempotent.zer`.
+
+**Why a warning and not the REJECT this entry previously proposed:** that one file is the regression guard
+for BH-18 #10 — a value-returning async that failed to finalise its state machine and re-ran its tail on
+every subsequent poll. Rejecting `async <non-void>` would delete the guard along with the footgun. Measured
+corpus cost of rejecting: 1 file, and it is the one file that must keep compiling.
+
+**Still OPEN as a feature:** a real retrieval mechanism (a stable `.result` field +
+`_zer_async_NAME_result(&task)`, distinct from the `int` poll done-flag) would let the warning be removed.
+Not memory-unsafe either way.
 
 ### ~~LOW Over-rejection — container field of `Handle(T)` drops T substitution~~ (`i0txin` `84097263`) — **`Handle(T)` FIXED `9ea6c864` 2026-08-06**; `Pool`/`Ring`/`Slab` stay rejected (emitter cannot stamp inline storage) — message quality tracked as its own OPEN entry
 `subst_typenode` (checker.c ~2158-2219) treats `TYNODE_HANDLE`/`POOL`/`RING`/`SLAB` as LEAVES and does not

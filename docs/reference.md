@@ -3669,6 +3669,16 @@ u32 main() {
 ```
 Zero heap, zero runtime. Each task is a stack-allocated struct (~4-50 bytes).
 
+**`async` functions should return `void`.** The poll protocol is an `int`
+done-flag, so a value returned from an async function has nowhere to go — it is
+computed and then discarded, and the compiler warns at the declaration. Write
+the result to a global, or to a struct the caller owns:
+
+```zer
+u32 result;
+async void compute() { yield; result = 42; }
+```
+
 **`yield` / `await` outside `async` is a compile error** — they only
 make sense inside async functions. Using them in a regular function
 emits nothing useful (no state machine exists), so the compiler rejects

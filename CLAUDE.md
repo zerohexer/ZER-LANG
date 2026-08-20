@@ -587,7 +587,9 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 
 10. **String literals are `[*]u8` (slices), not `char*`.** `[*]T` is the preferred syntax — reads as "pointer to many." `[]T` still works but emits a deprecation warning ("use [*]T instead"). Use `[*]T` in all new code.
     ```
-    [*]u8 msg = "Hello";          // slice with .ptr and .len
+    const [*]u8 msg = "Hello";     // slice with .ptr and .len — CONST is required:
+                                  // a string literal lives in .rodata, so binding
+                                  // it to a mutable slice is rejected
     ```
 
 11. **`else if` is supported.** Both forms work:

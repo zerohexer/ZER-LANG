@@ -1,0 +1,36 @@
+// Over-rejection boundary for the discarded-optional rule (2026-08-20).
+// Every way of ACKNOWLEDGING an optional must still compile, and a call that
+// does not return an optional must be unaffected.
+struct M { u32 v; }
+Ring(M, 4) rb;
+u32 sink;
+
+?u32  may_fail(u32 x) { if (x > 0) { return x; } return null; }
+?void may_void(u32 x) { if (x > 0) { return; } return null; }
+void  plain(u32 x)    { sink += x; }       // NOT optional — never flagged
+u32   returns_u32()   { return 7; }        // NOT optional — never flagged
+
+u32 main() {
+    M a; a.v = 1;
+
+    // ---- explicit "I am ignoring this" ----
+    rb.push_checked(a) orelse { };
+    may_void(0) orelse { };
+    may_fail(0) orelse { };
+
+    // ---- handled properly ----
+    u32 v = may_fail(1) orelse 0;
+    if (v != 1) { return 1; }
+    if (may_fail(2)) |w| { sink += w; }
+
+    // ---- non-optional results may be discarded freely ----
+    plain(3);
+    returns_u32();
+
+    // ---- a pop whose value is used ----
+    M got = rb.pop() orelse { return 2; };
+    if (got.v != 1) { return 3; }
+
+    if (sink != 5) { return 4; }   // 3 from plain(3) + 2 from the capture
+    return 0;
+}

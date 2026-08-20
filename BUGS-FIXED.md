@@ -5,6 +5,59 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20d — BUG-807: a discarded `?T` silently throws away the failure
+
+`?T` is the whole argument that a failure cannot be ignored in ZER: the checker
+forces an unwrap at every USE site. Throwing the entire optional away was the
+hole in that argument, and it was accepted everywhere:
+
+```zer
+rb.push_checked(a);   // ?void discarded — a FULL ring is silently ignored
+may_fail(x);          // ?u32  discarded — the failure never reaches anyone
+rb.pop();             // ?M    discarded
+```
+
+`push_checked` is the sharpest case: its ONLY difference from `push` is the
+`?void` it returns, so discarding it makes the call strictly identical to the
+fire-and-forget version — the one method whose entire purpose is reporting
+overflow stopped reporting it, with nothing said at compile time or runtime.
+
+**This SUBSUMES the old "ghost handle" check**, which was this same rule
+hand-specialised to `pool.alloc` / `slab.alloc_ptr`. One question — "is a failure
+being discarded?" — is now answered once, so a new optional-returning builtin is
+covered without being added to a list. The allocation case keeps its more
+specific wording, because *"handle leaked"* teaches more than *"failure
+ignored"*; all four existing ghost-handle negatives still reject with it.
+
+**Corpus cost MEASURED BEFORE SHIPPING, and that measurement is why this is a
+tightening rather than a proposal.** A temporary probe in the checker reported
+every statement-position call whose type is optional, across `tests/`,
+`rust_tests/`, `zig_tests/`, `test_modules/`, `lib/` and `examples/`: **6 sites,
+all six the ghost-handle NEGATIVES**, which are supposed to be rejected. Zero
+valid programs affected — the same bar the deref-launder reject shipped on. Full
+suite green with no test edits at all.
+
+The escape valve is one teachable line that states the intent instead of hiding
+it: `rb.push_checked(a) orelse { };`. `if (f()) |v| { }`, `x = f() orelse d`, and
+any non-optional result are all unaffected.
+
+Tests: `tests/zer_fail/discarded_optional_result.zer` and
+`tests/zer/discarded_optional_ok.zer` (the boundary: all three acknowledgement
+forms, a handled unwrap, a capture, and non-optional results discarded freely).
+
+### Also: a diagnostic that walked users into the next warning
+
+`[*]u8 msg = "Hello";` is correctly rejected (a string literal lives in .rodata),
+but the message said *"use 'const []u8' instead of '[]u8'"* — and `[]T` is
+DEPRECATED, so following the advice produced code the same compiler then warns
+about (*"use [*]T instead"*). Now: *"bind it to a const slice: 'const [*]u8 msg
+= ...'"*, naming the variable. CLAUDE.md's quick reference showed the
+non-compiling `[*]u8 msg = "Hello";` and is corrected too.
+
+`make check` exit 0, all six gates, 1256 ZER tests.
+
+---
+
 ## Session 2026-08-20c — BUG-806: an uninitialised Barrier silently does not synchronise
 
 Found by asking the generalisation of BUG-804 rather than by a report: **which

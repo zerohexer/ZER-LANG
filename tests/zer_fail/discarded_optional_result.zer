@@ -1,0 +1,20 @@
+// expect-error: discarded optional result
+//
+// `?T` exists so a failure cannot be ignored — the checker forces an unwrap at
+// every USE site. Throwing the whole optional away was the hole in that
+// argument: `rb.push_checked(a);` is exactly `rb.push(a)` once the `?void` is
+// dropped, so the one method whose entire purpose is REPORTING overflow
+// silently stopped reporting it. Nothing said so at compile time or at runtime.
+//
+// Corpus cost measured before shipping: 6 discarding sites in the whole tree,
+// all of them ghost-handle NEGATIVES. Zero valid programs.
+// The escape valve is `rb.push_checked(a) orelse { };` — one line, and it
+// states the intent to ignore rather than hiding it.
+struct M { u32 v; }
+Ring(M, 2) rb;
+
+u32 main() {
+    M a; a.v = 1;
+    rb.push_checked(a);     // ?void discarded: a full ring is silently ignored
+    return 0;
+}

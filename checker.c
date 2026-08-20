@@ -12644,11 +12644,17 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             /* string literal to mutable slice: runtime crash on write.
-             * String literals are const []u8 — only assign to const variables. */
+             * String literals live in .rodata — only bind them to const.
+             * The suggestion spells [*]T, not the DEPRECATED []T: the message
+             * used to say "use 'const []u8'", and following it produced code the
+             * same compiler then warns about ("use [*]T instead"). A diagnostic
+             * that walks the user into the next warning is worse than none. */
             if (node->var_decl.init->kind == NODE_STRING_LIT &&
                 type && type->kind == TYPE_SLICE && !node->var_decl.is_const) {
                 checker_error(c, node->loc.line,
-                    "string literal is read-only — use 'const []u8' instead of '[]u8'");
+                    "string literal is read-only — bind it to a const slice: "
+                    "'const [*]u8 %.*s = ...'",
+                    (int)node->var_decl.name_len, node->var_decl.name);
             }
 
             /* const slice/pointer → mutable variable: blocked (prevents write to .rodata) */
@@ -15119,44 +15125,92 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_EXPR_STMT:
         check_expr(c, node->expr_stmt.expr);
-        /* Ghost handle: warn if pool.alloc()/slab.alloc() result is discarded.
-         * The handle is leaked — must assign to a variable. */
+        /* DISCARDED OPTIONAL RESULT (generalised 2026-08-20).
+         *
+         * `?T` exists so a failure cannot be ignored: the checker forces an
+         * unwrap at every USE site. Throwing the whole optional away was the
+         * hole in that argument — `rb.push_checked(a);` is exactly `rb.push(a)`
+         * once the `?void` is dropped, and `may_fail(x);` ignores the failure
+         * entirely. Silent at compile time and at runtime, on hosted and on
+         * bare metal.
+         *
+         * This SUBSUMES the old pool/slab "ghost handle" check, which was this
+         * same rule hand-specialised to two method names. One question — "is a
+         * failure being discarded?" — now answered once, so a new
+         * optional-returning builtin is covered without being added to a list.
+         * The allocation case keeps its more specific wording because "the
+         * handle is leaked" teaches more than "the failure is ignored".
+         *
+         * CORPUS COST MEASURED BEFORE SHIPPING: 6 sites across
+         * tests/, rust_tests/, zig_tests/, test_modules/, lib/ and examples/ —
+         * ALL SIX are the ghost-handle NEGATIVE tests, which are supposed to be
+         * rejected. Zero valid programs affected. The escape valve is a
+         * one-line, teachable `f() orelse { };` that states the intent to
+         * ignore. */
+        if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL) {
+            Type *rt = checker_get_type(c, node->expr_stmt.expr);
+            if (rt && type_dispatch_kind(rt) == TYPE_OPTIONAL) {
+                /* Is it an allocator? Then say so — a leaked handle is a more
+                 * specific problem than an ignored failure. */
+                Node *callee = node->expr_stmt.expr->call.callee;
+                bool is_alloc = false;
+                const char *recv = NULL; int recv_len = 0;
+                if (callee && callee->kind == NODE_FIELD) {
+                    const char *mname = callee->field.field_name;
+                    uint32_t mlen = (uint32_t)callee->field.field_name_len;
+                    Node *call_obj = callee->field.object;
+                    if (((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                         (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0)) &&
+                        call_obj && call_obj->kind == NODE_IDENT) {
+                        Type *ot = checker_get_type(c, call_obj);
+                        if (!ot) {
+                            Symbol *sy = scope_lookup(c->current_scope, call_obj->ident.name,
+                                (uint32_t)call_obj->ident.name_len);
+                            if (sy) ot = sy->type;
+                        }
+                        if (ot && (type_dispatch_kind(ot) == TYPE_POOL ||
+                                   type_dispatch_kind(ot) == TYPE_SLAB)) {
+                            is_alloc = true;
+                            recv = call_obj->ident.name;
+                            recv_len = (int)call_obj->ident.name_len;
+                        }
+                    }
+                }
+                if (is_alloc) {
+                    checker_error(c, node->loc.line,
+                        "discarded alloc result — handle leaked. Assign to a variable: "
+                        "'Handle(...) h = %.*s.alloc() orelse return;'",
+                        recv_len, recv);
+                } else {
+                    checker_error(c, node->loc.line,
+                        "discarded optional result — the failure this call reports "
+                        "would be silently ignored. Handle it ('x = f() orelse ...') "
+                        "or state the intent to ignore it ('f() orelse { };')");
+                }
+            }
+        }
+
+        /* `a.over(buf);` as a bare statement. `.over` is a CONSTRUCTOR returning
+         * an Arena by value, not a mutator, so discarding the result leaves the
+         * receiver at capacity 0 and every later alloc() returns null — forever,
+         * with no diagnostic at either end. It reads exactly like initialisation,
+         * which is what makes it dangerous: measured, `a.over(mem); a.alloc(B)`
+         * yields null while `a = Arena.over(mem); a.alloc(B)` succeeds, and the
+         * only difference is the discarded assignment. (Not covered by the rule
+         * above: `.over` returns a plain Arena, not an optional.) */
         if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
             node->expr_stmt.expr->call.callee &&
             node->expr_stmt.expr->call.callee->kind == NODE_FIELD) {
             Node *call_obj = node->expr_stmt.expr->call.callee->field.object;
             const char *mname = node->expr_stmt.expr->call.callee->field.field_name;
             uint32_t mlen = (uint32_t)node->expr_stmt.expr->call.callee->field.field_name_len;
-            if (((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
-                 (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0)) && call_obj->kind == NODE_IDENT) {
-                Type *ot = checker_get_type(c, call_obj);
-                if (!ot) {
-                    Symbol *s = scope_lookup(c->current_scope, call_obj->ident.name,
-                        (uint32_t)call_obj->ident.name_len);
-                    if (s) ot = s->type;
-                }
-                if (ot && (ot->kind == TYPE_POOL || ot->kind == TYPE_SLAB)) {
-                    checker_error(c, node->loc.line,
-                        "discarded alloc result — handle leaked. Assign to a variable: "
-                        "'Handle(...) h = %.*s.alloc() orelse return;'",
-                        (int)call_obj->ident.name_len, call_obj->ident.name);
-                }
-            }
-            /* Same class, different builtin: `a.over(buf);` as a bare statement.
-             * `.over` is a CONSTRUCTOR returning an Arena by value, not a mutator,
-             * so discarding the result leaves the receiver at capacity 0 and every
-             * later alloc() returns null — forever, with no diagnostic at either
-             * end. It reads exactly like initialisation, which is what makes it
-             * dangerous: measured, `a.over(mem); a.alloc(B)` yields null while
-             * `a = Arena.over(mem); a.alloc(B)` succeeds, and the only difference
-             * is the discarded assignment. */
             if (mlen == 4 && memcmp(mname, "over", 4) == 0 && call_obj &&
                 call_obj->kind == NODE_IDENT) {
                 Type *ot = checker_get_type(c, call_obj);
                 if (!ot) {
-                    Symbol *s = scope_lookup(c->current_scope, call_obj->ident.name,
+                    Symbol *sy = scope_lookup(c->current_scope, call_obj->ident.name,
                         (uint32_t)call_obj->ident.name_len);
-                    if (s) ot = s->type;
+                    if (sy) ot = sy->type;
                 }
                 if (ot && type_dispatch_kind(ot) == TYPE_ARENA) {
                     checker_error(c, node->loc.line,

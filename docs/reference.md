@@ -1539,6 +1539,19 @@ Ring(u8, 256) rx_buf;      // 256-byte circular buffer, global only
 - `.push_checked(val)` → `?void` — Push value. Returns null if full.
 - `.pop()` → `?T` — Pop oldest. Returns null if empty.
 
+> **An optional result may not be silently discarded.** `rb.push_checked(a);` as
+> a bare statement is a compile error: the `?void` is the ONLY thing that
+> distinguishes it from `rb.push(a)`, so dropping it means the one method whose
+> purpose is reporting overflow stops reporting it. Handle it, or state the
+> intent to ignore it — both compile:
+> ```zer
+> rb.push_checked(a) orelse { };                 // deliberately ignoring
+> rb.push_checked(a) orelse { return 1; };       // handling
+> M got = rb.pop() orelse { return 2; };         // using the value
+> ```
+> This applies to every call whose result is an optional, not just Ring methods.
+> A non-optional result may be discarded freely.
+
 **EXAMPLE**
 ```zer
 Ring(u8, 256) rx_buf;
@@ -3593,11 +3606,20 @@ threadlocal u32 counter;    // each thread has its own copy
 ### Barrier — Thread Sync Point
 ```zer
 Barrier bar;                // keyword type (like Arena, Pool)
-@barrier_init(bar, 3);     // 3 threads must arrive
+@barrier_init(bar, 3);      // 3 threads must arrive — REQUIRED before any wait
 @barrier_wait(bar);         // blocks until all 3 call wait
 ```
 - `Barrier` is a builtin type — checker validates `@barrier_init`/`@barrier_wait` args are `Barrier` type.
 - Using wrong type (e.g., `u32`) → compile error.
+- **`@barrier_init` is mandatory before the first `@barrier_wait`.** A `Barrier`
+  keeps its party count in a runtime field, not in its type, so a bare
+  declaration zero-initialises it and `@barrier_wait` then returns IMMEDIATELY —
+  the rendezvous silently does not happen and threads that believe they are
+  synchronised are not. Waiting on a barrier that is never initialised anywhere
+  in the file is a compile error as of 2026-08-20. The check is deferred to
+  after all bodies, so an `@barrier_init` in `main` that appears LATER in the
+  file than the wait is fine, and a `*Barrier` parameter is never flagged (its
+  caller owns the initialisation).
 
 ### Semaphore — Counting Semaphore
 ```zer

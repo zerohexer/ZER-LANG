@@ -28,6 +28,15 @@ ZERC="${1:-./zerc}"
 #
 # Ordinary comments (headers, function docs) are filtered out by
 # restricting to specific short stubs.
+# NOTE (2026-08-20): the emitter's OWN give-up markers — "unhandled expr",
+# "unknown slice", "complex callee", "complex index callee", "unknown callee" —
+# are deliberately NOT listed here. They can no longer appear: those five sites
+# now abort with an INTERNAL ERROR instead of emitting a placeholder (see
+# emit_unreachable in emitter.c). They used to be the worst members of exactly
+# the class this script guards, because `/* complex callee */(a, b)` is a valid
+# C COMMA EXPRESSION evaluating to `b` — the program compiled, ran, and called
+# nothing. Verified before the change that ZERO of 1170 corpus programs emitted
+# any of them, so nothing reachable became an abort.
 PATTERNS=(
     "/\\* forward \\*/ "    # zerc_main.c dead stub (fixed 2026-04-18)
     "/\\* stub \\*/"

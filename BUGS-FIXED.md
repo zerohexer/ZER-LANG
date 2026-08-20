@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-20e — the emitter's five give-up paths are no longer silent
+
+Not a live bug — a live RISK, of exactly the class `tools/emit_audit.sh` exists
+to guard, sitting in the emitter itself and not covered by that script.
+
+Five sites emitted a comment plus a placeholder when the emitter reached a shape
+it could not lower:
+
+```
+/* unhandled expr <kind> */0     emit_expr default
+/* unknown slice */ 0
+/* complex callee */(            IR_CALL
+/* complex index callee */(
+/* unknown callee */(
+```
+
+The three callee ones are the worst thing in this list. `<comment>(a, b)` is a
+valid C **comma expression** evaluating to `b`, so the program compiles, runs,
+and **calls nothing** — no diagnostic, no crash, wrong behaviour. The two `0`
+cases substitute a literal zero for an expression. All five are silent
+miscompiles, and none of their fingerprints was in the audit's pattern list.
+
+**Measured before changing anything:** ZERO of **1170** corpus programs emitted
+any of the five markers, so nothing reachable was turned into an abort. They now
+call `emit_unreachable()`, which prints an `INTERNAL ERROR: emitter cannot lower
+… please report with a minimal reproducer` and aborts — the same house style
+`ir_lower_func` and `ir_validate` already use in this file, and the same policy
+CLAUDE.md states for the IR path ("lowering or validation failure = abort").
+`make check` green with no test changes, confirming the measurement.
+
+`tools/emit_audit.sh` records why those fingerprints are deliberately absent from
+its list: they can no longer be emitted at all.
+
+### Why the audit could not have caught them anyway
+
+It compiles **5 hand-picked multi-module samples** and greps for 4 fingerprints.
+Even with the right patterns added, a give-up in a shape none of those five
+programs contains would be invisible. Making the emitter loud is the durable
+form: it does not depend on a sample ever exercising the path.
+
+`make check` exit 0, all six gates, 1256 ZER tests.
+
+---
+
 ## Session 2026-08-20d — BUG-807: a discarded `?T` silently throws away the failure
 
 `?T` is the whole argument that a failure cannot be ignored in ZER: the checker

@@ -1384,6 +1384,25 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
  * EXPRESSION EMISSION
  * ================================================================ */
 
+/* The emitter reached a shape it cannot lower. Emitting a comment plus a
+ * placeholder is a SILENT MISCOMPILE, and for the callee cases it is worse than
+ * that: a bare comment followed by "(a, b)" is a valid C COMMA EXPRESSION that
+ * evaluates to `b`, so the program compiles, runs, and calls nothing.
+ *
+ * House style for "this should be unreachable" in this file is the same abort
+ * ir_lower_func / ir_validate use — see emit_func_decl. Measured before
+ * switching these over: ZERO of 1170 corpus programs emitted any of these five
+ * markers, so nothing reachable is being turned into an abort; what changes is
+ * that an unreachable case can no longer produce a wrong answer quietly. */
+static void emit_unreachable(Emitter *e, const char *what, const char *detail) {
+    fprintf(stderr,
+            "INTERNAL ERROR: emitter cannot lower %s%s%s at %s — "
+            "please report with a minimal reproducer.\n",
+            what, detail ? ": " : "", detail ? detail : "",
+            e->source_file ? e->source_file : "<unknown>");
+    abort();
+}
+
 static void emit_expr(Emitter *e, Node *node) {
     if (!node) return;
 
@@ -3868,7 +3887,7 @@ static void emit_expr(Emitter *e, Node *node) {
      * the IR pipeline); the diagnostic fallback is the right behavior
      * for any kind not legitimately reachable here. */
     default:
-        emit(e, "/* unhandled expr %s */0", node_kind_name(node->kind));
+        emit_unreachable(e, "this expression kind", node_kind_name(node->kind));
         break;
     }
 }
@@ -9897,7 +9916,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, " }); })");
             } else {
                 /* Truly unknown — emit placeholder */
-                emit(e, "/* unknown slice */ 0");
+                emit_unreachable(e, "this slice expression", NULL);
             }
         }
         return;
@@ -10520,7 +10539,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              (int)callee->field.field_name_len, callee->field.field_name);
                     }
                 } else {
-                    emit(e, "/* complex callee */(");
+                    emit_unreachable(e, "this call target", "complex callee");
                 }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
@@ -10573,10 +10592,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     }
                     emit(e, "](");
                 } else {
-                    emit(e, "/* complex index callee */(");
+                    emit_unreachable(e, "this call target", "complex indexed callee");
                 }
             } else {
-                emit(e, "/* unknown callee */(");
+                emit_unreachable(e, "this call target", "unknown callee");
             }
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");

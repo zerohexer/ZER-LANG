@@ -3894,7 +3894,39 @@ clearer code intent.
 
 ---
 
-## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+## `naked` attribute dropped on IR path — **NO LONGER SILENT (2026-08-20)**
+
+**Update 2026-08-20 — the attribute is still dropped, but the compiler now SAYS SO.**
+`naked void f()` emits a warning at the declaration site naming exactly what the user
+does not get (frame layout, their own `ret`/`iret`/`eret`, untouched callee-saved
+registers) and pointing at the cinclude workaround. This converts the entry below from a
+*silent* bare-metal miscompile into an audit-visible one, which is the bar ZER sets for
+anything it cannot verify. **Measured cost: 43 files in the corpus emit the warning** —
+that number IS the finding: 43 programs were silently getting non-naked semantics.
+`make check` exit 0, all six gates.
+
+**Re-measured facts that change the fix's shape (the deferral rationale below was written
+against an older GCC assumption):**
+- GCC 13 on **x86-64 DOES support** `__attribute__((naked))`. It emits
+  `endbr64; <body>; ud2` — no prologue, and **no `ret`**. So flipping the attribute on is
+  not free on the hosted test platform: 16 of the 18 positive `tests/zer/asm_*.zer` call
+  their naked function (measured by resolving each `naked` name against the non-declaration
+  lines of its own file), and every one would SIGILL on the `ud2`.
+- GCC documents that **only BASIC asm is supported inside a naked function**. ZER's
+  structured `asm { inputs: … outputs: … clobbers: … }` form lowers to EXTENDED asm with
+  operands, and the Z-rule operand tracking (Z1-Z8/Z11/Z12 — the thing that keeps UAF /
+  VRP / provenance live across the asm boundary) is built on those operands. So real naked
+  semantics and ZER's asm *safety* feature are in direct tension.
+- The root cause is that **`naked` is overloaded**: the S1 guard makes it the only way to
+  get permission to write `asm` at all, so nearly every use of the keyword in this repo
+  means "let me write asm", not "emit no prologue". A correct fix decouples those two
+  intents (the Option E direction, `docs/asm_lang_zer_safe.md`) rather than flipping a
+  flag.
+
+**Still OPEN**, and still a user-visible breaking change requiring the test migration
+described below. What changed is only that it can no longer bite anyone silently.
+
+### (original entry follows)
 
 **Status:** known regression from IR migration; not fixed because fixing
 breaks every existing `tests/zer/asm_*.zer` test.

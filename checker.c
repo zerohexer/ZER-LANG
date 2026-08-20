@@ -17688,6 +17688,34 @@ static void check_func_body(Checker *c, Node *node) {
 
         if (node->func_decl.is_naked) {
             c->in_naked = true;
+            /* The `naked` ATTRIBUTE IS NOT EMITTED (emitter.c emit_func_attributes,
+             * and the IR path's mirror). The IR migration dropped it and restoring
+             * it is a user-visible breaking change — see docs/limitations.md.
+             *
+             * Until then this must not be SILENT. A user who writes `naked` for a
+             * reset handler, a vector-table entry, or a context-switch primitive
+             * believes they control every byte of the function; GCC in fact emits a
+             * full prologue and epilogue around their asm. On bare metal that does
+             * not fault — it corrupts registers or returns via an epilogue the user
+             * did not write, which is precisely the silent hardware-domain failure
+             * ZER exists to refuse. A diagnostic converts it into an audit-visible
+             * one at the declaration site.
+             *
+             * Measured 2026-08-20 on GCC 13 x86-64: `__attribute__((naked))` IS
+             * supported there and emits `endbr64; <body>; ud2` with no `ret`, so
+             * simply turning it on SIGILLs the 16 of 18 positive asm tests that
+             * call their naked function. GCC also documents that only BASIC asm is
+             * supported inside a naked function, which the structured
+             * inputs/outputs/clobbers form (and the Z-rule operand tracking built
+             * on it) relies on. So the fix is a migration, not a flag flip. */
+            checker_warning(c, node->loc.line,
+                "'naked' is accepted but the attribute is NOT emitted — GCC will "
+                "still generate a prologue/epilogue for '%.*s'. Do not rely on "
+                "exact frame layout, on returning via your own ret/iret/eret, or "
+                "on callee-saved registers being untouched. For true naked "
+                "semantics write the function in C and link it via cinclude. "
+                "See docs/limitations.md \"naked attribute silently dropped\"",
+                (int)node->func_decl.name_len, node->func_decl.name);
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
             if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {

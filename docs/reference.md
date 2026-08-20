@@ -2253,11 +2253,53 @@ grep -rnE "\basm\s*[(]" src/
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+`naked` marks a function whose body must be pure `asm(...)` statements plus `return`.
+Today it serves two purposes, and only one of them is actually delivered:
+
+1. **It is the permission to write `asm` at all.** Inline assembly is allowed *only*
+   inside a `naked` function. This works and is the reason nearly every `naked` in
+   practice exists.
+2. **It is supposed to suppress the compiler-generated prologue/epilogue.** **This is
+   NOT delivered.** The compiler does not emit `__attribute__((naked))`, so GCC still
+   generates a full prologue and epilogue around your asm.
+
+The compiler **warns at the declaration site** so this cannot surprise you:
+
+```
+warning: 'naked' is accepted but the attribute is NOT emitted — GCC will still
+generate a prologue/epilogue for 'reset_handler'. ...
+```
+
+**What this means in practice.** Do NOT rely on any of the following inside a `naked`
+function:
+- exact frame layout (the compiler may spill),
+- returning via your own `ret` / `iret` / `eret` (an epilogue you did not write runs),
+- callee-saved registers being untouched.
+
+Ordinary asm — a fence, a `nop`, a privileged instruction, reading a register into an
+output operand — is unaffected, because those do not depend on the absence of a
+prologue. Reset handlers, vector-table entries and context-switch primitives DO depend
+on it: **write those in C and link them with `cinclude`.**
+
+Tracked in `docs/limitations.md` ("naked attribute silently dropped"). Restoring true
+naked semantics is a user-visible breaking change: GCC emits no `ret` for a naked
+function, and GCC supports only *basic* asm inside one — which the structured
+`inputs:`/`outputs:` form and ZER's Z-rule operand tracking both depend on.
 
 **SYNTAX**
 ```zer
+// Portable: `nop` assembles on x86, ARM and RISC-V alike.
+naked void spin_hint() {
+    asm("nop");
+}
+
+u32 main() { return 0; }
+```
+
+Architecture-specific bodies are written the same way, but only assemble for that
+target (this one is ARM, so it needs `--target-arch=aarch64` and a cross GCC):
+
+```
 naked void reset_handler() {
     asm("ldr sp, =_stack_top");
     asm("b main");

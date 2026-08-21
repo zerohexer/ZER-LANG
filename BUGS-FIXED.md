@@ -5,6 +5,121 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-22b — BUG-820..829: §B, the walker FIELD-descent family
+
+Harvested from `claude/vigilant-tesla-39294y`, whose real contribution is the GATE:
+`-Werror=switch` + `walker_default_audit.sh` already guarantee every safety walker
+NAMES every NodeKind, and nothing checked whether an arm that names a kind actually
+DESCENDS its children. That second half is where the holes live.
+
+**Built the gate first and read its output as the bug list** — `tools/audit_walker_fields.sh`
+(+ a baseline of `file:function:KIND:accessor`, self-checked against `ast.h` so a new
+NodeKind cannot silently rot the table). It reported **119 missing descents on main**.
+Wired into `make check` and standalone as `make check-walker-fields`.
+
+  119 -> 0. 21 vanished with a dead walker; 51 were real descents added; 47 stale
+  baseline rows were REMOVED in the same commit (a stale baseline is worse than none).
+
+### Dead code first: `has_atomic_or_barrier` (21 of the 119)
+Zero live callers — the only mentions were two comments saying it was superseded
+("Replaces has_atomic_or_barrier() standalone scanner", "absorbs has_atomic_or_barrier").
+A dead DUPLICATE of a live safety question is the multi-site drift this project treats
+as its #1 bug class, so it was deleted rather than taught to descend.
+
+### BUG-820 — three walkers missed `call.callee` (2 holes)
+`scan_body_shared_types`, `cond_pred_foreign_shared` and `record_atomic_plain_in_callee`
+each handled the callee ONLY when it was a bare IDENT (to resolve the callee by name)
+and never descended it as an EXPRESSION. `g.cb()` — a funcptr field on a shared struct —
+was invisible, so `h.y = helper()` passed the same-statement two-shared-type check while
+locking H then G, and `@cond_wait(g, gb.cb() > 0)` read a foreign shared struct holding
+only g's mutex. BUG-795 added this descent at five walkers; these three were not among them.
+
+### BUG-821 — `scan_func_props` (3 holes)
+`NODE_SLICE`, `NODE_TYPECAST` and `NODE_STRUCT_INIT` sat in a list whose comment reads
+"leaf/no-body kinds have no children to scan". All three carry expressions. Plus
+`orelse.fallback` and the `await` condition. So an effect reachable only through one of
+them was invisible, and `@critical { u32 v = maybe() orelse starter(); }` where
+`starter()` spawns emitted `pthread_create` between `cpsid i` and `msr primask` —
+interrupts disabled across thread creation, no diagnostic.
+
+### BUG-822 — the spawn race scan treated `@critical` as a LEAF (1 hole)
+`@critical` disables interrupts on ONE CORE and gives no cross-thread exclusion at all,
+so it reads as synchronisation and is not. Also wired `spawn` args and the `await`
+condition at the same walker.
+**`@once` deliberately stays a leaf** — it publishes with ACQ_REL/RELEASE, so it genuinely
+does synchronise. 39294y tried descending it and `once_loser_wait.zer` caught the mistake;
+that boundary was re-verified here.
+
+### BUG-823 — `expr_contains_yield` missed `orelse.fallback` (1 hole)
+A shared mutex held ACROSS a coroutine suspend. An orelse fallback may be a BLOCK, which
+is how BLOCK / EXPR_STMT / VAR_DECL / RETURN become reachable from expression position —
+all four were in the "statement kinds shouldn't appear in expression position" list.
+
+### BUG-824 — `check_call_provenance` recursed into BODIES only (3 holes)
+Seven positions reached: block, if/loop BODIES, func body, expr-stmt, var-decl init,
+return. Every CONDITION, the whole switch and every nested EXPRESSION were `break`:
+
+    if (process(@ptrcast(*opaque, &g_motor)) > 0) { }   // compiled
+    u32 v = process(@ptrcast(*opaque, &g_motor));       // rejected
+
+Same call, same wrong type, opposite verdicts. Type confusion, reachable by moving the
+call anywhere else.
+
+### BUG-825 — `scan_frame` and `contains_break`
+`scan_frame` skipped loop CONDITIONS, the for STEP, an assign TARGET, slice BOUNDS, an
+orelse FALLBACK and a callee EXPRESSION, so recursion detection and `--stack-limit`
+under-counted a call reachable only from one of those. Under-counting a stack budget is
+the direction that AFFIRMS a limit the target cannot honour.
+`contains_break` read `orelse.fallback_is_break`, which the parser sets ONLY for the bare
+`orelse break` form (it leaves `fallback` NULL); `orelse { break; }` puts the break in a
+BLOCK that was never descended.
+
+### BUG-826 — the ISR sibling, and a VRP invalidation gap
+`record_isr_globals` had SPAWN args and the AWAIT condition in its no-body list — the ISR
+path is the SIBLING SINK of the spawn race scan and must answer the same questions.
+`vrp_invalidate_loop_body_writes` missed a callee expression and a TYPECAST operand; a
+missed invalidation leaves a STALE RANGE and elides a bounds guard, which is exactly the
+2026-08-06 orelse-fallback defect's shape.
+
+### BUG-827 — `ir_defer_scan_frees` missed `for_stmt.init`
+A free in a for-INITIALISER inside a defer left the handle ALIVE at exit (spurious leak)
+and made a later free of the same allocation invisible as a double free.
+
+### BUG-828 — `find_param_cast_type` recursed into seven positions (accept-unsafe)
+Every loop, the switch, all conditions and every nested expression — including another
+INTRINSIC's arguments — were `break`. **A missed position here is an accept-unsafe hole
+one layer up, not lost precision**: a `@ptrcast` the search never reaches is a provenance
+expectation never recorded, and with no expectation `check_call_provenance` has nothing to
+compare against and SKIPS the call entirely.
+
+### BUG-829 — one question, two answers: is this call a free? (2 over-rejections)
+The main-body IR_CALL handler classifies a free with `ir_is_extern_free_call` (bodyless +
+void-or-destructor-named + pointer/opaque first param) AND with the cross-function
+FuncSummary. The DEFER-body scanner asked a narrower NAME-ONLY question — literally
+`free`, or a `.free`/`.free_ptr` method:
+
+    *opaque dev = sensor_open("/dev/spi0") orelse return;
+    defer sensor_close(dev);        // "allocated ... but never freed"
+
+The DIRECT call IS recognised, which localises the defect to the scanner. This is the
+flagship "Safe C Library Interop" example in `docs/reference.md`, which the documentation
+asserts compiles and which did not — and the over-rejection pushed users off the SAFER
+form, since without the defer every early return leaks.
+BOTH classifiers are now consulted, because there are TWO forms: a bodyless extern
+destructor, and a ZER WRAPPER around one (which is not bodyless, so only the summary
+settles it). Risk review: widening a free classification marks the handle FREED — the
+CONSERVATIVE direction for the use checks — so it relaxes only the LEAK check, and only
+by trusting the classifier the main-body path already trusts. **Double-free through a
+defer still fires**, verified.
+
+### One baseline entry added rather than fixed, with its reason
+`zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee` — a DELIBERATE narrowing documented
+at the site: the callee of `pool.get(h)` is the ALLOCATOR, not a tracked entity, so checking
+the whole callee would flag `pool` on every builtin method call. The arm descends
+`callee->field.object` instead, which is what reaches a tracked receiver.
+
+---
+
 ## Session 2026-08-22 — BUG-815..819: §A of the vigilant-tesla harvest (11 accept-unsafe holes)
 
 Harvested from `claude/vigilant-tesla-pjtawx` and `-39294y`. Every hole verified live

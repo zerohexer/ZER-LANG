@@ -1,0 +1,34 @@
+// BUG-810: scan_frame (the stack-frame / call-graph walker) never visited a
+// loop CONDITION or STEP, an assignment TARGET, or slice BOUNDS. A call placed
+// in any of those was not recorded as a callee, so the recursion DFS and
+// --stack-limit both looked straight past it.
+//
+// This is a POSITIVE test: recursion produces a warning, not an error, so the
+// only thing a test can assert is that the program still compiles and runs
+// correctly with the call in each of the newly-walked positions. The warning
+// itself is verified by hand (`zerc ... 2>&1 | grep recursive`).
+u32 g_calls = 0;
+
+bool step_once() {
+    g_calls += 1;
+    return false;
+}
+
+u32 pick() { return 0; }
+
+u8[4] buf;
+
+u32 main() {
+    // call in a while condition
+    while (step_once()) { return 1; }
+    // call in a for condition and step
+    for (u32 i = 0; i < 1 && step_once(); i += 1) { return 2; }
+    // call in an assignment target index
+    buf[pick()] = 9;
+    // calls in slice bounds
+    [*]u8 s = buf[pick()..4];
+    if (s.len != 4) { return 3; }
+    if (buf[0] != 9) { return 4; }
+    if (g_calls != 2) { return 5; }
+    return 0;
+}

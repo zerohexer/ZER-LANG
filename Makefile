@@ -210,6 +210,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/walker_audit.sh
 	@echo "=== Walker default-clause audit (Stage 2 Part B discipline) ==="
 	@bash tools/walker_default_audit.sh
+	@echo "=== Walker field-coverage audit (arm names the kind but skips a child) ==="
+	@bash tools/audit_walker_fields.sh
 	@echo "=== Fixed-buffer audit (Stage 3 — Rule #7 enforcement) ==="
 	@bash tools/audit_fixed_buffers.sh
 	@echo "=== Type-dispatch audit (distinct-unwrap class kill) ==="
@@ -226,6 +228,11 @@ check-fixed-buffers:
 	@bash tools/audit_fixed_buffers.sh
 
 # Standalone — run just the per-sink escape/UAF matrix against a built zerc.
+# Standalone — the FIELD half of the walker discipline
+# (walker_default_audit.sh is the KIND half).
+check-walker-fields:
+	@bash tools/audit_walker_fields.sh
+
 check-sink-matrix: zerc
 	@bash tools/sink_matrix.sh ./zerc
 

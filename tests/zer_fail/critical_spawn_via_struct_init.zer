@@ -1,0 +1,13 @@
+// expect-error: cannot spawn inside @critical block
+// BUG-803 sibling: NODE_STRUCT_INIT was a no-op leaf in the effect summary, so
+// a designated-initialiser field could hide a spawn from the @critical ban.
+void worker() { }
+u32 starter() { spawn worker(); return 3; }
+struct P { u32 a; }
+void f() {
+    @critical {
+        P p = { .a = starter() };
+        p.a = p.a;
+    }
+}
+u32 main() { f(); return 0; }

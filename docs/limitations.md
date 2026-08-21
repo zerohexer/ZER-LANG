@@ -13,6 +13,12 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
+**PROGRESS: §B landed 2026-08-22** (BUG-820..829) — the walker FIELD-descent gate
+`tools/audit_walker_fields.sh` is now in `make check` (and `make check-walker-fields`).
+It reported **119 missing descents on main**; 21 vanished with a dead walker, 51 were
+real descents added, 47 stale baseline rows removed in the same commit. W1..W10 and O1
+are struck through below. Remaining: 23.
+
 **PROGRESS: §A landed 2026-08-22** (BUG-815..819) — V1, V2, V3 and W7 are struck through
 below. Sink matrix grew 65 -> 78 cells (SHAPES p16 + p17) and was verified non-vacuous:
 8 holes against a from-HEAD pre-fix build, 0 after. 11 negatives installed, every one
@@ -88,17 +94,17 @@ these 11 are its output, each verified live.
 
 | # | Defect | Evidence on main |
 |---|---|---|
-| W1 | `scan_body_shared_types` / `cond_pred_foreign_shared` miss `call.callee` | `cond_wait_foreign_shared_callee`, `shared_callee_transitive_deadlock` ACCEPTED. **Main's BUG-795 fixed this at the ir_lower + checker sites only — these two are still open** |
-| W2 | `scan_func_props` misses `orelse.fallback` / `struct_init` / `slice` / `await.cond` | 3 negatives accepted. `@critical { u32 v = maybe() orelse starter(); }` emits `pthread_create` between `cpsid i` and `msr primask`. Verified: direct form REJECTED, orelse form ACCEPTED |
-| W3 | spawn race scan treats `@critical` as a LEAF | `spawn_race_via_critical` accepted. `@critical` disables interrupts on one core and gives NO cross-thread exclusion — it reads as synchronisation and is not. (Branch notes `@once` was in v1 of this fix and was WRONG — it publishes with ACQ_REL; reverted) |
-| W4 | `expr_contains_yield` misses `orelse.fallback` | Shared mutex held ACROSS a coroutine suspend, verified in emitted C |
-| W5 | `check_call_provenance` reaches a call only as a whole statement / var-decl init / return | 3 negatives accepted. `if (process(@ptrcast(*opaque,&g_motor)) > 0)` compiles; identical call as a var-decl init is rejected |
-| W6 | `emitter.c` holds TWO more drifted copies of the shared-root walker | `defer { sink(g.cb()); }` emits with NO mutex. Fix unifies to one `ir_find_shared_root_expr`, deletes ~170 lines + 6 dead walkers. **Complements V3** (pjtawx does ast.h/checker/zercheck_ir; this does emitter.c) |
+| ~~W1~~ **DONE (BUG-820)** | `scan_body_shared_types` / `cond_pred_foreign_shared` / `record_atomic_plain_in_callee` missed `call.callee` | `cond_wait_foreign_shared_callee`, `shared_callee_transitive_deadlock` ACCEPTED. **Main's BUG-795 fixed this at the ir_lower + checker sites only — these two are still open** |
+| ~~W2~~ **DONE (BUG-821)** | `scan_func_props` missed `orelse.fallback` / `struct_init` / `slice` / `await.cond` | 3 negatives accepted. `@critical { u32 v = maybe() orelse starter(); }` emits `pthread_create` between `cpsid i` and `msr primask`. Verified: direct form REJECTED, orelse form ACCEPTED |
+| ~~W3~~ **DONE (BUG-822)** | spawn race scan treated `@critical` as a LEAF | `spawn_race_via_critical` accepted. `@critical` disables interrupts on one core and gives NO cross-thread exclusion — it reads as synchronisation and is not. (Branch notes `@once` was in v1 of this fix and was WRONG — it publishes with ACQ_REL; reverted) |
+| ~~W4~~ **DONE (BUG-823)** | `expr_contains_yield` missed `orelse.fallback` | Shared mutex held ACROSS a coroutine suspend, verified in emitted C |
+| ~~W5~~ **DONE (BUG-824)** | `check_call_provenance` reached a call at only three positions | 3 negatives accepted. `if (process(@ptrcast(*opaque,&g_motor)) > 0)` compiles; identical call as a var-decl init is rejected |
+| ~~W6~~ **DONE in §A (BUG-817)** | the emitter's drifted copy of the shared-root walker | `defer { sink(g.cb()); }` emits with NO mutex. Fix unifies to one `ir_find_shared_root_expr`, deletes ~170 lines + 6 dead walkers. **Complements V3** (pjtawx does ast.h/checker/zercheck_ir; this does emitter.c) |
 | ~~W7~~ **DONE 2026-08-22 (BUG-819)** | `ir_defer_scan_uses` looked at expression statements only | `defer_use_in_condition_uaf`, `defer_use_in_vardecl_uaf` accepted — unreported UAF |
-| W8 | `scan_frame` skips loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
-| W9 | `expr_mentions_global` misses intrinsic/call/orelse | = V6 above |
-| W10 | `ir_defer_free_arg` knows only 3 builtin free spellings | OVER-REJECTION, see O1 |
-| W11 | `naked` silently dropped since the IR migration | see Q1 |
+| ~~W8~~ **DONE (BUG-825)** | `scan_frame` skipped loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
+| ~~W9~~ **DONE (BUG-826)** | ISR sibling + VRP invalidation descents | = V6 |
+| ~~W10~~ **DONE (BUG-829)** | `ir_defer_free_arg` knew only 3 builtin free spellings | = O1 |
+| W11 | `naked` silently dropped since the IR migration | see Q1 — still OPEN (§F) |
 
 **Latent, documented, not fixable yet:** no walker descends `asm` operand expressions.
 Unreachable only because `asm` is naked-only; opens seven holes at once the day S1 relaxes.

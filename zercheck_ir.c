@@ -2088,7 +2088,7 @@ static bool ir_defer_is_arena_reset(Node *node) {
  *   - bare free(x)    (plain cstdlib from cinclude)
  *   - Task.free(x) / Task.free_ptr(x)
  */
-static Node *ir_defer_free_arg(Node *node) {
+static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
     if (!node) return NULL;
     if (node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return NULL;
     Node *call = node->expr_stmt.expr;
@@ -2106,6 +2106,39 @@ static Node *ir_defer_free_arg(Node *node) {
         callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0)
         return call->call.args[0];
+    /* BUG-829: ONE question — "is this call a free?" — answered by TWO functions
+     * that disagreed. The main-body IR_CALL handler asks ir_is_extern_free_call
+     * (bodyless + void/destructor-named + pointer/opaque first param); this
+     * scanner asked a narrower NAME-ONLY question, so the same call inside a
+     * `defer` was not a free:
+     *     *opaque dev = sensor_open("/dev/spi0") orelse return;
+     *     defer sensor_close(dev);        // "allocated ... but never freed"
+     * The DIRECT call IS recognised, which is what localises this to the scanner
+     * rather than the heuristic. It is the flagship C-interop example in
+     * docs/reference.md, which the docs assert compiles and which did not.
+     * Widening a free classification marks the handle FREED — the CONSERVATIVE
+     * direction for the use checks — so this relaxes only the LEAK check, and
+     * only by trusting the classifier the main-body path already trusts.
+     * Double-free through a defer still fires. */
+    if (zc && ir_is_extern_free_call(zc, call))
+        return call->call.args[0];
+    /* BUG-829, second form: a ZER WRAPPER around the destructor
+     * (`void my_close(*Dev p) { dev_close(p); }`) is not bodyless, so the extern
+     * heuristic above says no. The main-body path settles it with the
+     * cross-function FuncSummary; ask the same summary here so BOTH forms of
+     * "this call frees its argument" get the same answer inside a defer as
+     * outside it. Returns the first param the callee is known to free. */
+    if (zc && callee && callee->kind == NODE_IDENT) {
+        for (int si = 0; si < zc->summary_count; si++) {
+            FuncSummary *sm = &zc->summaries[si];
+            if (sm->func_name_len != (uint32_t)callee->ident.name_len ||
+                memcmp(sm->func_name, callee->ident.name, sm->func_name_len) != 0)
+                continue;
+            for (int pi = 0; pi < sm->param_count && pi < call->call.arg_count; pi++)
+                if (sm->frees_param[pi]) return call->call.args[pi];
+            break;
+        }
+    }
     return NULL;
 }
 
@@ -2207,7 +2240,7 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     /* Try this node as a free statement */
-    Node *farg = ir_defer_free_arg(body);
+    Node *farg = ir_defer_free_arg(zc, body);
     if (farg) {
         int root_local;
         const char *path;
@@ -2296,6 +2329,10 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line, defer_id);
         break;
     case NODE_FOR:
+        /* BUG-827: a free in the for-INITIALISER of a defer body was not scanned,
+         * so the handle stayed ALIVE at exit (spurious leak) and a later free of
+         * the same allocation was not seen as a double free. */
+        ir_defer_scan_frees(zc, func, ps, body->for_stmt.init, defer_line, defer_id);
         ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line, defer_id);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
@@ -2349,7 +2386,7 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
-        ir_defer_free_arg(body) == NULL) {
+        ir_defer_free_arg(zc, body) == NULL) {
         ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
     }
     /* BUG-819: the two non-control-flow expression positions. Both sat in the

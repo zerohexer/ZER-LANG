@@ -1,0 +1,15 @@
+// expect-error: cannot spawn inside @critical block
+// BUG-803: scan_func_props (the FuncProps effect summary) never descended
+// orelse.fallback, so an effect reachable only on the failure path was invisible
+// to the @critical / ISR / defer context bans. Verified pre-fix: this compiled
+// and emitted pthread_create between `cpsid i` and `msr primask`.
+void worker() { }
+u32 starter() { spawn worker(); return 3; }
+?u32 maybe() { return null; }
+void f() {
+    @critical {
+        u32 v = maybe() orelse starter();
+        v = v;
+    }
+}
+u32 main() { f(); return 0; }

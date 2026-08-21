@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-21 — BUG-802..810: the FIELD half of the walker discipline
+## Session 2026-08-21 — BUG-802..813: the FIELD half of the walker discipline
 
 **The question this session asked.** `-Werror=switch` + `walker_default_audit.sh`
 guarantee every safety walker NAMES every NodeKind. Nothing checked whether an arm
@@ -18,9 +18,10 @@ present, one child never mentioned, `-Wswitch` perfectly happy.
 `tools/audit_walker_fields.sh` maps every NodeKind to its `Node *` children
 (self-checked against `ast.h`, so a new kind fails the audit) and reports, for every
 recursive kind-walker, each child an arm never descends.
-Eleven live defects came out of it — nine from the first run, BUG-811 from
+Twelve live defects came out of it — nine from the first run, BUG-811 from
 following up the gate's own stated blind spot, and BUG-812 from compiling every
-self-contained example in `docs/reference.md`. Every one was reproduced on the
+self-contained example in `docs/reference.md`, and BUG-813 from hand-probing
+bare-metal shapes. Every one was reproduced on the
 pre-fix compiler and its DIAGNOSTIC read, not just its exit code.
 
 | Bug | Walker | Missed child | Consequence, measured |
@@ -36,6 +37,7 @@ pre-fix compiler and its DIAGNOSTIC read, not just its exit code.
 | 810 | `scan_frame` | loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
 | 811 | `expr_mentions_global` (an if/else chain — invisible to BOTH gates) | intrinsic args, call args, orelse | non-atomic RMW on a volatile global, 3 spellings, both sinks |
 | 812 | `ir_defer_free_arg` | extern destructors, summary-based wrapper frees | `defer sensor_close(dev);` REJECTED as a leak — the reference's own C-interop example did not compile |
+| 813 | the packed-pointer rule | the CALL sink | `takes(&packed.b)` — misaligned store in the callee, hard fault on ARM/RISC-V, silent everywhere |
 
 ### BUG-802 — the transitive shared-type cache never looked at the CALLEE
 BUG-795 fixed the three DIRECT-site walkers and left two behind, one of which
@@ -175,6 +177,51 @@ GCC even warned about it. A build script passing `--release` got nothing and no
 diagnostic. It now warns that it has no effect, and the reference says why there
 is no debug/release split: the runtime safety checks are not debug scaffolding,
 and a `--release` that stripped them would be an escape hatch by another name.
+
+### BUG-813 — the packed-field address crossing a call boundary
+Found by probing bare-metal shapes rather than by the gate. BUG-786 rejects a
+DEREF through `&packed.field`, and BUG-493 rejects the same address at
+`@atomic_*`. Both rest on `Symbol.is_packed_derived`, a per-LOCAL Model-4
+annotation — and it dies at a parameter:
+
+```zer
+packed struct P { u8 a; u32 b; }
+void takes(*u32 q) { *q = 1; }
+takes(&p.b);                       // ACCEPTED pre-fix
+```
+
+Inside `takes`, the type says "aligned u32 pointer" and nothing remembers
+otherwise. The store is misaligned: a hard fault on ARM/RISC-V, silently slow on
+x86, no diagnostic at either end — the exact profile of a bare-metal silent gap.
+
+Fixed at the CALL sink rather than by propagating the fact into the callee: the
+callee's own signature is the lie, so a summary would have to carry an alignment
+obligation through every hop. Refusing the address at the boundary is one site,
+conservative, and leaves both supported forms intact (`p.b` directly, or copy to
+an aligned local). Both spellings caught — the inline `&p.b` and a local bound to
+it first.
+
+A local-to-local COPY of the pointer (`*u32 r = q;`) was open for the same
+reason and is closed in the same commit, by propagating the fact through the
+shared `propagate_escape_flags` alias helper rather than at another call site.
+
+**Four sinks remain measurably OPEN** and are recorded rather than quietly
+left — a struct FIELD, a GLOBAL pointer, a SLICE of a packed array field, and
+(behind a masking escape rejection) a return. They need the fact to ride the
+VALUE the way `is_volatile_addr_derived` does for BUG-797, which is a subsystem
+change, not a patch. `docs/limitations.md` carries the table and
+`tests/zer_gaps/packed_addr_remaining_sinks.zer` the reproducer, so the day the
+class is closed the gap file fails loudly and asks to be promoted.
+
+**Corpus cost measured at ZERO before shipping**: across tests/, rust_tests/,
+zig_tests/, test_modules/, examples/ and lib/, exactly one file passes a packed
+field's address anywhere, and it is BUG-493's negative, which already rejects.
+That number, not an argument, is what makes a new rejection defensible.
+
+Tests: `tests/zer_fail/packed_field_addr_call_arg.zer` and
+`..._via_local.zer`; `tests/zer/packed_field_direct_ok.zer` grew the
+over-rejection boundary — passing the packed field BY VALUE, and taking the
+address of a NON-packed field as an argument, must both keep working.
 
 ### What the gate caught about ITSELF
 The first version of `descends()` was a plain substring test and reported OK after I

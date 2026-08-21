@@ -1,0 +1,22 @@
+// GAP (2026-08-21, BUG-813 residual): the packed-field ADDRESS still escapes
+// four sinks. This file COMPILES CLEAN, and that is the gap — see
+// docs/limitations.md "the packed-field address escapes four more sinks".
+//
+// Closed elsewhere: @atomic_* (BUG-493), deref (BUG-786), call argument and
+// local-to-local copy (BUG-813). Open here: a struct FIELD, a GLOBAL pointer,
+// and a SLICE of a packed array field. Each writes through a possibly-
+// misaligned pointer — a hard fault on ARM/RISC-V, silent on x86.
+//
+// When this starts failing to compile, the gap is CLOSED: promote it to
+// tests/zer_fail/ with an `// expect-error:` line and delete the ledger entry.
+// Do not close these one at a time — the fact needs to ride the VALUE (as
+// is_volatile_addr_derived does), then all eight rows re-run as a grid.
+packed struct P { u8 a; u32 b; u32[4] arr; }
+struct H { *u32 p; }
+P p;  H h;  ?*u32 g = null;
+u32 main() {
+    h.p = &p.b;  *h.p = 1;
+    g = &p.b;    if (g) |q| { *q = 1; }
+    [*]u32 s = p.arr[0..2];  s[0] = 1;
+    return 0;
+}

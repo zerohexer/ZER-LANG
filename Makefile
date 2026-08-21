@@ -220,6 +220,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/audit_carrier_dispatch.sh
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
+	@echo "=== reference.md examples must still compile ==="
+	@bash tools/audit_doc_examples.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
 
@@ -231,6 +233,10 @@ check-fixed-buffers:
 # walker discipline; walker_default_audit.sh is the KIND half).
 check-walker-fields:
 	@bash tools/audit_walker_fields.sh
+
+# Standalone — compile every self-contained example in docs/reference.md.
+check-doc-examples: zerc
+	@bash tools/audit_doc_examples.sh ./zerc
 
 # Standalone — run just the per-sink escape/UAF matrix against a built zerc.
 check-sink-matrix: zerc

@@ -6,6 +6,15 @@ struct Plain { u8 a; u32 b; }
 
 P pk;
 Plain pl;
+u32 g_sink = 0;
+
+// BUG-813 (2026-08-21) extended the rule to the CALL sink: the ADDRESS of a
+// packed field may not be handed to a function, because the callee's `*u32`
+// says "aligned" and nothing carries the fact across. Passing the VALUE is the
+// supported form and must keep working — this pins that boundary so the
+// rejection cannot quietly widen.
+void take_value(u32 v) { g_sink += v; }
+void take_aligned_ptr(*u32 q) { *q = *q + 1; }
 
 u32 main() {
     pk.b = 7;                      // direct write to a packed field
@@ -20,5 +29,15 @@ u32 main() {
     *u32 q = &pl.b;                // NON-packed &field — naturally aligned, fine
     pl.b = 9;
     if (*q != 9) { return 4; }
+
+    take_value(pk.b);              // packed field BY VALUE — supported
+    if (g_sink != 7) { return 5; }
+
+    u32 aligned = pk.b;            // copy out, then the address IS aligned
+    take_aligned_ptr(&aligned);
+    if (aligned != 8) { return 6; }
+
+    take_aligned_ptr(&pl.b);       // NON-packed &field as an argument — fine
+    if (pl.b != 10) { return 7; }
     return 0;
 }

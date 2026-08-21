@@ -1747,6 +1747,11 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
         dst->nonkeep_root_param = src->nonkeep_root_param; /* keep inference: carry root param to aliases */
     }
     if (src->is_keep_derived) dst->is_keep_derived = true;
+    /* BUG-813: a possibly-MISALIGNED pointer stays misaligned when copied.
+     * `*u32 q = &p.b; *u32 r = q; *r = 1;` slipped past the deref sink because
+     * the fact lived only on the symbol that took the address. Propagating it
+     * through the shared alias helper covers every site that already uses it. */
+    if (src->is_packed_derived) dst->is_packed_derived = true;
 }
 
 /* Given the operand of a `&` (address-of), decide whether the resulting
@@ -7415,6 +7420,45 @@ static Type *check_expr(Checker *c, Node *node) {
                                 "embedded mutex would be copied, breaking auto-lock "
                                 "semantics. Pass by pointer '*%s' instead.",
                                 i + 1, type_name(arg), type_name(arg));
+                        }
+                    }
+
+                    /* BUG-813: the address of a PACKED struct field must not
+                     * cross a call boundary. `Symbol.is_packed_derived`
+                     * (BUG-786) is a per-LOCAL fact and dies at the parameter:
+                     * inside `void takes(*u32 q){ *q = 1; }` the type says
+                     * "aligned u32 pointer" and nothing remembers otherwise, so
+                     * the misaligned store compiles — a hard fault on
+                     * ARM/RISC-V, silently slow on x86, and invisible at both
+                     * ends. This is the same question BUG-493 asks at the
+                     * @atomic_* sink and BUG-786 at the deref sink; the CALL
+                     * sink had no answer.
+                     *
+                     * Both spellings are caught: the address formed inline
+                     * (`takes(&p.b)`) and one bound to a local first
+                     * (`*u32 q = &p.b; takes(q);`).
+                     *
+                     * Corpus cost measured at ZERO before shipping — no .zer
+                     * file in tests/, rust_tests/, zig_tests/, test_modules/,
+                     * examples/ or lib/ passes a packed field's address to a
+                     * function. The supported ways to touch a packed member are
+                     * unaffected: read/write it directly (`s.field`), or copy it
+                     * to an aligned local and pass THAT. */
+                    {
+                        Node *pa = node->call.args[i];
+                        bool packed_arg = addr_of_is_packed_field(c, pa);
+                        if (!packed_arg && pa && pa->kind == NODE_IDENT) {
+                            Symbol *ps = scope_lookup(c->current_scope,
+                                pa->ident.name, (uint32_t)pa->ident.name_len);
+                            if (ps && ps->is_packed_derived) packed_arg = true;
+                        }
+                        if (packed_arg) {
+                            checker_error(c, node->loc.line,
+                                "argument %u points into a PACKED struct field — "
+                                "the callee sees an ordinary aligned pointer and "
+                                "may fault on ARM/RISC-V. Pass the VALUE "
+                                "(`s.field`), or copy it to an aligned local and "
+                                "pass that", i + 1);
                         }
                     }
 

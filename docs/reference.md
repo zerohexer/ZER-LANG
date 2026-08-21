@@ -485,6 +485,39 @@ packed struct SensorPacket {
 }   // exactly 4 bytes, no padding
 ```
 
+**NOTES — you may not take the ADDRESS of a packed field**
+
+Direct access is always fine and is what you should use:
+
+```zer
+packed struct P { u8 a; u32 b; }
+P p;
+
+u32 main() {
+    p.b = 7;                 // OK — the compiler knows the field is packed
+    u32 v = p.b;             // OK
+    u32 aligned = p.b;       // OK — copy out, then `&aligned` is a normal pointer
+    return v + aligned;
+}
+```
+
+`&p.b` produces a pointer that is **not naturally aligned**. On ARM and RISC-V a
+load or store through it is a hard fault; on x86 it silently works and is slow.
+The generated C keeps no record of the packed-ness — `*u32 q = &p.b;` emits a
+plain `uint32_t *` — so nothing downstream can recover the fact. ZER therefore
+refuses the address at every sink that would consume it:
+
+| Use of `&packed.field` | Result |
+|---|---|
+| `@atomic_add(&p.b, 1)` | compile error (BUG-493) |
+| `*u32 q = &p.b; *q = 1;` | compile error (BUG-786) |
+| `takes(&p.b)` / `takes(q)` where `q = &p.b` | compile error (BUG-813) |
+| `p.b = 1;` / `u32 v = p.b;` | **fine** — use this |
+| `takes(p.b)` — pass the VALUE | **fine** |
+
+The address of a field of a NON-packed struct is unaffected: `&plain.b` is
+naturally aligned and behaves like any other pointer.
+
 **SEE ALSO**
 struct, move struct
 

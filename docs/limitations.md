@@ -5,6 +5,58 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — the packed-field address escapes four more sinks (MEDIUM, bare-metal silent)
+
+**Three sinks are closed; four are measured OPEN.** The question is "is this
+pointer naturally aligned?", and it must be answered wherever a
+`&packed_struct.field` can end up, because the emitter DROPS the packed-ness
+(`*u32 q = &p.b` emits a plain `uint32_t *`) and nothing downstream can recover
+it. Misaligned access is a hard fault on ARM/RISC-V and silently slow on x86 —
+no diagnostic at either end.
+
+| Sink | State |
+|---|---|
+| `@atomic_*(&p.b, …)` | CLOSED — BUG-493 |
+| deref: `*u32 q = &p.b; *q = 1;` | CLOSED — BUG-786 |
+| a call argument: `takes(&p.b)`, or a local bound to it | CLOSED — BUG-813 |
+| local-to-local copy: `*u32 r = q;` | CLOSED — BUG-813 (`propagate_escape_flags`) |
+| **stored in a struct FIELD**: `h.p = &p.b; *h.p = 1;` | **OPEN** |
+| **stored in a GLOBAL pointer**: `g = &p.b; if (g) \|q\| { *q = 1; }` | **OPEN** |
+| **returned from a function**: `*u32 getp(){ return &p.b; }` | **OPEN**\* |
+| **sliced**: `[*]u32 s = p.arr[0..2]; s[0] = 1;` | **OPEN** |
+
+\* the return case is currently rejected, but by the ESCAPE rule (returning a
+view of a global-derived address), not by the alignment rule — a masking
+rejection, so do not count it as covered. Route around it before re-measuring.
+
+**Reproducers** (each verified ACCEPTED on 2026-08-21):
+
+```zer
+packed struct P { u8 a; u32 b; u32[4] arr; }
+struct H { *u32 p; }
+P p;  H h;  ?*u32 g = null;
+
+u32 main() {
+    h.p = &p.b;  *h.p = 1;                     // struct field
+    g = &p.b;    if (g) |q| { *q = 1; }        // global
+    [*]u32 s = p.arr[0..2];  s[0] = 1;         // slice
+    return 0;
+}
+```
+
+**Why they are not closed here.** `Symbol.is_packed_derived` is a Model-4 static
+annotation on a LOCAL. A struct field, a global's pointee and a slice's backing
+store are not Symbols with per-instance flags, so covering them needs the fact to
+ride the VALUE the way `is_volatile_addr_derived` does for BUG-797 — i.e. a
+type-or-provenance-level carrier, not a symbol flag. That is the right fix and it
+is a subsystem change, not a patch.
+
+**Do NOT close these one at a time.** That is how this class got to seven sinks.
+Whoever does it should carry the fact on the value, then re-run all eight rows
+above as a grid.
+
+---
+
 ## OPEN — `asm` OPERANDS are invisible to every AST safety walker (LATENT — blocked only by the naked-only restriction)
 
 **Status: not a live hole today. It becomes one the day S1 relaxes.** Recorded

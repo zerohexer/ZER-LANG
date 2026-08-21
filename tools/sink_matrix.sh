@@ -188,6 +188,55 @@ cell p15_safe_value_cast    compile 'u32 gv15=0; void c(){ u32 x=5; gv15=(u32)x;
 cell p15_safe_orelse_global compile 'u32 gd15b=1; ?*u32 mk15b(){return null;} void c(){ g_p=mk15b() orelse &gd15b; } u32 main(){c();return 0;}'
 cell p15_safe_cast_global   compile 'u32 gd15c=1; void c(){ g_p=(*u32)(&gd15c); } u32 main(){c();return 0;}'
 
+# ---------------------------------------------------------------------------
+# SHAPE p16 (BUG-803): an ARENA-derived pointer is the SECOND lifetime this
+# matrix must track, and until 2026-08-18 only the first one (a stack local) was
+# asked at the SHARED helpers. The direct ident sinks had both; the struct
+# literal, the launder-through-a-local and the orelse JOIN had only "local". So
+# the byte-identical program escaped through whichever syntax reached a shared
+# helper — ASan-confirmed stack-use-after-return on `g = { .p = arena_ptr }`
+# while `g.p = arena_ptr` was rejected one line away.
+#
+# The axis is worth its own row because "frame-bound" has TWO causes with
+# DIFFERENT deaths: a local dies at return, arena memory dies at return AND at
+# `arena.reset()`. Any future sink must answer for both, which is why the leaf
+# test is now one predicate (symbol_is_frame_bound_ptr) rather than a flag read.
+echo "===== SHAPE p16 = an Arena-derived pointer at each shared-helper sink ====="
+cell p16_arena_direct_field  reject 'struct N16{u32 v;} struct B16{ *N16 p; } B16 gb16; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N16 a=ar.alloc(N16) orelse return; gb16.p=a; } u32 main(){c();return 0;}'
+cell p16_arena_struct_lit    reject 'struct N16{u32 v;} struct B16{ *N16 p; } B16 gb16; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N16 a=ar.alloc(N16) orelse return; gb16={ .p=a }; } u32 main(){c();return 0;}'
+cell p16_arena_lit_launder   reject 'struct N16{u32 v;} struct B16{ *N16 p; } B16 gb16; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N16 a=ar.alloc(N16) orelse return; B16 t={ .p=a }; gb16=t; } u32 main(){c();return 0;}'
+cell p16_arena_orelse_fb     reject 'struct N16{u32 v;} ?*N16 g16; ?*N16 none16(){return null;} void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N16 a=ar.alloc(N16) orelse return; g16=none16() orelse a; } u32 main(){c();return 0;}'
+cell p16_arena_lit_return    reject 'struct N16{u32 v;} struct B16{ *N16 p; } B16 mk16(){ u8[256] bk; Arena ar=Arena.over(bk); ?*N16 m=ar.alloc(N16); *N16 a=m orelse return; return { .p=a }; } u32 main(){ B16 x=mk16(); return 0;}'
+# BOUNDARY: an arena pointer used LOCALLY, and a struct literal carrying a
+# pointer to a GLOBAL, must both still compile — the widened predicate must not
+# turn "carries a pointer" into "escapes".
+cell p16_safe_arena_local    compile 'struct N16{u32 v;} u32 main(){ u8[256] bk; Arena ar=Arena.over(bk); ?*N16 m16=ar.alloc(N16); if (m16) |a| { a.v=7; if (a.v != 7) { return 1; } } return 0; }'
+cell p16_safe_lit_global_ptr compile 'struct N16{u32 v;} struct B16{ *N16 p; } N16 gn16; B16 gb16b; void c(){ gb16b={ .p=&gn16 }; } u32 main(){c();return 0;}'
+
+# ---------------------------------------------------------------------------
+# SHAPE p17 (BUG-807): the launder peel applied to a CALL ARGUMENT rather than
+# to the stored value. p15 above covers `g = <launder>(&local)` — the launder
+# wrapping the value at the sink. This row covers `g = f(<launder>(&local))` —
+# the launder wrapping an ARGUMENT, one level further in, where
+# arg_is_local_derived is the leaf that decides. That predicate was the one
+# frame-bound question that never called the shared peeler, so all three wrapper
+# forms walked past call_result_escapes and reached a global. ASan-confirmed
+# stack-use-after-return on each. The C-style cast is the worst of the three:
+# the emitter DELETES it, so the emitted C is byte-identical to the bare form
+# one line away that IS rejected.
+echo "===== SHAPE p17 = a launder wrapping a CALL ARGUMENT (not the stored value) ====="
+cell p17_arg_bare          reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17(&x); } u32 main(){c();return 0;}'
+cell p17_arg_ptrcast       reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17(@ptrcast(*u32,&x)); } u32 main(){c();return 0;}'
+cell p17_arg_ccast         reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17((*u32)(&x)); } u32 main(){c();return 0;}'
+cell p17_arg_pun           reject '*u32 id17(*u32 p){return p;} void c(){ u32 x=5; g_p=id17(@pun(*u32,&x)); } u32 main(){c();return 0;}'
+cell p17_arg_field_launder reject 'struct L17{u32 f;} *u32 id17(*u32 p){return p;} void c(){ L17 l; g_p=id17(@ptrcast(*u32,&l.f)); } u32 main(){c();return 0;}'
+# BOUNDARY: a launder over a GLOBAL address is not frame-bound, and a laundered
+# arg to a callee that returns a STATIC is settled by the return summary — the
+# peel must not turn every wrapped argument into an escape.
+cell p17_safe_arg_global   compile 'u32 gx17=1; *u32 id17b(*u32 p){return p;} void c(){ g_p=id17b(@ptrcast(*u32,&gx17)); } u32 main(){c();return 0;}'
+cell p17_safe_arg_static   compile 'u32 gs17=2; *u32 pick17(*u32 p){return &gs17;} void c(){ u32 x=5; g_p=pick17(@ptrcast(*u32,&x)); } u32 main(){c();return 0;}'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

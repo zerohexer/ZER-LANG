@@ -1,0 +1,29 @@
+// EXPECTED: compile error
+// expect-error: memory from an Arena
+// BUG-803 — the ARENA axis was missing from the two SHARED "is this value
+// frame-bound?" helpers, while the DIRECT ident sinks had it all along. So the
+// byte-identical program escaped whenever it went through a struct literal:
+//
+//     g.p = a;              // correctly REJECTED ("arena-derived pointer")
+//     g   = { .p = a };     // ACCEPTED — same pointer, same global
+//
+// Measured live before the fix, then confirmed with AddressSanitizer:
+// `stack-use-after-return` reading g.p.v after stash() returns, because the
+// arena's backing store is this frame's stack array.
+//
+// Root cause: struct_init_has_local_derived's alias-ident case tested only
+// `is_local_derived`, never `is_arena_derived` / `is_from_arena`. One question,
+// two lifetimes, one of them asked at only half the sites.
+struct Node { u32 v; }
+struct Box { *Node p; }
+Box g;
+
+void stash() {
+    u8[256] backing;
+    Arena scratch = Arena.over(backing);
+    *Node a = scratch.alloc(Node) orelse return;
+    a.v = 42;
+    g = { .p = a };
+}
+
+u32 main() { stash(); return 0; }

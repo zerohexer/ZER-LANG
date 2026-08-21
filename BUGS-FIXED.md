@@ -5,6 +5,89 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-22 — BUG-815..819: §A of the vigilant-tesla harvest (11 accept-unsafe holes)
+
+Harvested from `claude/vigilant-tesla-pjtawx` and `-39294y`. Every hole verified live
+on main by running the BRANCH'S OWN test file first, and every new test confirmed
+DISCRIMINATING against a from-HEAD pre-fix build (11/11 flip ACC -> REJ). Corpus cost
+zero. Sink matrix 65 -> 78 cells, verified non-vacuous: **8 holes pre-fix, 0 after**.
+
+Four of the five are the same shape the ledger keeps recording — one semantic question
+answered at N sites with site k missed.
+
+### BUG-815 — the launder peel was never applied to a call ARGUMENT (3 holes)
+`arg_is_local_derived` is the LEAF of `call_result_escapes` and of the Ring-push and
+spawn-arg gates, and it was the only "is this value frame-bound?" predicate in the file
+that never called `unwrap_ptr_launder`. So every sink reaching it was blind:
+
+    g = idfn(&x);                  // correctly REJECTED
+    g = idfn((*u32)(&x));          // ACCEPTED
+    g = idfn(@ptrcast(*u32, &x));  // ACCEPTED
+    g = idfn(@pun(*u32, &x));      // ACCEPTED
+
+All ASan-confirmed stack-use-after-return. The C-style cast is the worst: **the emitter
+ELIDES it entirely**, so the emitted C is byte-identical to the bare form one line above
+that IS rejected. Same signature as BUG-791 one level further in — that fix peeled the
+STORED VALUE, this peels the ARGUMENT. Peeled at the TOP of the predicate so every sink
+gains it at once. `NODE_ORELSE` is deliberately NOT peeled: it is a JOIN of two nodes and
+the arm below already checks both; a launder OVER an orelse composes, because the peel
+exposes the orelse node and that arm then handles it.
+Gate: SHAPE p17 in `tools/sink_matrix.sh`, 5 reject + 2 boundary compile cells.
+
+### BUG-816 — the ARENA lifetime was missing from three shared frame-bound helpers (4 holes)
+"Frame-bound" has TWO causes with DIFFERENT deaths: a local dies at return, arena memory
+dies at return AND at `arena.reset()`. `arg_is_local_derived` had been taught both; the
+three OTHER shared helpers tested only `is_local_derived`, so the byte-identical program
+escaped through whichever syntax reached one of them — `g = { .p = arena_ptr }` accepted
+while `g.p = arena_ptr` was rejected one line away. Added at `value_frame_bound_symbol`
+(ident arm), `addr_of_is_local_derived` (reference-root arm) and
+`struct_init_has_local_derived` (Case B).
+Gate: SHAPE p16, 5 reject + 2 boundary compile cells.
+
+### BUG-817 — the root-ident walk was written four times, and written wrong (1 hole)
+The same three lines appeared in `checker.c` (x3) and `emitter.c` as TWO SEQUENTIAL loops:
+
+    while (r->kind == NODE_FIELD) r = r->field.object;
+    while (r->kind == NODE_INDEX) r = r->index_expr.object;
+
+Correct for `a.b.c` and `a[0][1]`, WRONG for anything that ALTERNATES: `s.arr[0].f` peels
+`.f`, stops the first loop at the INDEX, peels `[0]`, then stops the second at the FIELD —
+leaving a FIELD node. Every caller tests `== NODE_IDENT`, which fails, and its safety check
+silently does not run. None NULL-guarded the dereference either. One `expr_root_ident()` in
+`ast.h`, inline so all TUs share one definition, every peel step in one loop.
+Measured live at the atomic sink; the other three are latent (masked today by other
+machinery) and fixed anyway, because a wrong walk sitting in four safety helpers is what
+regenerates the class the next time a masking is removed.
+
+### BUG-818 — `addr_of_is_packed_field` asked only about the ROOT SYMBOL (1 hole)
+A packed struct NESTED in a plain one shifts every offset inside it, so a field below it is
+just as misaligned — but the root-only test saw `Outer` (not packed) and said no.
+`@atomic_load(&g_s.arr[0].f)` compiled clean. The predicate now walks the path root-first,
+resolving the type at each step, and reports packed ANYWHERE in the chain.
+Also a class-kill: the `@atomic_*` sink held a hand-rolled COPY of this predicate carrying
+BOTH defects (root-only AND the broken sequential walk). It now asks the shared one.
+A misaligned atomic hard-faults on ARM/RISC-V and is silently non-atomic elsewhere — and
+x86 permits the unaligned access, so it is invisible on the dev host at both ends.
+
+### BUG-819 — `ir_defer_scan_uses` named every kind but descended no expression (2 holes)
+The walker passed the `-Werror=switch` kind gate cleanly and handed an expression to the UAF
+checker for `NODE_EXPR_STMT` ONLY. So a defer-body read of a freed handle in any expression
+position was unchecked:
+
+    defer { if (h.field > 0) { ... } }   // condition      — missed
+    defer { u32 v = h.field; use(v); }   // var-decl init  — missed
+
+`NODE_VAR_DECL` and `NODE_RETURN` sat in the no-op leaf list, which reads as "nothing to
+scan" while both carry an expression. Wired if/while/for/switch conditions, the for
+init/step, the var-decl initialiser and the return value through the same
+`ir_check_expr_uaf` the statement position already used.
+
+**This is the FIELD half of the walker discipline**: naming a kind is not descending its
+children, and only the kind half has a gate. `tools/audit_walker_fields.sh` (harvested
+from `-39294y`, §B) is the missing net — it found this one plus ten more.
+
+---
+
 ## Session 2026-08-17b — BUG-796..801: the remaining 13 harvested holes (39/39 closed)
 
 Six independent classes, the ones the five structural fixes did not collapse.

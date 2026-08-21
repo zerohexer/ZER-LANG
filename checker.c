@@ -1177,6 +1177,23 @@ static bool escape_type_carries_ref(Type *vt) {
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     if (!arg || depth > 8) return false;
+    /* BUG-815 (2026-08-22): this predicate is the LEAF of call_result_escapes and
+     * of the Ring-push / spawn-arg gates, and it was the only "is this value
+     * frame-bound?" question in the file that never called the shared peeler. So
+     * every sink reaching it was blind to a laundered ARGUMENT:
+     *     g = idfn(&x);                  // correctly REJECTED
+     *     g = idfn((*u32)(&x));          // ACCEPTED - and the emitter DELETES
+     *     g = idfn(@ptrcast(*u32, &x));  // ACCEPTED    this cast entirely, so the
+     *     g = idfn(@pun(*u32, &x));      // ACCEPTED    emitted C is byte-identical
+     * All ASan-confirmed stack-use-after-return. Same signature as BUG-791 one
+     * level further in: that fix peeled the STORED VALUE, this peels the ARGUMENT.
+     * Peeled HERE, at the top, so every sink gains it at once rather than at N
+     * hand-rolled call sites. NODE_ORELSE is deliberately NOT peeled - it is a
+     * JOIN of two nodes, so the arm below checks BOTH arms; peeling to the primary
+     * would drop the fallback. A launder OVER an orelse composes correctly: the
+     * peel exposes the orelse node and that arm then handles it. */
+    arg = unwrap_ptr_launder(arg);
+    if (!arg) return false;
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
@@ -1451,6 +1468,14 @@ static bool container_push_arg_escapes(Checker *c, Type *elem, Node *arg) {
  * to-global sink (AU-4: `g = { .ptr = &local };`) share ONE definition. Pure
  * tightening: only flags non-static non-global locals, so a global/static
  * address never trips it. */
+/* BUG-816: which LIFETIME did the walker actually hit? Set by
+ * struct_init_has_local_derived on each true-return so the diagnostic can name the
+ * ARENA rather than say "a local" for memory that is not one. Read immediately after
+ * the call at the reporting site; never latched. */
+static bool _si_hit_arena = false;
+static const char *frame_bound_noun(bool arena) {
+    return arena ? "memory from an Arena" : "a local";
+}
 static bool struct_init_has_local_derived(Checker *c, Node *init) {
     if (!init || init->kind != NODE_STRUCT_INIT) return false;
     for (int fi = 0; fi < init->struct_init.field_count; fi++) {
@@ -1480,11 +1505,15 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
                 if (src && !src->is_static && !is_global) return true;
             }
         }
-        /* Case B: alias ident already flagged is_local_derived */
+        /* Case B: alias ident already flagged frame-bound (local OR arena -
+         * BUG-816: the arena half was missing here too). */
         if (fv->kind == NODE_IDENT) {
             Symbol *fsym = scope_lookup(c->current_scope,
                 fv->ident.name, (uint32_t)fv->ident.name_len);
-            if (fsym && fsym->is_local_derived) return true;
+            if (fsym && (fsym->is_local_derived || fsym->is_arena_derived)) {
+                _si_hit_arena = fsym->is_arena_derived && !fsym->is_local_derived;
+                return true;
+            }
         }
         /* Case C: slice over a local array (local[0..]) */
         if (fv->kind == NODE_SLICE) {
@@ -1520,6 +1549,17 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
  * return the arg. Over-rejection acceptable (restructure / add `keep`),
  * under-rejection is a safety hole. The keep VALVE is unaffected: a `keep` arg
  * is NOT is_nonkeep_derived, so `idfn(keep_p)` does not fire. */
+/* BUG-816: reset-then-ask, so the ARENA/local distinction the walker recorded is
+ * read from a defined state. A wrapper rather than an out-param threaded through the
+ * recursion: the walker calls itself for nested literals, and the innermost hit is
+ * the one whose lifetime the diagnostic should name. */
+static bool struct_init_frame_bound(Checker *c, Node *init, bool *is_arena) {
+    _si_hit_arena = false;
+    bool hit = struct_init_has_local_derived(c, init);
+    if (is_arena) *is_arena = hit && _si_hit_arena;
+    return hit;
+}
+
 static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
     if (!call || call->kind != NODE_CALL || depth > 8) return false;
     for (int i = 0; i < call->call.arg_count; i++) {
@@ -1906,25 +1946,63 @@ static bool deref_launder_transfers_identity(Checker *c, Node *e) {
  * through the resulting pointer faults on ARM/RISC-V. BUG-493 already rejects
  * this at the @atomic_* sink; this is the same question, hoisted so the general
  * pointer sinks can ask it too — the multi-site pattern. */
+/* Peel pointer/optional/array wrappers to the aggregate underneath, so one step
+ * of an access path yields the struct it actually designates. */
+static Type *packed_step_aggregate(Type *t) {
+    for (int i = 0; t && i < 8; i++) {
+        Type *u = type_unwrap_distinct(t);
+        if (!u) return NULL;
+        TypeKind k = type_dispatch_kind(u);
+        if (k == TYPE_POINTER)       { t = u->pointer.inner; continue; }
+        if (k == TYPE_ARRAY)         { t = u->array.inner;   continue; }
+        if (k == TYPE_OPTIONAL)      { t = type_unwrap_optional(u); continue; }
+        return u;
+    }
+    return NULL;
+}
+/* BUG-818: resolve the aggregate that a path step designates, recording whether ANY
+ * struct along the way is packed. RECURSIVE on purpose — the first version collected
+ * the path into a fixed `Node *steps[32]` and the fixed-buffer audit rejected it,
+ * correctly: a path deeper than the cap would have been silently truncated and the
+ * root-first walk would then start at the wrong step, MISSING a packed struct and
+ * accepting a misaligned address. Recursion is bounded by the parser's own nesting
+ * limit, so there is no cap to truncate at. */
+static Type *packed_path_aggregate(Checker *c, Node *e, bool *packed_seen, int depth) {
+    if (!e || depth > 64) return NULL;
+    if (e->kind == NODE_IDENT) {
+        Symbol *sym = scope_lookup(c->current_scope, e->ident.name,
+                                   (uint32_t)e->ident.name_len);
+        return (sym && sym->type) ? packed_step_aggregate(sym->type) : NULL;
+    }
+    if (e->kind == NODE_INDEX)
+        return packed_path_aggregate(c, e->index_expr.object, packed_seen, depth + 1);
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_STAR)
+        return packed_path_aggregate(c, e->unary.operand, packed_seen, depth + 1);
+    if (e->kind == NODE_FIELD) {
+        Type *ct = packed_path_aggregate(c, e->field.object, packed_seen, depth + 1);
+        if (!ct || type_dispatch_kind(ct) != TYPE_STRUCT) return NULL;
+        /* A packed struct ANYWHERE in the chain shifts every offset inside it, so a
+         * field below it is just as misaligned. The old test asked only about the
+         * ROOT SYMBOL, so `packed Inner` nested in a plain `Outer` escaped. */
+        if (ct->struct_type.is_packed) *packed_seen = true;
+        for (uint32_t fi = 0; fi < ct->struct_type.field_count; fi++) {
+            SField *f = &ct->struct_type.fields[fi];
+            if (f->name_len == (uint32_t)e->field.field_name_len &&
+                memcmp(f->name, e->field.field_name, f->name_len) == 0)
+                return packed_step_aggregate(f->type);
+        }
+        return NULL;
+    }
+    return NULL;
+}
 static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     if (!expr || expr->kind != NODE_UNARY || expr->unary.op != TOK_AMP) return false;
     Node *op = expr->unary.operand;
     if (!op || op->kind != NODE_FIELD) return false;   /* must be a FIELD access */
-    Node *root = op;
-    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
-        if (root->kind == NODE_FIELD) root = root->field.object;
-        else root = root->index_expr.object;
-    }
-    if (!root || root->kind != NODE_IDENT) return false;
-    Symbol *sym = scope_lookup(c->current_scope, root->ident.name,
-                               (uint32_t)root->ident.name_len);
-    if (!sym || !sym->type) return false;
-    Type *st = type_unwrap_distinct(sym->type);
-    /* type_dispatch_kind, not a raw ->kind read: unwraps distinct and is
-     * NULL-safe, so this never trips the type-dispatch audit. */
-    return st && type_dispatch_kind(st) == TYPE_STRUCT && st->struct_type.is_packed;
+    bool packed_seen = false;
+    packed_path_aggregate(c, op, &packed_seen, 0);
+    return packed_seen;
 }
-
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     Node *root = operand;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -1940,7 +2018,10 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     bool root_is_ref = src->type &&
         (type_dispatch_kind(src->type) == TYPE_SLICE ||
          type_dispatch_kind(src->type) == TYPE_POINTER);
-    if (root_is_ref && !src->is_local_derived) return false;
+    /* BUG-816: an ARENA-derived reference root is frame-bound too (see
+     * value_frame_bound_symbol). Without this, `&arena_ptr.field` read as
+     * non-frame-bound and the address escaped. */
+    if (root_is_ref && !src->is_local_derived && !src->is_arena_derived) return false;
     return true;
 }
 
@@ -2206,7 +2287,12 @@ static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth) {
     if (v->kind == NODE_IDENT) {
         Symbol *s = scope_lookup(c->current_scope, v->ident.name,
                                  (uint32_t)v->ident.name_len);
-        if (s && s->is_local_derived) return s;
+        /* BUG-816: is_arena_derived is the SAME lifetime fact as is_local_derived
+         * for escape purposes - a pointer from a LOCAL arena.alloc() dies with the
+         * frame exactly as a stack pointer does. arg_is_local_derived was taught
+         * this (see its "§B #11" note); the two OTHER shared frame-bound helpers
+         * were not, so the arena half of the question was answered at 2 of 4 sites. */
+        if (s && (s->is_local_derived || s->is_arena_derived)) return s;
     }
     return NULL;
 }
@@ -5218,17 +5304,22 @@ static Type *check_expr(Checker *c, Node *node) {
                     classify_escape_sink(c, node->assign.target, &ots, &og, &op_);
                     if (og || op_) {
                         Symbol *bad = value_frame_bound_symbol(c, aval, 0);
-                        if (bad && ots)
+                        if (bad && ots) {
+                            /* BUG-816: name the ARENA when that is the lifetime, so a
+                             * user with no local in sight is not sent looking for one. */
+                            bool ar = bad->is_arena_derived && !bad->is_local_derived;
                             checker_error(c, node->loc.line,
                                 op_ ?
-                                "cannot store local-derived pointer '%.*s' through pointer parameter "
+                                "cannot store %s pointer '%.*s' through pointer parameter "
                                 "'%.*s' — reachable through an orelse arm; the pointer dangles when "
                                 "the frame returns" :
-                                "cannot store local-derived pointer '%.*s' in static/global variable "
+                                "cannot store %s pointer '%.*s' in static/global variable "
                                 "'%.*s' — reachable through an orelse arm; the pointer dangles when "
                                 "the frame returns",
+                                ar ? "arena-derived" : "local-derived",
                                 (int)bad->name_len, bad->name,
                                 (int)ots->name_len, ots->name);
+                        }
                     }
                 }
             }
@@ -5641,17 +5732,21 @@ static Type *check_expr(Checker *c, Node *node) {
          * the IDENT-root walker above never inspects a NODE_STRUCT_INIT value.
          * Reuse the recursive struct_init_has_local_derived helper (AU-3's fix).
          * Gated on classify_escape_sink (global/param) so a LOCAL target is fine. */
+        bool si_arena_a = false;
         if (node->assign.op == TOK_EQ &&
             node->assign.value && node->assign.value->kind == NODE_STRUCT_INIT &&
-            struct_init_has_local_derived(c, node->assign.value)) {
+            struct_init_frame_bound(c, node->assign.value, &si_arena_a)) {
+            bool si_arena = si_arena_a;
             Symbol *tgt_sym = NULL; bool tgt_g = false, tgt_p = false;
             classify_escape_sink(c, node->assign.target, &tgt_sym, &tgt_g, &tgt_p);
             if ((tgt_g || tgt_p) && tgt_sym) {
                 checker_error(c, node->loc.line,
-                    "cannot store struct/union literal carrying a pointer to a "
-                    "local in %s '%.*s' — pointer will dangle when function returns",
+                    "cannot store struct/union literal carrying a pointer to %s "
+                    "in %s '%.*s' — pointer will dangle when the frame returns%s",
+                    frame_bound_noun(si_arena),
                     tgt_p ? "pointer-parameter field" : "global/static variable",
-                    (int)tgt_sym->name_len, tgt_sym->name);
+                    (int)tgt_sym->name_len, tgt_sym->name,
+                    si_arena ? " (an arena-derived pointer also dies at arena.reset())" : "");
             }
         }
 
@@ -10496,29 +10591,19 @@ static Type *check_expr(Checker *c, Node *node) {
              * Packed fields can be misaligned. GCC __atomic builtins
              * require natural alignment — misaligned = hard fault on ARM/RISC-V. */
             if (node->intrinsic.arg_count >= 1) {
-                Node *aarg = node->intrinsic.args[0];
-                if (aarg->kind == NODE_UNARY && aarg->unary.op == TOK_AMP &&
-                    aarg->unary.operand->kind == NODE_FIELD) {
-                    /* Walk to root ident to find if struct is packed */
-                    Node *root = aarg->unary.operand;
-                    while (root->kind == NODE_FIELD) root = root->field.object;
-                    while (root->kind == NODE_INDEX) root = root->index_expr.object;
-                    if (root->kind == NODE_IDENT) {
-                        Symbol *sym = scope_lookup(c->current_scope,
-                            root->ident.name, (uint32_t)root->ident.name_len);
-                        if (sym && sym->type) {
-                            Type *st = type_unwrap_distinct(sym->type);
-                            /* SAFETY: zer_atomic_on_packed_valid in src/safety/atomic_rules.c (E03) */
-                            int is_packed = (st->kind == TYPE_STRUCT && st->struct_type.is_packed) ? 1 : 0;
-                            if (zer_atomic_on_packed_valid(is_packed) == 0) {
-                                checker_error(c, node->loc.line,
-                                    "@%.*s on packed struct field — may be misaligned. "
-                                    "Atomic operations require natural alignment. "
-                                    "Use a non-packed struct or copy to aligned local first",
-                                    (int)nlen, name);
-                            }
-                        }
-                    }
+                /* BUG-818: was a hand-rolled COPY of addr_of_is_packed_field that
+                 * tested only the ROOT SYMBOL's type (so a packed struct nested in a
+                 * plain one escaped) and used the broken sequential root walk (so an
+                 * ALTERNATING path like `&g.arr[0].f` escaped too). Both are the
+                 * shared predicate's job; ask it instead of keeping a second answer. */
+                /* SAFETY: zer_atomic_on_packed_valid in src/safety/atomic_rules.c (E03) */
+                int is_packed = addr_of_is_packed_field(c, node->intrinsic.args[0]) ? 1 : 0;
+                if (zer_atomic_on_packed_valid(is_packed) == 0) {
+                    checker_error(c, node->loc.line,
+                        "@%.*s on packed struct field — may be misaligned. "
+                        "Atomic operations require natural alignment. "
+                        "Use a non-packed struct or copy to aligned local first",
+                        (int)nlen, name);
                 }
             }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
@@ -10839,12 +10924,8 @@ static Type *check_expr(Checker *c, Node *node) {
                  * caught, while the legit pointer-param `b`/`b.field` case passes).
                  * Locking the 2nd struct inside the cond mutex is not an option
                  * (AB-BA deadlock + cond_wait sleeps holding the extra lock). */
-                Node *croot = node->intrinsic.args[0];
-                while (croot->kind == NODE_FIELD) croot = croot->field.object;
-                while (croot->kind == NODE_INDEX) croot = croot->index_expr.object;
-                while (croot->kind == NODE_UNARY && croot->unary.op == TOK_STAR)
-                    croot = croot->unary.operand;
-                if (croot->kind == NODE_IDENT) {
+                Node *croot = expr_root_ident(node->intrinsic.args[0]);  /* BUG-817 */
+                if (croot) {
                     Node *bad = cond_pred_foreign_shared(c, node->intrinsic.args[1],
                         croot->ident.name, (uint32_t)croot->ident.name_len);
                     if (bad) {
@@ -14576,11 +14657,13 @@ static void check_stmt(Checker *c, Node *node) {
                  * (`return { .p = &local }`, a slice-of-local, or a call-launder)
                  * dangles in the caller. Gate on the return type actually carrying
                  * a data pointer, then run the shared walker. */
+                bool si_arena_r = false;
                 if (type_carries_data_pointer(c->current_func_ret, 0) &&
-                    struct_init_has_local_derived(c, node->ret.expr)) {
+                    struct_init_frame_bound(c, node->ret.expr, &si_arena_r)) {
                     checker_error(c, node->loc.line,
-                        "cannot return a struct literal carrying a pointer to a "
-                        "local — stack memory is freed when the function returns");
+                        "cannot return a struct literal carrying a pointer to %s — "
+                        "that memory is freed when the function returns",
+                        frame_bound_noun(si_arena_r));
                 }
             }
 
@@ -20642,12 +20725,8 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
                 }
                 if (is_shared) {
                     /* Find the bare root ident for the cond-name comparison. */
-                    Node *root = cur;
-                    while (root->kind == NODE_FIELD) root = root->field.object;
-                    while (root->kind == NODE_INDEX) root = root->index_expr.object;
-                    while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-                        root = root->unary.operand;
-                    if (root->kind == NODE_IDENT &&
+                    Node *root = expr_root_ident(cur);  /* BUG-817 */
+                    if (root &&
                         !((uint32_t)root->ident.name_len == cond_root_len &&
                           memcmp(root->ident.name, cond_root, cond_root_len) == 0)) {
                         return pred; /* foreign shared read */

@@ -692,12 +692,8 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_FIELD) {
         /* Walk to root of field chain */
-        Node *root = expr;
-        while (root->kind == NODE_FIELD) root = root->field.object;
-        while (root->kind == NODE_INDEX) root = root->index_expr.object;
-        while (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        if (root->kind == NODE_IDENT) {
+        Node *root = expr_root_ident(expr);  /* BUG-817 */
+        if (root) {
             Type *t = checker_get_type(e->checker, root);
             if (t) {
                 Type *eff = type_unwrap_distinct(t);

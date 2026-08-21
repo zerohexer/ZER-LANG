@@ -738,6 +738,31 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
     return CONST_EVAL_FAIL;
 }
 
+/* BUG-817: THE root-ident walk. The same three lines had been hand-written at
+ * four sites (checker.c x3, emitter.c x1) as TWO SEQUENTIAL loops:
+ *     while (r->kind == NODE_FIELD) r = r->field.object;
+ *     while (r->kind == NODE_INDEX) r = r->index_expr.object;
+ * Correct for `a.b.c` and for `a[0][1]`, WRONG for anything that ALTERNATES:
+ * `s.arr[0].f` peels `.f`, stops the first loop at the INDEX, peels `[0]`, then
+ * stops the second loop at the FIELD - leaving a FIELD node. Every caller then
+ * tests `== NODE_IDENT`, which fails, and its safety check silently does not run.
+ * Measured live at the atomic sink: `@atomic_load(&g_s.arr[0].f)` on a packed
+ * struct compiled clean while `@atomic_load(&g_i.f)` was rejected one line away.
+ * None of the four NULL-guarded the dereference either. One loop, every peel step,
+ * NULL-guarded, bounded; returns NULL when the path does not bottom out in an ident. */
+static inline Node *expr_root_ident(Node *e) {
+    Node *cur = e;
+    int guard = 0;
+    while (cur && guard++ < 4096) {
+        if (cur->kind == NODE_FIELD)      cur = cur->field.object;
+        else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
+        else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR)
+                                          cur = cur->unary.operand;
+        else break;
+    }
+    return (cur && cur->kind == NODE_IDENT) ? cur : NULL;
+}
+
 /* BUG-389: depth-limited version — delegates to eval_const_expr_ex with no resolver */
 static inline int64_t eval_const_expr_d(Node *n, int depth) {
     return eval_const_expr_ex(n, depth, NULL, NULL);

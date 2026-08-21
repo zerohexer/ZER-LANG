@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: pointer
+// BUG-803, the LAUNDER-THROUGH-A-LOCAL sink: the struct literal is bound to a
+// plain local first, so the store that reaches the global sees only an ident.
+// It is caught because the var-decl taint propagation consults the same shared
+// helper — which is the point of fixing the predicate rather than the sinks.
+struct Node { u32 v; }
+struct Box { *Node p; }
+Box g;
+
+void stash() {
+    u8[256] backing;
+    Arena scratch = Arena.over(backing);
+    *Node a = scratch.alloc(Node) orelse return;
+    Box t = { .p = a };
+    g = t;
+}
+
+u32 main() { stash(); return 0; }

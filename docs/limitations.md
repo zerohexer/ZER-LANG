@@ -13,6 +13,11 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
+**PROGRESS: §A landed 2026-08-22** (BUG-815..819) — V1, V2, V3 and W7 are struck through
+below. Sink matrix grew 65 -> 78 cells (SHAPES p16 + p17) and was verified non-vacuous:
+8 holes against a from-HEAD pre-fix build, 0 after. 11 negatives installed, every one
+confirmed to flip ACC -> REJ. Remaining: 41.
+
 ### Source branches
 
 | Branch | Forked at | Commits | Theme |
@@ -46,9 +51,9 @@ phrasing. Cosmetic; the rules fire.
 
 | # | Fix | Best version | Evidence on main |
 |---|---|---|---|
-| V1 | `arg_is_local_derived` never called `unwrap_ptr_launder` — a laundered ARGUMENT escapes | **pjtawx** BUG-807 | `g = idfn(&x)` REJECTED; `(*u32)(&x)`, `@ptrcast`, `@pun` all ACCEPTED. The C-style cast is DELETED by the emitter, so emitted C is byte-identical to the rejected form. ASan stack-use-after-return. Argument-side sibling of main's BUG-791 |
-| V2 | ARENA lifetime missing from both frame-bound helpers | **pjtawx** BUG-803 | 4 negatives accepted: launder-then-store, orelse-fallback, struct-literal to global, struct-literal return |
-| V3 | Root-ident walk written 5x as two SEQUENTIAL loops — wrong for any ALTERNATING chain | **pjtawx** BUG-804 (`expr_root_ident` in ast.h) | `@atomic_load(&g_s.arr[0].f)` on a packed nested struct ACCEPTED; `@atomic_load(&g_i.f)` rejected one line away. Misaligned atomic = hard fault on ARM/RISC-V |
+| ~~V1~~ **DONE 2026-08-22 (BUG-815)** | `arg_is_local_derived` never called `unwrap_ptr_launder` — a laundered ARGUMENT escapes | **pjtawx** BUG-807 | `g = idfn(&x)` REJECTED; `(*u32)(&x)`, `@ptrcast`, `@pun` all ACCEPTED. The C-style cast is DELETED by the emitter, so emitted C is byte-identical to the rejected form. ASan stack-use-after-return. Argument-side sibling of main's BUG-791 |
+| ~~V2~~ **DONE 2026-08-22 (BUG-816)** | ARENA lifetime missing from THREE frame-bound helpers | **pjtawx** BUG-803 | 4 negatives accepted: launder-then-store, orelse-fallback, struct-literal to global, struct-literal return |
+| ~~V3~~ **DONE 2026-08-22 (BUG-817/818)** | Root-ident walk written 4x as two SEQUENTIAL loops — wrong for any ALTERNATING chain | **pjtawx** BUG-804 (`expr_root_ident` in ast.h) | `@atomic_load(&g_s.arr[0].f)` on a packed nested struct ACCEPTED; `@atomic_load(&g_i.f)` rejected one line away. Misaligned atomic = hard fault on ARM/RISC-V |
 | V4 | `&packed.field` gated at 1 of 5 sinks | **87xihb** BUG-804 (5 sinks + non-sticky) | assign / call-arg / alias sinks ACCEPTED. `39294y` BUG-813 is a 2-sink subset — take 87xihb, keep 39294y's `zer_gaps` file for the 4 sinks BOTH leave open |
 | V5 | Bit-range write `flags[3..0] = 5` is an implicit RMW, missed at BOTH sinks | **87xihb** BUG-803 | ACCEPTED while `flags += 1` is REJECTED — same operation, different spelling. `resolve_write_target_global` does not peel `NODE_SLICE` |
 | V6 | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
@@ -89,7 +94,7 @@ these 11 are its output, each verified live.
 | W4 | `expr_contains_yield` misses `orelse.fallback` | Shared mutex held ACROSS a coroutine suspend, verified in emitted C |
 | W5 | `check_call_provenance` reaches a call only as a whole statement / var-decl init / return | 3 negatives accepted. `if (process(@ptrcast(*opaque,&g_motor)) > 0)` compiles; identical call as a var-decl init is rejected |
 | W6 | `emitter.c` holds TWO more drifted copies of the shared-root walker | `defer { sink(g.cb()); }` emits with NO mutex. Fix unifies to one `ir_find_shared_root_expr`, deletes ~170 lines + 6 dead walkers. **Complements V3** (pjtawx does ast.h/checker/zercheck_ir; this does emitter.c) |
-| W7 | `ir_defer_scan_uses` looks at expression statements only | `defer_use_in_condition_uaf`, `defer_use_in_vardecl_uaf` accepted — unreported UAF |
+| ~~W7~~ **DONE 2026-08-22 (BUG-819)** | `ir_defer_scan_uses` looked at expression statements only | `defer_use_in_condition_uaf`, `defer_use_in_vardecl_uaf` accepted — unreported UAF |
 | W8 | `scan_frame` skips loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
 | W9 | `expr_mentions_global` misses intrinsic/call/orelse | = V6 above |
 | W10 | `ir_defer_free_arg` knows only 3 builtin free spellings | OVER-REJECTION, see O1 |

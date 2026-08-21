@@ -2352,23 +2352,45 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         ir_defer_free_arg(body) == NULL) {
         ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
     }
+    /* BUG-819: the two non-control-flow expression positions. Both sat in the
+     * no-op leaf list below, which reads as "nothing to scan" — but a VAR_DECL
+     * carries an initialiser and a RETURN carries a value, and either can read a
+     * handle this defer's exit state says is already freed. */
+    if (body->kind == NODE_VAR_DECL && body->var_decl.init)
+        ir_check_expr_uaf(zc, func, ps, body->var_decl.init, defer_line, rs);
+    if (body->kind == NODE_RETURN && body->ret.expr)
+        ir_check_expr_uaf(zc, func, ps, body->ret.expr, defer_line, rs);
 
+    /* BUG-819: this walker NAMED every control-flow kind but only ever handed an
+     * expression to the UAF checker for NODE_EXPR_STMT — so a defer-body read of a
+     * freed handle in any EXPRESSION POSITION was silently unchecked:
+     *     defer { if (h.field > 0) { ... } }      // condition   — missed
+     *     defer { u32 v = h.field; use(v); }      // var-decl init — missed
+     * Passing the kind gate is not the same as descending the fields; that is the
+     * whole point of the FIELD-descent discipline. Every expression position below
+     * now routes through the same ir_check_expr_uaf the statement position uses. */
     switch (body->kind) {
     case NODE_BLOCK:
         for (int i = 0; i < body->block.stmt_count; i++)
             ir_defer_scan_uses(zc, func, ps, body->block.stmts[i], defer_line, rs);
         break;
     case NODE_IF:
+        ir_check_expr_uaf(zc, func, ps, body->if_stmt.cond, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->if_stmt.then_body, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->if_stmt.else_body, defer_line, rs);
         break;
     case NODE_FOR:
+        ir_defer_scan_uses(zc, func, ps, body->for_stmt.init, defer_line, rs);
+        ir_check_expr_uaf(zc, func, ps, body->for_stmt.cond, defer_line, rs);
+        ir_check_expr_uaf(zc, func, ps, body->for_stmt.step, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->for_stmt.body, defer_line, rs);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
+        ir_check_expr_uaf(zc, func, ps, body->while_stmt.cond, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->while_stmt.body, defer_line, rs);
         break;
     case NODE_SWITCH:
+        ir_check_expr_uaf(zc, func, ps, body->switch_stmt.expr, defer_line, rs);
         for (int i = 0; i < body->switch_stmt.arm_count; i++)
             ir_defer_scan_uses(zc, func, ps, body->switch_stmt.arms[i].body, defer_line, rs);
         break;

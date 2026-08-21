@@ -1,0 +1,12 @@
+// expect-error: points into a PACKED struct field
+// BUG-813: BUG-786 rejects a DEREF through `&packed.field`, but the fact it
+// relies on (Symbol.is_packed_derived) is a per-local annotation and dies at a
+// parameter. Inside `void takes(*u32 q){ *q = 1; }` the type says "aligned u32
+// pointer" and nothing remembers otherwise, so the misaligned store compiled —
+// a hard fault on ARM/RISC-V, silently slow on x86, no diagnostic at either end.
+// The CALL is the sink that had no answer to the question @atomic_* (BUG-493)
+// and deref (BUG-786) already ask.
+packed struct P { u8 a; u32 b; }
+P p;
+void takes(*u32 q) { *q = 1; }
+u32 main() { takes(&p.b); return 0; }

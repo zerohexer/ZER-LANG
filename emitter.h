@@ -112,6 +112,11 @@ typedef struct {
      * function's cleanup — wrong. A trap aborts safely before the OOB access,
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
+    /* BUG-835: how many scopes are open that a `return` must NEVER leave — a held
+     * shared lock, or an interrupt-disabled @critical block. Counted rather than
+     * a bool because they nest. While non-zero, the bounds/UAF auto-guard degrades
+     * to _zer_trap instead of emitting an early `return`. */
+    int noreturn_scope_depth;
 
 } Emitter;
 

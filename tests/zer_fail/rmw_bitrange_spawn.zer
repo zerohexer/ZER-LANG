@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: read-modify-write
+// BUG-803 (2026-08-17): a BIT-RANGE write is an IMPLICIT read-modify-write — the
+// emitter lowers `flags[3..0] = 5` to
+//     *p = (*p & ~(((1ull << 4) - 1) << 0)) | ((5 << 0) & mask)
+// so an interrupt or a concurrent thread landing between the load and the store
+// loses the update. Both RMW gates asked the wrong question: one tested whether
+// the OPERATOR was compound, the other whether the RHS mentioned the global. A
+// bit-range write is spelled `=` and its RHS (`5`) never names the global, so both
+// disjuncts were false at BOTH sinks. The `+=` spelling of the identical operation
+// was correctly rejected the whole time, which makes this the SPELLING axis of one
+// question, not a new rule.
+//
+// Also fixed underneath: `resolve_write_target_global` peeled FIELD/INDEX/deref
+// but not NODE_SLICE, so the walk returned NULL and the write was invisible to
+// every caller of the shared resolver.
+volatile u32 flags;
+void bump() { flags[3..0] = 5; }
+u32 main() { spawn bump(); flags[3..0] = 1; return 0; }

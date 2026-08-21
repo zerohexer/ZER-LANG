@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: into a PACKED struct field
+// NOTE: narrowed to the substring EVERY packed sink shares. Two branches
+// phrased this rule differently ("points into" vs "a pointer into") and the
+// sentence that reads naturally differs per sink (deref / argument / return),
+// so the directive asserts the RULE rather than one sink's grammar.
+// BUG-804 — the ALIAS hop. The var-decl write site scanned only for a literal `&`,
+// so a pointer COPIED from a packed-derived local was never flagged and its deref
+// compiled to the same misaligned store.
+packed struct P { u8 a; u32 b; }
+P g;
+u32 main() {
+    *u32 q = &g.b;
+    *u32 r = q;      // alias — was not propagated
+    *r = 7;
+    return 0;
+}

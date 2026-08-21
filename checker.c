@@ -1787,6 +1787,11 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
         dst->nonkeep_root_param = src->nonkeep_root_param; /* keep inference: carry root param to aliases */
     }
     if (src->is_keep_derived) dst->is_keep_derived = true;
+    /* BUG-833: the packed-misalignment fact rides the VALUE the same way, so a
+     * local-to-local copy (`*u32 r = q;`) keeps it. Not sticky at the ASSIGNMENT
+     * sink (see below) — a reused pointer must re-clear when it is pointed at
+     * aligned memory. */
+    if (src->is_packed_derived) dst->is_packed_derived = true;
 }
 
 /* Given the operand of a `&` (address-of), decide whether the resulting
@@ -2003,6 +2008,36 @@ static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     packed_path_aggregate(c, op, &packed_seen, 0);
     return packed_seen;
 }
+/* BUG-833: `Symbol.is_packed_derived` was WRITTEN at exactly one site (the
+ * var-decl `addr_exprs` loop) and READ at exactly one (the deref of a bare ident).
+ * Of the five ways to reach the identical misaligned store, only the var-decl form
+ * was gated:
+ *     *u32 q = &g.b; *q = 7;      var-decl  -> REJECTED (the only guarded form)
+ *     q = &g.b; *q = 7;           assign    -> accepted
+ *     poke(&g.b);                 call-arg  -> accepted
+ *     *u32 r = q; *r = 7;         alias     -> accepted
+ *     return &g.b;                return    -> accepted
+ * Measured on the assignment form: `movl $7, 1+g(%rip)` — a 32-bit store at an ODD
+ * address. A hard fault on ARMv7-M / RISC-V, a silent split access on Cortex-M0+,
+ * and merely SLOW on x86 — which is why no hosted test could ever have caught it.
+ *
+ * The CALL-ARG sink is why the FLAG route was structurally incomplete rather than
+ * merely under-wired: `poke(&g.b)` binds no name, so no Symbol exists to carry the
+ * fact. A predicate asked on the EXPRESSION is the only thing that can reach it. */
+static bool value_is_packed_derived(Checker *c, Node *v) {
+    if (!v) return false;
+    v = unwrap_ptr_launder(v);
+    if (!v) return false;
+    if (addr_of_is_packed_field(c, v)) return true;
+    /* the ALIAS hop: `*u32 r = q;` where q is already packed-derived */
+    if (v->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                 (uint32_t)v->ident.name_len);
+        return s && s->is_packed_derived;
+    }
+    return false;
+}
+
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     Node *root = operand;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -2224,13 +2259,39 @@ static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth) {
  *
  * Returns the global Symbol written, or NULL. Conservative: an unresolvable
  * pointer yields NULL = today's behaviour, never a new rejection. */
+/* BUG-834: `flags[3..0] = 5` lowers to `*p = (*p & ~mask) | (v << lo)` — a literal
+ * read-modify-write. Both is_rmw gates asked the WRONG question: one tests whether
+ * the OPERATOR is compound, the other whether the RHS mentions the target. A
+ * bit-range write is spelled `=` with an RHS (`5`) that never names the global, so
+ * both disjuncts were false and an interrupt or a concurrent thread landing between
+ * the load and the store loses the update, silently and nondeterministically.
+ * The `+=` spelling of the identical operation was rejected the whole time, which
+ * is what makes this the SPELLING axis of one question rather than a new rule.
+ * A bit range is distinguished from a real slice by the TARGET's type: slicing an
+ * INTEGER is a bit range; slicing an aggregate is a subslice. */
+static bool target_is_bit_range(Checker *c, Node *target) {
+    if (!target || target->kind != NODE_SLICE) return false;
+    Type *ot = checker_get_type(c, target->slice.object);
+    if (!ot) return false;
+    TypeKind k = type_dispatch_kind(ot);
+    return k == TYPE_U8 || k == TYPE_U16 || k == TYPE_U32 || k == TYPE_U64 ||
+           k == TYPE_I8 || k == TYPE_I16 || k == TYPE_I32 || k == TYPE_I64 ||
+           k == TYPE_USIZE || k == TYPE_UINT || k == TYPE_SINT;
+}
+
 static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) {
     if (!target || depth > 6) return NULL;
     Node *r = target;
+    /* BUG-834: NODE_SLICE was missing. A BIT-RANGE target `flags[3..0] = 5` parses
+     * as a slice, so THE shared "which global does this write land on?" resolver
+     * stopped at the slice node and returned NULL — making the write invisible to
+     * every caller, including both RMW sinks. */
     while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                 r->kind == NODE_SLICE ||
                  (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
         if (r->kind == NODE_FIELD) r = r->field.object;
         else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_SLICE) r = r->slice.object;
         else r = r->unary.operand;
     }
     if (!r || r->kind != NODE_IDENT) return NULL;
@@ -2466,6 +2527,7 @@ static bool check_isr_ban(Checker *c, int line, const char *method) {
 /* Validates a NODE_STRUCT_INIT against a target struct type.
  * Checks: all field names exist, all field value types match.
  * Used at 4 value-flow sites: var-decl, assignment, call arg, return. */
+static void check_inttoptr_dest_volatile(Checker *c, Node *init, Type *dest, int line);  /* fwd */
 static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int line) {
     Type *st = type_unwrap_distinct(target_type);
     if (st->kind != TYPE_STRUCT) {
@@ -2495,6 +2557,16 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     checker_set_type(c, df->value, ft);
                     break;
                 }
+                /* BUG-831: the @inttoptr-into-non-volatile rule (BUG-799) had
+                 * exactly ONE call site — the var-decl initialiser. A struct
+                 * LITERAL field is a second binding of the same peripheral
+                 * address, and it was unguarded:
+                 *     struct Uart { *u32 dr; }        // not volatile
+                 *     g_uart = { .dr = @inttoptr(*u32, 0x40020004) };
+                 * -O2 then coalesces or deletes the device accesses, silently on
+                 * the host (no peripheral) AND silently on the target (no fault).
+                 * Same question, second sink. */
+                check_inttoptr_dest_volatile(c, df->value, ft, line);
                 Type *vt = checker_get_type(c, df->value);
                 if (vt && ft && !type_equals(ft, vt) &&
                     !can_implicit_coerce(vt, ft) &&
@@ -2689,6 +2761,18 @@ static bool inttoptr_addr_is_volatile_derived(Checker *c, Node *addr) {
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
  * Returns true if violation detected (error emitted). */
+/* BUG-832: the DETECTION half, split out so every sink asks ONE question while
+ * keeping its OWN wording. The call-argument, return and spawn-argument sinks
+ * hand-rolled a RAW pointer-kind comparison (a direct kind test against
+ * TYPE_POINTER), which is FALSE for `?*T`, so the whole check was skipped whenever either side was
+ * optional-wrapped. That axis is reachable because can_implicit_coerce converts
+ * `volatile *T -> ?*T` and the emitter lowers a null-sentinel `?*T` to a bare
+ * non-volatile pointer, so the qualifier is gone in the emitted C while the
+ * identical `*T` form has always been rejected. The peeling below already
+ * handles optionals on each side independently (see J2); only the SINKS were
+ * missing. */
+static bool volatile_strip_detected(Checker *c, Node *src_expr, Type *src_type,
+                                     Type *tgt_type);
 static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
                                   Type *tgt_type, int line, const char *context) {
     Type *seff = type_unwrap_distinct(src_type);
@@ -2732,6 +2816,27 @@ static bool check_volatile_strip(Checker *c, Node *src_expr, Type *src_type,
             "%s cannot strip volatile qualifier — "
             "target must be volatile pointer", context);
         return true;
+    }
+    return false;
+}
+
+/* The same question with no diagnostic — for sinks that own their wording. */
+static bool volatile_strip_detected(Checker *c, Node *src_expr, Type *src_type,
+                                     Type *tgt_type) {
+    Type *seff = type_unwrap_distinct(src_type);
+    Type *teff = type_unwrap_distinct(tgt_type);
+    while (seff && type_dispatch_kind(seff) == TYPE_OPTIONAL)
+        seff = type_unwrap_distinct(seff->optional.inner);
+    while (teff && type_dispatch_kind(teff) == TYPE_OPTIONAL)
+        teff = type_unwrap_distinct(teff->optional.inner);
+    if (!seff || type_dispatch_kind(seff) != TYPE_POINTER) return false;
+    if (!teff || type_dispatch_kind(teff) != TYPE_POINTER) return false;
+    if (teff->pointer.is_volatile) return false;   /* target keeps it — fine */
+    if (seff->pointer.is_volatile) return true;
+    if (src_expr && src_expr->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope,
+            src_expr->ident.name, (uint32_t)src_expr->ident.name_len);
+        if (s && s->is_volatile) return true;
     }
     return false;
 }
@@ -5051,6 +5156,7 @@ static Type *check_expr(Checker *c, Node *node) {
              * pointee), and treat a WRITTEN-OUT `g = g + 1` as the RMW it is. */
             Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
             bool is_rmw = (node->assign.op != TOK_EQ) ||
+                          target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                           (gs && assign_reads_own_target(node->assign.value, gs));
             if (is_rmw && gs && !gs->is_function)
                 track_isr_global(c, gs->name, gs->name_len, true);
@@ -5478,6 +5584,13 @@ static Type *check_expr(Checker *c, Node *node) {
                             addr_of_is_local_derived(c, vlaunder->unary.operand)) {
                             tsym->is_local_derived = true;
                         }
+                        /* BUG-833, the ASSIGNMENT sink. NOT STICKY: SET on a
+                         * packed-derived RHS and CLEAR otherwise, so `q = &aligned.z;`
+                         * re-clears. A sticky flag would over-reject every later deref
+                         * of a reused pointer, which is why this is an assignment
+                         * rather than an `if (...) = true`. */
+                        if (type_can_carry_pointer(tsym->type))
+                            tsym->is_packed_derived = value_is_packed_derived(c, vcheck);
                     }
                     /* check if new value is an alias of local/arena-derived */
                     {
@@ -7335,16 +7448,21 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         /* BUG-263: volatile pointer → non-volatile param strips volatile.
                          * Check both type-level and symbol-level volatile. */
-                        if (arg->kind == TYPE_POINTER && param->kind == TYPE_POINTER &&
-                            !param->pointer.is_volatile) {
-                            bool arg_volatile = arg->pointer.is_volatile;
-                            if (!arg_volatile && node->call.args[i]->kind == NODE_IDENT) {
-                                Symbol *as = scope_lookup(c->current_scope,
-                                    node->call.args[i]->ident.name,
-                                    (uint32_t)node->call.args[i]->ident.name_len);
-                                if (as && as->is_volatile) arg_volatile = true;
-                            }
-                            if (arg_volatile) {
+                        /* BUG-832: was a raw pointer-kind comparison, FALSE for
+                         * `?*T`, so the whole check was skipped on the optional
+                         * axis. One shared detector, this sink's own wording. */
+                        /* BUG-833, the CALL-ARG sink — the one that made the FLAG
+                         * route structurally incomplete: `poke(&g.b)` binds no name,
+                         * so no Symbol exists to carry the fact and only a predicate
+                         * asked on the EXPRESSION can reach it. */
+                        if (value_is_packed_derived(c, node->call.args[i])) {
+                            checker_error(c, node->loc.line,
+                                "argument %d points into a PACKED struct field and may be "
+                                "misaligned (a hard fault on ARM/RISC-V). Pass the field "
+                                "by value, or copy it to an aligned local first", i + 1);
+                        }
+                        if (volatile_strip_detected(c, node->call.args[i], arg, param)) {
+                            {
                                 checker_error(c, node->loc.line,
                                     "argument %d: cannot pass volatile pointer to non-volatile parameter",
                                     i + 1);
@@ -11852,6 +11970,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * the mirrored-sink drift this grid exists to catch (it caught this
              * one immediately). */
             bool _is_rmw = (node->assign.op != TOK_EQ) ||
+                           target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                            (ts && assign_reads_own_target(node->assign.value, ts));
             if (ts && !ts->is_function && !ts->is_const &&
                 zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,
@@ -12690,7 +12809,7 @@ static void check_stmt(Checker *c, Node *node) {
                          * Carry that on the symbol so the deref/index sinks can
                          * reject it — BUG-493 already rejects the @atomic_* sink,
                          * and this is the same question at the general sinks. */
-                        if (addr_of_is_packed_field(c, addr_exprs[ai]))
+                        if (value_is_packed_derived(c, addr_exprs[ai]))
                             sym->is_packed_derived = true;
                     }
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
@@ -14146,22 +14265,23 @@ static void check_stmt(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot return const slice as mutable — would allow writing to read-only memory");
                 }
-                /* BUG-281: volatile stripping on return */
-                if (ret_type->kind == TYPE_POINTER && c->current_func_ret->kind == TYPE_POINTER &&
-                    !c->current_func_ret->pointer.is_volatile) {
-                    /* check both type-level and symbol-level volatile */
-                    bool ret_volatile = ret_type->pointer.is_volatile;
-                    if (!ret_volatile && node->ret.expr->kind == NODE_IDENT) {
-                        Symbol *rs = scope_lookup(c->current_scope,
-                            node->ret.expr->ident.name,
-                            (uint32_t)node->ret.expr->ident.name_len);
-                        if (rs && rs->is_volatile) ret_volatile = true;
-                    }
-                    if (ret_volatile) {
-                        checker_error(c, node->loc.line,
-                            "cannot return volatile pointer as non-volatile — "
-                            "writes through result may be optimized away");
-                    }
+                /* BUG-281 + BUG-832: was a RAW pointer-kind comparison, FALSE for
+                 * `?*T`, so returning a volatile pointer as `?*u32` stripped the
+                 * qualifier silently. One shared detector, this sink's wording. */
+                if (volatile_strip_detected(c, node->ret.expr, ret_type,
+                                            c->current_func_ret)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return volatile pointer as non-volatile — "
+                        "writes through result may be optimized away");
+                }
+                /* BUG-833, the RETURN sink. Rejected at the SOURCE because the fact
+                 * does not cross the function boundary — the callee's signature says
+                 * "aligned pointer", so the caller's deref cannot know otherwise. */
+                if (value_is_packed_derived(c, node->ret.expr)) {
+                    checker_error(c, node->loc.line,
+                        "cannot return a pointer into a PACKED struct field — it may be "
+                        "misaligned (a hard fault on ARM/RISC-V), and the fact does not "
+                        "survive the function boundary. Return the field BY VALUE instead");
                 }
             }
 
@@ -19455,6 +19575,59 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                     "function '%.*s' calls through function pointer with unknown target — "
                     "stack depth not verifiable",
                     (int)f->name_len, f->name);
+            }
+        }
+        
+        /* BUG-836: every check above measures ONE entry point against the FULL
+         * limit, and they are never SUMMED. On bare metal `main` and every ISR
+         * share ONE stack: an interrupt frame is pushed ON TOP of whatever main
+         * had already used. So a program whose main chain needs N and whose ISR
+         * chain needs N passed --stack-limit N while the real peak is 2N.
+         * Measured: two 200-byte chains sailed through --stack-limit 256.
+         *
+         * The severity is not "failed to notice" — the tool positively AFFIRMED a
+         * budget the target cannot honour, which is worse than not checking at
+         * all, because the user set the limit precisely so they would not have to
+         * reason about this.
+         *
+         * Worst case = main's chain + the sum of every ISR's chain. Without
+         * priority information any ISR may preempt any other, so summing all of
+         * them is the sound bound; that is conservative for a design that assigns
+         * priorities so only some can nest, which is recoverable by raising the
+         * limit and visible because the diagnostic prints the arithmetic. The
+         * hardware exception frame is deliberately NOT added — its size is arch-
+         * and configuration-specific, i.e. datasheet truth rather than program
+         * data, so the diagnostic names it instead of guessing. */
+        if (c->stack_limit > 0) {
+            uint32_t main_depth = 0, isr_total = 0;
+            int isr_count = 0;
+            for (int i = 0; i < c->stack_frame_count; i++) {
+                struct StackFrame *f2 = &c->stack_frames[i];
+                if (f2->is_recursive) continue;
+                bool is_main = (f2->name_len == 4 && memcmp(f2->name, "main", 4) == 0);
+                bool is_isr = false;
+                for (int d = 0; d < file_node->file.decl_count; d++) {
+                    if (file_node->file.decls[d]->kind == NODE_INTERRUPT &&
+                        file_node->file.decls[d]->interrupt.name_len == f2->name_len &&
+                        memcmp(file_node->file.decls[d]->interrupt.name,
+                               f2->name, f2->name_len) == 0) { is_isr = true; break; }
+                }
+                if (!is_main && !is_isr) continue;
+                memset(visited, 0, c->stack_frame_count * sizeof(bool));
+                uint32_t d2 = compute_max_depth(c, f2, visited, 0);
+                if (is_main) main_depth = d2;
+                else { isr_total += d2; isr_count++; }
+            }
+            uint32_t peak = main_depth + isr_total;
+            if (isr_count > 0 && peak > c->stack_limit) {
+                checker_error(c, 0,
+                    "concurrent stack peak %u bytes exceeds --stack-limit %u: main's "
+                    "chain uses %u and %d interrupt handler%s add %u on top of it — on "
+                    "bare metal they share ONE stack. The hardware exception frame is "
+                    "NOT included (its size is arch- and configuration-specific)",
+                    (unsigned)peak, (unsigned)c->stack_limit,
+                    (unsigned)main_depth, isr_count, isr_count == 1 ? "" : "s",
+                    (unsigned)isr_total);
             }
         }
         free(visited);

@@ -38,7 +38,7 @@ for f in tests/zer/*.zer; do
     # Per-file flags: first line `// zerc-flags: --foo --bar=baz` is parsed
     # and appended to ZERC invocation. Used for tests that need specific
     # target features (e.g., --target-features=avx512f).
-    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    file_flags=$(head -5 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     # Timeout (2026-06-21): a positive test must compile + run + exit 0 within
     # ZER_RUN_TIMEOUT seconds. A DEADLOCK (e.g. a botched auto-lock leaving a
     # mutex held) would otherwise hang the whole `make check`; `timeout` makes
@@ -77,10 +77,27 @@ for f in tests/zer_trap/*.zer; do
     # Runtime-trap tests: compile clean, run, EXPECT non-zero exit (SIGTRAP = 133).
     # Per-file flags via '// zerc-flags: ...' first line (same as positive/negative
     # sections) — e.g. BUG-736's --no-strict-mmio alignment-trap test.
-    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
-    $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
+    file_flags=$(head -5 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    # BUG-835 harness, TWO weak-oracle holes closed:
+    #  * NO TIMEOUT. A trap test whose program HANGS did not pass vacuously — it
+    #    hung `make check` forever, so a regression test for the held-lock guard
+    #    (which deadlocks pre-fix) could not have lived in the suite at all.
+    #    124 is now an explicit FAIL: a hang is not a trap.
+    #  * "any non-zero exit" is a WEAK ORACLE — a hang, a SIGSEGV, a wrong answer
+    #    and a genuine safety trap were indistinguishable. Optional `// expect-trap`
+    #    demands SIGTRAP (133) specifically, the same opt-in shape as
+    #    `// expect-error` for negatives, so existing tests that abort by other
+    #    means keep working.
+    want_trap=$(head -5 "$f" | grep -c '// expect-trap')
+    timeout "${ZER_RUN_TIMEOUT:-20}" $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
     ret=$?
-    if [ $ret -ne 0 ]; then
+    if [ $ret -eq 124 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (TIMED OUT — a hang is not a trap)"
+    elif [ "$want_trap" -gt 0 ] && [ $ret -ne 133 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (expected SIGTRAP/133, got exit $ret)"
+    elif [ $ret -ne 0 ]; then
         PASS=$((PASS + 1))
         echo "  PASS: $name (correctly trapped, exit $ret)"
     else
@@ -100,7 +117,7 @@ for f in tests/zer_fail/*.zer; do
     # Per-file flags directive (same as positive branch). Some negatives
     # only fail under specific compiler configurations (e.g.,
     # --probe-mode=disabled rejecting @probe usage).
-    file_flags=$(head -1 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
+    file_flags=$(head -5 "$f" | grep -oE '// zerc-flags: .*$' | sed 's|// zerc-flags: ||')
     # Compile only (not --run), expect failure
     # 2026-08-03: capture the diagnostic instead of discarding it, so a test can
     # assert WHY it was rejected. Before this, a negative passed on ANY non-zero

@@ -5,6 +5,158 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-22c — BUG-830..838: §C, the bare-metal family
+
+From `claude/vigilant-tesla-87xihb` and `-pjtawx`. Every one is silent at compile time
+AND at run time on the dev host, and only shows up on real hardware — the defining
+shape of a bare-metal hole. Two of the nine are PAIRS that had to land together.
+
+### BUG-830 — `type_equals` was missing the POINTER carrier for `volatile`
+The pointer arm checked `is_const` but NOT `is_volatile`, while the SLICE arm three
+lines below had always checked both. Every sink deciding a volatile strip through
+`type_equals` missed the pointer carrier while catching the slice one:
+
+    Dev d = { .reg = volatile_ptr };   // designated init  — accepted, no diagnostic
+    Ops o = { .cb = plain_fn };        // funcptr param    — accepted
+
+The plain-assignment sibling was correctly rejected the whole time, which makes this
+the CARRIER axis of one question, not a new rule. Fixed at the root: one line in
+`type_equals`, plus the pointer sibling of the slice arm in `can_implicit_coerce`
+delegating to the same VST-verified predicates — which SUBSUMES the old const-only
+special case. Plain -> volatile still coerces at every value-flow site, so widening
+the qualifier costs nothing.
+
+**Diagnostic quality, because the fix surfaced unreadable messages.** `type_name`
+never rendered pointer qualifiers (only slices did), so the new errors read
+`expects '*u32', got '*u32'` — two identical spellings for a real mismatch. And every
+funcptr mismatch printed `fn(...)` on both sides. Pointers now render volatile/const
+and funcptrs render their signature: `expects 'fn(volatile *u32)', got 'fn(*u32)'`.
+A message that cannot express the difference it is reporting is worse than the hole
+it replaced.
+
+### BUG-831 — the `@inttoptr`-into-non-volatile rule had ONE call site
+BUG-799's rule was wired only at the var-decl initialiser. A struct LITERAL field is a
+second binding of the same peripheral address and was unguarded:
+
+    struct Uart { *u32 dr; }                          // not volatile
+    g_uart = { .dr = @inttoptr(*u32, 0x40020004) };   // accepted
+
+### BUG-832 — volatile strip: 4 of 6 sinks were blind to the `?*T` axis
+The call-argument, return and spawn-argument sinks hand-rolled a RAW pointer-kind
+comparison (`arg->kind == TYPE_POINTER`), which is FALSE for `?*T`, so the whole check
+was skipped whenever either side was optional-wrapped. The axis is reachable because
+`can_implicit_coerce` converts `volatile *T -> ?*T` and the emitter lowers a
+null-sentinel `?*T` to a bare non-volatile pointer, so the qualifier is gone in the
+emitted C while the identical `*T` form has always been rejected.
+Split the DETECTION half out of `check_volatile_strip` (`volatile_strip_detected`) so
+every sink asks the one question while KEEPING ITS OWN WORDING — the generic
+type-mismatch that BUG-830 alone produced does not tell the user writes may be
+optimised away.
+
+### BUG-833 — `&packed.field` was gated at 1 of 5 sinks
+`Symbol.is_packed_derived` was WRITTEN at exactly one site and READ at exactly one.
+Of the five ways to reach the identical misaligned store, only the var-decl form was
+gated; assign / call-arg / alias / return all compiled. Measured on the assignment
+form: `movl $7, 1+g(%rip)` — a 32-bit store at an ODD address. A hard fault on
+ARMv7-M / RISC-V, a silent split access on Cortex-M0+, and merely SLOW on x86, which
+is why no hosted test could have caught it.
+
+**The CALL-ARG sink is why the FLAG route was structurally incomplete rather than
+merely under-wired**: `poke(&g.b)` binds no name, so no Symbol exists to carry the
+fact — a predicate asked on the EXPRESSION is the only thing that can reach it. Same
+for RETURN from the other side: the fact does not cross the function boundary, so the
+caller's deref cannot know; it has to be rejected at the source.
+**NOT STICKY.** The assignment sink SETS on a packed-derived RHS and CLEARS otherwise,
+so `q = &aligned.z;` re-clears — a sticky flag would over-reject every later deref of
+a reused pointer. The boundary positive pins that, plus: forming the pointer is still
+fine (only using it is not), and direct field access `s.field` is unaffected.
+Subsumes 39294y's BUG-813, whose two negatives are the same call-arg question.
+
+### BUG-834 — a bit-range write is an implicit RMW, missed at BOTH sinks
+`flags[3..0] = 5` lowers to `*p = (*p & ~mask) | (v << lo)` — a literal
+read-modify-write. Two independent reasons it slipped, both fixed:
+`resolve_write_target_global` — THE shared "which global does this write land on?"
+resolver — peeled FIELD / INDEX / deref but not NODE_SLICE, which is what a bit-range
+target parses as, so the walk returned NULL and the write was invisible to every
+caller. And both `is_rmw` gates asked the wrong question: one tests whether the
+OPERATOR is compound, the other whether the RHS mentions the target. A bit-range write
+is spelled `=` with an RHS (`5`) that never names the global, so both disjuncts were
+false. The `+=` spelling was rejected the whole time — the SPELLING axis of one
+question, which is why both sinks are fixed in the same commit.
+
+### BUG-835 — the auto-guard's `return` leaked a held lock and the interrupt-disable
+When VRP cannot prove an index the emitter inserts `if (idx >= N) { <defers>; return X; }`.
+`guard_traps` already covered a DEFER body; nothing covered the two OTHER scopes a
+`return` must never leave. The compiler emitted, verbatim:
+
+    __asm__("mrs %0, primask\n cpsid i" ...);   // interrupts OFF
+    if ((size_t)(i) >= 4u) { return 0; }        // <-- leaves them OFF forever
+    pthread_mutex_lock(&g._zer_mtx);
+    if ((size_t)(i) >= 4u) { return; }          // <-- mutex never released
+
+ZER hard-errors a USER-written `return` inside `@critical` for exactly this reason.
+The compiler was emitting the construct it bans. MEASURED: the lock form HANGS FOREVER
+(exit 124); the `@critical` form returned 0 silently, because hosted x86-64 degrades
+the critical section to a compiler fence. That asymmetry is why no existing test could
+have caught either half. New `Emitter.noreturn_scope_depth`, counted INSIDE
+`emit_shared_lock_mode`/`emit_shared_unlock` so all five lock call sites are covered by
+construction rather than by remembering to bracket each, and in the two IR_CRITICAL
+handlers.
+
+**Two weak-oracle holes in the TRAP HARNESS, found while landing the test.** It had NO
+TIMEOUT, so a trap test whose program hangs did not pass vacuously — it hung
+`make check` forever, which is why this regression test could not have lived in the
+suite at all. And "any non-zero exit" could not distinguish a hang, a SIGSEGV, a wrong
+answer and a genuine trap. Added `timeout` with 124 an explicit FAIL ("a hang is not a
+trap") and an opt-in `// expect-trap` demanding SIGTRAP/133, the same shape as
+`// expect-error`. Verified to FIRE by injecting a trap test that exits 1.
+
+### BUG-836 — `--stack-limit` never summed main and the ISRs, which share one stack
+Every existing check measures ONE entry point against the FULL limit and they are never
+summed. On bare metal an interrupt frame is pushed ON TOP of whatever main had already
+used, so a program whose main chain needs N and whose ISR chain needs N passed
+`--stack-limit N` while the real peak is 2N. Measured: two 200-byte chains sailed
+through `--stack-limit 256`.
+The severity is not "failed to notice" — the tool positively AFFIRMED a budget the
+target cannot honour, which is worse than not checking at all, because the user set the
+limit precisely so they would not have to reason about it. Worst case = main's chain +
+the sum of every ISR's chain; without priority information any ISR may preempt any
+other, so summing all of them is the sound bound. The hardware exception frame is
+deliberately NOT added — its size is datasheet truth rather than program data, so the
+diagnostic names it instead of guessing.
+
+### BUG-837 — a bare-metal target had no way to say so; `@critical` degraded silently
+Every bare-metal branch keyed on `__STDC_HOSTED__` — a COMPILER-FLAG property (it is
+what `-ffreestanding` sets), not a target property. zerc never learns which C flags the
+emitted file will be compiled with, and there was no flag or macro for the user to
+declare it. So a bare-metal build whose flags leave `__STDC_HOSTED__` at 1 (`gcc -m64
+-nostdlib` does exactly that) took every hosted branch. Most of those failures are LOUD;
+one is not — `@critical` on x86 fell through to `__atomic_thread_fence`, a memory fence
+that does NOT disable interrupts.
+Scope, measured rather than assumed: ARM, RISC-V and AVR `@critical` key on the ARCH
+macro and were always correct. The real exposure is bare-metal **x86** — a kernel, a
+bootloader, an EFI application. One emitted `_ZER_HOSTED` predicate ORs the existing
+test with a user-declarable `ZER_FREESTANDING`; 13 emitted gates routed through it. A
+pure widening: a build that does not define the macro preprocesses identically.
+**Verified with `-DZER_FREESTANDING` ALONE**, because under `-ffreestanding` the old and
+new predicates agree and that combination would score a broken compiler as passing.
+
+### BUG-838 — the MMIO boot validator could never fire, and trying cost a boot hang
+The emitted constructor traps if a declared mmio range has no hardware. It is gated to
+non-Linux/macOS/Windows — exactly the targets where `_zer_probe` is the DIRECT-READ form
+that hardcodes `has_value = 1`. So the check is a compile-time `if(0)`: the trap is
+unreachable, and a user who typos a base address gets nothing.
+Worse than nothing. The read itself still happens, from a CONSTRUCTOR, i.e. BEFORE main
+and therefore before any RCC clock-enable. On an STM32 that is a BusFault on a
+clock-gated peripheral: a boot hang with no message, produced by a check that could not
+report anything. Emitted now only where the probe can actually FAIL, expressed at both
+layers — the emitter skips it under `--probe-mode=raw/disabled` leaving a comment saying
+why, and the C guard gained the `_ZER_HOSTED` term. Written as a condition on the probe
+FORM rather than by deleting the feature, so a future fault-detecting freestanding probe
+brings the validator back on its own.
+
+---
+
 ## Session 2026-08-22b — BUG-820..829: §B, the walker FIELD-descent family
 
 Harvested from `claude/vigilant-tesla-39294y`, whose real contribution is the GATE:

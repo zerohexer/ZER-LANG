@@ -1,0 +1,7 @@
+// expect-error: points into a PACKED struct field
+// BUG-813 sibling: the address bound to a local first. `is_packed_derived` is
+// already on the local (BUG-786 set it there); the call sink now reads it.
+packed struct P { u8 a; u32 b; }
+P p;
+void takes(*u32 q) { *q = 1; }
+u32 main() { *u32 q = &p.b; takes(q); return 0; }

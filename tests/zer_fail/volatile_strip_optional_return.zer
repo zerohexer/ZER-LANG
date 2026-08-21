@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: cannot return volatile pointer as non-volatile
+// BUG-810, the RETURN sink of the optional-wrapper axis. Same raw-kind test, same
+// skip: `c->current_func_ret->kind` is TYPE_OPTIONAL for `?*u32`, so the guard
+// never ran and the caller received a pointer whose volatility had been dropped.
+mmio 0x40020000..0x40020FFF;
+
+?*u32 get_reg() { return @inttoptr(volatile *u32, 0x40020004); }
+
+u32 main() { return 0; }

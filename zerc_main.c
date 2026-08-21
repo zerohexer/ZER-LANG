@@ -221,7 +221,7 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
+    bool release_mode = false; (void)release_mode;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -263,7 +263,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
+            /* Accepted, and it does nothing — say so rather than let a build
+             * script believe it changed the output. There is no debug/release
+             * split: the emitted C is identical, GCC is always invoked at
+             * `-O2 -fwrapv`, and the runtime safety checks (bounds guards,
+             * division guards, handle generation checks) are not debug
+             * scaffolding — a `--release` that stripped them would be an
+             * escape hatch by another name. Kept so existing scripts keep
+             * working; documented in docs/reference.md. */
             release_mode = true;
+            fprintf(stderr, "warning: --release currently has no effect "
+                            "(accepted for forward compatibility)\n");
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             zer_target_ptr_bits = atoi(argv[++i]);
             target_bits_explicit = true;

@@ -1,0 +1,17 @@
+// expect-error: wrong *opaque type
+// BUG-806: check_call_provenance reached a call only when it was the WHOLE of an
+// expression-statement, a var-decl initialiser, or a return value. In an if
+// CONDITION (or a loop condition, a switch subject, an argument, or any nested
+// expression) the whole-program *opaque provenance check never ran — silent type
+// confusion. `u32 v = process(...)` with the identical argument was rejected.
+struct Sensor { u32 id; }
+struct Motor { u32 speed; }
+u32 process(*opaque ctx) {
+    *Sensor s = @ptrcast(*Sensor, ctx);
+    return s.id;
+}
+Motor g_m;
+void f() {
+    if (process(@ptrcast(*opaque, &g_m)) > 0) { return; }
+}
+u32 main() { f(); return 0; }

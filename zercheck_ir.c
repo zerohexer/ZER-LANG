@@ -1702,12 +1702,6 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
-/* Backward-compat wrapper for callsites that don't have Checker handy.
- * Without checker, receiver-type validation is skipped (current behavior).
- * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
-static IRMethodKind ir_classify_method_call(Node *call) {
-    return ir_classify_method_call_ex(NULL, call);
-}
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
@@ -1841,6 +1835,12 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
              * chain, not the field access itself. */
             ir_check_expr_uaf(zc, func, ps, expr->call.callee->field.object,
                               line, rs);
+        } else if (expr->call.callee && expr->call.callee->kind != NODE_IDENT) {
+            /* Any OTHER non-ident callee is an ordinary expression and every
+             * read in it is a use: `handlers[freed_idx]()`, `(fp orelse g)()`.
+             * A plain function name is not a tracked value, so idents stay
+             * excluded. */
+            ir_check_expr_uaf(zc, func, ps, expr->call.callee, line, rs);
         }
         break;
     case NODE_UNARY:
@@ -2088,7 +2088,7 @@ static bool ir_defer_is_arena_reset(Node *node) {
  *   - bare free(x)    (plain cstdlib from cinclude)
  *   - Task.free(x) / Task.free_ptr(x)
  */
-static Node *ir_defer_free_arg(Node *node) {
+static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
     if (!node) return NULL;
     if (node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return NULL;
     Node *call = node->expr_stmt.expr;
@@ -2106,6 +2106,40 @@ static Node *ir_defer_free_arg(Node *node) {
         callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0)
         return call->call.args[0];
+
+    /* BUG-812: the defer site used to stop here — it knew only the three
+     * BUILTIN spellings, while the direct-call path answers the same question
+     * with ir_is_extern_free_call() and the cross-function FuncSummary. So:
+     *
+     *     *opaque dev = sensor_open("/dev/spi0");
+     *     defer sensor_close(dev);       // REJECTED: "allocated ... never freed"
+     *     sensor_close(dev);             // accepted — recognised as a free
+     *
+     * That is the canonical C-interop idiom, and the one docs/reference.md
+     * teaches under "Safe C Library Interop" — its example did not compile.
+     * The over-rejection actively pushed users off the SAFER form: drop the
+     * `defer` and every early return leaks.
+     *
+     * Same question, same two predicates, at this sink too. */
+    if (!zc || !callee || callee->kind != NODE_IDENT) return NULL;
+
+    /* (a) bodyless extern destructor — `void sensor_close(*opaque)` */
+    if (ir_is_extern_free_call(zc, call))
+        return call->call.args[0];
+
+    /* (b) a ZER wrapper whose summary says it frees param pi —
+     *     `void my_close(*opaque p) { sensor_close(p); }` */
+    for (int si = 0; si < zc->summary_count; si++) {
+        FuncSummary *sum = &zc->summaries[si];
+        if (sum->func_name_len != (uint32_t)callee->ident.name_len) continue;
+        if (memcmp(sum->func_name, callee->ident.name, sum->func_name_len) != 0) continue;
+        for (int pi = 0; pi < sum->param_count && pi < call->call.arg_count; pi++) {
+            bool frees = (sum->frees_param && sum->frees_param[pi]) ||
+                         (sum->maybe_frees_param && sum->maybe_frees_param[pi]);
+            if (frees) return call->call.args[pi];
+        }
+        break;
+    }
     return NULL;
 }
 
@@ -2207,7 +2241,7 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     /* Try this node as a free statement */
-    Node *farg = ir_defer_free_arg(body);
+    Node *farg = ir_defer_free_arg(zc, body);
     if (farg) {
         int root_local;
         const char *path;
@@ -2296,6 +2330,8 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line, defer_id);
         break;
     case NODE_FOR:
+        /* BUG-809: the init clause is a statement of its own */
+        ir_defer_scan_frees(zc, func, ps, body->for_stmt.init, defer_line, defer_id);
         ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line, defer_id);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
@@ -2349,8 +2385,29 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!body) return;
 
     if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
-        ir_defer_free_arg(body) == NULL) {
+        ir_defer_free_arg(zc, body) == NULL) {
         ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
+    }
+    /* BUG-809: the walker checked EXPRESSION STATEMENTS only, so a handle read
+     * from a defer body's CONDITION or a var-decl INITIALISER was invisible:
+     *     defer { if (pool.get(h).id > 0) { sink = 1; } }
+     *     pool.free(h);
+     * compiled clean and dereferenced the freed slot at defer fire, while the
+     * same read as a bare statement was correctly rejected. Conditions and
+     * initialisers are ordinary expressions and every one of them is a USE. */
+    if (body->kind == NODE_VAR_DECL)
+        ir_check_expr_uaf(zc, func, ps, body->var_decl.init, defer_line, rs);
+    else if (body->kind == NODE_RETURN)
+        ir_check_expr_uaf(zc, func, ps, body->ret.expr, defer_line, rs);
+    else if (body->kind == NODE_IF)
+        ir_check_expr_uaf(zc, func, ps, body->if_stmt.cond, defer_line, rs);
+    else if (body->kind == NODE_WHILE || body->kind == NODE_DO_WHILE)
+        ir_check_expr_uaf(zc, func, ps, body->while_stmt.cond, defer_line, rs);
+    else if (body->kind == NODE_SWITCH)
+        ir_check_expr_uaf(zc, func, ps, body->switch_stmt.expr, defer_line, rs);
+    else if (body->kind == NODE_FOR) {
+        ir_check_expr_uaf(zc, func, ps, body->for_stmt.cond, defer_line, rs);
+        ir_check_expr_uaf(zc, func, ps, body->for_stmt.step, defer_line, rs);
     }
 
     switch (body->kind) {
@@ -2363,6 +2420,8 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         ir_defer_scan_uses(zc, func, ps, body->if_stmt.else_body, defer_line, rs);
         break;
     case NODE_FOR:
+        /* BUG-809: the init clause is a statement of its own */
+        ir_defer_scan_uses(zc, func, ps, body->for_stmt.init, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->for_stmt.body, defer_line, rs);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:

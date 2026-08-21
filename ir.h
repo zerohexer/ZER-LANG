@@ -374,4 +374,20 @@ IRFunc *ir_lower_func(Arena *arena, void *checker, Node *func_decl);
 /* Lower an interrupt handler body to IR. */
 IRFunc *ir_lower_interrupt(Arena *arena, void *checker, Node *interrupt);
 
+/* THE "which shared struct does this expression touch?" walker.
+ *
+ * Returns the outermost sub-expression whose type is `shared struct` or
+ * `*shared struct`, or NULL. Callers wrap the statement in a lock around that
+ * root.
+ *
+ * Exported deliberately: this question used to be answered by THREE separate
+ * copies of the same walker (one here, two in emitter.c for the spawn-argument
+ * and defer-fire lock sinks), and the copies DRIFTED — BUG-795's `call.callee`
+ * fix and the 2026-06-28 `*shared` field-projection fix both landed in this one
+ * and neither reached the emitter's, so a spawn argument or a deferred
+ * statement reading shared state through those forms emitted with no mutex at
+ * all. One walker, three sinks (BUG-808). `checker` is `Checker *`, opaque here
+ * for the same reason as ir_lower_func's. */
+Node *ir_find_shared_root_expr(void *checker, Node *expr);
+
 #endif /* ZER_IR_H */

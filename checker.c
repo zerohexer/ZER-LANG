@@ -1985,35 +1985,104 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
 static bool assign_reads_own_target(Node *value, Symbol *tgt);
 /* Does this expression mention the identifier `nm`? Used to recognise a
  * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
+/* BUG-811. These two answer "does the value expression READ the thing being
+ * assigned?" — i.e. "is `x = <expr>` a read-modify-write?". Getting "no" here
+ * means ACCEPT: a written-out non-atomic RMW on a shared/volatile global from a
+ * spawned thread or an ISR compiles. The old comment on both ("partial by
+ * design: unlisted kinds yield no, never a new rejection") described the
+ * direction from the predicate's own point of view and was exactly backwards for
+ * every consumer. Measured live on the pre-fix compiler — all three ACCEPTED,
+ * while the bare `g = g + 1` was rejected:
+ *     g = @truncate(u32, g) + 1;      // intrinsic arg
+ *     g = idf(g) + 1;                 // call arg
+ *     g = (non() orelse g) + 1;       // orelse fallback
+ *
+ * Both are now no-default exhaustive switches. That is not cosmetic: the old
+ * if/else form was invisible to BOTH completeness gates — `-Werror=switch` and
+ * walker_default_audit.sh see only switches, and audit_walker_fields.sh analyses
+ * `case NODE_X:` arms — and several walkers in this file say outright that they
+ * use an if-chain "to stay clear of the walker-default audit". Shaping code to
+ * evade the gate is how this class survives; these two are the worked example. */
+static bool asm_operands_mention_name(Node *e, const char *nm, uint32_t nl, int depth);
+
 static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
     if (!e || !nm || depth > 16) return false;
-    if (e->kind == NODE_IDENT)
+    switch (e->kind) {
+    case NODE_IDENT:
         return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
-    if (e->kind == NODE_BINARY)
+    case NODE_BINARY:
         return expr_mentions_name(e->binary.left, nm, nl, depth + 1) ||
                expr_mentions_name(e->binary.right, nm, nl, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_name(e->field.object, nm, nl, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
-                                       expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    case NODE_UNARY:   return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
+    case NODE_FIELD:   return expr_mentions_name(e->field.object, nm, nl, depth + 1);
+    case NODE_INDEX:   return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
+                              expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
+    case NODE_TYPECAST: return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
+    case NODE_SLICE:
+        return expr_mentions_name(e->slice.object, nm, nl, depth + 1) ||
+               expr_mentions_name(e->slice.start, nm, nl, depth + 1) ||
+               expr_mentions_name(e->slice.end, nm, nl, depth + 1);
+    case NODE_ORELSE:
+        return expr_mentions_name(e->orelse.expr, nm, nl, depth + 1) ||
+               expr_mentions_name(e->orelse.fallback, nm, nl, depth + 1);
+    case NODE_CALL:
+        if (expr_mentions_name(e->call.callee, nm, nl, depth + 1)) return true;
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (expr_mentions_name(e->call.args[i], nm, nl, depth + 1)) return true;
+        return false;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (expr_mentions_name(e->intrinsic.args[i], nm, nl, depth + 1)) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (expr_mentions_name(e->struct_init.fields[i].value, nm, nl, depth + 1)) return true;
+        return false;
+    case NODE_ASSIGN:
+        return expr_mentions_name(e->assign.target, nm, nl, depth + 1) ||
+               expr_mentions_name(e->assign.value, nm, nl, depth + 1);
+    case NODE_ASM:
+        return asm_operands_mention_name(e, nm, nl, depth + 1);
+    /* Kinds that cannot appear inside an assignment's VALUE expression, plus
+     * the literals (no sub-expression to read). No `default:` — a new NodeKind
+     * must be considered here, because "not mentioned" means "not an RMW"
+     * means ACCEPT. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    }
+    return false;
+}
+
+/* The one place any walker in this tree reads asm operand expressions. It is
+ * reachable only if an `asm` block ever appears inside an assignment value,
+ * which the naked-only restriction (S1) currently forbids — see
+ * docs/limitations.md, "asm OPERANDS are invisible to every AST safety walker".
+ * Written now so this predicate is not one of the seven that go blind when S1
+ * relaxes. */
+static bool asm_operands_mention_name(Node *e, const char *nm, uint32_t nl, int depth) {
+    for (int i = 0; i < e->asm_stmt.input_count; i++)
+        if (expr_mentions_name(e->asm_stmt.inputs[i].expr, nm, nl, depth)) return true;
+    for (int i = 0; i < e->asm_stmt.output_count; i++)
+        if (expr_mentions_name(e->asm_stmt.outputs[i].expr, nm, nl, depth)) return true;
+    return false;
 }
 
 static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
     if (!e || !g || depth > 12) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == g->name_len &&
-               memcmp(e->ident.name, g->name, g->name_len) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_global(e->binary.left, g, depth + 1) ||
-               expr_mentions_global(e->binary.right, g, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
-                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    /* the global's identity here IS its name (a shadowing local is rejected
+     * separately), so the two predicates ask the same question. */
+    return expr_mentions_name(e, g->name, g->name_len, depth);
 }
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
     return expr_mentions_global(value, tgt, 0);
@@ -11002,9 +11071,16 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     switch (node->kind) {
     /* --- Direct effect detection --- */
     case NODE_YIELD:
+        parent_sym->props.can_yield = true;
+        parent_sym->props.has_direct_yield = true;
+        return;
+
     case NODE_AWAIT:
         parent_sym->props.can_yield = true;
         parent_sym->props.has_direct_yield = true;
+        /* BUG-803 sibling: the awaited CONDITION is an expression and can carry
+         * its own effects (`await ready();` where ready() allocates). */
+        scan_func_props(c, node->await_stmt.cond, parent_sym);
         return;
 
     case NODE_SPAWN:
@@ -11200,6 +11276,30 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         return;
     case NODE_ORELSE:
         scan_func_props(c, node->orelse.expr, parent_sym);
+        /* BUG-803: the FALLBACK runs on the failure path and is just as much
+         * part of this function's effect set. Missing it made the @critical /
+         * ISR / defer context bans (a HARDWARE constraint — pthread_create with
+         * interrupts disabled, malloc in an ISR) bypassable by moving the call
+         * one token to the right:
+         *     @critical { u32 v = maybe() orelse starter(); }   // starter() spawns
+         * compiled clean and emitted pthread_create between `cpsid i` and
+         * `msr primask`, while the same call outside the orelse was rejected. */
+        scan_func_props(c, node->orelse.fallback, parent_sym);
+        return;
+    /* Same class as the orelse fallback: wrapper expressions that can HOLD a
+     * call whose effects (spawn / alloc / yield / sync) belong to this function.
+     * Each was a silent no-op leaf. */
+    case NODE_TYPECAST:
+        scan_func_props(c, node->typecast.expr, parent_sym);
+        return;
+    case NODE_SLICE:
+        scan_func_props(c, node->slice.object, parent_sym);
+        scan_func_props(c, node->slice.start, parent_sym);
+        scan_func_props(c, node->slice.end, parent_sym);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            scan_func_props(c, node->struct_init.fields[i].value, parent_sym);
         return;
     case NODE_DEFER:
         scan_func_props(c, node->defer.body, parent_sym);
@@ -11211,7 +11311,16 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         scan_func_props(c, node->once.body, parent_sym);
         return;
     /* Stage 2 Part B (2026-04-28): exhaustive — leaf/no-body kinds
-     * have no children to scan for FuncProps tracking. */
+     * have no children to scan for FuncProps tracking.
+     * NODE_SLICE / NODE_TYPECAST / NODE_STRUCT_INIT moved OUT of this list by
+     * BUG-803 — they are wrapper expressions that can hold an effect-bearing
+     * call, and treating them as leaves hid spawn/alloc from the context bans.
+     * NODE_ASM is a deliberate hole, NOT an oversight: an asm OUTPUT binding
+     * writes a ZER lvalue, but `asm` is legal only inside a `naked` function
+     * and a naked function may hold nothing but asm + return, so no effect can
+     * be reached through an operand today. This becomes live the moment the S1
+     * naked-only restriction relaxes (docs/limitations.md, "asm operands are
+     * invisible to the AST safety walkers"). */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
@@ -11220,8 +11329,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     case NODE_LABEL: case NODE_ASM: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_SLICE: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return;
     }
 }
@@ -11283,85 +11391,6 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
-/* Check if a function body contains any @atomic_* or @barrier calls.
- * If yes, the developer is doing manual synchronization — race warnings not errors.
- * LEGACY wrapper — uses FuncProps internally now. */
-static bool has_atomic_or_barrier(Node *node) {
-    if (!node) return false;
-    if (node->kind == NODE_INTRINSIC) {
-        const char *n = node->intrinsic.name;
-        uint32_t nl = (uint32_t)node->intrinsic.name_len;
-        if ((nl >= 7 && memcmp(n, "atomic_", 7) == 0) ||
-            (nl == 7 && memcmp(n, "barrier", 7) == 0) ||
-            (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
-            (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
-            return true;
-    }
-    switch (node->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
-            if (has_atomic_or_barrier(node->block.stmts[i])) return true;
-        return false;
-    case NODE_IF:
-        return has_atomic_or_barrier(node->if_stmt.cond) ||
-               has_atomic_or_barrier(node->if_stmt.then_body) ||
-               has_atomic_or_barrier(node->if_stmt.else_body);
-    case NODE_FOR:
-        return has_atomic_or_barrier(node->for_stmt.init) ||
-               has_atomic_or_barrier(node->for_stmt.cond) ||
-               has_atomic_or_barrier(node->for_stmt.step) ||
-               has_atomic_or_barrier(node->for_stmt.body);
-    case NODE_WHILE: case NODE_DO_WHILE:
-        return has_atomic_or_barrier(node->while_stmt.cond) ||
-               has_atomic_or_barrier(node->while_stmt.body);
-    case NODE_EXPR_STMT:
-        return has_atomic_or_barrier(node->expr_stmt.expr);
-    case NODE_RETURN:
-        return has_atomic_or_barrier(node->ret.expr);
-    case NODE_DEFER:
-        return has_atomic_or_barrier(node->defer.body);
-    case NODE_BINARY:
-        return has_atomic_or_barrier(node->binary.left) ||
-               has_atomic_or_barrier(node->binary.right);
-    case NODE_UNARY:
-        return has_atomic_or_barrier(node->unary.operand);
-    case NODE_CALL:
-        if (has_atomic_or_barrier(node->call.callee)) return true;
-        for (int i = 0; i < node->call.arg_count; i++)
-            if (has_atomic_or_barrier(node->call.args[i])) return true;
-        return false;
-    case NODE_ASSIGN:
-        return has_atomic_or_barrier(node->assign.target) ||
-               has_atomic_or_barrier(node->assign.value);
-    case NODE_VAR_DECL:
-        return has_atomic_or_barrier(node->var_decl.init);
-    case NODE_ORELSE:
-        return has_atomic_or_barrier(node->orelse.expr);
-    case NODE_SWITCH:
-        if (has_atomic_or_barrier(node->switch_stmt.expr)) return true;
-        for (int i = 0; i < node->switch_stmt.arm_count; i++)
-            if (has_atomic_or_barrier(node->switch_stmt.arms[i].body)) return true;
-        return false;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf and structural
-     * kinds without an expression body that could contain @atomic_*
-     * or @barrier intrinsics. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
-    case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        return false;
-    }
-    return false;
-}
 
 /* Does this function forward its parameter `pidx` into a `spawn` argument —
  * directly, or transitively through another function that does?
@@ -11965,6 +11994,34 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         return false;
     case NODE_DEFER:
         return scan_unsafe_global_access(c, node->defer.body, out_name, out_len);
+    /* BUG-804: `@critical` was a LEAF here, so wrapping a non-shared global
+     * access in it hid the access from the spawn data-race scan. `@critical`
+     * reads as deliberate synchronisation and is not: it disables INTERRUPTS on
+     * the current core and gives no mutual exclusion between threads at all, so
+     * `void worker(){ @critical { g += 1; } }` + `spawn worker();` is a genuine
+     * race that compiled clean while the identical access without the wrapper
+     * was rejected.
+     *
+     * `@once` deliberately stays a LEAF and that is NOT an oversight. Its body
+     * runs on exactly one thread (ACQ_REL compare-exchange) and publishes with a
+     * RELEASE store that every loser ACQUIREs before continuing — so a plain
+     * global written inside `@once` is properly synchronised, and descending it
+     * over-rejects the canonical init idiom (tests/zer/once_loser_wait.zer,
+     * which is what caught the first version of this fix). The residual — two
+     * DISTINCT `@once` blocks in different spawn targets touching the same
+     * global, which are not mutually exclusive with each other — is recorded in
+     * docs/limitations.md.
+     *
+     * A nested `spawn inner(g)` inside a spawn target reads `g` in the argument
+     * on the parent thread — same blind spot as @critical, same fix. */
+    case NODE_CRITICAL:
+        return scan_unsafe_global_access(c, node->critical.body, out_name, out_len);
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            if (scan_unsafe_global_access(c, node->spawn_stmt.args[i], out_name, out_len)) return true;
+        return false;
+    case NODE_AWAIT:
+        return scan_unsafe_global_access(c, node->await_stmt.cond, out_name, out_len);
     case NODE_SWITCH:
         if (scan_unsafe_global_access(c, node->switch_stmt.expr, out_name, out_len)) return true;
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
@@ -11979,15 +12036,17 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
-    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_LABEL: case NODE_ASM: case NODE_YIELD: case NODE_ONCE:
+    case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     /* NODE_IDENT handled above the switch; NODE_CAST is vestigial (unused,
      * see ir_lower.c); NODE_SIZEOF operand is a compile-time type. NODE_SLICE
      * / NODE_TYPECAST / NODE_STRUCT_INIT now recurse above (were wrapper-blind
-     * leaves that hid a global read from the spawn data-race scan). */
+     * leaves that hid a global read from the spawn data-race scan), and so do
+     * NODE_CRITICAL / NODE_SPAWN / NODE_AWAIT (BUG-804); NODE_ONCE stays a
+     * leaf on purpose — see the note at its sibling arms above.
+     * NODE_ASM stays a leaf — see the note in scan_func_props. */
     case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
@@ -12002,13 +12061,31 @@ static bool expr_contains_yield(Node *n) {
     case NODE_BINARY: return expr_contains_yield(n->binary.left) || expr_contains_yield(n->binary.right);
     case NODE_UNARY: return expr_contains_yield(n->unary.operand);
     case NODE_CALL:
+        if (expr_contains_yield(n->call.callee)) return true;
         for (int i = 0; i < n->call.arg_count; i++)
             if (expr_contains_yield(n->call.args[i])) return true;
         return false;
     case NODE_ASSIGN: return expr_contains_yield(n->assign.target) || expr_contains_yield(n->assign.value);
     case NODE_FIELD: return expr_contains_yield(n->field.object);
     case NODE_INDEX: return expr_contains_yield(n->index_expr.object) || expr_contains_yield(n->index_expr.index);
-    case NODE_ORELSE: return expr_contains_yield(n->orelse.expr);
+    case NODE_ORELSE:
+        /* BUG-805: the FALLBACK suspends too. `u32 x = (m() orelse { yield;
+         * return; }) + g.v;` reported "no yield in this statement", so the
+         * shared-access-across-suspend ban did not fire and the emitter wrapped
+         * the whole statement in `pthread_mutex_lock(&g._zer_mtx)` … `case 1:`
+         * (the resume label) … `unlock` — the lock is held across the
+         * suspension point, which is exactly the deadlock the rule exists to
+         * prevent. Verified in the emitted C. */
+        return expr_contains_yield(n->orelse.expr) ||
+               expr_contains_yield(n->orelse.fallback);
+    case NODE_BLOCK:
+        /* an orelse fallback is frequently a BLOCK (`orelse { yield; return; }`) */
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (expr_contains_yield(n->block.stmts[i])) return true;
+        return false;
+    case NODE_EXPR_STMT: return expr_contains_yield(n->expr_stmt.expr);
+    case NODE_VAR_DECL:  return expr_contains_yield(n->var_decl.init);
+    case NODE_RETURN:    return expr_contains_yield(n->ret.expr);
     /* Stage 2 Part B (2026-04-28): exhaustive — leaf / non-yield-bearing
      * expression kinds. NODE_YIELD/AWAIT handled at the top via early
      * return. Other kinds can't contain a yield. */
@@ -12017,16 +12094,19 @@ static bool expr_contains_yield(Node *n) {
     case NODE_IDENT: case NODE_SLICE: case NODE_INTRINSIC:
     case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
     case NODE_STRUCT_INIT: case NODE_YIELD: case NODE_AWAIT:
-    /* Statement / decl kinds shouldn't appear in expression position */
+    /* Statement / decl kinds. BLOCK / EXPR_STMT / VAR_DECL / RETURN are
+     * REACHABLE from an orelse fallback and are handled above (BUG-805);
+     * the rest cannot appear below an expression. `yield` is banned inside
+     * defer and @critical outright, so those bodies need no descent. */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_IF:
     case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
-    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_BREAK: case NODE_CONTINUE:
     case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ASM: case NODE_CRITICAL:
     case NODE_ONCE: case NODE_SPAWN: case NODE_DO_WHILE:
     case NODE_STATIC_ASSERT:
         return false;
@@ -17267,7 +17347,11 @@ static bool contains_break(Node *node) {
         return false;
     /* BUG-204: orelse break hidden in expressions */
     case NODE_ORELSE:
-        return node->orelse.fallback_is_break;
+        /* the flag covers the bare `x orelse break`; a break nested inside a
+         * BLOCK fallback needs the descent. Finding MORE breaks is the
+         * conservative direction here (it only means "this loop can exit"). */
+        return node->orelse.fallback_is_break ||
+               contains_break(node->orelse.fallback);
     case NODE_VAR_DECL:
         return node->var_decl.init ? contains_break(node->var_decl.init) : false;
     case NODE_EXPR_STMT:
@@ -17486,6 +17570,27 @@ static void check_func_body(Checker *c, Node *node) {
 
         if (node->func_decl.is_naked) {
             c->in_naked = true;
+            /* BUG-807: the `naked` attribute is NOT emitted (see
+             * emit_func_attributes and docs/limitations.md) — GCC therefore
+             * generates a normal prologue/epilogue around the asm body. That
+             * has been true since the IR migration and was completely SILENT:
+             * a reset handler, an `iret`-returning ISR, or a context-switch
+             * primitive compiled without a word of diagnostic and then
+             * malfunctioned on real hardware.
+             *
+             * Restoring true naked semantics is a user-visible breaking change
+             * (GCC forbids asm OPERANDS inside a naked function, so
+             * tests/zer/asm_typed_operands.zer and friends need rewriting, not
+             * just an added `ret`). Until that migration lands, the honest
+             * thing is to make the drop LOUD rather than silent — the
+             * audit-visibility principle: the user's hardware assumption must
+             * be visible at the use site. A warning does not break any build. */
+            checker_warning(c, node->loc.line,
+                "'naked' is accepted but NOT emitted — GCC will add a normal "
+                "prologue/epilogue to '%.*s'. Do not rely on exact frame layout, "
+                "manual `ret`/`iret`, or an un-set-up stack here; for true naked "
+                "semantics write the function in C and link it via cinclude",
+                (int)node->func_decl.name_len, node->func_decl.name);
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
             if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {
@@ -17994,8 +18099,14 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
         vrp_invalidate_loop_body_writes(c, body->unary.operand);
         break;
     case NODE_CALL:
+        /* the callee is an expression too and can nest an orelse whose fallback
+         * writes an outer local — widening MORE is always the sound direction */
+        vrp_invalidate_loop_body_writes(c, body->call.callee);
         for (int i = 0; i < body->call.arg_count; i++)
             vrp_invalidate_loop_body_writes(c, body->call.args[i]);
+        break;
+    case NODE_TYPECAST:
+        vrp_invalidate_loop_body_writes(c, body->typecast.expr);
         break;
     case NODE_INTRINSIC:
         for (int i = 0; i < body->intrinsic.arg_count; i++)
@@ -18031,7 +18142,7 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_IDENT: case NODE_CAST:
     case NODE_SIZEOF:
         break;
     }
@@ -18462,14 +18573,30 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             record_isr_globals(c, node->switch_stmt.arms[i].body, depth);
         return;
-    /* leaf / declaration kinds with no global-bearing subtree */
+    /* BUG-804, ISR sink (the sibling of the spawn-scan fix — CLAUDE.md's rule
+     * that these are two sink sets and both move in the same commit). A spawn
+     * ARGUMENT and an await CONDITION are expressions evaluated in the ISR's own
+     * context, so a global read there is an ISR access and must be recorded for
+     * the missing-`volatile` check. */
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
+            record_isr_globals(c, node->spawn_stmt.args[i], depth);
+            record_isr_funcname_binding(c, node->spawn_stmt.args[i], depth);
+        }
+        return;
+    case NODE_AWAIT:
+        record_isr_globals(c, node->await_stmt.cond, depth);
+        return;
+    /* leaf / declaration kinds with no global-bearing subtree.
+     * NODE_ASM: see the note in scan_func_props — operands are unreachable
+     * while asm is naked-only (S1). */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN: case NODE_YIELD:
-    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_LABEL: case NODE_ASM: case NODE_YIELD:
+    case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_CAST: case NODE_SIZEOF:
@@ -18635,6 +18762,10 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
         return;
     }
     case NODE_CALL: {
+        /* the callee is an expression: `fns[g_cell]()` reads the atomic cell in
+         * callee position. A bare function-name ident is not a cell, so the
+         * descent is a no-op for the common shape. */
+        record_atomic_plain_in_callee(c, node->call.callee, depth);
         for (int i = 0; i < node->call.arg_count; i++)
             record_atomic_plain_in_callee(c, node->call.args[i], depth);
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
@@ -19022,6 +19153,13 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         break;
     }
     case NODE_CALL:
+        /* BUG-810: a non-ident CALLEE is an expression that can hold further
+         * calls (`table[pick()]()`, `factory(n)()`). Skipping it dropped those
+         * from the call graph, so a recursion cycle closed through a callee
+         * expression was never reported. A bare ident callee is handled by the
+         * name lookup below, so it is not re-walked. */
+        if (node->call.callee && node->call.callee->kind != NODE_IDENT)
+            scan_frame(c, frame, node->call.callee);
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
             Symbol *sym = scope_lookup(c->global_scope,
                 node->call.callee->ident.name,
@@ -19104,9 +19242,17 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         break;
     case NODE_FOR:
         scan_frame(c, frame, node->for_stmt.init);
+        /* BUG-810: a CALL in a loop condition or step is a callee like any
+         * other. Skipping them meant `while (recurse())` — direct or mutual
+         * recursion driven entirely from the condition — was invisible to the
+         * call-graph DFS, so neither the recursion warning nor --stack-limit
+         * ever saw it. */
+        scan_frame(c, frame, node->for_stmt.cond);
+        scan_frame(c, frame, node->for_stmt.step);
         scan_frame(c, frame, node->for_stmt.body);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
+        scan_frame(c, frame, node->while_stmt.cond);   /* BUG-810 */
         scan_frame(c, frame, node->while_stmt.body);
         break;
     case NODE_RETURN:
@@ -19116,6 +19262,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         scan_frame(c, frame, node->expr_stmt.expr);
         break;
     case NODE_ASSIGN:
+        scan_frame(c, frame, node->assign.target);     /* BUG-810: `a[f()] = x` */
         scan_frame(c, frame, node->assign.value);
         break;
     case NODE_BINARY:
@@ -19127,8 +19274,14 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         break;
     case NODE_ORELSE:
         scan_frame(c, frame, node->orelse.expr);
+        /* the FALLBACK is real code on the failure path: its locals occupy the
+         * frame and its calls are callees. A recursive call reachable only
+         * through a fallback was invisible to the call-graph DFS, so neither
+         * the recursion warning nor --stack-limit saw it. */
+        scan_frame(c, frame, node->orelse.fallback);
         break;
     case NODE_SWITCH:
+        scan_frame(c, frame, node->switch_stmt.expr);
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
             scan_frame(c, frame, node->switch_stmt.arms[i].body);
         break;
@@ -19162,6 +19315,8 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         break;
     case NODE_SLICE:
         scan_frame(c, frame, node->slice.object);
+        scan_frame(c, frame, node->slice.start);       /* BUG-810: `s[f()..g()]` */
+        scan_frame(c, frame, node->slice.end);
         break;
     /* Leaf nodes — no children to recurse into */
     case NODE_INT_LIT:
@@ -19719,33 +19874,114 @@ static Type *find_param_cast_type(Checker *c, Node *node,
         return find_param_cast_type(c, node->expr_stmt.expr, param_name, param_len);
     case NODE_RETURN:
         return find_param_cast_type(c, node->ret.expr, param_name, param_len);
-    case NODE_ASSIGN:
+    case NODE_ASSIGN: {
+        Type *t = find_param_cast_type(c, node->assign.target, param_name, param_len);
+        if (t) return t;
         return find_param_cast_type(c, node->assign.value, param_name, param_len);
-    case NODE_CALL:
+    }
+    case NODE_CALL: {
+        Type *t = find_param_cast_type(c, node->call.callee, param_name, param_len);
+        if (t) return t;
         for (int i = 0; i < node->call.arg_count; i++) {
-            Type *t = find_param_cast_type(c, node->call.args[i], param_name, param_len);
+            t = find_param_cast_type(c, node->call.args[i], param_name, param_len);
             if (t) return t;
         }
         break;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf / no-children
-     * kinds. find_param_cast_type only descends into nodes that may
-     * contain a @ptrcast(*T, param) intrinsic call. Listed kinds have
-     * no scannable expr children for this lookup. */
+    }
+    /* BUG-806: this used to stop at the six kinds above, so a callee that cast
+     * its `*opaque` param anywhere else — inside a loop, a switch arm, a
+     * condition, a `defer`, or nested in any compound expression — registered NO
+     * expectation, and every caller of it went unchecked by
+     * check_call_provenance. Full descent: an expectation missed here is a
+     * type-confusion that ships. */
+    case NODE_FOR: {
+        Type *t = find_param_cast_type(c, node->for_stmt.init, param_name, param_len);
+        if (t) return t;
+        if ((t = find_param_cast_type(c, node->for_stmt.cond, param_name, param_len))) return t;
+        if ((t = find_param_cast_type(c, node->for_stmt.step, param_name, param_len))) return t;
+        return find_param_cast_type(c, node->for_stmt.body, param_name, param_len);
+    }
+    case NODE_WHILE: case NODE_DO_WHILE: {
+        Type *t = find_param_cast_type(c, node->while_stmt.cond, param_name, param_len);
+        if (t) return t;
+        return find_param_cast_type(c, node->while_stmt.body, param_name, param_len);
+    }
+    case NODE_SWITCH: {
+        Type *t = find_param_cast_type(c, node->switch_stmt.expr, param_name, param_len);
+        if (t) return t;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+            t = find_param_cast_type(c, node->switch_stmt.arms[i].body, param_name, param_len);
+            if (t) return t;
+        }
+        break;
+    }
+    case NODE_DEFER:
+        return find_param_cast_type(c, node->defer.body, param_name, param_len);
+    case NODE_CRITICAL:
+        return find_param_cast_type(c, node->critical.body, param_name, param_len);
+    case NODE_ONCE:
+        return find_param_cast_type(c, node->once.body, param_name, param_len);
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
+            Type *t = find_param_cast_type(c, node->spawn_stmt.args[i], param_name, param_len);
+            if (t) return t;
+        }
+        break;
+    case NODE_AWAIT:
+        return find_param_cast_type(c, node->await_stmt.cond, param_name, param_len);
+    case NODE_BINARY: {
+        Type *t = find_param_cast_type(c, node->binary.left, param_name, param_len);
+        if (t) return t;
+        return find_param_cast_type(c, node->binary.right, param_name, param_len);
+    }
+    case NODE_UNARY:
+        return find_param_cast_type(c, node->unary.operand, param_name, param_len);
+    case NODE_FIELD:
+        return find_param_cast_type(c, node->field.object, param_name, param_len);
+    case NODE_INDEX: {
+        Type *t = find_param_cast_type(c, node->index_expr.object, param_name, param_len);
+        if (t) return t;
+        return find_param_cast_type(c, node->index_expr.index, param_name, param_len);
+    }
+    case NODE_SLICE: {
+        Type *t = find_param_cast_type(c, node->slice.object, param_name, param_len);
+        if (t) return t;
+        if ((t = find_param_cast_type(c, node->slice.start, param_name, param_len))) return t;
+        return find_param_cast_type(c, node->slice.end, param_name, param_len);
+    }
+    case NODE_ORELSE: {
+        Type *t = find_param_cast_type(c, node->orelse.expr, param_name, param_len);
+        if (t) return t;
+        return find_param_cast_type(c, node->orelse.fallback, param_name, param_len);
+    }
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++) {
+            Type *t = find_param_cast_type(c, node->intrinsic.args[i], param_name, param_len);
+            if (t) return t;
+        }
+        break;
+    case NODE_TYPECAST:
+        return find_param_cast_type(c, node->typecast.expr, param_name, param_len);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++) {
+            Type *t = find_param_cast_type(c, node->struct_init.fields[i].value,
+                                           param_name, param_len);
+            if (t) return t;
+        }
+        break;
+    /* Stage 2 Part B (2026-04-28): exhaustive — leaf / no-children kinds that
+     * cannot hold a `@ptrcast(*T, param)`. NODE_ASM: see the note in
+     * scan_func_props (operands unreachable while asm is naked-only). */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
+    case NODE_BREAK: case NODE_CONTINUE:
     case NODE_GOTO: case NODE_LABEL: case NODE_ASM:
-    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
-    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         break;
     }
     return NULL;
@@ -20090,7 +20326,8 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
  * Scans all call expressions in the file, checks argument provenance. */
 static void check_call_provenance(Checker *c, Node *node) {
     if (!node) return;
-    if (node->kind == NODE_CALL && node->call.callee->kind == NODE_IDENT) {
+    if (node->kind == NODE_CALL && node->call.callee &&
+        node->call.callee->kind == NODE_IDENT) {
         const char *fname = node->call.callee->ident.name;
         uint32_t flen = (uint32_t)node->call.callee->ident.name_len;
 
@@ -20148,14 +20385,28 @@ static void check_call_provenance(Checker *c, Node *node) {
         for (int i = 0; i < node->block.stmt_count; i++)
             check_call_provenance(c, node->block.stmts[i]);
         break;
+    /* BUG-806: the recursion used to reach a call only when it was the WHOLE
+     * of an expression-statement, a var-decl initialiser, or a return value.
+     * Every other position was unchecked — measured live:
+     *     if (process(@ptrcast(*opaque, &g_motor)) > 0) { ... }
+     * compiled clean while the identical call as `u32 v = process(...)` was
+     * rejected with "wrong *opaque type". That is type confusion — the exact
+     * class the provenance system exists to stop — reachable by moving the call
+     * into a condition, a loop, a switch subject, an argument, or any nested
+     * expression. Now a full descent. */
     case NODE_IF:
+        check_call_provenance(c, node->if_stmt.cond);
         check_call_provenance(c, node->if_stmt.then_body);
         check_call_provenance(c, node->if_stmt.else_body);
         break;
     case NODE_FOR:
+        check_call_provenance(c, node->for_stmt.init);
+        check_call_provenance(c, node->for_stmt.cond);
+        check_call_provenance(c, node->for_stmt.step);
         check_call_provenance(c, node->for_stmt.body);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
+        check_call_provenance(c, node->while_stmt.cond);
         check_call_provenance(c, node->while_stmt.body);
         break;
     case NODE_FUNC_DECL:
@@ -20170,24 +20421,85 @@ static void check_call_provenance(Checker *c, Node *node) {
     case NODE_RETURN:
         check_call_provenance(c, node->ret.expr);
         break;
+    case NODE_SWITCH:
+        check_call_provenance(c, node->switch_stmt.expr);
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            check_call_provenance(c, node->switch_stmt.arms[i].body);
+        break;
+    case NODE_DEFER:
+        check_call_provenance(c, node->defer.body);
+        break;
+    case NODE_CRITICAL:
+        check_call_provenance(c, node->critical.body);
+        break;
+    case NODE_ONCE:
+        check_call_provenance(c, node->once.body);
+        break;
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            check_call_provenance(c, node->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        check_call_provenance(c, node->await_stmt.cond);
+        break;
+    case NODE_BINARY:
+        check_call_provenance(c, node->binary.left);
+        check_call_provenance(c, node->binary.right);
+        break;
+    case NODE_UNARY:
+        check_call_provenance(c, node->unary.operand);
+        break;
+    case NODE_ASSIGN:
+        check_call_provenance(c, node->assign.target);
+        check_call_provenance(c, node->assign.value);
+        break;
+    case NODE_CALL:
+        check_call_provenance(c, node->call.callee);
+        for (int i = 0; i < node->call.arg_count; i++)
+            check_call_provenance(c, node->call.args[i]);
+        break;
+    case NODE_FIELD:
+        check_call_provenance(c, node->field.object);
+        break;
+    case NODE_INDEX:
+        check_call_provenance(c, node->index_expr.object);
+        check_call_provenance(c, node->index_expr.index);
+        break;
+    case NODE_SLICE:
+        check_call_provenance(c, node->slice.object);
+        check_call_provenance(c, node->slice.start);
+        check_call_provenance(c, node->slice.end);
+        break;
+    case NODE_ORELSE:
+        check_call_provenance(c, node->orelse.expr);
+        check_call_provenance(c, node->orelse.fallback);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            check_call_provenance(c, node->intrinsic.args[i]);
+        break;
+    case NODE_TYPECAST:
+        check_call_provenance(c, node->typecast.expr);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            check_call_provenance(c, node->struct_init.fields[i].value);
+        break;
     /* Stage 2 Part B (2026-04-28): exhaustive — kinds without
-     * scannable bodies/exprs for provenance check recursion. */
+     * scannable bodies/exprs for provenance check recursion.
+     * NODE_ASM: see the note in scan_func_props. */
     case NODE_FILE: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
     case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT:
     case NODE_CINCLUDE: case NODE_INTERRUPT: case NODE_MMIO:
     case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_SWITCH: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST:
+    case NODE_SIZEOF:
         break;
     }
 }
@@ -20476,6 +20788,18 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
                     fsc_add_type_id(fsc, callee_fsc->type_ids[i]);
             }
         }
+        /* BUG-802: the CALLEE is an expression too, and it can read a shared
+         * struct (`g.cb()` loads the funcptr out of shared G). BUG-795 added
+         * this descent to the three DIRECT-site walkers and missed this one —
+         * the TRANSITIVE cache — even though the comment below already claims
+         * lockstep with collect_shared_types_in_expr. Consequence measured:
+         * `u32 helper(){ return g.cb(); }` then `h.y = helper();` recorded only
+         * H, so the same-statement two-shared-type deadlock check passed on a
+         * statement that locks H and then locks G inside the callee. The direct
+         * spelling `h.y = g.cb();` was correctly rejected.
+         * A bare function-name callee is not a shared global, so descending an
+         * ident costs nothing and the transitive lookup above still runs. */
+        scan_body_shared_types(c, node->call.callee, fsc);
         for (int i = 0; i < node->call.arg_count; i++)
             scan_body_shared_types(c, node->call.args[i], fsc);
         break;
@@ -20676,6 +21000,12 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
     case NODE_TYPECAST:
         return cond_pred_foreign_shared(c, pred->typecast.expr, cond_root, cond_root_len);
     case NODE_CALL:
+        /* BUG-802 sibling: the callee is an expression. `@cond_wait(g,
+         * gb.cb() > 0)` reads foreign shared `gb` to fetch the funcptr while
+         * holding only g's mutex — the same unsynchronized read this rule
+         * rejects in argument position (`idf(gb.count) > 0`). */
+        if ((r = cond_pred_foreign_shared(c, pred->call.callee, cond_root, cond_root_len)))
+            return r;
         for (int i = 0; i < pred->call.arg_count; i++)
             if ((r = cond_pred_foreign_shared(c, pred->call.args[i], cond_root, cond_root_len)))
                 return r;

@@ -1396,6 +1396,12 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
     return found;
 }
 
+/* Public face of the walker above — see ir.h for why it is exported.
+ * (BUG-808: emitter.c held two drifted copies of this logic.) */
+Node *ir_find_shared_root_expr(void *checker, Node *expr) {
+    return find_shared_root_expr((Checker *)checker, expr);
+}
+
 /* B1 (2026-06-21): collect ALL distinct shared(rw) roots in an expr (dedup by
  * ident name), so a multi-shared-read statement (`x = ga.v + gb.v`) locks BOTH,
  * not just the first. Read locks compose (deadlock-free); the same-statement

@@ -1,0 +1,13 @@
+// expect-error: wrong *opaque type
+// BUG-806 sibling — while condition.
+struct Sensor { u32 id; }
+struct Motor { u32 speed; }
+u32 process(*opaque ctx) {
+    *Sensor s = @ptrcast(*Sensor, ctx);
+    return s.id;
+}
+Motor g_m;
+void f() {
+    while (process(@ptrcast(*opaque, &g_m)) > 0) { return; }
+}
+u32 main() { f(); return 0; }

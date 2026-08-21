@@ -5,6 +5,80 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `asm` OPERANDS are invisible to every AST safety walker (LATENT — blocked only by the naked-only restriction)
+
+**Status: not a live hole today. It becomes one the day S1 relaxes.** Recorded
+because the blocker is a *language restriction*, not a check, and Option E
+(`docs/asm_lang_zer_safe.md`) is explicitly heading toward removing it.
+
+**What is missing.** `NODE_ASM` carries `asm_stmt.inputs[]` and
+`asm_stmt.outputs[]`, each an `AsmOperand` holding a **ZER expression**. An
+output binding is a WRITE to a ZER lvalue:
+
+```zer
+asm {
+    instructions: "movq $42, %0"
+    outputs: { "rax" = g_result }      // writes g_result
+    inputs:  { "rcx" = g_input }       // reads g_input
+    safety:  "..."
+}
+```
+
+`tools/audit_walker_fields.sh` reports that **no walker in the tree descends
+either array** — the count is in `tools/walker_field_baseline.txt`, whose header
+carries the same note. Among the blind walkers:
+
+| Walker | What it would miss |
+|---|---|
+| `vrp_invalidate_loop_body_writes` | an asm output writing a loop-carried index → range not widened → **elided bounds guard** |
+| `ast_name_mutated_or_addrd` | an asm output writing a guard bool → the Level-B guarded-free relaxation's STABILITY precondition silently false → **accept-unsafe UAF** |
+| `record_isr_globals` | a global written by ISR asm → missing-`volatile` check bypassed |
+| `scan_unsafe_global_access` | a global touched by a spawned target's asm → data race |
+| `record_atomic_plain_in_callee` | a plain asm access to an atomic cell |
+| `scan_func_props` | effects reached through an operand expression |
+| `scan_body_shared_types` | a shared read in an operand |
+
+**Why it is unreachable today.** `asm` is permitted only inside a `naked`
+function (S1), and a naked function's body may contain nothing but `asm` and
+`return` — no locals, no loops, no calls. So there is no loop index to widen, no
+guard bool to destabilise, no `interrupt` body to be inside. The one shape that
+is arguably reachable is `spawn naked_fn()` where the naked function's asm writes
+a non-shared global; the race scan would not see it.
+
+**What to do when S1 relaxes.** Descend both operand arrays in every walker
+above IN THE SAME COMMIT as the relaxation, treating `outputs[i].expr` as a WRITE
+and `inputs[i].expr` as a READ. The baseline rows are grouped per walker to make
+that a mechanical sweep. Do not relax S1 first and fix the walkers after — that
+ordering opens seven holes at once.
+
+---
+
+## OPEN — two DISTINCT `@once` blocks touching the same global are not mutually exclusive (LOW)
+
+`@once` bodies are excluded from the spawn data-race scan, and that exclusion is
+correct for a SINGLE `@once`: the winner is chosen with an ACQ_REL
+compare-exchange and publishes with a RELEASE store that every loser ACQUIREs
+before continuing, so a plain global written inside it is properly synchronised.
+`tests/zer/once_loser_wait.zer` pins that idiom and is what caught an earlier,
+over-broad version of BUG-804.
+
+The residual: each `@once` site has its OWN guard variable, so two different
+`@once` blocks are not mutually exclusive with each other.
+
+```zer
+u32 g;
+void a() { @once { g = 1; } }     // once-guard #1
+void b() { @once { g = 2; } }     // once-guard #2 — races a()
+```
+
+Both spawned, both accepted. Narrow (it requires two `@once` sites over one
+global, which is already a design smell) and the fix is not "descend `@once`" —
+that re-breaks the single-site idiom. It would need the scan to record which
+once-guard an access sits under and flag only accesses under DIFFERENT guards.
+No corpus instance; no reproducer written.
+
+---
+
 ## ~~harvested 2026-08-17 from seven audit branches~~ — **ALL 39 CLOSED 2026-08-17**
 
 Five structural fixes (BUG-791..795) closed 26; the six remaining independent
@@ -3167,12 +3241,23 @@ Gated the "may require libatomic on 32-bit" warning on
 the field was memset-zeroed and any `target_ptr_bits < N` check
 silently always-true. See BUGS-FIXED.md "Fix #1".
 
-## OPEN — `naked` attribute silently dropped on IR path
+## OPEN — `naked` attribute dropped on IR path (NO LONGER SILENT as of BUG-807)
 
-See full entry near the bottom of this file ("`naked` attribute
-silently dropped on IR path (deferred 2026-05-02)") — kept in original
-location to preserve the more detailed analysis added in the
-2026-05-02 fix session.
+The attribute is still not emitted; what changed 2026-08-21 is that the drop is
+now **loud**. Every `naked` declaration raises a warning naming exactly what is
+not guaranteed (frame layout, a hand-written `ret`/`iret`, running before the
+stack is set up) and what to do instead (write it in C, link via `cinclude`).
+`docs/reference.md` carries the same text under "naked functions".
+
+Why the real fix is still deferred: GCC forbids asm OPERANDS inside a naked
+function, so restoring the attribute is not "add an explicit `ret` to the asm
+tests" — `tests/zer/asm_typed_operands.zer` and its siblings bind
+`outputs: { "rax" = g_result }`, which cannot exist in a truly naked function
+and would need rewriting. That is a user-visible breaking change and a migration
+of its own.
+
+See the full entry near the bottom of this file ("`naked` attribute
+silently dropped on IR path (deferred 2026-05-02)") for the original analysis.
 
 ## ~~Codebase audit 2026-05-07 — 5 silent gaps closed~~ (FIXED 2026-05-07)
 
@@ -3847,6 +3932,16 @@ clearer code intent.
 ---
 
 ## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+
+**UPDATE 2026-08-21 (BUG-807): no longer SILENT.** The attribute is still not
+emitted, but every `naked` declaration now warns. See the OPEN entry at the top
+of this file. The analysis below is unchanged and still accurate, with one
+correction measured this session: re-enabling the attribute would break
+`tests/zer/asm_typed_operands.zer` more deeply than "missing `ret`" — GCC
+forbids asm OPERANDS inside a naked function at all, so the structured
+`inputs:`/`outputs:` bindings would have to be redesigned, not patched. Also
+measured: GCC 13 on x86-64 DOES honour `__attribute__((naked))` (it is not
+ignored the way it once was on x86), so emitting it would take real effect.
 
 **Status:** known regression from IR migration; not fixed because fixing
 breaks every existing `tests/zer/asm_*.zer` test.

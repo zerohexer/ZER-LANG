@@ -5,6 +5,203 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-21 — BUG-802..810: the FIELD half of the walker discipline
+
+**The question this session asked.** `-Werror=switch` + `walker_default_audit.sh`
+guarantee every safety walker NAMES every NodeKind. Nothing checked whether an arm
+that names a kind actually DESCENDS that kind's children. That second half is where
+the holes were: BUG-795 (five shared-root walkers, none descending `call.callee`),
+the 2026-08-06 VRP orelse-fallback gap and BUG-772 are all the same shape — arm
+present, one child never mentioned, `-Wswitch` perfectly happy.
+
+**Built the gate first, then read its output as a bug list.**
+`tools/audit_walker_fields.sh` maps every NodeKind to its `Node *` children
+(self-checked against `ast.h`, so a new kind fails the audit) and reports, for every
+recursive kind-walker, each child an arm never descends.
+Eleven live defects came out of it — nine from the first run, BUG-811 from
+following up the gate's own stated blind spot, and BUG-812 from compiling every
+self-contained example in `docs/reference.md`. Every one was reproduced on the
+pre-fix compiler and its DIAGNOSTIC read, not just its exit code.
+
+| Bug | Walker | Missed child | Consequence, measured |
+|---|---|---|---|
+| 802 | `scan_body_shared_types`, `cond_pred_foreign_shared` | `call.callee` | missed deadlock; missed `@cond_wait` foreign-shared race |
+| 803 | `scan_func_props` | `orelse.fallback`, `struct_init.fields`, `slice.*`, `await.cond` | `spawn` inside `@critical` — pthread_create between `cpsid i` and `msr primask` |
+| 804 | `scan_unsafe_global_access`, `record_isr_globals` | `critical.body`, `spawn.args`, `await.cond` | non-shared global raced from a spawned thread |
+| 805 | `expr_contains_yield` | `orelse.fallback`, `call.callee`, block/stmt kinds | shared mutex held ACROSS a coroutine suspend |
+| 806 | `check_call_provenance`, `find_param_cast_type` | ~30 expression kinds each | `*opaque` type confusion in any nested position |
+| 807 | — | — | `naked` silently dropped; now warns |
+| 808 | `find_shared_root`, `emit_defer_shared_root` (emitter) | drifted copies | spawn arg / defer fire emitted with NO mutex |
+| 809 | `ir_defer_scan_uses` | conditions, var-decl inits, return exprs | defer-body UAF unreported |
+| 810 | `scan_frame` | loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
+| 811 | `expr_mentions_global` (an if/else chain — invisible to BOTH gates) | intrinsic args, call args, orelse | non-atomic RMW on a volatile global, 3 spellings, both sinks |
+| 812 | `ir_defer_free_arg` | extern destructors, summary-based wrapper frees | `defer sensor_close(dev);` REJECTED as a leak — the reference's own C-interop example did not compile |
+
+### BUG-802 — the transitive shared-type cache never looked at the CALLEE
+BUG-795 fixed the three DIRECT-site walkers and left two behind, one of which
+carries a comment claiming lockstep with a walker it had already diverged from.
+`u32 helper(){ return g.cb(); }` recorded no shared type, so `h.y = helper();`
+passed the same-statement two-shared-type check while locking H and then locking G
+inside the callee. The direct spelling `h.y = g.cb();` was correctly rejected.
+Same shape at `@cond_wait`: `@cond_wait(g, gb.cb() > 0)` compiled;
+`@cond_wait(g, idf(gb.count) > 0)` did not.
+
+### BUG-803 — an effect one token to the right of an orelse
+`scan_func_props` is the whole basis of the context bans (spawn/alloc/yield in
+`@critical`, ISR, `defer`). It walked `orelse.expr` and stopped. Measured:
+`@critical { u32 v = maybe() orelse starter(); }` where `starter()` spawns —
+compiled clean, and the emitted C really does call `pthread_create` between the
+interrupt-disable and the interrupt-restore. `NODE_STRUCT_INIT` and `NODE_SLICE`
+were no-op leaves in the same walker, so `P p = { .a = starter() }` and
+`buf[starter()..4]` hid the same effect.
+
+### BUG-804 — `@critical` is not synchronisation, and `@once` is
+`@critical` was a leaf in the spawn data-race scan. It reads as deliberate
+synchronisation and is not: it disables INTERRUPTS on one core and gives no mutual
+exclusion between threads. `void worker(){ @critical { g += 1; } }` + `spawn worker();`
+compiled while the identical access without the wrapper was rejected.
+
+**`@once` was in the first version of this fix and was WRONG.** `tests/zer/once_loser_wait.zer`
+failed — correctly. `@once` publishes with an ACQ_REL compare-exchange and a RELEASE
+store that every loser ACQUIREs, so a plain global written inside it is properly
+synchronised. Reverted, and the reason is now a comment at the arm so the next
+session does not re-add it. The residual (two DISTINCT `@once` blocks racing on one
+global) is in `docs/limitations.md`. One false rejection across the whole corpus,
+and it was the one that corrected a wrong hypothesis.
+
+### BUG-806 — provenance checked only three positions out of thirty
+`check_call_provenance` reached a call only as the whole of an expression-statement,
+a var-decl initialiser, or a return value. `if (process(@ptrcast(*opaque, &g_motor)) > 0)`
+compiled; `u32 v = process(...)` with the identical argument was rejected as
+"wrong *opaque type". That is type confusion reachable by moving the call into a
+condition, a loop, a switch subject, an argument, or any nested expression. Its
+partner `find_param_cast_type` had the same shape from the callee's side, so a
+function that cast its param inside a loop registered no expectation at all.
+
+### BUG-808 — the drift, structurally removed
+The emitter held TWO more copies of the shared-root walker: one for the
+spawn-argument lock, one for defer-fire. They had drifted apart — the spawn one
+was missing the 2026-06-28 `*shared` field-projection step AND orelse/slice/
+struct-init/intrinsic recursion AND BUG-795's callee descent; the defer one had
+everything except the callee. `defer { sink(g.cb()); }` emitted with no mutex;
+verified in the emitted C, and verified fixed there too. `find_shared_root_expr`
+is now exported from `ir_lower.c` as `ir_find_shared_root_expr` (ir.h) and answers
+the question for all three sinks. ~170 lines of duplicated walker deleted.
+
+Removed at the same time, as pure drift bait: the dead `find_shared_root_in_stmt`,
+`shared_needs_condvar`, `stmt_writes_shared`, `collect_async_locals` (emitter.c),
+`has_atomic_or_barrier` (checker.c — a stale hand copy of FuncProps sync detection
+carrying the same orelse gap) and `ir_classify_method_call` (zercheck_ir.c, the
+receiver-unvalidated variant CLAUDE.md says to deprecate). 10 dead-function
+warnings down to 4.
+
+### BUG-807 — `naked` was silently ignored, now it is loud
+`__attribute__((naked))` has not been emitted since the IR migration, so GCC adds a
+normal prologue/epilogue and a reset handler / `iret` ISR / context-switch
+primitive silently malfunctions on real hardware. Restoring the attribute is a real
+migration, not a one-line fix: GCC forbids asm OPERANDS inside a naked function, so
+`tests/zer/asm_typed_operands.zer` and friends would have to be rewritten, not just
+given an explicit `ret`. Until then the honest move is audit visibility — every
+`naked` declaration now warns, naming what is not guaranteed and what to do
+instead. `docs/reference.md` says the same thing where users will read it.
+
+### BUG-811 — the if/else-chain walkers, which BOTH gates are blind to
+Documenting the field gate's stated blind spot (if/else chains) turned into a
+hunt, and the hunt found a live accept-unsafe hole in the first predicate looked
+at. `expr_mentions_global` answers "does `x = <expr>` READ x?" — the
+written-out-RMW half of BUG-792. It descended binary/unary/field/index/typecast
+and stopped, so wrapping the read in anything else made the RMW invisible:
+
+```zer
+g = @truncate(u32, g) + 1;      // intrinsic arg
+g = idf(g) + 1;                 // call arg
+g = (non() orelse g) + 1;       // orelse fallback
+```
+
+All three ACCEPTED at BOTH the spawn and ISR sinks pre-fix, while the bare
+`g = g + 1` was rejected. Each is a lost-update race on a volatile global —
+`@truncate` around a widening read is an entirely natural spelling.
+
+Both predicates carried the comment *"partial by design: unlisted kinds yield
+'no', never a new rejection."* True of the predicate in isolation, and exactly
+backwards for every consumer: "not mentioned" means "not an RMW" means ACCEPT.
+Now one exhaustive no-default switch (`expr_mentions_global` delegates to it),
+so `-Werror=switch` and both walker audits cover it.
+
+Worth naming as a pattern: several walkers in this tree say in their own comments
+that they are written as if/else chains **"to avoid the walker-default audit"**.
+That is code shaped to evade a completeness gate, and this is what it costs.
+Gate: the RMW FORM grid in `tests/test_hw_matrix.c` grows 30 → 36 cells (site ×
+spelling); all six new cells were verified to fail against the pre-fix compiler.
+
+### BUG-812 — the reference's flagship C-interop example did not compile
+Found by compiling every self-contained ```zer block in `docs/reference.md`
+(24 of 174 are whole programs; 3 failed, 2 of those legitimately — a deliberate
+COMPILE-ERROR example and a multi-file module snippet). The third was real:
+
+```zer
+*opaque dev = sensor_open("/dev/spi0");
+defer sensor_close(dev);        // "allocated at line N but never freed"
+```
+
+The DIRECT call `sensor_close(dev);` is recognised as a free — via
+`ir_is_extern_free_call` (bodyless, pointer first param, void return or a
+destructor-convention name) and via the cross-function `frees_param` summary for
+a ZER wrapper. The DEFERRED one was not: `ir_defer_free_arg` had its own,
+narrower answer to "does this call free its argument?" — builtin `.free()`,
+`.free_ptr()` and bare `free()` only. The same question, answered at two sites,
+with the newer site poorer. The now-familiar shape.
+
+**This over-rejection had teeth**: it pushed users off the SAFER form. Drop the
+`defer` to satisfy the checker and every early return leaks — the compiler was
+arguing against its own idiom, and the documentation was teaching a program that
+did not build.
+
+Fixed by routing the defer site through the same two predicates. Side effect
+worth noting: `dev_close(dev); defer dev_close(dev);` used to report *"use after
+free"* (the deferred call's argument counted as a USE of an already-freed
+handle); it now reports *"double free: deferred free of %0 which was already
+freed"* — the accurate reason.
+
+Tests: `tests/zer/cinterop_defer_close_ok.zer` + `cinterop_defer_close_test.h`
+(links against a real C helper and asserts opens and closes stay balanced, so a
+future "fix" that accepts the program by ignoring the deferred call fails here),
+and `tests/zer_fail/cinterop_defer_double_close.zer`. Verified rejected pre-fix.
+
+### `--release` was a silent no-op
+`grep`ing the CLI flags against the reference turned up five undocumented ones.
+Four were real and are now documented. `--release` was **set and never read** —
+GCC even warned about it. A build script passing `--release` got nothing and no
+diagnostic. It now warns that it has no effect, and the reference says why there
+is no debug/release split: the runtime safety checks are not debug scaffolding,
+and a `--release` that stripped them would be an escape hatch by another name.
+
+### What the gate caught about ITSELF
+The first version of `descends()` was a plain substring test and reported OK after I
+deleted a known-good `call.callee` descent — because the arm still MENTIONED the
+field in `if (n->call.callee && n->call.callee->kind == NODE_IDENT)`. A green gate
+over a live bug is the exact failure this codebase keeps warning about. The test now
+requires the accessor to appear as a whole argument or indexed, and was re-verified
+by deleting the descent again. Its remaining blind spot — children handled BEFORE
+the switch, as `ir_defer_scan_uses` now does — is stated in the script rather than
+left for someone to discover.
+
+### A latent class worth knowing about
+No walker in the tree descends `asm_stmt.inputs` / `asm_stmt.outputs`, and an asm
+OUTPUT writes a ZER lvalue. That is currently unreachable rather than safe: `asm` is
+legal only inside a `naked` function, which may hold nothing but asm and `return`.
+It goes live the moment the S1 naked-only restriction is relaxed (Option E), and it
+would open holes in VRP widening, the guard-stability gate, the ISR volatile check
+and the spawn race scan simultaneously. Recorded in `docs/limitations.md` and in the
+baseline's header.
+
+**Tests:** 13 negatives in `tests/zer_fail/` (each with `// expect-error:`, each
+verified to have been ACCEPTED pre-fix), plus `tests/zer/walker_descent_ok.zer` and
+`tests/zer/recursion_via_loop_condition.zer` pinning the legal shape at every
+newly-reached position. `make check` green, all audits, sink matrix clean.
+
+---
+
 ## Session 2026-08-17b — BUG-796..801: the remaining 13 harvested holes (39/39 closed)
 
 Six independent classes, the ones the five structural fixes did not collapse.

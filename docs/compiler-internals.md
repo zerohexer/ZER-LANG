@@ -514,6 +514,92 @@ frozen, so the surface shrinks over time instead of ossifying.
 
 ---
 
+## The walker discipline has TWO halves — KIND and FIELD (2026-08-21, BUG-802..811)
+
+**Read this before writing or editing any recursive AST walker.**
+
+### The half that already existed
+
+`-Werror=switch` + `tools/walker_default_audit.sh` guarantee that every safety
+walker **NAMES** every `NodeKind`. A new kind added to `ast.h` fails the build
+until every no-default switch considers it. That gate is strong, free, and has
+worked exactly as designed since 2026-04-28.
+
+### The half that did not
+
+It says nothing about whether an arm that names a kind actually **DESCENDS** that
+kind's children. `case NODE_CALL:` that walks `call.args` and never `call.callee`
+is fully `-Wswitch`-clean and completely blind to `g.cb()`.
+
+**Every hole of this shape found in this project passed the kind gate:**
+
+| | |
+|---|---|
+| BUG-795 | five shared-root walkers, none descending `call.callee` — `go.cb()` emitted with NO mutex |
+| 2026-08-06 | `vrp_invalidate_loop_body_writes` named `NODE_ORELSE`, skipped `orelse.fallback` → **elided bounds guard**, ASan global-buffer-overflow |
+| BUG-772 | spawn race scan walked `orelse.expr`, dropped `orelse.fallback` |
+| BUG-802..806, 809, 810 | nine more, found by finally gating it |
+
+`tools/audit_walker_fields.sh` is that second half. It derives each NodeKind's
+`Node *` children from `struct Node`, **self-checks that table against ast.h's
+enum** (so a new kind fails the audit until its children are declared), and
+reports every child an arm never hands to anything.
+`tools/walker_field_baseline.txt` holds the reviewed exceptions, grouped per
+walker with a reason. Run it as `make check-walker-fields`.
+
+### Three things about it that are easy to get wrong
+
+1. **"Descends" is not "mentions".** The first version used a substring test and
+   reported OK after a known-good `call.callee` descent was deleted — because the
+   arm still mentioned the field inside
+   `if (n->call.callee && n->call.callee->kind == NODE_IDENT)`. A green gate over
+   a live bug. The test now requires the accessor to appear as a whole argument
+   (`,` `)` `;`) or indexed (`[`). **Verify a new gate FIRES before trusting it** —
+   this one was verified by deleting the descent twice.
+
+2. **If/else-chain walkers are invisible to BOTH gates.** Several walkers in this
+   tree say so in their own comments — *"implemented as an if/else chain (not a
+   switch) to stay clear of the walker-default audit"*. That is code shaped to
+   evade a completeness gate. BUG-811 is what it cost: `expr_mentions_global`, the
+   "is this a written-out RMW?" predicate, descended five kinds and silently
+   accepted `g = @truncate(u32, g) + 1` as a non-RMW at both the spawn and ISR
+   sinks. **Write new walkers as no-default switches.** If you convert one, expect
+   the field audit to light up with its no-op arms — that is the gate starting to
+   cover it, and those rows belong in the baseline.
+
+3. **Only text inside a `case NODE_X:` arm counts.** A walker that handles some
+   children *before* the switch (`ir_defer_scan_uses` checks conditions at its
+   head) is credited via the baseline, and deleting that head code would NOT turn
+   the gate red. Stated in the script; do not assume more coverage than that.
+
+### The latent class the audit surfaced
+
+**No walker in the tree descends `asm_stmt.inputs` / `asm_stmt.outputs`**, and an
+asm OUTPUT binding writes a ZER lvalue. Unreachable today only because `asm` is
+naked-only (S1) and a naked function holds nothing but asm and `return`. It goes
+live the moment S1 relaxes, and it opens holes in VRP widening, the guard-
+stability gate, the ISR volatile check and the spawn race scan **at the same
+time**. Full entry + the fix order in `docs/limitations.md`. `expr_mentions_name`
+is the one walker that already reads them, deliberately.
+
+### One walker, three sinks
+
+BUG-808 is the durable half of this session. "Which shared struct does this
+expression touch?" had THREE implementations — `find_shared_root_expr`
+(ir_lower.c, the maintained one), plus copies in emitter.c for the spawn-argument
+and defer-fire lock sinks. The copies had drifted: the spawn one predated the
+2026-06-28 `*shared` field-projection fix AND the orelse/slice/struct-init/
+intrinsic recursion AND BUG-795's callee descent. `defer { sink(g.cb()); }`
+emitted with no mutex. The walker is now exported as `ir_find_shared_root_expr`
+(ir.h) and answers the question once. Same commit removed the dead
+`find_shared_root_in_stmt` / `shared_needs_condvar` / `stmt_writes_shared` /
+`collect_async_locals` / `has_atomic_or_barrier` / `ir_classify_method_call`,
+which were stale AST-path leftovers a future session could mistake for live
+safety logic. **The durable end-state for any patchwork is ONE query + a gate,
+not N call sites** — this is that pattern applied again.
+
+---
+
 ## ZER Safety Architecture — Read Before Any Safety Work
 
 **Mandatory reading before modifying ANY safety-relevant code** (checker.c

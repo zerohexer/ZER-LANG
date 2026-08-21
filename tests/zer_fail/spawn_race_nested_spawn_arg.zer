@@ -1,0 +1,8 @@
+// expect-error: accesses non-shared global
+// BUG-804 sibling: a nested `spawn inner(g_counter)` reads g_counter in the
+// ARGUMENT, evaluated on the spawning thread — the scan treated NODE_SPAWN as a
+// leaf and never looked at the args.
+u32 g_counter = 0;
+void inner(u32 x) { x = x; }
+void worker() { spawn inner(g_counter); }
+u32 main() { spawn worker(); return 0; }

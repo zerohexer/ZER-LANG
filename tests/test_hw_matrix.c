@@ -304,6 +304,11 @@ static const char *vshape_flags(VShape s) {
  * ------------------------------------------------------------------------- */
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               /* BUG-811: the WRITTEN-OUT read was found by a predicate that
+                * only descended binary/unary/field/index/typecast, so wrapping
+                * the read in anything else made `g = <read of g> + 1` invisible.
+                * All three ACCEPTED pre-fix at BOTH sinks. */
+               RFORM_WRAP_INTRINSIC, RFORM_WRAP_CALL, RFORM_WRAP_ORELSE,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -313,6 +318,9 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_WRAP_INTRINSIC:  return "g=@trunc(g)+1";
+    case RFORM_WRAP_CALL:       return "g=idf(g)+1";
+    case RFORM_WRAP_ORELSE:     return "g=(none orelse g)+1";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -327,6 +335,9 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    case RFORM_WRAP_INTRINSIC: *helper = "";                                    *body = "g = @truncate(u32, g) + 1;"; break;
+    case RFORM_WRAP_CALL:      *helper = "u32 idf(u32 x){ return x; }";         *body = "g = idf(g) + 1;"; break;
+    case RFORM_WRAP_ORELSE:    *helper = "?u32 non(){ return null; }";          *body = "g = (non() orelse g) + 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

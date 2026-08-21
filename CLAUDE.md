@@ -381,6 +381,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Escape / keep ("frame-bound?") | store-global, return, keep-call, keep-infer, struct-field-store, spawn-arg | `tools/sink_matrix.sh` — **ADD A CELL per new shape** (a shape with no cell is INVISIBLE; yd5ajq grew it 32→41). `make check-sink-matrix` |
 | VRP range JOIN (merge at a control-flow join) | NODE_IF (§C#13 ✅), switch-arm, for-body, while/do-while body, do-while first-iter, goto/label | mirror `vrp_snap_take/restore/join` per node-kind; a missing kind = silent OOB. NO auto-gate — checklist every control-flow kind |
 | Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
+| **Walker FIELD coverage ("the arm names the kind but skips a child")** | every recursive kind-walker × every `Node *` child of the kinds it names | **`tools/audit_walker_fields.sh` + `tools/walker_field_baseline.txt`** (NEW 2026-08-21). The KIND gate above is only half the discipline: `-Wswitch` is satisfied by an arm that EXISTS, and says nothing about whether it descends. Every hole of this shape to date — BUG-795 (`call.callee` at five sites), the 2026-08-06 VRP `orelse.fallback`, BUG-772, and BUG-802..806/809/810 — passed the kind gate. Fix by descending the child, or add the `file:function:KIND:accessor` row with a justification. Self-checks its KIND table against `ast.h`, so a NEW NodeKind fails the audit |
 | Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
@@ -1964,6 +1965,21 @@ fall back (e.g., diagnostic emit), enumerate the fall-back kinds
 explicitly so the compiler enforces exhaustiveness when new kinds
 are added later.
 
+**…and `bash tools/audit_walker_fields.sh` (the FIELD half, added 2026-08-21).**
+Naming every kind is only half the discipline. `-Wswitch` is satisfied the moment
+an arm EXISTS; it cannot tell that `case NODE_CALL:` walks `call.args` and never
+`call.callee`. **Every hole of that shape found so far passed the kind gate** —
+BUG-795 (five walkers, none descending the callee), the 2026-08-06 VRP
+`orelse.fallback` gap that elided a bounds guard, BUG-772, and the nine of
+BUG-802..810. The field audit reports, per recursive kind-walker, each `Node *`
+child an arm never hands to anything; a new one FAILS `make check` until you
+either descend it or add the `file:function:KIND:accessor` row to
+`tools/walker_field_baseline.txt` with a reason. It also self-checks its KIND
+table against `ast.h`, so **adding a NodeKind fails the audit** until the new
+kind's children are declared. Two stated blind spots: if/else-chain walkers
+(invisible to both gates — prefer a no-default switch), and children handled
+BEFORE the switch rather than inside an arm.
+
 **Token-op switches excluded** (legitimate intentional defaults):
 TokenKind has 100+ values dispatching binary/unary/assign operations.
 The audit script excludes via `binary\.op|unary\.op|assign\.op|op_token`.
@@ -2929,6 +2945,19 @@ After any bug fix or feature change that passes `make check`, update ALL relevan
 - `BUGS-FIXED.md` — add the bug with symptom, root cause, fix, test reference
 - `docs/compiler-internals.md` — if ANY emitter pattern, checker behavior, type handling, builtin method, or preamble changed. This is the primary reference future sessions read. Stale info here causes bugs.
 - `docs/reference.md` — if ANY language feature, syntax, intrinsic, builtin method, or type behavior changed. This is the user-facing language reference. Must reflect what `zerc` actually compiles, not what's spec'd but unimplemented.
+  **Its self-contained examples are GATED — `tools/audit_doc_examples.sh` (in `make check`)
+  compiles every ```zer block containing a `main`.** It exists because the flagship
+  "Safe C Library Interop" example stopped compiling and nobody noticed (BUG-812): the
+  doc was right when written and the compiler drifted under it. Two things it does NOT
+  cover, so don't over-trust a green run: a block with no `main` is a fragment and is
+  skipped (~145 of ~175 blocks), and blocks that are SUPPOSED to fail live in the
+  script's `EXPECTED_FAIL` list — if one of those starts compiling that is ALSO a
+  failure, because the rule the prose describes has changed.
+  **When you add or change an intrinsic, keyword, or CLI flag, diff it against the
+  reference** — `grep -oE '@[a-z0-9_]+' docs/reference.md` vs the checker's dispatch
+  chain, and `grep -oE '"--[a-z-]+"' zerc_main.c` vs the Usage block. That diff found
+  80 undocumented intrinsics and 5 undocumented flags in one pass (2026-08-21), one of
+  which (`--release`) turned out to be a silently-accepted no-op.
 - `README.md` — if test counts, features, or status changed
 - `ZER-LANG.md` — if spec behavior changed
 - `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed

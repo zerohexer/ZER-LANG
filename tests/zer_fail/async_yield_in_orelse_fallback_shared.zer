@@ -1,0 +1,14 @@
+// expect-error: cannot access shared struct in statement containing yield/await
+// BUG-805: expr_contains_yield walked orelse.expr but not orelse.fallback, so a
+// statement that suspends on its failure path was reported as suspend-free. The
+// emitter then wrapped it in pthread_mutex_lock(&g._zer_mtx) ... `case 1:` (the
+// resume label) ... unlock — the lock is held ACROSS the suspension point, the
+// exact self-deadlock this rule prevents. Verified in the emitted C pre-fix.
+shared struct G { u32 v; }
+G g;
+?u32 m() { return null; }
+async void t() {
+    u32 x = (m() orelse { yield; return; }) + g.v;
+    x = x;
+}
+u32 main() { return 0; }

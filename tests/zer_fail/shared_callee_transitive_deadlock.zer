@@ -1,0 +1,23 @@
+// expect-error: deadlock: single statement accesses both
+// BUG-802: the TRANSITIVE shared-type cache (scan_body_shared_types) descended
+// call ARGUMENTS but not the CALLEE expression, so `helper()` — whose body reads
+// shared G in callee position (`g.cb()`) — recorded no shared type at all.
+// `h.y = helper();` then locks H and locks G inside the callee: a lock-order
+// inversion the same-statement check exists to reject. The direct spelling
+// `h.y = g.cb();` was correctly rejected; only the one-hop form compiled.
+u32 zero() { return 7; }
+
+shared struct G { *() -> u32 cb; }
+shared struct H { u32 y; }
+G g;
+H h;
+
+u32 helper() {
+    return g.cb();
+}
+
+u32 main() {
+    g.cb = zero;
+    h.y = helper();
+    return 0;
+}

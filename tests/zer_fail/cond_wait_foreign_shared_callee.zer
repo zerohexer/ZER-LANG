@@ -1,0 +1,15 @@
+// expect-error: @cond_wait predicate may only read the condition variable's own
+// BUG-802 sibling: cond_pred_foreign_shared descended predicate call ARGUMENTS
+// but not the CALLEE. `gb.cb()` reads foreign shared `gb` to fetch the funcptr
+// while holding only g's mutex — the same unsynchronized cross-thread read the
+// rule rejects in argument position (`idf(gb.count) > 0`).
+u32 zero() { return 7; }
+shared struct G { u32 count; }
+shared struct B { *() -> u32 cb; }
+G g;
+B gb;
+
+void waiter() {
+    @cond_wait(g, gb.cb() > 0);
+}
+u32 main() { gb.cb = zero; return 0; }

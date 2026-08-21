@@ -2022,6 +2022,369 @@ u8[512] fpu;
 
 ---
 
+## CPU / PLATFORM INTRINSICS
+
+Everything below is a low-level CPU or platform primitive. They are grouped by
+what they do rather than by batch.
+
+**Two rules that apply to the whole section:**
+
+1. **Privileged intrinsics SIGSEGV in user mode.** Anything marked *privileged*
+   requires CPL=0 (x86) / EL1+ (ARM) / M- or S-mode (RISC-V). To compile-test one
+   on a hosted machine, put it in a branch that never runs:
+   ```zer
+   volatile u32 never_true = 0;
+   if (never_true == 42) { @cpu_write_cr3(0); }   // compiles, never executes
+   ```
+2. **Non-x86 targets get a safe fallback**, not a compile error: an x86-only
+   intrinsic emits a no-op (or a portable equivalent) on ARM/RISC-V. Check the
+   NOTES of each group before relying on the value.
+
+---
+
+### @cpu_pause(), @cpu_wfe(), @cpu_sev(), @cpu_breakpoint(), @cpu_flush_pipeline()
+
+**DESCRIPTION**
+Zero-argument, `void` hints. `@cpu_pause` is the spin-wait hint (x86 `pause`,
+ARM `yield`). `@cpu_wfe` / `@cpu_sev` are the ARM wait-for-event / send-event
+pair. `@cpu_breakpoint` traps into a debugger. `@cpu_flush_pipeline` serialises
+instruction fetch after a self-modifying or control-register write.
+
+**EXAMPLE**
+```zer
+volatile u32 g_ready = 0;
+void spin() {
+    while (g_ready == 0) { @cpu_pause(); }
+}
+u32 main() { g_ready = 1; spin(); return 0; }
+```
+
+**NOTES**
+- All are non-privileged and safe to call directly.
+- `@cpu_wfe` blocks until an event; do not use it where no `@cpu_sev` can arrive.
+
+---
+
+### @cpu_id(), @cpu_read_counter(), @cpu_get_pc()
+
+**DESCRIPTION**
+`@cpu_id() -> u32` — current core number.
+`@cpu_read_counter() -> u64` — cycle counter (x86 `rdtsc`, ARM `cntvct_el0`).
+`@cpu_get_pc() -> u64` — address of the current instruction.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 t0 = @cpu_read_counter();
+    u64 t1 = @cpu_read_counter();
+    return (u32)((t1 - t0) & 0);
+}
+```
+
+**NOTES**
+- Non-privileged. The counter is not a wall clock — it counts cycles and may
+  differ per core.
+
+---
+
+### @wait_on_address(addr, expected)
+
+**DESCRIPTION**
+Efficient polling primitive: block while `*addr == expected`. Lowered to the
+platform's wait facility where one exists, and to a pause-spin otherwise.
+
+**EXAMPLE**
+```zer
+u32 g_flag = 0;
+u32 main() {
+    @wait_on_address(&g_flag, 0);    // wait until g_flag changes
+    return 0;
+}
+```
+
+**NOTES**
+- First argument must be a pointer, second an integer. Returns `void`.
+- This is a hint, not a guarantee — always re-check the condition in a loop.
+
+---
+
+### @cpu_rdrand(), @cpu_rdseed()
+
+**DESCRIPTION**
+Hardware random number generators. Both return **`?u64`** — `null` when the
+hardware entropy source was not ready, which is a real and common outcome.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u64 r = @cpu_rdrand() orelse 0;
+    u64 s = @cpu_rdseed() orelse 0;
+    return (u32)((r + s) & 0);
+}
+```
+
+**NOTES**
+- The optional return is the point: a failed draw is not an error to ignore.
+  Retry, or fall back to a software PRNG — never treat `orelse 0` as entropy.
+- `@cpu_rdseed` is the seed-grade source and fails more often than `@cpu_rdrand`.
+
+---
+
+### @barrier_dma()
+
+**DESCRIPTION**
+DMA-coherence barrier for driver code — orders CPU accesses against a device's
+view of memory. Companion to `@barrier()` / `@barrier_store()` /
+`@barrier_load()` / `@barrier_acq_rel()`.
+
+**EXAMPLE**
+```zer
+u32 main() {
+    @barrier_dma();
+    return 0;
+}
+```
+
+---
+
+### Cache maintenance — @cache_flush_line, @cache_zero_line, @cache_flush_range, @cache_clean_range, @cache_invalidate_range, @cache_invalidate_icache, @cache_flushopt, @cache_writeback, @nt_store
+
+**DESCRIPTION**
+
+| Intrinsic | Args | Effect |
+|---|---|---|
+| `@cache_flush_line(addr)` | 1 | flush (clean+invalidate) the line containing `addr` |
+| `@cache_zero_line(addr)` | 1 | zero a whole cache line without reading it first |
+| `@cache_flush_range(addr, len)` | 2 | flush a byte range |
+| `@cache_clean_range(addr, len)` | 2 | write back a range, keep it resident |
+| `@cache_invalidate_range(addr, len)` | 2 | drop a range without writing back |
+| `@cache_invalidate_icache(addr, len)` | 2 | invalidate the instruction cache |
+| `@cache_flushopt(addr)` | 1 | x86 `CLFLUSHOPT` — ordered alternative to `CLFLUSH` |
+| `@cache_writeback(addr)` | 1 | x86 `CLWB` — write back without invalidating (NVDIMM) |
+| `@nt_store(addr, val)` | 2 | non-temporal store (`MOVNTI`) — bypass the cache |
+
+All return `void`.
+
+**EXAMPLE**
+```zer
+u8[64] line;
+u32 main() {
+    @cache_flush_line(line);
+    @cache_flush_range(line, 64);
+    @cache_writeback(line);
+    return 0;
+}
+```
+
+**NOTES**
+- `@cache_invalidate_range` **discards** dirty data. Use `@cache_clean_range`
+  first if the CPU wrote to the range and the device must see it.
+- After writing code at runtime you need `@cache_clean_range` on the data side
+  **and** `@cache_invalidate_icache` on the instruction side, then
+  `@cpu_flush_pipeline()`.
+
+---
+
+### CPU inspection — @cpu_read_sp, @cpu_read_tp, @cpu_read_flags, @cpu_vendor_id, @cpu_feature_bits, @cpu_model_id, @cpu_core_id, @cpu_current_mode, @cpu_cache_line_size, @cpu_num_cores
+
+**DESCRIPTION**
+Non-privileged reads of CPU state.
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_read_sp()` | `u64` | stack pointer |
+| `@cpu_read_tp()` | `u64` | thread pointer / TLS base |
+| `@cpu_read_flags()` | `u64` | RFLAGS (x86) / NZCV (ARM) |
+| `@cpu_vendor_id()` | `u64` | CPUID leaf 0 EBX — first 4 vendor chars |
+| `@cpu_feature_bits()` | `u64` | CPUID leaf 1, ECX:EDX packed |
+| `@cpu_model_id()` | `u32` | CPUID leaf 1 EAX — family/model/stepping |
+| `@cpu_core_id()` | `u32` | physical core id |
+| `@cpu_current_mode()` | `u32` | privilege mode (0 = user) |
+| `@cpu_cache_line_size()` | `u32` | L1 line size in bytes |
+| `@cpu_num_cores()` | `u32` | logical core count |
+
+**EXAMPLE**
+```zer
+u32 main() {
+    u32 line = @cpu_cache_line_size();
+    u32 cores = @cpu_num_cores();
+    return (u32)((line + cores) & 0);
+}
+```
+
+**NOTES**
+- `@cpu_core_id`, `@cpu_current_mode`, `@cpu_cache_line_size` and
+  `@cpu_num_cores` return **conservative stubs** (0, 0, 64, 1) on targets where
+  the value is not cheaply readable. Treat them as hints, not as a topology API.
+
+---
+
+### MSR and control registers — @cpu_read_msr, @cpu_write_msr, @cpu_read_cr0/cr2/cr3/cr4, @cpu_write_cr0/cr3/cr4, @cpu_read_xcr0, @cpu_write_xcr0
+
+**DESCRIPTION** *(privileged, x86)*
+
+| Intrinsic | Signature |
+|---|---|
+| `@cpu_read_msr(msr)` | `(u32) -> u64` |
+| `@cpu_write_msr(msr, val)` | `(u32, u64) -> void` |
+| `@cpu_read_cr0()` / `@cpu_read_cr3()` / `@cpu_read_cr4()` | `() -> u64` |
+| `@cpu_write_cr0(v)` / `@cpu_write_cr3(v)` / `@cpu_write_cr4(v)` | `(u64) -> void` |
+| `@cpu_read_cr2()` | `() -> u64` — faulting address after a page fault |
+| `@cpu_read_xcr0()` / `@cpu_write_xcr0(v)` | XSAVE feature mask |
+
+**EXAMPLE**
+```zer
+volatile u32 never_true = 0;
+u32 main() {
+    if (never_true == 42) {
+        @cpu_write_cr3(@cpu_read_cr3());   // reload page tables (flushes TLB)
+        u64 fault_addr = @cpu_read_cr2();
+        @cpu_write_msr(0x1B, fault_addr);
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- There is no `@cpu_write_cr2` — CR2 is written by the hardware.
+- Writing CR3 flushes non-global TLB entries and switches address space.
+- Non-x86 targets get a no-op fallback.
+
+---
+
+### FS/GS base, port I/O, XSAVE, debug registers, firmware calls, PMC
+
+**DESCRIPTION** *(privileged; x86 unless noted)*
+
+| Intrinsic | Signature | Notes |
+|---|---|---|
+| `@cpu_read_fsbase()` / `@cpu_read_gsbase()` | `() -> u64` | needs CR4.FSGSBASE |
+| `@cpu_write_fsbase(v)` / `@cpu_write_gsbase(v)` | `(u64) -> void` | |
+| `@port_in8(port)` / `@port_in16` / `@port_in32` | `(u16) -> u8/u16/u32` | CPL <= IOPL |
+| `@port_out8(port, v)` / `@port_out16` / `@port_out32` | `(u16, uN) -> void` | |
+| `@cpu_xsave(buf, mask)` / `@cpu_xrstor(buf, mask)` | `(*u8, u64) -> void` | extended state |
+| `@cpu_read_dr(idx)` | `(u32) -> u64` | DR0-DR3, DR6, DR7 |
+| `@cpu_write_dr(idx, v)` | `(u32, u64) -> void` | |
+| `@cpu_read_pmc(idx)` | `(u32) -> u64` | RDPMC; needs CR4.PCE for user access |
+| `@cpu_sbi_call()` | `() -> void` | RISC-V `ecall` to M-mode firmware |
+| `@cpu_smc_call()` | `() -> void` | ARM TrustZone `smc #0` |
+
+**EXAMPLE**
+```zer
+u8[512] xbuf;
+volatile u32 never_true = 0;
+u32 main() {
+    if (never_true == 42) {
+        @port_out8(0x80, 0);              // POST code
+        u8 status = @port_in8(0x64);
+        @cpu_xsave(xbuf, 3);
+        @cpu_xrstor(xbuf, 3);
+        return (u32)status;
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- The XSAVE buffer must be 64-byte aligned and large enough for the requested
+  feature mask — ZER checks the argument is a pointer or array, not its size.
+- Port I/O is x86-only; other targets emit a no-op.
+
+---
+
+### Power management — @cpu_reset, @cpu_deep_sleep, @cpu_idle_hint, @cpu_monitor_addr, @cpu_mwait, @cpu_umonitor, @cpu_umwait
+
+**DESCRIPTION**
+
+| Intrinsic | Signature | Privileged |
+|---|---|---|
+| `@cpu_reset()` | `() -> void` | yes — safe halt-forever fallback; a real reset is platform-specific |
+| `@cpu_deep_sleep()` | `() -> void` | yes — deepest idle state (`hlt` / `wfi`) |
+| `@cpu_idle_hint()` | `() -> void` | **no** — non-blocking low-power hint |
+| `@cpu_monitor_addr(addr)` | `(*u8) -> void` | yes — x86 `MONITOR` |
+| `@cpu_mwait()` | `() -> void` | yes — x86 `MWAIT`, pairs with the above |
+| `@cpu_umonitor(addr)` | `(*u8) -> void` | **no** — user-mode `UMONITOR` |
+| `@cpu_umwait(hint, deadline)` | `(u32, u64) -> void` | **no** — `UMWAIT`; hint 0 = C0.2, 1 = C0.1 |
+
+**EXAMPLE**
+```zer
+u8[8] watch;
+volatile u32 never_true = 0;
+u32 main() {
+    @cpu_idle_hint();                     // non-blocking, always safe
+    if (never_true == 42) {
+        @cpu_monitor_addr(watch);
+        @cpu_mwait();
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- `@cpu_umwait` / `@cpu_umonitor` require the WAITPKG CPU feature.
+- `@cpu_reset()` does **not** return.
+
+---
+
+### Privileged mode transitions — @cpu_syscall, @cpu_sysret, @cpu_iret, @cpu_set_priv_stack, @cpu_get_priv_level, @cpu_hypercall
+
+**DESCRIPTION** *(all privileged except `@cpu_get_priv_level`)*
+
+| Intrinsic | Signature | Instruction |
+|---|---|---|
+| `@cpu_syscall()` | `() -> void` | `syscall` / `svc #0` / `ecall` |
+| `@cpu_sysret()` | `() -> void` | `sysretq` / `eret` / `sret` |
+| `@cpu_iret()` | `() -> void` | `iretq` / `eret` / `mret` |
+| `@cpu_set_priv_stack(sp)` | `(u64) -> void` | kernel stack for syscall entry |
+| `@cpu_get_priv_level()` | `() -> u32` | 0 = user |
+| `@cpu_hypercall()` | `() -> void` | `vmcall` / `hvc #0` / `ecall` |
+
+**NOTES**
+- Every one of these requires the system registers (CS/RIP/RFLAGS on x86;
+  ELR/SPSR on ARM; sepc/sstatus on RISC-V) to already hold the right values.
+  ZER cannot check that — it is a hardware-domain fact, outside the language's
+  program-consequence guarantee.
+
+---
+
+### Interrupt lifecycle and misc — @cpu_eoi, @cpu_cpuid, @cpu_cpuid_ecx, @cpu_cache_disable, @cpu_cache_enable, @cpu_fxsave, @cpu_fxrstor, @cpu_fpu_init, @cpu_endbr
+
+**DESCRIPTION**
+
+| Intrinsic | Signature | Notes |
+|---|---|---|
+| `@cpu_eoi()` | `() -> void` | end-of-interrupt to LAPIC / GICv3. Privileged |
+| `@cpu_cpuid(leaf, subleaf)` | `(u32, u32) -> u64` | `(EBX << 32) \| EAX` |
+| `@cpu_cpuid_ecx(leaf, subleaf)` | `(u32, u32) -> u64` | `(EDX << 32) \| ECX` |
+| `@cpu_cache_disable()` / `@cpu_cache_enable()` | `() -> void` | CR0.CD. Privileged |
+| `@cpu_fxsave(buf)` / `@cpu_fxrstor(buf)` | `(*u8) -> void` | legacy 512-byte, 16-byte aligned |
+| `@cpu_fpu_init()` | `() -> void` | `FNINIT` |
+| `@cpu_endbr()` | `() -> void` | CET-IBT landing pad; a multi-byte NOP without CET |
+
+**EXAMPLE**
+```zer
+u8[512] fxbuf;
+volatile u32 never_true = 0;
+u32 main() {
+    if (never_true == 42) {
+        u64 leaf0 = @cpu_cpuid(0, 0);
+        @cpu_fxsave(fxbuf);
+        @cpu_fpu_init();
+        @cpu_fxrstor(fxbuf);
+        @cpu_eoi();
+        return (u32)leaf0;
+    }
+    return 0;
+}
+```
+
+**NOTES**
+- The CPUID pair exists because ZER has no multi-value return: call both with
+  the same `(leaf, subleaf)` to get all four registers.
+- `@cpu_cache_disable()` also issues `WBINVD`, which is extremely slow.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2253,8 +2616,9 @@ grep -rnE "\basm\s*[(]" src/
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+Declares a function whose body must be pure `asm(...)` statements plus `return`
+— non-asm code would use stack that no prologue allocated, and the checker
+rejects it.
 
 **SYNTAX**
 ```zer
@@ -2262,7 +2626,32 @@ naked void reset_handler() {
     asm("ldr sp, =_stack_top");
     asm("b main");
 }
+u32 main() { return 0; }
 ```
+
+**NOTES — READ BEFORE RELYING ON THIS ON REAL HARDWARE**
+
+`naked` is currently **accepted but not emitted**. `__attribute__((naked))` is
+not placed on the generated C, so GCC produces a *normal* prologue and epilogue
+around the asm body. Every `naked` declaration therefore raises a warning:
+
+```
+warning: 'naked' is accepted but NOT emitted — GCC will add a normal
+prologue/epilogue to 'reset_handler'. ...
+```
+
+What still works: `asm` is permitted only inside a `naked` function, the
+asm-only body rule is enforced, and all Z-rule operand tracking is active.
+
+What does **not** work, and what the warning is telling you: exact frame layout,
+a hand-written `ret` / `iret` / `eret`, and running before the stack is set up.
+For those, write the routine in C with `__attribute__((naked))` and link it via
+`cinclude` — the pattern production firmware uses today.
+
+Why it is deferred rather than fixed: restoring the attribute is a
+user-visible breaking change. GCC forbids asm *operands* inside a naked
+function, so the structured `inputs:` / `outputs:` bindings would have to be
+rewritten, not merely given an explicit `ret`. Tracked in `docs/limitations.md`.
 
 ---
 
@@ -2432,7 +2821,29 @@ u32 main() {
 }
 // sensor_close(dev) fires via defer
 // sensor_read(dev) after close = COMPILE ERROR (use after free)
+// sensor_close(dev) as well as the defer = COMPILE ERROR (double free)
 ```
+
+**How `sensor_close` is recognised as a free.** ZER does not need an annotation:
+a **bodyless** function whose first parameter is a pointer (or `*opaque`) is
+treated as a destructor when it returns `void`, or when it returns a value and
+its NAME follows a destructor convention (`free`, `close`, `destroy`, `release`,
+`delete`, `dispose`, `drop`, `cleanup`, `deinit`, `fini`, `shutdown`, `term`).
+A ZER **wrapper** around one works too — the cross-function summary carries
+"frees param N" outward:
+
+```zer
+void my_close(*Dev d) { dev_close(d); }
+...
+defer my_close(dev);        // recognised, same as the direct extern
+```
+
+Both spellings are recognised at the **deferred** site as well as the direct one.
+Until BUG-812 (2026-08-21) they were not, and `defer sensor_close(dev);` was
+rejected as a leak — which pushed people onto the *less* safe form, since without
+the `defer` every early return leaks. Pinned by
+`tests/zer/cinterop_defer_close_ok.zer`, which links against a real C helper and
+asserts opens and closes stay balanced.
 
 **Concurrency safety** — wrap shared data in `shared struct`:
 ```zer
@@ -2794,10 +3205,27 @@ rather than undefined. A position known at compile time to be out of range is a
 compile error instead.
 
 ### NOT in ZER
-- `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
-- `,` — Comma operator
-- `goto` — Use structured control flow
+- `++  --` — use `+= 1`, `-= 1`
+- `cond ? a : b` — no ternary conditional. Use `if`/`else`, or `orelse` when the
+  question is "is this optional set?"
+- `,` — no comma operator
+- `p + n` on a pointer — no pointer arithmetic. Use `p[n]` to index, `[*]T` for a
+  bounds-checked collection, or `@ptrtoint` + arithmetic + `@inttoptr` for MMIO
+  (which the `mmio` range declarations then validate).
+- `sizeof x` on a value — `@size(T)` takes a TYPE.
+- no preprocessor: `#define` → `comptime` functions, `#ifdef` → `comptime if`,
+  header files → `import`.
+
+**Two things that ARE in ZER** and are commonly assumed not to be, because
+earlier versions of this document said so:
+
+- **`(T)expr` C-style casts are supported** — see "(Type)expr — C-Style Cast".
+  `@truncate` / `@saturate` / `@bitcast` / `@pun` remain for the cases a plain
+  cast deliberately refuses (explicit clamping, bit reinterpretation, type
+  punning between unrelated pointers).
+- **`goto` and labels are supported**, forward and backward — see "goto +
+  labels". They are safe here because auto-zeroing and `defer` neutralise the
+  traditional hazards. They are banned inside `defer` and `@critical` bodies.
 
 ---
 
@@ -2849,7 +3277,32 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 4096                # error if a frame or an entry-point call chain exceeds N bytes
+zerc source.zer --track-cptrs                     # force the *opaque runtime tracking on when emitting C (--lib)
+zerc source.zer --emit-ir                         # print the IR and exit (debugging)
+zerc source.zer --trace                           # print the compilation flow to stderr (debugging)
+zerc source.zer --trace-calls                     # full call-graph trace (zerc-trace build only)
 ```
+
+**`--track-cptrs`** is on automatically for `--run` and for a normal executable
+build, including with `--release`. It only needs to be passed explicitly when you
+are emitting a C library with `--lib` and still want the `_zer_opaque` wrapper,
+the `_zer_check_alive` header check and the `--wrap=malloc` interception
+compiled in.
+
+**`--release` is currently accepted and does nothing**, and says so:
+
+```
+warning: --release currently has no effect (accepted for forward compatibility)
+```
+
+There is no debug/release split today — the generated C is the same either way,
+`zerc` always invokes GCC at `-O2 -fwrapv`, and the safety checks that cost
+anything at runtime (bounds guards, division guards, handle generation checks)
+are **not** debug scaffolding and are never stripped. That is the point of the
+language; a `--release` that removed them would be an escape hatch by another
+name. The flag is kept so build scripts that pass it keep working, and it warns
+so nobody assumes it did something.
 
 ### Pipeline
 

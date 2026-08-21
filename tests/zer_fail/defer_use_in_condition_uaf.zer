@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-809: ir_defer_scan_uses only looked at EXPRESSION STATEMENTS inside a
+// defer body, so a handle read from a CONDITION (or a var-decl initialiser, or
+// a return expression) was invisible. The deferred `pool.get(h)` runs after
+// `pool.free(h)` and dereferences a freed slot — the same defect the plain
+// statement form `defer { sink = pool.get(h).id; }` was already rejected for.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+u32 sink = 0;
+u32 main() {
+    Handle(Task) h = pool.alloc() orelse return;
+    defer { if (pool.get(h).id > 0) { sink = 1; } }
+    pool.free(h);
+    return 0;
+}

@@ -1,0 +1,11 @@
+// expect-error: use after free
+// BUG-809 sibling: a var-decl INITIALISER inside a defer body.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+u32 sink = 0;
+u32 main() {
+    Handle(Task) h = pool.alloc() orelse return;
+    defer { u32 v = pool.get(h).id; sink = v; }
+    pool.free(h);
+    return 0;
+}

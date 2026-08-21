@@ -1,0 +1,13 @@
+// expect-error: cannot spawn inside @critical block
+// BUG-803 sibling: NODE_SLICE was a no-op leaf in the effect summary, so a
+// slice BOUND could hide a spawn from the @critical ban.
+void worker() { }
+u32 starter() { spawn worker(); return 1; }
+u8[8] buf;
+void f() {
+    @critical {
+        [*]u8 s = buf[starter()..4];
+        s = s;
+    }
+}
+u32 main() { f(); return 0; }

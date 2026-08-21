@@ -1,0 +1,14 @@
+// expect-error: double free: deferred free of
+// The other half of BUG-812. Once a deferred extern destructor is recognised as
+// a free, `dev_close(dev); defer dev_close(dev);` is a genuine double free —
+// the deferred one fires at scope exit on an already-closed handle. Before
+// BUG-812 the deferred call was not a free at all, so nothing was reported.
+*opaque dev_open();
+void dev_close(*opaque d);
+
+u32 main() {
+    *opaque dev = dev_open();
+    defer dev_close(dev);
+    dev_close(dev);
+    return 0;
+}

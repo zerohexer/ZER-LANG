@@ -1,0 +1,87 @@
+// Positive companion to BUG-802..806. Every one of those fixes made a safety
+// walker descend a child it previously ignored; each descent is a place an
+// over-broad fix would start rejecting legal code. This file pins the legal
+// shape at each newly-reached position, so a future tightening that goes too
+// far fails here instead of in a user's project.
+//
+// Compile + run + exit 0.
+
+struct Sensor { u32 id; }
+Sensor g_sensor;
+
+shared struct G { u32 count; }
+G g;
+
+threadlocal u32 tl_scratch = 0;
+u32 g_atomic_cell = 0;
+
+?u32 maybe_none() { return null; }
+u32 plain_helper() { return 5; }
+
+// --- BUG-806: provenance is now checked in conditions. A CORRECT cast must
+//     still pass, in every one of the newly-reached positions.
+u32 process(*opaque ctx) {
+    *Sensor s = @ptrcast(*Sensor, ctx);
+    return s.id;
+}
+
+u32 provenance_ok() {
+    u32 hits = 0;
+    if (process(@ptrcast(*opaque, &g_sensor)) == 0) { hits += 1; }
+    while (process(@ptrcast(*opaque, &g_sensor)) > 0) { break; }
+    switch (process(@ptrcast(*opaque, &g_sensor))) { default => { hits += 1; } }
+    return hits;
+}
+
+// --- BUG-803: the effect summary now walks orelse fallbacks, struct-init
+//     fields and slice bounds. An EFFECT-FREE call in any of them stays legal
+//     inside @critical.
+struct P { u32 a; }
+u8[8] buf;
+
+u32 critical_ok() {
+    u32 out = 0;
+    @critical {
+        u32 v = maybe_none() orelse plain_helper();
+        P p = { .a = plain_helper() };
+        [*]u8 s = buf[plain_helper()..6];
+        out = v + p.a + (u32)s.len;
+    }
+    return out;
+}
+
+// --- BUG-804: @critical / @once / nested-spawn args are now visible to the
+//     data-race scan. A spawn target may still use them over threadlocal and
+//     atomic state, which is exactly what they are for.
+void worker() {
+    @critical {
+        tl_scratch += 1;
+    }
+    @once {
+        @atomic_store(&g_atomic_cell, 1);
+    }
+}
+
+// --- BUG-802: a callee-position shared read is fine when it is the ONLY
+//     shared struct in the statement.
+u32 shared_callee_ok() {
+    return g.count;
+}
+
+// --- BUG-805: a yield in an orelse fallback is legal; only a SHARED access in
+//     the same statement is not.
+async void suspender() {
+    u32 x = maybe_none() orelse { yield; return; };
+    x = x;
+}
+
+u32 main() {
+    u32 a = provenance_ok();
+    u32 b = critical_ok();
+    spawn worker();
+    u32 c = shared_callee_ok();
+    if (a > 100) { return 1; }
+    if (b == 0) { return 2; }
+    if (c > 100) { return 3; }
+    return 0;
+}

@@ -1,0 +1,43 @@
+// BUG-812: `defer dev_close(dev);` — the C-interop idiom docs/reference.md
+// teaches under "Safe C Library Interop" — was REJECTED as a leak. The DIRECT
+// call `dev_close(dev);` was recognised as a free; the deferred one was not,
+// because the defer scanner had its own narrower answer to "does this call free
+// its argument?" (builtin `.free()` / `.free_ptr()` / bare `free()` only).
+//
+// The over-rejection pushed users off the SAFER form: without the defer, every
+// early return leaks. The reference's own example did not compile.
+//
+// Two forms, both rejected pre-fix, both reaching different predicates:
+//   - a bodyless extern destructor  -> ir_is_extern_free_call
+//   - a ZER wrapper around it       -> the cross-function FuncSummary
+//
+// Runs for real against the C helper and checks open/close stay balanced, so a
+// future change that "accepts" the program by dropping the deferred call
+// entirely would fail here rather than pass quietly.
+cinclude "cinterop_defer_close_test.h";
+struct Dev { u32 v; }
+*Dev dev_open();
+void dev_close(*Dev d);
+u32 dev_read(*Dev d);
+u32 dev_balanced();
+
+void my_close(*Dev p) { dev_close(p); }
+
+u32 extern_destructor_form() {
+    *Dev dev = dev_open();
+    defer dev_close(dev);
+    return dev_read(dev);
+}
+
+u32 wrapper_form() {
+    *Dev dev = dev_open();
+    defer my_close(dev);
+    return dev_read(dev);
+}
+
+u32 main() {
+    if (extern_destructor_form() != 7) { return 1; }
+    if (wrapper_form() != 7) { return 2; }
+    if (dev_balanced() != 1) { return 3; }   // every open was closed
+    return 0;
+}

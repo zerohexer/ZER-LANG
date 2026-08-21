@@ -223,6 +223,34 @@ Tests: `tests/zer_fail/packed_field_addr_call_arg.zer` and
 over-rejection boundary — passing the packed field BY VALUE, and taking the
 address of a NON-packed field as an argument, must both keep working.
 
+### The scoped-borrow relaxation: the grid, not the relaxation
+`docs/limitations.md` carries an OPEN over-rejection — a `ThreadHandle` join on
+EVERY arm of a branch is rejected, and the entry says the fix "should follow the
+documented accept-unsafe discipline: build the exhaustive branch x join-position
+grid FIRST, verify it fires against the pre-fix build, then relax."
+
+Measured the over-rejection (it still reproduces) and then built the grid rather
+than the relaxation. Doing the relaxation unattended would compress a process
+this file wrote down precisely because compressing it ships a data race; the grid
+is pure gain, cannot break anything, and makes the relaxation cheap and checkable
+for whoever does it next.
+
+`tests/test_conc_matrix.c` gains a SCOPED-BORROW grid: 11 cells over join
+POSITION with **three** verdicts instead of two — `BV_ACCEPT` (idioms that must
+compile), `BV_REJECT` (genuine races), and `BV_OVERREJ` (safe either way,
+reported and never failed — the cells the relaxation is allowed to flip). The
+`BV_REJECT` rows were chosen to be the PRECONDITIONS an "all arms joined"
+relaxation must discharge: a missing else, a non-joining default, a join nested
+deeper, a `goto` over the join, a re-spawn after joining.
+
+Each `BV_REJECT` cell also asserts WHICH rule rejected it — and that second
+oracle immediately paid for itself: `goto skips the join` is rejected by the LEAK
+rule, not the borrow rule, because on the goto path the handle is never joined at
+all. Sound, but it means that cell does not exercise the goto precondition today.
+It is labelled MASKED in the grid and in the ledger rather than counted as
+coverage. Verified the WRONG-RULE oracle fires by pointing the cell at the borrow
+message and watching it go red. conc-matrix 84 -> 93 cells.
+
 ### What the gate caught about ITSELF
 The first version of `descends()` was a plain substring test and reported OK after I
 deleted a known-good `call.callee` descent — because the arm still MENTIONED the

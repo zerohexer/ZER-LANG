@@ -1199,6 +1199,32 @@ over-rejection is safe to live with meanwhile.
 **Tripwire.** `tests/zer/scoped_borrow_branch_shapes.zer` pins the four shapes
 that must keep compiling, so the guard cannot broaden unnoticed.
 
+**THE GRID IS NOW BUILT (2026-08-21) — start there.** The pre-work this entry
+asks for exists: the SCOPED-BORROW grid in `tests/test_conc_matrix.c`, 11 cells
+over join POSITION, with three verdicts rather than two:
+
+| verdict | cells | meaning |
+|---|---|---|
+| `BV_ACCEPT` | straight join, join after branch, spawn+join in a loop, spawn+join in the same arm | idioms that must keep compiling |
+| `BV_OVERREJ` | **join on BOTH arms**, **join on every switch arm** | safe EITHER way — reported, never failed. Exactly the cells the relaxation is allowed to flip |
+| `BV_REJECT` | join on ONE arm, switch with a non-joining default, join nested deeper, goto skips the join, re-spawn after join | a genuine race. If a relaxation flips one of these it has shipped a data race |
+
+The `BV_REJECT` rows were chosen to be the PRECONDITIONS an "all arms joined"
+relaxation has to discharge — the Level-B lesson that a relaxation is only as
+good as the conditions it checks. Each `BV_REJECT` cell also asserts WHICH rule
+rejected it, so a masking rejection cannot pass as coverage.
+
+**One cell is honestly labelled MASKED**: `goto skips the join` is rejected by
+the LEAK rule ("ThreadHandle not joined before function exit"), because on the
+goto path the handle is never joined at all. The masking is sound — the race
+cannot ship — but that cell does not currently exercise the goto precondition.
+Whoever implements the relaxation must re-probe that shape with the leak removed.
+
+So the remaining work is: extend the release condition to "every arm of this
+branch joins this handle at the arm's top level, the branch has an else/default,
+no `goto` or label appears in an arm, and no arm re-spawns after joining", run
+the grid, and confirm only the two `BV_OVERREJ` cells changed.
+
 ---
 
 ## OPEN — findings carried forward from the 2026-07-21→31 branch wave (documented, NOT fixed on any branch)

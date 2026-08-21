@@ -3270,7 +3270,7 @@ earlier versions of this document said so:
 | Use-after-free | Handle generation counter + zercheck compile-time analysis |
 | Null dereference | `*T` non-null by type. `?*T` forces unwrap. |
 | Double free | zercheck: compile error |
-| Memory leak | zercheck: compile warning (alloc without free) |
+| Memory leak | zercheck: compile **error** (alloc without free). It was a warning until the 2026-04-06 alloc-id redesign removed the false positives that made an error unusable; the table said "warning" for a long time after that and was wrong. |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must use @truncate or @saturate explicitly |
@@ -3285,7 +3285,22 @@ earlier versions of this document said so:
 | Dangling @ptrtoint | `return @ptrtoint(&local)` → compile error (direct + indirect via struct fields) |
 | Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
 | Division by zero (call) | `x / func()` where func() return range unknown → compile error |
-| Wrong pointer cast | Provenance tracking through *opaque round-trips |
+| Wrong pointer cast | Provenance tracking through *opaque round-trips, checked at every call site — including calls in conditions, loop headers, switch subjects and nested expressions |
+| Misaligned packed access | The ADDRESS of a packed field is refused at every sink that would use it: `@atomic_*`, deref, and a call argument. Read the field directly, or copy it to an aligned local. See "packed struct" |
+| Deadlock | A single statement touching two shared structs is a compile error — including through a callee, and through a callee's callee |
+| Non-atomic read-modify-write | `g += 1` and its written-out spellings (`g = g + 1`, `g = @truncate(u32,g) + 1`, through a pointer, through a helper) on a shared/volatile global are rejected from both a spawned thread and an ISR |
+| Lock held across a suspend | Touching a shared struct in a statement that can `yield`/`await` — on any path, including an `orelse` fallback — is a compile error |
+| Effect in a forbidden context | `spawn` in `@critical`, heap `alloc` in an interrupt, `yield` in a `defer` — detected transitively, and through `orelse` fallbacks, designated initialisers and slice bounds |
+
+**Two guarantees this table does NOT make**, stated so nothing here is read as
+more than it is:
+
+- **`naked` functions.** The attribute is accepted but not emitted, so GCC adds a
+  prologue and epilogue. Every `naked` declaration warns. See "naked functions".
+- **`cinclude`d C.** Bugs inside a C library are outside the boundary — the same
+  line Rust draws at `unsafe extern`. ZER tracks the pointer's LIFECYCLE across
+  the boundary (`*opaque`, alloc/free, deferred destructors); it does not verify
+  what the C code does with it.
 
 ---
 

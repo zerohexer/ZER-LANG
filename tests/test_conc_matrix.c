@@ -618,6 +618,173 @@ static void gen_isr_reach(IsrReach r, char *out, size_t n) {
         extra, body);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * SCOPED-BORROW grid — join POSITION x whether the borrow may be released.
+ *
+ * `ThreadHandle th = spawn worker(&work);` BORROWS `work` until `th.join()`.
+ * The 2026-08-03 cross-block fix releases the borrow only when the join is no
+ * deeper in runtime-conditional nesting than the spawn, because a join inside a
+ * branch runs on SOME paths only:
+ *
+ *     ThreadHandle th = spawn worker(&work);
+ *     if (c) { th.join(); }
+ *     work.x = 2;                  // path where c is false: RACE
+ *
+ * That guard is what makes the rule sound, and its documented price is that a
+ * join on EVERY arm is over-rejected (docs/limitations.md, "scoped-borrow: a
+ * join on EVERY branch arm is over-rejected").
+ *
+ * THIS GRID IS THE PRE-WORK FOR THAT RELAXATION, built before it rather than
+ * after, per the accept-unsafe discipline in CLAUDE.md ("build the exhaustive
+ * grid FIRST, verify it fires against the pre-fix build, then relax").
+ *
+ * Three verdicts, not two:
+ *   BV_REJECT   a genuine race — MUST be rejected. If a future relaxation flips
+ *               one of these, it has shipped a data race.
+ *   BV_ACCEPT   an idiom that must keep compiling.
+ *   BV_OVERREJ  currently rejected, and SAFE either way. These are exactly the
+ *               cells the relaxation is allowed to flip. They are reported, not
+ *               failed, so the grid stays green across the change — and the
+ *               BV_REJECT rows are what tells you whether the flip was sound.
+ *
+ * The BV_REJECT rows are chosen to cover the PRECONDITIONS an "all arms joined"
+ * relaxation has to discharge, because a relaxation is only as good as the
+ * conditions it checks (the Level-B lesson: the hole is the variable the model
+ * left out):
+ *   - a missing else arm            (BJ_THEN_ONLY)
+ *   - a switch with no default      (BJ_SWITCH_NO_DEFAULT)
+ *   - a join nested DEEPER than the arm   (BJ_NESTED_DEEPER)
+ *   - a `goto` that skips the join  (BJ_GOTO_SKIP)
+ *   - a RE-spawn after the join     (BJ_RESPAWN_AFTER)
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    BJ_STRAIGHT, BJ_HOISTED, BJ_LOOP_BODY, BJ_SAME_BRANCH,
+    BJ_BOTH_ARMS, BJ_EVERY_SWITCH_ARM,
+    BJ_THEN_ONLY, BJ_SWITCH_NO_DEFAULT, BJ_NESTED_DEEPER,
+    BJ_GOTO_SKIP, BJ_RESPAWN_AFTER,
+    BJ_COUNT
+} BJoin;
+
+typedef enum { BV_ACCEPT, BV_REJECT, BV_OVERREJ } BVerdict;
+
+static const char *bj_name(BJoin j) {
+    switch (j) {
+    case BJ_STRAIGHT:          return "straight join";
+    case BJ_HOISTED:           return "join after branch";
+    case BJ_LOOP_BODY:         return "spawn+join in loop";
+    case BJ_SAME_BRANCH:       return "spawn+join same arm";
+    case BJ_BOTH_ARMS:         return "join on BOTH arms";
+    case BJ_EVERY_SWITCH_ARM:  return "join on every sw arm";
+    case BJ_THEN_ONLY:         return "join on ONE arm";
+    case BJ_SWITCH_NO_DEFAULT: return "switch, no default";
+    case BJ_NESTED_DEEPER:     return "join nested deeper";
+    case BJ_GOTO_SKIP:         return "goto skips the join";
+    case BJ_RESPAWN_AFTER:     return "re-spawn after join";
+    case BJ_COUNT: break;
+    }
+    return "?";
+}
+
+static BVerdict bj_verdict(BJoin j) {
+    switch (j) {
+    case BJ_STRAIGHT: case BJ_HOISTED:
+    case BJ_LOOP_BODY: case BJ_SAME_BRANCH:
+        return BV_ACCEPT;
+    /* safe in reality, rejected today — the relaxation's target set */
+    case BJ_BOTH_ARMS: case BJ_EVERY_SWITCH_ARM:
+        return BV_OVERREJ;
+    /* every one of these has a path that reaches the use WITHOUT having joined */
+    case BJ_THEN_ONLY: case BJ_SWITCH_NO_DEFAULT: case BJ_NESTED_DEEPER:
+    case BJ_GOTO_SKIP: case BJ_RESPAWN_AFTER:
+        return BV_REJECT;
+    case BJ_COUNT: break;
+    }
+    return BV_REJECT;
+}
+
+/* The substring the rejection MUST contain. A grid whose only oracle is
+ * "exit != 0" passes for whichever rule fires first, and this project has been
+ * bitten by exactly that here before (a conditionally-joined ThreadHandle
+ * tripping the LEAK check instead of the borrow check).
+ *
+ * BJ_GOTO_SKIP is MASKED and is labelled so rather than pretended otherwise: on
+ * the goto path `t` is never joined at all, so the LEAK rule rejects the program
+ * first and the borrow rule never gets to speak. The masking is itself sound —
+ * the race cannot ship — but this cell does NOT currently exercise the goto
+ * precondition. Whoever implements the all-arms relaxation must re-probe this
+ * shape with the leak removed, because "a goto can jump over the join" is one of
+ * the conditions that relaxation has to discharge. */
+static const char *bj_expect(BJoin j) {
+    switch (j) {
+    case BJ_GOTO_SKIP:         return "not joined";   /* MASKED — see above */
+    case BJ_THEN_ONLY: case BJ_SWITCH_NO_DEFAULT:
+    case BJ_NESTED_DEEPER: case BJ_RESPAWN_AFTER:
+        return "borrowed by a scoped spawn";
+    case BJ_STRAIGHT: case BJ_HOISTED: case BJ_LOOP_BODY:
+    case BJ_SAME_BRANCH: case BJ_BOTH_ARMS: case BJ_EVERY_SWITCH_ARM:
+        return NULL;   /* positives / safe-either-way — nothing to match */
+    case BJ_COUNT: break;
+    }
+    return NULL;
+}
+
+/* Every cell: spawn borrowing &work, place the join per the axis, then READ
+ * work after. The read is what the borrow rule guards. */
+static void gen_borrow(BJoin j, char *out, size_t n) {
+    const char *body = "";
+    switch (j) {
+    case BJ_STRAIGHT:
+        body = "  ThreadHandle t = spawn worker(&w);\n  t.join();\n"; break;
+    case BJ_HOISTED:
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  if (f == 3) { f = 1; }\n  t.join();\n"; break;
+    case BJ_LOOP_BODY:
+        body = "  for (u32 i = 0; i < 2; i += 1) {\n"
+               "    ThreadHandle t = spawn worker(&w);\n    t.join();\n  }\n"; break;
+    case BJ_SAME_BRANCH:
+        body = "  if (f == 3) {\n"
+               "    ThreadHandle t = spawn worker(&w);\n    t.join();\n"
+               "    if (w.x > 99) { return 9; }\n  }\n"; break;
+    case BJ_BOTH_ARMS:
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  if (f == 3) { t.join(); } else { t.join(); }\n"; break;
+    case BJ_EVERY_SWITCH_ARM:
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  switch (f) { 3 => { t.join(); } default => { t.join(); } }\n"; break;
+    case BJ_THEN_ONLY:
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  if (f == 3) { t.join(); }\n"; break;
+    case BJ_SWITCH_NO_DEFAULT:
+        /* an int switch REQUIRES a default, so the missing-arm shape is a
+         * default that does NOT join — same hole, spellable. */
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  switch (f) { 3 => { t.join(); } default => { f = 1; } }\n"; break;
+    case BJ_NESTED_DEEPER:
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  if (f == 3) { if (f > 0) { t.join(); } } else { t.join(); }\n"; break;
+    case BJ_GOTO_SKIP:
+        body = "  ThreadHandle t = spawn worker(&w);\n"
+               "  if (f == 3) { goto done; }\n  t.join();\n  done:\n"; break;
+    case BJ_RESPAWN_AFTER:
+        body = "  ThreadHandle t = spawn worker(&w);\n  t.join();\n"
+               "  ThreadHandle t2 = spawn worker(&w);\n"; break;
+    case BJ_COUNT: break;
+    }
+    /* BJ_RESPAWN_AFTER must still join t2 or the LEAK rule masks the borrow
+     * rule — the classic weak-oracle trap. Join it AFTER the read. */
+    const char *tail = (j == BJ_RESPAWN_AFTER)
+        ? "  u32 v = w.x;\n  t2.join();\n  return v & 0;\n"
+        : "  u32 v = w.x;\n  return v & 0;\n";
+    snprintf(out, n,
+        "struct W { u32 x; }\n"
+        "void worker(*W p) { p.x += 1; }\n"
+        "u32 main() {\n"
+        "  W w; w.x = 0;\n  u32 f = 3;\n"
+        "%s%s"
+        "}\n", body, tail);
+}
+
 int main(void) {
     find_zerc();
     fprintf(stderr, "=== Concurrency (data-race / spawn / deadlock) matrix ===\n");
@@ -689,6 +856,53 @@ int main(void) {
         fprintf(stderr, "  [%-18s][isr] %s\n", isr_name(r), ok ? "ok" : "*** FAIL ***");
         if (!ok) grid_ok = 0;
     }
+
+    /* ---- scoped-borrow grid (join position x release) ---- */
+    fprintf(stderr, "\n  -- scoped-borrow grid (where the join sits vs. where the use sits) --\n");
+    char bbuf[1024];
+    int overrej_known = 0;
+    for (BJoin j = 0; j < BJ_COUNT; j++) {
+        BVerdict v = bj_verdict(j);
+        char nm[160];
+        snprintf(nm, sizeof(nm), "borrow/%s", bj_name(j));
+        gen_borrow(j, bbuf, sizeof(bbuf));
+        if (v == BV_OVERREJ) {
+            /* Reported, never failed: safe in EITHER direction. These are the
+             * cells a future "all arms joined" relaxation is allowed to flip;
+             * the BV_REJECT rows above are what say whether it was sound. */
+            FILE *fp = fopen("/tmp/_zer_co.zer", "w");
+            if (fp) { fputs(bbuf, fp); fclose(fp); }
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd),
+                     "%s /tmp/_zer_co.zer -o /tmp/_zer_co.c 2>/dev/null", zerc_path);
+            int accepted = (system(cmd) == 0);
+            overrej_known++;
+            fprintf(stderr, "  [%-22s][safe-either-way] %s\n", bj_name(j),
+                    accepted ? "ACCEPTED (relaxation landed)"
+                             : "rejected (known over-rejection)");
+            continue;
+        }
+        valid_cells++;
+        int ok = (v == BV_REJECT) ? run_neg(nm, bbuf) : run_pos(nm, bbuf);
+        /* second oracle: the rejection must be the EXPECTED rule, not whichever
+         * one happened to fire first. */
+        if (ok && v == BV_REJECT && bj_expect(j)) {
+            FILE *ef = fopen("/tmp/_zer_co.err", "r");
+            char eb2[4096]; eb2[0] = 0;
+            if (ef) { size_t r2 = fread(eb2, 1, sizeof(eb2) - 1, ef); eb2[r2] = 0; fclose(ef); }
+            if (!strstr(eb2, bj_expect(j))) {
+                ok = 0; failed++; passed--;
+                fprintf(stderr, "  FAIL [WRONG-RULE] %s — rejected, but not by the rule\n"
+                                "       under test. want %s; got: %.120s\n",
+                        nm, bj_expect(j), eb2);
+            }
+        }
+        fprintf(stderr, "  [%-22s][%-3s] %s\n", bj_name(j),
+                v == BV_REJECT ? "neg" : "pos", ok ? "ok" : "*** FAIL ***");
+        if (!ok) grid_ok = 0;
+    }
+    fprintf(stderr, "  (%d cell(s) are safe in either direction — the relaxation target set)\n",
+            overrej_known);
 
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",

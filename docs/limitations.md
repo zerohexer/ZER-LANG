@@ -5,6 +5,201 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — harvest tracker: five `claude/vigilant-tesla-*` branches, verified against main 2026-08-22
+
+**Status: NOT implemented. This is a catalog, not a changelog.** Every row below was
+verified on a clean `make zerc` build of main (`5fef1d06`) by running **the branch's own
+test file**, reading the DIAGNOSTIC rather than the exit code, and routing around maskings.
+Rows that main already closed are listed in the "already on main" table so nobody
+re-implements them.
+
+### Source branches
+
+| Branch | Forked at | Commits | Theme |
+|---|---|---|---|
+| `vigilant-tesla-87xihb` | `47b0413a` (2 behind main) | 8 | bare-metal: volatile, packed, RMW, bounds |
+| `vigilant-tesla-pjtawx` | `47b0413a` (2 behind main) | 14 | broadest: escape, lowering, bare-metal, atomics |
+| `vigilant-tesla-4z36e0` | `5fef1d06` (main) | 13 | builtin init, optionals, comptime, global-init |
+| `vigilant-tesla-pmytnl` | `5fef1d06` (main) | 2 | UB sweep: float casts, enum forging, CLI |
+| `vigilant-tesla-39294y` | `5fef1d06` (main) | 3 | walker FIELD-descent gate + its 11 defects |
+
+**BUG NUMBERS COLLIDE ACROSS BRANCHES — never cite one without its branch.** Four branches
+independently number things BUG-802..814 for *different* bugs. `87xihb` and `pjtawx` forked
+BEFORE main's `e7e51eea`, so they also rediscovered bugs main has since closed.
+
+### Already on main — do NOT re-implement (verified: the branches' own negatives REJECT)
+
+| Class | Branch rows | Main's fix |
+|---|---|---|
+| Deref-identity boundary (4 forms) | 87xihb BUG-796, pjtawx BUG-796 | BUG-798 |
+| Provably-OOB index, array + MMIO sinks | 87xihb BUG-800, pjtawx BUG-799 | BUG-796 (`index_range_verdict`) |
+| `volatile` laundered via `@ptrtoint`->`@inttoptr` | 87xihb BUG-802, pjtawx BUG-800 | BUG-797 (`is_volatile_addr_derived`) |
+| `@inttoptr` bound to non-volatile destination | 87xihb BUG-802, pjtawx BUG-801 | BUG-799 |
+| RMW reaching a global through a helper | 87xihb BUG-806 | BUG-801 (`rmw_param_mask`) |
+| Merge conflict in `compound_field_maybe_freed.zer` | pmytnl BUG-806 | already resolved |
+
+Diagnostic WORDING differs on three of these (`volatile_launder_ptrtoint_*`,
+`packed_field_addr_deref`) — the branches' `expect-error` strings do not match main's
+phrasing. Cosmetic; the rules fire.
+
+### LIVE on main — accept-unsafe (a wrong program is accepted)
+
+| # | Fix | Best version | Evidence on main |
+|---|---|---|---|
+| V1 | `arg_is_local_derived` never called `unwrap_ptr_launder` — a laundered ARGUMENT escapes | **pjtawx** BUG-807 | `g = idfn(&x)` REJECTED; `(*u32)(&x)`, `@ptrcast`, `@pun` all ACCEPTED. The C-style cast is DELETED by the emitter, so emitted C is byte-identical to the rejected form. ASan stack-use-after-return. Argument-side sibling of main's BUG-791 |
+| V2 | ARENA lifetime missing from both frame-bound helpers | **pjtawx** BUG-803 | 4 negatives accepted: launder-then-store, orelse-fallback, struct-literal to global, struct-literal return |
+| V3 | Root-ident walk written 5x as two SEQUENTIAL loops — wrong for any ALTERNATING chain | **pjtawx** BUG-804 (`expr_root_ident` in ast.h) | `@atomic_load(&g_s.arr[0].f)` on a packed nested struct ACCEPTED; `@atomic_load(&g_i.f)` rejected one line away. Misaligned atomic = hard fault on ARM/RISC-V |
+| V4 | `&packed.field` gated at 1 of 5 sinks | **87xihb** BUG-804 (5 sinks + non-sticky) | assign / call-arg / alias sinks ACCEPTED. `39294y` BUG-813 is a 2-sink subset — take 87xihb, keep 39294y's `zer_gaps` file for the 4 sinks BOTH leave open |
+| V5 | Bit-range write `flags[3..0] = 5` is an implicit RMW, missed at BOTH sinks | **87xihb** BUG-803 | ACCEPTED while `flags += 1` is REJECTED — same operation, different spelling. `resolve_write_target_global` does not peel `NODE_SLICE` |
+| V6 | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
+| V7 | `volatile` strip: `type_equals` pointer arm checks `is_const` but NOT `is_volatile` | **87xihb** BUG-801 | struct-init field + funcptr param ACCEPTED. The SLICE arm 3 lines away checks both |
+| V8 | `volatile` strip: 4 of 6 sinks blind to the `?*T` optional axis | **pjtawx** BUG-810 | `?*T` call-arg and `?*T` return ACCEPTED. **Complementary to V7, not a duplicate** — V7 is the type-system root, V8 is the hand-rolled per-sink comparison |
+| V9 | `@atomic_*` in a global initializer emits broken C | **4z36e0** BUG-808 (structural) | Emits literally `uint32_t gres = ;`. pjtawx BUG-806 fixes only the atomics subset; 4z36e0 fixes the CAUSE — a name-check wrongly nested inside an `arg_count >= 1` precondition belonging to a different rule |
+| V10 | Zero-arg intrinsic skips the global-init guard entirely | **4z36e0** BUG-808 | `const u32 G = @cpu_model_id();` checker-accepted, only GCC rejects |
+| V11 | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Emitter answers a literal `0`; `a != b` is also false, which is the tell |
+| V12 | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | `switch(1) { default => r=9; 1 => r=1; }` returns **9**. Every arm after `default` becomes dead C |
+| V13 | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
+| V14 | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
+| V15 | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
+| V16 | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
+| V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted. **CAVEAT: the -O0/-O2 divergence pmytnl reports did NOT reproduce on this host's GCC** (consistent 4294967295 / -2147483648). The UB is real per C11 6.3.1.4p1 and ARM saturates differently; the divergence claim is host-specific — do not quote it |
+| V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
+| V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
+| V20 | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | `.over` is a constructor returning BY VALUE; as a statement it builds into a discarded temp |
+| V21 | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | `rb.push_checked(a);` — the one method whose entire purpose is reporting overflow, silently not reporting it. Subsumes the ghost-handle check. Corpus cost measured at ZERO (all 6 hits are ghost-handle negatives) |
+| V22 | `--stack-limit` never sums main + ISRs, which share one stack | **pjtawx** BUG-811 | Two 200-byte chains pass `--stack-limit 256`. The tool AFFIRMS a budget the target cannot honour |
+| V23 | Auto-guard's `return` leaks a held lock and the interrupt-disable | **87xihb** BUG-805 | **The lock form HANGS (deadlock, verified exit 124); the `@critical` form exits 0 silently.** The compiler emits the exact construct it hard-errors users for writing. Main has `guard_traps` for defer bodies only — needs `noreturn_scope_depth` counted inside `emit_shared_lock_mode`/`emit_shared_unlock` and both `IR_CRITICAL` handlers |
+| V24 | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | `--totally-bogus-flag`, `--target-arch=nonsense`, `--stack-limit=abc` all exit 0 with no diagnostic. `--target-arch=arm64` (valid spelling is `aarch64`) silently builds x86 |
+| V25 | `break`/`continue` in a for-INITIALISER binds to the ENCLOSING loop | **pjtawx** BUG-813 | Accepted. Branch REJECTS rather than rebinds — the semantics is genuinely ambiguous (`continue` would jump to the step of a loop whose induction variable was never initialised). Corpus cost zero |
+| V26 | No way to declare a bare-metal target; `@critical` degrades to a fence | **pjtawx** BUG-812 | `_ZER_HOSTED`/`ZER_FREESTANDING` absent. Scope is narrower than the branch first claimed: ARM/RISC-V/AVR key on the ARCH macro and were always correct — real exposure is **bare-metal x86** (kernel, bootloader, EFI) |
+| V27 | MMIO boot validator can never fire, and trying costs a boot hang | **pjtawx** BUG-814 | Gated to exactly the targets where `_zer_probe` hardcodes success. The read still happens from a constructor — before any RCC clock-enable, i.e. a BusFault on a clock-gated peripheral |
+
+### LIVE on main — the walker FIELD-descent family (all `39294y`, one gate found all of them)
+
+`-Werror=switch` + `walker_default_audit.sh` guarantee every safety walker NAMES every
+NodeKind. **Nothing checked whether an arm that names a kind actually DESCENDS its
+children.** `tools/audit_walker_fields.sh` (+ a 930-line baseline) is the missing gate;
+these 11 are its output, each verified live.
+
+| # | Defect | Evidence on main |
+|---|---|---|
+| W1 | `scan_body_shared_types` / `cond_pred_foreign_shared` miss `call.callee` | `cond_wait_foreign_shared_callee`, `shared_callee_transitive_deadlock` ACCEPTED. **Main's BUG-795 fixed this at the ir_lower + checker sites only — these two are still open** |
+| W2 | `scan_func_props` misses `orelse.fallback` / `struct_init` / `slice` / `await.cond` | 3 negatives accepted. `@critical { u32 v = maybe() orelse starter(); }` emits `pthread_create` between `cpsid i` and `msr primask`. Verified: direct form REJECTED, orelse form ACCEPTED |
+| W3 | spawn race scan treats `@critical` as a LEAF | `spawn_race_via_critical` accepted. `@critical` disables interrupts on one core and gives NO cross-thread exclusion — it reads as synchronisation and is not. (Branch notes `@once` was in v1 of this fix and was WRONG — it publishes with ACQ_REL; reverted) |
+| W4 | `expr_contains_yield` misses `orelse.fallback` | Shared mutex held ACROSS a coroutine suspend, verified in emitted C |
+| W5 | `check_call_provenance` reaches a call only as a whole statement / var-decl init / return | 3 negatives accepted. `if (process(@ptrcast(*opaque,&g_motor)) > 0)` compiles; identical call as a var-decl init is rejected |
+| W6 | `emitter.c` holds TWO more drifted copies of the shared-root walker | `defer { sink(g.cb()); }` emits with NO mutex. Fix unifies to one `ir_find_shared_root_expr`, deletes ~170 lines + 6 dead walkers. **Complements V3** (pjtawx does ast.h/checker/zercheck_ir; this does emitter.c) |
+| W7 | `ir_defer_scan_uses` looks at expression statements only | `defer_use_in_condition_uaf`, `defer_use_in_vardecl_uaf` accepted — unreported UAF |
+| W8 | `scan_frame` skips loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
+| W9 | `expr_mentions_global` misses intrinsic/call/orelse | = V6 above |
+| W10 | `ir_defer_free_arg` knows only 3 builtin free spellings | OVER-REJECTION, see O1 |
+| W11 | `naked` silently dropped since the IR migration | see Q1 |
+
+**Latent, documented, not fixable yet:** no walker descends `asm` operand expressions.
+Unreachable only because `asm` is naked-only; opens seven holes at once the day S1 relaxes.
+
+### LIVE on main — over-rejections (valid code refused)
+
+| # | Fix | Best version | Evidence |
+|---|---|---|---|
+| O1 | `defer sensor_close(dev)` reported as a leak; the DIRECT call is recognised | **39294y** BUG-812 (`ir_defer_free_arg`) | `cinterop_defer_close_ok` and `defer_extern_destructor_no_false_leak` both hard-error. This is the flagship "Safe C Library Interop" example in `reference.md` — the docs assert it compiles and it does not. pjtawx BUG-805 is the same fix; take either, keep both tests |
+| O2 | Sticky packed-derived flag refuses a re-cleared pointer | **87xihb** BUG-804 (boundary positive) | `packed_aligned_forms_ok` hard-errors on main. The fix SETS on a packed-derived RHS and CLEARS otherwise |
+| O3 | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
+
+### Quality / no-longer-silent (not soundness)
+
+| # | Item | Best version |
+|---|---|---|
+| Q1 | `naked` silently dropped -> warn at the declaration | **4z36e0**. Deeper measurement than 39294y's identical fix: GCC 13 x86-64 DOES support the attribute (emits `endbr64; body; ud2`, no `ret`), 16 of 18 `asm_*.zer` positives CALL their naked function so flipping it on SIGILLs all 16, and `naked` is OVERLOADED (it is the only way to get asm permission). 43 corpus files emit the warning — that number IS the finding |
+| Q2 | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
+| Q3 | Emitter's five give-up paths are silent miscompiles | **4z36e0**. `/* complex callee */(a, b)` is a valid C COMMA EXPRESSION — compiles, runs, CALLS NOTHING. Measured 0/1170 corpus programs reach them, so `emit_unreachable()` aborts nothing reachable |
+| Q4 | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |
+
+### Tooling and gates (pure gain — no behaviour change)
+
+| Tool | Branch | Why |
+|---|---|---|
+| `tools/audit_walker_fields.sh` + 930-line baseline | 39294y | **Highest value here.** The FIELD half of the walker discipline; found all 11 W-rows. Self-checked against `ast.h`. Its own blind spots (if/else chains, children handled before the switch) are stated in the script |
+| `tests/test_vrp_join_matrix.c` (32 cells) | 4z36e0 | Closes CLAUDE.md's "VRP range JOIN — NO auto-gate, checklist every control-flow kind" row. Verified to FIRE by reproducing BH-18 #2 behind an env flag. Its first draft was VACUOUS (open-ended pass rule swallowed exit 134 and 127) — now a CLOSED safe-set |
+| `tests/test_global_init_matrix.c` (54 cells) | 4z36e0 | DERIVES the intrinsic set from the compiler at run time, so a new intrinsic is covered the day it lands. Both prior hand-maintained lists lacked exactly that |
+| Trap-harness: `timeout` + `// expect-trap` | 87xihb | Main HAS `ZER_RUN_TIMEOUT`; it LACKS `expect-trap`. "Any non-zero exit" cannot distinguish a hang, a SIGSEGV, a wrong answer and a genuine trap |
+| `tools/audit_reference_examples.sh` | pjtawx (preferred) / 87xihb | Two implementations. pjtawx's checks BOTH directions and prints its skipped-fragment count; 87xihb's is opt-in-marked and asserts the REASON. Both were verified to fire by injection |
+| `tools/audit_freestanding.sh` | pjtawx | Needs no cross-toolchain. Must test `-DZER_FREESTANDING` ALONE — under `-ffreestanding` old and new predicates agree, so that combination scores a broken compiler as PASSING |
+| `tools/ub_sweep.sh`, `tools/negative_reason_audit.sh` | pmytnl | Differential UB detector (-O0/-O2, +/- `-fno-strict-aliasing`). The reason-audit reports the standing exposure: **125 of 575 negatives assert a reason, 450 do not** |
+| `tools/audit_doc_examples.sh` | 39294y | Overlaps the two above; take one |
+| SCOPED-BORROW grid (11 cells, conc-matrix 84 -> 93) | 39294y | Pre-work for the all-arms-join relaxation, with three verdicts (ACCEPT / OVERREJ / REJECT) so the grid stays green ACROSS the relaxation. The BV_REJECT rows are the preconditions the relaxation must discharge |
+
+### Repo hygiene (owner call)
+
+- **~558 compiled test binaries are TRACKED** (~9.1 MB). Every `make check` dirties them, so
+  `git status` is useless for review. Best version: **pmytnl** (`.gitignore` by shape +
+  the measurement). pjtawx removes 560; 4z36e0 covers 23. Untracking the existing set is a
+  `git rm --cached` sweep — an owner decision, not a fix.
+- **Build warnings 27 -> 0** (pmytnl): a `size_t`-into-`%.*s` varargs mismatch, a missing
+  return in `lower_expr`, a sign-compare, two `calloc(int,...)` clamps, six self-closing
+  comments, ~350 lines of provably-dead code.
+- **`reference.md` intrinsic coverage**: four branches did this independently
+  (4z36e0: 96, pjtawx: 98, pmytnl: 98, 39294y: 80). Best: **4z36e0** — signatures MEASURED
+  by probing the compiler, return types disambiguated by narrow assignments (u32 widens to
+  u64 and would otherwise read as u64), and it caught one of its own wrong claims by
+  RUNNING the examples. Note `@cpu_rdrand`/`@cpu_rdseed` return `?u64`, not `u64`.
+
+### Reported but NOT fixed on any branch — carry as OPEN, do not "harvest"
+
+- **extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id`** (4z36e0,
+  HIGH). ZER emits `_zer_opaque zzz_ptr(void);` where the real C function is
+  `void *zzz_ptr(void);`. `.ptr` arrives correctly by ABI luck; `.type_id` is register
+  residue. `@ptrcast`'s `!= 0` escape then either FALSE-TRAPS on correct code (measured,
+  exit 133) or — when residue equals a live type id, and they are small consecutive
+  integers — passes a WRONG cast silently. 32 declarations in-tree, including
+  `lib/io.zer`, `lib/compat.zer`, `lib/fmt.zer`. Deliberately not fixed: both candidate
+  fixes are risky (one lands in the IR/AST dual-dispatch hazard; the other's failure mode
+  is an UNDER-rejection). Exhibiting it needs linking a separate C TU, which no harness does.
+- **`vrp_ir.c` is ORPHANED** — no caller, absent from both Makefile source lists,
+  `strings zerc | grep -c vrp_ir` is 0. Re-measured on 4z36e0: Phase 0's headline
+  justification ("retires a CRITICAL live under-rejection") is STALE — that was BH-18 #2,
+  fixed 2026-06-26; 13 probes show every post-join index auto-guarded. The architectural
+  reason to wire it survives; the urgency does not.
+- **`f64` -> `f32` narrowing overflow is C UB** (pmytnl, LOW latent).
+- **Two DISTINCT `@once` blocks touching the same global are not mutually exclusive**
+  (39294y, LOW).
+- **Two arena allocations cannot be LINKED** (4z36e0, over-rejection). Both share the
+  arena's lifetime. Found because the doc's Arena example showed exactly that line and had
+  never been compiled.
+- **A bodyless declaration reusing a libc NAME** gets a confusing GCC error (4z36e0, LOW,
+  LOUD). Inherent to emit-C: the 17-name `is_cstdlib` list must stay declarable for interop.
+
+### Conflict groups — take together or not at all
+
+1. **V7 + V8** (volatile strip). V7 is the type-system root (`type_equals` +
+   `can_implicit_coerce`); V8 is the four hand-rolled sinks and the `?*T` axis. Landing
+   only V7 leaves `?*T` call-arg/return open; only V8 leaves struct-init and the funcptr
+   param match open.
+2. **V4 + O2** (packed). The 5-sink widening and the non-sticky boundary are one change;
+   the widening ALONE turns O2 into a worse over-rejection.
+3. **V3 + W6** (root-ident walk). pjtawx unifies ast.h/checker/zercheck_ir; 39294y unifies
+   the two remaining emitter.c copies. Landing one leaves a drifted duplicate of the same
+   walker — the exact shape both fixes exist to kill.
+4. **V9 + V10** (global init). Same `if` condition; V9's names without V10's condition
+   split changes nothing for 7 of the 11 names — which is what happened on 4z36e0's first
+   attempt, and what its new grid caught.
+5. **O3 is a PRECONDITION** for promoting the always-OOB verdict at short-circuit position.
+   Main warns today, so O3 is precision-only — but it becomes required the moment that
+   verdict is tightened.
+
+### Verification method (so a fresh session can reproduce this table)
+
+Clean `rm -f *.o src/safety/*.o && make zerc` on `5fef1d06`, then for each branch:
+`git show origin/claude/vigilant-tesla-<b>:tests/zer_fail/<t>.zer`, compile with
+`-o out.c` to isolate the CHECKER's verdict from GCC's, and grep the DIAGNOSTIC
+(excluding the echoed source line, which contains the offending text and defeats a
+loose grep). Three maskings were hit and routed around: the non-shared-global rule
+masks the RMW rule (use a `volatile` global), the non-null-initializer rule masks the
+escape rules (use `?*T`), and warnings are not rejections (check the exit code, not
+the presence of a message).
+
+---
+
 ## ~~harvested 2026-08-17 from seven audit branches~~ — **ALL 39 CLOSED 2026-08-17**
 
 Five structural fixes (BUG-791..795) closed 26; the six remaining independent

@@ -1,0 +1,3 @@
+// expect-error: negative constant -1 does not fit unsigned type
+u32 give() { return -1; }
+u32 main() { return give(); }

@@ -23,7 +23,12 @@ u64 d = 123456789;
 
 **NOTES**
 - No implicit narrowing: `u8 x = 300;` is a compile error. Use `@truncate(u8, 300)` or `@saturate(u8, 300)`.
-- No implicit sign conversion: `u32 x = -1;` is a compile error. Use `@bitcast(u32, -1)`.
+- No implicit sign conversion: `u32 x = -1;` is a compile error. Use `@bitcast(u32, -1)`,
+  or write the value you mean (`0xFFFFFFFF`). This holds at every width and at
+  every position a value can flow to — initializer, assignment, call argument,
+  return, `spawn` argument, struct initializer, `orelse` fallback, global init.
+- A LARGE POSITIVE literal is not a negative one: `u64 y = 0xDEADBEEFCAFEBABE;`
+  and `u64 m = 18446744073709551615;` are ordinary constants and compile.
 - Shift by >= width returns 0 (defined, not UB).
 
 **SEE ALSO**
@@ -929,6 +934,30 @@ switch (ready) {
   pattern works. `switch (v) { .red => ... }` works when inner is enum
   or union. Dot-prefix arms on `?u32` / `?bool` (non-variant inner) are
   rejected — use `if (x) |v| { ... } else { ... }` instead.
+- **`default` is the fallback wherever it is written.** Arms are matched in
+  MATCH order, not source order: every specific arm is tried first, and
+  `default` only runs when none matched. Writing it first is legal and does not
+  shadow the arms below it.
+
+  ```zer
+  u32 pick(u32 k) {
+      u32 r = 0;
+      switch (k) {
+          default => { r = 99; }
+          1 => { r = 11; }        // still reachable — k == 1 gives 11, not 99
+          2, 3 => { r = 23; }
+      }
+      return r;
+  }
+
+  u32 main() { if (pick(1) != 11) { return 1; } return 0; }
+  ```
+- **An enum value is always one of its declared variants**, which is what makes
+  the exhaustive form sound. `@bitcast` / `@truncate` into an enum (or into any
+  type that CARRIES one — a struct field, an array element, an optional) is a
+  compile error for exactly that reason; a forged value would silently take the
+  last arm. A constant that names a declared variant is fine:
+  `@bitcast(State, 1)` compiles.
 
 **SEE ALSO**
 enum, union
@@ -1663,6 +1692,7 @@ u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
   Use a literal, or compute it inside a function body. The same restriction
   applies to `@addc`, `@subb` and `@mulw`.
 ```zer
+// audit: skip — this block deliberately shows a REJECTED form
 u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
 u32 main() {
     u8 ok = @saturate(u8, 300);    // OK — inside a function body
@@ -2022,6 +2052,357 @@ u8[512] fpu;
 
 ---
 
+### Systems / privileged intrinsics — the complete set
+
+**DESCRIPTION**
+The 96 intrinsics below round out the systems surface: port I/O, model-specific
+and control registers, CPU identification, power and idle control, privileged
+mode transitions, cache and TLB maintenance, MMU control, and extended processor
+state. They are documented here as one measured table rather than one section
+each because they share a single shape — a thin, typed wrapper over one
+instruction, with no ZER-level semantics of its own.
+
+**Every signature below was MEASURED from the compiler**, not recalled: the
+arity and parameter names are the compiler's own diagnostics, and each return
+type was read out of a deliberate type mismatch. If a row disagrees with the
+compiler, the compiler is right and this table is stale — regenerate it.
+
+**PRIVILEGE.** Most of these execute at CPL=0 (or the ARM/RISC-V equivalent) and
+fault with SIGSEGV if you run them in user mode. They all *compile* in user mode.
+The test convention for exercising one without executing it is the dead-branch
+pattern:
+
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) { @cpu_write_cr3(0); }   // compiles, never runs
+    return 0;
+}
+```
+
+Rows marked **(P)** are privileged; the rest run anywhere.
+
+**ARCHITECTURE.** These lower to per-arch inline asm. On an architecture where
+an instruction does not exist the intrinsic is a no-op or a documented fallback
+(for example `@port_*` is x86-only; `@cpu_sbi_call` is RISC-V; `@cpu_smc_call`
+is ARM TrustZone). ZER verifies the *use* of the value — it does not verify that
+the instruction does what your datasheet says (the hardware-consequence floor;
+see CLAUDE.md "Program-Consequence Coverage").
+
+#### Port I/O — x86 (P)
+
+| Intrinsic | Returns |
+|---|---|
+| `@port_in8(port)` | `u8` |
+| `@port_in16(port)` | `u16` |
+| `@port_in32(port)` | `u32` |
+| `@port_out8(port, value)` | `void` |
+| `@port_out16(port, value)` | `void` |
+| `@port_out32(port, value)` | `void` |
+
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @port_out8(0x3F8, 65);            // write 'A' to COM1
+        u8 status = @port_in8(0x3FD);     // read line status
+        @port_out32(0xCF8, status);
+    }
+    return 0;
+}
+```
+
+Requires CPL <= IOPL. `port` is a `u16` port number.
+
+#### Model-specific, control, debug and performance registers (P)
+
+| Intrinsic | Returns |
+|---|---|
+| `@cpu_read_msr(msr)` / `@cpu_write_msr(msr, value)` | `u64` / `void` |
+| `@cpu_read_cr0()` / `@cpu_write_cr0(value)` | `u64` / `void` |
+| `@cpu_read_cr2()` | `u64` (page-fault address) |
+| `@cpu_read_cr3()` / `@cpu_write_cr3(value)` | `u64` / `void` |
+| `@cpu_read_cr4()` / `@cpu_write_cr4(value)` | `u64` / `void` |
+| `@cpu_read_xcr0()` / `@cpu_write_xcr0(value)` | `u64` / `void` |
+| `@cpu_read_dr(idx)` / `@cpu_write_dr(idx, value)` | `u64` / `void` |
+| `@cpu_read_pmc(idx)` | `u64` |
+| `@cpu_read_fsbase()` / `@cpu_write_fsbase(value)` | `u64` / `void` |
+| `@cpu_read_gsbase()` / `@cpu_write_gsbase(value)` | `u64` / `void` |
+
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        u64 efer = @cpu_read_msr(0xC0000080);
+        @cpu_write_msr(0xC0000080, efer | 1);
+        u64 pt = @cpu_read_cr3();
+        @cpu_write_cr3(pt);                    // reload — flushes non-global TLB
+        u64 fault_at = @cpu_read_cr2();
+        @cpu_write_dr(0, fault_at);
+    }
+    return 0;
+}
+```
+
+`@cpu_read_dr` takes a debug-register index (0-3, 6, 7) resolved at run time.
+`@cpu_read_pmc` needs `CR4.PCE=1` for user access. FS/GS base access needs the
+`FSGSBASE` feature (`CR4.FSGSBASE=1`).
+
+#### CPU identification and inspection (non-privileged)
+
+| Intrinsic | Returns |
+|---|---|
+| `@cpu_cpuid(leaf, subleaf)` | `u64` — `(EBX << 32) \| EAX` |
+| `@cpu_cpuid_ecx(leaf, subleaf)` | `u64` — `(EDX << 32) \| ECX` |
+| `@cpu_vendor_id()` | `u64` — CPUID leaf 0 EBX |
+| `@cpu_feature_bits()` | `u64` — CPUID leaf 1 ECX:EDX packed |
+| `@cpu_model_id()` | `u32` — CPUID leaf 1 EAX |
+| `@cpu_id()` | `u32` |
+| `@cpu_core_id()` | `u32` |
+| `@cpu_num_cores()` | `u32` |
+| `@cpu_cache_line_size()` | `u32` |
+| `@cpu_current_mode()` | `u32` |
+| `@cpu_get_priv_level()` | `u32` (0 = user) |
+| `@cpu_read_sp()` | `u64` — stack pointer |
+| `@cpu_read_tp()` | `u64` — thread pointer / TLS base |
+| `@cpu_read_flags()` | `u64` — RFLAGS / NZCV |
+| `@cpu_read_counter()` | `u64` — cycle counter |
+| `@cpu_get_pc()` | `u64` — program counter |
+
+```zer
+i32 printf(const *u8 fmt, ...);
+
+u32 main() {
+    u64 vendor = @cpu_vendor_id();
+    u32 model  = @cpu_model_id();
+    u32 cores  = @cpu_num_cores();
+    u32 line   = @cpu_cache_line_size();
+    u64 sp     = @cpu_read_sp();
+    u64 t0     = @cpu_read_counter();
+    u64 t1     = @cpu_read_counter();
+    printf("vendor=%llx model=%u cores=%u line=%u\n", vendor, model, cores, line);
+    if (sp == 0) { return 1; }
+    if (t1 < t0) { return 2; }
+    return 0;
+}
+```
+
+`@cpu_core_id`, `@cpu_current_mode`, `@cpu_num_cores` and `@cpu_cache_line_size`
+are stubs on the hosted target (0 / 0 / 1 / 64) — they exist so kernel code can
+be written once; a real BSP supplies the values through `cinclude`.
+
+#### Hardware random (non-privileged)
+
+| Intrinsic | Returns |
+|---|---|
+| `@cpu_rdrand()` | `?u64` |
+| `@cpu_rdseed()` | `?u64` |
+
+They return an **optional**, not a `u64`: the instruction can legitimately fail
+(entropy pool exhausted), and the optional makes that failure impossible to
+ignore.
+
+```zer
+u32 main() {
+    u64 r = @cpu_rdrand() orelse 0;
+    if (@cpu_rdseed()) |s| {
+        if (s == r) { return 1; }
+    }
+    return 0;
+}
+```
+
+#### Power, idle and wait
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@cpu_pause()` | `void` | spin-loop hint (PAUSE / YIELD) |
+| `@cpu_idle_hint()` | `void` | non-blocking low-power hint |
+| `@cpu_deep_sleep()` | `void` | **(P)** deepest idle state (WFI / HLT) |
+| `@cpu_reset()` | `void` | **(P)** safe halt-forever fallback |
+| `@cpu_wfe()` / `@cpu_sev()` | `void` | ARM wait-for-event / send-event |
+| `@cpu_monitor_addr(addr)` | `void` | **(P)** x86 MONITOR |
+| `@cpu_mwait()` | `void` | **(P)** x86 MWAIT — pairs with the above |
+| `@cpu_umonitor(ptr)` | `void` | user-mode MONITOR (WAITPKG) |
+| `@cpu_umwait(hint, deadline)` | `void` | user-mode MWAIT; hint 0 = C0.2, 1 = C0.1 |
+| `@wait_on_address(addr, expected)` | `void` | wait until `*addr != expected` |
+
+```zer
+u32 spin_until(volatile *u32 flag) {
+    u32 n = 0;
+    while (n < 4) {
+        @cpu_pause();
+        @cpu_idle_hint();
+        n += 1;
+    }
+    return n;
+}
+
+volatile u32 ready;
+
+u32 main() {
+    u32 n = spin_until(&ready);
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @cpu_monitor_addr(@ptrcast(volatile *u8, &ready));
+        @cpu_mwait();
+        @cpu_deep_sleep();
+    }
+    if (n != 4) { return 1; }
+    return 0;
+}
+```
+
+#### Privileged mode transitions (P)
+
+| Intrinsic | Notes |
+|---|---|
+| `@cpu_syscall()` | user -> kernel trap (syscall / svc #0 / ecall) |
+| `@cpu_sysret()` | kernel -> user return |
+| `@cpu_iret()` | interrupt return |
+| `@cpu_set_priv_stack(sp)` | kernel stack for syscall entry |
+| `@cpu_hypercall()` | guest -> hypervisor (vmcall / hvc #0) |
+| `@cpu_sbi_call()` | RISC-V ecall to M-mode firmware |
+| `@cpu_smc_call()` | ARM TrustZone `smc #0` |
+| `@cpu_eoi()` | end-of-interrupt to LAPIC / GICv3 |
+| `@cpu_breakpoint()` | debug trap (INT3 / BRK) |
+| `@cpu_endbr()` | CET-IBT landing pad (multi-byte NOP without CET) |
+| `@cpu_flush_pipeline()` | serialising barrier |
+
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @cpu_endbr();
+        @cpu_set_priv_stack(0x9000);
+        @cpu_syscall();
+        @cpu_eoi();
+        @cpu_iret();
+    }
+    return 0;
+}
+```
+
+Every one of these requires the system registers (CS/RIP/RFLAGS on x86;
+ELR/SPSR on ARM; sepc/sstatus on RISC-V) to be correct BEFORE the transition.
+ZER does not — and cannot — check that; it is the hardware-consequence floor.
+
+#### Cache maintenance
+
+| Intrinsic | Notes |
+|---|---|
+| `@cache_flush_line(addr)` | CLFLUSH — flush one line |
+| `@cache_flushopt(addr)` | CLFLUSHOPT — ordered alternative |
+| `@cache_writeback(addr)` | CLWB — writeback without invalidate (NVDIMM) |
+| `@cache_zero_line(addr)` | zero a whole cache line (DC ZVA) |
+| `@cache_flush_range(addr, size)` | flush a byte range |
+| `@cache_clean_range(addr, size)` | clean (write back) a byte range |
+| `@cache_invalidate_range(addr, size)` | invalidate a byte range |
+| `@cache_invalidate_icache(addr, size)` | instruction-cache invalidate |
+| `@cpu_cache_disable()` / `@cpu_cache_enable()` | **(P)** CR0.CD |
+| `@nt_store(addr, value)` | non-temporal store (MOVNTI) — bypasses cache |
+| `@barrier_dma()` | DMA-visible ordering barrier |
+
+```zer
+u8[128] dma_buf;
+
+u32 main() {
+    @cache_clean_range(&dma_buf[0], 128);
+    @barrier_dma();
+    @cache_invalidate_range(&dma_buf[0], 128);
+    @cache_flush_line(&dma_buf[0]);
+    @cache_writeback(&dma_buf[0]);
+    @nt_store(&dma_buf[0], 0);
+    return 0;
+}
+```
+
+The address argument is a **pointer or array**, not an integer — passing
+`@ptrtoint(&x)` is a compile error ("first argument must be pointer or array").
+Ordering matters and ZER does not enforce it: clean before a device reads,
+invalidate after a device writes.
+
+#### TLB and MMU (P)
+
+| Intrinsic | Returns |
+|---|---|
+| `@tlb_flush_all()` | `void` |
+| `@tlb_flush_global()` | `void` |
+| `@tlb_flush_addr(addr)` | `void` |
+| `@tlb_flush_asid(asid)` | `void` |
+| `@tlb_flush_range(start, end)` | `void` |
+| `@mmu_enable()` / `@mmu_disable()` | `void` |
+| `@mmu_is_enabled()` | `bool` |
+| `@mmu_get_pt()` / `@mmu_set_pt(phys)` | `u64` / `void` |
+| `@mmu_get_kernel_pt()` / `@mmu_set_kernel_pt(phys)` | `u64` / `void` |
+| `@mmu_get_fault_addr()` | `u64` |
+| `@mmu_get_fault_status()` | `u64` |
+| `@mmu_sync()` | `void` |
+
+```zer
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        u64 pt = @mmu_get_pt();
+        @mmu_set_pt(pt);
+        @tlb_flush_addr(0x1000);
+        @tlb_flush_range(0x1000, 0x2000);
+        @tlb_flush_asid(1);
+        @tlb_flush_all();
+        @mmu_sync();
+        if (@mmu_is_enabled()) { @mmu_disable(); }
+        @mmu_enable();
+        u64 far = @mmu_get_fault_addr();
+        if (far != 0) { return 1; }
+    }
+    return 0;
+}
+```
+
+`@mmu_is_enabled()` returns `bool` — it is the only one in this family that
+does, and `bool` is not an integer in ZER, so use it directly in a condition.
+
+#### Extended processor state
+
+| Intrinsic | Notes |
+|---|---|
+| `@cpu_xsave(buf, mask)` / `@cpu_xrstor(buf, mask)` | **(P)** XSAVE/XRSTOR (AVX, AVX-512) |
+| `@cpu_fxsave(ptr)` / `@cpu_fxrstor(ptr)` | legacy 512-byte FXSAVE area |
+| `@cpu_fpu_init()` | FNINIT |
+
+```zer
+u8[512] fx;
+u8[1024] xs;
+
+u32 main() {
+    @cpu_fpu_init();
+    @cpu_fxsave(&fx[0]);
+    @cpu_fxrstor(&fx[0]);
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        @cpu_xsave(&xs[0], 7);          // buffer is a pointer, mask is an integer
+        @cpu_xrstor(&xs[0], 7);
+    }
+    return 0;
+}
+```
+
+Buffers must be 16-byte aligned for FXSAVE and 64-byte aligned for XSAVE. ZER
+checks that the argument is a valid pointer/integer; the ALIGNMENT is yours.
+
+**NOTES (whole set)**
+- Arity is checked. `@cpu_read_msr()` with no argument is a compile error naming
+  the missing parameter — the compiler's message is the authoritative signature.
+- These are ordinary value-producing expressions: every ZER safety rule applies
+  to what you do with the result (bounds, optional unwrapping, escape, the
+  atomic-cell rule, qualifier preservation).
+- What ZER does NOT verify is whether the instruction is the right one for your
+  silicon, or whether the value you pass is correct for your board. That is the
+  hardware-consequence floor and no language removes it — it is surfaced here,
+  at the narrowest typed boundary, so a reviewer can see it.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2294,6 +2675,7 @@ import gpio;
 
 **EXAMPLE**
 ```zer
+// audit: skip — two FILES in one block; not compilable as a single unit
 // uart.zer:
 void uart_init(u32 baud) { }
 static void internal_helper() { }   // not visible to importers
@@ -2771,6 +3153,47 @@ undefined behavior.
 ### Comparison
 `==  !=  <  >  <=  >=` — Returns bool.
 
+**Only SCALAR values are comparable.** A comparison lowers to a C scalar
+comparison, and C has none for an aggregate, so ZER rejects it rather than
+inventing one:
+
+| Comparable | Not comparable |
+|---|---|
+| all integers, `uN`/`iN`, `f32`/`f64`, `bool`, `enum` | `struct`, `union` |
+| `*T`, function pointers, `Handle(T)`, `*opaque` (by pointer identity) | `T[N]`, `[*]T` — compare element-wise |
+| `?*T` (a null-sentinel pointer) — against `null` **or** another pointer | `?T`, `?void` — see below |
+
+```zer
+struct P { u32 x; u32 y; }
+
+u32 same(P a, P b) {
+    // if (a == b) { }              // COMPILE ERROR — aggregate, no value comparison
+    if (a.x == b.x && a.y == b.y) { return 1; }
+    return 0;
+}
+```
+
+**An optional carrying a value (`?T`) cannot be compared against a value.** It
+may hold nothing, and the comparison would have to read the payload without
+checking it — so `if (maybe == 0)` is a compile error, not a null test. Unwrap
+first, or compare against `null`:
+
+```zer
+?u32 lookup(u32 k) { if (k == 0) { return null; } return k; }
+
+u32 main() {
+    ?u32 m = lookup(0);
+    if (m == null) { return 0; }        // OK — the sanctioned test
+    // if (m == 0) { }                  // COMPILE ERROR — reads the payload unchecked
+    u32 v = m orelse 7;                 // OK — unwrap, then compare
+    if (v == 7) { return 0; }
+    return 1;
+}
+```
+
+`?*T` is different: it is a plain pointer with `null` as its own representation,
+so it compares like one.
+
 ### Logical
 `&&  ||  !` — Short-circuit evaluation.
 
@@ -2794,10 +3217,15 @@ rather than undefined. A position known at compile time to be out of range is a
 compile error instead.
 
 ### NOT in ZER
-- `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
-- `,` — Comma operator
-- `goto` — Use structured control flow
+- `++  --` — use `+= 1`, `-= 1`
+- `,` — the comma operator
+- pointer arithmetic (`ptr + n`) — use `ptr[n]`, or `@ptrtoint` / math /
+  `@inttoptr` for MMIO
+
+`(T)x` C-style casts **are** supported (see "(Type)expr — C-Style Cast"), and so
+is `goto` (see "goto + labels"). Both were listed here as absent; they are not.
+`@truncate` / `@saturate` / `@bitcast` remain for the conversions a plain cast
+deliberately refuses.
 
 ---
 
@@ -2849,7 +3277,21 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 2048        # error if estimated stack usage exceeds N bytes
+zerc source.zer --release                 # release build
+zerc source.zer --track-cptrs             # track pointers crossing the C boundary
+zerc source.zer --emit-ir                 # print the IR and exit (debugging)
+zerc source.zer --trace                   # narrate the compilation pipeline
+zerc --help                               # the authoritative option list
 ```
+
+**Unknown options are an error, not a shrug.** `zerc f.zer --no-strict-mmmio`
+(one `m` too many) fails and names the offending option; it does not build with
+the flag quietly missing. The same holds for a bad value: `--target-arch=arm64`
+is rejected (the spelling is `aarch64`) rather than silently leaving the x86_64
+default in place, and `--target-bits`/`--stack-limit` reject a non-numeric
+argument instead of parsing it as 0. `zerc --help` is the authoritative list —
+prefer it over this table, which can drift.
 
 ### Pipeline
 

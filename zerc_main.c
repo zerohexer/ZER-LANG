@@ -207,10 +207,40 @@ void zerc_ir_hook(void *ctx, void *ir_func) {
 
 /* ================================================================ */
 
+/* BUG-844: one place that spells the option surface, shared by the usage banner
+ * and the unknown-option error, so the two cannot drift apart. */
+static void zerc_print_usage(FILE *out) {
+    fprintf(out,
+        "Usage: zerc <input.zer> [options]\n"
+        "\n"
+        "  -o <path>                   output file (.c keeps the C; anything else builds an exe)\n"
+        "  --run                       compile and execute\n"
+        "  --emit-c                    keep the generated .c\n"
+        "  --emit-ir                   print the IR and exit\n"
+        "  --lib                       omit the preamble/runtime (C interop)\n"
+        "  --release                   release build\n"
+        "  --no-strict-mmio            allow @inttoptr without an mmio declaration\n"
+        "  --track-cptrs               track pointers crossing the C boundary\n"
+        "  --trace, --trace-calls      narrate the compilation pipeline\n"
+        "  --target-bits <16|32|64>    pointer width override\n"
+        "  --stack-limit <bytes>       error when estimated stack usage exceeds this\n"
+        "  --gcc <path>                C compiler to use\n"
+        "  --probe-mode={hosted,raw,disabled}\n"
+        "  --target-arch={x86_64,aarch64,riscv64}\n"
+        "  --target-features=<comma-separated>\n"
+        "  -h, --help                  this message\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: zerc <input.zer> [-o output] [--run] [--emit-c] [--emit-ir]\n");
+        zerc_print_usage(stderr);
         return 1;
+    }
+    /* BUG-844: `zerc --help` used to be read as an INPUT FILE NAME and reported
+     * "cannot open '--help'". */
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        zerc_print_usage(stdout);
+        return 0;
     }
 
     const char *input_path = argv[1];
@@ -265,7 +295,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--release") == 0) {
             release_mode = true;
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
-            zer_target_ptr_bits = atoi(argv[++i]);
+            /* BUG-844: `atoi` maps any non-numeric text to 0, and a 0-bit
+             * pointer width silently disables every width-dependent check
+             * (the volatile single-word exemption keys on it). */
+            const char *tb = argv[++i];
+            char *tb_end = NULL;
+            long tbv = strtol(tb, &tb_end, 10);
+            if (!tb_end || *tb_end != '\0' || (tbv != 16 && tbv != 32 && tbv != 64)) {
+                fprintf(stderr, "error: --target-bits expects 16, 32 or 64, got '%s'\n", tb);
+                return 1;
+            }
+            zer_target_ptr_bits = (int)tbv;
             target_bits_explicit = true;
         } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
             gcc_override = argv[++i];
@@ -280,7 +320,17 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
-            zer_stack_limit = (uint32_t)atoi(argv[++i]);
+            /* BUG-844: `--stack-limit abc` parsed as 0, which reads as "no
+             * limit" — the tool then AFFIRMS a stack budget it never checked. */
+            const char *sl = argv[++i];
+            char *sl_end = NULL;
+            long slv = strtol(sl, &sl_end, 10);
+            if (!sl_end || *sl_end != '\0' || slv <= 0) {
+                fprintf(stderr, "error: --stack-limit expects a positive byte "
+                        "count, got '%s'\n", sl);
+                return 1;
+            }
+            zer_stack_limit = (uint32_t)slv;
         } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
             /* F4.2 (2026-04-29): comma-separated CPU features. Each match
              * sets a bit in zer_target_features (matches ZerCpuFeature
@@ -331,7 +381,27 @@ int main(int argc, char **argv) {
                 zer_target_arch_id = 3;
                 zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
                 zer_target_features = 0;  /* clear x86 baseline */
+            } else {
+                /* BUG-844: an unknown arch used to fall through SILENTLY and
+                 * leave the x86_64 default in place, so `--target-arch=arm64`
+                 * (the wrong spelling of `aarch64`) built an x86 binary and
+                 * reported success. On a cross-compile that is a wrong-target
+                 * artefact, not a diagnostic. */
+                fprintf(stderr, "error: unknown --target-arch '%s' "
+                        "(use x86_64, aarch64, or riscv64)\n", a);
+                return 1;
             }
+        } else if (argv[i][0] == '-') {
+            /* BUG-844: every unrecognised option was silently ignored, so a
+             * typo (`--no-strict-mmmio`, `--stack-limit=256` written with an
+             * `=` instead of a space) produced a build with the safety setting
+             * the user asked for QUIETLY ABSENT, and exit 0. A build tool that
+             * affirms a flag it did not honour is worse than one that fails.
+             * Only dash-prefixed arguments are judged; a stray positional is
+             * left alone. */
+            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            zerc_print_usage(stderr);
+            return 1;
         }
     }
 

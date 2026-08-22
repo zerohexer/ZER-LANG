@@ -5,6 +5,94 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23b — BUG-842..844: a width-dependent rule, an enum forge, and a CLI that affirmed flags it ignored
+
+Second batch of the same original audit. Same discipline: reproduced on `430bda1`
+first, every negative verified ACCEPTED pre-fix, corpus cost measured at zero.
+
+### BUG-842 — a negative constant into an unsigned type: rejected at u8/u16, ACCEPTED at u32/u64
+    u8  b = -1;    // correctly REJECTED
+    u16 c = -300;  // correctly REJECTED
+    u32 a = -1;    // ACCEPTED -> 4294967295
+    u64 g = -1;    // ACCEPTED -> 18446744073709551615
+and the same asymmetry at assignment, call-argument, return, spawn-argument,
+struct-initializer, orelse-fallback and global-init position.
+
+`is_literal_compatible` implements ZER's "no implicit sign conversion" rule
+correctly — its negative-literal arm returns false for EVERY unsigned TypeKind.
+It was simply never REACHED for u32/u64/usize: `-1` is itself TYPED u32 (unary
+minus returns its operand's type), so `type_equals(u32, u32)` short-circuited the
+three-condition chain before the literal check ran. The classic "the check exists
+but is never reached" shape.
+
+A rule that fires at some widths and not others is a bug whichever way it is
+resolved. Resolved as a TIGHTENING, so the guarantee holds at every width;
+`@bitcast(u32, -1)` and `0xFFFFFFFF` remain the explicit routes.
+
+**The refactor that came with it.** That three-condition chain
+    !type_equals(target, vt) && !can_implicit_coerce(vt, target) &&
+    !is_literal_compatible(value, target)
+was written out at EIGHT sinks. Eight copies of one question is the multi-site
+shape CLAUDE.md names as the #1 recurring bug class, and it is exactly why the
+negative literal stayed accepted at every one of them. There is now ONE query,
+`value_flows_to`, and each sink keeps its own wording.
+
+**A measurement that changed the rule.** The first draft asked
+`eval_const_expr(value) < 0`, which broke SEVEN corpus programs: `eval_const_expr`
+folds in int64, so `u64 y = 0xDEADBEEFCAFEBABE;` reads back as negative while
+being a perfectly good u64 constant. The shipped rule requires an EXPLICIT unary
+`-` in the source and no operand above INT64_MAX. It gives up a little coverage
+(`u32 a = 1 - 2;` still slips) for zero false positives — the right trade for a
+tightening whose whole justification is consistency.
+Tests: 8 negatives `tests/zer_fail/neg_const_*.zer`, one per sink, ALL accepted
+pre-fix; boundary positive `tests/zer/neg_const_boundary_ok.zer` pins the large
+literals, the signed destinations and the `5 + -1` fold.
+
+### BUG-843 — `@bitcast`/`@truncate` forged an enum outside its declared variants
+    enum State { idle, running, done }
+    State s = @bitcast(State, 7);
+    switch (s) { .idle => …  .running => …  .done => … }   // ran .done, exit 12
+
+ZER's exhaustive enum switch is sound only while every value of an enum type IS a
+declared variant — the lowering RELIES on it, entering the last arm
+UNCONDITIONALLY (`elide_compare`) because the remaining variant is the only
+possibility. Forging a value breaks the premise and the last arm silently runs.
+`@cast` already requires a distinct typedef and there is no C-style int->enum
+cast, so these two were the whole in-language route in. (A value arriving from
+hand-written C is the FFI floor.)
+
+**The carrier axis, found by probing rather than by reasoning.** The first draft
+gated on "is the TARGET spelled as an enum?", and a probe walked straight past it:
+    struct Box { State s; }
+    Box b = @bitcast(Box, 7);   // accepted; switch (b.s) then took .done
+The gate now asks the PROPERTY via `type_carries_enum` (optional / array / struct
+field / union variant recursion, sibling of `type_carries_data_pointer`).
+Precision preserved: a compile-time constant naming a declared variant is still
+accepted, so `@bitcast(State, 1)` compiles.
+Tests: 3 negatives `tests/zer_fail/enum_forge_*.zer` (incl. the struct carrier),
+boundary positive `tests/zer/enum_forge_boundary_ok.zer`.
+
+### BUG-844 — unrecognised CLI options were silently ignored
+`--totally-bogus-flag` exited 0 with no diagnostic. So did `--target-arch=arm64`
+(the valid spelling is `aarch64`) — which left the x86_64 default in place and
+produced an x86 binary while the user believed they had cross-compiled. So did
+`--stack-limit abc`, whose `atoi` maps to 0, which reads as "no limit": the tool
+AFFIRMS a stack budget it never checked.
+
+Now: an unknown dash-prefixed option is an error listing the valid set; an unknown
+`--target-arch` is an error; `--target-bits` and `--stack-limit` validate their
+argument with `strtol`; and `zerc --help` prints usage instead of reporting
+"cannot open '--help'". A stray positional argument is still left alone.
+
+**A harness defect found while writing the tests.** `tests/test_zer.sh` ran
+`grep -qF "$want"`, so any `// expect-error:` string STARTING WITH `-` was parsed
+by grep as an option and the test failed with "grep: unrecognized option" — which
+reads exactly like a compiler defect. Now `grep -qF -- "$want"`.
+Tests: 3 negatives `tests/zer_fail/cli_*.zer` driven through the runner's
+`// zerc-flags:` directive.
+
+---
+
 ## Session 2026-08-23 — BUG-839..841: three silent miscompiles, found by original audit
 
 Found by probing the compiler directly rather than by harvesting a branch. All three

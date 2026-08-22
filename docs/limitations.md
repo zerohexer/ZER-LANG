@@ -13,10 +13,14 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
-**PROGRESS: an ORIGINAL audit landed 2026-08-23** (BUG-839..841) — three silent
-miscompiles found by probing the compiler directly, not by harvesting. Two of them
-happen to close tracker rows V11/V12 and one closes V6, each WIDER than the row
-described (see the struck-through rows for what the row missed). Remaining: 11.
+**PROGRESS: an ORIGINAL audit landed 2026-08-23** (BUG-839..844) — six defects found
+by probing the compiler directly, not by harvesting. Five of them happen to close
+tracker rows (V6, V11, V12, V16, V24), each WIDER than the row described — see the
+struck-through rows for what each row missed. BUG-842 (a negative constant into an
+unsigned type: rejected at u8/u16, ACCEPTED at u32/u64/usize, at all EIGHT
+value-flow sinks) is not on this tracker at all; it was in the
+"jjfk1k verified-and-deliberately-skipped" list below as unreproduced, and is now
+measured, fixed and pinned. Remaining: 9.
 
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
@@ -82,7 +86,7 @@ phrasing. Cosmetic; the rules fire.
 | V13 | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
 | V14 | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
 | V15 | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
-| V16 | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
+| ~~V16~~ **DONE 2026-08-23 (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | Closed wider than the branch row: `@truncate` is the SECOND route (the row names only `@bitcast`), and the gate asks `type_carries_enum` so a struct/array/optional/union WRAPPER cannot slip — `Box b = @bitcast(Box, 7)` was accepted by the first, spelling-based draft |
 | V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
 | V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
 | V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
@@ -90,7 +94,7 @@ phrasing. Cosmetic; the rules fire.
 | V21 | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | `rb.push_checked(a);` — the one method whose entire purpose is reporting overflow, silently not reporting it. Subsumes the ghost-handle check. Corpus cost measured at ZERO (all 6 hits are ghost-handle negatives) |
 | ~~V22~~ **DONE (BUG-836)** | `--stack-limit` never sums main + ISRs, which share one stack | **pjtawx** BUG-811 | Two 200-byte chains pass `--stack-limit 256`. The tool AFFIRMS a budget the target cannot honour |
 | ~~V23~~ **DONE (BUG-835)** | Auto-guard's `return` leaks a held lock and the interrupt-disable | **87xihb** BUG-805 | **The lock form HANGS (deadlock, verified exit 124); the `@critical` form exits 0 silently.** The compiler emits the exact construct it hard-errors users for writing. Main has `guard_traps` for defer bodies only — needs `noreturn_scope_depth` counted inside `emit_shared_lock_mode`/`emit_shared_unlock` and both `IR_CRITICAL` handlers |
-| V24 | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | `--totally-bogus-flag`, `--target-arch=nonsense`, `--stack-limit=abc` all exit 0 with no diagnostic. `--target-arch=arm64` (valid spelling is `aarch64`) silently builds x86 |
+| ~~V24~~ **DONE 2026-08-23 (BUG-844)** | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | Also validates `--target-bits`/`--stack-limit` arguments with `strtol` (`atoi` mapped `abc` to 0, i.e. "no limit"), adds `--help`, and fixes a harness defect found on the way: `grep -qF "$want"` in `tests/test_zer.sh` parsed any `expect-error` string starting with `-` as a grep OPTION |
 | V25 | `break`/`continue` in a for-INITIALISER binds to the ENCLOSING loop | **pjtawx** BUG-813 | Accepted. Branch REJECTS rather than rebinds — the semantics is genuinely ambiguous (`continue` would jump to the step of a loop whose induction variable was never initialised). Corpus cost zero |
 | ~~V26~~ **DONE (BUG-837)** | No way to declare a bare-metal target; `@critical` degrades to a fence | **pjtawx** BUG-812 | `_ZER_HOSTED`/`ZER_FREESTANDING` absent. Scope is narrower than the branch first claimed: ARM/RISC-V/AVR key on the ARCH macro and were always correct — real exposure is **bare-metal x86** (kernel, bootloader, EFI) |
 | ~~V27~~ **DONE (BUG-838)** | MMIO boot validator could never fire, and trying cost a boot hang | **pjtawx** BUG-814 | Gated to exactly the targets where `_zer_probe` hardcodes success. The read still happens from a constructor — before any RCC clock-enable, i.e. a BusFault on a clock-gated peripheral |
@@ -144,7 +148,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 | `tests/test_vrp_join_matrix.c` (32 cells) | 4z36e0 | Closes CLAUDE.md's "VRP range JOIN — NO auto-gate, checklist every control-flow kind" row. Verified to FIRE by reproducing BH-18 #2 behind an env flag. Its first draft was VACUOUS (open-ended pass rule swallowed exit 134 and 127) — now a CLOSED safe-set |
 | `tests/test_global_init_matrix.c` (54 cells) | 4z36e0 | DERIVES the intrinsic set from the compiler at run time, so a new intrinsic is covered the day it lands. Both prior hand-maintained lists lacked exactly that |
 | Trap-harness: `timeout` + `// expect-trap` | 87xihb | Main HAS `ZER_RUN_TIMEOUT`; it LACKS `expect-trap`. "Any non-zero exit" cannot distinguish a hang, a SIGSEGV, a wrong answer and a genuine trap |
-| `tools/audit_reference_examples.sh` | pjtawx (preferred) / 87xihb | Two implementations. pjtawx's checks BOTH directions and prints its skipped-fragment count; 87xihb's is opt-in-marked and asserts the REASON. Both were verified to fire by injection |
+| ~~`tools/audit_reference_examples.sh`~~ **BUILT 2026-08-23** | independent | In `make check` + `make check-reference-examples`. A block is checked iff it declares `main` (or carries `// audit: check`); `// audit: skip` excludes one. That rule was chosen by MEASUREMENT — the looser "contains a function body" rule classified 60 blocks as complete and 29 of those were fragments, and a gate that cries wolf gets switched off. Reports `169 total / 21 checked / 146 fragments / 2 skipped`, so a coverage drop is visible. Verified to FIRE by injecting a defect. It caught four real errors in freshly-written examples on its first run (a stripped `volatile` through `@ptrcast`, `@ptrtoint` into `u64` instead of `usize`, an integer address where `@cache_*` wants a pointer) |
 | `tools/audit_freestanding.sh` | pjtawx | Needs no cross-toolchain. Must test `-DZER_FREESTANDING` ALONE — under `-ffreestanding` old and new predicates agree, so that combination scores a broken compiler as PASSING |
 | `tools/ub_sweep.sh`, `tools/negative_reason_audit.sh` | pmytnl | Differential UB detector (-O0/-O2, +/- `-fno-strict-aliasing`). The reason-audit reports the standing exposure: **125 of 575 negatives assert a reason, 450 do not** |
 | `tools/audit_doc_examples.sh` | 39294y | Overlaps the two above; take one |
@@ -159,11 +163,15 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 - **Build warnings 27 -> 0** (pmytnl): a `size_t`-into-`%.*s` varargs mismatch, a missing
   return in `lower_expr`, a sign-compare, two `calloc(int,...)` clamps, six self-closing
   comments, ~350 lines of provably-dead code.
-- **`reference.md` intrinsic coverage**: four branches did this independently
-  (4z36e0: 96, pjtawx: 98, pmytnl: 98, 39294y: 80). Best: **4z36e0** — signatures MEASURED
-  by probing the compiler, return types disambiguated by narrow assignments (u32 widens to
-  u64 and would otherwise read as u64), and it caught one of its own wrong claims by
-  RUNNING the examples. Note `@cpu_rdrand`/`@cpu_rdseed` return `?u64`, not `u64`.
+- ~~**`reference.md` intrinsic coverage**~~ **DONE 2026-08-23, independently.** All 96
+  undocumented intrinsics are now in `docs/reference.md` ("Systems / privileged intrinsics
+  — the complete set"), grouped into ten families with a compileable example each. Every
+  signature was MEASURED from the compiler, the same method the branches used: arity and
+  parameter names come from the compiler's own arity diagnostics, and each return type was
+  read out of a deliberate type mismatch. The measurement independently confirms the
+  branches' note that `@cpu_rdrand`/`@cpu_rdseed` return `?u64`, not `u64`. Three stale
+  claims were also corrected: `reference.md` listed C-style casts and `goto` under "NOT in
+  ZER" while both have worked for months.
 
 ### Reported but NOT fixed on any branch — carry as OPEN, do not "harvest"
 
@@ -248,7 +256,9 @@ Residuals of this work that are still open are listed below.
 - j8f9t7's limitations.md carries a **SUSPECTED** block (code-reading only).
 - jjfk1k verified-and-deliberately-skipped: `@once` + a user `@sem_acquire`/`release`
   pair; global-scope `@inttoptr` with a non-literal address emits invalid C; a
-  negative literal into a wide unsigned type is accepted; `rust_tests/run_tests.sh`
+  negative literal into a wide unsigned type is accepted (**CONFIRMED and FIXED
+  2026-08-23, BUG-842** — it was accepted at all eight value-flow sinks for
+  u32/u64/usize while correctly rejected at u8/u16); `rust_tests/run_tests.sh`
   uses a hard `timeout 10` so pthread tests flake under load.
 
 ## DONE — HARVEST COMPLETE: all 45 fixes from eleven `claude/gifted-noether-*` branches landed (2026-08-01 → 2026-08-02)

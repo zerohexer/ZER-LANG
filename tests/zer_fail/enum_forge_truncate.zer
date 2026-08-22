@@ -1,0 +1,8 @@
+// expect-error: carries an enum
+// BUG-843: the @truncate route into the same hole.
+enum State { idle, running, done }
+u32 main() {
+    u32 x = 7;
+    State s = @truncate(State, x);
+    return (u32)s;
+}

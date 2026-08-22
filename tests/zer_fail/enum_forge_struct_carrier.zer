@@ -1,0 +1,14 @@
+// expect-error: carries an enum
+// BUG-843 carrier axis: gating on "is the TARGET an enum?" let a struct WRAPPER
+// through — @bitcast(Box, 7) forged Box.s and the switch took its last arm.
+enum State { idle, running, done }
+struct Box { State s; }
+u32 main() {
+    u32 x = 7;
+    Box b = @bitcast(Box, x);
+    switch (b.s) {
+        .idle => { return 1; }
+        .running => { return 2; }
+        .done => { return 3; }
+    }
+}

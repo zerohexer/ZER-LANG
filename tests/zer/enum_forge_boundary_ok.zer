@@ -1,0 +1,37 @@
+/* BUG-843 boundary positive: the enum-forge gate must reject only conversions
+ * that could produce an UNDECLARED variant. A compile-time constant naming a
+ * declared variant is known-good and stays legal — rejecting it would be pure
+ * over-rejection with no soundness gain. */
+
+enum State { idle, running, done }
+enum Coded { lo = 5, hi = 9 }
+
+u32 classify(State s) {
+    switch (s) {
+        .idle => { return 1; }
+        .running => { return 2; }
+        .done => { return 3; }
+    }
+}
+
+u32 main() {
+    /* constants that name declared variants */
+    State a = @bitcast(State, 1);
+    if (classify(a) != 2) { return 1; }
+    State b = @truncate(State, 2);
+    if (classify(b) != 3) { return 2; }
+
+    /* explicit variant values, including a sparse enum */
+    Coded c = @bitcast(Coded, 9);
+    if ((u32)c != 9) { return 3; }
+
+    /* the ordinary route is untouched */
+    State d = State.idle;
+    if (classify(d) != 1) { return 4; }
+
+    /* enum as the SOURCE of a conversion is not a forge */
+    u32 raw = @bitcast(u32, State.done);
+    if (raw != 2) { return 5; }
+
+    return 0;
+}

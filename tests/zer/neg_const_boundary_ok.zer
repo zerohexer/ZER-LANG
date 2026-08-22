@@ -1,0 +1,42 @@
+/* BUG-842 boundary positive. The rejection is "an explicitly-negated compile-time
+ * constant into an UNSIGNED destination". Everything below stays legal, and the
+ * first three are exactly the shapes that a first, cruder draft of the rule broke
+ * (a bare large literal folds to a negative int64 while being a valid u64). */
+
+i32 printf(const *u8 fmt, ...);
+
+u64 g_big  = 0xDEADBEEFCAFEBABE;      /* > INT64_MAX — NOT a negative constant */
+u64 g_max  = 18446744073709551615;    /* 2^64-1 — same */
+i64 g_neg  = -5;                      /* signed destination — always fine */
+
+u32 main() {
+    /* large positive literals into unsigned */
+    u64 y = 0xDEADBEEFCAFEBABE;
+    if (y != g_big) { return 1; }
+    if (g_max == 0) { return 2; }
+
+    /* negative constants into SIGNED destinations, at every width */
+    i8  a = -1;   if (a != -1) { return 3; }
+    i16 b = -300; if (b != -300) { return 4; }
+    i32 c = -1;   if (c != -1) { return 5; }
+    i64 d = -1;   if (d != -1) { return 6; }
+    if (g_neg != -5) { return 7; }
+
+    /* a negation whose FOLDED value is non-negative is not a negative constant */
+    u32 e = 5 + -1;   if (e != 4) { return 8; }
+    u32 f = -1 + 5;   if (f != 4) { return 9; }
+    u32 h = -0;       if (h != 0) { return 10; }
+
+    /* the sanctioned explicit routes to an all-ones unsigned value */
+    u32 m1 = @bitcast(u32, -1);
+    u32 m2 = 0xFFFFFFFF;
+    if (m1 != m2) { return 11; }
+
+    /* a RUNTIME negative value converted explicitly is untouched by the rule */
+    i32 s = -1;
+    u32 m3 = @bitcast(u32, s);
+    if (m3 != m2) { return 12; }
+
+    printf("neg-const boundary ok\n");
+    return 0;
+}

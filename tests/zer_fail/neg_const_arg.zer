@@ -1,0 +1,6 @@
+// expect-error: negative constant -1 does not fit unsigned type
+void take(u32 v) { }
+u32 main() {
+    take(-1);
+    return 0;
+}

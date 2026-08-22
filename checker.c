@@ -705,6 +705,84 @@ static bool type_is_value_comparable(Type *t) {
     return false;
 }
 
+/* BUG-843: does this conversion FORGE an enum value that is not one of the
+ * declared variants?
+ *
+ * ZER's exhaustive enum switch is only sound while every value of an enum type
+ * IS a declared variant — the IR lowering relies on it, entering the LAST arm of
+ * an exhaustive switch UNCONDITIONALLY (`elide_compare`, ir_lower.c) because the
+ * remaining variant is the only possibility. Forge a value outside the set and
+ * that arm runs for it:
+ *
+ *     enum State { idle, running, done }
+ *     State s = @bitcast(State, 7);
+ *     switch (s) { .idle => …  .running => …  .done => … }   // takes .done
+ *
+ * — no diagnostic, no trap, just the wrong branch. `@truncate(State, x)` is the
+ * same hole; `@cast` already requires a distinct typedef, and there is no
+ * C-style int->enum cast, so closing these two closes the in-language routes.
+ * (A value arriving from hand-written C through `cinclude` is the FFI floor.)
+ *
+ * A compile-time constant that IS a declared variant is allowed — the value is
+ * known, so the invariant is preserved and rejecting it would be pure
+ * over-rejection. */
+static bool enum_value_is_declared_variant(Type *enum_eff, int64_t v) {
+    if (!enum_eff) return false;
+    for (uint32_t i = 0; i < enum_eff->enum_type.variant_count; i++)
+        if ((int64_t)enum_eff->enum_type.variants[i].value == v) return true;
+    return false;
+}
+/* Does this type CARRY an enum at any nesting depth?
+ *
+ * The carrier axis, which the first draft of this gate missed and a probe found:
+ * gating on "is the TARGET spelled as an enum?" let a struct wrapper through —
+ *     struct Box { State s; }
+ *     Box b = @bitcast(Box, 7);   // accepted; switch (b.s) then took .done
+ * — the exact "gate tests the SPELLING, not the PROPERTY" shape CLAUDE.md names.
+ * Sibling of type_carries_data_pointer, same recursion (optional / array /
+ * struct field / union variant). */
+static bool type_carries_enum(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_ENUM) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_enum(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)    return type_carries_enum(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_enum(u->struct_type.fields[i].type, depth + 1)) return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_enum(u->union_type.variants[i].type, depth + 1)) return true;
+        return false;
+    }
+    return false;
+}
+static void check_enum_forge(Checker *c, Node *value, Type *target,
+                             int line, const char *what) {
+    if (!target) return;
+    Type *eff = type_unwrap_distinct(target);
+    if (!eff || !type_carries_enum(eff, 0)) return;
+    /* A compile-time constant naming a declared variant is safe — only for a
+     * DIRECT enum target; inside a carrier the constant's bits are not the
+     * enum's bits, so there is nothing to validate. */
+    if (value && type_dispatch_kind(eff) == TYPE_ENUM) {
+        int64_t v = eval_const_expr(value);
+        if (v != CONST_EVAL_FAIL && enum_value_is_declared_variant(eff, v)) return;
+    }
+    char tn[96];
+    snprintf(tn, sizeof(tn), "%s", type_name(target));
+    checker_error(c, line,
+        "%s cannot produce '%s' from unchecked bits — it carries an enum, and a "
+        "value outside the declared variants would silently take the last arm of an "
+        "exhaustive switch. Match on the integer and assign the variant explicitly, "
+        "or pass a constant that names a declared variant",
+        what, tn);
+}
+
 /* Spelling of a comparison operator, for diagnostics. */
 static const char *compare_op_spelling(TokenType op) {
     if (op == TOK_EQEQ)   return "==";
@@ -891,6 +969,131 @@ static Type *int_retype_target(Type *t) {
 }
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
+
+/* The integer destination a value ultimately lands in: the type itself, or the
+ * inner integer of an optional-of-integer (a `?u32` destination stores into a
+ * `u32` payload). NULL when the destination is not an integer at all. */
+static Type *unsigned_int_destination(Type *t) {
+    if (!t) return NULL;
+    Type *e = type_unwrap_distinct(t);
+    if (!e) return NULL;
+    if (type_dispatch_kind(e) == TYPE_OPTIONAL && e->optional.inner)
+        e = type_unwrap_distinct(e->optional.inner);
+    if (!e) return NULL;
+    TypeKind k = type_dispatch_kind(e);
+    if (k == TYPE_U8 || k == TYPE_U16 || k == TYPE_U32 || k == TYPE_U64 ||
+        k == TYPE_USIZE || k == TYPE_UINT)
+        return e;
+    return NULL;
+}
+
+/* BUG-842: is `value` a compile-time NEGATIVE constant landing in an UNSIGNED
+ * destination?
+ *
+ * ZER's stated rule is "no implicit narrowing or sign conversion", and
+ * `is_literal_compatible` implements exactly that — its negative-literal arm
+ * returns false for every unsigned TypeKind. But at all eight value-flow sinks
+ * that arm was UNREACHABLE for u32/u64/usize, because `-1` is itself TYPED u32
+ * (unary minus returns its operand's type), so `type_equals(u32, u32)` short-
+ * circuited the chain before the literal check ran. The result was a rule that
+ * fired for some widths and not others:
+ *     u8  b = -1;   // correctly REJECTED  ("cannot initialize 'u8' with 'u32'")
+ *     u16 c = -300; // correctly REJECTED
+ *     u32 a = -1;   // ACCEPTED -> 4294967295
+ *     u64 g = -1;   // ACCEPTED -> 18446744073709551615
+ * and the same asymmetry at assignment, call-argument and return position.
+ *
+ * A width-dependent rule is a bug whichever way it is resolved; this resolves it
+ * as a TIGHTENING, so the guarantee holds at every width. `@bitcast(u32, -1)`,
+ * `0xFFFFFFFF` and a runtime negation remain the explicit routes to an all-ones
+ * value.
+ *
+ * Gated on `is_pure_int_literal_expr`, so only expressions with no variable
+ * operands are folded — a runtime value is never judged here. */
+/* Does this pure-literal tree contain an explicit unary `-`? */
+static bool literal_tree_has_unary_minus(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_UNARY)
+        return e->unary.op == TOK_MINUS ||
+               literal_tree_has_unary_minus(e->unary.operand);
+    if (e->kind == NODE_BINARY)
+        return literal_tree_has_unary_minus(e->binary.left) ||
+               literal_tree_has_unary_minus(e->binary.right);
+    return false;
+}
+/* Does it contain a literal above INT64_MAX? `eval_const_expr` folds in int64,
+ * so such an operand makes the folded SIGN meaningless — `0xDEADBEEFCAFEBABE`
+ * reads back as a negative number while being a perfectly good u64 constant. */
+static bool literal_tree_has_huge_operand(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_INT_LIT)
+        return e->int_lit.value > (uint64_t)INT64_MAX;
+    if (e->kind == NODE_UNARY)
+        return literal_tree_has_huge_operand(e->unary.operand);
+    if (e->kind == NODE_BINARY)
+        return literal_tree_has_huge_operand(e->binary.left) ||
+               literal_tree_has_huge_operand(e->binary.right);
+    return false;
+}
+
+static bool const_negative_into_unsigned(Node *value, Type *target) {
+    if (!value || !unsigned_int_destination(target)) return false;
+    if (!is_pure_int_literal_expr(value)) return false;
+    /* Require an explicit `-` in the source. A bare large literal is NOT a
+     * negative constant even though the int64 fold reports one — measured: the
+     * first draft of this rule rejected `u64 y = 0xDEADBEEFCAFEBABE;` and six
+     * other valid corpus programs for exactly that reason. The narrower rule
+     * costs a little coverage (`u32 a = 1 - 2;` still slips, folding negative
+     * without a unary minus) and buys zero false positives, which is the right
+     * trade for a TIGHTENING whose whole justification is consistency. */
+    if (!literal_tree_has_unary_minus(value)) return false;
+    if (literal_tree_has_huge_operand(value)) return false;
+    int64_t v = eval_const_expr(value);
+    if (v == CONST_EVAL_FAIL) return false;
+    return v < 0;
+}
+
+/* THE value-flow compatibility question — "may a value of type `vt`, written as
+ * the expression `value`, flow into a destination of type `target`?"
+ *
+ * BUG-842 refactor: this exact three-condition chain
+ *     !type_equals(target, vt) && !can_implicit_coerce(vt, target) &&
+ *     !is_literal_compatible(value, target)
+ * was written out at EIGHT sinks — designated-init field, assignment, call
+ * argument, orelse fallback, var-decl init, return, spawn argument and
+ * global-var init. Eight copies of one question is the multi-site shape that
+ * CLAUDE.md names as the #1 recurring bug class, and it is what let the negative
+ * literal above stay accepted at every one of them. One query now; each site
+ * keeps its own wording for the error it raises. */
+static bool value_flows_to(Node *value, Type *vt, Type *target) {
+    if (const_negative_into_unsigned(value, target)) return false;
+    if (type_equals(target, vt)) return true;
+    if (can_implicit_coerce(vt, target)) return true;
+    if (is_literal_compatible(value, target)) return true;
+    return false;
+}
+
+/* The negative-constant rejection needs its OWN wording: the generic
+ * type-mismatch message at each sink would print `'u32' with 'u32'` — the same
+ * spelling on both sides — because the negation really is u32-typed. A message
+ * that cannot express the difference it reports is worse than the hole it
+ * replaced (the lesson BUG-830 recorded). Returns true when it handled the
+ * diagnosis, so the caller skips its generic message. */
+static bool report_negative_const_flow(Checker *c, Node *value, Type *target,
+                                       int line, const char *what) {
+    if (!const_negative_into_unsigned(value, target)) return false;
+    long long v = (long long)eval_const_expr(value);
+    /* type_name() rotates only TWO static buffers — capture before formatting
+     * (CLAUDE.md "type_name() uses 2-buffer rotation"). */
+    char tn[96];
+    snprintf(tn, sizeof(tn), "%s", type_name(target));
+    checker_error(c, line,
+        "%s: negative constant %lld does not fit unsigned type '%s' — ZER has no "
+        "implicit sign conversion. Use @bitcast(%s, %lld) for the bit pattern, or "
+        "write the value directly",
+        what, v, tn, tn, v);
+    return true;
+}
 
 /* BUG-392: Build a string key from an expression for union switch locking.
  * Same pattern as zercheck's handle_key_from_expr.
@@ -2757,9 +2960,9 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                  * Same question, second sink. */
                 check_inttoptr_dest_volatile(c, df->value, ft, line);
                 Type *vt = checker_get_type(c, df->value);
-                if (vt && ft && !type_equals(ft, vt) &&
-                    !can_implicit_coerce(vt, ft) &&
-                    !is_literal_compatible(df->value, ft)) {
+                if (vt && ft && !value_flows_to(df->value, vt, ft) &&
+                    !report_negative_const_flow(c, df->value, ft, line,
+                                                "struct initializer")) {
                     checker_error(c, line,
                         "field '.%.*s' expects '%s', got '%s'",
                         (int)df->name_len, df->name,
@@ -6632,9 +6835,9 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
-            if (!type_equals(target, value) &&
-                !can_implicit_coerce(value, target) &&
-                !is_literal_compatible(node->assign.value, target)) {
+            if (!value_flows_to(node->assign.value, value, target) &&
+                !report_negative_const_flow(c, node->assign.value, target,
+                                            node->loc.line, "assignment")) {
                 checker_error(c, node->loc.line,
                     "cannot assign '%s' to '%s'",
                     type_name(value), type_name(target));
@@ -7778,10 +7981,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
 
-                    if (!type_equals(param, arg) &&
-                        !can_implicit_coerce(arg, param) &&
-                        !is_literal_compatible(node->call.args[i], param) &&
-                        !slice_to_ptr_ok) {
+                    if (!value_flows_to(node->call.args[i], arg, param) &&
+                        !slice_to_ptr_ok &&
+                        !report_negative_const_flow(c, node->call.args[i], param,
+                                                    node->loc.line, "argument")) {
                         checker_error(c, node->loc.line,
                             "argument %u: expected '%s', got '%s'",
                             i + 1, type_name(param), type_name(arg));
@@ -9130,9 +9333,9 @@ static Type *check_expr(Checker *c, Node *node) {
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
-                if (!type_equals(unwrapped, fallback) &&
-                    !can_implicit_coerce(fallback, unwrapped) &&
-                    !is_literal_compatible(node->orelse.fallback, unwrapped)) {
+                if (!value_flows_to(node->orelse.fallback, fallback, unwrapped) &&
+                    !report_negative_const_flow(c, node->orelse.fallback, unwrapped,
+                                                node->loc.line, "orelse fallback")) {
                     checker_error(c, node->loc.line,
                         "orelse fallback type '%s' doesn't match '%s'",
                         type_name(fallback), type_name(unwrapped));
@@ -9715,6 +9918,10 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-843: an ENUM target would forge an out-of-variant value. */
+                check_enum_forge(c, node->intrinsic.arg_count > 0 ?
+                                 node->intrinsic.args[0] : NULL,
+                                 result, node->loc.line, "@bitcast");
                 /* validate same width */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
@@ -9843,6 +10050,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "@truncate target must be an integer type, got '%s'", type_name(result));
                 }
+                /* BUG-843: an ENUM target would forge an out-of-variant value. */
+                check_enum_forge(c, node->intrinsic.arg_count > 0 ?
+                                 node->intrinsic.args[0] : NULL,
+                                 result, node->loc.line, "@truncate");
             } else {
                 result = ty_void;
             }
@@ -12769,9 +12980,9 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            if (!type_equals(type, init_type) &&
-                !can_implicit_coerce(init_type, type) &&
-                !is_literal_compatible(node->var_decl.init, type)) {
+            if (!value_flows_to(node->var_decl.init, init_type, type) &&
+                !report_negative_const_flow(c, node->var_decl.init, type,
+                                            node->loc.line, "initializer")) {
                 /* RF6: better error for null used with non-optional type */
                 if (node->var_decl.init->kind == NODE_NULL_LIT) {
                     checker_error(c, node->loc.line,
@@ -14983,9 +15194,9 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             if (c->current_func_ret) {
-                if (!type_equals(c->current_func_ret, ret_type) &&
-                    !can_implicit_coerce(ret_type, c->current_func_ret) &&
-                    !is_literal_compatible(node->ret.expr, c->current_func_ret)) {
+                if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret) &&
+                    !report_negative_const_flow(c, node->ret.expr, c->current_func_ret,
+                                                node->loc.line, "return value")) {
                     checker_error(c, node->loc.line,
                         "return type '%s' doesn't match function return type '%s'",
                         type_name(ret_type), type_name(c->current_func_ret));
@@ -16404,9 +16615,9 @@ static void check_stmt(Checker *c, Node *node) {
                         typemap_set(c, node->spawn_stmt.args[i], param_type);
                     }
                 }
-                if (!type_equals(param_type, arg_type) &&
-                    !can_implicit_coerce(arg_type, param_type) &&
-                    !is_literal_compatible(node->spawn_stmt.args[i], param_type)) {
+                if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type) &&
+                    !report_negative_const_flow(c, node->spawn_stmt.args[i], param_type,
+                                                node->loc.line, "spawn argument")) {
                     checker_error(c, node->loc.line,
                         "spawn argument %d: expected '%s', got '%s'",
                         i + 1, type_name(param_type), type_name(arg_type));
@@ -20602,9 +20813,9 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     "global arrays must use literal initializers",
                     (int)decl->var_decl.name_len, decl->var_decl.name);
             }
-            if (!type_equals(type, init) &&
-                !can_implicit_coerce(init, type) &&
-                !is_literal_compatible(decl->var_decl.init, type)) {
+            if (!value_flows_to(decl->var_decl.init, init, type) &&
+                !report_negative_const_flow(c, decl->var_decl.init, type,
+                                            decl->loc.line, "initializer")) {
                 checker_error(c, decl->loc.line,
                     "cannot initialize '%.*s' of type '%s' with '%s'",
                     (int)decl->var_decl.name_len, decl->var_decl.name,

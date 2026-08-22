@@ -1,0 +1,5 @@
+// zerc-flags: --stack-limit abc
+// expect-error: --stack-limit expects a positive byte count
+// BUG-844: atoi mapped it to 0, which reads as "no limit" — the tool then
+// affirms a stack budget it never checked.
+u32 main() { return 0; }

@@ -1,0 +1,14 @@
+// expect-error: carries an enum
+// BUG-843: `@bitcast(State, 7)` produced an out-of-variant enum, and the
+// exhaustive switch then silently ran its LAST arm (`elide_compare` enters the
+// final arm unconditionally because the remaining variant is the only one left).
+enum State { idle, running, done }
+u32 main() {
+    u32 x = 7;
+    State s = @bitcast(State, x);
+    switch (s) {
+        .idle => { return 10; }
+        .running => { return 11; }
+        .done => { return 12; }
+    }
+}

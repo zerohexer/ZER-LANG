@@ -1,0 +1,21 @@
+// BUG-865 support module: three spawn targets, all thread-safe on their own
+// (a `shared struct` is auto-locked), so nothing here can be rejected by the
+// data-race scan and the only thing under test is the NAME the emitter uses.
+shared struct Acc { u32 total; u32 hits; }
+Acc acc;
+
+void tick() {
+    acc.hits = acc.hits + 1;
+}
+
+void add(u32 n) {
+    acc.total = acc.total + n;
+}
+
+u32 read_total() {
+    return acc.total;
+}
+
+u32 read_hits() {
+    return acc.hits;
+}

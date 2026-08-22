@@ -5,6 +5,80 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23l — BUG-865: `spawn <imported function>` did not link, and a doc that claimed UB where ZER has none
+
+### BUG-865 — spawning an imported function emitted the UNMANGLED name
+
+```zer
+// safe_mod.zer
+shared struct Bag { u32 v; }
+Bag bag;
+void tick() { bag.v = 1; }
+
+// main.zer
+import safe_mod;
+u32 main() { spawn tick(); return 0; }
+```
+
+Emitted `void tick();` and a wrapper body calling `tick()` — while the module's
+definition is `safe_mod__tick`. Nothing defines `tick`, so the program does not
+LINK. The checker ACCEPTS it, and the data-race scan even resolves the imported
+body correctly (measured: it reaches into the module and reports a non-shared
+global there), so the only signal is `ld returned 1 exit status` with no source
+line. **Spawning an imported function was completely non-functional** — a
+documented combination of two documented features, in every form.
+
+The mangling rule is the one `emit_expr`'s NODE_IDENT arm already uses for an
+ordinary call: if the symbol carries a `module_prefix`, emit `prefix__name`. It
+was spelled RAW at four spawn sites — two forward-declaration arms and two
+wrapper bodies — which is why no single fix existed. Now one helper,
+`emit_spawn_target_name`, at all four.
+
+`test_modules/spawn_user.zer` + `spawn_mod.zer` exercise all three spawn forms,
+because each is a separate emission arm: fire-and-forget, scoped
+(ThreadHandle + join), and with arguments. Verified: the pre-fix compiler emits
+C that GCC refuses to link.
+
+**Adjacent, measured, NOT a bug:** `spawn mod.func()` is a PARSE error while
+`mod.func()` is accepted — the spawn parser takes a bare IDENT. The unqualified
+form works and resolves correctly across modules, so this is ergonomics, not
+safety; recorded in `docs/limitations.md` rather than fixed, because doing it
+properly needs the module prefix carried on the spawn node so the checker can
+validate it the way the qualified-call path does (stripping the qualifier in the
+parser would silently accept `spawn structvar.method()`).
+
+### `@ctz` / `@clz` were documented as UB at zero, and are not
+
+`docs/reference.md` said "`@ctz(x)` — count trailing zeros (UB if x=0)". Measured:
+the emitter produces `((x) == 0) ? 32 : __builtin_ctz(x)` — ZER guards it, and
+`@ctz(0)` / `@clz(0)` return the operand's WIDTH, at both 32 and 64 bits. The
+doc was describing the C builtin rather than what ZER emits, in the dangerous
+direction: it tells users ZER has undefined behavior where it does not, which
+contradicts the language's own "no undefined behavior" guarantee and invites a
+redundant guard. Corrected, with a compileable example under the reference-example
+gate.
+
+### Also measured this round, all CLEAN — recorded so nobody re-probes them
+
+- **Bit queries at boundaries** — `@ctz`/`@clz`/`@ffs`/`@popcount`/`@parity` at 0
+  and at max, 32- and 64-bit: all total and correct.
+- **Carry primitives at boundaries** — `@addc(max,1,0)`, `@addc(max,0,1)`,
+  `@subb(0,1,0)`, `@mulw(max,max)`: all correct including the carry/borrow flags.
+- **`@truncate` / `@bitcast` at boundaries**, and `uN`/`iN` wraparound (`u3` 7+7,
+  `i3` sign extension, `u21` shift): all correct.
+- **Bounds auto-guard across index widths** — u8/u16/u32/u64/usize/i8/i16/i32/i64,
+  with and without intervening statements: the guard is emitted in every case.
+  (An earlier probe here appeared to show a missing guard; that was a stale
+  `--emit-c` output file, not a compiler defect. Confirm the emitted file is
+  fresh before reading it.)
+- **Cross-module escape summaries** — `mod.lookup(&local)` returning a global is
+  accepted, `mod.view(&local)` returning a param view is rejected; cross-module
+  leak and UAF are both caught.
+
+`make check` exit 0, all eight gates green.
+
+---
+
 ## Session 2026-08-23k — BUG-864: `@saturate` wrapped at the one boundary it exists to guard
 
 `@saturate` is the intrinsic ZER tells users to reach for when they want a

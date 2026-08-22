@@ -2130,15 +2130,36 @@ u32 net = @bswap32(host);
 ### @popcount(x), @ctz(x), @clz(x), @parity(x), @ffs(x)
 
 **DESCRIPTION**
-Bit query operations. All return `u32`.
+Bit query operations. All return `u32`, and all are TOTAL — every input has a
+defined answer, `0` included.
 - `@popcount(x)` — count 1-bits
-- `@ctz(x)` — count trailing zeros (UB if x=0)
-- `@clz(x)` — count leading zeros (UB if x=0)
+- `@ctz(x)` — count trailing zeros; **`x = 0` gives the operand's WIDTH** (32 or 64)
+- `@clz(x)` — count leading zeros; **`x = 0` gives the operand's WIDTH** (32 or 64)
 - `@parity(x)` — 0=even / 1=odd
-- `@ffs(x)` — position of lowest 1-bit, 1-indexed (0 if x=0)
+- `@ffs(x)` — position of lowest 1-bit, 1-indexed; `x = 0` gives 0
 
 Input must be integer. Width-dispatched (ll suffix for 64-bit inputs).
-Emits GCC `__builtin_*` / `__builtin_*ll`.
+Emits GCC `__builtin_*` / `__builtin_*ll` — but NOT bare: `__builtin_ctz(0)` and
+`__builtin_clz(0)` are undefined in C, so ZER emits the zero test alongside
+(`(x) == 0 ? 32 : __builtin_ctz(x)`). This entry used to say "UB if x=0",
+describing the C builtin rather than what ZER emits; no guard of your own is
+needed, and ZER has no undefined behavior here.
+
+```zer
+// audit: check
+i32 printf(const *u8 fmt, ...);
+volatile u32 zero = 0;
+volatile u64 wide = 0;
+
+u32 main() {
+    if (@ctz(zero) != 32) { return 1; }     // width, not UB
+    if (@clz(zero) != 32) { return 2; }
+    if (@ffs(zero) != 0)  { return 3; }
+    if (@ctz(wide) != 64) { return 4; }     // 64-bit operand -> 64
+    if (@popcount(zero) != 0) { return 5; }
+    return 0;
+}
+```
 
 ---
 

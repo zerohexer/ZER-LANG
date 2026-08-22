@@ -5,6 +5,40 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `spawn mod.func()` is a parse error while `mod.func()` is accepted (LOW, ergonomics)
+
+**Symptom (measured 2026-08-23):**
+
+```zer
+import store;
+u32 main() {
+    store.bump();          // OK — qualified call
+    spawn store.bump();    // error: expected '(' after spawn function name at '.'
+    return 0;
+}
+```
+
+The unqualified form works and is correct across modules — `spawn bump();`
+resolves the imported function, the data-race scan reaches into the module's
+body, and (since BUG-865) the emitter mangles the name properly. So this is
+ergonomics and a documentation inconsistency, not a safety gap.
+
+**Why the one-line parser fix is wrong.** `parse_statement`'s spawn arms read a
+single `TOK_IDENT` as the target name. Accepting `IDENT . IDENT` and keeping
+only the second part would also silently accept `spawn structvar.method()`,
+stripping the receiver and spawning a global that happens to share the method's
+name. The qualified-CALL path avoids exactly this by verifying `mod__func` exists
+in the global scope BEFORE rewriting (checker.c ~7560), and the parser has no
+scope to do that with.
+
+**Fix sketch.** Carry the module prefix on the spawn node
+(`spawn_stmt.module_name` / `_len`, defaulting NULL) and resolve it in the
+checker with the same `mod__func` existence test the call path uses, erroring if
+the prefix is not a module. Then `emit_spawn_target_name` already does the right
+thing with the resolved symbol.
+
+---
+
 ## OPEN — a call returning a view of a PARAMETER is leak-tracked as a fresh allocation (LOW, over-rejection)
 
 **Symptom (measured 2026-08-23, still live):**

@@ -4904,6 +4904,30 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
 
 static void emit_type(Emitter *e, Type *t); /* forward decl */
 
+/* BUG-865: the C name of a spawn target, module-mangled when it is imported.
+ *
+ * `spawn tick();` where `tick` comes from `import safe_mod` emitted a forward
+ * declaration `void tick();` and a wrapper body calling `tick()` — the
+ * UNMANGLED name — while the module's definition is `safe_mod__tick`. Nothing
+ * defines `tick`, so the program does not LINK. The checker accepts it (the
+ * data-race scan even resolves the imported body correctly), so the only
+ * signal is `ld returned 1 exit status` with no source line: spawning an
+ * imported function was completely non-functional.
+ *
+ * The rule is the one `emit_expr`'s NODE_IDENT arm already uses for an ordinary
+ * call — if the symbol carries a `module_prefix`, emit `prefix__name`. It was
+ * spelled raw at FOUR spawn sites (two forward-declaration arms, two wrapper
+ * bodies), which is why no single fix existed. One helper, four call sites. */
+static void emit_spawn_target_name(Emitter *e, const char *name, size_t len) {
+    Symbol *s = scope_lookup(e->checker->global_scope, name, (uint32_t)len);
+    if (s && s->module_prefix) {
+        emit(e, "%.*s__%.*s", (int)s->module_prefix_len, s->module_prefix,
+             (int)len, name);
+        return;
+    }
+    emit(e, "%.*s", (int)len, name);
+}
+
 static void emit_spawn_wrappers(Emitter *e) {
     if (e->spawn_wrapper_count == 0) return;
 
@@ -4918,7 +4942,10 @@ static void emit_spawn_wrappers(Emitter *e) {
             /* Emit return type + name + params */
             Type *ft = fsym->type;
             emit_type(e, ft->func_ptr.ret);
-            emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, " ");
+            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                   sn->spawn_stmt.func_name_len);
+            emit(e, "(");
             for (uint32_t pi = 0; pi < ft->func_ptr.param_count; pi++) {
                 if (pi > 0) emit(e, ", ");
                 emit_type(e, ft->func_ptr.params[pi]);
@@ -4931,7 +4958,10 @@ static void emit_spawn_wrappers(Emitter *e) {
                 Type *ret = checker_get_type(e->checker, fn);
                 if (ret && ret->kind == TYPE_FUNC_PTR) {
                     emit_type(e, ret->func_ptr.ret);
-                    emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    emit(e, " ");
+                    emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                           sn->spawn_stmt.func_name_len);
+                    emit(e, "(");
                     for (uint32_t pi = 0; pi < ret->func_ptr.param_count; pi++) {
                         if (pi > 0) emit(e, ", ");
                         emit_type(e, ret->func_ptr.params[pi]);
@@ -4939,8 +4969,10 @@ static void emit_spawn_wrappers(Emitter *e) {
                     emit(e, ");\n");
                 } else {
                     /* Fallback: just emit void func_name(); */
-                    emit(e, "void %.*s();\n",
-                         (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    emit(e, "void ");
+                    emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                           sn->spawn_stmt.func_name_len);
+                    emit(e, "();\n");
                 }
             }
         }
@@ -4998,7 +5030,10 @@ static void emit_spawn_wrappers(Emitter *e) {
         emit(e, "static void *_zer_spawn_wrap_%d(void *_raw) {\n", sid);
         if (ac > 0) {
             emit(e, "    struct _zer_spawn_args_%d *_a = (struct _zer_spawn_args_%d *)_raw;\n", sid, sid);
-            emit(e, "    %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, "    ");
+            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                   sn->spawn_stmt.func_name_len);
+            emit(e, "(");
             for (int i = 0; i < ac; i++) {
                 if (i > 0) emit(e, ", ");
                 emit(e, "_a->a%d", i);
@@ -5006,7 +5041,10 @@ static void emit_spawn_wrappers(Emitter *e) {
             emit(e, ");\n");
             emit(e, "    free(_a);\n");
         } else {
-            emit(e, "    %.*s();\n", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, "    ");
+            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                   sn->spawn_stmt.func_name_len);
+            emit(e, "();\n");
         }
         emit(e, "    return NULL;\n");
         emit(e, "}\n");

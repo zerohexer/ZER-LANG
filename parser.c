@@ -316,6 +316,32 @@ static TypeNode *parse_func_ptr_2c(Parser *p) {
         ret_type = new_type_node(p, TYNODE_VOID);
     }
 
+    /* BUG-855: `*(u32, u32) -> u32 [4] ops;` — an ARRAY of funcptrs, the
+     * typedef-free 2C form documented in reference.md and CLAUDE.md. The
+     * `[4]` is lexically adjacent to the RETURN type, so parse_type above
+     * swallowed it and produced `fn(u32,u32) -> u32[4]` — a funcptr
+     * RETURNING an array, which then failed at the use site with
+     * "cannot index type 'fn(u32) -> u32[3]'". Re-associate: the array
+     * levels belong to the DECLARATION, not the return type.
+     *
+     * This is unambiguous, not a heuristic: a ZER function cannot return an
+     * array at all ("cannot return array type — use a struct wrapper"), so
+     * `-> T[N]` has no other meaning it could be stealing. Multi-dim works
+     * for free — the innermost element is replaced and the chain is kept,
+     * so `-> u32[3][4]` gives 4 arrays of 3 funcptrs, matching ZER's
+     * existing `T[3][4]` reading. */
+    TypeNode *arr_outer = NULL;      /* outermost array level, if any */
+    TypeNode *arr_innermost = NULL;  /* level whose elem becomes the funcptr */
+    if (ret_type->kind == TYNODE_ARRAY) {
+        arr_outer = ret_type;
+        arr_innermost = ret_type;
+        while (arr_innermost->array.elem &&
+               arr_innermost->array.elem->kind == TYNODE_ARRAY) {
+            arr_innermost = arr_innermost->array.elem;
+        }
+        ret_type = arr_innermost->array.elem;   /* the real return type */
+    }
+
     TypeNode *t = new_type_node(p, TYNODE_FUNC_PTR);
     t->func_ptr.return_type = ret_type;
     t->func_ptr.param_count = param_count;
@@ -328,6 +354,10 @@ static TypeNode *parse_func_ptr_2c(Parser *p) {
             t->func_ptr.param_keeps = (bool *)arena_alloc(p->arena, param_count * sizeof(bool));
             memcpy(t->func_ptr.param_keeps, param_keeps, param_count * sizeof(bool));
         }
+    }
+    if (arr_outer) {
+        arr_innermost->array.elem = t;   /* array OF funcptr, not fn returning array */
+        return arr_outer;
     }
     return t;
 }

@@ -22,11 +22,17 @@ typedef void (*Action)(u32 input);
 }
 
 // Run a chain of validators — all must pass
-?u32 validate_all(u32 input, Validator[4] validators, u32 count) {
+// BUG-856: the element type is `?Validator`. An array of NON-null funcptrs
+// is auto-zeroed to NULL and ZER has no array initializer to fill it, so an
+// unset slot would be a call through address 0. An unset slot now simply
+// leaves the value unchanged.
+?u32 validate_all(u32 input, ?Validator[4] validators, u32 count) {
     u32 val = input;
     for (u32 i = 0; i < count; i += 1) {
         if (i >= 4) { break; }
-        val = validators[i](val) orelse { return null; };
+        if (validators[i]) |v| {
+            val = v(val) orelse { return null; };
+        }
     }
     return val;
 }
@@ -49,7 +55,7 @@ u32 main() {
     action_sum = 0;
 
     // Build validator chain
-    Validator[4] chain;
+    ?Validator[4] chain;
     chain[0] = validate_nonzero;
     chain[1] = validate_range;
     chain[2] = validate_even;

@@ -1,0 +1,83 @@
+/* BUG-858: `@size(x)` where x is a VARIABLE rather than a type.
+ *
+ * The name reaches the compiler as a plain identifier — the parser cannot tell
+ * a type name from a variable name — and BOTH emitter paths resolved it in the
+ * GLOBAL scope only. So:
+ *
+ *   - a LOCAL variable was never found, and the IR path fell through to a blind
+ *     `emit("struct %s", <the source text>)`, producing `sizeof(struct buf)`.
+ *     GCC then said "invalid application of 'sizeof' to incomplete type
+ *     'struct buf'" — loud, but naming a struct the user never wrote.
+ *
+ *   - a local SHADOWING a struct name was SILENT AND WRONG: with `struct Big`
+ *     in scope and a local `u8[2] Big`, the global lookup found the STRUCT and
+ *     `@size(Big)` returned 32 for a 2-byte array. Compiled clean, ran clean,
+ *     wrong number — and a @size feeding a copy length is a buffer overflow.
+ *     That is the case the `shadowed` block below pins.
+ *
+ * The fix resolves the name in the CHECKER, where the local scope is still
+ * live, letting the innermost binding win as every other identifier does.
+ * `@size(TypeName)` is unchanged and is re-checked here so the fix cannot have
+ * been bought by breaking it.
+ */
+
+struct Big { u64 a; u64 b; u64 c; u64 d; }   /* 32 bytes */
+packed struct P { u8 a; u32 b; }             /* 5 bytes, packed */
+union U { u32 i; f32 f; }
+
+struct Pair  { u32 a; u32 b; }
+struct Small { u8 x; u32 y; }                /* y at offset 4 */
+struct Wide  { u64 pad; u32 y; }             /* y at offset 8 */
+
+u32 main() {
+    /* --- @size of a TYPE: unchanged --- */
+    if (@size(Big) != 32) { return 1; }
+    if (@size(u32) != 4) { return 2; }
+    if (@size(P) != 5) { return 3; }
+    if (@size(U) < 4) { return 4; }
+
+    /* --- @size of a local VARIABLE: the array case that emitted
+     *     `sizeof(struct buf)` --- */
+    u8[4] buf;
+    if (@size(buf) != 4) { return 5; }
+
+    u64[8] wide;
+    if (@size(wide) != 64) { return 6; }
+
+    /* --- @size of a local of struct type --- */
+    Pair p;
+    if (@size(p) != 8) { return 7; }
+
+    /* --- @size of a scalar local --- */
+    u16 half;
+    if (@size(half) != 2) { return 8; }
+
+    /* --- THE SILENT ONE: a local shadowing a struct name. The variable is
+     *     2 bytes; the struct is 32. Pre-fix this returned 32. --- */
+    {
+        u8[2] Big;
+        Big[0] = 1;
+        if (@size(Big) != 2) { return 9; }
+    }
+
+    /* --- and outside that scope the name means the TYPE again --- */
+    if (@size(Big) != 32) { return 10; }
+
+    /* --- @offset is the SIBLING SITE, same defect, nastier payload. Its
+     *     emitter arm was a blind `emit("struct %s", <the source text>)` too,
+     *     so with a local `Small Big` shadowing `struct Big` it emitted
+     *     `offsetof(struct Big, y)` — 8, where the answer is 4. The CHECKER had
+     *     it right all along (it validated the field against Small); only the
+     *     emitter re-decided. An offset feeding @container or pointer
+     *     arithmetic makes that a memory-corruption bug, not a wrong number. */
+    if (@offset(Small, y) != 4) { return 11; }
+    if (@offset(Wide, y) != 8) { return 12; }
+    {
+        Small Wide;              /* shadows struct Wide, whose y is at 8 */
+        Wide.x = 1;
+        if (@offset(Wide, y) != 4) { return 13; }
+    }
+    if (@offset(Wide, y) != 8) { return 14; }
+
+    return 0;
+}

@@ -6,15 +6,18 @@ u32 double_val(u32 x) { return x * 2; }
 u32 triple_val(u32 x) { return x * 3; }
 u32 square_val(u32 x) { return x * x; }
 
-UnaryOp[3] ops;
+// BUG-856: an array of NON-null funcptrs is auto-zeroed to NULL and ZER has no
+// array initializer to fill it, so every element would start out holding the
+// one value its own type forbids. `?UnaryOp` + an unwrap is the sound spelling.
+?UnaryOp[3] ops;
 
 u32 main() {
     ops[0] = double_val;
     ops[1] = triple_val;
     ops[2] = square_val;
 
-    if (ops[0](5) != 10) { return 1; }
-    if (ops[1](5) != 15) { return 2; }
-    if (ops[2](5) != 25) { return 3; }
+    if (ops[0]) |f| { if (f(5) != 10) { return 1; } } else { return 1; }
+    if (ops[1]) |g| { if (g(5) != 15) { return 2; } } else { return 2; }
+    if (ops[2]) |h| { if (h(5) != 25) { return 3; } } else { return 3; }
     return 0;
 }

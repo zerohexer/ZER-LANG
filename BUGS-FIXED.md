@@ -5,6 +5,165 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23g — BUG-855..859: the non-null carrier class, and two silent wrong-answer intrinsics
+
+Five fixes from one thread: a documented syntax that never parsed, and pulling
+that thread found a NULL-safety rule enforced at one carrier out of five, an
+invalid-C emission, and two intrinsics that returned the wrong NUMBER without a
+word from anyone.
+
+### BUG-855 — `*(u32, u32) -> u32 [4] ops` never parsed as an array (parser.c)
+
+The typedef-free 2C array-of-funcptr form is documented in `docs/reference.md`
+and in CLAUDE.md's quick reference. It did not work. The `[4]` sits next to the
+RETURN type, so `parse_type` swallowed it and `parse_func_ptr_2c` built
+`fn(u32,u32) -> u32[4]` — a funcptr RETURNING an array — which failed later at
+the use site with `cannot index type 'fn(u32, u32) -> u32[4]'`, a message that
+points nowhere near the declaration.
+
+Fixed by re-associating the array levels onto the DECLARATION: if the parsed
+return type is `TYNODE_ARRAY`, walk to the innermost element, make that the
+funcptr's return type, and splice the funcptr into the innermost `array.elem`.
+Multi-dim falls out for free. **Unambiguous, not a heuristic** — a ZER function
+cannot return an array at all (`cannot return array type — use a struct
+wrapper`), so `-> T[N]` had no other meaning to steal.
+
+### BUG-856 — the non-null-pointer rule was enforced at ONE carrier in five (checker.c)
+
+`*T` and `*(args) -> R` are NON-NULL types; that split is the entire basis of
+`*T` vs `?*T`. A declaration with no initializer is auto-zeroed, so it starts out
+holding the one value its type forbids. The rule existed — as THREE hand-rolled
+copies. Measured coverage before the fix:
+
+| carrier | `*T` data pointer | `*(args) -> R` funcptr |
+|---|---|---|
+| local var-decl | rejected | rejected |
+| **global var-decl** | rejected | **ACCEPTED** |
+| **array of either** | n/a (parses as ptr-to-array) | **ACCEPTED** |
+| struct field | **ACCEPTED** | **ACCEPTED** |
+
+A global funcptr and any funcptr array auto-zeroed to NULL and calling one
+emitted a **raw indirect call through address 0** in the C. Hosted it dies
+(measured exit 133 — GCC turns the provably-NULL call into a trap); on bare metal
+with no MMU there is no fault at all, the call just jumps to the reset vector.
+No diagnostic at compile time or run time.
+
+Now ONE query — `nonnull_zero_hole` — at both var-decl sites, recursing through
+`distinct` and `ARRAY`, stopping at `OPTIONAL` (nullable by declaration) and
+`SLICE` (a zero slice is `{NULL,0}`, safe because every access is length-checked).
+The two sites call the same `check_nonnull_zero_init`, so the funcptr arm cannot
+go missing from one of them again.
+
+**The ARRAY diagnostic is deliberately different.** ZER has no array-literal
+initializer for ANY type (measured: `u32[3] a = {1,2,3}` is a parse error), so an
+array of a non-null type has no valid form at all — telling the user to add an
+initializer would send them after something that does not exist. It names `?T[N]`
+instead, which works as of BUG-857.
+
+**Corpus cost, paid not dodged:** 4 positive tests and 2 C unit tests declared
+non-null funcptr arrays or globals and were converted to the `?` spelling with an
+unwrap (`tests/zer/funcptr_array.zer`, `callback_system.zer`, `func_pipeline.zer`,
+`rust_tests/gen_funcptr_003.zer`, two `test_emit.c` cases). The
+`tests/test_conc_matrix.c` REACH grid's `array-element` cell needed the same
+change — and that one mattered for a second reason: with the non-null spelling
+the new rule would have rejected the cell on its own, turning every NEGATIVE cell
+in that row green for the wrong reason. Grid re-run after the change: 84/84, 0
+false negatives.
+
+**The one carrier still open is a struct FIELD** — it has no declaration site to
+attach the rule to, and banning `*T` fields outright would reject 70 `*T` fields
+in 68 files plus 15 funcptr fields in 11 files, most of them correct code that
+always designated-initializes. Tracked as its own `## OPEN` entry in
+`docs/limitations.md` with the fix sketch (per-field init tracking on the CFG,
+same shape as `resource_initialized`).
+
+### BUG-857 — `?FuncPtr[N]` emitted invalid C (emitter.c)
+
+The array branch of `emit_type_and_name` peeled only `distinct`, so an array of
+NULLABLE funcptrs — the spelling BUG-856 now steers everyone toward — emitted
+`uint32_t (*)(uint32_t) ops[3]`: an abstract declarator with a name glued on. Not
+C. GCC rejected it, in both the 2A typedef and 2C inline forms.
+
+The cause was duplication: "emit a funcptr declarator with the name inside the
+parens" was written out FOUR times (bare, distinct, optional, optional-distinct)
+plus a fifth inside the array branch, and the array one knew about fewer wrappers
+than its siblings. Replaced with one peeler, `funcptr_under`, that strips every
+representation-preserving wrapper (`distinct` never changes representation; `?`
+uses the null sentinel) — five call sites, no fifth spelling to forget. Net −44
+lines.
+
+### BUG-858 — `@size(x)` and `@offset(x, f)` measured the WRONG THING, silently
+
+The argument arrives as a plain identifier — the parser cannot tell a type name
+from a variable name — and BOTH emitter paths resolved it in the **global scope
+only**. Two consequences:
+
+- A local variable was never found, and the IR path fell through to a blind
+  `emit("struct %s", <the source text>)`. `@size(buf)` for `u8[4] buf` emitted
+  `sizeof(struct buf)`; GCC said "incomplete type 'struct buf'" — loud, but
+  naming a struct the user never wrote.
+- **A local SHADOWING a type name was silent and wrong.** With `struct Big` in
+  scope and a local `u8[2] Big`, the global lookup found the STRUCT: `@size(Big)`
+  returned 32 for a 2-byte array. Compiled clean, ran clean, wrong number. A
+  `@size` feeding a copy length is a buffer overflow.
+
+`@offset` is the sibling site with the nastier payload: its CHECKER validated the
+field against the local variable's type all along (`Small` has `y`) while its
+EMITTER emitted `offsetof(struct Big, y)` — 8 where the answer is 4. An offset
+feeding `@container` or pointer arithmetic is memory corruption, not a wrong
+number.
+
+Fixed in the CHECKER, where the local scope is still live: resolve the name there,
+let the innermost binding win as every other identifier in the language does, and
+publish the resolved type on the ident node so the emitter cannot re-decide. Types
+are declarable only at global scope, so "found below global" is an exact test for
+"this is a value, not a type". The three hand-rolled `sizeof`/`offsetof` operand
+emitters (which disagreed with each other) collapsed into one
+`emit_sizeof_type`, and the blind fallback became a loud undeclared identifier.
+
+`@size(variable)` and `@offset(variable, field)` are now supported and documented
+— strictly more accurate than erroring, since the checker knew the answer.
+
+### BUG-859 — bit extraction through a pointer: the documented MMIO idiom (checker.c)
+
+CLAUDE.md's own "Hardware Support" example and reference.md's
+`reg[9..8]  // Extract bits 9:8`:
+
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+    u32 bits = reg[9..8];
+
+did not compile. `[hi..lo]` on a POINTER fell through to the SUB-SLICE path,
+where hi > lo is a bounds error: `slice start (9) is greater than end (8)`. Bit
+extraction only ever worked on a scalar VALUE, so firmware had to spell the deref
+by hand. (Recorded as a LOW doc mismatch since 2026-08; fixed here by the second
+option that entry proposed.)
+
+`check_expr`'s `NODE_SLICE` arm now rewrites `p[hi..lo]` to `(*p)[hi..lo]` when
+`p` is a single pointer to an integer, and falls into the existing scalar path —
+so the deref goes through the normal MMIO range/alignment machinery and there is
+no new node kind, IR op, or emission path to keep in sync. Sound because slicing
+a `*T` was already an error (a single pointer has no length), so the form had no
+competing meaning; `[*]T` sub-slicing goes through the `TYPE_SLICE` arm and is
+untouched. Reads and writes both work, at every pointee width.
+
+### Tests
+
+- `tests/zer/funcptr_array_forms.zer` — every array-of-funcptr spelling, 2A and
+  2C, including per-element nullness (BUG-855 + BUG-857)
+- `tests/zer_fail/funcptr_array_nonnull.zer`, `funcptr_global_nonnull.zer` — the
+  two carriers BUG-856 closed, each with `// expect-error:`
+- `tests/zer/size_of_variable.zer` — `@size`/`@offset` over types, variables, and
+  the shadowing case that returned the wrong number
+- `tests/zer/bit_extract_through_pointer.zer` — read and write through a pointer
+  at two widths, plus a re-check that `[*]T` sub-slicing still means ELEMENTS
+
+Every one was verified to FAIL on a from-`HEAD` `git archive` build before being
+trusted. `docs/reference.md` gained the array-must-be-nullable rule, the
+`@size`/`@offset` variable form, and the through-a-pointer bit-extract section,
+all as compileable examples under `tools/audit_reference_examples.sh`.
+
+---
+
 ## Session 2026-08-23f — BUG-854: the emitter's two SILENT give-up paths
 
 When `emit_rewritten_node` could not resolve a call's callee it emitted

@@ -755,3 +755,12 @@ checker.c:t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
 zercheck_ir.c:if (t->kind == TYNODE_OPTIONAL) return ir_tynode_is_ref_producing(t->optional.inner);
 zercheck_ir.c:if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
 zercheck_ir.c:t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
+# BUG-857 (2026-08-23): funcptr_under() in emitter.c IS the wrapper peeler — it
+# must observe TYPE_DISTINCT and TYPE_OPTIONAL as raw kinds in order to strip
+# them, so routing it through type_dispatch_kind() (which strips distinct
+# itself) would make the loop unable to see what it is there to remove. The
+# TYPE_FUNC_PTR line is its terminating case, reached only after every wrapper
+# has already been peeled by the two lines above it.
+emitter.c:if (t->kind == TYPE_DISTINCT) { t = type_unwrap_distinct(t); continue; }
+emitter.c:if (t->kind == TYPE_FUNC_PTR) return t;
+emitter.c:if (t->kind == TYPE_OPTIONAL) { t = t->optional.inner; continue; }

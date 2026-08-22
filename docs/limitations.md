@@ -5,6 +5,65 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — a non-null pointer / funcptr as a STRUCT FIELD is auto-zeroed to NULL (MEDIUM, soundness — the one carrier BUG-856 did not close)
+
+**Symptom (measured 2026-08-23, still live):**
+
+```zer
+struct Task   { u32 id; }
+struct Holder { *Task p; }              // *T says NON-NULL
+u32 main() { Holder h; return h.p.id; } // ACCEPTED — h.p is NULL
+```
+
+```zer
+struct Ops { *(u32, u32) -> u32 f; }
+u32 main() { Ops o; return o.f(1, 2); } // ACCEPTED — raw call through 0
+```
+
+Both compile clean and both dereference NULL. Hosted they die (measured exit 133 —
+GCC turns the provably-NULL indirect call into a trap instruction); on bare metal
+with no MMU there is no fault at all: the load reads whatever is mapped at address
+0, and the call jumps to the reset vector. **No diagnostic at compile time or run
+time.** This is the silent-on-bare-metal class.
+
+**Root cause.** `*T` and `*(args) -> R` are NON-NULL types — the entire basis of the
+`*T` / `?*T` split — but a struct is auto-zeroed, so a field of such a type starts
+out holding the one value its type forbids. BUG-856 unified the rule across the
+carriers that HAVE a declaration site to attach it to (local var-decl, global
+var-decl, and arrays of either, via `nonnull_zero_hole` in `checker.c`). A struct
+field has no such site: the type is written once in the struct declaration and the
+value comes into existence at every `Holder h;`, `pool.alloc(Holder)`,
+`alloc(Holder)`, array-of-Holder element, nested-struct field, and zeroed slice
+element.
+
+**Why the obvious fixes are wrong.**
+- *Ban `*T` fields outright, require `?*T`.* Measured corpus cost: **70 non-optional
+  `*T` fields in 68 files + 15 non-optional funcptr fields in 11 files** across
+  `tests/zer`, `tests/zer_fail`, `test_modules`, `rust_tests`, `zig_tests`,
+  `examples`, `lib`. Most are structs that are always designated-initialized, i.e.
+  correct code. Rejecting all 85 to catch the un-initialized minority is the wrong
+  trade.
+- *Require a designated initializer covering the field at every construction.* This
+  is the right SHAPE, but "every construction" is itself a multi-site set — and two
+  of its members (`pool.alloc`/`alloc` returning zeroed memory, and an array of the
+  struct) have no initializer syntax to satisfy, exactly as `nonnull_zero_hole`'s
+  array arm found. A partial version would over-reject with no workaround.
+
+**Fix sketch (the one that does not have those problems).** Treat it as a Model-2
+program-point property rather than a Model-4 declaration constraint: a struct value
+that comes into existence zeroed carries "field `p` is NULL" until an assignment or
+designated initializer covers it, and the field-read check consults that. That is a
+per-field init-tracking lattice over the same CFG `zercheck_ir.c` already walks, and
+it is the same shape as `resource_initialized` (BUG-847/849). Until then, the
+`?*T` field with an unwrap at the use site is the sound spelling and is
+what `docs/reference.md` recommends.
+
+**Tripwires.** `tests/zer_gaps/` is the right home for the two reproducers above;
+`tests/zer/funcptr_array_forms.zer` and `tests/zer_fail/funcptr_array_nonnull.zer`
+pin the carriers that ARE closed, so a regression in those is loud.
+
+---
+
 ## OPEN — harvest tracker: five `claude/vigilant-tesla-*` branches, verified against main 2026-08-22
 
 **Status: NOT implemented. This is a catalog, not a changelog.** Every row below was
@@ -1558,12 +1617,18 @@ four TypeNode kinds.
 bare-param-view relaxation (BUG-764) covers `return p[0..2];` but not a param view wrapped in a
 returned-by-value struct. Errs conservative → no soundness threat.
 
-### LOW Doc mismatch — bit-extraction on a `volatile *u32` MMIO register is over-rejected (`rvek5f` `00f3c2af`)
-CLAUDE.md's "Hardware Support" quick reference shows
-`volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];`, but `reg[hi..lo]` on a POINTER parses as a slice
-range → `error: slice start (9) is greater than end (8)`. Bit-extraction only works on a scalar VALUE.
-Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to show the deref form, or make
-`reg[hi..lo]` on a volatile scalar pointer auto-deref for bit-extraction.
+### ~~LOW Doc mismatch — bit-extraction on a `volatile *u32` MMIO register is over-rejected~~ (`rvek5f` `00f3c2af`) — **FIXED 2026-08-23 (BUG-859)**
+CLAUDE.md's "Hardware Support" quick reference showed
+`volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];`, but `reg[hi..lo]` on a POINTER parsed as a slice
+range → `error: slice start (9) is greater than end (8)`. Bit-extraction only worked on a scalar VALUE.
+**Fixed by the second option this entry proposed:** `check_expr`'s `NODE_SLICE` arm now rewrites
+`p[hi..lo]` to `(*p)[hi..lo]` when `p` is a single pointer to an INTEGER, then falls into the existing
+scalar path — so the deref goes through the normal MMIO range/alignment machinery and no new node kind,
+IR op, or emission path exists to keep in sync. Sound because slicing a `*T` was already an error (a
+single pointer has no length), so the form had no competing meaning; `[*]T` sub-slicing goes through the
+TYPE_SLICE arm and is untouched. Works for reads and writes at every pointee width.
+Regression: `tests/zer/bit_extract_through_pointer.zer` (verified to fail on a pre-fix build, and it
+re-checks `[*]T` sub-slicing so the fix cannot have been bought by breaking element semantics).
 
 ### Cross-references (already tracked elsewhere in this file — do NOT duplicate)
 - **HOLE-C / cross-block scoped-borrow, join-in-branch** (`rvek5f` `00f3c2af`) — **FIXED 2026-08-03.**

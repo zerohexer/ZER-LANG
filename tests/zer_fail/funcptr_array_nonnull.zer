@@ -1,0 +1,16 @@
+// expect-error: array of non-null function pointers
+// BUG-856: `*(args) -> ret` is a NON-NULL type — that is the whole basis of the
+// `*T` / `?*T` split. An array of them is auto-zeroed to NULL and ZER has no
+// array initializer to fill it (measured: `u32[3] a = {1,2,3}` is a parse error
+// for every element type), so every element starts out holding the one value
+// its type forbids.
+//
+// Before this rule the call below compiled to a raw indirect call through
+// address 0 in the emitted C: SIGSEGV/SIGILL hosted, a jump to the reset vector
+// on bare metal — no diagnostic at compile time OR run time on a target with no
+// MMU. The fix is `?*(u32) -> u32 [3]` plus an unwrap at the use site; see
+// tests/zer/funcptr_array_forms.zer.
+u32 main() {
+    *(u32, u32) -> u32 [3] ops;
+    return ops[0](1, 2);
+}

@@ -16,13 +16,18 @@ void inc(u32 n) { counter += n; }
 void dec(u32 n) { counter -= n; }
 
 u32 test_unary_chain() {
-    UnaryOp[3] ops;
+    // BUG-856: the element type is `?UnaryOp`, not `UnaryOp`. An array of
+    // NON-null funcptrs is auto-zeroed to NULL and ZER has no array
+    // initializer to fill it, so every element would start out holding the one
+    // value its own type forbids — and `ops[i](val)` compiled to a raw indirect
+    // call through address 0.
+    ?UnaryOp[3] ops;
     ops[0] = add1;
     ops[1] = mul2;
     ops[2] = sub3;
     u32 val = 10;
     for (u32 i = 0; i < 3; i += 1) {
-        val = ops[i](val);
+        if (ops[i]) |f| { val = f(val); }
     }
     // 10 → 11 → 22 → 19
     if (val != 19) { return 1; }
@@ -30,10 +35,12 @@ u32 test_unary_chain() {
 }
 
 u32 test_binary() {
-    BinOp[2] ops;
+    ?BinOp[2] ops;
     ops[0] = add;
     ops[1] = mul;
-    u32 r = ops[0](3, 4) + ops[1](3, 4);
+    u32 r = 0;
+    if (ops[0]) |f| { r += f(3, 4); }
+    if (ops[1]) |g| { r += g(3, 4); }
     // 7 + 12 = 19
     if (r != 19) { return 1; }
     return 0;
@@ -41,11 +48,11 @@ u32 test_binary() {
 
 u32 test_void_return() {
     counter = 100;
-    Action[2] acts;
+    ?Action[2] acts;
     acts[0] = inc;
     acts[1] = dec;
-    acts[0](50);
-    acts[1](20);
+    if (acts[0]) |f| { f(50); }
+    if (acts[1]) |g| { g(20); }
     if (counter != 130) { return 1; }
     return 0;
 }

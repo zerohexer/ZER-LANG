@@ -1246,16 +1246,56 @@ static void emit_type(Emitter *e, Type *t) {
 }
 
 /* emit type with variable name (handles arrays and func ptrs) */
+/* BUG-857: peel every wrapper that keeps a function pointer's C REPRESENTATION
+ * (a bare `ret (*)(params)`) and return the funcptr underneath, or NULL.
+ *
+ * `distinct` never changes representation, and `?FuncPtr` uses the NULL
+ * SENTINEL — so `FuncPtr`, `distinct FuncPtr`, `?FuncPtr`, `?distinct FuncPtr`
+ * and `distinct ?FuncPtr` all emit the same C declarator, one whose name must
+ * sit INSIDE the parens. That was written out as four near-identical blocks
+ * below plus a fifth inside the array branch, and the array one peeled only
+ * `distinct` — so `?FuncPtr[N]` (either syntax) emitted
+ * `uint32_t (*)(uint32_t) ops[3]`, an abstract declarator with a name glued on,
+ * which is not C. One peeler, five call sites, no fifth thing to forget. */
+static Type *funcptr_under(Type *t) {
+    for (int depth = 0; t && depth < 32; depth++) {
+        if (t->kind == TYPE_FUNC_PTR) return t;
+        if (t->kind == TYPE_DISTINCT) { t = type_unwrap_distinct(t); continue; }
+        if (t->kind == TYPE_OPTIONAL) { t = t->optional.inner; continue; }
+        return NULL;
+    }
+    return NULL;
+}
+
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t name_len) {
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
+
+    /* Any funcptr representation, however wrapped: ret (*name)(params).
+     * No array guard needed — funcptr_under returns NULL for an array, which
+     * falls through to the array branch below. */
+    {
+        Type *fp = funcptr_under(t);
+        if (fp) {
+            emit_type(e, fp->func_ptr.ret);
+            emit(e, " (*%.*s)(", (int)name_len, name);
+            for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_type(e, fp->func_ptr.params[i]);
+            }
+            emit(e, ")");
+            return;
+        }
+    }
 
     if (t->kind == TYPE_ARRAY) {
         /* collect all array dimensions, emit base type + name + all dims */
         Type *base = t;
         while (base->kind == TYPE_ARRAY) base = base->array.inner;
-        /* function pointer array: ret (*name[dim1][dim2])(params) */
-        Type *base_eff = type_unwrap_distinct(base);
-        if (base_eff->kind == TYPE_FUNC_PTR) {
+        /* function pointer array: ret (*name[dim1][dim2])(params) — including
+         * `?FuncPtr[N]`, whose null-sentinel representation is the same C
+         * declarator (BUG-857). */
+        Type *base_eff = funcptr_under(base);
+        if (base_eff) {
             emit_type(e, base_eff->func_ptr.ret);
             emit(e, " (*%.*s", (int)name_len, name);
             Type *dim = t;
@@ -1294,75 +1334,44 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
-    /* function pointer: ret (*name)(param1, param2, ...) */
-    if (t->kind == TYPE_FUNC_PTR) {
-        emit_type(e, t->func_ptr.ret);
-        emit(e, " (*%.*s)(", (int)name_len, name);
-        for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_type(e, t->func_ptr.params[i]);
-        }
-        emit(e, ")");
-        return;
-    }
-
-    /* distinct function pointer: unwrap distinct to get func ptr for name placement */
-    if (t->kind == TYPE_DISTINCT && type_unwrap_distinct(t)->kind == TYPE_FUNC_PTR) {
-        Type *fp = type_unwrap_distinct(t);
-        emit_type(e, fp->func_ptr.ret);
-        emit(e, " (*%.*s)(", (int)name_len, name);
-        for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_type(e, fp->func_ptr.params[i]);
-        }
-        emit(e, ")");
-        return;
-    }
-
-    /* A19: distinct wrapping optional wrapping funcptr — unwrap distinct first */
-    if (t->kind == TYPE_DISTINCT) {
-        Type *dt = type_unwrap_distinct(t);
-        if (dt->kind == TYPE_OPTIONAL && type_unwrap_distinct(dt->optional.inner)->kind == TYPE_FUNC_PTR) {
-            Type *fp = type_unwrap_distinct(dt->optional.inner);
-            emit_type(e, fp->func_ptr.ret);
-            emit(e, " (*%.*s)(", (int)name_len, name);
-            for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                emit_type(e, fp->func_ptr.params[i]);
-            }
-            emit(e, ")");
-            return;
-        }
-    }
-
-    /* optional function pointer: ?ret (*name)(params) → ret (*name)(params) (null sentinel) */
-    if (t->kind == TYPE_OPTIONAL && t->optional.inner->kind == TYPE_FUNC_PTR) {
-        Type *fp = t->optional.inner;
-        emit_type(e, fp->func_ptr.ret);
-        emit(e, " (*%.*s)(", (int)name_len, name);
-        for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_type(e, fp->func_ptr.params[i]);
-        }
-        emit(e, ")");
-        return;
-    }
-
-    /* optional distinct function pointer: ?DistinctFuncPtr → null sentinel with name inside (*) */
-    if (t->kind == TYPE_OPTIONAL && type_unwrap_distinct(t->optional.inner)->kind == TYPE_FUNC_PTR) {
-        Type *fp = type_unwrap_distinct(t->optional.inner);
-        emit_type(e, fp->func_ptr.ret);
-        emit(e, " (*%.*s)(", (int)name_len, name);
-        for (uint32_t i = 0; i < fp->func_ptr.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_type(e, fp->func_ptr.params[i]);
-        }
-        emit(e, ")");
-        return;
-    }
+    /* (funcptr in every wrapping — FUNC_PTR, distinct, ?, ?distinct, distinct? —
+     * is handled by the funcptr_under() branch at the top of this function.) */
 
     emit_type(e, t);
     emit(e, " %.*s", (int)name_len, name);
+}
+
+/* BUG-858: the operand of a `sizeof(...)`, for a resolved ZER type.
+ *
+ * struct and union need their C tag spelled out (`struct Name`,
+ * `struct _union_Name`) and a packed struct needs its attribute, which is why
+ * this was written out inline at the @size sites rather than deferring to
+ * emit_type. It was written out THREE times — the AST path, the IR path's
+ * type_arg arm, and the IR path's ident arm — and only the first two agreed;
+ * the third ended in a blind `emit("struct %s", <the source text>)` for
+ * anything it could not resolve. One function, so there is no third spelling
+ * to drift. */
+static void emit_sizeof_type(Emitter *e, Type *t) {
+    Type *te = type_unwrap_distinct(t);
+    if (!te) { emit(e, "char"); return; }
+    if (te->kind == TYPE_STRUCT) {
+        if (te->struct_type.is_packed) emit(e, "struct __attribute__((packed)) ");
+        else emit(e, "struct ");
+        if (te->struct_type.module_prefix) {
+            emit(e, "%.*s__%.*s",
+                 (int)te->struct_type.module_prefix_len, te->struct_type.module_prefix,
+                 (int)te->struct_type.name_len, te->struct_type.name);
+        } else {
+            emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
+        }
+        return;
+    }
+    if (type_dispatch_kind(te) == TYPE_UNION) {
+        emit(e, "struct _union_%.*s",
+             (int)te->union_type.name_len, te->union_type.name);
+        return;
+    }
+    emit_type(e, t);
 }
 
 /* ================================================================
@@ -3117,18 +3126,25 @@ static void emit_expr(Emitter *e, Node *node) {
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) → sizeof(T) */
+            /* @size(T) → sizeof(T). The name may be a TYPE or (BUG-858) a
+             * VARIABLE whose type the checker resolved for us; the typemap
+             * answers both, and answers the shadowed case correctly. */
             emit(e, "sizeof(");
             if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                emit_type(e, t);
+                emit_sizeof_type(e, resolve_tynode(e, node->intrinsic.type_arg));
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
-                /* named type passed as identifier (e.g. @size(MyStruct)) */
-                Symbol *sym = scope_lookup(e->checker->global_scope,
-                    node->intrinsic.args[0]->ident.name,
-                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                if (sym && sym->type) emit_type(e, sym->type);
+                Type *st = checker_get_type(e->checker, node->intrinsic.args[0]);
+                if (!st) {
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        node->intrinsic.args[0]->ident.name,
+                        (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                    st = sym ? sym->type : NULL;
+                }
+                if (st) emit_sizeof_type(e, st);
+                else emit(e, "__zer_size_of_unresolved_%.*s",
+                          (int)node->intrinsic.args[0]->ident.name_len,
+                          node->intrinsic.args[0]->ident.name);
             }
             emit(e, ")");
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
@@ -3143,9 +3159,12 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
             } else if (node->intrinsic.arg_count >= 2) {
-                /* args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_expr(e, node->intrinsic.args[0]);
+                /* args[0] names a type OR a variable of struct type — the
+                 * checker published which (BUG-858 sibling; see the IR arm). */
+                Node *a0 = node->intrinsic.args[0];
+                Type *st = checker_get_type(e->checker, a0);
+                if (st) emit_sizeof_type(e, st);
+                else { emit(e, "struct "); emit_expr(e, a0); }
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
             }
@@ -7593,61 +7612,38 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         const char *name = node->intrinsic.name;
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
-            /* @size(T) → sizeof(CType) — direct type name emission. */
+            /* @size(T) → sizeof(CType). Same three resolutions as the AST path
+             * above, through the same emit_sizeof_type — this arm is where
+             * BUG-858 lived: its ident case looked ONLY in the global scope, so
+             * a local variable fell through to a blind `struct <text>` and a
+             * local SHADOWING a struct name silently measured the struct. */
             emit(e, "sizeof(");
             if (node->intrinsic.type_arg) {
                 TypeNode *ta = node->intrinsic.type_arg;
                 if (ta->kind == TYNODE_NAMED) {
-                    /* Named type: look up in scope for C name */
                     Symbol *sym = scope_lookup(e->checker->global_scope,
                         ta->named.name, (uint32_t)ta->named.name_len);
-                    if (sym && sym->type) {
-                        Type *te = type_unwrap_distinct(sym->type);
-                        if (te->kind == TYPE_STRUCT) {
-                            if (te->struct_type.is_packed)
-                                emit(e, "struct __attribute__((packed)) ");
-                            else emit(e, "struct ");
-                            if (te->struct_type.module_prefix) {
-                                emit(e, "%.*s__%.*s",
-                                     (int)te->struct_type.module_prefix_len, te->struct_type.module_prefix,
-                                     (int)te->struct_type.name_len, te->struct_type.name);
-                            } else {
-                                emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
-                            }
-                        } else if (te->kind == TYPE_UNION) {
-                            emit(e, "struct _union_%.*s", (int)te->union_type.name_len, te->union_type.name);
-                        } else {
-                            emit_type(e, sym->type);
-                        }
-                    } else {
-                        emit(e, "struct %.*s", (int)ta->named.name_len, ta->named.name);
-                    }
+                    if (sym && sym->type) emit_sizeof_type(e, sym->type);
+                    else emit(e, "struct %.*s", (int)ta->named.name_len, ta->named.name);
                 } else {
                     /* Keyword type (u32, i8, etc.) */
                     Type *t = resolve_type_for_emit(e, ta);
-                    if (t) emit_type(e, t);
+                    if (t) emit_sizeof_type(e, t);
                 }
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
-                /* @size(TypeName) — type name passed as ident arg */
-                const char *tn = node->intrinsic.args[0]->ident.name;
-                uint32_t tl = (uint32_t)node->intrinsic.args[0]->ident.name_len;
-                Symbol *sym = scope_lookup(e->checker->global_scope, tn, tl);
-                if (sym && sym->type) {
-                    Type *te = type_unwrap_distinct(sym->type);
-                    if (te->kind == TYPE_STRUCT) {
-                        if (te->struct_type.is_packed)
-                            emit(e, "struct __attribute__((packed)) ");
-                        else emit(e, "struct ");
-                        emit(e, "%.*s", (int)te->struct_type.name_len, te->struct_type.name);
-                    } else if (te->kind == TYPE_UNION) {
-                        emit(e, "struct _union_%.*s", (int)te->union_type.name_len, te->union_type.name);
-                    } else {
-                        emit_type(e, sym->type);
-                    }
-                } else {
-                    emit(e, "struct %.*s", (int)tl, tn);
+                /* A TYPE name, or a VARIABLE the checker resolved for us — the
+                 * typemap answers both, and answers a shadowed name correctly. */
+                Node *a0 = node->intrinsic.args[0];
+                Type *st = checker_get_type(e->checker, a0);
+                if (!st) {
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        a0->ident.name, (uint32_t)a0->ident.name_len);
+                    st = sym ? sym->type : NULL;
                 }
+                if (st) emit_sizeof_type(e, st);
+                else emit(e, "__zer_size_of_unresolved_%.*s",
+                          (int)a0->ident.name_len, a0->ident.name);
             } else if (node->intrinsic.arg_count > 0) {
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
             }
@@ -7786,9 +7782,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
             } else if (node->intrinsic.arg_count >= 2) {
-                /* Named type: args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                /* args[0] names a type OR a variable of struct type; the
+                 * checker resolved which and published it (BUG-858 sibling).
+                 * Emitting the source text as `struct <text>` measured the
+                 * wrong struct whenever a local shadowed a type name. */
+                Node *a0 = node->intrinsic.args[0];
+                Type *st = checker_get_type(e->checker, a0);
+                if (st) emit_sizeof_type(e, st);
+                else emit(e, "struct %.*s", (int)a0->ident.name_len, a0->ident.name);
                 emit(e, ", ");
                 emit_rewritten_node(e, node->intrinsic.args[1], func);
             }

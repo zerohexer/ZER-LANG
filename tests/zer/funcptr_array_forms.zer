@@ -1,0 +1,80 @@
+/* BUG-855 + BUG-857: arrays of function pointers, every spelling.
+ *
+ * BUG-855 (parser): the typedef-free 2C form `*(u32, u32) -> u32 [4] ops`
+ * is documented in reference.md and CLAUDE.md but did not parse as an array.
+ * The `[4]` sits next to the RETURN type, so parse_type swallowed it and built
+ * `fn(u32,u32) -> u32[4]` — a funcptr RETURNING an array — which then failed at
+ * the use site with "cannot index type 'fn(u32, u32) -> u32[4]'". Unambiguous
+ * to fix: a ZER function cannot return an array at all.
+ *
+ * BUG-857 (emitter): `?FuncPtr[N]` — an array of NULLABLE funcptrs, which is
+ * the only inhabitable form (see below) — emitted
+ * `uint32_t (*)(uint32_t) ops[3]`, an abstract declarator with a name glued on.
+ * Not C; GCC rejected it. The array branch of emit_type_and_name peeled only
+ * `distinct`, not the null-sentinel `?`.
+ *
+ * Why every array here is nullable (BUG-856): a NON-null element type cannot be
+ * used, because auto-zero fills the array with NULL and ZER has no array
+ * initializer to fill it with anything else (`u32[3] a = {1,2,3}` is a parse
+ * error for every type). `tests/zer_fail/funcptr_array_nonnull.zer` pins that
+ * rejection; this file pins that the nullable form actually works.
+ */
+
+typedef u32 (*BinOp)(u32, u32);
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 sub(u32 a, u32 b) { if (a < b) { return 0; } return a - b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+u32 inc(u32 x) { return x + 1; }
+
+u32 apply3(?BinOp[3] ops, u32 a, u32 b) {
+    u32 acc = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        if (ops[i]) |f| { acc += f(a, b); }
+    }
+    return acc;
+}
+
+u32 main() {
+    /* --- 2C inline, no typedef (BUG-855) --- */
+    ?*(u32, u32) -> u32 [3] ops;
+    ops[0] = add;
+    ops[1] = sub;
+    ops[2] = mul;
+    u32 acc = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        if (ops[i]) |f| { acc += f(6, 3); }
+    }
+    if (acc != 9 + 3 + 18) { return 1; }
+
+    /* --- no space before the bracket: same type --- */
+    ?*(u32) -> u32[2] tbl;
+    tbl[0] = inc;
+    tbl[1] = inc;
+    u32 chained = 0;
+    if (tbl[0]) |f0| {
+        if (tbl[1]) |f1| { chained = f0(f1(5)); }
+    }
+    if (chained != 7) { return 2; }
+
+    /* --- an unset element really is null, per element --- */
+    ?*(u32) -> u32 [2] sparse;
+    sparse[1] = inc;
+    u32 seen = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        if (sparse[i]) |f| { seen += f(0); }
+    }
+    if (seen != 1) { return 3; }
+
+    /* --- 2A typedef array, same shape (BUG-857 hit this one too) --- */
+    ?BinOp[3] td;
+    td[0] = add;
+    td[1] = mul;
+    if (apply3(td, 4, 5) != 9 + 20) { return 4; }
+
+    /* --- a plain non-array funcptr still needs its initializer --- */
+    *(u32) -> u32 single = inc;
+    if (single(1) != 2) { return 5; }
+
+    return 0;
+}

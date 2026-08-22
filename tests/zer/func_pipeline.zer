@@ -21,7 +21,10 @@ struct PipeResult {
     u32 failed_stage;
 }
 
-PipeResult run_pipeline(u32 input, Transform[4] stages, u32 stage_count) {
+// BUG-856: the element type is `?Transform` — an array of NON-null funcptrs
+// is auto-zeroed to NULL with no array initializer to fill it, so an unset
+// slot was a call through address 0. An unset slot is now a no-op stage.
+PipeResult run_pipeline(u32 input, ?Transform[4] stages, u32 stage_count) {
     PipeResult result;
     result.output = input;
     result.ok = true;
@@ -30,7 +33,8 @@ PipeResult run_pipeline(u32 input, Transform[4] stages, u32 stage_count) {
     u32 val = input;
     for (u32 i = 0; i < stage_count; i += 1) {
         if (i >= 4) { break; }
-        ?u32 next = stages[i](val);
+        ?u32 next = null;
+        if (stages[i]) |st| { next = st(val); }
         if (next) |n| {
             val = n;
         } else {
@@ -69,7 +73,7 @@ u32 map_count(u32[8] data, u32 count, Transform fn) {
 
 u32 main() {
     // Pipeline: double → add_ten → reject_odd → cap_at_100
-    Transform[4] pipeline;
+    ?Transform[4] pipeline;
     pipeline[0] = double_val;
     pipeline[1] = add_ten;
     pipeline[2] = reject_odd;

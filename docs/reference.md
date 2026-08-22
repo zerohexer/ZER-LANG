@@ -680,7 +680,7 @@ u32 apply(u32 (*op)(u32, u32), u32 x, u32 y);  // parameter
 ?void (*on_event)(u32) = null;             // optional — null = not set
 typedef u32 (*BinOp)(u32, u32);            // typedef
 typedef ?u32 (*OptHandler)(u32);           // typedef — returns ?u32
-BinOp[4] ops;                              // array of function pointers (via typedef)
+?BinOp[4] ops;                             // array of function pointers (via typedef)
 ```
 
 **SYNTAX — Variant 2C (ZER-native, typedef-free)**
@@ -694,11 +694,64 @@ u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y);  // parameter
 *(keep *Handler) register;                   // keep modifier on a param
 
 // Cases that REQUIRED typedef in 2A — now inline in 2C:
-*(u32, u32) -> u32 [4] ops;                  // array of funcptrs — INLINE
+?*(u32, u32) -> u32 [4] ops;                 // array of funcptrs — INLINE
 *(u32, u32) -> u32 select_op(u32 kind);      // return-of-funcptr — INLINE
 ```
 
 Discriminator: `*` BEFORE `(` is 2C; `*` INSIDE `(` is 2A. Both produce identical AST/types, so all downstream behavior (checker, IR, emitter, all 29 safety systems) is operator-agnostic — pick by readability.
+
+**AN ARRAY OF FUNCTION POINTERS MUST BE NULLABLE (`?`)**
+
+Both array forms above are written `?BinOp[4]` / `?*(…) -> u32 [4]`, not `BinOp[4]`.
+`*(args) -> ret` is a NON-NULL type, arrays are auto-zeroed like everything else,
+and ZER has no array-literal initializer (`u32[3] a = {1,2,3}` is a parse error for
+every element type) — so a non-null element type has no way to ever hold a legal
+value. The compiler says so:
+
+```
+error: an array of non-null function pointers is auto-zeroed to NULL and ZER has
+no array initializer to fill it — declare the element nullable
+(?*(args) -> ret [N]) and unwrap at the use site
+```
+
+Unwrap per element at the use site, exactly like any other optional:
+
+```zer
+// audit: skip — compiles and runs (it is tests/zer/funcptr_array_forms.zer in
+// miniature), but EVERY indirect call warns "stack depth not verifiable", which
+// the example gate treats as unclean. The warning is inherent to calling through a
+// function pointer, not a defect in this code.
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+
+u32 main() {
+    ?*(u32, u32) -> u32 [3] ops;    // 2C, typedef-free
+    ops[0] = add;
+    ops[1] = mul;                    // ops[2] stays null
+
+    u32 acc = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        if (ops[i]) |f| { acc += f(6, 3); }
+    }
+    if (acc != 9 + 18) { return 1; }
+    return 0;
+}
+```
+
+A SCALAR funcptr is different — there the non-null type is satisfiable, so an
+initializer is required rather than the type being rejected:
+
+```zer
+*(u32, u32) -> u32 op = add;      // OK — non-null, initialized
+*(u32, u32) -> u32 bad;           // error: function pointer requires an
+                                  //        initializer — use '?' prefix
+?*(u32, u32) -> u32 maybe;        // OK — nullable, starts null
+```
+
+The same rule applies to `*T` data pointers at every carrier (local, global, and
+arrays of either). The one carrier it does NOT yet cover is a struct FIELD — a
+`*T` or funcptr field is auto-zeroed to NULL and reading it is currently accepted;
+see `docs/limitations.md`. Prefer `?*T` for struct fields until that closes.
 
 **FIELD ACCESS RULE**
 
@@ -1930,23 +1983,53 @@ struct Device { u32 id; ListHead list; }
 ### @size(T)
 
 **DESCRIPTION**
-Returns the size of type T in bytes as usize. Like C's sizeof.
+Returns the size in bytes as `usize`, like C's `sizeof`. The argument may be a
+TYPE name or a VARIABLE — a variable measures its own type, and when a variable
+shadows a type name the variable wins, as it does everywhere else in the
+language.
 
 **EXAMPLE**
 ```zer
-usize s = @size(Task);     // e.g., 12
+// audit: check
+struct Task { u32 id; u64 deadline; }
+
+u32 main() {
+    usize s = @size(Task);          // the TYPE — 16
+    u8[4] buf;
+    usize b = @size(buf);           // the VARIABLE — 4
+    {
+        u8[2] Task;                 // shadows the struct name
+        Task[0] = 1;
+        if (@size(Task) != 2) { return 1; }   // the innermost binding wins
+    }
+    if (s != 16 || b != 4) { return 2; }
+    return 0;
+}
 ```
+
+`@size(void)` and `@size(opaque)` are rejected — neither has a defined size.
 
 ---
 
 ### @offset(T, field)
 
 **DESCRIPTION**
-Returns the byte offset of a field within struct T as usize. Like C's offsetof.
+Returns the byte offset of a field within a struct as `usize`, like C's
+`offsetof`. As with `@size`, the first argument may be a struct TYPE name or a
+VARIABLE of struct type, and the innermost binding wins. The field is checked
+for existence at compile time.
 
 **EXAMPLE**
 ```zer
-usize off = @offset(Task, priority);
+// audit: check
+struct Task { u32 id; u64 deadline; }
+
+u32 main() {
+    usize off = @offset(Task, deadline);
+    Task t;
+    if (off != @offset(t, deadline)) { return 1; }   // variable form agrees
+    return 0;
+}
 ```
 
 ---
@@ -3284,6 +3367,32 @@ beyond the width of the target, the write is a **defined no-op** — the target 
 unchanged — matching ZER's rule that a shift of at least the type width is `0`
 rather than undefined. A position known at compile time to be out of range is a
 compile error instead.
+
+**Through a pointer.** The target may be a single POINTER to an integer, which
+is what makes the MMIO idiom work — `reg[9..8]` reads the register once and
+extracts the field, and `reg[3..2] = 1` is a read-modify-write of just those
+bits:
+
+```zer
+// audit: check
+mmio 0x40020000..0x40020FFF;
+
+u32 read_pins() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40020014);
+    return reg[9..8];                 // one volatile read, bits 9:8
+}
+
+void set_mode() {
+    volatile *u32 reg = @inttoptr(*u32, 0x40020000);
+    reg[3..2] = 1;                    // read-modify-write of bits 3:2
+}
+
+u32 main() { return 0; }
+```
+
+This is bit extraction, NOT sub-slicing: a single `*T` has no length, so there
+is no element range to take. `[*]T` slices are the other way round — `s[1..3]`
+there means ELEMENTS 1 and 2.
 
 ### NOT in ZER
 - `++  --` — use `+= 1`, `-= 1`

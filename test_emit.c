@@ -1224,20 +1224,26 @@ int main(void) {
         41,
         "struct function pointer field: add(5,6)+mul(5,6)=41");
 
+    /* BUG-856: a global funcptr is auto-zeroed, so the NON-null spelling
+     * `u32 (*g_fn)(u32,u32);` declares a variable holding the one value its own
+     * type forbids — and calling it emitted a raw indirect call through address
+     * 0. Both globals below are therefore `?`, with an unwrap at the call site,
+     * exactly as ZER has long required for a `*T` data global. */
     printf("[func ptr: global variable]\n");
     test_compile_and_run(
         "u32 add(u32 a, u32 b) { return a + b; }\n"
-        "u32 (*g_fn)(u32, u32);\n"
+        "?u32 (*g_fn)(u32, u32);\n"
         "u32 main() {\n"
         "    g_fn = add;\n"
-        "    return g_fn(20, 5);\n"
+        "    if (g_fn) |f| { return f(20, 5); }\n"
+        "    return 0;\n"
         "}\n",
         25,
         "global function pointer: g_fn=add, g_fn(20,5)=25");
 
     printf("[func ptr: callback registration]\n");
     test_compile_and_run(
-        "void (*saved_cb)(u32 val);\n"
+        "?void (*saved_cb)(u32 val);\n"
         "u32 result = 0;\n"
         "void register_cb(void (*cb)(u32 val)) {\n"
         "    saved_cb = cb;\n"
@@ -1247,7 +1253,7 @@ int main(void) {
         "}\n"
         "u32 main() {\n"
         "    register_cb(my_handler);\n"
-        "    saved_cb(5);\n"
+        "    if (saved_cb) |cb| { cb(5); }\n"
         "    return result;\n"
         "}\n",
         15,

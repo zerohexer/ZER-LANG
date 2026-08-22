@@ -427,9 +427,15 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
     case RCH_FIELD:
         extra = "struct Ops { *() h; }\n";
         wbody = "Ops o; o.h = cb; o.h();"; break;
+    /* BUG-856: an array of NON-NULL funcptrs is auto-zeroed to NULL and ZER has
+     * no array initializer, so `Cb[2] t;` (what this cell used to say) is now
+     * rejected on its own — which would have turned every negative cell in this
+     * row green for the wrong reason. `?Cb[2]` + an unwrap keeps the REACH
+     * question (does the spawn scan follow cb through an array element?) the
+     * only thing under test. */
     case RCH_ARRAY:
         extra = "typedef *() Cb;\n";
-        wbody = "Cb[2] t; t[0] = cb; t[0]();"; break;
+        wbody = "?Cb[2] t; t[0] = cb; if (t[0]) |f| { f(); }"; break;
     case RCH_FACTORY1:
         extra = "*() mk() { return cb; }\n";
         wbody = "*() fp = mk(); fp();"; break;

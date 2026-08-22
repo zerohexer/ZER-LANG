@@ -761,6 +761,73 @@ static bool type_carries_enum(Type *t, int depth) {
     }
     return false;
 }
+/* BUG-856: "does auto-zero fill this type with a NULL that its own type says
+ * cannot be NULL?" — the ONE query behind the non-null-carrier rule.
+ *
+ * `*T` and `*(args) -> R` are NON-NULL types; that is the entire basis of the
+ * `*T` / `?*T` split. A declaration with no initializer is auto-zeroed, so the
+ * variable starts out holding the one value its type forbids. The rule existed
+ * before this, but as THREE hand-rolled copies covering different carriers:
+ * `*T` was checked at local and global var-decls, the funcptr sibling ONLY at
+ * local — so a global funcptr, and any ARRAY of either, auto-zeroed to NULL and
+ * calling it was accepted (measured: raw indirect call through 0 in the emitted
+ * C; SIGSEGV/SIGILL hosted, a jump to the reset vector on bare metal — no
+ * diagnostic at either compile or run time on a target without an MMU).
+ *
+ * Returns the offending inner type (so the caller can name it) or NULL. Stops
+ * at OPTIONAL — `?*T` / `?*(…)` are nullable BY DECLARATION and NULL is their
+ * documented zero value. Stops at SLICE — a zero slice is `{NULL, 0}`, which
+ * is safe because every access is length-checked. Struct FIELDS are NOT
+ * recursed into: see docs/limitations.md "non-null pointer field in a struct". */
+static Type *nonnull_zero_hole(Type *t, int depth, bool *in_array) {
+    if (!t || depth > 32) return NULL;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return NULL;
+    if (k == TYPE_POINTER || k == TYPE_FUNC_PTR) return u;
+    if (k == TYPE_ARRAY) {
+        if (in_array) *in_array = true;
+        return nonnull_zero_hole(u->array.inner, depth + 1, in_array);
+    }
+    return NULL;
+}
+
+/* The diagnostic for the above, shared by the local and global var-decl sites
+ * so the two cannot drift apart again.
+ *
+ * The ARRAY wording differs deliberately: ZER has no array-literal initializer
+ * for ANY type (measured — `u32[3] a = {1,2,3}` is a parse error), so an array
+ * of a non-null type has no valid form at all. Telling the user to "add an
+ * initializer" would send them after something that does not exist; the real
+ * answer is the nullable element type, which emits correctly as of BUG-857. */
+static void check_nonnull_zero_init(Checker *c, Type *type, int line) {
+    bool in_array = false;
+    Type *bad = nonnull_zero_hole(type, 0, &in_array);
+    if (!bad) return;
+    bool is_fp = (type_dispatch_kind(bad) == TYPE_FUNC_PTR);
+    char inner[96];
+    if (!is_fp) snprintf(inner, sizeof(inner), "%s", type_name(bad->pointer.inner));
+
+    if (in_array) {
+        checker_error(c, line,
+            "an array of non-null %s is auto-zeroed to NULL and ZER has no "
+            "array initializer to fill it — declare the element nullable "
+            "(%s) and unwrap at the use site",
+            is_fp ? "function pointers" : "pointers",
+            is_fp ? "?*(args) -> ret [N]" : "?*T[N]");
+        return;
+    }
+    if (is_fp) {
+        checker_error(c, line,
+            "function pointer requires an initializer — "
+            "use '?' prefix for nullable function pointer");
+        return;
+    }
+    checker_error(c, line,
+        "non-null pointer '*%s' requires an initializer — "
+        "use '?*%s' for nullable pointers", inner, inner);
+}
+
 static void check_enum_forge(Checker *c, Node *value, Type *target,
                              int line, const char *what) {
     if (!target) return;
@@ -9401,6 +9468,39 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *obj_raw = check_expr(c, node->slice.object);
         /* BUG-410: unwrap distinct for slice/array/integer dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
+
+        /* BUG-859: bit extraction through a single pointer to an integer —
+         * `volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];`
+         *
+         * That is CLAUDE.md's own "Hardware Support" example and reference.md's
+         * `reg[9..8]  // Extract bits 9:8`, and it did not compile: `[hi..lo]`
+         * on a POINTER fell through to the SUB-SLICE path and was rejected as
+         * "slice start (9) is greater than end (8)". Bit extraction only ever
+         * worked on a scalar VALUE, so firmware had to spell the deref itself.
+         *
+         * There is no competing meaning to steal: slicing a `*T` is an error
+         * (a single pointer has no length), and `[*]T` sub-slicing is handled
+         * by the TYPE_SLICE arm above and is untouched.
+         *
+         * Rewrite `p[hi..lo]` to `(*p)[hi..lo]` right here and let the existing
+         * scalar path do the rest — the deref goes through the normal MMIO
+         * range/alignment machinery, and the IR lowering, emitter and every
+         * safety walker see an ordinary integer bit-extract with no new node
+         * kind, no new emission path, and nothing new to keep in sync. */
+        if (obj && type_dispatch_kind(obj) == TYPE_POINTER && node->slice.start &&
+            node->slice.end && obj->pointer.inner &&
+            type_is_integer(obj->pointer.inner)) {
+            Node *deref = (Node *)arena_alloc(c->arena, sizeof(Node));
+            memset(deref, 0, sizeof(Node));
+            deref->kind = NODE_UNARY;
+            deref->unary.op = TOK_STAR;
+            deref->unary.operand = node->slice.object;
+            deref->loc = node->slice.object->loc;
+            node->slice.object = deref;
+            obj_raw = check_expr(c, deref);
+            obj = type_unwrap_distinct(obj_raw);
+        }
+
         if (node->slice.start) {
             Type *start = check_expr(c, node->slice.start);
             if (!type_is_integer(start)) {
@@ -9892,6 +9992,41 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
+            /* BUG-858: `@size(x)` where x is a VARIABLE, not a type.
+             *
+             * @size takes a TYPE. The name arrives as a plain NODE_IDENT (the
+             * parser cannot tell a type name from a variable name), and both
+             * emitter paths then resolved it in the GLOBAL scope only — so a
+             * LOCAL variable was never found and the IR path fell through to a
+             * blind `emit("struct %s", the_text)`, producing `sizeof(struct buf)`
+             * for `u8[4] buf`. Loud (GCC: incomplete type) but misattributed.
+             *
+             * The dangerous form is SHADOWING, and it was silent: with
+             * `struct Big {...}` in scope and a local `u8[2] Big`, `@size(Big)`
+             * found the STRUCT symbol in the global scope and returned 32 for a
+             * 2-byte array. Compiled clean, ran clean, wrong number — and a
+             * @size feeding a copy length is a buffer overflow.
+             *
+             * Fix: resolve the name here, where the LOCAL scope is still live,
+             * and let the innermost binding win (as every other identifier in
+             * the language does). A local hit means the user meant the variable,
+             * so record its type on the ident node for the emitter to read; the
+             * emitter's global lookup then never sees a shadowed name.
+             *
+             * Types are declarable only at global scope, so "found below global"
+             * is an exact test for "this is a value, not a type". */
+            if (!node->intrinsic.type_arg && node->intrinsic.arg_count == 1 &&
+                node->intrinsic.args[0] &&
+                node->intrinsic.args[0]->kind == NODE_IDENT) {
+                Node *a0 = node->intrinsic.args[0];
+                Symbol *local = NULL;
+                for (Scope *s = c->current_scope; s && s != c->global_scope; s = s->parent) {
+                    local = scope_lookup_local(s, a0->ident.name,
+                                               (uint32_t)a0->ident.name_len);
+                    if (local) break;
+                }
+                if (local && local->type) typemap_set(c, a0, local->type);
+            }
             /* BUG-231/320: reject @size(void) and @size(opaque) — no meaningful size.
              * Unwrap distinct first (BUG-320: distinct typedef void still has no size).
              * Check both type_arg path AND expression arg path (named types parsed as ident). */
@@ -9930,6 +10065,17 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->intrinsic.args[0]->ident.name,
                         (uint32_t)node->intrinsic.args[0]->ident.name_len);
                     if (sym) struct_type = sym->type;
+                    /* BUG-858 sibling: the emitter's ident arm was a blind
+                     * `emit("struct %s", <the source text>)`. That is the same
+                     * defect @size had, with a nastier payload: with a local
+                     * `Small Big` and a `struct Big` also in scope, THIS lookup
+                     * correctly validated `y` against Small while the emitter
+                     * emitted `offsetof(struct Big, y)` — compiled clean, ran
+                     * clean, returned 8 where the answer is 4. An offset feeding
+                     * @container or pointer arithmetic is memory corruption.
+                     * Publish what we resolved so the emitter cannot re-decide. */
+                    if (struct_type)
+                        typemap_set(c, node->intrinsic.args[0], struct_type);
                     if (node->intrinsic.args[1]->kind == NODE_IDENT) {
                         field_name = node->intrinsic.args[1]->ident.name;
                         field_len = (uint32_t)node->intrinsic.args[1]->ident.name_len;
@@ -13108,27 +13254,10 @@ static void check_stmt(Checker *c, Node *node) {
                 type = vp;
             }
         }
-        /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
-         * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR).
-         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT so `distinct typedef *u32 P; P p;`
-         * is caught — sibling funcptr check below already unwraps. */
-        if (!node->var_decl.init && type) {
-            Type *teff = type_unwrap_distinct(type);
-            if (teff && teff->kind == TYPE_POINTER) {
-                checker_error(c, node->loc.line,
-                    "non-null pointer '*%s' requires an initializer — "
-                    "use '?*%s' for nullable pointers",
-                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
-            }
-        }
-        /* Function pointer without initializer — auto-zero creates NULL funcptr.
-         * Calling it would segfault. Require init or use ?FuncPtr for nullable. */
-        if (!node->var_decl.init && type &&
-            type_unwrap_distinct(type)->kind == TYPE_FUNC_PTR) {
-            checker_error(c, node->loc.line,
-                "function pointer requires an initializer — "
-                "use '?' prefix for nullable function pointer");
-        }
+        /* BUG-239/253/856: a non-null carrier with no initializer is auto-zeroed
+         * to the one value its type forbids. ONE query for every carrier —
+         * local, global, and arrays of either. See nonnull_zero_hole. */
+        if (!node->var_decl.init) check_nonnull_zero_init(c, type, node->loc.line);
 
         typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
 
@@ -17820,18 +17949,9 @@ static void register_decl(Checker *c, Node *node) {
                     (int)node->var_decl.name_len, node->var_decl.name);
             }
         }
-        /* BUG-253: non-null pointer (*T) requires initializer at global scope too.
-         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT to catch
-         * `distinct typedef *u32 P; P g;` at global scope. */
-        if (!node->var_decl.init && type) {
-            Type *teff = type_unwrap_distinct(type);
-            if (teff && teff->kind == TYPE_POINTER) {
-                checker_error(c, node->loc.line,
-                    "non-null pointer '*%s' requires an initializer — "
-                    "use '?*%s' for nullable pointers",
-                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
-            }
-        }
+        /* BUG-253/856: same rule at global scope — same query, so the two sites
+         * cannot drift apart again (they had: the funcptr sibling was local-only). */
+        if (!node->var_decl.init) check_nonnull_zero_init(c, type, node->loc.line);
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,
                                (uint32_t)node->var_decl.name_len,

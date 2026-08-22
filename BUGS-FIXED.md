@@ -58,6 +58,25 @@ modules, a value-returning async, a void async, and an imported function through
 a funcptr. Measured on a from-`HEAD` build: **5 GCC errors**; zero now.
 Module tests 30/30.
 
+### The rest of the sweep — CLEAN, recorded so nobody re-probes
+
+Every remaining feature whose emitted C name is constructed was crossed with a
+module boundary and works: **union** (`struct _union_Name` + a mutable switch
+capture), **enum** + exhaustive switch, **`distinct typedef`** with `@cast` both
+ways, **auto-Slab** (`Task.alloc_ptr` / `free_ptr` inside the module),
+**`@once`**, **Semaphore** / **Barrier** / **threadlocal**, **Pool / Slab / Ring**
+declared in the module and driven from the importer, a **struct field of funcptr
+type** assigned across the boundary, **`section(...)`** on a module function
+(emits `lib4__hot` and the call site matches), and an **`interrupt` handler in a
+module** — whose global is mangled consistently in both the ISR and an accessor,
+and whose ISR-vs-main race check reaches across the boundary (a non-volatile
+module global touched from both is correctly rejected).
+
+The ISR case is verified COMPILE-ONLY: GCC refuses
+`__attribute__((interrupt))` on hosted x86-64, so a module containing one cannot
+be `--run` — which is worth knowing, because it made four unrelated probes in the
+same file look like failures until the ISR was removed.
+
 ### Method note
 
 All three cross-module bugs have the same shape: **the emitted C name is

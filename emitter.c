@@ -6559,9 +6559,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     return;
                 }
             }
-            /* Struct, union can't use == in C — not supported in IR path */
+            /* Struct/union have no C value comparison. BUG-840: this used to
+             * emit a literal `0`, which made `a == b` AND `a != b` both false —
+             * a silent wrong answer with no diagnostic anywhere. The CHECKER
+             * now rejects the form (`type_is_value_comparable`), so this arm is
+             * unreachable; emit an undeclared identifier rather than a value so
+             * that if a shape ever slips the gate GCC says so loudly instead of
+             * the binary quietly answering "not equal, and also not unequal".
+             * Same defence-in-depth as BUG-767's unsupported-intrinsic marker. */
             if (le->kind == TYPE_STRUCT || le->kind == TYPE_UNION) {
-                emit(e, "/* struct/union compare unsupported */ 0");
+                emit(e, "__zer_aggregate_comparison_unsupported");
                 return;
             }
             if (le->kind == TYPE_POINTER && le->pointer.inner &&

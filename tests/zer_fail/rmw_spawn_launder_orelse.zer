@@ -1,0 +1,6 @@
+// expect-error: non-atomic read-modify-write
+// BUG-841: the same RMW laundered through an `orelse`, at the mirrored sink.
+volatile u32 g;
+?u32 maybeu(u32 v) { return v; }
+void w() { g = maybeu(g) orelse 0; }
+u32 main() { spawn w(); u32 x = g; return x & 1; }

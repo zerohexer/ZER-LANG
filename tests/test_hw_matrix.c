@@ -304,6 +304,11 @@ static const char *vshape_flags(VShape s) {
  * ------------------------------------------------------------------------- */
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               /* BUG-841: the written-out form LAUNDERED through an expression
+                * the "does the RHS read its own target?" walker did not descend.
+                * All four compiled clean at BOTH sinks before the walker became
+                * an exhaustive no-`default:` switch. */
+               RFORM_INTRINSIC, RFORM_CALL, RFORM_ORELSE, RFORM_NESTED_LAUNDER,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -313,6 +318,10 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_INTRINSIC:       return "via @truncate";
+    case RFORM_CALL:            return "via call";
+    case RFORM_ORELSE:          return "via orelse";
+    case RFORM_NESTED_LAUNDER:  return "nested launder";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -327,6 +336,10 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    case RFORM_INTRINSIC:      *helper = "";                                    *body = "g = @truncate(u32, g) + 1;"; break;
+    case RFORM_CALL:           *helper = "u32 idfn(u32 v){ return v; }";        *body = "g = idfn(g) + 1;"; break;
+    case RFORM_ORELSE:         *helper = "?u32 maybeu(u32 v){ return v; }";     *body = "g = maybeu(g) orelse 0;"; break;
+    case RFORM_NESTED_LAUNDER: *helper = "u32 idfn(u32 v){ return v; }";        *body = "g = @truncate(u32, idfn((u32)g)) + 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

@@ -1,0 +1,50 @@
+/* BUG-840 boundary positive: the comparison gate must reject AGGREGATES only.
+ * Every scalar-comparable shape below still compiles and answers correctly, and
+ * `x == null` stays legal for every optional shape. */
+
+struct T { u32 v; }
+enum Color { red, green }
+distinct typedef u32 Ticks;
+
+u32 main() {
+    /* integers, floats, bool, enum */
+    u32 a = 3; u32 b = 4;
+    if (!(a < b)) { return 1; }
+    f64 f = 1.5;
+    if (!(f > 1.0)) { return 2; }
+    bool t = true;
+    if (!(t == true)) { return 3; }
+    Color c = Color.green;
+    if (!(c == Color.green)) { return 4; }
+
+    /* distinct integer typedef unwraps to a comparable scalar */
+    Ticks k = @cast(Ticks, 7);
+    if (!(k == @cast(Ticks, 7))) { return 5; }
+
+    /* pointers */
+    T x; T y;
+    *T px = &x;
+    *T py = &y;
+    if (px == py) { return 6; }
+    if (!(px == &x)) { return 7; }
+
+    /* ?*T is a null-sentinel pointer: comparable to null AND to a pointer */
+    ?*T mp = null;
+    if (!(mp == null)) { return 8; }
+    mp = &x;
+    if (mp == null) { return 9; }
+
+    /* ?T against null is the sanctioned test and stays legal */
+    ?u32 mv = null;
+    if (!(mv == null)) { return 10; }
+    mv = 5;
+    if (mv == null) { return 11; }
+
+    /* *opaque compares by pointer identity */
+    *opaque oa = @ptrcast(*opaque, &x);
+    *opaque ob = @ptrcast(*opaque, &y);
+    if (oa == ob) { return 12; }
+    if (!(oa == @ptrcast(*opaque, &x))) { return 13; }
+
+    return 0;
+}

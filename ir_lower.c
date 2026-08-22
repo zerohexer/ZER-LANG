@@ -3037,12 +3037,38 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool is_exhaustive_enum = is_enum && !has_default &&
                                   node->switch_stmt.arm_count > 0;
 
-        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+        /* BUG-839: lower the arms in MATCH order, not SOURCE order.
+         *
+         * A `default` arm emits an UNCONDITIONAL entry into its body (the
+         * `arm->is_default` branch below is a fall-through, not a BRANCH), and
+         * the arm chain is built in source order. So a `default` written before
+         * any other arm terminated the chain: EVERY later arm became dead C and
+         * the default ran even when a specific arm matched.
+         *      switch (1) { default => { r = 9; }  1 => { r = 1; } }   // gave 9
+         * Silent — it compiles, runs and answers wrongly.
+         *
+         * `default` means "if nothing else matched", which is a property of the
+         * arm, not of where it is written; C agrees (case labels are matched
+         * before `default` regardless of order). So order the chain that way:
+         * every non-default arm first in source order, then the default arm.
+         * For an exhaustive-enum switch there is no default by construction, so
+         * this order is the identity and `elide_compare` is unaffected. */
+        int *arm_order = (int *)arena_alloc(ctx->arena,
+            sizeof(int) * (size_t)(node->switch_stmt.arm_count > 0 ?
+                                   node->switch_stmt.arm_count : 1));
+        int arm_order_n = 0;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            if (!node->switch_stmt.arms[i].is_default) arm_order[arm_order_n++] = i;
+        for (int i = 0; i < node->switch_stmt.arm_count; i++)
+            if (node->switch_stmt.arms[i].is_default) arm_order[arm_order_n++] = i;
+
+        for (int oi = 0; oi < arm_order_n; oi++) {
+            int i = arm_order[oi];
             SwitchArm *arm = &node->switch_stmt.arms[i];
             int bb_arm = ir_add_block(ctx->func, ctx->arena);
-            int bb_next = (i + 1 < node->switch_stmt.arm_count) ?
+            int bb_next = (oi + 1 < arm_order_n) ?
                           ir_add_block(ctx->func, ctx->arena) : bb_exit;
-            bool is_last_arm = (i + 1 == node->switch_stmt.arm_count);
+            bool is_last_arm = (oi + 1 == arm_order_n);
             bool elide_compare = (is_exhaustive_enum && is_last_arm &&
                                   !arm->is_default);
 

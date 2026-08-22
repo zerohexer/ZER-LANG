@@ -1,0 +1,6 @@
+// expect-error: read-modify-written in a single statement
+// BUG-841: the same RMW laundered through a helper CALL.
+volatile u32 g;
+u32 idfn(u32 v) { return v; }
+interrupt TIM2 { g = idfn(g) + 1; }
+u32 main() { g = 0; return (u32)g; }

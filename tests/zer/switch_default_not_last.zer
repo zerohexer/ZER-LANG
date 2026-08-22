@@ -1,0 +1,57 @@
+/* BUG-839: a `default` arm written BEFORE other arms made every later arm dead
+ * C, and the default ran even when a specific arm matched. `default` means "if
+ * nothing else matched" regardless of where it is written, so the lowering now
+ * orders the arm chain by MATCH order (specific arms first, default last).
+ *
+ * Exits 0 only if EVERY arm below is reachable from its own matching value.
+ * On the pre-fix compiler every `pick*` call returned the default. */
+
+enum Color { red, green, blue }
+
+u32 pick_int(u32 k) {
+    u32 r = 0;
+    switch (k) {
+        default => { r = 99; }
+        1 => { r = 11; }
+        2, 3 => { r = 23; }
+    }
+    return r;
+}
+
+u32 pick_enum(Color c) {
+    u32 r = 0;
+    switch (c) {
+        default => { r = 99; }
+        .red => { r = 1; }
+        .green => { r = 2; }
+    }
+    return r;
+}
+
+/* default in the MIDDLE — arms on both sides must stay live */
+u32 pick_mid(u32 k) {
+    u32 r = 0;
+    switch (k) {
+        7 => { r = 7; }
+        default => { r = 99; }
+        8 => { r = 8; }
+    }
+    return r;
+}
+
+u32 main() {
+    if (pick_int(1) != 11) { return 1; }
+    if (pick_int(2) != 23) { return 2; }
+    if (pick_int(3) != 23) { return 3; }
+    if (pick_int(4) != 99) { return 4; }
+
+    if (pick_enum(Color.red) != 1) { return 5; }
+    if (pick_enum(Color.green) != 2) { return 6; }
+    if (pick_enum(Color.blue) != 99) { return 7; }
+
+    if (pick_mid(7) != 7) { return 8; }
+    if (pick_mid(8) != 8) { return 9; }
+    if (pick_mid(9) != 99) { return 10; }
+
+    return 0;
+}

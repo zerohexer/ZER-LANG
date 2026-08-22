@@ -1,0 +1,7 @@
+// expect-error: aggregate values have no value comparison
+union U { u32 i; f32 f; }
+u32 main() {
+    U a; U b;
+    if (a == b) { return 1; }
+    return 0;
+}

@@ -13,6 +13,11 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
+**PROGRESS: an ORIGINAL audit landed 2026-08-23** (BUG-839..841) — three silent
+miscompiles found by probing the compiler directly, not by harvesting. Two of them
+happen to close tracker rows V11/V12 and one closes V6, each WIDER than the row
+described (see the struck-through rows for what the row missed). Remaining: 11.
+
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
 (no timeout + "any non-zero exit" was a weak oracle) and widened the runner's
@@ -67,13 +72,13 @@ phrasing. Cosmetic; the rules fire.
 | ~~V3~~ **DONE 2026-08-22 (BUG-817/818)** | Root-ident walk written 4x as two SEQUENTIAL loops — wrong for any ALTERNATING chain | **pjtawx** BUG-804 (`expr_root_ident` in ast.h) | `@atomic_load(&g_s.arr[0].f)` on a packed nested struct ACCEPTED; `@atomic_load(&g_i.f)` rejected one line away. Misaligned atomic = hard fault on ARM/RISC-V |
 | ~~V4~~ **DONE (BUG-833)** | `&packed.field` gated at 1 of 5 sinks | **87xihb** BUG-804 (5 sinks + non-sticky) | assign / call-arg / alias sinks ACCEPTED. `39294y` BUG-813 is a 2-sink subset — take 87xihb, keep 39294y's `zer_gaps` file for the 4 sinks BOTH leave open |
 | ~~V5~~ **DONE (BUG-834)** | Bit-range write is an implicit RMW, missed at BOTH sinks | **87xihb** BUG-803 | ACCEPTED while `flags += 1` is REJECTED — same operation, different spelling. `resolve_write_target_global` does not peel `NODE_SLICE` |
-| V6 | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
+| ~~V6~~ **DONE 2026-08-23 (BUG-841)** | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | Closed by an independent audit, wider than the branch row: the duplicate `expr_mentions_global` is deleted, the surviving walker is an exhaustive no-`default:` switch over every child field, and the RMW grid grew 6 -> 10 forms (8 false negatives against a pre-fix build, 0 after) |
 | ~~V7~~ **DONE (BUG-830)** | `type_equals` pointer arm checked `is_const` but NOT `is_volatile` | **87xihb** BUG-801 | struct-init field + funcptr param ACCEPTED. The SLICE arm 3 lines away checks both |
 | ~~V8~~ **DONE (BUG-832)** | 4 of 6 sinks blind to the `?*T` optional axis | **pjtawx** BUG-810 | `?*T` call-arg and `?*T` return ACCEPTED. **Complementary to V7, not a duplicate** — V7 is the type-system root, V8 is the hand-rolled per-sink comparison |
 | V9 | `@atomic_*` in a global initializer emits broken C | **4z36e0** BUG-808 (structural) | Emits literally `uint32_t gres = ;`. pjtawx BUG-806 fixes only the atomics subset; 4z36e0 fixes the CAUSE — a name-check wrongly nested inside an `arg_count >= 1` precondition belonging to a different rule |
 | V10 | Zero-arg intrinsic skips the global-init guard entirely | **4z36e0** BUG-808 | `const u32 G = @cpu_model_id();` checker-accepted, only GCC rejects |
-| V11 | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Emitter answers a literal `0`; `a != b` is also false, which is the tell |
-| V12 | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | `switch(1) { default => r=9; 1 => r=1; }` returns **9**. Every arm after `default` becomes dead C |
+| ~~V11~~ **DONE 2026-08-23 (BUG-840)** | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Closed wider than the branch row: `type_is_value_comparable` also covers the RELATIONAL operators (never gated at all), `?T == value` (which read `.value` without `.has_value`, so a null `?u32` compared EQUAL to 0) and `?T == ?T` |
+| ~~V12~~ **DONE 2026-08-23 (BUG-839)** | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | Fixed by lowering the arms in MATCH order (non-default first, default last) rather than rejecting the form — `default` is the fallback its name promises wherever it is written, which is also C's rule |
 | V13 | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
 | V14 | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
 | V15 | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |

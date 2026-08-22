@@ -1,0 +1,10 @@
+// expect-error: aggregate values have no value comparison
+// BUG-840: `struct == struct` was accepted by the checker and answered by the
+// emitter with a literal 0, so `a == b` AND `a != b` were both false.
+struct P { u32 x; u32 y; }
+u32 main() {
+    P a; a.x = 1; a.y = 2;
+    P b; b.x = 1; b.y = 2;
+    if (a == b) { return 0; }
+    return 1;
+}

@@ -5,6 +5,89 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23 — BUG-839..841: three silent miscompiles, found by original audit
+
+Found by probing the compiler directly rather than by harvesting a branch. All three
+are SILENT on both the host and a bare-metal target: they compile clean, run, and
+answer wrongly. Each was verified live on `430bda1` first, and each regression test
+was verified to FAIL against a from-HEAD `git archive` build before the fix landed.
+
+### BUG-839 — a `default` switch arm written before other arms made them DEAD
+`switch (1) { default => { r = 9; }  1 => { r = 1; } }` returned **9**.
+
+The arm chain is lowered in SOURCE order, and the `default` arm emits an
+UNCONDITIONAL entry into its body (a fall-through, not a BRANCH). So a `default`
+written anywhere but last terminated the chain: every arm after it became dead C,
+and the default ran even when a specific arm matched. Nothing warned — not the
+checker, not GCC, because the emitted C is well-formed, just wrong.
+
+`default` means "if nothing else matched", which is a property of the arm and not of
+where it is written; C agrees (case labels are matched before `default` regardless of
+order). Fixed in `ir_lower.c` NODE_SWITCH by lowering the arms in MATCH order — every
+non-default arm first in source order, then the default — instead of source order.
+An exhaustive-enum switch has no default by construction, so the order is the identity
+there and the `elide_compare` optimisation is untouched.
+Test: `tests/zer/switch_default_not_last.zer` (exit 1 pre-fix, 0 after).
+
+### BUG-840 — `struct == struct` silently answered `0`, and so did `!=`
+The checker's comparison gate enumerated the two SPELLINGS someone had been bitten by
+(slice and array) rather than asking the property, and it only gated `==`/`!=`. So:
+
+    P a; P b;  if (a == b) { ... }     // emitter: /* struct/union compare unsupported */ 0
+    if (a != b) { ... }                // ALSO false — logically impossible
+    if (a <  b) { ... }                // relational was never gated at all
+
+`a == b` and `a != b` both false is the tell: no value comparison happened. Unions had
+the same hole. Three further shapes were found while closing it:
+
+- `?T == value` emitted `a.value == 0` — reading the payload WITHOUT `.has_value`, so a
+  **null `?u32` compared EQUAL to 0**. A null check written as `if (x == 0)` silently
+  passed. This is the one with a safety flavour: the guard the user wrote does nothing.
+- `?T == ?T` emitted `a.value == b` — invalid C, caught only by GCC.
+- relational operators on slices/arrays, never gated.
+
+Replaced the spelling test with one predicate, `type_is_value_comparable` — a no-`default:`
+switch over TypeKind, so a new kind fails the build rather than silently joining the
+comparable set. Aggregates (struct/union/slice/array) and STRUCT-representation
+optionals are rejected; integers, floats, bool, enum, pointers, funcptrs, `Handle`,
+`*opaque` (compared by `.ptr`) and null-sentinel `?*T` stay comparable, and `x == null`
+stays legal for every optional shape. The emitter's give-up path now emits an
+undeclared identifier instead of `0`, so a shape that ever slips the gate is a loud GCC
+error rather than a quiet wrong answer (same defence-in-depth as BUG-767).
+Tests: 5 negatives in `tests/zer_fail/compare_*.zer` (all ACCEPTED pre-fix) plus the
+boundary positive `tests/zer/compare_scalar_forms_ok.zer`. Corpus cost: **zero**.
+
+### BUG-841 — the non-atomic-RMW walker missed every LAUNDERED spelling
+With a `volatile` global touched from both an ISR and main:
+
+    g = g + 1;                  // correctly REJECTED
+    g = @truncate(u32, g) + 1;  // ACCEPTED — same operation, different spelling
+    g = idfn(g) + 1;            // ACCEPTED
+    g = maybeu(g) orelse 0;     // ACCEPTED
+
+`expr_mentions_name` — the "does this write also READ its own target?" predicate behind
+the rule at three sinks — was an if-chain over six node kinds ending in
+
+    return false;   /* partial by design: ... never a new rejection */
+
+For THIS question `false` means "not an RMW", so the bail-out rounded toward ACCEPT and
+a missed RMW is a shipped lost-update race. NODE_INTRINSIC, NODE_CALL, NODE_ORELSE,
+NODE_SLICE, NODE_STRUCT_INIT and a nested NODE_ASSIGN were all invisible. Because it was
+an if-chain and not a switch, BOTH walker gates were structurally blind to it
+(`audit_walker_fields.sh` states that limit in its own header).
+
+Now an exhaustive no-`default:` switch that descends every child field of every kind, so
+`-Werror=switch` turns a new NodeKind into a build failure and the field audit covers it.
+The depth cut-off also flipped to `return true`: "I stopped looking" must mean "may
+mention", never "does not". The fix also DELETES `expr_mentions_global`, a byte-for-byte
+duplicate that differed only in its depth constant — the two had to be fixed in lockstep
+and nothing said so.
+Gate: `tests/test_hw_matrix.c` RMW grid grew 6 -> 10 forms (30 -> 38 cells) and was
+verified NON-VACUOUS: **8 false negatives against a pre-fix build, 0 after**. Plus three
+negatives in `tests/zer_fail/rmw_*_launder_*.zer`. Corpus cost: **zero**.
+
+---
+
 ## Session 2026-08-22c — BUG-830..838: §C, the bare-metal family
 
 From `claude/vigilant-tesla-87xihb` and `-pjtawx`. Every one is silent at compile time

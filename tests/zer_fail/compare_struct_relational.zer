@@ -1,0 +1,8 @@
+// expect-error: aggregate values have no value comparison
+// BUG-840: relational operators on aggregates were never gated at all.
+struct P { u32 x; }
+u32 main() {
+    P a; P b;
+    if (a < b) { return 1; }
+    return 0;
+}

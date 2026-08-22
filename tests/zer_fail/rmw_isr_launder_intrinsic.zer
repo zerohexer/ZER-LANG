@@ -1,0 +1,7 @@
+// expect-error: read-modify-written in a single statement
+// BUG-841: `g = @truncate(u32, g) + 1` is the same lost-update race as
+// `g = g + 1`, but the "does the RHS read its own target?" walker did not
+// descend NODE_INTRINSIC, so only the second spelling was rejected.
+volatile u32 g;
+interrupt TIM2 { g = @truncate(u32, g) + 1; }
+u32 main() { g = 0; return (u32)g; }

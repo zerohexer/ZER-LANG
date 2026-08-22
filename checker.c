@@ -653,6 +653,69 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
     return false;
 }
 
+/* BUG-840: can a value of this type be compared by VALUE with ==/!=/</>?
+ *
+ * The old gate enumerated the two SPELLINGS someone had been bitten by (slice
+ * and array) instead of asking the property, so `struct == struct` sailed
+ * through the checker and the emitter answered it with a literal
+ * `/ * struct/union compare unsupported * / 0` — a SILENT wrong answer in which
+ * `a == b` and `a != b` are BOTH false. Same for `union`, and for relational
+ * operators on any of them (only ==/!= were gated at all).
+ *
+ * The property is "does this lower to a C scalar comparison?". An aggregate
+ * does not: C itself forbids `==` on struct/union, and ZER has no element-wise
+ * comparison to lower to. A STRUCT-representation optional (`?T`, two fields)
+ * is an aggregate too — comparing one against a value silently read `.value`
+ * WITHOUT `.has_value`, so a null `?u32` compared EQUAL to 0. Comparison
+ * against `null` is handled by the caller and stays legal for every optional.
+ *
+ * No `default:` — a new TypeKind fails the build under -Werror=switch rather
+ * than silently joining the comparable set. */
+static bool type_is_value_comparable(Type *t) {
+    if (!t) return false;
+    Type *eff = type_unwrap_distinct(t);
+    switch (type_dispatch_kind(eff)) {
+    case TYPE_U8:  case TYPE_U16: case TYPE_U32: case TYPE_U64:
+    case TYPE_I8:  case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_USIZE: case TYPE_UINT: case TYPE_SINT:
+    case TYPE_F32: case TYPE_F64:
+    case TYPE_BOOL: case TYPE_ENUM:
+    case TYPE_POINTER: case TYPE_FUNC_PTR:
+    case TYPE_HANDLE:
+        return true;
+    /* `*opaque` is the two-field `_zer_opaque`, but the emitter compares
+     * `.ptr`, which is the intended pointer identity — keep it comparable. */
+    case TYPE_OPAQUE:
+        return true;
+    /* ?*T / ?FuncPtr are plain C pointers (null sentinel) → comparable.
+     * ?T / ?void carry a `.has_value` field → aggregate. */
+    case TYPE_OPTIONAL:
+        return eff->optional.inner &&
+               (type_dispatch_kind(eff->optional.inner) == TYPE_POINTER ||
+                type_dispatch_kind(eff->optional.inner) == TYPE_FUNC_PTR) &&
+               !(type_dispatch_kind(eff->optional.inner) == TYPE_POINTER &&
+                 eff->optional.inner->pointer.inner &&
+                 type_dispatch_kind(eff->optional.inner->pointer.inner) == TYPE_OPAQUE);
+    case TYPE_STRUCT: case TYPE_UNION: case TYPE_SLICE: case TYPE_ARRAY:
+    case TYPE_VOID: case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+    case TYPE_BARRIER: case TYPE_SLAB: case TYPE_SEMAPHORE:
+    case TYPE_DISTINCT:   /* unreachable: unwrapped above */
+        return false;
+    }
+    return false;
+}
+
+/* Spelling of a comparison operator, for diagnostics. */
+static const char *compare_op_spelling(TokenType op) {
+    if (op == TOK_EQEQ)   return "==";
+    if (op == TOK_BANGEQ) return "!=";
+    if (op == TOK_LT)     return "<";
+    if (op == TOK_GT)     return ">";
+    if (op == TOK_LTEQ)   return "<=";
+    if (op == TOK_GTEQ)   return ">=";
+    return "a comparison operator";
+}
+
 /* Check if an expression node is a literal that can be assigned to target type.
  * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
 static bool is_literal_compatible(Node *expr, Type *target) {
@@ -2099,40 +2162,166 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
  * rule was SYNTACTIC (it tested only the compound operator), so spelling the RMW
  * out in full evaded it at every sink. */
 static bool assign_reads_own_target(Node *value, Symbol *tgt);
-/* Does this expression mention the identifier `nm`? Used to recognise a
- * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
+/* Does this expression mention the identifier `nm`?
+ *
+ * This is the "is the write also a READ of its own target?" predicate behind the
+ * non-atomic-RMW rule, asked at three sinks (ISR compound-assign tracking, the
+ * spawn/shared scan, and the ISR-body walker) plus the pointer-param RMW mask.
+ *
+ * BUG-841: it used to be an if-chain over six node kinds with
+ *     return false;   /* partial by design: ... never a new rejection * /
+ * — but for THIS question `false` means "not an RMW", i.e. the bail-out rounds
+ * toward ACCEPT, and a missed RMW is a shipped race. Measured live: with a
+ * volatile global touched from both an ISR and main,
+ *     g = g + 1;                  // correctly REJECTED
+ *     g = @truncate(u32, g) + 1;  // ACCEPTED — same operation, different spelling
+ * because NODE_INTRINSIC was not in the chain. NODE_CALL, NODE_ORELSE,
+ * NODE_SLICE, NODE_STRUCT_INIT and a nested NODE_ASSIGN were equally invisible.
+ *
+ * Now an exhaustive no-`default:` switch that descends EVERY child expression,
+ * so `-Werror=switch` makes a newly added NodeKind a build failure rather than a
+ * silent new hole (the walker discipline in CLAUDE.md). The depth cut-off also
+ * flipped: it returns TRUE, because "I stopped looking" must mean "may mention",
+ * never "does not mention". 64 is far beyond the parser's expression-nesting
+ * limit, so the conservative arm is unreachable in practice.
+ *
+ * BUG-841 also DELETES `expr_mentions_global`, a byte-for-byte duplicate of this
+ * function that differed only in taking a Symbol and in its depth constant — the
+ * two had to be fixed in lockstep and nothing said so. */
 static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
-    if (!e || !nm || depth > 16) return false;
-    if (e->kind == NODE_IDENT)
+    if (!e || !nm) return false;
+    if (depth > 64) return true;   /* stopped looking ⇒ "may mention" */
+    switch (e->kind) {
+    case NODE_IDENT:
         return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
-    if (e->kind == NODE_BINARY)
+    case NODE_BINARY:
         return expr_mentions_name(e->binary.left, nm, nl, depth + 1) ||
                expr_mentions_name(e->binary.right, nm, nl, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_name(e->field.object, nm, nl, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
-                                       expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    case NODE_UNARY:
+        return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
+    case NODE_FIELD:
+        return expr_mentions_name(e->field.object, nm, nl, depth + 1);
+    case NODE_INDEX:
+        return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
+               expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
+    case NODE_SLICE:
+        return expr_mentions_name(e->slice.object, nm, nl, depth + 1) ||
+               expr_mentions_name(e->slice.start, nm, nl, depth + 1) ||
+               expr_mentions_name(e->slice.end, nm, nl, depth + 1);
+    case NODE_TYPECAST:
+        return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
+    case NODE_INTRINSIC: {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (expr_mentions_name(e->intrinsic.args[i], nm, nl, depth + 1)) return true;
+        return false;
+    }
+    case NODE_CALL: {
+        if (expr_mentions_name(e->call.callee, nm, nl, depth + 1)) return true;
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (expr_mentions_name(e->call.args[i], nm, nl, depth + 1)) return true;
+        return false;
+    }
+    case NODE_ORELSE:
+        return expr_mentions_name(e->orelse.expr, nm, nl, depth + 1) ||
+               expr_mentions_name(e->orelse.fallback, nm, nl, depth + 1);
+    case NODE_ASSIGN:
+        return expr_mentions_name(e->assign.target, nm, nl, depth + 1) ||
+               expr_mentions_name(e->assign.value, nm, nl, depth + 1);
+    case NODE_STRUCT_INIT: {
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (expr_mentions_name(e->struct_init.fields[i].value, nm, nl, depth + 1))
+                return true;
+        return false;
+    }
+    case NODE_EXPR_STMT:
+        return expr_mentions_name(e->expr_stmt.expr, nm, nl, depth + 1);
+    case NODE_RETURN:
+        return expr_mentions_name(e->ret.expr, nm, nl, depth + 1);
+    case NODE_BLOCK: {
+        /* reachable as an `orelse { ... }` fallback */
+        for (int i = 0; i < e->block.stmt_count; i++)
+            if (expr_mentions_name(e->block.stmts[i], nm, nl, depth + 1)) return true;
+        return false;
+    }
+    case NODE_VAR_DECL: case NODE_GLOBAL_VAR:
+        return expr_mentions_name(e->var_decl.init, nm, nl, depth + 1);
+    /* Statement kinds. An assignment's VALUE cannot be one of these today, but
+     * an `orelse { ... }` fallback block can hold any statement, so descend
+     * them all rather than curating a "can't happen here" list — the curated
+     * list is precisely the artefact that produced this bug. Every child field
+     * is walked, which is also what keeps tools/audit_walker_fields.sh green. */
+    case NODE_IF:
+        return expr_mentions_name(e->if_stmt.cond, nm, nl, depth + 1) ||
+               expr_mentions_name(e->if_stmt.then_body, nm, nl, depth + 1) ||
+               expr_mentions_name(e->if_stmt.else_body, nm, nl, depth + 1);
+    case NODE_FOR:
+        return expr_mentions_name(e->for_stmt.init, nm, nl, depth + 1) ||
+               expr_mentions_name(e->for_stmt.cond, nm, nl, depth + 1) ||
+               expr_mentions_name(e->for_stmt.step, nm, nl, depth + 1) ||
+               expr_mentions_name(e->for_stmt.body, nm, nl, depth + 1);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return expr_mentions_name(e->while_stmt.cond, nm, nl, depth + 1) ||
+               expr_mentions_name(e->while_stmt.body, nm, nl, depth + 1);
+    case NODE_SWITCH: {
+        if (expr_mentions_name(e->switch_stmt.expr, nm, nl, depth + 1)) return true;
+        for (int i = 0; i < e->switch_stmt.arm_count; i++) {
+            for (int v = 0; v < e->switch_stmt.arms[i].value_count; v++)
+                if (expr_mentions_name(e->switch_stmt.arms[i].values[v], nm, nl, depth + 1))
+                    return true;
+            if (expr_mentions_name(e->switch_stmt.arms[i].body, nm, nl, depth + 1)) return true;
+        }
+        return false;
+    }
+    case NODE_DEFER:
+        return expr_mentions_name(e->defer.body, nm, nl, depth + 1);
+    case NODE_CRITICAL:
+        return expr_mentions_name(e->critical.body, nm, nl, depth + 1);
+    case NODE_ONCE:
+        return expr_mentions_name(e->once.body, nm, nl, depth + 1);
+    case NODE_AWAIT:
+        return expr_mentions_name(e->await_stmt.cond, nm, nl, depth + 1);
+    case NODE_STATIC_ASSERT:
+        return expr_mentions_name(e->static_assert_stmt.cond, nm, nl, depth + 1);
+    case NODE_SPAWN: {
+        for (int i = 0; i < e->spawn_stmt.arg_count; i++)
+            if (expr_mentions_name(e->spawn_stmt.args[i], nm, nl, depth + 1)) return true;
+        return false;
+    }
+    case NODE_ASM: {
+        for (int i = 0; i < e->asm_stmt.input_count; i++)
+            if (expr_mentions_name(e->asm_stmt.inputs[i].expr, nm, nl, depth + 1)) return true;
+        for (int i = 0; i < e->asm_stmt.output_count; i++)
+            if (expr_mentions_name(e->asm_stmt.outputs[i].expr, nm, nl, depth + 1)) return true;
+        return false;
+    }
+    case NODE_INTERRUPT:
+        return expr_mentions_name(e->interrupt.body, nm, nl, depth + 1);
+    case NODE_FUNC_DECL:
+        return expr_mentions_name(e->func_decl.body, nm, nl, depth + 1);
+    case NODE_FILE: {
+        for (int i = 0; i < e->file.decl_count; i++)
+            if (expr_mentions_name(e->file.decls[i], nm, nl, depth + 1)) return true;
+        return false;
+    }
+    /* True leaves — no Node child at all (checked against the accessor table in
+     * tools/audit_walker_fields.sh). No `default:`: a NEW NodeKind fails the
+     * build instead of silently joining this list. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_MMIO: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+        return false;
+    }
+    return false;
 }
 
-static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
-    if (!e || !g || depth > 12) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == g->name_len &&
-               memcmp(e->ident.name, g->name, g->name_len) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_global(e->binary.left, g, depth + 1) ||
-               expr_mentions_global(e->binary.right, g, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
-                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
-}
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
-    return expr_mentions_global(value, tgt, 0);
+    if (!tgt) return false;
+    return expr_mentions_name(value, tgt->name, tgt->name_len, 0);
 }
 
 /* BUG-801: does this function read-modify-write through pointer parameter n?
@@ -4731,14 +4920,41 @@ static Type *check_expr(Checker *c, Node *node) {
         case TOK_LT: case TOK_GT: case TOK_LTEQ: case TOK_GTEQ:
             /* reject slice/array comparison — C compares struct/pointer, not content.
              * BUG-315: unwrap distinct before checking (distinct []u8 is still a slice). */
-            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ)) {
+            /* BUG-840: ask the PROPERTY ("does this lower to a scalar
+             * comparison?"), not the two spellings that had been reported.
+             * Covers ==/!= AND the relational operators, which were never
+             * gated at all. `x == null` / `null == x` is the sanctioned
+             * optional test and stays legal for every optional shape. */
+            {
                 Type *eff_l = type_unwrap_distinct(left);
                 Type *eff_r = type_unwrap_distinct(right);
-                if ((eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY) ||
-                    (eff_r->kind == TYPE_SLICE || eff_r->kind == TYPE_ARRAY)) {
-                    checker_error(c, node->loc.line,
-                        "cannot compare '%s' with == — use element-wise comparison",
-                        type_name(eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY ? left : right));
+                bool null_operand =
+                    (node->binary.left  && node->binary.left->kind  == NODE_NULL_LIT) ||
+                    (node->binary.right && node->binary.right->kind == NODE_NULL_LIT);
+                if (!null_operand) {
+                    Type *bad = NULL;
+                    if (!type_is_value_comparable(eff_l)) bad = left;
+                    else if (!type_is_value_comparable(eff_r)) bad = right;
+                    if (bad) {
+                        TypeKind bk = type_dispatch_kind(bad);
+                        if (bk == TYPE_SLICE || bk == TYPE_ARRAY) {
+                            checker_error(c, node->loc.line,
+                                "cannot compare '%s' with %s — use element-wise comparison",
+                                type_name(bad), compare_op_spelling(node->binary.op));
+                        } else if (bk == TYPE_OPTIONAL) {
+                            checker_error(c, node->loc.line,
+                                "cannot compare optional '%s' with %s — it may hold no "
+                                "value, so the comparison would read the payload without "
+                                "checking it. Unwrap first (`orelse` or `if (x) |v|`), or "
+                                "compare against null",
+                                type_name(bad), compare_op_spelling(node->binary.op));
+                        } else {
+                            checker_error(c, node->loc.line,
+                                "cannot compare '%s' with %s — aggregate values have no "
+                                "value comparison. Compare the individual fields",
+                                type_name(bad), compare_op_spelling(node->binary.op));
+                        }
+                    }
                 }
             }
             if (!type_equals(left, right) &&

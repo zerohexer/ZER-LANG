@@ -3404,6 +3404,33 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
+                /* BUG-864: a FLOAT source goes through the total float→int
+                 * helper, exactly as a plain cast and @truncate already do
+                 * (BUG-850). The integer-literal clamp chain below CANNOT
+                 * express these bounds: C promotes the literal to the float
+                 * type for the comparison, and `(double)INT32_MAX` rounds UP to
+                 * 2147483648.0 — so `v > 2147483647LL` is FALSE for
+                 * v == 2147483648.0f, the value falls through to the raw cast,
+                 * and the cast is UB. Measured before the fix:
+                 *
+                 *     @saturate(i32, 2147483648.0f) -> -2147483648
+                 *     @saturate(u32, 4294967296.0f) -> 0
+                 *     @saturate(i64, 2^63)          -> INT64_MIN
+                 *     @saturate(u64, 2^64)          -> 0
+                 *
+                 * The intrinsic whose entire contract is "clamp to min/max"
+                 * WRAPPED, silently, at the one boundary that matters. The
+                 * helper compares against exact powers of two (0x1p31, 0x1p32,
+                 * …) which every float format represents exactly, and answers
+                 * NaN as 0. */
+                Type *sat_src = (node->intrinsic.arg_count > 0)
+                    ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+                if (needs_float_to_int_guard(sat_src, t)) {
+                    emit_f2i_open(e, t);
+                    emit_expr(e, node->intrinsic.args[0]);
+                    emit_f2i_close(e, t);
+                    break;
+                }
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
@@ -3436,6 +3463,16 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, "_zer_sat%d < -32768 ? -32768 : _zer_sat%d > 32767 ? 32767 : (int16_t)_zer_sat%d", tmp, tmp, tmp);
                     else if (w == 32)
                         emit(e, "_zer_sat%d < -2147483648LL ? -2147483648LL : _zer_sat%d > 2147483647LL ? 2147483647LL : (int32_t)_zer_sat%d", tmp, tmp, tmp);
+                    else if (w == 64)
+                        /* BUG-864: this arm used to be a bare `(int64_t)_zer_sat`
+                         * — NO clamp at all. A u64 source above INT64_MAX was
+                         * cast straight through and read back negative. The
+                         * literal form matches the IR path's: INT64_MIN cannot
+                         * be written directly (C parses `-9223372036854775808`
+                         * as unary minus on an out-of-range literal). */
+                        emit(e, "_zer_sat%d < (-9223372036854775807LL - 1) ? (-9223372036854775807LL - 1) : "
+                                "_zer_sat%d > 9223372036854775807LL ? 9223372036854775807LL : (int64_t)_zer_sat%d",
+                             tmp, tmp, tmp);
                     else
                         emit(e, "(int64_t)_zer_sat%d", tmp);
                 }
@@ -7686,6 +7723,19 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             /* @saturate(T, val) → clamp to T range */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                /* BUG-864: float source → the total float→int helper. The
+                 * integer-literal clamp below cannot express the bounds (the
+                 * literal is promoted to the float type and INT32_MAX rounds UP
+                 * to 2^31), so `@saturate` WRAPPED at the exact power-of-two
+                 * boundary. Twin of the AST arm; see the comment there. */
+                Type *sat_src = (node->intrinsic.arg_count > 0)
+                    ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+                if (needs_float_to_int_guard(sat_src, t)) {
+                    emit_f2i_open(e, t);
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit_f2i_close(e, t);
+                    return;
+                }
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)

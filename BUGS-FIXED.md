@@ -5,6 +5,59 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23k — BUG-864: `@saturate` wrapped at the one boundary it exists to guard
+
+`@saturate` is the intrinsic ZER tells users to reach for when they want a
+conversion that cannot go wrong. Measured on main:
+
+    @saturate(i32, 2147483648.0f)  -> -2147483648    (want  2147483647)
+    @saturate(u32, 4294967296.0f)  ->  0             (want  4294967295)
+    @saturate(i64, 2^63 as f64)    ->  INT64_MIN     (want  INT64_MAX)
+    @saturate(u64, 2^64 as f64)    ->  0             (want  UINT64_MAX)
+
+Compiles clean, runs clean, wrong SIGN. Not "imprecise" — the exact opposite end
+of the range.
+
+**Cause.** The clamp was a chain of INTEGER literal comparisons
+(`_zer_sat > 2147483647LL ? …`). Against a float operand C promotes the literal
+to the float type, and `(double)INT32_MAX` rounds UP to 2147483648.0 — so
+`v > 2147483647LL` is FALSE for exactly `v == 2147483648.0f`. The value then
+falls through to the raw cast, and a float→int cast that does not fit is UB, so
+it wraps.
+
+**Why the earlier float work missed it.** BUG-850 made plain casts and
+`@truncate` total, and its test asserts `@saturate` "agrees, as it always did".
+It does agree — for 1.0e30. `@saturate` is wrong ONLY at the exact
+power-of-two boundary, so a coarse probe confirms it. This is the vacuous-test
+shape one level in: the assertion was true and the claim it was taken to support
+was not.
+
+**Fix.** A float source now routes through the same total helper the plain cast
+and `@truncate` already use — `_zer_f2i` / `_zer_f2u`, which compare against
+exact powers of two (`0x1p31`, `0x1p32`, …), representable in every float
+format, and answer NaN as 0. Both emitter paths (AST ~3403 and IR ~7685), per
+the dual-dispatch rule.
+
+**Second half, from the same tracker row.** The AST path's signed-64 arm was a
+bare `(int64_t)_zer_sat` with NO clamp at all, so an integer source above
+INT64_MAX was cast straight through and read back negative. It now carries the
+same clamp the IR path has.
+
+**Test.** `tests/zer/saturate_total.zer` — 25 assertions: every width at its
+exact boundary, the negative boundary (representable, and it always worked, kept
+so the new helper cannot have broken it), far-outside values, in-range
+truncation, NaN, and integer sources including the unclamped signed-64 arm.
+Verified to COMPILE and FAIL on a from-`HEAD` build — it fails at the first
+assertion, which is the boundary itself.
+
+Worth noting for the next session: the NaN cases could not be written as
+`0.0/0.0` — the division guard rejects it — so they are built from the quiet-NaN
+bit pattern via `@bitcast`.
+
+`make check` exit 0, 1344 integration tests, all eight gates green.
+
+---
+
 ## Session 2026-08-23j — BUG-863: a value-returning `async` threw its value away
 
 `async u32 compute() { … return 42; }` compiled clean, the state machine

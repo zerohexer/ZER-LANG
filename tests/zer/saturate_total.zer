@@ -1,0 +1,102 @@
+/* BUG-864: `@saturate` — the intrinsic whose entire contract is "clamp to the
+ * min/max of T" — WRAPPED at the exact power-of-two boundary. Measured before
+ * the fix:
+ *
+ *     @saturate(i32, 2147483648.0f)  -> -2147483648   (want 2147483647)
+ *     @saturate(u32, 4294967296.0f)  ->  0            (want 4294967295)
+ *     @saturate(i64, 2^63 as f64)    ->  INT64_MIN    (want INT64_MAX)
+ *     @saturate(u64, 2^64 as f64)    ->  0            (want UINT64_MAX)
+ *
+ * Compiled clean, ran clean, wrong SIGN — from the intrinsic users are told to
+ * reach for when they want safety.
+ *
+ * Cause: the clamp was a chain of INTEGER literal comparisons. Against a float
+ * operand C promotes the literal to the float type, and `(double)INT32_MAX`
+ * rounds UP to 2147483648.0 — so `v > 2147483647LL` is FALSE for exactly
+ * v == 2147483648.0f, the value falls through to the raw cast, and a float→int
+ * cast that does not fit is UB. This is why the earlier float-totality work
+ * (BUG-850) did not catch it: `@saturate` is right for 1.0e30 and wrong only at
+ * the boundary, so a coarse probe agrees with it.
+ *
+ * A float source now goes through the same total helper a plain cast and
+ * @truncate already used, which compares against exact powers of two (0x1p31,
+ * 0x1p32, …) — representable in every float format — and answers NaN as 0.
+ *
+ * The second half of the bug was in the AST emission path: the signed-64 arm
+ * was a bare `(int64_t)_zer_sat` with NO clamp at all, so an INTEGER source
+ * above INT64_MAX was cast straight through and read back negative.
+ *
+ * Everything is laundered through `volatile` so no conversion here is folded at
+ * compile time.
+ */
+
+volatile f32 f32src;
+volatile f64 f64src;
+volatile u64 u64src;
+volatile i64 i64src;
+
+u32 main() {
+    /* --- THE BOUNDARY: exactly 2^(w-1) / 2^w, where the old chain wrapped --- */
+    f32src = 2147483648.0;
+    if (@saturate(i32, f32src) != 2147483647) { return 1; }
+    f32src = 4294967296.0;
+    if (@saturate(u32, f32src) != 4294967295) { return 2; }
+    f32src = 32768.0;
+    if (@saturate(i16, f32src) != 32767) { return 3; }
+    f32src = 65536.0;
+    if (@saturate(u16, f32src) != 65535) { return 4; }
+    f32src = 128.0;
+    if (@saturate(i8, f32src) != 127) { return 5; }
+    f32src = 256.0;
+    if (@saturate(u8, f32src) != 255) { return 6; }
+
+    f64src = 9223372036854775808.0;              /* 2^63 */
+    if (@saturate(i64, f64src) != 9223372036854775807) { return 7; }
+    f64src = 18446744073709551616.0;             /* 2^64 */
+    if (@saturate(u64, f64src) != 18446744073709551615) { return 8; }
+
+    /* --- the negative boundary is exactly representable and always worked;
+     *     kept so the new helper cannot have broken it --- */
+    f64src = -2147483648.0;
+    if (@saturate(i32, f64src) != -2147483648) { return 9; }
+    f64src = -2147483649.0;
+    if (@saturate(i32, f64src) != -2147483648) { return 10; }
+
+    /* --- far outside, which the old chain did get right --- */
+    f64src = 1.0e30;
+    if (@saturate(i32, f64src) != 2147483647) { return 11; }
+    if (@saturate(u32, f64src) != 4294967295) { return 12; }
+    f64src = -1.0e30;
+    if (@saturate(i32, f64src) != -2147483648) { return 13; }
+    if (@saturate(u32, f64src) != 0) { return 14; }
+
+    /* --- in range: ordinary truncation toward zero, unchanged --- */
+    f64src = 3.9;
+    if (@saturate(i32, f64src) != 3) { return 15; }
+    f64src = -3.9;
+    if (@saturate(i32, f64src) != -3) { return 16; }
+
+    /* --- NaN is 0, matching ZER's float->int definition. Built from its bit
+     *     pattern rather than 0.0/0.0, which the division guard rejects. --- */
+    u64src = 9221120237041090560;              /* 0x7FF8000000000000 = quiet NaN */
+    f64src = @bitcast(f64, u64src);
+    if (@saturate(i32, f64src) != 0) { return 17; }
+    if (@saturate(u32, f64src) != 0) { return 18; }
+
+    /* --- INTEGER sources: the signed-64 arm that had no clamp --- */
+    u64src = 18446744073709551615;
+    if (@saturate(i64, u64src) != 9223372036854775807) { return 19; }
+    if (@saturate(i32, u64src) != 2147483647) { return 20; }
+    u64src = 9223372036854775808;                /* 2^63 */
+    if (@saturate(i64, u64src) != 9223372036854775807) { return 21; }
+
+    i64src = -9223372036854775807;
+    if (@saturate(i32, i64src) != -2147483648) { return 22; }
+    if (@saturate(i8, i64src) != -128) { return 23; }
+    i64src = 300;
+    if (@saturate(u8, i64src) != 255) { return 24; }
+    i64src = -5;
+    if (@saturate(u8, i64src) != 0) { return 25; }
+
+    return 0;
+}

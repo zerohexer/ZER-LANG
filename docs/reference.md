@@ -1792,10 +1792,37 @@ u8 low = @truncate(u8, 0x1234);    // 0x34
 **DESCRIPTION**
 Clamp val to the min/max of type T. No data loss — just capped.
 
+`@saturate` is TOTAL: every input has a defined answer, at every width, from an
+integer or a float source. A float is truncated toward zero and then clamped,
+and NaN is 0 — the same definition a plain `(T)f` cast uses. In particular the
+clamp holds at the exact power-of-two boundary (`@saturate(i32, 2147483648.0)`
+is `2147483647`, not `-2147483648`), which a comparison written in floating
+point does not give you, because `2147483647` is not representable in `f32` and
+rounds up.
+
 **EXAMPLE**
 ```zer
 i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
-u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
+u8 floored = @saturate(u8, -5);    // 0 (u8 min)
+```
+
+```zer
+// audit: check
+volatile f32 f;
+volatile u64 big;
+
+u32 main() {
+    f = 2147483648.0;                              // exactly 2^31
+    if (@saturate(i32, f) != 2147483647) { return 1; }
+    f = -1.0e30;
+    if (@saturate(u32, f) != 0) { return 2; }      // negative into unsigned
+    f = 7.9;
+    if (@saturate(u8, f) != 7) { return 3; }       // truncate toward zero
+
+    big = 18446744073709551615;
+    if (@saturate(i64, big) != 9223372036854775807) { return 4; }
+    return 0;
+}
 ```
 
 **SAFETY**

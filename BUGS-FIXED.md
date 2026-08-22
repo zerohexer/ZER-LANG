@@ -5,6 +5,72 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23m — BUG-866/867: async and `container(T)` did not work across a module boundary either
+
+BUG-865 was one instance of a class, so the class got swept: cross a module
+boundary with every feature whose emitted C NAME is constructed rather than
+copied. Two more were broken, both loud-in-GCC and silent-in-ZER.
+
+### BUG-866 — an `async` function in an imported module could not be used
+
+The emitter builds the coroutine's five internal names from
+`func->module_prefix`: `_zer_async_lib1__acompute`, `…_init`, `…_poll`,
+`…_result`, and the state-struct type. The CHECKER registers all of them
+UNMANGLED (`_zer_async_acompute…`) — and that unmangled spelling is what the
+user writes, what the checker accepts, and what the emitter then emits verbatim
+at the use site. So GCC saw no such type and no such function:
+
+    warning: implicit declaration of function '_zer_async_acompute_result';
+             did you mean '_zer_async_lib1__acompute_result'?
+
+Async across a module boundary did not compile, in any form.
+
+Fixed on the EMITTER side — the async internal names are no longer
+module-mangled. That is the side that had to move: the checker's registration is
+what the user's source spells, and the accessor names are documented API
+(`reference.md`). The cost is that two modules each defining an async function
+of the same name now collide as a C redefinition; that is loud, and it was
+already true of the state-struct TYPE name, which the checker registered
+unmangled either way.
+
+### BUG-867 — a `container` template across a module boundary, two ways
+
+```
+error: redefinition of 'struct Box_u32'
+```
+
+`container_instances[]` is ONE list on the Checker — a stamp is keyed by
+template plus type argument, not by which module wrote it — but
+`emit_container_structs` was called once per MODULE, each call with a fresh
+`emitted[]` array. So every stamp was emitted twice.
+
+Underneath that was a second, independent defect: the definition emitted the
+bare `st->struct_type.name` while every REFERENCE goes through
+`EMIT_STRUCT_NAME`, which prepends `module_prefix`. For a stamp created inside
+an imported module the definition said `struct Box_u32` and the use said
+`struct lib2__Box_u32` — an incomplete type. Fixing only the duplicate would
+have swapped one GCC error for another, which is why both are here.
+
+### Test
+
+`test_modules/xfeat_user.zer` + `xfeat_mod.zer` — a container stamped in BOTH
+modules, a value-returning async, a void async, and an imported function through
+a funcptr. Measured on a from-`HEAD` build: **5 GCC errors**; zero now.
+Module tests 30/30.
+
+### Method note
+
+All three cross-module bugs have the same shape: **the emitted C name is
+CONSTRUCTED at two places that disagree.** BUG-865 the emitter forgot the prefix
+the checker's symbol carried; BUG-866 the emitter added a prefix the checker had
+not; BUG-867 the definition and the reference of one type disagreed. None is
+visible from either side alone — only from compiling a program that crosses the
+boundary. Worth a standing probe whenever a feature grows a generated C name.
+
+`make check` exit 0, all eight gates green.
+
+---
+
 ## Session 2026-08-23l — BUG-865: `spawn <imported function>` did not link, and a doc that claimed UB where ZER has none
 
 ### BUG-865 — spawning an imported function emitted the UNMANGLED name

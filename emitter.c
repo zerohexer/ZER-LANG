@@ -4177,7 +4177,16 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
     inprog[ci] = 0;
     if (emitted[ci]) return;
     emitted[ci] = 1;
-    emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
+    /* BUG-867: spell the DEFINITION the same way every REFERENCE is spelled.
+     * This used to emit the bare `st->struct_type.name` while a variable of the
+     * type went through EMIT_STRUCT_NAME, which prepends `module_prefix`. For a
+     * stamp created inside an imported module that meant the definition said
+     * `struct Box_u32` and the use said `struct lib2__Box_u32` — GCC saw an
+     * incomplete type, so a `container` template used across a module boundary
+     * did not compile. */
+    emit(e, "struct ");
+    EMIT_STRUCT_NAME(e, st);
+    emit(e, " {\n");
     e->indent++;
     for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
         SField *sf = &st->struct_type.fields[fi];
@@ -4193,6 +4202,13 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
  * by-value container field's struct is always complete before its user. */
 static void emit_container_structs(Emitter *e) {
     if (!e->checker || e->checker->container_inst_count == 0) return;
+    /* BUG-867: once per BUILD, not once per module — the instance list is shared
+     * (a stamp is keyed by template + type argument, not by which module wrote
+     * it), so the per-module call emitted `struct Box_u32` twice and GCC
+     * reported a redefinition. Any `container` template used across a module
+     * boundary hit this. */
+    if (e->container_structs_emitted) return;
+    e->container_structs_emitted = true;
     int n = e->checker->container_inst_count;
     char *emitted = (char *)calloc((size_t)n, 1);
     char *inprog = (char *)calloc((size_t)n, 1);
@@ -12882,16 +12898,30 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     if (!fn) return;
 
     /* Build mangled name */
+    /* BUG-866: the async internal names are NOT module-mangled.
+     *
+     * They used to be — `_zer_async_lib1__acompute` for a coroutine in module
+     * `lib1` — while the CHECKER registers the state-struct type and the
+     * init/poll/result accessors under the UNMANGLED `_zer_async_acompute`
+     * (checker.c, the NODE_FUNC_DECL async arm). So a user of an imported async
+     * wrote exactly what the checker accepts, the emitter emitted it verbatim at
+     * the use site, and GCC found no such type or function: async across module
+     * boundaries did not compile at all, in any form, with the failure landing
+     * as a GCC error in generated code rather than a ZER diagnostic.
+     *
+     * Dropping the prefix here makes all five names agree — the type, _init,
+     * _poll, _result and the state struct — and it is the side that had to move:
+     * the checker's registration is what the user's source spells, and the
+     * accessor names are part of the documented API (reference.md "async").
+     *
+     * The cost is that two modules each defining an async function of the SAME
+     * name now collide, as a C redefinition error. That is loud, and it was
+     * already true of the state-struct TYPE name before this change (the
+     * checker registered it unmangled either way). Recorded in
+     * docs/limitations.md. */
     char mname[256];
-    int flen;
-    if (func->module_prefix) {
-        flen = snprintf(mname, sizeof(mname), "%.*s__%.*s",
-            (int)func->module_prefix_len, func->module_prefix,
-            (int)func->name_len, func->name);
-    } else {
-        flen = snprintf(mname, sizeof(mname), "%.*s",
-            (int)func->name_len, func->name);
-    }
+    int flen = snprintf(mname, sizeof(mname), "%.*s",
+        (int)func->name_len, func->name);
     if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
 
     /* BUG-863: a value-returning async needs somewhere to PUT the value.

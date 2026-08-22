@@ -5,6 +5,34 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — two modules cannot each define an `async` function of the same NAME (LOW, collision)
+
+**Symptom.** The async internal names — the state-struct type and the
+`_init` / `_poll` / `_result` accessors — are NOT module-mangled (BUG-866). So
+`async void tick()` in two different modules produces two
+`typedef struct { … } _zer_async_tick;` in one translation unit and GCC reports
+a redefinition.
+
+**Why it is this way.** The CHECKER registers those names unmangled, and that
+unmangled spelling is what the user's source writes and what
+`docs/reference.md` documents as the API. Before BUG-866 the emitter mangled
+them, which made async unusable across a module boundary AT ALL — a much larger
+hole than a name collision. The state-struct TYPE already collided this way
+before the fix, since the checker registered it unmangled regardless.
+
+**Failure mode is loud** (a C redefinition error), never a silent miscompile.
+
+**Fix sketch.** Give the async accessor symbols a `module_prefix` and teach the
+use site to spell the mangled form — i.e. make the checker register
+`_zer_async_<prefix>__<name>_poll` and have an importer's unqualified
+`_zer_async_<name>_poll` resolve to it, the same two-name registration imported
+functions already get (CLAUDE.md "Dual symbol registration is a known pattern in
+multi-module"). That is the durable answer; it needs the emitter and the checker
+to agree on ONE composition, which is what all three of BUG-865/866/867 were
+about.
+
+---
+
 ## OPEN — `spawn mod.func()` is a parse error while `mod.func()` is accepted (LOW, ergonomics)
 
 **Symptom (measured 2026-08-23):**

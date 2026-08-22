@@ -1,0 +1,28 @@
+// BUG-866 / BUG-867 support module: features whose EMITTED names are built
+// differently inside an imported module than at the use site.
+container Box(T) { T v; }
+container Pair(T) { T a; T b; }
+
+// a container stamped INSIDE the module — this is what made the stamp carry a
+// module_prefix, so the definition and the reference disagreed (BUG-867)
+u32 lib_use() {
+    Box(u32) b;
+    b.v = 3;
+    Pair(u32) p;
+    p.a = 1;
+    p.b = 2;
+    return b.v + p.a + p.b;
+}
+
+// an async coroutine in a module: the emitter mangled its five internal names
+// while the checker registered them unmangled (BUG-866)
+async u32 acompute(u32 s) {
+    yield;
+    return s + 1;
+}
+
+async void atick() {
+    yield;
+}
+
+u32 dbl(u32 x) { return x * 2; }

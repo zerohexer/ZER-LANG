@@ -82,6 +82,9 @@ fi
 run_test shared_user 0
 # BUG-865: spawn of an IMPORTED function emitted the unmangled name (link failure)
 run_test spawn_user 0
+# BUG-866/867: async and container(T) across a module boundary (both emitted names
+# the use site could not name)
+run_test xfeat_user 0
 # Multi-module: move struct across modules
 run_test move_user 0
 # Multi-module: handle lifecycle across modules

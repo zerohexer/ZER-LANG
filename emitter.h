@@ -63,6 +63,11 @@ typedef struct {
     int spawn_wrapper_capacity;
     int next_spawn_id;      /* counter for unique spawn wrapper IDs */
 
+    /* BUG-867: container_instances[] is ONE list on the Checker, shared by every
+     * module in the build, so emitting it per-module produced a duplicate
+     * `struct Box_u32 { … }` and GCC refused the file. Emit it once. */
+    bool container_structs_emitted;
+
     /* async function emission state */
     bool in_async;              /* true when emitting inside an async function body */
     int async_yield_id;         /* counter for yield/await state IDs */

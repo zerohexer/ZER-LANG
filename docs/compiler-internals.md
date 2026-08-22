@@ -3627,8 +3627,8 @@ The `[]T → *T` auto-coerce for extern functions must check const: if arg is st
 
 **Flags (zerc_main.c):**
 - `--track-cptrs`: explicitly enable Level 3+4+5
-- `--release`: disable Level 3+4+5 (Level 1+2 always active)
-- `--run` without `--release`: Level 3+4+5 enabled by default (`track_cptrs || (!release_mode && do_run)`)
+- `--release`: NO LONGER disables Level 3+4+5 — see the corrected line below.
+- `--run`: Level 3+4+5 enabled by default (`track_cptrs || do_run`). **STALE UNTIL 2026-08-23** — this line used to read `track_cptrs || (!release_mode && do_run)`, but the gate was changed to "always on for --run, INCLUDING --release" (compiled-in safety, not debug) and this sentence was not updated. `--release` has had no effect since; it now warns that it has none (BUG-853).
 - `emitter.track_cptrs` flag on Emitter struct controls preamble emission
 
 **Full design document:** `docs/ZER_OPAQUE.md` — 601 lines covering all levels, edge cases, performance, Ada/SPARK comparison, implementation plan.

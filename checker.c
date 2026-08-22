@@ -11,8 +11,8 @@
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
-#include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
-#include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
+#include "src/safety/comptime_rules.h"     /* zer_comptime_ (static_assert / expr_nesting) — R */
+#include "src/safety/cast_rules.h"         /* zer_conversion_safe / bitcast / saturate / ptrtoint — J-ext */
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include "src/safety/asm_instruction_table.h" /* zer_asm_instruction_info — F4 per-instruction safety dispatch */
@@ -563,7 +563,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
- * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+ * Returns true and sets out_min / out_max if a bounded range was derived. */
 /* Refactor 1: unified VRP range invalidation for assignments.
  * Handles both simple ident keys and compound keys (s.x).
  * For TOK_EQ: tries literal, derive_expr_range, call return range.
@@ -2146,7 +2146,7 @@ static void record_resource_use(Checker *c, Symbol *sym, int line,
 }
 
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
- * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
+ * through & / field / index / slice / orelse / intrinsic / cast. If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
  * callee position makes the caller param escape too). Else -1. */
 static int keep_arg_caller_root(Checker *c, Node *arg) {
@@ -2571,7 +2571,7 @@ static bool assign_reads_own_target(Node *value, Symbol *tgt);
  * spawn/shared scan, and the ISR-body walker) plus the pointer-param RMW mask.
  *
  * BUG-841: it used to be an if-chain over six node kinds with
- *     return false;   /* partial by design: ... never a new rejection * /
+ *     return false;   // partial by design: ... never a new rejection
  * — but for THIS question `false` means "not an RMW", i.e. the bail-out rounds
  * toward ACCEPT, and a missed RMW is a shipped race. Measured live: with a
  * volatile global touched from both an ISR and main,
@@ -9866,7 +9866,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * to a wrong line.
                  *
                  * Two parse paths:
-                 *  (a) type keyword (u32/*T/etc.) → type_arg set, args carry values
+                 *  (a) type keyword (u32, *T, etc.) → type_arg set, args carry values
                  *  (b) named type as TOK_IDENT for intrinsics NOT in force_type_arg
                  *      (currently only @size) → type_arg NULL, args[0] is the type ident
                  *      (see parser.c:931-936 + BUG-316 path). The checker dispatch at
@@ -13350,7 +13350,7 @@ static void check_stmt(Checker *c, Node *node) {
             /* Walk parent scope chain to check if name matches a param */
             Symbol *existing = scope_lookup(c->current_scope,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len);
-            if (existing && existing->line != node->loc.line) {
+            if (existing && (int)existing->line != node->loc.line) {
                 checker_error(c, node->loc.line,
                     "variable '%.*s' shadows function parameter in async function — "
                     "async locals share state struct with params, shadowing overwrites param value. "
@@ -20503,7 +20503,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 }
 
 /* Scan a function body for return expressions with derivable range.
- * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+ * If ALL return expressions have the same derivable range, set out_min / out_max. */
 /* Union in the return ranges of any orelse-block fallback BURIED inside an
  * expression: `u32 v = (mb() orelse {return 9;}) + b;`, `id(mb() orelse
  * {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The original B9
@@ -21582,13 +21582,15 @@ bool checker_check(Checker *c, Node *file_node) {
     }
 
     /* Pass 2: type-check all function bodies and global initializers */
-    bool ok = checker_check_bodies(c, file_node);
+    /* The verdict is `c->error_count == 0` at the end, not this return value:
+     * every later pass can add errors. Kept as a (void) so the call's intent —
+     * "run the bodies" — stays readable without a variable nothing reads. */
+    (void)checker_check_bodies(c, file_node);
 
     /* Pass 2.4: resource-initialisation check (deferred — see check_resource_init) */
     check_resource_init(c);
     /* Pass 2.5: keep inference — transitive escape fixpoint + deferred enforcement */
     check_keep_inference(c);
-    if (c->error_count > 0) ok = false;
 
     /* Pass 3: whole-program *opaque param provenance validation */
     if (c->param_expect_count > 0) {

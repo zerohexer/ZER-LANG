@@ -251,7 +251,7 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
+    bool release_mode = false;   /* see --release below: currently inert */
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -293,6 +293,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
+            /* BUG-853: `--release` used to gate `track_cptrs`
+             * (`track_cptrs || (!release_mode && do_run)`), but that was
+             * deliberately changed to "always on for --run, including
+             * --release" — see the emitter setup below. The flag has had NO
+             * effect since, while docs/compiler-internals.md still described the
+             * old gate. Accepting a flag and doing nothing with it is the same
+             * silent affirmation BUG-844 was about, one level up, so say so. */
+            fprintf(stderr, "warning: --release currently has no effect — the "
+                    "pointer-tracking it used to disable is now always on "
+                    "(compiled-in safety, not debug). The flag is kept for the "
+                    "roadmap'd meaning; see docs/safety-roadmap.md\n");
             release_mode = true;
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             /* BUG-844: `atoi` maps any non-numeric text to 0, and a 0-bit
@@ -405,6 +416,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    (void)release_mode;   /* inert today — the warning above states so */
+
     /* auto-detect target pointer width from GCC if not explicitly set */
     if (!target_bits_explicit) {
         const char *probe_gcc = gcc_override ? gcc_override : "gcc";
@@ -472,9 +485,7 @@ int main(int argc, char **argv) {
         use_temp_c = true;
     }
 
-    /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    /* for temp .c mode, set up the exe path */
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

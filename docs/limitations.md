@@ -171,9 +171,13 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
   `git status` is useless for review. Best version: **pmytnl** (`.gitignore` by shape +
   the measurement). pjtawx removes 560; 4z36e0 covers 23. Untracking the existing set is a
   `git rm --cached` sweep — an owner decision, not a fix.
-- **Build warnings 27 -> 0** (pmytnl): a `size_t`-into-`%.*s` varargs mismatch, a missing
-  return in `lower_expr`, a sign-compare, two `calloc(int,...)` clamps, six self-closing
-  comments, ~350 lines of provably-dead code.
+- ~~**Build warnings 27 -> 0**~~ **DONE 2026-08-23 independently (26 -> 0).** The
+  branch's list is confirmed item for item: the `size_t`-into-`%.*s` varargs mismatch
+  (UB), the missing return in `lower_expr`, the sign-compares, the `calloc(int,...)`
+  clamps, the self-closing comments, and ~230 lines of dead code — including
+  `find_shared_root_in_stmt`, the drifted shared-root walker BUG-817 unified away, and
+  `ir_classify_method_call`, the Gap-32 backward-compat wrapper. A clean
+  `rm -f *.o src/safety/*.o && make zerc` is now silent.
 - ~~**`reference.md` intrinsic coverage**~~ **DONE 2026-08-23, independently.** All 96
   undocumented intrinsics are now in `docs/reference.md` ("Systems / privileged intrinsics
   — the complete set"), grouped into ten families with a compileable example each. Every

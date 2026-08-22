@@ -699,7 +699,12 @@ bool ir_validate(IRFunc *func) {
      * unreleased lock at runtime. Logged as ERROR, aborts compilation. */
     {
         /* Pre-compute which blocks contain ≥1 emit-bodies FIRE. */
-        bool *fire_in_block = (bool *)calloc(func->block_count, sizeof(bool));
+        /* block_count is an int; GCC cannot prove it non-negative here, and a
+         * negative one converts to a near-SIZE_MAX allocation request. Clamp
+         * at the call rather than silencing the warning — and do NOT early-
+         * return, which would skip the rest of ir_validate. */
+        size_t _nb = func->block_count > 0 ? (size_t)func->block_count : 0;
+        bool *fire_in_block = (bool *)calloc(_nb ? _nb : 1, sizeof(bool));
         if (fire_in_block) {
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *block = &func->blocks[bi];
@@ -712,7 +717,7 @@ bool ir_validate(IRFunc *func) {
                 }
             }
             /* For every PUSH, verify a reachable FIRE exists. */
-            bool *visited = (bool *)calloc(func->block_count, sizeof(bool));
+            bool *visited = (bool *)calloc(_nb ? _nb : 1, sizeof(bool));
             if (visited) {
                 for (int bi = 0; bi < func->block_count; bi++) {
                     IRBlock *block = &func->blocks[bi];

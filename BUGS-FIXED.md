@@ -5,6 +5,52 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23e — BUG-853 + build warnings 26 -> 0
+
+### Build warnings: 26 -> 0, and two of them were real defects
+A clean `rm -f *.o src/safety/*.o && make zerc` emitted 26 warnings. Two were not
+cosmetic:
+
+- **`zercheck_ir.c` passed a `size_t` to `%.*s`.** The field-precision specifier
+  takes an `int`; passing a `size_t` through varargs is UNDEFINED. It happens to
+  work on x86-64 because the callee reads the low half of the same register, and
+  would not on an ABI that passes them differently. Two sites, both cast.
+- **`ir_lower.c:lower_expr` fell off the end of a non-void function.** The switch
+  above it is exhaustive and every arm returns, so it is unreachable today — but a
+  NEW NodeKind whose arm forgets to return would have returned whatever was in the
+  return register, silently, as a local id. Now `return -1` ("no value produced").
+
+The rest, fixed rather than silenced:
+- **`ir.c` `calloc(func->block_count, ...)`** with an `int` GCC cannot prove
+  non-negative — a negative one converts to a near-SIZE_MAX request. Clamped at the
+  call (the first attempt early-returned from `ir_validate`, which would have
+  skipped the rest of validation — corrected).
+- **Two `#include` lines with "extra tokens".** `/* zer_comptime_*/_static_assert`
+  — the `*/` inside `zer_comptime_*` CLOSES the comment, leaving stray tokens after
+  the directive. Five more `"/*" within comment` warnings had the same self-closing
+  shape (`&/*`, `u32/*T`, `*out_min/*out_max`). CLAUDE.md already records this trap
+  for Coq comments; it applies to C just as well.
+- Two sign-compares, and ~230 lines of provably-dead code: `find_shared_root_in_stmt`
+  (the drifted copy of the shared-root walker that BUG-817 unified away),
+  `shared_needs_condvar`, `stmt_writes_shared`, `collect_async_locals`,
+  `classify_builtin_call`, `peek`, `arena_array`, `tok_str`, and
+  `ir_classify_method_call` — the backward-compat wrapper CLAUDE.md's Gap-32 note
+  said to "deprecate as you go"; nothing calls it any more, so it is gone.
+
+### BUG-853 — `--release` had had no effect for months, and the docs still described the old one
+`--release` used to gate pointer tracking (`track_cptrs || (!release_mode &&
+do_run)`). That gate was deliberately changed to "always on for --run, INCLUDING
+--release" — compiled-in safety, not debug — and the flag became inert. Nothing
+said so: `docs/compiler-internals.md` still documented the old expression, and
+`zerc --release` exited 0 having done nothing.
+
+That is the same silent affirmation BUG-844 was about, one level up — a build tool
+reporting success for a flag it did not honour. `--release` now warns that it
+currently has no effect, and the stale documentation line is corrected in place
+rather than deleted, so the change is visible to anyone who read the old one.
+
+---
+
 ## Session 2026-08-23d — BUG-850..852: undefined behavior, a dropped attribute, and a silent infinite loop
 
 ### BUG-850 — float -> integer conversion was UNDEFINED, and GCC disagreed with itself

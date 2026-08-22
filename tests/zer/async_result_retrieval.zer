@@ -1,0 +1,132 @@
+/* BUG-863: a value-returning `async` had no way to hand its value back.
+ *
+ * `async u32 compute() { … return 42; }` compiled clean and the state machine
+ * finalized correctly, but the emitter DISCARDED the value at the return site —
+ * the poll protocol is an `int` done-flag, and there was nowhere else to put it.
+ * So `async <non-void>` was neither rejected nor retrievable: a silent footgun
+ * where the compiler accepted a function whose whole point was unreachable.
+ *
+ * The state struct now carries a stable `_zer_result` field, filled at every
+ * return, and a `_zer_async_NAME_result(&task)` accessor reads it. The poll
+ * protocol is untouched — "is it finished" and "what did it produce" are
+ * different questions, so the done-flag stays an `int`.
+ *
+ * Two details that needed the non-async return path's logic mirrored, and had
+ * to be found by running rather than reading:
+ *   - a value-optional (`?u32`) is a {value, has_value} STRUCT, so the bare
+ *     temp cannot be assigned to the result field; it needs the same wrap the
+ *     ordinary return emits.
+ *   - a BARE `return;` from a `?void` function means has_value=1, not 0.
+ *
+ * A VOID async gets no accessor at all — `_zer_async_blink_result` is an
+ * undefined identifier, pinned by tests/zer_fail/async_void_no_result.zer.
+ */
+
+struct Pt { u32 x; u32 y; }
+
+u32 g = 9;
+
+/* plain scalar, several suspension points, a computed value */
+async u32 compute(u32 seed) {
+    u32 acc = seed;
+    yield;
+    acc = acc * 2;
+    yield;
+    return acc + 1;
+}
+
+/* a struct by value */
+async Pt make(u32 a) {
+    yield;
+    Pt p;
+    p.x = a;
+    p.y = a + 1;
+    return p;
+}
+
+/* a VALUE optional — the {value, has_value} wrap */
+async ?u32 lookup(u32 k) {
+    yield;
+    if (k > 10) { return null; }
+    return k * 2;
+}
+
+/* a NULL-SENTINEL optional — no wrap needed */
+async ?*u32 find(u32 k) {
+    yield;
+    if (k > 5) { return null; }
+    return &g;
+}
+
+/* ?void — has_value only, and a BARE return means present */
+async ?void ack(u32 k) {
+    yield;
+    if (k > 5) { return null; }
+    return;
+}
+
+u32 main() {
+    /* --- scalar --- */
+    _zer_async_compute t;
+    _zer_async_compute_init(&t, 20);
+    u32 spins = 0;
+    while (_zer_async_compute_poll(&t) == 0) {
+        spins += 1;
+        if (spins > 10) { return 1; }
+    }
+    if (_zer_async_compute_result(&t) != 41) { return 2; }
+    if (spins != 2) { return 3; }
+
+    /* the result is stable across extra polls of a finished task */
+    if (_zer_async_compute_poll(&t) != 1) { return 4; }
+    if (_zer_async_compute_result(&t) != 41) { return 5; }
+
+    /* --- struct --- */
+    _zer_async_make m;
+    _zer_async_make_init(&m, 5);
+    while (_zer_async_make_poll(&m) == 0) { }
+    Pt r = _zer_async_make_result(&m);
+    if (r.x != 5) { return 6; }
+    if (r.y != 6) { return 7; }
+
+    /* --- value optional, both arms --- */
+    _zer_async_lookup l;
+    _zer_async_lookup_init(&l, 4);
+    while (_zer_async_lookup_poll(&l) == 0) { }
+    ?u32 lr = _zer_async_lookup_result(&l);
+    if (lr) |v| { if (v != 8) { return 8; } } else { return 9; }
+
+    _zer_async_lookup l2;
+    _zer_async_lookup_init(&l2, 99);
+    while (_zer_async_lookup_poll(&l2) == 0) { }
+    ?u32 lr2 = _zer_async_lookup_result(&l2);
+    if (lr2) |_x| { return 10; }
+
+    /* --- null-sentinel optional, both arms --- */
+    _zer_async_find f;
+    _zer_async_find_init(&f, 1);
+    while (_zer_async_find_poll(&f) == 0) { }
+    ?*u32 fr = _zer_async_find_result(&f);
+    if (fr) |p| { if (*p != 9) { return 11; } } else { return 12; }
+
+    _zer_async_find f2;
+    _zer_async_find_init(&f2, 99);
+    while (_zer_async_find_poll(&f2) == 0) { }
+    ?*u32 fr2 = _zer_async_find_result(&f2);
+    if (fr2) |_q| { return 13; }
+
+    /* --- ?void: bare return is PRESENT, `return null` is absent --- */
+    _zer_async_ack a;
+    _zer_async_ack_init(&a, 1);
+    while (_zer_async_ack_poll(&a) == 0) { }
+    ?void ar = _zer_async_ack_result(&a);
+    if (ar) { } else { return 14; }
+
+    _zer_async_ack a2;
+    _zer_async_ack_init(&a2, 99);
+    while (_zer_async_ack_poll(&a2) == 0) { }
+    ?void ar2 = _zer_async_ack_result(&a2);
+    if (ar2) { return 15; }
+
+    return 0;
+}

@@ -3700,6 +3700,45 @@ void regular() {
 }
 ```
 
+**RETURNING A VALUE FROM AN ASYNC FUNCTION**
+
+An `async` function may return a value. The poll protocol stays an `int`
+done-flag — "is it finished" and "what did it produce" are separate questions —
+and the value is read with a third generated function,
+`_zer_async_NAME_result(&task)`:
+
+| generated | for | signature |
+|---|---|---|
+| `_zer_async_NAME_init`   | every async fn   | `void(*task, <original params>)` |
+| `_zer_async_NAME_poll`   | every async fn   | `i32(*task)` — 0 = pending, 1 = done |
+| `_zer_async_NAME_result` | NON-void only    | `<return type>(*task)` |
+
+```zer
+// audit: check
+async ?u32 lookup(u32 k) {
+    yield;                       // one step of work
+    if (k > 10) { return null; }
+    return k * 2;
+}
+
+u32 main() {
+    _zer_async_lookup t;
+    _zer_async_lookup_init(&t, 4);
+    while (_zer_async_lookup_poll(&t) == 0) { }   // drive to completion
+
+    ?u32 r = _zer_async_lookup_result(&t);
+    if (r) |v| { if (v != 8) { return 1; } } else { return 2; }
+    return 0;
+}
+```
+
+Any return type works — scalar, struct, `?T`, `?*T`, `?void`. Reading the result
+before the poll reports done gives the zeroed initial value, exactly like any
+other field of a freshly `_init`ed task; the value is stable across further
+polls of a finished task. A VOID async has no accessor at all, so
+`_zer_async_blink_result` on one is an undefined identifier rather than a call
+that yields nothing.
+
 ### Deadlock Detection (Compile-Time)
 
 ZER detects when a single statement accesses TWO different shared types — the emitter can only lock one per statement, leaving the other unprotected.

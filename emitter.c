@@ -10870,10 +10870,51 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * poll N>1 re-executed side effects) and `while(poll()==0)` saw the user
          * value instead of the done-flag. Coerce the value-return into the
          * void-async termination pattern: the poll protocol is an `int` done-flag,
-         * so emit `self->_zer_state = -1; return 1;` and discard the user value.
-         * (No existing test uses non-void async; a value-retrieval mechanism would
-         * be additive when needed.) */
+         * so emit `self->_zer_state = -1; return 1;` rather than the user value.
+         *
+         * BUG-863: the user value used to be DISCARDED here, which left
+         * `async <non-void>` neither rejected nor retrievable — a silent
+         * footgun. It now lands in the state struct's stable `_zer_result`
+         * field, which `_zer_async_NAME_result(&task)` reads. The poll protocol
+         * is unchanged: still an `int` done-flag, because "is it finished" and
+         * "what did it produce" are different questions. */
         if (inst->src1_local >= 0 && func->is_async) {
+            Type *aret = e->current_func_ret;
+            Type *aret_eff = aret ? type_unwrap_distinct(aret) : NULL;
+            if (aret_eff && type_dispatch_kind(aret_eff) != TYPE_VOID) {
+                IRLocal *asrc = &func->locals[inst->src1_local];
+                Type *asrc_eff = asrc->type ? type_unwrap_distinct(asrc->type) : NULL;
+                /* Same optional wrapping the non-async arm below performs. A
+                 * value-optional (`?u32`) is a `{value, has_value}` STRUCT, so
+                 * assigning the bare local would be a type error; `?void` has
+                 * only has_value; a null-sentinel optional (`?*T`) needs no
+                 * wrap at all. lower_expr represents `null` as a `*void` local,
+                 * which is how the null arm is recognised. */
+                bool a_wrap = (type_dispatch_kind(aret_eff) == TYPE_OPTIONAL &&
+                               !is_null_sentinel(aret_eff->optional.inner) &&
+                               asrc_eff && type_dispatch_kind(asrc_eff) != TYPE_OPTIONAL);
+                bool a_null_src = asrc_eff &&
+                    type_dispatch_kind(asrc_eff) == TYPE_POINTER &&
+                    asrc_eff->pointer.inner &&
+                    type_dispatch_kind(asrc_eff->pointer.inner) == TYPE_VOID;
+                emit(e, "self->_zer_result = ");
+                if (a_wrap && is_void_opt(aret_eff)) {
+                    emit(e, "(_zer_opt_void){ %d }", a_null_src ? 0 : 1);
+                } else if (a_wrap && a_null_src) {
+                    emit(e, "(");
+                    emit_type(e, aret_eff);
+                    emit(e, "){ 0 }");
+                } else if (a_wrap) {
+                    emit(e, "(");
+                    emit_type(e, aret_eff);
+                    emit(e, "){ ");
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, ", 1 }");
+                } else {
+                    emit_local_name(e, func, inst->src1_local);
+                }
+                emit(e, "; ");
+            }
             emit(e, "self->_zer_state = -1; return 1;\n");
             break;
         }
@@ -10958,6 +10999,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         } else {
             /* Void or bare return, or array→slice return via expr */
             if (func->is_async) {
+                /* BUG-863: a BARE `return;` from a `?void` function means
+                 * has_value=1 — that is what the non-async path emits
+                 * (`return (_zer_opt_void){ 1 };`). The async twin has to say
+                 * the same thing, or `?void` async results always read as null. */
+                Type *bret = e->current_func_ret;
+                Type *bret_eff = bret ? type_unwrap_distinct(bret) : NULL;
+                if (bret_eff && is_void_opt(bret_eff))
+                    emit(e, "self->_zer_result = (_zer_opt_void){ 1 }; ");
                 emit(e, "self->_zer_state = -1; return 1;\n");
             } else if (inst->expr) {
                 /* lower_expr returned -1 but expr was kept (array/void passthrough).
@@ -12757,9 +12806,28 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     }
     if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
 
+    /* BUG-863: a value-returning async needs somewhere to PUT the value.
+     * `async u32 compute() { … return 42; }` compiled clean and the state
+     * machine finalized correctly, but the value landed in an internal temp
+     * (`self->_zer_t0`) with no caller-accessible accessor and an unstable name
+     * — so a user who wrote `async <non-void>` could never read the result.
+     * Neither rejected nor retrievable. A stable `_zer_result` field plus a
+     * `_zer_async_NAME_result()` accessor is the additive half of that; the
+     * `int` poll protocol (0 = pending, 1 = done) is untouched, because the
+     * done-flag and the value are different questions. */
+    Type *afn_type = checker_get_type(e->checker, fn);
+    Type *async_ret = (afn_type && type_dispatch_kind(afn_type) == TYPE_FUNC_PTR)
+        ? afn_type->func_ptr.ret : NULL;
+    if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
+
     /* State struct = ALL locals */
     emit(e, "typedef struct {\n");
     emit(e, "    int _zer_state;\n");
+    if (async_ret) {
+        emit(e, "    ");
+        emit_type_and_name(e, async_ret, "_zer_result", 11);
+        emit(e, ";\n");
+    }
     for (int li = 0; li < func->local_count; li++) {
         IRLocal *l = &func->locals[li];
         if (l->is_static) continue;
@@ -12769,6 +12837,18 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         emit(e, ";\n");
     }
     emit(e, "} _zer_async_%.*s;\n\n", flen, mname);
+
+    /* Result accessor — only for a non-void async. Reading it before the poll
+     * protocol reports done yields the zeroed initial value, exactly like any
+     * other field of a freshly `_init`ed task. */
+    if (async_ret) {
+        emit(e, "static inline ");
+        emit_type(e, async_ret);
+        emit(e, " _zer_async_%.*s_result(_zer_async_%.*s *self) {\n",
+             flen, mname, flen, mname);
+        emit(e, "    return self->_zer_result;\n");
+        emit(e, "}\n\n");
+    }
 
     /* Init function */
     emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
@@ -12832,6 +12912,12 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     const char *saved_source = e->source_file;
     e->source_file = NULL;
 
+    /* BUG-863: IR_RETURN reads this to decide whether the async termination
+     * also stores a result. The regular-function path sets it; this one never
+     * did, because until now an async return had no value to carry. */
+    Type *saved_ret = e->current_func_ret;
+    e->current_func_ret = async_ret;
+
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
@@ -12864,6 +12950,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     }
 
     e->source_file = saved_source;
+    e->current_func_ret = saved_ret;
     emit(e, "    } self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");
 

@@ -17899,6 +17899,31 @@ static void register_decl(Checker *c, Node *node) {
             memcpy(pname_copy, pname, plen + 1);
             Symbol *psym = add_symbol_internal(c, pname_copy, plen, poll_ft, node->loc.line);
             if (psym) psym->is_function = true;
+
+            /* BUG-863: register _zer_async_funcname_result for a NON-VOID async,
+             * returning the function's own return type. Without it the value a
+             * value-returning async computes was unreachable: the emitter
+             * discarded it, and even once it was stored there was no name the
+             * checker would resolve. Void async functions get no accessor at
+             * all, so `_result` on one is an undefined identifier rather than a
+             * call returning nothing. */
+            {
+                Type *aret = resolve_type(c, node->func_decl.return_type);
+                if (aret && type_dispatch_kind(aret) != TYPE_VOID) {
+                    char rname[256];
+                    int rlen = snprintf(rname, sizeof(rname), "_zer_async_%.*s_result",
+                        (int)node->func_decl.name_len, node->func_decl.name);
+                    if (rlen >= (int)sizeof(rname)) rlen = (int)sizeof(rname) - 1;
+                    Type **rp = (Type **)arena_alloc(c->arena, sizeof(Type *));
+                    rp[0] = type_pointer(c->arena, async_type);
+                    Type *res_ft = type_func_ptr(c->arena, rp, 1, aret);
+                    char *rname_copy = arena_alloc(c->arena, rlen + 1);
+                    memcpy(rname_copy, rname, rlen + 1);
+                    Symbol *rsym = add_symbol_internal(c, rname_copy, rlen,
+                                                       res_ft, node->loc.line);
+                    if (rsym) rsym->is_function = true;
+                }
+            }
         }
         break;
     }
@@ -18753,6 +18778,25 @@ static void check_func_body(Checker *c, Node *node) {
                 if (fsym) {
                     fsym->ret_summary_complete = c->cur_ret_summary_complete;
                     fsym->ret_param_mask = c->cur_ret_param_mask;
+                }
+                /* BUG-863: mirror it onto the synthesized
+                 * `_zer_async_NAME_result` accessor. That accessor returns
+                 * exactly what the coroutine returned, so its provenance IS the
+                 * coroutine's — but being compiler-synthesized it has no body to
+                 * derive one from, and the {false, 0} default made every
+                 * pointer-returning async result look like a fresh allocation
+                 * the caller had failed to free. */
+                if (node->func_decl.is_async) {
+                    char rn[256];
+                    int rl = snprintf(rn, sizeof(rn), "_zer_async_%.*s_result",
+                        (int)node->func_decl.name_len, node->func_decl.name);
+                    if (rl >= (int)sizeof(rn)) rl = (int)sizeof(rn) - 1;
+                    Symbol *rsym = scope_lookup(c->current_scope, rn, (uint32_t)rl);
+                    if (!rsym) rsym = scope_lookup(c->global_scope, rn, (uint32_t)rl);
+                    if (rsym) {
+                        rsym->ret_summary_complete = c->cur_ret_summary_complete;
+                        rsym->ret_param_mask = c->cur_ret_param_mask;
+                    }
                 }
             }
         }

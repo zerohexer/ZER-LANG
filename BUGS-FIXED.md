@@ -5,6 +5,63 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23j — BUG-863: a value-returning `async` threw its value away
+
+`async u32 compute() { … return 42; }` compiled clean, the state machine
+finalized correctly (that was fixed as BH-18 #10 in 2026-06), and the emitter
+then DISCARDED the value at the return site — the poll protocol is an `int`
+done-flag and there was nowhere else to put it. So `async <non-void>` was
+neither rejected nor retrievable: the compiler accepted a function whose entire
+point was unreachable. Tracked as Q2 / a LOW-LOW limitation since 2026-07-28,
+with "a real retrieval mechanism, or REJECT" as the two options; reject had been
+measured and turned down (its corpus cost is the BH-18 #10 regression guard).
+
+Closed with the retrieval half:
+
+- the state struct carries a stable `_zer_result` field, typed from the
+  function's own return type, filled at every return;
+- `_zer_async_NAME_result(&task)` is emitted and registered in the checker for a
+  NON-void async only;
+- the poll protocol is untouched — still `int`, 0 pending / 1 done, because "is
+  it finished" and "what did it produce" are different questions.
+
+### Three things this needed that reading the code did not reveal
+
+1. **The optional wrap.** A value-optional (`?u32`) is a `{value, has_value}`
+   STRUCT, so `self->_zer_result = self->_zer_t4;` where `_zer_t4` is a bare
+   `uint32_t` is a type error. The non-async return arm does that wrap; the
+   async store has to mirror it, including the `null` arm (lower_expr represents
+   `null` as a `*void` local) and `?void` (has_value only, no value field).
+2. **A bare `return;` from a `?void` function means has_value=1** — the non-async
+   path emits `return (_zer_opt_void){ 1 };`. The async bare-return branch takes
+   a different arm (`src1_local < 0`) and had to be given the same answer, or
+   every `?void` async result read as null.
+3. **The accessor needed the coroutine's escape summary.** Being
+   compiler-synthesized it has no body, so its `{false, 0}` default made every
+   pointer-returning async result look like a fresh allocation the caller had
+   failed to free — the BUG-860 class, one layer along. It now inherits the
+   coroutine's `ret_summary_complete` / `ret_param_mask`, which is exactly right:
+   the accessor returns what the coroutine returned.
+
+Points 1 and 2 were found by RUNNING the probe, not by reading: the first
+compiled and produced a wrong-typed store, the second compiled and silently
+answered null.
+
+### Tests
+
+`tests/zer/async_result_retrieval.zer` — five return shapes (scalar, struct,
+`?u32`, `?*u32`, `?void`), both arms of every optional, plus a check that the
+result is stable across extra polls of a finished task. Verified to be REJECTED
+by a from-`HEAD` build. `tests/zer_fail/async_void_no_result.zer` pins that a
+VOID async gets no accessor at all.
+
+`docs/reference.md` gains the three-generated-functions table and a compileable
+example under `tools/audit_reference_examples.sh`.
+
+`make check` exit 0, 1343 integration tests, all eight gates green.
+
+---
+
 ## Session 2026-08-23i — BUG-862: Level-B leak coverage stopped at the alias boundary
 
 `freed_all_paths` marks an allocation as freed on every path — the flag that lets

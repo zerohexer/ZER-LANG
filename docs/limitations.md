@@ -252,7 +252,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 | # | Item | Best version |
 |---|---|---|
 | ~~Q1~~ **DONE 2026-08-23 (BUG-851)** | `naked` silently dropped -> warn at the declaration | **4z36e0**. Re-measured independently on current main: enabling the attribute breaks **6** tests, not 16 (all exit 132, SIGILL), and **44** files emit the warning. The OVERLOAD finding is confirmed and is the reason this is a warning and not a fix: decoupling asm-permission from `naked` is the precondition for emitting the attribute. **W11 in the walker table is the same item and is closed with it.** |
-| Q2 | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
+| ~~Q2~~ **DONE 2026-08-23 (BUG-863)** | Value-returning `async` has no retrieval API | Closed with the RETRIEVAL half rather than the warn: a stable `_zer_result` field + a generated `_zer_async_NAME_result(&task)`, registered in the checker with the function's own return type. The `int` poll done-flag is untouched. Void async gets no accessor (undefined identifier). `tests/zer/async_result_retrieval.zer` covers scalar / struct / `?T` / `?*T` / `?void`, both arms of each optional |
 | ~~Q3~~ **DONE 2026-08-23 (BUG-854)** | Emitter's give-up paths are silent miscompiles | **4z36e0**'s measurement independently reproduced (0 of 1116 positive programs reach either marker). Closed with an undeclared IDENTIFIER rather than `emit_unreachable()` — a hard C99 error that names the cause, without a compiler abort that would be unrecoverable if the arm ever IS reachable. `tools/emit_audit.sh` widened 5 -> 1369 samples so a regression to the quiet form goes red; verified to fire |
 | Q4 | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |
 
@@ -1642,13 +1642,22 @@ fixed for exactly this (audit #18, commit `c9e4abca`); the WRITE path was not.
 **Severity LOW** — the result is stored back through `*_zer_bp` typed to the carrier width, so the store
 truncates: a wrong VALUE / UB, **not** an out-of-bounds memory write.
 
-### LOW LOW — value-returning `async` has no result-retrieval API (`7fxhb3` `31796ef8`, 2026-07-28)
-`async u32 compute() { … return 42; }` compiles clean and the state machine correctly finalizes (BH-18 #10,
-fixed 2026-06-26). But the returned value is stored in an internal temp (`self->_zer_t0`) with **no
-caller-accessible accessor** — a user who writes `async <non-void>` can never read the result. Neither
-rejected nor retrievable = a silent footgun. Resolution is either a real retrieval mechanism (a stable
-`.result` field + `_zer_async_NAME_result(&task)`, distinct from the `int` poll done-flag) or REJECT
-`async <non-void>` until such an API exists. Not memory-unsafe (there is no valid usage today).
+### ~~LOW LOW — value-returning `async` has no result-retrieval API~~ (`7fxhb3` `31796ef8`, 2026-07-28) — **FIXED 2026-08-23 (BUG-863)**
+`async u32 compute() { … return 42; }` compiled clean and the state machine finalized correctly (BH-18 #10,
+fixed 2026-06-26), but the emitter DISCARDED the value at the return site — the poll protocol is an `int`
+done-flag and there was nowhere else to put it. Neither rejected nor retrievable = a silent footgun.
+**Fixed by the retrieval mechanism this entry preferred over the reject**: a stable `_zer_result` field in
+the state struct, filled at every return, plus a generated `_zer_async_NAME_result(&task)` accessor
+registered in the checker with the function's own return type. The poll protocol is unchanged. Two details
+needed the non-async return path's logic mirrored, and were found by RUNNING rather than reading: a
+value-optional (`?u32`) is a `{value, has_value}` struct so the bare temp cannot be assigned to the result
+field, and a BARE `return;` from a `?void` function means has_value=1. A VOID async gets no accessor, so
+`_zer_async_blink_result` on one is an undefined identifier. The accessor also inherits the coroutine's
+`ret_summary_complete`/`ret_param_mask` — being compiler-synthesized it has no body to derive provenance
+from, and the `{false, 0}` default made every pointer-returning async result look like a fresh allocation
+the caller had failed to free (the BUG-860 class). Regression: `tests/zer/async_result_retrieval.zer`
+(five return shapes, both arms of each optional, verified to fail on a pre-fix build) and
+`tests/zer_fail/async_void_no_result.zer`.
 
 ### ~~LOW Over-rejection — container field of `Handle(T)` drops T substitution~~ (`i0txin` `84097263`) — **`Handle(T)` FIXED `9ea6c864` 2026-08-06**; `Pool`/`Ring`/`Slab` stay rejected (emitter cannot stamp inline storage) — message quality tracked as its own OPEN entry
 `subst_typenode` (checker.c ~2158-2219) treats `TYNODE_HANDLE`/`POOL`/`RING`/`SLAB` as LEAVES and does not

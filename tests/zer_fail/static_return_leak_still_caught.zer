@@ -1,0 +1,19 @@
+// expect-error: never freed
+// BUG-860 boundary: the leak suppression applies ONLY when the callee provably
+// returns a STATIC (every valued return rooted at a global/static, or null).
+// `make()` returns a FRESH allocation, so `classify_return_root` sees a
+// NODE_CALL root it cannot prove static, the summary stays incomplete, and the
+// result is still an owned allocation the caller must free.
+//
+// This is the test that stops the relaxation from being a leak amnesty.
+struct Task { u32 id; }
+Slab(Task) heap;
+
+?*Task make() { return heap.alloc_ptr(); }
+
+u32 main() {
+    ?*Task t = make();
+    *Task p = t orelse return;
+    p.id = 1;
+    return 0;
+}

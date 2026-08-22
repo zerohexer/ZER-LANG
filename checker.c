@@ -18725,7 +18725,27 @@ static void check_func_body(Checker *c, Node *node) {
          * stays on. Grounded by lambda_zer_escape/param_lattice.v (ARStatic/
          * ARParam(n); T1/T4 no under-rejection). */
         {
-            TypeKind rk = type_dispatch_kind(ret);  /* unwraps distinct; NULL→VOID */
+            /* BUG-861: unwrap OPTIONAL before naming the kinds. `?*T` is THE
+             * idiomatic ZER signature for a fallible lookup, and it was missing
+             * from this disjunction — so a `?*T`-returning function never had its
+             * summary recorded, kept the {false, 0} default ("can't prove"), and
+             * the Stage-1 `returns_static` precision was silently absent for the
+             * most common pointer-returning shape in the language. Measured: with
+             * `*u32 lookup(*u32 sel) { return &g_table[*sel % 8]; }` the call
+             * result may be stored into a global; change ONE character to
+             * `?*u32` and the identical program is rejected with "cannot store
+             * result of call with local-derived pointer argument".
+             *
+             * This is the wrapper-hides-the-inner-kind class (CLAUDE.md's carrier
+             * table) at a site the carrier audit does not reach. Recording the
+             * summary is safe for an optional because the accumulator never looked
+             * at the declared return type in the first place — `return null` already
+             * classifies as RET_STATIC, which is correct: null carries no
+             * allocation and no view of a parameter. */
+            Type *ret_eff = type_unwrap_distinct(ret);
+            if (ret_eff && type_dispatch_kind(ret_eff) == TYPE_OPTIONAL)
+                ret_eff = type_unwrap_distinct(ret_eff->optional.inner);
+            TypeKind rk = type_dispatch_kind(ret_eff);  /* unwraps distinct; NULL→VOID */
             if (node->func_decl.body &&
                 (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT)) {
                 Symbol *fsym = scope_lookup(c->current_scope,

@@ -5,6 +5,52 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — a call returning a view of a PARAMETER is leak-tracked as a fresh allocation (LOW, over-rejection)
+
+**Symptom (measured 2026-08-23, still live):**
+
+```zer
+*u32 idp(*u32 a) { return a; }
+u32 main() {
+    u32 x = 5;
+    *u32 p = idp(&x);           // zercheck: handle %2 (local 'p') allocated at
+    return *p - 5;              //           line 4 but never freed
+}
+```
+
+Nothing is allocated. The same shape through a slice (`[*]u32 idsl([*]u32 s)`) is
+accepted, and so is the call used inline without binding (`return *idp(&x);`) —
+only binding a `*T` param-view result to a local trips it.
+
+**Why it is deliberate, and why it is still wrong here.** The erased-ownership
+lattice (`proofs/operational/lambda_zer_escape/erased_ownership_lattice.v`)
+distinguishes AOBorrow (a CONTENT read — suppress the leak check) from AOParam (a
+param VIEW — keep it), and the AOParam rule is sound in general: if the argument
+were heap memory, the returned view aliases it and the caller must still free.
+BUG-860 relaxed the ARStatic case and deliberately left this one alone.
+
+The remaining imprecision is that the result is registered with a **fresh
+`alloc_id`** rather than being ALIASED to the argument's handle. So when the
+argument is not a tracked allocation at all — `&local`, a global, a literal — the
+analyzer invents an allocation that never existed, instead of concluding there is
+nothing to track.
+
+**Fix sketch.** At the call-result registration site in `zercheck_ir.c`, when the
+callee's summary names param n (`ret_summary_complete` and bit n of
+`ret_param_mask`), do not mint a new allocation: look up argument n's handle and
+alias it (the existing `alias_state` / shared-`alloc_id` machinery), and register
+nothing when argument n has no handle. That is the call-site substitution
+`resolve(R_f, argreg)` the escape sinks already perform, applied to the ownership
+axis — `join_lattice.v`'s n-ary member set is the right shape when several params
+are masked. It is a relaxation (reject→accept), so it needs the full negative
+matrix: a heap argument whose view is returned and then leaked must still fail.
+
+**Tripwire.** `tests/zer/returns_static_optional_and_leak.zer` pins the cases that
+ARE closed; the shapes above belong in `tests/zer_gaps/` when that directory's
+inverted-expectation runner is next touched.
+
+---
+
 ## OPEN — a non-null pointer / funcptr as a STRUCT FIELD is auto-zeroed to NULL (MEDIUM, soundness — the one carrier BUG-856 did not close)
 
 **Symptom (measured 2026-08-23, still live):**

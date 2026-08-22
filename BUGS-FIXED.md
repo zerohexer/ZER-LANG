@@ -5,6 +5,90 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23h — BUG-860/861: `?*T` had no escape summary, and the leak check never asked
+
+Two precision holes that between them made the most idiomatic pointer-returning
+signature in ZER unusable. Both were found by probing for OVER-rejection — writing
+plainly-safe programs and seeing which were refused.
+
+### BUG-861 — the escape return summary was never recorded for `?*T`
+
+The Stage-1 cross-function escape summary (`ret_summary_complete` +
+`ret_param_mask`, the ARStatic/ARParam(n) lattice of `param_lattice.v`) is stored
+at the end of `check_stmt`'s function-decl arm, gated on the return type's kind:
+
+    if (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT)
+
+`TYPE_OPTIONAL` is not in that list, and `?*T` is THE ZER signature for a fallible
+lookup. So such a function kept the `{false, 0}` "can't prove" default and the
+entire `returns_static` precision — shipped 2026-06-22, with its own corpus test —
+was silently absent for it. One character decided the verdict on an otherwise
+identical program:
+
+     *u32 lookup(*u32 sel) { return &g_table[*sel % 8]; }   g = lookup(&idx);  // accepted
+    ?*u32 lookup(*u32 sel) { return &g_table[*sel % 8]; }   g = lookup(&idx);  // REJECTED
+        error: cannot store result of call with local-derived pointer argument
+
+This is the wrapper-hides-the-inner-kind class at a site the carrier audit does
+not reach. Fixed by unwrapping OPTIONAL before naming the kinds. Safe because the
+ACCUMULATOR never looked at the declared return type in the first place — it runs
+per `return` statement — and `return null` already classified as RET_STATIC, which
+is right: null carries no allocation and no view of a parameter.
+
+### BUG-860 — the leak check invented allocations that did not exist
+
+Binding the result of ANY pointer-returning ZER function to a local registered a
+fresh tracked allocation. So:
+
+    u32 gv = 5;
+    *u32 gp() { return &gv; }
+    u32 main() { *u32 p = gp(); return *p; }
+
+    zercheck: handle %0 (local 'p') allocated at line 4 but never freed
+
+naming an allocation that does not exist and demanding the caller free memory it
+does not own. Every accessor or lookup returning `*T` was unusable unless its
+result happened to ESCAPE into a global — which is why the existing corpus test
+`returns_static_no_overreject.zer` passed: it stores the result into a global,
+and escaping satisfies the leak check by accident.
+
+Fixed by consulting the SAME query the escape sinks already use:
+`ret_summary_complete && ret_param_mask == 0` = "every valued return is rooted at
+a global/static, or is null". `classify_return_root` is precise about that — a
+`return <call>` is UNKNOWN unless the inner callee is itself all-static, so
+`return alloc(...)` / `return heap.alloc_ptr()` never qualifies, and a plain local
+is UNKNOWN. Defaults are `{false, 0}`, so an unclassifiable callee keeps the
+tracking.
+
+**The suppression is `escaped = true`, never un-registering** — the same mechanism
+the erased-ref AOBorrow arm uses — so double-free and use-after-free through the
+result stay fully tracked. Verified: both still reject through a static-returning
+callee's result.
+
+**Not relaxed:** a callee returning a view of a PARAMETER (`*u32 idp(*u32 a) {
+return a; }`) stays tracked, as the erased-ownership lattice's AOParam element
+requires — its result aliases the parameter's allocation. That residual
+over-rejection is real and is documented rather than papered over.
+
+### Discipline notes
+
+Both changes are reject→accept, the one class where a bug is a shipped memory
+error, so each is pinned from the unsafe side as well as the safe one:
+
+- `tests/zer/returns_static_optional_and_leak.zer` — nine safe shapes across both
+  bugs and both escape sinks; verified to be REJECTED by a from-`HEAD` build.
+- `tests/zer_fail/static_return_leak_still_caught.zer` — a real allocator's result
+  is still a leak (this is what stops the relaxation being a leak amnesty).
+- `tests/zer_fail/static_return_double_free.zer` — double-free through a
+  static-returning callee's result is still caught.
+- `tests/zer_fail/optional_param_view_escape.zer` — recording the summary for a
+  `?*T` function buys PRECISION, not permission: a return that views a PARAMETER
+  still fails the call-site substitution when the argument is a local.
+
+`make check` exit 0, 1337 integration tests, all eight gates green.
+
+---
+
 ## Session 2026-08-23g — BUG-855..859: the non-null carrier class, and two silent wrong-answer intrinsics
 
 Five fixes from one thread: a documented syntax that never parsed, and pulling

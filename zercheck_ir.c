@@ -1463,6 +1463,46 @@ static Node *ir_return_value_expr(IRFunc *func, IRInst *last) {
     return NULL;
 }
 
+/* BUG-860: does this call provably return a STATIC — i.e. is every one of the
+ * callee's valued returns rooted at a global / static-duration local, or `null`?
+ *
+ * Reuses the escape subsystem's per-function return summary verbatim:
+ * `ret_summary_complete && ret_param_mask == 0` is Stage 1's "returns_static",
+ * the ARStatic element of lambda_zer_escape/param_lattice.v (T3 is its precision
+ * witness). The escape side has consulted it since 2026-06-22; the LEAK side
+ * never did, so
+ *
+ *     u32 gv = 5;
+ *     *u32 gp() { return &gv; }
+ *     u32 main() { *u32 p = gp(); return *p; }
+ *
+ * was rejected with "handle %0 (local 'p') allocated at line 4 but never freed"
+ * — naming an allocation that does not exist and demanding the caller free
+ * memory it does not own. Accessor and lookup functions returning `*T` were
+ * unusable unless their result also escaped into a global.
+ *
+ * Sound because `classify_return_root` is precise about what STATIC means: a
+ * `return <call>` is UNKNOWN unless the inner callee is itself all-static (so
+ * `return alloc(...)` / `return heap.alloc_ptr()` never qualifies), and a plain
+ * local is UNKNOWN. The flags default to {false, 0}, so an unclassifiable
+ * callee keeps the tracking. A global that HOLDS heap memory does qualify, and
+ * suppressing the caller's leak check there is right — the global owns it, the
+ * caller borrowed it, which is the same policy as "MAYBE_FREED globals at exit
+ * are deliberately NOT flagged".
+ *
+ * The suppression is `escaped = true`, never un-registering: double-free and
+ * UAF tracking on the result stay fully live. Same mechanism the erased-ref
+ * AOBorrow arm uses. */
+static bool ir_call_returns_static(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    Symbol *sym = scope_lookup(zc->checker->global_scope,
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (!sym || !sym->is_function) return false;
+    return sym->ret_summary_complete && sym->ret_param_mask == 0;
+}
+
 /* Check if a call is to an extern function that returns a pointer-like
  * type (allocator heuristic). Returns true for malloc/fopen/create/etc. */
 static bool ir_is_extern_alloc_call(ZerCheck *zc, Node *call) {
@@ -5223,6 +5263,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * erased_ownership_lattice.v. */
                         if (summary->ret_is_borrow && summary->ret_is_content)
                             h->escaped = true;
+                        /* BUG-860: the callee provably returns a STATIC (every
+                         * valued return is rooted at a global/static, or null).
+                         * Nothing was allocated for the caller to free. */
+                        if (ir_call_returns_static(zc, inst->expr))
+                            h->escaped = true;
                     }
                 }
             }
@@ -5298,6 +5343,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (dt_eff && dt_eff->kind == TYPE_OPTIONAL)
                         dt_eff = type_unwrap_distinct(dt_eff->optional.inner);
                     if (dt_eff && dt_eff->kind == TYPE_HANDLE)
+                        h->escaped = true;
+                    /* BUG-860: same suppression on the no-summary path — a
+                     * callee that provably returns a STATIC allocated nothing.
+                     * (escaped only: double-free / UAF tracking stays live.) */
+                    if (ir_call_returns_static(zc, call))
                         h->escaped = true;
                 }
             }

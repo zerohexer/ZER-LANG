@@ -1,0 +1,90 @@
+/* BUG-860 + BUG-861: two precision holes that made the most idiomatic
+ * pointer-returning signature in ZER unusable.
+ *
+ * BUG-861 — the Stage-1 escape summary was recorded only for a return type whose
+ * kind was POINTER, SLICE or STRUCT. `?*T` — THE ZER signature for a fallible
+ * lookup — was missing from that disjunction, so such a function kept the
+ * {false, 0} "can't prove" default and the whole `returns_static` precision was
+ * silently absent for it. One character changed the verdict on an otherwise
+ * identical program:
+ *
+ *      *u32 lookup(*u32 sel) { ... }     g = lookup(&idx);   // accepted
+ *     ?*u32 lookup(*u32 sel) { ... }     g = lookup(&idx);   // REJECTED
+ *
+ * BUG-860 — the LEAK side never consulted that summary at all. Binding the
+ * result of ANY pointer-returning ZER function to a local registered a fresh
+ * allocation, so
+ *
+ *     u32 gv = 5;  *u32 gp() { return &gv; }  *u32 p = gp();
+ *
+ * was rejected with "handle %0 (local 'p') allocated at line 4 but never freed"
+ * — naming an allocation that does not exist and demanding the caller free
+ * memory it does not own. Every accessor returning `*T` was unusable unless its
+ * result happened to escape into a global.
+ *
+ * Both fixes reuse the SAME query the escape sinks already use
+ * (`ret_summary_complete && ret_param_mask == 0` = ARStatic of
+ * lambda_zer_escape/param_lattice.v, T3 being its precision witness), and the
+ * leak suppression is `escaped = true` — the handle stays registered, so
+ * double-free and use-after-free through the result are still caught. The
+ * negatives in tests/zer_fail/ pin exactly that.
+ */
+
+u32[8] g_table;
+u32 gv = 5;
+
+/* returns a view of a GLOBAL, never of its parameter */
+*u32 lookup(*u32 sel)      { return &g_table[*sel % 8]; }
+?*u32 lookup_opt(*u32 sel) { return &g_table[*sel % 8]; }
+
+/* no parameters at all — still static */
+*u32 gp()      { return &gv; }
+?*u32 gp_opt() { return &gv; }
+
+/* a return that is null on one path and a global on the other: `null` carries
+ * no allocation and no parameter view, so this is still ARStatic */
+?*u32 maybe(u32 want) {
+    if (want > 7) { return null; }
+    return &g_table[want];
+}
+
+?*u32 g_result;
+?*u32 g_result2;
+
+u32 main() {
+    u32 idx = 3;
+    g_table[3] = 42;
+
+    /* --- BUG-860: bind and never free. Nothing was allocated. --- */
+    *u32 p = gp();
+    if (*p != 5) { return 1; }
+
+    *u32 q = lookup(&idx);
+    if (*q != 42) { return 2; }
+
+    /* --- and the same through the OPTIONAL forms (BUG-861) --- */
+    ?*u32 mo = gp_opt();
+    if (mo) |r| { if (*r != 5) { return 3; } } else { return 3; }
+
+    ?*u32 mq = lookup_opt(&idx);
+    if (mq) |r2| { if (*r2 != 42) { return 4; } } else { return 4; }
+
+    /* --- BUG-861 at the ESCAPE sink: the argument is local-derived, but the
+     *     callee provably returns a global, so storing the result into a
+     *     global is safe. This is the shape that flipped on the `?`. --- */
+    g_result = lookup_opt(&idx);
+    if (g_result) |a| { if (*a != 42) { return 5; } } else { return 5; }
+
+    /* var-decl then store, the second sink for the same fact */
+    ?*u32 r3 = lookup_opt(&idx);
+    g_result2 = r3;
+    if (g_result2) |b| { if (*b != 42) { return 6; } } else { return 6; }
+
+    /* --- a null-or-static return, both arms --- */
+    ?*u32 hit = maybe(3);
+    if (hit) |h| { if (*h != 42) { return 7; } } else { return 7; }
+    ?*u32 miss = maybe(99);
+    if (miss) |_m| { return 8; }
+
+    return 0;
+}

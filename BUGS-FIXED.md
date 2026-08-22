@@ -5,6 +5,72 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23i — BUG-862: Level-B leak coverage stopped at the alias boundary
+
+`freed_all_paths` marks an allocation as freed on every path — the flag that lets
+the Level-B guarded refinement accept the complementary-free idiom, and (in the
+other direction) the flag that closed an accept-unsafe UAF hole in 2026-07. It was
+set by direct assignment on whichever handle the free NAMED, at three separate
+free sites, and never reached the alias group. So:
+
+    Handle(Task) h = pool.alloc() orelse return;            // ACCEPTED
+    if (c) { pool.free(h); }  if (!c) { pool.free(h); }
+
+    ?Handle(Task) mh = pool.alloc();                        // REJECTED:
+    Handle(Task) h = mh orelse return;                      // "handle 'mh' may
+    if (c) { pool.free(h); }  if (!c) { pool.free(h); }     //  not be freed on
+                                                            //  all paths"
+
+Same program, same allocation — `alloc_id` grouping exists precisely so
+`?Handle mh` and `Handle h` are ONE allocation — but the coverage completed on
+`h` and the leak check then fired on `mh`. The `orelse`-intermediate spelling is
+the only one available when the optional has to be inspected before being
+unwrapped, so this was not an exotic shape.
+
+Fixed with ONE sink, `ir_mark_freed_all_paths`, that all three free sites now
+call (same rule as `ir_mark_transferred`: do not re-inline the assignment at a
+new site). Both directions of the flag are correct for an alias — at the leak
+check it removes a false leak, and at the use and double-free sites it makes
+`ir_use_guard_disjoint` return false, i.e. it TIGHTENS: once every path has
+freed, no later use or free is admissible through ANY name.
+
+### The bit worth remembering: a filter copied from the wrong sibling
+
+The first version of the sink looked right, built clean, and marked NOTHING. It
+had copied `ir_propagate_alias_state`'s guard —
+
+    if (a != h && a->alloc_id == aid && !ir_is_invalid(a))
+
+— which is correct when propagating a STATE (do not overwrite an alias that is
+already freed or transferred) and exactly wrong for a monotone flag:
+`zer_handle_state_is_invalid` is TRUE of MAYBE_FREED, and MAYBE_FREED is the
+state every alias is in at that point. The filter excluded precisely the handles
+the flag was for. Nothing failed; the probe just still reported the leak, and
+only a trace printing the scanned handle list showed the loop finding five
+aliases and skipping all five.
+
+That is the CLAUDE.md rule "when a fix silently does nothing, print whether it
+runs before theorising about why it doesn't", one level in: the code ran, the
+loop ran, the condition was false every time.
+
+### Tests
+
+- `tests/zer/guarded_coverage_through_alias.zer` — five shapes (Handle and heap
+  pointer, with and without a use on the non-freeing arm, a guard derived from a
+  read, and the single-variable form that always worked); verified REJECTED by a
+  from-`HEAD` build.
+- `tests/zer_fail/guarded_alias_use_after_coverage.zer`,
+  `guarded_alias_free_after_coverage.zer` — the tightening direction: a read, and
+  a third free, after coverage completes.
+- `tests/zer_fail/guarded_alias_different_conditions.zer` — independent guards
+  `c` and `d` are not complementary and must stay rejected.
+- The eight pre-existing `guarded_*` negatives and two positives were re-run
+  individually: unchanged.
+
+`make check` exit 0, 1341 integration tests, all eight gates green.
+
+---
+
 ## Session 2026-08-23h — BUG-860/861: `?*T` had no escape summary, and the leak check never asked
 
 Two precision holes that between them made the most idiomatic pointer-returning

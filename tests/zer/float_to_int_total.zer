@@ -1,0 +1,80 @@
+/* BUG-850: float -> integer conversion is UNDEFINED in C when the truncated
+ * value does not fit, and GCC does not even answer it consistently within one
+ * build. Measured on gcc 13, one emitted .c, two optimisation levels:
+ *
+ *     (u32)(-1.5)   ->  4294967295 at -O0, 0          at -O2
+ *     (u32)1.0e30   ->  0          at -O0, 4294967295 at -O2
+ *     (i32)1.0e30   -> -2147483648 at -O0, 2147483647 at -O2
+ *
+ * ZER defines it: truncate the fraction toward zero, SATURATE the range, NaN to
+ * 0 — the total definition Rust's `as` and the ARM/RISC-V FCVT instructions use.
+ *
+ * This test asserts the DEFINED answers, so it fails on any build that reverts
+ * to the raw C cast at either optimisation level. `make check` builds with -O2;
+ * the pre-fix compiler produced 4294967295 for `neg` at -O0 and 0 at -O2, so
+ * whichever level runs, one of the two assertions below catches it.
+ *
+ * The values are laundered through a `volatile` global so nothing here is
+ * constant-folded away — every conversion below is a real runtime one.
+ */
+
+i32 printf(const *u8 fmt, ...);
+
+volatile f64 src;
+
+u32 main() {
+    /* --- in range: ordinary truncation toward zero --- */
+    src = 3.9;   if ((u32)src != 3) { return 1; }
+    src = -3.9;  if ((i32)src != -3) { return 2; }
+    src = 0.5;   if ((u32)src != 0) { return 3; }
+    src = 255.0; if ((u8)src != 255) { return 4; }
+
+    /* --- negative into unsigned: saturates to 0, at every width --- */
+    src = -1.5;
+    if ((u8)src  != 0) { return 5; }
+    if ((u16)src != 0) { return 6; }
+    if ((u32)src != 0) { return 7; }
+    if ((u64)src != 0) { return 8; }
+
+    /* --- far above the range: saturates to the maximum --- */
+    src = 1.0e30;
+    if ((u8)src  != 255) { return 9; }
+    if ((u16)src != 65535) { return 10; }
+    if ((u32)src != 4294967295) { return 11; }
+    if ((i8)src  != 127) { return 12; }
+    if ((i16)src != 32767) { return 13; }
+    if ((i32)src != 2147483647) { return 14; }
+
+    /* --- far below the range: saturates to the minimum --- */
+    src = -1.0e30;
+    if ((i8)src  != -128) { return 15; }
+    if ((i16)src != -32768) { return 16; }
+    if ((i32)src != -2147483648) { return 17; }
+    if ((u32)src != 0) { return 18; }
+
+    /* --- exactly at the boundary stays exact --- */
+    src = 4294967295.0;
+    if ((u32)src != 4294967295) { return 19; }
+    src = 2147483647.0;
+    if ((i32)src != 2147483647) { return 20; }
+    src = -2147483648.0;
+    if ((i32)src != -2147483648) { return 21; }
+
+    /* --- @truncate on a float means the same thing: a float has no "low bits",
+     *     so it truncates the FRACTION and saturates the range --- */
+    src = -1.5;
+    if (@truncate(u32, src) != 0) { return 22; }
+    src = 1.0e30;
+    if (@truncate(u32, src) != 4294967295) { return 23; }
+    src = 7.75;
+    if (@truncate(u32, src) != 7) { return 24; }
+
+    /* --- @saturate agrees, as it always did --- */
+    src = -1.5;
+    if (@saturate(u32, src) != 0) { return 25; }
+    src = 1.0e30;
+    if (@saturate(u32, src) != 4294967295) { return 26; }
+
+    printf("float->int is total\n");
+    return 0;
+}

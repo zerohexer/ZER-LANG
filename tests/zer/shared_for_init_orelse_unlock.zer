@@ -5,8 +5,14 @@
 shared struct Bag { ?u32 maybe; u32 value; }
 Bag g;
 
+// The loop body must not run — what is under test is the for-INIT's early
+// return, not the loop. `v < never` (a volatile zero) says that without the
+// condition being decidable from the TYPE, which BUG-852 now warns about:
+// `v < 0` on an unsigned v is a tautology the compiler can see through.
+volatile u32 never = 0;
+
 void grab_for() {
-    for (u32 v = g.maybe orelse return; v < 0; v += 1) {
+    for (u32 v = g.maybe orelse return; v < never; v += 1) {
         g.value = v;
     }
 }

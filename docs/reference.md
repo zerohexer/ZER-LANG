@@ -123,6 +123,27 @@ f64 precise = 3.14159265358979;
 - Digit-group underscores are allowed in numeric literals for readability and
   are ignored by the value: `1_000.5`, `3.141_592`, `1e1_0` (and `1_000_000`
   for integers).
+- **Converting a float to an integer is TOTAL**: the fraction is truncated toward
+  zero, a value outside the target's range SATURATES to its minimum or maximum,
+  and NaN becomes 0. This holds for `(u32)f`, `@truncate(u32, f)` and
+  `@saturate(u32, f)` alike — a float has no "low bits" to keep, so `@truncate`
+  on one means truncate-the-fraction. In C this conversion is UNDEFINED out of
+  range, and the same source gives different answers at different optimisation
+  levels; ZER defines it (the same definition Rust's `as` and the ARM/RISC-V
+  FCVT instructions use).
+
+```zer
+volatile f64 src;
+
+u32 main() {
+    src = 3.9;    if ((u32)src != 3) { return 1; }            // truncates toward zero
+    src = -3.9;   if ((i32)src != -3) { return 2; }
+    src = -1.5;   if ((u32)src != 0) { return 3; }            // saturates to 0
+    src = 1.0e30; if ((u32)src != 4294967295) { return 4; }   // saturates to max
+    src = 1.0e30; if ((i8)src != 127) { return 5; }
+    return 0;
+}
+```
 
 ---
 
@@ -2683,6 +2704,16 @@ naked void reset_handler() {
 }
 ```
 
+
+**CURRENT LIMITATION — `naked` is checked but NOT emitted.** The generated C
+function still gets a normal prologue/epilogue, and the compiler warns at the
+declaration to say so. On a hosted target this is harmless. On a real target it is
+not: a reset vector or a context switch written `naked` precisely because it must
+not touch the stack will get a prologue that writes to a stack that does not exist
+yet. The reason it is not simply switched on is that `naked` is OVERLOADED — it is
+also the only way to get permission to write `asm` — so making it real breaks every
+function that uses it purely as an asm wrapper and then returns. Tracked in
+docs/limitations.md.
 ---
 
 ### section attribute

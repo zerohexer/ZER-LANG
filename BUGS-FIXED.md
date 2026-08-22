@@ -5,6 +5,77 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23d — BUG-850..852: undefined behavior, a dropped attribute, and a silent infinite loop
+
+### BUG-850 — float -> integer conversion was UNDEFINED, and GCC disagreed with itself
+C leaves float->int undefined when the truncated value does not fit. GCC does not
+even answer it consistently within one build — measured on gcc 13, ONE emitted .c,
+two optimisation levels:
+
+    (u32)(-1.5)   ->  4294967295 at -O0, 0          at -O2
+    (u32)1.0e30   ->  0          at -O0, 4294967295 at -O2
+    (i32)1.0e30   -> -2147483648 at -O0, 2147483647 at -O2
+    @truncate(u32, -1.5) -> 4294967295 at -O0, 0 at -O2
+
+The constant-folding path applies GCC's own arbitrary-precision rules and the
+instruction path applies the CPU's. **A `volatile` source HIDES the divergence**
+(it forces the instruction at every level), so a probe must use a plain value —
+recording this because probing with a volatile is what produced a wrong "does not
+reproduce" conclusion the first time this class was looked at.
+
+This is a direct contradiction of ZER's "no undefined behavior" guarantee, and it
+is the kind that a test suite cannot catch by luck: the answer depends on the flags
+the USER compiles the emitted C with.
+
+ZER now defines it — truncate the fraction toward zero, SATURATE the range, NaN to
+0 — the same total definition Rust's `as` and the ARM/RISC-V FCVT instructions use.
+Bounds are emitted as exact hex-float literals (`0x1p32`), so the comparison is
+exact at every width including 64. Wired at all THREE conversion sites: the IR
+`IR_CAST` (a plain `(u32)f`), and `@truncate` on BOTH emitter dispatch paths.
+`@saturate` was already correct and stable, and still agrees.
+Test: `tests/zer/float_to_int_total.zer` — 26 assertions, `volatile`-laundered so
+nothing folds; exit 5 on the pre-fix compiler at BOTH -O0 and -O2.
+
+### BUG-851 — `naked` is checked and then silently dropped
+`naked void bootstrap()` emits `void bootstrap(void) {` with no
+`__attribute__((naked))`. The IR migration dropped it and the emitter has
+deliberately not restored it. On a hosted target that is harmless; on a real target
+a reset vector or a context switcher written `naked` because it must NOT touch the
+stack gets a prologue that writes to a stack which does not exist yet — silent
+corruption, with the compiler having accepted the keyword that was supposed to
+prevent exactly that.
+
+**Not fixed by emitting the attribute, and the measurement is why.** `naked` is
+OVERLOADED in ZER: it is also the only way to get permission to write `asm` (the S1
+interim guard). Enabling the attribute was tried and measured: **six** corpus tests
+that call a `naked` function to check asm operand binding at run time SIGILL
+immediately (exit 132 — falling off the end into `ud2`), because a naked body has no
+`ret`. Decoupling asm-permission from `naked` is the precondition for the real fix.
+
+Shipped as a WARNING at the declaration, so the gap stops being SILENT. 44 corpus
+files emit it; that number IS the finding, not noise to suppress.
+
+### BUG-852 — a comparison the TYPE already decides, with no diagnostic
+    for (u8 i = 0; i < 300; i += 1) { ... }   // u8 tops out at 255
+
+compiles, runs forever, and says nothing. So does `if (x < 0)` on an unsigned x,
+which silently deletes the branch. **GCC cannot warn either** — the emitted C
+promotes both sides to `int` before comparing, so the information that `i` is a u8
+exists only in ZER. `-Wtype-limits` sees nothing.
+
+Now a warning, covering all six comparison operators in both operand orders, from
+the TYPE's full range (not VRP, so it is never wrong). A warning rather than an
+error because a tautology is not a memory-safety violation and generated/`comptime`
+code can legitimately produce one.
+
+Corpus cost: exactly ONE file, `shared_for_init_orelse_unlock.zer`, whose
+`for (u32 v = ...; v < 0; ...)` deliberately never ran the body — rewritten to
+`v < never` (a volatile zero), which says the same thing without a tautology.
+Tests: `tests/zer/type_limit_comparison_warn.zer` asserts the SILENCE (a false
+positive is the failure mode that gets a diagnostic switched off).
+
+---
+
 ## Session 2026-08-23c — BUG-845..849: the use-before-init family, and one relaxation
 
 Third batch. Four defects share ONE shape — a resource that zero-initialises into a

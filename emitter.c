@@ -1002,6 +1002,62 @@ static bool type_is_nonnative_intn(Type *t) {
     return !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
 }
 
+/* BUG-850: does this conversion need the TOTAL float->int helper?
+ * float source + integer (non-enum, non-bool) target, at a width the helper can
+ * express exactly. `bool` has its own truthy path; `enum` cannot be produced
+ * from a float in ZER. Widths above 64 keep the plain cast — the carrier is
+ * __int128 and no double can overflow it, so there is nothing to saturate. */
+static bool needs_float_to_int_guard(Type *src, Type *tgt) {
+    if (!src || !tgt) return false;
+    if (!type_is_float(type_unwrap_distinct(src))) return false;
+    Type *te = type_unwrap_distinct(tgt);
+    TypeKind tk = type_dispatch_kind(te);
+    if (tk == TYPE_BOOL || tk == TYPE_ENUM) return false;
+    if (!type_is_integer(te)) return false;
+    int w = type_width(te);
+    return w > 0 && w <= 64;
+}
+
+/* Emit `(<T>)_zer_f2u(...)` / `(<T>)_zer_f2i(...)` around an already-open value.
+ * The caller emits the VALUE between the two halves, so the same helper serves
+ * every emission path (AST expr, IR local, IR intrinsic). */
+static void emit_f2i_open(Emitter *e, Type *tgt) {
+    Type *te = type_unwrap_distinct(tgt);
+    int w = type_width(te);
+    bool sgn = type_is_signed(te);
+    emit(e, "(");
+    emit_type(e, tgt);
+    emit(e, ")");
+    if (!sgn) {
+        emit(e, "_zer_f2u((double)(");
+    } else {
+        emit(e, "_zer_f2i((double)(");
+    }
+    (void)w;
+}
+static void emit_f2i_close(Emitter *e, Type *tgt) {
+    Type *te = type_unwrap_distinct(tgt);
+    int w = type_width(te);
+    bool sgn = type_is_signed(te);
+    if (!sgn) {
+        /* hi = 2^w (exclusive), maxv = 2^w - 1 */
+        if (w >= 64)
+            emit(e, "), 0x1p64, 0xFFFFFFFFFFFFFFFFULL)");
+        else
+            emit(e, "), 0x1p%d, %lluULL)", w,
+                 (unsigned long long)((1ULL << w) - 1ULL));
+    } else {
+        /* lo = -2^(w-1) (inclusive), hi = 2^(w-1) (exclusive) */
+        if (w >= 64)
+            emit(e, "), -0x1p63, 0x1p63, (-9223372036854775807LL - 1), "
+                    "9223372036854775807LL)");
+        else
+            emit(e, "), -0x1p%d, 0x1p%d, %lldLL, %lldLL)", w - 1, w - 1,
+                 -(long long)(1ULL << (w - 1)),
+                 (long long)((1ULL << (w - 1)) - 1ULL));
+    }
+}
+
 /* emit a C type name for a ZER type */
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
@@ -3388,7 +3444,17 @@ static void emit_expr(Emitter *e, Node *node) {
              * 5), so mask the result here — covers INLINE uses (comparisons,
              * call args), not just stores. */
             Type *tt = node->intrinsic.type_arg ? resolve_tynode(e,node->intrinsic.type_arg) : NULL;
-            if (type_is_nonnative_intn(tt)) {
+            /* BUG-850: AST twin of the IR site — same total float->int helper.
+             * Both paths, per the emitter dual-dispatch rule. */
+            Type *tr_src_a = (node->intrinsic.arg_count > 0)
+                ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+            if (needs_float_to_int_guard(tr_src_a, tt)) {
+                emit(e, "(");
+                emit_f2i_open(e, tt);
+                emit_expr(e, node->intrinsic.args[0]);
+                emit_f2i_close(e, tt);
+                emit(e, ")");
+            } else if (type_is_nonnative_intn(tt)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -5727,6 +5793,41 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
             "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
+    /* BUG-850: TOTAL float -> integer conversion.
+     *
+     * In C, converting a float to an integer type is UNDEFINED when the
+     * truncated value is not representable in the target — and GCC does not even
+     * answer it consistently within one build. Measured on gcc 13, one .c file,
+     * two optimisation levels:
+     *
+     *     (u32)(-1.5)   ->  4294967295 at -O0, 0          at -O2
+     *     (u32)1.0e30   ->  0          at -O0, 4294967295 at -O2
+     *     (i32)1.0e30   -> -2147483648 at -O0, 2147483647 at -O2
+     *
+     * (the constant-folding path applies GCC's own arbitrary-precision rules,
+     * the instruction path applies the CPU's — a `volatile` source hides the
+     * divergence, which is why probing with one must be avoided.) That directly
+     * contradicts ZER's "no undefined behavior" guarantee.
+     *
+     * ZER defines it: truncate the fraction toward zero, SATURATE the range, and
+     * map NaN to 0 — the same total definition Rust's `as` and the ARM/RISC-V
+     * FCVT instructions use. Bounds are passed as exact hex-float literals
+     * (`0x1p32`), so the comparison is exact at every width including 64.
+     */
+    emit(e, "/* total float->int conversion: truncate toward zero, saturate, NaN=0 */\n");
+    emit(e, "static inline uint64_t _zer_f2u(double v, double hi, uint64_t maxv) {\n");
+    emit(e, "    if (!(v >= 0.0)) return 0;   /* NaN and negatives */\n");
+    emit(e, "    if (v >= hi) return maxv;\n");
+    emit(e, "    return (uint64_t)v;\n");
+    emit(e, "}\n");
+    emit(e, "static inline int64_t _zer_f2i(double v, double lo, double hi, "
+            "int64_t minv, int64_t maxv) {\n");
+    emit(e, "    if (v != v) return 0;        /* NaN */\n");
+    emit(e, "    if (v < lo) return minv;\n");
+    emit(e, "    if (v >= hi) return maxv;\n");
+    emit(e, "    return (int64_t)v;\n");
+    emit(e, "}\n\n");
+
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
     emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "
             "const char *file, int line) {\n");
@@ -7682,7 +7783,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             /* @truncate(T, val) → (T)(val). Non-native uN/iN: mask the result
              * (IR-path twin of the emit_expr site) — covers inline uses. */
             Type *tt = node->intrinsic.type_arg ? resolve_tynode(e, node->intrinsic.type_arg) : NULL;
-            if (type_is_nonnative_intn(tt)) {
+            /* BUG-850: a FLOAT source has no "low bits" to keep, so @truncate on
+             * one means truncate-the-fraction — and the plain C cast for that is
+             * UB out of range. Same total helper as the C-style cast. */
+            Type *tr_src = (node->intrinsic.arg_count > 0)
+                ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL;
+            if (needs_float_to_int_guard(tr_src, tt)) {
+                emit(e, "(");
+                emit_f2i_open(e, tt);
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit_f2i_close(e, tt);
+                emit(e, ")");
+            } else if (type_is_nonnative_intn(tt)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -12316,6 +12428,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "((uint8_t)!!(");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "))");
+            }
+            /* BUG-850: float -> integer is UB in C when the value does not fit,
+             * and GCC answers it differently at -O0 and -O2. Route through the
+             * total helper: truncate toward zero, saturate, NaN -> 0. */
+            else if (inst->src1_local >= 0 &&
+                     needs_float_to_int_guard(src_type, tgt)) {
+                emit(e, "(");
+                emit_f2i_open(e, tgt);
+                emit_local_name(e, func, inst->src1_local);
+                emit_f2i_close(e, tgt);
+                emit(e, ")");
             }
             /* Simple C cast */
             else if (inst->src1_local >= 0) {

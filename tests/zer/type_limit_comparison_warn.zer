@@ -1,0 +1,43 @@
+// BUG-852 boundary positive: the always-true/always-false warning must fire only
+// when the TYPE settles the comparison, and must stay quiet for every ordinary
+// one. This file must compile with NO warning — a false positive here is the
+// failure mode that gets a diagnostic switched off.
+//
+// (The warning itself is exercised by hand; a positive test cannot assert a
+// warning's presence, and tests/zer_fail cannot hold one either because a
+// warning does not fail the compile. The value here is the SILENCE.)
+
+i32 printf(const *u8 fmt, ...);
+
+volatile u32 v32;
+volatile u8  v8;
+volatile i8  vi8;
+
+u32 main() {
+    /* bounds that are exactly reachable — no warning */
+    u8 a = v8;
+    if (a < 255) { printf("a<255\n"); }
+    if (a > 0) { printf("a>0\n"); }
+    if (a == 255) { printf("a==255\n"); }
+    if (a != 0) { printf("a!=0\n"); }
+
+    i8 s = vi8;
+    if (s < 127) { printf("s<127\n"); }
+    if (s > -128) { printf("s>-128\n"); }
+    if (s == -128) { printf("s==-128\n"); }
+
+    u32 x = v32;
+    if (x < 4294967295) { printf("x<max\n"); }
+    if (x > 0) { printf("x>0\n"); }
+
+    /* two variables of the same type — nothing to decide statically */
+    u8 b = v8;
+    if (a < b) { printf("mixed\n"); }
+
+    /* a loop with a reachable bound */
+    u32 n = 0;
+    for (u8 i = 0; i < 200; i += 1) { n += 1; }
+    if (n != 200) { return 1; }
+
+    return 0;
+}

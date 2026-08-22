@@ -783,6 +783,112 @@ static void check_enum_forge(Checker *c, Node *value, Type *target,
         what, tn);
 }
 
+/* BUG-852: the full value range an integer TYPE can hold.
+ *
+ * Returns false when the upper bound does not fit in int64 (u64, usize on a
+ * 64-bit target, u128) — the caller then uses only the lower bound, which is
+ * where the interesting `unsigned < 0` case lives anyway. */
+static bool int_type_range(Type *t, int64_t *lo, int64_t *hi, bool *hi_fits) {
+    Type *e = type_unwrap_distinct(t);
+    if (!e || !type_is_integer(e)) return false;
+    *hi_fits = true;
+    switch (type_dispatch_kind(e)) {
+    case TYPE_U8:  *lo = 0; *hi = 255; return true;
+    case TYPE_U16: *lo = 0; *hi = 65535; return true;
+    case TYPE_U32: *lo = 0; *hi = 4294967295LL; return true;
+    case TYPE_U64: *lo = 0; *hi = 0; *hi_fits = false; return true;
+    case TYPE_USIZE:
+        *lo = 0;
+        if (zer_target_ptr_bits >= 64) { *hi = 0; *hi_fits = false; }
+        else *hi = (int64_t)((1ULL << zer_target_ptr_bits) - 1ULL);
+        return true;
+    case TYPE_I8:  *lo = -128; *hi = 127; return true;
+    case TYPE_I16: *lo = -32768; *hi = 32767; return true;
+    case TYPE_I32: *lo = -2147483648LL; *hi = 2147483647LL; return true;
+    case TYPE_I64: *lo = INT64_MIN; *hi = INT64_MAX; return true;
+    case TYPE_UINT: {
+        uint32_t b = e->intn.bits;
+        *lo = 0;
+        if (b >= 64) { *hi = 0; *hi_fits = false; }
+        else *hi = (int64_t)((1ULL << b) - 1ULL);
+        return true;
+    }
+    case TYPE_SINT: {
+        uint32_t b = e->intn.bits;
+        if (b >= 64) { *lo = INT64_MIN; *hi = INT64_MAX; return true; }
+        *lo = -(int64_t)(1ULL << (b - 1));
+        *hi = (int64_t)((1ULL << (b - 1)) - 1ULL);
+        return true;
+    }
+    /* enum: variant values are open-ended in practice — not judged here */
+    default: return false;
+    }
+}
+
+/* BUG-852: is this comparison decided by the TYPE alone — i.e. can the variable
+ * side never reach the constant side?
+ *
+ *     for (u8 i = 0; i < 300; i += 1) { ... }   // u8 tops out at 255
+ *
+ * compiles today, runs forever, and says nothing. So does `if (x < 0)` on an
+ * unsigned x, which silently deletes the branch. GCC cannot warn either, because
+ * the emitted C promotes both sides to `int` before comparing — the information
+ * that `i` is a u8 exists only in ZER.
+ *
+ * Reported as a WARNING, not an error: a tautology is not a memory-safety
+ * violation, and generated/`comptime` code can legitimately produce one. But an
+ * accidental infinite loop should not be silent.
+ *
+ * Sets *out_always to the constant answer. Judges only a PURE integer-literal
+ * constant against an integer-typed operand, and skips any constant whose fold
+ * is untrustworthy (an operand above INT64_MAX reads back negative). */
+static bool is_pure_int_literal_expr(Node *e);            /* defined below */
+static bool literal_tree_has_huge_operand(Node *e);      /* defined below */
+static bool comparison_decided_by_type(Node *lhs, Type *lt, Node *rhs, Type *rt,
+                                       TokenType op, bool *out_always) {
+    Node *var_side = NULL, *const_side = NULL;
+    Type *var_type = NULL;
+    bool const_on_right;
+    if (is_pure_int_literal_expr(rhs) && !is_pure_int_literal_expr(lhs)) {
+        var_side = lhs; var_type = lt; const_side = rhs; const_on_right = true;
+    } else if (is_pure_int_literal_expr(lhs) && !is_pure_int_literal_expr(rhs)) {
+        var_side = rhs; var_type = rt; const_side = lhs; const_on_right = false;
+    } else {
+        return false;
+    }
+    (void)var_side;
+    if (literal_tree_has_huge_operand(const_side)) return false;
+    int64_t v = eval_const_expr(const_side);
+    if (v == CONST_EVAL_FAIL) return false;
+    int64_t lo = 0, hi = 0; bool hi_fits = false;
+    if (!int_type_range(var_type, &lo, &hi, &hi_fits)) return false;
+
+    /* Normalise to "variable OP constant" by mirroring the operator. */
+    TokenType o = op;
+    if (!const_on_right) {
+        if (o == TOK_LT) o = TOK_GT;
+        else if (o == TOK_GT) o = TOK_LT;
+        else if (o == TOK_LTEQ) o = TOK_GTEQ;
+        else if (o == TOK_GTEQ) o = TOK_LTEQ;
+    }
+    bool above = hi_fits && v > hi;      /* constant is above everything the type holds */
+    bool at_or_above = hi_fits && v >= hi;
+    bool below = v < lo;
+    bool at_or_below = v <= lo;
+
+    if (o == TOK_LT)   { if (above)       { *out_always = true;  return true; }
+                         if (at_or_below) { *out_always = false; return true; } }
+    if (o == TOK_LTEQ) { if (at_or_above) { *out_always = true;  return true; }
+                         if (below)       { *out_always = false; return true; } }
+    if (o == TOK_GT)   { if (at_or_above) { *out_always = false; return true; }
+                         if (below)       { *out_always = true;  return true; } }
+    if (o == TOK_GTEQ) { if (above)       { *out_always = false; return true; }
+                         if (at_or_below) { *out_always = true;  return true; } }
+    if (o == TOK_EQEQ)   { if (above || below) { *out_always = false; return true; } }
+    if (o == TOK_BANGEQ) { if (above || below) { *out_always = true;  return true; } }
+    return false;
+}
+
 /* Spelling of a comparison operator, for diagnostics. */
 static const char *compare_op_spelling(TokenType op) {
     if (op == TOK_EQEQ)   return "==";
@@ -5259,6 +5365,31 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "cannot compare '%s' and '%s'",
                     type_name(left), type_name(right));
+            }
+            /* BUG-852: a comparison the TYPE already decides. `u8 i < 300` is a
+             * silent infinite loop; `unsigned x < 0` silently deletes a branch.
+             * GCC cannot see either — the emitted C promotes both sides to int,
+             * so the width information exists only here. */
+            {
+                bool always = false;
+                if (comparison_decided_by_type(node->binary.left, left,
+                                               node->binary.right, right,
+                                               node->binary.op, &always)) {
+                    Node *vn = is_pure_int_literal_expr(node->binary.right)
+                                 ? node->binary.left : node->binary.right;
+                    Type *vt = is_pure_int_literal_expr(node->binary.right)
+                                 ? left : right;
+                    char tn2[96];
+                    snprintf(tn2, sizeof(tn2), "%s", type_name(vt));
+                    checker_warning(c, node->loc.line,
+                        "comparison is always %s — %s'%s' cannot hold a value on "
+                        "the other side of this bound, so %s",
+                        always ? "TRUE" : "FALSE",
+                        (vn && vn->kind == NODE_IDENT) ? "" : "the operand of type ",
+                        tn2,
+                        always ? "the guard never fails (a loop on it never ends)"
+                               : "the guarded code never runs");
+                }
             }
             result = ty_bool;
             break;
@@ -18340,6 +18471,35 @@ static void check_func_body(Checker *c, Node *node) {
 
         if (node->func_decl.is_naked) {
             c->in_naked = true;
+            /* BUG-851: `naked` is accepted, checked — and then NOT EMITTED. The
+             * IR migration dropped `__attribute__((naked))` and the emitter has
+             * deliberately not restored it (emitter.c emit_func_attributes says
+             * why), so the generated function gets a normal prologue/epilogue.
+             *
+             * On a hosted target that is harmless; on a real target it is not.
+             * A reset vector or a context switcher written `naked` because it
+             * must NOT touch the stack gets a prologue that writes to a stack
+             * which does not exist yet — silent corruption, with the compiler
+             * having accepted the keyword that was supposed to prevent it.
+             *
+             * Restoring the attribute is a user-visible breaking change, not a
+             * bug fix, because `naked` is OVERLOADED in ZER: it is also the only
+             * way to get permission to write `asm` (the S1 interim guard). SIX
+             * corpus tests call a `naked` function to check asm operand binding
+             * at run time, and every one of them SIGILLs (exit 132, falling off
+             * the end into `ud2`) the moment the attribute is real — measured,
+             * not assumed. Decoupling asm-permission from `naked` is the
+             * precondition; until then this warning is the honest position:
+             * the gap stays, but it stops being SILENT.
+             *
+             * Tracked in docs/limitations.md. 44 corpus files emit this warning
+             * — that number is the finding, not noise to suppress. */
+            checker_warning(c, node->loc.line,
+                "'naked' is checked but NOT emitted — the generated function "
+                "still gets a prologue/epilogue. Safe on a hosted target; on a "
+                "real target a reset vector or context switch written 'naked' "
+                "will touch a stack it was written to avoid. See "
+                "docs/limitations.md \"naked attribute\"");
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
             if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {

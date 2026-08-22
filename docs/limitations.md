@@ -21,7 +21,9 @@ row described — see the struck-through rows for what each row missed. BUG-842 
 negative constant into an unsigned type: rejected at u8/u16, ACCEPTED at
 u32/u64/usize, at all EIGHT value-flow sinks) is not on this tracker at all; it was
 in the "jjfk1k verified-and-deliberately-skipped" list below as unreproduced, and is
-now measured, fixed and pinned. **The arena work exposed a whole seam of VACUOUS
+now measured, fixed and pinned; BUG-852 (a comparison the TYPE decides — `u8 i < 300`
+is a silent infinite loop, and GCC cannot warn because the emitted C promotes both
+sides to `int`) is likewise original. **The arena work exposed a whole seam of VACUOUS
 tests** — the tracker's "hid 5 VACUOUS tests" note was right and then some:
 `super_freelist_arena` (a 120-line "real program" that executed four lines),
 `stress_combined_safety_02`, `rust_tests/gen_arena_00{1,2,4}`, AND the semantic
@@ -96,7 +98,7 @@ phrasing. Cosmetic; the rules fire.
 | ~~V14~~ **DONE 2026-08-23 (BUG-845)** | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Closed wider than the branch row: `_zer_arena_alloc`'s OWN capacity test (`off + size > capacity`) also wraps for a size near SIZE_MAX and then compares small, so it is rewritten as a subtraction on the capacity side. Measured: a 1024-byte arena returned a slice of 2^61 elements and a write 1600 bytes past it succeeded with no trap |
 | V15 | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
 | ~~V16~~ **DONE 2026-08-23 (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | Closed wider than the branch row: `@truncate` is the SECOND route (the row names only `@bitcast`), and the gate asks `type_carries_enum` so a struct/array/optional/union WRAPPER cannot slip — `Box b = @bitcast(Box, 7)` was accepted by the first, spelling-based draft |
-| V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
+| ~~V17~~ **DONE 2026-08-23 (BUG-850)** | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Confirmed and closed. Two independent divergences measured on ONE gcc 13, one emitted .c: `(u32)(-1.5)` gives 4294967295 at -O0 and 0 at -O2, and `(u32)1.0e30` gives 0 at -O0 and 4294967295 at -O2 (opposite direction). ZER now defines it as truncate-toward-zero + SATURATE + NaN=0, the Rust `as` / ARM FCVT definition, at the IR cast and at `@truncate` on both emitter paths. The row's `volatile`-probe warning is confirmed and reproduced in the test's design |
 | ~~V18~~ **DONE 2026-08-23 (BUG-849)** | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | One deferred pass answers this AND V19 (they are the same use-before-init shape), run across ALL modules so a cross-module init is not falsely reported. Plus a runtime trap on `target == 0` for a barrier reached through a pointer param, which no per-file analysis can see |
 | ~~V19~~ **DONE 2026-08-23 (BUG-847)** | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | The "5 vacuous tests" claim is CONFIRMED and they are now fixed: `super_freelist_arena` (the 120-line one), `stress_combined_safety_02`, `rust_tests/gen_arena_00{1,2,4}`. Making the first one run exposed a second defect it had been hiding — it type-punned `*Block` into `*FreeNode` through `*opaque` and TRAPPED, so it was rewritten to the safe idiom |
 | ~~V20~~ **DONE 2026-08-23 (BUG-846)** | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | This is the line that made three of the five vacuous tests vacuous |
@@ -127,7 +129,7 @@ these 11 are its output, each verified live.
 | ~~W8~~ **DONE (BUG-825)** | `scan_frame` skipped loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
 | ~~W9~~ **DONE (BUG-826)** | ISR sibling + VRP invalidation descents | = V6 |
 | ~~W10~~ **DONE (BUG-829)** | `ir_defer_free_arg` knew only 3 builtin free spellings | = O1 |
-| W11 | `naked` silently dropped since the IR migration | see Q1 — still OPEN (§F) |
+| ~~W11~~ **DONE 2026-08-23 (BUG-851)** | `naked` silently dropped since the IR migration | = Q1. Now a warning at the declaration; emitting the attribute needs asm-permission decoupled from `naked` first (measured: 6 tests SIGILL) |
 
 **Latent, documented, not fixable yet:** no walker descends `asm` operand expressions.
 Unreachable only because `asm` is naked-only; opens seven holes at once the day S1 relaxes.
@@ -144,7 +146,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 
 | # | Item | Best version |
 |---|---|---|
-| Q1 | `naked` silently dropped -> warn at the declaration | **4z36e0**. Deeper measurement than 39294y's identical fix: GCC 13 x86-64 DOES support the attribute (emits `endbr64; body; ud2`, no `ret`), 16 of 18 `asm_*.zer` positives CALL their naked function so flipping it on SIGILLs all 16, and `naked` is OVERLOADED (it is the only way to get asm permission). 43 corpus files emit the warning — that number IS the finding |
+| ~~Q1~~ **DONE 2026-08-23 (BUG-851)** | `naked` silently dropped -> warn at the declaration | **4z36e0**. Re-measured independently on current main: enabling the attribute breaks **6** tests, not 16 (all exit 132, SIGILL), and **44** files emit the warning. The OVERLOAD finding is confirmed and is the reason this is a warning and not a fix: decoupling asm-permission from `naked` is the precondition for emitting the attribute. **W11 in the walker table is the same item and is closed with it.** |
 | Q2 | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
 | Q3 | Emitter's five give-up paths are silent miscompiles | **4z36e0**. `/* complex callee */(a, b)` is a valid C COMMA EXPRESSION — compiles, runs, CALLS NOTHING. Measured 0/1170 corpus programs reach them, so `emit_unreachable()` aborts nothing reachable |
 | Q4 | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |

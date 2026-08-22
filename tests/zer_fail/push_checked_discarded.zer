@@ -1,0 +1,11 @@
+// expect-error: discarded push_checked() result
+// BUG-846: push_checked returns `?void` whose ONLY purpose is reporting ring
+// overflow. Discarding it makes it identical to the unchecked `push`, so the one
+// method that reports the failure silently does not.
+struct Item { u32 v; }
+Ring(Item, 2) rb;
+u32 main() {
+    Item a; a.v = 1;
+    rb.push_checked(a);
+    return 0;
+}

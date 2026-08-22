@@ -1,13 +1,24 @@
-// Real program: Freelist allocator built on Arena
-// *opaque round-trips through function boundary (clears provenance),
-// ?*T linked list, defer cleanup
-// Tests: cast safety, interior pointer concepts, arena + linked list
-
-struct FreeNode {
-    ?*FreeNode next;
-}
+// Real program: freelist allocator built on Arena
+// *opaque round-trip through a function boundary, ?*T linked list, defer cleanup
+// Tests: arena allocation, cast safety, optional-pointer list, if-unwrap capture
+//
+// HISTORY (BUG-847). This test used to declare `Arena backing;` with NO backing
+// store, so every `backing.alloc(Block)` returned null and the FIRST
+// `orelse return` ended main — this 120-line "real program" executed four lines
+// and exited 0, which the harness scored as a pass. It was vacuous for months.
+//
+// Giving the arena a real buffer made it run, and it then TRAPPED at runtime:
+// the original body punned a `*Block` through `*opaque` into a `*FreeNode`, and
+// ZER's runtime provenance check (`_zer_opaque.type_id`) correctly refused it.
+// That is the "wrong pointer cast" guarantee doing its job — the program was
+// never legal ZER, only unexecuted.
+//
+// Rewritten to the safe idiom, keeping BOTH subjects the header claims: the
+// freelist link now lives IN the block (no cross-type pun), and the `*opaque`
+// round-trip is the sanctioned SAME-TYPE one, which passes the type_id check.
 
 struct Block {
+    ?*Block next;        // freelist link — meaningful only while the block is free
     u32 data_a;
     u32 data_b;
     u32 data_c;
@@ -15,91 +26,78 @@ struct Block {
 }
 
 Arena backing;
+u8[512] backing_mem;
 
-// Helper: cast *opaque to *Block — function boundary clears provenance
+// *opaque round-trip through a function boundary: the boundary clears static
+// provenance, so this is the runtime-checked path. Same type in, same type out.
 *Block opaque_to_block(*opaque raw) {
     return (*Block)raw;
 }
 
-*FreeNode opaque_to_freenode(*opaque raw) {
-    return (*FreeNode)raw;
-}
-
 u32 main() {
-    ?*FreeNode free_head = null;
+    backing = Arena.over(backing_mem);
+    defer backing.reset();
+
+    ?*Block free_head = null;
     u32 alloc_count = 0;
     u32 free_count = 0;
 
-    // === Allocate 4 blocks from arena ===
-    ?*Block mb1 = backing.alloc(Block);
-    *Block b1 = mb1 orelse return;
+    // === Allocate 4 blocks from the arena ===
+    *Block b1 = backing.alloc(Block) orelse { return 1; };
     b1.data_a = 10;
     b1.data_b = 20;
     alloc_count += 1;
 
-    ?*Block mb2 = backing.alloc(Block);
-    *Block b2 = mb2 orelse return;
+    *Block b2 = backing.alloc(Block) orelse { return 1; };
     b2.data_a = 30;
     b2.data_b = 40;
     alloc_count += 1;
 
-    ?*Block mb3 = backing.alloc(Block);
-    *Block b3 = mb3 orelse return;
+    *Block b3 = backing.alloc(Block) orelse { return 1; };
     b3.data_a = 50;
     alloc_count += 1;
 
-    ?*Block mb4 = backing.alloc(Block);
-    *Block b4 = mb4 orelse return;
+    *Block b4 = backing.alloc(Block) orelse { return 1; };
     b4.data_a = 60;
     alloc_count += 1;
 
-    if (alloc_count != 4) { return 1; }
-    if (b1.data_a != 10) { return 2; }
-    if (b2.data_b != 40) { return 3; }
+    if (alloc_count != 4) { return 2; }
+    if (b1.data_a != 10) { return 3; }
+    if (b2.data_b != 40) { return 4; }
 
-    // === "Free" b2 — add to freelist via *opaque type-pun ===
-    {
-        *opaque raw = (*opaque)b2;
-        *FreeNode node = opaque_to_freenode(raw);
-        node.next = free_head;
-        free_head = node;
-        free_count += 1;
-    }
+    // === "Free" b2 and b3 — push onto the freelist ===
+    b2.next = free_head;
+    free_head = b2;
+    free_count += 1;
 
-    // === "Free" b3 ===
-    {
-        *opaque raw = (*opaque)b3;
-        *FreeNode node = opaque_to_freenode(raw);
-        node.next = free_head;
-        free_head = node;
-        free_count += 1;
-    }
+    b3.next = free_head;
+    free_head = b3;
+    free_count += 1;
 
-    if (free_count != 2) { return 4; }
+    if (free_count != 2) { return 5; }
 
-    // === Re-allocate from freelist ===
-    *Block b5 = b1; // placeholder
+    // === Re-allocate from the freelist, through the *opaque round-trip ===
+    *Block b5 = b1;                       // placeholder
     if (free_head) |node| {
         free_head = node.next;
         *opaque raw = (*opaque)node;
         b5 = opaque_to_block(raw);
+        b5.next = null;
         b5.data_a = 0;
         b5.data_b = 0;
         b5.data_c = 0;
         b5.data_d = 0;
         alloc_count += 1;
     }
-
-    // Verify recycled block is zeroed
-    if (b5.data_a != 0) { return 5; }
+    if (b5.data_a != 0) { return 6; }
     b5.data_a = 70;
 
-    // Second re-alloc from freelist
-    *Block b6 = b1; // placeholder
+    *Block b6 = b1;                       // placeholder
     if (free_head) |node| {
         free_head = node.next;
         *opaque raw = (*opaque)node;
         b6 = opaque_to_block(raw);
+        b6.next = null;
         b6.data_a = 0;
         alloc_count += 1;
     }
@@ -107,13 +105,14 @@ u32 main() {
 
     if (alloc_count != 6) { return 7; }
 
-    // === Verify all blocks ===
+    // The recycled blocks are b3 (LIFO) then b2 — distinct storage, and the
+    // originals that were never freed keep their values.
     if (b1.data_a != 10) { return 8; }
     if (b4.data_a != 60) { return 9; }
     if (b5.data_a != 70) { return 10; }
     if (b6.data_a != 80) { return 11; }
+    if (b3.data_a != 70) { return 12; }   // b5 IS b3, recycled
+    if (b2.data_a != 80) { return 13; }   // b6 IS b2, recycled
 
-    // Arena reset frees all memory
-    defer backing.reset();
     return 0;
 }

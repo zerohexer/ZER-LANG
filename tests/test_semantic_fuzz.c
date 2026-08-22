@@ -89,6 +89,10 @@ static void gen_safe_arena_chain(char *buf, int depth) {
     char *p = buf;
     p += sprintf(p, "struct Block%d { u32 a; u32 b; }\n", depth);
     p += sprintf(p, "Arena ar%d;\n", depth);
+    /* BUG-847: the arena needs a BACKING STORE. Without one its capacity is 0,
+     * every alloc returns null, and this whole generated program ran only its
+     * `orelse return` — a vacuous "safe program" that proved nothing. */
+    p += sprintf(p, "u8[512] armem%d;\n", depth);
 
     /* Build wrapper chain */
     for (int i = 0; i < depth; i++) {
@@ -102,6 +106,7 @@ static void gen_safe_arena_chain(char *buf, int depth) {
     }
 
     p += sprintf(p, "u32 test_arena_chain_%d() {\n", depth);
+    p += sprintf(p, "    ar%d = Arena.over(armem%d);\n", depth, depth);
     p += sprintf(p, "    ?*Block%d mb = wrap%d_%d();\n", depth, depth, depth - 1);
     p += sprintf(p, "    *Block%d b = mb orelse return;\n", depth);
     p += sprintf(p, "    b.a = %d;\n", depth * 10);
@@ -602,8 +607,10 @@ static void gen_unsafe_arena_global(char *buf, int id) {
     char *p = buf;
     p += sprintf(p, "struct Ag%d { u32 v; }\n", id);
     p += sprintf(p, "Arena ag_arena%d;\n", id);
+    p += sprintf(p, "u8[256] agmem%d;\n", id);   /* BUG-847: real backing store */
     p += sprintf(p, "?*Ag%d ag_global%d = null;\n", id, id);
     p += sprintf(p, "u32 test_arena_esc_%d() {\n", id);
+    p += sprintf(p, "    ag_arena%d = Arena.over(agmem%d);\n", id, id);
     p += sprintf(p, "    ?*Ag%d ma = ag_arena%d.alloc(Ag%d);\n", id, id, id);
     p += sprintf(p, "    *Ag%d a = ma orelse return;\n", id);
     p += sprintf(p, "    ag_global%d = a;\n", id); /* arena escape to global */

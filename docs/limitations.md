@@ -13,14 +13,23 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
-**PROGRESS: an ORIGINAL audit landed 2026-08-23** (BUG-839..844) — six defects found
-by probing the compiler directly, not by harvesting. Five of them happen to close
-tracker rows (V6, V11, V12, V16, V24), each WIDER than the row described — see the
-struck-through rows for what each row missed. BUG-842 (a negative constant into an
-unsigned type: rejected at u8/u16, ACCEPTED at u32/u64/usize, at all EIGHT
-value-flow sinks) is not on this tracker at all; it was in the
-"jjfk1k verified-and-deliberately-skipped" list below as unreproduced, and is now
-measured, fixed and pinned. Remaining: 9.
+**PROGRESS: an ORIGINAL audit landed 2026-08-23** (BUG-839..849) — eleven defects
+found by probing the compiler directly, not by harvesting. Ten of them happen to
+close tracker rows (V6, V11, V12, V14, V16, V18, V19, V20, V21, V24) and one closes
+the "two arena allocations cannot be LINKED" over-rejection; each is WIDER than the
+row described — see the struck-through rows for what each row missed. BUG-842 (a
+negative constant into an unsigned type: rejected at u8/u16, ACCEPTED at
+u32/u64/usize, at all EIGHT value-flow sinks) is not on this tracker at all; it was
+in the "jjfk1k verified-and-deliberately-skipped" list below as unreproduced, and is
+now measured, fixed and pinned. **The arena work exposed a whole seam of VACUOUS
+tests** — the tracker's "hid 5 VACUOUS tests" note was right and then some:
+`super_freelist_arena` (a 120-line "real program" that executed four lines),
+`stress_combined_safety_02`, `rust_tests/gen_arena_00{1,2,4}`, AND the semantic
+fuzzer's two arena generators (`gen_safe_arena_chain`, `gen_unsafe_arena_global`),
+whose ~18 generated programs per run had likewise never allocated anything. All
+fixed; making the first one RUN exposed a second defect it had been hiding (a
+`*Block`→`*FreeNode` pun through `*opaque` that the runtime type_id check
+correctly traps). Remaining: 4.
 
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
@@ -84,14 +93,14 @@ phrasing. Cosmetic; the rules fire.
 | ~~V11~~ **DONE 2026-08-23 (BUG-840)** | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Closed wider than the branch row: `type_is_value_comparable` also covers the RELATIONAL operators (never gated at all), `?T == value` (which read `.value` without `.has_value`, so a null `?u32` compared EQUAL to 0) and `?T == ?T` |
 | ~~V12~~ **DONE 2026-08-23 (BUG-839)** | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | Fixed by lowering the arms in MATCH order (non-default first, default last) rather than rejecting the form — `default` is the fallback its name promises wherever it is written, which is also C's rule |
 | V13 | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
-| V14 | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
+| ~~V14~~ **DONE 2026-08-23 (BUG-845)** | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Closed wider than the branch row: `_zer_arena_alloc`'s OWN capacity test (`off + size > capacity`) also wraps for a size near SIZE_MAX and then compares small, so it is rewritten as a subtraction on the capacity side. Measured: a 1024-byte arena returned a slice of 2^61 elements and a write 1600 bytes past it succeeded with no trap |
 | V15 | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
 | ~~V16~~ **DONE 2026-08-23 (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | Closed wider than the branch row: `@truncate` is the SECOND route (the row names only `@bitcast`), and the gate asks `type_carries_enum` so a struct/array/optional/union WRAPPER cannot slip — `Box b = @bitcast(Box, 7)` was accepted by the first, spelling-based draft |
 | V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
-| V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
-| V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
-| V20 | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | `.over` is a constructor returning BY VALUE; as a statement it builds into a discarded temp |
-| V21 | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | `rb.push_checked(a);` — the one method whose entire purpose is reporting overflow, silently not reporting it. Subsumes the ghost-handle check. Corpus cost measured at ZERO (all 6 hits are ghost-handle negatives) |
+| ~~V18~~ **DONE 2026-08-23 (BUG-849)** | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | One deferred pass answers this AND V19 (they are the same use-before-init shape), run across ALL modules so a cross-module init is not falsely reported. Plus a runtime trap on `target == 0` for a barrier reached through a pointer param, which no per-file analysis can see |
+| ~~V19~~ **DONE 2026-08-23 (BUG-847)** | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | The "5 vacuous tests" claim is CONFIRMED and they are now fixed: `super_freelist_arena` (the 120-line one), `stress_combined_safety_02`, `rust_tests/gen_arena_00{1,2,4}`. Making the first one run exposed a second defect it had been hiding — it type-punned `*Block` into `*FreeNode` through `*opaque` and TRAPPED, so it was rewritten to the safe idiom |
+| ~~V20~~ **DONE 2026-08-23 (BUG-846)** | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | This is the line that made three of the five vacuous tests vacuous |
+| ~~V21~~ **DONE 2026-08-23 (BUG-846)** | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | Landed narrowly as `push_checked` specifically, extending the existing ghost-handle discard rule rather than a blanket discarded-optional ban. `rb.pop()` is deliberately excluded — discarding a popped item is a legitimate "drop one" |
 | ~~V22~~ **DONE (BUG-836)** | `--stack-limit` never sums main + ISRs, which share one stack | **pjtawx** BUG-811 | Two 200-byte chains pass `--stack-limit 256`. The tool AFFIRMS a budget the target cannot honour |
 | ~~V23~~ **DONE (BUG-835)** | Auto-guard's `return` leaks a held lock and the interrupt-disable | **87xihb** BUG-805 | **The lock form HANGS (deadlock, verified exit 124); the `@critical` form exits 0 silently.** The compiler emits the exact construct it hard-errors users for writing. Main has `guard_traps` for defer bodies only — needs `noreturn_scope_depth` counted inside `emit_shared_lock_mode`/`emit_shared_unlock` and both `IR_CRITICAL` handlers |
 | ~~V24~~ **DONE 2026-08-23 (BUG-844)** | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | Also validates `--target-bits`/`--stack-limit` arguments with `strtol` (`atoi` mapped `abc` to 0, i.e. "no limit"), adds `--help`, and fixes a harness defect found on the way: `grep -qF "$want"` in `tests/test_zer.sh` parsed any `expect-error` string starting with `-` as a grep OPTION |
@@ -173,6 +182,23 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
   claims were also corrected: `reference.md` listed C-style casts and `goto` under "NOT in
   ZER" while both have worked for months.
 
+### Measured 2026-08-23 and did NOT reproduce — do not implement without a new reproducer
+
+- **V13 (leak in a both-arms-return `if`)**: probed in four shapes — heap `alloc`
+  with `if/else` both returning, a Pool handle with an early `return`, and the
+  freeing variants — and the leak was REPORTED every time
+  (`handle %N (local 'n') allocated at line N but never freed`). The branch's own
+  test file was not fetched; fetch it before concluding either way (CLAUDE.md: "a
+  RECONSTRUCTED reproducer can CONFIRM a hole, never REFUTE one").
+- **V15 (comptime folds a different value than runtime)**: probed with a `comptime`
+  u8 addition that overflows (200+100) and a `comptime` shift past the width
+  (1 << 40); comptime and runtime AGREED in both, at `-O0` and `-O2`. Same caveat —
+  the branch's file was not fetched.
+- **Message-quality nit found while probing V13**: a leaked Pool handle bound by
+  `Handle(T) h = p.alloc() orelse {...};` is reported as "ghost handle: allocation
+  discarded — result of alloc() ... is never assigned or used". It WAS assigned;
+  the leak is real but the sentence describes a different defect.
+
 ### Reported but NOT fixed on any branch — carry as OPEN, do not "harvest"
 
 - **extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id`** (4z36e0,
@@ -192,9 +218,11 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 - **`f64` -> `f32` narrowing overflow is C UB** (pmytnl, LOW latent).
 - **Two DISTINCT `@once` blocks touching the same global are not mutually exclusive**
   (39294y, LOW).
-- **Two arena allocations cannot be LINKED** (4z36e0, over-rejection). Both share the
-  arena's lifetime. Found because the doc's Arena example showed exactly that line and had
-  never been compiled.
+- ~~**Two arena allocations cannot be LINKED**~~ **DONE 2026-08-23 (BUG-848)**, a
+  RELAXATION. `a.next = b;` from one arena now compiles; a pointer from a DIFFERENT
+  arena, and any global/static sink, still reject. Needed a new `Symbol.arena_source`
+  (arena IDENTITY, not a lifetime class — the class test was measured accept-unsafe
+  and is recorded in BUGS-FIXED.md as one of two mistakes caught before shipping).
 - **A bodyless declaration reusing a libc NAME** gets a confusing GCC error (4z36e0, LOW,
   LOUD). Inherent to emit-C: the 17-name `is_cstdlib` list must stay declarable for interop.
 

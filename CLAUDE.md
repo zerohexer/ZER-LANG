@@ -215,6 +215,17 @@ audit lines ("OK — no default: clauses…", "OK — no new raw type-dispatch
 sites"). exit=2 with those lines ABSENT means an earlier step (often CRLF)
 aborted make before the audits — investigate, don't wave it off.
 
+**A CHECKER HOOK MUST BE WIRED INTO `zerc_main.c`, NOT `checker_check` (cost a cycle
+2026-08-23).** `checker_check()` is NOT the compile-path entry point — `zerc_main.c`
+calls `checker_check_bodies()` + `check_keep_inference()` + `checker_post_passes()`
+directly. A new deferred pass added only to `checker_check` compiles, passes the C
+unit tests (which DO call `checker_check`), and never fires in `zerc`. This is the
+same "register in the always-run init" trap CLAUDE.md already records for
+`register_builtin_pair_types`; it recurs because the two entry points look
+interchangeable. Wire a cross-module deferred pass next to `check_keep_inference` in
+`zerc_main.c` AND in `checker_check` (for the LSP/test path). The one thing that
+exposed it was a one-line trace proving the predicate was never REACHED.
+
 **Ad-hoc Docker verify (binary-safe — binaries stay in-container, no Wacatac).**
 The Makefile `docker-*` targets are best, but for a quick targeted build+test of
 uncommitted edits use the read-only-mount + tar-to-`/build` pattern (NEVER a
@@ -387,7 +398,9 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
 | **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
-| **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
+| **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling). The SPELLING axis matters as much as the site axis: `g = @truncate(u32,g)+1`, `g = idfn(g)+1` and `g = maybe(g) orelse 0` were all accepted at BOTH sinks until BUG-841, because the underlying walker was an if-chain that returned "no" for unlisted node kinds |
+| **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
+| **Use-before-init ("did this resource ever receive its state?")** | Arena backing store, Barrier target | ONE deferred pass **`check_resource_init`** + `Symbol.resource_initialized`, run beside `check_keep_inference` so it sees every module. Both resources zero-initialise into a state that is USABLE but INERT (capacity 0 / target 0), which is why the failure is silent |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 

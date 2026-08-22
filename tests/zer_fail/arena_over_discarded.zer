@@ -1,0 +1,14 @@
+// expect-error: discarded Arena.over() result
+// BUG-846: `over` is a CONSTRUCTOR returning an Arena BY VALUE. As a bare
+// statement it built one into a discarded temp, so the arena kept its zeroed
+// capacity and every later allocation returned null — silently. Five tests in
+// this repo were passing with a dead arena because of exactly this line.
+Arena a;
+u8[64] buf;
+struct Node { u32 v; }
+u32 main() {
+    a.over(buf);
+    ?*Node n = a.alloc(Node);
+    if (n) |p| { p.v = 7; return 0; }
+    return 1;
+}

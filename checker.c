@@ -1402,6 +1402,57 @@ static void classify_escape_sink(Checker *c, Node *target,
     }
 }
 
+/* BUG-848 (a RELAXATION — reject -> accept, so read the reasoning before touching
+ * it): is this store ARENA-INTERNAL, i.e. an arena-derived value written into an
+ * arena-derived container?
+ *
+ * The escape rule exists to stop an arena pointer reaching something that
+ * OUTLIVES the arena. `classify_escape_sink` answers "does the destination
+ * outlive this scope?" with a single question — "is the destination reached
+ * through a pointer?" — and that question cannot distinguish
+ *
+ *     g_ptr.next = arena_ptr;      // destination outlives the arena  — UNSAFE
+ *     arena_ptr.next = other_ptr;  // destination IS in the arena     — safe
+ *
+ * so it rejected both. That is a missing finite VARIABLE (the destination's own
+ * lifetime class), not a wrong theorem — the coarse-domain shape CLAUDE.md's
+ * relaxation methodology describes. It is also why the Arena example in
+ * docs/reference.md (`a.next = b;`) had never compiled.
+ *
+ * Why arena-internal is sound: reaching the stored pointer requires first
+ * dereferencing the CONTAINER, and the container lives in the same arena. When
+ * the arena is reset, the container is invalidated by exactly the same rule that
+ * invalidates the stored pointer, and every arena-derived handle is marked freed
+ * at `reset()`. There is no path that reads the inner pointer while the outer one
+ * is dead.
+ *
+ * The precondition that must NOT be dropped: both sides must be in the same
+ * LIFETIME CLASS. `is_arena_derived` means "from a LOCAL arena" (its backing
+ * buffer dies with the frame) and `is_from_arena` means "from any arena". A
+ * local-arena pointer stored into a GLOBAL-arena object dangles the moment the
+ * frame returns, so the classes must MATCH — mixed is still rejected. Two local
+ * arenas can only be mixed within one function, where both die together; two
+ * global arenas are reset-coupled as argued above.
+ *
+ * A GLOBAL/static destination is never arena-derived, so this never weakens the
+ * global sink — only the `is_param_ptr` (destination-outlives-scope) one. */
+static bool arena_internal_store(Symbol *val_sym, Symbol *target_sym) {
+    if (!val_sym || !target_sym) return false;
+    if (!val_sym->is_from_arena || !target_sym->is_from_arena) return false;
+    if (val_sym->is_static || target_sym->is_static) return false;
+    /* SAME ARENA — the identity, not a lifetime CLASS.
+     *
+     * A class test (`is_arena_derived == is_arena_derived`, "both local or both
+     * global") was written first and MEASURED WRONG: it accepted a local-arena
+     * pointer stored into a global-arena object, a real dangle, because both
+     * symbols carried is_arena_derived=1. The flags answer "is this arena
+     * memory?", never "whose?", so they cannot express this precondition at all.
+     * `arena_source` is that missing variable; when it is unknown on either side
+     * the relaxation does not apply and the conservative rejection stands. */
+    if (!val_sym->arena_source || !target_sym->arena_source) return false;
+    return val_sym->arena_source == target_sym->arena_source;
+}
+
 /* field-level keep: helper target_struct_field_keep REMOVED (Site 2, 2026-06-19).
  * The field-keep store requirement it served is now auto (a keep-derived borrow
  * is provably static via the keep-param call-site chain, so storing it into any
@@ -1958,6 +2009,36 @@ static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
     e->caller_param_index = caller_param_index;
 }
 
+/* BUG-847: an `Arena` with no backing store has capacity 0, so every allocation
+ * from it returns null — forever, silently. The caller's MANDATORY `orelse` then
+ * hides it: the program takes the failure path on every allocation and looks
+ * like it is working. Measured in this repo's own suite: two "stress" tests,
+ * including a 120-line program, ran only their failure paths for months.
+ *
+ * Recorded here and checked AFTER all bodies (`check_resource_init`), because a
+ * global arena is legitimately initialised inside a function declared later in
+ * the file — the pattern every firmware example uses. */
+static void record_resource_use(Checker *c, Symbol *sym, int line,
+                                const char *kind, const char *fix) {
+    if (!sym) return;
+    if (c->resource_use_count >= c->resource_use_capacity) {
+        int ncap = c->resource_use_capacity ? c->resource_use_capacity * 2 : 16;
+        struct ResourceUse *nb = (struct ResourceUse *)arena_alloc(c->arena,
+            ncap * sizeof(struct ResourceUse));
+        if (!nb) return;
+        if (c->resource_uses)
+            memcpy(nb, c->resource_uses,
+                   c->resource_use_count * sizeof(struct ResourceUse));
+        c->resource_uses = nb;
+        c->resource_use_capacity = ncap;
+    }
+    c->resource_uses[c->resource_use_count].sym = sym;
+    c->resource_uses[c->resource_use_count].line = line;
+    c->resource_uses[c->resource_use_count].kind = kind;
+    c->resource_uses[c->resource_use_count].fix = fix;
+    c->resource_use_count++;
+}
+
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
  * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
@@ -2048,6 +2129,18 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_local_derived) dst->is_local_derived = true;
     if (src->is_arena_derived) dst->is_arena_derived = true;
     if (src->is_from_arena) dst->is_from_arena = true;
+    /* BUG-848: arena_source is deliberately NOT propagated here.
+     *
+     * This helper is called with `dst` = the ROOT of the assignment target, which
+     * for a FIELD store (`h.hp = n;`) is the CONTAINER, not an alias. The other
+     * flags want that (the container now holds arena memory, so it is tainted);
+     * arena_source must not, because it answers a different question — "is this
+     * pointer ITSELF arena memory?" — and the arena-internal relaxation reads it.
+     * MEASURED: propagating it here made `h.hp = n` mark the pointer PARAMETER
+     * `h` as arena memory, and the relaxation then accepted a store that dangles
+     * when the arena resets (tests/zer_fail/escape_arena_param_field.zer went
+     * green). Aliasing propagation is done at the whole-IDENT assignment sites
+     * instead, where the target really is an alias. */
     if (src->is_nonkeep_derived) {
         dst->is_nonkeep_derived = true;
         dst->nonkeep_root_param = src->nonkeep_root_param; /* keep inference: carry root param to aliases */
@@ -5944,6 +6037,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_local_derived = false;
                         tsym->is_arena_derived = false;
                         tsym->is_from_arena = false;  /* BUG-597: must clear on reassign */
+                        tsym->arena_source = NULL;    /* BUG-848: identity clears with it */
                         tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
                         tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
@@ -6019,6 +6113,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             Symbol *src = scope_lookup(c->current_scope,
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
                             if (src) propagate_escape_flags(tsym, src, tsym->type);
+                            /* BUG-848: the arena IDENTITY rides an ALIAS only —
+                             * `free_head = block_ptr;` (whole ident), never a
+                             * field store. See propagate_escape_flags. */
+                            if (src && src->arena_source && !tsym->arena_source &&
+                                node->assign.target->kind == NODE_IDENT)
+                                tsym->arena_source = src->arena_source;
                             /* BUG-fix (Gemini audit 2026-04-21): local array assigned
                              * to a field that carries a pointer (slice). Array→slice
                              * coercion makes the slice's .ptr point into the stack.
@@ -6614,6 +6714,14 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (tsym) {
                                     tsym->is_arena_derived = true;
                                     tsym->is_from_arena = true;
+                                    /* BUG-848: which arena (see Symbol.arena_source) */
+                                    if (obj->kind == NODE_IDENT) {
+                                        Symbol *asrc = scope_lookup(c->current_scope,
+                                            obj->ident.name, (uint32_t)obj->ident.name_len);
+                                        if (!asrc) asrc = scope_lookup(c->global_scope,
+                                            obj->ident.name, (uint32_t)obj->ident.name_len);
+                                        tsym->arena_source = asrc;
+                                    }
                                 }
                             }
                         }
@@ -6646,6 +6754,12 @@ static Type *check_expr(Checker *c, Node *node) {
             if (val_sym && (val_sym->is_arena_derived || val_sym->is_from_arena)) {
                 Symbol *target_sym = NULL; bool target_is_global = false, target_is_param = false;
                 classify_escape_sink(c, node->assign.target, &target_sym, &target_is_global, &target_is_param);
+                /* BUG-848: an arena-internal store is safe — see arena_internal_store.
+                 * Only the destination-outlives-scope sink is relaxed; a
+                 * global/static destination still rejects. */
+                if (target_is_param && !target_is_global &&
+                    arena_internal_store(val_sym, target_sym))
+                    target_is_param = false;
                 if (target_is_global || target_is_param) {
                     checker_error(c, node->loc.line,
                         target_is_param ?
@@ -6663,6 +6777,10 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (target_sym && !target_is_global && !target_is_param) {
                     target_sym->is_arena_derived = true;
                     target_sym->is_from_arena = true;
+                    /* BUG-848: carry the arena identity across an ALIAS only. */
+                    if (val_sym->arena_source && !target_sym->arena_source &&
+                        node->assign.target->kind == NODE_IDENT)
+                        target_sym->arena_source = val_sym->arena_source;
                 }
             }
         }
@@ -6833,6 +6951,17 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-847: `a = Arena.over(buf);` is how a GLOBAL arena is given its
+         * backing store (every firmware example does this), so the assignment
+         * sink is where the flag is set for that shape. */
+        if (node->assign.op == TOK_EQ && node->assign.target &&
+            node->assign.target->kind == NODE_IDENT &&
+            target && type_dispatch_kind(target) == TYPE_ARENA) {
+            Symbol *asym = scope_lookup(c->current_scope,
+                node->assign.target->ident.name,
+                (uint32_t)node->assign.target->ident.name_len);
+            if (asym) asym->resource_initialized = true;
+        }
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!value_flows_to(node->assign.value, value, target) &&
@@ -7597,6 +7726,23 @@ static Type *check_expr(Checker *c, Node *node) {
 
             /* Arena methods */
             if (obj->kind == TYPE_ARENA) {
+                /* BUG-847: record every allocation from a NAMED arena so the
+                 * deferred pass can tell whether that arena ever got a backing
+                 * store. `Arena.over(buf)` (the type name, not an instance) is
+                 * the constructor, not a use — it is excluded by requiring the
+                 * receiver to be a declared Arena SYMBOL. */
+                if ((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                    (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0)) {
+                                        Node *aobj = field_node->field.object;
+                    if (aobj && aobj->kind == NODE_IDENT) {
+                        Symbol *asym = scope_lookup(c->current_scope,
+                            aobj->ident.name, (uint32_t)aobj->ident.name_len);
+                        if (asym && asym->type &&
+                            type_dispatch_kind(asym->type) == TYPE_ARENA)
+                            record_resource_use(c, asym, node->loc.line, "arena",
+                                "= Arena.over(<buffer>)");
+                    }
+                }
                 if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "Arena.over() takes exactly 1 argument");
@@ -11512,6 +11658,18 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (ct && !type_is_integer(type_unwrap_distinct(ct)))
                         checker_error(c, node->loc.line,
                             "@barrier_init count must be an integer");
+                    /* BUG-849: mark the barrier initialised. A DIRECT name is
+                     * required; `@barrier_init(*p)` through a pointer param is
+                     * not attributable to a symbol here, and the deferred check
+                     * only reports a barrier it can see is never initialised. */
+                    Node *bn = node->intrinsic.args[0];
+                    if (bn && bn->kind == NODE_UNARY && bn->unary.op == TOK_AMP)
+                        bn = bn->unary.operand;
+                    if (bn && bn->kind == NODE_IDENT) {
+                        Symbol *bs = scope_lookup(c->current_scope,
+                            bn->ident.name, (uint32_t)bn->ident.name_len);
+                        if (bs) bs->resource_initialized = true;
+                    }
                 }
             } else if (is_bwait) {
                 /* Blocking wait in an ISR hangs the handler (see @cond_wait). */
@@ -11530,6 +11688,21 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@barrier_wait argument must be Barrier type, got '%s'",
                             type_name(bt));
+                    /* BUG-849: a Barrier zero-initialises to target 0, and
+                     * `_zer_barrier_wait` then returns IMMEDIATELY — it reports
+                     * success while synchronising nothing. Record the use; the
+                     * deferred pass reports it if no `@barrier_init` is ever
+                     * seen for that symbol, in any module. */
+                    Node *wn = node->intrinsic.args[0];
+                    if (wn && wn->kind == NODE_UNARY && wn->unary.op == TOK_AMP)
+                        wn = wn->unary.operand;
+                    if (wn && wn->kind == NODE_IDENT) {
+                        Symbol *ws = scope_lookup(c->current_scope,
+                            wn->ident.name, (uint32_t)wn->ident.name_len);
+                        if (ws && ws->type &&
+                            type_dispatch_kind(ws->type) == TYPE_BARRIER)
+                            record_resource_use(c, ws, node->loc.line, "barrier", "");
+                    }
                 }
             }
             result = ty_void;
@@ -13069,6 +13242,10 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-430: store AST node for const init lookup (enables
              * const u32 perms = ...; comptime if (FUNC(perms)) pattern) */
             sym->func_node = node;
+            /* BUG-847: `Arena a = Arena.over(buf);` — the local form. */
+            if (node->var_decl.init && type &&
+                type_dispatch_kind(type) == TYPE_ARENA)
+                sym->resource_initialized = true;
 
             /* detect arena-derived pointers: x = arena.alloc(T) orelse ... */
             if (node->var_decl.init) {
@@ -13096,6 +13273,15 @@ static void check_stmt(Checker *c, Node *node) {
                             /* BUG-455: ALL arena allocs (including global arena)
                              * cannot be stored in globals. Flag separately. */
                             sym->is_from_arena = true;
+                            /* BUG-848: record WHICH arena, for the arena-internal
+                             * store relaxation. Same shape as slab_source. */
+                            if (obj->kind == NODE_IDENT) {
+                                Symbol *asrc = scope_lookup(c->current_scope,
+                                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                                if (!asrc) asrc = scope_lookup(c->global_scope,
+                                    obj->ident.name, (uint32_t)obj->ident.name_len);
+                                sym->arena_source = asrc;
+                            }
                         }
                         /* Handle auto-deref: track slab_source from pool/slab.alloc() */
                         if (obj_type && (obj_type->kind == TYPE_POOL || obj_type->kind == TYPE_SLAB)) {
@@ -13169,6 +13355,10 @@ static void check_stmt(Checker *c, Node *node) {
                              * source struct was marked local-derived. Without this check,
                              * u32 val = struct_result.field falsely inherits the flag. */
                             if (src) propagate_escape_flags(sym, src, type);
+                            /* BUG-848: a var-decl target IS the whole variable, so
+                             * an initializer alias carries the arena identity. */
+                            if (src && src->arena_source && !sym->arena_source)
+                                sym->arena_source = src->arena_source;
                         }
                     }
                     /* Audit 2026-05-26: stack-escape via arithmetic chain.
@@ -13633,6 +13823,13 @@ static void check_stmt(Checker *c, Node *node) {
                             Symbol *csym = scope_lookup(c->current_scope,
                                 croot->ident.name, (uint32_t)croot->ident.name_len);
                             if (csym) propagate_escape_flags(cap, csym, cap->type);
+                            /* BUG-848: an if-unwrap/switch CAPTURE is an alias of
+                             * the captured value, never a container being stored
+                             * into, so it carries the arena identity. Without this
+                             * the relaxation dies at the first `if (h) |c| {...}`
+                             * — which is how every optional-linked list is walked. */
+                            if (csym && csym->arena_source && !cap->arena_source)
+                                cap->arena_source = csym->arena_source;
                             /* BH-18 #6 (copied from cool-johnson-t8vr3h):
                              * `if (m) |*v| { g = v; }` where `m` is a local
                              * optional — `v` points INTO `m`'s storage. The
@@ -14391,6 +14588,9 @@ static void check_stmt(Checker *c, Node *node) {
                         Symbol *src = scope_lookup(c->current_scope,
                             sw_root->ident.name, (uint32_t)sw_root->ident.name_len);
                         if (src) propagate_escape_flags(cap, src, cap->type);
+                        /* BUG-848: capture alias carries the arena identity. */
+                        if (src && src->arena_source && !cap->arena_source)
+                            cap->arena_source = src->arena_source;
                         /* BH-18 #6 SIBLING (2026-06-30 audit): the if-capture
                          * fix at checker.c ~10459-10467 closed
                          * `if (m) |*v| { g = v; }` — the switch-arm form
@@ -15381,6 +15581,47 @@ static void check_stmt(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "discarded alloc result — handle leaked. Assign to a variable: "
                         "'Handle(...) h = %.*s.alloc() orelse return;'",
+                        (int)call_obj->ident.name_len, call_obj->ident.name);
+                }
+            }
+            /* BUG-846: two more builtin results whose discard is ALWAYS a bug.
+             * The ghost-handle rule above already had the shape; these are the
+             * siblings it never grew.
+             *
+             *   a.over(buf);          `over` is a CONSTRUCTOR returning an Arena
+             *                         BY VALUE. As a statement it builds one into
+             *                         a discarded temp, so `a` keeps its zeroed
+             *                         capacity and EVERY later `a.alloc()` returns
+             *                         null forever — silently. Found live in
+             *                         tests/zer/stress_combined_safety_02.zer,
+             *                         which had been passing with a dead arena.
+             *
+             *   rb.push_checked(x);   returns `?void` whose ONLY purpose is
+             *                         reporting ring overflow. Discarding it makes
+             *                         it identical to the unchecked `push`, so the
+             *                         one method that reports the failure silently
+             *                         does not.
+             *
+             * `rb.pop()` is deliberately NOT included: discarding a popped item is
+             * a legitimate "drop one" operation. */
+            if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
+                Type *rt = checker_get_type(c, node->expr_stmt.expr);
+                if (rt && type_dispatch_kind(rt) == TYPE_ARENA) {
+                    checker_error(c, node->loc.line,
+                        "discarded Arena.over() result — the arena is NOT initialized. "
+                        "'over' returns a new arena by value; assign it: "
+                        "'%.*s = Arena.over(...);'",
+                        (int)call_obj->ident.name_len, call_obj->ident.name);
+                }
+            }
+            if (mlen == 12 && memcmp(mname, "push_checked", 12) == 0) {
+                Type *rt = checker_get_type(c, node->expr_stmt.expr);
+                if (rt && type_dispatch_kind(rt) == TYPE_OPTIONAL) {
+                    checker_error(c, node->loc.line,
+                        "discarded push_checked() result — the overflow report is "
+                        "thrown away, which makes this identical to the unchecked "
+                        "'push'. Handle it ('%.*s.push_checked(x) orelse { ... };') "
+                        "or call 'push' if dropping on overflow is intended",
                         (int)call_obj->ident.name_len, call_obj->ident.name);
                 }
             }
@@ -21065,6 +21306,38 @@ static bool keep_edge_propagates(struct KeepEdge *e) {
  * (stack/arena) argument feeding a now-final keep param is rejected, exactly as
  * the old inline check did, but with param_keeps fully resolved (so forward-
  * referenced/cross-module callees and transitive keeps are handled soundly). */
+/* BUG-847: deferred — every arena allocated from must have received a backing
+ * store SOMEWHERE in this file. Deferred rather than inline because the
+ * canonical global-arena pattern initialises it inside a function that may be
+ * declared after the one that allocates:
+ *
+ *     Arena scratch;  u8[4096] mem;
+ *     void work()  { ?*Node n = scratch.alloc(Node); ... }   // checked first
+ *     u32  main()  { scratch = Arena.over(mem); work(); }    // sets the flag
+ *
+ * A file-scoped answer is the right granularity: it is exactly what a per-file
+ * checker can see, and the restructure it asks for ("initialise the arena in the
+ * module that declares it") is a teachable discipline, which is the bar CLAUDE.md
+ * sets for an acceptable rejection. */
+void check_resource_init(Checker *c) {
+    for (int i = 0; i < c->resource_use_count; i++) {
+        Symbol *s = c->resource_uses[i].sym;
+        if (!s || s->resource_initialized) continue;
+        bool is_arena = (c->resource_uses[i].kind[0] == 'a');
+        checker_error(c, c->resource_uses[i].line,
+            is_arena ?
+            "arena '%.*s' is allocated from but never given a backing store — "
+            "capacity is 0, so EVERY allocation returns null and the failure path "
+            "runs every time. Add '%.*s %s;' before the first allocation" :
+            "barrier '%.*s' is waited on but never initialized — its target is 0, "
+            "so @barrier_wait returns IMMEDIATELY and synchronizes nothing while "
+            "reporting success. Add '@barrier_init(%.*s, <thread_count>);%s' "
+            "before the first wait",
+            (int)s->name_len, s->name, (int)s->name_len, s->name,
+            c->resource_uses[i].fix);
+    }
+}
+
 void check_keep_inference(Checker *c) {
     /* (1) transitive-escape fixpoint (monotone: flags only turn on → converges) */
     bool changed = true;
@@ -21151,6 +21424,8 @@ bool checker_check(Checker *c, Node *file_node) {
     /* Pass 2: type-check all function bodies and global initializers */
     bool ok = checker_check_bodies(c, file_node);
 
+    /* Pass 2.4: resource-initialisation check (deferred — see check_resource_init) */
+    check_resource_init(c);
     /* Pass 2.5: keep inference — transitive escape fixpoint + deferred enforcement */
     check_keep_inference(c);
     if (c->error_count > 0) ok = false;

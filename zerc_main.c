@@ -636,6 +636,9 @@ int main(int argc, char **argv) {
      * fixpoint + deferred call-site keep enforcement (param_keeps is final now,
      * so forward-referenced/cross-module/transitive keeps are handled soundly). */
     check_keep_inference(&checker);
+    /* BUG-847/849: same cross-module timing as keep inference — a resource
+     * declared in one module and initialised in another must not be reported. */
+    check_resource_init(&checker);
 
     /* Post-passes on main file: stack depth + interrupt safety + lock ordering */
     checker_post_passes(&checker, main_mod->ast);

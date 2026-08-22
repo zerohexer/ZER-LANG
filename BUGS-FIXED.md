@@ -5,6 +5,113 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23c — BUG-845..849: the use-before-init family, and one relaxation
+
+Third batch. Four defects share ONE shape — a resource that zero-initialises into a
+state that is USABLE but INERT, so the program runs, takes the failure path every
+time, and reports success. The fifth (BUG-848) is the over-rejection that closing
+them exposed.
+
+**Five VACUOUS tests fell out of this batch.** `super_freelist_arena.zer` (a 120-line
+"real program"), `stress_combined_safety_02.zer`, and `rust_tests/gen_arena_00{1,2,4}`
+all allocated from an arena that had never received a backing store, so every one of
+them ran only its `orelse` paths and exited 0. They had been green for months. All
+five now run for real — and the first one immediately TRAPPED, which is the next
+paragraph.
+
+### BUG-845 — `arena.alloc_slice(T, n)` had no overflow check on the IR path
+The AST path has computed `sizeof(T) * n` through `__builtin_mul_overflow` since
+BUG-266. The IR path — the only path a function body takes since the 2026-04
+migration — did not, so that guard had been dead code ever since.
+
+Measured: a **1024-byte** arena handed back a slice reporting **2305843009213693952**
+elements. `2^61 * 8` wraps to a ZERO-byte request, which trivially "fits". The
+LENGTH is what every downstream bounds check consults, so a write 1600 bytes past
+the arena then succeeded **with no trap and no diagnostic** — a silent global-buffer
+overflow. (A far-out-of-range index happens to hit the host's fault handler; a
+near one does not, and on bare metal neither does.)
+
+Fixed in both places the arithmetic can go wrong: the multiply now goes through
+`__builtin_mul_overflow`, and `_zer_arena_alloc`'s own capacity test — `off + size >
+capacity`, which WRAPS for a size near SIZE_MAX and then compares small — is
+rewritten as a subtraction on the capacity side, with the alignment rounding
+guarded the same way.
+Test: `tests/zer/arena_alloc_slice_overflow.zer` (exit 5 pre-fix, 0 after).
+
+### BUG-846 — two builtin results whose discard is always a bug
+`a.over(buf);` as a statement is a **silent no-op**: `over` is a CONSTRUCTOR
+returning an Arena BY VALUE, so it builds one into a discarded temp and the named
+arena keeps its zeroed capacity. This is the line that made three of the five
+vacuous tests vacuous.
+
+`rb.push_checked(x);` discards a `?void` whose ONLY purpose is reporting ring
+overflow, making it identical to the unchecked `push` — the one method that reports
+the failure silently does not.
+
+Both are now errors, extending the ghost-handle discard rule that already had the
+shape. `rb.pop()` is deliberately NOT included: discarding a popped item is a
+legitimate "drop one".
+
+### BUG-847 / BUG-849 — a resource used before it is initialized
+An `Arena` with no backing store has capacity 0: every allocation returns null,
+forever, and the caller's MANDATORY `orelse` hides it. A `Barrier` that never saw
+`@barrier_init` has target 0, so `@barrier_wait` returns on the FIRST arrival —
+every thread sails through and it reports success while synchronizing nothing. The
+barrier is the worse of the two: a dead arena at least fails visibly.
+
+One deferred pass (`check_resource_init`) answers both, run beside
+`check_keep_inference` so it sees ALL modules — a resource declared in one module
+and initialized in another is not falsely reported, and neither is the canonical
+global-arena pattern where `main` initializes an arena that an earlier-declared
+function allocates from. The barrier also gets a runtime belt: `_zer_barrier_wait`
+traps on `target == 0`, covering a barrier reached through a pointer parameter,
+which is beyond a per-file analysis.
+
+**A wiring trap worth recording, because CLAUDE.md warns about it and it still cost
+a cycle:** the first version was called from `checker_check`, which is NOT the
+compile-path entry point — `zerc_main.c` calls `checker_check_bodies` +
+`check_keep_inference` + `checker_post_passes` directly. The hook compiled, ran in
+the unit tests, and never fired in `zerc`. A one-line trace proving the predicate
+was never REACHED is what found it, exactly as the CLAUDE.md note prescribes.
+
+### BUG-848 — RELAXATION: linking two allocations from the SAME arena
+Closing the above exposed a real over-rejection: `a.next = b;` where both come from
+one arena was rejected. `classify_escape_sink` asks "does the destination outlive
+this scope?" via a single question — "is the destination reached through a
+pointer?" — which cannot distinguish
+
+    g_ptr.next     = arena_ptr;   // destination outlives the arena — UNSAFE
+    arena_ptr.next = other_ptr;   // destination IS in the arena    — safe
+
+so it rejected both. This is the shape docs/reference.md's Arena example has always
+shown and which had never been compiled.
+
+Sound because reaching the stored pointer requires dereferencing the CONTAINER, and
+the container lives in the same arena — `reset()` invalidates both by the same rule.
+
+**Two accept-unsafe mistakes were made and caught before shipping; both are the
+reason the final predicate looks the way it does.**
+
+1. The first version tested a lifetime CLASS (`is_arena_derived ==
+   is_arena_derived`, "both local or both global"). It ACCEPTED a local-arena
+   pointer stored into a global-arena object — a real dangle — because those flags
+   answer "is this arena memory?" and never "whose?". The predicate now tests arena
+   IDENTITY via a new `Symbol.arena_source`, the missing finite variable.
+   Pinned by `tests/zer_fail/arena_cross_arena_store.zer`.
+2. Propagating `arena_source` inside `propagate_escape_flags` marked a pointer
+   PARAMETER as arena memory, because that helper is called with the ROOT of a
+   FIELD store — the container, not an alias. `tests/zer_fail/escape_arena_param_field.zer`
+   went green. Identity now propagates only at whole-IDENT assignment, var-decl
+   initialization and capture binding, i.e. only where the target really is an alias.
+
+Both were found by deliberately probing the boundary, not by the corpus — which is
+the whole argument for writing the negative matrix before believing a relaxation.
+Tests: `tests/zer/arena_internal_link_ok.zer` (global arena, local arena, and
+through one level of aliasing — every real freelist needs that last one), plus the
+two negatives above.
+
+---
+
 ## Session 2026-08-23b — BUG-842..844: a width-dependent rule, an enum forge, and a CLI that affirmed flags it ignored
 
 Second batch of the same original audit. Same discipline: reproduced on `430bda1`

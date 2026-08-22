@@ -78,3 +78,40 @@ rust_tests/rt_task_alloc_free
 rust_tests/rt_task_alloc_free_cycle
 test_defer_goto_matrix
 test_view_alias_matrix
+
+# ---------------------------------------------------------------------------
+# Compiled test executables — ignored BY SHAPE, not by name.
+#
+# The .zer runners emit an EXTENSIONLESS binary next to each source, so every
+# new test used to need a new hand-written line above. It did not get one, which
+# is how ~563 of these binaries ended up TRACKED: `make check` dirties them all,
+# and `git status` becomes useless for review.
+#
+# These patterns stop the growth. They do NOT untrack what is already tracked —
+# git ignores only untracked files — so clearing the existing 563 is still a
+# `git rm --cached` sweep and an owner decision (see docs/limitations.md
+# "Repo hygiene").
+tests/zer/*
+!tests/zer/*.zer
+!tests/zer/*.md
+tests/zer_fail/*
+!tests/zer_fail/*.zer
+!tests/zer_fail/*.md
+tests/zer_trap/*
+!tests/zer_trap/*.zer
+!tests/zer_trap/*.md
+tests/zer_proof/*
+!tests/zer_proof/*.zer
+!tests/zer_proof/*.md
+tests/zer_gaps/*
+!tests/zer_gaps/*.zer
+!tests/zer_gaps/*.md
+rust_tests/*
+!rust_tests/*.zer
+!rust_tests/*.sh
+!rust_tests/*.md
+zig_tests/*
+!zig_tests/*.zer
+!zig_tests/*.sh
+!zig_tests/*.md
+test_modules/_*.c

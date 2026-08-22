@@ -1,0 +1,10 @@
+// expect-error: waited on but never initialized
+// BUG-849: a Barrier zero-initialises to target 0, and `_zer_barrier_wait` then
+// returns on the FIRST arrival — every thread sails through and the barrier
+// reports success while providing no synchronization at all. Worse than the
+// arena case: a dead arena at least fails visibly; a dead barrier succeeds.
+Barrier b;
+u32 main() {
+    @barrier_wait(b);
+    return 0;
+}

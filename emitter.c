@@ -5580,6 +5580,14 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    b->target = n;\n");
     emit(e, "}\n");
     emit(e, "static inline void _zer_barrier_wait(_zer_barrier *b) {\n");
+    /* BUG-849 runtime belt: a zero-initialised barrier has target 0, so the
+     * `count >= target` test below is true on the FIRST arrival — every thread
+     * sails straight through and the barrier reports success while synchronizing
+     * nothing. The checker rejects the case it can attribute to a named symbol;
+     * a barrier reached through a pointer parameter is beyond a per-file
+     * analysis, so trap loudly instead of silently degrading. */
+    emit(e, "    if (b->target == 0) _zer_trap(\"@barrier_wait on an uninitialized "
+            "barrier — call @barrier_init(b, N) first\", __FILE__, __LINE__);\n");
     emit(e, "    pthread_mutex_lock(&b->mtx);\n");
     emit(e, "    uint32_t gen = b->generation;\n");
     emit(e, "    b->count++;\n");
@@ -5788,9 +5796,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "/* ZER Arena runtime */\n");
     emit(e, "typedef struct { uint8_t *buf; size_t capacity; size_t offset; } _zer_arena;\n\n");
 
+    /* BUG-845: the capacity test itself must not overflow. `off + size >
+     * capacity` wraps when `size` is near SIZE_MAX, and a wrapped sum compares
+     * SMALL — so a request the arena obviously cannot satisfy was granted, and
+     * the caller got a pointer into a 1 KiB buffer with a length in the
+     * exabytes. Written as a subtraction on the capacity side, which cannot
+     * wrap because `off <= capacity` is established first. The alignment
+     * rounding is guarded the same way. */
     emit(e, "static inline void *_zer_arena_alloc(_zer_arena *a, size_t size, size_t align) {\n");
+    emit(e, "    if (align == 0) align = 1;\n");
+    emit(e, "    if (a->offset > (size_t)-1 - (align - 1)) return (void*)0;\n");
     emit(e, "    size_t off = (a->offset + align - 1) & ~(align - 1);\n");
-    emit(e, "    if (off + size > a->capacity) return (void*)0;\n");
+    emit(e, "    if (off > a->capacity) return (void*)0;\n");
+    emit(e, "    if (size > a->capacity - off) return (void*)0;\n");
     emit(e, "    a->offset = off + size;\n");
     emit(e, "    memset(a->buf + off, 0, size);\n");
     emit(e, "    return a->buf + off;\n");
@@ -6273,10 +6291,22 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
             if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
+                /* BUG-845: the byte count is `sizeof(T) * n` and it MUST be
+                 * computed with an overflow check. The AST path has done this
+                 * since BUG-266; this IR path — the only one that runs for a
+                 * function body since the 2026-04 migration — did not, so the
+                 * AST guard was dead code. Measured: a 1024-byte arena returned
+                 * a slice reporting 2^61 elements (2^61 * 8 wraps to a 0-byte
+                 * request, which trivially "fits"), and because the LENGTH is
+                 * what every downstream bounds check consults, a write 1600
+                 * bytes past the arena then succeeded with no trap and no
+                 * diagnostic. On bare metal there is no fault handler to catch
+                 * even the far-out-of-range case. */
                 emit(e,"({size_t _zer_an%d=",t); BA(1); emit(e,";");
-                emit(e,"uint8_t *_zer_ap%d=(uint8_t*)_zer_arena_alloc(&%.*s,",t,(int)ol,on);
-                /* sizeof(T)*n */
-                emit(e,"sizeof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,")*_zer_an%d,",t);
+                emit(e,"size_t _zer_asz%d;",t);
+                emit(e,"uint8_t *_zer_ap%d=__builtin_mul_overflow(sizeof(",t);
+                if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);}
+                emit(e,"),_zer_an%d,&_zer_asz%d)?(uint8_t*)0:(uint8_t*)_zer_arena_alloc(&%.*s,_zer_asz%d,",t,t,(int)ol,on,t);
                 /* _Alignof(T) */
                 emit(e,"_Alignof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,"));");
                 /* wrap in ?[]T */

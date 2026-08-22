@@ -1,0 +1,18 @@
+// expect-error: cannot store arena-derived pointer
+// BUG-848 boundary: the arena-internal store relaxation must apply ONLY when
+// both sides come from the SAME arena. Here `inner` is from a LOCAL arena whose
+// backing buffer dies with the frame, stored into an object in a GLOBAL arena —
+// a real dangle. The first draft of the relaxation ACCEPTED this, which is why
+// the predicate tests arena IDENTITY and not a lifetime class.
+struct B { ?*B next; u32 v; }
+Arena g_arena;
+u8[256] gmem;
+u32 main() {
+    g_arena = Arena.over(gmem);
+    *B outer = g_arena.alloc(B) orelse { return 1; };
+    u8[128] local_mem;
+    Arena local_arena = Arena.over(local_mem);
+    *B inner = local_arena.alloc(B) orelse { return 1; };
+    outer.next = inner;
+    return 0;
+}

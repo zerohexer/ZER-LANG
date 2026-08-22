@@ -30,7 +30,15 @@ u32 process_reading(Reading r) {
 }
 
 u32 main() {
-    scratch.over(backing);
+    /* BUG-846: this line used to read `scratch.over(backing);`, which is a
+     * silent NO-OP — `over` is a constructor returning an Arena BY VALUE, so as
+     * a statement it built one into a discarded temp and `scratch` kept its
+     * zeroed capacity. The arena was dead for the whole test's life and nothing
+     * said so. Assign it, and actually allocate from it so the line is load-
+     * bearing rather than decorative. */
+    scratch = Arena.over(backing);
+    ?*Sensor scratch_probe = scratch.alloc(Sensor);
+    if (scratch_probe) |sp| { sp.reading = 5; } else { return 3; }
 
     ?*Sensor ms1 = heap.alloc_ptr();
     *Sensor s1 = ms1 orelse return;

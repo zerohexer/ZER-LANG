@@ -6,8 +6,11 @@ Arena scratch;
 u8[256] backing;
 
 u32 main() {
-    scratch.over(backing);
-
+    /* BUG-846: was `scratch.over(backing);` — a silent NO-OP. `over` is a constructor
+     * returning an Arena BY VALUE, so as a statement it built one into a
+     * discarded temp and this arena stayed at capacity 0. Every allocation
+     * below then returned null and the test ran only its `orelse` path. */
+    scratch = Arena.over(backing);
     ?*Vec2 mv = scratch.alloc(Vec2);
     *Vec2 v = mv orelse return;
     v.x = 3;

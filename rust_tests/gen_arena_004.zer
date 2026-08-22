@@ -6,8 +6,11 @@ Arena ar;
 u8[1024] mem;
 
 u32 main() {
-    ar.over(mem);
-
+    /* BUG-846: was `ar.over(mem);` — a silent NO-OP. `over` is a constructor
+     * returning an Arena BY VALUE, so as a statement it built one into a
+     * discarded temp and this arena stayed at capacity 0. Every allocation
+     * below then returned null and the test ran only its `orelse` path. */
+    ar = Arena.over(mem);
     ?[*]Vec3 mverts = ar.alloc_slice(Vec3, 4);
     [*]Vec3 verts = mverts orelse return;
 

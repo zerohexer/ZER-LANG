@@ -115,6 +115,15 @@ zig_tests/*
 !zig_tests/*.sh
 !zig_tests/*.md
 test_modules/_*.c
-# compiled module-test executables (shape: test_modules/<name> with no extension)
-test_modules/spawn_user
-test_modules/xfeat_user
+# Compiled module-test executables. The runner builds `test_modules/<name>` with
+# no extension next to `<name>.zer`, so ignore everything here except the sources
+# and the runner itself — the same shape rust_tests/ and tests/zer_fail/ use.
+test_modules/*
+!test_modules/*.zer
+!test_modules/*.c
+!test_modules/*.h
+!test_modules/*.sh
+!test_modules/*.md
+# Stray root-level test binaries built from test.zer / test1.zer
+/test
+/test1

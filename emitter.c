@@ -3863,7 +3863,12 @@ static void emit_expr(Emitter *e, Node *node) {
      * the IR pipeline); the diagnostic fallback is the right behavior
      * for any kind not legitimately reachable here. */
     default:
-        emit(e, "/* unhandled expr %s */0", node_kind_name(node->kind));
+        /* BUG-854: emitting `0` here substitutes a VALUE for an expression the
+         * emitter did not understand — silently wrong, and valid C. Same
+         * treatment as the complex-callee arm: an undeclared identifier, whose
+         * name carries the node kind so the C error names the cause. Measured
+         * unreachable across the whole positive corpus. */
+        emit(e, "(__zer_unhandled_expr_%s)", node_kind_name(node->kind));
         break;
     }
 }
@@ -10614,7 +10619,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              (int)callee->field.field_name_len, callee->field.field_name);
                     }
                 } else {
-                    emit(e, "/* complex callee */(");
+                    /* BUG-854: this used to emit a "complex callee" comment
+                     * followed by an open paren — and
+                     * `(a, b)` is a VALID C comma expression. It compiles, it
+                     * evaluates the arguments, it CALLS NOTHING, and it yields
+                     * the last argument. A silent no-call with no diagnostic
+                     * anywhere. Measured over the whole positive corpus (1116
+                     * programs): this arm is reached ZERO times, so making it
+                     * loud costs nothing. An undeclared IDENTIFIER (not an
+                     * undeclared function, which older GCCs only warn about) is
+                     * a hard C99 error, so a shape that ever reaches here stops
+                     * the build instead of miscompiling. */
+                    emit(e, "(__zer_unsupported_complex_callee)(");
                 }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&

@@ -14,6 +14,14 @@
 #
 # Run from repo root: bash tools/emit_audit.sh
 # Exit 0 = clean. Exit 1 = stray markers found.
+#
+# LIMIT, stated so nobody over-trusts a green run: a sample that FAILS TO COMPILE
+# is skipped (it is probably a negative test). So a marker reachable only from a
+# program the CHECKER rejects is invisible here — which is exactly what happened
+# while verifying this gate: an injected `struct == struct` no longer compiles
+# (BUG-840), so the injection proved nothing until it was moved to a construct
+# every program emits. Verify a new pattern with a marker on a path that
+# COMPILING programs reach.
 
 set -euo pipefail
 
@@ -33,9 +41,23 @@ PATTERNS=(
     "/\\* stub \\*/"
     "/\\* placeholder \\*/"
     "/\\* TODO:[^*]*\\*/[^a-zA-Z\"]"   # bare TODO with no following code
+    # BUG-854: the emitter's GIVE-UP paths. Both used to emit valid C that did
+    # the wrong thing silently — `(a, b)` is a comma expression that calls
+    # nothing, and `0` is a value substituted for an expression the emitter did
+    # not understand. They now emit an undeclared identifier so GCC stops the
+    # build; these patterns catch a REGRESSION back to the quiet form.
+    "/\\* complex callee \\*/"
+    "/\\* unhandled expr "
+    "/\\* struct/union compare unsupported \\*/"
 )
 
-# Sample multi-module tests — representative of the module emission path.
+# Multi-module samples — representative of the module emission path — PLUS the
+# whole positive corpus. Five samples was the original scope, and it could not
+# have caught the give-up markers added above: those live in expression emission,
+# not module emission. Measured 2026-08-23: scanning every positive program
+# (~1100) finds ZERO of them, which is what makes turning them into hard errors
+# safe. Scanning the corpus is what turns that measurement into a standing gate
+# rather than a one-off.
 SAMPLES=(
     "test_modules/main.zer"
     "test_modules/defer_user.zer"
@@ -43,6 +65,11 @@ SAMPLES=(
     "test_modules/handle_user.zer"
     "test_modules/diamond.zer"
 )
+# ZER_EMIT_AUDIT_FAST=1 keeps the original 5-sample scope for a quick local run.
+if [ -z "${ZER_EMIT_AUDIT_FAST:-}" ]; then
+    while IFS= read -r f; do SAMPLES+=("$f"); done < <(
+        ls tests/zer/*.zer rust_tests/*.zer zig_tests/*.zer 2>/dev/null)
+fi
 
 FOUND=0
 TMP=$(mktemp /tmp/emit_audit.XXXXXX.c)
@@ -52,7 +79,7 @@ for sample in "${SAMPLES[@]}"; do
     if [ ! -f "$sample" ]; then
         continue   # test file may not exist in some checkouts
     fi
-    if ! "$ZERC" "$sample" --emit-c -o "$TMP" 2>/dev/null; then
+    if ! "$ZERC" "$sample" --emit-c -o "$TMP" >/dev/null 2>&1; then
         continue   # compile error; probably a negative test
     fi
     for pattern in "${PATTERNS[@]}"; do

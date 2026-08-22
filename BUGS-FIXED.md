@@ -5,6 +5,45 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23f — BUG-854: the emitter's two SILENT give-up paths
+
+When `emit_rewritten_node` could not resolve a call's callee it emitted
+
+    /* complex callee */(a, b)
+
+and `(a, b)` is a **valid C comma expression**. It compiles. It evaluates the
+arguments. It CALLS NOTHING, and yields the last argument. No diagnostic anywhere
+— from the compiler, from GCC, or from any gate. The AST emitter's `default:` arm
+had the same shape: `/* unhandled expr KIND */0` substitutes a VALUE for an
+expression it did not understand.
+
+**Measured before changing anything**: emitted C for the WHOLE positive corpus —
+1116 programs across `tests/zer`, `rust_tests` and `zig_tests` — contains ZERO of
+either marker. Both arms are unreachable in practice, which is what makes making
+them loud free.
+
+Both now emit an **undeclared identifier** (`(__zer_unsupported_complex_callee)(`
+and `(__zer_unhandled_expr_KIND)`), whose name carries the cause into the C error.
+An undeclared identifier, not an undeclared FUNCTION: older GCCs only warn about
+an implicit function declaration, while using an undeclared identifier as a value
+is a hard C99 error at every version.
+
+**`tools/emit_audit.sh` widened from 5 samples to 1369.** The original scope was
+five multi-module programs, chosen for the module-emission stub it was written to
+catch — it could not have caught either of these, which live in EXPRESSION
+emission. It now scans the whole positive corpus (37 s, fast enough for
+`make check`) with the two give-up markers and the aggregate-comparison one added
+to its pattern list, so a regression to the quiet form goes red.
+
+**Verified non-vacuous, and the first attempt was invalid — worth recording.**
+Injecting a `struct == struct` program proved nothing, because BUG-840 now rejects
+that form and the gate SKIPS anything that fails to compile. The injection only
+discriminated once the marker was moved to a construct every compiling program
+emits. That limit is now stated in the script header: a marker reachable only from
+a program the CHECKER rejects is invisible to this gate.
+
+---
+
 ## Session 2026-08-23e — BUG-853 + build warnings 26 -> 0
 
 ### Build warnings: 26 -> 0, and two of them were real defects

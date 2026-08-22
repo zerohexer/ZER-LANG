@@ -148,7 +148,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 |---|---|---|
 | ~~Q1~~ **DONE 2026-08-23 (BUG-851)** | `naked` silently dropped -> warn at the declaration | **4z36e0**. Re-measured independently on current main: enabling the attribute breaks **6** tests, not 16 (all exit 132, SIGILL), and **44** files emit the warning. The OVERLOAD finding is confirmed and is the reason this is a warning and not a fix: decoupling asm-permission from `naked` is the precondition for emitting the attribute. **W11 in the walker table is the same item and is closed with it.** |
 | Q2 | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
-| Q3 | Emitter's five give-up paths are silent miscompiles | **4z36e0**. `/* complex callee */(a, b)` is a valid C COMMA EXPRESSION — compiles, runs, CALLS NOTHING. Measured 0/1170 corpus programs reach them, so `emit_unreachable()` aborts nothing reachable |
+| ~~Q3~~ **DONE 2026-08-23 (BUG-854)** | Emitter's give-up paths are silent miscompiles | **4z36e0**'s measurement independently reproduced (0 of 1116 positive programs reach either marker). Closed with an undeclared IDENTIFIER rather than `emit_unreachable()` — a hard C99 error that names the cause, without a compiler abort that would be unrecoverable if the arm ever IS reachable. `tools/emit_audit.sh` widened 5 -> 1369 samples so a regression to the quiet form goes red; verified to fire |
 | Q4 | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |
 
 ### Tooling and gates (pure gain — no behaviour change)

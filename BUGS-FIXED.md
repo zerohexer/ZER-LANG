@@ -5,6 +5,100 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-22d — BUG-839..844: §D, six silent miscompiles
+
+From `claude/vigilant-tesla-pjtawx`, `-4z36e0` and `-pmytnl`. Each produces a WRONG
+ANSWER with no diagnostic and no fault — the class where the compiler is confidently
+incorrect rather than merely unhelpful.
+
+### BUG-839 — `arena.alloc_slice`'s overflow guard has been DEAD CODE since 2026-04
+BUG-266 added `__builtin_mul_overflow` around `sizeof(T)*n` on the **AST path only**,
+and function bodies have been IR-only since 2026-04-19, so the guard has been
+unreachable ever since. Measured: with a 1024-byte arena, `alloc_slice(Big, 2^61)`
+wrapped the byte count to 0, the zero-size bump SUCCEEDED, and the caller received a
+slice reporting 2305843009213693952 elements. **Every later bounds check then PASSES**
+— it compares against the bogus length — so every access is an unchecked OOB. A 32-bit
+target reaches the same wrap from a plain u32 count.
+`_zer_arena_alloc` hardened too: both `offset + align - 1` and `off + size` could wrap,
+and a wrap makes the capacity test pass for a request that does not fit.
+This is exactly why CLAUDE.md's AST->IR grep list carries `__builtin_*_overflow`: a
+wrapper whose absence produces a WRONG LENGTH defeats every downstream guard rather
+than merely removing one.
+
+### BUG-840 — a non-final `default` arm miscompiled the whole switch
+The dispatch chain is built arm-by-arm and the default arm's entry is an UNCONDITIONAL
+goto. Emitting it in the MIDDLE terminated the chain there: every later arm's
+comparison and IR_BRANCH were appended to the already-terminated tail block of the
+default BODY — dead C after a goto — and the arm bodies they guarded became unreachable.
+
+    switch (x) { default => { r = 9; } 1 => { r = 1; } }   // x == 1 gave r == 9
+
+Nothing rejected it: the parser accepts `default` in any position, neither
+exhaustiveness check constrains ordering, and every existing test happens to put it
+last. Fixed by a PERMUTATION — process default LAST whatever position it holds — which
+is the whole fix because ZER arms are mutually exclusive with no fallthrough. A
+closed-form index map rather than an `order[]` array: only ONE arm can be default.
+
+### BUG-841 — comparing two aggregates was silently ALWAYS FALSE
+`a == b` on two structs compiled with zero diagnostics and the emitter answered with a
+literal 0. So `a == b` was always false — **and so was `a != b`**, which is the tell
+that the value is a placeholder, not an answer. The checker already rejected the SLICE
+and ARRAY forms; struct and union were left out of that list. All six comparison
+operators are covered, because the emitter's placeholder branch keys on the operand
+TYPE, not the operator. Slice/array keep their incumbent wording (main's negatives
+assert it); aggregates get the precise reason.
+
+### BUG-842 — the global-initializer guard never ran for a ZERO-ARG intrinsic
+The name-based "does not lower to a constant" check sat inside
+`if (kind == NODE_INTRINSIC && arg_count >= 1 && args[0]->kind != NODE_FIELD)` — a
+precondition belonging to the BIT-QUERY check beside it, which inspects `args[0]` and
+has nothing to do with this one. So every zero-arg intrinsic skipped the guard:
+
+    const u32 G = @cpu_model_id();     // checker exits 0; only GCC stops it
+
+G7 (2026-08-01) added names to this list and recorded the rationale that the CHECKER
+should reject so the message names the ZER line — but adding names without splitting
+the condition changes nothing for a zero-arg intrinsic, which is the trap.
+Also closes the `@atomic_*` half: `uint32_t gres = ;` — the literal EMPTY STRING —
+was emitted for `@atomic_xchg` and the five `_fetch` forms, because the AST atomic
+branch is gated `nlen >= 10` and those arms matched nothing with no `else`, while
+`@atomic_or` (9 chars) missed the branch entirely and got the loud generic marker.
+What the user got depended on how many characters the name happened to have.
+
+### BUG-843 — `@bitcast` could FORGE an out-of-variant enum
+`@bitcast(State, 7)` took the `.done` arm while `s == State.done` was false — the
+switch silently ran its LAST arm. It was the only route in: ZER has no int->enum cast.
+Resolved by TRACKING, not banning (none of the four Ban-Framework conditions applies):
+reading an enum out of a hardware register field is a legitimate firmware idiom, so the
+value is variant-checked and traps at the point of forgery. Wired in BOTH emitter
+dispatch paths, per the dual-dispatch rule.
+
+### BUG-844 — the comptime interpreter answered a DIFFERENT question than the emitted code
+Differential probe, same expression comptime vs runtime in one program:
+
+    comptime u32 f(){ u8 x=200; u8 y=100; return x+y; }   folded 300,        runs 44
+    comptime u32 g(u32 a){ return (a*4)>>3; }  a=4e9      folded 2000000000, runs 389387264
+
+Both "succeeded" and disagreed, with the wrong constant burned into the emitted C.
+`ComptimeParam` carried only an `int64_t`, so nothing could wrap. **Masking only the
+final result cannot fix it** — `>>`, `/` and `%` read the bits an earlier overflow
+already discarded, which the second case shows exactly: 16000000000 reached the shift
+un-wrapped. The width is established per BINDING and applied at every operation,
+unary included (`u8 x = 0; return ~x;` is 255 in 8 bits, not -1 in 64).
+
+**Wired at all THREE binding sinks, and finding that took a trace, not reasoning.** The
+first version wired the sink in `eval_comptime_call_subst` and changed nothing; a
+one-line trace proved that function is never REACHED for the reproducer. pjtawx's
+commit warns about precisely this and the warning was worth heeding.
+
+**Residual, measured and recorded rather than left implicit:** array-element comptime
+bindings still carry no width, so `comptime u32 a_elem(){ u8[2] v; v[0]=200; v[1]=100;
+return v[0]+v[1]; }` folds 300 instead of 44. 4z36e0's `comptime_width_wrap_all_forms`
+exits 55 at exactly that check; every scalar, signed, mixed-width and nested-call form
+in it passes. Own OPEN entry in limitations.md.
+
+---
+
 ## Session 2026-08-22c — BUG-830..838: §C, the bare-metal family
 
 From `claude/vigilant-tesla-87xihb` and `-pjtawx`. Every one is silent at compile time

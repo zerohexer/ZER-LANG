@@ -3037,12 +3037,38 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool is_exhaustive_enum = is_enum && !has_default &&
                                   node->switch_stmt.arm_count > 0;
 
-        for (int i = 0; i < node->switch_stmt.arm_count; i++) {
+        /* BUG-840: the dispatch chain is built arm-by-arm and the DEFAULT arm's
+         * entry is an UNCONDITIONAL goto. Emitting it in the MIDDLE of the chain
+         * TERMINATED the chain there: every later arm's comparison and IR_BRANCH
+         * were appended to the already-terminated tail block of the default BODY —
+         * dead C after a goto — and the arm bodies they guarded became unreachable.
+         *
+         *     switch (x) { default => { r = 9; } 1 => { r = 1; } }   // x==1 gave 9
+         *
+         * No diagnostic, no fault; the program takes the wrong branch. Nothing
+         * rejected it either: the parser accepts `default` in any position and
+         * neither exhaustiveness check constrains ordering, and every existing test
+         * happens to put it last.
+         *
+         * Fixed by a PERMUTATION — process default LAST whatever position it holds.
+         * That is the whole fix because ZER switch arms are mutually exclusive with
+         * no fallthrough, so testing the specific arms first and falling through to
+         * default is exactly what the source means. A closed-form index map rather
+         * than an order[] array: only ONE arm can be default, so the permutation is
+         * "skip di on the way, then visit di last" — and it needs no buffer. */
+        int _sw_di = -1;
+        for (int k = 0; k < node->switch_stmt.arm_count; k++)
+            if (node->switch_stmt.arms[k].is_default) { _sw_di = k; break; }
+        for (int oi = 0; oi < node->switch_stmt.arm_count; oi++) {
+            int i;
+            if (_sw_di < 0)                                   i = oi;
+            else if (oi == node->switch_stmt.arm_count - 1)   i = _sw_di;
+            else                                              i = (oi < _sw_di) ? oi : oi + 1;
             SwitchArm *arm = &node->switch_stmt.arms[i];
             int bb_arm = ir_add_block(ctx->func, ctx->arena);
-            int bb_next = (i + 1 < node->switch_stmt.arm_count) ?
+            int bb_next = (oi + 1 < node->switch_stmt.arm_count) ?
                           ir_add_block(ctx->func, ctx->arena) : bb_exit;
-            bool is_last_arm = (i + 1 == node->switch_stmt.arm_count);
+            bool is_last_arm = (oi + 1 == node->switch_stmt.arm_count);
             bool elide_compare = (is_exhaustive_enum && is_last_arm &&
                                   !arm->is_default);
 

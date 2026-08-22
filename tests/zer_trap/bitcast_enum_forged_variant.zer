@@ -1,0 +1,21 @@
+// expect-trap
+// BUG-843 — @bitcast could FORGE an out-of-variant enum, and the switch then
+// silently ran its LAST arm: `@bitcast(State, 7)` took `.done` while
+// `s == State.done` was false. It was the only route in — ZER has no int->enum
+// cast, so every other path to an enum value is a declared variant.
+//
+// Resolved by TRACKING, not banning: reading an enum out of a hardware register
+// field is a legitimate firmware idiom (tests/zer/bitcast_enum_variant_ok.zer
+// pins that it still works), so the value is variant-checked and traps AT THE
+// POINT OF FORGERY rather than letting a later switch pick an arbitrary arm.
+//
+// Pre-fix this exited 12 (the .done arm). It must now SIGTRAP.
+enum State { idle, running, done }
+u32 main() {
+    State s = @bitcast(State, 7);
+    switch (s) {
+        .idle => { return 10; }
+        .running => { return 11; }
+        .done => { return 12; }
+    }
+}

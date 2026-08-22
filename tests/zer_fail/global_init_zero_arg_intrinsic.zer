@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: does not lower to a compile-time-constant
+// BUG-842 — the name-based "does not lower to a constant" guard lived inside a
+// condition requiring arg_count >= 1 (a precondition belonging to the BIT-QUERY
+// check next to it), so EVERY ZERO-ARG intrinsic skipped it. `zerc f.zer -o out.c`
+// reported SUCCESS for a program only GCC could stop, with a cryptic error naming
+// the generated .c file.
+const u32 G = @cpu_model_id();
+u32 main() { return 0; }

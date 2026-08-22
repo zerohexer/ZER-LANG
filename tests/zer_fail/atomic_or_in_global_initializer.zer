@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: initializer cannot use @atomic_or
+// BUG-806, the SHORT-NAME half of the same axis. `@atomic_or` is 9 characters, so
+// it missed the AST branch's `nlen >= 10` gate entirely and took a different
+// (also wrong) path than `@atomic_xchg`. Both cells exist because the two halves
+// failed differently, and a fix that only closed the one the reproducer used is
+// how this class keeps coming back.
+u32 gv = 1;
+u32 gres = @atomic_or(&gv, 2);
+
+u32 main() { return gres; }

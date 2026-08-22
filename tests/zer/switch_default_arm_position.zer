@@ -1,0 +1,71 @@
+// BUG-808 — a `default` arm that is NOT LAST made every arm after it unreachable
+// dead code, silently.
+//
+// The dispatch chain is built arm-by-arm, and the default arm's entry is an
+// UNCONDITIONAL goto (it matches everything). Emitting that goto in the middle of
+// the chain TERMINATED the chain there: every later arm's comparison and branch
+// were appended to the already-terminated tail block of the default BODY — dead
+// C after a `goto` — and the arm bodies they guarded became unreachable.
+//
+// Measured: `switch (x) { default => { r = 9; } 1 => { r = 1; } }` returned 9 for
+// x == 1. No diagnostic at compile time and no fault at run time; the program
+// just takes the wrong branch. `default` is legal in any position — parser.c
+// accepts it, and neither the enum-exhaustiveness check nor the
+// integer-needs-default check constrains ordering — so nothing rejected it either.
+//
+// Fixed by processing the default arm LAST regardless of source position, which
+// is semantics-preserving because ZER switch arms are MUTUALLY EXCLUSIVE with no
+// fallthrough: testing the specific arms first and falling through to `default`
+// is exactly what the source means, and is what a trailing `default` already
+// lowered to.
+//
+// Every switch FLAVOUR gets a cell, because each builds its dispatch comparison
+// differently (integer equality, enum variant, multi-value OR, optional
+// has_value) and a fix that only covered the flavour the reproducer used is how
+// this class comes back. Verified to FAIL on a from-HEAD build.
+i32 printf(const *u8 fmt, ...);
+
+enum Dir { north, south, east, west }
+
+u32 int_mid(u32 x) {
+    switch (x) { 1 => { return 1; } default => { return 9; } 2 => { return 2; } }
+}
+
+u32 enum_first(Dir d) {
+    switch (d) { default => { return 9; } .north => { return 1; } .south => { return 2; } }
+}
+
+u32 multi_mid(u32 x) {
+    switch (x) { 1, 2 => { return 12; } default => { return 9; } 3, 4 => { return 34; } }
+}
+
+u32 opt_first(?u32 o) {
+    switch (o) { default => { return 9; } 5 => { return 5; } }
+}
+
+// The trailing-default form must be unchanged by the permutation.
+u32 int_last(u32 x) {
+    switch (x) { 1 => { return 1; } 2 => { return 2; } default => { return 9; } }
+}
+
+u32 main() {
+    if (int_mid(1) != 1) { printf("int_mid(1)=%u\n", int_mid(1)); return 1; }
+    if (int_mid(2) != 2) { printf("int_mid(2)=%u\n", int_mid(2)); return 2; }
+    if (int_mid(7) != 9) { return 3; }
+
+    if (enum_first(Dir.north) != 1) { return 4; }
+    if (enum_first(Dir.south) != 2) { return 5; }
+    if (enum_first(Dir.east)  != 9) { return 6; }
+
+    if (multi_mid(2) != 12) { return 7; }
+    if (multi_mid(4) != 34) { return 8; }
+    if (multi_mid(9) != 9)  { return 9; }
+
+    ?u32 five = 5;
+    if (opt_first(five) != 5) { return 10; }
+
+    if (int_last(1) != 1) { return 11; }
+    if (int_last(2) != 2) { return 12; }
+    if (int_last(7) != 9) { return 13; }
+    return 0;
+}

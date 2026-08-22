@@ -3027,7 +3027,51 @@ typedef struct {
     int64_t value;
     int64_t *array_values;  /* non-NULL for array bindings */
     int array_size;         /* element count (0 = scalar) */
+    /* BUG-844: the comptime interpreter answered a DIFFERENT question than the
+     * emitted code. It carried only an int64_t, so nothing could wrap:
+     *   comptime u32 f(){ u8 x=200; u8 y=100; return x+y; }  folded 300, runs 44
+     *   comptime u32 g(u32 a){ return (a*4)>>3; } a=4e9      folded 2000000000,
+     *                                                        runs   389387264
+     * Both "succeeded" and disagreed, with the wrong constant burned into the
+     * emitted C. Masking only the FINAL result cannot fix it — >>, / and % read
+     * the bits the overflow already discarded, which the second case shows
+     * exactly (16000000000 reached the shift un-wrapped). The width has to be
+     * established per BINDING and applied at every operation. 0 = unknown. */
+    uint16_t bits;
+    bool is_signed;
 } ComptimeParam;
+
+/* Width of a comptime-visible declared type, 0 when it is not a sized integer. */
+static void ct_type_width(Type *t, uint16_t *bits, bool *is_signed) {
+    *bits = 0; *is_signed = false;
+    if (!t) return;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_U8:  *bits = 8;  break;
+    case TYPE_U16: *bits = 16; break;
+    case TYPE_U32: *bits = 32; break;
+    case TYPE_U64: *bits = 64; break;
+    case TYPE_USIZE: *bits = (uint16_t)zer_target_ptr_bits; break;
+    case TYPE_I8:  *bits = 8;  *is_signed = true; break;
+    case TYPE_I16: *bits = 16; *is_signed = true; break;
+    case TYPE_I32: *bits = 32; *is_signed = true; break;
+    case TYPE_I64: *bits = 64; *is_signed = true; break;
+    case TYPE_UINT: *bits = (uint16_t)u->intn.bits; break;
+    case TYPE_SINT: *bits = (uint16_t)u->intn.bits; *is_signed = true; break;
+    default: break;
+    }
+}
+
+/* Wrap `v` into `bits` as ZER's runtime does (uN masks, iN sign-extends). */
+static int64_t ct_wrap(int64_t v, uint16_t bits, bool is_signed) {
+    if (bits == 0 || bits >= 64) return v;
+    uint64_t mask = (bits == 64) ? ~0ULL : ((1ULL << bits) - 1ULL);
+    uint64_t m = (uint64_t)v & mask;
+    if (is_signed && (m & (1ULL << (bits - 1))))
+        return (int64_t)(m | ~mask);
+    return (int64_t)m;
+}
 
 /* Mutable comptime evaluation context — shared across block/loop boundaries.
  * Locals added in inner blocks are popped via saved_count on block exit.
@@ -3064,15 +3108,19 @@ static void ct_ctx_free(ComptimeCtx *ctx) {
     if (ctx->locals != ctx->stack) free(ctx->locals);
 }
 
-static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, int64_t value) {
-    /* update existing */
+static void ct_ctx_set_w(ComptimeCtx *ctx, const char *name, uint32_t name_len,
+                        int64_t value, uint16_t bits, bool is_signed) {
+    /* update existing — the DECLARED width does not change on assignment, so an
+     * update keeps the binding's width and wraps the new value into it. */
     for (int i = 0; i < ctx->count; i++) {
         if (ctx->locals[i].name_len == name_len &&
             memcmp(ctx->locals[i].name, name, name_len) == 0) {
-            ctx->locals[i].value = value;
+            ctx->locals[i].value = ct_wrap(value, ctx->locals[i].bits,
+                                           ctx->locals[i].is_signed);
             return;
         }
     }
+    value = ct_wrap(value, bits, is_signed);
     /* add new */
     if (ctx->count >= ctx->capacity) {
         int nc = ctx->capacity * 2;
@@ -3088,11 +3136,22 @@ static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, in
     ctx->locals[ctx->count].value = value;
     ctx->locals[ctx->count].array_values = NULL;
     ctx->locals[ctx->count].array_size = 0;
+    ctx->locals[ctx->count].bits = bits;
+    ctx->locals[ctx->count].is_signed = is_signed;
     ctx->count++;
+}
+/* width-less shim for the call sites that have no declared type in hand */
+static void ct_ctx_set(ComptimeCtx *ctx, const char *name, uint32_t name_len, int64_t value) {
+    ct_ctx_set_w(ctx, name, name_len, value, 0, false);
 }
 
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx);
 static Scope *_comptime_global_scope; /* set before eval for nested comptime calls */
+/* BUG-844: the comptime interpreter needs to RESOLVE declared types to learn each
+ * binding's width. Set beside _comptime_global_scope at the same two entry points;
+ * NULL leaves every width unknown, which degrades to the old (unwrapped) behaviour
+ * rather than to a wrong wrap. */
+static Checker *_comptime_checker;
 
 /* Gap 33 (2026-04-27): hoisted up so resolve_type_inner can reset the
  * latch before its eval chain. Set inside eval_comptime_call_subst when
@@ -3346,10 +3405,19 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                         if (cv == CONST_EVAL_FAIL) { all_const = false; break; }
                         cparams[ci].name = fn->func_decl.params[ci].name;
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
-                        cparams[ci].value = cv;
+                        cparams[ci].array_values = NULL;
+                        cparams[ci].array_size = 0;
+                        /* BUG-844: the DECLARED width of this comptime param. There are
+                         * THREE binding sinks and only one of them is the call path a
+                         * given fold takes — wiring one and assuming is how the first
+                         * attempt at this fix silently did nothing. */
+                        ct_type_width(resolve_type(c, fn->func_decl.params[ci].type),
+                                      &cparams[ci].bits, &cparams[ci].is_signed);
+                        cparams[ci].value = ct_wrap(cv, cparams[ci].bits, cparams[ci].is_signed);
                     }
                     if (all_const && fn->func_decl.body) {
                         _comptime_global_scope = c->global_scope;
+                        _comptime_checker = c;
                         /* Gap 33: clear depth latch before this eval chain. */
                         _comptime_depth_exceeded = false;
                         _comptime_diag_line = 0;
@@ -3812,7 +3880,14 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
         if (av == CONST_EVAL_FAIL) { if (need_free) free(cparams); _comptime_call_depth--; return CONST_EVAL_FAIL; }
         cparams[i].name = fn->func_decl.params[i].name;
         cparams[i].name_len = (uint32_t)fn->func_decl.params[i].name_len;
-        cparams[i].value = av;
+        cparams[i].array_values = NULL;
+        cparams[i].array_size = 0;
+        /* BUG-844 sink 1: a comptime PARAM's declared width. */
+        ct_type_width(_comptime_checker
+                        ? resolve_type(_comptime_checker, fn->func_decl.params[i].type)
+                        : NULL,
+                      &cparams[i].bits, &cparams[i].is_signed);
+        cparams[i].value = ct_wrap(av, cparams[i].bits, cparams[i].is_signed);
     }
     ComptimeCtx cctx;
     ct_ctx_init(&cctx, cparams, pc);
@@ -3821,6 +3896,34 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
     if (need_free) free(cparams);
     _comptime_call_depth--;
     return result;
+}
+
+/* BUG-844: the WIDTH an expression computes in — the declared width of whichever
+ * operand has one. A literal contributes no width, so `x + 1` uses x's; a mixed
+ * `u8 + u32` uses the wider, matching ZER's usual-arithmetic behaviour. */
+static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
+                             bool *is_signed, int depth) {
+    if (!n || depth > 32) return 0;
+    if (n->kind == NODE_IDENT) {
+        for (int i = 0; i < param_count; i++)
+            if (params[i].name_len == (uint32_t)n->ident.name_len &&
+                memcmp(params[i].name, n->ident.name, params[i].name_len) == 0) {
+                if (is_signed) *is_signed = params[i].is_signed;
+                return params[i].bits;
+            }
+        return 0;
+    }
+    if (n->kind == NODE_UNARY)
+        return ct_expr_bits(n->unary.operand, params, param_count, is_signed, depth + 1);
+    if (n->kind == NODE_BINARY) {
+        bool sl = false, sr = false;
+        uint16_t bl = ct_expr_bits(n->binary.left,  params, param_count, &sl, depth + 1);
+        uint16_t br = ct_expr_bits(n->binary.right, params, param_count, &sr, depth + 1);
+        if (bl >= br) { if (is_signed) *is_signed = sl; return bl; }
+        if (is_signed) *is_signed = sr;
+        return br;
+    }
+    return 0;
 }
 
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
@@ -3881,8 +3984,15 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_subst(n->unary.operand, params, param_count);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
-        if (n->unary.op == TOK_MINUS) return -v;
-        if (n->unary.op == TOK_TILDE) return ~v;
+        {
+            /* BUG-844: UNARY wraps too. `u8 x = 0; return ~x;` is 255 in 8 bits,
+             * not -1 in 64. `!` is excluded — its result is a bool, not a value
+             * in the operand's width. */
+            bool _usg = false;
+            uint16_t _ub = ct_expr_bits(n->unary.operand, params, param_count, &_usg, 0);
+            if (n->unary.op == TOK_MINUS) return ct_wrap(-v, _ub, _usg);
+            if (n->unary.op == TOK_TILDE) return ct_wrap(~v, _ub, _usg);
+        }
         if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
         return CONST_EVAL_FAIL;
     }
@@ -3890,13 +4000,21 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         int64_t l = eval_const_expr_subst(n->binary.left, params, param_count);
         int64_t r = eval_const_expr_subst(n->binary.right, params, param_count);
         if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        bool _ctsg = false;
+        uint16_t _ctb = ct_expr_bits(n, params, param_count, &_ctsg, 0);
+        #define CTW(x) ct_wrap((x), _ctb, _ctsg)
         switch (n->binary.op) {
-        case TOK_PLUS:   return l + r;
-        case TOK_MINUS:  return l - r;
-        case TOK_STAR:   return l * r;
-        case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : l / r;
-        case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : l % r;
-        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : (int64_t)((uint64_t)l << r);
+        /* BUG-844: wrap each result into the operand width BEFORE the next
+         * operation sees it. Masking only the final value cannot work — >>, /
+         * and % read the bits an earlier overflow already discarded, which is
+         * exactly how `(a*4)>>3` folded 2000000000 while the runtime gives
+         * 389387264: 16000000000 reached the shift un-wrapped. */
+        case TOK_PLUS:   return CTW(l + r);
+        case TOK_MINUS:  return CTW(l - r);
+        case TOK_STAR:   return CTW(l * r);
+        case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : CTW(l / r);
+        case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : CTW(l % r);
+        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : CTW((int64_t)((uint64_t)l << r));
         case TOK_RSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : l >> r;
         case TOK_AMP:    return l & r;
         case TOK_PIPE:   return l | r;
@@ -3911,6 +4029,7 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         case TOK_PIPEPIPE: return (l || r) ? 1 : 0;
         default: return CONST_EVAL_FAIL;
         }
+        #undef CTW
     }
     return CONST_EVAL_FAIL;
 }
@@ -4117,7 +4236,13 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 if (stmt->var_decl.init) {
                     int64_t val = eval_const_expr_subst(stmt->var_decl.init, ctx->locals, ctx->count);
                     if (val == CONST_EVAL_FAIL) { goto ct_done; }
-                    ct_ctx_set(ctx, stmt->var_decl.name, (uint32_t)stmt->var_decl.name_len, val);
+                    /* BUG-844 sink 2: a comptime LOCAL's declared width. */
+                    { uint16_t _b; bool _sg;
+                      ct_type_width(_comptime_checker
+                                      ? resolve_type(_comptime_checker, stmt->var_decl.type)
+                                      : NULL, &_b, &_sg);
+                      ct_ctx_set_w(ctx, stmt->var_decl.name,
+                                   (uint32_t)stmt->var_decl.name_len, val, _b, _sg); }
                 }
                 continue;
             }
@@ -4731,14 +4856,42 @@ static Type *check_expr(Checker *c, Node *node) {
         case TOK_LT: case TOK_GT: case TOK_LTEQ: case TOK_GTEQ:
             /* reject slice/array comparison — C compares struct/pointer, not content.
              * BUG-315: unwrap distinct before checking (distinct []u8 is still a slice). */
-            if ((node->binary.op == TOK_EQEQ || node->binary.op == TOK_BANGEQ)) {
+            {
+                /* BUG-841: STRUCT and UNION were missing from this list, so `a == b`
+                 * on two structs compiled with ZERO diagnostics and the emitter
+                 * answered with a literal 0 — always false. And so was `a != b`,
+                 * which is the tell that the value is a PLACEHOLDER, not an answer.
+                 * All SIX comparison operators are covered, not just ==/!=, because
+                 * the emitter's placeholder branch keys on the operand TYPE, not on
+                 * the operator. */
                 Type *eff_l = type_unwrap_distinct(left);
                 Type *eff_r = type_unwrap_distinct(right);
-                if ((eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY) ||
-                    (eff_r->kind == TYPE_SLICE || eff_r->kind == TYPE_ARRAY)) {
-                    checker_error(c, node->loc.line,
-                        "cannot compare '%s' with == — use element-wise comparison",
-                        type_name(eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY ? left : right));
+                TypeKind kl = type_dispatch_kind(eff_l), kr = type_dispatch_kind(eff_r);
+                bool agg_l = (kl == TYPE_SLICE || kl == TYPE_ARRAY ||
+                              kl == TYPE_STRUCT || kl == TYPE_UNION);
+                bool agg_r = (kr == TYPE_SLICE || kr == TYPE_ARRAY ||
+                              kr == TYPE_STRUCT || kr == TYPE_UNION);
+                if (agg_l || agg_r) {
+                    Type *bad = agg_l ? left : right;
+                    TypeKind bk = agg_l ? kl : kr;
+                    const char *op =
+                        node->binary.op == TOK_EQEQ   ? "==" :
+                        node->binary.op == TOK_BANGEQ ? "!=" :
+                        node->binary.op == TOK_LT     ? "<"  :
+                        node->binary.op == TOK_GT     ? ">"  :
+                        node->binary.op == TOK_LTEQ   ? "<=" : ">=";
+                    if (bk == TYPE_STRUCT || bk == TYPE_UNION) {
+                        checker_error(c, node->loc.line,
+                            "cannot compare '%s' with %s — an aggregate has no defined "
+                            "ordering or field-wise equality in ZER. Compare the fields "
+                            "you care about individually", type_name(bad), op);
+                    } else {
+                        /* slice/array keep the incumbent wording — main's existing
+                         * negatives assert it. */
+                        checker_error(c, node->loc.line,
+                            "cannot compare '%s' with %s — use element-wise comparison",
+                            type_name(bad), op);
+                    }
                 }
             }
             if (!type_equals(left, right) &&
@@ -7902,7 +8055,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         cparams[ci].name = fn->func_decl.params[ci].name;
                         cparams[ci].name_len = (uint32_t)fn->func_decl.params[ci].name_len;
-                        cparams[ci].value = v;
+                        cparams[ci].array_values = NULL;
+                        cparams[ci].array_size = 0;
+                        /* BUG-844: the DECLARED width of this comptime param. There are
+                         * THREE binding sinks and only one of them is the call path a
+                         * given fold takes — wiring one and assuming is how the first
+                         * attempt at this fix silently did nothing. */
+                        ct_type_width(resolve_type(c, fn->func_decl.params[ci].type),
+                                      &cparams[ci].bits, &cparams[ci].is_signed);
+                        cparams[ci].value = ct_wrap(v, cparams[ci].bits, cparams[ci].is_signed);
                     }
                     /* SAFETY: zer_comptime_arg_valid in src/safety/comptime_rules.c (R02) */
                     int arg_const_flag = all_const ? 1 : 0;
@@ -7917,6 +8078,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     } else if (fn->func_decl.body) {
                         _comptime_global_scope = c->global_scope;
+                        _comptime_checker = c;
                         /* Gap 33: clear depth latch before this eval chain. */
                         _comptime_depth_exceeded = false;
                         _comptime_diag_line = 0;
@@ -20331,6 +20493,23 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                         (int)decl->var_decl.name_len, decl->var_decl.name,
                         (int)gl, gn);
                 }
+            }
+            /* BUG-842: the name-based "does not lower to a constant" check below used
+             * to live INSIDE the block above, inheriting `arg_count >= 1` — a
+             * precondition that belongs to the BIT-QUERY check, which inspects
+             * args[0] and has nothing to do with this one. So EVERY ZERO-ARG
+             * INTRINSIC skipped the guard entirely:
+             *
+             *     const u32 G = @cpu_model_id();   // checker exits 0; only GCC stops it
+             *
+             * `zerc f.zer -o out.c` reported SUCCESS for a program that cannot be
+             * compiled. G7 (2026-08-01) added names to this list and recorded the
+             * rationale that the CHECKER should be the one to reject, so the message
+             * names the ZER line — but adding names without splitting the condition
+             * changes nothing for a zero-arg intrinsic, which is exactly the trap. */
+            if (ginit->kind == NODE_INTRINSIC) {
+                const char *gn = ginit->intrinsic.name;
+                uint32_t gl = (uint32_t)ginit->intrinsic.name_len;
                 /* G7 (2026-08-01): these can NEVER appear in a file-scope
                  * initializer, even with CONSTANT args — so unlike the bit-query
                  * gate above there is no eval_const_expr condition. @saturate
@@ -20363,7 +20542,31 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
                     }
                 }
+                /* Every @atomic_* form. An atomic is a memory operation on a LIVE
+                 * ADDRESS and can never be a compile-time constant, yet it was
+                 * missing from this list — and what the user got depended on how
+                 * many characters the name happened to have. The AST atomic branch
+                 * is gated `nlen >= 10`, so `@atomic_or` (9) missed it and fell to
+                 * the generic marker (loud, and at least named), while
+                 * `@atomic_xchg` and the five _fetch forms entered the branch,
+                 * matched none of its arms, and the arm had no else — emitting the
+                 * EMPTY STRING: `uint32_t gres = ;`. A C syntax error in generated
+                 * code the user never wrote, reported at a line in a file they never
+                 * opened. Both halves of that length axis are closed here. */
+                bool is_atomic = (gl >= 7 && memcmp(gn, "atomic_", 7) == 0);
+                /* Runtime CPU/port reads: constant-foldable NEVER, whatever the
+                 * arity. Measured by probing all recognised intrinsics in a
+                 * global-initializer position and compiling the emitted C. */
+                bool is_runtime_read =
+                    (gl == 6 && memcmp(gn, "expect", 6) == 0) ||
+                    (gl >= 8 && memcmp(gn, "port_in", 7) == 0) ||
+                    (gl >= 4 && memcmp(gn, "cpu_", 4) == 0) ||
+                    (gl >= 4 && memcmp(gn, "mmu_", 4) == 0) ||
+                    (gl >= 4 && memcmp(gn, "tlb_", 4) == 0) ||
+                    (gl >= 6 && memcmp(gn, "cache_", 6) == 0) ||
+                    (gl == 5 && memcmp(gn, "probe", 5) == 0);
                 int is_nonconst_emit =
+                    is_atomic || is_runtime_read ||
                     (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
                     (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
                     (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||

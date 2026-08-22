@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: has no defined ordering
+// BUG-798, the UNION + ORDERING facet. The emitter's placeholder branch keys on
+// the operand TYPE, not on the operator, so `<` on two unions was silently `0`
+// exactly like `==` on two structs. Both halves of the axis get a cell.
+union Val { u32 i; f32 f; }
+
+u32 main() {
+    Val a; a.i = 1;
+    Val b; b.i = 2;
+    if (a < b) { return 0; }
+    return 1;
+}

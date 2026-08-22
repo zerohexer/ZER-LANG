@@ -5,6 +5,36 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — comptime array-element bindings carry no width (LOW, found 2026-08-22)
+
+BUG-844 established the declared width at the three comptime binding sinks (params via
+two call paths, and local var-decls) and applies it at every binary and unary operation,
+so the interpreter now agrees with the emitted code for every scalar, signed,
+mixed-width and nested-call form. **Array elements are the one binding kind still
+unwidthed** — `ComptimeParam.array_values` is a bare `int64_t *` with no per-element
+width, so:
+
+    comptime u32 a_elem() { u8[2] v; v[0] = 200; v[1] = 100; return v[0] + v[1]; }
+
+folds to 300 where the runtime gives 44. Measured precisely: 4z36e0's
+`tests/zer/comptime_width_wrap_all_forms.zer` exits **55**, which is exactly that
+check; every other form in that file passes. Not shipped as a test here because it
+would be a known-failing positive — pjtawx's `comptime_width_wrap_agreement.zer` (which
+passes) is installed instead.
+
+**Fix sketch:** `array_values` needs the element width alongside it. The array binding
+sites are the same `ct_ctx_set`/`ct_ctx_set_w` family; give the array form the element
+type's width from the declared `T[N]` and wrap on element store and on element read.
+Same shape as the scalar fix, one more sink.
+
+**Why it is LOW:** the wrong value is a compile-time constant in a comptime function
+using an array of a NON-native-width type, which no corpus program does — the corpus
+cost of the whole BUG-844 change measured zero. It is recorded because a silent
+disagreement between the interpreter and the emitted code is the exact class BUG-844
+exists to close, and a partially-closed class is how this one came back.
+
+---
+
 ## OPEN — harvest tracker: five `claude/vigilant-tesla-*` branches, verified against main 2026-08-22
 
 **Status: NOT implemented. This is a catalog, not a changelog.** Every row below was
@@ -12,6 +42,10 @@ verified on a clean `make zerc` build of main (`5fef1d06`) by running **the bran
 test file**, reading the DIAGNOSTIC rather than the exit code, and routing around maskings.
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
+
+**PROGRESS: §D landed 2026-08-22** (BUG-839..844) — six silent miscompiles. V9, V10,
+V11, V12, V14, V15 and V16 struck through below. **V13 and V17 remain** (the
+both-arms-return leak, and float->int UB at the three cast sites). Remaining: 8.
 
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
@@ -70,14 +104,14 @@ phrasing. Cosmetic; the rules fire.
 | V6 | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
 | ~~V7~~ **DONE (BUG-830)** | `type_equals` pointer arm checked `is_const` but NOT `is_volatile` | **87xihb** BUG-801 | struct-init field + funcptr param ACCEPTED. The SLICE arm 3 lines away checks both |
 | ~~V8~~ **DONE (BUG-832)** | 4 of 6 sinks blind to the `?*T` optional axis | **pjtawx** BUG-810 | `?*T` call-arg and `?*T` return ACCEPTED. **Complementary to V7, not a duplicate** — V7 is the type-system root, V8 is the hand-rolled per-sink comparison |
-| V9 | `@atomic_*` in a global initializer emits broken C | **4z36e0** BUG-808 (structural) | Emits literally `uint32_t gres = ;`. pjtawx BUG-806 fixes only the atomics subset; 4z36e0 fixes the CAUSE — a name-check wrongly nested inside an `arg_count >= 1` precondition belonging to a different rule |
-| V10 | Zero-arg intrinsic skips the global-init guard entirely | **4z36e0** BUG-808 | `const u32 G = @cpu_model_id();` checker-accepted, only GCC rejects |
-| V11 | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Emitter answers a literal `0`; `a != b` is also false, which is the tell |
-| V12 | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | `switch(1) { default => r=9; 1 => r=1; }` returns **9**. Every arm after `default` becomes dead C |
+| ~~V9~~ **DONE (BUG-842)** | `@atomic_*` in a global initializer emits broken C | **4z36e0** BUG-808 (structural) | Emits literally `uint32_t gres = ;`. pjtawx BUG-806 fixes only the atomics subset; 4z36e0 fixes the CAUSE — a name-check wrongly nested inside an `arg_count >= 1` precondition belonging to a different rule |
+| ~~V10~~ **DONE (BUG-842)** | Zero-arg intrinsic skips the global-init guard entirely | **4z36e0** BUG-808 | `const u32 G = @cpu_model_id();` checker-accepted, only GCC rejects |
+| ~~V11~~ **DONE (BUG-841)** | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Emitter answers a literal `0`; `a != b` is also false, which is the tell |
+| ~~V12~~ **DONE (BUG-840)** | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | `switch(1) { default => r=9; 1 => r=1; }` returns **9**. Every arm after `default` becomes dead C |
 | V13 | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
-| V14 | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
-| V15 | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
-| V16 | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
+| ~~V14~~ **DONE (BUG-839)** | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
+| ~~V15~~ **DONE (BUG-844)** | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
+| ~~V16~~ **DONE (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
 | V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
 | V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
 | V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |

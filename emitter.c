@@ -972,6 +972,29 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * the assignment/compound-assign path is AST-passthrough and never reaches
  * emit_intn_mask, so odd-width stores need masking here (else silent wrong
  * value: `u3 y; y = a+b` would keep bit 3). */
+/* BUG-843: @bitcast could FORGE an out-of-variant enum, and the switch then
+ * silently ran its LAST arm — `@bitcast(State, 7)` took `.done` while
+ * `s == State.done` was false. It was the only route in: ZER has no int->enum
+ * cast, so every other path to an enum value is a declared variant.
+ *
+ * Resolved by TRACKING, not banning (the Ban Decision Framework: none of the four
+ * ban conditions applies). Reading an enum out of a hardware register field via
+ * @bitcast is a legitimate firmware idiom; what is not legitimate is the value
+ * silently becoming a variant it is not. The guard traps at the point of forgery
+ * rather than letting a later switch pick an arbitrary arm. */
+static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
+    Type *u = type_unwrap_distinct(t);
+    if (!u || type_dispatch_kind(u) != TYPE_ENUM) return;
+    if (u->enum_type.variant_count == 0) return;
+    emit(e, "if (!(");
+    for (uint32_t vi = 0; vi < u->enum_type.variant_count; vi++) {
+        if (vi) emit(e, " || ");
+        emit(e, "%s == %lld", lv, (long long)u->enum_type.variants[vi].value);
+    }
+    emit(e, ")) _zer_trap(\"@bitcast produced a value that is not a declared variant "
+            "of this enum\", __FILE__, __LINE__); ");
+}
+
 static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     if (!t) return;
     TypeKind k = type_dispatch_kind(t);
@@ -3378,6 +3401,8 @@ static void emit_expr(Emitter *e, Node *node) {
                     char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
                     emit_intn_mask_lv(e, t, lv);
                 }
+                { char lv2[40]; snprintf(lv2, sizeof lv2, "_zer_bco%d", tmp);
+                  emit_bitcast_enum_guard(e, t, lv2); }   /* BUG-843 */
                 emit(e, "_zer_bco%d; })", tmp);
             } else {
                 emit(e, "0");
@@ -5789,7 +5814,12 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { uint8_t *buf; size_t capacity; size_t offset; } _zer_arena;\n\n");
 
     emit(e, "static inline void *_zer_arena_alloc(_zer_arena *a, size_t size, size_t align) {\n");
+    /* BUG-839: BOTH additions here could wrap, and a wrap makes the capacity test
+     * PASS for a request that does not fit — the same defeat-the-guard shape as the
+     * un-guarded multiply at the call site. Check each before using it. */
+    emit(e, "    if (align == 0 || a->offset > (size_t)-1 - (align - 1)) return (void*)0;\n");
     emit(e, "    size_t off = (a->offset + align - 1) & ~(align - 1);\n");
+    emit(e, "    if (off > (size_t)-1 - size) return (void*)0;\n");
     emit(e, "    if (off + size > a->capacity) return (void*)0;\n");
     emit(e, "    a->offset = off + size;\n");
     emit(e, "    memset(a->buf + off, 0, size);\n");
@@ -6274,9 +6304,21 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
             if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
                 emit(e,"({size_t _zer_an%d=",t); BA(1); emit(e,";");
-                emit(e,"uint8_t *_zer_ap%d=(uint8_t*)_zer_arena_alloc(&%.*s,",t,(int)ol,on);
-                /* sizeof(T)*n */
-                emit(e,"sizeof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,")*_zer_an%d,",t);
+                /* BUG-839: BUG-266 added __builtin_mul_overflow around sizeof(T)*n on
+                 * the AST path ONLY, and function bodies have been IR-only since
+                 * 2026-04-19 — so the guard has been UNREACHABLE ever since. Measured:
+                 * with a 1024-byte arena, alloc_slice(Big, 2^61) wrapped the byte count
+                 * to 0, the zero-size bump SUCCEEDED, and the caller received a slice
+                 * reporting 2305843009213693952 elements. Every later bounds check then
+                 * PASSES — it compares against the bogus length — so every access is an
+                 * unchecked OOB. Silent at compile time and silent at run time; a
+                 * 32-bit target reaches the same wrap from a plain u32 count.
+                 * This is why CLAUDE.md's AST->IR grep list carries __builtin_*_overflow:
+                 * a wrapper whose absence produces a WRONG LENGTH defeats every
+                 * downstream guard rather than merely removing one. */
+                emit(e,"size_t _zer_asz%d; uint8_t *_zer_ap%d=__builtin_mul_overflow(sizeof(",t,t);
+                if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);}
+                emit(e,"),_zer_an%d,&_zer_asz%d)?(uint8_t*)0:(uint8_t*)_zer_arena_alloc(&%.*s,_zer_asz%d,",t,t,(int)ol,on,t);
                 /* _Alignof(T) */
                 emit(e,"_Alignof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,"));");
                 /* wrap in ?[]T */
@@ -7740,6 +7782,8 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     char lv[40]; snprintf(lv, sizeof lv, "_zer_bco%d", tmp);
                     emit_intn_mask_lv(e, t, lv);
                 }
+                { char lv2[40]; snprintf(lv2, sizeof lv2, "_zer_bco%d", tmp);
+                  emit_bitcast_enum_guard(e, t, lv2); }   /* BUG-843 */
                 emit(e, "_zer_bco%d; })", tmp);
             }
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {

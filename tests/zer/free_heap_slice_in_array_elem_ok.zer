@@ -1,0 +1,17 @@
+// BUG-851 (over-rejection): `b[0].s` is a heap slice the program stored into an
+// element of a stack array of structs. The non-heap-free guard peeled every
+// field/index step to the ROOT and asked "is the root a stack array?", so this
+// was refused with "views non-heap memory" while the identical `b.s` (no index)
+// was allowed. Provenance of a field whose own type is a SLICE comes from the
+// value stored there, not from the container.
+struct Box { [*]u8 s; }
+
+u32 main() {
+    Box[2] b;
+    b[0].s = alloc(u8, 4) orelse { return 1; };
+    b[0].s[0] = 7;
+    u32 r = b[0].s[0];
+    free(b[0].s);
+    if (r != 7) { return 2; }
+    return 0;
+}

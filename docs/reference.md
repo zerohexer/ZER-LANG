@@ -1617,13 +1617,32 @@ ar.alloc_slice(u8, n)  // PARSE ERROR — same restriction
 Workaround for primitives:
 ```zer
 struct Byte { u8 val; }
-ar.alloc_slice(Byte, 64);
+?[*]Byte bytes = ar.alloc_slice(Byte, 64);
 ```
 
 **NOTES**
 - Arena-derived pointers cannot be stored in global/static variables (compile error).
 - No individual free — arena is all-or-nothing.
 - Use `defer ar.reset()` to ensure cleanup on all exit paths.
+- **`.over(...)` RETURNS the arena — bind its result.** Writing `ar.over(buf);` as a
+  statement is a compile error: the constructor would build into a discarded temporary
+  and `ar` would keep its zero value, so every later `alloc()` would return null
+  forever. A global arena is assigned the same way:
+```zer
+Arena g_ar;
+u8[4096] g_backing;
+struct Item { u32 v; }
+u32 main() {
+    g_ar = Arena.over(g_backing);      // NOT `g_ar.over(g_backing);`
+    ?*Item p = g_ar.alloc(Item);
+    if (p) |q| { q.v = 1; return 0; }
+    return 1;
+}
+```
+- **Allocating from an arena that never got a backing store TRAPS** rather than
+  returning null. Null means "this arena is full", which is a runtime condition your
+  program can handle; an arena with no storage is a bug, and reporting the two the same
+  way is how it stayed invisible.
 
 **SEE ALSO**
 Pool(T,N), Slab(T)
@@ -1633,6 +1652,36 @@ Pool(T,N), Slab(T)
 ## INTRINSICS
 
 All intrinsics start with `@`.
+
+### Converting a float to an integer — DEFINED, and it SATURATES
+
+C leaves this conversion **undefined** when the truncated value does not fit the target
+type, and real compilers exploit that: the same source can give one answer at `-O0` and
+a different one at `-O2`. ZER promises no undefined behavior, so it defines the
+conversion instead — **out-of-range saturates to the target's minimum or maximum, and
+NaN becomes 0**. That holds for every spelling: a C-style cast, `@truncate` and
+`@saturate`.
+
+```zer
+volatile f64 v;
+u32 main() {
+    v = 3.75;
+    if ((u32)v != 3) { return 1; }               // in range: truncates toward zero
+    v = -1.5;
+    if ((u32)v != 0) { return 2; }               // below u32 min -> 0
+    v = 1.0e20;
+    if ((u32)v != 4294967295) { return 3; }      // above u32 max -> max
+    if ((i32)v != 2147483647) { return 4; }
+    if (@truncate(u8, v) != 255) { return 5; }   // same rule
+    if (@saturate(u8, v) != 255) { return 6; }
+    return 0;
+}
+```
+
+An arbitrary-width target saturates to ITS range, not its carrier's: `@truncate(u3, x)`
+of a large float is 7, not 255.
+
+---
 
 ### @truncate(T, val)
 
@@ -1663,6 +1712,7 @@ u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
   Use a literal, or compute it inside a function body. The same restriction
   applies to `@addc`, `@subb` and `@mulw`.
 ```zer
+// audit: expect-error initializer cannot use @saturate
 u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
 u32 main() {
     u8 ok = @saturate(u8, 300);    // OK — inside a function body
@@ -2149,6 +2199,392 @@ Per-architecture interrupt disable/enable.
 
 ---
 
+---
+
+## SYSTEM AND CPU INTRINSICS
+
+Everything in this section is a compiler builtin — no header, no library, no
+`cinclude`. Each one lowers to the right instruction (or GCC builtin) for the
+selected `--target-arch`; where an architecture has no equivalent, the
+intrinsic is a documented no-op or a portable fallback rather than a build
+error, so the same source builds for x86-64, AArch64 and RISC-V.
+
+**PRIVILEGE.** Most of these execute at CPL 0 / EL1 / M-mode. Calling a
+privileged one from a user-mode process **faults** (SIGSEGV / SIGILL) — the
+compiler cannot know your privilege level, so it does not stop you. Rows below
+are marked **priv** when the instruction is privileged. To prove such code
+COMPILES without executing it, put it behind a `volatile` guard the optimizer
+cannot fold away — the *dead-branch pattern* used throughout this section:
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    if (never == 42) {
+        @cpu_disable_int();      // compiled, never executed
+    }
+    return 0;
+}
+```
+
+**SAFETY SCOPE.** These intrinsics move values across the hardware boundary.
+ZER verifies every *program-level* operation on the values they return or
+consume — types, widths, bounds, qualifiers, aliasing. It does **not** verify
+that the value is correct for your silicon: whether MSR `0xC0000100` is the one
+you meant, or whether the page table you install is well-formed, is a datasheet
+question and stays yours.
+
+---
+
+### Memory fences
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@barrier()` | `void` | full fence (sequentially consistent) |
+| `@barrier_load()` | `void` | acquire fence — no later load moves before it |
+| `@barrier_store()` | `void` | release fence — no earlier store moves after it |
+| `@barrier_acq_rel()` | `void` | acquire + release |
+| `@barrier_dma()` | `void` | DMA-coherence fence for driver code |
+
+All take **zero** arguments; passing one is a compile error.
+
+```zer
+u32 g_data;
+u32 g_ready;
+u32 main() {
+    g_data = 42;
+    @barrier_store();          // release: prior stores land before the flag
+    g_ready = 1;
+    @barrier_load();           // acquire
+    u32 v = g_data;
+    @barrier_acq_rel();
+    @barrier();                // full seq_cst fence
+    @barrier_dma();            // DMA-coherence fence for driver code
+    if (v != 42) { return 1; }
+    return 0;
+}
+```
+
+---
+
+### CPU inspection (non-privileged)
+
+These run in user mode, so no dead-branch guard is needed. Values marked
+*stub* return a fixed sensible default on targets where ZER has no probe yet.
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_read_sp()` | `u64` | stack pointer |
+| `@cpu_read_tp()` | `u64` | thread pointer / TLS base |
+| `@cpu_read_flags()` | `u64` | RFLAGS / NZCV |
+| `@cpu_get_pc()` | `u64` | address of the current instruction |
+| `@cpu_read_counter()` | `u64` | cycle / timestamp counter |
+| `@cpu_vendor_id()` | `u64` | CPUID leaf 0 EBX (first 4 vendor chars) |
+| `@cpu_feature_bits()` | `u64` | CPUID leaf 1, ECX:EDX packed |
+| `@cpu_model_id()` | `u32` | CPUID leaf 1 EAX (family/model/stepping) |
+| `@cpu_id()` | `u32` | logical processor id |
+| `@cpu_core_id()` | `u32` | physical core id (*stub* 0) |
+| `@cpu_num_cores()` | `u32` | logical core count (*stub* 1) |
+| `@cpu_current_mode()` | `u32` | privilege mode (*stub* 0 = user) |
+| `@cpu_get_priv_level()` | `u32` | current privilege level |
+| `@cpu_cache_line_size()` | `u32` | L1 line size in bytes (*stub* 64) |
+| `@cpu_cpuid(leaf, sub)` | `u64` | `(EBX << 32) \| EAX` |
+| `@cpu_cpuid_ecx(leaf, sub)` | `u64` | `(EDX << 32) \| ECX` |
+
+```zer
+u32 main() {
+    u64 sp     = @cpu_read_sp();
+    u64 flags  = @cpu_read_flags();
+    u64 vendor = @cpu_vendor_id();
+    u64 feats  = @cpu_feature_bits();
+    u32 line   = @cpu_cache_line_size();
+    u32 ncores = @cpu_num_cores();
+    u64 leaf0  = @cpu_cpuid(0, 0);
+    u64 leaf1  = @cpu_cpuid_ecx(1, 0);
+    if (sp == 0)     { return 1; }
+    if (line == 0)   { return 2; }
+    if (ncores == 0) { return 3; }
+    if (flags + vendor + feats + leaf0 + leaf1 == 0) { return 4; }
+    return 0;
+}
+```
+
+---
+
+### Idle, spin and power
+
+| Intrinsic | Returns | Priv | Meaning |
+|---|---|---|---|
+| `@cpu_pause()` | `void` | — | spin-wait relax hint (`pause` / `yield`) |
+| `@cpu_idle_hint()` | `void` | — | non-blocking low-power hint |
+| `@cpu_endbr()` | `void` | — | CET-IBT landing pad (a NOP without CET) |
+| `@cpu_rdrand()` | `?u64` | — | hardware RNG — `null` when the instruction fails |
+| `@cpu_rdseed()` | `?u64` | — | hardware entropy seed — `null` on failure |
+| `@cpu_wfe()` | `void` | — | wait-for-event (ARM); NOP elsewhere |
+| `@cpu_sev()` | `void` | — | send-event (ARM); NOP elsewhere |
+| `@cpu_breakpoint()` | `void` | — | debugger trap (`int3` / `brk`) |
+| `@cpu_flush_pipeline()` | `void` | — | instruction-pipeline sync barrier |
+| `@cpu_wait_int()` | `void` | **priv** | halt until the next interrupt |
+| `@cpu_deep_sleep()` | `void` | **priv** | enter the deepest idle state |
+| `@cpu_reset()` | `void` | **priv** | halt forever (a real reset is board-specific) |
+| `@cpu_monitor_addr(addr)` | `void` | **priv** | x86 `MONITOR` — arm an address watch |
+| `@cpu_mwait()` | `void` | **priv** | x86 `MWAIT` — wait for the monitored write |
+| `@cpu_umonitor(addr)` | `void` | — | user-mode `UMONITOR` (needs WAITPKG) |
+| `@cpu_umwait(hint, deadline)` | `void` | — | user-mode `UMWAIT`; hint 0 = C0.2, 1 = C0.1 |
+| `@wait_on_address(addr, expected)` | `void` | — | block while `*addr == expected` |
+
+`@cpu_rdrand` and `@cpu_rdseed` return an **optional** because the instruction
+is allowed to fail; unwrap it like any other `?u64`.
+
+```zer
+u32 main() {
+    @cpu_pause();
+    @cpu_idle_hint();
+    @cpu_endbr();
+    ?u64 r = @cpu_rdrand();
+    u64 v = r orelse 0;
+    if (v == 1 && v == 2) { return 1; }
+    return 0;
+}
+```
+
+---
+
+### Interrupt control (privileged)
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_disable_int()` | `void` | mask interrupts globally (`cli` / `cpsid i` / `csrci`) |
+| `@cpu_enable_int()` | `void` | unmask interrupts globally |
+| `@cpu_save_int_state()` | `u64` | read the current interrupt-enable state |
+| `@cpu_restore_int_state(state)` | `void` | restore a saved state |
+
+Prefer `@critical { }` for a bracketed region: it pairs disable/enable
+automatically and the compiler rejects any `return`/`break`/`continue`/`goto`
+that would escape with interrupts still masked.
+
+---
+
+### Control, model-specific and debug registers (x86, privileged)
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_read_cr0()` / `@cpu_write_cr0(v)` | `u64` / `void` | CR0 — paging, WP, cache-disable |
+| `@cpu_read_cr2()` | `u64` | CR2 — faulting linear address |
+| `@cpu_read_cr3()` / `@cpu_write_cr3(v)` | `u64` / `void` | CR3 — page-directory base (writing switches address space) |
+| `@cpu_read_cr4()` / `@cpu_write_cr4(v)` | `u64` / `void` | CR4 — feature enables (PAE, SMEP, FSGSBASE, PCE) |
+| `@cpu_read_xcr0()` / `@cpu_write_xcr0(v)` | `u64` / `void` | XCR0 — XSAVE feature mask (`XGETBV` / `XSETBV`) |
+| `@cpu_read_msr(n)` / `@cpu_write_msr(n, v)` | `u64` / `void` | `RDMSR` / `WRMSR` |
+| `@cpu_read_dr(i)` / `@cpu_write_dr(i, v)` | `u64` / `void` | debug registers DR0-DR3, DR6, DR7 |
+| `@cpu_read_pmc(i)` | `u64` | `RDPMC` — needs `CR4.PCE = 1` for user access |
+| `@cpu_read_fsbase()` / `@cpu_write_fsbase(v)` | `u64` / `void` | FS base — needs `CR4.FSGSBASE = 1` |
+| `@cpu_read_gsbase()` / `@cpu_write_gsbase(v)` | `u64` / `void` | GS base — needs `CR4.FSGSBASE = 1` |
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    if (never == 42) {
+        @cpu_disable_int();
+        u64 st = @cpu_save_int_state();
+        @cpu_restore_int_state(st);
+        @cpu_enable_int();
+
+        u64 cr0 = @cpu_read_cr0();  @cpu_write_cr0(cr0);
+        u64 cr3 = @cpu_read_cr3();  @cpu_write_cr3(cr3);
+        u64 cr4 = @cpu_read_cr4();  @cpu_write_cr4(cr4);
+        u64 msr = @cpu_read_msr(0xC0000100);
+        @cpu_write_msr(0xC0000100, msr);
+        u64 dr  = @cpu_read_dr(0);  @cpu_write_dr(0, dr);
+        if (cr0 + cr3 + cr4 + msr + dr == 0) { return 1; }
+    }
+    return 0;
+}
+```
+
+---
+
+### Context and FPU state
+
+Buffer arguments accept either `u8[N]` or `*u8`. Sizes are the minimum the
+instruction needs; oversizing is free.
+
+| Intrinsic | Buffer | Meaning |
+|---|---|---|
+| `@cpu_save_context(buf)` / `@cpu_restore_context(buf)` | ≥ 128 B | callee-saved GPRs (`rbx`,`r12`-`r15` / `x19`-`x28` / `s0`-`s11`) |
+| `@cpu_save_fpu(buf)` / `@cpu_restore_fpu(buf)` | ≥ 512 B, 16-B aligned | SIMD / FP state |
+| `@cpu_fxsave(buf)` / `@cpu_fxrstor(buf)` | 512 B, 16-B aligned | legacy x87/SSE state (pre-XSAVE) |
+| `@cpu_xsave(buf, mask)` / `@cpu_xrstor(buf, mask)` | per XCR0 | extended state (AVX, AVX-512) |
+| `@cpu_fpu_init()` | — | `FNINIT` — reset the FPU |
+
+Only the **callee-saved** subset is saved. A full RSP/RIP switch needs a
+`naked` function; that is kernel-integration scope, not a single intrinsic.
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    u8[256] gp;
+    u8[512] fp;
+    if (never == 42) {
+        @cpu_save_context(gp);   @cpu_restore_context(gp);
+        @cpu_save_fpu(fp);       @cpu_restore_fpu(fp);
+        @cpu_fxsave(fp);         @cpu_fxrstor(fp);
+        @cpu_fpu_init();
+        @cpu_xsave(fp, 7);       @cpu_xrstor(fp, 7);
+    }
+    if (gp[0] != 0 || fp[0] != 0) { return 1; }
+    return 0;
+}
+```
+
+---
+
+### Privileged mode transitions
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@cpu_syscall()` | `void` | user → kernel trap (`syscall` / `svc #0` / `ecall`) |
+| `@cpu_sysret()` | `void` | kernel → user return |
+| `@cpu_iret()` | `void` | interrupt return (`iretq` / `eret` / `mret`) |
+| `@cpu_set_priv_stack(sp)` | `void` | kernel stack used on syscall entry |
+| `@cpu_hypercall()` | `void` | guest → hypervisor (`vmcall` / `hvc #0`) |
+| `@cpu_sbi_call()` | `void` | RISC-V `ecall` into M-mode firmware |
+| `@cpu_smc_call()` | `void` | ARM TrustZone `smc #0` |
+| `@cpu_eoi()` | `void` | end-of-interrupt to the LAPIC / GICv3 |
+
+Every transition instruction reads system registers you must have set first
+(CS/RIP/RFLAGS on x86; ELR/SPSR on ARM; sepc/sstatus on RISC-V). ZER checks the
+call, not that context.
+
+---
+
+### Port I/O (x86, privileged: `CPL <= IOPL`)
+
+| Intrinsic | Returns |
+|---|---|
+| `@port_in8(port)` / `@port_in16(port)` / `@port_in32(port)` | `u8` / `u16` / `u32` |
+| `@port_out8(port, v)` / `@port_out16(port, v)` / `@port_out32(port, v)` | `void` |
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    if (never == 42) {
+        u8  b = @port_in8(0x60);
+        u16 w = @port_in16(0x60);
+        u32 d = @port_in32(0x60);
+        @port_out8(0x60, b);
+        @port_out16(0x60, w);
+        @port_out32(0x60, d);
+    }
+    return 0;
+}
+```
+
+---
+
+### Cache maintenance
+
+| Intrinsic | Returns | Priv | Meaning |
+|---|---|---|---|
+| `@cache_flush_line(addr)` | `void` | — | flush one line (`clflush`) |
+| `@cache_flushopt(addr)` | `void` | — | `CLFLUSHOPT` — ordered alternative |
+| `@cache_writeback(addr)` | `void` | — | `CLWB` — write back, keep valid (NVDIMM) |
+| `@cache_zero_line(addr)` | `void` | — | zero a whole line without reading it |
+| `@cache_flush_range(addr, size)` | `void` | — | flush a byte range |
+| `@cache_clean_range(addr, size)` | `void` | — | clean (write back) a range |
+| `@cache_invalidate_range(addr, size)` | `void` | — | invalidate a range |
+| `@cache_invalidate_icache(addr, size)` | `void` | — | invalidate instruction cache (after emitting code) |
+| `@nt_store(addr, value)` | `void` | — | non-temporal store (`MOVNTI`) — bypasses cache |
+| `@cpu_cache_disable()` / `@cpu_cache_enable()` | `void` | **priv** | `CR0.CD` plus `WBINVD` |
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    u8[64] buf;
+    if (never == 42) {
+        @cache_flush_line(buf);
+        @cache_flushopt(buf);
+        @cache_writeback(buf);
+        @cache_zero_line(buf);
+        @cache_flush_range(buf, 64);
+        @cache_clean_range(buf, 64);
+        @cache_invalidate_range(buf, 64);
+        @cache_invalidate_icache(buf, 64);
+        @nt_store(buf, 1);
+        @cpu_cache_disable();
+        @cpu_cache_enable();
+    }
+    if (buf[0] != 0) { return 1; }
+    return 0;
+}
+```
+
+---
+
+### MMU and TLB (privileged)
+
+| Intrinsic | Returns | Meaning |
+|---|---|---|
+| `@mmu_enable()` / `@mmu_disable()` | `void` | turn address translation on / off |
+| `@mmu_is_enabled()` | `bool` | is translation on? |
+| `@mmu_set_pt(pa)` / `@mmu_get_pt()` | `void` / `u64` | user page-table base |
+| `@mmu_set_kernel_pt(pa)` / `@mmu_get_kernel_pt()` | `void` / `u64` | kernel page-table base |
+| `@mmu_get_fault_addr()` | `u64` | faulting address (CR2 / FAR / stval) |
+| `@mmu_get_fault_status()` | `u64` | fault status / error code |
+| `@mmu_sync()` | `void` | make page-table writes visible to the walker |
+| `@tlb_flush_all()` | `void` | flush the whole TLB |
+| `@tlb_flush_global()` | `void` | flush global entries too |
+| `@tlb_flush_addr(addr)` | `void` | flush one page |
+| `@tlb_flush_asid(asid)` | `void` | flush one address-space id |
+| `@tlb_flush_range(start, end)` | `void` | flush a range |
+
+```zer
+volatile u32 never = 0;
+u32 main() {
+    if (never == 42) {
+        @mmu_enable();
+        bool on = @mmu_is_enabled();
+        u64 pt  = @mmu_get_pt();        @mmu_set_pt(pt);
+        u64 kpt = @mmu_get_kernel_pt(); @mmu_set_kernel_pt(kpt);
+        u64 fa  = @mmu_get_fault_addr();
+        u64 fs  = @mmu_get_fault_status();
+        @mmu_sync();
+        @tlb_flush_all();
+        @tlb_flush_global();
+        @tlb_flush_addr(fa);
+        @tlb_flush_asid(1);
+        @tlb_flush_range(0, 4096);
+        @mmu_disable();
+        if (on && fs == 0) { return 1; }
+    }
+    return 0;
+}
+```
+
+---
+
+### Build configuration
+
+**`@config(key, default)`** — returns `default`. A placeholder for a future
+build-configuration lookup; today it always evaluates to the default, so it is
+a way to name a tunable without a preprocessor. Both arguments are required.
+
+---
+
+### Argument counts are checked
+
+Every intrinsic above has a fixed arity and the compiler enforces it. Passing
+the wrong number is a compile error naming the intrinsic, not a confusing error
+from the emitted C:
+
+```zer
+// audit: expect-error @barrier expects 0 arguments
+u32 main() {
+    u32 x = 1;
+    @barrier(x);
+    return x - 1;
+}
+```
+
+
 ## HARDWARE SUPPORT
 
 ### mmio
@@ -2294,6 +2730,7 @@ import gpio;
 
 **EXAMPLE**
 ```zer
+// audit: skip two files — see test_modules/ for the executable version
 // uart.zer:
 void uart_init(u32 baud) { }
 static void internal_helper() { }   // not visible to importers
@@ -3015,6 +3452,10 @@ Barrier bar;                // keyword type (like Arena, Pool)
 ```
 - `Barrier` is a builtin type — checker validates `@barrier_init`/`@barrier_wait` args are `Barrier` type.
 - Using wrong type (e.g., `u32`) → compile error.
+- **`@barrier_wait` before `@barrier_init` TRAPS.** A `Barrier` auto-zeroes to a target
+  of 0, so without the trap the first waiter would satisfy "everyone has arrived",
+  broadcast, and return immediately — a dead barrier reporting success, with the program
+  running on unsynchronised. `@barrier_init` must run before any thread waits.
 
 ### Semaphore — Counting Semaphore
 ```zer

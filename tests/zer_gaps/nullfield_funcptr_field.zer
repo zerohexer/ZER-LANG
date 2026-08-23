@@ -1,0 +1,7 @@
+// GAP (BUG-852): a non-optional function-pointer FIELD, same class as the array.
+typedef u32 (*BinOp)(u32, u32);
+struct Ops { BinOp fn; }
+u32 main() {
+    Ops o;
+    return o.fn(2, 5);
+}

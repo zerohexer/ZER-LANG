@@ -222,6 +222,10 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
+	@echo "=== Reference-example audit (every whole-program doc example compiles) ==="
+	@bash tools/audit_reference_examples.sh ./zerc docs/reference.md
+	@echo "=== VRP range-JOIN matrix (a stale narrow range elides a bounds check) ==="
+	@bash tools/vrp_join_matrix.sh ./zerc
 
 # Stage 3 standalone target — run just the fixed-buffer linter.
 check-fixed-buffers:
@@ -235,6 +239,26 @@ check-walker-fields:
 
 check-sink-matrix: zerc
 	@bash tools/sink_matrix.sh ./zerc
+
+# Standalone — compile the ```zer examples in the docs. docs/reference.md is the
+# only reference a ZER user has (there is no ZER on the web), so an example that
+# does not compile teaches a syntax the compiler rejects.
+check-reference-examples: zerc
+	@bash tools/audit_reference_examples.sh ./zerc docs/reference.md
+
+# Standalone — differential UB detector. Compiles each program's emitted C at -O0
+# and -O2 and compares stdout AND exit status; a disagreement is undefined
+# behaviour in the emitted code. Deliberately NOT in `make check` (two to four
+# gcc invocations per program). ZER_UB_ALIAS=1 adds the strict-aliasing axis.
+check-ub-sweep: zerc
+	@bash tools/ub_sweep.sh ./zerc tests/zer
+
+# Standalone — the VRP range-JOIN gate. One cell per control-flow kind, measured
+# BEHAVIOURALLY under AddressSanitizer (an elided check on a reachable value is an
+# ASan report), plus boundary cells asserting the ranges it CAN prove are still
+# elided — without those a compiler that guards everything would score perfectly.
+check-vrp-join: zerc
+	@bash tools/vrp_join_matrix.sh ./zerc
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

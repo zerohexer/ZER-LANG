@@ -1,0 +1,15 @@
+// expect-error: read-modify-written in a single statement
+// BUG-855: the "does this assignment read its own target" walker was a partial
+// if-chain over seven node kinds, so a read wrapped in ANY intrinsic was
+// invisible. `g_ticks = g_ticks + 1` was rejected and this — the identical
+// operation — compiled clean. On the target the lost update is silent: the ISR
+// reads, main writes, the ISR writes back and the intervening store is gone.
+volatile u32 g_ticks;
+
+interrupt TIMER {
+    g_ticks = @truncate(u32, g_ticks) + 1;
+}
+
+u32 main() {
+    return g_ticks & 1;
+}

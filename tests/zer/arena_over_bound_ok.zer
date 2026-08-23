@@ -1,0 +1,21 @@
+// BUG-857/858 boundary: the CORRECT spelling must work, and the arena must
+// actually allocate — the bug this guards made every allocation return null
+// while the test still exited 0.
+struct Vec2 { u32 x; u32 y; }
+
+u32 main() {
+    u8[256] backing;
+    Arena scratch = Arena.over(backing);
+    ?*Vec2 mv = scratch.alloc(Vec2);
+    *Vec2 v = mv orelse { return 1; };
+    v.x = 3;
+    v.y = 4;
+    if (v.x != 3) { return 2; }
+    if (v.y != 4) { return 3; }
+    scratch.reset();
+    ?*Vec2 mv2 = scratch.alloc(Vec2);
+    *Vec2 v2 = mv2 orelse { return 4; };
+    v2.x = 7;
+    if (v2.x != 7) { return 5; }
+    return 0;
+}

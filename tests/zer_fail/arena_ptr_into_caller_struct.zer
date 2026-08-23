@@ -1,0 +1,24 @@
+// expect-error: cannot store arena-derived pointer
+// BUG-859 boundary: the arena->arena relaxation must NOT extend to a
+// destination the CALLER owns. `holder` points at a struct on the caller's
+// stack, which outlives `scratch.reset()`, so the stored pointer dangles —
+// exactly the case the rule exists for.
+struct Cfg { u32 x; }
+struct Holder { ?*Cfg cfg; }
+Arena scratch;
+u8[256] scratch_store;
+
+void stash(*Holder holder) {
+    ?*Cfg mc = scratch.alloc(Cfg);
+    *Cfg c = mc orelse { return; };
+    c.x = 1;
+    holder.cfg = c;
+}
+
+u32 main() {
+    scratch = Arena.over(scratch_store);
+    Holder h;
+    stash(&h);
+    scratch.reset();
+    return 0;
+}

@@ -1,0 +1,9 @@
+// GAP (BUG-852): an ARRAY of non-optional function pointers auto-zeroes to NULL
+// entries. The bare `BinOp op;` spelling IS rejected ("function pointer requires
+// an initializer"); the array of the same type is not, and calling element 0
+// jumps to address 0.
+typedef u32 (*BinOp)(u32, u32);
+u32 main() {
+    BinOp[2] ops;
+    return ops[0](2, 5);
+}

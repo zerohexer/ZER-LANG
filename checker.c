@@ -2098,41 +2098,110 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
  * written-out `x = x + 1` — identical semantics, identical non-atomicity. The
  * rule was SYNTACTIC (it tested only the compound operator), so spelling the RMW
  * out in full evaded it at every sink. */
-static bool assign_reads_own_target(Node *value, Symbol *tgt);
-/* Does this expression mention the identifier `nm`? Used to recognise a
- * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
+/* Does this VALUE EXPRESSION read the identifier `nm`?
+ *
+ * The one question behind the non-atomic read-modify-write rule: `g = <expr>`
+ * is the same RMW as `g += 1` exactly when <expr> reads `g`. Three sinks ask it
+ * — the main-checker compound-assign site, the ISR walker, and the hardware
+ * RMW-form grid's shared resolver — all through `assign_reads_own_target`.
+ *
+ * BUG-855 (2026-08-23): this was TWO near-identical partial if-chains
+ * (`expr_mentions_name` for a param, `expr_mentions_global` for a global), each
+ * listing seven node kinds and each carrying the comment "partial by design:
+ * unlisted kinds yield no, never a new rejection". That reasoning is inverted
+ * here. Answering "no" means NOT flagging an RMW that IS one, so an unlisted
+ * kind is an ACCEPT-UNSAFE under-rejection, and four of them were live:
+ *
+ *     interrupt USART1 { g = @truncate(u32, g) + 1; }   // ACCEPTED
+ *     interrupt USART1 { g = @bswap32(g); }             // ACCEPTED
+ *     interrupt USART1 { g = @popcount(g); }            // ACCEPTED
+ *     interrupt USART1 { g = @saturate(u32, g) + 1; }   // ACCEPTED
+ *     interrupt USART1 { g = g + 1; }                   // rejected
+ *     interrupt USART1 { g = (u32)(g) + 1; }            // rejected
+ *
+ * Same operation, four spellings, no diagnostic — and on the target the lost
+ * update is silent: the ISR reads, main writes, the ISR writes back and the
+ * intervening store is gone.
+ *
+ * Now ONE no-default exhaustive switch, so `-Werror=switch` forces a decision
+ * for every new NodeKind and `tools/audit_walker_fields.sh` sees the arms.
+ * Statement kinds cannot appear in a value expression; they are listed to
+ * satisfy the switch and return false. */
 static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
     if (!e || !nm || depth > 16) return false;
-    if (e->kind == NODE_IDENT)
+    switch (e->kind) {
+    case NODE_IDENT:
         return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
-    if (e->kind == NODE_BINARY)
+    case NODE_BINARY:
         return expr_mentions_name(e->binary.left, nm, nl, depth + 1) ||
                expr_mentions_name(e->binary.right, nm, nl, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_name(e->field.object, nm, nl, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
-                                       expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    case NODE_UNARY:
+        return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
+    case NODE_FIELD:
+        return expr_mentions_name(e->field.object, nm, nl, depth + 1);
+    case NODE_INDEX:
+        return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
+               expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
+    case NODE_SLICE:
+        return expr_mentions_name(e->slice.object, nm, nl, depth + 1) ||
+               expr_mentions_name(e->slice.start, nm, nl, depth + 1) ||
+               expr_mentions_name(e->slice.end, nm, nl, depth + 1);
+    case NODE_TYPECAST:
+        return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
+    case NODE_ORELSE:
+        return expr_mentions_name(e->orelse.expr, nm, nl, depth + 1) ||
+               expr_mentions_name(e->orelse.fallback, nm, nl, depth + 1);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++) {
+            if (expr_mentions_name(e->intrinsic.args[i], nm, nl, depth + 1))
+                return true;
+        }
+        return false;
+    case NODE_CALL:
+        /* `g = f(g)` reads g just as `g = g + 1` does; the callee position
+         * matters too, for an indirect call through the target itself. A read
+         * INSIDE f is a different question, answered by func_rmw_param_mask. */
+        if (expr_mentions_name(e->call.callee, nm, nl, depth + 1)) return true;
+        for (int i = 0; i < e->call.arg_count; i++) {
+            if (expr_mentions_name(e->call.args[i], nm, nl, depth + 1)) return true;
+        }
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++) {
+            if (expr_mentions_name(e->struct_init.fields[i].value, nm, nl, depth + 1))
+                return true;
+        }
+        return false;
+    case NODE_ASSIGN:
+        /* a nested assignment used as a value (`g = (h = g)`) */
+        return expr_mentions_name(e->assign.target, nm, nl, depth + 1) ||
+               expr_mentions_name(e->assign.value, nm, nl, depth + 1);
+    /* Literals and type-only nodes read nothing. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    /* Statement / declaration kinds — not reachable from a value expression.
+     * Named so a new NodeKind fails the build instead of silently answering
+     * "no", which is the direction that hides an RMW. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT: case NODE_MMIO:
+    case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE:
+    case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
 }
 
-static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
-    if (!e || !g || depth > 12) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == g->name_len &&
-               memcmp(e->ident.name, g->name, g->name_len) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_global(e->binary.left, g, depth + 1) ||
-               expr_mentions_global(e->binary.right, g, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
-                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
-}
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
-    return expr_mentions_global(value, tgt, 0);
+    if (!tgt) return false;
+    return expr_mentions_name(value, tgt->name, tgt->name_len, 0);
 }
 
 /* BUG-801: does this function read-modify-write through pointer parameter n?
@@ -2166,7 +2235,7 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
                  * would stop looking and report NO rmw, and a missed rmw is a
                  * missed race (the same "which way does the bail-out round?"
                  * question the atomic-cell path walk answered). Mirrors
-                 * expr_mentions_global above. */
+                 * the RMW-read walker unified in BUG-855. */
                 is_rmw = expr_mentions_name(n->assign.value, root->ident.name,
                                             (uint32_t)root->ident.name_len, 0);
             }
@@ -6327,7 +6396,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         bool tgt_global = false, tgt_param = false;
                         classify_escape_sink(c, node->assign.target,
                             &target_sym, &tgt_global, &tgt_param);
-                        if (tgt_global || tgt_param) {
+                                                if (tgt_global || tgt_param) {
                             checker_error(c, node->loc.line,
                                 tgt_param ?
                                 "cannot store arena-derived pointer through pointer "
@@ -6929,24 +6998,56 @@ static Type *check_expr(Checker *c, Node *node) {
                  * (alloc(T,n)) and param/global slices (caller-owned) stay
                  * allowed. */
                 {
+                    /* BUG-851 (2026-08-23): the peel used to run through EVERY
+                     * field/index step to the root ident and then ask "is the
+                     * ROOT a stack array?". That answers the wrong question once
+                     * a step reads a STORED slice: in
+                     *
+                     *     Box[2] b;  b[0].s = alloc(u8, 4) orelse ...;
+                     *     free(b[0].s);
+                     *
+                     * `b[0].s` is a heap slice the program stored there, but the
+                     * root `b` is a stack ARRAY, so the free was refused with
+                     * "views non-heap memory". `free(b.s)` — same thing without
+                     * the index — was allowed, because `b` is a struct.
+                     *
+                     * The provenance of a field/element whose own type is a
+                     * SLICE or POINTER comes from the value stored in it, which
+                     * this check cannot see, so stop there and allow. Keep
+                     * peeling only through steps that navigate INTO inline
+                     * storage (an ARRAY-typed field/element) — that really is a
+                     * view of the container, and `via_inline_array` records it
+                     * so `free(s.buf[0..])` on a local struct's inline array is
+                     * rejected too (it was silently allowed before, because the
+                     * root `s` is a struct rather than an array). */
                     Node *root = node->call.args[0];
-                    while (root && (root->kind == NODE_SLICE ||
-                                    root->kind == NODE_FIELD ||
-                                    root->kind == NODE_INDEX)) {
-                        if (root->kind == NODE_SLICE) root = root->slice.object;
-                        else if (root->kind == NODE_FIELD) root = root->field.object;
-                        else root = root->index_expr.object;
+                    bool via_inline_array = false;
+                    while (root) {
+                        if (root->kind == NODE_SLICE) {
+                            root = root->slice.object;
+                            continue;
+                        }
+                        if (root->kind == NODE_FIELD || root->kind == NODE_INDEX) {
+                            Type *ct = checker_get_type(c, root);
+                            if (!ct || type_dispatch_kind(ct) != TYPE_ARRAY) break;
+                            via_inline_array = true;
+                            root = (root->kind == NODE_FIELD)
+                                 ? root->field.object : root->index_expr.object;
+                            continue;
+                        }
+                        break;
                     }
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *rs = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
                         bool rs_global = rs && scope_lookup_local(c->global_scope,
                             rs->name, rs->name_len) != NULL;
-                        bool root_is_local_array = rs && rs->type &&
-                            type_dispatch_kind(rs->type) == TYPE_ARRAY &&
-                            !rs->is_static && !rs_global;
+                        bool root_is_stack = rs && !rs->is_static && !rs_global;
+                        bool root_is_local_array = root_is_stack && rs->type &&
+                            type_dispatch_kind(rs->type) == TYPE_ARRAY;
                         if (rs && (rs->is_local_derived || rs->is_arena_derived ||
-                                   root_is_local_array)) {
+                                   root_is_local_array ||
+                                   (via_inline_array && root_is_stack))) {
                             checker_error(c, node->loc.line,
                                 "cannot free() a slice that views non-heap memory "
                                 "(stack array or arena); free is only for heap slices "
@@ -9353,6 +9454,78 @@ static Type *check_expr(Checker *c, Node *node) {
                         inlen, iname,
                         expected, (expected == 1 ? "" : "s"),
                         node->intrinsic.arg_count);
+                }
+            }
+        }
+
+        /* BUG-850 (2026-08-23) — the REST of the arity family. BH-18 #14 above
+         * closed the type-argument intrinsics; the value-only ones were never
+         * given the same treatment, and a scan of all 141 shipped intrinsics
+         * (compile each at arity 0..3, grep the emitted C) found seven that
+         * accept ANY arg count. @cstr() and @cstr(x) were the loud ones: they
+         * emit a literal comment-placeholder plus 0 into the C — a
+         * pointer-typed expression that compiles, runs and is always null.
+         * The others silently drop their extra arguments.
+         *
+         * Same table shape as the block above, so a new intrinsic gets its arity
+         * by adding one row rather than by hand-rolling a check in its handler.
+         * `@offset`/`@container` count their trailing FIELD-NAME argument (it is
+         * parsed as an ordinary arg and skipped by has_field_arg above). */
+        {
+            int want = -1;
+            bool want_type_arg = false;
+            if ((nlen == 7  && memcmp(name, "barrier", 7) == 0) ||
+                (nlen == 13 && memcmp(name, "barrier_store", 13) == 0) ||
+                (nlen == 12 && memcmp(name, "barrier_load", 12) == 0) ||
+                (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) ||
+                (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0)) {
+                want = 0;
+            } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
+                want = 0;
+            } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
+                want = 1;
+            } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
+                want = 2;                       /* @cstr(buf, slice) */
+            } else if (nlen == 6 && memcmp(name, "config", 6) == 0) {
+                want = 2;                       /* @config(key, default) */
+            } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
+                want = 1; want_type_arg = true; /* @offset(T, field) */
+            } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
+                want = 2; want_type_arg = true; /* @container(*T, ptr, field) */
+            }
+            if (want >= 0) {
+                /* A NAMED struct type parses as an ordinary ident argument, not
+                 * as type_arg (the parser only forces type_arg for intrinsics in
+                 * its force_type_arg set — the same split the @size check above
+                 * calls the "named path"). `@offset(Dev, tag)` therefore arrives
+                 * as {type_arg = NULL, args = [Dev, tag]} while
+                 * `@container(*Dev, p, f)` arrives as {type_arg = *Dev,
+                 * args = [p, f]}. Accept both spellings; requiring type_arg
+                 * outright rejects every named-struct use. */
+                int have = node->intrinsic.arg_count;
+                bool named_path = want_type_arg &&
+                    node->intrinsic.type_arg == NULL &&
+                    have == want + 1 &&
+                    node->intrinsic.args[0] &&
+                    node->intrinsic.args[0]->kind == NODE_IDENT;
+                bool named_shape = want_type_arg &&
+                    node->intrinsic.type_arg == NULL &&
+                    have >= 1 && node->intrinsic.args[0] &&
+                    node->intrinsic.args[0]->kind == NODE_IDENT;
+                if (named_path) {
+                    /* well-formed */
+                } else if (named_shape) {
+                    checker_error(c, node->loc.line,
+                        "@%.*s expects %d arguments (type, %s), got %d",
+                        (int)nlen, name, want + 1,
+                        (want == 1 ? "field" : "ptr, field"), have);
+                } else if (want_type_arg && node->intrinsic.type_arg == NULL) {
+                    checker_error(c, node->loc.line,
+                        "@%.*s requires a type argument", (int)nlen, name);
+                } else if (have != want) {
+                    checker_error(c, node->loc.line,
+                        "@%.*s expects %d argument%s, got %d",
+                        (int)nlen, name, want, (want == 1 ? "" : "s"), have);
                 }
             }
         }
@@ -13226,6 +13399,32 @@ static void check_stmt(Checker *c, Node *node) {
          * TOK_AMP handler — covers ALL &var sites (var-decl, assign, call arg,
          * struct field, return). No per-site duplicate code needed. */
 
+        /* BUG-854 (2026-08-23, PRECISION): a var-decl with NO initializer is
+         * auto-zeroed — that is an unconditional language guarantee, not an
+         * assumption — so its range at the declaration is exactly [0, 0]. It was
+         * left with no range entry at all, which is TOP, and the difference is
+         * visible one line later:
+         *
+         *     u32 i = 0;  if (c) { i = 1; } else { i = 2; }  a[i]  // elided
+         *     u32 i;      if (c) { i = 1; } else { i = 2; }  a[i]  // GUARDED
+         *
+         * Both arms assign a provably in-range value, so the join is [1, 2]
+         * either way — but with no entry to join INTO, `vrp_snap_join` has
+         * nothing to union and the check survives. Purely payable over-guarding
+         * (a runtime branch on an index the compiler could prove), never a
+         * soundness question: an entry that says [0,0] is exactly what the
+         * generated code does.
+         *
+         * Two exclusions, both about the value not actually being 0 at this
+         * point: a `static` local keeps its value ACROSS calls (zeroed once, at
+         * program start), and a `volatile` may be written by an ISR or by
+         * hardware between the declaration and the use. */
+        if (!node->var_decl.init && type && type_is_integer(type) &&
+            !node->var_decl.is_static && !node->var_decl.is_volatile) {
+            push_var_range(c, node->var_decl.name,
+                (uint32_t)node->var_decl.name_len, 0, 0, false);
+        }
+
         /* Value range propagation: track literal init values */
         if (node->var_decl.init && type && type_is_integer(type)) {
             int64_t val = eval_const_expr(node->var_decl.init);
@@ -15096,28 +15295,73 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_EXPR_STMT:
         check_expr(c, node->expr_stmt.expr);
-        /* Ghost handle: warn if pool.alloc()/slab.alloc() result is discarded.
-         * The handle is leaked — must assign to a variable. */
+        /* A builtin whose RESULT *is* the operation, used as a bare statement.
+         *
+         * The ghost-handle rule (`pool.alloc();` discards the handle, leaking it)
+         * was the first instance. BUG-857 (2026-08-23) adds the two siblings
+         * that were silent in a worse way — the operation did not merely leak,
+         * it did not HAPPEN:
+         *
+         *   Arena a; a.over(buf);           `.over` is a CONSTRUCTOR returning
+         *                                   an Arena BY VALUE. As a statement it
+         *                                   builds into a discarded temp, `a`
+         *                                   keeps its auto-zero {0} — no backing
+         *                                   store — and every later
+         *                                   `a.alloc(T)` returns null forever.
+         *                                   Compiles, runs, does nothing.
+         *                                   Correct: `Arena a = Arena.over(buf);`
+         *
+         *   rb.push_checked(x);             the ONE ring method whose entire
+         *                                   purpose is reporting overflow, with
+         *                                   the report thrown away. `rb.push(x)`
+         *                                   is the deliberate drop-on-full form.
+         *
+         * Also widened to `alloc_slice` and to a STRUCT receiver (the `Task.alloc()`
+         * auto-slab sugar), both of which the pool/slab type test excluded. */
         if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
             node->expr_stmt.expr->call.callee &&
             node->expr_stmt.expr->call.callee->kind == NODE_FIELD) {
             Node *call_obj = node->expr_stmt.expr->call.callee->field.object;
             const char *mname = node->expr_stmt.expr->call.callee->field.field_name;
             uint32_t mlen = (uint32_t)node->expr_stmt.expr->call.callee->field.field_name_len;
-            if (((mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
-                 (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0)) && call_obj->kind == NODE_IDENT) {
-                Type *ot = checker_get_type(c, call_obj);
+            Type *ot = NULL;
+            if (call_obj && call_obj->kind == NODE_IDENT) {
+                ot = checker_get_type(c, call_obj);
                 if (!ot) {
                     Symbol *s = scope_lookup(c->current_scope, call_obj->ident.name,
                         (uint32_t)call_obj->ident.name_len);
                     if (s) ot = s->type;
                 }
-                if (ot && (ot->kind == TYPE_POOL || ot->kind == TYPE_SLAB)) {
-                    checker_error(c, node->loc.line,
-                        "discarded alloc result — handle leaked. Assign to a variable: "
-                        "'Handle(...) h = %.*s.alloc() orelse return;'",
-                        (int)call_obj->ident.name_len, call_obj->ident.name);
-                }
+            }
+            TypeKind ok_kind = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+            bool is_alloc = (mlen == 5 && memcmp(mname, "alloc", 5) == 0) ||
+                            (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) ||
+                            (mlen == 11 && memcmp(mname, "alloc_slice", 11) == 0);
+            if (is_alloc && call_obj && call_obj->kind == NODE_IDENT &&
+                (ok_kind == TYPE_POOL || ok_kind == TYPE_SLAB ||
+                 ok_kind == TYPE_ARENA || ok_kind == TYPE_STRUCT)) {
+                checker_error(c, node->loc.line,
+                    "discarded alloc result — the allocation is leaked. Bind it: "
+                    "'Handle(...) h = %.*s.%.*s(...) orelse return;'",
+                    (int)call_obj->ident.name_len, call_obj->ident.name,
+                    (int)mlen, mname);
+            }
+            if (mlen == 4 && memcmp(mname, "over", 4) == 0 && ok_kind == TYPE_ARENA) {
+                checker_error(c, node->loc.line,
+                    "'.over(...)' builds an Arena and RETURNS it — used as a "
+                    "statement the result is discarded and the arena keeps its "
+                    "zero value, so every later alloc() returns null. Write "
+                    "'Arena a = Arena.over(buf);'");
+            }
+            if (mlen == 12 && memcmp(mname, "push_checked", 12) == 0 &&
+                ok_kind == TYPE_RING) {
+                checker_error(c, node->loc.line,
+                    "discarded 'push_checked' result — reporting overflow is the "
+                    "only thing it does that 'push' does not. Bind it "
+                    "('?void r = %.*s.push_checked(v);'), use 'orelse', or call "
+                    "'%.*s.push(v)' if dropping on a full ring is intended",
+                    (int)call_obj->ident.name_len, call_obj->ident.name,
+                    (int)call_obj->ident.name_len, call_obj->ident.name);
             }
         }
         break;

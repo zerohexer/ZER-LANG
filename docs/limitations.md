@@ -5,6 +5,133 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — an arena pointer cannot be stored into another ARENA allocation (over-rejection, measured 2026-08-23)
+
+**Symptom.** The arena's own idiom — an intrusive list, a tree, a freelist — is refused:
+
+```zer
+?*Node m1 = ar.alloc(Node);  *Node a = m1 orelse { return 1; };
+?*Node m2 = ar.alloc(Node);  *Node b = m2 orelse { return 2; };
+a.next = b;   // error: cannot store arena-derived pointer 'b' through pointer
+              //        parameter 'a' — pointer will dangle when arena is reset
+```
+
+It cannot dangle: `arena.reset()` invalidates EVERY arena-colored handle
+(`ir_mark_arena_handles_freed` widens across all arenas), so the container dies with the
+pointee and any later use is already a caught use-after-reset. The rule is for a pointer
+that OUTLIVES the arena — one stored in a global, or written through a param whose object
+the caller keeps — and an arena-derived destination is neither.
+
+**Why `tests/zer/super_freelist_arena.zer` does not show it.** That test was rewritten on
+2026-08-23 to an INDEX-based freelist precisely to route around this. It was previously a
+pointer-linked freelist and had never compiled far enough to hit the rule, because its
+arena had no backing store (BUG-858) and the program bailed out on its first allocation.
+
+**ATTEMPTED AND REVERTED — read this before trying again.** The obvious fix ("exempt the
+sink when the destination is itself arena-derived") was implemented and **opened a hole
+on the first negative it was run against**: `tests/zer_fail/arena_ptr_into_caller_struct.zer`
+(store into a `*Holder` the CALLER owns) was accepted.
+
+The reason is worth recording, because it makes the flag unusable as a precondition:
+**`Symbol.is_from_arena` is already set on a pointer PARAM at the moment the check runs,
+by the very store being checked.** Measured with a debug print:
+
+    [arena] line=15 tgt=holder glob=0 param=1 ad=0 fa=1
+
+`holder` is a plain caller-owned `*Holder` and carries `is_from_arena = 1`. The narrower
+`is_arena_derived` ("came from a LOCAL arena.alloc") is not polluted, but it is also not
+SET for an allocation from a GLOBAL arena, which is the common case — so it exempts
+nothing useful. Neither flag answers the question.
+
+**What a real fix needs.** The question is "does the destination's STORAGE live inside an
+arena", which is provenance, not a taint bit: the zercheck_ir side already has it as
+`IRHandleInfo.source_color == ZC_COLOR_ARENA`, keyed per allocation. Either move this
+check to that layer, or give the checker an equivalent per-symbol *provenance* record
+(set once at the declaration from the initializer, never widened by a later store) and
+gate on that. Do NOT gate on `is_from_arena`.
+
+**Tripwires (shipped):** `tests/zer_fail/arena_ptr_into_caller_struct.zer` is the negative
+the attempt broke — keep it green. The over-rejection itself has no test, deliberately:
+a positive asserting it stays broken would have to be deleted by the fix.
+
+---
+
+## OPEN — a non-optional pointer MEMBER is null after auto-zero (HIGH, measured 2026-08-23)
+
+**Symptom — four spellings, all accepted, all a null dereference or a null call:**
+
+```zer
+struct S { *u32 p; }          S s;      return *s.p;        // accepted
+struct S { *u32 p; }          S g_s;    return *g_s.p;      // accepted (global)
+typedef u32 (*Op)(u32, u32);  Op[2] ops; return ops[0](2,5); // accepted
+struct O { Op fn; }           O o;      return o.fn(2, 5);   // accepted
+```
+
+The bare spellings of the same two types ARE rejected:
+
+```zer
+*u32 p;      // error: non-null pointer '*u32' requires an initializer
+Op op;       // error: function pointer requires an initializer
+```
+
+**Root cause.** The rule is at the var-decl / global-var site and dispatches on the
+OUTERMOST type (`type_unwrap_distinct(type)->kind == TYPE_POINTER`, and the funcptr
+sibling beside it). Every AGGREGATE spelling — array-of, struct field, union variant,
+and any nesting of those — walks straight past it. This is precisely the
+"wrapper hides the inner kind" class CLAUDE.md lists, applied to the rule that
+*creates* ZER's null guarantee.
+
+**Why it is worse on the target than on the host.** Hosted x86-64 faults, loudly. On
+bare metal address 0 is normally the vector table or the start of flash, so the read
+SUCCEEDS and hands back garbage, and an indirect call to 0 re-enters the reset vector.
+Compile-time and runtime both miss it.
+
+**Why the obvious fix is wrong — MEASURED, do not re-derive.** The blanket rule
+("a declaration whose type carries a non-optional pointer member requires an
+initializer") was implemented behind `ZER_NULLFIELD` and run over the corpus:
+**34 files** are rejected, and every one of them is CORRECT code that declares such a
+struct and fills the fields in afterwards. Full list at the time of measuring:
+
+    tests/zer: _verify_funcptr_2c, callback_system, deref_scalar_ok, driver_registry,
+      erased_map_get_ok, field_ptr_alias_safe_ok, func_pipeline, funcptr_array,
+      funcptr_struct_reduce, nested_index_field_alias_ok, shared_lock_completeness_ok,
+      shared_multi_field_ptr_lock_ok, spawn_carrier_safe_shapes,
+      spawn_funcptr_array_field_ok, spawn_funcptr_field_safe_ok,
+      spawn_opt_carrier_safe_ok, struct_param_pointer_fields_ok, super_plugin,
+      super_sensor_logger, view_alias_correct_order_ok
+    rust_tests: gen_funcptr_004, rt_const_fn_ptr_struct, rt_move_into_struct,
+      rt_opaque_callback_lifecycle, rt_opaque_double_indirection,
+      rt_opaque_multi_dispatch, rt_opaque_nested_cast, rt_opaque_struct_field_track,
+      rt_opaque_vtable_dispatch, rt_opaque_vtable_safe, rt_opaque_wrapper_chain,
+      rt_scope_escape_struct_return, rt_scope_escape_via_field
+    zig_tests: zt_container_pointer_field
+
+So the declaration site is the wrong place: the question is not "was it initialized at
+birth" but "was this MEMBER written before this use".
+
+**Fix sketch (the real one).** A definite-assignment analysis on member paths, which
+zercheck_ir is already shaped for — it keys compound state as `(local, ".field")` and
+`ir_extract_compound_key` builds exactly that key from a use expression. Add an
+"unwritten non-null ref member" state seeded at the declaration of an aggregate with no
+initializer, cleared by any write to the path, joined at CFG merges (unwritten on ANY
+path = unwritten), and checked at a deref / indirect-call whose key resolves to it.
+Escape hatches that must bail to "assume written": the root's address is taken, the root
+is passed to a call, or the write goes through an alias the key extractor cannot follow.
+
+**A cheaper subset that was considered and rejected as low-value:** reject only when the
+member is written NOWHERE in the enclosing function (no path analysis, provably zero
+false positives, and it does close all four reproducers). It catches only obviously
+broken code; a real null-member bug is written on SOME path, which is exactly the case
+this subset cannot see. Not worth a new walker.
+
+**Tripwires (shipped):** `tests/zer_gaps/nullfield_struct_ptr_deref.zer`,
+`nullfield_global_struct_ptr.zer`, `nullfield_funcptr_array.zer`,
+`nullfield_funcptr_field.zer`. That directory runs with the expectation INVERTED
+(compile-clean IS the gap), so the day this closes the harness says so and asks for the
+tests to be promoted to `tests/zer_fail/`.
+
+---
+
 ## OPEN — comptime array-element bindings carry no width (LOW, found 2026-08-22)
 
 BUG-844 established the declared width at the three comptime binding sinks (params via
@@ -44,8 +171,18 @@ Rows that main already closed are listed in the "already on main" table so nobod
 re-implements them.
 
 **PROGRESS: §D landed 2026-08-22** (BUG-839..844) — six silent miscompiles. V9, V10,
-V11, V12, V14, V15 and V16 struck through below. **V13 and V17 remain** (the
-both-arms-return leak, and float->int UB at the three cast sites). Remaining: 8.
+V11, V12, V14, V15 and V16 struck through below. **V13 remains** (the
+both-arms-return leak). Remaining: 8.
+
+**PROGRESS: an independent audit on 2026-08-23** (BUG-845..858, not a harvest) closed
+**V6** (the RMW walker, found independently), **V17** and **Q4** (as a side effect of
+defining float->int conversion), **V18..V21** (the silent-builtin family — all four
+reproduced, all four fixed), and **Q3** (the emitter give-up branches, which turned out
+to be reachable after all — see the row). It also re-measured **O1** as STALE (closed by
+§B's BUG-829 the day before the row was written). Rows struck through below.
+Still live and NOT re-measured by that audit: **V13, V24, V25** on the accept-unsafe
+list, **O3** on the over-rejection list, and **W11, Q1, Q2**. Re-measure each before
+implementing — four of the rows this session touched had drifted from what they said.
 
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
@@ -101,7 +238,7 @@ phrasing. Cosmetic; the rules fire.
 | ~~V3~~ **DONE 2026-08-22 (BUG-817/818)** | Root-ident walk written 4x as two SEQUENTIAL loops — wrong for any ALTERNATING chain | **pjtawx** BUG-804 (`expr_root_ident` in ast.h) | `@atomic_load(&g_s.arr[0].f)` on a packed nested struct ACCEPTED; `@atomic_load(&g_i.f)` rejected one line away. Misaligned atomic = hard fault on ARM/RISC-V |
 | ~~V4~~ **DONE (BUG-833)** | `&packed.field` gated at 1 of 5 sinks | **87xihb** BUG-804 (5 sinks + non-sticky) | assign / call-arg / alias sinks ACCEPTED. `39294y` BUG-813 is a 2-sink subset — take 87xihb, keep 39294y's `zer_gaps` file for the 4 sinks BOTH leave open |
 | ~~V5~~ **DONE (BUG-834)** | Bit-range write is an implicit RMW, missed at BOTH sinks | **87xihb** BUG-803 | ACCEPTED while `flags += 1` is REJECTED — same operation, different spelling. `resolve_write_target_global` does not peel `NODE_SLICE` |
-| V6 | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
+| ~~V6~~ **DONE 2026-08-23 (BUG-855)** | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED. Found independently and fixed by UNIFYING the two near-identical partial walkers (`expr_mentions_name` + `expr_mentions_global`) into one no-default exhaustive switch, so `-Werror=switch` now covers the class. `@bswap32`/`@popcount`/`@saturate` and a CALL argument were open too. RMW form grid 30 -> 36 cells, verified non-vacuous at BOTH sinks |
 | ~~V7~~ **DONE (BUG-830)** | `type_equals` pointer arm checked `is_const` but NOT `is_volatile` | **87xihb** BUG-801 | struct-init field + funcptr param ACCEPTED. The SLICE arm 3 lines away checks both |
 | ~~V8~~ **DONE (BUG-832)** | 4 of 6 sinks blind to the `?*T` optional axis | **pjtawx** BUG-810 | `?*T` call-arg and `?*T` return ACCEPTED. **Complementary to V7, not a duplicate** — V7 is the type-system root, V8 is the hand-rolled per-sink comparison |
 | ~~V9~~ **DONE (BUG-842)** | `@atomic_*` in a global initializer emits broken C | **4z36e0** BUG-808 (structural) | Emits literally `uint32_t gres = ;`. pjtawx BUG-806 fixes only the atomics subset; 4z36e0 fixes the CAUSE — a name-check wrongly nested inside an `arg_count >= 1` precondition belonging to a different rule |
@@ -112,11 +249,11 @@ phrasing. Cosmetic; the rules fire.
 | ~~V14~~ **DONE (BUG-839)** | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
 | ~~V15~~ **DONE (BUG-844)** | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
 | ~~V16~~ **DONE (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
-| V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
-| V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
-| V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
-| V20 | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | `.over` is a constructor returning BY VALUE; as a statement it builds into a discarded temp |
-| V21 | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | `rb.push_checked(a);` — the one method whose entire purpose is reporting overflow, silently not reporting it. Subsumes the ghost-handle check. Corpus cost measured at ZERO (all 6 hits are ghost-handle negatives) |
+| ~~V17~~ **DONE 2026-08-23 (BUG-853)** | float -> integer conversion is C UB at all three cast sites (there are FOUR: the AST cast, the IR cast, `@truncate` and `@saturate`, the last two only with a float source) | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
+| ~~V18~~ **DONE 2026-08-23 (BUG-858)** | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | `_zer_barrier_wait` now traps on `target == 0`, BEFORE taking the lock (a zeroed `pthread_mutex_t` is only accidentally usable) |
+| ~~V19~~ **DONE 2026-08-23 (BUG-858)** | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | `_zer_arena_alloc` traps when `buf == NULL || capacity == 0`. Returning null conflated a program bug with "out of memory". A compile-time rule cannot cover this: `Arena scratch;` at file scope, assigned in `main`, is the corpus idiom in 19 files. The 5 vacuous tests were repaired in the same commit |
+| ~~V20~~ **DONE 2026-08-23 (BUG-857)** | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | Compile error now. Measured: 5 corpus files were written this way and were VACUOUS — proven by rewriting `orelse return` to `orelse { return 9; }`, exit 9 |
+| ~~V21~~ **DONE 2026-08-23 (BUG-857)** | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | Shipped NARROWLY rather than as a blanket "a discarded optional is an error": the ghost-handle rule was generalised to `push_checked`, `.over`, `alloc_slice` and a STRUCT receiver. A blanket rule would also reject a user `?void` called for its side effects, which is a language-design decision, not a bug fix |
 | ~~V22~~ **DONE (BUG-836)** | `--stack-limit` never sums main + ISRs, which share one stack | **pjtawx** BUG-811 | Two 200-byte chains pass `--stack-limit 256`. The tool AFFIRMS a budget the target cannot honour |
 | ~~V23~~ **DONE (BUG-835)** | Auto-guard's `return` leaks a held lock and the interrupt-disable | **87xihb** BUG-805 | **The lock form HANGS (deadlock, verified exit 124); the `@critical` form exits 0 silently.** The compiler emits the exact construct it hard-errors users for writing. Main has `guard_traps` for defer bodies only — needs `noreturn_scope_depth` counted inside `emit_shared_lock_mode`/`emit_shared_unlock` and both `IR_CRITICAL` handlers |
 | V24 | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | `--totally-bogus-flag`, `--target-arch=nonsense`, `--stack-limit=abc` all exit 0 with no diagnostic. `--target-arch=arm64` (valid spelling is `aarch64`) silently builds x86 |
@@ -152,7 +289,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| O1 | `defer sensor_close(dev)` reported as a leak; the DIRECT call is recognised | **39294y** BUG-812 (`ir_defer_free_arg`) | `cinterop_defer_close_ok` and `defer_extern_destructor_no_false_leak` both hard-error. This is the flagship "Safe C Library Interop" example in `reference.md` — the docs assert it compiles and it does not. pjtawx BUG-805 is the same fix; take either, keep both tests |
+| ~~O1~~ **STALE — re-measured 2026-08-23, does NOT reproduce** | `defer sensor_close(dev)` reported as a leak | **39294y** BUG-812 (`ir_defer_free_arg`) | The `reference.md` "Safe C Library Interop" example compiles CLEAN on main (extracted verbatim, checker-only), and `tests/zer/cinterop_defer_close_ok.zer` is IN the tree and green. Closed by BUG-829 in §B on 2026-08-22, which is the same `ir_defer_free_arg` widening. The row was written before §B landed. `tools/audit_reference_examples.sh` (2026-08-23) now compiles that example on every `make check`, so this cannot silently regress |
 | O2 | Sticky packed-derived flag refuses a re-cleared pointer | **87xihb** BUG-804 (boundary positive) | `packed_aligned_forms_ok` hard-errors on main. The fix SETS on a packed-derived RHS and CLEARS otherwise |
 | O3 | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
 
@@ -162,15 +299,15 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 |---|---|---|
 | Q1 | `naked` silently dropped -> warn at the declaration | **4z36e0**. Deeper measurement than 39294y's identical fix: GCC 13 x86-64 DOES support the attribute (emits `endbr64; body; ud2`, no `ret`), 16 of 18 `asm_*.zer` positives CALL their naked function so flipping it on SIGILLs all 16, and `naked` is OVERLOADED (it is the only way to get asm permission). 43 corpus files emit the warning — that number IS the finding |
 | Q2 | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
-| Q3 | Emitter's five give-up paths are silent miscompiles | **4z36e0**. `/* complex callee */(a, b)` is a valid C COMMA EXPRESSION — compiles, runs, CALLS NOTHING. Measured 0/1170 corpus programs reach them, so `emit_unreachable()` aborts nothing reachable |
-| Q4 | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |
+| ~~Q3~~ **DONE 2026-08-23 (BUG-856)** | Emitter's give-up paths are silent miscompiles | **4z36e0** measured 0/1170 corpus programs reaching them and proposed `emit_unreachable()`. That measurement was right and the conclusion was not: the branch is one array-of-pointers away — `OpsPtr[2] arr; arr[0].fn(10)` reaches it and returns the ARGUMENT instead of calling. (A plain `o.inner.fn(x)` does not, because the lowering treats a STRUCT-typed receiver as a builtin and skips arg decomposition.) Fixed by EMITTING the callee rather than aborting — it is an ordinary expression in every one of those shapes; only the genuinely-empty case aborts. `tools/emit_audit.sh` widened from 5 samples to 1087 programs with fingerprints for all ten comment-instead-of-code emissions |
+| ~~Q4~~ **DONE 2026-08-23 (BUG-853)** | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | A float source now routes through the same saturating macro as the cast, so the rounded-bound case (`(double)U64_MAX` rounds UP to 2^64 and the old test was a strict `>`) is covered by construction rather than by a hand-written clamp per width |
 
 ### Tooling and gates (pure gain — no behaviour change)
 
 | Tool | Branch | Why |
 |---|---|---|
 | `tools/audit_walker_fields.sh` + 930-line baseline | 39294y | **Highest value here.** The FIELD half of the walker discipline; found all 11 W-rows. Self-checked against `ast.h`. Its own blind spots (if/else chains, children handled before the switch) are stated in the script |
-| `tests/test_vrp_join_matrix.c` (32 cells) | 4z36e0 | Closes CLAUDE.md's "VRP range JOIN — NO auto-gate, checklist every control-flow kind" row. Verified to FIRE by reproducing BH-18 #2 behind an env flag. Its first draft was VACUOUS (open-ended pass rule swallowed exit 134 and 127) — now a CLOSED safe-set |
+| ~~`tests/test_vrp_join_matrix.c` (32 cells)~~ **SUPERSEDED 2026-08-23** | 4z36e0 | Closes CLAUDE.md's "VRP range JOIN — NO auto-gate" row. `tools/vrp_join_matrix.sh` (31 cells) now does this and is in `make check`; take one, not both. The branch version's lesson is still worth keeping: its first draft was VACUOUS (an open-ended pass rule swallowed exit 134 and 127). The shipped one measures `guarded` cells under ASan and pairs them with `elided` cells, so neither a wrong guard nor a guard-everything compiler scores a pass |
 | `tests/test_global_init_matrix.c` (54 cells) | 4z36e0 | DERIVES the intrinsic set from the compiler at run time, so a new intrinsic is covered the day it lands. Both prior hand-maintained lists lacked exactly that |
 | Trap-harness: `timeout` + `// expect-trap` | 87xihb | Main HAS `ZER_RUN_TIMEOUT`; it LACKS `expect-trap`. "Any non-zero exit" cannot distinguish a hang, a SIGSEGV, a wrong answer and a genuine trap |
 | `tools/audit_reference_examples.sh` | pjtawx (preferred) / 87xihb | Two implementations. pjtawx's checks BOTH directions and prints its skipped-fragment count; 87xihb's is opt-in-marked and asserts the REASON. Both were verified to fire by injection |
@@ -205,6 +342,11 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
   `lib/io.zer`, `lib/compat.zer`, `lib/fmt.zer`. Deliberately not fixed: both candidate
   fixes are risky (one lands in the IR/AST dual-dispatch hazard; the other's failure mode
   is an UNDER-rejection). Exhibiting it needs linking a separate C TU, which no harness does.
+- **The VRP-JOIN gate now EXISTS** (2026-08-23): `tools/vrp_join_matrix.sh`, 31 cells, in
+  `make check`. 4z36e0's `tests/test_vrp_join_matrix.c` in the tooling table above is
+  therefore superseded — take either, not both. Measured while building it: all fifteen
+  control-flow kinds were already sound; the one mismatch was on the PRECISION side
+  (BUG-854, an uninitialized local carried no range at all).
 - **`vrp_ir.c` is ORPHANED** — no caller, absent from both Makefile source lists,
   `strings zerc | grep -c vrp_ir` is 0. Re-measured on 4z36e0: Phase 0's headline
   justification ("retires a CRITICAL live under-rejection") is STALE — that was BH-18 #2,
@@ -215,7 +357,9 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
   (39294y, LOW).
 - **Two arena allocations cannot be LINKED** (4z36e0, over-rejection). Both share the
   arena's lifetime. Found because the doc's Arena example showed exactly that line and had
-  never been compiled.
+  never been compiled. **Reproduced independently 2026-08-23, ATTEMPTED, and REVERTED** —
+  the obvious exemption opened a hole on the first negative. Full analysis, including why
+  `Symbol.is_from_arena` cannot be used as the precondition, is its own OPEN entry above.
 - **A bodyless declaration reusing a libc NAME** gets a confusing GCC error (4z36e0, LOW,
   LOUD). Inherent to emit-C: the 17-name `is_cstdlib` list must stay declarable for interop.
 

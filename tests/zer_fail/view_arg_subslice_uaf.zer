@@ -1,0 +1,10 @@
+// expect-error: use after free
+// BUG-845, sibling FORM: the argument is a SUBSLICE expression. Same root
+// cause as view_arg_field_uaf — a non-ident argument lost the alias.
+[*]u8 head([*]u8 s) { return s[0..2]; }
+u32 main() {
+    [*]u8 s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 h = head(s[0..4]);
+    free(s);
+    return h[0];
+}

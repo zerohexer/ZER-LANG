@@ -889,3 +889,43 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# --- checker.c: expr_mentions_name (BUG-855) ---
+#   "Does this VALUE EXPRESSION read the identifier `nm`?" — the one question
+#   behind the non-atomic read-modify-write rule (`g = <expr>` is the same RMW as
+#   `g += 1` exactly when <expr> reads `g`). It runs only on the RHS of an
+#   assignment, so no STATEMENT kind is reachable; they are named to satisfy the
+#   no-default switch, which is the point — a new NodeKind now fails the build
+#   instead of silently answering "no", and "no" here means NOT flagging an RMW
+#   that is one. Before it was a switch this was two partial if-chains that
+#   between them missed NODE_INTRINSIC, NODE_CALL, NODE_ORELSE, NODE_SLICE and
+#   NODE_STRUCT_INIT — all five now DESCEND.
+checker.c:expr_mentions_name:NODE_ASM:asm_stmt.inputs
+checker.c:expr_mentions_name:NODE_ASM:asm_stmt.outputs
+checker.c:expr_mentions_name:NODE_AWAIT:await_stmt.cond
+checker.c:expr_mentions_name:NODE_BLOCK:block.stmts
+checker.c:expr_mentions_name:NODE_CRITICAL:critical.body
+checker.c:expr_mentions_name:NODE_DEFER:defer.body
+checker.c:expr_mentions_name:NODE_DO_WHILE:while_stmt.body
+checker.c:expr_mentions_name:NODE_DO_WHILE:while_stmt.cond
+checker.c:expr_mentions_name:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:expr_mentions_name:NODE_FILE:file.decls
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.body
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.cond
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.init
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.step
+checker.c:expr_mentions_name:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_mentions_name:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_mentions_name:NODE_IF:if_stmt.cond
+checker.c:expr_mentions_name:NODE_IF:if_stmt.else_body
+checker.c:expr_mentions_name:NODE_IF:if_stmt.then_body
+checker.c:expr_mentions_name:NODE_INTERRUPT:interrupt.body
+checker.c:expr_mentions_name:NODE_ONCE:once.body
+checker.c:expr_mentions_name:NODE_RETURN:ret.expr
+checker.c:expr_mentions_name:NODE_SPAWN:spawn_stmt.args
+checker.c:expr_mentions_name:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:expr_mentions_name:NODE_SWITCH:switch_stmt.arms
+checker.c:expr_mentions_name:NODE_SWITCH:switch_stmt.expr
+checker.c:expr_mentions_name:NODE_VAR_DECL:var_decl.init
+checker.c:expr_mentions_name:NODE_WHILE:while_stmt.body
+checker.c:expr_mentions_name:NODE_WHILE:while_stmt.cond

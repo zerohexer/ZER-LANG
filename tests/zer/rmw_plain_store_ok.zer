@@ -1,0 +1,28 @@
+// BUG-855 boundary: widening the "does this assignment read its own target"
+// walker must not turn a PLAIN STORE into a read-modify-write. Neither
+// statement below reads the variable it writes, so neither is an RMW and both
+// must compile — including the intrinsic and call forms, which are exactly what
+// the widening now descends into.
+//
+// The SPAWN sink is used rather than the ISR one because an `interrupt` block
+// cannot appear in a runnable positive: GCC refuses the attribute on hosted
+// x86-64. The ISR twin of this boundary is the `isr` half of the RMW form grid
+// in tests/test_hw_matrix.c.
+volatile u32 g_state;
+volatile u32 g_input;
+
+u32 idfn(u32 v) { return v; }
+
+void worker() {
+    g_state = 1;
+    g_state = g_input + 1;
+    g_state = @truncate(u32, g_input);
+    g_state = idfn(g_input);
+}
+
+u32 main() {
+    g_input = 6;
+    worker();
+    if (g_state != 6) { return 1; }
+    return 0;
+}

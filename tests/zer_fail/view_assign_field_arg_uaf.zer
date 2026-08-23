@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-845 at the SECOND consumer: `h.p = head(b.s)` is a passthrough ASSIGN
+// (no separate IR_CALL), so it has its own copy of the param-view application.
+// It had the identical bare-ident restriction.
+[*]u8 head([*]u8 s) { return s[0..2]; }
+struct Box { [*]u8 s; }
+struct H { [*]u8 p; }
+u32 main() {
+    Box b;
+    b.s = alloc(u8, 4) orelse { return 1; };
+    H h;
+    h.p = head(b.s);
+    free(b.s);
+    return h.p[0];
+}

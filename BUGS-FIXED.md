@@ -5,6 +5,442 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23 — BUG-845..858: the call-RESULT view class, float→int UB, and four silent miscompiles
+
+An independent audit (not a branch harvest). Nine fixes across four classes; every
+one was reproduced on a from-HEAD build BEFORE it was written, and every new test
+was verified to flip against that build.
+
+### The class: "which allocation does a call RESULT view?"
+
+`FuncSummary.returns_param_color` answers one question — *the result of this call is
+a view of argument N, so it must inherit that argument's allocation rather than being
+registered as a new one*. It was wrong in four independent ways, and a SLICE-typed
+result makes every one of them silent: a slice is not "pointer-ish", so when the
+answer is lost the fallback registers **nothing at all** and there is no leak
+diagnostic to notice.
+
+### BUG-845 — the two consumers resolved the aliased argument with `kind == NODE_IDENT`
+
+```zer
+[*]u8 head([*]u8 s) { return s[0..2]; }
+struct Box { [*]u8 s; }
+Box b;  b.s = alloc(u8, 4) orelse { return 1; };
+[*]u8 h = head(b.s);   free(b.s);   return h[0];      // ACCEPTED, ASan heap-UAF
+```
+
+`head(s)` — the same program with a bare-ident argument — is correctly rejected. Every
+other argument FORM (a struct field, an array element, a subslice, a launder cast, an
+`orelse`) fell through to "register a fresh allocation". Both consumer sites had the
+restriction independently: the `IR_CALL` application and the passthrough-ASSIGN mirror
+that handles `h.p = head(b.s)` (which emits no separate `IR_CALL`).
+
+This is the sibling the 2026-06-06 GAP-A fix closed for `frees_param` — that path
+already re-resolves its argument with `ir_extract_compound_key`, four hundred lines
+away — and left open here.
+
+Fixed with ONE query, `ir_view_arg_handle`, used at both sites: peel `orelse`, the
+launder casts, `&` and slice expressions (all of which FORM a reference into the
+argument's allocation), then key the remainder with `ir_extract_compound_key` so a
+stored `[*]T`/`*T` field resolves to its own compound handle rather than the
+container's.
+
+### BUG-846 — the inference searched only the RETURN's own basic block
+
+```zer
+[*]u8 head([*]u8 s) { [*]u8 v = s[0..2]; if (v.len > 1) { return v; } return v; }
+```
+
+The view is computed in `bb0` and reaches the returns through the `%v = COPY %t` that
+every named binding lowers to. The arm-(c) scan looked for a defining instruction in
+the RETURN's block only and did not follow COPY, so nothing was inferred.
+
+The code's own comment claimed this "falls back to mixed, which over-rejects rather
+than under-rejects". It does the **opposite**: an unset param color makes the CALL
+SITE treat the result as unrelated memory. Fixed with `ir_local_def_expr` — whole
+function, follows COPY chains, requires a UNIQUE definition when it has to leave the
+RETURN's own block (several definitions cannot be ordered without dominance info).
+
+### BUG-847 — `return null` vetoed the inference; and the leak false-positive it hid
+
+`?*T f(*T p) { if (c) { return p; } return null; }` is the canonical optional-view
+shape. The null arm aliases nothing, but it was neither classified nor skipped, so it
+poisoned the whole inference — and the caller then reported
+
+    handle 'mm' allocated at line 4 but never freed
+
+for a call that allocates nothing. A null return is now CLASSIFIED (contributes no
+param bit, vetoes nothing).
+
+With the four fixes above in place, the leak false-positive on a **proven param view**
+was also removed (a relaxation). `docs/limitations.md` had kept it deliberately —
+"it incidentally catches the through-call interior-pointer UAF" — and that reason is
+now obsolete: BUG-845/846 catch that class properly, by aliasing at every argument
+form, so the false positive bought nothing. `*u32 field_of(*Node n){ return &n.val; }`
+called on a STACK struct now compiles.
+
+Soundness: `returns_param_color` is set only when every classified return is a view of
+the SAME param, and only when `returns_color` is UNKNOWN — a body proven to return a
+POOL/ARENA/MALLOC allocation never reaches the inference at all.
+
+### BUG-848 — `is_early_exit` blocks were skipped by all three return summaries
+
+```zer
+[*]u8 pick([*]u8 a, [*]u8 b, bool f) { if (f) { return b[0..1]; } return a[0..1]; }
+```
+
+`is_early_exit` is a LEAK-COVERAGE tag ("this path is not the canonical exit"). It says
+nothing about the returned VALUE, but the ARENA-color loop, the param-view loop and
+the `ret_is_content` loop all skipped such blocks. So the summary above claimed "views
+param 0", the call site aliased the result to `a`, and freeing `b` was invisible —
+ASan-confirmed heap-UAF — while a use after `free(a)` would have been a false positive.
+Wrong in both directions from one skip.
+
+### BUG-849 — the answer is a SET; one slot collapsed it to "unknown"
+
+Once BUG-848 stopped hiding half the returns, the disjunctive case became reachable and
+`returns_param_color` — a single slot — had nothing to say. It collapsed to unknown,
+which is the ACCEPT-UNSAFE direction.
+
+`FuncSummary` now carries `returns_param_mask` (bit n = some return views param n) plus
+`returns_all_views` (every return was classified as a param view, a view of static
+storage, or null — so no path can be a fresh allocation). The color stays the
+exactly-one-bit fast path, so every existing consumer is untouched.
+
+At the call site a multi-bit mask registers the result as a handle that OWNS nothing
+(`alloc_id` 0, `escaped`) and carries the candidate allocations. The use-site check
+PULLS the current state of each candidate rather than pushing at free time — there are
+eighteen direct `state = IR_HS_FREED` stores, and a push design has to reach every one
+of them, which is the multi-site shape that produced this class in the first place.
+The candidate array is bounded with an explicit `view_overflow` flag: an overflowed
+view is treated as "may view ANY tracked allocation", so truncation over-rejects rather
+than silently dropping a candidate.
+
+A view of STATIC storage (`return g_buf[0..1]`) is also classified now — it owns
+nothing and needs no tracking, but as an *unclassified* return it used to veto the
+whole inference and lose the param view of the other arm.
+
+Gate: `tools/sink_matrix.sh` grew a **p18** axis (78 → 88 cells), verified non-vacuous
+— 7 holes and 2 over-rejects against a from-HEAD pre-fix build, 0 after. Seven negatives
+in `tests/zer_fail/view_*`, four positives in `tests/zer/view_*`.
+
+### BUG-850 — seven intrinsics accepted any argument count
+
+Measured by compiling all 141 shipped intrinsics at arity 0..3 and grepping the emitted
+C. `@cstr()` and `@cstr(x)` were the loud ones: with nothing to build from, the emitter
+wrote a comment placeholder and `0` — a pointer-typed C expression that compiles, runs,
+and is always null. `@barrier` and its four siblings, `@trap`, `@ptrtoint`, `@offset`,
+`@container` and `@config` silently dropped their extras.
+
+Fixed by extending the BH-18 #14 arity table rather than hand-rolling a check in each
+handler. One subtlety, caught by testing rather than by reading: a NAMED struct type
+parses as an ordinary ident argument, not as `type_arg`, so `@offset(Dev, tag)` arrives
+as `{type_arg = NULL, args = [Dev, tag]}` while `@container(*Dev, p, f)` arrives with
+`type_arg` set. Demanding `type_arg` outright rejected every named-struct use.
+
+### BUG-851 — `free()` of a heap slice stored in an ARRAY ELEMENT was refused
+
+```zer
+Box[2] b;   b[0].s = alloc(u8, 4) orelse ...;   free(b[0].s);
+```
+
+The non-heap-free guard peeled every field/index step to the ROOT and asked "is the
+root a stack array?". For `b[0].s` the root `b` is an array, so a perfectly good heap
+slice was refused with "views non-heap memory" — while `free(b.s)`, the same thing
+without the index, was allowed because `b` is a struct.
+
+The provenance of a field whose own type is a SLICE comes from the value stored in it,
+which this check cannot see. The peel now stops there and allows, and keeps walking
+only through steps that navigate INTO inline storage (an ARRAY-typed field/element).
+That also closed the dual hole: `free(s.buf[0..])` on a local struct's inline array was
+silently ALLOWED, because the peel bottomed out at `s`, a struct rather than an array.
+
+### BUG-852 — a non-optional pointer MEMBER is null after auto-zero (NOT fixed — recorded)
+
+```zer
+struct S { *u32 p; }   S s;   return *s.p;         // accepted, null deref
+typedef u32 (*Op)(u32, u32);  Op[2] ops; ops[0](1,2);  // accepted, null call
+struct O { Op fn; }    O o;   o.fn(1, 2);              // accepted, null call
+```
+
+`*T` is non-null by construction, and the var-decl rule enforces it for a BARE `*u32 p;`
+— but it dispatches on the OUTERMOST type only, so every aggregate spelling walks past.
+On a hosted target this is a SIGSEGV; on bare metal address 0 is usually the vector
+table or the start of flash, so the read SUCCEEDS and returns garbage.
+
+The blanket fix — "an aggregate carrying a non-optional pointer member requires an
+initializer" — was implemented behind an env flag and MEASURED: **34 corpus files** are
+correct code that declares such a struct and fills it in field by field. So the blanket
+rule is wrong and was not shipped. Four reproducers are recorded in `tests/zer_gaps/`
+(where compile-clean IS the gap, so a future fix is LOUD) and the analysis is in
+`docs/limitations.md`.
+
+### BUG-853 — float → integer conversion was C undefined behaviour, at four sites
+
+```
+(u32)(-1.5)   ->  4294967295 at -O0,  0          at -O2
+(u32)1.0e20   ->  0          at -O0,  4294967295 at -O2
+```
+
+One emitted `.c`, one gcc, two answers: the conversion instruction and the constant
+folder disagree, and under C99 6.3.1.4p1 neither is wrong. ZER's contract is "no
+undefined behavior", and this violated it silently — no diagnostic, no fault, and both
+runs pass every gate in the tree.
+
+The conversion is now DEFINED as **saturating**, with NaN → 0 (the choice Rust made for
+`as`, and what LLVM's `fptosi.sat` does), via two preamble macros — a
+statement-expression form for function bodies and a pure-ternary form for global
+initializers, which must stay C constant expressions. Wired at all four emission sites:
+the C-style cast on the AST and IR paths, and `@truncate` / `@saturate` with a float
+source. `@saturate` also had the boundary bug on its own: `(double)U64_MAX` rounds UP to
+2^64 and it compared with a strict `>`, so the value AT the rounded bound fell through
+to the undefined cast.
+
+For a non-native `uN`/`iN` target the bounds are 2^N-1, not the carrier's, and the
+saturating macro is applied BEFORE the width mask — the carrier cast in that branch is
+itself the undefined operation.
+
+The regression test reads every source through a **volatile** global, and that is
+load-bearing: with a plain constant, GCC's folder happens to produce the saturating
+answers at -O2, so the test would PASS on a broken compiler under the -O2 the harness
+uses. Verified: exit 6 against a from-HEAD build, 0 after.
+
+New gate `tools/ub_sweep.sh` — compile the emitted C at -O0 and -O2 (optionally also
+without `-fno-strict-aliasing`) and compare stdout and exit status. Neither harness can
+see UB otherwise: a positive test asserts exit 0, a negative asserts a diagnostic, and
+UB produces a different ANSWER. Verified to fire on the pre-fix witness and clean after.
+Not in `make check` (two to four gcc invocations per program); `make check-ub-sweep`.
+
+### BUG-854 — an uninitialized local had NO range, so a provable index stayed guarded
+
+```zer
+u32 i = 0;  if (c) { i = 1; } else { i = 2; }  a[i]   // check ELIDED
+u32 i;      if (c) { i = 1; } else { i = 2; }  a[i]   // check EMITTED
+```
+
+Both spellings generate identical code — ZER auto-zeroes every variable — but only
+the first had a VRP entry to join into. With no entry the join has nothing to union
+and the post-join range is TOP, so the check survived on an index the compiler could
+prove. Pure payable over-guarding: a runtime branch bought nothing.
+
+Fixed by giving an initializer-less integer var-decl the range `[0, 0]`, which is what
+the generated code actually does. Two exclusions, both about the value not being 0 at
+that point: a `static` local keeps its value ACROSS calls, and a `volatile` may be
+written by an ISR or by hardware between the declaration and the use.
+
+This is a RELAXATION — the checker now elides checks it used to keep — so its soundness
+rests entirely on every WRITE form widening that range again. Nine write forms
+(assignment, compound assignment, `&i` into a callee, a loop body, a call result, a
+copy via another local, an if-capture, a store through a pointer, an inner block) are
+cells in the new matrix below, measured behaviourally: a missed widening is an ASan
+report, not a judgement call.
+
+### BUG-857/858 — three builtins whose failure, or whose whole effect, was silent
+
+```zer
+Arena a;  a.over(buf);        // no-op: `a` keeps its zero value
+?*T p = a.alloc(T);           // null. Forever. Same signal as "out of memory".
+
+Barrier b;  @barrier_wait(b); // returns IMMEDIATELY, reporting success
+
+rb.push_checked(x);           // the one method whose job is reporting overflow,
+                              // with the report thrown away
+```
+
+`.over(...)` is a CONSTRUCTOR returning an Arena BY VALUE, so as a statement it builds
+into a discarded temp. **Five corpus tests were written that way and had been VACUOUS
+for their whole existence** — `*T v = m orelse return;` bails out with 0 on the first
+allocation, so a twenty-line arena test executed four lines and reported success.
+Measured by rewriting the `orelse return` to `orelse { return 9; }`: exit 9.
+
+A zeroed `Barrier` has `target == 0`, so the first waiter satisfies `count >= target`,
+broadcasts, and returns. A dead barrier that says "everyone arrived" is worse than one
+that hangs: the program runs on with none of the synchronisation it asked for.
+
+Two layers, because the two failure modes are different:
+
+- **BUG-857, compile time.** The ghost-handle rule ("`pool.alloc();` discards the
+  handle") generalised: a builtin whose RESULT *is* the operation may not be a bare
+  statement. Now covers `.over` (the arena is never built), `push_checked` (the
+  overflow report is discarded), `alloc_slice`, and a STRUCT receiver — the last two
+  were excluded by the old pool/slab-only type test, so `Task.alloc();` slipped.
+- **BUG-858, run time.** `_zer_arena_alloc` and `_zer_barrier_wait` now trap when the
+  object was never initialised. A compile-time rule cannot cover the global case
+  (`Arena scratch;` at file scope, assigned in `main`, is the corpus's normal idiom —
+  19 files), and returning null forever conflates a program bug with a runtime
+  condition. The barrier check runs BEFORE the lock, because a zeroed
+  `pthread_mutex_t` is only accidentally usable.
+
+The five vacuous tests are repaired in the same commit (`a = Arena.over(buf);`), and
+one of them — `rust_tests/gen_arena_003.zer`, a NEGATIVE — now rejects for the reason
+it was written to test (an arena-derived pointer stored to a global) instead of never
+reaching it.
+
+### BUG-856 — three emitter give-up branches wrote a comment where the call should be
+
+```zer
+struct Ops { *(u32) -> u32 fn; }
+typedef *Ops OpsPtr;
+OpsPtr[2] arr;  arr[0] = &a;
+u32 r = arr[0].fn(10);          // r == 10, not 15
+```
+
+emitted
+
+```c
+_zer_t4 = /* complex callee */(_zer_t3);
+```
+
+which is a valid C parenthesised expression. It compiles, it runs, and it CALLS
+NOTHING — the result is the argument. No diagnostic, no fault, a wrong answer.
+
+The three branches (`complex callee`, `complex index callee`, `unknown callee`) fire
+when the callee is not one of the shapes the IR call emitter special-cases. They looked
+unreachable — a previous audit measured 0/1170 corpus programs reaching them — and were
+one array-of-pointers away: the lowering treats a call through a STRUCT-typed receiver
+as a builtin (the `Task.new` sugar) and skips argument decomposition, so a plain
+`o.inner.fn(x)` never gets there; make the receiver a `*Ops` held in an array and it
+does.
+
+The callee is an ordinary expression in every one of those shapes, so the fix is to
+emit it — `emit_rewritten_node` on the callee, which is exactly what the index branch
+already did for a complex INDEX. The one remaining branch that has nothing to emit from
+(an `IR_CALL` with no callee expression at all) now aborts loudly: that would be a
+lowering bug, and emitting something that compiles is what hid it.
+
+Gate: `tools/emit_audit.sh` swept **five** files before — enough for the 2026-04-18 stub
+that fired on every module emission, not for a branch that needs one specific callee
+shape. It now sweeps **1087 programs** (every `tests/zer`, `rust_tests/rt_*` and
+`zig_tests/zt_*`, emission only, ~40s) and carries a fingerprint for all ten
+comment-instead-of-code emissions the emitter still contains. Verified: it reports the
+placeholder against a from-HEAD build and is clean after. That sweep also establishes
+that none of the other nine fingerprints is reachable from the current corpus.
+
+### BUG-855 — a read wrapped in ANY intrinsic hid a non-atomic read-modify-write
+
+```zer
+interrupt TIMER { g += 1; }                        // rejected
+interrupt TIMER { g = g + 1; }                     // rejected
+interrupt TIMER { g = (u32)(g) + 1; }              // rejected
+interrupt TIMER { g = @truncate(u32, g) + 1; }     // ACCEPTED
+interrupt TIMER { g = @bswap32(g); }               // ACCEPTED
+interrupt TIMER { g = @popcount(g); }              // ACCEPTED
+interrupt TIMER { g = idfn(g); }                   // ACCEPTED
+```
+
+Same operation, seven spellings, and the last four compiled clean at BOTH sinks (ISR
+and spawn). On the target the lost update is silent — the handler reads, main writes,
+the handler writes back, and the intervening store is gone.
+
+The predicate behind the rule existed twice, as two near-identical partial if-chains
+(`expr_mentions_name` for a parameter, `expr_mentions_global` for a global), each
+listing seven node kinds and each carrying the comment *"partial by design: unlisted
+kinds yield no, never a new rejection"*. That reasoning is inverted for this question:
+answering "no" means NOT flagging an RMW that IS one, so an unlisted kind is an
+accept-unsafe under-rejection, not a safe over-rejection. `NODE_INTRINSIC`,
+`NODE_CALL`, `NODE_ORELSE`, `NODE_SLICE` and `NODE_STRUCT_INIT` were all unlisted.
+
+Fixed by unifying the two into ONE no-default exhaustive switch, so `-Werror=switch`
+forces a decision for every new NodeKind and the walker-field audit sees the arms. All
+three sinks already funnelled through `assign_reads_own_target`, so one walker was the
+whole fix. The boundary holds: `g = 1` and `g = other + 1` are plain stores and stay
+accepted, including in their intrinsic and call forms.
+
+Gate: the RMW FORM grid in `tests/test_hw_matrix.c` grew three spellings at both sites
+(30 → 36 cells). Verified non-vacuous — 6 false negatives against a from-HEAD build
+(three forms × two sinks), 0 after.
+
+### The VRP range-JOIN gate that CLAUDE.md has been asking for
+
+`tools/vrp_join_matrix.sh` (`make check-vrp-join`, and in `make check`) — 31 cells.
+The multi-site table has carried "VRP range JOIN — NO auto-gate, checklist every
+control-flow kind" since the class was named, after BH-18 #2 and nine more leaks in the
+2026-08-01 sweep, every one found by a red team.
+
+It measures in BOTH directions, deliberately. `guarded` cells run under
+AddressSanitizer: an elided check on a reachable value is an OOB report, so the gate
+cannot be fooled by a guard that is emitted but wrong. `elided` cells assert the
+emitted C has NO check for an index the range CAN prove — without them, a compiler that
+simply guarded everything would score a perfect run and the gate would be measuring
+nothing. That half is also what caught BUG-854: fifteen control-flow kinds were already
+clean, and the one mismatch was on the precision side.
+
+### The self-cancelling vacuous test, and a sweep for the rest of them
+
+The five arena tests exposed a THIRD form of vacuous test, alongside the weak oracle and
+the unexecuted directory that CLAUDE.md already names: **a positive whose own early-exit
+path returns the success code.** `*T v = m orelse return;` in a `u32 main()` returns 0,
+and 0 is "pass" — so a failed allocation and a successful run are indistinguishable to
+the harness.
+
+Swept the whole positive corpus for it mechanically: rewrite every bare
+`orelse return;` to `orelse { return 90; }` in a copy and run. 73 files use the bare
+form, 40 of them inside `main`, and exactly **2** actually take the bail-out path:
+
+- `tests/zer/global_ptr_roundtrip_ok.zer` — INTENTIONAL and asserted (`s2` exists to
+  prove a null-reset global takes the orelse path; its 0 is checked by the caller).
+- `tests/zer/ring_buffer.zer` — genuinely self-cancelling. Its last section "tested"
+  `push_checked` on a full ring with `... orelse return;`, followed by a comment that
+  could not decide whether it should succeed or fail. Now measured and asserted:
+  overflow reported on a full ring, success once a slot is freed.
+
+The sweep is the useful artefact — one `sed` and a run tells you which positives can
+bail out silently.
+
+**The semantic fuzzer had the same hole, and the BUG-858 trap is what exposed it.**
+`gen_safe_arena_chain` declared `Arena arN;` with no backing store, so every allocation
+returned null, the `mb orelse return;` bailed out with 0, and the whole arena-chain
+family had been exercising the wrapper chain's TYPE checking while never allocating a
+byte. Eighteen of two hundred fuzz cases "started failing" the moment an uninitialised
+arena began trapping — which is the shape to recognise: when a family fails right after
+an allocator becomes strict, check whether it was ever allocating before assuming a
+regression. Generator fixed (real backing store, and a distinct bail-out code so a
+future vacuity is loud), and the hazard is written at the top of the `gen_safe_*` block
+because sixteen other generators use the same bare `orelse return;`.
+
+### An arena relaxation that was ATTEMPTED and REVERTED (worth the record)
+
+Rewriting `super_freelist_arena.zer` so it actually ran surfaced a second thing: ZER
+refuses to store an arena pointer into another ARENA allocation, so an intrusive list or
+freelist — the arena's own idiom — cannot be written. It cannot dangle (`reset()`
+invalidates every arena-colored handle, so the container dies with the pointee), so the
+exemption looked obvious.
+
+It was implemented and **opened a hole on the first negative it was run against**: a store
+into a `*Holder` the CALLER owns was accepted. The reason is the useful part —
+`Symbol.is_from_arena` is already set on a pointer PARAM at the moment the check runs, by
+the very store being checked:
+
+    [arena] line=15 tgt=holder glob=0 param=1 ad=0 fa=1
+
+`holder` is plain caller-owned storage and carries `is_from_arena = 1`. The narrower
+`is_arena_derived` is not polluted but is not set for allocations from a GLOBAL arena
+either, so it exempts nothing useful. Neither flag answers the question, which is
+provenance ("does the destination's storage live inside an arena"), not a taint bit —
+and zercheck_ir already has that as `source_color == ZC_COLOR_ARENA`.
+
+Reverted, with the negative that caught it shipped as a lock
+(`tests/zer_fail/arena_ptr_into_caller_struct.zer`) and the analysis in
+`docs/limitations.md` so the next attempt does not repeat it. This is the relaxation
+discipline working as intended: the negative matrix, not the reasoning, is what said no.
+
+### Also this session
+
+- `tools/audit_reference_examples.sh` + `make check-reference-examples`, wired into
+  `make check`: every whole-program ```zer block in `docs/reference.md` must compile.
+  `docs/reference.md` is the only reference a ZER user has — there is no ZER on the
+  web — so an example that does not compile teaches a syntax the compiler rejects. It
+  found two on its first run (one deliberate error example needing a directive, one
+  two-file module example) and reports its fragment count so the untested share is
+  visible rather than drifting.
+- `docs/reference.md` gained a SYSTEM AND CPU INTRINSICS section: ~100 shipped
+  intrinsics (`@cpu_*`, `@mmu_*`, `@tlb_*`, `@cache_*`, `@port_*`, `@nt_store`,
+  `@wait_on_address`, the fence family, `@config`) were implemented and mentioned
+  NOWHERE in the reference. Signatures and return types were MEASURED by probing the
+  compiler, not recalled, and every example in the section compiles and runs.
+
+---
+
 ## Session 2026-08-22d — BUG-839..844: §D, six silent miscompiles
 
 From `claude/vigilant-tesla-pjtawx`, `-4z36e0` and `-pmytnl`. Each produces a WRONG

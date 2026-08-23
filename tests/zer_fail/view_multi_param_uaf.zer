@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-849: the return may view EITHER param. `returns_param_color` is one slot,
+// so this collapsed to "unknown" — and an unknown-provenance SLICE result is not
+// registered at all, so `free(a); h[0]` compiled clean. The summary now carries
+// the param SET and the result handle carries the candidate allocations.
+[*]u8 pick([*]u8 a, [*]u8 b, bool f) { if (f) { return a[0..1]; } return b[0..1]; }
+u32 main() {
+    [*]u8 s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 t = alloc(u8, 4) orelse { return 2; };
+    [*]u8 h = pick(s, t, true);
+    free(s);
+    u32 r = h[0];
+    free(t);
+    return r;
+}

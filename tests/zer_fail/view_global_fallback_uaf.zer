@@ -1,0 +1,13 @@
+// expect-error: use after free
+// BUG-849: one return is a view of a param, the other a view of a GLOBAL array.
+// A view of static storage owns nothing and needs no tracking, but as an
+// UNCLASSIFIED return it vetoed the whole inference — losing the param view and
+// accepting the use after the param's allocation was freed.
+u8[8] g_buf;
+[*]u8 pick([*]u8 a, bool f) { if (f) { return a[0..1]; } return g_buf[0..1]; }
+u32 main() {
+    [*]u8 s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 h = pick(s, true);
+    free(s);
+    return h[0];
+}

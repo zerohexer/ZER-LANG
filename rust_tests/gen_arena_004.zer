@@ -6,7 +6,7 @@ Arena ar;
 u8[1024] mem;
 
 u32 main() {
-    ar.over(mem);
+    ar = Arena.over(mem);
 
     ?[*]Vec3 mverts = ar.alloc_slice(Vec3, 4);
     [*]Vec3 verts = mverts orelse return;

@@ -30,7 +30,7 @@ u32 process_reading(Reading r) {
 }
 
 u32 main() {
-    scratch.over(backing);
+    scratch = Arena.over(backing);
 
     ?*Sensor ms1 = heap.alloc_ptr();
     *Sensor s1 = ms1 orelse return;

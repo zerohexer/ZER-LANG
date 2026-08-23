@@ -33,9 +33,30 @@ PATTERNS=(
     "/\\* stub \\*/"
     "/\\* placeholder \\*/"
     "/\\* TODO:[^*]*\\*/[^a-zA-Z\"]"   # bare TODO with no following code
+    # BUG-856 (2026-08-23): the emitter's GIVE-UP branches. Each writes a
+    # comment where the code should be and then continues with the operands, so
+    # the result is a valid C parenthesised/comma expression: it compiles, it
+    # runs, and it does NOTHING. `arr[0].fn(10)` emitted `t4 = (t3);` — the call
+    # never happened and the result was the argument. No diagnostic, no fault,
+    # a wrong answer. These fingerprints are what that looks like in the output.
+    "/\\* complex callee \\*/"
+    "/\\* complex index callee \\*/"
+    "/\\* unknown callee \\*/"
+    "/\\* unhandled expr "
+    "/\\* unknown slice \\*/"
+    "/\\* unknown len \\*/"
+    "/\\* struct/union compare unsupported \\*/"
+    "/\\* handle auto-deref no alloc \\*/"
+    "/\\* ERROR: no allocator"
+    "— missing args \\*/"
 )
 
-# Sample multi-module tests — representative of the module emission path.
+# The module-emission path (multi-file, the original 2026-04-18 defect), plus
+# EVERY positive ZER program. Sampling five files was enough for a stub that
+# fired on every module emission; it is not enough for a give-up branch that
+# needs one specific callee shape to reach it, which is how BUG-856 sat
+# unreachable-looking for months while being one array-of-pointers away.
+# Emission only — no gcc — so the whole corpus costs about twenty seconds.
 SAMPLES=(
     "test_modules/main.zer"
     "test_modules/defer_user.zer"
@@ -43,6 +64,9 @@ SAMPLES=(
     "test_modules/handle_user.zer"
     "test_modules/diamond.zer"
 )
+for f in tests/zer/*.zer rust_tests/rt_*.zer zig_tests/zt_*.zer; do
+    [ -e "$f" ] && SAMPLES+=("$f")
+done
 
 FOUND=0
 TMP=$(mktemp /tmp/emit_audit.XXXXXX.c)
@@ -52,7 +76,7 @@ for sample in "${SAMPLES[@]}"; do
     if [ ! -f "$sample" ]; then
         continue   # test file may not exist in some checkouts
     fi
-    if ! "$ZERC" "$sample" --emit-c -o "$TMP" 2>/dev/null; then
+    if ! "$ZERC" "$sample" --emit-c -o "$TMP" >/dev/null 2>&1; then
         continue   # compile error; probably a negative test
     fi
     for pattern in "${PATTERNS[@]}"; do
@@ -65,7 +89,7 @@ for sample in "${SAMPLES[@]}"; do
 done
 
 if [ $FOUND -eq 0 ]; then
-    echo "OK — no dead-stub markers in emitted C across ${#SAMPLES[@]} samples."
+    echo "OK — no dead-stub markers in emitted C across ${#SAMPLES[@]} programs."
     exit 0
 else
     echo ""

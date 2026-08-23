@@ -1,0 +1,8 @@
+// expect-error: @offset expects 2 arguments
+// BUG-850: @offset accepted any arity; with one argument the emitted C reached
+// GCC as `offsetof(T)` and the error was reported against the emitted line.
+struct Dev { u32 id; u32 tag; }
+u32 main() {
+    if (@offset(Dev) != 4) { return 1; }
+    return 0;
+}

@@ -1,0 +1,19 @@
+// expect-error: builds an Arena and RETURNS it
+// BUG-857: `.over(...)` is a CONSTRUCTOR returning an Arena BY VALUE. Written as
+// a statement the result goes into a discarded temp, `a` keeps its auto-zero
+// {0}, and every later `a.alloc(T)` returns null FOREVER — the same signal as
+// "out of memory", so the program reads as merely full and runs on.
+//
+// Five corpus tests were written this way and had been VACUOUS for their whole
+// existence: `*T v = m orelse return;` bailed out with 0 on the very first
+// allocation, so a 20-line test executed four lines and reported success.
+struct Vec2 { u32 x; u32 y; }
+
+u32 main() {
+    u8[256] backing;
+    Arena scratch;
+    scratch.over(backing);
+    ?*Vec2 mv = scratch.alloc(Vec2);
+    if (mv) { return 0; }
+    return 1;
+}

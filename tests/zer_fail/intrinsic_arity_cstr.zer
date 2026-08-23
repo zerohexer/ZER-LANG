@@ -1,0 +1,10 @@
+// expect-error: @cstr expects 2 arguments
+// BUG-850: @cstr accepted ANY argument count. At arity 0 or 1 the emitter had
+// nothing to build from and emitted a comment placeholder plus `0` — a
+// pointer-typed C expression that compiles, runs, and is always null.
+u32 main() {
+    u8[16] buf;
+    *u8 p = @cstr(buf);
+    if (@ptrtoint(p) == 0) { return 1; }
+    return 0;
+}

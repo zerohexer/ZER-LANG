@@ -1,0 +1,65 @@
+// BUG-853: float -> integer conversion is UNDEFINED in C when the truncated
+// value is not representable (C99 6.3.1.4p1), and GCC exploits it: from ONE
+// emitted .c on ONE compiler, `(u32)(-1.5)` gave 4294967295 at -O0 and 0 at -O2,
+// and `(u32)1.0e20` gave 0 at -O0 and 4294967295 at -O2 — the hardware
+// instruction and the constant folder disagree, and neither is wrong under the
+// standard. ZER's contract is "no undefined behavior", so the conversion is now
+// DEFINED as SATURATING with NaN -> 0, at all four emission sites (C-style cast
+// on the AST and IR paths, plus @truncate and @saturate with a float source).
+//
+// EVERY source below is read through a `volatile` global. That is deliberate
+// and load-bearing: with a plain constant, GCC's folder happens to produce the
+// saturating answers at -O2, so the test would PASS on a broken compiler under
+// the -O2 the harness uses. A volatile read forces the real conversion
+// instruction, which is what actually ships.
+volatile f64 v_neg;
+volatile f64 v_big;
+volatile f64 v_nbig;
+volatile f64 v_huge;
+volatile f64 v_frac;
+volatile f32 v_f32;
+
+u32 main() {
+    v_frac = 3.75;
+    if ((u32)v_frac != 3) { return 1; }
+    v_frac = -3.75;
+    if ((i32)v_frac != -3) { return 2; }
+    v_f32 = 250.9;
+    if ((u8)v_f32 != 250) { return 3; }
+    v_frac = 255.0;
+    if ((u8)v_frac != 255) { return 4; }
+    v_frac = 0.0;
+    if ((u32)v_frac != 0) { return 5; }
+
+    v_neg = -1.5;
+    if ((u32)v_neg != 0) { return 6; }
+    if ((u8)v_neg != 0) { return 7; }
+
+    v_big = 1.0e20;
+    if ((u32)v_big != 4294967295) { return 8; }
+    if ((i32)v_big != 2147483647) { return 9; }
+    if ((u8)v_big != 255) { return 10; }
+
+    v_nbig = -1.0e20;
+    if ((i32)v_nbig != -2147483648) { return 11; }
+    if ((i8)v_nbig != -128) { return 12; }
+    if ((u32)v_nbig != 0) { return 13; }
+
+    // The rounded-bound case: (double)U64_MAX rounds UP to 2^64, so a strict
+    // `>` comparison would let the value AT the bound fall through to the
+    // undefined cast. @saturate had exactly that bug.
+    v_huge = 1.0e30;
+    if ((u64)v_huge != 18446744073709551615) { return 14; }
+    if ((i64)v_huge != 9223372036854775807) { return 15; }
+
+    // @truncate and @saturate agree with the cast.
+    if (@truncate(u32, v_big) != 4294967295) { return 16; }
+    if (@truncate(u32, v_neg) != 0) { return 17; }
+    if (@saturate(u32, v_big) != 4294967295) { return 18; }
+    if (@saturate(i32, v_nbig) != -2147483648) { return 19; }
+
+    // Arbitrary-width target: bounds are 2^N-1, not the carrier's.
+    u3 small = @truncate(u3, v_big);
+    if (small != 7) { return 20; }
+    return 0;
+}

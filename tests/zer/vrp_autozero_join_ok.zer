@@ -1,0 +1,31 @@
+// BUG-854 (precision): a var-decl with NO initializer is auto-zeroed, so its
+// range at the declaration is exactly [0, 0]. It used to carry no range entry
+// at all — which is TOP — and the difference showed one line later: with
+// `u32 i = 0;` the join of the two arms is [1, 2] and the bounds check is
+// elided; with `u32 i;` there was nothing to join into and the check survived.
+// Both spellings generate identical code, so the guard was pure cost.
+//
+// This file is a behaviour lock, not the discriminator: a precision change
+// cannot show up in an exit code, so this test passes on a compiler without the
+// fix too. What flips is the emitted C — one `>= 4u` guard before, none after —
+// and the cells that assert it are `e_both_arms` / `z_join_both` in
+// tools/vrp_join_matrix.sh. The soundness half of the same change (every write
+// form must widen that [0,0] range again) is the `z_*` block of that matrix,
+// measured behaviourally under AddressSanitizer.
+volatile u32 sel;
+
+u32 main() {
+    u8[4] a;
+    u32 i;
+    sel = 1;
+    if (sel == 0) { i = 1; } else { i = 2; }
+    a[i] = 7;
+    if (a[2] != 7) { return 1; }
+
+    // and the range must still WIDEN when the value is not provable
+    u32 j;
+    sel = 100;
+    j = sel;
+    if (j < 4) { a[j] = 1; }
+    return 0;
+}

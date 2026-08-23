@@ -1026,6 +1026,92 @@ static bool type_is_nonnative_intn(Type *t) {
 }
 
 /* emit a C type name for a ZER type */
+/* BUG-853: the [LO, HI] bounds of an integer target, as C constant expressions,
+ * for the saturating float->integer conversion. Returns false when `t` is not an
+ * integer target (so the caller emits a plain C cast). Handles the native widths,
+ * `usize` (target-configurable), and the arbitrary-width uN/iN family, whose
+ * bounds are 2^N-1 / -2^(N-1) .. 2^(N-1)-1 rather than a carrier's. */
+static bool int_target_bounds(Type *t, char *lo, size_t lo_sz, char *hi, size_t hi_sz) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(u);
+    bool is_signed;
+    int bits;
+    if (k == TYPE_U8)        { is_signed = false; bits = 8; }
+    else if (k == TYPE_U16)  { is_signed = false; bits = 16; }
+    else if (k == TYPE_U32)  { is_signed = false; bits = 32; }
+    else if (k == TYPE_U64)  { is_signed = false; bits = 64; }
+    else if (k == TYPE_USIZE){ is_signed = false; bits = zer_target_ptr_bits; }
+    else if (k == TYPE_I8)   { is_signed = true;  bits = 8; }
+    else if (k == TYPE_I16)  { is_signed = true;  bits = 16; }
+    else if (k == TYPE_I32)  { is_signed = true;  bits = 32; }
+    else if (k == TYPE_I64)  { is_signed = true;  bits = 64; }
+    else if (k == TYPE_UINT) { is_signed = false; bits = type_width(u); }
+    else if (k == TYPE_SINT) { is_signed = true;  bits = type_width(u); }
+    else return false;
+    if (bits <= 0) return false;
+    if (bits > 64) {
+        /* 128-bit: the bound has no plain integer literal, but it is still an
+         * exact C constant expression, and `(double)` of it is exact (2^128 /
+         * 2^127). Written through the UNSIGNED type because `(__int128)1 << 127`
+         * shifts into the sign bit, which is undefined in its own right. */
+        if (bits != 128) return false;
+        int nh, nl;
+        if (is_signed) {
+            nh = snprintf(hi, hi_sz, "((__int128)(((unsigned __int128)1 << 127) - 1))");
+            nl = snprintf(lo, lo_sz, "(-((__int128)(((unsigned __int128)1 << 127) - 1)) - 1)");
+        } else {
+            nh = snprintf(hi, hi_sz, "((unsigned __int128)-1)");
+            nl = snprintf(lo, lo_sz, "((unsigned __int128)0)");
+        }
+        /* A TRUNCATED bound would emit syntactically broken C, so refuse rather
+         * than emit half a constant; the caller then falls back to a plain cast. */
+        if (nh < 0 || (size_t)nh >= hi_sz || nl < 0 || (size_t)nl >= lo_sz) return false;
+        return true;
+    }
+    if (is_signed) {
+        /* -2^(bits-1) written as (-max - 1) so the literal itself never
+         * overflows the way a bare -9223372036854775808 does in C. */
+        unsigned long long mx = (bits == 64)
+            ? 0x7FFFFFFFFFFFFFFFULL
+            : ((1ULL << (bits - 1)) - 1ULL);
+        snprintf(hi, hi_sz, "%lluLL", mx);
+        snprintf(lo, lo_sz, "(-%lluLL - 1)", mx);
+    } else {
+        unsigned long long mx = (bits == 64)
+            ? 0xFFFFFFFFFFFFFFFFULL
+            : ((1ULL << bits) - 1ULL);
+        snprintf(hi, hi_sz, "%lluULL", mx);
+        snprintf(lo, lo_sz, "0ULL");
+    }
+    return true;
+}
+
+/* True when a conversion from `src` to `tgt` is the C-undefined float->integer
+ * one and therefore needs the saturating macro. */
+static bool needs_f2i_guard(Type *tgt, Type *src) {
+    if (!tgt || !src) return false;
+    Type *se = type_unwrap_distinct(src);
+    if (!se || !type_is_float(se)) return false;
+    char lo[96], hi[96];
+    return int_target_bounds(tgt, lo, sizeof lo, hi, sizeof hi);
+}
+
+/* Emit the `_zer_f2i(TY, LO, HI, ` prefix for a float->integer conversion.
+ * Returns true when it fired, in which case the caller emits the source
+ * expression and then a closing `)`. `single_eval` picks the statement-
+ * expression form; pass false ONLY where the context must remain a C constant
+ * expression (a global initializer) AND the operand is side-effect-free. */
+static bool emit_f2i_open(Emitter *e, Type *tgt, Type *src, bool single_eval) {
+    if (!needs_f2i_guard(tgt, src)) return false;
+    char lo[96], hi[96];
+    if (!int_target_bounds(tgt, lo, sizeof lo, hi, sizeof hi)) return false;
+    emit(e, "%s(", single_eval ? "_zer_f2i" : "_zer_f2ik");
+    emit_type(e, tgt);
+    emit(e, ", %s, %s, ", lo, hi);
+    return true;
+}
+
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
 
@@ -3124,6 +3210,18 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "((uint8_t)!!(");
             emit_expr(e, node->typecast.expr);
             emit(e, "))");
+        } else if (needs_f2i_guard(tgt, src)) {
+            /* BUG-853 site 1 of 4 (AST cast path — also serves GLOBAL
+             * initializers, which must stay C constant expressions, hence the
+             * ternary spelling when the operand is side-effect-free). */
+            char lo[96], hi[96];
+            int_target_bounds(tgt, lo, sizeof lo, hi, sizeof hi);
+            bool pure = !expr_has_side_effects(node->typecast.expr);
+            emit(e, "%s(", pure ? "_zer_f2ik" : "_zer_f2i");
+            emit_type(e, tgt);
+            emit(e, ", %s, %s, ", lo, hi);
+            emit_expr(e, node->typecast.expr);
+            emit(e, ")");
         } else {
             /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
             emit(e, "((");
@@ -3413,7 +3511,18 @@ static void emit_expr(Emitter *e, Node *node) {
              * 5), so mask the result here — covers INLINE uses (comparisons,
              * call args), not just stores. */
             Type *tt = node->intrinsic.type_arg ? resolve_tynode(e,node->intrinsic.type_arg) : NULL;
-            if (type_is_nonnative_intn(tt)) {
+            /* BUG-853 site 3 of 4: @truncate with a FLOAT source is the same
+             * C-undefined conversion as a cast, spelled differently. Checked
+             * BEFORE the non-native uN branch: that branch's plain carrier cast
+             * is itself the undefined operation, and the saturating macro
+             * already lands inside [0, 2^N-1], so no extra mask is needed. */
+            if (node->intrinsic.arg_count > 0 &&
+                emit_f2i_open(e, tt,
+                    checker_get_type(e->checker, node->intrinsic.args[0]),
+                    !expr_has_side_effects(node->intrinsic.args[0]))) {
+                emit_expr(e, node->intrinsic.args[0]);
+                emit(e, ")");
+            } else if (type_is_nonnative_intn(tt)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -3435,6 +3544,20 @@ static void emit_expr(Emitter *e, Node *node) {
             /* @saturate(T, val) → clamp val to T's min/max range */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
+                /* BUG-853: a FLOAT source is exactly the saturating float->int
+                 * conversion, and the hand-rolled clamp below gets the 64-bit
+                 * boundary wrong — it compares against the double-rounded max
+                 * (2^64 for u64, 2^63 for i64) with a STRICT `>`, so the value
+                 * AT the rounded bound falls through to a plain C cast, which is
+                 * the undefined case. Route it through the one macro instead. */
+                if (node->intrinsic.arg_count > 0 &&
+                    emit_f2i_open(e, t,
+                        checker_get_type(e->checker, node->intrinsic.args[0]),
+                        !expr_has_side_effects(node->intrinsic.args[0]))) {
+                    emit_expr(e, node->intrinsic.args[0]);
+                    emit(e, ")");
+                    break;
+                }
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
@@ -5605,6 +5728,15 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    b->target = n;\n");
     emit(e, "}\n");
     emit(e, "static inline void _zer_barrier_wait(_zer_barrier *b) {\n");
+    /* BUG-858: a Barrier that was never @barrier_init'd is all zeroes, so
+     * `target == 0` and the very first waiter satisfies `count >= target` —
+     * it broadcasts and returns IMMEDIATELY, reporting success. A dead barrier
+     * that says "everyone arrived" is worse than one that hangs: the program
+     * runs on with none of the synchronisation it asked for. Checked BEFORE the
+     * lock, because a zeroed pthread_mutex_t is only accidentally usable. */
+    emit(e, "    if (b->target == 0)\n");
+    emit(e, "        _zer_trap(\"barrier waited on before @barrier_init\", "
+            "__FILE__, __LINE__);\n");
     emit(e, "    pthread_mutex_lock(&b->mtx);\n");
     emit(e, "    uint32_t gen = b->generation;\n");
     emit(e, "    b->count++;\n");
@@ -5744,6 +5876,35 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
             "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
+    /* BUG-853: float -> integer conversion.
+     *
+     * C leaves it UNDEFINED when the truncated value is not representable in
+     * the target type (C99 6.3.1.4p1), and GCC exploits that: from ONE emitted
+     * .c on ONE compiler, `(u32)(-1.5)` yields 4294967295 at -O0 and 0 at -O2,
+     * and `(u32)1.0e20` yields 0 at -O0 and 4294967295 at -O2 — the runtime
+     * instruction and the constant folder disagree, and neither is wrong under
+     * the standard. ZER's contract is "no undefined behavior", so the
+     * conversion is DEFINED here as SATURATING, with NaN mapping to 0 (the same
+     * choice Rust made for `as`, and what LLVM's fptosi.sat does).
+     *
+     * The bound tests are done in `double`, which is exact for every f32 input
+     * and for every bound below 2^53; above that the bound rounds UP to the
+     * next representable double (2^63 for i64 max, 2^64 for u64 max) and the
+     * `>=` comparison then saturates exactly the values that would have been
+     * undefined. The `<=` side is exact for all targets.
+     *
+     * Two spellings because a GLOBAL initializer must be a C constant
+     * expression, which a statement-expression is not: _zer_f2i single-evaluates
+     * (function bodies), _zer_f2ik is a pure ternary for constant contexts and
+     * is only used where the operand is side-effect-free. */
+    emit(e, "#define _zer_f2i(TY, LO, HI, X) ({ double _zf = (double)(X); "
+            "(TY)((_zf != _zf) ? (TY)0 : (_zf <= (double)(LO)) ? (TY)(LO) : "
+            "(_zf >= (double)(HI)) ? (TY)(HI) : (TY)_zf); })\n");
+    emit(e, "#define _zer_f2ik(TY, LO, HI, X) "
+            "((TY)(((double)(X) != (double)(X)) ? (TY)0 : "
+            "((double)(X) <= (double)(LO)) ? (TY)(LO) : "
+            "((double)(X) >= (double)(HI)) ? (TY)(HI) : (TY)(double)(X)))\n\n");
+
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
     emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "
             "const char *file, int line) {\n");
@@ -5814,6 +5975,16 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { uint8_t *buf; size_t capacity; size_t offset; } _zer_arena;\n\n");
 
     emit(e, "static inline void *_zer_arena_alloc(_zer_arena *a, size_t size, size_t align) {\n");
+    /* BUG-858: an Arena that was never given a backing store is all zeroes, and
+     * `off + size > 0` then makes every allocation return null FOREVER — the
+     * same signal as "out of memory", so the program reads as merely full and
+     * runs on. That is the difference between a runtime condition and a program
+     * bug, and it was silent. `Arena a; a.over(buf);` produces exactly this (the
+     * constructor result is discarded — now a compile error, BUG-857), as does
+     * simply forgetting `a = Arena.over(buf);` on a global. Trap instead. */
+    emit(e, "    if (a->buf == (uint8_t*)0 || a->capacity == 0)\n");
+    emit(e, "        _zer_trap(\"arena used before its backing store was set — "
+            "write 'Arena a = Arena.over(buf);'\", __FILE__, __LINE__);\n");
     /* BUG-839: BOTH additions here could wrap, and a wrap makes the capacity test
      * PASS for a request that does not fit — the same defeat-the-guard shape as the
      * un-guarded multiply at the call site. Check each before using it. */
@@ -7687,7 +7858,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             /* @truncate(T, val) → (T)(val). Non-native uN/iN: mask the result
              * (IR-path twin of the emit_expr site) — covers inline uses. */
             Type *tt = node->intrinsic.type_arg ? resolve_tynode(e, node->intrinsic.type_arg) : NULL;
-            if (type_is_nonnative_intn(tt)) {
+            /* BUG-853 site 4 of 4: the IR twin — same ordering rule. */
+            if (node->intrinsic.arg_count > 0 &&
+                emit_f2i_open(e, tt,
+                    checker_get_type(e->checker, node->intrinsic.args[0]), true)) {
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit(e, ")");
+            } else if (type_is_nonnative_intn(tt)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -7709,6 +7886,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             /* @saturate(T, val) → clamp to T range */
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
+                /* BUG-853: IR twin of the float-source route (see the AST site). */
+                if (node->intrinsic.arg_count > 0 &&
+                    emit_f2i_open(e, t,
+                        checker_get_type(e->checker, node->intrinsic.args[0]), true)) {
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    emit(e, ")");
+                    return;
+                }
                 int tmp = e->temp_count++;
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
@@ -10640,7 +10825,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              (int)callee->field.field_name_len, callee->field.field_name);
                     }
                 } else {
-                    emit(e, "/* complex callee */(");
+                    /* BUG-856: this used to emit the literal comment plus `(`,
+                     * which is a VALID C parenthesised expression — it compiles,
+                     * runs, and CALLS NOTHING. `arr[0].fn(10)` (arr an array of
+                     * `*Ops`) became `t4 = (t3);`, so the result was the
+                     * ARGUMENT. No diagnostic, no fault, a wrong answer.
+                     * The callee is an ordinary expression; emit it. */
+                    emit_rewritten_node(e, callee, func);
+                    emit(e, "(");
                 }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
@@ -10693,10 +10885,27 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     }
                     emit(e, "](");
                 } else {
-                    emit(e, "/* complex index callee */(");
+                    /* BUG-856, same class: an indexed callee whose base is not a
+                     * bare ident (`table[i].ops[j](x)`). */
+                    emit_rewritten_node(e, idx_callee, func);
+                    emit(e, "(");
                 }
+            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+                       inst->expr->call.callee) {
+                /* BUG-856: any other callee shape — emit it rather than a
+                 * comment. Every remaining form is a plain expression. */
+                emit_rewritten_node(e, inst->expr->call.callee, func);
+                emit(e, "(");
             } else {
-                emit(e, "/* unknown callee */(");
+                /* Nothing to emit a callee FROM. Previously this produced a
+                 * comment-placeholder followed by the parenthesised arguments —
+                 * a comma expression that silently evaluated to its last
+                 * argument, calling nothing. Fail loudly instead:
+                 * a call with no callee expression is a lowering bug, and
+                 * emitting something that compiles hides it. */
+                fprintf(stderr, "zerc: internal error: IR_CALL with no callee "
+                                "expression at line %d\n", inst->source_line);
+                abort();
             }
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");
@@ -12323,6 +12532,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "((uint8_t)!!(");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "))");
+            }
+            /* BUG-853 site 2 of 4 (IR cast path — every function body). */
+            else if (inst->src1_local >= 0 && needs_f2i_guard(tgt, src_type)) {
+                char lo[96], hi[96];
+                int_target_bounds(tgt, lo, sizeof lo, hi, sizeof hi);
+                emit(e, "_zer_f2i(");
+                emit_type(e, tgt);
+                emit(e, ", %s, %s, ", lo, hi);
+                emit_local_name(e, func, inst->src1_local);
+                emit(e, ")");
             }
             /* Simple C cast */
             else if (inst->src1_local >= 0) {

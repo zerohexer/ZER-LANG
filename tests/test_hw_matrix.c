@@ -304,6 +304,12 @@ static const char *vshape_flags(VShape s) {
  * ------------------------------------------------------------------------- */
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               /* BUG-855 (2026-08-23): the "does the value read its own target"
+                * walker was a partial if-chain over seven node kinds, so a read
+                * wrapped in ANY intrinsic or handed to a call was invisible.
+                * `g = @truncate(u32,g) + 1` compiled clean while `g = g + 1`
+                * one line away was rejected. */
+               RFORM_INTRINSIC_WRAP, RFORM_INTRINSIC_ONLY, RFORM_CALL_ARG,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -313,6 +319,9 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_INTRINSIC_WRAP:  return "g=@truncate(g)+1";
+    case RFORM_INTRINSIC_ONLY:  return "g=@bswap32(g)";
+    case RFORM_CALL_ARG:        return "g=idfn(g)";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -327,6 +336,9 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    case RFORM_INTRINSIC_WRAP: *helper = "";                                    *body = "g = @truncate(u32, g) + 1;"; break;
+    case RFORM_INTRINSIC_ONLY: *helper = "";                                    *body = "g = @bswap32(g);"; break;
+    case RFORM_CALL_ARG:       *helper = "u32 idfn(u32 v){ return v; }";        *body = "g = idfn(g);";   break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

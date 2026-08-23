@@ -86,6 +86,22 @@ typedef struct {
     bool *maybe_frees_param_field;
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
     int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
+    /* BUG-849 (2026-08-23): the SET of params the return may be a view of.
+     * bit n set = some return path hands back a view of param n. This is the
+     * honest shape of the question `returns_param_color` asks with one slot;
+     * the color stays the exact-single-param fast path (every existing consumer
+     * keeps working), and the mask carries the disjunctive case that used to
+     * collapse to "unknown" — which is the ACCEPT-UNSAFE direction, because an
+     * unknown-provenance pointer result is registered as an unrelated fresh
+     * allocation and a slice result is not registered at all.
+     * 0 when nothing was proven. Only meaningful together with
+     * `returns_all_views`. */
+    uint32_t returns_param_mask;
+    /* Every non-early-exit, non-fallback return was CLASSIFIED as a view of a
+     * param, a view of static storage (`&global`), or a null literal — i.e. no
+     * return path can be a fresh allocation. False = at least one return could
+     * not be classified, so no view claim may be made at all. */
+    bool returns_all_views;
     /* PART 6 (erased-ref ownership, 2026-07-16): the function's body makes NO
      * pointer/opaque/handle-returning CALL, so any pointer it RETURNS is a
      * borrow of caller/global memory, never a fresh allocation (every alloc

@@ -1,0 +1,18 @@
+// expect-error: performs a non-atomic read-modify-write
+// BUG-855 at the SPAWN sink (the mirror of the ISR one — this project's
+// recurring defect is fixing a form at one site and leaving the other): handing
+// the target to a CALL is still a read of it, so `g = idfn(g)` is the same
+// non-atomic read-modify-write as `g += 1`.
+volatile u32 g_count;
+
+u32 idfn(u32 v) { return v; }
+
+void worker() {
+    g_count = idfn(g_count);
+}
+
+u32 main() {
+    spawn worker();
+    u32 x = g_count;
+    return x & 1;
+}

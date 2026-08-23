@@ -1,119 +1,137 @@
-// Real program: Freelist allocator built on Arena
-// *opaque round-trips through function boundary (clears provenance),
-// ?*T linked list, defer cleanup
-// Tests: cast safety, interior pointer concepts, arena + linked list
-
-struct FreeNode {
-    ?*FreeNode next;
-}
+// Real program: index-based freelist allocator built on Arena
+// *opaque round-trips through a function boundary (clears provenance),
+// arena allocation, defer cleanup
+// Tests: cast safety, interior pointer concepts, arena + freelist
+//
+// TWO THINGS WERE WRONG WITH THIS FILE UNTIL 2026-08-23, and the second was
+// hidden by the first.
+//
+// 1. `Arena backing;` never got a backing store, so every `alloc()` returned
+//    null and the very first `mb1 orelse return;` bailed out with 0 — which is
+//    the PASS code. This 120-line "real program" executed four lines and
+//    reported success for its whole existence (CLAUDE.md "VACUOUS TESTS", the
+//    self-cancelling form). BUG-858 made an uninitialised arena trap, which is
+//    how it surfaced. Every bail-out below now carries a distinct code.
+//
+// 2. Once it actually ran, it TRAPPED: the freelist was built by punning a
+//    `*Block` into a `*FreeNode` through `*opaque`, and ZER's runtime type-id
+//    check refuses exactly that — reusing one struct's storage as an unrelated
+//    struct is the type confusion the check exists to prevent. The program was
+//    written against a design the language rejects, and nobody found out
+//    because it never executed.
+//
+// The freelist is INDEX-based now: the blocks live in a local table and the
+// free list is a chain of indices through a sentinel. That needs no punning,
+// and it also sidesteps the arena->arena pointer link, which ZER currently
+// over-rejects (docs/limitations.md, "storing an arena pointer into another
+// arena allocation"). The `*opaque` round-trip is still exercised, on the SAME
+// type, which is the pattern that is actually legal.
 
 struct Block {
+    u32 next;          // index of the next free block, or NIL
     u32 data_a;
     u32 data_b;
     u32 data_c;
     u32 data_d;
 }
 
+typedef *Block BlockPtr;
+
+u8[1024] arena_store;
 Arena backing;
 
-// Helper: cast *opaque to *Block — function boundary clears provenance
+// Helper: *opaque round-trip — the function boundary clears provenance, so the
+// cast back is checked against the runtime type id rather than a tracked one.
 *Block opaque_to_block(*opaque raw) {
     return (*Block)raw;
 }
 
-*FreeNode opaque_to_freenode(*opaque raw) {
-    return (*FreeNode)raw;
-}
-
 u32 main() {
-    ?*FreeNode free_head = null;
+    backing = Arena.over(arena_store);
+
+    const u32 NIL = 999;
+    u32 free_head = NIL;
     u32 alloc_count = 0;
     u32 free_count = 0;
 
-    // === Allocate 4 blocks from arena ===
+    // === Allocate 4 blocks from the arena into a local table ===
     ?*Block mb1 = backing.alloc(Block);
-    *Block b1 = mb1 orelse return;
-    b1.data_a = 10;
-    b1.data_b = 20;
-    alloc_count += 1;
-
+    *Block b1 = mb1 orelse { return 90; };
     ?*Block mb2 = backing.alloc(Block);
-    *Block b2 = mb2 orelse return;
-    b2.data_a = 30;
-    b2.data_b = 40;
-    alloc_count += 1;
-
+    *Block b2 = mb2 orelse { return 91; };
     ?*Block mb3 = backing.alloc(Block);
-    *Block b3 = mb3 orelse return;
-    b3.data_a = 50;
-    alloc_count += 1;
-
+    *Block b3 = mb3 orelse { return 92; };
     ?*Block mb4 = backing.alloc(Block);
-    *Block b4 = mb4 orelse return;
-    b4.data_a = 60;
-    alloc_count += 1;
+    *Block b4 = mb4 orelse { return 93; };
+
+    BlockPtr[4] slot;
+    slot[0] = b1;
+    slot[1] = b2;
+    slot[2] = b3;
+    slot[3] = b4;
+
+    for (u32 i = 0; i < 4; i += 1) {
+        slot[i].next = NIL;
+        alloc_count += 1;
+    }
+    slot[0].data_a = 10;
+    slot[0].data_b = 20;
+    slot[1].data_a = 30;
+    slot[1].data_b = 40;
+    slot[2].data_a = 50;
+    slot[3].data_a = 60;
 
     if (alloc_count != 4) { return 1; }
-    if (b1.data_a != 10) { return 2; }
-    if (b2.data_b != 40) { return 3; }
+    if (slot[0].data_a != 10) { return 2; }
+    if (slot[1].data_b != 40) { return 3; }
 
-    // === "Free" b2 — add to freelist via *opaque type-pun ===
-    {
-        *opaque raw = (*opaque)b2;
-        *FreeNode node = opaque_to_freenode(raw);
-        node.next = free_head;
-        free_head = node;
-        free_count += 1;
-    }
+    // === "Free" blocks 1 and 2 — push their INDEX onto the free list ===
+    slot[1].next = free_head;
+    free_head = 1;
+    free_count += 1;
 
-    // === "Free" b3 ===
-    {
-        *opaque raw = (*opaque)b3;
-        *FreeNode node = opaque_to_freenode(raw);
-        node.next = free_head;
-        free_head = node;
-        free_count += 1;
-    }
+    slot[2].next = free_head;
+    free_head = 2;
+    free_count += 1;
 
     if (free_count != 2) { return 4; }
 
-    // === Re-allocate from freelist ===
-    *Block b5 = b1; // placeholder
-    if (free_head) |node| {
-        free_head = node.next;
-        *opaque raw = (*opaque)node;
-        b5 = opaque_to_block(raw);
-        b5.data_a = 0;
-        b5.data_b = 0;
-        b5.data_c = 0;
-        b5.data_d = 0;
-        alloc_count += 1;
-    }
+    // === Re-allocate from the freelist, through a *opaque round-trip ===
+    if (free_head == NIL) { return 12; }
+    u32 idx5 = free_head;
+    free_head = slot[idx5].next;
+    *opaque raw5 = (*opaque)slot[idx5];
+    *Block b5 = opaque_to_block(raw5);
+    b5.next = NIL;
+    b5.data_a = 0;
+    b5.data_b = 0;
+    b5.data_c = 0;
+    b5.data_d = 0;
+    alloc_count += 1;
 
-    // Verify recycled block is zeroed
     if (b5.data_a != 0) { return 5; }
     b5.data_a = 70;
 
-    // Second re-alloc from freelist
-    *Block b6 = b1; // placeholder
-    if (free_head) |node| {
-        free_head = node.next;
-        *opaque raw = (*opaque)node;
-        b6 = opaque_to_block(raw);
-        b6.data_a = 0;
-        alloc_count += 1;
-    }
+    // Second re-alloc from the freelist
+    if (free_head == NIL) { return 13; }
+    u32 idx6 = free_head;
+    free_head = slot[idx6].next;
+    *opaque raw6 = (*opaque)slot[idx6];
+    *Block b6 = opaque_to_block(raw6);
+    b6.next = NIL;
+    b6.data_a = 0;
+    alloc_count += 1;
     b6.data_a = 80;
 
     if (alloc_count != 6) { return 7; }
+    if (free_head != NIL) { return 14; }
 
     // === Verify all blocks ===
-    if (b1.data_a != 10) { return 8; }
-    if (b4.data_a != 60) { return 9; }
+    if (slot[0].data_a != 10) { return 8; }
+    if (slot[3].data_a != 60) { return 9; }
     if (b5.data_a != 70) { return 10; }
     if (b6.data_a != 80) { return 11; }
 
-    // Arena reset frees all memory
     defer backing.reset();
     return 0;
 }

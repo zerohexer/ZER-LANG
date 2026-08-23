@@ -1,0 +1,41 @@
+// BUG-856: the IR call emitter had three give-up branches that wrote a comment
+// placeholder followed by the parenthesised arguments. That is a VALID C
+// parenthesised/comma expression: it compiles, it runs, and it CALLS NOTHING —
+// the result is just the last argument. `arr[0].fn(10)` below emitted
+// `t4 = (t3);`, so `r` was 10 instead of 15, with no diagnostic and no fault.
+//
+// The callee is an ordinary expression in every one of those shapes, so the fix
+// is to emit it. The one branch that has nothing to emit from (a call with no
+// callee expression at all) now aborts loudly — that would be a lowering bug,
+// and emitting something that compiles is what hid it.
+u32 add5(u32 x) { return x + 5; }
+u32 dbl(u32 x) { return x * 2; }
+
+struct Ops { *(u32) -> u32 fn; }
+typedef *Ops OpsPtr;
+struct Table { OpsPtr[2] slot; }
+
+u32 main() {
+    Ops a;
+    Ops b;
+    a.fn = add5;
+    b.fn = dbl;
+
+    // callee is a FIELD whose object is an INDEX, not a bare ident
+    OpsPtr[2] arr;
+    arr[0] = &a;
+    arr[1] = &b;
+    if (arr[0].fn(10) != 15) { return 1; }
+    if (arr[1].fn(10) != 20) { return 2; }
+
+    u32 i = 1;
+    if (arr[i].fn(3) != 6) { return 3; }
+
+    // callee is a FIELD whose object is a FIELD of an INDEX
+    Table t;
+    t.slot[0] = &a;
+    t.slot[1] = &b;
+    if (t.slot[0].fn(1) != 6) { return 4; }
+    if (t.slot[1].fn(4) != 8) { return 5; }
+    return 0;
+}

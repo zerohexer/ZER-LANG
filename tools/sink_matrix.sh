@@ -237,6 +237,41 @@ cell p17_safe_arg_global   compile 'u32 gx17=1; *u32 id17b(*u32 p){return p;} vo
 cell p17_safe_arg_static   compile 'u32 gs17=2; *u32 pick17(*u32 p){return &gs17;} void c(){ u32 x=5; g_p=pick17(@ptrcast(*u32,&x)); } u32 main(){c();return 0;}'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p18 (BUG-845/846/848/849): "which allocation does a call RESULT view?"
+# p17 asks whether an ARGUMENT is frame-bound. This row asks the dual question
+# at the same sink — the callee returns a VIEW of one of its arguments, so the
+# RESULT must inherit that argument's allocation. Four independent ways the
+# answer was lost, each an ASan-confirmed heap-use-after-free:
+#   arg FORM      — the two consumers resolved the aliased argument with a bare
+#                   `kind == NODE_IDENT` test, so a field / subslice / launder
+#                   argument registered a FRESH allocation instead (BUG-845).
+#   def LOCALITY  — the inference searched only the RETURN's own block and did
+#                   not follow the COPY a named binding lowers to (BUG-846).
+#   BLOCK TAG     — is_early_exit blocks were skipped by the return summaries,
+#                   which answers a leak-coverage question, not a return-value
+#                   one (BUG-848).
+#   ARITY         — the answer is a SET; one slot collapsed a disjunctive view
+#                   to "unknown", and an unknown SLICE result is not tracked at
+#                   all (BUG-849).
+# A SLICE result makes these silent: it is not "pointer-ish", so the fallback
+# registers nothing and there is no leak diagnostic to notice.
+echo "===== SHAPE p18 = a call RESULT that VIEWS an argument ====="
+cell p18_res_arg_field     reject '[*]u8 hd18([*]u8 s){return s[0..2];} struct B18{[*]u8 s;} u32 main(){ B18 b; b.s=alloc(u8,4) orelse {return 1;}; [*]u8 h=hd18(b.s); free(b.s); return h[0]; }'
+cell p18_res_arg_subslice  reject '[*]u8 hd18([*]u8 s){return s[0..2];} u32 main(){ [*]u8 s=alloc(u8,4) orelse {return 1;}; [*]u8 h=hd18(s[0..4]); free(s); return h[0]; }'
+cell p18_res_assign_field  reject '[*]u8 hd18([*]u8 s){return s[0..2];} struct B18{[*]u8 s;} struct H18{[*]u8 p;} u32 main(){ B18 b; b.s=alloc(u8,4) orelse {return 1;}; H18 h; h.p=hd18(b.s); free(b.s); return h.p[0]; }'
+cell p18_res_crossblock    reject '[*]u8 hd18([*]u8 s){ [*]u8 v=s[0..2]; if (v.len>1) { return v; } return v; } u32 main(){ [*]u8 s=alloc(u8,4) orelse {return 1;}; [*]u8 h=hd18(s); free(s); return h[0]; }'
+cell p18_res_early_exit    reject '[*]u8 pk18([*]u8 a,[*]u8 b,bool f){ if (f) { return b[0..1]; } return a[0..1]; } u32 main(){ [*]u8 s=alloc(u8,4) orelse {return 1;}; [*]u8 t=alloc(u8,4) orelse {return 2;}; [*]u8 h=pk18(s,t,true); free(t); u32 r=h[0]; free(s); return r; }'
+cell p18_res_multi_param   reject '[*]u8 pk18([*]u8 a,[*]u8 b,bool f){ if (f) { return a[0..1]; } return b[0..1]; } u32 main(){ [*]u8 s=alloc(u8,4) orelse {return 1;}; [*]u8 t=alloc(u8,4) orelse {return 2;}; [*]u8 h=pk18(s,t,true); free(s); u32 r=h[0]; free(t); return r; }'
+cell p18_res_global_arm    reject 'u8[8] gb18; [*]u8 pk18([*]u8 a,bool f){ if (f) { return a[0..1]; } return gb18[0..1]; } u32 main(){ [*]u8 s=alloc(u8,4) orelse {return 1;}; [*]u8 h=pk18(s,true); free(s); return h[0]; }'
+# BOUNDARY: a view is NOT an allocation. Reading it before the backing store is
+# freed is correct code, and the result must never be leak-checked as if the
+# caller owned it (the BUG-847 relaxation).
+cell p18_safe_use_then_free compile '[*]u8 hd18b([*]u8 s){return s[0..2];} u32 main(){ [*]u8 s=alloc(u8,4) orelse {return 1;}; s[0]=5; [*]u8 h=hd18b(s); u32 r=h[0]; free(s); if (r!=5) { return 2; } return 0; }'
+cell p18_safe_stack_view    compile 'struct N18{u32 v;u32 w;} *u32 fo18(*N18 n){return &n.v;} u32 main(){ N18 nd; nd.v=7; *u32 p=fo18(&nd); if (*p != 7) { return 1; } return 0; }'
+cell p18_safe_null_arm      compile '?*u32 mb18(*u32 p,bool ok){ if (ok) { return p; } return null; } u32 main(){ u32 loc=3; ?*u32 m=mb18(&loc,true); if (m) |pp| { if (*pp != 3) { return 1; } } return 0; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

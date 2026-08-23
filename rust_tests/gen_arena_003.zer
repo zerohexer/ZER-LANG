@@ -7,7 +7,7 @@ u8[128] mem;
 *Box g_box;
 
 u32 main() {
-    ar.over(mem);
+    ar = Arena.over(mem);
     ?*Box mb = ar.alloc(Box);
     *Box b = mb orelse return;
     b.v = 5;

@@ -6,7 +6,7 @@ Arena scratch;
 u8[256] backing;
 
 u32 main() {
-    scratch.over(backing);
+    scratch = Arena.over(backing);
 
     ?*Vec2 mv = scratch.alloc(Vec2);
     *Vec2 v = mv orelse return;

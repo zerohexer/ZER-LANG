@@ -1,0 +1,8 @@
+// expect-error: @barrier expects 0 arguments
+// BUG-850: the fence family took no arguments but accepted and silently dropped
+// any that were passed, so a typo'd @barrier(x) looked like it did something.
+u32 main() {
+    u32 x = 1;
+    @barrier(x);
+    return x - 1;
+}

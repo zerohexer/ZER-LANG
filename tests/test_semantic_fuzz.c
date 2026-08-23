@@ -85,9 +85,25 @@ static void run_test(const char *name, const char *code, int expect_fail) {
 
 /* ---- Safe program generators ---- */
 
+/* HAZARD for every `gen_safe_*` below: a bare `orelse return;` inside a `u32`
+ * test function returns 0, and 0 is the PASS code the driver checks. So a
+ * generator whose allocator silently fails produces a program that bails out on
+ * its first line and reports success — it tests the TYPE checking of the shape
+ * and nothing else. That is exactly what `gen_safe_arena_chain` did until
+ * 2026-08-23 (its Arena had no backing store, so every alloc returned null).
+ * Prefer `orelse { return <distinct code>; }` in a new generator, and when a
+ * family suddenly starts failing after an allocator becomes strict, check
+ * whether it was ever allocating at all before assuming a regression. */
 static void gen_safe_arena_chain(char *buf, int depth) {
     char *p = buf;
     p += sprintf(p, "struct Block%d { u32 a; u32 b; }\n", depth);
+    /* BUG-858 (2026-08-23): this generator declared `Arena arN;` and never gave
+     * it a backing store, so every `alloc()` returned null, the `mb orelse
+     * return;` below bailed out with 0 — the PASS code — and the whole
+     * arena-chain family had been VACUOUS: it exercised the wrapper chain's
+     * TYPE-checking and never allocated a byte. An uninitialised arena now
+     * traps, which is how this surfaced. Give it real storage. */
+    p += sprintf(p, "u8[1024] arbk%d;\n", depth);
     p += sprintf(p, "Arena ar%d;\n", depth);
 
     /* Build wrapper chain */
@@ -102,8 +118,13 @@ static void gen_safe_arena_chain(char *buf, int depth) {
     }
 
     p += sprintf(p, "u32 test_arena_chain_%d() {\n", depth);
+    p += sprintf(p, "    ar%d = Arena.over(arbk%d);\n", depth, depth);
     p += sprintf(p, "    ?*Block%d mb = wrap%d_%d();\n", depth, depth, depth - 1);
-    p += sprintf(p, "    *Block%d b = mb orelse return;\n", depth);
+    /* A distinct bail-out code, not a bare `return`: in a u32 function a bare
+     * return yields 0, which IS the pass code, so a failed allocation and a
+     * successful run were indistinguishable to the harness (CLAUDE.md
+     * "VACUOUS TESTS", the self-cancelling form). */
+    p += sprintf(p, "    *Block%d b = mb orelse { return 7; };\n", depth);
     p += sprintf(p, "    b.a = %d;\n", depth * 10);
     p += sprintf(p, "    if (b.a != %d) { return 1; }\n", depth * 10);
     p += sprintf(p, "    defer ar%d.reset();\n", depth);

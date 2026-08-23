@@ -1,0 +1,11 @@
+// GAP (BUG-852, measured 2026-08-23): a NON-OPTIONAL pointer FIELD is auto-zeroed
+// to NULL and dereferenced. `*T` is non-null by construction — that is ZER's null
+// guarantee — and the var-decl rule enforces it for a BARE `*u32 p;`, but it
+// dispatches on the OUTERMOST type only, so every aggregate spelling walks past.
+// Hosted: SIGSEGV. Bare metal: address 0 is usually the vector table or the start
+// of flash, so the read SUCCEEDS and returns garbage — the silent case.
+struct S { *u32 p; }
+u32 main() {
+    S s;
+    return *s.p;
+}

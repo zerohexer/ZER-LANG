@@ -1,0 +1,7 @@
+// GAP (BUG-852): same hole at GLOBAL scope. The global non-null rule is the same
+// outermost-type dispatch as the local one.
+struct S { *u32 p; }
+S g_s;
+u32 main() {
+    return *g_s.p;
+}

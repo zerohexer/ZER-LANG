@@ -76,3 +76,13 @@ ir_lower.c:        Node *init_extra[16]; int init_extra_n = 0;
 # into the arena, because bailing out would yield "no key" and an untracked atomic
 # cell is a MISSED race, not a safe over-rejection.
 checker.c:    Node *fast[16];
+# BUG-849 (2026-08-23): the candidate allocations a param-VIEW call result may
+# alias. NOT a silent cap — the companion `view_overflow` flag records that the
+# set was truncated, and an overflowed view is then treated as "may view ANY
+# tracked allocation", so a use after any free is rejected. Truncation therefore
+# over-rejects, never under-rejects (a silently dropped candidate would be a
+# MISSED use-after-free). The bound is unreachable in practice: it needs one
+# return to be a view of nine or more DISTINCT tracked allocations. Lives inside
+# IRHandleInfo, which is memcpy-copied per CFG block, so a pointer field would
+# be shared across path-state copies.
+zercheck_ir.c:    int view_alloc_ids[8];

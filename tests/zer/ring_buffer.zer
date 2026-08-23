@@ -37,14 +37,22 @@ u32 main() {
     ?u32 empty = fifo.pop();
     if (empty) |val| { return 8; }
 
-    // push_checked on full ring
+    // push_checked on a full ring must REPORT the overflow.
+    //
+    // This section used to read `fifo.push_checked(99) orelse return;` followed
+    // by a comment that could not decide whether it should succeed or fail. In a
+    // `u32 main()` a bare `return` yields 0, which IS the pass code, so the
+    // section asserted NOTHING either way — the self-cancelling vacuous form
+    // (CLAUDE.md "VACUOUS TESTS"). Measured and asserted now: overflow on a full
+    // ring, success on a ring with room.
     for (u32 i = 0; i < 8; i += 1) {
         fifo.push(i);
     }
-    fifo.push_checked(99) orelse return;
-    // push_checked should fail on full ring — returns null
-    // We already pushed 8+1, the ring wraps so push_checked succeeds
-    // (ring overwrites on full). Test push_checked returns ?void with value.
+    ?void full = fifo.push_checked(99);
+    if (full) { return 9; }             // must NOT succeed — the ring is full
 
-    return 0;
+    v = fifo.pop() orelse { return 10; };
+    ?void room = fifo.push_checked(99);
+    if (room) { return 0; }             // must succeed — one slot freed
+    return 11;
 }

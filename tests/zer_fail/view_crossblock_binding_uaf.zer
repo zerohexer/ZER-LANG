@@ -1,0 +1,16 @@
+// expect-error: use after free
+// BUG-846: the view is bound to a NAME in an earlier block and returned from
+// two later blocks. The inference searched only the RETURN's own block and did
+// not follow the `%v = COPY %t` a binding lowers to, so no param view was
+// inferred and the caller treated the result as unrelated memory.
+[*]u8 head([*]u8 s) {
+    [*]u8 v = s[0..2];
+    if (v.len > 1) { return v; }
+    return v;
+}
+u32 main() {
+    [*]u8 s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 h = head(s);
+    free(s);
+    return h[0];
+}

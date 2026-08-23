@@ -363,6 +363,15 @@ those propagated a move-struct's TRANSFERRED state and broke `test_modules/move_
 steps are navigation within the same allocation and peel freely. `make check` caught this;
 reasoning about it did not.
 
+**A BLOCK TAG ANSWERS THE QUESTION IT WAS INVENTED FOR, AND NO OTHER.** `IRBlock.is_early_exit`
+means "this path is not the canonical exit" and exists so the LEAK check does not count it as
+coverage. Three separate RETURN-VALUE summaries also skipped those blocks, which asks a different
+question and gets a confidently wrong partial answer: `[*]u8 pick([*]u8 a,[*]u8 b,bool f){ if (f)
+{ return b[..]; } return a[..]; }` summarised as "views param 0", so freeing `b` went unnoticed
+(ASan heap-UAF) AND a use after freeing `a` would have been a false positive — wrong in both
+directions from one skip (BUG-848). Before reusing a flag in a new analysis, check what question it
+was defined to answer.
+
 **MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS — enumerate ALL sibling sites,
 never fix just the reported one, and gate the class so a new sibling can't silently
 regress.** The escape patchwork above is ONE instance of a GENERAL shape: the SAME
@@ -379,16 +388,19 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Multi-site class | The N sites | Completeness gate (what to run / add) |
 |---|---|---|
 | Escape / keep ("frame-bound?") | store-global, return, keep-call, keep-infer, struct-field-store, spawn-arg | `tools/sink_matrix.sh` — **ADD A CELL per new shape** (a shape with no cell is INVISIBLE; yd5ajq grew it 32→41). `make check-sink-matrix` |
-| VRP range JOIN (merge at a control-flow join) | NODE_IF (§C#13 ✅), switch-arm, for-body, while/do-while body, do-while first-iter, goto/label | mirror `vrp_snap_take/restore/join` per node-kind; a missing kind = silent OOB. NO auto-gate — checklist every control-flow kind |
+| VRP range JOIN (merge at a control-flow join) | NODE_IF, switch-arm, for/while/do-while body, orelse (value + block), if-capture, `@once`, defer body, goto (fwd + back), loop+break, call-result | mirror `vrp_snap_take/restore/join` per node-kind; a missing kind = silent OOB. **GATE EXISTS since 2026-08-23: `tools/vrp_join_matrix.sh`** (`make check-vrp-join`, in `make check`). `guarded` cells run under **ASan** so an elided check on a reachable value is an OOB report, not a judgement; `elided` cells assert the ranges it CAN prove are still elided — without that half, a compiler that guards everything scores perfectly and the gate measures nothing (that half is what found BUG-854). Add a cell when you add a control-flow kind |
 | Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
 | Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
+| **Call-RESULT view ("which allocation does this call's result view?")** | the `IR_CALL` param-view application, the passthrough-ASSIGN mirror (`h.p = f(x)`), and the THREE return-summary loops that compute the answer (arena color, param view, `ret_is_content`) | ONE query `ir_view_arg_handle` for the argument side + the **p18 axis in `tools/sink_matrix.sh`**. Was wrong FOUR ways at once (argument FORM, definition LOCALITY, an `is_early_exit` skip, and single-slot ARITY) — BUG-845/846/848/849. A SLICE result makes every one silent: it is not "pointer-ish", so the fallback registers NOTHING and there is no leak diagnostic to notice. **An unset `returns_param_color` is the ACCEPT-UNSAFE direction**, so a new bail-out in that loop is a soundness change |
+| **Undefined behaviour in the EMITTED C (no diagnostic, no fault, a different ANSWER)** | every emitter site that lowers a ZER operation to a C construct with a UB corner — float->int conversion had FOUR (AST cast, IR cast, `@truncate`, `@saturate`) | `tools/ub_sweep.sh` (`make check-ub-sweep`) — compile the emitted C at -O0 and -O2 and compare stdout AND exit status. Neither harness can see this class: a positive asserts exit 0, a negative asserts a diagnostic. **A regression test for it must launder its inputs through `volatile`** or GCC's constant folder answers correctly at -O2 and the test is vacuous |
 | **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
-| **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
+| **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling). **The "does the value read its own target" walker is ONE no-default exhaustive switch (BUG-855)** — it was two partial if-chains whose shared comment said "unlisted kinds yield no, never a new rejection", which is INVERTED for this question: "no" means not flagging an RMW that is one. `g = @truncate(u32,g)+1`, `@bswap32`, `@popcount` and a CALL argument were all accepted while `g = g + 1` was rejected |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **Emitter GIVE-UP branch (a comment where the code should be)** | every `emit(e, "/* … */ 0")` / `"/* … */("` — ten of them | `tools/emit_audit.sh` fingerprints, now swept over **1087 programs** rather than 5 samples. A give-up emission is VALID C — a parenthesised or comma expression that compiles, runs and does nothing — so no harness sees it. "0 of 1170 corpus programs reach it" is NOT the same as unreachable: BUG-856 was one array-of-pointers away, because a STRUCT-typed receiver is lowered as a builtin and never reaches the branch at all |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -1191,9 +1203,10 @@ When considering new features, apply the **primitives test**: if the use case ca
 |---|---|
 | Buffer overflow | Inline bounds check on every array/slice access; proven-safe indices skip check (range propagation); unsafe indices get auto-guard (silent if-return inserted) |
 | Use-after-free | Handle generation counter + ZER-CHECK (MAYBE_FREED + leak detection + loop pass + cross-function summaries) + Level 1-5 *opaque tracking (compile-time zercheck + poison-after-free + inline header + global malloc interception) |
-| Null dereference | `*T` non-null by default, `?T` requires unwrapping, local function pointer requires initializer |
+| Null dereference | `*T` non-null by default, `?T` requires unwrapping, local function pointer requires initializer. **Known hole (BUG-852, docs/limitations.md):** the rule dispatches on the OUTERMOST type, so a non-optional pointer/funcptr MEMBER of a struct, union or array is auto-zeroed to null and its deref/call is accepted. Reproducers in `tests/zer_gaps/nullfield_*` |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
+| Float → integer out of range | Saturates to the target's min/max, NaN → 0 (BUG-853). C leaves it undefined and GCC gives different answers at -O0 and -O2; ZER defines it at all four emission sites |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
 | Missing switch case | Exhaustive check for enums and bools |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
@@ -1209,7 +1222,8 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Comptime loop DoS | Nested comptime loops exceeding 1M total operations → compile error (global instruction budget). |
 | Move struct capture copy | `if (opt) \|k\|` value capture of move struct → compile error. Must use `\|*k\|` pointer capture. |
 | Async shared struct | Shared access in a statement CONTAINING yield/await → compile error (the lock would be held across the suspend). NOT a blanket ban on shared access inside an async fn: locking is PER-STATEMENT, so `x = g.v; yield;` releases before the suspend and is correctly ACCEPTED. Verified 2026-08-10 — the old wording overstated this and would have sent a session hunting a non-bug. |
-| Ghost handle (leaked alloc) | `pool.alloc()` / `slab.alloc()` as bare expression → compile error (handle discarded) |
+| Ghost handle (leaked alloc) | `pool.alloc()` / `slab.alloc()` / `alloc_slice` / `Task.alloc()` as a bare expression → compile error (handle discarded). Extended by BUG-857 to the two builtins whose result IS the operation: `a.over(buf);` as a statement (the arena is never built) and `rb.push_checked(x);` (the overflow report is discarded) |
+| Builtin used before initialisation | `_zer_arena_alloc` and `_zer_barrier_wait` TRAP when the object still holds its auto-zero value (BUG-858). Returning null forever, or reporting that every thread arrived, made a program bug indistinguishable from a runtime condition — and hid five VACUOUS corpus tests |
 | Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
 | Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error. Allocation coloring: arena wrappers (chained, type-punned) excluded via source_color + param color inference |
 | Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
@@ -1617,6 +1631,15 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.
 
+**Doc examples are compiled.** `tools/audit_reference_examples.sh` (in `make check`, and
+`make check-reference-examples`) compiles every whole-program ```zer block in
+`docs/reference.md`. `docs/reference.md` is the ONLY reference a ZER user has — there is no ZER on
+the web and no LLM has it in training data — so an example that does not compile teaches a syntax
+the compiler rejects, and the reader has no second source. Per-block directives:
+`// audit: skip <reason>` and `// audit: expect-error <substring>`. The script REPORTS its
+fragment count (blocks with no `main`, which it cannot compile) so the untested share stays visible
+instead of drifting.
+
 **Firmware examples (v0.3 feature coverage):**
 - `hello.zer` — MMIO, UART, enum, orelse, bounds check (v0.2)
 - `rtos.zer` — Pool, Ring, Arena, Handle, spawn, union, defer (v0.2)
@@ -1627,7 +1650,7 @@ All runners auto-detect positive vs negative tests. `make check` runs everything
 - `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
 - `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
 
-### VACUOUS TESTS — the #1 way this suite lies to you (both forms found 2026-08-03)
+### VACUOUS TESTS — the #1 way this suite lies to you (three forms; the third found 2026-08-23)
 
 **The name.** A test whose PASS CONDITION IS WEAKER THAN ITS CLAIM. Two forms, one root
 cause: *the verdict did not depend on the thing under test.* Both were live here, under
@@ -1637,6 +1660,13 @@ cause: *the verdict did not depend on the thing under test.* Both were live here
 |---|---|---|
 | **Weak oracle** — passes for the WRONG reason | negative test asserts only "compiler exited non-zero" | 476 negatives; diagnostic went to `/dev/null` |
 | **Unexecuted** — never runs at all | a test directory no runner globs | `tests/zer_gaps/`, 43 files, wired to NOTHING |
+| **Self-cancelling** — the test's OWN early-exit path returns the success code | `*T v = m orelse return;` in a `u32` function: a failed allocation returns 0, which IS "pass" | 5 arena tests; `x.over(buf);` never built the arena, so a 20-line test executed 4 lines and reported success for its whole existence |
+
+**The third form generalises past arenas: any `orelse return` inside a function whose
+success value is 0 turns a failure into a pass.** If a positive test can take its
+early-exit path and still exit 0, it is not testing what it says. Give the bail-out its
+own code — `orelse { return 9; }` — and the vacuity becomes visible immediately. That
+one rewrite is what exposed all five.
 
 **Why the weak-oracle form is structural here, not sloppiness.** ZER has MANY INDEPENDENT
 SAFETY RULES OVER THE SAME PROGRAMS. When N rules can reject one file, "exit != 0" tests

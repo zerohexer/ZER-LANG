@@ -349,9 +349,163 @@ zero behavior change), then Increment 1 (the consumer) — and TWO accept-unsafe
 negative tests, not by inspection (the orelse-hidden alloc, and the param-view UAF). Each drove the
 design to correctness. Never ship a relaxation on a green test suite alone; the negatives are the
 net. Tests: `tests/zer/erased_map_get_ok.zer` (positive), `tests/zer_fail/erased_wrapper_double_free.zer`
-+ `rust_tests/rt_drop_conflict_uaf.zer` (the guards). Residual (documented, NOT a regression): a
-param-view return still over-rejects with the leak false-positive — kept deliberately (it catches
-the through-call interior-pointer UAF). universal_pointer.md §36.17 has the full ledger.
++ `rust_tests/rt_drop_conflict_uaf.zer` (the guards). universal_pointer.md §36.17 has the full ledger.
+
+**Residual RESOLVED 2026-08-23 (BUG-845..849) — the paragraph above is superseded.** The
+"param-view return still over-rejects with a leak false-positive, kept deliberately because it
+catches the through-call interior-pointer UAF" reasoning no longer holds, and the bargain it
+described was worse than it looked: the leak error was catching that UAF only when the caller
+happened to bind the result to a local it never escaped, and it reported the WRONG defect while
+doing so. The through-call interior-pointer UAF is now caught PROPERLY — by aliasing the result to
+the argument's allocation — so the false positive was removed. See the section below for what was
+wrong and why the `returns_param_color` inference is the load-bearing part.
+
+## The call-RESULT view class — `returns_param_color` and its four failures (2026-08-23)
+
+One question: **which allocation does the RESULT of this call view?** It is answered from
+`FuncSummary.returns_param_color`, consumed at two sites, and it was wrong in four independent
+ways. Read this before touching call-result aliasing, the return summaries, or `is_early_exit`.
+
+**A SLICE result makes every failure SILENT.** The fresh-registration fallback (PART 6 path 2)
+only fires for a "pointer-ish" return — POINTER / OPAQUE / HANDLE. A `[*]T` is none of those, so
+when the view answer is lost for a slice-returning callee, NOTHING is registered: no alias, no
+handle, no leak diagnostic. `free(s); h[0]` then compiles clean. Every reproducer below is
+ASan-confirmed heap-use-after-free.
+
+| # | What was wrong | Shape that slipped |
+|---|---|---|
+| BUG-845 | both consumers resolved the aliased argument with a bare `arg->kind == NODE_IDENT` | `head(b.s)`, `head(s[0..3])`, `head(@ptrcast(…))`, `h.p = head(b.s)` |
+| BUG-846 | the inference searched the RETURN's OWN block and did not follow COPY | `[*]u8 v = s[0..2]; … return v;` (a NAMED binding) |
+| BUG-848 | all three return summaries skipped `is_early_exit` blocks | `if (f) { return b[..]; } return a[..];` — summary said "param 0" |
+| BUG-849 | the answer is a SET; one slot collapsed the disjunctive case to "unknown" | the same `pick`, once BUG-848 stopped hiding half of it |
+
+**The four rules that fall out, in order of how much they generalise:**
+
+1. **An unset `returns_param_color` is the UNSAFE direction, not the safe one.** The inference's
+   own comment claimed a failure to classify "falls back to mixed, which over-rejects rather than
+   under-rejects". It does the opposite: no param color means the call site treats the result as
+   unrelated memory (or, for a slice, does not track it at all). Any new bail-out in that loop is
+   an accept-unsafe change and must be justified as one.
+2. **`is_early_exit` is a LEAK-COVERAGE tag, not a statement about the returned value.** It marks
+   "this path is not the canonical exit" so the leak check does not count it as coverage. A
+   RETURN-VALUE summary that skips those blocks is answering a different question, and gets a
+   partial answer that is confidently wrong — here it produced a summary naming the WRONG param,
+   which is simultaneously a missed UAF on one argument and a false positive on the other. Three
+   loops had the skip; all three lost it.
+3. **Resolve an ARGUMENT with the same machinery a FREE argument gets.** The `frees_param` path had
+   already been widened (2026-06-06 GAP-A) to re-resolve `inst->args[pi]` with
+   `ir_extract_compound_key`; the view path four hundred lines away still tested for a bare ident.
+   The shared query is now `ir_view_arg_handle` — peel `orelse`, the launder casts, and the
+   reference-FORMING `&` / slice roots, then key the remainder. Do not re-inline it at a third site.
+4. **PULL a multi-view at the use site; do not PUSH it at the free.** There are eighteen direct
+   `state = IR_HS_FREED` stores in zercheck_ir.c. A design that has to update a view set at every
+   one of them is the multi-site shape that produced this class. `ir_check_ident_uaf` instead asks,
+   at the use, whether any allocation the handle may view has since become invalid. The view set
+   still has to ride along COPY/alias (`ir_snapshot_alias` / `ir_apply_alias`) — forgetting that is
+   how the first version silently did nothing, because `%h = COPY %tmp` is what every var-decl
+   lowers to.
+
+**The bound on the view set is a flag, not a cap.** `IRHandleInfo.view_alloc_ids[8]` plus
+`view_overflow`: an overflowed view is treated as "may view ANY tracked allocation", so truncation
+OVER-rejects. A silently dropped candidate would be a missed use-after-free, which is exactly what
+CLAUDE.md's Rule #7 exists to prevent.
+
+**Gate:** `tools/sink_matrix.sh` shape **p18** (10 cells). Verified non-vacuous against a from-HEAD
+pre-fix build: 7 holes + 2 over-rejects before, 0 after.
+
+## The silent-builtin class: a failure that reads as a runtime condition (2026-08-23)
+
+Three builtins reported nothing when they had done nothing (BUG-857/858). They are one
+class, and the class is worth naming because it is invisible to both harnesses:
+
+| shape | what happened | what it looked like |
+|---|---|---|
+| `Arena a; a.over(buf);` | `.over` RETURNS an Arena by value; as a statement the result goes into a discarded temp | every later `alloc()` returns null — indistinguishable from "out of memory" |
+| `Barrier b; @barrier_wait(b);` | a zeroed barrier has `target == 0`, so the first waiter satisfies `count >= target` | broadcast + return: "everyone arrived", instantly |
+| `rb.push_checked(x);` | the `?void` overflow report is discarded | the same as `rb.push(x)`, which is the deliberate drop-on-full form |
+
+**Why no test caught them.** A positive asserts exit 0 and a negative asserts a
+diagnostic. All three produce neither: they produce a program that runs and does less
+than it says. The arena case is the sharpest — **five corpus tests had been VACUOUS for
+their whole existence.** `*T v = m orelse return;` bails out with 0 on the first
+allocation, so a twenty-line arena test executed four lines and reported success. The
+way to prove it was to rewrite the `orelse return` to `orelse { return 9; }` and watch
+the exit code become 9. If a test's early-exit path is indistinguishable from its
+success path, the test cannot fail.
+
+**Two layers, and the split is the point.**
+
+- **Compile time** where the spelling itself is wrong. The ghost-handle rule
+  (`pool.alloc();` discards the handle) generalises to "a builtin whose RESULT *is* the
+  operation may not be a bare statement": `.over`, `push_checked`, `alloc_slice`, and a
+  STRUCT receiver (`Task.alloc();`, which the old pool/slab-only type test excluded).
+- **Run time** where it cannot. `Arena scratch;` at file scope with `scratch =
+  Arena.over(buf);` in `main` is the corpus's normal idiom — 19 files — so "declaration
+  must have an initializer" is not available. `_zer_arena_alloc` and
+  `_zer_barrier_wait` therefore trap when the object still holds its auto-zero value.
+  The barrier check runs BEFORE the lock: a zeroed `pthread_mutex_t` is only
+  accidentally usable.
+
+**The generalisable rule.** When a builtin's failure path returns the SAME value as one
+of its legitimate runtime outcomes, the failure is invisible. Null-for-"never
+initialised" and null-for-"full" are the same null; success-for-"target reached" and
+success-for-"target is zero" are the same success. Give the bug its own signal — a trap
+— and keep the runtime condition's signal for the runtime condition.
+
+## Float -> integer is DEFINED as saturating (2026-08-23, BUG-853)
+
+C leaves float->integer conversion UNDEFINED when the truncated value is not
+representable in the target (C99 6.3.1.4p1). ZER's contract is "no undefined behavior",
+so the emitter defines it: **saturate to the target's range, NaN maps to 0** — the same
+choice Rust made for `as` and what LLVM's `fptosi.sat` does.
+
+**The measurement that forced it.** From ONE emitted `.c`, on ONE gcc:
+
+    (u32)(-1.5)   ->  4294967295 at -O0,  0          at -O2
+    (u32)1.0e20   ->  0          at -O0,  4294967295 at -O2
+
+The runtime instruction (`cvttsd2si`, which produces the "integer indefinite" value)
+and the constant folder (arbitrary precision, then its own clamp) disagree, and under
+the standard neither is wrong. **Neither harness can see this**: a positive test asserts
+exit 0, a negative asserts a diagnostic, and UB produces a different ANSWER.
+
+**Two macros, because a GLOBAL initializer must stay a C constant expression.**
+`_zer_f2i` is a statement-expression (single-eval, function bodies); `_zer_f2ik` is a
+pure ternary used only where the operand is side-effect-free. The AST cast path serves
+both contexts and picks between them with `expr_has_side_effects`.
+
+**Four emission sites, all of them required** (the AST/IR dual-dispatch hazard in its
+usual form):
+
+| site | where |
+|---|---|
+| 1 | AST `NODE_TYPECAST`, simple-cast branch (also global initializers) |
+| 2 | `IR_CAST`, simple-cast branch (every function body) |
+| 3/4 | `@truncate` and `@saturate` with a FLOAT source, AST and IR twins each |
+
+**Three facts that are easy to get wrong:**
+
+- **The bound test is done in `double` and that is deliberate.** It is exact for every
+  f32 input and every bound below 2^53; above that the bound rounds UP (2^63 for i64
+  max, 2^64 for u64 max) and a `>=` comparison then saturates exactly the values that
+  would have been undefined. `@saturate` had this wrong on its own — it compared with a
+  strict `>`, so the value AT the rounded bound fell through to the undefined cast.
+- **A non-native `uN`/`iN` target has bounds 2^N-1, not its carrier's**, and the
+  saturating macro must run BEFORE the width mask: the plain carrier cast in the
+  non-native branch is itself the undefined operation. `int_target_bounds` handles
+  TYPE_UINT/TYPE_SINT from `type_width`, so the ordering is the whole fix.
+- **The regression test must launder every source through a `volatile` global.** With a
+  plain constant GCC's folder happens to produce the saturating answers at -O2, so the
+  test PASSES on a broken compiler under the -O2 the harness uses. Measured: with
+  volatile sources the pre-fix build exits 6, with constants it exits 0. This is the
+  same "verify the test discriminates" rule the merge-back methodology states, and this
+  class is where it bites hardest, because the compiler's own optimiser decides whether
+  your test is vacuous.
+
+**Gate:** `tools/ub_sweep.sh` (`make check-ub-sweep`) — compile the emitted C at -O0 and
+-O2 (optionally also without `-fno-strict-aliasing`) and compare stdout AND exit status.
+A disagreement is UB in the emitted code. NOT in `make check`: it is two to four gcc
+invocations per program. Run it after touching the emitter.
 
 ## The 2026-08-01/02 branch-harvest sweep — ALL 45 fixes, and WHY they existed (read before any safety work)
 

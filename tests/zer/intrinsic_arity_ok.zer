@@ -1,0 +1,25 @@
+// BUG-850 boundary: the correct spellings must keep working, including the
+// NAMED-struct path where the type arrives as an ordinary ident argument
+// (`@offset(Dev, tag)`) rather than as a parsed type argument
+// (`@container(*Dev, ...)`).
+struct Dev { u32 id; u32 tag; }
+
+u32 main() {
+    u8[16] buf;
+    const [*]u8 name = "hi";
+    *u8 cn = @cstr(buf, name);
+    if (buf[0] != 104) { return 1; }
+    if (@ptrtoint(cn) == 0) { return 5; }
+    if (@offset(Dev, tag) != 4) { return 2; }
+    Dev d;
+    d.id = 1;
+    d.tag = 2;
+    *u32 fp = &d.tag;
+    *Dev back = @container(*Dev, fp, tag);
+    if (back.id != 1) { return 3; }
+    @barrier();
+    @barrier_load();
+    @barrier_store();
+    if (@ptrtoint(fp) == 0) { return 4; }
+    return 0;
+}

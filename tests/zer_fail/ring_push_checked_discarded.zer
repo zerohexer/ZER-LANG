@@ -1,0 +1,13 @@
+// expect-error: discarded 'push_checked' result
+// BUG-857: `push_checked` is the one Ring method whose entire purpose is
+// reporting overflow — `push` already drops on a full ring. Discarding its
+// `?void` throws away the only thing it does, silently.
+struct T { u32 v; }
+Ring(T, 2) rb;
+
+u32 main() {
+    T a;
+    a.v = 1;
+    rb.push_checked(a);
+    return 0;
+}

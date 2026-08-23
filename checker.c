@@ -9551,34 +9551,72 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = ty_usize;
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
-            /* @offset(T, field) — validate field exists on struct T */
+            /* @offset(T, field) — T must be a STRUCT and `field` an actual field.
+             *
+             * BUG-860. The validation below used to be wrapped in a guard that
+             * required a non-NULL type, a raw struct type-kind comparison and a
+             * non-NULL field name all at once, and it did nothing whenever that
+             * guard failed (note: spelled with a raw type-kind comparison, which
+             * is why a distinct typedef slipped) — so FOUR shapes were
+             * accepted and emitted C that GCC then rejected, at a line in a file
+             * the user never wrote (the "silent checker / loud backend" shape this
+             * file already treats as a defect for @saturate/@bitcast at global
+             * scope). Measured 2026-08-23 by probing every intrinsic:
+             *
+             *   @offset(u32, 1)     -> offsetof(uint32_t, 1)      non-struct type
+             *   @offset(Dev, 1)     -> offsetof(struct Dev, 1)    field arg not a name
+             *   @offset(DevD, v)    -> offsetof(struct DevD, v)   distinct typedef
+             *   @offset(U, b)       -> offsetof(struct U, b)      union
+             *
+             * The third is the documented #1 bug class: a raw `->kind ==
+             * TYPE_STRUCT` on a resolved type, so a `distinct typedef` of a
+             * struct silently skipped the whole check. It is now unwrapped, which
+             * also makes @offset WORK on a distinct typedef (it emitted invalid C
+             * before) — a relaxation, not just a rejection.
+             *
+             * A UNION is rejected outright rather than validated: ZER unions are
+             * TAGGED (a variant cannot even be read without a switch), so a
+             * variant has no stable offset a user could act on, and the emitted
+             * `struct _union_X` payload is an implementation detail. */
             {
-                Type *struct_type = NULL;
-                const char *field_name = NULL;
-                uint32_t field_len = 0;
+                Type *named_type = NULL;    /* the type as written (may be distinct) */
+                Node *field_node = NULL;
+                Node *type_name_node = NULL;
                 if (node->intrinsic.type_arg) {
-                    struct_type = resolve_type(c, node->intrinsic.type_arg);
-                    if (node->intrinsic.arg_count > 0 &&
-                        node->intrinsic.args[0]->kind == NODE_IDENT) {
-                        field_name = node->intrinsic.args[0]->ident.name;
-                        field_len = (uint32_t)node->intrinsic.args[0]->ident.name_len;
-                    }
+                    named_type = resolve_type(c, node->intrinsic.type_arg);
+                    if (node->intrinsic.arg_count > 0) field_node = node->intrinsic.args[0];
                 } else if (node->intrinsic.arg_count >= 2 &&
                            node->intrinsic.args[0]->kind == NODE_IDENT) {
                     Symbol *sym = scope_lookup(c->current_scope,
                         node->intrinsic.args[0]->ident.name,
                         (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                    if (sym) struct_type = sym->type;
-                    if (node->intrinsic.args[1]->kind == NODE_IDENT) {
-                        field_name = node->intrinsic.args[1]->ident.name;
-                        field_len = (uint32_t)node->intrinsic.args[1]->ident.name_len;
-                    }
+                    if (sym) named_type = sym->type;
+                    type_name_node = node->intrinsic.args[0];
+                    field_node = node->intrinsic.args[1];
                 }
-                if (struct_type && struct_type->kind == TYPE_STRUCT && field_name) {
+
+                /* type_dispatch_kind unwraps distinct and is NULL-safe. */
+                TypeKind tk = type_dispatch_kind(named_type);
+                if (named_type && tk == TYPE_UNION) {
+                    checker_error(c, node->loc.line,
+                        "@offset: '%s' is a union — ZER unions are tagged, so a "
+                        "variant has no fixed offset. Use @offset on a struct",
+                        type_name(named_type));
+                } else if (named_type && tk != TYPE_STRUCT) {
+                    checker_error(c, node->loc.line,
+                        "@offset requires a struct type, got '%s'",
+                        type_name(named_type));
+                } else if (named_type && (!field_node || field_node->kind != NODE_IDENT)) {
+                    checker_error(c, node->loc.line,
+                        "@offset second argument must be a field name");
+                } else if (named_type) {
+                    Type *st = type_unwrap_distinct(named_type);
+                    const char *field_name = field_node->ident.name;
+                    uint32_t field_len = (uint32_t)field_node->ident.name_len;
                     bool found = false;
-                    for (uint32_t fi = 0; fi < struct_type->struct_type.field_count; fi++) {
-                        if (struct_type->struct_type.fields[fi].name_len == field_len &&
-                            memcmp(struct_type->struct_type.fields[fi].name, field_name, field_len) == 0) {
+                    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+                        if (st->struct_type.fields[fi].name_len == field_len &&
+                            memcmp(st->struct_type.fields[fi].name, field_name, field_len) == 0) {
                             found = true;
                             break;
                         }
@@ -9586,9 +9624,15 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!found) {
                         checker_error(c, node->loc.line,
                             "@offset: struct '%.*s' has no field '%.*s'",
-                            (int)struct_type->struct_type.name_len, struct_type->struct_type.name,
+                            (int)st->struct_type.name_len, st->struct_type.name,
                             (int)field_len, field_name);
                     }
+                    /* Hand the RESOLVED type to the emitter. Both emitter paths
+                     * used to hardcode `struct ` before the written name, which is
+                     * wrong for a distinct typedef (`struct DevD` is not a tag).
+                     * Recording it here keeps the spelling decision in emit_type,
+                     * which already knows how each kind is spelled. */
+                    if (type_name_node) checker_set_type(c, type_name_node, st);
                 }
             }
             result = ty_usize;
@@ -11102,6 +11146,65 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@cstr destination is a raw pointer '*u8' — no bounds check possible. "
                             "Use a slice ('[*]u8') or fixed array ('u8[N]') destination instead.");
+                    }
+                }
+            }
+            /* BUG-861: both arguments must actually be BUFFERS.
+             *
+             * Every @cstr check above is a NEGATIVE one — "not const", "not a
+             * raw pointer", "not too long". None ever asked what the arguments
+             * ARE, so a type that matched no rejection sailed through. The
+             * destination case is the serious one:
+             *
+             *     u32 gi;  gi = 4096;  @cstr(gi, sl);
+             *
+             * emitted `memcpy(gi, sl.ptr, sl.len)` and BUILT — gcc reports
+             * -Wint-conversion, which is a warning, so `zerc file.zer` exited 0
+             * and produced a binary that writes a slice through an address taken
+             * from an INTEGER. That is precisely the conversion ZER's grammar
+             * closure claims cannot be spelled: "no integer-to-pointer cast
+             * except through @inttoptr with mandatory mmio". @cstr was an
+             * unguarded second door to it — no mmio range, no alignment check,
+             * no bounds check. On a hosted target address 4096 faults; on bare
+             * metal it is ordinary RAM or flash, so the write SILENTLY lands.
+             *
+             * The source side is the same omission, one severity down (it emits
+             * `.ptr`/`.len` on a non-slice, which GCC does reject) — but a
+             * diagnostic about generated code the user never wrote is not a
+             * diagnostic, so it is closed here too.
+             *
+             * Allowed destinations mirror the exemptions the raw-pointer rule
+             * above already documents: a fixed array (compile-time checked), a
+             * slice (runtime checked), a volatile pointer (MMIO — the user
+             * explicitly targets hardware) and an opaque pointer (C-interop
+             * boundary carries its own length contract). */
+            if (node->intrinsic.arg_count >= 1) {
+                Type *dt = typemap_get(c, node->intrinsic.args[0]);
+                TypeKind dk = type_dispatch_kind(dt);
+                if (dt && dk != TYPE_ARRAY && dk != TYPE_SLICE && dk != TYPE_POINTER) {
+                    checker_error(c, node->loc.line,
+                        "@cstr destination must be a buffer (array 'u8[N]' or "
+                        "slice '[*]u8'), got '%s' — writing through an integer "
+                        "address requires @inttoptr and an mmio range",
+                        type_name(dt));
+                }
+            }
+            if (node->intrinsic.arg_count >= 2) {
+                Type *st = typemap_get(c, node->intrinsic.args[1]);
+                TypeKind sk = type_dispatch_kind(st);
+                if (st && sk != TYPE_SLICE) {
+                    /* An ARRAY source is rejected rather than coerced: the
+                     * emitter binds the source with __auto_type and reads
+                     * .ptr/.len off it, so an array produces invalid C. Point at
+                     * the slice spelling instead of silently emitting it. */
+                    if (sk == TYPE_ARRAY) {
+                        checker_error(c, node->loc.line,
+                            "@cstr source must be a slice — pass 'name[0..]' to "
+                            "slice the array '%s'", type_name(st));
+                    } else {
+                        checker_error(c, node->loc.line,
+                            "@cstr source must be a slice ('[*]u8' or a string "
+                            "literal), got '%s'", type_name(st));
                     }
                 }
             }
@@ -18078,6 +18181,35 @@ static void check_func_body(Checker *c, Node *node) {
 
         if (node->func_decl.is_naked) {
             c->in_naked = true;
+            /* BUG-862: say out loud that `naked` does NOT currently produce a
+             * naked function.
+             *
+             * The IR migration dropped `__attribute__((naked))` from the emitted
+             * C (docs/limitations.md, "naked attribute silently dropped on IR
+             * path"). GCC therefore wraps the asm body in an ordinary
+             * prologue/epilogue, and the asm APPEARS to work because that
+             * prologue saves the callee-saved registers and the epilogue
+             * supplies the `ret`.
+             *
+             * Restoring the attribute is a real migration — every existing
+             * tests/zer/asm_*.zer omits an explicit `ret` and would SIGILL — so
+             * it stays deferred. But DEFERRED and SILENT are different things,
+             * and only the silence is dangerous: a reset handler, an `iret`
+             * interrupt entry or a context-switch primitive written against the
+             * documented meaning of `naked` gets a hidden prologue, and the
+             * failure is a corrupted frame at run time on the target, with
+             * nothing said at compile time. On bare metal that does not fault —
+             * it just misbehaves.
+             *
+             * A warning costs nothing, breaks no test (exit status is unchanged)
+             * and converts a silent semantic loss into a visible one. Remove it
+             * in the same commit that re-enables the attribute. */
+            checker_warning(c, node->loc.line,
+                "'naked' is accepted but NOT applied — the emitted function still "
+                "gets a compiler prologue/epilogue, so it is not truly naked. Code "
+                "needing exact frame control (reset handlers, 'iret' entries, "
+                "context switches) must be written in C and linked via cinclude. "
+                "See docs/limitations.md");
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
             if (node->func_decl.body && node->func_decl.body->kind == NODE_BLOCK) {

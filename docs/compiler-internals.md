@@ -507,6 +507,57 @@ usual form):
 A disagreement is UB in the emitted code. NOT in `make check`: it is two to four gcc
 invocations per program. Run it after touching the emitter.
 
+**Gate defect fixed 2026-08-23 — do not re-introduce it.** `ub_sweep.sh` originally
+joined each run's stdout into ONE delimiter-separated string and re-split it to compare.
+Any program whose output contains a NEWLINE then split at the newline instead of the
+delimiter, and was reported divergent with visibly identical output (two multi-line
+programs did exactly that). Keep the outputs in an ARRAY and compare whole strings;
+never parse them back out of a joined string. After the fix the corpus-wide sweep is
+clean: 1122 programs compared, 0 divergences.
+
+## Probing the INTRINSIC SURFACE — the method, and the two bugs it found (2026-08-23)
+
+The intrinsics are the widest hand-written surface in the compiler (~155 names, each with
+its own ad-hoc argument handling in `checker.c` plus one or two emitter handlers). Reading
+them does not scale. PROBING them does, and it is mechanical: generate a program per
+(intrinsic × argument shape), compile, and let a downstream oracle judge the result. Three
+positions, three different oracles, three different defect classes:
+
+| Position | Oracle | What it catches |
+|---|---|---|
+| **Global initializer** | GCC compiles the emitted C | an intrinsic that does not fold to a C constant expression but is not on the checker's `is_nonconst_emit` list — emits a statement-expression or an empty RHS at file scope |
+| **Function body**, all arities | placeholder fingerprints in the emitted body | the silent form — `/* @name */ 0` compiles, runs, and is always the wrong value (this is what BUG-850 was) |
+| **Integer in every argument slot** | `gcc -Werror=int-conversion` | an integer reaching POINTER position, i.e. a breach of the grammar closure |
+
+Results on first run: body position was **clean** (zero placeholders — BUG-850 had closed
+that class); global-initializer position found **BUG-860**; the integer probe found
+**BUG-861**.
+
+Two durable lessons, both worth more than the individual bugs:
+
+- **Validate an intrinsic's arguments POSITIVELY, never as a list of rejections.** Every
+  `@cstr` check was a NEGATIVE one — "not const", "not a raw pointer", "not too long" — so
+  a type that matched none of them was accepted by default. That is how an INTEGER became
+  a legal `@cstr` destination. The rule to write is "must be an array or a slice", and
+  then the default answer for an unforeseen type is reject, not accept. The same shape
+  produced BUG-860: `@offset`'s field validation sat inside
+  `if (t && t->kind == TYPE_STRUCT && field_name)` and did NOTHING when the guard failed,
+  so four argument shapes were accepted by falling out of the check.
+- **A GCC diagnostic in generated code is not a diagnostic.** Several of these were
+  "caught" by GCC, which sounds acceptable until you read what the user sees: an error
+  about `offsetof(struct DevD, v)` at a line in a `.c` file they never opened. This
+  project already treats that as a defect (see the `@saturate`/`@bitcast` global-scope
+  comment in `checker.c`); the probes just make the class enumerable. And the severity is
+  not uniform — where GCC only WARNS (`-Wint-conversion`), the build SUCCEEDS and the
+  defect ships, which is exactly how BUG-861 stayed invisible.
+
+**The closure claim needed measuring, not asserting.** "No integer-to-pointer cast except
+through `@inttoptr` with mandatory `mmio`" is the sentence the language's safety argument
+rests on. It had never been tested. `tools/grammar_closure_probe.sh`
+(`make check-grammar-closure`) now tests it directly and is verified non-vacuous (2
+breaches pre-fix, 0 after). It reads the intrinsic list out of `checker.c`, so a new
+intrinsic is covered the day it lands.
+
 ## The 2026-08-01/02 branch-harvest sweep — ALL 45 fixes, and WHY they existed (read before any safety work)
 
 Eleven `claude/gifted-noether-*` audit branches were harvested into main: **ALL 45 fixes** —

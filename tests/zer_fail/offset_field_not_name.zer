@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: @offset second argument must be a field name
+// BUG-860: the field arg was only READ when it was an identifier; anything else
+// silently skipped validation and emitted offsetof(struct Dev, 1).
+struct Dev { u32 tag; }
+u32 main() {
+    usize s = @offset(Dev, 1);
+    return (u32)s;
+}

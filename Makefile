@@ -253,6 +253,14 @@ check-reference-examples: zerc
 check-ub-sweep: zerc
 	@bash tools/ub_sweep.sh ./zerc tests/zer
 
+# Standalone — tests the closure claim itself: no integer reaches pointer
+# position except through @inttoptr. Passes an integer in every argument
+# position of every intrinsic and lets GCC's -Werror=int-conversion be the
+# oracle. Found BUG-861 (@cstr was a second, unguarded door). NOT in `make
+# check` — ~900 compiler+gcc invocations.
+check-grammar-closure: zerc
+	@bash tools/grammar_closure_probe.sh ./zerc
+
 # Standalone — the VRP range-JOIN gate. One cell per control-flow kind, measured
 # BEHAVIOURALLY under AddressSanitizer (an elided check on a reachable value is an
 # ASan report), plus boundary cells asserting the ranges it CAN prove are still

@@ -1,0 +1,24 @@
+// BUG-861 companion: the shapes that must KEEP working after the destination and
+// source type rules were added — a fixed-array destination, a slice destination,
+// a string-literal source, and an explicitly sliced array source.
+u32 main() {
+    u8[16] buf;
+    u8[16] buf2;
+    u8[8]  src;
+    const [*]u8 sl = "hi";
+
+    @cstr(buf, sl);
+    if (buf[0] != 104) { return 1; }   // 'h'
+    if (buf[1] != 105) { return 2; }   // 'i'
+    if (buf[2] != 0)   { return 3; }   // null terminator
+
+    @cstr(buf2, "abc");
+    if (buf2[0] != 97) { return 4; }
+    if (buf2[3] != 0)  { return 5; }
+
+    src[0] = 65; src[1] = 66;
+    @cstr(buf, src[0..2]);
+    if (buf[0] != 65) { return 6; }
+    if (buf[2] != 0)  { return 7; }
+    return 0;
+}

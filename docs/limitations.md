@@ -5,6 +5,35 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `@cstr` rejects an ARRAY source instead of coercing it (over-rejection, LOW, 2026-08-23)
+
+**Symptom.** `u8[4] arr; @cstr(buf, arr);` is a compile error telling you to write
+`@cstr(buf, arr[0..])`. Everywhere else in ZER an array coerces to a slice
+automatically (call arguments, assignment, return), so this is an inconsistency
+the user has to learn.
+
+**Root cause.** The emitter binds the source with `__auto_type _zer_cs0 = <src>`
+and then reads `_zer_cs0.ptr` / `_zer_cs0.len` off it. An array has neither
+member, so an array source emitted invalid C. Before BUG-861 it was accepted and
+GCC reported the failure against generated code; the fix rejects it in the checker
+with the slice spelling in the message, which is honest but not the ideal answer.
+
+**Fix sketch.** In both `@cstr` emitter paths, when the source type is
+`TYPE_ARRAY`, emit a slice construction (`(_zer_slice_u8){ arr, N }`) instead of
+binding the array directly — the same coercion the call-argument path already
+performs. Then relax the checker rule to accept `TYPE_ARRAY` alongside
+`TYPE_SLICE`. Both emitter paths must change together (`emitter.c` AST path and
+the `emit_rewritten_node` path) or the IR path falls back to the broken form.
+
+**Why it is LOW.** Measured over the corpus: **zero** existing uses pass an array
+source, and the workaround is a three-character edit at the call site. It cannot
+produce a wrong answer — the only outcome is a diagnostic.
+
+**Tripwire.** `tests/zer_fail/cstr_array_src.zer` pins the current rejection. When
+this is fixed, that test moves to `tests/zer/` as a positive.
+
+---
+
 ## OPEN — an arena pointer cannot be stored into another ARENA allocation (over-rejection, measured 2026-08-23)
 
 **Symptom.** The arena's own idiom — an intrusive list, a tree, a freelist — is refused:
@@ -4235,10 +4264,29 @@ clearer code intent.
 
 ---
 
-## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+## `naked` attribute dropped on IR path (deferred 2026-05-02; NO LONGER SILENT since 2026-08-23)
 
 **Status:** known regression from IR migration; not fixed because fixing
 breaks every existing `tests/zer/asm_*.zer` test.
+
+**UPDATE 2026-08-23 (BUG-862) — re-measured, still live, and the SILENCE is now
+closed.** `naked void boot() { asm("nop"); }` still emits a plain `void boot(void)`
+with no `__attribute__((naked))` (verified by reading the emitted C, not by
+recalling this entry). The attribute stays deferred for the reason below — that
+part is a genuine migration — but "deferred" and "silent" are separable, and only
+the silence was dangerous: a user writing a reset handler or an `iret` entry
+against the documented meaning of `naked` got a hidden prologue with nothing said
+at compile time, and on bare metal that does not fault, it just misbehaves.
+
+The checker now emits a WARNING at every `naked` declaration naming the loss and
+the workaround. It costs nothing, changes no exit status, and breaks no test (the
+six `nowarn_check` files use no `naked`; the 45 corpus files that do are checked
+by exit code). Pinned by `tests/zer/naked_not_applied_warning.zer` via
+`warn_check` in `tests/test_zer.sh`, so the semantic loss cannot go quiet again.
+
+**When the attribute is restored:** delete the `checker_warning` call in
+`checker.c` (search BUG-862), the `warn_check` line in `tests/test_zer.sh`, the
+test file, and this entry — all in the same commit.
 
 **Symptom:** ZER source declaring `naked void f() { asm { ... } }`
 emits C without `__attribute__((naked))`. GCC therefore generates a

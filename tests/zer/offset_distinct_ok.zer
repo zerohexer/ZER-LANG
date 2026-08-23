@@ -1,0 +1,17 @@
+// BUG-860 (the relaxation half): @offset through a `distinct typedef` of a
+// struct is CORRECT ZER and used to emit `offsetof(struct DevD, v)` — DevD is a
+// typedef, not a struct tag, so GCC rejected code the user had every right to
+// write. The checker now unwraps distinct and hands the resolved type to the
+// emitter, which spells it via emit_type.
+struct Dev { u32 tag; u32 v; u64 wide; }
+distinct typedef Dev DevD;
+
+u32 main() {
+    usize a = @offset(DevD, tag);
+    usize b = @offset(DevD, v);
+    usize c = @offset(Dev, v);
+    if (a != 0) { return 1; }
+    if (b != c) { return 2; }   // distinct and underlying agree
+    if (b == 0) { return 3; }
+    return 0;
+}

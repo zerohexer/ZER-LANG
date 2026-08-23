@@ -156,6 +156,21 @@ emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
 When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
 `@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
 
+**BUT the "TWO hits" rule does NOT apply to every intrinsic — do not chase it
+(2026-08-23).** Measured: **108 of 155 intrinsics have exactly ONE `emitter.c`
+hit** and every one of them is correct. The `@cpu_*` / `@mmu_*` / `@tlb_*` /
+`@cache_*` / `@port_*` family is dispatched inside `emit_rewritten_node`, which
+IS the IR path; they need no AST-path handler because the only remaining
+AST-emission context is a global initializer, and the checker rejects the whole
+family there by PREFIX (`checker.c`, `is_runtime_read` — "does not lower to a
+compile-time-constant value at global scope"). So a single hit inside
+`emit_rewritten_node` is the CORRECT shape for a runtime-only intrinsic. Before
+reporting a dual-dispatch gap, check the enclosing function and whether the
+checker can even let that intrinsic reach the AST path. The real gate for the
+placeholder class is behavioural: `tools/emit_audit.sh` greps 1088 emitted
+programs for placeholder fingerprints, and a probe of every intrinsic in body
+position found **zero** placeholders.
+
 **`type_name()` uses 2-buffer rotation (types.c:518-523).** Calling
 `type_name(t)` 3+ times in a single `printf`/`checker_error` overwrites
 earlier results because there are only TWO static buffers. Symptoms: error
@@ -402,6 +417,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | **Emitter GIVE-UP branch (a comment where the code should be)** | every `emit(e, "/* … */ 0")` / `"/* … */("` — ten of them | `tools/emit_audit.sh` fingerprints, now swept over **1087 programs** rather than 5 samples. A give-up emission is VALID C — a parenthesised or comma expression that compiles, runs and does nothing — so no harness sees it. "0 of 1170 corpus programs reach it" is NOT the same as unreachable: BUG-856 was one array-of-pointers away, because a STRUCT-typed receiver is lowered as a builtin and never reaches the branch at all |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
+| **Intrinsic ARGUMENT validation ("right count" vs "right KIND")** | all ~155 intrinsics × (global-init, body, wrong-type) position | `tools/grammar_closure_probe.sh` (`make check-grammar-closure`) — an integer in every argument slot, with GCC's `-Werror=int-conversion` as the oracle. Arity was gated by the BH-18 #14 table (BUG-850); KIND was not, and `@cstr` accepted an integer DESTINATION and emitted `memcpy(int, …)` that only WARNS, so `zerc` exited 0 (BUG-861). **Validate POSITIVELY — "must be a buffer" — never as a list of rejections**: every `@cstr` check was a negative one, so a type matching none of them sailed through |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
 CONTENTS.** Cell counts, per-cell history and the current site set live in the gate itself

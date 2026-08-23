@@ -3299,9 +3299,20 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
             } else if (node->intrinsic.arg_count >= 2) {
-                /* args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_expr(e, node->intrinsic.args[0]);
+                /* args[0] = type name, args[1] = field name.
+                 * BUG-860: this used to emit a literal `struct ` before the name
+                 * as written, which is only correct when the name IS a struct
+                 * tag — `struct DevD` for a distinct typedef and `struct U` for a
+                 * union are both invalid C. The checker records the RESOLVED
+                 * (distinct-unwrapped) type on the name node; emit_type knows how
+                 * each kind is spelled. */
+                Type *nt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                if (nt) {
+                    emit_type(e, nt);
+                } else {
+                    emit(e, "struct ");
+                    emit_expr(e, node->intrinsic.args[0]);
+                }
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
             }
@@ -7992,9 +8003,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
             } else if (node->intrinsic.arg_count >= 2) {
-                /* Named type: args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                /* Named type: args[0] = type name, args[1] = field name.
+                 * BUG-860 — see the AST path above; the hardcoded `struct ` is
+                 * wrong for a distinct typedef and for a union. */
+                Type *nt = checker_get_type(e->checker, node->intrinsic.args[0]);
+                if (nt) {
+                    emit_type(e, nt);
+                } else {
+                    emit(e, "struct ");
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                }
                 emit(e, ", ");
                 emit_rewritten_node(e, node->intrinsic.args[1], func);
             }

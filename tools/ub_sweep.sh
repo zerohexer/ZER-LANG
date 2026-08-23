@@ -68,19 +68,25 @@ for d in "${DIRS[@]}"; do
     fi
     [ -s "$DIR/$name.c" ] || { skipped=$((skipped+1)); continue; }
 
-    outs=""; codes=""; built=0
+    # Outputs are kept in an ARRAY, never in one delimiter-joined string.
+    # A joined string has to be re-split to compare, and any program whose
+    # stdout contains a NEWLINE then splits at the newline instead of at the
+    # delimiter — which reported two multi-line-printing programs as
+    # "divergent" with visibly identical output (2026-08-23). Compare the whole
+    # strings; never parse them back out.
+    outs=(); labels=(); codes=""; built=0
     for lvl in $LEVELS; do
       if gcc $CFLAGS_BASE $lvl "$DIR/$name.c" -o "$DIR/$name$lvl.exe" \
              -lpthread >/dev/null 2>&1; then
         o=$(cd "$DIR" && timeout 20 "./$name$lvl.exe" 2>/dev/null); c=$?
-        outs="$outs<<$lvl:$o>>"; codes="$codes $c"; built=$((built+1))
+        outs+=("$o"); labels+=("$lvl"); codes="$codes $c"; built=$((built+1))
       fi
     done
     if [ -n "$EXTRA_SETS" ]; then
       if gcc -std=c99 -fwrapv -O2 "$DIR/$name.c" -o "$DIR/${name}_sa.exe" \
              -lpthread >/dev/null 2>&1; then
         o=$(cd "$DIR" && timeout 20 "./${name}_sa.exe" 2>/dev/null); c=$?
-        outs="$outs<<strict:$o>>"; codes="$codes $c"; built=$((built+1))
+        outs+=("$o"); labels+=("strict"); codes="$codes $c"; built=$((built+1))
       fi
     fi
     [ $built -lt 2 ] && { skipped=$((skipped+1)); continue; }
@@ -88,17 +94,18 @@ for d in "${DIRS[@]}"; do
 
     # Every run must agree on BOTH the exit status and stdout.
     uniq_codes=$(echo $codes | tr ' ' '\n' | sort -u | wc -l)
-    first=$(echo "$outs" | sed 's/<</\n<</g' | sed -n '2p' | sed 's/^<<[^:]*://; s/>>$//')
     same_out=1
-    while IFS= read -r piece; do
-      [ -z "$piece" ] && continue
-      v=$(echo "$piece" | sed 's/^<<[^:]*://; s/>>$//')
-      [ "$v" != "$first" ] && same_out=0
-    done < <(echo "$outs" | sed 's/<</\n<</g' | tail -n +2)
+    for i in "${!outs[@]}"; do
+      [ "${outs[$i]}" != "${outs[0]}" ] && same_out=0
+    done
 
     if [ "$uniq_codes" -gt 1 ] || [ "$same_out" -eq 0 ]; then
+      shown=""
+      for i in "${!outs[@]}"; do
+        shown="$shown\n       [${labels[$i]}] ${outs[$i]}"
+      done
       diverged=$((diverged+1))
-      report="$report\n  $f\n     exit codes:$codes\n     outputs: $outs"
+      report="$report\n  $f\n     exit codes:$codes\n     outputs:$shown"
     fi
     rm -f "$DIR/$name"*.exe "$DIR/$name.c"
   done

@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-23 — BUG-845..858: the call-RESULT view class, float→int UB, and four silent miscompiles
+## Session 2026-08-23 — BUG-845..862: the call-RESULT view class, float→int UB, four silent miscompiles, and a breach of the grammar closure
 
 An independent audit (not a branch harvest). Nine fixes across four classes; every
 one was reproduced on a from-HEAD build BEFORE it was written, and every new test
@@ -438,6 +438,103 @@ discipline working as intended: the negative matrix, not the reasoning, is what 
   `@wait_on_address`, the fence family, `@config`) were implemented and mentioned
   NOWHERE in the reference. Signatures and return types were MEASURED by probing the
   compiler, not recalled, and every example in the section compiles and runs.
+
+### BUG-860 / BUG-861 — probing the intrinsics found two more (same session, later)
+
+BUG-850 measured intrinsic ARITY. The follow-up asked the next question — *given
+the right number of arguments, are they the right KIND?* — by probing every
+intrinsic in three positions (global initializer, function body, integer-in-every-
+slot) and letting GCC judge the emitted C. Two findings.
+
+**BUG-861 — `@cstr` was a second, unguarded integer-to-pointer door.** This is the
+serious one, because it breaches the claim the whole language rests on:
+
+    u32 gi;  gi = 4096;  @cstr(gi, sl);   ->  memcpy(gi, sl.ptr, sl.len)
+
+`zerc file.zer` exited **0** and produced a binary. GCC's `-Wint-conversion` is a
+warning, so nothing in the pipeline objected. Every `@cstr` check that existed was
+a NEGATIVE one — "not const", "not a raw pointer", "not too long" — and none ever
+asked what the destination *was*, so a type matching no rejection sailed through.
+The result is a write through an address taken from an integer with no `mmio`
+range, no alignment check and no bounds check: exactly the conversion CLAUDE.md
+says cannot be spelled ("no integer-to-pointer cast except through `@inttoptr`").
+Hosted, address 4096 faults; on bare metal it is ordinary RAM or flash, so the
+write silently lands. The source side had the same omission one severity down.
+Both arguments are now type-checked; corpus cost of the new rule measured at
+**zero** (every existing use was already `(buffer, slice)`).
+
+New gate `tools/grammar_closure_probe.sh` + `make check-grammar-closure`: pass an
+integer in every argument position of every intrinsic (read from `checker.c`, so a
+new intrinsic is covered the day it lands) and compile with
+`-Werror=int-conversion`, using GCC's front end as the oracle. Verified
+non-vacuous — 2 breaches against a pre-fix build, 0 after. The closure claim had
+been ASSERTED for the whole life of the project and never MEASURED; it failed on
+first measurement.
+
+**BUG-860 — `@offset` validated nothing outside one narrow shape.** Its field check
+was wrapped in `if (struct_type && struct_type->kind == TYPE_STRUCT && field_name)`
+and did nothing whenever that guard failed, so four shapes were accepted and
+emitted C that GCC rejected at a line in a file the user never wrote:
+
+    @offset(u32, 1)    -> offsetof(uint32_t, 1)       non-struct type
+    @offset(Dev, 1)    -> offsetof(struct Dev, 1)     field arg not a name
+    @offset(DevD, v)   -> offsetof(struct DevD, v)    distinct typedef
+    @offset(U, b)      -> offsetof(struct U, b)       union
+
+The third is the documented #1 bug class — a raw `->kind == TYPE_STRUCT` on a
+resolved type, so a `distinct typedef` of a struct skipped validation ENTIRELY.
+Unwrapping it also makes `@offset` **work** through a distinct typedef, which used
+to emit invalid C for correct ZER (a relaxation, verified against a pre-fix build).
+A union is now rejected outright with a reason: ZER unions are TAGGED, a variant
+cannot be read without a `switch`, so it has no offset a user could act on. Both
+emitter paths stopped hardcoding `struct ` before the written name and now defer
+the spelling to `emit_type`, which already knows how each kind is spelled.
+
+Five tests, each verified to flip against a from-HEAD build.
+
+### BUG-862 — `naked` was accepted, dropped, and never mentioned
+
+Re-measured a documented OPEN entry per the MEASURE-FIRST protocol; unlike the
+four stale ones found on 2026-08-08, this one is still live.
+`naked void boot() { asm("nop"); }` emits a plain `void boot(void)` — no
+`__attribute__((naked))` — so GCC wraps the asm in an ordinary prologue/epilogue.
+
+Restoring the attribute IS a real migration (every existing `tests/zer/asm_*.zer`
+omits an explicit `ret` and would SIGILL), so it stays deferred. But *deferred*
+and *silent* are separable, and only the silence is dangerous: a reset handler,
+an `iret` interrupt entry or a context-switch primitive written against the
+documented meaning of `naked` gets a hidden prologue, and the failure lands at run
+time on the target. On bare metal it does not fault — it just misbehaves. That is
+the exact profile of the gap class this audit was looking for.
+
+The checker now WARNS at every `naked` declaration, naming the loss and the
+cinclude workaround. Zero cost, no exit-status change, no test broken (the six
+`nowarn_check` files use no `naked`; the 45 corpus files that do are judged by
+exit code). Pinned by `tests/zer/naked_not_applied_warning.zer` through the
+existing `warn_check` mechanism so it cannot go quiet again.
+
+### Also — two gate defects and 560 tracked binaries
+
+- **`tools/ub_sweep.sh` reported two false divergences.** It joined each run's
+  stdout into one delimiter-separated string and re-split it to compare, so any
+  program whose output contains a NEWLINE split at the newline instead of the
+  delimiter. Two multi-line-printing programs were reported divergent with
+  visibly identical output. Fixed by keeping the outputs in an array and never
+  parsing them back out; re-verified in BOTH directions (fires on the constant
+  `(u32)(-1.5)` witness, silent on the multi-line programs). The corpus-wide
+  sweep is then clean: **1122 programs compared, 0 divergences.**
+  Worth remembering: the regression test for BUG-853 routes through `volatile`,
+  which makes both -O levels agree on the *wrong* answer — so it is deliberately
+  NOT a divergence witness. Testing the detector needs the constant form.
+- **560 ELF binaries (11 MB) were tracked in git**, arriving one commit at a time
+  since 43126a1, and re-dirtying `git status` after every test run. `.gitignore`
+  listed test binaries by individual NAME — the same deny-list shape this project
+  keeps replacing with gates — so every new test that compiles to a binary had to
+  be added by hand and any that wasn't got committed. Replaced with a structural
+  rule: every test SOURCE in these trees has an extension, so an extension-less
+  file in them is a build artifact by construction (verified: all 558
+  extension-less tracked files in those directories were ELF). Untracked with
+  `git rm --cached`; the files stay on disk and are rebuilt by the runners.
 
 ---
 

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: is a union
+// BUG-860: ZER unions are TAGGED — a variant cannot be read without a switch,
+// so it has no fixed offset. This used to emit offsetof(struct U, b), which is
+// not even the emitted spelling of a ZER union (struct _union_U).
+union U { u32 a; u64 b; }
+u32 main() {
+    usize s = @offset(U, b);
+    return (u32)s;
+}

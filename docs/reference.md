@@ -1905,10 +1905,29 @@ usize s = @size(Task);     // e.g., 12
 **DESCRIPTION**
 Returns the byte offset of a field within struct T as usize. Like C's offsetof.
 
+`T` must be a **struct** (a `distinct typedef` of one works — it is unwrapped),
+and `field` must be a bare field NAME.
+
 **EXAMPLE**
 ```zer
-usize off = @offset(Task, priority);
+struct Task { u32 id; u32 priority; }
+distinct typedef Task TaskD;
+
+u32 main() {
+    usize off  = @offset(Task, priority);
+    usize offd = @offset(TaskD, priority);   // distinct typedef unwraps to Task
+    if (off != offd) { return 1; }
+    return 0;
+}
 ```
+
+**NOTES**
+- A **union** is rejected. ZER unions are tagged — a variant cannot be read
+  without a `switch`, so it has no fixed offset you could act on.
+- A non-struct type (`@offset(u32, x)`) and a non-name second argument
+  (`@offset(Task, 1)`) are compile errors. Before 2026-08-23 all of these were
+  accepted and produced C that GCC rejected, reported at a line in a generated
+  file you never wrote.
 
 ---
 
@@ -2087,6 +2106,17 @@ const [*]u8 name = "hello";
 
 **NOTES**
 - Returns pointer to buf. If slice doesn't fit, returns zero value (auto-guard).
+- The **destination** must be a buffer: a fixed array (`u8[N]`, bounds checked at
+  compile time) or a slice (`[*]u8`, checked at runtime). A `volatile *u8` (MMIO)
+  and a `*opaque` (C-interop boundary) are also accepted. A plain `*u8` is
+  rejected — a raw pointer carries no length, so neither check is possible.
+- The **source** must be a slice or a string literal. To copy from a fixed array,
+  slice it: `@cstr(buf, arr[0..])`.
+- An **integer** destination is a compile error. It used to be accepted and
+  emitted `memcpy(int_value, ...)`, which only warns in C — so the program built
+  and wrote through an address taken from an integer, bypassing the `@inttoptr` +
+  `mmio` discipline entirely. Use `@inttoptr` with a declared `mmio` range if you
+  genuinely mean a fixed hardware address.
 
 ---
 
@@ -2689,8 +2719,8 @@ grep -rnE "\basm\s*[(]" src/
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+Marks a function whose body must be pure `asm(...)` statements plus `return`.
+This is also the only place `asm(...)` is allowed.
 
 **SYNTAX**
 ```zer
@@ -2699,6 +2729,23 @@ naked void reset_handler() {
     asm("b main");
 }
 ```
+
+**NOTES**
+- **`naked` does NOT currently suppress the prologue/epilogue.** The compiler
+  accepts the keyword, enforces the asm-only body rule, and then emits an
+  ORDINARY function — `__attribute__((naked))` is not applied. GCC therefore
+  generates a normal prologue and epilogue around your asm. The compiler warns at
+  every `naked` declaration so this is not a surprise at run time.
+- The asm usually appears to work anyway, because the implicit prologue saves the
+  callee-saved registers and the epilogue supplies the `ret`.
+- **If you need true naked semantics** — a reset handler that runs before the
+  stack exists, an interrupt entry returning via `iret`/`eret`, a context-switch
+  primitive that saves registers itself, or anything depending on exact frame
+  layout — write that function in C and link it via `cinclude`. Under the implicit
+  prologue those cases misbehave rather than fault, which on bare metal means no
+  crash and no message.
+- Tracked in `docs/limitations.md`; restoring the attribute is a breaking change
+  for existing asm code that omits an explicit `ret`.
 
 ---
 

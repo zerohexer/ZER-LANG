@@ -1,0 +1,21 @@
+// BUG-862: `naked` is accepted but the IR path does NOT emit
+// __attribute__((naked)) — the function still gets a compiler prologue and
+// epilogue, so it is not truly naked (docs/limitations.md).
+//
+// Re-enabling the attribute is a real migration (every existing asm test omits
+// an explicit `ret` and would SIGILL), so it stays deferred. What is NOT
+// acceptable is the SILENCE: a reset handler or context-switch primitive written
+// against the documented meaning of `naked` gets a hidden prologue and fails on
+// the target with nothing said at compile time — and on bare metal that does not
+// fault, it just misbehaves.
+//
+// This test is wired through tests/test_zer.sh `warn_check`, which asserts the
+// warning is actually printed. Delete it in the same commit that re-enables the
+// attribute.
+naked void boot_entry() {
+    asm("nop");
+}
+
+u32 main() {
+    return 0;
+}

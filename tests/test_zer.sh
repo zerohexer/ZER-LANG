@@ -262,6 +262,11 @@ warn_check() {
 
 warn_check tests/zer/dyn_array_autoguard_crash.zer "auto-guard inserted" "autoguard-warning-emitted"
 warn_check tests/zer/dyn_array_guard.zer "auto-guard inserted" "dynguard-warning-emitted"
+# BUG-862: `naked` is accepted but the attribute is NOT emitted (deferred — see
+# docs/limitations.md). The deferral is fine; the SILENCE was not. This pins the
+# warning so the semantic loss cannot go quiet again. Remove this line in the
+# same commit that re-enables __attribute__((naked)).
+warn_check tests/zer/naked_not_applied_warning.zer "'naked' is accepted but NOT applied" "naked-not-applied-warning"
 
 echo ""
 echo "=== ZER No-Warning Verification (must compile + NO warnings + exit 0) ==="

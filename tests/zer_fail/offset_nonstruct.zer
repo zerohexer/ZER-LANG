@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: @offset requires a struct type
+// BUG-860: accepted, emitted offsetof(uint32_t, 1) — invalid C at a line the
+// user never wrote.
+u32 main() {
+    usize s = @offset(u32, 1);
+    return (u32)s;
+}

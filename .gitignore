@@ -47,21 +47,10 @@ editors/vscode/node_modules/
 hello.c
 hello.exe
 tags
-tests/zer/arena_alloc
-tests/zer/comptime_const_arg
-tests/zer/condvar_signal
-tests/zer/goto_spaghetti_safe
-tests/zer/interior_ptr_safe
-tests/zer/recursive_functions
-tests/zer/scoped_spawn
-tests/zer/super_freelist_arena
-tests/zer/super_sensor_logger
-tests/zer/super_uart_parser
-tests/zer/typecast_cstyle
-tests/zer/typecast_safe_complex
-tests/zer_proof/A01_no_uaf
 
-# Compiled matrix-oracle / IR-validate test binaries (rebuilt by `make check`)
+# Compiled matrix-oracle / IR-validate test binaries (rebuilt by `make check`).
+# These live at the REPO ROOT, which also holds legitimately extension-less
+# files (Makefile, Dockerfile), so the root list stays explicit.
 test_ir_validate
 test_shape_matrix
 test_escape_matrix
@@ -71,10 +60,58 @@ test_conc_matrix
 test_hw_matrix
 test_async_matrix
 test_asm_matrix
-test_modules/main
-
-# Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
-rust_tests/rt_task_alloc_free
-rust_tests/rt_task_alloc_free_cycle
 test_defer_goto_matrix
 test_view_alias_matrix
+/test
+/test1
+
+# ---------------------------------------------------------------------------
+# Compiled test binaries inside the test trees.
+#
+# This used to be a hand-maintained list of individual NAMES — the same
+# deny-list shape this project keeps replacing with gates. Every new test that
+# compiles to a binary had to be added by hand, and any that wasn't got
+# committed. It failed exactly that way: measured 2026-08-23, **560 ELF
+# binaries (11 MB) were tracked**, they re-dirty `git status` after every test
+# run, and they had been arriving one commit at a time since 43126a1.
+#
+# The durable rule: every test SOURCE in these trees carries an extension, so an
+# extension-less file in them is a compiled artifact BY CONSTRUCTION (verified:
+# of every extension-less tracked file in these directories, all 558 were ELF).
+# Ignore those, re-include anything with a dot, and re-ignore the build
+# extensions at the end of this file so the `*.*` negations cannot resurrect
+# them. A new test binary can no longer be committed by omission.
+# ---------------------------------------------------------------------------
+rust_tests/*
+!rust_tests/*.*
+!rust_tests/*/
+zig_tests/*
+!zig_tests/*.*
+!zig_tests/*/
+test_modules/*
+!test_modules/*.*
+!test_modules/*/
+tests/zer/*
+!tests/zer/*.*
+!tests/zer/*/
+tests/zer_fail/*
+!tests/zer_fail/*.*
+!tests/zer_fail/*/
+tests/zer_proof/*
+!tests/zer_proof/*.*
+!tests/zer_proof/*/
+tests/zer_trap/*
+!tests/zer_trap/*.*
+!tests/zer_trap/*/
+tests/zer_gaps/*
+!tests/zer_gaps/*.*
+!tests/zer_gaps/*/
+examples/cve-demos/*
+!examples/cve-demos/*.*
+!examples/cve-demos/*/
+
+# Re-ignore build artifacts LAST: the `!<dir>/*.*` negations above would
+# otherwise override the `*.o` / `*.exe` rules at the top of this file for any
+# path inside a test tree.
+*.o
+*.exe

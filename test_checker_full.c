@@ -409,24 +409,35 @@ static void test_s22_arena(void) {
     ok("Arena scratch;\nvoid f() { defer scratch.reset(); }",
        "arena reset inside defer OK (no warning)");
 
-    /* BUG-026: arena.alloc(T) → ?*T */
-    ok("struct Task { u32 id; }\nArena a;\n"
-       "void f() { *Task t = a.alloc(Task) orelse return; t.id = 1; }",
+    /* BUG-026: arena.alloc(T) → ?*T
+     * BUG-848: all four arenas below are now BACKED. They used to be bare
+     * `Arena a;`, i.e. capacity 0, so every alloc() they type-checked could only
+     * ever return null at runtime — the tests were type-checking an arena that
+     * could not allocate. Backing them preserves the property each one is FOR (the
+     * RETURN TYPE of alloc / alloc_slice) and removes the vacuity; and it matters
+     * for the two err() cases in particular, which would otherwise start passing
+     * for the WRONG REASON (the new arena rule rather than the type mismatch). */
+    ok("struct Task { u32 id; }\n"
+       "void f() { u8[256] bk; Arena a = Arena.over(bk); "
+       "*Task t = a.alloc(Task) orelse return; t.id = 1; }",
        "arena.alloc(Task) returns ?*Task — unwrap to *Task OK");
 
-    err("struct Task { u32 id; }\nArena a;\n"
-        "void f() { u32 t = a.alloc(Task) orelse return; }",
+    err("struct Task { u32 id; }\n"
+        "void f() { u8[256] bk; Arena a = Arena.over(bk); "
+        "u32 t = a.alloc(Task) orelse return; }",
         "arena.alloc(Task) returns ?*Task, assign to u32 REJECT");
 
     /* BUG-027: arena.alloc_slice(T, n) → ?[]T
      * Note: uses struct type since primitive keywords (u32 etc.) can't be
      * passed as arguments — they're keywords, not identifiers */
-    ok("struct Elem { u32 v; }\nArena a;\n"
-       "void f() { []Elem buf = a.alloc_slice(Elem, 10) orelse return; }",
+    ok("struct Elem { u32 v; }\n"
+       "void f() { u8[256] bk; Arena a = Arena.over(bk); "
+       "[]Elem buf = a.alloc_slice(Elem, 10) orelse return; }",
        "arena.alloc_slice(Elem, 10) returns ?[]Elem — unwrap to []Elem OK");
 
-    err("struct Elem { u32 v; }\nArena a;\n"
-        "void f() { u32 buf = a.alloc_slice(Elem, 10) orelse return; }",
+    err("struct Elem { u32 v; }\n"
+        "void f() { u8[256] bk; Arena a = Arena.over(bk); "
+        "u32 buf = a.alloc_slice(Elem, 10) orelse return; }",
         "arena.alloc_slice(Elem, 10) returns ?[]Elem, assign to u32 REJECT");
 }
 

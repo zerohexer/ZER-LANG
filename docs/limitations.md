@@ -5,6 +5,25 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `&&` / `||` do not narrow their RHS (PRECISION only, measured 2026-08-23)
+
+`if (i < 4 && arr[i] > 0)` — the canonical guarded-access idiom, and the exact shape the
+auto-guard warning tells users to write — still carries a runtime bounds guard, because
+VRP never applies a short-circuit LHS to its RHS. Verified still live after the harvest:
+the program compiles and runs correctly; the cost is one unnecessary branch.
+
+**This is PRECISION, not safety** — hence not shipped with the 45. It becomes REQUIRED
+the day the ALWAYS-OOB verdict is promoted at short-circuit position, because the same
+idiom would then be REJECTED rather than merely guarded. 87xihb's BUG-800 carries the
+implementation (`vrp_narrow_from_cond`: `ident <op> const` plus conjunctions, De Morgan
+for the inverted disjunction, refusing volatile operands, a no-op on anything else) and
+is deliberately NOT a second copy of the NODE_IF narrowing — that path stays
+authoritative and keeps field keys, guard-body detection, known_nonzero and the
+then/else JOIN; this covers only the position it structurally cannot reach, inside a
+condition EXPRESSION.
+
+---
+
 ## OPEN — comptime array-element bindings carry no width (LOW, found 2026-08-22)
 
 BUG-844 established the declared width at the three comptime binding sinks (params via
@@ -43,10 +62,12 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
-**PROGRESS: §D COMPLETE 2026-08-23** (BUG-839..846) — eight silent miscompiles. V9,
-V10, V11, V12, V13, V14, V15, V16 and V17 all struck through below. Remaining: 6 —
-§E/§F/§G only (arena + barrier init, discarded optional, CLI validation, break-in-
-for-init, the emitter give-up paths, and the naked / async warnings).
+**HARVEST CLOSED 2026-08-23 — 45/45.** §A (BUG-815..819), §B (820..829), §C (830..838),
+§D (839..846) and §E/§F/§G (847..855) are all landed; every V/W/O/Q row below is struck
+through. `make check` exit 0 with 1316 .zer tests and all seven audit gates. What is NOT
+closed is recorded as its own OPEN entry above (the comptime array-element width), plus
+the "reported but NOT fixed on any branch" list further down, which was never part of
+the 45.
 
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
@@ -102,7 +123,7 @@ phrasing. Cosmetic; the rules fire.
 | ~~V3~~ **DONE 2026-08-22 (BUG-817/818)** | Root-ident walk written 4x as two SEQUENTIAL loops — wrong for any ALTERNATING chain | **pjtawx** BUG-804 (`expr_root_ident` in ast.h) | `@atomic_load(&g_s.arr[0].f)` on a packed nested struct ACCEPTED; `@atomic_load(&g_i.f)` rejected one line away. Misaligned atomic = hard fault on ARM/RISC-V |
 | ~~V4~~ **DONE (BUG-833)** | `&packed.field` gated at 1 of 5 sinks | **87xihb** BUG-804 (5 sinks + non-sticky) | assign / call-arg / alias sinks ACCEPTED. `39294y` BUG-813 is a 2-sink subset — take 87xihb, keep 39294y's `zer_gaps` file for the 4 sinks BOTH leave open |
 | ~~V5~~ **DONE (BUG-834)** | Bit-range write is an implicit RMW, missed at BOTH sinks | **87xihb** BUG-803 | ACCEPTED while `flags += 1` is REJECTED — same operation, different spelling. `resolve_write_target_global` does not peel `NODE_SLICE` |
-| V6 | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
+| ~~V6~~ **DONE (BUG-856)** | `expr_mentions_global` missed intrinsic/call/orelse | **39294y** BUG-811 | `g = @truncate(u32,g) + 1` ACCEPTED; `g = g + 1` REJECTED |
 | ~~V7~~ **DONE (BUG-830)** | `type_equals` pointer arm checked `is_const` but NOT `is_volatile` | **87xihb** BUG-801 | struct-init field + funcptr param ACCEPTED. The SLICE arm 3 lines away checks both |
 | ~~V8~~ **DONE (BUG-832)** | 4 of 6 sinks blind to the `?*T` optional axis | **pjtawx** BUG-810 | `?*T` call-arg and `?*T` return ACCEPTED. **Complementary to V7, not a duplicate** — V7 is the type-system root, V8 is the hand-rolled per-sink comparison |
 | ~~V9~~ **DONE (BUG-842)** | `@atomic_*` in a global initializer emits broken C | **4z36e0** BUG-808 (structural) | Emits literally `uint32_t gres = ;`. pjtawx BUG-806 fixes only the atomics subset; 4z36e0 fixes the CAUSE — a name-check wrongly nested inside an `arg_count >= 1` precondition belonging to a different rule |
@@ -114,14 +135,14 @@ phrasing. Cosmetic; the rules fire.
 | ~~V15~~ **DONE (BUG-844)** | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
 | ~~V16~~ **DONE (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
 | ~~V17~~ **DONE (BUG-845)** | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
-| V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
-| V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
-| V20 | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | `.over` is a constructor returning BY VALUE; as a statement it builds into a discarded temp |
-| V21 | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | `rb.push_checked(a);` — the one method whose entire purpose is reporting overflow, silently not reporting it. Subsumes the ghost-handle check. Corpus cost measured at ZERO (all 6 hits are ghost-handle negatives) |
+| ~~V18~~ **DONE (BUG-848)** | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
+| ~~V19~~ **DONE (BUG-848)** | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
+| ~~V20~~ **DONE (BUG-849)** | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | `.over` is a constructor returning BY VALUE; as a statement it builds into a discarded temp |
+| ~~V21~~ **DONE (BUG-850)** | A discarded `?T` silently throws the failure away | **4z36e0** BUG-807 | `rb.push_checked(a);` — the one method whose entire purpose is reporting overflow, silently not reporting it. Subsumes the ghost-handle check. Corpus cost measured at ZERO (all 6 hits are ghost-handle negatives) |
 | ~~V22~~ **DONE (BUG-836)** | `--stack-limit` never sums main + ISRs, which share one stack | **pjtawx** BUG-811 | Two 200-byte chains pass `--stack-limit 256`. The tool AFFIRMS a budget the target cannot honour |
 | ~~V23~~ **DONE (BUG-835)** | Auto-guard's `return` leaks a held lock and the interrupt-disable | **87xihb** BUG-805 | **The lock form HANGS (deadlock, verified exit 124); the `@critical` form exits 0 silently.** The compiler emits the exact construct it hard-errors users for writing. Main has `guard_traps` for defer bodies only — needs `noreturn_scope_depth` counted inside `emit_shared_lock_mode`/`emit_shared_unlock` and both `IR_CRITICAL` handlers |
-| V24 | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | `--totally-bogus-flag`, `--target-arch=nonsense`, `--stack-limit=abc` all exit 0 with no diagnostic. `--target-arch=arm64` (valid spelling is `aarch64`) silently builds x86 |
-| V25 | `break`/`continue` in a for-INITIALISER binds to the ENCLOSING loop | **pjtawx** BUG-813 | Accepted. Branch REJECTS rather than rebinds — the semantics is genuinely ambiguous (`continue` would jump to the step of a loop whose induction variable was never initialised). Corpus cost zero |
+| ~~V24~~ **DONE (BUG-855)** | Unrecognised CLI options silently ignored | **pmytnl** BUG-805 | `--totally-bogus-flag`, `--target-arch=nonsense`, `--stack-limit=abc` all exit 0 with no diagnostic. `--target-arch=arm64` (valid spelling is `aarch64`) silently builds x86 |
+| ~~V25~~ **DONE (BUG-854)** | `break`/`continue` in a for-INITIALISER binds to the ENCLOSING loop | **pjtawx** BUG-813 | Accepted. Branch REJECTS rather than rebinds — the semantics is genuinely ambiguous (`continue` would jump to the step of a loop whose induction variable was never initialised). Corpus cost zero |
 | ~~V26~~ **DONE (BUG-837)** | No way to declare a bare-metal target; `@critical` degrades to a fence | **pjtawx** BUG-812 | `_ZER_HOSTED`/`ZER_FREESTANDING` absent. Scope is narrower than the branch first claimed: ARM/RISC-V/AVR key on the ARCH macro and were always correct — real exposure is **bare-metal x86** (kernel, bootloader, EFI) |
 | ~~V27~~ **DONE (BUG-838)** | MMIO boot validator could never fire, and trying cost a boot hang | **pjtawx** BUG-814 | Gated to exactly the targets where `_zer_probe` hardcodes success. The read still happens from a constructor — before any RCC clock-enable, i.e. a BusFault on a clock-gated peripheral |
 
@@ -144,7 +165,7 @@ these 11 are its output, each verified live.
 | ~~W8~~ **DONE (BUG-825)** | `scan_frame` skipped loop cond/step, assign target, slice bounds, callee | recursion + `--stack-limit` blind to a call in a condition |
 | ~~W9~~ **DONE (BUG-826)** | ISR sibling + VRP invalidation descents | = V6 |
 | ~~W10~~ **DONE (BUG-829)** | `ir_defer_free_arg` knew only 3 builtin free spellings | = O1 |
-| W11 | `naked` silently dropped since the IR migration | see Q1 — still OPEN (§F) |
+| ~~W11~~ **DONE (BUG-852)** | `naked` silently dropped since the IR migration | see Q1 — still OPEN (§F) |
 
 **Latent, documented, not fixable yet:** no walker descends `asm` operand expressions.
 Unreachable only because `asm` is naked-only; opens seven holes at once the day S1 relaxes.
@@ -153,18 +174,18 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| O1 | `defer sensor_close(dev)` reported as a leak; the DIRECT call is recognised | **39294y** BUG-812 (`ir_defer_free_arg`) | `cinterop_defer_close_ok` and `defer_extern_destructor_no_false_leak` both hard-error. This is the flagship "Safe C Library Interop" example in `reference.md` — the docs assert it compiles and it does not. pjtawx BUG-805 is the same fix; take either, keep both tests |
-| O2 | Sticky packed-derived flag refuses a re-cleared pointer | **87xihb** BUG-804 (boundary positive) | `packed_aligned_forms_ok` hard-errors on main. The fix SETS on a packed-derived RHS and CLEARS otherwise |
-| O3 | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
+| ~~O1~~ **DONE (BUG-829)** | `defer sensor_close(dev)` reported as a leak; the DIRECT call is recognised | **39294y** BUG-812 (`ir_defer_free_arg`) | `cinterop_defer_close_ok` and `defer_extern_destructor_no_false_leak` both hard-error. This is the flagship "Safe C Library Interop" example in `reference.md` — the docs assert it compiles and it does not. pjtawx BUG-805 is the same fix; take either, keep both tests |
+| ~~O2~~ **DONE (BUG-833)** | Sticky packed-derived flag refuses a re-cleared pointer | **87xihb** BUG-804 (boundary positive) | `packed_aligned_forms_ok` hard-errors on main. The fix SETS on a packed-derived RHS and CLEARS otherwise |
+| **O3 — STILL OPEN** | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
 
 ### Quality / no-longer-silent (not soundness)
 
 | # | Item | Best version |
 |---|---|---|
-| Q1 | `naked` silently dropped -> warn at the declaration | **4z36e0**. Deeper measurement than 39294y's identical fix: GCC 13 x86-64 DOES support the attribute (emits `endbr64; body; ud2`, no `ret`), 16 of 18 `asm_*.zer` positives CALL their naked function so flipping it on SIGILLs all 16, and `naked` is OVERLOADED (it is the only way to get asm permission). 43 corpus files emit the warning — that number IS the finding |
-| Q2 | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
-| Q3 | Emitter's five give-up paths are silent miscompiles | **4z36e0**. `/* complex callee */(a, b)` is a valid C COMMA EXPRESSION — compiles, runs, CALLS NOTHING. Measured 0/1170 corpus programs reach them, so `emit_unreachable()` aborts nothing reachable |
-| Q4 | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |
+| ~~Q1~~ **DONE (BUG-852)** | `naked` silently dropped -> warn at the declaration | **4z36e0**. Deeper measurement than 39294y's identical fix: GCC 13 x86-64 DOES support the attribute (emits `endbr64; body; ud2`, no `ret`), 16 of 18 `asm_*.zer` positives CALL their naked function so flipping it on SIGILLs all 16, and `naked` is OVERLOADED (it is the only way to get asm permission). 43 corpus files emit the warning — that number IS the finding |
+| ~~Q2~~ **DONE (BUG-853)** | Value-returning `async` has no retrieval API -> warn | **4z36e0**. Reject was measured and rejected: corpus cost is 1 file, and it is the BH-18 #10 regression guard |
+| ~~Q3~~ **DONE (BUG-851)** | Emitter's five give-up paths are silent miscompiles | **4z36e0**. `/* complex callee */(a, b)` is a valid C COMMA EXPRESSION — compiles, runs, CALLS NOTHING. Measured 0/1170 corpus programs reach them, so `emit_unreachable()` aborts nothing reachable |
+| ~~Q4~~ **DONE (BUG-845)** | `@saturate` not total (float bounds rounded UP; AST signed-64 arm had no clamp) | **pmytnl**, rides with V17 |
 
 ### Tooling and gates (pure gain — no behaviour change)
 

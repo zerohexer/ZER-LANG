@@ -1,0 +1,34 @@
+// EXPECTED: compile error
+// expect-error: for-loop INITIALISER is ambiguous
+// BUG-813 — `break` / `continue` reached from a for-INITIALISER binds to the
+// ENCLOSING loop, not the one being initialised: the lowerer runs the init
+// before installing this loop's exit/continue targets.
+//
+// MEASURED: with the inner loop's init doing `orelse break`, the program exited
+// the OUTER loop and returned 10 where inner-binding would give 18. Silent, and
+// the opposite of what `break` means everywhere else in ZER, where it always
+// binds to the innermost loop.
+//
+// REJECTED rather than rebound. The language has never said which loop it should
+// be, and neither answer is obviously right: binding to the loop being
+// initialised makes `break` consistent, but `continue` would then jump to the
+// STEP of a loop whose induction variable was never initialised, which is
+// incoherent. Picking a semantics silently is the actual defect. The spec call is
+// recorded in docs/limitations.md; until it is made, the diagnostic names the
+// ambiguity and gives the one-line workaround.
+//
+// Corpus cost measured at ZERO — no file in tests/, test_modules/, rust_tests/,
+// zig_tests/, lib/ or examples/ puts break or continue in a for-init.
+?u32 maybe(u32 i) { if (i == 1) { return null; } return i; }
+
+u32 count() {
+    u32 n = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        for (u32 v = maybe(i) orelse break; v < 10; v += 1) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+u32 main() { return count(); }

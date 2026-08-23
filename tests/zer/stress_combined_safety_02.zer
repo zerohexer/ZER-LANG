@@ -30,7 +30,11 @@ u32 process_reading(Reading r) {
 }
 
 u32 main() {
-    scratch.over(backing);
+    /* BUG-849: was `scratch.over(backing);` — a bare statement, which is a SILENT
+       NO-OP: .over is a constructor returning an Arena BY VALUE, so the result was
+       discarded and `scratch` kept capacity 0. Every alloc below returned null and
+       this 'stress' test ran almost none of itself. */
+    scratch = Arena.over(backing);
 
     ?*Sensor ms1 = heap.alloc_ptr();
     *Sensor s1 = ms1 orelse return;

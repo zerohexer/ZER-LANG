@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: read-modify-write
+// BUG-856 — `g = @truncate(u32, g) + 1` is the same non-atomic read-modify-write as
+// `g = g + 1`, which was correctly rejected the whole time. expr_mentions_global —
+// the "does the RHS read the target?" predicate both RMW sinks depend on — was
+// missing NODE_INTRINSIC, NODE_CALL and NODE_ORELSE, so a read laundered through any
+// of them did not count and the write was classified as a plain store.
+//
+// It is an if/else CHAIN, which is why NEITHER walker gate could see the gap:
+// walker_default_audit greps kind-SWITCHES and audit_walker_fields reads `case` arms.
+// Recorded because that shape is a standing blind spot, not a clean bill.
+volatile u32 g;
+void worker() { g = @truncate(u32, g) + 1; }
+u32 main() { spawn worker(); return 0; }

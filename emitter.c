@@ -1056,6 +1056,32 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
     emit(e, ")_zer_f2i%d; })", tmp);
 }
 
+/* BUG-851: five emitter GIVE-UP paths emitted a comment plus a placeholder when the
+ * emitter reached a shape it could not lower. Not a live bug — a live RISK, of exactly
+ * the class tools/emit_audit.sh exists to guard, sitting in the emitter itself and not
+ * covered by that script.
+ *
+ * The three CALLEE ones are the worst: a bare comment followed by "(a, b)" is a valid
+ * C COMMA EXPRESSION evaluating to `b`, so the program compiles, runs, and CALLS
+ * NOTHING — no diagnostic, no crash, wrong behaviour. The other two substitute a
+ * literal zero for an expression. All five are silent miscompiles, and none of their
+ * fingerprints was in the audit's pattern list.
+ *
+ * MEASURED BEFORE CHANGING ANYTHING: 0 of 1146 corpus programs emit any of the five
+ * markers, so nothing reachable becomes an abort. Why the audit could not have caught
+ * them regardless: it compiles 5 hand-picked samples and greps 4 fingerprints, so a
+ * give-up in a shape none of those contains is invisible even with the right patterns
+ * added. Making the emitter LOUD does not depend on a sample ever exercising the path. */
+static void emit_unreachable(Emitter *e, const char *what, Node *n) {
+    (void)e;
+    fprintf(stderr,
+            "INTERNAL ERROR: emitter cannot lower %s%s%s — please report with a minimal "
+            "reproducer.\n", what,
+            n ? " at line " : "", n ? "" : "");
+    if (n) fprintf(stderr, "  (source line %d)\n", n->loc.line);
+    abort();
+}
+
 static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     if (!t) return;
     TypeKind k = type_dispatch_kind(t);
@@ -3979,7 +4005,7 @@ static void emit_expr(Emitter *e, Node *node) {
      * the IR pipeline); the diagnostic fallback is the right behavior
      * for any kind not legitimately reachable here. */
     default:
-        emit(e, "/* unhandled expr %s */0", node_kind_name(node->kind));
+        emit_unreachable(e, node_kind_name(node->kind), node);   /* BUG-851 */
         break;
     }
 }
@@ -10083,7 +10109,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit(e, " }); })");
             } else {
                 /* Truly unknown — emit placeholder */
-                emit(e, "/* unknown slice */ 0");
+                emit_unreachable(e, "this slice shape", node);   /* BUG-851 */
             }
         }
         return;
@@ -10718,7 +10744,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              (int)callee->field.field_name_len, callee->field.field_name);
                     }
                 } else {
-                    emit(e, "/* complex callee */(");
+                    emit_unreachable(e, "this call target", inst->expr);   /* BUG-851 */
                 }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
@@ -10771,10 +10797,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     }
                     emit(e, "](");
                 } else {
-                    emit(e, "/* complex index callee */(");
+                    emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
                 }
             } else {
-                emit(e, "/* unknown callee */(");
+                emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
             }
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");

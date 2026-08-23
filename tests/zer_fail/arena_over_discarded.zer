@@ -1,0 +1,21 @@
+// expect-error: discarded Arena.over() result
+//
+// `.over` is a CONSTRUCTOR — it returns a new Arena by value. Written as a bare
+// statement it looks exactly like initialisation but assigns nothing, so the
+// receiver keeps capacity 0 and every later alloc() returns null, forever, with
+// no diagnostic at either end.
+//
+// Measured 2026-08-20: `a.over(mem); a.alloc(B)` yields null while
+// `a = Arena.over(mem); a.alloc(B)` succeeds — the ONLY difference is the
+// discarded assignment. Two files in the tree used the no-op form.
+struct B { u32 d; }
+
+u8[512] mem;
+Arena a;
+
+u32 main() {
+    a.over(mem);                 // no-op: the new Arena is thrown away
+    *B b = a.alloc(B) orelse { return 1; };
+    b.d = 5;
+    return 0;
+}

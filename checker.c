@@ -1151,6 +1151,49 @@ static void classify_escape_sink(Checker *c, Node *target,
  * stored to a global). A VALUE optional (?u32) copies a value, not a reference, so
  * it is correctly excluded (its unwrapped inner is not a pointer/slice). */
 static Node *unwrap_ptr_launder(Node *v);   /* fwd: defined below */
+/* BUG-854: does a for-INITIALISER contain a loop jump? A for-init is only ever a
+ * VAR_DECL or an EXPRESSION, so the reachable shapes are narrow — a bare
+ * `break`/`continue` statement, or one hidden in an `orelse` arm (the form that
+ * actually occurs: `x = f() orelse break`). Written as an if-chain rather than a
+ * kind-switch because it is a focused predicate, not a walker: it deliberately does
+ * NOT descend loop bodies or blocks, which cannot appear in an init anyway. */
+static bool for_init_has_loop_jump(Node *n, int depth) {
+    if (!n || depth > 32) return false;
+    if (n->kind == NODE_BREAK || n->kind == NODE_CONTINUE) return true;
+    if (n->kind == NODE_ORELSE) {
+        if (n->orelse.fallback_is_break || n->orelse.fallback_is_continue) return true;
+        return for_init_has_loop_jump(n->orelse.expr, depth + 1) ||
+               for_init_has_loop_jump(n->orelse.fallback, depth + 1);
+    }
+    if (n->kind == NODE_VAR_DECL)  return for_init_has_loop_jump(n->var_decl.init, depth + 1);
+    if (n->kind == NODE_EXPR_STMT) return for_init_has_loop_jump(n->expr_stmt.expr, depth + 1);
+    if (n->kind == NODE_ASSIGN)
+        return for_init_has_loop_jump(n->assign.target, depth + 1) ||
+               for_init_has_loop_jump(n->assign.value, depth + 1);
+    if (n->kind == NODE_BINARY)
+        return for_init_has_loop_jump(n->binary.left, depth + 1) ||
+               for_init_has_loop_jump(n->binary.right, depth + 1);
+    if (n->kind == NODE_UNARY)     return for_init_has_loop_jump(n->unary.operand, depth + 1);
+    if (n->kind == NODE_TYPECAST)  return for_init_has_loop_jump(n->typecast.expr, depth + 1);
+    if (n->kind == NODE_CALL) {
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (for_init_has_loop_jump(n->call.args[i], depth + 1)) return true;
+        return false;
+    }
+    if (n->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (for_init_has_loop_jump(n->intrinsic.args[i], depth + 1)) return true;
+        return false;
+    }
+    if (n->kind == NODE_BLOCK) {
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (for_init_has_loop_jump(n->block.stmts[i], depth + 1)) return true;
+        return false;
+    }
+    return false;
+}
+
+void checker_post_passes(Checker *c, Node *file_node);  /* fwd: defined below */
 static bool escape_type_carries_ref(Type *vt) {
     if (!vt) return false;
     TypeKind k = type_dispatch_kind(vt);
@@ -2129,6 +2172,36 @@ static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
     if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
                                        expr_mentions_global(e->index_expr.index, g, depth + 1);
     if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
+    /* BUG-856: INTRINSIC / CALL / ORELSE were missing, so a read of the global
+     * laundered through any of them did not count as reading it and the write was
+     * classified as a plain store rather than a read-modify-write:
+     *     g = @truncate(u32, g) + 1;    // ACCEPTED at both the spawn and ISR sinks
+     *     g = g + 1;                    // correctly REJECTED
+     * An interrupt or a concurrent thread landing between the load and the store
+     * loses the update, silently.
+     *
+     * This function is an if/else CHAIN, which is why NEITHER gate could see the
+     * gap: walker_default_audit greps kind-SWITCHES, and audit_walker_fields reads
+     * `case` arms. 39294y called that out explicitly and it held — the field audit
+     * reported this file's OTHER walkers and never this one. Recorded here so the
+     * next person knows the chain form is a blind spot, not a clean bill. */
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (expr_mentions_global(e->intrinsic.args[i], g, depth + 1)) return true;
+        return false;
+    }
+    if (e->kind == NODE_CALL) {
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (expr_mentions_global(e->call.args[i], g, depth + 1)) return true;
+        return expr_mentions_global(e->call.callee, g, depth + 1);
+    }
+    if (e->kind == NODE_ORELSE)
+        return expr_mentions_global(e->orelse.expr, g, depth + 1) ||
+               expr_mentions_global(e->orelse.fallback, g, depth + 1);
+    if (e->kind == NODE_SLICE)
+        return expr_mentions_global(e->slice.object, g, depth + 1) ||
+               expr_mentions_global(e->slice.start, g, depth + 1) ||
+               expr_mentions_global(e->slice.end, g, depth + 1);
     return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
 }
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
@@ -13778,6 +13851,29 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_FOR: {
         push_scope(c); /* for loop has its own scope */
+        /* BUG-854: the lowerer runs a for-loop's INIT before installing that loop's
+         * exit/continue targets, so a `break` reached from the init resolved against
+         * the ENCLOSING loop. Measured: with the inner loop's init doing
+         * `orelse break`, the program exited the OUTER loop and returned 10 where
+         * inner-binding gives 18. Silent, and the opposite of what break means
+         * everywhere else in ZER, where it always binds to the innermost loop.
+         *
+         * REJECTED rather than rebound, deliberately: the language has never said
+         * which loop it should be and neither answer is obviously right. Binding to
+         * the loop being initialised makes `break` consistent, but `continue` would
+         * then jump to the STEP of a loop whose induction variable was never
+         * initialised, which is incoherent. Picking a semantics silently is the
+         * actual defect; a diagnostic that names the ambiguity and gives the one-line
+         * workaround is the honest answer until the spec makes the call.
+         * Corpus cost measured at ZERO before shipping. */
+        if (node->for_stmt.init &&
+            for_init_has_loop_jump(node->for_stmt.init, 0)) {
+            checker_error(c, node->loc.line,
+                "'break'/'continue' in a for-loop INITIALISER is ambiguous — it is evaluated "
+                "before this loop exists, so it would bind to the ENCLOSING loop, which "
+                "is the opposite of what break means everywhere else in ZER. Hoist the "
+                "initialiser above the loop");
+        }
         if (node->for_stmt.init) {
             /* Parser emits either NODE_VAR_DECL (for `u32 i = 0`) or an
              * expression (for `i = 0`, `i += 5`, etc., via parse_expression).
@@ -15149,8 +15245,34 @@ static void check_stmt(Checker *c, Node *node) {
         break;
     }
 
-    case NODE_EXPR_STMT:
-        check_expr(c, node->expr_stmt.expr);
+    case NODE_EXPR_STMT: {
+        Type *_est = check_expr(c, node->expr_stmt.expr);
+        /* BUG-850: `?T` is the whole argument that a failure cannot be ignored in
+         * ZER — the checker forces an unwrap at every USE site. Throwing the entire
+         * optional away was the hole in that argument, and it was accepted
+         * everywhere:
+         *     rb.push_checked(a);   // ?void discarded — a FULL ring silently ignored
+         *     may_fail(x);          // ?u32  discarded — the failure reaches no one
+         *     rb.pop();             // ?M    discarded
+         * push_checked is the sharpest case: its ONLY difference from push is the
+         * ?void it returns, so discarding it makes the call identical to the
+         * fire-and-forget version. The one method whose entire purpose is reporting
+         * overflow stopped reporting it, at compile time and at runtime.
+         *
+         * This SUBSUMES the ghost-handle check below, which is this same rule
+         * hand-specialised to pool.alloc / slab.alloc_ptr — one question answered
+         * once, so a new optional-returning builtin is covered without being added
+         * to a list. The allocation case keeps its more specific wording ("handle
+         * leaked" teaches more than "failure ignored"), so it is tried FIRST.
+         *
+         * Corpus cost measured BEFORE shipping: a probe reporting every
+         * statement-position call whose type is optional across tests/, rust_tests/,
+         * zig_tests/, test_modules/, lib/ and examples/ found 6 sites, ALL SIX the
+         * ghost-handle NEGATIVES, which are supposed to be rejected.
+         *
+         * Escape valve is one teachable line that states the intent instead of
+         * hiding it: `rb.push_checked(a) orelse { };` */
+        bool _ghost_reported = false;
         /* Ghost handle: warn if pool.alloc()/slab.alloc() result is discarded.
          * The handle is leaked — must assign to a variable. */
         if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_CALL &&
@@ -15172,10 +15294,27 @@ static void check_stmt(Checker *c, Node *node) {
                         "discarded alloc result — handle leaked. Assign to a variable: "
                         "'Handle(...) h = %.*s.alloc() orelse return;'",
                         (int)call_obj->ident.name_len, call_obj->ident.name);
+                    _ghost_reported = true;
                 }
             }
         }
+        /* the general rule, when the specialised one did not already fire */
+        /* ONLY a CALL. An ASSIGNMENT in statement position is not a discard — the
+         * value went somewhere, and check_expr returns the assigned type, so a
+         * broader test flags `g_ptr = p;` and `arr[0] = pool.alloc();`. Measured:
+         * the broad version hit 38 VALID programs; scoped to calls it hits the
+         * ghost-handle negatives only. */
+        if (!_ghost_reported && node->expr_stmt.expr &&
+            node->expr_stmt.expr->kind == NODE_CALL && _est &&
+            type_dispatch_kind(_est) == TYPE_OPTIONAL) {
+            checker_error(c, node->loc.line,
+                "discarded optional result: throwing a '%s' away discards the failure, which is "
+                "what '?' exists to prevent. Handle it ('x = f() orelse d', "
+                "'if (f()) |v| { }'), or state the intent with 'f() orelse { };'",
+                type_name(_est));
+        }
         break;
+    }
 
     case NODE_ASM:
         /* MISRA Dir 4.3: asm must be encapsulated in naked functions
@@ -17140,6 +17279,26 @@ static void register_decl(Checker *c, Node *node) {
         typemap_set(c, node,func_type);
 
         /* Async function: register state struct type + init/poll functions */
+        if (node->func_decl.is_async && node->func_decl.return_type) {
+            /* BUG-853: `async u32 compute() { yield; return 42; }` compiles, runs and
+             * finalises its state machine correctly — and the 42 is UNREACHABLE. The
+             * poll protocol is an `int` done-flag; the value lands in an internal temp
+             * whose name depends on how the body happened to lower, so there is not
+             * even an unstable thing to reach for.
+             *
+             * A WARNING rather than a reject, and the reject was MEASURED before being
+             * rejected: corpus cost is 1 file, and it is the one file that must keep
+             * compiling — tests/zer/bh18_10_async_value_return_idempotent.zer, the
+             * regression guard for BH-18 #10 (a value-returning async that failed to
+             * finalise and re-ran its tail on every later poll). Rejecting would delete
+             * the guard along with the footgun. */
+            Type *art = resolve_type(c, node->func_decl.return_type);
+            if (art && type_dispatch_kind(art) != TYPE_VOID)
+                checker_warning(c, node->loc.line,
+                    "async function returns '%s', but the poll protocol has no way to "
+                    "deliver it — the value is unreachable. Return void and write the "
+                    "result to a global or a caller-owned struct", type_name(art));
+        }
         if (node->func_decl.is_async && sym) {
             /* Build mangled name: _zer_async_funcname */
             char aname[256];
@@ -17888,6 +18047,33 @@ static void check_func_body(Checker *c, Node *node) {
         }
 
         if (node->func_decl.is_naked) {
+            /* BUG-852: `naked` is SILENTLY DROPPED on the IR path — the emitted C is a
+             * plain function and GCC wraps the user's asm in a full prologue and
+             * epilogue. A user writing a reset handler, a vector-table entry or a
+             * context-switch primitive believes they control every byte; on bare metal
+             * that does not fault, it corrupts registers or returns through an epilogue
+             * they never wrote. Silent hardware-domain failure is what ZER refuses to
+             * ship, so the attribute is still dropped but the compiler now SAYS SO.
+             *
+             * Not simply restored, and the reasons are measured rather than assumed:
+             * GCC 13 x86-64 DOES support __attribute__((naked)) — it emits
+             * `endbr64; <body>; ud2`, with no prologue and NO `ret` — and 16 of the 18
+             * positive tests/zer/asm_*.zer CALL their naked function, so flipping the
+             * attribute on SIGILLs every one of them. GCC also permits only BASIC asm
+             * inside a naked function, while ZER's structured `asm { inputs: ... }`
+             * lowers to EXTENDED asm, and the Z-rule operand tracking that keeps
+             * UAF/VRP/provenance live across the asm boundary is built on those
+             * operands. Real naked semantics and ZER's asm SAFETY feature are in direct
+             * tension. Root cause: `naked` is OVERLOADED — the S1 guard makes it the
+             * only way to get permission to write asm, so almost every use here means
+             * "let me write asm", not "emit no prologue". Decoupling the two intents is
+             * Option E, not a flag flip. */
+            checker_warning(c, node->loc.line,
+                "'naked' is accepted for asm permission but the attribute is NOT emitted: "
+                "GCC will still generate a prologue/epilogue, so you do NOT get your own "
+                "frame layout, your own ret/iret/eret, or untouched callee-saved "
+                "registers. For true naked semantics write the function in C and bring it "
+                "in with 'cinclude'");
             c->in_naked = true;
             /* MISRA Dir 4.3: naked functions must only contain asm statements.
              * Non-asm code uses stack that was never allocated (no prologue). */
@@ -20986,22 +21172,13 @@ bool checker_check(Checker *c, Node *file_node) {
     check_keep_inference(c);
     if (c->error_count > 0) ok = false;
 
-    /* Pass 3: whole-program *opaque param provenance validation */
-    if (c->param_expect_count > 0) {
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            check_call_provenance(c, file_node->file.decls[i]);
-        }
-    }
-
-    /* Pass 4: interrupt safety — validate shared globals */
-    if (c->isr_global_count > 0) {
-        check_interrupt_safety(c);
-    }
-    /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
-    check_atomic_cell_safety(c);
-
-    /* Pass 5: stack depth analysis — detect recursion */
-    check_stack_depth(c, file_node);
+    /* BUG-847: this used to be a hand-rolled COPY of checker_post_passes' list, and
+     * the copy had DRIFTED — it was missing check_lock_ordering entirely, so
+     * deadlock detection ran for zerc (which calls checker_post_passes) and silently
+     * did NOT for the LSP or the C unit tests (which come through here). Two
+     * hand-maintained copies of one pass list is the same multi-site shape as the
+     * rest of this harvest, one level up: call the list, do not restate it. */
+    checker_post_passes(c, file_node);
 
     return c->error_count == 0;
 }
@@ -21738,6 +21915,211 @@ static void check_lock_ordering(Checker *c, Node *file_node) {
     }
 }
 
+/* ---- BUG-848: "was this builtin given the initialisation it requires?" ----
+ *
+ * Found by generalising rather than from a report: which OTHER builtins keep their
+ * capacity in a RUNTIME FIELD instead of in their type? A bare declaration
+ * zero-initialises those into something that compiles, runs, and silently does
+ * nothing. The answer is exactly TWO — Arena and Barrier — since every other builtin
+ * states its size in its type (Pool(T,N), Ring(T,N), Semaphore(N)) or grows on
+ * demand (Slab). So this is ONE question with two members, answered once:
+ *
+ *   Arena a;   *T p = a.alloc(T) orelse return;   // capacity 0 -> null, FOREVER
+ *   Barrier g; @barrier_wait(g);                  // target 0 -> `1 >= 0` on the
+ *                                                 // FIRST caller: broadcast, return
+ *
+ * The barrier case is worse in one respect: an unbacked arena at least returns null,
+ * which the caller must handle. A dead barrier returns SUCCESS — threads that believe
+ * they are synchronised are not.
+ *
+ * DEFERRED to a whole-file pass because the initialisation legitimately FOLLOWS the
+ * use lexically (the declare-global / init-in-main RTOS idiom, and `.over()` after
+ * the allocations). Flags only when all three facts hold: DECLARED here, USED, and
+ * never INITIALISED anywhere. Keyed by NAME, so a collision reads as INITIALISED —
+ * the conservative direction. A POINTER parameter (*Barrier / *Arena) is never
+ * flagged: the caller owns the initialisation. */
+typedef enum { ZBI_ARENA, ZBI_BARRIER } ZerInitKind;
+typedef struct {
+    const char *name; uint32_t name_len;
+    ZerInitKind kind;
+    int decl_line;
+    bool used;        /* alloc() / @barrier_wait() seen */
+    bool inited;      /* .over(...) assigned / @barrier_init() seen */
+} ZerInitUse;
+
+typedef struct {
+    ZerInitUse  stack[16];
+    ZerInitUse *v;
+    int n, cap;
+} ZerInitSet;
+
+static void zbi_init(ZerInitSet *st) { st->v = st->stack; st->n = 0; st->cap = 16; }
+static void zbi_free(ZerInitSet *st) { if (st->v != st->stack) free(st->v); }
+static ZerInitUse *zbi_find(ZerInitSet *st, const char *n, uint32_t l) {
+    for (int i = 0; i < st->n; i++)
+        if (st->v[i].name_len == l && memcmp(st->v[i].name, n, l) == 0) return &st->v[i];
+    return NULL;
+}
+static void zbi_add(ZerInitSet *st, const char *n, uint32_t l, ZerInitKind k, int line) {
+    if (zbi_find(st, n, l)) { /* name collision -> treat as initialised */
+        zbi_find(st, n, l)->inited = true; return;
+    }
+    if (st->n >= st->cap) {
+        int nc = st->cap * 2;
+        ZerInitUse *nv = (ZerInitUse *)malloc((size_t)nc * sizeof(ZerInitUse));
+        if (!nv) return;
+        memcpy(nv, st->v, (size_t)st->n * sizeof(ZerInitUse));
+        if (st->v != st->stack) free(st->v);
+        st->v = nv; st->cap = nc;
+    }
+    ZerInitUse *e = &st->v[st->n++];
+    e->name = n; e->name_len = l; e->kind = k; e->decl_line = line;
+    e->used = false; e->inited = false;
+}
+static void zbi_mark(ZerInitSet *st, Node *e, bool used, bool inited) {
+    if (!e || e->kind != NODE_IDENT) return;
+    ZerInitUse *u = zbi_find(st, e->ident.name, (uint32_t)e->ident.name_len);
+    if (!u) return;
+    if (used) u->used = true;
+    if (inited) u->inited = true;
+}
+
+static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth);
+static void zbi_scan_children(Checker *c, ZerInitSet *st, Node *n, int depth) {
+    #define Z(x) zbi_scan(c, st, (x), depth + 1)
+    switch (n->kind) {
+    case NODE_FILE: for (int i=0;i<n->file.decl_count;i++) Z(n->file.decls[i]); break;
+    case NODE_FUNC_DECL: Z(n->func_decl.body); break;
+    case NODE_INTERRUPT: Z(n->interrupt.body); break;
+    case NODE_BLOCK: for (int i=0;i<n->block.stmt_count;i++) Z(n->block.stmts[i]); break;
+    case NODE_IF: Z(n->if_stmt.cond); Z(n->if_stmt.then_body); Z(n->if_stmt.else_body); break;
+    case NODE_FOR: Z(n->for_stmt.init); Z(n->for_stmt.cond); Z(n->for_stmt.step); Z(n->for_stmt.body); break;
+    case NODE_WHILE: case NODE_DO_WHILE: Z(n->while_stmt.cond); Z(n->while_stmt.body); break;
+    case NODE_SWITCH: Z(n->switch_stmt.expr);
+        for (int i=0;i<n->switch_stmt.arm_count;i++) Z(n->switch_stmt.arms[i].body); break;
+    case NODE_GLOBAL_VAR: case NODE_VAR_DECL: Z(n->var_decl.init); break;
+    case NODE_RETURN: Z(n->ret.expr); break;
+    case NODE_DEFER: Z(n->defer.body); break;
+    case NODE_CRITICAL: Z(n->critical.body); break;
+    case NODE_ONCE: Z(n->once.body); break;
+    case NODE_AWAIT: Z(n->await_stmt.cond); break;
+    case NODE_STATIC_ASSERT: Z(n->static_assert_stmt.cond); break;
+    case NODE_SPAWN: for (int i=0;i<n->spawn_stmt.arg_count;i++) Z(n->spawn_stmt.args[i]); break;
+    case NODE_EXPR_STMT: Z(n->expr_stmt.expr); break;
+    case NODE_ASSIGN: Z(n->assign.target); Z(n->assign.value); break;
+    case NODE_BINARY: Z(n->binary.left); Z(n->binary.right); break;
+    case NODE_UNARY: Z(n->unary.operand); break;
+    case NODE_CALL: Z(n->call.callee);
+        for (int i=0;i<n->call.arg_count;i++) Z(n->call.args[i]); break;
+    case NODE_FIELD: Z(n->field.object); break;
+    case NODE_INDEX: Z(n->index_expr.object); Z(n->index_expr.index); break;
+    case NODE_SLICE: Z(n->slice.object); Z(n->slice.start); Z(n->slice.end); break;
+    case NODE_ORELSE: Z(n->orelse.expr); Z(n->orelse.fallback); break;
+    case NODE_INTRINSIC: for (int i=0;i<n->intrinsic.arg_count;i++) Z(n->intrinsic.args[i]); break;
+    case NODE_TYPECAST: Z(n->typecast.expr); break;
+    case NODE_STRUCT_INIT:
+        for (int i=0;i<n->struct_init.field_count;i++) Z(n->struct_init.fields[i].value); break;
+    /* exhaustive (no default:) — genuine leaves */
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO:
+    case NODE_CONTAINER_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_ASM: case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    }
+    #undef Z
+}
+
+static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
+    if (!n || depth > 256) return;
+
+    /* declarations */
+    if (n->kind == NODE_VAR_DECL || n->kind == NODE_GLOBAL_VAR) {
+        Type *t = n->var_decl.type ? resolve_type(c, n->var_decl.type) : NULL;
+        Type *u = t ? type_unwrap_distinct(t) : NULL;
+        if (u && type_dispatch_kind(u) == TYPE_ARENA)
+            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_ARENA, n->loc.line);
+        else if (u && type_dispatch_kind(u) == TYPE_BARRIER)
+            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_BARRIER, n->loc.line);
+        /* `Arena a = Arena.over(buf);` initialises at the declaration */
+        if (n->var_decl.init) zbi_mark(st, NULL, false, false);
+        if (u && type_dispatch_kind(u) == TYPE_ARENA && n->var_decl.init) {
+            ZerInitUse *e = zbi_find(st, n->var_decl.name, (uint32_t)n->var_decl.name_len);
+            if (e) e->inited = true;
+        }
+    }
+
+    /* `a = Arena.over(buf);` / `a = <anything>` initialises */
+    if (n->kind == NODE_ASSIGN && n->assign.target)
+        zbi_mark(st, n->assign.target, false, true);
+
+    /* method calls on the receiver */
+    if (n->kind == NODE_CALL && n->call.callee && n->call.callee->kind == NODE_FIELD) {
+        Node *recv = n->call.callee->field.object;
+        const char *m = n->call.callee->field.field_name;
+        uint32_t ml = (uint32_t)n->call.callee->field.field_name_len;
+        if ((ml == 5 && memcmp(m, "alloc", 5) == 0) ||
+            (ml == 11 && memcmp(m, "alloc_slice", 11) == 0))
+            zbi_mark(st, recv, true, false);
+    }
+
+    /* @barrier_wait / @barrier_init */
+    if (n->kind == NODE_INTRINSIC && n->intrinsic.arg_count >= 1) {
+        const char *nm = n->intrinsic.name;
+        uint32_t nl = (uint32_t)n->intrinsic.name_len;
+        if (nl == 12 && memcmp(nm, "barrier_wait", 12) == 0)
+            zbi_mark(st, n->intrinsic.args[0], true, false);
+        else if (nl == 12 && memcmp(nm, "barrier_init", 12) == 0)
+            zbi_mark(st, n->intrinsic.args[0], false, true);
+    }
+
+    /* BUG-849: `a.over(buf);` as a BARE STATEMENT is a silent no-op. `.over` is a
+     * CONSTRUCTOR returning an Arena BY VALUE; as a statement it builds one into a
+     * discarded temp and the receiver keeps capacity 0. It reads exactly like
+     * initialisation, which is what makes it dangerous: `a.over(mem); a.alloc(B)`
+     * yields null while `a = Arena.over(mem); a.alloc(B)` succeeds, and the only
+     * difference is the discarded assignment. */
+    if (n->kind == NODE_EXPR_STMT && n->expr_stmt.expr &&
+        n->expr_stmt.expr->kind == NODE_CALL &&
+        n->expr_stmt.expr->call.callee &&
+        n->expr_stmt.expr->call.callee->kind == NODE_FIELD) {
+        Node *cal = n->expr_stmt.expr->call.callee;
+        if (cal->field.field_name_len == 4 &&
+            memcmp(cal->field.field_name, "over", 4) == 0) {
+            checker_error(c, n->loc.line,
+                "discarded Arena.over() result — '.over(...)' as a statement does nothing. It is a "
+                "CONSTRUCTOR returning an Arena BY VALUE, so the result is thrown away and "
+                "the receiver keeps capacity 0. Write 'a = Arena.over(buf);'");
+        }
+    }
+
+    zbi_scan_children(c, st, n, depth);
+}
+
+static void check_builtin_init(Checker *c, Node *file_node) {
+    ZerInitSet st; zbi_init(&st);
+    zbi_scan(c, &st, file_node, 0);
+    for (int i = 0; i < st.n; i++) {
+        ZerInitUse *e = &st.v[i];
+        if (!e->used || e->inited) continue;
+        if (e->kind == ZBI_ARENA)
+            checker_error(c, e->decl_line,
+                "arena '%.*s' is allocated from but never given a backing store, so "
+                "every alloc() returns null forever. Add 'a = Arena.over(buf);' "
+                "(a global arena is declared then initialised in a function)",
+                (int)e->name_len, e->name);
+        else
+            checker_error(c, e->decl_line,
+                "barrier '%.*s' is waited on but never initialised, so its target is 0 "
+                "and the FIRST caller passes straight through — the rendezvous never "
+                "happens and it reports SUCCESS. Add '@barrier_init(%.*s, N);'",
+                (int)e->name_len, e->name, (int)e->name_len, e->name);
+    }
+    zbi_free(&st);
+}
+
 void checker_post_passes(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
 
@@ -21763,4 +22145,8 @@ void checker_post_passes(Checker *c, Node *file_node) {
      * If A (type_id=1) is accessed, then B (type_id=2), then A again after B → OK.
      * But if B is accessed first, then A → "potential deadlock: lock ordering violation." */
     check_lock_ordering(c, file_node);
+
+    /* BUG-848/849: Arena + Barrier need an initialisation their TYPE does not
+     * state. Deferred to here because it legitimately follows the use. */
+    check_builtin_init(c, file_node);
 }

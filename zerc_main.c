@@ -207,9 +207,37 @@ void zerc_ir_hook(void *ctx, void *ir_func) {
 
 /* ================================================================ */
 
+static void zer_print_usage(void) {
+    printf(
+      "usage: zerc <input.zer> [options]\n\n"
+      "  -o <path>                 output; .c keeps the C, anything else builds an exe\n"
+      "  --run                     compile and execute\n"
+      "  --emit-c                  keep the generated .c\n"
+      "  --emit-ir                 print the IR and exit\n"
+      "  --lib                     no preamble/runtime (for C interop)\n"
+      "  --no-strict-mmio          allow @inttoptr outside declared mmio ranges\n"
+      "  --track-cptrs             track C-interop pointers\n"
+      "  --trace, --trace-calls    compiler tracing\n"
+      "  --release                 accepted, currently a NO-OP\n"
+      "  --gcc <path>              C compiler to use\n"
+      "  --target-bits <32|64>     usize width override\n"
+      "  --target-arch=<a>         x86_64 | aarch64 | riscv64\n"
+      "  --target-features=<list>  comma-separated, e.g. avx512f,aes\n"
+      "  --probe-mode=<m>          hosted | raw | disabled\n"
+      "  --stack-limit <bytes>     error when a stack budget is exceeded\n"
+      "  -h, --help                this message\n");
+}
+
 int main(int argc, char **argv) {
+    /* BUG-855: answer --help BEFORE the input-file requirement — `zerc --help` with
+     * no source is the way anyone discovers the flags. */
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            zer_print_usage();
+            return 0;
+        }
     if (argc < 2) {
-        fprintf(stderr, "Usage: zerc <input.zer> [-o output] [--run] [--emit-c] [--emit-ir]\n");
+        zer_print_usage();
         return 1;
     }
 
@@ -263,8 +291,20 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--track-cptrs") == 0) {
             track_cptrs = true;
         } else if (strcmp(argv[i], "--release") == 0) {
+            /* BUG-855: set and never read. Say so rather than implying it did
+             * something. */
+            fprintf(stderr, "warning: --release is currently a NO-OP "
+                            "(optimisation is GCC's, via the flags zerc passes)\n");
             release_mode = true;
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
+            /* BUG-855: the value was taken unvalidated. */
+            {
+                const char *tb = argv[i + 1];
+                if (strcmp(tb, "32") != 0 && strcmp(tb, "64") != 0) {
+                    fprintf(stderr, "error: --target-bits must be 32 or 64, got '%s'\n", tb);
+                    return 1;
+                }
+            }
             zer_target_ptr_bits = atoi(argv[++i]);
             target_bits_explicit = true;
         } else if (strcmp(argv[i], "--gcc") == 0 && i + 1 < argc) {
@@ -280,6 +320,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (strcmp(argv[i], "--stack-limit") == 0 && i + 1 < argc) {
+            /* BUG-855: a non-numeric value silently became 0, i.e. "no limit" — the
+             * direction that AFFIRMS a budget nobody checked. */
+            {
+                const char *sl = argv[i + 1];
+                char *endp = NULL;
+                long v = strtol(sl, &endp, 10);
+                if (!*sl || (endp && *endp) || v <= 0) {
+                    fprintf(stderr, "error: --stack-limit must be a positive integer, "
+                            "got '%s'\n", sl);
+                    return 1;
+                }
+            }
             zer_stack_limit = (uint32_t)atoi(argv[++i]);
         } else if (strncmp(argv[i], "--target-features=", 18) == 0) {
             /* F4.2 (2026-04-29): comma-separated CPU features. Each match
@@ -331,7 +383,26 @@ int main(int argc, char **argv) {
                 zer_target_arch_id = 3;
                 zer_target_arch_gcc = "riscv64-linux-gnu-gcc";
                 zer_target_features = 0;  /* clear x86 baseline */
+            } else {
+                /* BUG-855: an unknown VALUE was silently ignored, so
+                 * `--target-arch=arm64` (the spelling is `aarch64`) built x86 code
+                 * successfully for someone who asked for ARM. */
+                fprintf(stderr, "error: unknown --target-arch '%s' "
+                        "(use x86_64, aarch64, or riscv64)\n", a);
+                return 1;
             }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            zer_print_usage();
+            return 0;
+        } else {
+            /* BUG-855: there was NO final else — every unrecognised option was
+             * SILENTLY IGNORED. Measured on main: `--totally-bogus-flag`,
+             * `--target-arch=nonsense` and `--stack-limit=abc` all exited 0 with no
+             * diagnostic at all. A build tool that accepts a flag it does not
+             * implement is worse than one that rejects it: the user believes the
+             * setting took effect. */
+            fprintf(stderr, "error: unknown option '%s' (try --help)\n", argv[i]);
+            return 1;
         }
     }
 

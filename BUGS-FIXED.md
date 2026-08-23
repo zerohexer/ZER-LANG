@@ -5,6 +5,144 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-23 — BUG-847..856: §E/§F/§G, and the harvest closes
+
+Nine silent-behaviour fixes from `4z36e0`, `pmytnl` and `pjtawx`. None is an
+accept-unsafe hole; all nine are the compiler (or the tooling) doing nothing while
+appearing to do something.
+
+### BUG-847 — two hand-maintained copies of the post-pass list, and the copy had drifted
+`checker_check` carried its own COPY of the after-all-bodies pass list instead of
+calling `checker_post_passes`, and it was **missing `check_lock_ordering` entirely** —
+so deadlock detection ran for zerc (which calls the real one) and silently did NOT for
+the LSP or the C unit tests. Two copies of one list is this harvest's shape one level
+up: call the list, do not restate it.
+
+### BUG-848 — Arena and Barrier need an initialisation their TYPE does not state
+Found by GENERALISING rather than from a report: which other builtins keep their
+capacity in a RUNTIME FIELD instead of in their type? Exactly two — every other builtin
+states its size in its type (Pool(T,N), Ring(T,N), Semaphore(N)) or grows on demand
+(Slab). So one question, two members, answered once (`check_builtin_init`).
+
+    Arena a;   *T p = a.alloc(T) orelse return;   // capacity 0 -> null, FOREVER
+    Barrier g; @barrier_wait(g);                  // target 0 -> `1 >= 0` on the FIRST
+                                                  // caller: broadcast, return
+
+The barrier is worse in one respect: an unbacked arena at least returns null, which the
+caller must handle. **A dead barrier returns SUCCESS** — threads that believe they are
+synchronised are not. Deferred to a whole-file pass because the initialisation
+legitimately FOLLOWS the use (declare-global / init-in-main). Keyed by name, so a
+collision reads as INITIALISED — the conservative direction.
+
+**The vacuity it had been generating is the real finding.** `orelse return` in a
+`u32 main()` returns 0 — PASS — so a test whose arena never allocated reported success:
+`tests/zer/super_freelist_arena.zer` ("Real program: freelist allocator built on Arena",
+~120 lines) ran about four of them; `rust_tests/gen_arena_001/002/004` had their first
+alloc return null; `test_checker_full.c` §22 type-checked an arena that could not
+allocate, in four cases; and the semantic fuzzer's `gen_safe_arena_chain` generated
+"safe" programs that allocated nothing.
+
+**And the corpus sweep that missed most of it is worth recording.** A sweep over `.zer`
+files reported ONE affected file. `make check` then found seventeen more in ZER programs
+generated INLINE by the fuzzer and embedded in C tests — the "a corpus sweep over .zer
+files only is incomplete" lesson, live, in the same session that documents it.
+
+Two corrections that came out of it: `rust_tests/gen_arena_003.zer` was a MASKED negative
+(it declared `*Box g_box;`, which the non-null-initializer rule rejects first, so the
+arena-escape rule it exists for never ran and it would have kept passing with that rule
+deleted); and `super_freelist_arena` type-punned Block <-> FreeNode through `*opaque`,
+the classic C freelist trick, which ZER refuses — with the arena backed the trap was
+immediate, so the link now lives inside Block.
+
+### BUG-849 — `a.over(buf);` as a bare statement is a silent no-op
+`.over` is a CONSTRUCTOR returning an Arena BY VALUE; as a statement it builds one into
+a discarded temp and the receiver keeps capacity 0. It reads exactly like initialisation,
+which is what makes it dangerous: `a.over(mem); a.alloc(B)` yields null while
+`a = Arena.over(mem); a.alloc(B)` succeeds, and the only difference is the discarded
+assignment. Someone already knew — `rust_tests/gen_arena_005.zer` carries a comment
+saying so, while 001..004 sat beside it using exactly that form. A comment in one file
+is not a gate.
+
+### BUG-850 — a discarded `?T` throws the failure away
+`?T` is the whole argument that a failure cannot be ignored in ZER: the checker forces
+an unwrap at every USE site. Throwing the entire optional away was the hole in that
+argument. `push_checked` is the sharpest case — its ONLY difference from `push` is the
+`?void` it returns, so discarding it makes the call identical to the fire-and-forget
+version. SUBSUMES the ghost-handle check, which was this same rule hand-specialised to
+pool.alloc / slab.alloc_ptr; the allocation case keeps its more specific wording.
+
+**The first version over-rejected 38 VALID programs and the corpus measurement caught
+it.** `check_expr` on an expression statement returns the ASSIGNED type for an
+assignment, so a rule keyed on "statement whose type is optional" flags `g_ptr = p;` and
+`arr[0] = pool.alloc();` — the value went somewhere; that is not a discard. Scoped to
+NODE_CALL the cost is ZERO, which is the bar this repo ships tightenings on.
+
+### BUG-851 — the emitter's five give-up paths were silent miscompiles
+Not a live bug — a live RISK, of exactly the class `tools/emit_audit.sh` exists to guard,
+sitting in the emitter and not covered by that script. The three CALLEE ones are the
+worst: a bare comment followed by `(a, b)` is a valid C COMMA EXPRESSION evaluating to
+`b`, so the program compiles, runs, and CALLS NOTHING. Measured before changing anything:
+**0 of 1146** corpus programs emit any of the five markers, so nothing reachable becomes
+an abort. Why the audit could not have caught them regardless: it compiles 5 hand-picked
+samples and greps 4 fingerprints, so a give-up in a shape none of those contains is
+invisible even with the right patterns added.
+
+### BUG-852 — `naked` is silently dropped
+The attribute is not emitted, so GCC wraps the user's asm in a full prologue and
+epilogue. A user writing a reset handler believes they control every byte; on bare metal
+that does not fault, it corrupts registers or returns through an epilogue they never
+wrote. Still dropped — now it SAYS SO. Not simply restored, for measured reasons: GCC 13
+x86-64 DOES support the attribute (`endbr64; body; ud2`, no prologue and no `ret`) and 16
+of the 18 positive `asm_*.zer` tests CALL their naked function, so flipping it SIGILLs
+all 16; and GCC permits only BASIC asm inside a naked function while ZER's structured
+`asm { inputs: ... }` lowers to EXTENDED asm, which the Z-rule operand tracking is built
+on. Root cause: `naked` is OVERLOADED — the S1 guard makes it the only way to get asm
+permission, so almost every use means "let me write asm".
+
+### BUG-853 — a value-returning `async` has no way to deliver the value
+The poll protocol is an `int` done-flag; the value lands in an internal temp whose name
+depends on how the body lowered. A WARNING, and the reject was MEASURED before being
+rejected: corpus cost is 1 file, and it is the one that must keep compiling —
+`bh18_10_async_value_return_idempotent.zer`, the regression guard for BH-18 #10.
+Rejecting would delete the guard along with the footgun.
+
+### BUG-854 — `break` in a for-INITIALISER bound to the ENCLOSING loop
+The lowerer runs a for-loop's INIT before installing that loop's exit/continue targets.
+Measured: with the inner loop's init doing `orelse break`, the program exited the OUTER
+loop and returned 10 where inner-binding gives 18 — silent, and the opposite of what
+`break` means everywhere else in ZER. REJECTED rather than rebound, deliberately: neither
+answer is obviously right (binding to the loop being initialised makes `break` consistent,
+but `continue` would then jump to the STEP of a loop whose induction variable was never
+initialised). Picking a semantics silently is the actual defect. Corpus cost zero.
+
+### BUG-855 — every unrecognised CLI option was silently ignored
+There was NO final `else` in the argument loop. Measured on main: `--totally-bogus-flag`,
+`--target-arch=nonsense` and `--stack-limit abc` all exited **0** with no diagnostic.
+`--target-arch=arm64` (the spelling is `aarch64`) silently built x86 code for someone who
+asked for ARM. A build tool that accepts a flag it does not implement is worse than one
+that rejects it: the user believes the setting took effect. Every option and every
+`--target-arch` / `--target-bits` / `--stack-limit` VALUE is now validated, `--help` is
+answered before the input-file requirement, and `--release` says it is a no-op instead of
+pretending.
+
+### BUG-856 — the RMW "does the RHS read the target?" predicate missed three kinds
+`g = @truncate(u32, g) + 1` is the same non-atomic read-modify-write as `g = g + 1`,
+which was correctly rejected the whole time. `expr_mentions_global` — the predicate both
+RMW sinks depend on — was missing NODE_INTRINSIC, NODE_CALL and NODE_ORELSE, so a read
+laundered through any of them did not count and the write was classified as a plain
+store. An interrupt or a concurrent thread landing between the load and the store loses
+the update, silently.
+
+**Found by re-verifying my own tracker rather than trusting it.** I had marked this row
+DONE under BUG-826, which fixed `record_isr_globals` and `vrp_invalidate_loop_body_writes`
+— different functions. Running the reproducer showed it still ACCEPTED. The reason it
+survived §B is worth keeping: `expr_mentions_global` is an if/else CHAIN, and NEITHER
+walker gate can see one — `walker_default_audit` greps kind-SWITCHES and
+`audit_walker_fields` reads `case` arms. 39294y called that blind spot out explicitly and
+it held. A green pair of walker gates is not a clean bill for chain-form predicates.
+
+---
+
 ## Session 2026-08-22d — BUG-839..846: §D COMPLETE, eight silent miscompiles
 
 From `claude/vigilant-tesla-pjtawx`, `-4z36e0` and `-pmytnl`. Each produces a WRONG

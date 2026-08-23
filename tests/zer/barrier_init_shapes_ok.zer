@@ -1,0 +1,27 @@
+// Over-rejection boundary for the "barrier waited on but never initialised"
+// rule (2026-08-20). Every legitimate shape must still compile.
+//
+// The interesting one is the PARAMETER: a `*Barrier` is initialised by the
+// CALLER, so the callee must never be flagged. And the check is deferred to
+// after all bodies precisely so that an @barrier_init appearing LATER in the
+// file than the wait (the declare-global / init-in-main idiom) is accepted.
+Barrier g_gate;
+
+void waits_on_param(*Barrier p) {
+    @barrier_wait(p);            // initialised by whoever owns it
+}
+
+void waits_on_global() {
+    @barrier_wait(g_gate);       // @barrier_init is lexically LATER, in main
+}
+
+u32 main() {
+    @barrier_init(g_gate, 1);
+    waits_on_global();
+    waits_on_param(&g_gate);
+
+    Barrier local;
+    @barrier_init(local, 1);
+    @barrier_wait(local);
+    return 0;
+}

@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-22d — BUG-839..844: §D, six silent miscompiles
+## Session 2026-08-22d — BUG-839..846: §D COMPLETE, eight silent miscompiles
 
 From `claude/vigilant-tesla-pjtawx`, `-4z36e0` and `-pmytnl`. Each produces a WRONG
 ANSWER with no diagnostic and no fault — the class where the compiler is confidently
@@ -96,6 +96,50 @@ bindings still carry no width, so `comptime u32 a_elem(){ u8[2] v; v[0]=200; v[1
 return v[0]+v[1]; }` folds 300 instead of 44. 4z36e0's `comptime_width_wrap_all_forms`
 exits 55 at exactly that check; every scalar, signed, mixed-width and nested-call form
 in it passes. Own OPEN entry in limitations.md.
+
+### BUG-845 — float -> integer conversion is C UNDEFINED, at three emission sites
+C11 6.3.1.4p1: undefined when the truncated value is not representable. Measured
+through ZER on ONE emitted .c with ONE gcc: `f64 g = -1.5; (u32)g` prints
+**4294967295 at -O0 and 0 at -O2** — same program, two answers, chosen by the
+optimiser. ARM saturates in hardware for a third.
+
+**A `volatile` source SUPPRESSES the divergence** and that cost a wrong conclusion
+earlier in this harvest: volatile forces the `cvttsd2si` instruction at every -O
+level, while the bug lives in the CONSTANT-FOLDING path where GCC folds with its own
+arbitrary-precision semantics. Probe with a plain constant, never a volatile one.
+
+Guarded at all THREE emission sites with EXACT bounds (hex-float powers of two, no
+rounding slop, so a representable value is never rejected; NaN fails every comparison
+and traps too). The third site is `emit_rewritten_node`'s own NODE_TYPECAST arm —
+which is how a DEFER BODY is emitted, so it is reachable, not a theoretical fallback;
+pmytnl reports nearly missing it, and a guard at two of three leaves the UB live in
+the scope hardest to notice.
+Checker half: a float LITERAL that cannot fit is now a compile ERROR (the compiler can
+already see it), and **`@truncate` on a float is rejected** — a float has no low bits
+to keep, so the emitted C was a plain float->int cast, i.e. this same UB spelled as if
+it were the SAFE narrowing primitive.
+Corpus cost measured before shipping: exactly ONE `.zer` file, and it is the negative
+that is supposed to be rejected. One C unit test (BUG-033) was ASSERTING THE OLD
+CONTRACT and is corrected, not deleted — the precision property it exists for is
+unchanged and still checked.
+
+### BUG-846 — a leak in a both-arms-return `if` was never reported
+Three layers, each necessary and none sufficient:
+1. `bb_then` / `bb_else` / `bb_join` are allocated CONSECUTIVELY, so the then-body
+   sweep over `[then_start_bi, block_count)` — skipping only `bb_join` — also tagged
+   `bb_ELSE`, a block whose body had not been lowered yet. The else sweep had the
+   mirror defect and swallowed the then body's blocks. Both now use the block-count
+   boundary that `then_start_block_count` was written for; it had been dead and
+   `(void)`-cast since it was introduced.
+2. The `is_early_exit` skip rests on an assumption its own comment states — "the
+   fall-through return holds the authoritative leak state" — which is FALSE when
+   EVERY return is an early exit, exactly what `if (c) { return a; } else { return b; }`
+   produces.
+3. The obvious guard ("is there a non-early-exit RETURN?") is not enough alone: when
+   both arms return, the join block is still emitted, still ends in a RETURN, and has
+   ZERO PREDECESSORS — it satisfied the canonical-exit test while carrying no state,
+   so the layer-2 fallback never fired. Reachability is the discriminator, and
+   `ir_compute_preds` already provides it.
 
 ---
 

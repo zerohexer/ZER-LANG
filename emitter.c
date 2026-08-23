@@ -995,6 +995,67 @@ static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
             "of this enum\", __FILE__, __LINE__); ");
 }
 
+/* BUG-845: float -> integer conversion is C UNDEFINED when the truncated value is
+ * not representable in the target (C11 6.3.1.4p1). Measured through ZER on one
+ * emitted .c with one gcc: `f64 g = -1.5; (u32)g` prints 4294967295 at -O0 and 0
+ * at -O2 — the same program, two answers, chosen by the optimiser. (A `volatile`
+ * source SUPPRESSES the divergence, because that forces the cvttsd2si instruction
+ * at every level while the bug lives in the CONSTANT-FOLDING path; probe with a
+ * plain constant.) ARM saturates in hardware for a third answer.
+ *
+ * Guarded at every emission site with EXACT bounds — hex-float powers of two, no
+ * rounding slop, so the guard never rejects a representable value. NaN fails every
+ * comparison, so `!(in range)` traps on it too. */
+static bool f2i_needs_guard(Type *src, Type *tgt) {
+    if (!src || !tgt) return false;
+    TypeKind sk = type_dispatch_kind(src);
+    if (sk != TYPE_F32 && sk != TYPE_F64) return false;
+    switch (type_dispatch_kind(tgt)) {
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_UINT: case TYPE_SINT:
+        return true;
+    default: return false;
+    }
+}
+static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
+    Type *u = type_unwrap_distinct(tgt);
+    *bits = 32; *is_signed = false;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_U8:  *bits = 8;  break;
+    case TYPE_U16: *bits = 16; break;
+    case TYPE_U32: *bits = 32; break;
+    case TYPE_U64: *bits = 64; break;
+    case TYPE_USIZE: *bits = zer_target_ptr_bits; break;
+    case TYPE_I8:  *bits = 8;  *is_signed = true; break;
+    case TYPE_I16: *bits = 16; *is_signed = true; break;
+    case TYPE_I32: *bits = 32; *is_signed = true; break;
+    case TYPE_I64: *bits = 64; *is_signed = true; break;
+    case TYPE_UINT: *bits = (int)u->intn.bits; break;
+    case TYPE_SINT: *bits = (int)u->intn.bits; *is_signed = true; break;
+    default: break;
+    }
+}
+/* Emits `({ <srcT> _v = ` — caller emits the source, then calls _close. */
+static void emit_f2i_open(Emitter *e, Type *src, int tmp) {
+    emit(e, "({ ");
+    emit_type(e, src);
+    emit(e, " _zer_f2i%d = ", tmp);
+}
+static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
+    int bits; bool sg;
+    f2i_bounds(tgt, &bits, &sg);
+    emit(e, "; if (!(");
+    if (sg) emit(e, "_zer_f2i%d > -0x1p%d - 1.0 && _zer_f2i%d < 0x1p%d",
+                 tmp, bits - 1, tmp, bits - 1);
+    else    emit(e, "_zer_f2i%d > -1.0 && _zer_f2i%d < 0x1p%d", tmp, tmp, bits);
+    emit(e, ")) _zer_trap(\"float-to-integer conversion out of range (C11 6.3.1.4p1 "
+            "makes this undefined; the answer would depend on the optimiser and the "
+            "target)\", __FILE__, __LINE__); (");
+    emit_type(e, tgt);
+    emit(e, ")_zer_f2i%d; })", tmp);
+}
+
 static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     if (!t) return;
     TypeKind k = type_dispatch_kind(t);
@@ -3124,6 +3185,11 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "((uint8_t)!!(");
             emit_expr(e, node->typecast.expr);
             emit(e, "))");
+        } else if (f2i_needs_guard(src_eff, tgt_eff)) {
+            int tmp = e->temp_count++;                    /* BUG-845 site 1 (AST) */
+            emit_f2i_open(e, src_eff, tmp);
+            emit_expr(e, node->typecast.expr);
+            emit_f2i_close(e, tgt, tmp);
         } else {
             /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
             emit(e, "((");
@@ -10024,12 +10090,24 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_TYPECAST: {
-        /* Should be handled by IR_CAST, but in case it reaches here */
-        emit(e, "((");
-        if (node->typecast.target_type) {
-            Type *t = resolve_tynode(e, node->typecast.target_type);
-            emit_type(e, t);
+        /* Should be handled by IR_CAST, but in case it reaches here.
+         * BUG-845 site 3: this arm is how a DEFER BODY is emitted, so it is a
+         * REACHABLE third emission path, not a theoretical fallback — pmytnl
+         * reports nearly missing it, and a guard at two of three sites leaves the
+         * UB live in exactly the scope that is hardest to notice. */
+        Type *t3 = node->typecast.target_type
+                     ? resolve_tynode(e, node->typecast.target_type) : NULL;
+        Type *s3 = checker_get_type(e->checker, node->typecast.expr);
+        if (t3 && f2i_needs_guard(s3 ? type_unwrap_distinct(s3) : NULL,
+                                  type_unwrap_distinct(t3))) {
+            int tmp = e->temp_count++;
+            emit_f2i_open(e, type_unwrap_distinct(s3), tmp);
+            emit_rewritten_node(e, node->typecast.expr, func);
+            emit_f2i_close(e, t3, tmp);
+            return;
         }
+        emit(e, "((");
+        if (t3) emit_type(e, t3);
         emit(e, ")");
         emit_rewritten_node(e, node->typecast.expr, func);
         emit(e, ")");
@@ -12325,6 +12403,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, "))");
             }
             /* Simple C cast */
+            else if (inst->src1_local >= 0 && f2i_needs_guard(src_eff, tgt_eff)) {
+                int tmp = e->temp_count++;                /* BUG-845 site 2 (IR_CAST) */
+                emit_f2i_open(e, src_eff, tmp);
+                emit_local_name(e, func, inst->src1_local);
+                emit_f2i_close(e, tgt, tmp);
+            }
             else if (inst->src1_local >= 0) {
                 emit(e, "((");
                 emit_type(e, tgt);

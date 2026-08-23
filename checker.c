@@ -9104,7 +9104,50 @@ static Type *check_expr(Checker *c, Node *node) {
         /* integer ↔ integer: widening (silent) or narrowing (truncate) */
         if (type_is_integer(target) && type_is_integer(source)) valid = true;
         /* integer ↔ float: value conversion */
-        if (type_is_integer(target) && type_is_float(source)) valid = true;
+        if (type_is_integer(target) && type_is_float(source)) {
+            valid = true;
+            /* BUG-845: when the source is a LITERAL the compiler can already see
+             * that the conversion is out of range, and C11 6.3.1.4p1 makes it
+             * UNDEFINED — so this is a diagnosable error, not a runtime trap.
+             * The runtime guard covers the unprovable cases. */
+            Node *fe = node->typecast.expr;
+            bool neg = false;
+            if (fe && fe->kind == NODE_UNARY && fe->unary.op == TOK_MINUS) {
+                neg = true; fe = fe->unary.operand;
+            }
+            if (fe && fe->kind == NODE_FLOAT_LIT) {
+                double v = fe->float_lit.value;
+                if (neg) v = -v;
+                double tv = (v < 0) ? -(double)(unsigned long long)(-v)
+                                    :  (double)(unsigned long long)(v);
+                (void)tv;
+                Type *te = type_unwrap_distinct(target);
+                int bits = 32; bool sg = false;
+                switch (type_dispatch_kind(te)) {
+                case TYPE_U8: bits=8; break;   case TYPE_U16: bits=16; break;
+                case TYPE_U32: bits=32; break; case TYPE_U64: bits=64; break;
+                case TYPE_USIZE: bits=zer_target_ptr_bits; break;
+                case TYPE_I8: bits=8; sg=true; break;
+                case TYPE_I16: bits=16; sg=true; break;
+                case TYPE_I32: bits=32; sg=true; break;
+                case TYPE_I64: bits=64; sg=true; break;
+                case TYPE_UINT: bits=(int)te->intn.bits; break;
+                case TYPE_SINT: bits=(int)te->intn.bits; sg=true; break;
+                default: bits = 0; break;
+                }
+                if (bits > 0) {
+                    double lo = sg ? -ldexp(1.0, bits - 1) - 1.0 : -1.0;
+                    double hi = sg ?  ldexp(1.0, bits - 1)       : ldexp(1.0, bits);
+                    if (!(v > lo && v < hi)) {
+                        checker_error(c, node->loc.line,
+                            "float-to-integer conversion is out of range: %g does not fit "
+                            "in '%s'. C11 6.3.1.4p1 makes this UNDEFINED, so the answer "
+                            "would depend on the optimiser and the target",
+                            v, type_name(target));
+                    }
+                }
+            }
+        }
         if (type_is_float(target) && type_is_integer(source)) valid = true;
         /* float ↔ float: f32 ↔ f64 */
         if (type_is_float(target) && type_is_float(source)) valid = true;
@@ -9779,6 +9822,18 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (effective && zer_saturate_operand_valid(type_is_numeric(effective) ? 1 : 0) == 0) {
                         checker_error(c, node->loc.line,
                             "@truncate requires numeric source, got '%s'", type_name(val_type));
+                    }
+                    /* BUG-845: @truncate means "keep the low bits". A FLOAT has no
+                     * low bits to keep — its representation is sign/exponent/mantissa
+                     * — so the operation is meaningless and the emitted C is a plain
+                     * float->int cast, i.e. the same UB this session is closing, but
+                     * spelled as if it were the SAFE narrowing primitive. */
+                    if (effective && type_is_float(effective)) {
+                        checker_error(c, node->loc.line,
+                            "@truncate has no meaning on a float — a float has no low bits "
+                            "to keep. Use a value cast '(%s)x' (range-checked at runtime), "
+                            "or @saturate to clamp",
+                            type_name(result));
                     }
                 }
                 /* anqp95 (copied): target must be an integer — mirrors @saturate.

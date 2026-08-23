@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-809, the MIRROR arm. Same three layers, leak in the THEN body with the
+// ELSE body ending in a return. Both cells exist because the two sweeps had
+// independent copies of the tagging bug and a fix to one would not have moved
+// the other.
+struct Task { u32 id; }
+Pool(Task, 4) g_pool;
+
+u32 leak_then(bool c) {
+    if (c) {
+        ?Handle(Task) mh = g_pool.alloc();
+        Handle(Task) h = mh orelse return;
+        return h.id;              // never freed
+    } else {
+        return 2;
+    }
+}
+
+u32 main() { return leak_then(true); }

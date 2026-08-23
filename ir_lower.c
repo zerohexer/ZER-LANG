@@ -2577,14 +2577,22 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * correctly handles if-unwrap early-exits via alias
          * propagation to the canonical return's state. */
         if (then_always_exits && !has_capture) {
-            /* Tag blocks created during then-body lowering plus bb_then.
-             * Skip bb_join — that's the canonical fall-through target. */
-            for (int bi = then_start_bi; bi < ctx->func->block_count; bi++) {
+            /* BUG-846: bb_then / bb_else / bb_join are allocated CONSECUTIVELY, so a
+             * sweep of [then_start_bi, block_count) that skips only bb_join also
+             * tags bb_ELSE — a block whose body has not even been lowered yet. The
+             * else sweep below had the mirror defect and swallowed the then body's
+             * blocks. The correct boundary is the BLOCK COUNT captured before the
+             * then-body was lowered: the blocks that body created are exactly
+             * [then_start_block_count, block_count), plus bb_then itself. That is
+             * what `then_start_block_count` was written for — it had been dead,
+             * (void)-cast, since it was introduced. */
+            if (!ctx->func->blocks[then_start_bi].is_early_exit)
+                ctx->func->blocks[then_start_bi].is_early_exit = true;
+            for (int bi = then_start_block_count; bi < ctx->func->block_count; bi++) {
                 if (bi == bb_join) continue;
                 if (!ctx->func->blocks[bi].is_early_exit)
                     ctx->func->blocks[bi].is_early_exit = true;
             }
-            (void)then_start_block_count;
         }
 
         ensure_terminated(ctx, bb_join);
@@ -2594,6 +2602,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
             else_start_bi = bb_else;
+            int else_start_block_count = ctx->func->block_count;   /* BUG-846 */
             int else_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* else-body block: we manage */
             lower_stmt(ctx, node->if_stmt.else_body);
@@ -2613,7 +2622,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 }
             }
             if (else_always_exits) {
-                for (int bi = else_start_bi; bi < ctx->func->block_count; bi++) {
+                /* BUG-846: same boundary fix, mirror side. */
+                if (!ctx->func->blocks[else_start_bi].is_early_exit)
+                    ctx->func->blocks[else_start_bi].is_early_exit = true;
+                for (int bi = else_start_block_count; bi < ctx->func->block_count; bi++) {
                     /* Don't tag bb_join if we accidentally reach it */
                     if (bi == bb_join) continue;
                     if (!ctx->func->blocks[bi].is_early_exit)

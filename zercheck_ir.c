@@ -7080,6 +7080,31 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      *   - early-exit (if-then-always-exits path, bypasses canonical flow)
      *
      * Mirrors zercheck.c's block_always_exits semantic. */
+    /* BUG-846 layers 2+3: the two sweeps below SKIP every early-exit RETURN, on the
+     * assumption its own comment states — "the fall-through return holds the
+     * authoritative leak state". That is FALSE when EVERY return is an early exit,
+     * which is exactly what `if (c) { return a; } else { return b; }` produces: both
+     * arms are tagged, nothing is left to check, and a handle leaked on both paths
+     * is never reported.
+     *
+     * And the obvious guard — "is there a non-early-exit RETURN?" — is not enough on
+     * its own (layer 3): when both arms return, the join block is STILL emitted,
+     * STILL ends in a RETURN, and has ZERO PREDECESSORS. It satisfies the
+     * canonical-exit test while carrying no state, so the fallback never fires.
+     * Reachability is the discriminator, and ir_compute_preds already provides it. */
+    bool has_reachable_canonical_exit = false;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        if (bb->inst_count == 0) continue;
+        if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
+        if (bb->is_orelse_fallback || bb->is_early_exit) continue;
+        if (bi != 0 && bb->pred_count == 0) continue;   /* emitted but unreachable */
+        has_reachable_canonical_exit = true;
+        break;
+    }
+    /* When there is none, the early-exit returns ARE the authoritative state. */
+    bool skip_early = has_reachable_canonical_exit;
+
     int *covered_ids = NULL;
     int covered_cap = 0, covered_n = 0;
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -7087,7 +7112,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         if (bb->inst_count == 0) continue;
         if (bb->insts[bb->inst_count - 1].op != IR_RETURN) continue;
         if (bb->is_orelse_fallback) continue;
-        if (bb->is_early_exit) continue;
+        if (skip_early && bb->is_early_exit) continue;   /* BUG-846 */
+        if (bi != 0 && bb->pred_count == 0) continue;
         IRPathState *ps2 = &block_states[bi];
         for (int hi = 0; hi < ps2->handle_count; hi++) {
             IRHandleInfo *h = &ps2->handles[hi];
@@ -7121,8 +7147,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         /* Phase E: skip early-exit blocks for leak checking too —
          * they represent conditional bypass paths whose state isn't
          * canonical. The fall-through return holds the authoritative
-         * leak state. */
-        if (bb->is_early_exit) continue;
+         * leak state — UNLESS there is no reachable canonical return at all,
+         * in which case these ARE the authoritative state (BUG-846). */
+        if (skip_early && bb->is_early_exit) continue;
+        if (bi != 0 && bb->pred_count == 0) continue;
 
         IRPathState *ps = &block_states[bi];
         for (int hi = 0; hi < ps->handle_count; hi++) {

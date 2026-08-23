@@ -43,9 +43,10 @@ test file**, reading the DIAGNOSTIC rather than the exit code, and routing aroun
 Rows that main already closed are listed in the "already on main" table so nobody
 re-implements them.
 
-**PROGRESS: §D landed 2026-08-22** (BUG-839..844) — six silent miscompiles. V9, V10,
-V11, V12, V14, V15 and V16 struck through below. **V13 and V17 remain** (the
-both-arms-return leak, and float->int UB at the three cast sites). Remaining: 8.
+**PROGRESS: §D COMPLETE 2026-08-23** (BUG-839..846) — eight silent miscompiles. V9,
+V10, V11, V12, V13, V14, V15, V16 and V17 all struck through below. Remaining: 6 —
+§E/§F/§G only (arena + barrier init, discarded optional, CLI validation, break-in-
+for-init, the emitter give-up paths, and the naked / async warnings).
 
 **PROGRESS: §C landed 2026-08-22** (BUG-830..838) — the bare-metal family. V4, V5, V7,
 V8, V22, V23, V26, V27 and O2 struck through below. Also hardened the TRAP HARNESS
@@ -108,11 +109,11 @@ phrasing. Cosmetic; the rules fire.
 | ~~V10~~ **DONE (BUG-842)** | Zero-arg intrinsic skips the global-init guard entirely | **4z36e0** BUG-808 | `const u32 G = @cpu_model_id();` checker-accepted, only GCC rejects |
 | ~~V11~~ **DONE (BUG-841)** | `struct == struct` / `union` comparison silently ALWAYS FALSE | **pjtawx** BUG-798 | Emitter answers a literal `0`; `a != b` is also false, which is the tell |
 | ~~V12~~ **DONE (BUG-840)** | `switch` with a NON-FINAL `default` arm miscompiles | **pjtawx** BUG-808 | `switch(1) { default => r=9; 1 => r=1; }` returns **9**. Every arm after `default` becomes dead C |
-| V13 | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
+| ~~V13~~ **DONE (BUG-846)** | Leak in a both-arms-return `if` never reported | **pjtawx** BUG-809 | 2 negatives accepted. Three independent layers, none sufficient alone |
 | ~~V14~~ **DONE (BUG-839)** | `arena.alloc_slice` overflow guard is DEAD CODE (AST-only since the 2026-04 IR migration) | **pjtawx** BUG-797 | Test exits 1. Wraps the byte count to 0, then hands back a slice reporting 2^61 elements — **every downstream bounds check then passes** |
 | ~~V15~~ **DONE (BUG-844)** | Comptime folds a DIFFERENT value than the same expression at runtime | **4z36e0** BUG-802/803 | Test exits 1. pjtawx BUG-802 is the same fix; 4z36e0's is later and sets the width at all THREE folding sinks |
 | ~~V16~~ **DONE (BUG-843)** | `@bitcast` forges an out-of-variant enum; switch silently runs its LAST arm | **pmytnl** BUG-804 | `@bitcast(State,7)` takes `.done`, exit 12. Only route in — there is no int->enum cast |
-| V17 | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
+| ~~V17~~ **DONE (BUG-845)** | float -> integer conversion is C UB at all three cast sites | **pmytnl** BUG-802 | Both negatives accepted, AND the divergence CONFIRMED end-to-end through ZER: `f64 g = -1.5; (u32)g` prints **4294967295 at -O0 and 0 at -O2** from one emitted .c on one gcc (7.5.0). **Probe note, recorded because it cost a wrong conclusion first time:** a `volatile` source SUPPRESSES the divergence (both levels give 4294967295) — volatile forces the `cvttsd2si` instruction at every -O level, while the bug lives in the CONSTANT-FOLDING path, where GCC folds with its own arbitrary-precision semantics instead. Probe with a plain constant, never a volatile one |
 | V18 | Barrier never initialised: `@barrier_wait` on `{0}` returns SUCCESS immediately | **4z36e0** BUG-806 | Accepted, runs, exits 0. Worse than the arena case — a dead barrier reports success |
 | V19 | Arena with no backing store: every `alloc()` returns null forever | **4z36e0** BUG-804 | Accepted. Hid 5 VACUOUS tests incl. a 120-line "real program" that ran 4 lines |
 | V20 | `a.over(buf);` as a bare statement is a silent no-op | **4z36e0** BUG-805 | `.over` is a constructor returning BY VALUE; as a statement it builds into a discarded temp |

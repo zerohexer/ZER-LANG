@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: does not lower to a compile-time-constant value
+// BUG-859: the global-initializer constant guard was a TOP-LEVEL kind test, so
+// one wrapper defeated it. `@cpu_model_id()` alone was rejected; the same call
+// inside a binary expression reached GCC, which failed on generated C.
+u32 G = @cpu_model_id() + 1;
+
+i32 main() { return 0; }

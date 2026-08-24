@@ -107,9 +107,6 @@ static void consume(Parser *p, TokenType type, const char *msg) {
     error_current(p, msg);
 }
 
-static Token peek(Parser *p) {
-    return p->current;
-}
 
 /* ---- Arena helpers ---- */
 
@@ -138,23 +135,12 @@ static void *parser_alloc(Parser *p, size_t size) {
     return ptr;
 }
 
-/* allocate array in arena */
-static void **arena_array(Parser *p, int count, size_t elem_size) {
-    return (void **)arena_alloc(p->arena, count * elem_size);
-}
 
 /* ---- Token text helpers ---- */
 
 static const char *tok_text(Token *t) { return t->start; }
 static size_t tok_len(Token *t) { return t->length; }
 
-/* copy token text into arena (for names that must persist) */
-static const char *tok_str(Parser *p, Token *t) {
-    char *s = (char *)arena_alloc(p->arena, t->length + 1);
-    memcpy(s, t->start, t->length);
-    s[t->length] = '\0';
-    return s;
-}
 
 /* ---- Forward declarations ---- */
 static Node *parse_expression(Parser *p);
@@ -1484,7 +1470,7 @@ static Node *parse_for_stmt(Parser *p) {
             if (!p->had_error && check(p, TOK_IDENT)) {
                 init_is_var_decl = true;
                 /* Check for range-based for: Type ident in expr */
-                Token ident_tok = p->current;
+                /* (the identifier token itself is not needed here) */
                 advance(p);
                 if (check(p, TOK_IDENT) && p->current.length == 2 &&
                     memcmp(p->current.start, "in", 2) == 0) {

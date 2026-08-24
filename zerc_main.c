@@ -249,7 +249,6 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -295,7 +294,6 @@ int main(int argc, char **argv) {
              * something. */
             fprintf(stderr, "warning: --release is currently a NO-OP "
                             "(optimisation is GCC's, via the flags zerc passes)\n");
-            release_mode = true;
         } else if (strcmp(argv[i], "--target-bits") == 0 && i + 1 < argc) {
             /* BUG-855: the value was taken unvalidated. */
             {
@@ -473,9 +471,7 @@ int main(int argc, char **argv) {
         use_temp_c = true;
     }
 
-    /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    /* for temp .c mode, set up the exe path */
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

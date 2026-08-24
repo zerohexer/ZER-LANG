@@ -23,12 +23,8 @@ static void ok(const char *src, const char *name) {
     arena_free(&a);
 }
 
-static void err(const char *src, const char *name) {
-    Arena a; arena_init(&a, 128*1024); total++;
-    if (!run_check(src, &a)) { pass++; }
-    else { printf("  FAIL(err): %s\n", name); fail++; }
-    arena_free(&a);
-}
+/* (the negative-test helper was removed with the last test that used it) */
+
 
 int main(void) {
     printf("=== Gap Verification Tests ===\n\n");

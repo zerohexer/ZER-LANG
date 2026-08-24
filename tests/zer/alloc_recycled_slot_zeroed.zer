@@ -1,0 +1,62 @@
+// BUG-861: a RECYCLED Pool/Slab slot was handed back holding the previous
+// object bit-for-bit, while the language documents "everything auto-zeroed".
+// A fresh page is calloc-clean, which is why this was silent — it only shows up
+// after the first free/alloc cycle.
+//
+// The consequence is not merely stale data. A pointer-carrying field comes back
+// NON-NULL and pointing at freed memory, so a program that sets only the fields
+// it cares about and trusts the guarantee for the rest can unwrap it and
+// dereference: a use-after-free reachable from pure safe ZER, with no
+// diagnostic, and invisible to ASan because the reuse happens inside ZER-owned
+// storage rather than in malloc.
+struct Payload { u32 magic; }
+struct Ctx { ?*Payload p; u32 tag; }
+struct Slot { u32 a; u32 b; }
+
+Pool(Slot, 4) pool;
+
+u32 ok_flag;
+
+void phase_one() {
+    ?*Payload pa = alloc(Payload);
+    *Payload pay = pa orelse return;
+    pay.magic = 0xABCD;
+
+    ?*Ctx ca = alloc(Ctx);
+    *Ctx c = ca orelse return;
+    c.p = pay;
+    c.tag = 1;
+
+    free(c);
+    free(pay);
+    ok_flag = 1;
+}
+
+i32 main() {
+    // Slab / alloc(T): the recycled Ctx must come back with .p == null.
+    phase_one();
+    if (ok_flag == 0) { return 90; }
+
+    ?*Ctx cb = alloc(Ctx);
+    *Ctx c2 = cb orelse return;
+    c2.tag = 2;
+    if (c2.p) |q| { free(c2); return 1; }   // pre-fix: taken, and q dangles
+    if (c2.tag != 2) { free(c2); return 2; }
+    free(c2);
+
+    // Pool: same question, second allocator. They must not diverge.
+    ?Handle(Slot) h1 = pool.alloc();
+    Handle(Slot) k1 = h1 orelse return;
+    pool.get(k1).a = 0xAA;
+    pool.get(k1).b = 0xBB;
+    pool.free(k1);
+
+    ?Handle(Slot) h2 = pool.alloc();
+    Handle(Slot) k2 = h2 orelse return;
+    u32 ra = pool.get(k2).a;
+    u32 rb = pool.get(k2).b;
+    pool.free(k2);
+    if (ra != 0) { return 3; }
+    if (rb != 0) { return 4; }
+    return 0;
+}

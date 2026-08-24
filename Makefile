@@ -222,6 +222,14 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
+	@echo "=== reference.md example audit (every documented example must compile) ==="
+	@bash tools/audit_reference_examples.sh ./zerc
+
+# Standalone — the user-facing reference is the only language description a
+# reader without web access has; a stale example there asserts behaviour the
+# compiler does not have.
+check-reference-examples: zerc
+	@bash tools/audit_reference_examples.sh ./zerc
 
 # Stage 3 standalone target — run just the fixed-buffer linter.
 check-fixed-buffers:

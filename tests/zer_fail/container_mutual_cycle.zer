@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: closes a containment cycle
+// BUG-864: the by-value self-containment guard compared the resolved field type
+// against THE ONE stamp being resolved in that frame, so it saw
+// `A(T){A(T) x;}` and missed the CYCLE below — where the field closes on the
+// OUTER stamp, which this frame does not own. Monomorphization then recursed
+// until the process stack was gone: `zerc` SEGFAULTED on these three lines
+// (ASan: stack-overflow in estimate_type_size).
+container A(T) { B(T) x; }
+container B(T) { A(T) y; }
+
+i32 main() {
+    A(u32) n;
+    return 0;
+}

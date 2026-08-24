@@ -308,52 +308,6 @@ checker.c:record_isr_globals:NODE_GLOBAL_VAR:var_decl.init
 checker.c:record_isr_globals:NODE_INTERRUPT:interrupt.body
 checker.c:record_isr_globals:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
-# --- checker.c: register_decl ---
-checker.c:register_decl:NODE_ASM:asm_stmt.inputs
-checker.c:register_decl:NODE_ASM:asm_stmt.outputs
-checker.c:register_decl:NODE_ASSIGN:assign.target
-checker.c:register_decl:NODE_ASSIGN:assign.value
-checker.c:register_decl:NODE_AWAIT:await_stmt.cond
-checker.c:register_decl:NODE_BINARY:binary.left
-checker.c:register_decl:NODE_BINARY:binary.right
-checker.c:register_decl:NODE_BLOCK:block.stmts
-checker.c:register_decl:NODE_CALL:call.args
-checker.c:register_decl:NODE_CALL:call.callee
-checker.c:register_decl:NODE_CRITICAL:critical.body
-checker.c:register_decl:NODE_DEFER:defer.body
-checker.c:register_decl:NODE_DO_WHILE:while_stmt.body
-checker.c:register_decl:NODE_DO_WHILE:while_stmt.cond
-checker.c:register_decl:NODE_EXPR_STMT:expr_stmt.expr
-checker.c:register_decl:NODE_FIELD:field.object
-checker.c:register_decl:NODE_FILE:file.decls
-checker.c:register_decl:NODE_FOR:for_stmt.body
-checker.c:register_decl:NODE_FOR:for_stmt.cond
-checker.c:register_decl:NODE_FOR:for_stmt.init
-checker.c:register_decl:NODE_FOR:for_stmt.step
-checker.c:register_decl:NODE_IF:if_stmt.cond
-checker.c:register_decl:NODE_IF:if_stmt.else_body
-checker.c:register_decl:NODE_IF:if_stmt.then_body
-checker.c:register_decl:NODE_INDEX:index_expr.index
-checker.c:register_decl:NODE_INDEX:index_expr.object
-checker.c:register_decl:NODE_INTERRUPT:interrupt.body
-checker.c:register_decl:NODE_INTRINSIC:intrinsic.args
-checker.c:register_decl:NODE_ONCE:once.body
-checker.c:register_decl:NODE_ORELSE:orelse.expr
-checker.c:register_decl:NODE_ORELSE:orelse.fallback
-checker.c:register_decl:NODE_RETURN:ret.expr
-checker.c:register_decl:NODE_SLICE:slice.end
-checker.c:register_decl:NODE_SLICE:slice.object
-checker.c:register_decl:NODE_SLICE:slice.start
-checker.c:register_decl:NODE_SPAWN:spawn_stmt.args
-checker.c:register_decl:NODE_STATIC_ASSERT:static_assert_stmt.cond
-checker.c:register_decl:NODE_STRUCT_INIT:struct_init.fields
-checker.c:register_decl:NODE_SWITCH:switch_stmt.arms
-checker.c:register_decl:NODE_SWITCH:switch_stmt.expr
-checker.c:register_decl:NODE_TYPECAST:typecast.expr
-checker.c:register_decl:NODE_UNARY:unary.operand
-checker.c:register_decl:NODE_VAR_DECL:var_decl.init
-checker.c:register_decl:NODE_WHILE:while_stmt.body
-checker.c:register_decl:NODE_WHILE:while_stmt.cond
 
 # --- checker.c: scan_body_shared_types ---
 checker.c:scan_body_shared_types:NODE_ASM:asm_stmt.inputs
@@ -835,36 +789,6 @@ zercheck_ir.c:ir_defer_scan_uses:NODE_TYPECAST:typecast.expr
 zercheck_ir.c:ir_defer_scan_uses:NODE_UNARY:unary.operand
 zercheck_ir.c:ir_defer_scan_uses:NODE_VAR_DECL:var_decl.init
 
-# --- zercheck_ir.c: zercheck_ir ---
-zercheck_ir.c:zercheck_ir:NODE_ASM:asm_stmt.inputs
-zercheck_ir.c:zercheck_ir:NODE_ASM:asm_stmt.outputs
-zercheck_ir.c:zercheck_ir:NODE_AWAIT:await_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_BLOCK:block.stmts
-zercheck_ir.c:zercheck_ir:NODE_CRITICAL:critical.body
-zercheck_ir.c:zercheck_ir:NODE_DEFER:defer.body
-zercheck_ir.c:zercheck_ir:NODE_DO_WHILE:while_stmt.body
-zercheck_ir.c:zercheck_ir:NODE_DO_WHILE:while_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_EXPR_STMT:expr_stmt.expr
-zercheck_ir.c:zercheck_ir:NODE_FILE:file.decls
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.body
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.init
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.step
-zercheck_ir.c:zercheck_ir:NODE_FUNC_DECL:func_decl.body
-zercheck_ir.c:zercheck_ir:NODE_GLOBAL_VAR:var_decl.init
-zercheck_ir.c:zercheck_ir:NODE_IF:if_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_IF:if_stmt.else_body
-zercheck_ir.c:zercheck_ir:NODE_IF:if_stmt.then_body
-zercheck_ir.c:zercheck_ir:NODE_INTERRUPT:interrupt.body
-zercheck_ir.c:zercheck_ir:NODE_ONCE:once.body
-zercheck_ir.c:zercheck_ir:NODE_RETURN:ret.expr
-zercheck_ir.c:zercheck_ir:NODE_SPAWN:spawn_stmt.args
-zercheck_ir.c:zercheck_ir:NODE_STATIC_ASSERT:static_assert_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_SWITCH:switch_stmt.arms
-zercheck_ir.c:zercheck_ir:NODE_SWITCH:switch_stmt.expr
-zercheck_ir.c:zercheck_ir:NODE_VAR_DECL:var_decl.init
-zercheck_ir.c:zercheck_ir:NODE_WHILE:while_stmt.body
-zercheck_ir.c:zercheck_ir:NODE_WHILE:while_stmt.cond
 
 # --- ir_lower.c: lower_expr ---
 #   NOT a safety walker — this is AST->IR lowering. A call's CALLEE is not
@@ -889,3 +813,40 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# --- checker.c: gi_scan_nonconst (BUG-859) ---
+#   Walks a GLOBAL INITIALIZER EXPRESSION looking for a sub-expression that does
+#   not lower to a C compile-time constant. Every kind below is a STATEMENT and
+#   cannot appear inside an initializer expression; they are named only so
+#   -Werror=switch keeps guarding this walker when a NodeKind is added.
+#   NODE_ASSIGN and NODE_EXPR_STMT are NOT here — this audit found that
+#   `u32 G = (x = f());` really does parse, so those two are descended.
+#   NODE_ASM operands: the tree-wide gap, see the header of this file.
+checker.c:gi_scan_nonconst:NODE_ASM:asm_stmt.inputs
+checker.c:gi_scan_nonconst:NODE_ASM:asm_stmt.outputs
+checker.c:gi_scan_nonconst:NODE_AWAIT:await_stmt.cond
+checker.c:gi_scan_nonconst:NODE_BLOCK:block.stmts
+checker.c:gi_scan_nonconst:NODE_CRITICAL:critical.body
+checker.c:gi_scan_nonconst:NODE_DEFER:defer.body
+checker.c:gi_scan_nonconst:NODE_DO_WHILE:while_stmt.body
+checker.c:gi_scan_nonconst:NODE_DO_WHILE:while_stmt.cond
+checker.c:gi_scan_nonconst:NODE_FILE:file.decls
+checker.c:gi_scan_nonconst:NODE_FOR:for_stmt.body
+checker.c:gi_scan_nonconst:NODE_FOR:for_stmt.cond
+checker.c:gi_scan_nonconst:NODE_FOR:for_stmt.init
+checker.c:gi_scan_nonconst:NODE_FOR:for_stmt.step
+checker.c:gi_scan_nonconst:NODE_FUNC_DECL:func_decl.body
+checker.c:gi_scan_nonconst:NODE_GLOBAL_VAR:var_decl.init
+checker.c:gi_scan_nonconst:NODE_IF:if_stmt.cond
+checker.c:gi_scan_nonconst:NODE_IF:if_stmt.else_body
+checker.c:gi_scan_nonconst:NODE_IF:if_stmt.then_body
+checker.c:gi_scan_nonconst:NODE_INTERRUPT:interrupt.body
+checker.c:gi_scan_nonconst:NODE_ONCE:once.body
+checker.c:gi_scan_nonconst:NODE_RETURN:ret.expr
+checker.c:gi_scan_nonconst:NODE_SPAWN:spawn_stmt.args
+checker.c:gi_scan_nonconst:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:gi_scan_nonconst:NODE_SWITCH:switch_stmt.arms
+checker.c:gi_scan_nonconst:NODE_SWITCH:switch_stmt.expr
+checker.c:gi_scan_nonconst:NODE_VAR_DECL:var_decl.init
+checker.c:gi_scan_nonconst:NODE_WHILE:while_stmt.body
+checker.c:gi_scan_nonconst:NODE_WHILE:while_stmt.cond

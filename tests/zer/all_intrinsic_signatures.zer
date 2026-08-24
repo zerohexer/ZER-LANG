@@ -1,0 +1,120 @@
+// Every intrinsic documented in docs/reference.md, exercised at its DOCUMENTED
+// signature — argument count, argument widths and return type.
+//
+// Why this exists: the ~100 @cpu_* / @mmu_* / @tlb_* / @cache_* / @port_* /
+// MSR / XSAVE / CPUID intrinsics had no reference.md entry at all until
+// 2026-08-24, and the only way to learn a signature was to feed candidates to
+// the compiler. This file is the machine-checkable form of what that probing
+// found: if a signature ever changes, the docs and this file disagree with the
+// compiler on the same day.
+//
+// Every call sits behind `if (arm == 0) { return 0; }` with `arm` a volatile
+// zero — the dead-branch pattern (CLAUDE.md). The privileged instructions are
+// COMPILED and their operands type-checked, and none of them EXECUTES, so this
+// runs and exits 0 on a hosted x86-64 test host.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+// volatile zero: the compiler cannot fold the guard away, so the calls below
+// are emitted and never reached.
+volatile u32 arm;
+i32 main() {
+  u8[512] buf; u64 v64=1; u32 v32=1;
+  if (arm == 0) { return 0; }
+  @barrier_dma();
+  @cache_clean_range(&buf[0], v64);
+  @cache_flush_line(&buf[0]);
+  @cache_flush_range(&buf[0], v64);
+  @cache_flushopt(&buf[0]);
+  @cache_invalidate_icache(&buf[0], v64);
+  @cache_invalidate_range(&buf[0], v64);
+  @cache_writeback(&buf[0]);
+  @cache_zero_line(&buf[0]);
+  @cpu_breakpoint();
+  @cpu_cache_disable();
+  @cpu_cache_enable();
+  u32 r12 = @cpu_cache_line_size(); if (r12 == 0) { return 1; }
+  u32 r13 = @cpu_core_id(); if (r13 == 0) { return 1; }
+  u64 r14 = @cpu_cpuid(v64, v64); if (r14 == 0) { return 1; }
+  u64 r15 = @cpu_cpuid_ecx(v64, v64); if (r15 == 0) { return 1; }
+  u32 r16 = @cpu_current_mode(); if (r16 == 0) { return 1; }
+  @cpu_deep_sleep();
+  @cpu_endbr();
+  @cpu_eoi();
+  u64 r20 = @cpu_feature_bits(); if (r20 == 0) { return 1; }
+  @cpu_flush_pipeline();
+  @cpu_fpu_init();
+  @cpu_fxrstor(&buf[0]);
+  @cpu_fxsave(&buf[0]);
+  u64 r25 = @cpu_get_pc(); if (r25 == 0) { return 1; }
+  u32 r26 = @cpu_get_priv_level(); if (r26 == 0) { return 1; }
+  @cpu_hypercall();
+  u32 r28 = @cpu_id(); if (r28 == 0) { return 1; }
+  @cpu_idle_hint();
+  @cpu_iret();
+  u32 r31 = @cpu_model_id(); if (r31 == 0) { return 1; }
+  @cpu_monitor_addr(&buf[0]);
+  @cpu_mwait();
+  u32 r34 = @cpu_num_cores(); if (r34 == 0) { return 1; }
+  @cpu_pause();
+  ?u64 r36 = @cpu_rdrand(); if (r36) |q36| { if (q36 == 0) { return 1; } }
+  ?u64 r37 = @cpu_rdseed(); if (r37) |q37| { if (q37 == 0) { return 1; } }
+  u64 r38 = @cpu_read_counter(); if (r38 == 0) { return 1; }
+  u64 r39 = @cpu_read_cr0(); if (r39 == 0) { return 1; }
+  u64 r40 = @cpu_read_cr2(); if (r40 == 0) { return 1; }
+  u64 r41 = @cpu_read_cr3(); if (r41 == 0) { return 1; }
+  u64 r42 = @cpu_read_cr4(); if (r42 == 0) { return 1; }
+  u64 r43 = @cpu_read_dr(v64); if (r43 == 0) { return 1; }
+  u64 r44 = @cpu_read_flags(); if (r44 == 0) { return 1; }
+  u64 r45 = @cpu_read_fsbase(); if (r45 == 0) { return 1; }
+  u64 r46 = @cpu_read_gsbase(); if (r46 == 0) { return 1; }
+  u64 r47 = @cpu_read_msr(v64); if (r47 == 0) { return 1; }
+  u64 r48 = @cpu_read_pmc(v64); if (r48 == 0) { return 1; }
+  u64 r49 = @cpu_read_sp(); if (r49 == 0) { return 1; }
+  u64 r50 = @cpu_read_tp(); if (r50 == 0) { return 1; }
+  u64 r51 = @cpu_read_xcr0(); if (r51 == 0) { return 1; }
+  @cpu_reset();
+  @cpu_sbi_call();
+  @cpu_set_priv_stack(v64);
+  @cpu_sev();
+  @cpu_smc_call();
+  @cpu_syscall();
+  @cpu_sysret();
+  @cpu_umonitor(&buf[0]);
+  @cpu_umwait(v64, v64);
+  u64 r61 = @cpu_vendor_id(); if (r61 == 0) { return 1; }
+  @cpu_wfe();
+  @cpu_write_cr0(v64);
+  @cpu_write_cr3(v64);
+  @cpu_write_cr4(v64);
+  @cpu_write_dr(v64, v64);
+  @cpu_write_fsbase(v64);
+  @cpu_write_gsbase(v64);
+  @cpu_write_msr(v64, v64);
+  @cpu_write_xcr0(v64);
+  @cpu_xrstor(&buf[0], v64);
+  @cpu_xsave(&buf[0], v64);
+  @mmu_disable();
+  @mmu_enable();
+  u64 r75 = @mmu_get_fault_addr(); if (r75 == 0) { return 1; }
+  u64 r76 = @mmu_get_fault_status(); if (r76 == 0) { return 1; }
+  u64 r77 = @mmu_get_kernel_pt(); if (r77 == 0) { return 1; }
+  u64 r78 = @mmu_get_pt(); if (r78 == 0) { return 1; }
+  bool r79 = @mmu_is_enabled(); if (!r79) { return 1; }
+  @mmu_set_kernel_pt(v64);
+  @mmu_set_pt(v64);
+  @mmu_sync();
+  @nt_store(&buf[0], v64);
+  u16 r84 = @port_in16(v64); if (r84 == 0) { return 1; }
+  u32 r85 = @port_in32(v64); if (r85 == 0) { return 1; }
+  u8 r86 = @port_in8(v64); if (r86 == 0) { return 1; }
+  @port_out16(v64, v64);
+  @port_out32(v64, v64);
+  @port_out8(v64, v64);
+  @tlb_flush_addr(v64);
+  @tlb_flush_all();
+  @tlb_flush_asid(v64);
+  @tlb_flush_global();
+  @tlb_flush_range(v64, v64);
+  @wait_on_address(&v32, 0);
+  return 0;
+}

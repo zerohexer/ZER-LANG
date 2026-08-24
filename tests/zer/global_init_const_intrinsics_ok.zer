@@ -1,0 +1,15 @@
+// BUG-859 boundary: the walk must not reject what DOES fold. A native-width
+// @truncate, a constant bit-query and @size arithmetic are all legal file-scope
+// initializers and must keep compiling.
+u32 A = @truncate(u32, 5);
+u32 B = @popcount(7);
+usize C = @size(u32) + 1;
+u32 D = @bswap32(0x11223344);
+
+i32 main() {
+    if (A != 5) { return 1; }
+    if (B != 3) { return 2; }
+    if (C != 5) { return 3; }
+    if (D != 0x44332211) { return 4; }
+    return 0;
+}

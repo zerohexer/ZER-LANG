@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-857: a BY-VALUE struct carrying a pointer field is the second carrier
+// shape the indirect-call keep worst-case was blind to.
+?*u32 g;
+
+struct Holder { ?*u32 p; }
+
+void setg(Holder h) { g = h.p; }
+
+i32 main() {
+    u32 x = 5;
+    Holder h;
+    h.p = &x;
+    *(Holder) fp = setg;
+    fp(h);
+    return 0;
+}

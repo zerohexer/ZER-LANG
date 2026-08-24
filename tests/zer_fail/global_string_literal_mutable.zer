@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: string literal is read-only
+// BUG-858 boundary: a MUTABLE global slice from a string literal must still be
+// rejected, and must now name the fix instead of printing '[]u8' with '[]u8'.
+[*]u8 BUF = "boot ok";
+
+i32 main() { return 0; }

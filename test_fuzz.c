@@ -1,3 +1,9 @@
+/* `fileno` is POSIX, not ISO C, so a strict -std=c99 build gets an implicit
+ * declaration — the same class as the popen crash in BUG-417. Declare the
+ * feature set before <stdio.h>. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

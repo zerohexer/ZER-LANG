@@ -234,10 +234,28 @@ for f in "${FILES[@]}"; do
             delete armkinds
             narm = 0
             bodybuf = ""
+            callbuf = ""
             infunc = 1
         }
         if (infunc) {
             bodybuf = bodybuf "\n" $0
+            # A COMMENT-ONLY mention must not make a function look recursive.
+            # Measured 2026-08-24: `register_decl` (46 baselined rows) and
+            # `zercheck_ir` (29) are both NON-recursive and qualified purely on
+            # prose — a doc-comment naming the function, and a ZTRACE string.
+            # Editing that prose silently moved a walker in or out of the
+            # audited set, which is the stale-gate failure this file warns
+            # about. `callbuf` is the body with line comments, whole-line
+            # block-comment continuations and string literals removed, so the
+            # recursion test below counts CALL-SHAPED occurrences only and the
+            # audited set finally matches the rule stated at the top of this file
+            # ("a function whose body calls itself").
+            cl = $0
+            gsub(/\/\/.*$/, "", cl)
+            sub(/\/\*.*\*\//, "", cl)
+            if (cl ~ /^[ \t]*\*/) cl = ""
+            gsub(/"[^"]*"/, "", cl)
+            callbuf = callbuf "\n" cl
             # collect case labels; a run of consecutive labels shares one arm
             l = $0
             if (l ~ /case[ \t]+NODE_[A-Z_0-9]+[ \t]*:/) {
@@ -257,8 +275,14 @@ for f in "${FILES[@]}"; do
             }
         }
         if (infunc && depth == 0) {
-            # leaving the function — only report RECURSIVE walkers
-            calls = split(bodybuf, _cparts, fname) - 1
+            # leaving the function — only report RECURSIVE walkers.
+            # calls == 1 is the definition line; a real self-call makes it >= 2.
+            calls = 0
+            _tmp = callbuf
+            while (match(_tmp, fname "[ \t]*\\(")) {
+                calls++
+                _tmp = substr(_tmp, RSTART + RLENGTH)
+            }
             if (calls >= 2 && narm > 0) {
                 for (a = 1; a <= narm; a++) {
                     nk = split(armkinds[a], ks, " ")
@@ -276,7 +300,7 @@ for f in "${FILES[@]}"; do
                     }
                 }
             }
-            infunc = 0; narm = 0; inlabels = 0; bodybuf = ""
+            infunc = 0; narm = 0; inlabels = 0; bodybuf = ""; callbuf = ""
         }
     }
     ' "$f" >> "$REPORT"

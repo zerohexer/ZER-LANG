@@ -386,9 +386,14 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
+| **Indirect-call worst-case ("could an invisible callee retain this argument?")** | funcptr-call keep enforcement + the transitive propagation that shares its predicate | ONE predicate `funcptr_param_worst_case_keep` answering with `type_carries_data_pointer`, NOT a `== TYPE_POINTER` test. A `?*T` / by-value-struct-carrying-a-pointer parameter escaped for the life of the rule (BUG-857, ASan-confirmed). The `[*]T` exemption is a KNOWN accept-unsafe — see docs/limitations.md before touching it |
+| **"Does this close a CYCLE?" (type-graph recursion)** | container by-value self-containment, struct/union self-containment, every size/layout walker over the result | ONE in-progress stack (`Checker.stamping[]`) tested against EVERY entry, not against the single frame's own stamp — the direct case `A{A x;}` is not the class, `A{B x;} B{A y;}` is (BUG-864, a compiler SEGFAULT on three lines). Any walker that can reach a type graph also needs a depth limit, because the failure mode is a crash, not a diagnostic |
+| **Fresh-memory zeroing ("does an allocator hand back clean storage?")** | `_zer_pool_alloc`, `_zer_slab_alloc`, `Arena.alloc` — three allocators, ONE documented guarantee | `tests/zer/alloc_recycled_slot_zeroed.zer` covers Pool AND Slab. Arena was always right and the other two were not (BUG-861); a new allocator must answer the same question. **ASan cannot see this class** — the reuse is inside ZER-owned storage, so only a value-asserting test finds it |
 | **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **Type-node re-resolution (checker `resolve_type` vs emitter `resolve_tynode`)** | array / Pool / Ring sizes, every qualifier fold | FOLD IN PLACE at the checker (`ct_fold_size_expr`), don't teach the second site. A RELAXATION is what makes the emitter path reachable for the first time, so its bugs cannot appear until the day you relax — see compiler-internals.md "Relaxations must be mirrored in the EMITTER" |
+| **Declaration qualifier fold (`const`/`volatile` on a global)** | `register_decl` (Pass 1) and `checker_check_bodies` (Pass 2) | ONE helper `global_var_qualified_type`. Pass 2 re-resolved the raw type node and dropped `const`, making `const [*]u8 S = "x";` undeclarable with a diagnostic that printed the SAME type on both sides (BUG-858) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -419,6 +424,15 @@ CATCHES its bug** by running it against a pre-fix build — a grid that has only
 script, not a net. GOTCHA: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE SOURCE, not at the
 `-o` path (CLAUDE.md "zerc -o gotchas") — getting this wrong yields exit 127 on every cell and looks
 like a compiler failure.
+
+**A DOCUMENTED example is a claim about the compiler, and it rots the same way a gate does
+(2026-08-24).** `docs/reference.md` is the whole language description for anyone without web
+access. Its `const` section showed `const [*]u8 NAME = "ZER";` for as long as anyone can
+tell, and that declaration did not compile (BUG-858) — the documentation was asserting
+behaviour the compiler lacked, which is the false-confidence failure this file warns about,
+pointed at the user instead of at the next session. `tools/audit_reference_examples.sh`
+compiles every example; when you add or change a language rule, the doc example is part of
+the change, not follow-up work.
 
 **Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
 **`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →
@@ -1614,8 +1628,15 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
 | `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/**view-alias**/hw/async/asm/defer-goto) | 10 grids | `make check` |
 | `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
+| `docs/reference.md` | Every ```zer example in the user-facing reference | 178+ blocks | `tools/audit_reference_examples.sh` (in `make check`, `make check-reference-examples`) |
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.
+**The counts above drift — `ls | wc -l` them rather than citing them.** The reference-example
+gate is the newest and the least obvious: `reference.md` is the only language description a
+reader without web access has, so a stale example there is the documentation asserting
+behaviour the compiler does not have. It caught exactly that in BUG-858 (the `const` section
+had shown `const [*]u8 NAME = "ZER";` while that declaration was not compilable) and it is
+what verifies the ~100 intrinsic signatures documented in the same session.
 
 **Firmware examples (v0.3 feature coverage):**
 - `hello.zer` — MMIO, UART, enum, orelse, bounds check (v0.2)

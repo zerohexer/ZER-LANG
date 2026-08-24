@@ -478,7 +478,9 @@ D1) wide open.
 - **Gate A (author-time)** — `tools/audit_carrier_dispatch.sh` + `tools/carrier_dispatch_baseline.txt`.
   Freezes the 33 hand-rolled carrier disjunctions in `checker.c`/`zercheck_ir.c` (`file:content`,
   line-number-agnostic — same design as its two siblings) and FAILS on a NEW one. Wired into
-  `make check`, which now runs **6** audit gates. Proven to fire by injecting a violation.
+  `make check`. (It ran 6 audit gates when this was written; the current count is
+  whatever the `check` target lists — do not cite this number, read the Makefile.)
+  Proven to fire by injecting a violation.
 - **Gate B (exhaustive)** — the `LD_OPTWRAP` axis in `tests/test_escape_matrix.c`: the escaping value
   is bound through an optional carrier before reaching each sink. `-Wswitch` on the enum forces every
   generator/name/validity site to handle it, so the grid cannot silently shrink. **35 → 43 cells**, all
@@ -1018,6 +1020,81 @@ The smallest-trusted-artifact payoff: when this is done, trust shrinks from
 predicate" — a human-auditable spec — plus the named floors (cinclude, GCC,
 hardware). That relocation is the entire point of the verified route and the
 best CompCert/seL4/CakeML achieve.
+
+---
+
+## Relaxations must be mirrored in the EMITTER, or they become miscompiles (2026-08-24)
+
+A rule this codebase already states for TIGHTENINGS ("emitter dual dispatch: AST + IR,
+`grep` must show TWO hits") has a sharper form for RELAXATIONS, learned by shipping the
+bug inside the fix.
+
+**The case.** BUG-860 relaxed array / Pool / Ring sizes to accept a `const` identifier
+(`const u32 CAP = 4; u8[CAP] buf;`). The checker's `resolve_type` learned
+`eval_const_expr_scoped`. `make check` was green and the negative boundary
+(a MUTABLE global) still rejected. The relaxation was nonetheless a **silent miscompile**:
+
+    const u32 CAP = 4;
+    usize s = @size(u8[CAP]);      // emitted `size_t s = {0};`
+
+because `resolve_tynode` in `emitter.c` re-resolves the SAME type node with the non-scoped
+`eval_const_expr` and sized the array 0.
+
+**The general shape.** An over-rejection is a REFUSAL, and a refusal has no emitter path —
+so while a form is rejected, the emitter's inability to handle it is invisible. Relaxing
+the checker is exactly the act that makes the emitter path reachable for the first time.
+Every relaxation therefore has a question the tightening class never has: *what emits this
+now that it is legal, and does that code agree with the checker?*
+
+**The fix pattern that removes the question.** Do not teach the emitter the same rule —
+that is a second site to drift. FOLD THE AST IN PLACE at the moment the checker resolves
+it (`ct_fold_size_expr` rewrites the size expression to `NODE_INT_LIT`), so there is no
+second evaluation to disagree with and every downstream consumer — emitter, LSP, WASM
+bridge — sees the already-resolved form. Fold ONLY where the old path failed, and
+previously-accepted programs emit byte-identical C.
+
+**The test property that caught it.** A compile-only test PASSES on the broken version:
+the program compiles, which is the whole point of the relaxation. Only a test asserting a
+RUNTIME VALUE discriminates. Same principle as `tests/test_defer_goto_matrix.c` (which
+asserts a balance because its defect emits no diagnostic), applied to relaxations: **when
+you relax, assert a value, not an exit code.**
+
+Checklist for the next relaxation:
+1. Name every consumer of the construct you just legalised (`grep` the type node / node
+   kind in `emitter.c`, `zer_lsp.c`, `zer_wasm.c`).
+2. Prefer folding at the checker over teaching each consumer.
+3. Write the regression test as a runtime assertion.
+4. Verify it FAILS against a from-HEAD build — for a relaxation the pre-fix build REJECTS,
+   so build the fix first, then re-run the test against a compiler with only the checker
+   half applied. That is the build that shows the wrong value.
+
+---
+
+## Enumerating FORMS beats reading subsystems (2026-08-24 audit method)
+
+All five findings of the 2026-08-24 audit came from the same procedure, and none required
+reading a subsystem end to end. Reuse it.
+
+1. **Pick a question the compiler already answers somewhere.** "Does an indirect call
+   retain this pointer?" "Is this global initializer a C constant?" "Is freshly allocated
+   memory zeroed?" A question with an existing implementation has an existing BOUNDARY, and
+   the boundary is where forms fall off.
+2. **Enumerate the syntactic forms of the ANSWER's input, not of the question.** For the
+   keep sink that is the parameter TYPE (`*T`, `?*T`, `[*]T`, struct-carrying-a-pointer,
+   distinct, array-of); for the initializer guard it is the WRAPPER (binary, cast, unary,
+   intrinsic argument, assignment); for the allocator it is which allocator (Pool / Slab /
+   Arena). Ten to fifteen one-file probes, run in a batch.
+3. **Compare the two spellings of one program.** The strongest signal is not "this is
+   accepted" but "this is accepted and the OTHER spelling of the same thing is rejected one
+   line away". Every accept-unsafe found this way had a rejected twin.
+4. **Confirm with ASan before believing it** — and know when ASan cannot help: BUG-861's
+   use-after-free is invisible to ASan because the reuse happens inside ZER-owned slab
+   storage. When the allocator is yours, the sanitizer is not watching.
+5. **Read the diagnostic, never the exit code** (the standing rule) — and for a
+   RUNTIME-value defect, read the value, since there is no diagnostic to read.
+
+The batch-probe harness is ~15 lines: compile with `-o out.c` to isolate the checker
+verdict, grep the diagnostic, then `gcc -fwrapv` and run.
 
 ---
 

@@ -1,0 +1,53 @@
+// BUG-860: a `const` declaration IS a compile-time constant, but the array /
+// Pool / Ring size paths used the NON-scoped evaluator, which cannot resolve an
+// identifier. `const u32 CAP = 4; u8[CAP] buf;` — the most idiomatic firmware
+// declaration there is — was rejected with "array size must be a compile-time
+// constant", naming a constant.
+//
+// The assertions below are RUNTIME, deliberately. The first cut of this fix
+// taught only the checker to resolve the const; the emitter re-resolves the same
+// type node with the non-scoped evaluator and sized the array 0, so
+// `@size(u8[CAP])` silently became 0. A compile-only test would have passed.
+const u32 CAP = 4;
+const u32 RING_CAP = 8;
+
+struct Slot { u32 v; }
+
+u8[CAP] gbuf;
+Pool(Slot, CAP) gpool;
+Ring(Slot, RING_CAP) gring;
+
+i32 main() {
+    u8[CAP] local;
+    u8[CAP * 2] wide;
+    local[3] = 7;
+    wide[7] = 9;
+    gbuf[3] = 5;
+    if (local[3] != 7) { return 1; }
+    if (wide[7] != 9) { return 2; }
+    if (gbuf[3] != 5) { return 3; }
+
+    // the SIZE the emitter used, not just the one the checker proved
+    if (@size(u8[CAP]) != 4) { return 4; }
+    if (@size(u8[CAP * 2]) != 8) { return 5; }
+
+    // Pool capacity really is CAP: exactly CAP allocations succeed.
+    // Allocate WITHOUT freeing — an alloc/free pair would succeed whatever the
+    // capacity and would assert nothing.
+    Handle(Slot)[8] held;
+    u32 got = 0;
+    for (u32 i = 0; i < 8; i += 1) {
+        ?Handle(Slot) h = gpool.alloc();
+        if (h) |k| { held[got] = k; got += 1; }
+    }
+    if (got != CAP) { return 6; }
+    for (u32 i = 0; i < got; i += 1) { gpool.free(held[i]); }
+
+    u32 pushed = 0;
+    for (u32 i = 0; i < 20; i += 1) {
+        Slot s; s.v = i;
+        if (gring.push_checked(s)) { pushed += 1; }
+    }
+    if (pushed != RING_CAP) { return 7; }
+    return 0;
+}

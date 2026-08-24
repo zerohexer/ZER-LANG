@@ -5,22 +5,192 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — `&&` / `||` do not narrow their RHS (PRECISION only, measured 2026-08-23)
+## OPEN — a `[*]T` funcptr parameter is exempt from the keep worst-case (accept-unsafe, deliberate, measured 2026-08-24)
 
-`if (i < 4 && arr[i] > 0)` — the canonical guarded-access idiom, and the exact shape the
-auto-guard warning tells users to write — still carries a runtime bounds guard, because
-VRP never applies a short-circuit LHS to its RHS. Verified still live after the harvest:
-the program compiles and runs correctly; the cost is one unnecessary branch.
+BUG-857 widened the indirect-call `keep` worst-case from a bare `*T` to the recursive
+carrier property, closing `?*T` and by-value-struct-carrying-a-pointer. **One shape is
+still accepted and is unsound:** a parameter whose own reference IS a slice.
 
-**This is PRECISION, not safety** — hence not shipped with the 45. It becomes REQUIRED
-the day the ALWAYS-OOB verdict is promoted at short-circuit position, because the same
-idiom would then be REJECTED rather than merely guarded. 87xihb's BUG-800 carries the
-implementation (`vrp_narrow_from_cond`: `ident <op> const` plus conjunctions, De Morgan
-for the inverted disjunction, refusing volatile operands, a no-op on anything else) and
-is deliberately NOT a second copy of the NODE_IF narrowing — that path stays
-authoritative and keeps field keys, guard-body detection, known_nonzero and the
-then/else JOIN; this covers only the position it structurally cannot reach, inside a
-condition EXPRESSION.
+    [*]u32 g;
+    void setg([*]u32 v) { g = v; }
+    void leak() { u32[4] a; *([*]u32) fp = setg; fp(a); }   // ACCEPTED
+
+ASan-confirmed `stack-use-after-return`. The DIRECT call `setg(a)` is rejected by inferred
+keep; only the indirect spelling is exempt.
+
+**Why it is exempt.** Passing a local array to a `[*]T` callback is the read-only-view
+idiom — the shape `sort(cmp, buf)` and every "here is a window on my data" API. Rejecting
+it costs real programs, and the exemption predates this session (it was stated in a code
+comment on `keep_edge_callee_keeps` as a deliberate carve-out). What was missing is that
+nobody had written down that the carve-out is an ACCEPT-UNSAFE rather than a precision
+choice.
+
+**Fix sketch, in increasing cost:**
+1. Resolve the funcptr target where the binding is visible — the compiler ALREADY does
+   this for spawn/ISR via `scan_funcname_binding` / `scan_returned_funcname` (nine forms,
+   see the funcptr REACH grid) — and apply the resolved callee's inferred keep. Precise;
+   leaves genuinely unresolvable targets to fall back to a decision.
+2. For the unresolvable tail, decide by the ADDRESS-TAKEN set: if no function whose
+   address is taken in the program has an inferred keep on a compatible `[*]T` position,
+   the call cannot retain. This is per-file-with-summaries, the same shape the escape
+   analysis already uses — not the banned whole-program analysis.
+3. Blanket reject (drop the exemption). Sound, one line, and the corpus cost has NOT been
+   measured — do that before considering it.
+
+**Do not "fix" this by deleting the exemption without measuring.** The measurement to run
+is: how many corpus programs pass a local array through a funcptr `[*]T` parameter. Until
+that number exists, option 3 is a guess.
+
+Boundary already pinned: `tests/zer/funcptr_keep_global_arg_ok.zer` asserts that a pointer
+to a GLOBAL still passes at every carrier shape, so a future tightening cannot become an
+over-rejection unnoticed.
+
+---
+
+## OPEN — `container Node(T) { Node(T) next; }` is documented as the recursion error, and it is not (DOC, 2026-08-24)
+
+CLAUDE.md's safety table gives the container-recursion example as
+
+    container Node(T) { ?*Node(T) next; }   ->  compile error (depth 32)
+
+That is the CANONICAL LINKED LIST and it compiles — correctly, since a pointer breaks the
+recursion and the type is finite. J4 (2026-08-02) tied the monomorphization knot
+specifically so it would. The genuine errors are the BY-VALUE forms:
+`container Node(T) { Node(T) next; }` and, since BUG-864, any by-value cycle through
+several containers.
+
+Left as an OPEN doc item rather than edited silently because the row also claims a
+"depth 32" mechanism, and the real guard is neither a depth limit nor about recursion
+depth — it is a cycle check over the stamps in progress. Fixing the row means rewriting
+the mechanism description too, which wants a second opinion on what the row is trying to
+promise.
+
+---
+
+## OPEN — no forward declaration: two mutually-referencing STRUCTS cannot both be written (MEDIUM, measured 2026-08-24)
+
+    struct A { ?*B x; }     // error: undefined type 'B'
+    struct B { ?*A y; }
+
+A struct may reference ITSELF through a pointer (`struct N { ?*N next; }` compiles, and
+the `@container` / intrusive-list pattern depends on it), and it may reference a struct
+declared EARLIER. It cannot reference one declared later, and there is no forward
+declaration, so a genuine A-to-B-to-A pair is not expressible.
+
+Three workarounds exist, in descending order of how much they cost the reader:
+
+1. **`container`** — containers resolve their fields lazily at instantiation, so
+   `container A(T) { ?*B(T) x; }` / `container B(T) { ?*A(T) y; }` compiles today
+   (verified). A single-type-parameter container used purely to get late binding is a
+   workaround, not a design.
+2. Merge the two into one struct with a variant tag.
+3. Route one direction through `*opaque` and `@ptrcast`, which costs the provenance check
+   at every use.
+
+**Fix sketch:** a forward declaration (`struct B;`) whose only legal use is behind a
+pointer / optional-pointer / slice, resolved in the same Pass-1 registration loop that
+already registers every top-level declaration before bodies are checked. The by-value
+containment guard (BUG-864) is the piece that must stay in front of it: a forward
+declaration makes a by-value cycle EXPRESSIBLE for plain structs, which today it is not —
+`struct A { B x; } struct B { A y; }` is rejected only by the accident that `B` is not yet
+a name. Adding forward declarations without extending that guard to plain structs would
+re-open BUG-864 outside containers.
+
+---
+
+## OPEN — `const` globals cannot initialise other globals (LOW, measured 2026-08-24)
+
+    const u32 A = 5;
+    const u32 B = A + 1;      // GCC: initializer element is not constant
+
+ZER emits a `const` global as a real C `const` variable, which is not a C constant
+expression. BUG-860 made a `const` usable as an array / Pool / Ring SIZE (those fold in
+the checker), but a global INITIALIZER is emitted verbatim, so this still reaches GCC.
+
+The failure is loud but the message names a C concept at a `#line`-mapped ZER line, and
+the workaround is non-obvious: use a `comptime` function
+(`comptime u32 DERIVE() { return 6; } const u32 B = DERIVE();`), which is accepted today.
+
+**Fix sketch:** the same in-place fold BUG-860 uses. In `checker_check_bodies`, when a
+global's declared type is an integer and `eval_const_expr_scoped` folds its initializer,
+rewrite the initializer node to a literal. Restrict to integer-typed globals and integer
+folds; do NOT fold a float or an aggregate. Cost: emitted C changes for every global whose
+initializer mentions a const, so measure the corpus diff before shipping.
+
+Documented in `reference.md` under `const`, with the comptime workaround, so a user is not
+left guessing.
+
+---
+
+## OPEN — no array-literal syntax; global aggregates cannot be initialised (MEDIUM, measured 2026-08-24)
+
+    u32[3] TABLE = {1, 2, 3};       // parse error, at global AND local scope
+    S g = { .x = 1 };               // designated init is not a global form
+
+There is no array-literal syntax anywhere in the language, and designated initializers are
+a var-decl / assignment / call-argument / return form only. So a lookup table — the single
+most common firmware global after a register address — has to be filled element by element
+from an init function.
+
+Diagnostics are poor: the global designated-init form reports
+`cannot initialize 'g' of type 'S' with 'void'`, which names neither the restriction nor a
+workaround.
+
+**Fix sketch, cheapest first:** (a) make the global designated-init path report the
+restriction and the workaround instead of a type mismatch — pure diagnostic, no semantics;
+(b) accept `S g = { .x = 1 };` at global scope by emitting the C designated initializer
+directly (it IS a valid C file-scope initializer when every field value is constant, which
+`gi_scan_nonconst` can already decide); (c) add array-literal syntax, which is a
+parser + emitter feature and the largest of the three.
+
+Recorded in `reference.md` under "Global variable initializers" so the restriction is at
+least discoverable.
+
+---
+
+## OPEN — `tools/audit_reference_examples.sh` baseline holds 86 non-compiling doc fragments (2026-08-24)
+
+The gate is new and green, but 86 of the 178 ```zer blocks in `reference.md` do not compile
+standalone — they name a type, variable or function that the surrounding prose supplies.
+Each is an example a reader cannot paste into a file.
+
+The baseline exists so the 87th cannot appear silently; it is not an endorsement of the 86.
+Converting one into a self-contained example and deleting its row is always an improvement.
+The baseline header says so; this entry is here so the number is visible outside the
+tooling.
+
+---
+
+## OPEN — `&&` / `||` do not narrow their RHS (PRECISION only; the CORRECTNESS half is fixed, 2026-08-24)
+
+`if (i < 4 && arr[i] > 0)` — the canonical guarded-access idiom — still carries a runtime
+bounds guard, because VRP never applies a short-circuit LHS to its RHS.
+
+**The correctness half is CLOSED (BUG-863).** The 2026-08-23 note above said this was
+"PRECISION only ... compiles" and that it "becomes REQUIRED the day the ALWAYS-OOB verdict
+is promoted at short-circuit position". Measured 2026-08-24: that day had already arrived.
+With a VRP-known index the access was **hard-rejected**:
+
+    u32 i = 9; if (i < 4 && a[i] > 0) { }   // error: index 'i' is always out of bounds
+
+while the nested-if spelling compiled. `Checker.sc_rhs_depth` now downgrades the always-OOB
+VERDICT to the ordinary auto-guard path while checking the RIGHT operand of `&&` / `||`.
+That is a strictly safe change: it removes no runtime check, so it can only turn a REJECT
+into a GUARDED ACCEPT. The boundary is pinned by
+`tests/zer_fail/shortcircuit_guard_after_access.zer` — with the guard written AFTER the
+access the verdict must still be a hard error.
+
+**What remains open is the PRECISION half:** the guard is emitted where a narrowed range
+would prove it unnecessary. 87xihb's BUG-800 carries the implementation
+(`vrp_narrow_from_cond`: `ident <op> const` plus conjunctions, De Morgan for the inverted
+disjunction, refusing volatile operands, a no-op on anything else) and is deliberately NOT
+a second copy of the NODE_IF narrowing — that path stays authoritative and keeps field
+keys, guard-body detection, `known_nonzero` and the then/else JOIN; this covers only the
+position it structurally cannot reach, inside a condition EXPRESSION.
+
+**This half is a RELAXATION that ELIDES a check, so it is the dangerous class** (unlike
+BUG-863, which kept the check). Follow the accept-unsafe discipline in
+compiler-internals.md before shipping it.
 
 ---
 

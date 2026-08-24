@@ -188,6 +188,21 @@ typedef struct {
     int keep_edge_count;
     int keep_edge_capacity;
 
+    /* BUG-864: containers whose fields are being resolved RIGHT NOW, innermost
+     * last. The by-value self-containment guard used to compare against the one
+     * in-progress stamp, which sees `A(T){A(T) x;}` but not the CYCLE
+     * `A(T){B(T) x;}` / `B(T){A(T) y;}` — that one recursed until the stack ran
+     * out (ASan: stack-overflow in estimate_type_size). Fixed-capacity: a cycle
+     * needs at most a handful of frames and overflow only disables the extra
+     * check, which the depth limit in estimate_type_size then backstops. */
+    Type *stamping[64];
+    int stamping_count;
+
+    /* BUG-863: >0 while checking the RIGHT operand of `&&` / `||`. That operand
+     * is CONDITIONAL, so a provably-out-of-range index there may be unreachable;
+     * the always-OOB verdict falls back to the auto-guard instead of rejecting. */
+    int sc_rhs_depth;
+
     /* Interrupt safety: track globals accessed from ISR and regular code */
     bool in_interrupt;  /* true when checking NODE_INTERRUPT body */
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */

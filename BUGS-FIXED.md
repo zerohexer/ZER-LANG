@@ -5,6 +5,298 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-24 — BUG-857..864: a fresh audit, seven findings, and warnings to zero
+
+An independent audit (no branch to harvest — probing the shipped compiler directly).
+**Two are accept-unsafe**, both ASan-confirmed, both silent at runtime; **one is a
+compiler crash** on a three-line program; two are genuine over-rejections, one of them
+the most idiomatic firmware declaration there is; and two are diagnostics that named no
+fix.
+
+Method note worth keeping: every finding below came from ENUMERATING FORMS against a
+question the compiler already answers somewhere — "does an indirect call retain this?",
+"is this initializer constant?", "is fresh memory zeroed?" — and asking it once per
+syntactic shape. Nothing here needed reading a subsystem end to end.
+
+### BUG-857 — an INDIRECT call worst-cased only a bare `*T`, so three carrier shapes escaped
+
+`keep_edge_callee_keeps` already worst-cases a funcptr call's pointer parameters as
+`keep`, because the target is invisible and could retain the pointer. It asked the
+question as `pt->kind == TYPE_POINTER` — a SPELLING test where the property is "can this
+carry a reference into my frame?". The CARRIER class (CLAUDE.md), at the keep sink.
+
+Three shapes walked past it. The DIRECT call of each is correctly rejected, so the two
+spellings of the same program disagreed:
+
+    void setg(?*u32 v)  { g = v; }   *(?*u32) fp = setg;  fp(&local);   // ?*T
+    void setg(Holder h) { g = h.p; } *(Holder) fp = setg; fp(h);        // struct{*T}
+    void setg([*]u32 v) { g = v; }   *([*]u32) fp = setg; fp(localarr); // slice
+
+Each is an ASan-confirmed `stack-use-after-return`. Without ASan the first one compiles
+clean, runs, and reads the dangling stack slot successfully — the exact "compile-time and
+runtime both miss it" shape. The transitive form (`void take(*(?*u32) fp, ?*u32 v){fp(v);}`
+called as `take(setg, &x)`) escaped too, because propagation and enforcement share the
+predicate.
+
+**Fix:** one predicate, `funcptr_param_worst_case_keep`, answering with the shared
+recursive `type_carries_data_pointer` — so `?T`, array-of, and by-value struct/union
+carriers are covered, and a NEW wrapper kind is covered the day it is added to that one
+predicate rather than to this call site.
+
+**The slice case is NOT fixed, deliberately, and is now written down.** The old comment
+already carved slices out ("passing a local array as a slice to a callback stays
+allowed"); that carve-out is an accept-unsafe, not merely an ergonomic choice, and it had
+never been recorded as one. The exemption is kept (rejecting the read-only-view idiom has
+real corpus cost) and now has an OPEN entry in `docs/limitations.md` and a paragraph in
+`reference.md` saying plainly that it is unsound. An exemption whose stated rationale is
+narrower than its code is a class this file has burned a session on before; this one is
+the reverse — code narrower than the danger, with the danger unstated.
+
+Tests: `tests/zer_fail/funcptr_keep_{optional_carrier,struct_carrier,forwarded_param}.zer`
+(all three verified to flip ACCEPT -> REJECT), plus the boundary positive
+`tests/zer/funcptr_keep_global_arg_ok.zer` — a pointer to a GLOBAL must still pass at
+every carrier shape, or the widening has become an over-rejection.
+
+### BUG-858 — a global `const [*]u8` was not declarable, and said so with the same type twice
+
+`const [*]u8 BANNER = "boot ok";` — the single most common firmware global — was rejected
+with:
+
+    cannot initialize 'BANNER' of type '[]u8' with '[]u8'
+
+The same type printed on both sides, because `type_name()` does not render slice
+constness. No spelling worked.
+
+**Root cause:** ZER carries `const`/`volatile` on the DECLARATION, and folding them into
+the slice/pointer type was written out longhand in `register_decl` (Pass 1) and NOT
+repeated in `checker_check_bodies` (Pass 2), which re-resolved the raw type node. Pass 2
+therefore compared a MUTABLE target against a CONST initializer. The `volatile` arm had
+the identical exposure on a `volatile [*]T` global.
+
+**Fix:** `global_var_qualified_type`, called by both passes. Two passes, one fold. Also
+added the string-literal diagnostic the local var-decl path already had — a global
+`[*]u8 S = "x";` now names the fix instead of printing a type mismatch against itself —
+and corrected both copies of that message, which recommended the DEPRECATED `[]u8`
+spelling.
+
+`reference.md` had shown `const [*]u8 NAME = "ZER";` in the `const` section all along.
+The documentation was asserting behaviour the compiler did not have; see BUG-862.
+
+### BUG-859 — the global-initializer constant guard was a top-level kind test
+
+Three guards ensure a global initializer is a C compile-time constant. All three tested
+the OUTERMOST node, so one wrapper defeated every one of them:
+
+    u32 G = @cpu_model_id();       // rejected, names the ZER line
+    u32 G = @cpu_model_id() + 1;   // ACCEPTED -> GCC fails on generated C
+    u32 G = (u32)@cpu_model_id();  // ACCEPTED
+    u32 G = -@cpu_model_id();      // ACCEPTED
+    u32 G = @truncate(u32, f());   // ACCEPTED
+
+This is the same instance BUG-842 exists to close, one level in — "the check exists but
+is never REACHED". LOUD, not unsound (GCC always stops it), but the whole reason the
+guards exist is that the user should be told in ZER terms at a ZER line instead of reading
+generated C.
+
+**Fix:** `gi_scan_nonconst`, one exhaustive no-`default:` walk over the initializer.
+`@truncate`'s non-native-`uN` test now reads the intrinsic's OWN `type_arg` and falls back
+to the declared type, so a nested `@truncate(u21, x)` is judged correctly — it could not
+be judged from the global's type at all.
+
+**`tools/audit_walker_fields.sh` earned its keep here.** It reported that the new walker
+named `NODE_ASSIGN` without descending it. That looked like a statement kind to baseline
+— until measuring: `u32 G = (x = f());` really does parse, and emits `uint32_t G = x = f();`.
+Descending it was mandatory, and only the gate knew.
+
+### BUG-860 — a `const` was not usable as an array / Pool / Ring size
+
+    const u32 CAP = 256;
+    u8[CAP] rx_buffer;      // error: array size must be a compile-time constant
+
+naming a constant. The size paths used the NON-scoped `eval_const_expr`, which cannot
+resolve an identifier, and then hand-special-cased `@size` and a comptime CALL one at a
+time. `eval_const_expr_scoped` resolves through `resolve_const_ident`, which requires
+`sym->is_const` — so a MUTABLE global still fails and no VLA slips in.
+
+**The first cut of this fix introduced a silent miscompile, which is the durable lesson.**
+Teaching only the CHECKER to resolve the const made it ACCEPT `u8[CAP]`; the emitter
+re-resolves the same type node in `resolve_tynode` with the non-scoped evaluator and sized
+the array **0**, so `@size(u8[CAP])` emitted `size_t s = {0};`. A relaxation that trades an
+over-rejection for a wrong answer is strictly worse than the over-rejection. Caught only
+because the regression test asserts a RUNTIME value; a compile-only test passes.
+
+**Fix:** `ct_fold_size_expr` folds the AST node to a literal on success, so there is no
+second evaluation to disagree with — every downstream consumer (emitter, LSP, wasm bridge)
+sees `u8[4]`. Folding happens ONLY where the old path already failed, so every
+previously-accepted program emits byte-identical C.
+
+Test `tests/zer/const_compile_time_sizes.zer` asserts the emitted sizes AND allocates
+until a `Pool(Slot, CAP)` is exhausted — an alloc/free pair would have succeeded whatever
+the capacity and asserted nothing.
+
+### BUG-861 — a recycled Pool/Slab slot was handed back dirty, against the documented guarantee
+
+ZER documents "Uninitialized memory | Everything auto-zeroed". `Arena.alloc` honours it
+(it memsets). `_zer_pool_alloc` and `_zer_slab_alloc` did not: they flipped `used[i] = 1`
+and returned the slot with the previous object still in it, bit for bit.
+
+Silent by construction — a fresh page is `calloc`-clean, so this only appears after the
+first free/alloc cycle:
+
+    ?*Ctx a = alloc(Ctx); c1.p = &payload; c1.tag = 1; free(c1);
+    ?*Ctx b = alloc(Ctx); c2.tag = 2;          // sets only what it cares about
+    if (c2.p) |q| { ... }                       // TAKEN. q points at freed memory.
+
+The consequence is not stale data, it is a **use-after-free reachable from pure safe ZER
+with no diagnostic** — a `?*T` field comes back non-null and dangling, and a program that
+trusts the documented guarantee for the fields it did not set will unwrap and dereference
+it. **ASan cannot see it**: the reuse happens inside ZER-owned slab storage, not in
+malloc. On bare metal it is a quiet wrong read. Measured: the ASan build returns the same
+wrong answer as the plain one.
+
+**Fix:** memset the slot on allocation in both allocators. `<string.h>` and `memset` were
+already unconditional preamble dependencies (the arena path uses them), so no new
+freestanding requirement.
+
+**Cost, measured** (`-O2`, alloc/free in a tight loop doing nothing else — the worst case
+this can be shown in): an 8-byte struct over 2,000,000 cycles is 9 ms both before and
+after, i.e. in the noise. A 260-byte struct over 200,000 cycles goes 4 ms -> 6-7 ms. The
+cost is memset bandwidth and scales with object size, which is exactly what a zeroing
+guarantee costs; the common small-object case is free. `Arena.alloc` has always paid it.
+
+**Shape:** three allocators answering "is fresh memory zeroed?", one right and two wrong —
+the multi-site signature, in the runtime rather than the checker.
+
+Test `tests/zer/alloc_recycled_slot_zeroed.zer` covers BOTH allocators and was verified
+DISCRIMINATING: exit 1 against a from-HEAD build, exit 0 after.
+
+### BUG-863 — the guarded-access idiom was hard-rejected when VRP knew the index
+
+    u32 i = 9;
+    if (i < 4 && a[i] > 0) { ... }   // error: index 'i' is always out of bounds
+
+while the equivalent nested-if spelling compiled. The RIGHT operand of `&&` / `||` is
+CONDITIONAL — it runs only when the left operand allows it — but the always-OOB verdict
+(BUG-796) judged the index there as if it always ran.
+
+**`docs/limitations.md` predicted this precisely** and had it recorded as not-yet-live:
+O3 said the short-circuit gap was "PRECISION only ... compiles" and "becomes REQUIRED the
+day the ALWAYS-OOB verdict is promoted at short-circuit position". Measured 2026-08-24:
+that day had already arrived — the entry was written before BUG-796 landed and nobody
+re-measured it. A documented open hole is a HYPOTHESIS (CLAUDE.md); this one had drifted in
+the direction that makes a precision note into a correctness bug.
+
+**Fix:** `Checker.sc_rhs_depth`, incremented while checking the right operand, downgrades
+IDX_ALWAYS_OOB to IDX_UNKNOWN — the ordinary warn-and-auto-guard path. Deliberately NOT
+range narrowing: it removes no runtime check, so it can only turn a REJECT into a GUARDED
+ACCEPT, never elide one. The precision half (narrowing the RHS so the guard is provably
+unnecessary) stays open and is the dangerous class, because that one DOES elide.
+
+Boundary pinned by `tests/zer_fail/shortcircuit_guard_after_access.zer`: with the guard
+written AFTER the access (`a[i] > 0 && i < 4`) the access is unconditional and must still
+be a hard error. `tests/zer/shortcircuit_guarded_index.zer` asserts runtime values —
+verified to produce 2 errors against a from-HEAD build and exit 0 after.
+
+### BUG-864 — a two-container containment cycle SEGFAULTED the compiler
+
+    container A(T) { B(T) x; }
+    container B(T) { A(T) y; }
+    i32 main() { A(u32) n; return 0; }
+
+Three lines, `zerc` exits 139. ASan named it in one run: stack-overflow in
+`estimate_type_size` (checker.c), recursing over a type graph with a cycle in it.
+
+**Root cause.** The by-value self-containment guard added with J4 compares the resolved
+field type against `st` — THE ONE stamp this frame is resolving. That sees
+`A(T){A(T) x;}`. It cannot see the cycle above, because the field that closes it
+(`B`'s `y`) closes on the OUTER stamp, which B's frame does not own. So the cycle was
+accepted and monomorphization recursed until the process stack was gone.
+
+The shape is familiar: a guard written for the ONE case in front of it, where the property
+is "does this close a cycle" — the same spelling-vs-property split as BUG-857, in the type
+system.
+
+**Fix:** `Checker.stamping[]`, the stack of container stamps whose fields are being resolved
+right now. The guard checks the field against EVERY entry, so a cycle of any length is
+caught (verified at 1, 2 and 3 links). The cyclic field is also set to `void` so no later
+pass walks an infinite type. The message names both ends — reporting "B cannot contain
+itself" for `B{A y;}` sends the reader looking for a field that is not there.
+
+Two boundaries kept: a POINTER cycle (`A{?*B x;} B{?*A y;}`) is finite and still compiles,
+as does the canonical `container Node(T) { ?*Node(T) next; }` linked list — the whole
+reason J4 tied the knot in the first place.
+
+**Belt and braces:** `estimate_type_size` is now depth-limited (128). The cycle is rejected
+before it can get there, so the limit should be unreachable — which is exactly what was
+believed about the direct-self-reference guard, and the cost of being wrong is a crash
+rather than a diagnostic.
+
+Tests: `tests/zer_fail/container_{mutual,three_way}_cycle.zer` and the boundary positive
+`tests/zer/container_pointer_cycle_ok.zer`.
+
+**Debugging note worth keeping.** After adding two fields to `struct Checker` in
+`checker.h` I ran `make zerc` without clearing objects, and got a MIXED-ABI binary — the
+documented trap (CLAUDE.md: the Makefile has zero header dependencies). It produced a
+convincing PHANTOM: `--stack-limit` silently stopped firing, and the pointer-cycle positive
+failed GCC with "variable has initializer but incomplete type", which reads exactly like a
+real emitter bug in container forward declarations. Both vanished after
+`rm -f *.o src/safety/*.o`. The rule earns its place: **touch a header, clear the objects,
+and do it before believing any result.**
+
+### BUG-862 — tooling and debt
+
+- **`tools/audit_reference_examples.sh` (new, in `make check`).** Every ```zer block in
+  `docs/reference.md` is compiled. Fragments are wrapped in a `main()`; a shared prelude
+  supplies the doc's standing cast (Task / Point / Sensor / …) only where the block does
+  not declare it itself. 86 pre-existing non-compiling fragments are frozen in
+  `tools/reference_example_baseline.txt`, keyed by a hash of the block BODY so a row
+  survives the block moving and dies when its text changes. Verified to FIRE by injecting
+  a typo. This gate is what proves the ~100 newly documented intrinsic signatures are
+  right, and it is what would have caught BUG-858 (the `const` section shows
+  `const [*]u8 NAME = "ZER";`).
+- **`tools/audit_walker_fields.sh` decided membership on PROSE.** Its recursion test
+  counted textual occurrences of the function name anywhere in the body, comments and
+  string literals included. Measured: `register_decl` (46 baselined rows) and
+  `zercheck_ir` (29) are both NON-recursive and qualified purely on a doc-comment and a
+  `ZTRACE` string — so editing a comment silently moved a walker in or out of the audited
+  set. Now counts CALL-SHAPED occurrences outside comments and strings; the audited set
+  finally matches the rule the script states. The 75 rows for those two walkers are
+  removed (baseline 758 -> 712) and the gate re-verified to fire.
+- **Build warnings 27 -> 0.** Nine dead static functions deleted, including the drifted
+  emitter copies of the shared-root walker that BUG-817's unification left behind
+  (`find_shared_root_in_stmt`, `shared_needs_condvar`, `stmt_writes_shared`) and the
+  `ir_classify_method_call` back-compat wrapper CLAUDE.md's Gap 32 asked to retire. Plus a
+  real `-Wreturn-type` in `lower_expr` (falling off a non-void function that returns a
+  LOCAL ID — an uninitialised id would read as a real slot), two `%.*s`/`size_t` varargs
+  mismatches, an unguarded `calloc(int, …)`, four nested-comment warnings and three
+  unused variables.
+
+### reference.md
+
+~100 intrinsics had no entry at all — the whole `@mmu_*`, `@tlb_*`, `@cache_*`,
+`@port_*`, MSR/CR/DR/XCR, XSAVE, CPUID, power/idle, mode-transition and CPU-inspection
+families. **Every signature was MEASURED by probing the compiler**, not recalled: arity
+from the diagnostic, argument widths by passing a `u64` and seeing whether the narrowing
+rule rejects it, and return types narrow-first (a `u32` return reads as `u64` if you try
+`u64` first) then disambiguated under `--target-bits 32` to separate `usize` from `u64`.
+Two corrections that came out of it: `@cpu_rdrand` / `@cpu_rdseed` return `?u64`, not
+`u64` — the optional IS the API, since the instruction is allowed to fail — and the port
+number of `@port_out8` is typed `u64` in ZER and truncated on emission, not `u16` as
+CLAUDE.md states.
+
+`tests/zer/all_intrinsic_signatures.zer` is the machine-checkable form of that probing:
+every one of the 96 at its documented arity, argument widths and return type, behind the
+dead-branch pattern so the privileged ones are compiled and type-checked without
+executing. It runs and exits 0 on a hosted host. A signature change now makes the docs,
+the test and the compiler disagree on the same day instead of silently drifting.
+
+Also documented: `const` as a compile-time size (BUG-860), the global-initializer rules
+(BUG-859), global `const` string slices (BUG-858), and a corrected funcptr-`keep`
+paragraph — the old text claimed "the keep/escape property is 100% sound", which was
+false in three shapes before BUG-857 and remains false for the slice exemption.
+
+---
+
 ## Session 2026-08-23 — BUG-847..856: §E/§F/§G, and the harvest closes
 
 Nine silent-behaviour fixes from `4z36e0`, `pmytnl` and `pjtawx`. None is an

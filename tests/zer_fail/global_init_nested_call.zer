@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot call functions at global scope
+// BUG-859: same hole on the CALL half — the top-level form was rejected, the
+// wrapped form was not.
+u32 f() { return 1; }
+u32 G = (u32)f();
+
+i32 main() { return 0; }

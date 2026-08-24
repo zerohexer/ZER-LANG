@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: closes a containment cycle
+// BUG-864 boundary: the cycle is not always two links long. The guard walks
+// every stamp still in progress, so a three-container cycle is caught the same
+// way — a two-element special case would have shipped the same crash one link
+// further out.
+container A(T) { B(T) x; }
+container B(T) { C(T) y; }
+container C(T) { A(T) z; }
+
+i32 main() {
+    A(u32) n;
+    return 0;
+}

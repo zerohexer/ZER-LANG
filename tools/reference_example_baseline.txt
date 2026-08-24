@@ -1,0 +1,107 @@
+# reference_example_baseline.txt — generated + reviewed. See
+# tools/audit_reference_examples.sh.
+#
+# Each row is `<sha1-16 of the block body>  reference.md:<line when frozen>`: a
+# ```zer example that does NOT compile standalone. Being in this file means the
+# block was looked at and judged an intentional FRAGMENT — it names a type, a
+# variable or a function that the surrounding prose supplies and that the
+# example is not meant to re-declare.
+#
+# THE POINT OF THE BASELINE IS TO SHRINK. Every row is an example a reader
+# cannot paste into a file and compile. Converting one into a self-contained
+# example and deleting its row is always an improvement; adding a row is a
+# conscious admission. A NEW non-compiling block fails the build.
+#
+# The key is a hash of the block BODY, so the row survives the block moving in
+# the file and dies the moment the block's text changes — which is exactly when
+# it needs re-reviewing. The trailing `reference.md:<line>` is a human hint only.
+#
+# Frozen 2026-08-24 at 86 rows, measured against a shared prelude that already
+# supplies the doc's standing cast (Task / Point / Sensor / SensorData /
+# ListHead / Command / heap / pool) plus a catch-all mmio range.
+de87cd773e12d8d9  reference.md:42
+dfa8ccb992bdfc47  reference.md:93
+cbf973809ab90199  reference.md:158
+dd5fdde401db71ce  reference.md:210
+a6ebf1e6f152d059  reference.md:221
+fada445f41559b48  reference.md:251
+6ef265d9e0172d35  reference.md:308
+652a795e1b0c8729  reference.md:314
+a88161d6ee26cd71  reference.md:347
+c50576dbc5c2a59b  reference.md:388
+44069030d6a04a51  reference.md:415
+c06cc35ad5af93f6  reference.md:447
+7eb20e4b46c67ca2  reference.md:457
+c48ac2be266d6950  reference.md:544
+f4ef00cd72e06770  reference.md:578
+539d23316d784881  reference.md:650
+a3f308c6610b6d60  reference.md:662
+92c5fd99fd346712  reference.md:682
+cef8a0991afd00d4  reference.md:691
+558cd267303bf777  reference.md:709
+24b431e06f2590db  reference.md:753
+6478d5bd3562fdc5  reference.md:805
+dfaf2a0615cbe6bc  reference.md:833
+677840937f6c448f  reference.md:852
+157f503d18ac369a  reference.md:866
+8d21605548eaef59  reference.md:884
+5a4d68b5356493c6  reference.md:904
+2c6ba96c2b1361c6  reference.md:994
+594b613eae238b12  reference.md:999
+c42c34dc7b640555  reference.md:1030
+b00320093cfba975  reference.md:1085
+d54d5d28f9372705  reference.md:1117
+f6aacb1c7407ada0  reference.md:1129
+122efc1c95771253  reference.md:1158
+47f803c951ed58ab  reference.md:1240
+5e14fe2966596dc4  reference.md:1293
+72ee3e99afd59bec  reference.md:1310
+84297a2431669274  reference.md:1350
+bec093813c5f183d  reference.md:1355
+e41d7631cbfce5eb  reference.md:1378
+aa63b3222878de43  reference.md:1406
+b06fafd5daf9214b  reference.md:1472
+919bf4b635112a98  reference.md:1495
+bd7964125ba9ebee  reference.md:1534
+75de8470de7afd97  reference.md:1544
+7ade3feda321aef7  reference.md:1583
+2e237bad4236a5e7  reference.md:1596
+de40d7f59a7c8237  reference.md:1619
+5ac99eba618f81de  reference.md:1656
+9c4588b653af2e44  reference.md:1683
+7a2aefd18fc7c978  reference.md:1696
+1cb844da08207d37  reference.md:1747
+8955b4e9d9ec07f0  reference.md:1792
+4c612956832afce6  reference.md:1833
+0d6e3127d44a32be  reference.md:1872
+6e0b4c6efe281acf  reference.md:1885
+de3e938dd8ebb874  reference.md:1912
+d361ea32e78aa5e3  reference.md:1926
+b28c0b01d6f2c572  reference.md:1962
+e044455f457cb3e7  reference.md:1988
+1512197f44d5f5f9  reference.md:2636
+d38a3e67e4ff9cd0  reference.md:2660
+a75a37b298d178ea  reference.md:2675
+aa8de80acb528ee5  reference.md:2688
+f9764f4cb5d9f483  reference.md:2724
+04fa5dbc461502aa  reference.md:2815
+cf1f45799e6f465a  reference.md:2857
+9077b704b75e0c84  reference.md:2872
+dcd613ebaca835de  reference.md:2894
+197eeeb88fb3a812  reference.md:3096
+a5fa354db7afd8d8  reference.md:3106
+a2d212648a84bea1  reference.md:3116
+3674a4d42fd5a947  reference.md:3134
+6c6f217dfa4c2874  reference.md:3147
+3c4361ded12b0d87  reference.md:3180
+8593d17a2cd3b65f  reference.md:3226
+234f52e2805d4d61  reference.md:3277
+af4c920a8953b104  reference.md:3316
+394fdfac3247114c  reference.md:3363
+e246a3334d5820c5  reference.md:3447
+d54d84941e077f48  reference.md:3465
+01adc7b7eff191c4  reference.md:3552
+22e9fa9c766877a3  reference.md:3578
+40b2571e361cc858  reference.md:3593
+95f5145d30a07c57  reference.md:3602
+fdba85d6406e565e  reference.md:3618

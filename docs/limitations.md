@@ -5,7 +5,15 @@ Entries removed once fixed.
 
 ---
 
-## OPEN — `&&` / `||` do not narrow their RHS (PRECISION only, measured 2026-08-23)
+## SUPERSEDED by harvest-2 H14 — `&&` / `||` narrowing (the "PRECISION only" call was WRONG)
+
+**Corrected 2026-08-25.** See the harvest-2 tracker above: with a PROVABLE index the
+`&&` spelling is HARD-REJECTED while the nested-if spelling of the same program compiles.
+The original entry below probed an UNPROVABLE index, which correctly guards, and drew the
+wrong conclusion. Kept for the measurement, not the verdict.
+
+### (original entry)
+
 
 `if (i < 4 && arr[i] > 0)` — the canonical guarded-access idiom, and the exact shape the
 auto-guard warning tells users to write — still carries a runtime bounds guard, because
@@ -21,6 +29,157 @@ is deliberately NOT a second copy of the NODE_IF narrowing — that path stays
 authoritative and keeps field keys, guard-body detection, known_nonzero and the
 then/else JOIN; this covers only the position it structurally cannot reach, inside a
 condition EXPRESSION.
+
+---
+
+## OPEN — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
+
+**Status: NOT implemented — a catalog.** Every row verified on a clean build of main
+(`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading
+the diagnostic. Rows main already closed are in the "already on main" table.
+
+### Source branches — and why the fork point matters here
+
+| Branch | Forked at | Commits | Overlap with the 45 |
+|---|---|---|---|
+| `r1piyr` | `1c4c64d2` = **current main** | 1 | **none** — audited the fully-harvested tree |
+| `29fiao` | `8b289ede` (before §E/F/G) | 3 | partial |
+| `qa249l` | `430bda19` (before §D) | 15 | heavy |
+
+`r1piyr` is the highest-value branch precisely because it had nothing to harvest: its
+eight findings are what survived the previous 45 fixes.
+
+**BUG numbers collide AGAIN** — all three renumber 839..865 for different bugs. Key by
+branch+sha.
+
+### A CORRECTION TO THE PREVIOUS HARVEST, which I got wrong
+
+`r1piyr` BUG-863 is the row I closed as **"O3, PRECISION only"**. It is not. I probed
+with an UNPROVABLE index (`volatile u32 v = 2; u32 i = v;`), which correctly falls to the
+auto-guard, and concluded there was no over-rejection. With a PROVABLE index the same
+program is HARD-REJECTED:
+
+```
+u32 i = 9;
+if (i < 4 && a[i] > 0) { }      // error: index 'i' is always out of bounds
+if (i < 4) { if (a[i] > 0) { } } // COMPILES — same program, other spelling
+```
+
+Worse, my own tracker predicted it — *"becomes REQUIRED if the always-OOB verdict is ever
+promoted at short-circuit position"* — and I never checked whether main had already
+promoted it. It had: `index_range_verdict`'s error arm shipped with BUG-796. Writing the
+prediction and not testing it is the failure here, not the missing feature.
+
+### Already on main — do NOT re-implement
+
+Arena backing / `.over()` discarded / Barrier init / discarded optional / CLI validation
+/ struct+union comparison / RMW launders (intrinsic, call, orelse) / guarded-alias
+coverage / static-return summaries / packed sinks / `@saturate` totality / the
+`naked` warning / the value-returning-async warning / the emitter give-up paths.
+Several report **"rejected, WRONG RULE"** — the rule fires, the wording differs from the
+branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
+
+### LIVE — accept-unsafe
+
+| # | Fix | Best version | Evidence on main |
+|---|---|---|---|
+| H1 | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
+| H2 | **Recycled pool/slab slot is not zeroed** | **r1piyr** BUG-861 | Verified: `alloc_recycled_slot_zeroed` exits 1 — the slot comes back holding the previous object bit-for-bit, against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A `?*T` field returns non-null and dangling, so safe ZER can unwrap and deref it. **Invisible to ASan** — the reuse is inside ZER-owned storage |
+| H3 | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
+| H4 | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
+| H5 | **Negative constant into an unsigned type** — 8 spellings | **qa249l** | `u32 a = -1;` silently becomes 4294967295. 8 negatives accepted (var-decl, assign, global, arg, return, orelse, spawn, struct-init) |
+| H6 | **Enum forging through `@truncate` and a struct carrier** | **qa249l** | 3 accepted. My BUG-843 closed `@bitcast` only; these are the sibling routes |
+| H7 | **`free` of an inline-array field slice** | **29fiao** | `free(s.buf[0..])` on an inline array accepted; the same without the index was already rejected |
+| H8 | **Non-null funcptr global** | **qa249l** | `funcptr_global_nonnull` accepted |
+| H9 | **Optional comparison** | **qa249l** | 2 accepted. My BUG-841 covered struct/union; `?T == ?T` and `?T == T` were left |
+
+### LIVE — compiler crash
+
+| # | Fix | Best version | Evidence |
+|---|---|---|---|
+| H10 | **Mutually-recursive containers SEGFAULT the compiler** | **r1piyr** BUG-864 | `container A(T){B(T) x;} container B(T){A(T) y;}`. The self-containment guard compares against the one stamp its own frame owns, which cannot see a cycle closing on an OUTER stamp. Fix is a stack of in-progress stamps; pointer cycles and the canonical linked list must still compile |
+
+### LIVE — invalid C reaches GCC (silent checker, loud backend)
+
+| # | Fix | Best version | Evidence |
+|---|---|---|---|
+| H11 | **Global-init constant guard is a TOP-LEVEL kind test** | **r1piyr** BUG-859 | 3 accepted: one wrapper (`+ 1`, a cast, a unary minus, an intrinsic argument) defeats all three checks and the failure lands on GCC. Needs one exhaustive walk. **This is the sibling of my BUG-842** — I split the arg_count precondition but left the top-level-kind shape |
+| H12 | **`@offset` validated nothing** | **29fiao** BUG-860 | 4 accepted. The field check sat inside a guard and did nothing when the guard failed. One case is the distinct-unwrap class, so `@offset` also now WORKS through a distinct typedef. A union is rejected with a reason (ZER unions are tagged, so a variant has no fixed offset) |
+| H13 | **Intrinsic arity unchecked** | **29fiao** | 3 accepted (`@barrier_*`, `@cstr`, `@offset` with wrong arity) |
+
+### LIVE — over-rejections (valid code refused)
+
+| # | Fix | Best version | Evidence |
+|---|---|---|---|
+| H14 | **`&&` / `\|\|` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
+| H15 | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
+| H16 | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
+| H17 | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |
+| H18 | Arena-internal link; guarded coverage through an alias; static-optional return + leak | **qa249l** | 3 positives rejected |
+| H19 | Heap-slice free in an array element; the view-class boundary positives | **29fiao** | ride with H1 |
+
+### LIVE — cross-module (unique to `qa249l`, nobody else looked)
+
+| # | Fix | Evidence |
+|---|---|---|
+| H20 | **`spawn <imported function>` does not LINK — the feature is completely non-functional** | Verified: `spawn_user.zer` emits `void tick();` and calls `tick()` while the definition is `spawn_mod__tick`. The checker ACCEPTS it (the data-race scan even resolves the imported body), so the only signal is `ld returned 1 exit status` with no source line. The name is spelled raw at FOUR emission sites |
+| H21 | **`async` and `container(T)` across a module boundary** | qa249l fixes both; needs re-measuring separately from H22 |
+
+### DESIGN DECISION — not a bug, and it needs an owner call
+
+**float -> integer out of range: SATURATE or TRAP?**
+
+Main currently **TRAPS** (my BUG-845). Both `29fiao` (BUG-853) and `qa249l` (BUG-850)
+independently chose **SATURATE**, with NaN -> 0. Both eliminate the UB; they disagree on
+what replaces it. Their positives (`float_to_int_saturates`, `float_to_int_total`) fail
+on main for exactly this reason — it is a semantics conflict, not a regression.
+
+- **For SATURATE:** `@saturate` already exists in ZER with precisely these semantics, so
+  the behaviour is already named in the language; ARM saturates in hardware; and ZER
+  already chose "define it, don't trap it" for integer overflow (wrap). No new failure
+  mode is introduced into working programs.
+- **For TRAP:** every other out-of-range response in ZER traps (slice OOB, `@inttoptr`
+  misalignment, `@pun` type mismatch). A saturated value is a WRONG ANSWER the program
+  then continues to use; a trap surfaces the bug. On a sensor -> actuator path a clamped
+  reading can be worse than a halt.
+- **The "it's free" argument does NOT apply either way** — both need the same
+  compare-and-branch, so this is purely about which failure mode you want.
+
+Genuine judgment call; recorded rather than decided. Whichever wins, the loser's tests
+must be updated, not deleted.
+
+### Tooling and gates
+
+| Item | Branch | Why |
+|---|---|---|
+| **`audit_walker_fields.sh` decided membership on PROSE** | r1piyr | Its recursion test counted the function name in COMMENTS AND STRINGS, so two non-recursive functions were audited by accident and **editing a comment moved a walker in or out of the audited set**. Baseline 758 -> 712. This is a gate I installed in §B; the membership bug came with it |
+| `tools/grammar_closure_probe.sh` (new) | 29fiao | An integer in every argument slot of every intrinsic, with GCC's `-Werror=int-conversion` as the oracle. **The closure claim had never been measured and failed on first measurement** (H4). Verified non-vacuous: 2 breaches pre-fix, 0 after |
+| `tools/ub_sweep.sh` had a real defect | 29fiao | It joined each run's stdout into one delimiter-separated string and re-split it, so any MULTI-LINE output split at the newline and was reported divergent with identical output |
+| `emit_audit` widened from 5 samples to 1088 programs | 29fiao | The give-up paths I measured at "0 of 1146" are "one array-of-pointers away" per their analysis |
+| sink_matrix 78 -> 88 (p18 axis) | 29fiao | gates H1 |
+| Untrack ~560 tracked test binaries | 29fiao / qa249l | Both do it; **29fiao's is the better one** — a STRUCTURAL rule (an extension-less file under a test tree is a build artifact by construction, verified: all 558 were ELF) rather than qa249l's name list, which is the same deny-list shape this project keeps replacing with gates |
+| Build warnings 27 -> 0 | r1piyr / qa249l | r1piyr's includes deleting **the drifted emitter copies of the shared-root walker that my BUG-817 left behind** — worth taking for that alone |
+
+### Documented, deliberately NOT fixed (adopt the reasoning, not a fix)
+
+- **29fiao BUG-852** — a non-optional pointer MEMBER is null after auto-zero; four
+  spellings accepted, silent on bare metal where address 0 reads back. The blanket rule
+  was implemented and **measured at 34 correct corpus files**, so it was not shipped.
+  Four reproducers live in `tests/zer_gaps/` where compile-clean IS the gap.
+- **29fiao BUG-859** — an arena pointer cannot be stored into another ARENA allocation.
+  The obvious exemption was implemented and **opened a hole on the first negative**:
+  `Symbol.is_from_arena` is already set on a pointer param by the very store being
+  checked. Reverted, negative shipped as a lock.
+
+### Conflict groups
+
+1. **H1 + H19** — the view class and its boundary positives are one change.
+2. **H11 is the sibling of my BUG-842.** I split the `arg_count` precondition; the
+   TOP-LEVEL-KIND shape is still there. Same rule, second axis.
+3. **H6 extends my BUG-843**, H9 extends **BUG-841**, H14 corrects **O3** — three rows
+   where the previous harvest closed one spelling of a question and left others.
+4. **The float decision gates two positives on each side** — resolve it before taking
+   either branch's tests.
 
 ---
 

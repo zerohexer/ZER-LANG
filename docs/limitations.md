@@ -38,6 +38,14 @@ condition EXPRESSION.
 (`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading
 the diagnostic. Rows main already closed are in the "already on main" table.
 
+**PROGRESS 2026-08-25:** H10 (the container-cycle SEGFAULT) and H2 (recycled pool/slab
+slots returning stale data) are landed as BUG-857/858. **H1 was attempted and BACKED
+OUT** — the shared argument resolver closes 2 of its 7 negatives and regresses nothing,
+but `29fiao` fixes this class as FOUR interlocking parts and the fourth turns
+`returns_param_color` from an int into a MASK. BUG-848 means the current int can name the
+WRONG param, so widening the consumer while the inference is still wrong makes the wrong
+answer apply MORE often. Land all four together or none. Remaining: 19.
+
 ### Source branches — and why the fork point matters here
 
 | Branch | Forked at | Commits | Overlap with the 45 |
@@ -84,7 +92,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 | # | Fix | Best version | Evidence on main |
 |---|---|---|---|
 | H1 | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
-| H2 | **Recycled pool/slab slot is not zeroed** | **r1piyr** BUG-861 | Verified: `alloc_recycled_slot_zeroed` exits 1 — the slot comes back holding the previous object bit-for-bit, against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A `?*T` field returns non-null and dangling, so safe ZER can unwrap and deref it. **Invisible to ASan** — the reuse is inside ZER-owned storage |
+| ~~H2~~ **DONE (BUG-858)** | **Recycled pool/slab slot is not zeroed** | **r1piyr** BUG-861 | Verified: `alloc_recycled_slot_zeroed` exits 1 — the slot comes back holding the previous object bit-for-bit, against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A `?*T` field returns non-null and dangling, so safe ZER can unwrap and deref it. **Invisible to ASan** — the reuse is inside ZER-owned storage |
 | H3 | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
 | H4 | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
 | H5 | **Negative constant into an unsigned type** — 8 spellings | **qa249l** | `u32 a = -1;` silently becomes 4294967295. 8 negatives accepted (var-decl, assign, global, arg, return, orelse, spawn, struct-init) |
@@ -97,7 +105,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| H10 | **Mutually-recursive containers SEGFAULT the compiler** | **r1piyr** BUG-864 | `container A(T){B(T) x;} container B(T){A(T) y;}`. The self-containment guard compares against the one stamp its own frame owns, which cannot see a cycle closing on an OUTER stamp. Fix is a stack of in-progress stamps; pointer cycles and the canonical linked list must still compile |
+| ~~H10~~ **DONE (BUG-857)** | **Mutually-recursive containers SEGFAULT the compiler** | **r1piyr** BUG-864 | `container A(T){B(T) x;} container B(T){A(T) y;}`. The self-containment guard compares against the one stamp its own frame owns, which cannot see a cycle closing on an OUTER stamp. Fix is a stack of in-progress stamps; pointer cycles and the canonical linked list must still compile |
 
 ### LIVE — invalid C reaches GCC (silent checker, loud backend)
 

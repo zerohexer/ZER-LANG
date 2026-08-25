@@ -5,6 +5,67 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-25 — BUG-857/858: harvest-2 begins (a compiler crash, and a UAF from safe ZER)
+
+Two rows from `docs/limitations.md` harvest tracker 2. Both reproduced on main first;
+both regression tests verified to flip against a from-`9f8cda08` build.
+
+### BUG-857 — mutually-recursive containers SEGFAULTED the compiler
+    container A(T) { B(T) x; }
+    container B(T) { A(T) y; }      // A(u32) crashed zerc
+
+The by-value self-containment guard compared the resolved field type against `st` —
+**the one stamp its own frame owns** — which cannot see a cycle that closes on an OUTER
+stamp. A's frame ties its knot and resolves `B(T) x`, which stamps B; B's frame resolves
+`A(T) y`, `resolve_type` returns the already-tied A from the cache, and B's guard asks
+`inner == st_B`, which is false. Each struct then contains the other by value, the layout
+is infinite, and the compiler dies. **Every cycle of length >= 2 was unguarded** — only
+the length-1 self-reference was caught.
+
+Fixed with a STACK of in-progress stamps, threaded through the C stack rather than a
+fixed array: it costs no buffer, needs no cap of its own, and is exactly as deep as the
+recursion actually is. The diagnostic distinguishes the self-reference from the longer
+cycle. Pointer cycles, the canonical linked list and plain container nesting still
+compile — pinned.
+
+### BUG-858 — a recycled pool/slab slot came back holding the previous object
+`_zer_pool_alloc` / `_zer_slab_alloc` returned a reused slot **bit-for-bit unchanged**,
+against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A
+`?*T` field then reads back NON-NULL and dangling, so a program that sets only the fields
+it cares about can unwrap and dereference it — a use-after-free reachable from pure safe
+ZER, with no `unsafe`, no C interop and no intrinsic involved.
+
+**Invisible to ASan**, because the reuse is inside ZER-owned storage: the allocator never
+returns the slot to libc, so there is no freed region for a sanitizer to poison. Verified
+directly rather than argued — the regression test exits 1 on the pre-fix compiler.
+
+The asymmetry is why it survived: the FRESH-page path already `calloc`s, so only the
+REUSE path was affected, and only when the previous occupant left a non-zero pattern.
+`pool_ptr` and `slot_size` were already parameters of `_zer_pool_alloc` — passed, and
+never used for this.
+
+### H1 (the call-RESULT view class) ATTEMPTED AND BACKED OUT — read this before retrying
+The shared argument resolver (`ir_view_arg_handle`, BUG-859 on `29fiao`) was written and
+measured: it closes 2 of the 7 view negatives — the FIELD and SUBSLICE argument spellings
+— and regresses nothing. It was still reverted, and the reason matters for whoever picks
+it up:
+
+`29fiao` fixes this class as FOUR interlocking parts, and the fourth changes
+`FuncSummary.returns_param_color` from an INT into a MASK. BUG-848 means the current int
+can name the **wrong** param (a leak-coverage tag, `is_early_exit`, is being read as a
+statement about the returned value). Widening the CONSUMER to accept every argument
+spelling while the INFERENCE still names the wrong param does not just leave the other
+five open — it makes the wrong answer apply more often. A partial fix here is not a
+strict improvement, which is the one case where landing half is worse than landing none.
+
+Also measured while there: the three view-class boundary positives
+(`view_optional_null_arm_ok`, `view_param_interior_ptr_ok`,
+`free_heap_slice_in_array_elem_ok`) over-reject on main ALREADY — they are tracker row
+H19 and are not caused by the partial. I briefly attributed them to my own change; they
+predate it.
+
+---
+
 ## Session 2026-08-23 — BUG-847..856: §E/§F/§G, and the harvest closes
 
 Nine silent-behaviour fixes from `4z36e0`, `pmytnl` and `pjtawx`. None is an

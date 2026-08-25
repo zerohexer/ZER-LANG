@@ -5597,6 +5597,16 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
     emit(e, "        if (!used[i]) {\n");
     emit(e, "            used[i] = 1;\n");
+    /* BUG-858: a RECYCLED slot came back holding the previous object BIT FOR BIT,
+     * against the documented "everything auto-zeroed" guarantee that Arena.alloc
+     * honours. A `?*T` field then returns NON-NULL and dangling, so a program that
+     * sets only the fields it cares about can unwrap and dereference it — a
+     * use-after-free reachable from pure safe ZER, and INVISIBLE to ASan because
+     * the reuse is inside ZER-owned storage.
+     *
+     * The asymmetry is why it survived: the FRESH-page path already callocs, so
+     * only the REUSE path was affected. */
+    emit(e, "            memset((char*)pool_ptr + (size_t)i * slot_size, 0, slot_size);\n");
     emit(e, "            if (gen[i] == 0) gen[i] = 1; /* skip 0: reserved for null handle */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
@@ -5936,6 +5946,16 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    for (uint32_t i = 0; i < s->total_slots; i++) {\n");
     emit(e, "        if (!s->used[i]) {\n");
     emit(e, "            s->used[i] = 1;\n");
+    /* BUG-858 (slab half): a RECYCLED slot came back holding the previous object BIT FOR BIT,
+     * against the documented "everything auto-zeroed" guarantee that Arena.alloc
+     * honours. A `?*T` field then returns NON-NULL and dangling, so a program that
+     * sets only the fields it cares about can unwrap and dereference it — a
+     * use-after-free reachable from pure safe ZER, and INVISIBLE to ASan because
+     * the reuse is inside ZER-owned storage.
+     *
+     * The asymmetry is why it survived: the FRESH-page path already callocs, so
+     * only the REUSE path was affected. */
+    emit(e, "            memset(s->pages[i / _ZER_SLAB_PAGE_SLOTS] + (i %% _ZER_SLAB_PAGE_SLOTS) * s->slot_size, 0, s->slot_size);\n");
     emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1; /* zero handle must not match */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)s->gen[i] << 32) | i;\n");

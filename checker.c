@@ -3593,6 +3593,25 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         /* Container instantiation: Stack(u32) → stamp concrete struct.
          * Depth limit prevents infinite recursion from self-referential containers. */
         static int _container_depth = 0;
+        /* BUG-857: the by-value self-containment guard below compared the field's
+         * resolved type against `st` — THE ONE STAMP THIS FRAME OWNS — which cannot
+         * see a cycle that closes on an OUTER stamp:
+         *
+         *     container A(T) { B(T) x; }
+         *     container B(T) { A(T) y; }      // A(u32) SEGFAULTED the compiler
+         *
+         * A's frame ties its knot and resolves `B(T) x`, which re-enters and stamps
+         * B; B's frame resolves `A(T) y`, resolve_type finds the already-tied A in
+         * the cache and returns it, and B's guard asks `inner == st_B` — false. So
+         * each struct contains the other BY VALUE, the layout is infinite, and the
+         * compiler dies. Every cycle of length >= 2 was unguarded; only the length-1
+         * self-reference was caught.
+         *
+         * A STACK of in-progress stamps, threaded through the C stack rather than a
+         * fixed array: it costs no buffer, needs no cap of its own, and is exactly
+         * as deep as the recursion actually is. */
+        struct CtInProgress { Type *st; struct CtInProgress *prev; };
+        static struct CtInProgress *_ct_stack = NULL;
         if (++_container_depth > 32) {
             _container_depth--;
             checker_error(c, tn->loc.line,
@@ -3755,6 +3774,12 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         ci->concrete_type = concrete;
         ci->stamped_struct = st;
 
+        /* BUG-857: this stamp is now in progress — visible to every nested frame. */
+        struct CtInProgress _ct_frame;
+        _ct_frame.st = st;
+        _ct_frame.prev = _ct_stack;
+        _ct_stack = &_ct_frame;
+
         /* Resolve fields with T substituted */
         if (tmpl->field_count > 0) {
             st->struct_type.fields = (SField *)arena_alloc(c->arena,
@@ -3782,10 +3807,20 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                     Type *inner = sf->type;
                     while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
                     inner = type_unwrap_distinct(inner);
-                    if (inner == st) {
+                    /* BUG-857: ask EVERY in-progress stamp, not just this frame's —
+                     * a mutual cycle closes on an outer one. */
+                    bool _cycles = false;
+                    for (struct CtInProgress *f = _ct_stack; f; f = f->prev)
+                        if (inner == f->st) { _cycles = true; break; }
+                    if (_cycles) {
                         checker_error(c, tn->loc.line,
-                            "container '%.*s(%s)' cannot contain itself by value "
-                            "in field '%.*s' — use '*%.*s(%s)' (pointer) instead",
+                            inner == st
+                              ? "container '%.*s(%s)' cannot contain itself by value "
+                                "in field '%.*s' — use '*%.*s(%s)' (pointer) instead"
+                              : "container '%.*s(%s)' field '%.*s' closes a containment "
+                                "cycle back to a container still being stamped — the "
+                                "layout would be infinite. Break it with a pointer "
+                                "('*%.*s(%s)')",
                             (int)cnlen, cname, ctype_name,
                             (int)sf->name_len, sf->name,
                             (int)cnlen, cname, ctype_name);
@@ -3796,6 +3831,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
             st->struct_type.fields = NULL;
         }
 
+        _ct_stack = _ct_frame.prev;   /* BUG-857 */
         _container_depth--;
         return st;
     }

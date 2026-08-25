@@ -397,6 +397,13 @@ u32 result = safe_divide(10, 3) orelse 0;  // default to 0
 - `?void` has ONE field (`has_value`). Everything else has TWO (`value` + `has_value`).
 - Returning `null` sets `has_value = 0`.
 - Returning a value sets `has_value = 1` and stores the value.
+- A value optional cannot be COMPARED directly — `opt == 5`, `opt < n`,
+  `opt == other_opt` are all compile errors. Only `opt == null` / `opt != null`
+  is allowed. The reason is that a comparison would read the payload without
+  consulting `has_value`, and auto-zero makes an absent `.value` equal to 0, so
+  `if (x == 0)` would pass silently on a value that is not there. Unwrap first:
+  `if (x) |v| { … v == 5 … }` or `x orelse 0 == 5`. A NULL-SENTINEL optional
+  (`?*T`, `?FuncPtr`) IS the pointer at runtime and compares normally.
 
 **SEE ALSO**
 ?*T, orelse, if-unwrap
@@ -467,6 +474,17 @@ t.next = null;
 
 **SEE ALSO**
 packed struct, enum, union
+
+---
+
+**NOTES**
+- A struct may reference ITSELF through a pointer — `struct Node { u32 v; ?*Node next; }`
+  — and may reference any struct declared EARLIER in the file. It cannot reference one
+  declared LATER: there is no forward declaration, so a mutually-referencing pair
+  (`A` holds `?*B`, `B` holds `?*A`) is not expressible with plain structs. Use
+  `container` for that shape (containers bind their field types at instantiation, so
+  `container A(T) { ?*B(T) x; } container B(T) { ?*A(T) y; }` compiles), or merge the two
+  into one struct with a variant tag. Tracked in `docs/limitations.md`.
 
 ---
 
@@ -647,32 +665,105 @@ ZER supports two function pointer syntaxes — both produce the same type, both 
 
 **SYNTAX — Variant 2A (C-style)**
 ```zer
-u32 (*fn)(u32, u32) = add;                 // local variable
-void (*callback)(u32 event);               // global variable
+u32 add(u32 a, u32 b) { return a + b; }
+void on_evt(u32 e) { }
+?u32 look(u32 k) { return k; }
+
+void (*g_callback)(u32 event) = on_evt;    // global — MUST be initialized
+?void (*g_optional)(u32) = null;           // optional — null = not set
 struct Ops { u32 (*compute)(u32); }        // struct field
 u32 apply(u32 (*op)(u32, u32), u32 x, u32 y);  // parameter
-?void (*on_event)(u32) = null;             // optional — null = not set
 typedef u32 (*BinOp)(u32, u32);            // typedef
 typedef ?u32 (*OptHandler)(u32);           // typedef — returns ?u32
-BinOp[4] ops;                              // array of function pointers (via typedef)
+BinOp[4] g_ops;                            // array of function pointers (via typedef)
+
+i32 main() {
+    u32 (*fn)(u32, u32) = add;             // local variable
+    return (i32)fn(1, 2) - 3;
+}
 ```
 
 **SYNTAX — Variant 2C (ZER-native, typedef-free)**
 ```zer
-*(u32, u32) -> u32 fn = add;               // local variable
-*(u32 event) callback;                      // global; void return = no arrow
-struct Ops { *(u32) -> u32 compute; }       // struct field
-u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y);  // parameter
-?*(u32) -> u32 on_event = null;             // nullable funcptr
-*(u32) -> ?u32 lookup;                      // funcptr returning optional
-*(keep *Handler) register;                   // keep modifier on a param
+u32 add2(u32 a, u32 b) { return a + b; }
+void on_evt2(u32 e) { }
+?u32 look2(u32 k) { return k; }
+
+*(u32 event) g_cb2 = on_evt2;               // global; void return = no arrow
+                                            // (MUST be initialized — see below)
+?*(u32) -> u32 g_opt2 = null;               // nullable funcptr
+*(u32) -> ?u32 g_look2 = look2;             // funcptr returning optional
+struct Ops2 { *(u32) -> u32 compute; }      // struct field
+u32 apply2(*(u32, u32) -> u32 op, u32 x, u32 y);  // parameter
 
 // Cases that REQUIRED typedef in 2A — now inline in 2C:
-*(u32, u32) -> u32 [4] ops;                  // array of funcptrs — INLINE
+?*(u32, u32) -> u32 [4] g_ops2;              // array of funcptrs — INLINE
 *(u32, u32) -> u32 select_op(u32 kind);      // return-of-funcptr — INLINE
+
+i32 main() {
+    *(u32, u32) -> u32 fn = add2;           // local variable
+    return (i32)fn(1, 2) - 3;
+}
 ```
 
+**ARRAYS OF FUNCTION POINTERS** work in both syntaxes, and the element type
+should be NULLABLE:
+
+```zer
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+typedef u32 (*BinOp)(u32, u32);
+
+u32 main() {
+    ?*(u32, u32) -> u32 [3] ops;    // 2C, typedef-free
+    ops[0] = add;
+    ops[1] = mul;
+    u32 acc = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        if (ops[i]) |f| { acc += f(6, 3); }   // unwrap per element
+    }
+    if (acc != 18 + 18) { return 1; }
+
+    ?BinOp[2] td;                   // 2A, via typedef — same shape
+    td[0] = add;
+    if (td[0]) |f| { if (f(1, 2) != 3) { return 2; } }
+    return 0;
+}
+```
+
+A NON-nullable element type (`BinOp[3]`, `*(u32) -> u32 [3]`) is accepted but
+should be avoided: auto-zero fills the array with NULL and ZER has no array
+initializer, so every element starts out holding the one value its type forbids.
+Assign every element before any use, or — better — use the `?` element type
+above, where the unwrap makes the not-yet-registered case explicit. See
+`tests/zer_gaps/funcptr_array_null_element.zer`.
+
+`keep` on a funcptr parameter is written `*(keep *Handler)` — see the `keep`
+section. An INDIRECT call cannot see its target, so ZER worst-cases every
+reference-carrying parameter of a funcptr as `keep`: passing a stack pointer to
+a callback is rejected whether the pointer is bare (`*T`), optional (`?*T`), or
+a field of a by-value struct.
+
 Discriminator: `*` BEFORE `(` is 2C; `*` INSIDE `(` is 2A. Both produce identical AST/types, so all downstream behavior (checker, IR, emitter, all 29 safety systems) is operator-agnostic — pick by readability.
+
+**A NON-OPTIONAL FUNCTION POINTER REQUIRES AN INITIALIZER**, at global scope as
+well as local. Auto-zero would otherwise leave it NULL and the call would be a
+raw jump through address 0. For the register-a-callback-later idiom — which is
+what a bare global funcptr usually means — use the optional and unwrap it:
+
+```zer
+?void (*saved_cb)(u32 val) = null;         // registered later
+
+void register_cb(void (*cb)(u32 val)) { saved_cb = cb; }
+
+void fire(u32 v) {
+    if (saved_cb) |cb| { cb(v); }          // called only once registered
+}
+```
+
+(The global sibling of this rule was missing until BUG-866: the local check had
+grown a funcptr arm and the global one never did, so the same declaration was
+accepted at file scope and rejected one scope deeper.)
 
 **FIELD ACCESS RULE**
 
@@ -766,11 +857,90 @@ distinct typedef Point Vec2;         // field access (v.x, v.y) works
 **DESCRIPTION**
 Compile-time constant. Value must be known at compile time.
 
+A `const` integer is usable **anywhere a compile-time constant is required** —
+array sizes, `Pool` / `Ring` counts, and arithmetic over those. A `const` slice
+initialised from a string literal is the way to declare a global string.
+
 **SYNTAX**
 ```zer
 const u32 MAX = 100;
 const [*]u8 NAME = "ZER";    // in .rodata (flash on embedded)
 ```
+
+**EXAMPLE**
+```zer
+const u32 RX_CAP = 64;
+const u32 SLOTS  = 8;
+
+struct Frame { u32 len; }
+
+u8[RX_CAP] rx_buffer;          // const as an array size
+u8[RX_CAP * 2] scratch;        // arithmetic over consts folds too
+Pool(Frame, SLOTS) frames;     // and as an allocator count
+Ring(Frame, SLOTS) inbox;
+
+const [*]u8 BANNER = "ready\n";
+
+i32 main() {
+    u8[RX_CAP] local;
+    local[0] = 1;
+    rx_buffer[RX_CAP - 1] = 2;
+    if (@size(u8[RX_CAP]) != 64) { return 1; }
+    if (BANNER.len != 6) { return 2; }
+    return 0;
+}
+```
+
+**NOTES**
+- The bound is still checked against the *resolved* size: with `const u32 N = 4`,
+  `u8[N] b; b[9] = 1;` is a compile error, not a runtime trap.
+- A **mutable** global is not a constant. `u32 N = 4; u8[N] b;` is rejected —
+  ZER has no variable-length arrays.
+- A `const` global is emitted as a real C `const` variable, not a macro, so it
+  cannot itself initialise another global: `const u32 A = 5; const u32 B = A + 1;`
+  is rejected by the C backend. Use a `comptime` function for a derived
+  constant — `comptime u32 DERIVE() { return 6; } const u32 B = DERIVE();`.
+- A string literal is read-only. `[*]u8 S = "x";` is rejected at global and
+  local scope alike; declare it `const [*]u8`.
+
+**SEE ALSO**
+comptime, static, Pool, Ring
+
+---
+
+### Global variable initializers
+
+**DESCRIPTION**
+A global's initializer must be a **compile-time constant**, because it becomes a
+C file-scope initializer. This is checked in ZER terms, at the ZER line, over the
+*whole* initializer expression — not just its outermost node.
+
+**EXAMPLE**
+```zer
+const u32 BASE = 0x10;
+
+u32 A = 5;                       // literal
+u32 B = BASE;                    // ERROR — a const is a C `const` var, not a constant
+u32 C = @truncate(u32, 300);     // native-width @truncate folds
+u32 D = @popcount(0xF0);         // bit query with a constant argument
+usize E = @size(u32) * 4;        // @size arithmetic
+```
+
+**NOTES**
+- Rejected anywhere in the initializer, not only at the top: a **function call**
+  (`u32 G = f() + 1;`), and any intrinsic that does not lower to a constant —
+  every `@atomic_*`, the `@cpu_*` / `@port_in*` / `@mmu_*` / `@tlb_*` / `@cache_*`
+  runtime reads, `@probe`, `@expect`, `@saturate`, `@bitcast`, `@addc` / `@subb` /
+  `@mulw`, and `@truncate` to a non-native `uN`/`iN` width.
+- An assignment inside an initializer (`u32 G = (x = f());`) is reachable and is
+  checked the same way.
+- Aggregates cannot be initialised at global scope: there is no array-literal
+  syntax, and a designated initializer (`S g = { .x = 1 };`) is a var-decl,
+  assignment, call-argument and return form only. Assign the fields from an init
+  function instead.
+
+**SEE ALSO**
+const, comptime, @size
 
 ---
 
@@ -1246,6 +1416,13 @@ Pool(Task, 8) tasks;       // 8 slots for Task, global only
 - `.get(h)` → `*T` — Access by handle. Traps if gen mismatch.
 - `.free(h)` → `void` — Free slot by handle, increment generation.
 - `.free_ptr(p)` → `void` — Free slot by pointer.
+
+A RECYCLED slot is zeroed before it is handed back, so the auto-zero guarantee
+holds for the second and every later allocation of a slot, not only the first.
+(It did not until BUG-861: a fresh page is calloc-clean, so the divergence only
+appeared after the first free/alloc cycle — and a `?*T` field came back non-null
+and dangling, which safe ZER could unwrap and dereference.) `Slab` behaves
+identically, and `Arena.alloc` always has.
 
 **EXAMPLE**
 ```zer
@@ -1860,6 +2037,13 @@ Returns the byte offset of a field within struct T as usize. Like C's offsetof.
 usize off = @offset(Task, priority);
 ```
 
+**NOTES**
+- The first argument must name a STRUCT — including through a `distinct
+  typedef` of one. A non-struct type is rejected.
+- A UNION is rejected with its own reason: ZER unions are TAGGED, so a variant
+  has no fixed offset. Take the offset of the struct field that holds the union.
+- The second argument must be a plain field NAME, not an expression.
+
 ---
 
 ### @trap()
@@ -2022,6 +2206,592 @@ u8[512] fpu;
 
 ---
 
+### @port_in8(port), @port_in16(port), @port_in32(port), @port_out8(port, val), @port_out16(port, val), @port_out32(port, val)
+
+**DESCRIPTION**
+x86 port-mapped I/O. `in`/`out` instructions of the matching width.
+Privileged on x86 (requires CPL <= IOPL) — SIGSEGV in ordinary user mode.
+Non-x86 targets emit a no-op fallback (reads yield 0).
+
+**SIGNATURE**
+```
+@port_in8(u64 port)  -> u8      @port_out8(u64 port, u64 val)  -> void
+@port_in16(u64 port) -> u16     @port_out16(u64 port, u64 val) -> void
+@port_in32(u64 port) -> u32     @port_out32(u64 port, u64 val) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 uart_ready;
+
+void serial_write(u8 ch) {
+    // 0x3F8 is the legacy COM1 data port.
+    @port_out8(0x3F8, ch);
+}
+
+u8 serial_read() {
+    return @port_in8(0x3F8);
+}
+```
+
+**NOTES**
+- The port argument is typed `u64` and truncated to 16 bits on emission;
+  x86 port numbers are 16-bit, so a value above `0xFFFF` silently wraps.
+- Kernel/bootloader code only. In user mode these fault.
+
+**SEE ALSO**
+@inttoptr, mmio
+
+---
+
+### @cpu_read_msr(msr), @cpu_write_msr(msr, val)
+
+**DESCRIPTION**
+x86 Model-Specific Register access (`rdmsr` / `wrmsr`). Privileged.
+Non-x86 targets read 0 and ignore writes.
+
+**SIGNATURE**
+```
+@cpu_read_msr(u64 msr) -> u64
+@cpu_write_msr(u64 msr, u64 val) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void enable_syscall() {
+    if (arm == 0) { return; }        // guard: privileged, kernel only
+    u64 efer = @cpu_read_msr(0xC0000080);
+    @cpu_write_msr(0xC0000080, efer | 1);
+}
+```
+
+**NOTES**
+- Common MSRs: `0xC0000080` EFER, `0xC0000100` FS_BASE, `0xC0000101` GS_BASE.
+- Prefer `@cpu_read_fsbase` / `@cpu_write_gsbase` where they apply — they use
+  the FSGSBASE instructions and do not need CPL 0.
+
+---
+
+### @cpu_read_cr0(), @cpu_write_cr0(v), @cpu_read_cr2(), @cpu_read_cr3(), @cpu_write_cr3(v), @cpu_read_cr4(), @cpu_write_cr4(v)
+
+**DESCRIPTION**
+x86 control-register access. All privileged. `CR2` is read-only (it holds the
+faulting linear address after a page fault), so there is no `@cpu_write_cr2`.
+Non-x86 targets read 0 and ignore writes.
+
+**SIGNATURE**
+```
+@cpu_read_cr0() -> u64      @cpu_write_cr0(u64 v) -> void
+@cpu_read_cr2() -> u64      (read only — page-fault address)
+@cpu_read_cr3() -> u64      @cpu_write_cr3(u64 v) -> void
+@cpu_read_cr4() -> u64      @cpu_write_cr4(u64 v) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+u64 page_fault_address() {
+    if (arm == 0) { return 0; }
+    return @cpu_read_cr2();
+}
+
+void switch_address_space(u64 pml4_phys) {
+    if (arm == 0) { return; }
+    @cpu_write_cr3(pml4_phys);        // also flushes non-global TLB entries
+}
+```
+
+**NOTES**
+- `@cpu_write_cr3` implicitly flushes non-global TLB entries.
+- CR0 bit 16 is WP, bit 31 is PG; CR4 bit 7 is PGE, bit 20 is SMEP.
+
+---
+
+### @cpu_read_xcr0(), @cpu_write_xcr0(v), @cpu_read_dr(idx), @cpu_write_dr(idx, v), @cpu_read_pmc(idx)
+
+**DESCRIPTION**
+XSAVE feature mask (`xgetbv`/`xsetbv`), debug registers DR0-DR3/DR6/DR7, and
+the performance counter read (`rdpmc`). All x86; all privileged except
+`@cpu_read_pmc`, which needs `CR4.PCE = 1` to be usable from user mode.
+
+**SIGNATURE**
+```
+@cpu_read_xcr0() -> u64          @cpu_write_xcr0(u64 v) -> void
+@cpu_read_dr(u64 idx) -> u64     @cpu_write_dr(u64 idx, u64 v) -> void
+@cpu_read_pmc(u64 idx) -> u64
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void enable_avx() {
+    if (arm == 0) { return; }
+    u64 mask = @cpu_read_xcr0();
+    @cpu_write_xcr0(mask | 7);       // x87 | SSE | AVX state
+}
+
+u64 hw_breakpoint0() {
+    if (arm == 0) { return 0; }
+    return @cpu_read_dr(0);
+}
+```
+
+**NOTES**
+- `idx` for `@cpu_read_dr` / `@cpu_write_dr` is a runtime value dispatched by a
+  switch; valid indices are 0-3, 6 and 7.
+
+---
+
+### @cpu_read_fsbase(), @cpu_read_gsbase(), @cpu_write_fsbase(v), @cpu_write_gsbase(v)
+
+**DESCRIPTION**
+x86-64 FS/GS segment-base access via the FSGSBASE instructions.
+Requires `CR4.FSGSBASE = 1`; with that bit set they run at any privilege level.
+Non-x86 targets read 0 and ignore writes.
+
+**SIGNATURE**
+```
+@cpu_read_fsbase() -> u64    @cpu_write_fsbase(u64 v) -> void
+@cpu_read_gsbase() -> u64    @cpu_write_gsbase(u64 v) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+u64 tls_base() {
+    if (arm == 0) { return 0; }
+    return @cpu_read_fsbase();
+}
+```
+
+**NOTES**
+- `@cpu_read_tp()` is the portable way to read the thread pointer; prefer it
+  unless you specifically need the x86 segment base.
+
+---
+
+### @cpu_xsave(buf, mask), @cpu_xrstor(buf, mask), @cpu_fxsave(buf), @cpu_fxrstor(buf), @cpu_fpu_init()
+
+**DESCRIPTION**
+Extended processor-state save/restore. `xsave`/`xrstor` take a component mask
+(AVX, AVX-512, …); `fxsave`/`fxrstor` are the legacy pre-XSAVE pair.
+`@cpu_fpu_init` issues `fninit`.
+
+**SIGNATURE**
+```
+@cpu_xsave(*u8 buf, u64 mask) -> void     @cpu_xrstor(*u8 buf, u64 mask) -> void
+@cpu_fxsave(*u8 buf) -> void              @cpu_fxrstor(*u8 buf) -> void
+@cpu_fpu_init() -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void save_fpu_state() {
+    u8[512] area;
+    if (arm == 0) { return; }
+    @cpu_fxsave(&area[0]);
+    @cpu_fxrstor(&area[0]);
+}
+```
+
+**NOTES**
+- `fxsave` needs a 512-byte, 16-byte-aligned buffer; `xsave` needs 64-byte
+  alignment and a size that depends on the enabled components.
+- The buffer argument accepts `*u8` or `u8[N]`.
+
+---
+
+### @cpu_cpuid(leaf, subleaf), @cpu_cpuid_ecx(leaf, subleaf), @cpu_vendor_id(), @cpu_feature_bits(), @cpu_model_id()
+
+**DESCRIPTION**
+x86 CPUID. `@cpu_cpuid` returns `(EBX << 32) | EAX` and `@cpu_cpuid_ecx`
+returns `(EDX << 32) | ECX` for the same leaf, so the two together give all
+four result registers. The three no-argument forms are fixed-leaf shorthands.
+Non-privileged.
+
+**SIGNATURE**
+```
+@cpu_cpuid(u64 leaf, u64 subleaf) -> u64        // (EBX << 32) | EAX
+@cpu_cpuid_ecx(u64 leaf, u64 subleaf) -> u64    // (EDX << 32) | ECX
+@cpu_vendor_id()    -> u64      // leaf 0 EBX — first 4 vendor chars
+@cpu_feature_bits() -> u64      // leaf 1, ECX:EDX packed
+@cpu_model_id()     -> u32      // leaf 1 EAX — family/model/stepping
+```
+
+**EXAMPLE**
+```zer
+i32 main() {
+    u64 lo = @cpu_cpuid(1, 0);
+    u64 hi = @cpu_cpuid_ecx(1, 0);
+    u32 eax = @truncate(u32, lo);
+    if (eax == 0 && hi == 0) { return 1; }
+    return 0;
+}
+```
+
+**NOTES**
+- Leaf/subleaf are `u64` in ZER and truncated to 32 bits on emission.
+- On non-x86 targets every form returns 0.
+
+---
+
+### @cpu_read_sp(), @cpu_read_tp(), @cpu_read_flags(), @cpu_get_pc(), @cpu_read_counter(), @cpu_id(), @cpu_core_id(), @cpu_num_cores(), @cpu_cache_line_size(), @cpu_current_mode(), @cpu_get_priv_level()
+
+**DESCRIPTION**
+Non-privileged CPU-state reads. Safe to call from ordinary user code.
+
+**SIGNATURE**
+```
+@cpu_read_sp()           -> u64   stack pointer
+@cpu_read_tp()           -> u64   thread pointer / TLS base
+@cpu_read_flags()        -> u64   RFLAGS (x86) / NZCV (ARM)
+@cpu_get_pc()            -> u64   current instruction pointer
+@cpu_read_counter()      -> u64   cycle/time counter (rdtsc / cntvct_el0 / rdtime)
+@cpu_id()                -> u32   current core number
+@cpu_core_id()           -> u32   physical core id
+@cpu_num_cores()         -> u32   logical core count
+@cpu_cache_line_size()   -> u32   L1 line size in bytes
+@cpu_current_mode()      -> u32   privilege mode
+@cpu_get_priv_level()    -> u32   privilege level (0 = user)
+```
+
+**EXAMPLE**
+```zer
+i32 main() {
+    u64 t0 = @cpu_read_counter();
+    u64 sp = @cpu_read_sp();
+    u32 line = @cpu_cache_line_size();
+    if (sp == 0) { return 1; }
+    u64 t1 = @cpu_read_counter();
+    if (t1 < t0) { return 2; }
+    if (line == 0) { return 3; }
+    return 0;
+}
+```
+
+**NOTES**
+- `@cpu_core_id`, `@cpu_current_mode`, `@cpu_num_cores` and
+  `@cpu_cache_line_size` are stubs on targets where the value is not readable
+  without a syscall — they return 0, 0, 1 and 64 respectively. Treat them as
+  hints, not facts.
+- `@cpu_read_counter` is a free-running counter, not wall-clock time.
+
+---
+
+### @cpu_rdrand(), @cpu_rdseed()
+
+**DESCRIPTION**
+Hardware random-number instructions. Both return `?u64` — **null when the
+instruction reports failure**, which is a real and expected outcome
+(`rdseed` in particular fails under load). Non-privileged.
+
+**SIGNATURE**
+```
+@cpu_rdrand() -> ?u64
+@cpu_rdseed() -> ?u64
+```
+
+**EXAMPLE**
+```zer
+u64 random_or(u64 fallback) {
+    return @cpu_rdrand() orelse fallback;
+}
+
+i32 main() {
+    if (@cpu_rdrand()) |v| { if (v == v) { return 0; } }
+    return 0;
+}
+```
+
+**NOTES**
+- The optional is the point: a bare `u64` return would silently hand back a
+  non-random value on failure. Unwrap it, and retry or fall back.
+- Not available on every x86 part and absent on most non-x86 targets, where the
+  result is null.
+
+---
+
+### @cpu_pause(), @cpu_wfe(), @cpu_sev(), @cpu_idle_hint(), @cpu_deep_sleep(), @cpu_monitor_addr(p), @cpu_mwait(), @cpu_umonitor(p), @cpu_umwait(hint, deadline)
+
+**DESCRIPTION**
+Spin-wait and idle hints.
+`@cpu_pause` is the spin-loop hint (`pause` / `yield` / Zihintpause).
+`@cpu_wfe` / `@cpu_sev` are the ARM wait-for-event pair (on x86 `wfe` degrades
+to `pause` and `sev` to a full fence).
+`@cpu_monitor_addr` + `@cpu_mwait` are the privileged x86 MONITOR/MWAIT pair;
+`@cpu_umonitor` + `@cpu_umwait` are their user-mode WAITPKG equivalents.
+`@cpu_deep_sleep` enters the deepest idle state and is privileged.
+
+**SIGNATURE**
+```
+@cpu_pause() -> void          @cpu_idle_hint() -> void
+@cpu_wfe()   -> void          @cpu_sev() -> void
+@cpu_deep_sleep() -> void
+@cpu_monitor_addr(*u8 p) -> void   @cpu_mwait() -> void
+@cpu_umonitor(*u8 p) -> void       @cpu_umwait(u64 hint, u64 deadline) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 flag;
+
+void spin_until_set() {
+    while (flag == 0) {
+        @cpu_pause();
+    }
+}
+```
+
+**NOTES**
+- `@cpu_pause` and `@cpu_idle_hint` are non-blocking and safe anywhere.
+- MONITOR/MWAIT require the monitored line to be written by another agent;
+  they are not a general sleep.
+- `@cpu_umwait` hint: 0 = C0.2 (deeper), 1 = C0.1 (faster wake).
+
+---
+
+### @wait_on_address(addr, expected)
+
+**DESCRIPTION**
+Spin until the 32-bit word at `addr` differs from `expected`, using the
+platform pause hint between polls. This is a **spin**, not a futex — the thread
+is never descheduled.
+
+**SIGNATURE**
+```
+@wait_on_address(*T addr, <integer> expected) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 ready;
+
+void wait_for_ready() {
+    @wait_on_address(&ready, 0);   // returns once `ready` becomes non-zero
+}
+```
+
+**NOTES**
+- The load is an acquire load, so a value published by another thread with a
+  release store is visible after this returns.
+- Burns a core while waiting. For anything longer than a few microseconds use a
+  condvar (`@cond_wait`) instead.
+
+---
+
+### @cpu_syscall(), @cpu_sysret(), @cpu_iret(), @cpu_set_priv_stack(sp), @cpu_hypercall(), @cpu_sbi_call(), @cpu_smc_call()
+
+**DESCRIPTION**
+Privilege-mode transitions. Every one of these requires the surrounding system
+registers to be set up first (CS/RIP/RFLAGS on x86, ELR/SPSR on ARM,
+sepc/sstatus on RISC-V); they are the instruction, not the sequence.
+
+**SIGNATURE**
+```
+@cpu_syscall()  -> void    user -> kernel trap   (syscall / svc #0 / ecall)
+@cpu_sysret()   -> void    kernel -> user return (sysretq / eret / sret)
+@cpu_iret()     -> void    interrupt return      (iretq / eret / mret)
+@cpu_set_priv_stack(u64 sp) -> void   kernel stack for syscall entry
+@cpu_hypercall() -> void   guest -> hypervisor   (vmcall / hvc #0 / ecall)
+@cpu_sbi_call()  -> void   RISC-V ecall to M-mode firmware
+@cpu_smc_call()  -> void   ARM TrustZone smc #0
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void enter_user_mode(u64 kernel_sp) {
+    if (arm == 0) { return; }
+    @cpu_set_priv_stack(kernel_sp);
+    @cpu_sysret();
+}
+```
+
+**NOTES**
+- All privileged. Calling any of them from user code faults.
+- ZER checks the *call*; it cannot check that the system-register context is
+  correct — that is hardware-consequence, outside the language boundary.
+
+---
+
+### @cpu_eoi(), @cpu_endbr(), @cpu_breakpoint(), @cpu_flush_pipeline(), @cpu_reset(), @cpu_cache_disable(), @cpu_cache_enable()
+
+**DESCRIPTION**
+Interrupt-lifecycle, control-flow-integrity and machine-control primitives.
+
+**SIGNATURE**
+```
+@cpu_eoi()            -> void   end-of-interrupt to LAPIC / GICv3 (privileged)
+@cpu_endbr()          -> void   ENDBR64 landing pad; a multi-byte NOP without CET-IBT
+@cpu_breakpoint()     -> void   debug trap (int3 / brk #0 / ebreak)
+@cpu_flush_pipeline() -> void   instruction-pipeline flush (mfence+lfence / isb / fence.i)
+@cpu_reset()          -> void   halt forever — a real reset is platform-specific
+@cpu_cache_disable()  -> void   CR0.CD = 1 plus WBINVD (privileged)
+@cpu_cache_enable()   -> void   CR0.CD = 0 (privileged)
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void isr_epilogue() {
+    if (arm == 0) { return; }
+    @cpu_eoi();
+}
+
+void after_patching_code() {
+    @cpu_flush_pipeline();
+}
+```
+
+**NOTES**
+- `@cpu_flush_pipeline` is required after writing instructions you are about to
+  execute; a data-cache flush alone is not enough.
+- `@cpu_breakpoint` traps unconditionally — it is not a conditional assert.
+
+---
+
+### @mmu_enable(), @mmu_disable(), @mmu_is_enabled(), @mmu_set_pt(v), @mmu_get_pt(), @mmu_set_kernel_pt(v), @mmu_get_kernel_pt(), @mmu_get_fault_addr(), @mmu_get_fault_status(), @mmu_sync()
+
+**DESCRIPTION**
+Memory-management-unit control. On x86 the page-table root is CR3 and
+`@mmu_enable` sets CR0.PG; on ARM64 they map to `SCTLR_EL1` / `TTBR0_EL1` /
+`TTBR1_EL1`; on RISC-V to `satp`. All privileged.
+
+**SIGNATURE**
+```
+@mmu_enable()  -> void        @mmu_disable() -> void
+@mmu_is_enabled() -> bool
+@mmu_set_pt(u64 root) -> void          @mmu_get_pt() -> u64
+@mmu_set_kernel_pt(u64 root) -> void   @mmu_get_kernel_pt() -> u64
+@mmu_get_fault_addr()   -> u64   faulting address (CR2 / FAR_EL1 / stval)
+@mmu_get_fault_status() -> u64   fault cause     (ESR_EL1 / scause)
+@mmu_sync() -> void              barrier making table writes visible to the walker
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void install_page_tables(u64 root) {
+    if (arm == 0) { return; }
+    @mmu_set_pt(root);
+    @mmu_sync();
+    @tlb_flush_all();
+    if (!@mmu_is_enabled()) { @mmu_enable(); }
+}
+
+u64 fault_address() {
+    if (arm == 0) { return 0; }
+    return @mmu_get_fault_addr();
+}
+```
+
+**NOTES**
+- `@mmu_set_kernel_pt` is the ARM64 `TTBR1_EL1` (high-half) root; on x86 there
+  is one root, so it aliases `@mmu_set_pt`.
+- Always `@mmu_sync()` after writing page-table entries and before relying on
+  them — the table walker is not coherent with ordinary stores on every arch.
+
+---
+
+### @tlb_flush_all(), @tlb_flush_global(), @tlb_flush_addr(a), @tlb_flush_asid(a), @tlb_flush_range(start, len)
+
+**DESCRIPTION**
+TLB invalidation. Privileged.
+
+**SIGNATURE**
+```
+@tlb_flush_all()    -> void        non-global entries
+@tlb_flush_global() -> void        including global entries
+@tlb_flush_addr(u64 addr)  -> void single page
+@tlb_flush_asid(u64 asid)  -> void one address-space id
+@tlb_flush_range(u64 start, u64 len) -> void
+```
+
+**EXAMPLE**
+```zer
+volatile u32 arm;
+
+void unmap_page(u64 va) {
+    if (arm == 0) { return; }
+    // ... clear the PTE ...
+    @mmu_sync();
+    @tlb_flush_addr(va);
+}
+```
+
+**NOTES**
+- Flush *after* the table write and the `@mmu_sync()`, never before.
+- On a multi-core system a local flush is not enough — a TLB shootdown IPI to
+  the other cores is the caller's responsibility.
+
+---
+
+### @cache_flush_line(p), @cache_flush_range(p, len), @cache_clean_range(p, len), @cache_invalidate_range(p, len), @cache_invalidate_icache(p, len), @cache_zero_line(p), @cache_flushopt(p), @cache_writeback(p), @nt_store(p, val), @barrier_dma()
+
+**DESCRIPTION**
+Cache maintenance and non-temporal stores — the DMA and persistent-memory
+primitives.
+
+- **clean** = write dirty lines back, keep them valid.
+- **invalidate** = drop lines without writing back (data loss if dirty).
+- **flush** = clean + invalidate.
+
+**SIGNATURE**
+```
+@cache_flush_line(*u8 p)                  -> void  clean+invalidate one line
+@cache_flush_range(*u8 p, u64 len)        -> void
+@cache_clean_range(*u8 p, u64 len)        -> void  writeback only
+@cache_invalidate_range(*u8 p, u64 len)   -> void  discard only
+@cache_invalidate_icache(*u8 p, u64 len)  -> void  instruction cache
+@cache_zero_line(*u8 p)                   -> void  zero a whole line (ARM `dc zva`)
+@cache_flushopt(*u8 p)                    -> void  CLFLUSHOPT — ordered flush
+@cache_writeback(*u8 p)                   -> void  CLWB — writeback, keep valid
+@nt_store(*u8 p, u64 val)                 -> void  MOVNTI — bypass cache
+@barrier_dma()                            -> void  ordering barrier for device DMA
+```
+
+**EXAMPLE**
+```zer
+u8[64] dma_buf;
+
+void publish_to_device() {
+    dma_buf[0] = 1;
+    @cache_clean_range(&dma_buf[0], 64);   // make the write visible to the device
+    @barrier_dma();
+}
+
+void consume_from_device() {
+    @cache_invalidate_range(&dma_buf[0], 64);  // drop stale lines before reading
+    @barrier_dma();
+    if (dma_buf[0] == 0) { return; }
+}
+```
+
+**NOTES**
+- Before a device READS your buffer: clean. After a device WROTE your buffer:
+  invalidate. Getting this backwards loses data silently.
+- `@cache_invalidate_icache` is required after writing code you will execute;
+  pair it with `@cpu_flush_pipeline()`.
+- `@cache_writeback` (CLWB) is the persistent-memory primitive — it keeps the
+  line valid, so a following read is still a cache hit.
+- Several of these are ARM/RISC-V concepts with no x86 instruction; on a target
+  that lacks one, ZER emits the nearest available barrier or evaluates the
+  arguments and does nothing. `@cache_zero_line` and `@tlb_flush_asid` are the
+  two where the no-op is most likely to surprise — check the emitted C if you
+  depend on the effect.
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2037,6 +2807,14 @@ const [*]u8 name = "hello";
 
 **NOTES**
 - Returns pointer to buf. If slice doesn't fit, returns zero value (auto-guard).
+- Takes exactly TWO arguments, and their shapes are an ALLOW-list, not a
+  deny-list. The destination must be a fixed array `u8[N]`, a slice `[*]u8`, or
+  a `volatile`/`*opaque` pointer at a hardware boundary; the source must be a
+  slice (a string literal is one — slice an array with `arr[0..]`). Anything
+  else is rejected. Before this was an allow-list, `@cstr(some_u32, sl)` was
+  accepted BY DEFAULT and memcpy'd through an address taken from an integer:
+  no mmio range, no alignment check, no bounds check.
+- The destination may not be `const`.
 
 ---
 
@@ -2654,6 +3432,18 @@ a.val = 10; b.val = 20; a.next = &b;
 container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR
 container BNode(T) { T val; ?*BNode(T) child; } // OK
 ```
+- A by-value CYCLE through several containers is the same error, at any cycle
+  length. Only the direct case used to be caught, and the two-container form
+  crashed the compiler (BUG-864):
+```zer
+container A(T) { B(T) x; }    // COMPILE ERROR — closes a containment cycle
+container B(T) { A(T) y; }
+```
+  Make any one link a pointer and the cycle is finite and legal:
+```zer
+container A(T) { ?*B(T) x; }
+container B(T) { ?*A(T) y; }
+```
 
 ---
 
@@ -2714,14 +3504,23 @@ register_callback(&global_handler);  // OK — global persists
   and modules (a dedicated post-body pass resolves keep before enforcing).
 - **Struct fields:** storing a keep-derived borrow into a struct field no longer
   requires a `keep` field — the borrow is provably static, so it is always safe.
-- **Function pointers:** a funcptr CALL worst-cases its pointer params as keep
-  (the target is invisible and could retain the pointer). This applies both to
-  passing `&local` *directly* to a funcptr param AND to *forwarding* a param to
-  a funcptr (`void fwd(*T p, *(*T) cb){ cb(p); }` infers `p` keep), so a stack
-  pointer can never reach a retaining callback through any funcptr indirection —
-  the keep/escape property is 100% sound. Consequence: a read-only callback must
-  be given a long-lived (global/static) context, not a stack-local one — the same
-  rule that already applies to a direct funcptr call.
+- **Function pointers:** a funcptr CALL worst-cases every REFERENCE-CARRYING
+  parameter as keep, because the target is invisible and could retain what it is
+  handed. "Reference-carrying" is the recursive property, not a spelling: `*T`,
+  `*opaque`, `?*T`, an array of those, and a **by-value struct or union with a
+  pointer field** all count. This applies both to passing `&local` *directly* to
+  such a parameter AND to *forwarding* a parameter to a funcptr
+  (`void fwd(*T p, *(*T) cb){ cb(p); }` infers `p` keep), so a stack pointer
+  cannot reach a retaining callback through a funcptr indirection.
+  Consequence: a read-only callback must be given a long-lived (global/static)
+  context, not a stack-local one — the same rule that already applies to a direct
+  funcptr call.
+- **The one exemption, stated plainly:** a parameter whose own reference IS a
+  SLICE (`[*]T`, or `?[*]T`) is NOT worst-cased, so passing a local array to a
+  `[*]T` callback still compiles. That is a deliberate ergonomic carve-out for
+  the read-only-view idiom and it is **not** sound: a target that stores the
+  slice in a global leaves it dangling. If a `[*]T` callback may retain its
+  argument, give it a global buffer. Tracked in `docs/limitations.md`.
 
 ---
 
@@ -2771,8 +3570,20 @@ undefined behavior.
 ### Comparison
 `==  !=  <  >  <=  >=` — Returns bool.
 
+Not defined on AGGREGATES: struct, union, slice and array operands are rejected
+for all six operators (compare the fields you care about individually). A value
+OPTIONAL is rejected too — see `?T` above; only `opt == null` is allowed.
+
 ### Logical
 `&&  ||  !` — Short-circuit evaluation.
+
+The RIGHT operand of `&&` / `||` runs only when the left permits it, and the
+bounds checker knows that: `if (i < 4 && a[i] > 0)` — the canonical guarded
+access — compiles. The index is not PROVEN in range there (range narrowing does
+not yet flow across a short-circuit), so it carries a runtime auto-guard rather
+than being elided; write the guard as a nested `if` to get the check for free.
+Putting the access on the LEFT (`a[i] > 0 && i < 4`) runs it unconditionally and
+is still a hard error when the index is provably out of range.
 
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`

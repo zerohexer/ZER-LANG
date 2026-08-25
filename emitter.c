@@ -1399,6 +1399,21 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         while (base->kind == TYPE_ARRAY) base = base->array.inner;
         /* function pointer array: ret (*name[dim1][dim2])(params) */
         Type *base_eff = type_unwrap_distinct(base);
+        /* BUG-879: peel a NULL-SENTINEL optional too. `?FuncPtr` IS the pointer
+         * at runtime (no `.has_value` field), so an array of them is an array of
+         * function pointers and needs this declarator shape — but the peel here
+         * only handled `distinct`, so the element kind read as TYPE_OPTIONAL,
+         * this branch was skipped, and the generic branch below emitted
+         * `uint32_t (*)(uint32_t) ops[3]`: an abstract declarator with a name
+         * glued on. Not C, and GCC said so at a line in generated code.
+         *
+         * It matters because the nullable form is the ONLY inhabitable one: an
+         * array of NON-null funcptrs cannot be used, since auto-zero fills it
+         * with NULL and ZER has no array initializer to fill it with anything
+         * else. So every working funcptr array reaches exactly this path. */
+        while (base_eff && type_dispatch_kind(base_eff) == TYPE_OPTIONAL &&
+               is_null_sentinel(base_eff->optional.inner))
+            base_eff = type_unwrap_distinct(base_eff->optional.inner);
         if (base_eff->kind == TYPE_FUNC_PTR) {
             emit_type(e, base_eff->func_ptr.ret);
             emit(e, " (*%.*s", (int)name_len, name);

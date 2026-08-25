@@ -417,6 +417,7 @@ static Type *nonnull_zero_hole(Type *t, bool *is_func) {
     if (!t) return NULL;
     Type *eff = type_unwrap_distinct(t);
     if (!eff) return NULL;
+    if (!eff) return NULL;
     TypeKind k = type_dispatch_kind(eff);
     if (k == TYPE_POINTER) return eff;
     if (k == TYPE_FUNC_PTR) { *is_func = true; return eff; }

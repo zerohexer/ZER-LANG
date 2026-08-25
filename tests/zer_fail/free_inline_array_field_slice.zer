@@ -1,0 +1,11 @@
+// expect-error: views non-heap memory
+// BUG-851 (the dual hole): `s.buf` is an INLINE array inside a stack struct, so
+// a slice of it views stack memory and free() on it is undefined. It was
+// silently ALLOWED because the peel bottomed out at `s`, which is a struct
+// rather than an array. Navigating into inline storage now carries the fact.
+struct S { u8[8] buf; }
+u32 main() {
+    S s;
+    free(s.buf[0..4]);
+    return 0;
+}

@@ -1,0 +1,13 @@
+// expect-error: function pointer requires an initializer
+// BUG-856, the site that had drifted: the non-null-funcptr rule existed only in
+// the LOCAL var-decl copy of the check. Its GLOBAL sibling checked `*T` data
+// pointers and never grew the funcptr arm, so this global auto-zeroed to NULL
+// and `gop(1, 2)` emitted a raw call through address 0.
+//
+// Both sites now run the same query (nonnull_zero_hole), so they cannot drift
+// apart again.
+*(u32, u32) -> u32 gop;
+
+u32 main() {
+    return gop(1, 2);
+}

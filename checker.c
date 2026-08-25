@@ -104,6 +104,49 @@ static bool type_carries_handle(Type *t, int depth) {
     return false;
 }
 
+/* "Does an uninitialised declaration of this type auto-zero into a NULL that
+ * the type promises cannot be null?"
+ *
+ * BUG-866. This question was answered at TWO sites — the local NODE_VAR_DECL
+ * and the global NODE_GLOBAL_VAR — as two hand-written copies, and they drifted:
+ * the local copy grew a FUNC_PTR arm, the global one never did. So
+ *
+ *     *(u32, u32) -> u32 gop;          // global: accepted
+ *     u32 main() { return gop(1, 2); } // emits a raw call through address 0
+ *
+ * compiled clean, while the identical declaration one scope deeper was rejected.
+ * Two spellings of one program disagreeing is the tell for a drifted duplicate.
+ *
+ * Returns the offending effective type (so the caller can name it) or NULL.
+ * `*is_func` distinguishes the two messages. Declaration level only: a non-null
+ * pointer FIELD inside a struct is the same hazard but a much wider rule, and
+ * that variant was measured at 34 affected corpus files, so it is deliberately
+ * out of scope here (see docs/limitations.md). */
+static Type *nonnull_zero_hole(Type *t, bool *is_func) {
+    *is_func = false;
+    if (!t) return NULL;
+    Type *eff = type_unwrap_distinct(t);
+    if (!eff) return NULL;
+    TypeKind k = type_dispatch_kind(eff);
+    if (k == TYPE_POINTER) return eff;
+    if (k == TYPE_FUNC_PTR) { *is_func = true; return eff; }
+    return NULL;
+}
+
+/* Is this optional INNER type represented by a null sentinel (so the optional
+ * IS the pointer at runtime and has no `.value` field)? Checker-side twin of
+ * emitter.c's `is_null_sentinel`; kept identical, including the `*opaque`
+ * exclusion (`_zer_opaque` is a struct, not a pointer). */
+static bool is_null_sentinel_ck(Type *inner) {
+    if (!inner) return false;
+    Type *u = type_unwrap_distinct(inner);
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(u);
+    if (k == TYPE_POINTER && u->pointer.inner &&
+        type_dispatch_kind(u->pointer.inner) == TYPE_OPAQUE) return false;
+    return k == TYPE_POINTER || k == TYPE_FUNC_PTR;
+}
+
 /* Does this type CARRY an enum at any nesting depth?
  *
  * BUG-864. A ZER enum is a CLOSED set, and the exhaustive-switch theorem rests
@@ -5129,6 +5172,55 @@ static Type *check_expr(Checker *c, Node *node) {
                             type_name(bad), op);
                     }
                 }
+
+                /* BUG-865: OPTIONAL is the remaining sibling of the aggregate
+                 * list above, and the worst-behaved one, because it produces a
+                 * WRONG ANSWER rather than invalid C.
+                 *
+                 * A value optional is `struct { T value; uint8_t has_value; }`.
+                 * `?u32 == 0` emitted `a.value == 0` and read the payload
+                 * WITHOUT consulting has_value, so a NULL `?u32` compared EQUAL
+                 * to 0 — auto-zero guarantees `.value` is 0 when absent. A null
+                 * check written the natural way, `if (x == 0)`, therefore passed
+                 * silently on a value that is not there. `?T == ?T` emitted
+                 * `a.value == b` (invalid C, caught only by GCC).
+                 *
+                 * Two shapes stay legal and must not be swept up:
+                 *  - `opt == null` / `opt != null`, either side. That is the
+                 *    intended spelling and already lowers correctly, to
+                 *    `!x.has_value`. Detected on the AST node, since a null
+                 *    literal's TYPE is not distinctive here.
+                 *  - a NULL-SENTINEL optional (`?*T`, `?FuncPtr`), which IS the
+                 *    pointer at runtime — it has no `.value` field to read past,
+                 *    so comparing it against another pointer is a plain, correct
+                 *    pointer comparison. The hazard is exactly the struct
+                 *    representation. */
+                bool l_null_lit = node->binary.left &&
+                                  node->binary.left->kind == NODE_NULL_LIT;
+                bool r_null_lit = node->binary.right &&
+                                  node->binary.right->kind == NODE_NULL_LIT;
+                if (!l_null_lit && !r_null_lit) {
+                    bool opt_l = (kl == TYPE_OPTIONAL) &&
+                                 !is_null_sentinel_ck(eff_l->optional.inner);
+                    bool opt_r = (kr == TYPE_OPTIONAL) &&
+                                 !is_null_sentinel_ck(eff_r->optional.inner);
+                    if (opt_l || opt_r) {
+                        Type *bad = opt_l ? left : right;
+                        const char *op =
+                            node->binary.op == TOK_EQEQ   ? "==" :
+                            node->binary.op == TOK_BANGEQ ? "!=" :
+                            node->binary.op == TOK_LT     ? "<"  :
+                            node->binary.op == TOK_GT     ? ">"  :
+                            node->binary.op == TOK_LTEQ   ? "<=" : ">=";
+                        checker_error(c, node->loc.line,
+                            "cannot compare optional '%s' with %s — the comparison would "
+                            "read the payload without checking whether it is present, so a "
+                            "null optional compares equal to 0. Unwrap first: "
+                            "'if (x) |v| { … v %s … }' or 'x orelse <default> %s …'. "
+                            "Only '%s null' is a valid direct comparison",
+                            type_name(bad), op, op, op, op);
+                    }
+                }
             }
             if (!type_equals(left, right) &&
                 !can_implicit_coerce(left, right) &&
@@ -7166,23 +7258,63 @@ static Type *check_expr(Checker *c, Node *node) {
                  * allowed. */
                 {
                     Node *root = node->call.args[0];
-                    while (root && (root->kind == NODE_SLICE ||
-                                    root->kind == NODE_FIELD ||
-                                    root->kind == NODE_INDEX)) {
-                        if (root->kind == NODE_SLICE) root = root->slice.object;
-                        else if (root->kind == NODE_FIELD) root = root->field.object;
-                        else root = root->index_expr.object;
+                    /* BUG-867: the peel walked to the root IDENT and then asked
+                     * "is the ROOT a local array?", which loses the thing that
+                     * matters. `free(s.buf[0..4])` on `struct S { u8[8] buf; }`
+                     * bottoms out at `s` — a STRUCT, not an array — so the test
+                     * failed and freeing a slice of INLINE STACK storage was
+                     * accepted, while `free(buf[0..4])` on a bare local array one
+                     * line away was rejected.
+                     *
+                     * The honest question is not what KIND the root is, but
+                     * whether the navigation stayed INSIDE the root's own
+                     * storage. Field and index steps through inline aggregates do
+                     * (`s.buf[..]` is bytes of `s`); a step through a POINTER or
+                     * SLICE does not (`s.heap_ptr[..]` is somebody else's memory,
+                     * and freeing it may well be right). So track that as we
+                     * descend, and let the root's LIFETIME decide. */
+                    bool views_root_storage = true;
+                    int peel_guard = 0;
+                    while (root && peel_guard++ < 64 &&
+                           (root->kind == NODE_SLICE ||
+                            root->kind == NODE_FIELD ||
+                            root->kind == NODE_INDEX)) {
+                        /* The discriminator is FORMED-view vs STORED-reference,
+                         * not the operand's kind. `s.buf[0..4]` FORMS a view over
+                         * inline bytes (NODE_SLICE), so it stays inside `s`.
+                         * `b.s`, where the field's declared type is itself a
+                         * slice/pointer, READS a reference the program put there
+                         * — the bytes are wherever that reference points, so
+                         * `free(b.s)` on a heap slice must keep working. Same
+                         * FORMS-vs-READS distinction CLAUDE.md records for the
+                         * alias rules. */
+                        if (root->kind != NODE_SLICE) {
+                            Type *ct = checker_get_type(c, root);
+                            TypeKind ck = ct ? type_dispatch_kind(ct) : TYPE_VOID;
+                            if (ck == TYPE_POINTER || ck == TYPE_SLICE || ck == TYPE_OPAQUE)
+                                views_root_storage = false;
+                        }
+                        root = (root->kind == NODE_SLICE) ? root->slice.object
+                             : (root->kind == NODE_FIELD) ? root->field.object
+                                                          : root->index_expr.object;
                     }
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *rs = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
                         bool rs_global = rs && scope_lookup_local(c->global_scope,
                             rs->name, rs->name_len) != NULL;
-                        bool root_is_local_array = rs && rs->type &&
-                            type_dispatch_kind(rs->type) == TYPE_ARRAY &&
-                            !rs->is_static && !rs_global;
+                        /* The root's own type must itself be INLINE storage — an
+                         * array or an aggregate holding one. A root that IS a
+                         * slice/pointer holds a reference, and `free(s)` on a heap
+                         * slice is the whole point of the feature. */
+                        TypeKind rk = (rs && rs->type) ? type_dispatch_kind(rs->type)
+                                                       : TYPE_VOID;
+                        bool root_inline_storage =
+                            (rk == TYPE_ARRAY || rk == TYPE_STRUCT || rk == TYPE_UNION);
+                        bool frees_stack_storage = rs && views_root_storage &&
+                            root_inline_storage && !rs->is_static && !rs_global;
                         if (rs && (rs->is_local_derived || rs->is_arena_derived ||
-                                   root_is_local_array)) {
+                                   frees_stack_storage)) {
                             checker_error(c, node->loc.line,
                                 "cannot free() a slice that views non-heap memory "
                                 "(stack array or arena); free is only for heap slices "
@@ -12888,21 +13020,18 @@ static void check_stmt(Checker *c, Node *node) {
          * AUDIT 2026-06-12: unwrap TYPE_DISTINCT so `distinct typedef *u32 P; P p;`
          * is caught — sibling funcptr check below already unwraps. */
         if (!node->var_decl.init && type) {
-            Type *teff = type_unwrap_distinct(type);
-            if (teff && teff->kind == TYPE_POINTER) {
+            bool nz_func = false;
+            Type *nz = nonnull_zero_hole(type, &nz_func);
+            if (nz && nz_func) {
+                checker_error(c, node->loc.line,
+                    "function pointer requires an initializer — "
+                    "use '?' prefix for nullable function pointer");
+            } else if (nz) {
                 checker_error(c, node->loc.line,
                     "non-null pointer '*%s' requires an initializer — "
                     "use '?*%s' for nullable pointers",
-                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
+                    type_name(nz->pointer.inner), type_name(nz->pointer.inner));
             }
-        }
-        /* Function pointer without initializer — auto-zero creates NULL funcptr.
-         * Calling it would segfault. Require init or use ?FuncPtr for nullable. */
-        if (!node->var_decl.init && type &&
-            type_unwrap_distinct(type)->kind == TYPE_FUNC_PTR) {
-            checker_error(c, node->loc.line,
-                "function pointer requires an initializer — "
-                "use '?' prefix for nullable function pointer");
         }
 
         typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
@@ -17620,16 +17749,22 @@ static void register_decl(Checker *c, Node *node) {
                     (int)node->var_decl.name_len, node->var_decl.name);
             }
         }
-        /* BUG-253: non-null pointer (*T) requires initializer at global scope too.
-         * AUDIT 2026-06-12: unwrap TYPE_DISTINCT to catch
-         * `distinct typedef *u32 P; P g;` at global scope. */
+        /* BUG-253 / BUG-866: non-null pointer AND function pointer require an
+         * initializer at global scope too. Same query as the local site, so the
+         * two cannot drift apart again — the funcptr arm was missing here for
+         * exactly as long as the two copies existed. */
         if (!node->var_decl.init && type) {
-            Type *teff = type_unwrap_distinct(type);
-            if (teff && teff->kind == TYPE_POINTER) {
+            bool nz_func = false;
+            Type *nz = nonnull_zero_hole(type, &nz_func);
+            if (nz && nz_func) {
+                checker_error(c, node->loc.line,
+                    "function pointer requires an initializer — "
+                    "use '?' prefix for nullable function pointer");
+            } else if (nz) {
                 checker_error(c, node->loc.line,
                     "non-null pointer '*%s' requires an initializer — "
                     "use '?*%s' for nullable pointers",
-                    type_name(teff->pointer.inner), type_name(teff->pointer.inner));
+                    type_name(nz->pointer.inner), type_name(nz->pointer.inner));
             }
         }
         Symbol *sym = node->var_decl.is_synthetic

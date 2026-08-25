@@ -1,0 +1,9 @@
+// expect-error: cannot compare optional
+// BUG-840: `?T == value` read `.value` WITHOUT `.has_value`, so a null `?u32`
+// compared EQUAL to 0 — a null check written as `if (x == 0)` silently passed.
+?u32 maybe(u32 k) { if (k == 0) { return null; } return k; }
+u32 main() {
+    ?u32 a = maybe(0);
+    if (a == 0) { return 1; }
+    return 0;
+}

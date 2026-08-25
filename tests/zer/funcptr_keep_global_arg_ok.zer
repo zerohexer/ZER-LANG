@@ -1,0 +1,23 @@
+// BUG-857 boundary: the widened indirect-call keep worst-case must NOT reject a
+// LONG-LIVED argument. A pointer to a global satisfies keep at every carrier
+// shape, so all three forms below must still compile.
+u32 shared_cell;
+?*u32 g;
+
+void setg(?*u32 v) { g = v; }
+
+struct Holder { ?*u32 p; }
+void seth(Holder h) { g = h.p; }
+
+i32 main() {
+    *(?*u32) fp = setg;
+    fp(&shared_cell);
+
+    Holder h;
+    h.p = &shared_cell;
+    *(Holder) fh = seth;
+    fh(h);
+
+    if (g) |p| { if (*p != 0) { return 1; } }
+    return 0;
+}

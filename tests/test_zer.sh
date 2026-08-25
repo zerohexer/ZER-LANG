@@ -136,7 +136,13 @@ for f in tests/zer_fail/*.zer; do
     $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>/tmp/_zer_neg_err.txt
     ret=$?
     if [ $ret -ne 0 ]; then
-        if [ -n "$want" ] && ! grep -qF "$want" /tmp/_zer_neg_err.txt; then
+        # `-- ` before the pattern: without it grep parses an expect-error string
+        # that STARTS WITH A DASH as its own options. Measured on
+        # cli_bad_stack_limit, whose expected substring is
+        # "--stack-limit must be a positive integer" — the diagnostic contained it
+        # verbatim and the test still reported WRONG REASON. Any rule whose message
+        # opens with a flag name was untestable through this harness.
+        if [ -n "$want" ] && ! grep -qF -- "$want" /tmp/_zer_neg_err.txt; then
             FAIL=$((FAIL + 1))
             echo "  FAIL: $name (rejected, but for the WRONG REASON)"
             echo "        expected to contain: $want"

@@ -21712,8 +21712,30 @@ static bool keep_edge_callee_keeps(struct KeepEdge *e) {
     if (!cs || cs->kind != TYPE_FUNC_PTR ||
         e->param_index >= (int)cs->func_ptr.param_count) return false;
     if (e->is_fn_ptr_call) {
-        Type *pt = type_unwrap_distinct(cs->func_ptr.params[e->param_index]);
-        if (pt && pt->kind == TYPE_POINTER) return true; /* pointer worst-case */
+        /* BUG-875 — CARRIER AXIS. The worst-case tested the param's BARE kind,
+         * so it caught `*T` and missed every wrapper carrying the same
+         * reference: a `?*T` parameter and a BY-VALUE STRUCT with a pointer
+         * field both let a stack pointer reach a retaining callback with no
+         * diagnostic (ASan-confirmed stack-use-after-return), while the DIRECT
+         * call of the very same function was rejected one line away. Two
+         * spellings of one program disagreeing.
+         *
+         * Same wrapper-hides-the-inner-kind family as the handle and pointer
+         * carriers, so it asks the shared carrier predicate instead of a
+         * hand-rolled disjunction.
+         *
+         * The TOP-LEVEL slice / opaque exemption is DELIBERATE and kept: it
+         * exists so `callback(local_array)` against a `[*]T` callback parameter
+         * — the read-only-callback pattern — stays allowed, and it was measured
+         * before being granted. It is a known accept-unsafe, recorded as such in
+         * docs/limitations.md rather than left implied by a comment. A pointer
+         * NESTED inside a struct gets no such exemption: no corpus pattern needs
+         * it, and the launder is exactly what the rule is for. */
+        Type *pt = cs->func_ptr.params[e->param_index];
+        TypeKind pk = pt ? type_dispatch_kind(pt) : TYPE_VOID;
+        if (pk != TYPE_SLICE && pk != TYPE_OPAQUE &&
+            type_carries_data_pointer(pt, 0))
+            return true;
     }
     return cs->func_ptr.param_keeps && cs->func_ptr.param_keeps[e->param_index];
 }

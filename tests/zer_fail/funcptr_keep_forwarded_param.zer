@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-857: the transitive half — `take` forwards its own parameter to an
+// indirect call, so `take`'s parameter must itself become keep and the call
+// site passing `&x` must be rejected.
+?*u32 g;
+
+void setg(?*u32 v) { g = v; }
+
+void take(*(?*u32) fp, ?*u32 v) { fp(v); }
+
+i32 main() {
+    u32 x = 5;
+    take(setg, &x);
+    return 0;
+}

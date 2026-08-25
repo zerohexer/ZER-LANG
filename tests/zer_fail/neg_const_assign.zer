@@ -1,0 +1,6 @@
+// expect-error: negative constant -1 does not fit unsigned type
+u32 main() {
+    u32 a = 0;
+    a = -1;
+    return a;
+}

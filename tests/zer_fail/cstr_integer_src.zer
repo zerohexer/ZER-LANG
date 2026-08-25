@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: @cstr source must be a slice
+// BUG-861: the source was never type-checked either. It emitted `.ptr`/`.len`
+// on an integer — GCC rejects that, but the diagnostic points at generated C the
+// user never wrote, which is not a usable diagnostic.
+u32 gi;
+u32 main() {
+    u8[16] buf;
+    @cstr(buf, gi);
+    return 0;
+}

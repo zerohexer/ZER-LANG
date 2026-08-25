@@ -1,0 +1,7 @@
+// expect-error: negative constant -1 does not fit unsigned type
+// BUG-842: `u32 a = -1;` was ACCEPTED (-> 4294967295) while `u8 b = -1;` was
+// rejected — the same rule firing at some widths and not others.
+u32 main() {
+    u32 a = -1;
+    return a;
+}

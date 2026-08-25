@@ -972,6 +972,32 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * the assignment/compound-assign path is AST-passthrough and never reaches
  * emit_intn_mask, so odd-width stores need masking here (else silent wrong
  * value: `u3 y; y = a+b` would keep bit 3). */
+/* Does this type CARRY an enum at any nesting depth? Emitter-side twin of
+ * checker.c's `type_carries_enum` (that one is static, and the two files share
+ * no header for these predicates). Same shape, same depth limit; keep them in
+ * step — they answer the same question for the same rule, the checker deciding
+ * whether to care and the emitter deciding where to look. */
+static bool type_carries_enum_e(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_ENUM) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_enum_e(u->struct_type.fields[i].type, depth + 1)) return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_enum_e(u->union_type.variants[i].type, depth + 1)) return true;
+        return false;
+    }
+    return false;
+}
+
 /* BUG-843: @bitcast could FORGE an out-of-variant enum, and the switch then
  * silently ran its LAST arm — `@bitcast(State, 7)` took `.done` while
  * `s == State.done` was false. It was the only route in: ZER has no int->enum
@@ -982,17 +1008,81 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * @bitcast is a legitimate firmware idiom; what is not legitimate is the value
  * silently becoming a variant it is not. The guard traps at the point of forgery
  * rather than letting a later switch pick an arbitrary arm. */
-static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
+/* BUG-864 extends this in two directions that were both silent.
+ *
+ * (a) CARRIER. The guard was a TOP-LEVEL kind test, so `@bitcast(Box, 7)` where
+ *     `struct Box { State s; }` returned early and forged `Box.s` exactly as
+ *     effectively as the bare spelling. Same wrapper-hides-the-inner-kind family
+ *     the audit_carrier_dispatch gate exists for. It now walks struct fields,
+ *     optional payloads and array elements, checking every enum it reaches.
+ * (b) SIBLING ROUTES. It was called only from the two @bitcast sites. @truncate
+ *     (and @saturate / @cast) reach an enum target just as directly, and
+ *     `@truncate(State, 7)` was accepted with no check at all. Every
+ *     value-producing conversion into an enum-carrying target now calls it.
+ *
+ * `path` is the C lvalue expression to test; recursion appends `.field` /
+ * `[i]` to it. Depth-limited like the type carriers in checker.c. */
+static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
+                                         const char *what, int depth) {
+    if (!t || depth > 8) return;
     Type *u = type_unwrap_distinct(t);
-    if (!u || type_dispatch_kind(u) != TYPE_ENUM) return;
-    if (u->enum_type.variant_count == 0) return;
-    emit(e, "if (!(");
-    for (uint32_t vi = 0; vi < u->enum_type.variant_count; vi++) {
-        if (vi) emit(e, " || ");
-        emit(e, "%s == %lld", lv, (long long)u->enum_type.variants[vi].value);
+    if (!u) return;
+    TypeKind k = type_dispatch_kind(u);
+    if (k == TYPE_ENUM) {
+        if (u->enum_type.variant_count == 0) return;
+        emit(e, "if (!(");
+        for (uint32_t vi = 0; vi < u->enum_type.variant_count; vi++) {
+            if (vi) emit(e, " || ");
+            emit(e, "%s == %lld", path, (long long)u->enum_type.variants[vi].value);
+        }
+        emit(e, ")) _zer_trap(\"%s produced a value that is not a declared variant "
+                "of this enum\", __FILE__, __LINE__); ", what);
+        return;
     }
-    emit(e, ")) _zer_trap(\"@bitcast produced a value that is not a declared variant "
-            "of this enum\", __FILE__, __LINE__); ");
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            Type *ft = u->struct_type.fields[i].type;
+            if (!type_carries_enum_e(ft, 0)) continue;
+            char sub[256];
+            snprintf(sub, sizeof(sub), "%s.%.*s", path,
+                     (int)u->struct_type.fields[i].name_len,
+                     u->struct_type.fields[i].name);
+            emit_enum_variant_guard_path(e, ft, sub, what, depth + 1);
+        }
+        return;
+    }
+    if (k == TYPE_OPTIONAL) {
+        Type *in = u->optional.inner;
+        if (!type_carries_enum_e(in, 0)) return;
+        /* Only the payload of a PRESENT optional is meaningful; a null one
+         * carries whatever the zeroing left, which is not a forged variant. */
+        char sub[256];
+        snprintf(sub, sizeof(sub), "%s.value", path);
+        emit(e, "if (%s.has_value) { ", path);
+        emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
+        emit(e, "} ");
+        return;
+    }
+    if (k == TYPE_ARRAY) {
+        Type *in = u->array.inner;
+        if (!type_carries_enum_e(in, 0)) return;
+        if (u->array.size == 0 || u->array.size > 4096) return;
+        int li = e->temp_count++;
+        char sub[256];
+        snprintf(sub, sizeof(sub), "%s[_zer_egi%d]", path, li);
+        emit(e, "for (size_t _zer_egi%d = 0; _zer_egi%d < %llu; _zer_egi%d++) { ",
+             li, li, (unsigned long long)u->array.size, li);
+        emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
+        emit(e, "} ");
+        return;
+    }
+    /* A UNION is TAGGED in ZER, so its payload is only readable through the
+     * variant switch, which re-checks the tag. Nothing to guard here. */
+}
+
+static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
+    if (!type_carries_enum_e(t, 0)) return;
+    emit_enum_variant_guard_path(e, t, lv, "@bitcast", 0);
 }
 
 /* BUG-845: float -> integer conversion is C UNDEFINED when the truncated value is
@@ -3505,7 +3595,11 @@ static void emit_expr(Emitter *e, Node *node) {
              * 5), so mask the result here — covers INLINE uses (comparisons,
              * call args), not just stores. */
             Type *tt = node->intrinsic.type_arg ? resolve_tynode(e,node->intrinsic.type_arg) : NULL;
-            if (type_is_nonnative_intn(tt)) {
+            /* BUG-864: an ENUM target needs the same variant guard @bitcast gets.
+             * `@truncate(State, 7)` reaches the closed set by a different door and
+             * had NO check at all, so the forged value silently ran the switch's
+             * last arm — the exact defect BUG-843 closed for the other spelling. */
+            if (type_is_nonnative_intn(tt) || type_carries_enum_e(tt, 0)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -3514,6 +3608,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 else emit(e, "0");
                 emit(e, "); ");
                 emit_intn_mask_lv(e, tt, lv);
+                emit_enum_variant_guard_path(e, tt, lv, "@truncate", 0);
                 emit(e, "_zer_tr%d; })", tmp);
             } else {
                 emit(e, "(");
@@ -5598,6 +5693,20 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "        if (!used[i]) {\n");
     emit(e, "            used[i] = 1;\n");
     emit(e, "            if (gen[i] == 0) gen[i] = 1; /* skip 0: reserved for null handle */\n");
+    /* BUG-861: a RECYCLED slot still held the previous object bit-for-bit, so
+     * `alloc` handed back dirty memory while the language documents
+     * "everything auto-zeroed". A fresh page is calloc-clean, which is exactly
+     * why this was silent: it only appears after the first free/alloc cycle.
+     * The consequence is not merely stale data — a pointer-carrying field
+     * (`?*T`) came back NON-NULL and pointing at freed memory, so a program
+     * that sets only the fields it cares about and trusts the guarantee for the
+     * rest could unwrap it and dereference. Reachable from pure safe ZER, with
+     * no diagnostic, and invisible to ASan because the reuse happens INSIDE
+     * ZER-owned storage.
+     *
+     * `pool_ptr` and `slot_size` were already parameters and had NO other use
+     * in this function — the zeroing they exist for was simply never written. */
+    emit(e, "            memset((char *)pool_ptr + (size_t)i * slot_size, 0, slot_size);\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -5937,6 +6046,12 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "        if (!s->used[i]) {\n");
     emit(e, "            s->used[i] = 1;\n");
     emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1; /* zero handle must not match */\n");
+    /* BUG-861 — see the matching comment in _zer_pool_alloc. Same defect, same
+     * fix; the two allocators answer the same question and must not diverge.
+     * (Arena already honoured the guarantee — it memsets in _zer_arena_alloc —
+     * so the divergence was between siblings, which is what made it invisible.) */
+    emit(e, "            memset(s->pages[i / _ZER_SLAB_PAGE_SLOTS] + "
+            "(size_t)(i %% _ZER_SLAB_PAGE_SLOTS) * s->slot_size, 0, s->slot_size);\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)s->gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -7779,7 +7894,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             /* @truncate(T, val) → (T)(val). Non-native uN/iN: mask the result
              * (IR-path twin of the emit_expr site) — covers inline uses. */
             Type *tt = node->intrinsic.type_arg ? resolve_tynode(e, node->intrinsic.type_arg) : NULL;
-            if (type_is_nonnative_intn(tt)) {
+            /* BUG-864 — IR-path twin. CLAUDE.md's dual-dispatch rule: an
+             * intrinsic handler exists at BOTH the AST and the IR site, and a
+             * safety wrapper added to one and not the other is a silent hole
+             * that only some spellings reach. */
+            if (type_is_nonnative_intn(tt) || type_carries_enum_e(tt, 0)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -7788,6 +7907,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 else emit(e, "0");
                 emit(e, "); ");
                 emit_intn_mask_lv(e, tt, lv);
+                emit_enum_variant_guard_path(e, tt, lv, "@truncate", 0);
                 emit(e, "_zer_tr%d; })", tmp);
             } else {
                 emit(e, "(");

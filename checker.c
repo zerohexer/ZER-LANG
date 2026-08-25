@@ -104,6 +104,95 @@ static bool type_carries_handle(Type *t, int depth) {
     return false;
 }
 
+/* Forward: the SCOPED constant evaluator (defined below with the other const
+ * machinery). Needed up here by the size fold, which must resolve a `const`
+ * identifier — the non-scoped evaluator cannot. */
+static int64_t eval_const_expr_scoped(Checker *c, Node *n);
+
+/* BUG-873: evaluate a declared SIZE/COUNT expression, resolving `const`
+ * identifiers, and FOLD THE RESULT IN PLACE.
+ *
+ * Four sites asked this question — array size, Pool count, Ring count,
+ * Semaphore count — each with its own `eval_const_expr(expr)` call, and all
+ * four used the NON-scoped evaluator, which by construction cannot resolve a
+ * NODE_IDENT. So
+ *
+ *     const u32 CAP = 4;   u8[CAP] buf;   Pool(Slot, CAP) p;
+ *
+ * — the most idiomatic firmware declaration there is — was rejected with "must
+ * be a compile-time constant", naming a constant.
+ *
+ * The IN-PLACE rewrite is the load-bearing part. The EMITTER re-resolves the
+ * same TypeNode with the non-scoped evaluator, so teaching only the checker
+ * leaves the emitter still failing — silently, sizing the array 0 and making
+ * `@size(u8[CAP])` yield 0. A compile-only test passes that. Trading an
+ * over-rejection for a wrong answer is worse than the over-rejection, so the
+ * two halves must see the same value, and the only way to guarantee that is for
+ * there to be one value. tests/zer/const_compile_time_sizes.zer therefore
+ * asserts the sizes at RUNTIME.
+ *
+ * Each caller keeps its own range predicate (> 0 for array/Pool/Ring, >= 0 for
+ * Semaphore) and its own message. */
+static int64_t eval_decl_size_expr(Checker *c, Node *e) {
+    if (!e) return CONST_EVAL_FAIL;
+    int64_t val = eval_const_expr(e);
+    if (val != CONST_EVAL_FAIL) return val;
+    int64_t sval = eval_const_expr_scoped(c, e);
+    if (sval == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+    e->kind = NODE_INT_LIT;
+    e->int_lit.value = (uint64_t)sval;
+    return sval;
+}
+
+/* Fold a declaration's `const` / `volatile` keywords into the resolved slice or
+ * pointer TYPE.
+ *
+ * BUG-872. This was written out longhand at TWO sites (register_decl and the
+ * body-check var-decl case) and MISSING at a third — the pass-2 global
+ * initializer check, which re-resolved `decl->var_decl.type` raw. So pass 1
+ * registered `BANNER` as `const [*]u8` and pass 2 compared a MUTABLE `[*]u8`
+ * target against a const initializer:
+ *
+ *     const [*]u8 BANNER = "boot ok";
+ *     error: cannot initialize 'BANNER' of type '[]u8' with '[]u8'
+ *
+ * — the single most common firmware global there is, not declarable at all, and
+ * reported with the SAME type printed on both sides, because `type_name` does
+ * not render qualifiers. A message that cannot express the difference it
+ * reports is the tell that the two sides were computed differently.
+ *
+ * One helper now, called at all three. `is_const`/`is_volatile` are passed
+ * rather than read off a Node so the qualifier source stays explicit. */
+static Type *fold_decl_qualifiers(Checker *c, Type *type, bool is_const, bool is_volatile) {
+    if (!type) return type;
+    /* The const branch does NOT unwrap distinct, deliberately. Rebuilding the
+     * type from the unwrapped inner would DISCARD the distinct wrapper's nominal
+     * identity, and `const MyPtr cg = g;` on a `distinct typedef *u32 MyPtr`
+     * would then stop type-checking against `MyPtr`. (Caught by
+     * tests/zer/distinct_const_read_ok when the first draft of this helper
+     * unwrapped here; a const distinct is already const-by-declaration through
+     * Symbol.is_const, so nothing is lost by leaving the type alone.) */
+    if (is_const) {
+        if (type->kind == TYPE_SLICE && !type->slice.is_const)
+            type = type_const_slice(c->arena, type->slice.inner);
+        else if (type->kind == TYPE_POINTER && !type->pointer.is_const)
+            type = type_const_pointer(c->arena, type->pointer.inner);
+    }
+    if (is_volatile) {
+        Type *eff = type_unwrap_distinct(type);
+        if (eff && eff->kind == TYPE_SLICE && !eff->slice.is_volatile) {
+            type = type_volatile_slice(c->arena, eff->slice.inner);
+            if (is_const) type->slice.is_const = true;
+        } else if (eff && eff->kind == TYPE_POINTER && !eff->pointer.is_volatile) {
+            Type *vp = type_pointer(c->arena, eff->pointer.inner);
+            vp->pointer.is_volatile = true;
+            if (eff->pointer.is_const || is_const) vp->pointer.is_const = true;
+            type = vp;
+        }
+    }
+    return type;
+}
+
 /* BUG-868: does a field DECLARED with this syntax keep its storage INLINE in
  * the enclosing struct — so a containment edge through it counts toward an
  * infinite size — or does it hold a reference, making the edge finite?
@@ -3779,7 +3868,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         uint32_t count = 0;
         if (tn->semaphore.count_expr) {
             check_expr(c, tn->semaphore.count_expr);
-            int64_t val = eval_const_expr(tn->semaphore.count_expr);
+            int64_t val = eval_decl_size_expr(c, tn->semaphore.count_expr);
             if (val >= 0) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Semaphore count must be a non-negative compile-time constant");
         }
@@ -3915,6 +4004,26 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                     }
                 }
             }
+            /* BUG-873: `const u32 CAP = 4; u8[CAP] buf;` — the most idiomatic
+             * firmware declaration there is — was rejected with "array size must
+             * be a compile-time constant", naming a constant. A `const` IS one;
+             * the size path just used the NON-scoped evaluator, which by
+             * construction cannot resolve a NODE_IDENT.
+             *
+             * The fold is done IN PLACE, rewriting the size expression to a
+             * literal, and that is the whole point. Teaching only the CHECKER to
+             * resolve the const leaves the EMITTER re-resolving the same
+             * TypeNode with the non-scoped evaluator, where it still fails — and
+             * a failure there is silent: the array is sized 0 and `@size(u8[CAP])`
+             * yields 0. A compile-only test passes that. Trading an
+             * over-rejection for a wrong answer is worse than the
+             * over-rejection, so both halves must see the same value, and the
+             * only way to guarantee that is for there to be one value.
+             *
+             * `tests/zer/const_compile_time_sizes.zer` asserts the sizes at
+             * RUNTIME, deliberately, for exactly this reason. */
+            if (val == CONST_EVAL_FAIL)
+                val = eval_decl_size_expr(c, tn->array.size_expr);
             if (val == CONST_EVAL_FAIL) {
                 /* BUG-275: if @size on target-dependent type (pointer/slice/struct-with-ptr),
                  * don't error — store the resolved Type for emitter to emit sizeof(). */
@@ -3964,7 +4073,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (tn->pool.count_expr) {
             /* BUG-423: resolve comptime calls before eval */
             check_expr(c, tn->pool.count_expr);
-            int64_t val = eval_const_expr(tn->pool.count_expr);
+            int64_t val = eval_decl_size_expr(c, tn->pool.count_expr);
             if (zer_count_is_positive((int)val)) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Pool count must be a positive compile-time constant");
         }
@@ -3977,7 +4086,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (tn->ring.count_expr) {
             /* BUG-423: resolve comptime calls before eval */
             check_expr(c, tn->ring.count_expr);
-            int64_t val = eval_const_expr(tn->ring.count_expr);
+            int64_t val = eval_decl_size_expr(c, tn->ring.count_expr);
             if (zer_count_is_positive((int)val)) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Ring count must be a positive compile-time constant");
         }
@@ -5244,7 +5353,30 @@ static Type *check_expr(Checker *c, Node *node) {
     /* ---- Binary expression ---- */
     case NODE_BINARY: {
         Type *left = check_expr(c, node->binary.left);
+        /* BUG-874: the RHS of `&&` / `||` only runs when the LHS permits it, so
+         * a range fact that holds at the STATEMENT is not a fact about the RHS.
+         *
+         *     u32 i = 9;
+         *     if (i < 4 && a[i] > 0) { }        // was: HARD REJECT, always-OOB
+         *     if (i < 4) { if (a[i] > 0) { } }  // compiles — same program
+         *
+         * The `&&` form is the canonical guarded-access idiom, and the exact
+         * shape the auto-guard warning tells users to write. VRP never applies a
+         * short-circuit LHS to its RHS, so the index looks unconditionally
+         * out of range; the ALWAYS-OOB verdict (which is an ERROR, not a guard)
+         * then rejected a correct program.
+         *
+         * This suppresses only the HARD VERDICT in that position — the index
+         * falls through to the auto-guard exactly as an unprovable one does, so
+         * no runtime check is removed and nothing becomes accepted that would
+         * execute an out-of-bounds access. The proper fix is to narrow VRP from
+         * the LHS (then the access is PROVEN and the guard is elided); until
+         * then this is the difference between rejecting the idiom and merely
+         * not optimising it. */
+        bool sc = (node->binary.op == TOK_AMPAMP || node->binary.op == TOK_PIPEPIPE);
+        if (sc) c->shortcircuit_rhs_depth++;
         Type *right = check_expr(c, node->binary.right);
+        if (sc && c->shortcircuit_rhs_depth > 0) c->shortcircuit_rhs_depth--;
 
         /* literal promotion: when one side is a literal and the other is
          * a known type, the literal adopts the other side's type.
@@ -9274,9 +9406,12 @@ static Type *check_expr(Checker *c, Node *node) {
                 IndexVerdict iv = index_range_verdict(r, obj->array.size);
                 if (iv == IDX_PROVEN_SAFE) {
                     mark_proven(c, node);
-                } else if (iv == IDX_ALWAYS_OOB) {
+                } else if (iv == IDX_ALWAYS_OOB && c->shortcircuit_rhs_depth == 0) {
                     /* BUG-796: every value the index can hold is out of bounds. The
-                     * auto-guard would compile this to a silent early return. */
+                     * auto-guard would compile this to a silent early return.
+                     * BUG-874: except in short-circuit RHS position, where the LHS
+                     * may make this code unreachable — there it falls through to
+                     * the auto-guard instead of being rejected. */
                     checker_error(c, node->loc.line,
                         "index '%.*s' is always out of bounds for array of size %llu "
                         "(its value is proven to be in [%lld, %lld])",
@@ -9330,7 +9465,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     mark_proven(c, node);
                 } else if (csym && csym->has_return_range &&
                            csym->return_range_min >= 0 &&
-                           (uint64_t)csym->return_range_min >= obj->array.size) {
+                           (uint64_t)csym->return_range_min >= obj->array.size &&
+                           c->shortcircuit_rhs_depth == 0) {
+                    /* BUG-874: same short-circuit exemption as the ident arm. */
                     checker_error(c, node->loc.line,
                         "array index from '%.*s()' returns [%lld, %lld] which is always out of bounds for array of size %llu",
                         (int)node->index_expr.index->call.callee->ident.name_len,
@@ -9406,7 +9543,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         struct VarRange *mr = find_var_range(c,
                             node->index_expr.index->ident.name,
                             (uint32_t)node->index_expr.index->ident.name_len);
-                        if (index_range_verdict(mr, mmio_bound) == IDX_ALWAYS_OOB) {
+                        if (index_range_verdict(mr, mmio_bound) == IDX_ALWAYS_OOB &&
+                            c->shortcircuit_rhs_depth == 0) {
+                            /* BUG-874: same short-circuit exemption. */
                             checker_error(c, node->loc.line,
                                 "MMIO index '%.*s' is always out of range (max %llu from "
                                 "mmio declaration; its value is proven to be in [%lld, %lld])",
@@ -13276,34 +13415,20 @@ static void check_stmt(Checker *c, Node *node) {
                 type_dispatch_kind(type) == TYPE_RING ? "Ring" : "Slab");
         }
         /* propagate const from var qualifier to slice/pointer type */
-        if (node->var_decl.is_const && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
-                type = type_const_slice(c->arena, type->slice.inner);
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
-                type = type_const_pointer(c->arena, type->pointer.inner);
-            }
-        }
-        /* propagate volatile from var qualifier to slice/pointer type.
+        /* BUG-872: one helper for the const/volatile fold, shared with
+         * register_decl and the pass-2 global-init check. Written out longhand
+         * it had already drifted — pass 2 did not have it at all.
          *
-         * Pointer propagation (BUG-643/664/665): without this, the type
-         * stored in the typemap for `volatile *u32 reg = ...` is plain
-         * `*u32`. Subsequent uses of `reg` (via NODE_IDENT) returned this
-         * non-volatile type; IR lowering copied `reg` into a temp typed
-         * `*u32`, and the emitter declared `uint32_t* _zer_t0 = reg;` —
-         * stripping volatile. GCC warned but the temp-routed reads/writes
-         * were not volatile in C — silent MMIO miscompile on baremetal. */
-        if (node->var_decl.is_volatile && type) {
-            Type *teff = type_unwrap_distinct(type);
-            if (teff && teff->kind == TYPE_SLICE && !teff->slice.is_volatile) {
-                type = type_volatile_slice(c->arena, teff->slice.inner);
-                if (node->var_decl.is_const) type->slice.is_const = true;
-            } else if (teff && teff->kind == TYPE_POINTER && !teff->pointer.is_volatile) {
-                Type *vp = type_pointer(c->arena, teff->pointer.inner);
-                vp->pointer.is_volatile = true;
-                if (teff->pointer.is_const || node->var_decl.is_const) vp->pointer.is_const = true;
-                type = vp;
-            }
-        }
+         * Why the volatile half matters (BUG-643/664/665): without it the type
+         * stored in the typemap for `volatile *u32 reg = ...` is plain `*u32`.
+         * Uses of `reg` then return the non-volatile type, IR lowering copies it
+         * into a `*u32` temp, and the emitter declares
+         * `uint32_t* _zer_t0 = reg;` — stripping volatile. GCC warns, but the
+         * temp-routed reads/writes are not volatile in C: a silent MMIO
+         * miscompile on bare metal. */
+        type = fold_decl_qualifiers(c, type,
+                                    node->var_decl.is_const,
+                                    node->var_decl.is_volatile);
         /* BUG-239/253: non-null pointer (*T) requires initializer — auto-zero creates NULL.
          * Applies to both local (NODE_VAR_DECL) and global (NODE_GLOBAL_VAR).
          * AUDIT 2026-06-12: unwrap TYPE_DISTINCT so `distinct typedef *u32 P; P p;`
@@ -17995,32 +18120,14 @@ static void register_decl(Checker *c, Node *node) {
     case NODE_GLOBAL_VAR: {
         Type *type = resolve_type(c, node->var_decl.type);
         /* propagate const from var qualifier to slice/pointer type */
-        if (node->var_decl.is_const && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
-                type = type_const_slice(c->arena, type->slice.inner);
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
-                type = type_const_pointer(c->arena, type->pointer.inner);
-            }
-        }
-        /* propagate volatile from var qualifier to slice/pointer type.
-         * Pointer propagation (added 2026-05-18): see matching block in
-         * the NODE_VAR_DECL/NODE_GLOBAL_VAR body-check case — globals are
-         * registered here in register_decl BEFORE bodies are checked, so
-         * sym->type must carry the volatile flag from this entry point.
-         * Without this, NODE_IDENT references to a global volatile pointer
-         * return the non-volatile sym->type and downstream IR temps strip
-         * volatile (silent miscompile on MMIO reads/writes). */
-        if (node->var_decl.is_volatile && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
-                type = type_volatile_slice(c->arena, type->slice.inner);
-                if (node->var_decl.is_const) type->slice.is_const = true;
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
-                Type *vp = type_pointer(c->arena, type->pointer.inner);
-                vp->pointer.is_volatile = true;
-                vp->pointer.is_const = type->pointer.is_const;
-                type = vp;
-            }
-        }
+        /* BUG-872: same fold as the body-check path and the pass-2 global-init
+         * check. Globals are registered HERE, before bodies are checked, so
+         * sym->type must carry the qualifiers from this entry point: without
+         * them, NODE_IDENT references to a global volatile pointer return the
+         * non-volatile sym->type and downstream IR temps strip volatile. */
+        type = fold_decl_qualifiers(c, type,
+                                    node->var_decl.is_const,
+                                    node->var_decl.is_volatile);
         /* Gap 43 (2026-04-27): reject threadlocal shared struct combination.
          * `threadlocal` puts each thread on its own copy with its own mutex;
          * cross-thread synchronization is impossible because threads never
@@ -21340,7 +21447,12 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             }
         }
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
-            Type *type = resolve_type(c, decl->var_decl.type);
+            /* BUG-872: fold the declaration's const/volatile, exactly as pass 1
+             * did. Without it this pass compared a MUTABLE target against a
+             * const initializer and printed the same type on both sides. */
+            Type *type = fold_decl_qualifiers(c,
+                resolve_type(c, decl->var_decl.type),
+                decl->var_decl.is_const, decl->var_decl.is_volatile);
             Type *init = check_expr(c, decl->var_decl.init);
             /* BUG-869: the three guards this replaces were TOP-LEVEL kind
              * tests on the initializer root, so one wrapper (`+ 1`, a cast, a

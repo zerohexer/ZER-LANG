@@ -1,0 +1,37 @@
+// BUG-863: the RIGHT operand of `&&` / `||` is CONDITIONAL, but the always-OOB
+// verdict judged an index there as if it always ran. The canonical guarded
+// access was therefore hard-REJECTED whenever VRP happened to know the index:
+//
+//     u32 i = 9; if (i < 4 && a[i] > 0) { ... }   // "always out of bounds"
+//
+// while the equivalent nested-if spelling compiled. docs/limitations.md O3
+// predicted this: promoting the always-OOB verdict turns short-circuit narrowing
+// from a precision nicety into a correctness requirement.
+//
+// The fix DOWNGRADES the verdict at that position to the ordinary auto-guard
+// path — it does not narrow the range and does not elide anything, so the
+// runtime guard below is still emitted. The assertions are runtime values
+// because the defect a wrong fix would introduce (an elided guard) produces no
+// diagnostic.
+i32 main() {
+    u32[4] a;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    u32 i = 9;                 // provably out of range
+    u32 hits = 0;
+
+    // guarded by the LHS: the access must never run, and must never trap
+    if (i < 4 && a[i] > 0) { hits += 1; }
+
+    // the `||` dual: the LHS is true, so the access is skipped
+    if (i >= 4 || a[i] == 0) { hits += 10; }
+
+    // an in-range index through the same shape still works
+    u32 j = 2;
+    if (j < 4 && a[j] == 3) { hits += 100; }
+
+    // the nested-if spelling, which always compiled — same answer
+    if (i < 4) { if (a[i] > 0) { hits += 1000; } }
+
+    if (hits != 110) { return (i32)hits; }
+    return 0;
+}

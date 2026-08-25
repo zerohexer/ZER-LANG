@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: is always out of bounds
+// BUG-863 boundary: only the RIGHT operand of a short-circuit is conditional.
+// Here the guard is written AFTER the access, so `a[i]` runs unconditionally and
+// the always-OOB verdict must still be a hard error. If this ever compiles, the
+// downgrade has been applied to the wrong operand and BUG-796's protection is
+// gone.
+i32 main() {
+    u32[4] a;
+    u32 i = 9;
+    if (a[i] > 0 && i < 4) { return 1; }
+    return 0;
+}

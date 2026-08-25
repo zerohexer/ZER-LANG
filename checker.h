@@ -290,6 +290,14 @@ typedef struct {
      * stamp that resolution pushes. */
     bool pending_edge_byvalue;
 
+    /* BUG-874: > 0 while checking the RHS of `&&` / `||`. That code runs only
+     * when the LHS permits it, so a range fact that holds at the statement is
+     * not a fact about the RHS — and the ALWAYS-OUT-OF-BOUNDS verdict is an
+     * ERROR, so applying it there rejects the canonical guarded-access idiom
+     * `if (i < 4 && a[i] > 0)`. Suppresses the hard verdict only; the access
+     * still falls through to the runtime auto-guard. */
+    int shortcircuit_rhs_depth;
+
     uint32_t stack_limit;   /* --stack-limit N: error when estimated stack > N bytes (0 = disabled) */
     uint32_t target_features; /* C4-minimum: ZerCpuFeature bitmap from --target-features=... CLI flag.
                                * Affects asm register validation (F7 looks up against AVX-512 table when

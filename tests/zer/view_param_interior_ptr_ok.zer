@@ -1,0 +1,20 @@
+// BUG-847 (relaxation): a function returning an interior pointer into a POINTER
+// param is the ordinary accessor idiom. Before the fix, binding its result to a
+// local reported "handle 'p' allocated at line N but never freed" — a leak that
+// does not exist (nothing was allocated). It was kept deliberately because it
+// incidentally caught the through-call interior-pointer UAF; BUG-845/846 now
+// catch that class properly by aliasing, so the false positive buys nothing.
+struct Node { u32 val; u32 other; }
+
+*u32 field_of(*Node n) { return &n.val; }
+
+u32 main() {
+    Node nd;
+    nd.val = 7;
+    nd.other = 1;
+    *u32 p = field_of(&nd);
+    if (*p != 7) { return 1; }
+    *p = 9;
+    if (nd.val != 9) { return 2; }
+    return 0;
+}

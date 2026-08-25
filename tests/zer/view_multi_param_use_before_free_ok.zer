@@ -1,0 +1,17 @@
+// BUG-849 boundary: the disjunctive param view must stay a VIEW, not an owned
+// allocation — using the result BEFORE either argument is freed is correct code
+// and must compile and run, and neither argument may be reported as leaked.
+[*]u8 pick([*]u8 a, [*]u8 b, bool f) { if (f) { return b[0..1]; } return a[0..1]; }
+
+u32 main() {
+    [*]u8 s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 t = alloc(u8, 4) orelse { return 2; };
+    s[0] = 7;
+    t[0] = 9;
+    [*]u8 h = pick(s, t, true);
+    u32 r = h[0];
+    free(s);
+    free(t);
+    if (r != 9) { return 3; }
+    return 0;
+}

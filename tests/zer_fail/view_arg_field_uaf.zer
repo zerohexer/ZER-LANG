@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-845: the callee returns a VIEW of its slice param. The call passes the
+// slice through a struct FIELD, not a bare ident, so the pre-fix call-site
+// aliasing (which tested `arg->kind == NODE_IDENT`) registered the result as a
+// FRESH allocation instead of an alias — `free(b.s); h[0]` compiled clean and
+// was ASan-confirmed heap-use-after-free. `head(s)` one line away was rejected.
+[*]u8 head([*]u8 s) { return s[0..2]; }
+struct Box { [*]u8 s; }
+u32 main() {
+    Box b;
+    b.s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 h = head(b.s);
+    free(b.s);
+    return h[0];
+}

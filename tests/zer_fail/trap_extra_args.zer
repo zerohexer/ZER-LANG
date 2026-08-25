@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: @trap takes no arguments
+// BUG-882: `@trap(1, 2, 3)` was accepted and the arguments SILENTLY DROPPED —
+// the emitter calls `_zer_trap("trap", ...)` with a fixed message, so a reader's
+// reasonable belief that the arguments reach the trap output is wrong. Same
+// shape as BUG-871's `@barrier(x)`; its immediate neighbour @unreachable has had
+// this check all along. Found by sweeping every intrinsic with an absurd
+// argument count — @trap was the only one left.
+u32 main() {
+    @trap(1, 2, 3);
+    return 0;
+}

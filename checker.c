@@ -11315,6 +11315,18 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = type_optional(c->arena, ty_u64);
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
+            /* BUG-882: `@trap(1, 2, 3)` was accepted and the arguments SILENTLY
+             * DROPPED — the emitter calls `_zer_trap("trap", …)` with a fixed
+             * message. Same shape as BUG-871's `@barrier(x)`: an intrinsic that
+             * takes nothing accepting anything makes a typo look purposeful, and
+             * here the reader's reasonable belief is that the arguments end up
+             * in the trap message. Its immediate neighbour @unreachable has had
+             * this check all along. Found by sweeping every intrinsic with an
+             * absurd argument count; these two were the only ones. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line,
+                    "@trap takes no arguments — the trap message is fixed");
+            }
             result = ty_void;
         } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {
             /* D-Alpha-2: @unreachable() — GCC's __builtin_unreachable hint */

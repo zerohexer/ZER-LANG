@@ -164,6 +164,35 @@ messages show the wrong type name in the third slot. Fix: capture each
 Discovered in BUG-700 (session 2026-06-06); same hazard exists everywhere
 `type_name` is composed in a single expression.
 
+**A RULE THAT COMPILES, SHIPS, AND DOES NOTHING — three forms, all hit 2026-08-25.**
+Each cost a build cycle and each is invisible to `make check`, because a rule that
+never fires breaks no test.
+1. **`TYPE_UINT` is the ARBITRARY-WIDTH `uN` kind, NOT "an unsigned integer".**
+   Plain u32 is `TYPE_U32`. A hand-rolled `kind == TYPE_UINT` gate therefore covers
+   `u21` and misses every ordinary width. Use `type_is_unsigned` (which delegates
+   to the VST-verified `zer_type_kind_is_unsigned`, enumerating all six kinds), and
+   likewise prefer the existing `type_is_*` predicates over kind tests generally.
+2. **A new `Parser`/`Checker` field MUST be initialised in `parser_init` /
+   `checker_init`,** not left to a caller's memset — some callers stack-allocate
+   without zeroing. A garbage `no_array_suffix` suppressed EVERY array suffix, so
+   `u8[256] buf;` stopped parsing as an array. Same shape as the
+   `Checker.target_ptr_bits` trap already recorded below.
+3. **A gate's ORACLE can be vacuous even when the gate runs.** A qualifier probe
+   built on `-Wdiscarded-qualifiers` printed OK against a compiler with the
+   volatile-strip check deliberately removed: ZER's emitter writes an EXPLICIT C
+   cast, which silences that warning by design. `-Wcast-qual` asks the question
+   actually being asked, and found 31 strips on the first honest run. ALWAYS run
+   the vacuity check (break the thing, confirm the gate fires) — for a PROBE that
+   means breaking the compiler, not just the test.
+
+**A HELPER EXTRACTED FROM N COPIES MUST PRESERVE EACH COPY'S SEMANTICS, INCLUDING
+THE ONES THAT DIFFER (2026-08-25).** Consolidating the const/volatile declaration
+fold from three longhand sites, I "improved" the const branch to unwrap `distinct`
+— which DISCARDS a distinct typedef's nominal identity and broke
+`tests/zer/distinct_const_read_ok`. When two copies of a rule differ, that is a
+fact to be understood before it is normalised: here one branch must unwrap and the
+other must not, and the helper now says why at the line.
+
 **STALE `src/safety/*.o` — the #1 phantom-bug trap (cost a full session 2026-06-19).**
 If a `make zerc`-built compiler spuriously rejects TRIVIAL valid programs
 (e.g. `error: expression nesting too deep` on `u32 main(){u32 x=5;return x;}`)
@@ -389,6 +418,9 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **Call-RESULT view ("which allocation does this call result view?")** | IR_CALL alias application, passthrough-ASSIGN mirror, the return-summary inference, the summary's ARITY | ONE query `ir_view_arg_handle` + `returns_param_mask`/`returns_all_views`; the use site PULLS viewed state (18 direct FREED stores make a push design unreachable). **`p18` axis in `tools/sink_matrix.sh`** |
+| **Value flow ("may this value reach this destination?")** | designated-init field, assignment, call arg, orelse fallback, var-decl, return, spawn arg, global init | ONE query `value_flows_to` — the three-condition chain was written out EIGHT times, which is exactly why the negative-constant rule had nowhere to live. Each sink keeps its own wording |
+| **Intrinsic pointer-arg qualifiers ("does this intrinsic write through a const buffer?")** | ~12 pointer-taking CPU/cache intrinsics, each validating only "pointer or array?" | `check_intrinsic_writes_const` at the WRITING members + **`tools/qualifier_closure_probe.sh`** (GCC's `-Wcast-qual` as the oracle, intrinsic list read FROM the checker, benign strips baselined) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -952,7 +984,10 @@ struct Ops { *(u32) -> u32 compute; }     // struct field
 u32 apply(*(u32, u32) -> u32 op, x, y);  // parameter
 ?*(u32) -> u32 on_event = null;           // nullable funcptr
 *(u32) -> ?u32 lookup;                    // funcptr returning optional
-*(u32, u32) -> u32 [4] ops;               // array — INLINE, no typedef!
+?*(u32, u32) -> u32 [4] ops;              // array — INLINE, no typedef!
+                                          // (nullable element: auto-zero fills
+                                          //  it with NULL and ZER has no array
+                                          //  initializer, so unwrap per element)
 *(u32, u32) -> u32 select_op(u32 kind);   // return type — INLINE, no typedef!
 *(keep *Handler) register_fn;              // keep on individual params
 ```
@@ -1155,7 +1190,11 @@ Uses zercheck's existing HS_TRANSFERRED state — zero new infrastructure.
 ### Hardware Support
 ```
 volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);  // MMIO register
-u32 bits = reg[9..8];                               // bit extraction
+u32 bits = reg[9..8];                               // bit extraction (works
+                                                    // THROUGH the pointer —
+                                                    // BUG-881; reads, writes and
+                                                    // reg[5..5] all lower to a
+                                                    // deref + mask)
 interrupt USART1 { handle_rx(); }                    // interrupt handler
 packed struct Packet { u8 id; u16 val; u8 crc; }    // unaligned struct
 ```

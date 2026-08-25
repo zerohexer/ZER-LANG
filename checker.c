@@ -104,6 +104,205 @@ static bool type_carries_handle(Type *t, int depth) {
     return false;
 }
 
+/* BUG-868: does a field DECLARED with this syntax keep its storage INLINE in
+ * the enclosing struct — so a containment edge through it counts toward an
+ * infinite size — or does it hold a reference, making the edge finite?
+ *
+ * A no-`default:` switch rather than an if-chain on purpose: this is the
+ * question the whole cycle guard turns on, every kind deserves an explicit
+ * answer, and `-Werror=switch` then makes a new TypeNodeKind a build failure
+ * instead of a silent default. (It also keeps the type-dispatch audit quiet,
+ * which greps for `->kind ==` comparisons and cannot tell a considered
+ * syntactic peel from the GAP-F distinct-unwrap bug class.)
+ *
+ * Erring toward INLINE is the safe direction here: a mis-classified indirect
+ * edge can only over-reject a cycle, whereas a mis-classified inline edge
+ * restores the compiler crash this guard exists to prevent. */
+static bool tynode_keeps_storage_inline(TypeNode *t, int depth) {
+    if (!t || depth > 32) return false;
+    switch (t->kind) {
+    /* Wrappers that keep the element inline — peel and re-ask. */
+    case TYNODE_ARRAY:    return tynode_keeps_storage_inline(t->array.elem, depth + 1);
+    case TYNODE_CONST:
+    case TYNODE_VOLATILE: return tynode_keeps_storage_inline(t->qualified.inner, depth + 1);
+    /* Inline storage of a user type — the edges that can close a size cycle. */
+    case TYNODE_CONTAINER:
+    case TYNODE_NAMED:    return true;
+    /* References: the pointee lives elsewhere, so the size is finite. */
+    case TYNODE_POINTER: case TYNODE_OPTIONAL: case TYNODE_SLICE:
+    case TYNODE_FUNC_PTR:
+        return false;
+    /* Builtins hold their own storage but can never BE a container stamp, so
+     * they cannot close a cycle back onto one. */
+    case TYNODE_POOL: case TYNODE_RING: case TYNODE_ARENA: case TYNODE_BARRIER:
+    case TYNODE_HANDLE: case TYNODE_SLAB: case TYNODE_SEMAPHORE:
+        return false;
+    /* Primitives — likewise. */
+    case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
+    case TYNODE_I8: case TYNODE_I16: case TYNODE_I32: case TYNODE_I64:
+    case TYNODE_USIZE: case TYNODE_F32: case TYNODE_F64:
+    case TYNODE_BOOL: case TYNODE_VOID: case TYNODE_OPAQUE:
+        return false;
+    }
+    return false;
+}
+
+/* ---------------------------------------------------------------------------
+ * BUG-869: is any NODE anywhere in a global initializer a form that cannot
+ * lower to a compile-time constant?
+ *
+ * The three guards this replaces were all TOP-LEVEL kind tests on the
+ * initializer root — `ginit->kind == NODE_CALL`, and two on
+ * `ginit->kind == NODE_INTRINSIC`. So ONE wrapper defeated all three:
+ *
+ *     u32 G = @cpu_model_id() + 1;    // binary  -> accepted
+ *     u32 G = (u32)f();               // cast    -> accepted
+ *     u32 G = -f();                   // unary   -> accepted
+ *     u32 G = @popcount(f());         // nested  -> accepted
+ *
+ * and the failure landed on GCC, naming a line in a generated .c the user never
+ * opened. This is the exact sibling of BUG-842, which split the `arg_count`
+ * precondition out of these checks but left the top-level-kind SHAPE — same
+ * rule, second axis.
+ *
+ * The verdict logic is unchanged; what changes is that it is asked at EVERY
+ * node instead of only the root. The recursion uses a no-`default:` switch so
+ * `-Werror=switch` makes a new NodeKind a build failure rather than a silent
+ * coverage gap (the walker discipline in CLAUDE.md).
+ * ------------------------------------------------------------------------- */
+
+/* Verdict for ONE node. Returns a reason string, or NULL if this node is fine.
+ * `type` is the DECLARED type of the global, needed only for the non-native
+ * uN/iN @truncate case. */
+static const char *global_init_node_reason(Node *n, Type *type) {
+    if (!n) return NULL;
+    if (n->kind == NODE_CALL && !n->call.is_comptime_resolved)
+        return "cannot call functions at global scope";
+    if (n->kind != NODE_INTRINSIC) return NULL;
+
+    const char *gn = n->intrinsic.name;
+    uint32_t gl = (uint32_t)n->intrinsic.name_len;
+
+    /* Bit-query / byte-swap: constant-foldable only with a foldable argument.
+     * NODE_FIELD is skipped to avoid over-rejecting an enum constant (State.x),
+     * which IS a C constant but which eval_const_expr cannot see. */
+    if (n->intrinsic.arg_count >= 1 && n->intrinsic.args[0] &&
+        n->intrinsic.args[0]->kind != NODE_FIELD) {
+        int is_bitq =
+            (gl == 8 && memcmp(gn, "popcount", 8) == 0) ||
+            (gl == 3 && memcmp(gn, "ctz", 3) == 0) ||
+            (gl == 3 && memcmp(gn, "clz", 3) == 0) ||
+            (gl == 3 && memcmp(gn, "ffs", 3) == 0) ||
+            (gl == 6 && memcmp(gn, "parity", 6) == 0) ||
+            (gl == 7 && (memcmp(gn, "bswap16", 7) == 0 ||
+                         memcmp(gn, "bswap32", 7) == 0 ||
+                         memcmp(gn, "bswap64", 7) == 0));
+        if (is_bitq && eval_const_expr(n->intrinsic.args[0]) == CONST_EVAL_FAIL)
+            return "requires a constant argument at global scope";
+    }
+
+    /* Forms that can NEVER appear in a file-scope initializer, whatever their
+     * arguments: they lower to a ({...}) statement-expression or a runtime call.
+     * @truncate folds to a constant `(T)val` cast for a NATIVE width only. */
+    bool tgt_nonnative_intn = false;
+    {
+        TypeKind tk = type_dispatch_kind(type); /* unwraps distinct, NULL-safe */
+        if (tk == TYPE_UINT || tk == TYPE_SINT) {
+            uint32_t nb = type_unwrap_distinct(type)->intn.bits;
+            tgt_nonnative_intn = !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
+        }
+    }
+    bool is_atomic = (gl >= 7 && memcmp(gn, "atomic_", 7) == 0);
+    bool is_runtime_read =
+        (gl == 6 && memcmp(gn, "expect", 6) == 0) ||
+        (gl >= 8 && memcmp(gn, "port_in", 7) == 0) ||
+        (gl >= 4 && memcmp(gn, "cpu_", 4) == 0) ||
+        (gl >= 4 && memcmp(gn, "mmu_", 4) == 0) ||
+        (gl >= 4 && memcmp(gn, "tlb_", 4) == 0) ||
+        (gl >= 6 && memcmp(gn, "cache_", 6) == 0) ||
+        (gl == 5 && memcmp(gn, "probe", 5) == 0);
+    if (is_atomic || is_runtime_read ||
+        (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
+        (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
+        (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||
+        (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
+                     memcmp(gn, "subb", 4) == 0 ||
+                     memcmp(gn, "mulw", 4) == 0)))
+        return "does not lower to a compile-time-constant value at global scope";
+    return NULL;
+}
+
+/* Walk the whole initializer tree; report the FIRST offending node. `*bad` is
+ * set to that node so the caller can name the construct. */
+static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) {
+    if (!n || depth > 128) return NULL;
+    const char *r = global_init_node_reason(n, type);
+    if (r) { *bad = n; return r; }
+    #define GI(x) do { const char *_r = global_init_scan((x), type, depth+1, bad); \
+                       if (_r) return _r; } while (0)
+    switch (n->kind) {
+    case NODE_BINARY: GI(n->binary.left); GI(n->binary.right); break;
+    case NODE_UNARY: GI(n->unary.operand); break;
+    case NODE_TYPECAST: GI(n->typecast.expr); break;
+    case NODE_ORELSE: GI(n->orelse.expr); GI(n->orelse.fallback); break;
+    case NODE_INDEX: GI(n->index_expr.object); GI(n->index_expr.index); break;
+    case NODE_SLICE: GI(n->slice.object); GI(n->slice.start); GI(n->slice.end); break;
+    case NODE_FIELD: GI(n->field.object); break;
+    case NODE_CALL:
+        GI(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) GI(n->call.args[i]);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) GI(n->intrinsic.args[i]);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            GI(n->struct_init.fields[i].value);
+        break;
+    case NODE_ASSIGN: GI(n->assign.target); GI(n->assign.value); break;
+    /* A global initializer is an EXPRESSION, so no statement kind can occur
+     * below here. They are still descended rather than listed as no-op leaves:
+     * the walker-field audit's rule is that an arm naming a kind must visit its
+     * children, and honouring it costs nothing while keeping the walk TOTAL if
+     * the AST ever changes shape. Mirrors zbi_scan_children. */
+    case NODE_FILE: for (int i=0;i<n->file.decl_count;i++) GI(n->file.decls[i]); break;
+    case NODE_FUNC_DECL: GI(n->func_decl.body); break;
+    case NODE_INTERRUPT: GI(n->interrupt.body); break;
+    case NODE_BLOCK: for (int i=0;i<n->block.stmt_count;i++) GI(n->block.stmts[i]); break;
+    case NODE_IF: GI(n->if_stmt.cond); GI(n->if_stmt.then_body); GI(n->if_stmt.else_body); break;
+    case NODE_FOR: GI(n->for_stmt.init); GI(n->for_stmt.cond); GI(n->for_stmt.step);
+        GI(n->for_stmt.body); break;
+    case NODE_WHILE: case NODE_DO_WHILE: GI(n->while_stmt.cond); GI(n->while_stmt.body); break;
+    case NODE_SWITCH: GI(n->switch_stmt.expr);
+        for (int i=0;i<n->switch_stmt.arm_count;i++) GI(n->switch_stmt.arms[i].body); break;
+    case NODE_GLOBAL_VAR: case NODE_VAR_DECL: GI(n->var_decl.init); break;
+    case NODE_RETURN: GI(n->ret.expr); break;
+    case NODE_DEFER: GI(n->defer.body); break;
+    case NODE_CRITICAL: GI(n->critical.body); break;
+    case NODE_ONCE: GI(n->once.body); break;
+    case NODE_AWAIT: GI(n->await_stmt.cond); break;
+    case NODE_STATIC_ASSERT: GI(n->static_assert_stmt.cond); break;
+    case NODE_SPAWN: for (int i=0;i<n->spawn_stmt.arg_count;i++) GI(n->spawn_stmt.args[i]); break;
+    case NODE_EXPR_STMT: GI(n->expr_stmt.expr); break;
+    /* exhaustive (no default:) — genuine leaves. A NEW NodeKind fails the build
+     * under -Werror=switch, which is the point. */
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO:
+    case NODE_ASM:
+        for (int i=0;i<n->asm_stmt.input_count;i++) GI(n->asm_stmt.inputs[i].expr);
+        for (int i=0;i<n->asm_stmt.output_count;i++) GI(n->asm_stmt.outputs[i].expr);
+        break;
+    case NODE_CONTAINER_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    }
+    #undef GI
+    return NULL;
+}
+
 /* "Does an uninitialised declaration of this type auto-zero into a NULL that
  * the type promises cannot be null?"
  *
@@ -3961,6 +4160,26 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         ci->concrete_type = concrete;
         ci->stamped_struct = st;
 
+        /* BUG-868: push this stamp while its fields resolve, so a field that
+         * closes a cycle back onto ANY enclosing stamp is caught — not just one
+         * that names this frame's own. */
+        if (c->inprogress_stamp_count >= c->inprogress_stamp_capacity) {
+            int nc = c->inprogress_stamp_capacity < 8 ? 8 : c->inprogress_stamp_capacity * 2;
+            Type **na = (Type **)arena_alloc(c->arena, nc * sizeof(Type *));
+            bool *nb = (bool *)arena_alloc(c->arena, nc * sizeof(bool));
+            if (c->inprogress_stamps && c->inprogress_stamp_count > 0) {
+                memcpy(na, c->inprogress_stamps,
+                       c->inprogress_stamp_count * sizeof(Type *));
+                memcpy(nb, c->inprogress_edge_byvalue,
+                       c->inprogress_stamp_count * sizeof(bool));
+            }
+            c->inprogress_stamps = na;
+            c->inprogress_edge_byvalue = nb;
+            c->inprogress_stamp_capacity = nc;
+        }
+        c->inprogress_edge_byvalue[c->inprogress_stamp_count] = c->pending_edge_byvalue;
+        c->inprogress_stamps[c->inprogress_stamp_count++] = st;
+
         /* Resolve fields with T substituted */
         if (tmpl->field_count > 0) {
             st->struct_type.fields = (SField *)arena_alloc(c->arena,
@@ -3975,8 +4194,10 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 /* Substitute type param T at any depth in the TypeNode tree.
                  * Recursive clone: replaces TYNODE_NAMED matching T with concrete type's TypeNode.
                  * Handles: T, *T, ?T, []T, T[N], ?*Container(T), etc. */
+                c->pending_edge_byvalue = tynode_keeps_storage_inline(fd->type, 0);
                 sf->type = resolve_type(c, subst_typenode(c->arena, fd->type,
                     tmpl->type_param, tmpl->type_param_len, tn->container.type_arg));
+                c->pending_edge_byvalue = false;
                 /* J4: by-value self-containment guard (mirrors the
                  * NODE_STRUCT_DECL check). Now that the knot is tied, a field
                  * that IS the in-progress stamp by value — bare, or wrapped only
@@ -3995,12 +4216,42 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                             (int)cnlen, cname, ctype_name,
                             (int)sf->name_len, sf->name,
                             (int)cnlen, cname, ctype_name);
+                    } else if (inner) {
+                        /* BUG-868: the MUTUAL case. `inner` is not this frame's
+                         * stamp but an ENCLOSING one, so the by-value chain
+                         * closes a cycle and the size is infinite. Reported
+                         * against the field that closes it, which is the one the
+                         * user can act on. */
+                        for (int si = 0; si < c->inprogress_stamp_count - 1; si++) {
+                            if (c->inprogress_stamps[si] != inner) continue;
+                            /* Infinite only if EVERY edge around the loop is
+                             * by-value. One pointer anywhere on the path makes
+                             * the size finite, and rejecting that would trade a
+                             * crash for an over-rejection. */
+                            bool all_byvalue = true;
+                            for (int ei = si + 1; ei < c->inprogress_stamp_count; ei++)
+                                if (!c->inprogress_edge_byvalue[ei]) all_byvalue = false;
+                            if (!all_byvalue) continue;
+                            Type *outer = c->inprogress_stamps[si];
+                            char on[96];
+                            snprintf(on, sizeof(on), "%.*s",
+                                     (int)outer->struct_type.name_len,
+                                     outer->struct_type.name);
+                            checker_error(c, tn->loc.line,
+                                "container '%.*s(%s)' field '%.*s' closes a containment "
+                                "cycle back to '%s' — each holds the other by value, so "
+                                "the size is infinite. Make one side a pointer",
+                                (int)cnlen, cname, ctype_name,
+                                (int)sf->name_len, sf->name, on);
+                            break;
+                        }
                     }
                 }
             }
         } else {
             st->struct_type.fields = NULL;
         }
+        if (c->inprogress_stamp_count > 0) c->inprogress_stamp_count--;
 
         _container_depth--;
         return st;
@@ -9815,11 +10066,41 @@ static Type *check_expr(Checker *c, Node *node) {
                         field_len = (uint32_t)node->intrinsic.args[1]->ident.name_len;
                     }
                 }
-                if (struct_type && struct_type->kind == TYPE_STRUCT && field_name) {
+                /* BUG-870: this whole check used to sit inside
+                 *   if (struct_type && it was a struct && field_name)
+                 * and did NOTHING when the guard failed — so a non-struct target,
+                 * a union target, and a non-ident field argument were all accepted
+                 * in silence, and its raw struct type-kind comparison also missed a
+                 * `distinct typedef` of a struct (the distinct-unwrap class this
+                 * codebase has a CI gate for). A guard that silently means "give
+                 * up" is the accept-by-default shape; every failure mode now says
+                 * what is wrong. */
+                Type *seff = struct_type ? type_unwrap_distinct(struct_type) : NULL;
+                TypeKind sk = struct_type ? type_dispatch_kind(struct_type) : TYPE_VOID;
+                if (node->intrinsic.arg_count < 1) {
+                    checker_error(c, node->loc.line,
+                        "@offset takes a type and a field name: '@offset(T, field)'");
+                } else if (!struct_type) {
+                    checker_error(c, node->loc.line,
+                        "@offset: first argument must name a struct type");
+                } else if (sk == TYPE_UNION) {
+                    checker_error(c, node->loc.line,
+                        "@offset: '%s' is a union — ZER unions are TAGGED, so a variant "
+                        "has no fixed offset. Use @offset on the struct that contains it",
+                        type_name(struct_type));
+                } else if (sk != TYPE_STRUCT) {
+                    checker_error(c, node->loc.line,
+                        "@offset: '%s' is not a struct — there is no field to take an "
+                        "offset of", type_name(struct_type));
+                } else if (!field_name) {
+                    checker_error(c, node->loc.line,
+                        "@offset: the second argument must be a plain field NAME, "
+                        "not an expression");
+                } else {
                     bool found = false;
-                    for (uint32_t fi = 0; fi < struct_type->struct_type.field_count; fi++) {
-                        if (struct_type->struct_type.fields[fi].name_len == field_len &&
-                            memcmp(struct_type->struct_type.fields[fi].name, field_name, field_len) == 0) {
+                    for (uint32_t fi = 0; fi < seff->struct_type.field_count; fi++) {
+                        if (seff->struct_type.fields[fi].name_len == field_len &&
+                            memcmp(seff->struct_type.fields[fi].name, field_name, field_len) == 0) {
                             found = true;
                             break;
                         }
@@ -9827,7 +10108,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!found) {
                         checker_error(c, node->loc.line,
                             "@offset: struct '%.*s' has no field '%.*s'",
-                            (int)struct_type->struct_type.name_len, struct_type->struct_type.name,
+                            (int)seff->struct_type.name_len, seff->struct_type.name,
                             (int)field_len, field_name);
                     }
                 }
@@ -10394,6 +10675,14 @@ static Type *check_expr(Checker *c, Node *node) {
                    (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) ||
                    (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0)) {
             /* D-Alpha-2/7: fences. barrier_dma is DMA-coherence barrier for driver code. */
+            /* BUG-871: the fence family took no arguments but ACCEPTED and
+             * silently dropped any that were passed, so a typo'd `@barrier(x)`
+             * looked like it did something with x. The 0-arg family immediately
+             * below has had this check all along — two neighbours answering the
+             * same question, one of them not. Same wording so they stay in step. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line, "@%.*s takes no arguments", (int)nlen, name);
+            }
             result = ty_void;
         } else if ((nlen == 9 && memcmp(name, "cpu_pause", 9) == 0) ||
                    (nlen == 7 && memcmp(name, "cpu_wfe", 7) == 0) ||
@@ -21053,132 +21342,28 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
             Type *type = resolve_type(c, decl->var_decl.type);
             Type *init = check_expr(c, decl->var_decl.init);
-            /* global initializers must be constant expressions in C */
+            /* BUG-869: the three guards this replaces were TOP-LEVEL kind
+             * tests on the initializer root, so one wrapper (`+ 1`, a cast, a
+             * unary minus, being an intrinsic ARGUMENT) defeated all of them and
+             * the failure landed on GCC, naming a line in a generated .c the
+             * user never opened. Same verdict logic, asked at EVERY node. */
             Node *ginit = decl->var_decl.init;
-            if (ginit->kind == NODE_CALL && !ginit->call.is_comptime_resolved) {
-                checker_error(c, decl->loc.line,
-                    "global variable '%.*s' initializer must be a constant expression — "
-                    "cannot call functions at global scope",
-                    (int)decl->var_decl.name_len, decl->var_decl.name);
-            }
-            /* plt86m audit (x9-11 completeness): bit-query / byte-swap
-             * intrinsics emit __builtin_*(arg) directly, so a NON-constant arg
-             * makes GCC reject the global init with the cryptic "initializer
-             * element is not constant". Catch it here with a clean ZER error.
-             * eval_const_expr (non-scoped) matches GCC's notion of a foldable
-             * arg: literals/arith fold; a plain ident (variable OR const, which
-             * ZER emits as a real C `const` var) does not. NODE_FIELD is skipped
-             * to avoid over-rejecting an enum constant (State.x) which IS a C
-             * constant but which eval_const_expr can't see (checker.c:2768). */
-            if (ginit->kind == NODE_INTRINSIC && ginit->intrinsic.arg_count >= 1 &&
-                ginit->intrinsic.args[0] &&
-                ginit->intrinsic.args[0]->kind != NODE_FIELD) {
-                const char *gn = ginit->intrinsic.name;
-                uint32_t gl = (uint32_t)ginit->intrinsic.name_len;
-                int is_bitq =
-                    (gl == 8 && memcmp(gn, "popcount", 8) == 0) ||
-                    (gl == 3 && memcmp(gn, "ctz", 3) == 0) ||
-                    (gl == 3 && memcmp(gn, "clz", 3) == 0) ||
-                    (gl == 3 && memcmp(gn, "ffs", 3) == 0) ||
-                    (gl == 6 && memcmp(gn, "parity", 6) == 0) ||
-                    (gl == 7 && (memcmp(gn, "bswap16", 7) == 0 ||
-                                 memcmp(gn, "bswap32", 7) == 0 ||
-                                 memcmp(gn, "bswap64", 7) == 0));
-                if (is_bitq &&
-                    eval_const_expr(ginit->intrinsic.args[0]) == CONST_EVAL_FAIL) {
-                    checker_error(c, decl->loc.line,
-                        "global variable '%.*s' initializer must be a compile-time "
-                        "constant — @%.*s requires a constant argument at global scope",
-                        (int)decl->var_decl.name_len, decl->var_decl.name,
-                        (int)gl, gn);
-                }
-            }
-            /* BUG-842: the name-based "does not lower to a constant" check below used
-             * to live INSIDE the block above, inheriting `arg_count >= 1` — a
-             * precondition that belongs to the BIT-QUERY check, which inspects
-             * args[0] and has nothing to do with this one. So EVERY ZERO-ARG
-             * INTRINSIC skipped the guard entirely:
-             *
-             *     const u32 G = @cpu_model_id();   // checker exits 0; only GCC stops it
-             *
-             * `zerc f.zer -o out.c` reported SUCCESS for a program that cannot be
-             * compiled. G7 (2026-08-01) added names to this list and recorded the
-             * rationale that the CHECKER should be the one to reject, so the message
-             * names the ZER line — but adding names without splitting the condition
-             * changes nothing for a zero-arg intrinsic, which is exactly the trap. */
-            if (ginit->kind == NODE_INTRINSIC) {
-                const char *gn = ginit->intrinsic.name;
-                uint32_t gl = (uint32_t)ginit->intrinsic.name_len;
-                /* G7 (2026-08-01): these can NEVER appear in a file-scope
-                 * initializer, even with CONSTANT args — so unlike the bit-query
-                 * gate above there is no eval_const_expr condition. @saturate
-                 * lowers to a ({...}) statement-expression (illegal at file
-                 * scope); @addc/@subb/@mulw lower to a runtime _zer_do_*() call
-                 * ("initializer element is not constant").
-                 *
-                 * Verified on main: the CHECKER emitted ZERO diagnostics — the
-                 * program was only stopped by GCC, with a cryptic error naming
-                 * the generated .c file. Same shape as the §D3 spawn hole: an
-                 * accident of the C backend masking a silent checker. Reject
-                 * cleanly here so the message names the ZER line and the fix.
-                 *
-                 * @bitcast ALWAYS lowers to a ({ ... memcpy ... }) statement-
-                 * expression (never a constant cast), so it can never be a
-                 * file-scope initializer. @truncate folds to a constant `(T)val`
-                 * cast ONLY for a NATIVE-width T; to a NON-NATIVE uN/iN it emits a
-                 * masking ({ ... }) statement-expr. Both were wrongly excluded — the
-                 * prior comment claimed they "fold to a constant cast", which is
-                 * false — so the checker accepted them and GCC then rejected the
-                 * emitted .c with "braced-group within expression allowed only
-                 * inside a function": the same silent-checker / loud-backend shape
-                 * as @saturate. A native-width @truncate global still compiles. */
-                bool tgt_nonnative_intn = false;
-                {
-                    TypeKind tk = type_dispatch_kind(type); /* unwraps distinct, NULL-safe */
-                    if (tk == TYPE_UINT || tk == TYPE_SINT) {
-                        uint32_t nb = type_unwrap_distinct(type)->intn.bits;
-                        tgt_nonnative_intn =
-                            !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
+            {
+                Node *bad = NULL;
+                const char *reason = global_init_scan(ginit, type, 0, &bad);
+                if (reason && bad) {
+                    if (bad->kind == NODE_CALL) {
+                        checker_error(c, decl->loc.line,
+                            "global variable '%.*s' initializer must be a constant "
+                            "expression — %s",
+                            (int)decl->var_decl.name_len, decl->var_decl.name, reason);
+                    } else {
+                        checker_error(c, decl->loc.line,
+                            "global variable '%.*s' initializer cannot use @%.*s — it %s. "
+                            "Use a literal, or compute it in a function body",
+                            (int)decl->var_decl.name_len, decl->var_decl.name,
+                            (int)bad->intrinsic.name_len, bad->intrinsic.name, reason);
                     }
-                }
-                /* Every @atomic_* form. An atomic is a memory operation on a LIVE
-                 * ADDRESS and can never be a compile-time constant, yet it was
-                 * missing from this list — and what the user got depended on how
-                 * many characters the name happened to have. The AST atomic branch
-                 * is gated `nlen >= 10`, so `@atomic_or` (9) missed it and fell to
-                 * the generic marker (loud, and at least named), while
-                 * `@atomic_xchg` and the five _fetch forms entered the branch,
-                 * matched none of its arms, and the arm had no else — emitting the
-                 * EMPTY STRING: `uint32_t gres = ;`. A C syntax error in generated
-                 * code the user never wrote, reported at a line in a file they never
-                 * opened. Both halves of that length axis are closed here. */
-                bool is_atomic = (gl >= 7 && memcmp(gn, "atomic_", 7) == 0);
-                /* Runtime CPU/port reads: constant-foldable NEVER, whatever the
-                 * arity. Measured by probing all recognised intrinsics in a
-                 * global-initializer position and compiling the emitted C. */
-                bool is_runtime_read =
-                    (gl == 6 && memcmp(gn, "expect", 6) == 0) ||
-                    (gl >= 8 && memcmp(gn, "port_in", 7) == 0) ||
-                    (gl >= 4 && memcmp(gn, "cpu_", 4) == 0) ||
-                    (gl >= 4 && memcmp(gn, "mmu_", 4) == 0) ||
-                    (gl >= 4 && memcmp(gn, "tlb_", 4) == 0) ||
-                    (gl >= 6 && memcmp(gn, "cache_", 6) == 0) ||
-                    (gl == 5 && memcmp(gn, "probe", 5) == 0);
-                int is_nonconst_emit =
-                    is_atomic || is_runtime_read ||
-                    (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
-                    (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
-                    (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||
-                    (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
-                                 memcmp(gn, "subb", 4) == 0 ||
-                                 memcmp(gn, "mulw", 4) == 0));
-                if (is_nonconst_emit) {
-                    checker_error(c, decl->loc.line,
-                        "global variable '%.*s' initializer cannot use @%.*s — it "
-                        "does not lower to a compile-time-constant value at global "
-                        "scope. Use a literal, or compute it in a function body",
-                        (int)decl->var_decl.name_len, decl->var_decl.name,
-                        (int)gl, gn);
                 }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */

@@ -1,0 +1,49 @@
+# qualifier_closure_baseline.txt — generated + reviewed. See tools/qualifier_closure_probe.sh.
+#
+# Each line is an intrinsic call form where the emitted C casts away `const` or
+# `volatile`. Being in this file means the strip was LOOKED AT and judged
+# harmless; a NEW line fails the probe.
+#
+# Why every entry below is benign, and how that was established: the emitted C
+# does not DEREFERENCE the stripped pointer. It passes the pointer's VALUE as an
+# `"r"` operand to an `__asm__ __volatile__` block carrying a `"memory"` clobber
+# (verified by reading the emission for @cache_flush_line and @nt_store). The
+# asm's own volatility and clobber already forbid the elision and reordering
+# that `volatile` on the pointee would forbid, so nothing is lost. The dangerous
+# shape — a volatile pointer becoming an ordinary C load or store — is a
+# different question, and check_volatile_strip already rejects it for
+# @ptrcast / @bitcast / @cast.
+#
+# The CONST half is not benign and is NOT baselined: an intrinsic that STORES
+# through a const buffer was BUG-877, and those six entries are gone from this
+# list because the compiler now rejects them. `@wait_on_address(cp, gi)` remains
+# because it READS the address — a const source is correct usage there.
+#
+# If a new line appears, ask the same question in the same order: does the
+# emitted C dereference the stripped pointer, or only hand its value to an asm
+# operand? Only the first is a defect.
+@cache_clean_range(vp, gi)
+@cache_flush_line(u32, vp)
+@cache_flush_line(vp)
+@cache_flush_range(vp, gi)
+@cache_flushopt(u32, vp)
+@cache_flushopt(vp)
+@cache_invalidate_icache(cp, gi)
+@cache_invalidate_icache(vp, gi)
+@cache_invalidate_range(vp, gi)
+@cache_writeback(u32, vp)
+@cache_writeback(vp)
+@cache_zero_line(u32, vp)
+@cache_zero_line(vp)
+@cpu_fxrstor(u32, vp)
+@cpu_fxrstor(vp)
+@cpu_fxsave(u32, vp)
+@cpu_fxsave(vp)
+@cpu_monitor_addr(u32, vp)
+@cpu_monitor_addr(vp)
+@cpu_umonitor(u32, vp)
+@cpu_umonitor(vp)
+@cpu_xrstor(vp, gi)
+@cpu_xsave(vp, gi)
+@nt_store(vp, gi)
+@wait_on_address(cp, gi)

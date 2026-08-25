@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: writes through its buffer argument, which is const
+// BUG-877, sibling: @cpu_fxsave saves 512 bytes of FPU state INTO the buffer.
+// Its arm also serves @cpu_fxrstor and @cpu_umonitor, which READ — only the
+// writing member is checked, so a const buffer stays legal for those.
+u32 main() {
+    const u8[512] buf;
+    @cpu_fxsave(&buf[0]);
+    return 0;
+}

@@ -3283,6 +3283,55 @@ static bool inttoptr_addr_is_volatile_derived(Checker *c, Node *addr) {
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
  * Returns true if violation detected (error emitted). */
+/* BUG-877: does this intrinsic argument name memory the intrinsic will WRITE,
+ * while the program declared that memory `const`?
+ *
+ * Found by tools/qualifier_closure_probe.sh, which feeds a `const *u32` and a
+ * `volatile *u32` into every argument slot of every intrinsic the checker
+ * recognises and uses GCC's `-Wcast-qual` as the oracle. Twelve pointer-taking
+ * CPU/cache intrinsics validated "is it a pointer or an array?" and NOTHING
+ * about qualifiers — twelve copies of one shape, each missing the same check.
+ * `@cstr` has had exactly this rule since BUG-238; nothing else did.
+ *
+ * The subset fixed here is the unambiguous one: an intrinsic that STORES
+ * through the pointer. `@nt_store` is literally a store; `@cpu_fxsave` /
+ * `@cpu_xsave` / `@cpu_save_context` / `@cpu_save_fpu` write processor state
+ * INTO the buffer; `@cache_zero_line` zeroes a cache line. A const global can
+ * live in `.rodata` — or, on bare metal, in FLASH, where the write neither
+ * faults nor takes effect, which is the silent case.
+ *
+ * The reading members of the same family (`@cpu_fxrstor`, `@cpu_xrstor`,
+ * `@cache_flush_*`, `@cpu_monitor_addr`, `@wait_on_address`) are deliberately
+ * NOT covered: they consume the address, so a const source is correct usage and
+ * rejecting it would be an over-rejection.
+ *
+ * The VOLATILE half the probe also reports is recorded in docs/limitations.md
+ * rather than fixed here — see that entry for why it is a narrower problem. */
+static void check_intrinsic_writes_const(Checker *c, Node *arg, int line,
+                                         const char *iname, int inlen) {
+    if (!arg) return;
+    Type *t = typemap_get(c, arg);
+    Type *eff = t ? type_unwrap_distinct(t) : NULL;
+    bool is_const = false;
+    if (eff && type_dispatch_kind(eff) == TYPE_POINTER && eff->pointer.is_const)
+        is_const = true;
+    if (eff && type_dispatch_kind(eff) == TYPE_SLICE && eff->slice.is_const)
+        is_const = true;
+    /* A `const u8[N] buf;` declaration carries the qualifier on the SYMBOL, not
+     * on an array type, so the type test alone would miss the array form. */
+    if (!is_const && arg->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope,
+            arg->ident.name, (uint32_t)arg->ident.name_len);
+        if (s && s->is_const) is_const = true;
+    }
+    if (!is_const) return;
+    checker_error(c, line,
+        "@%.*s writes through its buffer argument, which is const — the store "
+        "would target read-only memory (on bare metal, FLASH, where it neither "
+        "faults nor takes effect). Pass a mutable buffer",
+        inlen, iname);
+}
+
 /* BUG-832: the DETECTION half, split out so every sink asks ONE question while
  * keeping its OWN wording. The call-argument, return and spawn-argument sinks
  * hand-rolled a RAW pointer-kind comparison (a direct kind test against
@@ -10862,6 +10911,11 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line, "@%.*s argument must be pointer or array", (int)nlen, name);
                     }
                 }
+                /* BUG-877: of this arm's three, only @cpu_fxsave STORES into the
+                 * buffer; fxrstor and umonitor read it. */
+                if (nlen == 10 && memcmp(name, "cpu_fxsave", 10) == 0)
+                    check_intrinsic_writes_const(c, node->intrinsic.args[0],
+                                                 node->loc.line, name, (int)nlen);
             }
             result = ty_void;
         } else if (nlen == 10 && memcmp(name, "cpu_umwait", 10) == 0) {
@@ -10941,6 +10995,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (vt2 && !type_is_integer(vt2)) {
                     checker_error(c, node->loc.line, "@%.*s mask argument must be integer", (int)nlen, name);
                 }
+                /* BUG-877: @cpu_xsave stores processor state INTO the buffer;
+                 * @cpu_xrstor reads it. */
+                if (nlen == 9 && memcmp(name, "cpu_xsave", 9) == 0)
+                    check_intrinsic_writes_const(c, node->intrinsic.args[0],
+                                                 node->loc.line, name, (int)nlen);
             }
             result = ty_void;
         } else if (nlen == 11 && memcmp(name, "cpu_read_dr", 11) == 0) {
@@ -11005,6 +11064,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (vt2 && !type_is_integer(vt2)) {
                     checker_error(c, node->loc.line, "@nt_store value argument must be integer");
                 }
+                check_intrinsic_writes_const(c, node->intrinsic.args[0],
+                                             node->loc.line, name, (int)nlen);
             }
             result = ty_void;
         } else if (nlen == 12 && memcmp(name, "cpu_read_pmc", 12) == 0) {
@@ -11202,6 +11263,11 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line, "@%.*s argument must be pointer or array", (int)nlen, name);
                     }
                 }
+                /* BUG-877: @cache_zero_line WRITES (it zeroes the line);
+                 * @cache_flush_line only consumes the address. */
+                if (nlen == 15 && memcmp(name, "cache_zero_line", 15) == 0)
+                    check_intrinsic_writes_const(c, node->intrinsic.args[0],
+                                                 node->loc.line, name, (int)nlen);
             }
             result = ty_void;
         } else if ((nlen == 10 && memcmp(name, "cpu_rdrand", 10) == 0) ||
@@ -11279,6 +11345,12 @@ static Type *check_expr(Checker *c, Node *node) {
             if (node->intrinsic.arg_count != 1) {
                 checker_error(c, node->loc.line, "@%.*s requires 1 argument (buffer pointer)", (int)nlen, name);
             } else {
+                /* BUG-877: the two SAVE forms store processor state into the
+                 * buffer; the two RESTORE forms read it back out. */
+                if ((nlen == 16 && memcmp(name, "cpu_save_context", 16) == 0) ||
+                    (nlen == 12 && memcmp(name, "cpu_save_fpu", 12) == 0))
+                    check_intrinsic_writes_const(c, node->intrinsic.args[0],
+                                                 node->loc.line, name, (int)nlen);
                 Type *vt = typemap_get(c, node->intrinsic.args[0]);
                 if (vt) {
                     Type *eff = type_unwrap_distinct(vt);

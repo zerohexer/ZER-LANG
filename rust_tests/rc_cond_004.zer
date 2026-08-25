@@ -11,9 +11,23 @@ shared struct Queue {
 
 Queue gq;
 
-void enqueue(*Queue q, u32 val) {
-    q.items[q.tail] = val;
-    q.tail = (q.tail + 1) % 8;
+// NOTE (2026-08-25): this used to claim a slot with
+//
+//     q.items[q.tail] = val;
+//     q.tail = (q.tail + 1) % 8;
+//
+// which is a race IN THE TEST, and it made this file fail roughly 1 run in 8.
+// ZER's auto-locking is PER-STATEMENT, so those are two separate lock scopes:
+// two threads can both read `q.tail == 0`, both write `items[0]`, and both then
+// advance the tail — one value lost, `sum != 60`. The function body is not
+// atomic just because every statement in it is.
+//
+// The test's SUBJECT is @cond_wait re-checking its predicate, not slot
+// allocation, so each caller is given its own index and the contention is gone.
+// `q.count += 1` stays as it is: a compound assignment is ONE statement, hence
+// one lock scope, hence genuinely atomic.
+void enqueue(*Queue q, u32 idx, u32 val) {
+    q.items[idx] = val;
     q.count += 1;
     @cond_signal(q);
 }
@@ -23,9 +37,9 @@ u32 main() {
     gq.tail = 0;
     gq.count = 0;
 
-    ThreadHandle t1 = spawn enqueue(&gq, 10);
-    ThreadHandle t2 = spawn enqueue(&gq, 20);
-    ThreadHandle t3 = spawn enqueue(&gq, 30);
+    ThreadHandle t1 = spawn enqueue(&gq, 0, 10);
+    ThreadHandle t2 = spawn enqueue(&gq, 1, 20);
+    ThreadHandle t3 = spawn enqueue(&gq, 2, 30);
 
     // Wait until three items are available
     @cond_wait(gq, gq.count >= 3);

@@ -5,7 +5,24 @@ Entries removed once fixed.
 
 ---
 
-## SUPERSEDED by harvest-2 H14 — `&&` / `||` narrowing (the "PRECISION only" call was WRONG)
+## CLOSED (2026-08-25, BUG-874) — `&&` / `||` RHS no longer hard-rejects a provable index
+
+`if (i < 4 && a[i] > 0)` — the canonical guarded-access idiom, and the exact
+shape the auto-guard warning tells users to write — compiles again. The ALWAYS-
+OUT-OF-BOUNDS verdict is suppressed in short-circuit RHS position at all three
+sites that raise it (ident, call-return range, MMIO), so the access falls through
+to the runtime auto-guard exactly as an unprovable one does. **No runtime check
+is removed**, and `tests/zer_fail/shortcircuit_guard_after_access.zer` pins the
+boundary: with the access on the LEFT it runs unconditionally and still hard-
+rejects.
+
+What remains is PRECISION, not safety, and is the entry's original subject: VRP
+still does not narrow from a short-circuit LHS into its RHS, so the index is not
+PROVEN and carries a guard rather than eliding it. `87xihb`'s BUG-800 carries an
+implementation (`vrp_narrow_from_cond`). Writing the nested-`if` spelling gets
+the check elided today.
+
+### (history) SUPERSEDED by harvest-2 H14 — the "PRECISION only" call was WRONG
 
 **Corrected 2026-08-25.** See the harvest-2 tracker above: with a PROVABLE index the
 `&&` spelling is HARD-REJECTED while the nested-if spelling of the same program compiles.
@@ -32,7 +49,84 @@ condition EXPRESSION.
 
 ---
 
-## OPEN — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
+## DONE (2026-08-25) — harvest tracker 2 IMPLEMENTED: 43 accepted negatives -> 6, and none of the 6 is a hole
+
+**Status: the catalog below is now a CHANGELOG.** Shipped as BUG-857..881; see
+BUGS-FIXED.md "Session 2026-08-25" for the per-bug detail. Measured before and
+after by running all three branches' tests against a clean build and reading the
+DIAGNOSTIC, not the exit code.
+
+| | before | after |
+|---|---|---|
+| negatives ACCEPTED (holes) | 43 | 6 |
+| positives REJECTED (over-rejections) | 16 | 8 |
+
+**None of the remaining 6 is a hole**, and saying why matters more than the
+number:
+- The three `cli_*` rows were an artefact of MY measurement harness, which did
+  not pass the `// zerc-flags:` directive. The rules DO fire (verified by hand),
+  they shipped as BUG-855, and the tests are now installed and green in the real
+  runner — which is where the harness bug about `grep -qF` without `--` surfaced.
+- The three `enum_forge_*` rows are resolved by TRACKING rather than rejection.
+  BUG-864 made every route trap at the point of forgery; the branch's tests
+  expect a compile error, which is the wrong shape for this class (reading an
+  enum out of a hardware register is a legitimate firmware idiom, pinned by
+  `tests/zer/bitcast_enum_variant_ok.zer`). Verified: both sibling routes SIGTRAP.
+
+### Still LIVE from the tracker — 8 rejected positives, and what each needs
+
+| Row | Status |
+|---|---|
+| `float_to_int_saturates`, `float_to_int_total` | **The DESIGN DECISION below, unresolved.** Main TRAPS (BUG-845); both branches chose SATURATE. Not a regression — a semantics conflict that needs an owner call. Whichever wins, the loser's tests are updated, not deleted |
+| `arena_internal_link_ok`, `super_freelist_arena` | The arena-internal-store relaxation. Genuinely hard: 29fiao implemented the obvious exemption and it OPENED A HOLE on the first negative, because `Symbol.is_from_arena` is already set on a pointer param by the very store being checked. Needs the lifetime CLASS as a real variable, not a flag |
+| `async_result_retrieval` | A feature gap — retrieving the value of a value-returning `async`. Not a safety issue |
+| `guarded_coverage_through_alias` | Guard-disjointness coverage through an alias — a precision gap in the BUG-847 Level B recovery |
+| `returns_static_optional_and_leak` | Interaction of the static-return summary with the leak check |
+| ~~`bit_extract_through_pointer`~~ | **CLOSED — BUG-881** |
+| ~~`funcptr_array_forms`~~ | **CLOSED — BUG-878/879** |
+
+### NEW gap opened by this session's measurement (not from the tracker)
+
+`tests/zer_gaps/funcptr_array_null_element.zer` — an element of a NON-null
+function-pointer array is NULL until assigned, and calling it is caught by
+nothing. Hosted it faults; **on bare metal with no MMU the jump silently goes
+somewhere**. The scalar sibling is rejected (BUG-866), so this is one question
+answered differently for the array carrier.
+
+**Why the obvious fix is wrong** (it was implemented and reverted): ZER has no
+array initializer syntax, so extending the non-null-requires-an-initializer rule
+through the array does not say "initialize it" — it says "this type is unusable".
+It broke `tests/zer/funcptr_array.zer`, `callback_system.zer` and
+`func_pipeline.zer`, all of which assign EVERY element before any use and are
+correct as written. That is a feature removal traded for a partial safety gain.
+
+**Fix sketch, in preference order:** (1) TRACK, do not ban — emit
+`if (!fp) _zer_trap(...)` before an indirect call through a non-null funcptr the
+compiler cannot prove assigned; costs one predictable branch, GCC elides it where
+it can see the assignment, but it must go at BOTH emitter dispatch paths and
+needs the callee hoisted for single-evaluation, which is why it was not rushed
+into the hottest emission path here. (2) Definite-assignment over array elements
+— precise, much larger. The workaround available today is the nullable element
+type, fully supported and pinned by `tests/zer/funcptr_array_forms.zer`.
+
+### Also measured this session, and left alone with reasons
+
+- **25 volatile "strips" reported by the new `qualifier_closure_probe.sh` are
+  benign** and baselined with the argument: the pointer's VALUE becomes an `"r"`
+  operand of an `__asm__ __volatile__` block with a `"memory"` clobber, and C
+  never dereferences it, so the asm's own volatility already forbids what
+  `volatile` on the pointee would. Established by READING the emission, not
+  assumed. If a new row appears, ask the same question in the same order: does
+  the emitted C dereference the stripped pointer, or only hand its value to an
+  asm operand? Only the first is a defect.
+- **All 22 `tests/zer_gaps/` reproducers are still open** — none was closed
+  incidentally by this session's ~25 fixes, so no gap needed promoting.
+
+---
+
+## SUPERSEDED — the original harvest-2 catalog (kept for the measurements)
+
+### (original catalog) — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
 
 **Status: NOT implemented — a catalog.** Every row verified on a clean build of main
 (`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading

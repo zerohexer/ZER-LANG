@@ -5,6 +5,281 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-25 — BUG-857..881: the harvest-2 catalog, and two new probes
+
+The 2026-08-25 tracker was a CATALOG of 21 rows measured against main and not
+implemented. This session implemented it and then went looking for what it did
+not contain. Measured start: of the three branches' tests run against a clean
+build, **43 negatives were ACCEPTED** and 16 positives rejected. Measured end:
+**6 "holes" remain and none is one** — three are CLI rules that do fire (my
+measurement harness was not passing `// zerc-flags:`; the real runner does, and
+those tests are now installed and green) and three are the enum-forge cases,
+which are resolved by TRACKING rather than rejection and SIGTRAP correctly.
+
+### BUG-857..860 — the call-RESULT view class (four UAF holes, one question)
+
+"Which allocation does a call result view?" is answered independently at four
+places and each answered it wrong for a different shape. Every one is an
+ASan-confirmed heap-use-after-free reachable from safe ZER, and a SLICE result
+makes all four SILENT: a slice is not "pointer-ish", so the lost answer registers
+no allocation and there is no leak diagnostic either.
+
+- **857, argument FORM** — both consumers of `returns_param_color` resolved the
+  aliased argument with a bare `kind == NODE_IDENT` test, so `head(b.s)`,
+  `head(s[0..4])` and a laundered argument registered a FRESH allocation while
+  `head(s)` one line away was correctly rejected. Closed with ONE shared query,
+  `ir_view_arg_handle`, at both the IR_CALL sink and the passthrough-ASSIGN sink.
+- **858, definition LOCALITY** — the inference searched only the RETURN's own
+  block and did not follow the COPY a named binding lowers to, so
+  `[*]u8 v = s[0..2]; return v;` inferred nothing. Its own comment claimed that
+  falls back to over-rejection; it does the opposite.
+- **859, BLOCK TAG** — `is_early_exit` is a leak-COVERAGE tag, not a statement
+  about the returned value, but the return-VALUE summaries skipped such blocks.
+  A two-arm `pick` therefore claimed "views param 0" and aliased the result to
+  the WRONG argument — wrong in both directions.
+- **860, ARITY** — the answer is a SET. One slot collapsed a disjunctive view to
+  "unknown". `returns_param_mask` + `returns_all_views` carry it; the use site
+  PULLS the state of each viewed allocation rather than pushing, because there
+  are 18 direct FREED stores and a push design must reach every one.
+
+Also removed the leak false positive a proven param-view result produced
+(`*u32 p = field_of(&stack_node);` reported a leak that does not exist).
+limitations.md kept it deliberately because it "incidentally catches the
+through-call interior-pointer UAF" — that class is caught properly now.
+**Gate: sink_matrix p18 axis, 78 -> 88 cells.** Verified non-vacuous: all seven
+negatives compiled clean and both boundary positives failed on the pre-fix
+binary, in the same run.
+
+### BUG-861 — a recycled Pool/Slab slot was not zeroed
+
+Against the documented "everything auto-zeroed" guarantee. A fresh page is
+calloc-clean, which is exactly why it stayed silent: it only appears after the
+first free/alloc cycle. The consequence is not stale data — a `?*T` field comes
+back NON-NULL and dangling, so safe ZER can unwrap and dereference it. Invisible
+to ASan, because the reuse is inside ZER-owned storage. Arena already memset its
+allocations, so the divergence was between SIBLINGS. `pool_ptr` and `slot_size`
+were already parameters of `_zer_pool_alloc` with no other use — the zeroing they
+exist for had simply never been written.
+
+### BUG-862 — `@cstr` was a second, unguarded integer-to-pointer door
+
+Every check on it was a NEGATIVE one ("if const, error"; "if a raw pointer,
+error"), so a type matching none of them was accepted BY DEFAULT and the emitter
+cast arg0 straight to `uint8_t*`. `u32 gi = 4096; @cstr(gi, sl);` BUILT and
+memcpy'd through an address taken from an integer — no mmio range, no alignment
+check, no bounds check. That is precisely the conversion the grammar-closure
+claim says cannot be spelled. Replaced with an ALLOW-list plus an arity check;
+measured corpus cost zero.
+
+### BUG-863 — the SIGN half of "no implicit narrowing or sign conversion"
+
+`u32 a = -1;` silently became 4294967295 while `u8 b = -1;` was rejected — and
+the narrow widths rejected only INCIDENTALLY, because `-1` types as u32 and
+u32->u8 is a narrowing mismatch. Eight sinks accepted it, because the
+three-condition compatibility chain was written out EIGHT times and there was no
+single place to add a condition. Now ONE query, `value_flows_to`. The rejection
+carries its own wording because the generic message would print `'u32'` with
+`'u32'`. Corpus cost zero.
+
+**A trap worth recording: `TYPE_UINT` is the ARBITRARY-WIDTH `uN` kind, not "an
+unsigned integer".** Plain u32 is `TYPE_U32`. My first `unsigned_int_destination`
+tested `kind == TYPE_UINT`, so it covered `u21` and missed every ordinary width —
+a rule that compiled, shipped, and did nothing. `type_is_unsigned` (delegating to
+the VST-verified `zer_type_kind_is_unsigned`) enumerates all six.
+
+### BUG-864 — the enum-forge guard reached only some of its doors
+
+BUG-843 resolved that class correctly, by TRACKING (a variant guard that traps at
+the point of forgery, keeping the legitimate read-an-enum-from-a-register idiom
+working), but called the guard from the two `@bitcast` sites only and tested the
+target's TOP-LEVEL kind. So `@truncate(State, 7)` had no check at all, and
+`@bitcast(Box, 7)` where `struct Box { State s; }` walked past it — both forging
+a value outside the variant set, which an exhaustive switch answers by silently
+running its LAST arm. The guard now recurses struct fields, optional payloads and
+array elements, and `@truncate` calls it at BOTH emitter dispatch paths.
+
+**An earlier draft of this fix BANNED the conversions outright and broke
+`tests/zer/bitcast_enum_variant_ok`** — the Ban Decision Framework's point
+exactly, since a tracking system does cover it. Reverted and done by tracking.
+
+### BUG-865 — a null optional compared EQUAL to 0
+
+OPTIONAL was the last member missing from the aggregate-comparison list, and the
+worst-behaved, because it yields a WRONG ANSWER rather than invalid C. `?u32 == 0`
+emitted `a.value == 0`, reading the payload without consulting `has_value`, and
+auto-zero makes `.value` 0 when absent — so a null check written the natural way,
+`if (x == 0)`, passed silently on a value that is not there. `opt == null` and
+null-SENTINEL optionals (`?*T`) stay legal and are tested.
+
+### BUG-866 — a drifted duplicate: the non-null rule at global scope
+
+"Does an uninitialised declaration auto-zero into a NULL the type says cannot be
+null?" was answered by two hand-written copies, local and global, and they
+drifted: the local copy grew a FUNC_PTR arm, the global one never did. A global
+`*(u32,u32) -> u32 gop;` was accepted and `gop(1,2)` emitted a raw call through
+address 0, while the same declaration one scope deeper was rejected. One query,
+`nonnull_zero_hole`, at both sites. Two test_emit cases relied on the gap and the
+second WAS the hazard; both updated to the ZER-correct spelling.
+
+### BUG-867 — freeing a slice of an INLINE array field
+
+`free(s.buf[0..4])` on `struct S { u8[8] buf; }` freed stack storage. The peel
+walked to the root IDENT and asked "is the ROOT a local array?"; the root is a
+STRUCT, so the test failed, while `free(buf[0..4])` on a bare local array one
+line away was rejected. Fixed by asking the honest question — did the navigation
+stay inside the root's own storage? — with FORMED-view vs STORED-reference as the
+discriminator. The heap-slice-in-a-field boundary caught an error in the first
+draft.
+
+### BUG-868 — mutually recursive containers SEGFAULTED the compiler
+
+`container A(T){B(T) x;} container B(T){A(T) y;}`. The self-containment guard
+compared against `st`, THE ONE stamp its own frame owns, which structurally
+cannot see a cycle closing on an OUTER stamp. Both stamps are finite to stamp, so
+monomorphization terminated and produced a genuinely infinite-SIZE struct; zerc
+died computing its size (ASan: stack-overflow in `estimate_type_size`). Fixed
+with a stack of in-progress stamps.
+
+**The first draft traded the crash for an OVER-REJECTION**: it rejected
+`container A2(T){?*B2(T) x;} container B2(T){A2(T) y;}`, which is 8 bytes. A
+cycle is infinite only if EVERY edge is by-value, so the stack records the edge
+kind, answered by a no-`default:` switch over TypeNodeKind.
+
+### BUG-869..871 — three guards that gave up
+
+- **869** — the global-initializer constant guards were TOP-LEVEL kind tests on
+  the initializer ROOT, so one wrapper (`+ 1`, a cast, a unary minus, being an
+  intrinsic ARGUMENT) defeated all three and the failure landed on GCC, naming a
+  line in a generated `.c` the user never opened. Sibling of BUG-842, which split
+  the `arg_count` precondition and left the top-level-kind SHAPE.
+- **870** — `@offset` validated nothing outside one guard: the field check sat
+  inside `if (struct_type && <struct> && field_name)` and did NOTHING when that
+  failed, so a non-struct target, a union target and a non-ident field argument
+  were accepted in silence and `offsetof(uint32_t, 1)` reached GCC. The raw
+  struct type-kind comparison also missed a `distinct typedef`.
+- **871** — the fence family took no arguments but ACCEPTED and silently dropped
+  any passed, so a typo'd `@barrier(x)` looked like it did something. The 0-arg
+  family immediately below it has had this check all along.
+
+### BUG-872..874 — three idioms ZER refused
+
+- **872** — `const [*]u8 BANNER = "boot ok";` was not declarable AT ALL, and said
+  so with the SAME type on both sides. The const/volatile fold was longhand at
+  TWO sites and MISSING at a third (the pass-2 global-init check re-resolved the
+  type raw). One helper, `fold_decl_qualifiers`, at all three. Its const branch
+  deliberately does NOT unwrap distinct — doing so discards nominal identity,
+  which `tests/zer/distinct_const_read_ok` caught.
+- **873** — `const u32 CAP = 4; u8[CAP] buf;` rejected as "must be a
+  compile-time constant", naming a constant. FOUR sites (array, Pool, Ring,
+  Semaphore) used the NON-scoped evaluator. The fold is done IN PLACE, and that
+  is the load-bearing part: the emitter re-resolves the same TypeNode, so
+  teaching only the checker leaves it failing SILENTLY — array sized 0,
+  `@size(u8[CAP])` yielding 0. The test asserts sizes at RUNTIME for that reason.
+- **874** — `if (i < 4 && a[i] > 0)`, the canonical guarded access, was
+  HARD-REJECTED while the nested-`if` spelling of the same program compiled. The
+  hard verdict is suppressed in short-circuit RHS position at all three sites
+  that raise it; the access falls through to the runtime auto-guard, so nothing
+  is removed. A negative pins the boundary (access on the LEFT still rejects).
+
+### BUG-875 — the indirect-call keep worst-case tested the BARE kind
+
+So it caught `*T` and missed `?*T` and a by-value struct with a pointer field —
+both ASan-confirmed stack-use-after-return, both with the DIRECT call rejected
+one line away. Now asks `type_carries_data_pointer`. The top-level slice/opaque
+exemption is kept deliberately and was measured before being granted.
+
+### BUG-876 — `lower_expr` could return an INDETERMINATE local ID
+
+Its switch is exhaustive with no `default:` (deliberately), but C does not
+guarantee an enum-typed value is one of the enumerators, so control could reach
+the end of an int-returning function — and callers use that value as a LOCAL ID
+and index `func->locals[]` with it. GCC had been reporting it (-Wreturn-type);
+it was invisible among 31 other warnings. **Build warnings are now 0**, which is
+the argument: the real one was sitting in that list the whole time.
+
+### BUG-877 — six intrinsics that STORE through a `const` buffer
+
+Found by the NEW `tools/qualifier_closure_probe.sh`. Twelve pointer-taking
+CPU/cache intrinsics validated "is this a pointer or an array?" and NOTHING about
+qualifiers — twelve copies of one shape, each missing the same check. `@cstr` has
+had this rule since BUG-238 and nothing else did. The six that STORE
+(`@nt_store`, `@cpu_fxsave`, `@cpu_xsave`, `@cpu_save_context`, `@cpu_save_fpu`,
+`@cache_zero_line`) now reject a const buffer; the READING members are untouched,
+since consuming a const address is correct usage.
+
+**The probe's oracle choice is the whole probe.** My first version used
+`-Wdiscarded-qualifiers` and printed OK against a compiler with the volatile-strip
+check deliberately removed — a green gate over a live defect. The emitter writes
+an EXPLICIT C cast, which silences that warning by design. `-Wcast-qual` asks the
+question actually being asked. The vacuity check is what caught it.
+
+### BUG-878/879 — arrays of function pointers never worked, in either syntax
+
+`*(u32, u32) -> u32 [4] ops` is documented in reference.md AND CLAUDE.md.
+**878 (parser):** `parse_type` is greedy about a trailing `[N]`, so the bracket
+was swallowed into the RETURN type and the result was a funcptr RETURNING an
+array. A ZER function cannot return an array at all, so a `[` there can only
+belong to the declaration. **879 (emitter):** `?FuncPtr[N]` emitted
+`uint32_t (*)(uint32_t) ops[3]` — an abstract declarator with a name glued on,
+not C. The funcptr-array branch peeled `distinct` but not the null-sentinel `?`,
+and the nullable form is the one that matters (an array of non-null funcptrs is
+auto-zeroed to NULL and ZER has no array initializer).
+
+My first 878 attempt used `parse_base_type` and BROKE `*(u32) -> ?u32`; the
+doc-example gate caught it. The replacement flag then had to be initialised in
+`parser_init` rather than left to a caller's memset — garbage there suppresses
+EVERY array suffix and `u8[256] buf;` stops parsing as an array. The C parser
+tests caught that.
+
+### BUG-881 — bit extraction through a pointer
+
+`volatile *u32 reg = …; u32 bits = reg[9..8];` is in CLAUDE.md's Hardware Support
+reference and in reference.md, and did not compile: bit extraction dispatches on
+`type_is_integer(obj)`, a pointer is not an integer, so `[hi..lo]` fell through
+to the SUB-SLICE path where hi > lo is a bounds error. Nothing was ambiguous —
+slicing a `*T` is already an error. Fixed as a DESUGARING to `*p`, so one
+implementation of bit extraction serves the checker, IR lowering and both emitter
+paths and they cannot drift.
+
+### Tooling and tech debt
+
+- **`tools/qualifier_closure_probe.sh`** (new) — measures the qualifier-
+  preservation claim across all ~155 intrinsics; found BUG-877 on its first
+  honest run. The 25 remaining strips are benign (the pointer becomes an `"r"`
+  asm operand with a `"memory"` clobber; C never dereferences it) and are
+  baselined WITH that reasoning, so the probe fails on anything NEW rather than
+  sitting permanently red.
+- **`tools/grammar_closure_probe.sh`** adopted and re-verified on this tree: 0
+  breaches after BUG-862, 1 when the door is re-opened.
+- **`tools/audit_reference_examples.sh` is now IN `make check`.** For a reader
+  with no web access the reference IS the language.
+- **`audit_walker_fields.sh` decided MEMBERSHIP on PROSE** — it counted the
+  function's own name anywhere in its body, comments included. Two functions with
+  ZERO self-calls were audited by accident, and editing a comment could move a
+  function in or out of the audited set. Baseline 758 -> 684.
+- **The negative-test runner ran `grep -qF "$want"` without `--`**, so any
+  expect-error string starting with a dash was parsed by grep as its own options.
+  Any rule whose message opens with a flag name was untestable.
+- **565 compiled test binaries untracked**, by a structural rule (an
+  extension-less file under a test tree is a build artifact by construction —
+  verified: all 565 were ELF) replacing a 16-entry hand-kept deny-list.
+- **280 lines of dead code removed.** Three of the four emitter functions were
+  STALE COPIES of the shared-root walker whose live version is
+  `find_shared_root_expr` in ir_lower.c. A dead copy of a SAFETY walker is worse
+  than ordinary dead code: a future session edits the copy, sees no effect, and
+  concludes the analysis is broken.
+
+### Recorded, deliberately NOT fixed
+
+`tests/zer_gaps/funcptr_array_null_element.zer` — an element of a NON-null
+funcptr array is NULL until assigned and calling it is caught by nothing (silent
+on bare metal with no MMU). Extending the non-null rule through the array was
+implemented and REVERTED: with no array initializer syntax it does not say
+"initialize it", it says "this type is unusable", and it broke three corpus
+programs that assign every element before use and are correct as written.
+
+---
+
 ## Session 2026-08-23 — BUG-847..856: §E/§F/§G, and the harvest closes
 
 Nine silent-behaviour fixes from `4z36e0`, `pmytnl` and `pjtawx`. None is an

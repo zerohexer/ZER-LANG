@@ -1,0 +1,66 @@
+/* BUG-859: bit extraction through a single pointer to an integer.
+ *
+ * CLAUDE.md's "Hardware Support" quick reference and reference.md both show
+ *
+ *     volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);
+ *     u32 bits = reg[9..8];              // bit extraction
+ *
+ * and it did not compile. `[hi..lo]` on a POINTER fell through to the
+ * SUB-SLICE path, where hi > lo is a bounds error, so the documented firmware
+ * idiom failed with "slice start (9) is greater than end (8)". Bit extraction
+ * only ever worked on a scalar VALUE, and every firmware author had to spell
+ * the deref out by hand.
+ *
+ * Nothing was ambiguous about it: slicing a `*T` is an error (a single pointer
+ * has no length), so `[hi..lo]` on one had no competing meaning to steal.
+ * `[*]T` sub-slicing goes through the slice path and is re-checked at the
+ * bottom of this file so the fix cannot have been bought by breaking it.
+ *
+ * The MMIO form itself is verified COMPILE-ONLY (a `tests/zer/` positive has to
+ * run on a hosted x86-64 host, and touching 0x40020014 there is a segfault);
+ * what runs here is the same rewrite through a pointer to ordinary memory.
+ */
+
+u32 main() {
+    /* --- read through a pointer --- */
+    u32 raw = 0xDEADBEEF;
+    *u32 p = &raw;
+    if (p[7..0] != 0xEF) { return 1; }
+    if (p[15..8] != 0xBE) { return 2; }
+    if (p[31..24] != 0xDE) { return 3; }
+    if (p[9..8] != 2) { return 4; }        /* 0xBEEF bits 9:8 = 0b10 */
+
+    /* --- single-bit shorthand, still through the pointer --- */
+    if (p[0..0] != 1) { return 5; }
+    if (p[4..4] != 0) { return 6; }
+
+    /* --- write through a pointer, and the pointee really changes --- */
+    p[7..0] = 0x12;
+    if (raw != 0xDEADBE12) { return 7; }
+    p[31..24] = 0xAB;
+    if (raw != 0xABADBE12) { return 8; }
+
+    /* --- narrower pointee --- */
+    u8 small = 0xF0;
+    *u8 sp = &small;
+    if (sp[7..4] != 0xF) { return 9; }
+    if (sp[3..0] != 0) { return 10; }
+    sp[3..0] = 0xA;
+    if (small != 0xFA) { return 11; }
+
+    /* --- the scalar form is unchanged --- */
+    u32 v = 0xDEADBEEF;
+    if (v[7..0] != 0xEF) { return 12; }
+
+    /* --- and SLICE sub-slicing is untouched: [*]T keeps element semantics,
+     *     so [1..3] is elements 1 and 2, not bits --- */
+    u8[4] buf;
+    buf[0] = 10; buf[1] = 20; buf[2] = 30; buf[3] = 40;
+    [*]u8 s = buf[0..4];
+    [*]u8 mid = s[1..3];
+    if (mid.len != 2) { return 13; }
+    if (mid[0] != 20) { return 14; }
+    if (mid[1] != 30) { return 15; }
+
+    return 0;
+}

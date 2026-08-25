@@ -9632,6 +9632,42 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *obj_raw = check_expr(c, node->slice.object);
         /* BUG-410: unwrap distinct for slice/array/integer dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
+
+        /* BUG-881: BIT EXTRACTION THROUGH A POINTER.
+         *
+         *     volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);
+         *     u32 bits = reg[9..8];
+         *
+         * is the documented MMIO idiom — it appears in CLAUDE.md's Hardware
+         * Support reference and in reference.md — and it did not compile. Bit
+         * extraction dispatches on `type_is_integer(obj)`, a POINTER is not an
+         * integer, so `[hi..lo]` fell through to the SUB-SLICE path where
+         * hi > lo is a bounds error: "slice start (9) is greater than end (8)".
+         * Every firmware author had to spell the deref out by hand.
+         *
+         * Nothing is ambiguous here. Slicing a `*T` is ALREADY an error — a
+         * single pointer carries no length — so `[hi..lo]` on one has no
+         * competing meaning to steal. `[*]T` sub-slicing is unaffected: it is a
+         * TYPE_SLICE, not a pointer.
+         *
+         * Done as a DESUGARING — rewrite the object to `*p` and let the existing
+         * scalar path handle it — rather than by teaching the bit-extract rules
+         * about pointers. That keeps one implementation of bit extraction, so
+         * the checker, IR lowering and BOTH emitter dispatch paths need no
+         * change and cannot drift. */
+        if (obj && type_dispatch_kind(obj) == TYPE_POINTER &&
+            node->slice.start && node->slice.end &&
+            obj->pointer.inner && type_is_integer(type_unwrap_distinct(obj->pointer.inner))) {
+            Node *deref = (Node *)arena_alloc(c->arena, sizeof(Node));
+            memset(deref, 0, sizeof(Node));
+            deref->kind = NODE_UNARY;
+            deref->unary.op = TOK_STAR;
+            deref->unary.operand = node->slice.object;
+            deref->loc = node->slice.object->loc;
+            node->slice.object = deref;
+            obj_raw = check_expr(c, deref);
+            obj = type_unwrap_distinct(obj_raw);
+        }
         if (node->slice.start) {
             Type *start = check_expr(c, node->slice.start);
             if (!type_is_integer(start)) {

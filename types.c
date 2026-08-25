@@ -569,7 +569,7 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         /* BUG-830: every funcptr mismatch printed the same "fn(...)" on both
          * sides. Render the real signature so the two can differ on the page. */
         pos = tn_append(buf, pos, max, "fn(");
-        for (int fpi = 0; fpi < t->func_ptr.param_count; fpi++) {
+        for (uint32_t fpi = 0; fpi < t->func_ptr.param_count; fpi++) {
             if (fpi) pos = tn_append(buf, pos, max, ", ");
             pos = type_name_write(t->func_ptr.params[fpi], buf, pos, max);
         }

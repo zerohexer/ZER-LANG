@@ -1,0 +1,48 @@
+// BUG-877: the canonical guarded idiom stopped compiling.
+//
+//     u32 i = 9;
+//     if (i < 4 && a[i] > 0) { }        // ERROR: "always out of bounds"
+//     if (i < 4) { if (a[i] > 0) { } }  // the SAME program — compiles
+//
+// VRP never applies a short-circuit LHS to its RHS, so an index the LHS guards
+// still looks unconstrained; once the ALWAYS-OOB verdict became a hard ERROR
+// (BUG-796) that turned into a hard rejection of `i < 4 && a[i]` — which is
+// the exact shape the auto-guard warning tells users to write.
+//
+// The fix downgrades the verdict to the auto-guard path in that position only.
+// NO RUNTIME CHECK IS REMOVED: `guard_still_emitted` below has an LHS that does
+// NOT constrain the index, so the access really executes with an out-of-range
+// value, and the emitted C carries `if ((size_t)(i) >= 4u) { return 0; }` in
+// front of it. Verified in the emitted C, not inferred.
+u32 both_spellings() {
+    u8[4] a;
+    u32 i = 9;
+    if (i < 4 && a[i] > 0) { return 1; }
+    if (i < 4) { if (a[i] > 0) { return 2; } }
+    return 0;
+}
+
+u32 guard_still_emitted() {
+    u8[4] a;
+    a[0] = 11;
+    u32 i = 9;
+    // The LHS is TRUE, so the index really is evaluated out of range; the
+    // auto-guard returns 0 rather than reading a[9].
+    if (i > 0 && a[i] > 0) { return 1; }
+    return 2;
+}
+
+u32 in_range_still_works() {
+    u8[4] a;
+    a[2] = 7;
+    u32 i = 2;
+    if (i < 4 && a[i] > 0) { return 9; }
+    return 0;
+}
+
+u32 main() {
+    if (both_spellings() != 0) { return 1; }
+    if (guard_still_emitted() != 0) { return 2; }   // the guard's early return
+    if (in_range_still_works() != 9) { return 3; }
+    return 0;
+}

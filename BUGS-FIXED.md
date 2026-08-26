@@ -238,6 +238,31 @@ result stays a bool; an array sized by a wrapping comptime expression really is
 255 elements). It exits **55** on the pre-fix build, **57** with only the width
 half fixed, and **0** now.
 
+### BUG-877 — the canonical guarded idiom stopped compiling
+
+    u32 i = 9;
+    if (i < 4 && a[i] > 0) { }        // ERROR: "always out of bounds"
+    if (i < 4) { if (a[i] > 0) { } }  // the SAME program — compiles
+
+VRP never applies a short-circuit LHS to its RHS, so an index the LHS guards
+still looks unconstrained. That was harmless while the ALWAYS-OOB verdict was a
+warning; once BUG-796 promoted it to a hard ERROR it became a hard rejection of
+`i < 4 && a[i]` — **the exact shape the auto-guard warning tells users to
+write**. limitations.md had predicted this ("becomes REQUIRED the day the
+always-OOB verdict is promoted at short-circuit position") and the promotion had
+already shipped.
+
+The verdict now degrades to the auto-guard path in that position only.
+Deliberately NOT full narrowing: the NODE_IF path stays authoritative — it keeps
+field keys, guard-body detection, `known_nonzero` and the then/else JOIN — and a
+second copy of a 200-line rule is how two copies start to drift.
+
+**No runtime check is removed**, and the test proves it rather than asserting it:
+`guard_still_emitted()` uses an LHS that does NOT constrain the index, so the
+access really executes out of range, and the emitted C carries
+`if ((size_t)(i) >= 4u) { return 0; }` in front of it. Read out of the emitted
+C, not inferred.
+
 ### BUG-874 — `@offset`'s field check had an EMPTY failure branch
 
     distinct typedef P PD;   @offset(PD, b)   // "invalid use of undefined type

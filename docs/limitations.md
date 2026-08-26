@@ -5,30 +5,16 @@ Entries removed once fixed.
 
 ---
 
-## SUPERSEDED by harvest-2 H14 — `&&` / `||` narrowing (the "PRECISION only" call was WRONG)
+## ~~SUPERSEDED by harvest-2 H14~~ — CLOSED 2026-08-26 as BUG-877
 
-**Corrected 2026-08-25.** See the harvest-2 tracker above: with a PROVABLE index the
-`&&` spelling is HARD-REJECTED while the nested-if spelling of the same program compiles.
-The original entry below probed an UNPROVABLE index, which correctly guards, and drew the
-wrong conclusion. Kept for the measurement, not the verdict.
-
-### (original entry)
-
-
-`if (i < 4 && arr[i] > 0)` — the canonical guarded-access idiom, and the exact shape the
-auto-guard warning tells users to write — still carries a runtime bounds guard, because
-VRP never applies a short-circuit LHS to its RHS. Verified still live after the harvest:
-the program compiles and runs correctly; the cost is one unnecessary branch.
-
-**This is PRECISION, not safety** — hence not shipped with the 45. It becomes REQUIRED
-the day the ALWAYS-OOB verdict is promoted at short-circuit position, because the same
-idiom would then be REJECTED rather than merely guarded. 87xihb's BUG-800 carries the
-implementation (`vrp_narrow_from_cond`: `ident <op> const` plus conjunctions, De Morgan
-for the inverted disjunction, refusing volatile operands, a no-op on anything else) and
-is deliberately NOT a second copy of the NODE_IF narrowing — that path stays
-authoritative and keeps field keys, guard-body detection, known_nonzero and the
-then/else JOIN; this covers only the position it structurally cannot reach, inside a
-condition EXPRESSION.
+The `&&` / `||` RHS no longer hard-rejects a provable index: the ALWAYS-OOB
+verdict degrades to the auto-guard path in that position, which is what the
+nested-if spelling of the same program already gets. No runtime check is
+removed. The original entry's own prediction — that this "becomes REQUIRED the
+day the always-OOB verdict is promoted at short-circuit position" — was correct,
+and the promotion had already shipped as BUG-796 when the entry was written.
+Full narrowing of a short-circuit LHS into its RHS is still NOT implemented and
+remains a precision opportunity, not a correctness one.
 
 ---
 
@@ -243,7 +229,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| H14 | **`&&` / `\|\|` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
+| ~~H14~~ **DONE (BUG-877)** | **`&&` / `||` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
 | ~~H15~~ **DONE (BUG-875/876)** | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
 | ~~H16~~ **DONE (BUG-867)** | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
 | H17 | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |

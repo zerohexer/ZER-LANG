@@ -5159,7 +5159,28 @@ static Type *check_expr(Checker *c, Node *node) {
     /* ---- Binary expression ---- */
     case NODE_BINARY: {
         Type *left = check_expr(c, node->binary.left);
+        /* BUG-877: the RIGHT operand of `&&` / `||` runs ONLY when the left one
+         * permitted it. VRP never applies a short-circuit LHS to its RHS, so an
+         * index the LHS guards still looks unconstrained — and once the
+         * ALWAYS-OOB verdict became a hard ERROR (BUG-796), the canonical
+         * guarded idiom stopped compiling:
+         *
+         *     u32 i = 9;
+         *     if (i < 4 && a[i] > 0) { }        // ERROR: always out of bounds
+         *     if (i < 4) { if (a[i] > 0) { } }  // the SAME program — compiles
+         *
+         * and `i < 4 && a[i]` is the exact shape the auto-guard warning tells
+         * users to write. Flag the position so the verdict degrades to the
+         * auto-guard path there. NOT full narrowing: the NODE_IF path stays
+         * authoritative (it keeps field keys, guard-body detection,
+         * known_nonzero and the then/else JOIN), and duplicating it here is how
+         * two copies of one rule start to drift. NO RUNTIME CHECK IS REMOVED —
+         * the guard is still emitted, exactly as for the nested-if spelling. */
+        bool sc = (node->binary.op == TOK_AMPAMP || node->binary.op == TOK_PIPEPIPE);
+        bool saved_sc = c->in_shortcircuit_rhs;
+        if (sc) c->in_shortcircuit_rhs = true;
         Type *right = check_expr(c, node->binary.right);
+        c->in_shortcircuit_rhs = saved_sc;
 
         /* literal promotion: when one side is a literal and the other is
          * a known type, the literal adopts the other side's type.
@@ -9214,9 +9235,13 @@ static Type *check_expr(Checker *c, Node *node) {
                 IndexVerdict iv = index_range_verdict(r, obj->array.size);
                 if (iv == IDX_PROVEN_SAFE) {
                     mark_proven(c, node);
-                } else if (iv == IDX_ALWAYS_OOB) {
+                } else if (iv == IDX_ALWAYS_OOB && !c->in_shortcircuit_rhs) {
                     /* BUG-796: every value the index can hold is out of bounds. The
-                     * auto-guard would compile this to a silent early return. */
+                     * auto-guard would compile this to a silent early return.
+                     * BUG-877: NOT inside the RHS of `&&` / `||` — there the LHS
+                     * may be the very guard that keeps this unreachable, and VRP
+                     * does not apply it. Fall through to the auto-guard, which
+                     * is what the nested-if spelling of the same program gets. */
                     checker_error(c, node->loc.line,
                         "index '%.*s' is always out of bounds for array of size %llu "
                         "(its value is proven to be in [%lld, %lld])",

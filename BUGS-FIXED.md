@@ -238,6 +238,65 @@ result stays a bool; an array sized by a wrapping comptime expression really is
 255 elements). It exits **55** on the pre-fix build, **57** with only the width
 half fixed, and **0** now.
 
+### BUG-871 — comparing a VALUE optional read `.value` on an optional with none
+
+    ?u32 n = null;   n == 0        // emitted `n.value == zero`, answered TRUE
+    ?u32 a;  ?u32 b; a == b        // reached GCC, no ZER diagnostic
+
+A value optional (`?T` where T is not a pointer or funcptr) is a two-field
+struct and was missing from the aggregate-comparison rejection. The first case
+is the serious one: it READS `.value` on an optional that has no value, which
+is precisely the unwrapped read ZER's optional discipline exists to prevent,
+and it neither errored nor trapped. It type-checked because T coerces to ?T.
+
+`?*T` / `?FuncPtr` are NULL-SENTINEL representations — a bare pointer — so
+comparing them is a genuine address comparison and stays legal, as does
+`x == null` on both, which is the null TEST and the reason optionals are
+comparable at all. Corpus cost measured at ZERO by RUNNING the compiler over
+every `.zer` in the tree, not by grepping for the shape.
+
+### BUG-872 — the call-result alias lost the argument through any PROJECTION
+
+    [*]u8 head([*]u8 s) { return s[0..2]; }
+    struct Box { [*]u8 s; }
+    b.s = alloc(u8,4) orelse ...;
+    [*]u8 h = head(b.s);   free(b.s);   h[0]      // ACCEPTED
+
+**ASan-confirmed heap-use-after-free from pure safe ZER**, while `head(s)` on a
+bare ident one line away was rejected — two spellings of one program
+disagreeing. The param-color alias application tested
+`arg->kind == NODE_IDENT`, so passing the allocation through a struct field, an
+array element or a sub-slice failed to find the argument's handle,
+`dest_aliased_from_param` stayed false, and the call result registered as a
+FRESH allocation the free never reached.
+
+Fixed by using `ir_extract_compound_key` — the shared resolver every other
+argument sink in `zercheck_ir.c` already uses (the wrong-pool check, the free
+sinks, the spawn-arg checks). It peels identity casts, walks the field/index
+path, and returns the root local plus the path key.
+
+### BUG-873 — and the same root-vs-value confusion, in the other direction
+
+Closing BUG-872 surfaced its mirror image. A fixed TABLE of heap buffers could
+not be freed AT ALL:
+
+    struct Slot { [*]u8 s; }
+    Slot[2] slots;
+    slots[0].s = alloc(u8, 4) orelse ...;
+    free(slots[0].s);          // "cannot free() a slice that views non-heap memory"
+
+The non-heap gate walks the projection to the root and asks about the ROOT's
+storage — the right question only when the freed value is a VIEW of that
+object. `slots` is a local array, so the check fired; but `slots[0].s` is not
+stack memory, it is whatever was assigned to that slice field.
+
+BUG-862 was this same defect with the root test too WEAK; this is it too
+STRONG. Both come from answering a question about the ROOT instead of about the
+VALUE. Reading a POINTER- or SLICE-typed sub-object leaves the root's storage
+behind, so the root's storage class says nothing about the result; a `x[a..b]`
+node does NOT leave it, which is the BUG-862 case and stays rejected.
+Pre-existing — a pristine build rejects the table identically.
+
 ### BUG-869 — the global-initializer guard was a TOP-LEVEL KIND TEST
 
     u32 G = @cpu_model_id();        // correctly rejected

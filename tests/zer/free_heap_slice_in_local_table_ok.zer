@@ -1,0 +1,25 @@
+// BUG-873: a fixed TABLE of heap buffers could not be freed at all.
+//
+// The non-heap free() gate walked the projection to the root and then asked
+// about the ROOT's storage — right only when the freed value is a VIEW of that
+// object. `slots` is a local array, so `root_is_local_array` fired; but
+// `slots[0].s` is not stack memory, it is whatever was assigned to that slice
+// field. This is the same defect as BUG-862 in the other direction (that one
+// was the root test being too WEAK, this one too STRONG), and both come from
+// answering a question about the root instead of about the value.
+//
+// Pre-existing: a pristine build rejects this identically.
+struct Slot { [*]u8 s; }
+
+u32 main() {
+    Slot[2] slots;
+    slots[0].s = alloc(u8, 4) orelse { return 1; };
+    slots[1].s = alloc(u8, 4) orelse { return 2; };
+    slots[0].s[0] = 3;
+    slots[1].s[0] = 4;
+    u32 v = (u32)slots[0].s[0] + (u32)slots[1].s[0];
+    free(slots[0].s);
+    free(slots[1].s);
+    if (v != 7) { return 3; }
+    return 0;
+}

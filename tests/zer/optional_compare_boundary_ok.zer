@@ -1,0 +1,32 @@
+// BOUNDARY POSITIVES for BUG-871.
+//
+// `?*T` and `?FuncPtr` are NULL-SENTINEL representations — emitted as a bare
+// pointer whose NULL means "none" — so comparing them is a genuine address
+// comparison and must stay legal. So must `x == null` on BOTH representations:
+// that is the null TEST, and the reason optionals are comparable at all.
+// Rejecting a value-optional comparison must not take either with it.
+struct T { u32 a; }
+T g_t;
+?*T g_p;
+u32 add1(u32 x) { return x + 1; }
+?u32 mk(u32 x) { if (x > 0) { return x; } return null; }
+u32 main() {
+    ?u32 v = mk(0);
+    if (v != null) { return 1; }
+    if (g_p != null) { return 2; }
+
+    // nullable POINTER vs pointer: a real address comparison
+    g_p = &g_t;
+    *T q = &g_t;
+    if (g_p != q) { return 3; }
+
+    // nullable FUNCPTR vs funcptr
+    ?*(u32) -> u32 ocb = add1;
+    *(u32) -> u32 cb = add1;
+    if (ocb != cb) { return 4; }
+
+    u32 got = mk(7) orelse 0;
+    if (got != 7) { return 5; }
+    if (mk(7)) |x| { if (x != 7) { return 6; } } else { return 7; }
+    return 0;
+}

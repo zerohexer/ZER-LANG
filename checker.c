@@ -872,6 +872,24 @@ static Type *int_retype_target(Type *t) {
     return NULL;
 }
 
+/* BUG-871: is this optional a NULL-SENTINEL representation rather than a
+ * two-field struct? `?*T` and `?FuncPtr` are emitted as a bare pointer whose
+ * NULL means "none", so comparing them is a real address comparison. Every
+ * other `?T` is `struct { T value; u8 has_value; }`, where a comparison would
+ * have to read `.value` — possibly when there is none. Mirrors the emitter's
+ * `is_null_sentinel`, including the `*opaque` carve-out (a `_zer_opaque` is a
+ * struct, not a pointer). */
+static bool is_value_optional_exempt(Type *opt_eff) {
+    if (!opt_eff || type_dispatch_kind(opt_eff) != TYPE_OPTIONAL) return false;
+    Type *inner = opt_eff->optional.inner;
+    if (!inner) return false;
+    TypeKind ik = type_dispatch_kind(inner);
+    if (ik == TYPE_POINTER &&
+        type_dispatch_kind(type_unwrap_distinct(inner)->pointer.inner) == TYPE_OPAQUE)
+        return false;   /* *opaque optional is a struct — not comparable */
+    return ik == TYPE_POINTER || ik == TYPE_FUNC_PTR;
+}
+
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
 
 /* BUG-867: fold a declaration's `const` / `volatile` qualifier ONTO its
@@ -5273,6 +5291,41 @@ static Type *check_expr(Checker *c, Node *node) {
                               kl == TYPE_STRUCT || kl == TYPE_UNION);
                 bool agg_r = (kr == TYPE_SLICE || kr == TYPE_ARRAY ||
                               kr == TYPE_STRUCT || kr == TYPE_UNION);
+                /* BUG-871: a VALUE optional (`?T` where T is not a pointer or
+                 * funcptr) is a two-field struct, and it was missing from this
+                 * list. Two things followed, both silent at the checker:
+                 *
+                 *   ?u32 n = null;  n == 0     ->  emitted `n.value == zero`
+                 *                                  and answered TRUE
+                 *   ?u32 a;  ?u32 b; a == b    ->  reached GCC ("invalid
+                 *                                  operands to binary ==")
+                 *
+                 * The first is the serious one: it reads `.value` on an
+                 * optional that HAS NO VALUE, which is precisely the unwrapped
+                 * read ZER's optional discipline exists to prevent, and it
+                 * neither errors nor traps. `?T == T` type-checked because
+                 * T coerces to ?T.
+                 *
+                 * `?*T` / `?FuncPtr` are NULL-SENTINEL representations — a bare
+                 * pointer — so comparing them is a genuine address comparison
+                 * and stays legal. `x == null` stays legal for both, since that
+                 * is the null TEST and the reason optionals are comparable at
+                 * all. */
+                bool nullcmp = (node->binary.left->kind == NODE_NULL_LIT ||
+                                node->binary.right->kind == NODE_NULL_LIT);
+                bool vopt_l = (kl == TYPE_OPTIONAL) &&
+                              !is_value_optional_exempt(eff_l);
+                bool vopt_r = (kr == TYPE_OPTIONAL) &&
+                              !is_value_optional_exempt(eff_r);
+                if (!nullcmp && (vopt_l || vopt_r)) {
+                    Type *bad = vopt_l ? left : right;
+                    checker_error(c, node->loc.line,
+                        "cannot compare '%s' — an optional carries a HAS-VALUE flag, "
+                        "so comparing it would read a value that may not exist. "
+                        "Unwrap it first ('orelse' or 'if (x) |v|'), or compare "
+                        "against 'null' to test for absence",
+                        type_name(bad));
+                }
                 if (agg_l || agg_r) {
                     Type *bad = agg_l ? left : right;
                     TypeKind bk = agg_l ? kl : kr;
@@ -7363,6 +7416,53 @@ static Type *check_expr(Checker *c, Node *node) {
                                 type_name(sob));
                         }
                     }
+                    /* BUG-873: the walk below reaches the ROOT and then asks
+                     * about the ROOT's storage — which is only the right
+                     * question when the freed value is a VIEW OF that object.
+                     * It is not, once the path READS a stored pointer or slice
+                     * out of it:
+                     *
+                     *     struct Slot { [*]u8 s; }
+                     *     Slot[2] slots;
+                     *     slots[0].s = alloc(u8, 4) orelse ...;
+                     *     free(slots[0].s);      // REJECTED as "non-heap"
+                     *
+                     * `slots` is a local array, so `root_is_local_array` fires
+                     * — but `slots[0].s` is not stack memory, it is whatever
+                     * was assigned to that slice field. A fixed table of heap
+                     * buffers is an ordinary embedded pattern and it could not
+                     * be freed at all. (Pre-existing: a pristine build rejects
+                     * it identically.)
+                     *
+                     * This is the SAME defect as BUG-862 in the other
+                     * direction — that one was the root test being too weak,
+                     * this one is it being too strong — and both come from
+                     * answering a question about the root instead of about the
+                     * value. Reading a POINTER- or SLICE-typed sub-object
+                     * leaves the root's storage behind, so the root's own
+                     * storage class says nothing about it. */
+                    bool left_root_storage = false;
+                    for (Node *w = node->call.args[0];
+                         w && (w->kind == NODE_SLICE || w->kind == NODE_FIELD ||
+                               w->kind == NODE_INDEX); ) {
+                        Node *obj = (w->kind == NODE_SLICE)  ? w->slice.object
+                                  : (w->kind == NODE_FIELD)  ? w->field.object
+                                                             : w->index_expr.object;
+                        /* A FIELD or INDEX whose own value is a pointer/slice is
+                         * a stored reference read OUT of the aggregate. A SLICE
+                         * node (`x[a..b]`) is a view TAKEN OF its object, so it
+                         * does not leave the storage — that case is the BUG-862
+                         * test above. */
+                        if (w->kind != NODE_SLICE) {
+                            TypeKind wk = type_dispatch_kind(typemap_get(c, w));
+                            if (wk == TYPE_POINTER || wk == TYPE_SLICE ||
+                                wk == TYPE_OPAQUE) {
+                                left_root_storage = true;
+                                break;
+                            }
+                        }
+                        w = obj;
+                    }
                     Node *root = node->call.args[0];
                     while (root && (root->kind == NODE_SLICE ||
                                     root->kind == NODE_FIELD ||
@@ -7371,7 +7471,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         else if (root->kind == NODE_FIELD) root = root->field.object;
                         else root = root->index_expr.object;
                     }
-                    if (root && root->kind == NODE_IDENT) {
+                    if (!left_root_storage && root && root->kind == NODE_IDENT) {
                         Symbol *rs = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
                         bool rs_global = rs && scope_lookup_local(c->global_scope,

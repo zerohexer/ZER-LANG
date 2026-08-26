@@ -37,6 +37,27 @@ condition EXPRESSION.
 Each row below was reproduced on a clean build this session and left open on
 purpose. The reasoning is recorded so the next session does not re-derive it.
 
+### The call-RESULT view class — one of four parts landed (H1)
+
+BUG-872 closed the part that was ASan-reproducible: the param-color alias
+application at the call site lost its argument through ANY projection, so
+`head(b.s)` registered the result as a fresh allocation and the free of `b.s`
+never reached it. That is one of the FOUR independent ways `29fiao` reports the
+question "which allocation does this call result view?" being answered wrongly.
+
+**The remaining three are deliberately not attempted here**, and the reason is
+in the tracker: the fourth part turns `returns_param_color` from an int into a
+MASK, and the branch's own BUG-848 says the current int can name the WRONG
+param. Widening the CONSUMER while the INFERENCE is still wrong makes the wrong
+answer apply more often. Land all four together or none — this one is safe
+alone because it only makes the consumer find a handle it was already looking
+for.
+
+Still live per the tracker (unverified here beyond the one fixed shape): a
+SLICE result makes the lost answer silent in both directions, because a slice
+is not "pointer-ish" and so registers NO allocation and produces no leak
+diagnostic either. The gate to grow when the rest lands is `sink_matrix` p18.
+
 ### The SLICE exemption at a funcptr-call keep worst-case (known accept-unsafe)
 
 BUG-863 widened the funcptr-call keep worst-case from "the bare param is a
@@ -194,7 +215,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Best version | Evidence on main |
 |---|---|---|---|
-| H1 | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
+| H1 — **PARTLY DONE (BUG-872)** | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
 | ~~H2~~ **DONE (BUG-858)** | **Recycled pool/slab slot is not zeroed** | **r1piyr** BUG-861 | Verified: `alloc_recycled_slot_zeroed` exits 1 — the slot comes back holding the previous object bit-for-bit, against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A `?*T` field returns non-null and dangling, so safe ZER can unwrap and deref it. **Invisible to ASan** — the reuse is inside ZER-owned storage |
 | ~~H3~~ **DONE (BUG-863)** | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
 | ~~H4~~ **DONE (BUG-859)** | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
@@ -202,7 +223,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 | ~~H6~~ **DONE (BUG-861)** | **Enum forging through `@truncate` and a struct carrier** | **qa249l** | 3 accepted. My BUG-843 closed `@bitcast` only; these are the sibling routes |
 | ~~H7~~ **DONE (BUG-862)** | **`free` of an inline-array field slice** | **29fiao** | `free(s.buf[0..])` on an inline array accepted; the same without the index was already rejected |
 | ~~H8~~ **DONE (BUG-864, narrowed)** | **Non-null funcptr global** | **qa249l** | `funcptr_global_nonnull` accepted |
-| H9 | **Optional comparison** | **qa249l** | 2 accepted. My BUG-841 covered struct/union; `?T == ?T` and `?T == T` were left |
+| ~~H9~~ **DONE (BUG-871)** | **Optional comparison** | **qa249l** | 2 accepted. My BUG-841 covered struct/union; `?T == ?T` and `?T == T` were left |
 
 ### LIVE — compiler crash
 

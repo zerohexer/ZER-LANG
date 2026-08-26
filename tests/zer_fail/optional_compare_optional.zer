@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: an optional carries a HAS-VALUE flag
+// BUG-871 sibling: `?T == ?T` reached GCC ("invalid operands to binary ==")
+// with no ZER diagnostic at all.
+?u32 mk(u32 x) { if (x > 0) { return x; } return null; }
+u32 main() {
+    ?u32 a = mk(5);
+    ?u32 b = mk(5);
+    if (a == b) { return 1; }
+    return 0;
+}

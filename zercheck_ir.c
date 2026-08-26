@@ -5137,11 +5137,40 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             int param_idx = summary->returns_param_color - 1;
             if (param_idx < inst->expr->call.arg_count) {
                 Node *arg = inst->expr->call.args[param_idx];
-                if (arg && arg->kind == NODE_IDENT) {
-                    int arg_local = ir_find_local_exact_first(func,
-                        arg->ident.name, (uint32_t)arg->ident.name_len);
+                /* BUG-872: this tested `arg->kind == NODE_IDENT`, so passing the
+                 * allocation through a PROJECTION — a struct field, an array
+                 * element, a sub-slice — failed to find the argument's handle,
+                 * `dest_aliased_from_param` stayed false, and the call result
+                 * registered as a FRESH allocation instead of an ALIAS. The
+                 * free of the original then did not reach it:
+                 *
+                 *     [*]u8 head([*]u8 s) { return s[0..2]; }
+                 *     struct Box { [*]u8 s; }
+                 *     b.s = alloc(u8,4) orelse ...;
+                 *     [*]u8 h = head(b.s);  free(b.s);  h[0]   // ACCEPTED
+                 *
+                 * ASan-confirmed heap-use-after-free from pure safe ZER, while
+                 * `head(s)` on a bare ident one line away was rejected — two
+                 * spellings of one program disagreeing.
+                 *
+                 * `ir_extract_compound_key` is the shared resolver every other
+                 * argument sink in this file already uses (the wrong-pool
+                 * check, the free sinks, the spawn-arg checks); it peels
+                 * identity casts, walks the field/index path and returns the
+                 * root local plus the path key. Same three-step lookup as
+                 * those sites: compound handle, then the root's own handle as
+                 * the fallback for a path that was never registered
+                 * separately. */
+                int arg_local = -1;
+                const char *apath = NULL; uint32_t apath_len = 0;
+                if (arg && ir_extract_compound_key(zc, func, arg, &arg_local,
+                                                   &apath, &apath_len) == 0) {
                     if (arg_local >= 0) {
-                        IRHandleInfo *arg_h = ir_arg_view_handle(ps, arg_local);
+                        IRHandleInfo *arg_h = (apath_len == 0)
+                            ? ir_arg_view_handle(ps, arg_local)
+                            : ir_find_compound_handle(ps, arg_local, apath, apath_len);
+                        if (!arg_h && apath_len > 0)
+                            arg_h = ir_arg_view_handle(ps, arg_local);
                         if (arg_h) {
                             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                             if (dh) {

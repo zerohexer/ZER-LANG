@@ -1,0 +1,24 @@
+// BOUNDARY POSITIVES for BUG-872: widening the call-result alias to
+// projections must not reject the same shapes when the view is USED BEFORE the
+// free. These are exactly the programs the fix is supposed to keep compiling.
+[*]u8 head([*]u8 s) { return s[0..2]; }
+struct Box { [*]u8 s; }
+
+u32 main() {
+    Box b;
+    b.s = alloc(u8, 4) orelse { return 1; };
+    b.s[0] = 7;
+    [*]u8 h = head(b.s);
+    u32 v = (u32)h[0];
+    free(b.s);
+    if (v != 7) { return 2; }
+
+    // a sub-slice argument
+    [*]u8 s = alloc(u8, 8) orelse { return 3; };
+    s[0] = 5;
+    [*]u8 h2 = head(s[0..4]);
+    u32 v2 = (u32)h2[0];
+    free(s);
+    if (v2 != 5) { return 4; }
+    return 0;
+}

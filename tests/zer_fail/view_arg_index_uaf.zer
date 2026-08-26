@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-872, second projection shape: an ARRAY ELEMENT rather than a struct
+// field. The call-result alias resolver tested `arg->kind == NODE_IDENT`, so
+// any projection lost the argument's handle and the result registered as a
+// FRESH allocation that the free never reached.
+[*]u8 head([*]u8 s) { return s[0..2]; }
+struct Slot { [*]u8 s; }
+u32 main() {
+    Slot[2] slots;
+    slots[0].s = alloc(u8, 4) orelse { return 1; };
+    [*]u8 h = head(slots[0].s);
+    free(slots[0].s);
+    return h[0];
+}

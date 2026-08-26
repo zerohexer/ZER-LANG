@@ -5,6 +5,83 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26c — BUG-895/896: an indirect-call carrier, six intrinsics writing through const
+
+Adopted from `claude/vigilant-tesla-as71kk` (`6af2497e`, `a1919aa5`). Both applied with
+no conflicts.
+
+### BUG-895 — the indirect-call `keep` worst-case tested the BARE kind
+An indirect (funcptr) call cannot see its target, so it worst-cases pointer parameters as
+`keep` — that is what stops a stack pointer reaching a retaining callback. The test was on
+the parameter's BARE kind, so it caught `*T` and missed every wrapper carrying the same
+reference:
+
+```
+?*u32 g;
+void setg(?*u32 v) { g = v; }
+u32 x = 5;  *(?*u32) fp = setg;  fp(&x);          // accepted
+
+struct Holder { ?*u32 p; }
+void setg(Holder h) { g = h.p; }
+Holder h; h.p = &x;  fp(h);                        // accepted
+```
+
+Confirmed rather than taken on trust: a variant that actually READS the escaped pointer
+after the frame dies reports `AddressSanitizer: stack-use-after-return`. (The branch's own
+negative stores the pointer and returns without reading it, so ASan alone is silent on
+that file — the rejection is the oracle there, not the sanitizer.) The DIRECT call of each
+shape was already rejected one line away — two spellings of one program disagreeing, this
+codebase's reliable tell for a carrier gap.
+
+Fixed by asking the shared `type_carries_data_pointer` predicate instead of a hand-rolled
+kind test — the same class-kill the handle and pointer carriers already use. Corpus cost
+zero.
+
+**The TOP-LEVEL slice / opaque exemption is kept deliberately** and verified still to
+hold: it exists so `callback(local_array)` against a `[*]T` callback parameter stays
+allowed, and it was measured before being granted. A pointer NESTED in a struct gets no
+such exemption — nothing in the corpus needs it, and the launder is what the rule is for.
+
+### BUG-896 — six intrinsics that STORE through a `const` buffer
+Twelve pointer-taking CPU/cache intrinsics validated "is this a pointer or an array?" and
+NOTHING about qualifiers — twelve copies of one shape, each missing the same check.
+`@cstr` has had exactly this rule since BUG-238 and nothing else did.
+
+The subset fixed is the unambiguous one: the six that STORE through the pointer
+(`@nt_store`, `@cpu_fxsave`, `@cpu_xsave`, `@cpu_save_context`, `@cpu_save_fpu`,
+`@cache_zero_line`). A const global can live in `.rodata` — or, on bare metal, in FLASH,
+where the write neither faults nor takes effect, which is the silent case. The READING
+members of the same family (`@cpu_fxrstor`, `@cpu_xrstor`, `@cache_flushopt`, …) are
+deliberately untouched: they consume the address, so a const source is correct usage and
+rejecting it would be an over-rejection. Verified: `@cpu_fxrstor(const_buf)` still
+compiles.
+
+Found by `tools/qualifier_closure_probe.sh`, which is worth more than the fix. See the
+tooling note below.
+
+### The harness bug this exposed — and its SIBLING
+Wiring the three CLI-validation negatives (rules that shipped with BUG-855 but had no
+executed test) exposed a defect in the negative runner itself: it ran
+`grep -qF "$want"` without `--`, so an `expect-error` string STARTING WITH A DASH was
+parsed by grep as its own options. Proven at the shell level:
+
+```
+$ grep -qF   "--stack-limit must be a positive integer" file   # FAILS
+$ grep -qF -- "--stack-limit must be a positive integer" file  # matches
+```
+
+`cli_bad_stack_limit` reported WRONG REASON while the diagnostic contained the expected
+substring verbatim. **Any rule whose message opens with a flag name was untestable through
+this harness.**
+
+as71kk fixed the site it had measured. `tests/test_zer.sh` had TWO more `grep -q` sites
+taking a variable pattern — the `gap-masked-by` check (line ~193) and the warning-pattern
+check (~256) — with the identical defect. Both now carry `--`. Fixing only the measured
+site is the sibling-site mistake this project keeps recording; the third site
+(`grep -qi "warning"`) takes a literal and is left alone.
+
+---
+
 ## Session 2026-08-26b — BUG-892..894: a null optional equal to 0, a drifted rule, an inline free
 
 Adopted from `claude/vigilant-tesla-as71kk` (`dda5b33b`). One conflict in `checker.c`,

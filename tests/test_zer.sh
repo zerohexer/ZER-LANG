@@ -136,7 +136,13 @@ for f in tests/zer_fail/*.zer; do
     $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>/tmp/_zer_neg_err.txt
     ret=$?
     if [ $ret -ne 0 ]; then
-        if [ -n "$want" ] && ! grep -qF "$want" /tmp/_zer_neg_err.txt; then
+        # `-- ` before the pattern: without it grep parses an expect-error string
+        # that STARTS WITH A DASH as its own options. Measured on
+        # cli_bad_stack_limit, whose expected substring is
+        # "--stack-limit must be a positive integer" — the diagnostic contained it
+        # verbatim and the test still reported WRONG REASON. Any rule whose message
+        # opens with a flag name was untestable through this harness.
+        if [ -n "$want" ] && ! grep -qF -- "$want" /tmp/_zer_neg_err.txt; then
             FAIL=$((FAIL + 1))
             echo "  FAIL: $name (rejected, but for the WRONG REASON)"
             echo "        expected to contain: $want"
@@ -184,7 +190,12 @@ for f in tests/zer_gaps/*.zer; do
     if [ $gret -eq 0 ]; then
         GAP_OK=$((GAP_OK + 1))
         echo "  ok:   $name (gap still open)"
-    elif [ -n "$maskby" ] && grep -qF "$maskby" /tmp/_zer_gap_err.txt; then
+    # `--` here for the same reason as the expect-error site above: a
+    # gap-masked-by string that STARTS WITH A DASH would be parsed by grep as
+    # its own options. The two sites answer the same question and must not
+    # drift; fixing only the one that had been measured is the sibling-site
+    # mistake this project keeps recording.
+    elif [ -n "$maskby" ] && grep -qF -- "$maskby" /tmp/_zer_gap_err.txt; then
         GAP_OK=$((GAP_OK + 1))
         echo "  ok:   $name (known masking: $maskby)"
     else
@@ -247,7 +258,7 @@ warn_check() {
     TOTAL=$((TOTAL + 1))
     output=$($ZERC "$f" --run 2>&1)
     ret=$?
-    if [ $ret -eq 0 ] && echo "$output" | grep -q "$pattern"; then
+    if [ $ret -eq 0 ] && echo "$output" | grep -q -- "$pattern"; then
         PASS=$((PASS + 1))
         echo "  PASS: $name (warning verified)"
     elif [ $ret -ne 0 ]; then

@@ -1,0 +1,5 @@
+// zerc-flags: --target-arch=arm64
+// expect-error: unknown --target-arch 'arm64'
+// BUG-844: an unknown arch fell through silently and left the x86_64 default,
+// so this cross-compile produced an x86 binary and reported success.
+u32 main() { return 0; }

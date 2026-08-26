@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-857: an INDIRECT call worst-cased only a bare `*T` parameter, so a `?*T`
+// callback parameter let a stack pointer reach a retaining target with no
+// diagnostic. ASan-confirmed stack-use-after-return; the DIRECT call of the
+// same function was already rejected one line away.
+?*u32 g;
+
+void setg(?*u32 v) { g = v; }
+
+i32 main() {
+    u32 x = 5;
+    *(?*u32) fp = setg;
+    fp(&x);
+    return 0;
+}

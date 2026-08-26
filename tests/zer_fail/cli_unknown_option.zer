@@ -1,0 +1,5 @@
+// zerc-flags: --totally-bogus-flag
+// expect-error: unknown option '--totally-bogus-flag'
+// BUG-844: every unrecognised option was silently ignored and the build
+// reported success, so a typo'd safety flag was quietly absent.
+u32 main() { return 0; }

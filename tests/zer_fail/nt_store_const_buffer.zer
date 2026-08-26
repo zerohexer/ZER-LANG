@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: writes through its buffer argument, which is const
+// BUG-877: @nt_store is a STORE, and it validated only "is this a pointer or an
+// array?" — nothing about qualifiers. Storing through a const buffer targets
+// read-only memory; on bare metal that is FLASH, where the write neither faults
+// nor takes effect, which is the silent case. Found by
+// tools/qualifier_closure_probe.sh, which feeds a const and a volatile pointer
+// into every argument slot of every intrinsic and uses GCC's -Wcast-qual as the
+// oracle. Twelve intrinsics shared this shape; the six that WRITE are fixed.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+u32 backing;
+u32 main() {
+    const *u32 cp = &backing;
+    @nt_store(cp, 7);
+    return 0;
+}

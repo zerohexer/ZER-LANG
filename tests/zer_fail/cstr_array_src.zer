@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: @cstr source must be a slice
+// BUG-861: an ARRAY source emitted `__auto_type t = arr; t.ptr` — invalid C.
+// Rejected with the slice spelling rather than silently emitted.
+u32 main() {
+    u8[16] buf;
+    u8[4] arr;
+    @cstr(buf, arr);
+    return 0;
+}

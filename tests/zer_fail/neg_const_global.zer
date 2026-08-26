@@ -1,0 +1,3 @@
+// expect-error: negative constant -1 does not fit unsigned type
+u64 g = -1;
+u32 main() { if (g == 0) { return 0; } return 1; }

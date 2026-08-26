@@ -1,0 +1,6 @@
+// expect-error: negative constant -1 does not fit unsigned type
+?u32 maybe(u32 k) { if (k == 0) { return null; } return k; }
+u32 main() {
+    u32 v = maybe(0) orelse -1;
+    return v;
+}

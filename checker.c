@@ -1120,6 +1120,118 @@ static Type *int_retype_target(Type *t) {
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
 
+/* ---------------------------------------------------------------------------
+ * BUG-863: a NEGATIVE compile-time constant flowing into an UNSIGNED type.
+ *
+ * `u32 a = -1;` was accepted and silently became 4294967295, while `u8 b = -1;`
+ * was rejected — the same rule appearing to fire at some widths and not others.
+ * It was never a rule: the narrow widths rejected only INCIDENTALLY, because
+ * `-1` types as u32 and u32 -> u8 is a narrowing mismatch. At u32/u64 there is
+ * no narrowing, so nothing objected. ZER's own table says "No implicit
+ * narrowing or sign conversion"; this was the sign half, unenforced.
+ * ------------------------------------------------------------------------- */
+
+/* Does this pure-literal tree contain an explicit unary `-`? */
+static bool literal_tree_has_unary_minus(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_UNARY)
+        return e->unary.op == TOK_MINUS ||
+               literal_tree_has_unary_minus(e->unary.operand);
+    if (e->kind == NODE_BINARY)
+        return literal_tree_has_unary_minus(e->binary.left) ||
+               literal_tree_has_unary_minus(e->binary.right);
+    return false;
+}
+
+/* Does it contain a literal above INT64_MAX? `eval_const_expr` folds in int64,
+ * so such an operand makes the folded SIGN meaningless — `0xDEADBEEFCAFEBABE`
+ * reads back as a negative number while being a perfectly good u64 constant. */
+static bool literal_tree_has_huge_operand(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_INT_LIT)
+        return e->int_lit.value > (uint64_t)INT64_MAX;
+    if (e->kind == NODE_UNARY)
+        return literal_tree_has_huge_operand(e->unary.operand);
+    if (e->kind == NODE_BINARY)
+        return literal_tree_has_huge_operand(e->binary.left) ||
+               literal_tree_has_huge_operand(e->binary.right);
+    return false;
+}
+
+/* NOTE for anyone extending this: TYPE_UINT is the ARBITRARY-WIDTH `uN` kind,
+ * NOT "an unsigned integer" — plain u32 is TYPE_U32. A hand-rolled
+ * `kind == TYPE_UINT` test therefore covers `u21` and misses every ordinary
+ * width, which is exactly the silent no-op this rule was written to close.
+ * `type_is_unsigned` delegates to the VST-verified `zer_type_kind_is_unsigned`,
+ * which enumerates all six unsigned kinds. */
+static bool unsigned_int_destination(Type *t) {
+    if (!t) return false;
+    Type *e = type_unwrap_distinct(t);
+    if (!e) return false;
+    if (type_dispatch_kind(e) == TYPE_OPTIONAL)
+        e = type_unwrap_distinct(e->optional.inner);
+    return e && type_is_unsigned(e);
+}
+
+static bool const_negative_into_unsigned(Node *value, Type *target) {
+    if (!value || !unsigned_int_destination(target)) return false;
+    if (!is_pure_int_literal_expr(value)) return false;
+    /* Require an explicit `-` in the source. A bare large literal is NOT a
+     * negative constant even though the int64 fold reports one — the first draft
+     * of this rule rejected `u64 y = 0xDEADBEEFCAFEBABE;` for exactly that
+     * reason. The narrower rule costs a little coverage (`u32 a = 1 - 2;` still
+     * slips, folding negative without a unary minus) and buys zero false
+     * positives, which is the right trade for a TIGHTENING whose whole
+     * justification is consistency between widths. */
+    if (!literal_tree_has_unary_minus(value)) return false;
+    if (literal_tree_has_huge_operand(value)) return false;
+    int64_t v = eval_const_expr(value);
+    if (v == CONST_EVAL_FAIL) return false;
+    return v < 0;
+}
+
+/* THE value-flow compatibility question — "may a value of type `vt`, written as
+ * the expression `value`, flow into a destination of type `target`?"
+ *
+ * This exact three-condition chain
+ *     !type_equals(target, vt) && !can_implicit_coerce(vt, target) &&
+ *     !is_literal_compatible(value, target)
+ * was written out at EIGHT sinks — designated-init field, assignment, call
+ * argument, orelse fallback, var-decl init, return, spawn argument and
+ * global-var init. Eight copies of one question is the multi-site shape
+ * CLAUDE.md names as the #1 recurring bug class, and it is exactly what let the
+ * negative literal stay accepted at every one of them: there was no single place
+ * to add the condition. One query now; each site keeps its own error wording. */
+static bool value_flows_to(Node *value, Type *vt, Type *target) {
+    if (const_negative_into_unsigned(value, target)) return false;
+    if (type_equals(target, vt)) return true;
+    if (can_implicit_coerce(vt, target)) return true;
+    if (is_literal_compatible(value, target)) return true;
+    return false;
+}
+
+/* The negative-constant rejection needs its OWN wording: the generic
+ * type-mismatch message at each sink would print `'u32' with 'u32'` — the same
+ * spelling on both sides — because the negation really is u32-typed, and a
+ * message that cannot express the difference it reports is worse than the hole
+ * it replaced. Returns true when it handled the diagnosis, so the caller skips
+ * its generic message. */
+static bool report_negative_const_flow(Checker *c, Node *value, Type *target,
+                                       int line, const char *what) {
+    if (!const_negative_into_unsigned(value, target)) return false;
+    long long v = (long long)eval_const_expr(value);
+    /* type_name() rotates only TWO static buffers — capture before formatting
+     * (CLAUDE.md "type_name() uses 2-buffer rotation"). */
+    char tn[96];
+    snprintf(tn, sizeof(tn), "%s", type_name(target));
+    checker_error(c, line,
+        "%s: negative constant %lld does not fit unsigned type '%s' — ZER has no "
+        "implicit sign conversion. Use @bitcast(%s, %lld) for the bit pattern, or "
+        "write the value directly",
+        what, v, tn, tn, v);
+    return true;
+}
+
 /* BUG-392: Build a string key from an expression for union switch locking.
  * Same pattern as zercheck's handle_key_from_expr.
  *
@@ -2932,13 +3044,15 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                  * Same question, second sink. */
                 check_inttoptr_dest_volatile(c, df->value, ft, line);
                 Type *vt = checker_get_type(c, df->value);
-                if (vt && ft && !type_equals(ft, vt) &&
-                    !can_implicit_coerce(vt, ft) &&
-                    !is_literal_compatible(df->value, ft)) {
-                    checker_error(c, line,
-                        "field '.%.*s' expects '%s', got '%s'",
-                        (int)df->name_len, df->name,
-                        type_name(ft), type_name(vt));
+                if (vt && ft && !value_flows_to(df->value, vt, ft)) {
+                    char what[96];
+                    snprintf(what, sizeof(what), "field '.%.*s'",
+                             (int)df->name_len, df->name);
+                    if (!report_negative_const_flow(c, df->value, ft, line, what))
+                        checker_error(c, line,
+                            "field '.%.*s' expects '%s', got '%s'",
+                            (int)df->name_len, df->name,
+                            type_name(ft), type_name(vt));
                 } else if (df->value && is_pure_int_literal_expr(df->value)) {
                     /* LIT-1: `.baud = -7` into a 64-bit field must compute -7 in
                      * the field's width, not the literal's default u32. */
@@ -6985,12 +7099,12 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
-            if (!type_equals(target, value) &&
-                !can_implicit_coerce(value, target) &&
-                !is_literal_compatible(node->assign.value, target)) {
-                checker_error(c, node->loc.line,
-                    "cannot assign '%s' to '%s'",
-                    type_name(value), type_name(target));
+            if (!value_flows_to(node->assign.value, value, target)) {
+                if (!report_negative_const_flow(c, node->assign.value, target,
+                                                node->loc.line, "assignment"))
+                    checker_error(c, node->loc.line,
+                        "cannot assign '%s' to '%s'",
+                        type_name(value), type_name(target));
             }
             /* BUG-373: integer literal range check on assignment */
             if (node->assign.value->kind == NODE_INT_LIT &&
@@ -8131,13 +8245,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
 
-                    if (!type_equals(param, arg) &&
-                        !can_implicit_coerce(arg, param) &&
-                        !is_literal_compatible(node->call.args[i], param) &&
+                    if (!value_flows_to(node->call.args[i], arg, param) &&
                         !slice_to_ptr_ok) {
-                        checker_error(c, node->loc.line,
-                            "argument %u: expected '%s', got '%s'",
-                            i + 1, type_name(param), type_name(arg));
+                        char what[48];
+                        snprintf(what, sizeof(what), "argument %u", i + 1);
+                        if (!report_negative_const_flow(c, node->call.args[i], param,
+                                                        node->loc.line, what))
+                            checker_error(c, node->loc.line,
+                                "argument %u: expected '%s', got '%s'",
+                                i + 1, type_name(param), type_name(arg));
                     } else if (is_pure_int_literal_expr(node->call.args[i])) {
                         /* LIT-1: `f(-3)` where the param is i64 (or ?i64) must
                          * pass -3 computed in i64, not the literal's default u32. */
@@ -9492,12 +9608,12 @@ static Type *check_expr(Checker *c, Node *node) {
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
-                if (!type_equals(unwrapped, fallback) &&
-                    !can_implicit_coerce(fallback, unwrapped) &&
-                    !is_literal_compatible(node->orelse.fallback, unwrapped)) {
-                    checker_error(c, node->loc.line,
-                        "orelse fallback type '%s' doesn't match '%s'",
-                        type_name(fallback), type_name(unwrapped));
+                if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
+                    if (!report_negative_const_flow(c, node->orelse.fallback, unwrapped,
+                                                    node->loc.line, "orelse fallback"))
+                        checker_error(c, node->loc.line,
+                            "orelse fallback type '%s' doesn't match '%s'",
+                            type_name(fallback), type_name(unwrapped));
                 }
                 result = unwrapped;
             }
@@ -9821,6 +9937,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->intrinsic.arg_count);
                 }
             }
+
         }
 
         if (nlen == 4 && memcmp(name, "size", 4) == 0) {
@@ -11403,6 +11520,56 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
+            /* BUG-862: EVERY @cstr check below is a NEGATIVE one — "if the
+             * destination is const, error"; "if it is a raw pointer, error".
+             * A type matching NONE of them was therefore accepted BY DEFAULT,
+             * and the emitter casts arg0 straight to `uint8_t*`. So
+             *
+             *     u32 gi = 4096;  const [*]u8 sl = "hi";  @cstr(gi, sl);
+             *
+             * BUILT (gcc only warns on -Wint-conversion) and memcpy'd through
+             * an address taken from an INTEGER: no mmio range, no alignment
+             * check, no bounds check. That is precisely the conversion the
+             * grammar-closure claim says cannot be spelled — "no
+             * integer-to-pointer cast except through @inttoptr with mandatory
+             * mmio". Hosted, address 4096 faults; on bare metal it is ordinary
+             * RAM or flash and the write silently lands.
+             *
+             * The structural fix is an ALLOW-list, not one more deny rule: name
+             * the shapes @cstr can lower, and reject everything else. Measured
+             * corpus cost: zero — every existing use passes an array/slice/
+             * pointer destination and a slice or string-literal source. */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line,
+                    "@cstr takes exactly 2 arguments (destination buffer, source slice), got %d",
+                    node->intrinsic.arg_count);
+            }
+            if (node->intrinsic.arg_count >= 1) {
+                Type *dt = typemap_get(c, node->intrinsic.args[0]);
+                TypeKind dk = dt ? type_dispatch_kind(dt) : TYPE_VOID;
+                /* TYPE_POINTER is admitted here and NARROWED by the raw-pointer
+                 * rule below (only volatile-MMIO and *opaque survive it). */
+                if (dk != TYPE_ARRAY && dk != TYPE_SLICE && dk != TYPE_POINTER) {
+                    checker_error(c, node->loc.line,
+                        "@cstr destination must be a buffer — a fixed array 'u8[N]' or a slice "
+                        "'[*]u8' — got '%s'", dt ? type_name(dt) : "?");
+                }
+            }
+            if (node->intrinsic.arg_count >= 2) {
+                Type *st = typemap_get(c, node->intrinsic.args[1]);
+                TypeKind sk = st ? type_dispatch_kind(st) : TYPE_VOID;
+                /* The emitter binds the source with `__auto_type` and reads
+                 * `.len` / `.ptr`, so only a slice lowers. A string literal IS
+                 * a slice. An ARRAY source emitted `t = arr; t.ptr` — invalid C
+                 * whose diagnostic points at generated code the user never
+                 * wrote, which is not a usable diagnostic. */
+                if (sk != TYPE_SLICE) {
+                    checker_error(c, node->loc.line,
+                        "@cstr source must be a slice '[*]u8' (a string literal is one) — got '%s'"
+                        "%s", st ? type_name(st) : "?",
+                        sk == TYPE_ARRAY ? "; slice it with 'arr[0..]'" : "");
+                }
+            }
             /* BUG-238: reject @cstr to const destination */
             if (node->intrinsic.arg_count >= 1 &&
                 node->intrinsic.args[0]->kind == NODE_IDENT) {
@@ -13231,11 +13398,15 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            if (!type_equals(type, init_type) &&
-                !can_implicit_coerce(init_type, type) &&
-                !is_literal_compatible(node->var_decl.init, type)) {
+            if (!value_flows_to(node->var_decl.init, init_type, type)) {
+                char what[96];
+                snprintf(what, sizeof(what), "'%.*s'",
+                         (int)node->var_decl.name_len, node->var_decl.name);
+                if (report_negative_const_flow(c, node->var_decl.init, type,
+                                               node->loc.line, what)) {
+                    /* diagnosed with the sign-specific wording */
                 /* RF6: better error for null used with non-optional type */
-                if (node->var_decl.init->kind == NODE_NULL_LIT) {
+                } else if (node->var_decl.init->kind == NODE_NULL_LIT) {
                     checker_error(c, node->loc.line,
                         "'null' can only be assigned to optional types (?*T, ?T) — "
                         "'%s' is not optional",
@@ -15468,12 +15639,13 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             if (c->current_func_ret) {
-                if (!type_equals(c->current_func_ret, ret_type) &&
-                    !can_implicit_coerce(ret_type, c->current_func_ret) &&
-                    !is_literal_compatible(node->ret.expr, c->current_func_ret)) {
-                    checker_error(c, node->loc.line,
-                        "return type '%s' doesn't match function return type '%s'",
-                        type_name(ret_type), type_name(c->current_func_ret));
+                if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
+                    if (!report_negative_const_flow(c, node->ret.expr,
+                                                    c->current_func_ret,
+                                                    node->loc.line, "return value"))
+                        checker_error(c, node->loc.line,
+                            "return type '%s' doesn't match function return type '%s'",
+                            type_name(ret_type), type_name(c->current_func_ret));
                 } else if (is_pure_int_literal_expr(node->ret.expr)) {
                     /* LIT-1: `return -3;` from an i64 (or ?i64) function must
                      * compute in i64, not the literal's default u32. */
@@ -16932,12 +17104,14 @@ static void check_stmt(Checker *c, Node *node) {
                         typemap_set(c, node->spawn_stmt.args[i], param_type);
                     }
                 }
-                if (!type_equals(param_type, arg_type) &&
-                    !can_implicit_coerce(arg_type, param_type) &&
-                    !is_literal_compatible(node->spawn_stmt.args[i], param_type)) {
-                    checker_error(c, node->loc.line,
-                        "spawn argument %d: expected '%s', got '%s'",
-                        i + 1, type_name(param_type), type_name(arg_type));
+                if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
+                    char what[48];
+                    snprintf(what, sizeof(what), "spawn argument %d", i + 1);
+                    if (!report_negative_const_flow(c, node->spawn_stmt.args[i],
+                                                    param_type, node->loc.line, what))
+                        checker_error(c, node->loc.line,
+                            "spawn argument %d: expected '%s', got '%s'",
+                            i + 1, type_name(param_type), type_name(arg_type));
                 }
             }
         }
@@ -21114,13 +21288,16 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     "global arrays must use literal initializers",
                     (int)decl->var_decl.name_len, decl->var_decl.name);
             }
-            if (!type_equals(type, init) &&
-                !can_implicit_coerce(init, type) &&
-                !is_literal_compatible(decl->var_decl.init, type)) {
-                checker_error(c, decl->loc.line,
-                    "cannot initialize '%.*s' of type '%s' with '%s'",
-                    (int)decl->var_decl.name_len, decl->var_decl.name,
-                    type_name(type), type_name(init));
+            if (!value_flows_to(decl->var_decl.init, init, type)) {
+                char what[96];
+                snprintf(what, sizeof(what), "global '%.*s'",
+                         (int)decl->var_decl.name_len, decl->var_decl.name);
+                if (!report_negative_const_flow(c, decl->var_decl.init, type,
+                                                decl->loc.line, what))
+                    checker_error(c, decl->loc.line,
+                        "cannot initialize '%.*s' of type '%s' with '%s'",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        type_name(type), type_name(init));
             }
             /* BUG-373: integer literal range check for globals */
             if (decl->var_decl.init->kind == NODE_INT_LIT &&

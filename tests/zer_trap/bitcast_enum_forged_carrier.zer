@@ -1,0 +1,22 @@
+// expect-trap
+// BUG-864, the CARRIER AXIS. The variant guard was a TOP-LEVEL kind test
+// (`type_dispatch_kind(t) != TYPE_ENUM` -> return), so a struct WRAPPER walked
+// straight past it: `@bitcast(Box, 7)` forges `Box.s` exactly as effectively as
+// the bare spelling, and the exhaustive switch over `b.s` ran its last arm.
+//
+// Same wrapper-hides-the-inner-kind family that audit_carrier_dispatch.sh
+// exists to freeze. The guard now walks struct fields, optional payloads and
+// array elements.
+//
+// Pre-fix this exited 12. It must now SIGTRAP.
+enum State { idle, running, done }
+struct Box { State s; }
+u32 opaque_u32(u32 v) { return v; }
+u32 main() {
+    Box b = @bitcast(Box, opaque_u32(7));
+    switch (b.s) {
+        .idle => { return 10; }
+        .running => { return 11; }
+        .done => { return 12; }
+    }
+}

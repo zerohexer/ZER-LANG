@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: @cstr destination must be a buffer
+// BUG-861. This BUILT before the fix — `zerc f.zer` exited 0 and produced a
+// binary that memcpy'd a slice through an address taken from an INTEGER. gcc
+// only warns (-Wint-conversion), so nothing in the pipeline objected.
+//
+// It is the conversion ZER's grammar closure says cannot be spelled: "no
+// integer-to-pointer cast except through @inttoptr with mandatory mmio". No
+// mmio range, no alignment check, no bounds check. Hosted, address 4096 faults;
+// on bare metal it is ordinary RAM or flash and the write silently lands.
+u32 gi;
+u32 main() {
+    const [*]u8 sl = "hi";
+    gi = 4096;
+    @cstr(gi, sl);
+    return 0;
+}

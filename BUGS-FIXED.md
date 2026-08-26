@@ -5,6 +5,72 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26 — BUG-889..891: the @cstr door, the sign half, enum siblings
+
+Adopted from `claude/vigilant-tesla-as71kk` (`ccdd49ee`). Its BUG-861 (recycled-slot
+auto-zero) was ALREADY on main as BUG-858, so the cherry-pick's duplicate `memset` in
+both `_zer_pool_alloc` and `_zer_slab_alloc` was removed rather than shipped twice.
+
+### BUG-889 — `@cstr` was a second, unguarded integer-to-pointer door
+Every check on `@cstr`'s destination was a NEGATIVE one ("if const, error"; "if a raw
+pointer, error"), so a type matching NONE of them was accepted BY DEFAULT and the
+emitter cast arg0 straight to `uint8_t*`. Measured on main:
+
+```
+u32 gi = 4096;  u8[16] sl;  @cstr(gi, sl);      // accepted, exit 0
+// emitted:  memcpy(gi, _zer_cs0.ptr, _zer_cs0.len); ((uint8_t*)gi)[len] = 0;
+```
+
+That is a `memcpy` THROUGH an address taken from an integer — no `mmio` range, no
+alignment check, no bounds check — i.e. exactly the conversion the grammar-closure claim
+says cannot be spelled in ZER (`checker.c` permits no integer-to-pointer cast except
+`@inttoptr` with a mandatory `mmio` declaration). **Fix:** an ALLOW-list (array / slice /
+pointer destination, slice source) plus an arity check, replacing the deny-list. Corpus
+cost zero.
+
+**The general shape:** a deny-list answers "is this one of the things I know is wrong?"
+An allow-list answers "is this one of the things I know is right?" Only the second is
+closed under new type kinds. Any guard whose every arm is `if (bad) error` accepts the
+unenumerated case by construction.
+
+### BUG-890 — the SIGN half of "no implicit narrowing or sign conversion", at eight sinks
+`u32 a = -1;` silently became 4294967295 while `u8 b = -1;` was rejected — and the narrow
+widths rejected only INCIDENTALLY, because `-1` types as `u32` and `u32 -> u8` is a
+*narrowing* mismatch. The sign rule itself was never written.
+
+It had nowhere to live: the three-condition compatibility chain (`type_equals` ||
+`can_implicit_coerce` || `is_literal_compatible`) was written out EIGHT times — designated-init
+field, assignment, call arg, orelse fallback, var-decl, return, spawn arg, global init.
+Now ONE query, `value_flows_to`, with each sink keeping its own wording. The rejection
+carries its own message via `report_negative_const_flow`, because the generic
+type-mismatch text would print `'u32' with 'u32'` — the same spelling on both sides,
+since the negation really is u32-typed. Corpus cost zero.
+
+Regression: `tests/zer_fail/neg_const_{vardecl,assign,arg,return,orelse,structinit,spawn,global}.zer`
+— one per sink, which is the only way to prove the query actually replaced all eight.
+
+### BUG-891 — the enum-forge guard reached only some of its doors
+BUG-843 resolved the enum-forging class correctly, by TRACKING (a variant guard that traps
+at the point of forgery, keeping the legitimate read-an-enum-from-a-register idiom
+working) — but it was called from the two `@bitcast` sites only, and tested the target's
+TOP-LEVEL kind. So:
+
+- `@truncate(State, 7)` had no check at all — measured on main: the exhaustive switch ran
+  its LAST arm (exit 1) for a value that is neither variant;
+- `@bitcast(Box, 7)` where `struct Box { State s; }` walked past the top-level test and
+  forged `Box.s` just as effectively — the wrapper-hides-the-inner-kind family the
+  `audit_carrier_dispatch` gate exists for.
+
+The guard now recurses struct fields, optional payloads and array elements
+(`emit_enum_variant_guard_path`), and `@truncate` calls it at BOTH emitter dispatch paths
+(AST ~3653, IR ~7952) — the dual-dispatch invariant. Verified: all four sites present.
+
+An earlier draft on the branch BANNED the conversions and broke
+`tests/zer/bitcast_enum_variant_ok` — the Ban Decision Framework's point exactly, since a
+tracking system does cover the case.
+
+---
+
 ## Session 2026-08-25c — BUG-884..888: the call-RESULT view class, and my container fix replaced
 
 Adopted from `claude/vigilant-tesla-as71kk` rather than re-derived. Where that branch

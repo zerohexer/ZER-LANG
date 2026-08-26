@@ -1,0 +1,16 @@
+// expect-error: local-derived pointer
+// BUG-861 boundary: recording the return summary for a `?*T`-returning function
+// buys PRECISION, not permission. `view()` returns a view of its PARAMETER, so
+// its mask names param 0 — the call-site substitution then asks whether the
+// actual argument is static, and `&local` is not. The escape is still rejected.
+//
+// Without this the BUG-861 fix would read as "optional returns are exempt".
+?*u32 view(*u32 p) { return p; }
+
+?*u32 g;
+
+u32 main() {
+    u32 local = 5;
+    g = view(&local);
+    return 0;
+}

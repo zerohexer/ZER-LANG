@@ -1,0 +1,40 @@
+// BUG-865: `spawn <imported function>` emitted the UNMANGLED name.
+//
+// `spawn tick();` where `tick` comes from `import spawn_mod` produced a forward
+// declaration `void tick();` and a wrapper body calling `tick()`, while the
+// module's definition is `spawn_mod__tick`. Nothing defines `tick`, so the
+// program did not LINK — and the checker accepts the program (the data-race
+// scan even resolves the imported body correctly), so the only signal was
+// `ld returned 1 exit status` with no source line. Spawning an imported
+// function was completely non-functional.
+//
+// The name was spelled raw at FOUR emission sites — two forward-declaration
+// arms and two wrapper bodies — which is why no single fix existed. They now
+// share one helper that applies the same module_prefix rule an ordinary call
+// already used.
+//
+// All three spawn forms are exercised, because each is a separate emission arm:
+// fire-and-forget, scoped (ThreadHandle + join), and with arguments.
+import spawn_mod;
+
+u32 main() {
+    // scoped, no args
+    ThreadHandle t1 = spawn tick();
+    t1.join();
+
+    // scoped, WITH args — the arg-struct wrapper is a different arm
+    ThreadHandle t2 = spawn add(7);
+    t2.join();
+
+    ThreadHandle t3 = spawn add(5);
+    t3.join();
+
+    if (read_total() != 12) { return 1; }
+    if (read_hits() != 1) { return 2; }
+
+    // fire-and-forget: joined only by the two reads above having already run,
+    // so nothing here depends on its timing — it must merely LINK and run.
+    spawn tick();
+
+    return 0;
+}

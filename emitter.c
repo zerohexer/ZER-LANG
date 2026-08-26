@@ -4319,7 +4319,16 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
     inprog[ci] = 0;
     if (emitted[ci]) return;
     emitted[ci] = 1;
-    emit(e, "struct %.*s {\n", (int)st->struct_type.name_len, st->struct_type.name);
+    /* BUG-867: spell the DEFINITION the same way every REFERENCE is spelled.
+     * This used to emit the bare `st->struct_type.name` while a variable of the
+     * type went through EMIT_STRUCT_NAME, which prepends `module_prefix`. For a
+     * stamp created inside an imported module that meant the definition said
+     * `struct Box_u32` and the use said `struct lib2__Box_u32` — GCC saw an
+     * incomplete type, so a `container` template used across a module boundary
+     * did not compile. */
+    emit(e, "struct ");
+    EMIT_STRUCT_NAME(e, st);
+    emit(e, " {\n");
     e->indent++;
     for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
         SField *sf = &st->struct_type.fields[fi];
@@ -4335,6 +4344,13 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
  * by-value container field's struct is always complete before its user. */
 static void emit_container_structs(Emitter *e) {
     if (!e->checker || e->checker->container_inst_count == 0) return;
+    /* BUG-867: once per BUILD, not once per module — the instance list is shared
+     * (a stamp is keyed by template + type argument, not by which module wrote
+     * it), so the per-module call emitted `struct Box_u32` twice and GCC
+     * reported a redefinition. Any `container` template used across a module
+     * boundary hit this. */
+    if (e->container_structs_emitted) return;
+    e->container_structs_emitted = true;
     int n = e->checker->container_inst_count;
     char *emitted = (char *)calloc((size_t)n, 1);
     char *inprog = (char *)calloc((size_t)n, 1);
@@ -5046,6 +5062,30 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
 
 static void emit_type(Emitter *e, Type *t); /* forward decl */
 
+/* BUG-865: the C name of a spawn target, module-mangled when it is imported.
+ *
+ * `spawn tick();` where `tick` comes from `import safe_mod` emitted a forward
+ * declaration `void tick();` and a wrapper body calling `tick()` — the
+ * UNMANGLED name — while the module's definition is `safe_mod__tick`. Nothing
+ * defines `tick`, so the program does not LINK. The checker accepts it (the
+ * data-race scan even resolves the imported body correctly), so the only
+ * signal is `ld returned 1 exit status` with no source line: spawning an
+ * imported function was completely non-functional.
+ *
+ * The rule is the one `emit_expr`'s NODE_IDENT arm already uses for an ordinary
+ * call — if the symbol carries a `module_prefix`, emit `prefix__name`. It was
+ * spelled raw at FOUR spawn sites (two forward-declaration arms, two wrapper
+ * bodies), which is why no single fix existed. One helper, four call sites. */
+static void emit_spawn_target_name(Emitter *e, const char *name, size_t len) {
+    Symbol *s = scope_lookup(e->checker->global_scope, name, (uint32_t)len);
+    if (s && s->module_prefix) {
+        emit(e, "%.*s__%.*s", (int)s->module_prefix_len, s->module_prefix,
+             (int)len, name);
+        return;
+    }
+    emit(e, "%.*s", (int)len, name);
+}
+
 static void emit_spawn_wrappers(Emitter *e) {
     if (e->spawn_wrapper_count == 0) return;
 
@@ -5060,7 +5100,10 @@ static void emit_spawn_wrappers(Emitter *e) {
             /* Emit return type + name + params */
             Type *ft = fsym->type;
             emit_type(e, ft->func_ptr.ret);
-            emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, " ");
+            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                   sn->spawn_stmt.func_name_len);
+            emit(e, "(");
             for (uint32_t pi = 0; pi < ft->func_ptr.param_count; pi++) {
                 if (pi > 0) emit(e, ", ");
                 emit_type(e, ft->func_ptr.params[pi]);
@@ -5073,7 +5116,10 @@ static void emit_spawn_wrappers(Emitter *e) {
                 Type *ret = checker_get_type(e->checker, fn);
                 if (ret && ret->kind == TYPE_FUNC_PTR) {
                     emit_type(e, ret->func_ptr.ret);
-                    emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    emit(e, " ");
+                    emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                           sn->spawn_stmt.func_name_len);
+                    emit(e, "(");
                     for (uint32_t pi = 0; pi < ret->func_ptr.param_count; pi++) {
                         if (pi > 0) emit(e, ", ");
                         emit_type(e, ret->func_ptr.params[pi]);
@@ -5081,8 +5127,10 @@ static void emit_spawn_wrappers(Emitter *e) {
                     emit(e, ");\n");
                 } else {
                     /* Fallback: just emit void func_name(); */
-                    emit(e, "void %.*s();\n",
-                         (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    emit(e, "void ");
+                    emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                           sn->spawn_stmt.func_name_len);
+                    emit(e, "();\n");
                 }
             }
         }
@@ -5140,7 +5188,10 @@ static void emit_spawn_wrappers(Emitter *e) {
         emit(e, "static void *_zer_spawn_wrap_%d(void *_raw) {\n", sid);
         if (ac > 0) {
             emit(e, "    struct _zer_spawn_args_%d *_a = (struct _zer_spawn_args_%d *)_raw;\n", sid, sid);
-            emit(e, "    %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, "    ");
+            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                   sn->spawn_stmt.func_name_len);
+            emit(e, "(");
             for (int i = 0; i < ac; i++) {
                 if (i > 0) emit(e, ", ");
                 emit(e, "_a->a%d", i);
@@ -5148,7 +5199,10 @@ static void emit_spawn_wrappers(Emitter *e) {
             emit(e, ");\n");
             emit(e, "    free(_a);\n");
         } else {
-            emit(e, "    %.*s();\n", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, "    ");
+            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
+                                   sn->spawn_stmt.func_name_len);
+            emit(e, "();\n");
         }
         emit(e, "    return NULL;\n");
         emit(e, "}\n");
@@ -11029,10 +11083,51 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * poll N>1 re-executed side effects) and `while(poll()==0)` saw the user
          * value instead of the done-flag. Coerce the value-return into the
          * void-async termination pattern: the poll protocol is an `int` done-flag,
-         * so emit `self->_zer_state = -1; return 1;` and discard the user value.
-         * (No existing test uses non-void async; a value-retrieval mechanism would
-         * be additive when needed.) */
+         * so emit `self->_zer_state = -1; return 1;` rather than the user value.
+         *
+         * BUG-863: the user value used to be DISCARDED here, which left
+         * `async <non-void>` neither rejected nor retrievable — a silent
+         * footgun. It now lands in the state struct's stable `_zer_result`
+         * field, which `_zer_async_NAME_result(&task)` reads. The poll protocol
+         * is unchanged: still an `int` done-flag, because "is it finished" and
+         * "what did it produce" are different questions. */
         if (inst->src1_local >= 0 && func->is_async) {
+            Type *aret = e->current_func_ret;
+            Type *aret_eff = aret ? type_unwrap_distinct(aret) : NULL;
+            if (aret_eff && type_dispatch_kind(aret_eff) != TYPE_VOID) {
+                IRLocal *asrc = &func->locals[inst->src1_local];
+                Type *asrc_eff = asrc->type ? type_unwrap_distinct(asrc->type) : NULL;
+                /* Same optional wrapping the non-async arm below performs. A
+                 * value-optional (`?u32`) is a `{value, has_value}` STRUCT, so
+                 * assigning the bare local would be a type error; `?void` has
+                 * only has_value; a null-sentinel optional (`?*T`) needs no
+                 * wrap at all. lower_expr represents `null` as a `*void` local,
+                 * which is how the null arm is recognised. */
+                bool a_wrap = (type_dispatch_kind(aret_eff) == TYPE_OPTIONAL &&
+                               !is_null_sentinel(aret_eff->optional.inner) &&
+                               asrc_eff && type_dispatch_kind(asrc_eff) != TYPE_OPTIONAL);
+                bool a_null_src = asrc_eff &&
+                    type_dispatch_kind(asrc_eff) == TYPE_POINTER &&
+                    asrc_eff->pointer.inner &&
+                    type_dispatch_kind(asrc_eff->pointer.inner) == TYPE_VOID;
+                emit(e, "self->_zer_result = ");
+                if (a_wrap && is_void_opt(aret_eff)) {
+                    emit(e, "(_zer_opt_void){ %d }", a_null_src ? 0 : 1);
+                } else if (a_wrap && a_null_src) {
+                    emit(e, "(");
+                    emit_type(e, aret_eff);
+                    emit(e, "){ 0 }");
+                } else if (a_wrap) {
+                    emit(e, "(");
+                    emit_type(e, aret_eff);
+                    emit(e, "){ ");
+                    emit_local_name(e, func, inst->src1_local);
+                    emit(e, ", 1 }");
+                } else {
+                    emit_local_name(e, func, inst->src1_local);
+                }
+                emit(e, "; ");
+            }
             emit(e, "self->_zer_state = -1; return 1;\n");
             break;
         }
@@ -11117,6 +11212,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         } else {
             /* Void or bare return, or array→slice return via expr */
             if (func->is_async) {
+                /* BUG-863: a BARE `return;` from a `?void` function means
+                 * has_value=1 — that is what the non-async path emits
+                 * (`return (_zer_opt_void){ 1 };`). The async twin has to say
+                 * the same thing, or `?void` async results always read as null. */
+                Type *bret = e->current_func_ret;
+                Type *bret_eff = bret ? type_unwrap_distinct(bret) : NULL;
+                if (bret_eff && is_void_opt(bret_eff))
+                    emit(e, "self->_zer_result = (_zer_opt_void){ 1 }; ");
                 emit(e, "self->_zer_state = -1; return 1;\n");
             } else if (inst->expr) {
                 /* lower_expr returned -1 but expr was kept (array/void passthrough).
@@ -12899,21 +13002,54 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     if (!fn) return;
 
     /* Build mangled name */
+    /* BUG-866: the async internal names are NOT module-mangled.
+     *
+     * They used to be — `_zer_async_lib1__acompute` for a coroutine in module
+     * `lib1` — while the CHECKER registers the state-struct type and the
+     * init/poll/result accessors under the UNMANGLED `_zer_async_acompute`
+     * (checker.c, the NODE_FUNC_DECL async arm). So a user of an imported async
+     * wrote exactly what the checker accepts, the emitter emitted it verbatim at
+     * the use site, and GCC found no such type or function: async across module
+     * boundaries did not compile at all, in any form, with the failure landing
+     * as a GCC error in generated code rather than a ZER diagnostic.
+     *
+     * Dropping the prefix here makes all five names agree — the type, _init,
+     * _poll, _result and the state struct — and it is the side that had to move:
+     * the checker's registration is what the user's source spells, and the
+     * accessor names are part of the documented API (reference.md "async").
+     *
+     * The cost is that two modules each defining an async function of the SAME
+     * name now collide, as a C redefinition error. That is loud, and it was
+     * already true of the state-struct TYPE name before this change (the
+     * checker registered it unmangled either way). Recorded in
+     * docs/limitations.md. */
     char mname[256];
-    int flen;
-    if (func->module_prefix) {
-        flen = snprintf(mname, sizeof(mname), "%.*s__%.*s",
-            (int)func->module_prefix_len, func->module_prefix,
-            (int)func->name_len, func->name);
-    } else {
-        flen = snprintf(mname, sizeof(mname), "%.*s",
-            (int)func->name_len, func->name);
-    }
+    int flen = snprintf(mname, sizeof(mname), "%.*s",
+        (int)func->name_len, func->name);
     if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
+
+    /* BUG-863: a value-returning async needs somewhere to PUT the value.
+     * `async u32 compute() { … return 42; }` compiled clean and the state
+     * machine finalized correctly, but the value landed in an internal temp
+     * (`self->_zer_t0`) with no caller-accessible accessor and an unstable name
+     * — so a user who wrote `async <non-void>` could never read the result.
+     * Neither rejected nor retrievable. A stable `_zer_result` field plus a
+     * `_zer_async_NAME_result()` accessor is the additive half of that; the
+     * `int` poll protocol (0 = pending, 1 = done) is untouched, because the
+     * done-flag and the value are different questions. */
+    Type *afn_type = checker_get_type(e->checker, fn);
+    Type *async_ret = (afn_type && type_dispatch_kind(afn_type) == TYPE_FUNC_PTR)
+        ? afn_type->func_ptr.ret : NULL;
+    if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
 
     /* State struct = ALL locals */
     emit(e, "typedef struct {\n");
     emit(e, "    int _zer_state;\n");
+    if (async_ret) {
+        emit(e, "    ");
+        emit_type_and_name(e, async_ret, "_zer_result", 11);
+        emit(e, ";\n");
+    }
     for (int li = 0; li < func->local_count; li++) {
         IRLocal *l = &func->locals[li];
         if (l->is_static) continue;
@@ -12923,6 +13059,18 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         emit(e, ";\n");
     }
     emit(e, "} _zer_async_%.*s;\n\n", flen, mname);
+
+    /* Result accessor — only for a non-void async. Reading it before the poll
+     * protocol reports done yields the zeroed initial value, exactly like any
+     * other field of a freshly `_init`ed task. */
+    if (async_ret) {
+        emit(e, "static inline ");
+        emit_type(e, async_ret);
+        emit(e, " _zer_async_%.*s_result(_zer_async_%.*s *self) {\n",
+             flen, mname, flen, mname);
+        emit(e, "    return self->_zer_result;\n");
+        emit(e, "}\n\n");
+    }
 
     /* Init function */
     emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
@@ -12986,6 +13134,12 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     const char *saved_source = e->source_file;
     e->source_file = NULL;
 
+    /* BUG-863: IR_RETURN reads this to decide whether the async termination
+     * also stores a result. The regular-function path sets it; this one never
+     * did, because until now an async return had no value to carry. */
+    Type *saved_ret = e->current_func_ret;
+    e->current_func_ret = async_ret;
+
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
@@ -13018,6 +13172,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     }
 
     e->source_file = saved_source;
+    e->current_func_ret = saved_ret;
     emit(e, "    } self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");
 

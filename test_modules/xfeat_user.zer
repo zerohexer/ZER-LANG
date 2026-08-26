@@ -1,0 +1,44 @@
+// BUG-866: an `async` function defined in an imported module was unusable.
+// The emitter built its state-struct type and its _init/_poll/_result accessors
+// as `_zer_async_xfeat_mod__acompute*` (module-mangled), while the CHECKER
+// registers them as `_zer_async_acompute*` (unmangled) — which is what the user
+// writes and what the emitter then emits verbatim at the use site. GCC found no
+// such type or function. Async across a module boundary did not compile in any
+// form, and the failure landed as a GCC error in generated code rather than a
+// ZER diagnostic. The emitter now drops the prefix, so all five names agree.
+//
+// BUG-867: a `container` template used across a module boundary emitted its
+// stamped struct TWICE (the instance list is one shared list on the Checker,
+// but it was emitted once per module) AND spelled the definition without the
+// module prefix that every reference to it carries. Two separate GCC errors —
+// "redefinition of 'struct Box_u32'" and an incomplete type — for the same
+// stamp. Now emitted once, with the same name references use.
+import xfeat_mod;
+
+u32 main() {
+    // --- container stamped in BOTH modules: one definition, one name
+    Box(u32) mine;
+    mine.v = 4;
+    Pair(u32) q;
+    q.a = 5;
+    q.b = 6;
+    if (lib_use() != 6) { return 1; }
+    if (mine.v + q.a + q.b != 15) { return 2; }
+
+    // --- value-returning async from a module
+    _zer_async_acompute t;
+    _zer_async_acompute_init(&t, 4);
+    while (_zer_async_acompute_poll(&t) == 0) { }
+    if (_zer_async_acompute_result(&t) != 5) { return 3; }
+
+    // --- void async from a module (no _result accessor exists for it)
+    _zer_async_atick v;
+    _zer_async_atick_init(&v);
+    while (_zer_async_atick_poll(&v) == 0) { }
+
+    // --- an imported function through a funcptr, for good measure
+    ?*(u32) -> u32 fp = dbl;
+    if (fp) |f| { if (f(4) != 8) { return 4; } } else { return 5; }
+
+    return 0;
+}

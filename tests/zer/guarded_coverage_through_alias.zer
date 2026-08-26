@@ -1,0 +1,87 @@
+/* BUG-862: Level-B leak coverage was lost the moment an `?T` intermediate
+ * existed between the allocation and the frees.
+ *
+ *     Handle(Task) h = pool.alloc() orelse return;            // ACCEPTED
+ *     if (c) { pool.free(h); }  if (!c) { pool.free(h); }
+ *
+ *     ?Handle(Task) mh = pool.alloc();                        // REJECTED:
+ *     Handle(Task) h = mh orelse return;                      // "handle 'mh' may
+ *     if (c) { pool.free(h); }  if (!c) { pool.free(h); }     //  not be freed on
+ *                                                             //  all paths"
+ *
+ * `freed_all_paths` is a property of the ALLOCATION, but it was set by direct
+ * assignment on the handle the free named, at three separate free sites, and
+ * never reached the alias group — even though `alloc_id` grouping exists
+ * precisely so `?Handle mh` and `Handle h` ARE one allocation. The
+ * `orelse`-intermediate spelling is the only one available when the optional
+ * has to be inspected before being unwrapped, so this hit real code.
+ *
+ * The fix routes all three sites through ONE sink, `ir_mark_freed_all_paths`,
+ * which marks the whole alias group. Both directions of the flag are correct
+ * for an alias: at the leak check it removes a false leak, and at the use and
+ * double-free sites it makes `ir_use_guard_disjoint` return false — once every
+ * path has freed, no later use or free is admissible through ANY name. The
+ * negatives in tests/zer_fail/guarded_alias_*.zer pin that second direction.
+ */
+
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+Slab(Task) heap;
+
+/* the shape that regressed: optional intermediate, complementary frees */
+void via_optional(bool c) {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+}
+
+/* the same through a heap pointer rather than a Handle */
+void via_ptr(bool c) {
+    ?*Task mt = heap.alloc_ptr();
+    *Task p = mt orelse return;
+    if (c)  { heap.free_ptr(p); }
+    if (!c) { heap.free_ptr(p); }
+}
+
+/* with a real use on the non-freeing arm before its free — all three Level-B
+ * recoveries at once (read, double-free, coverage), now through an alias */
+void via_optional_with_use(bool c) {
+    ?*Task mt = heap.alloc_ptr();
+    *Task p = mt orelse return;
+    if (c) { heap.free_ptr(p); }
+    if (!c) {
+        p.id = 1;
+        heap.free_ptr(p);
+    }
+}
+
+/* the guard may be any immutable bool, including one derived from a read */
+void via_derived_guard() {
+    ?*Task mt = heap.alloc_ptr();
+    *Task p = mt orelse return;
+    bool empty = (p.id == 0);
+    if (empty)  { heap.free_ptr(p); }
+    if (!empty) { p.id = 1; heap.free_ptr(p); }
+}
+
+/* the single-variable form that always worked — kept so the fix cannot have
+ * been bought by breaking it */
+void direct(bool c) {
+    Handle(Task) h = pool.alloc() orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+}
+
+u32 main() {
+    via_optional(true);
+    via_optional(false);
+    via_ptr(true);
+    via_ptr(false);
+    via_optional_with_use(true);
+    via_optional_with_use(false);
+    via_derived_guard();
+    direct(true);
+    direct(false);
+    return 0;
+}

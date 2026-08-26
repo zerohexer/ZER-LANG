@@ -5,6 +5,87 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26f — BUG-904..907: the cross-module pair, and two invented problems
+
+Adopted from `claude/vigilant-tesla-qa249l` (`e2d9cafa`, `aa5fdc74`, `ef09de45`,
+`c56fbdc1`, `c5312903`). Only doc conflicts; the code applied cleanly, except one
+`test_checker_full.c` hunk where main's BUG-848 (local backed arena) and qa249l's BUG-847
+(global arena + global backing) fix the same vacuity two ways — main's kept.
+
+**qa249l is the branch nobody else overlapped with.** It forked earliest (at `430bda19`,
+before §D), so most of its 15 commits were superseded by what landed since — but it is the
+ONLY branch that looked across a module boundary, and both cross-module features it tested
+were completely non-functional.
+
+### BUG-904 — `spawn <imported function>` did not link at all
+`spawn tick();` where `tick` comes from `import spawn_mod` emitted the UNMANGLED name. The
+checker accepted it and the only signal was `ld: undefined reference to 'tick'` — measured
+on main before the fix. A feature that cannot be linked is not a partial gap; it never
+worked.
+
+### BUG-905 — `async` and `container(T)` across a module boundary
+`xfeat_user.zer` failed with `undefined identifier` / `cannot call non-function type`. Same
+class as BUG-904 — a name that is mangled for the importing module in one place and not in
+another.
+
+### BUG-906 — a value-returning `async` had nowhere to put its value
+`async u32 compute() { … return 42; }` compiled clean, the state machine finalised
+correctly, and the emitter then DISCARDED the value at the return site: the poll protocol
+is an int done-flag and there was nowhere else for it to go. So `async <non-void>` was
+neither rejected nor retrievable — *the compiler accepted a function whose entire point was
+unreachable.* Tracked as Q2 since 2026-07-28 with "a real retrieval mechanism, or reject"
+as the options; reject had been measured and turned down.
+
+Closed with the retrieval half: the state struct carries a stable `_zer_result` field typed
+from the function's own return type, filled at every return, with
+`_zer_async_NAME_result(&task)` emitted and registered for a non-void async only. The poll
+protocol is untouched — still `0` pending / `1` done — because **"is it finished" and "what
+did it produce" are different questions.** A value-optional (`?u32`) is a
+`{value, has_value}` struct, so the async store mirrors the non-async return arm's wrap,
+including the null arm and `?void`.
+
+### BUG-907 — two REJECTIONS that named problems that did not exist
+Both are relaxations (reject -> accept), the one change class where a mistake ships a
+use-after-free. Both arrived with their own negatives, and all five are verified to still
+reject.
+
+**(a) zercheck INVENTED an allocation for any pointer-returning ZER function.** Binding the
+result of `*u32 gp() { return &gv; }` to a local registered a fresh tracked allocation, so
+an accessor that plain produced *"handle %0 (local 'p') allocated at line 4 but never
+freed"* — naming an allocation that does not exist and demanding the caller free memory it
+does not own. The existing corpus test passed only because it stores the result into a
+global, and escaping satisfies the leak check by a different route.
+
+**(b) The Stage-1 escape summary skipped `?*T`.** It was gated on the return kind being
+POINTER, SLICE or STRUCT; `TYPE_OPTIONAL` was not in the list, so a `?*T`-returning
+function — the idiomatic ZER signature for a fallible lookup — kept the `{false, 0}`
+"can't prove" default and the whole `returns_static` precision was silently absent for it.
+Measured: changing ONE CHARACTER from `*u32 lookup(…)` to `?*u32 lookup(…)` flipped an
+otherwise identical program from accepted to *"cannot store result of call with
+local-derived pointer argument"*. Safe to widen because the accumulator never looked at the
+declared return type — it runs per return statement — and `return null` already classified
+as static, correctly.
+
+**(c) `freed_all_paths` never reached the alias group.** It is the flag the Level-B guarded
+refinement uses to accept the complementary-free idiom, set by direct assignment on
+whichever handle the free named, at three separate free sites. So the idiom worked with one
+name and was rejected the moment an `?T` intermediate existed — and the orelse-intermediate
+spelling is the only one available when the optional must be inspected before being
+unwrapped. `alloc_id` grouping exists precisely so those two names are ONE allocation.
+
+### Measured, and NOT taken
+- **`16e56477` (`@saturate` wrapped at the boundary)** — already fixed here. `@saturate` on
+  a float routes through the same `f2i_bounds` clamp BUG-883 added; verified
+  `@saturate(i32, 2^31 f32)` = 2147483647 and `@saturate(u32, 2^32 f64)` = 4294967295.
+- **The three `enum_forge_*` negatives** — qa249l BANS the conversion; main TRACKS it. All
+  three compile here and TRAP at runtime (exit 133), which is the documented choice: an
+  earlier draft of the ban broke `tests/zer/bitcast_enum_variant_ok`.
+- **`float_to_int_total`** — the decided `@truncate`-on-float divergence.
+- **The three `cli_*` negatives** — already on main since BUG-855, and now executed
+  (BUG-895 wired them up).
+
+---
+
 ## Session 2026-08-26e — BUG-902/903 + tooling: an indeterminate return, an arity gap, and a deny-list retired
 
 Adopted from `claude/vigilant-tesla-as71kk` (`1cb1f93e`, `15b4fe49`, `38c27c18`,

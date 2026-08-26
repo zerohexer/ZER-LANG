@@ -1,0 +1,23 @@
+// expect-error: use after free
+// BUG-860 boundary: the suppression is `escaped = true`, NOT un-registering the
+// handle — so double-free and use-after-free through a static-returning
+// callee's result are still tracked in full.
+//
+// `get()` returns the global cache pointer, which IS provably static, so the
+// leak check is (correctly) silent. The allocation is still real, and freeing
+// it twice is still a bug.
+struct Task { u32 id; }
+Slab(Task) heap;
+?*Task gcache;
+
+?*Task get() { return gcache; }
+
+u32 main() {
+    ?*Task a = heap.alloc_ptr();
+    gcache = a orelse return;
+    ?*Task m = get();
+    *Task p = m orelse return;
+    heap.free_ptr(p);
+    heap.free_ptr(p);
+    return 0;
+}

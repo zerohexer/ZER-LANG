@@ -1,0 +1,12 @@
+// expect-error: undefined identifier '_zer_async_blink_result'
+// BUG-863 boundary: the result accessor is emitted and registered ONLY for a
+// non-void async. A void coroutine has nothing to return, so asking for its
+// result is an undefined identifier rather than a call yielding nothing.
+async void blink() { yield; }
+
+u32 main() {
+    _zer_async_blink t;
+    _zer_async_blink_init(&t);
+    u32 x = _zer_async_blink_result(&t);
+    return x;
+}

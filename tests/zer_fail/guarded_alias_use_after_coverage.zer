@@ -1,0 +1,20 @@
+// expect-error: use after free
+// BUG-862 boundary, the TIGHTENING direction. Once a complementary free-pair has
+// covered every path, the allocation is gone on all of them — so a use after the
+// pair is a use-after-free no matter which NAME it goes through.
+//
+// Before the fix `freed_all_paths` never reached the alias group at all, so this
+// was decided by whichever handle the use happened to name. It is now decided by
+// the allocation, which is what the flag means.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 run(bool c) {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+    return pool.get(h).id;
+}
+
+u32 main() { return run(false); }

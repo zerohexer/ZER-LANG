@@ -2115,15 +2115,36 @@ u32 net = @bswap32(host);
 ### @popcount(x), @ctz(x), @clz(x), @parity(x), @ffs(x)
 
 **DESCRIPTION**
-Bit query operations. All return `u32`.
+Bit query operations. All return `u32`, and all are TOTAL — every input has a
+defined answer, `0` included.
 - `@popcount(x)` — count 1-bits
-- `@ctz(x)` — count trailing zeros (UB if x=0)
-- `@clz(x)` — count leading zeros (UB if x=0)
+- `@ctz(x)` — count trailing zeros; **`x = 0` gives the operand's WIDTH** (32 or 64)
+- `@clz(x)` — count leading zeros; **`x = 0` gives the operand's WIDTH** (32 or 64)
 - `@parity(x)` — 0=even / 1=odd
-- `@ffs(x)` — position of lowest 1-bit, 1-indexed (0 if x=0)
+- `@ffs(x)` — position of lowest 1-bit, 1-indexed; `x = 0` gives 0
 
 Input must be integer. Width-dispatched (ll suffix for 64-bit inputs).
-Emits GCC `__builtin_*` / `__builtin_*ll`.
+Emits GCC `__builtin_*` / `__builtin_*ll` — but NOT bare: `__builtin_ctz(0)` and
+`__builtin_clz(0)` are undefined in C, so ZER emits the zero test alongside
+(`(x) == 0 ? 32 : __builtin_ctz(x)`). This entry used to say "UB if x=0",
+describing the C builtin rather than what ZER emits; no guard of your own is
+needed, and ZER has no undefined behavior here.
+
+```zer
+// audit: check
+i32 printf(const *u8 fmt, ...);
+volatile u32 zero = 0;
+volatile u64 wide = 0;
+
+u32 main() {
+    if (@ctz(zero) != 32) { return 1; }     // width, not UB
+    if (@clz(zero) != 32) { return 2; }
+    if (@ffs(zero) != 0)  { return 3; }
+    if (@ctz(wide) != 64) { return 4; }     // 64-bit operand -> 64
+    if (@popcount(zero) != 0) { return 5; }
+    return 0;
+}
+```
 
 ---
 
@@ -3885,6 +3906,45 @@ void regular() {
     yield;   // COMPILE ERROR — 'yield' only allowed inside async function
 }
 ```
+
+**RETURNING A VALUE FROM AN ASYNC FUNCTION**
+
+An `async` function may return a value. The poll protocol stays an `int`
+done-flag — "is it finished" and "what did it produce" are separate questions —
+and the value is read with a third generated function,
+`_zer_async_NAME_result(&task)`:
+
+| generated | for | signature |
+|---|---|---|
+| `_zer_async_NAME_init`   | every async fn   | `void(*task, <original params>)` |
+| `_zer_async_NAME_poll`   | every async fn   | `i32(*task)` — 0 = pending, 1 = done |
+| `_zer_async_NAME_result` | NON-void only    | `<return type>(*task)` |
+
+```zer
+// audit: check
+async ?u32 lookup(u32 k) {
+    yield;                       // one step of work
+    if (k > 10) { return null; }
+    return k * 2;
+}
+
+u32 main() {
+    _zer_async_lookup t;
+    _zer_async_lookup_init(&t, 4);
+    while (_zer_async_lookup_poll(&t) == 0) { }   // drive to completion
+
+    ?u32 r = _zer_async_lookup_result(&t);
+    if (r) |v| { if (v != 8) { return 1; } } else { return 2; }
+    return 0;
+}
+```
+
+Any return type works — scalar, struct, `?T`, `?*T`, `?void`. Reading the result
+before the poll reports done gives the zeroed initial value, exactly like any
+other field of a freshly `_init`ed task; the value is stable across further
+polls of a finished task. A VOID async has no accessor at all, so
+`_zer_async_blink_result` on one is an undefined identifier rather than a call
+that yields nothing.
 
 ### Deadlock Detection (Compile-Time)
 

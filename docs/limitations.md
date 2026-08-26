@@ -32,7 +32,7 @@ repeated.
 
 ## Where main stands
 
-`make check` exit 0 — **1376 .zer**, 200 fuzz, 139 convert, all ten matrices, all EIGHT
+`make check` exit 0 — **1386 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT
 audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **88 cells / 0 mismatch**.
 
 Landed this session, newest first:
@@ -212,7 +212,7 @@ condition EXPRESSION.
 
 ---
 
-## OPEN — harvest tracker 3: `as71kk` (verified against main 2026-08-25)
+## CLOSED 2026-08-26 (all 20) — harvest tracker 3: `as71kk` (verified against main 2026-08-25)
 
 **Status: NOT implemented — a catalog.** Forked at `9f8cda08`, one commit behind main,
 so it does NOT contain BUG-857/858. 17 commits, BUG-857..882 (numbering collides with
@@ -344,7 +344,7 @@ Float stays parked until decided.
 
 ---
 
-## OPEN — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
+## OPEN (1 of 21 — the arena-internal link) — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
 
 **Status: NOT implemented — a catalog.** Every row verified on a clean build of main
 (`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading
@@ -403,15 +403,15 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Best version | Evidence on main |
 |---|---|---|---|
-| H1 | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
+| ~~H1~~ **DONE (BUG-884..887)** | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
 | ~~H2~~ **DONE (BUG-858)** | **Recycled pool/slab slot is not zeroed** | **r1piyr** BUG-861 | Verified: `alloc_recycled_slot_zeroed` exits 1 — the slot comes back holding the previous object bit-for-bit, against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A `?*T` field returns non-null and dangling, so safe ZER can unwrap and deref it. **Invisible to ASan** — the reuse is inside ZER-owned storage |
-| H3 | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
-| H4 | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
-| H5 | **Negative constant into an unsigned type** — 8 spellings | **qa249l** | `u32 a = -1;` silently becomes 4294967295. 8 negatives accepted (var-decl, assign, global, arg, return, orelse, spawn, struct-init) |
-| H6 | **Enum forging through `@truncate` and a struct carrier** | **qa249l** | 3 accepted. My BUG-843 closed `@bitcast` only; these are the sibling routes |
-| H7 | **`free` of an inline-array field slice** | **29fiao** | `free(s.buf[0..])` on an inline array accepted; the same without the index was already rejected |
-| H8 | **Non-null funcptr global** | **qa249l** | `funcptr_global_nonnull` accepted |
-| H9 | **Optional comparison** | **qa249l** | 2 accepted. My BUG-841 covered struct/union; `?T == ?T` and `?T == T` were left |
+| ~~H3~~ **DONE (BUG-895)** | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
+| ~~H4~~ **DONE (BUG-889)** | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
+| ~~H5~~ **DONE (BUG-890)** | **Negative constant into an unsigned type** — 8 spellings | **qa249l** | `u32 a = -1;` silently becomes 4294967295. 8 negatives accepted (var-decl, assign, global, arg, return, orelse, spawn, struct-init) |
+| ~~H6~~ **DONE (BUG-891)** | **Enum forging through `@truncate` and a struct carrier** | **qa249l** | 3 accepted. My BUG-843 closed `@bitcast` only; these are the sibling routes |
+| ~~H7~~ **DONE (BUG-894)** | **`free` of an inline-array field slice** | **29fiao** | `free(s.buf[0..])` on an inline array accepted; the same without the index was already rejected |
+| ~~H8~~ **DONE (BUG-893)** | **Non-null funcptr global** | **qa249l** | `funcptr_global_nonnull` accepted |
+| ~~H9~~ **DONE (BUG-892)** | **Optional comparison** | **qa249l** | 2 accepted. My BUG-841 covered struct/union; `?T == ?T` and `?T == T` were left |
 
 ### LIVE — compiler crash
 
@@ -423,27 +423,27 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| H11 | **Global-init constant guard is a TOP-LEVEL kind test** | **r1piyr** BUG-859 | 3 accepted: one wrapper (`+ 1`, a cast, a unary minus, an intrinsic argument) defeats all three checks and the failure lands on GCC. Needs one exhaustive walk. **This is the sibling of my BUG-842** — I split the arg_count precondition but left the top-level-kind shape |
-| H12 | **`@offset` validated nothing** | **29fiao** BUG-860 | 4 accepted. The field check sat inside a guard and did nothing when the guard failed. One case is the distinct-unwrap class, so `@offset` also now WORKS through a distinct typedef. A union is rejected with a reason (ZER unions are tagged, so a variant has no fixed offset) |
-| H13 | **Intrinsic arity unchecked** | **29fiao** | 3 accepted (`@barrier_*`, `@cstr`, `@offset` with wrong arity) |
+| ~~H11~~ **DONE (BUG-869)** | **Global-init constant guard is a TOP-LEVEL kind test** | **r1piyr** BUG-859 | 3 accepted: one wrapper (`+ 1`, a cast, a unary minus, an intrinsic argument) defeats all three checks and the failure lands on GCC. Needs one exhaustive walk. **This is the sibling of my BUG-842** — I split the arg_count precondition but left the top-level-kind shape |
+| ~~H12~~ **DONE (BUG-870)** | **`@offset` validated nothing** | **29fiao** BUG-860 | 4 accepted. The field check sat inside a guard and did nothing when the guard failed. One case is the distinct-unwrap class, so `@offset` also now WORKS through a distinct typedef. A union is rejected with a reason (ZER unions are tagged, so a variant has no fixed offset) |
+| ~~H13~~ **DONE (BUG-871/889/870/903)** | **Intrinsic arity unchecked** | **29fiao** | 3 accepted (`@barrier_*`, `@cstr`, `@offset` with wrong arity) |
 
 ### LIVE — over-rejections (valid code refused)
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| H14 | **`&&` / `\|\|` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
-| H15 | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
-| H16 | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
-| H17 | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |
-| H18 | Arena-internal link; guarded coverage through an alias; static-optional return + leak | **qa249l** | 3 positives rejected |
-| H19 | Heap-slice free in an array element; the view-class boundary positives | **29fiao** | ride with H1 |
+| ~~H14~~ **DONE (BUG-897)** | **`&&` / `\|\|` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
+| ~~H15~~ **DONE (BUG-899)** | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
+| ~~H16~~ **DONE (BUG-898)** | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
+| ~~H17~~ **DONE (BUG-900/901)** | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |
+| H18 | **PARTIAL — 2 of 3 DONE (BUG-907)**. ~~guarded coverage through an alias~~, ~~static-optional return + leak~~; **the ARENA-INTERNAL LINK is still open** — `a.next = b` where both come from the SAME arena is rejected as "cannot store arena-derived pointer", the shape reference.md has always shown. qa249l `9013ada3` carries it (BUG-848), but it is a RELAXATION touching ~10 checker sites plus a new `Symbol.arena_source`, and its own commit message records TWO accept-unsafe mistakes caught by boundary probes before shipping (a lifetime-CLASS test accepted a local-arena pointer stored into a global-arena object; propagating the identity through the shared escape helper marked a pointer PARAMETER as arena memory). Both are pinned by `tests/zer_fail/arena_cross_arena_store.zer` and a sibling. Left for its own isolated change rather than ridden in with the rest. | **qa249l** | 1 positive rejected |
+| ~~H19~~ **DONE (rides with BUG-884..887)** | Heap-slice free in an array element; the view-class boundary positives | **29fiao** | ride with H1 |
 
 ### LIVE — cross-module (unique to `qa249l`, nobody else looked)
 
 | # | Fix | Evidence |
 |---|---|---|
-| H20 | **`spawn <imported function>` does not LINK — the feature is completely non-functional** | Verified: `spawn_user.zer` emits `void tick();` and calls `tick()` while the definition is `spawn_mod__tick`. The checker ACCEPTS it (the data-race scan even resolves the imported body), so the only signal is `ld returned 1 exit status` with no source line. The name is spelled raw at FOUR emission sites |
-| H21 | **`async` and `container(T)` across a module boundary** | qa249l fixes both; needs re-measuring separately from H22 |
+| ~~H20~~ **DONE (BUG-904)** | **`spawn <imported function>` does not LINK — the feature is completely non-functional** | Verified: `spawn_user.zer` emits `void tick();` and calls `tick()` while the definition is `spawn_mod__tick`. The checker ACCEPTS it (the data-race scan even resolves the imported body), so the only signal is `ld returned 1 exit status` with no source line. The name is spelled raw at FOUR emission sites |
+| ~~H21~~ **DONE (BUG-905/906)** | **`async` and `container(T)` across a module boundary** | qa249l fixes both; needs re-measuring separately from H22 |
 
 ### DESIGN DECISION — not a bug, and it needs an owner call
 

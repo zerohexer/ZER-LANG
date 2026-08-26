@@ -1,0 +1,17 @@
+// expect-error: use after free
+// BUG-862 boundary: same as guarded_alias_use_after_coverage, for a third FREE
+// rather than a read. Complementary guards cover every path, so an unguarded
+// free after them is a double free on every path.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+
+u32 run(bool c) {
+    ?Handle(Task) mh = pool.alloc();
+    Handle(Task) h = mh orelse return;
+    if (c)  { pool.free(h); }
+    if (!c) { pool.free(h); }
+    pool.free(h);
+    return 0;
+}
+
+u32 main() { return run(false); }

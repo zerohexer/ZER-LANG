@@ -658,6 +658,58 @@ static bool ir_free_completes_coverage(ZerCheck *zc, IRHandleInfo *h) {
            bg[fb].g[0].pol  != bg[ub].g[0].pol;
 }
 
+/* BUG-862: THE single sink for "this allocation is now freed on every path".
+ *
+ * `freed_all_paths` is a property of the ALLOCATION, not of the name it was
+ * freed through, so it belongs to the whole alias group. It was set by direct
+ * assignment at three free sites, none of which reached the aliases — and only
+ * ONE of the three propagates state at all. That cost the Level-B leak-coverage
+ * recovery the moment an `?T` intermediate existed:
+ *
+ *     Handle(Task) h = pool.alloc() orelse return;          // ACCEPTED
+ *     if (c) { pool.free(h); }  if (!c) { pool.free(h); }
+ *
+ *     ?Handle(Task) mh = pool.alloc();                      // REJECTED:
+ *     Handle(Task) h = mh orelse return;                    // "handle 'mh' may
+ *     if (c) { pool.free(h); }  if (!c) { pool.free(h); }   //  not be freed on
+ *                                                           //  all paths"
+ *
+ * Coverage completed on `h` and never reached `mh`, though alloc_id grouping
+ * exists precisely so `?Handle mh` and `Handle h` are ONE allocation — the
+ * `orelse`-intermediate spelling is the only one available when the optional is
+ * inspected before being unwrapped.
+ *
+ * Both directions of the flag are correct for an alias. At the leak check a set
+ * flag REMOVES a false leak. At the use and double-free sites it makes
+ * `ir_use_guard_disjoint` return false, i.e. it TIGHTENS: once every path has
+ * freed, no later use or free is admissible through ANY name — which is the
+ * accept-unsafe hole the flag was introduced to close in the first place, now
+ * closed for aliases too.
+ *
+ * `free_block` is deliberately NOT propagated here: it feeds the ACCEPT side of
+ * the disjointness test, so carrying it across an alias would be a relaxation
+ * rather than this monotone flag.
+ *
+ * Do not re-inline `h->freed_all_paths = 1` at a new free site — same rule as
+ * `ir_mark_transferred`. */
+static void ir_mark_freed_all_paths(IRPathState *ps, IRHandleInfo *h) {
+    h->freed_all_paths = 1;
+    int aid = h->alloc_id;
+    if (aid == 0) return;                 /* untracked — no aliasing info */
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *a = &ps->handles[i];
+        /* NO `ir_is_invalid` filter here, unlike ir_propagate_alias_state. That
+         * filter is right when propagating a STATE (do not overwrite an alias
+         * that is already freed or transferred) and exactly wrong for this
+         * monotone flag: `zer_handle_state_is_invalid` is TRUE of MAYBE_FREED,
+         * which is the state every alias is in at this point — the one whose
+         * leak check needs the flag. Filtering them out marked nothing at all,
+         * which is how this stayed broken while looking fixed. */
+        if (a != h && a->alloc_id == aid)
+            a->freed_all_paths = 1;
+    }
+}
+
 /* ================================================================
  * Alias-copy helper (audit 2026-06-04)
  *
@@ -694,6 +746,8 @@ typedef struct {
     bool escaped;
     bool is_thread_handle;
     bool is_move_local;   /* bh18_1b: move-local handle/alias — leak-skip */
+    int freed_all_paths;  /* BUG-862: property of the ALLOCATION, so an alias
+                           * created after coverage completes inherits it. */
     const char *pool_name;
     uint32_t pool_name_len;
     /* BUG-849: the multi-view set travels with the alias. A view handle owns
@@ -714,6 +768,7 @@ static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
     snap->escaped = src->escaped;
     snap->is_thread_handle = src->is_thread_handle;
     snap->is_move_local = src->is_move_local;
+    snap->freed_all_paths = src->freed_all_paths;
     snap->pool_name = src->pool_name;
     snap->pool_name_len = src->pool_name_len;
     snap->view_count = src->view_count;
@@ -735,6 +790,7 @@ static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
     dst->escaped = snap->escaped;
     dst->is_thread_handle = snap->is_thread_handle;
     dst->is_move_local = snap->is_move_local;
+    dst->freed_all_paths = snap->freed_all_paths;
     dst->pool_name = snap->pool_name;
     dst->pool_name_len = snap->pool_name_len;
     dst->view_count = snap->view_count;
@@ -1554,6 +1610,46 @@ static Node *ir_return_value_expr(IRFunc *func, IRInst *last) {
         }
     }
     return NULL;
+}
+
+/* BUG-860: does this call provably return a STATIC — i.e. is every one of the
+ * callee's valued returns rooted at a global / static-duration local, or `null`?
+ *
+ * Reuses the escape subsystem's per-function return summary verbatim:
+ * `ret_summary_complete && ret_param_mask == 0` is Stage 1's "returns_static",
+ * the ARStatic element of lambda_zer_escape/param_lattice.v (T3 is its precision
+ * witness). The escape side has consulted it since 2026-06-22; the LEAK side
+ * never did, so
+ *
+ *     u32 gv = 5;
+ *     *u32 gp() { return &gv; }
+ *     u32 main() { *u32 p = gp(); return *p; }
+ *
+ * was rejected with "handle %0 (local 'p') allocated at line 4 but never freed"
+ * — naming an allocation that does not exist and demanding the caller free
+ * memory it does not own. Accessor and lookup functions returning `*T` were
+ * unusable unless their result also escaped into a global.
+ *
+ * Sound because `classify_return_root` is precise about what STATIC means: a
+ * `return <call>` is UNKNOWN unless the inner callee is itself all-static (so
+ * `return alloc(...)` / `return heap.alloc_ptr()` never qualifies), and a plain
+ * local is UNKNOWN. The flags default to {false, 0}, so an unclassifiable
+ * callee keeps the tracking. A global that HOLDS heap memory does qualify, and
+ * suppressing the caller's leak check there is right — the global owns it, the
+ * caller borrowed it, which is the same policy as "MAYBE_FREED globals at exit
+ * are deliberately NOT flagged".
+ *
+ * The suppression is `escaped = true`, never un-registering: double-free and
+ * UAF tracking on the result stay fully live. Same mechanism the erased-ref
+ * AOBorrow arm uses. */
+static bool ir_call_returns_static(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    Symbol *sym = scope_lookup(zc->checker->global_scope,
+        callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (!sym || !sym->is_function) return false;
+    return sym->ret_summary_complete && sym->ret_param_mask == 0;
 }
 
 /* Check if a call is to an extern function that returns a pointer-like
@@ -3429,7 +3525,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     /* free under a guard disjoint from the prior free — no
                      * double-free. If it is the exact complement, the handle is
                      * now freed on ALL paths (clears the leak check). */
-                    if (ir_free_completes_coverage(zc, h)) h->freed_all_paths = 1;
+                    if (ir_free_completes_coverage(zc, h)) ir_mark_freed_all_paths(ps, h);
                 } else {
                     ir_zc_error(zc, inst->source_line,
                         "freeing %%%d which may already be freed",
@@ -5118,7 +5214,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         } else if (h->state == IR_HS_MAYBE_FREED) {
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
-                                    h->freed_all_paths = 1;
+                                    ir_mark_freed_all_paths(ps, h);
                             } else {
                                 ir_zc_error(zc, inst->source_line,
                                     "freeing local %%%d which may already be freed",
@@ -5430,6 +5526,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * erased_ownership_lattice.v. */
                         if (summary->ret_is_borrow && summary->ret_is_content)
                             h->escaped = true;
+                        /* BUG-860: the callee provably returns a STATIC (every
+                         * valued return is rooted at a global/static, or null).
+                         * Nothing was allocated for the caller to free. */
+                        if (ir_call_returns_static(zc, inst->expr))
+                            h->escaped = true;
                     }
                 }
             }
@@ -5506,6 +5607,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         dt_eff = type_unwrap_distinct(dt_eff->optional.inner);
                     if (dt_eff && dt_eff->kind == TYPE_HANDLE)
                         h->escaped = true;
+                    /* BUG-860: same suppression on the no-summary path — a
+                     * callee that provably returns a STATIC allocated nothing.
+                     * (escaped only: double-free / UAF tracking stays live.) */
+                    if (ir_call_returns_static(zc, call))
+                        h->escaped = true;
                 }
             }
 
@@ -5541,7 +5647,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         } else if (h->state == IR_HS_MAYBE_FREED) {
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
-                                    h->freed_all_paths = 1;
+                                    ir_mark_freed_all_paths(ps, h);
                             } else {
                                 ir_zc_error(zc, inst->source_line,
                                     "freeing local %%%d which may already be freed",

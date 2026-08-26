@@ -3293,9 +3293,21 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
             } else if (node->intrinsic.arg_count >= 2) {
-                /* args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_expr(e, node->intrinsic.args[0]);
+                /* args[0] = type name, args[1] = field name.
+                 * BUG-874: emitting `struct <identifier-text>` spells a distinct
+                 * typedef's OWN name, and `struct PD` does not exist in the
+                 * emitted C. The checker records the RESOLVED struct on this
+                 * node for exactly this reason; fall back to the text only when
+                 * it did not (an unresolvable name is already an error). */
+                Type *ot = checker_get_type(e->checker, node->intrinsic.args[0]);
+                Type *ou = ot ? type_unwrap_distinct(ot) : NULL;
+                if (ou && type_dispatch_kind(ou) == TYPE_STRUCT) {
+                    emit(e, "struct ");
+                    EMIT_STRUCT_NAME(e, ou);
+                } else {
+                    emit(e, "struct ");
+                    emit_expr(e, node->intrinsic.args[0]);
+                }
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
             }
@@ -7954,9 +7966,21 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
             } else if (node->intrinsic.arg_count >= 2) {
-                /* Named type: args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                /* args[0] = type name, args[1] = field name.
+                 * BUG-874: emitting `struct <identifier-text>` spells a distinct
+                 * typedef's OWN name, and `struct PD` does not exist in the
+                 * emitted C. The checker records the RESOLVED struct on this
+                 * node for exactly this reason; fall back to the text only when
+                 * it did not (an unresolvable name is already an error). */
+                Type *ot = checker_get_type(e->checker, node->intrinsic.args[0]);
+                Type *ou = ot ? type_unwrap_distinct(ot) : NULL;
+                if (ou && type_dispatch_kind(ou) == TYPE_STRUCT) {
+                    emit(e, "struct ");
+                    EMIT_STRUCT_NAME(e, ou);
+                } else {
+                    emit(e, "struct ");
+                    emit_rewritten_node(e, node->intrinsic.args[0], func);
+                }
                 emit(e, ", ");
                 emit_rewritten_node(e, node->intrinsic.args[1], func);
             }

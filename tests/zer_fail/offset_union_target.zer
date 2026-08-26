@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: ZER unions are TAGGED
+// BUG-874: the @offset field check sat behind `struct_type->kind ==
+// TYPE_STRUCT` and did NOTHING when that failed, so every non-struct target
+// was accepted in silence and the emitted `offsetof` reached GCC. A guard
+// whose failure branch is empty is not a check — it is a check that only fires
+// on the inputs that were already fine.
+union U { u32 i; f32 f; }
+u32 main() { return (u32)@offset(U, i); }

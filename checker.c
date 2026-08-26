@@ -3328,6 +3328,9 @@ static int64_t compute_type_size(Type *t) {
 }
 
 static Type *resolve_type_inner(Checker *c, TypeNode *tn);
+/* BUG-875: the array-size path needs the SCOPED constant evaluator (the one
+ * that can resolve a `const` identifier). Defined below; forward-declared here. */
+static int64_t eval_const_expr_scoped(Checker *c, Node *n);
 
 /* BUG-391: forward declarations for comptime evaluation in array sizes */
 typedef struct {
@@ -3665,6 +3668,28 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         Type *size_of = NULL; /* resolved @size type, if any */
         if (tn->array.size_expr) {
             int64_t val = eval_const_expr(tn->array.size_expr);
+            /* BUG-875: `const u32 CAP = 256; u8[CAP] buf;` was rejected as "array
+             * size must be a compile-time constant" — while NAMING a constant.
+             * The size paths used the NON-scoped evaluator, which cannot resolve
+             * an identifier; the scoped one (used by static_assert and comptime
+             * conditions) can.
+             *
+             * FOLD IN PLACE. Teaching only the checker is the trap this fix has
+             * to avoid: the emitter evaluates the size expression independently
+             * and would still see an unresolvable ident, sizing the array 0 — a
+             * relaxation that trades an over-rejection for a WRONG ANSWER, which
+             * is worse than the over-rejection. Rewriting the node to a literal
+             * means every later reader, whatever evaluator it uses, sees the
+             * value. Idempotent, so a re-resolve of the same TypeNode is safe. */
+            if (val == CONST_EVAL_FAIL) {
+                int64_t sval = eval_const_expr_scoped(c, tn->array.size_expr);
+                if (sval != CONST_EVAL_FAIL && sval > 0 &&
+                    (uint64_t)sval <= UINT32_MAX) {
+                    tn->array.size_expr->kind = NODE_INT_LIT;
+                    tn->array.size_expr->int_lit.value = (uint64_t)sval;
+                    val = sval;
+                }
+            }
             /* BUG-199: handle @size(T) as compile-time constant */
             if (val == CONST_EVAL_FAIL && tn->array.size_expr->kind == NODE_INTRINSIC &&
                 tn->array.size_expr->intrinsic.name_len == 4 &&
@@ -10017,11 +10042,56 @@ static Type *check_expr(Checker *c, Node *node) {
                         field_len = (uint32_t)node->intrinsic.args[1]->ident.name_len;
                     }
                 }
-                if (struct_type && struct_type->kind == TYPE_STRUCT && field_name) {
+                /* BUG-874: the field check sat behind `struct_type->kind ==
+                 * TYPE_STRUCT` and did NOTHING when that failed — so every
+                 * non-struct target was accepted in silence and the emitted
+                 * `offsetof` reached GCC:
+                 *
+                 *     distinct typedef P PD;  @offset(PD, b)   // "invalid use
+                 *                                                 of undefined
+                 *                                                 type struct PD"
+                 *     union U { u32 i; }      @offset(U, i)    // same
+                 *     @offset(u32, a)                          // "request for
+                 *                                                 member 'a' in
+                 *                                                 something not
+                 *                                                 a structure"
+                 *
+                 * A guard whose failure branch is empty is not a check; it is a
+                 * check that only fires on the inputs that were already fine.
+                 *
+                 * `type_dispatch_kind` unwraps the distinct, so @offset now also
+                 * WORKS through a distinct typedef instead of merely failing
+                 * later. A UNION is rejected with its reason: ZER unions are
+                 * TAGGED, so a variant has no fixed offset from the union's
+                 * base. */
+                TypeKind stk = struct_type ? type_dispatch_kind(struct_type) : TYPE_VOID;
+                if (struct_type && stk == TYPE_UNION) {
+                    checker_error(c, node->loc.line,
+                        "@offset on the union '%s' — ZER unions are TAGGED, so a "
+                        "variant has no fixed offset from the union's base. Take "
+                        "the offset of the field in the struct that holds it",
+                        type_name(struct_type));
+                } else if (struct_type && stk != TYPE_STRUCT) {
+                    checker_error(c, node->loc.line,
+                        "@offset requires a struct type, got '%s'",
+                        type_name(struct_type));
+                } else if (struct_type && field_name) {
+                    Type *su = type_unwrap_distinct(struct_type);
+                    /* BUG-874 (emitter half): the named-type path emits
+                     * `offsetof(struct <ident>, f)` from the identifier TEXT, so
+                     * a distinct typedef produced `struct PD` — a type that does
+                     * not exist in the emitted C. Record the RESOLVED struct on
+                     * the type-name node so both emitter dispatch paths can spell
+                     * the real name; there is nowhere else for them to learn it,
+                     * since a type name is not otherwise in the typemap. */
+                    if (node->intrinsic.arg_count >= 1 &&
+                        node->intrinsic.args[0]->kind == NODE_IDENT &&
+                        !node->intrinsic.type_arg)
+                        typemap_set(c, node->intrinsic.args[0], su);
                     bool found = false;
-                    for (uint32_t fi = 0; fi < struct_type->struct_type.field_count; fi++) {
-                        if (struct_type->struct_type.fields[fi].name_len == field_len &&
-                            memcmp(struct_type->struct_type.fields[fi].name, field_name, field_len) == 0) {
+                    for (uint32_t fi = 0; fi < su->struct_type.field_count; fi++) {
+                        if (su->struct_type.fields[fi].name_len == field_len &&
+                            memcmp(su->struct_type.fields[fi].name, field_name, field_len) == 0) {
                             found = true;
                             break;
                         }
@@ -10029,7 +10099,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!found) {
                         checker_error(c, node->loc.line,
                             "@offset: struct '%.*s' has no field '%.*s'",
-                            (int)struct_type->struct_type.name_len, struct_type->struct_type.name,
+                            (int)su->struct_type.name_len, su->struct_type.name,
                             (int)field_len, field_name);
                     }
                 }
@@ -21497,6 +21567,34 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             check_negative_const_into_unsigned(c, decl->var_decl.init,
                                                int_retype_target(type),
                                                decl->loc.line, "global initializer");
+            /* BUG-876: a global whose initializer NAMES another global was
+             * emitted verbatim, and C rejects that at file scope:
+             *
+             *     const u32 A = 10;
+             *     const u32 B = A + 1;   // GCC: "initializer element is not
+             *                            //       constant" — no ZER diagnostic
+             *
+             * In ZER a `const` global IS a compile-time constant, so this is a
+             * valid program the backend happened to refuse; the right answer is
+             * to FOLD it, not to ban it. The same fold is what makes
+             * `const u32 CAP = 256; u8[CAP] buf;` size correctly (BUG-875) —
+             * note the emitted `uint32_t CAP` is not `const` in C, so without
+             * folding the array would have been a VLA even where GCC accepted
+             * it.
+             *
+             * Done IN PLACE and AFTER the checks above, so nothing folds away an
+             * intrinsic the previous rule needs to see (the scoped evaluator
+             * does not fold intrinsic calls in any case). Restricted to integer
+             * targets whose value the evaluator actually produced. */
+            if (decl->var_decl.init->kind != NODE_INT_LIT &&
+                type && type_is_integer(type_unwrap_distinct(type)) &&
+                is_pure_int_literal_expr(decl->var_decl.init) == false) {
+                int64_t gv = eval_const_expr_scoped(c, decl->var_decl.init);
+                if (gv != CONST_EVAL_FAIL && gv >= 0) {
+                    decl->var_decl.init->kind = NODE_INT_LIT;
+                    decl->var_decl.init->int_lit.value = (uint64_t)gv;
+                }
+            }
             /* BUG-373: integer literal range check for globals */
             if (decl->var_decl.init->kind == NODE_INT_LIT &&
                 type && type_is_integer(type_unwrap_distinct(type))) {

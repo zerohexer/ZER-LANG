@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: @offset requires a struct type
+// BUG-874, second shape: a primitive target reached GCC as "request for member
+// 'a' in something not a structure or union".
+u32 main() { return (u32)@offset(u32, a); }

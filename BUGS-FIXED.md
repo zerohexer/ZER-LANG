@@ -238,6 +238,52 @@ result stays a bool; an array sized by a wrapping comptime expression really is
 255 elements). It exits **55** on the pre-fix build, **57** with only the width
 half fixed, and **0** now.
 
+### BUG-874 — `@offset`'s field check had an EMPTY failure branch
+
+    distinct typedef P PD;   @offset(PD, b)   // "invalid use of undefined type
+                                              //  'struct PD'" — from GCC
+    union U { u32 i; }       @offset(U, i)    // same
+    @offset(u32, a)                           // "request for member 'a' in
+                                              //  something not a structure"
+
+The check sat behind `struct_type->kind == TYPE_STRUCT` and did NOTHING when
+that failed, so every non-struct target was accepted in silence and the emitted
+`offsetof` reached GCC. **A guard whose failure branch is empty is not a check;
+it is a check that only fires on the inputs that were already fine.**
+
+`type_dispatch_kind` unwraps the distinct, so `@offset` now WORKS through a
+distinct typedef rather than merely failing later — which needed the EMITTER
+half too, in both dispatch paths: the named-type path emits
+`offsetof(struct <identifier-text>, f)`, which spells `struct PD`, a type that
+does not exist in the emitted C. The checker records the resolved struct on the
+type-name node so the emitter has somewhere to learn it from; a type name is
+not otherwise in the typemap. A UNION is rejected with its reason: ZER unions
+are TAGGED, so a variant has no fixed offset from the union's base.
+
+### BUG-875 / BUG-876 — a constant that could not be used as one
+
+    const u32 CAP = 256;
+    u8[CAP] buf;              // "array size must be a compile-time constant"
+    const u32 B = CAP + 1;    // GCC: "initializer element is not constant"
+
+The array-size path used the NON-scoped constant evaluator, which cannot
+resolve an identifier; the scoped one — already used by `static_assert` and
+comptime conditions — can. And a global initializer naming another global was
+emitted verbatim, which C refuses at file scope.
+
+**The trap here is documented and real, and the test is built to catch it:**
+teaching only the CHECKER makes the EMITTER, which evaluates the size
+independently, size the array **0** — a relaxation that trades an
+over-rejection for a WRONG ANSWER, which is worse than the over-rejection. So
+the fold is done IN PLACE (the size expression is rewritten to a literal), and
+`tests/zer/const_array_size_ok.zer` WRITES AT THE LAST INDEX of each array,
+which only works if the emitted array really is CAP long. Measured in the
+emitted C: `uint8_t gbuf[256]`, `uint8_t small[128]`, `uint8_t big[260]`.
+
+The same in-place fold is what makes the const-from-const global emit valid C.
+Note the emitted `uint32_t CAP` is not `const` in C, so without folding the
+array would have been a VLA even where GCC accepted it.
+
 ### BUG-871 — comparing a VALUE optional read `.value` on an optional with none
 
     ?u32 n = null;   n == 0        // emitted `n.value == zero`, answered TRUE

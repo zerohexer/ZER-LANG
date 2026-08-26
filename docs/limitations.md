@@ -236,7 +236,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
 | ~~H11~~ **DONE (BUG-869)** | **Global-init constant guard is a TOP-LEVEL kind test** | **r1piyr** BUG-859 | 3 accepted: one wrapper (`+ 1`, a cast, a unary minus, an intrinsic argument) defeats all three checks and the failure lands on GCC. Needs one exhaustive walk. **This is the sibling of my BUG-842** — I split the arg_count precondition but left the top-level-kind shape |
-| H12 | **`@offset` validated nothing** | **29fiao** BUG-860 | 4 accepted. The field check sat inside a guard and did nothing when the guard failed. One case is the distinct-unwrap class, so `@offset` also now WORKS through a distinct typedef. A union is rejected with a reason (ZER unions are tagged, so a variant has no fixed offset) |
+| ~~H12~~ **DONE (BUG-874)** | **`@offset` validated nothing** | **29fiao** BUG-860 | 4 accepted. The field check sat inside a guard and did nothing when the guard failed. One case is the distinct-unwrap class, so `@offset` also now WORKS through a distinct typedef. A union is rejected with a reason (ZER unions are tagged, so a variant has no fixed offset) |
 | ~~H13~~ **DONE (BUG-870)** | **Intrinsic arity unchecked** | **29fiao** | 3 accepted (`@barrier_*`, `@cstr`, `@offset` with wrong arity) |
 
 ### LIVE — over-rejections (valid code refused)
@@ -244,7 +244,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
 | H14 | **`&&` / `\|\|` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
-| H15 | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
+| ~~H15~~ **DONE (BUG-875/876)** | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
 | ~~H16~~ **DONE (BUG-867)** | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
 | H17 | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |
 | H18 | Arena-internal link; guarded coverage through an alias; static-optional return + leak | **qa249l** | 3 positives rejected |

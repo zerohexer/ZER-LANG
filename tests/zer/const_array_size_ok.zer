@@ -1,0 +1,38 @@
+// BUG-875 / BUG-876: `const u32 CAP = 256; u8[CAP] buf;` was rejected as
+// "array size must be a compile-time constant" — while NAMING a constant. The
+// size paths used the NON-scoped evaluator, which cannot resolve an identifier.
+//
+// The documented trap this test exists to catch: teaching only the CHECKER
+// makes the EMITTER, which evaluates the size independently, size the array 0
+// — a relaxation that trades an over-rejection for a WRONG ANSWER, which is
+// worse than the over-rejection. So the fold is done IN PLACE, and this test
+// WRITES AT THE LAST INDEX of each array: that only works if the emitted array
+// really is CAP long.
+//
+// The same fold makes a const global initialized from another const global
+// emit valid C (`const u32 B = A + 1;` was "initializer element is not
+// constant" from GCC, with no ZER diagnostic).
+const u32 CAP  = 256;
+const u32 HALF = CAP / 2;
+const u32 PLUS = CAP + 4;
+
+u8[CAP] gbuf;
+
+u32 main() {
+    u8[CAP]  buf;
+    u8[HALF] small;
+    u8[PLUS] big;
+
+    buf[255]   = 7;
+    gbuf[255]  = 9;
+    small[127] = 5;
+    big[259]   = 3;
+
+    if (buf[255]   != 7) { return 1; }
+    if (gbuf[255]  != 9) { return 2; }
+    if (small[127] != 5) { return 3; }
+    if (big[259]   != 3) { return 4; }
+    if (HALF != 128) { return 5; }
+    if (PLUS != 260) { return 6; }
+    return 0;
+}

@@ -1,0 +1,16 @@
+// BUG-874 (positive): @offset through a distinct typedef now WORKS rather than
+// failing later. Two halves had to move together — the checker unwraps the
+// distinct to find the field, and BOTH emitter dispatch paths spell the
+// UNDERLYING struct's name, because emitting `struct <identifier-text>`
+// produced `struct PD`, a type that does not exist in the emitted C. The
+// checker records the resolved struct on the type-name node so the emitter has
+// somewhere to learn it from; a type name is not otherwise in the typemap.
+struct P { u32 a; u32 b; u64 c; }
+distinct typedef P PD;
+
+u32 main() {
+    if (@offset(P, b) != 4)  { return 1; }
+    if (@offset(PD, b) != 4) { return 2; }
+    if (@offset(PD, c) != 8) { return 3; }
+    return 0;
+}

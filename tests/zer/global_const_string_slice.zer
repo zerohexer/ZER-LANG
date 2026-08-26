@@ -1,0 +1,15 @@
+// BUG-858: `const [*]u8 BANNER = "...";` at GLOBAL scope was not declarable at
+// all — Pass 2 re-resolved the type node without the declaration's `const`, so a
+// mutable target was compared against a const initializer and the diagnostic
+// printed the SAME type on both sides ('[]u8' with '[]u8'). Every spelling
+// failed. This is the single most common firmware global there is.
+const [*]u8 BANNER = "boot ok";
+const [*]u8 EMPTY = "";
+
+i32 main() {
+    if (BANNER.len != 7) { return 1; }
+    if (BANNER[0] != 98) { return 2; }   // 'b'
+    if (BANNER[6] != 107) { return 3; }  // 'k'
+    if (EMPTY.len != 0) { return 4; }
+    return 0;
+}

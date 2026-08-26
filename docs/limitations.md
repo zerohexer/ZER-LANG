@@ -13,8 +13,8 @@ the corrections I made to my OWN earlier work so they are not repeated.
 
 ## Where main stands
 
-`make check` exit 0 — **1369 .zer**, 200 fuzz, 139 convert, all ten matrices, all seven
-audit gates, sink matrix **88 cells / 0 mismatch**.
+`make check` exit 0 — **1375 .zer**, 200 fuzz, 139 convert, all ten matrices, all EIGHT
+audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **88 cells / 0 mismatch**.
 
 Landed this session, newest first:
 
@@ -54,9 +54,9 @@ contains everything left below, with better implementations than the catalog ent
 | ~~`6af2497e`~~ TAKEN | **A8** indirect-call keep carrier | checker.c | none |
 | `1cb1f93e` | **A14** `lower_expr`, dead code, warnings 32 -> 0 | many | medium |
 | ~~`a1919aa5`~~ TAKEN | **A9** six intrinsics storing through const | checker.c | none |
-| `0a0ec95e` | **A15** short-circuit, **A16** const slice, **A17** const array size | checker.c checker.h | small |
-| `e937a1d8` | **A18** funcptr arrays | checker.c emitter.c parser.c parser.h | small |
-| `0828d1f7` | **A19** bit extraction through a pointer | checker.c | small |
+| ~~`0a0ec95e`~~ TAKEN | **A15** short-circuit, **A16** const slice, **A17** const array size | checker.c checker.h | none. Also fixes `audit_walker_fields.sh` membership (prose -> structural), baseline 758 -> 684. |
+| ~~`e937a1d8`~~ TAKEN | **A18** funcptr arrays | checker.c emitter.c parser.c parser.h | none. Brings `audit_reference_examples.sh` and WIRES it into `make check` — verified non-vacuous (RED on the pre-fix compiler). |
+| ~~`0828d1f7`~~ TAKEN | **A19** bit extraction through a pointer | checker.c | none |
 | `15b4fe49` | **A13** `@trap` arity + `ubsan_sweep.sh` | checker.c | small |
 | `38c27c18` `0ff11690` `d2cd8394` | tooling: `ub_sweep.sh`, the rc_cond_004 flake, structural `.gitignore` | — | none |
 
@@ -134,14 +134,15 @@ established by READING the emitted C (the pointer's value goes to an `"r"` asm o
 with a `"memory"` clobber, never a dereference), with the discriminating question written
 down for the next reader. The CONST half is not baselined — those six became BUG-896.
 
-## Recommended order for the remaining 8
+## Recommended order for the remaining 3
 
 1. ~~**A3**, **A2**, **A4**~~ — DONE 2026-08-26 (BUG-889..891, `ccdd49ee`). `value_flows_to`
    is in; the eight negative-constant sinks each have their own test, which is the only way
    to prove one query really replaced all eight.
 2. ~~**A5**, **A6**, **A7**, **A8**, **A9**~~ — ALL DONE 2026-08-26 (BUG-892..896,
    `dda5b33b` / `6af2497e` / `a1919aa5`). **Every accept-unsafe row in tracker 3 is closed.**
-3. **A15..A19** — over-rejections (A15 is my mis-closed row).
+3. ~~**A15..A19**~~ — ALL DONE 2026-08-26 (BUG-897..901, `0a0ec95e` / `e937a1d8` /
+   `0828d1f7`, no conflicts). A15 was my mis-closed row.
 4. **A13, A14** — arity and the indeterminate return.
 5. Tooling: `ubsan_sweep.sh`, `ub_sweep.sh`, the walker-field membership fix, the
    structural `.gitignore`, the rc_cond_004 flake.
@@ -281,11 +282,11 @@ My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
 
 | # | Fix | as71kk id | Evidence |
 |---|---|---|---|
-| A15 | **`if (i < 4 && a[i] > 0)` HARD-REJECTED** | 874 | = tracker-2 H14, the row I mis-closed as "precision only". Suppressed in short-circuit RHS position at all THREE sites that raise it (ident, call-return range, MMIO). A negative pins the boundary: `if (a[i] > 0 && i < 4)` puts the access on the LEFT, unconditional, and must still hard-reject |
-| A16 | **`const [*]u8 BANNER = "boot ok";` not declarable at all** | 872 | And it said so with the SAME type on both sides. The const/volatile fold written longhand at TWO sites |
-| A17 | **`const u32 CAP = 256; u8[CAP] buf;`** | 873 | Rejected as "not a compile-time constant", naming a constant |
-| A18 | **Arrays of function pointers never worked, in EITHER syntax** | 878/879 | Both `reference.md` and `CLAUDE.md` document `*(u32,u32) -> u32 [4] ops`. Parser: `parse_type` swallowed the `[3]` next to the RETURN type. Emitter: `?FuncPtr[N]` emitted an abstract declarator with a name glued on — not C. **The nullable form is the one that matters**, since a non-null funcptr array is auto-zeroed and ZER has no array initializer |
-| A19 | **Bit extraction through a pointer** | 881 | `volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];` appears in BOTH docs and did not compile — it fell to the SUB-SLICE path where hi > lo is a bounds error. Fixed as a DESUGARING to `*p` so one implementation of bit extraction stays and cannot drift |
+| ~~A15~~ **DONE (BUG-897)** | **`if (i < 4 && a[i] > 0)` HARD-REJECTED** | 874 | = tracker-2 H14, the row I mis-closed as "precision only". Suppressed in short-circuit RHS position at all THREE sites that raise it (ident, call-return range, MMIO). A negative pins the boundary: `if (a[i] > 0 && i < 4)` puts the access on the LEFT, unconditional, and must still hard-reject |
+| ~~A16~~ **DONE (BUG-898)** | **`const [*]u8 BANNER = "boot ok";` not declarable at all** | 872 | And it said so with the SAME type on both sides. The const/volatile fold written longhand at TWO sites |
+| ~~A17~~ **DONE (BUG-899)** | **`const u32 CAP = 256; u8[CAP] buf;`** | 873 | Rejected as "not a compile-time constant", naming a constant |
+| ~~A18~~ **DONE (BUG-900)** | **Arrays of function pointers never worked, in EITHER syntax** | 878/879 | Both `reference.md` and `CLAUDE.md` document `*(u32,u32) -> u32 [4] ops`. Parser: `parse_type` swallowed the `[3]` next to the RETURN type. Emitter: `?FuncPtr[N]` emitted an abstract declarator with a name glued on — not C. **The nullable form is the one that matters**, since a non-null funcptr array is auto-zeroed and ZER has no array initializer |
+| ~~A19~~ **DONE (BUG-901)** | **Bit extraction through a pointer** | 881 | `volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];` appears in BOTH docs and did not compile — it fell to the SUB-SLICE path where hi > lo is a bounds error. Fixed as a DESUGARING to `*p` so one implementation of bit extraction stays and cannot drift |
 | ~~A20~~ **DONE (BUG-884..887)** | **The two view-class boundary positives** | rides with A1 | `view_optional_null_arm_ok`, `view_param_interior_ptr_ok` — over-reject on main today (tracker-2 H19) |
 
 ### Tooling — take all of it

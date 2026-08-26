@@ -163,6 +163,7 @@ static Node *parse_statement(Parser *p);
 static Node *parse_block(Parser *p);
 static Node *parse_declaration(Parser *p);
 static TypeNode *parse_type(Parser *p);
+static TypeNode *parse_base_type(Parser *p);
 
 /* ---- Function pointer type helper ----
  * Called when we see '(' '*' after a return type.
@@ -325,10 +326,33 @@ static TypeNode *parse_func_ptr_2c(Parser *p) {
     }
     consume(p, TOK_RPAREN, "expected ')' after funcptr parameters");
 
-    /* Optional return type via '-> RET'. Default = void. */
+    /* Optional return type via '-> RET'. Default = void.
+     *
+     * BUG-878: the return type is parsed WITHOUT its array suffix. `parse_type`
+     * is greedy, so in
+     *
+     *     ?*(u32, u32) -> u32 [3] ops;      // array of 3 nullable funcptrs
+     *
+     * it swallowed `u32 [3]` and built `fn(u32,u32) -> u32[3]` — a funcptr
+     * RETURNING an array — which then failed at the use site with "cannot index
+     * type 'fn(u32, u32) -> u32[3]'". Both reference.md and CLAUDE.md document
+     * this exact spelling as the typedef-free array form, so the documentation
+     * asserted a feature the parser did not have.
+     *
+     * Disambiguating it needs no lookahead and no heuristic: a ZER function
+     * cannot return an array AT ALL, so a `[` here can only belong to the
+     * DECLARATION. Leaving the bracket unconsumed hands it to the array-suffix
+     * branch of parse_type, which is what builds the array. */
     TypeNode *ret_type;
     if (match(p, TOK_THIN_ARROW)) {
+        /* Full parse_type — the return type may be `?u32`, `*T`, `[*]u8`, a
+         * qualified type, anything — but with the trailing array suffix
+         * suppressed. Using parse_base_type instead was a first attempt and
+         * BROKE `*(u32) -> ?u32`, which the reference documents; the doc-example
+         * gate caught it. */
+        p->no_array_suffix++;
         ret_type = parse_type(p);
+        p->no_array_suffix--;
     } else {
         ret_type = new_type_node(p, TYNODE_VOID);
     }
@@ -640,7 +664,10 @@ static TypeNode *parse_type_inner(Parser *p) {
     TypeNode *base = parse_base_type(p);
 
     /* check for array suffix: T[N] or T[N][M] (multi-dimensional) */
-    if (match(p, TOK_LBRACKET)) {
+    /* BUG-878: inside a 2C funcptr RETURN type, a `[` belongs to the
+     * DECLARATION (an array OF funcptrs), not to the return type — a ZER
+     * function cannot return an array. Leave it for the caller. */
+    if (p->no_array_suffix == 0 && match(p, TOK_LBRACKET)) {
         TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
         arr->array.elem = base;
         arr->array.size_expr = parse_expression(p);
@@ -3125,6 +3152,11 @@ void parser_init(Parser *p, Scanner *scanner, Arena *arena, const char *file_nam
     p->file_name = file_name;
     p->source = NULL;
     p->depth = 0;
+    /* MUST be initialised here, not left to the caller's memset: callers that
+     * stack-allocate a Parser without zeroing get garbage, and a non-zero value
+     * suppresses EVERY array suffix — `u8[256] buf;` stops parsing as an array.
+     * Same shape as the Checker.target_ptr_bits trap CLAUDE.md records. */
+    p->no_array_suffix = 0;
     advance(p); /* prime the first token */
 }
 

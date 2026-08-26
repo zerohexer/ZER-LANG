@@ -5,6 +5,91 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26d — BUG-897..901: five idioms ZER documented and refused
+
+Adopted from `claude/vigilant-tesla-as71kk` (`0a0ec95e`, `e937a1d8`, `0828d1f7`). All
+three applied with NO conflicts. Every one of these is an OVER-rejection — the compiler
+refused a correct program — so the risk profile is the opposite of the accept-unsafe
+batch: the danger is not shipping a hole but *weakening a real rule while relaxing it*.
+Each is verified against the case that must still be rejected.
+
+### BUG-897 — `&&` / `||` did not narrow their RHS (my own mis-closed row)
+```
+u32 i = 9;
+if (i < 4 && a[i] > 0) { }      // error: index 'i' is always out of bounds
+if (i < 4) { if (a[i] > 0) { } } // the SAME program — compiles
+```
+The canonical guarded-access idiom, and the exact shape the auto-guard warning tells users
+to write, was HARD-REJECTED while the nested-if spelling compiled.
+
+**I closed this row myself as "precision, not safety."** That was wrong, and the way it
+was wrong is worth keeping: I probed with an UNPROVABLE index, which correctly falls to
+the auto-guard, and concluded there was no over-rejection. With a PROVABLE index the
+verdict is promoted to a hard error. My own tracker had even written the prediction —
+"becomes required the day the ALWAYS-OOB verdict is promoted at short-circuit position" —
+and I never checked whether BUG-796 had already promoted it. *Writing the prediction and
+not testing it is the failure, not missing the case.*
+
+The relaxation is ORDER-SENSITIVE, not a switch-off: `tests/zer_fail/shortcircuit_guard_after_access.zer`
+(the access BEFORE the guard) is verified still rejected.
+
+### BUG-898 — a `const` global slice could not be initialised
+`const [*]u8 MSG = "hello";` was rejected with **"cannot initialize 'MSG' of type '[]u8'
+with '[]u8'"** — the same spelling on both sides. A message that cannot express the
+difference it reports is the tell that the comparison is asking the wrong question.
+
+### BUG-899 — a `const` identifier could not size an array, Pool, Ring or Semaphore
+```
+const u32 CAP = 4;   u8[CAP] buf;   Pool(Slot, CAP) p;
+```
+— the most idiomatic firmware declaration there is — was rejected with "must be a
+compile-time constant", *naming a constant*. Four sites each called the NON-scoped
+`eval_const_expr`, which by construction cannot resolve a `NODE_IDENT`.
+
+**The in-place fold is the load-bearing part.** The EMITTER re-resolves the same TypeNode
+with the non-scoped evaluator, so teaching only the checker leaves the emitter silently
+sizing the array 0 and `@size(u8[CAP])` yielding 0 — and a compile-only test passes that.
+Trading an over-rejection for a wrong answer is worse than the over-rejection. The two
+halves must see the same value, and the only way to guarantee that is for there to be one
+value. `tests/zer/const_compile_time_sizes.zer` therefore asserts the sizes at RUNTIME.
+
+### BUG-900 — arrays of function pointers never worked, in either syntax
+```
+?*(u32, u32) -> u32 [3] ops;    // error: cannot index type '?fn(u32, u32) -> u32[3]'
+```
+`parse_type` is greedy, so the `[3]` — which sits next to the RETURN type — was swallowed
+into a funcptr RETURNING an array. Both `reference.md` and CLAUDE.md document this exact
+spelling as the typedef-free array form, so **the documentation asserted a feature the
+parser did not have.** Disambiguating needs no lookahead: a ZER function cannot return an
+array at all, so a `[` here can only belong to the declaration.
+
+### BUG-901 — bit extraction through a pointer, the documented MMIO idiom
+```
+volatile *u32 reg = @inttoptr(*u32, 0x4002_0014);
+u32 bits = reg[9..8];           // error: slice start (9) is greater than end (8)
+```
+Bit extraction dispatches on `type_is_integer(obj)`; a pointer is not an integer, so
+`[hi..lo]` fell through to the SUB-SLICE path where `hi > lo` is a bounds error. Every
+firmware author had to spell the deref out by hand. Done as a DESUGARING — rewrite the
+object to `*p` and let the existing scalar path run — so there stays ONE implementation of
+bit extraction and both emitter dispatch paths need no change and cannot drift.
+
+### Two gates, one fixed and one new — both verified to FIRE
+`tools/audit_walker_fields.sh` (which I installed in §B) decided membership on **prose**:
+it counted the walker's own name inside comments and strings, so editing a comment could
+move a walker in or out of the audited set. Baseline **758 -> 684** once membership is
+decided structurally.
+
+`tools/audit_reference_examples.sh` is NEW and IS wired into `make check` (and
+`make check-reference`): it compiles every `zer` block in `reference.md` — 184 blocks, 59
+compiled, 41 skipped, 84 baselined, 0 failed. Verified non-vacuous by running it against
+the pre-fix compiler, where it goes RED on the exact blocks BUG-900/901 fix. For a reader
+with no web access the reference IS the language; a stale example there is the
+documentation asserting behaviour the compiler does not have — which is precisely what
+two of these five bugs were.
+
+---
+
 ## Session 2026-08-26c — BUG-895/896: an indirect-call carrier, six intrinsics writing through const
 
 Adopted from `claude/vigilant-tesla-as71kk` (`6af2497e`, `a1919aa5`). Both applied with

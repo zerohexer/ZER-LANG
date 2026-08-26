@@ -234,10 +234,27 @@ for f in "${FILES[@]}"; do
             delete armkinds
             narm = 0
             bodybuf = ""
+            codebuf = ""
+            inbcom = 0
             infunc = 1
         }
         if (infunc) {
             bodybuf = bodybuf "\n" $0
+            # `codebuf` is the same body with COMMENTS REMOVED, used only for the
+            # self-call count below. Counting on the raw text made membership in
+            # this audit depend on PROSE: a function whose name appeared twice in
+            # its own doc-comment was audited as a recursive walker, and merely
+            # EDITING A COMMENT could move a function in or out of the audited
+            # set — which is how a real gap could disappear from this report
+            # without anyone touching the walker.
+            cl = $0
+            if (inbcom) {
+                if (cl ~ /\*\//) { sub(/^.*\*\//, "", cl); inbcom = 0 } else cl = ""
+            }
+            gsub(/\/\*[^*]*\*+([^\/*][^*]*\*+)*\//, "", cl)
+            if (cl ~ /\/\*/) { sub(/\/\*.*$/, "", cl); inbcom = 1 }
+            gsub(/\/\/.*$/, "", cl)
+            codebuf = codebuf "\n" cl
             # collect case labels; a run of consecutive labels shares one arm
             l = $0
             if (l ~ /case[ \t]+NODE_[A-Z_0-9]+[ \t]*:/) {
@@ -258,7 +275,14 @@ for f in "${FILES[@]}"; do
         }
         if (infunc && depth == 0) {
             # leaving the function — only report RECURSIVE walkers
-            calls = split(bodybuf, _cparts, fname) - 1
+            # Count real CALLS — the name followed by `(` — in comment-free code,
+            # not bare mentions anywhere in the text.
+            calls = 0
+            _rest = codebuf
+            while (match(_rest, "[^A-Za-z0-9_]" fname "[ \t]*\\(")) {
+                calls++
+                _rest = substr(_rest, RSTART + RLENGTH)
+            }
             if (calls >= 2 && narm > 0) {
                 for (a = 1; a <= narm; a++) {
                     nk = split(armkinds[a], ks, " ")

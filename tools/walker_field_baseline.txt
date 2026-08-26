@@ -4,6 +4,15 @@
 # kind-walker NAMES the kind of but never descends. Being in this file means the
 # omission was looked at and judged correct; a NEW line fails `make check`.
 #
+# 2026-08-25 — 758 -> 684. The audit decided MEMBERSHIP on PROSE: it counted the
+# function's own name anywhere in its body text, comments included, and treated
+# two or more occurrences as "recursive walker". Two functions that make ZERO
+# self-calls (checker.c:register_decl, zercheck_ir.c:zercheck_ir) were audited
+# by accident because their doc-comments named them, and EDITING A COMMENT could
+# move a function in or out of the audited set. The membership test now counts
+# call-shaped occurrences in comment-stripped code, and the 74 entries those two
+# functions contributed are gone.
+#
 # Two recurring, legitimate reasons appear throughout:
 #
 #   * STATEMENT-vs-EXPRESSION walkers. Many of these walkers only ever run on
@@ -309,51 +318,6 @@ checker.c:record_isr_globals:NODE_INTERRUPT:interrupt.body
 checker.c:record_isr_globals:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- checker.c: register_decl ---
-checker.c:register_decl:NODE_ASM:asm_stmt.inputs
-checker.c:register_decl:NODE_ASM:asm_stmt.outputs
-checker.c:register_decl:NODE_ASSIGN:assign.target
-checker.c:register_decl:NODE_ASSIGN:assign.value
-checker.c:register_decl:NODE_AWAIT:await_stmt.cond
-checker.c:register_decl:NODE_BINARY:binary.left
-checker.c:register_decl:NODE_BINARY:binary.right
-checker.c:register_decl:NODE_BLOCK:block.stmts
-checker.c:register_decl:NODE_CALL:call.args
-checker.c:register_decl:NODE_CALL:call.callee
-checker.c:register_decl:NODE_CRITICAL:critical.body
-checker.c:register_decl:NODE_DEFER:defer.body
-checker.c:register_decl:NODE_DO_WHILE:while_stmt.body
-checker.c:register_decl:NODE_DO_WHILE:while_stmt.cond
-checker.c:register_decl:NODE_EXPR_STMT:expr_stmt.expr
-checker.c:register_decl:NODE_FIELD:field.object
-checker.c:register_decl:NODE_FILE:file.decls
-checker.c:register_decl:NODE_FOR:for_stmt.body
-checker.c:register_decl:NODE_FOR:for_stmt.cond
-checker.c:register_decl:NODE_FOR:for_stmt.init
-checker.c:register_decl:NODE_FOR:for_stmt.step
-checker.c:register_decl:NODE_IF:if_stmt.cond
-checker.c:register_decl:NODE_IF:if_stmt.else_body
-checker.c:register_decl:NODE_IF:if_stmt.then_body
-checker.c:register_decl:NODE_INDEX:index_expr.index
-checker.c:register_decl:NODE_INDEX:index_expr.object
-checker.c:register_decl:NODE_INTERRUPT:interrupt.body
-checker.c:register_decl:NODE_INTRINSIC:intrinsic.args
-checker.c:register_decl:NODE_ONCE:once.body
-checker.c:register_decl:NODE_ORELSE:orelse.expr
-checker.c:register_decl:NODE_ORELSE:orelse.fallback
-checker.c:register_decl:NODE_RETURN:ret.expr
-checker.c:register_decl:NODE_SLICE:slice.end
-checker.c:register_decl:NODE_SLICE:slice.object
-checker.c:register_decl:NODE_SLICE:slice.start
-checker.c:register_decl:NODE_SPAWN:spawn_stmt.args
-checker.c:register_decl:NODE_STATIC_ASSERT:static_assert_stmt.cond
-checker.c:register_decl:NODE_STRUCT_INIT:struct_init.fields
-checker.c:register_decl:NODE_SWITCH:switch_stmt.arms
-checker.c:register_decl:NODE_SWITCH:switch_stmt.expr
-checker.c:register_decl:NODE_TYPECAST:typecast.expr
-checker.c:register_decl:NODE_UNARY:unary.operand
-checker.c:register_decl:NODE_VAR_DECL:var_decl.init
-checker.c:register_decl:NODE_WHILE:while_stmt.body
-checker.c:register_decl:NODE_WHILE:while_stmt.cond
 
 # --- checker.c: scan_body_shared_types ---
 checker.c:scan_body_shared_types:NODE_ASM:asm_stmt.inputs
@@ -836,35 +800,6 @@ zercheck_ir.c:ir_defer_scan_uses:NODE_UNARY:unary.operand
 zercheck_ir.c:ir_defer_scan_uses:NODE_VAR_DECL:var_decl.init
 
 # --- zercheck_ir.c: zercheck_ir ---
-zercheck_ir.c:zercheck_ir:NODE_ASM:asm_stmt.inputs
-zercheck_ir.c:zercheck_ir:NODE_ASM:asm_stmt.outputs
-zercheck_ir.c:zercheck_ir:NODE_AWAIT:await_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_BLOCK:block.stmts
-zercheck_ir.c:zercheck_ir:NODE_CRITICAL:critical.body
-zercheck_ir.c:zercheck_ir:NODE_DEFER:defer.body
-zercheck_ir.c:zercheck_ir:NODE_DO_WHILE:while_stmt.body
-zercheck_ir.c:zercheck_ir:NODE_DO_WHILE:while_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_EXPR_STMT:expr_stmt.expr
-zercheck_ir.c:zercheck_ir:NODE_FILE:file.decls
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.body
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.init
-zercheck_ir.c:zercheck_ir:NODE_FOR:for_stmt.step
-zercheck_ir.c:zercheck_ir:NODE_FUNC_DECL:func_decl.body
-zercheck_ir.c:zercheck_ir:NODE_GLOBAL_VAR:var_decl.init
-zercheck_ir.c:zercheck_ir:NODE_IF:if_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_IF:if_stmt.else_body
-zercheck_ir.c:zercheck_ir:NODE_IF:if_stmt.then_body
-zercheck_ir.c:zercheck_ir:NODE_INTERRUPT:interrupt.body
-zercheck_ir.c:zercheck_ir:NODE_ONCE:once.body
-zercheck_ir.c:zercheck_ir:NODE_RETURN:ret.expr
-zercheck_ir.c:zercheck_ir:NODE_SPAWN:spawn_stmt.args
-zercheck_ir.c:zercheck_ir:NODE_STATIC_ASSERT:static_assert_stmt.cond
-zercheck_ir.c:zercheck_ir:NODE_SWITCH:switch_stmt.arms
-zercheck_ir.c:zercheck_ir:NODE_SWITCH:switch_stmt.expr
-zercheck_ir.c:zercheck_ir:NODE_VAR_DECL:var_decl.init
-zercheck_ir.c:zercheck_ir:NODE_WHILE:while_stmt.body
-zercheck_ir.c:zercheck_ir:NODE_WHILE:while_stmt.cond
 
 # --- ir_lower.c: lower_expr ---
 #   NOT a safety walker — this is AST->IR lowering. A call's CALLEE is not

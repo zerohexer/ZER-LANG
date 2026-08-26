@@ -222,6 +222,9 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
+	@echo ""
+	@echo "=== reference.md examples must compile ==="
+	@bash tools/audit_reference_examples.sh ./zerc
 
 # Stage 3 standalone target — run just the fixed-buffer linter.
 check-fixed-buffers:
@@ -235,6 +238,10 @@ check-walker-fields:
 
 check-sink-matrix: zerc
 	@bash tools/sink_matrix.sh ./zerc
+
+# Standalone — every ```zer block in docs/reference.md must compile.
+check-reference: zerc
+	@bash tools/audit_reference_examples.sh ./zerc
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

@@ -280,6 +280,18 @@ struct Symbol {
      * mark what's shared and require synchronized access. */
     bool is_atomic_cell;
 
+    /* BUG-847/849: set on a RESOURCE symbol the first time it is given its
+     * backing state — an `Arena` receiving a buffer (a var-decl initializer or
+     * `a = Arena.over(buf)`), or a `Barrier` receiving `@barrier_init(b, n)`.
+     * Both resources zero-initialise to a state that is USABLE but INERT:
+     *   - an Arena with capacity 0 returns null from every allocation, forever,
+     *     and the caller's mandatory `orelse` hides it;
+     *   - a Barrier with target 0 lets `@barrier_wait` return IMMEDIATELY, so it
+     *     reports success while providing no synchronisation at all.
+     * Checked in a deferred pass (`check_resource_init`) so declaration order —
+     * and which module does the initialising — does not matter. */
+    bool resource_initialized;
+
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */
     Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
@@ -322,6 +334,13 @@ struct Symbol {
 
     /* Handle auto-deref: which Slab/Pool this handle was allocated from */
     Symbol *slab_source;        /* NULL = unknown (parameter, conditional) */
+    /* BUG-848: WHICH arena this pointer was allocated from. `is_arena_derived` /
+     * `is_from_arena` answer "is it arena memory?" but not "whose?", and the
+     * arena-internal store relaxation needs the identity: two pointers may be
+     * stored into one another only when they share an arena, hence a lifetime.
+     * NULL = unknown (parameter, conditional, laundered) -> the relaxation does
+     * not apply and the conservative rejection stands. */
+    Symbol *arena_source;
 
     /* MMIO pointer bound: derived from mmio range for @inttoptr pointers */
     uint64_t mmio_bound;        /* max valid index (0 = no bound) */

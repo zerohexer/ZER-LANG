@@ -1,0 +1,68 @@
+/* BUG-848 (a RELAXATION): linking two allocations from the SAME arena is safe
+ * and now compiles. It used to be rejected — the escape rule asked only "is the
+ * destination reached through a pointer?", which cannot tell
+ *
+ *     g_ptr.next   = arena_ptr;    // destination outlives the arena  — UNSAFE
+ *     arena_ptr.next = other_ptr;  // destination IS in the arena     — safe
+ *
+ * apart. Reaching the stored pointer requires dereferencing the CONTAINER, which
+ * lives in the same arena and is invalidated by the same `reset()`.
+ *
+ * This is the shape docs/reference.md's Arena example has always shown and which
+ * had never been compiled. The boundary — a pointer from a DIFFERENT arena — is
+ * still rejected; see tests/zer_fail/arena_cross_arena_store.zer.
+ *
+ * Exits 0 only if the linking compiles AND the links are actually traversable.
+ */
+
+struct Node {
+    ?*Node next;
+    u32 id;
+}
+
+Arena g_arena;
+u8[512] g_mem;
+
+u32 chain_len(?*Node head) {
+    u32 n = 0;
+    ?*Node cur = head;
+    while (n < 8) {
+        if (cur) |c| { n += 1; cur = c.next; } else { return n; }
+    }
+    return n;
+}
+
+u32 main() {
+    /* --- a GLOBAL arena, linked in place --- */
+    g_arena = Arena.over(g_mem);
+    defer g_arena.reset();
+
+    *Node a = g_arena.alloc(Node) orelse { return 1; };
+    *Node b = g_arena.alloc(Node) orelse { return 2; };
+    *Node c = g_arena.alloc(Node) orelse { return 3; };
+    a.id = 1; b.id = 2; c.id = 3;
+
+    a.next = b;                 /* same arena — accepted */
+    b.next = c;                 /* same arena — accepted */
+    if (chain_len(a) != 3) { return 4; }
+
+    /* the link is a real pointer, not a copy */
+    if (a.next) |an| { if (an.id != 2) { return 5; } } else { return 6; }
+
+    /* --- a LOCAL arena, linked in place --- */
+    u8[256] l_mem;
+    Arena l_arena = Arena.over(l_mem);
+    *Node x = l_arena.alloc(Node) orelse { return 7; };
+    *Node y = l_arena.alloc(Node) orelse { return 8; };
+    x.id = 10; y.id = 20;
+    x.next = y;                 /* same LOCAL arena — accepted */
+    if (chain_len(x) != 2) { return 9; }
+
+    /* --- through one level of aliasing, which is every real freelist --- */
+    ?*Node head = null;
+    head = b;                   /* alias: carries the arena identity */
+    if (head) |h| { h.next = a; }
+    if (a.next) |an2| { if (an2.id != 2) { return 10; } }
+
+    return 0;
+}

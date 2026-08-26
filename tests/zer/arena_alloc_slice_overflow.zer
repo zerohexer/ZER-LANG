@@ -1,0 +1,57 @@
+/* BUG-845: `arena.alloc_slice(T, n)` computed `sizeof(T) * n` with no overflow
+ * check on the IR path — the only path a function body takes since the 2026-04
+ * migration. The AST path's `__builtin_mul_overflow` guard (BUG-266) had been
+ * dead code ever since.
+ *
+ * Measured on the pre-fix compiler: a 1024-byte arena handed back a slice
+ * reporting 2305843009213693952 elements (2^61 * 8 wraps to a ZERO-byte
+ * request, which trivially "fits"), and because the LENGTH is what every
+ * downstream bounds check consults, a write 1600 bytes past the arena then
+ * succeeded silently — no trap, no diagnostic, corrupted whatever followed.
+ *
+ * This test asserts REFUSAL, which is the only observable the defect has: a
+ * lying length produces no diagnostic to match on.
+ *
+ * Exit 0 only if every over-large request is refused AND ordinary allocation
+ * still works. On the pre-fix compiler this exits 1.
+ */
+
+struct Cell { u64 v; }
+
+u8[1024] backing;
+
+u32 main() {
+    Arena a = Arena.over(backing);
+
+    /* 1. ordinary allocation must still succeed */
+    [*]Cell ok = a.alloc_slice(Cell, 4) orelse { return 1; };
+    if (ok.len != 4) { return 2; }
+    ok[0].v = 7;
+    ok[3].v = 9;
+    if (ok[0].v != 7) { return 3; }
+    if (ok[3].v != 9) { return 4; }
+
+    /* 2. sizeof(Cell) * n OVERFLOWS size_t: 2^61 * 8 == 2^64 == 0.
+     *    Pre-fix this "fit" in a 1024-byte arena. */
+    usize wrap_to_zero = 2305843009213693952;
+    ?[*]Cell bad1 = a.alloc_slice(Cell, wrap_to_zero);
+    if (bad1) |s1| { if (s1.len > 0) { return 5; } }
+
+    /* 3. no multiply overflow, but the byte count is near SIZE_MAX, so the
+     *    arena's own `offset + size > capacity` test wrapped and compared
+     *    small. Step 1 above left offset non-zero, which is what the old test
+     *    needed to wrap. */
+    usize near_max = 2305843009213693951;
+    ?[*]Cell bad2 = a.alloc_slice(Cell, near_max);
+    if (bad2) |s2| { if (s2.len > 0) { return 6; } }
+
+    /* 4. a plainly-too-large request (no arithmetic edge at all) */
+    ?[*]Cell bad3 = a.alloc_slice(Cell, 1000);
+    if (bad3) |s3| { if (s3.len > 0) { return 7; } }
+
+    /* 5. the arena is still usable and still bounded after the refusals */
+    [*]Cell ok2 = a.alloc_slice(Cell, 2) orelse { return 8; };
+    if (ok2.len != 2) { return 9; }
+
+    return 0;
+}

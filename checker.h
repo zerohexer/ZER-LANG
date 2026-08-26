@@ -188,6 +188,12 @@ typedef struct {
     int keep_edge_count;
     int keep_edge_capacity;
 
+    /* BUG-847/849: deferred "was this resource ever initialised?" sites.
+     * Recorded at each use (`arena.alloc*()`, `@barrier_wait`) and validated
+     * after ALL module bodies are checked, so a global resource initialised in a
+     * function declared LATER — or in another module — is not falsely reported.
+     * Same deferred shape as keep_edges. */
+
     /* Interrupt safety: track globals accessed from ISR and regular code */
     bool in_interrupt;  /* true when checking NODE_INTERRUPT body */
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */
@@ -343,7 +349,10 @@ void checker_init(Checker *c, Arena *arena, const char *file_name);
 void checker_register_file(Checker *c, Node *file_node); /* register declarations only */
 bool checker_check(Checker *c, Node *file_node);
 bool checker_check_bodies(Checker *c, Node *file_node); /* check bodies only, decls already registered */
-void check_keep_inference(Checker *c); /* keep inference: transitive escape fixpoint + deferred enforcement (after ALL bodies) */
+void check_keep_inference(Checker *c);
+/* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
+ * bodies, so a resource declared in one module and initialised in another is
+ * seen. Covers Arena backing stores and Barrier targets. */
 void checker_post_passes(Checker *c, Node *file_node); /* stack depth + interrupt safety (after all bodies checked) */
 void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with module's own types */
 void checker_pop_module_scope(Checker *c); /* pop module scope */

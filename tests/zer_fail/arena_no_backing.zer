@@ -1,0 +1,11 @@
+// expect-error: never given a backing store
+// BUG-847: an Arena with no backing store has capacity 0, so EVERY allocation
+// returns null, forever. The caller's mandatory `orelse` then hides it: the
+// program takes the failure path every time and looks like it works.
+Arena a;
+struct Node { u32 v; }
+u32 main() {
+    ?*Node n = a.alloc(Node);
+    if (n) |p| { p.v = 1; return 0; }
+    return 19;
+}

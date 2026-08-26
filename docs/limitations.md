@@ -7,8 +7,8 @@ Entries removed once fixed.
 
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
-**`as71kk` is fully consumed. There is nothing left to cherry-pick from any of the nine
-`vigilant-tesla` branches.** All three harvests are done: 45 rows (tracker 1), 21 (tracker
+**ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest
+trackers is closed — 45 + 21 + 20.** Nothing remains to cherry-pick. All three harvests are done: 45 rows (tracker 1), 21 (tracker
 2, mostly superseded), 20 (tracker 3). The cherry-pick recipe below is kept because it
 WORKED and the next branch will want it, not because anything is pending.
 
@@ -32,7 +32,7 @@ repeated.
 
 ## Where main stands
 
-`make check` exit 0 — **1386 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT
+`make check` exit 0 — **1391 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT
 audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **88 cells / 0 mismatch**.
 
 Landed this session, newest first:
@@ -344,7 +344,7 @@ Float stays parked until decided.
 
 ---
 
-## OPEN (1 of 21 — the arena-internal link) — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
+## CLOSED 2026-08-26 (all 21) — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
 
 **Status: NOT implemented — a catalog.** Every row verified on a clean build of main
 (`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading
@@ -435,7 +435,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 | ~~H15~~ **DONE (BUG-899)** | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
 | ~~H16~~ **DONE (BUG-898)** | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
 | ~~H17~~ **DONE (BUG-900/901)** | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |
-| H18 | **PARTIAL — 2 of 3 DONE (BUG-907)**. ~~guarded coverage through an alias~~, ~~static-optional return + leak~~; **the ARENA-INTERNAL LINK is still open** — `a.next = b` where both come from the SAME arena is rejected as "cannot store arena-derived pointer", the shape reference.md has always shown. qa249l `9013ada3` carries it (BUG-848), but it is a RELAXATION touching ~10 checker sites plus a new `Symbol.arena_source`, and its own commit message records TWO accept-unsafe mistakes caught by boundary probes before shipping (a lifetime-CLASS test accepted a local-arena pointer stored into a global-arena object; propagating the identity through the shared escape helper marked a pointer PARAMETER as arena memory). Both are pinned by `tests/zer_fail/arena_cross_arena_store.zer` and a sibling. Left for its own isolated change rather than ridden in with the rest. | **qa249l** | 1 positive rejected |
+| ~~H18~~ **DONE (BUG-907 + BUG-908)** | Arena-internal link; guarded coverage through an alias; static-optional return + leak | **qa249l** | all 3 closed. The arena-internal link (BUG-908) landed as its OWN change: a relaxation over ~10 checker sites, verified against all 27 existing `arena*`/`escape_arena*` negatives plus two boundary probes I wrote myself. |
 | ~~H19~~ **DONE (rides with BUG-884..887)** | Heap-slice free in an array element; the view-class boundary positives | **29fiao** | ride with H1 |
 
 ### LIVE — cross-module (unique to `qa249l`, nobody else looked)
@@ -533,7 +533,7 @@ exists to close, and a partially-closed class is how this one came back.
 
 ---
 
-## OPEN — harvest tracker: five `claude/vigilant-tesla-*` branches, verified against main 2026-08-22
+## CLOSED — harvest tracker: five `claude/vigilant-tesla-*` branches, verified against main 2026-08-22 (the B1..B9 / F1..F4 rows are before/after verification tables, not findings)
 
 **Status: NOT implemented. This is a catalog, not a changelog.** Every row below was
 verified on a clean `make zerc` build of main (`5fef1d06`) by running **the branch's own

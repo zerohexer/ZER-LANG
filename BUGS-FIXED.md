@@ -5,6 +5,91 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26g — BUG-908: linking two allocations from the SAME arena
+
+Adopted from `claude/vigilant-tesla-qa249l` (`9013ada3`, the BUG-848 half). **This closes
+the last row of all three harvests.** Landed as its own change rather than ridden in with
+the rest, because it is a RELAXATION touching ~10 checker sites plus a new
+`Symbol.arena_source`.
+
+### The over-rejection
+```
+struct B { ?*B next; u32 v; }
+*B a = arena.alloc(B) orelse { return 1; };
+*B b = arena.alloc(B) orelse { return 1; };
+a.next = b;     // error: cannot store arena-derived pointer 'b' through pointer parameter 'a'
+```
+Two objects in the SAME arena cannot outlive each other — they die together when the arena
+resets. Linking them is the shape `reference.md` has always shown, and it **had never been
+compiled.**
+
+### Why the predicate is arena IDENTITY, not a lifetime class
+The branch's own commit message records TWO accept-unsafe mistakes made and caught by
+deliberate boundary probes before it shipped, and both are the reason the design is what it
+is:
+
+1. a **lifetime-CLASS** test accepted a LOCAL-arena pointer stored into a GLOBAL-arena
+   object — a real dangle, since the local arena's backing buffer dies with the frame. So
+   the predicate tests *which arena*, not *what kind of arena*;
+2. propagating the identity through the shared escape helper marked a pointer PARAMETER as
+   arena memory.
+
+Both are pinned: `tests/zer_fail/arena_cross_arena_store.zer` carries the first with that
+history written into it. I probed the second myself rather than trust the note —
+`void link(*B a) { B local; a.next = &local; }` is still rejected, as is an arena pointer
+stored into a global.
+
+**Regression check for a relaxation is the negative corpus, not the positive.** All **27**
+existing `arena*` / `escape_arena*` negatives still reject.
+
+### What was NOT taken from that commit
+`9013ada3` is BUG-845..849, and everything except the relaxation was already here:
+
+- **BUG-845** (`alloc_slice` overflow on the IR path) = main's BUG-839. Both emitter hunks
+  conflicted and resolved to OURS; mine additionally rejects `align == 0` rather than
+  silently substituting 1.
+- **BUG-847/849** (Arena with no backing store, Barrier with no `@barrier_init`) = main's
+  BUG-848/849. `checker.c` applied CLEANLY here, which is the dangerous case: it added a
+  SECOND, independent implementation (`record_resource_use` / `check_resource_init` +
+  four `Checker` fields) alongside mine, which would have double-reported every
+  diagnostic. Excised — definition, both call sites, the deferred pass, its `zerc_main.c`
+  caller, and the struct in `checker.h`.
+
+  Their version defers to after all modules; mine runs per file, and their comment claims
+  that timing matters. **I probed it instead of assuming**: a global `Arena` declared in
+  one module and initialised by a function in another compiles clean here, so removing
+  theirs loses nothing. The in-file negative still rejects.
+
+- The vacuous-test repairs (`super_freelist_arena`, `stress_combined_safety_02`,
+  `gen_arena_00{1,2,4}`, the two fuzz generators) are main's BUG-848 versions; all
+  conflicted and resolved to OURS.
+
+*A clean apply is not evidence of no conflict.* Two implementations of one rule can coexist
+without git noticing — the same shape as the doubled `memset` in BUG-889's cherry-pick.
+
+### One test dropped, and why the harness earned its keep here
+`tests/zer_fail/barrier_no_init.zer` came with the pick and reported
+**"rejected, but for the WRONG REASON"** — its directive expects "never initial**ized**"
+while main's diagnostic says "never initial**ised**". The rule fired correctly; the two
+branches simply spell it differently.
+
+Dropped rather than patched: main already has `barrier_never_initialized.zer`, byte-for-byte
+the same program (only the variable name differs), with the correct directive and a far
+better comment — including the observation that the unbacked Arena and the uninitialised
+Barrier *are the whole class*, since every other builtin states its size in its type
+(`Pool(T,N)`, `Ring(T,N)`, `Semaphore(N)`) or grows on demand (`Slab`).
+
+`arena_no_backing.zer` is KEPT alongside main's `arena_no_backing_store.zer` — same rule,
+different unwrap spelling (`if (n) |p|` vs `orelse`), which is complementary coverage
+rather than duplication.
+
+This is the third time this session the `// expect-error` directive has caught a
+*passing-for-the-wrong-reason* result that an exit-code-only harness would have waved
+through. Under the old runner a spelling drift like this is invisible, and so is a rule
+being deleted entirely as long as some other rule rejects the same file.
+
+---
+
 ## Session 2026-08-26f — BUG-904..907: the cross-module pair, and two invented problems
 
 Adopted from `claude/vigilant-tesla-qa249l` (`e2d9cafa`, `aa5fdc74`, `ef09de45`,

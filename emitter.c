@@ -5782,6 +5782,14 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    b->target = n;\n");
     emit(e, "}\n");
     emit(e, "static inline void _zer_barrier_wait(_zer_barrier *b) {\n");
+    /* BUG-849 runtime belt: a zero-initialised barrier has target 0, so the
+     * `count >= target` test below is true on the FIRST arrival — every thread
+     * sails straight through and the barrier reports success while synchronizing
+     * nothing. The checker rejects the case it can attribute to a named symbol;
+     * a barrier reached through a pointer parameter is beyond a per-file
+     * analysis, so trap loudly instead of silently degrading. */
+    emit(e, "    if (b->target == 0) _zer_trap(\"@barrier_wait on an uninitialized "
+            "barrier — call @barrier_init(b, N) first\", __FILE__, __LINE__);\n");
     emit(e, "    pthread_mutex_lock(&b->mtx);\n");
     emit(e, "    uint32_t gen = b->generation;\n");
     emit(e, "    b->count++;\n");
@@ -5990,6 +5998,13 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "/* ZER Arena runtime */\n");
     emit(e, "typedef struct { uint8_t *buf; size_t capacity; size_t offset; } _zer_arena;\n\n");
 
+    /* BUG-845: the capacity test itself must not overflow. `off + size >
+     * capacity` wraps when `size` is near SIZE_MAX, and a wrapped sum compares
+     * SMALL — so a request the arena obviously cannot satisfy was granted, and
+     * the caller got a pointer into a 1 KiB buffer with a length in the
+     * exabytes. Written as a subtraction on the capacity side, which cannot
+     * wrap because `off <= capacity` is established first. The alignment
+     * rounding is guarded the same way. */
     emit(e, "static inline void *_zer_arena_alloc(_zer_arena *a, size_t size, size_t align) {\n");
     /* BUG-839: BOTH additions here could wrap, and a wrap makes the capacity test
      * PASS for a request that does not fit — the same defeat-the-guard shape as the
@@ -6490,6 +6505,17 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
             if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
+                /* BUG-845: the byte count is `sizeof(T) * n` and it MUST be
+                 * computed with an overflow check. The AST path has done this
+                 * since BUG-266; this IR path — the only one that runs for a
+                 * function body since the 2026-04 migration — did not, so the
+                 * AST guard was dead code. Measured: a 1024-byte arena returned
+                 * a slice reporting 2^61 elements (2^61 * 8 wraps to a 0-byte
+                 * request, which trivially "fits"), and because the LENGTH is
+                 * what every downstream bounds check consults, a write 1600
+                 * bytes past the arena then succeeded with no trap and no
+                 * diagnostic. On bare metal there is no fault handler to catch
+                 * even the far-out-of-range case. */
                 emit(e,"({size_t _zer_an%d=",t); BA(1); emit(e,";");
                 /* BUG-839: BUG-266 added __builtin_mul_overflow around sizeof(T)*n on
                  * the AST path ONLY, and function bodies have been IR-only since

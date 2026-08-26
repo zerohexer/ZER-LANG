@@ -1716,6 +1716,11 @@ Ring(u8, 256) rx_buf;      // 256-byte circular buffer, global only
 - `.push_checked(val)` → `?void` — Push value. Returns null if full.
 - `.pop()` → `?T` — Pop oldest. Returns null if empty.
 
+Discarding a `push_checked` result is a compile error: reporting overflow is its
+entire purpose, so throwing the report away makes it identical to `push`. Write
+`rb.push_checked(x) orelse { ... };`, or call `push` if dropping on overflow is
+what you mean. Discarding a `pop()` result is allowed — that is a "drop one".
+
 **EXAMPLE**
 ```zer
 Ring(u8, 256) rx_buf;
@@ -1757,9 +1762,26 @@ Cannot free individual allocations.
 
 **SYNOPSIS**
 ```zer
-u8[4096] backing;
-Arena ar = Arena.over(backing);
+u8[4096] backing;                        // the storage is a global array
+Arena g_ar;                              // a global arena is ASSIGNED in a function
+u8[4096] g_backing;
+
+u32 main() {
+    Arena ar = Arena.over(backing);      // local arena
+    g_ar = Arena.over(g_backing);        // global arena
+    return 0;
+}
 ```
+
+`Arena.over(...)` is a call, so it cannot appear in a global initializer — declare
+the arena at global scope and assign it inside a function (this is what every
+firmware example does).
+
+`over` is a CONSTRUCTOR: it RETURNS an arena, it does not mutate one. Writing
+`ar.over(buf);` as a bare statement is a compile error — it would build an arena
+into a discarded temporary and leave `ar` at capacity 0, so every later
+allocation would return null forever. Allocating from an arena that never
+received a backing store anywhere in the program is a compile error too.
 
 **METHODS**
 - `Arena.over(buf)` → `Arena` — Create arena over an array or slice.
@@ -1773,17 +1795,29 @@ Arena ar = Arena.over(backing);
 struct Node { u32 id; ?*Node next; }
 
 u8[4096] backing;
-Arena ar = Arena.over(backing);
 
-*Node a = ar.alloc(Node) orelse { return 1; };
-a.id = 1;
+u32 main() {
+    Arena ar = Arena.over(backing);
+    defer ar.reset();      // free everything at scope exit
 
-*Node b = ar.alloc(Node) orelse { return 2; };
-b.id = 2;
-a.next = b;
+    *Node a = ar.alloc(Node) orelse { return 1; };
+    a.id = 1;
 
-defer ar.reset();      // free everything at scope exit
+    *Node b = ar.alloc(Node) orelse { return 2; };
+    b.id = 2;
+    a.next = b;            // linking two allocations from the SAME arena is fine
+
+    if (a.next) |n| { if (n.id != 2) { return 3; } }
+    return 0;
+}
 ```
+
+**LINKING.** Storing an arena pointer into another object from the SAME arena is
+allowed — reaching the stored pointer requires dereferencing the container, and
+the container is invalidated by the same `reset()`. Storing one into an object
+from a DIFFERENT arena is a compile error, because their lifetimes are not tied
+together (a local arena's buffer dies with the frame). Storing one into a
+global/static remains a compile error.
 
 **ERRORS**
 ```zer
@@ -1799,6 +1833,10 @@ ar.alloc_slice(Byte, 64);
 
 **NOTES**
 - Arena-derived pointers cannot be stored in global/static variables (compile error).
+- Two allocations from the SAME arena may point at each other; from DIFFERENT
+  arenas they may not.
+- `alloc_slice(T, n)` refuses any request whose byte count `sizeof(T) * n`
+  overflows, so a slice can never report a length the arena does not hold.
 - No individual free — arena is all-or-nothing.
 - Use `defer ar.reset()` to ensure cleanup on all exit paths.
 
@@ -3847,6 +3885,11 @@ Barrier bar;                // keyword type (like Arena, Pool)
 ```
 - `Barrier` is a builtin type — checker validates `@barrier_init`/`@barrier_wait` args are `Barrier` type.
 - Using wrong type (e.g., `u32`) → compile error.
+- **`@barrier_init` is mandatory.** A `Barrier` zero-initializes to a target of 0,
+  and a wait on that returns on the FIRST arrival — every thread sails through and
+  it reports success while synchronizing nothing. Waiting on a barrier that no
+  `@barrier_init` ever names is a compile error; a barrier reached through a
+  pointer parameter (which no per-file analysis can see) traps at runtime instead.
 
 ### Semaphore — Counting Semaphore
 ```zer

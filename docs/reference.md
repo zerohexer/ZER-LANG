@@ -2123,6 +2123,31 @@ Emits GCC `__atomic_thread_fence()`.
 
 ---
 
+### @config(key, default)
+
+**DESCRIPTION**
+
+Build-configuration hook. Yields `default`, and takes its TYPE from `default`.
+
+**STATUS — read this before using it.** The hook is wired through the checker and both
+emitter paths, but there is no way to supply a value: the compiler has no `--config` flag,
+so `@config` **always** yields the default today. It is a placeholder for build-time
+configuration, not a working feature. `comptime` constants are the mechanism that works.
+
+Both arguments are ordinary expressions and both are type-checked, so `key` must be a
+literal or a declared identifier — a bare undeclared name is an "undefined identifier"
+error, not a key.
+
+```zer
+u32 main() {
+    u32 baud = @config("baud", 9600);   // yields 9600
+    if (baud != 9600) { return 1; }
+    return 0;
+}
+```
+
+---
+
 ### @unreachable(), @expect(val, expected)
 
 **DESCRIPTION**
@@ -2984,6 +3009,122 @@ Per-architecture interrupt disable/enable.
 // interrupts re-enabled
 ```
 
+### Converting a float to an integer — DEFINED, and it SATURATES
+
+C leaves a float-to-integer conversion UNDEFINED when the value does not fit, and the
+result really does vary: the same emitted C gave `4294967295` at `-O0` and `0` at `-O2`.
+ZER defines it. **The conversion SATURATES to the target's range, and NaN becomes 0.**
+
+```zer
+i32 printf(const *u8 fmt, ...);
+
+u32 main() {
+    f64 big  = 1e20;
+    f64 neg  = -1.5;
+    f64 frac = 3.7;
+
+    if ((u32)frac != 3)          { return 1; }   // in range — plain truncation toward zero
+    if ((u32)neg  != 0)          { return 2; }   // below the range — clamps to 0
+    if ((u32)big  != 4294967295) { return 3; }   // above the range — clamps to the max
+    if ((i32)big  != 2147483647) { return 4; }
+    if ((i32)(-1e20) != -2147483648) { return 5; }
+    if ((u8)300.0 != 255)        { return 6; }
+
+    printf("float->int saturates\n");
+    return 0;
+}
+```
+
+The rule matches Rust's `as`, and it follows ZER's existing split: a **memory** violation
+halts (slice OOB, misaligned `@inttoptr`, a bad `@pun`), while an **arithmetic** result
+gets a defined value — which is already why integer overflow wraps rather than trapping.
+
+`@saturate(T, x)` is the same operation under its own name, so both spellings agree:
+
+```zer
+u32 main() {
+    f32 over = 2147483648.0;
+    if (@saturate(i32, over) != 2147483647) { return 1; }
+    if ((i32)over            != 2147483647) { return 2; }
+    return 0;
+}
+```
+
+**NaN is tested first, deliberately.** Every comparison against NaN is false, so a range
+check written the obvious way falls straight through to the raw cast — the exact UB being
+removed. `u128` / `i128` keep a trap for NaN instead: the bounds are not expressible as
+literals at that width.
+
+**`@truncate` on a float is a compile error.** `@truncate` means "keep the low bits" and a
+float has none; giving one primitive two unrelated meanings by operand type is the kind of
+overload this language avoids. Use the cast or `@saturate`, which already say it:
+
+<!-- audit: skip -->
+```zer
+u32 bad(f32 x) {
+    return @truncate(u32, x);   // ERROR — @truncate has no meaning on a float
+}
+```
+
+### Forging an enum traps at the point of forgery
+
+ZER has no int-to-enum cast, so the only way to produce a value outside an enum's declared
+variants is a bit-level conversion. Those are legitimate — reading an enum out of a
+hardware register is a real firmware idiom — so ZER **tracks** rather than bans: the
+conversion compiles, and a guard traps if the value is not a declared variant. Without it
+an exhaustive `switch` silently runs its last arm on a value that matches none.
+
+There are exactly **three** doors, and each carries the guard:
+
+| conversion | guarded |
+|---|---|
+| `@bitcast(Enum, n)` | yes |
+| `@truncate(Enum, n)` | yes |
+| `@saturate(Enum, n)` | yes |
+
+`@cast` is **not** a fourth door: it requires a distinct typedef and cannot name a bare
+enum. The guard also recurses through struct fields, optional payloads and array elements,
+so `@bitcast(Box, 7)` where `struct Box { State s; }` is checked too.
+
+```zer
+enum State { idle, running, done }
+
+u32 main() {
+    State s = @bitcast(State, 2);   // 2 IS a declared variant — no trap
+    switch (s) {
+        .idle    => { return 1; }
+        .running => { return 2; }
+        .done    => { return 0; }
+    }
+}
+```
+
+`@bitcast(State, 7)` compiles and traps at run time with
+`@bitcast produced a value that is not a declared variant of this enum`.
+
+### Argument counts are checked
+
+An intrinsic that takes nothing used to accept anything and silently discard it, which
+makes a typo look purposeful — the reader's reasonable belief is that the arguments do
+something. Every intrinsic now reports its own arity, and so does `spawn`:
+
+<!-- audit: skip -->
+```zer
+void worker(u32 v) { }
+
+u32 bad() {
+    @trap(1, 2, 3);        // ERROR — @trap takes no arguments, the message is fixed
+    @barrier(1);           // ERROR — a fence takes no arguments
+    spawn worker();        // ERROR — spawn target 'worker' expects 1 argument, got 0
+    spawn worker(1, 2, 3); // ERROR — expects 1 argument, got 3
+    return 0;
+}
+```
+
+`spawn` is worth calling out: the direct call `worker(1,2,3)` was always rejected, but the
+`spawn` spelling of the same program used to reach the C compiler instead — extra arguments
+dropped, missing ones reading an auto-zeroed slot.
+
 ---
 
 ## HARDWARE SUPPORT
@@ -3668,6 +3809,157 @@ compile error instead.
 - `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
 - `goto` — Use structured control flow
+
+---
+
+## SAFETY RULES YOU WILL HIT
+
+Rules that reject code most people expect to compile. Each is here because the
+alternative is a wrong answer at run time rather than a message at compile time.
+
+### Bounds: three verdicts, not two
+
+An index gets one of three verdicts from its proven range:
+
+| Verdict | When | Result |
+|---|---|---|
+| PROVEN SAFE | the whole range is inside the bound | no check emitted — zero overhead |
+| PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
+| UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (runtime check) |
+
+The middle verdict is the one that surprises people: an index the compiler can prove is
+*always* wrong is an error, not a runtime check — including when it is reached through a
+variable, and including a range that is entirely negative.
+
+<!-- audit: skip -->
+```zer
+u32 past_end() {
+    u32[4] arr;
+    u32 i = 10;
+    return arr[i];      // ERROR — proven range [10,10], always out of bounds
+}
+
+u32 negative() {
+    u32[4] arr;
+    i32 i = -1;
+    return arr[i];      // ERROR — proven range [-1,-1], no valid index exists
+}
+```
+
+Proven-safe really does mean no code: `u32 i = 2; arr[i]` emits a bare `arr[i]`. An
+unprovable index emits `if ((size_t)(i) >= 4u) { return 0; }` in front of the access.
+
+### An out-of-bounds access inside `@critical` or a held lock TRAPS
+
+The auto-guard normally returns early. Inside `@critical`, or while a `shared struct`
+lock is held, an early `return` would leak the interrupt-disable or the mutex — so the
+guard **traps** instead (`SIGTRAP`), aborting before both the access and the leak.
+
+That makes an unprovable index in those scopes worth eliminating with an explicit check,
+which also removes the guard:
+
+```zer
+shared struct S { u32 v; }
+S g;
+volatile u32 g_idx = 9;
+
+u32 main() {
+    u8[4] a;
+    u32 i = g_idx;
+    if (i >= 4) { return 0; }   // explicit check — no guard is emitted at all
+    g.v = a[i];
+    return 0;
+}
+```
+
+Without the `if`, the same program compiles and traps with
+`out-of-bounds access inside a critical section or lock scope`.
+
+### A pointer into a `packed` field may not be dereferenced
+
+`&packed.field` is not naturally aligned. Dereferencing it is a hard fault on ARMv7-M and
+RISC-V, a silent split access on Cortex-M0+, and merely slow on x86 — so a hosted test
+will never show you the problem. FORMING the pointer is allowed; USING it is not, and the
+fact travels through an alias:
+
+<!-- audit: skip -->
+```zer
+packed struct P { u8 a; u32 b; }
+P g;
+
+void poke(*u32 p) { *p = 7; }
+
+u32 packed_misuse() {
+    *u32 q = &g.b;      // forming it is fine
+    *q = 7;             // ERROR — dereferencing a pointer into a PACKED struct field
+    poke(&g.b);         // ERROR — argument 1 points into a PACKED struct field
+    return 0;
+}
+```
+
+Read and write the field directly (`g.b = 7;`) — that path knows the layout and emits a
+correct unaligned access.
+
+### The dereference identity rule
+
+Reading a value out of a pointer dereference makes a COPY. For a scalar or a plain struct
+that is what you want. For three kinds of value it destroys the identity the compiler
+tracks, so BINDING the result is a compile error:
+
+<!-- audit: skip -->
+```zer
+struct Node { u32 v; }
+move struct Tok { u32 k; }
+Pool(Node, 4) pl;
+
+u32 bad_alias() {
+    Node n; *Node p = &n; **Node pp = &p;
+    *Node k = *pp;              // ERROR — pointer ALIAS: which allocation is k?
+    return k.v;
+}
+
+u32 bad_handle() {
+    Handle(Node) h = pl.alloc() orelse return;
+    *Handle(Node) hp = &h;
+    Handle(Node) g = *hp;       // ERROR — Handle: which pool slot does g own?
+    pl.free(g);
+    return 0;
+}
+
+u32 bad_move() {
+    Tok t; t.k = 1; *Tok tp = &t;
+    Tok b = *tp;                // ERROR — move struct: b is a second owner
+    return b.k;
+}
+```
+
+All three report `cannot bind a value obtained by dereferencing a pointer to a pointer`. Recovering the
+identity would need points-to analysis over the dereferenced pointer, which ZER
+deliberately does not have — whole-program analysis is outside the architecture — so the
+rule is "cannot prove, therefore reject".
+
+Copies with no identity to lose are fine:
+
+```zer
+struct S { u32 v; }
+
+u32 main() {
+    u32 x = 5;
+    *u32 p = &x;
+    u32 v = *p;             // OK — a scalar copy has no identity
+
+    S s; s.v = 3;
+    *S sp = &s;
+    S c = *sp;              // OK — a plain struct VALUE copy
+
+    if (v != 5) { return 1; }
+    if (c.v != 3) { return 2; }
+    return 0;
+}
+```
+
+The fix is always to bind the POINTER the compiler can follow (`*Node k = p;`) or to take
+the `Handle` by value rather than a pointer to it.
 
 ---
 

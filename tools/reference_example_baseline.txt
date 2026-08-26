@@ -68,8 +68,6 @@ b06fafd5daf9214b  reference.md:1472
 919bf4b635112a98  reference.md:1495
 bd7964125ba9ebee  reference.md:1534
 75de8470de7afd97  reference.md:1544
-7ade3feda321aef7  reference.md:1583
-2e237bad4236a5e7  reference.md:1596
 de40d7f59a7c8237  reference.md:1619
 5ac99eba618f81de  reference.md:1656
 9c4588b653af2e44  reference.md:1683

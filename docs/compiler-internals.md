@@ -12043,7 +12043,169 @@ every use site) that deliberately over-rejects, with relaxations underneath. Not
 architecture — Level A and Level B both already ship for the handle/UAF class in
 `proofs/operational/lambda_zer_handle/handle_flow_lattice.v`, which is the template.
 
+---
+
+## Harvesting an audit branch — the protocol, and the traps that cost loops (2026-08-26/27)
+
+Ten `claude/vigilant-tesla-*` branches were consumed across three harvest waves: 45 + 21 + 20 + 4
+rows, BUG-815 through BUG-912. CLAUDE.md carries the five-line version; this is the reasoning, the
+case studies, and the things that are only obvious once.
+
+### Triage: the fork point decides whether a branch is worth reading
+
+```
+base=$(git merge-base HEAD <branch>)
+git log -1 --oneline $base
+git rev-list --count $base..HEAD     # how far main has moved since
+```
+
+A branch that forked at or near main is auditing the CURRENT compiler and its findings are live. One
+that forked earlier is auditing a compiler that no longer exists: most of what it found has been fixed
+by a different route, and its BUG numbers collide with yours.
+
+Measured over the ten branches: `r1piyr` and `as71kk` forked near main and produced almost everything
+that survived. `qa249l` forked EARLIEST and was still worth reading — but only because it was the one
+branch that looked ACROSS A MODULE BOUNDARY, where it found two features (`spawn <imported fn>`,
+`async`/`container(T)` cross-module) that had never linked at all. The lesson is not "ignore old
+branches" but "read an old branch for the axis nobody else tried, not for its overlap".
+
+**Renumber on adoption.** Branch BUG numbers are assigned against the branch's own ledger and collide
+constantly (three branches all had a "BUG-857"). Take the next free number from `BUGS-FIXED.md` and
+say in the entry which branch commit it came from.
+
+### The adoption loop
+
+```
+git cherry-pick --no-commit <sha>
+git checkout --ours BUGS-FIXED.md docs/limitations.md .gitignore   # always conflict; write your own
+# resolve real code conflicts
+rm -f *.o src/safety/*.o && make zerc                              # MANDATORY after any .h edit
+<run the branch's own tests>
+make check
+```
+
+`git cherry-pick --quit` (not `--abort`) leaves the working tree intact when you want the changes
+without the cherry-pick state — needed when combining several picks before one commit.
+
+### TRAP 1 — a clean apply is not evidence of no conflict
+
+Git compares TEXT. Two independent implementations of the SAME RULE do not overlap textually, so they
+merge cleanly and both run. Hit twice in one session:
+
+- **The doubled `memset`.** `as71kk`'s BUG-861 (recycled slot auto-zero) was already on main as
+  BUG-858. `emitter.c` auto-merged and both `memset`s emitted, in both `_zer_pool_alloc` and
+  `_zer_slab_alloc`. Harmless but dead work in every emitted program.
+- **The doubled init pass.** `qa249l`'s BUG-847/849 (Arena with no backing store, Barrier with no
+  `@barrier_init`) was already on main as BUG-848/849. `checker.c` applied with ZERO conflicts and
+  added a whole second implementation — `record_resource_use`, `check_resource_init`, four `Checker`
+  struct fields, a `zerc_main.c` caller — beside the existing `check_builtin_init` / `zbi_scan`. It
+  would have double-reported every diagnostic.
+
+**After every pick, grep for the rule you already have.** Conflict markers are not the check; the
+check is "does this rule now exist twice?".
+
+When you remove the duplicate, verify the survivor covers what the other claimed. Theirs deferred the
+init check until after all modules and its comment said the timing mattered; mine runs per file. I
+probed it rather than assume — a global `Arena` declared in one module and initialised by a function
+in another compiles clean under mine, so removing theirs lost nothing. **Probe the claim; do not
+inherit the comment.**
+
+### TRAP 2 — the branch's tests are not authority until you run them against YOUR main
+
+A naive "run every branch test, report ACCEPT on a negative as a hole" produces false alarms. Three
+distinct causes, all seen:
+
+- **A missing `// zerc-flags:` line.** `cli_bad_stack_limit` needs `--stack-limit abc`; without it the
+  program compiles and looks like a hole.
+- **The branch BANS what main TRACKS.** Six `enum_forge_*` negatives "passed" (compiled) on main
+  because main resolves that class with a runtime variant guard. They TRAP — runtime exit 133. Check
+  the runtime exit before calling it a hole. (One of them, `@saturate`, really WAS a hole: exit 3, no
+  trap. The distinction is only visible if you run it.)
+- **A module test without its companion.** `contuser.zer` / `spawnimp_user.zer` "failed" because my
+  harness compiled them in a scratch directory without the `.zer` they import.
+
+### TRAP 3 — deciding between their fix and yours
+
+Build the branch and measure. `git archive <branch> | tar -x -C $S && (cd $S && make zerc)` takes a
+minute and settles design disagreements that argument cannot.
+
+Worked example — **the non-null global funcptr rule.** `osp1a7` replaced main's "initializer or `?`"
+rule with a WHOLE-FILE question ("is this global assigned anywhere in the file?"), to keep the C-style
+callback-registry idiom compiling. That is a real over-rejection main pays. But:
+
+```
+void (*saved_cb)(u32);
+void maybe_register(bool c) { if (c) { saved_cb = my_handler; } }
+maybe_register(false);  saved_cb(5);
+```
+
+Their build ACCEPTS it, and the emitted C contains a bare `saved_cb(_zer_t1)` with NO GUARD — an
+unguarded indirect call through a null pointer. "Assigned somewhere in the file" does not prove
+"assigned before this call"; the rule is path-insensitive where the hazard is path-sensitive.
+
+Main's rule stays, on ZER's own stated principle: soundness is a HARD WALL, over-rejection is a SOFT
+gradient. And the over-rejection has an idiomatic escape that was verified to work —
+`?void (*cb)(u32) = null;` + `if (saved_cb) |cb|` — which is what optionals are FOR.
+
+**Read the emitted C for the guard.** "It compiles" and "it is checked" are different claims.
+
+### TRAP 4 — an over-rejection FIX can itself be an over-reach
+
+Two of `osp1a7`'s negatives proposed rejecting `u32 a = ~0;` and `a = 0 - 1;` as "no implicit sign
+conversion" violations. They are not the same thing as `u32 a = -1;`:
+
+- `-1` is a NEGATIVE CONSTANT being CONVERTED to unsigned — a sign conversion, correctly rejected.
+- `~0` and `0 - 1` are UNSIGNED OPERATIONS whose RESULT has the high bit set. No conversion occurs.
+
+Settled by measurement, not by argument: `~0` appears 6 times in the corpus (plus 6 `~(` and a dozen
+other `~N`) and is the canonical all-ones idiom; and `0 - 1` wrapping is a guarantee CLAUDE.md states
+twice ("overflow wraps"). Rejecting either contradicts the language's own spec.
+
+**Before shipping ANY new rejection, run the grep:**
+`grep -rhoE '<the form>' tests/ rust_tests/ zig_tests/ lib/ examples/ | wc -l`. A zero is what makes a
+rejection defensible; a six is what makes it an over-reach.
+
+### TRAP 5 — `// expect-error` drift between branches
+
+`barrier_no_init.zer` arrived reporting "rejected, but for the WRONG REASON": its directive expects
+"never initial**ized**", main's diagnostic says "never initial**ised**". The rule fired perfectly; the
+two branches spell it differently.
+
+Fix the TEST, never the rule — and prefer dropping it when main already covers the shape. Here main's
+`barrier_never_initialized.zer` was byte-for-byte the same program with the right directive and a
+better comment. Its sibling `arena_no_backing.zer` was KEPT beside main's `arena_no_backing_store.zer`
+because the two use different unwrap spellings (`if (n) |p|` vs `orelse`) — complementary coverage,
+not duplication.
+
+### What the three waves actually taught
+
+**The multi-site tax is still the dominant class, and it caught ME.** BUG-891 closed enum forging via
+`@bitcast` and `@truncate`, at both dispatch paths, with a carrier walk — a thorough fix that
+enumerated two of the three doors. `@saturate` reaches an enum target just as directly and was left,
+so `@saturate(State, 7)` still forged a value and the exhaustive switch ran its last arm. The door set
+is now written down in CLAUDE.md's gate table BECAUSE enumerating it is the only thing that closes the
+class; a fix that closes "the sites I could see" leaves the next one.
+
+**A severity rating made from the shape of a wrong value, rather than from what the value is USED FOR,
+is worth re-deriving.** The comptime array-element width gap was parked as LOW because "the wrong
+value is a compile-time constant, and no corpus program depends on one". True — and irrelevant. The
+same wrongness selects a BRANCH: `comptime if (arr_sum() > 255)` takes the wrong arm, so conditional
+compilation EMITS THE WRONG CODE and discards the right one, with no diagnostic anywhere. When rating
+a gap, ask what CONSUMES the wrong value.
+
+**A documented OPEN entry is a hypothesis with a decay rate.** Of 19 rows carried in one tracker, 18
+had been closed by a different route days earlier and nobody had struck them. That is the same
+"stale gate is worse than none" failure applied to the ledger. **Strike the row in the SAME commit as
+the fix**, and when adopting a branch that closes rows, re-measure before implementing — several
+"live" rows had already been fixed by an unrelated change.
+
+
 ## Consuming a documented "open hole" — the MEASURE-FIRST protocol (2026-08-08)
+
+> **See also** the branch-harvest protocol immediately above: same discipline applied to a
+> `claude/*` branch rather than a ledger entry. The two share the reproduce-first rule and the
+> read-the-diagnostic rule; the branch one adds the clean-apply trap, which has no analogue here.
+
 
 **Why this section exists.** A reconciliation pass over `docs/limitations.md` found that **four of
 six** entries listed as OPEN CRITICAL/HIGH were already closed, one was live, and one did not

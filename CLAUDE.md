@@ -402,6 +402,8 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
 | **Use-before-init ("did this resource ever receive its state?")** | Arena backing store, Barrier target | ONE deferred pass **`check_resource_init`** + `Symbol.resource_initialized`, run beside `check_keep_inference` so it sees every module. Both resources zero-initialise into a state that is USABLE but INERT (capacity 0 / target 0), which is why the failure is silent |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **Enum-forge doors** ("can this conversion produce a non-variant?") | `@bitcast`, `@truncate`, `@saturate` — and `@cast` verified NOT to be one | the three `tests/zer_trap/*_enum_forged_*.zer`. Patched THREE times across three sessions before the door set was written down; each fix closed one door and left the siblings |
+| **Documented examples** ("does the reference still compile?") | every ```zer block in `docs/reference.md` | `tools/audit_reference_examples.sh` + `tools/reference_example_baseline.txt` — IN `make check` (the 8th gate). Twice the docs asserted a feature the parser did not have (funcptr arrays, bit-extract through a pointer) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -433,6 +435,30 @@ script, not a net. GOTCHA: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE
 `-o` path (CLAUDE.md "zerc -o gotchas") — getting this wrong yields exit 127 on every cell and looks
 like a compiler failure.
 
+**WHAT A GREEN `make check` ACTUALLY COVERS (verified from a run, 2026-08-27 — do not quote from
+memory, the census in this file was once wrong by 2x).** NINE gates, each printing its own verdict
+line, plus TEN axis-crossed matrices:
+
+| gate | verdict line it prints |
+|---|---|
+| `walker_audit.sh` | `OK — no gaps. IR emitter covers every node kind the AST emitter does.` |
+| `walker_default_audit.sh` | `OK — no default: clauses remain in node-kind / op-kind switches.` |
+| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (684 baselined)` |
+| `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
+| `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
+| `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
+| `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` |
+| `sink_matrix.sh` | `SINK MATRIX CLEAN` (88 cells) |
+| `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
+
+Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto.
+
+**Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
+loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
+`MAKE_CHECK_EXIT=2` was reported green). And these are the gates; `tools/ubsan_sweep.sh`,
+`tools/ub_sweep.sh`, `tools/grammar_closure_probe.sh` and `tools/qualifier_closure_probe.sh` are
+MEASUREMENT SWEEPS, run by hand, NOT in `make check` — do not count them as coverage.
+
 **Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
 **`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →
 **an audit-script baseline** (`file:content`, line-number-agnostic — `sink_matrix.sh` /
@@ -443,6 +469,16 @@ template) — this is the COVERAGE half the audits can't prove; it turns a missi
 a STUCK PROOF instead of a silent accept (the endgame direction). The durable end-state
 for ANY patchwork is **ONE query + a gate**, not N call sites (the `call_result_escapes` /
 `type_dispatch_kind` class-kills are the model).
+
+**A GATE CAN ITSELF BE BROKEN — verify membership, not just the verdict (2026-08-26, two instances).**
+`audit_walker_fields.sh` decided which functions it audited by counting the function's own name in
+PROSE — comments and strings included — so editing a COMMENT moved a walker in or out of the audited
+set (baseline 758 -> 684 once membership became structural). And a qualifier probe's first oracle used
+`-Wdiscarded-qualifiers`, which an EXPLICIT cast silences by design — and ZER's emitter writes explicit
+casts, so it printed OK against a deliberately broken compiler. `-Wcast-qual` is the warning that asks
+the question being asked. Both were caught the same way: **break the compiler on purpose and check the
+gate goes RED.** A gate that has only ever printed OK is a script, not a net — and that applies to the
+gate's SCOPE as much as to its assertion.
 
 **Keep the gates CURRENT — a stale matrix is worse than none (false confidence).** When a
 sink/site is unified away, REMOVE its cell/baseline row; when a new shape/site/node-kind is
@@ -667,7 +703,10 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 ### Intrinsics (@ builtins)
 ```
 @size(T)                 sizeof — returns usize
-@truncate(T, val)        keep low bits (big→small)
+@truncate(T, val)        keep low bits (big→small). REJECTED on a FLOAT operand — a float has no
+                         low bits; use `(T)x` (saturates) or `@saturate(T, x)`. Deliberate
+                         divergence from two audit branches, which made it saturate: that gives
+                         one primitive two unrelated meanings by operand type, and is redundant.
 @saturate(T, val)        clamp to min/max of T
 @bitcast(T, val)         reinterpret bits (same width required, qualifier-checked)
 @cast(T, val)            distinct typedef conversion only (qualifier-checked)
@@ -1207,10 +1246,12 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Null dereference | `*T` non-null by default, `?T` requires unwrapping, local function pointer requires initializer |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
+| Float -> int out of range | **SATURATES** (defined 2026-08-26, BUG-883, matching Rust `as`). `(u32)1e20` = 4294967295, `(u32)-1.5` = 0, **NaN -> 0** (tested FIRST — every comparison against NaN is false, so without an explicit `v != v` it falls through to the raw cast, which is the UB being removed). Identical at -O0 and -O2; the same program gave 4294967295 and 0 before. u128/i128 keep a NaN trap (the bounds are not expressible at that width). |
 | Silent truncation | Must `@truncate` or `@saturate` explicitly |
 | Missing switch case | Exhaustive check for enums and bools |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
+| Enum forging (a value outside the variant set) | Runtime variant guard at the point of forgery — TRACKED, not banned, so reading an enum from a register still works. The doors are EXACTLY THREE and the set is closed: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910). `@cast` is NOT a door — it requires a distinct typedef and cannot name a bare enum. The guard recurses struct fields, optional payloads and array elements, and each door wires it at BOTH emitter dispatch paths. **Adding a new value-producing conversion? It is a fourth door — wire the guard.** |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
 | Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + **MMIO index bounds from range** (compile-time) + startup @probe validation (boot-time) + `--no-strict-mmio` relaxes RANGE checks only (runtime alignment trap always emitted for variable addresses, BUG-736) |
@@ -1310,6 +1351,12 @@ Full transform catalog + architecture: `docs/compiler-internals.md`
 (zer-convert / zer-upgrade sections).
 
 ### Compiler Internals — MANDATORY READING
+
+**Harvesting a `claude/*` audit branch? Read `docs/compiler-internals.md` "Harvesting an audit
+branch" FIRST** — fork-point triage, the cherry-pick loop, and the five traps (the big one:
+a CLEAN APPLY IS NOT EVIDENCE OF NO CONFLICT — two implementations of one rule merge without
+git noticing, which happened twice). Ten branches are already fully consumed; nothing remains
+to harvest from any `vigilant-tesla-*`.
 
 **MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
 
@@ -1609,8 +1656,10 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **ZER Integration Tests (`tests/zer/`):**
 - Real `.zer` files compiled with `zerc --run`, must exit 0
 - Runner: `tests/test_zer.sh`, added to `make check`
-- Current tests: `ls tests/zer/*.zer` (~300 positive tests including hash_map, ring_buffer, pool_handle, move struct patterns, async/await, shared struct, condvar, container, defer, goto, opaque levels 1-9, etc.)
-- Negative tests: `ls tests/zer_fail/*.zer` (~70 tests — UAF, double-free, bounds OOB, div-zero, null deref, escape analysis, move-after-transfer, typecast safety, etc.)
+- COUNT FROM THE TREE, never from this file: `ls tests/zer/*.zer | wc -l` (the numbers here have been
+  wrong by 2x before — a census written from memory rots silently).
+- Positives: compile + run + exit 0. Negatives (`tests/zer_fail/`): must FAIL to compile AND, when the
+  file carries `// expect-error: <substring>`, fail for THAT reason.
 - Runtime-trap tests: `ls tests/zer_trap/*.zer` (compile clean, trap at runtime — slice bounds, signed div overflow, @inttoptr safety)
 - Module tests: `ls test_modules/*.zer` (~28 including diamond imports, shared cross-module, opaque wrappers)
 - Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
@@ -1619,10 +1668,12 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 314 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 260 | `tests/test_zer.sh` |
-| `test_modules/` | Multi-file module tests | 66 | `test_modules/run_tests.sh` |
-| `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 566 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 680 | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 37 | `tests/test_zer.sh` |
+| `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 23 | `tests/test_zer.sh` |
+| `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
+| `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
 | `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/**view-alias**/hw/async/asm/defer-goto) | 10 grids | `make check` |
@@ -2633,6 +2684,44 @@ When starting a new session or lacking context:
 6. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
 7. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC. New IR path (v0.4): AST → Checker → IR (flat locals + basic blocks) → zercheck on IR → emit C from IR → GCC. Use `--emit-ir` to see IR output.
 
+### HARVESTING A `claude/*` AUDIT BRANCH — the cheap path (2026-08-26/27, ten branches consumed)
+
+Full protocol + case studies: `docs/compiler-internals.md` "Harvesting an audit branch". The five
+things that actually cost loops:
+
+1. **READ THE FORK POINT FIRST — it is the whole triage.** `git merge-base HEAD <branch>` then
+   `git rev-list --count <base>..HEAD`. A branch that forked near main audits the CURRENT compiler and
+   its findings are live; one that forked earlier overlaps with everything landed since AND its BUG
+   numbers collide with yours. Measured over ten branches: only the two that forked near main produced
+   almost everything that survived. Renumber on adoption; never trust a branch's BUG-NNN to be free.
+2. **CHERRY-PICK, DO NOT RE-DERIVE.** `git cherry-pick --no-commit <sha>`, resolve, `rm -f *.o
+   src/safety/*.o && make zerc`, run the branch's own tests, then `make check`. Doc files
+   (`BUGS-FIXED.md`, `docs/limitations.md`, `.gitignore`) conflict every time — `git checkout --ours`
+   them and write your own entry.
+3. **A CLEAN APPLY IS NOT EVIDENCE OF NO CONFLICT.** Two independent implementations of ONE rule can
+   coexist without git noticing a thing. Hit TWICE: a doubled `memset` in both allocators, and a whole
+   second arena/barrier-init pass (`record_resource_use` + 4 `Checker` fields) sitting beside the
+   existing one, which would have double-reported every diagnostic. **After every pick, grep for the
+   rule you already have, not just for conflict markers.**
+4. **The branch's tests are NOT authority — run them against YOUR main.** A "HOLE LIVE" is usually one
+   of: a `// zerc-flags:` line the harness must pass; a negative that BANS what main resolves by
+   TRACKING (main compiles it and TRAPS — check the runtime exit, 133); a module test needing its
+   companion `.zer` in the same directory. All three produced false alarms this session.
+5. **Branch commits carry tracked ELF binaries** (test artifacts). `git diff --cached --numstat | awk
+   '$1=="-"'` before committing. The `.gitignore` now excludes them BY SHAPE (extension-less under a
+   test tree), so nothing re-appears.
+
+**Their fix vs yours — pick by MEASUREMENT.** Build the branch (`git archive <branch> | tar -x -C $S`)
+and run the shape you doubt against it. That is how the non-null-funcptr disagreement was settled:
+their whole-file rule ACCEPTED an unguarded indirect call through null (verified by reading the emitted
+C for a guard, and finding none). Soundness is the hard wall; over-rejection is the soft gradient.
+
+**Before adopting an over-rejection FIX, measure the corpus cost of the RULE:**
+`grep -rhoE '<the form>' tests/ rust_tests/ zig_tests/ lib/ examples/ | wc -l`. Two proposed negatives
+were rejected this way — `~0` (6 uses, the canonical all-ones idiom) and `0 - 1` (wrapping is a
+DOCUMENTED ZER guarantee). Those are UNSIGNED OPERATIONS whose result has the high bit set, not the
+sign CONVERSION `u32 x = -1;` that is correctly rejected. Do not collapse the two.
+
 ### Consuming an audit branch — VERIFY THE REPRODUCTION FIRST (2026-08-01, cost several loops)
 
 Before implementing ANY fix harvested from a `claude/*` audit branch, run its reproducer against
@@ -2688,7 +2777,23 @@ because a rejection is a rejection whether or not your patch caused it.
   across `tests/zer tests/zer_fail test_modules rust_tests zig_tests` and count. The
   deref-launder reject (BUG-781/782) shipped because that count was **ZERO** — that number,
   not an argument, is what makes "cannot prove => reject" defensible.
-- **`make check` REPORTS ITS OWN FAILURE ONLY IN THE EXIT CODE — echo it.** Measured 2026-08-10:
+- **WAITING FOR `make check` — do not poll it by hand.** It runs 5-15 min. Start it with the Bash tool's
+`run_in_background`, then block on `until ! pgrep -x make >/dev/null; do sleep 20; done` (a Monitor
+task, or a second backgrounded Bash). Two traps: `pgrep -f 'make check'` also matches YOUR OWN wrapper
+shell, so the loop exits instantly — use `pgrep -x make`. And with warnings now at ZERO the log stays
+tiny during the build phase, so a line count is NOT a progress signal; grep the log for
+`Passed:|Failed:` instead. ALWAYS write `MAKE_CHECK_EXIT=$?` into a status file — make aborts at the
+first failing audit, so a later gate silently never runs.
+
+**Fetching ONE file from a branch without checking it out:** `git show <branch>:<path>`. Use this to
+run a branch's reproducer verbatim — a RECONSTRUCTED probe can CONFIRM a hole but never REFUTE one.
+
+**`// expect-error` drift between branches is a real WRONG-REASON source.** Two branches spelled the
+same diagnostic "initialised" and "initialized"; the rule fired correctly and the harness still
+reported failure. When adopting a negative, either match main's ACTUAL wording or drop the test if
+main already covers the shape — never soften the rule to match a directive.
+
+**`make check` REPORTS ITS OWN FAILURE ONLY IN THE EXIT CODE — echo it.** Measured 2026-08-10:
   `make check` had been exiting **2** for four commits while being reported green. Make aborts at
   the first failing audit, so every LATER gate (fixed-buffer, type-dispatch, carrier-dispatch,
   emit-audit, sink matrix) silently never runs. The trap that hid it: verifying with

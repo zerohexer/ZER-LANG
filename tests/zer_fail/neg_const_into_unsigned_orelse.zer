@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: ZER has no implicit sign conversion
+?u32 maybe(u32 x) { if (x > 0) { return x; } return null; }
+u32 main() { u32 e = maybe(1) orelse -1; return e; }

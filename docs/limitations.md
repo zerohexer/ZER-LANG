@@ -32,11 +32,108 @@ condition EXPRESSION.
 
 ---
 
+## OPEN — measured 2026-08-26, deliberately NOT fixed
+
+Each row below was reproduced on a clean build this session and left open on
+purpose. The reasoning is recorded so the next session does not re-derive it.
+
+### The SLICE exemption at a funcptr-call keep worst-case (known accept-unsafe)
+
+BUG-863 widened the funcptr-call keep worst-case from "the bare param is a
+`*T`" to the recursive carrier question, closing `?*T` and by-value-struct
+carriers. **A bare SLICE param is still exempt, and that exemption is
+accept-unsafe:**
+
+    u32 sum([*]u8 b) { ... }              // could retain b into a global
+    u8[4] arr;  *([*]u8) -> u32 fp = sum;
+    fp(arr[0..]);                         // ACCEPTED — a stack view reaches
+                                          // a callback the checker cannot see
+
+It predates the fix and is kept deliberately: handing a local buffer to a
+read-only callback is the normal way to hand a buffer to one, and worst-casing
+it would reject the idiom outright. `type_carries_retainable_pointer` does not
+recurse into a slice either, so the exemption is CONSISTENT at depth
+(`struct { [*]u8 buf; }` is exempt exactly as the bare `[*]u8` is) rather than
+accidentally half-applied.
+
+Boundary positive: `tests/zer/funcptr_slice_callback_ok.zer`.
+
+**What would close it** is the same shape as the direct-call answer: a
+per-function summary saying "does this function retain param i", so an
+INDIRECT call can consult the summaries of every function whose address is
+taken with a matching signature, instead of worst-casing. That is the
+funcptr-REACH machinery (`scan_funcname_binding` and friends) applied to the
+keep axis rather than to the data-race axis. Not attempted here.
+
+### A funcptr STRUCT FIELD that is never assigned
+
+BUG-864 closed the global funcptr that is called and never assigned. The same
+hazard through a struct FIELD is still live:
+
+    struct H { *(u32) -> u32 cb; }
+    H g;
+    u32 main() { return g.cb(1); }        // ACCEPTED, jumps through NULL
+
+Not closed with the same mechanism, because a field legitimately gets its value
+from a later `g.cb = handler;` and the whole-file "was it ever assigned"
+question is much weaker for a field than for a global name: `g` may be one of
+many instances, assigned through a pointer, or filled by a designated
+initializer at a call site. Doing this properly is a definite-assignment
+analysis over aggregate FIELDS, which ZER does not have. It is the same family
+as the documented `29fiao BUG-852` row (a non-optional pointer MEMBER is null
+after auto-zero), whose blanket rule was implemented, measured at 34 correct
+corpus files, and not shipped.
+
+### `async` type names disagree between checker and emitter across modules
+
+    // amod.zer:  async void ticker() { yield; }
+    // auser.zer: import amod;  _zer_async_ticker t;
+
+The checker accepts `_zer_async_ticker` (the documented, un-mangled spelling);
+the emitter writes `_zer_async_amod__ticker`. GCC catches it with a helpful
+"did you mean" — so this is LOUD, not silent — but the diagnostic names the
+generated C, and the feature is effectively unusable across a module boundary.
+Sibling of BUG-865 (spawn) and BUG-866 (container stamps), both fixed this
+session; this third one needs the async state-struct name to be resolved
+through the same module-prefix query, at the checker's registration site as
+well as the emitter's.
+
+### `@config()` accepts zero arguments and yields `void`
+
+`@config(key, default)` is a real intrinsic (checker.c, NODE_INTRINSIC) that
+yields its last argument. With NO arguments it types as `void` and emits `0` —
+a meaningless call that is silently accepted. It is in the same family as the
+`@barrier*` / `@cstr` / `@offset` arity gaps recorded as harvest-2 H13. Now
+documented in `docs/reference.md`, which is the more urgent half; the arity
+gate is not.
+
+### Intrinsic arity is enforced per-family, not by one table
+
+Measured this session: the D-Alpha-5/6 families (MMU, TLB, cache) and the
+CR/MSR/DR family DO check arity, individually, each with its own `if
+(arg_count != N)`. The gaps are specific — `@barrier(1,2,3)` is accepted, and
+`@cstr` / `@offset` accept wrong arities — so harvest-2 H13's framing ("3
+accepted") is accurate and the class is narrower than the ~140-name surface
+suggests. The durable form is one arity table consulted once in the
+NODE_INTRINSIC prologue, which would also make a new intrinsic's arity a
+conscious add; the per-family checks then become redundant but harmless. Not
+built here because a wrong table entry over-rejects valid code, and the table
+must be derived from each family's emitter, not guessed.
+
+---
+
 ## OPEN — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
 
 **Status: NOT implemented — a catalog.** Every row verified on a clean build of main
 (`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading
 the diagnostic. Rows main already closed are in the "already on main" table.
+
+**PROGRESS 2026-08-26:** H3, H4, H5, H6, H7, H8 and H16 are landed as BUG-859..864 and
+BUG-867, together with three rows nobody had catalogued (cross-module `spawn` did not
+link; a container stamped across a module boundary emitted twice; `spawn` had no arity
+check at all). Each was reproduced on a pristine build first and each regression test was
+verified to flip against it. H8's obvious fix was measured and BACKED OUT — see BUG-864.
+Remaining: 12.
 
 **PROGRESS 2026-08-25:** H10 (the container-cycle SEGFAULT) and H2 (recycled pool/slab
 slots returning stale data) are landed as BUG-857/858. **H1 was attempted and BACKED
@@ -93,12 +190,12 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 |---|---|---|---|
 | H1 | **The call-RESULT view class** — "which allocation does a call result view?" answered wrong FOUR independent ways | **29fiao** BUG-845/846/848/849 | 7 negatives accepted; `view_arg_field_uaf` is **ASan heap-use-after-free**, reproduced here. A SLICE result makes every one silent: a slice is not "pointer-ish", so the lost answer registers NO allocation and there is no leak diagnostic either. Fixed with one shared query + a `returns_param_mask`; the use site PULLS state (18 direct FREED stores mean a push design must reach all of them). Gate: sink_matrix p18, 78 -> 88 cells |
 | ~~H2~~ **DONE (BUG-858)** | **Recycled pool/slab slot is not zeroed** | **r1piyr** BUG-861 | Verified: `alloc_recycled_slot_zeroed` exits 1 — the slot comes back holding the previous object bit-for-bit, against the documented "everything auto-zeroed" guarantee that `Arena.alloc` honours. A `?*T` field returns non-null and dangling, so safe ZER can unwrap and deref it. **Invisible to ASan** — the reuse is inside ZER-owned storage |
-| H3 | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
-| H4 | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
-| H5 | **Negative constant into an unsigned type** — 8 spellings | **qa249l** | `u32 a = -1;` silently becomes 4294967295. 8 negatives accepted (var-decl, assign, global, arg, return, orelse, spawn, struct-init) |
-| H6 | **Enum forging through `@truncate` and a struct carrier** | **qa249l** | 3 accepted. My BUG-843 closed `@bitcast` only; these are the sibling routes |
-| H7 | **`free` of an inline-array field slice** | **29fiao** | `free(s.buf[0..])` on an inline array accepted; the same without the index was already rejected |
-| H8 | **Non-null funcptr global** | **qa249l** | `funcptr_global_nonnull` accepted |
+| ~~H3~~ **DONE (BUG-863)** | **Indirect call worst-cases only a bare `*T` as keep** | **r1piyr** BUG-857 | 3 negatives accepted: `?*T` param and a by-value struct carrying a pointer let a stack pointer reach a retaining callback. The DIRECT call of each was already rejected — two spellings of one program disagreeing. The `[*]T` exemption is kept and should be recorded as a known accept-unsafe rather than left implied by a comment |
+| ~~H4~~ **DONE (BUG-859)** | **`@cstr` is a second, unguarded integer-to-pointer door** | **29fiao** BUG-861 | 3 negatives accepted. `u32 gi = 4096; @cstr(gi, sl);` emits `memcpy(gi, ...)` and RUNS. That is the conversion the language says cannot be spelled. Every `@cstr` check was a NEGATIVE one, so a type matching none of them was accepted by default. **Breaches the grammar-closure claim** |
+| ~~H5~~ **DONE (BUG-859)** | **Negative constant into an unsigned type** — 8 spellings | **qa249l** | `u32 a = -1;` silently becomes 4294967295. 8 negatives accepted (var-decl, assign, global, arg, return, orelse, spawn, struct-init) |
+| ~~H6~~ **DONE (BUG-861)** | **Enum forging through `@truncate` and a struct carrier** | **qa249l** | 3 accepted. My BUG-843 closed `@bitcast` only; these are the sibling routes |
+| ~~H7~~ **DONE (BUG-862)** | **`free` of an inline-array field slice** | **29fiao** | `free(s.buf[0..])` on an inline array accepted; the same without the index was already rejected |
+| ~~H8~~ **DONE (BUG-864, narrowed)** | **Non-null funcptr global** | **qa249l** | `funcptr_global_nonnull` accepted |
 | H9 | **Optional comparison** | **qa249l** | 2 accepted. My BUG-841 covered struct/union; `?T == ?T` and `?T == T` were left |
 
 ### LIVE — compiler crash
@@ -121,7 +218,7 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 |---|---|---|---|
 | H14 | **`&&` / `\|\|` RHS hard-rejects a provable index** | **r1piyr** BUG-863 | See the correction above. Downgrade the always-OOB verdict to the auto-guard path in short-circuit RHS position — **no runtime check is removed** |
 | H15 | **`const u32 CAP = 256; u8[CAP] buf;`** rejected as "not a compile-time constant", naming a constant | **r1piyr** BUG-860 | The size paths used the NON-scoped evaluator. The fold must be done IN PLACE: teaching only the checker made the emitter size the array **0** — a relaxation that trades an over-rejection for a wrong answer is worse than the over-rejection |
-| H16 | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
+| ~~H16~~ **DONE (BUG-867)** | **Global `const [*]u8 BANNER = "boot ok";` not declarable at all** | **r1piyr** BUG-858 | And it said so with the SAME type printed on both sides. The const/volatile fold was written longhand in Pass 1 and not repeated in Pass 2 |
 | H17 | Bit-extract through a pointer; funcptr ARRAY syntax forms | **qa249l** | 2 positives rejected |
 | H18 | Arena-internal link; guarded coverage through an alias; static-optional return + leak | **qa249l** | 3 positives rejected |
 | H19 | Heap-slice free in an array element; the view-class boundary positives | **29fiao** | ride with H1 |
@@ -130,8 +227,8 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Evidence |
 |---|---|---|
-| H20 | **`spawn <imported function>` does not LINK — the feature is completely non-functional** | Verified: `spawn_user.zer` emits `void tick();` and calls `tick()` while the definition is `spawn_mod__tick`. The checker ACCEPTS it (the data-race scan even resolves the imported body), so the only signal is `ld returned 1 exit status` with no source line. The name is spelled raw at FOUR emission sites |
-| H21 | **`async` and `container(T)` across a module boundary** | qa249l fixes both; needs re-measuring separately from H22 |
+| ~~H20~~ **DONE (BUG-865)** | **`spawn <imported function>` does not LINK — the feature is completely non-functional** | Verified: `spawn_user.zer` emits `void tick();` and calls `tick()` while the definition is `spawn_mod__tick`. The checker ACCEPTS it (the data-race scan even resolves the imported body), so the only signal is `ld returned 1 exit status` with no source line. The name is spelled raw at FOUR emission sites |
+| H21 | **`async` and `container(T)` across a module boundary** | **HALF DONE 2026-08-26.** Re-measured separately, as the row asked. The `container(T)` half was a DUPLICATE-EMISSION bug (`redefinition of 'struct Box_Item'`) and is fixed as BUG-866 with `test_modules/contuser.zer`. The `async` half is a checker/emitter NAME disagreement and is still open — see the 2026-08-26 measured-and-left section above |
 
 ### DESIGN DECISION — not a bug, and it needs an owner call
 

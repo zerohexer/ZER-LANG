@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: expects 1 argument, got 3
+// BUG-860: spawn had no arity check at all — the per-argument loop is bounded
+// by the PARAM count, so extras were silently dropped and only GCC complained
+// ("too many arguments to function"), with no source line. The direct call
+// `worker(1,2,3)` was already rejected: two spellings of one program.
+void worker(u32 v) { }
+u32 main() { spawn worker(1, 2, 3); return 0; }

@@ -936,6 +936,14 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         return tmp;
     }
     }
+    /* Unreachable: the switch above is exhaustive over NodeKind with no
+     * `default:` (that is what -Werror=switch enforces). GCC cannot prove it,
+     * so without this the function could FALL OFF THE END and return an
+     * indeterminate local id — which the IR would then reference as a real
+     * local. A garbage local id is a silent miscompile in the compiler itself,
+     * so return the "no value" sentinel rather than whatever is in the return
+     * register. */
+    return -1;
 }
 
 /* Check if a block always exits (return/break/continue/goto)

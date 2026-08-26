@@ -6274,7 +6274,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         func->ast_node->kind == NODE_FUNC_DECL) {
         fprintf(stderr, "ZCIR: building=%d fn='%.*s' pc=%d blocks=%d sumcount=%d\n",
             zc->building_summary,
-            func->ast_node->func_decl.name_len,
+            /* `%.*s` reads an `int` from varargs; `name_len` is a `size_t`, so
+             * this was a varargs type mismatch (formally UB, and wrong on any
+             * ABI where the two are passed differently). */
+            (int)func->ast_node->func_decl.name_len,
             func->ast_node->func_decl.name ? func->ast_node->func_decl.name : "?",
             func->ast_node->func_decl.param_count, func->block_count,
             zc->summary_count);

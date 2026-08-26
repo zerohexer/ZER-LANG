@@ -1663,6 +1663,7 @@ u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
   Use a literal, or compute it inside a function body. The same restriction
   applies to `@addc`, `@subb` and `@mulw`.
 ```zer
+// audit: expect-error the first line is the point — it must NOT compile
 u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
 u32 main() {
     u8 ok = @saturate(u8, 300);    // OK — inside a function body
@@ -2022,6 +2023,211 @@ u8[512] fpu;
 
 ---
 
+### Systems / privileged intrinsic families — complete list
+
+**DESCRIPTION**
+The families below round out the intrinsic surface (MMU, TLB, cache maintenance,
+port I/O, CPU state, control/model-specific/debug registers, extended state,
+power management, privileged transitions). Every signature here was MEASURED
+against the compiler rather than transcribed, and every arity shown is enforced
+by the checker.
+
+Most of these are **privileged (CPL=0 / EL1+ / M-mode)** and fault with SIGSEGV
+in user mode. Verify them with the *dead-branch pattern* — a `volatile` zero the
+optimiser cannot fold away — so the code is compiled and type-checked without
+being executed:
+
+```zer
+u32 main() {
+    volatile u32 never = 0;
+    u8[64] buf;
+    if (never == 42) {
+        @mmu_enable();
+        @mmu_set_pt(0x1000);
+        @tlb_flush_all();
+        @tlb_flush_addr(0x2000);
+        @tlb_flush_range(0x1000, 0x2000);
+        @cache_flush_range(&buf[0], 64);
+        @cache_flush_line(&buf[0]);
+        @cpu_write_cr3(0x1000);
+        @port_out8(0x80, 0);
+        @cpu_write_msr(0x1B, 0);
+    }
+    return 0;
+}
+```
+
+The **non-privileged** reads need no such guard and can be called directly:
+
+```zer
+u32 main() {
+    u32 line   = @cpu_cache_line_size();
+    u32 cores  = @cpu_num_cores();
+    u64 sp     = @cpu_read_sp();
+    u32 core   = @cpu_id();
+    u64 vendor = @cpu_vendor_id();
+    @cpu_pause();
+    // The hardware RNG can FAIL, so it returns ?u64 — unwrap it.
+    u64 r = @cpu_rdrand() orelse 0;
+    if (line == 0) { return 1; }
+    if (cores == 0) { return 2; }
+    if (r == 1) { return 3; }
+    return 0;
+}
+```
+
+---
+
+#### MMU (privileged)
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@mmu_enable()` | `void` | turn address translation on |
+| `@mmu_disable()` | `void` | turn address translation off |
+| `@mmu_sync()` | `void` | barrier for page-table edits |
+| `@mmu_is_enabled()` | `bool` | the only `bool`-returning intrinsic |
+| `@mmu_set_pt(addr)` | `void` | set the page-table base (physical address) |
+| `@mmu_set_kernel_pt(addr)` | `void` | set the kernel page-table base |
+| `@mmu_get_pt()` | `u64` | read the page-table base |
+| `@mmu_get_kernel_pt()` | `u64` | read the kernel page-table base |
+| `@mmu_get_fault_addr()` | `u64` | faulting address (x86 CR2 / ARM FAR / RISC-V stval) |
+| `@mmu_get_fault_status()` | `u64` | fault status (ARM FSR / RISC-V scause) |
+
+#### TLB (privileged)
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@tlb_flush_all()` | `void` | flush non-global entries |
+| `@tlb_flush_global()` | `void` | flush including global entries |
+| `@tlb_flush_addr(addr)` | `void` | one page |
+| `@tlb_flush_asid(asid)` | `void` | one address-space id |
+| `@tlb_flush_range(start, end)` | `void` | `end` is EXCLUSIVE |
+
+#### Cache maintenance
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@cache_flush_range(ptr, size)` | `void` | clean + invalidate; `ptr` is `*T` or an array |
+| `@cache_clean_range(ptr, size)` | `void` | write back, keep valid |
+| `@cache_invalidate_range(ptr, size)` | `void` | discard without writing back |
+| `@cache_invalidate_icache(ptr, size)` | `void` | after writing code |
+| `@cache_flush_line(ptr)` | `void` | one line (x86 `CLFLUSH`) |
+| `@cache_zero_line(ptr)` | `void` | allocate-zero a line (ARM `DC ZVA`) |
+| `@cache_flushopt(ptr)` | `void` | x86 `CLFLUSHOPT` — ordered alternative to CLFLUSH |
+| `@cache_writeback(ptr)` | `void` | x86 `CLWB` — write back, keep valid (NVDIMM) |
+| `@barrier_dma()` | `void` | DMA-coherence barrier for driver code |
+
+`@cache_invalidate_range` DISCARDS dirty lines. Use it only on a buffer the
+device owns; on a buffer the CPU has written it destroys those writes.
+
+#### Port I/O (x86, privileged — CPL <= IOPL)
+
+| Intrinsic | Returns |
+|---|---|
+| `@port_in8(port)` / `@port_in16(port)` / `@port_in32(port)` | `u8` / `u16` / `u32` |
+| `@port_out8(port, val)` / `@port_out16(port, val)` / `@port_out32(port, val)` | `void` |
+
+#### CPU state — non-privileged reads
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@cpu_id()` | `u32` | current core number |
+| `@cpu_core_id()` | `u32` | physical core id (stub 0) |
+| `@cpu_num_cores()` | `u32` | logical core count (stub 1) |
+| `@cpu_cache_line_size()` | `u32` | L1 line bytes (stub 64) |
+| `@cpu_current_mode()` | `u32` | privilege mode (stub 0 = user) |
+| `@cpu_get_priv_level()` | `u32` | queried privilege level |
+| `@cpu_model_id()` | `u32` | CPUID leaf 1 EAX (family/model/stepping) |
+| `@cpu_vendor_id()` | `u64` | CPUID leaf 0 EBX |
+| `@cpu_feature_bits()` | `u64` | CPUID leaf 1 ECX:EDX packed |
+| `@cpu_cpuid(leaf, subleaf)` | `u64` | `(EBX << 32) \| EAX` |
+| `@cpu_cpuid_ecx(leaf, subleaf)` | `u64` | `(EDX << 32) \| ECX` |
+| `@cpu_read_sp()` | `u64` | stack pointer |
+| `@cpu_read_tp()` | `u64` | thread pointer / TLS base |
+| `@cpu_read_flags()` | `u64` | RFLAGS / NZCV |
+| `@cpu_read_counter()` | `u64` | cycle counter (x86 `RDTSC`) |
+| `@cpu_get_pc()` | `u64` | current instruction pointer |
+| `@cpu_rdrand()` | `?u64` | **optional** — the instruction can fail |
+| `@cpu_rdseed()` | `?u64` | **optional** — the instruction can fail |
+
+`@cpu_rdrand` / `@cpu_rdseed` return `?u64`, not `u64`: the hardware RNG
+reports exhaustion, and ZER makes you handle it (`orelse`) instead of silently
+handing you a stale or zero word.
+
+#### Control / model-specific / debug registers, segment bases (privileged)
+
+| Intrinsic | Returns |
+|---|---|
+| `@cpu_read_cr0()` / `@cpu_read_cr2()` / `@cpu_read_cr3()` / `@cpu_read_cr4()` | `u64` |
+| `@cpu_write_cr0(v)` / `@cpu_write_cr3(v)` / `@cpu_write_cr4(v)` | `void` |
+| `@cpu_read_xcr0()` / `@cpu_write_xcr0(v)` | `u64` / `void` |
+| `@cpu_read_msr(msr)` / `@cpu_write_msr(msr, v)` | `u64` / `void` |
+| `@cpu_read_dr(idx)` / `@cpu_write_dr(idx, v)` | `u64` / `void` |
+| `@cpu_read_pmc(idx)` | `u64` (needs `CR4.PCE=1`) |
+| `@cpu_read_fsbase()` / `@cpu_read_gsbase()` | `u64` (needs `CR4.FSGSBASE=1`) |
+| `@cpu_write_fsbase(v)` / `@cpu_write_gsbase(v)` | `void` |
+
+There is no `@cpu_write_cr2` — CR2 is written by the hardware on a fault.
+
+#### Extended processor state
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@cpu_xsave(buf, mask)` / `@cpu_xrstor(buf, mask)` | `void` | AVX/AVX-512; `mask` selects components |
+| `@cpu_fxsave(buf)` / `@cpu_fxrstor(buf)` | `void` | legacy, 512-byte 16-byte-aligned buffer |
+| `@cpu_fpu_init()` | `void` | `FNINIT` |
+
+#### Power, idle and spin-wait
+
+| Intrinsic | Returns | Privileged? | Notes |
+|---|---|---|---|
+| `@cpu_pause()` | `void` | no | spin-loop hint (`PAUSE` / `YIELD`) |
+| `@cpu_wfe()` / `@cpu_sev()` | `void` | no | ARM event wait / signal |
+| `@cpu_idle_hint()` | `void` | no | non-blocking low-power hint |
+| `@cpu_deep_sleep()` | `void` | yes | deepest idle state (`WFI` / `HLT`) |
+| `@cpu_reset()` | `void` | yes | safe halt-forever fallback |
+| `@cpu_monitor_addr(ptr)` / `@cpu_mwait()` | `void` | yes | x86 `MONITOR` / `MWAIT` pair |
+| `@cpu_umonitor(ptr)` / `@cpu_umwait(hint, deadline)` | `void` | no | WAITPKG; hint 0 = C0.2, 1 = C0.1 |
+| `@wait_on_address(ptr, expected)` | `void` | no | efficient polling until `*ptr != expected` |
+| `@cpu_breakpoint()` | `void` | no | debugger trap (`INT3` / `BKPT`) |
+| `@cpu_flush_pipeline()` | `void` | no | instruction-barrier (`ISB` / serializing) |
+
+#### Privileged mode transitions
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@cpu_syscall()` | `void` | user -> kernel (`syscall` / `svc #0` / `ecall`) |
+| `@cpu_sysret()` | `void` | kernel -> user |
+| `@cpu_iret()` | `void` | interrupt return |
+| `@cpu_hypercall()` | `void` | guest -> hypervisor (`vmcall` / `hvc #0`) |
+| `@cpu_sbi_call()` | `void` | RISC-V `ecall` to M-mode firmware |
+| `@cpu_smc_call()` | `void` | ARM TrustZone `smc #0` |
+| `@cpu_set_priv_stack(sp)` | `void` | kernel stack for syscall entry |
+| `@cpu_eoi()` | `void` | end-of-interrupt to LAPIC / GICv3 |
+| `@cpu_cache_disable()` / `@cpu_cache_enable()` | `void` | `CR0.CD` + `WBINVD` |
+
+Every transition intrinsic requires the system-register context (CS/RIP/RFLAGS
+on x86, ELR/SPSR on ARM, sepc/sstatus on RISC-V) to be correct BEFORE it runs.
+ZER verifies the call, not the register state — that is hardware-consequence.
+
+#### Other
+
+| Intrinsic | Returns | Notes |
+|---|---|---|
+| `@nt_store(ptr, val)` | `void` | non-temporal store (`MOVNTI`) — bypasses cache |
+| `@cpu_endbr()` | `void` | CET-IBT landing pad; a multi-byte NOP when absent |
+| `@config(key, default)` | type of `default` | build-configuration hook; currently yields `default` |
+
+**NOTES**
+- Non-x86 targets get a no-op or the nearest equivalent for the x86-specific
+  entries, so a program using them still builds for ARM/RISC-V.
+- These are **not** covered by ZER's program-consequence guarantee beyond the
+  usual checks on their ARGUMENTS (type, bounds, provenance, qualifier). What
+  the peripheral or silicon then does is hardware-consequence — out of scope
+  for any language. See CLAUDE.md, "Program-Consequence Coverage".
+
+---
+
 ### @cstr(buf, slice)
 
 **DESCRIPTION**
@@ -2294,6 +2500,7 @@ import gpio;
 
 **EXAMPLE**
 ```zer
+// audit: skip two-file example — needs uart.zer beside it
 // uart.zer:
 void uart_init(u32 baud) { }
 static void internal_helper() { }   // not visible to importers

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot target the enum
+// BUG-861: `type_is_integer` answers TRUE for TYPE_ENUM, so an enum target
+// passed @truncate's "must be an integer" gate and FORGED a value that is no
+// declared variant; the switch then silently ran its LAST arm (measured exit
+// 3, where no arm matches). @bitcast is the guarded route in.
+enum State { idle, running, done }
+u32 main() {
+    State s = @truncate(State, 7);
+    switch (s) { .idle => { return 1; } .running => { return 2; } .done => { return 3; } }
+}

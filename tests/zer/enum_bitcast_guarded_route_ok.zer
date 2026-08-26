@@ -1,0 +1,8 @@
+// BOUNDARY POSITIVE for BUG-861: closing @truncate/@saturate must leave the
+// GUARDED route open. A @bitcast to a value that IS a declared variant passes
+// its runtime check and behaves normally; only an out-of-variant value traps.
+enum State { idle, running, done }
+u32 main() {
+    State s = @bitcast(State, 2);
+    switch (s) { .idle => { return 1; } .running => { return 2; } .done => { return 0; } }
+}

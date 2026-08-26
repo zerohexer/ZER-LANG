@@ -88,6 +88,15 @@ run_test handle_user 0
 run_test comptime_user 0
 # Multi-module: enum + switch across modules
 run_test enum_user 0
+# BUG-865: spawn of an IMPORTED function. The wrapper spelled the target name
+# RAW, so the emitted C called `tick()` while the definition is
+# `spawnimp_mod__tick` — a LINK failure with no source line and no ZER
+# diagnostic. Nothing in this suite spawned an imported function before
+# (shared_user spawns a LOCAL worker), which is why it survived.
+run_test spawnimp_user 0
+# BUG-866: a container stamped across a module boundary was emitted once per
+# module pass, so GCC saw "redefinition of 'struct Box_Item'".
+run_test contuser 0
 
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*

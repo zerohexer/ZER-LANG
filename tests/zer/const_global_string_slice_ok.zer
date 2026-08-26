@@ -1,0 +1,18 @@
+// BUG-867: a const string-literal slice was UNDECLARABLE at file scope — the
+// ordinary firmware banner — while the identical line inside a function
+// compiled. The global-initializer validation pass re-resolved the declared
+// type from scratch and never applied the const/volatile fold that
+// registration applies, so it compared a NON-const slice against a const
+// string literal. The diagnostic printed the SAME TYPE on both sides
+// ("of type '[]u8' with '[]u8'") because type_name does not render
+// qualifiers — a nonsense message is the tell that the two sides differ in
+// something the message cannot show.
+const [*]u8 BANNER = "boot ok";
+const []u8 LEGACY  = "old spelling";
+
+u32 main() {
+    if (BANNER.len != 7) { return 1; }
+    if (LEGACY.len != 12) { return 2; }
+    if (BANNER[0] != 98) { return 3; }   // 'b'
+    return 0;
+}

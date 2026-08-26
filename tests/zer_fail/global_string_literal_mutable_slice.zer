@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: string literal is read-only
+// BUG-867 sibling: the LOCAL site names this exactly; the GLOBAL site had no
+// such arm and fell through to a generic type mismatch that printed the same
+// type on both sides. Same rule, same wording, both sites.
+[*]u8 BANNER = "boot ok";
+u32 main() { return (u32)BANNER.len; }

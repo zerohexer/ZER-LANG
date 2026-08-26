@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: ZER has no implicit sign conversion
+u32 G = -1;
+u32 main() { return G; }

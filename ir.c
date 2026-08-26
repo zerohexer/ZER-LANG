@@ -699,7 +699,12 @@ bool ir_validate(IRFunc *func) {
      * unreleased lock at runtime. Logged as ERROR, aborts compilation. */
     {
         /* Pre-compute which blocks contain ≥1 emit-bodies FIRE. */
-        bool *fire_in_block = (bool *)calloc(func->block_count, sizeof(bool));
+        /* `block_count` is a signed int; GCC's range analysis therefore admits
+         * a negative value reaching calloc as a huge size_t. Clamp so the
+         * allocation size is provably sane (and a corrupt count cannot become
+         * a wild allocation). */
+        bool *fire_in_block = func->block_count > 0
+            ? (bool *)calloc((size_t)func->block_count, sizeof(bool)) : NULL;
         if (fire_in_block) {
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *block = &func->blocks[bi];

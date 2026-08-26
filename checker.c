@@ -66,6 +66,51 @@ static bool type_carries_data_pointer(Type *t, int depth) {
     return false;
 }
 
+/* BUG-863: does this type carry a pointer a CALLBACK COULD RETAIN?
+ *
+ * The funcptr-call keep worst-case ("I cannot see the target, so assume it
+ * keeps every pointer it is handed") asks this. It is deliberately NOT
+ * `type_carries_data_pointer`, because the SLICE shape is a documented,
+ * deliberate accept-unsafe exemption that predates this fix and whose removal
+ * would reject the canonical callback idiom: passing a local array to a
+ * read-only callback is the normal way to hand a buffer to one. That
+ * exemption is recorded in docs/limitations.md rather than left implied by a
+ * comment. TYPE_OPAQUE is listed alongside it for symmetry with the old
+ * wording — note that `*opaque` is a TYPE_POINTER whose inner is opaque, so
+ * it IS worst-cased, exactly as it was before this change (verified against a
+ * pristine baseline build: a `*opaque` context arg was already rejected).
+ *
+ * Everything else that reaches a pointer at any nesting depth is worst-cased,
+ * so `?*T`, `struct { *T p; }`, a union or an array of those, and any future
+ * wrapper are one query, not N hand-rolled arms. Not recursing into a slice
+ * keeps the exemption consistent at depth: `struct { [*]u8 buf; }` is exempt
+ * exactly as the bare `[*]u8` is. */
+static bool type_carries_retainable_pointer(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_SLICE || k == TYPE_OPAQUE) return false;  /* documented exemptions */
+    if (k == TYPE_POINTER) return true;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_retainable_pointer(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY)
+        return type_carries_retainable_pointer(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_retainable_pointer(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_retainable_pointer(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    return false;
+}
+
 /* Does this type CARRY a Handle at any nesting depth?
  *
  * Sibling of type_carries_data_pointer, deliberately SEPARATE rather than an
@@ -828,6 +873,177 @@ static Type *int_retype_target(Type *t) {
 }
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
+
+/* BUG-867: fold a declaration's `const` / `volatile` qualifier ONTO its
+ * slice/pointer type. ONE query for a question that was answered by three
+ * hand-written copies — NODE_VAR_DECL (local), NODE_GLOBAL_VAR (registration)
+ * and the global-initializer validation pass — and the third copy did not
+ * exist at all: it re-ran a bare `resolve_type` and compared the UNFOLDED type
+ * against the initializer.
+ *
+ * The measured consequence: a const string-literal slice was UNDECLARABLE at
+ * file scope, which is the ordinary firmware banner —
+ *
+ *     const [*]u8 BANNER = "boot ok";   // rejected at global scope
+ *     ...                               // the same line inside a function: fine
+ *
+ * and the diagnostic printed the SAME TYPE on both sides ("cannot initialize
+ * 'BANNER' of type '[]u8' with '[]u8'"), because `type_name` does not render
+ * qualifiers. A nonsense message is the tell that the two sides differ in
+ * something the message cannot show.
+ *
+ * Folds both qualifiers at once and preserves any already present on the type,
+ * so `volatile const [*]u8` keeps both — the old code reached that only
+ * through the volatile arm's extra `if (is_const)` line, which the const arm
+ * had no mirror for. */
+static Type *fold_decl_qualifiers(Checker *c, Node *decl, Type *type) {
+    if (!type || !decl) return type;
+    bool wc = decl->var_decl.is_const;
+    bool wv = decl->var_decl.is_volatile;
+    if (!wc && !wv) return type;
+    Type *eff = type_unwrap_distinct(type);
+    if (!eff) return type;
+    TypeKind ek = type_dispatch_kind(type);
+    if (ek == TYPE_SLICE) {
+        bool c_out = wc || eff->slice.is_const;
+        bool v_out = wv || eff->slice.is_volatile;
+        if (c_out == eff->slice.is_const && v_out == eff->slice.is_volatile)
+            return type;
+        Type *t = type_slice(c->arena, eff->slice.inner);
+        t->slice.is_const = c_out;
+        t->slice.is_volatile = v_out;
+        return t;
+    }
+    if (ek == TYPE_POINTER) {
+        bool c_out = wc || eff->pointer.is_const;
+        bool v_out = wv || eff->pointer.is_volatile;
+        if (c_out == eff->pointer.is_const && v_out == eff->pointer.is_volatile)
+            return type;
+        Type *p = type_pointer(c->arena, eff->pointer.inner);
+        p->pointer.is_const = c_out;
+        p->pointer.is_volatile = v_out;
+        return p;
+    }
+    return type;
+}
+
+/* BUG-859: a compile-time-constant NEGATIVE value flowing into an UNSIGNED
+ * destination.
+ *
+ * `is_literal_compatible` only ever inspects a BARE `NODE_INT_LIT`, and the
+ * negative arm it does have (NODE_UNARY/MINUS over an int literal) is reached
+ * only when the caller has already decided the types disagree. But unary
+ * minus is typed `result = operand` (checker.c NODE_UNARY), so `-1` carries
+ * the literal's default u32 — `type_equals(u32, u32)` succeeds at every
+ * destination and NOTHING checks the value. `u32 a = -1;` silently became
+ * 4294967295, which is precisely the implicit SIGN CONVERSION the language
+ * says it does not have.
+ *
+ * This is the shared query for that question, used at every value-flow sink
+ * (var-decl, assignment, global, call arg, return, orelse fallback, spawn
+ * arg, struct-init field). Deliberately NARROW so it can only ever reject a
+ * value it computed itself:
+ *   - the expression must be PURE literal (no ident/call/field operand), so
+ *     a runtime value can never reach here;
+ *   - only a folded value < 0 is rejected, so a large unsigned literal such
+ *     as `u64 x = 0xFFFFFFFFFFFFFFFF;` — which int64 folding cannot even
+ *     represent — is untouched;
+ *   - the destination must be an unsigned integer.
+ * Positive overflow (`u8 x = 200 + 100;`) is already caught by the ordinary
+ * type check, since the folded expression keeps its wider literal type.
+ *
+ * Corpus cost measured at ZERO before shipping: no `.zer` file in tests/zer,
+ * tests/zer_fail, test_modules, rust_tests, zig_tests, lib or examples spells
+ * a negative or `~` constant into an unsigned destination (the two `~N` grep
+ * hits are both in comments). */
+/* Does the tree contain an operator that can PRODUCE a negative value from
+ * non-negative literals — unary minus, binary minus, or bitwise complement?
+ * `eval_const_expr` folds in int64, so "the fold came out negative" alone
+ * cannot distinguish `-1` from the bare literal `0xFFFFFFFFFFFFFFFF`, whose
+ * int64 image is also -1. This is the syntactic half of that distinction. */
+static bool int_expr_has_negating_op(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_UNARY)
+        return e->unary.op == TOK_MINUS || e->unary.op == TOK_TILDE ||
+               int_expr_has_negating_op(e->unary.operand);
+    if (e->kind == NODE_BINARY)
+        return e->binary.op == TOK_MINUS ||
+               int_expr_has_negating_op(e->binary.left) ||
+               int_expr_has_negating_op(e->binary.right);
+    return false;
+}
+
+/* Does the tree contain an integer literal above INT64_MAX? If so the int64
+ * fold has already lost the value and its sign means nothing — leave it alone
+ * (`u64 x = 0xDEADBEEFCAFEBABE;` and `... - 1` are both legitimate). */
+static bool int_expr_has_over_int64_literal(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_INT_LIT)
+        return e->int_lit.value > (uint64_t)INT64_MAX;
+    if (e->kind == NODE_UNARY)
+        return int_expr_has_over_int64_literal(e->unary.operand);
+    if (e->kind == NODE_BINARY)
+        return int_expr_has_over_int64_literal(e->binary.left) ||
+               int_expr_has_over_int64_literal(e->binary.right);
+    return false;
+}
+
+static bool const_int_negative_into_unsigned(Node *e, Type *target,
+                                             int64_t *out_val) {
+    if (!e || !target) return false;
+    if (!is_pure_int_literal_expr(e)) return false;
+    Type *eff = type_unwrap_distinct(target);
+    if (!eff || !type_is_integer(eff)) return false;
+    if (!type_is_unsigned(eff)) return false;
+    int64_t v = eval_const_expr(e);
+    if (v == CONST_EVAL_FAIL) return false;
+    if (v >= 0) return false;
+    /* MEASURED, not reasoned: the first version of this rule tested only
+     * `v < 0` and over-rejected two corpus tests on the first `make check` —
+     * `u64 y = 0xDEADBEEFCAFEBABE;` and `u64 v = 0xFFFFFFFFFFFFFFFF;`, both
+     * bare positive literals whose int64 image is negative. A grep for `-`
+     * and `~` spellings had said the corpus cost was zero; it was measuring
+     * the wrong shape. These two guards are what the suite taught. */
+    if (!int_expr_has_negating_op(e)) return false;
+    if (int_expr_has_over_int64_literal(e)) return false;
+    if (out_val) *out_val = v;
+    return true;
+}
+
+/* BUG-861: the shared "this intrinsic must not FORGE an enum" gate.
+ *
+ * ZER has no int->enum cast, so the only routes to an enum value are a declared
+ * variant and the conversion intrinsics. `@bitcast` is the blessed one and
+ * TRACKS (emit_bitcast_enum_guard traps at the point of forgery, BUG-843).
+ * `@truncate` and `@saturate` reached the same place with NO guard, because
+ * `type_is_integer` answers TRUE for TYPE_ENUM and their "target must be an
+ * integer" gates therefore passed. Redirect to the guarded spelling rather than
+ * duplicating the runtime guard at four more emission sites — the capability is
+ * preserved, only the unguarded door closes. */
+static void reject_enum_forge_target(Checker *c, Type *target, int line,
+                                     const char *iname) {
+    if (!target) return;
+    if (type_dispatch_kind(target) != TYPE_ENUM) return;
+    checker_error(c, line,
+        "%s cannot target the enum '%s' — an enum's variants are a declared set, "
+        "not a width, so this would FORGE a value that is no variant at all and a "
+        "later switch would silently take an arbitrary arm. Use @bitcast, which "
+        "checks the value against the declared variants",
+        iname, type_name(target));
+}
+
+/* The one diagnostic for the class above. `what` names the sink so the user
+ * can find the position ("initializer", "argument", "return value", ...). */
+static void check_negative_const_into_unsigned(Checker *c, Node *e, Type *target,
+                                               int line, const char *what) {
+    int64_t v = 0;
+    if (!const_int_negative_into_unsigned(e, target, &v)) return;
+    checker_error(c, line,
+        "%s is the negative constant %lld but '%s' is unsigned — "
+        "ZER has no implicit sign conversion. Use a signed type, or write the "
+        "intended bit pattern (for an all-ones mask on 'uN', use the literal)",
+        what, (long long)v, type_name(target));
+}
 
 /* BUG-392: Build a string key from an expression for union switch locking.
  * Same pattern as zercheck's handle_key_from_expr.
@@ -2652,6 +2868,8 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     /* LIT-1: `.baud = -7` into a 64-bit field must compute -7 in
                      * the field's width, not the literal's default u32. */
                     Type *rt = int_retype_target(ft);
+                    check_negative_const_into_unsigned(c, df->value, rt, line,
+                                                       "struct-init field value");
                     if (rt) retype_const_int_to_target(c, df->value, rt);
                 }
                 break;
@@ -6685,6 +6903,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     "cannot assign '%s' to '%s'",
                     type_name(value), type_name(target));
             }
+            /* BUG-859 sink: assignment. */
+            check_negative_const_into_unsigned(c, node->assign.value,
+                                               int_retype_target(target),
+                                               node->loc.line, "assigned value");
             /* BUG-373: integer literal range check on assignment */
             if (node->assign.value->kind == NODE_INT_LIT &&
                 target && type_is_integer(type_unwrap_distinct(target))) {
@@ -7038,6 +7260,34 @@ static Type *check_expr(Checker *c, Node *node) {
                  * (alloc(T,n)) and param/global slices (caller-owned) stay
                  * allowed. */
                 {
+                    /* BUG-862: the walk below discards the PATH and then asks a
+                     * question about the ROOT SYMBOL's own type ("is the root a
+                     * local array?"). A local STRUCT holding an inline array
+                     * answers no, so `free(s.buf[0..])` was ACCEPTED while the
+                     * identical `free(buf[0..])` one line away was rejected —
+                     * two spellings of one program disagreeing. Measured: it
+                     * reaches libc `free()` on a stack address (exit 133 here
+                     * only because the poison guard happened to catch it; on
+                     * bare metal there is no guard and no diagnostic).
+                     *
+                     * The durable question is about the SLICED OBJECT, not the
+                     * root: an expression of TYPE_ARRAY is ALWAYS inline storage
+                     * in ZER — a heap array is `[*]T` from `alloc(T, n)`, never
+                     * `T[N]` — so slicing an array and freeing the result can
+                     * never be correct, at any nesting depth, through any
+                     * projection, in any storage class. One test, whole class. */
+                    if (node->call.args[0] &&
+                        node->call.args[0]->kind == NODE_SLICE) {
+                        Type *sob = typemap_get(c, node->call.args[0]->slice.object);
+                        if (sob && type_dispatch_kind(sob) == TYPE_ARRAY) {
+                            checker_error(c, node->loc.line,
+                                "cannot free() a slice of the inline array '%s' — a "
+                                "fixed array is stack, static or struct-embedded "
+                                "storage, never heap. free is only for heap slices "
+                                "from alloc(T, n)",
+                                type_name(sob));
+                        }
+                    }
                     Node *root = node->call.args[0];
                     while (root && (root->kind == NODE_SLICE ||
                                     root->kind == NODE_FIELD ||
@@ -7835,6 +8085,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* LIT-1: `f(-3)` where the param is i64 (or ?i64) must
                          * pass -3 computed in i64, not the literal's default u32. */
                         Type *rt = int_retype_target(param);
+                        check_negative_const_into_unsigned(c, node->call.args[i], rt,
+                                                           node->loc.line, "argument");
                         if (rt) retype_const_int_to_target(c, node->call.args[i], rt);
                     }
                 }
@@ -9192,6 +9444,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         "orelse fallback type '%s' doesn't match '%s'",
                         type_name(fallback), type_name(unwrapped));
                 }
+                /* BUG-859 sink: orelse fallback. */
+                check_negative_const_into_unsigned(c, node->orelse.fallback,
+                                                    int_retype_target(unwrapped),
+                                                    node->loc.line, "orelse fallback");
                 result = unwrapped;
             }
         } else {
@@ -9953,6 +10209,18 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "@truncate target must be an integer type, got '%s'", type_name(result));
                 }
+                /* BUG-861: `type_is_integer` answers TRUE for TYPE_ENUM, so an ENUM
+                 * target sailed through the gate above and `@truncate(State, 7)`
+                 * FORGED an out-of-variant enum — the switch then silently ran its
+                 * LAST arm (measured: exit 3 where no arm matches). That is exactly
+                 * the defect BUG-843 closed for @bitcast; this is its sibling
+                 * spelling, and @saturate below is the third.
+                 *
+                 * Not a ban: @bitcast remains the route in, and it TRACKS (runtime
+                 * variant guard at the point of forgery). @truncate's own meaning —
+                 * "keep the low bits" — has no content for an enum, whose variants
+                 * are a declared set and not a width. */
+                reject_enum_forge_target(c, result, node->loc.line, "@truncate");
             } else {
                 result = ty_void;
             }
@@ -9973,6 +10241,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "@saturate target must be an integer type, got '%s'", type_name(result));
                 }
+                /* BUG-861 sibling: same forge route. @saturate additionally has no
+                 * meaning here — clamping to "the enum's min/max" is nonsense when
+                 * the variants are a declared set rather than a contiguous range.
+                 * Measured on the pre-fix build: the emitted clamp did not clamp at
+                 * all and handed back the raw 7. */
+                reject_enum_forge_target(c, result, node->loc.line, "@saturate");
             } else {
                 result = ty_void;
             }
@@ -11094,6 +11368,34 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@cstr destination is a raw pointer '*u8' — no bounds check possible. "
                             "Use a slice ('[*]u8') or fixed array ('u8[N]') destination instead.");
                     }
+                }
+            }
+            /* BUG-859: the destination gate was a stack of NEGATIVE tests
+             * (reject const, reject raw `*T`) — so a type matching NONE of
+             * them was accepted BY DEFAULT. An integer destination is the
+             * live case: `u32 gi = 4096; @cstr(gi, sl);` emitted
+             * `memcpy(gi, ...)` and RAN. That is an integer-to-pointer
+             * conversion the language says cannot be spelled without
+             * `@inttoptr` + `mmio` — a breach of the grammar-closure claim,
+             * not merely a bad diagnostic.
+             *
+             * Replaced with a POSITIVE gate: the destination must be one of
+             * the three writable byte-buffer shapes. Pointers reach here only
+             * via the exemptions above (volatile MMIO / `*opaque` interop);
+             * everything else — integers, floats, bools, structs, unions,
+             * enums, handles, funcptrs, optionals — is rejected. */
+            if (node->intrinsic.arg_count >= 1) {
+                Type *dst_type = typemap_get(c, node->intrinsic.args[0]);
+                TypeKind dk = dst_type ? type_dispatch_kind(dst_type) : TYPE_VOID;
+                if (dst_type &&
+                    dk != TYPE_ARRAY &&
+                    dk != TYPE_SLICE &&
+                    dk != TYPE_POINTER) {
+                    checker_error(c, node->loc.line,
+                        "@cstr destination has type '%s' — must be a fixed array "
+                        "('u8[N]') or a slice ('[*]u8'). An integer address is not "
+                        "a destination; use @inttoptr with an 'mmio' range.",
+                        type_name(dst_type));
                 }
             }
             /* BUG-234: compile-time overflow check when dest is array and src is string literal */
@@ -12908,6 +13210,8 @@ static void check_stmt(Checker *c, Node *node) {
                  * a ?integer) so the value (and any negation / arithmetic) is
                  * computed in that width, not in the literal's default u32. */
                 Type *rt = int_retype_target(type);
+                check_negative_const_into_unsigned(c, node->var_decl.init, rt,
+                                                    node->loc.line, "initializer");
                 if (rt) retype_const_int_to_target(c, node->var_decl.init, rt);
             }
             /* cross-platform portability: @ptrtoint to fixed-width type is fragile.
@@ -15126,6 +15430,8 @@ static void check_stmt(Checker *c, Node *node) {
                     /* LIT-1: `return -3;` from an i64 (or ?i64) function must
                      * compute in i64, not the literal's default u32. */
                     Type *rt = int_retype_target(c->current_func_ret);
+                    check_negative_const_into_unsigned(c, node->ret.expr, rt,
+                                                        node->loc.line, "return value");
                     if (rt) retype_const_int_to_target(c, node->ret.expr, rt);
                 }
             }
@@ -16543,6 +16849,23 @@ static void check_stmt(Checker *c, Node *node) {
          * spawn worker(&const_val) must fail like a normal call would. */
         if (func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL) {
             int pc = func_sym->func_node->func_decl.param_count;
+            /* BUG-860: spawn had NO ARITY CHECK. The per-argument loop below is
+             * bounded by `i < pc`, so every extra argument was silently dropped
+             * and every missing one silently left the parameter reading the
+             * thread-argument struct's auto-zeroed slot. The DIRECT call
+             * `worker(1,2,3)` is rejected by NODE_CALL; the spawn spelling of
+             * the same program reached GCC ("too many arguments to function"),
+             * with no source line and no ZER diagnostic — the same
+             * two-spellings-of-one-program disagreement this file keeps finding.
+             * Variadic targets are excluded (a spawn of a variadic function is
+             * separately banned as an unchecked boundary). */
+            if (!func_sym->func_node->func_decl.is_variadic &&
+                node->spawn_stmt.arg_count != pc) {
+                checker_error(c, node->loc.line,
+                    "spawn target '%.*s' expects %d argument%s, got %d",
+                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                    pc, (pc == 1 ? "" : "s"), node->spawn_stmt.arg_count);
+            }
             for (int i = 0; i < node->spawn_stmt.arg_count && i < pc; i++) {
                 Type *arg_type = checker_get_type(c, node->spawn_stmt.args[i]);
                 Type *param_type = resolve_type(c, func_sym->func_node->func_decl.params[i].type);
@@ -16587,6 +16910,10 @@ static void check_stmt(Checker *c, Node *node) {
                         "spawn argument %d: expected '%s', got '%s'",
                         i + 1, type_name(param_type), type_name(arg_type));
                 }
+                /* BUG-859 sink: spawn argument. */
+                check_negative_const_into_unsigned(c, node->spawn_stmt.args[i],
+                                                    int_retype_target(param_type),
+                                                    node->loc.line, "spawn argument");
             }
         }
 
@@ -17388,34 +17715,14 @@ static void register_decl(Checker *c, Node *node) {
     }
 
     case NODE_GLOBAL_VAR: {
-        Type *type = resolve_type(c, node->var_decl.type);
-        /* propagate const from var qualifier to slice/pointer type */
-        if (node->var_decl.is_const && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_const) {
-                type = type_const_slice(c->arena, type->slice.inner);
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_const) {
-                type = type_const_pointer(c->arena, type->pointer.inner);
-            }
-        }
-        /* propagate volatile from var qualifier to slice/pointer type.
-         * Pointer propagation (added 2026-05-18): see matching block in
-         * the NODE_VAR_DECL/NODE_GLOBAL_VAR body-check case — globals are
-         * registered here in register_decl BEFORE bodies are checked, so
-         * sym->type must carry the volatile flag from this entry point.
-         * Without this, NODE_IDENT references to a global volatile pointer
-         * return the non-volatile sym->type and downstream IR temps strip
-         * volatile (silent miscompile on MMIO reads/writes). */
-        if (node->var_decl.is_volatile && type) {
-            if (type->kind == TYPE_SLICE && !type->slice.is_volatile) {
-                type = type_volatile_slice(c->arena, type->slice.inner);
-                if (node->var_decl.is_const) type->slice.is_const = true;
-            } else if (type->kind == TYPE_POINTER && !type->pointer.is_volatile) {
-                Type *vp = type_pointer(c->arena, type->pointer.inner);
-                vp->pointer.is_volatile = true;
-                vp->pointer.is_const = type->pointer.is_const;
-                type = vp;
-            }
-        }
+        /* BUG-867: const/volatile propagation onto the slice/pointer type.
+         * Globals are registered HERE, before bodies are checked, so sym->type
+         * must already carry both flags — a NODE_IDENT reference otherwise
+         * returns the unqualified type and downstream IR temps strip volatile
+         * (a silent MMIO miscompile on bare metal, BUG-643/664/665). One
+         * shared fold; see fold_decl_qualifiers. */
+        Type *type = fold_decl_qualifiers(c, node,
+                                          resolve_type(c, node->var_decl.type));
         /* Gap 43 (2026-04-27): reject threadlocal shared struct combination.
          * `threadlocal` puts each thread on its own copy with its own mutex;
          * cross-thread synchronization is impossible because threads never
@@ -17444,6 +17751,19 @@ static void register_decl(Checker *c, Node *node) {
                     "use '?*%s' for nullable pointers",
                     type_name(teff->pointer.inner), type_name(teff->pointer.inner));
             }
+            /* BUG-864 is NOT closed here — see check_builtin_init (ZBI_FUNCPTR).
+             *
+             * The LOCAL site rejects an uninitialised funcptr outright, and
+             * copying that rule to globals was the obvious move. It was
+             * MEASURED and BACKED OUT: it rejects the canonical firmware
+             * callback registry (`void (*saved_cb)(u32); ... saved_cb = h;`),
+             * which the reference documents and two `test_emit.c` cases
+             * assert. A global legitimately starts unset and is registered
+             * later; a local has no such window.
+             *
+             * The hazard that IS unambiguous — a global funcptr that is CALLED
+             * and never assigned ANYWHERE in the file — is caught in the
+             * whole-file pass instead, where the later assignment is visible. */
         }
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,
@@ -20729,7 +21049,13 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             }
         }
         if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.init) {
-            Type *type = resolve_type(c, decl->var_decl.type);
+            /* BUG-867: this pass re-resolved the declared type from scratch and
+             * never applied the const/volatile fold that registration applies,
+             * so a `const [*]u8` global was compared as a NON-const slice
+             * against a const string literal and rejected — with both sides
+             * printing as '[]u8'. One shared query now, at all three sites. */
+            Type *type = fold_decl_qualifiers(c, decl,
+                                              resolve_type(c, decl->var_decl.type));
             Type *init = check_expr(c, decl->var_decl.init);
             /* global initializers must be constant expressions in C */
             Node *ginit = decl->var_decl.init;
@@ -20859,6 +21185,16 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                         (int)gl, gn);
                 }
             }
+            /* BUG-867 sibling: the LOCAL declaration site names this exactly
+             * ("string literal is read-only — use 'const []u8'"); the global
+             * site had no such arm, so a mutable global string slice fell
+             * through to the generic type mismatch and printed the SAME TYPE on
+             * both sides. Same rule, same wording, both sites. */
+            if (ginit->kind == NODE_STRING_LIT && type &&
+                type_dispatch_kind(type) == TYPE_SLICE && !decl->var_decl.is_const) {
+                checker_error(c, decl->loc.line,
+                    "string literal is read-only — use 'const []u8' instead of '[]u8'");
+            }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */
             if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {
                 checker_error(c, decl->loc.line,
@@ -20874,6 +21210,10 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     (int)decl->var_decl.name_len, decl->var_decl.name,
                     type_name(type), type_name(init));
             }
+            /* BUG-859 sink: global initializer. */
+            check_negative_const_into_unsigned(c, decl->var_decl.init,
+                                               int_retype_target(type),
+                                               decl->loc.line, "global initializer");
             /* BUG-373: integer literal range check for globals */
             if (decl->var_decl.init->kind == NODE_INT_LIT &&
                 type && type_is_integer(type_unwrap_distinct(type))) {
@@ -21090,8 +21430,22 @@ static bool keep_edge_callee_keeps(struct KeepEdge *e) {
     if (!cs || cs->kind != TYPE_FUNC_PTR ||
         e->param_index >= (int)cs->func_ptr.param_count) return false;
     if (e->is_fn_ptr_call) {
-        Type *pt = type_unwrap_distinct(cs->func_ptr.params[e->param_index]);
-        if (pt && pt->kind == TYPE_POINTER) return true; /* pointer worst-case */
+        /* BUG-863: the worst-case tested the BARE param kind, so every wrapper
+         * of a pointer slipped it — the "wrapper hides the inner kind" family
+         * at a sink the carrier audit does not cover. Measured, and CONFIRMED
+         * BY ASAN as `stack-use-after-return` from pure safe ZER:
+         *
+         *     ?*u32 g;  void retain(?*u32 p){ g = p; }
+         *     void set(){ u32 l=5; *(?*u32) fp = retain; fp(&l); }
+         *
+         * The DIRECT `retain(&l)` is rejected; the funcptr spelling of the
+         * same program was accepted — two spellings of one program
+         * disagreeing. A by-value struct carrying a `*T` was the second
+         * accepted shape. Widened to the recursive carrier question so
+         * `?*T`, struct-of, union-of, array-of and every future wrapper are
+         * ONE call rather than N hand-rolled arms. */
+        if (type_carries_retainable_pointer(cs->func_ptr.params[e->param_index], 0))
+            return true;
     }
     return cs->func_ptr.param_keeps && cs->func_ptr.param_keeps[e->param_index];
 }
@@ -21974,7 +22328,7 @@ static void check_lock_ordering(Checker *c, Node *file_node) {
  * never INITIALISED anywhere. Keyed by NAME, so a collision reads as INITIALISED —
  * the conservative direction. A POINTER parameter (*Barrier / *Arena) is never
  * flagged: the caller owns the initialisation. */
-typedef enum { ZBI_ARENA, ZBI_BARRIER } ZerInitKind;
+typedef enum { ZBI_ARENA, ZBI_BARRIER, ZBI_FUNCPTR } ZerInitKind;
 typedef struct {
     const char *name; uint32_t name_len;
     ZerInitKind kind;
@@ -22079,6 +22433,20 @@ static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
             zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_ARENA, n->loc.line);
         else if (u && type_dispatch_kind(u) == TYPE_BARRIER)
             zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_BARRIER, n->loc.line);
+        /* BUG-864: a GLOBAL function pointer with no initializer. Auto-zero
+         * makes it NULL, and the LOCAL declaration site already rejects the
+         * same shape outright ("function pointer requires an initializer").
+         * The global sibling could not simply copy that rule — a callback
+         * REGISTRY legitimately starts unset and is assigned later, which is
+         * the documented firmware idiom — so the question moves here, where
+         * the whole file is visible and a later `g_cb = handler;` counts.
+         * What is left is unambiguous: CALLED and never assigned anywhere.
+         * On the host that is a SIGSEGV; on bare metal address 0 is routinely
+         * mapped (it is where the vector table lives), so the jump SUCCEEDS
+         * into whatever is there — silent at compile time AND at run time. */
+        else if (u && n->kind == NODE_GLOBAL_VAR && !n->var_decl.init &&
+                 type_dispatch_kind(u) == TYPE_FUNC_PTR)
+            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_FUNCPTR, n->loc.line);
         /* `Arena a = Arena.over(buf);` initialises at the declaration */
         if (n->var_decl.init) zbi_mark(st, NULL, false, false);
         if (u && type_dispatch_kind(u) == TYPE_ARENA && n->var_decl.init) {
@@ -22090,6 +22458,14 @@ static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
     /* `a = Arena.over(buf);` / `a = <anything>` initialises */
     if (n->kind == NODE_ASSIGN && n->assign.target)
         zbi_mark(st, n->assign.target, false, true);
+
+    /* BUG-864: a CALL through the name is the use that matters for a funcptr;
+     * an address-take (`&g_cb`, e.g. handing it to a registrar) counts as a
+     * possible assignment, since the callee can write through it. */
+    if (n->kind == NODE_CALL && n->call.callee && n->call.callee->kind == NODE_IDENT)
+        zbi_mark(st, n->call.callee, true, false);
+    if (n->kind == NODE_UNARY && n->unary.op == TOK_AMP)
+        zbi_mark(st, n->unary.operand, false, true);
 
     /* method calls on the receiver */
     if (n->kind == NODE_CALL && n->call.callee && n->call.callee->kind == NODE_FIELD) {
@@ -22140,6 +22516,17 @@ static void check_builtin_init(Checker *c, Node *file_node) {
     for (int i = 0; i < st.n; i++) {
         ZerInitUse *e = &st.v[i];
         if (!e->used || e->inited) continue;
+        if (e->kind == ZBI_FUNCPTR) {
+            checker_error(c, e->decl_line,
+                "global function pointer '%.*s' is CALLED but never assigned "
+                "anywhere in this file, so it is still the auto-zero NULL at the "
+                "call. On bare metal address 0 is usually mapped, so the jump "
+                "succeeds into whatever lives there instead of faulting. Give it "
+                "an initializer, assign it before use, or declare it '?' and "
+                "unwrap with orelse",
+                (int)e->name_len, e->name);
+            continue;
+        }
         if (e->kind == ZBI_ARENA)
             checker_error(c, e->decl_line,
                 "arena '%.*s' is allocated from but never given a backing store, so "

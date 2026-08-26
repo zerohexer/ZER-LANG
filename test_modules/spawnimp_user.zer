@@ -1,0 +1,7 @@
+import spawnimp_mod;
+
+u32 main() {
+    spawn tick();
+    spawn tick_by(3);
+    return 0;
+}

@@ -1,0 +1,10 @@
+// BUG-866: emit_container_structs iterates the checker's WHOLE shared
+// container_instances[] list once PER MODULE PASS, so one stamp used across a
+// module boundary was written into the .c twice and GCC answered "redefinition
+// of 'struct Box_Item'". No ZER diagnostic; the feature simply did not build.
+container Box(T) {
+    T v;
+    u32 tag;
+}
+
+struct Item { u32 id; }

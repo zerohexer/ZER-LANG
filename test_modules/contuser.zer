@@ -1,0 +1,10 @@
+import contmod;
+
+u32 main() {
+    Box(Item) b;
+    b.v.id = 7;
+    b.tag = 1;
+    if (b.tag != 1) { return 1; }
+    if (b.v.id != 7) { return 2; }
+    return 0;
+}

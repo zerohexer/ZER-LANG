@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: inline array
+// BUG-862: the non-heap free() gate asked about the ROOT SYMBOL's type ("is
+// the root a local array?"), so a local STRUCT holding an inline array
+// answered no and `free(s.buf[0..])` was accepted while `free(buf[0..])` one
+// line away was rejected. It reached libc free() on a stack address.
+struct S { u8[8] buf; }
+u32 main() {
+    S s;
+    free(s.buf[0..]);
+    return 0;
+}

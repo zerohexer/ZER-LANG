@@ -1,0 +1,15 @@
+// BOUNDARY POSITIVE for BUG-862: rejecting a slice OF AN INLINE ARRAY must not
+// touch a genuine heap slice, including one reached through a struct field.
+struct H { [*]u8 data; }
+u32 main() {
+    H h;
+    h.data = alloc(u8, 16) orelse return;
+    h.data[0] = 5;
+    u32 v = (u32)h.data[0];
+    free(h.data);
+    if (v != 5) { return 1; }
+    [*]u8 flat = alloc(u8, 8) orelse return;
+    flat[0] = 9;
+    free(flat);
+    return 0;
+}

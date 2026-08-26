@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: ZER has no implicit sign conversion
+struct C { u32 baud; }
+u32 main() { C c = { .baud = -1 }; return c.baud; }

@@ -5,6 +5,284 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26 — BUG-859..867: nine holes, and the multi-site tax again
+
+An audit sweep over the whole tree. Every row was reproduced on a pristine
+`git archive HEAD` build BEFORE being fixed, every regression test was verified
+to flip ACCEPT -> REJECT against that same build, and every over-rejection had
+its corpus cost measured rather than argued.
+
+**Root-cause pattern, for the third wave running:** eight of the nine are the
+SAME semantic question answered independently at N sites, with one site wrong.
+The two spellings of one program then disagree — `retain(&l)` rejected while
+`fp(&l)` compiles, `free(buf[0..])` rejected while `free(s.buf[0..])` compiles,
+a local funcptr rejected while the global sibling is not. Where a fix had a
+durable form, it is ONE query used at every site (`fold_decl_qualifiers`,
+`type_carries_retainable_pointer`, `emit_spawn_target_name`,
+`check_negative_const_into_unsigned`), not another arm.
+
+### BUG-859 — `@cstr`'s destination gate was a stack of NEGATIVE tests
+
+    u32 gi = 4096;
+    @cstr(gi, buf[0..]);        // emitted memcpy(gi, ...) and RAN
+
+Every destination check rejected something specific — a const symbol, a const
+pointer, a raw `*T` — so a type matching NONE of them was accepted BY DEFAULT.
+An INTEGER destination is that type. The emitted C performs an
+integer-to-pointer conversion, which the language says cannot be spelled
+without `@inttoptr` and an `mmio` range: this is a breach of the
+grammar-closure claim, not merely a poor diagnostic. The emitter's own
+fall-through arm even carries a comment asserting that "callers using raw `*u8`
+dest are rejected at checker" — true for pointers, false for integers.
+
+Replaced with a POSITIVE gate: the destination must be a fixed array, a slice,
+or a pointer (which reaches that arm only through the volatile-MMIO and
+`*opaque` exemptions above it).
+
+### BUG-859 — a negative CONSTANT flowing into an UNSIGNED destination
+
+    u32 a = -1;        // silently 4294967295, at all eight sinks
+
+`is_literal_compatible` has a correct negative-literal arm, but it is reached
+only once the caller has already decided the types disagree — and unary minus
+is typed `result = operand` (checker.c, NODE_UNARY), so `-1` carries the
+literal's default `u32`, `type_equals(u32, u32)` succeeds at every destination,
+and nothing ever checks the VALUE. That is the implicit SIGN CONVERSION the
+language spec says it does not have.
+
+One shared query, `check_negative_const_into_unsigned`, wired at all eight
+value-flow sinks (var-decl, assignment, global, call arg, return, orelse
+fallback, spawn arg, struct-init field) — the same site set LIT-1 already
+enumerates, so a ninth sink is a conscious add.
+
+**The measurement lesson, recorded because it cost a full `make check`.** The
+first version tested only "the int64 fold came out negative". A grep for `-`
+and `~` spellings had put the corpus cost at ZERO. It was measuring the wrong
+shape: `u64 y = 0xDEADBEEFCAFEBABE;` is a bare POSITIVE literal whose int64
+image is also negative, and the rule rejected it, breaking two corpus tests on
+the first run. Two guards were added by the suite, not by reasoning — the
+expression must contain a negating operator (`-`, unary `-`, `~`), and must not
+contain a literal above `INT64_MAX`. A grep is not a corpus measurement.
+
+### BUG-860 — `spawn` had NO ARITY CHECK
+
+    void worker(u32 v) { }
+    spawn worker(1, 2, 3);      // GCC: "too many arguments", no source line
+
+The per-argument loop is bounded by `i < param_count`, so every extra argument
+was silently dropped and every missing one left the parameter reading the
+auto-zeroed thread-argument slot. The DIRECT call `worker(1,2,3)` is rejected
+by NODE_CALL; only the spawn spelling reached the backend.
+
+### BUG-861 — `@truncate` / `@saturate` could FORGE an out-of-variant enum
+
+    State s = @truncate(State, 7);   // switch silently ran its LAST arm, exit 3
+
+`type_is_integer` answers TRUE for `TYPE_ENUM`, so an enum target sailed
+through both intrinsics' "target must be an integer type" gates. This is
+exactly the defect BUG-843 closed for `@bitcast`; these are its two sibling
+spellings, and `@saturate`'s clamp arithmetic did not even clamp — it handed
+back the raw 7.
+
+Resolved by REDIRECT, not ban: `@bitcast` remains the route in and it TRACKS
+(runtime variant guard at the point of forgery). `@truncate`'s own meaning —
+"keep the low bits" — has no content for an enum, whose variants are a declared
+set and not a width.
+
+### BUG-862 — `free()` of a slice of an INLINE ARRAY, through a struct field
+
+    struct S { u8[8] buf; }
+    free(s.buf[0..]);            // accepted; libc free() on a stack address
+
+The non-heap gate walked the projection to the root and then asked a question
+about the ROOT SYMBOL's own type ("is the root a local array?"). A local STRUCT
+holding an inline array answers no. `free(buf[0..])` one line away was
+rejected — two spellings, one program, opposite verdicts.
+
+The durable question is about the SLICED OBJECT, not the root: an expression of
+`TYPE_ARRAY` is ALWAYS inline storage in ZER (a heap array is `[*]T` from
+`alloc(T, n)`, never `T[N]`), so slicing an array and freeing the result can
+never be correct — at any depth, through any projection, in any storage class.
+One test, whole class.
+
+### BUG-863 — the funcptr-call keep worst-case tested the BARE param kind
+
+    ?*u32 g;  void retain(?*u32 p){ g = p; }
+    void set(){ u32 l = 5; *(?*u32) fp = retain; fp(&l); }
+
+**Confirmed by ASan as `stack-use-after-return` from pure safe ZER.** The
+direct `retain(&l)` is rejected; the funcptr spelling was accepted. A by-value
+struct carrying a `*T` was the second accepted shape. This is the
+"wrapper hides the inner kind" family at a sink the carrier audit does not
+cover.
+
+Widened to a recursive carrier query, `type_carries_retainable_pointer`, so
+`?*T`, struct-of, union-of, array-of and every future wrapper are ONE call.
+The SLICE exemption is deliberately preserved and now recorded in
+limitations.md as a known accept-unsafe rather than left implied by a comment:
+handing a local buffer to a read-only callback is the normal idiom, and
+`tests/zer/funcptr_slice_callback_ok.zer` is its boundary positive.
+
+### BUG-864 — a global function pointer CALLED but never assigned
+
+    *(u32) -> u32 g_cb;
+    u32 main() { return g_cb(5); }     // jumped through NULL
+
+The LOCAL declaration site rejects an uninitialised funcptr; the GLOBAL site
+had only the pointer arm. On the host this is a SIGSEGV; on bare metal address
+0 is routinely mapped — it is where the vector table lives — so the jump
+SUCCEEDS into whatever is there. Silent at compile time and at run time both.
+
+**The obvious fix was measured and BACKED OUT.** Copying the local rule to
+globals rejects the canonical firmware callback registry, which the reference
+documents and two `test_emit.c` cases assert:
+
+    void (*saved_cb)(u32 val);   // legitimately starts unset
+    void register_cb(void (*cb)(u32 val)) { saved_cb = cb; }
+
+A global has a registration window that a local does not. So the question moved
+into the whole-file pass (`check_builtin_init`, the same analysis that already
+catches an un-backed Arena and an un-initialised Barrier), where a later
+assignment is visible. What is left is unambiguous: called, and never assigned
+anywhere. Corpus cost zero; both registry idioms still compile and run.
+
+### BUG-865 — `spawn <imported function>` could not LINK
+
+    import spawn_mod;
+    spawn tick();       // emitted `void tick();` and `tick()`;
+                        // the definition is `spawn_mod__tick`
+
+The wrapper spelled the target's name RAW at five emission sites. The checker
+ACCEPTS the program — the data-race scan even resolves the imported body, which
+is what makes the feature look supported — so the only signal was
+`ld returned 1 exit status`, with no source line and no ZER diagnostic.
+
+Nothing in the suite had ever spawned an imported function: `shared_user.zer`
+spawns a LOCAL worker. One resolver, `emit_spawn_target_name`, now serves all
+five sites; `test_modules/spawnimp_user.zer` pins it.
+
+### BUG-866 — a container stamped across a module boundary emitted TWICE
+
+    // cmod.zer: container Box(T) { T v; u32 tag; }  struct Item { u32 id; }
+    // cuser.zer: Box(Item) b;      -> "redefinition of 'struct Box_Item'"
+
+`emit_container_structs` iterates the checker's WHOLE `container_instances[]`
+list — shared by every module — and is called once per module pass. Its
+`emitted` set was a per-call `calloc`, so every pass re-emitted every stamp.
+The set now lives on the Emitter (not a file-static: the LSP builds a fresh
+Emitter per compilation and a static would leak state between them). Deduping
+alone is the whole fix — it removes the SECOND emission and leaves the first
+where it is, so no ordering that works today changes.
+
+### BUG-867 — `const [*]u8 BANNER = "boot ok";` was undeclarable at file scope
+
+    const [*]u8 BANNER = "boot ok";
+    // error: cannot initialize 'BANNER' of type '[]u8' with '[]u8'
+
+The same line inside a function compiles. The global-initializer validation
+pass re-resolved the declared type with a bare `resolve_type` and never applied
+the const/volatile fold that registration applies, so it compared a NON-const
+slice against a const string literal. **The diagnostic printing the SAME TYPE
+on both sides is the tell** — `type_name` does not render qualifiers, so a
+nonsense message means the two sides differ in something the message cannot
+show.
+
+Three hand-written copies of the fold collapse to one `fold_decl_qualifiers`,
+which also fixes a latent asymmetry: the volatile arm carried an extra
+`if (is_const)` line that the const arm had no mirror for, so `volatile const`
+was order-dependent. The global site also gained the LOCAL site's precise
+diagnostic for a mutable string slice ("string literal is read-only"), which it
+had been answering with the generic mismatch.
+
+### Compiler-internal defects found in the build warnings
+
+- **`lower_expr` could fall off the end** and return an indeterminate local id,
+  which the IR would then reference as a real local — a silent miscompile
+  inside the compiler. The switch is exhaustive over `NodeKind` with no
+  `default:`, which is what `-Werror=switch` enforces, but GCC cannot prove it.
+  Now returns the "no value" sentinel.
+- **`%.*s` fed a `size_t`** in the IR summary trace — a varargs type mismatch.
+- **`calloc(func->block_count, ...)`** with a signed count GCC's range analysis
+  admits as negative. Clamped.
+
+### The walker-field gate decided membership on PROSE — fixed
+
+`tools/audit_walker_fields.sh` audits RECURSIVE kind-walkers, and decided which
+functions those are by counting the function NAME anywhere in the accumulated
+body text — **comments and string literals included**. So editing a comment
+could move a walker in or out of the audited set, and did: deleting one comment
+that happened to mention `register_decl` (while collapsing the BUG-867 duplicate
+folds) dropped it out and turned all 45 of its baseline rows stale in an
+otherwise unrelated commit. This was a known defect, reported but not fixed.
+
+Membership is now decided by an actual CALL (`name(`) in a COMMENT-STRIPPED copy
+of the body. Measured consequence: `register_decl` (45 rows) and `zercheck_ir`
+(29 rows) leave the audited set, because **neither function is recursive** —
+both are called only from elsewhere — so neither was ever inside the gate's
+stated scope. 758 baselined rows -> 684, and the removals are recorded in the
+baseline header rather than left as a silent shrink.
+
+One trap on the way, worth keeping: awk's `split()` treats a separator longer
+than one character as a REGEX, so an unescaped `name(` matched nothing and
+EVERY walker dropped out at once. The escaped form is `fname "[ \t]*\\("`.
+Verified the gate still fires by removing a real baseline row (it reports the
+gap and exits 1).
+
+### Tooling
+
+`tools/audit_reference_examples.sh` (new, in `make check` and standalone as
+`make check-reference-examples`): every ```zer block in `docs/reference.md` is
+read BOTH as a file and as a function body, and must parse in at least one
+reading. Three tiers — a block with `main(` is a complete program and must
+parse; `// audit: expect-error` must be REJECTED by any diagnostic; everything
+else must parse or is counted as a MIXED FRAGMENT (a declaration shown beside
+the statements that use it). The fragment and skip counts are PRINTED so the
+coverage is never overstated. **Verified non-vacuous by two injections** —
+breaking the syntax of a complete example, and making an `expect-error` example
+legal; both fail the gate.
+
+It is deliberately not a full semantic check on every block: most blocks name a
+type declared in the surrounding prose, and failing on that would demand ~72
+doc edits to reach green. A gate nobody adopts protects nothing.
+
+### `tools/ub_sweep.sh` (new, standalone) — differential UB detector
+
+Emits each positive test's C ONCE, then builds that one .c four ways (`-O0`,
+`-O2`, `-O2 -fstrict-aliasing`, `-Os`) and compares stdout and exit status. If
+the same emitted C answers differently under two settings, the emitted C has UB
+in it and ZER's "one defined meaning" claim is false for that program — while
+the checker was silent, GCC was silent, and the suite passed, because the suite
+runs exactly ONE configuration. **On bare metal there is no second
+configuration to disagree with it**, which is what makes this class silent at
+both compile time and run time.
+
+This is the method that pinned BUG-845 (one .c, one gcc, `4294967295` at -O0
+and `0` at -O2). Not wired into `make check` — it is a sweep, not a per-commit
+gate, and it multiplies build time by four. Run it after touching emission.
+
+Two implementation notes kept from a previous attempt at this idea: the third
+config deliberately DROPS `-fno-strict-aliasing` (which zerc's own driver always
+passes) so that reliance on type-punning shows up; and each run's output is
+compared separately rather than joined into one delimiter-separated string,
+because joining split any MULTI-LINE program output at the newline and reported
+it divergent with identical output.
+
+### `docs/reference.md` intrinsic coverage: 41 -> 139
+
+Measured, not transcribed: the intrinsic set was derived by probing the
+compiler (every candidate name compiled and filtered on "unknown intrinsic"),
+each signature's arity and return type read back from the compiler's own
+diagnostics, and the result diffed against the document. **98 intrinsics were
+undocumented**, including entire families that appear NOWHERE in the reference:
+MMU, TLB, cache maintenance, port I/O, CPU state reads, control/model-specific/
+debug registers, extended state, power management and privileged transitions.
+Several are absent from CLAUDE.md as well — `@cpu_rdrand` / `@cpu_rdseed`
+(which return `?u64`, because the instruction can fail), `@cpu_id`,
+`@cpu_read_counter`, `@cpu_get_pc`, `@wait_on_address`, `@barrier_dma` and
+`@config`. Both worked examples in the new section compile and run.
+
+---
+
 ## Session 2026-08-25 — BUG-857/858: harvest-2 begins (a compiler crash, and a UAF from safe ZER)
 
 Two rows from `docs/limitations.md` harvest tracker 2. Both reproduced on main first;

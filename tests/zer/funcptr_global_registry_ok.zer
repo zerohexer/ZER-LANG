@@ -1,0 +1,21 @@
+// BOUNDARY POSITIVE for BUG-864: a global funcptr legitimately starts unset
+// and is registered later — the canonical firmware callback registry, which
+// the reference documents and two test_emit.c cases assert. Copying the LOCAL
+// "needs an initializer" rule to globals rejects exactly this, which is why
+// the shipped rule asks the whole-file question instead.
+u32 add(u32 a, u32 b) { return a + b; }
+u32 (*g_fn)(u32, u32);
+
+u32 result = 0;
+void (*saved_cb)(u32 val);
+void register_cb(void (*cb)(u32 val)) { saved_cb = cb; }
+void my_handler(u32 val) { result = val + 10; }
+
+u32 main() {
+    g_fn = add;
+    if (g_fn(20, 5) != 25) { return 1; }
+    register_cb(my_handler);
+    saved_cb(5);
+    if (result != 15) { return 2; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+struct Hold { *u32 p; }
+?*u32 g_sink;
+void retain(Hold h) { g_sink = h.p; }
+u32 main() {
+    u32 local = 5;
+    Hold h = { .p = &local };
+    *(Hold) fp = retain;
+    fp(h);
+    return 0;
+}

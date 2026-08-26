@@ -389,6 +389,8 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling) |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
+| **Declaration QUALIFIER fold (`const`/`volatile` onto a slice/pointer type)** | local var-decl, global registration, global-initializer validation | ONE query `fold_decl_qualifiers` (BUG-867). The third site did not exist — it re-resolved the bare type — so `const [*]u8 BANNER = "boot ok";` was undeclarable at file scope. **The tell was the diagnostic printing the SAME TYPE on both sides**: `type_name` does not render qualifiers, so a nonsense message means the two sides differ in something the message cannot show |
+| **Cross-module NAME emission (does this identifier need the module prefix?)** | every emission site that spells a user name | the NODE_IDENT path resolves it from the SYMBOL's own `module_prefix`; a site that spells `->name` RAW is a link failure with no source line. BUG-865 found five such sites in the spawn wrapper alone. `emit_spawn_target_name` is the pattern; the async state-struct name is the one still open (limitations.md) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
@@ -1674,6 +1676,48 @@ confidence"), applied to TESTS. Treat them identically.
    rule fired. Read the message.
 5. Verify a new test gate FIRES before trusting it (inject a wrong expectation / a fake
    closure). A gate that has only ever passed is a script, not a net.
+
+### A GREP IS NOT A CORPUS MEASUREMENT (2026-08-26, cost a full `make check`)
+
+CLAUDE.md already says "before shipping an over-rejection, MEASURE its corpus cost", and
+the measurement it names is a `grep -rhoE` count. That is necessary and NOT sufficient: a
+grep can only count the shapes you thought of, and the shape that breaks you is the one
+you did not.
+
+Measured case. BUG-859 rejects a negative CONSTANT flowing into an unsigned destination.
+The corpus grep looked for `-` and `~` spellings into `u8|u16|u32|u64|usize` and returned
+**zero**. The rule then broke two corpus tests on its first run, both of the form
+
+    u64 y = 0xDEADBEEFCAFEBABE;      // a bare POSITIVE literal ...
+    u64 v = 0xFFFFFFFFFFFFFFFF;      // ... whose int64 image is NEGATIVE
+
+— no `-`, no `~`, nothing a grep for the spelling could find, because the negativity
+appears only after `eval_const_expr` folds in int64. The two guards that fixed it (the
+expression must contain a negating operator; it must not contain a literal above
+`INT64_MAX`) were taught by the suite, not derived.
+
+**The rule: a grep sizes the BLAST RADIUS; only `make check` MEASURES the cost.** Grep
+first to decide whether the change is worth attempting; then run the suite before writing
+any number into a commit message or a doc. If the suite is too slow to run before
+deciding, that is a reason to run it anyway, not a reason to trust the grep.
+
+### MEASURING A `defer` BALANCE: do not read the counter in a `return` expression
+
+A return EXPRESSION is evaluated BEFORE the function's defers fire (BUG-442, deliberate).
+So a positive test written as
+
+    return acquired * 10 + released;    // observes released BEFORE the last defer
+
+reports an imbalance that does not exist, and reads exactly like a real lost-cleanup bug.
+Measured 2026-08-26: `defer` under a backward `goto` looked broken (3 acquires, 2
+releases) and was correct — the third release runs after the return value is computed.
+Put the deferred region in a HELPER function and check the counters in the caller, after
+the scope has fully exited. `tests/zer/` positives that check a defer balance must use
+that shape.
+
+Related and worth knowing while reading emitted C: ZER's `defer` is not a stack of
+registrations. It lowers to an ARMED FLAG plus a fire site on each exit path, so a defer
+executed N times in a loop fires ONCE per exit, not N times.
 
 ### A NEGATIVE TEST PROVES NOTHING UNTIL YOU READ THE DIAGNOSTIC — use `// expect-error:`
 

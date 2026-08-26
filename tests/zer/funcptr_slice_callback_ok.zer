@@ -1,0 +1,16 @@
+// BOUNDARY POSITIVE for BUG-863: the SLICE exemption at a funcptr call is
+// deliberate and documented (docs/limitations.md) — handing a local buffer to
+// a read-only callback is the normal idiom. Widening the keep worst-case to
+// the recursive carrier question must NOT take this with it.
+u32 sum([*]u8 b) {
+    u32 t = 0;
+    for (u32 i = 0; i < b.len; i += 1) { t += (u32)b[i]; }
+    return t;
+}
+u32 main() {
+    u8[4] arr;
+    arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4;
+    *([*]u8) -> u32 fp = sum;
+    if (fp(arr[0..]) != 10) { return 1; }
+    return 0;
+}

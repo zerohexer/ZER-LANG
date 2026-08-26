@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-863: the funcptr-call keep worst-case tested the BARE param kind, so a
+// `?*T` param slipped it and a stack pointer reached a retaining callback.
+// Confirmed by ASan as stack-use-after-return. The DIRECT call of the same
+// function was already rejected.
+?*u32 g_sink;
+void retain(?*u32 p) { g_sink = p; }
+u32 main() {
+    u32 local = 5;
+    *(?*u32) fp = retain;
+    fp(&local);
+    return 0;
+}

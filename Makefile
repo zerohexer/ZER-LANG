@@ -222,6 +222,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
+	@echo "=== Reference-example audit (documented syntax must still parse) ==="
+	@bash tools/audit_reference_examples.sh
 
 # Stage 3 standalone target — run just the fixed-buffer linter.
 check-fixed-buffers:
@@ -235,6 +237,12 @@ check-walker-fields:
 
 check-sink-matrix: zerc
 	@bash tools/sink_matrix.sh ./zerc
+
+# Standalone — every ```zer block in docs/reference.md must still parse.
+# Documentation examples are written, not run, so they rot silently and then
+# teach the wrong thing; this is the gate that notices.
+check-reference-examples: zerc
+	@bash tools/audit_reference_examples.sh
 
 # ---- LSP server ----
 zer-lsp: zer_lsp.c $(LIB_SRCS)

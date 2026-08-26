@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: ZER has no implicit sign conversion
+void worker(u32 v) { }
+u32 main() { spawn worker(-1); return 0; }

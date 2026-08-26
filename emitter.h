@@ -118,6 +118,22 @@ typedef struct {
      * to _zer_trap instead of emitting an early `return`. */
     int noreturn_scope_depth;
 
+    /* BUG-866: stamped-container structs already written to THIS output file.
+     *
+     * `emit_container_structs` is called once per module pass and iterates the
+     * checker's WHOLE `container_instances[]` list, which is shared by every
+     * module. With one import and one stamp, `struct Box_Item` was therefore
+     * emitted twice into one .c and GCC answered "redefinition of 'struct
+     * Box_Item'" with no ZER diagnostic — i.e. a container used across a module
+     * boundary did not compile at all.
+     *
+     * Persisted on the Emitter (not a file-static) because the LSP creates a
+     * fresh Emitter per compilation and a static would leak state between them.
+     * Deduping alone is the whole fix: it removes the SECOND emission and leaves
+     * the first exactly where it is today, so no working ordering changes. */
+    char *container_emitted;
+    int container_emitted_cap;
+
 } Emitter;
 
 /* ---- API ---- */

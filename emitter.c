@@ -4275,11 +4275,22 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
 static void emit_container_structs(Emitter *e) {
     if (!e->checker || e->checker->container_inst_count == 0) return;
     int n = e->checker->container_inst_count;
-    char *emitted = (char *)calloc((size_t)n, 1);
+    /* BUG-866: the `emitted` set must survive ACROSS module passes — see the
+     * field comment in emitter.h. It was a per-call calloc, so every module
+     * pass re-emitted every stamp and a container used across a module boundary
+     * produced "redefinition of 'struct Box_Item'" from GCC. */
+    if (e->container_emitted_cap < n) {
+        char *grown = (char *)realloc(e->container_emitted, (size_t)n);
+        if (!grown) return;
+        memset(grown + e->container_emitted_cap, 0,
+               (size_t)(n - e->container_emitted_cap));
+        e->container_emitted = grown;
+        e->container_emitted_cap = n;
+    }
     char *inprog = (char *)calloc((size_t)n, 1);
-    if (!emitted || !inprog) { free(emitted); free(inprog); return; }
-    for (int ci = 0; ci < n; ci++) emit_one_container_struct(e, ci, emitted, inprog);
-    free(emitted);
+    if (!inprog) return;
+    for (int ci = 0; ci < n; ci++)
+        emit_one_container_struct(e, ci, e->container_emitted, inprog);
     free(inprog);
 }
 
@@ -5025,6 +5036,30 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
 
 static void emit_type(Emitter *e, Type *t); /* forward decl */
 
+/* BUG-865: emit a spawn target's C name, module-mangled.
+ *
+ * The five sites below spelled `sn->spawn_stmt.func_name` RAW. For an imported
+ * target that name does not exist in the emitted C: the definition is
+ * `spawn_mod__tick` and the wrapper called `tick()`, so `spawn <imported fn>()`
+ * emitted a program that CANNOT LINK — `ld returned 1 exit status`, no source
+ * line, no ZER diagnostic (the checker accepts it and the data-race scan even
+ * resolves the imported body, which is what makes it look supported). Every
+ * other identifier position already mangles via the NODE_IDENT path; this is
+ * that same resolution, in one function so a sixth site cannot drift.
+ *
+ * The symbol's OWN module_prefix is the authority — not e->current_module,
+ * which is the module being emitted, not the module the target lives in. */
+static void emit_spawn_target_name(Emitter *e, Node *sn) {
+    const char *nm = sn->spawn_stmt.func_name;
+    int nlen = (int)sn->spawn_stmt.func_name_len;
+    Symbol *fs = scope_lookup(e->checker->global_scope, nm, (uint32_t)nlen);
+    if (fs && fs->module_prefix && fs->module_prefix_len > 0) {
+        emit(e, "%.*s__%.*s", (int)fs->module_prefix_len, fs->module_prefix, nlen, nm);
+        return;
+    }
+    emit(e, "%.*s", nlen, nm);
+}
+
 static void emit_spawn_wrappers(Emitter *e) {
     if (e->spawn_wrapper_count == 0) return;
 
@@ -5039,7 +5074,7 @@ static void emit_spawn_wrappers(Emitter *e) {
             /* Emit return type + name + params */
             Type *ft = fsym->type;
             emit_type(e, ft->func_ptr.ret);
-            emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, " "); emit_spawn_target_name(e, sn); emit(e, "(");
             for (uint32_t pi = 0; pi < ft->func_ptr.param_count; pi++) {
                 if (pi > 0) emit(e, ", ");
                 emit_type(e, ft->func_ptr.params[pi]);
@@ -5052,7 +5087,7 @@ static void emit_spawn_wrappers(Emitter *e) {
                 Type *ret = checker_get_type(e->checker, fn);
                 if (ret && ret->kind == TYPE_FUNC_PTR) {
                     emit_type(e, ret->func_ptr.ret);
-                    emit(e, " %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    emit(e, " "); emit_spawn_target_name(e, sn); emit(e, "(");
                     for (uint32_t pi = 0; pi < ret->func_ptr.param_count; pi++) {
                         if (pi > 0) emit(e, ", ");
                         emit_type(e, ret->func_ptr.params[pi]);
@@ -5060,8 +5095,8 @@ static void emit_spawn_wrappers(Emitter *e) {
                     emit(e, ");\n");
                 } else {
                     /* Fallback: just emit void func_name(); */
-                    emit(e, "void %.*s();\n",
-                         (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+                    emit(e, "void "); emit_spawn_target_name(e, sn); emit(e, "();\n");
+
                 }
             }
         }
@@ -5119,7 +5154,7 @@ static void emit_spawn_wrappers(Emitter *e) {
         emit(e, "static void *_zer_spawn_wrap_%d(void *_raw) {\n", sid);
         if (ac > 0) {
             emit(e, "    struct _zer_spawn_args_%d *_a = (struct _zer_spawn_args_%d *)_raw;\n", sid, sid);
-            emit(e, "    %.*s(", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, "    "); emit_spawn_target_name(e, sn); emit(e, "(");
             for (int i = 0; i < ac; i++) {
                 if (i > 0) emit(e, ", ");
                 emit(e, "_a->a%d", i);
@@ -5127,7 +5162,7 @@ static void emit_spawn_wrappers(Emitter *e) {
             emit(e, ");\n");
             emit(e, "    free(_a);\n");
         } else {
-            emit(e, "    %.*s();\n", (int)sn->spawn_stmt.func_name_len, sn->spawn_stmt.func_name);
+            emit(e, "    "); emit_spawn_target_name(e, sn); emit(e, "();\n");
         }
         emit(e, "    return NULL;\n");
         emit(e, "}\n");

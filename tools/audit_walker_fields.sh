@@ -234,10 +234,30 @@ for f in "${FILES[@]}"; do
             delete armkinds
             narm = 0
             bodybuf = ""
+            bodycode = ""
+            incomment = 0
             infunc = 1
         }
         if (infunc) {
             bodybuf = bodybuf "\n" $0
+            # MEMBERSHIP MUST NOT DEPEND ON PROSE. The recursion test below
+            # counted the function NAME anywhere in the body text — comments and
+            # string literals included — so EDITING A COMMENT could move a
+            # walker in or out of the audited set, and did: deleting a comment
+            # that happened to name `register_decl` dropped it out and turned
+            # all 45 of its baseline rows stale in one unrelated commit.
+            # `bodycode` is the same body with line comments and block comments
+            # removed, and the count below requires an actual CALL (`name(`).
+            cl = $0
+            sub(/\/\/.*$/, "", cl)
+            while (match(cl, /\/\*[^*]*\*+([^\/*][^*]*\*+)*\//))
+                cl = substr(cl, 1, RSTART - 1) " " substr(cl, RSTART + RLENGTH)
+            if (incomment) {
+                if (match(cl, /\*\//)) { cl = substr(cl, RSTART + RLENGTH); incomment = 0 }
+                else cl = ""
+            }
+            if (match(cl, /\/\*/)) { cl = substr(cl, 1, RSTART - 1); incomment = 1 }
+            bodycode = bodycode "\n" cl
             # collect case labels; a run of consecutive labels shares one arm
             l = $0
             if (l ~ /case[ \t]+NODE_[A-Z_0-9]+[ \t]*:/) {
@@ -258,7 +278,10 @@ for f in "${FILES[@]}"; do
         }
         if (infunc && depth == 0) {
             # leaving the function — only report RECURSIVE walkers
-            calls = split(bodybuf, _cparts, fname) - 1
+            # awk splits on a REGEX when the separator is longer than one
+            # character, so "(" must be escaped or the count silently
+            # collapses (measured: every walker dropped out at once).
+            calls = split(bodycode, _cparts, fname "[ \t]*\\(") - 1
             if (calls >= 2 && narm > 0) {
                 for (a = 1; a <= narm; a++) {
                     nk = split(armkinds[a], ks, " ")
@@ -276,7 +299,7 @@ for f in "${FILES[@]}"; do
                     }
                 }
             }
-            infunc = 0; narm = 0; inlabels = 0; bodybuf = ""
+            infunc = 0; narm = 0; inlabels = 0; bodybuf = ""; bodycode = ""; incomment = 0
         }
     }
     ' "$f" >> "$REPORT"

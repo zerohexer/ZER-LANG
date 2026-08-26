@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: ZER has no implicit sign conversion
+u32 take(u32 v) { return v; }
+u32 main() { return take(-1); }

@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot target the enum
+enum State { idle, running, done }
+u32 main() {
+    State s = @saturate(State, 7);
+    switch (s) { .idle => { return 1; } .running => { return 2; } .done => { return 3; } }
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: CALLED but never assigned
+// BUG-864: the LOCAL declaration site rejects an uninitialised funcptr; the
+// GLOBAL site had no such arm, so this was accepted and `g_cb(5)` jumped
+// through NULL. On bare metal address 0 is routinely mapped, so the jump
+// SUCCEEDS into whatever lives there — silent at compile time and at run time.
+//
+// The rule deliberately is NOT "a global funcptr needs an initializer": that
+// was measured and BACKED OUT because it rejects the callback-registry idiom
+// (see tests/zer/funcptr_global_registry_ok.zer). Only "called and never
+// assigned anywhere in the file" is unambiguous.
+*(u32) -> u32 g_cb;
+u32 main() { return g_cb(5); }

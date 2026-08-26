@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: must be a fixed array
+// BUG-859: @cstr's destination gate was a stack of NEGATIVE tests, so an
+// INTEGER destination matched none of them and was accepted by default —
+// `memcpy(gi, ...)` on a u32. That is an integer-to-pointer conversion the
+// language says cannot be spelled without @inttoptr + an mmio range.
+u32 main() {
+    u8[16] buf;
+    u32 gi = 4096;
+    @cstr(gi, buf[0..]);
+    return 0;
+}

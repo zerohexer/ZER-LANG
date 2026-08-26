@@ -1,0 +1,14 @@
+// BUG-865: the spawn wrapper spelled the target's name RAW, so an IMPORTED
+// target emitted a call to `tick()` while the definition is
+// `spawnimp_mod__tick` — the program could not LINK, with no source line and
+// no ZER diagnostic. Nothing in the suite spawned an imported function, which
+// is why it survived: shared_user spawns a LOCAL worker.
+threadlocal u32 counter;
+
+void tick() {
+    counter = counter + 1;
+}
+
+void tick_by(u32 n) {
+    counter = counter + n;
+}

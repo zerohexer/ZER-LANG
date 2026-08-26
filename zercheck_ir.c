@@ -1608,7 +1608,8 @@ static bool ir_name_looks_like_destructor(const char *name, uint32_t len) {
 }
 
 /* Check if a call is to a function that frees its first argument.
- * Either explicitly named "free" OR bodyless void fn with *opaque/*T first
+ * Either explicitly named "free" OR bodyless void fn with an opaque or
+ * typed pointer as its first
  * param (signature heuristic — catches destroy/close/cleanup patterns)
  * OR bodyless non-void fn whose name matches a destructor convention
  * (Gap 17 / AUDIT 2026-06-06 GAP-D — catches `i32 destroy_resource(*R)`). */
@@ -1620,7 +1621,7 @@ static bool ir_is_extern_free_call(ZerCheck *zc, Node *call) {
     /* Explicit "free" */
     if (callee->ident.name_len == 4 &&
         memcmp(callee->ident.name, "free", 4) == 0) return true;
-    /* Signature heuristic: bodyless fn(*opaque/*T ...).
+    /* Signature heuristic: a bodyless fn taking an opaque or typed pointer.
      * Void return: always free-classified.
      * Non-void return: free-classified only if name looks like a destructor. */
     Symbol *sym = scope_lookup(zc->checker->global_scope,
@@ -1795,12 +1796,6 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
-/* Backward-compat wrapper for callsites that don't have Checker handy.
- * Without checker, receiver-type validation is skipped (current behavior).
- * Prefer ir_classify_method_call_ex(c, call) at new callsites. */
-static IRMethodKind ir_classify_method_call(Node *call) {
-    return ir_classify_method_call_ex(NULL, call);
-}
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
@@ -6559,7 +6554,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         func->ast_node->kind == NODE_FUNC_DECL) {
         fprintf(stderr, "ZCIR: building=%d fn='%.*s' pc=%d blocks=%d sumcount=%d\n",
             zc->building_summary,
-            func->ast_node->func_decl.name_len,
+            /* `%.*s` takes an INT precision; name_len is size_t. On any ABI where
+             * they differ in varargs this reads the wrong width and prints
+             * garbage — in a diagnostic, which is the worst place for it. */
+            (int)func->ast_node->func_decl.name_len,
             func->ast_node->func_decl.name ? func->ast_node->func_decl.name : "?",
             func->ast_node->func_decl.param_count, func->block_count,
             zc->summary_count);

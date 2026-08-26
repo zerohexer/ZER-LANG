@@ -11,8 +11,8 @@
 #include "src/safety/container_rules.h"    /* ZER_DP_* / ZER_HE_* / ZER_TCAT_* constants */
 #include "src/safety/variant_rules.h"      /* ZER_URM_* — union read mode P01/P02 */
 #include "src/safety/stack_rules.h"        /* zer_stack_frame_valid — S01/S02 */
-#include "src/safety/comptime_rules.h"     /* zer_comptime_*/_static_assert/_expr_nesting — R */
-#include "src/safety/cast_rules.h"         /* zer_conversion_safe/_bitcast_*/_saturate/_ptrtoint — J-ext */
+#include "src/safety/comptime_rules.h"     /* zer_comptime_ static_assert / expr_nesting — R */
+#include "src/safety/cast_rules.h"         /* zer_conversion_safe / bitcast / saturate / ptrtoint — J-ext */
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include "src/safety/asm_instruction_table.h" /* zer_asm_instruction_info — F4 per-instruction safety dispatch */
@@ -362,8 +362,10 @@ static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) 
     case NODE_FOR: GI(n->for_stmt.init); GI(n->for_stmt.cond); GI(n->for_stmt.step);
         GI(n->for_stmt.body); break;
     case NODE_WHILE: case NODE_DO_WHILE: GI(n->while_stmt.cond); GI(n->while_stmt.body); break;
-    case NODE_SWITCH: GI(n->switch_stmt.expr);
-        for (int i=0;i<n->switch_stmt.arm_count;i++) GI(n->switch_stmt.arms[i].body); break;
+    case NODE_SWITCH:
+        GI(n->switch_stmt.expr);
+        for (int i=0;i<n->switch_stmt.arm_count;i++) GI(n->switch_stmt.arms[i].body);
+        break;
     case NODE_GLOBAL_VAR: case NODE_VAR_DECL: GI(n->var_decl.init); break;
     case NODE_RETURN: GI(n->ret.expr); break;
     case NODE_DEFER: GI(n->defer.body); break;
@@ -436,54 +438,6 @@ static bool is_null_sentinel_ck(Type *inner) {
     return k == TYPE_POINTER || k == TYPE_FUNC_PTR;
 }
 
-/* Does this type CARRY an enum at any nesting depth?
- *
- * BUG-864. A ZER enum is a CLOSED set, and the exhaustive-switch theorem rests
- * on that: `switch (s)` over every variant needs no `default`, and the emitter
- * enters the final arm unconditionally because it is the only one left. So a
- * value outside the variant set does not fault — it silently runs the LAST arm.
- *
- *     enum State { idle, running, done }
- *     u32 x = 7;  State s = @bitcast(State, x);   // forged
- *     switch (s) { .idle => …  .running => …  .done => { return 12; } }  // taken
- *
- * The bit-reinterpreting conversions therefore may not MANUFACTURE an enum from
- * a non-enum. Enum -> enum and enum -> integer are fine (the closed set is being
- * read, not created); `@cast` between distinct wrappers of the same enum is also
- * fine because it never changes the value.
- *
- * CARRIER axis (the reason this is a `carries` predicate and not a bare
- * `kind == TYPE_ENUM` test): gating on "is the TARGET an enum?" lets a struct
- * WRAPPER straight through — `@bitcast(Box, 7)` where `struct Box { State s; }`
- * forges `Box.s` just as effectively. Same wrapper-hides-the-inner-kind family
- * as the pointer and handle carriers above, so it recurses optional / array /
- * struct / union and unwraps distinct. */
-static bool type_carries_enum(Type *t, int depth) {
-    if (!t || depth > 32) return false;
-    TypeKind k = type_dispatch_kind(t);
-    Type *u = type_unwrap_distinct(t);
-    if (!u) return false;
-    if (k == TYPE_ENUM) return true;
-    if (k == TYPE_OPTIONAL)
-        return type_carries_enum(u->optional.inner, depth + 1);
-    if (k == TYPE_ARRAY)
-        return type_carries_enum(u->array.inner, depth + 1);
-    if (k == TYPE_STRUCT) {
-        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
-            if (type_carries_enum(u->struct_type.fields[i].type, depth + 1))
-                return true;
-        }
-        return false;
-    }
-    if (k == TYPE_UNION) {
-        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
-            if (type_carries_enum(u->union_type.variants[i].type, depth + 1))
-                return true;
-        }
-        return false;
-    }
-    return false;
-}
 
 /* Does this type CARRY a pointer/slice/opaque whose pointee is NOT a shared
  * struct? That is the exact hazard the bare fire-and-forget spawn rule tests
@@ -944,7 +898,7 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
 
 /* Try to derive a bounded range from an expression.
  * x % N → [0, N-1], x & MASK → [0, MASK] (for constant N/MASK > 0).
- * Returns true and sets *out_min/*out_max if a bounded range was derived. */
+ * Returns true and sets out_min / out_max if a bounded range was derived. */
 /* Refactor 1: unified VRP range invalidation for assignments.
  * Handles both simple ident keys and compound keys (s.x).
  * For TOK_EQ: tries literal, derive_expr_range, call return range.
@@ -2229,7 +2183,8 @@ static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
 }
 
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
- * through &/* /field/index/slice/orelse/intrinsic/cast. If the root traces to a
+ * through address-of, deref, field, index, slice, orelse, intrinsic and cast.
+ * If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
  * callee position makes the caller param escape too). Else -1. */
 static int keep_arg_caller_root(Checker *c, Node *arg) {
@@ -10228,7 +10183,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * to a wrong line.
                  *
                  * Two parse paths:
-                 *  (a) type keyword (u32/*T/etc.) → type_arg set, args carry values
+                 *  (a) type keyword (u32, `*T`, etc.) → type_arg set, args carry values
                  *  (b) named type as TOK_IDENT for intrinsics NOT in force_type_arg
                  *      (currently only @size) → type_arg NULL, args[0] is the type ident
                  *      (see parser.c:931-936 + BUG-316 path). The checker dispatch at
@@ -11367,6 +11322,18 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = type_optional(c->arena, ty_u64);
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
+            /* BUG-882: `@trap(1, 2, 3)` was accepted and the arguments SILENTLY
+             * DROPPED — the emitter calls `_zer_trap("trap", …)` with a fixed
+             * message. Same shape as BUG-871's `@barrier(x)`: an intrinsic that
+             * takes nothing accepting anything makes a typo look purposeful, and
+             * here the reader's reasonable belief is that the arguments end up
+             * in the trap message. Its immediate neighbour @unreachable has had
+             * this check all along. Found by sweeping every intrinsic with an
+             * absurd argument count; these two were the only ones. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line,
+                    "@trap takes no arguments — the trap message is fixed");
+            }
             result = ty_void;
         } else if (nlen == 11 && memcmp(name, "unreachable", 11) == 0) {
             /* D-Alpha-2: @unreachable() — GCC's __builtin_unreachable hint */
@@ -13788,7 +13755,7 @@ static void check_stmt(Checker *c, Node *node) {
             /* Walk parent scope chain to check if name matches a param */
             Symbol *existing = scope_lookup(c->current_scope,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len);
-            if (existing && existing->line != node->loc.line) {
+            if (existing && existing->line != (uint32_t)node->loc.line) {
                 checker_error(c, node->loc.line,
                     "variable '%.*s' shadows function parameter in async function — "
                     "async locals share state struct with params, shadowing overwrites param value. "
@@ -20948,7 +20915,7 @@ static Type *find_return_provenance(Checker *c, Node *node) {
 }
 
 /* Scan a function body for return expressions with derivable range.
- * If ALL return expressions have the same derivable range, set *out_min/*out_max. */
+ * If ALL return expressions have the same derivable range, set out_min / out_max. */
 /* Union in the return ranges of any orelse-block fallback BURIED inside an
  * expression: `u32 v = (mb() orelse {return 9;}) + b;`, `id(mb() orelse
  * {return 9;})`, or `return (mb() orelse {return 9;}) & 3;`. The original B9
@@ -21976,7 +21943,10 @@ bool checker_check(Checker *c, Node *file_node) {
      * rest of this harvest, one level up: call the list, do not restate it. */
     checker_post_passes(c, file_node);
 
-    return c->error_count == 0;
+    /* `ok` folded in rather than discarded: today it can only be false when
+     * file_node is not a NODE_FILE (already guarded above), but dropping a
+     * status a callee bothered to compute is how a signal goes missing later. */
+    return ok && c->error_count == 0;
 }
 
 /* ---- Per-function shared type cache for deadlock detection (BUG-474 proper fix) ----
@@ -22791,8 +22761,10 @@ static void zbi_scan_children(Checker *c, ZerInitSet *st, Node *n, int depth) {
     case NODE_IF: Z(n->if_stmt.cond); Z(n->if_stmt.then_body); Z(n->if_stmt.else_body); break;
     case NODE_FOR: Z(n->for_stmt.init); Z(n->for_stmt.cond); Z(n->for_stmt.step); Z(n->for_stmt.body); break;
     case NODE_WHILE: case NODE_DO_WHILE: Z(n->while_stmt.cond); Z(n->while_stmt.body); break;
-    case NODE_SWITCH: Z(n->switch_stmt.expr);
-        for (int i=0;i<n->switch_stmt.arm_count;i++) Z(n->switch_stmt.arms[i].body); break;
+    case NODE_SWITCH:
+        Z(n->switch_stmt.expr);
+        for (int i=0;i<n->switch_stmt.arm_count;i++) Z(n->switch_stmt.arms[i].body);
+        break;
     case NODE_GLOBAL_VAR: case NODE_VAR_DECL: Z(n->var_decl.init); break;
     case NODE_RETURN: Z(n->ret.expr); break;
     case NODE_DEFER: Z(n->defer.body); break;
@@ -22805,8 +22777,10 @@ static void zbi_scan_children(Checker *c, ZerInitSet *st, Node *n, int depth) {
     case NODE_ASSIGN: Z(n->assign.target); Z(n->assign.value); break;
     case NODE_BINARY: Z(n->binary.left); Z(n->binary.right); break;
     case NODE_UNARY: Z(n->unary.operand); break;
-    case NODE_CALL: Z(n->call.callee);
-        for (int i=0;i<n->call.arg_count;i++) Z(n->call.args[i]); break;
+    case NODE_CALL:
+        Z(n->call.callee);
+        for (int i=0;i<n->call.arg_count;i++) Z(n->call.args[i]);
+        break;
     case NODE_FIELD: Z(n->field.object); break;
     case NODE_INDEX: Z(n->index_expr.object); Z(n->index_expr.index); break;
     case NODE_SLICE: Z(n->slice.object); Z(n->slice.start); Z(n->slice.end); break;
@@ -22814,7 +22788,8 @@ static void zbi_scan_children(Checker *c, ZerInitSet *st, Node *n, int depth) {
     case NODE_INTRINSIC: for (int i=0;i<n->intrinsic.arg_count;i++) Z(n->intrinsic.args[i]); break;
     case NODE_TYPECAST: Z(n->typecast.expr); break;
     case NODE_STRUCT_INIT:
-        for (int i=0;i<n->struct_init.field_count;i++) Z(n->struct_init.fields[i].value); break;
+        for (int i=0;i<n->struct_init.field_count;i++) Z(n->struct_init.fields[i].value);
+        break;
     /* exhaustive (no default:) — genuine leaves */
     case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
     case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO:

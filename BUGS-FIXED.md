@@ -5,6 +5,93 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26e — BUG-902/903 + tooling: an indeterminate return, an arity gap, and a deny-list retired
+
+Adopted from `claude/vigilant-tesla-as71kk` (`1cb1f93e`, `15b4fe49`, `38c27c18`,
+`0ff11690`, `d2cd8394`). This closes harvest tracker 3 completely.
+
+### BUG-902 — `lower_expr` could fall off the end of an int-returning function
+Its switch is exhaustive with no `default:` — deliberately, because that is what makes
+`-Werror=switch` catch a new NodeKind. But C does not guarantee an enum-typed value is one
+of the enumerators, so control can reach the end on a corrupted node and **the return value
+is INDETERMINATE**. Callers use that value as a LOCAL ID and index `func->locals[]` with
+it. Now returns `-1`, the defined "no value" answer every caller already handles.
+
+GCC had been reporting this the whole time (`ir_lower.c:939: control reaches end of
+non-void function`). It was invisible among 27 other warnings — which is the entire
+argument for the rest of the change.
+
+### Build warnings 28 -> 0, and 280 lines of dead code removed
+Measured on main before: 10 `-Wunused-function`, 6 `-Wcomment`, 3 `-Wunused-variable`,
+2 `-Wunused-but-set-variable`, 2 `-Wsign-compare`, 1 `-Wreturn-type`. After: **zero**.
+
+Two more real defects came out of that list: a `%.*s` given a `size_t` precision, and a
+signed/unsigned comparison.
+
+**The four emitter functions matter more than the line count.** `find_shared_root_in_stmt`,
+`shared_needs_condvar` and `stmt_writes_shared` were STALE COPIES of the shared-root walker
+whose live version is `find_shared_root_expr` in `ir_lower.c`, left behind by BUG-817.
+*A dead copy of a SAFETY walker is worse than ordinary dead code* — it is a trap for a
+future session, which edits the copy, sees no effect, and concludes the analysis is broken.
+Also removed: `collect_async_locals`, `classify_builtin_call`, the deprecated non-`_ex`
+`ir_classify_method_call` wrapper CLAUDE.md says to retire as you go, three unused parser
+helpers, and `type_carries_enum` (unused once BUG-891 was done by tracking, not banning).
+
+### BUG-903 — `@trap(1, 2, 3)` accepted, arguments silently dropped
+The emitter calls `_zer_trap("trap", …)` with a fixed message. Same shape as BUG-871's
+`@barrier(x)`: an intrinsic that takes nothing accepting anything makes a typo look
+purposeful, and here the reader's reasonable belief is that the arguments end up in the
+trap message. Its immediate neighbour `@unreachable` has had this check all along. Found by
+sweeping every intrinsic with an absurd argument count; these two were the only ones.
+
+### The .gitignore: a 16-entry deny-list replaced by a structural rule
+Every runner in this repo compiles `<name>.zer` to an extension-less `<name>` beside it, so
+under a test tree **"has no extension" IS the definition of a build artifact**. The
+.gitignore had been carrying a hand-maintained list of individual binary NAMES — 16 entries
+against **1084** tracked artifacts, needing an edit per new test and silently missing
+everything nobody got round to adding. That is the same deny-list shape this project keeps
+replacing with rules (cf. BUG-889's `@cstr` allow-list, one commit earlier).
+
+Verified exhaustively before removing anything: **all 1084 candidates are ELF, no
+exceptions**; all 558 `tests/zer` and 786 `rust_tests` `.zer` sources remain tracked;
+`rust_tests/qemu` is preserved by an explicit subdirectory negation; and `git status` shows
+**zero** untracked files afterwards, which is what proves the rule actually covers what it
+untracked.
+
+### The rc_cond_004 flake — and an honest note on reproduction
+The branch measured it failing 1 run in 8. **It did not reproduce here: 16/16 passed on a
+pre-fix build.** Races are machine- and load-dependent, so that neither confirms nor
+refutes the measurement — but the ANALYSIS is sound by construction and stands on its own:
+
+```
+q.items[q.tail] = val;
+q.tail = (q.tail + 1) % 8;
+```
+
+ZER's auto-locking is PER-STATEMENT, so those are two separate lock scopes. Three spawned
+threads can all read `q.tail == 0`, all write `items[0]`, and all then advance the tail —
+one value lost, `sum != 60`. The function body is not atomic just because every statement
+in it is. The test's SUBJECT is `@cond_wait` re-checking its predicate, not slot
+allocation, so each caller now gets its own index. `q.count += 1` is left alone
+deliberately: a compound assignment is ONE statement, hence one lock scope, hence genuinely
+atomic — worth keeping in the file as the contrast. 8/8 stable after.
+
+*A test that asserts a value depending on a race is the same family as a vacuous test: it
+reports something other than what it claims to.*
+
+### Two UB sweeps — MEASUREMENT SCRIPTS, not gates
+`tools/ubsan_sweep.sh` (sanitizer-based) and `tools/ub_sweep.sh` (differential -O0 vs -O2)
+measure the "no undefined behaviour" claim, which neither harness can check: a positive
+asserts exit 0, a negative asserts a diagnostic, and UB produces neither. Like the two
+closure probes, **they are not wired into `make check`** — see the standing note in
+docs/limitations.md.
+
+The calibration is the durable part: `float-cast-overflow` is NOT in GCC's
+`-fsanitize=undefined` and must be named explicitly — found by breaking the BUG-845 guard
+and watching the sweep report CLEAN on the exact class it exists to find.
+
+---
+
 ## Session 2026-08-26d — BUG-897..901: five idioms ZER documented and refused
 
 Adopted from `claude/vigilant-tesla-as71kk` (`0a0ec95e`, `e937a1d8`, `0828d1f7`). All

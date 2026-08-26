@@ -13,7 +13,7 @@ the corrections I made to my OWN earlier work so they are not repeated.
 
 ## Where main stands
 
-`make check` exit 0 — **1375 .zer**, 200 fuzz, 139 convert, all ten matrices, all EIGHT
+`make check` exit 0 — **1376 .zer**, 200 fuzz, 139 convert, all ten matrices, all EIGHT
 audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **88 cells / 0 mismatch**.
 
 Landed this session, newest first:
@@ -52,13 +52,13 @@ contains everything left below, with better implementations than the catalog ent
 | ~~`ccdd49ee`~~ TAKEN | **A2** @cstr, **A3** sign/`value_flows_to`, **A4** enum siblings (861 = already on main) | checker.c emitter.c | ONE conflict in checker.c, resolved to HEAD (purely additive on both sides). Its 861 `memset` had to be DELETED — main's BUG-858 already emits it, so the merge doubled it in both allocators. It also carried SEVEN tracked ELF binaries; dropped. |
 | ~~`dda5b33b`~~ TAKEN | **A5** `?T` compare, **A6** non-null drift, **A7** inline-array free | checker.c test_emit.c | ONE conflict in checker.c, resolved to HEAD. It is what finally USES `nonnull_zero_hole` / `is_null_sentinel_ck`, which had arrived dead with `a22de320`. |
 | ~~`6af2497e`~~ TAKEN | **A8** indirect-call keep carrier | checker.c | none |
-| `1cb1f93e` | **A14** `lower_expr`, dead code, warnings 32 -> 0 | many | medium |
+| ~~`1cb1f93e`~~ TAKEN | **A14** `lower_expr`, dead code, warnings 32 -> 0 | many | NONE. Measured on main: 28 warnings before, 0 after. |
 | ~~`a1919aa5`~~ TAKEN | **A9** six intrinsics storing through const | checker.c | none |
 | ~~`0a0ec95e`~~ TAKEN | **A15** short-circuit, **A16** const slice, **A17** const array size | checker.c checker.h | none. Also fixes `audit_walker_fields.sh` membership (prose -> structural), baseline 758 -> 684. |
 | ~~`e937a1d8`~~ TAKEN | **A18** funcptr arrays | checker.c emitter.c parser.c parser.h | none. Brings `audit_reference_examples.sh` and WIRES it into `make check` — verified non-vacuous (RED on the pre-fix compiler). |
 | ~~`0828d1f7`~~ TAKEN | **A19** bit extraction through a pointer | checker.c | none |
-| `15b4fe49` | **A13** `@trap` arity + `ubsan_sweep.sh` | checker.c | small |
-| `38c27c18` `0ff11690` `d2cd8394` | tooling: `ub_sweep.sh`, the rc_cond_004 flake, structural `.gitignore` | — | none |
+| ~~`15b4fe49`~~ TAKEN | **A13** `@trap` arity + `ubsan_sweep.sh` | checker.c | none |
+| ~~`38c27c18` `0ff11690` `d2cd8394`~~ TAKEN | tooling: `ub_sweep.sh`, the rc_cond_004 flake, structural `.gitignore` | — | `d2cd8394` conflicts modify/delete on the binaries it exists to remove; resolved by deleting. The flake did NOT reproduce here (16/16 on a pre-fix build) — the race is real by construction, not by measurement on this box. |
 
 Recipe that worked twice today:
 
@@ -134,7 +134,7 @@ established by READING the emitted C (the pointer's value goes to an `"r"` asm o
 with a `"memory"` clobber, never a dereference), with the discriminating question written
 down for the next reader. The CONST half is not baselined — those six became BUG-896.
 
-## Recommended order for the remaining 3
+## Recommended order — NOTHING REMAINS (kept as the record of what was done)
 
 1. ~~**A3**, **A2**, **A4**~~ — DONE 2026-08-26 (BUG-889..891, `ccdd49ee`). `value_flows_to`
    is in; the eight negative-constant sinks each have their own test, which is the only way
@@ -143,9 +143,14 @@ down for the next reader. The CONST half is not baselined — those six became B
    `dda5b33b` / `6af2497e` / `a1919aa5`). **Every accept-unsafe row in tracker 3 is closed.**
 3. ~~**A15..A19**~~ — ALL DONE 2026-08-26 (BUG-897..901, `0a0ec95e` / `e937a1d8` /
    `0828d1f7`, no conflicts). A15 was my mis-closed row.
-4. **A13, A14** — arity and the indeterminate return.
-5. Tooling: `ubsan_sweep.sh`, `ub_sweep.sh`, the walker-field membership fix, the
-   structural `.gitignore`, the rc_cond_004 flake.
+4. ~~**A13**, **A14**~~ — DONE 2026-08-26 (BUG-902/903, `15b4fe49` / `1cb1f93e`).
+5. ~~Tooling~~ — ALL DONE 2026-08-26. `ubsan_sweep.sh` + `ub_sweep.sh` (measurement
+   scripts, see the note above); the walker-field membership fix (758 -> 684, rode with
+   BUG-897); the structural `.gitignore` (1084 binaries untracked, all verified ELF); the
+   rc_cond_004 flake.
+
+**HARVEST TRACKER 3 IS CLOSED — all 20 rows.** `as71kk` is fully consumed; nothing
+remains to cherry-pick from it.
 
 Still parked, deliberately, with reasons recorded in their own entries below: the comptime
 array-element width, the extern `*opaque` type_id (both candidate fixes risk an
@@ -275,8 +280,8 @@ My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
 | ~~A10~~ **DONE (BUG-869)** | **Global-init guards were TOP-LEVEL kind tests** | 869 | 3 accepted: `@cpu_model_id() + 1`, `(u32)f()`, `-f()`, `@popcount(f())`. **The exact sibling of my BUG-842** — that split the `arg_count` precondition and left the top-level-kind SHAPE. Now asked at EVERY node by a no-`default:` walk |
 | ~~A11~~ **DONE (BUG-870)** | **`@offset` validated nothing outside one guard** | 870 | 4 accepted; `offsetof(uint32_t, 1)` reached GCC. Also missed a `distinct` of a struct — the distinct-unwrap class this repo has a CI gate for |
 | ~~A12~~ **DONE (BUG-871)** | **The fence family accepted and silently dropped arguments** | 871 | `@barrier(x)` looked like it did something with x. The 0-arg family immediately below had the check all along |
-| A13 | **`@trap(1,2,3)` silently drops its arguments** | 882 | NEW. Found by a companion sweep calling every intrinsic with an absurd arity — the only one left across ~155 |
-| A14 | **`lower_expr` could fall off the end of an int-returning function** | 876 | Callers use the value as a LOCAL ID and index `func->locals[]` with it. Latent, but the return was INDETERMINATE |
+| ~~A13~~ **DONE (BUG-903)** | **`@trap(1,2,3)` silently drops its arguments** | 882 | NEW. Found by a companion sweep calling every intrinsic with an absurd arity — the only one left across ~155 |
+| ~~A14~~ **DONE (BUG-902)** | **`lower_expr` could fall off the end of an int-returning function** | 876 | Callers use the value as a LOCAL ID and index `func->locals[]` with it. Latent, but the return was INDETERMINATE |
 
 ### LIVE — over-rejections
 

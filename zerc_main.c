@@ -249,7 +249,7 @@ int main(int argc, char **argv) {
     bool no_preamble = false;
     bool no_strict_mmio = false;
     bool track_cptrs = false;
-    bool release_mode = false;
+    bool release_mode = false; (void)release_mode;
     const char *gcc_override = NULL;
     bool target_bits_explicit = false;
     uint32_t zer_stack_limit = 0;
@@ -474,8 +474,8 @@ int main(int argc, char **argv) {
     }
 
     /* for temp .c mode, create temp path and set up exe path */
-    char temp_c_path[512];
-    char exe_from_input[512];
+    char temp_c_path[512]; (void)temp_c_path;
+    char exe_from_input[512]; (void)exe_from_input;
     if (use_temp_c) {
         size_t len = strlen(input_path);
         if (len > 4 && strcmp(input_path + len - 4, ".zer") == 0) {

@@ -5,11 +5,30 @@ Entries removed once fixed.
 
 ---
 
-# HANDOFF — read this first (written 2026-08-25, context running low)
+# HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
-Three harvests have been consumed. This section says where the work stands, what was
-DECIDED (so it is not re-litigated), what is LEFT with a cheap recipe for taking it, and
-the corrections I made to my OWN earlier work so they are not repeated.
+**`as71kk` is fully consumed. There is nothing left to cherry-pick from any of the nine
+`vigilant-tesla` branches.** All three harvests are done: 45 rows (tracker 1), 21 (tracker
+2, mostly superseded), 20 (tracker 3). The cherry-pick recipe below is kept because it
+WORKED and the next branch will want it, not because anything is pending.
+
+Landed 2026-08-26, newest first — every one adopted from `as71kk` rather than re-derived:
+
+| sha | rows | what |
+|---|---|---|
+| `015a6bc6` | A13, A14, tooling | indeterminate `lower_expr` return, `@trap` arity, warnings **28 -> 0**, 280 lines of dead code (incl. three STALE COPIES of a safety walker), the structural `.gitignore` (1084 binaries untracked, all verified ELF) |
+| `b1949a25` | A15..A19 | five idioms ZER documented and refused: `&&` narrowing (my mis-closed row), const slice, const array size, funcptr arrays, bit extraction through a pointer. Adds the reference-example gate |
+| `70a041e7` | A8, A9 | indirect-call keep carrier (ASan stack-use-after-return), six intrinsics storing through `const`, and the `grep -qF` harness bug + its two siblings |
+| `5f1cb5ac` | A5, A6, A7 | a NULL `?u32` equal to 0, the drifted non-null rule, `free()` of an inline-array view |
+| `75a76751` | A2, A3, A4 | the `@cstr` integer-to-pointer door, the SIGN half at eight sinks (`value_flows_to`), enum forging via `@truncate` and through carriers |
+
+Earlier: `7c873edd` (view class + container), `c0180e3f` (float saturates), `ae033cd0`,
+and the 45-row harvest 1.
+
+
+This section says what was DECIDED (so it is not re-litigated), the recipe that made the
+adoption cheap, and the corrections I made to my OWN earlier work so they are not
+repeated.
 
 ## Where main stands
 
@@ -41,11 +60,17 @@ overflow WRAPS. Two sub-decisions came with it and are also settled:
   `float_to_int_total` are therefore NOT taken verbatim;
   `tests/zer/float_to_int_saturates.zer` covers the same semantics.
 
-## THE CHEAP PATH: cherry-pick `as71kk`, do not re-derive
+## THE CHEAP PATH: cherry-pick, do not re-derive — this is how tracker 3 was closed
 
-`origin/claude/vigilant-tesla-as71kk` forked at `9f8cda08` (one behind main) and already
-contains everything left below, with better implementations than the catalog entries.
-**It cherry-picks.** Commit -> row -> conflict expectation:
+`origin/claude/vigilant-tesla-as71kk` forked at `9f8cda08` (one behind main) and carried
+better implementations than the catalog entries described. **It cherry-picked.** Every
+commit is now TAKEN; the table is the record of what each cost.
+
+The lesson for the next branch: **read the fork point first.** A branch that forked at or
+near main is auditing the CURRENT compiler and its findings are live; one that forked
+earlier will overlap heavily with whatever landed since, and its BUG numbers will collide.
+Of the nine branches, only `r1piyr` and `as71kk` forked near main, and they produced
+almost everything that survived.
 
 | commit | rows | files | conflicts with main? |
 |---|---|---|---|

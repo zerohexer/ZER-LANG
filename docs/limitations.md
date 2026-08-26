@@ -32,6 +32,112 @@ condition EXPRESSION.
 
 ---
 
+## OPEN — harvest tracker 3: `as71kk` (verified against main 2026-08-25)
+
+**Status: NOT implemented — a catalog.** Forked at `9f8cda08`, one commit behind main,
+so it does NOT contain BUG-857/858. 17 commits, BUG-857..882 (numbering collides with
+main's again — key by branch+sha).
+
+### The headline: this branch SUPERSEDES most of harvest tracker 2
+
+`as71kk` independently found and fixed **H1..H19** — and its implementations are better
+than the catalog entries in three measurable ways, so the recommendation is to take ITS
+versions rather than re-derive them from tracker 2:
+
+- it fixes the call-RESULT view class as **all four parts together** (the reason I backed
+  my partial out),
+- it found ROOT CAUSES where tracker 2 recorded symptoms — the negative-constant rule had
+  "nowhere to live" because the three-condition compatibility chain was written out
+  **eight times**; the fix is one `value_flows_to` query, not eight patches,
+- it records first attempts that were WRONG and why, which is the part a re-derivation
+  loses.
+
+### IT DOES NOT DECIDE THE FLOAT QUESTION
+
+`as71kk` leaves `float -> int` trap-vs-saturate open and says so explicitly: *"the 8
+remaining rejected positives are listed with what each actually needs, including the
+float trap-vs-saturate decision that still needs an owner."* Main's TRAP therefore stands
+until an owner decides. Two independent audits reaching "this needs an owner" is itself
+the signal that it is a semantics choice, not a defect.
+
+### A DEFECT IN WHAT I ALREADY SHIPPED
+
+**My BUG-857 (container cycle) traded the crash for an OVER-REJECTION**, which is exactly
+the first-draft mistake `as71kk` records against its own BUG-868:
+
+```
+container A2(T) { ?*B2(T) x; }
+container B2(T) { A2(T) y; }      // 8 bytes, MUST compile — main REJECTS it
+```
+
+A cycle is infinite only if **every edge around it is by-value**. My stack records the
+stamps; theirs records the stamps AND THE EDGE KIND, answered by a no-`default:` switch
+over `TypeNodeKind` so a new kind fails the build. Their version is a strict improvement
+and should replace mine. (Pre-fix the same program SEGFAULTED, so main is still ahead of
+`9f8cda08` — but it is over-rejecting valid code today.)
+
+My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
+
+### LIVE — accept-unsafe
+
+| # | Fix | as71kk id | Evidence on main |
+|---|---|---|---|
+| A1 | **The call-RESULT view class, ALL FOUR parts** | 857/858/859/860 | 7 negatives accepted; ASan heap-UAF. arg FORM (bare ident test), def LOCALITY (search missed the COPY a named binding lowers to), BLOCK TAG (`is_early_exit` is leak-COVERAGE, misread as a statement about the return value — wrong in BOTH directions), ARITY (the answer is a SET; one slot collapsed it to unknown). `returns_param_mask` + PULL at the use site, because 18 direct FREED stores mean a push design must reach all of them. Gate: sink_matrix p18, 78 -> 88 |
+| A2 | **`@cstr` is an unguarded integer-to-pointer door** | 862 | 3 accepted. Every check was NEGATIVE, so a type matching none was accepted BY DEFAULT. Replaced with an ALLOW-list + arity |
+| A3 | **The SIGN half of "no implicit narrowing or sign conversion" was never enforced** | 863 | 8 accepted. `u32 a = -1;` -> 4294967295, while `u8 b = -1;` was rejected only INCIDENTALLY (−1 types as u32, and u32->u8 is a narrowing mismatch). Root cause: the three-condition chain written out at EIGHT sinks, so there was nowhere to add a condition. One `value_flows_to` query |
+| A4 | **Enum forging reached only some doors** | 864 | `@truncate(State,7)` unchecked; `@bitcast(Box,7)` with a struct carrier walked past. The guard now recurses struct fields, optional payloads and array elements, at BOTH emitter paths. **Extended the TRACKING, not a ban** — an earlier draft banned it and broke `bitcast_enum_variant_ok` |
+| A5 | **`?T` comparison reads the payload without `has_value`** | 865 | 2 accepted, and the worst-behaved of the aggregate family because it yields a WRONG ANSWER, not invalid C: auto-zero makes `.value` 0 when absent, so a NULL `?u32` compares EQUAL to 0 — `if (x == 0)` passes on a value that is not there |
+| A6 | **Non-null auto-zero check: two hand-written copies that DRIFTED** | 866 | The local copy grew a FUNC_PTR arm, the global one never did — so a global `*(u32,u32)->u32 gop;` was accepted and `gop(1,2)` called through address 0. One `nonnull_zero_hole` at both sites. Two test_emit cases relied on the gap; **one WAS the hazard** |
+| A7 | **`free(s.buf[0..4])` frees INLINE STACK storage** | 867 | The peel asked "is the ROOT a local array?" — the root is a STRUCT. Fixed by the honest question (did navigation stay inside the root's own storage), i.e. FORMED-view vs STORED-reference |
+| A8 | **Indirect-call keep worst-case tested the BARE kind** | 875 | 3 accepted: `?*T` param and a by-value struct carrier. ASan stack-use-after-return; the DIRECT call of each was already rejected. Uses the shared `type_carries_data_pointer`. Top-level slice/opaque exemption kept deliberately and measured |
+| A9 | **Six intrinsics STORE through a `const` buffer** | 877 | NEW — not in tracker 2. 12 pointer-taking CPU/cache intrinsics validated "pointer or array?" and nothing about qualifiers; 6 of them STORE (`@nt_store`, `@cpu_fxsave`, `@cpu_xsave`, `@cpu_save_context`, `@cpu_save_fpu`, `@cache_zero_line`). On bare metal that is a write into FLASH that neither faults nor takes effect |
+
+### LIVE — invalid C / silent no-ops
+
+| # | Fix | as71kk id | Evidence |
+|---|---|---|---|
+| A10 | **Global-init guards were TOP-LEVEL kind tests** | 869 | 3 accepted: `@cpu_model_id() + 1`, `(u32)f()`, `-f()`, `@popcount(f())`. **The exact sibling of my BUG-842** — that split the `arg_count` precondition and left the top-level-kind SHAPE. Now asked at EVERY node by a no-`default:` walk |
+| A11 | **`@offset` validated nothing outside one guard** | 870 | 4 accepted; `offsetof(uint32_t, 1)` reached GCC. Also missed a `distinct` of a struct — the distinct-unwrap class this repo has a CI gate for |
+| A12 | **The fence family accepted and silently dropped arguments** | 871 | `@barrier(x)` looked like it did something with x. The 0-arg family immediately below had the check all along |
+| A13 | **`@trap(1,2,3)` silently drops its arguments** | 882 | NEW. Found by a companion sweep calling every intrinsic with an absurd arity — the only one left across ~155 |
+| A14 | **`lower_expr` could fall off the end of an int-returning function** | 876 | Callers use the value as a LOCAL ID and index `func->locals[]` with it. Latent, but the return was INDETERMINATE |
+
+### LIVE — over-rejections
+
+| # | Fix | as71kk id | Evidence |
+|---|---|---|---|
+| A15 | **`if (i < 4 && a[i] > 0)` HARD-REJECTED** | 874 | = tracker-2 H14, the row I mis-closed as "precision only". Suppressed in short-circuit RHS position at all THREE sites that raise it (ident, call-return range, MMIO). A negative pins the boundary: `if (a[i] > 0 && i < 4)` puts the access on the LEFT, unconditional, and must still hard-reject |
+| A16 | **`const [*]u8 BANNER = "boot ok";` not declarable at all** | 872 | And it said so with the SAME type on both sides. The const/volatile fold written longhand at TWO sites |
+| A17 | **`const u32 CAP = 256; u8[CAP] buf;`** | 873 | Rejected as "not a compile-time constant", naming a constant |
+| A18 | **Arrays of function pointers never worked, in EITHER syntax** | 878/879 | Both `reference.md` and `CLAUDE.md` document `*(u32,u32) -> u32 [4] ops`. Parser: `parse_type` swallowed the `[3]` next to the RETURN type. Emitter: `?FuncPtr[N]` emitted an abstract declarator with a name glued on — not C. **The nullable form is the one that matters**, since a non-null funcptr array is auto-zeroed and ZER has no array initializer |
+| A19 | **Bit extraction through a pointer** | 881 | `volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];` appears in BOTH docs and did not compile — it fell to the SUB-SLICE path where hi > lo is a bounds error. Fixed as a DESUGARING to `*p` so one implementation of bit extraction stays and cannot drift |
+| A20 | **The two view-class boundary positives** | rides with A1 | `view_optional_null_arm_ok`, `view_param_interior_ptr_ok` — over-reject on main today (tracker-2 H19) |
+
+### Tooling — take all of it
+
+| Item | Why |
+|---|---|
+| **`tools/ubsan_sweep.sh`** (NEW) | Compiles every program's emitted C under UBSan+ASan. Measures the "no undefined behavior" claim neither harness can check — a positive asserts exit 0, a negative asserts a diagnostic, and **UB produces neither**. 1097 programs, clean. **The calibration is the artefact:** `float-cast-overflow` is NOT in GCC's `-fsanitize=undefined` and must be named — found by breaking the BUG-845 guard and watching the sweep report CLEAN on the exact class it exists to find |
+| `tools/qualifier_closure_probe.sh` (NEW) | Found A9. **Its first ORACLE was vacuous** — `-Wdiscarded-qualifiers` is silenced by the explicit cast ZER's emitter writes, so it printed OK against a deliberately broken compiler. `-Wcast-qual` is the warning that asks the question. 31 strips on the first honest run |
+| `tools/grammar_closure_probe.sh` | Found A2. The closure claim had never been measured and failed on first measurement |
+| `tools/ub_sweep.sh` | Differential -O0/-O2. Complementary to ubsan_sweep, not superseded by it — one finds UB the optimiser changes, the other asks the sanitizer directly |
+| `audit_walker_fields.sh` membership fix | It decided membership on PROSE — counted the function's own name in comments, so editing a comment moved a walker in or out. Baseline 758 -> 684. **This is the gate I installed in §B** |
+| Structural `.gitignore` | 565 tracked binaries. "Extension-less under a test tree" IS a build artifact by construction; verified all 565 were ELF |
+| `rc_cond_004` flake | Failed 1 run in 8. **The race is IN THE TEST** — ZER's auto-locking is per-statement, so `q.items[q.tail] = val; q.tail = ...` is two lock scopes. 7-of-8 -> 25 consecutive |
+
+### Recommended order
+
+1. **A1** (view class, all four) — the biggest accept-unsafe family, and the reason my partial was reverted.
+2. **Replace my BUG-857 with their BUG-868** — main over-rejects valid code today.
+3. **A3** (`value_flows_to`) — one query retires eight duplicated sinks and unblocks the negative-constant family.
+4. **A8, A9, A2, A7, A4, A5, A6** — independent accept-unsafe.
+5. **A10** — my BUG-842's second axis.
+6. Over-rejections **A15..A19**, then tooling.
+
+Float stays parked until decided.
+
+---
+
 ## OPEN — harvest tracker 2: `r1piyr` / `29fiao` / `qa249l`, verified against main 2026-08-25
 
 **Status: NOT implemented — a catalog.** Every row verified on a clean build of main

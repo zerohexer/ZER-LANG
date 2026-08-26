@@ -141,12 +141,24 @@ work used (probe the compiler, do not transcribe).
 (`1c4c64d2`, i.e. AFTER the 45-row harvest) by running the branch's own test and reading
 the diagnostic. Rows main already closed are in the "already on main" table.
 
-**PROGRESS 2026-08-26:** H3, H4, H5, H6, H7, H8 and H16 are landed as BUG-859..864 and
-BUG-867, together with three rows nobody had catalogued (cross-module `spawn` did not
-link; a container stamped across a module boundary emitted twice; `spawn` had no arity
-check at all). Each was reproduced on a pristine build first and each regression test was
-verified to flip against it. H8's obvious fix was measured and BACKED OUT — see BUG-864.
-Remaining: 12.
+**PROGRESS 2026-08-26 — 15 of the 19 remaining rows are landed (BUG-859..877).**
+Struck through below: H3, H4, H5, H6, H7, H8, H9, H11, H12, H13, H14, H15, H16, H20, plus
+the `container(T)` half of H21 and ONE of H1's four parts. Alongside them, four rows
+nobody had catalogued: cross-module `spawn` did not link at all, a container stamped
+across a module boundary emitted twice, `spawn` had no arity check, and a global
+initialized from another global emitted invalid C.
+
+Method, unchanged and worth keeping: every row reproduced on a pristine `git archive HEAD`
+build BEFORE any fix, every negative verified to flip ACCEPT -> REJECT (or REASON, where
+another rule already masked it) against that same build, every over-rejection's corpus
+cost measured by RUNNING the suite rather than grepping for the shape — which is what
+caught BUG-859's first version rejecting `u64 y = 0xDEADBEEFCAFEBABE;`.
+
+Two rows were deliberately NOT taken whole: H8's obvious fix rejects the callback-registry
+idiom and was BACKED OUT in favour of a whole-file question (BUG-864), and three of H1's
+four parts wait on its inference half (see the measured-and-left section above).
+
+**Remaining: H1 (3 of 4 parts), H17, H18, H19, and the `async` half of H21.**
 
 **PROGRESS 2026-08-25:** H10 (the container-cycle SEGFAULT) and H2 (recycled pool/slab
 slots returning stale data) are landed as BUG-857/858. **H1 was attempted and BACKED

@@ -1598,8 +1598,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 **ZER Integration Tests (`tests/zer/`):**
 - Real `.zer` files compiled with `zerc --run`, must exit 0
 - Runner: `tests/test_zer.sh`, added to `make check`
-- Current tests: `ls tests/zer/*.zer` (~300 positive tests including hash_map, ring_buffer, pool_handle, move struct patterns, async/await, shared struct, condvar, container, defer, goto, opaque levels 1-9, etc.)
-- Negative tests: `ls tests/zer_fail/*.zer` (~70 tests — UAF, double-free, bounds OOB, div-zero, null deref, escape analysis, move-after-transfer, typecast safety, etc.)
+- Current tests: `ls tests/zer/*.zer` (560 positive tests including hash_map, ring_buffer, pool_handle, move struct patterns, async/await, shared struct, condvar, container, defer, goto, opaque levels 1-9, etc.)
+- Negative tests: `ls tests/zer_fail/*.zer` (658 tests — UAF, double-free, bounds OOB, div-zero, null deref, escape analysis, move-after-transfer, typecast safety, etc.)
 - Runtime-trap tests: `ls tests/zer_trap/*.zer` (compile clean, trap at runtime — slice bounds, signed div overflow, @inttoptr safety)
 - Module tests: `ls test_modules/*.zer` (~28 including diamond imports, shared cross-module, opaque wrappers)
 - Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
@@ -1608,13 +1608,15 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 314 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 260 | `tests/test_zer.sh` |
-| `test_modules/` | Multi-file module tests | 66 | `test_modules/run_tests.sh` |
-| `rust_tests/` | Rust test/ui translations ONLY | 786 | `rust_tests/run_tests.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 560 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 658 | `tests/test_zer.sh` |
+| `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
+| `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
 | `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/**view-alias**/hw/async/asm/defer-goto) | 10 grids | `make check` |
+| `docs/reference.md` | Every ```zer block must PARSE (as a file or as a function body) | 159 blocks | `tools/audit_reference_examples.sh`, in `make check` |
+| (sweep, not a gate) | Same emitted .c built four ways must answer identically — a divergence is UB in the emitted C | 1124 programs | `bash tools/ub_sweep.sh [dir…]` |
 | `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.

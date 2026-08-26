@@ -9248,10 +9248,17 @@ static Type *check_expr(Checker *c, Node *node) {
                     double lo = sg ? -ldexp(1.0, bits - 1) - 1.0 : -1.0;
                     double hi = sg ?  ldexp(1.0, bits - 1)       : ldexp(1.0, bits);
                     if (!(v > lo && v < hi)) {
-                        checker_error(c, node->loc.line,
-                            "float-to-integer conversion is out of range: %g does not fit "
-                            "in '%s'. C11 6.3.1.4p1 makes this UNDEFINED, so the answer "
-                            "would depend on the optimiser and the target",
+                        /* BUG-883: a WARNING, not an error, now that the conversion
+                         * SATURATES. Rejecting the literal while the identical value
+                         * through a variable produces a defined result is the
+                         * "two spellings of one program disagree" shape this codebase
+                         * treats as a defect in itself. The value is still almost
+                         * certainly a mistake, so it is worth saying — but it is
+                         * DEFINED, and refusing defined code is an over-rejection. */
+                        checker_warning(c, node->loc.line,
+                            "float literal %g does not fit in '%s' — the conversion "
+                            "SATURATES (to the nearest representable value; NaN gives 0), "
+                            "so this is defined but almost certainly not what you meant",
                             v, type_name(target));
                     }
                 }

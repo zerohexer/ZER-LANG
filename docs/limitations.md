@@ -52,7 +52,28 @@ versions rather than re-derive them from tracker 2:
 - it records first attempts that were WRONG and why, which is the part a re-derivation
   loses.
 
-### IT DOES NOT DECIDE THE FLOAT QUESTION
+### THE FLOAT QUESTION IS DECIDED: SATURATE (2026-08-25, BUG-883)
+
+Owner's call: `float -> int` out of range now **saturates**, NaN -> 0, matching what
+Rust settled on for `as` casts. In ZER's own terms the line is MEMORY vs ARITHMETIC —
+memory violations halt (slice OOB, misaligned `@inttoptr`, a bad `@pun`); arithmetic
+results get DEFINED values, which is already why integer overflow WRAPS rather than
+trapping. `@saturate` already named these semantics, so the plain cast now agrees with
+the primitive instead of contradicting it.
+
+Consequences, both measured:
+- the compile-time LITERAL rejection became a WARNING. Rejecting `(u32)(-1.5)` while the
+  same value through a variable produced a defined result was the "two spellings of one
+  program disagree" shape this codebase treats as a defect in itself.
+- **`@truncate` on a float STAYS REJECTED — a deliberate divergence from `29fiao` and
+  `qa249l`**, which make it saturate. `@truncate` means "keep the low bits"; a float has
+  no low bits. And it is redundant: `(u32)x` saturates and `@saturate(u32, x)` is named
+  for it — verified both give 4294967295 for 1e20 and 0 for -1.5. Making `@truncate` a
+  third spelling would give one primitive two unrelated meanings by operand type.
+  Those two branches' `float_to_int_saturates` / `float_to_int_total` are therefore NOT
+  taken verbatim; `tests/zer/float_to_int_saturates.zer` covers the same semantics.
+
+### as71kk DOES NOT DECIDE IT EITHER (recorded before the call above was made)
 
 `as71kk` leaves `float -> int` trap-vs-saturate open and says so explicitly: *"the 8
 remaining rejected positives are listed with what each actually needs, including the

@@ -1,0 +1,30 @@
+// BUG-883: float -> integer out of range is DEFINED as SATURATING, NaN -> 0.
+//
+// It was UNDEFINED (C11 6.3.1.4p1) and GCC exploited it: from ONE emitted .c on ONE
+// compiler, `(u32)(-1.5)` gave 4294967295 at -O0 and 0 at -O2. BUG-845 removed the UB
+// by TRAPPING; this file pins the OWNER'S CHOICE of a value instead — the same answer
+// Rust settled on for `as` casts, and consistent with ZER already defining integer
+// overflow as WRAPPING rather than trapping. Memory violations halt; arithmetic gets a
+// defined value.
+//
+// EVERY source is read through a `volatile` global, and that is load-bearing: with a
+// plain constant GCC's folder produces the saturating answers by itself at -O2, so the
+// test would pass on a compiler with no guard at all.
+volatile f64 v;
+volatile f32 f;
+u32 main() {
+    v = 3.7;     if ((u32)v != 3)  { return 1; }   // in range, truncates toward zero
+    v = -3.75;   if ((i32)v != -3) { return 2; }   // toward zero, not floor
+    v = -1.5;    if ((u32)v != 0)  { return 3; }   // below range -> MIN
+    v = 1.0e20;  if ((u32)v != 4294967295) { return 4; }
+    v = 1.0e20;  if ((i32)v != 2147483647) { return 5; }
+    v = -1.0e20; if ((i32)v != -2147483648) { return 6; }
+    v = 300.0;   if ((u8)v != 255) { return 7; }
+    v = 255.0;   if ((u8)v != 255) { return 8; }   // BOUNDARY: exact, must not clamp low
+    v = 0.0;     if ((u32)v != 0)  { return 9; }
+    f = 250.9;   if ((u8)f != 250) { return 10; }  // f32 source
+    u64 nanbits = 0x7FF8000000000000;
+    v = @bitcast(f64, nanbits);
+    if ((u32)v != 0) { return 11; }                // NaN -> 0, tested FIRST in the guard
+    return 0;
+}

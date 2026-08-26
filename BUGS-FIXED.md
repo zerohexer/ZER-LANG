@@ -5,6 +5,59 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-25b — BUG-883: float -> int is DEFINED as SATURATING (owner decision)
+
+Not a bug fix — a LANGUAGE SEMANTICS decision, made by the owner and implemented.
+
+BUG-845 removed the undefined behaviour by TRAPPING. Two independent audit branches
+(`29fiao`, `qa249l`) had instead chosen SATURATION, and a third (`as71kk`) declined to
+decide and flagged it as needing an owner. The owner chose **saturate, matching Rust**
+(which settled the same question for `as` casts in 1.45, for the same reason).
+
+The argument that decided it, in ZER's own terms: this codebase already draws the line
+at MEMORY vs ARITHMETIC. Memory violations halt — slice OOB, misaligned `@inttoptr`, a
+bad `@pun`. Arithmetic results get DEFINED values — which is why integer overflow WRAPS
+rather than trapping. A float that does not fit is arithmetic, not memory. And
+`@saturate` already named exactly these semantics, so the plain cast now agrees with the
+primitive instead of contradicting it. The "it is free" argument applies to neither
+option: both need the same compare-and-branch.
+
+Measured at both optimisation levels from one emitted .c — the point of the exercise:
+
+    (u32)3.7 = 3     (i32)-3.75 = -3    (u32)-1.5 = 0      (u32)1e20 = 4294967295
+    (i32)1e20 = 2147483647             (i32)-1e20 = -2147483648
+    (u8)300 = 255    (u8)255 = 255      (u32)NaN = 0       (u8)250.9f = 250
+
+identical at -O0 and -O2, where the same program before BUG-845 gave 4294967295 and 0.
+
+NaN is tested FIRST and explicitly (`_v != _v`): every comparison against NaN is false,
+so without that test it falls through the range checks into the raw cast — the exact UB
+being removed. Bounds are exact hex-float powers of two, so no representable value is
+clamped; the `(u8)255` case pins that boundary.
+
+### Two consequences, both decided rather than inherited
+
+**The compile-time LITERAL rejection became a WARNING.** Rejecting `(u32)(-1.5)` while
+the identical value through a variable produced a defined result is the "two spellings of
+one program disagree" shape this codebase treats as a defect. The value is still almost
+certainly a mistake, so it is still said — but refusing DEFINED code is an over-rejection.
+`tests/zer_fail/float_to_int_literal_out_of_range.zer` is retired and replaced by
+`tests/zer/float_to_int_saturates.zer`, which pins the semantics rather than the refusal.
+
+**`@truncate` on a float STAYS REJECTED — a deliberate divergence from both branches**,
+which make it saturate. `@truncate` means "keep the low bits" and a float has no low
+bits; making it a float operation gives one primitive two unrelated meanings selected by
+operand type. It is also redundant, verified rather than asserted: `(u32)x` now saturates
+and `@saturate(u32, x)` is named for it — both give 4294967295 for 1e20 and 0 for -1.5.
+So the rejection costs a user nothing and keeps one meaning per primitive. Those
+branches' `float_to_int_saturates` / `float_to_int_total` are consequently NOT taken
+verbatim.
+
+Widths above 64 bits (u128/i128) keep a NaN trap: the literal bounds cannot be expressed
+there, and a halt is defined where the raw cast is not.
+
+---
+
 ## Session 2026-08-25 — BUG-857/858: harvest-2 begins (a compiler crash, and a UAF from safe ZER)
 
 Two rows from `docs/limitations.md` harvest tracker 2. Both reproduced on main first;

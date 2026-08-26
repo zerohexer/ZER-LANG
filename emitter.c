@@ -1045,13 +1045,55 @@ static void emit_f2i_open(Emitter *e, Type *src, int tmp) {
 static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
     int bits; bool sg;
     f2i_bounds(tgt, &bits, &sg);
-    emit(e, "; if (!(");
-    if (sg) emit(e, "_zer_f2i%d > -0x1p%d - 1.0 && _zer_f2i%d < 0x1p%d",
-                 tmp, bits - 1, tmp, bits - 1);
-    else    emit(e, "_zer_f2i%d > -1.0 && _zer_f2i%d < 0x1p%d", tmp, tmp, bits);
-    emit(e, ")) _zer_trap(\"float-to-integer conversion out of range (C11 6.3.1.4p1 "
-            "makes this undefined; the answer would depend on the optimiser and the "
-            "target)\", __FILE__, __LINE__); (");
+    /* BUG-883: float -> integer out of range is DEFINED as SATURATING, with NaN -> 0.
+     *
+     * It was UNDEFINED (C11 6.3.1.4p1) and GCC exploited it — one emitted .c, one
+     * compiler, `(u32)(-1.5)` gave 4294967295 at -O0 and 0 at -O2. BUG-845 removed
+     * the UB by TRAPPING; this replaces that with a value, which is the owner's call
+     * and matches what Rust settled on for `as` casts in 1.45 for the same reason.
+     *
+     * Why a value rather than a halt, in ZER's own terms: this codebase already
+     * draws the line at MEMORY vs ARITHMETIC. Memory violations halt (slice OOB,
+     * misaligned @inttoptr, a bad @pun); arithmetic results get DEFINED values —
+     * integer overflow WRAPS rather than trapping. A float that does not fit is
+     * arithmetic, so it belongs on the defined-value side. `@saturate` already names
+     * exactly these semantics in the language, so the plain cast now agrees with the
+     * primitive instead of contradicting it.
+     *
+     * NaN is tested FIRST and explicitly: every comparison against NaN is false, so
+     * without `_v != _v` it would fall through the range tests into the raw cast —
+     * the exact UB being removed. Bounds are exact hex-float powers of two, so no
+     * representable value is ever clamped. */
+    if (bits > 0 && bits <= 64) {
+        char lo[64], hi[64], mn[64], mx[64];
+        if (sg) {
+            snprintf(lo, sizeof lo, "-0x1p%d - 1.0", bits - 1);
+            snprintf(hi, sizeof hi, "0x1p%d", bits - 1);
+            if (bits == 64) {
+                snprintf(mn, sizeof mn, "(-9223372036854775807LL - 1)");
+                snprintf(mx, sizeof mx, "9223372036854775807LL");
+            } else {
+                snprintf(mn, sizeof mn, "(-(1LL << %d))", bits - 1);
+                snprintf(mx, sizeof mx, "((1LL << %d) - 1)", bits - 1);
+            }
+        } else {
+            snprintf(lo, sizeof lo, "-1.0");
+            snprintf(hi, sizeof hi, "0x1p%d", bits);
+            snprintf(mn, sizeof mn, "0");
+            if (bits == 64) snprintf(mx, sizeof mx, "18446744073709551615ULL");
+            else            snprintf(mx, sizeof mx, "((1ULL << %d) - 1ULL)", bits);
+        }
+        emit(e, "; (_zer_f2i%d != _zer_f2i%d) ? (", tmp, tmp);
+        emit_type(e, tgt); emit(e, ")0 : (_zer_f2i%d <= (%s)) ? (", tmp, lo);
+        emit_type(e, tgt); emit(e, ")%s : (_zer_f2i%d >= (%s)) ? (", mn, tmp, hi);
+        emit_type(e, tgt); emit(e, ")%s : (", mx);
+        emit_type(e, tgt); emit(e, ")_zer_f2i%d; })", tmp);
+        return;
+    }
+    /* Width the literal bounds above cannot express (u128 / i128). Keep the TRAP
+     * rather than emit an unguarded cast — a halt is defined, the raw cast is not. */
+    emit(e, "; if (_zer_f2i%d != _zer_f2i%d) _zer_trap(\"NaN to integer\", __FILE__, __LINE__); (",
+         tmp, tmp);
     emit_type(e, tgt);
     emit(e, ")_zer_f2i%d; })", tmp);
 }

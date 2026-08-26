@@ -5,6 +5,136 @@ Entries removed once fixed.
 
 ---
 
+# HANDOFF — read this first (written 2026-08-25, context running low)
+
+Three harvests have been consumed. This section says where the work stands, what was
+DECIDED (so it is not re-litigated), what is LEFT with a cheap recipe for taking it, and
+the corrections I made to my OWN earlier work so they are not repeated.
+
+## Where main stands
+
+`make check` exit 0 — **1342 .zer**, 200 fuzz, 139 convert, all ten matrices, all seven
+audit gates, sink matrix **88 cells / 0 mismatch**.
+
+Landed this session, newest first:
+
+| sha | what |
+|---|---|
+| `7c873edd` | BUG-884..888 — the call-RESULT view class (4 parts) + my container fix REPLACED + BUG-869/870/871 |
+| `c0180e3f` | BUG-883 — float -> int is DEFINED as SATURATING |
+| `ae033cd0` | BUG-857/858 — container SEGFAULT (superseded, see below) + recycled-slot auto-zero |
+| earlier | the 45-row harvest 1, BUG-815..856 |
+
+## DECIDED — do not re-open
+
+**float -> int out of range SATURATES, NaN -> 0.** Owner's call, matching Rust's `as`.
+The reasoning is MEMORY vs ARITHMETIC: memory violations halt (slice OOB, misaligned
+`@inttoptr`, bad `@pun`); arithmetic gets a defined value, which is already why integer
+overflow WRAPS. Two sub-decisions came with it and are also settled:
+
+- the compile-time **literal** case is a WARNING, not an error — rejecting `(u32)(-1.5)`
+  while the same value through a variable is defined was "two spellings disagree";
+- **`@truncate` on a float STAYS REJECTED**, a deliberate divergence from `29fiao` and
+  `qa249l`. `@truncate` means "keep the low bits" and a float has none, and it is
+  redundant — verified: `(u32)x` saturates and `@saturate(u32,x)` is named for it, both
+  giving 4294967295 for 1e20 and 0 for -1.5. Their `float_to_int_saturates` /
+  `float_to_int_total` are therefore NOT taken verbatim;
+  `tests/zer/float_to_int_saturates.zer` covers the same semantics.
+
+## THE CHEAP PATH: cherry-pick `as71kk`, do not re-derive
+
+`origin/claude/vigilant-tesla-as71kk` forked at `9f8cda08` (one behind main) and already
+contains everything left below, with better implementations than the catalog entries.
+**It cherry-picks.** Commit -> row -> conflict expectation:
+
+| commit | rows | files | conflicts with main? |
+|---|---|---|---|
+| `ccdd49ee` | **A2** @cstr, **A3** sign/`value_flows_to`, **A4** enum siblings (861 = already on main) | checker.c emitter.c | likely (BUG-858 lives in emitter.c) |
+| `dda5b33b` | **A5** `?T` compare, **A6** non-null drift, **A7** inline-array free | checker.c test_emit.c | possible |
+| `6af2497e` | **A8** indirect-call keep carrier | checker.c | likely small |
+| `1cb1f93e` | **A14** `lower_expr`, dead code, warnings 32 -> 0 | many | medium |
+| `a1919aa5` | **A9** six intrinsics storing through const | checker.c | small |
+| `0a0ec95e` | **A15** short-circuit, **A16** const slice, **A17** const array size | checker.c checker.h | small |
+| `e937a1d8` | **A18** funcptr arrays | checker.c emitter.c parser.c parser.h | small |
+| `0828d1f7` | **A19** bit extraction through a pointer | checker.c | small |
+| `15b4fe49` | **A13** `@trap` arity + `ubsan_sweep.sh` | checker.c | small |
+| `38c27c18` `0ff11690` `d2cd8394` | tooling: `ub_sweep.sh`, the rc_cond_004 flake, structural `.gitignore` | — | none |
+
+Recipe that worked twice today:
+
+```
+git cherry-pick --no-commit <sha>
+# resolve any conflict by taking THEIRS unless main's version is strictly better
+rm -f *.o src/safety/*.o && make zerc          # ALWAYS after a .h edit
+# run the branch's own tests, then make check
+```
+
+`f63bddcb` (the view class) applied with **zero** conflicts because it touches only
+`zercheck.h` / `zercheck_ir.c`. `a22de320` conflicted twice in `checker.c` and both
+resolved to "theirs".
+
+## Verification that must not be skipped
+
+1. **Reproduce on main FIRST.** Read the DIAGNOSTIC, never the exit code — `-o out.c`
+   isolates the checker's verdict from GCC's, and the echoed source line contains the
+   offending text, which defeats a loose grep.
+2. **Build a pre-fix compiler and prove the test flips**:
+   `git archive <prev-sha> | tar -x -C $S && (cd $S && rm -f *.o src/safety/*.o && make zerc)`
+3. **A new gate must be shown to FIRE**, not merely pass. `bash tools/sink_matrix.sh $S/zerc`
+   is the pattern — p18 reported 7 holes + 2 over-rejects pre-fix, 0 after.
+4. `MAKE_CHECK_EXIT` must be echoed. Make aborts at the first failing audit, so a later
+   gate silently never runs.
+
+## Corrections I made to MY OWN work — do not repeat these
+
+- **O3 / H14 (`&&` narrowing).** I closed it as "precision only" after probing an
+  UNPROVABLE index, which correctly guards. With a PROVABLE index the `&&` spelling is
+  HARD-REJECTED while the nested-if spelling compiles. My own tracker had predicted this
+  ("becomes required if the always-OOB verdict is ever promoted") and I never checked
+  that BUG-796 had already promoted it. Still open as **A15**.
+- **BUG-857 (container cycle).** My fix stopped the SEGFAULT and traded it for an
+  OVER-REJECTION of a pointer-broken cycle. Replaced by as71kk's BUG-868 in `7c873edd`.
+  The rule: a cycle is infinite only if EVERY edge is by-value.
+- **The view class, partial.** I wrote the arg-FORM half and reverted it. Correct call:
+  the ARITY part turns `returns_param_color` into a MASK precisely because the BLOCK-TAG
+  bug lets the int name the WRONG param, so widening the consumer alone makes the wrong
+  answer apply more often. Landed whole in `7c873edd`.
+- **I briefly blamed my own change** for three view-class boundary over-rejections that
+  predated it. Check before attributing.
+
+## Two gates that were themselves broken — the general lesson
+
+`audit_walker_fields.sh` (which I installed) decided membership on **prose**, counting
+the function's own name inside comments, so editing a comment moved a walker in or out of
+the audited set. as71kk fixes it; baseline 758 -> 684.
+
+as71kk's qualifier probe's **first oracle was vacuous** — `-Wdiscarded-qualifiers` is
+silenced by the explicit cast ZER's emitter writes, so it printed OK against a
+deliberately broken compiler. And its `ubsan_sweep.sh` needed `float-cast-overflow` named
+explicitly, because it is NOT in GCC's `-fsanitize=undefined` — found by breaking the
+BUG-845 guard and watching the sweep report CLEAN on the exact class it exists to find.
+
+**A gate that has only ever printed OK is a script, not a net.** Both of these were
+caught by deliberately breaking the compiler and checking the gate went red.
+
+## Recommended order for the remaining 16
+
+1. **A3** (`value_flows_to`) — one query retires eight duplicated sinks and is what makes
+   the 8-spelling negative-constant family fixable at all.
+2. **A8, A9, A2, A7, A4, A5, A6** — independent accept-unsafe, any order.
+3. **A15..A19** — over-rejections (A15 is my mis-closed row).
+4. **A13, A14** — arity and the indeterminate return.
+5. Tooling: `ubsan_sweep.sh`, `ub_sweep.sh`, the walker-field membership fix, the
+   structural `.gitignore`, the rc_cond_004 flake.
+
+Still parked, deliberately, with reasons recorded in their own entries below: the comptime
+array-element width, the extern `*opaque` type_id (both candidate fixes risk an
+under-rejection), and `29fiao`'s BUG-852 (measured at 34 correct corpus files, so the
+blanket rule was NOT shipped).
+
+---
+
+
 ## SUPERSEDED by harvest-2 H14 — `&&` / `||` narrowing (the "PRECISION only" call was WRONG)
 
 **Corrected 2026-08-25.** See the harvest-2 tracker above: with a PROVABLE index the

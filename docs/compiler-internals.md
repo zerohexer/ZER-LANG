@@ -11861,7 +11861,7 @@ DE-RISK (all verified in Docker):
   re-introduces the native binary the whole exercise existed to remove.
   `editors/vscode-WASI/` + `Dockerfile.vsix-WASI` + `make docker-vsix-wasi` remain
   committed as the proven-pipeline harness (the smoke tests are the contract), at
-  0.5.7 and untouched since. The SHIPPING extension is `editors/vscode/` (0.6.6),
+  0.5.7 and untouched since. The SHIPPING extension is `editors/vscode/` (0.7.0),
   which is unaffected and uses bundled GCC.
 
 TEST RECIPE (baked image `zer-wasi:latest` = `emscripten/emsdk:3.1.74` +

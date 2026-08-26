@@ -111,14 +111,20 @@ gate is not.
 
 Measured this session: the D-Alpha-5/6 families (MMU, TLB, cache) and the
 CR/MSR/DR family DO check arity, individually, each with its own `if
-(arg_count != N)`. The gaps are specific — `@barrier(1,2,3)` is accepted, and
-`@cstr` / `@offset` accept wrong arities — so harvest-2 H13's framing ("3
-accepted") is accurate and the class is narrower than the ~140-name surface
-suggests. The durable form is one arity table consulted once in the
-NODE_INTRINSIC prologue, which would also make a new intrinsic's arity a
-conscious add; the per-family checks then become redundant but harmless. Not
-built here because a wrong table entry over-rejects valid code, and the table
-must be derived from each family's emitter, not guessed.
+(arg_count != N)`. The three that did NOT are now closed as BUG-870
+(`@barrier*`, `@cstr`, `@offset`/`@container`), so harvest-2 H13's framing ("3
+accepted") was exactly right and the class is much narrower than the ~140-name
+surface suggests.
+
+**What remains is the SHAPE, not a live hole:** the arity of ~140 intrinsics is
+asserted at ~40 independent sites, so a NEW intrinsic added without its own `if
+(arg_count != N)` is silently unchecked, and nothing notices. The durable form
+is one arity table consulted once in the NODE_INTRINSIC prologue, which would
+make a new intrinsic's arity a conscious add and turn the per-family checks
+redundant-but-harmless. Not built here because a wrong table entry
+over-rejects valid code, and the table must be DERIVED from each family's
+emitter rather than guessed — the same discipline the reference.md signature
+work used (probe the compiler, do not transcribe).
 
 ---
 
@@ -208,9 +214,9 @@ branch's `expect-error`. Cosmetic; adopt their phrasing only if a test is taken.
 
 | # | Fix | Best version | Evidence |
 |---|---|---|---|
-| H11 | **Global-init constant guard is a TOP-LEVEL kind test** | **r1piyr** BUG-859 | 3 accepted: one wrapper (`+ 1`, a cast, a unary minus, an intrinsic argument) defeats all three checks and the failure lands on GCC. Needs one exhaustive walk. **This is the sibling of my BUG-842** — I split the arg_count precondition but left the top-level-kind shape |
+| ~~H11~~ **DONE (BUG-869)** | **Global-init constant guard is a TOP-LEVEL kind test** | **r1piyr** BUG-859 | 3 accepted: one wrapper (`+ 1`, a cast, a unary minus, an intrinsic argument) defeats all three checks and the failure lands on GCC. Needs one exhaustive walk. **This is the sibling of my BUG-842** — I split the arg_count precondition but left the top-level-kind shape |
 | H12 | **`@offset` validated nothing** | **29fiao** BUG-860 | 4 accepted. The field check sat inside a guard and did nothing when the guard failed. One case is the distinct-unwrap class, so `@offset` also now WORKS through a distinct typedef. A union is rejected with a reason (ZER unions are tagged, so a variant has no fixed offset) |
-| H13 | **Intrinsic arity unchecked** | **29fiao** | 3 accepted (`@barrier_*`, `@cstr`, `@offset` with wrong arity) |
+| ~~H13~~ **DONE (BUG-870)** | **Intrinsic arity unchecked** | **29fiao** | 3 accepted (`@barrier_*`, `@cstr`, `@offset` with wrong arity) |
 
 ### LIVE — over-rejections (valid code refused)
 

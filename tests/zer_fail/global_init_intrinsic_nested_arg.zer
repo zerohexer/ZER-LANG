@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: does not lower to a compile-time-constant value
+// BUG-869, third wrapper shape: the offending intrinsic is someone else's
+// ARGUMENT, so it is not even the second-level node.
+u32 G = @truncate(u8, @cpu_model_id());
+u32 main() { return G; }

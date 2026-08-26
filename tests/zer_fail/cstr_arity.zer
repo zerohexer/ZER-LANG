@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: @cstr takes exactly 2 arguments
+// BUG-870: every @cstr check is written `arg_count >= 1` / `>= 2`, so a wrong
+// arity slid past all of them and the emitted copy took its source from
+// whatever the last argument happened to be.
+u32 main() { u8[8] b; @cstr(b); return 0; }

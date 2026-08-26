@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: does not lower to a compile-time-constant value
+// BUG-869, second wrapper shape: a C-style cast.
+u32 G = (u32)@cpu_model_id();
+u32 main() { return G; }

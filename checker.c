@@ -9760,7 +9760,33 @@ static Type *check_expr(Checker *c, Node *node) {
          * arg0 (value args are checked normally, so reading another atomic cell
          * as a value is still caught). */
         bool atomic_intr = (nlen >= 7 && memcmp(name, "atomic_", 7) == 0);
-        for (int i = 0; i < node->intrinsic.arg_count; i++) {
+        /* BUG-870: @offset / @container name a FIELD in their last argument,
+         * and the loop below exempts exactly that position from being looked
+         * up as a value. With a WRONG ARITY the field name is no longer last,
+         * so it was resolved as a variable and the user got "undefined
+         * identifier 'a'" — a diagnostic about the wrong thing entirely.
+         * Report the arity here, BEFORE the arg loop, and skip the value
+         * checking whose premise no longer holds. */
+        bool field_arity_bad = false;
+        if (has_field_arg) {
+            /* @offset(T, field) is two pieces; @container(*T, ptr, field) is
+             * three. Both spell the FIELD last, which is what has_field_arg
+             * keys on — but they do NOT share an arity, and treating them as
+             * if they did rejected every valid @container. */
+            bool is_container = (nlen == 9);
+            int extra = node->intrinsic.type_arg ? 1 : 0;   /* type in type_arg? */
+            int want_total = is_container ? 3 : 2;
+            int got_total = node->intrinsic.arg_count + extra;
+            if (got_total != want_total) {
+                field_arity_bad = true;
+                checker_error(c, node->loc.line,
+                    "@%.*s takes exactly %d arguments (%s), got %d",
+                    (int)nlen, name, want_total,
+                    is_container ? "type, pointer, field" : "type, field",
+                    got_total);
+            }
+        }
+        for (int i = 0; !field_arity_bad && i < node->intrinsic.arg_count; i++) {
             if (has_field_arg && i == node->intrinsic.arg_count - 1) {
                 /* last arg is a field name — don't look up as variable */
                 continue;
@@ -9861,6 +9887,13 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             result = ty_usize;
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
+            /* BUG-870: @offset has TWO parse shapes and both take exactly two
+             * pieces — a type argument plus a field name, or two idents when
+             * the type is a plain name. Unchecked, `@offset(P, a, 1, 2)` was
+             * answered with "undefined identifier 'a'", because the FIELD-name
+             * arg is only exempt from value-checking when it is the LAST one
+             * (see has_field_arg at the top of this case). A wrong arity
+             * therefore produced a diagnostic about the wrong thing. */
             /* @offset(T, field) — validate field exists on struct T */
             {
                 Type *struct_type = NULL;
@@ -10481,6 +10514,16 @@ static Type *check_expr(Checker *c, Node *node) {
                    (nlen == 15 && memcmp(name, "barrier_acq_rel", 15) == 0) ||
                    (nlen == 11 && memcmp(name, "barrier_dma", 11) == 0)) {
             /* D-Alpha-2/7: fences. barrier_dma is DMA-coherence barrier for driver code. */
+            /* BUG-870: a fence takes NO operands, and the arity was unchecked, so
+             * `@barrier(1, 2, 3)` compiled and SILENTLY DROPPED all three. The
+             * user wrote something with intent and the compiler ignored it —
+             * the same class as the @cstr and @offset arities below. The
+             * zero-arg @cpu_* families two branches down already check this. */
+            if (node->intrinsic.arg_count != 0) {
+                checker_error(c, node->loc.line,
+                    "@%.*s is a fence and takes no arguments, got %d",
+                    (int)nlen, name, node->intrinsic.arg_count);
+            }
             result = ty_void;
         } else if ((nlen == 9 && memcmp(name, "cpu_pause", 9) == 0) ||
                    (nlen == 7 && memcmp(name, "cpu_wfe", 7) == 0) ||
@@ -11400,6 +11443,16 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
         } else if (nlen == 4 && memcmp(name, "cstr", 4) == 0) {
+            /* BUG-870: @cstr(dest, src) takes exactly two. Unchecked, `@cstr(b)`
+             * and `@cstr(b, s, s)` both compiled — the first emitting a copy
+             * whose source is whatever the last argument happened to be, the
+             * second silently dropping one. Every check below is written
+             * `arg_count >= 1` / `>= 2`, so a wrong arity slid past all of them. */
+            if (node->intrinsic.arg_count != 2) {
+                checker_error(c, node->loc.line,
+                    "@cstr takes exactly 2 arguments (destination, source), got %d",
+                    node->intrinsic.arg_count);
+            }
             /* BUG-238: reject @cstr to const destination */
             if (node->intrinsic.arg_count >= 1 &&
                 node->intrinsic.args[0]->kind == NODE_IDENT) {
@@ -21097,6 +21150,110 @@ void checker_pop_module_scope(Checker *c) {
     pop_scope(c);
 }
 
+
+/* BUG-869: can this intrinsic NAME ever appear in a file-scope initializer?
+ *
+ * Extracted from the NODE_GLOBAL_VAR guard so the same question can be asked
+ * at EVERY position in the initializer expression rather than only at the top
+ * level. See find_nonconst_global_intrinsic below for why that matters.
+ * `tgt_nonnative_intn` is a property of the DECLARED type, computed by the
+ * caller. */
+static bool intrinsic_nonconst_at_file_scope(const char *gn, uint32_t gl,
+                                             bool tgt_nonnative_intn) {
+    if (!gn) return false;
+    /* Every @atomic_* form: a memory operation on a LIVE ADDRESS. */
+    if (gl >= 7 && memcmp(gn, "atomic_", 7) == 0) return true;
+    /* Runtime CPU / port / MMU / TLB / cache reads: never constant-foldable,
+     * whatever the arity. Measured by probing every recognised intrinsic in a
+     * global-initializer position and compiling the emitted C. */
+    if (gl == 6 && memcmp(gn, "expect", 6) == 0) return true;
+    if (gl >= 8 && memcmp(gn, "port_in", 7) == 0) return true;
+    if (gl >= 4 && memcmp(gn, "cpu_", 4) == 0) return true;
+    if (gl >= 4 && memcmp(gn, "mmu_", 4) == 0) return true;
+    if (gl >= 4 && memcmp(gn, "tlb_", 4) == 0) return true;
+    if (gl >= 6 && memcmp(gn, "cache_", 6) == 0) return true;
+    if (gl == 5 && memcmp(gn, "probe", 5) == 0) return true;
+    /* Lower to a ({ ... }) statement-expression, illegal at file scope. */
+    if (gl == 8 && memcmp(gn, "saturate", 8) == 0) return true;
+    if (gl == 7 && memcmp(gn, "bitcast", 7) == 0) return true;
+    /* @truncate folds to a constant `(T)val` cast ONLY for a NATIVE-width T;
+     * to a non-native uN/iN it emits a masking statement-expression. */
+    if (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) return true;
+    /* Lower to a runtime _zer_do_*() call. */
+    if (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
+                    memcmp(gn, "subb", 4) == 0 ||
+                    memcmp(gn, "mulw", 4) == 0)) return true;
+    return false;
+}
+
+/* BUG-869: find such an intrinsic ANYWHERE in a global initializer.
+ *
+ * The guard used to be a TOP-LEVEL KIND TEST — `if (ginit->kind ==
+ * NODE_INTRINSIC)` — so ONE wrapper defeated it entirely and the failure
+ * landed on GCC, naming a generated .c file the user never opened:
+ *
+ *     u32 G = @cpu_model_id();        // correctly rejected by ZER
+ *     u32 G = @cpu_model_id() + 1;    // accepted; GCC errors
+ *     u32 G = (u32)@cpu_model_id();   // accepted; GCC errors
+ *     u32 G = @saturate(u8,300) + 1;  // accepted; GCC errors
+ *
+ * This is the SIBLING of BUG-842, which split the `arg_count` precondition off
+ * the same guard and left the top-level-kind shape in place — one rule, two
+ * axes, one fixed at a time.
+ *
+ * Exhaustive no-default switch (-Werror=switch + walker_default_audit): a new
+ * NodeKind forces a decision here instead of silently reopening the hole.
+ * Returns the offending node, or NULL. */
+static Node *find_nonconst_global_intrinsic(Node *e, bool tgt_nonnative_intn,
+                                            int depth) {
+    if (!e || depth > 64) return NULL;
+    #define FNG(x) do { Node *_r = find_nonconst_global_intrinsic((x), tgt_nonnative_intn, depth + 1); if (_r) return _r; } while (0)
+    switch (e->kind) {
+    case NODE_INTRINSIC:
+        if (intrinsic_nonconst_at_file_scope(e->intrinsic.name,
+                                             (uint32_t)e->intrinsic.name_len,
+                                             tgt_nonnative_intn))
+            return e;
+        for (int i = 0; i < e->intrinsic.arg_count; i++) FNG(e->intrinsic.args[i]);
+        return NULL;
+    case NODE_BINARY:  FNG(e->binary.left); FNG(e->binary.right); return NULL;
+    case NODE_UNARY:   FNG(e->unary.operand); return NULL;
+    case NODE_TYPECAST: FNG(e->typecast.expr); return NULL;
+    case NODE_FIELD:   FNG(e->field.object); return NULL;
+    case NODE_INDEX:   FNG(e->index_expr.object); FNG(e->index_expr.index); return NULL;
+    case NODE_SLICE:   FNG(e->slice.object); FNG(e->slice.start); FNG(e->slice.end); return NULL;
+    case NODE_ORELSE:  FNG(e->orelse.expr); FNG(e->orelse.fallback); return NULL;
+    case NODE_CALL:
+        FNG(e->call.callee);
+        for (int i = 0; i < e->call.arg_count; i++) FNG(e->call.args[i]);
+        return NULL;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            FNG(e->struct_init.fields[i].value);
+        return NULL;
+    case NODE_ASSIGN:  FNG(e->assign.target); FNG(e->assign.value); return NULL;
+    /* Leaves and non-expression kinds: an initializer cannot contain them, and
+     * none of them can hide an intrinsic. Enumerated explicitly, no default:. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return NULL;
+    }
+    #undef FNG
+    return NULL;
+}
+
 /* check function bodies only (declarations already registered) */
 bool checker_check_bodies(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return false;
@@ -21185,79 +21342,30 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * rationale that the CHECKER should be the one to reject, so the message
              * names the ZER line — but adding names without splitting the condition
              * changes nothing for a zero-arg intrinsic, which is exactly the trap. */
-            if (ginit->kind == NODE_INTRINSIC) {
-                const char *gn = ginit->intrinsic.name;
-                uint32_t gl = (uint32_t)ginit->intrinsic.name_len;
-                /* G7 (2026-08-01): these can NEVER appear in a file-scope
-                 * initializer, even with CONSTANT args — so unlike the bit-query
-                 * gate above there is no eval_const_expr condition. @saturate
-                 * lowers to a ({...}) statement-expression (illegal at file
-                 * scope); @addc/@subb/@mulw lower to a runtime _zer_do_*() call
-                 * ("initializer element is not constant").
-                 *
-                 * Verified on main: the CHECKER emitted ZERO diagnostics — the
-                 * program was only stopped by GCC, with a cryptic error naming
-                 * the generated .c file. Same shape as the §D3 spawn hole: an
-                 * accident of the C backend masking a silent checker. Reject
-                 * cleanly here so the message names the ZER line and the fix.
-                 *
-                 * @bitcast ALWAYS lowers to a ({ ... memcpy ... }) statement-
-                 * expression (never a constant cast), so it can never be a
-                 * file-scope initializer. @truncate folds to a constant `(T)val`
-                 * cast ONLY for a NATIVE-width T; to a NON-NATIVE uN/iN it emits a
-                 * masking ({ ... }) statement-expr. Both were wrongly excluded — the
-                 * prior comment claimed they "fold to a constant cast", which is
-                 * false — so the checker accepted them and GCC then rejected the
-                 * emitted .c with "braced-group within expression allowed only
-                 * inside a function": the same silent-checker / loud-backend shape
-                 * as @saturate. A native-width @truncate global still compiles. */
+            /* BUG-869: ask the "can this intrinsic exist at file scope?"
+             * question at EVERY position in the initializer, not only at the
+             * top level. `if (ginit->kind == NODE_INTRINSIC)` meant ONE wrapper
+             * — a `+ 1`, a cast, a unary minus, being someone's argument —
+             * defeated the whole guard, and the failure then landed on GCC
+             * naming a generated .c file the user never opened. Sibling of
+             * BUG-842, which split the arg_count precondition off this same
+             * guard and left the top-level-kind shape untouched. */
+            {
                 bool tgt_nonnative_intn = false;
-                {
-                    TypeKind tk = type_dispatch_kind(type); /* unwraps distinct, NULL-safe */
-                    if (tk == TYPE_UINT || tk == TYPE_SINT) {
-                        uint32_t nb = type_unwrap_distinct(type)->intn.bits;
-                        tgt_nonnative_intn =
-                            !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
-                    }
+                TypeKind tk = type_dispatch_kind(type); /* unwraps distinct, NULL-safe */
+                if (tk == TYPE_UINT || tk == TYPE_SINT) {
+                    uint32_t nb = type_unwrap_distinct(type)->intn.bits;
+                    tgt_nonnative_intn =
+                        !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
                 }
-                /* Every @atomic_* form. An atomic is a memory operation on a LIVE
-                 * ADDRESS and can never be a compile-time constant, yet it was
-                 * missing from this list — and what the user got depended on how
-                 * many characters the name happened to have. The AST atomic branch
-                 * is gated `nlen >= 10`, so `@atomic_or` (9) missed it and fell to
-                 * the generic marker (loud, and at least named), while
-                 * `@atomic_xchg` and the five _fetch forms entered the branch,
-                 * matched none of its arms, and the arm had no else — emitting the
-                 * EMPTY STRING: `uint32_t gres = ;`. A C syntax error in generated
-                 * code the user never wrote, reported at a line in a file they never
-                 * opened. Both halves of that length axis are closed here. */
-                bool is_atomic = (gl >= 7 && memcmp(gn, "atomic_", 7) == 0);
-                /* Runtime CPU/port reads: constant-foldable NEVER, whatever the
-                 * arity. Measured by probing all recognised intrinsics in a
-                 * global-initializer position and compiling the emitted C. */
-                bool is_runtime_read =
-                    (gl == 6 && memcmp(gn, "expect", 6) == 0) ||
-                    (gl >= 8 && memcmp(gn, "port_in", 7) == 0) ||
-                    (gl >= 4 && memcmp(gn, "cpu_", 4) == 0) ||
-                    (gl >= 4 && memcmp(gn, "mmu_", 4) == 0) ||
-                    (gl >= 4 && memcmp(gn, "tlb_", 4) == 0) ||
-                    (gl >= 6 && memcmp(gn, "cache_", 6) == 0) ||
-                    (gl == 5 && memcmp(gn, "probe", 5) == 0);
-                int is_nonconst_emit =
-                    is_atomic || is_runtime_read ||
-                    (gl == 8 && memcmp(gn, "saturate", 8) == 0) ||
-                    (gl == 7 && memcmp(gn, "bitcast", 7) == 0) ||
-                    (gl == 8 && memcmp(gn, "truncate", 8) == 0 && tgt_nonnative_intn) ||
-                    (gl == 4 && (memcmp(gn, "addc", 4) == 0 ||
-                                 memcmp(gn, "subb", 4) == 0 ||
-                                 memcmp(gn, "mulw", 4) == 0));
-                if (is_nonconst_emit) {
+                Node *bad = find_nonconst_global_intrinsic(ginit, tgt_nonnative_intn, 0);
+                if (bad) {
                     checker_error(c, decl->loc.line,
                         "global variable '%.*s' initializer cannot use @%.*s — it "
                         "does not lower to a compile-time-constant value at global "
                         "scope. Use a literal, or compute it in a function body",
                         (int)decl->var_decl.name_len, decl->var_decl.name,
-                        (int)gl, gn);
+                        (int)bad->intrinsic.name_len, bad->intrinsic.name);
                 }
             }
             /* BUG-867 sibling: the LOCAL declaration site names this exactly

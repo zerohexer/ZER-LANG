@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: is a fence and takes no arguments
+// BUG-870: a fence takes no operands and the arity was unchecked, so this
+// compiled and SILENTLY DROPPED all three arguments.
+u32 main() { @barrier(1, 2, 3); return 0; }

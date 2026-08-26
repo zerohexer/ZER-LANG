@@ -1,0 +1,35 @@
+// BOUNDARY POSITIVES for BUG-870. @offset and @container both spell the FIELD
+// last, which is what the shared exemption keys on — but they do NOT share an
+// arity (2 pieces vs 3), and treating them as if they did rejected every valid
+// @container. These are the forms that must keep compiling.
+struct P { u32 a; u32 b; }
+struct D { u32 x; }
+struct Dev { u32 pad; D list; }
+
+u32 G_POP = @popcount(7) + 1;
+
+u32 main() {
+    if (@offset(P, b) != 4) { return 1; }
+
+    Dev d;
+    d.pad = 9;
+    *D p = &d.list;
+    *Dev q = @container(*Dev, p, list);
+    if (q.pad != 9) { return 2; }
+
+    @barrier();
+    @barrier_store();
+    @barrier_load();
+    @barrier_acq_rel();
+    @barrier_dma();
+
+    u8[8] buf;
+    const [*]u8 s = "hi";
+    @cstr(buf, s);
+    if (buf[0] != 104) { return 3; }   // 'h'
+
+    // Constant-foldable intrinsics stay legal in a global initializer, wrapped
+    // or not — the BUG-869 walk must not widen into them.
+    if (G_POP != 4) { return 4; }
+    return 0;
+}

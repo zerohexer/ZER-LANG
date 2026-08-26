@@ -238,10 +238,51 @@ result stays a bool; an array sized by a wrapping comptime expression really is
 255 elements). It exits **55** on the pre-fix build, **57** with only the width
 half fixed, and **0** now.
 
+### BUG-869 — the global-initializer guard was a TOP-LEVEL KIND TEST
+
+    u32 G = @cpu_model_id();        // correctly rejected
+    u32 G = @cpu_model_id() + 1;    // accepted; GCC errors
+    u32 G = (u32)@cpu_model_id();   // accepted; GCC errors
+    u32 G = @saturate(u8,300) + 1;  // accepted; GCC errors
+    u32 G = @truncate(u8, @cpu_model_id());  // accepted; GCC errors
+
+`if (ginit->kind == NODE_INTRINSIC)` asks the question at exactly one position,
+so ONE wrapper — a binary, a cast, a unary minus, being someone else's argument
+— defeated the whole guard, and the failure landed on GCC naming a generated .c
+file the user never opened.
+
+**This is the SIBLING of BUG-842**, which split the `arg_count` precondition off
+this same guard and left the top-level-kind shape untouched: one rule, two axes,
+one fixed at a time. Now an exhaustive no-default walk over the initializer
+(`find_nonconst_global_intrinsic`), with the name test extracted so both halves
+ask the same question. The constant-foldable intrinsics are untouched —
+`u32 G_POP = @popcount(7) + 1;` still compiles, and is pinned as a boundary
+positive.
+
+### BUG-870 — three intrinsics silently DROPPED arguments
+
+    @barrier(1, 2, 3);              // a fence — all three discarded
+    @cstr(b);                       // source taken from whatever was last
+    @cstr(b, s, s);                 // one silently dropped
+    @offset(P, a, 1, 2);            // "undefined identifier 'a'"
+
+Every `@cstr` check is written `arg_count >= 1` / `>= 2`, so a wrong arity slid
+past all of them. `@offset` names a FIELD in its LAST argument and the argument
+loop exempts exactly that position from value lookup — with a wrong arity the
+field name is no longer last, so it resolved as a variable and the user got a
+diagnostic about the wrong thing entirely. The arity is therefore reported
+BEFORE the argument loop, and the loop is skipped when its premise no longer
+holds.
+
+One trap while fixing it, caught by a boundary positive: `@offset` and
+`@container` both spell the field last, which is what the shared exemption keys
+on, but they do NOT share an arity (2 pieces vs 3). Treating them as if they did
+rejected every valid `@container`.
+
 ### The corpus has no optimisation-dependent behaviour — measured
 
-`tools/ub_sweep.sh` over `tests/zer`: **549 programs, four builds each, zero
-divergences.** A negative result worth recording, because it is the first time
+`tools/ub_sweep.sh` over `tests/zer`, then over `rust_tests` + `zig_tests`:
+**1124 programs, four builds each, zero divergences.** A negative result worth recording, because it is the first time
 the claim has been measured rather than assumed, and it is what the recent UB
 fixes (the float->integer trap, the shift guards, `-fwrapv`) were supposed to
 buy. Two of the sweep's first three "divergences" were its own harness missing

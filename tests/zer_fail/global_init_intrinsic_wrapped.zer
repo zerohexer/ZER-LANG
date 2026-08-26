@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: does not lower to a compile-time-constant value
+// BUG-869: the global-initializer guard was a TOP-LEVEL KIND TEST
+// (`if (ginit->kind == NODE_INTRINSIC)`), so ONE wrapper defeated it and the
+// failure landed on GCC naming a generated .c file the user never opened. The
+// BARE form `u32 G = @cpu_model_id();` was already rejected; `+ 1` was not.
+// Sibling of BUG-842, which split the arg_count precondition off this same
+// guard and left the top-level-kind shape untouched.
+u32 G = @cpu_model_id() + 1;
+u32 main() { return G; }

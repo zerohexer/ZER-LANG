@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: @offset takes exactly 2 arguments
+// BUG-870: @offset names a FIELD in its last argument and the arg loop exempts
+// exactly that position from being looked up as a value. With a wrong arity
+// the field name is no longer last, so it resolved as a variable and the user
+// got "undefined identifier 'a'" — a diagnostic about the wrong thing.
+struct P { u32 a; }
+u32 main() { return (u32)@offset(P, a, 1, 2); }

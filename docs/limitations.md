@@ -288,36 +288,6 @@ must be updated, not deleted.
 
 ---
 
-## OPEN — comptime array-element bindings carry no width (LOW, found 2026-08-22)
-
-BUG-844 established the declared width at the three comptime binding sinks (params via
-two call paths, and local var-decls) and applies it at every binary and unary operation,
-so the interpreter now agrees with the emitted code for every scalar, signed,
-mixed-width and nested-call form. **Array elements are the one binding kind still
-unwidthed** — `ComptimeParam.array_values` is a bare `int64_t *` with no per-element
-width, so:
-
-    comptime u32 a_elem() { u8[2] v; v[0] = 200; v[1] = 100; return v[0] + v[1]; }
-
-folds to 300 where the runtime gives 44. Measured precisely: 4z36e0's
-`tests/zer/comptime_width_wrap_all_forms.zer` exits **55**, which is exactly that
-check; every other form in that file passes. Not shipped as a test here because it
-would be a known-failing positive — pjtawx's `comptime_width_wrap_agreement.zer` (which
-passes) is installed instead.
-
-**Fix sketch:** `array_values` needs the element width alongside it. The array binding
-sites are the same `ct_ctx_set`/`ct_ctx_set_w` family; give the array form the element
-type's width from the declared `T[N]` and wrap on element store and on element read.
-Same shape as the scalar fix, one more sink.
-
-**Why it is LOW:** the wrong value is a compile-time constant in a comptime function
-using an array of a NON-native-width type, which no corpus program does — the corpus
-cost of the whole BUG-844 change measured zero. It is recorded because a silent
-disagreement between the interpreter and the emitted code is the exact class BUG-844
-exists to close, and a partially-closed class is how this one came back.
-
----
-
 ## OPEN — harvest tracker: five `claude/vigilant-tesla-*` branches, verified against main 2026-08-22
 
 **Status: NOT implemented. This is a catalog, not a changelog.** Every row below was

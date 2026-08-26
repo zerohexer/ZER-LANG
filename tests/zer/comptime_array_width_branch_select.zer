@@ -1,0 +1,31 @@
+// BUG-868, and a CORRECTION to how the gap was rated.
+//
+// docs/limitations.md carried this as "LOW: the wrong value is a compile-time
+// constant in a comptime function using an array of a NON-native-width type,
+// which no corpus program does". The wrong VALUE is low-impact. What the
+// entry did not say is that the same wrongness selects a BRANCH:
+//
+//     comptime u32 f() { u8[2] v; v[0]=200; v[1]=100; return v[0]+v[1]; }
+//     comptime if (f() > 255) { ... }     // 300 > 255 -> takes the wrong arm
+//
+// Conditional compilation then EMITS THE WRONG CODE and discards the right
+// arm, with no diagnostic anywhere. Measured on the pre-fix build: this file
+// exits 1 (wrong arm) and 0 after. The scalar spelling one line below has been
+// correct since BUG-844; the array spelling is what BUG-868 closed.
+comptime u32 arr_sum()    { u8[2] v; v[0] = 200; v[1] = 100; return v[0] + v[1]; }
+comptime u32 scalar_sum() { u8 a = 200; u8 b = 100; return a + b; }
+comptime u32 arr_store()  { u8[1] v; u8 h = 200; v[0] = h; v[0] += h; return v[0]; }
+
+u32 main() {
+    // Both fold to 44 in 8 bits, so neither comparison may be taken.
+    comptime if (arr_sum() > 255)    { return 1; }
+    comptime if (scalar_sum() > 255) { return 2; }
+    // 200 + 200 = 400, which is 144 in 8 bits — also not above 255.
+    comptime if (arr_store() > 255)  { return 3; }
+
+    // And the values themselves must match what the runtime computes.
+    if (arr_sum() != 44)     { return 4; }
+    if (scalar_sum() != 44)  { return 5; }
+    if (arr_store() != 144)  { return 6; }
+    return 0;
+}

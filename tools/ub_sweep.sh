@@ -75,7 +75,7 @@ for d in $DIRS; do
         fi
         [ -s "$TMP/$name.c" ] || { unbuildable=$((unbuildable + 1)); continue; }
 
-        base_out=""; base_rc=""; ok=1; report=""
+        base_out=""; base_rc=""; ok=1; report=""; nobuild=0
         ci=0
         for cfg in "${CONFIGS[@]}"; do
             ci=$((ci + 1))
@@ -84,9 +84,15 @@ for d in $DIRS; do
             extra="-fno-strict-aliasing"
             case "$cfg" in *-fstrict-aliasing*) extra="" ;; esac
             # shellcheck disable=SC2086
-            if ! gcc -std=c99 $cfg -fwrapv $extra -w -o "$TMP/$name.bin" \
+            # A build failure is NOT a divergence. Some programs need an
+            # include path for a cinclude'd header that lives beside the .zer;
+            # pass the source's own directory. If it still will not build, count
+            # it as not-built rather than reporting it as UB, which is what the
+            # first run of this sweep did (2 of its 3 "divergences" were
+            # `cinclude` tests missing -I).
+            if ! gcc -std=c99 $cfg -fwrapv $extra -w -I "$d" -o "$TMP/$name.bin" \
                      "$TMP/$name.c" >/dev/null 2>&1; then
-                ok=0; report="$report\n    (config '$cfg' failed to BUILD)"; break
+                nobuild=1; break
             fi
             out=$(timeout "$TIMEOUT" "$TMP/$name.bin" 2>&1); rc=$?
             if [ "$ci" -eq 1 ]; then
@@ -99,6 +105,9 @@ for d in $DIRS; do
             fi
         done
 
+        if [ "$nobuild" -eq 1 ]; then
+            unbuildable=$((unbuildable + 1)); continue
+        fi
         checked=$((checked + 1))
         if [ "$ok" -eq 0 ]; then
             diverged=$((diverged + 1))

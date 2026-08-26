@@ -194,6 +194,60 @@ was order-dependent. The global site also gained the LOCAL site's precise
 diagnostic for a mutable string slice ("string literal is read-only"), which it
 had been answering with the generic mismatch.
 
+### BUG-868 — the comptime interpreter still disagreed with the emitted code, on ARRAYS
+
+BUG-844 established a per-BINDING width for scalars and applied it at every
+operation. **Array-element bindings were the one kind left unwidthed**, and the
+`docs/limitations.md` entry recording that gap named the exact test that proves
+it. Closing it turned up TWO defects, not one:
+
+    comptime u32 a_elem()  { u8[2] v; v[0]=200; v[1]=100; return v[0]+v[1]; }
+    comptime u32 a_store() { u8[1] v; u8 h=200; v[0]=h; v[0]+=h; return v[0]; }
+
+- `ComptimeParam.array_values` carried no element width — the field was never
+  written for an array binding at all, so it also read whatever the grown
+  malloc buffer happened to hold — **and `ct_expr_bits` had no `NODE_INDEX`
+  arm**, so `v[0] + v[1]` derived width 0 and was never wrapped. Folded 300
+  where the runtime gives 44. The missing `NODE_INDEX` arm is the load-bearing
+  half: setting the width without it changes nothing, which is what the first
+  attempt measured.
+- The array-element assignment path **ignored `assign.op` entirely** and stored
+  the bare RHS, so `v[0] += h;` silently discarded the `+`. That is a wrong
+  answer folded into the emitted C independent of any width question, and it is
+  now one shared `ct_apply_assign_op` with the scalar path rather than a second
+  copy of the operator switch.
+
+**And a CORRECTION to how the gap was rated.** `docs/limitations.md` carried it
+as LOW, on the grounds that "the wrong value is a compile-time constant in a
+comptime function using an array of a non-native-width type, which no corpus
+program does". The wrong VALUE is indeed low-impact. What the entry did not say
+is that the same wrongness selects a BRANCH:
+
+    comptime if (arr_sum() > 255) { ... }    // 300 > 255 — takes the wrong arm
+
+Conditional compilation then EMITS THE WRONG CODE and discards the right arm,
+with no diagnostic anywhere. Measured on the pre-fix build:
+`tests/zer/comptime_array_width_branch_select.zer` exits 1, and 0 after. A
+severity call made from the shape of the wrong value missed what the value is
+USED for.
+
+Pinned by `tests/zer/comptime_width_wrap_all_forms.zer` — 158 lines taken
+verbatim from the branch that wrote it, covering every binding form plus the
+over-rejection controls (a wider operand still decides the width; a comparison
+result stays a bool; an array sized by a wrapping comptime expression really is
+255 elements). It exits **55** on the pre-fix build, **57** with only the width
+half fixed, and **0** now.
+
+### The corpus has no optimisation-dependent behaviour — measured
+
+`tools/ub_sweep.sh` over `tests/zer`: **549 programs, four builds each, zero
+divergences.** A negative result worth recording, because it is the first time
+the claim has been measured rather than assumed, and it is what the recent UB
+fixes (the float->integer trap, the shift guards, `-fwrapv`) were supposed to
+buy. Two of the sweep's first three "divergences" were its own harness missing
+`-I` for a `cinclude`d header; a build failure is now counted as not-built
+rather than reported as UB.
+
 ### Compiler-internal defects found in the build warnings
 
 - **`lower_expr` could fall off the end** and return an indeterminate local id,

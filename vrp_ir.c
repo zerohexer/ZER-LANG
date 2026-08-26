@@ -7,8 +7,41 @@
  *
  * Phase 7 of IR implementation. See docs/IR_Implementation.md Part 6.
  *
- * Status: FOUNDATION — core range tracking framework. Does NOT yet
- * replace the AST VRP. Both coexist during migration.
+ * ============================================================================
+ * STATUS: ORPHANED. THIS FILE IS NOT COMPILED AND NOTHING CALLS IT.
+ * ============================================================================
+ *
+ * Verified 2026-08-26, and it has been true for a long time:
+ *
+ *     grep -c vrp_ir Makefile            -> 0   (in NEITHER source list)
+ *     grep -rn vrp_ir *.c *.h            -> 0   (outside this file)
+ *     strings zerc | grep -c vrp_ir      -> 0
+ *
+ * The header used to say "does not YET replace the AST VRP. Both coexist
+ * during migration", which reads as *live but secondary code*. It is neither:
+ * it is dead. Nothing in this file has ever run in a shipped compiler, so
+ * nothing in it has ever been tested, and a reader who trusts the old wording
+ * would credit ZER with range analysis it does not perform. That is the same
+ * false-confidence failure this project records for a stale gate — one level
+ * down, in the source.
+ *
+ * The AUTHORITATIVE value-range analysis is the checker's `VarRange` machinery
+ * (checker.c: `find_var_range` / `push_var_range` / the `vrp_snap_*` JOIN
+ * helpers). Every bounds and division decision the compiler actually makes
+ * comes from there. If you are looking for VRP, that is where it lives.
+ *
+ * WHY IT IS KEPT RATHER THAN DELETED. Wiring a CFG-based VRP is the
+ * architectural direction (per-block ranges with a real JOIN retire the
+ * per-node-kind snapshot/restore patchwork that CLAUDE.md lists as a
+ * multi-site class with NO automated gate). This file is the started sketch of
+ * that. What has NOT survived is the urgency: its original headline
+ * justification — that it retires a live under-rejection — was BH-18 #2, fixed
+ * 2026-06-26, and 13 probes since then show every post-join index correctly
+ * auto-guarded.
+ *
+ * If you wire it: add it to BOTH Makefile source lists, give it a caller, and
+ * treat every function here as UNTESTED code being introduced for the first
+ * time, not as existing code being switched on.
  */
 
 #include "ir.h"

@@ -1,0 +1,18 @@
+// BUG-911: a global whose initializer NAMES another global was emitted verbatim
+// and C refuses that at file scope — GCC said "initializer element is not
+// constant", naming a .c file the user never opened. In ZER a `const` global IS
+// a compile-time constant, so the answer is to FOLD it, not to ban it.
+//
+// This asserts at RUNTIME and WRITES AT THE LAST INDEX, because the documented
+// trap is that teaching only the CHECKER leaves the EMITTER sizing the array 0:
+// a compile-only test passes that. Measured in the emitted C: uint8_t buf[260].
+const u32 CAP = 256;
+const u32 BIG = CAP + 4;
+u8[BIG] buf;
+
+u32 main() {
+    if (BIG != 260) { return 1; }
+    buf[BIG - 1] = 9;
+    if (buf[259] != 9) { return 2; }
+    return 0;
+}

@@ -5,6 +5,108 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
+
+`claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of
+its fifteen items were already closed here. Four were not, and one of those is a row I had
+PARKED with a severity rating that turns out to be wrong.
+
+Also recorded below: one place where **main's rule is better and the branch's was not
+taken**, and two of its negatives I am **rejecting outright**.
+
+### BUG-909 — `spawn` had NO arity check at all
+```
+void worker(u32 v) { }
+spawn worker();          // accepted
+spawn worker(1, 2, 3);   // accepted
+```
+The per-argument loop is bounded by `i < pc`, so every EXTRA argument was silently dropped
+and every MISSING one left the parameter reading the thread-argument struct's auto-zeroed
+slot. The DIRECT call `worker(1,2,3)` is rejected by `NODE_CALL`; the `spawn` spelling of
+the same program reached GCC with no source line and no ZER diagnostic — the
+two-spellings-of-one-program disagreement this codebase keeps finding. Variadic targets are
+excluded (spawning one is separately banned as an unchecked boundary). 27 spawn positives
+unaffected.
+
+### BUG-910 — `@saturate` was the THIRD door into an enum, and MY fix missed it
+BUG-843 closed `@bitcast`. BUG-891 added the carrier walk and wired `@truncate` at both
+dispatch paths — **and left `@saturate`**, which reaches an enum target just as directly:
+`@saturate(State, 7)` forged a value outside the variant set and the exhaustive switch
+silently ran its LAST arm. Measured before the fix: **exit 3, no trap.**
+
+That is the same multi-site tax BUG-891's own commit message was about. Enumerating the
+doors and fixing two of three is how the class survives.
+
+`@cast` is NOT a fourth door — verified, not assumed: it requires a distinct typedef and
+cannot name a bare enum. The carrier shape is closed by the checker for this intrinsic
+(`@saturate` target must be an integer type), so the three doors are the whole set.
+
+WRAPPED rather than threaded into the clamp: the two dispatch paths compute the clamp
+differently and its value is a bare ternary, not an lvalue the guard can name. Binding the
+finished result to a temp reuses each path's emission VERBATIM, so the guard cannot drift
+from the clamp it guards. Ordinary `@saturate` verified unchanged (127 / 255 / 2147483648).
+
+### BUG-911 — a global initializer naming another global
+```
+const u32 CAP = 256;
+const u32 BIG = CAP + 4;   // GCC: "initializer element is not constant"
+```
+No ZER diagnostic — a raw backend error naming a `.c` file the user never opened. In ZER a
+`const` global IS a compile-time constant, so this is a valid program the BACKEND happened
+to refuse; the answer is to FOLD it, not ban it.
+
+The fold is IN PLACE for the reason BUG-899 already documents: the emitter evaluates
+independently, so teaching only the checker leaves it sizing the array 0 — and a
+compile-only test passes that. Verified in the emitted C: `uint8_t buf[260]`, and the test
+WRITES AT THE LAST INDEX at runtime. Note the emitted `uint32_t CAP` is not `const` in C,
+so without the fold the array is a VLA even where GCC accepts it.
+
+Placed AFTER the existing checks so it cannot fold away an expression an earlier rule needs
+to see; BUG-869's global-init intrinsic guard is verified still to fire, and
+`@popcount(7) + 1` at file scope still compiles.
+
+### BUG-912 — comptime ARRAY-element bindings carried no width, AND A SEVERITY CALL I GOT WRONG
+BUG-844 established a per-binding width for scalars. Array-element bindings were the one
+kind left, and closing it needed two halves: `ComptimeParam.array_values` never carried an
+element width, and `ct_expr_bits` had no `NODE_INDEX` arm — the load-bearing half, since
+setting the width without it changes nothing. Separately, the array-element assignment path
+ignored `assign.op` entirely, so `v[0] += h;` silently discarded the `+`.
+
+**I parked this as LOW**, on the grounds that "the wrong value is a compile-time constant".
+That is the error. The wrong VALUE is low-impact; what I missed is what the value is USED
+FOR — `comptime if (arr_sum() > 255)` takes the wrong arm, so **conditional compilation
+emits the wrong code and discards the right one**, with no diagnostic anywhere. A severity
+call made from the shape of the wrong value, not from its consequence. `all_forms` exits 55
+pre-fix and 0 now; `branch_select` exits 1 pre-fix and 0 now.
+
+### Where MAIN's rule is better — measured, not argued
+osp1a7 replaces the non-null global funcptr rule with a WHOLE-FILE question ("is it
+assigned anywhere?") to keep the C-style callback registry compiling. I built the branch and
+ran the conditional-registration shape against it:
+
+```
+void (*saved_cb)(u32);
+void maybe_register(bool c) { if (c) { saved_cb = my_handler; } }
+maybe_register(false);  saved_cb(5);
+```
+
+osp1a7 **accepts** it, and its emitted C contains a bare `saved_cb(_zer_t1)` with **no
+guard** — an unguarded indirect call through a null pointer. "Assigned somewhere in the
+file" does not prove "assigned before this call". Main's rule (initializer or `?`) rejects
+it, and the ZER spelling works: `?void (*cb)(u32) = null;` + `if (saved_cb) |cb|` runs
+clean. Soundness is the hard wall; over-rejection is the soft gradient. Main's stays.
+
+### Two of its negatives REJECTED
+`u32 a = ~0;` and `a = 0 - 1;` are proposed as "no implicit sign conversion" errors. They
+are not the same thing as `u32 a = -1;`. That one converts a NEGATIVE CONSTANT to unsigned;
+these are UNSIGNED OPERATIONS whose result happens to have the high bit set — no conversion
+occurs. Measured rather than argued: `~0` appears **6 times** in the corpus (plus 6 `~(`
+and a dozen other `~N`) and is the canonical all-ones idiom, and `0 - 1` wrapping is a
+documented ZER guarantee — "overflow wraps", stated twice in CLAUDE.md. Rejecting either
+would contradict the language's own spec.
+
+---
+
 ## Session 2026-08-26g — BUG-908: linking two allocations from the SAME arena
 
 Adopted from `claude/vigilant-tesla-qa249l` (`9013ada3`, the BUG-848 half). **This closes

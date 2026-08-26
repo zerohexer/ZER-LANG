@@ -1,0 +1,12 @@
+// expect-trap
+// BUG-910: @saturate was the THIRD door into an enum target and had no
+// variant guard. BUG-843 closed @bitcast, BUG-891 added the carrier walk and
+// @truncate at both dispatch paths — and left this sibling. Measured on a
+// pre-fix build: exit 3, the exhaustive switch silently ran its LAST arm for
+// a value that is neither variant. Main resolves this class by TRACKING, so
+// the correct outcome is a TRAP at the point of forgery, not a rejection.
+enum State { idle, running, done }
+u32 main() {
+    State s = @saturate(State, 7);
+    switch (s) { .idle => { return 1; } .running => { return 2; } .done => { return 3; } }
+}

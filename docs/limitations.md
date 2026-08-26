@@ -503,7 +503,17 @@ must be updated, not deleted.
 
 ---
 
-## OPEN — comptime array-element bindings carry no width (LOW, found 2026-08-22)
+## CLOSED 2026-08-27 (BUG-912) — comptime array-element bindings carry no width
+
+**The LOW rating was WRONG, and that is the lesson.** The entry argued the impact was low
+because "the wrong value is a compile-time constant". The wrong VALUE is low-impact; what
+the entry missed is what the value is USED FOR — `comptime if (arr_sum() > 255)` takes the
+wrong arm, so conditional compilation EMITS THE WRONG CODE and discards the right one, with
+no diagnostic anywhere. A severity call made from the shape of the wrong value rather than
+from its consequence. Closed from `osp1a7`; `all_forms` 55 -> 0, `branch_select` 1 -> 0.
+
+### Original entry, kept for the measurement
+
 
 BUG-844 established the declared width at the three comptime binding sinks (params via
 two call paths, and local var-decls) and applies it at every binary and unary operation,

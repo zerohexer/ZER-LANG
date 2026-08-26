@@ -3589,6 +3589,22 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
+                /* BUG-910: @saturate is the THIRD door into an enum target, and it
+                 * had no variant guard. BUG-843 closed @bitcast; BUG-891 added the
+                 * carrier walk and @truncate at both dispatch paths — and left this
+                 * sibling, so `@saturate(State, 7)` still forged a value outside the
+                 * variant set and the exhaustive switch silently ran its LAST arm
+                 * (measured: exit 3, no trap). @cast is NOT a fourth door: it
+                 * requires a distinct typedef and cannot name a bare enum.
+                 *
+                 * WRAPPED rather than threaded into the clamp: the two dispatch
+                 * paths compute the clamp differently and its value is a bare
+                 * ternary, not an lvalue the guard can name. Binding the finished
+                 * result to a temp reuses each path's emission VERBATIM, so the
+                 * guard cannot drift from the clamp it guards. */
+                bool sat_enum = t && type_carries_enum_e(t, 0);
+                int seg = sat_enum ? e->temp_count++ : 0;
+                if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
@@ -3624,6 +3640,12 @@ static void emit_expr(Emitter *e, Node *node) {
                         emit(e, "(int64_t)_zer_sat%d", tmp);
                 }
                 emit(e, "; })");
+                if (sat_enum) {
+                    char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
+                    emit(e, "); ");
+                    emit_enum_variant_guard_path(e, t, segp, "@saturate", 0);
+                    emit(e, "_zer_seg%d; })", seg);
+                }
             } else {
                 emit(e, "0");
             }
@@ -7928,6 +7950,22 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
+                /* BUG-910: @saturate is the THIRD door into an enum target, and it
+                 * had no variant guard. BUG-843 closed @bitcast; BUG-891 added the
+                 * carrier walk and @truncate at both dispatch paths — and left this
+                 * sibling, so `@saturate(State, 7)` still forged a value outside the
+                 * variant set and the exhaustive switch silently ran its LAST arm
+                 * (measured: exit 3, no trap). @cast is NOT a fourth door: it
+                 * requires a distinct typedef and cannot name a bare enum.
+                 *
+                 * WRAPPED rather than threaded into the clamp: the two dispatch
+                 * paths compute the clamp differently and its value is a bare
+                 * ternary, not an lvalue the guard can name. Binding the finished
+                 * result to a temp reuses each path's emission VERBATIM, so the
+                 * guard cannot drift from the clamp it guards. */
+                bool sat_enum = t && type_carries_enum_e(t, 0);
+                int seg = sat_enum ? e->temp_count++ : 0;
+                if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -7978,6 +8016,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
                 emit_type(e, t);
                 emit(e, ")_zer_sat%d; })", tmp);
+                if (sat_enum) {
+                    char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
+                    emit(e, "); ");
+                    emit_enum_variant_guard_path(e, t, segp, "@saturate", 0);
+                    emit(e, "_zer_seg%d; })", seg);
+                }
             }
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             /* @bitcast(T, val) → memcpy type punning */

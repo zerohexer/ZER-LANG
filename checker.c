@@ -4621,6 +4621,23 @@ static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
             }
         return 0;
     }
+    /* BUG-868: an ARRAY ELEMENT read carries the element's width, exactly as a
+     * scalar ident carries the binding's. Without this arm `v[0] + v[1]` on a
+     * `u8[2]` derived width 0 and the sum was never wrapped, so the
+     * interpreter folded 300 where the runtime gives 44 — the last unwidthed
+     * binding kind, and the half of BUG-844 that was left open. */
+    if (n->kind == NODE_INDEX && n->index_expr.object &&
+        n->index_expr.object->kind == NODE_IDENT) {
+        const char *an = n->index_expr.object->ident.name;
+        uint32_t al = (uint32_t)n->index_expr.object->ident.name_len;
+        for (int i = 0; i < param_count; i++)
+            if (params[i].array_values && params[i].name_len == al &&
+                memcmp(params[i].name, an, al) == 0) {
+                if (is_signed) *is_signed = params[i].is_signed;
+                return params[i].bits;
+            }
+        return 0;
+    }
     if (n->kind == NODE_UNARY)
         return ct_expr_bits(n->unary.operand, params, param_count, is_signed, depth + 1);
     if (n->kind == NODE_BINARY) {
@@ -4657,7 +4674,12 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
                 int64_t idx = eval_const_expr_subst(n->index_expr.index, params, param_count);
                 if (idx == CONST_EVAL_FAIL || idx < 0 || idx >= params[i].array_size)
                     return CONST_EVAL_FAIL;
-                return params[i].array_values[idx];
+                /* BUG-868: wrap on READ as well as on store. The store site
+                 * covers values the interpreter itself wrote; this covers a
+                 * binding whose values were planted by a caller before the
+                 * width was known. */
+                return ct_wrap(params[i].array_values[idx],
+                               params[i].bits, params[i].is_signed);
             }
         }
         return CONST_EVAL_FAIL;
@@ -4743,6 +4765,30 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
 }
 
 
+/* Apply a compound-assignment operator. Shared by the scalar and the
+ * ARRAY-ELEMENT assignment paths — the array path used to ignore
+ * `asgn->assign.op` entirely and behave as if every store were a plain `=`,
+ * so `v[0] += h;` in a comptime function silently discarded the `+` and left
+ * `v[0] == h`. That is a WRONG ANSWER folded into the emitted C, independent
+ * of any width question. Returns false when the operator is not one this
+ * interpreter models. */
+static bool ct_apply_assign_op(int op, int64_t cur, int64_t rhs, int64_t *out) {
+    switch (op) {
+    case TOK_EQ:        *out = rhs; return true;
+    case TOK_PLUSEQ:    *out = cur + rhs; return true;
+    case TOK_MINUSEQ:   *out = cur - rhs; return true;
+    case TOK_STAREQ:    *out = cur * rhs; return true;
+    case TOK_SLASHEQ:   *out = rhs ? cur / rhs : 0; return true;
+    case TOK_PERCENTEQ: *out = rhs ? cur % rhs : 0; return true;
+    case TOK_LSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; return true;
+    case TOK_RSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? cur >> rhs : 0; return true;
+    case TOK_AMPEQ:     *out = cur & rhs; return true;
+    case TOK_PIPEEQ:    *out = cur | rhs; return true;
+    case TOK_CARETEQ:   *out = cur ^ rhs; return true;
+    default: return false;
+    }
+}
+
 /* Evaluate a comptime assignment: compute RHS, apply operator, update ctx */
 static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
     if (!asgn || asgn->kind != NODE_ASSIGN) return CONST_EVAL_FAIL;
@@ -4760,7 +4806,19 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
             if (ctx->locals[k].name_len == alen &&
                 memcmp(ctx->locals[k].name, aname, alen) == 0 &&
                 ctx->locals[k].array_values && idx >= 0 && idx < ctx->locals[k].array_size) {
-                ctx->locals[k].array_values[idx] = rhs;
+                /* BUG-868: apply the COMPOUND OPERATOR (this path used to
+                 * ignore `assign.op` and store the bare RHS), then wrap on
+                 * STORE, the same treatment a scalar binding gets in
+                 * ct_ctx_set_w. Wrapping only the final result cannot work —
+                 * a later `>>`, `/` or `%` reads the bits an earlier overflow
+                 * already discarded. */
+                int64_t newv;
+                if (!ct_apply_assign_op(asgn->assign.op,
+                                        ctx->locals[k].array_values[idx],
+                                        rhs, &newv))
+                    return CONST_EVAL_FAIL;
+                ctx->locals[k].array_values[idx] =
+                    ct_wrap(newv, ctx->locals[k].bits, ctx->locals[k].is_signed);
                 return 0;
             }
         }
@@ -4781,20 +4839,8 @@ static int64_t ct_eval_assign(ComptimeCtx *ctx, Node *asgn) {
         }
     }
     int64_t newval;
-    switch (asgn->assign.op) {
-    case TOK_EQ:        newval = rhs; break;
-    case TOK_PLUSEQ:    newval = cur + rhs; break;
-    case TOK_MINUSEQ:   newval = cur - rhs; break;
-    case TOK_STAREQ:    newval = cur * rhs; break;
-    case TOK_SLASHEQ:   newval = rhs ? cur / rhs : 0; break;
-    case TOK_PERCENTEQ: newval = rhs ? cur % rhs : 0; break;
-    case TOK_LSHIFTEQ:  newval = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; break;
-    case TOK_RSHIFTEQ:  newval = (rhs >= 0 && rhs < 64) ? cur >> rhs : 0; break;
-    case TOK_AMPEQ:     newval = cur & rhs; break;
-    case TOK_PIPEEQ:    newval = cur | rhs; break;
-    case TOK_CARETEQ:   newval = cur ^ rhs; break;
-    default: return CONST_EVAL_FAIL;
-    }
+    if (!ct_apply_assign_op(asgn->assign.op, cur, rhs, &newval))
+        return CONST_EVAL_FAIL;
     ct_ctx_set(ctx, name, nlen, newval);
     return 0; /* success (not a return value) */
 }
@@ -4890,9 +4936,23 @@ static Node *eval_comptime_struct_return(Arena *arena, Node *struct_init,
     return result;
 }
 
-/* Create an array binding in comptime context */
+/* Create an array binding in comptime context.
+ *
+ * BUG-868: this is the LAST unwidthed binding kind, and the half of BUG-844
+ * that was left open. `bits`/`is_signed` were not written here AT ALL, so an
+ * array binding inherited whatever was in the slot — and, more importantly,
+ * element stores and reads never wrapped:
+ *
+ *     comptime u32 f(){ u8[2] v; v[0]=200; v[1]=100; return v[0]+v[1]; }
+ *
+ * folded 300 where the runtime gives 44. That is exactly the silent
+ * interpreter-vs-emitted-code disagreement BUG-844 exists to close, and a
+ * partially-closed class is how this one came back — so it is closed here on
+ * the same terms: the width is established per BINDING (from the ELEMENT
+ * type) and applied at every element store and every element read. */
 static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_len,
-                              int64_t *values, int size) {
+                              int64_t *values, int size,
+                              uint16_t elem_bits, bool elem_signed) {
     /* grow if needed */
     if (ctx->count >= ctx->capacity) {
         int nc = ctx->capacity * 2;
@@ -4908,6 +4968,11 @@ static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_l
     ctx->locals[ctx->count].value = 0;
     ctx->locals[ctx->count].array_values = values;
     ctx->locals[ctx->count].array_size = size;
+    /* For an ARRAY binding these describe the ELEMENT, not the array. Writing
+     * them was missing entirely, which also left them reading whatever the
+     * grown malloc buffer happened to hold. */
+    ctx->locals[ctx->count].bits = elem_bits;
+    ctx->locals[ctx->count].is_signed = elem_signed;
     ctx->count++;
 }
 
@@ -4935,8 +5000,18 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                     if (sz > 0 && sz <= 1024) {
                         int64_t *arr = (int64_t *)calloc((size_t)sz, sizeof(int64_t));
                         if (arr) {
+                            /* BUG-868 sink: the ELEMENT type's width, taken from
+                             * the declared `T[N]`. NULL checker leaves it 0,
+                             * which degrades to the old unwrapped behaviour
+                             * rather than to a wrong wrap. */
+                            uint16_t _eb = 0; bool _es = false;
+                            ct_type_width(_comptime_checker
+                                            ? resolve_type(_comptime_checker,
+                                                           stmt->var_decl.type->array.elem)
+                                            : NULL, &_eb, &_es);
                             ct_ctx_set_array(ctx, stmt->var_decl.name,
-                                (uint32_t)stmt->var_decl.name_len, arr, (int)sz);
+                                (uint32_t)stmt->var_decl.name_len, arr, (int)sz,
+                                _eb, _es);
                         }
                     }
                     continue;
@@ -17544,6 +17619,24 @@ static void check_stmt(Checker *c, Node *node) {
          * spawn worker(&const_val) must fail like a normal call would. */
         if (func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL) {
             int pc = func_sym->func_node->func_decl.param_count;
+            /* BUG-909: spawn had NO ARITY CHECK. The per-argument loop below is
+             * bounded by `i < pc`, so every EXTRA argument was silently dropped
+             * and every MISSING one left the parameter reading the thread-argument
+             * struct's auto-zeroed slot. The DIRECT call `worker(1,2,3)` is
+             * rejected by NODE_CALL; the spawn spelling of the same program
+             * reached GCC ("too many arguments to function") with no source line
+             * and no ZER diagnostic — the two-spellings-of-one-program
+             * disagreement this codebase keeps finding.
+             *
+             * Variadic targets are excluded: a spawn of a variadic function is
+             * separately banned as an unchecked boundary. */
+            if (!func_sym->func_node->func_decl.is_variadic &&
+                node->spawn_stmt.arg_count != pc) {
+                checker_error(c, node->loc.line,
+                    "spawn target '%.*s' expects %d argument%s, got %d",
+                    (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                    pc, (pc == 1 ? "" : "s"), node->spawn_stmt.arg_count);
+            }
             for (int i = 0; i < node->spawn_stmt.arg_count && i < pc; i++) {
                 Type *arg_type = checker_get_type(c, node->spawn_stmt.args[i]);
                 Type *param_type = resolve_type(c, func_sym->func_node->func_decl.params[i].type);
@@ -21832,6 +21925,36 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                         "cannot initialize '%.*s' of type '%s' with '%s'",
                         (int)decl->var_decl.name_len, decl->var_decl.name,
                         type_name(type), type_name(init));
+            }
+            /* BUG-911: a global whose initializer NAMES another global was emitted
+             * VERBATIM, and C refuses that at file scope:
+             *
+             *     const u32 A = 10;
+             *     const u32 B = A + 1;   // GCC: "initializer element is not
+             *                            //       constant" — no ZER diagnostic,
+             *                            //       naming a .c file the user never
+             *                            //       opened
+             *
+             * In ZER a `const` global IS a compile-time constant, so this is a
+             * valid program the BACKEND happened to refuse. The right answer is to
+             * FOLD it, not to ban it — the same fold BUG-899 needed to make
+             * `const u32 CAP = 256; u8[CAP] buf;` size correctly, and for the same
+             * reason: the emitted `uint32_t CAP` is not `const` in C, so without
+             * folding the array is a VLA even where GCC accepts it.
+             *
+             * Done IN PLACE and AFTER the checks above, so nothing folds away an
+             * expression an earlier rule still needs to see (the scoped evaluator
+             * does not fold intrinsic calls in any case, which is what keeps
+             * BUG-869's global-init intrinsic guard intact). Restricted to integer
+             * targets, and to non-negative results — a negative one is the
+             * sign-conversion error BUG-890 reports just above. */
+            if (decl->var_decl.init->kind != NODE_INT_LIT &&
+                type && type_is_integer(type_unwrap_distinct(type))) {
+                int64_t gv = eval_const_expr_scoped(c, decl->var_decl.init);
+                if (gv != CONST_EVAL_FAIL && gv >= 0) {
+                    decl->var_decl.init->kind = NODE_INT_LIT;
+                    decl->var_decl.init->int_lit.value = (uint64_t)gv;
+                }
             }
             /* BUG-373: integer literal range check for globals */
             if (decl->var_decl.init->kind == NODE_INT_LIT &&

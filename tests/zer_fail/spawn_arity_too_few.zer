@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: expects 1 argument, got 0
+void worker(u32 v) { }
+u32 main() { spawn worker(); return 0; }

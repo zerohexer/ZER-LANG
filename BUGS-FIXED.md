@@ -5,6 +5,76 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-25c — BUG-884..888: the call-RESULT view class, and my container fix replaced
+
+Adopted from `claude/vigilant-tesla-as71kk` rather than re-derived. Where that branch
+and this one had both fixed something, ITS version was taken — twice for a stated
+reason, not by default.
+
+### BUG-884..887 — "which allocation does a call RESULT view?", all four parts
+One question, answered independently at four places, each wrong for a different shape.
+Every one an ASan-confirmed heap-use-after-free reachable from safe ZER, and a SLICE
+result makes all four SILENT: a slice is not "pointer-ish", so a lost answer registers
+no allocation and there is no leak diagnostic to notice either.
+
+- **arg FORM** — both consumers resolved the aliased argument with a bare
+  `kind == NODE_IDENT`, so `head(b.s)`, `head(s[0..4])` and a laundered argument
+  registered a FRESH allocation while `head(s)` one line away was correctly rejected.
+- **def LOCALITY** — the inference searched only the RETURN's own block and did not
+  follow the COPY a named binding lowers to, so `[*]u8 v = s[0..2]; return v;` inferred
+  nothing. Its own comment claimed that falls back to over-rejection; it does the opposite.
+- **BLOCK TAG** — `is_early_exit` is a leak-COVERAGE tag, not a statement about the
+  returned value, but the return-VALUE summaries skipped such blocks. A two-arm `pick`
+  therefore claimed "views param 0" and aliased to the WRONG argument — wrong in both
+  directions.
+- **ARITY** — the answer is a SET; one slot collapsed a disjunctive view to "unknown",
+  the accept-unsafe direction. `returns_param_mask` + `returns_all_views` carry it, and
+  the use site PULLS the state of each viewed allocation rather than pushing, because
+  there are 18 direct FREED stores and a push design has to reach every one.
+
+**Why this was NOT landed in pieces.** I had written the arg-FORM half in a previous
+session and reverted it. It closes 2 of the 7 negatives and regresses nothing, so
+shipping it looks free — but the ARITY part turns `returns_param_color` from an int into
+a mask precisely because the BLOCK-TAG bug means the int can name the WRONG param.
+Widening the CONSUMER to accept every argument spelling while the INFERENCE still names
+the wrong param does not merely leave five open, it makes the wrong answer apply more
+often. Four parts or none.
+
+Gate: `sink_matrix` p18 axis, 78 -> 88 cells. Verified non-vacuous against a pre-fix
+build in the same run: **7 HOLES and 2 OVER-REJECTS before, 0 after.**
+
+### BUG-888 — my own container fix replaced, because it over-rejected
+`BUG-857` (this repo, two commits ago) stopped the SEGFAULT on
+`container A(T){B(T) x;} container B(T){A(T) y;}` — and traded it for an OVER-REJECTION,
+which is the exact first-draft mistake `as71kk` records against its own BUG-868:
+
+    container A2(T) { ?*B2(T) x; }
+    container B2(T) { A2(T) y; }      // 8 bytes, MUST compile — my version rejected it
+
+**A cycle is infinite only if EVERY edge around it is by-value.** My stack recorded the
+stamps; theirs records the stamps AND THE EDGE KIND, answered by
+`tynode_keeps_storage_inline` — a no-`default:` switch over `TypeNodeKind`, so a new kind
+is a build failure rather than a silent default, and erring toward INLINE is the safe
+direction (a mis-classified indirect edge can only over-reject; a mis-classified inline
+edge restores the crash).
+
+Mine is deleted rather than patched. Pointer cycles, the canonical linked list and the
+2- and 3-way by-value cycles are all pinned.
+
+### BUG-869/870/871 came with it
+- **global-init guards were TOP-LEVEL kind tests** — one wrapper (`f() + 1`, `(u32)f()`,
+  `-f()`, `@popcount(f())`) defeated all three and the failure landed on GCC. **The exact
+  sibling of my BUG-842**, which split the `arg_count` precondition and left the
+  top-level-kind SHAPE. Same rule, second axis.
+- **`@offset` validated nothing outside one guard** — a non-struct target, a union target
+  and a non-ident field were accepted in silence; `offsetof(uint32_t, 1)` reached GCC. It
+  also missed a `distinct` of a struct, the class this repo has a CI gate for.
+- **the fence family accepted and silently dropped arguments** — `@barrier(x)` looked
+  like it did something with x, while the 0-arg family immediately below had the check
+  all along.
+
+---
+
 ## Session 2026-08-25b — BUG-883: float -> int is DEFINED as SATURATING (owner decision)
 
 Not a bug fix — a LANGUAGE SEMANTICS decision, made by the owner and implemented.

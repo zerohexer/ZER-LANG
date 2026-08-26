@@ -256,6 +256,40 @@ typedef struct {
     int container_inst_count;
     int container_inst_capacity;
 
+    /* BUG-868: stamps whose FIELDS are currently being resolved, innermost last.
+     *
+     * The by-value self-containment guard used to compare a resolved field type
+     * against `st` — THE ONE stamp its own frame owns — which structurally
+     * cannot see a cycle that closes on an OUTER stamp:
+     *
+     *     container A(T) { B(T) x; }
+     *     container B(T) { A(T) y; }
+     *
+     * Both stamps are finite to stamp (the knot-tie caches each before its
+     * fields resolve), so monomorphization terminates and produces a genuinely
+     * infinite-SIZE struct — A holds B by value, B holds A by value. `zerc` then
+     * SEGFAULTED computing its size (ASan: stack-overflow in estimate_type_size),
+     * i.e. a compiler crash on three lines of valid-looking source.
+     *
+     * Checking the whole stack catches a cycle of ANY length, because every
+     * ancestor is still on it when the closing field resolves. Stack-first with
+     * arena overflow, per Rule #7 — nesting is unbounded in principle. */
+    Type **inprogress_stamps;
+    /* Was the FIELD edge that led into stamps[i] a BY-VALUE one? A cycle is
+     * infinite only if every edge around it is by-value:
+     *
+     *     container A2(T) { ?*B2(T) x; }   container B2(T) { A2(T) y; }
+     *
+     * is 8 bytes and must still compile — the A2 -> B2 edge goes through a
+     * pointer. Without this flag the guard rejects it, which is how the first
+     * draft of the fix traded a compiler crash for an over-rejection. */
+    bool *inprogress_edge_byvalue;
+    int inprogress_stamp_count;
+    int inprogress_stamp_capacity;
+    /* Set immediately before a field's type is resolved; consumed by whatever
+     * stamp that resolution pushes. */
+    bool pending_edge_byvalue;
+
     uint32_t stack_limit;   /* --stack-limit N: error when estimated stack > N bytes (0 = disabled) */
     uint32_t target_features; /* C4-minimum: ZerCpuFeature bitmap from --target-features=... CLI flag.
                                * Affects asm register validation (F7 looks up against AVX-512 table when

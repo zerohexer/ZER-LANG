@@ -38,6 +38,11 @@ condition EXPRESSION.
 so it does NOT contain BUG-857/858. 17 commits, BUG-857..882 (numbering collides with
 main's again — key by branch+sha).
 
+**PROGRESS 2026-08-25:** the float question is DECIDED (saturate, BUG-883). A1 (the view
+class, all four parts), A10, A11, A12 are landed from `as71kk` — and **my BUG-857
+container fix was REPLACED by its BUG-868**, because mine traded the crash for an
+over-rejection of a pointer-broken cycle. Remaining: 16.
+
 ### The headline: this branch SUPERSEDES most of harvest tracker 2
 
 `as71kk` independently found and fixed **H1..H19** — and its implementations are better
@@ -103,7 +108,7 @@ My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
 
 | # | Fix | as71kk id | Evidence on main |
 |---|---|---|---|
-| A1 | **The call-RESULT view class, ALL FOUR parts** | 857/858/859/860 | 7 negatives accepted; ASan heap-UAF. arg FORM (bare ident test), def LOCALITY (search missed the COPY a named binding lowers to), BLOCK TAG (`is_early_exit` is leak-COVERAGE, misread as a statement about the return value — wrong in BOTH directions), ARITY (the answer is a SET; one slot collapsed it to unknown). `returns_param_mask` + PULL at the use site, because 18 direct FREED stores mean a push design must reach all of them. Gate: sink_matrix p18, 78 -> 88 |
+| ~~A1~~ **DONE (BUG-884..887)** | **The call-RESULT view class, ALL FOUR parts** | 857/858/859/860 | 7 negatives accepted; ASan heap-UAF. arg FORM (bare ident test), def LOCALITY (search missed the COPY a named binding lowers to), BLOCK TAG (`is_early_exit` is leak-COVERAGE, misread as a statement about the return value — wrong in BOTH directions), ARITY (the answer is a SET; one slot collapsed it to unknown). `returns_param_mask` + PULL at the use site, because 18 direct FREED stores mean a push design must reach all of them. Gate: sink_matrix p18, 78 -> 88 |
 | A2 | **`@cstr` is an unguarded integer-to-pointer door** | 862 | 3 accepted. Every check was NEGATIVE, so a type matching none was accepted BY DEFAULT. Replaced with an ALLOW-list + arity |
 | A3 | **The SIGN half of "no implicit narrowing or sign conversion" was never enforced** | 863 | 8 accepted. `u32 a = -1;` -> 4294967295, while `u8 b = -1;` was rejected only INCIDENTALLY (−1 types as u32, and u32->u8 is a narrowing mismatch). Root cause: the three-condition chain written out at EIGHT sinks, so there was nowhere to add a condition. One `value_flows_to` query |
 | A4 | **Enum forging reached only some doors** | 864 | `@truncate(State,7)` unchecked; `@bitcast(Box,7)` with a struct carrier walked past. The guard now recurses struct fields, optional payloads and array elements, at BOTH emitter paths. **Extended the TRACKING, not a ban** — an earlier draft banned it and broke `bitcast_enum_variant_ok` |
@@ -117,9 +122,9 @@ My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
 
 | # | Fix | as71kk id | Evidence |
 |---|---|---|---|
-| A10 | **Global-init guards were TOP-LEVEL kind tests** | 869 | 3 accepted: `@cpu_model_id() + 1`, `(u32)f()`, `-f()`, `@popcount(f())`. **The exact sibling of my BUG-842** — that split the `arg_count` precondition and left the top-level-kind SHAPE. Now asked at EVERY node by a no-`default:` walk |
-| A11 | **`@offset` validated nothing outside one guard** | 870 | 4 accepted; `offsetof(uint32_t, 1)` reached GCC. Also missed a `distinct` of a struct — the distinct-unwrap class this repo has a CI gate for |
-| A12 | **The fence family accepted and silently dropped arguments** | 871 | `@barrier(x)` looked like it did something with x. The 0-arg family immediately below had the check all along |
+| ~~A10~~ **DONE (BUG-869)** | **Global-init guards were TOP-LEVEL kind tests** | 869 | 3 accepted: `@cpu_model_id() + 1`, `(u32)f()`, `-f()`, `@popcount(f())`. **The exact sibling of my BUG-842** — that split the `arg_count` precondition and left the top-level-kind SHAPE. Now asked at EVERY node by a no-`default:` walk |
+| ~~A11~~ **DONE (BUG-870)** | **`@offset` validated nothing outside one guard** | 870 | 4 accepted; `offsetof(uint32_t, 1)` reached GCC. Also missed a `distinct` of a struct — the distinct-unwrap class this repo has a CI gate for |
+| ~~A12~~ **DONE (BUG-871)** | **The fence family accepted and silently dropped arguments** | 871 | `@barrier(x)` looked like it did something with x. The 0-arg family immediately below had the check all along |
 | A13 | **`@trap(1,2,3)` silently drops its arguments** | 882 | NEW. Found by a companion sweep calling every intrinsic with an absurd arity — the only one left across ~155 |
 | A14 | **`lower_expr` could fall off the end of an int-returning function** | 876 | Callers use the value as a LOCAL ID and index `func->locals[]` with it. Latent, but the return was INDETERMINATE |
 
@@ -132,7 +137,7 @@ My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
 | A17 | **`const u32 CAP = 256; u8[CAP] buf;`** | 873 | Rejected as "not a compile-time constant", naming a constant |
 | A18 | **Arrays of function pointers never worked, in EITHER syntax** | 878/879 | Both `reference.md` and `CLAUDE.md` document `*(u32,u32) -> u32 [4] ops`. Parser: `parse_type` swallowed the `[3]` next to the RETURN type. Emitter: `?FuncPtr[N]` emitted an abstract declarator with a name glued on — not C. **The nullable form is the one that matters**, since a non-null funcptr array is auto-zeroed and ZER has no array initializer |
 | A19 | **Bit extraction through a pointer** | 881 | `volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];` appears in BOTH docs and did not compile — it fell to the SUB-SLICE path where hi > lo is a bounds error. Fixed as a DESUGARING to `*p` so one implementation of bit extraction stays and cannot drift |
-| A20 | **The two view-class boundary positives** | rides with A1 | `view_optional_null_arm_ok`, `view_param_interior_ptr_ok` — over-reject on main today (tracker-2 H19) |
+| ~~A20~~ **DONE (BUG-884..887)** | **The two view-class boundary positives** | rides with A1 | `view_optional_null_arm_ok`, `view_param_interior_ptr_ok` — over-reject on main today (tracker-2 H19) |
 
 ### Tooling — take all of it
 

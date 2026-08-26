@@ -1,0 +1,20 @@
+// BUG-864 boundary: a cycle through POINTERS is finite and must keep compiling.
+// The fix rejects a cycle of BY-VALUE containment only; if it ever rejects this
+// file it has become an over-rejection that outlaws every linked structure.
+container Node(T) { ?*Node(T) next; T value; }
+container A(T) { ?*B(T) x; }
+container B(T) { ?*A(T) y; }
+
+i32 main() {
+    Node(u32) n;
+    n.value = 7;
+    n.next = null;
+    A(u32) a;
+    B(u32) b;
+    a.x = &b;
+    b.y = &a;
+    if (n.value != 7) { return 1; }
+    if (n.next) |q| { if (q.value == 0) { return 2; } }
+    if (a.x) |p| { if (p.y) |r| { if (r.x == null) { return 3; } } } else { return 4; }
+    return 0;
+}

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: cannot call functions at global scope
+// BUG-859: an assignment really is reachable inside a global initializer —
+// `u32 G = (x = f());` parses and emits `uint32_t G = x = f();`. Found by
+// tools/audit_walker_fields.sh while the new walker was being written.
+u32 x;
+u32 f() { return 1; }
+u32 G = (x = f());
+
+i32 main() { return 0; }

@@ -113,6 +113,28 @@ typedef struct {
      * reported for this handle, to avoid duplicate diagnostics when the C3
      * exit pass re-scans the same defer body. */
     bool defer_double_reported;
+    /* BUG-849 (2026-08-23) — MULTI-VIEW. `FuncSummary.returns_param_color` is a
+     * ONE-SLOT answer to a question whose truth is a SET: which arguments may the
+     * result be a view of. When a callee's returns are views of DIFFERENT params
+     * (`pick(a,b,f)` returning `a[..]` on one path and `b[..]` on another) the
+     * single slot cannot say so, so the inference collapsed to "unknown" and the
+     * call site treated the result as an unrelated value — for a SLICE result,
+     * as nothing at all. `free(b); h[0]` then compiled clean (ASan-confirmed
+     * heap-use-after-free).
+     *
+     * These are the alloc_ids this handle may alias WITHOUT owning any of them.
+     * `alloc_id` stays 0 (not an owned allocation, never leak-checked); the UAF
+     * check PULLS the current state of each viewed id at the use site, so no
+     * free sink needs to know about the set (there are 18 direct FREED stores;
+     * a push-based design would have to reach every one of them). */
+    int view_alloc_ids[8];
+    int view_count;
+    /* The candidate set did not fit. Sound degradation: an overflowed view is
+     * treated as "may view ANY tracked allocation", so a use after any free is
+     * rejected. Unreachable in practice — it needs a single return to be a view
+     * of nine or more DISTINCT tracked allocations — but the alternative to an
+     * explicit overflow flag is silent truncation, which is a MISSED UAF. */
+    bool view_overflow;
 } IRHandleInfo;
 
 /* Phase E: scoped spawn ThreadHandle tracking by name. Scoped spawn
@@ -674,6 +696,13 @@ typedef struct {
     bool is_move_local;   /* bh18_1b: move-local handle/alias — leak-skip */
     const char *pool_name;
     uint32_t pool_name_len;
+    /* BUG-849: the multi-view set travels with the alias. A view handle owns
+     * nothing, so it is carried by COPY/alias exactly like alloc_id is — without
+     * this the set died on the `%tmp = CALL; %h = COPY %tmp` lowering that every
+     * var-decl produces, and the pull check at the use site found an empty set. */
+    int view_alloc_ids[8];
+    int view_count;
+    bool view_overflow;
     IRHandleState state;  /* snapshot of source state, available if caller wants to inherit */
 } IRAliasSnapshot;
 
@@ -687,6 +716,11 @@ static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
     snap->is_move_local = src->is_move_local;
     snap->pool_name = src->pool_name;
     snap->pool_name_len = src->pool_name_len;
+    snap->view_count = src->view_count;
+    snap->view_overflow = src->view_overflow;
+    for (int i = 0; i < src->view_count &&
+             i < (int)(sizeof(snap->view_alloc_ids) / sizeof(snap->view_alloc_ids[0])); i++)
+        snap->view_alloc_ids[i] = src->view_alloc_ids[i];
     snap->state = src->state;
 }
 
@@ -703,6 +737,11 @@ static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
     dst->is_move_local = snap->is_move_local;
     dst->pool_name = snap->pool_name;
     dst->pool_name_len = snap->pool_name_len;
+    dst->view_count = snap->view_count;
+    dst->view_overflow = snap->view_overflow;
+    for (int i = 0; i < snap->view_count &&
+             i < (int)(sizeof(dst->view_alloc_ids) / sizeof(dst->view_alloc_ids[0])); i++)
+        dst->view_alloc_ids[i] = snap->view_alloc_ids[i];
 }
 
 /* ================================================================
@@ -1330,6 +1369,60 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     return 0;
 }
 
+/* ONE query: "which tracked allocation does this ARGUMENT EXPRESSION view?"
+ *
+ * BUG-845 (2026-08-23). The two consumers of `FuncSummary.returns_param_color`
+ * — the IR_CALL alias application (Phase F) and the passthrough-ASSIGN mirror
+ * (`h.p = first(s)`) — each resolved the aliased argument with a bare
+ * `arg->kind == NODE_IDENT` test. So `head(s)` aliased the result to `s`'s
+ * allocation and `head(b.s)` / `head(s[0..3])` / `head(@ptrcast(...))` did not:
+ * the result was instead registered as a FRESH allocation, and
+ *
+ *     Box b; b.s = alloc(u8,4) orelse {...};
+ *     [*]u8 h = head(b.s);   free(b.s);   return h[0];
+ *
+ * compiled CLEAN — ASan-confirmed heap-use-after-free. The identical program
+ * spelled `head(s)` is correctly rejected. Exactly the sibling that the
+ * 2026-06-06 GAP-A fix closed for `frees_param` (see the compound-key
+ * re-resolution at the passthrough loop below) and left open here.
+ *
+ * Peeling discipline mirrors the assign-side view rule: `&expr` and a SLICE
+ * expression FORM a reference into the argument's allocation, the launder
+ * casts are identity, and `orelse` selects its value arm. `ir_extract_compound_key`
+ * then keys field/literal-index navigation, so a stored `[*]T`/`*T` FIELD
+ * resolves to its own compound handle rather than to the container's.
+ *
+ * Returns the handle the result should alias, or NULL when the argument carries
+ * no tracked allocation (a stack/global/param view — nothing to track). */
+static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
+                                        IRPathState *ps, Node *arg) {
+    if (!arg) return NULL;
+    int guard = 0;
+    while (arg && guard++ < 32) {
+        Node *prev = arg;
+        if (arg->kind == NODE_ORELSE) arg = arg->orelse.expr;
+        arg = ir_peel_cast_wrappers(arg);
+        arg = ir_peel_ref_cast(arg);
+        if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
+            arg = arg->unary.operand;
+        else if (arg && arg->kind == NODE_SLICE)
+            arg = arg->slice.object;
+        if (arg == prev) break;
+    }
+    if (!arg) return NULL;
+    int root_local; const char *path; uint32_t path_len;
+    if (ir_extract_compound_key(zc, func, arg, &root_local, &path, &path_len) != 0)
+        return NULL;
+    if (path_len == 0) return ir_arg_view_handle(ps, root_local);
+    /* Compound: prefer the EXACT field/element handle. Falling back to "any
+     * compound on the root" (what ir_arg_view_handle does) could alias the
+     * wrong field of a multi-slot struct, so only the bare root handle is
+     * accepted as a second choice. */
+    IRHandleInfo *h = ir_find_compound_handle(ps, root_local, path, path_len);
+    if (h) return h;
+    return ir_find_handle(ps, root_local);
+}
+
 /* ================================================================
  * *opaque / extern alloc-free recognition (Phase C2 — 9a/9b/9c)
  *
@@ -1797,6 +1890,35 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!h) {
         /* Try root-only when a compound key wasn't found */
         if (path_len > 0) h = ir_find_handle(ps, root_local);
+    }
+    /* BUG-849 — MULTI-VIEW pull. A handle that VIEWS a set of allocations owns
+     * none of them, so no free sink updates it. Ask, at the use site, whether
+     * any allocation it may alias has since been freed. Pull rather than push:
+     * there are 18 direct `state = IR_HS_FREED` stores, and a push design has to
+     * reach every one of them (exactly the multi-site shape that produced this
+     * class in the first place). */
+    if (h && !ir_is_invalid(h) && (h->view_count > 0 || h->view_overflow)) {
+        for (int vi = 0; vi < h->view_count || (vi == 0 && h->view_overflow); vi++) {
+            for (int i = 0; i < ps->handle_count; i++) {
+                IRHandleInfo *vh = &ps->handles[i];
+                /* On overflow the listed set is incomplete, so EVERY tracked
+                 * allocation is a candidate (sound superset, over-rejects). */
+                if (!h->view_overflow && vh->alloc_id != h->view_alloc_ids[vi]) continue;
+                if (h->view_overflow && vh->alloc_id == 0) continue;
+                if (!ir_is_invalid(vh)) continue;
+                if (ir_use_guard_disjoint(zc, vh)) continue;
+                const char *nm = (root_local >= 0 && root_local < func->local_count)
+                    ? func->locals[root_local].name : "?";
+                int nl = (root_local >= 0 && root_local < func->local_count)
+                    ? (int)func->locals[root_local].name_len : 1;
+                ir_zc_error(zc, line,
+                    "use after free: '%.*s' may be a view of an allocation that "
+                    "is %s (freed at line %d)",
+                    nl, nm, ir_state_name(vh->state), vh->free_line);
+                urs_add(rs, root_local);
+                return;
+            }
+        }
     }
     if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
         const char *name = (root_local >= 0 && root_local < func->local_count)
@@ -3781,8 +3903,34 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     int pidx = cs->returns_param_color - 1;
                     if (pidx >= 0 && pidx < rv->call.arg_count &&
                         rv->call.args[pidx] &&
-                        rv->call.args[pidx]->kind == NODE_IDENT)
+                        rv->call.args[pidx]->kind == NODE_IDENT) {
                         rv = rv->call.args[pidx];   /* substitute the arg */
+                    } else if (pidx >= 0 && pidx < rv->call.arg_count) {
+                        /* BUG-845: the argument is a projection / view / launder
+                         * (`h.p = head(b.s)`, `head(s[0..3])`), which the bare-ident
+                         * substitution above dropped — the target then inherited no
+                         * alloc_id and `free(b.s); h.p[0]` was ASan-confirmed
+                         * heap-use-after-free. Resolve it with the same one query
+                         * the IR_CALL sibling uses and link here; the ident path
+                         * below is left untouched. */
+                        IRHandleInfo *vh = ir_view_arg_handle(zc, func, ps,
+                                               rv->call.args[pidx]);
+                        int vd_root; const char *vd_path; uint32_t vd_plen;
+                        if (vh && vh->alloc_id != 0 &&
+                            ir_extract_compound_key(zc, func,
+                                inst->expr->assign.target,
+                                &vd_root, &vd_path, &vd_plen) == 0) {
+                            IRAliasSnapshot vsnap;
+                            ir_snapshot_alias(&vsnap, vh);
+                            IRHandleInfo *vdst = (vd_plen == 0)
+                                ? ir_add_handle(ps, vd_root)
+                                : ir_add_compound_handle(ps, vd_root, vd_path, vd_plen);
+                            if (vdst) {
+                                ir_apply_alias(vdst, &vsnap);
+                                vdst->state = vsnap.state;
+                            }
+                        }
+                    }
                 }
             }
             if (rv && rv->kind == NODE_IDENT) {
@@ -5136,31 +5284,89 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             inst->expr->kind == NODE_CALL) {
             int param_idx = summary->returns_param_color - 1;
             if (param_idx < inst->expr->call.arg_count) {
-                Node *arg = inst->expr->call.args[param_idx];
-                if (arg && arg->kind == NODE_IDENT) {
-                    int arg_local = ir_find_local_exact_first(func,
-                        arg->ident.name, (uint32_t)arg->ident.name_len);
-                    if (arg_local >= 0) {
-                        IRHandleInfo *arg_h = ir_arg_view_handle(ps, arg_local);
-                        if (arg_h) {
-                            IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
-                            if (dh) {
-                                /* Audit 2026-06-11: raw field copy missed
-                                 * pool_name + escaped + is_thread_handle, so
-                                 * wrong-pool detection silently bypassed when
-                                 * the handle round-tripped through a passthrough
-                                 * function. Use ir_apply_alias to copy ALL
-                                 * tracked state — same shape as IR_COPY at 2758. */
-                                IRAliasSnapshot snap;
-                                ir_snapshot_alias(&snap, arg_h);
-                                ir_apply_alias(dh, &snap);
-                                dh->state = arg_h->state;
-                                dest_aliased_from_param = true;
-                            }
-                        }
+                /* BUG-845: every argument FORM, not just a bare ident. */
+                IRHandleInfo *arg_h = ir_view_arg_handle(zc, func, ps,
+                                          inst->expr->call.args[param_idx]);
+                if (arg_h) {
+                    IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+                    if (dh) {
+                        /* Audit 2026-06-11: raw field copy missed
+                         * pool_name + escaped + is_thread_handle, so
+                         * wrong-pool detection silently bypassed when
+                         * the handle round-tripped through a passthrough
+                         * function. Use ir_apply_alias to copy ALL
+                         * tracked state — same shape as IR_COPY at 2758. */
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, arg_h);
+                        ir_apply_alias(dh, &snap);
+                        dh->state = arg_h->state;
                     }
                 }
+                /* BUG-847 (RELAXATION, 2026-08-23): the result of a proven
+                 * param-VIEW return is NEVER a fresh allocation, whether or not
+                 * the argument happens to carry a tracked one. Suppress the
+                 * fresh-allocation registration below in BOTH cases.
+                 *
+                 * Without this, `*u32 field_of(*Node n) { return &n.val; }`
+                 * called as `*u32 p = field_of(&nd);` on a STACK `nd` reported
+                 * "handle 'p' allocated at line N but never freed" — a leak that
+                 * does not exist, on the ordinary interior-pointer idiom.
+                 * docs/limitations.md kept that false positive deliberately
+                 * because it "incidentally catches the through-call
+                 * interior-pointer UAF"; BUG-845/846 now catch that class
+                 * PROPERLY, by aliasing the result to the argument's allocation
+                 * at every argument form, so the incidental catch is obsolete and
+                 * the false positive no longer buys anything.
+                 *
+                 * Soundness: `returns_param_color` is set only when EVERY
+                 * non-early-exit return of the callee is a view of the SAME
+                 * param, and only when returns_color is UNKNOWN (a body proven to
+                 * return a POOL/ARENA/MALLOC allocation never reaches the
+                 * inference). A body that allocates on any path fails to match
+                 * and leaves the color unset, so this cannot suppress a real
+                 * allocation. */
+                dest_aliased_from_param = true;
             }
+        }
+
+        /* BUG-849 — MULTI-VIEW application. The callee's returns are all views
+         * (no path allocates) but they name MORE THAN ONE param, so no single
+         * alias is correct. Record the whole candidate set on the dest handle:
+         * it owns nothing (alloc_id 0, escaped → never leak-checked) and the UAF
+         * check pulls the live state of each viewed allocation at the use site.
+         *
+         * Pre-BUG-849 this case produced `returns_param_color = -1` and the dest
+         * was registered as an unrelated fresh allocation — or, for a SLICE
+         * result (not "pointer-ish", so nothing registered at all) — and
+         * `free(b); h[0]` compiled clean. */
+        if (summary && summary->returns_all_views &&
+            summary->returns_param_color <= 0 &&
+            summary->returns_param_mask != 0 &&
+            inst->dest_local >= 0 && inst->expr &&
+            inst->expr->kind == NODE_CALL) {
+            IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+            if (dh) {
+                dh->state = IR_HS_ALIVE;
+                dh->alloc_line = inst->source_line;
+                dh->escaped = true;   /* views, never owns → not a leak */
+                dh->view_count = 0;
+                dh->view_overflow = false;
+                const int vcap = (int)(sizeof(dh->view_alloc_ids) /
+                                       sizeof(dh->view_alloc_ids[0]));
+                for (int pi = 0; pi < 32 && pi < inst->expr->call.arg_count; pi++) {
+                    if (!(summary->returns_param_mask & ((uint32_t)1u << pi))) continue;
+                    IRHandleInfo *ah = ir_view_arg_handle(zc, func, ps,
+                                           inst->expr->call.args[pi]);
+                    if (!ah || ah->alloc_id == 0) continue;
+                    bool dup = false;
+                    for (int k = 0; k < dh->view_count; k++)
+                        if (dh->view_alloc_ids[k] == ah->alloc_id) dup = true;
+                    if (dup) continue;
+                    if (dh->view_count >= vcap) { dh->view_overflow = true; continue; }
+                    dh->view_alloc_ids[dh->view_count++] = ah->alloc_id;
+                }
+            }
+            dest_aliased_from_param = true;
         }
 
         /* Phase C2: signature heuristics on inst->expr (the AST NODE_CALL).
@@ -5969,6 +6175,85 @@ static void ir_trace_states(ZerCheck *zc, IRFunc *func, IRPathState *ps, IRInst 
     fprintf(stderr, "[state] @line %d:%s\n", inst->source_line, line);
 }
 
+/* The defining EXPRESSION of an IR local, following COPY chains.
+ *
+ * BUG-846 (2026-08-23). The `returns_param_color` view inference (arm c) looked
+ * for the returned local's definition in the RETURN's OWN basic block only, and
+ * did not follow the `%v = COPY %t` that a named binding lowers to. So
+ *
+ *     [*]u8 head([*]u8 s) { [*]u8 v = s[0..2]; if (..) { return v; } return v; }
+ *
+ * — the view computed in bb0, returned from bb1/bb2 — inferred nothing, and the
+ * inference's own comment claimed that "falls back to mixed, which over-rejects
+ * rather than under-rejects". It does the OPPOSITE: with no param color the call
+ * site registers the result as a FRESH allocation (and for a SLICE-typed result,
+ * which is not pointer-ish, registers NOTHING at all), so `free(s); h[0]` was
+ * accepted — ASan-confirmed heap-use-after-free, while the inline
+ * `return s[0..2];` spelling one line away is caught.
+ *
+ * `pref` is searched backwards first (a definition earlier in the RETURN's own
+ * block dominates it). Otherwise the whole function is searched and a UNIQUE
+ * definition is required: several definitions of one local cannot be ordered
+ * without dominance information, so ambiguity yields NULL and the caller keeps
+ * its previous behaviour. */
+static IRInst *ir_local_def_inst(IRFunc *func, IRBlock *pref, int local) {
+    int guard = 0;
+    while (local >= 0 && guard++ < 8) {
+        IRInst *def = NULL;
+        if (pref) {
+            for (int ii = pref->inst_count - 1; ii >= 0; ii--) {
+                if (pref->insts[ii].dest_local == local) {
+                    def = &pref->insts[ii]; break;
+                }
+            }
+        }
+        if (!def) {
+            int defs = 0;
+            for (int bi = 0; bi < func->block_count; bi++) {
+                IRBlock *b = &func->blocks[bi];
+                for (int ii = 0; ii < b->inst_count; ii++) {
+                    if (b->insts[ii].dest_local == local) {
+                        def = &b->insts[ii]; defs++;
+                    }
+                }
+            }
+            if (defs != 1) return NULL;
+        }
+        if (!def) return NULL;
+        if (def->expr) return def;
+        if (def->op == IR_COPY && def->src1_local >= 0) {
+            local = def->src1_local;
+            pref = NULL;
+            continue;
+        }
+        return def;
+    }
+    return NULL;
+}
+
+static Node *ir_local_def_expr(IRFunc *func, IRBlock *pref, int local) {
+    IRInst *def = ir_local_def_inst(func, pref, local);
+    return def ? def->expr : NULL;
+}
+
+/* Does this return hand back a NULL literal? `?*T find(*T p){ if (c) return p;
+ * return null; }` is the canonical optional-view idiom: the null arm aliases
+ * nothing, so it must not veto the param-view inference the other arm supports.
+ * Before BUG-847 it did, and the caller then registered the result as a fresh
+ * allocation and reported a leak that does not exist. */
+static bool ir_return_is_null_literal(IRFunc *func, IRBlock *bb, IRInst *last,
+                                      int rlocal) {
+    if (last->expr) {
+        Node *e = last->expr;
+        if (e->kind == NODE_ORELSE) e = e->orelse.expr;
+        if (e && e->kind == NODE_NULL_LIT) return true;
+    }
+    IRInst *def = ir_local_def_inst(func, bb, rlocal);
+    if (!def) return false;
+    if (def->expr && def->expr->kind == NODE_NULL_LIT) return true;
+    return def->op == IR_LITERAL && def->literal_kind == 4;
+}
+
 bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     if (!func || func->block_count == 0) return true;
     if (!zc->building_summary)
@@ -6423,7 +6708,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             IRInst *last = &bb->insts[bb->inst_count - 1];
             if (last->op != IR_RETURN) continue;
             if (bb->is_orelse_fallback) continue;
-            if (bb->is_early_exit) continue;
+            /* BUG-848: `is_early_exit` is a LEAK-COVERAGE tag ("this path is not
+             * the canonical exit"), NOT a statement about the returned VALUE. An
+             * early `if (c) { return arena_thing; }` hands its value to the
+             * caller exactly like the fall-through return does, so skipping such
+             * blocks in a RETURN-VALUE summary answers the wrong question. */
             /* Phase F: return can have src1_local (simple `return ident`
              * or `return call()` with result in local) OR expr (direct
              * NODE_IDENT / NODE_ORELSE for complex shapes). Check both. */
@@ -6457,15 +6746,31 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
          * block returns a local that traces to a param (via cast/ptrcast
          * alias chain), set returns_param_color = param_index + 1. */
         int returns_param_color_final = -1;
+        /* BUG-849: the mask is the honest answer; the color is its
+         * exactly-one-bit fast path. `all_views` records that EVERY return was
+         * classified (param view / static-storage view / null) so no path can be
+         * a fresh allocation — without it a mask bit means nothing, because an
+         * unclassified return could be an allocation the caller must own. */
+        uint32_t returns_param_mask_final = 0;
+        bool returns_all_views_final = false;
         if (returns_color_final == ZC_COLOR_UNKNOWN && pc > 0) {
             int inferred_param = -2;  /* -2 unset, -1 mixed, >=0 param idx */
+            uint32_t view_mask = 0;
+            bool all_views = true;
+            int classified_returns = 0;
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *bb = &func->blocks[bi];
                 if (bb->inst_count == 0) continue;
                 IRInst *last = &bb->insts[bb->inst_count - 1];
                 if (last->op != IR_RETURN) continue;
                 if (bb->is_orelse_fallback) continue;
-                if (bb->is_early_exit) continue;
+                /* BUG-848: do NOT skip is_early_exit here — see the ARENA loop
+                 * above. Measured hole: `[*]u8 pick([*]u8 a,[*]u8 b,bool f){ if
+                 * (f) { return b[0..1]; } return a[0..1]; }` had its `b` return
+                 * skipped, so the summary claimed "views param 0" and the call
+                 * site aliased the result to `a`. `free(b); h[0]` was accepted —
+                 * ASan-confirmed heap-use-after-free — AND a use after `free(a)`
+                 * would have been a false positive. Wrong in both directions. */
                 int rlocal = -1;
                 if (last->src1_local >= 0) rlocal = last->src1_local;
                 else if (last->expr) {
@@ -6476,7 +6781,15 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             re->ident.name, (uint32_t)re->ident.name_len);
                     }
                 }
-                if (rlocal < 0) { inferred_param = -1; break; }
+                if (rlocal < 0) { inferred_param = -1; all_views = false; break; }
+                /* BUG-847: a `return null;` arm aliases nothing, so it neither
+                 * supports nor vetoes the inference — the canonical
+                 * `?*T find(*T p){ if (c) return p; return null; }` shape. */
+                if (ir_return_is_null_literal(func, bb, last, rlocal)) {
+                    classified_returns++;
+                    continue;
+                }
+                bool root_is_static_view = false;
                 int match_param = -1;
                 /* (a) DIRECT return of the param itself — `[*]u8 f([*]u8 s)
                  * { return s; }`. 2026-08-02: this arm is new and closes a
@@ -6517,19 +6830,22 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                  * `return <view of s>`. Both are views of caller memory, so both
                  * must inherit the arg's alloc_id at the call site.
                  *
-                 * The temp is defined by an earlier instruction in this block
-                 * (`%1 = ASSIGN <expr>` holding the &-expression), so find that
-                 * definition and peel its expr through &/index/slice/field to a
-                 * root ident. Conservative: only a root that IS a param matches;
-                 * anything else leaves match_param < 0 and the caller falls back
-                 * to "mixed", which over-rejects rather than under-rejects. */
+                 * The temp is defined by an earlier instruction (`%1 = ASSIGN
+                 * <expr>` holding the &-expression), so find that definition and
+                 * peel its expr through &/index/slice/field to a root ident.
+                 * Only a root that IS a param matches.
+                 *
+                 * BUG-846: the search is `ir_local_def_expr` — the whole
+                 * function, following COPY chains — not "this block only". A
+                 * NAMED binding (`[*]u8 v = s[0..2]; ... return v;`) defines the
+                 * view in an EARLIER block and reaches the return through a
+                 * COPY; the old single-block scan found nothing and left
+                 * match_param < 0. That is NOT the safe direction: an unset
+                 * param color makes the CALL SITE treat the result as a fresh
+                 * allocation (or, for a slice, as nothing at all), so it
+                 * UNDER-rejects — a confirmed heap-UAF. */
                 if (match_param < 0) {
-                    Node *vexpr = NULL;
-                    for (int ii = bb->inst_count - 1; ii >= 0; ii--) {
-                        if (bb->insts[ii].dest_local == rlocal && bb->insts[ii].expr) {
-                            vexpr = bb->insts[ii].expr; break;
-                        }
-                    }
+                    Node *vexpr = ir_local_def_expr(func, bb, rlocal);
                     if (vexpr && vexpr->kind == NODE_ASSIGN && vexpr->assign.value)
                         vexpr = vexpr->assign.value;
                     vexpr = ir_peel_cast_wrappers(vexpr);
@@ -6695,11 +7011,23 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                                 p->name, (uint32_t)p->name_len);
                             if (plocal >= 0 && plocal == vroot) { match_param = pi; break; }
                         }
+                        /* BUG-849: a reference FORMED into a GLOBAL (`return
+                         * &g_default;`, `return g_buf[0..1];`) views STATIC
+                         * storage — never freed, never owned, nothing to track.
+                         * It must be CLASSIFIED, not treated as unknown: as an
+                         * unknown it vetoed the whole inference, so
+                         * `?[*]u8 pick([*]u8 a, bool f){ if (f) { return a[0..1]; }
+                         * return g_buf[0..1]; }` lost the param view for `a` and
+                         * `free(a); h[0]` was accepted. Restricted to a
+                         * reference-FORMING root so that a bare read of a global
+                         * POINTER variable (whose VALUE may be heap) is not
+                         * swept in. */
+                        if (match_param < 0 && vroot < 0) root_is_static_view = true;
                     }
                 }
-                if (match_param < 0) {
+                if (match_param < 0 && !root_is_static_view) {
                     IRHandleInfo *rh = ir_find_handle(&block_states[bi], rlocal);
-                    if (!rh) { inferred_param = -1; break; }
+                    if (!rh) { inferred_param = -1; all_views = false; break; }
                     for (int pi = 0; pi < pc; pi++) {
                         ParamDecl *p = &fn->func_decl.params[pi];
                         int plocal = ir_find_local_exact_first(func,
@@ -6712,11 +7040,20 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         }
                     }
                 }
-                if (match_param < 0) { inferred_param = -1; break; }
+                if (match_param < 0) {
+                    if (root_is_static_view) { classified_returns++; continue; }
+                    inferred_param = -1; all_views = false; break;
+                }
+                classified_returns++;
+                view_mask |= (uint32_t)1u << match_param;
                 if (inferred_param == -2) inferred_param = match_param;
-                else if (inferred_param != match_param) { inferred_param = -1; break; }
+                else if (inferred_param != match_param) inferred_param = -1;
             }
             if (inferred_param >= 0) returns_param_color_final = inferred_param + 1;
+            if (all_views && classified_returns > 0) {
+                returns_param_mask_final = view_mask;
+                returns_all_views_final = true;
+            }
         }
 
         /* PART 6 (erased-ref ownership, 2026-07-16): ret_is_borrow — the body
@@ -6760,7 +7097,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (bb->inst_count == 0) continue;
             IRInst *last = &bb->insts[bb->inst_count - 1];
             if (last->op != IR_RETURN) continue;
-            if (bb->is_early_exit || bb->is_orelse_fallback) continue;
+            /* BUG-848: is_early_exit is not a statement about the returned
+             * value (see the ARENA loop). Skipping it let an early-exit param
+             * VIEW keep ret_is_content=true, which suppresses the caller's
+             * tracking of exactly the class ret_is_content exists to preserve. */
+            if (bb->is_orelse_fallback) continue;
             /* void return (no value) — irrelevant to a pointer-return borrow */
             if (last->src1_local < 0 && !last->expr) continue;
             real_return_count++;
@@ -6796,6 +7137,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (existing->returns_color != returns_color_final) changed = true;
             if (existing->returns_param_color != returns_param_color_final) changed = true;
+            if (existing->returns_param_mask != returns_param_mask_final) changed = true;
+            if (existing->returns_all_views != returns_all_views_final) changed = true;
             if (existing->ret_is_borrow != ret_is_borrow_final) changed = true;
             if (existing->ret_is_content != ret_is_content_final) changed = true;
             if (changed) {
@@ -6810,6 +7153,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->maybe_frees_param_field = maybe_frees_field;
                 existing->returns_color = returns_color_final;
                 existing->returns_param_color = returns_param_color_final;
+                existing->returns_param_mask = returns_param_mask_final;
+                existing->returns_all_views = returns_all_views_final;
                 existing->ret_is_borrow = ret_is_borrow_final;
                 existing->ret_is_content = ret_is_content_final;
             } else {
@@ -6838,6 +7183,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->maybe_frees_param_field = maybe_frees_field;
                 s->returns_color = returns_color_final;
                 s->returns_param_color = returns_param_color_final;
+                s->returns_param_mask = returns_param_mask_final;
+                s->returns_all_views = returns_all_views_final;
                 s->ret_is_borrow = ret_is_borrow_final;
                 s->ret_is_content = ret_is_content_final;
             } else {

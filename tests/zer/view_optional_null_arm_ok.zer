@@ -1,0 +1,21 @@
+// BUG-847: `?*T f(*T p){ if (c) return p; return null; }` is the canonical
+// optional-view shape. The `return null` arm aliases nothing, but it used to
+// veto the param-view inference, so the caller registered the result as a fresh
+// allocation and reported a leak.
+?*u32 maybe_ptr(*u32 p, bool ok) {
+    if (ok) { return p; }
+    return null;
+}
+
+u32 main() {
+    u32 loc = 3;
+    ?*u32 mm = maybe_ptr(&loc, true);
+    if (mm) |pp| {
+        if (*pp != 3) { return 1; }
+    } else {
+        return 2;
+    }
+    ?*u32 nn = maybe_ptr(&loc, false);
+    if (nn) { return 3; }
+    return 0;
+}

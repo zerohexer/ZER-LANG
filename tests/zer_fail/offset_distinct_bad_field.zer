@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: has no field 'nosuch'
+// BUG-860: the guard was a raw `->kind == TYPE_STRUCT` on a resolved type, so a
+// `distinct typedef` of a struct skipped field validation ENTIRELY — the
+// documented #1 bug class. The bad field now reports instead of reaching GCC.
+struct Dev { u32 tag; u32 v; }
+distinct typedef Dev DevD;
+u32 main() {
+    usize s = @offset(DevD, nosuch);
+    return (u32)s;
+}

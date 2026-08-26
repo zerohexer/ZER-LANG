@@ -1,0 +1,15 @@
+// BUG-845 boundary: the tightening must not reject the correct order. The view
+// is read BEFORE the backing allocation is freed.
+[*]u8 head([*]u8 s) { return s[0..2]; }
+struct Box { [*]u8 s; }
+
+u32 main() {
+    Box b;
+    b.s = alloc(u8, 4) orelse { return 1; };
+    b.s[0] = 5;
+    [*]u8 h = head(b.s);
+    u32 r = h[0];
+    free(b.s);
+    if (r != 5) { return 2; }
+    return 0;
+}

@@ -13,7 +13,7 @@ the corrections I made to my OWN earlier work so they are not repeated.
 
 ## Where main stands
 
-`make check` exit 0 — **1356 .zer**, 200 fuzz, 139 convert, all ten matrices, all seven
+`make check` exit 0 — **1360 .zer**, 200 fuzz, 139 convert, all ten matrices, all seven
 audit gates, sink matrix **88 cells / 0 mismatch**.
 
 Landed this session, newest first:
@@ -50,7 +50,7 @@ contains everything left below, with better implementations than the catalog ent
 | commit | rows | files | conflicts with main? |
 |---|---|---|---|
 | ~~`ccdd49ee`~~ TAKEN | **A2** @cstr, **A3** sign/`value_flows_to`, **A4** enum siblings (861 = already on main) | checker.c emitter.c | ONE conflict in checker.c, resolved to HEAD (purely additive on both sides). Its 861 `memset` had to be DELETED — main's BUG-858 already emits it, so the merge doubled it in both allocators. It also carried SEVEN tracked ELF binaries; dropped. |
-| `dda5b33b` | **A5** `?T` compare, **A6** non-null drift, **A7** inline-array free | checker.c test_emit.c | possible |
+| ~~`dda5b33b`~~ TAKEN | **A5** `?T` compare, **A6** non-null drift, **A7** inline-array free | checker.c test_emit.c | ONE conflict in checker.c, resolved to HEAD. It is what finally USES `nonnull_zero_hole` / `is_null_sentinel_ck`, which had arrived dead with `a22de320`. |
 | `6af2497e` | **A8** indirect-call keep carrier | checker.c | likely small |
 | `1cb1f93e` | **A14** `lower_expr`, dead code, warnings 32 -> 0 | many | medium |
 | `a1919aa5` | **A9** six intrinsics storing through const | checker.c | small |
@@ -117,12 +117,12 @@ BUG-845 guard and watching the sweep report CLEAN on the exact class it exists t
 **A gate that has only ever printed OK is a script, not a net.** Both of these were
 caught by deliberately breaking the compiler and checking the gate went red.
 
-## Recommended order for the remaining 13
+## Recommended order for the remaining 10
 
 1. ~~**A3**, **A2**, **A4**~~ — DONE 2026-08-26 (BUG-889..891, `ccdd49ee`). `value_flows_to`
    is in; the eight negative-constant sinks each have their own test, which is the only way
    to prove one query really replaced all eight.
-2. **A8, A9, A7, A5, A6** — independent accept-unsafe, any order.
+2. ~~**A5**, **A6**, **A7**~~ — DONE 2026-08-26 (BUG-892..894, `dda5b33b`). **A8, A9** remain.
 3. **A15..A19** — over-rejections (A15 is my mis-closed row).
 4. **A13, A14** — arity and the indeterminate return.
 5. Tooling: `ubsan_sweep.sh`, `ub_sweep.sh`, the walker-field membership fix, the
@@ -243,9 +243,9 @@ My BUG-858 (auto-zero on slot reuse) equals their BUG-861; no action.
 | ~~A2~~ **DONE (BUG-889)** | **`@cstr` is an unguarded integer-to-pointer door** | 862 | 3 accepted. Every check was NEGATIVE, so a type matching none was accepted BY DEFAULT. Replaced with an ALLOW-list + arity |
 | ~~A3~~ **DONE (BUG-890)** | **The SIGN half of "no implicit narrowing or sign conversion" was never enforced** | 863 | 8 accepted. `u32 a = -1;` -> 4294967295, while `u8 b = -1;` was rejected only INCIDENTALLY (−1 types as u32, and u32->u8 is a narrowing mismatch). Root cause: the three-condition chain written out at EIGHT sinks, so there was nowhere to add a condition. One `value_flows_to` query |
 | ~~A4~~ **DONE (BUG-891)** | **Enum forging reached only some doors** | 864 | `@truncate(State,7)` unchecked; `@bitcast(Box,7)` with a struct carrier walked past. The guard now recurses struct fields, optional payloads and array elements, at BOTH emitter paths. **Extended the TRACKING, not a ban** — an earlier draft banned it and broke `bitcast_enum_variant_ok` |
-| A5 | **`?T` comparison reads the payload without `has_value`** | 865 | 2 accepted, and the worst-behaved of the aggregate family because it yields a WRONG ANSWER, not invalid C: auto-zero makes `.value` 0 when absent, so a NULL `?u32` compares EQUAL to 0 — `if (x == 0)` passes on a value that is not there |
-| A6 | **Non-null auto-zero check: two hand-written copies that DRIFTED** | 866 | The local copy grew a FUNC_PTR arm, the global one never did — so a global `*(u32,u32)->u32 gop;` was accepted and `gop(1,2)` called through address 0. One `nonnull_zero_hole` at both sites. Two test_emit cases relied on the gap; **one WAS the hazard** |
-| A7 | **`free(s.buf[0..4])` frees INLINE STACK storage** | 867 | The peel asked "is the ROOT a local array?" — the root is a STRUCT. Fixed by the honest question (did navigation stay inside the root's own storage), i.e. FORMED-view vs STORED-reference |
+| ~~A5~~ **DONE (BUG-892)** | **`?T` comparison reads the payload without `has_value`** | 865 | 2 accepted, and the worst-behaved of the aggregate family because it yields a WRONG ANSWER, not invalid C: auto-zero makes `.value` 0 when absent, so a NULL `?u32` compares EQUAL to 0 — `if (x == 0)` passes on a value that is not there |
+| ~~A6~~ **DONE (BUG-893)** | **Non-null auto-zero check: two hand-written copies that DRIFTED** | 866 | The local copy grew a FUNC_PTR arm, the global one never did — so a global `*(u32,u32)->u32 gop;` was accepted and `gop(1,2)` called through address 0. One `nonnull_zero_hole` at both sites. Two test_emit cases relied on the gap; **one WAS the hazard** |
+| ~~A7~~ **DONE (BUG-894)** | **`free(s.buf[0..4])` frees INLINE STACK storage** | 867 | The peel asked "is the ROOT a local array?" — the root is a STRUCT. Fixed by the honest question (did navigation stay inside the root's own storage), i.e. FORMED-view vs STORED-reference |
 | A8 | **Indirect-call keep worst-case tested the BARE kind** | 875 | 3 accepted: `?*T` param and a by-value struct carrier. ASan stack-use-after-return; the DIRECT call of each was already rejected. Uses the shared `type_carries_data_pointer`. Top-level slice/opaque exemption kept deliberately and measured |
 | A9 | **Six intrinsics STORE through a `const` buffer** | 877 | NEW — not in tracker 2. 12 pointer-taking CPU/cache intrinsics validated "pointer or array?" and nothing about qualifiers; 6 of them STORE (`@nt_store`, `@cpu_fxsave`, `@cpu_xsave`, `@cpu_save_context`, `@cpu_save_fpu`, `@cache_zero_line`). On bare metal that is a write into FLASH that neither faults nor takes effect |
 

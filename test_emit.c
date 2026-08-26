@@ -1226,10 +1226,15 @@ int main(void) {
 
     printf("[func ptr: global variable]\n");
     test_compile_and_run(
+        /* BUG-866: this used to declare `u32 (*g_fn)(u32,u32);` with no
+         * initializer. That auto-zeroes to a NULL funcptr, and the rule against
+         * it existed only in the LOCAL var-decl copy of the check — the global
+         * sibling had never grown the funcptr arm. Both sites now run one query,
+         * so the declaration must carry an initializer (or be `?`-optional),
+         * exactly as the identical declaration one scope deeper always has. */
         "u32 add(u32 a, u32 b) { return a + b; }\n"
-        "u32 (*g_fn)(u32, u32);\n"
+        "u32 (*g_fn)(u32, u32) = add;\n"
         "u32 main() {\n"
-        "    g_fn = add;\n"
         "    return g_fn(20, 5);\n"
         "}\n",
         25,
@@ -1237,7 +1242,13 @@ int main(void) {
 
     printf("[func ptr: callback registration]\n");
     test_compile_and_run(
-        "void (*saved_cb)(u32 val);\n"
+        /* BUG-866: this test WAS the hazard. `void (*saved_cb)(u32 val);` with no
+         * initializer auto-zeroes to NULL, and `saved_cb(5)` then emits a raw
+         * call through address 0 on any path where register_cb was not reached
+         * first. A registered-later callback slot is precisely what `?` is for,
+         * so the idiomatic spelling both compiles and makes the unwrap explicit
+         * — and this now exercises the optional-funcptr capture too. */
+        "?void (*saved_cb)(u32 val) = null;\n"
         "u32 result = 0;\n"
         "void register_cb(void (*cb)(u32 val)) {\n"
         "    saved_cb = cb;\n"
@@ -1247,7 +1258,7 @@ int main(void) {
         "}\n"
         "u32 main() {\n"
         "    register_cb(my_handler);\n"
-        "    saved_cb(5);\n"
+        "    if (saved_cb) |cb| { cb(5); }\n"
         "    return result;\n"
         "}\n",
         15,

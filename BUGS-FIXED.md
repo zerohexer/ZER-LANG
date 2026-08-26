@@ -5,6 +5,66 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-26b — BUG-892..894: a null optional equal to 0, a drifted rule, an inline free
+
+Adopted from `claude/vigilant-tesla-as71kk` (`dda5b33b`). One conflict in `checker.c`,
+purely additive on both sides, resolved to HEAD. The two helpers `nonnull_zero_hole` and
+`is_null_sentinel_ck` had arrived DEAD with the earlier `a22de320` pick and now have call
+sites — BUG-893 is what they were written for.
+
+### BUG-892 — a NULL `?u32` compared EQUAL to 0
+OPTIONAL was the last member missing from the "aggregate has no meaningful comparison"
+list, and the worst-behaved, because it yields a WRONG ANSWER rather than invalid C.
+A value optional is `struct { T value; uint8_t has_value; }`, and `?u32 == 0` emitted
+`a.value == 0` — reading the payload without consulting `has_value`. Auto-zero makes
+`.value` zero when absent, so a null check written the natural way passes on a value that
+is not there. Measured on main: the program below exits 0.
+
+```
+?u32 maybe() { return null; }
+?u32 x = maybe();
+if (x == 0) { return 0; }        // taken
+```
+
+`?T == ?T` emitted `a.value == b` — invalid C, caught only by GCC. Two shapes stay legal
+and are tested: `opt == null` (the intended spelling, already lowering to `!x.has_value`)
+and null-SENTINEL optionals `?*T` / `?FuncPtr`, which ARE the pointer at runtime and have
+no payload to read past.
+
+### BUG-893 — "auto-zeroes into a NULL the type forbids?" answered by two drifted copies
+Local and global var-decl each had a hand-written copy of the check, and they drifted: the
+LOCAL copy grew a `FUNC_PTR` arm, the global one never did. So
+
+```
+*(u32, u32) -> u32 gop;          // global: ACCEPTED
+u32 main() { return gop(1, 2); } // emits gop(...) — a raw call through address 0
+```
+
+while the identical declaration one scope deeper was rejected — two spellings of one
+program disagreeing, this codebase's reliable tell for a drifted duplicate. One query,
+`nonnull_zero_hole`, at both sites.
+
+Corpus cost: two `test_emit` cases relied on the gap, and **the second WAS the hazard** —
+an unregistered `saved_cb(5)` calling through address 0. Both are updated to the
+ZER-correct spelling rather than the rule being softened; the callback one now uses
+`?void (*cb)(u32)` + `if (saved_cb) |cb|`, which is what the optional is for and exercises
+the unwrap besides.
+
+### BUG-894 — `free()` of a slice over an INLINE array field
+`free(s.buf[0..4])` on `struct S { u8[8] buf; }` freed a slice of inline stack storage.
+The peel walked to the root IDENT and then asked "is the ROOT a local array?" — the root
+is a STRUCT, so the test failed, while `free(buf[0..4])` on a bare local array one line
+away was rejected.
+
+Fixed by asking the honest question instead of adding a case: **did the navigation stay
+inside the root's own storage?** The discriminator is FORMED-view vs STORED-reference —
+`s.buf[0..4]` forms a view over inline bytes, `h.s` reads a reference the program put
+there — the same distinction CLAUDE.md already records for the alias rules. Both shapes
+that must still compile are verified: `free(h.s)` where `s` is a heap slice in a field,
+and `free(heap)` directly.
+
+---
+
 ## Session 2026-08-26 — BUG-889..891: the @cstr door, the sign half, enum siblings
 
 Adopted from `claude/vigilant-tesla-as71kk` (`ccdd49ee`). Its BUG-861 (recycled-slot

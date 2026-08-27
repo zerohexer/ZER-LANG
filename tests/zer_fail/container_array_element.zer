@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// BUG-915: an ELEMENT of an Inner[N] is a complete Inner that is nobody's member,
+// so subtracting a field offset from it walks out of the array.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+u32 main() {
+    Inner[3] arr;
+    *Inner p = &arr[1];
+    *Outer o = @container(*Outer, p, in);
+    return (u32)o.pad;
+}

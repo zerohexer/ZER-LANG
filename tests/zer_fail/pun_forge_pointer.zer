@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: @pun cannot forge
+// BUG-916: an integer becomes a working pointer with no @inttoptr and no `mmio`
+// declaration — the grammar-level closure ZER's safety claim rests on, bypassed.
+// Pre-fix this compiled and ran: hosted it wrote 42 through the forged pointer
+// with no trap at all; a wild address is caught only by the hosted SIGSEGV
+// handler, which does not exist on bare metal.
+struct P { *u32 p; }
+u32 victim;
+u32 main() {
+    u64 addr = (u64)@ptrtoint(&victim);
+    *u64 ap = &addr;
+    *P pp = @pun(*P, ap);
+    *u32 q = pp.p;
+    *q = 42;
+    return victim;
+}

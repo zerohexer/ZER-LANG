@@ -301,6 +301,27 @@ struct Symbol {
     const char *container_field;
     uint32_t container_field_len;
 
+    /* BUG-915: the MISSING third state of @container provenance.
+     *
+     * The domain had exactly two elements — `container_struct != NULL` (this
+     * pointer came from `&outer.field`) and NULL, read as "unknown, cannot
+     * prove wrong, allow". But `*Inner ip = &i;` where `i` is a standalone
+     * `Inner` is not unknown: the compiler saw the address being formed and
+     * knows it points at a WHOLE object that is nobody's field. `@container`
+     * on it subtracts the field offset and hands back a pointer BEFORE the
+     * object — an out-of-bounds read with no diagnostic and no trap
+     * (ASan: stack-buffer-underflow / global-buffer-underflow).
+     *
+     * A missing abstract state that collapses a KNOWN-BAD case into "unknown"
+     * is the exact shape CLAUDE.md's MAX-oracle standard calls a soundness
+     * hole, so the state is now represented instead of inferred away.
+     *
+     * The two flags are MUTUALLY EXCLUSIVE and are maintained together at every
+     * site that writes either — see `set_container_prov_*` in checker.c. Keeping
+     * them as one pair with one writer is what stops the "set one, forget to
+     * clear the other" drift. */
+    bool is_whole_object_addr;       /* provably `&wholeObject`, never `&x.field` */
+
     /* for functions */
     bool is_function;
     bool is_comptime;       /* comptime function — evaluated at compile time */

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// BUG-915: a global source gives global-buffer-underflow rather than
+// stack-buffer-underflow — same defect, different segment.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+Inner gi;
+u32 main() {
+    *Inner ip = &gi;
+    *Outer o = @container(*Outer, ip, in);
+    return (u32)o.pad;
+}

@@ -2349,6 +2349,199 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_packed_derived) dst->is_packed_derived = true;
 }
 
+/* ================================================================
+ * BUG-915: @container pointer provenance — ONE writer for the pair
+ *
+ * `Symbol.container_struct` (came from `&outer.field`) and
+ * `Symbol.is_whole_object_addr` (came from `&wholeObject`) are the two KNOWN
+ * states of one three-valued fact; both clear means UNKNOWN. They are mutually
+ * exclusive, so every write must set one and clear the other — a variable
+ * re-pointed from `&o.in` to `&i` that kept the stale field provenance would
+ * report the WRONG diagnostic, and one re-pointed the other way would report
+ * none at all.
+ *
+ * Three call sites write this fact (var-decl init, assignment, alias copy), and
+ * the field-provenance half was already duplicated across two of them. Routing
+ * all three through these two setters is what keeps the pair consistent.
+ * ================================================================ */
+static void set_container_prov_field(Symbol *sym, Type *st,
+                                     const char *fname, uint32_t flen) {
+    if (!sym) return;
+    sym->container_struct = st;
+    sym->container_field = fname;
+    sym->container_field_len = flen;
+    sym->is_whole_object_addr = false;
+}
+static void set_container_prov_whole(Symbol *sym) {
+    if (!sym) return;
+    sym->container_struct = NULL;
+    sym->container_field = NULL;
+    sym->container_field_len = 0;
+    sym->is_whole_object_addr = true;
+}
+static void set_container_prov_unknown(Symbol *sym) {
+    if (!sym) return;
+    sym->container_struct = NULL;
+    sym->container_field = NULL;
+    sym->container_field_len = 0;
+    sym->is_whole_object_addr = false;
+}
+
+/* ================================================================
+ * BUG-916: does this type carry a value with a VALIDITY INVARIANT —
+ * one for which NOT every bit pattern is a legal value?
+ *
+ * The question the `@pun` rule needs. A `u32` has no invariant: all 2^32
+ * patterns are legal `u32`s, so reinterpreting foreign bytes as one produces a
+ * VALUE — possibly a surprising one, never an illegal one. A pointer, a slice
+ * (its `len` is what every bounds check trusts), a funcptr, an enum (its
+ * variant set is what exhaustive `switch` lowering trusts), a `bool` (0/1), an
+ * optional (its `has_value` byte) and a Handle all have one: a wrong bit
+ * pattern manufactures a CAPABILITY the rest of the compiler then believes.
+ *
+ * Sibling of `type_carries_data_pointer` / `type_carries_handle`, deliberately
+ * separate for the reason recorded there: three different questions, three
+ * predicates. This one is the union of "what can a forge produce that some
+ * other analysis is entitled to trust?".
+ *
+ * Exhaustive switch, no `default:` — a new TypeKind fails the build under
+ * -Werror=switch and forces this question to be answered for it, which is the
+ * completeness half CLAUDE.md asks a carrier predicate to have.
+ * ================================================================ */
+static bool type_carries_forgeable(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(t)) {
+    /* Values whose validity some later analysis trusts. */
+    case TYPE_POINTER: case TYPE_OPAQUE: case TYPE_SLICE:
+    case TYPE_FUNC_PTR: case TYPE_ENUM: case TYPE_BOOL:
+    case TYPE_HANDLE: case TYPE_OPTIONAL:
+        return true;
+    /* Builtin containers carry internal bookkeeping (indices, generation
+     * counters, capacities) that their own operations trust. */
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+    case TYPE_BARRIER: case TYPE_SLAB: case TYPE_SEMAPHORE:
+        return true;
+    /* Aggregates: forgeable iff some member is. */
+    case TYPE_ARRAY:
+        return type_carries_forgeable(u->array.inner, depth + 1);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_forgeable(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    case TYPE_UNION:
+        /* A ZER union is TAGGED, and the tag itself is an invariant. */
+        return true;
+    /* Every bit pattern is a legal value of these. */
+    case TYPE_VOID:
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64:
+    case TYPE_UINT: case TYPE_SINT:
+        return false;
+    /* Unwrapped by type_dispatch_kind, so unreachable; listed so the switch
+     * stays total. */
+    case TYPE_DISTINCT:
+        return false;
+    }
+    return false;
+}
+
+/* Does a pointee type carry a runtime `type_id`? Only struct / enum / union do —
+ * everything else packs 0, which the emitted @pun check reads as "unknown
+ * provenance, allow". Kept next to the predicate above because the pair is what
+ * decides whether @pun's advertised runtime check can fire at all. */
+static bool pun_pointee_has_type_id(Type *t) {
+    TypeKind k = type_dispatch_kind(t);
+    return k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_UNION;
+}
+
+/* Does this type carry an ENUM at any nesting depth?
+ *
+ * The checker-side twin of the emitter's `type_carries_enum_e`, which decides
+ * where the variant guard is emitted. Kept as its own predicate rather than
+ * folded into `type_carries_forgeable` because the two answer different
+ * questions: this one is "does an exhaustive switch downstream depend on these
+ * bits being a declared variant?", which is narrower and is the only half with
+ * a measured wrong-dispatch behind it (BUG-917). Recurses the same wrappers as
+ * every other carrier predicate in this file. */
+static bool type_carries_enum_c(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_ENUM) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_enum_c(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_enum_c(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_enum_c(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_enum_c(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    return false;
+}
+
+/* Can the @pun runtime type_id trap the emitter writes actually FIRE?
+ *
+ * It emits `pn.type_id = SRC_TID; if (pn.type_id != TGT_TID && pn.type_id != 0) trap`
+ * — and takes a plain-cast path with no check at all when TGT_TID is 0. So the
+ * trap is reachable only when BOTH pointees carry an id. This mirrors the
+ * emitter, and if that emission ever changes this predicate must change with it. */
+static bool pun_type_id_check_can_fire(Type *src_pointee, Type *tgt_pointee) {
+    return pun_pointee_has_type_id(src_pointee) &&
+           pun_pointee_has_type_id(tgt_pointee);
+}
+
+/* Classify the operand of a `&` for @container purposes.
+ *
+ *   &x            (x a plain variable)            -> WHOLE   (never a field)
+ *   &arr[i]       (arr an array/slice of Inner)   -> WHOLE   (element, not field)
+ *   &x.f  / &p.f  / &arr[i].f                     -> FIELD   (with struct + name)
+ *   anything else                                 -> UNKNOWN
+ *
+ * `&arr[i]` is WHOLE deliberately: an element of an `Inner[N]` is a complete
+ * `Inner` that is nobody's member, so subtracting a field offset from it walks
+ * out of the array exactly as it walks out of a standalone object. A chain that
+ * ENDS in a field (`&arr[i].f`) is FIELD and is handled by the field arm. */
+typedef enum { CPROV_UNKNOWN = 0, CPROV_FIELD, CPROV_WHOLE } ContainerProv;
+
+static ContainerProv classify_amp_operand(Checker *c, Node *operand,
+                                          Type **out_struct,
+                                          const char **out_field,
+                                          uint32_t *out_field_len) {
+    if (!operand) return CPROV_UNKNOWN;
+    if (operand->kind == NODE_FIELD) {
+        Type *ot = typemap_get(c, operand->field.object);
+        if (!ot) return CPROV_UNKNOWN;
+        Type *st = type_unwrap_distinct(ot);
+        if (st && type_dispatch_kind(st) == TYPE_POINTER)
+            st = type_unwrap_distinct(st->pointer.inner);
+        if (!st || type_dispatch_kind(st) != TYPE_STRUCT) return CPROV_UNKNOWN;
+        if (out_struct) *out_struct = st;
+        if (out_field) *out_field = operand->field.field_name;
+        if (out_field_len) *out_field_len = (uint32_t)operand->field.field_name_len;
+        return CPROV_FIELD;
+    }
+    if (operand->kind == NODE_IDENT) return CPROV_WHOLE;
+    if (operand->kind == NODE_INDEX) {
+        /* `&arr[i]` — an ELEMENT is a whole object. Only claim this when the
+         * indexed thing is itself a plain variable; a longer chain we have not
+         * modelled stays UNKNOWN (conservative: allow, as before). */
+        Node *obj = operand->index_expr.object;
+        if (obj && obj->kind == NODE_IDENT) return CPROV_WHOLE;
+    }
+    return CPROV_UNKNOWN;
+}
+
 /* Given the operand of a `&` (address-of), decide whether the resulting
  * pointer is LOCAL-DERIVED (points into THIS frame). Walks the field/index
  * chain to the root ident, then applies the pointer-into-nonlocal-ref
@@ -6537,9 +6730,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
                         tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
-                        tsym->container_struct = NULL;
-                        tsym->container_field = NULL;
-                        tsym->container_field_len = 0;
+                        /* BUG-915: clears BOTH halves of the @container fact —
+                         * a reassigned pointer must not keep a stale
+                         * whole-object claim any more than a stale field one. */
+                        set_container_prov_unknown(tsym);
                         /* HOLE FIX (§B #10): whole-ident slice target assigned a
                          * local array / slice-of-local — mark local-derived so
                          * `s = arr; return s;` (and g=s / &s[i]) is caught. The
@@ -6638,9 +6832,13 @@ static Type *check_expr(Checker *c, Node *node) {
                             /* provenance propagation through alias (compile-time belt) */
                             if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
                             if (src && src->container_struct) {
-                                tsym->container_struct = src->container_struct;
-                                tsym->container_field = src->container_field;
-                                tsym->container_field_len = src->container_field_len;
+                                set_container_prov_field(tsym, src->container_struct,
+                                    src->container_field, src->container_field_len);
+                            } else if (src && src->is_whole_object_addr) {
+                                /* BUG-915: the whole-object fact rides an alias
+                                 * exactly as the field fact does — `*Inner a = &i;
+                                 * *Inner b = a;` must still reject @container(b). */
+                                set_container_prov_whole(tsym);
                             }
                         }
                         /* BUG-750: `tmp.ref = local[0..]` field-store of a slice
@@ -6700,19 +6898,16 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (tkey.len > 0) prov_map_set(c, tkey.str, (uint32_t)tkey.len, src->provenance_type);
                             }
                         }
-                        /* @container provenance: val = &struct.field */
-                        if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP &&
-                            vcheck->unary.operand->kind == NODE_FIELD) {
-                            Node *fn = vcheck->unary.operand;
-                            Type *ot = typemap_get(c, fn->field.object);
-                            if (ot) {
-                                Type *st = type_unwrap_distinct(ot);
-                                if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
-                                if (st && st->kind == TYPE_STRUCT) {
-                                    tsym->container_struct = st;
-                                    tsym->container_field = fn->field.field_name;
-                                    tsym->container_field_len = (uint32_t)fn->field.field_name_len;
-                                }
+                        /* @container provenance: val = &struct.field, or
+                         * (BUG-915) val = &wholeObject — same classifier as the
+                         * var-decl sink so the two cannot diverge. */
+                        if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP) {
+                            Type *st = NULL; const char *cfn = NULL; uint32_t cfl = 0;
+                            switch (classify_amp_operand(c, vcheck->unary.operand,
+                                                         &st, &cfn, &cfl)) {
+                            case CPROV_FIELD: set_container_prov_field(tsym, st, cfn, cfl); break;
+                            case CPROV_WHOLE: set_container_prov_whole(tsym); break;
+                            case CPROV_UNKNOWN: break;
                             }
                         }
                         /* @ptrtoint(&local) on assignment → mark target as local-derived.
@@ -10714,6 +10909,70 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "reads past the %lld-byte source (out-of-bounds)",
                                     (long long)dst_sz, (long long)src_sz);
                             }
+
+                            /* BUG-916: the SAME-SIZE half of the same defect.
+                             *
+                             * BH-18 #4 (just above) closed the case where a
+                             * type_id-less pun reads PAST the source. It left the
+                             * case where it reads exactly IN BOUNDS and forges a
+                             * value the rest of the compiler trusts. Measured on
+                             * the pre-fix compiler, all accepted with no
+                             * diagnostic and no trap:
+                             *
+                             *   struct P { *u32 p; }   *P pp = @pun(*P, u64ptr);
+                             *       -> an integer became a working pointer, with
+                             *          no @inttoptr and no `mmio` declaration. That
+                             *          is the grammar-level closure ZER's safety
+                             *          claim rests on, bypassed by an intrinsic.
+                             *   struct Box { State s; } -> a forged enum, and the
+                             *          exhaustive-switch lowering emits the LAST arm
+                             *          as an unconditional else, so a value in no
+                             *          variant DISPATCHES TO AN ARM (measured).
+                             *   struct BW { bool b; }  -> a `bool` holding 200.
+                             *   struct FW { *(u32)->u32 f; } -> a call through it.
+                             *
+                             * Hosted, a wild address is caught by the SIGSEGV
+                             * handler; freestanding there is no handler, so on
+                             * bare metal it is a silent wild access. And a forged
+                             * pointer that happens to be VALID is silent everywhere.
+                             *
+                             * Why it was invisible: the emitted check is
+                             * `type_id != TGT && type_id != 0`, and only
+                             * struct/enum/union pointees carry an id. With a
+                             * primitive on either side the constant is 0 and the
+                             * check is vacuous — while @ptrcast's own diagnostic
+                             * tells users to reach for "@pun ... for an explicit
+                             * runtime-checked pun". The advertised check did not
+                             * exist for these sources.
+                             *
+                             * Scope, deliberately narrow: only when the runtime
+                             * check CANNOT fire, only when the pointee types
+                             * actually differ, and only when the TARGET carries a
+                             * value with a validity invariant. Reinterpreting bytes
+                             * into plain integers/floats forges nothing, so
+                             * `@pun(*u8, structptr)` — the byte-view idiom — still
+                             * compiles. An *opaque source is excluded above: that
+                             * is the FFI floor, where the check IS dynamic. */
+                            if (tgt_eff_pun_strip &&
+                                !pun_type_id_check_can_fire(eff->pointer.inner,
+                                                            tgt_eff_pun_strip->pointer.inner) &&
+                                !type_equals(type_unwrap_distinct(eff->pointer.inner),
+                                             type_unwrap_distinct(tgt_eff_pun_strip->pointer.inner)) &&
+                                type_carries_forgeable(tgt_eff_pun_strip->pointer.inner, 0)) {
+                                char tgtbuf[128];
+                                snprintf(tgtbuf, sizeof tgtbuf, "%s",
+                                         type_name(tgt_eff_pun_strip->pointer.inner));
+                                checker_error(c, node->loc.line,
+                                    "@pun cannot forge '%s' from '%s' — the target "
+                                    "carries a pointer, slice, enum, bool, optional "
+                                    "or handle, whose validity the rest of the "
+                                    "program trusts, and neither pointee carries a "
+                                    "runtime type_id so the @pun check cannot fire. "
+                                    "Use @inttoptr for an address, a [*]u8 slice to "
+                                    "parse bytes, or pun between two struct types "
+                                    "(which IS runtime-checked)",
+                                    tgtbuf, type_name(eff->pointer.inner));
+                            }
                         }
                     }
                 }
@@ -10897,6 +11156,55 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@inttoptr target must be a pointer type, got '%s'",
                             type_name(result));
+                    }
+                    /* BUG-917: the FOURTH enum-forging door.
+                     *
+                     * The enum-forge door set was documented as closed at three
+                     * (@bitcast, @truncate, @saturate), on the reasoning recorded
+                     * at emit_enum_variant_guard_path: "ZER has no int->enum cast,
+                     * so every other path to an enum value is a declared variant."
+                     * @inttoptr IS an int->pointer cast, and dereferencing what it
+                     * returns produces an enum value out of arbitrary foreign bits:
+                     *
+                     *     volatile *State reg = @inttoptr(*State, addr);
+                     *     switch (*reg) { .idle => ... .running => ... .done => ... }
+                     *
+                     * Measured pre-fix with the register holding 200: no diagnostic,
+                     * no guard emitted, and the switch RETURNED 3. Exhaustive-enum
+                     * lowering emits the LAST arm as an unconditional else — sound
+                     * only while every enum value really is a declared variant — so
+                     * a value in no variant DISPATCHES TO AN ARM. Same through a
+                     * struct field (`*Regs` with a `State` member). Bare metal makes
+                     * it worse, not better: there is no fault handler, so nothing
+                     * downstream ever notices.
+                     *
+                     * REJECTED rather than guarded, deliberately. The guard would
+                     * have to fire at every READ through the pointer (deref, field,
+                     * index, nested) — a new N-sink surface — whereas the idiom the
+                     * documentation already teaches goes through a door that IS
+                     * guarded: read the register as an integer, then convert.
+                     * Rejecting therefore keeps the door set CLOSED AT THREE instead
+                     * of adding a fourth that needs its own guard everywhere.
+                     * Corpus cost measured before shipping: ZERO — no test, example
+                     * or library file names an enum-carrying @inttoptr target.
+                     *
+                     * Scoped to ENUMS on purpose. A pointer-carrying MMIO struct is
+                     * a different question (@inttoptr IS the sanctioned int->pointer
+                     * door, and `lib/compat.zer` relies on `@inttoptr(*opaque, ...)`),
+                     * and no wrong-dispatch defect has been measured for it. See
+                     * docs/limitations.md. */
+                    if (type_dispatch_kind(res_eff) == TYPE_POINTER &&
+                        res_eff->pointer.inner &&
+                        type_carries_enum_c(res_eff->pointer.inner, 0)) {
+                        checker_error(c, node->loc.line,
+                            "@inttoptr cannot produce a pointer to '%s' — it carries "
+                            "an enum, and the bits at a hardware address are not "
+                            "guaranteed to be a declared variant, which an exhaustive "
+                            "switch relies on. Read the register as an integer and "
+                            "convert: 'volatile *u32 r = @inttoptr(*u32, addr); "
+                            "State s = @bitcast(State, *r);' — that conversion is "
+                            "checked at runtime",
+                            type_name(res_eff->pointer.inner));
                     }
                 }
                 if (node->intrinsic.arg_count > 0) {
@@ -12159,36 +12467,85 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
                 /* provenance check: if source pointer has container provenance,
-                 * target struct + field must match */
-                if (node->intrinsic.arg_count > 0 &&
-                    node->intrinsic.args[0]->kind == NODE_IDENT) {
-                    Symbol *src_sym = scope_lookup(c->current_scope,
-                        node->intrinsic.args[0]->ident.name,
-                        (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                    if (src_sym && src_sym->container_struct) {
-                        /* check struct matches */
-                        if (tgt && tgt->kind == TYPE_STRUCT &&
-                            tgt != src_sym->container_struct) {
-                            checker_error(c, node->loc.line,
-                                "@container: pointer provenance is struct '%.*s' "
-                                "but target is '%.*s'",
-                                (int)src_sym->container_struct->struct_type.name_len,
-                                src_sym->container_struct->struct_type.name,
-                                (int)tgt->struct_type.name_len, tgt->struct_type.name);
+                 * target struct + field must match.
+                 *
+                 * BUG-915: resolve the provenance from EITHER shape of arg0 —
+                 * a variable carrying the fact, or a `&expr` written straight
+                 * into the call. `@container(*Outer, &i, in)` used to skip this
+                 * block entirely (it tested `kind == NODE_IDENT`), so the direct
+                 * spelling of the very thing being checked was unchecked. One
+                 * resolution, one set of rules, both sinks. */
+                Type *prov_struct = NULL;
+                const char *prov_field = NULL;
+                uint32_t prov_field_len = 0;
+                bool prov_whole = false;
+                if (node->intrinsic.arg_count > 0) {
+                    Node *a0 = node->intrinsic.args[0];
+                    if (a0->kind == NODE_IDENT) {
+                        Symbol *src_sym = scope_lookup(c->current_scope,
+                            a0->ident.name, (uint32_t)a0->ident.name_len);
+                        if (src_sym) {
+                            prov_struct = src_sym->container_struct;
+                            prov_field = src_sym->container_field;
+                            prov_field_len = src_sym->container_field_len;
+                            prov_whole = src_sym->is_whole_object_addr;
                         }
-                        /* check field matches */
-                        if (node->intrinsic.arg_count > 1 &&
-                            node->intrinsic.args[1]->kind == NODE_IDENT) {
-                            const char *fn = node->intrinsic.args[1]->ident.name;
-                            uint32_t fl = (uint32_t)node->intrinsic.args[1]->ident.name_len;
-                            if (src_sym->container_field_len != fl ||
-                                memcmp(src_sym->container_field, fn, fl) != 0) {
-                                checker_error(c, node->loc.line,
-                                    "@container: pointer was derived from field '%.*s' "
-                                    "but used with field '%.*s'",
-                                    (int)src_sym->container_field_len, src_sym->container_field,
-                                    (int)fl, fn);
-                            }
+                    } else if (a0->kind == NODE_UNARY && a0->unary.op == TOK_AMP) {
+                        switch (classify_amp_operand(c, a0->unary.operand,
+                                                     &prov_struct, &prov_field,
+                                                     &prov_field_len)) {
+                        case CPROV_WHOLE:   prov_whole = true; break;
+                        case CPROV_FIELD:   break;   /* fields already written out */
+                        case CPROV_UNKNOWN: prov_struct = NULL; break;
+                        }
+                    }
+                }
+                if (prov_whole) {
+                    /* The pointer is the address of a COMPLETE object, so it is
+                     * nobody's member. @container subtracts the field offset and
+                     * hands back a pointer BEFORE that object: every read through
+                     * it is out of bounds. Measured pre-fix: accepted with no
+                     * diagnostic, no trap, and ASan reporting stack-buffer-underflow
+                     * (a global source gives global-buffer-underflow). Statically
+                     * decidable, so reject — same call the @pun widening rule makes
+                     * for the same reason. */
+                    checker_error(c, node->loc.line,
+                        "@container: the pointer is the address of a whole object, "
+                        "not of a field inside a '%.*s' — subtracting the field "
+                        "offset reads before the object. Pass a pointer obtained as "
+                        "'&outer.%.*s'",
+                        (tgt && type_dispatch_kind(tgt) == TYPE_STRUCT)
+                            ? (int)tgt->struct_type.name_len : 6,
+                        (tgt && type_dispatch_kind(tgt) == TYPE_STRUCT)
+                            ? tgt->struct_type.name : "struct",
+                        (node->intrinsic.arg_count > 1 &&
+                         node->intrinsic.args[1]->kind == NODE_IDENT)
+                            ? (int)node->intrinsic.args[1]->ident.name_len : 5,
+                        (node->intrinsic.arg_count > 1 &&
+                         node->intrinsic.args[1]->kind == NODE_IDENT)
+                            ? node->intrinsic.args[1]->ident.name : "field");
+                } else if (prov_struct) {
+                    /* check struct matches */
+                    if (tgt && type_dispatch_kind(tgt) == TYPE_STRUCT &&
+                        tgt != prov_struct) {
+                        checker_error(c, node->loc.line,
+                            "@container: pointer provenance is struct '%.*s' "
+                            "but target is '%.*s'",
+                            (int)prov_struct->struct_type.name_len,
+                            prov_struct->struct_type.name,
+                            (int)tgt->struct_type.name_len, tgt->struct_type.name);
+                    }
+                    /* check field matches */
+                    if (node->intrinsic.arg_count > 1 &&
+                        node->intrinsic.args[1]->kind == NODE_IDENT && prov_field) {
+                        const char *fn = node->intrinsic.args[1]->ident.name;
+                        uint32_t fl = (uint32_t)node->intrinsic.args[1]->ident.name_len;
+                        if (prov_field_len != fl ||
+                            memcmp(prov_field, fn, fl) != 0) {
+                            checker_error(c, node->loc.line,
+                                "@container: pointer was derived from field '%.*s' "
+                                "but used with field '%.*s'",
+                                (int)prov_field_len, prov_field, (int)fl, fn);
                         }
                     }
                 }
@@ -14265,9 +14622,10 @@ static void check_stmt(Checker *c, Node *node) {
                         if (src && src->provenance_type)
                             sym->provenance_type = src->provenance_type;
                         if (src && src->container_struct) {
-                            sym->container_struct = src->container_struct;
-                            sym->container_field = src->container_field;
-                            sym->container_field_len = src->container_field_len;
+                            set_container_prov_field(sym, src->container_struct,
+                                src->container_field, src->container_field_len);
+                        } else if (src && src->is_whole_object_addr) {
+                            set_container_prov_whole(sym);
                         }
                     }
                 }
@@ -14312,22 +14670,17 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* @container provenance: track struct+field when ptr = &struct.field */
+            /* @container provenance: track struct+field when ptr = &struct.field,
+             * and (BUG-915) the WHOLE-OBJECT case when ptr = &wholeObject. */
             if (sym && node->var_decl.init) {
                 Node *init = node->var_decl.init;
-                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP &&
-                    init->unary.operand->kind == NODE_FIELD) {
-                    Node *field_node = init->unary.operand;
-                    Type *obj_type = typemap_get(c, field_node->field.object);
-                    if (obj_type) {
-                        Type *st = type_unwrap_distinct(obj_type);
-                        /* walk through pointer auto-deref */
-                        if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
-                        if (st && st->kind == TYPE_STRUCT) {
-                            sym->container_struct = st;
-                            sym->container_field = field_node->field.field_name;
-                            sym->container_field_len = (uint32_t)field_node->field.field_name_len;
-                        }
+                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
+                    Type *st = NULL; const char *fn = NULL; uint32_t fl = 0;
+                    switch (classify_amp_operand(c, init->unary.operand,
+                                                 &st, &fn, &fl)) {
+                    case CPROV_FIELD:   set_container_prov_field(sym, st, fn, fl); break;
+                    case CPROV_WHOLE:   set_container_prov_whole(sym); break;
+                    case CPROV_UNKNOWN: break;
                     }
                 }
             }

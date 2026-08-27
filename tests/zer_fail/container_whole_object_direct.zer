@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// BUG-915, second sink: the provenance block used to test `args[0]->kind ==
+// NODE_IDENT`, so writing the `&` straight into the call skipped every check.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+u32 main() {
+    Inner i; i.a = 3;
+    *Outer o = @container(*Outer, &i, in);
+    return (u32)o.pad;
+}

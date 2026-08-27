@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: @pun cannot forge
+// BUG-916: a forged function pointer — an indirect call to an arbitrary address.
+struct FW { *(u32) -> u32 f; }
+u32 main() {
+    u64 addr = 0;
+    *u64 ap = &addr;
+    *FW fp = @pun(*FW, ap);
+    return fp.f(3);
+}

@@ -218,6 +218,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/audit_type_dispatch.sh
 	@echo "=== Carrier-dispatch audit (wrapper-hides-inner-kind class kill) ==="
 	@bash tools/audit_carrier_dispatch.sh
+	@echo "=== Float-literal audit (inf/nan must not reach emitted C as bare tokens) ==="
+	@bash tools/audit_float_literal.sh
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
@@ -238,6 +240,10 @@ check-walker-fields:
 
 check-sink-matrix: zerc
 	@bash tools/sink_matrix.sh ./zerc
+
+# Standalone — every emitted double must go through emit_double_lit.
+check-float-literal:
+	@bash tools/audit_float_literal.sh
 
 # Standalone — every ```zer block in docs/reference.md must compile.
 check-reference: zerc

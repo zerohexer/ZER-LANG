@@ -1,0 +1,26 @@
+// BUG-915 over-rejection boundary — the three shapes that must KEEP compiling:
+//   1. a pointer formed as `&outer.field`            (the whole point of @container)
+//   2. an UNKNOWN pointer (a parameter)              (cannot prove wrong -> allow)
+//   3. a pointer RE-POINTED from whole-object to field
+// (3) is what proves the two provenance halves are maintained as one pair: a
+// stale whole-object claim would reject a program that is correct.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+
+u32 up(*Inner p) { *Outer o = @container(*Outer, p, in); return (u32)o.pad; }
+
+u32 main() {
+    Outer ov; ov.pad = 11; ov.in.a = 1;
+    *Inner ip = &ov.in;
+    *Outer back = @container(*Outer, ip, in);
+    if ((u32)back.pad != 11) { return 1; }
+
+    if (up(&ov.in) != 11) { return 2; }
+
+    Inner i; i.a = 3;
+    *Inner p = &i;
+    p = &ov.in;
+    *Outer o2 = @container(*Outer, p, in);
+    if ((u32)o2.pad != 11) { return 3; }
+    return 0;
+}

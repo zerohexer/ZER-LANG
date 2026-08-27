@@ -5,6 +5,220 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-27b — BUG-913..917: two unchecked doors, and two defects the user sees as GCC errors
+
+A fresh audit, not a branch harvest — all nine `vigilant-tesla` branches are consumed and
+every harvest tracker is closed. Five findings, each reproduced on main first and each
+regression test **proved to flip** against a pre-fix build before being committed.
+
+Two are silent safety holes of the same shape: **an intrinsic advertises a check that, for
+certain operand types, is not emitted at all.** Two are defects where the compiler's own
+output is invalid C, so the user gets a GCC error pointing (through `#line`) at their own
+`.zer` line, with no ZER diagnostic naming the cause. One is a documentation-only
+correction that came out of the probing.
+
+### BUG-916 — `@pun`'s runtime check does not exist when either pointee is a primitive
+
+`@ptrcast` rejects unrelated pointer types with a message that ends *"use `@pun(*P, ...)`
+for an explicit **runtime-checked** pun"*. For a large family of operands that check is
+never emitted.
+
+The emitter writes `pn.type_id = SRC; if (pn.type_id != TGT && pn.type_id != 0) trap`, and
+only struct / enum / union pointees carry a `type_id` — everything else packs 0. So with a
+primitive on either side the constant is 0, the comparison folds to false, and there is no
+check. Measured on main, all accepted with **no diagnostic and no trap**:
+
+| probe | result on main |
+|---|---|
+| `struct P { *u32 p; }` from `*u64` | an integer became a working pointer — **wrote 42 through it, rc=42** |
+| `struct Box { State s; }` from `*u32` | forged enum; the switch **returned 3** (see below) |
+| `struct BW { bool b; }` from `*u8` | a `bool` holding 200 read as true |
+| `struct FW { *(u32)->u32 f; }` from `*u64` | indirect call to an arbitrary address |
+| `struct S { [*]u8 s; }` from `*[*]u8` | a forged slice `len` — the value every bounds check trusts |
+
+The first row is the serious one: it is an integer-to-pointer conversion with no
+`@inttoptr` and no `mmio` declaration, which is the grammar-level closure ZER's safety
+claim rests on. Hosted, a wild address is caught by the SIGSEGV handler — **which is
+`_ZER_HOSTED`-only, so on bare metal it is a silent wild access** — and a forged pointer
+that happens to be valid is silent everywhere.
+
+BH-18 #4 had already found the WIDENING half of this (`@pun(*Big, *u32)` reads past the
+source) and its commit even records *"the runtime type_id trap is skipped for an in-ZER
+primitive pointer ... so the OOB is SILENT."* It closed the case that reads OUT of bounds
+and left the case that reads IN bounds and forges a value.
+
+**Fix.** One rule beside its widening sibling, and deliberately narrow: reject only when
+the runtime check *cannot fire* (`pun_type_id_check_can_fire`), the pointee types actually
+differ, and the TARGET carries a value with a validity invariant
+(`type_carries_forgeable` — pointer / opaque / slice / funcptr / enum / bool / optional /
+Handle / builtin container, recursing arrays, structs and unions). Reinterpreting bits as
+plain integers forges nothing, so the byte-view idiom `@pun(*u8, structptr)` and
+`@pun(*Plain, *u32)` still compile — pinned by `tests/zer/pun_no_invariant_ok.zer`.
+Struct-to-struct puns are untouched: they keep the runtime trap.
+
+`type_carries_forgeable` is an exhaustive `switch` with no `default:`, so a new `TypeKind`
+fails the build rather than defaulting to "not forgeable".
+
+Tests: `tests/zer_fail/pun_forge_{pointer,enum,slice,funcptr}.zer` (all four ACCEPTED
+pre-fix), `tests/zer/pun_no_invariant_ok.zer`.
+
+### BUG-917 — the FOURTH enum-forging door: `@inttoptr` to an enum-carrying pointee
+
+The door set was recorded as closed at three (`@bitcast`, `@truncate`, `@saturate`) on the
+reasoning written at `emit_enum_variant_guard_path`: *"ZER has no int->enum cast, so every
+other path to an enum value is a declared variant."* `@inttoptr` **is** an int-to-pointer
+cast, and dereferencing what it returns produces an enum out of arbitrary foreign bits:
+
+```zer
+volatile *State reg = @inttoptr(*State, addr);
+switch (*reg) { .idle => ... .running => ... .done => ... }
+```
+
+Measured on main with the register holding 200: no diagnostic, **zero guard emissions in
+the generated C, and the switch returned 3.** Exhaustive-enum lowering emits the LAST arm
+as an unconditional `else` — sound only while every enum value really is a declared
+variant — so a value in no variant *dispatches to an arm* rather than falling through.
+Same through a struct field (`volatile *Regs` with a `State` member), and the same with a
+non-`volatile` target.
+
+**REJECTED rather than guarded, and that is the interesting call.** Guarding would mean
+firing at every READ through the pointer — deref, field, index, nested — a fresh N-sink
+surface of exactly the kind this codebase keeps paying for. The idiom the documentation
+already teaches goes through a door that IS guarded, so rejecting routes users there and
+keeps the door set **closed at three** instead of adding a fourth that needs its own guard
+everywhere. The diagnostic spells out the replacement, and
+`tests/zer_trap/mmio_enum_via_bitcast_trap.zer` proves that replacement both compiles and
+still catches the forgery:
+
+```zer
+volatile *u32 r = @inttoptr(*u32, addr);
+State s = @bitcast(State, *r);        // traps: "not a declared variant"
+```
+
+Corpus cost measured before shipping: **ZERO.** No test, example or library file names an
+enum-carrying `@inttoptr` target (69 are `*u32`, 12 `volatile`, 2 `*opaque`, 1 `*u8`, and
+the two struct targets are all-`u32`).
+
+Scoped to enums on purpose. A pointer-carrying MMIO struct is a different question —
+`@inttoptr` IS the sanctioned int-to-pointer door, `lib/compat.zer` depends on
+`@inttoptr(*opaque, ...)`, and no wrong-dispatch defect has been measured for it. Recorded
+in `docs/limitations.md` rather than shipped as an unmeasured tightening.
+
+Tests: `tests/zer_fail/inttoptr_enum_{target,in_struct}.zer` (both ACCEPTED pre-fix),
+`tests/zer_trap/mmio_enum_via_bitcast_trap.zer`.
+
+### BUG-915 — `@container` had a two-valued domain for a three-valued fact
+
+`@container` subtracts a field offset. Its provenance check had exactly two states —
+"came from `&outer.field`" and NULL, read as *unknown, cannot prove wrong, allow*. But
+`*Inner ip = &i;` where `i` is a standalone `Inner` is **not** unknown: the compiler saw
+the address being formed and knows it points at a whole object that is nobody's field.
+
+```zer
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+Inner i;
+*Inner ip = &i;
+*Outer o = @container(*Outer, ip, in);   // accepted on main
+u32 v = (u32)o.pad;                      // reads BEFORE the object
+```
+
+ASan on the emitted program: **`stack-buffer-underflow`**, `READ of size 8 ... offset 24
+underflows this variable`. A global source gives `global-buffer-underflow`. No diagnostic,
+no trap — silent on an ordinary build.
+
+A missing abstract state that folds a KNOWN-BAD case into "unknown" is precisely what
+CLAUDE.md's MAX-oracle standard calls a soundness hole, so the state is now represented:
+`Symbol.is_whole_object_addr`, the third element of the domain.
+
+**Second sink, found by enumerating rather than reported.** The provenance block tested
+`args[0]->kind == NODE_IDENT`, so `@container(*Outer, &i, in)` — the `&` written straight
+into the call — skipped every check including the pre-existing wrong-struct and
+wrong-field ones. Both sinks now resolve provenance through one classifier
+(`classify_amp_operand`) and run one set of rules.
+
+The two provenance halves are mutually exclusive and are written **only** through
+`set_container_prov_{field,whole,unknown}`, so a pointer re-pointed from `&i` to `&o.in`
+cannot keep a stale claim. `tests/zer/container_field_prov_ok.zer` pins that: it re-points
+a pointer both ways, aliases one, and passes one as a parameter, and all three must still
+compile.
+
+`&arr[i]` is classified WHOLE for the same reason a standalone object is — an element of
+an `Inner[N]` is a complete `Inner` that is nobody's member.
+
+Tests: `tests/zer_fail/container_whole_object{,_direct,_alias,_global}.zer`,
+`tests/zer_fail/container_array_element.zer` (all five ACCEPTED pre-fix),
+`tests/zer/container_field_prov_ok.zer`.
+
+### BUG-913 — a non-finite float literal reached emitted C as the bare token `inf`
+
+```zer
+f64 x = 1e400;      // strtod -> +inf
+```
+`%.17g` is round-trip exact for every FINITE double and prints `inf` / `-inf` / `nan` for
+the three that are not — none of which is a C token. GCC then said *"'inf' undeclared"*,
+pointing through `#line` at the user's own `.zer` line. Both function and global scope.
+
+The spelling was written out at **five** emission sites, so it was five defects. Replaced
+with one helper, `emit_double_lit`, which renders the non-finite values as
+`__builtin_inf()` / `(-__builtin_inf())` / `__builtin_nan("")` — GCC constants that are
+valid in a static initializer and available under `-ffreestanding`, both verified. NaN is
+tested first for the same reason the float-to-int guard does it: every comparison against
+NaN is false.
+
+**Gated**, because a sixth site would re-open it: `tools/audit_float_literal.sh` fails the
+build on any float conversion specifier outside that helper, and is wired into `make check`.
+Verified to go RED — reverting one call site makes it report the site and exit 1.
+
+Test: `tests/zer/float_literal_nonfinite_ok.zer` (failed to BUILD pre-fix).
+
+### BUG-914 — the float-to-int saturation guard is illegal at file scope
+
+```zer
+u32 g = (u32)1e20;
+```
+is a legal ZER global that the checker accepts, but the BUG-883 guard is a GCC statement
+expression, so the emitter wrote `uint32_t g = ({ ... });` at file scope and GCC said
+*"braced-group within expression allowed only inside a function"*. Same class as BUG-913:
+the compiler's own output is what fails, and no ZER diagnostic names the cause.
+
+Added `emit_f2i_const`, the same saturation as a constant expression, used at the AST
+typecast path — which that path's own comment already identifies as the global-initializer
+path. The operand is emitted four times, so it is used only when re-evaluating is free and
+observationally identical: no side effects and not `volatile` (a repeated MMIO read is a
+hardware event, not a free re-read). A global initializer is a constant expression by the
+checker's own rule, so it always qualifies.
+
+The four saturation limits are now produced by one `f2i_limits` helper shared with the
+statement form — the bounds ARE the safety property, and two copies of them is the drift
+shape this file is full of.
+
+Test: `tests/zer/f2i_global_saturate_ok.zer` — checks the global results AND that the
+in-function path agrees value-for-value. Failed to BUILD pre-fix.
+
+### Documentation-only: `u8[2][3]` is 3 rows of 2, the reverse of C
+
+Each bracket wraps the type built so far, so in `T[A][B]` the RIGHTMOST bracket is the
+OUTER dimension: `u8[2][3]` emits `uint8_t m[3][2]`, `m.len == 3`, `m[0].len == 2`
+(verified by a running program, not by reading the emitter). reference.md's only
+multi-dimensional example was `i32[3][3]`, which is square and hides it. Not a
+memory-safety problem — every index is still bounds-checked — but a correctness trap, now
+documented in the `T[N]` section.
+
+### What was probed and found CLEAN
+
+Recorded so it is not re-run blind: `uN`/`iN` width wrap across 8 emission forms
+(var-decl, field, array element, global store, compound assign, `orelse`, shift, signed
+sign-extend); float-to-int saturation at 7 sites (call arg, return, field, struct-init,
+index, compound assign, signed); comptime-vs-runtime agreement on overflow, shift-past-width
+and unsigned underflow; bounds checks across 6 shapes; `move struct` through arrays, fields
+and returns; tagged-union variant dispatch (a union CANNOT forge a pointer — the switch
+reads the tag); signed division overflow; the VRP JOIN site set (if / for / while /
+do-while / switch / defer / `@once` / orelse-block / if-capture, with labels widening
+everything).
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

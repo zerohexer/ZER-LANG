@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: it carries an enum
+// BUG-917: the FOURTH enum-forging door. The door set was documented closed at
+// three (@bitcast / @truncate / @saturate) on the reasoning "ZER has no int->enum
+// cast". @inttoptr IS an int->pointer cast, and dereferencing the result reads an
+// enum out of arbitrary foreign bits. Measured pre-fix with the register holding
+// 200: no diagnostic, no guard, and the exhaustive switch RETURNED 3 — a value in
+// no variant dispatched to `.done`, because the last arm is lowered as an
+// unconditional else.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+enum State { idle, running, done }
+usize gaddr;
+u32 store;
+u32 main() {
+    store = 200;
+    gaddr = @ptrtoint(&store);
+    volatile *State reg = @inttoptr(*State, gaddr);
+    State s = *reg;
+    switch (s) {
+        .idle => { return 1; }
+        .running => { return 2; }
+        .done => { return 3; }
+    }
+    return 77;
+}

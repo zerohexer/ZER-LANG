@@ -5,6 +5,80 @@ Entries removed once fixed.
 
 ---
 
+# SESSION 2026-08-27b — fresh audit (BUG-913..917), five findings
+
+Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
+trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
+of the intrinsic surface. **`make check` exit 0**, ten gates including the new
+`audit_float_literal.sh`.
+
+Two silent safety holes, both the same shape — **an intrinsic advertises a check that is
+not emitted for certain operand types**:
+
+| bug | what was silent | consequence measured on main |
+|---|---|---|
+| BUG-916 | `@pun`'s runtime `type_id` trap is absent whenever either pointee is a primitive/slice/funcptr (only struct/enum/union carry an id, everything else packs 0 and the comparison folds to false) | an integer became a **working pointer with no `@inttoptr` and no `mmio`** — rc=42 writing through it. Also forged enum / bool / funcptr / slice-`len`. Hosted a wild address hits the SIGSEGV handler, which is `_ZER_HOSTED`-only, so **bare metal is a silent wild access** |
+| BUG-917 | `@inttoptr(*State, addr)` — the FOURTH enum-forging door, in a set documented as closed at three | switch **returned 3** on a register holding 200; zero guard emissions in the generated C |
+| BUG-915 | `@container` had a two-valued provenance domain for a three-valued fact; `&wholeObject` fell into "unknown, allow" | ASan **stack-buffer-underflow** (global source: global-buffer-underflow), no diagnostic, no trap |
+
+Plus two defects where the COMPILER'S OWN OUTPUT is invalid C, so the user sees a GCC
+error against their own `.zer` line and no ZER diagnostic ever names the cause: a
+non-finite float literal emitted as the bare token `inf` (BUG-913, five sites, now one
+helper + a gate), and the float-to-int saturation guard emitted as a statement expression
+at file scope (BUG-914).
+
+**Method note worth keeping.** Every one of the five was found by PROBING the intrinsic
+surface for "what does this actually do", not by reading for suspicious code. Three of the
+five were sitting next to a comment that already described the hazard — BH-18 #4's own
+text says *"the runtime type_id trap is skipped for an in-ZER primitive pointer ... so the
+OOB is SILENT"*, and it fixed only the out-of-bounds half. **When a fix's rationale
+describes a mechanism as broken, check whether the fix covered every consequence of that
+mechanism or only the one that was reported.**
+
+## OPEN — `@inttoptr` to a pointer-carrying (not enum-carrying) pointee (LOW, unmeasured)
+
+BUG-917 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch
+downstream *elides work* on the assumption that every value is a declared variant, and that
+elision was measured turning a bad value into a wrong dispatch.
+
+The same intrinsic can produce a pointer to a struct carrying a `*T`, `[*]T`, `bool`,
+optional or `Handle`, and reading those fields forges those values from hardware bits. That
+was NOT shipped, deliberately:
+
+- `@inttoptr` **is** the sanctioned integer-to-pointer door (mmio-gated and audit-visible),
+  so a hardware register holding an address is the thing it exists to express;
+- `lib/compat.zer` depends on `@inttoptr(*opaque, ...)` for its pointer arithmetic, so the
+  blanket predicate (`type_carries_forgeable`) has a non-zero corpus cost;
+- no wrong-dispatch or wrong-elision defect has been measured for these, unlike the enum
+  case.
+
+If this is taken up, measure first: find a downstream analysis that ELIDES a check on the
+strength of one of these types, the way the exhaustive switch does for enums. Absent that,
+this is an unmeasured tightening and should stay unshipped.
+
+## NOTE — the exhaustive-enum switch's last-arm elision is the amplifier, not the hole
+
+Worth writing down because it explains why every enum-door bug reads as severe. Lowering an
+exhaustive `switch` emits the final arm as an **unconditional else**:
+
+```
+if (s == 0) -> arm0; else if (s == 1) -> arm1; else -> arm2;   /* no test on arm2 */
+```
+
+That is sound exactly while every enum value is a declared variant — which is what the
+forge doors defend. So a missed door does not merely let a strange value through; it makes
+that value *take an arm*, and the `return 77` fall-through after the switch becomes dead
+code. Every enum-forge bug to date (BUG-843, 864, 891, 910, and now 917) reports as "the
+switch silently ran its LAST arm" for this reason.
+
+Making the switch defensive (test the last arm too, fall through on no match) would remove
+the amplifier permanently and independently of door coverage. It was NOT done here: it
+costs a comparison and a branch on every enum switch, it silently does nothing on a forged
+value rather than trapping, and ZER's chosen answer is to trap at the point of forgery.
+Recorded as the alternative in case the door set ever stops being closable.
+
+---
+
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest

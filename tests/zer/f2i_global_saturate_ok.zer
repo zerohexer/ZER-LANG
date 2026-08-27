@@ -1,0 +1,22 @@
+// BUG-914: the BUG-883 float->int saturation guard is a GCC statement expression,
+// which is illegal at file scope. `u32 g = (u32)1e20;` is a legal ZER global the
+// checker accepts, but the emitted `uint32_t g = ({ ... });` made GCC say
+// "braced-group within expression allowed only inside a function". The constant
+// form must produce the SAME values as the in-function form.
+u32 gbig  = (u32)1e20;
+u32 gneg  = (u32)(-1.5);
+i8  gsmin = (i8)(-1e20);
+i8  gsmax = (i8)1e20;
+f64 src;
+u32 main() {
+    if (gbig != 4294967295) { return 1; }
+    if (gneg != 0) { return 2; }
+    if ((i32)gsmin != -128) { return 3; }
+    if ((i32)gsmax != 127) { return 4; }
+
+    /* the in-function path must agree value-for-value */
+    src = 1e20;  if ((u32)src != gbig) { return 5; }
+    src = -1.5;  if ((u32)src != gneg) { return 6; }
+    src = -1e20; if ((i8)src != gsmin) { return 7; }
+    return 0;
+}

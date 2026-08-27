@@ -1,0 +1,19 @@
+// BUG-916 over-rejection boundary. The rule fires ONLY when the target carries a
+// value whose validity something else trusts. Reinterpreting bytes as plain
+// integers forges nothing, so both directions must still compile:
+//   - struct -> *u8   : the byte-view idiom
+//   - u32    -> struct of plain integers
+struct A { u32 x; }
+struct Plain { u32 y; }
+u32 main() {
+    A a; a.x = 0x41424344;
+    *A pa = &a;
+    *u8 pb = @pun(*u8, pa);
+    if ((u32)(*pb) == 0) { return 1; }        // some byte of the pattern
+
+    u32 raw = 9;
+    *u32 rp = &raw;
+    *Plain pl = @pun(*Plain, rp);
+    if (pl.y != 9) { return 2; }
+    return 0;
+}

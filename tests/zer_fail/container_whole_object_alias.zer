@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// BUG-915: the whole-object fact must ride an alias exactly as the field fact
+// does, or one copy launders it.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+u32 main() {
+    Inner i; i.a = 3;
+    *Inner p1 = &i;
+    *Inner p2 = p1;
+    *Outer o = @container(*Outer, p2, in);
+    return (u32)o.pad;
+}

@@ -1,0 +1,16 @@
+// BUG-913: a float literal that overflows the double range becomes +inf, and the
+// emitter printed it with "%.17g" — glibc writes the token `inf`, which is not C.
+// GCC then said "'inf' undeclared", pointing (through #line) at this .zer line.
+// Both scopes were affected; both are pinned here.
+f64 gpos = 1e400;
+f64 gneg = -1e400;
+u32 main() {
+    if (!(gpos > 0.0)) { return 1; }
+    if (!(gneg < 0.0)) { return 2; }
+    if (!(gpos > 1.0e308)) { return 3; }
+
+    f64 lpos = 1e400;
+    if (!(lpos > 0.0)) { return 4; }
+    if (lpos != gpos) { return 5; }
+    return 0;
+}

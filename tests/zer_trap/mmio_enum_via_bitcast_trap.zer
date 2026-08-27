@@ -1,0 +1,21 @@
+// expect-trap
+// BUG-917 boundary: the idiom the new @inttoptr diagnostic TEACHES must actually
+// work, and must actually catch the forgery. Read the register as an integer,
+// convert through @bitcast — a door that IS guarded — and the out-of-variant
+// value traps at the point of forgery instead of silently dispatching to an arm.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+enum State { idle, running, done }
+usize gaddr;
+u32 store;
+u32 main() {
+    store = 200;
+    gaddr = @ptrtoint(&store);
+    volatile *u32 r = @inttoptr(*u32, gaddr);
+    State s = @bitcast(State, *r);
+    switch (s) {
+        .idle => { return 1; }
+        .running => { return 2; }
+        .done => { return 3; }
+    }
+    return 77;
+}

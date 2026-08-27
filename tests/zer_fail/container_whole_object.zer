@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// BUG-915: `&i` is the address of a COMPLETE Inner, so it is nobody's field.
+// @container subtracts the field offset and hands back a pointer BEFORE the
+// object. Pre-fix: accepted, no diagnostic, no trap, ASan reports
+// stack-buffer-underflow on the read.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+u32 main() {
+    Inner i; i.a = 3;
+    *Inner ip = &i;
+    *Outer o = @container(*Outer, ip, in);
+    return (u32)o.pad;
+}

@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-27b — BUG-913..919: three unchecked doors, a named debt paid, and two defects the user sees as GCC errors
+## Session 2026-08-27b — BUG-913..920: three unchecked doors, a named debt paid, and two defects the user sees as GCC errors
 
 A fresh audit, not a branch harvest — all nine `vigilant-tesla` branches are consumed and
 every harvest tracker is closed. Five findings, each reproduced on main first and each
@@ -20,6 +20,47 @@ whose type it knew. Two are defects where the compiler's own
 output is invalid C, so the user gets a GCC error pointing (through `#line`) at their own
 `.zer` line, with no ZER diagnostic naming the cause. One is a documentation-only
 correction that came out of the probing.
+
+### BUG-920 — the Ring channel warning was 1-of-4, and a stale CLAUDE.md row
+
+Two small findings from walking CLAUDE.md's own safety table and running each row.
+
+**The warning.** `Ring.push` warns when a pointer crosses a channel, because the receiver
+may not be able to use it. The test was `k == TYPE_POINTER || k == TYPE_OPAQUE` — the
+hand-rolled carrier disjunction `tools/audit_carrier_dispatch.sh` exists to freeze.
+Measured: of the four shapes that put a pointer through a channel, only the bare one warned.
+
+| element type | pre-fix |
+|---|---|
+| `Ring(*u32, N)` | warns |
+| `Ring(?*u32, N)` | **silent** |
+| `Ring([*]u8, N)` — a slice carries a pointer AND a length | **silent** |
+| `Ring(P, N)`, `struct P { *u32 p; }` | **silent** |
+
+**Severity is ADVISORY, and saying so precisely is the point.** The SAFETY half — pushing a
+pointer to a LOCAL — is carrier-complete already through `container_push_arg_escapes`,
+verified rejecting all four shapes with the right diagnostic. What was 1-of-4 is the
+advisory warning, not a soundness gate. Recording it the other way round would be the kind
+of overstatement this ledger exists to prevent.
+
+Fixed by calling `type_carries_data_pointer` at both sites (`push` and `push_checked`) —
+the prescription CLAUDE.md already gives for this class. The now-obsolete baseline row was
+REMOVED from `tools/carrier_dispatch_baseline.txt` in the same commit, per the
+keep-the-gates-current rule; a stale row is a site the gate thinks still exists.
+
+Tests: `tests/zer/ring_warn_carrier_{bare,optional,slice,struct}.zer`, wired through the
+runner's `warn_check` so the WARNING is asserted rather than merely the exit code. One file
+per shape deliberately — they share one message, so a single file with four pushes would
+pass on one surviving warning. Verified: 4-of-4 warn now, 1-of-4 pre-fix.
+
+**The stale row.** The same table says container infinite recursion is
+`container Node(T) { ?*Node(T) next; }` -> compile error. It is not, and must not be: that
+is the linked-list idiom, and it compiles and runs. The real rule (BUG-868) is that a cycle
+is infinite only if EVERY edge is BY VALUE — verified by running all three shapes: by-value
+self-containment and the mutual `A{B b} B{A a}` form are both rejected with a message
+naming the closing field, the pointer-broken form is accepted. The row named the
+over-rejection BUG-857 introduced and BUG-868 replaced. `docs/reference.md` had it right;
+only CLAUDE.md was stale, and a session trusting it would have hunted a non-bug.
 
 ### BUG-919 — the launder-peel debt, paid: a pointer INTO `args[0]` versus `args[last]`
 

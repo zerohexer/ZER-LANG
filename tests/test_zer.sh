@@ -274,6 +274,16 @@ warn_check() {
 warn_check tests/zer/dyn_array_autoguard_crash.zer "auto-guard inserted" "autoguard-warning-emitted"
 warn_check tests/zer/dyn_array_guard.zer "auto-guard inserted" "dynguard-warning-emitted"
 
+# BUG-920: the Ring channel-pointer warning, one cell per CARRIER shape. Only the
+# bare `*T` spelling used to warn; an optional, a slice and a struct FIELD were
+# silent. Separate files because they share one message — a single file with four
+# pushes would pass on one surviving warning.
+RW="pushing pointer through Ring channel"
+warn_check tests/zer/ring_warn_carrier_bare.zer     "$RW" "ring-warn-carrier-bare"
+warn_check tests/zer/ring_warn_carrier_optional.zer "$RW" "ring-warn-carrier-optional"
+warn_check tests/zer/ring_warn_carrier_slice.zer    "$RW" "ring-warn-carrier-slice"
+warn_check tests/zer/ring_warn_carrier_struct.zer   "$RW" "ring-warn-carrier-struct"
+
 echo ""
 echo "=== ZER No-Warning Verification (must compile + NO warnings + exit 0) ==="
 

@@ -1,0 +1,16 @@
+// BUG-920: the Ring channel-safety warning asked `k == TYPE_POINTER ||
+// k == TYPE_OPAQUE` — the hand-rolled carrier disjunction the
+// audit_carrier_dispatch gate exists to freeze. Of the four shapes that put a
+// pointer through a channel, only the BARE one warned.
+//
+// One file per shape ON PURPOSE: all four emit the same text, so a single file
+// with four pushes would pass warn_check even if three regressed.
+//
+// ADVISORY, and the ledger says so precisely: the SAFETY half (pushing a pointer
+// to a LOCAL) is carrier-complete already via container_push_arg_escapes, which
+// rejects all four. This warning is about a pointer the RECEIVER may not be able
+// to use.
+struct P { *u32 p; }
+Ring(P, 4) c;
+u32 gx;
+u32 main() { P v; v.p = &gx; c.push(v); return 0; }

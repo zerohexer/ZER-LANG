@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-# SESSION 2026-08-27b — fresh audit (BUG-913..919), seven findings
+# SESSION 2026-08-27b — fresh audit (BUG-913..920), eight findings
 
 Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
 trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
@@ -37,6 +37,16 @@ error against their own `.zer` line and no ZER diagnostic ever names the cause: 
 non-finite float literal emitted as the bare token `inf` (BUG-913, five sites, now one
 helper + a gate), and the float-to-int saturation guard emitted as a statement expression
 at file scope (BUG-914).
+
+A fifth came from a different method worth repeating: **walk the safety table in
+CLAUDE.md and RUN each row.** Two rows did not match the compiler. The `Ring.push`
+channel-pointer warning was 1-of-4 on the carrier axis (`?*T`, `[*]T` and a struct FIELD
+all silent) — **BUG-920**, advisory only, because the safety half is carrier-complete
+already. And the container-recursion row named `container Node(T) { ?*Node(T) next; }` as a
+compile error when that is the linked-list idiom and compiles; the real rule (BUG-868) is
+that a cycle is infinite only if EVERY edge is by value. `docs/reference.md` had it right.
+**A stale doc row costs a future session a hunt for a non-bug** — the same failure mode this
+file records for a stale gate.
 
 **Method note worth keeping.** Every one of the six was found by PROBING the intrinsic
 surface for "what does this actually do", not by reading for suspicious code. Three of the

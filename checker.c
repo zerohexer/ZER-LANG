@@ -12810,6 +12810,18 @@ static Type *check_expr(Checker *c, Node *node) {
                             "@%.*s first argument must be a shared struct variable",
                             (int)nlen, name);
                     }
+                    /* BUG-921: record that this struct needs a condvar member.
+                     * HERE, because this arm sees every `@cond_*` in every
+                     * expression position — the emitter prescan it replaces saw
+                     * only bare expression statements and therefore missed
+                     * @cond_timedwait, the one that returns a value. */
+                    if (ok) {
+                        Type *cvs = seff;
+                        if (type_dispatch_kind(cvs) == TYPE_POINTER)
+                            cvs = type_unwrap_distinct(cvs->pointer.inner);
+                        if (cvs && type_dispatch_kind(cvs) == TYPE_STRUCT)
+                            cvs->struct_type.uses_condvar = true;
+                    }
                 }
             }
             /* Type-check the condition expression for @cond_wait */

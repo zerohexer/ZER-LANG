@@ -1,0 +1,28 @@
+// BUG-921: @cond_timedwait ALONE — no other condvar intrinsic anywhere.
+//
+// That is the whole point of the test. Which shared structs need a
+// `pthread_cond_t _zer_cond` member used to be discovered by an emitter prescan
+// that matched a `@cond_*` intrinsic only when it was the WHOLE of an expression
+// statement. @cond_timedwait is the one condvar intrinsic that RETURNS a value
+// (?void), so it is written `?void r = @cond_timedwait(...)` — a var-decl
+// initializer the prescan never looked at. The struct emitted without the member
+// and GCC said "'struct C' has no member named '_zer_cond'", naming something the
+// user never wrote.
+//
+// It survived because any program that ALSO calls @cond_wait/@cond_signal gets the
+// member registered by that call, which masks it. Adding one here would make this
+// test pass on the broken compiler.
+shared struct C { u32 count; }
+C g;
+
+u32 main() {
+    // count is 0, so the predicate is false and the wait must TIME OUT ->
+    // @cond_timedwait returns null. A 1 ms timeout keeps the suite fast.
+    ?void r = @cond_timedwait(g, g.count > 0, 1);
+    if (r) { return 1; }        // must not report success
+
+    g.count = 1;
+    ?void r2 = @cond_timedwait(g, g.count > 0, 1);
+    if (r2) { return 0; }       // predicate already true -> immediate success
+    return 2;
+}

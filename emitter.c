@@ -547,7 +547,6 @@ static bool expr_has_side_effects(Node *n) {
 
 /* ---- Type emission ---- */
 static void prescan_async_temps(Emitter *e, Node *node);
-static bool is_condvar_type(Emitter *e, uint32_t type_id);
 
 /* Refactor 3: unified shared struct ensure-init emission.
  * Emits _zer_mtx_ensure_init[_cv] for a shared struct access.
@@ -557,8 +556,12 @@ static void emit_shared_ensure_init(Emitter *e, Node *root, const char *arrow) {
     Type *rt = checker_get_type(e->checker, root);
     Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
     if (rte && rte->kind == TYPE_POINTER) rte = type_unwrap_distinct(rte->pointer.inner);
-    bool needs_cv = rte && rte->kind == TYPE_STRUCT &&
-        is_condvar_type(e, rte->struct_type.type_id);
+    /* BUG-921: the CHECKER's flag, which is set for every `@cond_*` in every
+     * expression position. The old id-registry was filled by a prescan that only
+     * looked at bare expression statements. OR-ed rather than replacing it in one
+     * step would leave two mechanisms for one fact; the prescan is deleted below. */
+    bool needs_cv = rte && type_dispatch_kind(rte) == TYPE_STRUCT &&
+        rte->struct_type.uses_condvar;
     if (needs_cv) {
         emit(e, "_zer_mtx_ensure_init_cv(&");
         emit_expr(e, root);
@@ -826,7 +829,6 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
     return found;
 }
 
-static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
 static bool is_async_local(Emitter *e, const char *name, size_t len); /* forward decl */
 
 
@@ -4570,8 +4572,8 @@ static void emit_struct_decl(Emitter *e, Node *node) {
         } else {
             Type *st = checker_get_type(e->checker, (Node *)node);
             bool needs_condvar = false;
-            if (st && st->kind == TYPE_STRUCT)
-                needs_condvar = is_condvar_type(e, st->struct_type.type_id);
+            if (st && type_dispatch_kind(st) == TYPE_STRUCT)
+                needs_condvar = st->struct_type.uses_condvar;   /* BUG-921 */
             /* BUG-473: all shared structs use recursive pthread_mutex_t.
              * Lazy-init via _zer_mtx_inited flag (auto-zeroed). */
             emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
@@ -5125,26 +5127,12 @@ static void prescan_spawn_in_block(Emitter *e, Node *block) {
         prescan_spawn_in_node(e, block->block.stmts[i]);
 }
 
-static void register_condvar_type(Emitter *e, uint32_t type_id) {
-    /* Check if already registered */
-    for (int i = 0; i < e->condvar_type_count; i++)
-        if (e->condvar_type_ids[i] == type_id) return;
-    if (e->condvar_type_count >= e->condvar_type_capacity) {
-        int nc = e->condvar_type_capacity < 8 ? 8 : e->condvar_type_capacity * 2;
-        uint32_t *nids = (uint32_t *)arena_alloc(e->arena, nc * sizeof(uint32_t));
-        if (e->condvar_type_ids)
-            memcpy(nids, e->condvar_type_ids, e->condvar_type_count * sizeof(uint32_t));
-        e->condvar_type_ids = nids;
-        e->condvar_type_capacity = nc;
-    }
-    e->condvar_type_ids[e->condvar_type_count++] = type_id;
-}
-
-static bool is_condvar_type(Emitter *e, uint32_t type_id) {
-    for (int i = 0; i < e->condvar_type_count; i++)
-        if (e->condvar_type_ids[i] == type_id) return true;
-    return false;
-}
+/* BUG-921: `register_condvar_type` / `is_condvar_type` and the
+ * `condvar_type_ids` registry are DELETED. They existed so an emitter prescan
+ * could tell the struct emitter which shared structs need a `pthread_cond_t`
+ * member — a second mechanism for a fact the checker already establishes, and
+ * one that depended on WHERE the intrinsic appeared. The flag on the Type is
+ * the single source now. */
 
 static void prescan_spawn_in_node(Emitter *e, Node *node) {
     if (!node) return;
@@ -5165,26 +5153,13 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
         break;
     }
     case NODE_EXPR_STMT:
-        /* Detect @cond_wait/@cond_signal/@cond_broadcast usage */
-        if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_INTRINSIC) {
-            Node *intr = node->expr_stmt.expr;
-            if (intr->intrinsic.name_len >= 5 &&
-                memcmp(intr->intrinsic.name, "cond_", 5) == 0 &&
-                intr->intrinsic.arg_count >= 1) {
-                /* First arg is the shared struct variable — get its type */
-                Type *stype = checker_get_type(e->checker, intr->intrinsic.args[0]);
-                if (stype) {
-                    Type *seff = type_unwrap_distinct(stype);
-                    if (seff->kind == TYPE_STRUCT && seff->struct_type.is_shared)
-                        register_condvar_type(e, seff->struct_type.type_id);
-                    if (seff->kind == TYPE_POINTER) {
-                        Type *inner = type_unwrap_distinct(seff->pointer.inner);
-                        if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                            register_condvar_type(e, inner->struct_type.type_id);
-                    }
-                }
-            }
-        }
+        /* BUG-921: the condvar prescan that lived here is GONE. It matched a
+         * `cond_` intrinsic only when the intrinsic was the WHOLE of an
+         * expression statement, so `@cond_timedwait` — the one that returns a
+         * value, and is therefore written `?void r = @cond_timedwait(...)` —
+         * was never seen, and its shared struct emitted with no `_zer_cond`
+         * member. The fact is now recorded by the checker, which visits every
+         * `@cond_*` wherever it appears; see Type.struct_type.uses_condvar. */
         break;
     case NODE_BLOCK: prescan_spawn_in_block(e, node); break;
     case NODE_IF:

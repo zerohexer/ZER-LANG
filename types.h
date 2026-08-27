@@ -114,6 +114,18 @@ struct Type {
             bool is_packed;
             bool is_shared;
             bool is_shared_rw;      /* shared(rw) — reader-writer lock */
+            /* BUG-921: this shared struct is used with a condvar intrinsic, so its
+             * emitted C needs a `pthread_cond_t _zer_cond` member.
+             *
+             * Set by the CHECKER, which visits every `@cond_*` in full expression
+             * context. It used to be discovered by an emitter PRESCAN that matched
+             * an intrinsic only when it was the whole of a NODE_EXPR_STMT — and
+             * `@cond_timedwait` is the one condvar intrinsic that RETURNS a value
+             * (`?void`), so it is normally written `?void r = @cond_timedwait(...)`,
+             * a var-decl initializer the prescan never looked at. The struct then
+             * emitted without the member and GCC said *"'struct C' has no member
+             * named '_zer_cond'"* — about a member the user never wrote. */
+            bool uses_condvar;
             bool is_move;           /* move struct — ownership transfer on pass/assign */
             const char *module_prefix;  /* NULL for main module */
             uint32_t module_prefix_len;

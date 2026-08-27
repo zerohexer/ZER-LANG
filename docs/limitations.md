@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-# SESSION 2026-08-27b — fresh audit (BUG-913..920), eight findings
+# SESSION 2026-08-27b — fresh audit (BUG-913..921), nine findings
 
 Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
 trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
@@ -37,6 +37,16 @@ error against their own `.zer` line and no ZER diagnostic ever names the cause: 
 non-finite float literal emitted as the bare token `inf` (BUG-913, five sites, now one
 helper + a gate), and the float-to-int saturation guard emitted as a statement expression
 at file scope (BUG-914).
+
+The same method found **BUG-921**: `@cond_timedwait` used ALONE emitted C referencing
+`struct C._zer_cond`, a member that was never declared. The emitter prescan that decides
+which shared structs need a condvar member matched an intrinsic only when it was the WHOLE
+of an expression statement — and `@cond_timedwait` is the one condvar intrinsic that RETURNS
+a value, so it is written as a var-decl initializer. **The name test was fine; the POSITION
+test was the bug.** It survived because any program that also calls `@cond_wait` registers
+the member and masks it. Fixed by recording the fact in the CHECKER, which visits every
+`@cond_*` wherever it appears, and DELETING the registry rather than leaving two mechanisms
+for one fact.
 
 A fifth came from a different method worth repeating: **walk the safety table in
 CLAUDE.md and RUN each row.** Two rows did not match the compiler. The `Ring.push`

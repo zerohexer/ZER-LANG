@@ -86,11 +86,12 @@ typedef struct {
     int async_temp_capacity;
     int async_temp_next_id;
 
-    /* condvar types — shared structs that use @cond_wait/@cond_signal.
-     * These need pthread_mutex_t instead of spinlock. Tracked by type_id. */
-    uint32_t *condvar_type_ids;
-    int condvar_type_count;
-    int condvar_type_capacity;
+    /* BUG-921: the condvar_type_ids registry is GONE. Which shared structs need a
+     * `pthread_cond_t` member is recorded by the CHECKER on the Type itself
+     * (Type.struct_type.uses_condvar), because the emitter-side prescan that
+     * filled this registry only saw a `@cond_*` that was the WHOLE of an
+     * expression statement — and @cond_timedwait returns a value, so it never
+     * is one. */
 
     /* Phase F (2026-04-20): IR analysis hook. When set, the emitter calls
      * this function on every IRFunc it lowers, BEFORE emitting C. Used to

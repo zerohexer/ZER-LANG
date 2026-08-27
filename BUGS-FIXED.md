@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-27b — BUG-913..920: three unchecked doors, a named debt paid, and two defects the user sees as GCC errors
+## Session 2026-08-27b — BUG-913..921: three unchecked doors, a named debt paid, and three defects the user sees as GCC errors
 
 A fresh audit, not a branch harvest — all nine `vigilant-tesla` branches are consumed and
 every harvest tracker is closed. Five findings, each reproduced on main first and each
@@ -20,6 +20,42 @@ whose type it knew. Two are defects where the compiler's own
 output is invalid C, so the user gets a GCC error pointing (through `#line`) at their own
 `.zer` line, with no ZER diagnostic naming the cause. One is a documentation-only
 correction that came out of the probing.
+
+### BUG-921 — `@cond_timedwait` alone emitted C referencing a member that was never declared
+
+```zer
+shared struct C { u32 count; }
+C g;
+u32 main() { ?void r = @cond_timedwait(g, g.count > 0, 1); return 0; }
+```
+
+GCC: *"'struct C' has no member named `_zer_cond`"* — about a member the user never
+wrote, at their own `.zer` line. Same class as BUG-913/914: the compiler's own output is
+what fails.
+
+**Which one, and why exactly one.** Which shared structs need a `pthread_cond_t _zer_cond`
+member was discovered by an emitter PRESCAN that matched a `cond_` intrinsic only when it
+was the WHOLE of a `NODE_EXPR_STMT`. `@cond_wait` / `@cond_signal` / `@cond_broadcast`
+return void and are written as statements, so they registered. **`@cond_timedwait` is the
+one that returns a value** (`?void`, null on timeout), so it is written
+`?void r = @cond_timedwait(...)` — a var-decl initializer the prescan never looked at. The
+name test was not the bug; the POSITION test was.
+
+**Why it survived.** Any program that also calls `@cond_wait` or `@cond_signal` on the same
+struct gets the member registered by that call, which masks it — verified, and the reason
+the regression test uses `@cond_timedwait` and nothing else. Adding a second condvar call
+to that test would make it pass on the broken compiler.
+
+**Fix: record the fact where every occurrence is already visited.** The CHECKER validates
+every `@cond_*` first argument in full expression context, so it sets
+`Type.struct_type.uses_condvar` there. The emitter reads the flag at its two decision sites.
+The prescan arm, `register_condvar_type`, `is_condvar_type` and the whole
+`condvar_type_ids` registry are DELETED rather than left beside the flag — two mechanisms
+for one fact is how the position dependence got in.
+
+Test: `tests/zer/cond_timedwait_alone.zer` — verified to FAIL TO BUILD on a pre-fix
+compiler with exactly that GCC error, and to exercise both outcomes (timeout returns null,
+already-true predicate returns success).
 
 ### BUG-920 — the Ring channel warning was 1-of-4, and a stale CLAUDE.md row
 

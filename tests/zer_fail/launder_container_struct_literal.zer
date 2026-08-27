@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: local-derived pointer
+// BUG-919: @container's POINTER is args[0] and its LAST arg is a field NAME, so
+// the same last-arg peel walked to an identifier that names no variable at all.
+struct LH { u32 n; }
+struct Dev { u32 id; LH lh; }
+struct W { *Dev d; }
+?*Dev gd;
+u32 main() {
+    Dev local;
+    *LH lp = &local.lh;
+    W w = { .d = @container(*Dev, lp, lh) };
+    gd = w.d;
+    return 0;
+}

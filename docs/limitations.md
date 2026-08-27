@@ -5,7 +5,7 @@ Entries removed once fixed.
 
 ---
 
-# SESSION 2026-08-27b — fresh audit (BUG-913..918), six findings
+# SESSION 2026-08-27b — fresh audit (BUG-913..919), seven findings
 
 Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
 trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
@@ -21,6 +21,16 @@ not emitted for certain operand types**:
 | BUG-917 | `@inttoptr(*State, addr)` — the FOURTH enum-forging door, in a set documented as closed at three | switch **returned 3** on a register holding 200; zero guard emissions in the generated C |
 | BUG-915 | `@container` had a two-valued provenance domain for a three-valued fact; `&wholeObject` fell into "unknown, allow" | ASan **stack-buffer-underflow** (global source: global-buffer-underflow), no diagnostic, no trap |
 | BUG-918 | the ROOT of BUG-916 — erasing a non-aggregate pointer to `*opaque` recorded `type_id = 0`, which means "unknown origin, a C pointer we cannot vouch for" rather than "no id available" | `@ptrcast(*Big, opaque_from_u32ptr)` **RAN**; ASan stack-buffer-overflow on the 16-byte read of a 4-byte object. The same program with a `*Sensor` origin traps correctly — two spellings disagreeing |
+
+And a fourth, from CLAUDE.md's own NAMED debt rather than from probing blind — the
+launder-peel ratio (*"~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS
+the debt"*). It was still a live hole: `@cstr` and `@container` return a pointer INTO
+`args[0]`, six sites open-coded the peel and took `args[last]`, and `gp = @cstr(localbuf,
+s)` published a pointer into a dead frame to a global — ASan stack-use-after-return.
+**BUG-919**: five sites routed through the shared peeler, the shared frame-bound query
+taught the local-array decay, and the two remaining shape-matchers made to ASK that query
+instead of growing a case per launder. Gated by five new sink-matrix cells (88 -> 95),
+verified 4 HOLES pre-fix / 0 after.
 
 Plus two defects where the COMPILER'S OWN OUTPUT is invalid C, so the user sees a GCC
 error against their own `.zer` line and no ZER diagnostic ever names the cause: a

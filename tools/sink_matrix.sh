@@ -271,6 +271,32 @@ cell p18_safe_use_then_free compile '[*]u8 hd18b([*]u8 s){return s[0..2];} u32 m
 cell p18_safe_stack_view    compile 'struct N18{u32 v;u32 w;} *u32 fo18(*N18 n){return &n.v;} u32 main(){ N18 nd; nd.v=7; *u32 p=fo18(&nd); if (*p != 7) { return 1; } return 0; }'
 cell p18_safe_null_arm      compile '?*u32 mb18(*u32 p,bool ok){ if (ok) { return p; } return null; } u32 main(){ u32 loc=3; ?*u32 m=mb18(&loc,true); if (m) |pp| { if (*pp != 3) { return 1; } } return 0; }'
 
+echo ""
+echo "===== SHAPE p19 = a launder whose result points INTO args[0], not args[last] ====="
+# @cstr(dst, src) and @container(*T, ptr, field) both return a pointer INTO their
+# FIRST argument. Six escape sinks peeled to the LAST arg — which for @cstr is the
+# SOURCE SLICE (typically a string literal, i.e. static) and for @container is the
+# field NAME. So the local never looked frame-bound and the pointer escaped.
+# Measured live before BUG-919 at the global-store sinks: ASan stack-use-after-return.
+#
+# The peeled value is a BARE IDENTIFIER naming a local array — no `&` anywhere — which
+# is why every shape-matching case missed it and why the shared query needed the
+# local-array-decay arm.
+cell p19_cstr_global        reject 'u32 main(){ u8[8] b19; const [*]u8 s19="hi"; g_p=@ptrcast(*u32,@cstr(b19,s19)); return 0; }'
+cell p19_cstr_field_store   reject 'u32 main(){ u8[8] b19; const [*]u8 s19="hi"; g_h.p=@ptrcast(*u32,@cstr(b19,s19)); return 0; }'
+cell p19_cstr_struct_lit    reject 'u32 main(){ u8[8] b19; const [*]u8 s19="hi"; H h19={ .mp=@ptrcast(*u32,@cstr(b19,s19)) }; g_p=h19.mp; return 0; }'
+# Own typed global: wrapping the value in @ptrcast to reuse g_p would trip the
+# @ptrcast rule instead, and the cell would score "ok" on a compiler that has the
+# hole — a weak oracle inside the gate. Verified: this spelling is a HOLE pre-fix.
+cell p19_container_lit      reject 'struct LH19{u32 n;} struct D19{u32 id; LH19 lh;} struct W19{ *D19 d; } ?*D19 g_d19; u32 main(){ D19 l19; *LH19 lp19=&l19.lh; W19 w19={ .d=@container(*D19,lp19,lh) }; g_d19=w19.d; return 0; }'
+# This one was ALREADY caught pre-fix — the assignment sink open-coded @container
+# (and only @container). It is a COVERAGE cell, not a proof cell; the other four
+# are the ones that flipped. Kept so the shared peeler cannot silently lose it.
+cell p19_container_global   reject 'struct LH19{u32 n;} struct D19{u32 id; LH19 lh;} ?*D19 g_e19; u32 main(){ D19 l19; *LH19 lp19=&l19.lh; g_e19=@container(*D19,lp19,lh); return 0; }'
+# BOUNDARY: the same launders over a GLOBAL buffer are correct code and must compile.
+# These are what stops the fix from degenerating into "any @cstr is an escape".
+cell p19_safe_cstr_global   compile 'u8[8] gb19; u32 main(){ const [*]u8 s19="hi"; g_p=@ptrcast(*u32,@cstr(gb19,s19)); return 0; }'
+cell p19_safe_cstr_local_use compile 'u32 main(){ u8[8] b19; const [*]u8 s19="hi"; *u8 c19=@cstr(b19,s19); if (*c19 != 104) { return 1; } return 0; }'
 
 echo ""
 echo "==================================================================="

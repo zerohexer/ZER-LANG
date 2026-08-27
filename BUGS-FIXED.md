@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-27b — BUG-913..918: three unchecked doors, and two defects the user sees as GCC errors
+## Session 2026-08-27b — BUG-913..919: three unchecked doors, a named debt paid, and two defects the user sees as GCC errors
 
 A fresh audit, not a branch harvest — all nine `vigilant-tesla` branches are consumed and
 every harvest tracker is closed. Five findings, each reproduced on main first and each
@@ -20,6 +20,78 @@ whose type it knew. Two are defects where the compiler's own
 output is invalid C, so the user gets a GCC error pointing (through `#line`) at their own
 `.zer` line, with no ZER diagnostic naming the cause. One is a documentation-only
 correction that came out of the probing.
+
+### BUG-919 — the launder-peel debt, paid: a pointer INTO `args[0]` versus `args[last]`
+
+CLAUDE.md has carried this as a NAMED debt — *"`checker.c` still has ~30 hand-rolled peel
+sites vs ~15 shared-peeler uses — that ratio IS the debt"*. It was still a live hole.
+
+`unwrap_ptr_launder` knows something the hand-rolled loops do not: `@ptrcast` / `@pun` /
+`@bitcast` / `@cast` carry the pointer as their LAST argument, but **`@container` and
+`@cstr` return a pointer INTO `args[0]`**. Six sites open-coded the peel and took the last
+argument. For `@cstr` that is the SOURCE slice — typically a string literal, i.e. static —
+so the local destination buffer never looked frame-bound:
+
+```zer
+?*u8 gp;
+void publish() { u8[8] buf; const [*]u8 s = "hi"; gp = @cstr(buf, s); }
+```
+
+Compiled with no diagnostic. Reading `gp` after `publish()` returned:
+**ASan `stack-use-after-return`.**
+
+Measured across the sinks — four live, and the pattern is the usual one, the same question
+answered differently at each site:
+
+| sink | pre-fix |
+|---|---|
+| `gp = @cstr(localbuf, s)` (global store) | **accepted** |
+| `g.p = @cstr(localbuf, s)` (global FIELD store) | **accepted** |
+| `H h = { .p = @cstr(localbuf, s) }` (struct literal) | **accepted** |
+| `W w = { .d = @container(*Dev, lp, lh) }` (struct literal) | **accepted** |
+| `gd = @container(*Dev, lp, lh)` (global store) | caught — this ONE sink open-coded `@container` |
+| `return @cstr(localbuf, s)` | caught — by a bespoke `@cstr` rule of its own (BUG-259) |
+| spawn arg / keep arg | caught — by a different predicate entirely |
+
+The last two rows are the tell. The knowledge existed twice, in two bespoke rules, at two
+of the seven sinks.
+
+**Fix, in three parts, each removing a reason for the next hole.**
+
+1. **Route the hand-rolled peels through `unwrap_ptr_launder`** (five sites). The sixth,
+   `spawn_arg_is_stack_derived`, uses an ALLOW-LIST rather than a last-arg peel, so it is
+   conservative by construction — probed and confirmed masked by a stronger sibling, and
+   left alone.
+2. **Teach the shared query the missing state.** Peeling `@cstr` yields a BARE IDENTIFIER
+   naming a local array — no `&` anywhere — and `value_frame_bound_symbol` had no arm for
+   it, because `is_local_derived` marks a POINTER derived from a local and never the local
+   array itself. An array is the only bare identifier that DECAYS to a pointer, which is
+   what keeps `g = local_u32` (a copy) accepted.
+3. **Make the two remaining shape-matchers ask the shared query** instead of growing a new
+   case each time a launder is added: the assignment sink for a peeled value with no `&`,
+   and `struct_init_has_local_derived` as an additional case beside its existing four.
+
+**A trace, not an argument, is what found the last step.** After parts 1 and 2 the probes
+still compiled. The guard I had written was `aval != avalu` — "a launder actually peeled
+something" — and part 1 had made `aval` the ALREADY-PEELED value, so my own condition could
+never be true. One `fprintf` showed the sink was reached with `peeled=0`; no amount of
+re-reading would have shown that, and CLAUDE.md says so in as many words.
+
+**Gated.** Five new cells in `tools/sink_matrix.sh` (p19, matrix 88 -> 95). Verified
+non-vacuous against a pre-fix build: **4 HOLES before, 0 after.** The fifth is labelled in
+the script as a COVERAGE cell rather than a proof cell, because that sink already caught it
+— saying otherwise would be the false-confidence failure the ledger exists to prevent. Two
+BOUNDARY cells pin the over-rejection edge (a GLOBAL destination buffer, and a local
+destination used locally and never stored), which is what stops the rule degenerating into
+"any `@cstr` is an escape".
+
+Over-rejection cost measured, not argued: `make check` exit 0 with **no existing test
+changed**.
+
+Tests: `tests/zer_fail/launder_cstr_global_escape.zer`,
+`tests/zer_fail/launder_cstr_struct_literal.zer`,
+`tests/zer_fail/launder_container_struct_literal.zer` (all three ACCEPTED pre-fix),
+`tests/zer/launder_cstr_global_buffer_ok.zer`.
 
 ### BUG-918 — the ROOT of BUG-916: the `*opaque` erasure recorded a LIE
 

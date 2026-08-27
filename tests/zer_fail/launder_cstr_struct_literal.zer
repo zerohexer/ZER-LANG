@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: local-derived pointer
+// BUG-919, the struct-literal sink. struct_init_has_local_derived matched value
+// SHAPES (&local, an is_local_derived alias, a slice, a call-launder) and the
+// peeled @cstr is none of them — it is a BARE IDENTIFIER naming a local array.
+// The walker now also consults the shared frame-bound query, which knows the
+// local-array decay.
+struct H { *u8 p; }
+?*u8 gp;
+u32 main() {
+    u8[8] buf;
+    const [*]u8 s = "hi";
+    H h = { .p = @cstr(buf, s) };
+    gp = h.p;
+    return 0;
+}

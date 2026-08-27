@@ -1,0 +1,20 @@
+// BUG-919 over-rejection boundary. The rule is about the LIFETIME of @cstr's
+// destination, not about @cstr. Both of these must keep compiling:
+//   1. the destination is a GLOBAL buffer — the result outlives every frame
+//   2. the destination is a local, and the result is USED locally, never stored
+i32 printf(const *u8 fmt, ...);
+u8[16] gbuf;
+?*u8 gp;
+
+u32 main() {
+    const [*]u8 s = "hi";
+
+    gp = @cstr(gbuf, s);                 // global destination — fine
+    if (gp) |p| { if (*p != 104) { return 1; } }   // 'h'
+
+    u8[16] lbuf;
+    *u8 lc = @cstr(lbuf, s);             // local destination, local use — fine
+    if (*lc != 104) { return 2; }
+    printf("%s %s\n", gbuf, lbuf);
+    return 0;
+}

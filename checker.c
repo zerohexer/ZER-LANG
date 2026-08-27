@@ -2013,6 +2013,7 @@ static bool container_push_arg_escapes(Checker *c, Type *elem, Node *arg) {
  * struct_init_has_local_derived on each true-return so the diagnostic can name the
  * ARENA rather than say "a local" for memory that is not one. Read immediately after
  * the call at the reporting site; never latched. */
+static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth); /* fwd */
 static bool _si_hit_arena = false;
 static const char *frame_bound_noun(bool arena) {
     return arena ? "memory from an Arena" : "a local";
@@ -2027,10 +2028,16 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             if (struct_init_has_local_derived(c, fv)) return true;
             continue;
         }
-        /* unwrap intrinsic chains (mirror the direct case) */
-        Node *fu = fv;
-        while (fu && fu->kind == NODE_INTRINSIC && fu->intrinsic.arg_count > 0)
-            fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+        /* BUG-919: use the SHARED peeler. This hand-rolled loop took the LAST
+         * arg unconditionally, which is right for @ptrcast/@pun/@bitcast/@cast
+         * and WRONG for @container (args[0] is the pointer, the last is a field
+         * NAME) and @cstr (args[0] is the destination BUFFER, the last is the
+         * source slice). Measured live: `H h = { .p = @cstr(localbuf, s) };
+         * gp = h.p;` peeled to the string literal — a static — so the local
+         * never looked local-derived and the stack pointer reached a global.
+         * unwrap_ptr_launder knows both special cases and also peels a
+         * reference-producing C-style cast. */
+        Node *fu = unwrap_ptr_launder(fv);
         /* Case A: &local — direct address-of */
         if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
             Node *root = fu->unary.operand;
@@ -2044,6 +2051,24 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
                 Symbol *src = scope_lookup(c->current_scope,
                     root->ident.name, (uint32_t)root->ident.name_len);
                 if (src && !src->is_static && !is_global) return true;
+            }
+        }
+        /* Case E (BUG-919): ask the SHARED frame-bound query.
+         *
+         * Cases A-D each match a SHAPE, so a value that is frame-bound without
+         * having one of those shapes slipped through. The measured instance:
+         * `{ .p = @cstr(localbuf, s) }` peels to the BARE identifier `localbuf`
+         * — no `&`, not an is_local_derived alias, not a slice — so every case
+         * missed it and the literal never tainted its container. The shared query
+         * already knows the peel, the `&local` chain, the local-array decay and
+         * the orelse JOIN; consulting it here is how this walker stops needing a
+         * new case each time a launder is added. Kept as an ADDITIONAL case rather
+         * than a replacement for A-D so no existing verdict changes. */
+        {
+            Symbol *fb = value_frame_bound_symbol(c, fv, 0);
+            if (fb) {
+                _si_hit_arena = fb->is_arena_derived && !fb->is_local_derived;
+                return true;
             }
         }
         /* Case B: alias ident already flagged frame-bound (local OR arena -
@@ -2173,8 +2198,8 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
         bool may_return_i = !complete || (i < 64 && (mask & (1ull << i)));
         if (!may_return_i) continue;
         Node *arg = call->call.args[i];
-        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
-            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        arg = unwrap_ptr_launder(arg);   /* BUG-919: shared peeler, see the note at
+                                          * struct_init_has_local_derived */
         /* BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
          * descent — without it, `g = idfn(np[0..16])` records the launder but
          * skips keep inference (no propagation to np's root param). */
@@ -3132,6 +3157,28 @@ static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth) {
          * this (see its "§B #11" note); the two OTHER shared frame-bound helpers
          * were not, so the arena half of the question was answered at 2 of 4 sites. */
         if (s && (s->is_local_derived || s->is_arena_derived)) return s;
+        /* BUG-919: a bare identifier naming a LOCAL ARRAY.
+         *
+         * `is_local_derived` marks a POINTER derived from a local; the local array
+         * ITSELF never carries it, so this arm was missing and the peel above had
+         * nothing to hand back. That mattered the moment the peeler learned
+         * @cstr: `@cstr(localbuf, s)` returns a pointer INTO args[0], peeling
+         * gives the bare ident `localbuf`, and every sink then saw a plain
+         * identifier it had no rule for. Measured live at the global-store sinks
+         * — direct, through a struct field, and through a struct literal — with
+         * ASan reporting stack-use-after-return on the read.
+         *
+         * An ARRAY is the only bare identifier that DECAYS into a pointer; a
+         * scalar or struct identifier in a value position is a copy, not a
+         * reference, so restricting the arm to arrays is what keeps `g = localu32`
+         * accepted. The RETURN sink already knew this fact and expressed it as a
+         * bespoke `@cstr` rule of its own (BUG-259) — which is exactly why the
+         * other sinks did not have it. It belongs in the shared query. */
+        if (s && !s->is_static && s->type &&
+            type_dispatch_kind(s->type) == TYPE_ARRAY &&
+            !scope_lookup_local(c->global_scope, v->ident.name,
+                                (uint32_t)v->ident.name_len))
+            return s;
     }
     return NULL;
 }
@@ -6587,15 +6634,13 @@ static Type *check_expr(Checker *c, Node *node) {
          * Fix: for @container specifically, take args[0] (the pointer);
          * everything else continues to use the last-arg unwrap. */
         {
+            Node *aval_raw = node->assign.value;   /* BUG-919: pre-peel, for the launder test below */
             Node *aval = node->assign.value;
-            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0) {
-                const char *iname = aval->intrinsic.name;
-                size_t inlen = aval->intrinsic.name_len;
-                if (inlen == 9 && memcmp(iname, "container", 9) == 0)
-                    aval = aval->intrinsic.args[0];
-                else
-                    aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
-            }
+            /* BUG-919: this open-coded @container but NOT @cstr, so
+             * `gp = @cstr(localbuf, s);` peeled to the string literal and a
+             * pointer into the dead frame reached a global — ASan
+             * stack-use-after-return. The shared peeler knows both. */
+            aval = unwrap_ptr_launder(aval);
             /* AUDIT 2026-06-12: walk &(...) through NODE_FIELD / NODE_INDEX to
              * the root ident so `&local.field` / `&local.field.sub` / `&local[k]`
              * are detected (previously only bare `&local` was caught). The
@@ -6639,6 +6684,36 @@ static Type *check_expr(Checker *c, Node *node) {
             while (opv && (opv->kind == NODE_FIELD || opv->kind == NODE_INDEX)) {
                 opv = (opv->kind == NODE_FIELD) ? opv->field.object
                                                 : opv->index_expr.object;
+            }
+            /* BUG-919: the shape test below requires the value to LOOK like
+             * `&something`. A launder can hand back a frame-bound pointer with no
+             * `&` in sight: @cstr and @container both return a pointer INTO their
+             * args[0], so peeling them yields a BARE IDENTIFIER — typically a local
+             * array. Measured live at this sink: `gp = @cstr(localbuf, s);`
+             * compiled, and reading `gp` after the frame returned was an ASan
+             * stack-use-after-return.
+             *
+             * Gated on `aval != avalu` — a launder actually peeled something — so
+             * this cannot double-report a value the other rules already cover. */
+            if (node->assign.op == TOK_EQ && avalu && aval_raw != avalu &&
+                !(avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP)) {
+                Symbol *lts = NULL; bool ltg = false, ltp = false;
+                classify_escape_sink(c, node->assign.target, &lts, &ltg, &ltp);
+                if (ltg || ltp) {
+                    Symbol *bad = value_frame_bound_symbol(c, aval, 0);
+                    if (bad && lts) {
+                        checker_error(c, node->loc.line,
+                            ltp ?
+                            "cannot store pointer to local '%.*s' through pointer "
+                            "parameter '%.*s' — the launder returns a pointer INTO "
+                            "it, so it dangles when the frame returns" :
+                            "cannot store pointer to local '%.*s' in static/global "
+                            "variable '%.*s' — the launder returns a pointer INTO "
+                            "it, so it dangles when the frame returns",
+                            (int)bad->name_len, bad->name,
+                            (int)lts->name_len, lts->name);
+                    }
+                }
             }
             if (node->assign.op == TOK_EQ && avalu &&
                 avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP &&
@@ -14422,11 +14497,11 @@ static void check_stmt(Checker *c, Node *node) {
                              * (2026-08-01) commented that "@container is not a
                              * launder form and is handled elsewhere" — it is a
                              * launder form, and it was not handled here. */
+                            /* BUG-919: the shared peeler, which knows @container
+                             * AND @cstr (and peels a reference-producing cast).
+                             * This arm knew only @container. */
                             else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
-                                init_root = (init_root->intrinsic.name_len == 9 &&
-                                             memcmp(init_root->intrinsic.name, "container", 9) == 0)
-                                    ? init_root->intrinsic.args[0]
-                                    : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                                init_root = unwrap_ptr_launder(init_root);
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;
@@ -14609,13 +14684,9 @@ static void check_stmt(Checker *c, Node *node) {
                 {
                     Node *prov_root = init;
                     if (init->kind == NODE_ORELSE) prov_root = init->orelse.expr;
-                    while (prov_root) {
-                        if (prov_root->kind == NODE_INTRINSIC && prov_root->intrinsic.arg_count > 0)
-                            prov_root = prov_root->intrinsic.args[prov_root->intrinsic.arg_count - 1];
-                        else if (prov_root->kind == NODE_TYPECAST)
-                            prov_root = prov_root->typecast.expr;
-                        else break;
-                    }
+                    /* BUG-919: this WAS unwrap_ptr_launder, open-coded and missing
+                     * its two special cases. Call it. */
+                    prov_root = unwrap_ptr_launder(prov_root);
                     if (prov_root && prov_root->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             prov_root->ident.name, (uint32_t)prov_root->ident.name_len);

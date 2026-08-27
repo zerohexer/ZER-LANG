@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: the launder returns a pointer INTO it
+// BUG-919: @cstr(dst, src) returns a pointer INTO its FIRST argument. Six escape
+// sinks peeled a launder to its LAST arg, which for @cstr is the SOURCE slice —
+// here a string literal, i.e. STATIC — so the local buffer never looked
+// frame-bound and the pointer reached a global. Measured pre-fix: this compiled,
+// and reading gp after publish() returned was an ASan stack-use-after-return.
+?*u8 gp;
+void publish() {
+    u8[8] buf;
+    const [*]u8 s = "hi";
+    gp = @cstr(buf, s);
+}
+u32 main() {
+    publish();
+    if (gp) |p| { return (u32)(*p); }
+    return 0;
+}

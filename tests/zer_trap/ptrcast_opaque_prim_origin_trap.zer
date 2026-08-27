@@ -1,0 +1,17 @@
+// expect-trap
+// BUG-918: erasing a NON-aggregate pointer to *opaque recorded type_id 0, which
+// means "unknown origin, a C pointer we cannot vouch for" — a LIE, because the
+// compiler knew exactly what it was. Every downstream check then compared against
+// 0 and passed. Measured pre-fix: this RAN and returned, with ASan reporting
+// stack-buffer-overflow on the 16-byte read of a 4-byte object.
+//
+// The cast site cannot catch it: across the function boundary the provenance IS
+// unknown there, which is precisely why the runtime id exists. The fix records
+// the truth at the ERASURE, so the existing check now has something to compare.
+struct Big { u64 a; u64 b; }
+u32 use_as_big(*opaque ctx) { *Big m = @ptrcast(*Big, ctx); return (u32)m.b; }
+u32 main() {
+    u32 raw = 77;
+    *opaque c = @ptrcast(*opaque, &raw);
+    return use_as_big(c);
+}

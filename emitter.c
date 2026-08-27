@@ -82,6 +82,87 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
     } \
 } while(0)
 
+/* BUG-918: the runtime provenance id of a POINTER's pointee — ONE definition.
+ *
+ * `_zer_opaque` carries `{ptr, type_id}` and every `@ptrcast` / `@pun` out of an
+ * `*opaque` guards with `type_id != EXPECTED && type_id != 0`, where 0 means
+ * "unknown origin — a C pointer we cannot vouch for", which is the FFI floor.
+ *
+ * The bug: this computed an id for struct / enum / union ONLY, so erasing ANY
+ * other pointer recorded 0 — a LIE, because the compiler knew exactly what it
+ * was. Every downstream check then compared against 0 and passed. Measured:
+ *
+ *     u32 raw = 77;
+ *     *opaque c = @ptrcast(*opaque, &raw);
+ *     *Big m = @ptrcast(*Big, c);        // 16-byte read of a 4-byte object
+ *
+ * runs, with ASan reporting stack-buffer-overflow. The cast site cannot catch it
+ * — across a function boundary the provenance IS unknown there, which is exactly
+ * why the runtime id exists. The fix has to be at the ERASURE, by recording the
+ * truth.
+ *
+ * Non-aggregate pointees get a RESERVED id, in a range `next_type_id` (which
+ * counts up from 1) cannot reach. The id is derived from the type KIND plus the
+ * bit width for `uN`/`iN`, so `*u32` and `*f32` are distinguished but `*u8[4]`
+ * and `*u8[8]` are not. That is deliberate and it is the SAFE direction: two
+ * types sharing an id can only FAIL to trap, never trap wrongly, so the
+ * approximation costs precision and never soundness.
+ *
+ * `*opaque` stays 0. It is the one pointee whose origin genuinely is unknown,
+ * and collapsing it into "known" would start trapping legitimate C interop.
+ *
+ * Twelve sites had spelled the struct/enum/union chain out by hand, which is why
+ * one omission became twelve. They all call this now. */
+#define ZER_TID_RESERVED_BASE 0x7F000000u
+
+static uint32_t zer_pointee_tid(Type *ptr_type) {
+    if (!ptr_type) return 0;
+    Type *p = type_unwrap_distinct(ptr_type);
+    if (!p || type_dispatch_kind(p) != TYPE_POINTER || !p->pointer.inner) return 0;
+    Type *inner = type_unwrap_distinct(p->pointer.inner);
+    if (!inner) return 0;
+    TypeKind k = type_dispatch_kind(inner);
+    if (k == TYPE_STRUCT) return inner->struct_type.type_id;
+    if (k == TYPE_ENUM)   return inner->enum_type.type_id;
+    if (k == TYPE_UNION)  return inner->union_type.type_id;
+    /* The FFI floor: an untyped hardware/C pointer really is unknown. */
+    if (k == TYPE_OPAQUE) return 0;
+    /* Every other KNOWN pointee: a reserved id, width-qualified for uN/iN. */
+    uint32_t width = 0;
+    if (k == TYPE_UINT || k == TYPE_SINT) width = (uint32_t)inner->intn.bits & 0xFFu;
+    return ZER_TID_RESERVED_BASE + ((uint32_t)k * 256u) + width;
+}
+
+/* The AGGREGATE-ONLY id — a DIFFERENT question, kept as its own function.
+ *
+ * `zer_pointee_tid` answers "what does this pointer really point at?", which is
+ * what an `*opaque` round-trip needs: there the provenance is genuinely dynamic
+ * and the recorded id is the only evidence.
+ *
+ * A DIRECT pointer-to-pointer `@pun` is not that situation — both types are
+ * statically known at the call, and the checker has ALREADY ruled on it: it
+ * rejects a widening pun (BH-18 #4) and a forging one (BUG-916), and DELIBERATELY
+ * accepts the rest, because reinterpreting bits as plain integers forges nothing.
+ * Emitting a runtime trap for those would contradict a decision already made and
+ * would break the byte-view idiom `@pun(*u8, structptr)`.
+ *
+ * So the direct path keeps the historical aggregate-only ids: between two named
+ * aggregates the trap encodes @pun's audit-visible "you claimed wrong" policy;
+ * everywhere else the compile-time rules are the whole answer. Two questions,
+ * two functions — the same discipline the type_carries_* predicates follow. */
+static uint32_t zer_pointee_tid_agg(Type *ptr_type) {
+    if (!ptr_type) return 0;
+    Type *p = type_unwrap_distinct(ptr_type);
+    if (!p || type_dispatch_kind(p) != TYPE_POINTER || !p->pointer.inner) return 0;
+    Type *inner = type_unwrap_distinct(p->pointer.inner);
+    if (!inner) return 0;
+    TypeKind k = type_dispatch_kind(inner);
+    if (k == TYPE_STRUCT) return inner->struct_type.type_id;
+    if (k == TYPE_ENUM)   return inner->enum_type.type_id;
+    if (k == TYPE_UNION)  return inner->union_type.type_id;
+    return 0;
+}
+
 /* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
 static inline bool is_null_sentinel(Type *inner) {
@@ -3306,13 +3387,7 @@ static void emit_expr(Emitter *e, Node *node) {
             type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
             src_eff->kind == TYPE_POINTER) {
             /* casting TO *opaque — wrap with type_id */
-            uint32_t tid = 0;
-            if (src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-            }
+            uint32_t tid = zer_pointee_tid(src_eff);   /* BUG-918 */
             emit(e, "(_zer_opaque){(void*)(");
             emit_expr(e, node->typecast.expr);
             emit(e, "), %u}", (unsigned)tid);
@@ -3322,13 +3397,7 @@ static void emit_expr(Emitter *e, Node *node) {
                      type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
                     src_eff->kind == TYPE_OPAQUE)) {
             /* casting FROM *opaque — unwrap .ptr with type check */
-            uint32_t expected_tid = 0;
-            if (tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-            }
+            uint32_t expected_tid = zer_pointee_tid(tgt_eff);   /* BUG-918 */
             if (expected_tid > 0) {
                 int tmp = e->temp_count++;
                 emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -3480,13 +3549,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 tgt_eff->pointer.inner && type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE) {
                 /* casting TO *opaque — wrap with type_id */
                 /* determine source type's ID */
-                uint32_t tid = 0;
-                if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
+                uint32_t tid = zer_pointee_tid(src_eff);   /* BUG-918 */
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
@@ -3495,13 +3558,7 @@ static void emit_expr(Emitter *e, Node *node) {
                        src_eff->pointer.inner &&
                        type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) {
                 /* casting FROM *opaque — check type_id + unwrap .ptr */
-                uint32_t expected_tid = 0;
-                if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
+                uint32_t expected_tid = zer_pointee_tid(tgt_eff);   /* BUG-918 */
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -3553,26 +3610,21 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
             Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
 
-            /* determine source type_id */
-            uint32_t src_tid = 0;
-            if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
-            } else if (src_eff && src_eff->kind == TYPE_OPAQUE) {
-                /* source already *opaque — its type_id flows through directly */
-                src_tid = 0; /* will be read from the source's actual struct field */
-            }
-
-            /* determine target type_id */
-            uint32_t tgt_tid = 0;
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
-            }
+            /* BUG-918: TWO ids, because @pun has two situations.
+             *
+             * `tgt_tid_dyn` is the honest provenance id, used ONLY on the
+             * already-`*opaque` path, where the source's real origin is dynamic
+             * and the recorded id is the only evidence there is.
+             *
+             * `src_tid` / `tgt_tid` are the historical aggregate-only ids, used
+             * on the DIRECT pointer-to-pointer path, where both types are
+             * statically known and the checker has already ruled (widening
+             * rejected by BH-18 #4, forging by BUG-916, everything else
+             * deliberately allowed). Using the honest id there would emit a trap
+             * contradicting that ruling and would break `@pun(*u8, structptr)`. */
+            uint32_t tgt_tid_dyn = zer_pointee_tid(tgt_eff);
+            uint32_t src_tid = zer_pointee_tid_agg(src_eff);
+            uint32_t tgt_tid = zer_pointee_tid_agg(tgt_eff);
 
             /* If source is already *opaque, reuse its existing type_id and just
              * unwrap with check (single FROM-*opaque step). */
@@ -3582,7 +3634,11 @@ static void emit_expr(Emitter *e, Node *node) {
                  src_eff->kind == TYPE_OPAQUE));
 
             if (src_is_opaque) {
-                /* @pun on already-opaque source — only emit the FROM-*opaque check */
+                /* @pun on already-opaque source — only emit the FROM-*opaque check.
+                 * BUG-918: the DYNAMIC id here — the source's true origin is only
+                 * known at runtime, so a `*opaque` that really holds a `*u32`
+                 * must trap when claimed as any other pointee, aggregate or not. */
+                uint32_t tgt_tid = tgt_tid_dyn;
                 if (tgt_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pn%d = ", tmp);
@@ -8193,13 +8249,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
                 src_eff && src_eff->kind == TYPE_POINTER) {
                 /* To *opaque — wrap with type_id */
-                uint32_t tid = 0;
-                if (src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
+                uint32_t tid = zer_pointee_tid(src_eff);   /* BUG-918 */
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -8210,13 +8260,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                          type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
                         src_eff->kind == TYPE_OPAQUE)) {
                 /* From *opaque — unwrap .ptr with type check */
-                uint32_t expected_tid = 0;
-                if (tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
+                uint32_t expected_tid = zer_pointee_tid(tgt_eff);   /* BUG-918 */
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -8255,21 +8299,21 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
             Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
 
-            uint32_t src_tid = 0;
-            if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
-            }
-
-            uint32_t tgt_tid = 0;
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
-            }
+            /* BUG-918: TWO ids, because @pun has two situations.
+             *
+             * `tgt_tid_dyn` is the honest provenance id, used ONLY on the
+             * already-`*opaque` path, where the source's real origin is dynamic
+             * and the recorded id is the only evidence there is.
+             *
+             * `src_tid` / `tgt_tid` are the historical aggregate-only ids, used
+             * on the DIRECT pointer-to-pointer path, where both types are
+             * statically known and the checker has already ruled (widening
+             * rejected by BH-18 #4, forging by BUG-916, everything else
+             * deliberately allowed). Using the honest id there would emit a trap
+             * contradicting that ruling and would break `@pun(*u8, structptr)`. */
+            uint32_t tgt_tid_dyn = zer_pointee_tid(tgt_eff);
+            uint32_t src_tid = zer_pointee_tid_agg(src_eff);
+            uint32_t tgt_tid = zer_pointee_tid_agg(tgt_eff);
 
             bool src_is_opaque = (src_eff &&
                 ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
@@ -8277,7 +8321,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  src_eff->kind == TYPE_OPAQUE));
 
             if (src_is_opaque) {
-                /* @pun on already-opaque source — FROM-*opaque check only */
+                /* @pun on already-opaque source — FROM-*opaque check only.
+                 * BUG-918: the DYNAMIC id — see the AST sibling. */
+                uint32_t tgt_tid = tgt_tid_dyn;
                 if (tgt_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pn%d = ", tmp);
@@ -12691,13 +12737,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
                 type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
                 src_eff && src_eff->kind == TYPE_POINTER) {
-                uint32_t tid = 0;
-                if (src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
+                uint32_t tid = zer_pointee_tid(src_eff);   /* BUG-918 */
                 emit(e, "(_zer_opaque){(void*)(");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "), %u}", (unsigned)tid);
@@ -12708,13 +12748,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                      ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
                        type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
                       src_eff->kind == TYPE_OPAQUE)) {
-                uint32_t expected_tid = 0;
-                if (tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
+                uint32_t expected_tid = zer_pointee_tid(tgt_eff);   /* BUG-918 */
                 if (expected_tid > 0 && inst->src1_local >= 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);

@@ -1,0 +1,27 @@
+// BUG-918 over-rejection boundary. Giving non-aggregate pointees a real runtime
+// id must not break a CORRECT round-trip: erase, cross a function boundary where
+// the provenance is unknown, and come back as the SAME pointee type.
+//
+// Covers a primitive, a struct (the historical case, must be unchanged), and the
+// distinct-typedef wrapper — the id is computed after unwrapping, so `Meters`
+// and `u32` are the same pointee and round-trip through each other.
+struct Sensor { u32 v; }
+distinct typedef u32 Meters;
+
+u32 read_u32(*opaque c) { *u32 p = @ptrcast(*u32, c); return *p; }
+u32 read_sensor(*opaque c) { *Sensor s = @ptrcast(*Sensor, c); return s.v; }
+
+u32 main() {
+    u32 raw = 7;
+    *opaque c1 = @ptrcast(*opaque, &raw);
+    if (read_u32(c1) != 7) { return 1; }
+
+    Sensor s; s.v = 9;
+    *opaque c2 = @ptrcast(*opaque, &s);
+    if (read_sensor(c2) != 9) { return 2; }
+
+    Meters m = 5;
+    *opaque c3 = @ptrcast(*opaque, &m);
+    if (read_u32(c3) != 5) { return 3; }
+    return 0;
+}

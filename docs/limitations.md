@@ -58,6 +58,29 @@ that a cycle is infinite only if EVERY edge is by value. `docs/reference.md` had
 **A stale doc row costs a future session a hunt for a non-bug** — the same failure mode this
 file records for a stale gate.
 
+## What this session leaves for the next one
+
+Nothing is parked mid-flight. The seven fixes each shipped with their regression test
+proved to flip against a pre-fix build, and `make check` is exit 0 at every commit. Two
+things are deliberately NOT done and are recorded above as their own entries: `@inttoptr`
+to a POINTER-carrying (as opposed to enum-carrying) pointee, which has no measured
+wrong-elision behind it, and making the exhaustive-enum switch defensive, which would
+remove the amplifier but costs a branch on every enum switch and silently swallows a
+forged value instead of trapping.
+
+**The two methods that produced everything here, in order of yield:**
+
+1. **Probe the intrinsic surface for what it ACTUALLY does**, rather than reading for
+   suspicious code. Ask of every advertised runtime check: *for which operand types is the
+   emitted check a compile-time constant, or absent entirely?* That question alone produced
+   BUG-916, 917, 918 and 921.
+2. **Walk the documented tables and RUN each row.** CLAUDE.md's safety table produced
+   BUG-920 and a stale row that would have sent a session hunting a non-bug.
+
+And the discipline that kept them honest: **every negative test was run against a
+pre-fix build before being committed.** Four of the sink-matrix p19 cells flipped; the
+fifth did not, and is labelled a coverage cell rather than counted as proof.
+
 **Method note worth keeping.** Every one of the six was found by PROBING the intrinsic
 surface for "what does this actually do", not by reading for suspicious code. Three of the
 five were sitting next to a comment that already described the hazard — BH-18 #4's own

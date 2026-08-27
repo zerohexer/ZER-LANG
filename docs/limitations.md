@@ -268,6 +268,24 @@ zero value and then to NEGATIVE value once someone believes it covers something.
 session seeing `qualifier_closure_probe.sh` in `tools/` must not conclude qualifier
 closure is gated. It is measured, once, by whoever runs it.
 
+**UPDATE 2026-08-27 — `grammar_closure_probe.sh` printed OK on a compiler that HAD a
+breach, and now has a second axis.** BUG-916 forged a pointer from an integer, which is
+exactly what that probe exists to detect, and it reported clean. Its oracle is GCC's
+`-Werror=int-conversion` over an INTEGER placed in each argument POSITION; BUG-916's route
+puts no integer in pointer position at all — a pointer TO the integer is reinterpreted as a
+pointer to a struct whose field is a pointer, and that field is read. Every C-level
+assignment is pointer-to-pointer, so GCC's front end cannot see it.
+
+Axis 2 added: for each pointer-producing conversion intrinsic, a target that CARRIES a
+pointer reinterpreted from a source that does not must be REJECTED, with zerc itself as the
+oracle. Targets span the nesting axis (top-level pointer, offset pointer, nested struct,
+slice, funcptr) so a fix that checks only the top level fails four of five rows. **Verified
+non-vacuous: 15 breaches against a pre-BUG-916 build, 0 after.**
+
+The general lesson, worth more than the fix: **a probe measures its ORACLE's reach, not its
+headline.** Before believing what a gate prints, ask what its oracle is structurally unable
+to see. This one had asserted ZER's single most load-bearing claim for as long as it existed.
+
 `tools/qualifier_closure_baseline.txt` is the useful half: 25 justified strips, each
 established by READING the emitted C (the pointer's value goes to an `"r"` asm operand
 with a `"memory"` clobber, never a dereference), with the discriminating question written

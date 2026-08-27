@@ -457,6 +457,15 @@ line, plus TEN axis-crossed matrices:
 
 Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto.
 
+**A PROBE MEASURES ITS ORACLE'S REACH, NOT ITS HEADLINE (2026-08-27).** `grammar_closure_probe.sh`
+asserts ZER's most load-bearing claim — "no integer becomes a pointer except through `@inttoptr`" —
+and printed OK on a compiler that HAD a breach (BUG-916). Its oracle is GCC's
+`-Werror=int-conversion` over an integer placed in each argument POSITION, and BUG-916 puts no
+integer in pointer position at all: it reinterprets a pointer-to-integer as a pointer-to-struct
+whose field is a pointer. Every C-level assignment is pointer-to-pointer, so GCC's front end is
+structurally blind to it. The probe now has a second axis with zerc itself as the oracle (verified
+15 breaches pre-fix, 0 after). **Before believing a gate, ask what its oracle CANNOT see.**
+
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
 loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
 `MAKE_CHECK_EXIT=2` was reported green). And these are the gates; `tools/ubsan_sweep.sh`,

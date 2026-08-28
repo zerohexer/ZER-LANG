@@ -5,6 +5,127 @@
 
 ---
 
+## LEXICAL
+
+### Comments
+
+**DESCRIPTION**
+`//` runs to end of line. `/* ... */` spans lines and does **not** nest — the
+first `*/` closes it, so a `/*` inside a block comment is ordinary text and the
+comment ends early.
+
+**SYNTAX**
+```zer
+// line comment
+/* block
+   comment */
+u32 counter;
+```
+
+**SEE ALSO**
+comptime if
+
+---
+
+### Integer literals
+
+**DESCRIPTION**
+Decimal, hexadecimal (`0x`), and binary (`0b`). `_` may separate digits anywhere
+after the first and is ignored. **There is no octal** — a leading `0` is not
+special, so `0755` is decimal 755, not 493.
+
+**SYNTAX**
+```zer
+u32 dec  = 1000;
+u32 grp  = 1_000_000;
+u32 hex  = 0xDEAD_BEEF;
+u32 bin  = 0b1010_0101;
+u32 addr = 0x4002_0014;
+```
+
+**NOTES**
+- `0x` and `0b` must be followed by at least one digit — `0x;` is a lex error.
+- A literal too large for its destination type is a compile error, not a wrap.
+
+**SEE ALSO**
+u8..u64, i8..i64, @truncate
+
+---
+
+### Character literals
+
+**DESCRIPTION**
+`'c'` is a `u8`. The escape set is closed — exactly `\n \t \r \\ \' \" \0` and
+`\xNN` (two hex digits required). Anything else is a lex error. An empty `''` is
+an error.
+
+**SYNTAX**
+```zer
+u8 a    = 'A';
+u8 nl   = '\n';
+u8 tab  = '\t';
+u8 nul  = '\0';
+u8 byte = '\x41';
+```
+
+**SEE ALSO**
+u8, string literals
+
+---
+
+### String literals
+
+**DESCRIPTION**
+A string literal has type `[*]u8` — a slice with `.ptr` and `.len`, not a
+NUL-terminated `char*`. `.len` excludes any terminator.
+
+The escape set is closed and is **narrower than C's**: exactly
+`\n \t \r \\ \" \0` and `\xNN`. `\a`, `\v`, `\f`, `\b`, `\e`, `\u`, and `\'` are
+**lex errors**, not silently-accepted characters.
+
+**SYNTAX**
+```zer
+const [*]u8 msg = "Hello\n";
+u32 n = (u32)msg.len;        // 6 — the escape is one byte
+```
+
+A string literal lives in read-only memory, so it binds only to a `const`
+slice — `[*]u8 s = "x";` is rejected ("string literal is read-only").
+
+**SEE ALSO**
+[*]T, @cstr
+
+---
+
+### Identifiers
+
+**DESCRIPTION**
+Letters, digits and `_`, not starting with a digit. The prefix `_zer_` is
+RESERVED for compiler-generated names and is rejected in user source.
+
+**SYNTAX**
+<!-- audit: skip -->
+```zer
+u32 _zer_count;    // COMPILE ERROR — reserved prefix
+```
+
+**SEE ALSO**
+declarations
+
+---
+
+### `as`
+
+**DESCRIPTION**
+`as` is not a cast operator. Its only use in the grammar is naming the emitted
+symbol of an `interrupt` handler. ZER's conversion spellings are `(T)x`,
+`@truncate`, `@saturate`, `@bitcast` and `@cast`.
+
+**SEE ALSO**
+interrupt, C-style casts
+
+---
+
 ## PRIMITIVE TYPES
 
 ### u8, u16, u32, u64
@@ -1667,6 +1788,15 @@ Task.free_ptr(t);
 - `T.alloc_ptr()` → `?*T` — explicit pointer form (same as `T.alloc()` with `*T` target)
 - `T.free_ptr(p)` → `void` — explicit pointer form (same as `T.free(p)` when p is `*T`)
 
+**RESERVED METHOD NAMES**
+These four names are intercepted on ANY struct type, so a struct that declares a
+function-pointer field called `alloc`, `free`, `alloc_ptr` or `free_ptr` cannot
+be CALLED through that field — `s.alloc(x)` is read as the auto-slab method and
+reports *"Ops.alloc() takes no arguments"*. Reading and assigning the field still
+work; only the call is taken. Rename the field, or call through a local
+(`*(u32) -> u32 f = s.alloc; f(x);`). Every other field name, `join` included, is
+yours.
+
 **EXAMPLE**
 ```zer
 struct Task { u32 id; u32 priority; }
@@ -2925,8 +3055,27 @@ f32 ratio = (f32)big;          // int → float value convert
 **NOTES**
 - Widening: always safe, no data loss.
 - Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
+- float -> int SATURATES to the destination range and NaN becomes 0 (defined; see
+  the float section). It is not C's undefined conversion.
+- `bool` <-> integer IS allowed through this cast (`(u32)flag`, `(bool)n`) — it is
+  the only conversion between them; there is still no implicit coercion.
 - `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
-- `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+
+**WHAT THIS CAST CANNOT DO** — each of these is a hard compile error naming the
+intrinsic to use instead. `(Type)expr` is NOT general sugar for the pointer
+intrinsics:
+
+| spelling | verdict | use |
+|---|---|---|
+| `(*u32)addr` — integer to pointer | ERROR | `@inttoptr(*u32, addr)` (mmio-checked) |
+| `(u32)ptr` — pointer to integer | ERROR | `@ptrtoint(ptr)` |
+| `(*B)a_ptr` — one pointee to another | ERROR | `@pun(*B, a_ptr)` (runtime type_id check) |
+| `(*u32)volatile_ptr` — strip `volatile` | ERROR | keep the qualifier |
+| `(*u32)const_ptr` — strip `const` | ERROR | keep the qualifier |
+
+What it DOES do for pointers is the `*T` <-> `*opaque` round trip, which is
+provenance-checked: `(*opaque)sensor` records the origin type and `(*Motor)ctx`
+verifies it. An identity cast `(*T)p` where `p` is already `*T` is elided.
 
 ---
 
@@ -3102,6 +3251,25 @@ u32 main() {
 `@bitcast(State, 7)` compiles and traps at run time with
 `@bitcast produced a value that is not a declared variant of this enum`.
 
+### ...and the switch itself is total
+
+The three conversion doors above are the ones ZER can see. A non-variant can also
+arrive without any conversion at all, through a boundary the language does not own:
+
+- a `cinclude` / extern C function whose return type is the enum
+  (`Status st = HAL_Transmit(...);`),
+- an MMIO read — `volatile *Status r = @inttoptr(*Status, ADDR); Status s = *r;`,
+- a `@pun`'d pointer that is then dereferenced.
+
+None of those is a conversion, so no forge guard sees them. So the SWITCH carries
+its own check: an exhaustive enum switch that reaches a value matching no declared
+variant traps with `switch on a value that is not a declared variant of this enum`,
+instead of running its last arm. The union form traps with `switch on a union whose
+tag is not a declared variant` instead of silently running no arm at all.
+
+This costs one comparison per exhaustive switch and is the use-site half of the
+guarantee: a foreign value is caught where it is USED, not assumed away.
+
 ### Argument counts are checked
 
 An intrinsic that takes nothing used to accept anything and silently discard it, which
@@ -3226,21 +3394,120 @@ asm("mov %0, %1" : "=r"(out) : "r"(in));
 grep -rnE "\basm\s*[(]" src/
 ```
 
+**SEE ALSO**
+structured asm, naked functions, cinclude
+
+---
+
+### structured asm — `asm { ... }`
+
+**DESCRIPTION**
+The second, preferred spelling of inline assembly. Instead of GCC's constraint
+mini-language it binds operands to NAMED REGISTERS and carries a mandatory
+`safety:` rationale, so every asm block in a tree is greppable and reviewable.
+The operand bindings are what let UAF / bounds / move / provenance / qualifier /
+MMIO tracking stay live across the asm boundary.
+
+Like `asm("...")` it is allowed only inside a `naked` function, which means it
+has no locals to bind — bind globals.
+
+**SYNTAX**
+```zer
+u64 g_result = 0;
+u64 g_input = 7;
+
+naked void load_constant() {
+    asm {
+        instructions: "movq $42, %0"
+        outputs: { "rax" = g_result }
+        safety: "Test asm output binding by loading immediate 42 into rax register"
+    }
+}
+
+naked void double_input() {
+    asm {
+        instructions: "leaq (%1, %1), %0"
+        outputs: { "rax" = g_doubled }
+        inputs:  { "rcx" = g_input }
+        clobbers: ["memory"]
+        safety: "Double g_input via leaq — used as a portable shift-by-1 idiom"
+    }
+}
+
+u64 g_doubled = 0;
+
+i32 main() { return 0; }
+```
+
+**KEYS**
+
+| key | required | form |
+|---|---|---|
+| `instructions:` | YES | one string, `\n`-separated for multiple instructions |
+| `safety:` | YES | one string, **at least 30 characters** |
+| `inputs:` | no | `{ "reg" = expr, ... }` — expr evaluated, placed in `reg` |
+| `outputs:` | no | `{ "reg" = lvalue, ... }` — `reg` written back to `lvalue` |
+| `clobbers:` | no | `[ "reg", "memory", "cc" ]` |
+
+Operands are referenced positionally in `instructions:` as `%0`, `%1`, ... —
+outputs first, then inputs, in declaration order.
+
+**RULES** (each is a compile error)
+- `instructions:` missing or empty; `safety:` missing or under 30 characters.
+- More than **16** instructions in one block.
+- A LABEL inside the asm text.
+- An operand that is not integer- or pointer-typed.
+- An output that is not a writable lvalue, or is `const`.
+- The same register bound twice.
+- A `%N` reference with no matching operand.
+- An empty clobber entry, or a register name the target architecture does not
+  have (validated per `--target-arch`).
+- An instruction whose CPU feature is not enabled by `--target-features`.
+- `asm` inside a `defer` body, or inside an `async` function.
+- An asm INPUT binding a pointer parameter that is not `keep`.
+
+Load-linked / store-conditional pairs (`lr.w`/`sc.w`, `ldxr`/`stxr`,
+`monitor`/`mwait`) are tracked as a state machine — an unpaired half is
+reported.
+
+**SEE ALSO**
+asm, naked functions, --target-arch, --target-features
+
 ---
 
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+`naked` is what grants a function PERMISSION TO CONTAIN `asm`. That is the
+whole of what it does today, and the compiler says so: every `naked` function
+produces a warning that the `__attribute__((naked))` is **not emitted**, so GCC
+still generates a prologue and epilogue.
+
+You therefore do NOT get your own frame layout, your own `ret`/`iret`/`eret`, or
+untouched callee-saved registers. **For true naked semantics — a reset handler,
+a vector-table entry, a context-switch primitive — write the function in C and
+bring it in with `cinclude`.** Why it is not simply restored: GCC permits only
+BASIC asm inside a naked function, while ZER's structured `asm { inputs: ... }`
+lowers to EXTENDED asm, and the operand tracking that keeps UAF / VRP /
+provenance live across the asm boundary is built on those operands.
 
 **SYNTAX**
 ```zer
-naked void reset_handler() {
-    asm("ldr sp, =_stack_top");
-    asm("b main");
+naked void spin_hint() {
+    asm("nop");
 }
+
+i32 main() { return 0; }
 ```
+
+**RULES**
+- A `naked` body may contain ONLY `asm` statements and `return` — anything else
+  is a compile error ("non-asm code uses stack that was never allocated").
+- `asm` is allowed ONLY inside a `naked` function.
+- Local variables are therefore unavailable; bind asm operands to globals.
+
+**SEE ALSO**
+asm, structured asm, cinclude, interrupt
 
 ---
 
@@ -3806,9 +4073,12 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- `x as T` — `as` is not a cast (see LEXICAL); use `(T)x`
+- pointer arithmetic `p + n` — index (`p[n]`) or go through `@ptrtoint` / `@inttoptr`
+
+`goto` and `(T)x` ARE in ZER — see the `goto` and C-style-cast sections. Both
+used to be listed here; the entries were wrong.
 
 ---
 
@@ -4011,7 +4281,34 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --emit-ir                # print the IR and exit (debugging)
+zerc source.zer --stack-limit 4096       # error when a stack budget is exceeded
+zerc source.zer --track-cptrs            # track C-interop pointers
+zerc source.zer --trace                  # compiler tracing
+zerc source.zer --trace-calls            # compiler call tracing
+zerc source.zer --release                # accepted, currently a NO-OP
+zerc --help                              # usage
 ```
+
+### Argument rules
+
+- **The source file must be the FIRST argument.** `zerc --run foo.zer` fails with
+  *"unknown option 'foo.zer'"*; write `zerc foo.zer --run`.
+- An **unknown flag is a hard error**, not silently ignored.
+- `--stack-limit` requires a positive integer; anything else is a hard error.
+- `-o` decides the mode by EXTENSION: a `.c` path emits C and keeps it; any other
+  path builds an executable and deletes the intermediate `.c`. Note that for a
+  non-`.c` `-o` path the executable is written NEXT TO THE SOURCE, not at the
+  `-o` path.
+
+### --target-features
+
+Accepted values (comma-separated): `avx512f, sse, sse2, avx, avx2, aes, sha,
+bmi1` (alias `bmi`), `bmi2, lzcnt, popcnt, invpcid, pku, xsave, smap`.
+
+The x86_64 baseline is `sse,sse2` even with no flag. `--target-arch=aarch64` and
+`--target-arch=riscv64` CLEAR the feature set to empty. The set gates which
+instructions a structured `asm` block may use.
 
 ### Pipeline
 
@@ -4306,7 +4603,9 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator
-- No C-style casts
+- C-style casts EXIST but are restricted — `(T)x` converts between numeric types
+  and does `*T` <-> `*opaque`; it CANNOT cross the integer/pointer line, strip
+  `const`/`volatile`, or retype one pointee to another (see C-STYLE CASTS)
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

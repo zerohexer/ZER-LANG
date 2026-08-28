@@ -1,0 +1,25 @@
+// BUG-921 over-rejection boundary: @cast must still be usable — a laundered
+// value that IS freed exactly once, and a scalar @cast that carries no
+// allocation at all, both compile and run.
+i32 printf(const *u8 fmt, ...);
+distinct typedef [*]u8 Buf;
+distinct typedef u32 Meters;
+
+u32 res;
+
+void f() {
+    [*]u8 b = alloc(u8, 4) orelse return;
+    b[0] = 7;
+    Buf c = @cast(Buf, b);
+    u32 v = (u32)c[0];
+    free(c);                       // freed once, through the laundered name
+    Meters m = @cast(Meters, v);   // scalar @cast — no allocation involved
+    printf("v=%u m=%u\n", v, (u32)m);
+    res = v;
+}
+
+u32 main() {
+    f();
+    if (res != 7) { return 2; }
+    return 0;
+}

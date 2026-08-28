@@ -1,0 +1,11 @@
+// expect-error: double free
+// BUG-921, the free side of the same laundering.
+distinct typedef [*]u8 Buf;
+
+void f() {
+    [*]u8 b = alloc(u8, 4) orelse return;
+    Buf c = @cast(Buf, b);
+    free(c);
+    free(b);
+}
+u32 main() { f(); return 0; }

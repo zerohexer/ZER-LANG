@@ -1,0 +1,38 @@
+// BUG-915 + BUG-916 + the over-rejection boundary for BUG-918.
+//
+// BUG-915: the IR emitter rewrote ANY `<ident>.join(...)` to
+// `pthread_join(<ident>, NULL)` — the receiver passed as a pthread_t and every
+// argument DROPPED — because the gate was the field NAME alone. The comment
+// there claimed a type check; `ot` was computed below the branch.
+//
+// BUG-916: calling a function-pointer FIELD through a Handle emitted `h.fn(...)`
+// on a uint64_t. Reading and writing the same field both auto-dereffed; only
+// the CALL site re-implemented field emission by hand.
+i32 printf(const *u8 fmt, ...);
+
+u32 worker(u32 x) { return x + 1; }
+
+struct Ops { *(u32) -> u32 join; *(u32) -> u32 fn; u32 v; }
+Slab(Ops) pool;
+
+u32 main() {
+    // BUG-915: a user field legitimately named `join`
+    Ops s;
+    s.join = worker;
+    if (s.join(41) != 42) { return 1; }
+
+    // BUG-918 boundary: a struct literal over SCALAR fields must not be
+    // disturbed by the new operand walk.
+    Ops lit = { .v = 7 };
+    if (lit.v != 7) { return 2; }
+
+    // BUG-916: funcptr field call through a Handle
+    Handle(Ops) h = pool.alloc() orelse return;
+    h.fn = worker;
+    h.v = 5;
+    if (h.fn(10) != 11) { pool.free(h); return 3; }
+    if (h.v != 5) { pool.free(h); return 4; }
+    pool.free(h);
+    printf("ok\n");
+    return 0;
+}

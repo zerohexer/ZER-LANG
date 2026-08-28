@@ -1,0 +1,16 @@
+// expect-error: use after free
+// BUG-918: IR_STRUCT_INIT_DECOMP was the only value-consuming opcode that never
+// ran the UAF walker over its operands — the designated-initializer spelling of
+// a store the ASSIGNMENT spelling already rejected.
+struct Item { u32 id; }
+struct Holder { *Item t; }
+Slab(Item) pool;
+u32 res;
+
+void f() {
+    *Item t = pool.alloc_ptr() orelse return;
+    pool.free_ptr(t);
+    Holder h = { .t = t };
+    res = h.t.id;
+}
+u32 main() { f(); return 0; }

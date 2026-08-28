@@ -5,6 +5,207 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-28 — BUG-913..921: nine holes from a fresh audit (no branch to harvest)
+
+All nine `vigilant-tesla` branches are consumed, so this session had nothing to cherry-pick.
+Everything below was found by probing the compiler that is on main today. **Seven of the
+nine are accept-unsafe; two of those are SILENT on both hosted and bare metal** — no
+diagnostic, no trap, no crash, just the wrong action.
+
+The recurring shape is the one CLAUDE.md already names: **one semantic question answered at
+N sites, and the Nth site is the one nobody enumerated.** Six of the nine are literally
+that, and in four of them the OTHER spelling of the identical program was already rejected.
+When two spellings of one program disagree, the accepting one is the bug.
+
+### BUG-913 — an exhaustive enum switch ran its LAST arm on a value that is not a variant
+
+`ir_lower.c` elides the last arm's comparison for an enum switch with no `default`, on the
+stated grounds that *"the condition is always true for the remaining variant"*. It is not
+the compiler's to assume. A non-variant reaches a switch through boundaries that are not
+CONVERSIONS, so none of the three forge guards (`@bitcast` BUG-843, `@truncate` BUG-891,
+`@saturate` BUG-910) can see them. All three measured, all three ran the `.c` arm for 99:
+
+| route | shape |
+|---|---|
+| extern / cinclude return | `St v = ext_get(0);` with a C `int ext_get(unsigned)` returning 99 |
+| MMIO read | `volatile *St r = @inttoptr(*St, addr); St v = *r;` |
+| `@pun` + deref | `*St q = @pun(*St, p); St v = *q;` — `p` is `*u32`, so type_id is 0 and the pun's own trap correctly does not fire |
+
+The elision must STAY: it exists so `bb_exit` gains no spurious predecessor carrying
+pre-switch state, which is what caused MAYBE_FREED false positives on
+`rt_borrowck_switch_all_free`. So the guard is emitted INSIDE the dispatch block ahead of
+the unconditional goto — no new block, no new edge, CFG byte-identical. Cost is one
+comparison per exhaustive switch. Sparse enums (`lo = 5, mid = 9, hi = 100`) and
+multi-value last arms both verified.
+
+Test: `tests/zer_trap/enum_switch_foreign_value.zer` (`// expect-trap`),
+`tests/zer/enum_union_switch_totality_ok.zer`.
+
+### BUG-914 — the UNION sibling: a forged tag matched no arm and the switch did nothing
+
+Same promise (a union switch with no `default` is checked exhaustive), same class of
+foreign value, quieter failure: no arm ran and control fell straight through. Measured with
+a union read through `@inttoptr` — the statement after the switch executed with the union
+untouched.
+
+Different placement, and the reason matters: the union chain KEEPS its last comparison
+(only the enum chain elides one), so there is nothing to attach to at the tail. The check
+goes in front of the whole chain in its own block reached by an unconditional goto — one
+block, one edge, exactly one predecessor, so no join is created and the fixpoint sees the
+shape it saw before. Indices are contiguous, so one unsigned range test covers every
+non-variant tag.
+
+Test: `tests/zer_trap/union_switch_foreign_tag.zer`.
+
+### BUG-915 — `<anything>.join(...)` was rewritten to `pthread_join`, arguments dropped
+
+The IR emitter's ThreadHandle branch claimed *"field name `join` + object type is thread
+handle"* — and computed `ot` BELOW the branch, so the only gate was the NAME.
+`struct Ops { *(u32) -> u32 join; }` with `s.join(41)` emitted `pthread_join(s, NULL)`:
+receiver passed as a `pthread_t`, argument silently discarded. The AST path had always
+gated on the receiver being a registered scoped-spawn handle, so the two dispatch paths
+disagreed — the dual-dispatch class again. A ThreadHandle is a plain `u64` symbol, and
+nothing else that can own a `.join` FIELD is an integer, so the gate is the receiver's type
+kind (no lookup into a scope already popped by emission time).
+
+### BUG-916 — a function-pointer FIELD called through a Handle emitted `h.fn(...)`
+
+Handle auto-deref is implemented once, in `emit_rewritten_node`'s `NODE_FIELD` case. The
+decomposed-call site re-implements field emission by hand and its copy knew only `.` and
+`->`, so READING and WRITING `h.fn` both auto-dereffed while CALLING it emitted `h.fn(...)`
+on a `uint64_t`. GCC rejected the generated C pointing at the ZER line. Fixed by delegating
+that callee to the shared path rather than teaching a second copy about handles.
+
+Test (both, plus the BUG-918 scalar boundary): `tests/zer/struct_field_method_names_ok.zer`.
+
+### BUG-917 — `alloc_id == 0` was both a valid id and the "untracked" sentinel
+
+`ir_propagate_alias_state` and `ir_mark_freed_all_paths` both `return` immediately on
+`alloc_id == 0`, and fourteen further sites gate on `alloc_id != 0`. Eight sites minted an
+id straight from a LOCAL ID, and local ids start at 0. So whichever handle landed on local
+0 silently stopped propagating frees to its alias group.
+
+The same program, twice, differing only in a padding parameter:
+
+```
+void f(Holder hd)          { Handle(Item) k = hd.h; pool.free(k); pool.free(hd.h); }  // ACCEPTED
+void f(u32 pad, Holder hd) { Handle(Item) k = hd.h; pool.free(k); pool.free(hd.h); }  // rejected
+```
+
+Parameters are added as locals first, so a struct param in slot 0 hit it. A double free
+accepted or rejected by nothing but parameter position.
+
+Fixed by making the two id spaces disjoint rather than special-casing local 0: `alloc_id`
+is only ever compared for EQUALITY between handles — verified, it is never used to index
+`func->locals` — so a uniform `+1` through one function (`ir_alloc_id_of_local`) keeps every
+grouping identical and vacates 0 for the sentinel.
+
+Test: `tests/zer_fail/param_local0_double_free.zer`.
+
+### BUG-918 — the struct-literal sink neither checked its operands nor consumed a move
+
+`IR_STRUCT_INIT_DECOMP` was the only value-consuming opcode that never ran the UAF /
+wrong-pool walkers over `inst->expr`. Every sibling does. Its alias loop `continue`s on any
+state that is not ALIVE, so a FREED value fell out of the loop with no diagnostic:
+
+```
+*Item t = pool.alloc_ptr() orelse return;
+pool.free_ptr(t);
+Holder h = { .t = t };      // accepted
+res = h.t.id;               // use-after-free, silent
+```
+
+The assignment spelling `h.t = t;` of the same three lines was already rejected. The
+walkers already descend `NODE_STRUCT_INIT`, so the fix is to CALL them.
+
+The move half is the same sink: a move struct handed to a designated initializer is
+consumed exactly as `h.t = a;` consumes it, but this case never reached
+`ir_mark_transferred` (whose own comment says all thirteen consume sinks must funnel
+there). `Holder h = { .t = a }; return a.k;` compiled and returned 1.
+
+Tests: `tests/zer_fail/struct_init_field_uaf.zer`, `tests/zer_fail/struct_init_field_move.zer`.
+
+### BUG-919 — the MULTI-VIEW call result was registered at one sink, and joins erased it
+
+Two independent halves of the BUG-849 view machinery.
+
+**The sink.** `returns_all_views` (every return of the callee is a view, naming more than
+one param, so no single alias is correct) was consumed only on the `IR_CALL` path, which is
+the VAR-DECL spelling. The ASSIGNMENT spelling lowers to `IR_ASSIGN` into a temp and never
+reached it, so no view set was recorded at all:
+
+```
+[*]u8 h = pick(x, y, f);          free(y); h[0];   // rejected
+[*]u8 h = x; h = pick(x, y, f);   free(y); h[0];   // ACCEPTED
+```
+
+The single-view sibling (`returns_param_color > 0`) was already wired at BOTH sinks, which
+is exactly why only the multi-view arm drifted. Now one function — `ir_fill_multiview_set`
+— serves both.
+
+**The merge.** `ir_merge_states` merged four fields of `IRHandleInfo` in its
+both-predecessors loop and full-struct-copied in its only-in-this-predecessor loop. The
+view set was in neither, so a join with a predecessor that had no views ERASED the sets from
+the others. A view set is a MAY-alias fact: its join is UNION and the overflow flag ORs,
+both saturating toward "more suspected views" — the direction that can only over-report.
+
+Tests: `tests/zer_fail/multiview_assign_uaf.zer`, `tests/zer_fail/multiview_branch_join_uaf.zer`.
+
+### BUG-920 — latent: unbounded `func->locals[h->local_id]` in the leak reporter, and two NULL derefs
+
+Four report sites index `func->locals[h->local_id]` with no bounds check — the guarded
+block just above them closes first. `local_id` is legally `IR_GLOBAL_ROOT_ID` (-2) for a
+global pseudo-root, and the only thing keeping those out is the "global entries always
+carry `escaped = true`" invariant, enforced by convention at two creation sites and stated
+as a *request* in its own comment. Made a CHECK. Also NULL-guarded the two
+`type_unwrap_distinct` entry points in the move-type predicates, which dereference a result
+that is NULL for a distinct typedef with an unresolved underlying (their own recursive
+descendants already guard for it).
+
+### BUG-921 — the launder alias matched `@ptrcast` BY NAME, so `@cast` went untracked
+
+`ir_peel_cast_wrappers` already enumerates the whole pointer-preserving family — `ptrcast`,
+`pun`, `bitcast`, `cast`, `container` — with the right argument position for each. The
+alias registration in `IR_ASSIGN` did not use it; it string-compared `"ptrcast"`. `@cast`
+is the reachable sibling and it is not a corner case: it is the ONLY conversion a distinct
+typedef has, so the idiom that names one is exactly where it bites. Both directions
+measured:
+
+```
+distinct typedef [*]u8 Buf;
+[*]u8 b = alloc(u8, 4) orelse return;
+Buf c = @cast(Buf, b);
+free(b); res = c[0];      // use-after-free, accepted
+free(c); free(b);         // glibc: "double free detected in tcache 2"
+```
+
+The `@ptrcast` spelling of the same program is rejected, and so is the subslice spelling.
+Fixed by calling the one peeler.
+
+Tests: `tests/zer_fail/cast_launder_uaf.zer`, `tests/zer_fail/cast_launder_double_free.zer`,
+`tests/zer/cast_launder_ok.zer`.
+
+### Measurements taken this session (record, so they are not re-run blind)
+
+- **The negative suite is NOT vacuous at the checker.** All **680** `tests/zer_fail/*.zer`
+  were re-run with `-o <tmp>.c`, which isolates the CHECKER's verdict from GCC's: **680
+  rejected by the checker, 0 relying on GCC.** CLAUDE.md's warning that
+  `__attribute__((interrupt))` on hosted x86-64 makes ISR negatives pass for the wrong
+  reason no longer applies to this directory.
+- **`@critical` depth is NOT the zercheck_ir copy.** The `spawn`/`slab.alloc` bans inside
+  `@critical` fire in `checker.c`; `IRPathState.critical_depth` is not merged by
+  `ir_merge_states`, but both probes (direct and across a branch join) are rejected by the
+  checker, so that unmerged field is not reachable as a hole.
+- **A conditional escape is still not a leak.** `if (c) { g = p; }` with no free on the
+  other path stays ACCEPTED — the `escaped` field is not merged either. That is the
+  deliberate BUG-742 policy (flagging it noises the register-then-callback idiom), not a
+  new finding.
+- **`vrp_ir.c` is dead code**: 382 lines, referenced by nothing, absent from the Makefile.
+  Kept deliberately — it is Phase 0 of `docs/unified-oracle-proved-ZER.md`.
+
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

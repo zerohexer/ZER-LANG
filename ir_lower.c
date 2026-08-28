@@ -2854,6 +2854,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          *   captures &sw_ref->variant persist to the original.
          *   For everything else: sw_ref is NODE_IDENT to a value local. */
         Node *sw_ref = NULL;
+        /* BUG-913: LOCAL holding the hoisted switch value for the non-union
+         * path. Needed by the exhaustive-enum totality guard below — see the
+         * `elide_compare` comment. -1 when there is no such local (unions). */
+        int sw_val_local = -1;
         if (is_union) {
             Node *sw_expr = node->switch_stmt.expr;
             /* B2: when the union switch root is a shared struct, do NOT take the
@@ -2919,6 +2923,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *pl = &ctx->func->locals[ptr_local];
+            sw_val_local = ptr_local;   /* BUG-914 union totality guard */
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));
             sw_ref->kind = NODE_IDENT;
@@ -2933,6 +2938,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *vl = &ctx->func->locals[val_local];
+            sw_val_local = val_local;
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));
             sw_ref->kind = NODE_IDENT;
@@ -2968,6 +2974,33 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         bool is_exhaustive_enum = is_enum && !has_default &&
                                   node->switch_stmt.arm_count > 0;
+
+        /* BUG-914: the UNION sibling of BUG-913. A union switch with no default
+         * is checked exhaustive over the declared variants, so every value is
+         * promised an arm. A tag that is not a declared variant index — a union
+         * read from an MMIO register or handed over by a cinclude function —
+         * matches NO arm and the switch silently does nothing, with no
+         * diagnostic and no fault on hosted or bare metal. Measured: a union
+         * read through `@inttoptr(*U, addr)` with tag 77 fell straight through
+         * to the statement after the switch.
+         *
+         * Different shape from the enum case, so a different placement: the
+         * union chain keeps its last comparison (only the ENUM chain elides
+         * one), so there is nothing to attach to at the tail. The check goes in
+         * front of the whole chain instead, in its own block reached by an
+         * unconditional goto. One block, one edge, exactly one predecessor —
+         * no join is created, so the CFG merge and the leak/MAYBE_FREED
+         * fixpoint see the same shape they saw before. */
+        if (is_union && !has_default && node->switch_stmt.arm_count > 0 &&
+            sw_val_local >= 0 && sw_eff && sw_eff->union_type.variant_count > 0) {
+            int bb_guard = ir_add_block(ctx->func, ctx->arena);
+            IRInst ug = make_inst(IR_GOTO, node->loc.line);
+            ug.goto_block = bb_guard;
+            ug.cast_type = sw_eff;
+            ug.src1_local = sw_val_local;
+            emit_inst(ctx, ug);
+            ctx->current_block = bb_guard;
+        }
 
         /* BUG-840: the dispatch chain is built arm-by-arm and the DEFAULT arm's
          * entry is an UNCONDITIONAL goto. Emitting it in the MIDDLE of the chain
@@ -3007,9 +3040,47 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             if (arm->is_default) {
                 ensure_terminated(ctx, bb_arm);
             } else if (elide_compare) {
-                /* Unconditional entry — last arm of exhaustive enum */
+                /* Unconditional entry — last arm of exhaustive enum.
+                 *
+                 * BUG-913: the premise above ("the condition is always true for
+                 * the remaining variant") holds only for a value that IS one of
+                 * the declared variants. It is not the compiler's to assume: an
+                 * enum value can reach here carrying a non-variant bit pattern
+                 * through a boundary the language does not own —
+                 *   - a cinclude/extern C function returning the enum type
+                 *     (`HAL_Status st = HAL_UART_Transmit(...)`),
+                 *   - an MMIO read: `volatile *St r = @inttoptr(*St, ADDR); *r`,
+                 *   - `@pun(*St, p)` followed by a deref.
+                 * The three CONVERSION doors (@bitcast/@truncate/@saturate) each
+                 * trap at the point of forgery (BUG-843/864/891/910), but a LOAD
+                 * is not a conversion and none of them sees it. With the compare
+                 * elided the non-variant then silently executed the LAST arm —
+                 * no diagnostic, no fault, and on bare metal no crash either:
+                 * just the wrong action. Measured: all three routes above ran
+                 * the `.c` arm for a value of 99.
+                 *
+                 * The CFG must stay as it is — the elision exists so bb_exit
+                 * gains no spurious predecessor carrying pre-switch state (that
+                 * caused MAYBE_FREED false positives on `rt_borrowck_switch_all_free`).
+                 * So the guard is emitted INSIDE the dispatch block, ahead of
+                 * the unconditional goto, exactly like every other `_zer_trap`
+                 * wrapper: no new edge, no new block, CFG identical.
+                 *
+                 * `cast_type` carries the enum Type and `src1_local` the local
+                 * holding the hoisted switch value; emitter.c IR_GOTO renders
+                 * `if (!(v == V0 || ...)) _zer_trap(...)`. Reaching this point
+                 * means every earlier arm's comparison already failed, and the
+                 * checker enforced exhaustiveness, so "is a declared variant"
+                 * and "is one of this arm's variants" are the same predicate
+                 * here — the whole-enum spelling is used because it needs only
+                 * the type. */
                 IRInst go = make_inst(IR_GOTO, node->loc.line);
                 go.goto_block = bb_arm;
+                if (sw_val_local >= 0 && sw_eff &&
+                    sw_eff->enum_type.variant_count > 0) {
+                    go.cast_type = sw_eff;
+                    go.src1_local = sw_val_local;
+                }
                 emit_inst(ctx, go);
             } else {
                 /* Build per-arm comparison: OR of equality checks */

@@ -834,7 +834,12 @@ static const char *ir_state_name(IRHandleState s) {
 
 static bool ir_is_move_struct_type(Type *t) {
     if (!t) return false;
+    /* type_unwrap_distinct returns NULL for a TYPE_DISTINCT with a NULL
+     * underlying (an unresolved / forward distinct typedef). The recursive
+     * descendants below already guard for that; these two entry points did
+     * not. */
     Type *eff = type_unwrap_distinct(t);
+    if (!eff) return false;
     return (eff->kind == TYPE_STRUCT && eff->struct_type.is_move);
 }
 
@@ -852,6 +857,7 @@ static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
     if (!t) return false;
     if (depth > 32) return false;
     Type *eff = type_unwrap_distinct(t);
+    if (!eff) return false;
     if (eff->kind == TYPE_STRUCT) {
         for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
             Type *ft = eff->struct_type.fields[i].type;
@@ -894,6 +900,32 @@ static bool ir_should_track_move(Type *t) {
 static int _ir_next_alloc_id = 1000000;  /* high base so it doesn't
                                             collide with local_id-based
                                             ids set at allocation */
+
+/* BUG-917: alloc_id 0 is the "no allocation identity / untracked" SENTINEL —
+ * `ir_propagate_alias_state` (~2681) and `ir_mark_freed_all_paths` (~697) both
+ * `return` immediately on it, and fourteen further sites gate on
+ * `alloc_id != 0`. Eight sites minted an id straight from a LOCAL ID, and local
+ * ids start at 0, so whichever handle happened to land on local 0 silently
+ * became untracked: its alias group stopped propagating frees.
+ *
+ * Measured — the same program, twice:
+ *
+ *     void f(Holder hd)           { Handle(Item) k = hd.h; free(k); free(hd.h); }
+ *     void f(u32 pad, Holder hd)  { Handle(Item) k = hd.h; free(k); free(hd.h); }
+ *
+ * The second is rejected ("double free: local %1 already freed"); the FIRST
+ * compiles clean, because `hd` is local 0 (params are added first,
+ * ir_lower_func ~3948) so its compound handle got alloc_id 0. A double free
+ * accepted or rejected by nothing but parameter position.
+ *
+ * The fix is to make the id spaces disjoint rather than to special-case local 0:
+ * alloc_id is only ever compared for EQUALITY between handles (verified — it is
+ * never used to index `func->locals`), so a uniform +1 keeps every grouping
+ * identical while vacating 0 for the sentinel. Every site that derives an id
+ * from a local goes through this one function. */
+static int ir_alloc_id_of_local(int local_id) {
+    return local_id + 1;
+}
 
 /* ================================================================
  * Escape detection helpers (Phase B2)
@@ -1204,6 +1236,36 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle alive), so a pred without it cannot contribute an alive
              * path that this would wrongly mask. */
             if (ph->freed_all_paths) rh->freed_all_paths = 1;
+            /* BUG-919: UNION the view sets. `view_alloc_ids` records the
+             * allocations a local may be a VIEW of without owning any of them
+             * (BUG-849); the use-site check reads them from the handle, and
+             * everything else that copies a handle carries them —
+             * ir_snapshot_alias / ir_apply_alias do (~777, ~800) — but this
+             * merge did not. So a join with a predecessor that had no view set
+             * ERASED the sets from every other predecessor:
+             *
+             *     [*]u8 h = x;
+             *     if (c) { h = pick(x, y, fl); }   // {x,y} on this edge only
+             *     free(y);
+             *     res = h[0];                      // accepted after the join
+             *
+             * The same function without the `if` is rejected ("may be a view of
+             * an allocation that is freed"). A view set is a MAY-alias fact, so
+             * its join is UNION and the overflow flag ORs — both saturate toward
+             * "more suspected views", the direction that can only over-report. */
+            if (ph->view_overflow) rh->view_overflow = 1;
+            for (int vi = 0; vi < ph->view_count; vi++) {
+                int cap = (int)(sizeof(rh->view_alloc_ids) /
+                                sizeof(rh->view_alloc_ids[0]));
+                bool dup = false;
+                for (int vk = 0; vk < rh->view_count; vk++)
+                    if (rh->view_alloc_ids[vk] == ph->view_alloc_ids[vi]) {
+                        dup = true; break;
+                    }
+                if (dup) continue;
+                if (rh->view_count >= cap) { rh->view_overflow = 1; break; }
+                rh->view_alloc_ids[rh->view_count++] = ph->view_alloc_ids[vi];
+            }
             /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
              * MAYBE_FREED, keep it. Both same state → keep.
              * Both freed → keep freed. */
@@ -1450,6 +1512,52 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
  *
  * Returns the handle the result should alias, or NULL when the argument carries
  * no tracked allocation (a stack/global/param view — nothing to track). */
+/* BUG-919: fill `dh`'s VIEW SET from a multi-view call result.
+ *
+ * ONE implementation, two sinks. `returns_all_views` says every return of the
+ * callee is a view of an argument but they name MORE THAN ONE parameter, so no
+ * single alias is correct and the candidate set is recorded instead; the use
+ * site pulls the live state of each. That registration existed only on the
+ * IR_CALL path, which is the VAR-DECL spelling — the ASSIGNMENT spelling lowers
+ * to IR_ASSIGN into a temp, never reaches it, and lost the set entirely:
+ *
+ *     [*]u8 h = pick(x, y, f);   free(y);  h[0]   // rejected
+ *     [*]u8 h = x; h = pick(x, y, f); free(y); h[0]   // ACCEPTED — the hole
+ *
+ * The single-view sibling (`returns_param_color > 0`) was already wired at both
+ * sinks, which is exactly why only the multi-view arm drifted. Declared ahead of
+ * ir_view_arg_handle's definition would be circular, so it is defined after it
+ * and both call sites are below.
+ *
+ * Returns true when a set was recorded (possibly empty). */
+static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
+                                        IRPathState *ps, Node *arg);
+
+static bool ir_fill_multiview_set(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                  Node *call, FuncSummary *summary,
+                                  IRHandleInfo *dh, int line) {
+    if (!dh || !call || call->kind != NODE_CALL || !summary) return false;
+    dh->state = IR_HS_ALIVE;
+    dh->alloc_line = line;
+    dh->escaped = true;   /* views, never owns → not a leak */
+    dh->view_count = 0;
+    dh->view_overflow = false;
+    const int vcap = (int)(sizeof(dh->view_alloc_ids) /
+                           sizeof(dh->view_alloc_ids[0]));
+    for (int pi = 0; pi < 32 && pi < call->call.arg_count; pi++) {
+        if (!(summary->returns_param_mask & ((uint32_t)1u << pi))) continue;
+        IRHandleInfo *ah = ir_view_arg_handle(zc, func, ps, call->call.args[pi]);
+        if (!ah || ah->alloc_id == 0) continue;
+        bool dup = false;
+        for (int k = 0; k < dh->view_count; k++)
+            if (dh->view_alloc_ids[k] == ah->alloc_id) dup = true;
+        if (dup) continue;
+        if (dh->view_count >= vcap) { dh->view_overflow = true; continue; }
+        dh->view_alloc_ids[dh->view_count++] = ah->alloc_id;
+    }
+    return true;
+}
+
 static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
                                         IRPathState *ps, Node *arg) {
     if (!arg) return NULL;
@@ -2980,7 +3088,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
                 h->state = IR_HS_ALIVE;
                 h->alloc_line = inst->source_line;
-                h->alloc_id = inst->dest_local; /* simple: local_id = alloc_id */
+                h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                 h->source_color = ZC_COLOR_POOL;
             }
         }
@@ -3463,7 +3571,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (h) {
                 h->state = IR_HS_ALIVE;
                 h->alloc_line = inst->source_line;
-                h->alloc_id = inst->dest_local;
+                h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                 h->source_color = ZC_COLOR_ARENA;
             }
         }
@@ -4022,6 +4130,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             }
                         }
                     }
+                } else if (cs && cs->returns_all_views &&
+                           cs->returns_param_color <= 0 &&
+                           cs->returns_param_mask != 0) {
+                    /* BUG-919: the MULTI-VIEW sibling of the arm above. It was
+                     * wired only at the IR_CALL (var-decl) sink, so the
+                     * ASSIGNMENT spelling `h = pick(x, y, f);` recorded no view
+                     * set and `free(y); h[0]` compiled clean, while the var-decl
+                     * spelling of the same three lines was rejected. Same one
+                     * query as the var-decl sink — ir_fill_multiview_set. */
+                    int md_root; const char *md_path; uint32_t md_plen;
+                    if (ir_extract_compound_key(zc, func,
+                            inst->expr->assign.target,
+                            &md_root, &md_path, &md_plen) == 0) {
+                        IRHandleInfo *mdst = (md_plen == 0)
+                            ? ir_add_handle(ps, md_root)
+                            : ir_add_compound_handle(ps, md_root, md_path, md_plen);
+                        ir_fill_multiview_set(zc, func, ps, rv, cs, mdst,
+                                              inst->source_line);
+                    }
                 }
             }
             if (rv && rv->kind == NODE_IDENT) {
@@ -4369,11 +4496,30 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * state if free_ptr is later called on an alias). Needed to
              * propagate cross-function `destroy_cat(opaque)` patterns where
              * the opaque param is ptrcast then freed. */
+            /* BUG-921: this arm matched `ptrcast` BY NAME, so the four sibling
+             * launders that preserve the allocation just as exactly —
+             * `@cast`, `@pun`, `@bitcast`, `@container` — registered no alias
+             * and the value came out untracked. `@cast` is the reachable one
+             * and it is not a corner case: it is the ONLY conversion for a
+             * distinct typedef, so the idiom that names one is exactly where it
+             * bites. Measured, both directions of the class:
+             *
+             *   distinct typedef [*]u8 Buf;
+             *   [*]u8 b = alloc(u8,4) orelse return;
+             *   Buf c = @cast(Buf, b);
+             *   free(b);  res = c[0];     // use-after-free, accepted
+             *   free(c);  free(b);        // glibc "double free detected in tcache 2"
+             *
+             * The `@ptrcast` spelling of the same program is rejected, and so is
+             * the subslice spelling. `ir_peel_cast_wrappers` (~1067) ALREADY
+             * enumerates this exact family with the right argument position for
+             * each — one peeler, per CLAUDE.md's launder rule — so use it rather
+             * than adding four more name comparisons here. A peel that lands on
+             * a non-pointer ident simply finds no handle and does nothing. */
             if (rhs && rhs->kind == NODE_INTRINSIC &&
-                rhs->intrinsic.name && rhs->intrinsic.name_len == 7 &&
-                memcmp(rhs->intrinsic.name, "ptrcast", 7) == 0 &&
-                rhs->intrinsic.arg_count >= 1) {
-                Node *src = rhs->intrinsic.args[0];
+                rhs->intrinsic.name && rhs->intrinsic.arg_count >= 1 &&
+                ir_peel_cast_wrappers(rhs) != rhs) {
+                Node *src = ir_peel_cast_wrappers(rhs);
                 if (src && src->kind == NODE_IDENT) {
                     int src_local = ir_find_local_exact_first(func,
                         src->ident.name, (uint32_t)src->ident.name_len);
@@ -4598,7 +4744,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         h->state = IR_HS_ALIVE;
                         h->alloc_line = inst->source_line;
-                        h->alloc_id = inst->dest_local;
+                        h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                         h->source_color = ZC_COLOR_POOL;
                         /* F3.2: record source-level pool name for
                          * cross-pool misuse detection at GET/FREE sites
@@ -4612,7 +4758,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (h) {
                         h->state = IR_HS_ALIVE;
                         h->alloc_line = inst->source_line;
-                        h->alloc_id = inst->dest_local;
+                        h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                         h->source_color = ZC_COLOR_ARENA;
                     }
                     break;
@@ -5139,7 +5285,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     h->state = IR_HS_ALIVE;
                     h->alloc_line = inst->source_line;
-                    h->alloc_id = inst->dest_local;
+                    h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                     h->source_color = ZC_COLOR_POOL;
                     /* F3.2: record source-level pool name for
                      * cross-pool misuse detection at GET/FREE sites. */
@@ -5153,7 +5299,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (h) {
                     h->state = IR_HS_ALIVE;
                     h->alloc_line = inst->source_line;
-                    h->alloc_id = inst->dest_local;
+                    h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                     h->source_color = ZC_COLOR_ARENA;
                 }
                 break;
@@ -5436,27 +5582,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             inst->dest_local >= 0 && inst->expr &&
             inst->expr->kind == NODE_CALL) {
             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
-            if (dh) {
-                dh->state = IR_HS_ALIVE;
-                dh->alloc_line = inst->source_line;
-                dh->escaped = true;   /* views, never owns → not a leak */
-                dh->view_count = 0;
-                dh->view_overflow = false;
-                const int vcap = (int)(sizeof(dh->view_alloc_ids) /
-                                       sizeof(dh->view_alloc_ids[0]));
-                for (int pi = 0; pi < 32 && pi < inst->expr->call.arg_count; pi++) {
-                    if (!(summary->returns_param_mask & ((uint32_t)1u << pi))) continue;
-                    IRHandleInfo *ah = ir_view_arg_handle(zc, func, ps,
-                                           inst->expr->call.args[pi]);
-                    if (!ah || ah->alloc_id == 0) continue;
-                    bool dup = false;
-                    for (int k = 0; k < dh->view_count; k++)
-                        if (dh->view_alloc_ids[k] == ah->alloc_id) dup = true;
-                    if (dup) continue;
-                    if (dh->view_count >= vcap) { dh->view_overflow = true; continue; }
-                    dh->view_alloc_ids[dh->view_count++] = ah->alloc_id;
-                }
-            }
+            ir_fill_multiview_set(zc, func, ps, inst->expr, summary, dh,
+                                  inst->source_line);
             dest_aliased_from_param = true;
         }
 
@@ -5674,7 +5801,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (dh) {
                 dh->state = IR_HS_ALIVE;
                 dh->alloc_line = inst->source_line;
-                if (dh->alloc_id == 0) dh->alloc_id = inst->dest_local;
+                if (dh->alloc_id == 0) dh->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                 dh->source_color = ZC_COLOR_ARENA;
             }
         }
@@ -6139,12 +6266,54 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * propagates FREED to it and the existing use-site check fires. */
     case IR_STRUCT_INIT_DECOMP: {
         Node *si = inst->expr;
+        /* BUG-918: J3 (above) registered the ALIAS but left this case the only
+         * value-consuming opcode that never CHECKS its operands. Every sibling
+         * — IR_ASSIGN (~4144), IR_CALL, IR_INDEX_READ, IR_UNOP — runs the UAF +
+         * wrong-pool walkers over `inst->expr`; this one went straight to the
+         * alias loop, whose first line `continue`s on any state that is not
+         * ALIVE. So a FREED value simply fell out of the loop with no
+         * diagnostic:
+         *
+         *     *Item t = pool.alloc_ptr() orelse return;
+         *     pool.free_ptr(t);
+         *     Holder h = { .t = t };        // accepted
+         *     res = h.t.id;                 // use-after-free, silent
+         *
+         * The assignment spelling `h.t = t;` of the same three lines IS
+         * rejected. The walkers already descend NODE_STRUCT_INIT (~2115,
+         * ~2239), so the fix is to call them, not to teach them anything. */
+        if (inst->expr) {
+            UafReportSet rs = {0};
+            ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            UafReportSet pool_rs = {0};
+            ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
+                                     inst->source_line, &pool_rs);
+            free(pool_rs.ids);
+            free(rs.ids);
+        }
         if (si && si->kind == NODE_STRUCT_INIT && inst->dest_local >= 0 &&
             inst->call_arg_locals &&
             inst->call_arg_local_count == si->struct_init.field_count) {
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 int vloc = inst->call_arg_locals[i];
                 if (vloc < 0) continue;
+                /* BUG-918 (move half): a move struct handed to a designated
+                 * initializer is CONSUMED exactly as `h.t = a;` consumes it,
+                 * but this case never reached the transfer sink, so
+                 *
+                 *     Tok a; a.k = 1;
+                 *     Holder h = { .t = a };
+                 *     return a.k;              // accepted, returned 1
+                 *
+                 * compiled and ran while the assignment spelling was rejected.
+                 * Route through ir_mark_transferred like every other consume
+                 * sink (see its comment: all thirteen must funnel there). */
+                if (vloc < func->local_count &&
+                    ir_should_track_move(func->locals[vloc].type)) {
+                    IRHandleInfo *mh = ir_find_handle(ps, vloc);
+                    if (!mh) mh = ir_add_handle(ps, vloc);
+                    if (mh) ir_mark_transferred(ps, mh, inst->source_line);
+                }
                 IRHandleInfo *vh = ir_find_handle(ps, vloc);
                 if (!vh || vh->state != IR_HS_ALIVE || vh->alloc_id == 0)
                     continue;
@@ -6233,7 +6402,7 @@ static void ir_register_nested_handles(IRPathState *ps, void *arena_ptr,
             if (h) {
                 h->state = IR_HS_ALIVE;
                 h->alloc_line = 0;  /* param — no specific alloc site */
-                h->alloc_id = local_id;
+                h->alloc_id = ir_alloc_id_of_local(local_id);
                 h->source_color = 0;
             }
         } else if (ft->kind == TYPE_STRUCT || ft->kind == TYPE_UNION) {
@@ -7651,6 +7820,17 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
              * ir_should_track_move skip below; this also covers the `*T p = &a`
              * alias whose own type is a pointer, not a move struct). */
             if (h->is_move_local) continue;
+            /* BUG-920 (latent): the four report sites below index
+             * `func->locals[h->local_id]` with NO bounds check — the guarded
+             * block just underneath closes before them. `local_id` is legally
+             * IR_GLOBAL_ROOT_ID (-2) for a global pseudo-root, and the only
+             * thing keeping those out is the "global entries always carry
+             * escaped = true" invariant, which is enforced by CONVENTION at two
+             * creation sites and stated as a request in its own comment, not by
+             * code. A handle with no real local cannot be named in a report
+             * anyway, so make the invariant a CHECK: currently unreachable, and
+             * a `func->locals[-2]` read if it ever stops being. */
+            if (h->local_id < 0 || h->local_id >= func->local_count) continue;
             if (h->local_id >= 0 && h->local_id < func->local_count) {
                 IRLocal *loc = &func->locals[h->local_id];
                 Type *lt = loc->type;

@@ -1,0 +1,18 @@
+// expect-error: may be a view of an allocation that is freed
+// BUG-919 (merge half): ir_merge_states copied `view_alloc_ids`/`view_count`
+// from ONE predecessor and dropped the rest, so a join with a predecessor that
+// had no view set erased the sets from the others. A view set is a MAY-alias
+// fact; its join is UNION.
+[*]u8 pick([*]u8 a, [*]u8 b, bool fl) { if (fl) { return b[0..1]; } return a[0..1]; }
+u32 res;
+
+void g(bool c, bool fl) {
+    [*]u8 x = alloc(u8, 4) orelse return;
+    [*]u8 y = alloc(u8, 4) orelse return;
+    [*]u8 h = x;
+    if (c) { h = pick(x, y, fl); } else { h = x; }
+    free(y);
+    res = (u32)h[0];
+    free(x);
+}
+u32 main() { g(true, true); return 0; }

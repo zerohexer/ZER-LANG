@@ -5,7 +5,35 @@ Entries removed once fixed.
 
 ---
 
-# HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
+# HANDOFF — read this first (updated 2026-08-28)
+
+**2026-08-28 — first session with NO branch to harvest. Nine holes found by probing main
+directly (BUG-913..921); seven accept-unsafe, two SILENT on hosted AND bare metal.** Full
+detail in BUGS-FIXED.md "Session 2026-08-28". What a future session should take from it:
+
+- **The productive question was "which OTHER spelling of this program does the compiler
+  already reject?"** Four of the nine were found that way. When two spellings of one program
+  disagree, the accepting one is the bug — and it is cheap to check.
+- **A value can enter ZER without passing through any CONVERSION.** The enum forge guards
+  cover `@bitcast` / `@truncate` / `@saturate`; they cannot cover an extern C return, an MMIO
+  read, or a `@pun`'d deref, because none of those is a conversion. The answer was a USE-SITE
+  check (the switch is now total), not a fifth door. Ask this of any other "the doors are
+  closed" claim in this tree.
+- **A sentinel value that overlaps a legal value is a soundness hole** (BUG-917:
+  `alloc_id == 0` meant both "untracked" and "local 0"). Worth grepping for the same shape
+  elsewhere.
+
+Closed by that session and NOT open any more: the enum/union switch totality gap, the
+`.join()` name hijack, the Handle funcptr-field call, `alloc_id 0`, the struct-literal
+operand sink, the multi-view assignment sink + its merge, and the `@cast` launder.
+
+Still open and deliberately so, each with its own entry below: the conditional-escape leak
+(BUG-742 policy), `naked` (warned since BUG-852, not emitted), the deref-launder residual,
+and `vrp_ir.c` as dead code awaiting Phase 0.
+
+---
+
+# HANDOFF (2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest
 trackers is closed — 45 + 21 + 20.** Nothing remains to cherry-pick. All three harvests are done: 45 rows (tracker 1), 21 (tracker
@@ -1175,6 +1203,45 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 `-MMD -MP` depfiles, or at minimum a blanket `$(OBJS): $(HEADERS)` rule.
 
 ---
+
+## OPEN — `ir_merge_states` merges 5 of 18 `IRHandleInfo` fields (2026-08-28)
+
+**Measured, not inferred.** `ir_merge_states` (zercheck_ir.c ~1147) has two loops with
+different semantics, and that asymmetry IS the debt:
+
+- **both-predecessors loop** — merges `state` (the lattice), `free_line`, `free_block`,
+  `freed_all_paths`, and, since BUG-919, the view set (`view_alloc_ids` / `view_count` /
+  `view_overflow`, joined by UNION).
+- **only-in-this-predecessor loop** — `*nh = *src`, a full 18-field struct copy.
+
+So every field NOT in the first list keeps whatever the `first_live` predecessor happened to
+carry. Still unmerged: `escaped`, `source_color`, `is_move_local`, `is_thread_handle`,
+`pool_name` / `pool_name_len`, `alloc_id`, `alloc_line`, `freed_defer_id`.
+
+**What was probed and what it means.** Only the view set produced a reachable accept-unsafe
+hole (BUG-919 — the reproducer is in `tests/zer_fail/multiview_branch_join_uaf.zer`). Of the
+rest:
+
+| field | probed | verdict |
+|---|---|---|
+| `escaped` | `if (c) { g = p; }` with no free on the other path | ACCEPTED — but that is the deliberate BUG-742 policy (flagging it noises register-then-callback), not this entry's bug |
+| `critical_depth` (on `IRPathState`, also unmerged) | `spawn` / `slab.alloc` inside `@critical` across a branch join | REJECTED — the live check is in `checker.c`; the zercheck_ir copy is not the enforcing one |
+| `source_color` | not yet probed | would need one path arena-coloured and another pool-coloured for the SAME local; leak-only consequence |
+| `pool_name` | not yet probed | wrong-pool diagnostic quality only |
+| `is_thread_handle` | not yet probed | ThreadHandle-not-joined is reported from the ALIVE state, which IS merged |
+
+**Why this is recorded rather than fixed wholesale.** Each field wants a DIFFERENT join and
+picking the wrong one is a regression in either direction: `escaped` conservative for leaks
+is AND (report unless it escaped on every path), which is exactly the over-rejection BUG-742
+declined; `source_color` conservative is "ARENA only if all preds ARENA"; `is_move_local`
+and `is_thread_handle` are OR. Doing them as one sweep without a probe per field is how a
+merge gets a field's direction backwards silently.
+
+**Fix shape:** one probe per field first (construct a join where the two predecessors
+disagree on that field and the decision it feeds), then the join it justifies. The
+convergence comparison (~6519) compares only `state`, so an unmerged field can also keep
+changing after `changed` goes false — settle the joins before trusting any of them for a
+new decision.
 
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
@@ -4602,9 +4669,21 @@ clearer code intent.
 
 ---
 
-## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+## `naked` attribute dropped on IR path — NO LONGER SILENT (warned since BUG-852)
 
-**Status:** known regression from IR migration; not fixed because fixing
+**Status (corrected 2026-08-28):** the attribute is still not emitted, but the compiler now
+WARNS at every `naked` function saying exactly that (checker.c ~19217), and
+`docs/reference.md`'s `naked` section states it and points at `cinclude`. The word "silently"
+below is stale — it described the state before BUG-852. The deferral itself stands, and the
+reasons in BUG-852's comment are measured rather than assumed: GCC 13 x86-64 DOES support
+the attribute, 16 of the 18 positive `tests/zer/asm_*.zer` CALL their naked function so
+flipping it on SIGILLs every one, and GCC permits only BASIC asm inside a naked function
+while ZER's structured `asm { inputs: ... }` lowers to EXTENDED asm — real naked semantics
+and ZER's asm SAFETY feature are in direct tension. Root cause is that `naked` is OVERLOADED:
+the S1 guard makes it the only way to get permission to write asm, so nearly every use here
+means "let me write asm", not "emit no prologue". Decoupling the two intents is Option E.
+
+**Original entry (kept for the migration checklist):** not fixed because fixing
 breaks every existing `tests/zer/asm_*.zer` test.
 
 **Symptom:** ZER source declaring `naked void f() { asm { ... } }`

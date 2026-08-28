@@ -406,6 +406,31 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Documented examples** ("does the reference still compile?") | every ```zer block in `docs/reference.md` | `tools/audit_reference_examples.sh` + `tools/reference_example_baseline.txt` — IN `make check` (the 8th gate). Twice the docs asserted a feature the parser did not have (funcptr arrays, bit-extract through a pointer) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
+**TWO QUESTIONS THAT FOUND SEVEN HOLES IN ONE SESSION (2026-08-28) — ask both before writing
+any probe.**
+
+1. **"Which OTHER spelling of this program does the compiler already reject?"** Four of nine
+   holes that session were a pair of spellings where one was rejected and the other silently
+   accepted: `h.t = t` vs `Holder h = { .t = t }` (BUG-918), `[*]u8 h = pick(...)` vs
+   `h = pick(...)` (BUG-919), `@ptrcast` vs `@cast` (BUG-921), and the same program with and
+   without a padding parameter (BUG-917). **When two spellings of one program disagree, the
+   ACCEPTING one is the bug** — and finding it costs one edit, not an analysis. This is the
+   cheapest form of the multi-site enumeration above, because the rejecting spelling proves
+   the rule exists and tells you exactly what its diagnostic should say.
+2. **"Can this value arrive WITHOUT passing through the thing I am guarding?"** The enum
+   forge guards cover every CONVERSION into an enum, and the door set really is closed — but
+   an extern/cinclude return, an MMIO read and a `@pun`'d deref are LOADS, not conversions,
+   so no door guard could ever see them (BUG-913/914). A finite door set does not bound an
+   open boundary. When the answer is yes, the fix is a USE-SITE check, not another door.
+
+**A SENTINEL THAT OVERLAPS A LEGAL VALUE IS A SOUNDNESS HOLE.** BUG-917: `alloc_id == 0`
+meant "untracked, do not propagate" at sixteen sites AND was minted from a local id, and
+local ids start at 0. Whichever handle landed on local 0 stopped propagating frees — a
+double free accepted or rejected by parameter position alone. Fix by making the id spaces
+DISJOINT (a uniform `+1` behind one function), never by special-casing the collision. Grep
+for the shape: any `== 0` / `< 0` / `-1` sentinel compared against a value derived from an
+index or a count.
+
 **THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
 CONTENTS.** Cell counts, per-cell history and the current site set live in the gate itself
 (`tests/test_*_matrix.c`, `tools/*.sh` baselines) and in `docs/compiler-internals.md`. Numbers
@@ -1251,7 +1276,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Missing switch case | Exhaustive check for enums and bools |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
-| Enum forging (a value outside the variant set) | Runtime variant guard at the point of forgery — TRACKED, not banned, so reading an enum from a register still works. The doors are EXACTLY THREE and the set is closed: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910). `@cast` is NOT a door — it requires a distinct typedef and cannot name a bare enum. The guard recurses struct fields, optional payloads and array elements, and each door wires it at BOTH emitter dispatch paths. **Adding a new value-producing conversion? It is a fourth door — wire the guard.** |
+| Enum forging (a value outside the variant set) | TWO layers, because the doors are not the whole story. **(a) At the CONVERSION**: a runtime variant guard at the point of forgery — TRACKED, not banned, so reading an enum from a register still works. The conversion doors are EXACTLY THREE: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910); `@cast` is not one (it requires a distinct typedef and cannot name a bare enum). The guard recurses struct fields, optional payloads and array elements, and each door wires it at BOTH emitter dispatch paths. **Adding a new value-producing conversion? It is a fourth door — wire the guard.** **(b) At the USE (BUG-913/914)**: a foreign value can arrive with NO conversion at all — an extern/cinclude return typed as the enum, an MMIO read, a `@pun`'d deref — so no door guard can ever see it. The exhaustive `switch` therefore carries its own totality check and TRAPS on a non-variant instead of running its last arm; the union form traps on a tag that is not a declared variant index instead of running no arm. Do not "close the doors" and delete the use-site check: the door set is finite, the boundaries are not. |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
 | Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + **MMIO index bounds from range** (compile-time) + startup @probe validation (boot-time) + `--no-strict-mmio` relaxes RANGE checks only (runtime alignment trap always emitted for variable addresses, BUG-736) |

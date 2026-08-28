@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-921: the alias registration for a laundered pointer matched `@ptrcast`
+// BY NAME, so `@cast` — the ONLY conversion a distinct typedef has — produced
+// an untracked value. Pre-fix this compiled AND `free(c); free(b);` aborted in
+// glibc with "double free detected in tcache 2".
+distinct typedef [*]u8 Buf;
+u32 res;
+
+void f() {
+    [*]u8 b = alloc(u8, 4) orelse return;
+    Buf c = @cast(Buf, b);
+    free(b);
+    res = (u32)c[0];
+}
+u32 main() { f(); return 0; }

@@ -1,0 +1,55 @@
+// Over-rejection boundary for BUG-913/914: the totality guard must be
+// invisible to every VALID value, including a sparse enum (non-contiguous
+// variant values) and a multi-value last arm.
+i32 printf(const *u8 fmt, ...);
+
+enum St { a, b, c }
+enum Sparse { lo = 5, mid = 9, hi = 100 }
+enum Wide { w0, w1, w2, w3 }
+union U { u32 i; f32 f; }
+
+u32 n;
+
+i32 main() {
+    St[3] all;
+    all[0] = St.a; all[1] = St.b; all[2] = St.c;
+    for (u32 i = 0; i < 3; i += 1) {
+        switch (all[i]) {
+            .a => { n += 1; }
+            .b => { n += 10; }
+            .c => { n += 100; }
+        }
+    }
+    if (n != 111) { return 1; }
+
+    Sparse s = Sparse.hi;
+    switch (s) {
+        .lo  => { return 2; }
+        .mid => { return 3; }
+        .hi  => { n += 1000; }
+    }
+    if (n != 1111) { return 4; }
+
+    // multi-value LAST arm — the guard must accept every variant it covers
+    Wide w = Wide.w3;
+    switch (w) {
+        .w0      => { return 5; }
+        .w1, .w2, .w3 => { n += 10000; }
+    }
+    if (n != 11111) { return 6; }
+
+    U u; u.i = 5;
+    switch (u) {
+        .i => |v| { n += v; }
+        .f => |v| { n += (u32)v; }
+    }
+    if (n != 11116) { return 7; }
+    u.f = 1.5;
+    switch (u) {
+        .i => |v| { n += v; }
+        .f => |v| { n += (u32)v; }
+    }
+    if (n != 11117) { return 8; }
+    printf("n=%u\n", n);
+    return 0;
+}

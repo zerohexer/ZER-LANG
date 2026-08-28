@@ -1,0 +1,16 @@
+// expect-error: double free
+// BUG-917: alloc_id 0 is the "untracked" sentinel AND was a legal id minted
+// from local 0, so whichever handle landed on local 0 stopped propagating
+// frees to its aliases. Params are added first, so a struct param in slot 0
+// hit it: this exact program with a `u32 pad` param ahead of `hd` was
+// correctly rejected, and without it compiled clean.
+struct Item { u32 id; }
+struct Holder { Handle(Item) h; }
+Slab(Item) pool;
+
+void f(Holder hd) {
+    Handle(Item) k = hd.h;
+    pool.free(k);
+    pool.free(hd.h);
+}
+u32 main() { return 0; }

@@ -1,0 +1,24 @@
+// expect-trap
+// BUG-913: an exhaustive enum switch elided the LAST arm's comparison, so a
+// value that is not a declared variant silently RAN that arm. The three forge
+// guards (@bitcast/@truncate/@saturate) do not see a LOAD, and this value
+// arrives through an MMIO read — the canonical bare-metal enum source.
+// zerc-flags: --no-strict-mmio
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+enum St { a, b, c }
+
+i32 printf(const *u8 fmt, ...);
+
+i32 main() {
+    u32 backing = 99;                       // not any variant
+    usize addr = @ptrtoint(&backing);
+    volatile *St reg = @inttoptr(*St, addr);
+    St v = *reg;
+    switch (v) {
+        .a => { printf("A\n"); }
+        .b => { printf("B\n"); }
+        .c => { printf("C\n"); }            // pre-fix: THIS ran
+    }
+    return 0;
+}

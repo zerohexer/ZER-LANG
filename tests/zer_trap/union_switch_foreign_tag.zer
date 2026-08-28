@@ -1,0 +1,24 @@
+// expect-trap
+// BUG-914: the UNION sibling of BUG-913. A union switch with no default is
+// checked exhaustive, so every value is promised an arm; a tag that is not a
+// declared variant index matched NO arm and the switch silently did nothing.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+union U { u32 i; f32 f; }
+
+i32 printf(const *u8 fmt, ...);
+
+i32 main() {
+    u64[2] backing;
+    backing[0] = 77;                        // tag 77 — no such variant
+    backing[1] = 77;
+    usize addr = @ptrtoint(&backing);
+    *U r = @inttoptr(*U, addr);
+    U v = *r;
+    switch (v) {
+        .i => |x| { printf("I %u\n", x); }
+        .f => |x| { printf("F %f\n", (f64)x); }
+    }
+    printf("fell through\n");               // pre-fix: THIS ran
+    return 0;
+}

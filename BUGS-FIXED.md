@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-28 — BUG-913..923: eleven findings from a fresh audit (no branch to harvest)
+## Session 2026-08-28 — BUG-913..925: thirteen findings from a fresh audit (no branch to harvest)
 
 All nine `vigilant-tesla` branches are consumed, so this session had nothing to cherry-pick.
 Everything below was found by probing the compiler that is on main today. **Seven of the
@@ -249,6 +249,65 @@ supposed to emit an undeclared identifier so GCC errors. Three places bypassed t
 
 All three now land on the BUG-767 diagnostic. Nothing that worked stops working; what was
 silent or malformed becomes a named compile error.
+
+### BUG-924 — the read-modify-write rule was per-STATEMENT, so splitting it over two hid it
+
+Found by the same question as the rest: which other spelling of this program does the
+compiler already reject?
+
+```
+volatile u32 g;
+interrupt TIM2 { g = 7; }
+u32 main(){ g += 1;                return g; }   // rejected
+u32 main(){ g = g + 1;             return g; }   // rejected
+u32 main(){ g = idfn(g) + 1;       return g; }   // rejected
+u32 main(){ g = @truncate(u32,g)+1;return g; }   // rejected
+u32 main(){ u32 t = g; g = t + 1;  return g; }   // ACCEPTED — the hole
+```
+
+Every form the rule already knew is answerable inside ONE assignment: `assign_reads_own_target`
+asks whether the value expression mentions the target global. Split over two statements the
+first half writes no global and the second's value never mentions `g`, so both halves answer
+"not an RMW". On bare metal that is a lost update — the interrupt fires between the read and
+the write and its store is discarded, silently, with no fault on any target.
+
+**Fix: a NAME -> GLOBAL value taint**, the same shape as the VarRange map and reset at the
+same point. A local whose value came from global G carries G (transitively — a local reading
+a tainted local inherits it); a write to G whose value mentions such a local IS the
+read-modify-write. Re-assigning the local from anything else CLEARS the taint, so
+`u32 t = g; t = 5; g = t;` stays accepted. It can only ADD rejections, so the failure
+direction is over-rejection, never a shipped race.
+
+**Both sinks in the same commit, and the grid is why.** The ISR half went in first; the RMW
+FORM grid in `tests/test_hw_matrix.c` crosses SITE with SPELLING precisely so a form taught
+to one sink and not the other fails the build, and it reported the spawn cells as
+FALSE-NEGATIVE on the first run. The two sinks keep separate taint tables — one is filled
+while a function body is checked, the other while a CALLEE body is walked out of order — but
+share one `RmwTaintEnt` shape and one set of query helpers, so they cannot drift.
+
+The diagnostic lost the words "in a single statement", which now describe a shape the rule
+does not always have; eight negatives assert the reason and were updated to the part that is
+the rule's identity rather than its wording.
+
+Grid: `RFORM_SPLIT_STMT` and `RFORM_SPLIT_2HOP` (both sites), plus three POSITIVE boundary
+cells in an otherwise all-negative grid — taint-cleared, other-global, not-shared — because
+without them the cheapest way to pass the two new cells is "any function that reads g and
+writes g", which rejects a great deal of correct firmware. **Verified non-vacuous: 4
+FALSE-NEGATIVES against a pre-fix build, 0 after.**
+
+Test: `tests/zer_fail/isr_rmw_split_statements.zer`.
+
+### BUG-925 (tooling) — nine of the ten matrices could not be pointed at a pre-fix compiler
+
+`find_zerc` hardcoded `./zerc` and ignored `argv`, so `./test_hw_matrix /tmp/prefix/zerc_pre`
+silently measured the CURRENT compiler. It reported the same 37/37 for both, and the
+"verify the gate FIRES" step — the one CLAUDE.md insists on, because a gate that has only
+ever passed is a script and not a net — quietly measured nothing. It did exactly that to me
+once this session before the discrepancy with a hand probe gave it away.
+
+All ten grids now honour `ZER_MATRIX_ZERC`, the same affordance `tools/sink_matrix.sh` has
+always had as its first argument. Confirmed on the new cells: 4 false negatives with the
+override pointed at main, 0 without it.
 
 ### Measurements taken this session (record, so they are not re-run blind)
 

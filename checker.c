@@ -2628,7 +2628,17 @@ static int _rmw_alias_count = 0;
  * read-modify-write, so the diagnostic can name THAT rather than the generic
  * "accesses non-shared global" (which reads as if any access were the problem). */
 static bool _rmw_flagged_rmw = false;
-static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false; }
+/* BUG-924: the spawn sink's copy of the cross-statement VALUE taint. Same shape
+ * and same query helpers as `Checker.rmw_taints` (the ISR sink) — the table has
+ * to be separate only because this one is filled while a CALLEE's body is walked
+ * out of order, not while the enclosing function is checked. Reset with the
+ * alias table for the same reason: a stale row can only produce a false
+ * positive, and neither table may invent a rejection. */
+static RmwTaintEnt _rmw_vtaint[RMW_ALIAS_MAX];
+static int _rmw_vtaint_count = 0;
+static void rmw_alias_reset(void) {
+    _rmw_alias_count = 0; _rmw_flagged_rmw = false; _rmw_vtaint_count = 0;
+}
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
     for (int i = 0; i < _rmw_alias_count; i++)
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
@@ -2718,6 +2728,140 @@ static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
 }
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
     return expr_mentions_global(value, tgt, 0);
+}
+
+/* BUG-924 — cross-statement RMW taint. See `struct RmwTaint` in checker.h for
+ * why this exists and which direction it can be wrong in. Three operations:
+ *
+ *   rmw_taint_of(c, expr, &g)   does this expression read a tainted local, and
+ *                               if so which global does it carry?
+ *   rmw_taint_set(c, name, g)   record (or, with g == NULL, clear) a local's taint
+ *   rmw_value_taints_global     the query the RMW site asks: does this value
+ *                               expression carry global `g` through a local?
+ */
+static Symbol *rmw_tab_lookup(RmwTaintEnt *tab, int n,
+                              const char *nm, uint32_t nl) {
+    for (int i = n - 1; i >= 0; i--)
+        if (tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0)
+            return tab[i].global;
+    return NULL;
+}
+
+/* Set (or, with g == NULL, clear) a local's taint in `*tab`. `cap` is the
+ * capacity cell for the growable table and may be NULL for a FIXED one, in which
+ * case a full table silently drops the row — which costs a missed rejection,
+ * never a wrong one. */
+static void rmw_tab_set(RmwTaintEnt **tab, int *n, int *cap, int fixed_max,
+                        const char *nm, uint32_t nl, Symbol *g) {
+    if (!nm || nl == 0) return;
+    for (int i = 0; i < *n; i++) {
+        if ((*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0) {
+            (*tab)[i].global = g;   /* NULL clears */
+            return;
+        }
+    }
+    if (!g) return;   /* nothing to record */
+    if (cap) {
+        if (*n >= *cap) {
+            int nc = *cap ? *cap * 2 : 8;
+            RmwTaintEnt *nt = (RmwTaintEnt *)realloc(*tab, (size_t)nc * sizeof(*nt));
+            if (!nt) return;
+            *tab = nt;
+            *cap = nc;
+        }
+    } else if (*n >= fixed_max) {
+        return;
+    }
+    (*tab)[*n].name = nm;
+    (*tab)[*n].name_len = nl;
+    (*tab)[*n].global = g;
+    (*n)++;
+}
+
+/* Which global (if any) does this expression's value come from? A direct read of
+ * a global, or a read of a local already carrying one. Depth-limited, partial by
+ * design like `expr_mentions_global` — an unlisted node kind yields "none", which
+ * costs a missed rejection and never a wrong one. */
+/* Fixed-table convenience wrapper (the spawn sink's static array). */
+static void rmw_tab_set2(RmwTaintEnt *tab, int *n, int fixed_max,
+                         const char *nm, uint32_t nl, Symbol *g) {
+    rmw_tab_set(&tab, n, NULL, fixed_max, nm, nl, g);
+}
+
+static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
+                                       Node *e, int depth) {
+    if (!e || depth > 16) return NULL;
+    if (e->kind == NODE_IDENT) {
+        Symbol *t = rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len);
+        if (t) return t;
+        /* A GLOBAL read. Same test `resolve_write_target_global` uses on the
+         * WRITE side, so the two halves of the RMW agree on what a global is. */
+        Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                 (uint32_t)e->ident.name_len);
+        if (!s || s->is_function) return NULL;
+        return scope_lookup_local(c->global_scope, s->name, s->name_len);
+    }
+    if (e->kind == NODE_UNARY) return rmw_value_source_global(c, tab, n, e->unary.operand, depth + 1);
+    if (e->kind == NODE_TYPECAST) return rmw_value_source_global(c, tab, n, e->typecast.expr, depth + 1);
+    if (e->kind == NODE_FIELD) return rmw_value_source_global(c, tab, n, e->field.object, depth + 1);
+    if (e->kind == NODE_INDEX) return rmw_value_source_global(c, tab, n, e->index_expr.object, depth + 1);
+    if (e->kind == NODE_BINARY) {
+        Symbol *l = rmw_value_source_global(c, tab, n, e->binary.left, depth + 1);
+        if (l) return l;
+        return rmw_value_source_global(c, tab, n, e->binary.right, depth + 1);
+    }
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++) {
+            Symbol *s = rmw_value_source_global(c, tab, n, e->intrinsic.args[i], depth + 1);
+            if (s) return s;
+        }
+        return NULL;
+    }
+    if (e->kind == NODE_CALL) {
+        for (int i = 0; i < e->call.arg_count; i++) {
+            Symbol *s = rmw_value_source_global(c, tab, n, e->call.args[i], depth + 1);
+            if (s) return s;
+        }
+        return NULL;
+    }
+    if (e->kind == NODE_ORELSE) {
+        Symbol *s = rmw_value_source_global(c, tab, n, e->orelse.expr, depth + 1);
+        if (s) return s;
+        return rmw_value_source_global(c, tab, n, e->orelse.fallback, depth + 1);
+    }
+    return NULL;
+}
+
+/* Does this value expression carry `g` through a tainted LOCAL? (A direct
+ * mention of `g` itself is `assign_reads_own_target`'s job, not this one.) */
+static bool rmw_value_taints_global(RmwTaintEnt *tab, int n, Node *e,
+                                    Symbol *g, int depth) {
+    if (!e || !g || depth > 16) return false;
+    if (e->kind == NODE_IDENT)
+        return rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len) == g;
+    if (e->kind == NODE_UNARY)  return rmw_value_taints_global(tab, n, e->unary.operand, g, depth + 1);
+    if (e->kind == NODE_TYPECAST) return rmw_value_taints_global(tab, n, e->typecast.expr, g, depth + 1);
+    if (e->kind == NODE_FIELD)  return rmw_value_taints_global(tab, n, e->field.object, g, depth + 1);
+    if (e->kind == NODE_INDEX)
+        return rmw_value_taints_global(tab, n, e->index_expr.object, g, depth + 1) ||
+               rmw_value_taints_global(tab, n, e->index_expr.index, g, depth + 1);
+    if (e->kind == NODE_BINARY)
+        return rmw_value_taints_global(tab, n, e->binary.left, g, depth + 1) ||
+               rmw_value_taints_global(tab, n, e->binary.right, g, depth + 1);
+    if (e->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (rmw_value_taints_global(tab, n, e->intrinsic.args[i], g, depth + 1)) return true;
+        return false;
+    }
+    if (e->kind == NODE_CALL) {
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (rmw_value_taints_global(tab, n, e->call.args[i], g, depth + 1)) return true;
+        return false;
+    }
+    if (e->kind == NODE_ORELSE)
+        return rmw_value_taints_global(tab, n, e->orelse.expr, g, depth + 1) ||
+               rmw_value_taints_global(tab, n, e->orelse.fallback, g, depth + 1);
+    return false;
 }
 
 /* BUG-801: does this function read-modify-write through pointer parameter n?
@@ -6166,8 +6310,34 @@ static Type *check_expr(Checker *c, Node *node) {
             bool is_rmw = (node->assign.op != TOK_EQ) ||
                           target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                           (gs && assign_reads_own_target(node->assign.value, gs));
+            /* BUG-924: the SAME read-modify-write, split over two statements.
+             * `u32 t = g; g = t + 1;` answered "not an RMW" at both halves —
+             * the first writes no global, the second's value never mentions `g`
+             * — while `g += 1` and `g = g + 1` were both rejected. On bare metal
+             * the two-statement spelling is a lost update: the ISR fires between
+             * them and its store is discarded. */
+            if (!is_rmw && gs &&
+                rmw_value_taints_global(c->rmw_taints, c->rmw_taint_count,
+                                        node->assign.value, gs, 0))
+                is_rmw = true;
             if (is_rmw && gs && !gs->is_function)
                 track_isr_global(c, gs->name, gs->name_len, true);
+
+            /* BUG-924: maintain the taint. A plain `local = <expr>` SETS the
+             * local's taint to whichever global the expression's value came
+             * from, and CLEARS it when the value came from none — so
+             * `u32 t = g; t = 5; g = t;` is not an RMW. Only a bare local ident
+             * target: a write through a projection is not a rebinding. */
+            if (node->assign.op == TOK_EQ &&
+                node->assign.target && node->assign.target->kind == NODE_IDENT &&
+                !gs) {
+                rmw_tab_set(&c->rmw_taints, &c->rmw_taint_count,
+                            &c->rmw_taint_capacity, 0,
+                            node->assign.target->ident.name,
+                            (uint32_t)node->assign.target->ident.name_len,
+                            rmw_value_source_global(c, c->rmw_taints,
+                                c->rmw_taint_count, node->assign.value, 0));
+            }
         }
 
         /* BUG-294/302: reject assignment to non-lvalue.
@@ -13296,6 +13466,14 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 }
             }
         }
+        /* BUG-924: seed the VALUE taint for the split-statement RMW —
+         * `u32 t = g;` inside a spawned body makes `t` carry `g`. Uses the same
+         * query helper as the ISR sink; only the table differs. */
+        if (node->var_decl.init && node->var_decl.name)
+            rmw_tab_set2(_rmw_vtaint, &_rmw_vtaint_count, RMW_ALIAS_MAX,
+                         node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                         rmw_value_source_global(c, _rmw_vtaint, _rmw_vtaint_count,
+                                                 node->var_decl.init, 0));
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
         /* Axis A3 (2026-06-21): a COMPOUND assignment (RMW: +=, |=, etc.) on a
@@ -13318,6 +13496,24 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             bool _is_rmw = (node->assign.op != TOK_EQ) ||
                            target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                            (ts && assign_reads_own_target(node->assign.value, ts));
+            /* BUG-924: the split-statement spelling, at the SPAWN sink. Added in
+             * the same commit as the ISR one — the RMW grid in
+             * tests/test_hw_matrix.c crosses site with spelling precisely so a
+             * form taught to one sink and not the other fails the build, and it
+             * caught this the moment the ISR half went in. */
+            if (!_is_rmw && ts &&
+                rmw_value_taints_global(_rmw_vtaint, _rmw_vtaint_count,
+                                        node->assign.value, ts, 0))
+                _is_rmw = true;
+            /* Maintain the taint: a plain `local = <expr>` re-binds it, and a
+             * value from no global CLEARS it. */
+            if (node->assign.op == TOK_EQ && !ts &&
+                node->assign.target->kind == NODE_IDENT)
+                rmw_tab_set2(_rmw_vtaint, &_rmw_vtaint_count, RMW_ALIAS_MAX,
+                             node->assign.target->ident.name,
+                             (uint32_t)node->assign.target->ident.name_len,
+                             rmw_value_source_global(c, _rmw_vtaint, _rmw_vtaint_count,
+                                                     node->assign.value, 0));
             if (ts && !ts->is_function && !ts->is_const &&
                 zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,
                                             _is_rmw ? 1 : 0) == 0) {
@@ -13677,6 +13873,17 @@ static void check_stmt(Checker *c, Node *node) {
              * type-driven and reads the operand's type from the typemap, which is
              * not populated until the init has been checked. Running here missed
              * every non-ident operand (`*h.pp`). */
+        /* BUG-924: seed the cross-statement RMW taint. `u32 t = g;` makes `t`
+         * carry `g`, so a later `g = t + 1` is recognised as the
+         * read-modify-write it is. Done here rather than after check_expr
+         * because the query is name resolution only — it never reads the
+         * typemap — and the init's own identifiers are already in scope. */
+        if (node->kind == NODE_VAR_DECL && node->var_decl.init && node->var_decl.name)
+            rmw_tab_set(&c->rmw_taints, &c->rmw_taint_count,
+                        &c->rmw_taint_capacity, 0,
+                        node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                        rmw_value_source_global(c, c->rmw_taints,
+                            c->rmw_taint_count, node->var_decl.init, 0));
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
@@ -19261,6 +19468,7 @@ static void check_func_body(Checker *c, Node *node) {
          * reset re-clears them. Functions never nest, so nothing between here and
          * that next reset consults a stale range. */
         c->var_range_count = 0;
+        c->rmw_taint_count = 0;   /* BUG-924: per-function, same lifetime as VarRange */
         check_stmt(c, node->func_decl.body);
         /* NOT DONE — the mirror of ISR-TRANS (a transitive global-access walk over
          * every REGULAR function body, so an RMW reached from main through a
@@ -19428,6 +19636,7 @@ static void check_func_body(Checker *c, Node *node) {
          * fixed-array index "proven", and elided the bounds auto-guard inside the
          * ISR -> silent bare-metal stack OOB. Mirrors the func_decl reset. */
         c->var_range_count = 0;
+        c->rmw_taint_count = 0;   /* BUG-924 */
         check_stmt(c, node->interrupt.body);
         /* ISR-TRANS: also record globals reached through helper calls so the
          * "accessed from both ISR and main → volatile" and "volatile compound
@@ -20673,10 +20882,14 @@ static void check_interrupt_safety(Checker *c) {
                  * the rule now also sees `g = g + 1` and writes reaching g through a
                  * pointer — so the message must describe the OPERATION, not one
                  * spelling of it. */
-                "volatile global '%.*s' is read-modify-written in a single "
-                "statement and is shared between interrupt and main code — "
-                "the read and the write can be split by an interrupt, losing an "
-                "update; use an explicit read/mask/write or @atomic_*",
+                /* BUG-924: and no longer only within ONE statement — the taint
+                 * catches `u32 t = g; g = t + 1;` too, so "in a single
+                 * statement" would now name a shape the diagnostic does not
+                 * always describe. */
+                "volatile global '%.*s' is read-modify-written and is shared "
+                "between interrupt and main code — the read and the write can be "
+                "split by an interrupt, losing an update; use an explicit "
+                "read/mask/write inside @critical, or @atomic_*",
                 (int)g->name_len, g->name);
         } else if (!volatile_global_exempt_from_race_check(c, sym)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and

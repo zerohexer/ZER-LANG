@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: read-modify-written in a single statement
+// expect-error: read-modify-written and is shared
 // BUG-801: an RMW reached from MAIN through a helper. The ISR side of this family
 // closed with BUG-792; this form needed a MEMOISED per-function RMW summary
 // (bit n = performs an RMW through param n), because the naive alternative --

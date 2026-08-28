@@ -1,0 +1,14 @@
+// expect-error: read-modify-written and is shared
+// BUG-924: the same read-modify-write, split over two statements. `g += 1` and
+// `g = g + 1` were both rejected; `u32 t = g; g = t + 1;` was accepted, and on
+// bare metal that is a lost update — the ISR fires between the read and the
+// write and its store is discarded.
+volatile u32 g;
+
+interrupt TIM2 { g = 7; }
+
+u32 main() {
+    u32 t = g;
+    g = t + 1;
+    return g;
+}

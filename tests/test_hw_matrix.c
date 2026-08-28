@@ -29,7 +29,16 @@ static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, over_reject = 0;
 static const char *zerc_path = NULL;
 
+/* ZER_MATRIX_ZERC overrides the search. Verifying that a NEW cell actually FIRES
+ * means running this grid against a PRE-FIX compiler, and with a hardcoded
+ * `./zerc` there was no way to do that — passing a path as argv[1] was silently
+ * ignored, so a pre-fix run reported the same 37/37 as a fixed one and the
+ * "gate proven non-vacuous" step quietly measured nothing (2026-08-28: it did
+ * exactly that to me once). tools/sink_matrix.sh has always taken the path as
+ * its first argument; this is the same affordance. */
 static void find_zerc(void) {
+    const char *env = getenv("ZER_MATRIX_ZERC");
+    if (env && *env) { zerc_path = env; return; }
     if (system("test -x ./zerc") == 0) { zerc_path = "./zerc"; return; }
     if (system("test -x /tmp/zerc") == 0) { zerc_path = "/tmp/zerc"; return; }
     if (system("gcc -std=c99 -O2 -I. -o /tmp/zerc lexer.c parser.c ast.c types.c "
@@ -304,6 +313,7 @@ static const char *vshape_flags(VShape s) {
  * ------------------------------------------------------------------------- */
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -313,6 +323,8 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_SPLIT_STMT:      return "split t=g;g=t+1";
+    case RFORM_SPLIT_2HOP:      return "split 2-hop";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -327,6 +339,12 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    /* BUG-924: the SAME operation split over two statements. Every form above
+     * is answerable within ONE assignment; these two are not, and were accepted
+     * at both sinks while `g += 1` and `g = g + 1` were rejected. The 2-hop cell
+     * pins the taint being TRANSITIVE — a local reading a local that read g. */
+    case RFORM_SPLIT_STMT:     *helper = "";                                    *body = "u32 t = g; g = t + 1;"; break;
+    case RFORM_SPLIT_2HOP:     *helper = "";                                    *body = "u32 t = g; u32 u = t; g = u + 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }
@@ -450,6 +468,32 @@ int main(void) {
             int ok = run_vol(rnm, rbuf, "", 1);
             fprintf(stderr, "  [%-5s][%-15s][neg] %s\n",
                     vsite_name(vs), rform_name(rf), ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* BUG-924 BOUNDARY — the cross-statement taint must fire ONLY when the value
+     * written back really came from the same global. These three are safe code
+     * and an over-rejection here is a regression, so they are POSITIVE cells in
+     * a grid that is otherwise all negative. Without them the cheapest way to
+     * pass the two SPLIT cells above would be "any function that reads g and
+     * writes g", which rejects a great deal of correct firmware. */
+    fprintf(stderr, "\n--- RMW split-taint boundary (must COMPILE) ---\n");
+    {
+        static const char *bnames[3] = { "taint-cleared", "other-global", "not-shared" };
+        static const char *bbodies[3] = {
+            "volatile u32 g;\ninterrupt TIMER { g = 7; }\n"
+            "u32 main(){ u32 t = g; t = 5; g = t; return g & 1; }\n",
+            "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
+            "u32 main(){ u32 t = h; g = t + 1; return g & 1; }\n",
+            "u32 plain;\nu32 main(){ u32 t = plain; plain = t + 1; return plain & 1; }\n"
+        };
+        for (int bi = 0; bi < 3; bi++) {
+            valid_cells++;
+            char bnm[192];
+            snprintf(bnm, sizeof(bnm), "rmw-boundary/%s", bnames[bi]);
+            int ok = run_vol(bnm, bbodies[bi], "", 0);
+            fprintf(stderr, "  [%-22s][pos] %s\n", bnames[bi], ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
     }

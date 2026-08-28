@@ -7,8 +7,8 @@ Entries removed once fixed.
 
 # HANDOFF — read this first (updated 2026-08-28)
 
-**2026-08-28 — first session with NO branch to harvest. Eleven findings from probing main
-directly (BUG-913..923); eight accept-unsafe, three of those SILENT on hosted AND bare
+**2026-08-28 — first session with NO branch to harvest. Thirteen findings from probing main
+directly (BUG-913..925); nine accept-unsafe, four of those SILENT on hosted AND bare
 metal.** Full
 detail in BUGS-FIXED.md "Session 2026-08-28". What a future session should take from it:
 
@@ -20,6 +20,15 @@ detail in BUGS-FIXED.md "Session 2026-08-28". What a future session should take 
   read, or a `@pun`'d deref, because none of those is a conversion. The answer was a USE-SITE
   check (the switch is now total), not a fifth door. Ask this of any other "the doors are
   closed" claim in this tree.
+- **A rule scoped to ONE STATEMENT is a rule with a spelling loophole.** BUG-924: the
+  read-modify-write check asked whether one assignment both reads and writes the same
+  global, so `u32 t = g; g = t + 1;` answered "no" twice while four one-statement spellings
+  of the identical operation were all rejected. Whenever a rule's implementation is a
+  question about a single node, ask what the two-node version looks like.
+- **A gate you cannot point at a PRE-FIX compiler proves nothing.** BUG-925: all ten
+  `tests/test_*_matrix.c` grids hardcoded `./zerc` and ignored argv, so the "verify the new
+  cell FIRES" step graded the current compiler and reported all-green either way. They now
+  honour `ZER_MATRIX_ZERC`.
 - **Then ask it of the NEXT type with a closed value set.** Doing exactly that found
   BUG-922: `bool` had BOTH exposures — an unguarded `@bitcast(bool, 2)` door and an
   exhaustive switch that matched no arm — and produced the sharpest symptom of the session,

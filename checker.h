@@ -23,6 +23,19 @@ typedef struct {
     char message[256];
 } Diagnostic;
 
+/* BUG-924: one entry of the read-modify-write value taint — "this LOCAL's value
+ * came from that GLOBAL". Declared here, outside Checker, because the SAME table
+ * shape is used at both RMW sinks: the per-function map below (the ISR sink,
+ * populated while the body is checked) and a per-scan static table in checker.c
+ * (the spawn sink, populated while a CALLEE body is walked out of order). One
+ * shape, one set of query helpers, so the two sinks cannot drift — which is
+ * exactly what happened to every earlier form of this rule. */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    Symbol *global;      /* the global this local's value came from */
+} RmwTaintEnt;
+
 /* typemap entry — maps AST Node* to resolved Type* */
 typedef struct {
     Node *key;
@@ -122,6 +135,34 @@ typedef struct {
     } *var_ranges;
     int var_range_count;
     int var_range_capacity;
+
+    /* BUG-924: cross-statement read-modify-write taint for the ISR / spawn
+     * sharing rule.
+     *
+     * The RMW check is per-STATEMENT — it asks whether ONE assignment both reads
+     * and writes the same global (`g += 1`, `g = g + 1`, `g = idfn(g) + 1`, a
+     * bit-range write). Splitting the same operation over two statements
+     * (`u32 t = g; g = t + 1;`) answered "no" at both, so the identical program
+     * in its two-statement spelling was accepted while the one-statement
+     * spelling was rejected. On bare metal that is a lost update: the ISR fires
+     * between the read and the write and its store is discarded, with no
+     * diagnostic and no fault.
+     *
+     * This is a NAME -> GLOBAL taint, valid within one function body and reset
+     * at entry beside `var_range_count`: a local whose value came from global G
+     * (directly, or from another local already tainted with G) carries G, and a
+     * write to G whose value mentions such a local IS the read-modify-write.
+     * Reassigning the local from something else CLEARS the taint, so
+     * `u32 t = g; t = 5; g = t;` stays accepted.
+     *
+     * Only ever ADDS rejections, so the failure direction is over-rejection,
+     * never a shipped race. Name-keyed with no scope discriminator, exactly like
+     * VarRange above, with the same consequence: a shadowing local of the same
+     * name in a sibling scope can inherit a taint it did not earn. That
+     * over-rejects; it cannot under-reject. */
+    RmwTaintEnt *rmw_taints;
+    int rmw_taint_count;
+    int rmw_taint_capacity;
 
     /* Nodes proven safe by range propagation — emitter skips runtime checks */
     Node **proven_safe;

@@ -3339,7 +3339,24 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 - Shared globals accessed from interrupt handlers must be volatile. This holds
   even when the ISR reaches the global INDIRECTLY — through a helper, or through
   a function bound to a local function pointer (`*() fp = bump; fp();`).
-- Compound assign (`reg |= 1`) on shared volatile → compile error (non-atomic RMW).
+- A READ-MODIFY-WRITE of a shared volatile global is a compile error, in every
+  spelling — the interrupt can land between the read and the write and the
+  update is lost. It does not matter how the RMW is written or how far apart
+  the halves are:
+
+  ```
+  g += 1;                        // rejected
+  g = g + 1;                     // rejected
+  g = @truncate(u32, g) + 1;     // rejected
+  *p += 1;   // p bound to &g    // rejected
+  bump(&g);  // helper does += 1 // rejected, transitively
+  u32 t = g; g = t + 1;          // rejected — split over two statements
+  ```
+
+  The rule follows the VALUE, so re-binding the local from something else clears
+  it (`u32 t = g; t = 5; g = t;` is fine), and a local carrying a DIFFERENT
+  global is not this one's RMW. Use `@atomic_add` and friends, a `shared struct`,
+  or do the read/modify/write inside `@critical`.
 - INDEXING a volatile `*T` (`reg[i]`) is bounds-checked against the `mmio`
   declaration, but only when the compiler can DERIVE the bound — which it can do
   only for a pointer obtained directly from `@inttoptr(*T, <const addr>)` inside

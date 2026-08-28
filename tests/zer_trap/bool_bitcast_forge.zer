@@ -1,0 +1,16 @@
+// expect-trap
+// BUG-922: `bool` is a two-variant enum in everything but spelling and it has
+// the same forge door. `@bitcast(bool, 2)` produced a value for which `if (b)`
+// took the TRUE branch while the exhaustive `switch (b)` — which the checker
+// REQUIRES to handle both arms — matched NEITHER. Two constructs reading one
+// value and disagreeing, with no diagnostic on either side.
+i32 printf(const *u8 fmt, ...);
+
+u8 wild(u8 x) { return x; }
+
+i32 main() {
+    u8 n = wild(2);
+    bool b = @bitcast(bool, n);     // must trap HERE, at the forgery
+    printf("forged %u\n", (u32)b);
+    return 0;
+}

@@ -3270,6 +3270,20 @@ tag is not a declared variant` instead of silently running no arm at all.
 This costs one comparison per exhaustive switch and is the use-site half of the
 guarantee: a foreign value is caught where it is USED, not assumed away.
 
+### `bool` gets both halves too
+
+`bool` is a two-variant enum in everything but spelling — the checker requires a
+`switch` on one to handle BOTH `true` and `false`, so every value is promised an
+arm — and it is a `uint8_t` in the emitted C with nothing downstream to
+normalise it. So it has the same two exposures, and both are closed:
+
+- `@bitcast(bool, n)` is its ONE forge door, and it now traps on anything that
+  is neither 0 nor 1. (`(bool)n` normalises instead — it yields exactly 1 for any
+  non-zero `n`; `@truncate` and `@saturate` reject a bool target outright.)
+- an exhaustive `switch (b)` traps on a byte that is neither, instead of running
+  no arm. Without it, `if (b)` and `switch (b)` read the same value and
+  disagreed: the `if` took the true branch while the switch matched nothing.
+
 ### Argument counts are checked
 
 An intrinsic that takes nothing used to accept anything and silently discard it, which

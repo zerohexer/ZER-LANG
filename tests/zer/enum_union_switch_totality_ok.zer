@@ -50,6 +50,17 @@ i32 main() {
         .f => |v| { n += (u32)v; }
     }
     if (n != 11117) { return 8; }
+
+    // BUG-922 boundary: a bool switch and a legitimate @bitcast(bool, 0|1)
+    // must be untouched by the bool totality guard.
+    bool t = true;
+    switch (t) { true => { n += 1; } false => { return 9; } }
+    bool ff = false;
+    switch (ff) { true => { return 10; } false => { n += 2; } }
+    bool bc = @bitcast(bool, (u8)1);
+    switch (bc) { true => { n += 4; } false => { return 11; } }
+    if (n != 11124) { return 12; }
+
     printf("n=%u\n", n);
     return 0;
 }

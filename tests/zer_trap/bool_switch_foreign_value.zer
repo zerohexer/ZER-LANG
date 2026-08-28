@@ -1,0 +1,21 @@
+// expect-trap
+// BUG-922, the USE-SITE half: a bool can also arrive already out of domain,
+// through a boundary no forge guard sees. `bool` is a uint8_t in the emitted C
+// and nothing downstream normalises it, so an MMIO read of a byte that is
+// neither 0 nor 1 matched no arm and the switch silently ran nothing.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+i32 printf(const *u8 fmt, ...);
+
+i32 main() {
+    u8 backing = 2;
+    usize addr = @ptrtoint(&backing);
+    volatile *bool reg = @inttoptr(*bool, addr);
+    bool b = *reg;
+    switch (b) {
+        true  => { printf("T\n"); }
+        false => { printf("F\n"); }
+    }
+    printf("fell through\n");       // pre-fix: THIS ran
+    return 0;
+}

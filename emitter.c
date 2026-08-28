@@ -886,12 +886,25 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * no header for these predicates). Same shape, same depth limit; keep them in
  * step — they answer the same question for the same rule, the checker deciding
  * whether to care and the emitter deciding where to look. */
+/* BUG-922: `bool` is a two-variant enum in everything but spelling, and it has
+ * the SAME forge door. `@bitcast(bool, n)` with n = 2 produced a `bool` for
+ * which `if (b)` took the TRUE branch while `switch (b) { true => … false => … }`
+ * — which the checker REQUIRES to be exhaustive — matched neither arm and ran
+ * nothing. Two constructs reading one value and disagreeing, with no diagnostic
+ * on either side. `bool` is `uint8_t` in the emitted C, so there is nothing
+ * downstream to normalise it.
+ *
+ * It is the only door: `(bool)n` normalises (measured — it emits `!= 0` and
+ * yields 1), and `@truncate` / `@saturate` reject a bool target outright ("must
+ * be an integer type"). Corpus cost of guarding it: ZERO — `@bitcast(bool, …)`
+ * does not occur anywhere in tests/, rust_tests/, zig_tests/, test_modules/,
+ * lib/, examples/ or the reference. */
 static bool type_carries_enum_e(Type *t, int depth) {
     if (!t || depth > 32) return false;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
-    if (k == TYPE_ENUM) return true;
+    if (k == TYPE_ENUM || k == TYPE_BOOL) return true;
     if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, depth + 1);
     if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, depth + 1);
     if (k == TYPE_STRUCT) {
@@ -937,6 +950,13 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
     Type *u = type_unwrap_distinct(t);
     if (!u) return;
     TypeKind k = type_dispatch_kind(u);
+    if (k == TYPE_BOOL) {
+        /* BUG-922 — see type_carries_enum_e. The variant set of `bool` is
+         * {0, 1} and the emitted representation is `uint8_t`. */
+        emit(e, "if ((unsigned)(%s) > 1u) _zer_trap(\"%s produced a bool that is "
+                "neither true nor false\", __FILE__, __LINE__); ", path, what);
+        return;
+    }
     if (k == TYPE_ENUM) {
         if (u->enum_type.variant_count == 0) return;
         emit(e, "if (!(");
@@ -3745,8 +3765,19 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "))");
-        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
-            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission */
+        } else if (nlen >= 9 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission.
+             *
+             * BUG-923: the gate was `nlen >= 10`, one MORE than the checker's own
+             * `nlen >= 9` (checker.c ~11792), so `@atomic_or` — the only op whose
+             * name is 9 characters — never matched this branch at all. And the
+             * branch had NO trailing `else`, so the seven ops the IR path handles
+             * and this one does not (xchg, nand, and the five *_fetch forms)
+             * matched the gate and emitted the EMPTY STRING, producing malformed
+             * C rather than the BUG-767 diagnostic that exists for exactly this.
+             * Both now land on that diagnostic. This whole AST path is
+             * const-initialiser-only and no reachable program was measured
+             * through it — the point is that if one ever is, it fails LOUDLY. */
             const char *op = name + 7;
             int oplen = nlen - 7;
             bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
@@ -3788,6 +3819,10 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
                 emit(e, ", __ATOMIC_SEQ_CST)");
+            } else {
+                /* BUG-923 — see above. No AST-path handler for this atomic op. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field))
@@ -3971,7 +4006,15 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_cond); (void)0; })", ar);
             } else {
-                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+                /* BUG-923: this emitted a C comment naming the intrinsic
+                 * followed by a literal zero. For @barrier_acq_rel and
+                 * @barrier_dma, which
+                 * the checker accepts and only the IR path implements, that is
+                 * a MEMORY FENCE silently replaced by nothing, and it reached
+                 * here BEFORE the loud BUG-767 fallthrough that exists to stop
+                 * exactly this. Fail loudly instead. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen >= 8 && memcmp(name, "barrier_", 8) == 0) {
             const char *bop = name + 8;
@@ -3994,7 +4037,15 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ")");
             } else {
-                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+                /* BUG-923: this emitted a C comment naming the intrinsic
+                 * followed by a literal zero. For @barrier_acq_rel and
+                 * @barrier_dma, which
+                 * the checker accepts and only the IR path implements, that is
+                 * a MEMORY FENCE silently replaced by nothing, and it reached
+                 * here BEFORE the loud BUG-767 fallthrough that exists to stop
+                 * exactly this. Fail loudly instead. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 &&
                    node->intrinsic.arg_count >= 1) {
@@ -11206,6 +11257,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 }
                 emit(e, ")) _zer_trap(\"switch on a value that is not a declared "
                         "variant of this enum\", __FILE__, __LINE__);\n");
+                emit_indent(e);
+            }
+            /* BUG-922: the BOOL sibling. `bool` is a `uint8_t` in the emitted C
+             * and the checker promises both arms of an exhaustive bool switch,
+             * so a byte that is neither 0 nor 1 — from a cinclude return or an
+             * MMIO read — matched no arm and the switch silently ran nothing,
+             * while `if (b)` on the same value took the true branch. */
+            if (et && type_dispatch_kind(et) == TYPE_BOOL) {
+                IRLocal *sv = &func->locals[inst->src1_local];
+                const char *sp = func->is_async ? "self->" : "";
+                emit(e, "if ((unsigned)(%s%.*s) > 1u) "
+                        "_zer_trap(\"switch on a bool that is neither true nor "
+                        "false\", __FILE__, __LINE__);\n",
+                     sp, (int)sv->name_len, sv->name);
                 emit_indent(e);
             }
             /* BUG-914: the union sibling. `src1_local` holds the POINTER local

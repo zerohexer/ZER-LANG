@@ -271,6 +271,28 @@ cell p18_safe_use_then_free compile '[*]u8 hd18b([*]u8 s){return s[0..2];} u32 m
 cell p18_safe_stack_view    compile 'struct N18{u32 v;u32 w;} *u32 fo18(*N18 n){return &n.v;} u32 main(){ N18 nd; nd.v=7; *u32 p=fo18(&nd); if (*p != 7) { return 1; } return 0; }'
 cell p18_safe_null_arm      compile '?*u32 mb18(*u32 p,bool ok){ if (ok) { return p; } return null; } u32 main(){ u32 loc=3; ?*u32 m=mb18(&loc,true); if (m) |pp| { if (*pp != 3) { return 1; } } return 0; }'
 
+# p19 — THE SAME LAUNDER FAMILY, AT THE OTHER SINK (2026-08-28, BUG-921).
+# p11/p15 pin the launder peel at the ESCAPE sink, which lives in checker.c and
+# uses `unwrap_ptr_launder`. The identical question — "does this wrapper preserve
+# the allocation identity?" — is answered a SECOND time in zercheck_ir.c, at the
+# UAF / double-free sink, and there it was answered by a string compare against
+# "ptrcast". So `@cast` (the ONLY conversion a distinct typedef has) and `@pun`
+# both produced untracked values while their `@ptrcast` sibling was caught.
+# Verified non-vacuous against a pre-fix build: 4 of these 6 cells FLIP —
+# p19_cast_uaf, p19_cast_double_free, p19_cast_slice_uaf and p19_pun_uaf all
+# COMPILED, and the safe cell was OVER-REJECTED (freeing through the laundered
+# name did not discharge the allocation, so it reported a leak).
+echo "===== SHAPE p19 = launder wrappers at the UAF / free sink ====="
+cell p19_cast_uaf          reject 'struct N19 { u32 x; } distinct typedef *N19 PN19; u32 main(){ ?*N19 m = alloc(N19); *N19 n = m orelse { return 1; }; PN19 c = @cast(PN19, n); free(n); return c.x; }'
+cell p19_cast_double_free  reject 'struct N19 { u32 x; } distinct typedef *N19 PN19; u32 main(){ ?*N19 m = alloc(N19); *N19 n = m orelse { return 1; }; PN19 c = @cast(PN19, n); free(c); free(n); return 0; }'
+cell p19_cast_slice_uaf    reject 'distinct typedef [*]u8 B19; u32 main(){ ?[*]u8 m = alloc(u8, 4); [*]u8 b = m orelse { return 1; }; B19 c = @cast(B19, b); free(b); return (u32)c[0]; }'
+cell p19_pun_uaf           reject 'struct N19 { u32 x; } struct M19 { u32 y; } u32 main(){ ?*N19 m = alloc(N19); *N19 n = m orelse { return 1; }; *M19 c = @pun(*M19, n); free(n); return c.y; }'
+cell p19_ptrcast_uaf       reject 'struct N19 { u32 x; } u32 main(){ ?*N19 m = alloc(N19); *N19 n = m orelse { return 1; }; *N19 c = @ptrcast(*N19, n); free(n); return c.x; }'
+# BOUNDARY: a launder is not a second allocation. Freeing ONCE through the
+# laundered name must discharge it, and a scalar @cast carries nothing at all.
+cell safe_p19_cast_free_once compile 'distinct typedef [*]u8 B19; u32 main(){ ?[*]u8 m = alloc(u8, 4); [*]u8 b = m orelse { return 1; }; B19 c = @cast(B19, b); u32 v = (u32)c[0]; free(c); return v; }'
+
+
 
 echo ""
 echo "==================================================================="

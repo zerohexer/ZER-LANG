@@ -7,8 +7,9 @@ Entries removed once fixed.
 
 # HANDOFF — read this first (updated 2026-08-28)
 
-**2026-08-28 — first session with NO branch to harvest. Nine holes found by probing main
-directly (BUG-913..921); seven accept-unsafe, two SILENT on hosted AND bare metal.** Full
+**2026-08-28 — first session with NO branch to harvest. Eleven findings from probing main
+directly (BUG-913..923); eight accept-unsafe, three of those SILENT on hosted AND bare
+metal.** Full
 detail in BUGS-FIXED.md "Session 2026-08-28". What a future session should take from it:
 
 - **The productive question was "which OTHER spelling of this program does the compiler
@@ -19,17 +20,33 @@ detail in BUGS-FIXED.md "Session 2026-08-28". What a future session should take 
   read, or a `@pun`'d deref, because none of those is a conversion. The answer was a USE-SITE
   check (the switch is now total), not a fifth door. Ask this of any other "the doors are
   closed" claim in this tree.
+- **Then ask it of the NEXT type with a closed value set.** Doing exactly that found
+  BUG-922: `bool` had BOTH exposures — an unguarded `@bitcast(bool, 2)` door and an
+  exhaustive switch that matched no arm — and produced the sharpest symptom of the session,
+  `if (b)` and `switch (b)` disagreeing about one value with no diagnostic on either side.
+  Enum, union tag and bool are the three carriers of a closed set today.
 - **A sentinel value that overlaps a legal value is a soundness hole** (BUG-917:
   `alloc_id == 0` meant both "untracked" and "local 0"). Worth grepping for the same shape
   elsewhere.
 
-Closed by that session and NOT open any more: the enum/union switch totality gap, the
+Closed by that session and NOT open any more: the enum/union/bool switch totality gap, the
 `.join()` name hijack, the Handle funcptr-field call, `alloc_id 0`, the struct-literal
 operand sink, the multi-view assignment sink + its merge, and the `@cast` launder.
 
 Still open and deliberately so, each with its own entry below: the conditional-escape leak
 (BUG-742 policy), `naked` (warned since BUG-852, not emitted), the deref-launder residual,
-and `vrp_ir.c` as dead code awaiting Phase 0.
+and `vrp_ir.c` as dead code awaiting Phase 0. Newly recorded: **`ir_merge_states` merges 5
+of 18 `IRHandleInfo` fields** — the view set was the reachable hole and is fixed, the other
+eight are unprobed and each wants a different join.
+
+**Where the AST emission path stands (BUG-923).** `emit_expr`'s `NODE_INTRINSIC` case is
+reachable only from const initialisers and the auto-guard index walk, and it has no handler
+for ~108 of the 160 intrinsics. That is BY DESIGN — the fallthrough is a deliberate
+undeclared identifier so GCC errors — but three branches sat in FRONT of it and failed
+quietly instead (a fence emitted as `0`, seven atomics emitted as the empty string, and
+`@atomic_or` unable to match its own branch). All three now land on the loud fallthrough. If
+a future change makes that path reachable for statement-level intrinsics, the right move is
+still to route to the diagnostic, never to add a half-handler.
 
 ---
 
@@ -61,7 +78,9 @@ repeated.
 ## Where main stands
 
 `make check` exit 0 — **1391 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT
-audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **88 cells / 0 mismatch**.
+audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **CLEAN**
+(cell count is printed by the gate; 2026-08-28 added the p19 launder-at-the-UAF-sink block,
+verified non-vacuous — 5 mismatches on a pre-fix build, 0 after).
 
 Landed this session, newest first:
 

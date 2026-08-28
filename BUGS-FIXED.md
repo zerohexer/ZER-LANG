@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-28 — BUG-913..921: nine holes from a fresh audit (no branch to harvest)
+## Session 2026-08-28 — BUG-913..923: eleven findings from a fresh audit (no branch to harvest)
 
 All nine `vigilant-tesla` branches are consumed, so this session had nothing to cherry-pick.
 Everything below was found by probing the compiler that is on main today. **Seven of the
@@ -183,7 +183,72 @@ The `@ptrcast` spelling of the same program is rejected, and so is the subslice 
 Fixed by calling the one peeler.
 
 Tests: `tests/zer_fail/cast_launder_uaf.zer`, `tests/zer_fail/cast_launder_double_free.zer`,
-`tests/zer/cast_launder_ok.zer`.
+`tests/zer/cast_launder_ok.zer`, and a **new `p19` block in `tools/sink_matrix.sh`** —
+because p11/p15 already pin this exact question at the ESCAPE sink and nothing pinned it at
+the UAF/free sink, which is why the two drifted apart in the first place. **Verified
+non-vacuous against a pre-fix build**: 5 of its 6 cells mismatch there (four HOLES — `@cast`
+UAF, `@cast` double free, `@cast` on a slice, and `@pun` — plus one OVER-REJECT, since
+freeing through the laundered name did not discharge the allocation and reported a leak) and
+0 after. The `@pun` hole and the over-rejection were both found BY the enumeration, not
+reported.
+
+### BUG-922 — `bool` is the THIRD member of the forged-tag class, and it had BOTH exposures
+
+Found by asking BUG-913's own question of the next type that carries a closed value set.
+`bool` is a two-variant enum in everything but spelling — the checker REQUIRES a `switch`
+on one to handle both `true` and `false`, so every value is promised an arm — and it is a
+plain `uint8_t` in the emitted C with nothing downstream to normalise it.
+
+**The door.** `@bitcast(bool, n)` with n = 2:
+
+```
+bool b = @bitcast(bool, n);
+if (b) { ... } else { ... }                                   // took TRUE
+switch (b) { true => { ... } false => { ... } }               // matched NEITHER
+```
+
+Two constructs reading one value and disagreeing, with no diagnostic on either side. It is
+the ONLY door, verified rather than assumed: `(bool)n` NORMALISES (measured — it yields
+exactly 1 for n = 2) and `@truncate` / `@saturate` reject a bool target outright ("must be
+an integer type"). Corpus cost of the guard: **ZERO** — `@bitcast(bool, …)` does not occur
+anywhere in `tests/`, `rust_tests/`, `zig_tests/`, `test_modules/`, `lib/`, `examples/` or
+the reference.
+
+**The use site.** Same as BUG-913/914: a bool can also arrive already out of domain through
+a boundary no forge guard sees — a cinclude function returning a non-normalised byte, or an
+MMIO read. Both measured; the switch silently ran nothing and execution continued.
+
+Implemented by extending the SAME two mechanisms rather than adding a third: `bool` is now
+a carrier in `type_carries_enum_e` / `emit_enum_variant_guard_path` (variant set {0,1}), and
+the switch totality guard grew a bool arm alongside the enum and union ones.
+
+Tests: `tests/zer_trap/bool_bitcast_forge.zer`, `tests/zer_trap/bool_switch_foreign_value.zer`,
+and the bool section of `tests/zer/enum_union_switch_totality_ok.zer`.
+
+### BUG-923 — three AST-path intrinsic fallthroughs that fail QUIETLY instead of loudly
+
+Hardening, not a live bug — no reachable program was measured through any of these — but
+each is a landmine of exactly the shape BUG-767 already installed a guard against, sitting
+in FRONT of that guard.
+
+`emit_expr`'s `NODE_INTRINSIC` case is the AST path (const initialisers and the auto-guard
+index walk); the IR path is `emit_rewritten_node`. Where the AST path lacks a handler it is
+supposed to emit an undeclared identifier so GCC errors. Three places bypassed that:
+
+- **`@barrier_acq_rel` / `@barrier_dma`.** The checker accepts both; only the IR path emits
+  a real fence. On the AST path they are swallowed by the generic `barrier_` prefix branch,
+  whose sub-branches only match `init` and `wait`, and the `else` emitted a C comment
+  followed by a literal `0` — **a memory fence replaced by nothing**, in a branch that runs
+  BEFORE the loud fallthrough. (The `cond_` prefix branch had the identical `else`.)
+- **Seven atomic ops emitted the EMPTY STRING.** The atomic branch computes a GCC builtin
+  name for add/sub/or/and/xor plus load/store/cas and has **no trailing `else`**, so
+  `@atomic_xchg`, `@atomic_nand` and the five `*_fetch` forms — all of which the checker
+  accepts and the IR path implements — matched the gate and emitted nothing at all.
+- **`@atomic_or` could not reach the branch.** Its gate was `nlen >= 10`, one more than the
+  checker's own `nlen >= 9`, and `atomic_or` is the only op name that is 9 characters.
+
+All three now land on the BUG-767 diagnostic. Nothing that worked stops working; what was
+silent or malformed becomes a named compile error.
 
 ### Measurements taken this session (record, so they are not re-run blind)
 

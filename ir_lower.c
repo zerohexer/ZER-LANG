@@ -2991,6 +2991,25 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * unconditional goto. One block, one edge, exactly one predecessor —
          * no join is created, so the CFG merge and the leak/MAYBE_FREED
          * fixpoint see the same shape they saw before. */
+        /* BUG-922: the BOOL sibling of BUG-913/914. The checker REQUIRES a bool
+         * switch to handle both `true` and `false` ("switch on bool must handle
+         * both true and false"), so every value is promised an arm — but a bool
+         * is a `uint8_t` and one carrying 2 (a cinclude function returning a
+         * non-normalised byte, an MMIO read) matched NEITHER arm while `if (b)`
+         * on the same value took the TRUE branch. Measured: `if` printed
+         * "if-true" and the switch printed nothing. Same placement and the same
+         * one-block/one-edge shape as the union guard below. */
+        bool is_bool_sw = sw_eff && type_dispatch_kind(sw_eff) == TYPE_BOOL;
+        if (is_bool_sw && !has_default && node->switch_stmt.arm_count > 0 &&
+            sw_val_local >= 0) {
+            int bb_bguard = ir_add_block(ctx->func, ctx->arena);
+            IRInst bg = make_inst(IR_GOTO, node->loc.line);
+            bg.goto_block = bb_bguard;
+            bg.cast_type = sw_eff;
+            bg.src1_local = sw_val_local;
+            emit_inst(ctx, bg);
+            ctx->current_block = bb_bguard;
+        }
         if (is_union && !has_default && node->switch_stmt.arm_count > 0 &&
             sw_val_local >= 0 && sw_eff && sw_eff->union_type.variant_count > 0) {
             int bb_guard = ir_add_block(ctx->func, ctx->arena);

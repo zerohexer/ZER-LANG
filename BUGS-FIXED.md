@@ -267,6 +267,20 @@ silent or malformed becomes a named compile error.
   new finding.
 - **`vrp_ir.c` is dead code**: 382 lines, referenced by nothing, absent from the Makefile.
   Kept deliberately — it is Phase 0 of `docs/unified-oracle-proved-ZER.md`.
+- **The AST/IR safety-wrapper parity grep is CLEAN.** Every wrapper family present in the
+  AST region of `emitter.c` (`_zer_trap`, `_zer_bounds_check`, `_zer_shl`, `_zer_shr`,
+  `_zer_probe`, `emit_intn_mask`, `emit_intn_mask_lv`) is also present in the IR region; the
+  IR region has strictly more, which is the expected direction.
+- **A differential -O0 vs -O2 sweep over 1166 programs found ZERO divergence.**
+  `tools/ub_sweep.sh` had only ever been run against `tests/zer`; this run added
+  `rust_tests`, `zig_tests` and `test_modules` (1459 programs offered, 1166 built and
+  compared, 293 skipped as they do not build standalone). Every program agreed with itself
+  across optimisation levels — no undefined behaviour survives in the emitted C on those
+  corpora. That is the harness that would have caught BUG-845's float conversion and
+  BUG-883's saturation, so it is the right net; it is just clean now.
+- **`ir_merge_states` merges 5 of 18 `IRHandleInfo` fields.** The view set was the reachable
+  hole (BUG-919); the other eight are recorded, with what each was probed for, in
+  `docs/limitations.md`.
 
 
 ---

@@ -4069,6 +4069,36 @@ is still a hard error when the index is provably out of range.
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
+### Precedence
+
+Tightest binding LAST. Every level is left-associative except assignment.
+
+| level | operators |
+|---|---|
+| loosest | `=  +=  -=  *=  /=  %=  &=  \|=  ^=  <<=  >>=` |
+| | `orelse` |
+| | `\|\|` |
+| | `&&` |
+| | `\|` |
+| | `^` |
+| | `&` |
+| | `==  !=` |
+| | `<  >  <=  >=` |
+| | `<<  >>` |
+| | `+  -` |
+| | `*  /  %` |
+| | unary `-  !  ~  *  &` |
+| tightest | `.`  `()`  `[]` |
+
+This is C's table, with `orelse` inserted and `?:` and `,` absent. In particular
+`&` `^` `|` are LOOSER than `==` `!=`, exactly as in C — so `flags & MASK == 0`
+parses as `flags & (MASK == 0)` and is a type error here rather than a silent
+wrong answer, because `&` rejects a bool operand. Parenthesise:
+`(flags & MASK) == 0`.
+
+`orelse` is looser than everything except assignment, so `x = f() orelse 0 + 1`
+is `x = f() orelse (0 + 1)`.
+
 ### Bit Extraction
 ```zer
 reg[9..8]                  // Extract bits 9:8
@@ -4271,6 +4301,51 @@ the `Handle` by value rather than a pointer to it.
 | Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
 | Division by zero (call) | `x / func()` where func() return range unknown → compile error |
 | Wrong pointer cast | Provenance tracking through *opaque round-trips |
+
+---
+
+## RUNTIME TRAPS
+
+What ZER could not settle at compile time it settles at run time, and it does so
+by HALTING rather than continuing with a wrong value. A trap prints
+`ZER TRAP: <message> at <file>:<line>` on a hosted target and then executes the
+architecture's breakpoint instruction (`int3` / `bkpt` / `ebreak` / `break`)
+followed by an infinite loop; on a freestanding target it skips the print. The
+process exit status is 133 (128 + SIGTRAP), which is what the test harness
+asserts for `tests/zer_trap/`.
+
+This is the complete set. Every one of them is a bug in the program (or in the
+hardware description it was given), never a spurious failure.
+
+| Message | What happened | What to do |
+|---|---|---|
+| `array index out of bounds` | An index the compiler could not prove in range was, at run time, out of range | Guard the index, or narrow it so the check is elided |
+| `slice start > end` / `slice start > len` / `slice end > len` | A sub-slice `s[a..b]` with an impossible or out-of-range range | Clamp `a` and `b` before slicing |
+| `division by zero` | A divisor the compiler could not prove non-zero was 0 | Check the divisor, or narrow its range |
+| `signed division overflow` | `INT_MIN / -1` (or `%`), which has no representable result | Special-case `INT_MIN` |
+| `NaN to integer` | A NaN float converted to `u128`/`i128`, whose bounds are not expressible at that width | Test `v != v` first. Narrower widths SATURATE instead and never trap |
+| `@inttoptr: address outside mmio range` | A runtime address not inside any declared `mmio` range | Add the range, or check the address |
+| `@inttoptr: unaligned address` | The address does not satisfy the target type's alignment | Align it, or read a narrower type |
+| `memory access fault — invalid MMIO or pointer` | An `@probe` faulted (hosted probe mode installs a handler) | Expect `null` from `@probe` and handle it |
+| `mmio 0x..0x..: no hardware detected` | The boot-time probe of a declared `mmio` range found nothing | The range is wrong for this board, or the peripheral is unclocked |
+| `@pun type mismatch` / `@ptrcast type mismatch` | The runtime type_id of the pointer does not match the target | The provenance is genuinely different — you are punning the wrong object |
+| `type mismatch in cast` | A `*opaque` round-trip landed on a different type than it came from | Same as above |
+| `switch on a value that is not a declared variant of this enum` | An enum value from outside the language (extern C return, MMIO read, `@pun`'d deref) reached an exhaustive switch | Validate at the boundary, or give the switch a `default` |
+| `switch on a union whose tag is not a declared variant` | Same, for a union tag | Same |
+| `switch on a bool that is neither true nor false` | Same, for a `bool` byte that is not 0 or 1 | Same |
+| `@bitcast\|@truncate\|@saturate produced a value that is not a declared variant of this enum` | A conversion forged an out-of-set enum | The source value is not a valid variant — check it first |
+| `@bitcast produced a bool that is neither true nor false` | A conversion forged an out-of-domain bool | Use `n != 0`, or `(bool)n`, which normalises |
+| `use-after-free: handle generation mismatch` | A `Handle` outlived its slot; the generation counter caught it | The compile-time analysis missed a dynamic path — restructure the ownership |
+| `use-after-free: tracked pointer freed` / `double free: tracked pointer` | The runtime allocation header caught a use or free of a dead pointer | Same |
+| `slab: use-after-free or invalid handle` / `slab: free_ptr with invalid pointer` | A handle or pointer that this slab never issued | Wrong allocator, or a stale value |
+| `@cstr buffer overflow` | The destination buffer cannot hold the string plus its NUL | Size the buffer, or truncate first |
+| `out-of-bounds access inside a held lock, @critical block or ISR` | A bounds failure where unwinding is not safe | Same as `array index out of bounds`, but it must be fixed — the usual silent guard cannot be used here |
+| `@barrier_wait on an uninitialized barrier` | `@barrier_wait(b)` before `@barrier_init(b, N)` | Initialise before any waiter runs |
+| `explicit trap` | Your own `@trap()` | — |
+
+A message beginning `compiler bug:` (or `IR_FIELD_WRITE not implemented` and its
+siblings) is NOT a bug in your program. It means the emitter reached a case it
+does not handle. Please report it with a minimal reproducer.
 
 ---
 

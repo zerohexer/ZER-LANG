@@ -1223,6 +1223,26 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## MEASURED CLEAN 2026-08-28 — the -O0/-O2 differential sweep, now over four corpora
+
+`tools/ub_sweep.sh` is the only harness that can see UB in the EMITTED C: a positive test
+asserts exit 0 and a negative asserts a diagnostic, and UB produces neither — it produces a
+DIFFERENT ANSWER per optimisation level. It had only ever been pointed at `tests/zer`.
+
+Run 2026-08-28 over `rust_tests`, `zig_tests`, `test_modules` and `tests/zer`:
+**1459 programs offered, 1166 built and compared, 293 skipped (do not build standalone),
+0 divergences.** Every program agreed with itself between `-O0` and `-O2`.
+
+Recorded so it is not re-run blind, and because the number that matters is the 293: those
+are programs the sweep CANNOT speak for (module fragments needing a companion file,
+cross-arch files, negatives). If a future UB hunt comes up empty, that skip set is where to
+look next — not at the 1166.
+
+The sweep is NOT in `make check` (two to four gcc invocations per program). Run it after
+touching the emitter.
+
+---
+
 ## OPEN — `ir_merge_states` merges 5 of 18 `IRHandleInfo` fields (2026-08-28)
 
 **Measured, not inferred.** `ir_merge_states` (zercheck_ir.c ~1147) has two loops with

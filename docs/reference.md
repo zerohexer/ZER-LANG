@@ -3905,9 +3905,12 @@ void stack_push(*Stack(u32) s, u32 val) {
   another container over the same T).
 - `Pool(T, N)`, `Slab(T)` and `Ring(T, N)` are NOT supported as container fields —
   the compiler cannot stamp their inline storage for a monomorphized container.
-  `Handle(T)` works because a Handle is a `u64` (index + generation), so the
-  stamped struct needs no per-T layout. Declare the allocator as a global and
-  store `Handle(T)` in the container instead.
+  This holds whether the element is the type parameter or a concrete type, and
+  the diagnostic says so at the container. `Handle(T)` works because a Handle is
+  a `u64` (index + generation), so the stamped struct needs no per-T layout.
+  Declare the allocator as a global and store `Handle(T)` in the container
+  instead. A POINTER to an allocator (`*Pool(Item, 4)`) is a field like any
+  other — the restriction is about inline storage.
 - Instances cached — same `Stack(u32)` reuses cached stamp.
 - NOT generics — no type constraints, no SFINAE.
 - Type ARGUMENT must be a plain named type (primitive or struct/enum/union).

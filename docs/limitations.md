@@ -7,8 +7,8 @@ Entries removed once fixed.
 
 # HANDOFF — read this first (updated 2026-08-28)
 
-**2026-08-28 — first session with NO branch to harvest. Thirteen findings from probing main
-directly (BUG-913..925); nine accept-unsafe, four of those SILENT on hosted AND bare
+**2026-08-28 — first session with NO branch to harvest. Fourteen findings from probing main
+directly (BUG-913..926); nine accept-unsafe, four of those SILENT on hosted AND bare
 metal.** Full
 detail in BUGS-FIXED.md "Session 2026-08-28". What a future session should take from it:
 
@@ -1715,7 +1715,33 @@ From `l3vn1i`:
 
 ---
 
-## OPEN — `Pool`/`Slab`/`Ring` as a container FIELD reports "undefined type 'T'" (LOW, message quality)
+## CLOSED 2026-08-28 (BUG-926) — `Pool`/`Slab`/`Ring` as a container FIELD now names the restriction
+
+The fix sketch below said an explicit check naming the restriction is "a few lines and is what
+a user actually needs". It is, and it is in — with one correction to the sketch: **the entry
+described only HALF the problem.** Measured while implementing it:
+
+| field | before | now |
+|---|---|---|
+| `Pool(T, 4) v;` (parameterised) | *"undefined type 'T'"* — blames the type parameter | one ZER error naming the rule and the fix |
+| `Pool(It, 4) v;` (CONCRETE element) | **no ZER diagnostic at all** — a raw GCC error inside generated code, *"field 'slots' has incomplete type"*, naming a `.c` the user never opened | same ZER error |
+
+The concrete spelling is the worse of the two and was not recorded here at all. One predicate
+(`tynode_has_inline_allocator`) covers both, and it rejects nothing that used to work — the
+concrete form already failed, just later and worse. A POINTER to an allocator carries no inline
+storage and is deliberately not swept up.
+
+Tests: `tests/zer_fail/container_field_pool_{param,concrete}.zer`,
+`tests/zer/container_field_handle_ok.zer` (the boundary: the shape the diagnostic recommends).
+
+**RESIDUAL, still open (LOW).** `container Ref(T) { *Pool(T, 4) p; }` — a POINTER to a pool
+parameterised by T — still reports *"undefined type 'T'"*, because `subst_typenode` skips the
+family in every position, not just by-value ones. Under a pointer there is no inline storage,
+so the emitter objection does not apply and substituting would be sound; it was left alone
+because the by-value case is what users hit and widening `subst_typenode` is the change its
+own comment warns against making casually. Pinned by a note in the boundary test.
+
+### (original entry)
 
 **Symptom.** `container C(T) { Pool(T,4) v; }` is rejected with `error: undefined type 'T'`.
 

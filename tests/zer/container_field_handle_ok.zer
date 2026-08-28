@@ -1,0 +1,25 @@
+// BUG-926 boundary: what the diagnostic tells the user to write must work —
+// the allocator as a global, a Handle(T) in the container. A POINTER to an
+// allocator carries no inline storage, so the check must not sweep it up
+// either. (`*Pool(T, 4)` — a pointer to a pool parameterised by T — is a
+// separate, still-open gap in subst_typenode; see docs/limitations.md.)
+i32 printf(const *u8 fmt, ...);
+
+struct It { u32 v; }
+Pool(It, 4) gp;
+
+container Box(T) { Handle(T) h; u32 n; }
+container Ref(T) { *Pool(It, 4) p; T item; }
+
+Box(It) gb;
+
+u32 main() {
+    gb.n = 7;
+    Ref(It) r;
+    r.p = &gp;
+    r.item.v = 3;
+    printf("%u %u\n", gb.n, r.item.v);
+    if (gb.n != 7) { return 1; }
+    if (r.item.v != 3) { return 2; }
+    return 0;
+}

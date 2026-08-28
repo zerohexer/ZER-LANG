@@ -1,0 +1,10 @@
+// expect-error: cannot be a field of container
+// BUG-926: `Pool(T, 4)` as a container field reported "undefined type 'T'",
+// blaming the type parameter for a restriction that has nothing to do with it —
+// Pool/Ring/Slab are left unsubstituted ON PURPOSE because the emitter cannot
+// stamp their inline storage per-T.
+struct It { u32 v; }
+container Box(T) { Pool(T, 4) slots; u32 n; }
+Box(It) gb;
+
+u32 main() { gb.n = 1; return gb.n - 1; }

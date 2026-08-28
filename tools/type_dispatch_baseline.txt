@@ -710,3 +710,12 @@ checker.c:else if (type->kind == TYPE_POINTER && !type->pointer.is_const)
 checker.c:if (eff && eff->kind == TYPE_SLICE && !eff->slice.is_volatile) {
 checker.c:if (type->kind == TYPE_SLICE && !type->slice.is_const)
 checker.c:} else if (eff && eff->kind == TYPE_POINTER && !eff->pointer.is_volatile) {
+
+# BUG-926 (2026-08-28) — tynode_has_inline_allocator, checker.c.
+# A SYNTACTIC question about the parse tree: "does this container FIELD spell a
+# Pool/Ring/Slab by value?". TypeNode is pre-resolution — there is no
+# TYPE_DISTINCT at this layer and nothing for type_dispatch_kind() to unwrap, so
+# the raw kind test is the only correct form. The switch below it enumerates
+# every TypeNodeKind with no `default:`, so a new kind fails the build there.
+checker.c:if (tn->kind == TYNODE_POOL || tn->kind == TYNODE_RING ||
+checker.c:tn->kind == TYNODE_SLAB) return true;

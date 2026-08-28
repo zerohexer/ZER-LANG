@@ -1,0 +1,10 @@
+// expect-error: cannot be a field of container
+// BUG-926, the other half: with a CONCRETE element there was no ZER diagnostic
+// at all — just a raw GCC error inside generated code ("field 'slots' has
+// incomplete type"), naming a .c file the user never opened. Same restriction,
+// so one check, and it rejects nothing that used to work.
+struct It { u32 v; }
+container Box(T) { Slab(It) slots; T item; }
+Box(It) gb;
+
+u32 main() { gb.item.v = 1; return gb.item.v - 1; }

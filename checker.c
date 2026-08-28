@@ -3942,6 +3942,48 @@ static int _comptime_diag_line = 0;
 /* Recursive TypeNode substitution: clone the TypeNode tree with type param T replaced.
  * Used by container monomorphization to handle arbitrarily nested T references:
  * ?*Container(T), *T, []T, T[N], etc. */
+/* BUG-926: does this field's TypeNode contain a Pool, Ring or Slab BY VALUE?
+ *
+ * None of the three can be a container field: the emitter cannot stamp their
+ * inline storage for a monomorphized container. That was reported two different
+ * confusing ways depending on the element type, and NEITHER named the rule:
+ *   - `Pool(T, 4) v;`  -> *"undefined type 'T'"*, because subst_typenode leaves
+ *     the family unsubstituted ON PURPOSE (see its comment), so the field ends
+ *     up naming an undefined `T` and the message blames the type parameter;
+ *   - `Pool(It, 4) v;` with a CONCRETE element -> no ZER diagnostic at all, and
+ *     a raw GCC error inside generated code: *"field 'slots' has incomplete
+ *     type"*, naming a `.c` file the user never opened.
+ *
+ * One check covers both, and rejects nothing that used to work — the concrete
+ * spelling already failed, just later and worse. A POINTER to one is fine (no
+ * inline storage), so only by-value positions are walked. */
+static bool tynode_has_inline_allocator(TypeNode *tn, int depth) {
+    if (!tn || depth > 16) return false;
+    if (tn->kind == TYNODE_POOL || tn->kind == TYNODE_RING ||
+        tn->kind == TYNODE_SLAB) return true;
+    switch (tn->kind) {
+    case TYNODE_ARRAY:    return tynode_has_inline_allocator(tn->array.elem, depth + 1);
+    case TYNODE_CONST: case TYNODE_VOLATILE:
+                          return tynode_has_inline_allocator(tn->qualified.inner, depth + 1);
+    /* Exhaustive, no `default:` (Stage 2 Part B): POINTER / OPTIONAL / SLICE put
+     * the allocator BEHIND an indirection, so the container's own storage does
+     * not contain it and the restriction does not apply. The rest are leaves or
+     * carry no allocator. POOL / RING / SLAB are answered above. A new
+     * TypeNodeKind fails the build here until it is classified. */
+    case TYNODE_POINTER: case TYNODE_OPTIONAL: case TYNODE_SLICE:
+    case TYNODE_NAMED: case TYNODE_FUNC_PTR: case TYNODE_CONTAINER:
+    case TYNODE_HANDLE: case TYNODE_ARENA: case TYNODE_BARRIER:
+    case TYNODE_SEMAPHORE:
+    case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
+    case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
+    case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
+    case TYNODE_VOID: case TYNODE_OPAQUE:
+    case TYNODE_POOL: case TYNODE_RING: case TYNODE_SLAB:
+        return false;
+    }
+    return false;   /* defensive — unreachable with all cases enumerated */
+}
+
 static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
                                  const char *param_name, uint32_t param_len,
                                  TypeNode *replacement) {
@@ -4010,11 +4052,11 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
     /* Pool/Ring/Slab DO carry an inner type (`.pool.elem` etc.) and are left
      * unsubstituted DELIBERATELY: the emitter cannot stamp their inline storage
      * for a monomorphized container, so substituting here would replace a clear
-     * type error with a broken emission. They therefore still report
-     * "undefined type 'T'" — accurate as far as it goes, though a dedicated
-     * "not supported as a container field" message would be kinder. Tracked in
-     * docs/limitations.md; do NOT add substitution here without the emitter
-     * work. Arena/Barrier/Semaphore carry no element type at all. */
+     * type error with a broken emission. Do NOT add substitution here without
+     * the emitter work. Since BUG-926 the stamper rejects such a field UP FRONT
+     * with a message that names the restriction (tynode_has_inline_allocator),
+     * so this case is no longer what the user sees.
+     * Arena/Barrier/Semaphore carry no element type at all. */
     case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
     case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
@@ -4516,6 +4558,25 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 /* Substitute type param T at any depth in the TypeNode tree.
                  * Recursive clone: replaces TYNODE_NAMED matching T with concrete type's TypeNode.
                  * Handles: T, *T, ?T, []T, T[N], ?*Container(T), etc. */
+                /* BUG-926: name the real restriction. Pool/Ring/Slab are left
+                 * UNSUBSTITUTED by subst_typenode on purpose — the emitter
+                 * cannot stamp their inline storage per-T, so substituting would
+                 * trade a type error for a broken emission (the comment there
+                 * records this). The consequence was that `container C(T) {
+                 * Pool(T,4) v; }` reported *"undefined type 'T'"*, blaming the
+                 * type parameter for a restriction that has nothing to do with
+                 * it — a user reads that as "my container is malformed" and has
+                 * no way to reach the real answer. Say what is actually wrong,
+                 * and what to write instead. The rejection itself is unchanged. */
+                if (tynode_has_inline_allocator(fd->type, 0)) {
+                    checker_error(c, tn->loc.line,
+                        "Pool/Ring/Slab cannot be a field of container '%.*s' "
+                        "(field '%.*s') — their storage is inline and the compiler "
+                        "cannot stamp a per-type layout for it. Declare the "
+                        "allocator as a global and keep a 'Handle(T)' in the "
+                        "container instead",
+                        (int)cnlen, cname, (int)fd->name_len, fd->name);
+                }
                 c->pending_edge_byvalue = tynode_keeps_storage_inline(fd->type, 0);
                 sf->type = resolve_type(c, subst_typenode(c->arena, fd->type,
                     tmpl->type_param, tmpl->type_param_len, tn->container.type_arg));

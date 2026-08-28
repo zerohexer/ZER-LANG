@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-28 — BUG-913..925: thirteen findings from a fresh audit (no branch to harvest)
+## Session 2026-08-28 — BUG-913..926: fourteen findings from a fresh audit (no branch to harvest)
 
 All nine `vigilant-tesla` branches are consumed, so this session had nothing to cherry-pick.
 Everything below was found by probing the compiler that is on main today. **Seven of the
@@ -308,6 +308,34 @@ once this session before the discrepancy with a hand probe gave it away.
 All ten grids now honour `ZER_MATRIX_ZERC`, the same affordance `tools/sink_matrix.sh` has
 always had as its first argument. Confirmed on the new cells: 4 false negatives with the
 override pointed at main, 0 without it.
+
+### BUG-926 — a container field of Pool/Ring/Slab blamed the type parameter, or nothing at all
+
+Found by re-measuring a documented OPEN entry rather than implementing from its description —
+the entry recorded one half of the problem and the half it missed was the worse one.
+
+None of Pool/Ring/Slab can be a container field: the emitter cannot stamp their inline
+storage for a monomorphized container. Two spellings, two different confusing failures,
+NEITHER naming the rule:
+
+| field | before |
+|---|---|
+| `Pool(T, 4) v;` | *"undefined type 'T'"* — `subst_typenode` leaves the family unsubstituted ON PURPOSE, so the field names an undefined `T` and the message blames the type parameter |
+| `Pool(It, 4) v;` — CONCRETE element | **no ZER diagnostic at all**; a raw GCC error inside generated code, *"field 'slots' has incomplete type"*, naming a `.c` file the user never opened |
+
+One predicate covers both and says what is actually wrong and what to write instead. It
+rejects nothing that used to work — the concrete spelling already failed, just later and
+worse — and a POINTER to an allocator carries no inline storage, so it is deliberately not
+swept up.
+
+Residual, recorded rather than fixed: `*Pool(T, 4)` (a pointer to a pool parameterised by T)
+still reports "undefined type 'T'". Under a pointer the emitter objection does not apply, so
+substituting there would be sound; it was left alone because widening `subst_typenode` is
+exactly what its own comment warns against doing casually, and the by-value case is what
+users hit.
+
+Tests: `tests/zer_fail/container_field_pool_{param,concrete}.zer`,
+`tests/zer/container_field_handle_ok.zer`.
 
 ### Measurements taken this session (record, so they are not re-run blind)
 

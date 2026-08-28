@@ -1700,11 +1700,14 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 - Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
 
 ### Test Locations Summary
-| Directory | What | Count | Runner |
+**COUNT FROM THE TREE, never from this column** — `ls <dir>/*.zer | wc -l`. The numbers below
+are a shape, not a census; they have been wrong by 2x before and they drift with every commit.
+
+| Directory | What | Count (2026-08-28) | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 566 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 680 | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 37 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 570 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 690 | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 41 | `tests/test_zer.sh` |
 | `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 23 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |

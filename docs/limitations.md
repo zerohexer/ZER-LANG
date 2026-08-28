@@ -86,8 +86,8 @@ repeated.
 
 ## Where main stands
 
-`make check` exit 0 — **1391 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT
-audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **CLEAN**
+`make check` exit 0 — **1415 .zer** (2026-08-28), modules 30/30, 200 fuzz, 139 convert, all ten
+matrices (hw-matrix 37/37), all NINE audit gates, sink matrix **CLEAN**
 (cell count is printed by the gate; 2026-08-28 added the p19 launder-at-the-UAF-sink block,
 verified non-vacuous — 5 mismatches on a pre-fix build, 0 after).
 

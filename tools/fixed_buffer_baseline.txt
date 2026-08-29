@@ -86,3 +86,12 @@ checker.c:    Node *fast[16];
 # IRHandleInfo, which is memcpy-copied per CFG block, so a pointer field would
 # be shared across path-state copies.
 zercheck_ir.c:    int view_alloc_ids[8];
+# BUG-917 (2026-08-29): the PATH-VISITED set of the global-initializer cycle
+# walk (`GInitChain`). Stack-first FAST PATH only — this is the sanctioned
+# Rule #7 shape, not a cap: `ginit_chain_push` switches to an arena-backed
+# array the moment the path exceeds 64 links, so nothing is ever dropped. The
+# walk is additionally bounded by GLOBAL_INIT_CHAIN_LIMIT (a chain longer than
+# that is REJECTED with its own diagnostic, never silently accepted), and it is
+# a depth-first PATH set with push/pop, so its live size is the chain depth,
+# not the number of const globals in the program.
+checker.c:    Symbol *inline_buf[64];

@@ -321,6 +321,88 @@ static const char *global_init_node_reason(Node *n, Type *type) {
     return NULL;
 }
 
+/* BUG-917: does this global initializer depend on itself through a chain of
+ * const globals? `const u32 A = A;` and `const u32 A = B; const u32 B = A;` both
+ * used to spin `resolve_const_ident` forever — the depth bound there stops the
+ * hang, this reports it in the user's terms.
+ *
+ * VISITED SET, not a depth bound. A first cut used depth > 32 and reported a
+ * legitimate 60-link chain (`c0 = c1; c1 = c2; … c60 = 7;`) as a CYCLE, which is
+ * a wrong diagnostic, not merely a strict one. The two conditions are genuinely
+ * different and the caller reports them differently: revisiting a symbol is a
+ * cycle; a chain longer than the substitution machinery can carry is "too deep".
+ *
+ * Stack-first per CLAUDE rule #7: 64 inline entries, arena on overflow.
+ * Descends the same expression kinds as `global_init_scan` so an ident buried in
+ * `A + 1` is found too. */
+#define GLOBAL_INIT_CHAIN_LIMIT 64
+
+typedef struct {
+    Symbol *inline_buf[64];
+    Symbol **seen;
+    int count;
+    int cap;
+    bool too_deep;     /* chain exceeded the limit — NOT a cycle */
+} GInitChain;
+
+static bool ginit_chain_push(Checker *c, GInitChain *st, Symbol *s) {
+    for (int i = 0; i < st->count; i++)
+        if (st->seen[i] == s) return false;          /* cycle */
+    if (st->count >= st->cap) {
+        int nc = st->cap * 2;
+        Symbol **nb = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return false;
+        memcpy(nb, st->seen, (size_t)st->count * sizeof(Symbol *));
+        st->seen = nb; st->cap = nc;
+    }
+    st->seen[st->count++] = s;
+    return true;
+}
+
+static bool global_init_ident_cycle_walk(Checker *c, Node *n, GInitChain *st) {
+    if (!n) return false;
+    if (n->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->global_scope,
+            n->ident.name, (uint32_t)n->ident.name_len);
+        if (!s || !s->is_const || s->is_function || !s->func_node) return false;
+        if (s->func_node->kind != NODE_VAR_DECL &&
+            s->func_node->kind != NODE_GLOBAL_VAR) return false;
+        if (!ginit_chain_push(c, st, s)) return true;          /* revisit = cycle */
+        if (st->count > GLOBAL_INIT_CHAIN_LIMIT) { st->too_deep = true; return false; }
+        bool r = global_init_ident_cycle_walk(c, s->func_node->var_decl.init, st);
+        st->count--;                                            /* pop */
+        return r;
+    }
+    #define GIC(x) do { if (global_init_ident_cycle_walk(c, (x), st)) return true; } while (0)
+    if (n->kind == NODE_BINARY) { GIC(n->binary.left); GIC(n->binary.right); }
+    else if (n->kind == NODE_UNARY) { GIC(n->unary.operand); }
+    else if (n->kind == NODE_TYPECAST) { GIC(n->typecast.expr); }
+    else if (n->kind == NODE_ORELSE) { GIC(n->orelse.expr); GIC(n->orelse.fallback); }
+    else if (n->kind == NODE_INDEX) { GIC(n->index_expr.object); GIC(n->index_expr.index); }
+    else if (n->kind == NODE_SLICE) { GIC(n->slice.object); GIC(n->slice.start); GIC(n->slice.end); }
+    else if (n->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < n->intrinsic.arg_count; i++) GIC(n->intrinsic.args[i]);
+    } else if (n->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            GIC(n->struct_init.fields[i].value);
+    }
+    /* NODE_FIELD is deliberately NOT descended: `State.idle` is an enum constant
+     * whose "object" is a TYPE name, not a value that can close a cycle. */
+    #undef GIC
+    return false;
+}
+
+/* Returns 1 = cyclic, 2 = chain too deep to substitute, 0 = fine. */
+static int global_init_chain_verdict(Checker *c, Node *n) {
+    GInitChain st;
+    st.seen = st.inline_buf;
+    st.count = 0;
+    st.cap = (int)(sizeof(st.inline_buf) / sizeof(st.inline_buf[0]));
+    st.too_deep = false;
+    if (global_init_ident_cycle_walk(c, n, &st)) return 1;
+    return st.too_deep ? 2 : 0;
+}
+
 /* Walk the whole initializer tree; report the FIRST offending node. `*bad` is
  * set to that node so the caller can name the construct. */
 static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) {
@@ -3465,6 +3547,38 @@ static bool inttoptr_addr_is_volatile_derived(Checker *c, Node *addr) {
     return false;
 }
 
+/* BUG-918: the ONE query for "what constant address does this `@inttoptr`
+ * address argument designate?".
+ *
+ * MULTI-SITE CLASS (CLAUDE.md's #1 recurring shape). This question was
+ * answered independently at FOUR sites — the `@inttoptr` range/alignment gate,
+ * the direct `@inttoptr(...)[N]` index-bound derivation, the local var-decl
+ * `mmio_bound` derivation, and the global var-decl one — and every one of them
+ * called plain `eval_const_expr`, which folds LITERALS but not a `const`
+ * identifier. Real firmware never writes the literal:
+ *
+ *     const u32 UART = 0x4000_0000;
+ *     volatile *u32 r = @inttoptr(*u32, UART);   // <- fold failed here
+ *
+ * so `mmio_bound` stayed 0 and `r[i]` was REJECTED outright ("no compile-time
+ * MMIO bound is known for this pointer") even though the address is perfectly
+ * constant — a payable over-rejection on the single most common bare-metal
+ * shape. At the `@inttoptr` gate itself the same fold failure DEFERRED the
+ * range and alignment errors to a runtime trap, i.e. to first boot.
+ *
+ * `eval_const_expr_scoped` resolves an identifier only when the symbol is
+ * `is_const` and carries its own initializer (`resolve_const_ident`), and that
+ * initializer is itself required to be a compile-time constant (BUG-916), so
+ * substituting it is sound; BUG-917's `_const_ident_depth` bounds the walk.
+ * Using it here strictly TIGHTENS the two error gates (more addresses become
+ * compile-time known) and strictly RELAXES the two bound derivations (a bound
+ * is derived where none was). Route every new MMIO const-address site through
+ * this function — do not re-inline `eval_const_expr`. */
+static int64_t mmio_const_addr(Checker *c, Node *addr_arg) {
+    if (!addr_arg) return CONST_EVAL_FAIL;
+    return eval_const_expr_scoped(c, addr_arg);
+}
+
 /* Check if a cast/intrinsic strips volatile from source pointer.
  * Returns true if violation detected (error emitted). */
 /* BUG-877: does this intrinsic argument name memory the intrinsic will WRITE,
@@ -5315,6 +5429,28 @@ ct_done:
  * Looks up const symbols via scope chain, recursively evaluates init value.
  * BUG-430: enables const u32 perms = ...; comptime if (FUNC(perms)) pattern.
  * Uses eval_const_expr_ex with itself as callback — zero code duplication. */
+/* BUG-917: this callback hands `eval_const_expr_ex` a fresh depth of 0 on every
+ * identifier hop, so the evaluator's own depth bound could never see the chain.
+ * A cyclic const definition therefore recursed until the stack ran out:
+ *
+ *     const u32 A = A;                  // hangs the compiler
+ *     const u32 A = B;  const u32 B = A;  // hangs the compiler
+ *
+ * No diagnostic, no exit — `zerc` simply never returns, on two lines of source.
+ * The counter is a file-static because this evaluator is reached from several
+ * unrelated sites (global initializers, array sizes, `comptime if`, asm operand
+ * constraints) and threading a parameter through all of them would change four
+ * signatures to fix one loop; CLAUDE.md's "static globals are safe — the LSP is
+ * single-threaded" note covers the same shape for `_comptime_call_depth` and
+ * `_scan_global_depth`. Save/restore rather than a bare increment so an early
+ * CONST_EVAL_FAIL return cannot leak depth into the next evaluation.
+ *
+ * Bounding it makes a cycle evaluate to CONST_EVAL_FAIL; the SOURCE-level
+ * diagnostic for a cyclic global initializer is separate (see
+ * `global_init_ident_cycle`), because "not foldable" is the wrong thing to tell
+ * a user who wrote a definition that refers to itself. */
+static int _const_ident_depth = 0;
+
 static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_len) {
     Checker *c = (Checker *)ctx;
     Symbol *sym = scope_lookup(c->current_scope, name, name_len);
@@ -5323,7 +5459,14 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
         Node *init = (sym->func_node->kind == NODE_VAR_DECL ||
                       sym->func_node->kind == NODE_GLOBAL_VAR)
                      ? sym->func_node->var_decl.init : NULL;
-        if (init) return eval_const_expr_ex(init, 0, resolve_const_ident, ctx);
+        if (init) {
+            if (_const_ident_depth >= GLOBAL_INIT_CHAIN_LIMIT) return CONST_EVAL_FAIL;
+            int saved = _const_ident_depth;
+            _const_ident_depth++;
+            int64_t r = eval_const_expr_ex(init, 0, resolve_const_ident, ctx);
+            _const_ident_depth = saved;
+            return r;
+        }
     }
     return CONST_EVAL_FAIL;
 }
@@ -9836,7 +9979,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->index_expr.object->intrinsic.name_len == 8 &&
                 memcmp(node->index_expr.object->intrinsic.name, "inttoptr", 8) == 0 &&
                 node->index_expr.object->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(node->index_expr.object->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, node->index_expr.object->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -11086,7 +11229,7 @@ static Type *check_expr(Checker *c, Node *node) {
                      * --no-strict-mmio, a misaligned MMIO address is SIGBUS
                      * on ARM/RISC-V or silent corruption on Cortex-M0+. */
                     if (node->intrinsic.arg_count > 0) {
-                        int64_t cval = eval_const_expr(node->intrinsic.args[0]);
+                        int64_t cval = mmio_const_addr(c, node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
                         /* plt86m audit 2026-06-17: the range gate must account
@@ -14628,7 +14771,7 @@ static void check_stmt(Checker *c, Node *node) {
                 init_expr->intrinsic.name_len == 8 &&
                 memcmp(init_expr->intrinsic.name, "inttoptr", 8) == 0 &&
                 init_expr->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(init_expr->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, init_expr->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -18827,7 +18970,7 @@ static void register_decl(Checker *c, Node *node) {
                 if (gi->kind == NODE_INTRINSIC && gi->intrinsic.name_len == 8 &&
                     memcmp(gi->intrinsic.name, "inttoptr", 8) == 0 &&
                     gi->intrinsic.arg_count > 0) {
-                    int64_t addr = eval_const_expr(gi->intrinsic.args[0]);
+                    int64_t addr = mmio_const_addr(c, gi->intrinsic.args[0]);
                     if (addr != CONST_EVAL_FAIL) {
                         for (int ri = 0; ri < c->mmio_range_count; ri++) {
                             if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -22161,6 +22304,56 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             (int)decl->var_decl.name_len, decl->var_decl.name,
                             (int)bad->intrinsic.name_len, bad->intrinsic.name, reason);
                     }
+                }
+            }
+            /* BUG-916: a global initializer that NAMES a mutable global is not a
+             * compile-time constant, and C refuses it at file scope:
+             *
+             *     u32 SRC = 5;
+             *     u32 B = SRC;   // GCC: "initializer element is not constant"
+             *
+             * The `const` case is handled instead of banned — the emitter
+             * substitutes the referenced global's own initializer (see
+             * emit_expr's NODE_IDENT arm), which is what BUG-911 decided is the
+             * right answer for a value ZER considers constant. A MUTABLE global
+             * is genuinely not one, so it is rejected here, at the ZER line,
+             * rather than by GCC in a generated file.
+             *
+             * Function names (a funcptr global) and enum variants (NODE_FIELD)
+             * are unaffected. */
+            /* BUG-917: a cyclic const definition. `resolve_const_ident`'s depth
+             * bound now stops the HANG, but "cannot fold" is the wrong thing to
+             * say about a definition that refers to itself. Say what it is. */
+            {
+                int gv_verdict = global_init_chain_verdict(c, ginit);
+                if (gv_verdict == 1) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' has a cyclic initializer — it depends "
+                        "on itself through a chain of const globals",
+                        (int)decl->var_decl.name_len, decl->var_decl.name);
+                } else if (gv_verdict == 2) {
+                    /* Not a cycle — a chain longer than the substitution can
+                     * carry. Reported rather than left to GCC, which would say
+                     * "initializer element is not constant" about generated C. */
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' initializer chains through more than "
+                        "%d const globals — collapse the chain",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        GLOBAL_INIT_CHAIN_LIMIT);
+                }
+            }
+            if (ginit->kind == NODE_IDENT) {
+                Symbol *gsrc = scope_lookup(c->global_scope,
+                    ginit->ident.name, (uint32_t)ginit->ident.name_len);
+                if (gsrc && !gsrc->is_function && !gsrc->is_const) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' cannot be initialized from '%.*s' — "
+                        "a global initializer must be a compile-time constant and "
+                        "'%.*s' is mutable. Declare it 'const', or assign in an "
+                        "init function",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)ginit->ident.name_len, ginit->ident.name,
+                        (int)ginit->ident.name_len, ginit->ident.name);
                 }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */

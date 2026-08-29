@@ -1,0 +1,34 @@
+// BUG-918: a named `const` MMIO base address must derive the same compile-time
+// bound as an inline literal. Real firmware ALWAYS names its base addresses, so
+// before this fix the whole shape below was REJECTED ("no compile-time MMIO
+// bound is known for this pointer") even though the address is fully constant.
+// Covers all three derivation sites: local var-decl, direct-@inttoptr index,
+// and a const chained through a second const (BASE -> UART).
+//
+// The accesses sit in a DEAD BRANCH (CLAUDE.md's dead-branch pattern): on a
+// hosted x86-64 host 0x40000000 is unmapped, so the point of this test is that
+// the CHECKER accepts it — the address must never actually be touched.
+mmio 0x4000_0000..0x4000_001F;   // 8 u32 words
+
+const u32 BASE = 0x40000000;
+const u32 UART = BASE;           // chained const — folds through resolve_const_ident
+
+u32 main() {
+    volatile u32 never_true = 0;
+    if (never_true == 42) {
+        volatile *u32 r = @inttoptr(*u32, UART);
+        r[0] = 1;
+        r[7] = 2;                                // last in-range word
+        if (r[7] != 2) { return 1; }
+
+        // direct-@inttoptr index form (no intermediate variable)
+        @inttoptr(*u32, BASE)[3] = 9;
+        if (@inttoptr(*u32, BASE)[3] != 9) { return 2; }
+
+        // const arithmetic in the address
+        volatile *u32 q = @inttoptr(*u32, BASE + 16);
+        q[0] = 4;
+        if (q[0] != 4) { return 3; }
+    }
+    return 0;
+}

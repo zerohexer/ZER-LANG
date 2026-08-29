@@ -1,0 +1,12 @@
+// expect-error: MMIO index 9 is out of range
+// MASKED on the pre-fix compiler by the "cannot index volatile" over-rejection —
+// the `expect-error` directive is what makes this test discriminate: pre-fix the
+// diagnostic is the WRONG one (a refusal to analyse), post-fix it names the index.
+// BUG-918: with a named `const` base, the MMIO index bound must still be
+// derived — the literal form was already caught, this shape was not.
+mmio 0x4000_0000..0x4000_000F;   // 4 u32 words
+const u32 UART = 0x40000000;
+u32 main() {
+    volatile *u32 r = @inttoptr(*u32, UART);
+    return r[9];
+}

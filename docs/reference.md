@@ -134,6 +134,7 @@ bool done = false;
 ```
 
 **EXAMPLE**
+<!-- audit: expect-error: cannot initialize 'x' of type 'u32' with 'bool' -->
 ```zer
 bool flag = true;
 if (flag) { go(); }      // OK
@@ -319,6 +320,7 @@ void set_priority(*Task t, u32 p) {
 ```
 
 **ERRORS**
+<!-- audit: expect-error: non-null pointer '*Task' requires an initializer -->
 ```zer
 *Task t;                   // COMPILE ERROR — non-null pointer requires initializer
                            // use ?*Task for nullable
@@ -920,10 +922,47 @@ C file-scope initializer. This is checked in ZER terms, at the ZER line, over th
 const u32 BASE = 0x10;
 
 u32 A = 5;                       // literal
-u32 B = BASE;                    // ERROR — a const is a C `const` var, not a constant
+u32 B = BASE;                    // a const global — folded to its own initializer
 u32 C = @truncate(u32, 300);     // native-width @truncate folds
 u32 D = @popcount(0xF0);         // bit query with a constant argument
 usize E = @size(u32) * 4;        // @size arithmetic
+```
+
+Naming a **const** global is fine at any type — the compiler substitutes that global's
+own initializer, which already had to be a valid global initializer for ITS declaration:
+
+```zer
+const i32   NEG    = -5;
+const f32   SCALE  = 1.5;
+const bool  FLAG   = true;
+const usize WORDS  = @size(u32) * 4;
+const [*]u8 BANNER = "boot ok";
+
+i32   g_neg    = NEG;
+f32   g_scale  = SCALE + 1.0;    // the name may sit anywhere in the expression
+bool  g_flag   = FLAG;
+usize g_words  = WORDS;
+const [*]u8 g_banner = BANNER;
+
+u32 main() {
+    if (!g_flag) { return 1; }
+    if (g_neg != -5) { return 2; }
+    if (g_scale != 2.5) { return 3; }
+    if (g_words != 16) { return 4; }
+    if (g_banner.len != 7) { return 5; }
+    return 0;
+}
+```
+
+Naming a **mutable** global is not, and neither is a definition that refers to itself:
+
+<!-- audit: skip -->
+```zer
+u32 SRC = 5;
+u32 B = SRC;                     // ERROR — 'SRC' is mutable, not a constant
+
+const u32 X = Y;
+const u32 Y = X;                 // ERROR — cyclic initializer
 ```
 
 **NOTES**
@@ -986,6 +1025,7 @@ if (a) {
 ```
 
 **ERRORS**
+<!-- audit: expect-error: expected '{' at 'return' -->
 ```zer
 if (x > 5) return 1;      // COMPILE ERROR — braces required
 ```
@@ -1006,6 +1046,7 @@ for (u32 i = 0; i < 10; i += 1) {
 ```
 
 **ERRORS**
+<!-- audit: expect-error: expected expression at '+' -->
 ```zer
 for (u32 i = 0; i < 10; i++) { }   // COMPILE ERROR — no ++
 ```
@@ -1117,6 +1158,7 @@ Handle leaks are **compile errors** — allocating without `defer free()` (or re
 
 `defer` inside another `defer` body is also **banned** — the inner defer would run at the outer defer's execution time (scope exit), which is confusing and rarely what the programmer intends.
 
+<!-- audit: expect-error: 'defer' cannot be nested inside another 'defer' body -->
 ```zer
 defer {
     defer { cleanup(); }   // COMPILE ERROR — 'defer' cannot be nested
@@ -1298,6 +1340,7 @@ u32 val = get_value() orelse {            // block fallback
 ```
 
 **ERRORS**
+<!-- audit: expect-error: expected ';' after variable declaration at '1' -->
 ```zer
 u32 val = get_value() orelse return 1;    // PARSE ERROR — orelse return is bare
 ```
@@ -1912,6 +1955,7 @@ u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
   argument — it does not produce a compile-time-constant value at file scope.
   Use a literal, or compute it inside a function body. The same restriction
   applies to `@addc`, `@subb` and `@mulw`.
+<!-- audit: expect-error: initializer cannot use @saturate -->
 ```zer
 u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
 u32 main() {
@@ -1980,6 +2024,24 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   still emitted for variable addresses (alignment is a property of the
   target pointer type, not of mmio declarations), and constant
   addresses are alignment-checked at compile time regardless.
+- "Constant address" means any COMPILE-TIME CONSTANT, not just a literal — a
+  named `const`, a `const` defined from another `const`, and arithmetic over
+  them are all folded and checked at compile time. Only an address the compiler
+  cannot fold (a runtime value, or a MUTABLE global) falls back to the runtime
+  range + alignment trap:
+
+<!-- audit: expect-error: is not aligned to 4 bytes -->
+```zer
+mmio 0x40020000..0x40020FFF;
+const u32 BASE = 0x40020000;
+
+u32 folds() {
+    volatile *u32 ok  = @inttoptr(*u32, BASE + 0x14);    // OK — 0x40020014
+    volatile *u32 bad = @inttoptr(*u32, BASE + 0x2);     // COMPILE ERROR — misaligned for u32
+    volatile *u32 out = @inttoptr(*u32, BASE + 0x5000);  // COMPILE ERROR — outside the declared range
+    return 0;
+}
+```
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
 
 **SEE ALSO**
@@ -2037,6 +2099,7 @@ Cast pointer to a different pointer type. Provenance-tracked: the compiler
 remembers what type went in through `*opaque` round-trips.
 
 **EXAMPLE**
+<!-- audit: expect-error: @ptrcast type mismatch: source has provenance -->
 ```zer
 *opaque ctx = @ptrcast(*opaque, &sensor);  // provenance = *Sensor
 *Sensor s = @ptrcast(*Sensor, ctx);        // OK — matches
@@ -3282,6 +3345,7 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   a declared range. A parameter, alias or struct field carries no bound, so
   indexing one is a compile error rather than an unguarded access:
 
+<!-- audit: expect-error: no compile-time MMIO bound is known for this pointer -->
 ```zer
 mmio 0x40020000..0x40020FFF;
 
@@ -3294,6 +3358,27 @@ u32 bad(volatile *u32 reg, u32 i) {
     return reg[i];                        // COMPILE ERROR — no bound for a param
 }
 ```
+
+- "`<const addr>`" means any COMPILE-TIME CONSTANT, not just a literal. A named
+  `const`, a `const` defined from another `const`, and arithmetic over them all
+  fold, so the idiomatic firmware spelling derives a bound exactly like the
+  literal does:
+
+```zer
+mmio 0x40020000..0x4002001F;              // 8 u32 words
+
+const u32 PERIPH = 0x40020000;
+const u32 UART   = PERIPH;                // chained const — folds
+
+u32 named() {
+    volatile *u32 r = @inttoptr(*u32, UART);
+    return r[7];                          // OK — last in-range word
+}
+```
+
+  A `const` is required. A plain (mutable) global or a local variable does not
+  fold, so a pointer built from one carries no bound and indexing it is the
+  compile error above.
 
 ---
 
@@ -3745,17 +3830,27 @@ a.val = 10; b.val = 20; a.next = &b;
 ```
   `*LNode(T)`, `?*LNode(T)` and `[*]LNode(T)` self-fields are all fine.
 - BY-VALUE self-reference is a compile error — it would be an infinite-size
-  struct. Use a pointer field instead:
+  struct. Use a pointer field instead. The error is reported at the
+  INSTANTIATION, not at the template: a `container` is a stamp, and nothing is
+  laid out until a concrete type is stamped from it, so a template that is
+  declared and never used is accepted:
+<!-- audit: expect-error: cannot contain itself by value in field 'child' -->
 ```zer
-container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR
-container BNode(T) { T val; ?*BNode(T) child; } // OK
+container BNode(T) { T val; BNode(T) child; }
+BNode(u32) b;                                   // COMPILE ERROR — infinite size
+```
+```zer
+container BOk(T) { T val; ?*BOk(T) child; }     // OK — pointer field
+BOk(u32) ok_node;
 ```
 - A by-value CYCLE through several containers is the same error, at any cycle
-  length. Only the direct case used to be caught, and the two-container form
-  crashed the compiler (BUG-864):
+  length, and likewise reported at the instantiation. Only the direct case used
+  to be caught, and the two-container form crashed the compiler (BUG-864):
+<!-- audit: expect-error: closes a containment cycle -->
 ```zer
-container A(T) { B(T) x; }    // COMPILE ERROR — closes a containment cycle
+container A(T) { B(T) x; }
 container B(T) { A(T) y; }
+A(u32) cyc;                   // COMPILE ERROR — closes a containment cycle
 ```
   Make any one link a pointer and the cycle is finite and legal:
 ```zer
@@ -4354,6 +4449,7 @@ make sense inside async functions. Using them in a regular function
 emits nothing useful (no state machine exists), so the compiler rejects
 at the use site rather than silently stripping.
 
+<!-- audit: expect-error: 'yield' only allowed inside async function -->
 ```zer
 void regular() {
     yield;   // COMPILE ERROR — 'yield' only allowed inside async function

@@ -1,0 +1,12 @@
+// expect-error: is not aligned to 4 bytes
+// BUG-918: alignment is checked whenever the address is a compile-time
+// constant. Through const ARITHMETIC (BASE + OFF) it previously was not, so a
+// misaligned peripheral access reached the target (SIGBUS on ARM/RISC-V,
+// silent corruption on Cortex-M0+).
+mmio 0x4000_0000..0x4000_0FFF;
+const u32 BASE = 0x40000000;
+const u32 OFF  = 0x2;
+u32 main() {
+    volatile *u32 r = @inttoptr(*u32, BASE + OFF);
+    return 0;
+}

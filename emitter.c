@@ -1620,6 +1620,41 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_IDENT: {
+        /* BUG-916: inside a GLOBAL initializer a name is not a C constant
+         * expression. BUG-911 folds the common case — but only for an INTEGER
+         * target, only a NON-NEGATIVE result, and only through
+         * `eval_const_expr_scoped`, which does not fold intrinsics. Everything
+         * outside that window emitted the NAME and GCC refused it, with no ZER
+         * diagnostic and a line number in a .c file the user never opened —
+         * exactly the failure BUG-911's own comment says is unacceptable:
+         *
+         *     const i32 K = -5;      i32 G = K;              // negative
+         *     const f32 K = 1.5;     f32 G = K + 1.0;        // float target
+         *     const bool K = true;   bool G = K;             // bool target
+         *     const usize B = @size(u32) * 4;  usize C = B;  // intrinsic init
+         *     const [*]u8 A = "hi";  const [*]u8 B = A;      // slice target
+         *
+         * Substituting the referenced global's OWN initializer is correct by
+         * construction and needs no evaluator: that expression already passed
+         * the global-initializer rules for ITS declaration, so it is emittable
+         * at file scope, whatever its type. It also composes — the ident may sit
+         * anywhere in the expression, so `K + 1.0` works without a float folder.
+         *
+         * Restricted to a `const` global. A MUTABLE one is genuinely not a
+         * compile-time constant and is rejected in the checker instead. */
+        if (e->global_init_depth > 0 && e->global_init_depth < 64) {
+            Symbol *gs = scope_lookup(e->checker->global_scope,
+                node->ident.name, (uint32_t)node->ident.name_len);
+            if (gs && gs->is_const && !gs->is_function && gs->func_node &&
+                gs->func_node->kind == NODE_GLOBAL_VAR &&
+                gs->func_node->var_decl.init &&
+                gs->func_node->var_decl.init != node) {
+                e->global_init_depth++;
+                emit_expr(e, gs->func_node->var_decl.init);
+                e->global_init_depth--;
+                break;
+            }
+        }
         /* Async local promotion: emit self->name for promoted locals */
         if (is_async_local(e, node->ident.name, node->ident.name_len)) {
             emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
@@ -4923,7 +4958,12 @@ static void emit_global_var(Emitter *e, Node *node) {
             }
             if (!emitted_const) {
                 emit(e, " = ");
+                /* BUG-916: mark the global-initializer context so a NODE_IDENT
+                 * naming a const global is replaced by that global's own
+                 * initializer rather than emitted as a name (invalid C). */
+                e->global_init_depth++;
                 emit_expr(e, node->var_decl.init);
+                e->global_init_depth--;
             }
         }
     } else {

@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-29 — BUG-913..915: a gate exemption, and the three bugs it was hiding
+## Session 2026-08-29 — BUG-913..919: a gate exemption, the three bugs it was hiding, two the docs pointed at, the MMIO address spelling nobody could fold, and a gate that was checking nothing
 
 A full-codebase audit that started from the GATES rather than from the code. The finding
 that organises this session is that **`tools/walker_default_audit.sh` had an exemption
@@ -167,6 +167,194 @@ The trap sentence changed from `"%s produced a value that is not a declared vari
 `"%s: value is not a declared variant of this enum"`, because the new caller does not
 *produce* a value. `docs/reference.md` is updated for the new wording and for both new
 routes.
+
+### How BUG-916/917 were found: by MEASURING a doc claim, not by reading code
+
+`tools/audit_reference_examples.sh` SKIPS any ```zer block containing the words
+"COMPILE ERROR" / "PARSE ERROR" / "// ERROR" — 36 blocks that are neither compiled nor
+asserted to fail. Running them by hand asked the question the gate does not: *does the
+compiler actually reject what the reference says it rejects?*
+
+One block disagreed. `reference.md` said `u32 B = BASE;` (a const global) was an ERROR;
+the compiler ACCEPTS it and folds it, which is right. Chasing why the doc was wrong
+uncovered the two bugs below — the doc had been describing a rule that half-exists.
+
+That the 36 blocks are unchecked in either direction is recorded in docs/limitations.md;
+the honest oracle for them is not "must fail" (a fragment fails for the wrong reason) but
+an `expect-error`-style substring, which is a separate piece of work.
+
+### BUG-916 — six shapes of global initializer produced INVALID C, with no ZER diagnostic
+
+```zer
+const i32 K = -5;   i32 G = K;      // GCC: "initializer element is not constant"
+```
+`reference.md` states the rule as *"A global's initializer must be a compile-time constant
+... checked in ZER terms, at the ZER line"*. It was not: `emit_expr` emitted the NAME, and
+the failure landed on GCC pointing at a generated `.c` the user never opened — the exact
+failure BUG-911's own comment calls unacceptable.
+
+BUG-911 added a fold for this, but through three narrow gates: **integer** target,
+**non-negative** result, and `eval_const_expr_scoped`, which by design does not fold
+intrinsics. Everything outside that window still emitted the name:
+
+| shape | why the BUG-911 fold missed it |
+|---|---|
+| `const i32 K = -5; i32 G = K;` | the fold is gated `gv >= 0` |
+| `const f32 K = 1.5; f32 G = K;` | float target — `type_is_integer` false |
+| `const f32 K = 1.5; f32 G = K + 1.0;` | same, and the ident is nested |
+| `const bool K = true; bool G = K;` | bool target |
+| `const usize W = @size(u32)*4; usize B = W;` | the source's init is an intrinsic |
+| `const [*]u8 A = "hi"; const [*]u8 B = A;` | slice target |
+
+**Fix — substitution, not evaluation.** In a global-initializer context a `NODE_IDENT`
+naming a **const** global emits that global's OWN initializer instead of its name. That
+needs no evaluator and works at every type: the substituted expression already passed the
+global-initializer rules for ITS declaration, so it is emittable at file scope by
+construction. It also composes — the name may sit anywhere in the expression, so
+`SCALE + 1.0` works with no float folder. Depth-bounded (8) inside the emitter.
+
+A **mutable** global genuinely is not a compile-time constant, so `u32 SRC = 5; u32 B =
+SRC;` is now a ZER error at the ZER line instead of a GCC error in generated C. Function
+names (a funcptr global) and enum variants are unaffected — verified.
+
+Tests: `tests/zer/global_init_const_fold_ok.zer` (all six shapes, run and value-checked;
+the pre-fix compiler fails it with "initializer element is not constant") +
+`tests/zer_fail/global_init_from_mutable.zer`.
+
+### BUG-917 — a two-line program HUNG the compiler
+
+```zer
+const u32 A = A;
+u32 main() { return A; }
+```
+`zerc` never returns. The two-node form `const u32 A = B; const u32 B = A;` hangs too, and
+its arithmetic variant `const u32 A = B + 1; const u32 B = A + 1;` SEGFAULTS the pre-fix
+compiler outright (stack exhaustion).
+
+**Root cause.** `resolve_const_ident` — the identifier callback the constant evaluator uses
+— calls `eval_const_expr_ex(init, 0, resolve_const_ident, ctx)`. It passes depth **0** on
+every identifier hop, so the evaluator's own depth bound could never observe the chain. The
+recursion is unbounded by construction, not by accident of input size.
+
+Reached from four unrelated sites (global initializers, array sizes, `comptime if`, asm
+operand constraints); a file-static depth counter bounds it once rather than changing four
+signatures — the same shape CLAUDE.md already blesses for `_comptime_call_depth` and
+`_scan_global_depth`. Save/restore, not a bare increment, so an early `CONST_EVAL_FAIL`
+cannot leak depth into the next evaluation.
+
+Bounding it alone would report "cannot fold", which is the wrong thing to tell someone who
+wrote a definition that refers to itself, so `global_init_chain_verdict` reports the cycle in
+the user's terms. It descends expressions (the arithmetic form) and deliberately does not
+descend `NODE_FIELD` — `State.idle`'s "object" is a type name, not a value that can close a
+cycle.
+
+**The first cut of that detector was itself wrong, and the way it was wrong is worth
+keeping.** It called any chain deeper than 32 links CYCLIC. That is a *wrong diagnostic*, not
+a conservative one: a legitimate 60-link `const` chain was reported as "depends on itself",
+sending the reader looking for a cycle that does not exist. Depth is not evidence of a cycle.
+The shipped version is a PATH-VISITED set (`GInitChain`, `ginit_chain_push`,
+`global_init_ident_cycle_walk`) that pushes on the way in and **pops on the way out**, so a
+repeated symbol is only a cycle when it repeats *on the current path*; a DIAMOND
+(`DL = DR; DM = DR; DT = DL + DM`) legitimately visits `DR` twice and must compile. Depth is
+reported SEPARATELY, in its own words ("chains through more than 64 const globals"). Two
+distinct facts, two distinct messages — collapsing them is what made the first cut lie.
+
+Tests: `tests/zer_fail/global_init_cycle_{self,mutual}.zer` — the first HANGS the pre-fix
+compiler, the second SEGFAULTS it; `tests/zer_fail/global_init_chain_too_deep.zer` (70 links)
+for the depth verdict; and the diamond case in `tests/zer/global_init_const_fold_ok.zer`,
+which is the regression that would catch a naive global visited set.
+
+---
+
+### BUG-918 — every real firmware writes its MMIO base as a named `const`, and that was the one spelling the compiler could not fold
+
+```zer
+mmio 0x4000_0000..0x4000_000F;   // 4 u32 words
+const u32 UART = 0x40000000;
+volatile *u32 r = @inttoptr(*u32, UART);
+u32 v = r[9];        // word 9 — outside the declared window
+```
+Pre-fix this was **rejected, for the wrong reason**: *"cannot index volatile `*u32` — no
+compile-time MMIO bound is known for this pointer… A bound is derived only for a pointer
+obtained directly from `@inttoptr(*u32, <const addr>)`"* — which is exactly what the user
+wrote. Swap `UART` for the literal `0x40000000` and the same program compiles and the OOB
+index is caught precisely. The named-const spelling — the only one real firmware uses — got
+neither the bound nor the diagnostic.
+
+Two consequences, in opposite directions:
+
+- **Over-rejection.** `r[i]` was refused outright for every named-const peripheral. The
+  workaround was to paste the literal at each use site, which is worse code.
+- **A diagnostic deferred to first boot.** At the `@inttoptr` gate itself the same fold
+  failure meant a named-const address that is *outside* the declared range, or misaligned for
+  its target type, produced NO compile error — only a runtime `_zer_trap`. On a hosted host
+  that is a clean abort; on the target it is a fault at boot, found by whoever is holding the
+  board rather than by the compiler.
+
+**Root cause — the multi-site shape, again.** "What constant address does this `@inttoptr`
+designate?" was answered independently at FOUR sites (the range/alignment gate; the direct
+`@inttoptr(...)[N]` bound; the local var-decl `mmio_bound`; the global var-decl one), and all
+four called plain `eval_const_expr`, which folds literals and stops at an identifier. The
+scoped evaluator that resolves a `const` symbol through its own initializer
+(`eval_const_expr_scoped` → `resolve_const_ident`) already existed and was already used
+elsewhere in the same file.
+
+Fixed as ONE query — `mmio_const_addr(Checker*, Node*)` — with all four sites routed through
+it, so a fifth site cannot repeat the divergence. Soundness: `resolve_const_ident` resolves
+an identifier only when the symbol is `is_const` and carries its own initializer, and that
+initializer is now required to be a compile-time constant (BUG-916), so the substituted value
+is exactly the value the emitted C will hold; BUG-917's depth counter bounds the walk. The
+change strictly TIGHTENS the two error gates and strictly RELAXES the two bound derivations —
+a fold that still fails degrades to the old behaviour.
+
+Tests: `tests/zer/mmio_const_ident_base.zer` (the recovered acceptance — chained const,
+const arithmetic, and the direct-`@inttoptr` index form, all in a dead branch since a hosted
+host cannot touch 0x40000000) and `tests/zer_fail/mmio_const_ident_{oob_index,oob_addr,
+misaligned}.zer`. The last two are accepted outright by the pre-fix compiler; the first is
+MASKED there by the over-rejection above, so its `// expect-error:` directive is what makes
+it discriminate — pre-fix it fails for the wrong reason, which the exit code alone would have
+called a pass.
+
+---
+
+### BUG-919 — two documented "COMPILE ERROR" examples compiled clean, found by closing a gate that was checking nothing
+
+`tools/audit_reference_examples.sh` SKIPPED any ```zer block illustrating a rejection —
+right as far as it went (compiling one fails by design) but it left 49 blocks checked in
+NEITHER direction, so `reference.md` could keep asserting a rejection the compiler no longer
+performs. The gate gained an opt-in `<!-- audit: expect-error: <substring> -->` directive:
+the block is compiled through the same prelude/wrap pipeline and must be REJECTED with a
+diagnostic containing that substring.
+
+On its first run, two blocks the doc labelled `// COMPILE ERROR` **compiled clean**:
+
+```zer
+container BNode(T) { T val; BNode(T) child; }   // doc: COMPILE ERROR
+container A(T) { B(T) x; }                       // doc: COMPILE ERROR
+container B(T) { A(T) y; }
+```
+
+The COMPILER is right here and the DOC was wrong. A `container` is a stamp; nothing is laid
+out until a concrete type is instantiated, so the containment-cycle check runs at
+instantiation. `BNode(u32) b;` produces *"cannot contain itself by value in field 'child'"*
+and `A(u32) cyc;` produces *"closes a containment cycle"*. Both examples now carry the
+instantiation. Left uncorrected, a reader copying either would have concluded that the
+guarantee CLAUDE.md's safety table promises ("Container infinite recursion → compile error")
+did not exist.
+
+**The naive form of this gate was measured and rejected.** "Every error block must fail to
+compile" passes VACUOUSLY: run over 27 candidates, most fail on syntax or on `undefined
+identifier` — a cast of characters the fragment never declares — long before reaching the
+rule they illustrate; one block of bare expressions failed with *"expected ';' after
+expression"*. That is the weak-oracle shape `// expect-error:` exists to close for
+`tests/zer_fail/`, one level up in the harness. The substring is what makes the assertion
+mean anything. The gate was verified to FIRE (injected a substring that cannot appear) before
+being trusted.
+
+13 of 49 blocks are backfilled. The remaining 36 need the EXAMPLE made self-contained first —
+adding a directive to a block that dies on `undefined identifier` yields a gate that passes
+while testing nothing. `docs/limitations.md` carries the ledger and the explicit instruction
+not to close it by mass-adding directives.
 
 ---
 

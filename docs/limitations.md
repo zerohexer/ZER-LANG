@@ -1212,6 +1212,84 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 ---
 
 
+
+## PARTLY CLOSED 2026-08-29 — `reference.md` error-examples: the mechanism now exists, 13 of 49 backfilled
+
+**What shipped.** `tools/audit_reference_examples.sh` gained an opt-in
+`<!-- audit: expect-error: <substring> -->` directive. A block carrying one is
+COMPILED (through the same prelude/wrap pipeline as every other block) and must be
+REJECTED with a diagnostic containing that substring. Two distinct failure reports,
+because they mean different things: *"THE DOC CLAIMS A REJECTION THE COMPILER NO
+LONGER PERFORMS"* (compiled clean) and *"REJECTED FOR THE WRONG REASON"* (rejected,
+wrong diagnostic). Verified to FIRE before being trusted, by injecting a substring
+that cannot appear.
+
+`=== reference.md example audit: 206 blocks — 75 compiled, 13 rejected-as-documented,
+36 skipped, 82 baselined, 0 failed ===`
+
+**The naive version was measured and rejected, not merely argued against.** Asserting
+"every error block must fail" would have passed vacuously: running all 27 candidates
+through the harness, most failed on SYNTAX or on `undefined identifier` — a cast of
+characters the fragment never declares — long before reaching the rule they
+illustrate. One block of BARE EXPRESSIONS (`@inttoptr(*u32, BASE + 0x2)` with no
+statement around it) failed with *"expected ';' after expression"*. The substring
+oracle is what separates "rejected" from "rejected for the documented reason", and it
+is the same discipline `// expect-error:` enforces for `tests/zer_fail/`.
+
+**It found a real doc/compiler disagreement on its first run.** Two blocks the doc
+labelled `// COMPILE ERROR` **compiled clean**:
+
+```zer
+container BNode(T) { T val; BNode(T) child; }   // doc said COMPILE ERROR
+container A(T) { B(T) x; }                       // doc said COMPILE ERROR
+container B(T) { A(T) y; }
+```
+
+The compiler is right and the doc was incomplete: a `container` is a STAMP, so
+nothing is laid out until a concrete type is instantiated, and the cycle check runs
+at instantiation. Adding `BNode(u32) b;` / `A(u32) cyc;` produces the documented
+error. A reader who copied either example would have concluded the guarantee in
+CLAUDE.md's safety table ("Container infinite recursion → compile error") did not
+exist. Both blocks now carry the instantiation and an `expect-error` directive.
+
+**What is still open — 36 blocks, one authoring pass each.** They fall into two
+groups, and the second is the reason this is not finished:
+- Blocks whose intended rule fires cleanly once wrapped — pure backfill.
+- Blocks that name identifiers the doc never declares (`go`, `BIT`, `gq`,
+  `register_callback`, `Celsius`, `local_handler`, …). These need the EXAMPLE edited
+  to be self-contained, or a prelude entry, before any assertion is meaningful.
+  Adding a directive without that edit produces a substring assertion against an
+  `undefined identifier` diagnostic — a gate that passes while testing nothing.
+
+Until each is done, treat the remaining 36 as documentation, not coverage. Do NOT
+close this entry by mass-adding directives; add them one at a time, each verified to
+fail for the RIGHT reason.
+
+## ~~OPEN — 36 `reference.md` error-examples are checked in NEITHER direction (LOW, tooling)~~ (superseded by the entry above)
+
+`tools/audit_reference_examples.sh` skips any ```zer block whose text contains
+"COMPILE ERROR" / "PARSE ERROR" / "ERROR —" / "// ERROR". That is right as far as it
+goes — those blocks document a rejection, so compiling them would fail by design — but it
+means **36 blocks are neither compiled nor asserted to fail**. The docs can drift in the
+direction the gate cannot see: a rejection the compiler no longer performs.
+
+Measured 2026-08-29: all 36 were run by hand. One disagreed — `reference.md` claimed
+`u32 B = BASE;` (naming a `const` global) was an ERROR when the compiler accepts and folds
+it. Chasing that disagreement found BUG-916 and BUG-917.
+
+**The obvious upgrade is a WEAK ORACLE and must not be shipped as-is.** Asserting "these
+blocks must fail to compile" passes vacuously: most are FRAGMENTS, so they fail on syntax
+long before reaching the rule they illustrate — the same weak-oracle shape
+`// expect-error:` exists to close for `tests/zer_fail/`. The honest version is an
+`expect-error`-style SUBSTRING per block (from the block's own `// ERROR — ...` comment,
+which usually already paraphrases the diagnostic), so a block that stops being rejected —
+or starts being rejected for a different reason — fails loudly. That is a per-block
+authoring pass over 36 blocks, not a script change.
+
+Until then: treat the 36 as documentation, not coverage.
+
+---
+
 ## OPEN — `emit_defer_stmt` is the last raw-AST STATEMENT emitter (ARCHITECTURAL, 2026-08-29)
 
 **Symptom class, not a single bug.** Function bodies are IR-only — that migration exists
@@ -4025,12 +4103,27 @@ Gated the "may require libatomic on 32-bit" warning on
 the field was memset-zeroed and any `target_ptr_bits < N` check
 silently always-true. See BUGS-FIXED.md "Fix #1".
 
-## OPEN — `naked` attribute silently dropped on IR path
+## OPEN (no longer SILENT — warns since BUG-852) — `naked` attribute dropped on IR path
 
-See full entry near the bottom of this file ("`naked` attribute
-silently dropped on IR path (deferred 2026-05-02)") — kept in original
-location to preserve the more detailed analysis added in the
-2026-05-02 fix session.
+Re-measured 2026-08-29: `naked void f() { asm { … } }` still emits a plain
+C function (GCC generates a prologue/epilogue), but the compiler now says so
+at the declaration —
+
+```
+warning: 'naked' is accepted for asm permission but the attribute is NOT
+emitted: GCC will still generate a prologue/epilogue, so you do NOT get your
+own frame layout, your own ret/iret/eret, or untouched callee-saved
+registers. For true naked semantics write the function in C and bring it in
+with 'cinclude'
+```
+
+So the SEMANTIC loss is unchanged and the entry stays OPEN, but the failure
+mode is no longer the silent bare-metal one this ledger was tracking. The
+remaining work is the Option E decoupling of the two intents `naked` carries
+today ("emit no prologue" vs "let me write asm"), not a flag flip — see the
+full entry near the bottom of this file ("`naked` attribute silently dropped
+on IR path (deferred 2026-05-02)"), whose title is kept for history and whose
+"silent" wording is superseded by this paragraph.
 
 ## ~~Codebase audit 2026-05-07 — 5 silent gaps closed~~ (FIXED 2026-05-07)
 
@@ -4705,6 +4798,12 @@ clearer code intent.
 ---
 
 ## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+
+**SUPERSEDED IN PART, 2026-08-29 — it is no longer SILENT.** BUG-852 added a
+`checker_warning` at the naked declaration naming exactly what the user does
+not get. Re-measured on this tree: the warning fires, the attribute is still
+dropped. Everything below about the SEMANTICS remains accurate; only the word
+"silently" in the title is stale (kept for history / cross-references).
 
 **Status:** known regression from IR migration; not fixed because fixing
 breaks every existing `tests/zer/asm_*.zer` test.

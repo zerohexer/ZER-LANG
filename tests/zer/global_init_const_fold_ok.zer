@@ -1,0 +1,43 @@
+// BUG-916: a global initializer that NAMES a const global is not a C constant
+// expression, so it has to be replaced by that global's OWN initializer.
+// BUG-911 did this, but only for an INTEGER target, only a NON-NEGATIVE result,
+// and only through the scoped evaluator (which does not fold intrinsics). Every
+// shape outside that window emitted the NAME and GCC refused it — with no ZER
+// diagnostic. All six are here, and all of them run.
+const i32  NEG   = -5;                 // negative — outside BUG-911's gv >= 0
+const f32  SCALE = 1.5;                // float target — not an integer
+const bool FLAG  = true;               // bool target — not an integer
+const usize WORDS = @size(u32) * 4;    // init is an intrinsic expression
+const [*]u8 BANNER = "boot ok";        // slice target
+const u32  A = 10;                     // the BUG-911 case, still folded
+
+// BUG-917 boundary: a DIAMOND repeats a symbol on two different paths without
+// closing a cycle. The chain walk pops on the way out (a path-visited set, not a
+// global one), so this must compile — a naive visited-set would call it cyclic.
+const u32 DR = 3;
+const u32 DL = DR;
+const u32 DM = DR;
+const u32 DT = DL + DM;
+
+i32   g_neg    = NEG;
+f32   g_scale  = SCALE;
+f32   g_scale2 = SCALE + 1.0;          // ident nested in an expression
+bool  g_flag   = FLAG;
+usize g_words  = WORDS;
+usize g_words2 = WORDS + 1;
+const [*]u8 g_banner = BANNER;
+const u32 g_a  = A + 1;
+u32 g_diamond  = DT;
+
+u32 main() {
+    if (g_neg != -5) { return 1; }
+    if (g_scale != 1.5) { return 2; }
+    if (g_scale2 != 2.5) { return 3; }
+    if (!g_flag) { return 4; }
+    if (g_words != 16) { return 5; }
+    if (g_words2 != 17) { return 6; }
+    if (g_banner.len != 7) { return 7; }
+    if (g_a != 11) { return 8; }
+    if (g_diamond != 6) { return 9; }
+    return 0;
+}

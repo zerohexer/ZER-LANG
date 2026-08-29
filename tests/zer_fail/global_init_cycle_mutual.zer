@@ -1,0 +1,6 @@
+// expect-error: has a cyclic initializer
+// BUG-917, the two-node form — and through arithmetic, so the walk has to
+// descend the expression rather than only test a bare ident.
+const u32 A = B + 1;
+const u32 B = A + 1;
+u32 main() { return A; }
